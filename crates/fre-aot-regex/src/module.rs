@@ -4147,8 +4147,12 @@ fn build_native_dfa_table_with_cost_model(
             "native exact-product scanner does not verify every selective column",
         ));
     }
-    let prefix_fast_forward = if view.partial_discovered_states.is_none()
-        && ENABLE_NATIVE_PREFIX_FAST_FORWARD
+    // The proof sees exactly the completed rows exposed by either a complete
+    // or retained partial view. A transition to an incomplete frontier lies
+    // outside that extent, so `derive` declines instead of manufacturing a
+    // target row. Safe reconvergence inside the completed prefix therefore
+    // needs no separate complete-machine gate.
+    let prefix_fast_forward = if ENABLE_NATIVE_PREFIX_FAST_FORWARD
         && candidate_guard_active
         && exact_prefix_match_width.is_none()
     {
@@ -4161,6 +4165,11 @@ fn build_native_dfa_table_with_cost_model(
                 }
                 let target_state = usize::try_from(plan.target_state)
                     .map_err(|_| ObjectError::ArithmeticOverflow("native prefix target state"))?;
+                if target_state >= forward_states {
+                    return Err(ObjectError::InvalidModule(
+                        "native prefix fast-forward targets an incomplete row",
+                    ));
+                }
                 let target_row_offset = target_state
                     .checked_mul(row_bytes)
                     .and_then(|offset| forward_offset.checked_add(offset))
@@ -23649,6 +23658,264 @@ int main(void) {{
                 .chunks_exact(4)
                 .any(|bytes| bytes == aarch64_sve2_match_b(1, 0, 16).unwrap().to_le_bytes())
         );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "partial proof, wire regeneration, semantic parity, and both native encodings form one contract"
+    )]
+    fn incomplete_retained_table_reuses_guarded_prefix_fast_forward() {
+        const PATTERN: &str =
+            r"(?-u:\x01)abcdefgh(?:a+Q|[b-c][a-b]{1,5}(?:x+|y+))";
+        const GUARDED_PREFIX: &[u8] = b"\x01abcdefgh";
+        let limits = CompileLimitsV1 {
+            determinize: DeterminizeLimits {
+                max_states: 16,
+                ..DeterminizeLimits::default()
+            },
+            ..CompileLimitsV1::default()
+        };
+        let avx512 = FeatureSet::of(CpuFeature::X86Avx512F)
+            .with(CpuFeature::X86Avx512Bw)
+            .with(CpuFeature::X86Avx512Vl);
+        let sve2 = FeatureSet::of(CpuFeature::Aarch64Sve)
+            .with(CpuFeature::Aarch64Sve2);
+        let mixed_sve2 = FeatureSet::of(CpuFeature::Aarch64Asimd)
+            .with(CpuFeature::Aarch64Sve)
+            .with(CpuFeature::Aarch64Sve2);
+        let targets = [
+            Target::x86_64_linux(),
+            Target::x86_64_macos()
+                .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+                .unwrap(),
+            Target::x86_64_linux().with_features(avx512).unwrap(),
+            Target::aarch64_macos()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                .unwrap(),
+            Target::aarch64_linux()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                .unwrap(),
+            Target::aarch64_linux()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Sve))
+                .unwrap(),
+            Target::aarch64_linux().with_features(sve2).unwrap(),
+            Target::aarch64_linux().with_features(mixed_sve2).unwrap(),
+        ];
+        let haystacks = [
+            b"ordinary miss".as_slice(),
+            b"!!\x01abcdefghaaaaQ??".as_slice(),
+            b"\x01abcdefghbaxxx".as_slice(),
+            b"noise\x01abcdefghaaaaR".as_slice(),
+        ];
+
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let compiled = compile(
+                CompileRequest::new(PATTERN, Target::x86_64_linux())
+                    .mode(CompileMode::Optimizing)
+                    .output(output)
+                    .limits(limits),
+            )
+            .unwrap();
+            let reference = compile(
+                CompileRequest::new(PATTERN, Target::x86_64_linux())
+                    .mode(CompileMode::Fast)
+                    .output(output),
+            )
+            .unwrap();
+            let partial = compiled
+                .program()
+                .native_partial_dfa_view()
+                .expect("incomplete retained DFA");
+            assert!(partial.complete_rows < partial.dfa.discovered_states);
+            let (_, layout) = build_native_dfa_table(partial.native).unwrap();
+            let fast_forward = layout
+                .prefix_fast_forward
+                .expect("guarded prefix remains inside completed rows");
+            assert_eq!(
+                usize::from(fast_forward.consumed_bytes),
+                GUARDED_PREFIX.len()
+            );
+
+            let mut state = partial.dfa.dfa.initial_state;
+            for &byte in GUARDED_PREFIX {
+                let row = usize::try_from(state)
+                    .unwrap()
+                    .checked_mul(partial.dfa.class_count)
+                    .unwrap();
+                let class = usize::from(partial.dfa.byte_classes[usize::from(byte)]);
+                let cell = partial.dfa.dfa.forward_cells[row + class];
+                assert!(!cell.accepted, "fast-forward crossed acceptance");
+                assert_ne!(cell.next, NO_DFA_STATE, "fast-forward crossed death");
+                assert!(
+                    usize::try_from(cell.next).unwrap() < partial.complete_rows,
+                    "fast-forward crossed an incomplete frontier"
+                );
+                state = cell.next;
+            }
+            let row_bytes = layout
+                .transitions
+                .row_cells(partial.dfa.class_count)
+                .checked_mul(layout.cells.bytes())
+                .unwrap();
+            let expected_target = usize::try_from(layout.forward_offset)
+                .unwrap()
+                .checked_add(usize::try_from(state).unwrap().checked_mul(row_bytes).unwrap())
+                .and_then(|offset| u32::try_from(offset).ok())
+                .unwrap();
+            assert_eq!(fast_forward.target_row_offset, expected_target);
+
+            for haystack in haystacks {
+                for window in [
+                    SearchWindow::new(0, haystack.len()),
+                    SearchWindow::new(haystack.len().min(2), haystack.len()),
+                ] {
+                    assert_eq!(
+                        compiled.search(haystack, window).unwrap(),
+                        reference.search(haystack, window).unwrap(),
+                        "{output:?}/{haystack:?}/{window:?}"
+                    );
+                }
+            }
+
+            let serialized = compiled.program().serialize().unwrap();
+            let restored = crate::CompiledProgram::deserialize(&serialized).unwrap();
+            assert_eq!(restored.serialize().unwrap(), serialized);
+            assert_eq!(
+                restored.artifact_identity(),
+                compiled.program().artifact_identity()
+            );
+            let restored_partial = restored.native_partial_dfa_view().unwrap();
+            let restored_layout = build_native_dfa_table(restored_partial.native).unwrap().1;
+            assert_eq!(restored_layout.prefix_fast_forward, Some(fast_forward));
+            let restored_module = CompiledModule::lower(&restored, Target::x86_64_linux())
+                .expect("re-lower restored partial program");
+            assert_eq!(restored_module.sections(), compiled.module().sections());
+            assert_eq!(restored_module.symbols(), compiled.module().symbols());
+            assert_eq!(restored_module.relocations(), compiled.module().relocations());
+
+            for target in targets {
+                let (_, target_layout) = build_native_dfa_table_with_cost_model(
+                    partial.native,
+                    target.architecture,
+                    native_vector_filter_cost_model_for_target(target, true),
+                    direct_relation_vector_owns_route(target),
+                )
+                .unwrap();
+                assert_eq!(target_layout.prefix_fast_forward, Some(fast_forward));
+                let core = lower_native_dfa_with_entry_contract(
+                    partial.native,
+                    target,
+                    NativeDfaEntryContract::PreparedPartialCore,
+                )
+                .unwrap()
+                .unwrap_or_else(|| panic!("{target:?} declined its retained prefix scanner"));
+                match target.architecture {
+                    Architecture::X86_64 => {
+                        let mut expected = vec![
+                            0x48,
+                            0x83,
+                            0xc2,
+                            fast_forward.consumed_bytes,
+                            0x4d,
+                            0x8d,
+                            0x91,
+                        ];
+                        expected.extend_from_slice(&fast_forward.target_row_offset.to_le_bytes());
+                        assert!(
+                            core.code
+                                .windows(expected.len())
+                                .any(|actual| actual == expected),
+                            "{target:?}/{output:?} omitted the exact partial target row"
+                        );
+                    }
+                    Architecture::Aarch64 => {
+                        let mut expected = Aarch64Assembler::new();
+                        expected
+                            .instruction(
+                                aarch64_add_x_imm(
+                                    2,
+                                    2,
+                                    u16::from(fast_forward.consumed_bytes),
+                                )
+                                .unwrap(),
+                            )
+                            .unwrap();
+                        aarch64_set_row_base(
+                            &mut expected,
+                            fast_forward.target_row_offset,
+                        )
+                        .unwrap();
+                        let expected = expected.finish().unwrap();
+                        assert!(
+                            core.code
+                                .windows(expected.len())
+                                .any(|actual| actual == expected),
+                            "{target:?}/{output:?} omitted the exact partial target row"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn guarded_prefix_fast_forward_stops_before_an_incomplete_row() {
+        const PATTERN: &str =
+            r"(?-u:\x01)abcdefgh(?:a+Q|[b-c][a-b]{1,5}(?:x+|y+))";
+        let limits = CompileLimitsV1 {
+            determinize: DeterminizeLimits {
+                max_states: 12,
+                ..DeterminizeLimits::default()
+            },
+            ..CompileLimitsV1::default()
+        };
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let compiled = compile(
+                CompileRequest::new(PATTERN, Target::x86_64_linux())
+                    .mode(CompileMode::Optimizing)
+                    .output(output)
+                    .limits(limits),
+            )
+            .unwrap();
+            let partial = compiled
+                .program()
+                .native_partial_dfa_view()
+                .expect("smaller retained prefix");
+            let layout = build_native_dfa_table(partial.native).unwrap().1;
+            let fast_forward = layout
+                .prefix_fast_forward
+                .unwrap_or_else(|| panic!("{output:?} discarded the safe prefix before a hole"));
+            assert_eq!(fast_forward.consumed_bytes, 9, "{output:?}");
+            let row_bytes = layout
+                .transitions
+                .row_cells(partial.dfa.class_count)
+                .checked_mul(layout.cells.bytes())
+                .unwrap();
+            let target = usize::try_from(fast_forward.target_row_offset)
+                .unwrap()
+                .checked_sub(usize::try_from(layout.forward_offset).unwrap())
+                .and_then(|offset| offset.checked_div(row_bytes))
+                .unwrap();
+            assert!(target < partial.complete_rows, "{output:?}");
+            assert!(partial.dfa.dfa.forward_cells.iter().any(|cell| {
+                cell.next != NO_DFA_STATE
+                    && usize::try_from(cell.next)
+                        .ok()
+                        .is_some_and(|next| {
+                            next >= partial.complete_rows
+                                && next < partial.dfa.discovered_states
+                        })
+            }));
+        }
     }
 
     #[test]

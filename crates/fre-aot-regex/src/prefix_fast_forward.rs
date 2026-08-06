@@ -94,13 +94,24 @@ impl Budget {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CheckedStep {
     Live(u32),
+    /// An authenticated destination in the discovered-but-incomplete suffix.
+    Hole,
     AcceptOrDead,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Advance {
     Complete,
+    Hole,
     AcceptOrDead,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ValidatedExtent {
+    /// Rows whose complete transition cells are present in `forward_cells`.
+    completed_states: usize,
+    /// Complete rows followed by the authenticated K0 resume-state suffix.
+    discovered_states: usize,
 }
 
 struct FrontierWorkspace {
@@ -204,7 +215,7 @@ fn validate_view(
     view: NativeProgramView<'_>,
     limits: PrefixFastForwardLimits,
     budget: &mut Budget,
-) -> Option<usize> {
+) -> Option<ValidatedExtent> {
     let dfa = view.dfa;
     if dfa.initial_pending
         || dfa.initial_terminal
@@ -218,12 +229,18 @@ fn validate_view(
     {
         return None;
     }
-    let states = dfa.forward_cells.len().checked_div(dfa.class_count)?;
-    if states == 0 || states > limits.max_states {
+    let completed_states = dfa.forward_cells.len().checked_div(dfa.class_count)?;
+    if completed_states == 0 || completed_states > limits.max_states {
         return None;
     }
+    let discovered_states = match view.partial_discovered_states {
+        Some(discovered) if discovered > completed_states => discovered,
+        Some(_) => return None,
+        None => completed_states,
+    };
+    u32::try_from(discovered_states).ok()?;
     let initial = usize::try_from(dfa.initial_state).ok()?;
-    if initial >= states {
+    if initial >= completed_states {
         return None;
     }
 
@@ -256,19 +273,22 @@ fn validate_view(
     {
         return None;
     }
-    Some(states)
+    Some(ValidatedExtent {
+        completed_states,
+        discovered_states,
+    })
 }
 
 fn checked_step(
     view: NativeProgramView<'_>,
-    states: usize,
+    extent: ValidatedExtent,
     state: u32,
     byte: u8,
     budget: &mut Budget,
 ) -> Option<CheckedStep> {
     budget.charge(1)?;
     let state = usize::try_from(state).ok()?;
-    if state >= states {
+    if state >= extent.completed_states {
         return None;
     }
     let class = usize::from(view.dfa.byte_classes[usize::from(byte)]);
@@ -277,12 +297,17 @@ fn checked_step(
     }
     let row = state.checked_mul(view.dfa.class_count)?;
     let cell: ForwardCell = *view.dfa.forward_cells.get(row.checked_add(class)?)?;
-    if cell.next != NO_STATE
-        && usize::try_from(cell.next)
-            .ok()
-            .is_none_or(|next| next >= states)
-    {
-        return None;
+    if cell.next != NO_STATE {
+        let next = usize::try_from(cell.next).ok()?;
+        // A destination outside the declared discovered domain is malformed.
+        // A destination inside that domain but beyond the complete row prefix
+        // is a real partial-DFA hole and safely terminates prefix retention.
+        if next >= extent.discovered_states {
+            return None;
+        }
+        if next >= extent.completed_states {
+            return Some(CheckedStep::Hole);
+        }
     }
     if cell.accepted || cell.next == NO_STATE {
         Some(CheckedStep::AcceptOrDead)
@@ -293,7 +318,7 @@ fn checked_step(
 
 fn advance_independent(
     view: NativeProgramView<'_>,
-    states: usize,
+    extent: ValidatedExtent,
     set: AnchoredByteSet,
     workspace: &mut FrontierWorkspace,
     budget: &mut Budget,
@@ -302,8 +327,9 @@ fn advance_independent(
     for state_index in 0..workspace.current.len() {
         let state = workspace.current[state_index];
         for byte in SetMembers::new(set) {
-            match checked_step(view, states, state, byte, budget)? {
+            match checked_step(view, extent, state, byte, budget)? {
                 CheckedStep::Live(target) => workspace.insert_next(target)?,
+                CheckedStep::Hole => return Some(Advance::Hole),
                 CheckedStep::AcceptOrDead => return Some(Advance::AcceptOrDead),
             }
         }
@@ -360,7 +386,7 @@ fn validate_relation(
 
 fn advance_exact_pair(
     view: NativeProgramView<'_>,
-    states: usize,
+    extent: ValidatedExtent,
     relation: &PrefixRelation,
     workspace: &mut FrontierWorkspace,
     budget: &mut Budget,
@@ -369,13 +395,15 @@ fn advance_exact_pair(
     for group in relation.groups() {
         for first in SetMembers::new(group.first()) {
             let first_target =
-                match checked_step(view, states, view.dfa.initial_state, first, budget)? {
+                match checked_step(view, extent, view.dfa.initial_state, first, budget)? {
                     CheckedStep::Live(target) => target,
+                    CheckedStep::Hole => return Some(Advance::Hole),
                     CheckedStep::AcceptOrDead => return Some(Advance::AcceptOrDead),
                 };
             for second in SetMembers::new(group.second()) {
-                match checked_step(view, states, first_target, second, budget)? {
+                match checked_step(view, extent, first_target, second, budget)? {
                     CheckedStep::Live(target) => workspace.insert_next(target)?,
+                    CheckedStep::Hole => return Some(Advance::Hole),
                     CheckedStep::AcceptOrDead => return Some(Advance::AcceptOrDead),
                 }
             }
@@ -426,8 +454,9 @@ fn derive_with_limits(
     limits: PrefixFastForwardLimits,
 ) -> Option<PrefixFastForwardPlan> {
     let mut budget = Budget::new(limits.max_work);
-    let states = validate_view(view, limits, &mut budget)?;
-    let mut workspace = FrontierWorkspace::new(states, limits.max_memory_bytes)?;
+    let extent = validate_view(view, limits, &mut budget)?;
+    let mut workspace =
+        FrontierWorkspace::new(extent.completed_states, limits.max_memory_bytes)?;
     workspace.current.push(view.dfa.initial_state);
     let sets = view.anchored_prefix.sets();
     let mut best = None;
@@ -439,29 +468,26 @@ fn derive_with_limits(
         };
         let relation = prefix_relation::derive(view.raw)?;
         let viable_first = validate_relation(&relation, *first, *second, &mut budget)?;
-        if advance_independent(view, states, viable_first, &mut workspace, &mut budget)?
-            == Advance::AcceptOrDead
-        {
-            return None;
+        match advance_independent(view, extent, viable_first, &mut workspace, &mut budget)? {
+            Advance::Complete => {}
+            Advance::Hole | Advance::AcceptOrDead => return None,
         }
         record_singleton(&workspace, 1, &mut best)?;
 
         // The exact pair relation is rooted at the initial state, not at the
         // possibly merged first-byte frontier above.
-        if advance_exact_pair(view, states, &relation, &mut workspace, &mut budget)?
-            == Advance::AcceptOrDead
-        {
-            return best;
+        match advance_exact_pair(view, extent, &relation, &mut workspace, &mut budget)? {
+            Advance::Complete => {}
+            Advance::Hole | Advance::AcceptOrDead => return best,
         }
         record_singleton(&workspace, 2, &mut best)?;
         next_position = 2;
     }
 
     for (position, &set) in sets.iter().enumerate().skip(next_position) {
-        if advance_independent(view, states, set, &mut workspace, &mut budget)?
-            == Advance::AcceptOrDead
-        {
-            return best;
+        match advance_independent(view, extent, set, &mut workspace, &mut budget)? {
+            Advance::Complete => {}
+            Advance::Hole | Advance::AcceptOrDead => return best,
         }
         record_singleton(&workspace, position.checked_add(1)?, &mut best)?;
     }
@@ -480,7 +506,7 @@ mod tests {
         program::CompiledProgram,
     };
 
-    fn program(pattern: &str) -> CompiledProgram {
+    fn program_for_output(pattern: &str, output: OutputContract) -> CompiledProgram {
         let parsed = fre_syntax::parse(ParseRequest::rust(
             pattern.to_owned(),
             CompatibilityProfile::RustBytes(RustProfile::default()),
@@ -501,12 +527,16 @@ mod tests {
         CompiledProgram::build(
             raw,
             automaton,
-            OutputContract::Exists,
+            output,
             CompileMode::Optimizing,
             DeterminizeLimits::default(),
             usize::MAX,
         )
         .unwrap_or_else(|error| panic!("determinize {pattern:?}: {error}"))
+    }
+
+    fn program(pattern: &str) -> CompiledProgram {
+        program_for_output(pattern, OutputContract::Exists)
     }
 
     fn transition(view: NativeProgramView<'_>, state: u32, byte: u8) -> ForwardCell {
@@ -516,6 +546,15 @@ mod tests {
             .expect("oracle row");
         let class = usize::from(view.dfa.byte_classes[usize::from(byte)]);
         view.dfa.forward_cells[row.checked_add(class).expect("oracle cell")]
+    }
+
+    fn transition_index(view: NativeProgramView<'_>, state: u32, byte: u8) -> usize {
+        let row = usize::try_from(state)
+            .expect("oracle state")
+            .checked_mul(view.dfa.class_count)
+            .expect("oracle row");
+        let class = usize::from(view.dfa.byte_classes[usize::from(byte)]);
+        row.checked_add(class).expect("oracle cell")
     }
 
     fn cartesian_prefixes(sets: &[AnchoredByteSet], depth: usize) -> Vec<Vec<u8>> {
@@ -635,6 +674,66 @@ mod tests {
         }
     }
 
+    fn common_nonaccepting_target(
+        view: NativeProgramView<'_>,
+        exact_relation: bool,
+        depth: usize,
+    ) -> Option<u32> {
+        if depth == 0 {
+            return Some(view.dfa.initial_state);
+        }
+        let mut common = None;
+        for prefix in guarded_prefixes(view, exact_relation, depth) {
+            let mut state = view.dfa.initial_state;
+            for byte in prefix {
+                let cell = transition(view, state, byte);
+                if cell.accepted || cell.next == NO_STATE {
+                    return None;
+                }
+                state = cell.next;
+            }
+            if common.is_some_and(|existing| existing != state) {
+                return None;
+            }
+            common = Some(state);
+        }
+        common
+    }
+
+    fn replace_guarded_depth_with_destination(
+        view: NativeProgramView<'_>,
+        exact_relation: bool,
+        depth: usize,
+        destination: u32,
+    ) -> Vec<ForwardCell> {
+        let mut cells = view.dfa.forward_cells.to_vec();
+        let mut indices = Vec::new();
+        for prefix in guarded_prefixes(view, exact_relation, depth) {
+            let mut state = view.dfa.initial_state;
+            for (position, byte) in prefix.into_iter().enumerate() {
+                let index = transition_index(view, state, byte);
+                if position.checked_add(1) == Some(depth) {
+                    indices.push(index);
+                    break;
+                }
+                let cell = view.dfa.forward_cells[index];
+                assert!(!cell.accepted, "test prefix accepted before hole depth");
+                assert_ne!(cell.next, NO_STATE, "test prefix died before hole depth");
+                state = cell.next;
+            }
+        }
+        indices.sort_unstable();
+        indices.dedup();
+        assert!(!indices.is_empty(), "guarded depth has no transitions");
+        for index in indices {
+            cells[index] = ForwardCell {
+                next: destination,
+                accepted: false,
+            };
+        }
+        cells
+    }
+
     #[test]
     fn literal_skips_every_transition_before_acceptance() {
         let compiled = program("abcdef");
@@ -679,6 +778,110 @@ mod tests {
     }
 
     #[test]
+    fn partial_literal_holes_stop_before_every_guarded_depth_for_all_outputs() {
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let compiled = program_for_output("abcdefZ", output);
+            let base = compiled.native_dfa_view().expect("ordered literal DFA");
+            let completed_states = base.dfa.forward_cells.len() / base.dfa.class_count;
+            let discovered_states = completed_states.checked_add(1).unwrap();
+            let hole = u32::try_from(completed_states).unwrap();
+            for depth in 1..=base.anchored_prefix.sets().len() {
+                let expected_target = common_nonaccepting_target(base, false, depth - 1)
+                    .expect("literal prefix before hole is live and common");
+                let cells =
+                    replace_guarded_depth_with_destination(base, false, depth, hole);
+                let mut partial = base;
+                partial.dfa.forward_cells = &cells;
+                partial.partial_discovered_states = Some(discovered_states);
+                let actual = derive(partial, false);
+                let expected = (depth > 1).then_some(PrefixFastForwardPlan {
+                    consumed_bytes: u8::try_from(depth - 1).unwrap(),
+                    target_state: expected_target,
+                });
+                assert_eq!(actual, expected, "{output:?}/hole depth {depth}");
+            }
+        }
+    }
+
+    #[test]
+    fn partial_relation_holes_stop_before_every_guarded_depth_for_all_outputs() {
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let compiled = program_for_output("(?:ab|ac)XYZQ", output);
+            let base = compiled.native_dfa_view().expect("ordered relation DFA");
+            assert!(prefix_relation::derive(base.raw).is_some());
+            let completed_states = base.dfa.forward_cells.len() / base.dfa.class_count;
+            let discovered_states = completed_states.checked_add(1).unwrap();
+            let hole = u32::try_from(completed_states).unwrap();
+            for depth in 1..=base.anchored_prefix.sets().len() {
+                let expected_target = common_nonaccepting_target(base, true, depth - 1)
+                    .unwrap_or_else(|| panic!("relation prefix diverged before depth {depth}"));
+                let cells = replace_guarded_depth_with_destination(base, true, depth, hole);
+                let mut partial = base;
+                partial.dfa.forward_cells = &cells;
+                partial.partial_discovered_states = Some(discovered_states);
+                let actual = derive(partial, true);
+                let expected = (depth > 1).then_some(PrefixFastForwardPlan {
+                    consumed_bytes: u8::try_from(depth - 1).unwrap(),
+                    target_state: expected_target,
+                });
+                assert_eq!(actual, expected, "{output:?}/relation hole depth {depth}");
+            }
+        }
+    }
+
+    #[test]
+    fn partial_holes_are_distinct_from_malformed_destinations() {
+        let compiled = program("abcdefZ");
+        let base = compiled.native_dfa_view().expect("ordered DFA");
+        let completed_states = base.dfa.forward_cells.len() / base.dfa.class_count;
+        let discovered_states = completed_states.checked_add(1).unwrap();
+        let hole = u32::try_from(completed_states).unwrap();
+        let malformed = u32::try_from(discovered_states).unwrap();
+        let extent = ValidatedExtent {
+            completed_states,
+            discovered_states,
+        };
+        let first_byte = SetMembers::new(base.anchored_prefix.sets()[0])
+            .next()
+            .expect("first guarded byte");
+
+        let hole_cells = replace_guarded_depth_with_destination(base, false, 1, hole);
+        let mut hole_view = base;
+        hole_view.dfa.forward_cells = &hole_cells;
+        hole_view.partial_discovered_states = Some(discovered_states);
+        assert_eq!(
+            checked_step(
+                hole_view,
+                extent,
+                hole_view.dfa.initial_state,
+                first_byte,
+                &mut Budget::new(u64::MAX),
+            ),
+            Some(CheckedStep::Hole)
+        );
+        assert!(derive(hole_view, false).is_none());
+
+        let malformed_cells =
+            replace_guarded_depth_with_destination(base, false, 3, malformed);
+        let mut malformed_view = base;
+        malformed_view.dfa.forward_cells = &malformed_cells;
+        malformed_view.partial_discovered_states = Some(discovered_states);
+        assert!(
+            common_nonaccepting_target(base, false, 2).is_some(),
+            "malformed transition must follow an otherwise retained plan"
+        );
+        assert!(derive(malformed_view, false).is_none());
+    }
+
+    #[test]
     fn malformed_shapes_and_every_resource_ceiling_decline() {
         let compiled = program("abcdef");
         let view = compiled.native_dfa_view().expect("ordered DFA");
@@ -694,6 +897,13 @@ mod tests {
         let mut nullable = view;
         nullable.dfa.initial_pending = true;
         assert!(derive(nullable, false).is_none());
+
+        let states = view.dfa.forward_cells.len() / view.dfa.class_count;
+        for discovered in [states.saturating_sub(1), states, usize::MAX] {
+            let mut malformed = view;
+            malformed.partial_discovered_states = Some(discovered);
+            assert!(derive(malformed, false).is_none());
+        }
 
         let defaults = PrefixFastForwardLimits::default();
         for limits in [
