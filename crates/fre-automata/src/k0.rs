@@ -6514,7 +6514,6 @@ fn try_authenticated_warm_exists_value(
         || !workspace.lazy.is_bound_to(automaton)
         || !workspace.lazy.initialized
         || workspace.lazy.declined
-        || workspace.lazy.saturated
     {
         return Ok(None);
     }
@@ -6840,7 +6839,6 @@ fn probe_warm_context_exists(
         || !lazy.is_bound_to(automaton)
         || !lazy.initialized
         || lazy.declined
-        || lazy.saturated
         || proof.relaxed_nullable
     {
         return Ok(None);
@@ -7205,7 +7203,6 @@ fn probe_warm_context_selected_end(
         || !lazy.is_bound_to(automaton)
         || !lazy.initialized
         || lazy.declined
-        || lazy.saturated
         || proof.relaxed_nullable
     {
         return Ok(None);
@@ -7559,7 +7556,6 @@ fn warm_context_reverse_initial_state(
         || !reverse.is_bound_to(automaton)
         || !reverse.initialized
         || reverse.declined
-        || reverse.saturated
     {
         return Ok(None);
     }
@@ -7613,7 +7609,6 @@ fn warm_context_reverse_initial_state_metered(
         || !reverse.is_bound_to(automaton)
         || !reverse.initialized
         || reverse.declined
-        || reverse.saturated
     {
         return Ok(None);
     }
@@ -7907,7 +7902,6 @@ fn probe_warm_context_span(
         || !lazy.is_bound_to(automaton)
         || !lazy.initialized
         || lazy.declined
-        || lazy.saturated
         || !reverse.context.is_allocated()
         || !reverse.is_bound_to(automaton)
         || reverse.declined
@@ -23202,9 +23196,10 @@ mod tests {
 
     use super::{
         classify_byte_delta_16, scratch_bytes, ContextHotTransition, ContextTransitionSlot,
-        ContextTransitionStore, WorkMeter, WorkspaceLayout, ASCII_NARROW_BYTES, ASCII_WIDE_BYTES,
-        BYTE_SET_BLOCK_BYTES, BYTE_SET_WIDE_BLOCK_BYTES, CONTEXT_INITIAL_SOURCE,
-        INVOCATION_RESET_WORK, ROOT_RUN_SCANNER_SHAPE_MAX_WORK, WARM_EXISTS_INLINE_BYTES,
+        ContextTransitionStore, LazyWorkspace, WarmContextForwardContinuation, WorkMeter,
+        WorkspaceLayout, ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, BYTE_SET_BLOCK_BYTES,
+        BYTE_SET_WIDE_BLOCK_BYTES, CONTEXT_INITIAL_SOURCE, INVOCATION_RESET_WORK,
+        ROOT_RUN_SCANNER_SHAPE_MAX_WORK, WARM_EXISTS_INLINE_BYTES,
     };
     use crate::{
         plan::{
@@ -29441,6 +29436,128 @@ mod tests {
             store.hot[usize::try_from(source).unwrap()]
         };
         assert_ne!(hot.symbol, symbol);
+    }
+
+    fn seal_context_forward_capacity(workspace: &mut K0Workspace) {
+        let state_len = workspace.lazy.state_len;
+        let item_len = workspace.lazy.item_len;
+        workspace.lazy.offsets.truncate(state_len);
+        workspace.lazy.lengths.truncate(state_len);
+        workspace.lazy.modes.truncate(state_len);
+        workspace.lazy.hashes.truncate(state_len);
+        workspace.lazy.items.truncate(item_len);
+        workspace.lazy.saturated = true;
+    }
+
+    fn seal_context_reverse_capacity(workspace: &mut K0Workspace) {
+        let state_len = workspace.reverse.state_len;
+        let item_len = workspace.reverse.item_len;
+        workspace.reverse.offsets.truncate(state_len);
+        workspace.reverse.lengths.truncate(state_len);
+        workspace.reverse.hashes.truncate(state_len);
+        workspace.reverse.items.truncate(item_len);
+        workspace.reverse.saturated = true;
+    }
+
+    fn probe_context_forward_for_contract(
+        plan: &Automaton,
+        source: &[u8],
+        window: SearchWindow,
+        workspace: &K0Workspace,
+        contract: OutputContract,
+    ) -> WarmContextForwardContinuation {
+        let proof = plan.start_filter_proof.get().unwrap();
+        match contract {
+            OutputContract::Exists => match super::probe_warm_context_exists(
+                plan,
+                source,
+                window,
+                &workspace.lazy,
+                proof,
+            )
+            .unwrap()
+            {
+                Some(super::WarmContextExistsProbe::Continue(continuation)) => continuation,
+                other => panic!("expected Exists forward continuation, got {other:?}"),
+            },
+            OutputContract::SelectedEnd => match super::probe_warm_context_selected_end(
+                plan,
+                source,
+                window,
+                &workspace.lazy,
+                proof,
+            )
+            .unwrap()
+            {
+                Some(super::WarmContextSelectedEndProbe::Continue(continuation)) => continuation,
+                other => panic!("expected SelectedEnd forward continuation, got {other:?}"),
+            },
+            OutputContract::Span => match super::probe_warm_context_span(
+                plan,
+                source,
+                window,
+                &workspace.lazy,
+                &workspace.reverse,
+                proof,
+            )
+            .unwrap()
+            {
+                Some(super::WarmContextSpanProbe::ContinueForward(continuation)) => continuation,
+                other => panic!("expected Span forward continuation, got {other:?}"),
+            },
+            OutputContract::EarliestEnd => {
+                panic!("EarliestEnd has no contextual value continuation")
+            }
+        }
+    }
+
+    fn retained_context_initial_symbol(
+        plan: &Automaton,
+        source: &[u8],
+        position: usize,
+        lazy: &LazyWorkspace,
+    ) -> u32 {
+        let global_dependencies = plan.boundary_context_classifier().assertions();
+        let root_dependencies = lazy.context_root_dependency_mask(global_dependencies);
+        let normalized_assertions = super::enabled_assertion_mask_unmetered_for_dependencies(
+            plan,
+            root_dependencies,
+            source,
+            position,
+        );
+        let exact_assertions = super::enabled_assertion_mask_unmetered_for_dependencies(
+            plan,
+            global_dependencies,
+            source,
+            position,
+        );
+        [normalized_assertions, exact_assertions]
+            .into_iter()
+            .map(super::contextual_initial_symbol)
+            .find(|&symbol| {
+                lazy.context
+                    .lookup_existing_prevalidated(CONTEXT_INITIAL_SOURCE, symbol)
+                    .unwrap()
+                    .is_some()
+            })
+            .expect("one normalized or exact contextual initial record must be retained")
+    }
+
+    fn assert_forward_contract_result(
+        contract: OutputContract,
+        found: Option<MatchSpan>,
+        expected: MatchSpan,
+    ) {
+        match contract {
+            OutputContract::Exists => assert!(found.is_some()),
+            OutputContract::SelectedEnd => {
+                assert_eq!(found.map(MatchSpan::end), Some(expected.end()));
+            }
+            OutputContract::Span => assert_eq!(found, Some(expected)),
+            OutputContract::EarliestEnd => {
+                panic!("EarliestEnd has no contextual value continuation")
+            }
+        }
     }
 
     fn bounded_words(alphabet: &[u8], maximum_len: usize) -> Vec<Vec<u8>> {
@@ -44940,6 +45057,333 @@ mod tests {
     #[test]
     #[allow(
         clippy::too_many_lines,
+        reason = "the complete contract matrix checks both forward and reverse saturated admission"
+    )]
+    fn saturated_contextual_complete_value_matrix_remains_admitted() {
+        let plan = contextual_unicode_drop_loop_then_terminal();
+        pin_without_start_filter(&plan);
+        let run_end = super::LAZY_LOOP_SKIP_MIN_BYTES * 2;
+        let mut source = vec![b'!'; super::WARM_CONTEXT_MIN_WINDOW_BYTES];
+        source[..run_end].fill(b'x');
+        source[run_end] = b'z';
+        let window = SearchWindow::full(&source);
+        let expected = Some(MatchSpan::new(0, run_end + 1));
+        let mut session =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                .unwrap();
+        assert_eq!(
+            session
+                .search_window::<Span>(&source, window, SearchLimits::unlimited())
+                .unwrap()
+                .into_output(),
+            expected,
+        );
+        assert!(session.workspace.reverse.initialized);
+
+        let proof = plan.start_filter_proof.get().unwrap();
+        let exists = super::probe_warm_context_exists(
+            &plan,
+            &source,
+            window,
+            &session.workspace.lazy,
+            proof,
+        )
+        .unwrap();
+        let selected = super::probe_warm_context_selected_end(
+            &plan,
+            &source,
+            window,
+            &session.workspace.lazy,
+            proof,
+        )
+        .unwrap();
+        let span = super::probe_warm_context_span(
+            &plan,
+            &source,
+            window,
+            &session.workspace.lazy,
+            &session.workspace.reverse,
+            proof,
+        )
+        .unwrap();
+        assert_eq!(
+            exists,
+            Some(super::WarmContextExistsProbe::Complete(true))
+        );
+        assert_eq!(
+            selected,
+            Some(super::WarmContextSelectedEndProbe::Complete(Some(
+                run_end + 1
+            )))
+        );
+        assert_eq!(span, Some(super::WarmContextSpanProbe::Complete(expected)));
+
+        let forward_states = session.workspace.lazy.state_len;
+        let forward_items = session.workspace.lazy.item_len;
+        let reverse_states = session.workspace.reverse.state_len;
+        let reverse_items = session.workspace.reverse.item_len;
+        seal_context_forward_capacity(&mut session.workspace);
+        seal_context_reverse_capacity(&mut session.workspace);
+
+        assert_eq!(
+            super::probe_warm_context_exists(
+                &plan,
+                &source,
+                window,
+                &session.workspace.lazy,
+                proof,
+            )
+            .unwrap(),
+            exists,
+        );
+        assert_eq!(
+            super::probe_warm_context_selected_end(
+                &plan,
+                &source,
+                window,
+                &session.workspace.lazy,
+                proof,
+            )
+            .unwrap(),
+            selected,
+        );
+        assert_eq!(
+            super::probe_warm_context_span(
+                &plan,
+                &source,
+                window,
+                &session.workspace.lazy,
+                &session.workspace.reverse,
+                proof,
+            )
+            .unwrap(),
+            span,
+        );
+        assert!(session
+            .search_exists_value(&source, window, SearchLimits::unlimited())
+            .unwrap());
+        assert_eq!(
+            session
+                .search_selected_end_value(&source, window, SearchLimits::unlimited())
+                .unwrap(),
+            Some(run_end + 1),
+        );
+        assert_eq!(
+            session
+                .search_span_value(&source, window, SearchLimits::unlimited())
+                .unwrap(),
+            expected,
+        );
+        assert_eq!(session.workspace.lazy.state_len, forward_states);
+        assert_eq!(session.workspace.lazy.item_len, forward_items);
+        assert_eq!(session.workspace.reverse.state_len, reverse_states);
+        assert_eq!(session.workspace.reverse.item_len, reverse_items);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the contract/phase matrix checks exact handoff accounting, capacity, and no replay"
+    )]
+    fn saturated_contextual_forward_handoff_matrix_preserves_accounting_and_no_replay() {
+        for contract in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let plan = asserted_ordered_a_or_ab(true);
+            let mut source = vec![b'!'; super::WARM_CONTEXT_MIN_WINDOW_BYTES];
+            let far = super::WARM_CONTEXT_MIN_WINDOW_BYTES / 2;
+            source[far - 1] = b'\n';
+            source[far..far + 2].copy_from_slice(b"ab");
+            let window = SearchWindow::full(&source);
+            let expected = MatchSpan::new(far, far + 2);
+            let mut session =
+                K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                    .unwrap();
+            assert_eq!(
+                session
+                    .search_window::<Span>(&source, window, SearchLimits::unlimited())
+                    .unwrap()
+                    .into_output(),
+                Some(expected),
+            );
+
+            let initial_symbol = retained_context_initial_symbol(
+                &plan,
+                &source,
+                far,
+                &session.workspace.lazy,
+            );
+            remove_exact_context_record(
+                &mut session.workspace.lazy.context,
+                CONTEXT_INITIAL_SOURCE,
+                initial_symbol,
+            );
+            let unsaturated = probe_context_forward_for_contract(
+                &plan,
+                &source,
+                window,
+                &session.workspace,
+                contract,
+            );
+            assert_eq!(unsaturated.phase, super::WarmContextForwardPhase::Initial);
+            assert_eq!(unsaturated.position, far);
+            assert!(unsaturated.work > INVOCATION_RESET_WORK);
+
+            let states = session.workspace.lazy.state_len;
+            let items = session.workspace.lazy.item_len;
+            seal_context_forward_capacity(&mut session.workspace);
+            let saturated = probe_context_forward_for_contract(
+                &plan,
+                &source,
+                window,
+                &session.workspace,
+                contract,
+            );
+            assert_eq!(
+                saturated, unsaturated,
+                "saturation changed {contract:?} initial handoff accounting"
+            );
+            let proof = plan.start_filter_proof.get().unwrap();
+            let found = super::continue_mutable_warm_context_forward(
+                &plan,
+                &source,
+                &mut session.workspace,
+                proof,
+                saturated,
+                contract,
+            )
+            .unwrap();
+            assert_forward_contract_result(contract, found, expected);
+            assert_eq!(session.workspace.lazy.state_len, states);
+            assert_eq!(session.workspace.lazy.item_len, items);
+        }
+
+        for contract in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let plan = absolute_or_colon_with_ordered_suffixes();
+            let mut warm_source = vec![b'x'; super::WARM_CONTEXT_MIN_WINDOW_BYTES];
+            let warm_start = warm_source.len() - 4;
+            warm_source[warm_start..].copy_from_slice(b":abc");
+            let mut novel_source = vec![b'x'; super::WARM_CONTEXT_MIN_WINDOW_BYTES];
+            let novel_start = novel_source.len() - 5;
+            novel_source[novel_start..].copy_from_slice(b":abc!");
+            let window = SearchWindow::full(&novel_source);
+            let expected = MatchSpan::new(novel_start, novel_source.len());
+            let mut session =
+                K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                    .unwrap();
+            assert_eq!(
+                session
+                    .search_window::<Span>(
+                        &warm_source,
+                        SearchWindow::full(&warm_source),
+                        SearchLimits::unlimited(),
+                    )
+                    .unwrap()
+                    .into_output(),
+                Some(MatchSpan::new(warm_start, warm_source.len())),
+            );
+
+            let unsaturated = probe_context_forward_for_contract(
+                &plan,
+                &novel_source,
+                window,
+                &session.workspace,
+                contract,
+            );
+            let state = match unsaturated.phase {
+                super::WarmContextForwardPhase::Cell { state } => state,
+                other @ super::WarmContextForwardPhase::Initial => {
+                    panic!("expected novel contextual cell, got {other:?}")
+                }
+            };
+            assert!(unsaturated.position > novel_start);
+            let global_dependencies = plan.boundary_context_classifier().assertions();
+            let dependencies = session
+                .workspace
+                .lazy
+                .context_dependency_mask(state, global_dependencies)
+                .unwrap();
+            let destination = unsaturated.position + 1;
+            let assertions = super::enabled_assertion_mask_unmetered_for_dependencies(
+                &plan,
+                dependencies,
+                &novel_source,
+                destination,
+            );
+            let hole_symbol = super::contextual_symbol_for_byte(
+                &plan,
+                novel_source[unsaturated.position],
+                assertions,
+            );
+            assert_exact_context_record_absent(
+                &session.workspace.lazy.context,
+                state,
+                hole_symbol,
+            );
+
+            let states = session.workspace.lazy.state_len;
+            let items = session.workspace.lazy.item_len;
+            seal_context_forward_capacity(&mut session.workspace);
+            let saturated = probe_context_forward_for_contract(
+                &plan,
+                &novel_source,
+                window,
+                &session.workspace,
+                contract,
+            );
+            assert_eq!(
+                saturated, unsaturated,
+                "saturation changed {contract:?} cell handoff accounting"
+            );
+
+            let initial_symbol = retained_context_initial_symbol(
+                &plan,
+                &novel_source,
+                novel_start,
+                &session.workspace.lazy,
+            );
+            remove_exact_context_record(
+                &mut session.workspace.lazy.context,
+                CONTEXT_INITIAL_SOURCE,
+                initial_symbol,
+            );
+            let occupied = session.workspace.lazy.context.occupied_slots();
+            let proof = plan.start_filter_proof.get().unwrap();
+            let found = super::continue_mutable_warm_context_forward(
+                &plan,
+                &novel_source,
+                &mut session.workspace,
+                proof,
+                saturated,
+                contract,
+            )
+            .unwrap();
+            assert_forward_contract_result(contract, found, expected);
+            assert_exact_context_record_absent(
+                &session.workspace.lazy.context,
+                CONTEXT_INITIAL_SOURCE,
+                initial_symbol,
+            );
+            assert_exact_context_record_absent(
+                &session.workspace.lazy.context,
+                state,
+                hole_symbol,
+            );
+            assert_eq!(session.workspace.lazy.context.occupied_slots(), occupied);
+            assert_eq!(session.workspace.lazy.state_len, states);
+            assert_eq!(session.workspace.lazy.item_len, items);
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
         reason = "the no-replay proof captures, invalidates, authenticates, and resumes one exact frontier"
     )]
     fn contextual_selected_end_cell_handoff_preserves_priority_without_prefix_replay() {
@@ -46590,7 +47034,7 @@ mod tests {
         );
 
         let proof = warm_plan.start_filter_proof.get().unwrap();
-        let cell_continuation = match super::probe_warm_context_span(
+        let unsaturated_cell_continuation = match super::probe_warm_context_span(
             &warm_plan,
             &source,
             window,
@@ -46604,12 +47048,33 @@ mod tests {
             other => panic!("expected reverse cell continuation, got {other:?}"),
         };
         assert_eq!(
-            cell_continuation.phase,
+            unsaturated_cell_continuation.phase,
             super::WarmContextReversePhase::Cell {
                 state: second_state,
             },
         );
-        assert_eq!(cell_continuation.cursor, first_source);
+        assert_eq!(unsaturated_cell_continuation.cursor, first_source);
+
+        let reverse_states = warm.workspace.reverse.state_len;
+        let reverse_items = warm.workspace.reverse.item_len;
+        seal_context_reverse_capacity(&mut warm.workspace);
+        let cell_continuation = match super::probe_warm_context_span(
+            &warm_plan,
+            &source,
+            window,
+            &warm.workspace.lazy,
+            &warm.workspace.reverse,
+            proof,
+        )
+        .unwrap()
+        {
+            Some(super::WarmContextSpanProbe::ContinueReverse(continuation)) => continuation,
+            other => panic!("expected saturated reverse cell continuation, got {other:?}"),
+        };
+        assert_eq!(
+            cell_continuation, unsaturated_cell_continuation,
+            "reverse saturation changed the exact handoff accounting"
+        );
 
         remove_exact_context_record(
             &mut warm.workspace.reverse.context,
@@ -46631,6 +47096,8 @@ mod tests {
             first_state,
             first_symbol,
         );
+        assert_eq!(warm.workspace.reverse.state_len, reverse_states);
+        assert_eq!(warm.workspace.reverse.item_len, reverse_items);
     }
 
     #[test]
