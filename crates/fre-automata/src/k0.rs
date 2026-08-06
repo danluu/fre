@@ -501,6 +501,92 @@ impl ContextHotTransition {
 
 const _: () = assert!(size_of::<ContextHotTransition>() == 16);
 
+/// One invocation-local view of an authenticated, immutable complete dense
+/// row. The retained store remains the owner of every cell; this descriptor
+/// only hoists shape and publication proofs out of repeated self-loop reads.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CompleteContextDenseRow<'a> {
+    cells: &'a [u32],
+    class_count: usize,
+    first_dependency: u32,
+    second_dependency: u32,
+    realizable_variants: u8,
+    logical_prefix_work: u8,
+    classifier: BoundaryContextClassifier,
+    hot: ContextHotTransition,
+}
+
+impl CompleteContextDenseRow<'_> {
+    /// Read one canonically projected byte boundary. Authentication proved the
+    /// row, hot tag, and class domain once; the dynamic dense path retains one
+    /// bounds-checked load and an explicit unfilled-cell invariant check.
+    #[inline]
+    fn lookup_projected(
+        self,
+        class: u8,
+        assertions: u32,
+    ) -> Result<(u32, u64), SearchError> {
+        debug_assert_eq!(assertions & !self.classifier.assertions(), 0);
+        let class_index = usize::from(class);
+        if class_index >= self.class_count {
+            return Err(SearchError::InternalInvariant {
+                detail: "complete contextual dense byte class is outside its authenticated domain",
+            });
+        }
+        let symbol = contextual_class_symbol(class, assertions);
+        let lookup_work = if self.hot.symbol == symbol {
+            return Ok((
+                self.hot.value,
+                u64::from(self.logical_prefix_work)
+                    .wrapping_add(u64::from(self.hot.lookup_work)),
+            ));
+        } else {
+            2_u64
+        };
+
+        let variant = usize::from(
+            self.first_dependency != 0 && assertions & self.first_dependency != 0,
+        ) | (usize::from(
+            self.second_dependency != 0 && assertions & self.second_dependency != 0,
+        ) << 1);
+        debug_assert!(self.realizable_variants & (1_u8 << variant) != 0);
+        // Authentication bounds the product by four variants of at most 256
+        // byte classes, so this index cannot overflow on any supported target.
+        let relative = variant
+            .wrapping_mul(self.class_count)
+            .wrapping_add(class_index);
+        let value = *self
+            .cells
+            .get(relative)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "complete contextual dense prevalidated lookup exceeded its owner row",
+            })?;
+        if value == LAZY_CELL_UNFILLED {
+            return Err(SearchError::InternalInvariant {
+                detail: "complete contextual dense row missed a normalized warm symbol",
+            });
+        }
+        Ok((
+            value,
+            u64::from(self.logical_prefix_work).wrapping_add(lookup_work),
+        ))
+    }
+}
+
+#[derive(Default)]
+struct CompleteContextDenseRowCache<'a> {
+    entry: Option<(u32, CompleteContextDenseRow<'a>)>,
+    #[cfg(test)]
+    hits: usize,
+    #[cfg(test)]
+    authentication_attempts: usize,
+}
+
+enum WarmContextDenseSource<'a> {
+    Complete(CompleteContextDenseRow<'a>),
+    Incomplete(ContextHotTransition),
+}
+
 struct ContextTransitionStore {
     slots: Vec<ContextTransitionSlot>,
     hot: Vec<ContextHotTransition>,
@@ -1197,12 +1283,90 @@ impl ContextTransitionStore {
         Ok(None)
     }
 
-    /// Read one dependency-normalized symbol from an authenticated complete
-    /// dense row and return the logical retained-lookup work that the metered
-    /// reader would have charged. `None` means only that this source is not
-    /// complete; once the monotone completion tag is present, every missing
-    /// owner, dependency, or cell is a hard proof failure rather than a cache
-    /// hole that may fall through to the broader raw key.
+    /// Authenticate one complete row after the enclosing warm executor has
+    /// validated the retained store shape. `None` means only that the source
+    /// is incomplete; a zero missing-cell certificate makes every malformed
+    /// owner or dependency a hard proof failure.
+    #[inline]
+    fn authenticate_complete_dense_row_prevalidated(
+        &self,
+        hot: ContextHotTransition,
+        global_dependencies: u32,
+        byte_class_count: usize,
+    ) -> Result<Option<CompleteContextDenseRow<'_>>, SearchError> {
+        debug_assert!(self.validate_shape().is_ok());
+        if hot.dense_missing != 0 {
+            return Ok(None);
+        }
+        let owner = self
+            .dense_owner_for_hot(hot)?
+            .ok_or(SearchError::InternalInvariant {
+                detail: "complete contextual dense row has no owner",
+            })?;
+        let dependencies = hot.dependency_mask;
+        if dependencies & !global_dependencies != 0 {
+            return Err(SearchError::InternalInvariant {
+                detail: "complete contextual dense row exceeds global dependencies",
+            });
+        }
+        let class_count = usize::from(self.dense_class_count);
+        if class_count != byte_class_count {
+            return Err(SearchError::InternalInvariant {
+                detail: "complete contextual dense row disagrees with the byte-class domain",
+            });
+        }
+        if !(2..=CONTEXT_TRANSITION_WAYS + 1).contains(&usize::from(hot.lookup_work)) {
+            return Err(SearchError::InternalInvariant {
+                detail: "complete contextual hot lookup has invalid work",
+            });
+        }
+        let owner_stride = contextual_dense_owner_cells(class_count)?;
+        let begin = owner
+            .checked_mul(owner_stride)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "complete contextual dense owner row",
+            })?;
+        let end = begin
+            .checked_add(owner_stride)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "complete contextual dense owner row end",
+            })?;
+        let cells = self
+            .dense
+            .get(begin..end)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "complete contextual dense owner row is outside its fixed store",
+            })?;
+        let first_dependency = dependencies & dependencies.wrapping_neg();
+        let remaining = dependencies ^ first_dependency;
+        let second_dependency = remaining & remaining.wrapping_neg();
+        let realizable_variants = contextual_dense_realizable_variants(dependencies)?;
+        let logical_prefix_work = dependencies
+            .count_ones()
+            .checked_add(1)
+            .and_then(|work| u8::try_from(work).ok())
+            .ok_or(SearchError::InternalInvariant {
+                detail: "complete contextual dense logical work does not fit u8",
+            })?;
+        Ok(Some(CompleteContextDenseRow {
+            cells,
+            class_count,
+            first_dependency,
+            second_dependency,
+            realizable_variants,
+            logical_prefix_work,
+            classifier: BoundaryContextClassifier::new(dependencies),
+            hot,
+        }))
+    }
+
+    /// Fully checked single-symbol reader retained for invariant tests and
+    /// callers that have not established a reusable row descriptor.
+    #[cfg(any(test, debug_assertions))]
+    #[allow(
+        dead_code,
+        reason = "the checked reader is the debug and forged-state oracle for the release descriptor kernel"
+    )]
     #[inline]
     fn lookup_complete_dense_with_hot_prevalidated(
         &self,
@@ -6924,66 +7088,69 @@ fn warm_context_transition_for_dependencies_metered(
     )
 }
 
-/// Read one transition without touching the live meter when the source owns a
-/// fully initialized dependency-normalized row. The returned work is exactly
-/// the source-byte charge, logical assertion checks, and retained lookup work
-/// of `warm_context_transition_for_dependencies_metered`. A complete row makes
-/// the normalized lookup total, so the broader raw-key retry is unreachable.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the fused dense reader keeps the full-haystack boundary, source tag, and logical work domain explicit"
-)]
+/// Reuse one authenticated row across an immutable source-state run. Dense
+/// owners are monotone and never reused, while the shared workspace is only
+/// borrowed here, so a cached descriptor cannot outlive or race publication.
+#[inline]
+fn warm_context_hot_and_complete_dense_row<'a>(
+    context: &'a ContextTransitionStore,
+    state: u32,
+    global_dependencies: u32,
+    byte_class_count: usize,
+    cached: &mut CompleteContextDenseRowCache<'a>,
+) -> Result<WarmContextDenseSource<'a>, SearchError> {
+    if let Some((cached_state, row)) = cached.entry {
+        if cached_state == state {
+            #[cfg(test)]
+            {
+                cached.hits = cached.hits.checked_add(1).expect("test cache hits stay bounded");
+            }
+            return Ok(WarmContextDenseSource::Complete(row));
+        }
+    }
+    #[cfg(test)]
+    {
+        cached.authentication_attempts = cached
+            .authentication_attempts
+            .checked_add(1)
+            .expect("test authentication attempts stay bounded");
+    }
+    let hot = context.hot_transition(state)?;
+    let row = context.authenticate_complete_dense_row_prevalidated(
+        hot,
+        global_dependencies,
+        byte_class_count,
+    )?;
+    if let Some(row) = row {
+        cached.entry = Some((state, row));
+        return Ok(WarmContextDenseSource::Complete(row));
+    }
+    Ok(WarmContextDenseSource::Incomplete(hot))
+}
+
+/// Read one transition without touching the live meter from a row whose
+/// immutable shape and completion proof were already authenticated. The
+/// returned work exactly matches the canonical metered transition reader.
 #[inline]
 fn warm_context_complete_dense_transition(
     automaton: &Automaton,
     haystack: &[u8],
     boundary: usize,
-    context: &ContextTransitionStore,
-    hot: ContextHotTransition,
+    row: CompleteContextDenseRow<'_>,
     byte: u8,
-    global_dependencies: u32,
-) -> Result<Option<(u32, u64)>, SearchError> {
-    if hot.dense_missing != 0 {
-        return Ok(None);
-    }
-    let dependencies = hot.dependency_mask;
-    if dependencies == CONTEXT_DEPENDENCY_UNCOMPUTED
-        || dependencies & !global_dependencies != 0
-        || dependencies.count_ones() > 2
-    {
-        return Err(SearchError::InternalInvariant {
-            detail: "complete contextual dense row has invalid dependencies",
-        });
-    }
+) -> Result<(u32, u64), SearchError> {
     // A complete dependency-normalized row cannot take the broader raw-key
     // retry. Project its graph-derived (at most two-bit) dependency mask
     // directly so a word-only row, for example, does not also classify the
     // absolute and two line-boundary families merely to populate a reusable
     // raw observation that this path can never reuse.
-    let assertions = project_complete_context_dependencies(
-        dependencies,
+    let assertions = project_complete_context_dependencies_with_classifier(
+        row.classifier,
         automaton.line_terminator(),
         haystack,
         boundary,
     );
-    let symbol = contextual_symbol_for_byte(automaton, byte, assertions);
-    let Some((cell, lookup_work)) = context.lookup_complete_dense_with_hot_prevalidated(
-        symbol,
-        hot,
-        global_dependencies,
-    )?
-    else {
-        return Err(SearchError::InternalInvariant {
-            detail: "complete contextual dense transition lost its certificate",
-        });
-    };
-    let work = 1_u64
-        .checked_add(u64::from(dependencies.count_ones()))
-        .and_then(|work| work.checked_add(lookup_work))
-        .ok_or(SearchError::ArithmeticOverflow {
-            computation: "search work counter",
-        })?;
-    Ok(Some((cell, work)))
+    row.lookup_projected(automaton.byte_classes().class_of(byte), assertions)
 }
 
 /// Project existence from one complete, already-published contextual path.
@@ -7141,6 +7308,7 @@ fn try_warm_context_exists_loop<const LOOP_SKIP: bool>(
     let mut restartable = true;
     let mut active_start = Some(position);
     let mut entered = false;
+    let mut complete_dense_row_cache = CompleteContextDenseRowCache::default();
 
     loop {
         if (!initial_candidate_scanned || entered)
@@ -7288,7 +7456,13 @@ fn try_warm_context_exists_loop<const LOOP_SKIP: bool>(
             }
         }
 
-        let hot = lazy.context.hot_transition(state)?;
+        let dense_source = warm_context_hot_and_complete_dense_row(
+            &lazy.context,
+            state,
+            global_dependencies,
+            automaton.byte_classes().count(),
+            &mut complete_dense_row_cache,
+        )?;
         let byte = *haystack
             .get(position)
             .ok_or(SearchError::InternalInvariant {
@@ -7299,55 +7473,53 @@ fn try_warm_context_exists_loop<const LOOP_SKIP: bool>(
             .ok_or(SearchError::ArithmeticOverflow {
                 computation: "warm contextual lazy DFA destination",
             })?;
-        let cell = if hot.dense_missing == 0 {
-            let (cell, work) = warm_context_complete_dense_transition(
-                automaton,
-                haystack,
-                destination,
-                &lazy.context,
-                hot,
-                byte,
-                global_dependencies,
-            )?
-            .ok_or(SearchError::InternalInvariant {
-                detail: "complete contextual dense transition declined",
-            })?;
-            work_receipt.defer_completed(&meter, work)?;
-            cell
-        } else {
-            work_receipt.settle(&mut meter, position)?;
-            let work_before_step = meter.consumed;
-            meter.charge(1, position)?;
-            let Some(cell) = warm_context_transition_for_dependencies_metered(
-                automaton,
-                haystack,
-                destination,
-                lazy,
-                state,
-                hot,
-                byte,
-                global_dependencies,
-                &mut meter,
-            )? else {
-                return Ok(WarmContextExistsProbe::Continue(
-                    WarmContextForwardContinuation {
-                        cache_identity: lazy.cache_identity,
-                        window,
-                        phase: WarmContextForwardPhase::Cell { state },
-                        position,
-                        work: work_before_step,
-                        pending_end: None,
-                        active_start,
-                        pending_start: None,
-                        engine_candidate,
-                        retained_start_mask,
-                        adaptive_probe,
-                        loop_probe,
-                        active_loop_slot,
-                    },
-                ));
-            };
-            cell
+        let cell = match dense_source {
+            WarmContextDenseSource::Complete(row) => {
+                let (cell, work) = warm_context_complete_dense_transition(
+                    automaton,
+                    haystack,
+                    destination,
+                    row,
+                    byte,
+                )?;
+                work_receipt.defer_completed(&meter, work)?;
+                cell
+            }
+            WarmContextDenseSource::Incomplete(hot) => {
+                work_receipt.settle(&mut meter, position)?;
+                let work_before_step = meter.consumed;
+                meter.charge(1, position)?;
+                let Some(cell) = warm_context_transition_for_dependencies_metered(
+                    automaton,
+                    haystack,
+                    destination,
+                    lazy,
+                    state,
+                    hot,
+                    byte,
+                    global_dependencies,
+                    &mut meter,
+                )? else {
+                    return Ok(WarmContextExistsProbe::Continue(
+                        WarmContextForwardContinuation {
+                            cache_identity: lazy.cache_identity,
+                            window,
+                            phase: WarmContextForwardPhase::Cell { state },
+                            position,
+                            work: work_before_step,
+                            pending_end: None,
+                            active_start,
+                            pending_start: None,
+                            engine_candidate,
+                            retained_start_mask,
+                            adaptive_probe,
+                            loop_probe,
+                            active_loop_slot,
+                        },
+                    ));
+                };
+                cell
+            }
         };
         position = destination;
 
@@ -7528,6 +7700,7 @@ fn try_warm_context_selected_end_loop<const LOOP_SKIP: bool>(
     let mut restartable = true;
     let mut active_start = Some(position);
     let mut entered = false;
+    let mut complete_dense_row_cache = CompleteContextDenseRowCache::default();
 
     loop {
         if pending_end.is_none()
@@ -7676,7 +7849,13 @@ fn try_warm_context_selected_end_loop<const LOOP_SKIP: bool>(
             }
         }
 
-        let hot = lazy.context.hot_transition(state)?;
+        let dense_source = warm_context_hot_and_complete_dense_row(
+            &lazy.context,
+            state,
+            global_dependencies,
+            automaton.byte_classes().count(),
+            &mut complete_dense_row_cache,
+        )?;
         let byte = *haystack
             .get(position)
             .ok_or(SearchError::InternalInvariant {
@@ -7687,55 +7866,53 @@ fn try_warm_context_selected_end_loop<const LOOP_SKIP: bool>(
             .ok_or(SearchError::ArithmeticOverflow {
                 computation: "warm contextual lazy DFA destination",
             })?;
-        let cell = if hot.dense_missing == 0 {
-            let (cell, work) = warm_context_complete_dense_transition(
-                automaton,
-                haystack,
-                destination,
-                &lazy.context,
-                hot,
-                byte,
-                global_dependencies,
-            )?
-            .ok_or(SearchError::InternalInvariant {
-                detail: "complete contextual dense transition declined",
-            })?;
-            work_receipt.defer_completed(&meter, work)?;
-            cell
-        } else {
-            work_receipt.settle(&mut meter, position)?;
-            let work_before_step = meter.consumed;
-            meter.charge(1, position)?;
-            let Some(cell) = warm_context_transition_for_dependencies_metered(
-                automaton,
-                haystack,
-                destination,
-                lazy,
-                state,
-                hot,
-                byte,
-                global_dependencies,
-                &mut meter,
-            )? else {
-                return Ok(WarmContextSelectedEndProbe::Continue(
-                    WarmContextForwardContinuation {
-                        cache_identity: lazy.cache_identity,
-                        window,
-                        phase: WarmContextForwardPhase::Cell { state },
-                        position,
-                        work: work_before_step,
-                        pending_end,
-                        active_start,
-                        pending_start,
-                        engine_candidate,
-                        retained_start_mask,
-                        adaptive_probe,
-                        loop_probe,
-                        active_loop_slot,
-                    },
-                ));
-            };
-            cell
+        let cell = match dense_source {
+            WarmContextDenseSource::Complete(row) => {
+                let (cell, work) = warm_context_complete_dense_transition(
+                    automaton,
+                    haystack,
+                    destination,
+                    row,
+                    byte,
+                )?;
+                work_receipt.defer_completed(&meter, work)?;
+                cell
+            }
+            WarmContextDenseSource::Incomplete(hot) => {
+                work_receipt.settle(&mut meter, position)?;
+                let work_before_step = meter.consumed;
+                meter.charge(1, position)?;
+                let Some(cell) = warm_context_transition_for_dependencies_metered(
+                    automaton,
+                    haystack,
+                    destination,
+                    lazy,
+                    state,
+                    hot,
+                    byte,
+                    global_dependencies,
+                    &mut meter,
+                )? else {
+                    return Ok(WarmContextSelectedEndProbe::Continue(
+                        WarmContextForwardContinuation {
+                            cache_identity: lazy.cache_identity,
+                            window,
+                            phase: WarmContextForwardPhase::Cell { state },
+                            position,
+                            work: work_before_step,
+                            pending_end,
+                            active_start,
+                            pending_start,
+                            engine_candidate,
+                            retained_start_mask,
+                            adaptive_probe,
+                            loop_probe,
+                            active_loop_slot,
+                        },
+                    ));
+                };
+                cell
+            }
         };
         position = destination;
 
@@ -8255,6 +8432,7 @@ fn try_warm_context_span_loop<const LOOP_SKIP: bool>(
     let mut restartable = true;
     let mut active_start = Some(position);
     let mut entered = false;
+    let mut complete_dense_row_cache = CompleteContextDenseRowCache::default();
 
     loop {
         if pending_end.is_none()
@@ -8413,7 +8591,13 @@ fn try_warm_context_span_loop<const LOOP_SKIP: bool>(
             }
         }
 
-        let hot = lazy.context.hot_transition(state)?;
+        let dense_source = warm_context_hot_and_complete_dense_row(
+            &lazy.context,
+            state,
+            global_dependencies,
+            automaton.byte_classes().count(),
+            &mut complete_dense_row_cache,
+        )?;
         let byte = *haystack
             .get(position)
             .ok_or(SearchError::InternalInvariant {
@@ -8424,55 +8608,53 @@ fn try_warm_context_span_loop<const LOOP_SKIP: bool>(
             .ok_or(SearchError::ArithmeticOverflow {
                 computation: "warm contextual Span destination",
             })?;
-        let cell = if hot.dense_missing == 0 {
-            let (cell, work) = warm_context_complete_dense_transition(
-                automaton,
-                haystack,
-                destination,
-                &lazy.context,
-                hot,
-                byte,
-                global_dependencies,
-            )?
-            .ok_or(SearchError::InternalInvariant {
-                detail: "complete contextual dense transition declined",
-            })?;
-            work_receipt.defer_completed(&meter, work)?;
-            cell
-        } else {
-            work_receipt.settle(&mut meter, position)?;
-            let work_before_step = meter.consumed;
-            meter.charge(1, position)?;
-            let Some(cell) = warm_context_transition_for_dependencies_metered(
-                automaton,
-                haystack,
-                destination,
-                lazy,
-                state,
-                hot,
-                byte,
-                global_dependencies,
-                &mut meter,
-            )? else {
-                return Ok(WarmContextSpanProbe::ContinueForward(
-                    WarmContextForwardContinuation {
-                        cache_identity: lazy.cache_identity,
-                        window,
-                        phase: WarmContextForwardPhase::Cell { state },
-                        position,
-                        work: work_before_step,
-                        pending_end,
-                        active_start,
-                        pending_start,
-                        engine_candidate,
-                        retained_start_mask,
-                        adaptive_probe,
-                        loop_probe,
-                        active_loop_slot,
-                    },
-                ));
-            };
-            cell
+        let cell = match dense_source {
+            WarmContextDenseSource::Complete(row) => {
+                let (cell, work) = warm_context_complete_dense_transition(
+                    automaton,
+                    haystack,
+                    destination,
+                    row,
+                    byte,
+                )?;
+                work_receipt.defer_completed(&meter, work)?;
+                cell
+            }
+            WarmContextDenseSource::Incomplete(hot) => {
+                work_receipt.settle(&mut meter, position)?;
+                let work_before_step = meter.consumed;
+                meter.charge(1, position)?;
+                let Some(cell) = warm_context_transition_for_dependencies_metered(
+                    automaton,
+                    haystack,
+                    destination,
+                    lazy,
+                    state,
+                    hot,
+                    byte,
+                    global_dependencies,
+                    &mut meter,
+                )? else {
+                    return Ok(WarmContextSpanProbe::ContinueForward(
+                        WarmContextForwardContinuation {
+                            cache_identity: lazy.cache_identity,
+                            window,
+                            phase: WarmContextForwardPhase::Cell { state },
+                            position,
+                            work: work_before_step,
+                            pending_end,
+                            active_start,
+                            pending_start,
+                            engine_candidate,
+                            retained_start_mask,
+                            adaptive_probe,
+                            loop_probe,
+                            active_loop_slot,
+                        },
+                    ));
+                };
+                cell
+            }
         };
         position = destination;
 
@@ -22384,14 +22566,30 @@ fn enabled_assertion_mask_unmetered_for_dependencies(
 /// assertion bits. Keeping the mask explicit lets the canonical selective
 /// classifier touch only the families those bits name.
 #[inline]
+#[cfg(test)]
 fn project_complete_context_dependencies(
     dependencies: u32,
     line_terminator: u8,
     haystack: &[u8],
     position: usize,
 ) -> u32 {
-    enabled_assertion_mask_unmetered_with_classifier(
+    project_complete_context_dependencies_with_classifier(
         BoundaryContextClassifier::new(dependencies),
+        line_terminator,
+        haystack,
+        position,
+    )
+}
+
+#[inline]
+fn project_complete_context_dependencies_with_classifier(
+    classifier: BoundaryContextClassifier,
+    line_terminator: u8,
+    haystack: &[u8],
+    position: usize,
+) -> u32 {
+    enabled_assertion_mask_unmetered_with_classifier(
+        classifier,
         line_terminator,
         haystack,
         position,
@@ -27642,8 +27840,17 @@ mod tests {
 
         store.hot[0].symbol = u32::MAX;
         store.slots.fill(ContextTransitionSlot::EMPTY);
+        let row = store
+            .authenticate_complete_dense_row_prevalidated(store.hot[0], dependencies, 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.realizable_variants, 0b0110);
         for (variant, assertions) in [(1_usize, BOUNDARY), (2, NEGATED)] {
             for class in 0_u8..2 {
+                assert_eq!(
+                    row.lookup_projected(class, assertions).unwrap().0,
+                    100 + u32::try_from(variant * 2 + usize::from(class)).unwrap(),
+                );
                 assert_eq!(
                     store
                         .lookup_existing_prevalidated(
@@ -27798,6 +28005,11 @@ mod tests {
         assert_eq!(store.dense_owner_count, u8::MAX);
         assert_eq!(store.hot[254].dense_owner, 254);
         assert_eq!(store.hot[254].dense_missing, 0);
+        let terminal_row = store
+            .authenticate_complete_dense_row_prevalidated(store.hot[254], 0, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminal_row.lookup_projected(0, 0).unwrap().0, 255);
 
         let hot_before = store.hot[255];
         let dense_before = store.dense.clone();
@@ -28534,6 +28746,14 @@ mod tests {
             assert!(store.try_claim_dense_owner(0, &mut claim).unwrap());
             let hot = store.hot[0];
             assert!(store.dense_row_complete_for_hot(hot).unwrap());
+            let row = store
+                .authenticate_complete_dense_row_prevalidated(
+                    hot,
+                    FIRST | SECOND | IRRELEVANT,
+                    3,
+                )
+                .unwrap()
+                .unwrap();
 
             for bit_values in 0_u32..4 {
                 let assertions = ((u32::from(bit_values & 1 != 0) * FIRST)
@@ -28564,6 +28784,12 @@ mod tests {
                     assert_eq!(actual, expected);
                     assert_eq!(actual, 100 + u32::try_from(variant * 3 + usize::from(class)).unwrap());
                     assert_eq!(work, metered.consumed);
+                    let (kernel, kernel_work) = row.lookup_projected(class, assertions).unwrap();
+                    assert_eq!(kernel, expected);
+                    assert_eq!(
+                        kernel_work,
+                        1 + u64::from(dependencies.count_ones()) + metered.consumed,
+                    );
                 }
             }
 
@@ -28620,8 +28846,143 @@ mod tests {
                         detail: "complete contextual dense row missed a normalized warm symbol"
                     })
                 ));
+                let forged_row = store
+                    .authenticate_complete_dense_row_prevalidated(
+                        hot,
+                        FIRST | SECOND | IRRELEVANT,
+                        3,
+                    )
+                    .unwrap()
+                    .unwrap();
+                assert!(matches!(
+                    forged_row.lookup_projected(0, 0),
+                    Err(SearchError::InternalInvariant {
+                        detail: "complete contextual dense row missed a normalized warm symbol"
+                    })
+                ));
             }
         }
+    }
+
+    #[test]
+    fn contextual_complete_dense_descriptor_rejects_forged_metadata() {
+        let slots = super::contextual_transition_slots(1).unwrap();
+        let mut store =
+            super::ContextTransitionStore::new(slots, 1, 1, usize::MAX).unwrap();
+        publish_context_record(
+            &mut store,
+            0,
+            super::contextual_class_symbol(0, 0),
+            17,
+        );
+        store.hot[0].dependency_mask = 0;
+        let mut claim = WorkMeter::new(u64::MAX, 0);
+        assert!(store.try_claim_dense_owner(0, &mut claim).unwrap());
+        let hot = store.hot[0];
+        assert!(store
+            .authenticate_complete_dense_row_prevalidated(hot, 0, 1)
+            .unwrap()
+            .is_some());
+
+        let mut no_owner = hot;
+        no_owner.dense_owner = super::CONTEXT_DENSE_NO_OWNER;
+        assert!(matches!(
+            store.authenticate_complete_dense_row_prevalidated(no_owner, 0, 1),
+            Err(SearchError::InternalInvariant {
+                detail: "contextual dense missing-cell count has no owner"
+            })
+        ));
+
+        let mut unallocated_owner = hot;
+        unallocated_owner.dense_owner = 1;
+        assert!(matches!(
+            store.authenticate_complete_dense_row_prevalidated(unallocated_owner, 0, 1),
+            Err(SearchError::InternalInvariant {
+                detail: "contextual dense owner has invalid dependency metadata"
+            })
+        ));
+
+        let mut excessive_dependencies = hot;
+        excessive_dependencies.dependency_mask = 1 << 2;
+        assert!(matches!(
+            store.authenticate_complete_dense_row_prevalidated(excessive_dependencies, 0, 1),
+            Err(SearchError::InternalInvariant {
+                detail: "complete contextual dense row exceeds global dependencies"
+            })
+        ));
+        assert!(matches!(
+            store.authenticate_complete_dense_row_prevalidated(hot, 0, 2),
+            Err(SearchError::InternalInvariant {
+                detail: "complete contextual dense row disagrees with the byte-class domain"
+            })
+        ));
+
+        let mut invalid_work = hot;
+        invalid_work.lookup_work = 0;
+        assert!(matches!(
+            store.authenticate_complete_dense_row_prevalidated(invalid_work, 0, 1),
+            Err(SearchError::InternalInvariant {
+                detail: "complete contextual hot lookup has invalid work"
+            })
+        ));
+    }
+
+    #[test]
+    fn contextual_complete_dense_cache_reuses_self_loop_source_and_survives_an_incomplete_detour() {
+        let slots = super::contextual_transition_slots(2).unwrap();
+        let mut store =
+            super::ContextTransitionStore::new(slots, 2, 1, usize::MAX).unwrap();
+        publish_context_record(
+            &mut store,
+            0,
+            super::contextual_class_symbol(0, 0),
+            1,
+        );
+        store.hot[0].dependency_mask = 0;
+        let mut claim = WorkMeter::new(u64::MAX, 0);
+        assert!(store.try_claim_dense_owner(0, &mut claim).unwrap());
+
+        let mut cache = super::CompleteContextDenseRowCache::default();
+        let first = match super::warm_context_hot_and_complete_dense_row(
+            &store, 0, 0, 1, &mut cache,
+        )
+        .unwrap()
+        {
+            super::WarmContextDenseSource::Complete(row) => row,
+            super::WarmContextDenseSource::Incomplete(_) => panic!("complete source declined"),
+        };
+        assert_eq!(cache.authentication_attempts, 1);
+        assert_eq!(cache.hits, 0);
+
+        let repeated = match super::warm_context_hot_and_complete_dense_row(
+            &store, 0, 0, 1, &mut cache,
+        )
+        .unwrap()
+        {
+            super::WarmContextDenseSource::Complete(row) => row,
+            super::WarmContextDenseSource::Incomplete(_) => panic!("cached source declined"),
+        };
+        assert_eq!(repeated, first);
+        assert_eq!(cache.authentication_attempts, 1);
+        assert_eq!(cache.hits, 1);
+
+        assert!(matches!(
+            super::warm_context_hot_and_complete_dense_row(&store, 1, 0, 1, &mut cache)
+                .unwrap(),
+            super::WarmContextDenseSource::Incomplete(_)
+        ));
+        assert_eq!(cache.authentication_attempts, 2);
+        let resumed = match super::warm_context_hot_and_complete_dense_row(
+            &store, 0, 0, 1, &mut cache,
+        )
+        .unwrap()
+        {
+            super::WarmContextDenseSource::Complete(row) => row,
+            super::WarmContextDenseSource::Incomplete(_) => panic!("resumed source declined"),
+        };
+        assert_eq!(resumed, first);
+        assert_eq!(cache.authentication_attempts, 2);
+        assert_eq!(cache.hits, 2);
     }
 
     #[test]
@@ -40900,26 +41261,118 @@ mod tests {
     }
 
     #[test]
+    fn complete_dense_descriptor_matches_checked_reader_across_all_assertion_families() {
+        let dependency_masks = complete_context_dependency_masks();
+        let global_dependencies = (1_u32 << super::ASSERTION_KIND_COUNT) - 1;
+        let line_terminator = b';';
+        let automaton = every_assertion().with_line_terminator(line_terminator);
+        assert_eq!(automaton.byte_classes().count(), 1);
+        let haystacks = [
+            vec![0],
+            vec![b'\r', b'\n'],
+            b"a_!".to_vec(),
+            "é_β!".as_bytes().to_vec(),
+            vec![0xf0, 0x28, 0x8c, 0xbc],
+            vec![0x80, b'a', 0xc3],
+        ];
+
+        for dependencies in dependency_masks {
+            let slots = super::contextual_transition_slots(4).unwrap();
+            let mut store =
+                super::ContextTransitionStore::new(slots, 1, 1, usize::MAX).unwrap();
+            let realizable = super::contextual_dense_realizable_variants(dependencies).unwrap();
+            for variant in 0..super::CONTEXT_DENSE_VARIANT_LIMIT {
+                if realizable & (1_u8 << variant) == 0 {
+                    continue;
+                }
+                publish_context_record(
+                    &mut store,
+                    0,
+                    super::contextual_class_symbol(
+                        0,
+                        dependency_variant(dependencies, variant),
+                    ),
+                    100 + u32::try_from(variant).unwrap(),
+                );
+            }
+            store.hot[0].dependency_mask = dependencies;
+            let mut claim = WorkMeter::new(u64::MAX, 0);
+            assert!(store.try_claim_dense_owner(0, &mut claim).unwrap());
+            let hot = store.hot[0];
+            let row = store
+                .authenticate_complete_dense_row_prevalidated(
+                    hot,
+                    global_dependencies,
+                    1,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.realizable_variants, realizable);
+
+            for haystack in &haystacks {
+                for position in 0..=haystack.len() {
+                    let assertions = super::project_complete_context_dependencies_with_classifier(
+                        row.classifier,
+                        line_terminator,
+                        haystack,
+                        position,
+                    );
+                    let variant = super::contextual_dense_variant(assertions, dependencies).unwrap();
+                    assert_ne!(realizable & (1_u8 << variant), 0);
+                    let symbol = super::contextual_class_symbol(0, assertions);
+                    let (checked, checked_work) = store
+                        .lookup_complete_dense_with_hot_prevalidated(
+                            symbol,
+                            hot,
+                            global_dependencies,
+                        )
+                        .unwrap()
+                        .unwrap();
+                    let (kernel, kernel_work) = row.lookup_projected(0, assertions).unwrap();
+                    assert_eq!(kernel, checked);
+                    assert_eq!(kernel, 100 + u32::try_from(variant).unwrap());
+                    assert_eq!(
+                        kernel_work,
+                        1 + u64::from(dependencies.count_ones()) + checked_work,
+                    );
+                    assert_eq!(
+                        super::warm_context_complete_dense_transition(
+                            &automaton,
+                            haystack,
+                            position,
+                            row,
+                            0,
+                        )
+                        .unwrap(),
+                        (kernel, kernel_work),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn complete_context_projection_rejects_wide_forged_dependencies_before_lookup() {
         let automaton = asserted_line_a();
-        let context = super::ContextTransitionStore::disabled();
+        let slots = super::contextual_transition_slots(1).unwrap();
+        let mut context =
+            super::ContextTransitionStore::new(slots, 1, 1, usize::MAX).unwrap();
         let dependencies = (1 << 0) | (1 << 2) | (1 << 6);
         let mut forged = super::ContextHotTransition::EMPTY;
         forged.dependency_mask = dependencies;
         forged.dense_missing = 0;
+        forged.dense_owner = 0;
+        forged.lookup_work = 2;
+        context.dense_owner_count = 1;
 
         assert!(matches!(
-            super::warm_context_complete_dense_transition(
-                &automaton,
-                b"x",
-                0,
-                &context,
+            context.authenticate_complete_dense_row_prevalidated(
                 forged,
-                b'x',
                 dependencies,
+                automaton.byte_classes().count(),
             ),
             Err(SearchError::InternalInvariant {
-                detail: "complete contextual dense row has invalid dependencies"
+                detail: "contextual dense owner has invalid dependency metadata"
             })
         ));
     }
