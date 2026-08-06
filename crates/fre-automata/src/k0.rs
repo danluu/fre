@@ -2899,6 +2899,34 @@ impl LazyLoopProbe {
     }
 }
 
+/// Select the source-only admission threshold for a retained contextual loop.
+///
+/// Plan absence, invocation-local backoff, and the remaining source extent are
+/// all independent of the live work meter. Keeping those negative decisions in
+/// one pure gate lets a warm dense-row receipt span them without settlement.
+#[inline]
+fn warm_context_loop_scan_threshold(
+    leave_final_member: Option<bool>,
+    loop_probe: LazyLoopProbe,
+    position: usize,
+    remaining_source: usize,
+) -> Result<Option<usize>, SearchError> {
+    let Some(leave_final_member) = leave_final_member else {
+        return Ok(None);
+    };
+    let scan_threshold = if leave_final_member {
+        LAZY_LOOP_SKIP_MIN_BYTES
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "warm contextual loop scan threshold",
+            })?
+    } else {
+        LAZY_LOOP_SKIP_MIN_BYTES
+    };
+    Ok((loop_probe.is_ready(position) && remaining_source >= scan_threshold)
+        .then_some(scan_threshold))
+}
+
 impl LazyStartAction {
     const fn cell_bits(self) -> u32 {
         match self {
@@ -7196,7 +7224,6 @@ fn try_warm_context_exists_loop<const LOOP_SKIP: bool>(
         }
 
         if LOOP_SKIP {
-            work_receipt.settle(&mut meter, position)?;
             let selected = lazy
                 .context_loop_skip_plans
                 .find_with_hint(state, active_loop_slot);
@@ -7205,21 +7232,17 @@ fn try_warm_context_exists_loop<const LOOP_SKIP: bool>(
                 loop_probe.left_plan_state();
                 active_loop_slot = selected_slot;
             }
-            if let Some((_, plan)) = selected {
-                let scan_threshold = if plan.leave_final_member {
-                    LAZY_LOOP_SKIP_MIN_BYTES.checked_add(1).ok_or(
-                        SearchError::ArithmeticOverflow {
-                            computation: "warm contextual loop scan threshold",
-                        },
-                    )?
-                } else {
-                    LAZY_LOOP_SKIP_MIN_BYTES
-                };
-                if loop_probe.is_ready(position)
-                    && window.end().saturating_sub(position) >= scan_threshold
-                    && meter.remaining()
-                        >= u64::try_from(scan_threshold)
-                            .expect("warm contextual loop threshold fits u64")
+            let scan_threshold = warm_context_loop_scan_threshold(
+                selected.map(|(_, plan)| plan.leave_final_member),
+                loop_probe,
+                position,
+                window.end().saturating_sub(position),
+            )?;
+            if let (Some((_, plan)), Some(scan_threshold)) = (selected, scan_threshold) {
+                work_receipt.settle(&mut meter, position)?;
+                if meter.remaining()
+                    >= u64::try_from(scan_threshold)
+                        .expect("warm contextual loop threshold fits u64")
                 {
                     let available = usize::try_from(meter.remaining())
                         .unwrap_or(usize::MAX)
@@ -7589,7 +7612,6 @@ fn try_warm_context_selected_end_loop<const LOOP_SKIP: bool>(
         }
 
         if LOOP_SKIP {
-            work_receipt.settle(&mut meter, position)?;
             let selected = lazy
                 .context_loop_skip_plans
                 .find_with_hint(state, active_loop_slot);
@@ -7598,21 +7620,17 @@ fn try_warm_context_selected_end_loop<const LOOP_SKIP: bool>(
                 loop_probe.left_plan_state();
                 active_loop_slot = selected_slot;
             }
-            if let Some((_, plan)) = selected {
-                let scan_threshold = if plan.leave_final_member {
-                    LAZY_LOOP_SKIP_MIN_BYTES.checked_add(1).ok_or(
-                        SearchError::ArithmeticOverflow {
-                            computation: "warm contextual loop scan threshold",
-                        },
-                    )?
-                } else {
-                    LAZY_LOOP_SKIP_MIN_BYTES
-                };
-                if loop_probe.is_ready(position)
-                    && window.end().saturating_sub(position) >= scan_threshold
-                    && meter.remaining()
-                        >= u64::try_from(scan_threshold)
-                            .expect("warm contextual loop threshold fits u64")
+            let scan_threshold = warm_context_loop_scan_threshold(
+                selected.map(|(_, plan)| plan.leave_final_member),
+                loop_probe,
+                position,
+                window.end().saturating_sub(position),
+            )?;
+            if let (Some((_, plan)), Some(scan_threshold)) = (selected, scan_threshold) {
+                work_receipt.settle(&mut meter, position)?;
+                if meter.remaining()
+                    >= u64::try_from(scan_threshold)
+                        .expect("warm contextual loop threshold fits u64")
                 {
                     let available = usize::try_from(meter.remaining())
                         .unwrap_or(usize::MAX)
@@ -8330,7 +8348,6 @@ fn try_warm_context_span_loop<const LOOP_SKIP: bool>(
         }
 
         if LOOP_SKIP {
-            work_receipt.settle(&mut meter, position)?;
             let selected = lazy
                 .context_loop_skip_plans
                 .find_with_hint(state, active_loop_slot);
@@ -8339,21 +8356,17 @@ fn try_warm_context_span_loop<const LOOP_SKIP: bool>(
                 loop_probe.left_plan_state();
                 active_loop_slot = selected_slot;
             }
-            if let Some((_, plan)) = selected {
-                let scan_threshold = if plan.leave_final_member {
-                    LAZY_LOOP_SKIP_MIN_BYTES.checked_add(1).ok_or(
-                        SearchError::ArithmeticOverflow {
-                            computation: "warm contextual Span loop scan threshold",
-                        },
-                    )?
-                } else {
-                    LAZY_LOOP_SKIP_MIN_BYTES
-                };
-                if loop_probe.is_ready(position)
-                    && window.end().saturating_sub(position) >= scan_threshold
-                    && meter.remaining()
-                        >= u64::try_from(scan_threshold)
-                            .expect("warm contextual Span loop threshold fits u64")
+            let scan_threshold = warm_context_loop_scan_threshold(
+                selected.map(|(_, plan)| plan.leave_final_member),
+                loop_probe,
+                position,
+                window.end().saturating_sub(position),
+            )?;
+            if let (Some((_, plan)), Some(scan_threshold)) = (selected, scan_threshold) {
+                work_receipt.settle(&mut meter, position)?;
+                if meter.remaining()
+                    >= u64::try_from(scan_threshold)
+                        .expect("warm contextual Span loop threshold fits u64")
                 {
                     let available = usize::try_from(meter.remaining())
                         .unwrap_or(usize::MAX)
@@ -28667,6 +28680,97 @@ mod tests {
     }
 
     #[test]
+    fn contextual_loop_structural_gates_leave_completed_dense_work_deferred() {
+        let retained_state = 7;
+        let absent_state = 8;
+        let mut plans = super::ContextLazyLoopSkipPlans::empty();
+        plans.entries[0] = Some(super::ContextLazyLoopSkipPlan {
+            state: retained_state,
+            scanner: super::LazyLoopScanner::All,
+            start_action: super::LazyStartAction::Propagate,
+            leave_final_member: false,
+        });
+        super::byte_bitmap_insert(
+            &mut plans.state_members,
+            u8::try_from(retained_state).unwrap(),
+        );
+        assert!(!plans.is_empty());
+
+        let mut meter = WorkMeter::new(u64::MAX, 11);
+        let mut receipt = super::WarmContextWorkReceipt::new(&meter).unwrap();
+        for (position, work) in [(20, 2), (21, 3)] {
+            receipt.defer_completed(&meter, work).unwrap();
+            let selected = plans.find_with_hint(absent_state, Some(0));
+            assert!(selected.is_none());
+            assert_eq!(
+                super::warm_context_loop_scan_threshold(
+                    selected.map(|(_, plan)| plan.leave_final_member),
+                    super::LazyLoopProbe::default(),
+                    position,
+                    super::LAZY_LOOP_SKIP_MIN_BYTES * 2,
+                )
+                .unwrap(),
+                None,
+            );
+            assert_eq!(meter.consumed, 11);
+        }
+        assert_eq!(receipt.base, 11);
+        assert_eq!(receipt.accounted, 16);
+
+        let selected = plans.find_with_hint(retained_state, Some(0));
+        receipt.defer_completed(&meter, 5).unwrap();
+        assert_eq!(
+            super::warm_context_loop_scan_threshold(
+                selected.map(|(_, plan)| plan.leave_final_member),
+                super::LazyLoopProbe { retry_at: Some(31) },
+                30,
+                super::LAZY_LOOP_SKIP_MIN_BYTES * 2,
+            )
+            .unwrap(),
+            None,
+        );
+        assert_eq!(meter.consumed, 11);
+
+        receipt.defer_completed(&meter, 7).unwrap();
+        assert_eq!(
+            super::warm_context_loop_scan_threshold(
+                selected.map(|(_, plan)| plan.leave_final_member),
+                super::LazyLoopProbe::default(),
+                31,
+                super::LAZY_LOOP_SKIP_MIN_BYTES - 1,
+            )
+            .unwrap(),
+            None,
+        );
+        assert_eq!(meter.consumed, 11);
+        assert_eq!(receipt.accounted, 28);
+
+        let threshold = super::warm_context_loop_scan_threshold(
+            selected.map(|(_, plan)| plan.leave_final_member),
+            super::LazyLoopProbe::default(),
+            32,
+            super::LAZY_LOOP_SKIP_MIN_BYTES,
+        )
+        .unwrap();
+        assert_eq!(threshold, Some(super::LAZY_LOOP_SKIP_MIN_BYTES));
+        receipt.settle(&mut meter, 32).unwrap();
+        assert_eq!(meter.consumed, 28);
+        assert_eq!(receipt.base, 28);
+        assert_eq!(receipt.accounted, 28);
+
+        assert_eq!(
+            super::warm_context_loop_scan_threshold(
+                Some(true),
+                super::LazyLoopProbe::default(),
+                33,
+                super::LAZY_LOOP_SKIP_MIN_BYTES + 1,
+            )
+            .unwrap(),
+            Some(super::LAZY_LOOP_SKIP_MIN_BYTES + 1),
+        );
+    }
+
+    #[test]
     fn ordered_partial_permutation_caps_match_exhaustive_state_identities() {
         fn enumerate_nonempty_orders(used: &mut [bool], length: usize, lengths: &mut Vec<usize>) {
             for item in 0..used.len() {
@@ -38808,6 +38912,58 @@ mod tests {
             .context_loop_skip_plans
             .find_with_hint(b_plan.1, Some(a_plan.0))
             .is_some_and(|(slot, _)| slot == b_plan.0));
+
+        let proof = plan.start_filter_proof.get().unwrap();
+        assert_eq!(
+            super::try_warm_context_exists_loop::<true>(
+                &plan,
+                &haystack,
+                window,
+                &workspace.lazy,
+                proof,
+            ),
+            super::try_warm_context_exists_loop::<false>(
+                &plan,
+                &haystack,
+                window,
+                &workspace.lazy,
+                proof,
+            ),
+        );
+        assert_eq!(
+            super::try_warm_context_selected_end_loop::<true>(
+                &plan,
+                &haystack,
+                window,
+                &workspace.lazy,
+                proof,
+            ),
+            super::try_warm_context_selected_end_loop::<false>(
+                &plan,
+                &haystack,
+                window,
+                &workspace.lazy,
+                proof,
+            ),
+        );
+        assert_eq!(
+            super::try_warm_context_span_loop::<true>(
+                &plan,
+                &haystack,
+                window,
+                &workspace.lazy,
+                &workspace.reverse,
+                proof,
+            ),
+            super::try_warm_context_span_loop::<false>(
+                &plan,
+                &haystack,
+                window,
+                &workspace.lazy,
+                &workspace.reverse,
+                proof,
+            ),
+        );
 
         assert!(plan
             .prepare::<Exists>()
