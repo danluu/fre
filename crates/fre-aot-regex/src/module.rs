@@ -400,6 +400,42 @@ struct NativeDynamicRowsEmission {
     scanner: Option<NativeScannerEmission>,
 }
 
+/// Concrete `AArch64` lowering selected for one graph-certified dynamic root.
+///
+/// Table offsets are relative to the byte immediately following the embedded
+/// 32-byte artifact identity. Keeping that base distinct lets preflight retain
+/// the identity symbol unchanged while optional scanner constants are appended
+/// transactionally after it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "the booleans receipt independent target routes and lowering resources"
+)]
+struct Aarch64DynamicRootPlan {
+    filter: NativeStartFilter,
+    sve_kind: Option<Aarch64SveFilterKind>,
+    use_asimd: bool,
+    use_asimd_batch: bool,
+    use_exact_asimd_lane: bool,
+    use_runtime_vl_dispatch: bool,
+    lane_index_offset: Option<u32>,
+    scanner: NativeScannerEmission,
+}
+
+impl Aarch64DynamicRootPlan {
+    const fn uses_sve(self) -> bool {
+        self.sve_kind.is_some()
+    }
+
+    const fn has_tables(self) -> bool {
+        self.lane_index_offset.is_some()
+            || matches!(
+                self.sve_kind,
+                Some(Aarch64SveFilterKind::Sve2 { .. })
+            )
+    }
+}
+
 /// Validation contract at one emitted native-DFA entry.
 ///
 /// Public entries validate every raw ABI argument and initialize their public
@@ -1243,6 +1279,10 @@ fn lower_runtime_adapter(
 /// root byte class and otherwise executes only the authenticated rows already
 /// owned by the runtime's ordinary K0 workspace. No regex-specific row table
 /// or transition is embedded in this entry.
+#[allow(
+    clippy::too_many_lines,
+    reason = "identity tables, backend lowering, and semantic receipt validation are one transaction"
+)]
 fn lower_native_dynamic_rows_prepared(
     mut program_bytes: Vec<u8>,
     view: NativeDynamicRowsProgramView,
@@ -1268,6 +1308,20 @@ fn lower_native_dynamic_rows_prepared(
         .map(plan_dynamic_root_filter)
         .transpose()?
         .flatten();
+    let aarch64_root_plan = if target.architecture == Architecture::Aarch64 {
+        root_filter
+            .map(|filter| {
+                install_aarch64_dynamic_root_plan(
+                    &mut program_bytes,
+                    identity_offset,
+                    filter,
+                    target,
+                )
+            })
+            .transpose()?
+    } else {
+        None
+    };
 
     let (mut code, mut relocations) = match target.architecture {
         Architecture::X86_64 => lower_x86_64_runtime_adapter()?,
@@ -1292,26 +1346,23 @@ fn lower_native_dynamic_rows_prepared(
             }
         }
     }
-    // The exact-position requirement is target-neutral. This bounded slice
-    // publishes the existing x86 range-backed SIMD scanner; AArch64 retains
-    // its established scalar dynamic-row entry until its ASIMD/SVE scanner
-    // control flow can be shared without changing the prepared ABI.
+    // The exact-position requirement is target-neutral. Each backend returns
+    // a semantic receipt for the scanner it actually emitted, including a
+    // scalar AArch64 route when the requested vector capabilities cannot
+    // represent this graph column.
     let prepared = match target.architecture {
         Architecture::X86_64 => {
             lower_x86_64_dynamic_rows_prepared(root_filter, target.features)?
         }
-        Architecture::Aarch64 => {
-            let (code, relocations) = lower_aarch64_dynamic_rows_prepared()?;
-            NativeDynamicRowsEmission {
-                code,
-                relocations,
-                scanner: None,
-            }
-        }
+        Architecture::Aarch64 => lower_aarch64_dynamic_rows_prepared(aarch64_root_plan)?,
     };
-    if target.architecture == Architecture::X86_64
-        && let (Some(requirement), Some(_)) = (view.root_requirement, root_filter)
-        && !exact_position_scanner_is_preserved(
+    if root_filter.is_some() != prepared.scanner.is_some() {
+        return Err(ObjectError::InvalidModule(
+            "dynamic root scanner receipt does not match its graph plan",
+        ));
+    }
+    if let (Some(requirement), Some(_)) = (view.root_requirement, root_filter)
+        && !exact_position_scanner_semantics_are_preserved(
             prepared.scanner,
             requirement.scan_offset,
             requirement.membership,
@@ -2968,14 +3019,15 @@ fn retained_prefix_scanner_is_preserved(
     emission: Option<NativeScannerEmission>,
     requirement: NativeRetainedPrefixRequirement,
 ) -> bool {
-    exact_position_scanner_is_preserved(
-        emission,
-        requirement.scan_offset,
-        requirement.membership,
-    )
+    emission.is_some_and(|emission| emission.vectorized)
+        && exact_position_scanner_semantics_are_preserved(
+            emission,
+            requirement.scan_offset,
+            requirement.membership,
+        )
 }
 
-fn exact_position_scanner_is_preserved(
+fn exact_position_scanner_semantics_are_preserved(
     emission: Option<NativeScannerEmission>,
     scan_offset: u8,
     membership: [u64; 4],
@@ -2983,9 +3035,7 @@ fn exact_position_scanner_is_preserved(
     let Some(emission) = emission else {
         return false;
     };
-    emission.vectorized
-        && emission.scan_offset == scan_offset
-        && emission.membership == membership
+    emission.scan_offset == scan_offset && emission.membership == membership
 }
 
 fn plan_dynamic_root_filter(
@@ -3011,6 +3061,216 @@ fn plan_dynamic_root_filter(
         ));
     }
     Ok(Some(filter))
+}
+
+fn aarch64_dynamic_root_plan_shape(
+    filter: NativeStartFilter,
+    target: Target,
+    permit_sve2_match: bool,
+    permit_exact_asimd_lane: bool,
+) -> Result<(Aarch64DynamicRootPlan, usize), ObjectError> {
+    if target.architecture != Architecture::Aarch64
+        || filter.ranges().is_empty()
+        || !filter.from_anchored_prefix
+    {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 dynamic root scanner has an invalid graph filter",
+        ));
+    }
+    let use_sve2_match = permit_sve2_match
+        && target.operating_system == OperatingSystem::Linux
+        && target.features.has(CpuFeature::Aarch64Sve2)
+        && filter.is_exact();
+    let base_sve_supported = aarch64_base_sve_filter_supported(filter);
+    let primary_isa = aarch64_primary_scanner_isa(
+        target.operating_system,
+        target.features,
+        use_sve2_match || base_sve_supported,
+    );
+    let use_sve = aarch64_primary_scanner_uses_sve(primary_isa);
+    let use_runtime_vl_dispatch =
+        aarch64_primary_scanner_uses_runtime_vl_dispatch(primary_isa);
+    let use_asimd = matches!(
+        primary_isa,
+        Aarch64PrimaryScannerIsa::Asimd | Aarch64PrimaryScannerIsa::SveWithAsimdVl16
+    );
+    let use_exact_asimd_lane = use_asimd
+        && permit_exact_asimd_lane
+        && aarch64_use_exact_first_lane(target.operating_system);
+
+    let mut table_bytes = 0_usize;
+    let lane_index_offset = if use_exact_asimd_lane {
+        table_bytes = AARCH64_FIRST_LANE_INDEX.len();
+        Some(0)
+    } else {
+        None
+    };
+    let sve_kind = if use_sve && use_sve2_match {
+        let aligned = table_bytes
+            .checked_add(15)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "dynamic SVE2 match-table alignment",
+            ))?
+            & !15;
+        let match_table_offset = u32::try_from(aligned).map_err(|_| {
+            ObjectError::ArithmeticOverflow("dynamic SVE2 match-table offset")
+        })?;
+        table_bytes = aligned
+            .checked_add(16)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "dynamic SVE2 match-table bytes",
+            ))?;
+        Some(Aarch64SveFilterKind::Sve2 { match_table_offset })
+    } else if use_sve {
+        if !base_sve_supported {
+            return Err(ObjectError::InvalidModule(
+                "AArch64 dynamic root selected an unrepresentable base-SVE filter",
+            ));
+        }
+        Some(Aarch64SveFilterKind::Sve)
+    } else {
+        None
+    };
+    let sve_plan = sve_kind.map(|kind| Aarch64SveFilterPlan {
+        kinds: [kind; MAX_VECTOR_FILTER_COLUMNS],
+        column_count: 1,
+    });
+    let scanner = aarch64_range_scanner_emission(filter, use_sve, use_asimd, sve_plan)?;
+    Ok((
+        Aarch64DynamicRootPlan {
+            filter,
+            sve_kind,
+            use_asimd,
+            use_asimd_batch: use_asimd && use_aarch64_filter_batch(filter),
+            use_exact_asimd_lane,
+            use_runtime_vl_dispatch,
+            lane_index_offset,
+            scanner,
+        },
+        table_bytes,
+    ))
+}
+
+fn install_aarch64_dynamic_root_plan(
+    data: &mut Vec<u8>,
+    identity_offset: usize,
+    filter: NativeStartFilter,
+    target: Target,
+) -> Result<Aarch64DynamicRootPlan, ObjectError> {
+    let maximum_table_bytes = usize::try_from(u32::MAX)
+        .map_err(|_| ObjectError::ArithmeticOverflow("dynamic scanner table address limit"))?;
+    install_aarch64_dynamic_root_plan_with_limit(
+        data,
+        identity_offset,
+        filter,
+        target,
+        maximum_table_bytes,
+    )
+}
+
+/// Install optional `AArch64` dynamic-root constants as one transaction.
+///
+/// SVE2 MATCH is the preferred Linux lowering for exact singleton-range sets.
+/// If its repeated table cannot be reserved, the complete plan is recomputed
+/// for base SVE before any bytes are appended. The lane-index table is also
+/// optional: allocation failure preserves ASIMD block rejection and lets its
+/// rare hit refine through the common scalar scanner.
+fn install_aarch64_dynamic_root_plan_with_limit(
+    data: &mut Vec<u8>,
+    identity_offset: usize,
+    filter: NativeStartFilter,
+    target: Target,
+    maximum_table_bytes: usize,
+) -> Result<Aarch64DynamicRootPlan, ObjectError> {
+    let table_base = identity_offset
+        .checked_add(32)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "dynamic scanner table base",
+        ))?;
+    if data.len() != table_base {
+        return Err(ObjectError::InvalidModule(
+            "dynamic scanner tables do not follow the artifact identity",
+        ));
+    }
+
+    let mut permit_sve2_match = true;
+    let mut permit_exact_asimd_lane = true;
+    let (plan, table_bytes) = loop {
+        let (plan, table_bytes) = aarch64_dynamic_root_plan_shape(
+            filter,
+            target,
+            permit_sve2_match,
+            permit_exact_asimd_lane,
+        )?;
+        let reservation_succeeded = table_bytes <= maximum_table_bytes
+            && data.try_reserve_exact(table_bytes).is_ok();
+        if reservation_succeeded {
+            break (plan, table_bytes);
+        }
+        if matches!(plan.sve_kind, Some(Aarch64SveFilterKind::Sve2 { .. })) {
+            permit_sve2_match = false;
+            continue;
+        }
+        if plan.use_exact_asimd_lane {
+            permit_exact_asimd_lane = false;
+            continue;
+        }
+        if table_bytes != 0 {
+            return Err(ObjectError::InvalidModule(
+                "AArch64 dynamic scanner retained an unremovable table",
+            ));
+        }
+        break (plan, table_bytes);
+    };
+
+    if let Some(offset) = plan.lane_index_offset {
+        let offset = usize::try_from(offset)
+            .map_err(|_| ObjectError::ArithmeticOverflow("dynamic lane-index offset"))?;
+        if offset != 0 || data.len() != table_base {
+            return Err(ObjectError::InvalidModule(
+                "dynamic lane-index table lost relative offset zero",
+            ));
+        }
+        data.extend_from_slice(&AARCH64_FIRST_LANE_INDEX);
+    }
+    if let Some(Aarch64SveFilterKind::Sve2 { match_table_offset }) = plan.sve_kind {
+        let absolute = table_base
+            .checked_add(usize::try_from(match_table_offset).map_err(|_| {
+                ObjectError::ArithmeticOverflow("dynamic SVE2 match-table offset")
+            })?)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "dynamic SVE2 match-table address",
+            ))?;
+        data.resize(absolute, 0);
+        for index in 0..16_usize {
+            let range_index = index.checked_rem(filter.ranges().len()).ok_or(
+                ObjectError::InvalidModule("dynamic SVE2 match table has no exact members"),
+            )?;
+            let range = filter
+                .ranges()
+                .get(range_index)
+                .ok_or(ObjectError::InvalidModule(
+                    "dynamic SVE2 match table has no exact members",
+                ))?;
+            if range.start != range.end {
+                return Err(ObjectError::InvalidModule(
+                    "dynamic SVE2 match table contains a range",
+                ));
+            }
+            data.push(range.start);
+        }
+    }
+    let expected_extent = table_base
+        .checked_add(table_bytes)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "dynamic scanner table extent",
+        ))?;
+    if data.len() != expected_extent {
+        return Err(ObjectError::InvalidModule(
+            "dynamic scanner table extent changed during installation",
+        ));
+    }
+    Ok(plan)
 }
 
 fn retained_suffix_scanner_is_preserved(
@@ -16676,11 +16936,37 @@ fn lower_aarch64_runtime_adapter() -> Result<(Vec<u8>, Vec<ModuleRelocation>), O
     clippy::too_many_lines,
     reason = "the authenticated preflight, scanner, local exits, and whole-search deopt form one ABI transaction"
 )]
-fn lower_aarch64_dynamic_rows_prepared() -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
+fn lower_aarch64_dynamic_rows_prepared(
+    root_plan: Option<Aarch64DynamicRootPlan>,
+) -> Result<NativeDynamicRowsEmission, ObjectError> {
     const FRAME_BYTES: u16 = 96;
     let mut assembler = Aarch64Assembler::new();
     let preflight_enter = assembler.label()?;
     let scan = assembler.label()?;
+    let table_scan = assembler.label()?;
+    let root_dispatch = root_plan.map(|_| assembler.label()).transpose()?;
+    let root_sve = root_plan
+        .filter(|plan| plan.uses_sve())
+        .map(|_| assembler.label())
+        .transpose()?;
+    let root_asimd = root_plan
+        .filter(|plan| plan.use_asimd)
+        .map(|_| assembler.label())
+        .transpose()?;
+    let root_asimd_single = root_plan
+        .filter(|plan| plan.use_asimd)
+        .map(|_| assembler.label())
+        .transpose()?;
+    let root_asimd_batch_hit = root_plan
+        .filter(|plan| plan.use_asimd)
+        .map(|_| assembler.label())
+        .transpose()?;
+    let root_asimd_single_hit = root_plan
+        .filter(|plan| plan.use_asimd)
+        .map(|_| assembler.label())
+        .transpose()?;
+    let root_scalar = root_plan.map(|_| assembler.label()).transpose()?;
+    let root_scalar_reject = root_plan.map(|_| assembler.label()).transpose()?;
     let native_match = assembler.label()?;
     let native_no_match = assembler.label()?;
     let framed_fallback = assembler.label()?;
@@ -16703,6 +16989,10 @@ fn lower_aarch64_dynamic_rows_prepared() -> Result<(Vec<u8>, Vec<ModuleRelocatio
 
     let identity_page = assembler.instruction(0x9000_0006)?;
     let identity_page_offset = assembler.instruction(aarch64_add_x_imm(6, 6, 0)?)?;
+    // The private preflight record occupies SP+48..SP+79. Retain the identity
+    // address in the spare word at SP+80 so table-backed scanners can recover
+    // their post-identity base after the helper clobbers caller-saved X6.
+    assembler.instruction(aarch64_store_x(6, 31, 80)?)?;
     assembler.instruction(aarch64_add_x_imm(7, 31, 48)?)?;
     let preflight_branch = assembler.instruction(0x9400_0000)?;
     assembler.instruction(aarch64_cmp_w_imm(
@@ -16715,12 +17005,15 @@ fn lower_aarch64_dynamic_rows_prepared() -> Result<(Vec<u8>, Vec<ModuleRelocatio
     assembler.instruction(0xd65f_03c0)?;
 
     assembler.bind(preflight_enter)?;
-    assembler.instruction(aarch64_load_x_imm(17, 31, 64)?)?; // descriptor
-    assembler.instruction(aarch64_cmp_x_imm(17, 0)?)?;
+    // Caller-saved registers remain disjoint across the root scanners:
+    // X13 descriptor, X14/X15 map/rows, W11 current row, W1 initial row,
+    // X2/X3 position/end, W4/W7/W9 cell masks, and X8/X10/X12 scratch.
+    assembler.instruction(aarch64_load_x_imm(13, 31, 64)?)?; // descriptor
+    assembler.instruction(aarch64_cmp_x_imm(13, 0)?)?;
     assembler.branch_cond(AARCH64_EQ, framed_fallback)?;
     assembler.instruction(aarch64_load_x_imm(
         15,
-        17,
+        13,
         u16::try_from(NATIVE_ROWS_ROWS_ADDRESS)
             .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic rows address"))?,
     )?)?;
@@ -16728,7 +17021,7 @@ fn lower_aarch64_dynamic_rows_prepared() -> Result<(Vec<u8>, Vec<ModuleRelocatio
     assembler.branch_cond(AARCH64_EQ, framed_fallback)?;
     assembler.instruction(aarch64_load_x_imm(
         14,
-        17,
+        13,
         u16::try_from(NATIVE_ROWS_CLASS_MAP_ADDRESS)
             .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic class map"))?,
     )?)?;
@@ -16738,86 +17031,325 @@ fn lower_aarch64_dynamic_rows_prepared() -> Result<(Vec<u8>, Vec<ModuleRelocatio
     assembler.instruction(aarch64_cmp_x_imm(10, 0)?)?;
     assembler.branch_cond(AARCH64_EQ, framed_fallback)?;
     assembler.instruction(aarch64_load_x_imm(
-        9,
-        17,
+        8,
+        13,
         u16::try_from(NATIVE_ROWS_CACHE_IDENTITY)
             .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic cache identity"))?,
     )?)?;
-    assembler.instruction(aarch64_cmp_x(10, 9)?)?;
+    assembler.instruction(aarch64_cmp_x(10, 8)?)?;
     assembler.branch_cond(AARCH64_NE, framed_fallback)?;
     assembler.instruction(aarch64_load_w_imm(
         8,
-        17,
+        13,
         u16::try_from(NATIVE_ROWS_INITIAL_FLAGS)
             .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic initial flags"))?,
     )?)?;
     assembler.branch_nonzero_w(8, framed_fallback)?;
     assembler.instruction(aarch64_load_w_imm(
-        8,
-        17,
+        10,
+        13,
         u16::try_from(NATIVE_ROWS_LOOP_COUNT)
             .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic loop count"))?,
     )?)?;
-    assembler.branch_nonzero_w(8, framed_fallback)?;
+    if root_plan.is_some() {
+        assembler.instruction(aarch64_cmp_w_imm(
+            10,
+            u16::try_from(NATIVE_ROWS_LOOP_ROW_CAPACITY)
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic loop capacity"))?,
+        )?)?;
+        assembler.branch_cond(AARCH64_HI, framed_fallback)?;
+    } else {
+        // Without an independent root scanner, preserve the established
+        // conservative decline for every learned-loop overlay.
+        assembler.branch_nonzero_w(10, framed_fallback)?;
+    }
     assembler.instruction(aarch64_load_w_imm(
         8,
-        17,
+        13,
         u16::try_from(NATIVE_ROWS_ROW_STRIDE)
             .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic row stride"))?,
     )?)?;
     assembler.branch_zero_w(8, framed_fallback)?;
     assembler.instruction(aarch64_load_w_imm(
-        12,
-        17,
+        1,
+        13,
         u16::try_from(NATIVE_ROWS_INITIAL_ROW)
             .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic initial row"))?,
     )?)?;
     assembler.instruction(aarch64_load_x_imm(
         10,
-        17,
+        13,
         u16::try_from(NATIVE_ROWS_LIVE_CELLS)
             .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic live cells"))?,
     )?)?;
-    assembler.instruction(aarch64_cmp_x(12, 10)?)?;
+    assembler.instruction(aarch64_cmp_x(1, 10)?)?;
     assembler.branch_cond(AARCH64_HS, framed_fallback)?;
     assembler.instruction(aarch64_load_w_imm(
-        6,
-        17,
+        4,
+        13,
         u16::try_from(NATIVE_ROWS_UNFILLED_CELL)
             .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic unfilled cell"))?,
     )?)?;
     assembler.instruction(aarch64_load_w_imm(
-        16,
-        17,
+        7,
+        13,
         u16::try_from(NATIVE_ROWS_ACCEPT_MASK)
             .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic accept mask"))?,
     )?)?;
     assembler.instruction(aarch64_load_w_imm(
         9,
-        17,
+        13,
         u16::try_from(NATIVE_ROWS_NEXT_ROW_TOKEN_MASK)
             .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic next-row mask"))?,
     )?)?;
-    assembler.instruction(aarch64_load_x_imm(1, 31, 8)?)?;
+    assembler.instruction(aarch64_load_x_imm(0, 31, 8)?)?; // haystack
     assembler.instruction(aarch64_load_x_imm(2, 31, 48)?)?;
-    assembler.instruction(aarch64_load_x_imm(11, 31, 56)?)?;
+    assembler.instruction(aarch64_load_x_imm(3, 31, 56)?)?;
+    assembler.instruction(aarch64_and_w(11, 1, 1)?)?;
+
+    if let Some(plan) = root_plan {
+        if plan.has_tables() {
+            assembler.instruction(aarch64_load_x_imm(5, 31, 80)?)?;
+            assembler.instruction(aarch64_add_x_imm(5, 5, 32)?)?;
+        }
+        if plan.use_asimd {
+            aarch64_emit_start_filter_constants(
+                &mut assembler,
+                plan.filter,
+                AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
+            )?;
+        }
+        if plan.use_exact_asimd_lane {
+            aarch64_emit_first_lane_constants(
+                &mut assembler,
+                plan.lane_index_offset.ok_or(ObjectError::InvalidModule(
+                    "dynamic ASIMD exact lane has no index table",
+                ))?,
+            )?;
+        }
+        if let Some(kind) = plan.sve_kind.filter(|_| !plan.use_runtime_vl_dispatch) {
+            // A pure-SVE route never executes ASIMD, so its Z16..Z23 constants
+            // are immutable across scalar tails and dynamic-row transitions.
+            aarch64_emit_sve_filter_setup(&mut assembler, plan.filter, kind, 0)?;
+        }
+        if plan.use_runtime_vl_dispatch {
+            // The process vector length is stable. Sample it once after
+            // preflight, retain zero at VL16 in X17, and reuse both values on
+            // every root retry.
+            assembler.instruction(aarch64_sve_cntb(16)?)?;
+            assembler.instruction(aarch64_sub_x_imm(
+                17,
+                16,
+                AARCH64_SVE_MIN_VECTOR_BYTES,
+            )?)?;
+        }
+    }
 
     assembler.bind(scan)?;
-    assembler.instruction(aarch64_cmp_x(2, 11)?)?;
+    assembler.instruction(aarch64_cmp_x(2, 3)?)?;
     assembler.branch_cond(AARCH64_HS, native_no_match)?;
-    assembler.instruction(aarch64_load_byte_reg(8, 1, 2)?)?;
+    if root_plan.is_some() {
+        // The graph scanner owns the initial row even when K0 publishes a
+        // learned-loop overlay for that same row. Every non-root learned row
+        // remains K0-owned and deopts before consuming its first byte.
+        assembler.instruction(aarch64_cmp_w(11, 1)?)?;
+        assembler.branch_cond(
+            AARCH64_EQ,
+            root_dispatch.ok_or(ObjectError::InvalidModule(
+                "AArch64 dynamic root dispatch is absent",
+            ))?,
+        )?;
+        assembler.instruction(aarch64_load_w_imm(
+            10,
+            13,
+            u16::try_from(NATIVE_ROWS_LOOP_COUNT)
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic loop count"))?,
+        )?)?;
+        assembler.branch_zero_w(10, table_scan)?;
+        for loop_row in 0..NATIVE_ROWS_LOOP_ROW_CAPACITY {
+            assembler.instruction(aarch64_load_w_imm(
+                8,
+                13,
+                u16::try_from(native_rows_loop_row_offset(loop_row)?).map_err(|_| {
+                    ObjectError::ArithmeticOverflow("AArch64 dynamic learned-loop displacement")
+                })?,
+            )?)?;
+            assembler.instruction(aarch64_cmp_w(11, 8)?)?;
+            assembler.branch_cond(AARCH64_EQ, framed_fallback)?;
+            let live_count = u16::try_from(loop_row.checked_add(1).ok_or(
+                ObjectError::ArithmeticOverflow("AArch64 dynamic loop count"),
+            )?)
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic loop count"))?;
+            if usize::from(live_count) < NATIVE_ROWS_LOOP_ROW_CAPACITY {
+                assembler.instruction(aarch64_cmp_w_imm(10, live_count)?)?;
+                assembler.branch_cond(AARCH64_EQ, table_scan)?;
+            }
+        }
+    }
+
+    assembler.bind(table_scan)?;
+    assembler.instruction(aarch64_load_byte_reg(8, 0, 2)?)?;
     assembler.instruction(aarch64_load_byte_reg(10, 14, 8)?)?;
-    assembler.instruction(aarch64_add_w_reg(10, 12, 10)?)?;
+    assembler.instruction(aarch64_add_w_reg(10, 11, 10)?)?;
     assembler.instruction(aarch64_load_w_uxtw(8, 15, 10)?)?;
-    assembler.instruction(aarch64_cmp_w(8, 6)?)?;
+    assembler.instruction(aarch64_cmp_w(8, 4)?)?;
     assembler.branch_cond(AARCH64_EQ, framed_fallback)?;
     assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
-    assembler.instruction(aarch64_tst_w(8, 16)?)?;
+    assembler.instruction(aarch64_tst_w(8, 7)?)?;
     assembler.branch_cond(AARCH64_NE, native_match)?;
     assembler.instruction(aarch64_and_w(8, 8, 9)?)?;
     assembler.branch_zero_w(8, native_no_match)?;
-    assembler.instruction(aarch64_sub_w_imm(12, 8, 1)?)?;
+    assembler.instruction(aarch64_sub_w_imm(11, 8, 1)?)?;
     assembler.branch(scan)?;
+
+    if let Some(plan) = root_plan {
+        let dispatch = root_dispatch.ok_or(ObjectError::InvalidModule(
+            "AArch64 dynamic root dispatch is absent",
+        ))?;
+        let scalar = root_scalar.ok_or(ObjectError::InvalidModule(
+            "AArch64 dynamic root scalar tail is absent",
+        ))?;
+        let scalar_reject = root_scalar_reject.ok_or(ObjectError::InvalidModule(
+            "AArch64 dynamic root scalar reject is absent",
+        ))?;
+        assembler.bind(dispatch)?;
+        if plan.use_runtime_vl_dispatch {
+            let asimd = root_asimd.ok_or(ObjectError::InvalidModule(
+                "mixed dynamic root has no ASIMD route",
+            ))?;
+            let sve = root_sve.ok_or(ObjectError::InvalidModule(
+                "mixed dynamic root has no SVE route",
+            ))?;
+            assembler.branch_zero_w(17, asimd)?;
+            assembler.instruction(aarch64_mov_x(6, 16)?)?;
+            assembler.branch(sve)?;
+        } else if let Some(sve) = root_sve {
+            assembler.branch(sve)?;
+        } else if let Some(asimd) = root_asimd {
+            assembler.branch(asimd)?;
+        } else {
+            assembler.branch(scalar)?;
+        }
+
+        if let (Some(sve), Some(kind)) = (root_sve, plan.sve_kind) {
+            // Mixed lowering rematerializes scalable constants on each root
+            // retry because Z16..Z23 alias the ASIMD V16..V23 bank. Pure SVE
+            // installed them once above.
+            aarch64_emit_sve_start_filter_scanner(
+                &mut assembler,
+                plan.filter,
+                plan.filter.scan_offset,
+                kind,
+                plan.use_runtime_vl_dispatch,
+                plan.use_runtime_vl_dispatch,
+                sve,
+                scalar,
+                table_scan,
+            )?;
+        }
+
+        if let Some(asimd) = root_asimd {
+            let single = root_asimd_single.ok_or(ObjectError::InvalidModule(
+                "AArch64 dynamic ASIMD single-vector route is absent",
+            ))?;
+            let batch_hit = root_asimd_batch_hit.ok_or(ObjectError::InvalidModule(
+                "AArch64 dynamic ASIMD batch hit is absent",
+            ))?;
+            let single_hit = root_asimd_single_hit.ok_or(ObjectError::InvalidModule(
+                "AArch64 dynamic ASIMD single hit is absent",
+            ))?;
+            assembler.bind(asimd)?;
+            assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
+            let mut batch_first_candidates = None;
+            if plan.use_asimd_batch {
+                let batch_bytes = u16::from(plan.filter.scan_offset)
+                    .checked_add(AARCH64_BATCH_BYTES)
+                    .ok_or(ObjectError::ArithmeticOverflow(
+                        "dynamic ASIMD batch width",
+                    ))?;
+                assembler.instruction(aarch64_cmp_x_imm(12, batch_bytes)?)?;
+                assembler.branch_cond(AARCH64_LO, single)?;
+                let first_candidates = aarch64_emit_start_filter_batch_candidates(
+                    &mut assembler,
+                    plan.filter,
+                    AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
+                )?;
+                batch_first_candidates = Some(first_candidates);
+                aarch64_emit_candidate_batch_any(&mut assembler, first_candidates)?;
+                assembler.branch_cond(
+                    AARCH64_NE,
+                    if plan.use_exact_asimd_lane {
+                        batch_hit
+                    } else {
+                        scalar
+                    },
+                )?;
+                assembler.instruction(aarch64_add_x_imm(2, 2, AARCH64_BATCH_BYTES)?)?;
+                assembler.branch(asimd)?;
+            }
+
+            assembler.bind(single)?;
+            let vector_bytes = u16::from(plan.filter.scan_offset)
+                .checked_add(16)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "dynamic ASIMD vector width",
+                ))?;
+            assembler.instruction(aarch64_cmp_x_imm(12, vector_bytes)?)?;
+            assembler.branch_cond(AARCH64_LO, scalar)?;
+            aarch64_emit_start_filter_address(&mut assembler, plan.filter.scan_offset)?;
+            assembler.instruction(aarch64_load_q(0, 12)?)?;
+            aarch64_emit_start_filter_vector_candidates(
+                &mut assembler,
+                plan.filter,
+                0,
+                24,
+                AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
+            )?;
+            aarch64_emit_candidate_any(&mut assembler, 24)?;
+            assembler.branch_cond(
+                AARCH64_NE,
+                if plan.use_exact_asimd_lane {
+                    single_hit
+                } else {
+                    scalar
+                },
+            )?;
+            assembler.instruction(aarch64_add_x_imm(2, 2, 16)?)?;
+            assembler.branch(asimd)?;
+
+            assembler.bind(batch_hit)?;
+            if plan.use_exact_asimd_lane
+                && let Some(first_candidates) = batch_first_candidates
+            {
+                aarch64_emit_first_candidate_in_batch(&mut assembler, first_candidates)?;
+                assembler.branch(table_scan)?;
+            } else {
+                assembler.branch(scalar)?;
+            }
+            assembler.bind(single_hit)?;
+            if plan.use_exact_asimd_lane {
+                aarch64_emit_first_candidate_lane(&mut assembler, 24)?;
+                assembler.branch(table_scan)?;
+            } else {
+                assembler.branch(scalar)?;
+            }
+        }
+
+        assembler.bind(scalar)?;
+        aarch64_emit_start_filter_scalar_bound(
+            &mut assembler,
+            plan.filter.scan_offset,
+            native_no_match,
+        )?;
+        aarch64_emit_scalar_filter_membership(&mut assembler, plan.filter, scalar_reject)?;
+        // A scanner hit identifies the candidate start. Do not consume the
+        // filtered byte here; the canonical table transition below owns the
+        // byte at X2, including for nonzero proof offsets.
+        assembler.branch(table_scan)?;
+        assembler.bind(scalar_reject)?;
+        assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
+        assembler.branch(scalar)?;
+    }
 
     assembler.bind(native_no_match)?;
     assembler.instruction(aarch64_movz_w(0, 0)?)?;
@@ -16859,9 +17391,9 @@ fn lower_aarch64_dynamic_rows_prepared() -> Result<(Vec<u8>, Vec<ModuleRelocatio
         fallback_branch,
     ];
     let code = assembler.finish_with_offsets(&mut relocation_offsets)?;
-    Ok((
+    Ok(NativeDynamicRowsEmission {
         code,
-        vec![
+        relocations: vec![
             ModuleRelocation {
                 section: TEXT_SECTION,
                 offset: offset_u64(relocation_offsets[0], "AArch64 dynamic identity ADRP")?,
@@ -16898,7 +17430,8 @@ fn lower_aarch64_dynamic_rows_prepared() -> Result<(Vec<u8>, Vec<ModuleRelocatio
                 addend: 0,
             },
         ],
-    ))
+        scanner: root_plan.map(|plan| plan.scanner),
+    })
 }
 
 #[allow(
@@ -17247,6 +17780,20 @@ mod tests {
             }
         }
         targets
+    }
+
+    fn dynamic_root_test_filter(members: &[u8], scan_offset: u8) -> NativeStartFilter {
+        let mut membership = [0_u64; 4];
+        for &byte in members {
+            let byte = usize::from(byte);
+            membership[byte / 64] |= 1_u64 << (byte % 64);
+        }
+        plan_dynamic_root_filter(NativeDynamicRootRequirement {
+            scan_offset,
+            membership,
+        })
+        .expect("dynamic test root planning")
+        .expect("representable dynamic test root")
     }
 
     fn complete_forward_resource_fallback(
@@ -18291,6 +18838,15 @@ mod tests {
             }),
             requirement
         ));
+        assert!(exact_position_scanner_semantics_are_preserved(
+            Some(NativeScannerEmission {
+                isa: NativeScannerIsa::Aarch64ScalarRange,
+                vectorized: false,
+                ..emission
+            }),
+            requirement.scan_offset,
+            requirement.membership,
+        ));
         assert!(!retained_prefix_scanner_is_preserved(None, requirement));
         assert!(!retained_prefix_scanner_is_preserved(
             Some(NativeScannerEmission {
@@ -18306,6 +18862,225 @@ mod tests {
             }),
             requirement
         ));
+    }
+
+    #[test]
+    fn dynamic_root_aarch64_target_receipts_follow_linux_mixed_policy() {
+        let filter = dynamic_root_test_filter(b"AC", 3);
+        let sve = FeatureSet::of(CpuFeature::Aarch64Sve);
+        let sve2 = sve.with(CpuFeature::Aarch64Sve2);
+        let asimd = FeatureSet::of(CpuFeature::Aarch64Asimd);
+        let cases = [
+            (
+                Target::aarch64_linux(),
+                NativeScannerIsa::Aarch64ScalarRange,
+                StartAccelerator::Scalar,
+            ),
+            (
+                Target::aarch64_macos().with_features(sve2).unwrap(),
+                NativeScannerIsa::Aarch64ScalarRange,
+                StartAccelerator::Scalar,
+            ),
+            (
+                Target::aarch64_macos().with_features(asimd).unwrap(),
+                NativeScannerIsa::Aarch64Asimd,
+                StartAccelerator::Aarch64Asimd,
+            ),
+            (
+                Target::aarch64_linux().with_features(sve).unwrap(),
+                NativeScannerIsa::Aarch64Sve,
+                StartAccelerator::Aarch64Sve,
+            ),
+            (
+                Target::aarch64_linux().with_features(sve2).unwrap(),
+                NativeScannerIsa::Aarch64Sve2,
+                StartAccelerator::Aarch64Sve2,
+            ),
+            (
+                Target::aarch64_linux()
+                    .with_features(asimd.with(CpuFeature::Aarch64Sve))
+                    .unwrap(),
+                NativeScannerIsa::Aarch64Sve,
+                StartAccelerator::Aarch64Sve,
+            ),
+            (
+                Target::aarch64_linux()
+                    .with_features(asimd.with(CpuFeature::Aarch64Sve).with(CpuFeature::Aarch64Sve2))
+                    .unwrap(),
+                NativeScannerIsa::Aarch64Sve2,
+                StartAccelerator::Aarch64Sve2,
+            ),
+        ];
+        for (target, expected_isa, expected_accelerator) in cases {
+            let mut data = vec![0xa5; 32];
+            let plan = install_aarch64_dynamic_root_plan(&mut data, 0, filter, target)
+                .unwrap_or_else(|error| panic!("dynamic root plan {target:?}: {error}"));
+            assert_eq!(plan.scanner.isa, expected_isa, "{target:?}");
+            assert_eq!(
+                plan.scanner.start_accelerator(),
+                expected_accelerator,
+                "{target:?}"
+            );
+            assert!(exact_position_scanner_semantics_are_preserved(
+                Some(plan.scanner),
+                filter.scan_offset,
+                start_filter_membership(filter).unwrap(),
+            ));
+            assert_eq!(
+                plan.use_runtime_vl_dispatch,
+                target.operating_system == OperatingSystem::Linux
+                    && target.features.has(CpuFeature::Aarch64Asimd)
+                    && target.features.has(CpuFeature::Aarch64Sve),
+                "{target:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_root_aarch64_tables_are_post_identity_and_fallback_transactionally() {
+        let filter = dynamic_root_test_filter(b"AC", 0);
+        let identity = [0x5a; 32];
+        let sve2 = FeatureSet::of(CpuFeature::Aarch64Sve)
+            .with(CpuFeature::Aarch64Sve2);
+        let sve2_target = Target::aarch64_linux().with_features(sve2).unwrap();
+        let mut sve2_data = identity.to_vec();
+        let sve2_plan = install_aarch64_dynamic_root_plan_with_limit(
+            &mut sve2_data,
+            0,
+            filter,
+            sve2_target,
+            usize::MAX,
+        )
+        .unwrap();
+        assert_eq!(&sve2_data[..32], &identity);
+        assert_eq!(sve2_data.len(), 48);
+        assert_eq!(
+            sve2_plan.sve_kind,
+            Some(Aarch64SveFilterKind::Sve2 {
+                match_table_offset: 0,
+            })
+        );
+        assert_eq!(&sve2_data[32..48], b"ACACACACACACACAC");
+
+        let mut fallback_data = identity.to_vec();
+        let fallback = install_aarch64_dynamic_root_plan_with_limit(
+            &mut fallback_data,
+            0,
+            filter,
+            sve2_target,
+            0,
+        )
+        .unwrap();
+        assert_eq!(fallback.sve_kind, Some(Aarch64SveFilterKind::Sve));
+        assert_eq!(fallback.scanner.isa, NativeScannerIsa::Aarch64Sve);
+        assert_eq!(fallback_data, identity);
+
+        let asimd_target = Target::aarch64_macos()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .unwrap();
+        let mut asimd_data = identity.to_vec();
+        let asimd = install_aarch64_dynamic_root_plan_with_limit(
+            &mut asimd_data,
+            0,
+            filter,
+            asimd_target,
+            usize::MAX,
+        )
+        .unwrap();
+        assert_eq!(asimd.lane_index_offset, Some(0));
+        assert_eq!(&asimd_data[32..48], &AARCH64_FIRST_LANE_INDEX);
+
+        let mut asimd_fallback_data = identity.to_vec();
+        let asimd_fallback = install_aarch64_dynamic_root_plan_with_limit(
+            &mut asimd_fallback_data,
+            0,
+            filter,
+            asimd_target,
+            0,
+        )
+        .unwrap();
+        assert!(asimd_fallback.use_asimd);
+        assert!(!asimd_fallback.use_exact_asimd_lane);
+        assert_eq!(asimd_fallback.lane_index_offset, None);
+        assert_eq!(asimd_fallback_data, identity);
+    }
+
+    #[test]
+    fn dynamic_root_aarch64_cfg_prioritizes_root_and_preserves_table_byte_ownership() {
+        let filter = dynamic_root_test_filter(b"A", 0);
+        let features = FeatureSet::of(CpuFeature::Aarch64Asimd)
+            .with(CpuFeature::Aarch64Sve)
+            .with(CpuFeature::Aarch64Sve2);
+        let target = Target::aarch64_linux().with_features(features).unwrap();
+        let mut data = vec![0_u8; 32];
+        let plan = install_aarch64_dynamic_root_plan(&mut data, 0, filter, target).unwrap();
+        assert!(plan.use_runtime_vl_dispatch);
+        let emission = lower_aarch64_dynamic_rows_prepared(Some(plan)).unwrap();
+        assert_eq!(emission.scanner, Some(plan.scanner));
+        let words = emission
+            .code
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            words
+                .iter()
+                .filter(|&&word| word == aarch64_sve_cntb(16).unwrap())
+                .count(),
+            1,
+            "mixed dynamic root must sample CNTB once"
+        );
+        assert_eq!(
+            words
+                .iter()
+                .filter(|&&word| {
+                    word == aarch64_sub_x_imm(17, 16, AARCH64_SVE_MIN_VECTOR_BYTES).unwrap()
+                })
+                .count(),
+            1,
+            "mixed dynamic root must retain its VL16 mode"
+        );
+        assert!(words.contains(&aarch64_mov_x(6, 16).unwrap()));
+        assert!(words.contains(&aarch64_sve2_match_b(1, 0, 16).unwrap()));
+        assert!(words.contains(&aarch64_cmeq_16b(24, 0, 16).unwrap()));
+
+        let root_compare = words
+            .iter()
+            .position(|&word| word == aarch64_cmp_w(11, 1).unwrap())
+            .expect("initial-row comparison");
+        let learned_row_load = words
+            .iter()
+            .position(|&word| {
+                word
+                    == aarch64_load_w_imm(
+                        8,
+                        13,
+                        u16::try_from(native_rows_loop_row_offset(0).unwrap()).unwrap(),
+                    )
+                    .unwrap()
+            })
+            .expect("learned-row ownership load");
+        let table_byte = words
+            .iter()
+            .position(|&word| word == aarch64_load_byte_reg(8, 0, 2).unwrap())
+            .expect("canonical table byte load");
+        let first_consumption = words
+            .iter()
+            .position(|&word| word == aarch64_add_x_imm(2, 2, 1).unwrap())
+            .expect("canonical byte consumption");
+        assert!(root_compare < learned_row_load);
+        assert!(learned_row_load < table_byte);
+        assert!(table_byte < first_consumption);
+
+        let scalar = lower_aarch64_dynamic_rows_prepared(None).unwrap();
+        assert_eq!(scalar.scanner, None);
+        let scalar_words = scalar
+            .code
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(!scalar_words.contains(&aarch64_cmp_w(11, 1).unwrap()));
+        assert!(!scalar_words.contains(&aarch64_sve_cntb(16).unwrap()));
     }
 
     #[test]
@@ -19742,6 +20517,14 @@ mod tests {
                         compiled.module().start_accelerator(),
                         StartAccelerator::None | StartAccelerator::Scalar
                     ));
+                } else if output == OutputContract::Exists
+                    && compiled.program().native_dynamic_rows_view().is_some()
+                {
+                    assert_eq!(
+                        compiled.module().start_accelerator(),
+                        StartAccelerator::Scalar,
+                        "{target:?}/{output:?} dynamic root must receipt its scalar scanner"
+                    );
                 } else {
                     assert_eq!(compiled.module().start_accelerator(), StartAccelerator::None);
                 }
@@ -20483,19 +21266,11 @@ mod tests {
                 .expect("dynamic graph view");
             assert!(dynamic_view.root_requirement.is_some());
             assert!(compiled.module().prepared_entry_symbol().is_some());
-            if target.architecture == Architecture::X86_64 {
-                assert_ne!(
-                    compiled.module().start_accelerator(),
-                    StartAccelerator::None,
-                    "x86 dynamic root scanner receipt: {target:?}"
-                );
-            } else {
-                assert_eq!(
-                    compiled.module().start_accelerator(),
-                    StartAccelerator::None,
-                    "bounded AArch64 slice must retain the scalar dynamic entry: {target:?}"
-                );
-            }
+            assert_ne!(
+                compiled.module().start_accelerator(),
+                StartAccelerator::None,
+                "dynamic root scanner receipt: {target:?}"
+            );
             assert_eq!(
                 compiled
                     .module()
