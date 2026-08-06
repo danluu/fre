@@ -1,7 +1,8 @@
 use fre_automata::{
     Automaton, CompileLimits as AutomatonCompileLimits, EdgeKind, Exists,
-    K0OrderedResumeCompletion, K0ResumeSet, K0Workspace, RawPlan, SearchLimits,
-    SearchWindow as K0SearchWindow, SelectedEnd, Span, StateRole, WorkspaceLimits,
+    K0FullyPrefilledResumeCacheReceipt, K0OrderedResumeCompletion, K0ResumeSet, K0Workspace,
+    RawPlan, SearchLimits, SearchWindow as K0SearchWindow, SelectedEnd, Span, StateRole,
+    WorkspaceLimits,
 };
 use fre_simd_kernels::{
     ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, AsciiByteSet, AsciiByteSetClassifier,
@@ -2474,6 +2475,20 @@ pub struct ProgramWorkspace {
     dynamic_native_rows: Option<Box<DynamicNativeRowsWorkspace>>,
 }
 
+/// Opaque proof that one prepared program/workspace pair published every
+/// reachable retained-partial fallback row transactionally.
+///
+/// This is retained only by the permanently owned exclusive runtime session.
+/// The process-local program lineage prevents a receipt from crossing semantic
+/// owners; K0 independently reauthenticates its exact cache generation,
+/// direct-row shape, resume set, and selected resume hint on every use.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FullyPrefilledFallbackReceipt {
+    program_instance: u64,
+    k0: K0FullyPrefilledResumeCacheReceipt,
+}
+
 impl ProgramWorkspace {
     pub(crate) const fn has_retained_partial_workspace(&self) -> bool {
         self.partial.is_some()
@@ -3968,6 +3983,39 @@ impl CompiledProgram {
         self.search_with_workspace(haystack, window, workspace)
     }
 
+    /// Exclusive prepared entry retaining the setup-authenticated complete
+    /// fallback receipt. The receipt is consumed only by a retained-partial
+    /// hole; every bypass and non-partial route remains on the ordinary
+    /// checked executor.
+    #[doc(hidden)]
+    #[inline]
+    pub fn search_exclusive_optimized_with_fully_prefilled_fallback_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+        receipt: FullyPrefilledFallbackReceipt,
+    ) -> Result<MatchResult, CompileError> {
+        debug_assert!(window.start <= window.end && window.end <= haystack.len());
+        debug_assert!(workspace.identity.compatible(&self.identity));
+        if window.end.saturating_sub(window.start) >= PARTIAL_DFA_MIN_INPUT_BYTES
+            && workspace.has_retained_partial_workspace()
+            && let Some(partial) = self.partial_dfa()
+        {
+            debug_assert!(self.context_dfa.is_none());
+            debug_assert!(matches!(self.engine, ProgramEngine::OrderedNfa));
+            workspace.mark_dynamic_native_rows_dirty();
+            return self.search_nfa_with_partial_entry_and_fallback_receipt(
+                partial,
+                haystack,
+                window,
+                workspace,
+                Some(receipt),
+            );
+        }
+        self.search_with_workspace(haystack, window, workspace)
+    }
+
     /// Decide whether a prepared native entry should attempt authenticated
     /// retained rows for this input length.
     ///
@@ -4014,6 +4062,19 @@ impl CompiledProgram {
         &self,
         workspace: &mut ProgramWorkspace,
     ) -> Result<bool, CompileError> {
+        self.compiler_private_try_prefill_retained_fallback_with_workspace_receipt(workspace)
+            .map(|receipt| receipt.is_some())
+    }
+
+    /// Receipt-bearing counterpart of the compatibility bool prefill seam.
+    /// Successful publication binds the receipt to this program lineage and
+    /// the exact K0 cache transaction; a decline leaves every live value
+    /// untouched and returns `None`.
+    #[doc(hidden)]
+    pub fn compiler_private_try_prefill_retained_fallback_with_workspace_receipt(
+        &self,
+        workspace: &mut ProgramWorkspace,
+    ) -> Result<Option<FullyPrefilledFallbackReceipt>, CompileError> {
         if !workspace.identity.compatible(&self.identity) {
             return Err(CompileError::InternalInvariant(
                 "fallback prefill workspace belongs to a different semantic program",
@@ -4023,7 +4084,7 @@ impl CompiledProgram {
             || !matches!(self.engine, ProgramEngine::OrderedNfa)
             || self.partial_dfa().is_none()
         {
-            return Ok(false);
+            return Ok(None);
         }
         let (nfa, partial) = (&mut workspace.nfa, &mut workspace.partial);
         let (Some(nfa), Some(resume)) = (
@@ -4032,9 +4093,14 @@ impl CompiledProgram {
                 .as_deref_mut()
                 .and_then(|partial| partial.resume.as_mut()),
         ) else {
-            return Ok(false);
+            return Ok(None);
         };
-        Ok(nfa.compiler_private_try_prefill_resume_caches(&self.automaton, resume))
+        Ok(nfa
+            .compiler_private_try_prefill_resume_caches_with_receipt(&self.automaton, resume)
+            .map(|k0| FullyPrefilledFallbackReceipt {
+                program_instance: self.identity.instance,
+                k0,
+            }))
     }
 
     /// Execute the separately prepared retained-row route.
@@ -4098,7 +4164,7 @@ impl CompiledProgram {
         clippy::too_many_arguments,
         reason = "the continuation boundary keeps artifact, window, frontier, and committed prefix explicit"
     )]
-    pub fn search_from_retained_partial_resume_with_workspace(
+    fn search_from_retained_partial_resume_with_workspace_impl(
         &self,
         haystack: &[u8],
         window: SearchWindow,
@@ -4107,6 +4173,7 @@ impl CompiledProgram {
         resume_state: usize,
         resume_position: usize,
         pending_end: Option<usize>,
+        receipt: Option<FullyPrefilledFallbackReceipt>,
     ) -> Result<MatchResult, CompileError> {
         if window.start > window.end || window.end > haystack.len() {
             return Err(CompileError::InvalidWindow {
@@ -4179,6 +4246,7 @@ impl CompiledProgram {
                 position: resume_position,
                 pending_end,
             },
+            receipt,
         )?;
         partial_workspace.state.observe_resume_completion(
             resume_position.saturating_sub(window.start),
@@ -4186,6 +4254,61 @@ impl CompiledProgram {
             resumed.completion,
         );
         Ok(resumed.found)
+    }
+
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the continuation boundary keeps artifact, window, frontier, and committed prefix explicit"
+    )]
+    pub fn search_from_retained_partial_resume_with_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+        expected_artifact_identity: [u8; 32],
+        resume_state: usize,
+        resume_position: usize,
+        pending_end: Option<usize>,
+    ) -> Result<MatchResult, CompileError> {
+        self.search_from_retained_partial_resume_with_workspace_impl(
+            haystack,
+            window,
+            workspace,
+            expected_artifact_identity,
+            resume_state,
+            resume_position,
+            pending_end,
+            None,
+        )
+    }
+
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the exclusive continuation retains its setup receipt beside the authenticated payload"
+    )]
+    pub fn search_from_retained_partial_resume_with_fully_prefilled_fallback_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+        expected_artifact_identity: [u8; 32],
+        resume_state: usize,
+        resume_position: usize,
+        pending_end: Option<usize>,
+        receipt: FullyPrefilledFallbackReceipt,
+    ) -> Result<MatchResult, CompileError> {
+        self.search_from_retained_partial_resume_with_workspace_impl(
+            haystack,
+            window,
+            workspace,
+            expected_artifact_identity,
+            resume_state,
+            resume_position,
+            pending_end,
+            Some(receipt),
+        )
     }
 
     /// Continue from a retained-row hole admitted by the immediately
@@ -4207,7 +4330,7 @@ impl CompiledProgram {
         clippy::too_many_arguments,
         reason = "the trusted continuation retains the exact native resume payload"
     )]
-    pub fn search_from_preflight_retained_partial_resume_with_workspace(
+    fn search_from_preflight_retained_partial_resume_with_workspace_impl(
         &self,
         haystack: &[u8],
         window: SearchWindow,
@@ -4215,6 +4338,7 @@ impl CompiledProgram {
         resume_state: usize,
         resume_position: usize,
         pending_end: Option<usize>,
+        receipt: Option<FullyPrefilledFallbackReceipt>,
     ) -> Result<MatchResult, CompileError> {
         if window.start > window.end || window.end > haystack.len() {
             return Err(CompileError::InvalidWindow {
@@ -4246,6 +4370,58 @@ impl CompiledProgram {
             resume_state,
             resume_position,
             pending_end,
+            receipt,
+        )
+    }
+
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the trusted continuation retains the exact native resume payload"
+    )]
+    pub fn search_from_preflight_retained_partial_resume_with_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+        resume_state: usize,
+        resume_position: usize,
+        pending_end: Option<usize>,
+    ) -> Result<MatchResult, CompileError> {
+        self.search_from_preflight_retained_partial_resume_with_workspace_impl(
+            haystack,
+            window,
+            workspace,
+            resume_state,
+            resume_position,
+            pending_end,
+            None,
+        )
+    }
+
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the exclusive continuation retains its setup receipt beside the authenticated payload"
+    )]
+    pub fn search_from_preflight_retained_partial_resume_with_fully_prefilled_fallback_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+        resume_state: usize,
+        resume_position: usize,
+        pending_end: Option<usize>,
+        receipt: FullyPrefilledFallbackReceipt,
+    ) -> Result<MatchResult, CompileError> {
+        self.search_from_preflight_retained_partial_resume_with_workspace_impl(
+            haystack,
+            window,
+            workspace,
+            resume_state,
+            resume_position,
+            pending_end,
+            Some(receipt),
         )
     }
 
@@ -4268,13 +4444,14 @@ impl CompiledProgram {
         clippy::too_many_arguments,
         reason = "the compact trusted continuation retains the native resume payload"
     )]
-    pub fn search_from_preflight_retained_partial_resume_ticket_with_workspace(
+    fn search_from_preflight_retained_partial_resume_ticket_with_workspace_impl(
         &self,
         haystack: &[u8],
         workspace: &mut ProgramWorkspace,
         resume_state: usize,
         resume_position: usize,
         pending_end: Option<usize>,
+        receipt: Option<FullyPrefilledFallbackReceipt>,
     ) -> Result<MatchResult, CompileError> {
         let window = Self::take_preflight_partial_resume_ticket(haystack, workspace)?;
         let canonical_pending = self.preflight_partial_resume_pending(resume_state)?;
@@ -4290,6 +4467,54 @@ impl CompiledProgram {
             resume_state,
             resume_position,
             pending_end,
+            receipt,
+        )
+    }
+
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the compact trusted continuation retains the native resume payload"
+    )]
+    pub fn search_from_preflight_retained_partial_resume_ticket_with_workspace(
+        &self,
+        haystack: &[u8],
+        workspace: &mut ProgramWorkspace,
+        resume_state: usize,
+        resume_position: usize,
+        pending_end: Option<usize>,
+    ) -> Result<MatchResult, CompileError> {
+        self.search_from_preflight_retained_partial_resume_ticket_with_workspace_impl(
+            haystack,
+            workspace,
+            resume_state,
+            resume_position,
+            pending_end,
+            None,
+        )
+    }
+
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the exclusive compact continuation retains its setup receipt"
+    )]
+    pub fn search_from_preflight_retained_partial_resume_ticket_with_fully_prefilled_fallback_workspace(
+        &self,
+        haystack: &[u8],
+        workspace: &mut ProgramWorkspace,
+        resume_state: usize,
+        resume_position: usize,
+        pending_end: Option<usize>,
+        receipt: FullyPrefilledFallbackReceipt,
+    ) -> Result<MatchResult, CompileError> {
+        self.search_from_preflight_retained_partial_resume_ticket_with_workspace_impl(
+            haystack,
+            workspace,
+            resume_state,
+            resume_position,
+            pending_end,
+            Some(receipt),
         )
     }
 
@@ -4302,13 +4527,14 @@ impl CompiledProgram {
     /// direct callers and older runtime adapters.
     #[doc(hidden)]
     #[inline]
-    pub fn search_from_preflight_retained_partial_resume_ticket_inferred_with_workspace(
+    fn search_from_preflight_retained_partial_resume_ticket_inferred_with_workspace_impl(
         &self,
         haystack: &[u8],
         workspace: &mut ProgramWorkspace,
         resume_state: usize,
         resume_position: usize,
         pending_end: usize,
+        receipt: Option<FullyPrefilledFallbackReceipt>,
     ) -> Result<MatchResult, CompileError> {
         let window = Self::take_preflight_partial_resume_ticket(haystack, workspace)?;
         let pending_end = self
@@ -4321,6 +4547,48 @@ impl CompiledProgram {
             resume_state,
             resume_position,
             pending_end,
+            receipt,
+        )
+    }
+
+    #[doc(hidden)]
+    #[inline]
+    pub fn search_from_preflight_retained_partial_resume_ticket_inferred_with_workspace(
+        &self,
+        haystack: &[u8],
+        workspace: &mut ProgramWorkspace,
+        resume_state: usize,
+        resume_position: usize,
+        pending_end: usize,
+    ) -> Result<MatchResult, CompileError> {
+        self.search_from_preflight_retained_partial_resume_ticket_inferred_with_workspace_impl(
+            haystack,
+            workspace,
+            resume_state,
+            resume_position,
+            pending_end,
+            None,
+        )
+    }
+
+    #[doc(hidden)]
+    #[inline]
+    pub fn search_from_preflight_retained_partial_resume_ticket_inferred_with_fully_prefilled_fallback_workspace(
+        &self,
+        haystack: &[u8],
+        workspace: &mut ProgramWorkspace,
+        resume_state: usize,
+        resume_position: usize,
+        pending_end: usize,
+        receipt: FullyPrefilledFallbackReceipt,
+    ) -> Result<MatchResult, CompileError> {
+        self.search_from_preflight_retained_partial_resume_ticket_inferred_with_workspace_impl(
+            haystack,
+            workspace,
+            resume_state,
+            resume_position,
+            pending_end,
+            Some(receipt),
         )
     }
 
@@ -4362,6 +4630,10 @@ impl CompiledProgram {
             ))
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the consumed native continuation keeps its exact receipt and resume payload explicit"
+    )]
     #[inline]
     fn search_from_consumed_preflight_retained_partial_resume_with_workspace(
         &self,
@@ -4371,6 +4643,7 @@ impl CompiledProgram {
         resume_state: usize,
         resume_position: usize,
         pending_end: Option<usize>,
+        receipt: Option<FullyPrefilledFallbackReceipt>,
     ) -> Result<MatchResult, CompileError> {
         if resume_position <= window.start || resume_position >= window.end {
             return Err(CompileError::InternalInvariant(
@@ -4405,6 +4678,7 @@ impl CompiledProgram {
                 position: resume_position,
                 pending_end,
             },
+            receipt,
         )?;
         partial_workspace.state.observe_resume_completion(
             resume_position.saturating_sub(window.start),
@@ -4442,6 +4716,51 @@ impl CompiledProgram {
         workspace: &mut ProgramWorkspace,
         expected_artifact_identity: [u8; 32],
         selected_end: usize,
+    ) -> Result<MatchResult, CompileError> {
+        self.recover_retained_partial_span_from_selected_end_with_workspace_impl(
+            haystack,
+            window,
+            workspace,
+            expected_artifact_identity,
+            selected_end,
+            None,
+        )
+    }
+
+    /// Receipt-bearing counterpart for the permanently owned exclusive
+    /// prepared runtime. A stale receipt uses the ordinary reverse executor.
+    #[doc(hidden)]
+    pub fn recover_retained_partial_span_from_selected_end_with_fully_prefilled_fallback_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+        expected_artifact_identity: [u8; 32],
+        selected_end: usize,
+        receipt: FullyPrefilledFallbackReceipt,
+    ) -> Result<MatchResult, CompileError> {
+        self.recover_retained_partial_span_from_selected_end_with_workspace_impl(
+            haystack,
+            window,
+            workspace,
+            expected_artifact_identity,
+            selected_end,
+            Some(receipt),
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the authenticated Span postflight keeps its exact window, endpoint, and optional setup receipt explicit"
+    )]
+    fn recover_retained_partial_span_from_selected_end_with_workspace_impl(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+        expected_artifact_identity: [u8; 32],
+        selected_end: usize,
+        receipt: Option<FullyPrefilledFallbackReceipt>,
     ) -> Result<MatchResult, CompileError> {
         if window.start > window.end || window.end > haystack.len() {
             return Err(CompileError::InvalidWindow {
@@ -4512,20 +4831,15 @@ impl CompiledProgram {
         let workspace = nfa.as_mut().ok_or(CompileError::InternalInvariant(
             "retained partial Span recovery has no prepared bidirectional K0 workspace",
         ))?;
-        let recovered = self
-            .automaton
-            .prepare::<Span>()
-            .recover_span_from_selected_end_with_workspace(
-                haystack,
-                K0SearchWindow::new(window.start, window.end),
-                workspace,
-                selected_end,
-                SearchLimits::unlimited(),
-            )?
-            .into_output();
-        if recovered.start() < window.start
-            || recovered.start() > selected_end
-            || recovered.end() != selected_end
+        let recovered_start = self.recover_partial_span_start(
+            haystack,
+            window,
+            workspace,
+            partial_workspace.resume.as_ref(),
+            selected_end,
+            receipt,
+        )?;
+        if recovered_start < window.start || recovered_start > selected_end
         {
             return Err(CompileError::InternalInvariant(
                 "reverse K0 did not recover a span inside the admitted window at the native forward-selected endpoint",
@@ -4535,7 +4849,7 @@ impl CompiledProgram {
             selected_end.saturating_sub(window.start),
             window.end.saturating_sub(window.start),
         );
-        Ok(MatchResult::Span(Some((recovered.start(), selected_end))))
+        Ok(MatchResult::Span(Some((recovered_start, selected_end))))
     }
 
     /// Authenticate and prepare one native incomplete-retained execution.
@@ -5050,6 +5364,20 @@ impl CompiledProgram {
         window: SearchWindow,
         workspace: &mut ProgramWorkspace,
     ) -> Result<MatchResult, CompileError> {
+        self.search_nfa_with_partial_entry_and_fallback_receipt(
+            partial, haystack, window, workspace, None,
+        )
+    }
+
+    #[inline(never)]
+    fn search_nfa_with_partial_entry_and_fallback_receipt(
+        &self,
+        partial: &PartialDfa,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+        receipt: Option<FullyPrefilledFallbackReceipt>,
+    ) -> Result<MatchResult, CompileError> {
         let nfa = workspace
             .nfa
             .as_mut()
@@ -5076,13 +5404,14 @@ impl CompiledProgram {
             // without the program's serialized partial payload reaching it.
             return self.search_nfa_unaccelerated(haystack, window, nfa);
         };
-        if let Some(found) = self.search_nfa_with_partial_dfa(
+        if let Some(found) = self.search_nfa_with_partial_dfa_and_fallback_receipt(
             partial,
             haystack,
             window,
             nfa,
             &mut partial_workspace.resume,
             &mut partial_workspace.state,
+            receipt,
         )? {
             return Ok(found);
         }
@@ -5180,6 +5509,7 @@ impl CompiledProgram {
     /// caller's determinization budget. A side exit carries the exact ordered
     /// subset and pending endpoint into K0 at the first unconsumed byte; the
     /// original prefix is never replayed.
+    #[cfg(test)]
     fn search_nfa_with_partial_dfa(
         &self,
         partial: &PartialDfa,
@@ -5188,6 +5518,25 @@ impl CompiledProgram {
         workspace: &mut K0Workspace,
         resume_set: &mut Option<K0ResumeSet>,
         state: &mut PartialDfaRuntimeState,
+    ) -> Result<Option<MatchResult>, CompileError> {
+        self.search_nfa_with_partial_dfa_and_fallback_receipt(
+            partial, haystack, window, workspace, resume_set, state, None,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the retained fallback keeps its setup receipt beside the exact resume state"
+    )]
+    fn search_nfa_with_partial_dfa_and_fallback_receipt(
+        &self,
+        partial: &PartialDfa,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut K0Workspace,
+        resume_set: &mut Option<K0ResumeSet>,
+        state: &mut PartialDfaRuntimeState,
+        receipt: Option<FullyPrefilledFallbackReceipt>,
     ) -> Result<Option<MatchResult>, CompileError> {
         if !state.admit() {
             return Ok(None);
@@ -5204,8 +5553,9 @@ impl CompiledProgram {
                     state.observe_complete();
                     Ok(Some(MatchResult::Exists(found)))
                 }
-                PartialDfaResult::Resume(resume) => self
-                    .resolve_partial_hole(haystack, window, workspace, resume_set, state, resume),
+                PartialDfaResult::Resume(resume) => self.resolve_partial_hole(
+                    haystack, window, workspace, resume_set, state, resume, receipt,
+                ),
             },
             OutputContract::SelectedEnd => {
                 match partial.selected_end(
@@ -5220,7 +5570,7 @@ impl CompiledProgram {
                         Ok(Some(MatchResult::SelectedEnd(found)))
                     }
                     PartialDfaResult::Resume(resume) => self.resolve_partial_hole(
-                        haystack, window, workspace, resume_set, state, resume,
+                        haystack, window, workspace, resume_set, state, resume, receipt,
                     ),
                 }
             }
@@ -5233,7 +5583,7 @@ impl CompiledProgram {
                     state.prefix_plan,
                 )? {
                     PartialDfaResult::Resume(resume) => self.resolve_partial_hole(
-                        haystack, window, workspace, resume_set, state, resume,
+                        haystack, window, workspace, resume_set, state, resume, receipt,
                     ),
                     PartialDfaResult::Complete(selection) => {
                         let Some(end) = selection.end else {
@@ -5263,27 +5613,19 @@ impl CompiledProgram {
                             state.observe_complete();
                             start
                         } else {
-                            let recovered = self
-                                .automaton
-                                .prepare::<Span>()
-                                .recover_span_from_selected_end_with_workspace(
-                                    haystack,
-                                    K0SearchWindow::new(window.start, window.end),
-                                    workspace,
-                                    end,
-                                    SearchLimits::unlimited(),
-                                )?
-                                .into_output();
-                            if recovered.end() != end {
-                                return Err(CompileError::InternalInvariant(
-                                    "reverse K0 changed the forward-selected endpoint",
-                                ));
-                            }
+                            let start = self.recover_partial_span_start(
+                                haystack,
+                                window,
+                                workspace,
+                                resume_set.as_ref(),
+                                end,
+                                receipt,
+                            )?;
                             state.observe_reverse_recovered(
                                 end.saturating_sub(window.start),
                                 window.end.saturating_sub(window.start),
                             );
-                            recovered.start()
+                            start
                         };
                         Ok(Some(MatchResult::Span(Some((start, end)))))
                     }
@@ -5292,6 +5634,51 @@ impl CompiledProgram {
         }
     }
 
+    fn recover_partial_span_start(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut K0Workspace,
+        resume_set: Option<&K0ResumeSet>,
+        selected_end: usize,
+        receipt: Option<FullyPrefilledFallbackReceipt>,
+    ) -> Result<usize, CompileError> {
+        let plan = self.automaton.prepare::<Span>();
+        let k0_receipt = receipt
+            .filter(|receipt| receipt.program_instance == self.identity.instance)
+            .map(|receipt| receipt.k0);
+        let recovered = if let (Some(receipt), Some(resume_set)) = (k0_receipt, resume_set) {
+            plan.recover_span_from_selected_end_with_fully_prefilled_workspace(
+                haystack,
+                K0SearchWindow::new(window.start, window.end),
+                workspace,
+                resume_set,
+                selected_end,
+                SearchLimits::unlimited(),
+                receipt,
+            )?
+        } else {
+            plan.recover_span_from_selected_end_with_workspace(
+                haystack,
+                K0SearchWindow::new(window.start, window.end),
+                workspace,
+                selected_end,
+                SearchLimits::unlimited(),
+            )?
+        }
+        .into_output();
+        if recovered.end() != selected_end {
+            return Err(CompileError::InternalInvariant(
+                "reverse K0 changed the forward-selected endpoint",
+            ));
+        }
+        Ok(recovered.start())
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the retained hole keeps its adaptive state and optional setup receipt explicit"
+    )]
     fn resolve_partial_hole(
         &self,
         haystack: &[u8],
@@ -5300,6 +5687,7 @@ impl CompiledProgram {
         resume_set: &mut Option<K0ResumeSet>,
         state: &mut PartialDfaRuntimeState,
         resume: PartialDfaResume,
+        receipt: Option<FullyPrefilledFallbackReceipt>,
     ) -> Result<Option<MatchResult>, CompileError> {
         let input_bytes = window.end.saturating_sub(window.start);
         let consumed = resume.position.saturating_sub(window.start);
@@ -5310,12 +5698,17 @@ impl CompiledProgram {
             state.observe_fallback(consumed, input_bytes);
             return Ok(None);
         }
-        let resumed =
-            self.search_nfa_from_partial_resume(haystack, window, workspace, resume_set, resume)?;
+        let resumed = self.search_nfa_from_partial_resume(
+            haystack, window, workspace, resume_set, resume, receipt,
+        )?;
         state.observe_resume_completion(consumed, input_bytes, resumed.completion);
         Ok(Some(resumed.found))
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one output dispatch preserves the three contracts and receipt fallback side by side"
+    )]
     fn search_nfa_from_partial_resume(
         &self,
         haystack: &[u8],
@@ -5323,48 +5716,76 @@ impl CompiledProgram {
         workspace: &mut K0Workspace,
         resume_set: &mut Option<K0ResumeSet>,
         resume: PartialDfaResume,
+        receipt: Option<FullyPrefilledFallbackReceipt>,
     ) -> Result<PartialDfaResumeResult, CompileError> {
         let resume_set = resume_set.as_mut().ok_or(CompileError::InternalInvariant(
             "partial DFA hole has no authenticated K0 resume set",
         ))?;
         let k0_window = K0SearchWindow::new(window.start, window.end);
         let limits = SearchLimits::unlimited();
+        let k0_receipt = receipt
+            .filter(|receipt| receipt.program_instance == self.identity.instance)
+            .map(|receipt| receipt.k0);
         match self.output {
             OutputContract::Exists => {
-                let (found, completion) = self
-                    .automaton
-                    .prepare::<Exists>()
-                    .search_prevalidated_exists_value_from_ordered_resume_with_authenticated_workspace_with_completion(
-                        haystack,
-                        k0_window,
-                        workspace,
-                        resume_set,
-                        resume.state,
-                        resume.position,
-                        resume.pending_end,
-                        limits,
-                    )?
-                    .into_parts();
+                let plan = self.automaton.prepare::<Exists>();
+                let result = if let Some(receipt) = k0_receipt {
+                    plan.search_prevalidated_exists_value_from_fully_prefilled_ordered_resume_with_authenticated_workspace_with_completion(
+                            haystack,
+                            k0_window,
+                            workspace,
+                            resume_set,
+                            resume.state,
+                            resume.position,
+                            resume.pending_end,
+                            limits,
+                            receipt,
+                        )?
+                } else {
+                    plan.search_prevalidated_exists_value_from_ordered_resume_with_authenticated_workspace_with_completion(
+                            haystack,
+                            k0_window,
+                            workspace,
+                            resume_set,
+                            resume.state,
+                            resume.position,
+                            resume.pending_end,
+                            limits,
+                        )?
+                };
+                let (found, completion) = result.into_parts();
                 Ok(PartialDfaResumeResult {
                     found: MatchResult::Exists(found),
                     completion,
                 })
             }
             OutputContract::SelectedEnd => {
-                let (found, completion) = self
-                    .automaton
-                    .prepare::<SelectedEnd>()
-                    .search_prevalidated_selected_end_value_from_ordered_resume_with_authenticated_workspace_with_completion(
-                        haystack,
-                        k0_window,
-                        workspace,
-                        resume_set,
-                        resume.state,
-                        resume.position,
-                        resume.pending_end,
-                        limits,
-                    )?
-                    .into_parts();
+                let plan = self.automaton.prepare::<SelectedEnd>();
+                let result = if let Some(receipt) = k0_receipt {
+                    plan.search_prevalidated_selected_end_value_from_fully_prefilled_ordered_resume_with_authenticated_workspace_with_completion(
+                            haystack,
+                            k0_window,
+                            workspace,
+                            resume_set,
+                            resume.state,
+                            resume.position,
+                            resume.pending_end,
+                            limits,
+                            receipt,
+                        )?
+                } else {
+                    plan.search_prevalidated_selected_end_value_from_ordered_resume_with_authenticated_workspace_with_completion(
+                            haystack,
+                            k0_window,
+                            workspace,
+                            resume_set,
+                            resume.state,
+                            resume.position,
+                            resume.pending_end,
+                            limits,
+                        )?
+                };
+                let (found, completion) = result.into_parts();
                 Ok(PartialDfaResumeResult {
                     found: MatchResult::SelectedEnd(found),
                     completion,
@@ -5375,36 +5796,60 @@ impl CompiledProgram {
                     .partial_dfa()
                     .is_some_and(PartialDfa::initial_pending)
                 {
-                    let (found, completion) = self
-                        .automaton
-                        .prepare::<SelectedEnd>()
-                        .search_prevalidated_selected_end_value_from_ordered_resume_with_authenticated_workspace_with_completion(
-                            haystack,
-                            k0_window,
-                            workspace,
-                            resume_set,
-                            resume.state,
-                            resume.position,
-                            resume.pending_end,
-                            limits,
-                        )?
-                        .into_parts();
+                    let plan = self.automaton.prepare::<SelectedEnd>();
+                    let result = if let Some(receipt) = k0_receipt {
+                        plan.search_prevalidated_selected_end_value_from_fully_prefilled_ordered_resume_with_authenticated_workspace_with_completion(
+                                haystack,
+                                k0_window,
+                                workspace,
+                                resume_set,
+                                resume.state,
+                                resume.position,
+                                resume.pending_end,
+                                limits,
+                                receipt,
+                            )?
+                    } else {
+                        plan.search_prevalidated_selected_end_value_from_ordered_resume_with_authenticated_workspace_with_completion(
+                                haystack,
+                                k0_window,
+                                workspace,
+                                resume_set,
+                                resume.state,
+                                resume.position,
+                                resume.pending_end,
+                                limits,
+                            )?
+                    };
+                    let (found, completion) = result.into_parts();
                     (found.map(|end| (window.start, end)), completion)
                 } else if let Some(width) = self.exact_match_width {
-                    let (found, completion) = self
-                        .automaton
-                        .prepare::<SelectedEnd>()
-                        .search_prevalidated_selected_end_value_from_ordered_resume_with_authenticated_workspace_with_completion(
-                            haystack,
-                            k0_window,
-                            workspace,
-                            resume_set,
-                            resume.state,
-                            resume.position,
-                            resume.pending_end,
-                            limits,
-                        )?
-                        .into_parts();
+                    let plan = self.automaton.prepare::<SelectedEnd>();
+                    let result = if let Some(receipt) = k0_receipt {
+                        plan.search_prevalidated_selected_end_value_from_fully_prefilled_ordered_resume_with_authenticated_workspace_with_completion(
+                                haystack,
+                                k0_window,
+                                workspace,
+                                resume_set,
+                                resume.state,
+                                resume.position,
+                                resume.pending_end,
+                                limits,
+                                receipt,
+                            )?
+                    } else {
+                        plan.search_prevalidated_selected_end_value_from_ordered_resume_with_authenticated_workspace_with_completion(
+                                haystack,
+                                k0_window,
+                                workspace,
+                                resume_set,
+                                resume.state,
+                                resume.position,
+                                resume.pending_end,
+                                limits,
+                            )?
+                    };
+                    let (found, completion) = result.into_parts();
                     let found = found
                         .map(|end| {
                             end.checked_sub(width).map(|start| (start, end)).ok_or(
@@ -5416,20 +5861,32 @@ impl CompiledProgram {
                         .transpose()?;
                     (found, completion)
                 } else {
-                    let (found, completion) = self
-                        .automaton
-                        .prepare::<Span>()
-                        .search_prevalidated_span_value_from_ordered_resume_with_authenticated_workspace_with_completion(
-                            haystack,
-                            k0_window,
-                            workspace,
-                            resume_set,
-                            resume.state,
-                            resume.position,
-                            resume.pending_end,
-                            limits,
-                        )?
-                        .into_parts();
+                    let plan = self.automaton.prepare::<Span>();
+                    let result = if let Some(receipt) = k0_receipt {
+                        plan.search_prevalidated_span_value_from_fully_prefilled_ordered_resume_with_authenticated_workspace_with_completion(
+                                haystack,
+                                k0_window,
+                                workspace,
+                                resume_set,
+                                resume.state,
+                                resume.position,
+                                resume.pending_end,
+                                limits,
+                                receipt,
+                            )?
+                    } else {
+                        plan.search_prevalidated_span_value_from_ordered_resume_with_authenticated_workspace_with_completion(
+                                haystack,
+                                k0_window,
+                                workspace,
+                                resume_set,
+                                resume.state,
+                                resume.position,
+                                resume.pending_end,
+                                limits,
+                            )?
+                    };
+                    let (found, completion) = result.into_parts();
                     (found.map(|span| (span.start(), span.end())), completion)
                 };
                 Ok(PartialDfaResumeResult {
@@ -13805,6 +14262,21 @@ mod tests {
             );
             let mut checked_workspace = compiled.prepare_workspace().unwrap();
             let mut exclusive_workspace = compiled.prepare_workspace().unwrap();
+            let mut prefilled_workspace = compiled.prepare_workspace().unwrap();
+            let mut stale_lineage_workspace = compiled.prepare_workspace().unwrap();
+            let prefilled_receipt = compiled
+                .compiler_private_try_prefill_retained_fallback_with_workspace_receipt(
+                    &mut prefilled_workspace,
+                )
+                .unwrap()
+                .unwrap_or_else(|| panic!("prefill declined for {output:?}"));
+            let mut stale_lineage_receipt = compiled
+                .compiler_private_try_prefill_retained_fallback_with_workspace_receipt(
+                    &mut stale_lineage_workspace,
+                )
+                .unwrap()
+                .unwrap_or_else(|| panic!("stale-lineage prefill declined for {output:?}"));
+            stale_lineage_receipt.program_instance ^= u64::MAX;
             let mut reference_workspace = reference.prepare_workspace().unwrap();
             let expected = reference
                 .search_with_workspace(&haystack, window, &mut reference_workspace)
@@ -13832,9 +14304,35 @@ mod tests {
                 expected,
                 "exclusive {output:?}"
             );
+            assert_eq!(
+                compiled
+                    .search_exclusive_optimized_with_fully_prefilled_fallback_workspace(
+                        &haystack,
+                        window,
+                        &mut prefilled_workspace,
+                        prefilled_receipt,
+                    )
+                    .unwrap(),
+                expected,
+                "fully-prefilled exclusive {output:?}"
+            );
+            assert_eq!(
+                compiled
+                    .search_exclusive_optimized_with_fully_prefilled_fallback_workspace(
+                        &haystack,
+                        window,
+                        &mut stale_lineage_workspace,
+                        stale_lineage_receipt,
+                    )
+                    .unwrap(),
+                expected,
+                "stale-lineage fallback {output:?}"
+            );
 
             let checked = checked_workspace.partial.as_deref().unwrap().state;
             let exclusive = exclusive_workspace.partial.as_deref().unwrap().state;
+            let prefilled = prefilled_workspace.partial.as_deref().unwrap().state;
+            let stale_lineage = stale_lineage_workspace.partial.as_deref().unwrap().state;
             assert_eq!(exclusive.resumed, checked.resumed, "{output:?}");
             assert_eq!(
                 exclusive.reverse_recovered, checked.reverse_recovered,
@@ -13853,7 +14351,23 @@ mod tests {
                 "{output:?}"
             );
             assert_eq!(
+                prefilled.consecutive_fallbacks, checked.consecutive_fallbacks,
+                "{output:?}"
+            );
+            assert_eq!(
+                stale_lineage.consecutive_fallbacks, checked.consecutive_fallbacks,
+                "{output:?}"
+            );
+            assert_eq!(
                 exclusive.bypass_remaining, checked.bypass_remaining,
+                "{output:?}"
+            );
+            assert_eq!(
+                prefilled.bypass_remaining, checked.bypass_remaining,
+                "{output:?}"
+            );
+            assert_eq!(
+                stale_lineage.bypass_remaining, checked.bypass_remaining,
                 "{output:?}"
             );
         }

@@ -1,8 +1,8 @@
 use core::marker::PhantomData;
 
 use crate::{
-    Automaton, K0ResumeSet, K0SearchSession, K0SpanSourceCursor, K0Workspace, SearchError,
-    SearchLimits, SearchWindow,
+    Automaton, K0FullyPrefilledResumeCacheReceipt, K0ResumeSet, K0SearchSession,
+    K0SpanSourceCursor, K0Workspace, SearchError, SearchLimits, SearchWindow,
 };
 
 /// The capture-free output promised by a prepared entry point.
@@ -767,6 +767,39 @@ impl TypedPlan<'_, Exists> {
             limits,
         )
     }
+
+    /// Return existence through a setup-authenticated complete ordered-resume
+    /// cache. A stale receipt fails closed to the ordinary exact warm path.
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the fully-prefilled resume boundary keeps its setup receipt explicit"
+    )]
+    pub fn search_prevalidated_exists_value_from_fully_prefilled_ordered_resume_with_authenticated_workspace_with_completion(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut K0Workspace,
+        resume_set: &mut K0ResumeSet,
+        resume_state: usize,
+        resume_position: usize,
+        pending_end: Option<usize>,
+        limits: SearchLimits,
+        receipt: K0FullyPrefilledResumeCacheReceipt,
+    ) -> Result<K0OrderedResumeValue<bool>, SearchError> {
+        crate::k0::search_prevalidated_exists_value_from_fully_prefilled_ordered_resume_with_authenticated_workspace_with_completion(
+            self.automaton,
+            haystack,
+            window,
+            workspace,
+            resume_set,
+            resume_state,
+            resume_position,
+            pending_end,
+            limits,
+            receipt,
+        )
+    }
 }
 
 impl TypedPlan<'_, SelectedEnd> {
@@ -902,6 +935,39 @@ impl TypedPlan<'_, SelectedEnd> {
             resume_position,
             pending_end,
             limits,
+        )
+    }
+
+    /// Return the selected endpoint through a setup-authenticated complete
+    /// ordered-resume cache. A stale receipt uses the ordinary exact path.
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the fully-prefilled resume boundary keeps its setup receipt explicit"
+    )]
+    pub fn search_prevalidated_selected_end_value_from_fully_prefilled_ordered_resume_with_authenticated_workspace_with_completion(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut K0Workspace,
+        resume_set: &mut K0ResumeSet,
+        resume_state: usize,
+        resume_position: usize,
+        pending_end: Option<usize>,
+        limits: SearchLimits,
+        receipt: K0FullyPrefilledResumeCacheReceipt,
+    ) -> Result<K0OrderedResumeValue<Option<usize>>, SearchError> {
+        crate::k0::search_prevalidated_selected_end_value_from_fully_prefilled_ordered_resume_with_authenticated_workspace_with_completion(
+            self.automaton,
+            haystack,
+            window,
+            workspace,
+            resume_set,
+            resume_state,
+            resume_position,
+            pending_end,
+            limits,
+            receipt,
         )
     }
 
@@ -1043,6 +1109,40 @@ impl TypedPlan<'_, Span> {
         )
     }
 
+    /// Return the selected span through setup-authenticated complete forward
+    /// and reverse ordered-resume caches. A stale receipt uses the ordinary
+    /// exact path.
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the fully-prefilled Span resume boundary keeps its setup receipt explicit"
+    )]
+    pub fn search_prevalidated_span_value_from_fully_prefilled_ordered_resume_with_authenticated_workspace_with_completion(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut K0Workspace,
+        resume_set: &mut K0ResumeSet,
+        resume_state: usize,
+        resume_position: usize,
+        pending_end: Option<usize>,
+        limits: SearchLimits,
+        receipt: K0FullyPrefilledResumeCacheReceipt,
+    ) -> Result<K0OrderedResumeValue<Option<MatchSpan>>, SearchError> {
+        crate::k0::search_prevalidated_span_value_from_fully_prefilled_ordered_resume_with_authenticated_workspace_with_completion(
+            self.automaton,
+            haystack,
+            window,
+            workspace,
+            resume_set,
+            resume_state,
+            resume_position,
+            pending_end,
+            limits,
+            receipt,
+        )
+    }
+
     /// Recover a span from one already authenticated selected endpoint.
     ///
     /// This entry runs only K0's reverse machine. `selected_end` must be the
@@ -1078,6 +1178,41 @@ impl TypedPlan<'_, Span> {
         )?;
         let span = report.found.ok_or(SearchError::InternalInvariant {
             detail: "selected-end reverse recovery returned no span",
+        })?;
+        Ok(SearchReport::new(span, report.accounting))
+    }
+
+    /// Recover an authenticated selected endpoint through setup-completed
+    /// reverse rows. A stale receipt or finite resource limit fails closed to
+    /// [`Self::recover_span_from_selected_end_with_workspace`].
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the fully-prefilled reverse bridge keeps its cache owner and selected endpoint explicit"
+    )]
+    pub fn recover_span_from_selected_end_with_fully_prefilled_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut K0Workspace,
+        resume_set: &K0ResumeSet,
+        selected_end: usize,
+        limits: SearchLimits,
+        receipt: K0FullyPrefilledResumeCacheReceipt,
+    ) -> Result<SearchReport<MatchSpan>, SearchError> {
+        let report =
+            crate::k0::recover_span_from_selected_end_with_fully_prefilled_workspace(
+                self.automaton,
+                haystack,
+                window,
+                workspace,
+                resume_set,
+                selected_end,
+                limits,
+                receipt,
+            )?;
+        let span = report.found.ok_or(SearchError::InternalInvariant {
+            detail: "fully-prefilled selected-end reverse recovery returned no span",
         })?;
         Ok(SearchReport::new(span, report.accounting))
     }

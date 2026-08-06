@@ -65,8 +65,9 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex, OnceLock, TryLockError};
 
 use fre_aot_regex::{
-    CompileError, CompiledProgram, MatchResult, OutputContract, PROGRAM_HEADER_LEN,
-    ProgramFormatError, ProgramWorkspace, RetainedPartialPreflight, SearchWindow,
+    CompileError, CompiledProgram, FullyPrefilledFallbackReceipt, MatchResult, OutputContract,
+    PROGRAM_HEADER_LEN, ProgramFormatError, ProgramWorkspace, RetainedPartialPreflight,
+    SearchWindow,
 };
 
 /// No match was selected.
@@ -371,6 +372,7 @@ impl Default for FreAotRegexExclusiveHandleV1 {
 pub struct PreparedAotRegex {
     program: CompiledProgram,
     workspace: ProgramWorkspace,
+    fully_prefilled_fallback: Option<FullyPrefilledFallbackReceipt>,
 }
 
 impl PreparedAotRegex {
@@ -390,10 +392,14 @@ impl PreparedAotRegex {
         let mut workspace = program
             .prepare_workspace()
             .map_err(PrepareError::Workspace)?;
-        program
-            .compiler_private_try_prefill_retained_fallback_with_workspace(&mut workspace)
+        let fully_prefilled_fallback = program
+            .compiler_private_try_prefill_retained_fallback_with_workspace_receipt(&mut workspace)
             .map_err(PrepareError::Workspace)?;
-        Ok(Self { program, workspace })
+        Ok(Self {
+            program,
+            workspace,
+            fully_prefilled_fallback,
+        })
     }
 
     /// Execute without re-deserializing or allocating executor workspace.
@@ -416,11 +422,21 @@ impl PreparedAotRegex {
         haystack: &[u8],
         window: SearchWindow,
     ) -> Result<MatchResult, CompileError> {
-        self.program.search_exclusive_optimized_with_workspace(
-            haystack,
-            window,
-            &mut self.workspace,
-        )
+        if let Some(receipt) = self.fully_prefilled_fallback {
+            self.program
+                .search_exclusive_optimized_with_fully_prefilled_fallback_workspace(
+                    haystack,
+                    window,
+                    &mut self.workspace,
+                    receipt,
+                )
+        } else {
+            self.program.search_exclusive_optimized_with_workspace(
+                haystack,
+                window,
+                &mut self.workspace,
+            )
+        }
     }
 
     fn search_from_retained_partial_resume(
@@ -432,8 +448,20 @@ impl PreparedAotRegex {
         resume_position: usize,
         pending_end: Option<usize>,
     ) -> Result<MatchResult, CompileError> {
-        self.program
-            .search_from_retained_partial_resume_with_workspace(
+        if let Some(receipt) = self.fully_prefilled_fallback {
+            self.program
+                .search_from_retained_partial_resume_with_fully_prefilled_fallback_workspace(
+                    haystack,
+                    window,
+                    &mut self.workspace,
+                    expected_artifact_identity,
+                    resume_state,
+                    resume_position,
+                    pending_end,
+                    receipt,
+                )
+        } else {
+            self.program.search_from_retained_partial_resume_with_workspace(
                 haystack,
                 window,
                 &mut self.workspace,
@@ -442,6 +470,7 @@ impl PreparedAotRegex {
                 resume_position,
                 pending_end,
             )
+        }
     }
 
     fn search_from_preflight_retained_partial_resume(
@@ -452,8 +481,20 @@ impl PreparedAotRegex {
         resume_position: usize,
         pending_end: Option<usize>,
     ) -> Result<MatchResult, CompileError> {
-        self.program
-            .search_from_preflight_retained_partial_resume_with_workspace(
+        if let Some(receipt) = self.fully_prefilled_fallback {
+            self.program
+                .search_from_preflight_retained_partial_resume_with_fully_prefilled_fallback_workspace(
+                    haystack,
+                    window,
+                    &mut self.workspace,
+                    resume_state,
+                    resume_position,
+                    pending_end,
+                    receipt,
+                )
+        } else {
+            self.program
+                .search_from_preflight_retained_partial_resume_with_workspace(
                 haystack,
                 window,
                 &mut self.workspace,
@@ -461,6 +502,7 @@ impl PreparedAotRegex {
                 resume_position,
                 pending_end,
             )
+        }
     }
 
     fn search_from_preflight_retained_partial_resume_ticket(
@@ -470,14 +512,26 @@ impl PreparedAotRegex {
         resume_position: usize,
         pending_end: Option<usize>,
     ) -> Result<MatchResult, CompileError> {
-        self.program
-            .search_from_preflight_retained_partial_resume_ticket_with_workspace(
+        if let Some(receipt) = self.fully_prefilled_fallback {
+            self.program
+                .search_from_preflight_retained_partial_resume_ticket_with_fully_prefilled_fallback_workspace(
+                    haystack,
+                    &mut self.workspace,
+                    resume_state,
+                    resume_position,
+                    pending_end,
+                    receipt,
+                )
+        } else {
+            self.program
+                .search_from_preflight_retained_partial_resume_ticket_with_workspace(
                 haystack,
                 &mut self.workspace,
                 resume_state,
                 resume_position,
                 pending_end,
             )
+        }
     }
 
     fn search_from_preflight_retained_partial_resume_ticket_inferred(
@@ -487,14 +541,26 @@ impl PreparedAotRegex {
         resume_position: usize,
         pending_end: usize,
     ) -> Result<MatchResult, CompileError> {
-        self.program
-            .search_from_preflight_retained_partial_resume_ticket_inferred_with_workspace(
+        if let Some(receipt) = self.fully_prefilled_fallback {
+            self.program
+                .search_from_preflight_retained_partial_resume_ticket_inferred_with_fully_prefilled_fallback_workspace(
+                    haystack,
+                    &mut self.workspace,
+                    resume_state,
+                    resume_position,
+                    pending_end,
+                    receipt,
+                )
+        } else {
+            self.program
+                .search_from_preflight_retained_partial_resume_ticket_inferred_with_workspace(
                 haystack,
                 &mut self.workspace,
                 resume_state,
                 resume_position,
                 pending_end,
             )
+        }
     }
 
     fn prepared_partial_should_enter(
@@ -526,14 +592,26 @@ impl PreparedAotRegex {
         expected_artifact_identity: [u8; ARTIFACT_IDENTITY_BYTES],
         selected_end: usize,
     ) -> Result<MatchResult, CompileError> {
-        self.program
-            .recover_retained_partial_span_from_selected_end_with_workspace(
+        if let Some(receipt) = self.fully_prefilled_fallback {
+            self.program
+                .recover_retained_partial_span_from_selected_end_with_fully_prefilled_fallback_workspace(
+                    haystack,
+                    window,
+                    &mut self.workspace,
+                    expected_artifact_identity,
+                    selected_end,
+                    receipt,
+                )
+        } else {
+            self.program
+                .recover_retained_partial_span_from_selected_end_with_workspace(
                 haystack,
                 window,
                 &mut self.workspace,
                 expected_artifact_identity,
                 selected_end,
             )
+        }
     }
 
     fn preflight_retained_partial_native_root(

@@ -3662,6 +3662,27 @@ impl LazyWorkspace {
             })
     }
 
+    /// Read a cell after a live fully-prefilled receipt authenticated the
+    /// complete direct table and the selected resume row. The safe indexing
+    /// remains a final memory-safety guard, while conversions and fallible
+    /// invariant branches stay off the per-byte path.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the authenticated receipt bounds every direct row and class"
+    )]
+    #[inline]
+    fn fully_prefilled_direct_cell(&self, row_offset: u32, class: u8) -> u32 {
+        debug_assert!(u32::from(class) < self.direct_row_stride);
+        let row_offset = usize::try_from(row_offset)
+            .expect("the authenticated fully-prefilled row offset fits usize");
+        let stride = usize::try_from(self.direct_row_stride)
+            .expect("the authenticated fully-prefilled row stride fits usize");
+        debug_assert_ne!(stride, 0);
+        debug_assert_eq!(row_offset % stride, 0);
+        debug_assert!(row_offset / stride < self.state_len);
+        self.rows[row_offset + usize::from(class)]
+    }
+
     fn set_cell(&mut self, state: u32, class: u8, cell: u32) -> Result<(), SearchError> {
         let state = usize::try_from(state).map_err(|_| SearchError::InternalInvariant {
             detail: "lazy DFA transition state does not fit usize",
@@ -4618,6 +4639,24 @@ impl ReverseWorkspace {
             })
     }
 
+    /// Reverse counterpart of `LazyWorkspace::fully_prefilled_direct_cell`.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the authenticated receipt bounds every reverse row and class"
+    )]
+    #[inline]
+    fn fully_prefilled_direct_cell(&self, row_offset: u32, class: u8) -> u32 {
+        debug_assert!(u32::from(class) < self.direct_row_stride);
+        let row_offset = usize::try_from(row_offset)
+            .expect("the authenticated fully-prefilled reverse row offset fits usize");
+        let stride = usize::try_from(self.direct_row_stride)
+            .expect("the authenticated fully-prefilled reverse row stride fits usize");
+        debug_assert_ne!(stride, 0);
+        debug_assert_eq!(row_offset % stride, 0);
+        debug_assert!(row_offset / stride < self.state_len);
+        self.rows[row_offset + usize::from(class)]
+    }
+
     fn set_cell(&mut self, state: u32, class: u8, value: u32) -> Result<(), SearchError> {
         let state = usize::try_from(state).map_err(|_| SearchError::InternalInvariant {
             detail: "reverse DFA transition state does not fit usize",
@@ -5167,6 +5206,7 @@ pub struct K0ResumeSet {
     items: Vec<u32>,
     cached_states: Vec<u32>,
     cached_workspace_identities: Vec<u64>,
+    fully_prefilled_cache_identity: u64,
     retained_bytes: usize,
 }
 
@@ -5345,6 +5385,7 @@ impl K0ResumeSet {
             items,
             cached_states,
             cached_workspace_identities,
+            fully_prefilled_cache_identity: 0,
             retained_bytes,
         })
     }
@@ -5397,6 +5438,27 @@ impl K0ResumeSet {
             != 0;
         Ok((items, pending))
     }
+}
+
+/// Authentication receipt for one transactionally completed ordered-resume
+/// cache.
+///
+/// The receipt is intentionally opaque. It binds the exact append-only K0
+/// cache generation, direct-row layout, and forward/reverse live extents that
+/// were checked before publication. Compiler-private prepared runtimes may
+/// retain it alongside the permanently owned workspace; every accelerated use
+/// reauthenticates these fields and the selected resume hint in constant time.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct K0FullyPrefilledResumeCacheReceipt {
+    automaton_identity: u64,
+    cache_identity: u64,
+    direct_row_stride: u32,
+    forward_state_len: usize,
+    forward_cells: usize,
+    reverse_allocated: bool,
+    reverse_state_len: usize,
+    reverse_cells: usize,
 }
 
 /// Caller-owned fixed-capacity storage for allocation-free repeated K0 calls.
@@ -5879,7 +5941,108 @@ impl K0Workspace {
         automaton: &Automaton,
         resume_set: &mut K0ResumeSet,
     ) -> bool {
-        prefill_bound_resume_caches_transaction(automaton, self, resume_set).unwrap_or(false)
+        self.compiler_private_try_prefill_resume_caches_with_receipt(automaton, resume_set)
+            .is_some()
+    }
+
+    /// Complete the ordered-resume caches and retain the transaction's exact
+    /// authentication receipt.
+    ///
+    /// This is the receipt-bearing counterpart of
+    /// [`Self::compiler_private_try_prefill_resume_caches`]. A declined or
+    /// failed transaction returns `None` and leaves the live workspace and
+    /// resume hints unchanged.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn compiler_private_try_prefill_resume_caches_with_receipt(
+        &mut self,
+        automaton: &Automaton,
+        resume_set: &mut K0ResumeSet,
+    ) -> Option<K0FullyPrefilledResumeCacheReceipt> {
+        prefill_bound_resume_caches_transaction(automaton, self, resume_set).unwrap_or(None)
+    }
+
+    /// Authenticate a retained prefill receipt and return the exact cached row
+    /// for one already-validated resume-state index.
+    #[inline]
+    fn fully_prefilled_resume_row(
+        &self,
+        automaton: &Automaton,
+        resume_set: &K0ResumeSet,
+        resume_state: usize,
+        receipt: K0FullyPrefilledResumeCacheReceipt,
+        require_reverse: bool,
+    ) -> Option<u32> {
+        self.fully_prefilled_cache_is_live(
+            automaton,
+            resume_set,
+            receipt,
+            require_reverse,
+        )?;
+
+        let cached_hint = *resume_set.cached_states.get(resume_state)?;
+        let cached_identity = *resume_set.cached_workspace_identities.get(resume_state)?;
+        if cached_identity != receipt.cache_identity
+            || cached_hint == LAZY_NO_STATE
+            || usize::try_from(cached_hint).ok()? >= receipt.forward_state_len
+        {
+            return None;
+        }
+        self.lazy.row_offset(cached_hint).ok()
+    }
+
+    /// Authenticate the complete cache transaction without selecting a
+    /// forward resume hint. Reverse-only native Span postflight uses this
+    /// after its exact forward endpoint has already been authenticated.
+    #[inline]
+    fn fully_prefilled_cache_is_live(
+        &self,
+        automaton: &Automaton,
+        resume_set: &K0ResumeSet,
+        receipt: K0FullyPrefilledResumeCacheReceipt,
+        require_reverse: bool,
+    ) -> Option<()> {
+        let stride = usize::try_from(receipt.direct_row_stride).ok()?;
+        let forward_cells = receipt.forward_state_len.checked_mul(stride)?;
+        if receipt.cache_identity == 0
+            || receipt.automaton_identity != automaton.identity()
+            || self.bound_automaton_identity != receipt.automaton_identity
+            || resume_set.automaton_identity != receipt.automaton_identity
+            || self.lazy.automaton_identity != receipt.automaton_identity
+            || self.lazy.cache_identity != receipt.cache_identity
+            || resume_set.fully_prefilled_cache_identity != receipt.cache_identity
+            || self.lazy.direct_row_stride != receipt.direct_row_stride
+            || self.lazy.context.is_allocated()
+            || !self.lazy.initialized
+            || self.lazy.declined
+            || self.lazy.saturated
+            || self.lazy.state_len != receipt.forward_state_len
+            || receipt.forward_cells != forward_cells
+            || receipt.forward_cells > self.lazy.rows.len()
+            || usize::try_from(self.lazy.direct_cells_published).ok()? != receipt.forward_cells
+            || self.reverse.is_allocated() != receipt.reverse_allocated
+        {
+            return None;
+        }
+
+        if receipt.reverse_allocated {
+            let reverse_cells = receipt.reverse_state_len.checked_mul(stride)?;
+            if self.reverse.automaton_identity != receipt.automaton_identity
+                || self.reverse.direct_row_stride != receipt.direct_row_stride
+                || self.reverse.context.is_allocated()
+                || !self.reverse.initialized
+                || self.reverse.declined
+                || self.reverse.saturated
+                || self.reverse.state_len != receipt.reverse_state_len
+                || receipt.reverse_cells != reverse_cells
+                || receipt.reverse_cells > self.reverse.rows.len()
+            {
+                return None;
+            }
+        } else if require_reverse {
+            return None;
+        }
+        Some(())
     }
 
     fn begin_invocation(
@@ -12250,6 +12413,12 @@ enum WarmResumeSpan {
     Complete(Option<MatchSpan>),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FullyPrefilledResumeSpan {
+    Stale,
+    Complete(Option<MatchSpan>),
+}
+
 /// Exact immutable forward position reached before the first unpublished
 /// lazy cell. `work` includes the ordinary invocation reset, cached-state
 /// authentication, and every already-consumed direct byte, but excludes the
@@ -12419,7 +12588,7 @@ fn try_accounted_warm_ordered_resume_endpoint_impl<const LOOP_SKIP: bool>(
     } else {
         resume_cached_state_comparison_work(seed.len())?
     };
-    let mut work = initial_accounted_warm_resume_work(authentication_work)?;
+    let work = initial_accounted_warm_resume_work(authentication_work)?;
     if !trusted_cache {
         let (cached_offset, cached_length, cached_pending) =
             resume_lazy_state_bounds(&workspace.lazy, cached_hint)?;
@@ -12435,7 +12604,109 @@ fn try_accounted_warm_ordered_resume_endpoint_impl<const LOOP_SKIP: bool>(
         }
     }
 
-    let mut row = workspace.lazy.row_offset(cached_hint)?;
+    let row = workspace.lazy.row_offset(cached_hint)?;
+    execute_accounted_warm_ordered_resume_endpoint_loop::<LOOP_SKIP, false>(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        row,
+        resume_position,
+        pending_end,
+        earliest,
+        work,
+    )
+}
+
+/// Execute from a setup-authenticated complete resume cache. `None` is a
+/// constant-time stale-receipt decline and leaves the caller on the ordinary
+/// warm executor. A successful authentication selects a const-generic loop
+/// with no unpublished-cell test or mutable-continuation construction.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the fully-prefilled continuation keeps its receipt and committed prefix explicit"
+)]
+#[inline]
+fn try_fully_prefilled_ordered_resume_endpoint(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &K0Workspace,
+    resume_set: &K0ResumeSet,
+    resume_state: usize,
+    resume_position: usize,
+    pending_end: Option<usize>,
+    earliest: bool,
+    require_reverse: bool,
+    receipt: K0FullyPrefilledResumeCacheReceipt,
+) -> Result<Option<(Option<usize>, u64)>, SearchError> {
+    let Some(row) = workspace.fully_prefilled_resume_row(
+        automaton,
+        resume_set,
+        resume_state,
+        receipt,
+        require_reverse,
+    ) else {
+        return Ok(None);
+    };
+    let work = initial_accounted_warm_resume_work(RESUME_CACHE_IDENTITY_CHECK_WORK)?;
+    let completed = if workspace.lazy.loop_skip_plans.is_empty() {
+        execute_accounted_warm_ordered_resume_endpoint_loop::<false, true>(
+            automaton,
+            haystack,
+            window,
+            workspace,
+            row,
+            resume_position,
+            pending_end,
+            earliest,
+            work,
+        )?
+    } else {
+        execute_accounted_warm_ordered_resume_endpoint_loop::<true, true>(
+            automaton,
+            haystack,
+            window,
+            workspace,
+            row,
+            resume_position,
+            pending_end,
+            earliest,
+            work,
+        )?
+    };
+    match completed {
+        AccountedWarmResumeEndpoint::Complete { found, work } => Ok(Some((found, work))),
+        AccountedWarmResumeEndpoint::Continue(_) | AccountedWarmResumeEndpoint::Declined => {
+            Err(SearchError::InternalInvariant {
+                detail: "fully-prefilled forward loop produced a mutable handoff",
+            })
+        }
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the generic and receipt-authenticated warm paths share exact step accounting"
+)]
+#[inline]
+fn execute_accounted_warm_ordered_resume_endpoint_loop<
+    const LOOP_SKIP: bool,
+    const FULLY_PREFILLED: bool,
+>(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &K0Workspace,
+    mut row: u32,
+    resume_position: usize,
+    pending_end: Option<usize>,
+    earliest: bool,
+    mut work: u64,
+) -> Result<AccountedWarmResumeEndpoint, SearchError> {
+    debug_assert!(!LOOP_SKIP || !workspace.lazy.loop_skip_plans.is_empty());
+    debug_assert!(!FULLY_PREFILLED || workspace.lazy.initialized);
     let mut position = resume_position;
     let mut pending_end = pending_end;
     let mut loop_probe = LazyLoopProbe::default();
@@ -12515,8 +12786,12 @@ fn try_accounted_warm_ordered_resume_endpoint_impl<const LOOP_SKIP: bool>(
                 detail: "warm resume source position exceeded the validated window",
             })?;
         let class = automaton.byte_classes().class_of(byte);
-        let cell = workspace.lazy.direct_cell(row, class)?;
-        if cell == LAZY_CELL_UNFILLED {
+        let cell = if FULLY_PREFILLED {
+            workspace.lazy.fully_prefilled_direct_cell(row, class)
+        } else {
+            workspace.lazy.direct_cell(row, class)?
+        };
+        if !FULLY_PREFILLED && cell == LAZY_CELL_UNFILLED {
             return Ok(AccountedWarmResumeEndpoint::Continue(
                 WarmResumeForwardContinuation {
                     row,
@@ -12526,6 +12801,7 @@ fn try_accounted_warm_ordered_resume_endpoint_impl<const LOOP_SKIP: bool>(
                 },
             ));
         }
+        debug_assert!(!FULLY_PREFILLED || cell != LAZY_CELL_UNFILLED);
         position = position
             .checked_add(1)
             .ok_or(SearchError::ArithmeticOverflow {
@@ -12604,7 +12880,7 @@ fn try_warm_ordered_resume_span(
     resume_position: usize,
     pending_end: Option<usize>,
 ) -> Result<WarmResumeSpan, SearchError> {
-    let (selected_end, mut work) = match try_accounted_warm_ordered_resume_endpoint(
+    let (selected_end, work) = match try_accounted_warm_ordered_resume_endpoint(
         automaton,
         haystack,
         window,
@@ -12640,6 +12916,93 @@ fn try_warm_ordered_resume_span(
     {
         return Ok(WarmResumeSpan::RecoverReverse { selected_end, work });
     }
+    execute_accounted_warm_ordered_resume_reverse_loop::<false>(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        selected_end,
+        work,
+    )
+    .map(|(outcome, _work)| outcome)
+}
+
+/// Execute a bidirectional ordered resume through setup-proved complete rows.
+/// A stale receipt returns `None` before reading the source; an authenticated
+/// call has neither forward nor reverse continuation machinery in its hot
+/// monomorphization.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the fully-prefilled Span continuation keeps its receipt and committed prefix explicit"
+)]
+fn try_fully_prefilled_ordered_resume_span(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &K0Workspace,
+    resume_set: &K0ResumeSet,
+    resume_state: usize,
+    resume_position: usize,
+    pending_end: Option<usize>,
+    receipt: K0FullyPrefilledResumeCacheReceipt,
+) -> Result<FullyPrefilledResumeSpan, SearchError> {
+    let Some((selected_end, work)) = try_fully_prefilled_ordered_resume_endpoint(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        resume_set,
+        resume_state,
+        resume_position,
+        pending_end,
+        false,
+        true,
+        receipt,
+    )?
+    else {
+        return Ok(FullyPrefilledResumeSpan::Stale);
+    };
+    let Some(selected_end) = selected_end else {
+        return Ok(FullyPrefilledResumeSpan::Complete(None));
+    };
+    if selected_end == window.start() {
+        // Preserve the ordinary path's defensive empty-endpoint recovery.
+        return Ok(FullyPrefilledResumeSpan::Stale);
+    }
+    match execute_accounted_warm_ordered_resume_reverse_loop::<true>(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        selected_end,
+        work,
+    )?
+    .0
+    {
+        WarmResumeSpan::Complete(found) => Ok(FullyPrefilledResumeSpan::Complete(found)),
+        WarmResumeSpan::ContinueForward(_)
+        | WarmResumeSpan::RecoverReverse { .. }
+        | WarmResumeSpan::ContinueReverse(_)
+        | WarmResumeSpan::Declined => Err(SearchError::InternalInvariant {
+            detail: "fully-prefilled reverse loop produced a mutable handoff",
+        }),
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the generic and receipt-authenticated reverse paths share exact step accounting"
+)]
+fn execute_accounted_warm_ordered_resume_reverse_loop<const FULLY_PREFILLED: bool>(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &K0Workspace,
+    selected_end: usize,
+    mut work: u64,
+) -> Result<(WarmResumeSpan, u64), SearchError> {
+    let reverse = &workspace.reverse;
+    debug_assert!(!FULLY_PREFILLED || reverse.initialized);
     let mut row = reverse.row_offset(reverse.initial)?;
     let mut cursor = selected_end;
     let mut candidate = None;
@@ -12660,18 +13023,24 @@ fn try_warm_ordered_resume_span(
                 detail: "warm resume Span reverse position exceeded the validated source",
             })?;
         let class = automaton.byte_classes().class_of(byte);
-        let cell = reverse.direct_cell(row, class)?;
-        if cell == LAZY_CELL_UNFILLED {
-            return Ok(WarmResumeSpan::ContinueReverse(
-                WarmResumeReverseContinuation {
+        let cell = if FULLY_PREFILLED {
+            reverse.fully_prefilled_direct_cell(row, class)
+        } else {
+            reverse.direct_cell(row, class)?
+        };
+        if !FULLY_PREFILLED && cell == LAZY_CELL_UNFILLED {
+            return Ok((
+                WarmResumeSpan::ContinueReverse(WarmResumeReverseContinuation {
                     selected_end,
                     row,
                     cursor,
                     candidate,
                     work: work_before_step,
-                },
+                }),
+                work,
             ));
         }
+        debug_assert!(!FULLY_PREFILLED || cell != LAZY_CELL_UNFILLED);
         debug_assert_eq!(cell & (LAZY_CELL_RESTART | LAZY_CELL_START_PROPAGATE), 0);
         cursor = source;
         if cell & LAZY_CELL_ACCEPT != 0 {
@@ -12688,10 +13057,10 @@ fn try_warm_ordered_resume_span(
     let start = candidate.ok_or(SearchError::InternalInvariant {
         detail: "warmed reverse DFA could not recover the resume-selected span",
     })?;
-    Ok(WarmResumeSpan::Complete(Some(MatchSpan::new(
-        start,
-        selected_end,
-    ))))
+    Ok((
+        WarmResumeSpan::Complete(Some(MatchSpan::new(start, selected_end))),
+        work,
+    ))
 }
 
 /// Start mutable execution only after a read-only warm probe reaches its
@@ -12981,6 +13350,66 @@ pub(crate) fn search_prevalidated_exists_value_from_ordered_resume_with_authenti
     pending_end: Option<usize>,
     limits: SearchLimits,
 ) -> Result<K0OrderedResumeValue<bool>, SearchError> {
+    search_prevalidated_exists_value_from_ordered_resume_with_authenticated_workspace_with_completion_impl(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        resume_set,
+        resume_state,
+        resume_position,
+        pending_end,
+        limits,
+        None,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the fully-prefilled value continuation keeps its authenticated setup receipt explicit"
+)]
+pub(crate) fn search_prevalidated_exists_value_from_fully_prefilled_ordered_resume_with_authenticated_workspace_with_completion(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    resume_set: &mut K0ResumeSet,
+    resume_state: usize,
+    resume_position: usize,
+    pending_end: Option<usize>,
+    limits: SearchLimits,
+    receipt: K0FullyPrefilledResumeCacheReceipt,
+) -> Result<K0OrderedResumeValue<bool>, SearchError> {
+    search_prevalidated_exists_value_from_ordered_resume_with_authenticated_workspace_with_completion_impl(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        resume_set,
+        resume_state,
+        resume_position,
+        pending_end,
+        limits,
+        Some(receipt),
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the value-only continuation keeps its authenticated frontier and optional setup receipt explicit"
+)]
+fn search_prevalidated_exists_value_from_ordered_resume_with_authenticated_workspace_with_completion_impl(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    resume_set: &mut K0ResumeSet,
+    resume_state: usize,
+    resume_position: usize,
+    pending_end: Option<usize>,
+    limits: SearchLimits,
+    receipt: Option<K0FullyPrefilledResumeCacheReceipt>,
+) -> Result<K0OrderedResumeValue<bool>, SearchError> {
     validate_ordered_resume_request(
         automaton,
         haystack,
@@ -12993,6 +13422,27 @@ pub(crate) fn search_prevalidated_exists_value_from_ordered_resume_with_authenti
         OutputContract::Exists,
     )?;
     if limits == SearchLimits::unlimited() {
+        if let Some(receipt) = receipt {
+            if let Some((found, _work)) = try_fully_prefilled_ordered_resume_endpoint(
+                automaton,
+                haystack,
+                window,
+                workspace,
+                resume_set,
+                resume_state,
+                resume_position,
+                pending_end,
+                true,
+                false,
+                receipt,
+            )?
+            {
+                return Ok(K0OrderedResumeValue::new(
+                    found.is_some(),
+                    K0OrderedResumeCompletion::FullyWarmRows,
+                ));
+            }
+        }
         match try_warm_ordered_resume_endpoint(
             automaton,
             haystack,
@@ -13065,6 +13515,66 @@ pub(crate) fn search_prevalidated_selected_end_value_from_ordered_resume_with_au
     pending_end: Option<usize>,
     limits: SearchLimits,
 ) -> Result<K0OrderedResumeValue<Option<usize>>, SearchError> {
+    search_prevalidated_selected_end_value_from_ordered_resume_with_authenticated_workspace_with_completion_impl(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        resume_set,
+        resume_state,
+        resume_position,
+        pending_end,
+        limits,
+        None,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the fully-prefilled value continuation keeps its authenticated setup receipt explicit"
+)]
+pub(crate) fn search_prevalidated_selected_end_value_from_fully_prefilled_ordered_resume_with_authenticated_workspace_with_completion(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    resume_set: &mut K0ResumeSet,
+    resume_state: usize,
+    resume_position: usize,
+    pending_end: Option<usize>,
+    limits: SearchLimits,
+    receipt: K0FullyPrefilledResumeCacheReceipt,
+) -> Result<K0OrderedResumeValue<Option<usize>>, SearchError> {
+    search_prevalidated_selected_end_value_from_ordered_resume_with_authenticated_workspace_with_completion_impl(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        resume_set,
+        resume_state,
+        resume_position,
+        pending_end,
+        limits,
+        Some(receipt),
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the value-only continuation keeps its authenticated frontier and optional setup receipt explicit"
+)]
+fn search_prevalidated_selected_end_value_from_ordered_resume_with_authenticated_workspace_with_completion_impl(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    resume_set: &mut K0ResumeSet,
+    resume_state: usize,
+    resume_position: usize,
+    pending_end: Option<usize>,
+    limits: SearchLimits,
+    receipt: Option<K0FullyPrefilledResumeCacheReceipt>,
+) -> Result<K0OrderedResumeValue<Option<usize>>, SearchError> {
     validate_ordered_resume_request(
         automaton,
         haystack,
@@ -13077,6 +13587,27 @@ pub(crate) fn search_prevalidated_selected_end_value_from_ordered_resume_with_au
         OutputContract::SelectedEnd,
     )?;
     if limits == SearchLimits::unlimited() {
+        if let Some(receipt) = receipt {
+            if let Some((found, _work)) = try_fully_prefilled_ordered_resume_endpoint(
+                automaton,
+                haystack,
+                window,
+                workspace,
+                resume_set,
+                resume_state,
+                resume_position,
+                pending_end,
+                false,
+                false,
+                receipt,
+            )?
+            {
+                return Ok(K0OrderedResumeValue::new(
+                    found,
+                    K0OrderedResumeCompletion::FullyWarmRows,
+                ));
+            }
+        }
         match try_warm_ordered_resume_endpoint(
             automaton,
             haystack,
@@ -13150,6 +13681,67 @@ pub(crate) fn search_prevalidated_span_value_from_ordered_resume_with_authentica
     pending_end: Option<usize>,
     limits: SearchLimits,
 ) -> Result<K0OrderedResumeValue<Option<MatchSpan>>, SearchError> {
+    search_prevalidated_span_value_from_ordered_resume_with_authenticated_workspace_with_completion_impl(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        resume_set,
+        resume_state,
+        resume_position,
+        pending_end,
+        limits,
+        None,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the fully-prefilled Span continuation keeps its authenticated setup receipt explicit"
+)]
+pub(crate) fn search_prevalidated_span_value_from_fully_prefilled_ordered_resume_with_authenticated_workspace_with_completion(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    resume_set: &mut K0ResumeSet,
+    resume_state: usize,
+    resume_position: usize,
+    pending_end: Option<usize>,
+    limits: SearchLimits,
+    receipt: K0FullyPrefilledResumeCacheReceipt,
+) -> Result<K0OrderedResumeValue<Option<MatchSpan>>, SearchError> {
+    search_prevalidated_span_value_from_ordered_resume_with_authenticated_workspace_with_completion_impl(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        resume_set,
+        resume_state,
+        resume_position,
+        pending_end,
+        limits,
+        Some(receipt),
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the Span continuation keeps its authenticated frontier and optional setup receipt explicit"
+)]
+fn search_prevalidated_span_value_from_ordered_resume_with_authenticated_workspace_with_completion_impl(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    resume_set: &mut K0ResumeSet,
+    resume_state: usize,
+    resume_position: usize,
+    pending_end: Option<usize>,
+    limits: SearchLimits,
+    receipt: Option<K0FullyPrefilledResumeCacheReceipt>,
+) -> Result<K0OrderedResumeValue<Option<MatchSpan>>, SearchError> {
     validate_ordered_resume_request(
         automaton,
         haystack,
@@ -13167,6 +13759,26 @@ pub(crate) fn search_prevalidated_span_value_from_ordered_resume_with_authentica
         });
     }
     if limits == SearchLimits::unlimited() {
+        if let Some(receipt) = receipt {
+            if let FullyPrefilledResumeSpan::Complete(found) =
+                try_fully_prefilled_ordered_resume_span(
+                automaton,
+                haystack,
+                window,
+                workspace,
+                resume_set,
+                resume_state,
+                resume_position,
+                pending_end,
+                receipt,
+            )?
+            {
+                return Ok(K0OrderedResumeValue::new(
+                    found,
+                    K0OrderedResumeCompletion::FullyWarmRows,
+                ));
+            }
+        }
         match try_warm_ordered_resume_span(
             automaton,
             haystack,
@@ -13410,6 +14022,103 @@ pub(crate) fn recover_span_from_selected_end_with_workspace(
         found: Some(MatchSpan::new(start, selected_end)),
         accounting: SearchAccounting::new(
             meter.consumed,
+            setup,
+            transition_work,
+            scratch_bytes,
+            boundaries,
+        ),
+    })
+}
+
+/// Reverse-only counterpart of the fully-prefilled ordered-resume executor.
+///
+/// The native forward machine has already authenticated and selected the
+/// endpoint, so a live receipt can traverse the setup-completed reverse rows
+/// without testing for unpublished cells or constructing a mutable handoff.
+/// Finite limits, empty endpoints, and stale receipts use the ordinary exact
+/// recovery entry unchanged.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the reverse-only bridge keeps its exact endpoint, cache owner, and setup receipt explicit"
+)]
+pub(crate) fn recover_span_from_selected_end_with_fully_prefilled_workspace(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    resume_set: &K0ResumeSet,
+    selected_end: usize,
+    limits: SearchLimits,
+    receipt: K0FullyPrefilledResumeCacheReceipt,
+) -> Result<UntypedReport, SearchError> {
+    validate_window(haystack, window)?;
+    if selected_end < window.start() || selected_end > window.end() {
+        return Err(SearchError::InvalidResumeState {
+            detail: "selected endpoint is outside the original search window",
+        });
+    }
+    if workspace.bound_automaton_identity != automaton.identity() {
+        return Err(SearchError::InvalidResumeState {
+            detail: "selected-end reverse recovery workspace belongs to another automaton",
+        });
+    }
+    if selected_end != window.start()
+        && (automaton.stats().assertion_edges() != 0
+            || !workspace.reverse.is_allocated()
+            || !workspace.reverse.is_bound_to(automaton))
+    {
+        return Err(SearchError::InvalidResumeState {
+            detail: "positive selected-end recovery requires an assertion-free bound bidirectional workspace",
+        });
+    }
+    if limits != SearchLimits::unlimited()
+        || selected_end == window.start()
+        || workspace
+            .fully_prefilled_cache_is_live(automaton, resume_set, receipt, true)
+            .is_none()
+    {
+        return recover_span_from_selected_end_with_workspace(
+            automaton,
+            haystack,
+            window,
+            workspace,
+            selected_end,
+            limits,
+        );
+    }
+
+    let initial_work = initial_accounted_warm_resume_work(0)?;
+    let (outcome, work) = execute_accounted_warm_ordered_resume_reverse_loop::<true>(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        selected_end,
+        initial_work,
+    )?;
+    let WarmResumeSpan::Complete(Some(found)) = outcome else {
+        return Err(SearchError::InternalInvariant {
+            detail: "fully-prefilled selected-end recovery produced a mutable handoff",
+        });
+    };
+    let transition_work = work.checked_sub(initial_work).ok_or(
+        SearchError::InternalInvariant {
+            detail: "fully-prefilled selected-end recovery work regressed",
+        },
+    )?;
+    let boundaries = usize::try_from(transition_work)
+        .ok()
+        .and_then(|bytes| bytes.checked_add(1))
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "fully-prefilled selected-end examined boundaries",
+        })?;
+    let scratch_bytes = workspace.retained_bytes;
+    let mut setup = SetupAccounting::empty(scratch_bytes, true);
+    setup.work = initial_work;
+    Ok(UntypedReport {
+        found: Some(found),
+        accounting: SearchAccounting::new(
+            work,
             setup,
             transition_work,
             scratch_bytes,
@@ -15324,6 +16033,11 @@ fn seed_lazy_resume_state(
             .intern_speculative(pending, meter, core_reserve, position)?
         {
             LazyInterned::State(state) => {
+                // Publishing or repairing any hint ends the all-rows receipt
+                // lifecycle. A later prepared invocation must re-enter the
+                // ordinary authenticated warm path instead of assuming that
+                // every hint still belongs to the setup transaction.
+                resume_set.fully_prefilled_cache_identity = 0;
                 resume_set.cached_states[resume_state] = state;
                 resume_set.cached_workspace_identities[resume_state] = cache_identity;
                 return Ok(LazyState::Cached(workspace.lazy.row_offset(state)?));
@@ -16748,7 +17462,7 @@ fn prefill_bound_resume_caches_transaction(
     automaton: &Automaton,
     live: &mut K0Workspace,
     resume_set: &mut K0ResumeSet,
-) -> Result<bool, SearchError> {
+) -> Result<Option<K0FullyPrefilledResumeCacheReceipt>, SearchError> {
     if live.bound_automaton_identity != automaton.identity()
         || !resume_set.is_bound_to(automaton)
         || automaton.stats().assertion_edges() != 0
@@ -16771,7 +17485,7 @@ fn prefill_bound_resume_caches_transaction(
             .iter()
             .any(|&state| state != LAZY_NO_STATE)
     {
-        return Ok(false);
+        return Ok(None);
     }
 
     let mut staged =
@@ -16779,17 +17493,17 @@ fn prefill_bound_resume_caches_transaction(
     if staged.lazy.context.is_allocated()
         || staged.reverse.is_allocated() && staged.reverse.context.is_allocated()
     {
-        return Ok(false);
+        return Ok(None);
     }
 
     let mut meter = WorkMeter::new(u64::MAX, 0);
     if !prepare_lazy(automaton, &mut staged, &mut meter, 0, 0)? {
-        return Ok(false);
+        return Ok(None);
     }
 
     let hint_count = resume_set.cached_states.len();
     if hint_count == 0 {
-        return Ok(false);
+        return Ok(None);
     }
     let mut staged_hints = allocate_slots(hint_count, LAZY_NO_STATE, resume_set.retained_bytes())?;
     for (resume_state, hint) in staged_hints.iter_mut().enumerate() {
@@ -16808,19 +17522,18 @@ fn prefill_bound_resume_caches_transaction(
         staged.lazy.scratch_len = frontier.len();
         *hint = match staged.lazy.intern_speculative(pending, &mut meter, 0, 0)? {
             LazyInterned::State(state) => state,
-            LazyInterned::BudgetDeclined | LazyInterned::CapacityFull => return Ok(false),
+            LazyInterned::BudgetDeclined | LazyInterned::CapacityFull => return Ok(None),
         };
     }
 
     if !prefill_all_forward_direct_rows(automaton, &mut staged, &mut meter)? {
-        return Ok(false);
+        return Ok(None);
     }
-    if staged.reverse.is_allocated() {
-        if !prepare_reverse_lazy(automaton, &mut staged, &mut meter, 0, 0)?
-            || !prefill_all_reverse_direct_rows(automaton, &mut staged, &mut meter)?
-        {
-            return Ok(false);
-        }
+    if staged.reverse.is_allocated()
+        && (!prepare_reverse_lazy(automaton, &mut staged, &mut meter, 0, 0)?
+            || !prefill_all_reverse_direct_rows(automaton, &mut staged, &mut meter)?)
+    {
+        return Ok(None);
     }
 
     let stride = automaton.byte_classes().count();
@@ -16845,7 +17558,7 @@ fn prefill_bound_resume_caches_transaction(
             .get(..forward_cells)
             .map_or(true, |rows| rows.contains(&LAZY_CELL_UNFILLED))
     {
-        return Ok(false);
+        return Ok(None);
     }
     if staged.reverse.is_allocated() {
         let reverse_cells = staged.reverse.state_len.checked_mul(stride).ok_or(
@@ -16860,7 +17573,7 @@ fn prefill_bound_resume_caches_transaction(
                 .get(..reverse_cells)
                 .map_or(true, |rows| rows.contains(&LAZY_CELL_UNFILLED))
         {
-            return Ok(false);
+            return Ok(None);
         }
     }
 
@@ -16884,20 +17597,45 @@ fn prefill_bound_resume_caches_transaction(
         // `Vec::try_reserve_exact` may legally retain more than requested.
         // Refuse a replacement whose allocator-visible capacities would make
         // the live workspace's already-published scratch accounting stale.
-        return Ok(false);
+        return Ok(None);
     }
 
     // No checked or allocating operation follows these publications. The
     // ordinary Pike scratch, live generation, span cursor, accounting, and
     // fixed retained-byte contract stay intact.
     let staged_cache_identity = staged.lazy.cache_identity;
+    // Identity exhaustion deliberately declines the optimized receipt rather
+    // than publishing a cache that cannot be reauthenticated in constant
+    // time. The ordinary exact executor remains available unchanged.
+    if staged_cache_identity == 0 {
+        return Ok(None);
+    }
+    let receipt = K0FullyPrefilledResumeCacheReceipt {
+        automaton_identity: automaton.identity(),
+        cache_identity: staged_cache_identity,
+        direct_row_stride: staged.lazy.direct_row_stride,
+        forward_state_len: staged.lazy.state_len,
+        forward_cells,
+        reverse_allocated: staged.reverse.is_allocated(),
+        reverse_state_len: staged.reverse.state_len,
+        reverse_cells: if staged.reverse.is_allocated() {
+            staged.reverse.state_len.checked_mul(stride).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "compiler-private reverse receipt cells",
+                },
+            )?
+        } else {
+            0
+        },
+    };
     core::mem::swap(&mut live.lazy, &mut staged.lazy);
     core::mem::swap(&mut live.reverse, &mut staged.reverse);
     resume_set.cached_states.copy_from_slice(&staged_hints);
     resume_set
         .cached_workspace_identities
         .fill(staged_cache_identity);
-    Ok(true)
+    resume_set.fully_prefilled_cache_identity = staged_cache_identity;
+    Ok(Some(receipt))
 }
 
 fn prefill_all_forward_direct_rows(
@@ -46957,6 +47695,224 @@ mod tests {
         assert_eq!(workspace.lazy.state_len, forward_states);
         assert_eq!(workspace.reverse.state_len, reverse_states);
         assert_eq!(workspace.lazy.direct_cells_published, published);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one lifecycle test covers all outputs, reverse recovery, and stale-receipt repair"
+    )]
+    fn fully_prefilled_resume_receipt_covers_all_outputs_and_fails_closed_after_repair() {
+        let plan = direct_split_loop_then_terminal();
+        let frontier = [0_u32];
+        let mut resume = K0ResumeSet::new(&plan, 1, 1, [(&frontier[..], false)]).unwrap();
+        let mut workspace =
+            K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let receipt = workspace
+            .compiler_private_try_prefill_resume_caches_with_receipt(&plan, &mut resume)
+            .expect("the complete direct graph must publish a receipt");
+
+        let prefix = 5;
+        let run = super::LAZY_LOOP_SKIP_MIN_BYTES * 2;
+        let mut haystack = vec![b'!'; prefix];
+        haystack.extend(core::iter::repeat(b'b').take(run));
+        haystack.push(b'z');
+        let end = haystack.len();
+        haystack.extend_from_slice(b"!!");
+        let window = SearchWindow::new(prefix, end);
+        let expected_work = super::INVOCATION_RESET_WORK
+            + super::RESUME_CACHE_IDENTITY_CHECK_WORK
+            + u64::try_from(window.end() - window.start()).unwrap();
+
+        assert_eq!(
+            super::try_fully_prefilled_ordered_resume_endpoint(
+                &plan,
+                &haystack,
+                window,
+                &workspace,
+                &resume,
+                0,
+                window.start(),
+                None,
+                false,
+                true,
+                receipt,
+            )
+            .unwrap(),
+            Some((Some(window.end()), expected_work))
+        );
+        assert_eq!(
+            super::try_fully_prefilled_ordered_resume_span(
+                &plan,
+                &haystack,
+                window,
+                &workspace,
+                &resume,
+                0,
+                window.start(),
+                None,
+                receipt,
+            )
+            .unwrap(),
+            super::FullyPrefilledResumeSpan::Complete(Some(MatchSpan::new(
+                window.start(),
+                window.end(),
+            )))
+        );
+
+        let forward_states = workspace.lazy.state_len;
+        let reverse_states = workspace.reverse.state_len;
+        assert_eq!(
+            plan.prepare::<Exists>()
+                .search_prevalidated_exists_value_from_fully_prefilled_ordered_resume_with_authenticated_workspace_with_completion(
+                    &haystack,
+                    window,
+                    &mut workspace,
+                    &mut resume,
+                    0,
+                    window.start(),
+                    None,
+                    SearchLimits::unlimited(),
+                    receipt,
+                )
+                .unwrap()
+                .into_parts(),
+            (true, K0OrderedResumeCompletion::FullyWarmRows)
+        );
+        assert_eq!(
+            plan.prepare::<SelectedEnd>()
+                .search_prevalidated_selected_end_value_from_fully_prefilled_ordered_resume_with_authenticated_workspace_with_completion(
+                    &haystack,
+                    window,
+                    &mut workspace,
+                    &mut resume,
+                    0,
+                    window.start(),
+                    None,
+                    SearchLimits::unlimited(),
+                    receipt,
+                )
+                .unwrap()
+                .into_parts(),
+            (
+                Some(window.end()),
+                K0OrderedResumeCompletion::FullyWarmRows,
+            )
+        );
+        assert_eq!(
+            plan.prepare::<Span>()
+                .search_prevalidated_span_value_from_fully_prefilled_ordered_resume_with_authenticated_workspace_with_completion(
+                    &haystack,
+                    window,
+                    &mut workspace,
+                    &mut resume,
+                    0,
+                    window.start(),
+                    None,
+                    SearchLimits::unlimited(),
+                    receipt,
+                )
+                .unwrap()
+                .into_parts(),
+            (
+                Some(MatchSpan::new(window.start(), window.end())),
+                K0OrderedResumeCompletion::FullyWarmRows,
+            )
+        );
+        assert_eq!(workspace.lazy.state_len, forward_states);
+        assert_eq!(workspace.reverse.state_len, reverse_states);
+
+        let reverse_only = plan
+            .prepare::<Span>()
+            .recover_span_from_selected_end_with_fully_prefilled_workspace(
+                &haystack,
+                window,
+                &mut workspace,
+                &resume,
+                window.end(),
+                SearchLimits::unlimited(),
+                receipt,
+            )
+            .unwrap();
+        assert_eq!(
+            reverse_only.output(),
+            &MatchSpan::new(window.start(), window.end())
+        );
+        assert_eq!(
+            reverse_only.accounting().work(),
+            super::INVOCATION_RESET_WORK + u64::try_from(window.end() - window.start()).unwrap()
+        );
+        assert_eq!(
+            reverse_only.accounting().transition_work(),
+            u64::try_from(window.end() - window.start()).unwrap()
+        );
+        assert_eq!(
+            reverse_only.accounting().boundaries(),
+            window.end() - window.start() + 1
+        );
+
+        // Pairing the resume set with another append-only cache repairs its
+        // hint and explicitly ends the original receipt lifecycle.
+        let mut foreign =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        assert_eq!(
+            plan.prepare::<SelectedEnd>()
+                .search_prevalidated_selected_end_value_from_ordered_resume_with_authenticated_workspace(
+                    &haystack,
+                    window,
+                    &mut foreign,
+                    &mut resume,
+                    0,
+                    window.start(),
+                    None,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            Some(window.end())
+        );
+        assert_eq!(resume.fully_prefilled_cache_identity, 0);
+        assert!(
+            workspace
+                .fully_prefilled_resume_row(&plan, &resume, 0, receipt, true)
+                .is_none()
+        );
+
+        // The receipt-bearing facade must now select the old exact executor,
+        // repair the hint for the original workspace, and preserve the value.
+        assert_eq!(
+            plan.prepare::<SelectedEnd>()
+                .search_prevalidated_selected_end_value_from_fully_prefilled_ordered_resume_with_authenticated_workspace_with_completion(
+                    &haystack,
+                    window,
+                    &mut workspace,
+                    &mut resume,
+                    0,
+                    window.start(),
+                    None,
+                    SearchLimits::unlimited(),
+                    receipt,
+                )
+                .unwrap()
+                .into_output(),
+            Some(window.end())
+        );
+        assert_eq!(resume.fully_prefilled_cache_identity, 0);
+        assert_eq!(
+            plan.prepare::<Span>()
+                .recover_span_from_selected_end_with_fully_prefilled_workspace(
+                    &haystack,
+                    window,
+                    &mut workspace,
+                    &resume,
+                    window.end(),
+                    SearchLimits::unlimited(),
+                    receipt,
+                )
+                .unwrap()
+                .into_output(),
+            MatchSpan::new(window.start(), window.end())
+        );
+        assert_eq!(resume.fully_prefilled_cache_identity, 0);
     }
 
     #[test]

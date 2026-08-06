@@ -50,9 +50,9 @@ pub use object::{ObjectFormat, emit_object};
 pub use program::{
     AnchoredPrefixStats, CompiledProgram, ContextDeterminizationReport, DynamicNativeRowsV1,
     EngineKind,
-    EngineSelectionReason, MAX_ANCHORED_PREFIX_BYTES, MAX_SERIALIZED_PROGRAM_BYTES, MatchResult,
-    OutputContract, PROGRAM_HEADER_LEN, PartialDfaStats, ProgramFormatError, ProgramStats,
-    ProgramWorkspace, RetainedPartialPreflight, SearchWindow,
+    EngineSelectionReason, FullyPrefilledFallbackReceipt, MAX_ANCHORED_PREFIX_BYTES,
+    MAX_SERIALIZED_PROGRAM_BYTES, MatchResult, OutputContract, PROGRAM_HEADER_LEN, PartialDfaStats,
+    ProgramFormatError, ProgramStats, ProgramWorkspace, RetainedPartialPreflight, SearchWindow,
 };
 
 /// Stable compiler pipeline identity.
