@@ -23060,9 +23060,13 @@ fn expand_root<E: PikeBoundaryEvaluator>(
     if meter.limit == u64::MAX {
         if let Some(dispatch) = automaton.epsilon_closure_dispatch.as_ref() {
             match dispatch.root(root.state) {
-                crate::epsilon_closure_dispatch::ClosureRoot::Program(program) => {
+                crate::epsilon_closure_dispatch::ClosureRoot::Program {
+                    instructions,
+                    max_work,
+                } => {
                     return expand_compiled_epsilon_root(
-                        program,
+                        instructions,
+                        max_work,
                         position,
                         root.start,
                         workspace,
@@ -23152,12 +23156,107 @@ fn expand_direct_epsilon_leaf_root(
 #[inline]
 fn expand_compiled_epsilon_root(
     program: &[crate::epsilon_closure_dispatch::ClosureInstruction],
+    max_work: u64,
     position: usize,
     start: usize,
     workspace: &mut K0Workspace,
     meter: &mut WorkMeter,
 ) -> Result<Option<MatchSpan>, SearchError> {
     workspace.stack_len = 0;
+    if max_work <= meter.remaining() {
+        let (result, work) = expand_compiled_epsilon_root_deferred(
+            program,
+            position,
+            start,
+            workspace,
+        );
+        debug_assert!(work <= max_work);
+        meter.charge_admitted(work);
+        return result;
+    }
+    expand_compiled_epsilon_root_exact(program, position, start, workspace, meter)
+}
+
+/// Execute one program after its retained shape proves that every possible
+/// state-pop and Split-edge charge fits the current unlimited receipt. The
+/// exact completed work remains local until every success or error exit, so
+/// the hot loop does not repeatedly compare or publish `WorkMeter` state.
+#[inline]
+fn expand_compiled_epsilon_root_deferred(
+    program: &[crate::epsilon_closure_dispatch::ClosureInstruction],
+    position: usize,
+    start: usize,
+    workspace: &mut K0Workspace,
+) -> (Result<Option<MatchSpan>, SearchError>, u64) {
+    let mut work = 0_u64;
+    let mut instruction_index = 0usize;
+    while instruction_index < program.len() {
+        let instruction = program[instruction_index];
+        work = work.wrapping_add(1);
+        let state = crate::plan::plan_index(instruction.state());
+        if workspace.seen_at[state] == workspace.generation {
+            let subtree_end = instruction.subtree_end();
+            if subtree_end <= instruction_index || subtree_end > program.len() {
+                return (
+                    Err(SearchError::InternalInvariant {
+                        detail: "compiled epsilon closure has an invalid subtree end",
+                    }),
+                    work,
+                );
+            }
+            instruction_index = subtree_end;
+            continue;
+        }
+        workspace.seen_at[state] = workspace.generation;
+
+        match instruction.action() {
+            crate::epsilon_closure_dispatch::ClosureAction::Accept => {
+                return (Ok(Some(MatchSpan::new(start, position))), work);
+            }
+            crate::epsilon_closure_dispatch::ClosureAction::Consume => {
+                if let Err(error) = workspace.push_current(Thread {
+                    state: instruction.state(),
+                    start,
+                }) {
+                    return (Err(error), work);
+                }
+            }
+            crate::epsilon_closure_dispatch::ClosureAction::Split => {
+                work = work.wrapping_add(u64::from(instruction.edge_work()));
+            }
+            crate::epsilon_closure_dispatch::ClosureAction::SeenBackedge => {
+                return (
+                    Err(SearchError::InternalInvariant {
+                        detail: "compiled epsilon backedge reached an unseen state",
+                    }),
+                    work,
+                );
+            }
+        }
+        let Some(next) = instruction_index.checked_add(1) else {
+            return (
+                Err(SearchError::ArithmeticOverflow {
+                    computation: "compiled epsilon instruction cursor",
+                }),
+                work,
+            );
+        };
+        instruction_index = next;
+    }
+    (Ok(None), work)
+}
+
+/// Preserve scalar charge/failure order when an invocation has reached the
+/// narrow tail where the retained program bound no longer proves completion.
+#[cold]
+#[inline(never)]
+fn expand_compiled_epsilon_root_exact(
+    program: &[crate::epsilon_closure_dispatch::ClosureInstruction],
+    position: usize,
+    start: usize,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+) -> Result<Option<MatchSpan>, SearchError> {
     let mut instruction_index = 0usize;
     while instruction_index < program.len() {
         let instruction = program[instruction_index];
@@ -32327,6 +32426,114 @@ mod tests {
     }
 
     #[test]
+    fn deferred_compiled_epsilon_settles_success_and_malformed_errors_exactly() {
+        use crate::epsilon_closure_dispatch::{ClosureAction, ClosureInstruction};
+
+        fn run(
+            automaton: &Automaton,
+            program: &[ClosureInstruction],
+            max_work: u64,
+            seen: bool,
+            current_full: bool,
+            exact: bool,
+        ) -> (
+            Result<Option<MatchSpan>, SearchError>,
+            u64,
+            usize,
+            usize,
+            Vec<u64>,
+        ) {
+            let mut workspace =
+                K0Workspace::new(automaton, WorkspaceLimits::unlimited()).unwrap();
+            workspace.generation = 1;
+            if seen {
+                workspace.seen_at[0] = workspace.generation;
+            }
+            if current_full {
+                workspace.current_len = workspace.current.len();
+            }
+            let mut meter = WorkMeter::new(u64::MAX, 11);
+            let result = if exact {
+                super::expand_compiled_epsilon_root_exact(
+                    program,
+                    0,
+                    17,
+                    &mut workspace,
+                    &mut meter,
+                )
+            } else {
+                super::expand_compiled_epsilon_root(
+                    program,
+                    max_work,
+                    0,
+                    17,
+                    &mut workspace,
+                    &mut meter,
+                )
+            };
+            (
+                result,
+                meter.consumed,
+                workspace.current_len,
+                workspace.stack_len,
+                workspace.seen_at,
+            )
+        }
+
+        let automaton = duplicate_target_closure(2);
+        let cases = [
+            (
+                ClosureInstruction::for_runtime_test(0, 1, ClosureAction::Split, 4),
+                false,
+                false,
+                5,
+            ),
+            (
+                ClosureInstruction::for_runtime_test(0, 1, ClosureAction::Accept, 0),
+                false,
+                false,
+                1,
+            ),
+            (
+                ClosureInstruction::for_runtime_test(0, 1, ClosureAction::Consume, 0),
+                true,
+                false,
+                1,
+            ),
+            (
+                ClosureInstruction::for_runtime_test(0, 0, ClosureAction::Split, 0),
+                true,
+                false,
+                1,
+            ),
+            (
+                ClosureInstruction::for_runtime_test(
+                    0,
+                    1,
+                    ClosureAction::SeenBackedge,
+                    0,
+                ),
+                false,
+                false,
+                1,
+            ),
+            (
+                ClosureInstruction::for_runtime_test(0, 1, ClosureAction::Consume, 0),
+                false,
+                true,
+                1,
+            ),
+        ];
+        for (instruction, seen, current_full, expected_work) in cases {
+            let program = [instruction];
+            let deferred = run(&automaton, &program, 8, seen, current_full, false);
+            let exact = run(&automaton, &program, 8, seen, current_full, true);
+            assert_eq!(deferred, exact);
+            assert_eq!(deferred.1, 11 + expected_work);
+        }
+    }
+
+    #[test]
     #[allow(
         clippy::too_many_lines,
         reason = "all output contracts, exact-start routing, finite limits, and near-overflow recovery share one closure differential"
@@ -32468,6 +32675,68 @@ mod tests {
 
         let (baseline, root_work, _) = root_run(&scalar, 0);
         assert_eq!(baseline, Ok(None));
+        let crate::epsilon_closure_dispatch::ClosureRoot::Program {
+            max_work: root_bound,
+            ..
+        } = compiled
+            .epsilon_closure_dispatch
+            .as_ref()
+            .unwrap()
+            .root(0)
+        else {
+            panic!("compiled root retained its bytecode");
+        };
+        assert!(root_work <= root_bound);
+        for remaining in [root_bound, root_bound.checked_sub(1).unwrap()] {
+            let consumed = u64::MAX.checked_sub(remaining).unwrap();
+            let (scalar_threshold, scalar_total, _) = root_run(&scalar, consumed);
+            let (compiled_threshold, compiled_total, _) = root_run(&compiled, consumed);
+            assert_eq!(compiled_threshold, scalar_threshold);
+            assert_eq!(compiled_total, scalar_total);
+        }
+
+        let mut underbounded = compiled.clone();
+        assert!(underbounded
+            .epsilon_closure_dispatch
+            .as_mut()
+            .unwrap()
+            .underbound_program_root_for_test(0));
+        assert!(matches!(
+            underbounded
+                .epsilon_closure_dispatch
+                .as_ref()
+                .unwrap()
+                .root(0),
+            crate::epsilon_closure_dispatch::ClosureRoot::Scalar
+        ));
+        let (scalar_underbound, scalar_underbound_total, scalar_underbound_workspace) =
+            root_run(&scalar, 0);
+        let (stale_underbound, stale_underbound_total, stale_underbound_workspace) =
+            root_run(&underbounded, 0);
+        assert_eq!(stale_underbound, scalar_underbound);
+        assert_eq!(stale_underbound_total, scalar_underbound_total);
+        assert_eq!(
+            stale_underbound_workspace.current_len,
+            scalar_underbound_workspace.current_len
+        );
+        for (stale, scalar) in stale_underbound_workspace.current
+            [..stale_underbound_workspace.current_len]
+            .iter()
+            .zip(
+                scalar_underbound_workspace.current[..scalar_underbound_workspace.current_len]
+                    .iter(),
+            )
+        {
+            assert_eq!((stale.state, stale.start), (scalar.state, scalar.start));
+        }
+        assert_eq!(
+            stale_underbound_workspace.seen_at,
+            scalar_underbound_workspace.seen_at
+        );
+        assert_eq!(
+            stale_underbound_workspace.stack_len,
+            scalar_underbound_workspace.stack_len
+        );
         let (scalar_exact, scalar_exact_total, _) =
             root_run(&scalar, u64::MAX.checked_sub(root_work).unwrap());
         let (compiled_exact, compiled_exact_total, _) =

@@ -19,14 +19,29 @@ use core::{fmt, mem::size_of};
 
 use crate::plan::{plan_index, Automaton, StateRole};
 
-// Retained program offsets are bounded below 2^30, leaving the high bit as a
-// branch-friendly tag that cannot collide with instruction storage.
+// Retained program offsets are bounded below 2^24. The high byte carries a
+// branch-friendly leaf tag or a compact runtime-work certificate.
 const ROOT_SENTINEL_BIT: u32 = 1 << 31;
 const NO_PROGRAM: u32 = ROOT_SENTINEL_BIT;
 const DIRECT_CONSUME: u32 = ROOT_SENTINEL_BIT | 1;
 const DIRECT_ACCEPT: u32 = ROOT_SENTINEL_BIT | 2;
+// The 64 MiB retained ceiling admits fewer than 2^24 twelve-byte
+// instructions. Pack a power-of-two runtime-work bound into the otherwise
+// unused high six bits of every program root. The top two bits remain reserved
+// for guarded-program and leaf/scalar tags.
+const PROGRAM_OFFSET_BITS: u32 = 24;
+const PROGRAM_OFFSET_MASK: u32 = (1_u32 << PROGRAM_OFFSET_BITS) - 1;
+const PROGRAM_WORK_SHIFT: u32 = PROGRAM_OFFSET_BITS;
+const PROGRAM_WORK_EXPONENT_MASK: u32 = 0x3f;
+// Reserved for a future assertion-aware program arena. Until that arena is
+// implemented, tagged roots must decline to the scalar closure.
+const PROGRAM_GUARDED_TAG: u32 = 1 << 30;
+// Instructions have six spare bits between their now-24-bit subtree end and
+// two-bit action. The first instruction duplicates the root's work exponent
+// so a stale or underbounded private descriptor declines instead of entering
+// the deferred interpreter with an invalid proof.
 const ACTION_SHIFT: u32 = 30;
-const SUBTREE_END_MASK: u32 = (1_u32 << ACTION_SHIFT) - 1;
+const SUBTREE_END_MASK: u32 = (1_u32 << PROGRAM_WORK_SHIFT) - 1;
 
 // The sidecar is a compiler optimization, not part of the language.  These
 // graph-independent ceilings bound both fresh compilation and canonical wire
@@ -114,7 +129,10 @@ pub(crate) struct ClosureInstruction {
 /// compiled Split bytecode. Leaf sentinels let runtime settle the common
 /// Consume/Accept cases without first probing the instruction arena.
 pub(crate) enum ClosureRoot<'a> {
-    Program(&'a [ClosureInstruction]),
+    Program {
+        instructions: &'a [ClosureInstruction],
+        max_work: u64,
+    },
     Consume,
     Accept,
     Scalar,
@@ -161,6 +179,29 @@ impl ClosureInstruction {
     pub(crate) const fn edge_work(self) -> u32 {
         self.edge_work
     }
+
+    const fn program_work_exponent(self) -> u32 {
+        (self.subtree_end_and_action >> PROGRAM_WORK_SHIFT) & PROGRAM_WORK_EXPONENT_MASK
+    }
+
+    fn set_program_work_exponent(&mut self, exponent: u32) {
+        debug_assert!(exponent != 0 && exponent <= PROGRAM_WORK_EXPONENT_MASK);
+        self.subtree_end_and_action |= exponent << PROGRAM_WORK_SHIFT;
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_runtime_test(
+        state: u32,
+        subtree_end: u32,
+        action: ClosureAction,
+        edge_work: u32,
+    ) -> Self {
+        Self {
+            state,
+            subtree_end_and_action: subtree_end | (action.encoded() << ACTION_SHIFT),
+            edge_work,
+        }
+    }
 }
 
 /// Immutable Split programs and leaf actions indexed by the only states that
@@ -192,6 +233,56 @@ impl ProgramShape {
     const fn admitted(self) -> bool {
         self.edge_visits >= MIN_ELIMINATED_EDGE_VISITS
     }
+
+    /// Maximum scalar work one execution of this unfolded program can
+    /// perform. Shared-seen skips and early Accepts can only reduce it.
+    fn runtime_work(self) -> Option<usize> {
+        self.instructions.checked_add(self.edge_visits)
+    }
+
+    /// Encodable power-of-two upper bound used to select deferred accounting
+    /// before the interpreter touches mutable closure state.
+    fn runtime_work_bound(self) -> Option<(u32, u64)> {
+        let work = self.runtime_work()?;
+        if work == 0 {
+            return None;
+        }
+        let bound = u64::try_from(work.checked_next_power_of_two()?).ok()?;
+        let exponent = bound.trailing_zeros();
+        // Every admitted program has a Split with at least two edges, so zero
+        // is unavailable and remains a useful stale/uncertified marker.
+        if exponent == 0 || exponent > PROGRAM_WORK_EXPONENT_MASK {
+            return None;
+        }
+        Some((exponent, bound))
+    }
+}
+
+fn encode_program_root(offset: usize, shape: ProgramShape) -> Option<u32> {
+    let offset = u32::try_from(offset).ok()?;
+    if offset > PROGRAM_OFFSET_MASK {
+        return None;
+    }
+    let (work_exponent, work_bound) = shape.runtime_work_bound()?;
+    debug_assert!(work_bound.is_power_of_two());
+    Some(offset | (work_exponent << PROGRAM_WORK_SHIFT))
+}
+
+fn decode_program_root(encoded: u32) -> Option<(usize, u32, u64)> {
+    debug_assert_eq!(encoded & ROOT_SENTINEL_BIT, 0);
+    if encoded & PROGRAM_GUARDED_TAG != 0 {
+        return None;
+    }
+    let exponent = (encoded >> PROGRAM_WORK_SHIFT) & PROGRAM_WORK_EXPONENT_MASK;
+    if exponent == 0 {
+        return None;
+    }
+    let max_work = 1_u64.checked_shl(exponent)?;
+    Some((
+        plan_index(encoded & PROGRAM_OFFSET_MASK),
+        exponent,
+        max_work,
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -280,8 +371,8 @@ impl EpsilonClosureDispatch {
             if !program_shape.admitted() {
                 continue;
             }
-            program_offsets[state] = u32::try_from(instructions.len())
-                .expect("bounded epsilon-closure instruction offset fits u32");
+            program_offsets[state] = encode_program_root(instructions.len(), program_shape)
+                .expect("preflighted epsilon-closure root metadata remains encodable");
             emit_program(
                 automaton,
                 root,
@@ -333,17 +424,26 @@ impl EpsilonClosureDispatch {
                 _ => ClosureRoot::Scalar,
             };
         }
-        let begin = plan_index(encoded);
+        let Some((begin, work_exponent, max_work)) = decode_program_root(encoded) else {
+            return ClosureRoot::Scalar;
+        };
         let Some(first) = data.instructions.get(begin).copied() else {
             return ClosureRoot::Scalar;
         };
+        if first.program_work_exponent() != work_exponent {
+            return ClosureRoot::Scalar;
+        }
         let length = first.subtree_end();
         let Some(end) = begin.checked_add(length) else {
             return ClosureRoot::Scalar;
         };
-        data.instructions
-            .get(begin..end)
-            .map_or(ClosureRoot::Scalar, ClosureRoot::Program)
+        data.instructions.get(begin..end).map_or(
+            ClosureRoot::Scalar,
+            |instructions| ClosureRoot::Program {
+                instructions,
+                max_work,
+            },
+        )
     }
 
     pub(crate) const fn retained_bytes(&self) -> usize {
@@ -363,6 +463,28 @@ impl EpsilonClosureDispatch {
     #[cfg(test)]
     pub(crate) fn instruction_count(&self) -> usize {
         self.0[0].instructions.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn underbound_program_root_for_test(&mut self, state: u32) -> bool {
+        let Some(encoded) = self.0[0]
+            .program_offsets
+            .get_mut(plan_index(state))
+        else {
+            return false;
+        };
+        if *encoded & ROOT_SENTINEL_BIT != 0 {
+            return false;
+        }
+        let work_exponent = (*encoded >> PROGRAM_WORK_SHIFT) & PROGRAM_WORK_EXPONENT_MASK;
+        let Some(underbound) = work_exponent
+            .checked_sub(1)
+            .filter(|&exponent| exponent != 0)
+        else {
+            return false;
+        };
+        *encoded = (*encoded & PROGRAM_OFFSET_MASK) | (underbound << PROGRAM_WORK_SHIFT);
+        true
     }
 }
 
@@ -433,6 +555,9 @@ fn derive_shape_and_roots(
         }
         if !program.admitted() {
             continue;
+        }
+        if encode_program_root(instructions, program).is_none() {
+            return Ok(None);
         }
         programs = programs.checked_add(1).ok_or(
             EpsilonClosureDispatchAllocationError {
@@ -746,6 +871,10 @@ fn emit_program(
         Some(expected.instructions)
     );
     debug_assert_eq!(emitted_edge_visits, expected.edge_visits);
+    let (work_exponent, _) = expected
+        .runtime_work_bound()
+        .expect("an emitted program has positive encodable runtime work");
+    instructions[base].set_program_work_exponent(work_exponent);
 }
 
 fn state_edges(automaton: &Automaton, state: usize) -> core::ops::Range<usize> {
@@ -857,7 +986,11 @@ mod tests {
         let dispatch = automaton.epsilon_closure_dispatch.as_ref().unwrap();
         assert_eq!(dispatch.admitted_programs(), 1);
         assert!(dispatch.eliminated_edge_visits() >= 4);
-        let ClosureRoot::Program(program) = dispatch.root(0) else {
+        let ClosureRoot::Program {
+            instructions: program,
+            max_work,
+        } = dispatch.root(0)
+        else {
             panic!("the admitted start Split has compiled bytecode");
         };
         assert!(
@@ -870,6 +1003,20 @@ mod tests {
         assert!(program
             .iter()
             .any(|instruction| instruction.action() == ClosureAction::SeenBackedge));
+        let exact_work = program
+            .iter()
+            .try_fold(0_u64, |work, instruction| {
+                let work = work.checked_add(1)?;
+                if instruction.action() == ClosureAction::Split {
+                    work.checked_add(u64::from(instruction.edge_work()))
+                } else {
+                    Some(work)
+                }
+            })
+            .unwrap();
+        assert!(max_work.is_power_of_two());
+        assert!(exact_work <= max_work);
+        assert!(max_work < exact_work.checked_mul(2).unwrap());
         assert!(automaton.epsilon_closure_dispatch_retained_bytes() > 0);
         assert_eq!(
             automaton.epsilon_closure_dispatch_retained_bytes(),
@@ -899,12 +1046,37 @@ mod tests {
         let mut automaton = branching_leaf_roots();
         assert!(automaton.try_enable_epsilon_closure_dispatch().unwrap());
         let dispatch = automaton.epsilon_closure_dispatch.as_ref().unwrap();
-        assert!(matches!(dispatch.root(0), ClosureRoot::Program(_)));
+        assert!(matches!(dispatch.root(0), ClosureRoot::Program { .. }));
         assert!(matches!(dispatch.root(1), ClosureRoot::Scalar));
         assert!(matches!(dispatch.root(2), ClosureRoot::Consume));
         assert!(matches!(dispatch.root(3), ClosureRoot::Accept));
         assert!(matches!(dispatch.root(4), ClosureRoot::Scalar));
         assert!(matches!(dispatch.root(5), ClosureRoot::Accept));
+    }
+
+    #[test]
+    fn root_lookup_rejects_stale_program_bounds_and_offsets() {
+        let mut automaton = branching_cycle(false);
+        assert!(automaton.try_enable_epsilon_closure_dispatch().unwrap());
+        let dispatch = automaton.epsilon_closure_dispatch.as_mut().unwrap();
+
+        dispatch.0[0].program_offsets[0] = super::PROGRAM_GUARDED_TAG;
+        assert!(matches!(dispatch.root(0), ClosureRoot::Scalar));
+
+        dispatch.0[0].program_offsets[0] =
+            (1 << super::PROGRAM_WORK_SHIFT) | super::PROGRAM_OFFSET_MASK;
+        assert!(matches!(dispatch.root(0), ClosureRoot::Scalar));
+
+        // A pre-certificate descriptor (zero exponent), and a plausible but
+        // lower exponent that disagrees with the retained witness, decline.
+        dispatch.0[0].program_offsets[0] = 0;
+        assert!(matches!(dispatch.root(0), ClosureRoot::Scalar));
+
+        let mut fresh = branching_cycle(false);
+        assert!(fresh.try_enable_epsilon_closure_dispatch().unwrap());
+        let dispatch = fresh.epsilon_closure_dispatch.as_mut().unwrap();
+        assert!(dispatch.underbound_program_root_for_test(0));
+        assert!(matches!(dispatch.root(0), ClosureRoot::Scalar));
     }
 
     #[test]
