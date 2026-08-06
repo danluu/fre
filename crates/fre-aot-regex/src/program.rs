@@ -2581,33 +2581,36 @@ impl DynamicNativeRowsWorkspace {
 struct DynamicNativeRowsState {
     consecutive_deopts: u8,
     bypass_remaining: u16,
-    native_entry_in_flight: bool,
+    native_entry_window: Option<SearchWindow>,
 }
 
 impl DynamicNativeRowsState {
     fn settle_unobserved_local_entry(&mut self) {
-        if self.native_entry_in_flight {
-            self.native_entry_in_flight = false;
+        if self.native_entry_window.take().is_some() {
             self.consecutive_deopts = 0;
             self.bypass_remaining = 0;
         }
     }
 
-    fn claim(&mut self) -> bool {
+    fn claim(&mut self, window: SearchWindow) -> bool {
         self.settle_unobserved_local_entry();
         if self.bypass_remaining != 0 {
             self.bypass_remaining = self.bypass_remaining.saturating_sub(1);
             return false;
         }
-        self.native_entry_in_flight = true;
+        self.native_entry_window = Some(window);
         true
     }
 
     fn observe_deopt(&mut self) {
-        if !self.native_entry_in_flight {
+        let claimed = self.native_entry_window.take().is_some();
+        self.observe_consumed_deopt(claimed);
+    }
+
+    fn observe_consumed_deopt(&mut self, claimed: bool) {
+        if !claimed {
             return;
         }
-        self.native_entry_in_flight = false;
         self.consecutive_deopts = self.consecutive_deopts.saturating_add(1);
         if self.consecutive_deopts >= 2 {
             let shift = u32::from(self.consecutive_deopts.saturating_sub(2))
@@ -2615,6 +2618,12 @@ impl DynamicNativeRowsState {
                 .min(10);
             self.bypass_remaining = 1_u16 << shift;
         }
+    }
+
+    fn settle_consumed_local_completion(&mut self) {
+        debug_assert!(self.native_entry_window.is_none());
+        self.consecutive_deopts = 0;
+        self.bypass_remaining = 0;
     }
 }
 
@@ -4641,7 +4650,7 @@ impl CompiledProgram {
                 if dynamic.refresh_native_rows(&self.automaton, nfa) {
                     initial_pending =
                         dynamic.native_rows.initial_flags & NATIVE_ROWS_INITIAL_PENDING != 0;
-                    if !initial_pending && dynamic.state.claim() {
+                    if !initial_pending && dynamic.state.claim(window) {
                         enter = Some((
                             (&raw const dynamic.native_rows).expose_provenance(),
                             dynamic.native_rows.cache_identity,
@@ -4662,6 +4671,177 @@ impl CompiledProgram {
         }
         self.search_optimized_with_workspace(haystack, window, workspace)
             .map(|found| (RetainedPartialPreflight::Complete(found), 0, 0))
+    }
+
+    /// Continue the exact first unpublished cell reached by an admitted
+    /// dynamically warmed native row entry.
+    ///
+    /// The admitted window is a single-use workspace ticket. It is consumed
+    /// before any cache mutation, then the artifact, workspace, route shape,
+    /// cache identity, row, unread position, pending endpoint, and exact
+    /// unfilled cell are authenticated. A valid continuation reuses K0's
+    /// mutable first-miss handoff and resets adaptive deopt state. Any stale or
+    /// malformed callback consumes the outstanding ticket, records the same
+    /// deopt feedback as the established whole-window side exit, and completes
+    /// through the canonical optimizing executor on the original window.
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the private native continuation carries every authenticated handoff field explicitly"
+    )]
+    pub fn search_from_dynamic_native_rows_hole_with_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+        expected_artifact_identity: [u8; 32],
+        current_row: usize,
+        resume_position: usize,
+        pending_valid: usize,
+        pending_end: usize,
+        cache_identity: u64,
+    ) -> Result<MatchResult, CompileError> {
+        // Consume before any validation that could reach mutable K0 state. An
+        // independently invoked private ABI therefore cannot borrow a live
+        // admission indefinitely or substitute a different search window.
+        let admitted_window = workspace
+            .dynamic_native_rows
+            .as_deref_mut()
+            .and_then(|dynamic| dynamic.state.native_entry_window.take());
+        let had_claim = admitted_window.is_some();
+
+        let continued = (|| -> Result<MatchResult, CompileError> {
+            if admitted_window != Some(window) {
+                return Err(CompileError::InternalInvariant(
+                    "dynamic native-row continuation window was not admitted by preflight",
+                ));
+            }
+            if expected_artifact_identity != self.identity.artifact {
+                return Err(CompileError::InternalInvariant(
+                    "dynamic native-row continuation artifact identity does not match the prepared program",
+                ));
+            }
+            if !workspace.identity.compatible(&self.identity) {
+                return Err(CompileError::InternalInvariant(
+                    "dynamic native-row continuation workspace belongs to a different semantic program",
+                ));
+            }
+            let dynamic_view = self.native_dynamic_rows_view().ok_or(
+                CompileError::InternalInvariant(
+                    "dynamic native-row continuation requires a supported assertion-free ordered-NFA artifact",
+                ),
+            )?;
+            if dynamic_view.root_requirement.is_some() {
+                return Err(CompileError::InternalInvariant(
+                    "dynamic native-row continuation cannot inherit an emitted root scanner",
+                ));
+            }
+            if pending_valid > 1 {
+                return Err(CompileError::InternalInvariant(
+                    "dynamic native-row continuation pending discriminator is malformed",
+                ));
+            }
+            let pending = if pending_valid == 0 {
+                if pending_end != 0 {
+                    return Err(CompileError::InternalInvariant(
+                        "dynamic native-row continuation carried an endpoint without pending mode",
+                    ));
+                }
+                None
+            } else {
+                Some(pending_end)
+            };
+            let current_row = u32::try_from(current_row).map_err(|_| {
+                CompileError::InternalInvariant(
+                    "dynamic native-row continuation row does not fit the K0 cache",
+                )
+            })?;
+            let k0_window = K0SearchWindow::new(window.start, window.end);
+            let nfa = workspace.nfa.as_mut().ok_or(CompileError::InternalInvariant(
+                "dynamic native-row continuation has no prepared K0 workspace",
+            ))?;
+            match self.output {
+                OutputContract::Exists => {
+                    if pending.is_some() {
+                        return Err(CompileError::InternalInvariant(
+                            "dynamic native-row Exists continuation cannot carry a pending endpoint",
+                        ));
+                    }
+                    self.automaton
+                        .prepare::<Exists>()
+                        .search_prevalidated_exists_value_from_dynamic_direct_hole_with_authenticated_workspace(
+                            haystack,
+                            k0_window,
+                            nfa,
+                            current_row,
+                            resume_position,
+                            cache_identity,
+                        )
+                        .map(MatchResult::Exists)
+                        .map_err(CompileError::from)
+                }
+                OutputContract::SelectedEnd => self
+                    .automaton
+                    .prepare::<SelectedEnd>()
+                    .search_prevalidated_selected_end_value_from_dynamic_direct_hole_with_authenticated_workspace(
+                        haystack,
+                        k0_window,
+                        nfa,
+                        current_row,
+                        resume_position,
+                        pending,
+                        cache_identity,
+                    )
+                    .map(MatchResult::SelectedEnd)
+                    .map_err(CompileError::from),
+                OutputContract::Span => {
+                    let width = dynamic_view.exact_match_width.filter(|width| *width != 0).ok_or(
+                        CompileError::InternalInvariant(
+                            "dynamic native-row Span continuation has no positive exact width",
+                        ),
+                    )?;
+                    let found = self
+                        .automaton
+                        .prepare::<SelectedEnd>()
+                        .search_prevalidated_selected_end_value_from_dynamic_direct_hole_with_authenticated_workspace(
+                            haystack,
+                            k0_window,
+                            nfa,
+                            current_row,
+                            resume_position,
+                            pending,
+                            cache_identity,
+                        )?
+                        .map(|end| {
+                            end.checked_sub(width)
+                                .filter(|start| *start >= window.start)
+                                .map(|start| (start, end))
+                                .ok_or(CompileError::InternalInvariant(
+                                    "dynamic native-row fixed-width endpoint preceded its admitted start",
+                                ))
+                        })
+                        .transpose()?;
+                    Ok(MatchResult::Span(found))
+                }
+            }
+        })();
+
+        if let Ok(found) = continued {
+            if let Some(dynamic) = workspace.dynamic_native_rows.as_deref_mut() {
+                dynamic.state.settle_consumed_local_completion();
+            }
+            return Ok(found);
+        }
+        if let Some(dynamic) = workspace.dynamic_native_rows.as_deref_mut() {
+            dynamic.state.observe_consumed_deopt(had_claim);
+        }
+        // A malformed callback cannot substitute its own window after
+        // consuming a valid admission. Complete the exact preflight search;
+        // only a callback with no outstanding ticket falls back to its
+        // ordinary validated arguments.
+        let fallback_window = admitted_window.unwrap_or(window);
+        self.search_optimized_with_workspace(haystack, fallback_window, workspace)
     }
 
     /// Record that an admitted dynamic root took its dedicated whole-search
@@ -7468,6 +7648,33 @@ mod tests {
         .expect("compile test graph")
     }
 
+    fn scanner_free_branching_pair_raw() -> RawPlan {
+        RawPlan {
+            start: 0,
+            roles: vec![
+                StateRole::Split,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Accept,
+            ],
+            edge_offsets: vec![0, 2, 3, 4, 6, 7, 7],
+            edge_targets: vec![1, 3, 2, 5, 4, 4, 5],
+            edge_kinds: vec![
+                EdgeKind::Epsilon,
+                EdgeKind::Epsilon,
+                EdgeKind::ByteRange,
+                EdgeKind::ByteRange,
+                EdgeKind::ByteRange,
+                EdgeKind::ByteRange,
+                EdgeKind::ByteRange,
+            ],
+            byte_starts: vec![0, 0, b'a', 0, 0, b'b', 0],
+            byte_ends: vec![0, 0, b'a', 0xff, b'`', 0xff, 0xff],
+        }
+    }
+
     fn generated_byte_strings(alphabet: &[u8], max_len: usize) -> Vec<Vec<u8>> {
         fn extend(
             strings: &mut Vec<Vec<u8>>,
@@ -7523,7 +7730,7 @@ mod tests {
         );
         assert_eq!((cold_address, cold_cache_identity), (0, 0));
         let dynamic = workspace.dynamic_native_rows.as_deref().unwrap();
-        assert!(!dynamic.state.native_entry_in_flight);
+        assert_eq!(dynamic.state.native_entry_window, None);
 
         let (warm, first_address, first_cache_identity) = compiled
             .preflight_dynamic_native_rows_with_workspace(
@@ -7537,7 +7744,7 @@ mod tests {
         assert_ne!(first_address, 0);
         assert_ne!(first_cache_identity, 0);
         let dynamic = workspace.dynamic_native_rows.as_deref().unwrap();
-        assert!(dynamic.state.native_entry_in_flight);
+        assert_eq!(dynamic.state.native_entry_window, Some(window));
         assert_eq!(dynamic.native_rows.cache_identity, first_cache_identity);
         assert_eq!(dynamic.native_rows.initial_flags, 0);
 
@@ -7555,6 +7762,212 @@ mod tests {
         assert_eq!(reentered, RetainedPartialPreflight::Enter(window));
         assert_eq!(second_address, first_address);
         assert_eq!(second_cache_identity, first_cache_identity);
+    }
+
+    #[test]
+    fn dynamic_native_rows_first_hole_continuation_covers_value_contracts() {
+        let raw = scanner_free_branching_pair_raw();
+        for (output, expected) in [
+            (OutputContract::Exists, MatchResult::Exists(true)),
+            (
+                OutputContract::SelectedEnd,
+                MatchResult::SelectedEnd(Some(2)),
+            ),
+            (OutputContract::Span, MatchResult::Span(Some((0, 2)))),
+        ] {
+            let compiled = raw_program(
+                &raw,
+                output,
+                CompileMode::Fast,
+                DeterminizeLimits::default(),
+            );
+            let view = compiled
+                .native_dynamic_rows_view()
+                .expect("scanner-free resource fallback view");
+            assert_eq!(view.root_requirement, None);
+            assert_eq!(view.exact_match_width, Some(2));
+
+            let mut workspace = compiled.prepare_workspace().expect("dynamic workspace");
+            let mut warmed = vec![b'!'; DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES];
+            warmed[..2].copy_from_slice(b"aa");
+            let window = SearchWindow::full(&warmed);
+            let identity = compiled.artifact_identity();
+            let (cold, address, cache_identity) = compiled
+                .preflight_dynamic_native_rows_with_workspace(
+                    &warmed,
+                    window,
+                    &mut workspace,
+                    identity,
+                )
+                .expect("cold scanner-free preflight");
+            assert_eq!(cold, RetainedPartialPreflight::Complete(expected));
+            assert_eq!((address, cache_identity), (0, 0));
+
+            // The first-byte `a` and non-`a` branches occupy distinct global
+            // byte classes. Warming `aa` publishes only the `a` root cell, so
+            // `ba` reaches an authentic root hole before consuming any byte.
+            let mut novel = warmed.clone();
+            novel[..2].copy_from_slice(b"ba");
+            let (enter, address, cache_identity) = compiled
+                .preflight_dynamic_native_rows_with_workspace(
+                    &novel,
+                    window,
+                    &mut workspace,
+                    identity,
+                )
+                .expect("warm scanner-free preflight");
+            assert_eq!(enter, RetainedPartialPreflight::Enter(window));
+            assert_ne!((address, cache_identity), (0, 0));
+            let descriptor = workspace
+                .dynamic_native_rows
+                .as_deref()
+                .expect("dynamic descriptor")
+                .native_rows;
+            assert_eq!(descriptor.learned_loop_row_count, 0);
+            assert_eq!(descriptor.cache_identity, cache_identity);
+
+            let found = compiled
+                .search_from_dynamic_native_rows_hole_with_workspace(
+                    &novel,
+                    window,
+                    &mut workspace,
+                    identity,
+                    usize::try_from(descriptor.initial_row).unwrap(),
+                    window.start,
+                    0,
+                    0,
+                    cache_identity,
+                )
+                .expect("exact first-hole continuation");
+            assert_eq!(found, expected, "{output:?}");
+            assert_eq!(
+                workspace
+                    .dynamic_native_rows
+                    .as_deref()
+                    .expect("settled descriptor")
+                    .state,
+                DynamicNativeRowsState::default(),
+                "successful continuation settles the single-use admission"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one test keeps exact-window substitution and stale-cache ticket consumption together"
+    )]
+    fn dynamic_native_rows_malformed_continuation_consumes_exact_window_ticket() {
+        let compiled = raw_program(
+            &scanner_free_branching_pair_raw(),
+            OutputContract::Span,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        let mut workspace = compiled.prepare_workspace().expect("dynamic workspace");
+        let mut warmed = vec![b'!'; DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES + 8];
+        warmed[5..7].copy_from_slice(b"aa");
+        let admitted = SearchWindow::new(5, warmed.len());
+        let identity = compiled.artifact_identity();
+        let (cold, _, _) = compiled
+            .preflight_dynamic_native_rows_with_workspace(
+                &warmed,
+                admitted,
+                &mut workspace,
+                identity,
+            )
+            .expect("cold exact-window preflight");
+        assert_eq!(cold, RetainedPartialPreflight::Complete(MatchResult::Span(Some((5, 7)))));
+
+        let mut novel = warmed.clone();
+        novel[5] = b'b';
+        let (enter, _, cache_identity) = compiled
+            .preflight_dynamic_native_rows_with_workspace(
+                &novel,
+                admitted,
+                &mut workspace,
+                identity,
+            )
+            .expect("admitted exact-window preflight");
+        assert_eq!(enter, RetainedPartialPreflight::Enter(admitted));
+        let descriptor = workspace
+            .dynamic_native_rows
+            .as_deref()
+            .expect("dynamic descriptor")
+            .native_rows;
+        let substituted = SearchWindow::new(6, warmed.len());
+        let found = compiled
+            .search_from_dynamic_native_rows_hole_with_workspace(
+                &novel,
+                substituted,
+                &mut workspace,
+                identity,
+                usize::try_from(descriptor.initial_row).unwrap(),
+                admitted.start,
+                0,
+                0,
+                cache_identity,
+            )
+            .expect("malformed callback completes canonically");
+        assert_eq!(
+            found,
+            MatchResult::Span(Some((5, 7))),
+            "a callback cannot substitute a different window after admission"
+        );
+        let state = workspace
+            .dynamic_native_rows
+            .as_deref()
+            .expect("consumed dynamic descriptor")
+            .state;
+        assert_eq!(state.native_entry_window, None);
+        assert_eq!(state.consecutive_deopts, 1);
+        assert_eq!(state.bypass_remaining, 0);
+
+        let mut stale_workspace = compiled.prepare_workspace().expect("stale dynamic workspace");
+        let (cold, _, _) = compiled
+            .preflight_dynamic_native_rows_with_workspace(
+                &warmed,
+                admitted,
+                &mut stale_workspace,
+                identity,
+            )
+            .expect("cold stale-cache preflight");
+        assert_eq!(cold, RetainedPartialPreflight::Complete(MatchResult::Span(Some((5, 7)))));
+        let (enter, _, cache_identity) = compiled
+            .preflight_dynamic_native_rows_with_workspace(
+                &novel,
+                admitted,
+                &mut stale_workspace,
+                identity,
+            )
+            .expect("admitted stale-cache preflight");
+        assert_eq!(enter, RetainedPartialPreflight::Enter(admitted));
+        let descriptor = stale_workspace
+            .dynamic_native_rows
+            .as_deref()
+            .expect("stale dynamic descriptor")
+            .native_rows;
+        let found = compiled
+            .search_from_dynamic_native_rows_hole_with_workspace(
+                &novel,
+                admitted,
+                &mut stale_workspace,
+                identity,
+                usize::try_from(descriptor.initial_row).unwrap(),
+                admitted.start,
+                0,
+                0,
+                cache_identity.wrapping_add(1),
+            )
+            .expect("stale cache callback completes canonically");
+        assert_eq!(found, MatchResult::Span(Some((5, 7))));
+        let state = stale_workspace
+            .dynamic_native_rows
+            .as_deref()
+            .expect("consumed stale descriptor")
+            .state;
+        assert_eq!(state.native_entry_window, None);
+        assert_eq!(state.consecutive_deopts, 1);
     }
 
     #[test]
@@ -7706,7 +8119,7 @@ mod tests {
             &dynamic.native_rows.learned_loop_rows[..learned_loop_rows.len()],
             learned_loop_rows.as_slice()
         );
-        assert!(dynamic.state.native_entry_in_flight);
+        assert_eq!(dynamic.state.native_entry_window, Some(window));
     }
 
     #[test]
@@ -7778,7 +8191,7 @@ mod tests {
             0
         );
         assert_eq!(dynamic.native_rows.rows_address, 0);
-        assert!(!dynamic.state.native_entry_in_flight);
+        assert_eq!(dynamic.state.native_entry_window, None);
     }
 
     #[test]
@@ -7822,7 +8235,7 @@ mod tests {
         assert_ne!((address, cache_identity), (0, 0));
         let dynamic = workspace.dynamic_native_rows.as_deref().unwrap();
         assert_eq!(dynamic.native_rows.initial_flags, 0);
-        assert!(dynamic.state.native_entry_in_flight);
+        assert_eq!(dynamic.state.native_entry_window, Some(window));
     }
 
     #[test]
@@ -7853,7 +8266,7 @@ mod tests {
             workspace
                 .dynamic_native_rows
                 .as_deref()
-                .is_some_and(|dynamic| !dynamic.state.native_entry_in_flight)
+                .is_some_and(|dynamic| dynamic.state.native_entry_window.is_none())
         );
 
         let variable_span = program(
@@ -7874,21 +8287,22 @@ mod tests {
     #[test]
     fn dynamic_native_rows_back_off_repeated_whole_search_deopts() {
         let mut state = DynamicNativeRowsState::default();
-        assert!(state.claim());
+        let window = SearchWindow::new(7, 71);
+        assert!(state.claim(window));
         state.observe_deopt();
         assert_eq!(state.consecutive_deopts, 1);
         assert_eq!(state.bypass_remaining, 0);
 
-        assert!(state.claim());
+        assert!(state.claim(window));
         state.observe_deopt();
         assert_eq!(state.consecutive_deopts, 2);
         assert_eq!(state.bypass_remaining, 16);
         for remaining in (0_u16..16).rev() {
-            assert!(!state.claim());
+            assert!(!state.claim(window));
             assert_eq!(state.bypass_remaining, remaining);
         }
 
-        assert!(state.claim());
+        assert!(state.claim(window));
         state.settle_unobserved_local_entry();
         assert_eq!(state, DynamicNativeRowsState::default());
     }

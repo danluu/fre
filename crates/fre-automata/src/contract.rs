@@ -621,6 +621,33 @@ impl TypedPlan<'_, Exists> {
         )
     }
 
+    /// Continue a compiler-authenticated warmed native row at its exact first
+    /// unpublished cell without replaying the generated scalar prefix.
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the private continuation keeps its cache identity and unread boundary explicit"
+    )]
+    pub fn search_prevalidated_exists_value_from_dynamic_direct_hole_with_authenticated_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut K0Workspace,
+        current_row: u32,
+        position: usize,
+        cache_identity: u64,
+    ) -> Result<bool, SearchError> {
+        crate::k0::search_prevalidated_exists_value_from_dynamic_direct_hole_with_authenticated_workspace(
+            self.automaton,
+            haystack,
+            window,
+            workspace,
+            current_row,
+            position,
+            cache_identity,
+        )
+    }
+
     /// Return only existence after one authenticated ordered frontier has
     /// already consumed the prefix ending at `resume_position`.
     ///
@@ -695,6 +722,36 @@ impl TypedPlan<'_, SelectedEnd> {
             window,
             workspace,
             limits,
+        )
+    }
+
+    /// Continue a compiler-authenticated warmed native row at its exact first
+    /// unpublished cell while retaining the selected endpoint committed by
+    /// its generated prefix.
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the private continuation keeps its cache identity and pending endpoint explicit"
+    )]
+    pub fn search_prevalidated_selected_end_value_from_dynamic_direct_hole_with_authenticated_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut K0Workspace,
+        current_row: u32,
+        position: usize,
+        pending_end: Option<usize>,
+        cache_identity: u64,
+    ) -> Result<Option<usize>, SearchError> {
+        crate::k0::search_prevalidated_selected_end_value_from_dynamic_direct_hole_with_authenticated_workspace(
+            self.automaton,
+            haystack,
+            window,
+            workspace,
+            current_row,
+            position,
+            pending_end,
+            cache_identity,
         )
     }
 

@@ -666,6 +666,7 @@ const PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL: usize = 11;
 // Dynamic-row and partial-Span entries are mutually exclusive layouts, so
 // their one layout-specific helper occupies the same deterministic slot.
 const DYNAMIC_ROWS_DEOPT_RUNTIME_SYMBOL: usize = 11;
+const DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL: usize = 12;
 
 const RUNTIME_SYMBOL_NAME: &str = "fre_aot_regex_runtime_search_v1";
 const PARTIAL_RUNTIME_SYMBOL_NAME: &str =
@@ -678,6 +679,8 @@ const DYNAMIC_ROWS_PREFLIGHT_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_search_exclusive_dynamic_rows_preflight_v1";
 const DYNAMIC_ROWS_DEOPT_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_search_exclusive_dynamic_rows_deopt_v1";
+const DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL_NAME: &str =
+    "fre_aot_regex_runtime_search_exclusive_dynamic_rows_continue_v1";
 const PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_search_exclusive_recover_partial_span_v1";
 const ENTRY_SYMBOL_PREFIX: &str = "fre_aot_regex_search_v1_";
@@ -876,6 +879,10 @@ impl CompiledModule {
             code_size
         };
         let prepared_code_size = prepared_layout.map(|prepared| prepared.code_size);
+        let needs_dynamic_rows_continue_symbol = lowering
+            .relocations
+            .iter()
+            .any(|relocation| relocation.symbol == DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL);
 
         let sections = vec![
             ModuleSection {
@@ -1042,6 +1049,21 @@ impl CompiledModule {
                     offset: 0,
                     size: 0,
                 });
+                if needs_dynamic_rows_continue_symbol {
+                    if symbols.len() != DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL {
+                        return Err(ObjectError::InvalidModule(
+                            "dynamic-row continuation symbol order is inconsistent",
+                        ));
+                    }
+                    symbols.push(ModuleSymbol {
+                        name: DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL_NAME.to_owned(),
+                        binding: SymbolBinding::Global,
+                        kind: SymbolKind::Function,
+                        section: None,
+                        offset: 0,
+                        size: 0,
+                    });
+                }
             } else if prepared.span_recovery {
                 if symbols.len() != PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL {
                     return Err(ObjectError::InvalidModule(
@@ -1182,6 +1204,28 @@ impl CompiledModule {
             .filter(|symbol| {
                 symbol.section.is_none()
                     && symbol.name == DYNAMIC_ROWS_DEOPT_RUNTIME_SYMBOL_NAME
+            })
+            .map(|symbol| symbol.name.as_str())
+    }
+
+    /// Return the exact first-unpublished-cell continuation helper required by
+    /// a scanner-free dynamically warmed-row entry, when that entry is
+    /// present.
+    #[must_use]
+    pub fn required_prepared_dynamic_rows_continue_runtime_symbol(&self) -> Option<&str> {
+        self.prepared_entry_symbol_index?;
+        if !self
+            .relocations
+            .iter()
+            .any(|relocation| relocation.symbol == DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL)
+        {
+            return None;
+        }
+        self.symbols
+            .get(DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL)
+            .filter(|symbol| {
+                symbol.section.is_none()
+                    && symbol.name == DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL_NAME
             })
             .map(|symbol| symbol.name.as_str())
     }
@@ -1364,12 +1408,14 @@ fn lower_native_dynamic_rows_prepared(
                 target.features,
                 view.output,
                 exact_span_width,
+                view.root_requirement.is_none(),
             )?
         }
         Architecture::Aarch64 => lower_aarch64_dynamic_rows_prepared_for_output(
             aarch64_root_plan,
             view.output,
             exact_span_width,
+            view.root_requirement.is_none(),
         )?,
     };
     if root_filter.is_some() != prepared.scanner.is_some() {
@@ -10843,6 +10889,7 @@ fn lower_x86_64_dynamic_rows_prepared(
         features,
         OutputContract::Exists,
         None,
+        root_filter.is_none(),
     )
 }
 
@@ -10857,6 +10904,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output(
     features: FeatureSet,
     output: OutputContract,
     exact_span_width: Option<u64>,
+    allow_direct_hole_continuation: bool,
 ) -> Result<NativeDynamicRowsEmission, ObjectError> {
     const FRAME_BYTES: u8 = 104;
     if (output == OutputContract::Span) != exact_span_width.is_some()
@@ -10871,6 +10919,11 @@ fn lower_x86_64_dynamic_rows_prepared_for_output(
     }) {
         return Err(ObjectError::InvalidModule(
             "x86 dynamic root scanner has an invalid graph filter",
+        ));
+    }
+    if allow_direct_hole_continuation && root_filter.is_some() {
+        return Err(ObjectError::InvalidModule(
+            "x86 dynamic continuation cannot inherit a root scanner",
         ));
     }
     let mut assembler = X86Assembler::new();
@@ -10889,6 +10942,9 @@ fn lower_x86_64_dynamic_rows_prepared_for_output(
     let native_match = assembler.label()?;
     let native_no_match = assembler.label()?;
     let native_complete = (output != OutputContract::Exists)
+        .then(|| assembler.label())
+        .transpose()?;
+    let native_continue = allow_direct_hole_continuation
         .then(|| assembler.label())
         .transpose()?;
     let framed_fallback = assembler.label()?;
@@ -11050,7 +11106,10 @@ fn lower_x86_64_dynamic_rows_prepared_for_output(
     assembler.instruction(&[0x4d, 0x01, 0xc2])?;
     assembler.instruction(&[0x46, 0x8b, 0x14, 0x96])?;
     assembler.instruction(&[0x45, 0x3b, 0x53, NATIVE_ROWS_UNFILLED_CELL as u8])?;
-    assembler.branch(&[0x0f, 0x84], framed_fallback)?;
+    assembler.branch(
+        &[0x0f, 0x84],
+        native_continue.unwrap_or(framed_fallback),
+    )?;
     assembler.instruction(&[0x48, 0xff, 0xc2])?;
     assembler.instruction(&[0x45, 0x85, 0x53, NATIVE_ROWS_ACCEPT_MASK as u8])?;
     if output == OutputContract::Exists {
@@ -11168,6 +11227,56 @@ fn lower_x86_64_dynamic_rows_prepared_for_output(
     assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
     assembler.instruction(&[0xc3])?;
 
+    let mut continuation_identity_displacement_label = None;
+    let mut continuation_displacement_label = None;
+    if let Some(native_continue) = native_continue {
+        assembler.bind(native_continue)?;
+        // The scanner-free route has no vector state or loop ledger. Preserve
+        // the exact row and unread byte, then reuse the five preflight/output
+        // words as the compiler-private continuation record.
+        assembler.instruction(&[0x4c, 0x8b, 0x5c, 0x24, 0x58])?; // cache identity
+        assembler.instruction(&[0x4c, 0x89, 0x44, 0x24, 0x40])?; // current row
+        assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x48])?; // unread position
+        if output == OutputContract::Exists {
+            assembler.instruction(&[0x31, 0xc0])?;
+            assembler.instruction(&[0x48, 0x89, 0x44, 0x24, 0x50])?; // pending valid
+            assembler.instruction(&[0x48, 0x89, 0x44, 0x24, 0x58])?; // pending end
+        } else {
+            assembler.instruction(&[0x4c, 0x8b, 0x54, 0x24, 0x60])?; // pending end
+            assembler.instruction(&[0x31, 0xc0])?;
+            assembler.instruction(&[0x4d, 0x85, 0xd2])?;
+            assembler.instruction(&[0x0f, 0x95, 0xc0])?; // setne al
+            assembler.instruction(&[0x48, 0x89, 0x44, 0x24, 0x50])?; // pending valid
+            assembler.instruction(&[0x4c, 0x89, 0x54, 0x24, 0x58])?; // pending end
+        }
+        assembler.instruction(&[0x4c, 0x89, 0x5c, 0x24, 0x60])?; // cache identity
+
+        // SysV arguments seven and eight point to the immutable artifact
+        // identity and the frame-local continuation record.
+        assembler.instruction(&[0x48, 0x8d, 0x05])?;
+        let identity = assembler.label()?;
+        assembler.bind(identity)?;
+        push_bytes(&mut assembler.code, &[0; 4])?;
+        continuation_identity_displacement_label = Some(identity);
+        assembler.instruction(&[0x48, 0x89, 0x04, 0x24])?;
+        assembler.instruction(&[0x48, 0x8d, 0x44, 0x24, 0x40])?;
+        assembler.instruction(&[0x48, 0x89, 0x44, 0x24, 0x08])?;
+
+        assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x10])?;
+        assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x18])?;
+        assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x20])?;
+        assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x28])?;
+        assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x30])?;
+        assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x38])?;
+        assembler.instruction(&[0xe8])?;
+        let continuation = assembler.label()?;
+        assembler.bind(continuation)?;
+        push_bytes(&mut assembler.code, &[0; 4])?;
+        continuation_displacement_label = Some(continuation);
+        assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+        assembler.instruction(&[0xc3])?;
+    }
+
     assembler.bind(framed_fallback)?;
     if filter_kind.is_some_and(X86StartFilterKind::needs_vzeroupper) {
         assembler.instruction(&[0xc5, 0xf8, 0x77])?;
@@ -11195,38 +11304,68 @@ fn lower_x86_64_dynamic_rows_prepared_for_output(
     let preflight_displacement = finished.label_offset(preflight_displacement_label)?;
     let deopt_displacement = finished.label_offset(deopt_displacement_label)?;
     let fallback_displacement = finished.label_offset(fallback_displacement_label)?;
+    let continuation_identity_displacement = continuation_identity_displacement_label
+        .map(|label| finished.label_offset(label))
+        .transpose()?;
+    let continuation_displacement = continuation_displacement_label
+        .map(|label| finished.label_offset(label))
+        .transpose()?;
+    let mut relocations = vec![
+        ModuleRelocation {
+            section: TEXT_SECTION,
+            offset: offset_u64(identity_displacement, "x86 dynamic identity relocation")?,
+            kind: RelocationKind::X86PcRelative32,
+            symbol: PARTIAL_IDENTITY_SYMBOL,
+            addend: -4,
+        },
+        ModuleRelocation {
+            section: TEXT_SECTION,
+            offset: offset_u64(preflight_displacement, "x86 dynamic preflight relocation")?,
+            kind: RelocationKind::X86PltRelative32,
+            symbol: PREPARED_PREFLIGHT_RUNTIME_SYMBOL,
+            addend: -4,
+        },
+        ModuleRelocation {
+            section: TEXT_SECTION,
+            offset: offset_u64(deopt_displacement, "x86 dynamic deopt relocation")?,
+            kind: RelocationKind::X86PltRelative32,
+            symbol: DYNAMIC_ROWS_DEOPT_RUNTIME_SYMBOL,
+            addend: -4,
+        },
+        ModuleRelocation {
+            section: TEXT_SECTION,
+            offset: offset_u64(fallback_displacement, "x86 dynamic fallback relocation")?,
+            kind: RelocationKind::X86PltRelative32,
+            symbol: PREPARED_FALLBACK_RUNTIME_SYMBOL,
+            addend: -4,
+        },
+    ];
+    if let (Some(identity), Some(continuation)) = (
+        continuation_identity_displacement,
+        continuation_displacement,
+    ) {
+        relocations.push(ModuleRelocation {
+            section: TEXT_SECTION,
+            offset: offset_u64(identity, "x86 dynamic continuation identity relocation")?,
+            kind: RelocationKind::X86PcRelative32,
+            symbol: PARTIAL_IDENTITY_SYMBOL,
+            addend: -4,
+        });
+        relocations.push(ModuleRelocation {
+            section: TEXT_SECTION,
+            offset: offset_u64(continuation, "x86 dynamic continuation relocation")?,
+            kind: RelocationKind::X86PltRelative32,
+            symbol: DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL,
+            addend: -4,
+        });
+    } else if continuation_identity_displacement.is_some() || continuation_displacement.is_some() {
+        return Err(ObjectError::InvalidModule(
+            "x86 dynamic continuation relocation pair is incomplete",
+        ));
+    }
     Ok(NativeDynamicRowsEmission {
         code: finished.code,
-        relocations: vec![
-            ModuleRelocation {
-                section: TEXT_SECTION,
-                offset: offset_u64(identity_displacement, "x86 dynamic identity relocation")?,
-                kind: RelocationKind::X86PcRelative32,
-                symbol: PARTIAL_IDENTITY_SYMBOL,
-                addend: -4,
-            },
-            ModuleRelocation {
-                section: TEXT_SECTION,
-                offset: offset_u64(preflight_displacement, "x86 dynamic preflight relocation")?,
-                kind: RelocationKind::X86PltRelative32,
-                symbol: PREPARED_PREFLIGHT_RUNTIME_SYMBOL,
-                addend: -4,
-            },
-            ModuleRelocation {
-                section: TEXT_SECTION,
-                offset: offset_u64(deopt_displacement, "x86 dynamic deopt relocation")?,
-                kind: RelocationKind::X86PltRelative32,
-                symbol: DYNAMIC_ROWS_DEOPT_RUNTIME_SYMBOL,
-                addend: -4,
-            },
-            ModuleRelocation {
-                section: TEXT_SECTION,
-                offset: offset_u64(fallback_displacement, "x86 dynamic fallback relocation")?,
-                kind: RelocationKind::X86PltRelative32,
-                symbol: PREPARED_FALLBACK_RUNTIME_SYMBOL,
-                addend: -4,
-            },
-        ],
+        relocations,
         scanner,
     })
 }
@@ -17048,7 +17187,12 @@ fn lower_aarch64_runtime_adapter() -> Result<(Vec<u8>, Vec<ModuleRelocation>), O
 fn lower_aarch64_dynamic_rows_prepared(
     root_plan: Option<Aarch64DynamicRootPlan>,
 ) -> Result<NativeDynamicRowsEmission, ObjectError> {
-    lower_aarch64_dynamic_rows_prepared_for_output(root_plan, OutputContract::Exists, None)
+    lower_aarch64_dynamic_rows_prepared_for_output(
+        root_plan,
+        OutputContract::Exists,
+        None,
+        root_plan.is_none(),
+    )
 }
 
 #[allow(
@@ -17059,6 +17203,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output(
     root_plan: Option<Aarch64DynamicRootPlan>,
     output: OutputContract,
     exact_span_width: Option<u64>,
+    allow_direct_hole_continuation: bool,
 ) -> Result<NativeDynamicRowsEmission, ObjectError> {
     const FRAME_BYTES: u16 = 96;
     if (output == OutputContract::Span) != exact_span_width.is_some()
@@ -17066,6 +17211,11 @@ fn lower_aarch64_dynamic_rows_prepared_for_output(
     {
         return Err(ObjectError::InvalidModule(
             "AArch64 dynamic rows have an inconsistent exact Span width",
+        ));
+    }
+    if allow_direct_hole_continuation && root_plan.is_some() {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 dynamic continuation cannot inherit a root scanner",
         ));
     }
     let mut assembler = Aarch64Assembler::new();
@@ -17098,6 +17248,9 @@ fn lower_aarch64_dynamic_rows_prepared_for_output(
     let native_match = assembler.label()?;
     let native_no_match = assembler.label()?;
     let native_complete = (output != OutputContract::Exists)
+        .then(|| assembler.label())
+        .transpose()?;
+    let native_continue = allow_direct_hole_continuation
         .then(|| assembler.label())
         .transpose()?;
     let framed_fallback = assembler.label()?;
@@ -17341,7 +17494,10 @@ fn lower_aarch64_dynamic_rows_prepared_for_output(
     assembler.instruction(aarch64_add_w_reg(10, 11, 10)?)?;
     assembler.instruction(aarch64_load_w_uxtw(8, 15, 10)?)?;
     assembler.instruction(aarch64_cmp_w(8, 4)?)?;
-    assembler.branch_cond(AARCH64_EQ, framed_fallback)?;
+    assembler.branch_cond(
+        AARCH64_EQ,
+        native_continue.unwrap_or(framed_fallback),
+    )?;
     assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
     assembler.instruction(aarch64_tst_w(8, 7)?)?;
     if output == OutputContract::Exists {
@@ -17550,6 +17706,51 @@ fn lower_aarch64_dynamic_rows_prepared_for_output(
     assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
     assembler.instruction(0xd65f_03c0)?;
 
+    let mut continuation_identity_page = None;
+    let mut continuation_identity_page_offset = None;
+    let mut continuation_branch = None;
+    if let Some(native_continue) = native_continue {
+        assembler.bind(native_continue)?;
+        // Preserve the exact scalar frontier, then reuse the five preflight
+        // words as the compiler-private continuation record.
+        assembler.instruction(aarch64_load_x_imm(9, 31, 72)?)?; // cache identity
+        assembler.instruction(aarch64_store_x(11, 31, 48)?)?; // current row
+        assembler.instruction(aarch64_store_x(2, 31, 56)?)?; // unread position
+        let pending = if output == OutputContract::Exists {
+            assembler.instruction(aarch64_movz_w(10, 0)?)?;
+            None
+        } else {
+            assembler.instruction(aarch64_load_x_imm(10, 31, 80)?)?;
+            Some(assembler.label()?)
+        };
+        assembler.instruction(aarch64_store_x(31, 31, 64)?)?; // pending valid = 0
+        if let Some(no_pending) = pending {
+            assembler.instruction(aarch64_cmp_x_imm(10, 0)?)?;
+            assembler.branch_cond(AARCH64_EQ, no_pending)?;
+            assembler.instruction(aarch64_movz_w(8, 1)?)?;
+            assembler.instruction(aarch64_store_x(8, 31, 64)?)?;
+            assembler.bind(no_pending)?;
+        }
+        assembler.instruction(aarch64_store_x(10, 31, 72)?)?; // pending end
+        assembler.instruction(aarch64_store_x(9, 31, 80)?)?; // cache identity
+
+        let identity_page = assembler.instruction(0x9000_0006)?;
+        let identity_page_offset = assembler.instruction(aarch64_add_x_imm(6, 6, 0)?)?;
+        continuation_identity_page = Some(identity_page);
+        continuation_identity_page_offset = Some(identity_page_offset);
+        assembler.instruction(aarch64_add_x_imm(7, 31, 48)?)?;
+        assembler.instruction(aarch64_load_x_imm(0, 31, 0)?)?;
+        assembler.instruction(aarch64_load_x_imm(1, 31, 8)?)?;
+        assembler.instruction(aarch64_load_x_imm(2, 31, 16)?)?;
+        assembler.instruction(aarch64_load_x_imm(3, 31, 24)?)?;
+        assembler.instruction(aarch64_load_x_imm(4, 31, 32)?)?;
+        assembler.instruction(aarch64_load_x_imm(5, 31, 40)?)?;
+        continuation_branch = Some(assembler.instruction(0x9400_0000)?);
+        assembler.instruction(aarch64_load_x_imm(30, 31, 88)?)?;
+        assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+        assembler.instruction(0xd65f_03c0)?;
+    }
+
     assembler.bind(framed_fallback)?;
     assembler.instruction(aarch64_load_x_imm(0, 31, 0)?)?;
     assembler.instruction(aarch64_load_x_imm(1, 31, 8)?)?;
@@ -17564,17 +17765,33 @@ fn lower_aarch64_dynamic_rows_prepared_for_output(
     assembler.bind(short_fallback)?;
     let fallback_branch = assembler.instruction(0x1400_0000)?;
 
-    let mut relocation_offsets = [
+    let mut relocation_offsets = vec![
         identity_page,
         identity_page_offset,
         preflight_branch,
         deopt_branch,
         fallback_branch,
     ];
+    let continuation_relocation_base = if let (Some(identity_page), Some(identity_offset), Some(branch)) = (
+        continuation_identity_page,
+        continuation_identity_page_offset,
+        continuation_branch,
+    ) {
+        let base = relocation_offsets.len();
+        relocation_offsets.extend_from_slice(&[identity_page, identity_offset, branch]);
+        Some(base)
+    } else if continuation_identity_page.is_some()
+        || continuation_identity_page_offset.is_some()
+        || continuation_branch.is_some()
+    {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 dynamic continuation relocation set is incomplete",
+        ));
+    } else {
+        None
+    };
     let code = assembler.finish_with_offsets(&mut relocation_offsets)?;
-    Ok(NativeDynamicRowsEmission {
-        code,
-        relocations: vec![
+    let mut relocations = vec![
             ModuleRelocation {
                 section: TEXT_SECTION,
                 offset: offset_u64(relocation_offsets[0], "AArch64 dynamic identity ADRP")?,
@@ -17610,7 +17827,59 @@ fn lower_aarch64_dynamic_rows_prepared_for_output(
                 symbol: PREPARED_FALLBACK_RUNTIME_SYMBOL,
                 addend: 0,
             },
-        ],
+    ];
+    if let Some(base) = continuation_relocation_base {
+        let end = base
+            .checked_add(3)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "AArch64 dynamic continuation relocation indices",
+            ))?;
+        let &[identity_page, identity_offset, branch] = relocation_offsets
+            .get(base..end)
+            .ok_or(ObjectError::InvalidModule(
+                "AArch64 dynamic continuation relocation offsets are absent",
+            ))?
+        else {
+            return Err(ObjectError::InvalidModule(
+                "AArch64 dynamic continuation relocation offsets are malformed",
+            ));
+        };
+        relocations.extend_from_slice(&[
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(
+                    identity_page,
+                    "AArch64 dynamic continuation identity ADRP",
+                )?,
+                kind: RelocationKind::Aarch64Page21,
+                symbol: PARTIAL_IDENTITY_SYMBOL,
+                addend: 0,
+            },
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(
+                    identity_offset,
+                    "AArch64 dynamic continuation identity ADD",
+                )?,
+                kind: RelocationKind::Aarch64PageOff12,
+                symbol: PARTIAL_IDENTITY_SYMBOL,
+                addend: 0,
+            },
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(
+                    branch,
+                    "AArch64 dynamic continuation branch",
+                )?,
+                kind: RelocationKind::Aarch64Branch26,
+                symbol: DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL,
+                addend: 0,
+            },
+        ]);
+    }
+    Ok(NativeDynamicRowsEmission {
+        code,
+        relocations,
         scanner: root_plan.map(|plan| plan.scanner),
     })
 }
@@ -19198,6 +19467,15 @@ mod tests {
         assert!(plan.use_runtime_vl_dispatch);
         let emission = lower_aarch64_dynamic_rows_prepared(Some(plan)).unwrap();
         assert_eq!(emission.scanner, Some(plan.scanner));
+        assert_eq!(
+            emission
+                .relocations
+                .iter()
+                .filter(|relocation| relocation.symbol == DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL)
+                .count(),
+            0,
+            "root-scanner AArch64 entry retains whole-window deopt"
+        );
         let words = emission
             .code
             .chunks_exact(4)
@@ -19255,6 +19533,14 @@ mod tests {
 
         let scalar = lower_aarch64_dynamic_rows_prepared(None).unwrap();
         assert_eq!(scalar.scanner, None);
+        assert_eq!(
+            scalar
+                .relocations
+                .iter()
+                .filter(|relocation| relocation.symbol == DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL)
+                .count(),
+            1
+        );
         let scalar_words = scalar
             .code
             .chunks_exact(4)
@@ -21419,6 +21705,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the target matrix keeps scanner receipts, private symbols, and relocations in one audit"
+    )]
     fn zero_retained_rows_publish_general_dynamic_exists_entry_on_every_target() {
         let limits = CompileLimitsV1 {
             determinize: DeterminizeLimits {
@@ -21491,6 +21781,21 @@ mod tests {
                     .required_prepared_dynamic_rows_deopt_runtime_symbol(),
                 Some(DYNAMIC_ROWS_DEOPT_RUNTIME_SYMBOL_NAME)
             );
+            assert_eq!(
+                compiled
+                    .module()
+                    .required_prepared_dynamic_rows_continue_runtime_symbol(),
+                None,
+                "root-scanner entry must retain whole-window deopt: {target:?}"
+            );
+            assert!(
+                compiled
+                    .module()
+                    .symbols()
+                    .iter()
+                    .all(|symbol| symbol.name != DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL_NAME),
+                "an unused private continuation symbol must not leak into the object: {target:?}"
+            );
             assert!(
                 compiled
                     .module()
@@ -21539,6 +21844,70 @@ mod tests {
                 1,
                 "{target:?}"
             );
+        }
+    }
+
+    #[test]
+    fn scanner_free_dynamic_first_hole_symbol_is_target_and_contract_general() {
+        let pattern = r"(?-u:(?:a[\x00-\xFF]|[^a][\x00-\xFF]))";
+        for target in identity_target_matrix() {
+            for output in [
+                OutputContract::Exists,
+                OutputContract::SelectedEnd,
+                OutputContract::Span,
+            ] {
+                let compiled = compile(
+                    CompileRequest::new(pattern, target)
+                        .mode(CompileMode::Fast)
+                        .output(output),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("scanner-free dynamic continuation {target:?}/{output:?}: {error}")
+                });
+                assert_eq!(compiled.receipt().engine, EngineKind::OrderedNfa);
+                let view = compiled
+                    .program()
+                    .native_dynamic_rows_view()
+                    .expect("scanner-free dynamic graph view");
+                assert_eq!(view.root_requirement, None, "{target:?}/{output:?}");
+                assert_eq!(view.exact_match_width, Some(2));
+                assert!(compiled.module().prepared_entry_symbol().is_some());
+                assert_eq!(
+                    compiled.module().start_accelerator(),
+                    StartAccelerator::None,
+                    "{target:?}/{output:?}"
+                );
+                assert_eq!(
+                    compiled
+                        .module()
+                        .required_prepared_dynamic_rows_continue_runtime_symbol(),
+                    Some(DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL_NAME),
+                    "{target:?}/{output:?}"
+                );
+                assert_eq!(
+                    compiled
+                        .module()
+                        .required_prepared_dynamic_rows_deopt_runtime_symbol(),
+                    Some(DYNAMIC_ROWS_DEOPT_RUNTIME_SYMBOL_NAME),
+                    "descriptor/loop failures retain the canonical side exit"
+                );
+                assert_eq!(
+                    compiled
+                        .module()
+                        .relocations()
+                        .iter()
+                        .filter(|relocation| {
+                            relocation.symbol == DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL
+                        })
+                        .count(),
+                    1,
+                    "{target:?}/{output:?}"
+                );
+                assert_eq!(
+                    compiled.module().symbols()[DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL].name,
+                    DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL_NAME
+                );
+            }
         }
     }
 
@@ -21745,6 +22114,17 @@ mod tests {
                 }
             }
             assert!(previous_loop_compare < table_start);
+            assert_eq!(
+                emission
+                    .relocations
+                    .iter()
+                    .filter(|relocation| {
+                        relocation.symbol == DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL
+                    })
+                    .count(),
+                0,
+                "a root-scanner entry must keep whole-window deopt: {accelerator:?}"
+            );
         }
 
         let scalar = lower_x86_64_dynamic_rows_prepared(
@@ -21758,6 +22138,14 @@ mod tests {
         }));
         assert_eq!(occurrences(&scalar.code, &[0x41, 0x8b, 0x43, loop_count]), 0);
         assert_eq!(occurrences(&scalar.code, &[0xc5, 0xf8, 0x77]), 0);
+        assert_eq!(
+            scalar
+                .relocations
+                .iter()
+                .filter(|relocation| relocation.symbol == DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL)
+                .count(),
+            1
+        );
         for loop_row in 0..NATIVE_ROWS_LOOP_ROW_CAPACITY {
             let displacement = u8::try_from(native_rows_loop_row_offset(loop_row).unwrap()).unwrap();
             assert_eq!(
@@ -21789,6 +22177,7 @@ mod tests {
                     features,
                     output,
                     width,
+                    false,
                 )
                 .unwrap()
                 .code;
@@ -21843,6 +22232,7 @@ mod tests {
                     Some(plan),
                     output,
                     width,
+                    false,
                 )
                 .unwrap()
                 .code
@@ -21867,6 +22257,189 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the cross-ISA ABI audit keeps the exact branch targets and record stores together"
+    )]
+    fn dynamic_first_hole_codegen_marshals_exact_frontier_on_both_architectures() {
+        fn x86_unfilled_target(code: &[u8]) -> usize {
+            let comparison = [
+                0x45,
+                0x3b,
+                0x53,
+                u8::try_from(NATIVE_ROWS_UNFILLED_CELL).unwrap(),
+            ];
+            let compare = code
+                .windows(comparison.len())
+                .position(|bytes| bytes == comparison)
+                .expect("x86 dynamic unfilled-cell comparison");
+            x86_test_branch_target(code, compare + comparison.len())
+                .expect("x86 dynamic unfilled branch")
+                .0
+        }
+
+        fn aarch64_conditional_target(words: &[u32], branch: usize) -> usize {
+            let instruction = words[branch];
+            assert_eq!(instruction & 0xff00_0010, 0x5400_0000);
+            let immediate = (instruction >> 5) & 0x7_ffff;
+            let signed = i32::try_from(immediate << 13).unwrap() >> 13;
+            branch
+                .checked_add_signed(isize::try_from(signed).unwrap())
+                .expect("AArch64 conditional target")
+        }
+
+        for (output, width) in [
+            (OutputContract::Exists, None),
+            (OutputContract::SelectedEnd, None),
+            (OutputContract::Span, Some(2)),
+        ] {
+            let x86 = lower_x86_64_dynamic_rows_prepared_for_output(
+                None,
+                FeatureSet::of(CpuFeature::X86Avx2),
+                output,
+                width,
+                true,
+            )
+            .unwrap();
+            assert_eq!(
+                x86.relocations
+                    .iter()
+                    .filter(|relocation| {
+                        relocation.symbol == DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL
+                    })
+                    .count(),
+                1,
+                "x86 {output:?}"
+            );
+            let continuation = x86_unfilled_target(&x86.code);
+            assert_eq!(
+                &x86.code[continuation..continuation + 5],
+                &[0x4c, 0x8b, 0x5c, 0x24, 0x58],
+                "x86 {output:?} branches directly to cache-identity capture"
+            );
+            for instruction in [
+                [0x4c, 0x89, 0x44, 0x24, 0x40],
+                [0x48, 0x89, 0x54, 0x24, 0x48],
+                [0x4c, 0x89, 0x5c, 0x24, 0x60],
+                [0x48, 0x8d, 0x44, 0x24, 0x40],
+            ] {
+                assert!(
+                    x86.code.windows(instruction.len()).any(|bytes| bytes == instruction),
+                    "x86 {output:?} missing continuation record instruction {instruction:02x?}"
+                );
+            }
+
+            let arm = lower_aarch64_dynamic_rows_prepared_for_output(
+                None,
+                output,
+                width,
+                true,
+            )
+            .unwrap();
+            assert_eq!(
+                arm.relocations
+                    .iter()
+                    .filter(|relocation| {
+                        relocation.symbol == DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL
+                    })
+                    .count(),
+                1,
+                "AArch64 {output:?}"
+            );
+            let words = arm
+                .code
+                .chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            let table_byte = words
+                .iter()
+                .position(|&word| word == aarch64_load_byte_reg(8, 0, 2).unwrap())
+                .expect("AArch64 dynamic table byte");
+            let compare = table_byte
+                + words[table_byte..]
+                    .iter()
+                    .position(|&word| word == aarch64_cmp_w(8, 4).unwrap())
+                    .expect("AArch64 dynamic unfilled comparison");
+            let continuation = aarch64_conditional_target(&words, compare + 1);
+            assert_eq!(
+                words[continuation],
+                aarch64_load_x_imm(9, 31, 72).unwrap(),
+                "AArch64 {output:?} branches directly to cache-identity capture"
+            );
+            for instruction in [
+                aarch64_store_x(11, 31, 48).unwrap(),
+                aarch64_store_x(2, 31, 56).unwrap(),
+                aarch64_store_x(9, 31, 80).unwrap(),
+                aarch64_add_x_imm(7, 31, 48).unwrap(),
+            ] {
+                assert!(
+                    words.contains(&instruction),
+                    "AArch64 {output:?} missing continuation record instruction {instruction:08x}"
+                );
+            }
+        }
+
+        let x86_deopt = lower_x86_64_dynamic_rows_prepared_for_output(
+            None,
+            FeatureSet::EMPTY,
+            OutputContract::Exists,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            x86_deopt
+                .relocations
+                .iter()
+                .filter(|relocation| relocation.symbol == DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL)
+                .count(),
+            0
+        );
+        let fallback = x86_unfilled_target(&x86_deopt.code);
+        assert_eq!(
+            &x86_deopt.code[fallback..fallback + 5],
+            &[0x48, 0x8b, 0x7c, 0x24, 0x10],
+            "an unauthenticated scanner-free lowering retains whole-window deopt"
+        );
+
+        let arm_deopt = lower_aarch64_dynamic_rows_prepared_for_output(
+            None,
+            OutputContract::Exists,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            arm_deopt
+                .relocations
+                .iter()
+                .filter(|relocation| relocation.symbol == DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL)
+                .count(),
+            0
+        );
+        let words = arm_deopt
+            .code
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        let table_byte = words
+            .iter()
+            .position(|&word| word == aarch64_load_byte_reg(8, 0, 2).unwrap())
+            .unwrap();
+        let compare = table_byte
+            + words[table_byte..]
+                .iter()
+                .position(|&word| word == aarch64_cmp_w(8, 4).unwrap())
+                .unwrap();
+        let fallback = aarch64_conditional_target(&words, compare + 1);
+        assert_eq!(
+            words[fallback],
+            aarch64_load_x_imm(0, 31, 0).unwrap(),
+            "unauthenticated AArch64 lowering retains whole-window deopt"
+        );
     }
 
     #[test]
@@ -21900,6 +22473,13 @@ mod tests {
                     .module()
                     .required_prepared_dynamic_rows_deopt_runtime_symbol(),
                 Some(DYNAMIC_ROWS_DEOPT_RUNTIME_SYMBOL_NAME),
+                "{target:?}"
+            );
+            assert_eq!(
+                compiled
+                    .module()
+                    .required_prepared_dynamic_rows_continue_runtime_symbol(),
+                None,
                 "{target:?}"
             );
             for symbol in [
