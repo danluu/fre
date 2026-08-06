@@ -6926,13 +6926,17 @@ fn warm_context_complete_dense_transition(
             detail: "complete contextual dense row has invalid dependencies",
         });
     }
-    let mut observation = PreparedBoundaryObservation::new(
+    // A complete dependency-normalized row cannot take the broader raw-key
+    // retry. Project its graph-derived (at most two-bit) dependency mask
+    // directly so a word-only row, for example, does not also classify the
+    // absolute and two line-boundary families merely to populate a reusable
+    // raw observation that this path can never reuse.
+    let assertions = project_complete_context_dependencies(
+        dependencies,
         automaton.line_terminator(),
         haystack,
         boundary,
-        global_dependencies,
     );
-    let assertions = observation.project(dependencies);
     let symbol = contextual_symbol_for_byte(automaton, byte, assertions);
     let Some((cell, lookup_work)) = context.lookup_complete_dense_with_hot_prevalidated(
         symbol,
@@ -22359,6 +22363,27 @@ fn enabled_assertion_mask_unmetered_for_dependencies(
     )
 }
 
+/// Project the exact dependency domain of one certified complete contextual
+/// row without preparing observations for a broader raw-key retry.
+///
+/// Dense ownership admits only graph-derived masks containing at most two
+/// assertion bits. Keeping the mask explicit lets the canonical selective
+/// classifier touch only the families those bits name.
+#[inline]
+fn project_complete_context_dependencies(
+    dependencies: u32,
+    line_terminator: u8,
+    haystack: &[u8],
+    position: usize,
+) -> u32 {
+    enabled_assertion_mask_unmetered_with_classifier(
+        BoundaryContextClassifier::new(dependencies),
+        line_terminator,
+        haystack,
+        position,
+    )
+}
+
 /// One full-haystack boundary observation shared by dependency projections.
 ///
 /// Raw byte-derived properties and Unicode word classification each stay
@@ -22543,6 +22568,7 @@ fn enabled_assertion_mask_with_classifier(
     ))
 }
 
+#[inline]
 fn enabled_assertion_mask_unmetered_with_classifier(
     classifier: BoundaryContextClassifier,
     line_terminator: u8,
@@ -24307,6 +24333,40 @@ mod tests {
             CompileLimits::default(),
         )
         .unwrap()
+    }
+
+    fn complete_context_dependency_masks() -> Vec<u32> {
+        let mut masks = Vec::with_capacity(172);
+        masks.push(0);
+        for first in 0..super::ASSERTION_KIND_COUNT {
+            let first_bit = 1_u32 << first;
+            masks.push(first_bit);
+            for second in first + 1..super::ASSERTION_KIND_COUNT {
+                masks.push(first_bit | (1_u32 << second));
+            }
+        }
+        masks
+    }
+
+    fn edge_evaluated_assertion_mask(
+        line_terminator: u8,
+        haystack: &[u8],
+        position: usize,
+    ) -> u32 {
+        super::ASSERTION_KINDS
+            .into_iter()
+            .filter(|&kind| {
+                super::zero_width_edge_enabled_with_line_terminator(
+                    line_terminator,
+                    kind,
+                    haystack,
+                    position,
+                )
+                .unwrap()
+            })
+            .fold(0_u32, |mask, kind| {
+                mask | kind.assertion_bit().unwrap()
+            })
     }
 
     fn trailing_assertion_or_bang(assertion: EdgeKind) -> Automaton {
@@ -40641,6 +40701,137 @@ mod tests {
                     );
                     assert_eq!(mask & !bit, 0);
                     assert_eq!(meter.consumed, 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn complete_context_projection_matches_every_dependency_and_line_terminator() {
+        let dependencies = complete_context_dependency_masks();
+        assert_eq!(dependencies.len(), 172);
+
+        for line_terminator in u8::MIN..=u8::MAX {
+            let haystacks = [
+                Vec::new(),
+                vec![line_terminator],
+                vec![b'\r', line_terminator, b'\n'],
+                vec![line_terminator, b'_', 0x80, line_terminator],
+            ];
+            for haystack in haystacks {
+                for position in 0..=haystack.len() {
+                    let enabled = edge_evaluated_assertion_mask(
+                        line_terminator,
+                        &haystack,
+                        position,
+                    );
+                    for &dependency_mask in &dependencies {
+                        assert_eq!(
+                            super::project_complete_context_dependencies(
+                                dependency_mask,
+                                line_terminator,
+                                &haystack,
+                                position,
+                            ),
+                            enabled & dependency_mask,
+                            "dependencies={dependency_mask:#07x} terminator={line_terminator:#04x} source={haystack:?} position={position}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn complete_context_projection_matches_every_raw_byte_pair_and_endpoint() {
+        let raw_domain = (1_u32 << 12) - 1;
+        let dependencies = complete_context_dependency_masks()
+            .into_iter()
+            .filter(|mask| mask & !raw_domain == 0)
+            .collect::<Vec<_>>();
+        assert_eq!(dependencies.len(), 79);
+        let line_terminator = b';';
+
+        for byte in u8::MIN..=u8::MAX {
+            let haystack = [byte];
+            for position in 0..=haystack.len() {
+                let enabled =
+                    edge_evaluated_assertion_mask(line_terminator, &haystack, position);
+                for &dependency_mask in &dependencies {
+                    assert_eq!(
+                        super::project_complete_context_dependencies(
+                            dependency_mask,
+                            line_terminator,
+                            &haystack,
+                            position,
+                        ),
+                        enabled & dependency_mask,
+                        "dependencies={dependency_mask:#07x} byte={byte:#04x} position={position}",
+                    );
+                }
+            }
+        }
+
+        for before in u8::MIN..=u8::MAX {
+            for after in u8::MIN..=u8::MAX {
+                let haystack = [before, after];
+                let enabled = edge_evaluated_assertion_mask(line_terminator, &haystack, 1);
+                for &dependency_mask in &dependencies {
+                    assert_eq!(
+                        super::project_complete_context_dependencies(
+                            dependency_mask,
+                            line_terminator,
+                            &haystack,
+                            1,
+                        ),
+                        enabled & dependency_mask,
+                        "dependencies={dependency_mask:#07x} before={before:#04x} after={after:#04x}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn complete_context_projection_matches_unicode_and_invalid_utf8_boundaries() {
+        let dependencies = complete_context_dependency_masks();
+        let mut haystacks = (u8::MIN..=u8::MAX)
+            .map(|byte| vec![byte])
+            .collect::<Vec<_>>();
+        haystacks.extend([
+            Vec::new(),
+            "a_!".as_bytes().to_vec(),
+            "é_β!".as_bytes().to_vec(),
+            "中β_💩!".as_bytes().to_vec(),
+            "a\u{301}β".as_bytes().to_vec(),
+            vec![0xc3],
+            vec![0x80, b'a'],
+            vec![0xc0, 0xaf],
+            vec![0xed, 0xa0, 0x80],
+            vec![0xf0, 0x28, 0x8c, 0xbc],
+            vec![0xf0, 0x9f, 0x92],
+        ]);
+
+        for line_terminator in [0, b'\r', b'\n', b';', 0x7f, 0xff] {
+            for haystack in &haystacks {
+                for position in 0..=haystack.len() {
+                    let enabled = edge_evaluated_assertion_mask(
+                        line_terminator,
+                        haystack,
+                        position,
+                    );
+                    for &dependency_mask in &dependencies {
+                        assert_eq!(
+                            super::project_complete_context_dependencies(
+                                dependency_mask,
+                                line_terminator,
+                                haystack,
+                                position,
+                            ),
+                            enabled & dependency_mask,
+                            "dependencies={dependency_mask:#07x} terminator={line_terminator:#04x} source={haystack:?} position={position}",
+                        );
+                    }
                 }
             }
         }
