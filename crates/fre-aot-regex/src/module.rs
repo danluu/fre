@@ -28,9 +28,9 @@ use crate::{
     program::{
         AnchoredByteSet, CompiledProgram, DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES,
         DynamicNativeRowsV1, MAX_ANCHORED_PREFIX_BYTES, NativeContextProgramView,
-        NativeDynamicRowsProgramView, NativePartialProgramView, NativeProgramView,
-        NativeRetainedPrefixRequirement, NativeRetainedSuffixRequirement, OutputContract,
-        PARTIAL_DFA_MIN_INPUT_BYTES,
+        NativeDynamicRootRequirement, NativeDynamicRowsProgramView, NativePartialProgramView,
+        NativeProgramView, NativeRetainedPrefixRequirement, NativeRetainedSuffixRequirement,
+        OutputContract, PARTIAL_DFA_MIN_INPUT_BYTES,
     },
     required_literals::{MaximumConsumedDistance, RequiredInteriorCandidate, RequiredLiteralSet},
     seeded_reverse::{
@@ -345,8 +345,9 @@ pub enum SectionKind {
 
 /// Start-state accelerator actually emitted in a native module.
 ///
-/// `None` means either the program uses the runtime adapter or the complete DFA
-/// did not satisfy the graph-derived filter cost model.
+/// `None` means no start scanner was emitted: the module may use the runtime
+/// adapter, or its selected native route, target backend, or graph-derived
+/// filter cost model may have retained scalar transition work.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum StartAccelerator {
     None,
@@ -391,6 +392,12 @@ struct NativeDfaEmission {
     scanner: Option<NativeScannerEmission>,
     suffix_scanner: Option<NativeScannerEmission>,
     conjunction: Option<NativeVectorConjunctionEmission>,
+}
+
+struct NativeDynamicRowsEmission {
+    code: Vec<u8>,
+    relocations: Vec<ModuleRelocation>,
+    scanner: Option<NativeScannerEmission>,
 }
 
 /// Validation contract at one emitted native-DFA entry.
@@ -668,11 +675,27 @@ const NATIVE_ROWS_CACHE_IDENTITY: usize =
     core::mem::offset_of!(DynamicNativeRowsV1, cache_identity);
 const NATIVE_ROWS_LOOP_COUNT: usize =
     core::mem::offset_of!(DynamicNativeRowsV1, learned_loop_row_count);
+const NATIVE_ROWS_LOOP_ROWS: usize =
+    core::mem::offset_of!(DynamicNativeRowsV1, learned_loop_rows);
+const NATIVE_ROWS_LOOP_ROW_CAPACITY: usize = 4;
 const NATIVE_ROWS_INITIAL_ROW: usize =
     core::mem::offset_of!(DynamicNativeRowsV1, initial_row);
 const NATIVE_ROWS_INITIAL_FLAGS: usize =
     core::mem::offset_of!(DynamicNativeRowsV1, initial_flags);
 const _: () = assert!(core::mem::size_of::<DynamicNativeRowsV1>() <= 127);
+
+fn native_rows_loop_row_offset(loop_row: usize) -> Result<usize, ObjectError> {
+    let delta = loop_row
+        .checked_mul(core::mem::size_of::<u32>())
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "dynamic learned-loop row offset",
+        ))?;
+    NATIVE_ROWS_LOOP_ROWS
+        .checked_add(delta)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "dynamic learned-loop row offset",
+        ))
+}
 
 struct NativeLowering {
     code: Vec<u8>,
@@ -1216,9 +1239,10 @@ fn lower_runtime_adapter(
     })
 }
 
-/// Add an exclusive prepared entry that executes only the authenticated rows
-/// already owned by the runtime's ordinary K0 workspace. No regex-specific
-/// table or transition is embedded in this entry.
+/// Add an exclusive prepared entry that scans one optional graph-certified
+/// root byte class and otherwise executes only the authenticated rows already
+/// owned by the runtime's ordinary K0 workspace. No regex-specific row table
+/// or transition is embedded in this entry.
 fn lower_native_dynamic_rows_prepared(
     mut program_bytes: Vec<u8>,
     view: NativeDynamicRowsProgramView,
@@ -1239,6 +1263,11 @@ fn lower_native_dynamic_rows_prepared(
             & !15;
     program_bytes.resize(identity_offset, 0);
     program_bytes.extend_from_slice(&view.artifact_identity);
+    let root_filter = view
+        .root_requirement
+        .map(plan_dynamic_root_filter)
+        .transpose()?
+        .flatten();
 
     let (mut code, mut relocations) = match target.architecture {
         Architecture::X86_64 => lower_x86_64_runtime_adapter()?,
@@ -1263,10 +1292,40 @@ fn lower_native_dynamic_rows_prepared(
             }
         }
     }
-    let (prepared_code, prepared_relocations) = match target.architecture {
-        Architecture::X86_64 => lower_x86_64_dynamic_rows_prepared()?,
-        Architecture::Aarch64 => lower_aarch64_dynamic_rows_prepared()?,
+    // The exact-position requirement is target-neutral. This bounded slice
+    // publishes the existing x86 range-backed SIMD scanner; AArch64 retains
+    // its established scalar dynamic-row entry until its ASIMD/SVE scanner
+    // control flow can be shared without changing the prepared ABI.
+    let prepared = match target.architecture {
+        Architecture::X86_64 => {
+            lower_x86_64_dynamic_rows_prepared(root_filter, target.features)?
+        }
+        Architecture::Aarch64 => {
+            let (code, relocations) = lower_aarch64_dynamic_rows_prepared()?;
+            NativeDynamicRowsEmission {
+                code,
+                relocations,
+                scanner: None,
+            }
+        }
     };
+    if target.architecture == Architecture::X86_64
+        && let (Some(requirement), Some(_)) = (view.root_requirement, root_filter)
+        && !exact_position_scanner_is_preserved(
+            prepared.scanner,
+            requirement.scan_offset,
+            requirement.membership,
+        )
+    {
+        return Err(ObjectError::InvalidModule(
+            "dynamic root scanner did not preserve its graph proof",
+        ));
+    }
+    let start_accelerator = prepared
+        .scanner
+        .map_or(StartAccelerator::None, NativeScannerEmission::start_accelerator);
+    let prepared_code = prepared.code;
+    let prepared_relocations = prepared.relocations;
     let code_size = prepared_code.len();
     push_bytes(&mut code, &prepared_code)?;
     for mut relocation in prepared_relocations {
@@ -1289,7 +1348,7 @@ fn lower_native_dynamic_rows_prepared(
             data: program_bytes,
             relocations,
             needs_runtime: true,
-            start_accelerator: StartAccelerator::None,
+            start_accelerator,
             anchored_prefix_filter_bytes: 0,
         },
         PreparedEntryLayout {
@@ -2909,12 +2968,49 @@ fn retained_prefix_scanner_is_preserved(
     emission: Option<NativeScannerEmission>,
     requirement: NativeRetainedPrefixRequirement,
 ) -> bool {
+    exact_position_scanner_is_preserved(
+        emission,
+        requirement.scan_offset,
+        requirement.membership,
+    )
+}
+
+fn exact_position_scanner_is_preserved(
+    emission: Option<NativeScannerEmission>,
+    scan_offset: u8,
+    membership: [u64; 4],
+) -> bool {
     let Some(emission) = emission else {
         return false;
     };
     emission.vectorized
-        && emission.scan_offset == requirement.scan_offset
-        && emission.membership == requirement.membership
+        && emission.scan_offset == scan_offset
+        && emission.membership == membership
+}
+
+fn plan_dynamic_root_filter(
+    requirement: NativeDynamicRootRequirement,
+) -> Result<Option<NativeStartFilter>, ObjectError> {
+    let Some(filter) = filter_from_membership_words(
+        requirement.membership,
+        usize::from(requirement.scan_offset),
+        true,
+    )?
+    else {
+        return Ok(None);
+    };
+    // An empty graph column cannot admit a moving candidate. Keep the scalar
+    // dynamic entry instead of treating the backend's nonempty-filter
+    // requirement as a module-construction failure.
+    if filter.ranges().is_empty() {
+        return Ok(None);
+    }
+    if start_filter_membership(filter)? != requirement.membership {
+        return Err(ObjectError::InvalidModule(
+            "dynamic root filter changed its exact graph membership",
+        ));
+    }
+    Ok(Some(filter))
 }
 
 fn retained_suffix_scanner_is_preserved(
@@ -10452,11 +10548,31 @@ fn lower_x86_64_runtime_adapter() -> Result<(Vec<u8>, Vec<ModuleRelocation>), Ob
     clippy::too_many_lines,
     reason = "the compile-time descriptor size assertion proves every encoded positive disp8 offset"
 )]
-fn lower_x86_64_dynamic_rows_prepared() -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
+fn lower_x86_64_dynamic_rows_prepared(
+    root_filter: Option<NativeStartFilter>,
+    features: FeatureSet,
+) -> Result<NativeDynamicRowsEmission, ObjectError> {
     const FRAME_BYTES: u8 = 104;
+    if root_filter.is_some_and(|filter| {
+        filter.ranges().is_empty() || !filter.from_anchored_prefix
+    }) {
+        return Err(ObjectError::InvalidModule(
+            "x86 dynamic root scanner has an invalid graph filter",
+        ));
+    }
     let mut assembler = X86Assembler::new();
+    let filter_kind = root_filter.map(|_| x86_start_filter_kind(features));
+    let scanner = root_filter
+        .zip(filter_kind)
+        .map(|(filter, kind)| x86_range_scanner_emission(filter, kind))
+        .transpose()?;
     let preflight_enter = assembler.label()?;
     let scan = assembler.label()?;
+    let table_scan = assembler.label()?;
+    let root_vector = root_filter.map(|_| assembler.label()).transpose()?;
+    let root_vector_hit = root_filter.map(|_| assembler.label()).transpose()?;
+    let root_scalar = root_filter.map(|_| assembler.label()).transpose()?;
+    let root_scalar_reject = root_filter.map(|_| assembler.label()).transpose()?;
     let native_match = assembler.label()?;
     let native_no_match = assembler.label()?;
     let framed_fallback = assembler.label()?;
@@ -10502,53 +10618,169 @@ fn lower_x86_64_dynamic_rows_prepared() -> Result<(Vec<u8>, Vec<ModuleRelocation
     assembler.instruction(&[0xc3])?;
 
     assembler.bind(preflight_enter)?;
-    assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, 0x50])?; // descriptor
-    assembler.instruction(&[0x48, 0x85, 0xc0])?;
+    // R11 retains the authenticated descriptor while the shared scanner
+    // helpers use RAX for constants, remaining lengths, and candidate masks.
+    assembler.instruction(&[0x4c, 0x8b, 0x5c, 0x24, 0x50])?; // descriptor
+    assembler.instruction(&[0x4d, 0x85, 0xdb])?;
     assembler.branch(&[0x0f, 0x84], framed_fallback)?;
-    assembler.instruction(&[0x48, 0x8b, 0x30])?; // rows
+    assembler.instruction(&[0x49, 0x8b, 0x33])?; // rows
     assembler.instruction(&[0x48, 0x85, 0xf6])?;
     assembler.branch(&[0x0f, 0x84], framed_fallback)?;
-    assembler.instruction(&[0x4c, 0x8b, 0x48, NATIVE_ROWS_CLASS_MAP_ADDRESS as u8])?;
+    assembler.instruction(&[0x4d, 0x8b, 0x4b, NATIVE_ROWS_CLASS_MAP_ADDRESS as u8])?;
     assembler.instruction(&[0x4d, 0x85, 0xc9])?;
     assembler.branch(&[0x0f, 0x84], framed_fallback)?;
     assembler.instruction(&[0x4c, 0x8b, 0x54, 0x24, 0x58])?; // generation
     assembler.instruction(&[0x4d, 0x85, 0xd2])?;
     assembler.branch(&[0x0f, 0x84], framed_fallback)?;
-    assembler.instruction(&[0x4c, 0x3b, 0x50, NATIVE_ROWS_CACHE_IDENTITY as u8])?;
+    assembler.instruction(&[0x4d, 0x3b, 0x53, NATIVE_ROWS_CACHE_IDENTITY as u8])?;
     assembler.branch(&[0x0f, 0x85], framed_fallback)?;
-    assembler.instruction(&[0x83, 0x78, NATIVE_ROWS_INITIAL_FLAGS as u8, 0])?;
+    assembler.instruction(&[0x41, 0x83, 0x7b, NATIVE_ROWS_INITIAL_FLAGS as u8, 0])?;
     assembler.branch(&[0x0f, 0x85], framed_fallback)?;
-    assembler.instruction(&[0x83, 0x78, NATIVE_ROWS_LOOP_COUNT as u8, 0])?;
-    assembler.branch(&[0x0f, 0x85], framed_fallback)?;
-    assembler.instruction(&[0x83, 0x78, NATIVE_ROWS_ROW_STRIDE as u8, 0])?;
+    if root_filter.is_some() {
+        assembler.instruction(&[
+            0x41,
+            0x83,
+            0x7b,
+            NATIVE_ROWS_LOOP_COUNT as u8,
+            u8::try_from(NATIVE_ROWS_LOOP_ROW_CAPACITY)
+                .map_err(|_| ObjectError::ArithmeticOverflow("x86 dynamic loop capacity"))?,
+        ])?;
+        assembler.branch(&[0x0f, 0x87], framed_fallback)?; // loop count > capacity
+    } else {
+        // Without an independent root scanner, preserve the established
+        // whole-cache decline instead of adding loop ownership checks to the
+        // ordinary scalar dynamic-row hot path.
+        assembler.instruction(&[0x41, 0x83, 0x7b, NATIVE_ROWS_LOOP_COUNT as u8, 0])?;
+        assembler.branch(&[0x0f, 0x85], framed_fallback)?;
+    }
+    assembler.instruction(&[0x41, 0x83, 0x7b, NATIVE_ROWS_ROW_STRIDE as u8, 0])?;
     assembler.branch(&[0x0f, 0x84], framed_fallback)?;
-    assembler.instruction(&[0x44, 0x8b, 0x40, NATIVE_ROWS_INITIAL_ROW as u8])?;
-    assembler.instruction(&[0x4c, 0x3b, 0x40, NATIVE_ROWS_LIVE_CELLS as u8])?;
+    assembler.instruction(&[0x45, 0x8b, 0x43, NATIVE_ROWS_INITIAL_ROW as u8])?;
+    assembler.instruction(&[0x4d, 0x3b, 0x43, NATIVE_ROWS_LIVE_CELLS as u8])?;
     assembler.branch(&[0x0f, 0x83], framed_fallback)?;
     assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x18])?; // haystack
     assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x40])?; // position
     assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x48])?; // exact end
+    if let (Some(filter), Some(kind)) = (root_filter, filter_kind) {
+        x86_emit_start_filter_constants(&mut assembler, filter, kind, 1)?;
+        assembler.instruction(&[0x41, 0x8b, 0x43, NATIVE_ROWS_LOOP_COUNT as u8])?;
+    }
 
+    let loop_rows_checked = root_filter.map(|_| assembler.label()).transpose()?;
     assembler.bind(scan)?;
     assembler.instruction(&[0x48, 0x39, 0xca])?;
     assembler.branch(&[0x0f, 0x83], native_no_match)?;
+    // The graph scanner independently owns the restartable initial-row skip,
+    // including when K0 has also learned a loop overlay for that row. A hit
+    // enters the canonical direct cell once; only non-root learned rows remain
+    // canonical-loop ownership boundaries.
+    if root_filter.is_some() {
+        let loop_rows_checked = loop_rows_checked.ok_or(ObjectError::InvalidModule(
+            "x86 dynamic loop ownership label is absent",
+        ))?;
+        assembler.instruction(&[0x45, 0x3b, 0x43, NATIVE_ROWS_INITIAL_ROW as u8])?;
+        assembler.branch(
+            &[0x0f, 0x84],
+            root_vector.ok_or(ObjectError::InvalidModule(
+                "x86 dynamic root vector label is absent",
+            ))?,
+        )?;
+        // Canonical K0 owns every published learned-loop row. Check only the
+        // authenticated live prefix and side-exit before consuming its first
+        // byte. The root scanner branched above, so these are non-root plans;
+        // inactive descriptor slots are never interpreted. EAX retains the
+        // immutable count across ordinary table transitions.
+        assembler.instruction(&[0x85, 0xc0])?;
+        assembler.branch(&[0x0f, 0x84], loop_rows_checked)?;
+        for loop_row in 0..NATIVE_ROWS_LOOP_ROW_CAPACITY {
+            assembler.instruction(&[
+                0x45,
+                0x3b,
+                0x43,
+                u8::try_from(native_rows_loop_row_offset(loop_row)?).map_err(|_| {
+                    ObjectError::ArithmeticOverflow("x86 dynamic learned-loop displacement")
+                })?,
+            ])?;
+            assembler.branch(&[0x0f, 0x84], framed_fallback)?;
+            let live_count = u8::try_from(loop_row + 1)
+                .map_err(|_| ObjectError::ArithmeticOverflow("x86 dynamic learned-loop count"))?;
+            if usize::from(live_count) < NATIVE_ROWS_LOOP_ROW_CAPACITY {
+                assembler.instruction(&[0x83, 0xf8, live_count])?;
+                assembler.branch(&[0x0f, 0x84], loop_rows_checked)?;
+            }
+        }
+        assembler.bind(loop_rows_checked)?;
+    }
+
+    assembler.bind(table_scan)?;
     assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
     assembler.instruction(&[0x47, 0x0f, 0xb6, 0x14, 0x11])?;
     assembler.instruction(&[0x4d, 0x01, 0xc2])?;
     assembler.instruction(&[0x46, 0x8b, 0x14, 0x96])?;
-    assembler.instruction(&[0x44, 0x3b, 0x50, NATIVE_ROWS_UNFILLED_CELL as u8])?;
+    assembler.instruction(&[0x45, 0x3b, 0x53, NATIVE_ROWS_UNFILLED_CELL as u8])?;
     assembler.branch(&[0x0f, 0x84], framed_fallback)?;
     assembler.instruction(&[0x48, 0xff, 0xc2])?;
-    assembler.instruction(&[0x44, 0x85, 0x50, NATIVE_ROWS_ACCEPT_MASK as u8])?;
+    assembler.instruction(&[0x45, 0x85, 0x53, NATIVE_ROWS_ACCEPT_MASK as u8])?;
     assembler.branch(&[0x0f, 0x85], native_match)?;
-    assembler.instruction(&[0x44, 0x23, 0x50, NATIVE_ROWS_NEXT_ROW_TOKEN_MASK as u8])?;
+    assembler.instruction(&[0x45, 0x23, 0x53, NATIVE_ROWS_NEXT_ROW_TOKEN_MASK as u8])?;
     assembler.instruction(&[0x45, 0x85, 0xd2])?;
     assembler.branch(&[0x0f, 0x84], native_no_match)?;
     assembler.instruction(&[0x45, 0x89, 0xd0])?;
     assembler.instruction(&[0x41, 0xff, 0xc8])?;
     assembler.branch(&[0xe9], scan)?;
 
+    if let (Some(filter), Some(kind)) = (root_filter, filter_kind) {
+        let vector = root_vector.ok_or(ObjectError::InvalidModule(
+            "x86 dynamic root vector label is absent",
+        ))?;
+        let vector_hit = root_vector_hit.ok_or(ObjectError::InvalidModule(
+            "x86 dynamic root hit label is absent",
+        ))?;
+        let scalar = root_scalar.ok_or(ObjectError::InvalidModule(
+            "x86 dynamic root scalar label is absent",
+        ))?;
+        let scalar_reject = root_scalar_reject.ok_or(ObjectError::InvalidModule(
+            "x86 dynamic root scalar reject label is absent",
+        ))?;
+        assembler.bind(vector)?;
+        assembler.instruction(&[0x48, 0x89, 0xc8])?; // remaining = end
+        assembler.instruction(&[0x48, 0x29, 0xd0])?; // remaining -= position
+        let required = u32::from(kind.width())
+            .checked_add(u32::from(filter.scan_offset))
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "x86 dynamic root vector bound",
+            ))?;
+        let mut compare = vec![0x48, 0x3d];
+        compare.extend_from_slice(&required.to_le_bytes());
+        assembler.instruction(&compare)?;
+        assembler.branch(&[0x0f, 0x82], scalar)?;
+        x86_emit_start_filter_vector_candidate(&mut assembler, filter, kind, vector_hit)?;
+        assembler.instruction(&[0x48, 0x83, 0xc2, kind.width()])?;
+        assembler.branch(&[0xe9], vector)?;
+
+        assembler.bind(vector_hit)?;
+        x86_emit_first_candidate_lane(
+            &mut assembler,
+            X86CandidateMask::for_filter(filter, kind),
+        )?;
+        assembler.instruction(&[0x48, 0x01, 0xc2])?; // position += first lane
+        assembler.instruction(&[0x41, 0x8b, 0x43, NATIVE_ROWS_LOOP_COUNT as u8])?;
+        assembler.branch(&[0xe9], table_scan)?;
+
+        assembler.bind(scalar)?;
+        x86_emit_start_filter_scalar_bound(&mut assembler, filter.scan_offset, native_no_match)?;
+        x86_emit_scalar_filter_membership(&mut assembler, filter, scalar_reject)?;
+        assembler.instruction(&[0x41, 0x8b, 0x43, NATIVE_ROWS_LOOP_COUNT as u8])?;
+        assembler.branch(&[0xe9], table_scan)?;
+        assembler.bind(scalar_reject)?;
+        assembler.instruction(&[0x48, 0xff, 0xc2])?;
+        assembler.branch(&[0xe9], scalar)?;
+    }
+
     assembler.bind(native_no_match)?;
+    if filter_kind.is_some_and(X86StartFilterKind::needs_vzeroupper) {
+        assembler.instruction(&[0xc5, 0xf8, 0x77])?;
+    }
     assembler.instruction(&[0x31, 0xc0])?;
     assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x38])?;
     assembler.instruction(&[0x49, 0x89, 0x01])?;
@@ -10557,6 +10789,9 @@ fn lower_x86_64_dynamic_rows_prepared() -> Result<(Vec<u8>, Vec<ModuleRelocation
     assembler.instruction(&[0xc3])?;
 
     assembler.bind(native_match)?;
+    if filter_kind.is_some_and(X86StartFilterKind::needs_vzeroupper) {
+        assembler.instruction(&[0xc5, 0xf8, 0x77])?;
+    }
     assembler.instruction(&[0x31, 0xc0])?;
     assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x38])?;
     assembler.instruction(&[0x49, 0x89, 0x01])?;
@@ -10566,6 +10801,9 @@ fn lower_x86_64_dynamic_rows_prepared() -> Result<(Vec<u8>, Vec<ModuleRelocation
     assembler.instruction(&[0xc3])?;
 
     assembler.bind(framed_fallback)?;
+    if filter_kind.is_some_and(X86StartFilterKind::needs_vzeroupper) {
+        assembler.instruction(&[0xc5, 0xf8, 0x77])?;
+    }
     assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x10])?;
     assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x18])?;
     assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x20])?;
@@ -10589,9 +10827,9 @@ fn lower_x86_64_dynamic_rows_prepared() -> Result<(Vec<u8>, Vec<ModuleRelocation
     let preflight_displacement = finished.label_offset(preflight_displacement_label)?;
     let deopt_displacement = finished.label_offset(deopt_displacement_label)?;
     let fallback_displacement = finished.label_offset(fallback_displacement_label)?;
-    Ok((
-        finished.code,
-        vec![
+    Ok(NativeDynamicRowsEmission {
+        code: finished.code,
+        relocations: vec![
             ModuleRelocation {
                 section: TEXT_SECTION,
                 offset: offset_u64(identity_displacement, "x86 dynamic identity relocation")?,
@@ -10621,7 +10859,8 @@ fn lower_x86_64_dynamic_rows_prepared() -> Result<(Vec<u8>, Vec<ModuleRelocation
                 addend: -4,
             },
         ],
-    ))
+        scanner,
+    })
 }
 
 #[allow(
@@ -20238,8 +20477,25 @@ mod tests {
             assert!(compiled.program().partial_dfa_stats().unwrap().is_none());
             assert!(compiled.program().native_dfa_view().is_none());
             assert!(compiled.program().native_partial_dfa_view().is_none());
-            assert!(compiled.program().native_dynamic_rows_view().is_some());
+            let dynamic_view = compiled
+                .program()
+                .native_dynamic_rows_view()
+                .expect("dynamic graph view");
+            assert!(dynamic_view.root_requirement.is_some());
             assert!(compiled.module().prepared_entry_symbol().is_some());
+            if target.architecture == Architecture::X86_64 {
+                assert_ne!(
+                    compiled.module().start_accelerator(),
+                    StartAccelerator::None,
+                    "x86 dynamic root scanner receipt: {target:?}"
+                );
+            } else {
+                assert_eq!(
+                    compiled.module().start_accelerator(),
+                    StartAccelerator::None,
+                    "bounded AArch64 slice must retain the scalar dynamic entry: {target:?}"
+                );
+            }
             assert_eq!(
                 compiled
                     .module()
@@ -20434,12 +20690,13 @@ typedef struct {{
 }} preflight_t;
 extern uint32_t {symbol}(handle_t,const unsigned char*,size_t,size_t,size_t,result_t*);
 static const unsigned char identity[32] = {{{identity}}};
-static const unsigned char haystack[80] = {{0}};
+static unsigned char haystack[80];
 static unsigned char classes[256];
 static uint32_t cells[1];
 static rows_t rows;
 static int mode, preflight_calls, fallback_calls, deopt_calls;
 static void init_rows(void) {{
+  memset(haystack,'a',sizeof(haystack));
   memset(&rows,0,sizeof(rows));
   rows.rows_address=(size_t)(uintptr_t)cells;
   rows.class_map_address=(size_t)(uintptr_t)classes;

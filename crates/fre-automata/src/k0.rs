@@ -1977,7 +1977,8 @@ enum LazyInitialKind {
 /// Direct rows are fixed-capacity and initialized at construction; later K0
 /// publication changes only an existing `u32` cell. A native caller must
 /// nevertheless re-enter K0 at its first unpublished cell, or before it would
-/// execute one of the learned-loop rows below.
+/// execute one of the learned-loop rows below without an independent
+/// authenticated scanner that owns that exact row and skip.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug)]
 pub struct K0DynamicRootProjection<'a> {

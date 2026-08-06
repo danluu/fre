@@ -307,9 +307,10 @@ pub enum RetainedPartialPreflight {
 /// admitted by that preflight. They must not be retained across a helper call,
 /// re-entry, or destruction. A generated entry must authenticate the immutable
 /// `cache_identity` before following either source address and conservatively
-/// side-exit on an unpublished cell or a learned-loop row. The identity binds
-/// the descriptor to one fixed-capacity cache; it is not a mutable generation
-/// counter or a single-use ticket.
+/// side-exit on an unpublished cell or a learned-loop row it does not own with
+/// an independent authenticated scanner. The identity binds the descriptor to
+/// one fixed-capacity cache; it is not a mutable generation counter or a
+/// single-use ticket.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[repr(C)]
@@ -323,9 +324,9 @@ pub struct DynamicNativeRowsV1 {
     pub next_row_token_mask: u32,
     pub cache_identity: u64,
     pub learned_loop_row_count: u32,
-    // Retained as ABI-reserved storage for already-emitted V1 descriptors.
-    // Current generated entries conservatively decline every learned-loop
-    // cache and therefore never inspect individual row offsets.
+    // Fixed-capacity ownership boundary for canonical K0 loop scanners.
+    // Generated entries must side-exit before a listed row unless an
+    // independent authenticated scanner owns that exact row and skip.
     pub learned_loop_rows: [u32; 4],
     pub initial_row: u32,
     pub initial_flags: u32,
@@ -2493,12 +2494,15 @@ impl DynamicNativeRowsWorkspace {
                 native_rows_initial_flags(true, direct.initial_terminal());
             return true;
         }
-        // The current native scanner cannot execute K0's learned loop rows.
-        // Decline before calculating or publishing the fixed-layout
-        // descriptor instead of copying offsets that no generated entry uses.
-        if !direct.learned_loop_row_offsets().is_empty() {
+        let loop_rows = direct.learned_loop_row_offsets();
+        let Ok(learned_loop_row_count) = u32::try_from(loop_rows.len()) else {
             return false;
-        }
+        };
+        let mut learned_loop_rows = [u32::MAX; 4];
+        let Some(destination) = learned_loop_rows.get_mut(..loop_rows.len()) else {
+            return false;
+        };
+        destination.copy_from_slice(loop_rows);
         let Some(live_cells) = direct
             .state_count()
             .checked_mul(usize::try_from(direct.row_stride()).unwrap_or(usize::MAX))
@@ -2522,8 +2526,8 @@ impl DynamicNativeRowsWorkspace {
             accept_mask: direct.accept_mask(),
             next_row_token_mask: direct.next_row_token_mask(),
             cache_identity: direct.cache_identity(),
-            learned_loop_row_count: 0,
-            learned_loop_rows: [u32::MAX; 4],
+            learned_loop_row_count,
+            learned_loop_rows,
             initial_row: direct.initial_row(),
             initial_flags: native_rows_initial_flags(
                 direct.initial_pending(),
@@ -2842,6 +2846,21 @@ pub(crate) struct NativePartialProgramView<'a> {
 pub(crate) struct NativeDynamicRowsProgramView {
     pub(crate) output: OutputContract,
     pub(crate) artifact_identity: [u8; 32],
+    /// Exact match-relative byte class selected from the Thompson graph.
+    /// Target lowering may use it only while the authenticated cache is in
+    /// its initial row; unsupported shapes retain the scalar row entry.
+    pub(crate) root_requirement: Option<NativeDynamicRootRequirement>,
+}
+
+/// Target-neutral proof for one moving initial-row scanner.
+///
+/// This is an exact graph-derived membership set at a consumed-byte offset,
+/// not source spelling or a pattern identity. Backends receipt the emitted
+/// membership and offset before advertising an accelerator.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NativeDynamicRootRequirement {
+    pub(crate) scan_offset: u8,
+    pub(crate) membership: [u64; 4],
 }
 
 // An exact-product native entry returns directly from its moving primary
@@ -3447,7 +3466,8 @@ impl CompiledProgram {
     /// prepared K0 cache can be projected into an additive native root entry.
     /// Static/full native routes retain precedence in module lowering; this
     /// view is their target-specific fallback and never embeds regex-specific
-    /// rows or source predicates.
+    /// rows, source spelling, or source identities. Its optional exact byte
+    /// class is derived solely from the Thompson graph.
     pub(crate) fn native_dynamic_rows_view(&self) -> Option<NativeDynamicRowsProgramView> {
         if self.output != OutputContract::Exists
             || self.context_dfa.is_some()
@@ -3457,9 +3477,23 @@ impl CompiledProgram {
         {
             return None;
         }
+        let (prefix_plan, prefix_supported) =
+            PartialDfaPrefixPlan::derive(self.anchored_prefix.sets());
+        let root_requirement = if prefix_supported {
+            prefix_plan.and_then(|plan| {
+                let depth = plan.primary_depth();
+                Some(NativeDynamicRootRequirement {
+                    scan_offset: u8::try_from(depth).ok()?,
+                    membership: self.anchored_prefix.sets().get(depth)?.words(),
+                })
+            })
+        } else {
+            None
+        };
         Some(NativeDynamicRowsProgramView {
             output: self.output,
             artifact_identity: self.artifact_identity(),
+            root_requirement,
         })
     }
 
@@ -7412,7 +7446,7 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_native_rows_decline_learned_loop_owned_cache() {
+    fn dynamic_native_rows_publish_learned_loop_ownership_boundary() {
         let raw = RawPlan {
             start: 0,
             roles: vec![StateRole::Consume, StateRole::Accept],
@@ -7452,25 +7486,31 @@ mod tests {
             .as_ref()
             .and_then(|nfa| nfa.dynamic_root_projection(&compiled.automaton))
             .expect("warm loop-owned projection");
-        assert!(!projection.learned_loop_row_offsets().is_empty());
+        let learned_loop_rows = projection.learned_loop_row_offsets().to_vec();
+        assert!(!learned_loop_rows.is_empty());
 
-        let (declined, address, cache_identity) = compiled
+        let (entered, address, cache_identity) = compiled
             .preflight_dynamic_native_rows_with_workspace(
                 &haystack,
                 window,
                 &mut workspace,
                 identity,
             )
-            .expect("loop-owned dynamic decline");
-        assert_eq!(
-            declined,
-            RetainedPartialPreflight::Complete(MatchResult::Exists(true))
-        );
-        assert_eq!((address, cache_identity), (0, 0));
+            .expect("loop-owned dynamic entry");
+        assert_eq!(entered, RetainedPartialPreflight::Enter(window));
+        assert_ne!((address, cache_identity), (0, 0));
         let dynamic = workspace.dynamic_native_rows.as_deref().unwrap();
-        assert_eq!(dynamic.native_rows.rows_address, 0);
-        assert_eq!(dynamic.native_rows.class_map_address, 0);
-        assert!(!dynamic.state.native_entry_in_flight);
+        assert_ne!(dynamic.native_rows.rows_address, 0);
+        assert_ne!(dynamic.native_rows.class_map_address, 0);
+        assert_eq!(
+            usize::try_from(dynamic.native_rows.learned_loop_row_count).unwrap(),
+            learned_loop_rows.len()
+        );
+        assert_eq!(
+            &dynamic.native_rows.learned_loop_rows[..learned_loop_rows.len()],
+            learned_loop_rows.as_slice()
+        );
+        assert!(dynamic.state.native_entry_in_flight);
     }
 
     #[test]
