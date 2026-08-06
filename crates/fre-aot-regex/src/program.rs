@@ -2478,6 +2478,16 @@ impl ProgramWorkspace {
     pub(crate) const fn has_retained_partial_workspace(&self) -> bool {
         self.partial.is_some()
     }
+
+    /// Invalidate the prepared native projection before any route that may
+    /// publish or reset K0 rows. The fixed-capacity row allocation stays at a
+    /// stable address, but its live extent, learned-loop ownership, and cache
+    /// identity are invocation-mutable metadata.
+    fn mark_dynamic_native_rows_dirty(&mut self) {
+        if let Some(dynamic) = self.dynamic_native_rows.as_deref_mut() {
+            dynamic.native_rows_dirty = true;
+        }
+    }
 }
 
 /// Scratch used only by an ordered-NFA program with retained subset rows.
@@ -2497,6 +2507,9 @@ struct DynamicNativeRowsWorkspace {
     state: DynamicNativeRowsState,
     class_map: [u8; 256],
     native_rows: DynamicNativeRowsV1,
+    native_rows_dirty: bool,
+    #[cfg(test)]
+    native_rows_refreshes: usize,
 }
 
 const NATIVE_ROWS_INITIAL_PENDING: u32 = 1;
@@ -2518,6 +2531,11 @@ const fn native_rows_initial_flags(pending: bool, terminal: bool) -> u32 {
 
 impl DynamicNativeRowsWorkspace {
     fn refresh_native_rows(&mut self, automaton: &Automaton, workspace: &K0Workspace) -> bool {
+        debug_assert!(self.native_rows_dirty);
+        #[cfg(test)]
+        {
+            self.native_rows_refreshes = self.native_rows_refreshes.saturating_add(1);
+        }
         self.native_rows = DynamicNativeRowsV1::default();
         let Some(direct) = workspace.dynamic_root_projection(automaton) else {
             return false;
@@ -2528,6 +2546,7 @@ impl DynamicNativeRowsWorkspace {
         if direct.initial_pending() {
             self.native_rows.initial_flags =
                 native_rows_initial_flags(true, direct.initial_terminal());
+            self.native_rows_dirty = false;
             return true;
         }
         let loop_rows = direct.learned_loop_row_offsets();
@@ -2570,6 +2589,7 @@ impl DynamicNativeRowsWorkspace {
                 direct.initial_terminal(),
             ),
         };
+        self.native_rows_dirty = false;
         true
     }
 }
@@ -3759,6 +3779,9 @@ impl CompiledProgram {
                     state: DynamicNativeRowsState::default(),
                     class_map,
                     native_rows: DynamicNativeRowsV1::default(),
+                    native_rows_dirty: true,
+                    #[cfg(test)]
+                    native_rows_refreshes: 0,
                 })
             });
         Ok(ProgramWorkspace {
@@ -3794,6 +3817,10 @@ impl CompiledProgram {
                 "program workspace belongs to a different semantic program",
             ));
         }
+        // Any semantic execution may publish a K0 row or roll its cache
+        // generation. A later native preflight must re-project the mutable
+        // descriptor metadata before generated code reads it.
+        workspace.mark_dynamic_native_rows_dirty();
         if let Some(machine) = &self.context_dfa {
             return machine.search(haystack, window, self.output);
         }
@@ -3982,6 +4009,7 @@ impl CompiledProgram {
                 "retained partial rows require the universal ordered-NFA engine",
             ));
         }
+        workspace.mark_dynamic_native_rows_dirty();
         let partial = self.partial_dfa().ok_or(CompileError::InternalInvariant(
             "retained partial execution was selected without retained rows",
         ))?;
@@ -4062,6 +4090,7 @@ impl CompiledProgram {
                 "retained partial resume pending mode disagrees with the canonical artifact",
             ));
         }
+        workspace.mark_dynamic_native_rows_dirty();
         let partial_workspace = workspace.partial.as_deref_mut().ok_or(
             CompileError::InternalInvariant(
                 "retained partial resume has no prepared partial workspace",
@@ -4289,6 +4318,7 @@ impl CompiledProgram {
                 "preflight-authenticated partial resume position is not inside its window",
             ));
         }
+        workspace.mark_dynamic_native_rows_dirty();
         let ProgramWorkspace { nfa, partial, .. } = workspace;
         let partial_workspace = partial.as_deref_mut().ok_or(
             CompileError::InternalInvariant(
@@ -4394,7 +4424,12 @@ impl CompiledProgram {
             ));
         }
 
-        let ProgramWorkspace { nfa, partial, .. } = workspace;
+        let ProgramWorkspace {
+            nfa,
+            partial,
+            dynamic_native_rows,
+            ..
+        } = workspace;
         let partial_workspace = partial.as_deref_mut().ok_or(
             CompileError::InternalInvariant(
                 "retained partial Span recovery has no prepared retained workspace",
@@ -4409,6 +4444,9 @@ impl CompiledProgram {
             return Err(CompileError::InternalInvariant(
                 "retained partial Span recovery endpoint is not inside the admitted window",
             ));
+        }
+        if let Some(dynamic) = dynamic_native_rows.as_deref_mut() {
+            dynamic.native_rows_dirty = true;
         }
 
         let workspace = nfa.as_mut().ok_or(CompileError::InternalInvariant(
@@ -4552,7 +4590,12 @@ impl CompiledProgram {
             ));
         }
         let input_bytes = window.end.saturating_sub(window.start);
-        let ProgramWorkspace { nfa, partial, .. } = workspace;
+        let ProgramWorkspace {
+            nfa,
+            partial,
+            dynamic_native_rows,
+            ..
+        } = workspace;
         let nfa = nfa.as_mut().ok_or(CompileError::InternalInvariant(
             "retained partial preflight has no prepared K0 workspace",
         ))?;
@@ -4581,6 +4624,10 @@ impl CompiledProgram {
             if enter {
                 return Ok(RetainedPartialPreflight::Enter(window));
             }
+        }
+
+        if let Some(dynamic) = dynamic_native_rows.as_deref_mut() {
+            dynamic.native_rows_dirty = true;
         }
 
         let narrowed = match self
@@ -4682,7 +4729,9 @@ impl CompiledProgram {
                 let nfa = nfa.as_ref().ok_or(CompileError::InternalInvariant(
                     "dynamic native-row preflight has no prepared K0 workspace",
                 ))?;
-                if dynamic.refresh_native_rows(&self.automaton, nfa) {
+                let descriptor_ready = !dynamic.native_rows_dirty
+                    || dynamic.refresh_native_rows(&self.automaton, nfa);
+                if descriptor_ready {
                     initial_pending =
                         dynamic.native_rows.initial_flags & NATIVE_ROWS_INITIAL_PENDING != 0;
                     if !initial_pending && dynamic.state.claim(window) {
@@ -4793,6 +4842,7 @@ impl CompiledProgram {
                 )
             })?;
             let k0_window = K0SearchWindow::new(window.start, window.end);
+            workspace.mark_dynamic_native_rows_dirty();
             let nfa = workspace.nfa.as_mut().ok_or(CompileError::InternalInvariant(
                 "dynamic native-row continuation has no prepared K0 workspace",
             ))?;
@@ -4889,6 +4939,7 @@ impl CompiledProgram {
     ) {
         if let Some(dynamic) = workspace.dynamic_native_rows.as_deref_mut() {
             dynamic.state.observe_deopt();
+            dynamic.native_rows_dirty = true;
         }
     }
 
@@ -7710,6 +7761,68 @@ mod tests {
         }
     }
 
+    fn dynamic_rows(workspace: &ProgramWorkspace) -> &DynamicNativeRowsWorkspace {
+        workspace
+            .dynamic_native_rows
+            .as_deref()
+            .expect("prepared dynamic-row workspace")
+    }
+
+    fn assert_dynamic_rows_lifecycle(
+        workspace: &ProgramWorkspace,
+        dirty: bool,
+        refreshes: usize,
+        ticket: Option<SearchWindow>,
+    ) {
+        let dynamic = dynamic_rows(workspace);
+        assert_eq!(dynamic.native_rows_dirty, dirty);
+        assert_eq!(dynamic.native_rows_refreshes, refreshes);
+        assert_eq!(dynamic.state.native_entry_window, ticket);
+    }
+
+    fn enter_dynamic_rows(
+        compiled: &CompiledProgram,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+        identity: [u8; 32],
+        context: &str,
+    ) -> (usize, u64, DynamicNativeRowsV1) {
+        let (outcome, address, cache_identity) = compiled
+            .preflight_dynamic_native_rows_with_workspace(
+                haystack,
+                window,
+                workspace,
+                identity,
+            )
+            .unwrap_or_else(|error| panic!("{context}: {error}"));
+        assert_eq!(outcome, RetainedPartialPreflight::Enter(window), "{context}");
+        assert_ne!((address, cache_identity), (0, 0), "{context}");
+        (address, cache_identity, dynamic_rows(workspace).native_rows)
+    }
+
+    fn refresh_dynamic_rows_after_invalidation(
+        compiled: &CompiledProgram,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+        identity: [u8; 32],
+        expected_refreshes: usize,
+        context: &str,
+    ) {
+        let previous_refreshes = expected_refreshes
+            .checked_sub(1)
+            .expect("a dirty projection must precede a positive refresh count");
+        assert_dynamic_rows_lifecycle(workspace, true, previous_refreshes, None);
+        enter_dynamic_rows(compiled, haystack, window, workspace, identity, context);
+        assert_dynamic_rows_lifecycle(
+            workspace,
+            false,
+            expected_refreshes,
+            Some(window),
+        );
+    }
+
     fn generated_byte_strings(alphabet: &[u8], max_len: usize) -> Vec<Vec<u8>> {
         fn extend(
             strings: &mut Vec<Vec<u8>>,
@@ -7734,7 +7847,11 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_native_rows_cold_entry_is_ticket_free_and_warm_entry_is_stable() {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one lifecycle regression proves projection reuse and every dirty-to-refresh boundary"
+    )]
+    fn dynamic_native_rows_projection_reuse_and_invalidation_are_exact() {
         let compiled = program(
             "(?:ab|ac)+z",
             OutputContract::Exists,
@@ -7764,39 +7881,195 @@ mod tests {
             RetainedPartialPreflight::Complete(MatchResult::Exists(true))
         );
         assert_eq!((cold_address, cold_cache_identity), (0, 0));
-        let dynamic = workspace.dynamic_native_rows.as_deref().unwrap();
-        assert_eq!(dynamic.state.native_entry_window, None);
+        assert_dynamic_rows_lifecycle(&workspace, true, 1, None);
 
-        let (warm, first_address, first_cache_identity) = compiled
-            .preflight_dynamic_native_rows_with_workspace(
-                &haystack,
-                window,
-                &mut workspace,
-                identity,
-            )
-            .expect("warm dynamic preflight");
-        assert_eq!(warm, RetainedPartialPreflight::Enter(window));
-        assert_ne!(first_address, 0);
-        assert_ne!(first_cache_identity, 0);
-        let dynamic = workspace.dynamic_native_rows.as_deref().unwrap();
-        assert_eq!(dynamic.state.native_entry_window, Some(window));
-        assert_eq!(dynamic.native_rows.cache_identity, first_cache_identity);
-        assert_eq!(dynamic.native_rows.initial_flags, 0);
+        let (first_address, first_cache_identity, first_projection) = enter_dynamic_rows(
+            &compiled,
+            &haystack,
+            window,
+            &mut workspace,
+            identity,
+            "warm dynamic preflight",
+        );
+        assert_dynamic_rows_lifecycle(&workspace, false, 2, Some(window));
+        assert_eq!(first_projection.cache_identity, first_cache_identity);
+        assert_eq!(first_projection.initial_flags, 0);
 
         // No callback means the prior generated scan returned locally. The
-        // next preflight settles it as success and republishes the same boxed
-        // descriptor and immutable workspace cache identity.
-        let (reentered, second_address, second_cache_identity) = compiled
+        // next preflight reuses the byte-for-byte identical projection.
+        let (second_address, second_cache_identity, second_projection) = enter_dynamic_rows(
+            &compiled,
+            &haystack,
+            window,
+            &mut workspace,
+            identity,
+            "settled dynamic preflight",
+        );
+        assert_eq!(second_address, first_address);
+        assert_eq!(second_cache_identity, first_cache_identity);
+        assert_eq!(second_projection, first_projection);
+        assert_dynamic_rows_lifecycle(&workspace, false, 2, Some(window));
+
+        // A whole-search side exit invalidates before canonical K0 runs. The
+        // two dirty stores coalesce, and the next admission refreshes exactly
+        // once rather than once per invalidating edge.
+        compiled.observe_dynamic_native_rows_deopt_with_workspace(&mut workspace);
+        assert_eq!(
+            compiled
+                .search_optimized_with_workspace(&haystack, window, &mut workspace)
+                .expect("canonical dynamic deopt completion"),
+            MatchResult::Exists(true)
+        );
+        refresh_dynamic_rows_after_invalidation(
+            &compiled,
+            &haystack,
+            window,
+            &mut workspace,
+            identity,
+            3,
+            "post-deopt dynamic preflight",
+        );
+
+        // An independently requested canonical search has the same one-shot
+        // invalidation contract even if it only traverses already-filled
+        // rows.
+        compiled.settle_dynamic_native_rows_local_completion_with_workspace(&mut workspace);
+        assert_eq!(
+            compiled
+                .search_optimized_with_workspace(&haystack, window, &mut workspace)
+                .expect("independent canonical completion"),
+            MatchResult::Exists(true)
+        );
+        refresh_dynamic_rows_after_invalidation(
+            &compiled,
+            &haystack,
+            window,
+            &mut workspace,
+            identity,
+            4,
+            "post-canonical dynamic preflight",
+        );
+
+        // A malformed callback consumes the exact outstanding ticket and
+        // canonically completes the admitted window. Its early validation
+        // failure still produces exactly one refresh on the next preflight.
+        let substituted = SearchWindow::new(window.start + 1, window.end);
+        assert_eq!(
+            compiled
+                .search_from_dynamic_native_rows_hole_with_workspace(
+                    &haystack,
+                    substituted,
+                    &mut workspace,
+                    identity,
+                    0,
+                    substituted.start,
+                    0,
+                    0,
+                    first_cache_identity,
+                )
+                .expect("malformed callback canonical completion"),
+            MatchResult::Exists(true)
+        );
+        refresh_dynamic_rows_after_invalidation(
+            &compiled,
+            &haystack,
+            window,
+            &mut workspace,
+            identity,
+            5,
+            "post-malformed dynamic preflight",
+        );
+
+        // With no ticket, a valid helper window is an ordinary canonical
+        // search and therefore dirties once. An invalid window fails before
+        // K0 and leaves the still-current projection reusable.
+        compiled.settle_dynamic_native_rows_local_completion_with_workspace(&mut workspace);
+        assert_eq!(
+            compiled
+                .search_from_dynamic_native_rows_hole_with_workspace(
+                    &haystack,
+                    window,
+                    &mut workspace,
+                    identity,
+                    0,
+                    window.start,
+                    0,
+                    0,
+                    first_cache_identity,
+                )
+                .expect("ticket-free callback canonical completion"),
+            MatchResult::Exists(true)
+        );
+        refresh_dynamic_rows_after_invalidation(
+            &compiled,
+            &haystack,
+            window,
+            &mut workspace,
+            identity,
+            6,
+            "post-ticket-failure dynamic preflight",
+        );
+        let current_projection = dynamic_rows(&workspace).native_rows;
+
+        compiled.settle_dynamic_native_rows_local_completion_with_workspace(&mut workspace);
+        let invalid = SearchWindow::new(window.start, haystack.len() + 1);
+        assert!(matches!(
+            compiled.search_from_dynamic_native_rows_hole_with_workspace(
+                &haystack,
+                invalid,
+                &mut workspace,
+                identity,
+                0,
+                invalid.start,
+                0,
+                0,
+                first_cache_identity,
+            ),
+            Err(CompileError::InvalidWindow { .. })
+        ));
+        assert_dynamic_rows_lifecycle(&workspace, false, 6, None);
+        let (_, _, projection_after_invalid) = enter_dynamic_rows(
+            &compiled,
+            &haystack,
+            window,
+            &mut workspace,
+            identity,
+            "post-invalid-window dynamic preflight",
+        );
+        assert_eq!(projection_after_invalid, current_projection);
+        assert_dynamic_rows_lifecycle(&workspace, false, 6, Some(window));
+
+        // Preflight authentication and window checks precede both ticket
+        // settlement and descriptor state. Rejected calls therefore cannot
+        // consume a live read-only completion or trigger a refresh.
+        let mut wrong_identity = identity;
+        wrong_identity[0] ^= 1;
+        assert!(compiled
             .preflight_dynamic_native_rows_with_workspace(
                 &haystack,
                 window,
                 &mut workspace,
+                wrong_identity,
+            )
+            .is_err());
+        assert!(compiled
+            .preflight_dynamic_native_rows_with_workspace(
+                &haystack,
+                invalid,
+                &mut workspace,
                 identity,
             )
-            .expect("settled dynamic preflight");
-        assert_eq!(reentered, RetainedPartialPreflight::Enter(window));
-        assert_eq!(second_address, first_address);
-        assert_eq!(second_cache_identity, first_cache_identity);
+            .is_err());
+        assert_dynamic_rows_lifecycle(&workspace, false, 6, Some(window));
+        enter_dynamic_rows(
+            &compiled,
+            &haystack,
+            window,
+            &mut workspace,
+            identity,
+            "post-rejection dynamic preflight",
+        );
+        assert_dynamic_rows_lifecycle(&workspace, false, 6, Some(window));
     }
 
     #[test]
@@ -7875,14 +8148,18 @@ mod tests {
                 )
                 .expect("exact first-hole continuation");
             assert_eq!(found, expected, "{output:?}");
+            let dynamic = workspace
+                .dynamic_native_rows
+                .as_deref()
+                .expect("settled descriptor");
             assert_eq!(
-                workspace
-                    .dynamic_native_rows
-                    .as_deref()
-                    .expect("settled descriptor")
-                    .state,
+                dynamic.state,
                 DynamicNativeRowsState::default(),
                 "successful continuation settles the single-use admission"
+            );
+            assert!(
+                dynamic.native_rows_dirty,
+                "a mutable K0 continuation must invalidate the projected live extent"
             );
         }
     }
@@ -8050,6 +8327,14 @@ mod tests {
             .as_deref()
             .expect("dynamic descriptor workspace")
             .native_rows;
+        assert_eq!(
+            workspace
+                .dynamic_native_rows
+                .as_deref()
+                .expect("dynamic descriptor workspace")
+                .native_rows_refreshes,
+            2
+        );
 
         compiled.settle_dynamic_native_rows_local_completion_with_workspace(&mut workspace);
         let mut publishes_branch = vec![b'!'; 64];
@@ -8064,6 +8349,14 @@ mod tests {
                 .expect("canonical publication search"),
             MatchResult::Exists(true)
         );
+        assert!(
+            workspace
+                .dynamic_native_rows
+                .as_deref()
+                .expect("published dynamic descriptor workspace")
+                .native_rows_dirty,
+            "canonical K0 publication must invalidate descriptor metadata"
+        );
 
         let (reentered, second_descriptor_address, second_cache_identity) = compiled
             .preflight_dynamic_native_rows_with_workspace(
@@ -8076,11 +8369,13 @@ mod tests {
         assert_eq!(reentered, RetainedPartialPreflight::Enter(window));
         assert_eq!(second_descriptor_address, descriptor_address);
         assert_eq!(second_cache_identity, cache_identity);
-        let after = workspace
+        let dynamic = workspace
             .dynamic_native_rows
             .as_deref()
-            .expect("refreshed dynamic descriptor workspace")
-            .native_rows;
+            .expect("refreshed dynamic descriptor workspace");
+        assert!(!dynamic.native_rows_dirty);
+        assert_eq!(dynamic.native_rows_refreshes, 3);
+        let after = dynamic.native_rows;
         assert_eq!(after.rows_address, before.rows_address);
         assert_eq!(after.class_map_address, before.class_map_address);
         assert!(
@@ -8204,7 +8499,7 @@ mod tests {
         let window = SearchWindow::full(&haystack);
         let identity = compiled.artifact_identity();
 
-        for phase in ["cold", "warm"] {
+        for phase in ["cold", "warm", "reused"] {
             let (outcome, address, cache_identity) = compiled
                 .preflight_dynamic_native_rows_with_workspace(
                     &haystack,
@@ -8227,6 +8522,11 @@ mod tests {
         );
         assert_eq!(dynamic.native_rows.rows_address, 0);
         assert_eq!(dynamic.state.native_entry_window, None);
+        assert!(!dynamic.native_rows_dirty);
+        assert_eq!(
+            dynamic.native_rows_refreshes, 2,
+            "an initial-pending Exists completion is read-only and reuses its projection"
+        );
     }
 
     #[test]
