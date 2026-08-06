@@ -1,4 +1,4 @@
-//! Canonical priority-DFS programs for assertion-free Pike closures.
+//! Canonical priority-DFS programs for Pike closures.
 //!
 //! Ordinary Pike expansion repeatedly decodes the same immutable split rows,
 //! pushes their targets in reverse order, and pops them again in priority
@@ -11,6 +11,10 @@
 //! Only ancestor backedges are folded while deriving a program.  A repeated
 //! DAG node is unfolded at every occurrence because an earlier occurrence can
 //! lie below a subtree skipped by state shared with a higher-priority root.
+//! Assertion-bearing programs retain the assertion on each incoming edge and
+//! still evaluate every reached Split row in scalar reverse order before
+//! visiting its first child. This preserves Pike priority while letting a
+//! disabled edge jump over its complete unfolded subtree without a stack.
 //! Fixed work, expansion, retained-byte, and graph-relative ceilings make that
 //! conservative duplication safe for untrusted graphs.  Refusal leaves the
 //! universal scalar Pike implementation unchanged.
@@ -18,6 +22,7 @@
 use core::{fmt, mem::size_of};
 
 use crate::plan::{plan_index, Automaton, StateRole};
+use crate::EdgeKind;
 
 // Retained program offsets are bounded below 2^24. The high byte carries a
 // branch-friendly leaf tag or a compact runtime-work certificate.
@@ -33,8 +38,6 @@ const PROGRAM_OFFSET_BITS: u32 = 24;
 const PROGRAM_OFFSET_MASK: u32 = (1_u32 << PROGRAM_OFFSET_BITS) - 1;
 const PROGRAM_WORK_SHIFT: u32 = PROGRAM_OFFSET_BITS;
 const PROGRAM_WORK_EXPONENT_MASK: u32 = 0x3f;
-// Reserved for a future assertion-aware program arena. Until that arena is
-// implemented, tagged roots must decline to the scalar closure.
 const PROGRAM_GUARDED_TAG: u32 = 1 << 30;
 // Instructions have six spare bits between their now-24-bit subtree end and
 // two-bit action. The first instruction duplicates the root's work exponent
@@ -42,6 +45,20 @@ const PROGRAM_GUARDED_TAG: u32 = 1 << 30;
 // the deferred interpreter with an invalid proof.
 const ACTION_SHIFT: u32 = 30;
 const SUBTREE_END_MASK: u32 = (1_u32 << PROGRAM_WORK_SHIFT) - 1;
+
+// Guarded programs use one naturally aligned pair of words per Pike pop. The
+// state word has ample room for the duplicated six-bit work certificate under
+// the independent compiler-scratch ceiling. The control word retains a
+// 25-bit local subtree end, one unconditional plus eighteen assertion guards,
+// and the same four actions as the assertion-free arena.
+const GUARDED_STATE_BITS: u32 = 26;
+const GUARDED_STATE_MASK: u32 = (1_u32 << GUARDED_STATE_BITS) - 1;
+const GUARDED_WORK_SHIFT: u32 = GUARDED_STATE_BITS;
+const GUARDED_SUBTREE_BITS: u32 = 25;
+const GUARDED_SUBTREE_END_MASK: u32 = (1_u32 << GUARDED_SUBTREE_BITS) - 1;
+const GUARDED_GUARD_SHIFT: u32 = GUARDED_SUBTREE_BITS;
+const GUARDED_GUARD_MASK: u32 = 0x1f;
+const ASSERTION_GUARD_COUNT: u32 = 18;
 
 // The sidecar is a compiler optimization, not part of the language.  These
 // graph-independent ceilings bound both fresh compilation and canonical wire
@@ -111,11 +128,11 @@ impl ClosureAction {
 /// One compact state visit in an unfolded priority-DFS program.
 ///
 /// Three `u32` words avoid target-width restrictions while retaining a
-/// 30-bit program-local subtree end. The third word deliberately stores Split
+/// 24-bit program-local subtree end. The third word deliberately stores Split
 /// edge work instead of recovering it from two CSR-offset loads in every hot
 /// unseen Split. The >=2-edge admission floor, <=4x graph expansion ceiling,
 /// and <=2x graph-storage retained ceiling bound that cache-space tradeoff.
-/// The 64 MiB absolute ceiling admits fewer than 2^30 such instructions, so
+/// The 64 MiB absolute ceiling admits fewer than 2^24 such instructions, so
 /// every encoded end is representable.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(C)]
@@ -123,6 +140,16 @@ pub(crate) struct ClosureInstruction {
     state: u32,
     subtree_end_and_action: u32,
     edge_work: u32,
+}
+
+/// One assertion-aware Pike pop. Split edge kinds remain in the authenticated
+/// graph so runtime can reproduce exact reverse evaluator order without
+/// retaining a second copy. The incoming guard is tested before state work.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C)]
+pub(crate) struct GuardedClosureInstruction {
+    state_and_root_work: u32,
+    subtree_end_guard_and_action: u32,
 }
 
 /// One boundary root classified by the same state-index lookup that locates
@@ -133,9 +160,83 @@ pub(crate) enum ClosureRoot<'a> {
         instructions: &'a [ClosureInstruction],
         max_work: u64,
     },
+    GuardedProgram {
+        instructions: &'a [GuardedClosureInstruction],
+        max_work: u64,
+    },
     Consume,
     Accept,
     Scalar,
+}
+
+impl GuardedClosureInstruction {
+    fn placeholder(state: u32, guard: u32, action: ClosureAction) -> Self {
+        debug_assert_eq!(state & !GUARDED_STATE_MASK, 0);
+        debug_assert!(guard <= ASSERTION_GUARD_COUNT);
+        Self {
+            state_and_root_work: state,
+            subtree_end_guard_and_action: (guard << GUARDED_GUARD_SHIFT)
+                | (action.encoded() << ACTION_SHIFT),
+        }
+    }
+
+    fn finish(&mut self, subtree_end: usize) {
+        let subtree_end = u32::try_from(subtree_end)
+            .expect("bounded guarded-closure program end fits u32");
+        debug_assert_eq!(subtree_end & !GUARDED_SUBTREE_END_MASK, 0);
+        self.subtree_end_guard_and_action = (self.subtree_end_guard_and_action
+            & !GUARDED_SUBTREE_END_MASK)
+            | subtree_end;
+    }
+
+    #[inline]
+    pub(crate) const fn state(self) -> u32 {
+        self.state_and_root_work & GUARDED_STATE_MASK
+    }
+
+    #[inline]
+    pub(crate) fn subtree_end(self) -> usize {
+        plan_index(self.subtree_end_guard_and_action & GUARDED_SUBTREE_END_MASK)
+    }
+
+    #[inline]
+    pub(crate) const fn guard(self) -> u32 {
+        (self.subtree_end_guard_and_action >> GUARDED_GUARD_SHIFT) & GUARDED_GUARD_MASK
+    }
+
+    #[inline]
+    pub(crate) const fn action(self) -> ClosureAction {
+        match self.subtree_end_guard_and_action >> ACTION_SHIFT {
+            0 => ClosureAction::Split,
+            1 => ClosureAction::Consume,
+            2 => ClosureAction::Accept,
+            _ => ClosureAction::SeenBackedge,
+        }
+    }
+
+    const fn program_work_exponent(self) -> u32 {
+        self.state_and_root_work >> GUARDED_WORK_SHIFT
+    }
+
+    fn set_program_work_exponent(&mut self, exponent: u32) {
+        debug_assert!(exponent != 0 && exponent <= PROGRAM_WORK_EXPONENT_MASK);
+        self.state_and_root_work |= exponent << GUARDED_WORK_SHIFT;
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_runtime_test(
+        state: u32,
+        subtree_end: u32,
+        guard: u32,
+        action: ClosureAction,
+    ) -> Self {
+        Self {
+            state_and_root_work: state,
+            subtree_end_guard_and_action: subtree_end
+                | (guard << GUARDED_GUARD_SHIFT)
+                | (action.encoded() << ACTION_SHIFT),
+        }
+    }
 }
 
 impl ClosureInstruction {
@@ -218,6 +319,7 @@ pub(crate) struct EpsilonClosureDispatch(Box<[EpsilonClosureDispatchData; 1]>);
 struct EpsilonClosureDispatchData {
     program_offsets: Box<[u32]>,
     instructions: Box<[ClosureInstruction]>,
+    guarded_instructions: Box<[GuardedClosureInstruction]>,
     retained_bytes: usize,
     admitted_programs: usize,
     eliminated_edge_visits: usize,
@@ -227,11 +329,16 @@ struct EpsilonClosureDispatchData {
 struct ProgramShape {
     instructions: usize,
     edge_visits: usize,
+    assertion_edge_visits: usize,
 }
 
 impl ProgramShape {
     const fn admitted(self) -> bool {
         self.edge_visits >= MIN_ELIMINATED_EDGE_VISITS
+    }
+
+    const fn guarded(self) -> bool {
+        self.assertion_edge_visits != 0
     }
 
     /// Maximum scalar work one execution of this unfolded program can
@@ -265,7 +372,12 @@ fn encode_program_root(offset: usize, shape: ProgramShape) -> Option<u32> {
     }
     let (work_exponent, work_bound) = shape.runtime_work_bound()?;
     debug_assert!(work_bound.is_power_of_two());
-    Some(offset | (work_exponent << PROGRAM_WORK_SHIFT))
+    let guarded = if shape.guarded() {
+        PROGRAM_GUARDED_TAG
+    } else {
+        0
+    };
+    Some(offset | (work_exponent << PROGRAM_WORK_SHIFT) | guarded)
 }
 
 fn decode_program_root(encoded: u32) -> Option<(usize, u32, u64)> {
@@ -304,12 +416,17 @@ struct EmitFrame {
 struct DispatchShape {
     programs: usize,
     instructions: usize,
+    guarded_instructions: usize,
     eliminated_edge_visits: usize,
     retained_bytes: usize,
     derivation_work: usize,
 }
 
 impl EpsilonClosureDispatch {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "plain and guarded arenas share one failure-atomic exact-allocation transaction"
+    )]
     pub(crate) fn derive(
         automaton: &Automaton,
     ) -> Result<Option<Self>, EpsilonClosureDispatchAllocationError> {
@@ -338,6 +455,8 @@ impl EpsilonClosureDispatch {
             shape.retained_bytes,
         )?;
         let mut instructions = exact_vec(shape.instructions, shape.retained_bytes)?;
+        let mut guarded_instructions =
+            exact_vec(shape.guarded_instructions, shape.retained_bytes)?;
 
         let graph_instruction_limit = graph_instruction_limit(automaton).unwrap_or(0);
         let mut emitted_programs = 0usize;
@@ -371,16 +490,32 @@ impl EpsilonClosureDispatch {
             if !program_shape.admitted() {
                 continue;
             }
-            program_offsets[state] = encode_program_root(instructions.len(), program_shape)
-                .expect("preflighted epsilon-closure root metadata remains encodable");
-            emit_program(
-                automaton,
-                root,
-                &mut active,
-                &mut emit_frames,
-                &mut instructions,
-                program_shape,
-            );
+            let offset = if program_shape.guarded() {
+                guarded_instructions.len()
+            } else {
+                instructions.len()
+            };
+            program_offsets[state] = encode_program_root(offset, program_shape)
+                .expect("preflighted closure root metadata remains encodable");
+            if program_shape.guarded() {
+                emit_guarded_program(
+                    automaton,
+                    root,
+                    &mut active,
+                    &mut emit_frames,
+                    &mut guarded_instructions,
+                    program_shape,
+                );
+            } else {
+                emit_program(
+                    automaton,
+                    root,
+                    &mut active,
+                    &mut emit_frames,
+                    &mut instructions,
+                    program_shape,
+                );
+            }
             emitted_programs = emitted_programs
                 .checked_add(1)
                 .expect("preflighted epsilon-closure program count");
@@ -390,12 +525,14 @@ impl EpsilonClosureDispatch {
         }
         debug_assert!(derivation_work <= shape.derivation_work);
         debug_assert_eq!(instructions.len(), shape.instructions);
+        debug_assert_eq!(guarded_instructions.len(), shape.guarded_instructions);
         debug_assert_eq!(emitted_programs, shape.programs);
         debug_assert_eq!(emitted_edge_visits, shape.eliminated_edge_visits);
 
         let data = EpsilonClosureDispatchData {
             program_offsets: program_offsets.into_boxed_slice(),
             instructions: instructions.into_boxed_slice(),
+            guarded_instructions: guarded_instructions.into_boxed_slice(),
             retained_bytes: shape.retained_bytes,
             admitted_programs: shape.programs,
             eliminated_edge_visits: shape.eliminated_edge_visits,
@@ -446,6 +583,54 @@ impl EpsilonClosureDispatch {
         )
     }
 
+    /// Assertion-capable lookup. Assertion-free callers retain [`Self::root`]
+    /// so their monomorph never decodes or branches to the guarded arena.
+    #[inline]
+    pub(crate) fn assertion_root(&self, state: u32) -> ClosureRoot<'_> {
+        let data = &self.0[0];
+        let Some(&encoded) = data.program_offsets.get(plan_index(state)) else {
+            return ClosureRoot::Scalar;
+        };
+        if encoded & ROOT_SENTINEL_BIT != 0 {
+            return match encoded {
+                DIRECT_CONSUME => ClosureRoot::Consume,
+                DIRECT_ACCEPT => ClosureRoot::Accept,
+                _ => ClosureRoot::Scalar,
+            };
+        }
+        if encoded & PROGRAM_GUARDED_TAG == 0 {
+            return self.root(state);
+        }
+        let exponent = (encoded >> PROGRAM_WORK_SHIFT) & PROGRAM_WORK_EXPONENT_MASK;
+        if exponent == 0 {
+            return ClosureRoot::Scalar;
+        }
+        let Some(max_work) = 1_u64.checked_shl(exponent) else {
+            return ClosureRoot::Scalar;
+        };
+        let begin = plan_index(encoded & PROGRAM_OFFSET_MASK);
+        let Some(first) = data.guarded_instructions.get(begin).copied() else {
+            return ClosureRoot::Scalar;
+        };
+        if first.program_work_exponent() != exponent
+            || first.guard() != 0
+            || first.state() != state
+        {
+            return ClosureRoot::Scalar;
+        }
+        let length = first.subtree_end();
+        let Some(end) = begin.checked_add(length) else {
+            return ClosureRoot::Scalar;
+        };
+        data.guarded_instructions.get(begin..end).map_or(
+            ClosureRoot::Scalar,
+            |instructions| ClosureRoot::GuardedProgram {
+                instructions,
+                max_work,
+            },
+        )
+    }
+
     pub(crate) const fn retained_bytes(&self) -> usize {
         self.0[0].retained_bytes
     }
@@ -466,6 +651,11 @@ impl EpsilonClosureDispatch {
     }
 
     #[cfg(test)]
+    pub(crate) fn guarded_instruction_count(&self) -> usize {
+        self.0[0].guarded_instructions.len()
+    }
+
+    #[cfg(test)]
     pub(crate) fn underbound_program_root_for_test(&mut self, state: u32) -> bool {
         let Some(encoded) = self.0[0]
             .program_offsets
@@ -483,7 +673,8 @@ impl EpsilonClosureDispatch {
         else {
             return false;
         };
-        *encoded = (*encoded & PROGRAM_OFFSET_MASK) | (underbound << PROGRAM_WORK_SHIFT);
+        *encoded = (*encoded & (PROGRAM_OFFSET_MASK | PROGRAM_GUARDED_TAG))
+            | (underbound << PROGRAM_WORK_SHIFT);
         true
     }
 }
@@ -498,12 +689,13 @@ fn derive_shape_and_roots(
     Option<(DispatchShape, Vec<u8>)>,
     EpsilonClosureDispatchAllocationError,
 > {
-    if automaton.stats().assertion_edges() != 0
-        || automaton.stats().zero_width_edges() < MIN_ELIMINATED_EDGE_VISITS
-    {
+    if automaton.stats().zero_width_edges() < MIN_ELIMINATED_EDGE_VISITS {
         return Ok(None);
     }
     let states = automaton.roles.len();
+    if states > plan_index(GUARDED_STATE_MASK).saturating_add(1) {
+        return Ok(None);
+    }
     let Some(scratch_bytes) = bounded_compiler_scratch_bytes(states)? else {
         return Ok(None);
     };
@@ -534,6 +726,8 @@ fn derive_shape_and_roots(
     let mut frames = exact_vec(states, scratch_bytes)?;
     let mut programs = 0usize;
     let mut instructions = 0usize;
+    let mut guarded_instructions = 0usize;
+    let mut total_instructions = 0usize;
     let mut eliminated_edge_visits = 0usize;
     for (state, &is_root) in roots.iter().enumerate() {
         if is_root == 0 || automaton.roles[state] != StateRole::Split {
@@ -556,7 +750,12 @@ fn derive_shape_and_roots(
         if !program.admitted() {
             continue;
         }
-        if encode_program_root(instructions, program).is_none() {
+        let offset = if program.guarded() {
+            guarded_instructions
+        } else {
+            instructions
+        };
+        if encode_program_root(offset, program).is_none() {
             return Ok(None);
         }
         programs = programs.checked_add(1).ok_or(
@@ -564,17 +763,30 @@ fn derive_shape_and_roots(
                 requested_bytes: usize::MAX,
             },
         )?;
-        instructions = instructions.checked_add(program.instructions).ok_or(
-            EpsilonClosureDispatchAllocationError {
+        if program.guarded() {
+            guarded_instructions = guarded_instructions
+                .checked_add(program.instructions)
+                .ok_or(EpsilonClosureDispatchAllocationError {
+                    requested_bytes: usize::MAX,
+                })?;
+        } else {
+            instructions = instructions.checked_add(program.instructions).ok_or(
+                EpsilonClosureDispatchAllocationError {
+                    requested_bytes: usize::MAX,
+                },
+            )?;
+        }
+        total_instructions = total_instructions
+            .checked_add(program.instructions)
+            .ok_or(EpsilonClosureDispatchAllocationError {
                 requested_bytes: usize::MAX,
-            },
-        )?;
+            })?;
         eliminated_edge_visits = eliminated_edge_visits
             .checked_add(program.edge_visits)
             .ok_or(EpsilonClosureDispatchAllocationError {
                 requested_bytes: usize::MAX,
             })?;
-        if instructions > graph_instruction_limit {
+        if total_instructions > graph_instruction_limit {
             return Ok(None);
         }
     }
@@ -583,6 +795,7 @@ fn derive_shape_and_roots(
             DispatchShape {
                 programs: 0,
                 instructions: 0,
+                guarded_instructions: 0,
                 eliminated_edge_visits: 0,
                 retained_bytes: 0,
                 derivation_work,
@@ -595,7 +808,7 @@ fn derive_shape_and_roots(
     // emission, plus one emission visit per retained instruction.
     derivation_work = derivation_work
         .checked_mul(2)
-        .and_then(|work| work.checked_add(instructions))
+        .and_then(|work| work.checked_add(total_instructions))
         .ok_or(EpsilonClosureDispatchAllocationError {
             requested_bytes: usize::MAX,
         })?;
@@ -609,6 +822,11 @@ fn derive_shape_and_roots(
                 .checked_mul(size_of::<ClosureInstruction>())
                 .and_then(|more| bytes.checked_add(more))
         })
+        .and_then(|bytes| {
+            guarded_instructions
+                .checked_mul(size_of::<GuardedClosureInstruction>())
+                .and_then(|more| bytes.checked_add(more))
+        })
         .and_then(|bytes| bytes.checked_add(size_of::<EpsilonClosureDispatchData>()))
         .ok_or(EpsilonClosureDispatchAllocationError {
             requested_bytes: usize::MAX,
@@ -620,7 +838,10 @@ fn derive_shape_and_roots(
     if retained_bytes > MAX_RETAINED_BYTES
         || retained_bytes > graph_relative_limit
         || instructions > usize::try_from(SUBTREE_END_MASK).unwrap_or(usize::MAX)
-        || u32::try_from(instructions).is_err()
+        || guarded_instructions
+            > usize::try_from(GUARDED_SUBTREE_END_MASK).unwrap_or(usize::MAX)
+        || instructions > plan_index(PROGRAM_OFFSET_MASK)
+        || guarded_instructions > plan_index(PROGRAM_OFFSET_MASK)
     {
         return Ok(None);
     }
@@ -628,6 +849,7 @@ fn derive_shape_and_roots(
         DispatchShape {
             programs,
             instructions,
+            guarded_instructions,
             eliminated_edge_visits,
             retained_bytes,
             derivation_work,
@@ -642,8 +864,9 @@ fn graph_instruction_limit(automaton: &Automaton) -> Option<usize> {
         .states()
         .checked_add(automaton.stats().zero_width_edges())?;
     let relative = graph_items.checked_mul(MAX_PROGRAM_EXPANSION_FACTOR)?;
-    let retained = MAX_RETAINED_BYTES.checked_div(size_of::<ClosureInstruction>())?;
-    Some(relative.min(retained).min(plan_index(SUBTREE_END_MASK)))
+    let retained = MAX_RETAINED_BYTES
+        .checked_div(size_of::<GuardedClosureInstruction>())?;
+    Some(relative.min(retained).min(plan_index(PROGRAM_OFFSET_MASK)))
 }
 
 fn compiler_scratch_bytes(
@@ -744,6 +967,12 @@ fn count_program(
             let edge = frame.next_edge;
             frame.next_edge = frame.next_edge.checked_add(1)?;
             *derivation_work = derivation_work.checked_add(1)?;
+            let kind = automaton.edge_kinds[edge];
+            debug_assert!(kind.is_zero_width());
+            if kind != EdgeKind::Epsilon {
+                shape.assertion_edge_visits =
+                    shape.assertion_edge_visits.checked_add(1)?;
+            }
             let target = automaton.edge_targets[edge];
             visit(
                 target,
@@ -877,6 +1106,139 @@ fn emit_program(
     instructions[base].set_program_work_exponent(work_exponent);
 }
 
+fn assertion_guard(kind: EdgeKind) -> u32 {
+    if kind == EdgeKind::Epsilon {
+        return 0;
+    }
+    let bit = kind
+        .assertion_bit()
+        .expect("validated Split edge is epsilon or an assertion");
+    bit.trailing_zeros()
+        .checked_add(1)
+        .expect("assertion guard ordinal remains positive")
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one iterative guarded-DFS visit updates the shared arena, ancestry stack, and exact edge receipt"
+)]
+fn emit_guarded_visit(
+    automaton: &Automaton,
+    state: u32,
+    guard: u32,
+    base: usize,
+    active: &mut [u8],
+    frames: &mut Vec<EmitFrame>,
+    instructions: &mut Vec<GuardedClosureInstruction>,
+    emitted_edge_visits: &mut usize,
+) {
+    let index = plan_index(state);
+    if active[index] != 0 {
+        let instruction = instructions.len();
+        instructions.push(GuardedClosureInstruction::placeholder(
+            state,
+            guard,
+            ClosureAction::SeenBackedge,
+        ));
+        let subtree_end = instruction
+            .checked_add(1)
+            .and_then(|end| end.checked_sub(base))
+            .expect("the guarded program-local backedge end is ordered");
+        instructions[instruction].finish(subtree_end);
+        return;
+    }
+    let action = match automaton.roles[index] {
+        StateRole::Split => ClosureAction::Split,
+        StateRole::Consume => ClosureAction::Consume,
+        StateRole::Accept => ClosureAction::Accept,
+    };
+    let instruction = instructions.len();
+    instructions.push(GuardedClosureInstruction::placeholder(
+        state, guard, action,
+    ));
+    if action == ClosureAction::Split {
+        let edges = automaton.state_edges(state);
+        *emitted_edge_visits = emitted_edge_visits
+            .checked_add(edges.len())
+            .expect("preflighted guarded-closure edge visits");
+        active[index] = 1;
+        frames.push(EmitFrame {
+            state,
+            next_edge: edges.start,
+            end_edge: edges.end,
+            instruction,
+        });
+    } else {
+        let subtree_end = instruction
+            .checked_add(1)
+            .and_then(|end| end.checked_sub(base))
+            .expect("the guarded program-local leaf end is ordered");
+        instructions[instruction].finish(subtree_end);
+    }
+}
+
+fn emit_guarded_program(
+    automaton: &Automaton,
+    root: u32,
+    active: &mut [u8],
+    frames: &mut Vec<EmitFrame>,
+    instructions: &mut Vec<GuardedClosureInstruction>,
+    expected: ProgramShape,
+) {
+    debug_assert!(expected.guarded());
+    debug_assert!(active.iter().all(|&entry| entry == 0));
+    frames.clear();
+    let base = instructions.len();
+    let mut emitted_edge_visits = 0usize;
+
+    emit_guarded_visit(
+        automaton,
+        root,
+        0,
+        base,
+        active,
+        frames,
+        instructions,
+        &mut emitted_edge_visits,
+    );
+    while let Some(frame) = frames.last_mut() {
+        if frame.next_edge < frame.end_edge {
+            let edge = frame.next_edge;
+            frame.next_edge = frame
+                .next_edge
+                .checked_add(1)
+                .expect("preflighted guarded-closure edge cursor");
+            emit_guarded_visit(
+                automaton,
+                automaton.edge_targets[edge],
+                assertion_guard(automaton.edge_kinds[edge]),
+                base,
+                active,
+                frames,
+                instructions,
+                &mut emitted_edge_visits,
+            );
+        } else {
+            let frame = frames.pop().expect("the current guarded emit frame exists");
+            active[plan_index(frame.state)] = 0;
+            let subtree_end = instructions
+                .len()
+                .checked_sub(base)
+                .expect("the bounded guarded program end follows its base");
+            instructions[frame.instruction].finish(subtree_end);
+        }
+    }
+    debug_assert_eq!(
+        instructions.len().checked_sub(base),
+        Some(expected.instructions)
+    );
+    debug_assert_eq!(emitted_edge_visits, expected.edge_visits);
+    let (work_exponent, _) = expected
+        .runtime_work_bound()
+        .expect("an emitted guarded program has positive encodable runtime work");
+    instructions[base].set_program_work_exponent(work_exponent);
+}
+
 fn state_edges(automaton: &Automaton, state: usize) -> core::ops::Range<usize> {
     let next = state
         .checked_add(1)
@@ -914,7 +1276,7 @@ mod tests {
 
     use super::{
         ClosureAction, ClosureInstruction, ClosureRoot, EpsilonClosureDispatchData,
-        MAX_RETAINED_TO_GRAPH_FACTOR,
+        GuardedClosureInstruction, MAX_RETAINED_TO_GRAPH_FACTOR,
     };
     use crate::{Automaton, CompileLimits, EdgeKind, RawPlan, StateRole};
 
@@ -973,6 +1335,37 @@ mod tests {
                 ],
                 byte_starts: vec![0, 0, b'a', b'b', b'c'],
                 byte_ends: vec![0, 0, b'a', b'b', b'c'],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn mixed_guarded_and_plain_roots() -> Automaton {
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Split,
+                    StateRole::Accept,
+                    StateRole::Consume,
+                ],
+                edge_offsets: vec![0, 2, 3, 4, 6, 6, 7],
+                edge_targets: vec![1, 2, 3, 4, 4, 5, 4],
+                edge_kinds: vec![
+                    EdgeKind::AssertHaystackStart,
+                    EdgeKind::Epsilon,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::ByteRange,
+                ],
+                byte_starts: vec![0, 0, b'a', b'b', 0, 0, b'c'],
+                byte_ends: vec![0, 0, b'a', b'b', 0, 0, b'c'],
             },
             CompileLimits::default(),
         )
@@ -1080,10 +1473,39 @@ mod tests {
     }
 
     #[test]
-    fn assertions_and_trivial_closures_decline_without_partial_state() {
+    fn assertions_use_the_guarded_arena_while_trivial_closures_decline() {
         let mut asserted = branching_cycle(true);
-        assert!(!asserted.try_enable_epsilon_closure_dispatch().unwrap());
-        assert!(!asserted.has_epsilon_closure_dispatch());
+        assert!(asserted.try_enable_epsilon_closure_dispatch().unwrap());
+        assert!(asserted.has_epsilon_closure_dispatch());
+        let dispatch = asserted.epsilon_closure_dispatch.as_ref().unwrap();
+        assert!(matches!(dispatch.root(0), ClosureRoot::Scalar));
+        let ClosureRoot::GuardedProgram {
+            instructions,
+            max_work,
+        } = dispatch.assertion_root(0)
+        else {
+            panic!("assertion-bearing root retained guarded bytecode");
+        };
+        assert_eq!(size_of::<GuardedClosureInstruction>(), 8);
+        assert_eq!(instructions[0].state(), 0);
+        assert_eq!(instructions[0].guard(), 0);
+        assert_eq!(instructions[0].subtree_end(), instructions.len());
+        assert!(instructions.iter().skip(1).any(|instruction| {
+            instruction.guard() != 0
+        }));
+        assert!(max_work.is_power_of_two());
+        assert_eq!(dispatch.instruction_count(), 0);
+        assert_eq!(dispatch.guarded_instruction_count(), instructions.len());
+        assert_eq!(
+            asserted.epsilon_closure_dispatch_retained_bytes(),
+            asserted.stats().states() * size_of::<u32>()
+                + instructions.len() * size_of::<GuardedClosureInstruction>()
+                + size_of::<EpsilonClosureDispatchData>()
+        );
+        let dispatch = asserted.epsilon_closure_dispatch.as_mut().unwrap();
+        assert!(dispatch.underbound_program_root_for_test(0));
+        assert!(matches!(dispatch.root(0), ClosureRoot::Scalar));
+        assert!(matches!(dispatch.assertion_root(0), ClosureRoot::Scalar));
 
         let mut literal = Automaton::from_raw(
             RawPlan {
@@ -1100,6 +1522,41 @@ mod tests {
         .unwrap();
         assert!(!literal.try_enable_epsilon_closure_dispatch().unwrap());
         assert_eq!(literal.epsilon_closure_dispatch_retained_bytes(), 0);
+    }
+
+    #[test]
+    fn guarded_and_plain_program_offsets_are_local_to_disjoint_arenas() {
+        let mut automaton = mixed_guarded_and_plain_roots();
+        assert!(automaton.try_enable_epsilon_closure_dispatch().unwrap());
+        let dispatch = automaton.epsilon_closure_dispatch.as_ref().unwrap();
+
+        assert!(matches!(dispatch.root(0), ClosureRoot::Scalar));
+        let ClosureRoot::GuardedProgram {
+            instructions: guarded,
+            ..
+        } = dispatch.assertion_root(0)
+        else {
+            panic!("asserted start root must use the guarded arena");
+        };
+        let ClosureRoot::Program {
+            instructions: plain,
+            ..
+        } = dispatch.root(3)
+        else {
+            panic!("assertion-free post-consume root must use the plain arena");
+        };
+        assert!(matches!(dispatch.assertion_root(3), ClosureRoot::Program { .. }));
+        assert_eq!(guarded[0].state(), 0);
+        assert_eq!(plain[0].state(), 3);
+        assert_eq!(dispatch.guarded_instruction_count(), guarded.len());
+        assert_eq!(dispatch.instruction_count(), plain.len());
+        assert_eq!(
+            automaton.epsilon_closure_dispatch_retained_bytes(),
+            automaton.stats().states() * size_of::<u32>()
+                + guarded.len() * size_of::<GuardedClosureInstruction>()
+                + plain.len() * size_of::<ClosureInstruction>()
+                + size_of::<EpsilonClosureDispatchData>()
+        );
     }
 
     #[test]

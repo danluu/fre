@@ -22505,6 +22505,8 @@ const PIKE_BOUNDARY_BYTE_ABSENT: u16 = 256;
 const PIKE_BOUNDARY_NEIGHBORS_UNPREPARED: u16 = u16::MAX;
 
 trait PikeBoundaryEvaluator {
+    const ASSERTION_AWARE: bool;
+
     fn edge_enabled(&mut self, kind: EdgeKind) -> Result<bool, SearchError>;
 }
 
@@ -22533,6 +22535,8 @@ pub(crate) fn boundary_fact_reuse_is_profitable(automaton: &Automaton) -> bool {
 struct AssertionFreePikeBoundary;
 
 impl PikeBoundaryEvaluator for AssertionFreePikeBoundary {
+    const ASSERTION_AWARE: bool = false;
+
     #[inline]
     fn edge_enabled(&mut self, kind: EdgeKind) -> Result<bool, SearchError> {
         debug_assert_eq!(kind, EdgeKind::Epsilon);
@@ -22722,6 +22726,8 @@ impl<'h> PreparedBoundaryFacts<'h> {
 }
 
 impl PikeBoundaryEvaluator for PreparedBoundaryFacts<'_> {
+    const ASSERTION_AWARE: bool = true;
+
     #[inline]
     fn edge_enabled(&mut self, kind: EdgeKind) -> Result<bool, SearchError> {
         Self::edge_enabled(self, kind)
@@ -22745,6 +22751,8 @@ impl<'h> DirectPikeBoundary<'h> {
 }
 
 impl PikeBoundaryEvaluator for DirectPikeBoundary<'_> {
+    const ASSERTION_AWARE: bool = true;
+
     #[inline]
     fn edge_enabled(&mut self, kind: EdgeKind) -> Result<bool, SearchError> {
         zero_width_edge_enabled_with_line_terminator(
@@ -23059,7 +23067,12 @@ fn expand_root<E: PikeBoundaryEvaluator>(
     }
     if meter.limit == u64::MAX {
         if let Some(dispatch) = automaton.epsilon_closure_dispatch.as_ref() {
-            match dispatch.root(root.state) {
+            let closure_root = if E::ASSERTION_AWARE {
+                dispatch.assertion_root(root.state)
+            } else {
+                dispatch.root(root.state)
+            };
+            match closure_root {
                 crate::epsilon_closure_dispatch::ClosureRoot::Program {
                     instructions,
                     max_work,
@@ -23069,6 +23082,21 @@ fn expand_root<E: PikeBoundaryEvaluator>(
                         max_work,
                         position,
                         root.start,
+                        workspace,
+                        meter,
+                    );
+                }
+                crate::epsilon_closure_dispatch::ClosureRoot::GuardedProgram {
+                    instructions,
+                    max_work,
+                } => {
+                    return expand_compiled_guarded_root(
+                        automaton,
+                        instructions,
+                        max_work,
+                        position,
+                        root.start,
+                        evaluator,
                         workspace,
                         meter,
                     );
@@ -23296,6 +23324,293 @@ fn expand_compiled_epsilon_root_exact(
         instruction_index = instruction_index.checked_add(1).ok_or(
             SearchError::ArithmeticOverflow {
                 computation: "compiled epsilon instruction cursor",
+            },
+        )?;
+    }
+    Ok(None)
+}
+
+fn guarded_assertion_bit(guard: u32) -> Result<Option<u32>, SearchError> {
+    if guard == 0 {
+        return Ok(None);
+    }
+    let ordinal = guard.checked_sub(1).ok_or(SearchError::InternalInvariant {
+        detail: "compiled guarded closure has an invalid assertion guard",
+    })?;
+    if ordinal >= 18 {
+        return Err(SearchError::InternalInvariant {
+            detail: "compiled guarded closure has an invalid assertion guard",
+        });
+    }
+    Ok(Some(1_u32 << ordinal))
+}
+
+fn record_guarded_assertion(
+    kind: EdgeKind,
+    is_enabled: bool,
+    known: &mut u32,
+    enabled: &mut u32,
+) -> Result<(), SearchError> {
+    if kind == EdgeKind::Epsilon {
+        if is_enabled {
+            return Ok(());
+        }
+        return Err(SearchError::InternalInvariant {
+            detail: "compiled guarded closure disabled an epsilon edge",
+        });
+    }
+    let bit = kind.assertion_bit().ok_or(SearchError::InternalInvariant {
+        detail: "compiled guarded closure reached a consuming Split edge",
+    })?;
+    if *known & bit != 0 && (*enabled & bit != 0) != is_enabled {
+        return Err(SearchError::InternalInvariant {
+            detail: "compiled guarded closure observed inconsistent assertion truth",
+        });
+    }
+    *known |= bit;
+    if is_enabled {
+        *enabled |= bit;
+    }
+    Ok(())
+}
+
+/// Execute one assertion-bearing priority program. Every reached unseen Split
+/// still evaluates its complete row in scalar reverse order before a child is
+/// considered. Boundary-wide masks survive nested Splits, while `known`
+/// distinguishes a false assertion from a malformed guard that precedes its
+/// owning row evaluation.
+#[inline]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the guarded closure kernel needs graph, boundary evaluator, thread provenance, workspace, and exact meter"
+)]
+fn expand_compiled_guarded_root<E: PikeBoundaryEvaluator>(
+    automaton: &Automaton,
+    program: &[crate::epsilon_closure_dispatch::GuardedClosureInstruction],
+    max_work: u64,
+    position: usize,
+    start: usize,
+    evaluator: &mut E,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+) -> Result<Option<MatchSpan>, SearchError> {
+    workspace.stack_len = 0;
+    if max_work <= meter.remaining() {
+        let (result, work) = expand_compiled_guarded_root_deferred(
+            automaton,
+            program,
+            position,
+            start,
+            evaluator,
+            workspace,
+        );
+        debug_assert!(work <= max_work);
+        meter.charge_admitted(work);
+        return result;
+    }
+    expand_compiled_guarded_root_exact(
+        automaton,
+        program,
+        position,
+        start,
+        evaluator,
+        workspace,
+        meter,
+    )
+}
+
+#[inline]
+fn expand_compiled_guarded_root_deferred<E: PikeBoundaryEvaluator>(
+    automaton: &Automaton,
+    program: &[crate::epsilon_closure_dispatch::GuardedClosureInstruction],
+    position: usize,
+    start: usize,
+    evaluator: &mut E,
+    workspace: &mut K0Workspace,
+) -> (Result<Option<MatchSpan>, SearchError>, u64) {
+    let mut work = 0_u64;
+    let mut known_assertions = 0_u32;
+    let mut enabled_assertions = 0_u32;
+    let mut instruction_index = 0usize;
+    while instruction_index < program.len() {
+        let instruction = program[instruction_index];
+        let guard = match guarded_assertion_bit(instruction.guard()) {
+            Ok(guard) => guard,
+            Err(error) => return (Err(error), work),
+        };
+        if let Some(bit) = guard {
+            if known_assertions & bit == 0 {
+                return (
+                    Err(SearchError::InternalInvariant {
+                        detail: "compiled guarded closure used an assertion before evaluation",
+                    }),
+                    work,
+                );
+            }
+            if enabled_assertions & bit == 0 {
+                let subtree_end = instruction.subtree_end();
+                if subtree_end <= instruction_index || subtree_end > program.len() {
+                    return (
+                        Err(SearchError::InternalInvariant {
+                            detail: "compiled guarded closure has an invalid subtree end",
+                        }),
+                        work,
+                    );
+                }
+                instruction_index = subtree_end;
+                continue;
+            }
+        }
+
+        work = work.wrapping_add(1);
+        let state = crate::plan::plan_index(instruction.state());
+        if workspace.seen_at[state] == workspace.generation {
+            let subtree_end = instruction.subtree_end();
+            if subtree_end <= instruction_index || subtree_end > program.len() {
+                return (
+                    Err(SearchError::InternalInvariant {
+                        detail: "compiled guarded closure has an invalid subtree end",
+                    }),
+                    work,
+                );
+            }
+            instruction_index = subtree_end;
+            continue;
+        }
+        workspace.seen_at[state] = workspace.generation;
+
+        match instruction.action() {
+            crate::epsilon_closure_dispatch::ClosureAction::Accept => {
+                return (Ok(Some(MatchSpan::new(start, position))), work);
+            }
+            crate::epsilon_closure_dispatch::ClosureAction::Consume => {
+                if let Err(error) = workspace.push_current(Thread {
+                    state: instruction.state(),
+                    start,
+                }) {
+                    return (Err(error), work);
+                }
+            }
+            crate::epsilon_closure_dispatch::ClosureAction::Split => {
+                for edge in automaton.state_edges(instruction.state()).rev() {
+                    work = work.wrapping_add(1);
+                    let kind = automaton.edge_kinds[edge];
+                    let is_enabled = match evaluator.edge_enabled(kind) {
+                        Ok(is_enabled) => is_enabled,
+                        Err(error) => return (Err(error), work),
+                    };
+                    if let Err(error) = record_guarded_assertion(
+                        kind,
+                        is_enabled,
+                        &mut known_assertions,
+                        &mut enabled_assertions,
+                    ) {
+                        return (Err(error), work);
+                    }
+                }
+            }
+            crate::epsilon_closure_dispatch::ClosureAction::SeenBackedge => {
+                return (
+                    Err(SearchError::InternalInvariant {
+                        detail: "compiled guarded backedge reached an unseen state",
+                    }),
+                    work,
+                );
+            }
+        }
+        let Some(next) = instruction_index.checked_add(1) else {
+            return (
+                Err(SearchError::ArithmeticOverflow {
+                    computation: "compiled guarded instruction cursor",
+                }),
+                work,
+            );
+        };
+        instruction_index = next;
+    }
+    (Ok(None), work)
+}
+
+#[cold]
+#[inline(never)]
+fn expand_compiled_guarded_root_exact<E: PikeBoundaryEvaluator>(
+    automaton: &Automaton,
+    program: &[crate::epsilon_closure_dispatch::GuardedClosureInstruction],
+    position: usize,
+    start: usize,
+    evaluator: &mut E,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+) -> Result<Option<MatchSpan>, SearchError> {
+    let mut known_assertions = 0_u32;
+    let mut enabled_assertions = 0_u32;
+    let mut instruction_index = 0usize;
+    while instruction_index < program.len() {
+        let instruction = program[instruction_index];
+        if let Some(bit) = guarded_assertion_bit(instruction.guard())? {
+            if known_assertions & bit == 0 {
+                return Err(SearchError::InternalInvariant {
+                    detail: "compiled guarded closure used an assertion before evaluation",
+                });
+            }
+            if enabled_assertions & bit == 0 {
+                let subtree_end = instruction.subtree_end();
+                if subtree_end <= instruction_index || subtree_end > program.len() {
+                    return Err(SearchError::InternalInvariant {
+                        detail: "compiled guarded closure has an invalid subtree end",
+                    });
+                }
+                instruction_index = subtree_end;
+                continue;
+            }
+        }
+
+        meter.charge(1, position)?;
+        let state = crate::plan::plan_index(instruction.state());
+        if workspace.seen_at[state] == workspace.generation {
+            let subtree_end = instruction.subtree_end();
+            if subtree_end <= instruction_index || subtree_end > program.len() {
+                return Err(SearchError::InternalInvariant {
+                    detail: "compiled guarded closure has an invalid subtree end",
+                });
+            }
+            instruction_index = subtree_end;
+            continue;
+        }
+        workspace.seen_at[state] = workspace.generation;
+
+        match instruction.action() {
+            crate::epsilon_closure_dispatch::ClosureAction::Accept => {
+                return Ok(Some(MatchSpan::new(start, position)));
+            }
+            crate::epsilon_closure_dispatch::ClosureAction::Consume => {
+                workspace.push_current(Thread {
+                    state: instruction.state(),
+                    start,
+                })?;
+            }
+            crate::epsilon_closure_dispatch::ClosureAction::Split => {
+                for edge in automaton.state_edges(instruction.state()).rev() {
+                    meter.charge(1, position)?;
+                    let kind = automaton.edge_kinds[edge];
+                    let is_enabled = evaluator.edge_enabled(kind)?;
+                    record_guarded_assertion(
+                        kind,
+                        is_enabled,
+                        &mut known_assertions,
+                        &mut enabled_assertions,
+                    )?;
+                }
+            }
+            crate::epsilon_closure_dispatch::ClosureAction::SeenBackedge => {
+                return Err(SearchError::InternalInvariant {
+                    detail: "compiled guarded backedge reached an unseen state",
+                });
+            }
+        }
+        instruction_index = instruction_index.checked_add(1).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "compiled guarded instruction cursor",
             },
         )?;
     }
@@ -32058,6 +32373,50 @@ mod tests {
         .unwrap()
     }
 
+    fn compiled_guarded_nested_assertions() -> Automaton {
+        // State 0 reaches the nested Split only through haystack-start, while
+        // its lower-priority sibling is guarded by haystack-end. The nested
+        // row repeats haystack-start after two different line assertions.
+        // Its exact reverse evaluator order is therefore:
+        //
+        //   haystack-end, haystack-start,
+        //   haystack-start, line-end, line-start.
+        //
+        // Keeping the parent sibling after the complete nested subtree also
+        // exercises boundary-wide false facts across nested Split rows.
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![
+                    StateRole::Split,
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Accept,
+                ],
+                edge_offsets: vec![0, 2, 5, 6, 7, 8, 9, 9],
+                edge_targets: vec![1, 5, 2, 3, 4, 6, 6, 6, 6],
+                edge_kinds: vec![
+                    EdgeKind::AssertHaystackStart,
+                    EdgeKind::AssertHaystackEnd,
+                    EdgeKind::AssertLineStartLf,
+                    EdgeKind::AssertLineEndLf,
+                    EdgeKind::AssertHaystackStart,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                ],
+                byte_starts: vec![0, 0, 0, 0, 0, b'a', b'b', b'c', b'd'],
+                byte_ends: vec![0, 0, 0, 0, 0, b'a', b'b', b'c', b'd'],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
     fn early_accept_with_shared_parent() -> Automaton {
         Automaton::from_raw(
             RawPlan {
@@ -32530,6 +32889,316 @@ mod tests {
             let exact = run(&automaton, &program, 8, seen, current_full, true);
             assert_eq!(deferred, exact);
             assert_eq!(deferred.1, 11 + expected_work);
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "reverse evaluator order, failures, malformed programs, and near-overflow settlement share one guarded-runtime audit"
+    )]
+    fn guarded_compiled_closure_preserves_nested_assertion_order_and_exact_work() {
+        use crate::epsilon_closure_dispatch::{
+            ClosureAction, ClosureRoot, GuardedClosureInstruction,
+        };
+
+        #[derive(Debug)]
+        struct LoggingBoundary {
+            enabled: u32,
+            fail_at: Option<usize>,
+            calls: Vec<EdgeKind>,
+        }
+
+        impl super::PikeBoundaryEvaluator for LoggingBoundary {
+            const ASSERTION_AWARE: bool = true;
+
+            fn edge_enabled(&mut self, kind: EdgeKind) -> Result<bool, SearchError> {
+                self.calls.push(kind);
+                if self.fail_at == Some(self.calls.len().checked_sub(1).unwrap()) {
+                    return Err(SearchError::InternalInvariant {
+                        detail: "guarded test evaluator failure",
+                    });
+                }
+                if kind == EdgeKind::Epsilon {
+                    return Ok(true);
+                }
+                let bit = kind.assertion_bit().ok_or(SearchError::InternalInvariant {
+                    detail: "guarded test evaluator reached a consuming edge",
+                })?;
+                Ok(self.enabled & bit != 0)
+            }
+        }
+
+        #[derive(Debug, Eq, PartialEq)]
+        struct Run {
+            result: Result<Option<MatchSpan>, SearchError>,
+            consumed: u64,
+            current: Vec<(u32, usize)>,
+            seen_at: Vec<u64>,
+            calls: Vec<EdgeKind>,
+            stack_len: usize,
+        }
+
+        fn run(
+            automaton: &Automaton,
+            enabled: u32,
+            fail_at: Option<usize>,
+            consumed: u64,
+        ) -> Run {
+            let mut workspace =
+                K0Workspace::new(automaton, WorkspaceLimits::unlimited()).unwrap();
+            workspace.generation = 1;
+            let mut evaluator = LoggingBoundary {
+                enabled,
+                fail_at,
+                calls: Vec::new(),
+            };
+            let mut meter = WorkMeter::new(u64::MAX, consumed);
+            let result = super::expand_root(
+                automaton,
+                b"a",
+                0,
+                &mut evaluator,
+                super::Thread { state: 0, start: 7 },
+                &mut workspace,
+                &mut meter,
+            );
+            Run {
+                result,
+                consumed: meter.consumed,
+                current: workspace.current[..workspace.current_len]
+                    .iter()
+                    .map(|thread| (thread.state, thread.start))
+                    .collect(),
+                seen_at: workspace.seen_at,
+                calls: evaluator.calls,
+                stack_len: workspace.stack_len,
+            }
+        }
+
+        let scalar = compiled_guarded_nested_assertions();
+        let mut compiled = compiled_guarded_nested_assertions();
+        assert!(compiled.try_enable_epsilon_closure_dispatch().unwrap());
+        assert!(compiled.has_epsilon_closure_dispatch());
+        let ClosureRoot::GuardedProgram {
+            max_work,
+            instructions,
+        } = compiled
+            .epsilon_closure_dispatch
+            .as_ref()
+            .unwrap()
+            .assertion_root(0)
+        else {
+            panic!("assertion-bearing root did not retain guarded bytecode");
+        };
+        assert_eq!(instructions[0].guard(), 0);
+        assert_eq!(instructions[0].state(), 0);
+        assert_eq!(instructions[0].subtree_end(), instructions.len());
+        assert!(max_work >= 9);
+
+        let enabled = EdgeKind::AssertHaystackStart.assertion_bit().unwrap()
+            | EdgeKind::AssertLineStartLf.assertion_bit().unwrap();
+        let expected_calls = vec![
+            EdgeKind::AssertHaystackEnd,
+            EdgeKind::AssertHaystackStart,
+            EdgeKind::AssertHaystackStart,
+            EdgeKind::AssertLineEndLf,
+            EdgeKind::AssertLineStartLf,
+        ];
+        let scalar_success = run(&scalar, enabled, None, 0);
+        let compiled_success = run(&compiled, enabled, None, 0);
+        assert_eq!(compiled_success, scalar_success);
+        assert_eq!(compiled_success.result, Ok(None));
+        assert_eq!(compiled_success.consumed, 9);
+        assert_eq!(compiled_success.current, vec![(2, 7), (4, 7)]);
+        assert_eq!(compiled_success.calls, expected_calls);
+        assert_eq!(compiled_success.stack_len, 0);
+
+        // Every evaluator exit settles the edge charge that precedes the
+        // callback. Scalar can retain already-pushed siblings on failure, so
+        // only semantically reusable state is compared for those exits.
+        for fail_at in 0..expected_calls.len() {
+            let mut scalar_failure = run(&scalar, enabled, Some(fail_at), 0);
+            let mut compiled_failure = run(&compiled, enabled, Some(fail_at), 0);
+            assert_eq!(compiled_failure.result, scalar_failure.result);
+            assert_eq!(compiled_failure.consumed, scalar_failure.consumed);
+            assert_eq!(compiled_failure.current, scalar_failure.current);
+            assert_eq!(compiled_failure.seen_at, scalar_failure.seen_at);
+            assert_eq!(compiled_failure.calls, scalar_failure.calls);
+            assert_eq!(compiled_failure.stack_len, 0);
+            scalar_failure.stack_len = 0;
+            compiled_failure.stack_len = 0;
+            assert_eq!(compiled_failure, scalar_failure);
+        }
+
+        let exact_base = u64::MAX.checked_sub(9).unwrap();
+        assert_eq!(
+            run(&compiled, enabled, None, exact_base),
+            run(&scalar, enabled, None, exact_base)
+        );
+        assert_eq!(run(&compiled, enabled, None, exact_base).consumed, u64::MAX);
+        let overflow_base = exact_base.checked_add(1).unwrap();
+        assert_eq!(
+            run(&compiled, enabled, None, overflow_base),
+            run(&scalar, enabled, None, overflow_base)
+        );
+        assert!(matches!(
+            run(&compiled, enabled, None, overflow_base).result,
+            Err(SearchError::ArithmeticOverflow {
+                computation: "search work counter"
+            })
+        ));
+
+        fn malformed_run(
+            automaton: &Automaton,
+            program: &[GuardedClosureInstruction],
+            enabled: u32,
+            exact: bool,
+        ) -> (Result<Option<MatchSpan>, SearchError>, u64) {
+            let mut workspace =
+                K0Workspace::new(automaton, WorkspaceLimits::unlimited()).unwrap();
+            workspace.generation = 1;
+            let mut evaluator = LoggingBoundary {
+                enabled,
+                fail_at: None,
+                calls: Vec::new(),
+            };
+            let mut meter = WorkMeter::new(u64::MAX, 11);
+            let result = if exact {
+                super::expand_compiled_guarded_root_exact(
+                    automaton,
+                    program,
+                    0,
+                    3,
+                    &mut evaluator,
+                    &mut workspace,
+                    &mut meter,
+                )
+            } else {
+                let (result, work) = super::expand_compiled_guarded_root_deferred(
+                    automaton,
+                    program,
+                    0,
+                    3,
+                    &mut evaluator,
+                    &mut workspace,
+                );
+                meter.charge_admitted(work);
+                result
+            };
+            (result, meter.consumed)
+        }
+
+        let malformed = [
+            GuardedClosureInstruction::for_runtime_test(
+                0,
+                1,
+                19,
+                ClosureAction::Consume,
+            ),
+            GuardedClosureInstruction::for_runtime_test(
+                0,
+                1,
+                1,
+                ClosureAction::Consume,
+            ),
+        ];
+        for instruction in malformed {
+            let program = [instruction];
+            assert_eq!(
+                malformed_run(&compiled, &program, enabled, false),
+                malformed_run(&compiled, &program, enabled, true)
+            );
+            assert_eq!(malformed_run(&compiled, &program, enabled, false).1, 11);
+        }
+
+        let invalid_false_subtree = [
+            GuardedClosureInstruction::for_runtime_test(0, 2, 0, ClosureAction::Split),
+            GuardedClosureInstruction::for_runtime_test(5, 1, 2, ClosureAction::Consume),
+        ];
+        assert_eq!(
+            malformed_run(&compiled, &invalid_false_subtree, enabled, false),
+            malformed_run(&compiled, &invalid_false_subtree, enabled, true)
+        );
+        assert_eq!(
+            malformed_run(&compiled, &invalid_false_subtree, enabled, false).1,
+            14
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "all output contracts and every bounded search window share one guarded-closure differential"
+    )]
+    fn guarded_compiled_closure_is_a_full_pike_differential() {
+        let scalar = compiled_guarded_nested_assertions();
+        let mut compiled = compiled_guarded_nested_assertions();
+        assert!(compiled.try_enable_epsilon_closure_dispatch().unwrap());
+        assert!(compiled.has_epsilon_closure_dispatch());
+        pin_without_start_filter(&scalar);
+        pin_without_start_filter(&compiled);
+
+        macro_rules! compare {
+            ($operation:ty, $haystack:expr, $window:expr) => {{
+                let mut scalar_workspace =
+                    K0Workspace::new(&scalar, WorkspaceLimits::unlimited()).unwrap();
+                let mut compiled_workspace =
+                    K0Workspace::new(&compiled, WorkspaceLimits::unlimited()).unwrap();
+                let expected = scalar
+                    .prepare::<$operation>()
+                    .search_window_with_workspace(
+                        $haystack,
+                        $window,
+                        &mut scalar_workspace,
+                        SearchLimits::unlimited(),
+                    )
+                    .unwrap();
+                let actual = compiled
+                    .prepare::<$operation>()
+                    .search_window_with_workspace(
+                        $haystack,
+                        $window,
+                        &mut compiled_workspace,
+                        SearchLimits::unlimited(),
+                    )
+                    .unwrap();
+                assert_eq!(actual.output(), expected.output());
+                assert_eq!(actual.accounting(), expected.accounting());
+
+                let exact_expected = scalar
+                    .prepare::<$operation>()
+                    .search_prevalidated_exact_start_with_authenticated_workspace(
+                        $haystack,
+                        $window,
+                        &mut scalar_workspace,
+                        SearchLimits::unlimited(),
+                    )
+                    .unwrap();
+                let exact_actual = compiled
+                    .prepare::<$operation>()
+                    .search_prevalidated_exact_start_with_authenticated_workspace(
+                        $haystack,
+                        $window,
+                        &mut compiled_workspace,
+                        SearchLimits::unlimited(),
+                    )
+                    .unwrap();
+                assert_eq!(exact_actual.output(), exact_expected.output());
+                assert_eq!(exact_actual.accounting(), exact_expected.accounting());
+            }};
+        }
+
+        for haystack in bounded_words(&[b'a', b'b', b'c', b'd', b'\n', 0xff], 3) {
+            for start in 0..=haystack.len() {
+                for end in start..=haystack.len() {
+                    let window = SearchWindow::new(start, end);
+                    compare!(Exists, &haystack, window);
+                    compare!(EarliestEnd, &haystack, window);
+                    compare!(SelectedEnd, &haystack, window);
+                    compare!(Span, &haystack, window);
+                }
+            }
         }
     }
 

@@ -14274,11 +14274,32 @@ mod tests {
                 );
 
                 let bytes = optimized.serialize().unwrap();
-                assert_eq!(bytes, fallback.serialize().unwrap(), "{pattern}");
+                assert!(
+                    optimized.automaton.has_epsilon_closure_dispatch(),
+                    "{pattern}"
+                );
+                assert_eq!(
+                    u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+                    PROGRAM_FORMAT_VERSION_V5,
+                    "{pattern}"
+                );
+                assert_ne!(
+                    bytes[15] & PROGRAM_FLAG_NFA_EPSILON_CLOSURE_DISPATCH,
+                    0,
+                    "{pattern}"
+                );
+                let fallback_bytes = fallback.serialize().unwrap();
+                assert_eq!(
+                    u32::from_le_bytes(fallback_bytes[8..12].try_into().unwrap()),
+                    PROGRAM_FORMAT_VERSION_V4,
+                    "{pattern}"
+                );
+                assert_ne!(bytes, fallback_bytes, "{pattern}");
                 let restored = CompiledProgram::deserialize(&bytes).unwrap();
                 assert_eq!(restored.engine_kind(), EngineKind::OrderedNfa);
                 assert_eq!(restored.context_dfa_stats(), None);
                 assert_eq!(restored.context_determinization_report(), None);
+                assert!(restored.automaton.has_epsilon_closure_dispatch());
                 assert_eq!(restored.serialize().unwrap(), bytes);
 
                 let cloned = optimized.clone();
@@ -14732,6 +14753,36 @@ mod tests {
         }
     }
 
+    fn assertion_epsilon_dispatch_wire_graph() -> RawPlan {
+        RawPlan {
+            start: 0,
+            roles: vec![
+                StateRole::Split,
+                StateRole::Split,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Accept,
+            ],
+            edge_offsets: vec![0, 2, 5, 6, 7, 8, 9, 9],
+            edge_targets: vec![1, 5, 2, 3, 4, 6, 6, 6, 6],
+            edge_kinds: vec![
+                EdgeKind::AssertHaystackStart,
+                EdgeKind::AssertHaystackEnd,
+                EdgeKind::AssertLineStartLf,
+                EdgeKind::AssertLineEndLf,
+                EdgeKind::AssertHaystackStart,
+                EdgeKind::ByteRange,
+                EdgeKind::ByteRange,
+                EdgeKind::ByteRange,
+                EdgeKind::ByteRange,
+            ],
+            byte_starts: vec![0, 0, 0, 0, 0, b'a', b'b', b'c', b'd'],
+            byte_ends: vec![0, 0, 0, 0, 0, b'a', b'b', b'c', b'd'],
+        }
+    }
+
     fn with_ordered_dispatch_dead_branch(mut raw: RawPlan) -> RawPlan {
         let old_start = raw.start;
         let wide = u32::try_from(raw.roles.len()).unwrap();
@@ -14831,6 +14882,71 @@ mod tests {
                             restored.search(haystack, window).unwrap(),
                             reference.search(haystack, window).unwrap(),
                             "output={output:?}, source={haystack:?}, window={window:?}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Assertion-bearing programs use the same graph-owned V5 marker.
+        // The guarded arena is deliberately absent from the wire and must be
+        // rederived byte-for-byte from the authenticated graph on every
+        // deserialize, including its nested duplicate assertion row.
+        let asserted_raw = assertion_epsilon_dispatch_wire_graph();
+        let asserted_haystacks =
+            generated_byte_strings(&[b'a', b'b', b'c', b'd', b'\n', 0xff], 3);
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let optimized = raw_program(
+                &asserted_raw,
+                output,
+                CompileMode::Optimizing,
+                fallback_limits,
+            );
+            assert_eq!(optimized.engine_kind(), EngineKind::OrderedNfa);
+            assert!(optimized.automaton.has_epsilon_closure_dispatch());
+            let retained = optimized
+                .automaton
+                .epsilon_closure_dispatch_retained_bytes();
+            assert!(retained > 0);
+
+            let bytes = optimized.serialize().unwrap();
+            assert_eq!(
+                u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+                PROGRAM_FORMAT_VERSION_V5
+            );
+            assert_ne!(
+                bytes[15] & PROGRAM_FLAG_NFA_EPSILON_CLOSURE_DISPATCH,
+                0
+            );
+            let restored = CompiledProgram::deserialize(&bytes).unwrap();
+            assert!(restored.automaton.has_epsilon_closure_dispatch());
+            assert_eq!(
+                restored
+                    .automaton
+                    .epsilon_closure_dispatch_retained_bytes(),
+                retained
+            );
+            assert_eq!(restored.serialize().unwrap(), bytes);
+
+            let reference = raw_program(
+                &asserted_raw,
+                output,
+                CompileMode::Fast,
+                DeterminizeLimits::default(),
+            );
+            assert!(!reference.automaton.has_epsilon_closure_dispatch());
+            for haystack in &asserted_haystacks {
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let window = SearchWindow::new(start, end);
+                        assert_eq!(
+                            restored.search(haystack, window).unwrap(),
+                            reference.search(haystack, window).unwrap(),
+                            "guarded output={output:?}, source={haystack:?}, window={window:?}"
                         );
                     }
                 }
