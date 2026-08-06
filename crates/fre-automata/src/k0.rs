@@ -13884,9 +13884,9 @@ enum ContextLoopUnionAnalysis {
 /// Every subset initializes the complete product-selection table, inspects
 /// every retained product, considers every product/atom pair, and may rebuild
 /// one complete byte bitmap. A contextual lookup is charged at its bounded
-/// hot/hash/four-way ceiling even when an earlier way succeeds. Precharging
-/// the whole envelope keeps a decline ahead of all subset-local work and
-/// makes retry/publication atomic.
+/// hot/dense/hash/four-way ceiling even when an earlier tier or way succeeds.
+/// Precharging the whole envelope keeps a decline ahead of all subset-local
+/// work and makes retry/publication atomic.
 fn context_loop_subset_work_upper(
     product_count: usize,
     atom_count: usize,
@@ -13903,7 +13903,10 @@ fn context_loop_subset_work_upper(
     let byte_domain = u64::try_from(BYTE_ALPHABET).expect("the byte alphabet fits u64");
     let lookup_work = u64::try_from(CONTEXT_TRANSITION_WAYS)
         .expect("the contextual transition ways fit u64")
-        .checked_add(1)
+        // One hot-tag check and one optional dense-row check precede the
+        // complete associative-way scan. Reserving both remains conservative
+        // when the state has no dense owner and exact when it does and misses.
+        .checked_add(2)
         .ok_or(SearchError::ArithmeticOverflow {
             computation: "contextual loop lookup work",
         })?;
@@ -36293,6 +36296,23 @@ mod tests {
         for nonmember in [0x80, 0xc3, 0xa9, u8::MAX] {
             assert!(!retained.scanner.contains(nonmember));
         }
+    }
+
+    #[test]
+    fn contextual_pair_closed_work_reserves_the_dense_lookup_tier() {
+        let assertion_work = 3_u64;
+        let total = super::context_loop_subset_work_upper(1, 1, assertion_work).unwrap();
+        let byte_domain = u64::try_from(super::BYTE_ALPHABET).unwrap();
+        // Fixed subset initialization, one retained product, publication,
+        // and the final bitmap rebuild surround exactly one product/atom
+        // pair in this shape.
+        let fixed = 1_u64 + byte_domain + 1 + 1 + byte_domain;
+        let pair_bookkeeping = 1_u64;
+        let lookup = total - fixed - assertion_work - pair_bookkeeping;
+        assert_eq!(
+            lookup,
+            u64::try_from(super::CONTEXT_TRANSITION_WAYS).unwrap() + 2
+        );
     }
 
     #[test]
