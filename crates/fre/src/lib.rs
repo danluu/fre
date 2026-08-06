@@ -14619,7 +14619,7 @@ mod tests {
                 );
                 assert_eq!(
                     mandatory_suffix_span_state.classes[class_index].next_predicate
-                        & K0_FINITE_SUFFIX_EXACT_ROUTE,
+                        & super::K0_FINITE_SUFFIX_EXACT_ROUTE,
                     0,
                     "the first Present call does not train an unmeasured exact win",
                 );
@@ -14667,7 +14667,7 @@ mod tests {
                 );
                 assert_eq!(
                     mandatory_suffix_span_state.classes[class_index].next_predicate
-                        & K0_FINITE_SUFFIX_EXACT_ROUTE,
+                        & super::K0_FINITE_SUFFIX_EXACT_ROUTE,
                     0,
                 );
                 *mandatory_suffix_span_state
