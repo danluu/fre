@@ -781,13 +781,14 @@ pub use unicode_word_run::{
 /// Stable schema for facade-level explanation records.
 pub const EXPLAIN_SCHEMA_VERSION: u32 = 14;
 
-// Automatic ordinary search admits exact anchors and general plans with two
-// independently selective predicate finders. The kernel's source-derived
-// cardinality gate leaves broad or single-finder shapes on K0. Construction
-// proves a word width of at most 64, so one primary finder leaves at most 63
-// non-universal verification predicates. The retained second finder and final
-// Shift-And handoff keep dense rejection streams inside the closed linear
-// bound.
+// Automatic ordinary search admits exact anchors and staged general plans with
+// a three-member primary plus an independently selective predicate finder.
+// Wider direct-pair plans, predicates above the kernel's source-derived
+// cardinality gate, and single-finder shapes preserve K0 as the facade
+// incumbent. Construction proves a word width of at most 64, so one primary
+// finder leaves at most 63 non-universal verification predicates. The retained
+// second finder and final Shift-And handoff keep dense rejection streams inside
+// the closed linear bound.
 const FIXED_PREDICATE_SEARCH_AUTO_MAX_VERIFICATION_PREDICATES: usize =
     FIXED_PREDICATE_WORD64_MAX_WIDTH - 1;
 
@@ -2448,11 +2449,13 @@ fn try_fixed_predicate_word64_before_finite(
         reducer,
         FixedPredicateWord64Reducer::OneByteAnchor | FixedPredicateWord64Reducer::TwoByteAnchor
     );
-    let general_pair = matches!(reducer, FixedPredicateWord64Reducer::ShiftAnd)
-        && strategy.primary_finder.is_some()
+    let staged_general_pair = matches!(reducer, FixedPredicateWord64Reducer::ShiftAnd)
+        && strategy.primary_finder.is_some_and(|finder| {
+            finder.kind == FixedPredicateWord64AdaptiveFinderKind::Three
+        })
         && fixed.has_non_universal_predicate()
         && fixed.finite_incumbent_cannot_fit(finite_max_patterns, finite_max_pattern_bytes);
-    let auto_admitted = (exact_anchor || general_pair)
+    let auto_admitted = (exact_anchor || staged_general_pair)
         && plan.max_verification_predicates()
             <= FIXED_PREDICATE_SEARCH_AUTO_MAX_VERIFICATION_PREDICATES;
     if !auto_admitted {
@@ -12689,7 +12692,9 @@ mod tests {
     use fre_automata::{MandatoryCutAnalysisLimits, MaximumConsumedDistance};
     use fre_kernels::{
         BoundedLiteralClassRunPlan, DispatchedPrefixClassAlternationSearchCursor,
-        FixedPredicateWord64SearchCursor, PrefixClassAlternationSearchCursor,
+        FixedPredicateWord64AdaptiveFinderKind, FixedPredicateWord64AdaptiveHandoffIdentity,
+        FixedPredicateWord64Reducer, FixedPredicateWord64SearchCursor,
+        PrefixClassAlternationSearchCursor,
     };
     use fre_lower::UnsupportedFeature;
     use std::fmt::Write as _;
@@ -15501,7 +15506,7 @@ mod tests {
     }
 
     #[test]
-    fn selective_general_pair_routes_before_k0_but_broad_shapes_preserve_k0() {
+    fn staged_three_member_pair_routes_before_k0_but_direct_and_broad_shapes_preserve_k0() {
         let limits = BuildLimits {
             literal_set: fre_kernels::LiteralSetBuildLimits {
                 max_patterns: 4,
@@ -15526,13 +15531,20 @@ mod tests {
             accounting.identity.reducer,
             FixedPredicateWord64Reducer::ShiftAnd
         );
-        assert!(accounting.identity.primary_finder.is_some());
+        assert_eq!(
+            accounting.identity.primary_finder.unwrap().kind,
+            FixedPredicateWord64AdaptiveFinderKind::Three
+        );
         assert!(matches!(
             accounting.identity.adaptive_handoff,
             FixedPredicateWord64AdaptiveHandoffIdentity::Finder { .. }
         ));
 
-        for pattern in [r"[\x00-\x7E][\x00-\x7E]", r"[a-c][\x00-\xFF]"] {
+        for pattern in [
+            r"[a-d][e-h]",
+            r"[\x00-\x7E][\x00-\x7E]",
+            r"[a-c][\x00-\xFF]",
+        ] {
             let broad = PortableBuilder::new(pattern)
                 .unicode(false)
                 .limits(limits)
@@ -15560,7 +15572,7 @@ mod tests {
 
         let mut haystack = Vec::new();
         for _ in 0..8 {
-            haystack.extend_from_slice(&[b'A', 0xff, b'Q']);
+            haystack.extend_from_slice(&[0xff, b'!', b'Q']);
         }
         for _ in 0..64 {
             haystack.extend_from_slice(b"A!Q");

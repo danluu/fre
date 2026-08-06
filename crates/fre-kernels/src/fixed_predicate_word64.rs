@@ -5,13 +5,14 @@
 //! predicate is supplied as inclusive byte ranges and is compiled into a full
 //! byte-to-position mask table. An exact
 //! one-or-two-byte predicate drives a monotone candidate stream when available.
-//! Otherwise, two sufficiently selective non-universal predicates drive one
-//! retained intersected vector stream directly. An exact-primary rejection
-//! burst moves to the same intersection; a dense intersected rejection burst
-//! then moves monotonically to Shift-And. Broad predicates remain direct
-//! Shift-And plans so a caller can preserve a stronger incumbent. Universal
-//! predicates are never rechecked. Every phase restarts after each accepted
-//! word, allocates no operation memory, and materializes no spans.
+//! Otherwise, a three-member predicate starts one `memchr3` stream.
+//! Dense rejections by its paired predicate move to a retained intersected
+//! vector stream, where the second classifier runs only for blocks with a
+//! primary survivor. Dense residual rejections move monotonically to
+//! Shift-And. Explicit plans with wider selective primaries begin directly in
+//! the retained intersected stream.
+//! Universal predicates are never rechecked. Every phase restarts after each
+//! accepted word, allocates no operation memory, and materializes no spans.
 
 use core::{fmt, mem::size_of};
 
@@ -21,30 +22,28 @@ use fre_simd_kernels::{
     classify_byte_set1_16, classify_byte_set1_32, classify_byte_set2_16, classify_byte_set2_32,
     classify_byte_set3_16, classify_byte_set3_32, classify_byte_set4_16, classify_byte_set4_32,
 };
-#[cfg(test)]
-use memchr::memchr3;
-use memchr::{memchr, memchr2};
+use memchr::{memchr, memchr2, memchr3};
 
 use crate::Window;
 use crate::packed_ordered_literal_aggregate::byte_frequency_rank;
 
 /// Stable identity for the fixed-predicate selective-finder-or-Shift-And strategy.
 pub const PLAN_ID: &str =
-    "fixed-predicate-word64.selective-predicate-or-shift-and.nonoverlap.v11";
+    "fixed-predicate-word64.selective-predicate-or-shift-and.nonoverlap.v12";
 /// Stable identity for the count reducer.
-pub const COUNT_OPERATION_ID: &str = "fixed-predicate-word64.count.v10";
+pub const COUNT_OPERATION_ID: &str = "fixed-predicate-word64.count.v11";
 /// Stable identity for the matched-byte-sum reducer.
-pub const SPAN_SUM_OPERATION_ID: &str = "fixed-predicate-word64.span-sum.v10";
+pub const SPAN_SUM_OPERATION_ID: &str = "fixed-predicate-word64.span-sum.v11";
 /// Stable identity for the ordinary first-match search projection.
-pub const SEARCH_PLAN_ID: &str = "fixed-predicate-word64.first-match.v7";
+pub const SEARCH_PLAN_ID: &str = "fixed-predicate-word64.first-match.v8";
 /// Stable identity for existence search.
-const EXISTS_SEARCH_OPERATION_ID: &str = "fixed-predicate-word64.search.exists.v7";
+const EXISTS_SEARCH_OPERATION_ID: &str = "fixed-predicate-word64.search.exists.v8";
 /// Stable identity for the first accepting end projection.
-const EARLIEST_END_SEARCH_OPERATION_ID: &str = "fixed-predicate-word64.search.earliest-end.v7";
+const EARLIEST_END_SEARCH_OPERATION_ID: &str = "fixed-predicate-word64.search.earliest-end.v8";
 /// Stable identity for the selected match end projection.
-const SELECTED_END_SEARCH_OPERATION_ID: &str = "fixed-predicate-word64.search.selected-end.v7";
+const SELECTED_END_SEARCH_OPERATION_ID: &str = "fixed-predicate-word64.search.selected-end.v8";
 /// Stable identity for the selected span projection.
-const SPAN_SEARCH_OPERATION_ID: &str = "fixed-predicate-word64.search.span.v7";
+const SPAN_SEARCH_OPERATION_ID: &str = "fixed-predicate-word64.search.span.v8";
 /// Version of the receipt-bearing fixed-predicate construction protocol.
 pub const BUILD_ATTEMPT_ALGORITHM_VERSION: u32 = 11;
 /// Version of the partial-actual fixed-predicate construction ledger.
@@ -70,9 +69,8 @@ const REDUCE_FINAL_WORK: usize = 1;
 const ADAPTIVE_FALLBACK_REJECTIONS: usize = 8;
 const ADAPTIVE_FALLBACK_MAX_MEAN_SKIP: usize = BYTE_SET_BLOCK_BYTES;
 // This is the same source-derived maximum used by K0's retained guard. Above
-// it, a predicate admits at least one quarter of the byte domain, so this
-// kernel leaves the raw Shift-And plan available for explicit use while Auto
-// preserves K0 as the incumbent.
+// it, a predicate admits more than one quarter of the byte domain and cannot
+// justify a retained intersection.
 const GENERAL_PRIMARY_MAX_CARDINALITY: usize = 64;
 
 #[inline]
@@ -203,8 +201,9 @@ pub enum AdaptiveHandoffIdentity {
     /// Dense primary rejection moves directly to Shift-And.
     DirectShiftAnd,
     /// One secondary finder is retained. With an exact primary, dense
-    /// rejection hands off to an intersected stream. With a general primary
-    /// recorded by the operation identity, search begins in that stream.
+    /// rejection hands off to an intersected stream. A three-member general
+    /// primary begins with `memchr3` and hands off after dense rejections by
+    /// this finder; wider general primaries begin in the intersected stream.
     Finder {
         /// Exact retained finder.
         finder: AdaptiveFinderIdentity,
@@ -1596,11 +1595,20 @@ impl<'a> AdaptiveFinderCursor<'a> {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct CandidateStreamBlock {
     // Candidate-start coordinates let both retained predicate masks survive
-    // every monotone restart within a classified block.
+    // every monotone restart within a classified block. An empty primary mask
+    // authenticates an empty fallback mask without reading the second source
+    // slice.
     start: usize,
     end: usize,
     primary_members: u32,
     fallback_members: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GeneralPrimaryOutcome {
+    Match,
+    FallbackRejected,
+    ResidualRejected,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1748,7 +1756,8 @@ struct CandidateStreamCursor<'a> {
     bytes: &'a [u8],
     legal_start_end: usize,
     block: CandidateStreamBlock,
-    classified_candidate_bytes: usize,
+    primary_classified_bytes: usize,
+    fallback_classified_bytes: usize,
     #[cfg(test)]
     classified_chunks: usize,
 }
@@ -1766,7 +1775,8 @@ impl<'a> CandidateStreamCursor<'a> {
             bytes,
             legal_start_end,
             block: CandidateStreamBlock::default(),
-            classified_candidate_bytes: 0,
+            primary_classified_bytes: 0,
+            fallback_classified_bytes: 0,
             #[cfg(test)]
             classified_chunks: 0,
         }
@@ -1785,7 +1795,8 @@ impl<'a> CandidateStreamCursor<'a> {
             bytes,
             legal_start_end,
             block,
-            classified_candidate_bytes: 0,
+            primary_classified_bytes: 0,
+            fallback_classified_bytes: 0,
             #[cfg(test)]
             classified_chunks: 0,
         }
@@ -1797,6 +1808,9 @@ impl<'a> CandidateStreamCursor<'a> {
 
     #[inline]
     fn find(&mut self, mut cursor: usize) -> Option<usize> {
+        if self.primary.offset()? == self.fallback.offset {
+            return None;
+        }
         while cursor < self.legal_start_end {
             if self.block.start <= cursor && cursor < self.block.end {
                 if let Some(candidate) = self.find_retained_before(cursor, self.block.end) {
@@ -1820,15 +1834,33 @@ impl<'a> CandidateStreamCursor<'a> {
                 remaining.min(block_bytes)
             };
             let chunk_end = cursor.checked_add(chunk_len)?;
-            let (primary_members, fallback_members) = if chunk_len == BYTE_SET_WIDE_BLOCK_BYTES {
-                self.classify_32(cursor)?
+            let primary_members = if chunk_len == BYTE_SET_WIDE_BLOCK_BYTES {
+                self.classify_primary_32(cursor)?
             } else if chunk_len == BYTE_SET_BLOCK_BYTES {
-                self.classify_16(cursor)?
+                self.classify_primary_16(cursor)?
             } else {
-                self.classify_tail(cursor, chunk_len)?
+                self.classify_primary_tail(cursor, chunk_len)?
             };
-            self.classified_candidate_bytes =
-                self.classified_candidate_bytes.checked_add(chunk_len)?;
+            self.primary_classified_bytes =
+                self.primary_classified_bytes.checked_add(chunk_len)?;
+            // The second predicate cannot contribute a candidate when the
+            // first mask is empty. Keep its classifier entirely off that
+            // block's path instead of unconditionally reading and classifying
+            // a second source slice.
+            let fallback_members = if primary_members == 0 {
+                0
+            } else {
+                let members = if chunk_len == BYTE_SET_WIDE_BLOCK_BYTES {
+                    self.classify_fallback_32(cursor)?
+                } else if chunk_len == BYTE_SET_BLOCK_BYTES {
+                    self.classify_fallback_16(cursor)?
+                } else {
+                    self.classify_fallback_tail(cursor, chunk_len)?
+                };
+                self.fallback_classified_bytes =
+                    self.fallback_classified_bytes.checked_add(chunk_len)?;
+                members
+            };
             self.block = CandidateStreamBlock {
                 start: cursor,
                 end: chunk_end,
@@ -1870,56 +1902,69 @@ impl<'a> CandidateStreamCursor<'a> {
     }
 
     #[inline]
-    fn classify_16(&self, start: usize) -> Option<(u32, u32)> {
+    fn classify_primary_16(&self, start: usize) -> Option<u32> {
         let primary_offset = usize::from(self.primary.offset()?);
-        let fallback_offset = usize::from(self.fallback.offset);
-        if primary_offset == fallback_offset {
-            return None;
-        }
         let primary = self.block_16(start.checked_add(primary_offset)?)?;
-        let fallback = self.block_16(start.checked_add(fallback_offset)?)?;
-        Some((
-            u32::from(self.primary.classify_16(primary)?),
-            u32::from(self.fallback.classify_16(fallback)),
-        ))
+        Some(u32::from(self.primary.classify_16(primary)?))
     }
 
     #[inline]
-    fn classify_32(&self, start: usize) -> Option<(u32, u32)> {
-        let primary_offset = usize::from(self.primary.offset()?);
+    fn classify_fallback_16(&self, start: usize) -> Option<u32> {
         let fallback_offset = usize::from(self.fallback.offset);
-        if primary_offset == fallback_offset
-            || self.primary.candidate_block_bytes() != BYTE_SET_WIDE_BLOCK_BYTES
-            || self.fallback.candidate_block_bytes() != BYTE_SET_WIDE_BLOCK_BYTES
-        {
+        let fallback = self.block_16(start.checked_add(fallback_offset)?)?;
+        Some(u32::from(self.fallback.classify_16(fallback)))
+    }
+
+    #[inline]
+    fn classify_primary_32(&self, start: usize) -> Option<u32> {
+        let primary_offset = usize::from(self.primary.offset()?);
+        if self.primary.candidate_block_bytes() != BYTE_SET_WIDE_BLOCK_BYTES {
             return None;
         }
         let primary = self.block_32(start.checked_add(primary_offset)?)?;
-        let fallback = self.block_32(start.checked_add(fallback_offset)?)?;
-        Some((
-            self.primary.classify_32(primary)?,
-            self.fallback.classify_32(fallback)?,
-        ))
+        self.primary.classify_32(primary)
     }
 
     #[inline]
-    fn classify_tail(&self, start: usize, len: usize) -> Option<(u32, u32)> {
-        let primary_offset = usize::from(self.primary.offset()?);
+    fn classify_fallback_32(&self, start: usize) -> Option<u32> {
         let fallback_offset = usize::from(self.fallback.offset);
-        if primary_offset == fallback_offset || len >= BYTE_SET_BLOCK_BYTES {
+        if self.fallback.candidate_block_bytes() != BYTE_SET_WIDE_BLOCK_BYTES {
+            return None;
+        }
+        let fallback = self.block_32(start.checked_add(fallback_offset)?)?;
+        self.fallback.classify_32(fallback)
+    }
+
+    #[inline]
+    fn classify_primary_tail(&self, start: usize, len: usize) -> Option<u32> {
+        let primary_offset = usize::from(self.primary.offset()?);
+        if len >= BYTE_SET_BLOCK_BYTES {
             return None;
         }
         let mut primary_members = 0_u32;
-        let mut fallback_members = 0_u32;
         for lane in 0..len {
             let candidate = start.checked_add(lane)?;
             let primary_byte = *self.bytes.get(candidate.checked_add(primary_offset)?)?;
-            let fallback_byte = *self.bytes.get(candidate.checked_add(fallback_offset)?)?;
             let lane_shift = u32::try_from(lane).ok()?;
             primary_members |= u32::from(self.primary.matches(primary_byte)?) << lane_shift;
+        }
+        Some(primary_members)
+    }
+
+    #[inline]
+    fn classify_fallback_tail(&self, start: usize, len: usize) -> Option<u32> {
+        let fallback_offset = usize::from(self.fallback.offset);
+        if len >= BYTE_SET_BLOCK_BYTES {
+            return None;
+        }
+        let mut fallback_members = 0_u32;
+        for lane in 0..len {
+            let candidate = start.checked_add(lane)?;
+            let fallback_byte = *self.bytes.get(candidate.checked_add(fallback_offset)?)?;
+            let lane_shift = u32::try_from(lane).ok()?;
             fallback_members |= u32::from(self.fallback.matches(fallback_byte)) << lane_shift;
         }
-        Some((primary_members, fallback_members))
+        Some(fallback_members)
     }
 
     #[inline]
@@ -1934,8 +1979,12 @@ impl<'a> CandidateStreamCursor<'a> {
         self.bytes.get(start..end)?.try_into().ok()
     }
 
-    const fn classified_candidate_bytes(&self) -> usize {
-        self.classified_candidate_bytes
+    const fn primary_classified_bytes(&self) -> usize {
+        self.primary_classified_bytes
+    }
+
+    const fn fallback_classified_bytes(&self) -> usize {
+        self.fallback_classified_bytes
     }
 
     #[cfg(test)]
@@ -2380,10 +2429,9 @@ fn select_anchor(
         }
     }
     let exact_primary_offset = selected.offset().map(usize::from);
-    // A general primary is admitted only with a second independently
-    // selective predicate. Starting directly in the retained two-mask stream
-    // then avoids overlapping classification at a single-to-paired handoff,
-    // while shapes with only one useful predicate preserve K0 as incumbent.
+    // A general primary is retained only with a second independently selective
+    // predicate. Three-member primaries begin with memchr3; wider explicit
+    // plans begin directly in the retained two-mask stream.
     let general_pair = match (exact_primary_offset, fallback_first, fallback_second) {
         (None, Some(primary), Some(secondary))
             if primary.score.0 <= GENERAL_PRIMARY_MAX_CARDINALITY
@@ -2627,6 +2675,20 @@ impl FixedPredicateWord64Plan {
         match self.primary_finder.as_ref() {
             Some(finder) => Some(PrimaryPredicate::General(finder)),
             None => self.anchor.offset().map(|_| PrimaryPredicate::Exact(self.anchor)),
+        }
+    }
+
+    fn general_primary_memchr3(&self) -> Option<(usize, [u8; 3])> {
+        let finder = self.primary_finder.as_ref()?;
+        match finder.finder {
+            AdaptiveFinder::Three(first, second, third) => {
+                Some((usize::from(finder.offset), [first, second, third]))
+            }
+            AdaptiveFinder::One(_)
+            | AdaptiveFinder::Two(_, _)
+            | AdaptiveFinder::Four(_)
+            | AdaptiveFinder::Range { .. }
+            | AdaptiveFinder::Set(_) => None,
         }
     }
 
@@ -2931,7 +2993,11 @@ impl FixedPredicateWord64Plan {
                     "admitted fixed-predicate window disappeared",
                 ))?;
         if self.primary_finder.is_some() {
-            return self.first_adaptive_fallback_value(slice, window.start(), 0);
+            return if self.general_primary_memchr3().is_some() {
+                self.first_general_primary_value(slice, window.start())
+            } else {
+                self.first_adaptive_fallback_value(slice, window.start(), 0)
+            };
         }
         match self.anchor {
             Anchor::One { offset, byte } => {
@@ -2948,6 +3014,155 @@ impl FixedPredicateWord64Plan {
             }),
             Anchor::ShiftAnd => self.first_shift_and_value(slice, window.start()),
         }
+    }
+
+    #[inline]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the compact general-primary phase keeps outcome-typed one-way handoffs adjacent"
+    )]
+    fn first_general_primary_value(
+        &self,
+        slice: &[u8],
+        window_start: usize,
+    ) -> Result<Option<(usize, usize)>, SearchError> {
+        let (primary_offset, [first, second, third]) = self.general_primary_memchr3().ok_or(
+            SearchError::InternalInvariant("general primary lost its three-byte finder"),
+        )?;
+        let fallback = self.adaptive_fallback.as_ref().ok_or(
+            SearchError::InternalInvariant("general primary lost its paired predicate finder"),
+        )?;
+        let fallback_offset = usize::from(fallback.offset);
+        if primary_offset == fallback_offset {
+            return Err(SearchError::InternalInvariant(
+                "general primary duplicated its paired predicate",
+            ));
+        }
+        let anchor_end = slice
+            .len()
+            .checked_sub(self.width)
+            .and_then(|last_start| last_start.checked_add(primary_offset))
+            .and_then(|last_anchor| last_anchor.checked_add(1))
+            .unwrap_or(0);
+        let mut cursor = primary_offset.min(anchor_end);
+        let mut fallback_burst_start = 0_usize;
+        let mut fallback_rejections = 0_usize;
+        let mut residual_burst_start = 0_usize;
+        let mut residual_rejections = 0_usize;
+        while cursor < anchor_end {
+            let search = slice.get(cursor..anchor_end).ok_or(
+                SearchError::InternalInvariant("general primary search escaped the input"),
+            )?;
+            let Some(relative) = memchr3(first, second, third, search) else {
+                break;
+            };
+            let anchor = cursor.checked_add(relative).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "general primary anchor position",
+                },
+            )?;
+            let start = anchor.checked_sub(primary_offset).ok_or(
+                SearchError::InternalInvariant("general primary preceded its fixed offset"),
+            )?;
+            match self
+                .general_primary_outcome_value(
+                    slice,
+                    start,
+                    primary_offset,
+                    fallback,
+                    fallback_offset,
+                )
+                .ok_or(SearchError::InternalInvariant(
+                    "general primary verification failed",
+                ))?
+            {
+                GeneralPrimaryOutcome::Match => {
+                    let end = start.checked_add(self.width).ok_or(
+                        SearchError::ArithmeticOverflow {
+                            computation: "general primary match end",
+                        },
+                    )?;
+                    let absolute_start = window_start.checked_add(start).ok_or(
+                        SearchError::ArithmeticOverflow {
+                            computation: "general primary absolute start",
+                        },
+                    )?;
+                    let absolute_end = window_start.checked_add(end).ok_or(
+                        SearchError::ArithmeticOverflow {
+                            computation: "general primary absolute end",
+                        },
+                    )?;
+                    return Ok(Some((absolute_start, absolute_end)));
+                }
+                GeneralPrimaryOutcome::FallbackRejected => {
+                    residual_rejections = 0;
+                    if fallback_rejections == 0 {
+                        fallback_burst_start = anchor;
+                    }
+                    fallback_rejections = fallback_rejections.checked_add(1).ok_or(
+                        SearchError::ArithmeticOverflow {
+                            computation: "general primary fallback rejection burst",
+                        },
+                    )?;
+                }
+                GeneralPrimaryOutcome::ResidualRejected => {
+                    fallback_rejections = 0;
+                    if residual_rejections == 0 {
+                        residual_burst_start = anchor;
+                    }
+                    residual_rejections = residual_rejections.checked_add(1).ok_or(
+                        SearchError::ArithmeticOverflow {
+                            computation: "general primary residual rejection burst",
+                        },
+                    )?;
+                }
+            }
+            cursor = anchor.checked_add(1).ok_or(SearchError::ArithmeticOverflow {
+                computation: "general primary rejected restart",
+            })?;
+            let first_untested_start = cursor.checked_sub(primary_offset).ok_or(
+                SearchError::InternalInvariant("general primary handoff preceded its cursor"),
+            )?;
+            if fallback_rejections == ADAPTIVE_FALLBACK_REJECTIONS {
+                if dense_rejection_burst(
+                    fallback_burst_start,
+                    anchor,
+                    fallback_rejections,
+                )
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "general primary fallback rejection density",
+                })? {
+                    return self.first_adaptive_fallback_value(
+                        slice,
+                        window_start,
+                        first_untested_start,
+                    );
+                }
+                fallback_rejections = 0;
+            }
+            if residual_rejections == ADAPTIVE_FALLBACK_REJECTIONS {
+                if dense_rejection_burst(
+                    residual_burst_start,
+                    anchor,
+                    residual_rejections,
+                )
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "general primary residual rejection density",
+                })? {
+                    let remaining = slice.get(first_untested_start..).ok_or(
+                        SearchError::InternalInvariant("general primary Shift-And escaped input"),
+                    )?;
+                    let absolute = window_start.checked_add(first_untested_start).ok_or(
+                        SearchError::ArithmeticOverflow {
+                            computation: "general primary Shift-And absolute start",
+                        },
+                    )?;
+                    return self.first_shift_and_value(remaining, absolute);
+                }
+                residual_rejections = 0;
+            }
+        }
+        Ok(None)
     }
 
     #[inline]
@@ -3430,6 +3645,7 @@ impl FixedPredicateWord64Plan {
     ) -> Result<(Option<(usize, usize)>, SearchActualCounters), SearchError> {
         let mut actual = AnchorActual::default();
         if self.primary_finder.is_some()
+            && self.general_primary_memchr3().is_none()
             && matches!(cursor.phase, RetainedSearchPhase::Primary)
         {
             cursor.phase = RetainedSearchPhase::CandidateStream;
@@ -3438,6 +3654,8 @@ impl FixedPredicateWord64Plan {
             cursor.phase = RetainedSearchPhase::ShiftAnd;
         }
         let matched = match cursor.phase {
+            RetainedSearchPhase::Primary if self.general_primary_memchr3().is_some() => self
+                .execute_retained_general_primary(haystack, window, cursor, &mut actual)?,
             RetainedSearchPhase::Primary => {
                 self.execute_retained_primary(haystack, window, cursor, &mut actual)?
             }
@@ -3476,6 +3694,192 @@ impl FixedPredicateWord64Plan {
         };
         ensure_search_actual_within(search_actual, upper)?;
         Ok((matched, search_actual))
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the retained general-primary phase keeps outcome-typed handoffs and cursor mutation adjacent"
+    )]
+    fn execute_retained_general_primary(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        retained: &mut FixedPredicateWord64SearchCursor<'_, '_>,
+        actual: &mut AnchorActual,
+    ) -> Result<Option<(usize, usize)>, SearchError> {
+        let (primary_offset, [first, second, third]) = self.general_primary_memchr3().ok_or(
+            SearchError::InternalInvariant("retained general primary lost its three-byte finder"),
+        )?;
+        let fallback = self.adaptive_fallback.as_ref().ok_or(
+            SearchError::InternalInvariant(
+                "retained general primary lost its paired predicate finder",
+            ),
+        )?;
+        let fallback_offset = usize::from(fallback.offset);
+        if primary_offset == fallback_offset {
+            return Err(SearchError::InternalInvariant(
+                "retained general primary duplicated its paired predicate",
+            ));
+        }
+        let legal_start_end = window
+            .end()
+            .checked_sub(self.width)
+            .and_then(|last_start| last_start.checked_add(1))
+            .unwrap_or(window.start());
+        let anchor_end = legal_start_end.checked_add(primary_offset).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "retained general primary anchor end",
+            },
+        )?;
+        let mut scan = window
+            .start()
+            .checked_add(primary_offset)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "retained general primary cursor",
+            })?
+            .min(anchor_end);
+        let mut fallback_burst_start = 0_usize;
+        let mut fallback_rejections = 0_usize;
+        let mut residual_burst_start = 0_usize;
+        let mut residual_rejections = 0_usize;
+        while scan < anchor_end {
+            let search = haystack.get(scan..anchor_end).ok_or(
+                SearchError::InternalInvariant("retained general primary escaped the source"),
+            )?;
+            actual.finder_calls = actual.finder_calls.checked_add(1).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "retained general primary finder calls",
+                },
+            )?;
+            let Some(relative) = memchr3(first, second, third, search) else {
+                actual.finder_scanned_bytes = actual
+                    .finder_scanned_bytes
+                    .checked_add(search.len())
+                    .ok_or(SearchError::ArithmeticOverflow {
+                        computation: "retained general primary terminal service",
+                    })?;
+                retained.exhaust();
+                return Ok(None);
+            };
+            let service = relative.checked_add(1).ok_or(SearchError::ArithmeticOverflow {
+                computation: "retained general primary service",
+            })?;
+            actual.finder_scanned_bytes = actual.finder_scanned_bytes.checked_add(service).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "retained general primary service bytes",
+                },
+            )?;
+            let anchor = scan.checked_add(relative).ok_or(SearchError::ArithmeticOverflow {
+                computation: "retained general primary anchor",
+            })?;
+            let start = anchor.checked_sub(primary_offset).ok_or(
+                SearchError::InternalInvariant("retained general primary preceded its offset"),
+            )?;
+            actual.anchor_candidates = actual.anchor_candidates.checked_add(1).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "retained general primary candidates",
+                },
+            )?;
+            match self
+                .general_primary_outcome(
+                    haystack,
+                    start,
+                    primary_offset,
+                    fallback,
+                    fallback_offset,
+                    &mut actual.predicate_checks,
+                )
+                .map_err(|error| search_error_from_reduce(&error))?
+            {
+                GeneralPrimaryOutcome::Match => {
+                    let end = start.checked_add(self.width).ok_or(
+                        SearchError::ArithmeticOverflow {
+                            computation: "retained general primary match end",
+                        },
+                    )?;
+                    actual.match_events = actual.match_events.checked_add(1).ok_or(
+                        SearchError::ArithmeticOverflow {
+                            computation: "retained general primary match events",
+                        },
+                    )?;
+                    retained.phase = RetainedSearchPhase::Primary;
+                    retained.retain_match(end);
+                    return Ok(Some((start, end)));
+                }
+                GeneralPrimaryOutcome::FallbackRejected => {
+                    residual_rejections = 0;
+                    if fallback_rejections == 0 {
+                        fallback_burst_start = anchor;
+                    }
+                    fallback_rejections = fallback_rejections.checked_add(1).ok_or(
+                        SearchError::ArithmeticOverflow {
+                            computation: "retained general primary fallback rejection burst",
+                        },
+                    )?;
+                }
+                GeneralPrimaryOutcome::ResidualRejected => {
+                    fallback_rejections = 0;
+                    if residual_rejections == 0 {
+                        residual_burst_start = anchor;
+                    }
+                    residual_rejections = residual_rejections.checked_add(1).ok_or(
+                        SearchError::ArithmeticOverflow {
+                            computation: "retained general primary residual rejection burst",
+                        },
+                    )?;
+                }
+            }
+            scan = anchor.checked_add(1).ok_or(SearchError::ArithmeticOverflow {
+                computation: "retained general primary rejected restart",
+            })?;
+            let first_untested_start = scan.checked_sub(primary_offset).ok_or(
+                SearchError::InternalInvariant("retained general primary handoff preceded cursor"),
+            )?;
+            if fallback_rejections == ADAPTIVE_FALLBACK_REJECTIONS {
+                if dense_rejection_burst(
+                    fallback_burst_start,
+                    anchor,
+                    fallback_rejections,
+                )
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "retained general primary fallback rejection density",
+                })? {
+                    retained.phase = RetainedSearchPhase::CandidateStream;
+                    retained.block = CandidateStreamBlock::default();
+                    return self.execute_retained_candidate_stream_from(
+                        haystack,
+                        window,
+                        first_untested_start,
+                        retained,
+                        actual,
+                    );
+                }
+                fallback_rejections = 0;
+            }
+            if residual_rejections == ADAPTIVE_FALLBACK_REJECTIONS {
+                if dense_rejection_burst(
+                    residual_burst_start,
+                    anchor,
+                    residual_rejections,
+                )
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "retained general primary residual rejection density",
+                })? {
+                    retained.phase = RetainedSearchPhase::ShiftAnd;
+                    retained.block = CandidateStreamBlock::default();
+                    return self.execute_retained_shift_and_from(
+                        haystack,
+                        window,
+                        first_untested_start,
+                        retained,
+                        actual,
+                    );
+                }
+                residual_rejections = 0;
+            }
+        }
+        retained.exhaust();
+        Ok(None)
     }
 
     #[allow(
@@ -3722,26 +4126,33 @@ impl FixedPredicateWord64Plan {
                         computation: "retained candidate-stream finder calls",
                     })?;
             let service_start = scan;
-            let classified_before = finder.classified_candidate_bytes();
+            let primary_before = finder.primary_classified_bytes();
+            let fallback_before = finder.fallback_classified_bytes();
             let found = match drain_end {
                 Some(end) => finder.find_retained_before(scan, end),
                 None => finder.find(scan),
             };
-            let newly_classified = finder
-                .classified_candidate_bytes()
-                .checked_sub(classified_before)
+            let newly_primary = finder
+                .primary_classified_bytes()
+                .checked_sub(primary_before)
                 .ok_or(SearchError::ArithmeticOverflow {
-                    computation: "retained candidate-stream classification",
+                    computation: "retained candidate-stream primary classification",
+                })?;
+            let newly_fallback = finder
+                .fallback_classified_bytes()
+                .checked_sub(fallback_before)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "retained candidate-stream fallback classification",
                 })?;
             actual.finder_scanned_bytes = actual
                 .finder_scanned_bytes
-                .checked_add(newly_classified)
+                .checked_add(newly_fallback)
                 .ok_or(SearchError::ArithmeticOverflow {
                     computation: "retained fallback-classifier service",
                 })?;
             actual.predicate_checks = actual
                 .predicate_checks
-                .checked_add(newly_classified)
+                .checked_add(newly_primary)
                 .ok_or(SearchError::ArithmeticOverflow {
                     computation: "retained primary-classifier checks",
                 })?;
@@ -3947,7 +4358,216 @@ impl FixedPredicateWord64Plan {
         Ok((matched, actual))
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the reporting general-primary phase keeps its exact ledger beside every handoff"
+    )]
     fn execute_first_general_finder(
+        &self,
+        slice: &[u8],
+        window_start: usize,
+        upper: SearchUpperBounds,
+    ) -> Result<(Option<(usize, usize)>, SearchActualCounters), SearchError> {
+        let Some((primary_offset, [first, second, third])) = self.general_primary_memchr3() else {
+            return self.execute_first_direct_general_finder(slice, window_start, upper);
+        };
+        let fallback = self.adaptive_fallback.as_ref().ok_or(
+            SearchError::InternalInvariant("general primary lost its paired predicate finder"),
+        )?;
+        let fallback_offset = usize::from(fallback.offset);
+        if primary_offset == fallback_offset {
+            return Err(SearchError::InternalInvariant(
+                "general primary duplicated its paired predicate",
+            ));
+        }
+        let mut finder_scanned_bytes = 0_usize;
+        let mut shift_and_transitions = 0_usize;
+        let mut finder_calls = 0_usize;
+        let mut candidate_events = 0_usize;
+        let mut predicate_checks = 0_usize;
+        let anchor_end = slice
+            .len()
+            .checked_sub(self.width)
+            .and_then(|last_start| last_start.checked_add(primary_offset))
+            .and_then(|last_anchor| last_anchor.checked_add(1))
+            .unwrap_or(0);
+        let mut cursor = primary_offset.min(anchor_end);
+        let mut fallback_burst_start = 0_usize;
+        let mut fallback_rejections = 0_usize;
+        let mut residual_burst_start = 0_usize;
+        let mut residual_rejections = 0_usize;
+        let mut matched = None;
+        while cursor < anchor_end {
+            let search = slice.get(cursor..anchor_end).ok_or(
+                SearchError::InternalInvariant("general primary search escaped the input"),
+            )?;
+            finder_calls = finder_calls.checked_add(1).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "general primary finder calls",
+                },
+            )?;
+            let Some(relative) = memchr3(first, second, third, search) else {
+                finder_scanned_bytes = finder_scanned_bytes.checked_add(search.len()).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "general primary terminal finder service",
+                    },
+                )?;
+                break;
+            };
+            let service = relative.checked_add(1).ok_or(SearchError::ArithmeticOverflow {
+                computation: "general primary finder service",
+            })?;
+            finder_scanned_bytes = finder_scanned_bytes.checked_add(service).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "general primary finder service bytes",
+                },
+            )?;
+            let anchor = cursor.checked_add(relative).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "general primary anchor position",
+                },
+            )?;
+            let start = anchor.checked_sub(primary_offset).ok_or(
+                SearchError::InternalInvariant("general primary preceded its fixed offset"),
+            )?;
+            candidate_events = candidate_events.checked_add(1).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "general primary candidate events",
+                },
+            )?;
+            match self
+                .general_primary_outcome(
+                    slice,
+                    start,
+                    primary_offset,
+                    fallback,
+                    fallback_offset,
+                    &mut predicate_checks,
+                )
+                .map_err(|error| search_error_from_reduce(&error))?
+            {
+                GeneralPrimaryOutcome::Match => {
+                    let end = start.checked_add(self.width).ok_or(
+                        SearchError::ArithmeticOverflow {
+                            computation: "general primary match end",
+                        },
+                    )?;
+                    matched = Some((
+                        window_start.checked_add(start).ok_or(
+                            SearchError::ArithmeticOverflow {
+                                computation: "general primary absolute start",
+                            },
+                        )?,
+                        window_start.checked_add(end).ok_or(
+                            SearchError::ArithmeticOverflow {
+                                computation: "general primary absolute end",
+                            },
+                        )?,
+                    ));
+                    break;
+                }
+                GeneralPrimaryOutcome::FallbackRejected => {
+                    residual_rejections = 0;
+                    if fallback_rejections == 0 {
+                        fallback_burst_start = anchor;
+                    }
+                    fallback_rejections = fallback_rejections.checked_add(1).ok_or(
+                        SearchError::ArithmeticOverflow {
+                            computation: "general primary fallback rejection burst",
+                        },
+                    )?;
+                }
+                GeneralPrimaryOutcome::ResidualRejected => {
+                    fallback_rejections = 0;
+                    if residual_rejections == 0 {
+                        residual_burst_start = anchor;
+                    }
+                    residual_rejections = residual_rejections.checked_add(1).ok_or(
+                        SearchError::ArithmeticOverflow {
+                            computation: "general primary residual rejection burst",
+                        },
+                    )?;
+                }
+            }
+            cursor = anchor.checked_add(1).ok_or(SearchError::ArithmeticOverflow {
+                computation: "general primary rejected restart",
+            })?;
+            let first_untested_start = cursor.checked_sub(primary_offset).ok_or(
+                SearchError::InternalInvariant("general primary handoff preceded its cursor"),
+            )?;
+            if fallback_rejections == ADAPTIVE_FALLBACK_REJECTIONS {
+                if dense_rejection_burst(
+                    fallback_burst_start,
+                    anchor,
+                    fallback_rejections,
+                )
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "general primary fallback rejection density",
+                })? {
+                    matched = self.execute_first_adaptive_reporting(
+                        slice,
+                        window_start,
+                        first_untested_start,
+                        &mut finder_scanned_bytes,
+                        &mut shift_and_transitions,
+                        &mut finder_calls,
+                        &mut candidate_events,
+                        &mut predicate_checks,
+                    )?;
+                    break;
+                }
+                fallback_rejections = 0;
+            }
+            if residual_rejections == ADAPTIVE_FALLBACK_REJECTIONS {
+                if dense_rejection_burst(
+                    residual_burst_start,
+                    anchor,
+                    residual_rejections,
+                )
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "general primary residual rejection density",
+                })? {
+                    matched = self.execute_first_shift_and_reporting(
+                        slice,
+                        window_start,
+                        first_untested_start,
+                        &mut shift_and_transitions,
+                    )?;
+                    break;
+                }
+                residual_rejections = 0;
+            }
+        }
+        let match_events = usize::from(matched.is_some());
+        let transitions = finder_scanned_bytes
+            .checked_add(shift_and_transitions)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "general predicate search transitions",
+            })?;
+        let actual = SearchActualCounters {
+            window_bytes: slice.len(),
+            transitions,
+            finder_scanned_bytes,
+            shift_and_transitions,
+            finder_calls,
+            candidate_events,
+            predicate_checks,
+            match_events,
+            work: search_work(
+                finder_scanned_bytes,
+                shift_and_transitions,
+                finder_calls,
+                candidate_events,
+                predicate_checks,
+                match_events,
+            )?,
+            scratch_bytes: 0,
+        };
+        ensure_search_actual_within(actual, upper)?;
+        Ok((matched, actual))
+    }
+
+    fn execute_first_direct_general_finder(
         &self,
         slice: &[u8],
         window_start: usize,
@@ -3977,7 +4597,7 @@ impl FixedPredicateWord64Plan {
         let transitions = finder_scanned_bytes
             .checked_add(shift_and_transitions)
             .ok_or(SearchError::ArithmeticOverflow {
-                computation: "general predicate search transitions",
+                computation: "direct general-predicate search transitions",
             })?;
         let actual = SearchActualCounters {
             window_bytes: slice.len(),
@@ -4232,23 +4852,30 @@ impl FixedPredicateWord64Plan {
                     computation: "adaptive reporting candidate-stream finder calls",
                 })?;
             let service_start = cursor;
-            let classified_before = finder.classified_candidate_bytes();
+            let primary_before = finder.primary_classified_bytes();
+            let fallback_before = finder.fallback_classified_bytes();
             let found = match drain_end {
                 Some(end) => finder.find_retained_before(cursor, end),
                 None => finder.find(cursor),
             };
-            let newly_classified = finder
-                .classified_candidate_bytes()
-                .checked_sub(classified_before)
+            let newly_primary = finder
+                .primary_classified_bytes()
+                .checked_sub(primary_before)
                 .ok_or(SearchError::ArithmeticOverflow {
-                    computation: "adaptive reporting candidate-stream classification",
+                    computation: "adaptive reporting primary classification",
                 })?;
-            *finder_scanned_bytes = finder_scanned_bytes.checked_add(newly_classified).ok_or(
+            let newly_fallback = finder
+                .fallback_classified_bytes()
+                .checked_sub(fallback_before)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "adaptive reporting fallback classification",
+                })?;
+            *finder_scanned_bytes = finder_scanned_bytes.checked_add(newly_fallback).ok_or(
                 SearchError::ArithmeticOverflow {
                     computation: "adaptive reporting fallback-classifier service",
                 },
             )?;
-            *predicate_checks = predicate_checks.checked_add(newly_classified).ok_or(
+            *predicate_checks = predicate_checks.checked_add(newly_primary).ok_or(
                 SearchError::ArithmeticOverflow {
                     computation: "adaptive reporting primary-classifier checks",
                 },
@@ -4802,7 +5429,11 @@ impl FixedPredicateWord64Plan {
     ) -> Result<ReduceActualCounters, ReduceError> {
         if self.primary_finder.is_some() {
             let mut actual = AnchorActual::default();
-            self.scan_adaptive_reporting(haystack, 0, &mut actual)?;
+            if self.general_primary_memchr3().is_some() {
+                self.scan_general_primary_reporting(haystack, &mut actual)?;
+            } else {
+                self.scan_adaptive_reporting(haystack, 0, &mut actual)?;
+            }
             return self.finish_anchor_actual(haystack.len(), upper_bounds, actual);
         }
         match self.anchor {
@@ -4829,7 +5460,11 @@ impl FixedPredicateWord64Plan {
         upper_bounds: ReduceUpperBounds,
     ) -> Option<ValueReduction> {
         let count = if self.primary_finder.is_some() {
-            self.scan_adaptive_fallback_value(haystack, 0)?
+            if self.general_primary_memchr3().is_some() {
+                self.scan_general_primary_value(haystack)?
+            } else {
+                self.scan_adaptive_fallback_value(haystack, 0)?
+            }
         } else {
             match self.anchor {
                 Anchor::One { offset, byte } => self.scan_anchor_value(
@@ -4872,6 +5507,92 @@ impl FixedPredicateWord64Plan {
             if state & self.accepting_bit != 0 {
                 count = count.checked_add(1)?;
                 state = 0;
+            }
+        }
+        Some(count)
+    }
+
+    #[inline]
+    fn scan_general_primary_value(&self, haystack: &[u8]) -> Option<u64> {
+        let (primary_offset, [first, second, third]) = self.general_primary_memchr3()?;
+        let fallback = self.adaptive_fallback.as_ref()?;
+        let fallback_offset = usize::from(fallback.offset);
+        if primary_offset == fallback_offset {
+            return None;
+        }
+        let anchor_end = haystack
+            .len()
+            .checked_sub(self.width)
+            .and_then(|last_start| last_start.checked_add(primary_offset))
+            .and_then(|last_anchor| last_anchor.checked_add(1))
+            .unwrap_or(0);
+        let mut cursor = primary_offset.min(anchor_end);
+        let mut count = 0_u64;
+        let mut fallback_burst_start = 0_usize;
+        let mut fallback_rejections = 0_usize;
+        let mut residual_burst_start = 0_usize;
+        let mut residual_rejections = 0_usize;
+        while cursor < anchor_end {
+            let search = haystack.get(cursor..anchor_end)?;
+            let Some(relative) = memchr3(first, second, third, search) else {
+                break;
+            };
+            let anchor = cursor.checked_add(relative)?;
+            let start = anchor.checked_sub(primary_offset)?;
+            match self.general_primary_outcome_value(
+                haystack,
+                start,
+                primary_offset,
+                fallback,
+                fallback_offset,
+            )? {
+                GeneralPrimaryOutcome::Match => {
+                    count = count.checked_add(1)?;
+                    cursor = anchor.checked_add(self.width)?;
+                    fallback_rejections = 0;
+                    residual_rejections = 0;
+                    continue;
+                }
+                GeneralPrimaryOutcome::FallbackRejected => {
+                    residual_rejections = 0;
+                    if fallback_rejections == 0 {
+                        fallback_burst_start = anchor;
+                    }
+                    fallback_rejections = fallback_rejections.checked_add(1)?;
+                }
+                GeneralPrimaryOutcome::ResidualRejected => {
+                    fallback_rejections = 0;
+                    if residual_rejections == 0 {
+                        residual_burst_start = anchor;
+                    }
+                    residual_rejections = residual_rejections.checked_add(1)?;
+                }
+            }
+            cursor = anchor.checked_add(1)?;
+            let first_untested_start = cursor.checked_sub(primary_offset)?;
+            if fallback_rejections == ADAPTIVE_FALLBACK_REJECTIONS {
+                if dense_rejection_burst(
+                    fallback_burst_start,
+                    anchor,
+                    fallback_rejections,
+                )? {
+                    return count.checked_add(
+                        self.scan_adaptive_fallback_value(haystack, first_untested_start)?,
+                    );
+                }
+                fallback_rejections = 0;
+            }
+            if residual_rejections == ADAPTIVE_FALLBACK_REJECTIONS {
+                if dense_rejection_burst(
+                    residual_burst_start,
+                    anchor,
+                    residual_rejections,
+                )? {
+                    return count.checked_add(
+                        self.scan_shift_and_value(haystack.get(first_untested_start..)?)?,
+                    );
+                }
+                residual_rejections = 0;
             }
         }
         Some(count)
@@ -5046,6 +5767,31 @@ impl FixedPredicateWord64Plan {
     }
 
     #[inline]
+    fn general_primary_outcome_value(
+        &self,
+        haystack: &[u8],
+        start: usize,
+        primary_offset: usize,
+        fallback: &AdaptiveFallback,
+        fallback_offset: usize,
+    ) -> Option<GeneralPrimaryOutcome> {
+        let fallback_byte = *haystack.get(start.checked_add(fallback_offset)?)?;
+        if !fallback.matches(fallback_byte) {
+            return Some(GeneralPrimaryOutcome::FallbackRejected);
+        }
+        if self.candidate_matches_value_skipping_pair(
+            haystack,
+            start,
+            primary_offset,
+            fallback_offset,
+        )? {
+            Some(GeneralPrimaryOutcome::Match)
+        } else {
+            Some(GeneralPrimaryOutcome::ResidualRejected)
+        }
+    }
+
+    #[inline]
     fn anchor_candidate_matches_value(
         &self,
         haystack: &[u8],
@@ -5183,6 +5929,165 @@ impl FixedPredicateWord64Plan {
     ) -> Result<ReduceActualCounters, ReduceError> {
         let actual = self.scan_anchor(haystack, anchor_offset, find)?;
         self.finish_anchor_actual(haystack.len(), upper_bounds, actual)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the general primary reducer keeps outcome-typed one-way handoffs in one closed ledger"
+    )]
+    fn scan_general_primary_reporting(
+        &self,
+        haystack: &[u8],
+        actual: &mut AnchorActual,
+    ) -> Result<(), ReduceError> {
+        let (primary_offset, [first, second, third]) = self.general_primary_memchr3().ok_or(
+            ReduceError::InternalInvariant("general reducer lost its three-byte primary"),
+        )?;
+        let fallback = self.adaptive_fallback.as_ref().ok_or(
+            ReduceError::InternalInvariant("general reducer lost its paired predicate finder"),
+        )?;
+        let fallback_offset = usize::from(fallback.offset);
+        if primary_offset == fallback_offset {
+            return Err(ReduceError::InternalInvariant(
+                "general reducer duplicated its paired predicate",
+            ));
+        }
+        let anchor_end = haystack
+            .len()
+            .checked_sub(self.width)
+            .and_then(|last_start| last_start.checked_add(primary_offset))
+            .and_then(|last_anchor| last_anchor.checked_add(1))
+            .unwrap_or(0);
+        let mut cursor = primary_offset.min(anchor_end);
+        let mut fallback_burst_start = 0_usize;
+        let mut fallback_rejections = 0_usize;
+        let mut residual_burst_start = 0_usize;
+        let mut residual_rejections = 0_usize;
+        while cursor < anchor_end {
+            let search = haystack
+                .get(cursor..anchor_end)
+                .ok_or(ReduceError::InternalInvariant(
+                    "general reducer primary escaped the input",
+                ))?;
+            actual.finder_calls = actual.finder_calls.checked_add(1).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "general reducer primary finder calls",
+                },
+            )?;
+            let Some(relative) = memchr3(first, second, third, search) else {
+                actual.finder_scanned_bytes = actual
+                    .finder_scanned_bytes
+                    .checked_add(search.len())
+                    .ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "general reducer terminal finder service",
+                    })?;
+                break;
+            };
+            let service = relative.checked_add(1).ok_or(ReduceError::ArithmeticOverflow {
+                computation: "general reducer primary finder service",
+            })?;
+            actual.finder_scanned_bytes = actual.finder_scanned_bytes.checked_add(service).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "general reducer primary service bytes",
+                },
+            )?;
+            let anchor = cursor.checked_add(relative).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "general reducer primary anchor",
+                },
+            )?;
+            let start = anchor.checked_sub(primary_offset).ok_or(
+                ReduceError::InternalInvariant("general reducer primary preceded its offset"),
+            )?;
+            actual.anchor_candidates = actual.anchor_candidates.checked_add(1).ok_or(
+                ReduceError::ArithmeticOverflow {
+                    computation: "general reducer primary candidates",
+                },
+            )?;
+            match self.general_primary_outcome(
+                haystack,
+                start,
+                primary_offset,
+                fallback,
+                fallback_offset,
+                &mut actual.predicate_checks,
+            )? {
+                GeneralPrimaryOutcome::Match => {
+                    actual.match_events = actual.match_events.checked_add(1).ok_or(
+                        ReduceError::ArithmeticOverflow {
+                            computation: "general reducer primary match events",
+                        },
+                    )?;
+                    cursor = anchor.checked_add(self.width).ok_or(
+                        ReduceError::ArithmeticOverflow {
+                            computation: "general reducer accepted restart",
+                        },
+                    )?;
+                    fallback_rejections = 0;
+                    residual_rejections = 0;
+                    continue;
+                }
+                GeneralPrimaryOutcome::FallbackRejected => {
+                    residual_rejections = 0;
+                    if fallback_rejections == 0 {
+                        fallback_burst_start = anchor;
+                    }
+                    fallback_rejections = fallback_rejections.checked_add(1).ok_or(
+                        ReduceError::ArithmeticOverflow {
+                            computation: "general reducer fallback rejection burst",
+                        },
+                    )?;
+                }
+                GeneralPrimaryOutcome::ResidualRejected => {
+                    fallback_rejections = 0;
+                    if residual_rejections == 0 {
+                        residual_burst_start = anchor;
+                    }
+                    residual_rejections = residual_rejections.checked_add(1).ok_or(
+                        ReduceError::ArithmeticOverflow {
+                            computation: "general reducer residual rejection burst",
+                        },
+                    )?;
+                }
+            }
+            cursor = anchor.checked_add(1).ok_or(ReduceError::ArithmeticOverflow {
+                computation: "general reducer rejected restart",
+            })?;
+            let first_untested_start = cursor.checked_sub(primary_offset).ok_or(
+                ReduceError::InternalInvariant("general reducer handoff preceded its cursor"),
+            )?;
+            if fallback_rejections == ADAPTIVE_FALLBACK_REJECTIONS {
+                if dense_rejection_burst(
+                    fallback_burst_start,
+                    anchor,
+                    fallback_rejections,
+                )
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "general reducer fallback rejection density",
+                })? {
+                    return self.scan_adaptive_reporting(haystack, first_untested_start, actual);
+                }
+                fallback_rejections = 0;
+            }
+            if residual_rejections == ADAPTIVE_FALLBACK_REJECTIONS {
+                if dense_rejection_burst(
+                    residual_burst_start,
+                    anchor,
+                    residual_rejections,
+                )
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "general reducer residual rejection density",
+                })? {
+                    return self.scan_shift_and_reporting_suffix(
+                        haystack,
+                        first_untested_start,
+                        actual,
+                    );
+                }
+                residual_rejections = 0;
+            }
+        }
+        Ok(())
     }
 
     fn scan_anchor(
@@ -5358,26 +6263,33 @@ impl FixedPredicateWord64Plan {
                         computation: "adaptive reducer candidate-stream finder calls",
                     })?;
             let service_start = cursor;
-            let classified_before = finder.classified_candidate_bytes();
+            let primary_before = finder.primary_classified_bytes();
+            let fallback_before = finder.fallback_classified_bytes();
             let found = match drain_end {
                 Some(end) => finder.find_retained_before(cursor, end),
                 None => finder.find(cursor),
             };
-            let newly_classified = finder
-                .classified_candidate_bytes()
-                .checked_sub(classified_before)
+            let newly_primary = finder
+                .primary_classified_bytes()
+                .checked_sub(primary_before)
                 .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "adaptive reducer candidate-stream classification",
+                    computation: "adaptive reducer primary classification",
+                })?;
+            let newly_fallback = finder
+                .fallback_classified_bytes()
+                .checked_sub(fallback_before)
+                .ok_or(ReduceError::ArithmeticOverflow {
+                    computation: "adaptive reducer fallback classification",
                 })?;
             actual.finder_scanned_bytes = actual
                 .finder_scanned_bytes
-                .checked_add(newly_classified)
+                .checked_add(newly_fallback)
                 .ok_or(ReduceError::ArithmeticOverflow {
                     computation: "adaptive reducer fallback-classifier service",
                 })?;
             actual.predicate_checks = actual
                 .predicate_checks
-                .checked_add(newly_classified)
+                .checked_add(newly_primary)
                 .ok_or(ReduceError::ArithmeticOverflow {
                     computation: "adaptive reducer primary-classifier checks",
                 })?;
@@ -5712,6 +6624,44 @@ impl FixedPredicateWord64Plan {
             }
         }
         Ok(true)
+    }
+
+    fn general_primary_outcome(
+        &self,
+        haystack: &[u8],
+        start: usize,
+        primary_offset: usize,
+        fallback: &AdaptiveFallback,
+        fallback_offset: usize,
+        predicate_checks: &mut usize,
+    ) -> Result<GeneralPrimaryOutcome, ReduceError> {
+        let fallback_position = start.checked_add(fallback_offset).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "general primary fallback position",
+            },
+        )?;
+        let fallback_byte = *haystack.get(fallback_position).ok_or(
+            ReduceError::InternalInvariant("general primary fallback escaped the input"),
+        )?;
+        *predicate_checks = predicate_checks.checked_add(1).ok_or(
+            ReduceError::ArithmeticOverflow {
+                computation: "general primary fallback predicate checks",
+            },
+        )?;
+        if !fallback.matches(fallback_byte) {
+            return Ok(GeneralPrimaryOutcome::FallbackRejected);
+        }
+        if self.candidate_matches_skipping_pair(
+            haystack,
+            start,
+            primary_offset,
+            fallback_offset,
+            predicate_checks,
+        )? {
+            Ok(GeneralPrimaryOutcome::Match)
+        } else {
+            Ok(GeneralPrimaryOutcome::ResidualRejected)
+        }
     }
 
     fn anchor_candidate_position_matches_bit(
@@ -7500,25 +8450,41 @@ mod tests {
     }
 
     #[test]
-    fn general_pair_cardinality_boundary_preserves_raw_shift_and_incumbent() {
+    fn general_pair_cardinality_boundary_selects_staged_and_direct_kernel_routes() {
         const SELECTIVE: &[(u8, u8)] = &[(b'a', b'c')];
+        const FOUR: &[(u8, u8)] = &[(0, 3)];
         const AT_LIMIT: &[(u8, u8)] = &[(0, 63)];
         const OVER_LIMIT: &[(u8, u8)] = &[(0, 64)];
         const BROAD: &[(u8, u8)] = &[(0, 0x7e)];
         const FULL: &[(u8, u8)] = &[(0, 0xff)];
         let admitted =
-            FixedPredicateWord64Plan::build(&[AT_LIMIT, AT_LIMIT], BuildLimits::unlimited())
+            FixedPredicateWord64Plan::build(&[SELECTIVE, AT_LIMIT], BuildLimits::unlimited())
                 .unwrap();
-        assert!(
+        assert_eq!(
             admitted
                 .operation_identity(Operation::Count)
                 .primary_finder
-                .is_some()
+                .unwrap()
+                .kind,
+            AdaptiveFinderKind::Three
         );
+
+        for predicates in [&[FOUR, FOUR][..], &[AT_LIMIT, AT_LIMIT][..]] {
+            let plan =
+                FixedPredicateWord64Plan::build(predicates, BuildLimits::unlimited()).unwrap();
+            let identity = plan.operation_identity(Operation::Count);
+            assert_eq!(identity.reducer, Reducer::ShiftAnd);
+            assert_ne!(identity.primary_finder.unwrap().kind, AdaptiveFinderKind::Three);
+            assert!(matches!(
+                identity.adaptive_handoff,
+                AdaptiveHandoffIdentity::Finder { .. }
+            ));
+        }
 
         for predicates in [
             &[SELECTIVE, FULL][..],
-            &[AT_LIMIT, OVER_LIMIT][..],
+            &[SELECTIVE, OVER_LIMIT][..],
+            &[OVER_LIMIT, OVER_LIMIT][..],
             &[BROAD, BROAD][..],
         ] {
             let plan =
@@ -7528,6 +8494,70 @@ mod tests {
             assert_eq!(identity.primary_finder, None);
             assert_eq!(identity.adaptive_handoff, AdaptiveHandoffIdentity::Disabled);
         }
+    }
+
+    #[test]
+    fn direct_general_pair_covers_search_retained_and_aggregate_surfaces() {
+        const LEFT: &[(u8, u8)] = &[(1, 1), (3, 3), (5, 5), (7, 7)];
+        const RIGHT: &[(u8, u8)] = &[(2, 2), (4, 4), (6, 6), (8, 8)];
+        let predicates = [LEFT, RIGHT];
+        let plan = FixedPredicateWord64Plan::build(&predicates, BuildLimits::unlimited()).unwrap();
+        let identity = plan.operation_identity(Operation::Count);
+        assert_eq!(identity.reducer, Reducer::ShiftAnd);
+        assert_eq!(
+            identity.primary_finder.unwrap().kind,
+            AdaptiveFinderKind::Four
+        );
+        assert!(matches!(
+            identity.adaptive_handoff,
+            AdaptiveHandoffIdentity::Finder { .. }
+        ));
+
+        let haystack = [9_u8, 1, 2, 3, 4, 9, 5, 6, 7, 8];
+        assert_search_case(&plan, &predicates, &haystack, Window::full(&haystack));
+
+        let mut retained = plan.search_cursor(&haystack);
+        let (first, first_accounting) = retained
+            .find_window(Window::full(&haystack), SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(first, Some((1, 3)));
+        assert!(first_accounting.actual.finder_scanned_bytes > 0);
+        assert_eq!(retained.phase, RetainedSearchPhase::CandidateStream);
+        assert_eq!(
+            retained
+                .find_window(
+                    Window::new(3, haystack.len()),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .0,
+            Some((3, 5))
+        );
+
+        let count = plan
+            .count(&haystack, ReduceLimits::unlimited())
+            .unwrap();
+        assert_eq!(count.count, 4);
+        assert_eq!(
+            plan.count_value_success(&haystack, ReduceLimits::unlimited()),
+            Some(4)
+        );
+        let span = plan
+            .span_sum(&haystack, ReduceLimits::unlimited())
+            .unwrap();
+        assert_eq!(span.span_sum, 8);
+        assert_eq!(
+            plan.span_sum_value_success(&haystack, ReduceLimits::unlimited()),
+            Some(8)
+        );
+        assert!(actual_within_upper(
+            count.accounting.actual,
+            count.accounting.upper_bounds
+        ));
+        assert!(actual_within_upper(
+            span.accounting.actual,
+            span.accounting.upper_bounds
+        ));
     }
 
     #[test]
@@ -7621,12 +8651,10 @@ mod tests {
     }
 
     #[test]
-    fn candidate_stream_wide_remainders_cover_two_set_search_surfaces() {
+    fn candidate_stream_wide_remainders_cover_general_pair_search_surfaces() {
         const LEFT: &[(u8, u8)] = &[
             (1, 1),
-            (17, 17),
             (65, 65),
-            (129, 129),
             (255, 255),
         ];
         const RIGHT: &[(u8, u8)] = &[
@@ -7641,7 +8669,7 @@ mod tests {
         let plan = FixedPredicateWord64Plan::build(&predicates, BuildLimits::unlimited()).unwrap();
         let primary = plan.primary_finder.as_ref().unwrap();
         let fallback = plan.adaptive_fallback.as_ref().unwrap();
-        assert!(matches!(primary.finder, AdaptiveFinder::Set(_)));
+        assert!(matches!(primary.finder, AdaptiveFinder::Three(1, 65, 255)));
         assert!(matches!(fallback.finder, AdaptiveFinder::Set(_)));
         if primary.candidate_block_bytes() != BYTE_SET_WIDE_BLOCK_BYTES
             || fallback.candidate_block_bytes() != BYTE_SET_WIDE_BLOCK_BYTES
@@ -7697,7 +8725,11 @@ mod tests {
                         Some(candidate_positions - 1),
                         "stream candidate_positions={candidate_positions}, window_start={window_start}"
                     );
-                    assert_eq!(stream.classified_candidate_bytes(), candidate_positions);
+                    assert_eq!(stream.primary_classified_bytes(), candidate_positions);
+                    assert_eq!(
+                        stream.fallback_classified_bytes(),
+                        remainder - BYTE_SET_BLOCK_BYTES
+                    );
                     assert_eq!(
                         stream.classified_chunks(),
                         if candidate_positions < BYTE_SET_WIDE_BLOCK_BYTES {
@@ -7729,7 +8761,8 @@ mod tests {
         for position in 0..block_bytes {
             assert_eq!(stream.find(position), Some(position));
             assert_eq!(stream.classified_chunks(), 1);
-            assert_eq!(stream.classified_candidate_bytes(), block_bytes);
+            assert_eq!(stream.primary_classified_bytes(), block_bytes);
+            assert_eq!(stream.fallback_classified_bytes(), block_bytes);
         }
         for position in (block_bytes..legal_start_end).step_by(7) {
             let prior_end = stream.block.end;
@@ -7742,6 +8775,47 @@ mod tests {
             };
             assert_eq!(stream.classified_chunks(), expected_chunks);
         }
+    }
+
+    #[test]
+    fn candidate_stream_skips_fallback_classification_for_empty_primary_blocks() {
+        let primary = PrimaryPredicate::Exact(Anchor::One {
+            offset: 0,
+            byte: b'A',
+        });
+        let fallback = AdaptiveFallback {
+            offset: 1,
+            cardinality: 4,
+            finder: AdaptiveFinder::Four([b'A', b'B', b'C', b'D']),
+        };
+        let bytes = [b'z'; 96];
+        let legal_start_end = 80;
+        let mut stream = CandidateStreamCursor::new(primary, &fallback, &bytes, legal_start_end);
+        assert_eq!(stream.find(0), None);
+        assert_eq!(stream.primary_classified_bytes(), legal_start_end);
+        assert_eq!(stream.fallback_classified_bytes(), 0);
+    }
+
+    #[test]
+    fn absent_general_primary_uses_one_memchr3_service() {
+        const SMALL: &[(u8, u8)] = &[(0, 2)];
+        let predicates = [SMALL, SMALL];
+        let plan = FixedPredicateWord64Plan::build(&predicates, BuildLimits::unlimited()).unwrap();
+        assert!(plan.primary_finder.is_some());
+        let haystack = [0xff; 64];
+        let (matched, accounting) = plan
+            .find_window(
+                &haystack,
+                Window::new(0, haystack.len()),
+                SearchLimits::unlimited(),
+            )
+            .unwrap();
+        assert_eq!(matched, None);
+        assert_eq!(accounting.actual.finder_scanned_bytes, 63);
+        assert_eq!(accounting.actual.predicate_checks, 0);
+        assert_eq!(accounting.actual.transitions, 63);
+        assert_eq!(accounting.actual.finder_calls, 1);
+        assert!(accounting.actual.work <= accounting.upper_bounds.work);
     }
 
     #[test]
@@ -7811,7 +8885,7 @@ mod tests {
 
         let mut haystack = Vec::new();
         for _ in 0..ADAPTIVE_FALLBACK_REJECTIONS {
-            haystack.extend_from_slice(&[b'A', 0xff, b'Q']);
+            haystack.extend_from_slice(&[0xff, b'!', b'Q']);
         }
         for _ in 0..64 {
             haystack.extend_from_slice(b"A!Q");
@@ -8006,7 +9080,7 @@ mod tests {
         const FALLBACK: &[(u8, u8)] = &[(b'A', b'Z')];
         const VERIFY: &[(u8, u8)] = &[(0, 0x7f)];
         const PRIMARY: &[(u8, u8)] = &[(b'Q', b'S')];
-        const DRAIN_BOUNDARY: usize = 32;
+        const DRAIN_BOUNDARY: usize = 54;
         let predicates = [FALLBACK, VERIFY, PRIMARY];
         let plan = FixedPredicateWord64Plan::build(&predicates, BuildLimits::unlimited()).unwrap();
         assert_eq!(
@@ -8021,7 +9095,10 @@ mod tests {
 
         for target in [DRAIN_BOUNDARY - 1, DRAIN_BOUNDARY, DRAIN_BOUNDARY + 1] {
             let mut haystack = Vec::new();
-            for _ in 0..2 * ADAPTIVE_FALLBACK_REJECTIONS {
+            for _ in 0..ADAPTIVE_FALLBACK_REJECTIONS {
+                haystack.extend_from_slice(&[0xff, b'!', b'Q']);
+            }
+            for _ in 0..ADAPTIVE_FALLBACK_REJECTIONS {
                 haystack.extend_from_slice(&[b'A', 0xff, b'Q']);
             }
             haystack.resize(96, b'z');
@@ -8112,6 +9189,9 @@ mod tests {
         );
         let mut haystack = Vec::new();
         for _ in 0..ADAPTIVE_FALLBACK_REJECTIONS {
+            haystack.extend_from_slice(&[0xff, b'!', b'Q']);
+        }
+        for _ in 0..ADAPTIVE_FALLBACK_REJECTIONS {
             haystack.extend_from_slice(&[b'A', 0xff, b'Q']);
         }
         for _ in 0..64 {
@@ -8123,7 +9203,7 @@ mod tests {
             .find_window(&haystack, full, SearchLimits::unlimited())
             .unwrap();
         let expected_first = expected_first.unwrap();
-        assert_eq!(expected_first, (24, 27));
+        assert_eq!(expected_first, (48, 51));
         assert!(search_baseline.actual.finder_scanned_bytes > 0);
         let search_upper = search_baseline.upper_bounds;
         let exact_search = SearchLimits {
@@ -8226,7 +9306,7 @@ mod tests {
             "a late failure must not consume a live retained block"
         );
         let (second, second_accounting) = retained.find_window(next_window, exact_next).unwrap();
-        assert_eq!(second, Some((27, 30)));
+        assert_eq!(second, Some((51, 54)));
         assert_eq!(
             second_accounting.actual.finder_scanned_bytes, 0,
             "recovery after refusal must reuse the still-live two-mask block"
@@ -8518,8 +9598,13 @@ mod tests {
     }
 
     #[test]
-    fn general_pair_accounts_two_arbitrary_set_classifiers_transactionally() {
-        const LEFT: &[(u8, u8)] = &[
+    fn general_pair_accounts_staged_and_direct_set_classifiers_transactionally() {
+        const THREE_LEFT: &[(u8, u8)] = &[
+            (1, 1),
+            (65, 65),
+            (255, 255),
+        ];
+        const SET_LEFT: &[(u8, u8)] = &[
             (1, 1),
             (17, 17),
             (65, 65),
@@ -8534,56 +9619,56 @@ mod tests {
             (200, 200),
             (254, 254),
         ];
-        let positions = [LEFT, RIGHT];
-        let baseline =
-            FixedPredicateWord64Plan::build(&positions, BuildLimits::unlimited()).unwrap();
-        let accounting = baseline.build_accounting();
-        assert_eq!(
-            baseline.operation_identity(Operation::Count).reducer,
-            Reducer::ShiftAnd
-        );
-        assert!(
-            baseline
-                .operation_identity(Operation::Count)
-                .primary_finder
-                .is_some()
-        );
-        assert_eq!(
-            accounting.adaptive_classifier_build_work,
-            BYTE_SET_CLASSIFIER_BUILD_WORK * 2
-        );
-        let exact = FixedPredicateWord64Plan::build_attempt(
-            &positions,
-            BuildLimits {
-                max_build_work: accounting.work_upper_bound,
-                ..BuildLimits::unlimited()
-            },
-        )
-        .unwrap();
-        assert!(exact.closes());
-        assert_eq!(
-            exact.plan()
-                .build_accounting()
-                .adaptive_classifier_build_work,
-            BYTE_SET_CLASSIFIER_BUILD_WORK * 2
-        );
+        for (left, primary_kind, classifier_count) in [
+            (THREE_LEFT, AdaptiveFinderKind::Three, 1_usize),
+            (SET_LEFT, AdaptiveFinderKind::Set, 2_usize),
+        ] {
+            let positions = [left, RIGHT];
+            let baseline =
+                FixedPredicateWord64Plan::build(&positions, BuildLimits::unlimited()).unwrap();
+            let accounting = baseline.build_accounting();
+            let identity = baseline.operation_identity(Operation::Count);
+            assert_eq!(identity.reducer, Reducer::ShiftAnd);
+            assert_eq!(identity.primary_finder.unwrap().kind, primary_kind);
+            let expected_classifier_work = BYTE_SET_CLASSIFIER_BUILD_WORK * classifier_count;
+            assert_eq!(
+                accounting.adaptive_classifier_build_work,
+                expected_classifier_work
+            );
+            let exact = FixedPredicateWord64Plan::build_attempt(
+                &positions,
+                BuildLimits {
+                    max_build_work: accounting.work_upper_bound,
+                    ..BuildLimits::unlimited()
+                },
+            )
+            .unwrap();
+            assert!(exact.closes());
+            assert_eq!(
+                exact
+                    .plan()
+                    .build_accounting()
+                    .adaptive_classifier_build_work,
+                expected_classifier_work
+            );
 
-        let one_below = accounting.work_upper_bound.checked_sub(1).unwrap();
-        let refused = FixedPredicateWord64Plan::build_attempt(
-            &positions,
-            BuildLimits {
-                max_build_work: one_below,
-                ..BuildLimits::unlimited()
-            },
-        )
-        .unwrap_err();
-        assert!(matches!(
-            refused.source(),
-            BuildError::WorkLimit { needed, limit }
-                if *needed == accounting.work_upper_bound && *limit == one_below
-        ));
-        assert!(refused.closes());
-        assert_eq!(refused.receipt().actual(), BuildAttemptActual::default());
+            let one_below = accounting.work_upper_bound.checked_sub(1).unwrap();
+            let refused = FixedPredicateWord64Plan::build_attempt(
+                &positions,
+                BuildLimits {
+                    max_build_work: one_below,
+                    ..BuildLimits::unlimited()
+                },
+            )
+            .unwrap_err();
+            assert!(matches!(
+                refused.source(),
+                BuildError::WorkLimit { needed, limit }
+                    if *needed == accounting.work_upper_bound && *limit == one_below
+            ));
+            assert!(refused.closes());
+            assert_eq!(refused.receipt().actual(), BuildAttemptActual::default());
+        }
     }
 
     #[test]

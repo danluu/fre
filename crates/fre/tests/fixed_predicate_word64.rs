@@ -4,9 +4,9 @@ use fre::{
     AggregateBuildAccounting, AggregateBuildError, AggregateBuildLimits, AggregateBuilder,
     AggregateExecutionDetails, AggregateExecutionSource, AggregateOperation, AggregatePlanIdentity,
     AggregatePlanKind, AggregatePlanSelection, AggregateRunLimits, AggregateStrategy,
-    FixedPredicateWord64MatchSelection, FixedPredicateWord64MatchSemantics,
-    FixedPredicateWord64Operation, FixedPredicateWord64ReduceError, FixedPredicateWord64Reducer,
-    RustProfile,
+    FixedPredicateWord64AdaptiveFinderKind, FixedPredicateWord64MatchSelection,
+    FixedPredicateWord64MatchSemantics, FixedPredicateWord64Operation,
+    FixedPredicateWord64ReduceError, FixedPredicateWord64Reducer, RustProfile,
 };
 
 const PATTERN: &str = "Sherlock Holmes";
@@ -160,6 +160,10 @@ fn exact_repeated_ascii_classes_select_one_retained_predicate_word() {
     };
     assert_eq!(identity.width, 20);
     assert_eq!(identity.reducer, FixedPredicateWord64Reducer::ShiftAnd);
+    assert_ne!(
+        identity.primary_finder.unwrap().kind,
+        FixedPredicateWord64AdaptiveFinderKind::Three
+    );
     assert_eq!(
         count
             .count_value(haystack, AggregateRunLimits::default())
