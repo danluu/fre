@@ -3930,6 +3930,44 @@ impl CompiledProgram {
         }
     }
 
+    /// Execute an optimizing search after the exclusive runtime boundary has
+    /// validated the raw window and authenticated its permanently owned
+    /// program/workspace pair.
+    ///
+    /// Only the retained-partial branch consumes that stronger contract. It
+    /// enters the existing private partial executor directly, avoiding a
+    /// second window, workspace-identity, engine, and sidecar validation. All
+    /// other engines and bypasses deliberately retain the ordinary checked
+    /// entry, keeping their code placement and failure behavior unchanged.
+    ///
+    /// # Contract
+    ///
+    /// `window` must satisfy `start <= end <= haystack.len()`, and `workspace`
+    /// must be the live workspace prepared for this semantic program. The
+    /// exclusive owner must prevent either value from being replaced during
+    /// the call.
+    #[doc(hidden)]
+    #[inline]
+    pub fn search_exclusive_optimized_with_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+    ) -> Result<MatchResult, CompileError> {
+        debug_assert!(window.start <= window.end && window.end <= haystack.len());
+        debug_assert!(workspace.identity.compatible(&self.identity));
+        if window.end.saturating_sub(window.start) >= PARTIAL_DFA_MIN_INPUT_BYTES
+            && workspace.has_retained_partial_workspace()
+            && let Some(partial) = self.partial_dfa()
+        {
+            debug_assert!(self.context_dfa.is_none());
+            debug_assert!(matches!(self.engine, ProgramEngine::OrderedNfa));
+            workspace.mark_dynamic_native_rows_dirty();
+            return self.search_nfa_with_partial_entry(partial, haystack, window, workspace);
+        }
+        self.search_with_workspace(haystack, window, workspace)
+    }
+
     /// Decide whether a prepared native entry should attempt authenticated
     /// retained rows for this input length.
     ///
@@ -13738,6 +13776,86 @@ mod tests {
                 .unwrap();
             assert_eq!(after.cache_identity(), cache_identity, "{output:?}");
             assert_eq!(after.state_count(), state_count, "{output:?}");
+        }
+    }
+
+    #[test]
+    fn exclusive_optimized_entry_matches_checked_retained_policy_for_every_output() {
+        let pattern = r"a+Q|[b-c][a-b]{1,5}(?:x+|y+)";
+        let limits = DeterminizeLimits {
+            max_states: 8,
+            ..DeterminizeLimits::default()
+        };
+        let mut haystack = vec![b'x'; PARTIAL_DFA_MIN_INPUT_BYTES];
+        haystack.extend_from_slice(b"cbbbbx");
+        let window = SearchWindow::full(&haystack);
+
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let compiled = program(pattern, output, CompileMode::Optimizing, limits);
+            assert!(compiled.partial_dfa().is_some(), "{output:?}");
+            let reference = program(
+                pattern,
+                output,
+                CompileMode::Fast,
+                DeterminizeLimits::default(),
+            );
+            let mut checked_workspace = compiled.prepare_workspace().unwrap();
+            let mut exclusive_workspace = compiled.prepare_workspace().unwrap();
+            let mut reference_workspace = reference.prepare_workspace().unwrap();
+            let expected = reference
+                .search_with_workspace(&haystack, window, &mut reference_workspace)
+                .unwrap();
+
+            assert_eq!(
+                compiled
+                    .search_optimized_with_workspace(
+                        &haystack,
+                        window,
+                        &mut checked_workspace,
+                    )
+                    .unwrap(),
+                expected,
+                "checked {output:?}"
+            );
+            assert_eq!(
+                compiled
+                    .search_exclusive_optimized_with_workspace(
+                        &haystack,
+                        window,
+                        &mut exclusive_workspace,
+                    )
+                    .unwrap(),
+                expected,
+                "exclusive {output:?}"
+            );
+
+            let checked = checked_workspace.partial.as_deref().unwrap().state;
+            let exclusive = exclusive_workspace.partial.as_deref().unwrap().state;
+            assert_eq!(exclusive.resumed, checked.resumed, "{output:?}");
+            assert_eq!(
+                exclusive.reverse_recovered, checked.reverse_recovered,
+                "{output:?}"
+            );
+            assert_eq!(
+                exclusive.forward_start_certified, checked.forward_start_certified,
+                "{output:?}"
+            );
+            assert_eq!(
+                exclusive.complete_accelerated, checked.complete_accelerated,
+                "{output:?}"
+            );
+            assert_eq!(
+                exclusive.consecutive_fallbacks, checked.consecutive_fallbacks,
+                "{output:?}"
+            );
+            assert_eq!(
+                exclusive.bypass_remaining, checked.bypass_remaining,
+                "{output:?}"
+            );
         }
     }
 

@@ -410,6 +410,19 @@ impl PreparedAotRegex {
             .search_optimized_with_workspace(haystack, window, &mut self.workspace)
     }
 
+    #[inline]
+    fn search_exclusive(
+        &mut self,
+        haystack: &[u8],
+        window: SearchWindow,
+    ) -> Result<MatchResult, CompileError> {
+        self.program.search_exclusive_optimized_with_workspace(
+            haystack,
+            window,
+            &mut self.workspace,
+        )
+    }
+
     fn search_from_retained_partial_resume(
         &mut self,
         haystack: &[u8],
@@ -1136,7 +1149,8 @@ fn search_exclusive_with_dynamic_rows_outcome(
                 prepared.observe_dynamic_native_rows_deopt();
             }
         }
-        let Ok((status, result)) = execute_search(prepared, haystack, window_start, window_end)
+        let Ok((status, result)) =
+            execute_exclusive_search(prepared, haystack, window_start, window_end)
         else {
             return STATUS_RUNTIME_FAILURE;
         };
@@ -2114,6 +2128,18 @@ fn execute_search(
     window_end: usize,
 ) -> Result<(u32, FreAotRegexResultV1), CompileError> {
     Ok(encode_match_result(prepared.search(
+        haystack,
+        SearchWindow::new(window_start, window_end),
+    )?))
+}
+
+fn execute_exclusive_search(
+    prepared: &mut PreparedAotRegex,
+    haystack: &[u8],
+    window_start: usize,
+    window_end: usize,
+) -> Result<(u32, FreAotRegexResultV1), CompileError> {
+    Ok(encode_match_result(prepared.search_exclusive(
         haystack,
         SearchWindow::new(window_start, window_end),
     )?))
