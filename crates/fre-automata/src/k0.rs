@@ -5568,35 +5568,24 @@ impl<'a> K0SearchSession<'a> {
 
     /// Project one authenticated warm Span without report construction.
     ///
-    /// Unlimited, assertion-free sessions may complete through immutable
-    /// forward rows. Reverse rows are required only when the selected endpoint
-    /// lacks scalar start provenance. A missing required cell declines without
-    /// changing invocation scratch, cache rows, or retained metadata. The
-    /// ordinary executor then restarts from the exact original window and
-    /// remains authoritative for every finite call, preparation, decline, and
-    /// error.
+    /// Unlimited sessions may complete through immutable forward rows or
+    /// assertion-contextual records. Reverse rows are required only when the
+    /// selected endpoint lacks scalar start provenance. A missing required
+    /// direct or exact-context cell declines without changing invocation
+    /// scratch, cache rows, or retained metadata. The ordinary executor then
+    /// restarts from the exact original window and remains authoritative for
+    /// every finite call, preparation, decline, and error.
     pub(crate) fn search_span_value_untyped(
         &mut self,
         haystack: &[u8],
         window: SearchWindow,
         limits: SearchLimits,
     ) -> Result<Option<MatchSpan>, SearchError> {
-        if limits == SearchLimits::unlimited()
-            && self.capabilities.lazy
-            && !self.capabilities.contextual
-            && self.workspace.lazy.is_bound_to(self.automaton)
-            && self.workspace.lazy.initialized
-            && !self.workspace.lazy.declined
-            && !self.workspace.lazy.saturated
-        {
+        validate_window(haystack, window)?;
+        if limits == SearchLimits::unlimited() && self.capabilities.lazy {
             if let Some(proof) = self.automaton.start_filter_proof.get() {
-                let nullable_initial = matches!(
-                    self.workspace.lazy.initial_kind,
-                    LazyInitialKind::NullablePrefix | LazyInitialKind::NullableTerminal
-                );
-                if !proof.force_haystack_start && proof.relaxed_nullable == nullable_initial {
-                    validate_window(haystack, window)?;
-                    if let WarmDirectSpan::Complete(found) = try_warm_direct_span_with_reverse(
+                if self.capabilities.contextual {
+                    if let Some(found) = try_warm_context_span(
                         self.automaton,
                         haystack,
                         window,
@@ -5604,13 +5593,36 @@ impl<'a> K0SearchSession<'a> {
                         &self.workspace.reverse,
                         proof,
                     )? {
-                        return Ok(found.map(WarmDirectMatch::span));
+                        return Ok(found);
+                    }
+                } else if self.workspace.lazy.is_bound_to(self.automaton)
+                    && self.workspace.lazy.initialized
+                    && !self.workspace.lazy.declined
+                    && !self.workspace.lazy.saturated
+                {
+                    let nullable_initial = matches!(
+                        self.workspace.lazy.initial_kind,
+                        LazyInitialKind::NullablePrefix | LazyInitialKind::NullableTerminal
+                    );
+                    if !proof.force_haystack_start && proof.relaxed_nullable == nullable_initial {
+                        if let WarmDirectSpan::Complete(found) =
+                            try_warm_direct_span_with_reverse(
+                                self.automaton,
+                                haystack,
+                                window,
+                                &self.workspace.lazy,
+                                &self.workspace.reverse,
+                                proof,
+                            )?
+                        {
+                            return Ok(found.map(WarmDirectMatch::span));
+                        }
                     }
                 }
             }
         }
 
-        execute_bound(
+        execute_bound_prevalidated(
             self.automaton,
             haystack,
             window,
@@ -6408,6 +6420,520 @@ fn try_warm_context_selected_end_bounded<const LOOP_SKIP: bool>(
                 detail: "warm contextual lazy DFA encoded state underflowed",
             })?;
         restartable = cell & LAZY_CELL_RESTART != 0;
+    }
+}
+
+/// Read the contextual reverse initial record for one forward-selected end.
+///
+/// The exact enabled-assertion mask is part of the retained key. `None` is a
+/// transactional cache decline; an invalid retained cell is a hard invariant
+/// failure and must not be hidden by the ordinary executor.
+fn warm_context_reverse_initial_state(
+    automaton: &Automaton,
+    haystack: &[u8],
+    selected_end: usize,
+    reverse: &ReverseWorkspace,
+) -> Result<Option<u32>, SearchError> {
+    if !reverse.context.is_allocated()
+        || !reverse.is_bound_to(automaton)
+        || !reverse.initialized
+        || reverse.declined
+        || reverse.saturated
+    {
+        return Ok(None);
+    }
+    reverse.context.validate_shape()?;
+    let global_dependencies = automaton.boundary_context_classifier().assertions();
+    let assertions = enabled_assertion_mask_unmetered_for_dependencies(
+        automaton,
+        global_dependencies,
+        haystack,
+        selected_end,
+    );
+    let symbol = contextual_initial_symbol(assertions);
+    let Some(cell) = reverse
+        .context
+        .lookup_existing_prevalidated(CONTEXT_INITIAL_SOURCE, symbol)?
+    else {
+        return Ok(None);
+    };
+    let encoded = cell & LAZY_CELL_STATE_MASK;
+    if encoded == 0
+        || cell & (LAZY_CELL_ACCEPT | LAZY_CELL_RESTART | LAZY_CELL_START_PROPAGATE) != 0
+    {
+        return Err(SearchError::InternalInvariant {
+            detail: "warm contextual reverse initial cache cell is invalid",
+        });
+    }
+    let state = encoded
+        .checked_sub(1)
+        .ok_or(SearchError::InternalInvariant {
+            detail: "warm contextual reverse initial state underflowed",
+        })?;
+    let state_index = usize::try_from(state).map_err(|_| SearchError::InternalInvariant {
+        detail: "warm contextual reverse initial state does not fit usize",
+    })?;
+    if state_index >= reverse.state_len {
+        return Err(SearchError::InternalInvariant {
+            detail: "warm contextual reverse initial state is outside retained rows",
+        });
+    }
+    Ok(Some(state))
+}
+
+/// Recover the earliest start for one selected endpoint through a complete,
+/// already-published contextual reverse path.
+///
+/// This reader never reserves or publishes a record. The first unavailable
+/// exact-context cell declines the whole warm Span projection, while the
+/// caller's private meter bounds forward and reverse speculation together.
+fn try_warm_context_reverse_start(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window_start: usize,
+    selected_end: usize,
+    reverse: &ReverseWorkspace,
+    meter: &mut WorkMeter,
+) -> Result<Option<usize>, SearchError> {
+    let Some(mut state) =
+        warm_context_reverse_initial_state(automaton, haystack, selected_end, reverse)?
+    else {
+        return Ok(None);
+    };
+    let global_dependencies = automaton.boundary_context_classifier().assertions();
+    let mut cursor = selected_end;
+    let mut candidate = None;
+    while cursor > window_start {
+        let source = cursor
+            .checked_sub(1)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "warm contextual reverse cursor underflowed",
+            })?;
+        meter.charge(1, source)?;
+        let byte = *haystack
+            .get(source)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "warm contextual reverse source exceeded the validated window",
+            })?;
+        let assertions = enabled_assertion_mask_unmetered_for_dependencies(
+            automaton,
+            global_dependencies,
+            haystack,
+            source,
+        );
+        let symbol = contextual_symbol_for_byte(automaton, byte, assertions);
+        let Some(cell) = reverse
+            .context
+            .lookup_existing_prevalidated(state, symbol)?
+        else {
+            return Ok(None);
+        };
+        if cell & (LAZY_CELL_RESTART | LAZY_CELL_START_PROPAGATE) != 0 {
+            return Err(SearchError::InternalInvariant {
+                detail: "warm contextual reverse cache cell retained forward provenance bits",
+            });
+        }
+        cursor = source;
+        if cell & LAZY_CELL_ACCEPT != 0 {
+            candidate = Some(cursor);
+        }
+        let encoded = cell & LAZY_CELL_STATE_MASK;
+        if encoded == 0 {
+            break;
+        }
+        state = encoded
+            .checked_sub(1)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "warm contextual reverse encoded state underflowed",
+            })?;
+        let state_index = usize::try_from(state).map_err(|_| SearchError::InternalInvariant {
+            detail: "warm contextual reverse state does not fit usize",
+        })?;
+        if state_index >= reverse.state_len {
+            return Err(SearchError::InternalInvariant {
+                detail: "warm contextual reverse state is outside retained rows",
+            });
+        }
+    }
+    let start = candidate.ok_or(SearchError::InternalInvariant {
+        detail: "warmed contextual reverse DFA could not recover the forward-selected span",
+    })?;
+    Ok(Some(start))
+}
+
+/// Complete one warmed contextual Span after ordered forward selection.
+///
+/// Exact scalar start provenance avoids reverse storage entirely. Otherwise
+/// reverse recovery is part of the same immutable cache transaction and uses
+/// the same private speculation meter as the forward walk.
+#[allow(
+    clippy::option_option,
+    reason = "the outer option is a cache transaction result and the inner option is the Span result"
+)]
+fn complete_warm_context_span(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    reverse: &ReverseWorkspace,
+    meter: &mut WorkMeter,
+    pending_end: Option<usize>,
+    pending_start: Option<usize>,
+) -> Result<Option<Option<MatchSpan>>, SearchError> {
+    let Some(selected_end) = pending_end else {
+        return Ok(Some(None));
+    };
+    if let Some(start) = pending_start {
+        return Ok(Some(Some(MatchSpan::new(start, selected_end))));
+    }
+    if selected_end == window.start() {
+        return Ok(Some(Some(MatchSpan::new(window.start(), selected_end))));
+    }
+    let Some(start) = try_warm_context_reverse_start(
+        automaton,
+        haystack,
+        window.start(),
+        selected_end,
+        reverse,
+        meter,
+    )? else {
+        return Ok(None);
+    };
+    Ok(Some(Some(MatchSpan::new(start, selected_end))))
+}
+
+/// Project a selected Span from one complete, already-published contextual
+/// path.
+///
+/// The outer `Option` distinguishes a transactional cache decline from a
+/// complete negative result. Forward cells carry invocation-local scalar
+/// start provenance; an unknown selected start is recovered through immutable
+/// contextual reverse rows without publishing either half of the path.
+#[allow(
+    clippy::option_option,
+    reason = "the outer option is a cache transaction result and the inner option is the Span result"
+)]
+fn try_warm_context_span(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    lazy: &LazyWorkspace,
+    reverse: &ReverseWorkspace,
+    proof: &StartFilterProof,
+) -> Result<Option<Option<MatchSpan>>, SearchError> {
+    if !lazy.context.is_allocated()
+        || !lazy.is_bound_to(automaton)
+        || !lazy.initialized
+        || lazy.declined
+        || lazy.saturated
+        || proof.relaxed_nullable
+    {
+        return Ok(None);
+    }
+    let window_bytes = window
+        .end()
+        .checked_sub(window.start())
+        .ok_or(SearchError::InternalInvariant {
+            detail: "warm contextual Span window has a descending range",
+        })?;
+    if window_bytes < WARM_CONTEXT_MIN_WINDOW_BYTES {
+        return Ok(None);
+    }
+    lazy.context.validate_shape()?;
+
+    let bounded = if lazy.context_loop_skip_plans.is_empty() {
+        try_warm_context_span_bounded::<false>(
+            automaton,
+            haystack,
+            window,
+            lazy,
+            reverse,
+            proof,
+        )
+    } else {
+        try_warm_context_span_bounded::<true>(
+            automaton,
+            haystack,
+            window,
+            lazy,
+            reverse,
+            proof,
+        )
+    };
+    match bounded {
+        Err(SearchError::WorkLimitExceeded { limit, .. })
+            if limit == WARM_CONTEXT_SPECULATION_WORK =>
+        {
+            Ok(None)
+        }
+        result => result,
+    }
+}
+
+/// Execute one warm contextual Span attempt under a private forward/reverse
+/// bound. The caller converts only this bound's exhaustion into a cache miss.
+#[allow(
+    clippy::option_option,
+    clippy::too_many_lines,
+    reason = "the bounded transactional loop mirrors contextual endpoint selection while retaining exact start provenance"
+)]
+fn try_warm_context_span_bounded<const LOOP_SKIP: bool>(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    lazy: &LazyWorkspace,
+    reverse: &ReverseWorkspace,
+    proof: &StartFilterProof,
+) -> Result<Option<Option<MatchSpan>>, SearchError> {
+    debug_assert!(!LOOP_SKIP || !lazy.context_loop_skip_plans.is_empty());
+    let global_dependencies = automaton.boundary_context_classifier().assertions();
+    let root_dependencies = lazy.context_root_dependency_mask(global_dependencies);
+    let scanner = proof.scanner.as_ref();
+    let guard = proof.guard();
+    let probe = proof.probe();
+    let mut meter = WorkMeter::new(WARM_CONTEXT_SPECULATION_WORK, 0);
+    let mut position = window.start();
+    let mut initial_candidate_scanned = false;
+    let mut retained_start_mask = RetainedStartMaskCursor::default();
+    let mut adaptive_probe = AdaptiveStartProbe::default();
+    let mut engine_candidate = None;
+    let mut loop_probe = LazyLoopProbe::default();
+    let mut active_loop_slot = None;
+    let mut pending_end = None;
+    let mut pending_start = None;
+
+    if let Some(scanner) = scanner {
+        // Preserve the absolute-start alternative at original boundary zero;
+        // every later restart is eligible for the published scanner.
+        if !(proof.force_haystack_start && position == 0) {
+            position = next_start_candidate_adaptive(
+                scanner,
+                haystack,
+                position,
+                window.end(),
+                guard,
+                probe,
+                &mut meter,
+                &mut retained_start_mask,
+                &mut adaptive_probe,
+            )?;
+            if position == window.end() {
+                return Ok(Some(None));
+            }
+            if probe.is_some() && adaptive_probe.samples_rejections() {
+                engine_candidate = Some(position);
+            }
+            initial_candidate_scanned = true;
+        }
+    }
+
+    let Some(mut state) = warm_context_initial_state_for_dependencies(
+        automaton,
+        haystack,
+        position,
+        lazy,
+        root_dependencies,
+        global_dependencies,
+    )? else {
+        return Ok(None);
+    };
+    let mut restartable = true;
+    let mut active_start = Some(position);
+    let mut entered = false;
+
+    loop {
+        if pending_end.is_none()
+            && (!initial_candidate_scanned || entered)
+            && restartable
+            && !(proof.force_haystack_start && position == 0)
+        {
+            let candidate = if let Some(scanner) = scanner {
+                if position < window.end() {
+                    if let (Some(probe), Some(candidate)) = (probe, engine_candidate.take()) {
+                        adaptive_probe.observe_restartable_rejection(
+                            probe,
+                            haystack,
+                            candidate,
+                            window.end(),
+                            &mut meter,
+                        )?;
+                    }
+                } else {
+                    engine_candidate = None;
+                }
+                next_start_candidate_adaptive(
+                    scanner,
+                    haystack,
+                    position,
+                    window.end(),
+                    guard,
+                    probe,
+                    &mut meter,
+                    &mut retained_start_mask,
+                    &mut adaptive_probe,
+                )?
+            } else {
+                position
+            };
+            if candidate == window.end() {
+                return Ok(Some(None));
+            }
+            if probe.is_some() && adaptive_probe.samples_rejections() {
+                engine_candidate = Some(candidate);
+            }
+            if candidate != position {
+                position = candidate;
+                let Some(initial) = warm_context_initial_state_for_dependencies(
+                    automaton,
+                    haystack,
+                    position,
+                    lazy,
+                    root_dependencies,
+                    global_dependencies,
+                )? else {
+                    return Ok(None);
+                };
+                state = initial;
+            }
+            active_start = Some(position);
+        }
+        entered = true;
+        if position == window.end() {
+            return complete_warm_context_span(
+                automaton,
+                haystack,
+                window,
+                reverse,
+                &mut meter,
+                pending_end,
+                pending_start,
+            );
+        }
+
+        if LOOP_SKIP {
+            let selected = lazy
+                .context_loop_skip_plans
+                .find_with_hint(state, active_loop_slot);
+            let selected_slot = selected.map(|(slot, _)| slot);
+            if selected_slot != active_loop_slot {
+                loop_probe.left_plan_state();
+                active_loop_slot = selected_slot;
+            }
+            if let Some((_, plan)) = selected {
+                let scan_threshold = if plan.leave_final_member {
+                    LAZY_LOOP_SKIP_MIN_BYTES.checked_add(1).ok_or(
+                        SearchError::ArithmeticOverflow {
+                            computation: "warm contextual Span loop scan threshold",
+                        },
+                    )?
+                } else {
+                    LAZY_LOOP_SKIP_MIN_BYTES
+                };
+                if loop_probe.is_ready(position)
+                    && window.end().saturating_sub(position) >= scan_threshold
+                    && meter.remaining()
+                        >= u64::try_from(scan_threshold)
+                            .expect("warm contextual Span loop threshold fits u64")
+                {
+                    let available = usize::try_from(meter.remaining())
+                        .unwrap_or(usize::MAX)
+                        .min(window.end().saturating_sub(position));
+                    let scan_end = position.checked_add(available).ok_or(
+                        SearchError::ArithmeticOverflow {
+                            computation: "warm contextual Span loop scan end",
+                        },
+                    )?;
+                    let source = haystack.get(position..scan_end).ok_or(
+                        SearchError::InternalInvariant {
+                            detail: "warm contextual Span loop scan exceeded its validated window",
+                        },
+                    )?;
+                    let member_run = plan.scanner.scan_forward(source);
+                    let skipped = if plan.leave_final_member {
+                        member_run.saturating_sub(1)
+                    } else {
+                        member_run
+                    };
+                    loop_probe.observe(position, skipped)?;
+                    if skipped != 0 {
+                        meter.charge_admitted(
+                            u64::try_from(skipped)
+                                .expect("warm contextual Span loop skip length fits u64"),
+                        );
+                        position = position.checked_add(skipped).ok_or(
+                            SearchError::ArithmeticOverflow {
+                                computation: "warm contextual Span loop source progress",
+                            },
+                        )?;
+                        // A skipped self-loop is nonaccepting, so any selected
+                        // endpoint/start pair remains committed. Only live
+                        // frontier provenance follows the graph-proved action.
+                        restartable = false;
+                        if plan.start_action == LazyStartAction::Drop {
+                            active_start = None;
+                        }
+                        if position == window.end() {
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        meter.charge(1, position)?;
+        let byte = *haystack
+            .get(position)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "warm contextual Span source exceeded the validated window",
+            })?;
+        let destination = position
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "warm contextual Span destination",
+            })?;
+        let dependencies = lazy.context_dependency_mask(state, global_dependencies)?;
+        let Some(cell) = warm_context_transition_for_dependencies(
+            automaton,
+            haystack,
+            destination,
+            lazy,
+            state,
+            byte,
+            dependencies,
+            global_dependencies,
+        )? else {
+            return Ok(None);
+        };
+        position = destination;
+
+        let start_action = LazyStartAction::from_direct_cell(cell);
+        let next_start = match start_action {
+            LazyStartAction::Drop => None,
+            LazyStartAction::Propagate => active_start,
+            LazyStartAction::Reset => Some(position),
+        };
+        if cell & LAZY_CELL_ACCEPT != 0 {
+            pending_end = Some(position);
+            pending_start = next_start;
+        }
+        let encoded = cell & LAZY_CELL_STATE_MASK;
+        if encoded == 0 {
+            return complete_warm_context_span(
+                automaton,
+                haystack,
+                window,
+                reverse,
+                &mut meter,
+                pending_end,
+                pending_start,
+            );
+        }
+        state = encoded
+            .checked_sub(1)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "warm contextual Span encoded state underflowed",
+            })?;
+        restartable = cell & LAZY_CELL_RESTART != 0;
+        active_start = next_start;
     }
 }
 
@@ -8321,21 +8847,10 @@ pub(crate) fn search_prevalidated_span_value_with_authenticated_workspace(
     }
     debug_assert!(validate_window(haystack, window).is_ok());
     let capabilities = workspace.bound_capabilities;
-    if limits == SearchLimits::unlimited()
-        && capabilities.lazy
-        && !capabilities.contextual
-        && workspace.lazy.is_bound_to(automaton)
-        && workspace.lazy.initialized
-        && !workspace.lazy.declined
-        && !workspace.lazy.saturated
-    {
+    if limits == SearchLimits::unlimited() && capabilities.lazy {
         if let Some(proof) = automaton.start_filter_proof.get() {
-            let nullable_initial = matches!(
-                workspace.lazy.initial_kind,
-                LazyInitialKind::NullablePrefix | LazyInitialKind::NullableTerminal
-            );
-            if !proof.force_haystack_start && proof.relaxed_nullable == nullable_initial {
-                if let WarmDirectSpan::Complete(found) = try_warm_direct_span_with_reverse(
+            if capabilities.contextual {
+                if let Some(found) = try_warm_context_span(
                     automaton,
                     haystack,
                     window,
@@ -8343,7 +8858,28 @@ pub(crate) fn search_prevalidated_span_value_with_authenticated_workspace(
                     &workspace.reverse,
                     proof,
                 )? {
-                    return Ok(found.map(WarmDirectMatch::span));
+                    return Ok(found);
+                }
+            } else if workspace.lazy.is_bound_to(automaton)
+                && workspace.lazy.initialized
+                && !workspace.lazy.declined
+                && !workspace.lazy.saturated
+            {
+                let nullable_initial = matches!(
+                    workspace.lazy.initial_kind,
+                    LazyInitialKind::NullablePrefix | LazyInitialKind::NullableTerminal
+                );
+                if !proof.force_haystack_start && proof.relaxed_nullable == nullable_initial {
+                    if let WarmDirectSpan::Complete(found) = try_warm_direct_span_with_reverse(
+                        automaton,
+                        haystack,
+                        window,
+                        &workspace.lazy,
+                        &workspace.reverse,
+                        proof,
+                    )? {
+                        return Ok(found.map(WarmDirectMatch::span));
+                    }
                 }
             }
         }
@@ -20205,10 +20741,10 @@ mod tests {
     };
 
     use super::{
-        classify_byte_delta_16, scratch_bytes, ContextTransitionSlot, WorkMeter, WorkspaceLayout,
-        ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, BYTE_SET_BLOCK_BYTES, BYTE_SET_WIDE_BLOCK_BYTES,
-        CONTEXT_INITIAL_SOURCE, INVOCATION_RESET_WORK, ROOT_RUN_SCANNER_SHAPE_MAX_WORK,
-        WARM_EXISTS_INLINE_BYTES,
+        classify_byte_delta_16, scratch_bytes, ContextHotTransition, ContextTransitionSlot,
+        ContextTransitionStore, WorkMeter, WorkspaceLayout, ASCII_NARROW_BYTES, ASCII_WIDE_BYTES,
+        BYTE_SET_BLOCK_BYTES, BYTE_SET_WIDE_BLOCK_BYTES, CONTEXT_INITIAL_SOURCE,
+        INVOCATION_RESET_WORK, ROOT_RUN_SCANNER_SHAPE_MAX_WORK, WARM_EXISTS_INLINE_BYTES,
     };
     use crate::{
         plan::{
@@ -40717,6 +41253,430 @@ mod tests {
                 "{name}: warm projection",
             );
         }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one differential exercises contextual Span priority, restart, source context, loop actions, and the private bound"
+    )]
+    fn warm_context_span_covers_general_contextual_control_flow() {
+        fn exercise_complete(
+            name: &str,
+            plan: &Automaton,
+            source: &[u8],
+            window: SearchWindow,
+            expected: Option<MatchSpan>,
+        ) {
+            let mut session =
+                K0SearchSession::new_selected(plan, WorkspaceLimits::unlimited(), true, true)
+                    .unwrap();
+            let reported = session
+                .search_window::<Span>(source, window, SearchLimits::unlimited())
+                .unwrap()
+                .into_output();
+            assert_eq!(reported, expected, "{name}: ordinary result");
+            let proof = plan.start_filter_proof.get().unwrap();
+            assert_eq!(
+                super::try_warm_context_span(
+                    plan,
+                    source,
+                    window,
+                    &session.workspace.lazy,
+                    &session.workspace.reverse,
+                    proof,
+                ),
+                Ok(Some(expected)),
+                "{name}: warm projection",
+            );
+            assert_eq!(
+                session
+                    .search_span_value(source, window, SearchLimits::unlimited())
+                    .unwrap(),
+                expected,
+                "{name}: value facade",
+            );
+        }
+
+        let mut root = vec![b'!'; super::WARM_CONTEXT_MIN_WINDOW_BYTES];
+        root[..2].copy_from_slice(b"ab");
+        let full = SearchWindow::full(&root);
+        exercise_complete(
+            "long-first provisional acceptance",
+            &asserted_ordered_a_or_ab(true),
+            &root,
+            full,
+            Some(MatchSpan::new(0, 2)),
+        );
+        exercise_complete(
+            "short-first terminal acceptance",
+            &asserted_ordered_a_or_ab(false),
+            &root,
+            full,
+            Some(MatchSpan::new(0, 1)),
+        );
+
+        let restart_plan = trailing_assertion_or_bang(EdgeKind::AssertLineEndLf);
+        let mut restarted = vec![b'x'; super::WARM_CONTEXT_MIN_WINDOW_BYTES];
+        restarted[..5].copy_from_slice(b"axxa!");
+        exercise_complete(
+            "scanner restarts after a rejected candidate",
+            &restart_plan,
+            &restarted,
+            SearchWindow::full(&restarted),
+            Some(MatchSpan::new(3, 5)),
+        );
+
+        let offset_plan = digit_slash_then_line_end_or_bang();
+        let mut offset_source = vec![b'x'; super::WARM_CONTEXT_MIN_WINDOW_BYTES + 2];
+        offset_source[2..5].copy_from_slice(b"7/!");
+        exercise_complete(
+            "nonzero exact scanner offset",
+            &offset_plan,
+            &offset_source,
+            SearchWindow::new(2, offset_source.len()),
+            Some(MatchSpan::new(2, 5)),
+        );
+
+        let mut clipped = vec![b'!'; super::WARM_CONTEXT_MIN_WINDOW_BYTES + 2];
+        clipped[1] = b'\n';
+        clipped[2..4].copy_from_slice(b"ab");
+        exercise_complete(
+            "offset window reads assertion context outside the window",
+            &asserted_ordered_a_or_ab(true),
+            &clipped,
+            SearchWindow::new(2, clipped.len()),
+            Some(MatchSpan::new(2, 4)),
+        );
+
+        for (name, plan, member, expected_action) in [
+            (
+                "propagating contextual loop",
+                contextual_word_loop_then_terminal(),
+                b'a',
+                super::LazyStartAction::Propagate,
+            ),
+            (
+                "dropping contextual loop",
+                contextual_unicode_drop_loop_then_terminal(),
+                b'x',
+                super::LazyStartAction::Drop,
+            ),
+        ] {
+            pin_without_start_filter(&plan);
+            let run_end = super::LAZY_LOOP_SKIP_MIN_BYTES + 8;
+            let mut source = vec![b'!'; super::WARM_CONTEXT_MIN_WINDOW_BYTES];
+            source[..run_end].fill(member);
+            source[run_end] = b'z';
+            let window = SearchWindow::full(&source);
+            let mut session = K0SearchSession::new_selected(
+                &plan,
+                WorkspaceLimits::unlimited(),
+                true,
+                true,
+            )
+            .unwrap();
+            let expected = Some(MatchSpan::new(0, run_end + 1));
+            assert_eq!(
+                session
+                    .search_window::<Span>(&source, window, SearchLimits::unlimited())
+                    .unwrap()
+                    .into_output(),
+                expected,
+                "{name}: ordinary result",
+            );
+            let loop_plan = session
+                .workspace
+                .lazy
+                .context_loop_skip_plans
+                .first()
+                .expect("the contextual loop should retain a skip plan");
+            assert_eq!(loop_plan.start_action, expected_action, "{name}: action");
+            let proof = plan.start_filter_proof.get().unwrap();
+            assert_eq!(
+                super::try_warm_context_span(
+                    &plan,
+                    &source,
+                    window,
+                    &session.workspace.lazy,
+                    &session.workspace.reverse,
+                    proof,
+                ),
+                Ok(Some(expected)),
+                "{name}: warm projection",
+            );
+        }
+
+        let long_first = asserted_ordered_a_or_ab(true);
+        let mut bounded = vec![b'!'; super::WARM_CONTEXT_MIN_WINDOW_BYTES];
+        let far = usize::try_from(super::WARM_CONTEXT_SPECULATION_WORK)
+            .unwrap()
+            .checked_add(1)
+            .unwrap();
+        bounded[far - 1] = b'\n';
+        bounded[far..far + 2].copy_from_slice(b"ab");
+        let bounded_window = SearchWindow::full(&bounded);
+        let mut bounded_session = K0SearchSession::new_selected(
+            &long_first,
+            WorkspaceLimits::unlimited(),
+            true,
+            true,
+        )
+        .unwrap();
+        let expected = Some(MatchSpan::new(far, far + 2));
+        assert_eq!(
+            bounded_session
+                .search_window::<Span>(
+                    &bounded,
+                    bounded_window,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .into_output(),
+            expected,
+        );
+        let proof = long_first.start_filter_proof.get().unwrap();
+        assert_eq!(
+            super::try_warm_context_span(
+                &long_first,
+                &bounded,
+                bounded_window,
+                &bounded_session.workspace.lazy,
+                &bounded_session.workspace.reverse,
+                proof,
+            ),
+            Ok(None),
+            "the private speculation ceiling must decline transactionally",
+        );
+        assert_eq!(
+            bounded_session
+                .search_span_value(
+                    &bounded,
+                    bounded_window,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            expected,
+        );
+
+        let reverse_bounded_plan = contextual_unicode_drop_loop_then_terminal();
+        pin_without_start_filter(&reverse_bounded_plan);
+        let reverse_bounded_end = 160;
+        let mut reverse_bounded_source = vec![b'!'; super::WARM_CONTEXT_MIN_WINDOW_BYTES];
+        reverse_bounded_source[..reverse_bounded_end].fill(b'x');
+        reverse_bounded_source[reverse_bounded_end] = b'z';
+        let reverse_bounded_window = SearchWindow::full(&reverse_bounded_source);
+        let reverse_bounded_expected = Some(MatchSpan::new(0, reverse_bounded_end + 1));
+        let mut reverse_bounded_session = K0SearchSession::new_selected(
+            &reverse_bounded_plan,
+            WorkspaceLimits::unlimited(),
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            reverse_bounded_session
+                .search_window::<Span>(
+                    &reverse_bounded_source,
+                    reverse_bounded_window,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .into_output(),
+            reverse_bounded_expected,
+        );
+        let proof = reverse_bounded_plan.start_filter_proof.get().unwrap();
+        assert_eq!(
+            super::try_warm_context_span(
+                &reverse_bounded_plan,
+                &reverse_bounded_source,
+                reverse_bounded_window,
+                &reverse_bounded_session.workspace.lazy,
+                &reverse_bounded_session.workspace.reverse,
+                proof,
+            ),
+            Ok(None),
+            "forward and reverse must share one private speculation ceiling",
+        );
+        assert_eq!(
+            reverse_bounded_session
+                .search_span_value(
+                    &reverse_bounded_source,
+                    reverse_bounded_window,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            reverse_bounded_expected,
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the forward and reverse cache-hole transactions share one exact warmed fixture"
+    )]
+    fn warm_context_span_is_read_only_and_declines_forward_or_reverse_holes() {
+        fn remove_transition(
+            store: &mut ContextTransitionStore,
+        ) -> (usize, ContextTransitionSlot, usize, ContextHotTransition) {
+            let slot = store
+                .slots
+                .iter()
+                .position(|slot| {
+                    slot.source != super::CONTEXT_EMPTY_SOURCE
+                        && slot.source != CONTEXT_INITIAL_SOURCE
+                })
+                .expect("the warmed contextual path must publish a transition");
+            let retained = store.slots[slot];
+            let hot_source = usize::try_from(retained.source).unwrap();
+            let retained_hot = store.hot[hot_source];
+            store.slots[slot] = ContextTransitionSlot::EMPTY;
+            let mut empty_hot = super::ContextHotTransition::EMPTY;
+            empty_hot.dependency_mask = retained_hot.dependency_mask;
+            store.hot[hot_source] = empty_hot;
+            (slot, retained, hot_source, retained_hot)
+        }
+
+        let plan = contextual_unicode_drop_loop_then_terminal();
+        pin_without_start_filter(&plan);
+        let run_end = super::LAZY_LOOP_SKIP_MIN_BYTES + 8;
+        let mut source = vec![b'!'; super::WARM_CONTEXT_MIN_WINDOW_BYTES];
+        source[..run_end].fill(b'x');
+        source[run_end] = b'z';
+        let window = SearchWindow::full(&source);
+        let expected = Some(MatchSpan::new(0, run_end + 1));
+        let mut session =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                .unwrap();
+
+        // Endpoint-only execution fills forward contextual records but cannot
+        // publish reverse rows. An unknown start therefore declines cleanly.
+        assert_eq!(
+            session
+                .search_window::<SelectedEnd>(&source, window, SearchLimits::unlimited())
+                .unwrap()
+                .into_output(),
+            Some(run_end + 1),
+        );
+        assert!(!session.workspace.reverse.initialized);
+        let proof = plan.start_filter_proof.get().unwrap();
+        assert_eq!(
+            super::try_warm_context_span(
+                &plan,
+                &source,
+                window,
+                &session.workspace.lazy,
+                &session.workspace.reverse,
+                proof,
+            ),
+            Ok(None),
+            "cold reverse rows must decline the whole projection",
+        );
+
+        assert_eq!(
+            session
+                .search_span_value(&source, window, SearchLimits::unlimited())
+                .unwrap(),
+            expected,
+        );
+        assert!(session.workspace.reverse.initialized);
+        assert!(session.workspace.reverse.context.occupied_slots() > 1);
+
+        let generation = session.workspace.generation;
+        let current_len = session.workspace.current_len;
+        let roots_len = session.workspace.roots_len;
+        let stack_len = session.workspace.stack_len;
+        let forward_frontier_len = session.workspace.lazy.frontier_len;
+        let reverse_frontier_len = session.workspace.reverse.frontier_len;
+        let forward_slots = session.workspace.lazy.context.slots.clone();
+        let forward_hot = session.workspace.lazy.context.hot.clone();
+        let forward_hot_initial = session.workspace.lazy.context.hot_initial;
+        let reverse_slots = session.workspace.reverse.context.slots.clone();
+        let reverse_hot = session.workspace.reverse.context.hot.clone();
+        let reverse_hot_initial = session.workspace.reverse.context.hot_initial;
+        assert_eq!(
+            session
+                .search_span_value(&source, window, SearchLimits::unlimited())
+                .unwrap(),
+            expected,
+        );
+        assert_eq!(session.workspace.generation, generation);
+        assert_eq!(session.workspace.current_len, current_len);
+        assert_eq!(session.workspace.roots_len, roots_len);
+        assert_eq!(session.workspace.stack_len, stack_len);
+        assert_eq!(session.workspace.lazy.frontier_len, forward_frontier_len);
+        assert_eq!(session.workspace.reverse.frontier_len, reverse_frontier_len);
+        assert_eq!(session.workspace.lazy.context.slots, forward_slots);
+        assert_eq!(session.workspace.lazy.context.hot, forward_hot);
+        assert_eq!(
+            session.workspace.lazy.context.hot_initial,
+            forward_hot_initial,
+        );
+        assert_eq!(session.workspace.reverse.context.slots, reverse_slots);
+        assert_eq!(session.workspace.reverse.context.hot, reverse_hot);
+        assert_eq!(
+            session.workspace.reverse.context.hot_initial,
+            reverse_hot_initial,
+        );
+
+        let (forward_slot, forward_record, forward_hot_source, forward_hot_record) =
+            remove_transition(&mut session.workspace.lazy.context);
+        let before_forward_hole_slots = session.workspace.lazy.context.slots.clone();
+        let before_forward_hole_hot = session.workspace.lazy.context.hot.clone();
+        assert_eq!(
+            super::try_warm_context_span(
+                &plan,
+                &source,
+                window,
+                &session.workspace.lazy,
+                &session.workspace.reverse,
+                proof,
+            ),
+            Ok(None),
+            "a forward hole must not expose a provisional endpoint",
+        );
+        assert_eq!(
+            session.workspace.lazy.context.slots,
+            before_forward_hole_slots,
+        );
+        assert_eq!(session.workspace.lazy.context.hot, before_forward_hole_hot);
+        session.workspace.lazy.context.slots[forward_slot] = forward_record;
+        session.workspace.lazy.context.hot[forward_hot_source] = forward_hot_record;
+
+        let (reverse_slot, reverse_record, reverse_hot_source, reverse_hot_record) =
+            remove_transition(&mut session.workspace.reverse.context);
+        let before_reverse_hole_slots = session.workspace.reverse.context.slots.clone();
+        let before_reverse_hole_hot = session.workspace.reverse.context.hot.clone();
+        assert_eq!(
+            super::try_warm_context_span(
+                &plan,
+                &source,
+                window,
+                &session.workspace.lazy,
+                &session.workspace.reverse,
+                proof,
+            ),
+            Ok(None),
+            "a reverse hole must decline the complete forward selection",
+        );
+        assert_eq!(
+            session.workspace.reverse.context.slots,
+            before_reverse_hole_slots,
+        );
+        assert_eq!(session.workspace.reverse.context.hot, before_reverse_hole_hot);
+        session.workspace.reverse.context.slots[reverse_slot] = reverse_record;
+        session.workspace.reverse.context.hot[reverse_hot_source] = reverse_hot_record;
+        assert_eq!(
+            super::try_warm_context_span(
+                &plan,
+                &source,
+                window,
+                &session.workspace.lazy,
+                &session.workspace.reverse,
+                proof,
+            ),
+            Ok(Some(expected)),
+        );
     }
 
     #[test]

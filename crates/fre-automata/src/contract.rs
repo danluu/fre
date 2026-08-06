@@ -775,9 +775,11 @@ impl TypedPlan<'_, Span> {
     /// workspace.
     ///
     /// An unlimited exact-identity call may use already-filled forward and
-    /// reverse rows without constructing diagnostic accounting. Every finite,
-    /// cold, contextual, unfilled, or unauthenticated case uses the ordinary
-    /// report-producing executor with unchanged error behavior.
+    /// reverse rows or exact assertion-contextual records without constructing
+    /// diagnostic accounting. A contextual cache miss declines the entire
+    /// read-only attempt transactionally. Every finite, cold, incomplete, or
+    /// unauthenticated case uses the ordinary report-producing executor with
+    /// unchanged error behavior.
     ///
     /// # Errors
     ///
@@ -1000,11 +1002,13 @@ impl K0SearchSession<'_> {
 
     /// Return only a Span, allowing an authenticated warm bidirectional
     /// session to omit diagnostic construction and recover an unknown start
-    /// through already-filled reverse DFA rows.
+    /// through already-filled direct or exact assertion-contextual reverse
+    /// rows.
     ///
-    /// Finite limits and every cold, contextual, or incomplete-cache call use
-    /// the ordinary report-producing executor with unchanged resource and
-    /// error behavior.
+    /// A contextual warm projection reads retained records only and declines
+    /// transactionally on any missing forward or reverse cell. Finite limits
+    /// and every cold or incomplete-cache call use the ordinary
+    /// report-producing executor with unchanged resource and error behavior.
     ///
     /// # Errors
     ///

@@ -8958,6 +8958,40 @@ mod tests {
     }
 
     #[test]
+    fn ordered_nfa_contextual_span_reuses_one_prepared_workspace() {
+        let compiled = program(
+            "(?m:(?:^a|x+)(?:b|c+|))",
+            OutputContract::Span,
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+        );
+        assert_eq!(compiled.engine_kind(), EngineKind::OrderedNfa);
+        assert_eq!(
+            compiled.engine_selection_reason(),
+            Some(EngineSelectionReason::ContextAssertions),
+        );
+        assert!(compiled.exact_match_width.is_none());
+
+        let mut source = vec![b'!'; 4_096];
+        source[..4].copy_from_slice(b"accc");
+        let window = SearchWindow::full(&source);
+        let expected = MatchResult::Span(Some((0, 4)));
+        let mut workspace = compiled.prepare_workspace().expect("prepare NFA workspace");
+        for attempt in 0..4 {
+            assert_eq!(
+                compiled
+                    .search_with_workspace(&source, window, &mut workspace)
+                    .unwrap(),
+                expected,
+                "prepared contextual Span attempt {attempt}",
+            );
+        }
+    }
+
+    #[test]
     fn resource_fallback_mandatory_suffix_is_structural_and_round_trips() {
         let fallback_limits = DeterminizeLimits {
             max_states: 0,
