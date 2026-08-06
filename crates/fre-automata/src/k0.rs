@@ -19898,41 +19898,16 @@ fn execute_exact_start_loop(
                 computation: "exact-start examined boundary count",
             })?;
         workspace.begin_boundary(meter, position)?;
-
-        let root_count = workspace.roots_len;
-        let mut root_index = 0usize;
-        while root_index < root_count {
-            let root = workspace.roots[root_index];
-            if let Some(found) =
-                expand_root(automaton, haystack, position, root, workspace, meter)?
-            {
-                pending = Some(found);
-                break;
-            }
-            root_index =
-                root_index
-                    .checked_add(1)
-                    .ok_or(SearchError::ArithmeticOverflow {
-                        computation: "exact-start next-boundary root index",
-                    })?;
-        }
-        workspace.roots_len = 0;
-
-        if initial {
-            debug_assert_eq!(root_count, 0);
-            pending = expand_root(
-                automaton,
-                haystack,
-                position,
-                Thread {
-                    state: automaton.start,
-                    start: window.start(),
-                },
-                workspace,
-                meter,
-            )?;
-            initial = false;
-        }
+        expand_exact_boundary_roots(
+            automaton,
+            haystack,
+            position,
+            window.start(),
+            workspace,
+            meter,
+            &mut pending,
+            &mut initial,
+        )?;
 
         if earliest && pending.is_some() {
             break;
@@ -22338,6 +22313,218 @@ fn required_generation_count(
     })
 }
 
+const PIKE_BOUNDARY_ABSOLUTE: usize = 0;
+const PIKE_BOUNDARY_CONFIGURED_LINE: usize = 1;
+const PIKE_BOUNDARY_CRLF_LINE: usize = 2;
+const PIKE_BOUNDARY_ASCII_WORD: usize = 3;
+const PIKE_BOUNDARY_UNICODE_WORD: usize = 4;
+#[cfg(test)]
+const PIKE_BOUNDARY_FAMILY_COUNT: usize = 5;
+const PIKE_BOUNDARY_BYTE_ABSENT: u16 = 256;
+const PIKE_BOUNDARY_NEIGHBORS_UNPREPARED: u16 = u16::MAX;
+
+trait PikeBoundaryEvaluator {
+    fn edge_enabled(&mut self, kind: EdgeKind) -> Result<bool, SearchError>;
+}
+
+struct AssertionFreePikeBoundary;
+
+impl PikeBoundaryEvaluator for AssertionFreePikeBoundary {
+    #[inline]
+    fn edge_enabled(&mut self, kind: EdgeKind) -> Result<bool, SearchError> {
+        debug_assert_eq!(kind, EdgeKind::Epsilon);
+        Ok(true)
+    }
+}
+
+/// Lazily prepared assertion facts for one ordinary Pike boundary.
+///
+/// The owner is created after `begin_boundary` and shared by every queued
+/// root and the lower-priority injected root at that exact position. Each raw
+/// family is classified independently, Unicode decoding remains separate,
+/// and neighboring bytes are loaded only if a byte-sensitive family is
+/// reached. Logical work is still charged by `expand_root` for every edge;
+/// this object memoizes only the immutable full-haystack observation.
+struct PreparedPikeBoundaryFacts<'h> {
+    haystack: &'h [u8],
+    position: usize,
+    enabled: u32,
+    prepared_families: u8,
+    line_terminator: u8,
+    before: u16,
+    after: u16,
+    #[cfg(test)]
+    family_preparations: [u8; PIKE_BOUNDARY_FAMILY_COUNT],
+    #[cfg(test)]
+    neighbor_preparations: u8,
+}
+
+impl<'h> PreparedPikeBoundaryFacts<'h> {
+    #[inline]
+    fn new(automaton: &Automaton, haystack: &'h [u8], position: usize) -> Self {
+        Self {
+            haystack,
+            position,
+            enabled: 0,
+            prepared_families: 0,
+            line_terminator: automaton.line_terminator(),
+            before: PIKE_BOUNDARY_NEIGHBORS_UNPREPARED,
+            after: PIKE_BOUNDARY_NEIGHBORS_UNPREPARED,
+            #[cfg(test)]
+            family_preparations: [0; PIKE_BOUNDARY_FAMILY_COUNT],
+            #[cfg(test)]
+            neighbor_preparations: 0,
+        }
+    }
+
+    #[inline]
+    fn neighbors(&mut self) -> (Option<u8>, Option<u8>) {
+        if self.before == PIKE_BOUNDARY_NEIGHBORS_UNPREPARED {
+            self.before = self
+                .position
+                .checked_sub(1)
+                .and_then(|index| self.haystack.get(index))
+                .copied()
+                .map_or(PIKE_BOUNDARY_BYTE_ABSENT, u16::from);
+            self.after = self
+                .haystack
+                .get(self.position)
+                .copied()
+                .map_or(PIKE_BOUNDARY_BYTE_ABSENT, u16::from);
+            #[cfg(test)]
+            {
+                self.neighbor_preparations = self
+                    .neighbor_preparations
+                    .checked_add(1)
+                    .expect("test Pike neighbor preparation count remains bounded");
+            }
+        }
+        debug_assert_ne!(self.after, PIKE_BOUNDARY_NEIGHBORS_UNPREPARED);
+        (u8::try_from(self.before).ok(), u8::try_from(self.after).ok())
+    }
+
+    #[inline]
+    fn prepare_family(&mut self, family: usize) {
+        let family_bit = 1_u8 << family;
+        if self.prepared_families & family_bit != 0 {
+            return;
+        }
+        let enabled = match family {
+            PIKE_BOUNDARY_ABSOLUTE => {
+                let class = binary_boundary_class(
+                    self.position == 0,
+                    self.position == self.haystack.len(),
+                );
+                ABSOLUTE_ENABLED_BY_CLASS[class]
+            }
+            PIKE_BOUNDARY_CONFIGURED_LINE => {
+                let (before, after) = self.neighbors();
+                let class = binary_boundary_class(
+                    self.position == 0 || before == Some(self.line_terminator),
+                    self.position == self.haystack.len()
+                        || after == Some(self.line_terminator),
+                );
+                CONFIGURED_LINE_ENABLED_BY_CLASS[class]
+            }
+            PIKE_BOUNDARY_CRLF_LINE => {
+                let (before, after) = self.neighbors();
+                let class = binary_boundary_class(
+                    self.position == 0
+                        || before == Some(b'\n')
+                        || before == Some(b'\r') && after != Some(b'\n'),
+                    self.position == self.haystack.len()
+                        || after == Some(b'\r')
+                        || after == Some(b'\n') && before != Some(b'\r'),
+                );
+                CRLF_LINE_ENABLED_BY_CLASS[class]
+            }
+            PIKE_BOUNDARY_ASCII_WORD => {
+                let (before, after) = self.neighbors();
+                let class = binary_boundary_class(
+                    before.is_some_and(is_ascii_word),
+                    after.is_some_and(is_ascii_word),
+                );
+                ASCII_WORD_ENABLED_BY_CLASS[class]
+            }
+            PIKE_BOUNDARY_UNICODE_WORD => {
+                let class = UnicodeLookMatcher::classify_prevalidated(
+                    self.haystack,
+                    self.position,
+                )
+                .class();
+                UNICODE_WORD_ENABLED_BY_CLASS[class]
+            }
+            _ => {
+                debug_assert!(false, "Pike boundary family is canonical");
+                return;
+            }
+        };
+        self.enabled |= enabled;
+        self.prepared_families |= family_bit;
+        #[cfg(test)]
+        {
+            self.family_preparations[family] = self.family_preparations[family]
+                .checked_add(1)
+                .expect("test Pike boundary family preparation count remains bounded");
+        }
+    }
+
+    #[inline]
+    fn edge_enabled(&mut self, kind: EdgeKind) -> Result<bool, SearchError> {
+        let family = match kind {
+            EdgeKind::Epsilon => return Ok(true),
+            EdgeKind::AssertHaystackStart | EdgeKind::AssertHaystackEnd => {
+                PIKE_BOUNDARY_ABSOLUTE
+            }
+            EdgeKind::AssertLineStartLf | EdgeKind::AssertLineEndLf => {
+                PIKE_BOUNDARY_CONFIGURED_LINE
+            }
+            EdgeKind::AssertLineStartCrlf | EdgeKind::AssertLineEndCrlf => {
+                PIKE_BOUNDARY_CRLF_LINE
+            }
+            EdgeKind::AssertWordAscii
+            | EdgeKind::AssertWordAsciiNegate
+            | EdgeKind::AssertWordStartAscii
+            | EdgeKind::AssertWordEndAscii
+            | EdgeKind::AssertWordStartHalfAscii
+            | EdgeKind::AssertWordEndHalfAscii => PIKE_BOUNDARY_ASCII_WORD,
+            EdgeKind::AssertWordUnicode
+            | EdgeKind::AssertWordUnicodeNegate
+            | EdgeKind::AssertWordStartUnicode
+            | EdgeKind::AssertWordEndUnicode
+            | EdgeKind::AssertWordStartHalfUnicode
+            | EdgeKind::AssertWordEndHalfUnicode => PIKE_BOUNDARY_UNICODE_WORD,
+            EdgeKind::ByteRange => {
+                return Err(SearchError::InternalInvariant {
+                    detail: "split state contained a consuming edge",
+                });
+            }
+        };
+        self.prepare_family(family);
+        let bit = kind.assertion_bit().ok_or(SearchError::InternalInvariant {
+            detail: "Pike assertion family lost its canonical bit",
+        })?;
+        Ok(self.enabled & bit != 0)
+    }
+
+    #[cfg(test)]
+    const fn family_preparations(&self) -> [u8; PIKE_BOUNDARY_FAMILY_COUNT] {
+        self.family_preparations
+    }
+
+    #[cfg(test)]
+    const fn neighbor_preparations(&self) -> u8 {
+        self.neighbor_preparations
+    }
+}
+
+impl PikeBoundaryEvaluator for PreparedPikeBoundaryFacts<'_> {
+    #[inline]
+    fn edge_enabled(&mut self, kind: EdgeKind) -> Result<bool, SearchError> {
+        Self::edge_enabled(self, kind)
+    }
+}
+
 fn expand_boundary_roots(
     automaton: &Automaton,
     haystack: &[u8],
@@ -22346,11 +22533,53 @@ fn expand_boundary_roots(
     meter: &mut WorkMeter,
     pending: &mut Option<MatchSpan>,
 ) -> Result<(), SearchError> {
+    if automaton.stats().assertion_edges() == 0 {
+        let mut evaluator = AssertionFreePikeBoundary;
+        expand_boundary_roots_with(
+            automaton,
+            haystack,
+            position,
+            &mut evaluator,
+            workspace,
+            meter,
+            pending,
+        )
+    } else {
+        let mut evaluator = PreparedPikeBoundaryFacts::new(automaton, haystack, position);
+        expand_boundary_roots_with(
+            automaton,
+            haystack,
+            position,
+            &mut evaluator,
+            workspace,
+            meter,
+            pending,
+        )
+    }
+}
+
+fn expand_boundary_roots_with<E: PikeBoundaryEvaluator>(
+    automaton: &Automaton,
+    haystack: &[u8],
+    position: usize,
+    evaluator: &mut E,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+    pending: &mut Option<MatchSpan>,
+) -> Result<(), SearchError> {
     let root_count = workspace.roots_len;
     let mut root_index = 0usize;
     while root_index < root_count {
         let root = workspace.roots[root_index];
-        if let Some(found) = expand_root(automaton, haystack, position, root, workspace, meter)? {
+        if let Some(found) = expand_root(
+            automaton,
+            haystack,
+            position,
+            evaluator,
+            root,
+            workspace,
+            meter,
+        )? {
             *pending = Some(found);
             break;
         }
@@ -22369,6 +22598,7 @@ fn expand_boundary_roots(
             automaton,
             haystack,
             position,
+            evaluator,
             Thread {
                 state: automaton.start,
                 start: position,
@@ -22376,6 +22606,107 @@ fn expand_boundary_roots(
             workspace,
             meter,
         )?;
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the exact-start boundary retains its immutable source and provenance"
+)]
+fn expand_exact_boundary_roots(
+    automaton: &Automaton,
+    haystack: &[u8],
+    position: usize,
+    exact_start: usize,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+    pending: &mut Option<MatchSpan>,
+    initial: &mut bool,
+) -> Result<(), SearchError> {
+    if automaton.stats().assertion_edges() == 0 {
+        let mut evaluator = AssertionFreePikeBoundary;
+        expand_exact_boundary_roots_with(
+            automaton,
+            haystack,
+            position,
+            exact_start,
+            &mut evaluator,
+            workspace,
+            meter,
+            pending,
+            initial,
+        )
+    } else {
+        let mut evaluator = PreparedPikeBoundaryFacts::new(automaton, haystack, position);
+        expand_exact_boundary_roots_with(
+            automaton,
+            haystack,
+            position,
+            exact_start,
+            &mut evaluator,
+            workspace,
+            meter,
+            pending,
+            initial,
+        )
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the generic kernel retains exact-start provenance and boundary state"
+)]
+fn expand_exact_boundary_roots_with<E: PikeBoundaryEvaluator>(
+    automaton: &Automaton,
+    haystack: &[u8],
+    position: usize,
+    exact_start: usize,
+    evaluator: &mut E,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+    pending: &mut Option<MatchSpan>,
+    initial: &mut bool,
+) -> Result<(), SearchError> {
+    let root_count = workspace.roots_len;
+    let mut root_index = 0usize;
+    while root_index < root_count {
+        let root = workspace.roots[root_index];
+        if let Some(found) = expand_root(
+            automaton,
+            haystack,
+            position,
+            evaluator,
+            root,
+            workspace,
+            meter,
+        )? {
+            *pending = Some(found);
+            break;
+        }
+        root_index = root_index
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "exact-start next-boundary root index",
+            })?;
+    }
+    workspace.roots_len = 0;
+
+    if *initial {
+        debug_assert_eq!(root_count, 0);
+        *pending = expand_root(
+            automaton,
+            haystack,
+            position,
+            evaluator,
+            Thread {
+                state: automaton.start,
+                start: exact_start,
+            },
+            workspace,
+            meter,
+        )?;
+        *initial = false;
     }
     Ok(())
 }
@@ -22427,10 +22758,11 @@ fn validate_window(haystack: &[u8], window: SearchWindow) -> Result<(), SearchEr
     Ok(())
 }
 
-fn expand_root(
+fn expand_root<E: PikeBoundaryEvaluator>(
     automaton: &Automaton,
     haystack: &[u8],
     position: usize,
+    evaluator: &mut E,
     root: Thread,
     workspace: &mut K0Workspace,
     meter: &mut WorkMeter,
@@ -22458,12 +22790,7 @@ fn expand_root(
                 // Reverse push produces forward edge order under a LIFO stack.
                 for edge in automaton.state_edges(thread.state).rev() {
                     meter.charge(1, position)?;
-                    let enabled = zero_width_edge_enabled(
-                        automaton,
-                        automaton.edge_kinds[edge],
-                        haystack,
-                        position,
-                    )?;
+                    let enabled = evaluator.edge_enabled(automaton.edge_kinds[edge])?;
                     if enabled {
                         workspace.push_stack(Thread {
                             state: automaton.edge_targets[edge],
@@ -24541,6 +24868,48 @@ mod tests {
                 edge_kinds: super::ASSERTION_KINDS.to_vec(),
                 byte_starts: vec![0; super::ASSERTION_KINDS.len()],
                 byte_ends: vec![0; super::ASSERTION_KINDS.len()],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn repeated_boundary_assertion_roots() -> Automaton {
+        assert_eq!(super::ASSERTION_KIND_COUNT, 18);
+        let mut edge_kinds = Vec::new();
+        for _ in 0..3 {
+            edge_kinds.extend(super::ASSERTION_KINDS);
+        }
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![
+                    StateRole::Split,
+                    StateRole::Split,
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Accept,
+                ],
+                edge_offsets: vec![0, 18, 36, 54, 55, 55],
+                edge_targets: {
+                    let mut targets = vec![3; 54];
+                    targets.push(4);
+                    targets
+                },
+                edge_kinds: {
+                    edge_kinds.push(EdgeKind::ByteRange);
+                    edge_kinds
+                },
+                byte_starts: {
+                    let mut starts = vec![0; 54];
+                    starts.push(b'x');
+                    starts
+                },
+                byte_ends: {
+                    let mut ends = vec![0; 54];
+                    ends.push(b'x');
+                    ends
+                },
             },
             CompileLimits::default(),
         )
@@ -41222,6 +41591,247 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn pike_boundary_facts_match_every_canonical_assertion_and_context() {
+        fn check(plan: &Automaton, haystack: &[u8], position: usize) {
+            let expected = edge_evaluated_assertion_mask(
+                plan.line_terminator(),
+                haystack,
+                position,
+            );
+            let mut facts =
+                super::PreparedPikeBoundaryFacts::new(plan, haystack, position);
+            assert!(facts.edge_enabled(EdgeKind::Epsilon).unwrap());
+            assert_eq!(
+                facts.family_preparations(),
+                [0; super::PIKE_BOUNDARY_FAMILY_COUNT]
+            );
+            assert_eq!(facts.neighbor_preparations(), 0);
+
+            for _ in 0..3 {
+                for kind in super::ASSERTION_KINDS {
+                    let bit = kind.assertion_bit().unwrap();
+                    assert_eq!(
+                        facts.edge_enabled(kind).unwrap(),
+                        expected & bit != 0,
+                        "kind={kind:?} terminator={:#04x} source={haystack:?} position={position}",
+                        plan.line_terminator(),
+                    );
+                }
+            }
+            assert_eq!(
+                facts.family_preparations(),
+                [1; super::PIKE_BOUNDARY_FAMILY_COUNT]
+            );
+            assert_eq!(facts.neighbor_preparations(), 1);
+            assert_eq!(
+                facts.edge_enabled(EdgeKind::ByteRange),
+                Err(SearchError::InternalInvariant {
+                    detail: "split state contained a consuming edge",
+                })
+            );
+            assert_eq!(
+                facts.family_preparations(),
+                [1; super::PIKE_BOUNDARY_FAMILY_COUNT]
+            );
+            assert_eq!(facts.neighbor_preparations(), 1);
+        }
+
+        for line_terminator in u8::MIN..=u8::MAX {
+            let plan = every_assertion().with_line_terminator(line_terminator);
+            let haystacks = [
+                vec![],
+                vec![line_terminator],
+                vec![b'\r', line_terminator, b'\n'],
+                vec![line_terminator, b'_', 0x80, line_terminator],
+            ];
+            for haystack in haystacks {
+                for position in 0..=haystack.len() {
+                    check(&plan, &haystack, position);
+                }
+            }
+        }
+
+        let plan = every_assertion().with_line_terminator(b';');
+        for byte in u8::MIN..=u8::MAX {
+            check(&plan, &[byte], 0);
+            check(&plan, &[byte], 1);
+        }
+        for left in u8::MIN..=u8::MAX {
+            for right in u8::MIN..=u8::MAX {
+                check(&plan, &[left, right], 1);
+            }
+        }
+
+        let unicode_and_malformed = [
+            "é".as_bytes().to_vec(),
+            "α_".as_bytes().to_vec(),
+            " aβ\u{200C}!".as_bytes().to_vec(),
+            vec![0xf0, 0x9f, 0x92, 0xa9],
+            vec![0xf0, 0x28, 0x8c, 0xbc],
+            vec![0xc3],
+            vec![0x80, b'a'],
+            vec![b'a', 0xed, 0xa0, 0x80, b'_'],
+            vec![0xf4, 0x90, 0x80, 0x80],
+        ];
+        for haystack in unicode_and_malformed {
+            for position in 0..=haystack.len() {
+                check(&plan, &haystack, position);
+            }
+        }
+
+        // Window boundaries still observe immutable bytes on both sides from
+        // the original haystack, never a slice-local substitute.
+        let haystack = b"x;\r\na_\xc3\xa9!";
+        for start in 0..=haystack.len() {
+            for end in start..=haystack.len() {
+                let window = SearchWindow::new(start, end);
+                check(&plan, haystack, window.start());
+                check(&plan, haystack, window.end());
+            }
+        }
+    }
+
+    #[test]
+    fn pike_boundary_facts_prepare_only_the_requested_family_once() {
+        let plan = every_assertion().with_line_terminator(b';');
+        let haystack = "a;\r\né_β".as_bytes();
+        let cases = [
+            (super::PIKE_BOUNDARY_ABSOLUTE, EdgeKind::AssertHaystackEnd, 0),
+            (
+                super::PIKE_BOUNDARY_CONFIGURED_LINE,
+                EdgeKind::AssertLineStartLf,
+                1,
+            ),
+            (
+                super::PIKE_BOUNDARY_CRLF_LINE,
+                EdgeKind::AssertLineEndCrlf,
+                1,
+            ),
+            (
+                super::PIKE_BOUNDARY_ASCII_WORD,
+                EdgeKind::AssertWordStartHalfAscii,
+                1,
+            ),
+            (
+                super::PIKE_BOUNDARY_UNICODE_WORD,
+                EdgeKind::AssertWordEndUnicode,
+                0,
+            ),
+        ];
+        for (family, kind, neighbor_preparations) in cases {
+            let mut facts =
+                super::PreparedPikeBoundaryFacts::new(&plan, haystack, 5);
+            let expected =
+                super::zero_width_edge_enabled(&plan, kind, haystack, 5).unwrap();
+            for _ in 0..8 {
+                assert_eq!(facts.edge_enabled(kind).unwrap(), expected);
+            }
+            let mut family_preparations =
+                [0; super::PIKE_BOUNDARY_FAMILY_COUNT];
+            family_preparations[family] = 1;
+            assert_eq!(facts.family_preparations(), family_preparations);
+            assert_eq!(facts.neighbor_preparations(), neighbor_preparations);
+        }
+    }
+
+    #[test]
+    fn pike_boundary_facts_are_shared_by_all_roots_with_exact_work() {
+        struct Run {
+            result: Result<(), SearchError>,
+            work: u64,
+            family_preparations: [u8; super::PIKE_BOUNDARY_FAMILY_COUNT],
+            neighbor_preparations: u8,
+            current_len: usize,
+            roots_len: usize,
+            pending: Option<MatchSpan>,
+        }
+
+        fn run(
+            plan: &Automaton,
+            haystack: &[u8],
+            position: usize,
+            limit: u64,
+        ) -> Run {
+            let mut workspace =
+                K0Workspace::new(plan, WorkspaceLimits::unlimited()).unwrap();
+            workspace
+                .push_root(super::Thread { state: 1, start: 0 })
+                .unwrap();
+            workspace
+                .push_root(super::Thread { state: 2, start: 0 })
+                .unwrap();
+            let mut meter = WorkMeter::new(limit, 0);
+            workspace.begin_boundary(&mut meter, position).unwrap();
+            let mut facts =
+                super::PreparedPikeBoundaryFacts::new(plan, haystack, position);
+            let mut pending = None;
+            let result = super::expand_boundary_roots_with(
+                plan,
+                haystack,
+                position,
+                &mut facts,
+                &mut workspace,
+                &mut meter,
+                &mut pending,
+            );
+            Run {
+                result,
+                work: meter.consumed,
+                family_preparations: facts.family_preparations(),
+                neighbor_preparations: facts.neighbor_preparations(),
+                current_len: workspace.current_len,
+                roots_len: workspace.roots_len,
+                pending,
+            }
+        }
+
+        let plan = repeated_boundary_assertion_roots().with_line_terminator(b';');
+        let haystack = [b'\r', b'_', 0xf0, 0x28, 0x8c, 0xbc];
+        let position = 1;
+        let enabled = super::ASSERTION_KINDS
+            .into_iter()
+            .filter(|&kind| {
+                super::zero_width_edge_enabled(&plan, kind, &haystack, position).unwrap()
+            })
+            .count();
+        let split_visits = 3_u64;
+        let edge_visits = u64::try_from(super::ASSERTION_KIND_COUNT * 3).unwrap();
+        let enabled_target_visits = u64::try_from(enabled * 3).unwrap();
+        let exact = 1 + split_visits + edge_visits + enabled_target_visits;
+
+        let completed = run(&plan, &haystack, position, exact);
+        assert_eq!(completed.result, Ok(()));
+        assert_eq!(completed.work, exact);
+        assert_eq!(
+            completed.family_preparations,
+            [1; super::PIKE_BOUNDARY_FAMILY_COUNT],
+            "the two queued roots and injected start must share one family cache",
+        );
+        assert_eq!(completed.neighbor_preparations, 1);
+        assert_eq!(completed.current_len, 1);
+        assert_eq!(completed.roots_len, 0);
+        assert_eq!(completed.pending, None);
+
+        let one_below = exact.checked_sub(1).unwrap();
+        let refused = run(&plan, &haystack, position, one_below);
+        assert_eq!(
+            refused.result,
+            Err(SearchError::WorkLimitExceeded {
+                limit: one_below,
+                consumed: one_below,
+                requested: 1,
+                position,
+            })
+        );
+        assert_eq!(refused.work, one_below);
+        assert_eq!(
+            refused.family_preparations,
+            [1; super::PIKE_BOUNDARY_FAMILY_COUNT]
+        );
+        assert_eq!(refused.neighbor_preparations, 1);
     }
 
     #[test]
