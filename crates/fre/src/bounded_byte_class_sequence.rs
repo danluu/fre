@@ -3009,7 +3009,7 @@ mod tests {
         };
         let (too_short, accounting) = regex.find(b"a", zero_work).unwrap();
         assert_eq!(too_short, None);
-        assert_eq!(accounting.work(), 0);
+        assert_eq!(accounting.work_or_linear_terms(), 0);
         assert!(matches!(
             regex.find_window(
                 b"abc",

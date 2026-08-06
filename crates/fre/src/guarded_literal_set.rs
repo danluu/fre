@@ -3466,7 +3466,8 @@ mod tests {
         ASCII_WIDE_BYTES, CorrelatedColumns, FIXED_PACKED_PLAN_ID, ONE_BYTE_PLAN_ID,
         PLAN_ID, PackedProbeResult, Plan, SearchError, SingleByteWordSet,
         WIDE_CORRELATED_BOUNDARY_COLUMNS, WIDE_PACKED_PLAN_ID, WIDE_PACKED_PREFIX_BYTES,
-        WIDE_RANKED_COLUMN_LIMIT, WIDE_REJECTION_PACKED_PROBE_BYTES,
+        WIDE_CORRELATED_SAMPLE_BYTES, WIDE_RANKED_COLUMN_LIMIT,
+        WIDE_REJECTION_PACKED_PROBE_BYTES,
         WIDE_SECONDARY_COLUMN_LIMIT, WideByteAnchor, WideFindResult,
         correlated_columns_dimensions, extraction_limits,
     };
@@ -3997,7 +3998,7 @@ mod tests {
             .iter()
             .map(|word| word.as_slice())
             .collect::<Vec<_>>();
-        let all_words = plan(&all_word_refs);
+        let all_words = self::plan(&all_word_refs);
         assert_eq!(all_words.plan_id(), ONE_BYTE_PLAN_ID);
         assert!(
             all_words
@@ -4421,7 +4422,7 @@ mod tests {
         assert!(!correlated.matches(&recombined));
 
         let narrow_words: &[&[u8]] = &[b"aa", b"bc", b"ce", b"dg"];
-        let narrow = plan(narrow_words);
+        let narrow = self::plan(narrow_words);
         let narrow_correlated = narrow
             .wide_anchor
             .as_ref()

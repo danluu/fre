@@ -12679,15 +12679,18 @@ mod tests {
         K0_MANDATORY_CUT_PLAN_CONSTRUCTION_WORK,
         K0_NEGATIVE_PREFILTER_PRESENT_STREAK_LIMIT, K0_NEGATIVE_PREFILTER_SIZE_CLASS_STATES,
         k0_finite_prefix_hedge_window, k0_finite_suffix_prefix_hedge_bytes,
+        k0_finite_suffix_incumbent_single_pass_negative,
         k0_mandatory_suffix_completed_negative_is_useful, K0FinitePrefixExistsHedge,
         K0FinitePrefixSpanHedge, K0FiniteSuffixDirectRoute,
+        observe_k0_finite_suffix_direct_incumbent,
         observe_k0_finite_suffix_incumbent, observe_k0_finite_suffix_loss,
         observe_k0_finite_suffix_win, observe_k0_mandatory_suffix_completed_negative,
         run_k0_finite_prefix_exists_hedge, run_k0_finite_prefix_span_hedge,
         run_k0_negative_prefilter, select_k0_finite_suffix_direct_route,
         select_k0_finite_suffix_route, try_build_k0_mandatory_cut,
         try_box_bounded_literal_class_run_owner, try_k0_mandatory_suffix_span_start,
-        BYTE_SET_BLOCK_BYTES,
+        BYTE_SET_BLOCK_BYTES, K0_FINITE_SUFFIX_INCUMBENT_ROUTE,
+        K0_FINITE_SUFFIX_SINGLE_PASS_NEGATIVE,
     };
     use fre_automata::{MandatoryCutAnalysisLimits, MaximumConsumedDistance};
     use fre_kernels::{
@@ -13657,7 +13660,7 @@ mod tests {
             ),
         );
 
-        let window_start = 37;
+        let window_start: usize = 37;
         let first_unproved_start = window_start
             .checked_add(prefix_hedge_bytes)
             .expect("bounded hedge start fits usize");
