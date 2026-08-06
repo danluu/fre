@@ -42,10 +42,10 @@
 //! that authenticated call admits first and runs the portable proofs only on
 //! a decline. If a native scan then reaches a partial-DFA hole, the current
 //! compiler continues the same exclusive session through
-//! [`fre_aot_regex_runtime_search_exclusive_from_partial_preflight_v1`]. Its
-//! single-use preflight ticket replaces repeated program authentication while
-//! the compact canonical resume-state index is still checked before K0
-//! continues without replaying the prefix. The fully authenticating
+//! [`fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v1`].
+//! Its single-use preflight ticket replaces repeated program and window
+//! authentication while the compact canonical resume-state index is still
+//! checked before K0 continues without replaying the prefix. The fully authenticating
 //! [`fre_aot_regex_runtime_search_exclusive_from_partial_v1`] remains available
 //! for older generated objects.
 //! A variable-width Span table that completes locally with only its selected
@@ -405,6 +405,23 @@ impl PreparedAotRegex {
             .search_from_preflight_retained_partial_resume_with_workspace(
                 haystack,
                 window,
+                &mut self.workspace,
+                resume_state,
+                resume_position,
+                pending_end,
+            )
+    }
+
+    fn search_from_preflight_retained_partial_resume_ticket(
+        &mut self,
+        haystack: &[u8],
+        resume_state: usize,
+        resume_position: usize,
+        pending_end: Option<usize>,
+    ) -> Result<MatchResult, CompileError> {
+        self.program
+            .search_from_preflight_retained_partial_resume_ticket_with_workspace(
+                haystack,
                 &mut self.workspace,
                 resume_state,
                 resume_position,
@@ -1200,6 +1217,60 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_search_exclusive_from_partial_pre
         let Ok(found) = prepared.search_from_preflight_retained_partial_resume(
             haystack,
             SearchWindow::new(window_start, window_end),
+            resume_state,
+            resume_position,
+            pending_end,
+        ) else {
+            return STATUS_RUNTIME_FAILURE;
+        };
+        let (status, result) = encode_match_result(found);
+        result_ptr.write(result);
+        status
+    }))
+    .unwrap_or(STATUS_RUNTIME_FAILURE)
+}
+
+/// Continue a combined-preflight transaction without passing its already
+/// authenticated identity or exact window back across the private ABI.
+///
+/// The single-use workspace ticket supplies the admitted window. This compact
+/// compiler-private entry therefore needs only the live handle and haystack,
+/// untouched result, and native core's state/position/pending payload.
+///
+/// # Safety
+///
+/// This function may only be called by the compiler-emitted wrapper after its
+/// immediately preceding combined preflight admitted local native execution
+/// for this handle and haystack. The handle, haystack, and result pointer must
+/// remain live, aligned, disjoint, and exclusively owned until this immediate
+/// continuation returns.
+#[unsafe(no_mangle)]
+#[allow(
+    unsafe_code,
+    clippy::too_many_arguments,
+    reason = "the compact compiler-private continuation maps one native payload"
+)]
+pub unsafe extern "C" fn fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v1(
+    handle: FreAotRegexExclusiveHandleV1,
+    haystack_ptr: *const u8,
+    haystack_len: usize,
+    result_ptr: *mut FreAotRegexResultV1,
+    resume_state: usize,
+    resume_position: usize,
+    pending_end_present: u32,
+    pending_end: usize,
+) -> u32 {
+    if pending_end_present > 1 {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: the compiler-owned ticket proves that the immediately preceding
+    // preflight authenticated these live allocations for exclusive use.
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        let prepared = &mut *handle.0.cast::<PreparedAotRegex>();
+        let haystack = std::slice::from_raw_parts(haystack_ptr, haystack_len);
+        let pending_end = (pending_end_present == 1).then_some(pending_end);
+        let Ok(found) = prepared.search_from_preflight_retained_partial_resume_ticket(
+            haystack,
             resume_state,
             resume_position,
             pending_end,
@@ -2022,6 +2093,9 @@ mod tests {
         assert!(!C_API_V1_HEADER.contains(
             "fre_aot_regex_runtime_search_exclusive_from_partial_preflight_v1"
         ));
+        assert!(!C_API_V1_HEADER.contains(
+            "fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v1"
+        ));
 
         let _: unsafe extern "C" fn(*const u8, usize, *mut FreAotRegexPreparedHandleV1) -> u32 =
             fre_aot_regex_runtime_prepare_v1;
@@ -2089,6 +2163,39 @@ mod tests {
                     0,
                     &raw mut malformed_result,
                     std::ptr::null(),
+                    0,
+                    0,
+                    2,
+                    0,
+                )
+            },
+            STATUS_INVALID_ARGUMENT
+        );
+        assert_eq!(
+            malformed_result,
+            FreAotRegexResultV1 {
+                start: 123,
+                end: 456,
+            }
+        );
+        let _: unsafe extern "C" fn(
+            FreAotRegexExclusiveHandleV1,
+            *const u8,
+            usize,
+            *mut FreAotRegexResultV1,
+            usize,
+            usize,
+            u32,
+            usize,
+        ) -> u32 = fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v1;
+        // SAFETY: the malformed discriminator is rejected before dereference.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v1(
+                    FreAotRegexExclusiveHandleV1::INVALID,
+                    std::ptr::null(),
+                    0,
+                    &raw mut malformed_result,
                     0,
                     0,
                     2,

@@ -620,7 +620,7 @@ const PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL: usize = 11;
 
 const RUNTIME_SYMBOL_NAME: &str = "fre_aot_regex_runtime_search_v1";
 const PARTIAL_RUNTIME_SYMBOL_NAME: &str =
-    "fre_aot_regex_runtime_search_exclusive_from_partial_preflight_v1";
+    "fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v1";
 const PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_search_exclusive_v1";
 const PREPARED_PREFLIGHT_RUNTIME_SYMBOL_NAME: &str =
@@ -10230,7 +10230,7 @@ fn lower_x86_64_runtime_adapter() -> Result<(Vec<u8>, Vec<ModuleRelocation>), Ob
 fn lower_x86_64_partial_prepared(
     view: &NativePartialProgramView<'_>,
 ) -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
-    const FRAME_BYTES: u8 = 104;
+    const FRAME_BYTES: u8 = 88;
     let mut assembler = X86Assembler::new();
     let span_recovery = view.output == OutputContract::Span
         && !view.dfa.initial_pending
@@ -10277,15 +10277,15 @@ fn lower_x86_64_partial_prepared(
     assembler.instruction(&compare_minimum)?;
     assembler.branch(&[0x0f, 0x82], fallback_runtime)?;
 
-    // Entry RSP is 8 modulo 16. A 104-byte frame aligns it for calls, reserves
-    // five SysV continuation arguments, and leaves two exact-window outputs.
+    // Entry RSP is 8 modulo 16. An 88-byte frame aligns it for calls, reserves
+    // two SysV private arguments, and leaves two exact-window outputs.
     assembler.instruction(&[0x48, 0x83, 0xec, FRAME_BYTES])?;
-    assembler.instruction(&[0x48, 0x89, 0x7c, 0x24, 0x28])?;
-    assembler.instruction(&[0x48, 0x89, 0x74, 0x24, 0x30])?;
-    assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x38])?;
-    assembler.instruction(&[0x48, 0x89, 0x4c, 0x24, 0x40])?;
-    assembler.instruction(&[0x4c, 0x89, 0x44, 0x24, 0x48])?;
-    assembler.instruction(&[0x4c, 0x89, 0x4c, 0x24, 0x50])?;
+    assembler.instruction(&[0x48, 0x89, 0x7c, 0x24, 0x10])?;
+    assembler.instruction(&[0x48, 0x89, 0x74, 0x24, 0x18])?;
+    assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x20])?;
+    assembler.instruction(&[0x48, 0x89, 0x4c, 0x24, 0x28])?;
+    assembler.instruction(&[0x4c, 0x89, 0x44, 0x24, 0x30])?;
+    assembler.instruction(&[0x4c, 0x89, 0x4c, 0x24, 0x38])?;
 
     // One authenticated runtime transaction settles the prior local native
     // result, runs suffix then cut, and consults adaptive admission. SysV
@@ -10295,14 +10295,14 @@ fn lower_x86_64_partial_prepared(
     assembler.bind(preflight_identity_displacement_label)?;
     push_bytes(&mut assembler.code, &[0; 4])?;
     assembler.instruction(&[0x48, 0x89, 0x04, 0x24])?;
-    assembler.instruction(&[0x48, 0x8d, 0x44, 0x24, 0x58])?;
+    assembler.instruction(&[0x48, 0x8d, 0x44, 0x24, 0x40])?;
     assembler.instruction(&[0x48, 0x89, 0x44, 0x24, 0x08])?;
-    assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x28])?;
-    assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x30])?;
-    assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x38])?;
-    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x40])?;
-    assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x48])?;
-    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x50])?;
+    assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x10])?;
+    assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x18])?;
+    assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x20])?;
+    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x28])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x30])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x38])?;
     assembler.instruction(&[0xe8])?;
     let preflight_runtime_displacement_label = assembler.label()?;
     assembler.bind(preflight_runtime_displacement_label)?;
@@ -10313,23 +10313,23 @@ fn lower_x86_64_partial_prepared(
     assembler.instruction(&[0xc3])?;
 
     assembler.bind(preflight_enter)?;
-    assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x28])?;
-    assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x30])?;
-    assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x38])?;
-    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x58])?;
-    assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x60])?;
-    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x50])?;
-    assembler.instruction(&[0x48, 0x89, 0x4c, 0x24, 0x40])?;
-    assembler.instruction(&[0x4c, 0x89, 0x44, 0x24, 0x48])?;
+    assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x10])?;
+    assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x18])?;
+    assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x20])?;
+    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x40])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x48])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x38])?;
+    assembler.instruction(&[0x48, 0x89, 0x4c, 0x24, 0x28])?;
+    assembler.instruction(&[0x4c, 0x89, 0x44, 0x24, 0x30])?;
 
     // Execute the receipt-authenticated local native core over the exact
     // window returned by preflight. It returns match/resume payloads in
     // caller-saved registers; these outgoing stack slots remain available to
     // an Exists retry scratch path and the continuation ABI.
-    assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x30])?; // haystack
-    assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x38])?; // length
-    assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x40])?; // narrowed start
-    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x48])?; // narrowed end
+    assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x18])?; // haystack
+    assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x20])?; // length
+    assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x28])?; // narrowed start
+    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x30])?; // narrowed end
     assembler.instruction(&[0x4c, 0x8d, 0x04, 0x24])?; // result = rsp
     assembler.instruction(&[0xe8])?;
     let native_core_displacement_label = assembler.label()?;
@@ -10345,14 +10345,14 @@ fn lower_x86_64_partial_prepared(
     }
     assembler.instruction(&[0x85, 0xc0])?;
     assembler.branch(&[0x0f, 0x85], native_invalid)?;
-    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x50])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x38])?;
     assembler.instruction(&[0x49, 0xc7, 0x01, 0, 0, 0, 0])?;
     assembler.instruction(&[0x49, 0xc7, 0x41, 0x08, 0, 0, 0, 0])?;
     assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
     assembler.instruction(&[0xc3])?;
 
     assembler.bind(native_match)?;
-    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x50])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x38])?;
     if view.output == OutputContract::Exists {
         assembler.instruction(&[0x31, 0xc0])?;
         assembler.instruction(&[0x49, 0x89, 0x01])?;
@@ -10379,12 +10379,12 @@ fn lower_x86_64_partial_prepared(
         push_bytes(&mut assembler.code, &[0; 4])?;
         assembler.instruction(&[0x48, 0x89, 0x04, 0x24])?;
         assembler.instruction(&[0x4c, 0x89, 0x5c, 0x24, 0x08])?;
-        assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x28])?;
-        assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x30])?;
-        assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x38])?;
-        assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x40])?;
-        assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x48])?;
-        assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x50])?;
+        assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x10])?;
+        assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x18])?;
+        assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x20])?;
+        assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x28])?;
+        assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x30])?;
+        assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x38])?;
         assembler.instruction(&[0xe8])?;
         let recovery_runtime_displacement_label = assembler.label()?;
         assembler.bind(recovery_runtime_displacement_label)?;
@@ -10400,28 +10400,21 @@ fn lower_x86_64_partial_prepared(
     };
 
     assembler.bind(native_resume)?;
-    // Convert the core's r10/rdx/r11 state, position, and pending endpoint
-    // directly into SysV arguments seven through eleven. No private-frame
-    // loads, scalar-table token reconstruction, or rescanning is required.
-    assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x18, 0, 0, 0, 0])?;
+    // Convert the core's r10/rdx/r11 state, position, and pending endpoint into
+    // the compact private ABI. Only pending mode and endpoint use SysV stack
+    // arguments; identity and window stay in the consumed preflight ticket.
+    assembler.instruction(&[0x4c, 0x89, 0x5c, 0x24, 0x08])?;
+    assembler.instruction(&[0x48, 0xc7, 0x04, 0x24, 0, 0, 0, 0])?;
     assembler.instruction(&[0x49, 0x83, 0xfb, 0xff])?;
     assembler.branch(&[0x0f, 0x84], native_pending_ready)?;
-    assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x18, 1, 0, 0, 0])?;
+    assembler.instruction(&[0x48, 0xc7, 0x04, 0x24, 1, 0, 0, 0])?;
     assembler.bind(native_pending_ready)?;
-    assembler.instruction(&[0x48, 0x8d, 0x05])?;
-    let identity_displacement_label = assembler.label()?;
-    assembler.bind(identity_displacement_label)?;
-    push_bytes(&mut assembler.code, &[0; 4])?;
-    assembler.instruction(&[0x48, 0x89, 0x04, 0x24])?;
-    assembler.instruction(&[0x4c, 0x89, 0x54, 0x24, 0x08])?;
-    assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x10])?;
-    assembler.instruction(&[0x4c, 0x89, 0x5c, 0x24, 0x20])?;
-    assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x28])?;
-    assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x30])?;
-    assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x38])?;
-    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x40])?;
-    assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x48])?;
-    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x50])?;
+    assembler.instruction(&[0x49, 0x89, 0xd1])?; // position -> r9
+    assembler.instruction(&[0x4d, 0x89, 0xd0])?; // state -> r8
+    assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x10])?;
+    assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x18])?;
+    assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x20])?;
+    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x38])?;
     assembler.instruction(&[0xe8])?;
     let runtime_displacement_label = assembler.label()?;
     assembler.bind(runtime_displacement_label)?;
@@ -10461,7 +10454,6 @@ fn lower_x86_64_partial_prepared(
             ))
         })
         .transpose()?;
-    let identity_displacement = finished.label_offset(identity_displacement_label)?;
     let runtime_displacement = finished.label_offset(runtime_displacement_label)?;
     let fallback_runtime_displacement =
         finished.label_offset(fallback_runtime_displacement_label)?;
@@ -10494,13 +10486,6 @@ fn lower_x86_64_partial_prepared(
             )?,
             kind: RelocationKind::X86PltRelative32,
             symbol: PREPARED_PREFLIGHT_RUNTIME_SYMBOL,
-            addend: -4,
-        },
-        ModuleRelocation {
-            section: TEXT_SECTION,
-            offset: offset_u64(identity_displacement, "x86 partial identity relocation")?,
-            kind: RelocationKind::X86PcRelative32,
-            symbol: PARTIAL_IDENTITY_SYMBOL,
             addend: -4,
         },
         ModuleRelocation {
@@ -16055,7 +16040,7 @@ fn lower_aarch64_runtime_adapter() -> Result<(Vec<u8>, Vec<ModuleRelocation>), O
 fn lower_aarch64_partial_prepared(
     view: &NativePartialProgramView<'_>,
 ) -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
-    const FRAME_BYTES: u16 = 128;
+    const FRAME_BYTES: u16 = 80;
     let mut assembler = Aarch64Assembler::new();
     let span_recovery = view.output == OutputContract::Span
         && !view.dfa.initial_pending
@@ -16096,13 +16081,13 @@ fn lower_aarch64_partial_prepared(
     assembler.branch_cond(AARCH64_LO, fallback_runtime)?;
 
     assembler.instruction(aarch64_sub_x_imm(31, 31, FRAME_BYTES)?)?;
-    assembler.instruction(aarch64_store_x(30, 31, 120)?)?;
-    assembler.instruction(aarch64_store_x(0, 31, 32)?)?;
-    assembler.instruction(aarch64_store_x(1, 31, 40)?)?;
-    assembler.instruction(aarch64_store_x(2, 31, 48)?)?;
-    assembler.instruction(aarch64_store_x(3, 31, 56)?)?;
-    assembler.instruction(aarch64_store_x(4, 31, 64)?)?;
-    assembler.instruction(aarch64_store_x(5, 31, 72)?)?;
+    assembler.instruction(aarch64_store_x(30, 31, 72)?)?;
+    assembler.instruction(aarch64_store_x(0, 31, 0)?)?;
+    assembler.instruction(aarch64_store_x(1, 31, 8)?)?;
+    assembler.instruction(aarch64_store_x(2, 31, 16)?)?;
+    assembler.instruction(aarch64_store_x(3, 31, 24)?)?;
+    assembler.instruction(aarch64_store_x(4, 31, 32)?)?;
+    assembler.instruction(aarch64_store_x(5, 31, 40)?)?;
 
     // AAPCS64 carries the authenticated identity and exact-window output in
     // x6/x7, so the combined suffix/cut/admission transaction needs no stack
@@ -16110,40 +16095,40 @@ fn lower_aarch64_partial_prepared(
     let preflight_identity_page = assembler.instruction(0x9000_0006)?;
     let preflight_identity_page_offset =
         assembler.instruction(aarch64_add_x_imm(6, 6, 0)?)?;
-    assembler.instruction(aarch64_add_x_imm(7, 31, 80)?)?;
-    assembler.instruction(aarch64_load_x_imm(0, 31, 32)?)?;
-    assembler.instruction(aarch64_load_x_imm(1, 31, 40)?)?;
-    assembler.instruction(aarch64_load_x_imm(2, 31, 48)?)?;
-    assembler.instruction(aarch64_load_x_imm(3, 31, 56)?)?;
-    assembler.instruction(aarch64_load_x_imm(4, 31, 64)?)?;
-    assembler.instruction(aarch64_load_x_imm(5, 31, 72)?)?;
+    assembler.instruction(aarch64_add_x_imm(7, 31, 48)?)?;
+    assembler.instruction(aarch64_load_x_imm(0, 31, 0)?)?;
+    assembler.instruction(aarch64_load_x_imm(1, 31, 8)?)?;
+    assembler.instruction(aarch64_load_x_imm(2, 31, 16)?)?;
+    assembler.instruction(aarch64_load_x_imm(3, 31, 24)?)?;
+    assembler.instruction(aarch64_load_x_imm(4, 31, 32)?)?;
+    assembler.instruction(aarch64_load_x_imm(5, 31, 40)?)?;
     let preflight_runtime_branch = assembler.instruction(0x9400_0000)?;
     assembler.instruction(aarch64_cmp_w_imm(
         0,
         u16::from(PARTIAL_PREFLIGHT_ENTER_STATUS),
     )?)?;
     assembler.branch_cond(AARCH64_EQ, preflight_enter)?;
-    assembler.instruction(aarch64_load_x_imm(30, 31, 120)?)?;
+    assembler.instruction(aarch64_load_x_imm(30, 31, 72)?)?;
     assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
     assembler.instruction(0xd65f_03c0)?;
 
     assembler.bind(preflight_enter)?;
-    assembler.instruction(aarch64_load_x_imm(0, 31, 32)?)?;
-    assembler.instruction(aarch64_load_x_imm(1, 31, 40)?)?;
-    assembler.instruction(aarch64_load_x_imm(2, 31, 48)?)?;
-    assembler.instruction(aarch64_load_x_imm(3, 31, 80)?)?;
-    assembler.instruction(aarch64_load_x_imm(4, 31, 88)?)?;
-    assembler.instruction(aarch64_load_x_imm(5, 31, 72)?)?;
-    assembler.instruction(aarch64_store_x(3, 31, 56)?)?;
-    assembler.instruction(aarch64_store_x(4, 31, 64)?)?;
+    assembler.instruction(aarch64_load_x_imm(0, 31, 0)?)?;
+    assembler.instruction(aarch64_load_x_imm(1, 31, 8)?)?;
+    assembler.instruction(aarch64_load_x_imm(2, 31, 16)?)?;
+    assembler.instruction(aarch64_load_x_imm(3, 31, 48)?)?;
+    assembler.instruction(aarch64_load_x_imm(4, 31, 56)?)?;
+    assembler.instruction(aarch64_load_x_imm(5, 31, 40)?)?;
+    assembler.instruction(aarch64_store_x(3, 31, 24)?)?;
+    assembler.instruction(aarch64_store_x(4, 31, 32)?)?;
 
     // The combined preflight is authoritative and always runs first. The
     // local core returns match/resume payloads in caller-saved registers, so
     // the exact-window slots need no private-outcome initialization.
-    assembler.instruction(aarch64_load_x_imm(0, 31, 40)?)?; // haystack
-    assembler.instruction(aarch64_load_x_imm(1, 31, 48)?)?; // length
-    assembler.instruction(aarch64_load_x_imm(2, 31, 56)?)?; // narrowed start
-    assembler.instruction(aarch64_load_x_imm(3, 31, 64)?)?; // narrowed end
+    assembler.instruction(aarch64_load_x_imm(0, 31, 8)?)?; // haystack
+    assembler.instruction(aarch64_load_x_imm(1, 31, 16)?)?; // length
+    assembler.instruction(aarch64_load_x_imm(2, 31, 24)?)?; // narrowed start
+    assembler.instruction(aarch64_load_x_imm(3, 31, 32)?)?; // narrowed end
     let native_core_branch = assembler.instruction(0x9400_0000)?;
     assembler.instruction(aarch64_cmp_w_imm(0, 1)?)?;
     assembler.branch_cond(AARCH64_EQ, native_match)?;
@@ -16163,15 +16148,15 @@ fn lower_aarch64_partial_prepared(
     }
     assembler.instruction(aarch64_cmp_w_imm(0, 0)?)?;
     assembler.branch_cond(AARCH64_NE, native_invalid)?;
-    assembler.instruction(aarch64_load_x_imm(5, 31, 72)?)?;
+    assembler.instruction(aarch64_load_x_imm(5, 31, 40)?)?;
     assembler.instruction(aarch64_store_x(31, 5, 0)?)?;
     assembler.instruction(aarch64_store_x(31, 5, 8)?)?;
-    assembler.instruction(aarch64_load_x_imm(30, 31, 120)?)?;
+    assembler.instruction(aarch64_load_x_imm(30, 31, 72)?)?;
     assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
     assembler.instruction(0xd65f_03c0)?;
 
     assembler.bind(native_match)?;
-    assembler.instruction(aarch64_load_x_imm(5, 31, 72)?)?;
+    assembler.instruction(aarch64_load_x_imm(5, 31, 40)?)?;
     if view.output == OutputContract::Exists {
         assembler.instruction(aarch64_store_x(31, 5, 0)?)?;
         assembler.instruction(aarch64_store_x(31, 5, 8)?)?;
@@ -16183,7 +16168,7 @@ fn lower_aarch64_partial_prepared(
         assembler.instruction(aarch64_store_x(7, 5, 8)?)?;
     }
     assembler.instruction(aarch64_movz_w(0, 1)?)?;
-    assembler.instruction(aarch64_load_x_imm(30, 31, 120)?)?;
+    assembler.instruction(aarch64_load_x_imm(30, 31, 72)?)?;
     assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
     assembler.instruction(0xd65f_03c0)?;
 
@@ -16195,14 +16180,14 @@ fn lower_aarch64_partial_prepared(
         let recovery_identity_page = assembler.instruction(0x9000_0006)?;
         let recovery_identity_page_offset =
             assembler.instruction(aarch64_add_x_imm(6, 6, 0)?)?;
-        assembler.instruction(aarch64_load_x_imm(0, 31, 32)?)?;
-        assembler.instruction(aarch64_load_x_imm(1, 31, 40)?)?;
-        assembler.instruction(aarch64_load_x_imm(2, 31, 48)?)?;
-        assembler.instruction(aarch64_load_x_imm(3, 31, 56)?)?;
-        assembler.instruction(aarch64_load_x_imm(4, 31, 64)?)?;
-        assembler.instruction(aarch64_load_x_imm(5, 31, 72)?)?;
+        assembler.instruction(aarch64_load_x_imm(0, 31, 0)?)?;
+        assembler.instruction(aarch64_load_x_imm(1, 31, 8)?)?;
+        assembler.instruction(aarch64_load_x_imm(2, 31, 16)?)?;
+        assembler.instruction(aarch64_load_x_imm(3, 31, 24)?)?;
+        assembler.instruction(aarch64_load_x_imm(4, 31, 32)?)?;
+        assembler.instruction(aarch64_load_x_imm(5, 31, 40)?)?;
         let recovery_runtime_branch = assembler.instruction(0x9400_0000)?;
-        assembler.instruction(aarch64_load_x_imm(30, 31, 120)?)?;
+        assembler.instruction(aarch64_load_x_imm(30, 31, 72)?)?;
         assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
         assembler.instruction(0xd65f_03c0)?;
         Some((
@@ -16215,34 +16200,28 @@ fn lower_aarch64_partial_prepared(
     };
 
     assembler.bind(native_resume)?;
-    // Convert the core's x6/x2/x7 state, position, and pending endpoint
-    // directly into AAPCS64 arguments seven through eleven.
-    assembler.instruction(aarch64_store_x(2, 31, 0)?)?;
-    assembler.instruction(aarch64_store_x(7, 31, 16)?)?;
-    assembler.instruction(aarch64_movz_w(14, 0)?)?;
+    // Convert the core's x6/x2/x7 state, position, and pending endpoint into
+    // the compact eight-register ABI; the preflight ticket owns the window.
+    assembler.instruction(aarch64_mov_x(5, 2)?)?;
+    assembler.instruction(aarch64_mov_x(4, 6)?)?;
+    assembler.instruction(aarch64_movz_w(6, 0)?)?;
     aarch64_load_u64_constant(&mut assembler, 10, u64::MAX)?;
     assembler.instruction(aarch64_cmp_x(7, 10)?)?;
     assembler.branch_cond(AARCH64_EQ, native_pending_ready)?;
-    assembler.instruction(aarch64_movz_w(14, 1)?)?;
+    assembler.instruction(aarch64_movz_w(6, 1)?)?;
     assembler.bind(native_pending_ready)?;
-    assembler.instruction(aarch64_store_x(14, 31, 8)?)?;
-    assembler.instruction(aarch64_mov_x(7, 6)?)?;
-    let identity_page = assembler.instruction(0x9000_0006)?; // adrp x6, identity
-    let identity_page_offset = assembler.instruction(aarch64_add_x_imm(6, 6, 0)?)?;
-    assembler.instruction(aarch64_load_x_imm(0, 31, 32)?)?;
-    assembler.instruction(aarch64_load_x_imm(1, 31, 40)?)?;
-    assembler.instruction(aarch64_load_x_imm(2, 31, 48)?)?;
-    assembler.instruction(aarch64_load_x_imm(3, 31, 56)?)?;
-    assembler.instruction(aarch64_load_x_imm(4, 31, 64)?)?;
-    assembler.instruction(aarch64_load_x_imm(5, 31, 72)?)?;
+    assembler.instruction(aarch64_load_x_imm(0, 31, 0)?)?;
+    assembler.instruction(aarch64_load_x_imm(1, 31, 8)?)?;
+    assembler.instruction(aarch64_load_x_imm(2, 31, 16)?)?;
+    assembler.instruction(aarch64_load_x_imm(3, 31, 40)?)?;
     let runtime_branch = assembler.instruction(0x9400_0000)?; // bl runtime helper
-    assembler.instruction(aarch64_load_x_imm(30, 31, 120)?)?;
+    assembler.instruction(aarch64_load_x_imm(30, 31, 72)?)?;
     assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
     assembler.instruction(0xd65f_03c0)?;
 
     assembler.bind(native_invalid)?;
     assembler.instruction(aarch64_movz_w(0, 2)?)?;
-    assembler.instruction(aarch64_load_x_imm(30, 31, 120)?)?;
+    assembler.instruction(aarch64_load_x_imm(30, 31, 72)?)?;
     assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
     assembler.instruction(0xd65f_03c0)?;
 
@@ -16261,8 +16240,6 @@ fn lower_aarch64_partial_prepared(
         preflight_identity_page_offset,
         preflight_runtime_branch,
         native_core_branch,
-        identity_page,
-        identity_page_offset,
         runtime_branch,
         fallback_runtime_branch,
     ];
@@ -16314,21 +16291,7 @@ fn lower_aarch64_partial_prepared(
         },
         ModuleRelocation {
             section: TEXT_SECTION,
-            offset: offset_u64(relocation_offsets[4], "AArch64 partial identity ADRP")?,
-            kind: RelocationKind::Aarch64Page21,
-            symbol: PARTIAL_IDENTITY_SYMBOL,
-            addend: 0,
-        },
-        ModuleRelocation {
-            section: TEXT_SECTION,
-            offset: offset_u64(relocation_offsets[5], "AArch64 partial identity ADD")?,
-            kind: RelocationKind::Aarch64PageOff12,
-            symbol: PARTIAL_IDENTITY_SYMBOL,
-            addend: 0,
-        },
-        ModuleRelocation {
-            section: TEXT_SECTION,
-            offset: offset_u64(relocation_offsets[6], "AArch64 partial runtime branch")?,
+            offset: offset_u64(relocation_offsets[4], "AArch64 partial runtime branch")?,
             kind: RelocationKind::Aarch64Branch26,
             symbol: PARTIAL_RUNTIME_SYMBOL,
             addend: 0,
@@ -16336,7 +16299,7 @@ fn lower_aarch64_partial_prepared(
         ModuleRelocation {
             section: TEXT_SECTION,
             offset: offset_u64(
-                relocation_offsets[7],
+                relocation_offsets[5],
                 "AArch64 prepared fallback runtime branch",
             )?,
             kind: RelocationKind::Aarch64Branch26,
@@ -19937,7 +19900,7 @@ mod tests {
             .expect("partial prepared view");
 
         let (x86, x86_relocations) = lower_x86_64_partial_prepared(&view).unwrap();
-        assert_eq!(x86.len(), 433, "x86 register-outcome prepared wrapper size");
+        assert_eq!(x86.len(), 402, "x86 compact-resume prepared wrapper size");
         assert_eq!(
             x86_relocations
                 .iter()
@@ -19947,7 +19910,6 @@ mod tests {
                 PARTIAL_IDENTITY_SYMBOL,
                 PARTIAL_NATIVE_CORE_SYMBOL,
                 PREPARED_PREFLIGHT_RUNTIME_SYMBOL,
-                PARTIAL_IDENTITY_SYMBOL,
                 PARTIAL_RUNTIME_SYMBOL,
                 PREPARED_FALLBACK_RUNTIME_SYMBOL,
             ]
@@ -19965,7 +19927,7 @@ mod tests {
                 .to_le_bytes(),
         );
         assert!(x86.windows(x86_floor.len()).any(|bytes| bytes == x86_floor));
-        assert!(x86.windows(4).any(|bytes| bytes == [0x48, 0x83, 0xec, 104]));
+        assert!(x86.windows(4).any(|bytes| bytes == [0x48, 0x83, 0xec, 88]));
         let native_core_offset = usize::try_from(x86_relocations[1].offset).unwrap();
         assert_eq!(x86.get(native_core_offset.wrapping_sub(1)), Some(&0xe8));
         let caller_zero_start = x86
@@ -19986,22 +19948,22 @@ mod tests {
         );
         assert!(
             x86.windows(5)
-                .any(|bytes| bytes == [0x48, 0x8b, 0x4c, 0x24, 0x58])
+                .any(|bytes| bytes == [0x48, 0x8b, 0x4c, 0x24, 0x40])
         );
         assert!(
             x86.windows(5)
-                .any(|bytes| bytes == [0x4c, 0x8b, 0x44, 0x24, 0x60])
+                .any(|bytes| bytes == [0x4c, 0x8b, 0x44, 0x24, 0x48])
         );
-        let runtime_offset = usize::try_from(x86_relocations[4].offset).unwrap();
+        let runtime_offset = usize::try_from(x86_relocations[3].offset).unwrap();
         assert_eq!(x86.get(runtime_offset.wrapping_sub(1)), Some(&0xe8));
-        let fallback_offset = usize::try_from(x86_relocations[5].offset).unwrap();
+        let fallback_offset = usize::try_from(x86_relocations[4].offset).unwrap();
         assert_eq!(x86.get(fallback_offset.wrapping_sub(1)), Some(&0xe9));
 
         let (aarch64, aarch64_relocations) = lower_aarch64_partial_prepared(&view).unwrap();
         assert_eq!(
             aarch64.len(),
-            424,
-            "AArch64 register-outcome prepared wrapper size"
+            400,
+            "AArch64 compact-resume prepared wrapper size"
         );
         assert_eq!(
             aarch64_relocations
@@ -20013,8 +19975,6 @@ mod tests {
                 PARTIAL_IDENTITY_SYMBOL,
                 PREPARED_PREFLIGHT_RUNTIME_SYMBOL,
                 PARTIAL_NATIVE_CORE_SYMBOL,
-                PARTIAL_IDENTITY_SYMBOL,
-                PARTIAL_IDENTITY_SYMBOL,
                 PARTIAL_RUNTIME_SYMBOL,
                 PREPARED_FALLBACK_RUNTIME_SYMBOL,
             ]
@@ -20028,11 +19988,10 @@ mod tests {
             .chunks_exact(4)
             .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
             .collect::<Vec<_>>();
-        assert!(words.contains(&aarch64_sub_x_imm(31, 31, 128).unwrap()));
-        assert!(words.contains(&aarch64_store_x(30, 31, 120).unwrap()));
-        assert!(words.contains(&aarch64_store_x(2, 31, 0).unwrap()));
-        assert!(words.contains(&aarch64_store_x(14, 31, 8).unwrap()));
-        assert!(words.contains(&aarch64_store_x(7, 31, 16).unwrap()));
+        assert!(words.contains(&aarch64_sub_x_imm(31, 31, 80).unwrap()));
+        assert!(words.contains(&aarch64_store_x(30, 31, 72).unwrap()));
+        assert!(words.contains(&aarch64_mov_x(5, 2).unwrap()));
+        assert!(words.contains(&aarch64_mov_x(4, 6).unwrap()));
         assert!(words.contains(
             &aarch64_cmp_x_imm(6, u16::try_from(PARTIAL_DFA_MIN_INPUT_BYTES).unwrap()).unwrap()
         ));
@@ -20064,17 +20023,17 @@ mod tests {
             .expect("AArch64 native no-match result.end initialization");
         assert!(native_core_offset / 4 < caller_zero_start);
         assert!(caller_zero_start < caller_zero_end);
-        assert!(words.contains(&aarch64_add_x_imm(7, 31, 80).unwrap()));
-        assert!(words.contains(&aarch64_load_x_imm(3, 31, 80).unwrap()));
-        assert!(words.contains(&aarch64_load_x_imm(4, 31, 88).unwrap()));
-        assert!(words.contains(&aarch64_store_x(3, 31, 56).unwrap()));
-        assert!(words.contains(&aarch64_store_x(4, 31, 64).unwrap()));
-        let runtime_offset = usize::try_from(aarch64_relocations[6].offset).unwrap();
+        assert!(words.contains(&aarch64_add_x_imm(7, 31, 48).unwrap()));
+        assert!(words.contains(&aarch64_load_x_imm(3, 31, 48).unwrap()));
+        assert!(words.contains(&aarch64_load_x_imm(4, 31, 56).unwrap()));
+        assert!(words.contains(&aarch64_store_x(3, 31, 24).unwrap()));
+        assert!(words.contains(&aarch64_store_x(4, 31, 32).unwrap()));
+        let runtime_offset = usize::try_from(aarch64_relocations[4].offset).unwrap();
         assert_eq!(
             u32::from_le_bytes(aarch64[runtime_offset..runtime_offset + 4].try_into().unwrap()),
             0x9400_0000
         );
-        let fallback_offset = usize::try_from(aarch64_relocations[7].offset).unwrap();
+        let fallback_offset = usize::try_from(aarch64_relocations[5].offset).unwrap();
         assert_eq!(
             u32::from_le_bytes(aarch64[fallback_offset..fallback_offset + 4].try_into().unwrap()),
             0x1400_0000
@@ -20607,12 +20566,12 @@ mod tests {
                         [
                             0x9000_0006,
                             aarch64_add_x_imm(6, 6, 0).unwrap(),
-                            aarch64_load_x_imm(0, 31, 32).unwrap(),
-                            aarch64_load_x_imm(1, 31, 40).unwrap(),
-                            aarch64_load_x_imm(2, 31, 48).unwrap(),
-                            aarch64_load_x_imm(3, 31, 56).unwrap(),
-                            aarch64_load_x_imm(4, 31, 64).unwrap(),
-                            aarch64_load_x_imm(5, 31, 72).unwrap(),
+                            aarch64_load_x_imm(0, 31, 0).unwrap(),
+                            aarch64_load_x_imm(1, 31, 8).unwrap(),
+                            aarch64_load_x_imm(2, 31, 16).unwrap(),
+                            aarch64_load_x_imm(3, 31, 24).unwrap(),
+                            aarch64_load_x_imm(4, 31, 32).unwrap(),
+                            aarch64_load_x_imm(5, 31, 40).unwrap(),
                         ]
                     );
                 }
@@ -21067,7 +21026,7 @@ mod tests {
                             .iter()
                             .filter(|relocation| relocation.symbol == PARTIAL_IDENTITY_SYMBOL)
                             .count(),
-                        2,
+                        1,
                         "{target:?}"
                     );
                     assert!(code.windows(3).any(|bytes| {
@@ -21075,19 +21034,19 @@ mod tests {
                     }));
                     assert!(code
                         .windows(5)
-                        .any(|bytes| bytes == [0x48, 0x8b, 0x4c, 0x24, 0x58]));
+                        .any(|bytes| bytes == [0x48, 0x8b, 0x4c, 0x24, 0x40]));
                     assert!(code
                         .windows(5)
-                        .any(|bytes| bytes == [0x4c, 0x8b, 0x44, 0x24, 0x60]));
+                        .any(|bytes| bytes == [0x4c, 0x8b, 0x44, 0x24, 0x48]));
                     assert!(code
                         .windows(5)
-                        .any(|bytes| bytes == [0x48, 0x89, 0x4c, 0x24, 0x40]));
+                        .any(|bytes| bytes == [0x48, 0x89, 0x4c, 0x24, 0x28]));
                     assert!(code
                         .windows(5)
-                        .any(|bytes| bytes == [0x4c, 0x89, 0x44, 0x24, 0x48]));
+                        .any(|bytes| bytes == [0x4c, 0x89, 0x44, 0x24, 0x30]));
                     assert!(code
                         .windows(5)
-                        .any(|bytes| bytes == [0x48, 0x83, 0xc4, 104, 0xc3]));
+                        .any(|bytes| bytes == [0x48, 0x83, 0xc4, 88, 0xc3]));
                     let eager_private_initialization = [0_u8, 8, 16, 24, 32]
                         .into_iter()
                         .flat_map(|offset| {
@@ -21104,9 +21063,9 @@ mod tests {
                     );
                     for instruction in [
                         [0x4d, 0x89, 0x19].as_slice(),
-                        [0x4c, 0x89, 0x54, 0x24, 0x08].as_slice(),
-                        [0x48, 0x89, 0x54, 0x24, 0x10].as_slice(),
-                        [0x4c, 0x89, 0x5c, 0x24, 0x20].as_slice(),
+                        [0x4c, 0x89, 0x5c, 0x24, 0x08].as_slice(),
+                        [0x49, 0x89, 0xd1].as_slice(),
+                        [0x4d, 0x89, 0xd0].as_slice(),
                     ] {
                         assert!(
                             code.windows(instruction.len()).any(|bytes| bytes == instruction),
@@ -21129,7 +21088,7 @@ mod tests {
                             .iter()
                             .filter(|relocation| relocation.symbol == PARTIAL_IDENTITY_SYMBOL)
                             .count(),
-                        4,
+                        2,
                         "{target:?}"
                     );
                     let words = code
@@ -21137,16 +21096,16 @@ mod tests {
                         .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
                         .collect::<Vec<_>>();
                     for instruction in [
-                        aarch64_add_x_imm(7, 31, 80).unwrap(),
+                        aarch64_add_x_imm(7, 31, 48).unwrap(),
                         aarch64_cmp_w_imm(
                             0,
                             u16::from(PARTIAL_PREFLIGHT_ENTER_STATUS),
                         )
                         .unwrap(),
-                        aarch64_load_x_imm(3, 31, 80).unwrap(),
-                        aarch64_load_x_imm(4, 31, 88).unwrap(),
-                        aarch64_store_x(3, 31, 56).unwrap(),
-                        aarch64_store_x(4, 31, 64).unwrap(),
+                        aarch64_load_x_imm(3, 31, 48).unwrap(),
+                        aarch64_load_x_imm(4, 31, 56).unwrap(),
+                        aarch64_store_x(3, 31, 24).unwrap(),
+                        aarch64_store_x(4, 31, 32).unwrap(),
                     ] {
                         assert!(words.contains(&instruction), "{target:?}/{instruction:#x}");
                     }
@@ -21160,9 +21119,9 @@ mod tests {
                     );
                     for instruction in [
                         aarch64_store_x(7, 5, 0).unwrap(),
-                        aarch64_store_x(2, 31, 0).unwrap(),
-                        aarch64_store_x(7, 31, 16).unwrap(),
-                        aarch64_mov_x(7, 6).unwrap(),
+                        aarch64_mov_x(5, 2).unwrap(),
+                        aarch64_mov_x(4, 6).unwrap(),
+                        aarch64_movz_w(6, 0).unwrap(),
                     ] {
                         assert!(words.contains(&instruction), "{target:?}/{instruction:#x}");
                     }
@@ -21280,12 +21239,12 @@ mod tests {
                         [
                             0x9000_0006,
                             aarch64_add_x_imm(6, 6, 0).unwrap(),
-                            aarch64_load_x_imm(0, 31, 32).unwrap(),
-                            aarch64_load_x_imm(1, 31, 40).unwrap(),
-                            aarch64_load_x_imm(2, 31, 48).unwrap(),
-                            aarch64_load_x_imm(3, 31, 56).unwrap(),
-                            aarch64_load_x_imm(4, 31, 64).unwrap(),
-                            aarch64_load_x_imm(5, 31, 72).unwrap(),
+                            aarch64_load_x_imm(0, 31, 0).unwrap(),
+                            aarch64_load_x_imm(1, 31, 8).unwrap(),
+                            aarch64_load_x_imm(2, 31, 16).unwrap(),
+                            aarch64_load_x_imm(3, 31, 24).unwrap(),
+                            aarch64_load_x_imm(4, 31, 32).unwrap(),
+                            aarch64_load_x_imm(5, 31, 40).unwrap(),
                         ],
                         "{target:?}"
                     );
@@ -21474,11 +21433,11 @@ mod tests {
                   s!={window_start}U||e!={window_end}U||r==NULL||w==NULL||memcmp(d,identity,32U)!=0)return 88U;\
                if(expect_path==2){{w->start={narrowed_start}U;w->end=e;return 6U;}}\
                if(expect_path==3){{r[0]=321U;r[1]=654U;return 76U;}}return 88U;}}\n\
-             uint32_t fre_aot_regex_runtime_search_exclusive_from_partial_preflight_v1(\
-               handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,size_t*r,\
-               const unsigned char*d,size_t state,size_t position,uint32_t pending,size_t pend){{\
+             uint32_t fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v1(\
+               handle_t h,const unsigned char*p,size_t n,size_t*r,\
+               size_t state,size_t position,uint32_t pending,size_t pend){{\
                if(expect_path!=2||h!=(handle_t)(uintptr_t)0x1234U||p!=haystack||n!=sizeof(haystack)||\
-                  s!={narrowed_start}U||e!={window_end}U||r==NULL||memcmp(d,identity,32U)!=0||\
+                  r==NULL||\
                   state!={}U||position!={}U||pending!={pending_present}U||pend!={pending_end}U)return 90U;\
                r[0]=123U;r[1]=456U;return 77U;}}\n\
              int main(void){{size_t r[2]={{91U,92U}};uint32_t status;\n",
@@ -22071,8 +22030,8 @@ mod tests {
              uint32_t fre_aot_regex_runtime_search_exclusive_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,size_t*r){{\
                fallback_calls++;if(mode!=2||h!=(handle_t)(uintptr_t)0x1234U||p!=haystack||n!=sizeof(haystack)||s!=0U||e!=100U||r==NULL)return 89U;\
                r[0]=9U;r[1]=9U;return 77U;}}\n\
-             uint32_t fre_aot_regex_runtime_search_exclusive_from_partial_preflight_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,size_t*r,const unsigned char*d,size_t a,size_t b,uint32_t c,size_t z){{\
-               (void)h;(void)p;(void)n;(void)s;(void)e;(void)r;(void)d;(void)a;(void)b;(void)c;(void)z;return 90U;}}\n\
+             uint32_t fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v1(handle_t h,const unsigned char*p,size_t n,size_t*r,size_t a,size_t b,uint32_t c,size_t z){{\
+               (void)h;(void)p;(void)n;(void)r;(void)a;(void)b;(void)c;(void)z;return 90U;}}\n\
              uint32_t fre_aot_regex_runtime_search_exclusive_partial_preflight_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,size_t*r,const unsigned char*d,window_t*w){{\
                preflight_calls++;if(h!=(handle_t)(uintptr_t)0x1234U||p!=haystack||n!=sizeof(haystack)||s!=0U||e!=sizeof(haystack)||r==NULL||w==NULL||memcmp(d,identity,32U)!=0)return 88U;\
                if(mode==0){{r[0]=123U;r[1]=123U;return 1U;}}\

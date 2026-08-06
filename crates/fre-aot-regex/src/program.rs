@@ -2528,8 +2528,18 @@ impl PartialDfaRuntimeState {
     /// a continuation boundary proves that the entry did not return locally,
     /// so even a mismatched callback aborts the outstanding transaction.
     fn consume_native_entry_window(&mut self, window: SearchWindow) -> bool {
-        let authenticated =
-            self.native_entry_in_flight && self.native_entry_window == Some(window);
+        let authenticated = self.take_native_entry_window() == Some(window);
+        authenticated
+    }
+
+    /// Take the exact admitted window when the compiler-private continuation
+    /// ABI does not redundantly pass it back. Any attempt consumes the native
+    /// transaction, including a legacy entry that did not retain a window.
+    fn take_native_entry_window(&mut self) -> Option<SearchWindow> {
+        let authenticated = self
+            .native_entry_in_flight
+            .then_some(self.native_entry_window)
+            .flatten();
         self.clear_native_entry();
         authenticated
     }
@@ -3740,11 +3750,91 @@ impl CompiledProgram {
                 "partial resume window was not admitted by combined preflight",
             ));
         }
+        self.search_from_consumed_preflight_retained_partial_resume_with_workspace(
+            haystack,
+            window,
+            workspace,
+            resume_state,
+            resume_position,
+            pending_end,
+        )
+    }
+
+    /// Continue a retained-row hole using the exact window carried only by
+    /// the immediately preceding combined-preflight ticket.
+    ///
+    /// This is the compact compiler/runtime-private counterpart of
+    /// [`Self::search_from_preflight_retained_partial_resume_with_workspace`].
+    /// Omitting the already authenticated window and identity from the
+    /// continuation ABI reduces cross-ABI marshaling without weakening the
+    /// single-use transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-window error if the admitted ticket cannot fit the
+    /// still-live haystack, or an invariant/search error if the ticket or
+    /// compact native payload is invalid.
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the compact trusted continuation retains the native resume payload"
+    )]
+    pub fn search_from_preflight_retained_partial_resume_ticket_with_workspace(
+        &self,
+        haystack: &[u8],
+        workspace: &mut ProgramWorkspace,
+        resume_state: usize,
+        resume_position: usize,
+        pending_end: Option<usize>,
+    ) -> Result<MatchResult, CompileError> {
+        let window = workspace
+            .partial
+            .as_deref_mut()
+            .ok_or(CompileError::InternalInvariant(
+                "ticketed partial resume has no retained workspace",
+            ))?
+            .state
+            .take_native_entry_window()
+            .ok_or(CompileError::InternalInvariant(
+                "ticketed partial resume has no admitted native window",
+            ))?;
+        if window.start > window.end || window.end > haystack.len() {
+            return Err(CompileError::InvalidWindow {
+                start: window.start,
+                end: window.end,
+                haystack_len: haystack.len(),
+            });
+        }
+        self.search_from_consumed_preflight_retained_partial_resume_with_workspace(
+            haystack,
+            window,
+            workspace,
+            resume_state,
+            resume_position,
+            pending_end,
+        )
+    }
+
+    fn search_from_consumed_preflight_retained_partial_resume_with_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+        resume_state: usize,
+        resume_position: usize,
+        pending_end: Option<usize>,
+    ) -> Result<MatchResult, CompileError> {
         if resume_position <= window.start || resume_position >= window.end {
             return Err(CompileError::InternalInvariant(
                 "preflight-authenticated partial resume position is not inside its window",
             ));
         }
+        let ProgramWorkspace { nfa, partial, .. } = workspace;
+        let partial_workspace = partial.as_deref_mut().ok_or(
+            CompileError::InternalInvariant(
+                "preflight-authenticated partial resume has no retained workspace",
+            ),
+        )?;
         let partial = self.partial_dfa().ok_or(CompileError::InternalInvariant(
             "preflight-authenticated partial resume has no retained rows",
         ))?;
@@ -3770,7 +3860,7 @@ impl CompiledProgram {
         let found = self.search_nfa_from_partial_resume(
             haystack,
             window,
-            workspace.nfa.as_mut().ok_or(CompileError::InternalInvariant(
+            nfa.as_mut().ok_or(CompileError::InternalInvariant(
                 "preflight-authenticated partial resume has no K0 workspace",
             ))?,
             &mut partial_workspace.resume,
@@ -12368,6 +12458,41 @@ mod tests {
                 .native_entry_in_flight
         );
 
+        let mut short_ticket = limited.prepare_workspace().unwrap();
+        assert_eq!(
+            limited
+                .preflight_retained_partial_with_workspace(
+                    &haystack,
+                    original,
+                    &mut short_ticket,
+                    limited.artifact_identity(),
+                )
+                .unwrap(),
+            RetainedPartialPreflight::Enter(narrowed)
+        );
+        assert!(matches!(
+            limited.search_from_preflight_retained_partial_resume_ticket_with_workspace(
+                &haystack[..narrowed.end - 1],
+                &mut short_ticket,
+                resume.state,
+                resume.position,
+                resume.pending_end,
+            ),
+            Err(CompileError::InvalidWindow { .. })
+        ));
+        assert!(
+            limited
+                .search_from_preflight_retained_partial_resume_ticket_with_workspace(
+                    &haystack,
+                    &mut short_ticket,
+                    resume.state,
+                    resume.position,
+                    resume.pending_end,
+                )
+                .is_err(),
+            "an invalid compact haystack left its ticket reusable"
+        );
+
         // Two authenticated shallow holes are measured from the returned cut
         // window, not from the much earlier public window. That must engage
         // the shallow-exit backoff.
@@ -12395,9 +12520,8 @@ mod tests {
                     resume.pending_end,
                 )
             } else {
-                limited.search_from_preflight_retained_partial_resume_with_workspace(
+                limited.search_from_preflight_retained_partial_resume_ticket_with_workspace(
                     &haystack,
-                    narrowed,
                     &mut resumed,
                     resume.state,
                     resume.position,
