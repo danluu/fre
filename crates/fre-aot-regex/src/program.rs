@@ -2481,6 +2481,14 @@ impl DynamicNativeRowsWorkspace {
         let Some(direct) = workspace.dynamic_root_projection(automaton) else {
             return false;
         };
+        // A pending initial subset proves Exists immediately and never exposes
+        // the descriptor to generated code. Preserve that O(1) completion
+        // without filling addresses or any learned-loop payload.
+        if direct.initial_pending() {
+            self.native_rows.initial_flags =
+                native_rows_initial_flags(true, direct.initial_terminal());
+            return true;
+        }
         // The current native scanner cannot execute K0's learned loop rows.
         // Decline before calculating or publishing the fixed-layout
         // descriptor instead of copying offsets that no generated entry uses.
@@ -7310,6 +7318,44 @@ mod tests {
         assert_eq!(reentered, RetainedPartialPreflight::Enter(window));
         assert_eq!(second_address, first_address);
         assert_eq!(second_generation, first_generation);
+    }
+
+    #[test]
+    fn dynamic_native_rows_nullable_root_completes_without_publishing_descriptor() {
+        let compiled = program(
+            "[ab]*",
+            OutputContract::Exists,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        let mut workspace = compiled.prepare_workspace().expect("prepared K0 workspace");
+        let haystack = vec![b'x'; 64];
+        let window = SearchWindow::full(&haystack);
+        let identity = compiled.artifact_identity();
+
+        for phase in ["cold", "warm"] {
+            let (outcome, address, generation) = compiled
+                .preflight_dynamic_native_rows_with_workspace(
+                    &haystack,
+                    window,
+                    &mut workspace,
+                    identity,
+                )
+                .unwrap_or_else(|error| panic!("{phase} nullable preflight: {error}"));
+            assert_eq!(
+                outcome,
+                RetainedPartialPreflight::Complete(MatchResult::Exists(true)),
+                "{phase}"
+            );
+            assert_eq!((address, generation), (0, 0), "{phase}");
+        }
+        let dynamic = workspace.dynamic_native_rows.as_deref().unwrap();
+        assert_ne!(
+            dynamic.native_rows.initial_flags & NATIVE_ROWS_INITIAL_PENDING,
+            0
+        );
+        assert_eq!(dynamic.native_rows.rows_address, 0);
+        assert!(!dynamic.state.native_entry_in_flight);
     }
 
     #[test]
