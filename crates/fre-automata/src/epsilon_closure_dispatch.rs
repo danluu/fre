@@ -213,7 +213,11 @@ impl EpsilonClosureDispatch {
             return Ok(None);
         }
 
-        let scratch_bytes = compiler_scratch_bytes(automaton.roles.len())?;
+        let Some(scratch_bytes) = bounded_compiler_scratch_bytes(automaton.roles.len())? else {
+            // The immutable preflight already made this refusal, but retain
+            // the cap at the allocation boundary as an independent guard.
+            return Ok(None);
+        };
         let mut active = exact_filled(
             automaton.roles.len(),
             0_u8,
@@ -338,31 +342,27 @@ fn derive_shape_and_roots(
         return Ok(None);
     }
     let states = automaton.roles.len();
-    let scratch_bytes = compiler_scratch_bytes(states)?;
-    // Refuse before allocating even the root bitmap. The later exact
-    // compiler allocations are a subset of this combined scratch extent.
-    if scratch_bytes > MAX_COMPILER_SCRATCH_BYTES {
+    let Some(scratch_bytes) = bounded_compiler_scratch_bytes(states)? else {
         return Ok(None);
-    }
+    };
     let mut roots = exact_filled(states, 0_u8, scratch_bytes)?;
     roots[plan_index(automaton.start)] = 1;
-    let mut derivation_work = states;
+    let mut derivation_work = 0usize;
+    if !try_admit_derivation_work(&mut derivation_work, states)? {
+        return Ok(None);
+    }
     for (state, &role) in automaton.roles.iter().enumerate() {
         if role != StateRole::Consume {
             continue;
         }
         for edge in state_edges(automaton, state) {
+            if !try_admit_derivation_work(&mut derivation_work, 1)? {
+                return Ok(None);
+            }
             roots[plan_index(automaton.edge_targets[edge])] = 1;
-            derivation_work = derivation_work.checked_add(1).ok_or(
-                EpsilonClosureDispatchAllocationError {
-                    requested_bytes: usize::MAX,
-                },
-            )?;
         }
     }
-    if derivation_work > MAX_DERIVATION_WORK {
-        return Ok(None);
-    }
+    debug_assert!(derivation_work <= MAX_DERIVATION_WORK);
 
     let graph_instruction_limit = graph_instruction_limit(automaton).unwrap_or(0);
     if graph_instruction_limit == 0 {
@@ -499,6 +499,31 @@ fn compiler_scratch_bytes(
         .ok_or(EpsilonClosureDispatchAllocationError {
             requested_bytes: usize::MAX,
         })
+}
+
+fn bounded_compiler_scratch_bytes(
+    states: usize,
+) -> Result<Option<usize>, EpsilonClosureDispatchAllocationError> {
+    let bytes = compiler_scratch_bytes(states)?;
+    // Refuse before allocating even the root bitmap. The later exact
+    // compiler scratch allocations are a subset of this combined extent.
+    Ok((bytes <= MAX_COMPILER_SCRATCH_BYTES).then_some(bytes))
+}
+
+fn try_admit_derivation_work(
+    consumed: &mut usize,
+    requested: usize,
+) -> Result<bool, EpsilonClosureDispatchAllocationError> {
+    let next = consumed.checked_add(requested).ok_or(
+        EpsilonClosureDispatchAllocationError {
+            requested_bytes: usize::MAX,
+        },
+    )?;
+    if next > MAX_DERIVATION_WORK {
+        return Ok(false);
+    }
+    *consumed = next;
+    Ok(true)
 }
 
 fn count_program(
@@ -876,9 +901,41 @@ mod tests {
     }
 
     #[test]
-    fn unrepresentable_compiler_scratch_is_rejected_before_allocation() {
+    fn compiler_scratch_cap_declines_transactionally_and_overflow_is_an_error() {
+        let bytes_per_state = super::compiler_scratch_bytes(1).unwrap();
+        let threshold_states = super::MAX_COMPILER_SCRATCH_BYTES / bytes_per_state;
+        let threshold_bytes = super::bounded_compiler_scratch_bytes(threshold_states)
+            .unwrap()
+            .expect("the greatest whole-state extent below the cap is admitted");
+        assert!(threshold_bytes <= super::MAX_COMPILER_SCRATCH_BYTES);
         assert_eq!(
-            super::compiler_scratch_bytes(usize::MAX),
+            super::bounded_compiler_scratch_bytes(threshold_states.checked_add(1).unwrap()),
+            Ok(None),
+            "one state over the fixed scratch ceiling declines without allocating"
+        );
+        assert_eq!(
+            super::bounded_compiler_scratch_bytes(usize::MAX),
+            Err(super::EpsilonClosureDispatchAllocationError {
+                requested_bytes: usize::MAX
+            })
+        );
+    }
+
+    #[test]
+    fn derivation_work_declines_at_one_over_without_scanning_more_edges() {
+        let mut work = super::MAX_DERIVATION_WORK.checked_sub(1).unwrap();
+        assert_eq!(super::try_admit_derivation_work(&mut work, 1), Ok(true));
+        assert_eq!(work, super::MAX_DERIVATION_WORK);
+        assert_eq!(super::try_admit_derivation_work(&mut work, 1), Ok(false));
+        assert_eq!(
+            work,
+            super::MAX_DERIVATION_WORK,
+            "declined work is not committed"
+        );
+
+        work = usize::MAX;
+        assert_eq!(
+            super::try_admit_derivation_work(&mut work, 1),
             Err(super::EpsilonClosureDispatchAllocationError {
                 requested_bytes: usize::MAX
             })
