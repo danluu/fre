@@ -319,6 +319,9 @@ pub struct DynamicNativeRowsV1 {
     pub next_row_token_mask: u32,
     pub cache_identity: u64,
     pub learned_loop_row_count: u32,
+    // Retained as ABI-reserved storage for already-emitted V1 descriptors.
+    // Current generated entries conservatively decline every learned-loop
+    // cache and therefore never inspect individual row offsets.
     pub learned_loop_rows: [u32; 4],
     pub initial_row: u32,
     pub initial_flags: u32,
@@ -2478,24 +2481,26 @@ impl DynamicNativeRowsWorkspace {
         let Some(direct) = workspace.dynamic_root_projection(automaton) else {
             return false;
         };
+        // The current native scanner cannot execute K0's learned loop rows.
+        // Decline before calculating or publishing the fixed-layout
+        // descriptor instead of copying offsets that no generated entry uses.
+        if !direct.learned_loop_row_offsets().is_empty() {
+            return false;
+        }
         let Some(live_cells) = direct
             .state_count()
             .checked_mul(usize::try_from(direct.row_stride()).unwrap_or(usize::MAX))
         else {
             return false;
         };
-        let loop_rows = direct.learned_loop_row_offsets();
         if direct.row_stride() == 0
             || live_cells == 0
             || live_cells > direct.initialized_cells()
             || usize::try_from(direct.initial_row()).map_or(true, |row| row >= live_cells)
             || direct.cache_identity() == 0
-            || loop_rows.len() > self.native_rows.learned_loop_rows.len()
         {
             return false;
         }
-        let mut learned_loop_rows = [u32::MAX; 4];
-        learned_loop_rows[..loop_rows.len()].copy_from_slice(loop_rows);
         self.native_rows = DynamicNativeRowsV1 {
             rows_address: direct.rows_address().addr(),
             class_map_address: self.class_map.as_ptr().addr(),
@@ -2505,9 +2510,8 @@ impl DynamicNativeRowsWorkspace {
             accept_mask: direct.accept_mask(),
             next_row_token_mask: direct.next_row_token_mask(),
             cache_identity: direct.cache_identity(),
-            learned_loop_row_count: u32::try_from(loop_rows.len())
-                .expect("the fixed learned-loop projection count fits u32"),
-            learned_loop_rows,
+            learned_loop_row_count: 0,
+            learned_loop_rows: [u32::MAX; 4],
             initial_row: direct.initial_row(),
             initial_flags: native_rows_initial_flags(
                 direct.initial_pending(),
@@ -4472,10 +4476,7 @@ impl CompiledProgram {
                 ))?;
                 if dynamic.refresh_native_rows(&self.automaton, nfa) {
                     nullable = dynamic.native_rows.initial_flags & NATIVE_ROWS_INITIAL_PENDING != 0;
-                    if !nullable
-                        && dynamic.native_rows.learned_loop_row_count == 0
-                        && dynamic.state.claim()
-                    {
+                    if !nullable && dynamic.state.claim() {
                         enter = Some((
                             (&raw const dynamic.native_rows).addr(),
                             dynamic.native_rows.cache_identity,
@@ -4502,9 +4503,9 @@ impl CompiledProgram {
             .map(|found| (RetainedPartialPreflight::Complete(found), 0, 0))
     }
 
-    /// Record that an admitted dynamic root re-entered the ordinary runtime.
-    /// The canonical search that follows may publish the missing cell; repeat
-    /// early deopts receive exponential periodic backoff.
+    /// Record that an admitted dynamic root took its dedicated whole-search
+    /// side exit. The canonical search that follows may publish the missing
+    /// cell; repeat early deopts receive exponential periodic backoff.
     #[doc(hidden)]
     pub fn observe_dynamic_native_rows_deopt_with_workspace(
         &self,
@@ -4512,6 +4513,19 @@ impl CompiledProgram {
     ) {
         if let Some(dynamic) = workspace.dynamic_native_rows.as_deref_mut() {
             dynamic.state.observe_deopt();
+        }
+    }
+
+    /// Settle an admitted dynamic root that returned locally before an
+    /// ordinary or short-window search starts. Unlike a true generated-code
+    /// side exit, this resets rather than advances adaptive deopt backoff.
+    #[doc(hidden)]
+    pub fn settle_dynamic_native_rows_local_completion_with_workspace(
+        &self,
+        workspace: &mut ProgramWorkspace,
+    ) {
+        if let Some(dynamic) = workspace.dynamic_native_rows.as_deref_mut() {
+            dynamic.state.settle_unobserved_local_entry();
         }
     }
 

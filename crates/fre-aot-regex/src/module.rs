@@ -620,6 +620,9 @@ const PARTIAL_RUNTIME_SYMBOL: usize = 8;
 const PREPARED_FALLBACK_RUNTIME_SYMBOL: usize = 9;
 const PREPARED_PREFLIGHT_RUNTIME_SYMBOL: usize = 10;
 const PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL: usize = 11;
+// Dynamic-row and partial-Span entries are mutually exclusive layouts, so
+// their one layout-specific helper occupies the same deterministic slot.
+const DYNAMIC_ROWS_DEOPT_RUNTIME_SYMBOL: usize = 11;
 
 const RUNTIME_SYMBOL_NAME: &str = "fre_aot_regex_runtime_search_v1";
 const PARTIAL_RUNTIME_SYMBOL_NAME: &str =
@@ -630,6 +633,8 @@ const PREPARED_PREFLIGHT_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_search_exclusive_partial_preflight_v1";
 const DYNAMIC_ROWS_PREFLIGHT_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_search_exclusive_dynamic_rows_preflight_v1";
+const DYNAMIC_ROWS_DEOPT_RUNTIME_SYMBOL_NAME: &str =
+    "fre_aot_regex_runtime_search_exclusive_dynamic_rows_deopt_v1";
 const PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_search_exclusive_recover_partial_span_v1";
 const ENTRY_SYMBOL_PREFIX: &str = "fre_aot_regex_search_v1_";
@@ -959,7 +964,26 @@ impl CompiledModule {
                 offset: 0,
                 size: 0,
             });
-            if prepared.span_recovery {
+            if prepared.dynamic_rows && prepared.span_recovery {
+                return Err(ObjectError::InvalidModule(
+                    "dynamic rows and partial Span recovery cannot share one prepared layout",
+                ));
+            }
+            if prepared.dynamic_rows {
+                if symbols.len() != DYNAMIC_ROWS_DEOPT_RUNTIME_SYMBOL {
+                    return Err(ObjectError::InvalidModule(
+                        "dynamic-row deopt symbol order is inconsistent",
+                    ));
+                }
+                symbols.push(ModuleSymbol {
+                    name: DYNAMIC_ROWS_DEOPT_RUNTIME_SYMBOL_NAME.to_owned(),
+                    binding: SymbolBinding::Global,
+                    kind: SymbolKind::Function,
+                    section: None,
+                    offset: 0,
+                    size: 0,
+                });
+            } else if prepared.span_recovery {
                 if symbols.len() != PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL {
                     return Err(ObjectError::InvalidModule(
                         "partial Span recovery symbol order is inconsistent",
@@ -1082,6 +1106,27 @@ impl CompiledModule {
             .map(|symbol| symbol.name.as_str())
     }
 
+    /// Return the dedicated whole-search side-exit helper required by a
+    /// dynamically warmed-row prepared entry, when that entry is present.
+    #[must_use]
+    pub fn required_prepared_dynamic_rows_deopt_runtime_symbol(&self) -> Option<&str> {
+        self.prepared_entry_symbol_index?;
+        if !self
+            .relocations
+            .iter()
+            .any(|relocation| relocation.symbol == DYNAMIC_ROWS_DEOPT_RUNTIME_SYMBOL)
+        {
+            return None;
+        }
+        self.symbols
+            .get(DYNAMIC_ROWS_DEOPT_RUNTIME_SYMBOL)
+            .filter(|symbol| {
+                symbol.section.is_none()
+                    && symbol.name == DYNAMIC_ROWS_DEOPT_RUNTIME_SYMBOL_NAME
+            })
+            .map(|symbol| symbol.name.as_str())
+    }
+
     /// Return the authenticated selected-end-to-Span recovery helper required
     /// by a variable-width partial Span entry, when that entry is present.
     #[must_use]
@@ -1096,7 +1141,10 @@ impl CompiledModule {
         }
         self.symbols
             .get(PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL)
-            .filter(|symbol| symbol.section.is_none())
+            .filter(|symbol| {
+                symbol.section.is_none()
+                    && symbol.name == PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME
+            })
             .map(|symbol| symbol.name.as_str())
     }
 
@@ -1615,10 +1663,19 @@ fn native_module_digest(
             .iter()
             .any(|relocation| relocation.symbol == PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL)
         {
+            let auxiliary_symbol_name = if lowering
+                .relocations
+                .iter()
+                .any(|relocation| relocation.symbol == PARTIAL_RUNTIME_SYMBOL)
+            {
+                PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME
+            } else {
+                DYNAMIC_ROWS_DEOPT_RUNTIME_SYMBOL_NAME
+            };
             update_bytes(
                 &mut digest,
-                PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME.as_bytes(),
-                "partial Span recovery runtime symbol identity byte length",
+                auxiliary_symbol_name.as_bytes(),
+                "prepared auxiliary runtime symbol identity byte length",
             )?;
         }
     }
@@ -10516,7 +10573,10 @@ fn lower_x86_64_dynamic_rows_prepared() -> Result<(Vec<u8>, Vec<ModuleRelocation
     assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x30])?;
     assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x38])?;
     assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
-    assembler.branch(&[0xe9], short_fallback)?;
+    assembler.instruction(&[0xe9])?;
+    let deopt_displacement_label = assembler.label()?;
+    assembler.bind(deopt_displacement_label)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
 
     assembler.bind(short_fallback)?;
     assembler.instruction(&[0xe9])?;
@@ -10527,6 +10587,7 @@ fn lower_x86_64_dynamic_rows_prepared() -> Result<(Vec<u8>, Vec<ModuleRelocation
     let finished = assembler.finish_with_label_offsets()?;
     let identity_displacement = finished.label_offset(identity_displacement_label)?;
     let preflight_displacement = finished.label_offset(preflight_displacement_label)?;
+    let deopt_displacement = finished.label_offset(deopt_displacement_label)?;
     let fallback_displacement = finished.label_offset(fallback_displacement_label)?;
     Ok((
         finished.code,
@@ -10543,6 +10604,13 @@ fn lower_x86_64_dynamic_rows_prepared() -> Result<(Vec<u8>, Vec<ModuleRelocation
                 offset: offset_u64(preflight_displacement, "x86 dynamic preflight relocation")?,
                 kind: RelocationKind::X86PltRelative32,
                 symbol: PREPARED_PREFLIGHT_RUNTIME_SYMBOL,
+                addend: -4,
+            },
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(deopt_displacement, "x86 dynamic deopt relocation")?,
+                kind: RelocationKind::X86PltRelative32,
+                symbol: DYNAMIC_ROWS_DEOPT_RUNTIME_SYMBOL,
                 addend: -4,
             },
             ModuleRelocation {
@@ -16539,7 +16607,7 @@ fn lower_aarch64_dynamic_rows_prepared() -> Result<(Vec<u8>, Vec<ModuleRelocatio
     assembler.instruction(aarch64_load_x_imm(5, 31, 40)?)?;
     assembler.instruction(aarch64_load_x_imm(30, 31, 88)?)?;
     assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
-    assembler.branch(short_fallback)?;
+    let deopt_branch = assembler.instruction(0x1400_0000)?;
 
     assembler.bind(short_fallback)?;
     let fallback_branch = assembler.instruction(0x1400_0000)?;
@@ -16548,6 +16616,7 @@ fn lower_aarch64_dynamic_rows_prepared() -> Result<(Vec<u8>, Vec<ModuleRelocatio
         identity_page,
         identity_page_offset,
         preflight_branch,
+        deopt_branch,
         fallback_branch,
     ];
     let code = assembler.finish_with_offsets(&mut relocation_offsets)?;
@@ -16577,7 +16646,14 @@ fn lower_aarch64_dynamic_rows_prepared() -> Result<(Vec<u8>, Vec<ModuleRelocatio
             },
             ModuleRelocation {
                 section: TEXT_SECTION,
-                offset: offset_u64(relocation_offsets[3], "AArch64 dynamic fallback branch")?,
+                offset: offset_u64(relocation_offsets[3], "AArch64 dynamic deopt branch")?,
+                kind: RelocationKind::Aarch64Branch26,
+                symbol: DYNAMIC_ROWS_DEOPT_RUNTIME_SYMBOL,
+                addend: 0,
+            },
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(relocation_offsets[4], "AArch64 dynamic fallback branch")?,
                 kind: RelocationKind::Aarch64Branch26,
                 symbol: PREPARED_FALLBACK_RUNTIME_SYMBOL,
                 addend: 0,
@@ -19597,6 +19673,12 @@ mod tests {
                 .required_prepared_preflight_runtime_symbol(),
             Some(DYNAMIC_ROWS_PREFLIGHT_RUNTIME_SYMBOL_NAME)
         );
+        assert_eq!(
+            declined
+                .module()
+                .required_prepared_dynamic_rows_deopt_runtime_symbol(),
+            Some(DYNAMIC_ROWS_DEOPT_RUNTIME_SYMBOL_NAME)
+        );
     }
 
     #[test]
@@ -20168,6 +20250,18 @@ mod tests {
                 compiled.module().required_prepared_fallback_runtime_symbol(),
                 Some(PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME)
             );
+            assert_eq!(
+                compiled
+                    .module()
+                    .required_prepared_dynamic_rows_deopt_runtime_symbol(),
+                Some(DYNAMIC_ROWS_DEOPT_RUNTIME_SYMBOL_NAME)
+            );
+            assert!(
+                compiled
+                    .module()
+                    .required_prepared_span_recovery_runtime_symbol()
+                    .is_none()
+            );
             assert!(compiled.module().required_prepared_runtime_symbol().is_none());
             assert_eq!(compiled.module().symbols()[PARTIAL_TABLE_SYMBOL].size, 0);
             assert_eq!(
@@ -20181,6 +20275,30 @@ mod tests {
                     .iter()
                     .filter(|relocation| {
                         relocation.symbol == PREPARED_PREFLIGHT_RUNTIME_SYMBOL
+                    })
+                    .count(),
+                1,
+                "{target:?}"
+            );
+            assert_eq!(
+                compiled
+                    .module()
+                    .relocations()
+                    .iter()
+                    .filter(|relocation| {
+                        relocation.symbol == PREPARED_FALLBACK_RUNTIME_SYMBOL
+                    })
+                    .count(),
+                1,
+                "{target:?}"
+            );
+            assert_eq!(
+                compiled
+                    .module()
+                    .relocations()
+                    .iter()
+                    .filter(|relocation| {
+                        relocation.symbol == DYNAMIC_ROWS_DEOPT_RUNTIME_SYMBOL
                     })
                     .count(),
                 1,
@@ -20268,7 +20386,7 @@ static const unsigned char haystack[80] = {{0}};
 static unsigned char classes[256];
 static uint32_t cells[1];
 static rows_t rows;
-static int mode, preflight_calls, fallback_calls;
+static int mode, preflight_calls, fallback_calls, deopt_calls;
 static void init_rows(void) {{
   memset(&rows,0,sizeof(rows));
   rows.rows_address=(size_t)(uintptr_t)cells;
@@ -20283,7 +20401,13 @@ uint32_t fre_aot_regex_runtime_search_v1(const unsigned char*a,const unsigned ch
 uint32_t fre_aot_regex_runtime_search_exclusive_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r) {{
   fallback_calls++;
   if(h==NULL)return 5;
-  if(p!=haystack||n!=sizeof(haystack)||s!=5||((mode==1&&e!=36)||(mode!=1&&e!=69)))return 89;
+  if(p!=haystack||n!=sizeof(haystack)||s!=5||e!=36||mode!=1)return 89;
+  r->start=123;r->end=456;return 77;
+}}
+uint32_t fre_aot_regex_runtime_search_exclusive_dynamic_rows_deopt_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r) {{
+  deopt_calls++;
+  if(h==NULL)return 5;
+  if(p!=haystack||n!=sizeof(haystack)||s!=5||e!=69||mode<5||mode>7)return 87;
   r->start=123;r->end=456;return 77;
 }}
 uint32_t fre_aot_regex_runtime_search_exclusive_dynamic_rows_preflight_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*d,preflight_t*out) {{
@@ -20296,22 +20420,22 @@ uint32_t fre_aot_regex_runtime_search_exclusive_dynamic_rows_preflight_v1(handle
 }}
 int main(void) {{
   init_rows(); result_t r={{91,92}}; uint32_t status;
-  mode=1;fallback_calls=preflight_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,36,&r);
-  if(status!=77||r.start!=123||r.end!=456||fallback_calls!=1||preflight_calls!=0)return 10;
-  mode=2;r=(result_t){{91,92}};fallback_calls=preflight_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,69,&r);
-  if(status!=76||r.start!=321||r.end!=654||fallback_calls!=0||preflight_calls!=1)return 11;
-  mode=3;cells[0]=UINT32_C(0x80000000);r=(result_t){{91,92}};fallback_calls=preflight_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,69,&r);
-  if(status!=1||r.start!=0||r.end!=0||fallback_calls!=0||preflight_calls!=1)return 12;
-  mode=4;cells[0]=0;r=(result_t){{91,92}};fallback_calls=preflight_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,69,&r);
-  if(status!=0||r.start!=0||r.end!=0||fallback_calls!=0||preflight_calls!=1)return 13;
-  mode=5;cells[0]=UINT32_MAX;r=(result_t){{91,92}};fallback_calls=preflight_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,69,&r);
-  if(status!=77||r.start!=123||r.end!=456||fallback_calls!=1||preflight_calls!=1)return 14;
-  mode=6;cells[0]=UINT32_C(0x80000000);r=(result_t){{91,92}};fallback_calls=preflight_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,69,&r);
-  if(status!=77||r.start!=123||r.end!=456||fallback_calls!=1||preflight_calls!=1)return 15;
-  mode=7;rows.initial_flags=1;r=(result_t){{91,92}};fallback_calls=preflight_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,69,&r);
-  if(status!=77||r.start!=123||r.end!=456||fallback_calls!=1||preflight_calls!=1)return 16;
-  mode=0;rows.initial_flags=0;r=(result_t){{91,92}};fallback_calls=preflight_calls=0;status={symbol}(NULL,haystack,sizeof(haystack),5,69,&r);
-  if(status!=5||r.start!=91||r.end!=92||fallback_calls!=0||preflight_calls!=1)return 17;
+  mode=1;fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,36,&r);
+  if(status!=77||r.start!=123||r.end!=456||fallback_calls!=1||deopt_calls!=0||preflight_calls!=0)return 10;
+  mode=2;r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,69,&r);
+  if(status!=76||r.start!=321||r.end!=654||fallback_calls!=0||deopt_calls!=0||preflight_calls!=1)return 11;
+  mode=3;cells[0]=UINT32_C(0x80000000);r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,69,&r);
+  if(status!=1||r.start!=0||r.end!=0||fallback_calls!=0||deopt_calls!=0||preflight_calls!=1)return 12;
+  mode=4;cells[0]=0;r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,69,&r);
+  if(status!=0||r.start!=0||r.end!=0||fallback_calls!=0||deopt_calls!=0||preflight_calls!=1)return 13;
+  mode=5;cells[0]=UINT32_MAX;r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,69,&r);
+  if(status!=77||r.start!=123||r.end!=456||fallback_calls!=0||deopt_calls!=1||preflight_calls!=1)return 14;
+  mode=6;cells[0]=UINT32_C(0x80000000);r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,69,&r);
+  if(status!=77||r.start!=123||r.end!=456||fallback_calls!=0||deopt_calls!=1||preflight_calls!=1)return 15;
+  mode=7;rows.initial_flags=1;r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,69,&r);
+  if(status!=77||r.start!=123||r.end!=456||fallback_calls!=0||deopt_calls!=1||preflight_calls!=1)return 16;
+  mode=0;rows.initial_flags=0;r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}(NULL,haystack,sizeof(haystack),5,69,&r);
+  if(status!=5||r.start!=91||r.end!=92||fallback_calls!=0||deopt_calls!=0||preflight_calls!=1)return 17;
   return 0;
 }}
 "#,

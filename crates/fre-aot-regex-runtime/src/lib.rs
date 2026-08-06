@@ -534,6 +534,11 @@ impl PreparedAotRegex {
             .observe_dynamic_native_rows_deopt_with_workspace(&mut self.workspace);
     }
 
+    fn settle_dynamic_native_rows_local_completion(&mut self) {
+        self.program
+            .settle_dynamic_native_rows_local_completion_with_workspace(&mut self.workspace);
+    }
+
     /// Find the first selected span in `haystack`.
     ///
     /// # Errors
@@ -1037,6 +1042,62 @@ unsafe fn search_prepared_checked_pointers(
     status
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DynamicNativeRowsFallbackOutcome {
+    LocalCompletion,
+    Deopt,
+}
+
+#[allow(
+    unsafe_code,
+    clippy::too_many_arguments,
+    reason = "the shared implementation validates and executes one raw exclusive-search ABI"
+)]
+fn search_exclusive_with_dynamic_rows_outcome(
+    handle: FreAotRegexExclusiveHandleV1,
+    haystack_ptr: *const u8,
+    haystack_len: usize,
+    window_start: usize,
+    window_end: usize,
+    result_ptr: *mut FreAotRegexResultV1,
+    dynamic_rows_outcome: DynamicNativeRowsFallbackOutcome,
+) -> u32 {
+    if handle.is_invalid() {
+        return STATUS_INVALID_HANDLE;
+    }
+    if haystack_ptr.is_null()
+        || result_ptr.is_null()
+        || !result_ptr.is_aligned()
+        || haystack_len > isize::MAX.unsigned_abs()
+        || window_start > window_end
+        || window_end > haystack_len
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+
+    // SAFETY: each exported caller requires the live exclusively owned
+    // session plus readable haystack and writable disjoint result extents.
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        let prepared = &mut *handle.0.cast::<PreparedAotRegex>();
+        let haystack = std::slice::from_raw_parts(haystack_ptr, haystack_len);
+        match dynamic_rows_outcome {
+            DynamicNativeRowsFallbackOutcome::LocalCompletion => {
+                prepared.settle_dynamic_native_rows_local_completion();
+            }
+            DynamicNativeRowsFallbackOutcome::Deopt => {
+                prepared.observe_dynamic_native_rows_deopt();
+            }
+        }
+        let Ok((status, result)) = execute_search(prepared, haystack, window_start, window_end)
+        else {
+            return STATUS_RUNTIME_FAILURE;
+        };
+        result_ptr.write(result);
+        status
+    }))
+    .unwrap_or(STATUS_RUNTIME_FAILURE)
+}
+
 /// Search an exclusively owned direct-pointer prepared session.
 ///
 /// Status and result conventions are identical to
@@ -1063,36 +1124,52 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_search_exclusive_v1(
     window_end: usize,
     result_ptr: *mut FreAotRegexResultV1,
 ) -> u32 {
-    if handle.is_invalid() {
-        return STATUS_INVALID_HANDLE;
-    }
-    if haystack_ptr.is_null()
-        || result_ptr.is_null()
-        || !result_ptr.is_aligned()
-        || haystack_len > isize::MAX.unsigned_abs()
-        || window_start > window_end
-        || window_end > haystack_len
-    {
-        return STATUS_INVALID_ARGUMENT;
-    }
+    search_exclusive_with_dynamic_rows_outcome(
+        handle,
+        haystack_ptr,
+        haystack_len,
+        window_start,
+        window_end,
+        result_ptr,
+        DynamicNativeRowsFallbackOutcome::LocalCompletion,
+    )
+}
 
-    // SAFETY: the caller guarantees a live exclusively owned session plus the
-    // readable haystack and writable disjoint result extents.
-    catch_unwind(AssertUnwindSafe(|| unsafe {
-        let prepared = &mut *handle.0.cast::<PreparedAotRegex>();
-        let haystack = std::slice::from_raw_parts(haystack_ptr, haystack_len);
-        // An admitted dynamic native root reaches this ordinary helper only
-        // on a conservative whole-search side exit. Record that deopt before
-        // canonical K0 may publish the missing transition.
-        prepared.observe_dynamic_native_rows_deopt();
-        let Ok((status, result)) = execute_search(prepared, haystack, window_start, window_end)
-        else {
-            return STATUS_RUNTIME_FAILURE;
-        };
-        result_ptr.write(result);
-        status
-    }))
-    .unwrap_or(STATUS_RUNTIME_FAILURE)
+/// Continue a genuine whole-search side exit from the generated dynamic-row
+/// scanner. This private compiler/runtime seam has the same raw ABI and
+/// semantic result contract as [`fre_aot_regex_runtime_search_exclusive_v1`],
+/// but records adaptive deopt feedback instead of settling a prior local
+/// native completion.
+///
+/// # Safety
+///
+/// Requirements are identical to
+/// [`fre_aot_regex_runtime_search_exclusive_v1`]. The caller must use this
+/// helper only after the authenticated dynamic-row preflight admitted the
+/// same exclusive search transaction.
+#[doc(hidden)]
+#[unsafe(no_mangle)]
+#[allow(
+    unsafe_code,
+    reason = "this private generated-code symbol is an audited raw C pointer boundary"
+)]
+pub unsafe extern "C" fn fre_aot_regex_runtime_search_exclusive_dynamic_rows_deopt_v1(
+    handle: FreAotRegexExclusiveHandleV1,
+    haystack_ptr: *const u8,
+    haystack_len: usize,
+    window_start: usize,
+    window_end: usize,
+    result_ptr: *mut FreAotRegexResultV1,
+) -> u32 {
+    search_exclusive_with_dynamic_rows_outcome(
+        handle,
+        haystack_ptr,
+        haystack_len,
+        window_start,
+        window_end,
+        result_ptr,
+        DynamicNativeRowsFallbackOutcome::Deopt,
+    )
 }
 
 /// Decide whether a legacy exclusive prepared native entry should execute its
@@ -2071,6 +2148,28 @@ mod tests {
         }
     }
 
+    fn call_exclusive_dynamic_rows_deopt(
+        handle: FreAotRegexExclusiveHandleV1,
+        haystack: &[u8],
+        start: usize,
+        end: usize,
+        result: &mut FreAotRegexResultV1,
+    ) -> u32 {
+        // SAFETY: each test keeps exclusive ownership of the live admitted
+        // transaction; the readable haystack and disjoint aligned result
+        // outlive this synchronous side-exit continuation.
+        unsafe {
+            fre_aot_regex_runtime_search_exclusive_dynamic_rows_deopt_v1(
+                handle,
+                haystack.as_ptr(),
+                haystack.len(),
+                start,
+                end,
+                result,
+            )
+        }
+    }
+
     fn call_partial_should_enter(
         handle: FreAotRegexExclusiveHandleV1,
         input_bytes: usize,
@@ -2330,6 +2429,9 @@ mod tests {
         assert!(!C_API_V1_HEADER.contains(
             "fre_aot_regex_runtime_search_exclusive_dynamic_rows_preflight_v1"
         ));
+        assert!(!C_API_V1_HEADER.contains(
+            "fre_aot_regex_runtime_search_exclusive_dynamic_rows_deopt_v1"
+        ));
 
         let _: unsafe extern "C" fn(*const u8, usize, *mut FreAotRegexPreparedHandleV1) -> u32 =
             fre_aot_regex_runtime_prepare_v1;
@@ -2353,6 +2455,14 @@ mod tests {
             usize,
             *mut FreAotRegexResultV1,
         ) -> u32 = fre_aot_regex_runtime_search_exclusive_v1;
+        let _: unsafe extern "C" fn(
+            FreAotRegexExclusiveHandleV1,
+            *const u8,
+            usize,
+            usize,
+            usize,
+            *mut FreAotRegexResultV1,
+        ) -> u32 = fre_aot_regex_runtime_search_exclusive_dynamic_rows_deopt_v1;
         let _: unsafe extern "C" fn(FreAotRegexExclusiveHandleV1, usize) -> u32 =
             fre_aot_regex_runtime_prepared_partial_should_enter_v1;
         let _: unsafe extern "C" fn(
@@ -2613,11 +2723,11 @@ mod tests {
         assert_ne!(descriptor.class_map_address, 0);
         assert_eq!(descriptor.initial_flags, 0);
 
-        // The generated side-exit contract enters the ordinary helper, which
-        // clears the outstanding ticket before canonical K0 completes.
+        // A genuine generated side exit uses its dedicated helper, which
+        // records deopt feedback before canonical K0 completes.
         result = sentinel_result;
         assert_eq!(
-            call_exclusive(handle, &haystack, start, end, &mut result),
+            call_exclusive_dynamic_rows_deopt(handle, &haystack, start, end, &mut result),
             STATUS_MATCH
         );
         assert_eq!(result, FreAotRegexResultV1::default());
@@ -2640,6 +2750,129 @@ mod tests {
         );
         assert_eq!(result, sentinel_result);
         assert_eq!(output, sentinel_output);
+
+        // SAFETY: the handle remains uniquely owned and no call overlaps its
+        // destruction.
+        assert_eq!(
+            unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(handle) },
+            STATUS_SUCCESS
+        );
+    }
+
+    #[test]
+    fn exclusive_dynamic_rows_short_fallback_settles_local_success_without_backoff() {
+        let compiled = compile(
+            CompileRequest::new("(?:ab|ac)+z", Target::x86_64_linux())
+                .mode(CompileMode::Fast)
+                .output(OutputContract::Exists),
+        )
+        .expect("compile alternating dynamic-row fixture");
+        let identity = compiled.receipt().program_sha256;
+        let serialized = compiled.program().serialize().unwrap();
+        let handle = prepare_exclusive(&serialized);
+        let mut haystack = vec![b'!'; 80];
+        for pair in haystack[8..70].chunks_exact_mut(2) {
+            pair.copy_from_slice(b"ab");
+        }
+        haystack[70] = b'z';
+        let start = 8;
+        let end = 72;
+        let mut result = FreAotRegexResultV1::default();
+        let mut output = FreAotRegexDynamicRowsPreflightV1::default();
+
+        assert_eq!(
+            call_exclusive_dynamic_rows_preflight(
+                handle,
+                &haystack,
+                start,
+                end,
+                &mut result,
+                &identity,
+                &mut output,
+            ),
+            STATUS_MATCH,
+            "cold canonical search warms the K0 root"
+        );
+
+        for cycle in 0..3 {
+            result = FreAotRegexResultV1::default();
+            output = FreAotRegexDynamicRowsPreflightV1::default();
+            assert_eq!(
+                call_exclusive_dynamic_rows_preflight(
+                    handle,
+                    &haystack,
+                    start,
+                    end,
+                    &mut result,
+                    &identity,
+                    &mut output,
+                ),
+                STATUS_PARTIAL_PREFLIGHT_ENTER,
+                "long local-success transaction {cycle} must remain admitted"
+            );
+
+            // Model the generated scan returning locally, followed by a
+            // separate short call that bypasses preflight in the wrapper.
+            // The ordinary helper must settle that success, not report a
+            // side exit for the preceding long transaction.
+            result = FreAotRegexResultV1::default();
+            assert_eq!(
+                call_exclusive(handle, &haystack, 0, 16, &mut result),
+                STATUS_NO_MATCH,
+                "short ordinary fallback {cycle}"
+            );
+        }
+
+        output = FreAotRegexDynamicRowsPreflightV1::default();
+        assert_eq!(
+            call_exclusive_dynamic_rows_preflight(
+                handle,
+                &haystack,
+                start,
+                end,
+                &mut result,
+                &identity,
+                &mut output,
+            ),
+            STATUS_PARTIAL_PREFLIGHT_ENTER,
+            "alternating local-success/short calls must not trigger deopt backoff"
+        );
+
+        // True side exits still advance the adaptive policy and two
+        // consecutive deopts activate its first bypass interval.
+        assert_eq!(
+            call_exclusive_dynamic_rows_deopt(handle, &haystack, start, end, &mut result),
+            STATUS_MATCH
+        );
+        assert_eq!(
+            call_exclusive_dynamic_rows_preflight(
+                handle,
+                &haystack,
+                start,
+                end,
+                &mut result,
+                &identity,
+                &mut output,
+            ),
+            STATUS_PARTIAL_PREFLIGHT_ENTER
+        );
+        assert_eq!(
+            call_exclusive_dynamic_rows_deopt(handle, &haystack, start, end, &mut result),
+            STATUS_MATCH
+        );
+        assert_eq!(
+            call_exclusive_dynamic_rows_preflight(
+                handle,
+                &haystack,
+                start,
+                end,
+                &mut result,
+                &identity,
+                &mut output,
+            ),
+            STATUS_MATCH,
+            "two genuine side exits must retain the existing backoff behavior"
+        );
 
         // SAFETY: the handle remains uniquely owned and no call overlaps its
         // destruction.
