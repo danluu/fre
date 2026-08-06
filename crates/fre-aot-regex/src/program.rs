@@ -13711,6 +13711,10 @@ mod tests {
             assert_ne!(cache_identity, 0, "{output:?}");
             assert!(state_count != 0, "{output:?}");
             assert!(
+                !projection.learned_loop_row_offsets().is_empty(),
+                "prefill did not publish a derivable loop plan for {output:?}"
+            );
+            assert!(
                 !compiled
                     .compiler_private_try_prefill_retained_fallback_with_workspace(
                         &mut workspace,
@@ -13820,6 +13824,19 @@ mod tests {
                 assert!(
                     prefilled,
                     "family={family} output={output:?} max_states={max_states}"
+                );
+                let projection = workspace
+                    .nfa
+                    .as_ref()
+                    .and_then(|nfa| nfa.dynamic_root_projection(&compiled.automaton))
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "family={family} output={output:?} max_states={max_states} has no prefilled projection"
+                        )
+                    });
+                assert!(
+                    !projection.learned_loop_row_offsets().is_empty(),
+                    "family={family} output={output:?} max_states={max_states} has no derived loop plan"
                 );
 
                 let reference = program(

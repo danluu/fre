@@ -5857,7 +5857,8 @@ impl K0Workspace {
     }
 
     /// Try to construct every direct forward and reverse row reachable from
-    /// the ordinary start plus a graph-bound continuation set.
+    /// the ordinary start plus a graph-bound continuation set, then derive
+    /// any authenticated forward self-loop scanners from those complete rows.
     ///
     /// This is a compiler-private setup optimization. Construction happens in
     /// a second workspace with an unlimited setup meter. The live workspace
@@ -12319,11 +12320,14 @@ fn charge_accounted_warm_resume_step(work: &mut u64) -> Result<(), SearchError> 
 /// returns the exact cached row, byte position, pending endpoint, and
 /// already-accounted work. The value-only entry can then initialize mutable
 /// invocation scratch and continue at that cell without replaying the
-/// immutable warm prefix.
+/// immutable warm prefix. An authenticated nonaccepting self-loop may scan
+/// its complete member run read-only; skipped bytes retain the scalar work
+/// ledger and cannot change the selected endpoint.
 #[allow(
     clippy::too_many_arguments,
     reason = "the warmed continuation keeps its authenticated frontier and committed prefix explicit"
 )]
+#[inline]
 fn try_accounted_warm_ordered_resume_endpoint(
     automaton: &Automaton,
     haystack: &[u8],
@@ -12335,6 +12339,50 @@ fn try_accounted_warm_ordered_resume_endpoint(
     pending_end: Option<usize>,
     earliest: bool,
 ) -> Result<AccountedWarmResumeEndpoint, SearchError> {
+    if workspace.lazy.loop_skip_plans.is_empty() {
+        try_accounted_warm_ordered_resume_endpoint_impl::<false>(
+            automaton,
+            haystack,
+            window,
+            workspace,
+            resume_set,
+            resume_state,
+            resume_position,
+            pending_end,
+            earliest,
+        )
+    } else {
+        try_accounted_warm_ordered_resume_endpoint_impl::<true>(
+            automaton,
+            haystack,
+            window,
+            workspace,
+            resume_set,
+            resume_state,
+            resume_position,
+            pending_end,
+            earliest,
+        )
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the warmed continuation keeps its authenticated frontier and committed prefix explicit"
+)]
+fn try_accounted_warm_ordered_resume_endpoint_impl<const LOOP_SKIP: bool>(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &K0Workspace,
+    resume_set: &K0ResumeSet,
+    resume_state: usize,
+    resume_position: usize,
+    pending_end: Option<usize>,
+    earliest: bool,
+) -> Result<AccountedWarmResumeEndpoint, SearchError> {
+    debug_assert!(!LOOP_SKIP || !workspace.lazy.loop_skip_plans.is_empty());
     let (seed, seed_pending) = resume_set.frontier(resume_state)?;
     let cached_hint = *resume_set.cached_states.get(resume_state).ok_or(
         SearchError::InvalidResumeState {
@@ -12390,12 +12438,70 @@ fn try_accounted_warm_ordered_resume_endpoint(
     let mut row = workspace.lazy.row_offset(cached_hint)?;
     let mut position = resume_position;
     let mut pending_end = pending_end;
+    let mut loop_probe = LazyLoopProbe::default();
+    let mut active_loop_slot = None;
     if earliest && pending_end.is_some() {
         return Ok(complete_warm_resume_endpoint(pending_end, work));
     }
     loop {
         if position == window.end() {
             return Ok(complete_warm_resume_endpoint(pending_end, work));
+        }
+        if LOOP_SKIP {
+            let selected = workspace.lazy.loop_skip_plans.find_with_hint(
+                row,
+                active_loop_slot,
+                workspace.lazy.direct_row_stride,
+            );
+            let selected_slot = selected.map(|(slot, _)| slot);
+            if selected_slot != active_loop_slot {
+                loop_probe.left_plan_state();
+                active_loop_slot = selected_slot;
+            }
+            if let Some((_, plan)) = selected {
+                let remaining_source = window.end().saturating_sub(position);
+                let remaining_work = u64::MAX.saturating_sub(work);
+                if loop_probe.is_ready(position)
+                    && remaining_source >= LAZY_LOOP_SKIP_MIN_BYTES
+                    && remaining_work
+                        >= u64::try_from(LAZY_LOOP_SKIP_MIN_BYTES)
+                            .expect("lazy loop threshold fits u64")
+                {
+                    let available = usize::try_from(remaining_work)
+                        .unwrap_or(usize::MAX)
+                        .min(remaining_source);
+                    let scan_end = position.checked_add(available).ok_or(
+                        SearchError::ArithmeticOverflow {
+                            computation: "warm resume loop scan end",
+                        },
+                    )?;
+                    let source = haystack.get(position..scan_end).ok_or(
+                        SearchError::InternalInvariant {
+                            detail: "warm resume loop scan exceeded the validated window",
+                        },
+                    )?;
+                    let skipped = plan.scanner.scan_forward(source);
+                    loop_probe.observe(position, skipped)?;
+                    if skipped != 0 {
+                        work = work
+                            .checked_add(
+                                u64::try_from(skipped)
+                                    .expect("warm resume loop length fits u64"),
+                            )
+                            .ok_or(SearchError::ArithmeticOverflow {
+                                computation: "search work counter",
+                            })?;
+                        position = position.checked_add(skipped).ok_or(
+                            SearchError::ArithmeticOverflow {
+                                computation: "warm resume loop source progress",
+                            },
+                        )?;
+                        if position == window.end() {
+                            continue;
+                        }
+                    }
+                }
+            }
         }
         // Match `WorkMeter::charge` in the ordinary loop: an unlimited work
         // overflow precedes the source read at this exact byte boundary. Keep
@@ -16757,6 +16863,14 @@ fn prefill_bound_resume_caches_transaction(
             return Ok(false);
         }
     }
+
+    // Every reachable direct row is now complete in private storage. Reuse
+    // the ordinary graph-only authentication pass so the first prepared
+    // invocation can enter the same scalar/SIMD loop scanners as a cache
+    // warmed by matching. Any checked failure still precedes publication and
+    // therefore leaves the live workspace and resume hints untouched.
+    try_derive_lazy_loop_skip(automaton, &mut staged, &mut meter)?;
+
     if staged_hints.len() != resume_set.cached_states.len()
         || staged_hints.len() != resume_set.cached_workspace_identities.len()
     {
@@ -46846,6 +46960,155 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the prepared scanner test covers publication, clipped work, all outputs, and immutable inferred cells"
+    )]
+    fn compiler_private_resume_prefill_publishes_and_uses_direct_loop_plans() {
+        let plan = direct_split_loop_then_terminal();
+        assert_ne!(byte_class(&plan, b'a'), byte_class(&plan, b'b'));
+        let frontier = [0_u32];
+        let mut resume = K0ResumeSet::new(&plan, 1, 1, [(&frontier[..], false)]).unwrap();
+        let mut workspace =
+            K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let retained = workspace.retained_bytes();
+
+        assert!(workspace.compiler_private_try_prefill_resume_caches(&plan, &mut resume));
+        assert_eq!(workspace.retained_bytes(), retained);
+        let resume_row = workspace.lazy.row_offset(resume.cached_states[0]).unwrap();
+        let (_, loop_plan) = workspace
+            .lazy
+            .loop_skip_plans
+            .find(resume_row, workspace.lazy.direct_row_stride)
+            .expect("the complete repeated frontier must publish its graph loop proof");
+        assert_eq!(loop_plan.start_action, super::LazyStartAction::Propagate);
+        assert!(loop_plan.scanner.contains(b'a'));
+        assert!(loop_plan.scanner.contains(b'b'));
+        assert!(!loop_plan.scanner.contains(b'z'));
+
+        // Keep the graph-authenticated `b` member physically unpublished.
+        // A scalar row walk would hand off at the first byte; completing all
+        // three outputs read-only proves that the prepared plan is consumed.
+        let b_cell = usize::try_from(resume_row).unwrap()
+            .checked_add(usize::from(byte_class(&plan, b'b')))
+            .unwrap();
+        workspace.lazy.rows[b_cell] = super::LAZY_CELL_UNFILLED;
+        let prefix = 3;
+        let run = super::LAZY_LOOP_SKIP_MIN_BYTES * 3;
+        let mut haystack = vec![b'!'; prefix];
+        haystack.extend(core::iter::repeat_n(b'b', run));
+        haystack.push(b'z');
+        let end = haystack.len();
+        haystack.extend_from_slice(b"!!");
+        let window = SearchWindow::new(prefix, end);
+        let expected_work = super::INVOCATION_RESET_WORK
+            + super::RESUME_CACHE_IDENTITY_CHECK_WORK
+            + u64::try_from(window.end() - window.start()).unwrap();
+
+        assert_eq!(
+            super::try_accounted_warm_ordered_resume_endpoint(
+                &plan,
+                &haystack,
+                window,
+                &workspace,
+                &resume,
+                0,
+                window.start(),
+                None,
+                false,
+            )
+            .unwrap(),
+            super::AccountedWarmResumeEndpoint::Complete {
+                found: Some(window.end()),
+                work: expected_work,
+            }
+        );
+        assert_eq!(
+            plan.prepare::<Exists>()
+                .search_prevalidated_exists_value_from_ordered_resume_with_authenticated_workspace_with_completion(
+                    &haystack,
+                    window,
+                    &mut workspace,
+                    &mut resume,
+                    0,
+                    window.start(),
+                    None,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .into_parts(),
+            (true, K0OrderedResumeCompletion::FullyWarmRows)
+        );
+        assert_eq!(
+            plan.prepare::<SelectedEnd>()
+                .search_prevalidated_selected_end_value_from_ordered_resume_with_authenticated_workspace_with_completion(
+                    &haystack,
+                    window,
+                    &mut workspace,
+                    &mut resume,
+                    0,
+                    window.start(),
+                    None,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .into_parts(),
+            (
+                Some(window.end()),
+                K0OrderedResumeCompletion::FullyWarmRows,
+            )
+        );
+        assert_eq!(
+            plan.prepare::<Span>()
+                .search_prevalidated_span_value_from_ordered_resume_with_authenticated_workspace_with_completion(
+                    &haystack,
+                    window,
+                    &mut workspace,
+                    &mut resume,
+                    0,
+                    window.start(),
+                    None,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .into_parts(),
+            (
+                Some(MatchSpan::new(window.start(), window.end())),
+                K0OrderedResumeCompletion::FullyWarmRows,
+            )
+        );
+        assert_eq!(workspace.lazy.rows[b_cell], super::LAZY_CELL_UNFILLED);
+    }
+
+    #[test]
+    fn compiler_private_resume_prefill_keeps_nonloop_graphs_plan_free() {
+        let plan = Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![StateRole::Consume, StateRole::Accept],
+                edge_offsets: vec![0, 1, 1],
+                edge_targets: vec![1],
+                edge_kinds: vec![EdgeKind::ByteRange],
+                byte_starts: vec![u8::MIN],
+                byte_ends: vec![u8::MAX],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap();
+        let frontier = [0_u32];
+        let mut resume = K0ResumeSet::new(&plan, 1, 1, [(&frontier[..], false)]).unwrap();
+        let mut workspace =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+
+        assert!(workspace.compiler_private_try_prefill_resume_caches(&plan, &mut resume));
+        assert!(workspace.lazy.loop_skip_plans.is_empty());
+        assert_eq!(
+            workspace.lazy.loop_skip_analyzed_at_cells,
+            workspace.lazy.direct_cells_published
+        );
+    }
+
+    #[test]
     fn compiler_private_resume_prefill_capacity_decline_is_transactional() {
         let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b'), (b'c', b'c')]);
         let frontier = [1_u32];
@@ -46866,6 +47129,8 @@ mod tests {
         assert_eq!(workspace.lazy.state_len, 0);
         assert_eq!(workspace.lazy.item_len, 0);
         assert!(!workspace.lazy.initialized);
+        assert!(workspace.lazy.loop_skip_plans.is_empty());
+        assert_eq!(workspace.lazy.loop_skip_analyzed_at_cells, 0);
         assert_eq!(resume.cached_states.as_slice(), &[super::LAZY_NO_STATE]);
         assert_eq!(
             resume.cached_workspace_identities,
