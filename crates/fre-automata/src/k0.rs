@@ -274,6 +274,30 @@ fn direct_row_encoded_state(state: u32, stride: u32) -> Result<u32, SearchError>
         })
 }
 
+/// Validate every target before direct rows cross into native code.
+///
+/// This is deliberately a setup-time linear pass. Native execution can then
+/// mask an encoded row token and index the immutable projected slice without
+/// repeating target bounds or unpublished-cell checks for each source byte.
+fn frozen_direct_rows_are_closed(rows: &[u32], stride: usize) -> bool {
+    if stride == 0 || rows.is_empty() || rows.len().checked_rem(stride) != Some(0) {
+        return false;
+    }
+    rows.iter().copied().all(|cell| {
+        if cell == LAZY_CELL_UNFILLED {
+            return false;
+        }
+        let encoded = cell & LAZY_CELL_STATE_MASK;
+        if encoded == 0 {
+            return true;
+        }
+        encoded
+            .checked_sub(1)
+            .and_then(|row| usize::try_from(row).ok())
+            .is_some_and(|row| row < rows.len() && row.checked_rem(stride) == Some(0))
+    })
+}
+
 #[allow(
     clippy::arithmetic_side_effects,
     reason = "authenticated direct row offsets are exact multiples of the immutable stride"
@@ -5592,6 +5616,117 @@ impl K0FullyPrefilledResumeCacheReceipt {
     }
 }
 
+/// Immutable native projection of one setup-authenticated complete K0 cache.
+///
+/// Construction revalidates the opaque prefill receipt, exact forward and
+/// reverse extents, initial rows, class map, and every encoded row target.
+/// The projected slices borrow the fixed-capacity workspace and remain stable
+/// only while no mutable workspace entry is invoked. Compiler-private
+/// exclusive runtimes use that one-time proof to construct their own
+/// versioned, irreversibly revocable hot header.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct K0FullyPrefilledRootProjection<'a> {
+    forward_rows: &'a [u32],
+    reverse_rows: Option<&'a [u32]>,
+    class_map: [u8; BYTE_ALPHABET],
+    row_stride: u32,
+    forward_initial_row: u32,
+    reverse_initial_row: Option<u32>,
+    initial_pending: bool,
+    initial_terminal: bool,
+    cache_identity: u64,
+    unfilled_cell: u32,
+    accept_mask: u32,
+    next_row_token_mask: u32,
+}
+
+impl K0FullyPrefilledRootProjection<'_> {
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn forward_rows_address(&self) -> *const u32 {
+        self.forward_rows.as_ptr()
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn forward_live_cells(&self) -> usize {
+        self.forward_rows.len()
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn reverse_rows_address(&self) -> Option<*const u32> {
+        self.reverse_rows.map(<[u32]>::as_ptr)
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn reverse_live_cells(&self) -> usize {
+        self.reverse_rows.map_or(0, <[u32]>::len)
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn class_map(&self) -> &[u8; BYTE_ALPHABET] {
+        &self.class_map
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn row_stride(&self) -> u32 {
+        self.row_stride
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn forward_initial_row(&self) -> u32 {
+        self.forward_initial_row
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn reverse_initial_row(&self) -> Option<u32> {
+        self.reverse_initial_row
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn initial_pending(&self) -> bool {
+        self.initial_pending
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn initial_terminal(&self) -> bool {
+        self.initial_terminal
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn cache_identity(&self) -> u64 {
+        self.cache_identity
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn unfilled_cell(&self) -> u32 {
+        self.unfilled_cell
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn accept_mask(&self) -> u32 {
+        self.accept_mask
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn next_row_token_mask(&self) -> u32 {
+        self.next_row_token_mask
+    }
+}
+
 /// Caller-owned fixed-capacity storage for allocation-free repeated K0 calls.
 ///
 /// All backing vectors retain their full initialized length. Separate logical
@@ -6207,6 +6342,81 @@ impl K0Workspace {
             }
         }
         Some(())
+    }
+
+    /// Authenticate a complete setup receipt once and project root-start
+    /// forward/reverse rows for a versioned exclusive-runtime header.
+    ///
+    /// Unlike the warmed continuation projection, this checks every encoded
+    /// row target before exposing an address. The returned slices borrow this
+    /// workspace, and any later mutable workspace entry invalidates the
+    /// caller's external seal even though the fixed-capacity allocations stay
+    /// at stable addresses.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn compiler_private_fully_prefilled_root_projection(
+        &self,
+        automaton: &Automaton,
+        resume_set: &K0ResumeSet,
+        receipt: K0FullyPrefilledResumeCacheReceipt,
+    ) -> Option<K0FullyPrefilledRootProjection<'_>> {
+        self.fully_prefilled_cache_is_live(automaton, resume_set, receipt, false)?;
+        let stride = usize::try_from(receipt.direct_row_stride).ok()?;
+        let forward_rows = self.lazy.rows.get(..receipt.forward_cells)?;
+        if !frozen_direct_rows_are_closed(forward_rows, stride)
+            || self.lazy.initial == LAZY_NO_STATE
+        {
+            return None;
+        }
+        let forward_initial_row = self.lazy.row_offset(self.lazy.initial).ok()?;
+        if usize::try_from(forward_initial_row).ok()? >= forward_rows.len() {
+            return None;
+        }
+        let (initial_pending, initial_terminal) = match self.lazy.initial_kind {
+            LazyInitialKind::Positive | LazyInitialKind::PositiveSingle => (false, false),
+            LazyInitialKind::NullablePrefix => (true, false),
+            LazyInitialKind::NullableTerminal => (true, true),
+            LazyInitialKind::Uninitialized => return None,
+        };
+
+        let (reverse_rows, reverse_initial_row) = if receipt.reverse_allocated {
+            let rows = self.reverse.rows.get(..receipt.reverse_cells)?;
+            if !frozen_direct_rows_are_closed(rows, stride)
+                || self.reverse.initial == LAZY_NO_STATE
+            {
+                return None;
+            }
+            let initial = self.reverse.row_offset(self.reverse.initial).ok()?;
+            if usize::try_from(initial).ok()? >= rows.len() {
+                return None;
+            }
+            (Some(rows), Some(initial))
+        } else {
+            (None, None)
+        };
+
+        let mut class_map = [0_u8; BYTE_ALPHABET];
+        for byte in u8::MIN..=u8::MAX {
+            let class = automaton.byte_classes().class_of(byte);
+            if usize::from(class) >= stride {
+                return None;
+            }
+            class_map[usize::from(byte)] = class;
+        }
+        Some(K0FullyPrefilledRootProjection {
+            forward_rows,
+            reverse_rows,
+            class_map,
+            row_stride: receipt.direct_row_stride,
+            forward_initial_row,
+            reverse_initial_row,
+            initial_pending,
+            initial_terminal,
+            cache_identity: receipt.cache_identity,
+            unfilled_cell: LAZY_CELL_UNFILLED,
+            accept_mask: LAZY_CELL_ACCEPT,
+            next_row_token_mask: LAZY_CELL_STATE_MASK,
+        })
     }
 
     fn begin_invocation(
@@ -48558,6 +48768,60 @@ mod tests {
             .compiler_private_try_prefill_resume_caches_with_receipt(&plan, &mut resume)
             .expect("the complete direct graph must publish a receipt");
         assert!(!receipt.has_forward_byte_rows());
+        let projection = workspace
+            .compiler_private_fully_prefilled_root_projection(&plan, &resume, receipt)
+            .expect("the fresh complete receipt must project frozen root rows");
+        assert_eq!(projection.forward_rows_address(), workspace.lazy.rows.as_ptr());
+        assert_eq!(
+            projection.forward_live_cells(),
+            workspace
+                .lazy
+                .state_len
+                .checked_mul(plan.byte_classes().count())
+                .unwrap()
+        );
+        assert_eq!(
+            projection.reverse_rows_address(),
+            Some(workspace.reverse.rows.as_ptr())
+        );
+        assert_eq!(
+            projection.reverse_live_cells(),
+            workspace
+                .reverse
+                .state_len
+                .checked_mul(plan.byte_classes().count())
+                .unwrap()
+        );
+        assert_eq!(projection.row_stride(), workspace.lazy.direct_row_stride);
+        assert_eq!(projection.cache_identity(), workspace.lazy.cache_identity);
+        assert!(!projection.initial_pending());
+        assert!(!projection.initial_terminal());
+        for byte in u8::MIN..=u8::MAX {
+            assert_eq!(
+                projection.class_map()[usize::from(byte)],
+                plan.byte_classes().class_of(byte)
+            );
+        }
+        assert!(
+            workspace
+                .compiler_private_fully_prefilled_root_projection(
+                    &direct_split_loop_then_terminal(),
+                    &resume,
+                    receipt,
+                )
+                .is_none(),
+            "an equal-shape foreign automaton must not authenticate"
+        );
+        let initial_cell = usize::try_from(projection.forward_initial_row()).unwrap();
+        let saved = workspace.lazy.rows[initial_cell];
+        workspace.lazy.rows[initial_cell] = super::LAZY_CELL_STATE_MASK;
+        assert!(
+            workspace
+                .compiler_private_fully_prefilled_root_projection(&plan, &resume, receipt)
+                .is_none(),
+            "an out-of-range native row target must fail before publication"
+        );
+        workspace.lazy.rows[initial_cell] = saved;
 
         let prefix = 5;
         let run = super::LAZY_LOOP_SKIP_MIN_BYTES * 2;
@@ -48722,6 +48986,12 @@ mod tests {
             workspace
                 .fully_prefilled_resume_row(&plan, &resume, 0, receipt, true)
                 .is_none()
+        );
+        assert!(
+            workspace
+                .compiler_private_fully_prefilled_root_projection(&plan, &resume, receipt)
+                .is_none(),
+            "repair must also retire the frozen root projection"
         );
 
         // The receipt-bearing facade must now select the old exact executor,

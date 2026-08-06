@@ -65,9 +65,9 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex, OnceLock, TryLockError};
 
 use fre_aot_regex::{
-    CompileError, CompiledProgram, FullyPrefilledFallbackReceipt, MatchResult, OutputContract,
-    PROGRAM_HEADER_LEN, ProgramFormatError, ProgramWorkspace, RetainedPartialPreflight,
-    SearchWindow,
+    CompileError, CompiledProgram, FrozenPreparedHeaderV1, FullyPrefilledFallbackReceipt,
+    MatchResult, OutputContract, PROGRAM_HEADER_LEN, ProgramFormatError, ProgramWorkspace,
+    RetainedPartialPreflight, SearchWindow,
 };
 
 /// No match was selected.
@@ -369,11 +369,15 @@ impl Default for FreAotRegexExclusiveHandleV1 {
 /// the program's fixed-capacity workspace once. Repeated [`Self::search`]
 /// calls neither deserialize the program nor allocate executor workspace.
 #[derive(Debug)]
+#[repr(C)]
 pub struct PreparedAotRegex {
+    frozen_header: FrozenPreparedHeaderV1,
     program: CompiledProgram,
     workspace: ProgramWorkspace,
     fully_prefilled_fallback: Option<FullyPrefilledFallbackReceipt>,
 }
+
+const _: () = assert!(std::mem::offset_of!(PreparedAotRegex, frozen_header) == 0);
 
 impl PreparedAotRegex {
     /// Validate, own, and prepare one serialized AOT semantic program.
@@ -395,11 +399,23 @@ impl PreparedAotRegex {
         let fully_prefilled_fallback = program
             .compiler_private_try_prefill_retained_fallback_with_workspace_receipt(&mut workspace)
             .map_err(PrepareError::Workspace)?;
+        let frozen_header = program.compiler_private_frozen_prepared_header_v1(
+            &workspace,
+            fully_prefilled_fallback,
+        );
         Ok(Self {
+            frozen_header,
             program,
             workspace,
             fully_prefilled_fallback,
         })
+    }
+
+    #[inline]
+    fn deactivate_frozen_header(&mut self) {
+        if self.frozen_header.is_active() {
+            self.frozen_header.deactivate();
+        }
     }
 
     /// Execute without re-deserializing or allocating executor workspace.
@@ -412,6 +428,7 @@ impl PreparedAotRegex {
         haystack: &[u8],
         window: SearchWindow,
     ) -> Result<MatchResult, CompileError> {
+        self.deactivate_frozen_header();
         self.program
             .search_optimized_with_workspace(haystack, window, &mut self.workspace)
     }
@@ -422,6 +439,7 @@ impl PreparedAotRegex {
         haystack: &[u8],
         window: SearchWindow,
     ) -> Result<MatchResult, CompileError> {
+        self.deactivate_frozen_header();
         if let Some(receipt) = self.fully_prefilled_fallback {
             self.program
                 .search_exclusive_optimized_with_fully_prefilled_fallback_workspace(
@@ -448,6 +466,7 @@ impl PreparedAotRegex {
         resume_position: usize,
         pending_end: Option<usize>,
     ) -> Result<MatchResult, CompileError> {
+        self.deactivate_frozen_header();
         if let Some(receipt) = self.fully_prefilled_fallback {
             self.program
                 .search_from_retained_partial_resume_with_fully_prefilled_fallback_workspace(
@@ -481,6 +500,7 @@ impl PreparedAotRegex {
         resume_position: usize,
         pending_end: Option<usize>,
     ) -> Result<MatchResult, CompileError> {
+        self.deactivate_frozen_header();
         if let Some(receipt) = self.fully_prefilled_fallback {
             self.program
                 .search_from_preflight_retained_partial_resume_with_fully_prefilled_fallback_workspace(
@@ -512,6 +532,7 @@ impl PreparedAotRegex {
         resume_position: usize,
         pending_end: Option<usize>,
     ) -> Result<MatchResult, CompileError> {
+        self.deactivate_frozen_header();
         if let Some(receipt) = self.fully_prefilled_fallback {
             self.program
                 .search_from_preflight_retained_partial_resume_ticket_with_fully_prefilled_fallback_workspace(
@@ -541,6 +562,7 @@ impl PreparedAotRegex {
         resume_position: usize,
         pending_end: usize,
     ) -> Result<MatchResult, CompileError> {
+        self.deactivate_frozen_header();
         if let Some(receipt) = self.fully_prefilled_fallback {
             self.program
                 .search_from_preflight_retained_partial_resume_ticket_inferred_with_fully_prefilled_fallback_workspace(
@@ -567,6 +589,7 @@ impl PreparedAotRegex {
         &mut self,
         input_bytes: usize,
     ) -> Result<bool, CompileError> {
+        self.deactivate_frozen_header();
         self.program
             .prepared_partial_should_enter_with_workspace(&mut self.workspace, input_bytes)
     }
@@ -577,6 +600,7 @@ impl PreparedAotRegex {
         window: SearchWindow,
         expected_artifact_identity: [u8; ARTIFACT_IDENTITY_BYTES],
     ) -> Result<RetainedPartialPreflight, CompileError> {
+        self.deactivate_frozen_header();
         self.program.preflight_retained_partial_with_workspace(
             haystack,
             window,
@@ -592,6 +616,7 @@ impl PreparedAotRegex {
         expected_artifact_identity: [u8; ARTIFACT_IDENTITY_BYTES],
         selected_end: usize,
     ) -> Result<MatchResult, CompileError> {
+        self.deactivate_frozen_header();
         if let Some(receipt) = self.fully_prefilled_fallback {
             self.program
                 .recover_retained_partial_span_from_selected_end_with_fully_prefilled_fallback_workspace(
@@ -620,6 +645,7 @@ impl PreparedAotRegex {
         window: SearchWindow,
         expected_artifact_identity: [u8; ARTIFACT_IDENTITY_BYTES],
     ) -> Result<RetainedPartialPreflight, CompileError> {
+        self.deactivate_frozen_header();
         self.program
             .preflight_retained_partial_native_root_with_workspace(
                 haystack,
@@ -635,6 +661,7 @@ impl PreparedAotRegex {
         window: SearchWindow,
         expected_artifact_identity: [u8; ARTIFACT_IDENTITY_BYTES],
     ) -> Result<(RetainedPartialPreflight, usize, u64), CompileError> {
+        self.deactivate_frozen_header();
         self.program.preflight_dynamic_native_rows_with_workspace(
             haystack,
             window,
@@ -644,11 +671,13 @@ impl PreparedAotRegex {
     }
 
     fn observe_dynamic_native_rows_deopt(&mut self) {
+        self.deactivate_frozen_header();
         self.program
             .observe_dynamic_native_rows_deopt_with_workspace(&mut self.workspace);
     }
 
     fn settle_dynamic_native_rows_local_completion(&mut self) {
+        self.deactivate_frozen_header();
         self.program
             .settle_dynamic_native_rows_local_completion_with_workspace(&mut self.workspace);
     }
@@ -664,6 +693,7 @@ impl PreparedAotRegex {
         expected_artifact_identity: [u8; ARTIFACT_IDENTITY_BYTES],
         continuation: FreAotRegexDynamicRowsContinuationV1,
     ) -> Result<MatchResult, CompileError> {
+        self.deactivate_frozen_header();
         self.program
             .search_from_dynamic_native_rows_hole_with_workspace(
                 haystack,
@@ -1273,6 +1303,78 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_search_exclusive_v1(
         result_ptr,
         DynamicNativeRowsFallbackOutcome::LocalCompletion,
     )
+}
+
+/// Compiler-private capability and side exit for a frozen prepared root.
+///
+/// Future generated direct entries link this distinct symbol instead of a V1
+/// legacy search helper. Its presence proves that the runtime allocation begins
+/// with the matching versioned header. Entering the helper permanently clears
+/// that header's direct-use seal before authenticating the emitted artifact or
+/// touching mutable workspace state. Thus a wrong-artifact side exit also
+/// retires the projection and leaves the result untouched.
+///
+/// This symbol is intentionally absent from [`C_API_V1_HEADER`]. Linking a
+/// frozen-entry object against an older runtime therefore fails closed.
+///
+/// # Safety
+///
+/// `handle` must satisfy the exclusive ownership contract of
+/// [`fre_aot_regex_runtime_search_exclusive_v1`]. The haystack and result
+/// extents have the same requirements. `expected_artifact_identity_ptr` must
+/// address exactly [`ARTIFACT_IDENTITY_BYTES`] readable bytes, disjoint from
+/// writable output, for the duration of the call.
+#[doc(hidden)]
+#[unsafe(no_mangle)]
+#[allow(
+    unsafe_code,
+    clippy::too_many_arguments,
+    reason = "the compiler-private frozen fallback authenticates one exact artifact and search window"
+)]
+pub unsafe extern "C" fn fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
+    handle: FreAotRegexExclusiveHandleV1,
+    haystack_ptr: *const u8,
+    haystack_len: usize,
+    window_start: usize,
+    window_end: usize,
+    result_ptr: *mut FreAotRegexResultV1,
+    expected_artifact_identity_ptr: *const u8,
+) -> u32 {
+    if handle.is_invalid() {
+        return STATUS_INVALID_HANDLE;
+    }
+    if haystack_ptr.is_null()
+        || result_ptr.is_null()
+        || !result_ptr.is_aligned()
+        || expected_artifact_identity_ptr.is_null()
+        || haystack_len > isize::MAX.unsigned_abs()
+        || window_start > window_end
+        || window_end > haystack_len
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+
+    // SAFETY: the caller guarantees one live exclusively owned allocation and
+    // all readable/writable disjoint extents documented above.
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        let prepared = &mut *handle.0.cast::<PreparedAotRegex>();
+        prepared.deactivate_frozen_header();
+        let expected_artifact_identity = expected_artifact_identity_ptr
+            .cast::<[u8; ARTIFACT_IDENTITY_BYTES]>()
+            .read();
+        if expected_artifact_identity != *prepared.frozen_header.artifact_identity() {
+            return STATUS_RUNTIME_FAILURE;
+        }
+        let haystack = std::slice::from_raw_parts(haystack_ptr, haystack_len);
+        let Ok((status, result)) =
+            execute_exclusive_search(prepared, haystack, window_start, window_end)
+        else {
+            return STATUS_RUNTIME_FAILURE;
+        };
+        result_ptr.write(result);
+        status
+    }))
+    .unwrap_or(STATUS_RUNTIME_FAILURE)
 }
 
 /// Continue a genuine whole-search side exit from the generated dynamic-row
@@ -2377,6 +2479,53 @@ mod tests {
         }
     }
 
+    fn call_exclusive_frozen_fallback(
+        handle: FreAotRegexExclusiveHandleV1,
+        haystack: &[u8],
+        start: usize,
+        end: usize,
+        result: &mut FreAotRegexResultV1,
+        expected_artifact_identity: &[u8; ARTIFACT_IDENTITY_BYTES],
+    ) -> u32 {
+        // SAFETY: each test owns the live exclusive session and supplies
+        // readable haystack/identity plus disjoint aligned writable output.
+        unsafe {
+            fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
+                handle,
+                haystack.as_ptr(),
+                haystack.len(),
+                start,
+                end,
+                result,
+                expected_artifact_identity.as_ptr(),
+            )
+        }
+    }
+
+    fn exclusive_frozen_header_is_active(handle: FreAotRegexExclusiveHandleV1) -> bool {
+        assert!(!handle.is_invalid());
+        // SAFETY: lifecycle tests call this only while they uniquely own the
+        // live allocation and no search or destruction overlaps the read.
+        unsafe {
+            (&*handle.0.cast::<PreparedAotRegex>())
+                .frozen_header
+                .is_active()
+        }
+    }
+
+    fn exclusive_frozen_header_identity(
+        handle: FreAotRegexExclusiveHandleV1,
+    ) -> [u8; ARTIFACT_IDENTITY_BYTES] {
+        assert!(!handle.is_invalid());
+        // SAFETY: identical unique-live-handle reasoning to the active-seal
+        // helper immediately above.
+        unsafe {
+            *(&*handle.0.cast::<PreparedAotRegex>())
+                .frozen_header
+                .artifact_identity()
+        }
+    }
+
     fn call_exclusive_dynamic_rows_deopt(
         handle: FreAotRegexExclusiveHandleV1,
         haystack: &[u8],
@@ -2632,6 +2781,15 @@ mod tests {
         reason = "the ABI audit keeps every public and compiler-private function type in one ledger"
     )]
     fn c_abi_layout_declarations_and_function_types_are_stable() {
+        assert_eq!(std::mem::offset_of!(PreparedAotRegex, frozen_header), 0);
+        assert_eq!(
+            size_of::<FrozenPreparedHeaderV1>(),
+            fre_aot_regex::FROZEN_PREPARED_HEADER_V1_BYTES
+        );
+        assert_eq!(
+            fre_aot_regex::FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL_OFFSET,
+            0
+        );
         assert_eq!(size_of::<FreAotRegexPreparedHandleV1>(), size_of::<u64>());
         assert_eq!(align_of::<FreAotRegexPreparedHandleV1>(), align_of::<u64>());
         assert_eq!(
@@ -2695,6 +2853,7 @@ mod tests {
             "fre_aot_regex_runtime_search_exclusive_dynamic_rows_preflight_v1",
             "fre_aot_regex_runtime_search_exclusive_dynamic_rows_deopt_v1",
             "fre_aot_regex_runtime_search_exclusive_dynamic_rows_continue_v1",
+            "fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1",
             "native_rows_address",
             "cache_generation",
             "current_row",
@@ -2727,6 +2886,15 @@ mod tests {
             usize,
             *mut FreAotRegexResultV1,
         ) -> u32 = fre_aot_regex_runtime_search_exclusive_v1;
+        let _: unsafe extern "C" fn(
+            FreAotRegexExclusiveHandleV1,
+            *const u8,
+            usize,
+            usize,
+            usize,
+            *mut FreAotRegexResultV1,
+            *const u8,
+        ) -> u32 = fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1;
         let _: unsafe extern "C" fn(
             FreAotRegexExclusiveHandleV1,
             *const u8,
@@ -2888,6 +3056,95 @@ mod tests {
         ) -> u32 = fre_aot_regex_runtime_search_exclusive_partial_native_root_preflight_v1;
         let _: unsafe extern "C" fn(FreAotRegexExclusiveHandleV1) -> u32 =
             fre_aot_regex_runtime_destroy_exclusive_v1;
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn frozen_object_link_fails_against_a_legacy_runtime_without_the_capability_symbol() {
+        use std::{fs, process::Command, time::SystemTime};
+
+        const FROZEN_SYMBOL: &str =
+            "fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1";
+        assert!(!C_API_V1_HEADER.contains(FROZEN_SYMBOL));
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("system clock after epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "fre-aot-frozen-old-runtime-link-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("create isolated linker fixture");
+        let caller = directory.join("frozen_caller.c");
+        let legacy = directory.join("legacy_runtime.c");
+        let capable = directory.join("capable_runtime.c");
+        let compatible_executable = directory.join("compatible");
+        let legacy_executable = directory.join("legacy");
+        fs::write(
+            &caller,
+            r"#include <stddef.h>
+#include <stdint.h>
+typedef struct { size_t start; size_t end; } result_t;
+extern uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
+    void *, const unsigned char *, size_t, size_t, size_t, result_t *,
+    const unsigned char *);
+int main(void) {
+    static const unsigned char haystack[1] = { 0 };
+    static const unsigned char identity[32] = { 0 };
+    result_t result = { 0, 0 };
+    return (int)fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
+        (void *)1, haystack, 1, 0, 1, &result, identity);
+}
+",
+        )
+        .expect("write frozen caller");
+        fs::write(
+            &legacy,
+            r"#include <stdint.h>
+uint32_t fre_aot_regex_runtime_search_exclusive_v1(void) { return 0; }
+",
+        )
+        .expect("write legacy runtime stub");
+        fs::write(
+            &capable,
+            r"#include <stddef.h>
+#include <stdint.h>
+typedef struct { size_t start; size_t end; } result_t;
+uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
+    void *h, const unsigned char *p, size_t n, size_t s, size_t e, result_t *r,
+    const unsigned char *d) {
+    (void)h; (void)p; (void)n; (void)s; (void)e; (void)r; (void)d;
+    return 0;
+}
+",
+        )
+        .expect("write capable runtime stub");
+
+        let compatible = Command::new("cc")
+            .arg(&caller)
+            .arg(&legacy)
+            .arg(&capable)
+            .arg("-o")
+            .arg(&compatible_executable)
+            .output()
+            .expect("invoke host C linker for capable runtime");
+        assert!(
+            compatible.status.success(),
+            "capable fixture failed to link: {}",
+            String::from_utf8_lossy(&compatible.stderr)
+        );
+        let old = Command::new("cc")
+            .arg(&caller)
+            .arg(&legacy)
+            .arg("-o")
+            .arg(&legacy_executable)
+            .output()
+            .expect("invoke host C linker for legacy runtime");
+        assert!(
+            !old.status.success(),
+            "a frozen caller unexpectedly linked without {FROZEN_SYMBOL}"
+        );
+        fs::remove_dir_all(&directory).expect("remove isolated linker fixture");
     }
 
     #[test]
@@ -3889,6 +4146,154 @@ mod tests {
                 STATUS_SUCCESS
             );
         }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one lifecycle ledger keeps initial publication, alternate legacy revocation, and wrong-artifact fallback transactional"
+    )]
+    fn frozen_header_is_first_and_every_legacy_or_fallback_path_revokes_it() {
+        let pattern = r"a+Q|[b-c][a-b]{1,5}(?:x+|y+)";
+        let mut limits = CompileLimitsV1::default();
+        limits.determinize.max_states = 8;
+        let compiled = compile(
+            CompileRequest::new(pattern, Target::x86_64_linux())
+                .mode(CompileMode::Optimizing)
+                .limits(limits)
+                .output(OutputContract::SelectedEnd),
+        )
+        .expect("compile retained frozen fixture");
+        assert_eq!(
+            compiled.receipt().engine_selection_reason,
+            EngineSelectionReason::DeterminizationResourceLimit
+        );
+        let identity = compiled.receipt().program_sha256;
+        let serialized = compiled.program().serialize().expect("serialize fixture");
+        let haystack = b"xxcbbbbx";
+        let window = SearchWindow::full(haystack);
+        let expected = compiled
+            .search(haystack, window)
+            .expect("portable expected result");
+        let expected_ffi = expected_ffi(expected);
+
+        let mut direct = PreparedAotRegex::deserialize(&serialized).expect("prepare direct Rust");
+        assert!(direct.fully_prefilled_fallback.is_some());
+        assert!(direct.frozen_header.is_active());
+        assert_eq!(*direct.frozen_header.artifact_identity(), identity);
+        assert_eq!(
+            (&raw const direct).cast::<u8>().addr(),
+            (&raw const direct.frozen_header).cast::<u8>().addr(),
+            "the opaque prepared allocation must begin with the versioned header"
+        );
+        assert_eq!(direct.search(haystack, window).unwrap(), expected);
+        assert!(!direct.frozen_header.is_active());
+        assert_eq!(direct.search(haystack, window).unwrap(), expected);
+        assert!(!direct.frozen_header.is_active(), "a legacy search cannot reactivate");
+
+        let legacy = prepare_exclusive(&serialized);
+        assert!(exclusive_frozen_header_is_active(legacy));
+        assert_eq!(exclusive_frozen_header_identity(legacy), identity);
+        let mut legacy_result = FreAotRegexResultV1 {
+            start: usize::MAX,
+            end: usize::MAX,
+        };
+        assert_eq!(
+            (
+                call_exclusive(legacy, haystack, 0, haystack.len(), &mut legacy_result),
+                legacy_result,
+            ),
+            expected_ffi
+        );
+        assert!(!exclusive_frozen_header_is_active(legacy));
+        let mut fallback_after_legacy = FreAotRegexResultV1::default();
+        assert_eq!(
+            (
+                call_exclusive_frozen_fallback(
+                    legacy,
+                    haystack,
+                    0,
+                    haystack.len(),
+                    &mut fallback_after_legacy,
+                    &identity,
+                ),
+                fallback_after_legacy,
+            ),
+            expected_ffi
+        );
+        assert!(
+            !exclusive_frozen_header_is_active(legacy),
+            "a correct fallback after legacy use cannot restore the seal"
+        );
+        // SAFETY: this test owns the unique live allocation and no call overlaps
+        // its destruction.
+        assert_eq!(
+            unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(legacy) },
+            STATUS_SUCCESS
+        );
+
+        let alternate = prepare_exclusive(&serialized);
+        assert!(exclusive_frozen_header_is_active(alternate));
+        assert!(matches!(
+            call_partial_should_enter(alternate, 4_096),
+            PARTIAL_ENTRY_BYPASS | PARTIAL_ENTRY_ENTER
+        ));
+        assert!(
+            !exclusive_frozen_header_is_active(alternate),
+            "an alternate legacy admission entry must permanently kill the seal"
+        );
+        // SAFETY: unique, live, non-overlapping handle.
+        assert_eq!(
+            unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(alternate) },
+            STATUS_SUCCESS
+        );
+
+        let wrong_artifact = prepare_exclusive(&serialized);
+        assert!(exclusive_frozen_header_is_active(wrong_artifact));
+        let mut mismatched_identity = identity;
+        mismatched_identity[0] ^= 0x80;
+        let sentinel = FreAotRegexResultV1 {
+            start: 0xfeed_face,
+            end: 0xdead_beef,
+        };
+        let mut wrong_result = sentinel;
+        assert_eq!(
+            call_exclusive_frozen_fallback(
+                wrong_artifact,
+                haystack,
+                0,
+                haystack.len(),
+                &mut wrong_result,
+                &mismatched_identity,
+            ),
+            STATUS_RUNTIME_FAILURE
+        );
+        assert_eq!(wrong_result, sentinel, "wrong-artifact output is transactional");
+        assert!(
+            !exclusive_frozen_header_is_active(wrong_artifact),
+            "wrong-artifact fallback must revoke before authentication"
+        );
+        let mut recovered = FreAotRegexResultV1::default();
+        assert_eq!(
+            (
+                call_exclusive_frozen_fallback(
+                    wrong_artifact,
+                    haystack,
+                    0,
+                    haystack.len(),
+                    &mut recovered,
+                    &identity,
+                ),
+                recovered,
+            ),
+            expected_ffi
+        );
+        assert!(!exclusive_frozen_header_is_active(wrong_artifact));
+        // SAFETY: unique, live, non-overlapping handle.
+        assert_eq!(
+            unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(wrong_artifact) },
+            STATUS_SUCCESS
+        );
     }
 
     #[test]

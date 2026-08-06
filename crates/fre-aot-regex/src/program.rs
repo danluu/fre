@@ -2489,6 +2489,212 @@ pub struct FullyPrefilledFallbackReceipt {
     k0: K0FullyPrefilledResumeCacheReceipt,
 }
 
+/// Versioned, target-native header for one setup-authenticated frozen K0 root.
+///
+/// Prepared exclusive runtimes place this record at byte offset zero of their
+/// opaque allocation. The active seal is published only after the complete
+/// forward/reverse projection has been authenticated. Any legacy or fallback
+/// runtime entry clears that seal before it may mutate the workspace, and no
+/// public operation can restore it. The inline class map deliberately follows
+/// every hot authentication and row-layout field.
+#[doc(hidden)]
+#[derive(Debug, Eq, PartialEq)]
+#[repr(C)]
+pub struct FrozenPreparedHeaderV1 {
+    active_seal: u64,
+    magic: u64,
+    abi_version: u32,
+    flags: u32,
+    header_bytes: usize,
+    artifact_identity: [u8; 32],
+    forward_rows_address: usize,
+    reverse_rows_address: usize,
+    forward_live_cells: usize,
+    reverse_live_cells: usize,
+    cache_identity: u64,
+    row_stride: u32,
+    forward_initial_row: u32,
+    reverse_initial_row: u32,
+    unfilled_cell: u32,
+    accept_mask: u32,
+    next_row_token_mask: u32,
+    class_map: [u8; 256],
+}
+
+/// Stable preamble magic for [`FrozenPreparedHeaderV1`].
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V1_MAGIC: u64 = u64::from_le_bytes(*b"FREFRZ1\0");
+/// Current frozen prepared-header ABI version.
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V1_ABI_VERSION: u32 = 1;
+/// Process-private live value stored only after complete setup authentication.
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL: u64 = 0x8e89_4d42_c5a7_13bf;
+/// A reverse frozen row projection is present.
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V1_FLAG_REVERSE: u32 = 1;
+/// The initial forward frontier already carries a pending endpoint.
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V1_FLAG_INITIAL_PENDING: u32 = 1 << 1;
+/// The initial forward frontier is nullable and terminal.
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V1_FLAG_INITIAL_TERMINAL: u32 = 1 << 2;
+/// Sentinel used when no reverse root row exists.
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V1_NO_REVERSE_ROW: u32 = u32::MAX;
+
+/// Byte offset of the revocable seal in [`FrozenPreparedHeaderV1`].
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL_OFFSET: usize =
+    std::mem::offset_of!(FrozenPreparedHeaderV1, active_seal);
+/// Byte offset of the preamble magic.
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V1_MAGIC_OFFSET: usize =
+    std::mem::offset_of!(FrozenPreparedHeaderV1, magic);
+/// Byte offset of the ABI version.
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V1_ABI_VERSION_OFFSET: usize =
+    std::mem::offset_of!(FrozenPreparedHeaderV1, abi_version);
+/// Byte offset of the projection flags.
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V1_FLAGS_OFFSET: usize =
+    std::mem::offset_of!(FrozenPreparedHeaderV1, flags);
+/// Byte offset of the target-native header extent.
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V1_HEADER_BYTES_OFFSET: usize =
+    std::mem::offset_of!(FrozenPreparedHeaderV1, header_bytes);
+/// Byte offset of the exact artifact identity.
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET: usize =
+    std::mem::offset_of!(FrozenPreparedHeaderV1, artifact_identity);
+/// Byte offset of the forward row address.
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V1_FORWARD_ROWS_ADDRESS_OFFSET: usize =
+    std::mem::offset_of!(FrozenPreparedHeaderV1, forward_rows_address);
+/// Byte offset of the optional reverse row address.
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V1_REVERSE_ROWS_ADDRESS_OFFSET: usize =
+    std::mem::offset_of!(FrozenPreparedHeaderV1, reverse_rows_address);
+/// Byte offset of the forward live-cell extent.
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V1_FORWARD_LIVE_CELLS_OFFSET: usize =
+    std::mem::offset_of!(FrozenPreparedHeaderV1, forward_live_cells);
+/// Byte offset of the reverse live-cell extent.
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V1_REVERSE_LIVE_CELLS_OFFSET: usize =
+    std::mem::offset_of!(FrozenPreparedHeaderV1, reverse_live_cells);
+/// Byte offset of the exact K0 cache identity.
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V1_CACHE_IDENTITY_OFFSET: usize =
+    std::mem::offset_of!(FrozenPreparedHeaderV1, cache_identity);
+/// Byte offset of the direct row stride.
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V1_ROW_STRIDE_OFFSET: usize =
+    std::mem::offset_of!(FrozenPreparedHeaderV1, row_stride);
+/// Byte offset of the forward root row.
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V1_FORWARD_INITIAL_ROW_OFFSET: usize =
+    std::mem::offset_of!(FrozenPreparedHeaderV1, forward_initial_row);
+/// Byte offset of the optional reverse root row.
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V1_REVERSE_INITIAL_ROW_OFFSET: usize =
+    std::mem::offset_of!(FrozenPreparedHeaderV1, reverse_initial_row);
+/// Byte offset of the unpublished-cell sentinel.
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V1_UNFILLED_CELL_OFFSET: usize =
+    std::mem::offset_of!(FrozenPreparedHeaderV1, unfilled_cell);
+/// Byte offset of the accepting-cell mask.
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V1_ACCEPT_MASK_OFFSET: usize =
+    std::mem::offset_of!(FrozenPreparedHeaderV1, accept_mask);
+/// Byte offset of the encoded next-row token mask.
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V1_NEXT_ROW_TOKEN_MASK_OFFSET: usize =
+    std::mem::offset_of!(FrozenPreparedHeaderV1, next_row_token_mask);
+/// Byte offset of the inline raw-byte class map.
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V1_CLASS_MAP_OFFSET: usize =
+    std::mem::offset_of!(FrozenPreparedHeaderV1, class_map);
+/// Target-native byte extent of [`FrozenPreparedHeaderV1`].
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V1_BYTES: usize = std::mem::size_of::<FrozenPreparedHeaderV1>();
+
+const _: () = {
+    assert!(FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL_OFFSET == 0);
+    assert!(FROZEN_PREPARED_HEADER_V1_MAGIC_OFFSET == std::mem::size_of::<u64>());
+    assert!(FROZEN_PREPARED_HEADER_V1_MAGIC_OFFSET < FROZEN_PREPARED_HEADER_V1_ABI_VERSION_OFFSET);
+    assert!(
+        FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET
+            < FROZEN_PREPARED_HEADER_V1_FORWARD_ROWS_ADDRESS_OFFSET
+    );
+    assert!(
+        FROZEN_PREPARED_HEADER_V1_FORWARD_ROWS_ADDRESS_OFFSET
+            < FROZEN_PREPARED_HEADER_V1_CLASS_MAP_OFFSET
+    );
+    assert!(
+        FROZEN_PREPARED_HEADER_V1_REVERSE_ROWS_ADDRESS_OFFSET
+            < FROZEN_PREPARED_HEADER_V1_CLASS_MAP_OFFSET
+    );
+    assert!(
+        FROZEN_PREPARED_HEADER_V1_NEXT_ROW_TOKEN_MASK_OFFSET
+            < FROZEN_PREPARED_HEADER_V1_CLASS_MAP_OFFSET
+    );
+    assert!(FROZEN_PREPARED_HEADER_V1_CLASS_MAP_OFFSET + 256 <= FROZEN_PREPARED_HEADER_V1_BYTES);
+};
+
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    assert!(FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET == 32);
+    assert!(FROZEN_PREPARED_HEADER_V1_FORWARD_ROWS_ADDRESS_OFFSET == 64);
+    assert!(FROZEN_PREPARED_HEADER_V1_CLASS_MAP_OFFSET == 128);
+    assert!(FROZEN_PREPARED_HEADER_V1_BYTES == 384);
+};
+
+impl FrozenPreparedHeaderV1 {
+    const fn inactive(artifact_identity: [u8; 32]) -> Self {
+        Self {
+            active_seal: 0,
+            magic: FROZEN_PREPARED_HEADER_V1_MAGIC,
+            abi_version: FROZEN_PREPARED_HEADER_V1_ABI_VERSION,
+            flags: 0,
+            header_bytes: FROZEN_PREPARED_HEADER_V1_BYTES,
+            artifact_identity,
+            forward_rows_address: 0,
+            reverse_rows_address: 0,
+            forward_live_cells: 0,
+            reverse_live_cells: 0,
+            cache_identity: 0,
+            row_stride: 0,
+            forward_initial_row: 0,
+            reverse_initial_row: FROZEN_PREPARED_HEADER_V1_NO_REVERSE_ROW,
+            unfilled_cell: u32::MAX,
+            accept_mask: 0,
+            next_row_token_mask: 0,
+            class_map: [0; 256],
+        }
+    }
+
+    /// Return whether direct frozen-row use remains authorized.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn is_active(&self) -> bool {
+        self.active_seal == FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL
+    }
+
+    /// Return the exact semantic artifact identity authenticated at setup.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn artifact_identity(&self) -> &[u8; 32] {
+        &self.artifact_identity
+    }
+
+    /// Permanently revoke direct frozen-row use for this header instance.
+    #[doc(hidden)]
+    pub fn deactivate(&mut self) {
+        self.active_seal = 0;
+    }
+}
+
 impl ProgramWorkspace {
     pub(crate) const fn has_retained_partial_workspace(&self) -> bool {
         self.partial.is_some()
@@ -4101,6 +4307,80 @@ impl CompiledProgram {
                 program_instance: self.identity.instance,
                 k0,
             }))
+    }
+
+    /// Build the versioned frozen-root header after one complete setup proof.
+    ///
+    /// Every decline returns a well-formed inactive header that still carries
+    /// this artifact's exact identity. Successful construction authenticates
+    /// the program/workspace lineage, retained resume graph, complete K0 cache,
+    /// every encoded target, root rows, and raw-byte class map before publishing
+    /// the active seal as the final local write.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn compiler_private_frozen_prepared_header_v1(
+        &self,
+        workspace: &ProgramWorkspace,
+        receipt: Option<FullyPrefilledFallbackReceipt>,
+    ) -> FrozenPreparedHeaderV1 {
+        let mut header = FrozenPreparedHeaderV1::inactive(self.identity.artifact);
+        let Some(receipt) = receipt else {
+            return header;
+        };
+        if receipt.program_instance != self.identity.instance
+            || workspace.identity.instance != self.identity.instance
+            || self.context_dfa.is_some()
+            || !matches!(self.engine, ProgramEngine::OrderedNfa)
+            || self.partial_dfa().is_none()
+        {
+            return header;
+        }
+        let (Some(nfa), Some(resume)) = (
+            workspace.nfa.as_ref(),
+            workspace
+                .partial
+                .as_deref()
+                .and_then(|partial| partial.resume.as_ref()),
+        ) else {
+            return header;
+        };
+        let Some(projection) = nfa.compiler_private_fully_prefilled_root_projection(
+            &self.automaton,
+            resume,
+            receipt.k0,
+        ) else {
+            return header;
+        };
+
+        header.flags = if projection.reverse_rows_address().is_some() {
+            FROZEN_PREPARED_HEADER_V1_FLAG_REVERSE
+        } else {
+            0
+        };
+        if projection.initial_pending() {
+            header.flags |= FROZEN_PREPARED_HEADER_V1_FLAG_INITIAL_PENDING;
+        }
+        if projection.initial_terminal() {
+            header.flags |= FROZEN_PREPARED_HEADER_V1_FLAG_INITIAL_TERMINAL;
+        }
+        header.forward_rows_address = projection.forward_rows_address().expose_provenance();
+        header.reverse_rows_address = projection
+            .reverse_rows_address()
+            .map_or(0, <*const u32>::expose_provenance);
+        header.forward_live_cells = projection.forward_live_cells();
+        header.reverse_live_cells = projection.reverse_live_cells();
+        header.cache_identity = projection.cache_identity();
+        header.row_stride = projection.row_stride();
+        header.forward_initial_row = projection.forward_initial_row();
+        header.reverse_initial_row = projection
+            .reverse_initial_row()
+            .unwrap_or(FROZEN_PREPARED_HEADER_V1_NO_REVERSE_ROW);
+        header.unfilled_cell = projection.unfilled_cell();
+        header.accept_mask = projection.accept_mask();
+        header.next_row_token_mask = projection.next_row_token_mask();
+        header.class_map.copy_from_slice(projection.class_map());
+        header.active_seal = FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL;
+        header
     }
 
     /// Execute the separately prepared retained-row route.
@@ -14233,6 +14513,125 @@ mod tests {
                 .unwrap();
             assert_eq!(after.cache_identity(), cache_identity, "{output:?}");
             assert_eq!(after.state_count(), state_count, "{output:?}");
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one setup ledger audits all output contracts, header fields, and stale or foreign lineage declines"
+    )]
+    fn frozen_prepared_header_authenticates_layout_lineage_and_complete_rows() {
+        let pattern = r"a+Q|[b-c][a-b]{1,5}(?:x+|y+)";
+        let limits = DeterminizeLimits {
+            max_states: 8,
+            ..DeterminizeLimits::default()
+        };
+
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let compiled = program(pattern, output, CompileMode::Optimizing, limits);
+            let mut workspace = compiled.prepare_workspace().unwrap();
+            let receipt = compiled
+                .compiler_private_try_prefill_retained_fallback_with_workspace_receipt(
+                    &mut workspace,
+                )
+                .unwrap()
+                .unwrap_or_else(|| panic!("prefill declined for {output:?}"));
+            let header = compiled.compiler_private_frozen_prepared_header_v1(
+                &workspace,
+                Some(receipt),
+            );
+            assert!(header.is_active(), "{output:?}");
+            assert_eq!(header.active_seal, FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL);
+            assert_eq!(header.magic, FROZEN_PREPARED_HEADER_V1_MAGIC);
+            assert_eq!(header.abi_version, FROZEN_PREPARED_HEADER_V1_ABI_VERSION);
+            assert_eq!(header.header_bytes, FROZEN_PREPARED_HEADER_V1_BYTES);
+            assert_eq!(header.artifact_identity, compiled.identity.artifact);
+            assert_ne!(header.forward_rows_address, 0, "{output:?}");
+            assert_ne!(header.forward_live_cells, 0, "{output:?}");
+            assert_ne!(header.cache_identity, 0, "{output:?}");
+            assert_ne!(header.row_stride, 0, "{output:?}");
+            assert!(
+                usize::try_from(header.forward_initial_row).unwrap()
+                    < header.forward_live_cells,
+                "{output:?}"
+            );
+            assert_eq!(header.unfilled_cell, u32::MAX);
+            assert_ne!(header.accept_mask, 0);
+            assert_ne!(header.next_row_token_mask, 0);
+            assert!(
+                header
+                    .class_map
+                    .iter()
+                    .all(|class| u32::from(*class) < header.row_stride),
+                "{output:?}"
+            );
+            if output == OutputContract::Span {
+                assert_ne!(
+                    header.flags & FROZEN_PREPARED_HEADER_V1_FLAG_REVERSE,
+                    0
+                );
+                assert_ne!(header.reverse_rows_address, 0);
+                assert_ne!(header.reverse_live_cells, 0);
+                assert_ne!(
+                    header.reverse_initial_row,
+                    FROZEN_PREPARED_HEADER_V1_NO_REVERSE_ROW
+                );
+            } else {
+                assert_eq!(
+                    header.flags & FROZEN_PREPARED_HEADER_V1_FLAG_REVERSE,
+                    0
+                );
+                assert_eq!(header.reverse_rows_address, 0);
+                assert_eq!(header.reverse_live_cells, 0);
+                assert_eq!(
+                    header.reverse_initial_row,
+                    FROZEN_PREPARED_HEADER_V1_NO_REVERSE_ROW
+                );
+            }
+
+            let inactive =
+                compiled.compiler_private_frozen_prepared_header_v1(&workspace, None);
+            assert!(!inactive.is_active());
+            assert_eq!(inactive.artifact_identity, compiled.identity.artifact);
+            assert_eq!(inactive.magic, FROZEN_PREPARED_HEADER_V1_MAGIC);
+            assert_eq!(inactive.abi_version, FROZEN_PREPARED_HEADER_V1_ABI_VERSION);
+            assert_eq!(inactive.forward_rows_address, 0);
+
+            let mut stale_lineage = receipt;
+            stale_lineage.program_instance ^= u64::MAX;
+            assert!(
+                !compiled
+                    .compiler_private_frozen_prepared_header_v1(
+                        &workspace,
+                        Some(stale_lineage),
+                    )
+                    .is_active(),
+                "a stale program-lineage receipt must fail closed for {output:?}"
+            );
+
+            let serialized = compiled.serialize().unwrap();
+            let restored = CompiledProgram::deserialize(&serialized).unwrap();
+            let mut restored_workspace = restored.prepare_workspace().unwrap();
+            let restored_receipt = restored
+                .compiler_private_try_prefill_retained_fallback_with_workspace_receipt(
+                    &mut restored_workspace,
+                )
+                .unwrap()
+                .unwrap();
+            assert!(
+                !compiled
+                    .compiler_private_frozen_prepared_header_v1(
+                        &restored_workspace,
+                        Some(restored_receipt),
+                    )
+                    .is_active(),
+                "an equal-artifact foreign runtime lineage must fail closed for {output:?}"
+            );
         }
     }
 
