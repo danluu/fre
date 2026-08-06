@@ -30,8 +30,9 @@ use crate::{
         START_FILTER_POSITION_COUNT, START_FILTER_PROBE_SELECTION_WORK,
         START_FILTER_SCANNER_SELECTION_WORK,
     },
-    Automaton, EdgeKind, MatchSpan, OutputContract, ResourceKind, SearchAccounting, SearchError,
-    SearchLimits, SearchWindow, SetupAccounting, StateRole, UnicodeLookMatcher,
+    Automaton, EdgeKind, K0OrderedResumeCompletion, K0OrderedResumeValue, MatchSpan,
+    OutputContract, ResourceKind, SearchAccounting, SearchError, SearchLimits, SearchWindow,
+    SetupAccounting, StateRole, UnicodeLookMatcher,
 };
 
 const INVOCATION_RESET_WORK: u64 = 3;
@@ -12863,7 +12864,7 @@ fn continue_warm_ordered_resume_reverse(
     clippy::too_many_arguments,
     reason = "the value-only continuation keeps its authenticated frontier and original window explicit"
 )]
-pub(crate) fn search_prevalidated_exists_value_from_ordered_resume_with_authenticated_workspace(
+pub(crate) fn search_prevalidated_exists_value_from_ordered_resume_with_authenticated_workspace_with_completion(
     automaton: &Automaton,
     haystack: &[u8],
     window: SearchWindow,
@@ -12873,7 +12874,7 @@ pub(crate) fn search_prevalidated_exists_value_from_ordered_resume_with_authenti
     resume_position: usize,
     pending_end: Option<usize>,
     limits: SearchLimits,
-) -> Result<bool, SearchError> {
+) -> Result<K0OrderedResumeValue<bool>, SearchError> {
     validate_ordered_resume_request(
         automaton,
         haystack,
@@ -12897,7 +12898,12 @@ pub(crate) fn search_prevalidated_exists_value_from_ordered_resume_with_authenti
             pending_end,
             true,
         )? {
-            WarmResumeEndpoint::Complete(found) => return Ok(found.is_some()),
+            WarmResumeEndpoint::Complete(found) => {
+                return Ok(K0OrderedResumeValue::new(
+                    found.is_some(),
+                    K0OrderedResumeCompletion::FullyWarmRows,
+                ));
+            }
             WarmResumeEndpoint::Continue(continuation) => {
                 return continue_warm_ordered_resume_forward(
                     automaton,
@@ -12908,7 +12914,12 @@ pub(crate) fn search_prevalidated_exists_value_from_ordered_resume_with_authenti
                     continuation,
                     OutputContract::Exists,
                 )
-                .map(|found| found.is_some());
+                .map(|found| {
+                    K0OrderedResumeValue::new(
+                        found.is_some(),
+                        K0OrderedResumeCompletion::NotFullyWarm,
+                    )
+                });
             }
             WarmResumeEndpoint::Declined => {}
         }
@@ -12925,14 +12936,19 @@ pub(crate) fn search_prevalidated_exists_value_from_ordered_resume_with_authenti
         limits,
         OutputContract::Exists,
     )
-    .map(|report| report.found.is_some())
+    .map(|report| {
+        K0OrderedResumeValue::new(
+            report.found.is_some(),
+            K0OrderedResumeCompletion::NotFullyWarm,
+        )
+    })
 }
 
 #[allow(
     clippy::too_many_arguments,
     reason = "the value-only continuation keeps its authenticated frontier and original window explicit"
 )]
-pub(crate) fn search_prevalidated_selected_end_value_from_ordered_resume_with_authenticated_workspace(
+pub(crate) fn search_prevalidated_selected_end_value_from_ordered_resume_with_authenticated_workspace_with_completion(
     automaton: &Automaton,
     haystack: &[u8],
     window: SearchWindow,
@@ -12942,7 +12958,7 @@ pub(crate) fn search_prevalidated_selected_end_value_from_ordered_resume_with_au
     resume_position: usize,
     pending_end: Option<usize>,
     limits: SearchLimits,
-) -> Result<Option<usize>, SearchError> {
+) -> Result<K0OrderedResumeValue<Option<usize>>, SearchError> {
     validate_ordered_resume_request(
         automaton,
         haystack,
@@ -12966,7 +12982,12 @@ pub(crate) fn search_prevalidated_selected_end_value_from_ordered_resume_with_au
             pending_end,
             false,
         )? {
-            WarmResumeEndpoint::Complete(found) => return Ok(found),
+            WarmResumeEndpoint::Complete(found) => {
+                return Ok(K0OrderedResumeValue::new(
+                    found,
+                    K0OrderedResumeCompletion::FullyWarmRows,
+                ));
+            }
             WarmResumeEndpoint::Continue(continuation) => {
                 return continue_warm_ordered_resume_forward(
                     automaton,
@@ -12977,7 +12998,12 @@ pub(crate) fn search_prevalidated_selected_end_value_from_ordered_resume_with_au
                     continuation,
                     OutputContract::SelectedEnd,
                 )
-                .map(|found| found.map(MatchSpan::end));
+                .map(|found| {
+                    K0OrderedResumeValue::new(
+                        found.map(MatchSpan::end),
+                        K0OrderedResumeCompletion::NotFullyWarm,
+                    )
+                });
             }
             WarmResumeEndpoint::Declined => {}
         }
@@ -12994,14 +13020,20 @@ pub(crate) fn search_prevalidated_selected_end_value_from_ordered_resume_with_au
         limits,
         OutputContract::SelectedEnd,
     )
-    .map(|report| report.found.map(MatchSpan::end))
+    .map(|report| {
+        K0OrderedResumeValue::new(
+            report.found.map(MatchSpan::end),
+            K0OrderedResumeCompletion::NotFullyWarm,
+        )
+    })
 }
 
 #[allow(
     clippy::too_many_arguments,
+    clippy::too_many_lines,
     reason = "the value-only Span continuation keeps its authenticated frontier and original window explicit"
 )]
-pub(crate) fn search_prevalidated_span_value_from_ordered_resume_with_authenticated_workspace(
+pub(crate) fn search_prevalidated_span_value_from_ordered_resume_with_authenticated_workspace_with_completion(
     automaton: &Automaton,
     haystack: &[u8],
     window: SearchWindow,
@@ -13011,7 +13043,7 @@ pub(crate) fn search_prevalidated_span_value_from_ordered_resume_with_authentica
     resume_position: usize,
     pending_end: Option<usize>,
     limits: SearchLimits,
-) -> Result<Option<MatchSpan>, SearchError> {
+) -> Result<K0OrderedResumeValue<Option<MatchSpan>>, SearchError> {
     validate_ordered_resume_request(
         automaton,
         haystack,
@@ -13039,7 +13071,12 @@ pub(crate) fn search_prevalidated_span_value_from_ordered_resume_with_authentica
             resume_position,
             pending_end,
         )? {
-            WarmResumeSpan::Complete(found) => return Ok(found),
+            WarmResumeSpan::Complete(found) => {
+                return Ok(K0OrderedResumeValue::new(
+                    found,
+                    K0OrderedResumeCompletion::FullyWarmRows,
+                ));
+            }
             WarmResumeSpan::ContinueForward(continuation) => {
                 return continue_warm_ordered_resume_forward(
                     automaton,
@@ -13049,7 +13086,13 @@ pub(crate) fn search_prevalidated_span_value_from_ordered_resume_with_authentica
                     resume_set,
                     continuation,
                     OutputContract::Span,
-                );
+                )
+                .map(|found| {
+                    K0OrderedResumeValue::new(
+                        found,
+                        K0OrderedResumeCompletion::NotFullyWarm,
+                    )
+                });
             }
             WarmResumeSpan::RecoverReverse { selected_end, work } => {
                 return continue_warm_ordered_resume_reverse(
@@ -13061,7 +13104,13 @@ pub(crate) fn search_prevalidated_span_value_from_ordered_resume_with_authentica
                     selected_end,
                     work,
                     None,
-                );
+                )
+                .map(|found| {
+                    K0OrderedResumeValue::new(
+                        found,
+                        K0OrderedResumeCompletion::NotFullyWarm,
+                    )
+                });
             }
             WarmResumeSpan::ContinueReverse(continuation) => {
                 return continue_warm_ordered_resume_reverse(
@@ -13073,7 +13122,13 @@ pub(crate) fn search_prevalidated_span_value_from_ordered_resume_with_authentica
                     continuation.selected_end,
                     continuation.work,
                     Some(continuation),
-                );
+                )
+                .map(|found| {
+                    K0OrderedResumeValue::new(
+                        found,
+                        K0OrderedResumeCompletion::NotFullyWarm,
+                    )
+                });
             }
             WarmResumeSpan::Declined => {}
         }
@@ -13090,7 +13145,9 @@ pub(crate) fn search_prevalidated_span_value_from_ordered_resume_with_authentica
         limits,
         OutputContract::Span,
     )
-    .map(|report| report.found)
+    .map(|report| {
+        K0OrderedResumeValue::new(report.found, K0OrderedResumeCompletion::NotFullyWarm)
+    })
 }
 
 #[allow(
@@ -25627,10 +25684,11 @@ mod tests {
             START_FILTER_MAX_SELECTION_WORK, START_FILTER_POSITION_COUNT,
             START_FILTER_PROBE_SELECTION_WORK, START_FILTER_SCANNER_SELECTION_WORK,
         },
-        Automaton, CompileLimits, EarliestEnd, EdgeKind, Exists, K0PositiveEndLimits,
-        K0PositiveEndOutcome, K0PositiveEndStartOutcome, K0ResumeSet, K0SearchSession,
-        K0SpanSourceCursor, K0Workspace, MatchSpan, OutputContract, RawPlan, ResourceKind,
-        SearchError, SearchLimits, SearchWindow, SelectedEnd, Span, StateRole, WorkspaceLimits,
+        Automaton, CompileLimits, EarliestEnd, EdgeKind, Exists, K0OrderedResumeCompletion,
+        K0PositiveEndLimits, K0PositiveEndOutcome, K0PositiveEndStartOutcome, K0ResumeSet,
+        K0SearchSession, K0SpanSourceCursor, K0Workspace, MatchSpan, OutputContract, RawPlan,
+        ResourceKind, SearchError, SearchLimits, SearchWindow, SelectedEnd, Span, StateRole,
+        WorkspaceLimits,
     };
 
     fn ascii_literal(byte: u8) -> Automaton {
@@ -55714,6 +55772,194 @@ mod tests {
             }
             assert_resume_cache_equivalent(&batched_workspace, &scalar_workspace);
         }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the receipt test covers endpoint, finite, existence, and reverse completion modes"
+    )]
+    fn ordered_resume_completion_requires_fully_immutable_warm_rows() {
+        let plan = greedy_a_star_b();
+        let frontier = [1_u32, 2_u32];
+        let warmed = b"aaaaaa";
+        let novel = b"aaaaaax";
+        let novel_window = SearchWindow::full(novel);
+        let (mut workspace, mut resume) = warm_resume_batch_fixture(
+            &plan,
+            &frontier,
+            warmed,
+            SearchWindow::full(warmed),
+            None,
+            OutputContract::SelectedEnd,
+        );
+        let first = plan
+            .prepare::<SelectedEnd>()
+            .search_prevalidated_selected_end_value_from_ordered_resume_with_authenticated_workspace_with_completion(
+                novel,
+                novel_window,
+                &mut workspace,
+                &mut resume,
+                0,
+                0,
+                None,
+                SearchLimits::unlimited(),
+            )
+            .unwrap();
+        assert_eq!(
+            first.into_parts(),
+            (None, K0OrderedResumeCompletion::NotFullyWarm)
+        );
+        let second = plan
+            .prepare::<SelectedEnd>()
+            .search_prevalidated_selected_end_value_from_ordered_resume_with_authenticated_workspace_with_completion(
+                novel,
+                novel_window,
+                &mut workspace,
+                &mut resume,
+                0,
+                0,
+                None,
+                SearchLimits::unlimited(),
+            )
+            .unwrap();
+        assert_eq!(
+            second.into_parts(),
+            (None, K0OrderedResumeCompletion::FullyWarmRows)
+        );
+        let finite = plan
+            .prepare::<SelectedEnd>()
+            .search_prevalidated_selected_end_value_from_ordered_resume_with_authenticated_workspace_with_completion(
+                novel,
+                novel_window,
+                &mut workspace,
+                &mut resume,
+                0,
+                0,
+                None,
+                SearchLimits {
+                    max_work: u64::MAX - 1,
+                    max_scratch_bytes: usize::MAX,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            finite.into_parts(),
+            (None, K0OrderedResumeCompletion::NotFullyWarm)
+        );
+
+        let accepted = b"aaaaaab";
+        let accepted_window = SearchWindow::full(accepted);
+        let (mut workspace, mut resume) = warm_resume_batch_fixture(
+            &plan,
+            &frontier,
+            accepted,
+            accepted_window,
+            None,
+            OutputContract::Exists,
+        );
+        let exists = plan
+            .prepare::<Exists>()
+            .search_prevalidated_exists_value_from_ordered_resume_with_authenticated_workspace_with_completion(
+                accepted,
+                accepted_window,
+                &mut workspace,
+                &mut resume,
+                0,
+                0,
+                None,
+                SearchLimits::unlimited(),
+            )
+            .unwrap();
+        assert_eq!(
+            exists.into_parts(),
+            (true, K0OrderedResumeCompletion::FullyWarmRows)
+        );
+
+        let span_plan = byte_class_then_range(b"ab", (b'c', b'c'), None);
+        let span_warmed = b"ac";
+        let span_window = SearchWindow::full(span_warmed);
+        let (mut cold_reverse_workspace, mut cold_reverse_resume) = warm_resume_at_fixture(
+            &span_plan,
+            &[1_u32],
+            span_warmed,
+            span_window,
+            1,
+            None,
+            OutputContract::SelectedEnd,
+        );
+        let recovered = span_plan
+            .prepare::<Span>()
+            .search_prevalidated_span_value_from_ordered_resume_with_authenticated_workspace_with_completion(
+                span_warmed,
+                span_window,
+                &mut cold_reverse_workspace,
+                &mut cold_reverse_resume,
+                0,
+                1,
+                None,
+                SearchLimits::unlimited(),
+            )
+            .unwrap();
+        assert_eq!(
+            recovered.into_parts(),
+            (
+                Some(MatchSpan::new(0, span_warmed.len())),
+                K0OrderedResumeCompletion::NotFullyWarm,
+            ),
+            "cold reverse recovery must not claim an immutable completion"
+        );
+
+        let span_novel = b"bc";
+        let (mut workspace, mut resume) = warm_resume_at_fixture(
+            &span_plan,
+            &[1_u32],
+            span_warmed,
+            span_window,
+            1,
+            None,
+            OutputContract::Span,
+        );
+        let first = span_plan
+            .prepare::<Span>()
+            .search_prevalidated_span_value_from_ordered_resume_with_authenticated_workspace_with_completion(
+                span_novel,
+                span_window,
+                &mut workspace,
+                &mut resume,
+                0,
+                1,
+                None,
+                SearchLimits::unlimited(),
+            )
+            .unwrap();
+        assert_eq!(
+            first.into_parts(),
+            (
+                Some(MatchSpan::new(0, span_novel.len())),
+                K0OrderedResumeCompletion::NotFullyWarm,
+            )
+        );
+        let second = span_plan
+            .prepare::<Span>()
+            .search_prevalidated_span_value_from_ordered_resume_with_authenticated_workspace_with_completion(
+                span_novel,
+                span_window,
+                &mut workspace,
+                &mut resume,
+                0,
+                1,
+                None,
+                SearchLimits::unlimited(),
+            )
+            .unwrap();
+        assert_eq!(
+            second.into_parts(),
+            (
+                Some(MatchSpan::new(0, span_novel.len())),
+                K0OrderedResumeCompletion::FullyWarmRows,
+            )
+        );
     }
 
     #[test]

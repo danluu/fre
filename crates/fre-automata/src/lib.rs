@@ -31,8 +31,8 @@ mod tagged_many;
 mod unicode_look;
 
 pub use contract::{
-    EarliestEnd, Exists, MatchSpan, Operation, OutputContract, SearchAccounting, SearchReport,
-    SelectedEnd, SetupAccounting, Span, TypedPlan,
+    EarliestEnd, Exists, K0OrderedResumeCompletion, K0OrderedResumeValue, MatchSpan, Operation,
+    OutputContract, SearchAccounting, SearchReport, SelectedEnd, SetupAccounting, Span, TypedPlan,
 };
 pub use epsilon_closure_dispatch::EpsilonClosureDispatchAllocationError;
 pub use error::{CompileError, MalformedPlan, ResourceKind, SearchError};

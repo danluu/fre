@@ -1,7 +1,7 @@
 use fre_automata::{
-    Automaton, CompileLimits as AutomatonCompileLimits, EdgeKind, Exists, K0ResumeSet, K0Workspace,
-    RawPlan, SearchLimits, SearchWindow as K0SearchWindow, SelectedEnd, Span, StateRole,
-    WorkspaceLimits,
+    Automaton, CompileLimits as AutomatonCompileLimits, EdgeKind, Exists,
+    K0OrderedResumeCompletion, K0ResumeSet, K0Workspace, RawPlan, SearchLimits,
+    SearchWindow as K0SearchWindow, SelectedEnd, Span, StateRole, WorkspaceLimits,
 };
 use fre_simd_kernels::{
     ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, AsciiByteSet, AsciiByteSetClassifier,
@@ -2499,6 +2499,12 @@ struct PartialDfaWorkspace {
     state: PartialDfaRuntimeState,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PartialDfaResumeResult {
+    found: MatchResult,
+    completion: K0OrderedResumeCompletion,
+}
+
 /// Pointer-stable prepared projection and adaptive state for an ordinary K0
 /// artifact whose emitted module owns a warmed-row root entry. The box is
 /// allocated once by workspace preparation; no search allocates or moves it.
@@ -2806,6 +2812,20 @@ impl PartialDfaRuntimeState {
             self.observe_fallback(consumed, input_bytes);
         } else {
             self.observe_complete();
+        }
+    }
+
+    fn observe_resume_completion(
+        &mut self,
+        consumed: usize,
+        input_bytes: usize,
+        completion: K0OrderedResumeCompletion,
+    ) {
+        match completion {
+            K0OrderedResumeCompletion::FullyWarmRows => self.observe_complete(),
+            K0OrderedResumeCompletion::NotFullyWarm => {
+                self.observe_resume(consumed, input_bytes);
+            }
         }
     }
 
@@ -4109,7 +4129,7 @@ impl CompiledProgram {
                 "retained partial resume has no authenticated K0 resume set",
             ));
         }
-        let found = self.search_nfa_from_partial_resume(
+        let resumed = self.search_nfa_from_partial_resume(
             haystack,
             window,
             workspace.nfa.as_mut().ok_or(CompileError::InternalInvariant(
@@ -4122,11 +4142,12 @@ impl CompiledProgram {
                 pending_end,
             },
         )?;
-        partial_workspace.state.observe_resume(
+        partial_workspace.state.observe_resume_completion(
             resume_position.saturating_sub(window.start),
             window.end.saturating_sub(window.start),
+            resumed.completion,
         );
-        Ok(found)
+        Ok(resumed.found)
     }
 
     /// Continue from a retained-row hole admitted by the immediately
@@ -4334,7 +4355,7 @@ impl CompiledProgram {
                 "preflight-authenticated partial resume has no K0 resume set",
             ));
         }
-        let found = self.search_nfa_from_partial_resume(
+        let resumed = self.search_nfa_from_partial_resume(
             haystack,
             window,
             nfa.as_mut().ok_or(CompileError::InternalInvariant(
@@ -4347,11 +4368,12 @@ impl CompiledProgram {
                 pending_end,
             },
         )?;
-        partial_workspace.state.observe_resume(
+        partial_workspace.state.observe_resume_completion(
             resume_position.saturating_sub(window.start),
             window.end.saturating_sub(window.start),
+            resumed.completion,
         );
-        Ok(found)
+        Ok(resumed.found)
     }
 
     /// Recover the selected start after an authenticated native retained-row
@@ -5250,10 +5272,10 @@ impl CompiledProgram {
             state.observe_fallback(consumed, input_bytes);
             return Ok(None);
         }
-        let found =
+        let resumed =
             self.search_nfa_from_partial_resume(haystack, window, workspace, resume_set, resume)?;
-        state.observe_resume(consumed, input_bytes);
-        Ok(Some(found))
+        state.observe_resume_completion(consumed, input_bytes, resumed.completion);
+        Ok(Some(resumed.found))
     }
 
     fn search_nfa_from_partial_resume(
@@ -5263,7 +5285,7 @@ impl CompiledProgram {
         workspace: &mut K0Workspace,
         resume_set: &mut Option<K0ResumeSet>,
         resume: PartialDfaResume,
-    ) -> Result<MatchResult, CompileError> {
+    ) -> Result<PartialDfaResumeResult, CompileError> {
         let resume_set = resume_set.as_mut().ok_or(CompileError::InternalInvariant(
             "partial DFA hole has no authenticated K0 resume set",
         ))?;
@@ -5271,10 +5293,10 @@ impl CompiledProgram {
         let limits = SearchLimits::unlimited();
         match self.output {
             OutputContract::Exists => {
-                let found = self
+                let (found, completion) = self
                     .automaton
                     .prepare::<Exists>()
-                    .search_prevalidated_exists_value_from_ordered_resume_with_authenticated_workspace(
+                    .search_prevalidated_exists_value_from_ordered_resume_with_authenticated_workspace_with_completion(
                         haystack,
                         k0_window,
                         workspace,
@@ -5283,14 +5305,18 @@ impl CompiledProgram {
                         resume.position,
                         resume.pending_end,
                         limits,
-                    )?;
-                Ok(MatchResult::Exists(found))
+                    )?
+                    .into_parts();
+                Ok(PartialDfaResumeResult {
+                    found: MatchResult::Exists(found),
+                    completion,
+                })
             }
             OutputContract::SelectedEnd => {
-                let found = self
+                let (found, completion) = self
                     .automaton
                     .prepare::<SelectedEnd>()
-                    .search_prevalidated_selected_end_value_from_ordered_resume_with_authenticated_workspace(
+                    .search_prevalidated_selected_end_value_from_ordered_resume_with_authenticated_workspace_with_completion(
                         haystack,
                         k0_window,
                         workspace,
@@ -5299,17 +5325,22 @@ impl CompiledProgram {
                         resume.position,
                         resume.pending_end,
                         limits,
-                    )?;
-                Ok(MatchResult::SelectedEnd(found))
+                    )?
+                    .into_parts();
+                Ok(PartialDfaResumeResult {
+                    found: MatchResult::SelectedEnd(found),
+                    completion,
+                })
             }
             OutputContract::Span => {
-                let found = if self
+                let (found, completion) = if self
                     .partial_dfa()
                     .is_some_and(PartialDfa::initial_pending)
                 {
-                    self.automaton
+                    let (found, completion) = self
+                        .automaton
                         .prepare::<SelectedEnd>()
-                        .search_prevalidated_selected_end_value_from_ordered_resume_with_authenticated_workspace(
+                        .search_prevalidated_selected_end_value_from_ordered_resume_with_authenticated_workspace_with_completion(
                             haystack,
                             k0_window,
                             workspace,
@@ -5319,11 +5350,13 @@ impl CompiledProgram {
                             resume.pending_end,
                             limits,
                         )?
-                        .map(|end| (window.start, end))
+                        .into_parts();
+                    (found.map(|end| (window.start, end)), completion)
                 } else if let Some(width) = self.exact_match_width {
-                    self.automaton
+                    let (found, completion) = self
+                        .automaton
                         .prepare::<SelectedEnd>()
-                        .search_prevalidated_selected_end_value_from_ordered_resume_with_authenticated_workspace(
+                        .search_prevalidated_selected_end_value_from_ordered_resume_with_authenticated_workspace_with_completion(
                             haystack,
                             k0_window,
                             workspace,
@@ -5333,6 +5366,8 @@ impl CompiledProgram {
                             resume.pending_end,
                             limits,
                         )?
+                        .into_parts();
+                    let found = found
                         .map(|end| {
                             end.checked_sub(width).map(|start| (start, end)).ok_or(
                                 CompileError::InternalInvariant(
@@ -5340,11 +5375,13 @@ impl CompiledProgram {
                                 ),
                             )
                         })
-                        .transpose()?
+                        .transpose()?;
+                    (found, completion)
                 } else {
-                    self.automaton
+                    let (found, completion) = self
+                        .automaton
                         .prepare::<Span>()
-                        .search_prevalidated_span_value_from_ordered_resume_with_authenticated_workspace(
+                        .search_prevalidated_span_value_from_ordered_resume_with_authenticated_workspace_with_completion(
                             haystack,
                             k0_window,
                             workspace,
@@ -5354,9 +5391,13 @@ impl CompiledProgram {
                             resume.pending_end,
                             limits,
                         )?
-                        .map(|span| (span.start(), span.end()))
+                        .into_parts();
+                    (found.map(|span| (span.start(), span.end())), completion)
                 };
-                Ok(MatchResult::Span(found))
+                Ok(PartialDfaResumeResult {
+                    found: MatchResult::Span(found),
+                    completion,
+                })
             }
         }
     }
@@ -12409,10 +12450,13 @@ mod tests {
                     expected,
                     "warm retained {output:?}"
                 );
-                assert!(
-                    workspace.partial.as_deref().unwrap().state.resumed > resumed,
-                    "the repeated {output:?} witness did not revisit its retained hole"
+                let state = &workspace.partial.as_deref().unwrap().state;
+                assert_eq!(
+                    state.resumed, resumed,
+                    "the repeated {output:?} witness was not completed by warm rows"
                 );
+                assert_eq!(state.consecutive_fallbacks, 0);
+                assert_eq!(state.bypass_remaining, 0);
                 found_witness = true;
                 repeated = repeated.checked_add(1).unwrap();
                 break;
@@ -12516,7 +12560,12 @@ mod tests {
                 expected
             );
             let state = &workspace.partial.as_deref().unwrap().state;
-            assert!(state.resumed > resumed);
+            assert_eq!(
+                state.resumed, resumed,
+                "the repeated initial-pending Span did not complete through warm rows"
+            );
+            assert_eq!(state.consecutive_fallbacks, 0);
+            assert_eq!(state.bypass_remaining, 0);
             assert_eq!(
                 state.reverse_recovered, 0,
                 "initial-pending Span must retain the authoritative window start"
@@ -14769,9 +14818,11 @@ mod tests {
             "an invalid compact haystack left its ticket reusable"
         );
 
-        // Two authenticated shallow holes are measured from the returned cut
-        // window, not from the much earlier public window. That must engage
-        // the shallow-exit backoff.
+        // The first authenticated shallow hole is measured from the returned
+        // cut window, not from the much earlier public window. Its exact K0
+        // continuation fills the missing rows; the second call then completes
+        // immutably through those rows and resets admission instead of
+        // misclassifying the warm result as another fallback.
         let mut resumed = limited.prepare_workspace().unwrap();
         for attempt in 0..2 {
             assert_eq!(
@@ -14824,8 +14875,9 @@ mod tests {
             "the single-use preflight ticket was reused"
         );
         let state = &resumed.partial.as_deref().unwrap().state;
-        assert_eq!(state.consecutive_fallbacks, 2);
-        assert_eq!(state.bypass_remaining, 16);
+        assert_eq!(state.resumed, 1);
+        assert_eq!(state.consecutive_fallbacks, 0);
+        assert_eq!(state.bypass_remaining, 0);
         assert!(!state.native_entry_in_flight);
     }
 
@@ -14864,6 +14916,34 @@ mod tests {
     }
 
     #[test]
+    fn fully_warm_resume_completion_clears_partial_admission_backoff() {
+        let mut state = PartialDfaRuntimeState {
+            prefix_supported: true,
+            ..PartialDfaRuntimeState::default()
+        };
+        for _ in 0..2 {
+            state.observe_resume_completion(
+                1,
+                1_024,
+                K0OrderedResumeCompletion::NotFullyWarm,
+            );
+        }
+        assert_eq!(state.consecutive_fallbacks, 2);
+        assert_eq!(state.bypass_remaining, 16);
+        assert_eq!(state.resumed, 2);
+
+        state.observe_resume_completion(
+            1,
+            1_024,
+            K0OrderedResumeCompletion::FullyWarmRows,
+        );
+        assert_eq!(state.consecutive_fallbacks, 0);
+        assert_eq!(state.bypass_remaining, 0);
+        assert_eq!(state.resumed, 2);
+        assert!(state.admit());
+    }
+
+    #[test]
     fn native_partial_admission_peeks_at_bypass_and_lazily_observes_completion() {
         let mut state = PartialDfaRuntimeState {
             prefix_supported: true,
@@ -14893,7 +14973,7 @@ mod tests {
     }
 
     #[test]
-    fn optimized_authenticated_shallow_holes_back_off_end_to_end() {
+    fn optimized_authenticated_warm_hole_completion_resets_end_to_end() {
         let pattern = r"[b-c][a-b]{1,10}z";
         let mut limited = program(
             pattern,
@@ -14948,47 +15028,19 @@ mod tests {
                 .and_then(|partial| partial.resume.as_ref())
                 .is_some_and(|resume| resume.is_bound_to(&limited.automaton))
         );
-        for attempt in 0..2 {
+        for attempt in 0..3 {
             assert_eq!(
                 limited
                     .search_optimized_with_workspace(&haystack, window, &mut workspace)
                     .expect("authenticated resumed search"),
                 expected,
-                "initial resume {attempt}"
+                "warm resume {attempt}"
             );
         }
-        {
-            let state = &workspace.partial.as_deref().unwrap().state;
-            assert_eq!(state.resumed, 2);
-            assert_eq!(state.consecutive_fallbacks, 2);
-            assert_eq!(state.bypass_remaining, 16);
-        }
-
-        for attempt in 0..16 {
-            assert_eq!(
-                limited
-                    .search_optimized_with_workspace(&haystack, window, &mut workspace)
-                    .expect("backed-off ordinary search"),
-                expected,
-                "bypass {attempt}"
-            );
-        }
-        {
-            let state = &workspace.partial.as_deref().unwrap().state;
-            assert_eq!(state.resumed, 2, "bypasses must not enter K0 resume");
-            assert_eq!(state.bypass_remaining, 0);
-        }
-
-        assert_eq!(
-            limited
-                .search_optimized_with_workspace(&haystack, window, &mut workspace)
-                .expect("periodic authenticated re-probe"),
-            expected
-        );
         let state = &workspace.partial.as_deref().unwrap().state;
-        assert_eq!(state.resumed, 3);
-        assert_eq!(state.consecutive_fallbacks, 3);
-        assert_eq!(state.bypass_remaining, 32);
+        assert_eq!(state.resumed, 1, "only the first call mutably resumes K0");
+        assert_eq!(state.consecutive_fallbacks, 0);
+        assert_eq!(state.bypass_remaining, 0);
     }
 
     #[test]

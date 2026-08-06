@@ -4054,9 +4054,9 @@ mod tests {
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "the end-to-end adaptive protocol keeps admission, continuation, bypass, and lazy completion in one exclusive handle lifecycle"
+        reason = "the end-to-end adaptive protocol keeps admission, continuation, warm completion, and lazy native completion in one exclusive handle lifecycle"
     )]
-    fn exclusive_native_partial_admission_backs_off_and_reprobes() {
+    fn exclusive_native_partial_warm_resume_resets_admission() {
         let pattern = r"a+Q|[b-c][a-b]{1,5}(?:x+|y+)";
         let mut limits = CompileLimitsV1::default();
         limits.determinize.max_states = 8;
@@ -4079,7 +4079,11 @@ mod tests {
                 .expect("portable adaptive result"),
         );
 
-        for _ in 0..2 {
+        // The first shallow continuation publishes its missing K0 rows. The
+        // second and third continuations complete entirely through immutable
+        // warmed rows, so each one resets admission instead of creating a
+        // bypass interval.
+        for _ in 0..3 {
             assert_eq!(
                 call_partial_should_enter(handle, haystack.len()),
                 PARTIAL_ENTRY_ENTER
@@ -4102,23 +4106,10 @@ mod tests {
             assert_eq!(result, expected.1);
         }
 
-        for _ in 0..16 {
-            assert_eq!(
-                call_partial_should_enter(handle, haystack.len()),
-                PARTIAL_ENTRY_BYPASS
-            );
-            let mut result = FreAotRegexResultV1::default();
-            assert_eq!(
-                call_exclusive(handle, &haystack, 0, haystack.len(), &mut result),
-                expected.0
-            );
-            assert_eq!(result, expected.1);
-        }
-
         assert_eq!(
             call_partial_should_enter(handle, haystack.len()),
             PARTIAL_ENTRY_ENTER,
-            "periodic native re-probe"
+            "warm K0 completion resets adaptive admission"
         );
         // Model a native scan that returned locally: no continuation call is
         // made, so the next admission must settle it as a completion.

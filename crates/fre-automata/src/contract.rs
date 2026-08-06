@@ -48,6 +48,53 @@ impl MatchSpan {
     }
 }
 
+/// Whether an ordered-resume value was decided entirely by immutable warm
+/// rows already retained in the authenticated workspace.
+///
+/// This compiler-private receipt lets an adaptive caller distinguish a true
+/// warm completion from a call that had to publish or recover any row. It is
+/// deliberately independent of the selected output value: a warm no-match is
+/// still a complete warm execution.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum K0OrderedResumeCompletion {
+    FullyWarmRows,
+    NotFullyWarm,
+}
+
+/// A value-only ordered-resume result paired with its warm-row completion
+/// status.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct K0OrderedResumeValue<T> {
+    output: T,
+    completion: K0OrderedResumeCompletion,
+}
+
+impl<T> K0OrderedResumeValue<T> {
+    pub(crate) const fn new(output: T, completion: K0OrderedResumeCompletion) -> Self {
+        Self { output, completion }
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn completion(&self) -> K0OrderedResumeCompletion {
+        self.completion
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn into_output(self) -> T {
+        self.output
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn into_parts(self) -> (T, K0OrderedResumeCompletion) {
+        (self.output, self.completion)
+    }
+}
+
 /// Exact counters returned with every successful search invocation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SearchAccounting {
@@ -677,7 +724,38 @@ impl TypedPlan<'_, Exists> {
         pending_end: Option<usize>,
         limits: SearchLimits,
     ) -> Result<bool, SearchError> {
-        crate::k0::search_prevalidated_exists_value_from_ordered_resume_with_authenticated_workspace(
+        self.search_prevalidated_exists_value_from_ordered_resume_with_authenticated_workspace_with_completion(
+            haystack,
+            window,
+            workspace,
+            resume_set,
+            resume_state,
+            resume_position,
+            pending_end,
+            limits,
+        )
+        .map(K0OrderedResumeValue::into_output)
+    }
+
+    /// Return existence together with whether immutable warm rows alone
+    /// decided the ordered-resume result.
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the value-only resume boundary keeps its committed prefix explicit"
+    )]
+    pub fn search_prevalidated_exists_value_from_ordered_resume_with_authenticated_workspace_with_completion(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut K0Workspace,
+        resume_set: &mut K0ResumeSet,
+        resume_state: usize,
+        resume_position: usize,
+        pending_end: Option<usize>,
+        limits: SearchLimits,
+    ) -> Result<K0OrderedResumeValue<bool>, SearchError> {
+        crate::k0::search_prevalidated_exists_value_from_ordered_resume_with_authenticated_workspace_with_completion(
             self.automaton,
             haystack,
             window,
@@ -783,7 +861,38 @@ impl TypedPlan<'_, SelectedEnd> {
         pending_end: Option<usize>,
         limits: SearchLimits,
     ) -> Result<Option<usize>, SearchError> {
-        crate::k0::search_prevalidated_selected_end_value_from_ordered_resume_with_authenticated_workspace(
+        self.search_prevalidated_selected_end_value_from_ordered_resume_with_authenticated_workspace_with_completion(
+            haystack,
+            window,
+            workspace,
+            resume_set,
+            resume_state,
+            resume_position,
+            pending_end,
+            limits,
+        )
+        .map(K0OrderedResumeValue::into_output)
+    }
+
+    /// Return the selected endpoint together with whether immutable warm rows
+    /// alone decided the ordered-resume result.
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the value-only resume boundary keeps its committed prefix explicit"
+    )]
+    pub fn search_prevalidated_selected_end_value_from_ordered_resume_with_authenticated_workspace_with_completion(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut K0Workspace,
+        resume_set: &mut K0ResumeSet,
+        resume_state: usize,
+        resume_position: usize,
+        pending_end: Option<usize>,
+        limits: SearchLimits,
+    ) -> Result<K0OrderedResumeValue<Option<usize>>, SearchError> {
+        crate::k0::search_prevalidated_selected_end_value_from_ordered_resume_with_authenticated_workspace_with_completion(
             self.automaton,
             haystack,
             window,
@@ -890,7 +999,38 @@ impl TypedPlan<'_, Span> {
         pending_end: Option<usize>,
         limits: SearchLimits,
     ) -> Result<Option<MatchSpan>, SearchError> {
-        crate::k0::search_prevalidated_span_value_from_ordered_resume_with_authenticated_workspace(
+        self.search_prevalidated_span_value_from_ordered_resume_with_authenticated_workspace_with_completion(
+            haystack,
+            window,
+            workspace,
+            resume_set,
+            resume_state,
+            resume_position,
+            pending_end,
+            limits,
+        )
+        .map(K0OrderedResumeValue::into_output)
+    }
+
+    /// Return the selected span together with whether immutable warm forward
+    /// and, when required, reverse rows alone decided the result.
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the value-only Span resume boundary keeps its committed prefix explicit"
+    )]
+    pub fn search_prevalidated_span_value_from_ordered_resume_with_authenticated_workspace_with_completion(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut K0Workspace,
+        resume_set: &mut K0ResumeSet,
+        resume_state: usize,
+        resume_position: usize,
+        pending_end: Option<usize>,
+        limits: SearchLimits,
+    ) -> Result<K0OrderedResumeValue<Option<MatchSpan>>, SearchError> {
+        crate::k0::search_prevalidated_span_value_from_ordered_resume_with_authenticated_workspace_with_completion(
             self.automaton,
             haystack,
             window,
