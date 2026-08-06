@@ -7100,18 +7100,17 @@ pub(crate) fn search_prevalidated_proved_exact_start_selected_end_value_with_aut
     clippy::too_many_arguments,
     reason = "the continuation entry keeps its authenticated frontier and original window explicit"
 )]
-pub(crate) fn search_from_resume_with_workspace(
+fn validate_ordered_resume_request(
     automaton: &Automaton,
     haystack: &[u8],
     window: SearchWindow,
-    workspace: &mut K0Workspace,
-    resume_set: &mut K0ResumeSet,
+    workspace: &K0Workspace,
+    resume_set: &K0ResumeSet,
     resume_state: usize,
     resume_position: usize,
     pending_end: Option<usize>,
-    limits: SearchLimits,
     contract: OutputContract,
-) -> Result<UntypedReport, SearchError> {
+) -> Result<(), SearchError> {
     validate_window(haystack, window)?;
     if resume_position < window.start() || resume_position > window.end() {
         return Err(SearchError::InvalidResumeState {
@@ -7150,6 +7149,881 @@ pub(crate) fn search_from_resume_with_workspace(
             detail: "resume output contract is unsupported",
         });
     }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WarmResumeEndpoint {
+    Declined,
+    Continue(WarmResumeForwardContinuation),
+    Complete(Option<usize>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AccountedWarmResumeEndpoint {
+    Declined,
+    Continue(WarmResumeForwardContinuation),
+    Complete { found: Option<usize>, work: u64 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WarmResumeSpan {
+    Declined,
+    ContinueForward(WarmResumeForwardContinuation),
+    RecoverReverse { selected_end: usize, work: u64 },
+    ContinueReverse(WarmResumeReverseContinuation),
+    Complete(Option<MatchSpan>),
+}
+
+/// Exact immutable forward position reached before the first unpublished
+/// lazy cell. `work` includes the ordinary invocation reset, authenticated
+/// cached-frontier comparison, and every already-consumed direct byte, but
+/// excludes the still-unconsumed cell that caused the handoff.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WarmResumeForwardContinuation {
+    row: u32,
+    position: usize,
+    pending_end: Option<usize>,
+    work: u64,
+}
+
+/// Exact immutable reverse position reached before the first unpublished
+/// reverse cell. The selected endpoint and any earlier accepting start remain
+/// committed, so the mutable reverse builder can continue without replaying
+/// either the completed forward suffix or the filled reverse prefix.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WarmResumeReverseContinuation {
+    selected_end: usize,
+    row: u32,
+    cursor: usize,
+    candidate: Option<usize>,
+    work: u64,
+}
+
+fn initial_accounted_warm_resume_work(seed_items: usize) -> Result<u64, SearchError> {
+    let seed_items = u64::try_from(seed_items)
+        .map_err(|_| SearchError::ArithmeticOverflow {
+            computation: "warm resume seed-item conversion",
+        })?
+        .checked_add(1)
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "warm resume cached-state comparison work",
+        })?;
+    INVOCATION_RESET_WORK
+        .checked_add(seed_items)
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "search work counter",
+        })
+}
+
+const fn complete_warm_resume_endpoint(
+    pending_end: Option<usize>,
+    work: u64,
+) -> AccountedWarmResumeEndpoint {
+    AccountedWarmResumeEndpoint::Complete {
+        found: pending_end,
+        work,
+    }
+}
+
+fn charge_accounted_warm_resume_step(work: &mut u64) -> Result<(), SearchError> {
+    *work = work
+        .checked_add(1)
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "search work counter",
+        })?;
+    Ok(())
+}
+
+/// Read a fully warmed continuation without rebuilding accounting or mutating
+/// the lazy cache. The cached hint remains only a hint: its exact pending bit
+/// and ordered frontier are content-checked before any input is consumed.
+/// Encountering an unfilled cell returns the exact cached row, byte position,
+/// pending endpoint, and already-accounted work. The value-only entry can then
+/// initialize mutable invocation scratch and continue at that cell without
+/// replaying the immutable warm prefix.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the warmed continuation keeps its authenticated frontier and committed prefix explicit"
+)]
+fn try_accounted_warm_ordered_resume_endpoint(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &K0Workspace,
+    resume_set: &K0ResumeSet,
+    resume_state: usize,
+    resume_position: usize,
+    pending_end: Option<usize>,
+    earliest: bool,
+) -> Result<AccountedWarmResumeEndpoint, SearchError> {
+    let (seed, seed_pending) = resume_set.frontier(resume_state)?;
+    let cached_hint = *resume_set.cached_states.get(resume_state).ok_or(
+        SearchError::InvalidResumeState {
+            detail: "resume cached-state hint is outside its metadata",
+        },
+    )?;
+    if cached_hint == LAZY_NO_STATE {
+        return Ok(AccountedWarmResumeEndpoint::Declined);
+    }
+    let cached_hint_in_bounds = match usize::try_from(cached_hint) {
+        Ok(state) => state < workspace.lazy.state_len,
+        Err(_) => false,
+    };
+    if !cached_hint_in_bounds {
+        return Ok(AccountedWarmResumeEndpoint::Declined);
+    }
+    // The ordinary valid-hint path charges the pending-mode comparison plus
+    // every frontier item after its fixed invocation reset. Establish that
+    // exact total before reading the retained state contents.
+    let mut work = initial_accounted_warm_resume_work(seed.len())?;
+    let (cached_offset, cached_length, cached_pending) =
+        resume_lazy_state_bounds(&workspace.lazy, cached_hint)?;
+    let cached_end = cached_offset.checked_add(cached_length).ok_or(
+        SearchError::ArithmeticOverflow {
+            computation: "warm resume cached-state item end",
+        },
+    )?;
+    if cached_pending != seed_pending
+        || workspace.lazy.items.get(cached_offset..cached_end) != Some(seed)
+    {
+        return Ok(AccountedWarmResumeEndpoint::Declined);
+    }
+
+    let mut row = workspace.lazy.row_offset(cached_hint)?;
+    let mut position = resume_position;
+    let mut pending_end = pending_end;
+    if earliest && pending_end.is_some() {
+        return Ok(complete_warm_resume_endpoint(pending_end, work));
+    }
+    loop {
+        if position == window.end() {
+            return Ok(complete_warm_resume_endpoint(pending_end, work));
+        }
+        // Match `WorkMeter::charge` in the ordinary loop: an unlimited work
+        // overflow precedes the source read at this exact byte boundary. Keep
+        // the previous total so an unpublished cell can be handed to the
+        // mutable executor as still unconsumed and charged exactly once.
+        let work_before_step = work;
+        charge_accounted_warm_resume_step(&mut work)?;
+        let byte = *haystack
+            .get(position)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "warm resume source position exceeded the validated window",
+            })?;
+        let class = automaton.byte_classes().class_of(byte);
+        let cell = workspace.lazy.direct_cell(row, class)?;
+        if cell == LAZY_CELL_UNFILLED {
+            return Ok(AccountedWarmResumeEndpoint::Continue(
+                WarmResumeForwardContinuation {
+                    row,
+                    position,
+                    pending_end,
+                    work: work_before_step,
+                },
+            ));
+        }
+        position = position
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "warm resume input position",
+            })?;
+        if cell & LAZY_CELL_ACCEPT != 0 {
+            pending_end = Some(position);
+            if earliest {
+                return Ok(complete_warm_resume_endpoint(pending_end, work));
+            }
+        }
+        let encoded = cell & LAZY_CELL_STATE_MASK;
+        if encoded == 0 {
+            return Ok(complete_warm_resume_endpoint(pending_end, work));
+        }
+        row = encoded.checked_sub(1).ok_or(SearchError::InternalInvariant {
+            detail: "warm resume encoded state underflowed",
+        })?;
+    }
+}
+
+#[allow(
+    clippy::inline_always,
+    clippy::too_many_arguments,
+    reason = "the warmed endpoint projection shares the Span path's exact checked accounting"
+)]
+#[inline(always)]
+fn try_warm_ordered_resume_endpoint(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &K0Workspace,
+    resume_set: &K0ResumeSet,
+    resume_state: usize,
+    resume_position: usize,
+    pending_end: Option<usize>,
+    earliest: bool,
+) -> Result<WarmResumeEndpoint, SearchError> {
+    Ok(match try_accounted_warm_ordered_resume_endpoint(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        resume_set,
+        resume_state,
+        resume_position,
+        pending_end,
+        earliest,
+    )? {
+        AccountedWarmResumeEndpoint::Declined => WarmResumeEndpoint::Declined,
+        AccountedWarmResumeEndpoint::Continue(continuation) => {
+            WarmResumeEndpoint::Continue(continuation)
+        }
+        AccountedWarmResumeEndpoint::Complete { found, .. } => {
+            WarmResumeEndpoint::Complete(found)
+        }
+    })
+}
+
+/// Complete a warmed Span continuation by pairing the immutable forward
+/// endpoint projection with the already-filled reverse cache. A first
+/// unpublished forward or reverse cell returns an exact mutable handoff; a
+/// missing authenticated forward hint still declines before mutation to the
+/// ordinary bidirectional resume executor.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the warmed Span continuation keeps its authenticated frontier and committed prefix explicit"
+)]
+fn try_warm_ordered_resume_span(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &K0Workspace,
+    resume_set: &K0ResumeSet,
+    resume_state: usize,
+    resume_position: usize,
+    pending_end: Option<usize>,
+) -> Result<WarmResumeSpan, SearchError> {
+    let (selected_end, mut work) = match try_accounted_warm_ordered_resume_endpoint(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        resume_set,
+        resume_state,
+        resume_position,
+        pending_end,
+        false,
+    )? {
+        AccountedWarmResumeEndpoint::Declined => return Ok(WarmResumeSpan::Declined),
+        AccountedWarmResumeEndpoint::Continue(continuation) => {
+            return Ok(WarmResumeSpan::ContinueForward(continuation));
+        }
+        AccountedWarmResumeEndpoint::Complete { found: None, .. } => {
+            return Ok(WarmResumeSpan::Complete(None));
+        }
+        AccountedWarmResumeEndpoint::Complete {
+            found: Some(end),
+            work,
+        } => (end, work),
+    };
+    if selected_end == window.start() {
+        return Ok(WarmResumeSpan::Declined);
+    }
+
+    let reverse = &workspace.reverse;
+    if !reverse.is_bound_to(automaton)
+        || !reverse.initialized
+        || reverse.declined
+        || reverse.saturated
+        || reverse.initial == LAZY_NO_STATE
+    {
+        return Ok(WarmResumeSpan::RecoverReverse { selected_end, work });
+    }
+    let mut row = reverse.row_offset(reverse.initial)?;
+    let mut cursor = selected_end;
+    let mut candidate = None;
+    while cursor > window.start() {
+        let source = cursor
+            .checked_sub(1)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "warm resume Span reverse cursor underflowed",
+            })?;
+        // The ordinary reverse loop charges this boundary before reading its
+        // source byte or transition. Continue the exact forward total so an
+        // unlimited overflow occurs at the same reverse boundary.
+        let work_before_step = work;
+        charge_accounted_warm_resume_step(&mut work)?;
+        let byte = *haystack
+            .get(source)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "warm resume Span reverse position exceeded the validated source",
+            })?;
+        let class = automaton.byte_classes().class_of(byte);
+        let cell = reverse.direct_cell(row, class)?;
+        if cell == LAZY_CELL_UNFILLED {
+            return Ok(WarmResumeSpan::ContinueReverse(
+                WarmResumeReverseContinuation {
+                    selected_end,
+                    row,
+                    cursor,
+                    candidate,
+                    work: work_before_step,
+                },
+            ));
+        }
+        debug_assert_eq!(cell & (LAZY_CELL_RESTART | LAZY_CELL_START_PROPAGATE), 0);
+        cursor = source;
+        if cell & LAZY_CELL_ACCEPT != 0 {
+            candidate = Some(cursor);
+        }
+        let encoded = cell & LAZY_CELL_STATE_MASK;
+        if encoded == 0 {
+            break;
+        }
+        row = encoded.checked_sub(1).ok_or(SearchError::InternalInvariant {
+            detail: "warm resume Span encoded reverse state underflowed",
+        })?;
+    }
+    let start = candidate.ok_or(SearchError::InternalInvariant {
+        detail: "warmed reverse DFA could not recover the resume-selected span",
+    })?;
+    Ok(WarmResumeSpan::Complete(Some(MatchSpan::new(
+        start,
+        selected_end,
+    ))))
+}
+
+/// Start mutable execution only after a read-only warm probe reaches its
+/// first unpublished cell. The probe's fixed reset charge is replaced by the
+/// actual invocation setup (which may include a generation rollover), while
+/// its cached-frontier authentication and completed direct steps remain
+/// charged exactly once.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the no-replay handoff keeps retained scratch, setup mode, and exact probe work explicit"
+)]
+fn prepare_warm_resume_continuation_meter(
+    automaton: &Automaton,
+    workspace: &mut K0Workspace,
+    resume_set: &K0ResumeSet,
+    window: SearchWindow,
+    accounted_work: u64,
+    position: usize,
+    may_use_lazy: bool,
+    may_use_reverse: bool,
+) -> Result<WorkMeter, SearchError> {
+    let scratch_bytes = workspace
+        .retained_bytes
+        .checked_add(resume_set.retained_bytes)
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "resume invocation retained scratch bytes",
+        })?;
+    let mut setup = SetupAccounting::empty(scratch_bytes, true);
+    let (mut meter, _) = prepare_resume_invocation(
+        automaton,
+        workspace,
+        window,
+        SearchLimits::unlimited(),
+        &mut setup,
+        may_use_lazy,
+        may_use_reverse,
+    )?;
+    let completed_transition_work = accounted_work.checked_sub(INVOCATION_RESET_WORK).ok_or(
+        SearchError::InternalInvariant {
+            detail: "warm resume probe work omitted its invocation reset",
+        },
+    )?;
+    meter.charge(completed_transition_work, position)?;
+    Ok(meter)
+}
+
+/// Continue the exact first unpublished forward cell without replaying any
+/// source byte already traversed by the immutable warm probe.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the no-replay value continuation keeps its original window and committed endpoint explicit"
+)]
+fn continue_warm_ordered_resume_forward(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    resume_set: &K0ResumeSet,
+    continuation: WarmResumeForwardContinuation,
+    contract: OutputContract,
+) -> Result<Option<MatchSpan>, SearchError> {
+    let wants_span = contract == OutputContract::Span;
+    if wants_span
+        && (!workspace.reverse.is_allocated() || !workspace.reverse.is_bound_to(automaton))
+    {
+        return Err(SearchError::InvalidResumeState {
+            detail: "span resume requires a bidirectional workspace",
+        });
+    }
+    let mut meter = prepare_warm_resume_continuation_meter(
+        automaton,
+        workspace,
+        resume_set,
+        window,
+        continuation.work,
+        continuation.position,
+        true,
+        wants_span,
+    )?;
+    let (mut pending, _) = execute_lazy_resume_loop::<true>(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        &mut meter,
+        contract,
+        0,
+        LazyState::Cached(continuation.row),
+        continuation.position,
+        continuation.pending_end,
+    )?;
+
+    if wants_span {
+        if let Some(selected) = pending {
+            let end = selected.end();
+            if !prepare_reverse_lazy(automaton, workspace, &mut meter, 0, end)? {
+                if workspace.reverse.declined {
+                    return Err(SearchError::InternalInvariant {
+                        detail: "selected resume endpoint has no reverse start frontier",
+                    });
+                }
+                return Err(SearchError::WorkLimitExceeded {
+                    limit: u64::MAX,
+                    consumed: meter.consumed,
+                    requested: reverse_initial_work_upper(automaton)?,
+                    position: end,
+                });
+            }
+            let (start, _) = execute_resume_reverse_lazy_loop(
+                automaton,
+                haystack,
+                window.start(),
+                end,
+                workspace,
+                &mut meter,
+                0,
+            )?;
+            let start = start.ok_or(SearchError::InternalInvariant {
+                detail: "reverse DFA could not recover the resume-selected span",
+            })?;
+            pending = Some(MatchSpan::new(start, end));
+        }
+    }
+    Ok(pending)
+}
+
+/// Resume reverse recovery at an exact cached row and source cursor. This is
+/// the reverse analogue of the forward first-unfilled handoff: its candidate
+/// start is already the earliest accepting boundary seen in the filled
+/// suffix, so later mutable transitions may update it without rescanning.
+fn continue_warm_resume_reverse_lazy_loop(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window_start: usize,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+    continuation: WarmResumeReverseContinuation,
+) -> Result<Option<usize>, SearchError> {
+    let mut state = ReverseState::Cached(continuation.row);
+    let mut cursor = continuation.cursor;
+    let mut candidate = continuation.candidate;
+    while cursor > window_start {
+        let source = cursor
+            .checked_sub(1)
+            .ok_or(SearchError::InternalInvariant {
+                detail: "warm resume reverse continuation cursor underflowed",
+            })?;
+        meter.charge(1, source)?;
+        let byte = *haystack.get(source).ok_or(SearchError::InternalInvariant {
+            detail: "warm resume reverse continuation exceeded the validated source",
+        })?;
+        let transition = match state {
+            ReverseState::Cached(cached) => {
+                let class = automaton.byte_classes().class_of(byte);
+                let cell = workspace.reverse.direct_cell(cached, class)?;
+                if cell == LAZY_CELL_UNFILLED {
+                    build_resume_reverse_cached_transition(
+                        automaton,
+                        workspace.reverse.row_state(cached),
+                        byte,
+                        class,
+                        workspace,
+                        meter,
+                        0,
+                        source,
+                    )?
+                } else {
+                    ReverseTransition::Ready(cell)
+                }
+            }
+            ReverseState::Inline => {
+                build_resume_reverse_inline_transition(automaton, byte, workspace, meter, source)?
+            }
+        };
+        cursor = source;
+        let (reaches_start, next) = match transition {
+            ReverseTransition::Ready(cell) => {
+                let encoded = cell & LAZY_CELL_STATE_MASK;
+                (
+                    cell & LAZY_CELL_ACCEPT != 0,
+                    if encoded == 0 {
+                        None
+                    } else {
+                        Some(ReverseState::Cached(encoded.checked_sub(1).ok_or(
+                            SearchError::InternalInvariant {
+                                detail: "warm resume reverse encoded state underflowed",
+                            },
+                        )?))
+                    },
+                )
+            }
+            ReverseTransition::Inline { reaches_start } => {
+                (reaches_start, Some(ReverseState::Inline))
+            }
+        };
+        if reaches_start {
+            candidate = Some(cursor);
+        }
+        let Some(next) = next else {
+            break;
+        };
+        state = next;
+    }
+    Ok(candidate)
+}
+
+/// Recover a completed warm forward endpoint without replaying it. A cold
+/// reverse cache starts at its ordinary authenticated initial row; a partially
+/// warm reverse cache continues at the first unpublished cell.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the no-replay reverse handoff keeps its selected endpoint and retained work explicit"
+)]
+fn continue_warm_ordered_resume_reverse(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    resume_set: &K0ResumeSet,
+    selected_end: usize,
+    accounted_work: u64,
+    continuation: Option<WarmResumeReverseContinuation>,
+) -> Result<Option<MatchSpan>, SearchError> {
+    let charge_position = continuation.map_or(selected_end, |progress| progress.cursor);
+    let mut meter = prepare_warm_resume_continuation_meter(
+        automaton,
+        workspace,
+        resume_set,
+        window,
+        accounted_work,
+        charge_position,
+        false,
+        true,
+    )?;
+    if !prepare_reverse_lazy(automaton, workspace, &mut meter, 0, selected_end)? {
+        if workspace.reverse.declined {
+            return Err(SearchError::InternalInvariant {
+                detail: "selected resume endpoint has no reverse start frontier",
+            });
+        }
+        return Err(SearchError::WorkLimitExceeded {
+            limit: u64::MAX,
+            consumed: meter.consumed,
+            requested: reverse_initial_work_upper(automaton)?,
+            position: selected_end,
+        });
+    }
+    let start = if let Some(continuation) = continuation {
+        continue_warm_resume_reverse_lazy_loop(
+            automaton,
+            haystack,
+            window.start(),
+            workspace,
+            &mut meter,
+            continuation,
+        )?
+    } else {
+        execute_resume_reverse_lazy_loop(
+            automaton,
+            haystack,
+            window.start(),
+            selected_end,
+            workspace,
+            &mut meter,
+            0,
+        )?
+        .0
+    };
+    let start = start.ok_or(SearchError::InternalInvariant {
+        detail: "reverse DFA could not recover the resume-selected span",
+    })?;
+    Ok(Some(MatchSpan::new(start, selected_end)))
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the value-only continuation keeps its authenticated frontier and original window explicit"
+)]
+pub(crate) fn search_prevalidated_exists_value_from_ordered_resume_with_authenticated_workspace(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    resume_set: &mut K0ResumeSet,
+    resume_state: usize,
+    resume_position: usize,
+    pending_end: Option<usize>,
+    limits: SearchLimits,
+) -> Result<bool, SearchError> {
+    validate_ordered_resume_request(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        resume_set,
+        resume_state,
+        resume_position,
+        pending_end,
+        OutputContract::Exists,
+    )?;
+    if limits == SearchLimits::unlimited() {
+        match try_warm_ordered_resume_endpoint(
+            automaton,
+            haystack,
+            window,
+            workspace,
+            resume_set,
+            resume_state,
+            resume_position,
+            pending_end,
+            true,
+        )? {
+            WarmResumeEndpoint::Complete(found) => return Ok(found.is_some()),
+            WarmResumeEndpoint::Continue(continuation) => {
+                return continue_warm_ordered_resume_forward(
+                    automaton,
+                    haystack,
+                    window,
+                    workspace,
+                    resume_set,
+                    continuation,
+                    OutputContract::Exists,
+                )
+                .map(|found| found.is_some());
+            }
+            WarmResumeEndpoint::Declined => {}
+        }
+    }
+    execute_from_resume(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        resume_set,
+        resume_state,
+        resume_position,
+        pending_end,
+        limits,
+        OutputContract::Exists,
+    )
+    .map(|report| report.found.is_some())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the value-only continuation keeps its authenticated frontier and original window explicit"
+)]
+pub(crate) fn search_prevalidated_selected_end_value_from_ordered_resume_with_authenticated_workspace(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    resume_set: &mut K0ResumeSet,
+    resume_state: usize,
+    resume_position: usize,
+    pending_end: Option<usize>,
+    limits: SearchLimits,
+) -> Result<Option<usize>, SearchError> {
+    validate_ordered_resume_request(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        resume_set,
+        resume_state,
+        resume_position,
+        pending_end,
+        OutputContract::SelectedEnd,
+    )?;
+    if limits == SearchLimits::unlimited() {
+        match try_warm_ordered_resume_endpoint(
+            automaton,
+            haystack,
+            window,
+            workspace,
+            resume_set,
+            resume_state,
+            resume_position,
+            pending_end,
+            false,
+        )? {
+            WarmResumeEndpoint::Complete(found) => return Ok(found),
+            WarmResumeEndpoint::Continue(continuation) => {
+                return continue_warm_ordered_resume_forward(
+                    automaton,
+                    haystack,
+                    window,
+                    workspace,
+                    resume_set,
+                    continuation,
+                    OutputContract::SelectedEnd,
+                )
+                .map(|found| found.map(MatchSpan::end));
+            }
+            WarmResumeEndpoint::Declined => {}
+        }
+    }
+    execute_from_resume(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        resume_set,
+        resume_state,
+        resume_position,
+        pending_end,
+        limits,
+        OutputContract::SelectedEnd,
+    )
+    .map(|report| report.found.map(MatchSpan::end))
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the value-only Span continuation keeps its authenticated frontier and original window explicit"
+)]
+pub(crate) fn search_prevalidated_span_value_from_ordered_resume_with_authenticated_workspace(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    resume_set: &mut K0ResumeSet,
+    resume_state: usize,
+    resume_position: usize,
+    pending_end: Option<usize>,
+    limits: SearchLimits,
+) -> Result<Option<MatchSpan>, SearchError> {
+    validate_ordered_resume_request(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        resume_set,
+        resume_state,
+        resume_position,
+        pending_end,
+        OutputContract::Span,
+    )?;
+    if !workspace.reverse.is_allocated() || !workspace.reverse.is_bound_to(automaton) {
+        return Err(SearchError::InvalidResumeState {
+            detail: "span resume requires a bidirectional workspace",
+        });
+    }
+    if limits == SearchLimits::unlimited() {
+        match try_warm_ordered_resume_span(
+            automaton,
+            haystack,
+            window,
+            workspace,
+            resume_set,
+            resume_state,
+            resume_position,
+            pending_end,
+        )? {
+            WarmResumeSpan::Complete(found) => return Ok(found),
+            WarmResumeSpan::ContinueForward(continuation) => {
+                return continue_warm_ordered_resume_forward(
+                    automaton,
+                    haystack,
+                    window,
+                    workspace,
+                    resume_set,
+                    continuation,
+                    OutputContract::Span,
+                );
+            }
+            WarmResumeSpan::RecoverReverse { selected_end, work } => {
+                return continue_warm_ordered_resume_reverse(
+                    automaton,
+                    haystack,
+                    window,
+                    workspace,
+                    resume_set,
+                    selected_end,
+                    work,
+                    None,
+                );
+            }
+            WarmResumeSpan::ContinueReverse(continuation) => {
+                return continue_warm_ordered_resume_reverse(
+                    automaton,
+                    haystack,
+                    window,
+                    workspace,
+                    resume_set,
+                    continuation.selected_end,
+                    continuation.work,
+                    Some(continuation),
+                );
+            }
+            WarmResumeSpan::Declined => {}
+        }
+    }
+    execute_from_resume(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        resume_set,
+        resume_state,
+        resume_position,
+        pending_end,
+        limits,
+        OutputContract::Span,
+    )
+    .map(|report| report.found)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the continuation entry keeps its authenticated frontier and original window explicit"
+)]
+pub(crate) fn search_from_resume_with_workspace(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    resume_set: &mut K0ResumeSet,
+    resume_state: usize,
+    resume_position: usize,
+    pending_end: Option<usize>,
+    limits: SearchLimits,
+    contract: OutputContract,
+) -> Result<UntypedReport, SearchError> {
+    validate_ordered_resume_request(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        resume_set,
+        resume_state,
+        resume_position,
+        pending_end,
+        contract,
+    )?;
     execute_from_resume(
         automaton,
         haystack,
@@ -38399,6 +39273,30 @@ mod tests {
         pending_end: Option<usize>,
         contract: OutputContract,
     ) -> (K0Workspace, K0ResumeSet) {
+        warm_resume_at_fixture(
+            plan,
+            frontier,
+            haystack,
+            window,
+            window.start(),
+            pending_end,
+            contract,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the resume test fixture names its consumed boundary explicitly"
+    )]
+    fn warm_resume_at_fixture(
+        plan: &Automaton,
+        frontier: &[u32],
+        haystack: &[u8],
+        window: SearchWindow,
+        resume_position: usize,
+        pending_end: Option<usize>,
+        contract: OutputContract,
+    ) -> (K0Workspace, K0ResumeSet) {
         let mut resume =
             K0ResumeSet::new(plan, 1, frontier.len(), [(frontier, pending_end.is_some())])
                 .unwrap();
@@ -38411,7 +39309,7 @@ mod tests {
             &mut workspace,
             &mut resume,
             0,
-            window.start(),
+            resume_position,
             pending_end,
             SearchLimits {
                 max_work: u64::MAX - 1,
@@ -38599,6 +39497,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn warmed_resume_batch_matches_scalar_at_every_exit_and_contract() {
         let endpoint_plan = greedy_a_star_b();
         // Exact ordered closure of the `a*b` split.
@@ -38691,20 +39590,18 @@ mod tests {
             ResumeBatchExit::FirstUnfilled,
             None,
         );
-        for contract in [OutputContract::SelectedEnd] {
-            assert_warmed_resume_batch_case(
-                &endpoint_plan,
-                &endpoint_frontier,
-                first_unfilled,
-                SearchWindow::full(first_unfilled),
-                first_unfilled,
-                SearchWindow::full(first_unfilled),
-                Some(0),
-                contract,
-                ResumeBatchExit::Dead,
-                Some(MatchSpan::new(0, 0)),
-            );
-        }
+        assert_warmed_resume_batch_case(
+            &endpoint_plan,
+            &endpoint_frontier,
+            first_unfilled,
+            SearchWindow::full(first_unfilled),
+            first_unfilled,
+            SearchWindow::full(first_unfilled),
+            Some(0),
+            OutputContract::SelectedEnd,
+            ResumeBatchExit::Dead,
+            Some(MatchSpan::new(0, 0)),
+        );
         let exact_work = assert_warmed_resume_batch_case(
             &span_plan,
             &span_frontier,
@@ -38877,8 +39774,1409 @@ mod tests {
                 contract,
             );
             assert_eq!(batched, scalar, "randomized resume case {case}");
+            if contract != OutputContract::Span {
+                let expected_end = batched.0.0.map(MatchSpan::end);
+                assert_eq!(
+                    super::try_warm_ordered_resume_endpoint(
+                        &plan,
+                        &haystack,
+                        window,
+                        &batched_workspace,
+                        &batched_resume,
+                        0,
+                        window.start(),
+                        pending_end,
+                        contract == OutputContract::Exists,
+                    )
+                    .unwrap(),
+                    super::WarmResumeEndpoint::Complete(expected_end),
+                    "randomized report-free resume case {case}"
+                );
+            }
             assert_resume_cache_equivalent(&batched_workspace, &scalar_workspace);
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn warmed_resume_value_paths_are_read_only_and_handoff_at_first_unfilled() {
+        let plan = greedy_a_star_b();
+        let frontier = [1_u32, 2_u32];
+        let accepted = b"aaaaaab";
+        let accepted_window = SearchWindow::full(accepted);
+
+        let (mut selected_workspace, mut selected_resume) = warm_resume_batch_fixture(
+            &plan,
+            &frontier,
+            accepted,
+            accepted_window,
+            None,
+            OutputContract::SelectedEnd,
+        );
+        let (selected_reference, selected_reference_resume) = warm_resume_batch_fixture(
+            &plan,
+            &frontier,
+            accepted,
+            accepted_window,
+            None,
+            OutputContract::SelectedEnd,
+        );
+        assert_eq!(
+            super::try_warm_ordered_resume_endpoint(
+                &plan,
+                accepted,
+                accepted_window,
+                &selected_workspace,
+                &selected_resume,
+                0,
+                0,
+                None,
+                false,
+            )
+            .unwrap(),
+            super::WarmResumeEndpoint::Complete(Some(accepted.len()))
+        );
+        assert_eq!(
+            plan.prepare::<SelectedEnd>()
+                .search_prevalidated_selected_end_value_from_ordered_resume_with_authenticated_workspace(
+                    accepted,
+                    accepted_window,
+                    &mut selected_workspace,
+                    &mut selected_resume,
+                    0,
+                    0,
+                    None,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            Some(accepted.len())
+        );
+        assert_resume_cache_equivalent(&selected_workspace, &selected_reference);
+        assert_eq!(
+            selected_resume.cached_states,
+            selected_reference_resume.cached_states
+        );
+
+        let (mut exists_workspace, mut exists_resume) = warm_resume_batch_fixture(
+            &plan,
+            &frontier,
+            accepted,
+            accepted_window,
+            None,
+            OutputContract::Exists,
+        );
+        assert!(
+            plan.prepare::<Exists>()
+                .search_prevalidated_exists_value_from_ordered_resume_with_authenticated_workspace(
+                    accepted,
+                    accepted_window,
+                    &mut exists_workspace,
+                    &mut exists_resume,
+                    0,
+                    0,
+                    None,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+        );
+
+        let (mut span_workspace, mut span_resume) = warm_resume_batch_fixture(
+            &plan,
+            &frontier,
+            accepted,
+            accepted_window,
+            None,
+            OutputContract::Span,
+        );
+        let reverse_rows = span_workspace.reverse.rows.clone();
+        let reverse_offsets = span_workspace.reverse.offsets.clone();
+        let reverse_lengths = span_workspace.reverse.lengths.clone();
+        let reverse_hashes = span_workspace.reverse.hashes.clone();
+        let reverse_items = span_workspace.reverse.items.clone();
+        let reverse_shape = (
+            span_workspace.reverse.state_len,
+            span_workspace.reverse.item_len,
+            span_workspace.reverse.initial,
+            span_workspace.reverse.initialized,
+            span_workspace.reverse.declined,
+            span_workspace.reverse.saturated,
+        );
+        assert_eq!(
+            plan.prepare::<Span>()
+                .search_prevalidated_span_value_from_ordered_resume_with_authenticated_workspace(
+                    accepted,
+                    accepted_window,
+                    &mut span_workspace,
+                    &mut span_resume,
+                    0,
+                    0,
+                    None,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            Some(MatchSpan::new(0, accepted.len()))
+        );
+        assert_eq!(span_workspace.reverse.rows, reverse_rows);
+        assert_eq!(span_workspace.reverse.offsets, reverse_offsets);
+        assert_eq!(span_workspace.reverse.lengths, reverse_lengths);
+        assert_eq!(span_workspace.reverse.hashes, reverse_hashes);
+        assert_eq!(span_workspace.reverse.items, reverse_items);
+        assert_eq!(
+            (
+                span_workspace.reverse.state_len,
+                span_workspace.reverse.item_len,
+                span_workspace.reverse.initial,
+                span_workspace.reverse.initialized,
+                span_workspace.reverse.declined,
+                span_workspace.reverse.saturated,
+            ),
+            reverse_shape
+        );
+
+        let warmed = b"aaaaaa";
+        let unfilled = b"aaaaaax";
+        let (mut decline_workspace, mut decline_resume) = warm_resume_batch_fixture(
+            &plan,
+            &frontier,
+            warmed,
+            SearchWindow::full(warmed),
+            None,
+            OutputContract::SelectedEnd,
+        );
+        let continuation = match super::try_warm_ordered_resume_endpoint(
+            &plan,
+            unfilled,
+            SearchWindow::full(unfilled),
+            &decline_workspace,
+            &decline_resume,
+            0,
+            0,
+            None,
+            false,
+        )
+        .unwrap()
+        {
+            super::WarmResumeEndpoint::Continue(continuation) => continuation,
+            outcome => {
+                panic!("novel suffix did not hand off at its first unfilled cell: {outcome:?}")
+            }
+        };
+        assert_eq!(continuation.position, warmed.len());
+        assert_eq!(continuation.pending_end, None);
+        assert_eq!(
+            decline_workspace
+                .lazy
+                .direct_cell(continuation.row, byte_class(&plan, b'x'))
+                .unwrap(),
+            super::LAZY_CELL_UNFILLED
+        );
+        assert_eq!(
+            plan.prepare::<SelectedEnd>()
+                .search_prevalidated_selected_end_value_from_ordered_resume_with_authenticated_workspace(
+                    unfilled,
+                    SearchWindow::full(unfilled),
+                    &mut decline_workspace,
+                    &mut decline_resume,
+                    0,
+                    0,
+                    None,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            None
+        );
+        assert_ne!(
+            decline_workspace
+                .lazy
+                .direct_cell(continuation.row, byte_class(&plan, b'x'))
+                .unwrap(),
+            super::LAZY_CELL_UNFILLED,
+            "the mutable fallback did not continue at the handed-off cell"
+        );
+
+        // Exercise the continuation itself with an earlier filled edge
+        // deliberately removed after the immutable probe. Exact handoff must
+        // neither read nor republish that consumed-prefix edge.
+        let (mut no_replay_workspace, no_replay_resume) = warm_resume_batch_fixture(
+            &plan,
+            &frontier,
+            warmed,
+            SearchWindow::full(warmed),
+            None,
+            OutputContract::SelectedEnd,
+        );
+        let no_replay = match super::try_warm_ordered_resume_endpoint(
+            &plan,
+            unfilled,
+            SearchWindow::full(unfilled),
+            &no_replay_workspace,
+            &no_replay_resume,
+            0,
+            0,
+            None,
+            false,
+        )
+        .unwrap()
+        {
+            super::WarmResumeEndpoint::Continue(continuation) => continuation,
+            outcome => panic!("no-replay fixture did not return a continuation: {outcome:?}"),
+        };
+        let seed_row = no_replay_workspace
+            .lazy
+            .row_offset(no_replay_resume.cached_states[0])
+            .unwrap();
+        let consumed_prefix_cell = usize::try_from(seed_row)
+            .unwrap()
+            .checked_add(usize::from(byte_class(&plan, b'a')))
+            .unwrap();
+        assert_ne!(
+            no_replay_workspace.lazy.rows[consumed_prefix_cell],
+            super::LAZY_CELL_UNFILLED
+        );
+        no_replay_workspace.lazy.rows[consumed_prefix_cell] = super::LAZY_CELL_UNFILLED;
+        assert_eq!(
+            super::continue_warm_ordered_resume_forward(
+                &plan,
+                unfilled,
+                SearchWindow::full(unfilled),
+                &mut no_replay_workspace,
+                &no_replay_resume,
+                no_replay,
+                OutputContract::SelectedEnd,
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            no_replay_workspace.lazy.rows[consumed_prefix_cell],
+            super::LAZY_CELL_UNFILLED,
+            "forward continuation replayed a consumed prefix edge"
+        );
+
+        assert!(matches!(
+            plan.prepare::<SelectedEnd>()
+                .search_prevalidated_selected_end_value_from_ordered_resume_with_authenticated_workspace(
+                    accepted,
+                    accepted_window,
+                    &mut selected_workspace,
+                    &mut selected_resume,
+                    0,
+                    0,
+                    None,
+                    SearchLimits {
+                        max_work: 0,
+                        max_scratch_bytes: usize::MAX,
+                    },
+                ),
+            Err(SearchError::WorkLimitExceeded { limit: 0, .. })
+        ));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn warmed_resume_span_hands_off_reverse_at_first_unfilled_without_forward_replay() {
+        // Both alternatives reach the same authenticated suffix frontier.
+        // Warming `ac` publishes the complete forward `c` row and reverse
+        // `c,a` path. The novel `bc` call therefore completes forward through
+        // filled rows, then meets its first unpublished cell only in reverse.
+        let plan = byte_class_then_range(b"ab", (b'c', b'c'), None);
+        let frontier = [1_u32];
+        let warmed = b"ac";
+        let novel = b"bc";
+        let window = SearchWindow::full(warmed);
+        let (mut workspace, mut resume) = warm_resume_at_fixture(
+            &plan,
+            &frontier,
+            warmed,
+            window,
+            1,
+            None,
+            OutputContract::Span,
+        );
+
+        let continuation = match super::try_warm_ordered_resume_span(
+            &plan,
+            novel,
+            window,
+            &workspace,
+            &resume,
+            0,
+            1,
+            None,
+        )
+        .unwrap()
+        {
+            super::WarmResumeSpan::ContinueReverse(continuation) => continuation,
+            outcome => panic!("novel reverse class did not hand off exactly: {outcome:?}"),
+        };
+        assert_eq!(continuation.selected_end, novel.len());
+        assert_eq!(continuation.cursor, 1);
+        assert_eq!(continuation.candidate, None);
+        assert_eq!(
+            workspace
+                .reverse
+                .direct_cell(continuation.row, byte_class(&plan, b'b'))
+                .unwrap(),
+            super::LAZY_CELL_UNFILLED
+        );
+
+        assert_eq!(
+            plan.prepare::<Span>()
+                .search_prevalidated_span_value_from_ordered_resume_with_authenticated_workspace(
+                    novel,
+                    window,
+                    &mut workspace,
+                    &mut resume,
+                    0,
+                    1,
+                    None,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            Some(MatchSpan::new(0, novel.len()))
+        );
+        assert_ne!(
+            workspace
+                .reverse
+                .direct_cell(continuation.row, byte_class(&plan, b'b'))
+                .unwrap(),
+            super::LAZY_CELL_UNFILLED,
+            "reverse fallback did not publish the exact handed-off cell"
+        );
+
+        // The newly published path is now a completely immutable warm Span.
+        let rows = workspace.reverse.rows.clone();
+        assert_eq!(
+            super::try_warm_ordered_resume_span(
+                &plan,
+                novel,
+                window,
+                &workspace,
+                &resume,
+                0,
+                1,
+                None,
+            )
+            .unwrap(),
+            super::WarmResumeSpan::Complete(Some(MatchSpan::new(0, novel.len())))
+        );
+        assert_eq!(workspace.reverse.rows, rows);
+
+        // Poison the already-traversed reverse `c` edge after obtaining a
+        // continuation. Reverse recovery must begin at the retained `b` row
+        // and leave that completed suffix edge untouched.
+        let (mut no_replay_workspace, no_replay_resume) = warm_resume_at_fixture(
+            &plan,
+            &frontier,
+            warmed,
+            window,
+            1,
+            None,
+            OutputContract::Span,
+        );
+        let no_replay = match super::try_warm_ordered_resume_span(
+            &plan,
+            novel,
+            window,
+            &no_replay_workspace,
+            &no_replay_resume,
+            0,
+            1,
+            None,
+        )
+        .unwrap()
+        {
+            super::WarmResumeSpan::ContinueReverse(continuation) => continuation,
+            outcome => panic!("no-replay reverse fixture did not continue: {outcome:?}"),
+        };
+        let reverse_initial_row = no_replay_workspace
+            .reverse
+            .row_offset(no_replay_workspace.reverse.initial)
+            .unwrap();
+        let consumed_suffix_cell = usize::try_from(reverse_initial_row)
+            .unwrap()
+            .checked_add(usize::from(byte_class(&plan, b'c')))
+            .unwrap();
+        assert_ne!(
+            no_replay_workspace.reverse.rows[consumed_suffix_cell],
+            super::LAZY_CELL_UNFILLED
+        );
+        no_replay_workspace.reverse.rows[consumed_suffix_cell] = super::LAZY_CELL_UNFILLED;
+        assert_eq!(
+            super::continue_warm_ordered_resume_reverse(
+                &plan,
+                novel,
+                window,
+                &mut no_replay_workspace,
+                &no_replay_resume,
+                no_replay.selected_end,
+                no_replay.work,
+                Some(no_replay),
+            )
+            .unwrap(),
+            Some(MatchSpan::new(0, novel.len()))
+        );
+        assert_eq!(
+            no_replay_workspace.reverse.rows[consumed_suffix_cell],
+            super::LAZY_CELL_UNFILLED,
+            "reverse continuation replayed a consumed suffix edge"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn ordered_resume_value_paths_cold_publish_then_complete_warm_for_every_contract() {
+        let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b')]);
+        let frontier = [1_u32];
+        let haystack = b"xxab!";
+        let window = SearchWindow::new(2, 4);
+        let resume_position = 3;
+
+        for contract in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let mut value_resume =
+                K0ResumeSet::new(&plan, 1, 1, [(&frontier[..], false)]).unwrap();
+            let mut value_workspace =
+                K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+            let mut report_resume =
+                K0ResumeSet::new(&plan, 1, 1, [(&frontier[..], false)]).unwrap();
+            let mut report_workspace =
+                K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+
+            let expected = super::search_from_resume_with_workspace(
+                &plan,
+                haystack,
+                window,
+                &mut report_workspace,
+                &mut report_resume,
+                0,
+                resume_position,
+                None,
+                SearchLimits::unlimited(),
+                contract,
+            )
+            .map(|report| report.found);
+            match contract {
+                OutputContract::Exists => assert_eq!(
+                    plan.prepare::<Exists>()
+                        .search_prevalidated_exists_value_from_ordered_resume_with_authenticated_workspace(
+                            haystack,
+                            window,
+                            &mut value_workspace,
+                            &mut value_resume,
+                            0,
+                            resume_position,
+                            None,
+                            SearchLimits::unlimited(),
+                        ),
+                    expected.map(|found| found.is_some()),
+                    "cold {contract:?}"
+                ),
+                OutputContract::SelectedEnd => assert_eq!(
+                    plan.prepare::<SelectedEnd>()
+                        .search_prevalidated_selected_end_value_from_ordered_resume_with_authenticated_workspace(
+                            haystack,
+                            window,
+                            &mut value_workspace,
+                            &mut value_resume,
+                            0,
+                            resume_position,
+                            None,
+                            SearchLimits::unlimited(),
+                        ),
+                    expected.map(|found| found.map(MatchSpan::end)),
+                    "cold {contract:?}"
+                ),
+                OutputContract::Span => assert_eq!(
+                    plan.prepare::<Span>()
+                        .search_prevalidated_span_value_from_ordered_resume_with_authenticated_workspace(
+                            haystack,
+                            window,
+                            &mut value_workspace,
+                            &mut value_resume,
+                            0,
+                            resume_position,
+                            None,
+                            SearchLimits::unlimited(),
+                        ),
+                    expected,
+                    "cold {contract:?}"
+                ),
+                _ => unreachable!("test contract is capture-free"),
+            }
+            assert_ne!(value_resume.cached_states[0], super::LAZY_NO_STATE);
+
+            match contract {
+                OutputContract::Exists => assert!(matches!(
+                    super::try_warm_ordered_resume_endpoint(
+                        &plan,
+                        haystack,
+                        window,
+                        &value_workspace,
+                        &value_resume,
+                        0,
+                        resume_position,
+                        None,
+                        true,
+                    )
+                    .unwrap(),
+                    super::WarmResumeEndpoint::Complete(Some(_))
+                )),
+                OutputContract::SelectedEnd => assert_eq!(
+                    super::try_warm_ordered_resume_endpoint(
+                        &plan,
+                        haystack,
+                        window,
+                        &value_workspace,
+                        &value_resume,
+                        0,
+                        resume_position,
+                        None,
+                        false,
+                    )
+                    .unwrap(),
+                    super::WarmResumeEndpoint::Complete(Some(window.end()))
+                ),
+                OutputContract::Span => assert_eq!(
+                    super::try_warm_ordered_resume_span(
+                        &plan,
+                        haystack,
+                        window,
+                        &value_workspace,
+                        &value_resume,
+                        0,
+                        resume_position,
+                        None,
+                    )
+                    .unwrap(),
+                    super::WarmResumeSpan::Complete(Some(MatchSpan::new(
+                        window.start(),
+                        window.end(),
+                    )))
+                ),
+                _ => unreachable!("test contract is capture-free"),
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn ordered_resume_value_paths_preserve_every_finite_limit_boundary() {
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum Value {
+            Exists(bool),
+            SelectedEnd(Option<usize>),
+            Span(Option<MatchSpan>),
+        }
+
+        let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b')]);
+        let frontier = [1_u32];
+        let haystack = b"xxab!";
+        let window = SearchWindow::new(2, 4);
+        let resume_position = 3;
+
+        for contract in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            macro_rules! call_value {
+                ($workspace:expr, $resume:expr, $limits:expr) => {
+                    match contract {
+                        OutputContract::Exists => plan
+                            .prepare::<Exists>()
+                            .search_prevalidated_exists_value_from_ordered_resume_with_authenticated_workspace(
+                                haystack,
+                                window,
+                                $workspace,
+                                $resume,
+                                0,
+                                resume_position,
+                                None,
+                                $limits,
+                            )
+                            .map(Value::Exists),
+                        OutputContract::SelectedEnd => plan
+                            .prepare::<SelectedEnd>()
+                            .search_prevalidated_selected_end_value_from_ordered_resume_with_authenticated_workspace(
+                                haystack,
+                                window,
+                                $workspace,
+                                $resume,
+                                0,
+                                resume_position,
+                                None,
+                                $limits,
+                            )
+                            .map(Value::SelectedEnd),
+                        OutputContract::Span => plan
+                            .prepare::<Span>()
+                            .search_prevalidated_span_value_from_ordered_resume_with_authenticated_workspace(
+                                haystack,
+                                window,
+                                $workspace,
+                                $resume,
+                                0,
+                                resume_position,
+                                None,
+                                $limits,
+                            )
+                            .map(Value::Span),
+                        _ => unreachable!("test contract is capture-free"),
+                    }
+                };
+            }
+
+            let (mut report_workspace, mut report_resume) = warm_resume_at_fixture(
+                &plan,
+                &frontier,
+                haystack,
+                window,
+                resume_position,
+                None,
+                contract,
+            );
+            let scratch = report_workspace
+                .retained_bytes()
+                .checked_add(report_resume.retained_bytes())
+                .unwrap();
+            let report = super::search_from_resume_with_workspace(
+                &plan,
+                haystack,
+                window,
+                &mut report_workspace,
+                &mut report_resume,
+                0,
+                resume_position,
+                None,
+                SearchLimits::unlimited(),
+                contract,
+            )
+            .unwrap();
+            let exact_work = report.accounting.work();
+            let expected = match contract {
+                OutputContract::Exists => Value::Exists(report.found.is_some()),
+                OutputContract::SelectedEnd => {
+                    Value::SelectedEnd(report.found.map(MatchSpan::end))
+                }
+                OutputContract::Span => Value::Span(report.found),
+                _ => unreachable!("test contract is capture-free"),
+            };
+            assert!(exact_work > 0);
+
+            let (mut exact_workspace, mut exact_resume) = warm_resume_at_fixture(
+                &plan,
+                &frontier,
+                haystack,
+                window,
+                resume_position,
+                None,
+                contract,
+            );
+            assert_eq!(
+                call_value!(
+                    &mut exact_workspace,
+                    &mut exact_resume,
+                    SearchLimits {
+                        max_work: exact_work,
+                        max_scratch_bytes: scratch,
+                    }
+                )
+                .unwrap(),
+                expected,
+                "exact finite {contract:?}"
+            );
+
+            let (mut work_workspace, mut work_resume) = warm_resume_at_fixture(
+                &plan,
+                &frontier,
+                haystack,
+                window,
+                resume_position,
+                None,
+                contract,
+            );
+            assert!(matches!(
+                call_value!(
+                    &mut work_workspace,
+                    &mut work_resume,
+                    SearchLimits {
+                        max_work: exact_work - 1,
+                        max_scratch_bytes: scratch,
+                    }
+                ),
+                Err(SearchError::WorkLimitExceeded { limit, .. }) if limit == exact_work - 1
+            ));
+
+            let (mut scratch_workspace, mut scratch_resume) = warm_resume_at_fixture(
+                &plan,
+                &frontier,
+                haystack,
+                window,
+                resume_position,
+                None,
+                contract,
+            );
+            assert!(matches!(
+                call_value!(
+                    &mut scratch_workspace,
+                    &mut scratch_resume,
+                    SearchLimits {
+                        max_work: u64::MAX,
+                        max_scratch_bytes: scratch - 1,
+                    }
+                ),
+                Err(SearchError::ResourceLimit {
+                    resource: ResourceKind::ScratchBytes,
+                    needed,
+                    limit,
+                }) if needed == scratch && limit == scratch - 1
+            ));
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn ordered_resume_values_exhaustively_match_reports_on_small_novel_inputs() {
+        let plan = greedy_a_star_b();
+        let frontier = [1_u32, 2_u32];
+        let alphabet = [b'a', b'b', b'x'];
+        let mut warm_source = vec![b'!', b'!'];
+        warm_source.extend_from_slice(b"aaaaab");
+        warm_source.push(b'!');
+        let warm_window = SearchWindow::new(2, warm_source.len() - 1);
+        let mut checked = 0usize;
+        let mut completed = 0usize;
+        let mut forward_handoffs = 0usize;
+
+        for contract in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            for has_pending in [false, true] {
+                let warm_pending = has_pending.then_some(warm_window.start());
+                for length in 0_u32..=4 {
+                    let cases = alphabet.len().pow(length);
+                    for mut encoded in 0..cases {
+                        let mut source = vec![b'!', b'!'];
+                        for _ in 0..length {
+                            source.push(alphabet[encoded % alphabet.len()]);
+                            encoded /= alphabet.len();
+                        }
+                        let window = SearchWindow::new(2, source.len());
+                        source.push(b'!');
+                        let pending_end = has_pending.then_some(window.start());
+                        let (mut value_workspace, mut value_resume) = warm_resume_at_fixture(
+                            &plan,
+                            &frontier,
+                            &warm_source,
+                            warm_window,
+                            warm_window.start(),
+                            warm_pending,
+                            contract,
+                        );
+                        let (mut report_workspace, mut report_resume) = warm_resume_at_fixture(
+                            &plan,
+                            &frontier,
+                            &warm_source,
+                            warm_window,
+                            warm_window.start(),
+                            warm_pending,
+                            contract,
+                        );
+
+                        match contract {
+                            OutputContract::Exists => match super::try_warm_ordered_resume_endpoint(
+                                &plan,
+                                &source,
+                                window,
+                                &value_workspace,
+                                &value_resume,
+                                0,
+                                window.start(),
+                                pending_end,
+                                true,
+                            )
+                            .unwrap()
+                            {
+                                super::WarmResumeEndpoint::Complete(_) => completed += 1,
+                                super::WarmResumeEndpoint::Continue(_) => forward_handoffs += 1,
+                                super::WarmResumeEndpoint::Declined => {}
+                            },
+                            OutputContract::SelectedEnd => {
+                                match super::try_warm_ordered_resume_endpoint(
+                                    &plan,
+                                    &source,
+                                    window,
+                                    &value_workspace,
+                                    &value_resume,
+                                    0,
+                                    window.start(),
+                                    pending_end,
+                                    false,
+                                )
+                                .unwrap()
+                                {
+                                    super::WarmResumeEndpoint::Complete(_) => completed += 1,
+                                    super::WarmResumeEndpoint::Continue(_) => {
+                                        forward_handoffs += 1;
+                                    }
+                                    super::WarmResumeEndpoint::Declined => {}
+                                }
+                            }
+                            OutputContract::Span => match super::try_warm_ordered_resume_span(
+                                &plan,
+                                &source,
+                                window,
+                                &value_workspace,
+                                &value_resume,
+                                0,
+                                window.start(),
+                                pending_end,
+                            )
+                            .unwrap()
+                            {
+                                super::WarmResumeSpan::Complete(_) => completed += 1,
+                                super::WarmResumeSpan::ContinueForward(_) => {
+                                    forward_handoffs += 1;
+                                }
+                                super::WarmResumeSpan::RecoverReverse { .. }
+                                | super::WarmResumeSpan::ContinueReverse(_)
+                                | super::WarmResumeSpan::Declined => {}
+                            },
+                            _ => unreachable!("test contract is capture-free"),
+                        }
+
+                        let expected = super::search_from_resume_with_workspace(
+                            &plan,
+                            &source,
+                            window,
+                            &mut report_workspace,
+                            &mut report_resume,
+                            0,
+                            window.start(),
+                            pending_end,
+                            SearchLimits::unlimited(),
+                            contract,
+                        )
+                        .map(|report| report.found);
+                        match contract {
+                            OutputContract::Exists => assert_eq!(
+                                plan.prepare::<Exists>()
+                                    .search_prevalidated_exists_value_from_ordered_resume_with_authenticated_workspace(
+                                        &source,
+                                        window,
+                                        &mut value_workspace,
+                                        &mut value_resume,
+                                        0,
+                                        window.start(),
+                                        pending_end,
+                                        SearchLimits::unlimited(),
+                                    ),
+                                expected.map(|found| found.is_some()),
+                                "Exists word {encoded} length {length} pending {has_pending}"
+                            ),
+                            OutputContract::SelectedEnd => assert_eq!(
+                                plan.prepare::<SelectedEnd>()
+                                    .search_prevalidated_selected_end_value_from_ordered_resume_with_authenticated_workspace(
+                                        &source,
+                                        window,
+                                        &mut value_workspace,
+                                        &mut value_resume,
+                                        0,
+                                        window.start(),
+                                        pending_end,
+                                        SearchLimits::unlimited(),
+                                    ),
+                                expected.map(|found| found.map(MatchSpan::end)),
+                                "SelectedEnd word {encoded} length {length} pending {has_pending}"
+                            ),
+                            OutputContract::Span => assert_eq!(
+                                plan.prepare::<Span>()
+                                    .search_prevalidated_span_value_from_ordered_resume_with_authenticated_workspace(
+                                        &source,
+                                        window,
+                                        &mut value_workspace,
+                                        &mut value_resume,
+                                        0,
+                                        window.start(),
+                                        pending_end,
+                                        SearchLimits::unlimited(),
+                                    ),
+                                expected,
+                                "Span word {encoded} length {length} pending {has_pending}"
+                            ),
+                            _ => unreachable!("test contract is capture-free"),
+                        }
+                        checked += 1;
+                    }
+                }
+            }
+        }
+
+        assert_eq!(checked, 3 * 2 * (1 + 3 + 9 + 27 + 81));
+        assert!(completed > 0, "no small input completed from immutable rows");
+        assert!(
+            forward_handoffs > 0,
+            "no novel small input reached a first-unfilled forward handoff"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn warmed_resume_value_paths_reauthenticate_stale_and_out_of_range_hints() {
+        let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b')]);
+        let frontier = [1_u32];
+        let haystack = b"xxab!";
+        let window = SearchWindow::new(2, 4);
+        let resume_position = 3;
+
+        let (mut stale_workspace, mut stale_resume) = warm_resume_at_fixture(
+            &plan,
+            &frontier,
+            haystack,
+            window,
+            resume_position,
+            None,
+            OutputContract::SelectedEnd,
+        );
+        let stale_hint = stale_workspace.lazy.initial;
+        assert_ne!(stale_hint, super::LAZY_NO_STATE);
+        let (offset, length, pending) =
+            super::resume_lazy_state_bounds(&stale_workspace.lazy, stale_hint).unwrap();
+        let end = offset.checked_add(length).unwrap();
+        assert!(
+            pending
+                || stale_workspace.lazy.items.get(offset..end) != Some(frontier.as_slice())
+        );
+        stale_resume.cached_states[0] = stale_hint;
+        assert_eq!(
+            super::try_warm_ordered_resume_endpoint(
+                &plan,
+                haystack,
+                window,
+                &stale_workspace,
+                &stale_resume,
+                0,
+                resume_position,
+                None,
+                false,
+            )
+            .unwrap(),
+            super::WarmResumeEndpoint::Declined
+        );
+        assert_eq!(stale_resume.cached_states[0], stale_hint);
+        assert_eq!(
+            plan.prepare::<SelectedEnd>()
+                .search_prevalidated_selected_end_value_from_ordered_resume_with_authenticated_workspace(
+                    haystack,
+                    window,
+                    &mut stale_workspace,
+                    &mut stale_resume,
+                    0,
+                    resume_position,
+                    None,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            Some(window.end())
+        );
+        let repaired = stale_resume.cached_states[0];
+        assert_ne!(repaired, super::LAZY_NO_STATE);
+        let (offset, length, pending) =
+            super::resume_lazy_state_bounds(&stale_workspace.lazy, repaired).unwrap();
+        let end = offset.checked_add(length).unwrap();
+        assert!(!pending);
+        assert_eq!(
+            stale_workspace.lazy.items.get(offset..end),
+            Some(frontier.as_slice())
+        );
+
+        let (mut outside_workspace, mut outside_resume) = warm_resume_at_fixture(
+            &plan,
+            &frontier,
+            haystack,
+            window,
+            resume_position,
+            None,
+            OutputContract::SelectedEnd,
+        );
+        let outside = u32::try_from(outside_workspace.lazy.state_len).unwrap();
+        assert_ne!(outside, super::LAZY_NO_STATE);
+        outside_resume.cached_states[0] = outside;
+        assert_eq!(
+            super::try_warm_ordered_resume_endpoint(
+                &plan,
+                haystack,
+                window,
+                &outside_workspace,
+                &outside_resume,
+                0,
+                resume_position,
+                None,
+                false,
+            )
+            .unwrap(),
+            super::WarmResumeEndpoint::Declined
+        );
+        assert_eq!(outside_resume.cached_states[0], outside);
+        assert_eq!(
+            plan.prepare::<SelectedEnd>()
+                .search_prevalidated_selected_end_value_from_ordered_resume_with_authenticated_workspace(
+                    haystack,
+                    window,
+                    &mut outside_workspace,
+                    &mut outside_resume,
+                    0,
+                    resume_position,
+                    None,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            Some(window.end())
+        );
+        assert_ne!(outside_resume.cached_states[0], outside);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn warmed_resume_value_paths_cover_no_match_and_initial_pending_nonzero_windows() {
+        let plan = greedy_a_star_b();
+        let frontier = [1_u32, 2_u32];
+
+        let absent = b"xxaaaaaa!";
+        let absent_window = SearchWindow::new(2, 8);
+        let (mut absent_workspace, mut absent_resume) = warm_resume_batch_fixture(
+            &plan,
+            &frontier,
+            absent,
+            absent_window,
+            None,
+            OutputContract::SelectedEnd,
+        );
+        let (absent_reference, absent_reference_resume) = warm_resume_batch_fixture(
+            &plan,
+            &frontier,
+            absent,
+            absent_window,
+            None,
+            OutputContract::SelectedEnd,
+        );
+        assert_eq!(
+            super::try_warm_ordered_resume_endpoint(
+                &plan,
+                absent,
+                absent_window,
+                &absent_workspace,
+                &absent_resume,
+                0,
+                absent_window.start(),
+                None,
+                false,
+            )
+            .unwrap(),
+            super::WarmResumeEndpoint::Complete(None)
+        );
+        assert_eq!(
+            plan.prepare::<SelectedEnd>()
+                .search_prevalidated_selected_end_value_from_ordered_resume_with_authenticated_workspace(
+                    absent,
+                    absent_window,
+                    &mut absent_workspace,
+                    &mut absent_resume,
+                    0,
+                    absent_window.start(),
+                    None,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            None
+        );
+        assert_resume_cache_equivalent(&absent_workspace, &absent_reference);
+        assert_eq!(
+            absent_resume.cached_states,
+            absent_reference_resume.cached_states
+        );
+
+        let (mut absent_span_workspace, mut absent_span_resume) = warm_resume_batch_fixture(
+            &plan,
+            &frontier,
+            absent,
+            absent_window,
+            None,
+            OutputContract::Span,
+        );
+        assert_eq!(
+            super::try_warm_ordered_resume_span(
+                &plan,
+                absent,
+                absent_window,
+                &absent_span_workspace,
+                &absent_span_resume,
+                0,
+                absent_window.start(),
+                None,
+            )
+            .unwrap(),
+            super::WarmResumeSpan::Complete(None)
+        );
+        assert_eq!(
+            plan.prepare::<Span>()
+                .search_prevalidated_span_value_from_ordered_resume_with_authenticated_workspace(
+                    absent,
+                    absent_window,
+                    &mut absent_span_workspace,
+                    &mut absent_span_resume,
+                    0,
+                    absent_window.start(),
+                    None,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            None
+        );
+
+        let nullable_plan = a_star(true);
+        let nullable_frontier = [1_u32];
+        let accepted = b"xxaaaaaa!";
+        let accepted_window = SearchWindow::new(2, 8);
+        let initial_pending = Some(accepted_window.start());
+        let (mut exists_workspace, mut exists_resume) = warm_resume_batch_fixture(
+            &nullable_plan,
+            &nullable_frontier,
+            accepted,
+            accepted_window,
+            initial_pending,
+            OutputContract::Exists,
+        );
+        assert!(
+            nullable_plan.prepare::<Exists>()
+                .search_prevalidated_exists_value_from_ordered_resume_with_authenticated_workspace(
+                    accepted,
+                    accepted_window,
+                    &mut exists_workspace,
+                    &mut exists_resume,
+                    0,
+                    accepted_window.start(),
+                    initial_pending,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+        );
+
+        let (mut selected_workspace, mut selected_resume) = warm_resume_batch_fixture(
+            &nullable_plan,
+            &nullable_frontier,
+            accepted,
+            accepted_window,
+            initial_pending,
+            OutputContract::SelectedEnd,
+        );
+        assert_eq!(
+            nullable_plan.prepare::<SelectedEnd>()
+                .search_prevalidated_selected_end_value_from_ordered_resume_with_authenticated_workspace(
+                    accepted,
+                    accepted_window,
+                    &mut selected_workspace,
+                    &mut selected_resume,
+                    0,
+                    accepted_window.start(),
+                    initial_pending,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            Some(accepted_window.end())
+        );
+
+        let (mut span_workspace, mut span_resume) = warm_resume_batch_fixture(
+            &nullable_plan,
+            &nullable_frontier,
+            accepted,
+            accepted_window,
+            initial_pending,
+            OutputContract::Span,
+        );
+        assert_eq!(
+            super::try_warm_ordered_resume_span(
+                &nullable_plan,
+                accepted,
+                accepted_window,
+                &span_workspace,
+                &span_resume,
+                0,
+                accepted_window.start(),
+                initial_pending,
+            )
+            .unwrap(),
+            super::WarmResumeSpan::Complete(Some(MatchSpan::new(
+                accepted_window.start(),
+                accepted_window.end(),
+            )))
+        );
+        assert_eq!(
+            nullable_plan.prepare::<Span>()
+                .search_prevalidated_span_value_from_ordered_resume_with_authenticated_workspace(
+                    accepted,
+                    accepted_window,
+                    &mut span_workspace,
+                    &mut span_resume,
+                    0,
+                    accepted_window.start(),
+                    initial_pending,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            Some(MatchSpan::new(
+                accepted_window.start(),
+                accepted_window.end(),
+            ))
+        );
+    }
+
+    #[test]
+    fn warmed_resume_value_span_preserves_finite_scratch_refusal() {
+        let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b')]);
+        let frontier = [1_u32];
+        let haystack = b"xxab!";
+        let window = SearchWindow::new(2, 4);
+        let resume_position = 3;
+        let (mut workspace, mut resume) = warm_resume_at_fixture(
+            &plan,
+            &frontier,
+            haystack,
+            window,
+            resume_position,
+            None,
+            OutputContract::Span,
+        );
+        let scratch = workspace
+            .retained_bytes()
+            .checked_add(resume.retained_bytes())
+            .unwrap();
+        assert!(scratch > 0);
+        assert!(matches!(
+            plan.prepare::<Span>()
+                .search_prevalidated_span_value_from_ordered_resume_with_authenticated_workspace(
+                    haystack,
+                    window,
+                    &mut workspace,
+                    &mut resume,
+                    0,
+                    resume_position,
+                    None,
+                    SearchLimits {
+                        max_work: u64::MAX,
+                        max_scratch_bytes: scratch - 1,
+                    },
+                ),
+            Err(SearchError::ResourceLimit {
+                resource: ResourceKind::ScratchBytes,
+                needed,
+                limit,
+            }) if needed == scratch && limit == scratch - 1
+        ));
+    }
+
+    #[test]
+    fn warmed_resume_span_declines_initial_pending_empty_endpoint_for_executor_parity() {
+        let plan = a_star(true);
+        let frontier = [1_u32];
+        let haystack = b"xx!";
+        let window = SearchWindow::new(2, 2);
+        let pending_end = Some(window.start());
+        let (mut value_workspace, mut value_resume) = warm_resume_at_fixture(
+            &plan,
+            &frontier,
+            haystack,
+            window,
+            window.start(),
+            pending_end,
+            OutputContract::SelectedEnd,
+        );
+        assert_eq!(
+            super::try_warm_ordered_resume_span(
+                &plan,
+                haystack,
+                window,
+                &value_workspace,
+                &value_resume,
+                0,
+                window.start(),
+                pending_end,
+            )
+            .unwrap(),
+            super::WarmResumeSpan::Declined
+        );
+
+        let (mut report_workspace, mut report_resume) = warm_resume_at_fixture(
+            &plan,
+            &frontier,
+            haystack,
+            window,
+            window.start(),
+            pending_end,
+            OutputContract::SelectedEnd,
+        );
+        let expected = plan
+            .prepare::<Span>()
+            .search_window_from_ordered_resume(
+                haystack,
+                window,
+                &mut report_workspace,
+                &mut report_resume,
+                0,
+                window.start(),
+                pending_end,
+                SearchLimits::unlimited(),
+            )
+            .unwrap_err();
+        let actual = plan
+            .prepare::<Span>()
+            .search_prevalidated_span_value_from_ordered_resume_with_authenticated_workspace(
+                haystack,
+                window,
+                &mut value_workspace,
+                &mut value_resume,
+                0,
+                window.start(),
+                pending_end,
+                SearchLimits::unlimited(),
+            )
+            .unwrap_err();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn warmed_resume_span_continues_exact_forward_accounting_through_reverse_steps() {
+        let mut completed_work = super::initial_accounted_warm_resume_work(2).unwrap();
+        for _ in 0..5 {
+            super::charge_accounted_warm_resume_step(&mut completed_work).unwrap();
+        }
+        let accounted = super::complete_warm_resume_endpoint(Some(17), completed_work);
+        let super::AccountedWarmResumeEndpoint::Complete { found, work } = accounted else {
+            panic!("completed endpoint accounting declined")
+        };
+        assert_eq!(found, Some(17));
+        assert_eq!(work, super::INVOCATION_RESET_WORK + 2 + 1 + 5);
+
+        let mut warm_work = u64::MAX - 1;
+        let mut ordinary = WorkMeter::new(u64::MAX, u64::MAX - 1);
+        assert_eq!(
+            super::charge_accounted_warm_resume_step(&mut warm_work),
+            ordinary.charge(1, 9)
+        );
+        assert_eq!(warm_work, u64::MAX);
+        assert_eq!(ordinary.consumed, u64::MAX);
+        assert_eq!(
+            super::charge_accounted_warm_resume_step(&mut warm_work),
+            ordinary.charge(1, 8)
+        );
+        assert_eq!(warm_work, u64::MAX);
+        assert_eq!(ordinary.consumed, u64::MAX);
     }
 
     #[test]

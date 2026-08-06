@@ -4487,7 +4487,7 @@ impl CompiledProgram {
                 let found = self
                     .automaton
                     .prepare::<Exists>()
-                    .search_window_from_ordered_resume(
+                    .search_prevalidated_exists_value_from_ordered_resume_with_authenticated_workspace(
                         haystack,
                         k0_window,
                         workspace,
@@ -4496,15 +4496,14 @@ impl CompiledProgram {
                         resume.position,
                         resume.pending_end,
                         limits,
-                    )?
-                    .into_output();
+                    )?;
                 Ok(MatchResult::Exists(found))
             }
             OutputContract::SelectedEnd => {
                 let found = self
                     .automaton
                     .prepare::<SelectedEnd>()
-                    .search_window_from_ordered_resume(
+                    .search_prevalidated_selected_end_value_from_ordered_resume_with_authenticated_workspace(
                         haystack,
                         k0_window,
                         workspace,
@@ -4513,8 +4512,7 @@ impl CompiledProgram {
                         resume.position,
                         resume.pending_end,
                         limits,
-                    )?
-                    .into_output();
+                    )?;
                 Ok(MatchResult::SelectedEnd(found))
             }
             OutputContract::Span => {
@@ -4524,7 +4522,7 @@ impl CompiledProgram {
                 {
                     self.automaton
                         .prepare::<SelectedEnd>()
-                        .search_window_from_ordered_resume(
+                        .search_prevalidated_selected_end_value_from_ordered_resume_with_authenticated_workspace(
                             haystack,
                             k0_window,
                             workspace,
@@ -4534,12 +4532,11 @@ impl CompiledProgram {
                             resume.pending_end,
                             limits,
                         )?
-                        .into_output()
                         .map(|end| (window.start, end))
                 } else if let Some(width) = self.exact_match_width {
                     self.automaton
                         .prepare::<SelectedEnd>()
-                        .search_window_from_ordered_resume(
+                        .search_prevalidated_selected_end_value_from_ordered_resume_with_authenticated_workspace(
                             haystack,
                             k0_window,
                             workspace,
@@ -4549,7 +4546,6 @@ impl CompiledProgram {
                             resume.pending_end,
                             limits,
                         )?
-                        .into_output()
                         .map(|end| {
                             end.checked_sub(width).map(|start| (start, end)).ok_or(
                                 CompileError::InternalInvariant(
@@ -4561,7 +4557,7 @@ impl CompiledProgram {
                 } else {
                     self.automaton
                         .prepare::<Span>()
-                        .search_window_from_ordered_resume(
+                        .search_prevalidated_span_value_from_ordered_resume_with_authenticated_workspace(
                             haystack,
                             k0_window,
                             workspace,
@@ -4571,7 +4567,6 @@ impl CompiledProgram {
                             resume.pending_end,
                             limits,
                         )?
-                        .into_output()
                         .map(|span| (span.start(), span.end()))
                 };
                 Ok(MatchResult::Span(found))
@@ -10411,6 +10406,87 @@ mod tests {
     }
 
     #[test]
+    fn repeated_retained_resume_values_match_every_output_at_nonzero_windows() {
+        let pattern = r"a+Q|[b-c][a-b]{1,5}(?:x+|y+)";
+        let mut sources = Vec::new();
+        for tail in [
+            b"cbbbbx".as_slice(),
+            b"cbbbbbyyyyy".as_slice(),
+            b"baaaaaxxxxx".as_slice(),
+        ] {
+            let mut source = vec![b'!'; 3];
+            source.extend(core::iter::repeat_n(b'x', PARTIAL_DFA_MIN_INPUT_BYTES));
+            source.extend_from_slice(tail);
+            source.push(b'!');
+            sources.push(source);
+        }
+        let mut repeated = 0_usize;
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let limits = DeterminizeLimits {
+                max_states: if output == OutputContract::Exists {
+                    8
+                } else {
+                    16
+                },
+                ..DeterminizeLimits::default()
+            };
+            let mut partial = program(pattern, output, CompileMode::Optimizing, limits);
+            assert!(partial.partial_dfa().is_some(), "{output:?}");
+            // This test owns the retained continuation itself. Complete
+            // suffix/cut proofs are independently covered and would hide the
+            // warm resume boundary under test.
+            partial.nfa_mandatory_suffix = None;
+            partial.nfa_mandatory_cut = None;
+            let reference = program(
+                pattern,
+                output,
+                CompileMode::Fast,
+                DeterminizeLimits::default(),
+            );
+            let mut found_witness = false;
+            for source in &sources {
+                let window = SearchWindow::new(3, source.len() - 1);
+                let expected = reference.search(source, window).unwrap();
+                let mut workspace = partial.prepare_workspace().unwrap();
+                assert_eq!(
+                    partial
+                        .search_with_retained_partial_workspace(source, window, &mut workspace)
+                        .unwrap(),
+                    expected,
+                    "cold retained {output:?}"
+                );
+                let resumed = workspace.partial.as_deref().unwrap().state.resumed;
+                if resumed == 0 {
+                    continue;
+                }
+                assert_eq!(
+                    partial
+                        .search_with_retained_partial_workspace(source, window, &mut workspace)
+                        .unwrap(),
+                    expected,
+                    "warm retained {output:?}"
+                );
+                assert!(
+                    workspace.partial.as_deref().unwrap().state.resumed > resumed,
+                    "the repeated {output:?} witness did not revisit its retained hole"
+                );
+                found_witness = true;
+                repeated = repeated.checked_add(1).unwrap();
+                break;
+            }
+            assert!(
+                found_witness,
+                "no nonzero-window retained-hole witness for {output:?}"
+            );
+        }
+        assert_eq!(repeated, 3);
+    }
+
+    #[test]
     fn nullable_retained_span_keeps_the_proved_window_start() {
         // The nullable branch fixes the selected start at the authoritative
         // window boundary, while the overlapping positive branch creates
@@ -10470,6 +10546,49 @@ mod tests {
                 }
             }
         }
+        let mut warmed_initial_pending = false;
+        for repeated_b in 1..=16 {
+            let mut haystack = vec![b'!'; 3];
+            haystack.push(b'c');
+            haystack.extend(core::iter::repeat_n(b'b', repeated_b));
+            haystack.push(b'z');
+            haystack.resize(3 + PARTIAL_DFA_MIN_INPUT_BYTES + 32, b'x');
+            let window = SearchWindow::new(3, haystack.len());
+            let expected = reference.search(&haystack, window).unwrap();
+            assert!(matches!(
+                expected,
+                MatchResult::Span(Some((start, _))) if start == window.start
+            ));
+            let mut workspace = limited.prepare_workspace().unwrap();
+            assert_eq!(
+                limited
+                    .search_with_retained_partial_workspace(&haystack, window, &mut workspace)
+                    .unwrap(),
+                expected
+            );
+            let resumed = workspace.partial.as_deref().unwrap().state.resumed;
+            if resumed == 0 {
+                continue;
+            }
+            assert_eq!(
+                limited
+                    .search_with_retained_partial_workspace(&haystack, window, &mut workspace)
+                    .unwrap(),
+                expected
+            );
+            let state = &workspace.partial.as_deref().unwrap().state;
+            assert!(state.resumed > resumed);
+            assert_eq!(
+                state.reverse_recovered, 0,
+                "initial-pending Span must retain the authoritative window start"
+            );
+            warmed_initial_pending = true;
+            break;
+        }
+        assert!(
+            warmed_initial_pending,
+            "nullable retained Span produced no repeated initial-pending hole"
+        );
         let state = &limited_workspace.partial.as_deref().unwrap().state;
         assert_eq!(
             state.reverse_recovered, 0,

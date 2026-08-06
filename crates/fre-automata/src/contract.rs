@@ -616,6 +616,48 @@ impl TypedPlan<'_, Exists> {
             limits,
         )
     }
+
+    /// Return only existence after one authenticated ordered frontier has
+    /// already consumed the prefix ending at `resume_position`.
+    ///
+    /// Unlimited warm calls may read a content-checked cached resume row and
+    /// its filled successors without constructing diagnostic accounting. An
+    /// unavailable hint re-enters the ordinary exact resume executor; an
+    /// unfilled successor hands its exact row, source position, and pending
+    /// endpoint to mutable execution without replaying the filled prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same resume, window, workspace, and
+    /// limit contract as [`TypedPlan::search_window_from_ordered_resume`].
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the value-only resume boundary keeps its committed prefix explicit"
+    )]
+    pub fn search_prevalidated_exists_value_from_ordered_resume_with_authenticated_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut K0Workspace,
+        resume_set: &mut K0ResumeSet,
+        resume_state: usize,
+        resume_position: usize,
+        pending_end: Option<usize>,
+        limits: SearchLimits,
+    ) -> Result<bool, SearchError> {
+        crate::k0::search_prevalidated_exists_value_from_ordered_resume_with_authenticated_workspace(
+            self.automaton,
+            haystack,
+            window,
+            workspace,
+            resume_set,
+            resume_state,
+            resume_position,
+            pending_end,
+            limits,
+        )
+    }
 }
 
 impl TypedPlan<'_, SelectedEnd> {
@@ -645,6 +687,47 @@ impl TypedPlan<'_, SelectedEnd> {
             haystack,
             window,
             workspace,
+            limits,
+        )
+    }
+
+    /// Return only the selected endpoint after one authenticated ordered
+    /// frontier has already consumed the prefix ending at `resume_position`.
+    ///
+    /// An unlimited warm call may complete through immutable filled lazy rows
+    /// after content-checking the cached frontier hint. Its first unfilled row
+    /// continues mutably at that exact byte without replay. Cold, finite-limit,
+    /// and incompatible cases use the ordinary resume executor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same resume, window, workspace, and
+    /// limit contract as [`TypedPlan::search_window_from_ordered_resume`].
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the value-only resume boundary keeps its committed prefix explicit"
+    )]
+    pub fn search_prevalidated_selected_end_value_from_ordered_resume_with_authenticated_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut K0Workspace,
+        resume_set: &mut K0ResumeSet,
+        resume_state: usize,
+        resume_position: usize,
+        pending_end: Option<usize>,
+        limits: SearchLimits,
+    ) -> Result<Option<usize>, SearchError> {
+        crate::k0::search_prevalidated_selected_end_value_from_ordered_resume_with_authenticated_workspace(
+            self.automaton,
+            haystack,
+            window,
+            workspace,
+            resume_set,
+            resume_state,
+            resume_position,
+            pending_end,
             limits,
         )
     }
@@ -707,6 +790,49 @@ impl TypedPlan<'_, Span> {
             haystack,
             window,
             workspace,
+            limits,
+        )
+    }
+
+    /// Return only the selected span after one authenticated ordered frontier
+    /// has already consumed the prefix ending at `resume_position`.
+    ///
+    /// Unlimited warm calls may pair a content-checked filled forward resume
+    /// row with filled reverse rows without constructing diagnostic
+    /// accounting. The first unfilled forward or reverse row continues at its
+    /// exact cached frontier without replaying either completed prefix. Cold,
+    /// finite-limit, and incompatible cases use the ordinary bidirectional
+    /// resume executor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same resume, window, workspace, and
+    /// limit contract as [`TypedPlan::search_window_from_ordered_resume`].
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the value-only Span resume boundary keeps its committed prefix explicit"
+    )]
+    pub fn search_prevalidated_span_value_from_ordered_resume_with_authenticated_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut K0Workspace,
+        resume_set: &mut K0ResumeSet,
+        resume_state: usize,
+        resume_position: usize,
+        pending_end: Option<usize>,
+        limits: SearchLimits,
+    ) -> Result<Option<MatchSpan>, SearchError> {
+        crate::k0::search_prevalidated_span_value_from_ordered_resume_with_authenticated_workspace(
+            self.automaton,
+            haystack,
+            window,
+            workspace,
+            resume_set,
+            resume_state,
+            resume_position,
+            pending_end,
             limits,
         )
     }
