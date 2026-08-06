@@ -6921,6 +6921,7 @@ fn warm_context_complete_dense_transition(
     let dependencies = hot.dependency_mask;
     if dependencies == CONTEXT_DEPENDENCY_UNCOMPUTED
         || dependencies & !global_dependencies != 0
+        || dependencies.count_ones() > 2
     {
         return Err(SearchError::InternalInvariant {
             detail: "complete contextual dense row has invalid dependencies",
@@ -40740,6 +40741,31 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn complete_context_projection_rejects_wide_forged_dependencies_before_lookup() {
+        let automaton = asserted_line_a();
+        let context = super::ContextTransitionStore::disabled();
+        let dependencies = (1 << 0) | (1 << 2) | (1 << 6);
+        let mut forged = super::ContextHotTransition::EMPTY;
+        forged.dependency_mask = dependencies;
+        forged.dense_missing = 0;
+
+        assert!(matches!(
+            super::warm_context_complete_dense_transition(
+                &automaton,
+                b"x",
+                0,
+                &context,
+                forged,
+                b'x',
+                dependencies,
+            ),
+            Err(SearchError::InternalInvariant {
+                detail: "complete contextual dense row has invalid dependencies"
+            })
+        ));
     }
 
     #[test]
