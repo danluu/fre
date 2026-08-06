@@ -2842,9 +2842,26 @@ pub(crate) struct NativePartialProgramView<'a> {
 /// Unlike [`NativePartialProgramView`], this carries no compile-time row
 /// table: its exclusively owned prepared workspace authenticates all rows at
 /// call time.
+///
+/// # Endpoint proof
+///
+/// K0's ordered retained-state identity includes whether an endpoint is
+/// pending. On each authenticated accepting cell, native lowering records the
+/// post-consumption position and continues only the encoded higher-priority
+/// successor. A dead successor or the admitted window end commits the last
+/// such position. Once one is pending, an initial-row successor uses its exact
+/// table row instead of restarting the graph scanner. Holes and K0-owned loop
+/// rows tail-deopt before consuming their byte, so the ordinary executor can
+/// restart the saved original window transactionally. A `Span` start is
+/// recoverable from that endpoint only through the positive graph-proved width
+/// below; every other `Span` provenance declines this entry.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct NativeDynamicRowsProgramView {
     pub(crate) output: OutputContract,
+    /// A fixed positive graph-proved width for `Span` output. `SelectedEnd` and
+    /// `Exists` do not consume this field. Variable- and zero-width `Span`
+    /// artifacts decline the dynamic-row entry.
+    pub(crate) exact_match_width: Option<usize>,
     pub(crate) artifact_identity: [u8; 32],
     /// Exact match-relative byte class selected from the Thompson graph.
     /// Target lowering may use it only while the authenticated cache is in
@@ -3469,7 +3486,11 @@ impl CompiledProgram {
     /// rows, source spelling, or source identities. Its optional exact byte
     /// class is derived solely from the Thompson graph.
     pub(crate) fn native_dynamic_rows_view(&self) -> Option<NativeDynamicRowsProgramView> {
-        if self.output != OutputContract::Exists
+        let output_supported = match self.output {
+            OutputContract::Exists | OutputContract::SelectedEnd => true,
+            OutputContract::Span => self.exact_match_width.is_some_and(|width| width != 0),
+        };
+        if !output_supported
             || self.context_dfa.is_some()
             || !matches!(self.engine, ProgramEngine::OrderedNfa)
             || self.automaton.stats().has_assertions()
@@ -3492,6 +3513,7 @@ impl CompiledProgram {
         };
         Some(NativeDynamicRowsProgramView {
             output: self.output,
+            exact_match_width: self.exact_match_width,
             artifact_identity: self.artifact_identity(),
             root_requirement,
         })
@@ -4493,19 +4515,23 @@ impl CompiledProgram {
                 "dynamic native-row workspace belongs to a different semantic program",
             ));
         }
-        if self.output != OutputContract::Exists
+        let output_supported = match self.output {
+            OutputContract::Exists | OutputContract::SelectedEnd => true,
+            OutputContract::Span => self.exact_match_width.is_some_and(|width| width != 0),
+        };
+        if !output_supported
             || self.context_dfa.is_some()
             || !matches!(self.engine, ProgramEngine::OrderedNfa)
             || self.automaton.stats().has_assertions()
             || self.nfa_mandatory_cut.is_some()
         {
             return Err(CompileError::InternalInvariant(
-                "dynamic native rows require assertion-free ordered-NFA existence output",
+                "dynamic native rows require assertion-free ordered-NFA endpoint output or positive fixed-width Span",
             ));
         }
 
         let input_bytes = window.end.saturating_sub(window.start);
-        let mut nullable = false;
+        let mut initial_pending = false;
         let mut enter = None;
         {
             let ProgramWorkspace {
@@ -4524,8 +4550,9 @@ impl CompiledProgram {
                     "dynamic native-row preflight has no prepared K0 workspace",
                 ))?;
                 if dynamic.refresh_native_rows(&self.automaton, nfa) {
-                    nullable = dynamic.native_rows.initial_flags & NATIVE_ROWS_INITIAL_PENDING != 0;
-                    if !nullable && dynamic.state.claim() {
+                    initial_pending =
+                        dynamic.native_rows.initial_flags & NATIVE_ROWS_INITIAL_PENDING != 0;
+                    if !initial_pending && dynamic.state.claim() {
                         enter = Some((
                             (&raw const dynamic.native_rows).expose_provenance(),
                             dynamic.native_rows.cache_identity,
@@ -4534,12 +4561,8 @@ impl CompiledProgram {
                 }
             }
         }
-        if nullable {
-            return Ok((
-                RetainedPartialPreflight::Complete(MatchResult::Exists(true)),
-                0,
-                0,
-            ));
+        if initial_pending && self.output == OutputContract::Exists {
+            return Ok((RetainedPartialPreflight::Complete(MatchResult::Exists(true)), 0, 0));
         }
         if let Some((native_rows_address, cache_identity)) = enter {
             return Ok((
@@ -7583,6 +7606,96 @@ mod tests {
         );
         assert_eq!(dynamic.native_rows.rows_address, 0);
         assert!(!dynamic.state.native_entry_in_flight);
+    }
+
+    #[test]
+    fn dynamic_native_rows_preserve_pending_selected_end_priority() {
+        let compiled = program(
+            "(?:ab|a)",
+            OutputContract::SelectedEnd,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        assert!(compiled.native_dynamic_rows_view().is_some());
+        let mut workspace = compiled.prepare_workspace().expect("prepared K0 workspace");
+        let mut haystack = vec![b'!'; 64];
+        haystack[..2].copy_from_slice(b"ab");
+        let window = SearchWindow::full(&haystack);
+        let identity = compiled.artifact_identity();
+
+        let (cold, address, cache_identity) = compiled
+            .preflight_dynamic_native_rows_with_workspace(
+                &haystack,
+                window,
+                &mut workspace,
+                identity,
+            )
+            .expect("cold selected-end preflight");
+        assert_eq!(
+            cold,
+            RetainedPartialPreflight::Complete(MatchResult::SelectedEnd(Some(2)))
+        );
+        assert_eq!((address, cache_identity), (0, 0));
+
+        let (warm, address, cache_identity) = compiled
+            .preflight_dynamic_native_rows_with_workspace(
+                &haystack,
+                window,
+                &mut workspace,
+                identity,
+            )
+            .expect("warm selected-end preflight");
+        assert_eq!(warm, RetainedPartialPreflight::Enter(window));
+        assert_ne!((address, cache_identity), (0, 0));
+        let dynamic = workspace.dynamic_native_rows.as_deref().unwrap();
+        assert_eq!(dynamic.native_rows.initial_flags, 0);
+        assert!(dynamic.state.native_entry_in_flight);
+    }
+
+    #[test]
+    fn dynamic_native_rows_decline_unsupported_endpoint_provenance() {
+        let compiled = program(
+            "[ab]*",
+            OutputContract::SelectedEnd,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        let mut workspace = compiled.prepare_workspace().expect("prepared K0 workspace");
+        let haystack = vec![b'x'; 64];
+        let window = SearchWindow::full(&haystack);
+        let (outcome, address, cache_identity) = compiled
+            .preflight_dynamic_native_rows_with_workspace(
+                &haystack,
+                window,
+                &mut workspace,
+                compiled.artifact_identity(),
+            )
+            .expect("nullable endpoint preflight");
+        assert!(
+            matches!(outcome, RetainedPartialPreflight::Complete(_)),
+            "SelectedEnd must remain in the ordinary executor"
+        );
+        assert_eq!((address, cache_identity), (0, 0));
+        assert!(
+            workspace
+                .dynamic_native_rows
+                .as_deref()
+                .is_some_and(|dynamic| !dynamic.state.native_entry_in_flight)
+        );
+
+        let variable_span = program(
+            "[ab]*",
+            OutputContract::Span,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        assert!(variable_span.native_dynamic_rows_view().is_none());
+        assert_eq!(
+            variable_span
+                .search(&haystack, window)
+                .expect("ordinary nullable Span search"),
+            MatchResult::Span(Some((0, 0)))
+        );
     }
 
     #[test]

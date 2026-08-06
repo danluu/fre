@@ -1288,11 +1288,18 @@ fn lower_native_dynamic_rows_prepared(
     view: NativeDynamicRowsProgramView,
     target: Target,
 ) -> Result<(NativeLowering, PreparedEntryLayout), ObjectError> {
-    if view.output != OutputContract::Exists {
-        return Err(ObjectError::InvalidModule(
-            "dynamic native rows currently require existence output",
-        ));
-    }
+    let exact_span_width = match (view.output, view.exact_match_width) {
+        (OutputContract::Exists | OutputContract::SelectedEnd, _) => None,
+        (OutputContract::Span, Some(width)) if width != 0 => Some(
+            u64::try_from(width)
+                .map_err(|_| ObjectError::ArithmeticOverflow("dynamic native Span width"))?,
+        ),
+        (OutputContract::Span, _) => {
+            return Err(ObjectError::InvalidModule(
+                "dynamic native Span requires a positive exact width",
+            ));
+        }
+    };
     let identity_offset =
         program_bytes
             .len()
@@ -1352,9 +1359,18 @@ fn lower_native_dynamic_rows_prepared(
     // represent this graph column.
     let prepared = match target.architecture {
         Architecture::X86_64 => {
-            lower_x86_64_dynamic_rows_prepared(root_filter, target.features)?
+            lower_x86_64_dynamic_rows_prepared_for_output(
+                root_filter,
+                target.features,
+                view.output,
+                exact_span_width,
+            )?
         }
-        Architecture::Aarch64 => lower_aarch64_dynamic_rows_prepared(aarch64_root_plan)?,
+        Architecture::Aarch64 => lower_aarch64_dynamic_rows_prepared_for_output(
+            aarch64_root_plan,
+            view.output,
+            exact_span_width,
+        )?,
     };
     if root_filter.is_some() != prepared.scanner.is_some() {
         return Err(ObjectError::InvalidModule(
@@ -10808,11 +10824,39 @@ fn lower_x86_64_runtime_adapter() -> Result<(Vec<u8>, Vec<ModuleRelocation>), Ob
     clippy::too_many_lines,
     reason = "the compile-time descriptor size assertion proves every encoded positive disp8 offset"
 )]
+#[cfg(test)]
 fn lower_x86_64_dynamic_rows_prepared(
     root_filter: Option<NativeStartFilter>,
     features: FeatureSet,
 ) -> Result<NativeDynamicRowsEmission, ObjectError> {
+    lower_x86_64_dynamic_rows_prepared_for_output(
+        root_filter,
+        features,
+        OutputContract::Exists,
+        None,
+    )
+}
+
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::too_many_lines,
+    reason = "the compile-time descriptor size assertion proves every encoded positive disp8 offset"
+)]
+fn lower_x86_64_dynamic_rows_prepared_for_output(
+    root_filter: Option<NativeStartFilter>,
+    features: FeatureSet,
+    output: OutputContract,
+    exact_span_width: Option<u64>,
+) -> Result<NativeDynamicRowsEmission, ObjectError> {
     const FRAME_BYTES: u8 = 104;
+    if (output == OutputContract::Span) != exact_span_width.is_some()
+        || exact_span_width == Some(0)
+    {
+        return Err(ObjectError::InvalidModule(
+            "x86 dynamic rows have an inconsistent exact Span width",
+        ));
+    }
     if root_filter.is_some_and(|filter| {
         filter.ranges().is_empty() || !filter.from_anchored_prefix
     }) {
@@ -10835,6 +10879,9 @@ fn lower_x86_64_dynamic_rows_prepared(
     let root_scalar_reject = root_filter.map(|_| assembler.label()).transpose()?;
     let native_match = assembler.label()?;
     let native_no_match = assembler.label()?;
+    let native_complete = (output != OutputContract::Exists)
+        .then(|| assembler.label())
+        .transpose()?;
     let framed_fallback = assembler.label()?;
     let short_fallback = assembler.label()?;
 
@@ -10925,11 +10972,20 @@ fn lower_x86_64_dynamic_rows_prepared(
         x86_emit_start_filter_constants(&mut assembler, filter, kind, 1)?;
         assembler.instruction(&[0x41, 0x8b, 0x43, NATIVE_ROWS_LOOP_COUNT as u8])?;
     }
+    if output != OutputContract::Exists {
+        // A non-nullable admitted descriptor has no pending endpoint yet.
+        // The final unused frame word retains it across vector/scalar root
+        // retries and direct-row transitions without consuming a hot GPR.
+        assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x60, 0, 0, 0, 0])?;
+    }
 
     let loop_rows_checked = root_filter.map(|_| assembler.label()).transpose()?;
     assembler.bind(scan)?;
     assembler.instruction(&[0x48, 0x39, 0xca])?;
-    assembler.branch(&[0x0f, 0x83], native_no_match)?;
+    assembler.branch(
+        &[0x0f, 0x83],
+        native_complete.unwrap_or(native_no_match),
+    )?;
     // The graph scanner independently owns the restartable initial-row skip,
     // including when K0 has also learned a loop overlay for that row. A hit
     // enters the canonical direct cell once; only non-root learned rows remain
@@ -10939,12 +10995,19 @@ fn lower_x86_64_dynamic_rows_prepared(
             "x86 dynamic loop ownership label is absent",
         ))?;
         assembler.instruction(&[0x45, 0x3b, 0x43, NATIVE_ROWS_INITIAL_ROW as u8])?;
-        assembler.branch(
-            &[0x0f, 0x84],
-            root_vector.ok_or(ObjectError::InvalidModule(
-                "x86 dynamic root vector label is absent",
-            ))?,
-        )?;
+        let root_vector = root_vector.ok_or(ObjectError::InvalidModule(
+            "x86 dynamic root vector label is absent",
+        ))?;
+        if output == OutputContract::Exists {
+            assembler.branch(&[0x0f, 0x84], root_vector)?;
+        } else {
+            let non_root = assembler.label()?;
+            assembler.branch(&[0x0f, 0x85], non_root)?;
+            assembler.instruction(&[0x48, 0x83, 0x7c, 0x24, 0x60, 0])?;
+            assembler.branch(&[0x0f, 0x85], table_scan)?;
+            assembler.branch(&[0xe9], root_vector)?;
+            assembler.bind(non_root)?;
+        }
         // Canonical K0 owns every published learned-loop row. Check only the
         // authenticated live prefix and side-exit before consuming its first
         // byte. The root scanner branched above, so these are non-root plans;
@@ -10981,10 +11044,20 @@ fn lower_x86_64_dynamic_rows_prepared(
     assembler.branch(&[0x0f, 0x84], framed_fallback)?;
     assembler.instruction(&[0x48, 0xff, 0xc2])?;
     assembler.instruction(&[0x45, 0x85, 0x53, NATIVE_ROWS_ACCEPT_MASK as u8])?;
-    assembler.branch(&[0x0f, 0x85], native_match)?;
+    if output == OutputContract::Exists {
+        assembler.branch(&[0x0f, 0x85], native_match)?;
+    } else {
+        let not_accepting = assembler.label()?;
+        assembler.branch(&[0x0f, 0x84], not_accepting)?;
+        assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x60])?;
+        assembler.bind(not_accepting)?;
+    }
     assembler.instruction(&[0x45, 0x23, 0x53, NATIVE_ROWS_NEXT_ROW_TOKEN_MASK as u8])?;
     assembler.instruction(&[0x45, 0x85, 0xd2])?;
-    assembler.branch(&[0x0f, 0x84], native_no_match)?;
+    assembler.branch(
+        &[0x0f, 0x84],
+        native_complete.unwrap_or(native_no_match),
+    )?;
     assembler.instruction(&[0x45, 0x89, 0xd0])?;
     assembler.instruction(&[0x41, 0xff, 0xc8])?;
     assembler.branch(&[0xe9], scan)?;
@@ -11037,6 +11110,14 @@ fn lower_x86_64_dynamic_rows_prepared(
         assembler.branch(&[0xe9], scalar)?;
     }
 
+    if let Some(native_complete) = native_complete {
+        assembler.bind(native_complete)?;
+        assembler.instruction(&[0x4c, 0x8b, 0x5c, 0x24, 0x60])?;
+        assembler.instruction(&[0x4d, 0x85, 0xdb])?;
+        assembler.branch(&[0x0f, 0x84], native_no_match)?;
+        assembler.branch(&[0xe9], native_match)?;
+    }
+
     assembler.bind(native_no_match)?;
     if filter_kind.is_some_and(X86StartFilterKind::needs_vzeroupper) {
         assembler.instruction(&[0xc5, 0xf8, 0x77])?;
@@ -11052,10 +11133,28 @@ fn lower_x86_64_dynamic_rows_prepared(
     if filter_kind.is_some_and(X86StartFilterKind::needs_vzeroupper) {
         assembler.instruction(&[0xc5, 0xf8, 0x77])?;
     }
-    assembler.instruction(&[0x31, 0xc0])?;
     assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x38])?;
-    assembler.instruction(&[0x49, 0x89, 0x01])?;
-    assembler.instruction(&[0x49, 0x89, 0x41, 0x08])?;
+    match output {
+        OutputContract::Exists => {
+            assembler.instruction(&[0x31, 0xc0])?;
+            assembler.instruction(&[0x49, 0x89, 0x01])?;
+            assembler.instruction(&[0x49, 0x89, 0x41, 0x08])?;
+        }
+        OutputContract::SelectedEnd => {
+            assembler.instruction(&[0x4d, 0x89, 0x19])?;
+            assembler.instruction(&[0x4d, 0x89, 0x59, 0x08])?;
+        }
+        OutputContract::Span => {
+            x86_emit_exact_span_start(
+                &mut assembler,
+                exact_span_width.ok_or(ObjectError::InvalidModule(
+                    "x86 dynamic Span has no exact width",
+                ))?,
+            )?;
+            assembler.instruction(&[0x49, 0x89, 0x01])?;
+            assembler.instruction(&[0x4d, 0x89, 0x59, 0x08])?;
+        }
+    }
     assembler.instruction(&[0xb8, 1, 0, 0, 0])?;
     assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
     assembler.instruction(&[0xc3])?;
@@ -16936,10 +17035,30 @@ fn lower_aarch64_runtime_adapter() -> Result<(Vec<u8>, Vec<ModuleRelocation>), O
     clippy::too_many_lines,
     reason = "the authenticated preflight, scanner, local exits, and whole-search deopt form one ABI transaction"
 )]
+#[cfg(test)]
 fn lower_aarch64_dynamic_rows_prepared(
     root_plan: Option<Aarch64DynamicRootPlan>,
 ) -> Result<NativeDynamicRowsEmission, ObjectError> {
+    lower_aarch64_dynamic_rows_prepared_for_output(root_plan, OutputContract::Exists, None)
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the authenticated preflight, scanner, local exits, and whole-search deopt form one ABI transaction"
+)]
+fn lower_aarch64_dynamic_rows_prepared_for_output(
+    root_plan: Option<Aarch64DynamicRootPlan>,
+    output: OutputContract,
+    exact_span_width: Option<u64>,
+) -> Result<NativeDynamicRowsEmission, ObjectError> {
     const FRAME_BYTES: u16 = 96;
+    if (output == OutputContract::Span) != exact_span_width.is_some()
+        || exact_span_width == Some(0)
+    {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 dynamic rows have an inconsistent exact Span width",
+        ));
+    }
     let mut assembler = Aarch64Assembler::new();
     let preflight_enter = assembler.label()?;
     let scan = assembler.label()?;
@@ -16969,6 +17088,9 @@ fn lower_aarch64_dynamic_rows_prepared(
     let root_scalar_reject = root_plan.map(|_| assembler.label()).transpose()?;
     let native_match = assembler.label()?;
     let native_no_match = assembler.label()?;
+    let native_complete = (output != OutputContract::Exists)
+        .then(|| assembler.label())
+        .transpose()?;
     let framed_fallback = assembler.label()?;
     let short_fallback = assembler.label()?;
 
@@ -17144,21 +17266,38 @@ fn lower_aarch64_dynamic_rows_prepared(
             )?)?;
         }
     }
+    if output != OutputContract::Exists {
+        // The post-preflight setup has either materialized the identity-backed
+        // table base in X5 or no longer needs the saved identity address.
+        // Reuse its spare frame word as the pending selected endpoint.
+        assembler.instruction(aarch64_store_x(31, 31, 80)?)?;
+    }
 
     assembler.bind(scan)?;
     assembler.instruction(aarch64_cmp_x(2, 3)?)?;
-    assembler.branch_cond(AARCH64_HS, native_no_match)?;
+    assembler.branch_cond(
+        AARCH64_HS,
+        native_complete.unwrap_or(native_no_match),
+    )?;
     if root_plan.is_some() {
         // The graph scanner owns the initial row even when K0 publishes a
         // learned-loop overlay for that same row. Every non-root learned row
         // remains K0-owned and deopts before consuming its first byte.
         assembler.instruction(aarch64_cmp_w(11, 1)?)?;
-        assembler.branch_cond(
-            AARCH64_EQ,
-            root_dispatch.ok_or(ObjectError::InvalidModule(
-                "AArch64 dynamic root dispatch is absent",
-            ))?,
-        )?;
+        let root_dispatch = root_dispatch.ok_or(ObjectError::InvalidModule(
+            "AArch64 dynamic root dispatch is absent",
+        ))?;
+        if output == OutputContract::Exists {
+            assembler.branch_cond(AARCH64_EQ, root_dispatch)?;
+        } else {
+            let non_root = assembler.label()?;
+            assembler.branch_cond(AARCH64_NE, non_root)?;
+            assembler.instruction(aarch64_load_x_imm(8, 31, 80)?)?;
+            assembler.instruction(aarch64_cmp_x_imm(8, 0)?)?;
+            assembler.branch_cond(AARCH64_NE, table_scan)?;
+            assembler.branch(root_dispatch)?;
+            assembler.bind(non_root)?;
+        }
         assembler.instruction(aarch64_load_w_imm(
             10,
             13,
@@ -17196,9 +17335,16 @@ fn lower_aarch64_dynamic_rows_prepared(
     assembler.branch_cond(AARCH64_EQ, framed_fallback)?;
     assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
     assembler.instruction(aarch64_tst_w(8, 7)?)?;
-    assembler.branch_cond(AARCH64_NE, native_match)?;
+    if output == OutputContract::Exists {
+        assembler.branch_cond(AARCH64_NE, native_match)?;
+    } else {
+        let not_accepting = assembler.label()?;
+        assembler.branch_cond(AARCH64_EQ, not_accepting)?;
+        assembler.instruction(aarch64_store_x(2, 31, 80)?)?;
+        assembler.bind(not_accepting)?;
+    }
     assembler.instruction(aarch64_and_w(8, 8, 9)?)?;
-    assembler.branch_zero_w(8, native_no_match)?;
+    assembler.branch_zero_w(8, native_complete.unwrap_or(native_no_match))?;
     assembler.instruction(aarch64_sub_w_imm(11, 8, 1)?)?;
     assembler.branch(scan)?;
 
@@ -17351,6 +17497,14 @@ fn lower_aarch64_dynamic_rows_prepared(
         assembler.branch(scalar)?;
     }
 
+    if let Some(native_complete) = native_complete {
+        assembler.bind(native_complete)?;
+        assembler.instruction(aarch64_load_x_imm(7, 31, 80)?)?;
+        assembler.instruction(aarch64_cmp_x_imm(7, 0)?)?;
+        assembler.branch_cond(AARCH64_EQ, native_no_match)?;
+        assembler.branch(native_match)?;
+    }
+
     assembler.bind(native_no_match)?;
     assembler.instruction(aarch64_movz_w(0, 0)?)?;
     assembler.instruction(aarch64_load_x_imm(5, 31, 40)?)?;
@@ -17362,8 +17516,26 @@ fn lower_aarch64_dynamic_rows_prepared(
 
     assembler.bind(native_match)?;
     assembler.instruction(aarch64_load_x_imm(5, 31, 40)?)?;
-    assembler.instruction(aarch64_store_x(31, 5, 0)?)?;
-    assembler.instruction(aarch64_store_x(31, 5, 8)?)?;
+    match output {
+        OutputContract::Exists => {
+            assembler.instruction(aarch64_store_x(31, 5, 0)?)?;
+            assembler.instruction(aarch64_store_x(31, 5, 8)?)?;
+        }
+        OutputContract::SelectedEnd => {
+            assembler.instruction(aarch64_store_x(7, 5, 0)?)?;
+            assembler.instruction(aarch64_store_x(7, 5, 8)?)?;
+        }
+        OutputContract::Span => {
+            aarch64_emit_exact_span_start(
+                &mut assembler,
+                exact_span_width.ok_or(ObjectError::InvalidModule(
+                    "AArch64 dynamic Span has no exact width",
+                ))?,
+            )?;
+            assembler.instruction(aarch64_store_x(6, 5, 0)?)?;
+            assembler.instruction(aarch64_store_x(7, 5, 8)?)?;
+        }
+    }
     assembler.instruction(aarch64_movz_w(0, 1)?)?;
     assembler.instruction(aarch64_load_x_imm(30, 31, 88)?)?;
     assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
@@ -20500,7 +20672,7 @@ mod tests {
                 assert!(compiled.program().native_partial_dfa_view().is_none());
                 assert_eq!(
                     compiled.module().prepared_entry_symbol().is_some(),
-                    output == OutputContract::Exists && !direct,
+                    output != OutputContract::Span && !direct,
                     "{target:?}/{output:?} dynamic fallback publication"
                 );
                 if direct {
@@ -20517,9 +20689,7 @@ mod tests {
                         compiled.module().start_accelerator(),
                         StartAccelerator::None | StartAccelerator::Scalar
                     ));
-                } else if output == OutputContract::Exists
-                    && compiled.program().native_dynamic_rows_view().is_some()
-                {
+                } else if compiled.program().native_dynamic_rows_view().is_some() {
                     assert_eq!(
                         compiled.module().start_accelerator(),
                         StartAccelerator::Scalar,
@@ -21364,6 +21534,58 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_endpoint_contracts_lower_on_every_target_when_graph_proved() {
+        let zero_rows = CompileLimitsV1 {
+            determinize: DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+            ..CompileLimitsV1::default()
+        };
+        for target in identity_target_matrix() {
+            let selected = compile(
+                CompileRequest::new("(?:ab|ac)+z", target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::SelectedEnd)
+                    .limits(zero_rows),
+            )
+            .unwrap_or_else(|error| panic!("dynamic SelectedEnd {target:?}: {error}"));
+            let selected_view = selected
+                .program()
+                .native_dynamic_rows_view()
+                .expect("SelectedEnd dynamic graph view");
+            assert_eq!(selected_view.output, OutputContract::SelectedEnd);
+            assert_eq!(selected_view.exact_match_width, None);
+            assert!(selected.module().prepared_entry_symbol().is_some());
+
+            // Fast mode deliberately freezes the general ordered NFA. The
+            // exact-width graph proof remains available even though the
+            // optimizing exact-product sidecar was not requested.
+            let span = compile(
+                CompileRequest::new("(?:ab|ac)", target)
+                    .mode(CompileMode::Fast)
+                    .output(OutputContract::Span),
+            )
+            .unwrap_or_else(|error| panic!("dynamic fixed Span {target:?}: {error}"));
+            let span_view = span
+                .program()
+                .native_dynamic_rows_view()
+                .expect("fixed Span dynamic graph view");
+            assert_eq!(span_view.output, OutputContract::Span);
+            assert_eq!(span_view.exact_match_width, Some(2));
+            assert!(span.module().prepared_entry_symbol().is_some());
+
+            let variable = compile(
+                CompileRequest::new("(?:ab|ac)+", target)
+                    .mode(CompileMode::Fast)
+                    .output(OutputContract::Span),
+            )
+            .unwrap_or_else(|error| panic!("variable Span {target:?}: {error}"));
+            assert!(variable.program().native_dynamic_rows_view().is_none());
+        }
+    }
+
+    #[test]
     fn dynamic_root_filter_planning_is_exact_and_declines_unsupported_shapes() {
         fn membership(bytes: impl IntoIterator<Item = u8>) -> [u64; 4] {
             let mut words = [0_u64; 4];
@@ -21537,6 +21759,108 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_endpoint_pending_storage_survives_every_vector_tier_and_exit() {
+        fn byte_occurrences(code: &[u8], needle: &[u8]) -> usize {
+            code.windows(needle.len())
+                .filter(|window| *window == needle)
+                .count()
+        }
+
+        let filter = dynamic_root_test_filter(b"a", 1);
+        let avx512 = FeatureSet::of(CpuFeature::X86Avx512F)
+            .with(CpuFeature::X86Avx512Bw)
+            .with(CpuFeature::X86Avx512Vl);
+        for features in [FeatureSet::of(CpuFeature::X86Avx2), avx512] {
+            for (output, width) in [
+                (OutputContract::SelectedEnd, None),
+                (OutputContract::Span, Some(2)),
+            ] {
+                let code = lower_x86_64_dynamic_rows_prepared_for_output(
+                    Some(filter),
+                    features,
+                    output,
+                    width,
+                )
+                .unwrap()
+                .code;
+                assert_eq!(
+                    byte_occurrences(&code, &[0x48, 0xc7, 0x44, 0x24, 0x60, 0, 0, 0, 0]),
+                    1
+                );
+                assert_eq!(
+                    byte_occurrences(&code, &[0x48, 0x89, 0x54, 0x24, 0x60]),
+                    1
+                );
+                assert_eq!(
+                    byte_occurrences(&code, &[0x4c, 0x8b, 0x5c, 0x24, 0x60]),
+                    1
+                );
+                assert_eq!(
+                    byte_occurrences(&code, &[0xc5, 0xf8, 0x77]),
+                    3,
+                    "match, no-match, and deopt exits must clean vector state: {features:?}/{output:?}"
+                );
+            }
+        }
+
+        let arm_targets = [
+            Target::aarch64_macos()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                .unwrap(),
+            Target::aarch64_linux()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Sve))
+                .unwrap(),
+            Target::aarch64_linux()
+                .with_features(
+                    FeatureSet::of(CpuFeature::Aarch64Sve).with(CpuFeature::Aarch64Sve2),
+                )
+                .unwrap(),
+            Target::aarch64_linux()
+                .with_features(
+                    FeatureSet::of(CpuFeature::Aarch64Asimd)
+                        .with(CpuFeature::Aarch64Sve)
+                        .with(CpuFeature::Aarch64Sve2),
+                )
+                .unwrap(),
+        ];
+        for target in arm_targets {
+            let mut data = vec![0_u8; 32];
+            let plan = install_aarch64_dynamic_root_plan(&mut data, 0, filter, target).unwrap();
+            for (output, width) in [
+                (OutputContract::SelectedEnd, None),
+                (OutputContract::Span, Some(2)),
+            ] {
+                let words = lower_aarch64_dynamic_rows_prepared_for_output(
+                    Some(plan),
+                    output,
+                    width,
+                )
+                .unwrap()
+                .code
+                .chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>();
+                for (instruction, expected, detail) in [
+                    (aarch64_store_x(31, 31, 80).unwrap(), 1, "pending initialization"),
+                    (aarch64_store_x(2, 31, 80).unwrap(), 1, "pending update"),
+                    (aarch64_load_x_imm(7, 31, 80).unwrap(), 1, "pending completion"),
+                    (
+                        aarch64_add_x_imm(31, 31, 96).unwrap(),
+                        4,
+                        "all framed exits",
+                    ),
+                ] {
+                    assert_eq!(
+                        words.iter().filter(|&&word| word == instruction).count(),
+                        expected,
+                        "{target:?}/{output:?}: {detail}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn fast_mode_publishes_general_dynamic_exists_entry_on_every_target() {
         for target in identity_target_matrix() {
             let compiled = compile(
@@ -21601,6 +21925,28 @@ mod tests {
         target: Target,
         expected_accelerator: StartAccelerator,
     ) {
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            linked_dynamic_rows_entry_for_output(target, expected_accelerator, output);
+        }
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the opt-in linked transaction fixture keeps its complete C ABI oracle together"
+    )]
+    fn linked_dynamic_rows_entry_for_output(
+        target: Target,
+        expected_accelerator: StartAccelerator,
+        output: OutputContract,
+    ) {
         use std::{fs, process::Command};
 
         let limits = CompileLimitsV1 {
@@ -21610,10 +21956,15 @@ mod tests {
             },
             ..CompileLimitsV1::default()
         };
+        let (pattern, mode) = if output == OutputContract::Span {
+            ("(?:ab|ac)", CompileMode::Fast)
+        } else {
+            ("(?:ab|ac)+z", CompileMode::Optimizing)
+        };
         let compiled = compile(
-            CompileRequest::new("(?:ab|ac)+z", target)
-                .mode(CompileMode::Optimizing)
-                .output(OutputContract::Exists)
+            CompileRequest::new(pattern, target)
+                .mode(mode)
+                .output(output)
                 .limits(limits),
         )
         .expect("host dynamic-row object");
@@ -21642,7 +21993,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join(",");
         let directory = std::env::temp_dir().join(format!(
-            "fre-aot-dynamic-rows-{}-{:016x}",
+            "fre-aot-dynamic-rows-{}-{:016x}-{output:?}",
             std::process::id(),
             target.features.bits(),
         ));
@@ -21651,10 +22002,50 @@ mod tests {
         let c_path = directory.join("dynamic.c");
         let executable = directory.join("dynamic");
         fs::write(&object, compiled.object()).expect("write dynamic object");
-        let initial_loop_assertion =
-            "if(status!=1||r.start!=0||r.end!=0||fallback_calls!=0||deopt_calls!=0||preflight_calls!=1)return 19;";
+        let (match_start, match_end) = match output {
+            OutputContract::Exists => (0, 0),
+            OutputContract::SelectedEnd => (7, 7),
+            OutputContract::Span => (5, 7),
+        };
+        let first_match_cell = if output == OutputContract::SelectedEnd {
+            "(UINT32_C(0x80000000)|2)"
+        } else {
+            "2"
+        };
+        let pending_deopt_cell = if output == OutputContract::Exists {
+            "2"
+        } else {
+            "(UINT32_C(0x80000000)|2)"
+        };
+        let initial_loop_assertion = format!(
+            "if(status!=1||r.start!={match_start}||r.end!={match_end}||fallback_calls!=0||deopt_calls!=0||preflight_calls!=1)return 19;"
+        );
+        let exhaustive_selected = if output == OutputContract::SelectedEnd {
+            format!(
+                r"
+  for(uint32_t left=0;left<6;left++)for(uint32_t right=0;right<6;right++){{
+    init_rows();mode=12;
+    cells[0]=((left>=3)?UINT32_C(0x80000000):0)|(left%3);
+    cells[1]=((right>=3)?UINT32_C(0x80000000):0)|(right%3);
+    size_t position=5,pending=0;uint32_t state=0;
+    while(position<69){{
+      uint32_t cell=cells[state];position++;
+      if((cell&UINT32_C(0x80000000))!=0)pending=position;
+      uint32_t next=cell&UINT32_C(0x7fffffff);
+      if(next==0)break;
+      state=next-1;
+    }}
+    r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;
+    status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,69,&r);
+    if(status!=(pending?1u:0u)||r.start!=pending||r.end!=pending||fallback_calls!=0||deopt_calls!=0||preflight_calls!=1)return 22;
+  }}
+"
+            )
+        } else {
+            String::new()
+        };
         let source = format!(
-            r#"#include <stddef.h>
+            r"#include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 typedef void *handle_t;
@@ -21678,6 +22069,7 @@ static rows_t rows;
 static int mode, preflight_calls, fallback_calls, deopt_calls;
 static void init_rows(void) {{
   memset(haystack,'a',sizeof(haystack));
+  memset(cells,0,sizeof(cells));
   memset(&rows,0,sizeof(rows));
   rows.rows_address=(size_t)(uintptr_t)cells;
   rows.class_map_address=(size_t)(uintptr_t)classes;
@@ -21714,9 +22106,9 @@ int main(void) {{
   if(status!=77||r.start!=123||r.end!=456||fallback_calls!=1||deopt_calls!=0||preflight_calls!=0)return 10;
   mode=2;r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,69,&r);
   if(status!=76||r.start!=321||r.end!=654||fallback_calls!=0||deopt_calls!=0||preflight_calls!=1)return 11;
-  mode=3;cells[0]=UINT32_C(0x80000000);r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,69,&r);
-  if(status!=1||r.start!=0||r.end!=0||fallback_calls!=0||deopt_calls!=0||preflight_calls!=1)return 12;
-  mode=4;cells[0]=0;r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,69,&r);
+  mode=3;cells[0]={first_match_cell};cells[1]=UINT32_C(0x80000000);r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,69,&r);
+  if(status!=1||r.start!={match_start}||r.end!={match_end}||fallback_calls!=0||deopt_calls!=0||preflight_calls!=1)return 12;
+  mode=4;cells[0]=0;cells[1]=0;r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,69,&r);
   if(status!=0||r.start!=0||r.end!=0||fallback_calls!=0||deopt_calls!=0||preflight_calls!=1)return 13;
   mode=5;cells[0]=UINT32_MAX;r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,69,&r);
   if(status!=77||r.start!=123||r.end!=456||fallback_calls!=0||deopt_calls!=1||preflight_calls!=1)return 14;
@@ -21726,17 +22118,18 @@ int main(void) {{
   if(status!=77||r.start!=123||r.end!=456||fallback_calls!=0||deopt_calls!=1||preflight_calls!=1)return 16;
   init_rows();mode=8;cells[0]=2;cells[1]=2;r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,69,&r);
   if(status!=0||r.start!=0||r.end!=0||fallback_calls!=0||deopt_calls!=0||preflight_calls!=1)return 18;
-  init_rows();mode=9;rows.learned_loop_row_count=1;rows.learned_loop_rows[0]=0;cells[0]=UINT32_C(0x80000000);r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,69,&r);
+  init_rows();mode=9;rows.learned_loop_row_count=1;rows.learned_loop_rows[0]=0;cells[0]=2;cells[1]=UINT32_C(0x80000000);r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,69,&r);
   {initial_loop_assertion}
-  init_rows();mode=10;rows.learned_loop_row_count=1;rows.learned_loop_rows[0]=1;cells[0]=2;cells[1]=UINT32_C(0x80000000);r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,69,&r);
+  init_rows();mode=10;rows.learned_loop_row_count=1;rows.learned_loop_rows[0]=1;cells[0]={pending_deopt_cell};cells[1]=UINT32_C(0x80000000);r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,69,&r);
   if(status!=77||r.start!=123||r.end!=456||fallback_calls!=0||deopt_calls!=1||preflight_calls!=1)return 20;
   init_rows();mode=11;rows.learned_loop_row_count=5;r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,69,&r);
   if(status!=77||r.start!=123||r.end!=456||fallback_calls!=0||deopt_calls!=1||preflight_calls!=1)return 21;
   mode=0;rows.initial_flags=0;r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}(NULL,haystack,sizeof(haystack),5,69,&r);
   if(status!=5||r.start!=91||r.end!=92||fallback_calls!=0||deopt_calls!=0||preflight_calls!=1)return 17;
+  {exhaustive_selected}
   return 0;
 }}
-"#,
+",
         );
         fs::write(&c_path, source).expect("write dynamic C harness");
         let c_compiler = if cfg!(target_os = "macos") {
@@ -21913,11 +22306,9 @@ int main(void) {{
             assert!(partial.resume_frontiers > 0);
             assert!(compiled.receipt().runtime_helper_required);
             assert!(compiled.module().required_runtime_symbol().is_some());
-            let target_has_mandatory_scanner = target.architecture == Architecture::X86_64;
-            assert_eq!(
+            assert!(
                 compiled.module().prepared_entry_symbol().is_some(),
-                target_has_mandatory_scanner,
-                "selective retained root publication must follow the exact SIMD receipt: {target:?}"
+                "SelectedEnd must retain its general dynamic-row fallback: {target:?}"
             );
         }
     }
