@@ -26,9 +26,11 @@ use crate::{
     },
     prefix_relation::{self, PrefixRelation},
     program::{
-        AnchoredByteSet, CompiledProgram, MAX_ANCHORED_PREFIX_BYTES, NativeContextProgramView,
-        NativePartialProgramView, NativeProgramView, NativeRetainedPrefixRequirement,
-        NativeRetainedSuffixRequirement, OutputContract, PARTIAL_DFA_MIN_INPUT_BYTES,
+        AnchoredByteSet, CompiledProgram, DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES,
+        DynamicNativeRowsV1, MAX_ANCHORED_PREFIX_BYTES, NativeContextProgramView,
+        NativeDynamicRowsProgramView, NativePartialProgramView, NativeProgramView,
+        NativeRetainedPrefixRequirement, NativeRetainedSuffixRequirement, OutputContract,
+        PARTIAL_DFA_MIN_INPUT_BYTES,
     },
     required_literals::{MaximumConsumedDistance, RequiredInteriorCandidate, RequiredLiteralSet},
     seeded_reverse::{
@@ -626,6 +628,8 @@ const PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_search_exclusive_v1";
 const PREPARED_PREFLIGHT_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_search_exclusive_partial_preflight_v1";
+const DYNAMIC_ROWS_PREFLIGHT_RUNTIME_SYMBOL_NAME: &str =
+    "fre_aot_regex_runtime_search_exclusive_dynamic_rows_preflight_v1";
 const PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_search_exclusive_recover_partial_span_v1";
 const ENTRY_SYMBOL_PREFIX: &str = "fre_aot_regex_search_v1_";
@@ -640,6 +644,30 @@ const PARTIAL_CELL_DEAD: u32 = PARTIAL_CELL_ACCEPTED - 1;
 const PARTIAL_PREFLIGHT_ENTER_STATUS: u8 = 6;
 const NATIVE_PARTIAL_STATUS_RESUME: u32 = 3;
 const NATIVE_PARTIAL_STATUS_SELECTED_END: u32 = 4;
+
+const NATIVE_ROWS_ROWS_ADDRESS: usize =
+    core::mem::offset_of!(DynamicNativeRowsV1, rows_address);
+const NATIVE_ROWS_CLASS_MAP_ADDRESS: usize =
+    core::mem::offset_of!(DynamicNativeRowsV1, class_map_address);
+const NATIVE_ROWS_LIVE_CELLS: usize =
+    core::mem::offset_of!(DynamicNativeRowsV1, live_cells);
+const NATIVE_ROWS_ROW_STRIDE: usize =
+    core::mem::offset_of!(DynamicNativeRowsV1, row_stride);
+const NATIVE_ROWS_UNFILLED_CELL: usize =
+    core::mem::offset_of!(DynamicNativeRowsV1, unfilled_cell);
+const NATIVE_ROWS_ACCEPT_MASK: usize =
+    core::mem::offset_of!(DynamicNativeRowsV1, accept_mask);
+const NATIVE_ROWS_NEXT_ROW_TOKEN_MASK: usize =
+    core::mem::offset_of!(DynamicNativeRowsV1, next_row_token_mask);
+const NATIVE_ROWS_CACHE_IDENTITY: usize =
+    core::mem::offset_of!(DynamicNativeRowsV1, cache_identity);
+const NATIVE_ROWS_LOOP_COUNT: usize =
+    core::mem::offset_of!(DynamicNativeRowsV1, learned_loop_row_count);
+const NATIVE_ROWS_INITIAL_ROW: usize =
+    core::mem::offset_of!(DynamicNativeRowsV1, initial_row);
+const NATIVE_ROWS_INITIAL_FLAGS: usize =
+    core::mem::offset_of!(DynamicNativeRowsV1, initial_flags);
+const _: () = assert!(core::mem::size_of::<DynamicNativeRowsV1>() <= 127);
 
 struct NativeLowering {
     code: Vec<u8>,
@@ -660,6 +688,7 @@ struct PreparedEntryLayout {
     table_size: usize,
     identity_offset: usize,
     span_recovery: bool,
+    dynamic_rows: bool,
 }
 
 impl CompiledModule {
@@ -686,8 +715,16 @@ impl CompiledModule {
             .or_else(|| program.native_exact_product_view());
         let native_context = program.native_context_program_view();
         let native_partial = program.native_partial_dfa_view();
-        Self::lower_serialized(program_bytes, native, native_context, native_partial, target)
-            .map_err(CompileError::from)
+        let native_dynamic_rows = program.native_dynamic_rows_view();
+        Self::lower_serialized(
+            program_bytes,
+            native,
+            native_context,
+            native_partial,
+            native_dynamic_rows,
+            target,
+        )
+        .map_err(CompileError::from)
     }
 
     #[allow(
@@ -699,6 +736,7 @@ impl CompiledModule {
         native: Option<NativeProgramView<'_>>,
         native_context: Option<NativeContextProgramView<'_>>,
         native_partial: Option<NativePartialProgramView<'_>>,
+        native_dynamic_rows: Option<NativeDynamicRowsProgramView>,
         target: Target,
     ) -> Result<Self, ObjectError> {
         let serialized_program_size = program_bytes.len();
@@ -708,6 +746,11 @@ impl CompiledModule {
             if let Some(lowering) = lower_native_dfa(view, target)? {
                 let native_digest = native_module_digest(&program_bytes, target, &lowering)?;
                 (lowering, native_digest, None)
+            } else if let Some(dynamic) = native_dynamic_rows {
+                let (lowering, prepared_layout) =
+                    lower_native_dynamic_rows_prepared(program_bytes.clone(), dynamic, target)?;
+                let native_digest = native_module_digest(&lowering.data, target, &lowering)?;
+                (lowering, native_digest, Some(prepared_layout))
             } else {
                 let lowering = lower_runtime_adapter(program_bytes, target.architecture)?;
                 let native_digest = native_module_digest(&lowering.data, target, &lowering)?;
@@ -723,11 +766,21 @@ impl CompiledModule {
             {
                 let native_digest = native_module_digest(&lowering.data, target, &lowering)?;
                 (lowering, native_digest, Some(prepared_layout))
+            } else if let Some(dynamic) = native_dynamic_rows {
+                let (lowering, prepared_layout) =
+                    lower_native_dynamic_rows_prepared(program_bytes.clone(), dynamic, target)?;
+                let native_digest = native_module_digest(&lowering.data, target, &lowering)?;
+                (lowering, native_digest, Some(prepared_layout))
             } else {
                 let lowering = lower_runtime_adapter(program_bytes, target.architecture)?;
                 let native_digest = native_module_digest(&lowering.data, target, &lowering)?;
                 (lowering, native_digest, None)
             }
+        } else if let Some(dynamic) = native_dynamic_rows {
+            let (lowering, prepared_layout) =
+                lower_native_dynamic_rows_prepared(program_bytes.clone(), dynamic, target)?;
+            let native_digest = native_module_digest(&lowering.data, target, &lowering)?;
+            (lowering, native_digest, Some(prepared_layout))
         } else {
             let lowering = lower_runtime_adapter(program_bytes, target.architecture)?;
             let native_digest = native_module_digest(&lowering.data, target, &lowering)?;
@@ -894,7 +947,12 @@ impl CompiledModule {
                 size: 0,
             });
             symbols.push(ModuleSymbol {
-                name: PREPARED_PREFLIGHT_RUNTIME_SYMBOL_NAME.to_owned(),
+                name: if prepared.dynamic_rows {
+                    DYNAMIC_ROWS_PREFLIGHT_RUNTIME_SYMBOL_NAME
+                } else {
+                    PREPARED_PREFLIGHT_RUNTIME_SYMBOL_NAME
+                }
+                .to_owned(),
                 binding: SymbolBinding::Global,
                 kind: SymbolKind::Function,
                 section: None,
@@ -965,8 +1023,8 @@ impl CompiledModule {
         &self.symbols[self.entry_symbol_index].name
     }
 
-    /// Return the additive exclusive-handle entry when authenticated
-    /// incomplete retained rows were lowered into this module.
+    /// Return the additive exclusive-handle entry when authenticated static
+    /// or dynamically warmed rows were lowered into this module.
     #[must_use]
     pub fn prepared_entry_symbol(&self) -> Option<&str> {
         self.prepared_entry_symbol_index
@@ -974,19 +1032,26 @@ impl CompiledModule {
             .map(|symbol| symbol.name.as_str())
     }
 
-    /// Return the authenticated hole-continuation helper required by the
-    /// additive prepared entry, when that entry is present.
+    /// Return the authenticated hole-continuation helper when the additive
+    /// prepared entry actually references one.
     #[must_use]
     pub fn required_prepared_runtime_symbol(&self) -> Option<&str> {
         self.prepared_entry_symbol_index?;
+        if !self
+            .relocations
+            .iter()
+            .any(|relocation| relocation.symbol == PARTIAL_RUNTIME_SYMBOL)
+        {
+            return None;
+        }
         self.symbols
             .get(PARTIAL_RUNTIME_SYMBOL)
             .filter(|symbol| symbol.section.is_none())
             .map(|symbol| symbol.name.as_str())
     }
 
-    /// Return the ordinary prepared helper used below the partial-DFA input
-    /// admission floor, when the additive prepared entry is present.
+    /// Return the ordinary prepared helper used when the additive native entry
+    /// declines or falls below its input admission floor.
     #[must_use]
     pub fn required_prepared_fallback_runtime_symbol(&self) -> Option<&str> {
         self.prepared_entry_symbol_index?;
@@ -1006,7 +1071,7 @@ impl CompiledModule {
         None
     }
 
-    /// Return the authenticated accelerator/admission transaction required by
+    /// Return the authenticated preflight/admission transaction required by
     /// the additive prepared entry, when that entry is present.
     #[must_use]
     pub fn required_prepared_preflight_runtime_symbol(&self) -> Option<&str> {
@@ -1101,6 +1166,96 @@ fn lower_runtime_adapter(
         start_accelerator: StartAccelerator::None,
         anchored_prefix_filter_bytes: 0,
     })
+}
+
+/// Add an exclusive prepared entry that executes only the authenticated rows
+/// already owned by the runtime's ordinary K0 workspace. No regex-specific
+/// table or transition is embedded in this entry.
+fn lower_native_dynamic_rows_prepared(
+    mut program_bytes: Vec<u8>,
+    view: NativeDynamicRowsProgramView,
+    target: Target,
+) -> Result<(NativeLowering, PreparedEntryLayout), ObjectError> {
+    if view.output != OutputContract::Exists {
+        return Err(ObjectError::InvalidModule(
+            "dynamic native rows currently require existence output",
+        ));
+    }
+    let identity_offset =
+        program_bytes
+            .len()
+            .checked_add(15)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "dynamic native-row identity alignment",
+            ))?
+            & !15;
+    program_bytes.resize(identity_offset, 0);
+    program_bytes.extend_from_slice(&view.artifact_identity);
+
+    let (mut code, mut relocations) = match target.architecture {
+        Architecture::X86_64 => lower_x86_64_runtime_adapter()?,
+        Architecture::Aarch64 => lower_aarch64_runtime_adapter()?,
+    };
+    let code_alignment_mask = match target.architecture {
+        Architecture::X86_64 => 15,
+        Architecture::Aarch64 => 3,
+    };
+    let code_offset =
+        code.len()
+            .checked_add(code_alignment_mask)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "dynamic native-row code alignment",
+            ))?
+            & !code_alignment_mask;
+    match target.architecture {
+        Architecture::X86_64 => code.resize(code_offset, 0x90),
+        Architecture::Aarch64 => {
+            while code.len() < code_offset {
+                push_bytes(&mut code, &0xd503_201f_u32.to_le_bytes())?;
+            }
+        }
+    }
+    let (prepared_code, prepared_relocations) = match target.architecture {
+        Architecture::X86_64 => lower_x86_64_dynamic_rows_prepared()?,
+        Architecture::Aarch64 => lower_aarch64_dynamic_rows_prepared()?,
+    };
+    let code_size = prepared_code.len();
+    push_bytes(&mut code, &prepared_code)?;
+    for mut relocation in prepared_relocations {
+        relocation.offset = relocation
+            .offset
+            .checked_add(offset_u64(
+                code_offset,
+                "dynamic prepared code relocation base",
+            )?)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "dynamic prepared code relocation offset",
+            ))?;
+        relocations.push(relocation);
+    }
+    let native_core_offset = code.len();
+
+    Ok((
+        NativeLowering {
+            code,
+            data: program_bytes,
+            relocations,
+            needs_runtime: true,
+            start_accelerator: StartAccelerator::None,
+            anchored_prefix_filter_bytes: 0,
+        },
+        PreparedEntryLayout {
+            code_offset,
+            code_size,
+            native_core_offset,
+            native_core_size: 0,
+            table_offset: identity_offset,
+            table_size: 0,
+            identity_offset,
+            span_recovery: false,
+            dynamic_rows: true,
+        },
+    ))
 }
 
 #[allow(
@@ -1332,6 +1487,7 @@ fn lower_native_partial_prepared(
             table_size,
             identity_offset,
             span_recovery,
+            dynamic_rows: false,
         },
     )))
 }
@@ -1436,9 +1592,21 @@ fn native_module_digest(
             .iter()
             .any(|relocation| relocation.symbol == PREPARED_PREFLIGHT_RUNTIME_SYMBOL)
         {
+            // The dynamic warmed-root entry deliberately has no partial-hole
+            // continuation relocation. Commit the actual unresolved helper
+            // name, rather than the shared symbol slot, into module identity.
+            let preflight_symbol_name = if lowering
+                .relocations
+                .iter()
+                .any(|relocation| relocation.symbol == PARTIAL_RUNTIME_SYMBOL)
+            {
+                PREPARED_PREFLIGHT_RUNTIME_SYMBOL_NAME
+            } else {
+                DYNAMIC_ROWS_PREFLIGHT_RUNTIME_SYMBOL_NAME
+            };
             update_bytes(
                 &mut digest,
-                PREPARED_PREFLIGHT_RUNTIME_SYMBOL_NAME.as_bytes(),
+                preflight_symbol_name.as_bytes(),
                 "prepared preflight runtime symbol identity byte length",
             )?;
         }
@@ -10222,6 +10390,173 @@ fn lower_x86_64_runtime_adapter() -> Result<(Vec<u8>, Vec<ModuleRelocation>), Ob
 }
 
 #[allow(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::too_many_lines,
+    reason = "the compile-time descriptor size assertion proves every encoded positive disp8 offset"
+)]
+fn lower_x86_64_dynamic_rows_prepared() -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
+    const FRAME_BYTES: u8 = 104;
+    let mut assembler = X86Assembler::new();
+    let preflight_enter = assembler.label()?;
+    let scan = assembler.label()?;
+    let native_match = assembler.label()?;
+    let native_no_match = assembler.label()?;
+    let framed_fallback = assembler.label()?;
+    let short_fallback = assembler.label()?;
+
+    // Preserve the public ABI on the short path; the ordinary helper remains
+    // the sole validator when the wrapping length selects it.
+    assembler.instruction(&[0x4c, 0x89, 0xc0])?; // mov r8, rax
+    assembler.instruction(&[0x48, 0x29, 0xc8])?; // sub rcx, rax
+    let minimum = u32::try_from(DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES)
+        .map_err(|_| ObjectError::ArithmeticOverflow("dynamic row input floor"))?;
+    let mut compare_minimum = vec![0x48, 0x3d];
+    compare_minimum.extend_from_slice(&minimum.to_le_bytes());
+    assembler.instruction(&compare_minimum)?;
+    assembler.branch(&[0x0f, 0x82], short_fallback)?;
+
+    // Entry RSP is 8 modulo 16. The frame aligns calls, retains all six
+    // public arguments, and reserves the four-word private preflight record.
+    assembler.instruction(&[0x48, 0x83, 0xec, FRAME_BYTES])?;
+    assembler.instruction(&[0x48, 0x89, 0x7c, 0x24, 0x10])?;
+    assembler.instruction(&[0x48, 0x89, 0x74, 0x24, 0x18])?;
+    assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x20])?;
+    assembler.instruction(&[0x48, 0x89, 0x4c, 0x24, 0x28])?;
+    assembler.instruction(&[0x4c, 0x89, 0x44, 0x24, 0x30])?;
+    assembler.instruction(&[0x4c, 0x89, 0x4c, 0x24, 0x38])?;
+
+    // SysV arguments seven and eight are the embedded artifact identity and
+    // the generation-bearing output record.
+    assembler.instruction(&[0x48, 0x8d, 0x05])?;
+    let identity_displacement_label = assembler.label()?;
+    assembler.bind(identity_displacement_label)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    assembler.instruction(&[0x48, 0x89, 0x04, 0x24])?;
+    assembler.instruction(&[0x48, 0x8d, 0x44, 0x24, 0x40])?;
+    assembler.instruction(&[0x48, 0x89, 0x44, 0x24, 0x08])?;
+    assembler.instruction(&[0xe8])?;
+    let preflight_displacement_label = assembler.label()?;
+    assembler.bind(preflight_displacement_label)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    assembler.instruction(&[0x83, 0xf8, PARTIAL_PREFLIGHT_ENTER_STATUS])?;
+    assembler.branch(&[0x0f, 0x84], preflight_enter)?;
+    assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+    assembler.instruction(&[0xc3])?;
+
+    assembler.bind(preflight_enter)?;
+    assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, 0x50])?; // descriptor
+    assembler.instruction(&[0x48, 0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x84], framed_fallback)?;
+    assembler.instruction(&[0x48, 0x8b, 0x30])?; // rows
+    assembler.instruction(&[0x48, 0x85, 0xf6])?;
+    assembler.branch(&[0x0f, 0x84], framed_fallback)?;
+    assembler.instruction(&[0x4c, 0x8b, 0x48, NATIVE_ROWS_CLASS_MAP_ADDRESS as u8])?;
+    assembler.instruction(&[0x4d, 0x85, 0xc9])?;
+    assembler.branch(&[0x0f, 0x84], framed_fallback)?;
+    assembler.instruction(&[0x4c, 0x8b, 0x54, 0x24, 0x58])?; // generation
+    assembler.instruction(&[0x4d, 0x85, 0xd2])?;
+    assembler.branch(&[0x0f, 0x84], framed_fallback)?;
+    assembler.instruction(&[0x4c, 0x3b, 0x50, NATIVE_ROWS_CACHE_IDENTITY as u8])?;
+    assembler.branch(&[0x0f, 0x85], framed_fallback)?;
+    assembler.instruction(&[0x83, 0x78, NATIVE_ROWS_INITIAL_FLAGS as u8, 0])?;
+    assembler.branch(&[0x0f, 0x85], framed_fallback)?;
+    assembler.instruction(&[0x83, 0x78, NATIVE_ROWS_LOOP_COUNT as u8, 0])?;
+    assembler.branch(&[0x0f, 0x85], framed_fallback)?;
+    assembler.instruction(&[0x83, 0x78, NATIVE_ROWS_ROW_STRIDE as u8, 0])?;
+    assembler.branch(&[0x0f, 0x84], framed_fallback)?;
+    assembler.instruction(&[0x44, 0x8b, 0x40, NATIVE_ROWS_INITIAL_ROW as u8])?;
+    assembler.instruction(&[0x4c, 0x3b, 0x40, NATIVE_ROWS_LIVE_CELLS as u8])?;
+    assembler.branch(&[0x0f, 0x83], framed_fallback)?;
+    assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x18])?; // haystack
+    assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x40])?; // position
+    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x48])?; // exact end
+
+    assembler.bind(scan)?;
+    assembler.instruction(&[0x48, 0x39, 0xca])?;
+    assembler.branch(&[0x0f, 0x83], native_no_match)?;
+    assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
+    assembler.instruction(&[0x47, 0x0f, 0xb6, 0x14, 0x11])?;
+    assembler.instruction(&[0x4d, 0x01, 0xc2])?;
+    assembler.instruction(&[0x46, 0x8b, 0x14, 0x96])?;
+    assembler.instruction(&[0x44, 0x3b, 0x50, NATIVE_ROWS_UNFILLED_CELL as u8])?;
+    assembler.branch(&[0x0f, 0x84], framed_fallback)?;
+    assembler.instruction(&[0x48, 0xff, 0xc2])?;
+    assembler.instruction(&[0x44, 0x85, 0x50, NATIVE_ROWS_ACCEPT_MASK as u8])?;
+    assembler.branch(&[0x0f, 0x85], native_match)?;
+    assembler.instruction(&[0x44, 0x23, 0x50, NATIVE_ROWS_NEXT_ROW_TOKEN_MASK as u8])?;
+    assembler.instruction(&[0x45, 0x85, 0xd2])?;
+    assembler.branch(&[0x0f, 0x84], native_no_match)?;
+    assembler.instruction(&[0x45, 0x89, 0xd0])?;
+    assembler.instruction(&[0x41, 0xff, 0xc8])?;
+    assembler.branch(&[0xe9], scan)?;
+
+    assembler.bind(native_no_match)?;
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x38])?;
+    assembler.instruction(&[0x49, 0x89, 0x01])?;
+    assembler.instruction(&[0x49, 0x89, 0x41, 0x08])?;
+    assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+    assembler.instruction(&[0xc3])?;
+
+    assembler.bind(native_match)?;
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x38])?;
+    assembler.instruction(&[0x49, 0x89, 0x01])?;
+    assembler.instruction(&[0x49, 0x89, 0x41, 0x08])?;
+    assembler.instruction(&[0xb8, 1, 0, 0, 0])?;
+    assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+    assembler.instruction(&[0xc3])?;
+
+    assembler.bind(framed_fallback)?;
+    assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x10])?;
+    assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x18])?;
+    assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x20])?;
+    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x28])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x30])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x38])?;
+    assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+    assembler.branch(&[0xe9], short_fallback)?;
+
+    assembler.bind(short_fallback)?;
+    assembler.instruction(&[0xe9])?;
+    let fallback_displacement_label = assembler.label()?;
+    assembler.bind(fallback_displacement_label)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+
+    let finished = assembler.finish_with_label_offsets()?;
+    let identity_displacement = finished.label_offset(identity_displacement_label)?;
+    let preflight_displacement = finished.label_offset(preflight_displacement_label)?;
+    let fallback_displacement = finished.label_offset(fallback_displacement_label)?;
+    Ok((
+        finished.code,
+        vec![
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(identity_displacement, "x86 dynamic identity relocation")?,
+                kind: RelocationKind::X86PcRelative32,
+                symbol: PARTIAL_IDENTITY_SYMBOL,
+                addend: -4,
+            },
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(preflight_displacement, "x86 dynamic preflight relocation")?,
+                kind: RelocationKind::X86PltRelative32,
+                symbol: PREPARED_PREFLIGHT_RUNTIME_SYMBOL,
+                addend: -4,
+            },
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(fallback_displacement, "x86 dynamic fallback relocation")?,
+                kind: RelocationKind::X86PltRelative32,
+                symbol: PREPARED_FALLBACK_RUNTIME_SYMBOL,
+                addend: -4,
+            },
+        ],
+    ))
+}
+
+#[allow(
     clippy::too_many_lines,
     reason = "the prepared SysV entry keeps helper validation, preflight, private native outcome, and continuation marshaling contiguous"
 )]
@@ -11381,6 +11716,10 @@ fn aarch64_cmp_x(left: u8, right: u8) -> Result<u32, ObjectError> {
     Ok(0xeb00_001f | aarch64_reg(right, 16)? | aarch64_reg(left, 5)?)
 }
 
+fn aarch64_cmp_w(left: u8, right: u8) -> Result<u32, ObjectError> {
+    Ok(0x6b00_001f | aarch64_reg(right, 16)? | aarch64_reg(left, 5)?)
+}
+
 fn aarch64_cmp_x_lsl(left: u8, right: u8, shift: u8) -> Result<u32, ObjectError> {
     if shift > 63 {
         return Err(ObjectError::InvalidModule("AArch64 CMP X shift"));
@@ -11429,6 +11768,28 @@ fn aarch64_add_x_reg(destination: u8, left: u8, right: u8) -> Result<u32, Object
             | aarch64_reg(left, 5)?
             | aarch64_reg(destination, 0)?,
     )
+}
+
+fn aarch64_add_w_reg(destination: u8, left: u8, right: u8) -> Result<u32, ObjectError> {
+    Ok(
+        0x0b00_0000
+            | aarch64_reg(right, 16)?
+            | aarch64_reg(left, 5)?
+            | aarch64_reg(destination, 0)?,
+    )
+}
+
+fn aarch64_and_w(destination: u8, left: u8, right: u8) -> Result<u32, ObjectError> {
+    Ok(
+        0x0a00_0000
+            | aarch64_reg(right, 16)?
+            | aarch64_reg(left, 5)?
+            | aarch64_reg(destination, 0)?,
+    )
+}
+
+fn aarch64_tst_w(left: u8, right: u8) -> Result<u32, ObjectError> {
+    Ok(0x6a00_001f | aarch64_reg(right, 16)? | aarch64_reg(left, 5)?)
 }
 
 fn aarch64_sub_x_reg(destination: u8, left: u8, right: u8) -> Result<u32, ObjectError> {
@@ -11486,6 +11847,16 @@ fn aarch64_load_x_imm(destination: u8, base: u8, byte_offset: u16) -> Result<u32
     }
     Ok(0xf940_0000
         | (u32::from(byte_offset / 8) << 10)
+        | aarch64_reg(base, 5)?
+        | aarch64_reg(destination, 0)?)
+}
+
+fn aarch64_load_w_imm(destination: u8, base: u8, byte_offset: u16) -> Result<u32, ObjectError> {
+    if !byte_offset.is_multiple_of(4) || byte_offset / 4 > 0x0fff {
+        return Err(ObjectError::InvalidModule("AArch64 LDR W offset"));
+    }
+    Ok(0xb940_0000
+        | (u32::from(byte_offset / 4) << 10)
         | aarch64_reg(base, 5)?
         | aarch64_reg(destination, 0)?)
 }
@@ -15996,6 +16367,227 @@ fn lower_aarch64_runtime_adapter() -> Result<(Vec<u8>, Vec<ModuleRelocation>), O
 
 #[allow(
     clippy::too_many_lines,
+    reason = "the authenticated preflight, scanner, local exits, and whole-search deopt form one ABI transaction"
+)]
+fn lower_aarch64_dynamic_rows_prepared() -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
+    const FRAME_BYTES: u16 = 96;
+    let mut assembler = Aarch64Assembler::new();
+    let preflight_enter = assembler.label()?;
+    let scan = assembler.label()?;
+    let native_match = assembler.label()?;
+    let native_no_match = assembler.label()?;
+    let framed_fallback = assembler.label()?;
+    let short_fallback = assembler.label()?;
+
+    assembler.instruction(aarch64_sub_x_reg(6, 4, 3)?)?;
+    let minimum = u16::try_from(DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES)
+        .map_err(|_| ObjectError::ArithmeticOverflow("dynamic row input floor"))?;
+    assembler.instruction(aarch64_cmp_x_imm(6, minimum)?)?;
+    assembler.branch_cond(AARCH64_LO, short_fallback)?;
+
+    assembler.instruction(aarch64_sub_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(aarch64_store_x(30, 31, 88)?)?;
+    assembler.instruction(aarch64_store_x(0, 31, 0)?)?;
+    assembler.instruction(aarch64_store_x(1, 31, 8)?)?;
+    assembler.instruction(aarch64_store_x(2, 31, 16)?)?;
+    assembler.instruction(aarch64_store_x(3, 31, 24)?)?;
+    assembler.instruction(aarch64_store_x(4, 31, 32)?)?;
+    assembler.instruction(aarch64_store_x(5, 31, 40)?)?;
+
+    let identity_page = assembler.instruction(0x9000_0006)?;
+    let identity_page_offset = assembler.instruction(aarch64_add_x_imm(6, 6, 0)?)?;
+    assembler.instruction(aarch64_add_x_imm(7, 31, 48)?)?;
+    let preflight_branch = assembler.instruction(0x9400_0000)?;
+    assembler.instruction(aarch64_cmp_w_imm(
+        0,
+        u16::from(PARTIAL_PREFLIGHT_ENTER_STATUS),
+    )?)?;
+    assembler.branch_cond(AARCH64_EQ, preflight_enter)?;
+    assembler.instruction(aarch64_load_x_imm(30, 31, 88)?)?;
+    assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    assembler.bind(preflight_enter)?;
+    assembler.instruction(aarch64_load_x_imm(17, 31, 64)?)?; // descriptor
+    assembler.instruction(aarch64_cmp_x_imm(17, 0)?)?;
+    assembler.branch_cond(AARCH64_EQ, framed_fallback)?;
+    assembler.instruction(aarch64_load_x_imm(
+        15,
+        17,
+        u16::try_from(NATIVE_ROWS_ROWS_ADDRESS)
+            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic rows address"))?,
+    )?)?;
+    assembler.instruction(aarch64_cmp_x_imm(15, 0)?)?;
+    assembler.branch_cond(AARCH64_EQ, framed_fallback)?;
+    assembler.instruction(aarch64_load_x_imm(
+        14,
+        17,
+        u16::try_from(NATIVE_ROWS_CLASS_MAP_ADDRESS)
+            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic class map"))?,
+    )?)?;
+    assembler.instruction(aarch64_cmp_x_imm(14, 0)?)?;
+    assembler.branch_cond(AARCH64_EQ, framed_fallback)?;
+    assembler.instruction(aarch64_load_x_imm(10, 31, 72)?)?; // output generation
+    assembler.instruction(aarch64_cmp_x_imm(10, 0)?)?;
+    assembler.branch_cond(AARCH64_EQ, framed_fallback)?;
+    assembler.instruction(aarch64_load_x_imm(
+        9,
+        17,
+        u16::try_from(NATIVE_ROWS_CACHE_IDENTITY)
+            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic generation"))?,
+    )?)?;
+    assembler.instruction(aarch64_cmp_x(10, 9)?)?;
+    assembler.branch_cond(AARCH64_NE, framed_fallback)?;
+    assembler.instruction(aarch64_load_w_imm(
+        8,
+        17,
+        u16::try_from(NATIVE_ROWS_INITIAL_FLAGS)
+            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic initial flags"))?,
+    )?)?;
+    assembler.branch_nonzero_w(8, framed_fallback)?;
+    assembler.instruction(aarch64_load_w_imm(
+        8,
+        17,
+        u16::try_from(NATIVE_ROWS_LOOP_COUNT)
+            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic loop count"))?,
+    )?)?;
+    assembler.branch_nonzero_w(8, framed_fallback)?;
+    assembler.instruction(aarch64_load_w_imm(
+        8,
+        17,
+        u16::try_from(NATIVE_ROWS_ROW_STRIDE)
+            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic row stride"))?,
+    )?)?;
+    assembler.branch_zero_w(8, framed_fallback)?;
+    assembler.instruction(aarch64_load_w_imm(
+        12,
+        17,
+        u16::try_from(NATIVE_ROWS_INITIAL_ROW)
+            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic initial row"))?,
+    )?)?;
+    assembler.instruction(aarch64_load_x_imm(
+        10,
+        17,
+        u16::try_from(NATIVE_ROWS_LIVE_CELLS)
+            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic live cells"))?,
+    )?)?;
+    assembler.instruction(aarch64_cmp_x(12, 10)?)?;
+    assembler.branch_cond(AARCH64_HS, framed_fallback)?;
+    assembler.instruction(aarch64_load_w_imm(
+        6,
+        17,
+        u16::try_from(NATIVE_ROWS_UNFILLED_CELL)
+            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic unfilled cell"))?,
+    )?)?;
+    assembler.instruction(aarch64_load_w_imm(
+        16,
+        17,
+        u16::try_from(NATIVE_ROWS_ACCEPT_MASK)
+            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic accept mask"))?,
+    )?)?;
+    assembler.instruction(aarch64_load_w_imm(
+        9,
+        17,
+        u16::try_from(NATIVE_ROWS_NEXT_ROW_TOKEN_MASK)
+            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic next-row mask"))?,
+    )?)?;
+    assembler.instruction(aarch64_load_x_imm(1, 31, 8)?)?;
+    assembler.instruction(aarch64_load_x_imm(2, 31, 48)?)?;
+    assembler.instruction(aarch64_load_x_imm(11, 31, 56)?)?;
+
+    assembler.bind(scan)?;
+    assembler.instruction(aarch64_cmp_x(2, 11)?)?;
+    assembler.branch_cond(AARCH64_HS, native_no_match)?;
+    assembler.instruction(aarch64_load_byte_reg(8, 1, 2)?)?;
+    assembler.instruction(aarch64_load_byte_reg(10, 14, 8)?)?;
+    assembler.instruction(aarch64_add_w_reg(10, 12, 10)?)?;
+    assembler.instruction(aarch64_load_w_uxtw(8, 15, 10)?)?;
+    assembler.instruction(aarch64_cmp_w(8, 6)?)?;
+    assembler.branch_cond(AARCH64_EQ, framed_fallback)?;
+    assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
+    assembler.instruction(aarch64_tst_w(8, 16)?)?;
+    assembler.branch_cond(AARCH64_NE, native_match)?;
+    assembler.instruction(aarch64_and_w(8, 8, 9)?)?;
+    assembler.branch_zero_w(8, native_no_match)?;
+    assembler.instruction(aarch64_sub_w_imm(12, 8, 1)?)?;
+    assembler.branch(scan)?;
+
+    assembler.bind(native_no_match)?;
+    assembler.instruction(aarch64_movz_w(0, 0)?)?;
+    assembler.instruction(aarch64_load_x_imm(5, 31, 40)?)?;
+    assembler.instruction(aarch64_store_x(31, 5, 0)?)?;
+    assembler.instruction(aarch64_store_x(31, 5, 8)?)?;
+    assembler.instruction(aarch64_load_x_imm(30, 31, 88)?)?;
+    assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    assembler.bind(native_match)?;
+    assembler.instruction(aarch64_load_x_imm(5, 31, 40)?)?;
+    assembler.instruction(aarch64_store_x(31, 5, 0)?)?;
+    assembler.instruction(aarch64_store_x(31, 5, 8)?)?;
+    assembler.instruction(aarch64_movz_w(0, 1)?)?;
+    assembler.instruction(aarch64_load_x_imm(30, 31, 88)?)?;
+    assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    assembler.bind(framed_fallback)?;
+    assembler.instruction(aarch64_load_x_imm(0, 31, 0)?)?;
+    assembler.instruction(aarch64_load_x_imm(1, 31, 8)?)?;
+    assembler.instruction(aarch64_load_x_imm(2, 31, 16)?)?;
+    assembler.instruction(aarch64_load_x_imm(3, 31, 24)?)?;
+    assembler.instruction(aarch64_load_x_imm(4, 31, 32)?)?;
+    assembler.instruction(aarch64_load_x_imm(5, 31, 40)?)?;
+    assembler.instruction(aarch64_load_x_imm(30, 31, 88)?)?;
+    assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.branch(short_fallback)?;
+
+    assembler.bind(short_fallback)?;
+    let fallback_branch = assembler.instruction(0x1400_0000)?;
+
+    let mut relocation_offsets = [
+        identity_page,
+        identity_page_offset,
+        preflight_branch,
+        fallback_branch,
+    ];
+    let code = assembler.finish_with_offsets(&mut relocation_offsets)?;
+    Ok((
+        code,
+        vec![
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(relocation_offsets[0], "AArch64 dynamic identity ADRP")?,
+                kind: RelocationKind::Aarch64Page21,
+                symbol: PARTIAL_IDENTITY_SYMBOL,
+                addend: 0,
+            },
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(relocation_offsets[1], "AArch64 dynamic identity ADD")?,
+                kind: RelocationKind::Aarch64PageOff12,
+                symbol: PARTIAL_IDENTITY_SYMBOL,
+                addend: 0,
+            },
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(relocation_offsets[2], "AArch64 dynamic preflight branch")?,
+                kind: RelocationKind::Aarch64Branch26,
+                symbol: PREPARED_PREFLIGHT_RUNTIME_SYMBOL,
+                addend: 0,
+            },
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(relocation_offsets[3], "AArch64 dynamic fallback branch")?,
+                kind: RelocationKind::Aarch64Branch26,
+                symbol: PREPARED_FALLBACK_RUNTIME_SYMBOL,
+                addend: 0,
+            },
+        ],
+    ))
+}
+
+#[allow(
+    clippy::too_many_lines,
     reason = "the prepared AAPCS64 entry keeps helper validation, preflight, private native outcome, and continuation marshaling contiguous"
 )]
 fn lower_aarch64_partial_prepared(
@@ -18816,7 +19408,11 @@ mod tests {
                 assert_eq!(!compiled.receipt().runtime_helper_required, direct);
                 assert_eq!(compiled.module().required_runtime_symbol().is_none(), direct);
                 assert!(compiled.program().native_partial_dfa_view().is_none());
-                assert!(compiled.module().prepared_entry_symbol().is_none());
+                assert_eq!(
+                    compiled.module().prepared_entry_symbol().is_some(),
+                    output == OutputContract::Exists && !direct,
+                    "{target:?}/{output:?} dynamic fallback publication"
+                );
                 if direct {
                     let view = direct_view.expect("direct complete suffix view");
                     let (_, layout) =
@@ -18977,8 +19573,9 @@ mod tests {
         assert!(lower_native_dfa(mismatched, target).unwrap().is_none());
 
         // This view is otherwise directly eligible, but baseline AArch64 has
-        // no emitted vector-suffix receipt. The decline must restore the
-        // ordinary runtime adapter, never a complete prepared wrapper.
+        // no emitted vector-suffix receipt. The complete static root declines,
+        // but Exists can still publish the general warmed-row prepared entry
+        // alongside the ordinary runtime adapter.
         let declined_target = Target::aarch64_linux();
         let declined = complete_forward_resource_fallback(
             "[b-c][a-b]{1,10}z",
@@ -18993,7 +19590,13 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(declined.module().required_runtime_symbol().is_some());
-        assert!(declined.module().prepared_entry_symbol().is_none());
+        assert!(declined.module().prepared_entry_symbol().is_some());
+        assert_eq!(
+            declined
+                .module()
+                .required_prepared_preflight_runtime_symbol(),
+            Some(DYNAMIC_ROWS_PREFLIGHT_RUNTIME_SYMBOL_NAME)
+        );
     }
 
     #[test]
@@ -19523,6 +20126,214 @@ mod tests {
         let output = Command::new(&executable)
             .output()
             .expect("execute exact-product native differential");
+        assert!(
+            output.status.success(),
+            "status={:?} stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn zero_retained_rows_publish_general_dynamic_exists_entry_on_every_target() {
+        let limits = CompileLimitsV1 {
+            determinize: DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+            ..CompileLimitsV1::default()
+        };
+        for target in identity_target_matrix() {
+            let compiled = compile(
+                CompileRequest::new("(?:ab|ac)+z", target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Exists)
+                    .limits(limits),
+            )
+            .unwrap_or_else(|error| panic!("dynamic zero-row {target:?}: {error}"));
+            assert_eq!(compiled.receipt().engine, EngineKind::OrderedNfa);
+            assert!(compiled.program().partial_dfa_stats().unwrap().is_none());
+            assert!(compiled.program().native_dfa_view().is_none());
+            assert!(compiled.program().native_partial_dfa_view().is_none());
+            assert!(compiled.program().native_dynamic_rows_view().is_some());
+            assert!(compiled.module().prepared_entry_symbol().is_some());
+            assert_eq!(
+                compiled
+                    .module()
+                    .required_prepared_preflight_runtime_symbol(),
+                Some(DYNAMIC_ROWS_PREFLIGHT_RUNTIME_SYMBOL_NAME)
+            );
+            assert_eq!(
+                compiled.module().required_prepared_fallback_runtime_symbol(),
+                Some(PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME)
+            );
+            assert!(compiled.module().required_prepared_runtime_symbol().is_none());
+            assert_eq!(compiled.module().symbols()[PARTIAL_TABLE_SYMBOL].size, 0);
+            assert_eq!(
+                compiled.module().symbols()[PARTIAL_NATIVE_CORE_SYMBOL].size,
+                0
+            );
+            assert_eq!(
+                compiled
+                    .module()
+                    .relocations()
+                    .iter()
+                    .filter(|relocation| {
+                        relocation.symbol == PREPARED_PREFLIGHT_RUNTIME_SYMBOL
+                    })
+                    .count(),
+                1,
+                "{target:?}"
+            );
+        }
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    #[ignore = "links and executes the dynamic warmed-row prepared ABI against a validating C runtime stub"]
+    #[allow(
+        clippy::needless_raw_string_hashes,
+        clippy::too_many_lines,
+        reason = "the opt-in linked transaction fixture keeps its complete C ABI oracle together"
+    )]
+    fn linked_host_dynamic_rows_entry_preserves_local_and_deopt_transactions() {
+        use std::{fs, process::Command};
+
+        let target = if cfg!(target_arch = "x86_64") {
+            if cfg!(target_os = "linux") {
+                Target::x86_64_linux()
+            } else {
+                Target::x86_64_macos()
+            }
+        } else if cfg!(target_os = "linux") {
+            Target::aarch64_linux()
+        } else {
+            Target::aarch64_macos()
+        };
+        let limits = CompileLimitsV1 {
+            determinize: DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+            ..CompileLimitsV1::default()
+        };
+        let compiled = compile(
+            CompileRequest::new("(?:ab|ac)+z", target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists)
+                .limits(limits),
+        )
+        .expect("host dynamic-row object");
+        let symbol = compiled
+            .module()
+            .prepared_entry_symbol()
+            .expect("dynamic prepared symbol");
+        let identity = compiled
+            .program()
+            .artifact_identity()
+            .iter()
+            .map(u8::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let directory =
+            std::env::temp_dir().join(format!("fre-aot-dynamic-rows-{}", std::process::id()));
+        fs::create_dir_all(&directory).expect("create dynamic linker directory");
+        let object = directory.join("dynamic.o");
+        let c_path = directory.join("dynamic.c");
+        let executable = directory.join("dynamic");
+        fs::write(&object, compiled.object()).expect("write dynamic object");
+        let source = format!(
+            r#"#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+typedef void *handle_t;
+typedef struct {{ size_t start; size_t end; }} result_t;
+typedef struct {{
+  size_t rows_address; size_t class_map_address; size_t live_cells;
+  uint32_t row_stride; uint32_t unfilled_cell; uint32_t accept_mask;
+  uint32_t next_row_token_mask; uint64_t cache_identity;
+  uint32_t learned_loop_row_count; uint32_t learned_loop_rows[4];
+  uint32_t initial_row; uint32_t initial_flags;
+}} rows_t;
+typedef struct {{
+  size_t start; size_t end; size_t native_rows_address; uint64_t cache_generation;
+}} preflight_t;
+extern uint32_t {symbol}(handle_t,const unsigned char*,size_t,size_t,size_t,result_t*);
+static const unsigned char identity[32] = {{{identity}}};
+static const unsigned char haystack[80] = {{0}};
+static unsigned char classes[256];
+static uint32_t cells[1];
+static rows_t rows;
+static int mode, preflight_calls, fallback_calls;
+static void init_rows(void) {{
+  memset(&rows,0,sizeof(rows));
+  rows.rows_address=(size_t)(uintptr_t)cells;
+  rows.class_map_address=(size_t)(uintptr_t)classes;
+  rows.live_cells=1; rows.row_stride=1; rows.initial_row=0;
+  rows.unfilled_cell=UINT32_MAX; rows.accept_mask=UINT32_C(0x80000000);
+  rows.next_row_token_mask=UINT32_C(0x7fffffff); rows.cache_identity=77;
+}}
+uint32_t fre_aot_regex_runtime_search_v1(const unsigned char*a,const unsigned char*b,size_t n,size_t s,size_t e,result_t*r) {{
+  (void)a;(void)b;(void)n;(void)s;(void)e;(void)r;return 98;
+}}
+uint32_t fre_aot_regex_runtime_search_exclusive_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r) {{
+  fallback_calls++;
+  if(h==NULL)return 5;
+  if(p!=haystack||n!=sizeof(haystack)||s!=5||((mode==1&&e!=36)||(mode!=1&&e!=69)))return 89;
+  r->start=123;r->end=456;return 77;
+}}
+uint32_t fre_aot_regex_runtime_search_exclusive_dynamic_rows_preflight_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*d,preflight_t*out) {{
+  preflight_calls++;
+  if(h==NULL)return 5;
+  if(p!=haystack||n!=sizeof(haystack)||s!=5||e!=69||d==NULL||out==NULL||memcmp(d,identity,32)!=0)return 88;
+  if(mode==2){{r->start=321;r->end=654;return 76;}}
+  out->start=s;out->end=e;out->native_rows_address=(size_t)(uintptr_t)&rows;
+  out->cache_generation=(mode==6)?78:77;return 6;
+}}
+int main(void) {{
+  init_rows(); result_t r={{91,92}}; uint32_t status;
+  mode=1;fallback_calls=preflight_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,36,&r);
+  if(status!=77||r.start!=123||r.end!=456||fallback_calls!=1||preflight_calls!=0)return 10;
+  mode=2;r=(result_t){{91,92}};fallback_calls=preflight_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,69,&r);
+  if(status!=76||r.start!=321||r.end!=654||fallback_calls!=0||preflight_calls!=1)return 11;
+  mode=3;cells[0]=UINT32_C(0x80000000);r=(result_t){{91,92}};fallback_calls=preflight_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,69,&r);
+  if(status!=1||r.start!=0||r.end!=0||fallback_calls!=0||preflight_calls!=1)return 12;
+  mode=4;cells[0]=0;r=(result_t){{91,92}};fallback_calls=preflight_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,69,&r);
+  if(status!=0||r.start!=0||r.end!=0||fallback_calls!=0||preflight_calls!=1)return 13;
+  mode=5;cells[0]=UINT32_MAX;r=(result_t){{91,92}};fallback_calls=preflight_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,69,&r);
+  if(status!=77||r.start!=123||r.end!=456||fallback_calls!=1||preflight_calls!=1)return 14;
+  mode=6;cells[0]=UINT32_C(0x80000000);r=(result_t){{91,92}};fallback_calls=preflight_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,69,&r);
+  if(status!=77||r.start!=123||r.end!=456||fallback_calls!=1||preflight_calls!=1)return 15;
+  mode=7;rows.initial_flags=1;r=(result_t){{91,92}};fallback_calls=preflight_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,69,&r);
+  if(status!=77||r.start!=123||r.end!=456||fallback_calls!=1||preflight_calls!=1)return 16;
+  mode=0;rows.initial_flags=0;r=(result_t){{91,92}};fallback_calls=preflight_calls=0;status={symbol}(NULL,haystack,sizeof(haystack),5,69,&r);
+  if(status!=5||r.start!=91||r.end!=92||fallback_calls!=0||preflight_calls!=1)return 17;
+  return 0;
+}}
+"#,
+        );
+        fs::write(&c_path, source).expect("write dynamic C harness");
+        let c_compiler = if cfg!(target_os = "macos") {
+            "clang"
+        } else {
+            "cc"
+        };
+        let status = Command::new(c_compiler)
+            .arg("-O0")
+            .arg(&c_path)
+            .arg(&object)
+            .arg("-o")
+            .arg(&executable)
+            .status()
+            .expect("invoke host C compiler");
+        assert!(status.success());
+        let output = Command::new(&executable)
+            .output()
+            .expect("run dynamic prepared harness");
         assert!(
             output.status.success(),
             "status={:?} stdout={} stderr={}",

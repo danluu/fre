@@ -1969,6 +1969,106 @@ enum LazyInitialKind {
     NullableTerminal,
 }
 
+/// Immutable direct-row inputs for an exclusive warmed-root native probe.
+///
+/// This deliberately projects semantic components instead of the private
+/// lazy-workspace layout. The row address stays valid while the borrowed
+/// workspace remains at the same address and no mutable callback starts.
+/// Direct rows are fixed-capacity and initialized at construction; later K0
+/// publication changes only an existing `u32` cell. A native caller must
+/// nevertheless re-enter K0 at its first unpublished cell, or before it would
+/// execute one of the learned-loop rows below.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct K0DynamicRootProjection<'a> {
+    rows: &'a [u32],
+    row_stride: u32,
+    state_count: usize,
+    initial_row: u32,
+    initial_pending: bool,
+    initial_terminal: bool,
+    cache_identity: u64,
+    learned_loop_rows: [u32; LAZY_LOOP_SKIP_PLAN_CAPACITY],
+    learned_loop_row_count: usize,
+    unfilled_cell: u32,
+    accept_mask: u32,
+    next_row_token_mask: u32,
+}
+
+impl K0DynamicRootProjection<'_> {
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn rows_address(&self) -> *const u32 {
+        self.rows.as_ptr()
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn initialized_cells(&self) -> usize {
+        self.rows.len()
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn row_stride(&self) -> u32 {
+        self.row_stride
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn state_count(&self) -> usize {
+        self.state_count
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn initial_row(&self) -> u32 {
+        self.initial_row
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn initial_pending(&self) -> bool {
+        self.initial_pending
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn initial_terminal(&self) -> bool {
+        self.initial_terminal
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn cache_identity(&self) -> u64 {
+        self.cache_identity
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn learned_loop_row_offsets(&self) -> &[u32] {
+        &self.learned_loop_rows[..self.learned_loop_row_count]
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn unfilled_cell(&self) -> u32 {
+        self.unfilled_cell
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn accept_mask(&self) -> u32 {
+        self.accept_mask
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn next_row_token_mask(&self) -> u32 {
+        self.next_row_token_mask
+    }
+}
+
 /// Fixed ordered-subset rows owned by one exact immutable automaton session.
 ///
 /// `modes` makes the pending selected-end bit part of state identity. The
@@ -4253,6 +4353,103 @@ impl K0Workspace {
     #[must_use]
     pub const fn retained_bytes(&self) -> usize {
         self.retained_bytes
+    }
+
+    /// Snapshot the immutable raw-byte class map for an assertion-free direct
+    /// cache. This is intended for one-time prepared-workspace construction;
+    /// warmed preflights use [`Self::dynamic_root_projection`] and do not
+    /// rebuild the map.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn dynamic_root_class_map(
+        &self,
+        automaton: &Automaton,
+    ) -> Option<[u8; BYTE_ALPHABET]> {
+        let lazy = &self.lazy;
+        if self.bound_automaton_identity != automaton.identity()
+            || !lazy.is_allocated()
+            || !lazy.is_bound_to(automaton)
+            || lazy.rows.is_empty()
+            || lazy.direct_row_stride == 0
+        {
+            return None;
+        }
+        let mut class_by_byte = [0_u8; BYTE_ALPHABET];
+        for byte in u8::MIN..=u8::MAX {
+            class_by_byte[usize::from(byte)] = automaton.byte_classes().class_of(byte);
+        }
+        Some(class_by_byte)
+    }
+
+    /// Project the currently retained assertion-free direct cache without
+    /// deriving, publishing, or otherwise mutating a row.
+    ///
+    /// A disabled, contextual, cold, declined, identity-exhausted, or malformed
+    /// cache returns `None`, directing generated code to canonical K0.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn dynamic_root_projection(
+        &self,
+        automaton: &Automaton,
+    ) -> Option<K0DynamicRootProjection<'_>> {
+        let lazy = &self.lazy;
+        if self.bound_automaton_identity != automaton.identity()
+            || !lazy.is_allocated()
+            || !lazy.is_bound_to(automaton)
+            || !lazy.initialized
+            || lazy.declined
+            || lazy.cache_identity == 0
+            || lazy.rows.is_empty()
+            || lazy.state_len == 0
+            || lazy.direct_row_stride == 0
+            || lazy.initial == LAZY_NO_STATE
+        {
+            return None;
+        }
+        let stride = usize::try_from(lazy.direct_row_stride).ok()?;
+        let live_cells = lazy.state_len.checked_mul(stride)?;
+        if live_cells > lazy.rows.len() {
+            return None;
+        }
+        let initial_row = lazy.row_offset(lazy.initial).ok()?;
+        if usize::try_from(initial_row).ok()? >= live_cells {
+            return None;
+        }
+        let (initial_pending, initial_terminal) = match lazy.initial_kind {
+            LazyInitialKind::Positive | LazyInitialKind::PositiveSingle => (false, false),
+            LazyInitialKind::NullablePrefix => (true, false),
+            LazyInitialKind::NullableTerminal => (true, true),
+            LazyInitialKind::Uninitialized => return None,
+        };
+
+        let mut learned_loop_rows = [0_u32; LAZY_LOOP_SKIP_PLAN_CAPACITY];
+        let mut learned_loop_row_count = 0usize;
+        for plan in lazy.loop_skip_plans.entries.iter().flatten() {
+            let row = usize::try_from(plan.row_offset).ok()?;
+            if row.checked_rem(stride) != Some(0)
+                || row >= live_cells
+                || learned_loop_rows[..learned_loop_row_count].contains(&plan.row_offset)
+            {
+                return None;
+            }
+            *learned_loop_rows.get_mut(learned_loop_row_count)? = plan.row_offset;
+            learned_loop_row_count = learned_loop_row_count.checked_add(1)?;
+        }
+
+        Some(K0DynamicRootProjection {
+            rows: &lazy.rows,
+            row_stride: lazy.direct_row_stride,
+            state_count: lazy.state_len,
+            initial_row,
+            initial_pending,
+            initial_terminal,
+            cache_identity: lazy.cache_identity,
+            learned_loop_rows,
+            learned_loop_row_count,
+            unfilled_cell: LAZY_CELL_UNFILLED,
+            accept_mask: LAZY_CELL_ACCEPT,
+            next_row_token_mask: LAZY_CELL_STATE_MASK,
+        })
     }
 
     /// Constructor allocation and initialization charges.
@@ -31943,6 +32140,54 @@ mod tests {
         assert_eq!(workspace.lazy.rows, rows);
         assert_eq!(workspace.lazy.direct_cells_published, published);
         assert_eq!(workspace.lazy.loop_skip_analyzed_at_cells, epoch);
+    }
+
+    #[test]
+    fn dynamic_root_projection_is_warm_identity_bound_and_semantic() {
+        let plan = direct_two_state_inferred_loop();
+        let workspace = direct_two_state_loop_workspace(&plan);
+        let projection = workspace
+            .dynamic_root_projection(&plan)
+            .expect("warm direct cache must project");
+        assert_eq!(projection.rows_address(), workspace.lazy.rows.as_ptr());
+        assert_eq!(projection.initialized_cells(), workspace.lazy.rows.len());
+        assert_eq!(projection.row_stride(), workspace.lazy.direct_row_stride);
+        assert_eq!(projection.state_count(), workspace.lazy.state_len);
+        assert_eq!(
+            projection.initial_row(),
+            workspace.lazy.row_offset(workspace.lazy.initial).unwrap()
+        );
+        assert!(!projection.initial_pending());
+        assert!(!projection.initial_terminal());
+        assert_eq!(projection.cache_identity(), workspace.lazy.cache_identity);
+        assert_eq!(projection.unfilled_cell(), super::LAZY_CELL_UNFILLED);
+        assert_eq!(projection.accept_mask(), super::LAZY_CELL_ACCEPT);
+        assert_eq!(projection.next_row_token_mask(), super::LAZY_CELL_STATE_MASK);
+        assert_eq!(
+            projection.learned_loop_row_offsets().len(),
+            workspace
+                .lazy
+                .loop_skip_plans
+                .entries
+                .iter()
+                .flatten()
+                .count()
+        );
+
+        let classes = workspace
+            .dynamic_root_class_map(&plan)
+            .expect("direct class map");
+        for byte in u8::MIN..=u8::MAX {
+            assert_eq!(classes[usize::from(byte)], byte_class(&plan, byte));
+        }
+
+        let same_shape_other = direct_two_state_inferred_loop();
+        assert!(workspace
+            .dynamic_root_projection(&same_shape_other)
+            .is_none());
+        let cold = K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        assert!(cold.dynamic_root_projection(&plan).is_none());
+        assert!(cold.dynamic_root_class_map(&plan).is_some());
     }
 
     #[test]

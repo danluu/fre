@@ -34,7 +34,7 @@ pub use contract::{
 };
 pub use error::{CompileError, MalformedPlan, ResourceKind, SearchError};
 pub use k0::{
-    K0PositiveEndLimits, K0PositiveEndOutcome, K0PositiveEndReceipt,
+    K0DynamicRootProjection, K0PositiveEndLimits, K0PositiveEndOutcome, K0PositiveEndReceipt,
     K0PositiveEndStartOutcome, K0PositiveEndStartVerification, K0PositiveEndVerification,
     K0ResumeSet, K0SearchSession, K0SpanSourceCursor, K0Workspace, WorkspaceLayout, WorkspaceLimits,
 };

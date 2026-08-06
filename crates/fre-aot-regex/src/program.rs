@@ -298,6 +298,32 @@ pub enum RetainedPartialPreflight {
     Enter(SearchWindow),
 }
 
+/// Fixed-layout read-only view of one prepared K0 warmed-root cache.
+///
+/// Addresses are represented as `usize` rather than Rust pointers so the
+/// prepared workspace remains movable and `Send`; they become live only after
+/// the final owning prepared regex has reached its exclusive call site. A
+/// generated entry must authenticate `cache_identity` before following either
+/// source address and conservatively side-exit on an unpublished cell or a
+/// learned-loop row.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(C)]
+pub struct DynamicNativeRowsV1 {
+    pub rows_address: usize,
+    pub class_map_address: usize,
+    pub live_cells: usize,
+    pub row_stride: u32,
+    pub unfilled_cell: u32,
+    pub accept_mask: u32,
+    pub next_row_token_mask: u32,
+    pub cache_identity: u64,
+    pub learned_loop_row_count: u32,
+    pub learned_loop_rows: [u32; 4],
+    pub initial_row: u32,
+    pub initial_flags: u32,
+}
+
 impl SearchWindow {
     #[must_use]
     pub const fn new(start: usize, end: usize) -> Self {
@@ -2401,6 +2427,7 @@ pub struct ProgramWorkspace {
     identity: ProgramIdentity,
     nfa: Option<K0Workspace>,
     partial: Option<Box<PartialDfaWorkspace>>,
+    dynamic_native_rows: Option<Box<DynamicNativeRowsWorkspace>>,
 }
 
 impl ProgramWorkspace {
@@ -2416,6 +2443,123 @@ impl ProgramWorkspace {
 struct PartialDfaWorkspace {
     resume: Option<K0ResumeSet>,
     state: PartialDfaRuntimeState,
+}
+
+/// Pointer-stable prepared projection and adaptive state for an ordinary K0
+/// artifact whose emitted module owns a warmed-row root entry. The box is
+/// allocated once by workspace preparation; no search allocates or moves it.
+#[derive(Debug)]
+struct DynamicNativeRowsWorkspace {
+    state: DynamicNativeRowsState,
+    class_map: [u8; 256],
+    native_rows: DynamicNativeRowsV1,
+}
+
+const NATIVE_ROWS_INITIAL_PENDING: u32 = 1;
+const NATIVE_ROWS_INITIAL_TERMINAL: u32 = 1 << 1;
+
+const fn native_rows_initial_flags(pending: bool, terminal: bool) -> u32 {
+    let pending = if pending {
+        NATIVE_ROWS_INITIAL_PENDING
+    } else {
+        0
+    };
+    let terminal = if terminal {
+        NATIVE_ROWS_INITIAL_TERMINAL
+    } else {
+        0
+    };
+    pending | terminal
+}
+
+impl DynamicNativeRowsWorkspace {
+    fn refresh_native_rows(&mut self, automaton: &Automaton, workspace: &K0Workspace) -> bool {
+        self.native_rows = DynamicNativeRowsV1::default();
+        let Some(direct) = workspace.dynamic_root_projection(automaton) else {
+            return false;
+        };
+        let Some(live_cells) = direct
+            .state_count()
+            .checked_mul(usize::try_from(direct.row_stride()).unwrap_or(usize::MAX))
+        else {
+            return false;
+        };
+        let loop_rows = direct.learned_loop_row_offsets();
+        if direct.row_stride() == 0
+            || live_cells == 0
+            || live_cells > direct.initialized_cells()
+            || usize::try_from(direct.initial_row()).map_or(true, |row| row >= live_cells)
+            || direct.cache_identity() == 0
+            || loop_rows.len() > self.native_rows.learned_loop_rows.len()
+        {
+            return false;
+        }
+        let mut learned_loop_rows = [u32::MAX; 4];
+        learned_loop_rows[..loop_rows.len()].copy_from_slice(loop_rows);
+        self.native_rows = DynamicNativeRowsV1 {
+            rows_address: direct.rows_address().addr(),
+            class_map_address: self.class_map.as_ptr().addr(),
+            live_cells,
+            row_stride: direct.row_stride(),
+            unfilled_cell: direct.unfilled_cell(),
+            accept_mask: direct.accept_mask(),
+            next_row_token_mask: direct.next_row_token_mask(),
+            cache_identity: direct.cache_identity(),
+            learned_loop_row_count: u32::try_from(loop_rows.len())
+                .expect("the fixed learned-loop projection count fits u32"),
+            learned_loop_rows,
+            initial_row: direct.initial_row(),
+            initial_flags: native_rows_initial_flags(
+                direct.initial_pending(),
+                direct.initial_terminal(),
+            ),
+        };
+        true
+    }
+}
+
+/// Per-workspace backoff for speculative warmed-root entries. An emitted
+/// local return is settled by the next preflight; a whole-search side exit
+/// enters the ordinary runtime helper, which records the deopt before K0 runs.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DynamicNativeRowsState {
+    consecutive_deopts: u8,
+    bypass_remaining: u16,
+    native_entry_in_flight: bool,
+}
+
+impl DynamicNativeRowsState {
+    fn settle_unobserved_local_entry(&mut self) {
+        if self.native_entry_in_flight {
+            self.native_entry_in_flight = false;
+            self.consecutive_deopts = 0;
+            self.bypass_remaining = 0;
+        }
+    }
+
+    fn claim(&mut self) -> bool {
+        self.settle_unobserved_local_entry();
+        if self.bypass_remaining != 0 {
+            self.bypass_remaining = self.bypass_remaining.saturating_sub(1);
+            return false;
+        }
+        self.native_entry_in_flight = true;
+        true
+    }
+
+    fn observe_deopt(&mut self) {
+        if !self.native_entry_in_flight {
+            return;
+        }
+        self.native_entry_in_flight = false;
+        self.consecutive_deopts = self.consecutive_deopts.saturating_add(1);
+        if self.consecutive_deopts >= 2 {
+            let shift = u32::from(self.consecutive_deopts.saturating_sub(2))
+                .saturating_add(4)
+                .min(10);
+            self.bypass_remaining = 1_u16 << shift;
+        }
+    }
 }
 
 /// Per-prepared-workspace admission state for a retained partial table.
@@ -2451,6 +2595,9 @@ struct PartialDfaRuntimeState {
 // Below this general amortization floor, enter the already-prepared ordinary
 // executor directly; larger windows can repay the retained-row setup.
 pub(crate) const PARTIAL_DFA_MIN_INPUT_BYTES: usize = 256;
+/// The dynamic warmed root has no static-table setup or continuation payload;
+/// admit the short general rows that most need to amortize runtime dispatch.
+pub(crate) const DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES: usize = 32;
 
 impl PartialDfaRuntimeState {
     fn new(prefix: &[AnchoredByteSet]) -> Self {
@@ -2668,6 +2815,16 @@ pub(crate) struct NativePartialProgramView<'a> {
     /// cells before native target-specific row/hole repacking.
     pub(crate) complete_rows: usize,
     pub(crate) resume_states: usize,
+    pub(crate) artifact_identity: [u8; 32],
+}
+
+/// General warmed-K0 root eligible for an additive prepared native entry.
+/// Unlike [`NativePartialProgramView`], this carries no compile-time row
+/// table: its exclusively owned prepared workspace authenticates all rows at
+/// call time.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NativeDynamicRowsProgramView {
+    pub(crate) output: OutputContract,
     pub(crate) artifact_identity: [u8; 32],
 }
 
@@ -3270,6 +3427,26 @@ impl CompiledProgram {
         })
     }
 
+    /// Return a general assertion-free resource fallback whose already
+    /// prepared K0 cache can be projected into an additive native root entry.
+    /// Static/full native routes retain precedence in module lowering; this
+    /// view is their target-specific fallback and never embeds regex-specific
+    /// rows or source predicates.
+    pub(crate) fn native_dynamic_rows_view(&self) -> Option<NativeDynamicRowsProgramView> {
+        if self.output != OutputContract::Exists
+            || self.context_dfa.is_some()
+            || !matches!(self.engine, ProgramEngine::OrderedNfa)
+            || self.automaton.stats().has_assertions()
+            || self.nfa_mandatory_cut.is_some()
+        {
+            return None;
+        }
+        Some(NativeDynamicRowsProgramView {
+            output: self.output,
+            artifact_identity: self.artifact_identity(),
+        })
+    }
+
     /// Return the complete fixed-width Cartesian proof as a native scanner
     /// program, even though determinization retained no rows.
     ///
@@ -3402,10 +3579,23 @@ impl CompiledProgram {
                 }))
             })
             .transpose()?;
+        let dynamic_native_rows = (nfa.is_some() && self.native_dynamic_rows_view().is_some())
+            .then(|| {
+                let class_map = nfa
+                    .as_ref()
+                    .and_then(|workspace| workspace.dynamic_root_class_map(&self.automaton))
+                    .unwrap_or([0_u8; 256]);
+                Box::new(DynamicNativeRowsWorkspace {
+                    state: DynamicNativeRowsState::default(),
+                    class_map,
+                    native_rows: DynamicNativeRowsV1::default(),
+                })
+            });
         Ok(ProgramWorkspace {
             identity: self.identity,
             nfa,
             partial,
+            dynamic_native_rows,
         })
     }
 
@@ -4218,6 +4408,110 @@ impl CompiledProgram {
         } else {
             self.search_nfa_unaccelerated(haystack, narrowed, nfa)
                 .map(RetainedPartialPreflight::Complete)
+        }
+    }
+
+    /// Authenticate and project an ordinary prepared K0 cache for the
+    /// additive dynamic warmed-row root. Projection and admission are O(1),
+    /// allocation-free, and publish a generation token that generated code
+    /// compares against the descriptor before reading either source address.
+    #[doc(hidden)]
+    pub fn preflight_dynamic_native_rows_with_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+        expected_artifact_identity: [u8; 32],
+    ) -> Result<(RetainedPartialPreflight, usize, u64), CompileError> {
+        if window.start > window.end || window.end > haystack.len() {
+            return Err(CompileError::InvalidWindow {
+                start: window.start,
+                end: window.end,
+                haystack_len: haystack.len(),
+            });
+        }
+        if expected_artifact_identity != self.identity.artifact {
+            return Err(CompileError::InternalInvariant(
+                "dynamic native-row preflight artifact identity does not match the prepared program",
+            ));
+        }
+        if !workspace.identity.compatible(&self.identity) {
+            return Err(CompileError::InternalInvariant(
+                "dynamic native-row workspace belongs to a different semantic program",
+            ));
+        }
+        if self.output != OutputContract::Exists
+            || self.context_dfa.is_some()
+            || !matches!(self.engine, ProgramEngine::OrderedNfa)
+            || self.automaton.stats().has_assertions()
+            || self.nfa_mandatory_cut.is_some()
+        {
+            return Err(CompileError::InternalInvariant(
+                "dynamic native rows require assertion-free ordered-NFA existence output",
+            ));
+        }
+
+        let input_bytes = window.end.saturating_sub(window.start);
+        let mut nullable = false;
+        let mut enter = None;
+        {
+            let ProgramWorkspace {
+                nfa,
+                dynamic_native_rows,
+                ..
+            } = workspace;
+            let dynamic = dynamic_native_rows.as_deref_mut().ok_or(
+                CompileError::InternalInvariant(
+                    "dynamic native-row preflight has no prepared descriptor workspace",
+                ),
+            )?;
+            dynamic.state.settle_unobserved_local_entry();
+            if input_bytes >= DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES {
+                let nfa = nfa.as_ref().ok_or(CompileError::InternalInvariant(
+                    "dynamic native-row preflight has no prepared K0 workspace",
+                ))?;
+                if dynamic.refresh_native_rows(&self.automaton, nfa) {
+                    nullable = dynamic.native_rows.initial_flags & NATIVE_ROWS_INITIAL_PENDING != 0;
+                    if !nullable
+                        && dynamic.native_rows.learned_loop_row_count == 0
+                        && dynamic.state.claim()
+                    {
+                        enter = Some((
+                            (&raw const dynamic.native_rows).addr(),
+                            dynamic.native_rows.cache_identity,
+                        ));
+                    }
+                }
+            }
+        }
+        if nullable {
+            return Ok((
+                RetainedPartialPreflight::Complete(MatchResult::Exists(true)),
+                0,
+                0,
+            ));
+        }
+        if let Some((native_rows_address, generation)) = enter {
+            return Ok((
+                RetainedPartialPreflight::Enter(window),
+                native_rows_address,
+                generation,
+            ));
+        }
+        self.search_optimized_with_workspace(haystack, window, workspace)
+            .map(|found| (RetainedPartialPreflight::Complete(found), 0, 0))
+    }
+
+    /// Record that an admitted dynamic root re-entered the ordinary runtime.
+    /// The canonical search that follows may publish the missing cell; repeat
+    /// early deopts receive exponential periodic backoff.
+    #[doc(hidden)]
+    pub fn observe_dynamic_native_rows_deopt_with_workspace(
+        &self,
+        workspace: &mut ProgramWorkspace,
+    ) {
+        if let Some(dynamic) = workspace.dynamic_native_rows.as_deref_mut() {
+            dynamic.state.observe_deopt();
         }
     }
 
@@ -6936,6 +7230,94 @@ mod tests {
         let mut strings = Vec::new();
         extend(&mut strings, &mut Vec::new(), alphabet, max_len);
         strings
+    }
+
+    #[test]
+    fn dynamic_native_rows_cold_entry_is_ticket_free_and_warm_entry_is_stable() {
+        let compiled = program(
+            "(?:ab|ac)+z",
+            OutputContract::Exists,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        let mut workspace = compiled.prepare_workspace().expect("prepared K0 workspace");
+        let mut haystack = vec![b'a'; 64];
+        for pair in haystack[..62].chunks_exact_mut(2) {
+            pair.copy_from_slice(b"ab");
+        }
+        haystack[62] = b'z';
+        haystack[63] = b'!';
+        let window = SearchWindow::new(0, haystack.len());
+        let identity = compiled.artifact_identity();
+
+        let (cold, cold_address, cold_generation) = compiled
+            .preflight_dynamic_native_rows_with_workspace(
+                &haystack,
+                window,
+                &mut workspace,
+                identity,
+            )
+            .expect("cold dynamic preflight");
+        assert_eq!(
+            cold,
+            RetainedPartialPreflight::Complete(MatchResult::Exists(true))
+        );
+        assert_eq!((cold_address, cold_generation), (0, 0));
+        let dynamic = workspace.dynamic_native_rows.as_deref().unwrap();
+        assert!(!dynamic.state.native_entry_in_flight);
+
+        let (warm, first_address, first_generation) = compiled
+            .preflight_dynamic_native_rows_with_workspace(
+                &haystack,
+                window,
+                &mut workspace,
+                identity,
+            )
+            .expect("warm dynamic preflight");
+        assert_eq!(warm, RetainedPartialPreflight::Enter(window));
+        assert_ne!(first_address, 0);
+        assert_ne!(first_generation, 0);
+        let dynamic = workspace.dynamic_native_rows.as_deref().unwrap();
+        assert!(dynamic.state.native_entry_in_flight);
+        assert_eq!(dynamic.native_rows.cache_identity, first_generation);
+        assert_eq!(dynamic.native_rows.initial_flags, 0);
+
+        // No callback means the prior generated scan returned locally. The
+        // next preflight settles it as success and republishes the same boxed
+        // descriptor and immutable workspace generation.
+        let (reentered, second_address, second_generation) = compiled
+            .preflight_dynamic_native_rows_with_workspace(
+                &haystack,
+                window,
+                &mut workspace,
+                identity,
+            )
+            .expect("settled dynamic preflight");
+        assert_eq!(reentered, RetainedPartialPreflight::Enter(window));
+        assert_eq!(second_address, first_address);
+        assert_eq!(second_generation, first_generation);
+    }
+
+    #[test]
+    fn dynamic_native_rows_back_off_repeated_whole_search_deopts() {
+        let mut state = DynamicNativeRowsState::default();
+        assert!(state.claim());
+        state.observe_deopt();
+        assert_eq!(state.consecutive_deopts, 1);
+        assert_eq!(state.bypass_remaining, 0);
+
+        assert!(state.claim());
+        state.observe_deopt();
+        assert_eq!(state.consecutive_deopts, 2);
+        assert_eq!(state.bypass_remaining, 16);
+        for remaining in (0_u16..16).rev() {
+            assert!(!state.claim());
+            assert_eq!(state.bypass_remaining, remaining);
+        }
+
+        assert!(state.claim());
+        state.settle_unobserved_local_entry();
+        assert_eq!(state, DynamicNativeRowsState::default());
     }
 
     fn authentic_partial_resume(
