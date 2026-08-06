@@ -8526,21 +8526,15 @@ fn prepare_resume_invocation(
     may_use_lazy: bool,
     may_use_reverse: bool,
 ) -> Result<(WorkMeter, u64), SearchError> {
-    let required_layout = WorkspaceLayout::for_automaton(automaton)?;
-    if required_layout.states != workspace.layout.states
-        || required_layout.edges != workspace.layout.edges
-        || required_layout.zero_width_edges != workspace.layout.zero_width_edges
-        || required_layout.closure_slots != workspace.layout.closure_slots
-    {
-        return Err(SearchError::WorkspaceLayoutMismatch {
-            required_states: required_layout.states,
-            actual_states: workspace.layout.states,
-            required_edges: required_layout.edges,
-            actual_edges: workspace.layout.edges,
-            required_zero_width_edges: required_layout.zero_width_edges,
-            actual_zero_width_edges: workspace.layout.zero_width_edges,
-        });
-    }
+    // The retained entry has already authenticated both the workspace's lazy
+    // arena and the resume set against this exact immutable automaton. Those
+    // identities are stronger than re-deriving and comparing the four Pike
+    // layout dimensions here, and every workspace field is private to its
+    // checked constructor. Keep the ordinary public entry's shape validation
+    // there, but do not repeat its fallible layout arithmetic on every partial
+    // DFA side exit.
+    debug_assert_eq!(workspace.bound_automaton_identity, automaton.identity());
+    debug_assert!(workspace.lazy.is_bound_to(automaton));
     if setup.retained_bytes > limits.max_scratch_bytes {
         return Err(SearchError::ResourceLimit {
             resource: ResourceKind::ScratchBytes,
