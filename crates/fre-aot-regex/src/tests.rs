@@ -328,6 +328,42 @@ fn compiled_regex_facade_executes_retained_rows_on_amortized_windows() {
 }
 
 #[test]
+fn contextual_selected_end_reuses_authenticated_ordered_nfa_workspace() {
+    let mut limits = CompileLimitsV1::default();
+    limits.determinize.max_states = 0;
+    let compiled = compile(
+        CompileRequest::new(r"(?m)^(?:ab|a)", Target::aarch64_macos())
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::SelectedEnd)
+            .limits(limits),
+    )
+    .unwrap();
+    assert_eq!(compiled.receipt().engine, EngineKind::OrderedNfa);
+    assert_eq!(
+        compiled.receipt().engine_selection_reason,
+        EngineSelectionReason::ContextAssertions,
+    );
+
+    let mut haystack = vec![b'!'; 4096];
+    haystack[..2].copy_from_slice(b"ab");
+    let window = SearchWindow::full(&haystack);
+    let expected = MatchResult::SelectedEnd(Some(2));
+    let mut workspace = compiled.prepare_workspace().unwrap();
+    assert_eq!(
+        compiled
+            .search_with_workspace(&haystack, window, &mut workspace)
+            .unwrap(),
+        expected,
+    );
+    assert_eq!(
+        compiled
+            .search_with_workspace(&haystack, window, &mut workspace)
+            .unwrap(),
+        expected,
+    );
+}
+
+#[test]
 fn stable_dfa_work_ceiling_and_effective_limits_are_explicit() {
     assert_eq!(
         crate::DeterminizeLimits::unlimited().max_work,

@@ -669,9 +669,10 @@ impl TypedPlan<'_, SelectedEnd> {
     /// caller-validated workspace.
     ///
     /// An unlimited exact-identity call may read already-filled forward rows
-    /// without constructing diagnostic accounting. Its first unavailable
-    /// direct transition can continue mutably at that exact byte without
-    /// replaying the filled prefix. Every finite, cold, contextual,
+    /// without constructing diagnostic accounting. Assertion-free execution
+    /// can continue mutably at its first unavailable direct transition;
+    /// contextual execution reads only a complete already-published path and
+    /// declines transactionally on a missing record. Every finite, cold,
     /// unauthenticated, or otherwise ineligible case uses the ordinary
     /// report-producing executor with unchanged error behavior.
     ///
@@ -978,9 +979,10 @@ impl K0SearchSession<'_> {
     /// Return only the selected endpoint, allowing an authenticated warm
     /// session to omit diagnostic report construction for unlimited calls.
     ///
-    /// Finite limits and every cold, contextual, or otherwise ineligible call
-    /// use the ordinary report-producing executor with unchanged accounting
-    /// and error precedence.
+    /// Finite limits and every cold or otherwise ineligible call use the
+    /// ordinary report-producing executor with unchanged accounting and error
+    /// precedence. A contextual warm projection is read-only and falls back
+    /// transactionally if any required published record is unavailable.
     ///
     /// # Errors
     ///
