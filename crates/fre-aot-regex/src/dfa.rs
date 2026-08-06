@@ -31,6 +31,12 @@ pub const MAX_STABLE_DFA_TRANSITIONS: usize = 500_000_000;
 /// Every constructed state charges work and the work ceiling is lower than
 /// the `u32` state-identifier ceiling on every supported target.
 pub const MAX_STABLE_DFA_STATES: usize = 500_000_000;
+// The complete-machine owner already retains canonical build work. Its unused
+// high bit records the in-memory replay identity without growing the runtime
+// layout; stable serialization writes the exact untagged work and binds the
+// same identity through the enclosing program version.
+const CLASS_MASS_REPLAY_WORK_TAG: u64 = 1 << 63;
+const _: () = assert!(MAX_STABLE_DFA_BUILD_WORK < CLASS_MASS_REPLAY_WORK_TAG);
 /// Endpoint rescue retains one compact ordered partial while building at most
 /// one replacement attempt. State/transition limits are per attempt; compile
 /// peak is therefore bounded by this fixed multiplier, plus the separately
@@ -560,6 +566,20 @@ enum ForwardSemantics {
     /// SelectedEnd and Span share the same selected-end transducer. Span start
     /// recovery remains on the untouched reverse/raw graph.
     EndpointPruned,
+}
+
+/// Canonical graph-class visitation order used while discovering forward
+/// subset states.
+///
+/// Stable V1--V5 DFA artifacts use `Fifo`. Fresh optimizing compilation
+/// uses `DescendingClassMass`, whose distinct replay identity is carried by
+/// the enclosing program format. Neither order changes canonical table
+/// columns; it changes only which semantic states are discovered first when a
+/// bounded construction stops.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DfaReplayOrder {
+    Fifo,
+    DescendingClassMass,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2018,18 +2038,24 @@ impl PartialDfa {
         raw: &RawPlan,
         wants_span: bool,
         output: OutputContract,
+        replay_order: DfaReplayOrder,
     ) -> Result<Self, ProgramFormatError> {
         // Exists partials may use canonical unordered frontiers. Try that
         // construction first, then the historical ordered construction so
         // pre-specialization stable artifacts remain readable.
         if output == OutputContract::Exists {
-            let regenerated =
-                determinize_impl(raw, false, self.effective_limits, ForwardSemantics::Exists)
-                    .map_err(|_| {
-                        ProgramFormatError::Malformed(
-                            "existential partial DFA canonical regeneration returned an error",
-                        )
-                    })?;
+            let regenerated = determinize_impl(
+                raw,
+                false,
+                self.effective_limits,
+                ForwardSemantics::Exists,
+                replay_order,
+            )
+            .map_err(|_| {
+                ProgramFormatError::Malformed(
+                    "existential partial DFA canonical regeneration returned an error",
+                )
+            })?;
             if let DeterminizeOutcome::Declined {
                 partial: Some(regenerated),
                 ..
@@ -2039,7 +2065,14 @@ impl PartialDfa {
                 return Ok(regenerated);
             }
         }
-        let regenerated = determinize(raw, wants_span, self.effective_limits).map_err(|_| {
+        let regenerated = determinize_impl(
+            raw,
+            wants_span,
+            self.effective_limits,
+            ForwardSemantics::Ordered,
+            replay_order,
+        )
+        .map_err(|_| {
             ProgramFormatError::Malformed("partial DFA canonical regeneration returned an error")
         })?;
         let regenerated = match regenerated {
@@ -2086,8 +2119,18 @@ impl PartialDfa {
 }
 
 impl OrderedDfa {
+    pub(crate) const fn replay_order(&self) -> DfaReplayOrder {
+        if self.stats.build_work & CLASS_MASS_REPLAY_WORK_TAG != 0 {
+            DfaReplayOrder::DescendingClassMass
+        } else {
+            DfaReplayOrder::Fifo
+        }
+    }
+
     pub(crate) const fn stats(&self) -> DfaStats {
-        self.stats
+        let mut stats = self.stats;
+        stats.build_work &= !CLASS_MASS_REPLAY_WORK_TAG;
+        stats
     }
 
     #[allow(dead_code, reason = "structural handoff for native code generation")]
@@ -2281,7 +2324,7 @@ impl OrderedDfa {
     }
 
     pub(crate) fn serialize_into(&self, bytes: &mut Vec<u8>) {
-        put_u64(bytes, self.stats.build_work);
+        put_u64(bytes, self.stats().build_work);
         put_u32(
             bytes,
             u32::try_from(self.alphabet.classes()).unwrap_or(u32::MAX),
@@ -2338,6 +2381,7 @@ impl OrderedDfa {
         exact_match_width: Option<usize>,
         construction_classes: (usize, usize),
         boundary_starts: &[bool; 256],
+        replay_order: DfaReplayOrder,
     ) -> Result<Self, ProgramFormatError> {
         let (boundary_classes, graph_classes) = construction_classes;
         let mut reader = DfaReader::new(bytes);
@@ -2617,7 +2661,12 @@ impl OrderedDfa {
                 reverse_states_before_minimization,
                 reverse_states,
                 reverse_transitions: reverse_cell_count,
-                build_work,
+                build_work: build_work
+                    | if replay_order == DfaReplayOrder::DescendingClassMass {
+                        CLASS_MASS_REPLAY_WORK_TAG
+                    } else {
+                        0
+                    },
             },
         })
     }
@@ -2626,6 +2675,7 @@ impl OrderedDfa {
         &self,
         raw: &RawPlan,
         output: OutputContract,
+        replay_order: DfaReplayOrder,
     ) -> Result<(), ProgramFormatError> {
         let max_states = self
             .stats
@@ -2642,18 +2692,26 @@ impl OrderedDfa {
         let limits = DeterminizeLimits {
             max_states,
             max_transitions,
-            max_work: self.stats.build_work,
+            max_work: self.stats().build_work,
         };
-        // New Exists artifacts use unordered semantic subsets. Accept the
-        // historical priority-preserving canonical table as well so the
-        // stable wire format remains backwards compatible.
+        // Exists artifacts use unordered semantic subsets. Endpoint-rescued
+        // artifacts use the separately proved pruned semantics. The enclosing
+        // program version selects exactly one class replay order; only the
+        // historical ordered semantic construction is tried as a second
+        // semantic identity under that same replay order.
         if output == OutputContract::Exists {
-            let regenerated = determinize_impl(raw, false, limits, ForwardSemantics::Exists)
-                .map_err(|_| {
-                    ProgramFormatError::Malformed(
-                        "existential DFA canonical regeneration returned an error",
-                    )
-                })?;
+            let regenerated = determinize_impl(
+                raw,
+                false,
+                limits,
+                ForwardSemantics::Exists,
+                replay_order,
+            )
+            .map_err(|_| {
+                ProgramFormatError::Malformed(
+                    "existential DFA canonical regeneration returned an error",
+                )
+            })?;
             if matches!(
                 regenerated,
                 DeterminizeOutcome::Complete { ref machine, .. } if machine == self
@@ -2666,6 +2724,7 @@ impl OrderedDfa {
                 self.reverse.is_some(),
                 limits,
                 ForwardSemantics::EndpointPruned,
+                replay_order,
             )
             .map_err(|_| {
                 ProgramFormatError::Malformed(
@@ -2679,7 +2738,14 @@ impl OrderedDfa {
                 return Ok(());
             }
         }
-        let regenerated = determinize(raw, self.reverse.is_some(), limits).map_err(|_| {
+        let regenerated = determinize_impl(
+            raw,
+            self.reverse.is_some(),
+            limits,
+            ForwardSemantics::Ordered,
+            replay_order,
+        )
+        .map_err(|_| {
             ProgramFormatError::Malformed("DFA canonical regeneration returned an error")
         })?;
         let regenerated = match regenerated {
@@ -2993,6 +3059,7 @@ fn determinize_impl(
     wants_span: bool,
     requested_limits: DeterminizeLimits,
     semantics: ForwardSemantics,
+    replay_order: DfaReplayOrder,
 ) -> Result<DeterminizeOutcome, CompileError> {
     if raw
         .edge_kinds
@@ -3016,7 +3083,7 @@ fn determinize_impl(
     } = built_alphabet;
     budget.complete_stage(DeterminizationStage::AlphabetPartition)?;
     budget.begin_stage(DeterminizationStage::ForwardSubsetConstruction);
-    let mut forward = match build_forward(raw, &alphabet, &mut budget, semantics)? {
+    let mut forward = match build_forward(raw, &alphabet, &mut budget, semantics, replay_order)? {
         ForwardBuildOutcome::Complete(forward) => forward,
         ForwardBuildOutcome::Declined(partial) => {
             let partial = partial.map(|forward| PartialDfa {
@@ -3031,7 +3098,11 @@ fn determinize_impl(
     let mut reverse = if wants_span && !forward.initial_pending {
         budget.begin_stage(DeterminizationStage::ReverseSubsetConstruction);
         let Some(reverse) = build_reverse(raw, &alphabet, &mut budget)? else {
-            let partial = PartialDfa::from_complete_forward(alphabet, forward, &mut budget)?;
+            let partial = PartialDfa::from_complete_forward(
+                alphabet,
+                forward,
+                &mut budget,
+            )?;
             return Ok(DeterminizeOutcome::from_budget(None, partial, budget));
         };
         budget.complete_stage(DeterminizationStage::ReverseSubsetConstruction)?;
@@ -3068,7 +3139,12 @@ fn determinize_impl(
         reverse_states_before_minimization,
         reverse_states,
         reverse_transitions,
-        build_work: budget.work,
+        build_work: budget.work
+            | if replay_order == DfaReplayOrder::DescendingClassMass {
+                CLASS_MASS_REPLAY_WORK_TAG
+            } else {
+                0
+            },
     };
     let machine = OrderedDfa {
         alphabet,
@@ -3084,12 +3160,39 @@ fn determinize_impl(
 /// Keeping this entry point preserves canonical validation for previously
 /// serialized programs and supplies an unquotiented semantic oracle for
 /// differential tests.
+#[allow(dead_code, reason = "stable FIFO replay oracle and compatibility fixture")]
 pub(crate) fn determinize(
     raw: &RawPlan,
     wants_span: bool,
     requested_limits: DeterminizeLimits,
 ) -> Result<DeterminizeOutcome, CompileError> {
-    determinize_impl(raw, wants_span, requested_limits, ForwardSemantics::Ordered)
+    determinize_impl(
+        raw,
+        wants_span,
+        requested_limits,
+        ForwardSemantics::Ordered,
+        DfaReplayOrder::Fifo,
+    )
+}
+
+/// Build the current priority-preserving machine without an endpoint rescue.
+///
+/// This is used by exact accounting and canonical-compatibility checks that
+/// need to distinguish the first ordered attempt from the optional second
+/// endpoint-pruned attempt.
+#[allow(dead_code, reason = "exact first-attempt accounting and compatibility fixture")]
+pub(crate) fn determinize_current_ordered(
+    raw: &RawPlan,
+    wants_span: bool,
+    requested_limits: DeterminizeLimits,
+) -> Result<DeterminizeOutcome, CompileError> {
+    determinize_impl(
+        raw,
+        wants_span,
+        requested_limits,
+        ForwardSemantics::Ordered,
+        DfaReplayOrder::DescendingClassMass,
+    )
 }
 
 /// Build an output-specialized semantic machine.
@@ -3111,13 +3214,20 @@ pub(crate) fn determinize_for_output(
     requested_limits: DeterminizeLimits,
 ) -> Result<DeterminizeOutcome, CompileError> {
     if output == OutputContract::Exists {
-        return determinize_impl(raw, false, requested_limits, ForwardSemantics::Exists);
+        return determinize_impl(
+            raw,
+            false,
+            requested_limits,
+            ForwardSemantics::Exists,
+            DfaReplayOrder::DescendingClassMass,
+        );
     }
     let ordered = determinize_impl(
         raw,
         wants_span,
         requested_limits,
         ForwardSemantics::Ordered,
+        DfaReplayOrder::DescendingClassMass,
     )?;
     if matches!(ordered, DeterminizeOutcome::Complete { .. })
         || matches!(
@@ -3161,6 +3271,7 @@ pub(crate) fn determinize_for_output(
         wants_span,
         rescue_limits,
         ForwardSemantics::EndpointPruned,
+        DfaReplayOrder::DescendingClassMass,
     )?;
     if matches!(pruned, DeterminizeOutcome::Complete { .. }) {
         pruned.account_prior_attempt(ordered_work, requested_limits)?;
@@ -4320,6 +4431,107 @@ fn prune_endpoint_items(
         .prune_items(raw, alphabet, items, budget)
 }
 
+#[derive(Clone, Copy)]
+struct ForwardClassVisitOrder {
+    classes: [u8; 256],
+    len: usize,
+}
+
+impl ForwardClassVisitOrder {
+    fn build(
+        alphabet: &Alphabet,
+        replay_order: DfaReplayOrder,
+        budget: &mut BuildBudget,
+    ) -> Result<Option<Self>, CompileError> {
+        let len = alphabet.classes();
+        if len == 0 || len > 256 {
+            return Err(CompileError::InternalInvariant(
+                "forward DFA class visit width is outside 1..=256",
+            ));
+        }
+        let mut classes = [0_u8; 256];
+        if replay_order == DfaReplayOrder::Fifo {
+            for (class, slot) in classes[..len].iter_mut().enumerate() {
+                *slot = u8::try_from(class).map_err(|_| {
+                    CompileError::InternalInvariant("forward DFA class exceeded u8")
+                })?;
+            }
+            return Ok(Some(Self { classes, len }));
+        }
+
+        // Raw-byte mass, not boundary width or source syntax, determines the
+        // rank. Counting sort is fixed at the byte alphabet: all scratch has
+        // at most 256 entries and every inspected byte, class, and bucket is
+        // charged exactly. Class-id order inside one mass bucket is stable.
+        let mut class_mass = [0_u16; 256];
+        for &class in &alphabet.byte_to_class {
+            if !budget.charge(1) {
+                return Ok(None);
+            }
+            let class = usize::from(class);
+            let mass = class_mass.get_mut(class).ok_or(
+                CompileError::InternalInvariant(
+                    "forward DFA byte map references an absent class",
+                ),
+            )?;
+            *mass = mass.checked_add(1).ok_or(CompileError::InternalInvariant(
+                "forward DFA class mass overflowed",
+            ))?;
+        }
+        let mut bucket_cursor = [0_u16; 256];
+        for &mass in &class_mass[..len] {
+            if !budget.charge(1) {
+                return Ok(None);
+            }
+            let bucket = usize::from(mass.checked_sub(1).ok_or(
+                CompileError::InternalInvariant("forward DFA class has zero raw-byte mass"),
+            )?);
+            let count = bucket_cursor.get_mut(bucket).ok_or(
+                CompileError::InternalInvariant("forward DFA class mass exceeded 256"),
+            )?;
+            *count = count.checked_add(1).ok_or(CompileError::InternalInvariant(
+                "forward DFA mass bucket overflowed",
+            ))?;
+        }
+        let mut next = 0_u16;
+        for bucket in (0..256).rev() {
+            if !budget.charge(1) {
+                return Ok(None);
+            }
+            let count = bucket_cursor[bucket];
+            bucket_cursor[bucket] = next;
+            next = next.checked_add(count).ok_or(CompileError::InternalInvariant(
+                "forward DFA class-order offset overflowed",
+            ))?;
+        }
+        if usize::from(next) != len {
+            return Err(CompileError::InternalInvariant(
+                "forward DFA class-order buckets lost a class",
+            ));
+        }
+        for (class, &mass) in class_mass[..len].iter().enumerate() {
+            if !budget.charge(1) {
+                return Ok(None);
+            }
+            let bucket = usize::from(mass - 1);
+            let position = usize::from(bucket_cursor[bucket]);
+            *classes.get_mut(position).ok_or(CompileError::InternalInvariant(
+                "forward DFA class-order position is outside scratch",
+            ))? = u8::try_from(class).map_err(|_| {
+                CompileError::InternalInvariant("forward DFA class exceeded u8")
+            })?;
+            bucket_cursor[bucket] = bucket_cursor[bucket].checked_add(1).ok_or(
+                CompileError::InternalInvariant("forward DFA class-order cursor overflowed"),
+            )?;
+        }
+        Ok(Some(Self { classes, len }))
+    }
+
+    fn iter(&self) -> impl ExactSizeIterator<Item = usize> + '_ {
+        self.classes[..self.len].iter().copied().map(usize::from)
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "complete ordered subset construction is kept in one auditable worklist"
@@ -4329,7 +4541,12 @@ fn build_forward(
     alphabet: &Alphabet,
     budget: &mut BuildBudget,
     semantics: ForwardSemantics,
+    replay_order: DfaReplayOrder,
 ) -> Result<ForwardBuildOutcome, CompileError> {
+    let Some(class_visit_order) = ForwardClassVisitOrder::build(alphabet, replay_order, budget)?
+    else {
+        return Ok(ForwardBuildOutcome::Declined(None));
+    };
     let existence_only = semantics == ForwardSemantics::Exists;
     let mut endpoint_dominance = None;
     let Some(mut closure) = ForwardClosure::new(raw, budget) else {
@@ -4416,7 +4633,17 @@ fn build_forward(
         ) else {
             decline_with_complete_rows!();
         };
-        for &byte in alphabet.representatives.as_ref() {
+        let mut row_cells = [ForwardCell {
+            next: NO_STATE,
+            accepted: false,
+        }; 256];
+        let mut row_start_actions = [ForwardStartAction::Drop; 256];
+        for class in class_visit_order.iter() {
+            let byte = *alphabet.representatives.get(class).ok_or(
+                CompileError::InternalInvariant(
+                    "forward DFA class visit references an absent representative",
+                ),
+            )?;
             if !budget.charge(1) {
                 decline_with_complete_rows!();
             }
@@ -4538,8 +4765,15 @@ fn build_forward(
                     id
                 }
             };
-            transitions.push(ForwardCell { next, accepted });
-            start_actions.push(start_action);
+            row_cells[class] = ForwardCell { next, accepted };
+            row_start_actions[class] = start_action;
+        }
+        // Discovery order is independent of the retained table layout. Every
+        // completed row is committed only after all classes succeed and is
+        // always stored in canonical class-id columns.
+        for class in 0..alphabet.classes() {
+            transitions.push(row_cells[class]);
+            start_actions.push(row_start_actions[class]);
         }
         cursor = cursor
             .checked_add(1)
@@ -5249,6 +5483,262 @@ fn put_u64(bytes: &mut Vec<u8>, value: u64) {
 mod tests {
     use super::*;
 
+    fn class_mass_test_alphabet() -> Alphabet {
+        let mut byte_to_class = [2_u8; 256];
+        byte_to_class[0] = 0;
+        byte_to_class[1..201].fill(1);
+        Alphabet {
+            byte_to_class,
+            representatives: vec![0, 1, 201].into_boxed_slice(),
+        }
+    }
+
+    #[test]
+    fn class_mass_visit_order_is_stable_and_exactly_metered() {
+        let alphabet = class_mass_test_alphabet();
+        let expected_work = 512 + 2 * 3;
+        let limits = DeterminizeLimits {
+            max_work: expected_work,
+            ..DeterminizeLimits::unlimited()
+        };
+        let mut exact = BuildBudget::new(limits);
+        exact.begin_stage(DeterminizationStage::ForwardSubsetConstruction);
+        let order = ForwardClassVisitOrder::build(
+            &alphabet,
+            DfaReplayOrder::DescendingClassMass,
+            &mut exact,
+        )
+        .expect("valid class masses")
+        .expect("exact class-order work");
+        assert_eq!(order.iter().collect::<Vec<_>>(), [1, 2, 0]);
+        assert_eq!(exact.work, expected_work);
+        assert!(!exact.declined);
+
+        let mut one_short = BuildBudget::new(DeterminizeLimits {
+            max_work: expected_work - 1,
+            ..DeterminizeLimits::unlimited()
+        });
+        one_short.begin_stage(DeterminizationStage::ForwardSubsetConstruction);
+        assert!(
+            ForwardClassVisitOrder::build(
+                &alphabet,
+                DfaReplayOrder::DescendingClassMass,
+                &mut one_short,
+            )
+            .expect("valid class masses")
+            .is_none()
+        );
+        assert_eq!(one_short.work, expected_work - 1);
+        assert_eq!(
+            one_short.decline.as_ref().map(|decline| decline.resource),
+            Some(DeterminizationResource::Work {
+                limit: expected_work - 1,
+                required: expected_work,
+            })
+        );
+
+        let mut fifo = BuildBudget::new(DeterminizeLimits {
+            max_work: 0,
+            ..DeterminizeLimits::unlimited()
+        });
+        fifo.begin_stage(DeterminizationStage::ForwardSubsetConstruction);
+        let fifo_order = ForwardClassVisitOrder::build(
+            &alphabet,
+            DfaReplayOrder::Fifo,
+            &mut fifo,
+        )
+        .expect("valid FIFO classes")
+        .expect("FIFO order needs no new replay work");
+        assert_eq!(fifo_order.iter().collect::<Vec<_>>(), [0, 1, 2]);
+        assert_eq!(fifo.work, 0);
+    }
+
+    fn weighted_branch_graph() -> RawPlan {
+        RawPlan {
+            start: 0,
+            roles: vec![
+                StateRole::Split,
+                StateRole::Split,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Accept,
+            ],
+            edge_offsets: vec![0, 2, 4, 5, 6, 7, 8, 9, 10, 10],
+            edge_targets: vec![1, 8, 2, 5, 3, 4, 8, 6, 7, 8],
+            edge_kinds: vec![
+                EdgeKind::Epsilon,
+                EdgeKind::Epsilon,
+                EdgeKind::Epsilon,
+                EdgeKind::Epsilon,
+                EdgeKind::ByteRange,
+                EdgeKind::ByteRange,
+                EdgeKind::ByteRange,
+                EdgeKind::ByteRange,
+                EdgeKind::ByteRange,
+                EdgeKind::ByteRange,
+            ],
+            byte_starts: vec![0, 0, 0, 0, b'a', b'a', b'a', b'b', b'b', b'b'],
+            byte_ends: vec![0, 0, 0, 0, b'a', b'a', b'a', u8::MAX, u8::MAX, u8::MAX],
+        }
+    }
+
+    fn declined_partial_with_order(raw: &RawPlan, replay_order: DfaReplayOrder) -> PartialDfa {
+        match determinize_impl(
+            raw,
+            false,
+            DeterminizeLimits {
+                max_states: 4,
+                ..DeterminizeLimits::unlimited()
+            },
+            ForwardSemantics::Ordered,
+            replay_order,
+        )
+        .expect("bounded ordered construction")
+        {
+            DeterminizeOutcome::Declined {
+                report,
+                partial: Some(partial),
+            } => {
+                assert_eq!(
+                    report.decline.map(|decline| decline.resource),
+                    Some(DeterminizationResource::States {
+                        limit: 4,
+                        required: 5,
+                    })
+                );
+                partial
+            }
+            DeterminizeOutcome::Declined { report, partial: None } => {
+                panic!("bounded construction retained no rows: {report:?}")
+            }
+            DeterminizeOutcome::Complete { .. } => {
+                panic!("four-state construction unexpectedly completed")
+            }
+        }
+    }
+
+    fn initial_completed_target_mass(partial: &PartialDfa) -> usize {
+        let classes = partial.alphabet.classes();
+        let row = partial
+            .forward
+            .transitions
+            .get(..classes)
+            .expect("completed initial row");
+        partial
+            .alphabet
+            .byte_to_class
+            .iter()
+            .filter(|&&class| {
+                let next = row[usize::from(class)].next;
+                next != NO_STATE
+                    && usize::try_from(next)
+                        .ok()
+                        .is_some_and(|next| next < partial.forward.complete_rows)
+            })
+            .count()
+    }
+
+    #[test]
+    fn class_mass_order_commits_canonical_rows_and_prioritizes_wide_branches() {
+        let raw = weighted_branch_graph();
+        let fifo = declined_partial_with_order(&raw, DfaReplayOrder::Fifo);
+        let ranked =
+            declined_partial_with_order(&raw, DfaReplayOrder::DescendingClassMass);
+
+        for partial in [&fifo, &ranked] {
+            assert_eq!(partial.forward.complete_rows, 2);
+            assert_eq!(partial.forward.discovered_states, 4);
+            assert_eq!(
+                partial.forward.transitions.len(),
+                partial.forward.complete_rows * partial.alphabet.classes(),
+                "the state-limit refusal occurred mid-row but published no partial row",
+            );
+            assert_eq!(
+                partial.forward.start_actions.len(),
+                partial.forward.transitions.len(),
+            );
+        }
+        assert_eq!(initial_completed_target_mass(&fifo), 1);
+        assert_eq!(initial_completed_target_mass(&ranked), 158);
+        assert!(initial_completed_target_mass(&ranked) > initial_completed_target_mass(&fifo));
+
+        // Canonical table columns remain class-id ordered even though the wide
+        // class was evaluated first: its initial destination is state one.
+        let wide_class = ranked.alphabet.class(b'b');
+        let narrow_class = ranked.alphabet.class(b'a');
+        assert_eq!(ranked.forward.transitions[wide_class].next, 1);
+        assert_eq!(ranked.forward.transitions[narrow_class].next, 2);
+        assert_eq!(fifo.forward.transitions[narrow_class].next, 1);
+        assert_eq!(fifo.forward.transitions[wide_class].next, 2);
+    }
+
+    fn forward_with_work_limit(
+        raw: &RawPlan,
+        alphabet: &Alphabet,
+        max_work: u64,
+    ) -> (ForwardBuildOutcome, BuildBudget) {
+        let mut budget = BuildBudget::new(DeterminizeLimits {
+            max_work,
+            ..DeterminizeLimits::unlimited()
+        });
+        budget.begin_stage(DeterminizationStage::ForwardSubsetConstruction);
+        let outcome = build_forward(
+            raw,
+            alphabet,
+            &mut budget,
+            ForwardSemantics::Ordered,
+            DfaReplayOrder::DescendingClassMass,
+        )
+        .expect("valid weighted branch graph");
+        (outcome, budget)
+    }
+
+    #[test]
+    fn class_mass_work_decline_commits_only_the_last_exact_complete_row() {
+        let raw = weighted_branch_graph();
+        let alphabet = unlimited_graph_alphabet(&raw);
+        let precharge = 512 + 2 * u64::try_from(alphabet.classes()).unwrap();
+        let exact = (precharge..20_000)
+            .find(|&limit| {
+                matches!(
+                    forward_with_work_limit(&raw, &alphabet, limit).0,
+                    ForwardBuildOutcome::Declined(Some(PartialForwardDfa {
+                        complete_rows: 1,
+                        ..
+                    }))
+                )
+            })
+            .expect("a bounded work limit commits exactly the initial row");
+        assert!(exact > precharge);
+
+        let (one_short, one_short_budget) =
+            forward_with_work_limit(&raw, &alphabet, exact - 1);
+        assert!(matches!(one_short, ForwardBuildOutcome::Declined(None)));
+        assert_eq!(one_short_budget.work, exact - 1);
+
+        let (outcome, budget) = forward_with_work_limit(&raw, &alphabet, exact);
+        let ForwardBuildOutcome::Declined(Some(partial)) = outcome else {
+            panic!("exact first-row work did not retain one row")
+        };
+        assert_eq!(partial.complete_rows, 1);
+        assert!(partial.discovered_states > partial.complete_rows);
+        assert_eq!(partial.transitions.len(), alphabet.classes());
+        assert_eq!(partial.start_actions.len(), alphabet.classes());
+        assert_eq!(budget.work, exact);
+        assert!(matches!(
+            budget.decline,
+            Some(DeterminizationDecline {
+                stage: DeterminizationStage::ForwardSubsetConstruction,
+                resource: DeterminizationResource::Work { limit, required },
+                ..
+            }) if limit == exact && required == exact + 1
+        ));
+    }
+
     #[test]
     fn packed_partial_cells_round_trip_every_semantic_boundary() {
         assert_eq!(core::mem::size_of::<PackedForwardCell>(), 4);
@@ -5644,6 +6134,67 @@ mod tests {
         .into_plan()
     }
 
+    fn completed_machine(outcome: DeterminizeOutcome) -> OrderedDfa {
+        match outcome {
+            DeterminizeOutcome::Complete { machine, .. } => machine,
+            DeterminizeOutcome::Declined { report, .. } => {
+                panic!("unlimited complete-machine fixture declined: {report:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn complete_class_mass_replay_preserves_canonical_tables_across_graph_families() {
+        for pattern in [
+            "a",
+            "(?:a|b)c",
+            "[a-z]+Q",
+            "(?:ab|a[bc]|[d-f]{0,2})z",
+            "a+Q|[b-c][a-b]{1,5}(?:x+|y+)",
+            "(?:[a-c][x-z]?|[^q]{1,2})R",
+        ] {
+            let raw = lowered_assertion_free(pattern);
+            for (semantics, wants_span) in [
+                (ForwardSemantics::Exists, false),
+                (ForwardSemantics::Ordered, false),
+                (ForwardSemantics::Ordered, true),
+                (ForwardSemantics::EndpointPruned, true),
+            ] {
+                let fifo = completed_machine(
+                    determinize_impl(
+                        &raw,
+                        wants_span,
+                        DeterminizeLimits::unlimited(),
+                        semantics,
+                        DfaReplayOrder::Fifo,
+                    )
+                    .expect("FIFO complete construction"),
+                );
+                let ranked = completed_machine(
+                    determinize_impl(
+                        &raw,
+                        wants_span,
+                        DeterminizeLimits::unlimited(),
+                        semantics,
+                        DfaReplayOrder::DescendingClassMass,
+                    )
+                    .expect("class-mass complete construction"),
+                );
+                assert_eq!(ranked.alphabet, fifo.alphabet, "{pattern:?}/{semantics:?}");
+                assert_eq!(ranked.forward, fifo.forward, "{pattern:?}/{semantics:?}");
+                assert_eq!(ranked.reverse, fifo.reverse, "{pattern:?}/{semantics:?}");
+                let mut fifo_stats = fifo.stats();
+                let fifo_work = fifo_stats.build_work;
+                fifo_stats.build_work = 0;
+                let mut ranked_stats = ranked.stats();
+                let ranked_work = ranked_stats.build_work;
+                ranked_stats.build_work = 0;
+                assert_eq!(ranked_stats, fifo_stats, "{pattern:?}/{semantics:?}");
+                assert!(ranked_work > fifo_work, "{pattern:?}/{semantics:?}");
+            }
+        }
+    }
+
     fn byte_edge_signature(raw: &RawPlan, byte: u8) -> Vec<bool> {
         raw.edge_kinds
             .iter()
@@ -5755,8 +6306,14 @@ mod tests {
     #[test]
     fn endpoint_rescue_does_not_tax_an_exact_work_completed_baseline() {
         let raw = lowered_assertion_free("ab");
-        let first = determinize(&raw, true, DeterminizeLimits::unlimited())
-            .expect("unlimited ordered baseline");
+        let first = determinize_impl(
+            &raw,
+            true,
+            DeterminizeLimits::unlimited(),
+            ForwardSemantics::Ordered,
+            DfaReplayOrder::DescendingClassMass,
+        )
+        .expect("unlimited ordered baseline");
         let first_work = match first {
             DeterminizeOutcome::Complete { report, .. } => report.work_completed,
             DeterminizeOutcome::Declined { report, .. } => {
@@ -5767,7 +6324,14 @@ mod tests {
             max_work: first_work,
             ..DeterminizeLimits::unlimited()
         };
-        let ordered = determinize(&raw, true, limits).expect("exact-work ordered baseline");
+        let ordered = determinize_impl(
+            &raw,
+            true,
+            limits,
+            ForwardSemantics::Ordered,
+            DfaReplayOrder::DescendingClassMass,
+        )
+        .expect("exact-work ordered baseline");
         let specialized = determinize_for_output(&raw, OutputContract::Span, true, limits)
             .expect("exact-work endpoint construction");
         match (ordered, specialized) {

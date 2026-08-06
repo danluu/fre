@@ -21,9 +21,9 @@ use crate::{
         NativeContextDfaView,
     },
     dfa::{
-        self, DeterminizationReport, DeterminizeLimits, DeterminizeOutcome, DfaStats, ForwardCell,
-        NativeDfaView, NativePartialDfaView, OrderedDfa, PartialDfa, PartialDfaPrefixPlan,
-        PartialDfaResult, PartialDfaResume,
+        self, DeterminizationReport, DeterminizeLimits, DeterminizeOutcome, DfaReplayOrder,
+        DfaStats, ForwardCell, NativeDfaView, NativePartialDfaView, OrderedDfa, PartialDfa,
+        PartialDfaPrefixPlan, PartialDfaResult, PartialDfaResume,
     },
     error::{CompileError, CompileResource},
     required_literals::{self, RequiredLiterals},
@@ -39,8 +39,10 @@ const PROGRAM_FORMAT_VERSION_V2: u32 = 2;
 const PROGRAM_FORMAT_VERSION_V3: u32 = 3;
 const PROGRAM_FORMAT_VERSION_V4: u32 = 4;
 const PROGRAM_FORMAT_VERSION_V5: u32 = 5;
-// V4 remains the canonical format for Fast programs and optimizing programs
-// without either canonically rederived graph-dispatch sidecar.
+const PROGRAM_FORMAT_VERSION_V6: u32 = 6;
+// V4 remains the canonical FIFO format without a graph-dispatch marker. V5
+// adds canonically rederived graph dispatch while retaining FIFO DFA replay.
+// V6 binds fresh optimizing DFA artifacts to descending class-mass replay.
 const PROGRAM_FORMAT_VERSION: u32 = PROGRAM_FORMAT_VERSION_V4;
 const PROGRAM_FLAG_NFA_MANDATORY_SUFFIX: u8 = 1 << 0;
 const PROGRAM_FLAG_NFA_MANDATORY_CUT: u8 = 1 << 1;
@@ -58,6 +60,7 @@ const PROGRAM_KNOWN_FLAGS: u8 = PROGRAM_FLAG_NFA_MANDATORY_SUFFIX
 const PROGRAM_V5_GRAPH_DISPATCH_FLAGS: u8 = PROGRAM_FLAG_NFA_ORDERED_EDGE_DISPATCH
     | PROGRAM_FLAG_NFA_EPSILON_CLOSURE_DISPATCH;
 const PROGRAM_V5_KNOWN_FLAGS: u8 = PROGRAM_KNOWN_FLAGS | PROGRAM_V5_GRAPH_DISPATCH_FLAGS;
+const PROGRAM_V6_KNOWN_FLAGS: u8 = PROGRAM_V5_KNOWN_FLAGS;
 const DEFAULT_LINE_TERMINATOR: u8 = b'\n';
 
 static NEXT_PROGRAM_INSTANCE_IDENTITY: AtomicU64 = AtomicU64::new(1);
@@ -2293,6 +2296,20 @@ impl ProgramEngine {
     const fn is_ordered_nfa(&self) -> bool {
         matches!(self, Self::OrderedNfa)
     }
+
+    const fn ordered_dfa(&self) -> Option<&OrderedDfa> {
+        match self {
+            Self::OrderedDfa(machine) => Some(machine),
+            Self::OrderedNfa => None,
+        }
+    }
+
+    const fn replay_order(&self) -> Option<DfaReplayOrder> {
+        match self {
+            Self::OrderedDfa(machine) => Some(machine.replay_order()),
+            Self::OrderedNfa => None,
+        }
+    }
 }
 
 fn derive_nfa_suffix(
@@ -2397,7 +2414,10 @@ pub struct CompiledProgram {
 enum ProgramOptimizationSidecar {
     None,
     Context(ContextDeterminizationReport),
+    /// Fresh V6 class-mass replay.
     Partial(Box<PartialDfa>),
+    /// Stable V1--V5 FIFO replay.
+    LegacyPartial(Box<PartialDfa>),
 }
 
 const _: () = assert!(
@@ -2413,19 +2433,27 @@ impl ProgramOptimizationSidecar {
     const fn context_report(&self) -> Option<&ContextDeterminizationReport> {
         match self {
             Self::Context(report) => Some(report),
-            Self::None | Self::Partial(_) => None,
+            Self::None | Self::Partial(_) | Self::LegacyPartial(_) => None,
         }
     }
 
-    fn partial_dfa(&self) -> Option<&PartialDfa> {
+    const fn partial_dfa(&self) -> Option<&PartialDfa> {
         match self {
-            Self::Partial(partial) => Some(partial),
+            Self::Partial(partial) | Self::LegacyPartial(partial) => Some(partial),
             Self::None | Self::Context(_) => None,
         }
     }
 
     const fn has_partial_dfa(&self) -> bool {
-        matches!(self, Self::Partial(_))
+        matches!(self, Self::Partial(_) | Self::LegacyPartial(_))
+    }
+
+    const fn partial_replay_order(&self) -> Option<DfaReplayOrder> {
+        match self {
+            Self::Partial(_) => Some(DfaReplayOrder::DescendingClassMass),
+            Self::LegacyPartial(_) => Some(DfaReplayOrder::Fifo),
+            Self::None | Self::Context(_) => None,
+        }
     }
 }
 
@@ -3198,7 +3226,16 @@ impl CompiledProgram {
     }
 
     const fn program_format_version(&self) -> u32 {
-        if self.automaton.has_ordered_edge_dispatch()
+        let class_mass_dfa = matches!(
+            self.engine.replay_order(),
+            Some(DfaReplayOrder::DescendingClassMass)
+        ) || matches!(
+            self.optimization_sidecar.partial_replay_order(),
+            Some(DfaReplayOrder::DescendingClassMass)
+        );
+        if class_mass_dfa {
+            PROGRAM_FORMAT_VERSION_V6
+        } else if self.automaton.has_ordered_edge_dispatch()
             || self.automaton.has_epsilon_closure_dispatch()
         {
             PROGRAM_FORMAT_VERSION_V5
@@ -3221,9 +3258,9 @@ impl CompiledProgram {
 
     #[must_use]
     pub const fn dfa_stats(&self) -> Option<DfaStats> {
-        match &self.engine {
-            ProgramEngine::OrderedNfa => None,
-            ProgramEngine::OrderedDfa(machine) => Some(machine.stats()),
+        match self.engine.ordered_dfa() {
+            Some(machine) => Some(machine.stats()),
+            None => None,
         }
     }
 
@@ -5480,7 +5517,7 @@ impl CompiledProgram {
             return Err(ProgramFormatError::Malformed("bad program magic"));
         }
         let version = read_u32_at(header, 8)?;
-        EngineKind::from_tag(header[12])?;
+        let engine_kind = EngineKind::from_tag(header[12])?;
         OutputContract::from_tag(header[13])?;
         header_line_terminator(header, version)?;
         let flags = header_program_flags(header, version)?;
@@ -5489,6 +5526,14 @@ impl CompiledProgram {
         {
             return Err(ProgramFormatError::Malformed(
                 "V5 program has no graph-dispatch marker",
+            ));
+        }
+        if version == PROGRAM_FORMAT_VERSION_V6
+            && flags & PROGRAM_FLAG_NFA_PARTIAL_DFA == 0
+            && engine_kind != EngineKind::OrderedDfa
+        {
+            return Err(ProgramFormatError::Malformed(
+                "V6 program has no class-mass DFA replay identity",
             ));
         }
         let total = usize_from_u64(read_u64_at(header, 16)?, "program total length")?;
@@ -5538,6 +5583,11 @@ impl CompiledProgram {
             program_flags & PROGRAM_FLAG_NFA_ORDERED_EDGE_DISPATCH != 0;
         let epsilon_closure_dispatch_enabled =
             program_flags & PROGRAM_FLAG_NFA_EPSILON_CLOSURE_DISPATCH != 0;
+        let dfa_replay_order = if version == PROGRAM_FORMAT_VERSION_V6 {
+            DfaReplayOrder::DescendingClassMass
+        } else {
+            DfaReplayOrder::Fifo
+        };
         if (mandatory_suffix_enabled || mandatory_cut_enabled || exact_product_enabled)
             && engine_kind != EngineKind::OrderedNfa
         {
@@ -5634,6 +5684,7 @@ impl CompiledProgram {
                         &raw,
                         output == OutputContract::Span && exact_match_width.is_none(),
                         output,
+                        dfa_replay_order,
                     )?;
                     Some(Box::new(partial))
                 } else {
@@ -5668,8 +5719,9 @@ impl CompiledProgram {
                     exact_match_width,
                     alphabet_shape.construction_classes(),
                     &alphabet_shape.boundary_starts,
+                    dfa_replay_order,
                 )?;
-                machine.validate_canonical(&raw, output)?;
+                machine.validate_canonical(&raw, output, dfa_replay_order)?;
                 (ProgramEngine::OrderedDfa(machine), None)
             }
         };
@@ -5743,7 +5795,12 @@ impl CompiledProgram {
         }
         let optimization_sidecar = partial_dfa.map_or(
             ProgramOptimizationSidecar::None,
-            ProgramOptimizationSidecar::Partial,
+            |partial| match dfa_replay_order {
+                DfaReplayOrder::Fifo => ProgramOptimizationSidecar::LegacyPartial(partial),
+                DfaReplayOrder::DescendingClassMass => {
+                    ProgramOptimizationSidecar::Partial(partial)
+                }
+            },
         );
         let program = Self {
             raw,
@@ -7147,7 +7204,8 @@ fn header_line_terminator(header: &[u8], version: u32) -> Result<u8, ProgramForm
         }
         PROGRAM_FORMAT_VERSION_V3
         | PROGRAM_FORMAT_VERSION_V4
-        | PROGRAM_FORMAT_VERSION_V5 => Ok(header[14]),
+        | PROGRAM_FORMAT_VERSION_V5
+        | PROGRAM_FORMAT_VERSION_V6 => Ok(header[14]),
         _ => Err(ProgramFormatError::Malformed(
             "unsupported program format version",
         )),
@@ -7180,6 +7238,15 @@ fn header_program_flags(header: &[u8], version: u32) -> Result<u8, ProgramFormat
             if flags & !PROGRAM_V5_KNOWN_FLAGS != 0 {
                 return Err(ProgramFormatError::Malformed(
                     "V5 program header contains unknown flags",
+                ));
+            }
+            Ok(flags)
+        }
+        PROGRAM_FORMAT_VERSION_V6 => {
+            let flags = header[15];
+            if flags & !PROGRAM_V6_KNOWN_FLAGS != 0 {
+                return Err(ProgramFormatError::Malformed(
+                    "V6 program header contains unknown flags",
                 ));
             }
             Ok(flags)
@@ -10827,7 +10894,7 @@ mod tests {
             baseline_stats.forward_states_before_minimization,
             131_072
         );
-        let direct_baseline = match dfa::determinize(
+        let direct_baseline = match dfa::determinize_current_ordered(
             &baseline.raw,
             true,
             DeterminizeLimits::default(),
@@ -10874,7 +10941,7 @@ mod tests {
         assert_eq!(report.effective_limits.max_states, 256);
         assert_eq!(report.decline, None);
         assert!(report.work_completed <= report.effective_limits.max_work);
-        let ordered_rescue_probe = match dfa::determinize(
+        let ordered_rescue_probe = match dfa::determinize_current_ordered(
             &rescued.raw,
             true,
             DeterminizeLimits {
@@ -10985,8 +11052,8 @@ mod tests {
         );
         assert_eq!(decline.states_completed, 153);
 
-        let legacy_partial = match dfa::determinize(&below.raw, true, below_limits)
-            .expect("direct legacy partial construction")
+        let ordered_partial = match dfa::determinize_current_ordered(&below.raw, true, below_limits)
+            .expect("direct current partial construction")
         {
             DeterminizeOutcome::Declined {
                 partial: Some(partial),
@@ -10994,7 +11061,7 @@ mod tests {
             } => partial,
             _ => panic!("direct legacy construction did not retain a partial"),
         };
-        assert_eq!(below.partial_dfa(), Some(&legacy_partial));
+        assert_eq!(below.partial_dfa(), Some(&ordered_partial));
         assert!(
             below
                 .determinization_report()
@@ -11119,7 +11186,11 @@ mod tests {
         };
         assert!(
             existential_machine
-                .validate_canonical(&optimized.raw, OutputContract::SelectedEnd)
+                .validate_canonical(
+                    &optimized.raw,
+                    OutputContract::SelectedEnd,
+                    DfaReplayOrder::DescendingClassMass,
+                )
                 .is_err(),
             "existential terminal edges are not canonical for endpoint selection"
         );
@@ -11197,8 +11268,13 @@ mod tests {
         );
         assert!(semantic.partial_dfa().is_some());
         let semantic_bytes = semantic.serialize().expect("serialize semantic partial");
+        assert_eq!(
+            u32::from_le_bytes(semantic_bytes[8..12].try_into().unwrap()),
+            PROGRAM_FORMAT_VERSION_V6
+        );
         let semantic_restored = CompiledProgram::deserialize(&semantic_bytes)
             .expect("deserialize semantic partial");
+        assert_eq!(semantic_restored.serialize().unwrap(), semantic_bytes);
 
         let mut legacy = program(
             pattern,
@@ -11220,13 +11296,29 @@ mod tests {
                 }
             };
         legacy.optimization_sidecar =
-            ProgramOptimizationSidecar::Partial(Box::new(legacy_partial));
+            ProgramOptimizationSidecar::LegacyPartial(Box::new(legacy_partial));
         legacy.engine_selection_reason = Some(EngineSelectionReason::DeterminizationResourceLimit);
         legacy.determinization_report = Some(legacy_report);
+        assert!(
+            legacy
+                .automaton
+                .try_enable_epsilon_closure_dispatch()
+                .expect("derive current graph marker for legacy FIFO partial")
+        );
         let legacy_bytes = legacy.serialize().expect("serialize legacy partial");
+        assert_eq!(
+            u32::from_le_bytes(legacy_bytes[8..12].try_into().unwrap()),
+            PROGRAM_FORMAT_VERSION_V5
+        );
         assert_ne!(legacy_bytes, semantic_bytes);
         let legacy_restored = CompiledProgram::deserialize(&legacy_bytes)
             .expect("deserialize legacy ordered partial");
+        assert_eq!(legacy_restored.serialize().unwrap(), legacy_bytes);
+        assert_eq!(
+            legacy_restored.optimization_sidecar.partial_replay_order(),
+            Some(DfaReplayOrder::Fifo),
+        );
+        assert!(legacy_restored.automaton.has_epsilon_closure_dispatch());
 
         let reference = program(
             pattern,
@@ -11268,6 +11360,96 @@ mod tests {
         }
         assert!(semantic_workspace.partial.as_deref().unwrap().state.resumed > 0);
         assert!(legacy_workspace.partial.as_deref().unwrap().state.resumed > 0);
+    }
+
+    #[test]
+    fn complete_class_mass_v6_and_fifo_v4_are_strict_and_all_output_general() {
+        let pattern = r"(?:a|bb)+Q";
+        let haystacks = generated_byte_strings(&[0, b'a', b'b', b'Q', 255], 5);
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let ranked = program(
+                pattern,
+                output,
+                CompileMode::Optimizing,
+                DeterminizeLimits::default(),
+            );
+            assert_eq!(ranked.engine_kind(), EngineKind::OrderedDfa);
+            let ranked_bytes = ranked.serialize().expect("serialize class-mass DFA");
+            assert_eq!(
+                u32::from_le_bytes(ranked_bytes[8..12].try_into().unwrap()),
+                PROGRAM_FORMAT_VERSION_V6,
+            );
+            let ranked_restored = CompiledProgram::deserialize(&ranked_bytes)
+                .expect("deserialize class-mass DFA");
+            assert_eq!(ranked_restored.serialize().unwrap(), ranked_bytes);
+
+            let mut wrong_replay = ranked_bytes.clone();
+            wrong_replay[8..12].copy_from_slice(&PROGRAM_FORMAT_VERSION_V4.to_le_bytes());
+            assert!(
+                CompiledProgram::deserialize(&wrong_replay).is_err(),
+                "V6 class-mass work/table identity authenticated as V4 FIFO for {output:?}",
+            );
+
+            let mut fifo = program(
+                pattern,
+                output,
+                CompileMode::Fast,
+                DeterminizeLimits::default(),
+            );
+            let wants_span = output == OutputContract::Span && fifo.exact_match_width.is_none();
+            let fifo_machine = match dfa::determinize(
+                &fifo.raw,
+                wants_span,
+                DeterminizeLimits::default(),
+            )
+            .expect("legacy FIFO complete construction")
+            {
+                DeterminizeOutcome::Complete { machine, .. } => machine,
+                DeterminizeOutcome::Declined { report, .. } => {
+                    panic!("legacy FIFO fixture declined: {report:?}")
+                }
+            };
+            fifo.engine = ProgramEngine::OrderedDfa(fifo_machine);
+            fifo.engine_selection_reason = Some(EngineSelectionReason::CompleteDfa);
+            let fifo_bytes = fifo.serialize().expect("serialize FIFO DFA");
+            assert_eq!(
+                u32::from_le_bytes(fifo_bytes[8..12].try_into().unwrap()),
+                PROGRAM_FORMAT_VERSION_V4,
+            );
+            let fifo_restored =
+                CompiledProgram::deserialize(&fifo_bytes).expect("deserialize FIFO DFA");
+            assert_eq!(fifo_restored.serialize().unwrap(), fifo_bytes);
+            assert_ne!(ranked_bytes, fifo_bytes);
+
+            let reference = program(
+                pattern,
+                output,
+                CompileMode::Fast,
+                DeterminizeLimits::default(),
+            );
+            for haystack in &haystacks {
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let window = SearchWindow::new(start, end);
+                        let expected = reference.search(haystack, window).unwrap();
+                        assert_eq!(
+                            ranked_restored.search(haystack, window).unwrap(),
+                            expected,
+                            "ranked/{output:?}/{haystack:?}/{window:?}",
+                        );
+                        assert_eq!(
+                            fifo_restored.search(haystack, window).unwrap(),
+                            expected,
+                            "FIFO/{output:?}/{haystack:?}/{window:?}",
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -11324,7 +11506,7 @@ mod tests {
             let bytes = partial.serialize().expect("serialize partial DFA");
             assert_eq!(
                 u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
-                PROGRAM_FORMAT_VERSION_V5
+                PROGRAM_FORMAT_VERSION_V6
             );
             assert_ne!(bytes[15] & PROGRAM_FLAG_NFA_PARTIAL_DFA, 0);
             assert_ne!(
@@ -11332,7 +11514,10 @@ mod tests {
                 0
             );
             let restored = CompiledProgram::deserialize(&bytes).expect("restore partial DFA");
-            assert!(restored.partial_dfa().is_some());
+            assert_eq!(
+                restored.optimization_sidecar.partial_replay_order(),
+                Some(DfaReplayOrder::DescendingClassMass)
+            );
             assert_eq!(restored.serialize().unwrap(), bytes);
 
             let reference = program(
@@ -14874,8 +15059,8 @@ mod tests {
             ))
         ));
 
-        // Optimizing artifacts that complete determinization still use the
-        // unchanged V4 representation because they need no NFA dispatch.
+        // Optimizing artifacts that complete determinization use V6 to bind
+        // the exactly metered class-mass replay identity.
         let complete = raw_program(
             &raw,
             OutputContract::Span,
@@ -14884,7 +15069,7 @@ mod tests {
         );
         assert_eq!(complete.engine_kind(), EngineKind::OrderedDfa);
         assert!(!complete.automaton.has_ordered_edge_dispatch());
-        assert_eq!(complete.program_format_version(), PROGRAM_FORMAT_VERSION_V4);
+        assert_eq!(complete.program_format_version(), PROGRAM_FORMAT_VERSION_V6);
 
         // A fresh complete contextual DFA remains NFA-backed for its bounded
         // fallback routes, so it may legitimately carry the same sidecar.
@@ -15269,12 +15454,26 @@ mod tests {
 
     #[test]
     fn strict_v1_ordered_dfa_canonical_upgrades_to_v4_with_identical_semantics() {
-        let original = program(
+        let mut original = program(
             "(?:ab|a)+?b",
             OutputContract::Span,
-            CompileMode::Optimizing,
+            CompileMode::Fast,
             DeterminizeLimits::default(),
         );
+        let fifo_machine = match dfa::determinize(
+            &original.raw,
+            true,
+            DeterminizeLimits::default(),
+        )
+        .expect("V1 FIFO ordered DFA")
+        {
+            DeterminizeOutcome::Complete { machine, .. } => machine,
+            DeterminizeOutcome::Declined { report, .. } => {
+                panic!("V1 FIFO fixture declined: {report:?}")
+            }
+        };
+        original.engine = ProgramEngine::OrderedDfa(fifo_machine);
+        original.engine_selection_reason = Some(EngineSelectionReason::CompleteDfa);
         assert_eq!(original.engine_kind(), EngineKind::OrderedDfa);
         let canonical_v4 = original.serialize().unwrap();
         let mut v1 = canonical_v4.clone();
