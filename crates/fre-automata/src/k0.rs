@@ -22804,6 +22804,7 @@ fn expand_root<E: PikeBoundaryEvaluator>(
     Ok(None)
 }
 
+#[cfg(test)]
 pub(crate) fn zero_width_edge_enabled(
     automaton: &Automaton,
     kind: EdgeKind,
