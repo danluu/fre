@@ -23058,49 +23058,87 @@ fn expand_root<E: PikeBoundaryEvaluator>(
         });
     }
     if meter.limit == u64::MAX {
-        if let Some(program) = automaton
-            .epsilon_closure_dispatch
-            .as_ref()
-            .and_then(|dispatch| dispatch.program(root.state))
-        {
-            return expand_compiled_epsilon_root(
-                program,
-                position,
-                root.start,
-                workspace,
-                meter,
-            );
+        if let Some(dispatch) = automaton.epsilon_closure_dispatch.as_ref() {
+            match dispatch.root(root.state) {
+                crate::epsilon_closure_dispatch::ClosureRoot::Program(program) => {
+                    return expand_compiled_epsilon_root(
+                        program,
+                        position,
+                        root.start,
+                        workspace,
+                        meter,
+                    );
+                }
+                crate::epsilon_closure_dispatch::ClosureRoot::Consume => {
+                    return expand_direct_epsilon_leaf_root(
+                        false, position, root, workspace, meter,
+                    );
+                }
+                crate::epsilon_closure_dispatch::ClosureRoot::Accept => {
+                    return expand_direct_epsilon_leaf_root(
+                        true, position, root, workspace, meter,
+                    );
+                }
+                crate::epsilon_closure_dispatch::ClosureRoot::Scalar => {}
+            }
         }
     }
     workspace.stack_len = 0;
-    workspace.push_stack(root)?;
+    let mut thread = root;
 
-    while let Some(thread) = workspace.pop_stack() {
+    loop {
         meter.charge(1, position)?;
         let state = crate::plan::plan_index(thread.state);
-        if workspace.seen_at[state] == workspace.generation {
-            continue;
-        }
-        workspace.seen_at[state] = workspace.generation;
+        if workspace.seen_at[state] != workspace.generation {
+            workspace.seen_at[state] = workspace.generation;
 
-        match automaton.roles[state] {
-            StateRole::Accept => return Ok(Some(MatchSpan::new(thread.start, position))),
-            StateRole::Consume => workspace.push_current(thread)?,
-            StateRole::Split => {
-                // Reverse push produces forward edge order under a LIFO stack.
-                for edge in automaton.state_edges(thread.state).rev() {
-                    meter.charge(1, position)?;
-                    let enabled = evaluator.edge_enabled(automaton.edge_kinds[edge])?;
-                    if enabled {
-                        workspace.push_stack(Thread {
-                            state: automaton.edge_targets[edge],
-                            start: thread.start,
-                        })?;
+            match automaton.roles[state] {
+                StateRole::Accept => return Ok(Some(MatchSpan::new(thread.start, position))),
+                StateRole::Consume => workspace.push_current(thread)?,
+                StateRole::Split => {
+                    // Reverse push produces forward edge order under a LIFO stack.
+                    for edge in automaton.state_edges(thread.state).rev() {
+                        meter.charge(1, position)?;
+                        let enabled = evaluator.edge_enabled(automaton.edge_kinds[edge])?;
+                        if enabled {
+                            workspace.push_stack(Thread {
+                                state: automaton.edge_targets[edge],
+                                start: thread.start,
+                            })?;
+                        }
                     }
                 }
             }
         }
+        let Some(next) = workspace.pop_stack() else {
+            return Ok(None);
+        };
+        thread = next;
     }
+}
+
+/// Settle a sidecar-classified leaf without probing the instruction arena or
+/// materializing the scalar root stack. The state-pop charge still precedes
+/// shared-seen mutation and every externally visible result.
+#[inline]
+fn expand_direct_epsilon_leaf_root(
+    accept: bool,
+    position: usize,
+    root: Thread,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+) -> Result<Option<MatchSpan>, SearchError> {
+    workspace.stack_len = 0;
+    meter.charge(1, position)?;
+    let state = crate::plan::plan_index(root.state);
+    if workspace.seen_at[state] == workspace.generation {
+        return Ok(None);
+    }
+    workspace.seen_at[state] = workspace.generation;
+    if accept {
+        return Ok(Some(MatchSpan::new(root.start, position)));
+    }
+    workspace.push_current(root)?;
     Ok(None)
 }
 
@@ -31982,6 +32020,202 @@ mod tests {
             CompileLimits::default(),
         )
         .unwrap()
+    }
+
+    fn boundary_leaf_roots() -> Automaton {
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Accept,
+                    StateRole::Consume,
+                    StateRole::Accept,
+                ],
+                edge_offsets: vec![0, 2, 3, 4, 4, 5, 5],
+                edge_targets: vec![1, 4, 2, 3, 5],
+                edge_kinds: vec![
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                ],
+                byte_starts: vec![0, 0, b'a', b'b', b'c'],
+                byte_ends: vec![0, 0, b'a', b'b', b'c'],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "leaf outputs, stale stack, shared seen, finite work, and overflow share one exact root audit"
+    )]
+    fn leaf_roots_preserve_stack_seen_and_exact_work_with_or_without_dispatch() {
+        fn expand_leaf(
+            automaton: &Automaton,
+            state: u32,
+            start: usize,
+            workspace: &mut K0Workspace,
+            meter: &mut WorkMeter,
+        ) -> Result<Option<MatchSpan>, SearchError> {
+            let mut evaluator = super::AssertionFreePikeBoundary;
+            super::expand_root(
+                automaton,
+                b"",
+                0,
+                &mut evaluator,
+                super::Thread { state, start },
+                workspace,
+                meter,
+            )
+        }
+
+        for enable_dispatch in [false, true] {
+            let mut automaton = boundary_leaf_roots();
+            if enable_dispatch {
+                assert!(automaton.try_enable_epsilon_closure_dispatch().unwrap());
+                assert!(automaton.has_epsilon_closure_dispatch());
+            }
+            let mut workspace =
+                K0Workspace::new(&automaton, WorkspaceLimits::unlimited()).unwrap();
+            workspace.generation = 1;
+            let mut meter = WorkMeter::new(u64::MAX, 0);
+
+            workspace.stack_len = 1;
+            assert_eq!(
+                expand_leaf(&automaton, 2, 7, &mut workspace, &mut meter),
+                Ok(None)
+            );
+            assert_eq!(workspace.stack_len, 0);
+            assert_eq!(workspace.current_len, 1);
+            assert_eq!(workspace.current[0].state, 2);
+            assert_eq!(workspace.current[0].start, 7);
+
+            // A shared-seen hit still charges the scalar pop but neither
+            // duplicates the current state nor preserves a stale stack.
+            workspace.stack_len = 1;
+            assert_eq!(
+                expand_leaf(&automaton, 2, 99, &mut workspace, &mut meter),
+                Ok(None)
+            );
+            assert_eq!(workspace.stack_len, 0);
+            assert_eq!(workspace.current_len, 1);
+
+            workspace.stack_len = 1;
+            assert_eq!(
+                expand_leaf(&automaton, 3, 11, &mut workspace, &mut meter),
+                Ok(Some(MatchSpan::new(11, 0)))
+            );
+            assert_eq!(workspace.stack_len, 0);
+            assert_eq!(meter.consumed, 3);
+
+            // Accept participates in the same generation-wide seen set.
+            workspace.stack_len = 1;
+            assert_eq!(
+                expand_leaf(&automaton, 3, 13, &mut workspace, &mut meter),
+                Ok(None)
+            );
+            assert_eq!(workspace.stack_len, 0);
+            assert_eq!(meter.consumed, 4);
+
+            let mut refused =
+                K0Workspace::new(&automaton, WorkspaceLimits::unlimited()).unwrap();
+            refused.generation = 1;
+            refused.stack_len = 1;
+            let mut finite = WorkMeter::new(0, 0);
+            assert!(matches!(
+                expand_leaf(&automaton, 2, 0, &mut refused, &mut finite),
+                Err(SearchError::WorkLimitExceeded {
+                    limit: 0,
+                    consumed: 0,
+                    requested: 1,
+                    position: 0,
+                })
+            ));
+            assert_eq!(refused.stack_len, 0);
+            assert_eq!(refused.current_len, 0);
+            assert_ne!(refused.seen_at[2], refused.generation);
+
+            let mut exact =
+                K0Workspace::new(&automaton, WorkspaceLimits::unlimited()).unwrap();
+            exact.generation = 1;
+            let mut near_overflow = WorkMeter::new(u64::MAX, u64::MAX - 1);
+            assert_eq!(
+                expand_leaf(&automaton, 3, 17, &mut exact, &mut near_overflow),
+                Ok(Some(MatchSpan::new(17, 0)))
+            );
+            assert_eq!(near_overflow.consumed, u64::MAX);
+            assert!(matches!(
+                expand_leaf(&automaton, 3, 17, &mut exact, &mut near_overflow),
+                Err(SearchError::ArithmeticOverflow {
+                    computation: "search work counter",
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn boundary_leaf_dispatch_is_differential_for_every_output_contract() {
+        let scalar = boundary_leaf_roots();
+        let mut dispatched = boundary_leaf_roots();
+        assert!(dispatched.try_enable_epsilon_closure_dispatch().unwrap());
+        pin_without_start_filter(&scalar);
+        pin_without_start_filter(&dispatched);
+
+        macro_rules! compare {
+            ($operation:ty, $haystack:expr, $window:expr) => {{
+                let mut scalar_workspace =
+                    K0Workspace::new(&scalar, WorkspaceLimits::unlimited()).unwrap();
+                let mut dispatched_workspace =
+                    K0Workspace::new(&dispatched, WorkspaceLimits::unlimited()).unwrap();
+                let expected = scalar
+                    .prepare::<$operation>()
+                    .search_window_with_workspace(
+                        $haystack,
+                        $window,
+                        &mut scalar_workspace,
+                        SearchLimits::unlimited(),
+                    )
+                    .unwrap();
+                let actual = dispatched
+                    .prepare::<$operation>()
+                    .search_window_with_workspace(
+                        $haystack,
+                        $window,
+                        &mut dispatched_workspace,
+                        SearchLimits::unlimited(),
+                    )
+                    .unwrap();
+                assert_eq!(actual.output(), expected.output());
+                assert_eq!(actual.accounting(), expected.accounting());
+            }};
+        }
+
+        for haystack in [
+            b"".as_slice(),
+            b"a",
+            b"ab",
+            b"c",
+            b"cab",
+            b"acb",
+            b"zabz",
+        ] {
+            for start in 0..=haystack.len() {
+                for end in start..=haystack.len() {
+                    let window = SearchWindow::new(start, end);
+                    compare!(Exists, haystack, window);
+                    compare!(EarliestEnd, haystack, window);
+                    compare!(SelectedEnd, haystack, window);
+                    compare!(Span, haystack, window);
+                }
+            }
+        }
     }
 
     #[test]

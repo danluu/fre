@@ -19,7 +19,12 @@ use core::{fmt, mem::size_of};
 
 use crate::plan::{plan_index, Automaton, StateRole};
 
-const NO_PROGRAM: u32 = u32::MAX;
+// Retained program offsets are bounded below 2^30, leaving the high bit as a
+// branch-friendly tag that cannot collide with instruction storage.
+const ROOT_SENTINEL_BIT: u32 = 1 << 31;
+const NO_PROGRAM: u32 = ROOT_SENTINEL_BIT;
+const DIRECT_CONSUME: u32 = ROOT_SENTINEL_BIT | 1;
+const DIRECT_ACCEPT: u32 = ROOT_SENTINEL_BIT | 2;
 const ACTION_SHIFT: u32 = 30;
 const SUBTREE_END_MASK: u32 = (1_u32 << ACTION_SHIFT) - 1;
 
@@ -105,6 +110,16 @@ pub(crate) struct ClosureInstruction {
     edge_work: u32,
 }
 
+/// One boundary root classified by the same state-index lookup that locates
+/// compiled Split bytecode. Leaf sentinels let runtime settle the common
+/// Consume/Accept cases without first probing the instruction arena.
+pub(crate) enum ClosureRoot<'a> {
+    Program(&'a [ClosureInstruction]),
+    Consume,
+    Accept,
+    Scalar,
+}
+
 impl ClosureInstruction {
     const fn placeholder(state: u32, action: ClosureAction, edge_work: u32) -> Self {
         Self {
@@ -148,8 +163,9 @@ impl ClosureInstruction {
     }
 }
 
-/// Immutable programs indexed by the only states that can begin a forward
-/// boundary closure: the automaton start and consuming-edge targets.
+/// Immutable Split programs and leaf actions indexed by the only states that
+/// can begin a forward boundary closure: the automaton start and every target
+/// of a consuming edge.
 ///
 /// The thin one-element owner keeps the optional sidecar to one pointer in
 /// [`Automaton`] while retaining exact fallible allocation.
@@ -237,8 +253,19 @@ impl EpsilonClosureDispatch {
         let mut emitted_edge_visits = 0usize;
         let mut derivation_work = 0usize;
         for (state, &is_root) in roots.iter().enumerate() {
-            if is_root == 0 || automaton.roles[state] != StateRole::Split {
+            if is_root == 0 {
                 continue;
+            }
+            match automaton.roles[state] {
+                StateRole::Consume => {
+                    program_offsets[state] = DIRECT_CONSUME;
+                    continue;
+                }
+                StateRole::Accept => {
+                    program_offsets[state] = DIRECT_ACCEPT;
+                    continue;
+                }
+                StateRole::Split => {}
             }
             let root = u32::try_from(state).expect("validated state index fits u32");
             let program_shape = count_program(
@@ -294,16 +321,29 @@ impl EpsilonClosureDispatch {
     }
 
     #[inline]
-    pub(crate) fn program(&self, state: u32) -> Option<&[ClosureInstruction]> {
+    pub(crate) fn root(&self, state: u32) -> ClosureRoot<'_> {
         let data = &self.0[0];
-        let begin = plan_index(*data.program_offsets.get(plan_index(state))?);
-        if begin == plan_index(NO_PROGRAM) {
-            return None;
+        let Some(&encoded) = data.program_offsets.get(plan_index(state)) else {
+            return ClosureRoot::Scalar;
+        };
+        if encoded & ROOT_SENTINEL_BIT != 0 {
+            return match encoded {
+                DIRECT_CONSUME => ClosureRoot::Consume,
+                DIRECT_ACCEPT => ClosureRoot::Accept,
+                _ => ClosureRoot::Scalar,
+            };
         }
-        let first = *data.instructions.get(begin)?;
+        let begin = plan_index(encoded);
+        let Some(first) = data.instructions.get(begin).copied() else {
+            return ClosureRoot::Scalar;
+        };
         let length = first.subtree_end();
-        let end = begin.checked_add(length)?;
-        data.instructions.get(begin..end)
+        let Some(end) = begin.checked_add(length) else {
+            return ClosureRoot::Scalar;
+        };
+        data.instructions
+            .get(begin..end)
+            .map_or(ClosureRoot::Scalar, ClosureRoot::Program)
     }
 
     pub(crate) const fn retained_bytes(&self) -> usize {
@@ -744,7 +784,7 @@ mod tests {
     use core::mem::size_of;
 
     use super::{
-        ClosureAction, ClosureInstruction, EpsilonClosureDispatchData,
+        ClosureAction, ClosureInstruction, ClosureRoot, EpsilonClosureDispatchData,
         MAX_RETAINED_TO_GRAPH_FACTOR,
     };
     use crate::{Automaton, CompileLimits, EdgeKind, RawPlan, StateRole};
@@ -781,6 +821,35 @@ mod tests {
         .unwrap()
     }
 
+    fn branching_leaf_roots() -> Automaton {
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Accept,
+                    StateRole::Consume,
+                    StateRole::Accept,
+                ],
+                edge_offsets: vec![0, 2, 3, 4, 4, 5, 5],
+                edge_targets: vec![1, 4, 2, 3, 5],
+                edge_kinds: vec![
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                ],
+                byte_starts: vec![0, 0, b'a', b'b', b'c'],
+                byte_ends: vec![0, 0, b'a', b'b', b'c'],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn canonical_program_unfolds_priority_and_marks_only_ancestor_backedges() {
         let mut automaton = branching_cycle(false);
@@ -788,8 +857,13 @@ mod tests {
         let dispatch = automaton.epsilon_closure_dispatch.as_ref().unwrap();
         assert_eq!(dispatch.admitted_programs(), 1);
         assert!(dispatch.eliminated_edge_visits() >= 4);
-        let program = dispatch.program(0).unwrap();
-        assert!(dispatch.program(1).is_none(), "non-root Split has no descriptor");
+        let ClosureRoot::Program(program) = dispatch.root(0) else {
+            panic!("the admitted start Split has compiled bytecode");
+        };
+        assert!(
+            matches!(dispatch.root(1), ClosureRoot::Scalar),
+            "non-root Split has no descriptor"
+        );
         assert_eq!(program[0].state(), 0);
         assert_eq!(program[0].action(), ClosureAction::Split);
         assert_eq!(program[0].subtree_end(), program.len());
@@ -818,6 +892,19 @@ mod tests {
             cloned.epsilon_closure_dispatch,
             automaton.epsilon_closure_dispatch
         );
+    }
+
+    #[test]
+    fn root_lookup_classifies_boundary_leaves_without_instruction_entries() {
+        let mut automaton = branching_leaf_roots();
+        assert!(automaton.try_enable_epsilon_closure_dispatch().unwrap());
+        let dispatch = automaton.epsilon_closure_dispatch.as_ref().unwrap();
+        assert!(matches!(dispatch.root(0), ClosureRoot::Program(_)));
+        assert!(matches!(dispatch.root(1), ClosureRoot::Scalar));
+        assert!(matches!(dispatch.root(2), ClosureRoot::Consume));
+        assert!(matches!(dispatch.root(3), ClosureRoot::Accept));
+        assert!(matches!(dispatch.root(4), ClosureRoot::Scalar));
+        assert!(matches!(dispatch.root(5), ClosureRoot::Accept));
     }
 
     #[test]
