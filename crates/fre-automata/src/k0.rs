@@ -2386,10 +2386,11 @@ const CONTEXT_LAZY_LOOP_SKIP_BITMAP_PUBLICATION_WORK: u64 = 1;
 /// A bounded set of independently authenticated contextual-loop proofs.
 ///
 /// Exact signatures keep their physical owner slots across reanalysis, so an
-/// unchanged compiled scanner is never rebuilt or republished. The state
-/// bitmap rejects nonmembers before the remaining exact-owner walk. Runtime
-/// lookup first checks the invocation's active owner, preserving the common
-/// same-state path without making discovery or source order part of ranking.
+/// unchanged compiled scanner is never rebuilt or republished. For state IDs
+/// in `0..=255`, the bitmap rejects nonmembers before the remaining exact-owner
+/// walk; wider IDs use the exact-owner walk directly. Runtime lookup first
+/// checks the invocation's active owner, preserving the common same-state path
+/// without making discovery or source order part of ranking.
 #[derive(Debug)]
 struct ContextLazyLoopSkipPlans {
     entries: [Option<ContextLazyLoopSkipPlan>; CONTEXT_LAZY_LOOP_SKIP_PLAN_CAPACITY],
