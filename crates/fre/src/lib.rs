@@ -14273,7 +14273,9 @@ mod tests {
             .mandatory_suffix
             .as_ref()
             .expect("incumbent long suffix is retained");
-        assert_eq!(narrow_suffix.needle(), b"XYZ");
+        // The analyzer correctly includes the repetition's four-byte
+        // mandatory minimum in the longest exact suffix.
+        assert_eq!(narrow_suffix.needle(), b"aaaaXYZ");
         assert!(narrow_suffix.has_consumption_run());
         assert_eq!(narrow_suffix.finite_maximum_match_bytes(), None);
 
