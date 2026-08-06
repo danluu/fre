@@ -300,12 +300,16 @@ pub enum RetainedPartialPreflight {
 
 /// Fixed-layout read-only view of one prepared K0 warmed-root cache.
 ///
-/// Addresses are represented as `usize` rather than Rust pointers so the
-/// prepared workspace remains movable and `Send`; they become live only after
-/// the final owning prepared regex has reached its exclusive call site. A
-/// generated entry must authenticate `cache_identity` before following either
-/// source address and conservatively side-exit on an unpublished cell or a
-/// learned-loop row.
+/// Addresses are represented as exposed-provenance `usize` values rather than
+/// Rust pointers so the prepared workspace remains movable and `Send`. They
+/// become live only after the final owning prepared regex has reached its
+/// exclusive call site, and remain valid only for the synchronous native scan
+/// admitted by that preflight. They must not be retained across a helper call,
+/// re-entry, or destruction. A generated entry must authenticate the immutable
+/// `cache_identity` before following either source address and conservatively
+/// side-exit on an unpublished cell or a learned-loop row. The identity binds
+/// the descriptor to one fixed-capacity cache; it is not a mutable generation
+/// counter or a single-use ticket.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[repr(C)]
@@ -2510,8 +2514,8 @@ impl DynamicNativeRowsWorkspace {
             return false;
         }
         self.native_rows = DynamicNativeRowsV1 {
-            rows_address: direct.rows_address().addr(),
-            class_map_address: self.class_map.as_ptr().addr(),
+            rows_address: direct.rows_address().expose_provenance(),
+            class_map_address: self.class_map.as_ptr().expose_provenance(),
             live_cells,
             row_stride: direct.row_stride(),
             unfilled_cell: direct.unfilled_cell(),
@@ -4425,8 +4429,11 @@ impl CompiledProgram {
 
     /// Authenticate and project an ordinary prepared K0 cache for the
     /// additive dynamic warmed-row root. Projection and admission are O(1),
-    /// allocation-free, and publish a generation token that generated code
-    /// compares against the descriptor before reading either source address.
+    /// allocation-free, and publish the cache's immutable identity token for
+    /// generated code to compare against the descriptor before reading either
+    /// source address. The returned exposed-provenance addresses are valid only
+    /// for that synchronous admitted scan and must not survive a helper call or
+    /// re-entry.
     #[doc(hidden)]
     pub fn preflight_dynamic_native_rows_with_workspace(
         &self,
@@ -4486,7 +4493,7 @@ impl CompiledProgram {
                     nullable = dynamic.native_rows.initial_flags & NATIVE_ROWS_INITIAL_PENDING != 0;
                     if !nullable && dynamic.state.claim() {
                         enter = Some((
-                            (&raw const dynamic.native_rows).addr(),
+                            (&raw const dynamic.native_rows).expose_provenance(),
                             dynamic.native_rows.cache_identity,
                         ));
                     }
@@ -4500,11 +4507,11 @@ impl CompiledProgram {
                 0,
             ));
         }
-        if let Some((native_rows_address, generation)) = enter {
+        if let Some((native_rows_address, cache_identity)) = enter {
             return Ok((
                 RetainedPartialPreflight::Enter(window),
                 native_rows_address,
-                generation,
+                cache_identity,
             ));
         }
         self.search_optimized_with_workspace(haystack, window, workspace)

@@ -115,11 +115,15 @@ pub struct FreAotRegexSearchWindowV1 {
     pub end: usize,
 }
 
-/// Exact admitted window and generation-authenticated ordinary K0 rows.
+/// Exact admitted window and identity-authenticated ordinary K0 rows.
 ///
-/// This private record carries the immutable workspace cache generation
-/// separately. Generated code compares it to the descriptor before following
-/// either projected source address.
+/// This private record carries the immutable, process-unique workspace cache
+/// identity separately. The `cache_generation` field name is retained for the
+/// private V1 ABI layout, but the value is neither a mutable generation counter
+/// nor a single-use ticket. Generated code compares it to the descriptor before
+/// following either projected source address. The descriptor and its exposed-
+/// provenance addresses are valid only for the synchronous native scan admitted
+/// by this preflight and must not survive a helper call or re-entry.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[repr(C)]
 pub struct FreAotRegexDynamicRowsPreflightV1 {
@@ -1608,10 +1612,12 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_search_exclusive_partial_prefligh
 ///
 /// On status [`STATUS_PARTIAL_PREFLIGHT_ENTER`], `preflight_out` contains the
 /// exact original search window, a pointer-stable fixed-layout descriptor,
-/// and the immutable cache generation that must equal the descriptor's
-/// generation before either projected address is read. A cold, loop-owned,
-/// adaptively bypassed, or structurally unsupported cache completes through
-/// canonical K0 inside this call and returns an ordinary match status.
+/// and the immutable cache identity that must equal the descriptor's identity
+/// before either projected address is read. These exposed-provenance addresses
+/// are live only until the admitted native scan returns or calls a runtime
+/// helper; generated code must not retain them across that boundary. A cold,
+/// loop-owned, adaptively bypassed, or structurally unsupported cache completes
+/// through canonical K0 inside this call and returns an ordinary match status.
 ///
 /// # Safety
 ///
@@ -1623,7 +1629,7 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_search_exclusive_partial_prefligh
 #[allow(
     unsafe_code,
     clippy::too_many_arguments,
-    reason = "the private dynamic-row boundary carries an authenticated descriptor generation"
+    reason = "the private dynamic-row boundary carries an authenticated descriptor identity"
 )]
 pub unsafe extern "C" fn fre_aot_regex_runtime_search_exclusive_dynamic_rows_preflight_v1(
     handle: FreAotRegexExclusiveHandleV1,
@@ -1659,7 +1665,7 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_search_exclusive_dynamic_rows_pre
         let expected_artifact_identity = expected_artifact_identity_ptr
             .cast::<[u8; ARTIFACT_IDENTITY_BYTES]>()
             .read();
-        let Ok((outcome, native_rows_address, cache_generation)) = prepared
+        let Ok((outcome, native_rows_address, cache_identity)) = prepared
             .preflight_dynamic_native_rows(
                 haystack,
                 SearchWindow::new(window_start, window_end),
@@ -1679,7 +1685,7 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_search_exclusive_dynamic_rows_pre
                     start: window.start(),
                     end: window.end(),
                     native_rows_address,
-                    cache_generation,
+                    cache_generation: cache_identity,
                 });
                 STATUS_PARTIAL_PREFLIGHT_ENTER
             }

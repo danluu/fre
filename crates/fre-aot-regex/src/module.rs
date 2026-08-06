@@ -16495,14 +16495,14 @@ fn lower_aarch64_dynamic_rows_prepared() -> Result<(Vec<u8>, Vec<ModuleRelocatio
     )?)?;
     assembler.instruction(aarch64_cmp_x_imm(14, 0)?)?;
     assembler.branch_cond(AARCH64_EQ, framed_fallback)?;
-    assembler.instruction(aarch64_load_x_imm(10, 31, 72)?)?; // output generation
+    assembler.instruction(aarch64_load_x_imm(10, 31, 72)?)?; // output cache identity
     assembler.instruction(aarch64_cmp_x_imm(10, 0)?)?;
     assembler.branch_cond(AARCH64_EQ, framed_fallback)?;
     assembler.instruction(aarch64_load_x_imm(
         9,
         17,
         u16::try_from(NATIVE_ROWS_CACHE_IDENTITY)
-            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic generation"))?,
+            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic cache identity"))?,
     )?)?;
     assembler.instruction(aarch64_cmp_x(10, 9)?)?;
     assembler.branch_cond(AARCH64_NE, framed_fallback)?;
