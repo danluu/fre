@@ -400,6 +400,25 @@ struct NativeDynamicRowsEmission {
     scanner: Option<NativeScannerEmission>,
 }
 
+/// Target-neutral representation selected for one graph-certified dynamic
+/// root. Compact range filters retain their established immediate-constant
+/// lowering. Every other nontrivial membership is represented by the same
+/// canonical bitmap/nibble tables used by retained native DFA roots.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeDynamicRootPlan {
+    Range(NativeStartFilter),
+    Exact(NativeExactByteSet),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum X86DynamicRootPlan {
+    Range(NativeStartFilter),
+    Exact {
+        set: NativeExactByteSet,
+        storage: NativeExactByteSetStorage,
+    },
+}
+
 /// Concrete `AArch64` lowering selected for one graph-certified dynamic root.
 ///
 /// Table offsets are relative to the byte immediately following the embedded
@@ -433,6 +452,57 @@ impl Aarch64DynamicRootPlan {
                 self.sve_kind,
                 Some(Aarch64SveFilterKind::Sve2 { .. })
             )
+    }
+}
+
+/// Table-backed arbitrary-membership lowering for one dynamic `AArch64` root.
+/// All offsets are relative to the byte immediately after the artifact
+/// identity, matching [`Aarch64DynamicRootPlan`]'s range-table convention.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Aarch64DynamicExactRootPlan {
+    set: NativeExactByteSet,
+    storage: NativeExactByteSetStorage,
+    sve_kind: Option<Aarch64ExactSveKind>,
+    use_asimd: bool,
+    use_exact_asimd_lane: bool,
+    use_runtime_vl_dispatch: bool,
+    lane_index_offset: Option<u32>,
+    scanner: NativeScannerEmission,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Aarch64DynamicScannerPlan {
+    Range(Aarch64DynamicRootPlan),
+    Exact(Aarch64DynamicExactRootPlan),
+}
+
+impl Aarch64DynamicScannerPlan {
+    const fn scanner(self) -> NativeScannerEmission {
+        match self {
+            Self::Range(plan) => plan.scanner,
+            Self::Exact(plan) => plan.scanner,
+        }
+    }
+
+    const fn has_tables(self) -> bool {
+        match self {
+            Self::Range(plan) => plan.has_tables(),
+            Self::Exact(_) => true,
+        }
+    }
+
+    const fn uses_sve(self) -> bool {
+        match self {
+            Self::Range(plan) => plan.uses_sve(),
+            Self::Exact(plan) => plan.sve_kind.is_some(),
+        }
+    }
+
+    const fn uses_asimd(self) -> bool {
+        match self {
+            Self::Range(plan) => plan.use_asimd,
+            Self::Exact(plan) => plan.use_asimd,
+        }
     }
 }
 
@@ -1354,22 +1424,33 @@ fn lower_native_dynamic_rows_prepared(
             & !15;
     program_bytes.resize(identity_offset, 0);
     program_bytes.extend_from_slice(&view.artifact_identity);
-    let root_filter = view
+    let root_plan = view
         .root_requirement
-        .map(plan_dynamic_root_filter)
+        .map(plan_dynamic_root_scanner)
         .transpose()?
         .flatten();
+    let x86_root_plan = if target.architecture == Architecture::X86_64 {
+        root_plan
+            .map(|plan| {
+                install_x86_dynamic_root_plan(&mut program_bytes, identity_offset, plan)
+            })
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
     let aarch64_root_plan = if target.architecture == Architecture::Aarch64 {
-        root_filter
-            .map(|filter| {
-                install_aarch64_dynamic_root_plan(
+        root_plan
+            .map(|plan| {
+                install_aarch64_dynamic_scanner_plan(
                     &mut program_bytes,
                     identity_offset,
-                    filter,
+                    plan,
                     target,
                 )
             })
             .transpose()?
+            .flatten()
     } else {
         None
     };
@@ -1403,27 +1484,31 @@ fn lower_native_dynamic_rows_prepared(
     // represent this graph column.
     let prepared = match target.architecture {
         Architecture::X86_64 => {
-            lower_x86_64_dynamic_rows_prepared_for_output(
-                root_filter,
+            lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
+                x86_root_plan,
                 target.features,
                 view.output,
                 exact_span_width,
                 view.root_requirement.is_none(),
             )?
         }
-        Architecture::Aarch64 => lower_aarch64_dynamic_rows_prepared_for_output(
+        Architecture::Aarch64 => lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
             aarch64_root_plan,
             view.output,
             exact_span_width,
             view.root_requirement.is_none(),
         )?,
     };
-    if root_filter.is_some() != prepared.scanner.is_some() {
+    let installed_root = match target.architecture {
+        Architecture::X86_64 => x86_root_plan.is_some(),
+        Architecture::Aarch64 => aarch64_root_plan.is_some(),
+    };
+    if installed_root != prepared.scanner.is_some() {
         return Err(ObjectError::InvalidModule(
             "dynamic root scanner receipt does not match its graph plan",
         ));
     }
-    if let (Some(requirement), Some(_)) = (view.root_requirement, root_filter)
+    if let (Some(requirement), true) = (view.root_requirement, installed_root)
         && !exact_position_scanner_semantics_are_preserved(
             prepared.scanner,
             requirement.scan_offset,
@@ -3123,6 +3208,207 @@ fn plan_dynamic_root_filter(
         ));
     }
     Ok(Some(filter))
+}
+
+fn plan_dynamic_root_scanner(
+    requirement: NativeDynamicRootRequirement,
+) -> Result<Option<NativeDynamicRootPlan>, ObjectError> {
+    if let Some(filter) = plan_dynamic_root_filter(requirement)? {
+        return Ok(Some(NativeDynamicRootPlan::Range(filter)));
+    }
+    Ok(NativeExactByteSet::from_membership(
+        requirement.membership,
+        requirement.scan_offset,
+        true,
+    )
+    .map(NativeDynamicRootPlan::Exact))
+}
+
+/// Append canonical dynamic-root tables relative to the post-identity base.
+/// Building in a temporary vector keeps allocation failure transactional and
+/// makes the offsets independent of the serialized program's absolute size.
+fn stage_dynamic_exact_root_storage(
+    data: &[u8],
+    identity_offset: usize,
+    set: NativeExactByteSet,
+    architecture: Architecture,
+    maximum_table_bytes: usize,
+) -> Result<Option<(NativeExactByteSetStorage, Vec<u8>)>, ObjectError> {
+    let table_base = identity_offset
+        .checked_add(32)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "dynamic exact-root table base",
+        ))?;
+    if data.len() != table_base {
+        return Err(ObjectError::InvalidModule(
+            "dynamic exact-root tables do not follow the artifact identity",
+        ));
+    }
+    let mut tables = Vec::new();
+    let Some(storage) = append_native_exact_byte_set(
+        &mut tables,
+        set,
+        architecture,
+        maximum_table_bytes,
+    )? else {
+        return Ok(None);
+    };
+    Ok(Some((storage, tables)))
+}
+
+fn install_x86_dynamic_root_plan(
+    data: &mut Vec<u8>,
+    identity_offset: usize,
+    plan: NativeDynamicRootPlan,
+) -> Result<Option<X86DynamicRootPlan>, ObjectError> {
+    match plan {
+        NativeDynamicRootPlan::Range(filter) => Ok(Some(X86DynamicRootPlan::Range(filter))),
+        NativeDynamicRootPlan::Exact(set) => {
+            let Some((storage, tables)) = stage_dynamic_exact_root_storage(
+                data,
+                identity_offset,
+                set,
+                Architecture::X86_64,
+                usize::MAX,
+            )? else {
+                return Ok(None);
+            };
+            if data.try_reserve_exact(tables.len()).is_err() {
+                return Ok(None);
+            }
+            data.extend_from_slice(&tables);
+            Ok(Some(X86DynamicRootPlan::Exact { set, storage }))
+        }
+    }
+}
+
+fn install_aarch64_dynamic_scanner_plan(
+    data: &mut Vec<u8>,
+    identity_offset: usize,
+    plan: NativeDynamicRootPlan,
+    target: Target,
+) -> Result<Option<Aarch64DynamicScannerPlan>, ObjectError> {
+    match plan {
+        NativeDynamicRootPlan::Range(filter) => install_aarch64_dynamic_root_plan(
+            data,
+            identity_offset,
+            filter,
+            target,
+        )
+        .map(Aarch64DynamicScannerPlan::Range)
+        .map(Some),
+        NativeDynamicRootPlan::Exact(set) => install_aarch64_dynamic_exact_root_plan(
+            data,
+            identity_offset,
+            set,
+            target,
+            usize::MAX,
+        )
+        .map(|plan| plan.map(Aarch64DynamicScannerPlan::Exact)),
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "exact storage, optional first-lane data, and target receipt form one transaction"
+)]
+fn install_aarch64_dynamic_exact_root_plan(
+    data: &mut Vec<u8>,
+    identity_offset: usize,
+    set: NativeExactByteSet,
+    target: Target,
+    maximum_table_bytes: usize,
+) -> Result<Option<Aarch64DynamicExactRootPlan>, ObjectError> {
+    if target.architecture != Architecture::Aarch64 || !set.from_anchored_prefix {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 dynamic exact root has an invalid graph set",
+        ));
+    }
+    let Some((storage, mut tables)) = stage_dynamic_exact_root_storage(
+        data,
+        identity_offset,
+        set,
+        Architecture::Aarch64,
+        maximum_table_bytes,
+    )? else {
+        return Ok(None);
+    };
+
+    let primary_isa = aarch64_primary_scanner_isa(
+        target.operating_system,
+        target.features,
+        true,
+    );
+    let sve_kind = selected_aarch64_exact_sve_kind(
+        target.operating_system,
+        target.features,
+        storage,
+    );
+    let use_runtime_vl_dispatch = sve_kind.is_some()
+        && aarch64_primary_scanner_uses_runtime_vl_dispatch(primary_isa);
+    let use_asimd = target.features.has(CpuFeature::Aarch64Asimd)
+        && (sve_kind.is_none() || use_runtime_vl_dispatch);
+
+    let mut lane_index_offset = None;
+    if use_asimd && aarch64_use_exact_first_lane(target.operating_system) {
+        let aligned = tables
+            .len()
+            .checked_add(15)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "dynamic exact-root lane-index alignment",
+            ))?
+            & !15;
+        let end = aligned.checked_add(AARCH64_FIRST_LANE_INDEX.len()).ok_or(
+            ObjectError::ArithmeticOverflow("dynamic exact-root lane-index bytes"),
+        )?;
+        let additional = end
+            .checked_sub(tables.len())
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "dynamic exact-root lane-index bytes",
+            ))?;
+        if end <= maximum_table_bytes && tables.try_reserve_exact(additional).is_ok() {
+            tables.resize(aligned, 0);
+            lane_index_offset = Some(u32::try_from(aligned).map_err(|_| {
+                ObjectError::ArithmeticOverflow("dynamic exact-root lane-index offset")
+            })?);
+            tables.extend_from_slice(&AARCH64_FIRST_LANE_INDEX);
+        }
+    }
+    let table_base = identity_offset
+        .checked_add(32)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "dynamic exact-root table base",
+        ))?;
+    if data.len() != table_base || data.try_reserve_exact(tables.len()).is_err() {
+        return Ok(None);
+    }
+
+    let scanner = NativeScannerEmission {
+        scan_offset: set.scan_offset,
+        membership: set.membership,
+        isa: sve_kind.map_or_else(
+            || {
+                if use_asimd {
+                    NativeScannerIsa::Aarch64Asimd
+                } else {
+                    NativeScannerIsa::Aarch64ScalarLut
+                }
+            },
+            Aarch64ExactSveKind::scanner_isa,
+        ),
+        vectorized: use_asimd || sve_kind.is_some(),
+    };
+    data.extend_from_slice(&tables);
+    Ok(Some(Aarch64DynamicExactRootPlan {
+        set,
+        storage,
+        sve_kind,
+        use_asimd,
+        use_exact_asimd_lane: use_asimd && lane_index_offset.is_some(),
+        use_runtime_vl_dispatch,
+        lane_index_offset,
+        scanner,
+    }))
 }
 
 fn aarch64_dynamic_root_plan_shape(
@@ -8180,13 +8466,30 @@ fn x86_emit_exact_byte_set_test(
     storage: NativeExactByteSetStorage,
     member: X86Label,
 ) -> Result<(), ObjectError> {
+    x86_emit_exact_byte_set_test_with_base(assembler, storage, 9, member)
+}
+
+/// Test EAX against an exact-set bitmap addressed by one extended caller-
+/// saved base register. Complete DFA entries use R9; dynamic roots use R10 so
+/// their authenticated class map can remain live in R9.
+fn x86_emit_exact_byte_set_test_with_base(
+    assembler: &mut X86Assembler,
+    storage: NativeExactByteSetStorage,
+    base: u8,
+    member: X86Label,
+) -> Result<(), ObjectError> {
     if storage.aarch64_lut_offset.is_some() {
         return Err(ObjectError::InvalidModule(
             "x86 exact-set scanner received an AArch64 LUT",
         ));
     }
+    if !(8..=15).contains(&base) {
+        return Err(ObjectError::InvalidModule(
+            "x86 exact-set scanner received an unsupported bitmap base",
+        ));
+    }
     let displacement = x86_exact_bitmap_displacement(storage)?;
-    let mut test = vec![0x49, 0x0f, 0xa3, 0x81];
+    let mut test = vec![0x49, 0x0f, 0xa3, 0x80 | (base & 7)];
     test.extend_from_slice(&displacement.to_le_bytes());
     assembler.instruction(&test)?;
     assembler.branch(&[0x0f, 0x82], member)?; // jc
@@ -10893,14 +11196,31 @@ fn lower_x86_64_dynamic_rows_prepared(
     )
 }
 
+#[cfg(test)]
+fn lower_x86_64_dynamic_rows_prepared_for_output(
+    root_filter: Option<NativeStartFilter>,
+    features: FeatureSet,
+    output: OutputContract,
+    exact_span_width: Option<u64>,
+    allow_direct_hole_continuation: bool,
+) -> Result<NativeDynamicRowsEmission, ObjectError> {
+    lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
+        root_filter.map(X86DynamicRootPlan::Range),
+        features,
+        output,
+        exact_span_width,
+        allow_direct_hole_continuation,
+    )
+}
+
 #[allow(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     clippy::too_many_lines,
     reason = "the compile-time descriptor size assertion proves every encoded positive disp8 offset"
 )]
-fn lower_x86_64_dynamic_rows_prepared_for_output(
-    root_filter: Option<NativeStartFilter>,
+fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
+    root_plan: Option<X86DynamicRootPlan>,
     features: FeatureSet,
     output: OutputContract,
     exact_span_width: Option<u64>,
@@ -10914,31 +11234,68 @@ fn lower_x86_64_dynamic_rows_prepared_for_output(
             "x86 dynamic rows have an inconsistent exact Span width",
         ));
     }
-    if root_filter.is_some_and(|filter| {
-        filter.ranges().is_empty() || !filter.from_anchored_prefix
+    if root_plan.is_some_and(|plan| match plan {
+        X86DynamicRootPlan::Range(filter) => {
+            filter.ranges().is_empty() || !filter.from_anchored_prefix
+        }
+        X86DynamicRootPlan::Exact { set, storage } => {
+            !set.is_valid()
+                || !set.from_anchored_prefix
+                || storage.aarch64_lut_offset.is_some()
+                || !storage.bitmap_offset.is_multiple_of(8)
+        }
     }) {
         return Err(ObjectError::InvalidModule(
             "x86 dynamic root scanner has an invalid graph filter",
         ));
     }
-    if allow_direct_hole_continuation && root_filter.is_some() {
+    if allow_direct_hole_continuation && root_plan.is_some() {
         return Err(ObjectError::InvalidModule(
             "x86 dynamic continuation cannot inherit a root scanner",
         ));
     }
     let mut assembler = X86Assembler::new();
-    let filter_kind = root_filter.map(|_| x86_start_filter_kind(features));
-    let scanner = root_filter
-        .zip(filter_kind)
-        .map(|(filter, kind)| x86_range_scanner_emission(filter, kind))
-        .transpose()?;
+    let filter_kind = root_plan.map(|_| x86_start_filter_kind(features));
+    let exact_vector_kind = root_plan
+        .filter(|plan| matches!(plan, X86DynamicRootPlan::Exact { .. }))
+        .and(filter_kind)
+        .filter(|kind| !matches!(kind, X86StartFilterKind::Sse2));
+    let scanner = match (root_plan, filter_kind) {
+        (Some(X86DynamicRootPlan::Range(filter)), Some(kind)) => {
+            Some(x86_range_scanner_emission(filter, kind)?)
+        }
+        (Some(X86DynamicRootPlan::Exact { set, .. }), Some(_)) => {
+            Some(NativeScannerEmission {
+                scan_offset: set.scan_offset,
+                membership: set.membership,
+                isa: match exact_vector_kind {
+                    Some(X86StartFilterKind::Avx2) => NativeScannerIsa::X86Avx2,
+                    Some(X86StartFilterKind::Avx512Bw) => NativeScannerIsa::X86Avx512Bw,
+                    Some(X86StartFilterKind::Sse2) => {
+                        return Err(ObjectError::InvalidModule(
+                            "x86 dynamic exact scanner selected SSE2 vectors",
+                        ));
+                    }
+                    None => NativeScannerIsa::X86ScalarBitmap,
+                },
+                vectorized: exact_vector_kind.is_some(),
+            })
+        }
+        (None, None) => None,
+        _ => {
+            return Err(ObjectError::InvalidModule(
+                "x86 dynamic root instruction selection is inconsistent",
+            ));
+        }
+    };
     let preflight_enter = assembler.label()?;
     let scan = assembler.label()?;
     let table_scan = assembler.label()?;
-    let root_vector = root_filter.map(|_| assembler.label()).transpose()?;
-    let root_vector_hit = root_filter.map(|_| assembler.label()).transpose()?;
-    let root_scalar = root_filter.map(|_| assembler.label()).transpose()?;
-    let root_scalar_reject = root_filter.map(|_| assembler.label()).transpose()?;
+    let root_vector = root_plan.map(|_| assembler.label()).transpose()?;
+    let root_vector_hit = root_plan.map(|_| assembler.label()).transpose()?;
+    let root_scalar = root_plan.map(|_| assembler.label()).transpose()?;
+    let root_scalar_hit = root_plan.map(|_| assembler.label()).transpose()?;
+    let root_scalar_reject = root_plan.map(|_| assembler.label()).transpose()?;
     let native_match = assembler.label()?;
     let native_no_match = assembler.label()?;
     let native_complete = (output != OutputContract::Exists)
@@ -11008,7 +11365,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output(
     assembler.branch(&[0x0f, 0x85], framed_fallback)?;
     assembler.instruction(&[0x41, 0x83, 0x7b, NATIVE_ROWS_INITIAL_FLAGS as u8, 0])?;
     assembler.branch(&[0x0f, 0x85], framed_fallback)?;
-    if root_filter.is_some() {
+    if root_plan.is_some() {
         assembler.instruction(&[
             0x41,
             0x83,
@@ -11033,9 +11390,33 @@ fn lower_x86_64_dynamic_rows_prepared_for_output(
     assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x18])?; // haystack
     assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x40])?; // position
     assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x48])?; // exact end
-    if let (Some(filter), Some(kind)) = (root_filter, filter_kind) {
-        x86_emit_start_filter_constants(&mut assembler, filter, kind, 1)?;
-        assembler.instruction(&[0x41, 0x8b, 0x43, NATIVE_ROWS_LOOP_COUNT as u8])?;
+    match (root_plan, filter_kind) {
+        (Some(X86DynamicRootPlan::Range(filter)), Some(kind)) => {
+            x86_emit_start_filter_constants(&mut assembler, filter, kind, 1)?;
+            assembler.instruction(&[0x41, 0x8b, 0x43, NATIVE_ROWS_LOOP_COUNT as u8])?;
+        }
+        (Some(X86DynamicRootPlan::Exact { storage, .. }), Some(_)) => {
+            // The preflight's seventh stack argument still contains the
+            // relocated identity address. Convert it to the stable table
+            // base, retain that base in the now-dead eighth argument slot,
+            // and borrow R9 only while loading immutable vector constants.
+            assembler.instruction(&[0x48, 0x8b, 0x04, 0x24])?; // identity
+            assembler.instruction(&[0x48, 0x83, 0xc0, 32])?; // post-identity tables
+            assembler.instruction(&[0x48, 0x89, 0x44, 0x24, 0x08])?;
+            if let Some(kind) = exact_vector_kind {
+                assembler.instruction(&[0x4c, 0x89, 0x0c, 0x24])?; // save class map
+                assembler.instruction(&[0x49, 0x89, 0xc1])?; // exact table base -> r9
+                x86_emit_exact_vector_constants(&mut assembler, storage, kind)?;
+                assembler.instruction(&[0x4c, 0x8b, 0x0c, 0x24])?; // restore class map
+            }
+            assembler.instruction(&[0x41, 0x8b, 0x43, NATIVE_ROWS_LOOP_COUNT as u8])?;
+        }
+        (None, None) => {}
+        _ => {
+            return Err(ObjectError::InvalidModule(
+                "x86 dynamic root setup is inconsistent",
+            ));
+        }
     }
     if output != OutputContract::Exists {
         // A non-nullable admitted descriptor has no pending endpoint yet.
@@ -11044,7 +11425,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output(
         assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x60, 0, 0, 0, 0])?;
     }
 
-    let loop_rows_checked = root_filter.map(|_| assembler.label()).transpose()?;
+    let loop_rows_checked = root_plan.map(|_| assembler.label()).transpose()?;
     assembler.bind(scan)?;
     assembler.instruction(&[0x48, 0x39, 0xca])?;
     assembler.branch(
@@ -11055,7 +11436,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output(
     // including when K0 has also learned a loop overlay for that row. A hit
     // enters the canonical direct cell once; only non-root learned rows remain
     // canonical-loop ownership boundaries.
-    if root_filter.is_some() {
+    if root_plan.is_some() {
         let loop_rows_checked = loop_rows_checked.ok_or(ObjectError::InvalidModule(
             "x86 dynamic loop ownership label is absent",
         ))?;
@@ -11130,7 +11511,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output(
     assembler.instruction(&[0x41, 0xff, 0xc8])?;
     assembler.branch(&[0xe9], scan)?;
 
-    if let (Some(filter), Some(kind)) = (root_filter, filter_kind) {
+    if let (Some(X86DynamicRootPlan::Range(filter)), Some(kind)) = (root_plan, filter_kind) {
         let vector = root_vector.ok_or(ObjectError::InvalidModule(
             "x86 dynamic root vector label is absent",
         ))?;
@@ -11139,6 +11520,9 @@ fn lower_x86_64_dynamic_rows_prepared_for_output(
         ))?;
         let scalar = root_scalar.ok_or(ObjectError::InvalidModule(
             "x86 dynamic root scalar label is absent",
+        ))?;
+        let scalar_hit = root_scalar_hit.ok_or(ObjectError::InvalidModule(
+            "x86 dynamic root scalar hit label is absent",
         ))?;
         let scalar_reject = root_scalar_reject.ok_or(ObjectError::InvalidModule(
             "x86 dynamic root scalar reject label is absent",
@@ -11171,6 +11555,74 @@ fn lower_x86_64_dynamic_rows_prepared_for_output(
         assembler.bind(scalar)?;
         x86_emit_start_filter_scalar_bound(&mut assembler, filter.scan_offset, native_no_match)?;
         x86_emit_scalar_filter_membership(&mut assembler, filter, scalar_reject)?;
+        assembler.bind(scalar_hit)?;
+        assembler.instruction(&[0x41, 0x8b, 0x43, NATIVE_ROWS_LOOP_COUNT as u8])?;
+        assembler.branch(&[0xe9], table_scan)?;
+        assembler.bind(scalar_reject)?;
+        assembler.instruction(&[0x48, 0xff, 0xc2])?;
+        assembler.branch(&[0xe9], scalar)?;
+    } else if let (Some(X86DynamicRootPlan::Exact { set, storage }), Some(_)) =
+        (root_plan, filter_kind)
+    {
+        let vector = root_vector.ok_or(ObjectError::InvalidModule(
+            "x86 dynamic exact root vector label is absent",
+        ))?;
+        let vector_hit = root_vector_hit.ok_or(ObjectError::InvalidModule(
+            "x86 dynamic exact root hit label is absent",
+        ))?;
+        let scalar = root_scalar.ok_or(ObjectError::InvalidModule(
+            "x86 dynamic exact root scalar label is absent",
+        ))?;
+        let scalar_hit = root_scalar_hit.ok_or(ObjectError::InvalidModule(
+            "x86 dynamic exact root scalar hit label is absent",
+        ))?;
+        let scalar_reject = root_scalar_reject.ok_or(ObjectError::InvalidModule(
+            "x86 dynamic exact root scalar reject label is absent",
+        ))?;
+
+        assembler.bind(vector)?;
+        if let Some(kind) = exact_vector_kind {
+            assembler.instruction(&[0x48, 0x89, 0xc8])?; // remaining = end
+            assembler.instruction(&[0x48, 0x29, 0xd0])?; // remaining -= position
+            let required = u32::from(kind.width())
+                .checked_add(u32::from(set.scan_offset))
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "x86 dynamic exact root vector bound",
+                ))?;
+            let mut compare = vec![0x48, 0x3d];
+            compare.extend_from_slice(&required.to_le_bytes());
+            assembler.instruction(&compare)?;
+            assembler.branch(&[0x0f, 0x82], scalar)?;
+            let mask = x86_emit_exact_vector_candidates(
+                &mut assembler,
+                kind,
+                set.scan_offset,
+            )?;
+            x86_emit_candidate_nonzero(&mut assembler, mask)?;
+            assembler.branch(&[0x0f, 0x85], vector_hit)?;
+            assembler.instruction(&[0x48, 0x83, 0xc2, kind.width()])?;
+            assembler.branch(&[0xe9], vector)?;
+
+            assembler.bind(vector_hit)?;
+            x86_emit_first_candidate_lane(&mut assembler, mask)?;
+            assembler.instruction(&[0x48, 0x01, 0xc2])?;
+            assembler.instruction(&[0x41, 0x8b, 0x43, NATIVE_ROWS_LOOP_COUNT as u8])?;
+            assembler.branch(&[0xe9], table_scan)?;
+        } else {
+            assembler.branch(&[0xe9], scalar)?;
+        }
+
+        assembler.bind(scalar)?;
+        x86_emit_exact_byte_set_scalar_bound(
+            &mut assembler,
+            set.scan_offset,
+            native_no_match,
+        )?;
+        x86_emit_exact_byte_set_scalar_load(&mut assembler, u16::from(set.scan_offset))?;
+        assembler.instruction(&[0x4c, 0x8b, 0x54, 0x24, 0x08])?; // exact table base
+        x86_emit_exact_byte_set_test_with_base(&mut assembler, storage, 10, scalar_hit)?;
+        assembler.branch(&[0xe9], scalar_reject)?;
+        assembler.bind(scalar_hit)?;
         assembler.instruction(&[0x41, 0x8b, 0x43, NATIVE_ROWS_LOOP_COUNT as u8])?;
         assembler.branch(&[0xe9], table_scan)?;
         assembler.bind(scalar_reject)?;
@@ -17195,12 +17647,27 @@ fn lower_aarch64_dynamic_rows_prepared(
     )
 }
 
+#[cfg(test)]
+fn lower_aarch64_dynamic_rows_prepared_for_output(
+    root_plan: Option<Aarch64DynamicRootPlan>,
+    output: OutputContract,
+    exact_span_width: Option<u64>,
+    allow_direct_hole_continuation: bool,
+) -> Result<NativeDynamicRowsEmission, ObjectError> {
+    lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
+        root_plan.map(Aarch64DynamicScannerPlan::Range),
+        output,
+        exact_span_width,
+        allow_direct_hole_continuation,
+    )
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the authenticated preflight, scanner, local exits, and whole-search deopt form one ABI transaction"
 )]
-fn lower_aarch64_dynamic_rows_prepared_for_output(
-    root_plan: Option<Aarch64DynamicRootPlan>,
+fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
+    root_plan: Option<Aarch64DynamicScannerPlan>,
     output: OutputContract,
     exact_span_width: Option<u64>,
     allow_direct_hole_continuation: bool,
@@ -17228,22 +17695,29 @@ fn lower_aarch64_dynamic_rows_prepared_for_output(
         .map(|_| assembler.label())
         .transpose()?;
     let root_asimd = root_plan
-        .filter(|plan| plan.use_asimd)
+        .filter(|plan| plan.uses_asimd())
         .map(|_| assembler.label())
         .transpose()?;
     let root_asimd_single = root_plan
-        .filter(|plan| plan.use_asimd)
+        .filter(|plan| {
+            matches!(plan, Aarch64DynamicScannerPlan::Range(plan) if plan.use_asimd)
+        })
         .map(|_| assembler.label())
         .transpose()?;
     let root_asimd_batch_hit = root_plan
-        .filter(|plan| plan.use_asimd)
+        .filter(|plan| {
+            matches!(plan, Aarch64DynamicScannerPlan::Range(plan) if plan.use_asimd)
+        })
         .map(|_| assembler.label())
         .transpose()?;
     let root_asimd_single_hit = root_plan
-        .filter(|plan| plan.use_asimd)
+        .filter(|plan| {
+            matches!(plan, Aarch64DynamicScannerPlan::Range(plan) if plan.use_asimd)
+        })
         .map(|_| assembler.label())
         .transpose()?;
     let root_scalar = root_plan.map(|_| assembler.label()).transpose()?;
+    let root_scalar_hit = root_plan.map(|_| assembler.label()).transpose()?;
     let root_scalar_reject = root_plan.map(|_| assembler.label()).transpose()?;
     let native_match = assembler.label()?;
     let native_no_match = assembler.label()?;
@@ -17396,36 +17870,60 @@ fn lower_aarch64_dynamic_rows_prepared_for_output(
             assembler.instruction(aarch64_load_x_imm(5, 31, 80)?)?;
             assembler.instruction(aarch64_add_x_imm(5, 5, 32)?)?;
         }
-        if plan.use_asimd {
-            aarch64_emit_start_filter_constants(
-                &mut assembler,
-                plan.filter,
-                AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
-            )?;
-        }
-        if plan.use_exact_asimd_lane {
-            aarch64_emit_first_lane_constants(
-                &mut assembler,
-                plan.lane_index_offset.ok_or(ObjectError::InvalidModule(
-                    "dynamic ASIMD exact lane has no index table",
-                ))?,
-            )?;
-        }
-        if let Some(kind) = plan.sve_kind.filter(|_| !plan.use_runtime_vl_dispatch) {
-            // A pure-SVE route never executes ASIMD, so its Z16..Z23 constants
-            // are immutable across scalar tails and dynamic-row transitions.
-            aarch64_emit_sve_filter_setup(&mut assembler, plan.filter, kind, 0)?;
-        }
-        if plan.use_runtime_vl_dispatch {
-            // The process vector length is stable. Sample it once after
-            // preflight, retain zero at VL16 in X17, and reuse both values on
-            // every root retry.
-            assembler.instruction(aarch64_sve_cntb(16)?)?;
-            assembler.instruction(aarch64_sub_x_imm(
-                17,
-                16,
-                AARCH64_SVE_MIN_VECTOR_BYTES,
-            )?)?;
+        match plan {
+            Aarch64DynamicScannerPlan::Range(plan) => {
+                if plan.use_asimd {
+                    aarch64_emit_start_filter_constants(
+                        &mut assembler,
+                        plan.filter,
+                        AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
+                    )?;
+                }
+                if plan.use_exact_asimd_lane {
+                    aarch64_emit_first_lane_constants(
+                        &mut assembler,
+                        plan.lane_index_offset.ok_or(ObjectError::InvalidModule(
+                            "dynamic ASIMD exact lane has no index table",
+                        ))?,
+                    )?;
+                }
+                if let Some(kind) = plan.sve_kind.filter(|_| !plan.use_runtime_vl_dispatch) {
+                    // A pure-SVE route never executes ASIMD, so its Z16..Z23
+                    // constants survive scalar tails and row transitions.
+                    aarch64_emit_sve_filter_setup(&mut assembler, plan.filter, kind, 0)?;
+                }
+                if plan.use_runtime_vl_dispatch {
+                    assembler.instruction(aarch64_sve_cntb(16)?)?;
+                    assembler.instruction(aarch64_sub_x_imm(
+                        17,
+                        16,
+                        AARCH64_SVE_MIN_VECTOR_BYTES,
+                    )?)?;
+                }
+            }
+            Aarch64DynamicScannerPlan::Exact(plan) => {
+                if let Some(kind) = plan.sve_kind {
+                    aarch64_emit_exact_sve_constants(&mut assembler, plan.storage, kind)?;
+                } else if plan.use_asimd {
+                    aarch64_emit_exact_asimd_constants(&mut assembler, plan.storage)?;
+                }
+                if plan.use_exact_asimd_lane {
+                    aarch64_emit_first_lane_constants(
+                        &mut assembler,
+                        plan.lane_index_offset.ok_or(ObjectError::InvalidModule(
+                            "dynamic exact ASIMD lane has no index table",
+                        ))?,
+                    )?;
+                }
+                if plan.use_runtime_vl_dispatch {
+                    assembler.instruction(aarch64_sve_cntb(16)?)?;
+                    assembler.instruction(aarch64_sub_x_imm(
+                        17,
+                        16,
+                        AARCH64_SVE_MIN_VECTOR_BYTES,
+                    )?)?;
+                }
+            }
         }
     }
     if output != OutputContract::Exists {
@@ -17520,10 +18018,15 @@ fn lower_aarch64_dynamic_rows_prepared_for_output(
         let scalar = root_scalar.ok_or(ObjectError::InvalidModule(
             "AArch64 dynamic root scalar tail is absent",
         ))?;
+        let scalar_hit = root_scalar_hit.ok_or(ObjectError::InvalidModule(
+            "AArch64 dynamic root scalar hit is absent",
+        ))?;
         let scalar_reject = root_scalar_reject.ok_or(ObjectError::InvalidModule(
             "AArch64 dynamic root scalar reject is absent",
         ))?;
         assembler.bind(dispatch)?;
+        match plan {
+        Aarch64DynamicScannerPlan::Range(plan) => {
         if plan.use_runtime_vl_dispatch {
             let asimd = root_asimd.ok_or(ObjectError::InvalidModule(
                 "mixed dynamic root has no ASIMD route",
@@ -17653,6 +18156,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output(
             native_no_match,
         )?;
         aarch64_emit_scalar_filter_membership(&mut assembler, plan.filter, scalar_reject)?;
+        assembler.bind(scalar_hit)?;
         // A scanner hit identifies the candidate start. Do not consume the
         // filtered byte here; the canonical table transition below owns the
         // byte at X2, including for nonzero proof offsets.
@@ -17660,6 +18164,84 @@ fn lower_aarch64_dynamic_rows_prepared_for_output(
         assembler.bind(scalar_reject)?;
         assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
         assembler.branch(scalar)?;
+        }
+        Aarch64DynamicScannerPlan::Exact(plan) => {
+            if plan.use_runtime_vl_dispatch {
+                let asimd = root_asimd.ok_or(ObjectError::InvalidModule(
+                    "mixed dynamic exact root has no ASIMD route",
+                ))?;
+                let sve = root_sve.ok_or(ObjectError::InvalidModule(
+                    "mixed dynamic exact root has no SVE route",
+                ))?;
+                assembler.branch_zero_w(17, asimd)?;
+                assembler.instruction(aarch64_mov_x(6, 16)?)?;
+                assembler.branch(sve)?;
+            } else if let Some(sve) = root_sve {
+                assembler.branch(sve)?;
+            } else if let Some(asimd) = root_asimd {
+                assembler.branch(asimd)?;
+            } else {
+                assembler.branch(scalar)?;
+            }
+
+            if let (Some(sve), Some(kind)) = (root_sve, plan.sve_kind) {
+                aarch64_emit_exact_sve_scanner(
+                    &mut assembler,
+                    plan.set,
+                    kind,
+                    plan.use_runtime_vl_dispatch.then_some(16),
+                    sve,
+                    scalar,
+                    table_scan,
+                )?;
+            }
+
+            if let Some(asimd) = root_asimd {
+                let asimd_scan = if plan.use_runtime_vl_dispatch {
+                    assembler.bind(asimd)?;
+                    // SVE constants alias the ASIMD bank. The process-wide
+                    // VL16 arm replaces them with canonical nibble data on
+                    // every root retry before entering the ASIMD scan loop.
+                    aarch64_emit_exact_asimd_constants(&mut assembler, plan.storage)?;
+                    assembler.label()?
+                } else {
+                    asimd
+                };
+                aarch64_emit_exact_asimd_scanner(
+                    &mut assembler,
+                    plan.set,
+                    asimd_scan,
+                    scalar,
+                    table_scan,
+                    plan.use_exact_asimd_lane,
+                )?;
+            }
+
+            assembler.bind(scalar)?;
+            aarch64_set_table_address(
+                &mut assembler,
+                6,
+                plan.storage.aarch64_lut_offset.ok_or(
+                    ObjectError::InvalidModule("dynamic exact root has no scalar LUT"),
+                )?,
+            )?;
+            let scalar_loop = assembler.label()?;
+            assembler.bind(scalar_loop)?;
+            aarch64_emit_start_filter_scalar_bound(
+                &mut assembler,
+                plan.set.scan_offset,
+                native_no_match,
+            )?;
+            aarch64_emit_start_filter_scalar_load(&mut assembler, plan.set.scan_offset)?;
+            aarch64_emit_exact_byte_set_lut_test(&mut assembler, 6, scalar_hit)?;
+            assembler.branch(scalar_reject)?;
+            assembler.bind(scalar_hit)?;
+            assembler.branch(table_scan)?;
+            assembler.bind(scalar_reject)?;
+            assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
+            assembler.branch(scalar_loop)?;
+        }
+        }
     }
 
     if let Some(native_complete) = native_complete {
@@ -17880,7 +18462,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output(
     Ok(NativeDynamicRowsEmission {
         code,
         relocations,
-        scanner: root_plan.map(|plan| plan.scanner),
+        scanner: root_plan.map(Aarch64DynamicScannerPlan::scanner),
     })
 }
 
@@ -18233,17 +18815,36 @@ mod tests {
     }
 
     fn dynamic_root_test_filter(members: &[u8], scan_offset: u8) -> NativeStartFilter {
-        let mut membership = [0_u64; 4];
-        for &byte in members {
-            let byte = usize::from(byte);
-            membership[byte / 64] |= 1_u64 << (byte % 64);
-        }
+        let membership = dynamic_root_test_membership(members.iter().copied());
         plan_dynamic_root_filter(NativeDynamicRootRequirement {
             scan_offset,
             membership,
         })
         .expect("dynamic test root planning")
         .expect("representable dynamic test root")
+    }
+
+    fn dynamic_root_test_membership(bytes: impl IntoIterator<Item = u8>) -> [u64; 4] {
+        let mut membership = [0_u64; 4];
+        for byte in bytes {
+            let byte = usize::from(byte);
+            membership[byte / 64] |= 1_u64 << (byte % 64);
+        }
+        membership
+    }
+
+    fn dynamic_exact_test_set(scan_offset: u8) -> NativeExactByteSet {
+        NativeExactByteSet::from_membership(
+            dynamic_root_test_membership(
+                b"acegikmoqsuwy"
+                    .iter()
+                    .copied()
+                    .chain([0x80, 0x82, 0xf0, 0xff]),
+            ),
+            scan_offset,
+            true,
+        )
+        .expect("fragmented dynamic exact set")
     }
 
     fn complete_forward_resource_fallback(
@@ -20804,7 +21405,9 @@ mod tests {
         }
 
         // A baseline x86 object and macOS targets without ASIMD still cannot
-        // claim an exact vector scanner that their emitted code does not have.
+        // claim an exact vector scanner that their complete retained-table
+        // path does not have. The separate dynamic-row fallback can publish
+        // the same graph-derived exact set through its scalar scanner.
         for target in [
             Target::x86_64_linux(),
             Target::aarch64_macos()
@@ -20822,7 +21425,12 @@ mod tests {
                 target,
             );
             assert!(compiled.receipt().runtime_helper_required, "{target:?}");
-            assert_eq!(compiled.module().start_accelerator(), StartAccelerator::None);
+            assert!(compiled.module().required_runtime_symbol().is_some());
+            assert!(compiled.module().prepared_entry_symbol().is_some());
+            assert_eq!(
+                compiled.module().start_accelerator(),
+                StartAccelerator::Scalar
+            );
         }
     }
 
@@ -20858,7 +21466,7 @@ mod tests {
         assert_eq!(restored_module.sections(), compiled.module().sections());
         assert_eq!(restored_module.symbols(), compiled.module().symbols());
         assert_eq!(restored_module.relocations(), compiled.module().relocations());
-        assert_eq!(restored_module.start_accelerator(), StartAccelerator::None);
+        assert_eq!(restored_module.start_accelerator(), StartAccelerator::Scalar);
     }
 
     #[test]
@@ -20995,10 +21603,9 @@ mod tests {
                 }
             }
 
-            // The portable retained path scans arbitrary exact byte sets.
-            // Native range filters deliberately have tighter hot-loop bounds,
-            // so a complete table must not replace that scanner with a scalar
-            // byte-by-byte root walk when no native moving filter is emitted.
+            // The complete retained-table path still requires an exact vector
+            // receipt, but its separate dynamic-row fallback can now scan the
+            // same arbitrary graph-derived byte set with a scalar native loop.
             if target.features != FeatureSet::EMPTY {
                 continue;
             }
@@ -21013,12 +21620,13 @@ mod tests {
                 );
                 assert!(
                     prefix_accelerated.receipt().runtime_helper_required,
-                    "{pattern:?}/{target:?} discarded the portable byte-set scanner"
+                    "{pattern:?}/{target:?} discarded the prepared fallback workspace"
                 );
                 assert!(prefix_accelerated.module().required_runtime_symbol().is_some());
+                assert!(prefix_accelerated.module().prepared_entry_symbol().is_some());
                 assert_eq!(
                     prefix_accelerated.module().start_accelerator(),
-                    StartAccelerator::None
+                    StartAccelerator::Scalar
                 );
             }
         }
@@ -21506,6 +22114,52 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    #[ignore = "links and executes a fragmented exact dynamic root on the host ISA"]
+    fn linked_host_dynamic_exact_root_entry_preserves_all_outputs_and_windows() {
+        #[cfg(target_arch = "x86_64")]
+        let (target, expected) = {
+            assert!(
+                std::is_x86_feature_detected!("avx2"),
+                "exact dynamic-root host validation requires AVX2 hardware"
+            );
+            let base = if cfg!(target_os = "linux") {
+                Target::x86_64_linux()
+            } else {
+                Target::x86_64_macos()
+            };
+            (
+                base.with_features(FeatureSet::of(CpuFeature::X86Avx2))
+                    .unwrap(),
+                StartAccelerator::X86Avx2,
+            )
+        };
+        #[cfg(target_arch = "aarch64")]
+        let (target, expected) = {
+            let base = if cfg!(target_os = "linux") {
+                Target::aarch64_linux()
+            } else {
+                Target::aarch64_macos()
+            };
+            (
+                base.with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                    .unwrap(),
+                StartAccelerator::Aarch64Asimd,
+            )
+        };
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            linked_dynamic_rows_entry_for_output(target, expected, output, true);
+        }
     }
 
     #[cfg(all(
@@ -22008,6 +22662,86 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_root_scanner_covers_every_nontrivial_cardinality_without_recipe_gates() {
+        let range_words = dynamic_root_test_membership(b"ab".iter().copied());
+        assert!(matches!(
+            plan_dynamic_root_scanner(NativeDynamicRootRequirement {
+                scan_offset: 7,
+                membership: range_words,
+            })
+            .unwrap(),
+            Some(NativeDynamicRootPlan::Range(filter))
+                if filter.scan_offset == 7
+                    && start_filter_membership(filter).unwrap() == range_words
+        ));
+
+        for (scan_offset, words) in [
+            (
+                0,
+                dynamic_root_test_membership((0_u8..9).map(|byte| byte * 2)),
+            ),
+            (17, dynamic_root_test_membership(0_u8..=64)),
+            (
+                u8::MAX,
+                dynamic_root_test_membership(u8::MIN..u8::MAX),
+            ),
+        ] {
+            let plan = plan_dynamic_root_scanner(NativeDynamicRootRequirement {
+                scan_offset,
+                membership: words,
+            })
+            .unwrap()
+            .expect("nontrivial membership must have a dynamic scanner");
+            let NativeDynamicRootPlan::Exact(set) = plan else {
+                panic!("fragmented/broad dynamic set unexpectedly used the range plan");
+            };
+            assert_eq!(set.scan_offset, scan_offset);
+            assert_eq!(set.membership, words);
+            assert!(set.from_anchored_prefix);
+            assert!(set.is_valid());
+        }
+
+        // Exercise every useful cardinality with a different permutation
+        // prefix. Selection may retain the compact range representation or
+        // choose the arbitrary-set tables, but it must never depend on a
+        // pattern identity, literal recipe, or a hand-picked set size.
+        for cardinality in 1_usize..256 {
+            let mut membership = [0_u64; 4];
+            for index in 0..cardinality {
+                let byte = (index * 73 + cardinality * 19) & 0xff;
+                membership[byte / 64] |= 1_u64 << (byte % 64);
+            }
+            let scan_offset = u8::try_from((cardinality * 29) & 0xff).unwrap();
+            let plan = plan_dynamic_root_scanner(NativeDynamicRootRequirement {
+                scan_offset,
+                membership,
+            })
+            .unwrap()
+            .expect("every nontrivial cardinality must have a scanner");
+            let (actual_offset, actual_membership) = match plan {
+                NativeDynamicRootPlan::Range(filter) => {
+                    (filter.scan_offset, start_filter_membership(filter).unwrap())
+                }
+                NativeDynamicRootPlan::Exact(set) => (set.scan_offset, set.membership),
+            };
+            assert_eq!(actual_offset, scan_offset, "cardinality={cardinality}");
+            assert_eq!(actual_membership, membership, "cardinality={cardinality}");
+        }
+
+        for membership in [[0_u64; 4], [u64::MAX; 4]] {
+            assert_eq!(
+                plan_dynamic_root_scanner(NativeDynamicRootRequirement {
+                    scan_offset: 0,
+                    membership,
+                })
+                .unwrap(),
+                None,
+                "empty/full roots retain ordinary row execution"
+            );
+        }
+    }
+
+    #[test]
     #[allow(
         clippy::too_many_lines,
         reason = "one code-byte audit keeps the cached count, loop ownership, and exit cleanup contract together"
@@ -22152,6 +22886,455 @@ mod tests {
                 occurrences(&scalar.code, &[0x45, 0x3b, 0x43, displacement]),
                 0
             );
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the exact dynamic-root target matrix audits one shared ABI and storage contract"
+    )]
+    fn x86_dynamic_exact_root_reuses_canonical_storage_at_every_vector_tier() {
+        let set = dynamic_exact_test_set(3);
+        let identity_offset = 16_usize;
+        let identity = [0x5a; 32];
+        let mut data = vec![0xa5; identity_offset];
+        data.extend_from_slice(&identity);
+        let plan = install_x86_dynamic_root_plan(
+            &mut data,
+            identity_offset,
+            NativeDynamicRootPlan::Exact(set),
+        )
+        .unwrap()
+        .expect("x86 dynamic exact plan");
+        let X86DynamicRootPlan::Exact { storage, .. } = plan else {
+            panic!("fragmented membership unexpectedly used ranges");
+        };
+        let table_base = identity_offset + identity.len();
+        assert_eq!(&data[identity_offset..table_base], &identity);
+        assert!(data.len() > table_base);
+        for byte in u8::MIN..=u8::MAX {
+            assert_eq!(
+                exact_storage_contains(
+                    &data[table_base..],
+                    storage,
+                    Architecture::X86_64,
+                    byte,
+                ),
+                set.contains(byte),
+                "byte={byte}"
+            );
+        }
+
+        let avx512 = FeatureSet::of(CpuFeature::X86Avx512F)
+            .with(CpuFeature::X86Avx512Bw);
+        for (features, accelerator, vector_opcode, vzeroupper_count) in [
+            (FeatureSet::EMPTY, StartAccelerator::Scalar, None, 0),
+            (
+                FeatureSet::of(CpuFeature::X86Avx2),
+                StartAccelerator::X86Avx2,
+                Some([0xc5, 0xdd, 0x71, 0xd0, 0x04].as_slice()),
+                3,
+            ),
+            (
+                avx512,
+                StartAccelerator::X86Avx512Bw,
+                Some([0x62, 0xf2, 0x4d, 0x48, 0x26, 0xce].as_slice()),
+                3,
+            ),
+        ] {
+            for (output, width) in [
+                (OutputContract::Exists, None),
+                (OutputContract::SelectedEnd, None),
+                (OutputContract::Span, Some(7)),
+            ] {
+                let emission = lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
+                    Some(plan),
+                    features,
+                    output,
+                    width,
+                    false,
+                )
+                .unwrap();
+                let scanner = emission.scanner.expect("x86 exact scanner receipt");
+                assert_eq!(scanner.start_accelerator(), accelerator);
+                assert_eq!(scanner.scan_offset, set.scan_offset);
+                assert_eq!(scanner.membership, set.membership);
+                assert_eq!(scanner.vectorized, vector_opcode.is_some());
+                assert!(
+                    emission
+                        .code
+                        .windows(4)
+                        .any(|bytes| bytes == [0x49, 0x0f, 0xa3, 0x82]),
+                    "scalar bitmap tail must use R10 without displacing R9: {features:?}/{output:?}"
+                );
+                if let Some(opcode) = vector_opcode {
+                    assert!(
+                        emission.code.windows(opcode.len()).any(|bytes| bytes == opcode),
+                        "missing exact vector classifier: {features:?}/{output:?}"
+                    );
+                }
+                assert_eq!(
+                    emission
+                        .code
+                        .windows(3)
+                        .filter(|bytes| *bytes == [0xc5, 0xf8, 0x77])
+                        .count(),
+                    vzeroupper_count,
+                    "{features:?}/{output:?}"
+                );
+                assert_eq!(
+                    emission
+                        .relocations
+                        .iter()
+                        .filter(|relocation| relocation.symbol == PARTIAL_IDENTITY_SYMBOL)
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    emission
+                        .relocations
+                        .iter()
+                        .filter(|relocation| {
+                            relocation.symbol == DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL
+                        })
+                        .count(),
+                    0
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the exact dynamic-root matrix audits scalar, fixed, scalable, and mixed lowering"
+    )]
+    fn aarch64_dynamic_exact_root_uses_lut_asimd_sve_and_sve2_from_one_set() {
+        let set = dynamic_exact_test_set(3);
+        let asimd_target = Target::aarch64_macos()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .unwrap();
+        let mut refused = vec![0x3c; 32];
+        let refused_before = refused.clone();
+        assert_eq!(
+            install_aarch64_dynamic_exact_root_plan(&mut refused, 0, set, asimd_target, 0)
+                .unwrap(),
+            None
+        );
+        assert_eq!(refused, refused_before, "table refusal must be atomic");
+
+        let targets = [
+            (Target::aarch64_linux(), StartAccelerator::Scalar),
+            (asimd_target, StartAccelerator::Aarch64Asimd),
+            (
+                Target::aarch64_linux()
+                    .with_features(FeatureSet::of(CpuFeature::Aarch64Sve))
+                    .unwrap(),
+                StartAccelerator::Aarch64Sve,
+            ),
+            (
+                Target::aarch64_linux()
+                    .with_features(
+                        FeatureSet::of(CpuFeature::Aarch64Sve)
+                            .with(CpuFeature::Aarch64Sve2),
+                    )
+                    .unwrap(),
+                StartAccelerator::Aarch64Sve2,
+            ),
+            (
+                Target::aarch64_linux()
+                    .with_features(
+                        FeatureSet::of(CpuFeature::Aarch64Asimd)
+                            .with(CpuFeature::Aarch64Sve)
+                            .with(CpuFeature::Aarch64Sve2),
+                    )
+                    .unwrap(),
+                StartAccelerator::Aarch64Sve2,
+            ),
+        ];
+        for (target, accelerator) in targets {
+            let identity_offset = 16_usize;
+            let identity = [0x3c; 32];
+            let mut data = vec![0xa5; identity_offset];
+            data.extend_from_slice(&identity);
+            let installed = install_aarch64_dynamic_exact_root_plan(
+                &mut data,
+                identity_offset,
+                set,
+                target,
+                usize::MAX,
+            )
+            .unwrap()
+            .expect("AArch64 dynamic exact plan");
+            let table_base = identity_offset + identity.len();
+            assert_eq!(&data[identity_offset..table_base], &identity);
+            assert!(data.len() > table_base);
+            for byte in u8::MIN..=u8::MAX {
+                assert_eq!(
+                    exact_storage_contains(
+                        &data[table_base..],
+                        installed.storage,
+                        Architecture::Aarch64,
+                        byte,
+                    ),
+                    set.contains(byte),
+                    "{target:?}, byte={byte}"
+                );
+            }
+            assert_eq!(installed.scanner.start_accelerator(), accelerator);
+            assert_eq!(installed.scanner.membership, set.membership);
+            assert_eq!(
+                installed.lane_index_offset.is_some(),
+                installed.use_asimd,
+                "the unbounded fixture must retain exact ASIMD lane extraction"
+            );
+
+            for (output, width) in [
+                (OutputContract::Exists, None),
+                (OutputContract::SelectedEnd, None),
+                (OutputContract::Span, Some(7)),
+            ] {
+                let emission = lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
+                    Some(Aarch64DynamicScannerPlan::Exact(installed)),
+                    output,
+                    width,
+                    false,
+                )
+                .unwrap();
+                assert_eq!(emission.scanner, Some(installed.scanner));
+                let words = emission
+                    .code
+                    .chunks_exact(4)
+                    .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                    .collect::<Vec<_>>();
+                assert!(
+                    words.contains(&aarch64_load_byte_reg(8, 6, 8).unwrap()),
+                    "every tier retains an exact scalar LUT tail: {target:?}/{output:?}"
+                );
+                if installed.use_asimd {
+                    assert!(words.contains(&aarch64_tbl1_16b(22, 16, 21).unwrap()));
+                }
+                match installed.sve_kind {
+                    Some(Aarch64ExactSveKind::Nibble) => {
+                        assert!(words.contains(&aarch64_sve_tbl_b(6, 16, 5).unwrap()));
+                    }
+                    Some(Aarch64ExactSveKind::Sve2Match(_)) => {
+                        assert!(words.contains(&aarch64_sve2_match_b(1, 0, 16).unwrap()));
+                    }
+                    None => {}
+                }
+                assert_eq!(
+                    emission
+                        .relocations
+                        .iter()
+                        .filter(|relocation| relocation.symbol == PARTIAL_IDENTITY_SYMBOL)
+                        .count(),
+                    2
+                );
+                assert_eq!(
+                    emission
+                        .relocations
+                        .iter()
+                        .filter(|relocation| {
+                            relocation.symbol == DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL
+                        })
+                        .count(),
+                    0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fragmented_graph_roots_publish_exact_dynamic_entries_for_all_outputs_and_targets() {
+        const CLASS: &str = r"(?-u:[acegikmoqsuwy\x80\x82\xF0\xFF])";
+        let zero_rows = CompileLimitsV1 {
+            determinize: DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+            ..CompileLimitsV1::default()
+        };
+        let avx512 = FeatureSet::of(CpuFeature::X86Avx512F)
+            .with(CpuFeature::X86Avx512Bw);
+        let targets = [
+            Target::x86_64_linux(),
+            Target::x86_64_macos()
+                .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+                .unwrap(),
+            Target::x86_64_linux().with_features(avx512).unwrap(),
+            Target::aarch64_linux(),
+            Target::aarch64_macos()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                .unwrap(),
+            Target::aarch64_linux()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Sve))
+                .unwrap(),
+            Target::aarch64_linux()
+                .with_features(
+                    FeatureSet::of(CpuFeature::Aarch64Sve).with(CpuFeature::Aarch64Sve2),
+                )
+                .unwrap(),
+            Target::aarch64_linux()
+                .with_features(
+                    FeatureSet::of(CpuFeature::Aarch64Asimd)
+                        .with(CpuFeature::Aarch64Sve)
+                        .with(CpuFeature::Aarch64Sve2),
+                )
+                .unwrap(),
+        ];
+        for target in targets {
+            for (output, pattern, mode) in [
+                (
+                    OutputContract::Exists,
+                    format!("(?:{CLASS})+"),
+                    CompileMode::Optimizing,
+                ),
+                (
+                    OutputContract::SelectedEnd,
+                    format!("(?:{CLASS})+"),
+                    CompileMode::Optimizing,
+                ),
+                (
+                    OutputContract::Span,
+                    format!("{CLASS}(?-u:.)"),
+                    CompileMode::Fast,
+                ),
+            ] {
+                let compiled = compile(
+                    CompileRequest::new(&pattern, target)
+                        .mode(mode)
+                        .output(output)
+                        .limits(zero_rows),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("fragmented dynamic root {target:?}/{output:?}: {error}")
+                });
+                assert_eq!(compiled.receipt().engine, EngineKind::OrderedNfa);
+                let view = compiled
+                    .program()
+                    .native_dynamic_rows_view()
+                    .expect("general dynamic-row view");
+                let requirement = view
+                    .root_requirement
+                    .expect("fragmented graph root requirement");
+                let plan = plan_dynamic_root_scanner(requirement)
+                    .unwrap()
+                    .expect("fragmented exact scanner plan");
+                assert!(matches!(plan, NativeDynamicRootPlan::Exact(_)));
+                assert!(compiled.module().prepared_entry_symbol().is_some());
+                assert_ne!(
+                    compiled.module().start_accelerator(),
+                    StartAccelerator::None,
+                    "{target:?}/{output:?}"
+                );
+                assert_eq!(
+                    compiled
+                        .module()
+                        .required_prepared_dynamic_rows_continue_runtime_symbol(),
+                    None,
+                    "a scanner-owned root keeps the established whole-window deopt contract"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dynamic_exact_root_models_preserve_candidate_starts_across_windows_and_tails() {
+        let membership = dynamic_exact_test_set(0).membership;
+        let haystack = (0_u16..=u16::from(u8::MAX))
+            .chain(0_u16..96)
+            .map(|index| u8::try_from((index * 37 + 11) & 0xff).unwrap())
+            .collect::<Vec<_>>();
+        for scan_offset in [0_u8, 1, 7, 127, u8::MAX] {
+            let set = NativeExactByteSet::from_membership(
+                membership,
+                scan_offset,
+                true,
+            )
+            .unwrap();
+            for architecture in [Architecture::X86_64, Architecture::Aarch64] {
+                let mut tables = Vec::new();
+                let storage = append_native_exact_byte_set(
+                    &mut tables,
+                    set,
+                    architecture,
+                    usize::MAX,
+                )
+                .unwrap()
+                .unwrap();
+                let nibble = exact_nibble_tables_from_storage(
+                    &tables,
+                    storage,
+                    architecture,
+                );
+                for start in [0_usize, 1, 15, 31, 63, 95] {
+                    for end in [start, start + 1, start + 15, start + 64, haystack.len()] {
+                        let end = end.min(haystack.len());
+                        let expected = (start..end).find(|&candidate| {
+                            candidate
+                                .checked_add(usize::from(scan_offset))
+                                .filter(|&source| source < end)
+                                .is_some_and(|source| set.contains(haystack[source]))
+                        });
+                        assert_eq!(
+                            exact_storage_first_candidate(
+                                &tables,
+                                storage,
+                                architecture,
+                                &haystack,
+                                start,
+                                end,
+                                usize::from(scan_offset),
+                            ),
+                            expected,
+                            "scalar {architecture:?}/{scan_offset}/{start}..{end}"
+                        );
+                        for width in [16_usize, 32, 64] {
+                            assert_eq!(
+                                exact_nibble_first_candidate(
+                                    nibble,
+                                    &haystack,
+                                    start,
+                                    end,
+                                    usize::from(scan_offset),
+                                    width,
+                                ),
+                                expected,
+                                "vector {architecture:?}/{width}/{scan_offset}/{start}..{end}"
+                            );
+                        }
+                        if architecture == Architecture::Aarch64 {
+                            for kind in [
+                                Some(Aarch64ExactSveKind::Nibble),
+                                storage.sve2_match.map(Aarch64ExactSveKind::Sve2Match),
+                            ]
+                            .into_iter()
+                            .flatten()
+                            {
+                                for vector_length in [16_usize, 32, 64, 256] {
+                                    assert_eq!(
+                                        exact_sve_first_candidate(
+                                            &tables,
+                                            storage,
+                                            nibble,
+                                            kind,
+                                            &haystack,
+                                            start,
+                                            end,
+                                            usize::from(scan_offset),
+                                            vector_length,
+                                        ),
+                                        expected,
+                                        "SVE {kind:?}/{vector_length}/{scan_offset}/{start}..{end}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -23030,7 +24213,7 @@ mod tests {
             OutputContract::SelectedEnd,
             OutputContract::Span,
         ] {
-            linked_dynamic_rows_entry_for_output(target, expected_accelerator, output);
+            linked_dynamic_rows_entry_for_output(target, expected_accelerator, output, false);
         }
     }
 
@@ -23046,6 +24229,7 @@ mod tests {
         target: Target,
         expected_accelerator: StartAccelerator,
         output: OutputContract,
+        fragmented_exact_root: bool,
     ) {
         use std::{fs, process::Command};
 
@@ -23056,13 +24240,20 @@ mod tests {
             },
             ..CompileLimitsV1::default()
         };
-        let (pattern, mode) = if output == OutputContract::Span {
-            ("(?:ab|ac)", CompileMode::Fast)
+        let (pattern, mode) = if fragmented_exact_root {
+            const CLASS: &str = r"(?-u:[acegikmoqsuwy\x80\x82\xF0\xFF])";
+            if output == OutputContract::Span {
+                (format!("{CLASS}(?-u:.)"), CompileMode::Fast)
+            } else {
+                (format!("(?:{CLASS})+"), CompileMode::Optimizing)
+            }
+        } else if output == OutputContract::Span {
+            ("(?:ab|ac)".to_owned(), CompileMode::Fast)
         } else {
-            ("(?:ab|ac)+z", CompileMode::Optimizing)
+            ("(?:ab|ac)+z".to_owned(), CompileMode::Optimizing)
         };
         let compiled = compile(
-            CompileRequest::new(pattern, target)
+            CompileRequest::new(&pattern, target)
                 .mode(mode)
                 .output(output)
                 .limits(limits),
@@ -23093,9 +24284,10 @@ mod tests {
             .collect::<Vec<_>>()
             .join(",");
         let directory = std::env::temp_dir().join(format!(
-            "fre-aot-dynamic-rows-{}-{:016x}-{output:?}",
+            "fre-aot-dynamic-rows-{}-{:016x}-{output:?}-{}",
             std::process::id(),
             target.features.bits(),
+            if fragmented_exact_root { "exact" } else { "range" },
         ));
         fs::create_dir_all(&directory).expect("create dynamic linker directory");
         let object = directory.join("dynamic.o");
