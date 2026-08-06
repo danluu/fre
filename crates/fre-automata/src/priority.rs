@@ -8362,12 +8362,31 @@ mod tests {
                 EdgeKind::AssertHaystackEnd,
             ],
             false,
-            super::PriorityBoundaryStrategy::Cached,
+            super::PriorityBoundaryStrategy::Direct,
         );
         check(
             &[
                 EdgeKind::AssertLineStartLf,
                 EdgeKind::AssertWordAscii,
+            ],
+            false,
+            super::PriorityBoundaryStrategy::Direct,
+        );
+        check(
+            &[
+                EdgeKind::AssertWordUnicode,
+                EdgeKind::AssertWordUnicode,
+                EdgeKind::AssertWordUnicode,
+            ],
+            false,
+            super::PriorityBoundaryStrategy::Direct,
+        );
+        check(
+            &[
+                EdgeKind::AssertWordUnicode,
+                EdgeKind::AssertWordUnicode,
+                EdgeKind::AssertWordUnicode,
+                EdgeKind::AssertWordUnicode,
             ],
             false,
             super::PriorityBoundaryStrategy::Cached,
@@ -8378,7 +8397,9 @@ mod tests {
     fn priority_cached_boundary_is_created_only_for_a_reached_assertion() {
         let automaton = boundary_strategy_automaton(&[
             EdgeKind::AssertHaystackStart,
-            EdgeKind::AssertHaystackEnd,
+            EdgeKind::AssertHaystackStart,
+            EdgeKind::AssertHaystackStart,
+            EdgeKind::AssertHaystackStart,
         ]);
         let strategy = super::priority_boundary_strategy(&automaton, false);
         assert_eq!(strategy, super::PriorityBoundaryStrategy::Cached);

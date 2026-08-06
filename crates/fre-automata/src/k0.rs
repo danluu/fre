@@ -22313,29 +22313,26 @@ trait PikeBoundaryEvaluator {
     fn edge_enabled(&mut self, kind: EdgeKind) -> Result<bool, SearchError>;
 }
 
-/// Whether a boundary-fact owner has a graph-proved reuse opportunity.
+/// Whether a boundary-fact owner has enough graph-proved duplicate work to be
+/// worth its bookkeeping.
 ///
-/// Repeated assertion edges in one family reuse that family's classification.
-/// Configured-line, CRLF-line and ASCII-word families additionally share one
-/// neighboring-byte load, so any two active neighbor families can amortize the
-/// owner even when each owns only one edge. The predicate depends only on
-/// immutable, authenticated graph metadata.
-#[allow(clippy::arithmetic_side_effects)]
+/// A kind's first edge cannot reuse a prior classification. Count only edges
+/// beyond the graph's distinct assertion kinds, and require both multiple such
+/// duplicates and a nontrivial total edge population. This deliberately keeps
+/// one- and two-assertion graphs direct, and does not infer reuse merely because
+/// unrelated families exist somewhere in the graph. The predicate depends only
+/// on immutable, authenticated graph metadata; runtime reachability remains
+/// guarded by the demand-driven owner.
 pub(crate) fn boundary_fact_reuse_is_profitable(automaton: &Automaton) -> bool {
-    let classifier = automaton.boundary_context_classifier();
-    let absolute = usize::from(classifier.absolute() != 0);
-    let configured_line = usize::from(classifier.configured_line() != 0);
-    let crlf_line = usize::from(classifier.crlf_line() != 0);
-    let ascii_word = usize::from(classifier.ascii_word() != 0);
-    let unicode_word = usize::from(classifier.unicode_word() != 0);
-    let active_family_count = absolute
-        + configured_line
-        + crlf_line
-        + ascii_word
-        + unicode_word;
-    let neighbor_family_count = configured_line + crlf_line + ascii_word;
-    debug_assert_eq!(active_family_count == 0, automaton.stats().assertion_edges() == 0);
-    automaton.stats().assertion_edges() > active_family_count || neighbor_family_count >= 2
+    const MIN_ASSERTION_EDGES: usize = 4;
+    const MIN_DUPLICATE_EDGES: usize = 2;
+
+    let assertion_edges = automaton.stats().assertion_edges();
+    let distinct_kinds = usize::try_from(automaton.stats().assertion_kinds().count_ones())
+        .expect("at most 18 assertion kinds fit usize");
+    debug_assert_eq!(distinct_kinds == 0, assertion_edges == 0);
+    assertion_edges >= MIN_ASSERTION_EDGES
+        && assertion_edges.saturating_sub(distinct_kinds) >= MIN_DUPLICATE_EDGES
 }
 
 struct AssertionFreePikeBoundary;
@@ -22564,43 +22561,6 @@ impl PikeBoundaryEvaluator for DirectPikeBoundary<'_> {
     }
 }
 
-struct CachedPikeBoundary<'a> {
-    automaton: &'a Automaton,
-    haystack: &'a [u8],
-    position: usize,
-    facts: Option<PreparedBoundaryFacts<'a>>,
-}
-
-impl<'a> CachedPikeBoundary<'a> {
-    const fn new(automaton: &'a Automaton, haystack: &'a [u8], position: usize) -> Self {
-        Self {
-            automaton,
-            haystack,
-            position,
-            facts: None,
-        }
-    }
-}
-
-impl PikeBoundaryEvaluator for CachedPikeBoundary<'_> {
-    #[inline]
-    fn edge_enabled(&mut self, kind: EdgeKind) -> Result<bool, SearchError> {
-        if kind == EdgeKind::Epsilon {
-            return Ok(true);
-        }
-        if kind == EdgeKind::ByteRange {
-            return Err(SearchError::InternalInvariant {
-                detail: "split state contained a consuming edge",
-            });
-        }
-        self.facts
-            .get_or_insert_with(|| {
-                PreparedBoundaryFacts::new(self.automaton, self.haystack, self.position)
-            })
-            .edge_enabled(kind)
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OrdinaryPikeBoundaryStrategy {
     AssertionFree,
@@ -22653,7 +22613,10 @@ fn expand_boundary_roots(
             )
         }
         OrdinaryPikeBoundaryStrategy::Cached => {
-            let mut evaluator = CachedPikeBoundary::new(automaton, haystack, position);
+            // Constructing the owner only records immutable boundary metadata.
+            // Every family, neighboring-byte load and Unicode decode remains
+            // demand driven until `expand_root` reaches its first assertion.
+            let mut evaluator = PreparedBoundaryFacts::new(automaton, haystack, position);
             expand_boundary_roots_with(
                 automaton,
                 haystack,
@@ -22764,7 +22727,7 @@ fn expand_exact_boundary_roots(
             )
         }
         OrdinaryPikeBoundaryStrategy::Cached => {
-            let mut evaluator = CachedPikeBoundary::new(automaton, haystack, position);
+            let mut evaluator = PreparedBoundaryFacts::new(automaton, haystack, position);
             expand_exact_boundary_roots_with(
                 automaton,
                 haystack,
@@ -25018,6 +24981,28 @@ mod tests {
                 byte_starts: vec![0; edge_kinds.len()],
                 byte_ends: vec![0; edge_kinds.len()],
                 edge_kinds,
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn cached_strategy_with_unreachable_assertions() -> Automaton {
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![StateRole::Consume, StateRole::Accept, StateRole::Split],
+                edge_offsets: vec![0, 1, 1, 5],
+                edge_targets: vec![1, 1, 1, 1, 1],
+                edge_kinds: vec![
+                    EdgeKind::ByteRange,
+                    EdgeKind::AssertWordAscii,
+                    EdgeKind::AssertWordAscii,
+                    EdgeKind::AssertWordAscii,
+                    EdgeKind::AssertWordAscii,
+                ],
+                byte_starts: vec![b'x', 0, 0, 0, 0],
+                byte_ends: vec![b'x', 0, 0, 0, 0],
             },
             CompileLimits::default(),
         )
@@ -41776,7 +41761,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_boundary_strategy_uses_only_authenticated_family_reuse() {
+    fn ordinary_boundary_strategy_requires_dense_exact_kind_reuse() {
         fn check(assertions: &[EdgeKind], expected: super::OrdinaryPikeBoundaryStrategy) {
             let plan = boundary_strategy_assertions(assertions);
             assert_eq!(super::ordinary_pike_boundary_strategy(&plan), expected);
@@ -41796,14 +41781,22 @@ mod tests {
                 EdgeKind::AssertHaystackStart,
                 EdgeKind::AssertHaystackEnd,
             ],
-            super::OrdinaryPikeBoundaryStrategy::Cached,
+            super::OrdinaryPikeBoundaryStrategy::Direct,
         );
         check(
             &[
                 EdgeKind::AssertLineStartLf,
                 EdgeKind::AssertWordAscii,
             ],
-            super::OrdinaryPikeBoundaryStrategy::Cached,
+            super::OrdinaryPikeBoundaryStrategy::Direct,
+        );
+        check(
+            &[
+                EdgeKind::AssertLineStartLf,
+                EdgeKind::AssertLineStartCrlf,
+                EdgeKind::AssertWordAscii,
+            ],
+            super::OrdinaryPikeBoundaryStrategy::Direct,
         );
         check(
             &[
@@ -41812,39 +41805,79 @@ mod tests {
             ],
             super::OrdinaryPikeBoundaryStrategy::Direct,
         );
+        check(
+            &[
+                EdgeKind::AssertWordUnicode,
+                EdgeKind::AssertWordUnicode,
+            ],
+            super::OrdinaryPikeBoundaryStrategy::Direct,
+        );
+        check(
+            &[
+                EdgeKind::AssertWordUnicode,
+                EdgeKind::AssertWordUnicode,
+                EdgeKind::AssertWordUnicode,
+            ],
+            super::OrdinaryPikeBoundaryStrategy::Direct,
+        );
+        check(
+            &[
+                EdgeKind::AssertWordUnicode,
+                EdgeKind::AssertWordUnicode,
+                EdgeKind::AssertWordUnicode,
+                EdgeKind::AssertWordUnicode,
+            ],
+            super::OrdinaryPikeBoundaryStrategy::Cached,
+        );
+        check(
+            &[
+                EdgeKind::AssertHaystackStart,
+                EdgeKind::AssertHaystackStart,
+                EdgeKind::AssertHaystackEnd,
+                EdgeKind::AssertWordUnicode,
+            ],
+            super::OrdinaryPikeBoundaryStrategy::Direct,
+        );
+        check(
+            &[
+                EdgeKind::AssertHaystackStart,
+                EdgeKind::AssertHaystackStart,
+                EdgeKind::AssertHaystackEnd,
+                EdgeKind::AssertHaystackEnd,
+            ],
+            super::OrdinaryPikeBoundaryStrategy::Cached,
+        );
     }
 
     #[test]
-    fn ordinary_cached_boundary_stays_unprepared_until_an_assertion_is_visited() {
-        let plan = boundary_strategy_assertions(&[
-            EdgeKind::AssertHaystackStart,
-            EdgeKind::AssertHaystackEnd,
-        ]);
-        let mut evaluator = super::CachedPikeBoundary::new(&plan, b"x", 0);
-        assert!(evaluator.facts.is_none());
-        for _ in 0..8 {
-            assert!(super::PikeBoundaryEvaluator::edge_enabled(
-                &mut evaluator,
-                EdgeKind::Epsilon,
-            )
-            .unwrap());
-        }
-        assert!(evaluator.facts.is_none());
-        assert!(super::PikeBoundaryEvaluator::edge_enabled(
+    fn ordinary_cached_owner_does_no_fact_work_when_closure_reaches_no_assertion() {
+        let plan = cached_strategy_with_unreachable_assertions();
+        assert_eq!(
+            super::ordinary_pike_boundary_strategy(&plan),
+            super::OrdinaryPikeBoundaryStrategy::Cached,
+        );
+        let mut workspace = K0Workspace::new(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let mut meter = WorkMeter::new(u64::MAX, 0);
+        workspace.begin_boundary(&mut meter, 0).unwrap();
+        let mut evaluator = super::PreparedBoundaryFacts::new(&plan, b"x", 0);
+        let mut pending = None;
+        super::expand_boundary_roots_with(
+            &plan,
+            b"x",
+            0,
             &mut evaluator,
-            EdgeKind::ByteRange,
+            &mut workspace,
+            &mut meter,
+            &mut pending,
         )
-        .is_err());
-        assert!(evaluator.facts.is_none());
-
-        assert!(super::PikeBoundaryEvaluator::edge_enabled(
-            &mut evaluator,
-            EdgeKind::AssertHaystackStart,
-        )
-        .unwrap());
-        let facts = evaluator.facts.as_ref().unwrap();
-        assert_eq!(facts.family_preparations(), [1, 0, 0, 0, 0]);
-        assert_eq!(facts.neighbor_preparations(), 0);
+        .unwrap();
+        assert_eq!(
+            evaluator.family_preparations(),
+            [0; super::PIKE_BOUNDARY_FAMILY_COUNT]
+        );
+        assert_eq!(evaluator.neighbor_preparations(), 0);
+        assert_eq!(workspace.current_len, 1);
+        assert_eq!(pending, None);
 
         let direct = boundary_strategy_assertions(&[EdgeKind::AssertHaystackStart]);
         assert_eq!(
