@@ -101,6 +101,7 @@ const ORDINARY_START_FILTER_PROOF: StartFilterProof = StartFilterProof {
 };
 const BYTE_ALPHABET: usize = 256;
 const _: () = assert!(BYTE_ALPHABET == 1 << 8);
+const FULLY_PREFILLED_BYTE_ROW_STRIDE: u32 = 256;
 // This is both the contextual-state ceiling and the reference state count for
 // the fixed direct-workspace resource budget. Assertion-free exact-class rows
 // may reinvest unused row storage in more forward identities, but their
@@ -2574,8 +2575,21 @@ struct LazyIndexPromotionPlan {
     slots: [usize; LAZY_IDENTITY_INDEX_PROMOTION_STATES],
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FullyPrefilledByteRows {
+    Absent,
+    Frozen,
+}
+
+impl FullyPrefilledByteRows {
+    const fn is_frozen(self) -> bool {
+        matches!(self, Self::Frozen)
+    }
+}
+
 fn validate_lazy_capacity_full(
     item_universe: usize,
+    fully_prefilled_byte_rows: FullyPrefilledByteRows,
     detail: &'static str,
 ) -> Result<(), SearchError> {
     // Through three distinct consuming items, every ordered subset, pending
@@ -2583,7 +2597,14 @@ fn validate_lazy_capacity_full(
     // corresponding aggregate item arena is exact as well. CapacityFull in
     // that regime therefore proves a broken layout or cache invariant rather
     // than ordinary bounded-cache saturation.
-    if item_universe <= EXACT_LAZY_CAPACITY_MAX_ITEMS {
+    // A fully-prefilled raw-byte view deliberately shortens only `offsets`
+    // after enumerating its complete transaction. A foreign resume frontier
+    // may then reach this cold capacity path even for a small graph; it must
+    // fail closed to inline execution instead of being mistaken for a broken
+    // resource layout.
+    if !fully_prefilled_byte_rows.is_frozen()
+        && item_universe <= EXACT_LAZY_CAPACITY_MAX_ITEMS
+    {
         return Err(SearchError::InternalInvariant { detail });
     }
     Ok(())
@@ -2889,6 +2910,47 @@ impl LazyLoopSkipPlans {
         debug_assert!(
             bitmap_member != Some(true) || found.is_some(),
             "direct loop state bitmap has no exact plan"
+        );
+        found
+    }
+
+    #[inline]
+    fn find_fully_prefilled_byte_row_with_hint(
+        &self,
+        row_offset: u32,
+        preferred_slot: Option<usize>,
+        byte_row_base: u32,
+        byte_row_owners: &[u32; LAZY_LOOP_SKIP_PLAN_CAPACITY],
+    ) -> Option<(usize, &LazyLoopSkipPlan)> {
+        if let Some(slot) = preferred_slot {
+            if byte_row_owners.get(slot).copied() == Some(row_offset) {
+                if let Some(plan) = self.entries.get(slot).and_then(|entry| entry.as_ref()) {
+                    return Some((slot, plan));
+                }
+            }
+        }
+        if preferred_slot != Some(0) && byte_row_owners[0] == row_offset {
+            if let Some(plan) = self.entries[0].as_ref() {
+                return Some((0, plan));
+            }
+        }
+        let relative = row_offset.checked_sub(byte_row_base)?;
+        debug_assert_eq!(relative % FULLY_PREFILLED_BYTE_ROW_STRIDE, 0);
+        let bitmap_member = u8::try_from(relative / FULLY_PREFILLED_BYTE_ROW_STRIDE)
+            .ok()
+            .map(|state| byte_bitmap_contains(self.state_members, state));
+        if bitmap_member == Some(false) {
+            return None;
+        }
+        let found = self.entries.iter().enumerate().find_map(|(slot, plan)| {
+            if preferred_slot == Some(slot) || slot == 0 || byte_row_owners[slot] != row_offset {
+                return None;
+            }
+            plan.as_ref().map(|plan| (slot, plan))
+        });
+        debug_assert!(
+            bitmap_member != Some(true) || found.is_some(),
+            "expanded direct loop state bitmap has no exact plan"
         );
         found
     }
@@ -3344,6 +3406,7 @@ struct LazyWorkspace {
     initial_kind: LazyInitialKind,
     inline_start_action: LazyStartAction,
     loop_skip_plans: LazyLoopSkipPlans,
+    fully_prefilled_byte_loop_rows: [u32; LAZY_LOOP_SKIP_PLAN_CAPACITY],
     context_loop_skip_plans: ContextLazyLoopSkipPlans,
     direct_cells_published: u32,
     loop_skip_analyzed_at_cells: u32,
@@ -3353,6 +3416,7 @@ struct LazyWorkspace {
     initialized: bool,
     declined: bool,
     saturated: bool,
+    fully_prefilled_byte_rows: FullyPrefilledByteRows,
 }
 
 impl LazyWorkspace {
@@ -3422,6 +3486,7 @@ impl LazyWorkspace {
             initial_kind: LazyInitialKind::Uninitialized,
             inline_start_action: LazyStartAction::Drop,
             loop_skip_plans: LazyLoopSkipPlans::empty(),
+            fully_prefilled_byte_loop_rows: [LAZY_NO_STATE; LAZY_LOOP_SKIP_PLAN_CAPACITY],
             context_loop_skip_plans: ContextLazyLoopSkipPlans::empty(),
             direct_cells_published: 0,
             loop_skip_analyzed_at_cells: 0,
@@ -3431,6 +3496,7 @@ impl LazyWorkspace {
             initialized: false,
             declined: false,
             saturated: false,
+            fully_prefilled_byte_rows: FullyPrefilledByteRows::Absent,
         })
     }
 
@@ -3457,6 +3523,7 @@ impl LazyWorkspace {
             initial_kind: LazyInitialKind::Uninitialized,
             inline_start_action: LazyStartAction::Drop,
             loop_skip_plans: LazyLoopSkipPlans::empty(),
+            fully_prefilled_byte_loop_rows: [LAZY_NO_STATE; LAZY_LOOP_SKIP_PLAN_CAPACITY],
             context_loop_skip_plans: ContextLazyLoopSkipPlans::empty(),
             direct_cells_published: 0,
             loop_skip_analyzed_at_cells: 0,
@@ -3466,6 +3533,7 @@ impl LazyWorkspace {
             initialized: false,
             declined: true,
             saturated: false,
+            fully_prefilled_byte_rows: FullyPrefilledByteRows::Absent,
         }
     }
 
@@ -3681,6 +3749,31 @@ impl LazyWorkspace {
         debug_assert_eq!(row_offset % stride, 0);
         debug_assert!(row_offset / stride < self.state_len);
         self.rows[row_offset + usize::from(class)]
+    }
+
+    /// Read a raw-byte-expanded cell whose absolute row token was sealed by
+    /// the same complete-cache receipt. The compact prefix remains the sole
+    /// mutable/fail-closed representation; this view occupies only the frozen
+    /// unused row arena.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the authenticated byte-row receipt bounds the absolute row and byte"
+    )]
+    #[inline]
+    fn fully_prefilled_byte_cell(
+        &self,
+        row_offset: u32,
+        byte_row_base: u32,
+        byte: u8,
+    ) -> u32 {
+        debug_assert!(row_offset >= byte_row_base);
+        debug_assert_eq!(
+            (row_offset - byte_row_base) % FULLY_PREFILLED_BYTE_ROW_STRIDE,
+            0
+        );
+        let row_offset = usize::try_from(row_offset)
+            .expect("the authenticated fully-prefilled byte row fits usize");
+        self.rows[row_offset + usize::from(byte)]
     }
 
     fn set_cell(&mut self, state: u32, class: u8, cell: u32) -> Result<(), SearchError> {
@@ -4273,6 +4366,7 @@ struct ReverseWorkspace {
     initialized: bool,
     declined: bool,
     saturated: bool,
+    fully_prefilled_byte_rows: FullyPrefilledByteRows,
 }
 
 impl ReverseWorkspace {
@@ -4349,6 +4443,7 @@ impl ReverseWorkspace {
             initialized: false,
             declined: false,
             saturated: false,
+            fully_prefilled_byte_rows: FullyPrefilledByteRows::Absent,
         };
         reverse.build_csr(automaton, seen_at)?;
         Ok(reverse)
@@ -4380,6 +4475,7 @@ impl ReverseWorkspace {
             initialized: false,
             declined: true,
             saturated: false,
+            fully_prefilled_byte_rows: FullyPrefilledByteRows::Absent,
         }
     }
 
@@ -4655,6 +4751,27 @@ impl ReverseWorkspace {
         debug_assert_eq!(row_offset % stride, 0);
         debug_assert!(row_offset / stride < self.state_len);
         self.rows[row_offset + usize::from(class)]
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the authenticated reverse byte-row receipt bounds the absolute row and byte"
+    )]
+    #[inline]
+    fn fully_prefilled_byte_cell(
+        &self,
+        row_offset: u32,
+        byte_row_base: u32,
+        byte: u8,
+    ) -> u32 {
+        debug_assert!(row_offset >= byte_row_base);
+        debug_assert_eq!(
+            (row_offset - byte_row_base) % FULLY_PREFILLED_BYTE_ROW_STRIDE,
+            0
+        );
+        let row_offset = usize::try_from(row_offset)
+            .expect("the authenticated fully-prefilled reverse byte row fits usize");
+        self.rows[row_offset + usize::from(byte)]
     }
 
     fn set_cell(&mut self, state: u32, class: u8, value: u32) -> Result<(), SearchError> {
@@ -5456,9 +5573,23 @@ pub struct K0FullyPrefilledResumeCacheReceipt {
     direct_row_stride: u32,
     forward_state_len: usize,
     forward_cells: usize,
+    byte_row_flags: u8,
     reverse_allocated: bool,
     reverse_state_len: usize,
     reverse_cells: usize,
+}
+
+const FULLY_PREFILLED_FORWARD_BYTE_ROWS: u8 = 1 << 0;
+const FULLY_PREFILLED_REVERSE_BYTE_ROWS: u8 = 1 << 1;
+
+impl K0FullyPrefilledResumeCacheReceipt {
+    const fn has_forward_byte_rows(self) -> bool {
+        self.byte_row_flags & FULLY_PREFILLED_FORWARD_BYTE_ROWS != 0
+    }
+
+    const fn has_reverse_byte_rows(self) -> bool {
+        self.byte_row_flags & FULLY_PREFILLED_REVERSE_BYTE_ROWS != 0
+    }
 }
 
 /// Caller-owned fixed-capacity storage for allocation-free repeated K0 calls.
@@ -6024,7 +6155,6 @@ impl K0Workspace {
         {
             return None;
         }
-
         if receipt.reverse_allocated {
             let reverse_cells = receipt.reverse_state_len.checked_mul(stride)?;
             if self.reverse.automaton_identity != receipt.automaton_identity
@@ -6039,8 +6169,42 @@ impl K0Workspace {
             {
                 return None;
             }
-        } else if require_reverse {
+        } else if receipt.reverse_cells != 0
+            || receipt.reverse_state_len != 0
+            || require_reverse
+        {
             return None;
+        }
+        if receipt.byte_row_flags != 0 {
+            if receipt.byte_row_flags
+                & !(FULLY_PREFILLED_FORWARD_BYTE_ROWS | FULLY_PREFILLED_REVERSE_BYTE_ROWS)
+                != 0
+            {
+                return None;
+            }
+            if receipt.has_forward_byte_rows() {
+                let byte_cells = receipt.forward_state_len.checked_mul(BYTE_ALPHABET)?;
+                let byte_end = receipt.forward_cells.checked_add(byte_cells)?;
+                if !self.lazy.fully_prefilled_byte_rows.is_frozen()
+                    || byte_end > self.lazy.rows.len()
+                    || self.lazy.offsets.len() != receipt.forward_state_len
+                {
+                    return None;
+                }
+            }
+            if receipt.has_reverse_byte_rows() {
+                if !receipt.reverse_allocated {
+                    return None;
+                }
+                let byte_cells = receipt.reverse_state_len.checked_mul(BYTE_ALPHABET)?;
+                let byte_end = receipt.reverse_cells.checked_add(byte_cells)?;
+                if !self.reverse.fully_prefilled_byte_rows.is_frozen()
+                    || byte_end > self.reverse.rows.len()
+                    || self.reverse.offsets.len() != receipt.reverse_state_len
+                {
+                    return None;
+                }
+            }
         }
         Some(())
     }
@@ -12605,12 +12769,13 @@ fn try_accounted_warm_ordered_resume_endpoint_impl<const LOOP_SKIP: bool>(
     }
 
     let row = workspace.lazy.row_offset(cached_hint)?;
-    execute_accounted_warm_ordered_resume_endpoint_loop::<LOOP_SKIP, false>(
+    execute_accounted_warm_ordered_resume_endpoint_loop::<LOOP_SKIP, false, false>(
         automaton,
         haystack,
         window,
         workspace,
         row,
+        0,
         resume_position,
         pending_end,
         earliest,
@@ -12650,25 +12815,72 @@ fn try_fully_prefilled_ordered_resume_endpoint(
         return Ok(None);
     };
     let work = initial_accounted_warm_resume_work(RESUME_CACHE_IDENTITY_CHECK_WORK)?;
-    let completed = if workspace.lazy.loop_skip_plans.is_empty() {
-        execute_accounted_warm_ordered_resume_endpoint_loop::<false, true>(
+    let has_loop_rows = !workspace.lazy.loop_skip_plans.is_empty();
+    let has_byte_rows = receipt.has_forward_byte_rows();
+    let byte_row_base = if has_byte_rows {
+        u32::try_from(receipt.forward_cells).map_err(|_| {
+            SearchError::InternalInvariant {
+                detail: "authenticated forward byte-row base does not fit u32",
+            }
+        })?
+    } else {
+        0
+    };
+    let row = if has_byte_rows {
+        fully_prefilled_byte_row_offset(
+            receipt.forward_cells,
+            workspace.lazy.row_state(row),
+        )?
+    } else {
+        row
+    };
+    let completed = if has_loop_rows && has_byte_rows {
+        execute_accounted_warm_ordered_resume_endpoint_loop::<true, true, true>(
             automaton,
             haystack,
             window,
             workspace,
             row,
+            byte_row_base,
+            resume_position,
+            pending_end,
+            earliest,
+            work,
+        )?
+    } else if has_loop_rows {
+        execute_accounted_warm_ordered_resume_endpoint_loop::<true, true, false>(
+            automaton,
+            haystack,
+            window,
+            workspace,
+            row,
+            0,
+            resume_position,
+            pending_end,
+            earliest,
+            work,
+        )?
+    } else if has_byte_rows {
+        execute_accounted_warm_ordered_resume_endpoint_loop::<false, true, true>(
+            automaton,
+            haystack,
+            window,
+            workspace,
+            row,
+            byte_row_base,
             resume_position,
             pending_end,
             earliest,
             work,
         )?
     } else {
-        execute_accounted_warm_ordered_resume_endpoint_loop::<true, true>(
+        execute_accounted_warm_ordered_resume_endpoint_loop::<false, true, false>(
             automaton,
             haystack,
             window,
             workspace,
             row,
+            0,
             resume_position,
             pending_end,
             earliest,
@@ -12694,12 +12906,14 @@ fn try_fully_prefilled_ordered_resume_endpoint(
 fn execute_accounted_warm_ordered_resume_endpoint_loop<
     const LOOP_SKIP: bool,
     const FULLY_PREFILLED: bool,
+    const BYTE_ROWS: bool,
 >(
     automaton: &Automaton,
     haystack: &[u8],
     window: SearchWindow,
     workspace: &K0Workspace,
     mut row: u32,
+    byte_row_base: u32,
     resume_position: usize,
     pending_end: Option<usize>,
     earliest: bool,
@@ -12707,6 +12921,7 @@ fn execute_accounted_warm_ordered_resume_endpoint_loop<
 ) -> Result<AccountedWarmResumeEndpoint, SearchError> {
     debug_assert!(!LOOP_SKIP || !workspace.lazy.loop_skip_plans.is_empty());
     debug_assert!(!FULLY_PREFILLED || workspace.lazy.initialized);
+    debug_assert!(!BYTE_ROWS || FULLY_PREFILLED);
     let mut position = resume_position;
     let mut pending_end = pending_end;
     let mut loop_probe = LazyLoopProbe::default();
@@ -12719,11 +12934,23 @@ fn execute_accounted_warm_ordered_resume_endpoint_loop<
             return Ok(complete_warm_resume_endpoint(pending_end, work));
         }
         if LOOP_SKIP {
-            let selected = workspace.lazy.loop_skip_plans.find_with_hint(
-                row,
-                active_loop_slot,
-                workspace.lazy.direct_row_stride,
-            );
+            let selected = if BYTE_ROWS {
+                workspace
+                    .lazy
+                    .loop_skip_plans
+                    .find_fully_prefilled_byte_row_with_hint(
+                        row,
+                        active_loop_slot,
+                        byte_row_base,
+                        &workspace.lazy.fully_prefilled_byte_loop_rows,
+                    )
+            } else {
+                workspace.lazy.loop_skip_plans.find_with_hint(
+                    row,
+                    active_loop_slot,
+                    workspace.lazy.direct_row_stride,
+                )
+            };
             let selected_slot = selected.map(|(slot, _)| slot);
             if selected_slot != active_loop_slot {
                 loop_probe.left_plan_state();
@@ -12785,11 +13012,17 @@ fn execute_accounted_warm_ordered_resume_endpoint_loop<
             .ok_or(SearchError::InternalInvariant {
                 detail: "warm resume source position exceeded the validated window",
             })?;
-        let class = automaton.byte_classes().class_of(byte);
-        let cell = if FULLY_PREFILLED {
-            workspace.lazy.fully_prefilled_direct_cell(row, class)
+        let cell = if BYTE_ROWS {
+            workspace
+                .lazy
+                .fully_prefilled_byte_cell(row, byte_row_base, byte)
         } else {
-            workspace.lazy.direct_cell(row, class)?
+            let class = automaton.byte_classes().class_of(byte);
+            if FULLY_PREFILLED {
+                workspace.lazy.fully_prefilled_direct_cell(row, class)
+            } else {
+                workspace.lazy.direct_cell(row, class)?
+            }
         };
         if !FULLY_PREFILLED && cell == LAZY_CELL_UNFILLED {
             return Ok(AccountedWarmResumeEndpoint::Continue(
@@ -12916,11 +13149,12 @@ fn try_warm_ordered_resume_span(
     {
         return Ok(WarmResumeSpan::RecoverReverse { selected_end, work });
     }
-    execute_accounted_warm_ordered_resume_reverse_loop::<false>(
+    execute_accounted_warm_ordered_resume_reverse_loop::<false, false>(
         automaton,
         haystack,
         window,
         workspace,
+        0,
         selected_end,
         work,
     )
@@ -12969,16 +13203,35 @@ fn try_fully_prefilled_ordered_resume_span(
         // Preserve the ordinary path's defensive empty-endpoint recovery.
         return Ok(FullyPrefilledResumeSpan::Stale);
     }
-    match execute_accounted_warm_ordered_resume_reverse_loop::<true>(
-        automaton,
-        haystack,
-        window,
-        workspace,
-        selected_end,
-        work,
-    )?
-    .0
-    {
+    let reverse_outcome = if receipt.has_reverse_byte_rows() {
+        let byte_row_base = u32::try_from(receipt.reverse_cells).map_err(|_| {
+            SearchError::InternalInvariant {
+                detail: "authenticated reverse byte-row base does not fit u32",
+            }
+        })?;
+        execute_accounted_warm_ordered_resume_reverse_loop::<true, true>(
+            automaton,
+            haystack,
+            window,
+            workspace,
+            byte_row_base,
+            selected_end,
+            work,
+        )?
+        .0
+    } else {
+        execute_accounted_warm_ordered_resume_reverse_loop::<true, false>(
+            automaton,
+            haystack,
+            window,
+            workspace,
+            0,
+            selected_end,
+            work,
+        )?
+        .0
+    };
+    match reverse_outcome {
         WarmResumeSpan::Complete(found) => Ok(FullyPrefilledResumeSpan::Complete(found)),
         WarmResumeSpan::ContinueForward(_)
         | WarmResumeSpan::RecoverReverse { .. }
@@ -12993,17 +13246,29 @@ fn try_fully_prefilled_ordered_resume_span(
     clippy::too_many_arguments,
     reason = "the generic and receipt-authenticated reverse paths share exact step accounting"
 )]
-fn execute_accounted_warm_ordered_resume_reverse_loop<const FULLY_PREFILLED: bool>(
+fn execute_accounted_warm_ordered_resume_reverse_loop<
+    const FULLY_PREFILLED: bool,
+    const BYTE_ROWS: bool,
+>(
     automaton: &Automaton,
     haystack: &[u8],
     window: SearchWindow,
     workspace: &K0Workspace,
+    byte_row_base: u32,
     selected_end: usize,
     mut work: u64,
 ) -> Result<(WarmResumeSpan, u64), SearchError> {
     let reverse = &workspace.reverse;
     debug_assert!(!FULLY_PREFILLED || reverse.initialized);
-    let mut row = reverse.row_offset(reverse.initial)?;
+    debug_assert!(!BYTE_ROWS || FULLY_PREFILLED);
+    let mut row = if BYTE_ROWS {
+        fully_prefilled_byte_row_offset(
+            usize::try_from(byte_row_base).expect("authenticated byte-row base fits usize"),
+            reverse.initial,
+        )?
+    } else {
+        reverse.row_offset(reverse.initial)?
+    };
     let mut cursor = selected_end;
     let mut candidate = None;
     while cursor > window.start() {
@@ -13022,11 +13287,15 @@ fn execute_accounted_warm_ordered_resume_reverse_loop<const FULLY_PREFILLED: boo
             .ok_or(SearchError::InternalInvariant {
                 detail: "warm resume Span reverse position exceeded the validated source",
             })?;
-        let class = automaton.byte_classes().class_of(byte);
-        let cell = if FULLY_PREFILLED {
-            reverse.fully_prefilled_direct_cell(row, class)
+        let cell = if BYTE_ROWS {
+            reverse.fully_prefilled_byte_cell(row, byte_row_base, byte)
         } else {
-            reverse.direct_cell(row, class)?
+            let class = automaton.byte_classes().class_of(byte);
+            if FULLY_PREFILLED {
+                reverse.fully_prefilled_direct_cell(row, class)
+            } else {
+                reverse.direct_cell(row, class)?
+            }
         };
         if !FULLY_PREFILLED && cell == LAZY_CELL_UNFILLED {
             return Ok((
@@ -14088,14 +14357,32 @@ pub(crate) fn recover_span_from_selected_end_with_fully_prefilled_workspace(
     }
 
     let initial_work = initial_accounted_warm_resume_work(0)?;
-    let (outcome, work) = execute_accounted_warm_ordered_resume_reverse_loop::<true>(
-        automaton,
-        haystack,
-        window,
-        workspace,
-        selected_end,
-        initial_work,
-    )?;
+    let (outcome, work) = if receipt.has_reverse_byte_rows() {
+        let byte_row_base = u32::try_from(receipt.reverse_cells).map_err(|_| {
+            SearchError::InternalInvariant {
+                detail: "authenticated reverse byte-row base does not fit u32",
+            }
+        })?;
+        execute_accounted_warm_ordered_resume_reverse_loop::<true, true>(
+            automaton,
+            haystack,
+            window,
+            workspace,
+            byte_row_base,
+            selected_end,
+            initial_work,
+        )?
+    } else {
+        execute_accounted_warm_ordered_resume_reverse_loop::<true, false>(
+            automaton,
+            haystack,
+            window,
+            workspace,
+            0,
+            selected_end,
+            initial_work,
+        )?
+    };
     let WarmResumeSpan::Complete(Some(found)) = outcome else {
         return Err(SearchError::InternalInvariant {
             detail: "fully-prefilled selected-end recovery produced a mutable handoff",
@@ -15507,6 +15794,7 @@ fn finish_resume_lazy_cached_transition(
             LazyInterned::CapacityFull => {
                 validate_lazy_capacity_full(
                     automaton.stats().consuming_states(),
+                    workspace.lazy.fully_prefilled_byte_rows,
                     "exact small lazy DFA exhausted its proven capacity",
                 )?;
                 workspace.lazy.saturated = true;
@@ -16049,6 +16337,7 @@ fn seed_lazy_resume_state(
             LazyInterned::CapacityFull => {
                 validate_lazy_capacity_full(
                     automaton.stats().consuming_states(),
+                    workspace.lazy.fully_prefilled_byte_rows,
                     "exact small resume frontier exhausted its proven cache capacity",
                 )?;
                 workspace.lazy.saturated = true;
@@ -17400,6 +17689,7 @@ fn retain_context_lazy_scratch(
         LazyInterned::CapacityFull => {
             validate_lazy_capacity_full(
                 automaton.stats().consuming_states(),
+                workspace.lazy.fully_prefilled_byte_rows,
                 "exact small contextual lazy DFA exhausted its proven capacity",
             )?;
             workspace.lazy.saturated = true;
@@ -17446,6 +17736,184 @@ fn expand_context_lazy_root(
         }
     }
     Ok(false)
+}
+
+fn fully_prefilled_byte_row_offset(
+    byte_row_base: usize,
+    state: u32,
+) -> Result<u32, SearchError> {
+    let state = usize::try_from(state).map_err(|_| SearchError::InternalInvariant {
+        detail: "fully-prefilled byte-row state does not fit usize",
+    })?;
+    byte_row_base
+        .checked_add(state.checked_mul(BYTE_ALPHABET).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "fully-prefilled byte-row state offset",
+            },
+        )?)
+        .and_then(|offset| u32::try_from(offset).ok())
+        .filter(|&offset| offset < LAZY_CELL_STATE_MASK)
+        .ok_or(SearchError::InternalInvariant {
+            detail: "fully-prefilled byte-row offset exceeds its cell field",
+        })
+}
+
+/// Materialize one absolute-token raw-byte view into the unused suffix of an
+/// already initialized compact-row arena. A capacity decline writes nothing;
+/// every other failure remains private to the staged workspace transaction.
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::too_many_lines,
+    reason = "validated nonzero strides and admitted row extents bound raw-byte expansion"
+)]
+#[cold]
+fn try_materialize_fully_prefilled_byte_rows(
+    automaton: &Automaton,
+    rows: &mut [u32],
+    compact_stride: u32,
+    state_len: usize,
+    compact_cells: usize,
+    meter: &mut WorkMeter,
+) -> Result<Option<usize>, SearchError> {
+    let stride = usize::try_from(compact_stride).map_err(|_| {
+        SearchError::InternalInvariant {
+            detail: "fully-prefilled compact stride does not fit usize",
+        }
+    })?;
+    if stride == 0
+        || stride != automaton.byte_classes().count()
+        || state_len.checked_mul(stride) != Some(compact_cells)
+    {
+        return Err(SearchError::InternalInvariant {
+            detail: "fully-prefilled compact rows do not match their immutable alphabet",
+        });
+    }
+    let byte_cells = state_len.checked_mul(BYTE_ALPHABET).ok_or(
+        SearchError::ArithmeticOverflow {
+            computation: "fully-prefilled raw-byte cells",
+        },
+    )?;
+    let byte_row_base = compact_cells;
+    let Some(byte_row_end) = byte_row_base.checked_add(byte_cells) else {
+        return Ok(None);
+    };
+    if byte_cells == 0 || byte_row_end > rows.len() {
+        return Ok(None);
+    }
+    let last_state = u32::try_from(state_len - 1).map_err(|_| {
+        SearchError::InternalInvariant {
+            detail: "fully-prefilled final state does not fit u32",
+        }
+    })?;
+    let last_row = fully_prefilled_byte_row_offset(byte_row_base, last_state)?;
+    if usize::try_from(last_row)
+        .ok()
+        .and_then(|row| row.checked_add(BYTE_ALPHABET))
+        != Some(byte_row_end)
+    {
+        return Err(SearchError::InternalInvariant {
+            detail: "fully-prefilled byte rows do not close their admitted arena",
+        });
+    }
+
+    for state in 0..state_len {
+        for byte in u8::MIN..=u8::MAX {
+            meter.charge(1, 0)?;
+            let class = automaton.byte_classes().class_of(byte);
+            let compact_index = state
+                .checked_mul(stride)
+                .and_then(|row| row.checked_add(usize::from(class)))
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "fully-prefilled compact source cell",
+                })?;
+            let compact = *rows.get(compact_index).ok_or(
+                SearchError::InternalInvariant {
+                    detail: "fully-prefilled compact source cell is outside its arena",
+                },
+            )?;
+            if compact == LAZY_CELL_UNFILLED {
+                return Err(SearchError::InternalInvariant {
+                    detail: "fully-prefilled raw-byte source contains an unpublished cell",
+                });
+            }
+            let encoded = compact & LAZY_CELL_STATE_MASK;
+            let expanded = if encoded == 0 {
+                compact
+            } else {
+                let compact_row = encoded.checked_sub(1).ok_or(
+                    SearchError::InternalInvariant {
+                        detail: "fully-prefilled compact row token underflowed",
+                    },
+                )?;
+                if compact_row % compact_stride != 0 {
+                    return Err(SearchError::InternalInvariant {
+                        detail: "fully-prefilled compact row token is misaligned",
+                    });
+                }
+                let next_state = compact_row / compact_stride;
+                if usize::try_from(next_state)
+                    .ok()
+                    .map_or(true, |state| state >= state_len)
+                {
+                    return Err(SearchError::InternalInvariant {
+                        detail: "fully-prefilled compact row token leaves the live cache",
+                    });
+                }
+                let byte_row = fully_prefilled_byte_row_offset(byte_row_base, next_state)?;
+                let byte_token = byte_row.checked_add(1).ok_or(
+                    SearchError::InternalInvariant {
+                        detail: "fully-prefilled byte-row token overflowed",
+                    },
+                )?;
+                (compact & !LAZY_CELL_STATE_MASK) | byte_token
+            };
+            let byte_index = byte_row_base
+                .checked_add(state.checked_mul(BYTE_ALPHABET).ok_or(
+                    SearchError::ArithmeticOverflow {
+                        computation: "fully-prefilled byte-row destination",
+                    },
+                )?)
+                .and_then(|row| row.checked_add(usize::from(byte)))
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "fully-prefilled byte destination cell",
+                })?;
+            *rows.get_mut(byte_index).ok_or(
+                SearchError::InternalInvariant {
+                    detail: "fully-prefilled byte destination is outside its arena",
+                },
+            )? = expanded;
+        }
+    }
+    Ok(Some(byte_row_base))
+}
+
+fn fully_prefilled_byte_loop_rows(
+    lazy: &LazyWorkspace,
+    byte_row_base: usize,
+) -> Result<[u32; LAZY_LOOP_SKIP_PLAN_CAPACITY], SearchError> {
+    let mut owners = [LAZY_NO_STATE; LAZY_LOOP_SKIP_PLAN_CAPACITY];
+    for (slot, plan) in lazy.loop_skip_plans.entries.iter().enumerate() {
+        let Some(plan) = plan else {
+            continue;
+        };
+        let state = direct_row_state(plan.row_offset, lazy.direct_row_stride);
+        if usize::try_from(state)
+            .ok()
+            .map_or(true, |state| state >= lazy.state_len)
+        {
+            return Err(SearchError::InternalInvariant {
+                detail: "fully-prefilled loop owner leaves the live cache",
+            });
+        }
+        let owner = fully_prefilled_byte_row_offset(byte_row_base, state)?;
+        if owners[..slot].contains(&owner) {
+            return Err(SearchError::InternalInvariant {
+                detail: "fully-prefilled byte-row loop owner is duplicated",
+            });
+        }
+        owners[slot] = owner;
+    }
+    Ok(owners)
 }
 
 /// Build a complete direct cache in temporary storage, then publish it with
@@ -17584,6 +18052,64 @@ fn prefill_bound_resume_caches_transaction(
     // therefore leaves the live workspace and resume hints untouched.
     try_derive_lazy_loop_skip(automaton, &mut staged, &mut meter)?;
 
+    // The exact-class layout may have reinvested the old 256-cell row budget
+    // in a larger identity arena. When the transaction's complete reachable
+    // graph uses only part of that arena, reuse the initialized suffix for an
+    // absolute-token raw-byte view. Freezing publication at the enumerated
+    // state count keeps those suffix cells permanently outside every compact
+    // ordinary/fail-closed row; a later foreign frontier therefore declines
+    // to inline execution instead of touching the overlay.
+    let forward_stride = staged.lazy.direct_row_stride;
+    let forward_state_len = staged.lazy.state_len;
+    let forward_byte_rows =
+        match try_materialize_fully_prefilled_byte_rows(
+            automaton,
+            &mut staged.lazy.rows,
+            forward_stride,
+            forward_state_len,
+            forward_cells,
+            &mut meter,
+        )? {
+            Some(base) => {
+                staged.lazy.fully_prefilled_byte_loop_rows =
+                    fully_prefilled_byte_loop_rows(&staged.lazy, base)?;
+                staged.lazy.offsets.truncate(staged.lazy.state_len);
+                staged.lazy.fully_prefilled_byte_rows = FullyPrefilledByteRows::Frozen;
+                true
+            }
+            None => false,
+        };
+    let reverse_cells = if staged.reverse.is_allocated() {
+        staged.reverse.state_len.checked_mul(stride).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "compiler-private reverse receipt cells",
+            },
+        )?
+    } else {
+        0
+    };
+    let reverse_byte_rows = if staged.reverse.is_allocated() {
+        let reverse_stride = staged.reverse.direct_row_stride;
+        let reverse_state_len = staged.reverse.state_len;
+        match try_materialize_fully_prefilled_byte_rows(
+            automaton,
+            &mut staged.reverse.rows,
+            reverse_stride,
+            reverse_state_len,
+            reverse_cells,
+            &mut meter,
+        )? {
+            Some(_) => {
+                staged.reverse.offsets.truncate(staged.reverse.state_len);
+                staged.reverse.fully_prefilled_byte_rows = FullyPrefilledByteRows::Frozen;
+                true
+            }
+            None => false,
+        }
+    } else {
+        false
+    };
+
     if staged_hints.len() != resume_set.cached_states.len()
         || staged_hints.len() != resume_set.cached_workspace_identities.len()
     {
@@ -17616,17 +18142,18 @@ fn prefill_bound_resume_caches_transaction(
         direct_row_stride: staged.lazy.direct_row_stride,
         forward_state_len: staged.lazy.state_len,
         forward_cells,
-        reverse_allocated: staged.reverse.is_allocated(),
-        reverse_state_len: staged.reverse.state_len,
-        reverse_cells: if staged.reverse.is_allocated() {
-            staged.reverse.state_len.checked_mul(stride).ok_or(
-                SearchError::ArithmeticOverflow {
-                    computation: "compiler-private reverse receipt cells",
-                },
-            )?
+        byte_row_flags: if forward_byte_rows {
+            FULLY_PREFILLED_FORWARD_BYTE_ROWS
+        } else {
+            0
+        } | if reverse_byte_rows {
+            FULLY_PREFILLED_REVERSE_BYTE_ROWS
         } else {
             0
         },
+        reverse_allocated: staged.reverse.is_allocated(),
+        reverse_state_len: staged.reverse.state_len,
+        reverse_cells,
     };
     core::mem::swap(&mut live.lazy, &mut staged.lazy);
     core::mem::swap(&mut live.reverse, &mut staged.reverse);
@@ -19665,6 +20192,7 @@ fn finish_lazy_cached_transition(
             LazyInterned::CapacityFull => {
                 validate_lazy_capacity_full(
                     automaton.stats().consuming_states(),
+                    workspace.lazy.fully_prefilled_byte_rows,
                     "exact small lazy DFA exhausted its proven capacity",
                 )?;
                 workspace.lazy.saturated = true;
@@ -20158,6 +20686,7 @@ fn finish_reverse_cached_transition(
             LazyInterned::CapacityFull => {
                 validate_lazy_capacity_full(
                     automaton.stats().consuming_edges(),
+                    workspace.reverse.fully_prefilled_byte_rows,
                     "exact small reverse DFA exhausted its proven capacity",
                 )?;
                 workspace.reverse.saturated = true;
@@ -21325,6 +21854,7 @@ fn retain_context_reverse_scratch(
         LazyInterned::CapacityFull => {
             validate_lazy_capacity_full(
                 automaton.stats().consuming_edges(),
+                workspace.reverse.fully_prefilled_byte_rows,
                 "exact small contextual reverse DFA exhausted its proven capacity",
             )?;
             workspace.reverse.saturated = true;
@@ -28172,6 +28702,36 @@ mod tests {
                 edge_kinds: vec![EdgeKind::ByteRange; 4],
                 byte_starts: vec![b'a', b'z', b'q', b'b'],
                 byte_ends: vec![b'b', b'z', b'q', b'b'],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn wide_direct_split_loop_then_terminal() -> Automaton {
+        // The reachable side chain raises the source-independent direct-cache
+        // budget without changing state zero's general loop semantics. Its
+        // `b` edge also keeps `a` and `b` in distinct global byte classes, so
+        // the learned scanner and raw-byte overlay must agree independently.
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![
+                    StateRole::Consume,
+                    StateRole::Accept,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Accept,
+                ],
+                edge_offsets: vec![0, 3, 3, 4, 5, 6, 7, 8, 9, 9],
+                edge_targets: vec![0, 1, 2, 3, 4, 5, 6, 7, 8],
+                edge_kinds: vec![EdgeKind::ByteRange; 9],
+                byte_starts: vec![b'a', b'z', b'q', b'b', b'c', b'd', b'e', b'f', b'g'],
+                byte_ends: vec![b'b', b'z', b'q', b'b', b'c', b'd', b'e', b'f', b'g'],
             },
             CompileLimits::default(),
         )
@@ -47700,6 +48260,292 @@ mod tests {
     #[test]
     #[allow(
         clippy::too_many_lines,
+        reason = "one end-to-end transaction audit checks both row directions and frozen fallback"
+    )]
+    fn compiler_private_prefill_reuses_frozen_row_tail_for_raw_byte_views() {
+        let plan = byte_chain(&[
+            (b'a', b'a'),
+            (b'b', b'b'),
+            (b'c', b'c'),
+            (b'd', b'd'),
+            (b'e', b'e'),
+            (b'f', b'f'),
+            (b'g', b'g'),
+        ]);
+        let frontier = [1_u32];
+        let mut resume = K0ResumeSet::new(&plan, 1, 1, [(&frontier[..], false)]).unwrap();
+        let mut workspace =
+            K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let retained = workspace.retained_bytes();
+        let receipt = workspace
+            .compiler_private_try_prefill_resume_caches_with_receipt(&plan, &mut resume)
+            .expect("the deterministic graph must fit the complete transaction");
+
+        assert!(receipt.has_forward_byte_rows());
+        assert!(receipt.has_reverse_byte_rows());
+        assert_eq!(workspace.retained_bytes(), retained);
+        assert_eq!(workspace.lazy.offsets.len(), workspace.lazy.state_len);
+        assert_eq!(workspace.reverse.offsets.len(), workspace.reverse.state_len);
+
+        let stride = usize::try_from(receipt.direct_row_stride).unwrap();
+        let assert_expanded = |rows: &[u32], state_len: usize, compact_cells: usize| {
+            for state in 0..state_len {
+                for byte in u8::MIN..=u8::MAX {
+                    let compact = rows
+                        [state * stride + usize::from(byte_class(&plan, byte))];
+                    let expanded = rows
+                        [compact_cells + state * super::BYTE_ALPHABET + usize::from(byte)];
+                    assert_eq!(
+                        expanded & !super::LAZY_CELL_STATE_MASK,
+                        compact & !super::LAZY_CELL_STATE_MASK
+                    );
+                    let compact_token = compact & super::LAZY_CELL_STATE_MASK;
+                    let expanded_token = expanded & super::LAZY_CELL_STATE_MASK;
+                    if compact_token == 0 {
+                        assert_eq!(expanded_token, 0);
+                    } else {
+                        let compact_row = compact_token - 1;
+                        let next_state = usize::try_from(compact_row).unwrap() / stride;
+                        assert_eq!(
+                            usize::try_from(expanded_token - 1).unwrap(),
+                            compact_cells + next_state * super::BYTE_ALPHABET
+                        );
+                    }
+                }
+            }
+        };
+        assert_expanded(
+            &workspace.lazy.rows,
+            receipt.forward_state_len,
+            receipt.forward_cells,
+        );
+        assert_expanded(
+            &workspace.reverse.rows,
+            receipt.reverse_state_len,
+            receipt.reverse_cells,
+        );
+
+        let haystack = b"abcdefg";
+        let window = SearchWindow::new(0, haystack.len());
+        let expected_forward_work = super::INVOCATION_RESET_WORK
+            + super::RESUME_CACHE_IDENTITY_CHECK_WORK
+            + u64::try_from(haystack.len() - 1).unwrap();
+        assert_eq!(
+            super::try_fully_prefilled_ordered_resume_endpoint(
+                &plan,
+                haystack,
+                window,
+                &workspace,
+                &resume,
+                0,
+                1,
+                None,
+                false,
+                true,
+                receipt,
+            )
+            .unwrap(),
+            Some((Some(haystack.len()), expected_forward_work))
+        );
+        assert_eq!(
+            super::try_fully_prefilled_ordered_resume_span(
+                &plan,
+                haystack,
+                window,
+                &workspace,
+                &resume,
+                0,
+                1,
+                None,
+                receipt,
+            )
+            .unwrap(),
+            super::FullyPrefilledResumeSpan::Complete(Some(MatchSpan::new(0, haystack.len())))
+        );
+
+        // Once an overlay occupies unused compact-state slots, publication is
+        // frozen at the exhaustively enumerated graph. A foreign frontier can
+        // still execute inline, but it cannot reinterpret overlay cells as a
+        // newly published compact row.
+        let compact_before = workspace.lazy.rows[..receipt.forward_cells].to_vec();
+        workspace.lazy.scratch[0] = u32::MAX;
+        workspace.lazy.scratch_len = 1;
+        let mut meter = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            workspace.lazy.intern_speculative(false, &mut meter, 0, 0).unwrap(),
+            super::LazyInterned::CapacityFull
+        );
+        assert_eq!(
+            &workspace.lazy.rows[..receipt.forward_cells],
+            compact_before.as_slice()
+        );
+
+        let reverse_before = workspace.reverse.rows[..receipt.reverse_cells].to_vec();
+        workspace.reverse.scratch[0] = u32::MAX;
+        workspace.reverse.scratch_len = 1;
+        let mut reverse_meter = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            workspace
+                .reverse
+                .intern_speculative(&mut reverse_meter, 0, 0)
+                .unwrap(),
+            super::LazyInterned::CapacityFull
+        );
+        assert_eq!(
+            &workspace.reverse.rows[..receipt.reverse_cells],
+            reverse_before.as_slice()
+        );
+    }
+
+    #[test]
+    fn frozen_raw_byte_rows_decline_foreign_small_frontiers_inline() {
+        let byte_starts: Vec<u8> = (u8::MIN..=u8::MAX).collect();
+        let edge_targets = byte_starts
+            .iter()
+            .map(|&byte| u32::from(byte & 1))
+            .collect();
+        let plan = Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![StateRole::Consume, StateRole::Accept],
+                edge_offsets: vec![0, 256, 256],
+                edge_targets,
+                edge_kinds: vec![EdgeKind::ByteRange; super::BYTE_ALPHABET],
+                byte_ends: byte_starts.clone(),
+                byte_starts,
+            },
+            CompileLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(plan.stats().consuming_states(), 1);
+        assert_eq!(plan.byte_classes().count(), super::BYTE_ALPHABET);
+        let frontier = [0_u32];
+        let mut primary = K0ResumeSet::new(&plan, 1, 1, [(&frontier[..], false)]).unwrap();
+        let mut frozen =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let receipt = frozen
+            .compiler_private_try_prefill_resume_caches_with_receipt(&plan, &mut primary)
+            .expect("the one-state graph must admit a raw-byte view");
+        assert!(receipt.has_forward_byte_rows());
+
+        let haystack = b"\x01";
+        let window = SearchWindow::full(haystack);
+        let mut expected_resume =
+            K0ResumeSet::new(&plan, 1, 1, [(&frontier[..], true)]).unwrap();
+        let mut expected_workspace =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let expected = super::search_from_resume_with_workspace(
+            &plan,
+            haystack,
+            window,
+            &mut expected_workspace,
+            &mut expected_resume,
+            0,
+            0,
+            Some(0),
+            SearchLimits::unlimited(),
+            OutputContract::SelectedEnd,
+        )
+        .unwrap()
+        .found;
+
+        let mut foreign_resume =
+            K0ResumeSet::new(&plan, 1, 1, [(&frontier[..], true)]).unwrap();
+        let actual = super::search_from_resume_with_workspace(
+            &plan,
+            haystack,
+            window,
+            &mut frozen,
+            &mut foreign_resume,
+            0,
+            0,
+            Some(0),
+            SearchLimits::unlimited(),
+            OutputContract::SelectedEnd,
+        )
+        .unwrap()
+        .found;
+        assert_eq!(actual, expected);
+        assert!(frozen.lazy.saturated);
+        assert!(
+            frozen
+                .fully_prefilled_resume_row(&plan, &primary, 0, receipt, false)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn fully_prefilled_raw_byte_rows_preserve_learned_loop_ownership() {
+        let plan = wide_direct_split_loop_then_terminal();
+        let frontier = [0_u32];
+        let mut resume = K0ResumeSet::new(&plan, 1, 1, [(&frontier[..], false)]).unwrap();
+        let mut workspace =
+            K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let receipt = workspace
+            .compiler_private_try_prefill_resume_caches_with_receipt(&plan, &mut resume)
+            .expect("the widened loop graph must fit the complete transaction");
+        assert!(receipt.has_forward_byte_rows());
+
+        let compact_row = workspace.lazy.row_offset(resume.cached_states[0]).unwrap();
+        let (slot, compact_plan) = workspace
+            .lazy
+            .loop_skip_plans
+            .find(compact_row, workspace.lazy.direct_row_stride)
+            .expect("the repeated frontier must retain its exact loop scanner");
+        let byte_row = super::fully_prefilled_byte_row_offset(
+            receipt.forward_cells,
+            workspace.lazy.row_state(compact_row),
+        )
+        .unwrap();
+        assert_eq!(workspace.lazy.fully_prefilled_byte_loop_rows[slot], byte_row);
+        assert!(compact_plan.scanner.contains(b'a'));
+        assert!(compact_plan.scanner.contains(b'b'));
+        assert!(!compact_plan.scanner.contains(b'z'));
+
+        let run = super::LAZY_LOOP_SKIP_MIN_BYTES * 3;
+        let mut haystack = vec![b'b'; run];
+        haystack.push(b'z');
+        let window = SearchWindow::new(0, haystack.len());
+        let expected_work = super::INVOCATION_RESET_WORK
+            + super::RESUME_CACHE_IDENTITY_CHECK_WORK
+            + u64::try_from(haystack.len()).unwrap();
+        assert_eq!(
+            super::try_fully_prefilled_ordered_resume_endpoint(
+                &plan,
+                &haystack,
+                window,
+                &workspace,
+                &resume,
+                0,
+                0,
+                None,
+                false,
+                false,
+                receipt,
+            )
+            .unwrap(),
+            Some((Some(haystack.len()), expected_work))
+        );
+        assert_eq!(
+            super::try_fully_prefilled_ordered_resume_span(
+                &plan,
+                &haystack,
+                window,
+                &workspace,
+                &resume,
+                0,
+                0,
+                None,
+                receipt,
+            )
+            .unwrap(),
+            super::FullyPrefilledResumeSpan::Complete(Some(MatchSpan::new(0, haystack.len())))
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
         reason = "one lifecycle test covers all outputs, reverse recovery, and stale-receipt repair"
     )]
     fn fully_prefilled_resume_receipt_covers_all_outputs_and_fails_closed_after_repair() {
@@ -47711,6 +48557,7 @@ mod tests {
         let receipt = workspace
             .compiler_private_try_prefill_resume_caches_with_receipt(&plan, &mut resume)
             .expect("the complete direct graph must publish a receipt");
+        assert!(!receipt.has_forward_byte_rows());
 
         let prefix = 5;
         let run = super::LAZY_LOOP_SKIP_MIN_BYTES * 2;
