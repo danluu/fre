@@ -22,6 +22,7 @@ mod k0;
 mod k0_root_corridor;
 mod mandatory_cut;
 mod mandatory_suffix;
+mod ordered_edge_dispatch;
 pub mod p16_grep_stream;
 mod plan;
 mod priority;
@@ -55,6 +56,7 @@ pub use mandatory_suffix::{
     MandatorySuffixCandidate, MandatorySuffixDeclineReason, MandatorySuffixGraphIssue,
     MandatorySuffixResource, MandatorySuffixStopReason, analyze_mandatory_suffix,
 };
+pub use ordered_edge_dispatch::OrderedEdgeDispatchAllocationError;
 pub use plan::{
     Automaton, CompileLimits, EdgeKind, PlanStats, RawPlan, SearchLimits, SearchWindow, StateRole,
 };

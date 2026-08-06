@@ -10982,6 +10982,117 @@ impl WarmContextWorkReceipt {
     }
 }
 
+/// Priority-ordered matching edges for one admitted consuming row.
+struct OrderedConsumingEdges<'a> {
+    edges: &'a [u32],
+    cursor: usize,
+    next_unaccounted: usize,
+    row_end: usize,
+}
+
+impl OrderedConsumingEdges<'_> {
+    #[allow(
+        clippy::inline_always,
+        reason = "the admitted consuming-row iterator is part of seven inner transition loops"
+    )]
+    #[inline(always)]
+    fn next(
+        &mut self,
+        meter: &mut WorkMeter,
+        position: usize,
+    ) -> Result<Option<usize>, SearchError> {
+        let Some(&encoded) = self.edges.get(self.cursor) else {
+            let tail = self.row_end.checked_sub(self.next_unaccounted).ok_or(
+                SearchError::InternalInvariant {
+                    detail: "ordered consuming dispatch accounting passed its row end",
+                },
+            )?;
+            charge_ordered_consuming_run(meter, tail, position)?;
+            self.next_unaccounted = self.row_end;
+            return Ok(None);
+        };
+        let edge = crate::plan::plan_index(encoded);
+        let through = edge
+            .checked_add(1)
+            .and_then(|end| end.checked_sub(self.next_unaccounted))
+            .ok_or(SearchError::InternalInvariant {
+                detail: "ordered consuming dispatch edges are not increasing within their row",
+            })?;
+        charge_ordered_consuming_run(meter, through, position)?;
+        self.next_unaccounted = edge
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "ordered consuming dispatch next edge",
+            })?;
+        self.cursor = self
+            .cursor
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "ordered consuming dispatch cursor",
+            })?;
+        Ok(Some(edge))
+    }
+}
+
+#[inline]
+fn charge_ordered_consuming_run(
+    meter: &mut WorkMeter,
+    requested: usize,
+    position: usize,
+) -> Result<(), SearchError> {
+    let requested = u64::try_from(requested).map_err(|_| SearchError::ArithmeticOverflow {
+        computation: "ordered consuming-row work conversion",
+    })?;
+    let remaining = meter.remaining();
+    if requested <= remaining {
+        return meter.charge(requested, position);
+    }
+    // Every edge before the matching edge represented by this run is known
+    // not to match. Consuming the available prefix at once, then attempting
+    // one more unit, reproduces the scalar loop's exact counter and error
+    // without an astronomically long near-overflow loop.
+    meter.charge(remaining, position)?;
+    meter.charge(1, position)?;
+    Err(SearchError::InternalInvariant {
+        detail: "ordered consuming run exceeded its meter without an error",
+    })
+}
+
+/// Return the priority-ordered matching edges for one admitted consuming row
+/// while preserving the scalar path's exact abstract inspection work.
+///
+/// Finite limits deliberately retain the original edge-at-a-time loop: its
+/// interleaving with closure expansion defines the precise failure receipt
+/// and mutation boundary. With an unlimited limit, each run of skipped edge
+/// charges ordinarily cannot be refused, so one checked addition per matching
+/// edge is equivalent and lets the immutable sidecar skip every nonmatching
+/// edge. The near-`u64::MAX` path still consumes the exact scalar prefix before
+/// returning the same overflow.
+#[allow(
+    clippy::inline_always,
+    reason = "all seven consuming scans need the absent/finite branch to disappear"
+)]
+#[inline(always)]
+fn try_ordered_consuming_edges<'a>(
+    automaton: &'a Automaton,
+    state: u32,
+    byte: u8,
+    meter: &WorkMeter,
+) -> Option<OrderedConsumingEdges<'a>> {
+    let dispatch = automaton.ordered_edge_dispatch.as_ref()?;
+    if meter.limit != u64::MAX {
+        return None;
+    }
+    let edges = dispatch.edges(state, byte)?;
+    let row = automaton.state_edges(state);
+    Some(OrderedConsumingEdges {
+        edges,
+        cursor: 0,
+        next_unaccounted: row.start,
+        row_end: row.end,
+    })
+}
+
 pub(crate) fn search(
     automaton: &Automaton,
     haystack: &[u8],
@@ -13958,20 +14069,36 @@ fn build_resume_lazy_cached_transition(
                 .ok_or(SearchError::InternalInvariant {
                     detail: "lazy DFA item is outside the retained arena",
                 })?;
-        for edge in automaton.state_edges(consuming) {
-            meter.charge(1, position)?;
-            if automaton.byte_starts[edge] <= byte
-                && byte <= automaton.byte_ends[edge]
-                && expand_lazy_root(
+        if let Some(mut edges) = try_ordered_consuming_edges(automaton, consuming, byte, meter)
+        {
+            while let Some(edge) = edges.next(meter, position)? {
+                if expand_lazy_root(
                     automaton,
                     automaton.edge_targets[edge],
                     workspace,
                     meter,
                     position,
-                )?
-            {
-                accepted = true;
-                break 'frontier;
+                )? {
+                    accepted = true;
+                    break 'frontier;
+                }
+            }
+        } else {
+            for edge in automaton.state_edges(consuming) {
+                meter.charge(1, position)?;
+                if automaton.byte_starts[edge] <= byte
+                    && byte <= automaton.byte_ends[edge]
+                    && expand_lazy_root(
+                        automaton,
+                        automaton.edge_targets[edge],
+                        workspace,
+                        meter,
+                        position,
+                    )?
+                {
+                    accepted = true;
+                    break 'frontier;
+                }
             }
         }
     }
@@ -14026,20 +14153,36 @@ fn build_resume_lazy_inline_transition(
                 .ok_or(SearchError::InternalInvariant {
                     detail: "lazy DFA inline frontier item is outside its arena",
                 })?;
-        for edge in automaton.state_edges(consuming) {
-            meter.charge(1, position)?;
-            if automaton.byte_starts[edge] <= byte
-                && byte <= automaton.byte_ends[edge]
-                && expand_lazy_root(
+        if let Some(mut edges) = try_ordered_consuming_edges(automaton, consuming, byte, meter)
+        {
+            while let Some(edge) = edges.next(meter, position)? {
+                if expand_lazy_root(
                     automaton,
                     automaton.edge_targets[edge],
                     workspace,
                     meter,
                     position,
-                )?
-            {
-                accepted = true;
-                break 'frontier;
+                )? {
+                    accepted = true;
+                    break 'frontier;
+                }
+            }
+        } else {
+            for edge in automaton.state_edges(consuming) {
+                meter.charge(1, position)?;
+                if automaton.byte_starts[edge] <= byte
+                    && byte <= automaton.byte_ends[edge]
+                    && expand_lazy_root(
+                        automaton,
+                        automaton.edge_targets[edge],
+                        workspace,
+                        meter,
+                        position,
+                    )?
+                {
+                    accepted = true;
+                    break 'frontier;
+                }
             }
         }
     }
@@ -15512,21 +15655,38 @@ fn build_context_lazy_cached_transition(
     let mut accepted = false;
     'frontier: for ordinal in 0..length {
         let consuming = workspace.lazy.item(state, ordinal)?;
-        for edge in automaton.state_edges(consuming) {
-            meter.charge(1, position)?;
-            if automaton.byte_starts[edge] <= byte
-                && byte <= automaton.byte_ends[edge]
-                && expand_context_lazy_root(
+        if let Some(mut edges) = try_ordered_consuming_edges(automaton, consuming, byte, meter)
+        {
+            while let Some(edge) = edges.next(meter, position)? {
+                if expand_context_lazy_root(
                     automaton,
                     automaton.edge_targets[edge],
                     assertions,
                     workspace,
                     meter,
                     position,
-                )?
-            {
-                accepted = true;
-                break 'frontier;
+                )? {
+                    accepted = true;
+                    break 'frontier;
+                }
+            }
+        } else {
+            for edge in automaton.state_edges(consuming) {
+                meter.charge(1, position)?;
+                if automaton.byte_starts[edge] <= byte
+                    && byte <= automaton.byte_ends[edge]
+                    && expand_context_lazy_root(
+                        automaton,
+                        automaton.edge_targets[edge],
+                        assertions,
+                        workspace,
+                        meter,
+                        position,
+                    )?
+                {
+                    accepted = true;
+                    break 'frontier;
+                }
             }
         }
     }
@@ -15629,21 +15789,38 @@ fn build_context_lazy_inline_transition(
                 .ok_or(SearchError::InternalInvariant {
                     detail: "contextual inline frontier item is outside its arena",
                 })?;
-        for edge in automaton.state_edges(consuming) {
-            meter.charge(1, position)?;
-            if automaton.byte_starts[edge] <= byte
-                && byte <= automaton.byte_ends[edge]
-                && expand_context_lazy_root(
+        if let Some(mut edges) = try_ordered_consuming_edges(automaton, consuming, byte, meter)
+        {
+            while let Some(edge) = edges.next(meter, position)? {
+                if expand_context_lazy_root(
                     automaton,
                     automaton.edge_targets[edge],
                     assertions,
                     workspace,
                     meter,
                     position,
-                )?
-            {
-                accepted = true;
-                break 'frontier;
+                )? {
+                    accepted = true;
+                    break 'frontier;
+                }
+            }
+        } else {
+            for edge in automaton.state_edges(consuming) {
+                meter.charge(1, position)?;
+                if automaton.byte_starts[edge] <= byte
+                    && byte <= automaton.byte_ends[edge]
+                    && expand_context_lazy_root(
+                        automaton,
+                        automaton.edge_targets[edge],
+                        assertions,
+                        workspace,
+                        meter,
+                        position,
+                    )?
+                {
+                    accepted = true;
+                    break 'frontier;
+                }
             }
         }
     }
@@ -17630,20 +17807,36 @@ fn build_lazy_cached_transition(
     let mut accepted = false;
     'frontier: for ordinal in 0..length {
         let consuming = workspace.lazy.item(state, ordinal)?;
-        for edge in automaton.state_edges(consuming) {
-            meter.charge(1, position)?;
-            if automaton.byte_starts[edge] <= byte
-                && byte <= automaton.byte_ends[edge]
-                && expand_lazy_root(
+        if let Some(mut edges) = try_ordered_consuming_edges(automaton, consuming, byte, meter)
+        {
+            while let Some(edge) = edges.next(meter, position)? {
+                if expand_lazy_root(
                     automaton,
                     automaton.edge_targets[edge],
                     workspace,
                     meter,
                     position,
-                )?
-            {
-                accepted = true;
-                break 'frontier;
+                )? {
+                    accepted = true;
+                    break 'frontier;
+                }
+            }
+        } else {
+            for edge in automaton.state_edges(consuming) {
+                meter.charge(1, position)?;
+                if automaton.byte_starts[edge] <= byte
+                    && byte <= automaton.byte_ends[edge]
+                    && expand_lazy_root(
+                        automaton,
+                        automaton.edge_targets[edge],
+                        workspace,
+                        meter,
+                        position,
+                    )?
+                {
+                    accepted = true;
+                    break 'frontier;
+                }
             }
         }
     }
@@ -17745,20 +17938,36 @@ fn build_lazy_inline_transition(
                 .ok_or(SearchError::InternalInvariant {
                     detail: "lazy DFA inline frontier item is outside its arena",
                 })?;
-        for edge in automaton.state_edges(consuming) {
-            meter.charge(1, position)?;
-            if automaton.byte_starts[edge] <= byte
-                && byte <= automaton.byte_ends[edge]
-                && expand_lazy_root(
+        if let Some(mut edges) = try_ordered_consuming_edges(automaton, consuming, byte, meter)
+        {
+            while let Some(edge) = edges.next(meter, position)? {
+                if expand_lazy_root(
                     automaton,
                     automaton.edge_targets[edge],
                     workspace,
                     meter,
                     position,
-                )?
-            {
-                accepted = true;
-                break 'frontier;
+                )? {
+                    accepted = true;
+                    break 'frontier;
+                }
+            }
+        } else {
+            for edge in automaton.state_edges(consuming) {
+                meter.charge(1, position)?;
+                if automaton.byte_starts[edge] <= byte
+                    && byte <= automaton.byte_ends[edge]
+                    && expand_lazy_root(
+                        automaton,
+                        automaton.edge_targets[edge],
+                        workspace,
+                        meter,
+                        position,
+                    )?
+                {
+                    accepted = true;
+                    break 'frontier;
+                }
             }
         }
     }
@@ -21982,14 +22191,25 @@ fn consume_current(
     let current_len = workspace.current_len;
     for index in 0..current_len {
         let thread = workspace.current[index];
-        for edge in automaton.state_edges(thread.state) {
-            meter.charge(1, position)?;
-            debug_assert_eq!(automaton.edge_kinds[edge], EdgeKind::ByteRange);
-            if automaton.byte_starts[edge] <= byte && byte <= automaton.byte_ends[edge] {
+        if let Some(mut edges) =
+            try_ordered_consuming_edges(automaton, thread.state, byte, meter)
+        {
+            while let Some(edge) = edges.next(meter, position)? {
                 workspace.push_root(Thread {
                     state: automaton.edge_targets[edge],
                     start: thread.start,
                 })?;
+            }
+        } else {
+            for edge in automaton.state_edges(thread.state) {
+                meter.charge(1, position)?;
+                debug_assert_eq!(automaton.edge_kinds[edge], EdgeKind::ByteRange);
+                if automaton.byte_starts[edge] <= byte && byte <= automaton.byte_ends[edge] {
+                    workspace.push_root(Thread {
+                        state: automaton.edge_targets[edge],
+                        start: thread.start,
+                    })?;
+                }
             }
         }
     }
@@ -23514,6 +23734,7 @@ mod tests {
         ROOT_RUN_SCANNER_SHAPE_MAX_WORK, WARM_EXISTS_INLINE_BYTES,
     };
     use crate::{
+        ordered_edge_dispatch::OrderedEdgeDispatch,
         plan::{
             ByteSet, StartFilterProof, StartFilterProofCell, StartPositionClass,
             StartPositionFilter, StartPositionScanner, StartScanner,
@@ -30287,6 +30508,256 @@ mod tests {
         words
     }
 
+    fn wide_ordered_consume(asserted: bool) -> Automaton {
+        let bytes = [b'a', b'c', b'e', b'g', b'i', b'k', b'm', b'o'];
+        let (roles, edge_offsets, mut edge_targets, mut edge_kinds, mut starts, mut ends) =
+            if asserted {
+                (
+                    vec![StateRole::Split, StateRole::Consume, StateRole::Accept],
+                    vec![0, 1, 9, 9],
+                    vec![1],
+                    vec![EdgeKind::AssertLineStartLf],
+                    vec![0],
+                    vec![0],
+                )
+            } else {
+                (
+                    vec![StateRole::Consume, StateRole::Accept],
+                    vec![0, 8, 8],
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+            };
+        let accept = u32::try_from(roles.len().checked_sub(1).unwrap()).unwrap();
+        for byte in bytes {
+            edge_targets.push(accept);
+            edge_kinds.push(EdgeKind::ByteRange);
+            starts.push(byte);
+            ends.push(byte);
+        }
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles,
+                edge_offsets,
+                edge_targets,
+                edge_kinds,
+                byte_starts: starts,
+                byte_ends: ends,
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+        .with_line_terminator(b';')
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "ordinary, cached, contextual, all-output, and finite ledgers share one differential"
+    )]
+    fn assert_ordered_dispatch_differential(asserted: bool, haystacks: &[Vec<u8>]) {
+        let scalar = wide_ordered_consume(asserted);
+        let mut dispatched = wide_ordered_consume(asserted);
+        assert!(dispatched.try_enable_ordered_edge_dispatch().unwrap());
+        let consuming = u32::from(asserted);
+        let last_edge = usize::from(asserted).checked_add(7).unwrap();
+        let mut overflow_meter = WorkMeter::new(u64::MAX, u64::MAX - 7);
+        let mut overflow_edges = super::try_ordered_consuming_edges(
+            &dispatched,
+            consuming,
+            b'o',
+            &overflow_meter,
+        )
+        .unwrap();
+        assert!(matches!(
+            overflow_edges.next(&mut overflow_meter, 19),
+            Err(SearchError::ArithmeticOverflow {
+                computation: "search work counter"
+            })
+        ));
+        assert_eq!(overflow_meter.consumed, u64::MAX);
+        let mut exact_meter = WorkMeter::new(u64::MAX, u64::MAX - 8);
+        let mut exact_edges = super::try_ordered_consuming_edges(
+            &dispatched,
+            consuming,
+            b'o',
+            &exact_meter,
+        )
+        .unwrap();
+        assert_eq!(
+            exact_edges.next(&mut exact_meter, 19).unwrap(),
+            Some(last_edge)
+        );
+        assert_eq!(exact_meter.consumed, u64::MAX);
+        pin_without_start_filter(&scalar);
+        pin_without_start_filter(&dispatched);
+
+        let mut scalar_pike = K0Workspace::new(&scalar, WorkspaceLimits::unlimited()).unwrap();
+        let mut dispatch_pike =
+            K0Workspace::new(&dispatched, WorkspaceLimits::unlimited()).unwrap();
+        let mut scalar_endpoint =
+            K0Workspace::new_accelerated(&scalar, WorkspaceLimits::unlimited()).unwrap();
+        let mut dispatch_endpoint =
+            K0Workspace::new_accelerated(&dispatched, WorkspaceLimits::unlimited()).unwrap();
+        let mut scalar_span =
+            K0Workspace::new_bidirectional(&scalar, WorkspaceLimits::unlimited()).unwrap();
+        let mut dispatch_span =
+            K0Workspace::new_bidirectional(&dispatched, WorkspaceLimits::unlimited()).unwrap();
+
+        macro_rules! compare {
+            ($operation:ty, $left:expr, $right:expr, $haystack:expr, $window:expr) => {{
+                let want = scalar
+                    .prepare::<$operation>()
+                    .search_window_with_workspace(
+                        $haystack,
+                        $window,
+                        $left,
+                        SearchLimits::unlimited(),
+                    )
+                    .unwrap();
+                let got = dispatched
+                    .prepare::<$operation>()
+                    .search_window_with_workspace(
+                        $haystack,
+                        $window,
+                        $right,
+                        SearchLimits::unlimited(),
+                    )
+                    .unwrap();
+                assert_eq!(got.output(), want.output());
+                assert_eq!(got.accounting(), want.accounting());
+            }};
+        }
+
+        for haystack in haystacks {
+            for start in 0..=haystack.len() {
+                for end in start..=haystack.len() {
+                    let window = SearchWindow::new(start, end);
+                    compare!(
+                        Exists,
+                        &mut scalar_pike,
+                        &mut dispatch_pike,
+                        haystack,
+                        window
+                    );
+                    compare!(
+                        SelectedEnd,
+                        &mut scalar_pike,
+                        &mut dispatch_pike,
+                        haystack,
+                        window
+                    );
+                    compare!(
+                        Span,
+                        &mut scalar_pike,
+                        &mut dispatch_pike,
+                        haystack,
+                        window
+                    );
+                    compare!(
+                        EarliestEnd,
+                        &mut scalar_endpoint,
+                        &mut dispatch_endpoint,
+                        haystack,
+                        window
+                    );
+                    compare!(
+                        Exists,
+                        &mut scalar_endpoint,
+                        &mut dispatch_endpoint,
+                        haystack,
+                        window
+                    );
+                    compare!(
+                        SelectedEnd,
+                        &mut scalar_endpoint,
+                        &mut dispatch_endpoint,
+                        haystack,
+                        window
+                    );
+                    compare!(
+                        Span,
+                        &mut scalar_span,
+                        &mut dispatch_span,
+                        haystack,
+                        window
+                    );
+                }
+            }
+        }
+
+        let haystack = b"xx;acegimo!";
+        let window = SearchWindow::full(haystack);
+        macro_rules! finite_boundary {
+            ($operation:ty) => {{
+                let mut workspace =
+                    K0Workspace::new(&dispatched, WorkspaceLimits::unlimited()).unwrap();
+                let measured = dispatched
+                    .prepare::<$operation>()
+                    .search_window_with_workspace(
+                        haystack,
+                        window,
+                        &mut workspace,
+                        SearchLimits::unlimited(),
+                    )
+                    .unwrap();
+                let exact_work = measured.accounting().work();
+                let expected = measured.into_output();
+                assert_eq!(
+                    dispatched
+                        .prepare::<$operation>()
+                        .search_window_with_workspace(
+                            haystack,
+                            window,
+                            &mut workspace,
+                            SearchLimits {
+                                max_work: exact_work,
+                                max_scratch_bytes: usize::MAX,
+                            },
+                        )
+                        .unwrap()
+                        .into_output(),
+                    expected
+                );
+                let one_below = exact_work.checked_sub(1).unwrap();
+                assert!(matches!(
+                    dispatched.prepare::<$operation>().search_window_with_workspace(
+                        haystack,
+                        window,
+                        &mut workspace,
+                        SearchLimits {
+                            max_work: one_below,
+                            max_scratch_bytes: usize::MAX,
+                        },
+                    ),
+                    Err(SearchError::WorkLimitExceeded { limit, .. }) if limit == one_below
+                ));
+            }};
+        }
+        finite_boundary!(Exists);
+        finite_boundary!(EarliestEnd);
+        finite_boundary!(SelectedEnd);
+        finite_boundary!(Span);
+    }
+
+    #[test]
+    fn ordered_edge_dispatch_is_differential_for_all_forward_routes_and_outputs() {
+        let direct = bounded_words(&[b'a', b'b', b'c', b'o', b'x', 0xff], 3);
+        assert_ordered_dispatch_differential(false, &direct);
+        let contextual = vec![
+            Vec::new(),
+            b"a".to_vec(),
+            b"xa".to_vec(),
+            b"x;a".to_vec(),
+            b";o!".to_vec(),
+            b"xx;ace".to_vec(),
+            vec![0xff, b';', b'm', b'x'],
+        ];
+        assert_ordered_dispatch_differential(true, &contextual);
+    }
+
     /// Derive exact-start results from the ordinary unanchored Pike contract.
     ///
     /// A match at `window.start()` must beat every later start, so the
@@ -35232,6 +35703,11 @@ mod tests {
     #[test]
     fn start_filter_owner_layout_is_pointer_isolated() {
         assert_eq!(
+            size_of::<Option<OrderedEdgeDispatch>>(),
+            size_of::<usize>(),
+            "the ordered-edge dispatch owner must remain one optional pointer"
+        );
+        assert_eq!(
             size_of::<Option<StartPositionFilter>>(),
             size_of::<Option<StartPositionClass>>(),
             "the Guard/Probe tag must reuse the incumbent optional-class discriminant"
@@ -35245,7 +35721,9 @@ mod tests {
             assert!(size_of::<StartFilterProofCell>() <= 16);
             assert!(
                 size_of::<Automaton>()
-                    <= 192 + Automaton::BYTE_CLASS_MAP_RETAINED_BYTES
+                    <= 192
+                        + size_of::<usize>()
+                        + Automaton::BYTE_CLASS_MAP_RETAINED_BYTES
             );
         }
         #[cfg(all(
@@ -35255,7 +35733,7 @@ mod tests {
         ))]
         {
             assert_eq!(size_of::<StartFilterProofCell>(), 16);
-            assert_eq!(size_of::<Automaton>(), 448);
+            assert_eq!(size_of::<Automaton>(), 448 + size_of::<usize>());
             #[cfg(feature = "static-dispatch")]
             assert_eq!(size_of::<StartFilterProof>(), 192);
             #[cfg(not(feature = "static-dispatch"))]

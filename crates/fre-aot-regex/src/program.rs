@@ -38,11 +38,15 @@ const PROGRAM_FORMAT_VERSION_V1: u32 = 1;
 const PROGRAM_FORMAT_VERSION_V2: u32 = 2;
 const PROGRAM_FORMAT_VERSION_V3: u32 = 3;
 const PROGRAM_FORMAT_VERSION_V4: u32 = 4;
+const PROGRAM_FORMAT_VERSION_V5: u32 = 5;
+// V4 remains the canonical format for Fast programs and optimizing programs
+// without the graph-derived ordered-edge sidecar.
 const PROGRAM_FORMAT_VERSION: u32 = PROGRAM_FORMAT_VERSION_V4;
 const PROGRAM_FLAG_NFA_MANDATORY_SUFFIX: u8 = 1 << 0;
 const PROGRAM_FLAG_NFA_MANDATORY_CUT: u8 = 1 << 1;
 const PROGRAM_FLAG_NFA_EXACT_PRODUCT: u8 = 1 << 2;
 const PROGRAM_FLAG_NFA_PARTIAL_DFA: u8 = 1 << 3;
+const PROGRAM_FLAG_NFA_ORDERED_EDGE_DISPATCH: u8 = 1 << 4;
 const PROGRAM_V3_KNOWN_FLAGS: u8 = PROGRAM_FLAG_NFA_MANDATORY_SUFFIX
     | PROGRAM_FLAG_NFA_MANDATORY_CUT
     | PROGRAM_FLAG_NFA_EXACT_PRODUCT;
@@ -50,6 +54,8 @@ const PROGRAM_KNOWN_FLAGS: u8 = PROGRAM_FLAG_NFA_MANDATORY_SUFFIX
     | PROGRAM_FLAG_NFA_MANDATORY_CUT
     | PROGRAM_FLAG_NFA_EXACT_PRODUCT
     | PROGRAM_FLAG_NFA_PARTIAL_DFA;
+const PROGRAM_V5_KNOWN_FLAGS: u8 =
+    PROGRAM_KNOWN_FLAGS | PROGRAM_FLAG_NFA_ORDERED_EDGE_DISPATCH;
 const DEFAULT_LINE_TERMINATOR: u8 = b'\n';
 
 static NEXT_PROGRAM_INSTANCE_IDENTITY: AtomicU64 = AtomicU64::new(1);
@@ -2936,7 +2942,7 @@ impl CompiledProgram {
     )]
     pub(crate) fn build(
         raw: RawPlan,
-        automaton: Automaton,
+        mut automaton: Automaton,
         output: OutputContract,
         mode: CompileMode,
         limits: DeterminizeLimits,
@@ -3021,6 +3027,22 @@ impl CompiledProgram {
                 ),
             },
         };
+        let retains_ordered_edge_dispatch =
+            mode == CompileMode::Optimizing && matches!(engine, ProgramEngine::OrderedNfa);
+        if !retains_ordered_edge_dispatch && automaton.has_ordered_edge_dispatch() {
+            return Err(CompileError::InternalInvariant(
+                "ordered-edge dispatch was preattached to an ineligible engine",
+            ));
+        }
+        if retains_ordered_edge_dispatch {
+            automaton
+                .try_enable_ordered_edge_dispatch()
+                .map_err(|_| {
+                    CompileError::InternalInvariant(
+                        "ordered-edge dispatch allocation failed",
+                    )
+                })?;
+        }
         let anchored_prefix = derive_anchored_prefix(&raw);
         let anchored_suffix = derive_anchored_suffix(&raw);
         let required_literals = if mode == CompileMode::Optimizing {
@@ -3152,7 +3174,18 @@ impl CompiledProgram {
         if self.optimization_sidecar.has_partial_dfa() {
             flags |= PROGRAM_FLAG_NFA_PARTIAL_DFA;
         }
+        if self.automaton.has_ordered_edge_dispatch() {
+            flags |= PROGRAM_FLAG_NFA_ORDERED_EDGE_DISPATCH;
+        }
         flags
+    }
+
+    const fn program_format_version(&self) -> u32 {
+        if self.automaton.has_ordered_edge_dispatch() {
+            PROGRAM_FORMAT_VERSION_V5
+        } else {
+            PROGRAM_FORMAT_VERSION
+        }
     }
 
     /// Return the structural reason for the selected engine when provenance is
@@ -5357,7 +5390,7 @@ impl CompiledProgram {
             CompileError::InternalInvariant("program serialization allocation failed")
         })?;
         bytes.extend_from_slice(PROGRAM_MAGIC);
-        put_u32(&mut bytes, PROGRAM_FORMAT_VERSION);
+        put_u32(&mut bytes, self.program_format_version());
         bytes.push(self.engine_kind().tag());
         bytes.push(self.output.tag());
         bytes.extend_from_slice(&[self.line_terminator, self.program_flags()]);
@@ -5431,7 +5464,14 @@ impl CompiledProgram {
         EngineKind::from_tag(header[12])?;
         OutputContract::from_tag(header[13])?;
         header_line_terminator(header, version)?;
-        header_program_flags(header, version)?;
+        let flags = header_program_flags(header, version)?;
+        if version == PROGRAM_FORMAT_VERSION_V5
+            && flags & PROGRAM_FLAG_NFA_ORDERED_EDGE_DISPATCH == 0
+        {
+            return Err(ProgramFormatError::Malformed(
+                "V5 program has no ordered-edge dispatch marker",
+            ));
+        }
         let total = usize_from_u64(read_u64_at(header, 16)?, "program total length")?;
         if !(MIN_SERIALIZED_PROGRAM_BYTES..=MAX_SERIALIZED_PROGRAM_BYTES).contains(&total) {
             return Err(ProgramFormatError::Malformed(
@@ -5475,6 +5515,8 @@ impl CompiledProgram {
         let mandatory_suffix_enabled = program_flags & PROGRAM_FLAG_NFA_MANDATORY_SUFFIX != 0;
         let mandatory_cut_enabled = program_flags & PROGRAM_FLAG_NFA_MANDATORY_CUT != 0;
         let exact_product_enabled = program_flags & PROGRAM_FLAG_NFA_EXACT_PRODUCT != 0;
+        let ordered_edge_dispatch_enabled =
+            program_flags & PROGRAM_FLAG_NFA_ORDERED_EDGE_DISPATCH != 0;
         if (mandatory_suffix_enabled || mandatory_cut_enabled || exact_product_enabled)
             && engine_kind != EngineKind::OrderedNfa
         {
@@ -5497,6 +5539,11 @@ impl CompiledProgram {
                 "partial-DFA flag requires an ordered-NFA engine",
             ));
         }
+        if ordered_edge_dispatch_enabled && engine_kind != EngineKind::OrderedNfa {
+            return Err(ProgramFormatError::Malformed(
+                "ordered-edge dispatch flag requires an ordered-NFA engine",
+            ));
+        }
         if exact_product_enabled && program_flags & PROGRAM_FLAG_NFA_PARTIAL_DFA != 0 {
             return Err(ProgramFormatError::Malformed(
                 "exact-product and partial-DFA flags are mutually exclusive",
@@ -5508,7 +5555,17 @@ impl CompiledProgram {
                 .ok_or(ProgramFormatError::Malformed("program body is truncated"))?,
         );
         let raw = deserialize_raw(&mut reader)?;
-        let automaton = deserialize_automaton(&raw, line_terminator)?;
+        let mut automaton = deserialize_automaton(&raw, line_terminator)?;
+        if ordered_edge_dispatch_enabled {
+            let derived = automaton
+                .try_enable_ordered_edge_dispatch()
+                .map_err(|_| ProgramFormatError::Allocation("ordered-edge dispatch"))?;
+            if !derived {
+                return Err(ProgramFormatError::Malformed(
+                    "ordered-edge dispatch marker is incompatible with the embedded graph",
+                ));
+            }
+        }
         let exact_match_width = derive_exact_match_width(&raw);
 
         let dfa_len = reader.usize_u64("DFA byte length")?;
@@ -5591,6 +5648,7 @@ impl CompiledProgram {
         let required_literals = if engine_kind == EngineKind::OrderedDfa
             || mandatory_cut_enabled
             || program_flags & PROGRAM_FLAG_NFA_PARTIAL_DFA != 0
+            || ordered_edge_dispatch_enabled
         {
             required_literals::derive(&raw)
         } else {
@@ -7050,7 +7108,9 @@ fn header_line_terminator(header: &[u8], version: u32) -> Result<u8, ProgramForm
             }
             Ok(header[14])
         }
-        PROGRAM_FORMAT_VERSION_V3 | PROGRAM_FORMAT_VERSION_V4 => Ok(header[14]),
+        PROGRAM_FORMAT_VERSION_V3
+        | PROGRAM_FORMAT_VERSION_V4
+        | PROGRAM_FORMAT_VERSION_V5 => Ok(header[14]),
         _ => Err(ProgramFormatError::Malformed(
             "unsupported program format version",
         )),
@@ -7074,6 +7134,15 @@ fn header_program_flags(header: &[u8], version: u32) -> Result<u8, ProgramFormat
             if flags & !PROGRAM_KNOWN_FLAGS != 0 {
                 return Err(ProgramFormatError::Malformed(
                     "V4 program header contains unknown flags",
+                ));
+            }
+            Ok(flags)
+        }
+        PROGRAM_FORMAT_VERSION_V5 => {
+            let flags = header[15];
+            if flags & !PROGRAM_V5_KNOWN_FLAGS != 0 {
+                return Err(ProgramFormatError::Malformed(
+                    "V5 program header contains unknown flags",
                 ));
             }
             Ok(flags)
@@ -10288,7 +10357,11 @@ mod tests {
                 None
             );
             let bytes = wide.serialize().unwrap();
-            assert_eq!(bytes[15], PROGRAM_FLAG_NFA_MANDATORY_SUFFIX);
+            assert_eq!(
+                bytes[15],
+                PROGRAM_FLAG_NFA_MANDATORY_SUFFIX
+                    | PROGRAM_FLAG_NFA_ORDERED_EDGE_DISPATCH
+            );
             let restored = CompiledProgram::deserialize(&bytes).unwrap();
             assert_eq!(restored.serialize().unwrap(), bytes);
             for haystack in [
@@ -14322,6 +14395,285 @@ mod tests {
                 alternate_terminator.line_terminator
             )
         );
+    }
+
+    fn ordered_dispatch_wire_graph(edges: usize) -> RawPlan {
+        let mut roles = vec![StateRole::Consume];
+        roles.resize(edges.saturating_add(1), StateRole::Accept);
+        let encoded_edges = u32::try_from(edges).unwrap();
+        let mut edge_offsets = vec![0, encoded_edges];
+        edge_offsets.resize(edges.saturating_add(2), encoded_edges);
+        RawPlan {
+            start: 0,
+            roles,
+            edge_offsets,
+            edge_targets: (1..=edges)
+                .map(|target| u32::try_from(target).unwrap())
+                .collect(),
+            edge_kinds: vec![EdgeKind::ByteRange; edges],
+            byte_starts: (0..edges)
+                .map(|edge| u8::try_from(edge.saturating_mul(2)).unwrap())
+                .collect(),
+            byte_ends: (0..edges)
+                .map(|edge| u8::try_from(edge.saturating_mul(2)).unwrap())
+                .collect(),
+        }
+    }
+
+    fn with_ordered_dispatch_dead_branch(mut raw: RawPlan) -> RawPlan {
+        let old_start = raw.start;
+        let wide = u32::try_from(raw.roles.len()).unwrap();
+        let dead = wide.checked_add(1).unwrap();
+        let start = dead.checked_add(1).unwrap();
+        raw.roles.extend([
+            StateRole::Consume,
+            StateRole::Consume,
+            StateRole::Split,
+        ]);
+        for edge in 0_u8..8 {
+            raw.edge_targets.push(dead);
+            raw.edge_kinds.push(EdgeKind::ByteRange);
+            let byte = edge.saturating_mul(2);
+            raw.byte_starts.push(byte);
+            raw.byte_ends.push(byte);
+        }
+        raw.edge_offsets
+            .push(u32::try_from(raw.edge_targets.len()).unwrap());
+        // The post-consume state is deliberately dead, preserving the base
+        // language while keeping the wide row genuinely reachable.
+        raw.edge_offsets
+            .push(u32::try_from(raw.edge_targets.len()).unwrap());
+        raw.edge_targets.extend([old_start, wide]);
+        raw.edge_kinds
+            .extend([EdgeKind::Epsilon, EdgeKind::Epsilon]);
+        raw.byte_starts.extend([0, 0]);
+        raw.byte_ends.extend([0, 0]);
+        raw.edge_offsets
+            .push(u32::try_from(raw.edge_targets.len()).unwrap());
+        raw.start = start;
+        raw
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "V4 identity, V5 strictness, all outputs, clone, and partial coexistence share one wire matrix"
+    )]
+    fn ordered_edge_dispatch_v5_is_canonical_strict_and_all_output_general() {
+        let raw = ordered_dispatch_wire_graph(8);
+        let fallback_limits = DeterminizeLimits {
+            max_states: 0,
+            ..DeterminizeLimits::default()
+        };
+        let haystacks = generated_byte_strings(&[0, 1, 2, 3, 14, 15, 0xff], 3);
+
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let optimized = raw_program(&raw, output, CompileMode::Optimizing, fallback_limits);
+            assert_eq!(optimized.engine_kind(), EngineKind::OrderedNfa);
+            assert!(optimized.automaton.has_ordered_edge_dispatch());
+            let bytes = optimized.serialize().unwrap();
+            assert_eq!(
+                u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+                PROGRAM_FORMAT_VERSION_V5
+            );
+            assert_ne!(bytes[15] & PROGRAM_FLAG_NFA_ORDERED_EDGE_DISPATCH, 0);
+
+            let restored = CompiledProgram::deserialize(&bytes).unwrap();
+            assert!(restored.automaton.has_ordered_edge_dispatch());
+            assert_eq!(restored.serialize().unwrap(), bytes);
+            let cloned = restored.clone();
+            assert!(cloned.automaton.has_ordered_edge_dispatch());
+            assert_eq!(cloned.serialize().unwrap(), bytes);
+
+            let reference = raw_program(
+                &raw,
+                output,
+                CompileMode::Fast,
+                DeterminizeLimits::default(),
+            );
+            for haystack in &haystacks {
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let window = SearchWindow::new(start, end);
+                        assert_eq!(
+                            restored.search(haystack, window).unwrap(),
+                            reference.search(haystack, window).unwrap(),
+                            "output={output:?}, source={haystack:?}, window={window:?}"
+                        );
+                    }
+                }
+            }
+
+            let fast_bytes = reference.serialize().unwrap();
+            assert_eq!(
+                u32::from_le_bytes(fast_bytes[8..12].try_into().unwrap()),
+                PROGRAM_FORMAT_VERSION_V4
+            );
+            assert_eq!(fast_bytes[15] & PROGRAM_FLAG_NFA_ORDERED_EDGE_DISPATCH, 0);
+            assert_eq!(
+                CompiledProgram::deserialize(&fast_bytes)
+                    .unwrap()
+                    .serialize()
+                    .unwrap(),
+                fast_bytes
+            );
+        }
+
+        let optimized = raw_program(
+            &raw,
+            OutputContract::Span,
+            CompileMode::Optimizing,
+            fallback_limits,
+        );
+        let bytes = optimized.serialize().unwrap();
+
+        let mut missing_marker = bytes.clone();
+        missing_marker[15] &= !PROGRAM_FLAG_NFA_ORDERED_EDGE_DISPATCH;
+        assert!(CompiledProgram::deserialize(&missing_marker).is_err());
+
+        let mut legacy_with_marker = bytes.clone();
+        legacy_with_marker[8..12].copy_from_slice(&PROGRAM_FORMAT_VERSION_V4.to_le_bytes());
+        assert!(CompiledProgram::deserialize(&legacy_with_marker).is_err());
+
+        let mut wrong_engine = bytes.clone();
+        wrong_engine[12] = EngineKind::OrderedDfa.tag();
+        assert!(CompiledProgram::deserialize(&wrong_engine).is_err());
+
+        let mut unknown = bytes.clone();
+        unknown[15] |= 1 << 7;
+        assert!(CompiledProgram::deserialize(&unknown).is_err());
+
+        // The V5 marker is a canonical request to rederive the complete
+        // graph-owned sidecar. A graph whose strict cost proof admits no row
+        // cannot claim it, even though the rest of the V4 body is valid.
+        let narrow = ordered_dispatch_wire_graph(5);
+        let mut incompatible = raw_program(
+            &narrow,
+            OutputContract::Span,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        )
+        .serialize()
+        .unwrap();
+        incompatible[8..12].copy_from_slice(&PROGRAM_FORMAT_VERSION_V5.to_le_bytes());
+        incompatible[15] |= PROGRAM_FLAG_NFA_ORDERED_EDGE_DISPATCH;
+        assert!(matches!(
+            CompiledProgram::deserialize(&incompatible),
+            Err(ProgramFormatError::Malformed(
+                "ordered-edge dispatch marker is incompatible with the embedded graph"
+            ))
+        ));
+
+        // Optimizing artifacts that complete determinization still use the
+        // unchanged V4 representation because they need no NFA dispatch.
+        let complete = raw_program(
+            &raw,
+            OutputContract::Span,
+            CompileMode::Optimizing,
+            DeterminizeLimits::default(),
+        );
+        assert_eq!(complete.engine_kind(), EngineKind::OrderedDfa);
+        assert!(!complete.automaton.has_ordered_edge_dispatch());
+        assert_eq!(complete.program_format_version(), PROGRAM_FORMAT_VERSION_V4);
+
+        // A fresh complete contextual DFA remains NFA-backed for its bounded
+        // fallback routes, so it may legitimately carry the same sidecar.
+        // Its stable tag deliberately restores the universal ordered NFA;
+        // the V5 marker must retain the dispatch through that downgrade.
+        let contextual = program(
+            r"(?m:^[acegikmo])",
+            OutputContract::Exists,
+            CompileMode::Optimizing,
+            DeterminizeLimits::default(),
+        );
+        assert_eq!(
+            contextual.engine_kind(),
+            EngineKind::OrderedContextDfa,
+            "{:?}",
+            contextual.context_determinization_report()
+        );
+        assert!(contextual.automaton.has_ordered_edge_dispatch());
+        let contextual_bytes = contextual.serialize().unwrap();
+        assert_eq!(
+            u32::from_le_bytes(contextual_bytes[8..12].try_into().unwrap()),
+            PROGRAM_FORMAT_VERSION_V5
+        );
+        let contextual_restored = CompiledProgram::deserialize(&contextual_bytes).unwrap();
+        assert_eq!(contextual_restored.engine_kind(), EngineKind::OrderedNfa);
+        assert!(contextual_restored.automaton.has_ordered_edge_dispatch());
+        assert_eq!(contextual_restored.serialize().unwrap(), contextual_bytes);
+
+        // A caller cannot accidentally leak a prederived sidecar into Fast or
+        // a completed-DFA artifact. Those artifacts must stay byte-identical
+        // V4 programs, and build has no authority to silently discard state.
+        let mut preattached = Automaton::from_raw(raw.clone(), CompileLimits::default()).unwrap();
+        assert!(preattached.try_enable_ordered_edge_dispatch().unwrap());
+        assert!(matches!(
+            CompiledProgram::build(
+                raw.clone(),
+                preattached.clone(),
+                OutputContract::Span,
+                CompileMode::Fast,
+                DeterminizeLimits::default(),
+                usize::MAX,
+            ),
+            Err(CompileError::InternalInvariant(
+                "ordered-edge dispatch was preattached to an ineligible engine"
+            ))
+        ));
+        assert!(matches!(
+            CompiledProgram::build(
+                raw.clone(),
+                preattached,
+                OutputContract::Span,
+                CompileMode::Optimizing,
+                DeterminizeLimits::default(),
+                usize::MAX,
+            ),
+            Err(CompileError::InternalInvariant(
+                "ordered-edge dispatch was preattached to an ineligible engine"
+            ))
+        ));
+
+        let partial_raw = with_ordered_dispatch_dead_branch(
+            program(
+                r"a+Q|[b-c][a-b]{1,5}(?:x+|y+)",
+                OutputContract::SelectedEnd,
+                CompileMode::Fast,
+                DeterminizeLimits::default(),
+            )
+            .raw,
+        );
+        let coexist = [8, 16, 32]
+            .into_iter()
+            .find_map(|max_states| {
+                let program = raw_program(
+                    &partial_raw,
+                    OutputContract::SelectedEnd,
+                    CompileMode::Optimizing,
+                    DeterminizeLimits {
+                        max_states,
+                        ..DeterminizeLimits::default()
+                    },
+                );
+                (program.partial_dfa().is_some()).then_some(program)
+            })
+            .expect("a bounded decline should retain at least one partial row");
+        assert!(coexist.automaton.has_ordered_edge_dispatch());
+        let coexist_bytes = coexist.serialize().unwrap();
+        assert_eq!(
+            coexist_bytes[15]
+                & (PROGRAM_FLAG_NFA_PARTIAL_DFA | PROGRAM_FLAG_NFA_ORDERED_EDGE_DISPATCH),
+            PROGRAM_FLAG_NFA_PARTIAL_DFA | PROGRAM_FLAG_NFA_ORDERED_EDGE_DISPATCH
+        );
+        let coexist_restored = CompiledProgram::deserialize(&coexist_bytes).unwrap();
+        assert!(coexist_restored.partial_dfa().is_some());
+        assert!(coexist_restored.automaton.has_ordered_edge_dispatch());
+        assert_eq!(coexist_restored.serialize().unwrap(), coexist_bytes);
     }
 
     #[test]

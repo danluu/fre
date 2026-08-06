@@ -10,6 +10,9 @@ use fre_simd_kernels::{
 };
 
 use crate::{CompileError, MalformedPlan, Operation, ResourceKind, TypedPlan, WorkspaceLayout};
+use crate::{
+    OrderedEdgeDispatchAllocationError, ordered_edge_dispatch::OrderedEdgeDispatch,
+};
 
 static NEXT_AUTOMATON_IDENTITY: AtomicU64 = AtomicU64::new(1);
 
@@ -852,6 +855,7 @@ pub struct Automaton {
     pub(crate) byte_starts: Box<[u8]>,
     pub(crate) byte_ends: Box<[u8]>,
     byte_classes: ByteClasses,
+    pub(crate) ordered_edge_dispatch: Option<OrderedEdgeDispatch>,
     pub(crate) start_filter_proof: StartFilterProofCell,
     line_terminator: u8,
     stats: PlanStats,
@@ -869,6 +873,7 @@ impl Clone for Automaton {
             byte_starts: self.byte_starts.clone(),
             byte_ends: self.byte_ends.clone(),
             byte_classes: self.byte_classes,
+            ordered_edge_dispatch: self.ordered_edge_dispatch.clone(),
             // A clone is a new immutable plan construction. Do not silently
             // copy first-use specialization that this instance has not paid
             // to derive.
@@ -913,6 +918,7 @@ impl Automaton {
             byte_starts: raw.byte_starts.into_boxed_slice(),
             byte_ends: raw.byte_ends.into_boxed_slice(),
             byte_classes,
+            ordered_edge_dispatch: None,
             start_filter_proof: StartFilterProofCell::new(),
             line_terminator: b'\n',
             stats,
@@ -946,6 +952,43 @@ impl Automaton {
     /// Exact bounded alphabet partition derived from validated byte ranges.
     pub(crate) const fn byte_classes(&self) -> &ByteClasses {
         &self.byte_classes
+    }
+
+    /// Derive the canonical priority-preserving dispatch for profitable wide
+    /// consuming rows.
+    ///
+    /// Qualification depends only on the validated graph and fixed compiler
+    /// ceilings. `Ok(false)` means no row qualified (or the fixed derivation
+    /// ceiling was reached). Allocation begins only after exact dimensions
+    /// have been derived; an allocation failure is returned explicitly so an
+    /// optimizing artifact never changes identity based on allocator state.
+    ///
+    /// # Errors
+    ///
+    /// Returns the exact bounded allocation extent when a qualifying sidecar
+    /// could not be retained.
+    pub fn try_enable_ordered_edge_dispatch(
+        &mut self,
+    ) -> Result<bool, OrderedEdgeDispatchAllocationError> {
+        if self.ordered_edge_dispatch.is_some() {
+            return Ok(true);
+        }
+        self.ordered_edge_dispatch = OrderedEdgeDispatch::derive(self)?;
+        Ok(self.ordered_edge_dispatch.is_some())
+    }
+
+    /// Whether this immutable graph owns a canonical ordered-edge dispatch.
+    #[must_use]
+    pub const fn has_ordered_edge_dispatch(&self) -> bool {
+        self.ordered_edge_dispatch.is_some()
+    }
+
+    /// Retained immutable bytes in the optional ordered-edge dispatch.
+    #[must_use]
+    pub fn ordered_edge_dispatch_retained_bytes(&self) -> usize {
+        self.ordered_edge_dispatch
+            .as_ref()
+            .map_or(0, OrderedEdgeDispatch::retained_bytes)
     }
 
     pub(crate) const fn identity(&self) -> u64 {
