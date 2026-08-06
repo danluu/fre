@@ -583,7 +583,7 @@ impl ContextTransitionStore {
         if self.slots.is_empty()
             || self.slots.len() != expected_slots
             || self.slots.len() > CONTEXT_TRANSITION_MAX_SLOTS
-            || self.hot.len() > LAZY_MAX_STATES
+            || self.hot.len() > DIRECT_LAZY_MAX_STATES
             || self.dense.len()
                 != contextual_dense_cells(usize::from(self.dense_class_count))?
             || self.dense_owners >> CONTEXT_DENSE_OWNER_LIMIT != 0
@@ -1224,16 +1224,54 @@ fn contextual_dense_relative_index(
 // four-way bucket domain up for masking. The proof depends only on immutable
 // graph shape; a full bucket still executes through the bounded inline path.
 fn contextual_transition_slots(state_capacity: usize) -> Result<usize, SearchError> {
+    let bounded_states = state_capacity.min(LAZY_MAX_STATES);
+    contextual_transition_slots_for_symbols(bounded_states, BYTE_ALPHABET)
+}
+
+/// Size the associative cache for a dependency-normalized exact-class row.
+///
+/// The immutable graph-wide assertion mask bounds every state's projected
+/// dependency product. When a wide contextual identity arena can exceed the
+/// legacy state ceiling, this exact class-by-product demand lets otherwise
+/// overprovisioned transition slots pay for additional identity metadata.
+/// The arena remains only a cache: a full bucket keeps the canonical inline
+/// frontier, so the smaller shape changes neither matching semantics nor
+/// saturation.
+fn compact_contextual_transition_slots(
+    state_capacity: usize,
+    class_count: usize,
+    global_dependencies: u32,
+) -> Result<usize, SearchError> {
+    if !(1..=BYTE_ALPHABET).contains(&class_count) {
+        return Err(SearchError::InternalInvariant {
+            detail: "contextual transition class count is outside the byte alphabet",
+        });
+    }
+    let variants = 1_usize
+        .checked_shl(global_dependencies.count_ones())
+        .unwrap_or(usize::MAX);
+    let symbols_per_state = class_count.saturating_mul(variants).min(BYTE_ALPHABET);
+    contextual_transition_slots_for_symbols(state_capacity, symbols_per_state)
+}
+
+fn contextual_transition_slots_for_symbols(
+    state_capacity: usize,
+    symbols_per_state: usize,
+) -> Result<usize, SearchError> {
     if state_capacity == 0 {
         return Ok(0);
     }
-    let bounded_states = state_capacity.min(LAZY_MAX_STATES);
-    let desired_slots =
-        bounded_states
-            .checked_mul(BYTE_ALPHABET)
-            .ok_or(SearchError::ArithmeticOverflow {
-                computation: "contextual transition desired slots",
-            })?;
+    if !(1..=BYTE_ALPHABET).contains(&symbols_per_state) {
+        return Err(SearchError::InternalInvariant {
+            detail: "contextual transition symbol demand is outside the byte alphabet",
+        });
+    }
+    let desired_slots = state_capacity
+        .checked_mul(symbols_per_state)
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "contextual transition desired slots",
+        })?
+        .min(CONTEXT_TRANSITION_MAX_SLOTS);
     let desired_buckets = desired_slots.div_ceil(CONTEXT_TRANSITION_WAYS);
     let bucket_count = desired_buckets
         .checked_next_power_of_two()
@@ -1699,28 +1737,27 @@ impl WorkspaceLayout {
                 .ok_or(SearchError::ArithmeticOverflow {
                     computation: "closure stack capacity",
                 })?;
-        let (lazy_state_capacity, lazy_item_capacity) = if mode == WorkspaceMode::Pike {
-            (0, 0)
-        } else {
-            lazy_capacities(automaton, automaton.byte_classes().count(), tier)?
-        };
-        let lazy_context_slots =
-            if lazy_state_capacity != 0 && automaton.stats().assertion_edges() != 0 {
-                contextual_transition_slots(lazy_state_capacity)?
+        let contextual = automaton.stats().assertion_edges() != 0;
+        let (lazy_state_capacity, lazy_item_capacity, lazy_context_slots) =
+            if mode == WorkspaceMode::Pike {
+                (0, 0, 0)
+            } else if contextual {
+                contextual_lazy_capacities(automaton, tier)?
             } else {
-                0
+                let (states, items) =
+                    lazy_capacities(automaton, automaton.byte_classes().count(), tier)?;
+                (states, items, 0)
             };
-        let (reverse_state_capacity, reverse_item_capacity) =
+        let (reverse_state_capacity, reverse_item_capacity, reverse_context_slots) =
             if mode == WorkspaceMode::Bidirectional && lazy_state_capacity != 0 {
-                reverse_capacities(automaton, tier)?
+                if contextual {
+                    contextual_reverse_capacities(automaton, tier)?
+                } else {
+                    let (states, items) = reverse_capacities(automaton, tier)?;
+                    (states, items, 0)
+                }
             } else {
-                (0, 0)
-            };
-        let reverse_context_slots =
-            if reverse_state_capacity != 0 && automaton.stats().assertion_edges() != 0 {
-                contextual_transition_slots(reverse_state_capacity)?
-            } else {
-                0
+                (0, 0, 0)
             };
         // Direct rows and the optional contextual dense tier both index the
         // automaton's exact immutable byte partition. Pike-only layouts keep
@@ -2417,8 +2454,10 @@ impl ContextLazyLoopSkipPlans {
                 }
             }
         }
-        let state = u8::try_from(state).ok()?;
-        if !byte_bitmap_contains(self.state_members, state) {
+        let bitmap_member = u8::try_from(state)
+            .ok()
+            .map(|state| byte_bitmap_contains(self.state_members, state));
+        if bitmap_member == Some(false) {
             return None;
         }
         let found = self
@@ -2430,11 +2469,11 @@ impl ContextLazyLoopSkipPlans {
                     return None;
                 }
                 plan.as_ref()
-                    .filter(|plan| plan.state == u32::from(state))
+                    .filter(|plan| plan.state == state)
                     .map(|plan| (slot, plan))
             });
         debug_assert!(
-            found.is_some(),
+            bitmap_member != Some(true) || found.is_some(),
             "contextual loop state bitmap has no exact plan"
         );
         found
@@ -3909,7 +3948,14 @@ impl ReverseWorkspace {
                 detail: "reverse DFA transition class is outside the direct row",
             });
         }
-        debug_assert!(self.state_len <= LAZY_MAX_STATES);
+        debug_assert!(
+            self.state_len
+                <= if self.context.is_allocated() {
+                    DIRECT_LAZY_MAX_STATES
+                } else {
+                    LAZY_MAX_STATES
+                }
+        );
         let cell = direct_row_cell_index(state, class, self.direct_row_stride);
         self.rows
             .get(cell)
@@ -3958,7 +4004,14 @@ impl ReverseWorkspace {
                 detail: "reverse DFA transition class is outside the direct row",
             });
         }
-        debug_assert!(self.state_len <= LAZY_MAX_STATES);
+        debug_assert!(
+            self.state_len
+                <= if self.context.is_allocated() {
+                    DIRECT_LAZY_MAX_STATES
+                } else {
+                    LAZY_MAX_STATES
+                }
+        );
         let cell = direct_row_cell_index(state, class, self.direct_row_stride);
         *self
             .rows
@@ -4051,14 +4104,15 @@ impl ReverseWorkspace {
         meter: &mut WorkMeter,
         position: usize,
     ) -> Result<LazyIndexProbe, SearchError> {
-        let mut index_slot = lazy_index_start(hash, self.index.len())?;
+        let index_slots = lazy_active_index_slots(self.index.len(), self.state_len);
+        let mut index_slot = lazy_index_start(hash, index_slots)?;
         let probe_limit = self
             .state_len
             .checked_add(1)
             .ok_or(SearchError::ArithmeticOverflow {
                 computation: "reverse DFA identity-index probe limit",
             })?;
-        if probe_limit > self.index.len() {
+        if probe_limit > index_slots {
             return Err(SearchError::InternalInvariant {
                 detail: "reverse DFA identity-index probe bound exceeds its arena",
             });
@@ -4101,7 +4155,7 @@ impl ReverseWorkspace {
                 }
             }
             if probe != self.state_len {
-                index_slot = lazy_index_advance(index_slot, self.index.len())?;
+                index_slot = lazy_index_advance(index_slot, index_slots)?;
             }
         }
         Err(SearchError::InternalInvariant {
@@ -4124,6 +4178,7 @@ impl ReverseWorkspace {
                 detail: "reverse DFA index bootstrap is outside its publication boundary",
             });
         }
+        let index_slots = lazy_active_index_slots(self.index.len(), self.state_len);
         let mut slots = [usize::MAX; LAZY_HASH_INDEX_MIN_STATES];
         for state in 0..LAZY_HASH_INDEX_MIN_STATES {
             let hash = if state == self.state_len {
@@ -4131,7 +4186,7 @@ impl ReverseWorkspace {
             } else {
                 self.hashes[state]
             };
-            let mut slot = lazy_index_start(hash, self.index.len())?;
+            let mut slot = lazy_index_start(hash, index_slots)?;
             let mut selected = None;
             let probe_limit = state
                 .checked_add(1)
@@ -4158,7 +4213,7 @@ impl ReverseWorkspace {
                     break;
                 }
                 if probe != state {
-                    slot = lazy_index_advance(slot, self.index.len())?;
+                    slot = lazy_index_advance(slot, index_slots)?;
                 }
             }
             let slot = selected.ok_or(SearchError::InternalInvariant {
@@ -4177,6 +4232,107 @@ impl ReverseWorkspace {
         Ok(slots)
     }
 
+    /// Rebuild the legacy reverse identity-index prefix into the already
+    /// allocated wide arena before publishing identity 257. Reverse keeps its
+    /// four-way bucket start, but otherwise shares the forward transaction:
+    /// every placement is planned and charged before the first live write.
+    #[cold]
+    #[inline(never)]
+    fn plan_index_promotion(
+        &self,
+        final_hash: u64,
+        meter: &mut WorkMeter,
+        position: usize,
+    ) -> Result<LazyIndexPromotionPlan, SearchError> {
+        let source_slots = lazy_active_index_slots(self.index.len(), self.state_len);
+        if self.state_len != LAZY_MAX_STATES
+            || self.index.len() <= source_slots
+            || source_slots != LAZY_LEGACY_IDENTITY_INDEX_SLOTS
+            || self.index.len() > LAZY_IDENTITY_INDEX_MAX_SLOTS
+            || self.hashes.len() <= self.state_len
+        {
+            return Err(SearchError::InternalInvariant {
+                detail: "reverse DFA identity-index promotion is outside its exact boundary",
+            });
+        }
+
+        meter.charge(
+            u64::try_from(LAZY_IDENTITY_INDEX_OCCUPANCY_WORDS).map_err(|_| {
+                SearchError::ArithmeticOverflow {
+                    computation: "reverse DFA identity-index occupancy work conversion",
+                }
+            })?,
+            position,
+        )?;
+        let mut occupied = [0_u64; LAZY_IDENTITY_INDEX_OCCUPANCY_WORDS];
+        let mut slots = [usize::MAX; LAZY_IDENTITY_INDEX_PROMOTION_STATES];
+        for (state, planned_slot) in slots.iter_mut().enumerate() {
+            let hash = if state == self.state_len {
+                final_hash
+            } else {
+                self.hashes[state]
+            };
+            let mut slot = lazy_index_start(hash, self.index.len())?;
+            let probe_limit = state
+                .checked_add(1)
+                .ok_or(SearchError::ArithmeticOverflow {
+                    computation: "reverse DFA identity-index promotion probe limit",
+                })?;
+            let mut selected = None;
+            for probe in 0..probe_limit {
+                meter.charge(1, position)?;
+                let word = slot / 64;
+                let bit = u32::try_from(slot % 64).map_err(|_| {
+                    SearchError::InternalInvariant {
+                        detail: "reverse DFA identity-index promotion bit does not fit u32",
+                    }
+                })?;
+                let mask = 1_u64.checked_shl(bit).ok_or(
+                    SearchError::InternalInvariant {
+                        detail: "reverse DFA identity-index promotion bit is outside its word",
+                    },
+                )?;
+                let word = occupied.get_mut(word).ok_or(
+                    SearchError::InternalInvariant {
+                        detail: "reverse DFA identity-index promotion slot exceeds its bitset",
+                    },
+                )?;
+                if *word & mask == 0 {
+                    *word |= mask;
+                    selected = Some(slot);
+                    break;
+                }
+                if probe != state {
+                    slot = lazy_index_advance(slot, self.index.len())?;
+                }
+            }
+            *planned_slot = selected.ok_or(SearchError::InternalInvariant {
+                detail: "reverse DFA identity-index promotion has no publication slot",
+            })?;
+        }
+
+        let publication_work = self
+            .index
+            .len()
+            .checked_add(LAZY_IDENTITY_INDEX_PROMOTION_STATES)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "reverse DFA identity-index promotion publication work",
+            })?;
+        meter.charge(
+            u64::try_from(publication_work).map_err(|_| {
+                SearchError::ArithmeticOverflow {
+                    computation: "reverse DFA identity-index promotion work conversion",
+                }
+            })?,
+            position,
+        )?;
+        Ok(LazyIndexPromotionPlan { slots })
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one failure-atomic reverse transaction reserves lookup, publication, bootstrap, and wide promotion"
+    )]
     fn intern_speculative(
         &mut self,
         meter: &mut WorkMeter,
@@ -4196,6 +4352,11 @@ impl ReverseWorkspace {
         let bootstraps_index = can_publish
             && !self.index.is_empty()
             && self.state_len.checked_add(1) == Some(LAZY_HASH_INDEX_MIN_STATES);
+        let promotes_index = can_publish
+            && use_index
+            && self.state_len == LAZY_MAX_STATES
+            && self.index.len()
+                > lazy_active_index_slots(self.index.len(), self.state_len);
         // Mirror the forward complete-chain bound: every retained reverse
         // identity owns one entry, followed by a terminating sentinel.
         let indexed_lookup_slots = if use_index {
@@ -4207,9 +4368,14 @@ impl ReverseWorkspace {
         } else {
             self.state_len
         };
-        let index_publication_work = usize::from(use_index && can_publish);
+        let index_publication_work = usize::from(use_index && can_publish && !promotes_index);
         let bootstrap_work = if bootstraps_index {
             LAZY_HASH_INDEX_BOOTSTRAP_MAX_WORK
+        } else {
+            0
+        };
+        let promotion_work = if promotes_index {
+            lazy_index_promotion_max_work(self.index.len())?
         } else {
             0
         };
@@ -4225,6 +4391,7 @@ impl ReverseWorkspace {
             .and_then(|work| work.checked_add(publication_work))
             .and_then(|work| work.checked_add(index_publication_work))
             .and_then(|work| work.checked_add(bootstrap_work))
+            .and_then(|work| work.checked_add(promotion_work))
             .ok_or(SearchError::ArithmeticOverflow {
                 computation: "reverse DFA learning work",
             })?;
@@ -4279,6 +4446,11 @@ impl ReverseWorkspace {
             u32::try_from(item_count).map_err(|_| SearchError::InternalInvariant {
                 detail: "reverse DFA item count does not fit u32",
             })?;
+        let promotion = if promotes_index {
+            Some(self.plan_index_promotion(hash, meter, position)?)
+        } else {
+            None
+        };
         let bootstrap = if bootstraps_index {
             let slots = self.plan_index_bootstrap(hash, meter, position)?;
             let mut states = [0_u32; LAZY_HASH_INDEX_MIN_STATES];
@@ -4299,7 +4471,7 @@ impl ReverseWorkspace {
             })?,
             position,
         )?;
-        if insertion_slot.is_some() {
+        if insertion_slot.is_some() && promotion.is_none() {
             meter.charge(1, position)?;
         }
         self.items[self.item_len..item_end].copy_from_slice(&self.scratch[..item_count]);
@@ -4307,12 +4479,20 @@ impl ReverseWorkspace {
         self.offsets[state] = self.item_len;
         self.lengths[state] = encoded_item_count;
         self.hashes[state] = hash;
-        if let Some(slot) = insertion_slot {
-            self.index[slot] = indexed_state;
-        }
-        if let Some((slots, states)) = bootstrap {
-            for (slot, indexed) in slots.into_iter().zip(states) {
-                self.index[slot] = indexed;
+        if let Some(promotion) = promotion {
+            self.index.fill(LAZY_NO_STATE);
+            for (state, slot) in promotion.slots.into_iter().enumerate() {
+                self.index[slot] = u32::try_from(state)
+                    .expect("the fixed reverse identity-index promotion state fits u32");
+            }
+        } else {
+            if let Some(slot) = insertion_slot {
+                self.index[slot] = indexed_state;
+            }
+            if let Some((slots, states)) = bootstrap {
+                for (slot, indexed) in slots.into_iter().zip(states) {
+                    self.index[slot] = indexed;
+                }
             }
         }
         self.item_len = item_end;
@@ -15268,17 +15448,25 @@ fn try_publish_context_lazy_loop_skip_candidates(
                 detail: "contextual loop publication state is outside retained states",
             });
         }
-        let state = u8::try_from(candidate.state).map_err(|_| {
-            SearchError::InternalInvariant {
-                detail: "contextual loop publication state does not fit its fixed bitmap",
-            }
-        })?;
-        if byte_bitmap_contains(target_members, state) {
+        if target
+            .iter()
+            .flatten()
+            .filter(|retained| retained.state == candidate.state)
+            .count()
+            != 1
+        {
             return Err(SearchError::InternalInvariant {
                 detail: "contextual loop publication retained one state twice",
             });
         }
-        byte_bitmap_insert(&mut target_members, state);
+        if let Ok(state) = u8::try_from(candidate.state) {
+            if byte_bitmap_contains(target_members, state) {
+                return Err(SearchError::InternalInvariant {
+                    detail: "contextual loop publication retained one state twice",
+                });
+            }
+            byte_bitmap_insert(&mut target_members, state);
+        }
     }
 
     let mut changed = [false; CONTEXT_LAZY_LOOP_SKIP_PLAN_CAPACITY];
@@ -20387,6 +20575,213 @@ fn unicode_assertion_matches(
     ))
 }
 
+/// Reinvest overprovisioned contextual transition slots in forward identity
+/// metadata without exceeding this automaton's legacy retained-byte or setup
+/// work envelope. Narrow layouts and shapes whose complete identity domain is
+/// at most 256 states retain their former dimensions exactly.
+fn contextual_lazy_capacities(
+    automaton: &Automaton,
+    tier: LazyCacheTier,
+) -> Result<(usize, usize, usize), SearchError> {
+    let states = automaton.stats().states();
+    if states == 0 || states > LAZY_MAX_ITEMS {
+        return Ok((0, 0, 0));
+    }
+    let consuming = automaton.stats().consuming_states();
+    let legacy_states = forward_lazy_state_capacity_up_to(consuming, tier.state_limit());
+    let legacy_items = ordered_partial_permutation_item_capacity(
+        consuming,
+        2,
+        legacy_states,
+        "contextual lazy DFA item capacity",
+    )?;
+    let legacy_slots = contextual_transition_slots(legacy_states)?;
+    if tier == LazyCacheTier::Narrow || legacy_states < LAZY_MAX_STATES {
+        return Ok((legacy_states, legacy_items, legacy_slots));
+    }
+
+    let class_count = automaton.byte_classes().count();
+    let global_dependencies = automaton.boundary_context_classifier().assertions();
+    let stride = u32::try_from(class_count).map_err(|_| SearchError::InternalInvariant {
+        detail: "contextual lazy byte-class count does not fit the row stride",
+    })?;
+    let byte_budget = lazy_scratch_bytes(
+        states,
+        legacy_states,
+        legacy_items,
+        stride,
+        legacy_slots,
+    )?;
+    let initialized_slot_budget = lazy_initialized_slots(
+        states,
+        legacy_states,
+        legacy_items,
+        stride,
+        legacy_slots,
+    )?;
+    let maximum_states =
+        forward_lazy_state_capacity_up_to(consuming, DIRECT_LAZY_MAX_STATES);
+    let byte_limited = maximize_direct_state_capacity(
+        legacy_states,
+        maximum_states,
+        byte_budget,
+        |candidate| {
+            let items = ordered_partial_permutation_item_capacity(
+                consuming,
+                2,
+                candidate,
+                "contextual lazy DFA item capacity",
+            )?;
+            let slots = compact_contextual_transition_slots(
+                candidate,
+                class_count,
+                global_dependencies,
+            )?;
+            lazy_scratch_bytes(states, candidate, items, stride, slots)
+        },
+    )?;
+    let expanded_states = maximize_direct_state_capacity(
+        legacy_states,
+        byte_limited,
+        initialized_slot_budget,
+        |candidate| {
+            let items = ordered_partial_permutation_item_capacity(
+                consuming,
+                2,
+                candidate,
+                "contextual lazy DFA item capacity",
+            )?;
+            let slots = compact_contextual_transition_slots(
+                candidate,
+                class_count,
+                global_dependencies,
+            )?;
+            lazy_initialized_slots(states, candidate, items, stride, slots)
+        },
+    )?;
+    if expanded_states == legacy_states {
+        return Ok((legacy_states, legacy_items, legacy_slots));
+    }
+    let expanded_items = ordered_partial_permutation_item_capacity(
+        consuming,
+        2,
+        expanded_states,
+        "contextual lazy DFA item capacity",
+    )?;
+    let expanded_slots = compact_contextual_transition_slots(
+        expanded_states,
+        class_count,
+        global_dependencies,
+    )?;
+    Ok((expanded_states, expanded_items, expanded_slots))
+}
+
+/// Reverse counterpart of [`contextual_lazy_capacities`]. The fixed reverse
+/// CSR is included in both sides of each exact resource comparison, and only
+/// contextual wide layouts can select the expanded result.
+fn contextual_reverse_capacities(
+    automaton: &Automaton,
+    tier: LazyCacheTier,
+) -> Result<(usize, usize, usize), SearchError> {
+    let consuming = automaton.stats().consuming_edges();
+    if consuming == 0 || consuming > LAZY_MAX_ITEMS {
+        return Ok((0, 0, 0));
+    }
+    let legacy_states = reverse_lazy_state_capacity_up_to(consuming, true, tier.state_limit());
+    let legacy_items = ordered_partial_permutation_item_capacity(
+        consuming,
+        1,
+        legacy_states,
+        "contextual reverse lazy DFA item capacity",
+    )?;
+    let legacy_slots = contextual_transition_slots(legacy_states)?;
+    if tier == LazyCacheTier::Narrow || legacy_states < LAZY_MAX_STATES {
+        return Ok((legacy_states, legacy_items, legacy_slots));
+    }
+
+    let class_count = automaton.byte_classes().count();
+    let global_dependencies = automaton.boundary_context_classifier().assertions();
+    let stride = u32::try_from(class_count).map_err(|_| SearchError::InternalInvariant {
+        detail: "contextual reverse byte-class count does not fit the row stride",
+    })?;
+    let states = automaton.stats().states();
+    let edges = automaton.stats().edges();
+    let byte_budget = reverse_scratch_bytes(
+        states,
+        edges,
+        legacy_states,
+        legacy_items,
+        stride,
+        legacy_slots,
+    )?;
+    let initialized_slot_budget = reverse_initialized_slots(
+        states,
+        edges,
+        legacy_states,
+        legacy_items,
+        stride,
+        legacy_slots,
+    )?;
+    let maximum_states = reverse_lazy_state_capacity_up_to(
+        consuming,
+        true,
+        DIRECT_LAZY_MAX_STATES,
+    );
+    let byte_limited = maximize_direct_state_capacity(
+        legacy_states,
+        maximum_states,
+        byte_budget,
+        |candidate| {
+            let items = ordered_partial_permutation_item_capacity(
+                consuming,
+                1,
+                candidate,
+                "contextual reverse lazy DFA item capacity",
+            )?;
+            let slots = compact_contextual_transition_slots(
+                candidate,
+                class_count,
+                global_dependencies,
+            )?;
+            reverse_scratch_bytes(states, edges, candidate, items, stride, slots)
+        },
+    )?;
+    let expanded_states = maximize_direct_state_capacity(
+        legacy_states,
+        byte_limited,
+        initialized_slot_budget,
+        |candidate| {
+            let items = ordered_partial_permutation_item_capacity(
+                consuming,
+                1,
+                candidate,
+                "contextual reverse lazy DFA item capacity",
+            )?;
+            let slots = compact_contextual_transition_slots(
+                candidate,
+                class_count,
+                global_dependencies,
+            )?;
+            reverse_initialized_slots(states, edges, candidate, items, stride, slots)
+        },
+    )?;
+    if expanded_states == legacy_states {
+        return Ok((legacy_states, legacy_items, legacy_slots));
+    }
+    let expanded_items = ordered_partial_permutation_item_capacity(
+        consuming,
+        1,
+        expanded_states,
+        "contextual reverse lazy DFA item capacity",
+    )?;
+    let expanded_slots = compact_contextual_transition_slots(
+        expanded_states,
+        class_count,
+        global_dependencies,
+    )?;
+    Ok((expanded_states, expanded_items, expanded_slots))
+}
+
 fn lazy_capacities(
     automaton: &Automaton,
     direct_class_count: usize,
@@ -20497,7 +20892,8 @@ fn lazy_index_slots(state_capacity: usize) -> Result<usize, SearchError> {
         })
 }
 
-/// Live identity-index domain for one retained-state boundary.
+/// Live forward or reverse identity-index domain for one retained-state
+/// boundary.
 ///
 /// Capacities at or below the legacy ceiling are unchanged. A wider direct
 /// arena hashes into exactly the same 512-slot prefix until the first identity
@@ -23654,6 +24050,40 @@ mod tests {
         .unwrap()
     }
 
+    /// `(?m:^[ab]*a[ab]{8}z)` as a hand-authenticated raw graph. The nine
+    /// bytes before `z` expose all 512 ordered forward histories, while the
+    /// line assertion keeps the machine on the contextual path.
+    fn asserted_binary_history_then_z() -> Automaton {
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: core::iter::once(StateRole::Split)
+                    .chain(core::iter::once(StateRole::Split))
+                    .chain((0..11).map(|_| StateRole::Consume))
+                    .chain(core::iter::once(StateRole::Accept))
+                    .collect(),
+                edge_offsets: vec![0, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 14],
+                edge_targets: vec![1, 2, 3, 1, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+                edge_kinds: core::iter::once(EdgeKind::AssertLineStartLf)
+                    .chain(core::iter::repeat_n(EdgeKind::Epsilon, 2))
+                    .chain(core::iter::repeat_n(EdgeKind::ByteRange, 11))
+                    .collect(),
+                byte_starts: core::iter::repeat_n(0, 3)
+                    .chain([b'a', b'a'])
+                    .chain(core::iter::repeat_n(b'a', 8))
+                    .chain(core::iter::once(b'z'))
+                    .collect(),
+                byte_ends: core::iter::repeat_n(0, 3)
+                    .chain([b'b', b'a'])
+                    .chain(core::iter::repeat_n(b'b', 8))
+                    .chain(core::iter::once(b'z'))
+                    .collect(),
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn contextual_transition_slots_round_exact_state_domains_to_buckets() {
         let cases = [
@@ -23694,6 +24124,18 @@ mod tests {
             }
         }
         assert_eq!(super::contextual_transition_bucket_mask(0).unwrap(), 0);
+        assert_eq!(
+            super::compact_contextual_transition_slots(257, 1, 0b11).unwrap(),
+            2_048
+        );
+        assert_eq!(
+            super::compact_contextual_transition_slots(257, 5, 0b11).unwrap(),
+            8_192
+        );
+        assert_eq!(
+            super::compact_contextual_transition_slots(257, 64, 0b11).unwrap(),
+            super::CONTEXT_TRANSITION_MAX_SLOTS
+        );
         for slots in [
             1,
             super::CONTEXT_TRANSITION_WAYS + 1,
@@ -23806,9 +24248,9 @@ mod tests {
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "one matrix proves both resource bounds, directional exclusion, and contextual exclusion"
+        reason = "one matrix proves both exact resource bounds for direct and contextual directional expansion"
     )]
-    fn exact_class_rows_expand_only_forward_direct_capacity_within_both_budgets() {
+    fn exact_class_resources_expand_direct_and_contextual_capacity_within_both_budgets() {
         let ranges = [
             (b'a', b'a'),
             (b'b', b'b'),
@@ -23953,13 +24395,176 @@ mod tests {
             contextual_layout.direct_row_stride,
             u32::try_from(contextual.byte_classes().count()).unwrap()
         );
-        assert_eq!(
-            contextual_layout.lazy_state_capacity,
-            super::LAZY_MAX_STATES
+        let contextual_legacy_states = super::LAZY_MAX_STATES;
+        let contextual_legacy_slots =
+            super::contextual_transition_slots(contextual_legacy_states).unwrap();
+        let contextual_forward_legacy_items = super::ordered_partial_permutation_item_capacity(
+            contextual.stats().consuming_states(),
+            2,
+            contextual_legacy_states,
+            "test legacy contextual forward items",
+        )
+        .unwrap();
+        let contextual_reverse_legacy_items = super::ordered_partial_permutation_item_capacity(
+            contextual.stats().consuming_edges(),
+            1,
+            contextual_legacy_states,
+            "test legacy contextual reverse items",
+        )
+        .unwrap();
+        let contextual_forward_byte_budget = super::lazy_scratch_bytes(
+            contextual_layout.states,
+            contextual_legacy_states,
+            contextual_forward_legacy_items,
+            contextual_layout.direct_row_stride,
+            contextual_legacy_slots,
+        )
+        .unwrap();
+        let contextual_forward_slot_budget = super::lazy_initialized_slots(
+            contextual_layout.states,
+            contextual_legacy_states,
+            contextual_forward_legacy_items,
+            contextual_layout.direct_row_stride,
+            contextual_legacy_slots,
+        )
+        .unwrap();
+        let contextual_reverse_byte_budget = super::reverse_scratch_bytes(
+            contextual_layout.states,
+            contextual_layout.edges,
+            contextual_legacy_states,
+            contextual_reverse_legacy_items,
+            contextual_layout.direct_row_stride,
+            contextual_legacy_slots,
+        )
+        .unwrap();
+        let contextual_reverse_slot_budget = super::reverse_initialized_slots(
+            contextual_layout.states,
+            contextual_layout.edges,
+            contextual_legacy_states,
+            contextual_reverse_legacy_items,
+            contextual_layout.direct_row_stride,
+            contextual_legacy_slots,
+        )
+        .unwrap();
+        assert!(contextual_layout.lazy_state_capacity > contextual_legacy_states);
+        assert!(contextual_layout.reverse_state_capacity > contextual_legacy_states);
+        assert!(contextual_layout.lazy_context_slots < contextual_legacy_slots);
+        assert!(contextual_layout.reverse_context_slots < contextual_legacy_slots);
+        assert!(
+            super::lazy_scratch_bytes(
+                contextual_layout.states,
+                contextual_layout.lazy_state_capacity,
+                contextual_layout.lazy_item_capacity,
+                contextual_layout.direct_row_stride,
+                contextual_layout.lazy_context_slots,
+            )
+            .unwrap()
+                <= contextual_forward_byte_budget
         );
-        assert_eq!(
-            contextual_layout.reverse_state_capacity,
-            super::LAZY_MAX_STATES
+        assert!(
+            super::lazy_initialized_slots(
+                contextual_layout.states,
+                contextual_layout.lazy_state_capacity,
+                contextual_layout.lazy_item_capacity,
+                contextual_layout.direct_row_stride,
+                contextual_layout.lazy_context_slots,
+            )
+            .unwrap()
+                <= contextual_forward_slot_budget
+        );
+        assert!(
+            super::reverse_scratch_bytes(
+                contextual_layout.states,
+                contextual_layout.edges,
+                contextual_layout.reverse_state_capacity,
+                contextual_layout.reverse_item_capacity,
+                contextual_layout.direct_row_stride,
+                contextual_layout.reverse_context_slots,
+            )
+            .unwrap()
+                <= contextual_reverse_byte_budget
+        );
+        assert!(
+            super::reverse_initialized_slots(
+                contextual_layout.states,
+                contextual_layout.edges,
+                contextual_layout.reverse_state_capacity,
+                contextual_layout.reverse_item_capacity,
+                contextual_layout.direct_row_stride,
+                contextual_layout.reverse_context_slots,
+            )
+            .unwrap()
+                <= contextual_reverse_slot_budget
+        );
+        let next_forward_states = contextual_layout.lazy_state_capacity + 1;
+        let next_forward_items = super::ordered_partial_permutation_item_capacity(
+            contextual.stats().consuming_states(),
+            2,
+            next_forward_states,
+            "test next contextual forward items",
+        )
+        .unwrap();
+        let next_forward_slots = super::compact_contextual_transition_slots(
+            next_forward_states,
+            contextual.byte_classes().count(),
+            contextual.boundary_context_classifier().assertions(),
+        )
+        .unwrap();
+        assert!(
+            super::lazy_scratch_bytes(
+                contextual_layout.states,
+                next_forward_states,
+                next_forward_items,
+                contextual_layout.direct_row_stride,
+                next_forward_slots,
+            )
+            .unwrap()
+                > contextual_forward_byte_budget
+                || super::lazy_initialized_slots(
+                    contextual_layout.states,
+                    next_forward_states,
+                    next_forward_items,
+                    contextual_layout.direct_row_stride,
+                    next_forward_slots,
+                )
+                .unwrap()
+                    > contextual_forward_slot_budget
+        );
+        let next_reverse_states = contextual_layout.reverse_state_capacity + 1;
+        let next_reverse_items = super::ordered_partial_permutation_item_capacity(
+            contextual.stats().consuming_edges(),
+            1,
+            next_reverse_states,
+            "test next contextual reverse items",
+        )
+        .unwrap();
+        let next_reverse_slots = super::compact_contextual_transition_slots(
+            next_reverse_states,
+            contextual.byte_classes().count(),
+            contextual.boundary_context_classifier().assertions(),
+        )
+        .unwrap();
+        assert!(
+            super::reverse_scratch_bytes(
+                contextual_layout.states,
+                contextual_layout.edges,
+                next_reverse_states,
+                next_reverse_items,
+                contextual_layout.direct_row_stride,
+                next_reverse_slots,
+            )
+            .unwrap()
+                > contextual_reverse_byte_budget
+                || super::reverse_initialized_slots(
+                    contextual_layout.states,
+                    contextual_layout.edges,
+                    next_reverse_states,
+                    next_reverse_items,
+                    contextual_layout.direct_row_stride,
+                    next_reverse_slots,
+                )
+                .unwrap()
+                    > contextual_reverse_slot_budget
         );
         let contextual_narrow =
             WorkspaceLayout::for_narrow_bidirectional_automaton(&contextual).unwrap();
@@ -24198,6 +24803,256 @@ mod tests {
             warm_four.accounting().transition_work()
                 <= warm_two.accounting().transition_work().checked_mul(2).unwrap()
         );
+    }
+
+    #[test]
+    fn expanded_contextual_capacity_retains_natural_histories_and_saturated_fallback() {
+        let plan = asserted_binary_history_then_z();
+        pin_without_start_filter(&plan);
+        let endpoint = plan.accelerated_workspace_layout().unwrap();
+        let full = plan.bidirectional_workspace_layout().unwrap();
+        assert!(endpoint.lazy_state_capacity > super::LAZY_MAX_STATES);
+        assert!(full.reverse_state_capacity > super::LAZY_MAX_STATES);
+        assert!(endpoint.lazy_context_slots <= super::CONTEXT_TRANSITION_MAX_SLOTS);
+        assert!(full.reverse_context_slots <= super::CONTEXT_TRANSITION_MAX_SLOTS);
+
+        let mut no_match = Vec::with_capacity(512 * 10);
+        for word in 0_u16..512 {
+            no_match.push(b'\n');
+            for shift in (0..9).rev() {
+                no_match.push(if word & (1 << shift) == 0 { b'b' } else { b'a' });
+            }
+        }
+        let mut pike = K0Workspace::new(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let expected = plan
+            .prepare::<SelectedEnd>()
+            .search_with_workspace(&no_match, &mut pike, SearchLimits::unlimited())
+            .unwrap()
+            .into_output();
+        assert_eq!(expected, None);
+
+        let mut wide =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let actual = plan
+            .prepare::<SelectedEnd>()
+            .search_with_workspace(&no_match, &mut wide, SearchLimits::unlimited())
+            .unwrap()
+            .into_output();
+        assert_eq!(actual, expected);
+        assert!(wide.lazy.state_len > super::LAZY_MAX_STATES);
+        assert!(!wide.lazy.saturated);
+        assert_eq!(
+            super::lazy_active_index_slots(wide.lazy.index.len(), wide.lazy.state_len),
+            wide.lazy.index.len()
+        );
+
+        let retained_states = wide.lazy.state_len;
+        let retained_items = wide.lazy.item_len;
+        let second = plan
+            .prepare::<SelectedEnd>()
+            .search_with_workspace(&no_match, &mut wide, SearchLimits::unlimited())
+            .unwrap()
+            .into_output();
+        assert_eq!(second, expected);
+        assert_eq!(wide.lazy.state_len, retained_states);
+        assert_eq!(wide.lazy.item_len, retained_items);
+
+        let mut narrow = K0Workspace::new_with_layout(
+            &plan,
+            WorkspaceLimits::unlimited(),
+            WorkspaceLayout::for_narrow_accelerated_automaton(&plan).unwrap(),
+        )
+        .unwrap();
+        let narrow_actual = plan
+            .prepare::<SelectedEnd>()
+            .search_with_workspace(&no_match, &mut narrow, SearchLimits::unlimited())
+            .unwrap()
+            .into_output();
+        assert_eq!(narrow_actual, expected);
+        assert_eq!(narrow.lazy.state_len, super::LAZY_NARROW_MAX_STATES);
+        assert!(narrow.lazy.saturated);
+
+        let mut matching = no_match;
+        matching.extend_from_slice(b"\nabbbbbbbbz");
+        let mut pike_span = K0Workspace::new(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let expected_span = plan
+            .prepare::<Span>()
+            .search_with_workspace(&matching, &mut pike_span, SearchLimits::unlimited())
+            .unwrap()
+            .into_output();
+        assert!(expected_span.is_some());
+        let mut narrow_span = K0Workspace::new_with_layout(
+            &plan,
+            WorkspaceLimits::unlimited(),
+            WorkspaceLayout::for_narrow_bidirectional_automaton(&plan).unwrap(),
+        )
+        .unwrap();
+        let actual_span = plan
+            .prepare::<Span>()
+            .search_with_workspace(&matching, &mut narrow_span, SearchLimits::unlimited())
+            .unwrap()
+            .into_output();
+        assert_eq!(actual_span, expected_span);
+        assert!(narrow_span.lazy.saturated);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one reverse boundary test proves legacy placement, atomic promotion, exact retry, and capacity saturation"
+    )]
+    fn contextual_reverse_identity_index_promotes_atomically_at_257() {
+        fn stage(workspace: &mut K0Workspace, item: u32) {
+            workspace.reverse.scratch[0] = item;
+            workspace.reverse.scratch_len = 1;
+        }
+
+        fn assert_complete_index(workspace: &K0Workspace, index_slots: usize) {
+            assert_eq!(
+                workspace.reverse.index[..index_slots]
+                    .iter()
+                    .filter(|&&state| state != super::LAZY_NO_STATE)
+                    .count(),
+                workspace.reverse.state_len
+            );
+            for expected in 0..workspace.reverse.state_len {
+                let mut slot = super::lazy_index_start(
+                    workspace.reverse.hashes[expected],
+                    index_slots,
+                )
+                .unwrap();
+                let mut found = false;
+                for _ in 0..=workspace.reverse.state_len {
+                    let indexed = workspace.reverse.index[slot];
+                    assert_ne!(indexed, super::LAZY_NO_STATE);
+                    if usize::try_from(indexed).unwrap() == expected {
+                        found = true;
+                        break;
+                    }
+                    slot = super::lazy_index_advance(slot, index_slots).unwrap();
+                }
+                assert!(found, "reverse state {expected} is absent from its probe chain");
+            }
+        }
+
+        let plan = asserted_binary_history_then_z();
+        let layout = plan.bidirectional_workspace_layout().unwrap();
+        let mut workspace =
+            K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+        assert!(layout.reverse_state_capacity > super::LAZY_MAX_STATES);
+        assert!(workspace.reverse.index.len() > super::LAZY_LEGACY_IDENTITY_INDEX_SLOTS);
+
+        let mut meter = WorkMeter::new(u64::MAX, 0);
+        for state in 0..super::LAZY_MAX_STATES {
+            stage(&mut workspace, u32::try_from(10_000 + state).unwrap());
+            let interned = if state == 0 {
+                workspace
+                    .reverse
+                    .intern_initial(&mut meter, 0)
+                    .map(super::LazyInterned::State)
+            } else {
+                workspace.reverse.intern_speculative(&mut meter, 0, 0)
+            };
+            assert_eq!(
+                interned,
+                Ok(super::LazyInterned::State(u32::try_from(state).unwrap()))
+            );
+        }
+        let legacy_slots = super::lazy_active_index_slots(
+            workspace.reverse.index.len(),
+            workspace.reverse.state_len,
+        );
+        assert_eq!(legacy_slots, super::LAZY_LEGACY_IDENTITY_INDEX_SLOTS);
+        assert!(workspace.reverse.index[legacy_slots..]
+            .iter()
+            .all(|&state| state == super::LAZY_NO_STATE));
+        assert_complete_index(&workspace, legacy_slots);
+
+        stage(&mut workspace, 20_000);
+        let promotion_work =
+            super::lazy_index_promotion_max_work(workspace.reverse.index.len()).unwrap();
+        let promotion_bound = workspace
+            .reverse
+            .state_len
+            .checked_add(1)
+            .and_then(|work| work.checked_mul(2))
+            .and_then(|work| work.checked_add(2))
+            .and_then(|work| work.checked_add(promotion_work))
+            .unwrap();
+        let before_index = workspace.reverse.index.clone();
+        let before_items = workspace.reverse.items.clone();
+        let before_offsets = workspace.reverse.offsets.clone();
+        let before_lengths = workspace.reverse.lengths.clone();
+        let before_hashes = workspace.reverse.hashes.clone();
+        let mut one_below = WorkMeter::new(
+            u64::try_from(promotion_bound.checked_sub(1).unwrap()).unwrap(),
+            0,
+        );
+        assert_eq!(
+            workspace
+                .reverse
+                .intern_speculative(&mut one_below, 0, 0),
+            Ok(super::LazyInterned::BudgetDeclined)
+        );
+        assert_eq!(one_below.consumed, 0);
+        assert_eq!(workspace.reverse.state_len, super::LAZY_MAX_STATES);
+        assert_eq!(workspace.reverse.scratch_len, 1);
+        assert_eq!(workspace.reverse.index, before_index);
+        assert_eq!(workspace.reverse.items, before_items);
+        assert_eq!(workspace.reverse.offsets, before_offsets);
+        assert_eq!(workspace.reverse.lengths, before_lengths);
+        assert_eq!(workspace.reverse.hashes, before_hashes);
+
+        let mut exact = WorkMeter::new(u64::try_from(promotion_bound).unwrap(), 0);
+        assert_eq!(
+            workspace.reverse.intern_speculative(&mut exact, 0, 0),
+            Ok(super::LazyInterned::State(
+                u32::try_from(super::LAZY_MAX_STATES).unwrap()
+            ))
+        );
+        assert!(exact.consumed <= u64::try_from(promotion_bound).unwrap());
+        assert_eq!(
+            super::lazy_active_index_slots(
+                workspace.reverse.index.len(),
+                workspace.reverse.state_len,
+            ),
+            workspace.reverse.index.len()
+        );
+        assert_complete_index(&workspace, workspace.reverse.index.len());
+
+        for state in (0..workspace.reverse.state_len).rev() {
+            let item = if state == super::LAZY_MAX_STATES {
+                20_000
+            } else {
+                u32::try_from(10_000 + state).unwrap()
+            };
+            stage(&mut workspace, item);
+            let mut hit = WorkMeter::new(u64::MAX, 0);
+            assert_eq!(
+                workspace.reverse.intern_speculative(&mut hit, 0, 0),
+                Ok(super::LazyInterned::State(u32::try_from(state).unwrap()))
+            );
+        }
+
+        let capacity = workspace.reverse.offsets.len();
+        for state in workspace.reverse.state_len..capacity {
+            stage(&mut workspace, u32::try_from(30_000 + state).unwrap());
+            assert_eq!(
+                workspace.reverse.intern_speculative(&mut meter, 0, 0),
+                Ok(super::LazyInterned::State(u32::try_from(state).unwrap()))
+            );
+        }
+        let before_items = workspace.reverse.item_len;
+        let before_index = workspace.reverse.index.clone();
+        stage(&mut workspace, 99_999);
+        assert_eq!(
+            workspace.reverse.intern_speculative(&mut meter, 0, 0),
+            Ok(super::LazyInterned::CapacityFull)
+        );
+        assert_eq!(workspace.reverse.state_len, capacity);
+        assert_eq!(workspace.reverse.item_len, before_items);
+        assert_eq!(workspace.reverse.index, before_index);
+        assert_eq!(workspace.reverse.scratch_len, 1);
     }
 
     #[test]
