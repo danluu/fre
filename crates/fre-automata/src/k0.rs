@@ -201,17 +201,18 @@ const CONTEXT_TRANSITION_MAX_BUCKETS: usize =
     CONTEXT_TRANSITION_MAX_SLOTS / CONTEXT_TRANSITION_WAYS;
 const CONTEXT_EMPTY_SOURCE: u32 = u32::MAX;
 const CONTEXT_INITIAL_SOURCE: u32 = u32::MAX - 1;
-// A few dependency-proven states can retain an immutable, state-local view of
-// their already-published contextual records. Two assertion dependencies have
-// at most four values, so four owners need at most 4 * 4 * 256 u32 cells. The
-// fixed ceiling keeps this optional tier at or below 16 KiB per forward store.
-const CONTEXT_DENSE_OWNER_LIMIT: usize = 4;
+// Dependency-proven states can retain an immutable, state-local view of their
+// already-published contextual records. Two assertion dependencies have at
+// most four values. The owner count adapts to the immutable byte-class stride,
+// so narrow alphabets use more rows while every store remains at or below the
+// same 16 KiB ceiling. Owner tag 255 remains the no-owner sentinel.
+const CONTEXT_DENSE_OWNER_CAPACITY_MAX: usize = 255;
 const CONTEXT_DENSE_VARIANT_LIMIT: usize = 4;
 const CONTEXT_DENSE_NO_OWNER: u8 = u8::MAX;
+const CONTEXT_DENSE_NO_MISSING: u16 = u16::MAX;
 const CONTEXT_DENSE_CELLS_PER_OWNER_MAX: usize =
     CONTEXT_DENSE_VARIANT_LIMIT * BYTE_ALPHABET;
-const CONTEXT_DENSE_MAX_CELLS: usize =
-    CONTEXT_DENSE_OWNER_LIMIT * CONTEXT_DENSE_CELLS_PER_OWNER_MAX;
+const CONTEXT_DENSE_MAX_CELLS: usize = 4 * CONTEXT_DENSE_CELLS_PER_OWNER_MAX;
 const CONTEXT_DENSE_MAX_BYTES: usize = CONTEXT_DENSE_MAX_CELLS * size_of::<u32>();
 const _: () = assert!(CONTEXT_DENSE_MAX_BYTES == 16 * 1024);
 
@@ -477,13 +478,14 @@ struct ContextHotTransition {
     symbol: u32,
     value: u32,
     dependency_mask: u32,
+    // Missing normalized cells belong to the source row and therefore fit in
+    // the source's hot metadata. Zero is the one-load completion certificate;
+    // `u16::MAX` means no owner.
+    dense_missing: u16,
     lookup_work: u8,
-    // `u8::MAX` means no dense owner. Values 0..=3 index disjoint monotone
-    // owner slices; the field consumes padding already present in this tag.
+    // `u8::MAX` means no dense owner. Lower values index disjoint monotone
+    // owner slices; both byte fields consume padding already present in this tag.
     dense_owner: u8,
-    // Monotone certificate that every dependency-normalized cell in the
-    // owned row is initialized. This consumes the tag's remaining padding.
-    dense_complete: u8,
 }
 
 impl ContextHotTransition {
@@ -491,9 +493,9 @@ impl ContextHotTransition {
         symbol: u32::MAX,
         value: 0,
         dependency_mask: CONTEXT_DEPENDENCY_UNCOMPUTED,
+        dense_missing: CONTEXT_DENSE_NO_MISSING,
         lookup_work: 0,
         dense_owner: CONTEXT_DENSE_NO_OWNER,
-        dense_complete: 0,
     };
 }
 
@@ -504,14 +506,12 @@ struct ContextTransitionStore {
     hot: Vec<ContextHotTransition>,
     dense: Vec<u32>,
     dense_class_count: u16,
-    // Monotone no-eviction ownership remains independent of the hot tags so
-    // replacement of an exact tag can never make an initialized slice reusable.
-    dense_owners: u8,
-    // Missing normalized cells in each owned row. Zero authenticates a
-    // complete row only while the corresponding monotone owner bit is set.
-    // Counts are inline metadata: the fixed dense allocation already retains
-    // every cell that later publications initialize.
-    dense_missing: [u16; CONTEXT_DENSE_OWNER_LIMIT],
+    // Immutable maximum derived once from the class stride and physical arena.
+    dense_owner_capacity: u8,
+    // Owners are allocated sequentially and never evicted. The count remains
+    // independent of replaceable exact tags, so initialized slices are never
+    // reused even after their source's hot symbol changes.
+    dense_owner_count: u8,
     hot_initial: ContextHotTransition,
     bucket_mask: usize,
     published: u32,
@@ -525,17 +525,18 @@ impl fmt::Debug for ContextTransitionStore {
         } else {
             self.bucket_mask.saturating_add(1)
         };
-        let dense_complete = (0..CONTEXT_DENSE_OWNER_LIMIT)
-            .filter(|&owner| {
-                self.dense_owners & (1_u8 << owner) != 0 && self.dense_missing[owner] == 0
-            })
+        let dense_complete = self
+            .hot
+            .iter()
+            .filter(|hot| hot.dense_missing == 0)
             .count();
         formatter
             .debug_struct("ContextTransitionStore")
             .field("slots", &self.slots.len())
             .field("hot", &self.hot.len())
             .field("dense", &self.dense.len())
-            .field("dense_owners", &self.dense_owners.count_ones())
+            .field("dense_owners", &self.dense_owner_count)
+            .field("dense_owner_capacity", &self.dense_owner_capacity)
             .field("dense_complete", &dense_complete)
             .field("buckets", &buckets)
             .field("occupied", &self.occupied_slots())
@@ -551,7 +552,14 @@ impl ContextTransitionStore {
         total_bytes: usize,
     ) -> Result<Self, SearchError> {
         let bucket_mask = contextual_transition_bucket_mask(slot_count)?;
-        let dense_cells = contextual_dense_cells(dense_class_count)?;
+        let dense_cells = contextual_dense_cells(dense_class_count, hot_count)?;
+        let dense_owner_capacity = u8::try_from(contextual_dense_owner_capacity(
+            dense_class_count,
+            hot_count,
+        )?)
+        .map_err(|_| SearchError::InternalInvariant {
+            detail: "contextual dense owner capacity does not fit u8",
+        })?;
         Ok(Self {
             slots: allocate_slots(slot_count, ContextTransitionSlot::EMPTY, total_bytes)?,
             hot: allocate_slots(hot_count, ContextHotTransition::EMPTY, total_bytes)?,
@@ -561,8 +569,8 @@ impl ContextTransitionStore {
                     detail: "contextual dense class count does not fit u16",
                 }
             })?,
-            dense_owners: 0,
-            dense_missing: [0; CONTEXT_DENSE_OWNER_LIMIT],
+            dense_owner_capacity,
+            dense_owner_count: 0,
             hot_initial: ContextHotTransition::EMPTY,
             bucket_mask,
             published: 0,
@@ -576,8 +584,8 @@ impl ContextTransitionStore {
             hot: Vec::new(),
             dense: Vec::new(),
             dense_class_count: 0,
-            dense_owners: 0,
-            dense_missing: [0; CONTEXT_DENSE_OWNER_LIMIT],
+            dense_owner_capacity: 0,
+            dense_owner_count: 0,
             hot_initial: ContextHotTransition::EMPTY,
             bucket_mask: 0,
             published: 0,
@@ -675,23 +683,19 @@ impl ContextTransitionStore {
         } else {
             contextual_dense_owner_cells(usize::from(self.dense_class_count))?
         };
-        let invalid_missing = self
-            .dense_missing
-            .iter()
-            .enumerate()
-            .any(|(owner, &missing)| {
-                let owned = self.dense_owners & (1_u8 << owner) != 0;
-                (!owned && missing != 0)
-                    || (owned && (owner_cells == 0 || usize::from(missing) > owner_cells))
-            });
+        let expected_dense_cells = owner_cells
+            .checked_mul(usize::from(self.dense_owner_capacity))
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "contextual dense transition store shape",
+            })?;
         if self.slots.is_empty()
             || self.slots.len() != expected_slots
             || self.slots.len() > CONTEXT_TRANSITION_MAX_SLOTS
             || self.hot.len() > DIRECT_LAZY_MAX_STATES
-            || self.dense.len()
-                != contextual_dense_cells(usize::from(self.dense_class_count))?
-            || self.dense_owners >> CONTEXT_DENSE_OWNER_LIMIT != 0
-            || invalid_missing
+            || self.dense.len() != expected_dense_cells
+            || self.dense.len() > CONTEXT_DENSE_MAX_CELLS
+            || usize::from(self.dense_owner_count)
+                > usize::from(self.dense_owner_capacity)
         {
             return Err(SearchError::InternalInvariant {
                 detail: "contextual transition store has an invalid bucket shape",
@@ -752,22 +756,30 @@ impl ContextTransitionStore {
         hot: ContextHotTransition,
     ) -> Result<Option<usize>, SearchError> {
         if hot.dense_owner == CONTEXT_DENSE_NO_OWNER {
-            if hot.dense_complete != 0 {
+            if hot.dense_missing != CONTEXT_DENSE_NO_MISSING {
                 return Err(SearchError::InternalInvariant {
-                    detail: "contextual dense completion has no owner",
+                    detail: "contextual dense missing-cell count has no owner",
                 });
             }
             return Ok(None);
         }
         let owner = usize::from(hot.dense_owner);
-        if owner >= CONTEXT_DENSE_OWNER_LIMIT
-            || self.dense_owners & (1_u8 << owner) == 0
+        if owner >= usize::from(self.dense_owner_count)
+            || owner >= usize::from(self.dense_owner_capacity)
             || hot.dependency_mask == CONTEXT_DEPENDENCY_UNCOMPUTED
             || hot.dependency_mask.count_ones() > 2
-            || hot.dense_complete > 1
         {
             return Err(SearchError::InternalInvariant {
                 detail: "contextual dense owner has invalid dependency metadata",
+            });
+        }
+        let required = contextual_dense_required_cells(
+            usize::from(self.dense_class_count),
+            hot.dependency_mask,
+        )?;
+        if usize::from(hot.dense_missing) > required {
+            return Err(SearchError::InternalInvariant {
+                detail: "contextual dense row has an invalid missing-cell count",
             });
         }
         Ok(Some(owner))
@@ -780,38 +792,22 @@ impl ContextTransitionStore {
         &self,
         hot: ContextHotTransition,
     ) -> Result<bool, SearchError> {
-        let Some(owner) = self.dense_owner_for_hot(hot)? else {
+        let Some(_) = self.dense_owner_for_hot(hot)? else {
             return Ok(false);
         };
-        let required = contextual_dense_required_cells(
-            usize::from(self.dense_class_count),
-            hot.dependency_mask,
-        )?;
-        let missing = usize::from(self.dense_missing[owner]);
-        if missing > required {
-            return Err(SearchError::InternalInvariant {
-                detail: "contextual dense row has an invalid missing-cell count",
-            });
-        }
-        let complete = missing == 0;
-        if (hot.dense_complete != 0) != complete {
-            return Err(SearchError::InternalInvariant {
-                detail: "contextual dense completion disagrees with its missing-cell count",
-            });
-        }
-        Ok(complete)
+        Ok(hot.dense_missing == 0)
     }
 
     #[inline]
     #[cfg(test)]
     fn dense_row_is_complete(&self, hot: ContextHotTransition) -> bool {
         debug_assert!(
-            hot.dense_complete == 0
+            hot.dense_missing != 0
                 || self
                     .dense_row_complete_for_hot(hot)
                     .is_ok_and(|complete| complete)
         );
-        hot.dense_complete != 0
+        hot.dense_missing == 0
     }
 
     /// Plan one post-claim row initialization without changing either cache.
@@ -863,7 +859,7 @@ impl ContextTransitionStore {
             });
         }
         let required = contextual_dense_required_cells(class_count, hot.dependency_mask)?;
-        let missing = usize::from(self.dense_missing[owner]);
+        let missing = usize::from(hot.dense_missing);
         if missing == 0 || missing > required {
             return Err(SearchError::InternalInvariant {
                 detail: "contextual dense publication has an invalid missing-cell count",
@@ -909,7 +905,7 @@ impl ContextTransitionStore {
                 detail: "contextual dense source is outside hot metadata",
             },
         )?;
-        if source_hot.dense_owner != CONTEXT_DENSE_NO_OWNER {
+        if self.dense_owner_for_hot(source_hot)?.is_some() {
             return Ok(true);
         }
         let dependencies = source_hot.dependency_mask;
@@ -917,12 +913,17 @@ impl ContextTransitionStore {
             return Ok(false);
         }
 
-        let Some(owner) = (0..CONTEXT_DENSE_OWNER_LIMIT)
-            .find(|&candidate| self.dense_owners & (1_u8 << candidate) == 0)
-        else {
-            return Ok(false);
-        };
         let class_count = usize::from(self.dense_class_count);
+        let owner_capacity = usize::from(self.dense_owner_capacity);
+        let owner = usize::from(self.dense_owner_count);
+        if owner >= owner_capacity {
+            return Ok(false);
+        }
+        let next_owner_count = self.dense_owner_count.checked_add(1).ok_or(
+            SearchError::InternalInvariant {
+                detail: "contextual dense owner count exceeds its tag domain",
+            },
+        )?;
         let owner_cells = contextual_dense_owner_cells(class_count)?;
         let owner_begin = owner
             .checked_mul(owner_cells)
@@ -949,7 +950,7 @@ impl ContextTransitionStore {
         let snapshot_work = self
             .slots
             .len()
-            .checked_add(CONTEXT_DENSE_OWNER_LIMIT)
+            .checked_add(1)
             .and_then(|work| work.checked_add(CONTEXT_DENSE_CELLS_PER_OWNER_MAX))
             .and_then(|work| work.checked_add(owner_cells))
             .and_then(|work| work.checked_add(1))
@@ -1015,15 +1016,12 @@ impl ContextTransitionStore {
         let missing = u16::try_from(missing).map_err(|_| SearchError::InternalInvariant {
             detail: "contextual dense missing-cell count does not fit u16",
         })?;
-        let owner_tag = u8::try_from(owner).map_err(|_| SearchError::InternalInvariant {
-            detail: "contextual dense owner does not fit its hot tag",
-        })?;
+        let owner_tag = self.dense_owner_count;
 
         self.dense[owner_begin..owner_end].copy_from_slice(&planned[..owner_cells]);
-        self.dense_missing[owner] = missing;
-        self.dense_owners |= 1_u8 << owner;
+        self.hot[source_index].dense_missing = missing;
         self.hot[source_index].dense_owner = owner_tag;
-        self.hot[source_index].dense_complete = u8::from(missing == 0);
+        self.dense_owner_count = next_owner_count;
         Ok(true)
     }
 
@@ -1101,9 +1099,14 @@ impl ContextTransitionStore {
                 detail: "contextual dense-only publication source does not fit usize",
             }
         })?;
-        self.hot.get(source).ok_or(SearchError::InternalInvariant {
+        let hot = self.hot.get(source).ok_or(SearchError::InternalInvariant {
             detail: "contextual dense-only publication is outside its state domain",
         })?;
+        if usize::from(hot.dense_owner) != owner {
+            return Err(SearchError::InternalInvariant {
+                detail: "contextual dense-only publication owner changed after planning",
+            });
+        }
         // A full associative bucket contributes no publication work. The
         // dependency-proven dense cell is therefore the entire optional
         // transaction, and a decline leaves the row byte-for-byte intact.
@@ -1111,10 +1114,7 @@ impl ContextTransitionStore {
             return Ok(());
         }
         self.dense[dense_index] = record.value;
-        self.dense_missing[owner] = remaining;
-        if remaining == 0 {
-            self.hot[source].dense_complete = 1;
-        }
+        self.hot[source].dense_missing = remaining;
         Ok(())
     }
 
@@ -1211,7 +1211,7 @@ impl ContextTransitionStore {
         global_dependencies: u32,
     ) -> Result<Option<(u32, u64)>, SearchError> {
         debug_assert!(self.validate_shape().is_ok());
-        if hot.dense_complete == 0 {
+        if hot.dense_missing != 0 {
             return Ok(None);
         }
         let owner = self
@@ -1225,17 +1225,15 @@ impl ContextTransitionStore {
             });
         }
         let class_count = usize::from(self.dense_class_count);
-        let _required = contextual_dense_required_cells(class_count, hot.dependency_mask)?;
-        let missing = usize::from(self.dense_missing[owner]);
-        if missing != 0 {
-            return Err(SearchError::InternalInvariant {
-                detail: "contextual dense completion disagrees with its missing-cell count",
-            });
-        }
         let assertions = symbol >> CONTEXT_SYMBOL_CLASS_BITS;
         if assertions & !hot.dependency_mask != 0 {
             return Err(SearchError::InternalInvariant {
                 detail: "complete contextual dense lookup received a raw assertion key",
+            });
+        }
+        if !contextual_dense_symbol_is_realizable(symbol, hot.dependency_mask)? {
+            return Err(SearchError::InternalInvariant {
+                detail: "complete contextual dense lookup received an impossible assertion product",
             });
         }
         if hot.symbol == symbol {
@@ -1356,14 +1354,14 @@ impl ContextTransitionStore {
                 symbol: record.symbol,
                 value: record.value,
                 dependency_mask: CONTEXT_DEPENDENCY_UNCOMPUTED,
+                dense_missing: CONTEXT_DENSE_NO_MISSING,
                 lookup_work,
                 dense_owner: CONTEXT_DENSE_NO_OWNER,
-                dense_complete: 0,
             };
             if record.source == CONTEXT_INITIAL_SOURCE {
                 hot.dependency_mask = self.hot_initial.dependency_mask;
+                hot.dense_missing = self.hot_initial.dense_missing;
                 hot.dense_owner = self.hot_initial.dense_owner;
-                hot.dense_complete = self.hot_initial.dense_complete;
                 self.hot_initial = hot;
             } else if !self.hot.is_empty() {
                 let source = usize::try_from(record.source).map_err(|_| {
@@ -1375,10 +1373,10 @@ impl ContextTransitionStore {
                     detail: "contextual hot-transition publication is outside its state domain",
                 })?;
                 hot.dependency_mask = retained.dependency_mask;
+                hot.dense_missing = retained.dense_missing;
                 hot.dense_owner = retained.dense_owner;
-                hot.dense_complete = retained.dense_complete;
-                if matches!(dense_publication, Some((_, _, 0))) {
-                    hot.dense_complete = 1;
+                if let Some((_, _, remaining)) = dense_publication {
+                    hot.dense_missing = remaining;
                 }
                 let symbol_class = record.symbol & CONTEXT_SYMBOL_CLASS_MASK;
                 if symbol_class < CONTEXT_INITIAL_CLASS
@@ -1393,9 +1391,8 @@ impl ContextTransitionStore {
                 }
                 *retained = hot;
             }
-            if let Some((dense_index, owner, remaining)) = dense_publication {
+            if let Some((dense_index, _, _)) = dense_publication {
                 self.dense[dense_index] = record.value;
-                self.dense_missing[owner] = remaining;
             }
         }
         Ok(())
@@ -1413,6 +1410,24 @@ fn contextual_dense_owner_cells(class_count: usize) -> Result<usize, SearchError
         .ok_or(SearchError::ArithmeticOverflow {
             computation: "contextual dense owner cells",
         })
+}
+
+fn contextual_dense_owner_capacity(
+    class_count: usize,
+    hot_count: usize,
+) -> Result<usize, SearchError> {
+    if class_count == 0 || hot_count == 0 {
+        return Ok(0);
+    }
+    let owner_cells = contextual_dense_owner_cells(class_count)?;
+    let capacity = CONTEXT_DENSE_MAX_CELLS.checked_div(owner_cells).ok_or(
+        SearchError::InternalInvariant {
+            detail: "contextual dense owner stride is zero",
+        },
+    )?;
+    Ok(capacity
+        .min(CONTEXT_DENSE_OWNER_CAPACITY_MAX)
+        .min(hot_count))
 }
 
 /// Complete rows require every class-by-realizable-dependency product.
@@ -1524,12 +1539,12 @@ fn contextual_dense_symbol_is_realizable(
     Ok(contextual_dense_realizable_variants(dependencies)? & bit != 0)
 }
 
-fn contextual_dense_cells(class_count: usize) -> Result<usize, SearchError> {
-    if class_count == 0 {
+fn contextual_dense_cells(class_count: usize, hot_count: usize) -> Result<usize, SearchError> {
+    if class_count == 0 || hot_count == 0 {
         return Ok(0);
     }
     contextual_dense_owner_cells(class_count)?
-        .checked_mul(CONTEXT_DENSE_OWNER_LIMIT)
+        .checked_mul(contextual_dense_owner_capacity(class_count, hot_count)?)
         .filter(|&cells| cells <= CONTEXT_DENSE_MAX_CELLS)
         .ok_or(SearchError::ArithmeticOverflow {
             computation: "contextual dense transition cells",
@@ -6900,7 +6915,7 @@ fn warm_context_complete_dense_transition(
     byte: u8,
     global_dependencies: u32,
 ) -> Result<Option<(u32, u64)>, SearchError> {
-    if hot.dense_complete == 0 {
+    if hot.dense_missing != 0 {
         return Ok(None);
     }
     let dependencies = hot.dependency_mask;
@@ -7256,7 +7271,7 @@ fn try_warm_context_exists_loop<const LOOP_SKIP: bool>(
             .ok_or(SearchError::ArithmeticOverflow {
                 computation: "warm contextual lazy DFA destination",
             })?;
-        let cell = if hot.dense_complete != 0 {
+        let cell = if hot.dense_missing == 0 {
             let (cell, work) = warm_context_complete_dense_transition(
                 automaton,
                 haystack,
@@ -7649,7 +7664,7 @@ fn try_warm_context_selected_end_loop<const LOOP_SKIP: bool>(
             .ok_or(SearchError::ArithmeticOverflow {
                 computation: "warm contextual lazy DFA destination",
             })?;
-        let cell = if hot.dense_complete != 0 {
+        let cell = if hot.dense_missing == 0 {
             let (cell, work) = warm_context_complete_dense_transition(
                 automaton,
                 haystack,
@@ -8391,7 +8406,7 @@ fn try_warm_context_span_loop<const LOOP_SKIP: bool>(
             .ok_or(SearchError::ArithmeticOverflow {
                 computation: "warm contextual Span destination",
             })?;
-        let cell = if hot.dense_complete != 0 {
+        let cell = if hot.dense_missing == 0 {
             let (cell, work) = warm_context_complete_dense_transition(
                 automaton,
                 haystack,
@@ -23109,11 +23124,14 @@ fn lazy_initialized_slots(
     let context_dense_slots = if context_slots == 0 {
         0
     } else {
-        contextual_dense_cells(usize::try_from(direct_row_stride).map_err(|_| {
-            SearchError::InternalInvariant {
-                detail: "contextual dense class count does not fit usize",
-            }
-        })?)?
+        contextual_dense_cells(
+            usize::try_from(direct_row_stride).map_err(|_| {
+                SearchError::InternalInvariant {
+                    detail: "contextual dense class count does not fit usize",
+                }
+            })?,
+            state_capacity,
+        )?
     };
     states
         .checked_mul(2)
@@ -23201,11 +23219,14 @@ fn lazy_scratch_bytes(
     let context_dense_bytes = if context_slots == 0 {
         0
     } else {
-        contextual_dense_cells(usize::try_from(direct_row_stride).map_err(|_| {
-            SearchError::InternalInvariant {
-                detail: "contextual dense class count does not fit usize",
-            }
-        })?)?
+        contextual_dense_cells(
+            usize::try_from(direct_row_stride).map_err(|_| {
+                SearchError::InternalInvariant {
+                    detail: "contextual dense class count does not fit usize",
+                }
+            })?,
+            state_capacity,
+        )?
         .checked_mul(size_of::<u32>())
         .ok_or(SearchError::ArithmeticOverflow {
             computation: "lazy DFA contextual dense-transition bytes",
@@ -27321,7 +27342,7 @@ mod tests {
             super::contextual_dense_required_cells(2, dependencies).unwrap(),
             4,
         );
-        assert_eq!(store.dense_missing[0], 0);
+        assert_eq!(store.hot[0].dense_missing, 0);
         assert!(store.dense_row_is_complete(store.hot[0]));
 
         store.hot[0].symbol = u32::MAX;
@@ -27356,12 +27377,22 @@ mod tests {
         }
 
         let impossible = super::contextual_class_symbol(0, 0);
+        assert!(matches!(
+            store.lookup_complete_dense_with_hot_prevalidated(
+                impossible,
+                store.hot[0],
+                dependencies,
+            ),
+            Err(SearchError::InternalInvariant {
+                detail: "complete contextual dense lookup received an impossible assertion product"
+            })
+        ));
         let mut lookup = WorkMeter::new(u64::MAX, 0);
         let (_, slot) = store.lookup(0, impossible, &mut lookup, 17).unwrap();
         let slots_before = store.slots.clone();
         let hot_before = store.hot[0];
         let dense_before = store.dense.clone();
-        let missing_before = store.dense_missing;
+        let owner_count_before = store.dense_owner_count;
         let mut publication = WorkMeter::new(u64::MAX, 0);
         assert!(matches!(
             store.publish(
@@ -27378,7 +27409,111 @@ mod tests {
         assert_eq!(store.slots, slots_before);
         assert_eq!(store.hot[0], hot_before);
         assert_eq!(store.dense, dense_before);
-        assert_eq!(store.dense_missing, missing_before);
+        assert_eq!(store.dense_owner_count, owner_count_before);
+    }
+
+    #[test]
+    fn contextual_dense_owner_capacity_adapts_under_the_fixed_byte_ceiling() {
+        let hot_count = super::CONTEXT_DENSE_OWNER_CAPACITY_MAX;
+        assert_eq!(super::contextual_dense_owner_capacity(0, hot_count).unwrap(), 0);
+        assert_eq!(super::contextual_dense_owner_capacity(1, hot_count).unwrap(), 255);
+        assert_eq!(super::contextual_dense_owner_capacity(2, hot_count).unwrap(), 255);
+        assert_eq!(super::contextual_dense_owner_capacity(4, hot_count).unwrap(), 255);
+        assert_eq!(super::contextual_dense_owner_capacity(5, hot_count).unwrap(), 204);
+        assert_eq!(
+            super::contextual_dense_owner_capacity(256, hot_count).unwrap(),
+            4
+        );
+        assert_eq!(super::contextual_dense_owner_capacity(4, 3).unwrap(), 3);
+        assert_eq!(super::contextual_dense_cells(4, 3).unwrap(), 48);
+
+        for class_count in 1..=super::BYTE_ALPHABET {
+            let owner_cells = super::contextual_dense_owner_cells(class_count).unwrap();
+            let capacity =
+                super::contextual_dense_owner_capacity(class_count, hot_count).unwrap();
+            let cells = super::contextual_dense_cells(class_count, hot_count).unwrap();
+            assert_eq!(cells, owner_cells * capacity);
+            assert!(capacity >= 4);
+            assert!(capacity <= super::CONTEXT_DENSE_OWNER_CAPACITY_MAX);
+            assert!(cells <= super::CONTEXT_DENSE_MAX_CELLS);
+            if capacity < super::CONTEXT_DENSE_OWNER_CAPACITY_MAX {
+                assert!(super::CONTEXT_DENSE_MAX_CELLS - cells < owner_cells);
+            }
+        }
+        assert_eq!(std::mem::size_of::<super::ContextHotTransition>(), 16);
+    }
+
+    #[test]
+    fn contextual_dense_adaptive_owner_claim_is_exact_and_failure_atomic() {
+        let slots = super::contextual_transition_slots(1).unwrap();
+        let mut store =
+            super::ContextTransitionStore::new(slots, 1, 1, usize::MAX).unwrap();
+        publish_context_record(
+            &mut store,
+            0,
+            super::contextual_class_symbol(0, 0),
+            7,
+        );
+        store.hot[0].dependency_mask = 0;
+        let owner_cells = super::contextual_dense_owner_cells(1).unwrap();
+        let snapshot_work = u64::try_from(
+            slots + 1 + super::CONTEXT_DENSE_CELLS_PER_OWNER_MAX + owner_cells + 1,
+        )
+        .unwrap();
+        let hot_before = store.hot.clone();
+        let dense_before = store.dense.clone();
+        let owner_count_before = store.dense_owner_count;
+
+        let mut one_below = WorkMeter::new(snapshot_work - 1, 0);
+        assert!(!store
+            .try_claim_dense_owner(0, &mut one_below)
+            .unwrap());
+        assert_eq!(one_below.consumed, 0);
+        assert_eq!(store.hot, hot_before);
+        assert_eq!(store.dense, dense_before);
+        assert_eq!(store.dense_owner_count, owner_count_before);
+
+        let mut exact = WorkMeter::new(snapshot_work, 0);
+        assert!(store.try_claim_dense_owner(0, &mut exact).unwrap());
+        assert_eq!(exact.consumed, snapshot_work);
+        assert_eq!(store.hot[0].dense_owner, 0);
+        assert_eq!(store.hot[0].dense_missing, 0);
+        assert_eq!(store.dense_owner_count, 1);
+    }
+
+    #[test]
+    fn contextual_dense_owner_tag_254_preserves_the_255_sentinel_boundary() {
+        let hot_count = 256;
+        let slots = super::contextual_transition_slots(hot_count).unwrap();
+        let mut store =
+            super::ContextTransitionStore::new(slots, hot_count, 1, usize::MAX).unwrap();
+        for source in 0..u32::try_from(hot_count).unwrap() {
+            publish_context_record(
+                &mut store,
+                source,
+                super::contextual_class_symbol(0, 0),
+                source.checked_add(1).unwrap(),
+            );
+            store.hot[usize::try_from(source).unwrap()].dependency_mask = 0;
+        }
+        for source in 0..u32::try_from(super::CONTEXT_DENSE_OWNER_CAPACITY_MAX).unwrap() {
+            let mut meter = WorkMeter::new(u64::MAX, 0);
+            assert!(store.try_claim_dense_owner(source, &mut meter).unwrap());
+        }
+        assert_eq!(store.dense_owner_count, u8::MAX);
+        assert_eq!(store.hot[254].dense_owner, 254);
+        assert_eq!(store.hot[254].dense_missing, 0);
+
+        let hot_before = store.hot[255];
+        let dense_before = store.dense.clone();
+        let mut refused = WorkMeter::new(u64::MAX, 0);
+        assert!(!store.try_claim_dense_owner(255, &mut refused).unwrap());
+        assert_eq!(refused.consumed, 0);
+        assert_eq!(store.hot[255], hot_before);
+        assert_eq!(store.hot[255].dense_owner, super::CONTEXT_DENSE_NO_OWNER);
+        assert_eq!(store.hot[255].dense_missing, super::CONTEXT_DENSE_NO_MISSING);
+        assert_eq!(store.dense, dense_before);
+        assert_eq!(store.dense_owner_count, u8::MAX);
     }
 
     #[test]
@@ -27410,8 +27545,7 @@ mod tests {
             let mut claim = WorkMeter::new(u64::MAX, 0);
             assert!(store.try_claim_dense_owner(0, &mut claim).unwrap());
             assert_eq!(store.hot[0].dense_owner, 0);
-            assert_eq!(store.hot[0].dense_complete, 1);
-            assert_eq!(store.dense_missing[0], 0);
+            assert_eq!(store.hot[0].dense_missing, 0);
             assert!(store
                 .dense_row_complete_for_hot(store.hot[0])
                 .unwrap());
@@ -27463,8 +27597,7 @@ mod tests {
             let retained_bytes = store.retained_bytes().unwrap();
             let mut claim = WorkMeter::new(u64::MAX, 0);
             assert!(store.try_claim_dense_owner(0, &mut claim).unwrap());
-            assert_eq!(usize::from(store.dense_missing[0]), expected_cells - 1);
-            assert_eq!(store.hot[0].dense_complete, 0);
+            assert_eq!(usize::from(store.hot[0].dense_missing), expected_cells - 1);
             assert!(!store
                 .dense_row_complete_for_hot(store.hot[0])
                 .unwrap());
@@ -27483,7 +27616,7 @@ mod tests {
                     let (cached, slot) = store.lookup(0, symbol, &mut lookup, 19).unwrap();
                     assert_eq!(cached, None);
                     let slot = slot.expect("the late dense fixture exhausted a hash bucket");
-                    let before_missing = store.dense_missing[0];
+                    let before_missing = store.hot[0].dense_missing;
                     let mut publication = WorkMeter::new(u64::MAX, 0);
                     store
                         .publish(
@@ -27495,12 +27628,11 @@ mod tests {
                         )
                         .unwrap();
                     assert_eq!(publication.consumed, 2);
-                    assert_eq!(store.dense_missing[0], before_missing - 1);
+                    assert_eq!(store.hot[0].dense_missing, before_missing - 1);
                     assert_eq!(store.retained_bytes().unwrap(), retained_bytes);
                 }
             }
-            assert_eq!(store.dense_missing[0], 0);
-            assert_eq!(store.hot[0].dense_complete, 1);
+            assert_eq!(store.hot[0].dense_missing, 0);
             assert!(store
                 .dense_row_complete_for_hot(store.hot[0])
                 .unwrap());
@@ -27524,7 +27656,7 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(alias_publish.consumed, 1);
-            assert_eq!(store.dense_missing[0], 0);
+            assert_eq!(store.hot[0].dense_missing, 0);
 
             // Remove both exact tiers and exhaustively prove the completed row
             // answers every relevant/irrelevant assertion combination.
@@ -27561,8 +27693,7 @@ mod tests {
         store.hot[0].dependency_mask = 0;
         let mut claim = WorkMeter::new(u64::MAX, 0);
         assert!(store.try_claim_dense_owner(0, &mut claim).unwrap());
-        assert_eq!(store.dense_missing[0], 1);
-        assert_eq!(store.hot[0].dense_complete, 0);
+        assert_eq!(store.hot[0].dense_missing, 1);
 
         let mut lookup = WorkMeter::new(u64::MAX, 0);
         let (_, slot) = store.lookup(0, second, &mut lookup, 31).unwrap();
@@ -27570,7 +27701,7 @@ mod tests {
         let before_slots = store.slots.clone();
         let before_hot = store.hot[0];
         let before_dense = store.dense.clone();
-        let before_missing = store.dense_missing;
+        let before_owner_count = store.dense_owner_count;
         let before_published = store.published;
         let mut one_unit = WorkMeter::new(1, 0);
         store
@@ -27586,7 +27717,7 @@ mod tests {
         assert_eq!(store.slots, before_slots);
         assert_eq!(store.hot[0], before_hot);
         assert_eq!(store.dense, before_dense);
-        assert_eq!(store.dense_missing, before_missing);
+        assert_eq!(store.dense_owner_count, before_owner_count);
         assert_eq!(store.published, before_published);
 
         let mut retry = WorkMeter::new(2, 0);
@@ -27600,8 +27731,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(retry.consumed, 2);
-        assert_eq!(store.dense_missing[0], 0);
-        assert_eq!(store.hot[0].dense_complete, 1);
+        assert_eq!(store.hot[0].dense_missing, 0);
         assert!(store
             .dense_row_complete_for_hot(store.hot[0])
             .unwrap());
@@ -27613,7 +27743,7 @@ mod tests {
         let before_slots = store.slots.clone();
         let before_hot = store.hot[0];
         let before_dense = store.dense.clone();
-        let before_missing = store.dense_missing;
+        let before_owner_count = store.dense_owner_count;
         let before_published = store.published;
         let mut conflict = WorkMeter::new(u64::MAX, 0);
         assert!(matches!(
@@ -27632,7 +27762,7 @@ mod tests {
         assert_eq!(store.slots, before_slots);
         assert_eq!(store.hot[0], before_hot);
         assert_eq!(store.dense, before_dense);
-        assert_eq!(store.dense_missing, before_missing);
+        assert_eq!(store.dense_owner_count, before_owner_count);
         assert_eq!(store.published, before_published);
     }
 
@@ -27649,8 +27779,7 @@ mod tests {
         store.hot[0].dependency_mask = 0;
         let mut claim = WorkMeter::new(u64::MAX, 0);
         assert!(store.try_claim_dense_owner(0, &mut claim).unwrap());
-        assert_eq!(store.dense_missing[0], 1);
-        assert_eq!(store.hot[0].dense_complete, 0);
+        assert_eq!(store.hot[0].dense_missing, 1);
 
         fill_context_bucket(&mut store, 0, saturated_symbol);
         let mut lookup = WorkMeter::new(u64::MAX, 0);
@@ -27669,7 +27798,7 @@ mod tests {
         let slots_before = store.slots.clone();
         let hot_before = store.hot[0];
         let dense_before = store.dense.clone();
-        let missing_before = store.dense_missing;
+        let owner_count_before = store.dense_owner_count;
         let published_before = store.published;
         let loop_candidates_before = store.loop_candidates_published;
 
@@ -27681,7 +27810,7 @@ mod tests {
         assert_eq!(store.slots, slots_before);
         assert_eq!(store.hot[0], hot_before);
         assert_eq!(store.dense, dense_before);
-        assert_eq!(store.dense_missing, missing_before);
+        assert_eq!(store.dense_owner_count, owner_count_before);
         assert_eq!(store.published, published_before);
         assert_eq!(store.loop_candidates_published, loop_candidates_before);
 
@@ -27692,9 +27821,9 @@ mod tests {
         assert_eq!(exact.consumed, 1);
         assert_eq!(store.slots, slots_before);
         let mut completed_hot = hot_before;
-        completed_hot.dense_complete = 1;
+        completed_hot.dense_missing = 0;
         assert_eq!(store.hot[0], completed_hot);
-        assert_eq!(store.dense_missing[0], 0);
+        assert_eq!(store.hot[0].dense_missing, 0);
         assert!(store.dense_row_is_complete(store.hot[0]));
         assert_eq!(store.published, published_before);
         assert_eq!(store.loop_candidates_published, loop_candidates_before);
@@ -27729,7 +27858,7 @@ mod tests {
         let slots_before = store.slots.clone();
         let hot_before = store.hot[0];
         let dense_before = store.dense.clone();
-        let missing_before = store.dense_missing;
+        let owner_count_before = store.dense_owner_count;
         let published_before = store.published;
         let loop_candidates_before = store.loop_candidates_published;
         let mut conflict = WorkMeter::new(u64::MAX, 0);
@@ -27749,7 +27878,7 @@ mod tests {
         assert_eq!(store.slots, slots_before);
         assert_eq!(store.hot[0], hot_before);
         assert_eq!(store.dense, dense_before);
-        assert_eq!(store.dense_missing, missing_before);
+        assert_eq!(store.dense_owner_count, owner_count_before);
         assert_eq!(store.published, published_before);
         assert_eq!(store.loop_candidates_published, loop_candidates_before);
     }
@@ -27783,8 +27912,7 @@ mod tests {
         store.hot[0].dependency_mask = FIRST | SECOND;
         let mut claim = WorkMeter::new(u64::MAX, 0);
         assert!(store.try_claim_dense_owner(0, &mut claim).unwrap());
-        assert_eq!(store.dense_missing[0], 4);
-        assert_eq!(store.hot[0].dense_complete, 0);
+        assert_eq!(store.hot[0].dense_missing, 4);
         assert!(!store
             .dense_row_complete_for_hot(store.hot[0])
             .unwrap());
@@ -27812,17 +27940,16 @@ mod tests {
                     )
                     .unwrap();
                 assert_eq!(publication.consumed, 1);
-                assert_eq!(store.dense_missing[0], 4);
-                assert_eq!(store.hot[0].dense_complete, 0);
+                assert_eq!(store.hot[0].dense_missing, 4);
             }
         }
 
         let mut forged = store.hot[0];
-        forged.dense_complete = 1;
+        forged.dense_missing = u16::MAX;
         assert!(matches!(
             store.dense_row_complete_for_hot(forged),
             Err(SearchError::InternalInvariant {
-                detail: "contextual dense completion disagrees with its missing-cell count"
+                detail: "contextual dense row has an invalid missing-cell count"
             })
         ));
     }
@@ -27853,7 +27980,7 @@ mod tests {
         let slots_before = store.slots.clone();
         let hot_before = store.hot.clone();
         let dense_before = store.dense.clone();
-        let missing_before = store.dense_missing;
+        let owner_count_before = store.dense_owner_count;
         let published_before = store.published;
         let mut zero = WorkMeter::new(0, 0);
         super::charge_warm_context_speculation(&store, store.hot[0], &mut zero, 0).unwrap();
@@ -27880,7 +28007,7 @@ mod tests {
         assert_eq!(store.slots, slots_before);
         assert_eq!(store.hot, hot_before);
         assert_eq!(store.dense, dense_before);
-        assert_eq!(store.dense_missing, missing_before);
+        assert_eq!(store.dense_owner_count, owner_count_before);
         assert_eq!(store.published, published_before);
         assert_eq!(store.retained_bytes().unwrap(), retained_bytes);
 
@@ -27905,7 +28032,7 @@ mod tests {
     }
 
     #[test]
-    fn contextual_dense_rows_decline_conflicts_misses_large_masks_and_owner_exhaustion() {
+    fn contextual_dense_rows_decline_conflicts_misses_large_masks_and_expand_past_four_owners() {
         let slots = super::contextual_transition_slots(5).unwrap();
 
         let mut conflict =
@@ -27962,32 +28089,64 @@ mod tests {
         assert_eq!(declined.dense, before);
         assert_eq!(declined.hot[0].dense_owner, super::CONTEXT_DENSE_NO_OWNER);
 
-        let mut exhausted =
+        let mut expanded =
             super::ContextTransitionStore::new(slots, 5, 1, usize::MAX).unwrap();
         for source in 0_u32..5 {
             publish_context_record(
-                &mut exhausted,
+                &mut expanded,
                 source,
                 super::contextual_class_symbol(0, 0),
                 source + 1,
             );
-            exhausted.hot[usize::try_from(source).unwrap()].dependency_mask = 0;
+            expanded.hot[usize::try_from(source).unwrap()].dependency_mask = 0;
+            let mut owner_meter = WorkMeter::new(u64::MAX, 0);
+            assert!(expanded
+                .try_claim_dense_owner(source, &mut owner_meter)
+                .unwrap());
+        }
+        assert_eq!(
+            expanded
+                .hot
+                .iter()
+                .map(|hot| hot.dense_owner)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4]
+        );
+        assert_eq!(expanded.dense_owner_count, 5);
+    }
+
+    #[test]
+    fn contextual_dense_full_alphabet_preserves_four_owner_ceiling() {
+        // A full 256-class alphabet still has the legacy four-row capacity,
+        // proving that adaptation never exceeds the fixed 16 KiB arena.
+        let slots = super::contextual_transition_slots(5).unwrap();
+        let mut full_alphabet =
+            super::ContextTransitionStore::new(slots, 5, 256, usize::MAX).unwrap();
+        for source in 0_u32..5 {
+            publish_context_record(
+                &mut full_alphabet,
+                source,
+                super::contextual_class_symbol(0, 0),
+                source + 11,
+            );
+            full_alphabet.hot[usize::try_from(source).unwrap()].dependency_mask = 0;
             let mut owner_meter = WorkMeter::new(u64::MAX, 0);
             assert_eq!(
-                exhausted
+                full_alphabet
                     .try_claim_dense_owner(source, &mut owner_meter)
                     .unwrap(),
-                source < u32::try_from(super::CONTEXT_DENSE_OWNER_LIMIT).unwrap()
+                source < 4
             );
         }
         assert_eq!(
-            exhausted
+            full_alphabet
                 .hot
                 .iter()
                 .map(|hot| hot.dense_owner)
                 .collect::<Vec<_>>(),
             vec![0, 1, 2, 3, super::CONTEXT_DENSE_NO_OWNER]
         );
+        assert_eq!(full_alphabet.dense_owner_count, 4);
     }
 
     #[test]
@@ -28126,7 +28285,7 @@ mod tests {
             ));
 
             let mut incomplete = hot;
-            incomplete.dense_complete = 0;
+            incomplete.dense_missing = 1;
             assert_eq!(
                 store
                     .lookup_complete_dense_with_hot_prevalidated(
@@ -29732,6 +29891,7 @@ mod tests {
         assert_eq!(workspace.lazy.context.hot.len(), 3);
         let contextual_dense_cells = super::contextual_dense_cells(
             contextual.byte_classes().count(),
+            workspace.lazy.context.hot.len(),
         )
         .unwrap();
         assert_eq!(workspace.lazy.context.dense.len(), contextual_dense_cells);
@@ -29770,7 +29930,11 @@ mod tests {
         assert_eq!(workspace.lazy.context.slots.len(), 8_192);
         assert_eq!(
             workspace.lazy.context.dense.len(),
-            super::contextual_dense_cells(three_classes.byte_classes().count()).unwrap()
+            super::contextual_dense_cells(
+                three_classes.byte_classes().count(),
+                workspace.lazy.context.hot.len(),
+            )
+            .unwrap()
         );
         assert_eq!(workspace.reverse.context.slots.len(), 4_096);
         assert_eq!(workspace.reverse.context.hot.len(), 16);
@@ -45007,7 +45171,7 @@ mod tests {
             let slots = session.workspace.lazy.context.slots.clone();
             let hot = session.workspace.lazy.context.hot.clone();
             let dense = session.workspace.lazy.context.dense.clone();
-            let dense_missing = session.workspace.lazy.context.dense_missing;
+            let dense_owner_count = session.workspace.lazy.context.dense_owner_count;
             let hot_initial = session.workspace.lazy.context.hot_initial;
             let published = session.workspace.lazy.context.published;
             let proof = plan.start_filter_proof.get().unwrap();
@@ -45026,7 +45190,10 @@ mod tests {
             assert_eq!(session.workspace.lazy.context.slots, slots);
             assert_eq!(session.workspace.lazy.context.hot, hot);
             assert_eq!(session.workspace.lazy.context.dense, dense);
-            assert_eq!(session.workspace.lazy.context.dense_missing, dense_missing);
+            assert_eq!(
+                session.workspace.lazy.context.dense_owner_count,
+                dense_owner_count
+            );
             assert_eq!(session.workspace.lazy.context.hot_initial, hot_initial);
             assert_eq!(session.workspace.lazy.context.published, published);
         }
