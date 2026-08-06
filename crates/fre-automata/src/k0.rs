@@ -342,6 +342,7 @@ const RAW_BOUNDARY_ENABLED_BY_PAIR_CLASS: [u32; 256] = {
     }
     table
 };
+const RAW_BOUNDARY_ENABLED_UNPREPARED: u32 = u32::MAX;
 const UNICODE_BOUNDARY_CLASS_UNPREPARED: u8 = u8::MAX;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -20041,15 +20042,18 @@ fn enabled_assertion_mask_unmetered_for_dependencies(
 
 /// One full-haystack boundary observation shared by dependency projections.
 ///
-/// Raw byte-derived properties are immutable after construction. Unicode word
-/// classification stays unprepared until a requested dependency needs it, and
-/// a broader raw-key retry reuses the same adjacent-scalar result.
+/// Raw byte-derived properties and Unicode word classification each stay
+/// unprepared until a requested dependency needs that family. A broader
+/// raw-key retry computes each observation at most once and reuses it.
 struct PreparedBoundaryObservation<'h> {
     haystack: &'h [u8],
     position: usize,
+    line_terminator: u8,
     raw_enabled: u32,
     global_dependencies: u32,
     unicode_class: u8,
+    #[cfg(test)]
+    raw_preparations: u8,
     #[cfg(test)]
     unicode_classifications: u8,
 }
@@ -20063,26 +20067,42 @@ impl<'h> PreparedBoundaryObservation<'h> {
         global_dependencies: u32,
     ) -> Self {
         debug_assert!(position <= haystack.len());
-        let classifier = BoundaryContextClassifier::new(global_dependencies);
-        let raw_dependencies = global_dependencies & !classifier.unicode_word();
-        let raw_enabled = if raw_dependencies == 0 {
-            0
-        } else {
-            let before = position
+        Self {
+            haystack,
+            position,
+            line_terminator,
+            raw_enabled: RAW_BOUNDARY_ENABLED_UNPREPARED,
+            global_dependencies,
+            unicode_class: UNICODE_BOUNDARY_CLASS_UNPREPARED,
+            #[cfg(test)]
+            raw_preparations: 0,
+            #[cfg(test)]
+            unicode_classifications: 0,
+        }
+    }
+
+    #[inline]
+    fn prepare_raw(&mut self) -> u32 {
+        if self.raw_enabled == RAW_BOUNDARY_ENABLED_UNPREPARED {
+            let before = self
+                .position
                 .checked_sub(1)
-                .and_then(|index| haystack.get(index))
+                .and_then(|index| self.haystack.get(index))
                 .copied();
-            let after = haystack.get(position).copied();
-            let absolute = binary_boundary_class(position == 0, position == haystack.len());
+            let after = self.haystack.get(self.position).copied();
+            let absolute = binary_boundary_class(
+                self.position == 0,
+                self.position == self.haystack.len(),
+            );
             let configured_line = binary_boundary_class(
-                position == 0 || before == Some(line_terminator),
-                position == haystack.len() || after == Some(line_terminator),
+                self.position == 0 || before == Some(self.line_terminator),
+                self.position == self.haystack.len() || after == Some(self.line_terminator),
             );
             let crlf_line = binary_boundary_class(
-                position == 0
+                self.position == 0
                     || before == Some(b'\n')
                     || before == Some(b'\r') && after != Some(b'\n'),
-                position == haystack.len()
+                self.position == self.haystack.len()
                     || after == Some(b'\r')
                     || after == Some(b'\n') && before != Some(b'\r'),
             );
@@ -20094,24 +20114,31 @@ impl<'h> PreparedBoundaryObservation<'h> {
                 | (configured_line << 2)
                 | (crlf_line << 4)
                 | (ascii_word << 6);
-            RAW_BOUNDARY_ENABLED_BY_PAIR_CLASS[packed] & raw_dependencies
-        };
-        Self {
-            haystack,
-            position,
-            raw_enabled,
-            global_dependencies,
-            unicode_class: UNICODE_BOUNDARY_CLASS_UNPREPARED,
+            let unicode_dependencies =
+                BoundaryContextClassifier::new(self.global_dependencies).unicode_word();
+            let raw_dependencies = self.global_dependencies & !unicode_dependencies;
+            self.raw_enabled = RAW_BOUNDARY_ENABLED_BY_PAIR_CLASS[packed] & raw_dependencies;
             #[cfg(test)]
-            unicode_classifications: 0,
+            {
+                self.raw_preparations = self
+                    .raw_preparations
+                    .checked_add(1)
+                    .expect("test raw boundary preparation count remains bounded");
+            }
         }
+        self.raw_enabled
     }
 
     #[inline]
     fn project(&mut self, dependencies: u32) -> u32 {
         debug_assert_eq!(dependencies & !self.global_dependencies, 0);
         let unicode_dependencies = BoundaryContextClassifier::new(dependencies).unicode_word();
-        let mut enabled = self.raw_enabled & dependencies;
+        let raw_dependencies = dependencies & !unicode_dependencies;
+        let mut enabled = if raw_dependencies == 0 {
+            0
+        } else {
+            self.prepare_raw() & raw_dependencies
+        };
         if unicode_dependencies != 0 {
             let class = if self.unicode_class == UNICODE_BOUNDARY_CLASS_UNPREPARED {
                 let class = UnicodeLookMatcher::classify_prevalidated(self.haystack, self.position)
@@ -20132,6 +20159,11 @@ impl<'h> PreparedBoundaryObservation<'h> {
             enabled |= UNICODE_WORD_ENABLED_BY_CLASS[class] & unicode_dependencies;
         }
         enabled
+    }
+
+    #[cfg(test)]
+    fn raw_preparations(&self) -> u8 {
+        self.raw_preparations
     }
 
     #[cfg(test)]
@@ -21839,6 +21871,26 @@ mod tests {
                 ],
                 byte_starts: vec![u8::MIN, 0, 0, 0, 0, 0, 0],
                 byte_ends: vec![u8::MAX, 0, 0, 0, 0, 0, 0],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn contextual_unicode_word_loop_or_haystack_end() -> Automaton {
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![StateRole::Consume, StateRole::Split, StateRole::Accept],
+                edge_offsets: vec![0, 1, 3, 3],
+                edge_targets: vec![1, 0, 2],
+                edge_kinds: vec![
+                    EdgeKind::ByteRange,
+                    EdgeKind::AssertWordUnicode,
+                    EdgeKind::AssertHaystackEnd,
+                ],
+                byte_starts: vec![b'a', 0, 0],
+                byte_ends: vec![b'a', 0, 0],
             },
             CompileLimits::default(),
         )
@@ -36641,7 +36693,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_boundary_observation_classifies_unicode_only_once_when_requested() {
+    fn prepared_boundary_observation_prepares_only_requested_families_once() {
         let plan = every_assertion().with_line_terminator(b';');
         let global_dependencies = plan.boundary_context_classifier().assertions();
         let unicode_dependencies = plan.boundary_context_classifier().unicode_word();
@@ -36655,16 +36707,10 @@ mod tests {
             global_dependencies,
         );
 
+        assert_eq!(observation.raw_preparations(), 0);
         assert_eq!(observation.unicode_classifications(), 0);
-        assert_eq!(
-            observation.project(raw_dependencies),
-            super::enabled_assertion_mask_unmetered_for_dependencies(
-                &plan,
-                raw_dependencies,
-                haystack,
-                position,
-            )
-        );
+        assert_eq!(observation.project(0), 0);
+        assert_eq!(observation.raw_preparations(), 0);
         assert_eq!(observation.unicode_classifications(), 0);
         assert_eq!(
             observation.project(unicode_dependencies),
@@ -36675,6 +36721,29 @@ mod tests {
                 position,
             )
         );
+        assert_eq!(observation.raw_preparations(), 0);
+        assert_eq!(observation.unicode_classifications(), 1);
+        assert_eq!(
+            observation.project(raw_dependencies),
+            super::enabled_assertion_mask_unmetered_for_dependencies(
+                &plan,
+                raw_dependencies,
+                haystack,
+                position,
+            )
+        );
+        assert_eq!(observation.raw_preparations(), 1);
+        assert_eq!(observation.unicode_classifications(), 1);
+        assert_eq!(
+            observation.project(raw_dependencies),
+            super::enabled_assertion_mask_unmetered_for_dependencies(
+                &plan,
+                raw_dependencies,
+                haystack,
+                position,
+            )
+        );
+        assert_eq!(observation.raw_preparations(), 1);
         assert_eq!(observation.unicode_classifications(), 1);
         assert_eq!(
             observation.project(global_dependencies),
@@ -36685,15 +36754,16 @@ mod tests {
                 position,
             )
         );
+        assert_eq!(observation.raw_preparations(), 1);
         assert_eq!(observation.unicode_classifications(), 1);
     }
 
     #[test]
     fn warm_dependency_projection_retries_raw_initial_and_transition_keys() {
-        let plan = full_byte_contextual_unicode_word_loop();
+        let plan = contextual_unicode_word_loop_or_haystack_end();
         let global_dependencies = plan.boundary_context_classifier().assertions();
         let dependencies = EdgeKind::AssertWordUnicode.assertion_bit().unwrap();
-        let haystack = b"a!";
+        let haystack = b"a";
         let position = 1;
         let mut observation = super::PreparedBoundaryObservation::new(
             plan.line_terminator(),
@@ -36702,8 +36772,11 @@ mod tests {
             global_dependencies,
         );
         let normalized_assertions = observation.project(dependencies);
+        assert_eq!(observation.raw_preparations(), 0);
+        assert_eq!(observation.unicode_classifications(), 1);
         let exact_assertions = observation.project(global_dependencies);
         assert_ne!(normalized_assertions, exact_assertions);
+        assert_eq!(observation.raw_preparations(), 1);
         assert_eq!(observation.unicode_classifications(), 1);
 
         let mut workspace =
