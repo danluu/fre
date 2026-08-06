@@ -185,7 +185,6 @@ const LAZY_CELL_STATE_MASK: u32 = LAZY_CELL_START_PROPAGATE - 1;
 const _: () = assert!(DIRECT_LAZY_MAX_STATES * BYTE_ALPHABET <= (1_usize << 29).saturating_sub(1));
 const LAZY_CELL_UNFILLED: u32 = u32::MAX;
 const LAZY_NO_STATE: u32 = u32::MAX;
-#[cfg(test)]
 const ASSERTION_KIND_COUNT: usize = 18;
 // Contextual transition identity retains the immutable global byte class,
 // not the raw source byte. ByteClasses proves that every member takes the
@@ -324,6 +323,111 @@ const UNICODE_WORD_ENABLED_BY_CLASS: [u32; 9] = [
     (1 << 12) | (1 << 14) | (1 << 16),
     1 << 13,
 ];
+const CONTEXT_DENSE_REALIZABLE_PAIR_COUNT: usize =
+    ASSERTION_KIND_COUNT * ASSERTION_KIND_COUNT;
+
+const fn contextual_assertion_family(ordinal: usize) -> u8 {
+    match ordinal {
+        0..=1 => 0,
+        2..=3 => 1,
+        4..=5 => 2,
+        6..=11 => 3,
+        12..=17 => 4,
+        _ => u8::MAX,
+    }
+}
+
+const fn contextual_dense_pair_variant_bit(enabled: u32, first: u32, second: u32) -> u8 {
+    let first_enabled = if enabled & first != 0 { 1 } else { 0 };
+    let second_enabled = if enabled & second != 0 { 1 } else { 0 };
+    1_u8 << (first_enabled | (second_enabled << 1))
+}
+
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "the const-table cursors are bounded by fixed canonical assertion arrays"
+)]
+const fn contextual_dense_pair_variants(first_ordinal: usize, second_ordinal: usize) -> u8 {
+    if first_ordinal == second_ordinal {
+        return 0b0011;
+    }
+    let family = contextual_assertion_family(first_ordinal);
+    if family == u8::MAX || family != contextual_assertion_family(second_ordinal) {
+        return 0b1111;
+    }
+    let first = 1_u32 << first_ordinal;
+    let second = 1_u32 << second_ordinal;
+    let mut variants = 0_u8;
+    let mut class = 0usize;
+    match family {
+        0 => {
+            // A byte-consuming transition cannot be both at absolute start
+            // and absolute end. Interior, start-only and end-only remain.
+            let enabled = [0, 1 << 0, 1 << 1];
+            while class < enabled.len() {
+                variants |= contextual_dense_pair_variant_bit(enabled[class], first, second);
+                class += 1;
+            }
+        }
+        1 => {
+            while class < CONFIGURED_LINE_ENABLED_BY_CLASS.len() {
+                variants |= contextual_dense_pair_variant_bit(
+                    CONFIGURED_LINE_ENABLED_BY_CLASS[class],
+                    first,
+                    second,
+                );
+                class += 1;
+            }
+        }
+        2 => {
+            while class < CRLF_LINE_ENABLED_BY_CLASS.len() {
+                variants |= contextual_dense_pair_variant_bit(
+                    CRLF_LINE_ENABLED_BY_CLASS[class],
+                    first,
+                    second,
+                );
+                class += 1;
+            }
+        }
+        3 => {
+            while class < ASCII_WORD_ENABLED_BY_CLASS.len() {
+                variants |= contextual_dense_pair_variant_bit(
+                    ASCII_WORD_ENABLED_BY_CLASS[class],
+                    first,
+                    second,
+                );
+                class += 1;
+            }
+        }
+        4 => {
+            while class < UNICODE_WORD_ENABLED_BY_CLASS.len() {
+                variants |= contextual_dense_pair_variant_bit(
+                    UNICODE_WORD_ENABLED_BY_CLASS[class],
+                    first,
+                    second,
+                );
+                class += 1;
+            }
+        }
+        _ => return 0b1111,
+    }
+    variants
+}
+
+const CONTEXT_DENSE_REALIZABLE_VARIANTS_BY_PAIR: [u8; CONTEXT_DENSE_REALIZABLE_PAIR_COUNT] = {
+    let mut table = [0_u8; CONTEXT_DENSE_REALIZABLE_PAIR_COUNT];
+    let mut first = 0usize;
+    while first < ASSERTION_KIND_COUNT {
+        let mut second = 0usize;
+        while second < ASSERTION_KIND_COUNT {
+            table[first * ASSERTION_KIND_COUNT + second] =
+                contextual_dense_pair_variants(first, second);
+            second += 1;
+        }
+        first += 1;
+    }
+    table
+};
 
 // Pack the four byte-local boundary-family pair classes into one byte. The
 // observation path pays the neighboring-byte classification once, then every
@@ -731,6 +835,11 @@ impl ContextTransitionStore {
                 detail: "contextual state transition uses the initial symbol class",
             });
         };
+        if !contextual_dense_symbol_is_realizable(record.symbol, hot.dependency_mask)? {
+            return Err(SearchError::InternalInvariant {
+                detail: "contextual dense publication has an impossible assertion product",
+            });
+        }
         let owner_stride = contextual_dense_owner_cells(class_count)?;
         let dense_index = owner
             .checked_mul(owner_stride)
@@ -867,6 +976,11 @@ impl ContextTransitionStore {
                     detail: "contextual state transition uses the initial symbol class",
                 });
             };
+            if !contextual_dense_symbol_is_realizable(record.symbol, dependencies)? {
+                return Err(SearchError::InternalInvariant {
+                    detail: "contextual dense snapshot has an impossible assertion product",
+                });
+            }
             let retained = planned.get_mut(relative).ok_or(
                 SearchError::InternalInvariant {
                     detail: "contextual dense plan index is outside its stack buffer",
@@ -1143,10 +1257,10 @@ fn contextual_dense_owner_cells(class_count: usize) -> Result<usize, SearchError
         })
 }
 
-/// Complete rows deliberately require the full class-by-dependency product.
-/// Some graph/source boundaries cannot realize every combination; retaining
-/// those missing cells is conservative and can delay, but never forge, the
-/// completion certificate.
+/// Complete rows require every class-by-realizable-dependency product.
+/// Correlations are taken only from the canonical assertion-family truth
+/// tables; dependencies in different families remain conservatively
+/// independent.
 fn contextual_dense_required_cells(
     class_count: usize,
     dependencies: u32,
@@ -1156,11 +1270,12 @@ fn contextual_dense_required_cells(
             detail: "contextual dense dependency mask exceeds two bits",
         });
     }
-    let variants = 1_usize
-        .checked_shl(dependencies.count_ones())
-        .ok_or(SearchError::ArithmeticOverflow {
-            computation: "contextual dense required variants",
-        })?;
+    let variants = usize::try_from(
+        contextual_dense_realizable_variants(dependencies)?.count_ones(),
+    )
+    .map_err(|_| SearchError::ArithmeticOverflow {
+        computation: "contextual dense required variants conversion",
+    })?;
     let owner_cells = contextual_dense_owner_cells(class_count)?;
     class_count
         .checked_mul(variants)
@@ -1168,6 +1283,87 @@ fn contextual_dense_required_cells(
         .ok_or(SearchError::ArithmeticOverflow {
             computation: "contextual dense required cells",
         })
+}
+
+/// Return the normalized variants that can occur at a byte-consuming
+/// transition boundary for one at-most-two-bit dependency set.
+///
+/// Assertions in different boundary families are conservatively independent.
+/// Assertions in one family are correlated by that family's canonical truth
+/// table: for example, an ASCII word boundary and its negation cannot both be
+/// enabled, while word-start and word-end cannot both hold at one boundary.
+/// The absolute family additionally excludes simultaneous haystack start and
+/// end because both forward and reverse contextual transitions consume an
+/// existing byte. Initial closures use the associative store and never own a
+/// dense row.
+fn contextual_dense_realizable_variants(dependencies: u32) -> Result<u8, SearchError> {
+    let assertion_domain = (1_u32 << ASSERTION_KIND_COUNT) - 1;
+    if dependencies & !assertion_domain != 0 {
+        return Err(SearchError::InternalInvariant {
+            detail: "contextual dense dependency is outside the assertion domain",
+        });
+    }
+    let dependency_count = dependencies.count_ones();
+    if dependency_count > 2 {
+        return Err(SearchError::InternalInvariant {
+            detail: "contextual dense dependency mask exceeds two bits",
+        });
+    }
+    if dependency_count == 0 {
+        return Ok(0b0001);
+    }
+    if dependency_count == 1 {
+        // Every individual assertion can be both enabled and disabled across
+        // the union of forward and reverse consuming boundaries.
+        return Ok(0b0011);
+    }
+    let first = usize::try_from(dependencies.trailing_zeros()).map_err(|_| {
+        SearchError::InternalInvariant {
+            detail: "contextual dense first dependency does not fit usize",
+        }
+    })?;
+    let remaining = dependencies & dependencies.wrapping_sub(1);
+    let second = usize::try_from(remaining.trailing_zeros()).map_err(|_| {
+        SearchError::InternalInvariant {
+            detail: "contextual dense second dependency does not fit usize",
+        }
+    })?;
+    if first >= ASSERTION_KIND_COUNT || second >= ASSERTION_KIND_COUNT {
+        return Err(SearchError::InternalInvariant {
+            detail: "contextual dense dependency is outside the assertion domain",
+        });
+    }
+    let index = first
+        .checked_mul(ASSERTION_KIND_COUNT)
+        .and_then(|begin| begin.checked_add(second))
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "contextual dense dependency-pair index",
+        })?;
+    CONTEXT_DENSE_REALIZABLE_VARIANTS_BY_PAIR
+        .get(index)
+        .copied()
+        .filter(|&variants| variants != 0)
+        .ok_or(SearchError::InternalInvariant {
+            detail: "contextual dense dependency mask has no realizable variant",
+        })
+}
+
+fn contextual_dense_symbol_is_realizable(
+    symbol: u32,
+    dependencies: u32,
+) -> Result<bool, SearchError> {
+    let assertions = symbol >> CONTEXT_SYMBOL_CLASS_BITS;
+    let variant = contextual_dense_variant(assertions, dependencies)?;
+    let bit = 1_u8
+        .checked_shl(
+            u32::try_from(variant).map_err(|_| SearchError::InternalInvariant {
+                detail: "contextual dense variant does not fit u32",
+            })?,
+        )
+        .ok_or(SearchError::InternalInvariant {
+            detail: "contextual dense variant exceeds its four-bit mask",
+        })?;
+    Ok(contextual_dense_realizable_variants(dependencies)? & bit != 0)
 }
 
 fn contextual_dense_cells(class_count: usize) -> Result<usize, SearchError> {
@@ -25196,6 +25392,189 @@ mod tests {
                 0,
             );
         }
+    }
+
+    #[test]
+    fn contextual_dense_required_variants_follow_canonical_family_truth_tables() {
+        assert_eq!(
+            super::contextual_dense_realizable_variants(0).unwrap(),
+            0b0001
+        );
+        assert_eq!(
+            super::contextual_dense_realizable_variants(1 << 6).unwrap(),
+            0b0011,
+        );
+        assert_eq!(
+            super::contextual_dense_realizable_variants((1 << 0) | (1 << 1)).unwrap(),
+            0b0111,
+        );
+        assert_eq!(
+            super::contextual_dense_realizable_variants((1 << 2) | (1 << 3)).unwrap(),
+            0b1111,
+        );
+        assert_eq!(
+            super::contextual_dense_realizable_variants((1 << 6) | (1 << 7)).unwrap(),
+            0b0110,
+        );
+        assert_eq!(
+            super::contextual_dense_realizable_variants((1 << 8) | (1 << 9)).unwrap(),
+            0b0111,
+        );
+        assert_eq!(
+            super::contextual_dense_realizable_variants((1 << 10) | (1 << 11)).unwrap(),
+            0b1111,
+        );
+        assert_eq!(
+            super::contextual_dense_realizable_variants((1 << 12) | (1 << 13)).unwrap(),
+            0b0111,
+        );
+        assert_eq!(
+            super::contextual_dense_realizable_variants((1 << 2) | (1 << 7)).unwrap(),
+            0b1111,
+        );
+        assert!(matches!(
+            super::contextual_dense_realizable_variants((1 << 2) | (1 << 7) | (1 << 12)),
+            Err(SearchError::InternalInvariant {
+                detail: "contextual dense dependency mask exceeds two bits"
+            })
+        ));
+        assert!(matches!(
+            super::contextual_dense_realizable_variants(1 << super::ASSERTION_KIND_COUNT),
+            Err(SearchError::InternalInvariant {
+                detail: "contextual dense dependency is outside the assertion domain"
+            })
+        ));
+    }
+
+    #[test]
+    fn contextual_dense_realizable_variants_cover_every_sampled_consuming_boundary() {
+        let haystacks = [
+            vec![0],
+            vec![b'\r', b'\n'],
+            vec![b'\n', b'\n'],
+            vec![b';'],
+            b"a_!".to_vec(),
+            "é_β!".as_bytes().to_vec(),
+            vec![0xf0, 0x28, 0x8c, 0xbc],
+            vec![0x80, b'a', 0xc3],
+        ];
+        let all_dependencies = (1_u32 << super::ASSERTION_KIND_COUNT) - 1;
+        let classifier = crate::plan::BoundaryContextClassifier::new(all_dependencies);
+
+        for line_terminator in [b'\n', b';', 0xff] {
+            for haystack in &haystacks {
+                // The union of forward destinations and reverse sources is
+                // every boundary of a nonempty haystack. It excludes only the
+                // empty boundary where absolute start and end coincide.
+                for position in 0..=haystack.len() {
+                    let enabled = super::enabled_assertion_mask_unmetered_with_classifier(
+                        classifier,
+                        line_terminator,
+                        haystack,
+                        position,
+                    );
+                    for first in 0..super::ASSERTION_KIND_COUNT {
+                        for second in first + 1..super::ASSERTION_KIND_COUNT {
+                            let dependencies = (1_u32 << first) | (1_u32 << second);
+                            let variant = super::contextual_dense_variant(enabled, dependencies)
+                                .unwrap();
+                            let variant_bit = 1_u8 << u32::try_from(variant).unwrap();
+                            assert_ne!(
+                                super::contextual_dense_realizable_variants(dependencies).unwrap()
+                                    & variant_bit,
+                                0,
+                                "missing variant: terminator={line_terminator:#04x} source={haystack:?} position={position} dependencies={dependencies:#07x}",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn contextual_dense_completion_excludes_impossible_boundary_negation_products() {
+        const BOUNDARY: u32 = 1 << 6;
+        const NEGATED: u32 = 1 << 7;
+        let dependencies = BOUNDARY | NEGATED;
+        let slots = super::contextual_transition_slots(4).unwrap();
+        let mut store = super::ContextTransitionStore::new(slots, 1, 2, usize::MAX).unwrap();
+
+        for (variant, assertions) in [(1_usize, BOUNDARY), (2, NEGATED)] {
+            for class in 0_u8..2 {
+                publish_context_record(
+                    &mut store,
+                    0,
+                    super::contextual_class_symbol(class, assertions),
+                    100 + u32::try_from(variant * 2 + usize::from(class)).unwrap(),
+                );
+            }
+        }
+        store.hot[0].dependency_mask = dependencies;
+        let mut claim = WorkMeter::new(u64::MAX, 0);
+        assert!(store.try_claim_dense_owner(0, &mut claim).unwrap());
+        assert_eq!(
+            super::contextual_dense_required_cells(2, dependencies).unwrap(),
+            4,
+        );
+        assert_eq!(store.dense_missing[0], 0);
+        assert!(store.dense_row_is_complete(store.hot[0]));
+
+        store.hot[0].symbol = u32::MAX;
+        store.slots.fill(ContextTransitionSlot::EMPTY);
+        for (variant, assertions) in [(1_usize, BOUNDARY), (2, NEGATED)] {
+            for class in 0_u8..2 {
+                assert_eq!(
+                    store
+                        .lookup_existing_prevalidated(
+                            0,
+                            super::contextual_class_symbol(class, assertions),
+                        )
+                        .unwrap(),
+                    Some(100 + u32::try_from(variant * 2 + usize::from(class)).unwrap()),
+                );
+            }
+        }
+        // These normalized products contradict the canonical assertion
+        // family. They remain physically uninitialized and therefore cannot
+        // silently fabricate a transition even if an internal caller forges
+        // one of their symbols.
+        for assertions in [0, dependencies] {
+            assert_eq!(
+                store
+                    .lookup_existing_prevalidated(
+                        0,
+                        super::contextual_class_symbol(0, assertions),
+                    )
+                    .unwrap(),
+                None,
+            );
+        }
+
+        let impossible = super::contextual_class_symbol(0, 0);
+        let mut lookup = WorkMeter::new(u64::MAX, 0);
+        let (_, slot) = store.lookup(0, impossible, &mut lookup, 17).unwrap();
+        let slots_before = store.slots.clone();
+        let hot_before = store.hot[0];
+        let dense_before = store.dense.clone();
+        let missing_before = store.dense_missing;
+        let mut publication = WorkMeter::new(u64::MAX, 0);
+        assert!(matches!(
+            store.publish(
+                slot,
+                ContextTransitionSlot::populated(0, impossible, 999),
+                &mut publication,
+                0,
+                17,
+            ),
+            Err(SearchError::InternalInvariant {
+                detail: "contextual dense publication has an impossible assertion product"
+            })
+        ));
+        assert_eq!(store.slots, slots_before);
+        assert_eq!(store.hot[0], hot_before);
+        assert_eq!(store.dense, dense_before);
+        assert_eq!(store.dense_missing, missing_before);
     }
 
     #[test]
