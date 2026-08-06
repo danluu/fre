@@ -23057,6 +23057,21 @@ fn expand_root<E: PikeBoundaryEvaluator>(
             detail: "assertion position exceeded original haystack",
         });
     }
+    if meter.limit == u64::MAX {
+        if let Some(program) = automaton
+            .epsilon_closure_dispatch
+            .as_ref()
+            .and_then(|dispatch| dispatch.program(root.state))
+        {
+            return expand_compiled_epsilon_root(
+                program,
+                position,
+                root.start,
+                workspace,
+                meter,
+            );
+        }
+    }
     workspace.stack_len = 0;
     workspace.push_stack(root)?;
 
@@ -23087,6 +23102,89 @@ fn expand_root<E: PikeBoundaryEvaluator>(
         }
     }
     Ok(None)
+}
+
+/// Execute one canonically unfolded assertion-free priority closure.
+///
+/// The program contains the scalar stack's exact pop order. A shared-seen hit
+/// jumps over that occurrence's complete subtree, while an unseen Split bulk
+/// charges the entire edge-push run before its first child, matching scalar
+/// ordering. Finite meters never enter this path; the near-`u64::MAX` helper
+/// below still reproduces the scalar overflow receipt for unlimited calls.
+#[inline]
+fn expand_compiled_epsilon_root(
+    program: &[crate::epsilon_closure_dispatch::ClosureInstruction],
+    position: usize,
+    start: usize,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+) -> Result<Option<MatchSpan>, SearchError> {
+    workspace.stack_len = 0;
+    let mut instruction_index = 0usize;
+    while instruction_index < program.len() {
+        let instruction = program[instruction_index];
+        meter.charge(1, position)?;
+        let state = crate::plan::plan_index(instruction.state());
+        if workspace.seen_at[state] == workspace.generation {
+            let subtree_end = instruction.subtree_end();
+            if subtree_end <= instruction_index || subtree_end > program.len() {
+                return Err(SearchError::InternalInvariant {
+                    detail: "compiled epsilon closure has an invalid subtree end",
+                });
+            }
+            instruction_index = subtree_end;
+            continue;
+        }
+        workspace.seen_at[state] = workspace.generation;
+
+        match instruction.action() {
+            crate::epsilon_closure_dispatch::ClosureAction::Accept => {
+                return Ok(Some(MatchSpan::new(start, position)));
+            }
+            crate::epsilon_closure_dispatch::ClosureAction::Consume => {
+                workspace.push_current(Thread {
+                    state: instruction.state(),
+                    start,
+                })?;
+            }
+            crate::epsilon_closure_dispatch::ClosureAction::Split => {
+                charge_compiled_epsilon_edges(meter, instruction.edge_work(), position)?;
+            }
+            crate::epsilon_closure_dispatch::ClosureAction::SeenBackedge => {
+                return Err(SearchError::InternalInvariant {
+                    detail: "compiled epsilon backedge reached an unseen state",
+                });
+            }
+        }
+        instruction_index = instruction_index.checked_add(1).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "compiled epsilon instruction cursor",
+            },
+        )?;
+    }
+    Ok(None)
+}
+
+#[inline]
+fn charge_compiled_epsilon_edges(
+    meter: &mut WorkMeter,
+    requested: u32,
+    position: usize,
+) -> Result<(), SearchError> {
+    let requested = u64::from(requested);
+    let remaining = meter.remaining();
+    if requested <= remaining {
+        return meter.charge(requested, position);
+    }
+    // Scalar Pike charges and pushes one reverse edge at a time. Once this
+    // invocation is going to fail, stack contents are unobservable and the
+    // next invocation resets them; consume the identical successful prefix,
+    // then make the same one-unit failing request.
+    meter.charge(remaining, position)?;
+    meter.charge(1, position)?;
+    Err(SearchError::InternalInvariant {
+        detail: "compiled epsilon edge run exceeded its meter without an error",
+    })
 }
 
 #[cfg(test)]
@@ -24585,6 +24683,7 @@ mod tests {
         ROOT_RUN_SCANNER_SHAPE_MAX_WORK, WARM_EXISTS_INLINE_BYTES,
     };
     use crate::{
+        epsilon_closure_dispatch::EpsilonClosureDispatch,
         ordered_edge_dispatch::OrderedEdgeDispatch,
         plan::{
             ByteSet, StartFilterProof, StartFilterProofCell, StartPositionClass,
@@ -31778,6 +31877,405 @@ mod tests {
         .with_line_terminator(b';')
     }
 
+    fn compiled_epsilon_cycle_and_dag() -> Automaton {
+        // The initial closure has both a true ancestor backedge (4 -> 0) and
+        // a cross-DAG revisit (both 1 and 2 reach 4). Consuming states 3 and 5
+        // can enqueue the same split root 6 at one boundary, while 6 retains
+        // the greedy loop before its lower-priority Accept.
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![
+                    StateRole::Split,
+                    StateRole::Split,
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Accept,
+                ],
+                edge_offsets: vec![0, 2, 4, 6, 7, 9, 10, 12, 13, 13],
+                edge_targets: vec![1, 2, 3, 4, 4, 5, 6, 0, 7, 6, 3, 8, 8],
+                edge_kinds: vec![
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::ByteRange,
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::ByteRange,
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::ByteRange,
+                ],
+                byte_starts: vec![0, 0, 0, 0, 0, 0, b'a', 0, 0, b'a', 0, 0, b'b'],
+                byte_ends: vec![0, 0, 0, 0, 0, 0, b'a', 0, 0, b'a', 0, 0, b'b'],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn early_accept_with_shared_parent() -> Automaton {
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![
+                    StateRole::Split,
+                    StateRole::Accept,
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                ],
+                edge_offsets: vec![0, 2, 2, 4, 5, 6],
+                edge_targets: vec![1, 2, 0, 3, 1, 2],
+                edge_kinds: vec![
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                ],
+                byte_starts: vec![0, 0, 0, 0, b'a', b'b'],
+                byte_ends: vec![0, 0, 0, 0, b'a', b'b'],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn duplicate_target_closure(degree: usize) -> Automaton {
+        let degree_u32 = u32::try_from(degree).unwrap();
+        let final_edge = degree_u32.checked_add(1).unwrap();
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Accept,
+                ],
+                edge_offsets: vec![0, degree_u32, final_edge, final_edge],
+                edge_targets: core::iter::repeat(1)
+                    .take(degree)
+                    .chain(core::iter::once(2))
+                    .collect(),
+                edge_kinds: core::iter::repeat(EdgeKind::Epsilon)
+                    .take(degree)
+                    .chain(core::iter::once(EdgeKind::ByteRange))
+                    .collect(),
+                byte_starts: core::iter::repeat(0)
+                    .take(degree)
+                    .chain(core::iter::once(b'a'))
+                    .collect(),
+                byte_ends: core::iter::repeat(0)
+                    .take(degree)
+                    .chain(core::iter::once(b'a'))
+                    .collect(),
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn compiled_epsilon_closure_resets_early_accept_stack_and_handles_duplicate_rows() {
+        fn run_two_roots(
+            automaton: &Automaton,
+        ) -> (
+            Option<MatchSpan>,
+            Option<MatchSpan>,
+            u64,
+            usize,
+            usize,
+            Vec<(u32, usize)>,
+        ) {
+            let mut workspace =
+                K0Workspace::new(automaton, WorkspaceLimits::unlimited()).unwrap();
+            workspace.generation = 1;
+            let mut meter = WorkMeter::new(u64::MAX, 0);
+            let mut evaluator = super::AssertionFreePikeBoundary;
+            let first = super::expand_root(
+                automaton,
+                b"",
+                0,
+                &mut evaluator,
+                super::Thread { state: 0, start: 7 },
+                &mut workspace,
+                &mut meter,
+            )
+            .unwrap();
+            let pending_stack = workspace.stack_len;
+            let second = super::expand_root(
+                automaton,
+                b"",
+                0,
+                &mut evaluator,
+                super::Thread { state: 2, start: 11 },
+                &mut workspace,
+                &mut meter,
+            )
+            .unwrap();
+            (
+                first,
+                second,
+                meter.consumed,
+                pending_stack,
+                workspace.stack_len,
+                workspace.current[..workspace.current_len]
+                    .iter()
+                    .map(|thread| (thread.state, thread.start))
+                    .collect(),
+            )
+        }
+
+        let scalar = early_accept_with_shared_parent();
+        let mut compiled = early_accept_with_shared_parent();
+        assert!(compiled.try_enable_epsilon_closure_dispatch().unwrap());
+        let scalar_run = run_two_roots(&scalar);
+        let compiled_run = run_two_roots(&compiled);
+        assert_eq!(scalar_run.0, Some(MatchSpan::new(7, 0)));
+        assert_eq!(scalar_run.1, None);
+        assert_eq!(compiled_run.0, scalar_run.0);
+        assert_eq!(compiled_run.1, scalar_run.1);
+        assert_eq!(compiled_run.2, scalar_run.2);
+        assert_eq!(scalar_run.3, 1, "scalar Accept leaves its lower sibling pushed");
+        assert_eq!(compiled_run.3, 0, "compiled closure has no physical stack");
+        assert_eq!(scalar_run.4, 0, "the next root drains its fresh stack");
+        assert_eq!(compiled_run.4, 0);
+        assert_eq!(
+            scalar_run.5,
+            vec![(3, 11)]
+        );
+        assert_eq!(compiled_run.5, scalar_run.5);
+
+        const DEGREE: usize = 64;
+        let duplicate_scalar = duplicate_target_closure(DEGREE);
+        let mut duplicate_compiled = duplicate_target_closure(DEGREE);
+        assert!(duplicate_compiled
+            .try_enable_epsilon_closure_dispatch()
+            .unwrap());
+        assert_eq!(
+            duplicate_scalar.workspace_layout().unwrap().closure_slots(),
+            DEGREE + 1
+        );
+        for automaton in [&duplicate_scalar, &duplicate_compiled] {
+            let mut workspace =
+                K0Workspace::new(automaton, WorkspaceLimits::unlimited()).unwrap();
+            workspace.generation = 1;
+            let mut meter = WorkMeter::new(u64::MAX, 0);
+            let mut evaluator = super::AssertionFreePikeBoundary;
+            assert_eq!(
+                super::expand_root(
+                    automaton,
+                    b"a",
+                    0,
+                    &mut evaluator,
+                    super::Thread { state: 0, start: 19 },
+                    &mut workspace,
+                    &mut meter,
+                )
+                .unwrap(),
+                None
+            );
+            assert_eq!(workspace.current_len, 1);
+            assert_eq!(workspace.current[0].state, 1);
+            assert_eq!(workspace.current[0].start, 19);
+            assert_eq!(meter.consumed, u64::try_from(DEGREE * 2 + 1).unwrap());
+            assert_eq!(workspace.stack_len, 0);
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "all output contracts, exact-start routing, finite limits, and near-overflow recovery share one closure differential"
+    )]
+    fn compiled_epsilon_closure_is_a_full_pike_differential() {
+        let scalar = compiled_epsilon_cycle_and_dag();
+        let mut compiled = compiled_epsilon_cycle_and_dag();
+        assert!(compiled.try_enable_epsilon_closure_dispatch().unwrap());
+        assert!(compiled.has_epsilon_closure_dispatch());
+        pin_without_start_filter(&scalar);
+        pin_without_start_filter(&compiled);
+
+        let haystacks = bounded_words(&[b'a', b'b', b'c', 0xff], 3);
+        macro_rules! compare_route {
+            ($operation:ty, $haystack:expr, $window:expr) => {{
+                let mut scalar_workspace =
+                    K0Workspace::new(&scalar, WorkspaceLimits::unlimited()).unwrap();
+                let mut compiled_workspace =
+                    K0Workspace::new(&compiled, WorkspaceLimits::unlimited()).unwrap();
+                let expected = scalar
+                    .prepare::<$operation>()
+                    .search_window_with_workspace(
+                        $haystack,
+                        $window,
+                        &mut scalar_workspace,
+                        SearchLimits::unlimited(),
+                    )
+                    .unwrap();
+                let actual = compiled
+                    .prepare::<$operation>()
+                    .search_window_with_workspace(
+                        $haystack,
+                        $window,
+                        &mut compiled_workspace,
+                        SearchLimits::unlimited(),
+                    )
+                    .unwrap();
+                assert_eq!(actual.output(), expected.output());
+                assert_eq!(actual.accounting(), expected.accounting());
+
+                let exact_expected = scalar
+                    .prepare::<$operation>()
+                    .search_prevalidated_exact_start_with_authenticated_workspace(
+                        $haystack,
+                        $window,
+                        &mut scalar_workspace,
+                        SearchLimits::unlimited(),
+                    )
+                    .unwrap();
+                let exact_actual = compiled
+                    .prepare::<$operation>()
+                    .search_prevalidated_exact_start_with_authenticated_workspace(
+                        $haystack,
+                        $window,
+                        &mut compiled_workspace,
+                        SearchLimits::unlimited(),
+                    )
+                    .unwrap();
+                assert_eq!(exact_actual.output(), exact_expected.output());
+                assert_eq!(exact_actual.accounting(), exact_expected.accounting());
+            }};
+        }
+        for haystack in &haystacks {
+            for start in 0..=haystack.len() {
+                for end in start..=haystack.len() {
+                    let window = SearchWindow::new(start, end);
+                    compare_route!(Exists, haystack, window);
+                    compare_route!(EarliestEnd, haystack, window);
+                    compare_route!(SelectedEnd, haystack, window);
+                    compare_route!(Span, haystack, window);
+                }
+            }
+        }
+
+        let haystack = b"aaab";
+        let window = SearchWindow::full(haystack);
+        let mut measured_workspace =
+            K0Workspace::new(&compiled, WorkspaceLimits::unlimited()).unwrap();
+        let measured = compiled
+            .prepare::<Span>()
+            .search_window_with_workspace(
+                haystack,
+                window,
+                &mut measured_workspace,
+                SearchLimits::unlimited(),
+            )
+            .unwrap();
+        let exact_work = measured.accounting().work();
+        let expected_output = *measured.output();
+        for limit in [exact_work, exact_work.checked_sub(1).unwrap()] {
+            let mut scalar_workspace =
+                K0Workspace::new(&scalar, WorkspaceLimits::unlimited()).unwrap();
+            let mut compiled_workspace =
+                K0Workspace::new(&compiled, WorkspaceLimits::unlimited()).unwrap();
+            let limits = SearchLimits {
+                max_work: limit,
+                max_scratch_bytes: usize::MAX,
+            };
+            let expected = scalar.prepare::<Span>().search_window_with_workspace(
+                haystack,
+                window,
+                &mut scalar_workspace,
+                limits,
+            );
+            let actual = compiled.prepare::<Span>().search_window_with_workspace(
+                haystack,
+                window,
+                &mut compiled_workspace,
+                limits,
+            );
+            assert_eq!(actual, expected);
+            if limit == exact_work {
+                assert_eq!(*actual.unwrap().output(), expected_output);
+            } else {
+                assert!(matches!(actual, Err(SearchError::WorkLimitExceeded { .. })));
+            }
+        }
+
+        fn root_run(
+            automaton: &Automaton,
+            consumed: u64,
+        ) -> (Result<Option<MatchSpan>, SearchError>, u64, K0Workspace) {
+            let mut workspace =
+                K0Workspace::new(automaton, WorkspaceLimits::unlimited()).unwrap();
+            workspace.generation = 1;
+            let mut meter = WorkMeter::new(u64::MAX, consumed);
+            let mut evaluator = super::AssertionFreePikeBoundary;
+            let result = super::expand_root(
+                automaton,
+                b"a",
+                0,
+                &mut evaluator,
+                super::Thread { state: 0, start: 0 },
+                &mut workspace,
+                &mut meter,
+            );
+            (result, meter.consumed, workspace)
+        }
+
+        let (baseline, root_work, _) = root_run(&scalar, 0);
+        assert_eq!(baseline, Ok(None));
+        let (scalar_exact, scalar_exact_total, _) =
+            root_run(&scalar, u64::MAX.checked_sub(root_work).unwrap());
+        let (compiled_exact, compiled_exact_total, _) =
+            root_run(&compiled, u64::MAX.checked_sub(root_work).unwrap());
+        assert_eq!(compiled_exact, scalar_exact);
+        assert_eq!(compiled_exact_total, scalar_exact_total);
+        assert_eq!(compiled_exact_total, u64::MAX);
+
+        let refused_base = u64::MAX
+            .checked_sub(root_work.checked_sub(1).unwrap())
+            .unwrap();
+        let (scalar_refused, scalar_refused_total, _) = root_run(&scalar, refused_base);
+        let (compiled_refused, compiled_refused_total, mut failed_workspace) =
+            root_run(&compiled, refused_base);
+        assert_eq!(compiled_refused, scalar_refused);
+        assert_eq!(compiled_refused_total, scalar_refused_total);
+        assert_eq!(compiled_refused_total, u64::MAX);
+
+        // A failed bulk edge charge leaves no externally visible partial
+        // stack. The ordinary invocation reset and next generation must make
+        // the same workspace fully reusable.
+        let recovered = compiled
+            .prepare::<Span>()
+            .search_with_workspace(
+                b"a",
+                &mut failed_workspace,
+                SearchLimits::unlimited(),
+            )
+            .unwrap();
+        let mut fresh_workspace =
+            K0Workspace::new(&compiled, WorkspaceLimits::unlimited()).unwrap();
+        let fresh = compiled
+            .prepare::<Span>()
+            .search_with_workspace(
+                b"a",
+                &mut fresh_workspace,
+                SearchLimits::unlimited(),
+            )
+            .unwrap();
+        assert_eq!(recovered, fresh);
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "ordinary, cached, contextual, all-output, and finite ledgers share one differential"
@@ -36960,6 +37458,11 @@ mod tests {
     #[test]
     fn start_filter_owner_layout_is_pointer_isolated() {
         assert_eq!(
+            size_of::<Option<EpsilonClosureDispatch>>(),
+            size_of::<usize>(),
+            "the epsilon-closure dispatch owner must remain one optional pointer"
+        );
+        assert_eq!(
             size_of::<Option<OrderedEdgeDispatch>>(),
             size_of::<usize>(),
             "the ordered-edge dispatch owner must remain one optional pointer"
@@ -36979,7 +37482,7 @@ mod tests {
             assert!(
                 size_of::<Automaton>()
                     <= 192
-                        + size_of::<usize>()
+                        + size_of::<usize>() * 2
                         + Automaton::BYTE_CLASS_MAP_RETAINED_BYTES
             );
         }
@@ -36990,7 +37493,7 @@ mod tests {
         ))]
         {
             assert_eq!(size_of::<StartFilterProofCell>(), 16);
-            assert_eq!(size_of::<Automaton>(), 448 + size_of::<usize>());
+            assert_eq!(size_of::<Automaton>(), 448 + size_of::<usize>() * 2);
             #[cfg(feature = "static-dispatch")]
             assert_eq!(size_of::<StartFilterProof>(), 192);
             #[cfg(not(feature = "static-dispatch"))]

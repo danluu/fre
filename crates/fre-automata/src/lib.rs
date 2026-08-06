@@ -17,6 +17,7 @@
 #![forbid(unsafe_code)]
 
 mod contract;
+mod epsilon_closure_dispatch;
 mod error;
 mod k0;
 mod k0_root_corridor;
@@ -33,6 +34,7 @@ pub use contract::{
     EarliestEnd, Exists, MatchSpan, Operation, OutputContract, SearchAccounting, SearchReport,
     SelectedEnd, SetupAccounting, Span, TypedPlan,
 };
+pub use epsilon_closure_dispatch::EpsilonClosureDispatchAllocationError;
 pub use error::{CompileError, MalformedPlan, ResourceKind, SearchError};
 pub use k0::{
     K0DynamicRootProjection, K0PositiveEndLimits, K0PositiveEndOutcome, K0PositiveEndReceipt,

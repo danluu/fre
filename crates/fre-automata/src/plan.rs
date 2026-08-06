@@ -11,8 +11,10 @@ use fre_simd_kernels::{
 
 use crate::{CompileError, MalformedPlan, Operation, ResourceKind, TypedPlan, WorkspaceLayout};
 use crate::{
+    EpsilonClosureDispatchAllocationError,
     OrderedEdgeDispatchAllocationError, ordered_edge_dispatch::OrderedEdgeDispatch,
 };
+use crate::epsilon_closure_dispatch::EpsilonClosureDispatch;
 
 static NEXT_AUTOMATON_IDENTITY: AtomicU64 = AtomicU64::new(1);
 
@@ -855,6 +857,7 @@ pub struct Automaton {
     pub(crate) byte_starts: Box<[u8]>,
     pub(crate) byte_ends: Box<[u8]>,
     byte_classes: ByteClasses,
+    pub(crate) epsilon_closure_dispatch: Option<EpsilonClosureDispatch>,
     pub(crate) ordered_edge_dispatch: Option<OrderedEdgeDispatch>,
     pub(crate) start_filter_proof: StartFilterProofCell,
     line_terminator: u8,
@@ -873,6 +876,7 @@ impl Clone for Automaton {
             byte_starts: self.byte_starts.clone(),
             byte_ends: self.byte_ends.clone(),
             byte_classes: self.byte_classes,
+            epsilon_closure_dispatch: self.epsilon_closure_dispatch.clone(),
             ordered_edge_dispatch: self.ordered_edge_dispatch.clone(),
             // A clone is a new immutable plan construction. Do not silently
             // copy first-use specialization that this instance has not paid
@@ -918,6 +922,7 @@ impl Automaton {
             byte_starts: raw.byte_starts.into_boxed_slice(),
             byte_ends: raw.byte_ends.into_boxed_slice(),
             byte_classes,
+            epsilon_closure_dispatch: None,
             ordered_edge_dispatch: None,
             start_filter_proof: StartFilterProofCell::new(),
             line_terminator: b'\n',
@@ -952,6 +957,42 @@ impl Automaton {
     /// Exact bounded alphabet partition derived from validated byte ranges.
     pub(crate) const fn byte_classes(&self) -> &ByteClasses {
         &self.byte_classes
+    }
+
+    /// Derive canonical priority-DFS programs for profitable assertion-free
+    /// boundary closures.
+    ///
+    /// Qualification depends only on the validated graph and fixed compiler
+    /// ceilings. `Ok(false)` means no closure qualified (or a fixed ceiling
+    /// was reached). Allocation begins only after exact dimensions have been
+    /// derived, and the sidecar is canonically reconstructible from the graph.
+    ///
+    /// # Errors
+    ///
+    /// Returns the exact bounded allocation extent when a qualifying sidecar
+    /// could not be retained.
+    pub fn try_enable_epsilon_closure_dispatch(
+        &mut self,
+    ) -> Result<bool, EpsilonClosureDispatchAllocationError> {
+        if self.epsilon_closure_dispatch.is_some() {
+            return Ok(true);
+        }
+        self.epsilon_closure_dispatch = EpsilonClosureDispatch::derive(self)?;
+        Ok(self.epsilon_closure_dispatch.is_some())
+    }
+
+    /// Whether this immutable graph owns canonical Pike closure programs.
+    #[must_use]
+    pub const fn has_epsilon_closure_dispatch(&self) -> bool {
+        self.epsilon_closure_dispatch.is_some()
+    }
+
+    /// Retained immutable bytes in the optional Pike closure programs.
+    #[must_use]
+    pub fn epsilon_closure_dispatch_retained_bytes(&self) -> usize {
+        self.epsilon_closure_dispatch
+            .as_ref()
+            .map_or(0, EpsilonClosureDispatch::retained_bytes)
     }
 
     /// Derive the canonical priority-preserving dispatch for profitable wide

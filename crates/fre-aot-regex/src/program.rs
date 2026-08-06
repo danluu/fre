@@ -40,13 +40,14 @@ const PROGRAM_FORMAT_VERSION_V3: u32 = 3;
 const PROGRAM_FORMAT_VERSION_V4: u32 = 4;
 const PROGRAM_FORMAT_VERSION_V5: u32 = 5;
 // V4 remains the canonical format for Fast programs and optimizing programs
-// without the graph-derived ordered-edge sidecar.
+// without either canonically rederived graph-dispatch sidecar.
 const PROGRAM_FORMAT_VERSION: u32 = PROGRAM_FORMAT_VERSION_V4;
 const PROGRAM_FLAG_NFA_MANDATORY_SUFFIX: u8 = 1 << 0;
 const PROGRAM_FLAG_NFA_MANDATORY_CUT: u8 = 1 << 1;
 const PROGRAM_FLAG_NFA_EXACT_PRODUCT: u8 = 1 << 2;
 const PROGRAM_FLAG_NFA_PARTIAL_DFA: u8 = 1 << 3;
 const PROGRAM_FLAG_NFA_ORDERED_EDGE_DISPATCH: u8 = 1 << 4;
+const PROGRAM_FLAG_NFA_EPSILON_CLOSURE_DISPATCH: u8 = 1 << 5;
 const PROGRAM_V3_KNOWN_FLAGS: u8 = PROGRAM_FLAG_NFA_MANDATORY_SUFFIX
     | PROGRAM_FLAG_NFA_MANDATORY_CUT
     | PROGRAM_FLAG_NFA_EXACT_PRODUCT;
@@ -54,8 +55,9 @@ const PROGRAM_KNOWN_FLAGS: u8 = PROGRAM_FLAG_NFA_MANDATORY_SUFFIX
     | PROGRAM_FLAG_NFA_MANDATORY_CUT
     | PROGRAM_FLAG_NFA_EXACT_PRODUCT
     | PROGRAM_FLAG_NFA_PARTIAL_DFA;
-const PROGRAM_V5_KNOWN_FLAGS: u8 =
-    PROGRAM_KNOWN_FLAGS | PROGRAM_FLAG_NFA_ORDERED_EDGE_DISPATCH;
+const PROGRAM_V5_GRAPH_DISPATCH_FLAGS: u8 = PROGRAM_FLAG_NFA_ORDERED_EDGE_DISPATCH
+    | PROGRAM_FLAG_NFA_EPSILON_CLOSURE_DISPATCH;
+const PROGRAM_V5_KNOWN_FLAGS: u8 = PROGRAM_KNOWN_FLAGS | PROGRAM_V5_GRAPH_DISPATCH_FLAGS;
 const DEFAULT_LINE_TERMINATOR: u8 = b'\n';
 
 static NEXT_PROGRAM_INSTANCE_IDENTITY: AtomicU64 = AtomicU64::new(1);
@@ -3027,19 +3029,31 @@ impl CompiledProgram {
                 ),
             },
         };
-        let retains_ordered_edge_dispatch =
+        let retains_graph_dispatches =
             mode == CompileMode::Optimizing && matches!(engine, ProgramEngine::OrderedNfa);
-        if !retains_ordered_edge_dispatch && automaton.has_ordered_edge_dispatch() {
+        if !retains_graph_dispatches && automaton.has_ordered_edge_dispatch() {
             return Err(CompileError::InternalInvariant(
                 "ordered-edge dispatch was preattached to an ineligible engine",
             ));
         }
-        if retains_ordered_edge_dispatch {
+        if !retains_graph_dispatches && automaton.has_epsilon_closure_dispatch() {
+            return Err(CompileError::InternalInvariant(
+                "epsilon-closure dispatch was preattached to an ineligible engine",
+            ));
+        }
+        if retains_graph_dispatches {
             automaton
                 .try_enable_ordered_edge_dispatch()
                 .map_err(|_| {
                     CompileError::InternalInvariant(
                         "ordered-edge dispatch allocation failed",
+                    )
+                })?;
+            automaton
+                .try_enable_epsilon_closure_dispatch()
+                .map_err(|_| {
+                    CompileError::InternalInvariant(
+                        "epsilon-closure dispatch allocation failed",
                     )
                 })?;
         }
@@ -3177,11 +3191,16 @@ impl CompiledProgram {
         if self.automaton.has_ordered_edge_dispatch() {
             flags |= PROGRAM_FLAG_NFA_ORDERED_EDGE_DISPATCH;
         }
+        if self.automaton.has_epsilon_closure_dispatch() {
+            flags |= PROGRAM_FLAG_NFA_EPSILON_CLOSURE_DISPATCH;
+        }
         flags
     }
 
     const fn program_format_version(&self) -> u32 {
-        if self.automaton.has_ordered_edge_dispatch() {
+        if self.automaton.has_ordered_edge_dispatch()
+            || self.automaton.has_epsilon_closure_dispatch()
+        {
             PROGRAM_FORMAT_VERSION_V5
         } else {
             PROGRAM_FORMAT_VERSION
@@ -5466,10 +5485,10 @@ impl CompiledProgram {
         header_line_terminator(header, version)?;
         let flags = header_program_flags(header, version)?;
         if version == PROGRAM_FORMAT_VERSION_V5
-            && flags & PROGRAM_FLAG_NFA_ORDERED_EDGE_DISPATCH == 0
+            && flags & PROGRAM_V5_GRAPH_DISPATCH_FLAGS == 0
         {
             return Err(ProgramFormatError::Malformed(
-                "V5 program has no ordered-edge dispatch marker",
+                "V5 program has no graph-dispatch marker",
             ));
         }
         let total = usize_from_u64(read_u64_at(header, 16)?, "program total length")?;
@@ -5517,6 +5536,8 @@ impl CompiledProgram {
         let exact_product_enabled = program_flags & PROGRAM_FLAG_NFA_EXACT_PRODUCT != 0;
         let ordered_edge_dispatch_enabled =
             program_flags & PROGRAM_FLAG_NFA_ORDERED_EDGE_DISPATCH != 0;
+        let epsilon_closure_dispatch_enabled =
+            program_flags & PROGRAM_FLAG_NFA_EPSILON_CLOSURE_DISPATCH != 0;
         if (mandatory_suffix_enabled || mandatory_cut_enabled || exact_product_enabled)
             && engine_kind != EngineKind::OrderedNfa
         {
@@ -5544,6 +5565,11 @@ impl CompiledProgram {
                 "ordered-edge dispatch flag requires an ordered-NFA engine",
             ));
         }
+        if epsilon_closure_dispatch_enabled && engine_kind != EngineKind::OrderedNfa {
+            return Err(ProgramFormatError::Malformed(
+                "epsilon-closure dispatch flag requires an ordered-NFA engine",
+            ));
+        }
         if exact_product_enabled && program_flags & PROGRAM_FLAG_NFA_PARTIAL_DFA != 0 {
             return Err(ProgramFormatError::Malformed(
                 "exact-product and partial-DFA flags are mutually exclusive",
@@ -5563,6 +5589,16 @@ impl CompiledProgram {
             if !derived {
                 return Err(ProgramFormatError::Malformed(
                     "ordered-edge dispatch marker is incompatible with the embedded graph",
+                ));
+            }
+        }
+        if epsilon_closure_dispatch_enabled {
+            let derived = automaton
+                .try_enable_epsilon_closure_dispatch()
+                .map_err(|_| ProgramFormatError::Allocation("epsilon-closure dispatch"))?;
+            if !derived {
+                return Err(ProgramFormatError::Malformed(
+                    "epsilon-closure dispatch marker is incompatible with the embedded graph",
                 ));
             }
         }
@@ -5649,6 +5685,7 @@ impl CompiledProgram {
             || mandatory_cut_enabled
             || program_flags & PROGRAM_FLAG_NFA_PARTIAL_DFA != 0
             || ordered_edge_dispatch_enabled
+            || epsilon_closure_dispatch_enabled
         {
             required_literals::derive(&raw)
         } else {
@@ -7867,7 +7904,15 @@ mod tests {
                 assert_eq!(product.primary_offset, expected, "{pattern}/{output:?}");
             }
             let serialized = accelerated.serialize().expect("serialize exact product");
-            assert_eq!(serialized[15], PROGRAM_FLAG_NFA_EXACT_PRODUCT);
+            let epsilon_flag = if accelerated.automaton.has_epsilon_closure_dispatch() {
+                PROGRAM_FLAG_NFA_EPSILON_CLOSURE_DISPATCH
+            } else {
+                0
+            };
+            assert_eq!(
+                serialized[15],
+                PROGRAM_FLAG_NFA_EXACT_PRODUCT | epsilon_flag
+            );
             let restored = CompiledProgram::deserialize(&serialized)
                 .expect("deserialize frontier exact product");
             assert_eq!(restored.serialize().unwrap(), serialized);
@@ -9206,9 +9251,14 @@ mod tests {
             let bytes = compiled.serialize().expect("serialize fallback");
             assert_eq!(
                 u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
-                PROGRAM_FORMAT_VERSION_V4
+                PROGRAM_FORMAT_VERSION_V5
             );
-            assert_eq!(bytes[15], PROGRAM_FLAG_NFA_MANDATORY_SUFFIX);
+            assert!(compiled.automaton.has_epsilon_closure_dispatch());
+            assert_eq!(
+                bytes[15],
+                PROGRAM_FLAG_NFA_MANDATORY_SUFFIX
+                    | PROGRAM_FLAG_NFA_EPSILON_CLOSURE_DISPATCH
+            );
             let restored = CompiledProgram::deserialize(&bytes).expect("restore fallback");
             assert_eq!(restored.engine_kind(), EngineKind::OrderedNfa);
             assert!(restored.nfa_mandatory_suffix.is_some());
@@ -9499,7 +9549,12 @@ mod tests {
             assert!(!cut.has_member(b"cut-free window"));
 
             let bytes = compiled.serialize().expect("serialize cut fallback");
-            assert_eq!(bytes[15], PROGRAM_FLAG_NFA_MANDATORY_CUT);
+            assert!(compiled.automaton.has_epsilon_closure_dispatch());
+            assert_eq!(
+                bytes[15],
+                PROGRAM_FLAG_NFA_MANDATORY_CUT
+                    | PROGRAM_FLAG_NFA_EPSILON_CLOSURE_DISPATCH
+            );
             let restored = CompiledProgram::deserialize(&bytes).expect("restore cut fallback");
             assert!(restored.nfa_mandatory_suffix.is_none());
             assert!(restored.nfa_mandatory_cut.is_some());
@@ -10325,7 +10380,12 @@ mod tests {
             assert_eq!(accelerator.maximum_width, None);
 
             let bytes = compiled.serialize().expect("serialize fallback");
-            assert_eq!(bytes[15], PROGRAM_FLAG_NFA_MANDATORY_SUFFIX);
+            assert!(compiled.automaton.has_epsilon_closure_dispatch());
+            assert_eq!(
+                bytes[15],
+                PROGRAM_FLAG_NFA_MANDATORY_SUFFIX
+                    | PROGRAM_FLAG_NFA_EPSILON_CLOSURE_DISPATCH
+            );
             let restored = CompiledProgram::deserialize(&bytes).expect("restore fallback");
             assert!(restored.nfa_mandatory_suffix.is_some());
             assert_eq!(
@@ -11264,9 +11324,13 @@ mod tests {
             let bytes = partial.serialize().expect("serialize partial DFA");
             assert_eq!(
                 u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
-                PROGRAM_FORMAT_VERSION_V4
+                PROGRAM_FORMAT_VERSION_V5
             );
             assert_ne!(bytes[15] & PROGRAM_FLAG_NFA_PARTIAL_DFA, 0);
+            assert_ne!(
+                bytes[15] & PROGRAM_FLAG_NFA_EPSILON_CLOSURE_DISPATCH,
+                0
+            );
             let restored = CompiledProgram::deserialize(&bytes).expect("restore partial DFA");
             assert!(restored.partial_dfa().is_some());
             assert_eq!(restored.serialize().unwrap(), bytes);
@@ -14447,6 +14511,42 @@ mod tests {
         }
     }
 
+    fn epsilon_dispatch_wire_graph() -> RawPlan {
+        RawPlan {
+            start: 0,
+            roles: vec![
+                StateRole::Split,
+                StateRole::Split,
+                StateRole::Split,
+                StateRole::Consume,
+                StateRole::Split,
+                StateRole::Consume,
+                StateRole::Split,
+                StateRole::Consume,
+                StateRole::Accept,
+            ],
+            edge_offsets: vec![0, 2, 4, 6, 7, 9, 10, 12, 13, 13],
+            edge_targets: vec![1, 2, 3, 4, 4, 5, 6, 0, 7, 6, 3, 8, 8],
+            edge_kinds: vec![
+                EdgeKind::Epsilon,
+                EdgeKind::Epsilon,
+                EdgeKind::Epsilon,
+                EdgeKind::Epsilon,
+                EdgeKind::Epsilon,
+                EdgeKind::Epsilon,
+                EdgeKind::ByteRange,
+                EdgeKind::Epsilon,
+                EdgeKind::Epsilon,
+                EdgeKind::ByteRange,
+                EdgeKind::Epsilon,
+                EdgeKind::Epsilon,
+                EdgeKind::ByteRange,
+            ],
+            byte_starts: vec![0, 0, 0, 0, 0, 0, b'a', 0, 0, b'a', 0, 0, b'b'],
+            byte_ends: vec![0, 0, 0, 0, 0, 0, b'a', 0, 0, b'a', 0, 0, b'b'],
+        }
+    }
+
     fn with_ordered_dispatch_dead_branch(mut raw: RawPlan) -> RawPlan {
         let old_start = raw.start;
         let wide = u32::try_from(raw.roles.len()).unwrap();
@@ -14484,6 +14584,179 @@ mod tests {
     #[test]
     #[allow(
         clippy::too_many_lines,
+        reason = "V5 strictness, canonical rederivation, all outputs, clone, and ineligible-engine rejection share one wire matrix"
+    )]
+    fn epsilon_closure_dispatch_v5_is_canonical_strict_and_general() {
+        let raw = epsilon_dispatch_wire_graph();
+        let fallback_limits = DeterminizeLimits {
+            max_states: 0,
+            ..DeterminizeLimits::default()
+        };
+        let haystacks = generated_byte_strings(&[b'a', b'b', b'c', 0xff], 3);
+
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let optimized = raw_program(&raw, output, CompileMode::Optimizing, fallback_limits);
+            assert_eq!(optimized.engine_kind(), EngineKind::OrderedNfa);
+            assert!(optimized.automaton.has_epsilon_closure_dispatch());
+            assert!(!optimized.automaton.has_ordered_edge_dispatch());
+            let retained = optimized
+                .automaton
+                .epsilon_closure_dispatch_retained_bytes();
+            assert!(retained > 0);
+            assert!(retained <= optimized.automaton.stats().storage_bytes() * 2);
+
+            let bytes = optimized.serialize().unwrap();
+            assert_eq!(
+                u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+                PROGRAM_FORMAT_VERSION_V5
+            );
+            assert_ne!(
+                bytes[15] & PROGRAM_FLAG_NFA_EPSILON_CLOSURE_DISPATCH,
+                0
+            );
+            let restored = CompiledProgram::deserialize(&bytes).unwrap();
+            assert!(restored.automaton.has_epsilon_closure_dispatch());
+            assert_eq!(
+                restored
+                    .automaton
+                    .epsilon_closure_dispatch_retained_bytes(),
+                retained
+            );
+            assert_eq!(restored.serialize().unwrap(), bytes);
+            let cloned = restored.clone();
+            assert!(cloned.automaton.has_epsilon_closure_dispatch());
+            assert_eq!(cloned.serialize().unwrap(), bytes);
+
+            let reference = raw_program(
+                &raw,
+                output,
+                CompileMode::Fast,
+                DeterminizeLimits::default(),
+            );
+            assert!(!reference.automaton.has_epsilon_closure_dispatch());
+            for haystack in &haystacks {
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let window = SearchWindow::new(start, end);
+                        assert_eq!(
+                            restored.search(haystack, window).unwrap(),
+                            reference.search(haystack, window).unwrap(),
+                            "output={output:?}, source={haystack:?}, window={window:?}"
+                        );
+                    }
+                }
+            }
+        }
+
+        let optimized = raw_program(
+            &raw,
+            OutputContract::Span,
+            CompileMode::Optimizing,
+            fallback_limits,
+        );
+        let bytes = optimized.serialize().unwrap();
+        let mut missing_marker = bytes.clone();
+        missing_marker[15] &= !PROGRAM_FLAG_NFA_EPSILON_CLOSURE_DISPATCH;
+        assert!(matches!(
+            CompiledProgram::deserialize(&missing_marker),
+            Err(ProgramFormatError::Malformed(
+                "V5 program has no graph-dispatch marker"
+            ))
+        ));
+
+        let mut legacy_with_marker = bytes.clone();
+        legacy_with_marker[8..12].copy_from_slice(&PROGRAM_FORMAT_VERSION_V4.to_le_bytes());
+        assert!(CompiledProgram::deserialize(&legacy_with_marker).is_err());
+
+        let mut wrong_engine = bytes.clone();
+        wrong_engine[12] = EngineKind::OrderedDfa.tag();
+        assert!(CompiledProgram::deserialize(&wrong_engine).is_err());
+
+        let literal = program(
+            "a",
+            OutputContract::Span,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        let mut incompatible = literal.serialize().unwrap();
+        incompatible[8..12].copy_from_slice(&PROGRAM_FORMAT_VERSION_V5.to_le_bytes());
+        incompatible[15] |= PROGRAM_FLAG_NFA_EPSILON_CLOSURE_DISPATCH;
+        assert!(matches!(
+            CompiledProgram::deserialize(&incompatible),
+            Err(ProgramFormatError::Malformed(
+                "epsilon-closure dispatch marker is incompatible with the embedded graph"
+            ))
+        ));
+
+        let mut preattached = Automaton::from_raw(raw.clone(), CompileLimits::default()).unwrap();
+        assert!(preattached
+            .try_enable_epsilon_closure_dispatch()
+            .unwrap());
+        assert!(matches!(
+            CompiledProgram::build(
+                raw.clone(),
+                preattached.clone(),
+                OutputContract::Span,
+                CompileMode::Fast,
+                DeterminizeLimits::default(),
+                usize::MAX,
+            ),
+            Err(CompileError::InternalInvariant(
+                "epsilon-closure dispatch was preattached to an ineligible engine"
+            ))
+        ));
+        assert!(matches!(
+            CompiledProgram::build(
+                raw,
+                preattached,
+                OutputContract::Span,
+                CompileMode::Optimizing,
+                DeterminizeLimits::default(),
+                usize::MAX,
+            ),
+            Err(CompileError::InternalInvariant(
+                "epsilon-closure dispatch was preattached to an ineligible engine"
+            ))
+        ));
+
+        let both_raw = with_ordered_dispatch_dead_branch(epsilon_dispatch_wire_graph());
+        let both = raw_program(
+            &both_raw,
+            OutputContract::Span,
+            CompileMode::Optimizing,
+            fallback_limits,
+        );
+        assert!(both.automaton.has_epsilon_closure_dispatch());
+        assert!(both.automaton.has_ordered_edge_dispatch());
+        let both_bytes = both.serialize().unwrap();
+        assert_eq!(
+            both_bytes[15] & PROGRAM_V5_GRAPH_DISPATCH_FLAGS,
+            PROGRAM_V5_GRAPH_DISPATCH_FLAGS
+        );
+        let both_restored = CompiledProgram::deserialize(&both_bytes).unwrap();
+        assert!(both_restored.automaton.has_epsilon_closure_dispatch());
+        assert!(both_restored.automaton.has_ordered_edge_dispatch());
+        assert_eq!(both_restored.serialize().unwrap(), both_bytes);
+
+        // V5 existed before the epsilon marker. An old ordered-only V5 body
+        // remains byte-identical even when its graph would qualify for the new
+        // sidecar: wire markers, never local optimizer availability, govern
+        // canonical reconstruction.
+        let mut old_v5 = both_bytes;
+        old_v5[15] &= !PROGRAM_FLAG_NFA_EPSILON_CLOSURE_DISPATCH;
+        let old_restored = CompiledProgram::deserialize(&old_v5).unwrap();
+        assert!(old_restored.automaton.has_ordered_edge_dispatch());
+        assert!(!old_restored.automaton.has_epsilon_closure_dispatch());
+        assert_eq!(old_restored.serialize().unwrap(), old_v5);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
         reason = "V4 identity, V5 strictness, all outputs, clone, and partial coexistence share one wire matrix"
     )]
     fn ordered_edge_dispatch_v5_is_canonical_strict_and_all_output_general() {
@@ -14502,15 +14775,21 @@ mod tests {
             let optimized = raw_program(&raw, output, CompileMode::Optimizing, fallback_limits);
             assert_eq!(optimized.engine_kind(), EngineKind::OrderedNfa);
             assert!(optimized.automaton.has_ordered_edge_dispatch());
+            assert!(!optimized.automaton.has_epsilon_closure_dispatch());
             let bytes = optimized.serialize().unwrap();
             assert_eq!(
                 u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
                 PROGRAM_FORMAT_VERSION_V5
             );
             assert_ne!(bytes[15] & PROGRAM_FLAG_NFA_ORDERED_EDGE_DISPATCH, 0);
+            assert_eq!(
+                bytes[15] & PROGRAM_V5_GRAPH_DISPATCH_FLAGS,
+                PROGRAM_FLAG_NFA_ORDERED_EDGE_DISPATCH
+            );
 
             let restored = CompiledProgram::deserialize(&bytes).unwrap();
             assert!(restored.automaton.has_ordered_edge_dispatch());
+            assert!(!restored.automaton.has_epsilon_closure_dispatch());
             assert_eq!(restored.serialize().unwrap(), bytes);
             let cloned = restored.clone();
             assert!(cloned.automaton.has_ordered_edge_dispatch());
@@ -14798,7 +15077,7 @@ mod tests {
     }
 
     #[test]
-    fn v4_nfa_sidecar_flags_are_strict_versioned_and_engine_scoped() {
+    fn nfa_sidecar_flags_are_strict_versioned_and_engine_scoped() {
         let fallback = program(
             "(?:a|bb)q[xz]",
             OutputContract::Span,
@@ -14809,7 +15088,11 @@ mod tests {
             },
         );
         let bytes = fallback.serialize().unwrap();
-        assert_eq!(bytes[15], PROGRAM_FLAG_NFA_MANDATORY_SUFFIX);
+        assert_eq!(
+            bytes[15],
+            PROGRAM_FLAG_NFA_MANDATORY_SUFFIX
+                | PROGRAM_FLAG_NFA_EPSILON_CLOSURE_DISPATCH
+        );
 
         let mut unknown = bytes.clone();
         unknown[15] |= 1 << 7;
@@ -14825,15 +15108,25 @@ mod tests {
             },
         );
         let cut_bytes = cut.serialize().unwrap();
-        assert_eq!(cut_bytes[15], PROGRAM_FLAG_NFA_MANDATORY_CUT);
+        assert_eq!(
+            cut_bytes[15],
+            PROGRAM_FLAG_NFA_MANDATORY_CUT
+                | PROGRAM_FLAG_NFA_EPSILON_CLOSURE_DISPATCH
+        );
         assert!(CompiledProgram::deserialize(&cut_bytes).is_ok());
 
         let mut contradictory = cut_bytes.clone();
-        contradictory[15] = PROGRAM_FLAG_NFA_MANDATORY_SUFFIX | PROGRAM_FLAG_NFA_MANDATORY_CUT;
+        contradictory[15] = PROGRAM_FLAG_NFA_MANDATORY_SUFFIX
+            | PROGRAM_FLAG_NFA_MANDATORY_CUT
+            | PROGRAM_FLAG_NFA_EPSILON_CLOSURE_DISPATCH;
         assert!(CompiledProgram::deserialize(&contradictory).is_err());
-        contradictory[15] = PROGRAM_FLAG_NFA_MANDATORY_SUFFIX | PROGRAM_FLAG_NFA_EXACT_PRODUCT;
+        contradictory[15] = PROGRAM_FLAG_NFA_MANDATORY_SUFFIX
+            | PROGRAM_FLAG_NFA_EXACT_PRODUCT
+            | PROGRAM_FLAG_NFA_EPSILON_CLOSURE_DISPATCH;
         assert!(CompiledProgram::deserialize(&contradictory).is_err());
-        contradictory[15] = PROGRAM_FLAG_NFA_MANDATORY_CUT | PROGRAM_FLAG_NFA_EXACT_PRODUCT;
+        contradictory[15] = PROGRAM_FLAG_NFA_MANDATORY_CUT
+            | PROGRAM_FLAG_NFA_EXACT_PRODUCT
+            | PROGRAM_FLAG_NFA_EPSILON_CLOSURE_DISPATCH;
         assert!(CompiledProgram::deserialize(&contradictory).is_err());
 
         let mut incompatible = program(
@@ -14859,7 +15152,11 @@ mod tests {
             },
         );
         let unbounded_bytes = unbounded.serialize().unwrap();
-        assert_eq!(unbounded_bytes[15], PROGRAM_FLAG_NFA_MANDATORY_SUFFIX);
+        assert_eq!(
+            unbounded_bytes[15],
+            PROGRAM_FLAG_NFA_MANDATORY_SUFFIX
+                | PROGRAM_FLAG_NFA_EPSILON_CLOSURE_DISPATCH
+        );
         assert!(CompiledProgram::deserialize(&unbounded_bytes).is_ok());
 
         let mut legacy_v3_partial = bytes;
