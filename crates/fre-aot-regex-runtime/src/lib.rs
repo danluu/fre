@@ -2423,21 +2423,20 @@ mod tests {
         ] {
             assert!(C_API_V1_HEADER.contains(symbol), "{symbol}");
         }
-        assert!(!C_API_V1_HEADER.contains(
-            "fre_aot_regex_runtime_search_exclusive_from_partial_preflight_v1"
-        ));
-        assert!(!C_API_V1_HEADER.contains(
-            "fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v1"
-        ));
-        assert!(!C_API_V1_HEADER.contains(
-            "fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v2"
-        ));
-        assert!(!C_API_V1_HEADER.contains(
-            "fre_aot_regex_runtime_search_exclusive_dynamic_rows_preflight_v1"
-        ));
-        assert!(!C_API_V1_HEADER.contains(
-            "fre_aot_regex_runtime_search_exclusive_dynamic_rows_deopt_v1"
-        ));
+        for private_fragment in [
+            "fre_aot_regex_runtime_search_exclusive_from_partial_preflight_v1",
+            "fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v1",
+            "fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v2",
+            "fre_aot_regex_runtime_search_exclusive_dynamic_rows_preflight_v1",
+            "fre_aot_regex_runtime_search_exclusive_dynamic_rows_deopt_v1",
+            "native_rows_address",
+            "cache_generation",
+        ] {
+            assert!(
+                !C_API_V1_HEADER.contains(private_fragment),
+                "private ABI fragment leaked into the public header: {private_fragment}"
+            );
+        }
 
         let _: unsafe extern "C" fn(*const u8, usize, *mut FreAotRegexPreparedHandleV1) -> u32 =
             fre_aot_regex_runtime_prepare_v1;
@@ -2657,7 +2656,7 @@ mod tests {
     }
 
     #[test]
-    fn exclusive_dynamic_rows_preflight_is_generation_bound_and_exact() {
+    fn exclusive_dynamic_rows_preflight_exposes_identity_bound_pointer_provenance() {
         let compiled = compile(
             CompileRequest::new("(?:ab|ac)+z", Target::x86_64_linux())
                 .mode(CompileMode::Fast)
@@ -2728,6 +2727,27 @@ mod tests {
         assert_ne!(descriptor.rows_address, 0);
         assert_ne!(descriptor.class_map_address, 0);
         assert_eq!(descriptor.initial_flags, 0);
+        // SAFETY: all three addresses were explicitly exposed by the same live
+        // prepared workspace, and no helper call or re-entry has ended this
+        // exclusive preflight transaction.
+        let class_map = unsafe {
+            &*std::ptr::with_exposed_provenance::<[u8; 256]>(descriptor.class_map_address)
+        };
+        // SAFETY: the authenticated descriptor bounds this fixed-capacity row
+        // prefix, and the exclusive transaction prevents concurrent mutation.
+        let rows = unsafe {
+            std::slice::from_raw_parts(
+                std::ptr::with_exposed_provenance::<u32>(descriptor.rows_address),
+                descriptor.live_cells,
+            )
+        };
+        let first_class = class_map[usize::from(haystack[start])];
+        let first_cell = usize::try_from(descriptor.initial_row)
+            .unwrap()
+            .checked_add(usize::from(first_class))
+            .unwrap();
+        assert!(first_cell < rows.len());
+        assert_ne!(rows[first_cell], descriptor.unfilled_cell);
 
         // A genuine generated side exit uses its dedicated helper, which
         // records deopt feedback before canonical K0 completes.

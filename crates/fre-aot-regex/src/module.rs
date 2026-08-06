@@ -20307,6 +20307,58 @@ mod tests {
         }
     }
 
+    #[test]
+    fn fast_mode_publishes_general_dynamic_exists_entry_on_every_target() {
+        for target in identity_target_matrix() {
+            let compiled = compile(
+                CompileRequest::new("(?:ab|ac)+z", target)
+                    .mode(CompileMode::Fast)
+                    .output(OutputContract::Exists),
+            )
+            .unwrap_or_else(|error| panic!("fast dynamic rows {target:?}: {error}"));
+            assert_eq!(compiled.receipt().engine, EngineKind::OrderedNfa);
+            assert!(compiled.program().native_dfa_view().is_none());
+            assert!(compiled.program().native_partial_dfa_view().is_none());
+            assert!(compiled.program().native_dynamic_rows_view().is_some());
+            assert!(compiled.module().prepared_entry_symbol().is_some());
+            assert_eq!(
+                compiled
+                    .module()
+                    .required_prepared_preflight_runtime_symbol(),
+                Some(DYNAMIC_ROWS_PREFLIGHT_RUNTIME_SYMBOL_NAME),
+                "{target:?}"
+            );
+            assert_eq!(
+                compiled.module().required_prepared_fallback_runtime_symbol(),
+                Some(PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME),
+                "{target:?}"
+            );
+            assert_eq!(
+                compiled
+                    .module()
+                    .required_prepared_dynamic_rows_deopt_runtime_symbol(),
+                Some(DYNAMIC_ROWS_DEOPT_RUNTIME_SYMBOL_NAME),
+                "{target:?}"
+            );
+            for symbol in [
+                PREPARED_PREFLIGHT_RUNTIME_SYMBOL,
+                PREPARED_FALLBACK_RUNTIME_SYMBOL,
+                DYNAMIC_ROWS_DEOPT_RUNTIME_SYMBOL,
+            ] {
+                assert_eq!(
+                    compiled
+                        .module()
+                        .relocations()
+                        .iter()
+                        .filter(|relocation| relocation.symbol == symbol)
+                        .count(),
+                    1,
+                    "{target:?} symbol {symbol}"
+                );
+            }
+        }
+    }
+
     #[cfg(all(
         any(target_arch = "x86_64", target_arch = "aarch64"),
         any(target_os = "linux", target_os = "macos")

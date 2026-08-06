@@ -7279,7 +7279,7 @@ mod tests {
         let window = SearchWindow::new(0, haystack.len());
         let identity = compiled.artifact_identity();
 
-        let (cold, cold_address, cold_generation) = compiled
+        let (cold, cold_address, cold_cache_identity) = compiled
             .preflight_dynamic_native_rows_with_workspace(
                 &haystack,
                 window,
@@ -7291,11 +7291,11 @@ mod tests {
             cold,
             RetainedPartialPreflight::Complete(MatchResult::Exists(true))
         );
-        assert_eq!((cold_address, cold_generation), (0, 0));
+        assert_eq!((cold_address, cold_cache_identity), (0, 0));
         let dynamic = workspace.dynamic_native_rows.as_deref().unwrap();
         assert!(!dynamic.state.native_entry_in_flight);
 
-        let (warm, first_address, first_generation) = compiled
+        let (warm, first_address, first_cache_identity) = compiled
             .preflight_dynamic_native_rows_with_workspace(
                 &haystack,
                 window,
@@ -7305,16 +7305,16 @@ mod tests {
             .expect("warm dynamic preflight");
         assert_eq!(warm, RetainedPartialPreflight::Enter(window));
         assert_ne!(first_address, 0);
-        assert_ne!(first_generation, 0);
+        assert_ne!(first_cache_identity, 0);
         let dynamic = workspace.dynamic_native_rows.as_deref().unwrap();
         assert!(dynamic.state.native_entry_in_flight);
-        assert_eq!(dynamic.native_rows.cache_identity, first_generation);
+        assert_eq!(dynamic.native_rows.cache_identity, first_cache_identity);
         assert_eq!(dynamic.native_rows.initial_flags, 0);
 
         // No callback means the prior generated scan returned locally. The
         // next preflight settles it as success and republishes the same boxed
-        // descriptor and immutable workspace generation.
-        let (reentered, second_address, second_generation) = compiled
+        // descriptor and immutable workspace cache identity.
+        let (reentered, second_address, second_cache_identity) = compiled
             .preflight_dynamic_native_rows_with_workspace(
                 &haystack,
                 window,
@@ -7324,7 +7324,187 @@ mod tests {
             .expect("settled dynamic preflight");
         assert_eq!(reentered, RetainedPartialPreflight::Enter(window));
         assert_eq!(second_address, first_address);
-        assert_eq!(second_generation, first_generation);
+        assert_eq!(second_cache_identity, first_cache_identity);
+    }
+
+    #[test]
+    fn dynamic_native_rows_addresses_stay_stable_after_canonical_publication() {
+        let compiled = program(
+            "(?:ab|acd)+z",
+            OutputContract::Exists,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        let mut workspace = compiled.prepare_workspace().expect("prepared K0 workspace");
+        let mut warmed = vec![b'!'; 64];
+        for pair in warmed[..62].chunks_exact_mut(2) {
+            pair.copy_from_slice(b"ab");
+        }
+        warmed[62] = b'z';
+        let window = SearchWindow::full(&warmed);
+        let identity = compiled.artifact_identity();
+
+        let (cold, address, cache_identity) = compiled
+            .preflight_dynamic_native_rows_with_workspace(
+                &warmed,
+                window,
+                &mut workspace,
+                identity,
+            )
+            .expect("cold dynamic preflight");
+        assert_eq!(
+            cold,
+            RetainedPartialPreflight::Complete(MatchResult::Exists(true))
+        );
+        assert_eq!((address, cache_identity), (0, 0));
+
+        let (warm, descriptor_address, cache_identity) = compiled
+            .preflight_dynamic_native_rows_with_workspace(
+                &warmed,
+                window,
+                &mut workspace,
+                identity,
+            )
+            .expect("warm dynamic preflight");
+        assert_eq!(warm, RetainedPartialPreflight::Enter(window));
+        let before = workspace
+            .dynamic_native_rows
+            .as_deref()
+            .expect("dynamic descriptor workspace")
+            .native_rows;
+
+        compiled.settle_dynamic_native_rows_local_completion_with_workspace(&mut workspace);
+        let mut publishes_branch = vec![b'!'; 64];
+        publishes_branch[..4].copy_from_slice(b"acdz");
+        assert_eq!(
+            compiled
+                .search_optimized_with_workspace(
+                    &publishes_branch,
+                    SearchWindow::full(&publishes_branch),
+                    &mut workspace,
+                )
+                .expect("canonical publication search"),
+            MatchResult::Exists(true)
+        );
+
+        let (reentered, second_descriptor_address, second_cache_identity) = compiled
+            .preflight_dynamic_native_rows_with_workspace(
+                &warmed,
+                window,
+                &mut workspace,
+                identity,
+            )
+            .expect("post-publication dynamic preflight");
+        assert_eq!(reentered, RetainedPartialPreflight::Enter(window));
+        assert_eq!(second_descriptor_address, descriptor_address);
+        assert_eq!(second_cache_identity, cache_identity);
+        let after = workspace
+            .dynamic_native_rows
+            .as_deref()
+            .expect("refreshed dynamic descriptor workspace")
+            .native_rows;
+        assert_eq!(after.rows_address, before.rows_address);
+        assert_eq!(after.class_map_address, before.class_map_address);
+        assert!(
+            after.live_cells > before.live_cells,
+            "canonical K0 must retain the newly published branch state"
+        );
+    }
+
+    #[test]
+    fn dynamic_native_rows_decline_learned_loop_owned_cache() {
+        let raw = RawPlan {
+            start: 0,
+            roles: vec![StateRole::Consume, StateRole::Accept],
+            edge_offsets: vec![0, 2, 2],
+            edge_targets: vec![0, 1],
+            edge_kinds: vec![EdgeKind::ByteRange, EdgeKind::ByteRange],
+            byte_starts: vec![0, 1],
+            byte_ends: vec![0, 1],
+        };
+        let compiled = raw_program(
+            &raw,
+            OutputContract::Exists,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        let mut workspace = compiled.prepare_workspace().expect("prepared loop workspace");
+        let mut haystack = vec![0_u8; 1_057];
+        haystack[1_024] = 1;
+        let window = SearchWindow::full(&haystack);
+        let identity = compiled.artifact_identity();
+
+        let (cold, address, cache_identity) = compiled
+            .preflight_dynamic_native_rows_with_workspace(
+                &haystack,
+                window,
+                &mut workspace,
+                identity,
+            )
+            .expect("loop-learning preflight");
+        assert_eq!(
+            cold,
+            RetainedPartialPreflight::Complete(MatchResult::Exists(true))
+        );
+        assert_eq!((address, cache_identity), (0, 0));
+        let projection = workspace
+            .nfa
+            .as_ref()
+            .and_then(|nfa| nfa.dynamic_root_projection(&compiled.automaton))
+            .expect("warm loop-owned projection");
+        assert!(!projection.learned_loop_row_offsets().is_empty());
+
+        let (declined, address, cache_identity) = compiled
+            .preflight_dynamic_native_rows_with_workspace(
+                &haystack,
+                window,
+                &mut workspace,
+                identity,
+            )
+            .expect("loop-owned dynamic decline");
+        assert_eq!(
+            declined,
+            RetainedPartialPreflight::Complete(MatchResult::Exists(true))
+        );
+        assert_eq!((address, cache_identity), (0, 0));
+        let dynamic = workspace.dynamic_native_rows.as_deref().unwrap();
+        assert_eq!(dynamic.native_rows.rows_address, 0);
+        assert_eq!(dynamic.native_rows.class_map_address, 0);
+        assert!(!dynamic.state.native_entry_in_flight);
+    }
+
+    #[test]
+    fn dynamic_native_rows_reject_cross_program_workspace() {
+        let compiled = program(
+            "ab+z",
+            OutputContract::Exists,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        let foreign = program(
+            "ac+z",
+            OutputContract::Exists,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        let mut foreign_workspace = foreign
+            .prepare_workspace()
+            .expect("foreign prepared workspace");
+        let haystack = vec![b'a'; 64];
+        let error = compiled
+            .preflight_dynamic_native_rows_with_workspace(
+                &haystack,
+                SearchWindow::full(&haystack),
+                &mut foreign_workspace,
+                compiled.artifact_identity(),
+            )
+            .expect_err("cross-program workspace must be rejected");
+        assert!(matches!(
+            error,
+            CompileError::InternalInvariant(
+                "dynamic native-row workspace belongs to a different semantic program"
+            )
+        ));
     }
 
     #[test]
@@ -7341,7 +7521,7 @@ mod tests {
         let identity = compiled.artifact_identity();
 
         for phase in ["cold", "warm"] {
-            let (outcome, address, generation) = compiled
+            let (outcome, address, cache_identity) = compiled
                 .preflight_dynamic_native_rows_with_workspace(
                     &haystack,
                     window,
@@ -7354,7 +7534,7 @@ mod tests {
                 RetainedPartialPreflight::Complete(MatchResult::Exists(true)),
                 "{phase}"
             );
-            assert_eq!((address, generation), (0, 0), "{phase}");
+            assert_eq!((address, cache_identity), (0, 0), "{phase}");
         }
         let dynamic = workspace.dynamic_native_rows.as_deref().unwrap();
         assert_ne!(
