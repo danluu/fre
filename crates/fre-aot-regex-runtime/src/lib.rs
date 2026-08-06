@@ -4497,27 +4497,32 @@ mod tests {
     }
 
     #[test]
-    fn prepared_c_lifecycle_accepts_strict_v1_ordered_dfa() {
+    fn prepared_c_lifecycle_accepts_strict_v1_ordered_nfa() {
+        // Complete optimizing DFAs now authenticate both class-mass state
+        // discovery and its exact construction work as V6, so rewriting only
+        // their header would deliberately create a noncanonical V1 artifact.
+        // Legacy FIFO-DFA canonical validation remains covered in the program
+        // crate; this runtime lifecycle test uses the stable V1 ordered NFA.
         let pattern = "(?:ab|a)+?b";
         let compiled = compile(
             CompileRequest::new(pattern, Target::x86_64_linux())
-                .mode(CompileMode::Optimizing)
+                .mode(CompileMode::Fast)
                 .output(OutputContract::Span),
         )
-        .expect("compile ordered DFA");
-        assert_eq!(compiled.program().engine_kind(), EngineKind::OrderedDfa);
+        .expect("compile ordered NFA");
+        assert_eq!(compiled.program().engine_kind(), EngineKind::OrderedNfa);
 
-        let canonical_v2 = compiled
+        let canonical = compiled
             .program()
             .serialize()
-            .expect("serialize V2 program");
-        let mut v1 = canonical_v2.clone();
+            .expect("serialize current program");
+        let mut v1 = canonical.clone();
         v1[8..12].copy_from_slice(&1_u32.to_le_bytes());
         v1[14] = 0;
         v1[15] = 0;
         let handle = prepare_handle(&v1);
         drop(v1);
-        drop(canonical_v2);
+        drop(canonical);
 
         let mut haystacks = generated_haystacks();
         haystacks.extend([b"xxaaab".to_vec(), b"ababbx".to_vec()]);
