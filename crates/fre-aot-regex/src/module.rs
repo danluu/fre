@@ -21592,27 +21592,17 @@ mod tests {
         any(target_arch = "x86_64", target_arch = "aarch64"),
         any(target_os = "linux", target_os = "macos")
     ))]
-    #[test]
-    #[ignore = "links and executes the dynamic warmed-row prepared ABI against a validating C runtime stub"]
     #[allow(
         clippy::needless_raw_string_hashes,
         clippy::too_many_lines,
         reason = "the opt-in linked transaction fixture keeps its complete C ABI oracle together"
     )]
-    fn linked_host_dynamic_rows_entry_preserves_local_and_deopt_transactions() {
+    fn linked_dynamic_rows_entry_for_target(
+        target: Target,
+        expected_accelerator: StartAccelerator,
+    ) {
         use std::{fs, process::Command};
 
-        let target = if cfg!(target_arch = "x86_64") {
-            if cfg!(target_os = "linux") {
-                Target::x86_64_linux()
-            } else {
-                Target::x86_64_macos()
-            }
-        } else if cfg!(target_os = "linux") {
-            Target::aarch64_linux()
-        } else {
-            Target::aarch64_macos()
-        };
         let limits = CompileLimitsV1 {
             determinize: DeterminizeLimits {
                 max_states: 0,
@@ -21627,6 +21617,19 @@ mod tests {
                 .limits(limits),
         )
         .expect("host dynamic-row object");
+        assert_eq!(compiled.receipt().engine, EngineKind::OrderedNfa);
+        assert!(
+            compiled
+                .program()
+                .native_dynamic_rows_view()
+                .is_some_and(|view| view.root_requirement.is_some()),
+            "linked feature fixture must retain a graph-derived dynamic root: {target:?}",
+        );
+        assert_eq!(
+            compiled.module().start_accelerator(),
+            expected_accelerator,
+            "linked feature fixture did not lower the requested dynamic-root tier: {target:?}",
+        );
         let symbol = compiled
             .module()
             .prepared_entry_symbol()
@@ -21638,8 +21641,11 @@ mod tests {
             .map(u8::to_string)
             .collect::<Vec<_>>()
             .join(",");
-        let directory =
-            std::env::temp_dir().join(format!("fre-aot-dynamic-rows-{}", std::process::id()));
+        let directory = std::env::temp_dir().join(format!(
+            "fre-aot-dynamic-rows-{}-{:016x}",
+            std::process::id(),
+            target.features.bits(),
+        ));
         fs::create_dir_all(&directory).expect("create dynamic linker directory");
         let object = directory.join("dynamic.o");
         let c_path = directory.join("dynamic.c");
@@ -21757,6 +21763,122 @@ int main(void) {{
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    #[ignore = "links and executes the portable dynamic warmed-row prepared ABI"]
+    fn linked_host_dynamic_rows_entry_preserves_local_and_deopt_transactions() {
+        let target = if cfg!(target_arch = "x86_64") {
+            if cfg!(target_os = "linux") {
+                Target::x86_64_linux()
+            } else {
+                Target::x86_64_macos()
+            }
+        } else if cfg!(target_os = "linux") {
+            Target::aarch64_linux()
+        } else {
+            Target::aarch64_macos()
+        };
+        let expected = match target.architecture {
+            Architecture::X86_64 => StartAccelerator::X86Sse2,
+            Architecture::Aarch64 => StartAccelerator::Scalar,
+        };
+        linked_dynamic_rows_entry_for_target(target, expected);
+    }
+
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    #[ignore = "requires and executes an AVX2 host dynamic-root prepared entry"]
+    fn linked_host_avx2_dynamic_root_entry() {
+        assert!(
+            std::is_x86_feature_detected!("avx2"),
+            "AVX2 dynamic-root validation requires AVX2 hardware",
+        );
+        let target = if cfg!(target_os = "linux") {
+            Target::x86_64_linux()
+        } else {
+            Target::x86_64_macos()
+        }
+        .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+        .unwrap();
+        linked_dynamic_rows_entry_for_target(target, StartAccelerator::X86Avx2);
+    }
+
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    #[ignore = "requires and executes an ASIMD host dynamic-root prepared entry"]
+    fn linked_host_asimd_dynamic_root_entry() {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon"),
+            "ASIMD dynamic-root validation requires ASIMD hardware",
+        );
+        let target = if cfg!(target_os = "linux") {
+            Target::aarch64_linux()
+        } else {
+            Target::aarch64_macos()
+        }
+        .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+        .unwrap();
+        linked_dynamic_rows_entry_for_target(target, StartAccelerator::Aarch64Asimd);
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    #[test]
+    #[ignore = "requires and executes a base-SVE host dynamic-root prepared entry"]
+    fn linked_host_sve_dynamic_root_entry() {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("sve"),
+            "SVE dynamic-root validation requires SVE hardware",
+        );
+        let target = Target::aarch64_linux()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Sve))
+            .unwrap();
+        linked_dynamic_rows_entry_for_target(target, StartAccelerator::Aarch64Sve);
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    #[test]
+    #[ignore = "requires and executes an SVE2 host dynamic-root prepared entry"]
+    fn linked_host_sve2_dynamic_root_entry() {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("sve2"),
+            "SVE2 dynamic-root validation requires SVE2 hardware",
+        );
+        let target = Target::aarch64_linux()
+            .with_features(
+                FeatureSet::of(CpuFeature::Aarch64Sve).with(CpuFeature::Aarch64Sve2),
+            )
+            .unwrap();
+        linked_dynamic_rows_entry_for_target(target, StartAccelerator::Aarch64Sve2);
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    #[test]
+    #[ignore = "requires and executes mixed ASIMD/SVE2 dynamic-root width dispatch"]
+    fn linked_host_mixed_sve2_dynamic_root_entry() {
+        assert!(
+            std::arch::is_aarch64_feature_detected!("neon")
+                && std::arch::is_aarch64_feature_detected!("sve2"),
+            "mixed dynamic-root validation requires ASIMD and SVE2 hardware",
+        );
+        let target = Target::aarch64_linux()
+            .with_features(
+                FeatureSet::of(CpuFeature::Aarch64Asimd)
+                    .with(CpuFeature::Aarch64Sve)
+                    .with(CpuFeature::Aarch64Sve2),
+            )
+            .unwrap();
+        linked_dynamic_rows_entry_for_target(target, StartAccelerator::Aarch64Sve2);
     }
 
     #[test]
