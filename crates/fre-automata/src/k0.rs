@@ -16680,7 +16680,7 @@ fn prefill_bound_resume_caches_transaction(
             .lazy
             .rows
             .get(..forward_cells)
-            .is_none_or(|rows| rows.contains(&LAZY_CELL_UNFILLED))
+            .map_or(true, |rows| rows.contains(&LAZY_CELL_UNFILLED))
     {
         return Ok(false);
     }
@@ -16695,7 +16695,7 @@ fn prefill_bound_resume_caches_transaction(
                 .reverse
                 .rows
                 .get(..reverse_cells)
-                .is_none_or(|rows| rows.contains(&LAZY_CELL_UNFILLED))
+                .map_or(true, |rows| rows.contains(&LAZY_CELL_UNFILLED))
         {
             return Ok(false);
         }
