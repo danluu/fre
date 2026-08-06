@@ -4,8 +4,11 @@
 //! though only a small subset can match any one byte. The universal K0 path
 //! must preserve that edge order, but it need not inspect the nonmatching
 //! edges on an unlimited invocation. This sidecar partitions each admitted
-//! row into its exact local byte segments and stores the matching edge
-//! ordinals in original order.
+//! row into its exact local byte segments. Each matching transition retains
+//! its target and the exact scalar edge-inspection delta in one packed word;
+//! each segment separately retains the terminal nonmatching tail. Runtime can
+//! therefore preserve priority and abstract work without returning to the
+//! source graph for edge ordinals, targets, or row bounds.
 
 use core::{fmt, mem::size_of};
 
@@ -33,19 +36,58 @@ const MAX_RETAINED_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RowDescriptor {
-    segment_offset_base: u32,
+    segment_base: u32,
     row_ordinal: u32,
 }
 
 impl RowDescriptor {
     const ABSENT: Self = Self {
-        segment_offset_base: u32::MAX,
+        segment_base: u32::MAX,
         row_ordinal: 0,
     };
 
     const fn is_present(self) -> bool {
-        self.segment_offset_base != u32::MAX
+        self.segment_base != u32::MAX
     }
+}
+
+/// One runtime-ready matching transition.
+///
+/// The low half is the direct graph target and the high half is the exact
+/// number of scalar row edges inspected through this match. Both source
+/// fields are validated `u32`s, so the representation is lossless even at
+/// their maximum encodings and is target-width independent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(transparent)]
+pub(crate) struct PackedOrderedTransition(u64);
+
+impl PackedOrderedTransition {
+    fn new(target: u32, work: u32) -> Self {
+        Self(u64::from(target) | (u64::from(work) << u32::BITS))
+    }
+
+    pub(crate) const fn target(self) -> u32 {
+        self.0 as u32
+    }
+
+    pub(crate) const fn work(self) -> u32 {
+        (self.0 >> u32::BITS) as u32
+    }
+}
+
+/// Start of one local byte segment's packed transition run and the exact
+/// scalar work remaining after that run. A final sentinel supplies the end
+/// offset for the last real segment in the graph.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SegmentDescriptor {
+    transition_base: u32,
+    tail_work: u32,
+}
+
+/// Borrowed runtime view for one byte in one admitted consuming row.
+pub(crate) struct OrderedEdgeSegment<'a> {
+    pub(crate) transitions: &'a [PackedOrderedTransition],
+    pub(crate) tail_work: u32,
 }
 
 /// Allocation failure after a graph has deterministically qualified.
@@ -87,8 +129,8 @@ pub(crate) struct OrderedEdgeDispatch(Box<[OrderedEdgeDispatchData; 1]>);
 struct OrderedEdgeDispatchData {
     rows: Box<[RowDescriptor]>,
     segment_by_byte: Box<[u8]>,
-    segment_offsets: Box<[u32]>,
-    edges: Box<[u32]>,
+    segments: Box<[SegmentDescriptor]>,
+    transitions: Box<[PackedOrderedTransition]>,
     retained_bytes: usize,
 }
 
@@ -103,7 +145,7 @@ struct RowShape {
 #[derive(Clone, Copy)]
 struct Shape {
     admitted_rows: usize,
-    segment_offsets: usize,
+    segments: usize,
     matching_edges: usize,
     retained_bytes: usize,
 }
@@ -138,8 +180,12 @@ impl OrderedEdgeDispatch {
             .checked_mul(BYTE_DOMAIN)
             .expect("bounded ordered-edge dispatch byte-map length was checked during derivation");
         let mut segment_by_byte = exact_vec(byte_map_len, shape.retained_bytes)?;
-        let mut segment_offsets = exact_vec(shape.segment_offsets, shape.retained_bytes)?;
-        let mut edges = exact_vec(shape.matching_edges, shape.retained_bytes)?;
+        let segment_descriptor_count = shape
+            .segments
+            .checked_add(1)
+            .expect("bounded ordered-edge segment count has one sentinel");
+        let mut segments = exact_vec(segment_descriptor_count, shape.retained_bytes)?;
+        let mut transitions = exact_vec(shape.matching_edges, shape.retained_bytes)?;
 
         let mut row_ordinal = 0usize;
         for (state, (&role, descriptor)) in automaton.roles.iter().zip(&mut rows).enumerate() {
@@ -152,10 +198,10 @@ impl OrderedEdgeDispatch {
                 continue;
             }
 
-            let segment_offset_base = segment_offsets.len();
+            let segment_base = segments.len();
             *descriptor = RowDescriptor {
-                segment_offset_base: u32::try_from(segment_offset_base)
-                    .expect("bounded dispatch offset count fits u32"),
+                segment_base: u32::try_from(segment_base)
+                    .expect("bounded dispatch segment count fits u32"),
                 row_ordinal: u32::try_from(row_ordinal)
                     .expect("bounded dispatch row count fits u32"),
             };
@@ -174,38 +220,63 @@ impl OrderedEdgeDispatch {
             debug_assert_eq!(segment.checked_add(1), Some(row_shape.segments));
 
             for representative in segment_representatives(&boundaries).iter() {
-                segment_offsets.push(
-                    u32::try_from(edges.len()).expect("bounded dispatch edge count fits u32"),
-                );
+                let transition_base = transitions.len();
+                let mut next_unaccounted = range.start;
                 for edge in range.clone() {
                     if automaton.byte_starts[edge] <= representative
                         && representative <= automaton.byte_ends[edge]
                     {
                         // Iterating the source CSR is the priority proof. The
-                        // exact global edge ordinal additionally lets runtime
-                        // accounting charge skipped nonmatches up through
-                        // each match before a possible early acceptance.
-                        edges.push(u32::try_from(edge).expect("validated edge index fits u32"));
+                        // exact local delta charges skipped nonmatches through
+                        // this match before a possible early acceptance. The
+                        // target is lowered now so runtime never reloads the
+                        // source edge arrays.
+                        let through = edge
+                            .checked_add(1)
+                            .and_then(|end| end.checked_sub(next_unaccounted))
+                            .expect("increasing edges remain within their source row");
+                        transitions.push(PackedOrderedTransition::new(
+                            automaton.edge_targets[edge],
+                            u32::try_from(through)
+                                .expect("validated consuming-row degree fits u32"),
+                        ));
+                        next_unaccounted = edge
+                            .checked_add(1)
+                            .expect("validated edge index has a representable successor");
                     }
                 }
+                let tail_work = range
+                    .end
+                    .checked_sub(next_unaccounted)
+                    .expect("matching edges remain within their source row");
+                segments.push(SegmentDescriptor {
+                    transition_base: u32::try_from(transition_base)
+                        .expect("bounded dispatch transition count fits u32"),
+                    tail_work: u32::try_from(tail_work)
+                        .expect("validated consuming-row degree fits u32"),
+                });
             }
-            segment_offsets
-                .push(u32::try_from(edges.len()).expect("bounded dispatch edge count fits u32"));
             row_ordinal = row_ordinal
                 .checked_add(1)
                 .expect("bounded dispatch row count");
         }
 
+        segments.push(SegmentDescriptor {
+            transition_base: u32::try_from(transitions.len())
+                .expect("bounded dispatch transition count fits u32"),
+            tail_work: 0,
+        });
+
         debug_assert_eq!(row_ordinal, shape.admitted_rows);
         debug_assert_eq!(segment_by_byte.len(), byte_map_len);
-        debug_assert_eq!(segment_offsets.len(), shape.segment_offsets);
-        debug_assert_eq!(edges.len(), shape.matching_edges);
+        debug_assert_eq!(segments.len(), segment_descriptor_count);
+        debug_assert_eq!(transitions.len(), shape.matching_edges);
 
         let data = OrderedEdgeDispatchData {
             rows: rows.into_boxed_slice(),
             segment_by_byte: segment_by_byte.into_boxed_slice(),
-            segment_offsets: segment_offsets.into_boxed_slice(),
-            edges: edges.into_boxed_slice(),
+            segments: segments.into_boxed_slice(),
+            transitions: transitions.into_boxed_slice(),
             retained_bytes: shape.retained_bytes,
         };
         let mut owner = exact_vec(1, shape.retained_bytes)?;
@@ -221,10 +292,10 @@ impl OrderedEdgeDispatch {
 
     #[allow(
         clippy::inline_always,
-        reason = "four dispatch loads replace one admitted inner consuming-row scan"
+        reason = "bounded sidecar loads replace one admitted source-row scan and target lookup"
     )]
     #[inline(always)]
-    pub(crate) fn edges(&self, state: u32, byte: u8) -> Option<&[u32]> {
+    pub(crate) fn segment(&self, state: u32, byte: u8) -> Option<OrderedEdgeSegment<'_>> {
         let data = &self.0[0];
         let state = plan_index(state);
         let descriptor = data.rows[state];
@@ -237,15 +308,20 @@ impl OrderedEdgeDispatch {
             .and_then(|base| base.checked_add(usize::from(byte)))
             .expect("validated dispatch byte-map index");
         let segment = usize::from(data.segment_by_byte[map]);
-        let offset = plan_index(descriptor.segment_offset_base)
+        let segment_index = plan_index(descriptor.segment_base)
             .checked_add(segment)
-            .expect("validated dispatch segment offset");
-        let begin = plan_index(data.segment_offsets[offset]);
-        let next_offset = offset
+            .expect("validated dispatch segment index");
+        let current = data.segments[segment_index];
+        let next_segment = segment_index
             .checked_add(1)
-            .expect("validated dispatch next segment offset");
-        let end = plan_index(data.segment_offsets[next_offset]);
-        Some(&data.edges[begin..end])
+            .expect("validated dispatch next segment index");
+        let next = data.segments[next_segment];
+        let begin = plan_index(current.transition_base);
+        let end = plan_index(next.transition_base);
+        Some(OrderedEdgeSegment {
+            transitions: &data.transitions[begin..end],
+            tail_work: current.tail_work,
+        })
     }
 
     pub(crate) const fn retained_bytes(&self) -> usize {
@@ -274,7 +350,7 @@ fn exact_vec<T>(
 
 fn derive_shape(automaton: &Automaton) -> Option<Shape> {
     let mut admitted_rows = 0usize;
-    let mut segment_offsets = 0usize;
+    let mut segments = 0usize;
     let mut matching_edges = 0usize;
     let mut derivation_work = automaton.roles.len().checked_mul(RESERVED_STATE_PASSES)?;
     if derivation_work > MAX_DERIVATION_WORK {
@@ -297,7 +373,7 @@ fn derive_shape(automaton: &Automaton) -> Option<Shape> {
         derivation_work = derivation_work.checked_add(reserved)?;
         if shape.admitted {
             admitted_rows = admitted_rows.checked_add(1)?;
-            segment_offsets = segment_offsets.checked_add(shape.segments.checked_add(1)?)?;
+            segments = segments.checked_add(shape.segments)?;
             matching_edges = matching_edges.checked_add(shape.matching_edges)?;
         }
         if derivation_work > MAX_DERIVATION_WORK {
@@ -308,7 +384,7 @@ fn derive_shape(automaton: &Automaton) -> Option<Shape> {
     if admitted_rows == 0 {
         return Some(Shape {
             admitted_rows: 0,
-            segment_offsets: 0,
+            segments: 0,
             matching_edges: 0,
             retained_bytes: 0,
         });
@@ -319,19 +395,25 @@ fn derive_shape(automaton: &Automaton) -> Option<Shape> {
         .len()
         .checked_mul(size_of::<RowDescriptor>())?
         .checked_add(admitted_rows.checked_mul(BYTE_DOMAIN)?)?
-        .checked_add(segment_offsets.checked_mul(size_of::<u32>())?)?
-        .checked_add(matching_edges.checked_mul(size_of::<u32>())?)?
+        .checked_add(
+            segments
+                .checked_add(1)?
+                .checked_mul(size_of::<SegmentDescriptor>())?,
+        )?
+        .checked_add(
+            matching_edges.checked_mul(size_of::<PackedOrderedTransition>())?,
+        )?
         .checked_add(size_of::<OrderedEdgeDispatchData>())?;
     if retained_bytes > MAX_RETAINED_BYTES
         || u32::try_from(admitted_rows).is_err()
-        || u32::try_from(segment_offsets).is_err()
+        || u32::try_from(segments.checked_add(1)?).is_err()
         || u32::try_from(matching_edges).is_err()
     {
         return None;
     }
     Some(Shape {
         admitted_rows,
-        segment_offsets,
+        segments,
         matching_edges,
         retained_bytes,
     })
@@ -449,7 +531,6 @@ fn state_edges(automaton: &Automaton, state: usize) -> core::ops::Range<usize> {
 
 #[cfg(test)]
 mod tests {
-    use crate::plan::plan_index;
     use crate::{Automaton, CompileLimits, EdgeKind, RawPlan, StateRole};
 
     fn one_row(ranges: &[(u8, u8)]) -> Automaton {
@@ -475,14 +556,40 @@ mod tests {
         .unwrap()
     }
 
-    fn scalar_targets(automaton: &Automaton, byte: u8) -> Vec<u32> {
+    fn scalar_targets(automaton: &Automaton, state: u32, byte: u8) -> Vec<u32> {
         automaton
-            .state_edges(0)
+            .state_edges(state)
             .filter(|&edge| {
                 automaton.byte_starts[edge] <= byte && byte <= automaton.byte_ends[edge]
             })
             .map(|edge| automaton.edge_targets[edge])
             .collect()
+    }
+
+    fn dispatched_targets_and_work(
+        automaton: &Automaton,
+        state: u32,
+        byte: u8,
+    ) -> (Vec<u32>, u64) {
+        let segment = automaton
+            .ordered_edge_dispatch
+            .as_ref()
+            .unwrap()
+            .segment(state, byte)
+            .unwrap();
+        let targets = segment
+            .transitions
+            .iter()
+            .map(|&transition| transition.target())
+            .collect();
+        let work = segment
+            .transitions
+            .iter()
+            .map(|transition| u64::from(transition.work()))
+            .sum::<u64>()
+            .checked_add(u64::from(segment.tail_work))
+            .unwrap();
+        (targets, work)
     }
 
     #[test]
@@ -524,21 +631,132 @@ mod tests {
                 continue;
             }
             admitted = admitted.saturating_add(1);
-            let dispatch = automaton.ordered_edge_dispatch.as_ref().unwrap();
             for byte in u8::MIN..=u8::MAX {
+                let (targets, work) = dispatched_targets_and_work(&automaton, 0, byte);
                 assert_eq!(
-                    dispatch
-                        .edges(0, byte)
-                        .unwrap()
-                        .iter()
-                        .map(|&edge| automaton.edge_targets[plan_index(edge)])
-                        .collect::<Vec<_>>(),
-                    scalar_targets(&automaton, byte),
+                    targets,
+                    scalar_targets(&automaton, 0, byte),
+                    "mask={mask:#x}, byte={byte:#x}"
+                );
+                assert_eq!(
+                    work,
+                    u64::try_from(ranges.len()).unwrap(),
                     "mask={mask:#x}, byte={byte:#x}"
                 );
             }
         }
         assert!(admitted > 0);
+    }
+
+    #[test]
+    fn packed_entries_are_direct_targets_with_exact_empty_and_overlapping_tails() {
+        let ranges = [
+            (1, 4),
+            (3, 7),
+            (9, 9),
+            (11, 14),
+            (13, 18),
+            (32, 63),
+            (128, 191),
+            (255, 255),
+        ];
+        let targets = [8, 3, 7, 1, 6, 2, 5, 4];
+        let mut automaton = one_row(&ranges);
+        automaton.edge_targets.copy_from_slice(&targets);
+        assert!(automaton.try_enable_ordered_edge_dispatch().unwrap());
+
+        for byte in u8::MIN..=u8::MAX {
+            let (packed_targets, work) = dispatched_targets_and_work(&automaton, 0, byte);
+            assert_eq!(
+                packed_targets,
+                scalar_targets(&automaton, 0, byte),
+                "byte={byte}"
+            );
+            assert_eq!(work, u64::try_from(ranges.len()).unwrap(), "byte={byte}");
+        }
+        let empty = automaton
+            .ordered_edge_dispatch
+            .as_ref()
+            .unwrap()
+            .segment(0, 200)
+            .unwrap();
+        assert!(empty.transitions.is_empty());
+        assert_eq!(empty.tail_work, u32::try_from(ranges.len()).unwrap());
+    }
+
+    #[test]
+    fn packed_transition_preserves_maximum_target_and_work_encodings() {
+        let packed = super::PackedOrderedTransition::new(u32::MAX, u32::MAX);
+        assert_eq!(packed.target(), u32::MAX);
+        assert_eq!(packed.work(), u32::MAX);
+        assert_eq!(core::mem::size_of_val(&packed), core::mem::size_of::<u64>());
+    }
+
+    #[test]
+    fn packed_segment_bases_are_exact_across_multiple_admitted_rows() {
+        let first = [
+            (0, 0),
+            (2, 2),
+            (4, 4),
+            (6, 6),
+            (8, 8),
+            (10, 10),
+            (12, 12),
+            (14, 14),
+        ];
+        let second = [
+            (1, 5),
+            (3, 7),
+            (16, 31),
+            (32, 47),
+            (64, 95),
+            (127, 127),
+            (128, 191),
+            (255, 255),
+        ];
+        let mut edge_offsets = vec![0, 8, 16];
+        edge_offsets.resize(11, 16);
+        let mut automaton = Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: [StateRole::Consume, StateRole::Consume]
+                    .into_iter()
+                    .chain(core::iter::repeat(StateRole::Accept).take(8))
+                    .collect(),
+                edge_offsets,
+                edge_targets: (2_u32..10).chain((2_u32..10).rev()).collect(),
+                edge_kinds: vec![EdgeKind::ByteRange; 16],
+                byte_starts: first
+                    .iter()
+                    .chain(&second)
+                    .map(|&(start, _)| start)
+                    .collect(),
+                byte_ends: first
+                    .iter()
+                    .chain(&second)
+                    .map(|&(_, end)| end)
+                    .collect(),
+            },
+            CompileLimits::default(),
+        )
+        .unwrap();
+        assert!(automaton.try_enable_ordered_edge_dispatch().unwrap());
+        assert_eq!(
+            automaton
+                .ordered_edge_dispatch
+                .as_ref()
+                .unwrap()
+                .admitted_rows(),
+            2
+        );
+
+        for state in [0_u32, 1] {
+            for byte in u8::MIN..=u8::MAX {
+                let (targets, work) = dispatched_targets_and_work(&automaton, state, byte);
+                assert_eq!(targets, scalar_targets(&automaton, state, byte));
+                assert_eq!(work, 8, "state={state}, byte={byte}");
+            }
+        }
     }
 
     #[test]

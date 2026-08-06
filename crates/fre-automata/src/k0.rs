@@ -11184,10 +11184,10 @@ impl WarmContextWorkReceipt {
 
 /// Priority-ordered matching edges for one admitted consuming row.
 struct OrderedConsumingEdges<'a> {
-    edges: &'a [u32],
+    transitions: &'a [crate::ordered_edge_dispatch::PackedOrderedTransition],
     cursor: usize,
-    next_unaccounted: usize,
-    row_end: usize,
+    tail_work: u32,
+    tail_pending: bool,
 }
 
 impl OrderedConsumingEdges<'_> {
@@ -11200,49 +11200,30 @@ impl OrderedConsumingEdges<'_> {
         &mut self,
         meter: &mut WorkMeter,
         position: usize,
-    ) -> Result<Option<usize>, SearchError> {
-        let Some(&encoded) = self.edges.get(self.cursor) else {
-            let tail = self.row_end.checked_sub(self.next_unaccounted).ok_or(
-                SearchError::InternalInvariant {
-                    detail: "ordered consuming dispatch accounting passed its row end",
-                },
-            )?;
-            charge_ordered_consuming_run(meter, tail, position)?;
-            self.next_unaccounted = self.row_end;
+    ) -> Result<Option<u32>, SearchError> {
+        let Some(&transition) = self.transitions.get(self.cursor) else {
+            if self.tail_pending {
+                charge_ordered_consuming_run(meter, self.tail_work, position)?;
+                self.tail_pending = false;
+            }
             return Ok(None);
         };
-        let edge = crate::plan::plan_index(encoded);
-        let through = edge
-            .checked_add(1)
-            .and_then(|end| end.checked_sub(self.next_unaccounted))
-            .ok_or(SearchError::InternalInvariant {
-                detail: "ordered consuming dispatch edges are not increasing within their row",
-            })?;
-        charge_ordered_consuming_run(meter, through, position)?;
-        self.next_unaccounted = edge
-            .checked_add(1)
-            .ok_or(SearchError::ArithmeticOverflow {
-                computation: "ordered consuming dispatch next edge",
-            })?;
-        self.cursor = self
-            .cursor
-            .checked_add(1)
-            .ok_or(SearchError::ArithmeticOverflow {
-                computation: "ordered consuming dispatch cursor",
-            })?;
-        Ok(Some(edge))
+        // A successful slice lookup proves `cursor < len`, so its successor
+        // is representable. One packed load now supplies both exact abstract
+        // work and the direct graph target.
+        charge_ordered_consuming_run(meter, transition.work(), position)?;
+        self.cursor += 1;
+        Ok(Some(transition.target()))
     }
 }
 
 #[inline]
 fn charge_ordered_consuming_run(
     meter: &mut WorkMeter,
-    requested: usize,
+    requested: u32,
     position: usize,
 ) -> Result<(), SearchError> {
-    let requested = u64::try_from(requested).map_err(|_| SearchError::ArithmeticOverflow {
-        computation: "ordered consuming-row work conversion",
-    })?;
+    let requested = u64::from(requested);
     let remaining = meter.remaining();
     if requested <= remaining {
         return meter.charge(requested, position);
@@ -11283,13 +11264,12 @@ fn try_ordered_consuming_edges<'a>(
     if meter.limit != u64::MAX {
         return None;
     }
-    let edges = dispatch.edges(state, byte)?;
-    let row = automaton.state_edges(state);
+    let segment = dispatch.segment(state, byte)?;
     Some(OrderedConsumingEdges {
-        edges,
+        transitions: segment.transitions,
         cursor: 0,
-        next_unaccounted: row.start,
-        row_end: row.end,
+        tail_work: segment.tail_work,
+        tail_pending: true,
     })
 }
 
@@ -14271,10 +14251,10 @@ fn build_resume_lazy_cached_transition(
                 })?;
         if let Some(mut edges) = try_ordered_consuming_edges(automaton, consuming, byte, meter)
         {
-            while let Some(edge) = edges.next(meter, position)? {
+            while let Some(target) = edges.next(meter, position)? {
                 if expand_lazy_root(
                     automaton,
-                    automaton.edge_targets[edge],
+                    target,
                     workspace,
                     meter,
                     position,
@@ -14355,10 +14335,10 @@ fn build_resume_lazy_inline_transition(
                 })?;
         if let Some(mut edges) = try_ordered_consuming_edges(automaton, consuming, byte, meter)
         {
-            while let Some(edge) = edges.next(meter, position)? {
+            while let Some(target) = edges.next(meter, position)? {
                 if expand_lazy_root(
                     automaton,
-                    automaton.edge_targets[edge],
+                    target,
                     workspace,
                     meter,
                     position,
@@ -15857,10 +15837,10 @@ fn build_context_lazy_cached_transition(
         let consuming = workspace.lazy.item(state, ordinal)?;
         if let Some(mut edges) = try_ordered_consuming_edges(automaton, consuming, byte, meter)
         {
-            while let Some(edge) = edges.next(meter, position)? {
+            while let Some(target) = edges.next(meter, position)? {
                 if expand_context_lazy_root(
                     automaton,
-                    automaton.edge_targets[edge],
+                    target,
                     assertions,
                     workspace,
                     meter,
@@ -15991,10 +15971,10 @@ fn build_context_lazy_inline_transition(
                 })?;
         if let Some(mut edges) = try_ordered_consuming_edges(automaton, consuming, byte, meter)
         {
-            while let Some(edge) = edges.next(meter, position)? {
+            while let Some(target) = edges.next(meter, position)? {
                 if expand_context_lazy_root(
                     automaton,
-                    automaton.edge_targets[edge],
+                    target,
                     assertions,
                     workspace,
                     meter,
@@ -18009,10 +17989,10 @@ fn build_lazy_cached_transition(
         let consuming = workspace.lazy.item(state, ordinal)?;
         if let Some(mut edges) = try_ordered_consuming_edges(automaton, consuming, byte, meter)
         {
-            while let Some(edge) = edges.next(meter, position)? {
+            while let Some(target) = edges.next(meter, position)? {
                 if expand_lazy_root(
                     automaton,
-                    automaton.edge_targets[edge],
+                    target,
                     workspace,
                     meter,
                     position,
@@ -18140,10 +18120,10 @@ fn build_lazy_inline_transition(
                 })?;
         if let Some(mut edges) = try_ordered_consuming_edges(automaton, consuming, byte, meter)
         {
-            while let Some(edge) = edges.next(meter, position)? {
+            while let Some(target) = edges.next(meter, position)? {
                 if expand_lazy_root(
                     automaton,
-                    automaton.edge_targets[edge],
+                    target,
                     workspace,
                     meter,
                     position,
@@ -22725,9 +22705,9 @@ fn consume_current(
         if let Some(mut edges) =
             try_ordered_consuming_edges(automaton, thread.state, byte, meter)
         {
-            while let Some(edge) = edges.next(meter, position)? {
+            while let Some(target) = edges.next(meter, position)? {
                 workspace.push_root(Thread {
-                    state: automaton.edge_targets[edge],
+                    state: target,
                     start: thread.start,
                 })?;
             }
@@ -31528,6 +31508,7 @@ mod tests {
         assert!(dispatched.try_enable_ordered_edge_dispatch().unwrap());
         let consuming = u32::from(asserted);
         let last_edge = usize::from(asserted).checked_add(7).unwrap();
+        let expected_target = dispatched.edge_targets[last_edge];
         let mut overflow_meter = WorkMeter::new(u64::MAX, u64::MAX - 7);
         let mut overflow_edges = super::try_ordered_consuming_edges(
             &dispatched,
@@ -31543,6 +31524,12 @@ mod tests {
             })
         ));
         assert_eq!(overflow_meter.consumed, u64::MAX);
+        assert!(matches!(
+            overflow_edges.next(&mut overflow_meter, 19),
+            Err(SearchError::ArithmeticOverflow {
+                computation: "search work counter"
+            })
+        ));
         let mut exact_meter = WorkMeter::new(u64::MAX, u64::MAX - 8);
         let mut exact_edges = super::try_ordered_consuming_edges(
             &dispatched,
@@ -31553,9 +31540,34 @@ mod tests {
         .unwrap();
         assert_eq!(
             exact_edges.next(&mut exact_meter, 19).unwrap(),
-            Some(last_edge)
+            Some(expected_target)
         );
         assert_eq!(exact_meter.consumed, u64::MAX);
+        let mut tail_overflow_meter = WorkMeter::new(u64::MAX, u64::MAX - 7);
+        let mut tail_overflow = super::try_ordered_consuming_edges(
+            &dispatched,
+            consuming,
+            b'x',
+            &tail_overflow_meter,
+        )
+        .unwrap();
+        assert!(matches!(
+            tail_overflow.next(&mut tail_overflow_meter, 23),
+            Err(SearchError::ArithmeticOverflow {
+                computation: "search work counter"
+            })
+        ));
+        assert_eq!(tail_overflow_meter.consumed, u64::MAX);
+        let mut exact_tail_meter = WorkMeter::new(u64::MAX, u64::MAX - 8);
+        let mut exact_tail = super::try_ordered_consuming_edges(
+            &dispatched,
+            consuming,
+            b'x',
+            &exact_tail_meter,
+        )
+        .unwrap();
+        assert_eq!(exact_tail.next(&mut exact_tail_meter, 23).unwrap(), None);
+        assert_eq!(exact_tail_meter.consumed, u64::MAX);
         pin_without_start_filter(&scalar);
         pin_without_start_filter(&dispatched);
 
