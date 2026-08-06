@@ -46996,7 +46996,7 @@ mod tests {
         let prefix = 3;
         let run = super::LAZY_LOOP_SKIP_MIN_BYTES * 3;
         let mut haystack = vec![b'!'; prefix];
-        haystack.extend(core::iter::repeat_n(b'b', run));
+        haystack.extend(core::iter::repeat(b'b').take(run));
         haystack.push(b'z');
         let end = haystack.len();
         haystack.extend_from_slice(b"!!");
