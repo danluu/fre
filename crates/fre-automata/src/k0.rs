@@ -1197,6 +1197,84 @@ impl ContextTransitionStore {
         Ok(None)
     }
 
+    /// Read one dependency-normalized symbol from an authenticated complete
+    /// dense row and return the logical retained-lookup work that the metered
+    /// reader would have charged. `None` means only that this source is not
+    /// complete; once the monotone completion tag is present, every missing
+    /// owner, dependency, or cell is a hard proof failure rather than a cache
+    /// hole that may fall through to the broader raw key.
+    #[inline]
+    fn lookup_complete_dense_with_hot_prevalidated(
+        &self,
+        symbol: u32,
+        hot: ContextHotTransition,
+        global_dependencies: u32,
+    ) -> Result<Option<(u32, u64)>, SearchError> {
+        debug_assert!(self.validate_shape().is_ok());
+        if hot.dense_complete == 0 {
+            return Ok(None);
+        }
+        let owner = self
+            .dense_owner_for_hot(hot)?
+            .ok_or(SearchError::InternalInvariant {
+                detail: "complete contextual dense row has no owner",
+            })?;
+        if hot.dependency_mask & !global_dependencies != 0 {
+            return Err(SearchError::InternalInvariant {
+                detail: "complete contextual dense row exceeds global dependencies",
+            });
+        }
+        let class_count = usize::from(self.dense_class_count);
+        let _required = contextual_dense_required_cells(class_count, hot.dependency_mask)?;
+        let missing = usize::from(self.dense_missing[owner]);
+        if missing != 0 {
+            return Err(SearchError::InternalInvariant {
+                detail: "contextual dense completion disagrees with its missing-cell count",
+            });
+        }
+        let assertions = symbol >> CONTEXT_SYMBOL_CLASS_BITS;
+        if assertions & !hot.dependency_mask != 0 {
+            return Err(SearchError::InternalInvariant {
+                detail: "complete contextual dense lookup received a raw assertion key",
+            });
+        }
+        if hot.symbol == symbol {
+            if !(2..=CONTEXT_TRANSITION_WAYS + 1).contains(&usize::from(hot.lookup_work)) {
+                return Err(SearchError::InternalInvariant {
+                    detail: "complete contextual hot lookup has invalid work",
+                });
+            }
+            return Ok(Some((hot.value, u64::from(hot.lookup_work))));
+        }
+
+        let relative = contextual_dense_relative_index(
+            symbol,
+            hot.dependency_mask,
+            class_count,
+        )?
+        .ok_or(SearchError::InternalInvariant {
+            detail: "complete contextual dense row received an initial symbol",
+        })?;
+        let owner_stride = contextual_dense_owner_cells(class_count)?;
+        let index = owner
+            .checked_mul(owner_stride)
+            .and_then(|begin| begin.checked_add(relative))
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "complete contextual dense transition index",
+            })?;
+        let value = *self.dense.get(index).ok_or(SearchError::InternalInvariant {
+            detail: "complete contextual dense transition is outside its fixed store",
+        })?;
+        if value == LAZY_CELL_UNFILLED {
+            return Err(SearchError::InternalInvariant {
+                detail: "complete contextual dense row missed a normalized warm symbol",
+            });
+        }
+        // The canonical warm reader charges one failed hot tag and one dense
+        // probe before returning this value.
+        Ok(Some((value, 2)))
+    }
+
     fn publish(
         &mut self,
         index: Option<usize>,
@@ -6803,6 +6881,63 @@ fn warm_context_transition_for_dependencies_metered(
     )
 }
 
+/// Read one transition without touching the live meter when the source owns a
+/// fully initialized dependency-normalized row. The returned work is exactly
+/// the source-byte charge, logical assertion checks, and retained lookup work
+/// of `warm_context_transition_for_dependencies_metered`. A complete row makes
+/// the normalized lookup total, so the broader raw-key retry is unreachable.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the fused dense reader keeps the full-haystack boundary, source tag, and logical work domain explicit"
+)]
+#[inline]
+fn warm_context_complete_dense_transition(
+    automaton: &Automaton,
+    haystack: &[u8],
+    boundary: usize,
+    context: &ContextTransitionStore,
+    hot: ContextHotTransition,
+    byte: u8,
+    global_dependencies: u32,
+) -> Result<Option<(u32, u64)>, SearchError> {
+    if hot.dense_complete == 0 {
+        return Ok(None);
+    }
+    let dependencies = hot.dependency_mask;
+    if dependencies == CONTEXT_DEPENDENCY_UNCOMPUTED
+        || dependencies & !global_dependencies != 0
+    {
+        return Err(SearchError::InternalInvariant {
+            detail: "complete contextual dense row has invalid dependencies",
+        });
+    }
+    let mut observation = PreparedBoundaryObservation::new(
+        automaton.line_terminator(),
+        haystack,
+        boundary,
+        global_dependencies,
+    );
+    let assertions = observation.project(dependencies);
+    let symbol = contextual_symbol_for_byte(automaton, byte, assertions);
+    let Some((cell, lookup_work)) = context.lookup_complete_dense_with_hot_prevalidated(
+        symbol,
+        hot,
+        global_dependencies,
+    )?
+    else {
+        return Err(SearchError::InternalInvariant {
+            detail: "complete contextual dense transition lost its certificate",
+        });
+    };
+    let work = 1_u64
+        .checked_add(u64::from(dependencies.count_ones()))
+        .and_then(|work| work.checked_add(lookup_work))
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "search work counter",
+        })?;
+    Ok(Some((cell, work)))
+}
+
 /// Project existence from one complete, already-published contextual path.
 ///
 /// Every mutable search cursor is invocation-local. The retained workspace,
@@ -6893,6 +7028,7 @@ fn try_warm_context_exists_loop<const LOOP_SKIP: bool>(
     let guard = proof.guard();
     let probe = proof.probe();
     let mut meter = WorkMeter::new(u64::MAX, INVOCATION_RESET_WORK);
+    let mut work_receipt = WarmContextWorkReceipt::new(&meter)?;
     let mut position = window.start();
     let mut initial_candidate_scanned = false;
     let mut retained_start_mask = RetainedStartMaskCursor::default();
@@ -6964,6 +7100,7 @@ fn try_warm_context_exists_loop<const LOOP_SKIP: bool>(
             && !(proof.force_haystack_start && position == 0)
         {
             let candidate = if let Some(scanner) = scanner {
+                work_receipt.settle(&mut meter, position)?;
                 if position < window.end() {
                     if let (Some(probe), Some(candidate)) = (probe, engine_candidate.take()) {
                         adaptive_probe.observe_restartable_rejection(
@@ -6992,6 +7129,7 @@ fn try_warm_context_exists_loop<const LOOP_SKIP: bool>(
                 position
             };
             if candidate == window.end() {
+                work_receipt.settle(&mut meter, candidate)?;
                 return Ok(WarmContextExistsProbe::Complete(false));
             }
             if probe.is_some() && adaptive_probe.samples_rejections() {
@@ -7033,10 +7171,12 @@ fn try_warm_context_exists_loop<const LOOP_SKIP: bool>(
         }
         entered = true;
         if position == window.end() {
+            work_receipt.settle(&mut meter, position)?;
             return Ok(WarmContextExistsProbe::Complete(false));
         }
 
         if LOOP_SKIP {
+            work_receipt.settle(&mut meter, position)?;
             let selected = lazy
                 .context_loop_skip_plans
                 .find_with_hint(state, active_loop_slot);
@@ -7106,8 +7246,6 @@ fn try_warm_context_exists_loop<const LOOP_SKIP: bool>(
         }
 
         let hot = lazy.context.hot_transition(state)?;
-        let work_before_step = meter.consumed;
-        meter.charge(1, position)?;
         let byte = *haystack
             .get(position)
             .ok_or(SearchError::InternalInvariant {
@@ -7118,34 +7256,55 @@ fn try_warm_context_exists_loop<const LOOP_SKIP: bool>(
             .ok_or(SearchError::ArithmeticOverflow {
                 computation: "warm contextual lazy DFA destination",
             })?;
-        let Some(cell) = warm_context_transition_for_dependencies_metered(
-            automaton,
-            haystack,
-            destination,
-            lazy,
-            state,
-            hot,
-            byte,
-            global_dependencies,
-            &mut meter,
-        )? else {
-            return Ok(WarmContextExistsProbe::Continue(
-                WarmContextForwardContinuation {
-                    cache_identity: lazy.cache_identity,
-                    window,
-                    phase: WarmContextForwardPhase::Cell { state },
-                    position,
-                    work: work_before_step,
-                    pending_end: None,
-                    active_start,
-                    pending_start: None,
-                    engine_candidate,
-                    retained_start_mask,
-                    adaptive_probe,
-                    loop_probe,
-                    active_loop_slot,
-                },
-            ));
+        let cell = if hot.dense_complete != 0 {
+            let (cell, work) = warm_context_complete_dense_transition(
+                automaton,
+                haystack,
+                destination,
+                &lazy.context,
+                hot,
+                byte,
+                global_dependencies,
+            )?
+            .ok_or(SearchError::InternalInvariant {
+                detail: "complete contextual dense transition declined",
+            })?;
+            work_receipt.defer_completed(&meter, work)?;
+            cell
+        } else {
+            work_receipt.settle(&mut meter, position)?;
+            let work_before_step = meter.consumed;
+            meter.charge(1, position)?;
+            let Some(cell) = warm_context_transition_for_dependencies_metered(
+                automaton,
+                haystack,
+                destination,
+                lazy,
+                state,
+                hot,
+                byte,
+                global_dependencies,
+                &mut meter,
+            )? else {
+                return Ok(WarmContextExistsProbe::Continue(
+                    WarmContextForwardContinuation {
+                        cache_identity: lazy.cache_identity,
+                        window,
+                        phase: WarmContextForwardPhase::Cell { state },
+                        position,
+                        work: work_before_step,
+                        pending_end: None,
+                        active_start,
+                        pending_start: None,
+                        engine_candidate,
+                        retained_start_mask,
+                        adaptive_probe,
+                        loop_probe,
+                        active_loop_slot,
+                    },
+                ));
+            };
+            cell
         };
         position = destination;
 
@@ -7156,10 +7315,12 @@ fn try_warm_context_exists_loop<const LOOP_SKIP: bool>(
         };
 
         if cell & LAZY_CELL_ACCEPT != 0 {
+            work_receipt.settle(&mut meter, position)?;
             return Ok(WarmContextExistsProbe::Complete(true));
         }
         let encoded = cell & LAZY_CELL_STATE_MASK;
         if encoded == 0 {
+            work_receipt.settle(&mut meter, position)?;
             return Ok(WarmContextExistsProbe::Complete(false));
         }
         state = encoded
@@ -7257,6 +7418,7 @@ fn try_warm_context_selected_end_loop<const LOOP_SKIP: bool>(
     let guard = proof.guard();
     let probe = proof.probe();
     let mut meter = WorkMeter::new(u64::MAX, INVOCATION_RESET_WORK);
+    let mut work_receipt = WarmContextWorkReceipt::new(&meter)?;
     let mut position = window.start();
     let mut initial_candidate_scanned = false;
     let mut retained_start_mask = RetainedStartMaskCursor::default();
@@ -7331,6 +7493,7 @@ fn try_warm_context_selected_end_loop<const LOOP_SKIP: bool>(
             && !(proof.force_haystack_start && position == 0)
         {
             let candidate = if let Some(scanner) = scanner {
+                work_receipt.settle(&mut meter, position)?;
                 if position < window.end() {
                     if let (Some(probe), Some(candidate)) = (probe, engine_candidate.take()) {
                         adaptive_probe.observe_restartable_rejection(
@@ -7359,6 +7522,7 @@ fn try_warm_context_selected_end_loop<const LOOP_SKIP: bool>(
                 position
             };
             if candidate == window.end() {
+                work_receipt.settle(&mut meter, candidate)?;
                 return Ok(WarmContextSelectedEndProbe::Complete(None));
             }
             if probe.is_some() && adaptive_probe.samples_rejections() {
@@ -7400,10 +7564,12 @@ fn try_warm_context_selected_end_loop<const LOOP_SKIP: bool>(
         }
         entered = true;
         if position == window.end() {
+            work_receipt.settle(&mut meter, position)?;
             return Ok(WarmContextSelectedEndProbe::Complete(pending_end));
         }
 
         if LOOP_SKIP {
+            work_receipt.settle(&mut meter, position)?;
             let selected = lazy
                 .context_loop_skip_plans
                 .find_with_hint(state, active_loop_slot);
@@ -7473,8 +7639,6 @@ fn try_warm_context_selected_end_loop<const LOOP_SKIP: bool>(
         }
 
         let hot = lazy.context.hot_transition(state)?;
-        let work_before_step = meter.consumed;
-        meter.charge(1, position)?;
         let byte = *haystack
             .get(position)
             .ok_or(SearchError::InternalInvariant {
@@ -7485,34 +7649,55 @@ fn try_warm_context_selected_end_loop<const LOOP_SKIP: bool>(
             .ok_or(SearchError::ArithmeticOverflow {
                 computation: "warm contextual lazy DFA destination",
             })?;
-        let Some(cell) = warm_context_transition_for_dependencies_metered(
-            automaton,
-            haystack,
-            destination,
-            lazy,
-            state,
-            hot,
-            byte,
-            global_dependencies,
-            &mut meter,
-        )? else {
-            return Ok(WarmContextSelectedEndProbe::Continue(
-                WarmContextForwardContinuation {
-                    cache_identity: lazy.cache_identity,
-                    window,
-                    phase: WarmContextForwardPhase::Cell { state },
-                    position,
-                    work: work_before_step,
-                    pending_end,
-                    active_start,
-                    pending_start,
-                    engine_candidate,
-                    retained_start_mask,
-                    adaptive_probe,
-                    loop_probe,
-                    active_loop_slot,
-                },
-            ));
+        let cell = if hot.dense_complete != 0 {
+            let (cell, work) = warm_context_complete_dense_transition(
+                automaton,
+                haystack,
+                destination,
+                &lazy.context,
+                hot,
+                byte,
+                global_dependencies,
+            )?
+            .ok_or(SearchError::InternalInvariant {
+                detail: "complete contextual dense transition declined",
+            })?;
+            work_receipt.defer_completed(&meter, work)?;
+            cell
+        } else {
+            work_receipt.settle(&mut meter, position)?;
+            let work_before_step = meter.consumed;
+            meter.charge(1, position)?;
+            let Some(cell) = warm_context_transition_for_dependencies_metered(
+                automaton,
+                haystack,
+                destination,
+                lazy,
+                state,
+                hot,
+                byte,
+                global_dependencies,
+                &mut meter,
+            )? else {
+                return Ok(WarmContextSelectedEndProbe::Continue(
+                    WarmContextForwardContinuation {
+                        cache_identity: lazy.cache_identity,
+                        window,
+                        phase: WarmContextForwardPhase::Cell { state },
+                        position,
+                        work: work_before_step,
+                        pending_end,
+                        active_start,
+                        pending_start,
+                        engine_candidate,
+                        retained_start_mask,
+                        adaptive_probe,
+                        loop_probe,
+                        active_loop_slot,
+                    },
+                ));
+            };
+            cell
         };
         position = destination;
 
@@ -7528,6 +7713,7 @@ fn try_warm_context_selected_end_loop<const LOOP_SKIP: bool>(
         }
         let encoded = cell & LAZY_CELL_STATE_MASK;
         if encoded == 0 {
+            work_receipt.settle(&mut meter, position)?;
             return Ok(WarmContextSelectedEndProbe::Complete(pending_end));
         }
         state = encoded
@@ -7964,6 +8150,7 @@ fn try_warm_context_span_loop<const LOOP_SKIP: bool>(
     let guard = proof.guard();
     let probe = proof.probe();
     let mut meter = WorkMeter::new(u64::MAX, INVOCATION_RESET_WORK);
+    let mut work_receipt = WarmContextWorkReceipt::new(&meter)?;
     let mut position = window.start();
     let mut initial_candidate_scanned = false;
     let mut retained_start_mask = RetainedStartMaskCursor::default();
@@ -8038,6 +8225,7 @@ fn try_warm_context_span_loop<const LOOP_SKIP: bool>(
             && !(proof.force_haystack_start && position == 0)
         {
             let candidate = if let Some(scanner) = scanner {
+                work_receipt.settle(&mut meter, position)?;
                 if position < window.end() {
                     if let (Some(probe), Some(candidate)) = (probe, engine_candidate.take()) {
                         adaptive_probe.observe_restartable_rejection(
@@ -8066,6 +8254,7 @@ fn try_warm_context_span_loop<const LOOP_SKIP: bool>(
                 position
             };
             if candidate == window.end() {
+                work_receipt.settle(&mut meter, candidate)?;
                 return Ok(WarmContextSpanProbe::Complete(None));
             }
             if probe.is_some() && adaptive_probe.samples_rejections() {
@@ -8107,6 +8296,7 @@ fn try_warm_context_span_loop<const LOOP_SKIP: bool>(
         }
         entered = true;
         if position == window.end() {
+            work_receipt.settle(&mut meter, position)?;
             return complete_warm_context_span(
                 automaton,
                 haystack,
@@ -8120,6 +8310,7 @@ fn try_warm_context_span_loop<const LOOP_SKIP: bool>(
         }
 
         if LOOP_SKIP {
+            work_receipt.settle(&mut meter, position)?;
             let selected = lazy
                 .context_loop_skip_plans
                 .find_with_hint(state, active_loop_slot);
@@ -8190,8 +8381,6 @@ fn try_warm_context_span_loop<const LOOP_SKIP: bool>(
         }
 
         let hot = lazy.context.hot_transition(state)?;
-        let work_before_step = meter.consumed;
-        meter.charge(1, position)?;
         let byte = *haystack
             .get(position)
             .ok_or(SearchError::InternalInvariant {
@@ -8202,34 +8391,55 @@ fn try_warm_context_span_loop<const LOOP_SKIP: bool>(
             .ok_or(SearchError::ArithmeticOverflow {
                 computation: "warm contextual Span destination",
             })?;
-        let Some(cell) = warm_context_transition_for_dependencies_metered(
-            automaton,
-            haystack,
-            destination,
-            lazy,
-            state,
-            hot,
-            byte,
-            global_dependencies,
-            &mut meter,
-        )? else {
-            return Ok(WarmContextSpanProbe::ContinueForward(
-                WarmContextForwardContinuation {
-                    cache_identity: lazy.cache_identity,
-                    window,
-                    phase: WarmContextForwardPhase::Cell { state },
-                    position,
-                    work: work_before_step,
-                    pending_end,
-                    active_start,
-                    pending_start,
-                    engine_candidate,
-                    retained_start_mask,
-                    adaptive_probe,
-                    loop_probe,
-                    active_loop_slot,
-                },
-            ));
+        let cell = if hot.dense_complete != 0 {
+            let (cell, work) = warm_context_complete_dense_transition(
+                automaton,
+                haystack,
+                destination,
+                &lazy.context,
+                hot,
+                byte,
+                global_dependencies,
+            )?
+            .ok_or(SearchError::InternalInvariant {
+                detail: "complete contextual dense transition declined",
+            })?;
+            work_receipt.defer_completed(&meter, work)?;
+            cell
+        } else {
+            work_receipt.settle(&mut meter, position)?;
+            let work_before_step = meter.consumed;
+            meter.charge(1, position)?;
+            let Some(cell) = warm_context_transition_for_dependencies_metered(
+                automaton,
+                haystack,
+                destination,
+                lazy,
+                state,
+                hot,
+                byte,
+                global_dependencies,
+                &mut meter,
+            )? else {
+                return Ok(WarmContextSpanProbe::ContinueForward(
+                    WarmContextForwardContinuation {
+                        cache_identity: lazy.cache_identity,
+                        window,
+                        phase: WarmContextForwardPhase::Cell { state },
+                        position,
+                        work: work_before_step,
+                        pending_end,
+                        active_start,
+                        pending_start,
+                        engine_candidate,
+                        retained_start_mask,
+                        adaptive_probe,
+                        loop_probe,
+                        active_loop_slot,
+                    },
+                ));
+            };
+            cell
         };
         position = destination;
 
@@ -8245,6 +8455,7 @@ fn try_warm_context_span_loop<const LOOP_SKIP: bool>(
         }
         let encoded = cell & LAZY_CELL_STATE_MASK;
         if encoded == 0 {
+            work_receipt.settle(&mut meter, position)?;
             return complete_warm_context_span(
                 automaton,
                 haystack,
@@ -10673,6 +10884,86 @@ impl WorkMeter {
         // itself is representable. Saturation is therefore unreachable and
         // keeps this post-success accounting update infallible.
         self.consumed = self.consumed.saturating_add(requested);
+    }
+}
+
+/// Logical work completed by immutable contextual transitions whose dense-row
+/// certificate makes a cache miss impossible.
+///
+/// Warm contextual value probes are admitted only for an unlimited search.
+/// Within that private probe, retaining an absolute checked total avoids a
+/// `WorkMeter` update on every byte while preserving the ordinary counter's
+/// overflow edge. The receipt must be settled before any operation that reads
+/// or changes the live meter, before an incomplete-row transaction, and before
+/// a result or mutable continuation escapes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WarmContextWorkReceipt {
+    base: u64,
+    accounted: u64,
+}
+
+impl WarmContextWorkReceipt {
+    fn new(meter: &WorkMeter) -> Result<Self, SearchError> {
+        if meter.limit != u64::MAX {
+            return Err(SearchError::InternalInvariant {
+                detail: "deferred contextual work requires an unlimited meter",
+            });
+        }
+        Ok(Self {
+            base: meter.consumed,
+            accounted: meter.consumed,
+        })
+    }
+
+    #[inline]
+    fn defer_completed(
+        &mut self,
+        meter: &WorkMeter,
+        requested: u64,
+    ) -> Result<(), SearchError> {
+        if self.accounted == self.base {
+            self.base = meter.consumed;
+            self.accounted = meter.consumed;
+        } else if meter.consumed != self.base {
+            return Err(SearchError::InternalInvariant {
+                detail: "deferred contextual work crossed a meter operation",
+            });
+        }
+        self.accounted = self
+            .accounted
+            .checked_add(requested)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "search work counter",
+            })?;
+        Ok(())
+    }
+
+    #[inline]
+    fn settle(
+        &mut self,
+        meter: &mut WorkMeter,
+        position: usize,
+    ) -> Result<(), SearchError> {
+        if self.accounted == self.base {
+            self.base = meter.consumed;
+            self.accounted = meter.consumed;
+            return Ok(());
+        }
+        debug_assert_eq!(meter.limit, u64::MAX);
+        if meter.consumed != self.base {
+            return Err(SearchError::InternalInvariant {
+                detail: "deferred contextual work crossed a meter operation",
+            });
+        }
+        let requested = self.accounted.checked_sub(self.base).ok_or(
+            SearchError::InternalInvariant {
+                detail: "deferred contextual work regressed",
+            },
+        )?;
+        meter.charge(requested, position)?;
+        self.base = meter.consumed;
+        self.accounted = meter.consumed;
+        Ok(())
     }
 }
 
@@ -26810,6 +27101,84 @@ mod tests {
         assert!(slot.is_some(), "the dense-row fixture exhausted a hash bucket");
     }
 
+    fn dependency_variant(dependencies: u32, variant: usize) -> u32 {
+        assert!(dependencies.count_ones() <= 2);
+        let first = dependencies & dependencies.wrapping_neg();
+        let remaining = dependencies ^ first;
+        let second = remaining & remaining.wrapping_neg();
+        let first_value = if variant & 1 == 0 { 0 } else { first };
+        let second_value = if variant & 2 == 0 { 0 } else { second };
+        first_value | second_value
+    }
+
+    fn contextual_class_representatives(automaton: &Automaton) -> Vec<u8> {
+        (0..automaton.byte_classes().count())
+            .map(|class| {
+                (0_u8..=u8::MAX)
+                    .find(|&byte| usize::from(automaton.byte_classes().class_of(byte)) == class)
+                    .expect("every byte class has a representative")
+            })
+            .collect()
+    }
+
+    fn complete_forward_context_row(
+        automaton: &Automaton,
+        workspace: &mut K0Workspace,
+        state: u32,
+    ) {
+        let dependencies = workspace
+            .lazy
+            .context
+            .hot_transition(state)
+            .unwrap()
+            .dependency_mask;
+        assert_ne!(dependencies, super::CONTEXT_DEPENDENCY_UNCOMPUTED);
+        assert!(dependencies.count_ones() <= 2);
+        let representatives = contextual_class_representatives(automaton);
+        let mut meter = WorkMeter::new(u64::MAX, 0);
+        for variant in 0..(1_usize << dependencies.count_ones()) {
+            let assertions = dependency_variant(dependencies, variant);
+            for &byte in &representatives {
+                let symbol = super::contextual_symbol_for_byte(automaton, byte, assertions);
+                assert!(matches!(
+                    super::build_context_lazy_cached_transition(
+                        automaton,
+                        state,
+                        byte,
+                        symbol,
+                        assertions,
+                        workspace,
+                        &mut meter,
+                        0,
+                        0,
+                    )
+                    .unwrap(),
+                    super::ContextLazyTransition::Ready(_)
+                ));
+            }
+        }
+        if workspace
+            .lazy
+            .context
+            .hot_transition(state)
+            .unwrap()
+            .dense_owner
+            == super::CONTEXT_DENSE_NO_OWNER
+        {
+            assert!(workspace
+                .lazy
+                .context
+                .try_claim_dense_owner(state, &mut meter)
+                .unwrap());
+        }
+        let hot = workspace.lazy.context.hot_transition(state).unwrap();
+        assert!(workspace
+            .lazy
+            .context
+            .dense_row_complete_for_hot(hot)
+            .unwrap());
+    }
+
     fn fill_context_bucket(
         store: &mut super::ContextTransitionStore,
         source: u32,
@@ -27676,6 +28045,182 @@ mod tests {
                 consumed: 1,
                 requested: 1,
                 position: 31,
+            })
+        ));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the normalized product, raw rejection, incomplete tag, and forged cell share one complete-row fixture"
+    )]
+    fn contextual_complete_dense_lookup_matches_every_metered_normalized_product() {
+        const FIRST: u32 = 1 << 2;
+        const SECOND: u32 = 1 << 7;
+        const IRRELEVANT: u32 = 1 << 17;
+        let slots = super::contextual_transition_slots(4).unwrap();
+
+        for dependencies in [0, FIRST, FIRST | SECOND] {
+            let mut store =
+                super::ContextTransitionStore::new(slots, 1, 3, usize::MAX).unwrap();
+            let variants = 1_usize << dependencies.count_ones();
+            for variant in 0..variants {
+                let assertions = dependency_variant(dependencies, variant);
+                for class in 0_u8..3 {
+                    publish_context_record(
+                        &mut store,
+                        0,
+                        super::contextual_class_symbol(class, assertions),
+                        100 + u32::try_from(variant * 3 + usize::from(class)).unwrap(),
+                    );
+                }
+            }
+            store.hot[0].dependency_mask = dependencies;
+            let mut claim = WorkMeter::new(u64::MAX, 0);
+            assert!(store.try_claim_dense_owner(0, &mut claim).unwrap());
+            let hot = store.hot[0];
+            assert!(store.dense_row_complete_for_hot(hot).unwrap());
+
+            for bit_values in 0_u32..4 {
+                let assertions = ((u32::from(bit_values & 1 != 0) * FIRST)
+                    | (u32::from(bit_values & 2 != 0) * SECOND))
+                    & dependencies;
+                let variant = super::contextual_dense_variant(assertions, dependencies).unwrap();
+                for class in 0_u8..3 {
+                    let symbol = super::contextual_class_symbol(class, assertions);
+                    let mut metered = WorkMeter::new(u64::MAX, 0);
+                    let expected = store
+                        .lookup_warm_metered_with_hot_prevalidated(
+                            0,
+                            symbol,
+                            hot,
+                            &mut metered,
+                            31,
+                        )
+                        .unwrap()
+                        .unwrap();
+                    let (actual, work) = store
+                        .lookup_complete_dense_with_hot_prevalidated(
+                            symbol,
+                            hot,
+                            FIRST | SECOND | IRRELEVANT,
+                        )
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(actual, expected);
+                    assert_eq!(actual, 100 + u32::try_from(variant * 3 + usize::from(class)).unwrap());
+                    assert_eq!(work, metered.consumed);
+                }
+            }
+
+            let raw_symbol = super::contextual_class_symbol(0, IRRELEVANT);
+            assert!(matches!(
+                store.lookup_complete_dense_with_hot_prevalidated(
+                    raw_symbol,
+                    hot,
+                    FIRST | SECOND | IRRELEVANT,
+                ),
+                Err(SearchError::InternalInvariant {
+                    detail: "complete contextual dense lookup received a raw assertion key"
+                })
+            ));
+
+            let mut incomplete = hot;
+            incomplete.dense_complete = 0;
+            assert_eq!(
+                store
+                    .lookup_complete_dense_with_hot_prevalidated(
+                        super::contextual_class_symbol(0, 0),
+                        incomplete,
+                        FIRST | SECOND | IRRELEVANT,
+                    )
+                    .unwrap(),
+                None,
+            );
+
+            // The missing counter is the monotone certificate, but the
+            // requested cell is still authenticated before it can bypass the
+            // raw and associative tiers.
+            let symbol = super::contextual_class_symbol(0, 0);
+            if hot.symbol != symbol {
+                let owner = usize::from(hot.dense_owner);
+                let relative = super::contextual_dense_relative_index(
+                    symbol,
+                    dependencies,
+                    usize::from(store.dense_class_count),
+                )
+                .unwrap()
+                .unwrap();
+                let index = owner
+                    * super::contextual_dense_owner_cells(usize::from(store.dense_class_count))
+                        .unwrap()
+                    + relative;
+                store.dense[index] = super::LAZY_CELL_UNFILLED;
+                assert!(matches!(
+                    store.lookup_complete_dense_with_hot_prevalidated(
+                        symbol,
+                        hot,
+                        FIRST | SECOND | IRRELEVANT,
+                    ),
+                    Err(SearchError::InternalInvariant {
+                        detail: "complete contextual dense row missed a normalized warm symbol"
+                    })
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn contextual_deferred_work_receipt_is_checked_unlimited_and_transactional() {
+        let mut meter = WorkMeter::new(u64::MAX, 7);
+        let mut receipt = super::WarmContextWorkReceipt::new(&meter).unwrap();
+        receipt.defer_completed(&meter, 3).unwrap();
+        receipt.defer_completed(&meter, 4).unwrap();
+        assert_eq!(meter.consumed, 7);
+        receipt.settle(&mut meter, 19).unwrap();
+        assert_eq!(meter.consumed, 14);
+        assert_eq!(receipt.base, 14);
+        assert_eq!(receipt.accounted, 14);
+
+        meter.charge(5, 20).unwrap();
+        receipt.defer_completed(&meter, 2).unwrap();
+        assert_eq!(meter.consumed, 19);
+        receipt.settle(&mut meter, 21).unwrap();
+        assert_eq!(meter.consumed, 21);
+
+        let mut overflow_meter = WorkMeter::new(u64::MAX, u64::MAX - 2);
+        let mut overflow_receipt =
+            super::WarmContextWorkReceipt::new(&overflow_meter).unwrap();
+        overflow_receipt
+            .defer_completed(&overflow_meter, 2)
+            .unwrap();
+        assert!(matches!(
+            overflow_receipt.defer_completed(&overflow_meter, 1),
+            Err(SearchError::ArithmeticOverflow {
+                computation: "search work counter"
+            })
+        ));
+        overflow_receipt
+            .settle(&mut overflow_meter, 23)
+            .unwrap();
+        assert_eq!(overflow_meter.consumed, u64::MAX);
+
+        let finite = WorkMeter::new(100, 0);
+        assert!(matches!(
+            super::WarmContextWorkReceipt::new(&finite),
+            Err(SearchError::InternalInvariant {
+                detail: "deferred contextual work requires an unlimited meter"
+            })
+        ));
+
+        let mut crossed_meter = WorkMeter::new(u64::MAX, 0);
+        let mut crossed = super::WarmContextWorkReceipt::new(&crossed_meter).unwrap();
+        crossed.defer_completed(&crossed_meter, 2).unwrap();
+        crossed_meter.charge(1, 29).unwrap();
+        assert!(matches!(
+            crossed.settle(&mut crossed_meter, 30),
+            Err(SearchError::InternalInvariant {
+                detail: "deferred contextual work crossed a meter operation"
             })
         ));
     }
@@ -45565,6 +46110,7 @@ mod tests {
     )]
     fn contextual_exists_cell_handoff_does_not_replay_filled_prefix() {
         let plan = digit_slash_then_line_end_or_bang();
+        pin_without_start_filter(&plan);
         let mut source = vec![b'!'; super::WARM_CONTEXT_MIN_WINDOW_BYTES];
         source[..3].copy_from_slice(b"0/\n");
         let window = SearchWindow::full(&source);
@@ -45591,6 +46137,75 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+        complete_forward_context_row(&plan, &mut session.workspace, initial);
+        let normalized_initial_assertions =
+            super::enabled_assertion_mask_unmetered_for_dependencies(
+                &plan,
+                root_dependencies,
+                &source,
+                0,
+            );
+        let normalized_initial_symbol =
+            super::contextual_initial_symbol(normalized_initial_assertions);
+        let initial_symbol = if session
+            .workspace
+            .lazy
+            .context
+            .lookup_existing_prevalidated(
+                CONTEXT_INITIAL_SOURCE,
+                normalized_initial_symbol,
+            )
+            .unwrap()
+            .is_some()
+        {
+            normalized_initial_symbol
+        } else {
+            let exact_initial_assertions =
+                super::enabled_assertion_mask_unmetered_for_dependencies(
+                    &plan,
+                    global_dependencies,
+                    &source,
+                    0,
+                );
+            super::contextual_initial_symbol(exact_initial_assertions)
+        };
+        let initial_slot = session
+            .workspace
+            .lazy
+            .context
+            .slots
+            .iter()
+            .position(|record| {
+                record.source == CONTEXT_INITIAL_SOURCE && record.symbol == initial_symbol
+            })
+            .unwrap();
+        let retained_initial = session.workspace.lazy.context.slots[initial_slot];
+        let retained_initial_hot = session.workspace.lazy.context.hot_initial;
+        remove_exact_context_record(
+            &mut session.workspace.lazy.context,
+            CONTEXT_INITIAL_SOURCE,
+            initial_symbol,
+        );
+        let proof = plan.start_filter_proof.get().unwrap();
+        let initial_continuation = match super::probe_warm_context_exists(
+            &plan,
+            &source,
+            window,
+            &session.workspace.lazy,
+            proof,
+        )
+        .unwrap()
+        {
+            Some(super::WarmContextExistsProbe::Continue(continuation)) => continuation,
+            other => panic!("expected accounting baseline at contextual initial, got {other:?}"),
+        };
+        assert_eq!(
+            initial_continuation.phase,
+            super::WarmContextForwardPhase::Initial,
+        );
+        session.workspace.lazy.context.slots[initial_slot] = retained_initial;
+        session.workspace.lazy.context.hot_initial = retained_initial_hot;
+
         let initial_dependencies = session
             .workspace
             .lazy
@@ -45611,6 +46226,48 @@ mod tests {
             .lookup_existing_prevalidated(initial, prefix_symbol)
             .unwrap()
             .unwrap();
+        let initial_hot = session
+            .workspace
+            .lazy
+            .context
+            .hot_transition(initial)
+            .unwrap();
+        assert!(session
+            .workspace
+            .lazy
+            .context
+            .dense_row_complete_for_hot(initial_hot)
+            .unwrap());
+        let mut prefix_work = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            super::warm_context_initial_state_for_dependencies_metered(
+                &plan,
+                &source,
+                0,
+                &session.workspace.lazy,
+                root_dependencies,
+                global_dependencies,
+                &mut prefix_work,
+            )
+            .unwrap(),
+            Some(initial),
+        );
+        prefix_work.charge(1, 0).unwrap();
+        assert_eq!(
+            super::warm_context_transition_for_dependencies_metered(
+                &plan,
+                &source,
+                1,
+                &session.workspace.lazy,
+                initial,
+                initial_hot,
+                source[0],
+                global_dependencies,
+                &mut prefix_work,
+            )
+            .unwrap(),
+            Some(prefix),
+        );
         let after_prefix = (prefix & super::LAZY_CELL_STATE_MASK)
             .checked_sub(1)
             .unwrap();
@@ -45633,7 +46290,6 @@ mod tests {
             terminal_symbol,
         );
 
-        let proof = plan.start_filter_proof.get().unwrap();
         let continuation = match super::probe_warm_context_exists(
             &plan,
             &source,
@@ -45653,6 +46309,14 @@ mod tests {
             },
         );
         assert_eq!(continuation.position, 1);
+        assert_eq!(
+            continuation.work,
+            initial_continuation
+                .work
+                .checked_add(prefix_work.consumed)
+                .unwrap(),
+            "the completed dense forward cell must settle before the next cache hole",
+        );
 
         remove_exact_context_record(
             &mut session.workspace.lazy.context,
@@ -46984,6 +47648,57 @@ mod tests {
             expected,
         );
         let selected_end = run_end + 1;
+        let proof = warm_plan.start_filter_proof.get().unwrap();
+        let global_dependencies = warm_plan.boundary_context_classifier().assertions();
+        let reverse_initial_assertions =
+            super::enabled_assertion_mask_unmetered_for_dependencies(
+                &warm_plan,
+                global_dependencies,
+                &source,
+                selected_end,
+            );
+        let reverse_initial_symbol =
+            super::contextual_initial_symbol(reverse_initial_assertions);
+        let reverse_initial_slot = warm
+            .workspace
+            .reverse
+            .context
+            .slots
+            .iter()
+            .position(|record| {
+                record.source == CONTEXT_INITIAL_SOURCE
+                    && record.symbol == reverse_initial_symbol
+            })
+            .unwrap();
+        let retained_reverse_initial =
+            warm.workspace.reverse.context.slots[reverse_initial_slot];
+        let retained_reverse_initial_hot = warm.workspace.reverse.context.hot_initial;
+        remove_exact_context_record(
+            &mut warm.workspace.reverse.context,
+            CONTEXT_INITIAL_SOURCE,
+            reverse_initial_symbol,
+        );
+        let reverse_initial_continuation = match super::probe_warm_context_span(
+            &warm_plan,
+            &source,
+            window,
+            &warm.workspace.lazy,
+            &warm.workspace.reverse,
+            proof,
+        )
+        .unwrap()
+        {
+            Some(super::WarmContextSpanProbe::ContinueReverse(continuation)) => continuation,
+            other => panic!("expected accounting baseline at reverse initial, got {other:?}"),
+        };
+        assert_eq!(
+            reverse_initial_continuation.phase,
+            super::WarmContextReversePhase::Initial,
+        );
+        warm.workspace.reverse.context.slots[reverse_initial_slot] =
+            retained_reverse_initial;
+        warm.workspace.reverse.context.hot_initial = retained_reverse_initial_hot;
+
         let first_state = super::warm_context_reverse_initial_state(
             &warm_plan,
             &source,
@@ -47011,6 +47726,39 @@ mod tests {
             .lookup_existing_prevalidated(first_state, first_symbol)
             .unwrap()
             .unwrap();
+        let first_hot = warm
+            .workspace
+            .reverse
+            .context
+            .hot_transition(first_state)
+            .unwrap();
+        let mut reverse_prefix = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            super::warm_context_reverse_initial_state_metered(
+                &warm_plan,
+                &source,
+                selected_end,
+                &warm.workspace.reverse,
+                &mut reverse_prefix,
+            )
+            .unwrap(),
+            Some(first_state),
+        );
+        reverse_prefix.charge(1, first_source).unwrap();
+        assert_eq!(
+            super::warm_context_reverse_transition_metered(
+                &warm_plan,
+                &source,
+                first_source,
+                &warm.workspace.reverse,
+                first_state,
+                first_hot,
+                source[first_source],
+                &mut reverse_prefix,
+            )
+            .unwrap(),
+            Some(first_cell),
+        );
         let second_state = (first_cell & super::LAZY_CELL_STATE_MASK)
             .checked_sub(1)
             .unwrap();
@@ -47033,7 +47781,6 @@ mod tests {
             second_symbol,
         );
 
-        let proof = warm_plan.start_filter_proof.get().unwrap();
         let unsaturated_cell_continuation = match super::probe_warm_context_span(
             &warm_plan,
             &source,
@@ -47054,6 +47801,14 @@ mod tests {
             },
         );
         assert_eq!(unsaturated_cell_continuation.cursor, first_source);
+        assert_eq!(
+            unsaturated_cell_continuation.work,
+            reverse_initial_continuation
+                .work
+                .checked_add(reverse_prefix.consumed)
+                .unwrap(),
+            "the completed dense reverse cell must settle before the next cache hole",
+        );
 
         let reverse_states = warm.workspace.reverse.state_len;
         let reverse_items = warm.workspace.reverse.item_len;
