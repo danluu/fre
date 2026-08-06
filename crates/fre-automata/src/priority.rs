@@ -11,7 +11,9 @@
 
 use core::{fmt, marker::PhantomData, mem::size_of};
 
-use crate::{k0::zero_width_edge_enabled, plan::plan_index, Automaton, StateRole};
+use crate::{
+    k0::PreparedBoundaryObservation, plan::plan_index, Automaton, EdgeKind, SearchError, StateRole,
+};
 
 const BYTE_VALUES: usize = 256;
 const NO_DFA_STATE: u32 = u32::MAX;
@@ -6380,6 +6382,20 @@ fn finite_ring_slot(position: usize, ring_len: usize) -> Result<usize, ReduceErr
         })
 }
 
+#[inline]
+fn priority_boundary_edge_enabled(
+    boundary: &mut Option<PreparedBoundaryObservation<'_>>,
+    kind: EdgeKind,
+) -> Result<bool, SearchError> {
+    match boundary {
+        Some(boundary) => boundary.edge_enabled(kind),
+        None if kind == EdgeKind::Epsilon => Ok(true),
+        None => Err(SearchError::InternalInvariant {
+            detail: "assertion-free priority row reached a non-epsilon split edge",
+        }),
+    }
+}
+
 fn walk_acyclic_sparse_rows<O, F>(
     plan: &PreparedPriorityAutomaton<O>,
     haystack: &[u8],
@@ -6403,6 +6419,7 @@ where
             detail: "sparse evaluation order has the wrong state count",
         });
     }
+    let has_assertions = plan.automaton.stats().has_assertions();
     for position in (0..=haystack.len()).rev() {
         meter.charge(1)?;
         actual.boundary_rows =
@@ -6413,6 +6430,9 @@ where
                     computation: "sparse boundary rows",
                 })?;
         let byte = haystack.get(position).copied();
+        let mut boundary = has_assertions.then(|| {
+            PreparedBoundaryObservation::for_automaton(&plan.automaton, haystack, position)
+        });
         for &state in evaluation_order {
             meter.charge(1)?;
             actual.sparse_root_evaluations = actual.sparse_root_evaluations.checked_add(1).ok_or(
@@ -6470,11 +6490,9 @@ where
                             .ok_or(ReduceError::ArithmeticOverflow {
                                 computation: "sparse edge visits",
                             })?;
-                        let enabled = zero_width_edge_enabled(
-                            &plan.automaton,
+                        let enabled = priority_boundary_edge_enabled(
+                            &mut boundary,
                             plan.automaton.edge_kinds[edge],
-                            haystack,
-                            position,
                         )
                         .map_err(|_| ReduceError::InternalInvariant {
                             detail: "validated zero-width assertion evaluation failed",
@@ -6516,6 +6534,7 @@ where
         &mut ExecutionActual,
     ) -> Result<(), ReduceError>,
 {
+    let has_assertions = plan.automaton.stats().has_assertions();
     for position in (0..=haystack.len()).rev() {
         meter.charge(1)?;
         actual.boundary_rows =
@@ -6526,6 +6545,9 @@ where
                     computation: "cyclic sparse boundary rows",
                 })?;
         let byte = haystack.get(position).copied();
+        let mut boundary = has_assertions.then(|| {
+            PreparedBoundaryObservation::for_automaton(&plan.automaton, haystack, position)
+        });
         for state in 0..plan.automaton.stats().states() {
             next_cyclic_sparse_generation(workspace, meter, actual)?;
             actual.sparse_root_evaluations = actual.sparse_root_evaluations.checked_add(1).ok_or(
@@ -6537,7 +6559,14 @@ where
                 computation: "cyclic sparse root state conversion",
             })?;
             workspace.current[plan_index(state)] = evaluate_cyclic_sparse_root(
-                plan, haystack, position, byte, state, workspace, meter, actual,
+                plan,
+                position,
+                byte,
+                state,
+                workspace,
+                &mut boundary,
+                meter,
+                actual,
             )?;
         }
         let root = workspace.current[plan_index(plan.automaton.start)];
@@ -6583,11 +6612,11 @@ fn next_cyclic_sparse_generation(
 #[allow(clippy::too_many_arguments)]
 fn evaluate_cyclic_sparse_root<O: DirectReduceValue>(
     plan: &PreparedPriorityAutomaton<O>,
-    haystack: &[u8],
     position: usize,
     byte: Option<u8>,
     root: u32,
     workspace: &mut CyclicSparseWorkspace,
+    boundary: &mut Option<PreparedBoundaryObservation<'_>>,
     meter: &mut ExecutionMeter,
     actual: &mut ExecutionActual,
 ) -> Result<Option<AnchoredOutcome>, ReduceError> {
@@ -6646,11 +6675,9 @@ fn evaluate_cyclic_sparse_root<O: DirectReduceValue>(
                             computation: "cyclic sparse edge visits",
                         },
                     )?;
-                    let enabled = zero_width_edge_enabled(
-                        &plan.automaton,
+                    let enabled = priority_boundary_edge_enabled(
+                        boundary,
                         plan.automaton.edge_kinds[edge],
-                        haystack,
-                        position,
                     )
                     .map_err(|_| ReduceError::InternalInvariant {
                         detail: "validated cyclic zero-width assertion evaluation failed",
@@ -6701,6 +6728,7 @@ where
             detail: "tagged evaluation order has the wrong state count",
         });
     }
+    let has_assertions = plan.automaton.stats().has_assertions();
     for position in (0..=haystack.len()).rev() {
         meter.charge(1)?;
         actual.boundary_rows =
@@ -6711,6 +6739,9 @@ where
                     computation: "tagged acyclic boundary rows",
                 })?;
         let byte = haystack.get(position).copied();
+        let mut boundary = has_assertions.then(|| {
+            PreparedBoundaryObservation::for_automaton(&plan.automaton, haystack, position)
+        });
         for &state in evaluation_order {
             meter.charge(1)?;
             increment_tagged_state_evaluations(actual)?;
@@ -6742,11 +6773,9 @@ where
                     for edge in plan.automaton.state_edges(state) {
                         meter.charge(1)?;
                         increment_tagged_edge_visits(actual)?;
-                        let enabled = zero_width_edge_enabled(
-                            &plan.automaton,
+                        let enabled = priority_boundary_edge_enabled(
+                            &mut boundary,
                             plan.automaton.edge_kinds[edge],
-                            haystack,
-                            position,
                         )
                         .map_err(|_| ReduceError::InternalInvariant {
                             detail: "validated tagged zero-width assertion evaluation failed",
@@ -6789,6 +6818,7 @@ where
         &mut ExecutionActual,
     ) -> Result<(), ReduceError>,
 {
+    let has_assertions = plan.automaton.stats().has_assertions();
     for position in (0..=haystack.len()).rev() {
         meter.charge(1)?;
         actual.boundary_rows =
@@ -6799,13 +6829,24 @@ where
                     computation: "tagged cyclic boundary rows",
                 })?;
         let byte = haystack.get(position).copied();
+        let mut boundary = has_assertions.then(|| {
+            PreparedBoundaryObservation::for_automaton(&plan.automaton, haystack, position)
+        });
         for state in 0..plan.automaton.stats().states() {
             next_cyclic_sparse_generation(workspace, meter, actual)?;
             let state = u32::try_from(state).map_err(|_| ReduceError::ArithmeticOverflow {
                 computation: "tagged cyclic root state conversion",
             })?;
             workspace.current[plan_index(state)] = evaluate_cyclic_tagged_root(
-                plan, haystack, position, byte, state, workspace, dispatcher, meter, actual,
+                plan,
+                position,
+                byte,
+                state,
+                workspace,
+                &mut boundary,
+                dispatcher,
+                meter,
+                actual,
             )?;
         }
         let root = workspace.current[plan_index(plan.automaton.start)];
@@ -6818,11 +6859,11 @@ where
 #[allow(clippy::too_many_arguments)]
 fn evaluate_cyclic_tagged_root<O: DirectReduceValue>(
     plan: &PreparedPriorityAutomaton<O>,
-    haystack: &[u8],
     position: usize,
     byte: Option<u8>,
     root: u32,
     workspace: &mut CyclicSparseWorkspace,
+    boundary: &mut Option<PreparedBoundaryObservation<'_>>,
     dispatcher: &mut dyn TaggedCandidateDispatcher,
     meter: &mut ExecutionMeter,
     actual: &mut ExecutionActual,
@@ -6867,11 +6908,9 @@ fn evaluate_cyclic_tagged_root<O: DirectReduceValue>(
                 for edge in plan.automaton.state_edges(state).rev() {
                     meter.charge(1)?;
                     increment_tagged_edge_visits(actual)?;
-                    let enabled = zero_width_edge_enabled(
-                        &plan.automaton,
+                    let enabled = priority_boundary_edge_enabled(
+                        boundary,
                         plan.automaton.edge_kinds[edge],
-                        haystack,
-                        position,
                     )
                     .map_err(|_| ReduceError::InternalInvariant {
                         detail: "validated cyclic tagged zero-width assertion evaluation failed",
@@ -8040,6 +8079,19 @@ mod tests {
         assert_eq!(
             traced.report().actual().work,
             ordinary.actual().work + trace_delta
+        );
+    }
+
+    #[test]
+    fn assertion_free_priority_rows_directly_enable_only_epsilon() {
+        let mut boundary: Option<crate::k0::PreparedBoundaryObservation<'static>> = None;
+        for _ in 0..32 {
+            assert!(
+                super::priority_boundary_edge_enabled(&mut boundary, EdgeKind::Epsilon).unwrap()
+            );
+        }
+        assert!(
+            super::priority_boundary_edge_enabled(&mut boundary, EdgeKind::ByteRange).is_err()
         );
     }
 

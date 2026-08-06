@@ -22928,7 +22928,7 @@ fn project_complete_context_dependencies_with_classifier(
 /// Raw byte-derived properties and Unicode word classification each stay
 /// unprepared until a requested dependency needs that family. A broader
 /// raw-key retry computes each observation at most once and reuses it.
-struct PreparedBoundaryObservation<'h> {
+pub(crate) struct PreparedBoundaryObservation<'h> {
     haystack: &'h [u8],
     position: usize,
     line_terminator: u8,
@@ -22942,6 +22942,25 @@ struct PreparedBoundaryObservation<'h> {
 }
 
 impl<'h> PreparedBoundaryObservation<'h> {
+    /// Start one lazy observation for a boundary in an authenticated graph.
+    ///
+    /// The graph-derived dependency mask keeps projections honest while raw
+    /// byte facts and Unicode classification remain unprepared until an edge
+    /// from the corresponding family is actually visited.
+    #[inline]
+    pub(crate) fn for_automaton(
+        automaton: &Automaton,
+        haystack: &'h [u8],
+        position: usize,
+    ) -> Self {
+        Self::new(
+            automaton.line_terminator(),
+            haystack,
+            position,
+            automaton.boundary_context_classifier().assertions(),
+        )
+    }
+
     #[inline]
     fn new(
         line_terminator: u8,
@@ -23044,6 +23063,23 @@ impl<'h> PreparedBoundaryObservation<'h> {
         enabled
     }
 
+    /// Evaluate one authenticated zero-width edge from this shared boundary.
+    ///
+    /// Epsilon remains allocation- and classification-free. Assertion edges
+    /// request only their own dependency bit, allowing every edge visit to
+    /// retain its exact priority and accounting while repeated visits share
+    /// the underlying boundary facts.
+    #[inline]
+    pub(crate) fn edge_enabled(&mut self, kind: EdgeKind) -> Result<bool, SearchError> {
+        if kind == EdgeKind::Epsilon {
+            return Ok(true);
+        }
+        let dependency = kind.assertion_bit().ok_or(SearchError::InternalInvariant {
+            detail: "split state contained a consuming edge",
+        })?;
+        Ok(self.project(dependency) & dependency != 0)
+    }
+
     /// Charge the same logical assertion checks as the canonical boundary
     /// evaluator, then project them from this invocation's shared observation.
     fn project_metered(
@@ -23067,12 +23103,12 @@ impl<'h> PreparedBoundaryObservation<'h> {
     }
 
     #[cfg(test)]
-    fn raw_preparations(&self) -> u8 {
+    pub(crate) fn raw_preparations(&self) -> u8 {
         self.raw_preparations
     }
 
     #[cfg(test)]
-    fn unicode_classifications(&self) -> u8 {
+    pub(crate) fn unicode_classifications(&self) -> u8 {
         self.unicode_classifications
     }
 }
@@ -24948,6 +24984,39 @@ mod tests {
             .fold(0_u32, |mask, kind| {
                 mask | kind.assertion_bit().unwrap()
             })
+    }
+
+    fn assert_prepared_boundary_edges_match_canonical(
+        plan: &Automaton,
+        haystack: &[u8],
+        position: usize,
+    ) {
+        let mut observation = super::PreparedBoundaryObservation::for_automaton(
+            plan,
+            haystack,
+            position,
+        );
+        for kind in core::iter::once(EdgeKind::Epsilon)
+            .chain(super::ASSERTION_KINDS)
+            .chain(core::iter::once(EdgeKind::ByteRange))
+        {
+            assert_eq!(
+                observation.edge_enabled(kind),
+                super::zero_width_edge_enabled(plan, kind, haystack, position),
+                "kind={kind:?} terminator={:#04x} source={haystack:?} position={position}",
+                plan.line_terminator(),
+            );
+        }
+        assert_eq!(
+            observation.raw_preparations(),
+            1,
+            "raw facts must be shared across every raw assertion edge"
+        );
+        assert_eq!(
+            observation.unicode_classifications(),
+            1,
+            "Unicode classification must be shared across every Unicode assertion edge"
+        );
     }
 
     fn trailing_assertion_or_bang(assertion: EdgeKind) -> Automaton {
@@ -42114,6 +42183,67 @@ mod tests {
                         observation.project(dependencies),
                         expected,
                         "dependencies={dependencies:#07x} terminator={line_terminator:#04x} source={haystack:?} position={position}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_boundary_edges_match_every_canonical_boundary_domain() {
+        for line_terminator in u8::MIN..=u8::MAX {
+            let plan = every_assertion().with_line_terminator(line_terminator);
+            let haystacks = [
+                Vec::new(),
+                vec![line_terminator],
+                vec![b'\r', line_terminator, b'\n'],
+                vec![line_terminator, b'_', 0x80, line_terminator],
+            ];
+            for haystack in haystacks {
+                for position in 0..=haystack.len() {
+                    assert_prepared_boundary_edges_match_canonical(
+                        &plan,
+                        &haystack,
+                        position,
+                    );
+                }
+            }
+        }
+
+        let plan = every_assertion().with_line_terminator(b';');
+        for byte in u8::MIN..=u8::MAX {
+            let haystack = [byte];
+            assert_prepared_boundary_edges_match_canonical(&plan, &haystack, 0);
+            assert_prepared_boundary_edges_match_canonical(&plan, &haystack, haystack.len());
+        }
+        for before in u8::MIN..=u8::MAX {
+            for after in u8::MIN..=u8::MAX {
+                assert_prepared_boundary_edges_match_canonical(&plan, &[before, after], 1);
+            }
+        }
+
+        let unicode_and_malformed = [
+            Vec::new(),
+            "a_!".as_bytes().to_vec(),
+            "é_β!".as_bytes().to_vec(),
+            "中β_💩!".as_bytes().to_vec(),
+            "a\u{301}β".as_bytes().to_vec(),
+            vec![0xc3],
+            vec![0x80, b'a'],
+            vec![0xc0, 0xaf],
+            vec![0xed, 0xa0, 0x80],
+            vec![0xf0, 0x28, 0x8c, 0xbc],
+            vec![0xf0, 0x9f, 0x92],
+            vec![0xf4, 0x90, 0x80, 0x80],
+        ];
+        for line_terminator in [0, b'\r', b'\n', b';', 0x7f, 0xff] {
+            let plan = every_assertion().with_line_terminator(line_terminator);
+            for haystack in &unicode_and_malformed {
+                for position in 0..=haystack.len() {
+                    assert_prepared_boundary_edges_match_canonical(
+                        &plan,
+                        haystack,
+                        position,
                     );
                 }
             }
