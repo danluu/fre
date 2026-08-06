@@ -12,7 +12,12 @@
 use core::{fmt, marker::PhantomData, mem::size_of};
 
 use crate::{
-    k0::PreparedBoundaryObservation, plan::plan_index, Automaton, EdgeKind, SearchError, StateRole,
+    k0::{
+        boundary_fact_reuse_is_profitable, zero_width_edge_enabled_with_line_terminator,
+        PreparedBoundaryFacts,
+    },
+    plan::plan_index,
+    Automaton, EdgeKind, SearchError, StateRole,
 };
 
 const BYTE_VALUES: usize = 256;
@@ -6383,19 +6388,59 @@ fn finite_ring_slot(position: usize, ring_len: usize) -> Result<usize, ReduceErr
 }
 
 #[inline]
-fn priority_boundary_edge_enabled(
-    boundary: &mut Option<PreparedBoundaryObservation<'_>>,
+fn priority_boundary_edge_enabled<'h>(
+    strategy: PriorityBoundaryStrategy,
+    automaton: &Automaton,
+    haystack: &'h [u8],
+    position: usize,
+    boundary: &mut Option<PreparedBoundaryFacts<'h>>,
     kind: EdgeKind,
 ) -> Result<bool, SearchError> {
-    match boundary {
-        Some(boundary) => boundary.edge_enabled(kind),
-        None if kind == EdgeKind::Epsilon => Ok(true),
-        None => Err(SearchError::InternalInvariant {
-            detail: "assertion-free priority row reached a non-epsilon split edge",
+    if kind == EdgeKind::Epsilon {
+        return Ok(true);
+    }
+    if kind == EdgeKind::ByteRange {
+        return Err(SearchError::InternalInvariant {
+            detail: "split state contained a consuming edge",
+        });
+    }
+    match strategy {
+        PriorityBoundaryStrategy::AssertionFree => Err(SearchError::InternalInvariant {
+            detail: "assertion-free priority row reached an assertion edge",
         }),
+        PriorityBoundaryStrategy::Direct => zero_width_edge_enabled_with_line_terminator(
+            automaton.line_terminator(),
+            kind,
+            haystack,
+            position,
+        ),
+        PriorityBoundaryStrategy::Cached => boundary
+            .get_or_insert_with(|| PreparedBoundaryFacts::new(automaton, haystack, position))
+            .edge_enabled(kind),
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PriorityBoundaryStrategy {
+    AssertionFree,
+    Direct,
+    Cached,
+}
+
+fn priority_boundary_strategy(
+    automaton: &Automaton,
+    cyclic: bool,
+) -> PriorityBoundaryStrategy {
+    if automaton.stats().assertion_edges() == 0 {
+        PriorityBoundaryStrategy::AssertionFree
+    } else if cyclic || boundary_fact_reuse_is_profitable(automaton) {
+        PriorityBoundaryStrategy::Cached
+    } else {
+        PriorityBoundaryStrategy::Direct
+    }
+}
+
+#[allow(clippy::too_many_lines)]
 fn walk_acyclic_sparse_rows<O, F>(
     plan: &PreparedPriorityAutomaton<O>,
     haystack: &[u8],
@@ -6419,7 +6464,7 @@ where
             detail: "sparse evaluation order has the wrong state count",
         });
     }
-    let has_assertions = plan.automaton.stats().has_assertions();
+    let boundary_strategy = priority_boundary_strategy(&plan.automaton, false);
     for position in (0..=haystack.len()).rev() {
         meter.charge(1)?;
         actual.boundary_rows =
@@ -6430,9 +6475,7 @@ where
                     computation: "sparse boundary rows",
                 })?;
         let byte = haystack.get(position).copied();
-        let mut boundary = has_assertions.then(|| {
-            PreparedBoundaryObservation::for_automaton(&plan.automaton, haystack, position)
-        });
+        let mut boundary = None;
         for &state in evaluation_order {
             meter.charge(1)?;
             actual.sparse_root_evaluations = actual.sparse_root_evaluations.checked_add(1).ok_or(
@@ -6491,6 +6534,10 @@ where
                                 computation: "sparse edge visits",
                             })?;
                         let enabled = priority_boundary_edge_enabled(
+                            boundary_strategy,
+                            &plan.automaton,
+                            haystack,
+                            position,
                             &mut boundary,
                             plan.automaton.edge_kinds[edge],
                         )
@@ -6534,7 +6581,7 @@ where
         &mut ExecutionActual,
     ) -> Result<(), ReduceError>,
 {
-    let has_assertions = plan.automaton.stats().has_assertions();
+    let boundary_strategy = priority_boundary_strategy(&plan.automaton, true);
     for position in (0..=haystack.len()).rev() {
         meter.charge(1)?;
         actual.boundary_rows =
@@ -6545,9 +6592,7 @@ where
                     computation: "cyclic sparse boundary rows",
                 })?;
         let byte = haystack.get(position).copied();
-        let mut boundary = has_assertions.then(|| {
-            PreparedBoundaryObservation::for_automaton(&plan.automaton, haystack, position)
-        });
+        let mut boundary = None;
         for state in 0..plan.automaton.stats().states() {
             next_cyclic_sparse_generation(workspace, meter, actual)?;
             actual.sparse_root_evaluations = actual.sparse_root_evaluations.checked_add(1).ok_or(
@@ -6560,10 +6605,12 @@ where
             })?;
             workspace.current[plan_index(state)] = evaluate_cyclic_sparse_root(
                 plan,
+                haystack,
                 position,
                 byte,
                 state,
                 workspace,
+                boundary_strategy,
                 &mut boundary,
                 meter,
                 actual,
@@ -6610,13 +6657,15 @@ fn next_cyclic_sparse_generation(
 // Cyclic zero-width graphs retain the bounded root-local DFS used before the
 // acyclic whole-row executor was introduced.
 #[allow(clippy::too_many_arguments)]
-fn evaluate_cyclic_sparse_root<O: DirectReduceValue>(
+fn evaluate_cyclic_sparse_root<'h, O: DirectReduceValue>(
     plan: &PreparedPriorityAutomaton<O>,
+    haystack: &'h [u8],
     position: usize,
     byte: Option<u8>,
     root: u32,
     workspace: &mut CyclicSparseWorkspace,
-    boundary: &mut Option<PreparedBoundaryObservation<'_>>,
+    boundary_strategy: PriorityBoundaryStrategy,
+    boundary: &mut Option<PreparedBoundaryFacts<'h>>,
     meter: &mut ExecutionMeter,
     actual: &mut ExecutionActual,
 ) -> Result<Option<AnchoredOutcome>, ReduceError> {
@@ -6676,6 +6725,10 @@ fn evaluate_cyclic_sparse_root<O: DirectReduceValue>(
                         },
                     )?;
                     let enabled = priority_boundary_edge_enabled(
+                        boundary_strategy,
+                        &plan.automaton,
+                        haystack,
+                        position,
                         boundary,
                         plan.automaton.edge_kinds[edge],
                     )
@@ -6728,7 +6781,7 @@ where
             detail: "tagged evaluation order has the wrong state count",
         });
     }
-    let has_assertions = plan.automaton.stats().has_assertions();
+    let boundary_strategy = priority_boundary_strategy(&plan.automaton, false);
     for position in (0..=haystack.len()).rev() {
         meter.charge(1)?;
         actual.boundary_rows =
@@ -6739,9 +6792,7 @@ where
                     computation: "tagged acyclic boundary rows",
                 })?;
         let byte = haystack.get(position).copied();
-        let mut boundary = has_assertions.then(|| {
-            PreparedBoundaryObservation::for_automaton(&plan.automaton, haystack, position)
-        });
+        let mut boundary = None;
         for &state in evaluation_order {
             meter.charge(1)?;
             increment_tagged_state_evaluations(actual)?;
@@ -6774,6 +6825,10 @@ where
                         meter.charge(1)?;
                         increment_tagged_edge_visits(actual)?;
                         let enabled = priority_boundary_edge_enabled(
+                            boundary_strategy,
+                            &plan.automaton,
+                            haystack,
+                            position,
                             &mut boundary,
                             plan.automaton.edge_kinds[edge],
                         )
@@ -6818,7 +6873,7 @@ where
         &mut ExecutionActual,
     ) -> Result<(), ReduceError>,
 {
-    let has_assertions = plan.automaton.stats().has_assertions();
+    let boundary_strategy = priority_boundary_strategy(&plan.automaton, true);
     for position in (0..=haystack.len()).rev() {
         meter.charge(1)?;
         actual.boundary_rows =
@@ -6829,9 +6884,7 @@ where
                     computation: "tagged cyclic boundary rows",
                 })?;
         let byte = haystack.get(position).copied();
-        let mut boundary = has_assertions.then(|| {
-            PreparedBoundaryObservation::for_automaton(&plan.automaton, haystack, position)
-        });
+        let mut boundary = None;
         for state in 0..plan.automaton.stats().states() {
             next_cyclic_sparse_generation(workspace, meter, actual)?;
             let state = u32::try_from(state).map_err(|_| ReduceError::ArithmeticOverflow {
@@ -6839,10 +6892,12 @@ where
             })?;
             workspace.current[plan_index(state)] = evaluate_cyclic_tagged_root(
                 plan,
+                haystack,
                 position,
                 byte,
                 state,
                 workspace,
+                boundary_strategy,
                 &mut boundary,
                 dispatcher,
                 meter,
@@ -6857,13 +6912,15 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-fn evaluate_cyclic_tagged_root<O: DirectReduceValue>(
+fn evaluate_cyclic_tagged_root<'h, O: DirectReduceValue>(
     plan: &PreparedPriorityAutomaton<O>,
+    haystack: &'h [u8],
     position: usize,
     byte: Option<u8>,
     root: u32,
     workspace: &mut CyclicSparseWorkspace,
-    boundary: &mut Option<PreparedBoundaryObservation<'_>>,
+    boundary_strategy: PriorityBoundaryStrategy,
+    boundary: &mut Option<PreparedBoundaryFacts<'h>>,
     dispatcher: &mut dyn TaggedCandidateDispatcher,
     meter: &mut ExecutionMeter,
     actual: &mut ExecutionActual,
@@ -6909,6 +6966,10 @@ fn evaluate_cyclic_tagged_root<O: DirectReduceValue>(
                     meter.charge(1)?;
                     increment_tagged_edge_visits(actual)?;
                     let enabled = priority_boundary_edge_enabled(
+                        boundary_strategy,
+                        &plan.automaton,
+                        haystack,
+                        position,
                         boundary,
                         plan.automaton.edge_kinds[edge],
                     )
@@ -7530,6 +7591,156 @@ mod tests {
         )
     }
 
+    fn boundary_strategy_automaton(assertions: &[EdgeKind]) -> Automaton {
+        let edge_kinds = if assertions.is_empty() {
+            vec![EdgeKind::Epsilon]
+        } else {
+            assertions.to_vec()
+        };
+        let edges = u32::try_from(edge_kinds.len()).unwrap();
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![StateRole::Split, StateRole::Accept],
+                edge_offsets: vec![0, edges, edges],
+                edge_targets: vec![1; edge_kinds.len()],
+                byte_starts: vec![0; edge_kinds.len()],
+                byte_ends: vec![0; edge_kinds.len()],
+                edge_kinds,
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    const PRIORITY_ASSERTION_KINDS: [EdgeKind; 18] = [
+        EdgeKind::AssertHaystackStart,
+        EdgeKind::AssertHaystackEnd,
+        EdgeKind::AssertLineStartLf,
+        EdgeKind::AssertLineEndLf,
+        EdgeKind::AssertLineStartCrlf,
+        EdgeKind::AssertLineEndCrlf,
+        EdgeKind::AssertWordAscii,
+        EdgeKind::AssertWordAsciiNegate,
+        EdgeKind::AssertWordStartAscii,
+        EdgeKind::AssertWordEndAscii,
+        EdgeKind::AssertWordStartHalfAscii,
+        EdgeKind::AssertWordEndHalfAscii,
+        EdgeKind::AssertWordUnicode,
+        EdgeKind::AssertWordUnicodeNegate,
+        EdgeKind::AssertWordStartUnicode,
+        EdgeKind::AssertWordEndUnicode,
+        EdgeKind::AssertWordStartHalfUnicode,
+        EdgeKind::AssertWordEndHalfUnicode,
+    ];
+
+    fn asserted_literal(
+        assertion: EdgeKind,
+        cyclic: bool,
+        line_terminator: u8,
+    ) -> PriorityAutomataFacts {
+        let (roles, edge_offsets, edge_targets, edge_kinds, byte_starts, byte_ends) = if cyclic {
+            (
+                vec![
+                    StateRole::Split,
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Accept,
+                ],
+                vec![0, 1, 3, 4, 4],
+                vec![1, 0, 2, 3],
+                vec![
+                    assertion,
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::ByteRange,
+                ],
+                vec![0, 0, 0, b'a'],
+                vec![0, 0, 0, b'a'],
+            )
+        } else {
+            (
+                vec![StateRole::Split, StateRole::Consume, StateRole::Accept],
+                vec![0, 1, 2, 2],
+                vec![1, 2],
+                vec![assertion, EdgeKind::ByteRange],
+                vec![0, b'a'],
+                vec![0, b'a'],
+            )
+        };
+        let automaton = Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles,
+                edge_offsets,
+                edge_targets,
+                edge_kinds,
+                byte_starts,
+                byte_ends,
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+        .with_line_terminator(line_terminator);
+        let mut actions = vec![None; automaton.stats().states()];
+        let accept = actions.len().checked_sub(1).unwrap();
+        actions[accept] = Some(action(0));
+        PriorityAutomataFacts::new(
+            automaton,
+            actions,
+            MatchLengthProof::Exact(1),
+            EmptyMatchProgress::Byte,
+        )
+    }
+
+    #[allow(clippy::arithmetic_side_effects)]
+    fn expected_asserted_literal_trace(
+        assertion: EdgeKind,
+        line_terminator: u8,
+        haystack: &[u8],
+    ) -> Vec<(u32, usize, usize)> {
+        haystack
+            .iter()
+            .enumerate()
+            .filter_map(|(position, &byte)| {
+                (byte == b'a'
+                    && crate::k0::zero_width_edge_enabled_with_line_terminator(
+                        line_terminator,
+                        assertion,
+                        haystack,
+                        position,
+                    )
+                    .unwrap())
+                .then_some((0, position, position + 1))
+            })
+            .collect()
+    }
+
+    fn assert_prepared_boundary_topology(
+        plan: &super::PreparedPriorityAutomaton<DirectTrace>,
+        route: ForcedExecution,
+        cyclic: bool,
+    ) {
+        let evaluation = match (&plan.route, route) {
+            (super::PreparedRoute::Sparse { evaluation }, ForcedExecution::Sparse)
+            | (
+                super::PreparedRoute::FiniteHorizon { evaluation, .. },
+                ForcedExecution::FiniteHorizon,
+            ) => evaluation,
+            (super::PreparedRoute::FullTransducer(transducer), ForcedExecution::FullDfa) => {
+                &transducer.evaluation
+            }
+            (super::PreparedRoute::LazyTransducer(transducer), ForcedExecution::LazyDfa) => {
+                &transducer.evaluation
+            }
+            _ => panic!("asserted literal selected an unexpected priority route"),
+        };
+        assert_eq!(
+            matches!(evaluation, super::SparseEvaluation::Cyclic),
+            cyclic,
+        );
+    }
+
     fn words(max_len: usize) -> Vec<Vec<u8>> {
         let mut words = vec![Vec::new()];
         let mut frontier = vec![Vec::new()];
@@ -8084,15 +8295,345 @@ mod tests {
 
     #[test]
     fn assertion_free_priority_rows_directly_enable_only_epsilon() {
-        let mut boundary: Option<crate::k0::PreparedBoundaryObservation<'static>> = None;
+        let automaton = boundary_strategy_automaton(&[]);
+        let strategy = super::priority_boundary_strategy(&automaton, false);
+        let mut boundary = None;
         for _ in 0..32 {
-            assert!(
-                super::priority_boundary_edge_enabled(&mut boundary, EdgeKind::Epsilon).unwrap()
+            assert!(super::priority_boundary_edge_enabled(
+                strategy,
+                &automaton,
+                b"",
+                0,
+                &mut boundary,
+                EdgeKind::Epsilon,
+            )
+            .unwrap());
+        }
+        assert!(boundary.is_none());
+        assert!(super::priority_boundary_edge_enabled(
+            strategy,
+            &automaton,
+            b"",
+            0,
+            &mut boundary,
+            EdgeKind::ByteRange,
+        )
+        .is_err());
+        assert!(boundary.is_none());
+    }
+
+    #[test]
+    fn priority_boundary_strategy_uses_graph_reuse_and_cyclic_ownership() {
+        fn check(
+            assertions: &[EdgeKind],
+            cyclic: bool,
+            expected: super::PriorityBoundaryStrategy,
+        ) {
+            let automaton = boundary_strategy_automaton(assertions);
+            assert_eq!(
+                super::priority_boundary_strategy(&automaton, cyclic),
+                expected,
             );
         }
-        assert!(
-            super::priority_boundary_edge_enabled(&mut boundary, EdgeKind::ByteRange).is_err()
+
+        check(&[], false, super::PriorityBoundaryStrategy::AssertionFree);
+        check(&[], true, super::PriorityBoundaryStrategy::AssertionFree);
+        check(
+            &[EdgeKind::AssertHaystackStart],
+            false,
+            super::PriorityBoundaryStrategy::Direct,
         );
+        check(
+            &[EdgeKind::AssertHaystackStart],
+            true,
+            super::PriorityBoundaryStrategy::Cached,
+        );
+        check(
+            &[
+                EdgeKind::AssertHaystackStart,
+                EdgeKind::AssertWordUnicode,
+            ],
+            false,
+            super::PriorityBoundaryStrategy::Direct,
+        );
+        check(
+            &[
+                EdgeKind::AssertHaystackStart,
+                EdgeKind::AssertHaystackEnd,
+            ],
+            false,
+            super::PriorityBoundaryStrategy::Cached,
+        );
+        check(
+            &[
+                EdgeKind::AssertLineStartLf,
+                EdgeKind::AssertWordAscii,
+            ],
+            false,
+            super::PriorityBoundaryStrategy::Cached,
+        );
+    }
+
+    #[test]
+    fn priority_cached_boundary_is_created_only_for_a_reached_assertion() {
+        let automaton = boundary_strategy_automaton(&[
+            EdgeKind::AssertHaystackStart,
+            EdgeKind::AssertHaystackEnd,
+        ]);
+        let strategy = super::priority_boundary_strategy(&automaton, false);
+        assert_eq!(strategy, super::PriorityBoundaryStrategy::Cached);
+        let mut boundary = None;
+
+        for _ in 0..8 {
+            assert!(super::priority_boundary_edge_enabled(
+                strategy,
+                &automaton,
+                b"x",
+                0,
+                &mut boundary,
+                EdgeKind::Epsilon,
+            )
+            .unwrap());
+        }
+        assert!(boundary.is_none());
+        assert!(super::priority_boundary_edge_enabled(
+            strategy,
+            &automaton,
+            b"x",
+            0,
+            &mut boundary,
+            EdgeKind::ByteRange,
+        )
+        .is_err());
+        assert!(boundary.is_none());
+
+        assert!(super::priority_boundary_edge_enabled(
+            strategy,
+            &automaton,
+            b"x",
+            0,
+            &mut boundary,
+            EdgeKind::AssertHaystackStart,
+        )
+        .unwrap());
+        let facts = boundary.as_ref().unwrap();
+        assert_eq!(facts.family_preparations(), [1, 0, 0, 0, 0]);
+        assert_eq!(facts.neighbor_preparations(), 0);
+
+        let direct = boundary_strategy_automaton(&[EdgeKind::AssertLineStartLf]);
+        let strategy = super::priority_boundary_strategy(&direct, false);
+        assert_eq!(strategy, super::PriorityBoundaryStrategy::Direct);
+        let mut boundary = None;
+        assert!(super::priority_boundary_edge_enabled(
+            strategy,
+            &direct,
+            b"\na",
+            1,
+            &mut boundary,
+            EdgeKind::AssertLineStartLf,
+        )
+        .unwrap());
+        assert!(boundary.is_none());
+    }
+
+    #[test]
+    fn priority_boundary_evaluators_match_the_canonical_boundary_domain() {
+        fn check(plan: &Automaton, haystack: &[u8], position: usize) {
+            for strategy in [
+                super::PriorityBoundaryStrategy::Direct,
+                super::PriorityBoundaryStrategy::Cached,
+            ] {
+                let mut boundary = None;
+                for _ in 0..2 {
+                    assert!(super::priority_boundary_edge_enabled(
+                        strategy,
+                        plan,
+                        haystack,
+                        position,
+                        &mut boundary,
+                        EdgeKind::Epsilon,
+                    )
+                    .unwrap());
+                    for kind in PRIORITY_ASSERTION_KINDS {
+                        assert_eq!(
+                            super::priority_boundary_edge_enabled(
+                                strategy,
+                                plan,
+                                haystack,
+                                position,
+                                &mut boundary,
+                                kind,
+                            )
+                            .unwrap(),
+                            crate::k0::zero_width_edge_enabled_with_line_terminator(
+                                plan.line_terminator(),
+                                kind,
+                                haystack,
+                                position,
+                            )
+                            .unwrap(),
+                            "strategy={strategy:?} kind={kind:?} terminator={:#04x} source={haystack:?} position={position}",
+                            plan.line_terminator(),
+                        );
+                    }
+                }
+                match strategy {
+                    super::PriorityBoundaryStrategy::Direct => assert!(boundary.is_none()),
+                    super::PriorityBoundaryStrategy::Cached => {
+                        let facts = boundary.as_ref().unwrap();
+                        assert_eq!(facts.family_preparations(), [1, 1, 1, 1, 1]);
+                        assert_eq!(facts.neighbor_preparations(), 1);
+                    }
+                    super::PriorityBoundaryStrategy::AssertionFree => unreachable!(),
+                }
+                assert!(super::priority_boundary_edge_enabled(
+                    strategy,
+                    plan,
+                    haystack,
+                    position,
+                    &mut boundary,
+                    EdgeKind::ByteRange,
+                )
+                .is_err());
+            }
+        }
+
+        for line_terminator in u8::MIN..=u8::MAX {
+            let plan = boundary_strategy_automaton(&PRIORITY_ASSERTION_KINDS)
+                .with_line_terminator(line_terminator);
+            for haystack in [
+                vec![],
+                vec![line_terminator],
+                vec![b'\r', line_terminator, b'\n'],
+                vec![line_terminator, b'_', 0x80, line_terminator],
+            ] {
+                for position in 0..=haystack.len() {
+                    check(&plan, &haystack, position);
+                }
+            }
+        }
+
+        let plan = boundary_strategy_automaton(&PRIORITY_ASSERTION_KINDS)
+            .with_line_terminator(b';');
+        for before in u8::MIN..=u8::MAX {
+            for after in u8::MIN..=u8::MAX {
+                check(&plan, &[before, after], 1);
+            }
+        }
+        for haystack in [
+            "é_β!".as_bytes().to_vec(),
+            "中β_💩!".as_bytes().to_vec(),
+            "a\u{301}β".as_bytes().to_vec(),
+            vec![0xc3],
+            vec![0x80, b'a'],
+            vec![0xc0, 0xaf],
+            vec![0xed, 0xa0, 0x80],
+            vec![0xf0, 0x28, 0x8c, 0xbc],
+            vec![0xf0, 0x9f, 0x92],
+            vec![0xf4, 0x90, 0x80, 0x80],
+        ] {
+            for position in 0..=haystack.len() {
+                check(&plan, &haystack, position);
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::arithmetic_side_effects)]
+    fn every_priority_row_walker_preserves_boundary_assertions() {
+        let routes = [
+            ForcedExecution::Sparse,
+            ForcedExecution::FiniteHorizon,
+            ForcedExecution::FullDfa,
+            ForcedExecution::LazyDfa,
+        ];
+        for line_terminator in [0, b'\r', b'\n', b';', 0x7f, 0xff] {
+            let haystacks = [
+                vec![],
+                vec![b'a'],
+                vec![line_terminator, b'a', line_terminator, b'a'],
+                vec![b'\r', b'\n', b'a', b'_', b'a'],
+                "éa_βa!".as_bytes().to_vec(),
+                vec![0x80, b'a', 0xc3, b'a'],
+                vec![0xf0, 0x28, 0x8c, 0xbc, b'a'],
+            ];
+            for assertion in PRIORITY_ASSERTION_KINDS {
+                for haystack in &haystacks {
+                    let expected = expected_asserted_literal_trace(
+                        assertion,
+                        line_terminator,
+                        haystack,
+                    );
+                    for cyclic in [false, true] {
+                        for route in routes {
+                            let plan = asserted_literal(assertion, cyclic, line_terminator)
+                                .prepare_forced::<DirectTrace>(
+                                    route,
+                                    PriorityTarget::portable(),
+                                    PreparationLimits::unlimited(),
+                                )
+                                .unwrap();
+                            assert_prepared_boundary_topology(&plan, route, cyclic);
+                            let report = plan
+                                .execute_forced(haystack, DirectReduceLimits::unlimited())
+                                .unwrap();
+                            assert_eq!(
+                                report.output(),
+                                &expected,
+                                "route={route:?} cyclic={cyclic} assertion={assertion:?} terminator={line_terminator:#04x} source={haystack:?}",
+                            );
+                            assert_eq!(report.actual().boundary_rows, haystack.len() + 1);
+                            assert!(report.actual().work <= report.prospective().work_upper_bound);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::arithmetic_side_effects)]
+    fn priority_boundary_strategy_preserves_exact_route_ledgers() {
+        let haystack = [b'a', 0xf0, 0x28, 0x8c, 0xbc, b'a', b'_'];
+        for cyclic in [false, true] {
+            for route in [
+                ForcedExecution::Sparse,
+                ForcedExecution::FiniteHorizon,
+                ForcedExecution::FullDfa,
+                ForcedExecution::LazyDfa,
+            ] {
+                let prepare = || {
+                    asserted_literal(EdgeKind::AssertWordUnicode, cyclic, b';')
+                        .prepare_forced::<DirectTrace>(
+                            route,
+                            PriorityTarget::portable(),
+                            PreparationLimits::unlimited(),
+                        )
+                        .unwrap()
+                };
+                let probe = prepare()
+                    .execute_forced(&haystack, DirectReduceLimits::unlimited())
+                    .unwrap();
+                let exact = exact_execution_limits(probe.prospective());
+                let replay = prepare().execute_forced(&haystack, exact).unwrap();
+                assert_eq!(replay.output(), probe.output());
+                assert_eq!(replay.prospective(), probe.prospective());
+                assert_eq!(replay.actual(), probe.actual());
+
+                let below_work = DirectReduceLimits {
+                    max_work: exact.max_work.checked_sub(1).unwrap(),
+                    ..exact
+                };
+                assert!(matches!(
+                    prepare().execute_forced(&haystack, below_work),
+                    Err(ReduceError::WorkLimit {
+                        consumed: 0,
+                        requested,
+                        limit,
+                    }) if requested == exact.max_work && limit + 1 == exact.max_work
+                ));
+            }
+        }
     }
 
     #[test]
