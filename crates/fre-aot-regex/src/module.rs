@@ -10281,12 +10281,10 @@ fn lower_x86_64_partial_prepared(
     assembler.instruction(&[0x48, 0x89, 0x04, 0x24])?;
     assembler.instruction(&[0x48, 0x8d, 0x44, 0x24, 0x40])?;
     assembler.instruction(&[0x48, 0x89, 0x44, 0x24, 0x08])?;
-    assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x10])?;
-    assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x18])?;
-    assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x20])?;
-    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x28])?;
-    assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x30])?;
-    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x38])?;
+    // Saving the public arguments did not clobber RDI through R9. Keep those
+    // live entry values in their ABI registers for the first preflight call;
+    // the frame copies remain authoritative after that helper may clobber
+    // every caller-saved register.
     assembler.instruction(&[0xe8])?;
     let preflight_runtime_displacement_label = assembler.label()?;
     assembler.bind(preflight_runtime_displacement_label)?;
@@ -10297,23 +10295,15 @@ fn lower_x86_64_partial_prepared(
     assembler.instruction(&[0xc3])?;
 
     assembler.bind(preflight_enter)?;
-    assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x10])?;
-    assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x18])?;
-    assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x20])?;
-    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x40])?;
-    assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x48])?;
-    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x38])?;
-    assembler.instruction(&[0x48, 0x89, 0x4c, 0x24, 0x28])?;
-    assembler.instruction(&[0x4c, 0x89, 0x44, 0x24, 0x30])?;
-
     // Execute the receipt-authenticated local native core over the exact
-    // window returned by preflight. It returns match/resume payloads in
-    // caller-saved registers; these outgoing stack slots remain available to
-    // an Exists retry scratch path and the continuation ABI.
+    // window returned by preflight. Load that window directly from its output
+    // slots, leaving the original public bounds intact. The core returns
+    // match/resume payloads in caller-saved registers; these outgoing stack
+    // slots remain available to an Exists retry scratch path and continuation.
     assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x18])?; // haystack
     assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x20])?; // length
-    assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x28])?; // narrowed start
-    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x30])?; // narrowed end
+    assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x40])?; // exact start
+    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x48])?; // exact end
     assembler.instruction(&[0x4c, 0x8d, 0x04, 0x24])?; // result = rsp
     assembler.instruction(&[0xe8])?;
     let native_core_displacement_label = assembler.label()?;
@@ -10366,8 +10356,8 @@ fn lower_x86_64_partial_prepared(
         assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x10])?;
         assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x18])?;
         assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x20])?;
-        assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x28])?;
-        assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x30])?;
+        assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x40])?;
+        assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x48])?;
         assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x38])?;
         assembler.instruction(&[0xe8])?;
         let recovery_runtime_displacement_label = assembler.label()?;
@@ -16050,12 +16040,9 @@ fn lower_aarch64_partial_prepared(
     let preflight_identity_page_offset =
         assembler.instruction(aarch64_add_x_imm(6, 6, 0)?)?;
     assembler.instruction(aarch64_add_x_imm(7, 31, 48)?)?;
-    assembler.instruction(aarch64_load_x_imm(0, 31, 0)?)?;
-    assembler.instruction(aarch64_load_x_imm(1, 31, 8)?)?;
-    assembler.instruction(aarch64_load_x_imm(2, 31, 16)?)?;
-    assembler.instruction(aarch64_load_x_imm(3, 31, 24)?)?;
-    assembler.instruction(aarch64_load_x_imm(4, 31, 32)?)?;
-    assembler.instruction(aarch64_load_x_imm(5, 31, 40)?)?;
+    // The frame stores preserve x0 through x5 without changing their live
+    // values. Only x6 and x7 are selected for the additional preflight
+    // arguments, so the first helper consumes the original six directly.
     let preflight_runtime_branch = assembler.instruction(0x9400_0000)?;
     assembler.instruction(aarch64_cmp_w_imm(
         0,
@@ -16067,22 +16054,14 @@ fn lower_aarch64_partial_prepared(
     assembler.instruction(0xd65f_03c0)?;
 
     assembler.bind(preflight_enter)?;
-    assembler.instruction(aarch64_load_x_imm(0, 31, 0)?)?;
-    assembler.instruction(aarch64_load_x_imm(1, 31, 8)?)?;
-    assembler.instruction(aarch64_load_x_imm(2, 31, 16)?)?;
-    assembler.instruction(aarch64_load_x_imm(3, 31, 48)?)?;
-    assembler.instruction(aarch64_load_x_imm(4, 31, 56)?)?;
-    assembler.instruction(aarch64_load_x_imm(5, 31, 40)?)?;
-    assembler.instruction(aarch64_store_x(3, 31, 24)?)?;
-    assembler.instruction(aarch64_store_x(4, 31, 32)?)?;
-
     // The combined preflight is authoritative and always runs first. The
-    // local core returns match/resume payloads in caller-saved registers, so
-    // the exact-window slots need no private-outcome initialization.
+    // local core reads its admitted bounds directly from the exact-window
+    // output slots and returns match/resume payloads in caller-saved registers,
+    // so those slots need no private-outcome initialization or copy.
     assembler.instruction(aarch64_load_x_imm(0, 31, 8)?)?; // haystack
     assembler.instruction(aarch64_load_x_imm(1, 31, 16)?)?; // length
-    assembler.instruction(aarch64_load_x_imm(2, 31, 24)?)?; // narrowed start
-    assembler.instruction(aarch64_load_x_imm(3, 31, 32)?)?; // narrowed end
+    assembler.instruction(aarch64_load_x_imm(2, 31, 48)?)?; // exact start
+    assembler.instruction(aarch64_load_x_imm(3, 31, 56)?)?; // exact end
     let native_core_branch = assembler.instruction(0x9400_0000)?;
     assembler.instruction(aarch64_cmp_w_imm(0, 1)?)?;
     assembler.branch_cond(AARCH64_EQ, native_match)?;
@@ -16129,16 +16108,16 @@ fn lower_aarch64_partial_prepared(
     let span_recovery_relocations = if let Some(native_selected_end) = native_selected_end {
         assembler.bind(native_selected_end)?;
         // AAPCS64 carries identity and selected end in x6/x7. The exact
-        // admitted window and untouched caller result reload from their saved
-        // public-argument slots.
+        // admitted window reloads from the preflight output slots, while the
+        // untouched caller result reloads from its saved public-argument slot.
         let recovery_identity_page = assembler.instruction(0x9000_0006)?;
         let recovery_identity_page_offset =
             assembler.instruction(aarch64_add_x_imm(6, 6, 0)?)?;
         assembler.instruction(aarch64_load_x_imm(0, 31, 0)?)?;
         assembler.instruction(aarch64_load_x_imm(1, 31, 8)?)?;
         assembler.instruction(aarch64_load_x_imm(2, 31, 16)?)?;
-        assembler.instruction(aarch64_load_x_imm(3, 31, 24)?)?;
-        assembler.instruction(aarch64_load_x_imm(4, 31, 32)?)?;
+        assembler.instruction(aarch64_load_x_imm(3, 31, 48)?)?;
+        assembler.instruction(aarch64_load_x_imm(4, 31, 56)?)?;
         assembler.instruction(aarch64_load_x_imm(5, 31, 40)?)?;
         let recovery_runtime_branch = assembler.instruction(0x9400_0000)?;
         assembler.instruction(aarch64_load_x_imm(30, 31, 72)?)?;
@@ -19843,7 +19822,7 @@ mod tests {
             .expect("partial prepared view");
 
         let (x86, x86_relocations) = lower_x86_64_partial_prepared(&view).unwrap();
-        assert_eq!(x86.len(), 303, "x86 combined prepared wrapper size");
+        assert_eq!(x86.len(), 233, "x86 combined prepared wrapper size");
         assert_eq!(
             x86_relocations
                 .iter()
@@ -19876,6 +19855,20 @@ mod tests {
         assert!(x86.windows(4).any(|bytes| bytes == [0x48, 0x83, 0xec, 88]));
         let native_core_offset = usize::try_from(x86_relocations[1].offset).unwrap();
         assert_eq!(x86.get(native_core_offset.wrapping_sub(1)), Some(&0xe8));
+        assert_eq!(
+            x86.get(native_core_offset.wrapping_sub(25)..native_core_offset.wrapping_sub(1)),
+            Some(
+                [
+                    0x48, 0x8b, 0x7c, 0x24, 0x18, // haystack
+                    0x48, 0x8b, 0x74, 0x24, 0x20, // length
+                    0x48, 0x8b, 0x54, 0x24, 0x40, // exact start
+                    0x48, 0x8b, 0x4c, 0x24, 0x48, // exact end
+                    0x4c, 0x8d, 0x04, 0x24, // result
+                ]
+                .as_slice()
+            ),
+            "x86 native core must load the preflight exact window directly",
+        );
         let caller_zero_start = x86
             .windows(7)
             .position(|bytes| bytes == [0x49, 0xc7, 0x01, 0, 0, 0, 0])
@@ -19888,17 +19881,28 @@ mod tests {
         assert!(caller_zero_start < caller_zero_end);
         let preflight_offset = usize::try_from(x86_relocations[2].offset).unwrap();
         assert_eq!(x86.get(preflight_offset.wrapping_sub(1)), Some(&0xe8));
+        assert_eq!(
+            x86.get(preflight_offset.wrapping_sub(6)..preflight_offset.wrapping_sub(1)),
+            Some([0x48, 0x89, 0x44, 0x24, 0x08].as_slice()),
+            "the first preflight call must directly follow its final private-argument store",
+        );
         assert!(
             x86.windows(3)
                 .any(|bytes| { bytes == [0x83, 0xf8, PARTIAL_PREFLIGHT_ENTER_STATUS] })
         );
-        assert!(
+        assert_eq!(
             x86.windows(5)
-                .any(|bytes| bytes == [0x48, 0x8b, 0x4c, 0x24, 0x40])
+                .filter(|bytes| *bytes == [0x48, 0x89, 0x4c, 0x24, 0x28].as_slice())
+                .count(),
+            1,
+            "x86 canonical start must only be saved on entry",
         );
-        assert!(
+        assert_eq!(
             x86.windows(5)
-                .any(|bytes| bytes == [0x4c, 0x8b, 0x44, 0x24, 0x48])
+                .filter(|bytes| *bytes == [0x4c, 0x89, 0x44, 0x24, 0x30].as_slice())
+                .count(),
+            1,
+            "x86 canonical end must only be saved on entry",
         );
         let runtime_offset = usize::try_from(x86_relocations[3].offset).unwrap();
         assert_eq!(x86.get(runtime_offset.wrapping_sub(1)), Some(&0xe8));
@@ -19908,7 +19912,7 @@ mod tests {
         let (aarch64, aarch64_relocations) = lower_aarch64_partial_prepared(&view).unwrap();
         assert_eq!(
             aarch64.len(),
-            296,
+            240,
             "AArch64 combined prepared wrapper size"
         );
         assert_eq!(
@@ -19951,6 +19955,15 @@ mod tests {
             ),
             0x9400_0000
         );
+        assert_eq!(
+            u32::from_le_bytes(
+                aarch64[preflight_offset - 4..preflight_offset]
+                    .try_into()
+                    .unwrap()
+            ),
+            aarch64_add_x_imm(7, 31, 48).unwrap(),
+            "the first preflight call must directly follow its final argument setup",
+        );
         let native_core_offset = usize::try_from(aarch64_relocations[3].offset).unwrap();
         assert_eq!(
             u32::from_le_bytes(
@@ -19959,6 +19972,19 @@ mod tests {
                     .unwrap()
             ),
             0x9400_0000
+        );
+        assert_eq!(
+            aarch64[native_core_offset - 16..native_core_offset]
+                .chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>(),
+            [
+                aarch64_load_x_imm(0, 31, 8).unwrap(),
+                aarch64_load_x_imm(1, 31, 16).unwrap(),
+                aarch64_load_x_imm(2, 31, 48).unwrap(),
+                aarch64_load_x_imm(3, 31, 56).unwrap(),
+            ],
+            "AArch64 native core must load the preflight exact window directly",
         );
         let caller_zero_start = words
             .iter()
@@ -19971,10 +19997,22 @@ mod tests {
         assert!(native_core_offset / 4 < caller_zero_start);
         assert!(caller_zero_start < caller_zero_end);
         assert!(words.contains(&aarch64_add_x_imm(7, 31, 48).unwrap()));
-        assert!(words.contains(&aarch64_load_x_imm(3, 31, 48).unwrap()));
-        assert!(words.contains(&aarch64_load_x_imm(4, 31, 56).unwrap()));
-        assert!(words.contains(&aarch64_store_x(3, 31, 24).unwrap()));
-        assert!(words.contains(&aarch64_store_x(4, 31, 32).unwrap()));
+        assert_eq!(
+            words
+                .iter()
+                .filter(|&&word| word == aarch64_store_x(3, 31, 24).unwrap())
+                .count(),
+            1,
+            "AArch64 canonical start must only be saved on entry",
+        );
+        assert_eq!(
+            words
+                .iter()
+                .filter(|&&word| word == aarch64_store_x(4, 31, 32).unwrap())
+                .count(),
+            1,
+            "AArch64 canonical end must only be saved on entry",
+        );
         let runtime_offset = usize::try_from(aarch64_relocations[4].offset).unwrap();
         assert_eq!(
             u32::from_le_bytes(aarch64[runtime_offset..runtime_offset + 4].try_into().unwrap()),
@@ -20516,8 +20554,8 @@ mod tests {
                             aarch64_load_x_imm(0, 31, 0).unwrap(),
                             aarch64_load_x_imm(1, 31, 8).unwrap(),
                             aarch64_load_x_imm(2, 31, 16).unwrap(),
-                            aarch64_load_x_imm(3, 31, 24).unwrap(),
-                            aarch64_load_x_imm(4, 31, 32).unwrap(),
+                            aarch64_load_x_imm(3, 31, 48).unwrap(),
+                            aarch64_load_x_imm(4, 31, 56).unwrap(),
                             aarch64_load_x_imm(5, 31, 40).unwrap(),
                         ]
                     );
@@ -20979,18 +21017,41 @@ mod tests {
                     assert!(code.windows(3).any(|bytes| {
                         bytes == [0x83, 0xf8, PARTIAL_PREFLIGHT_ENTER_STATUS]
                     }));
-                    assert!(code
-                        .windows(5)
-                        .any(|bytes| bytes == [0x48, 0x8b, 0x4c, 0x24, 0x40]));
-                    assert!(code
-                        .windows(5)
-                        .any(|bytes| bytes == [0x4c, 0x8b, 0x44, 0x24, 0x48]));
-                    assert!(code
-                        .windows(5)
-                        .any(|bytes| bytes == [0x48, 0x89, 0x4c, 0x24, 0x28]));
-                    assert!(code
-                        .windows(5)
-                        .any(|bytes| bytes == [0x4c, 0x89, 0x44, 0x24, 0x30]));
+                    assert_eq!(
+                        code.get(
+                            native_core_offset.wrapping_sub(25)
+                                ..native_core_offset.wrapping_sub(1)
+                        ),
+                        Some(
+                            [
+                                0x48, 0x8b, 0x7c, 0x24, 0x18, // haystack
+                                0x48, 0x8b, 0x74, 0x24, 0x20, // length
+                                0x48, 0x8b, 0x54, 0x24, 0x40, // exact start
+                                0x48, 0x8b, 0x4c, 0x24, 0x48, // exact end
+                                0x4c, 0x8d, 0x04, 0x24, // result
+                            ]
+                            .as_slice()
+                        ),
+                        "{target:?} native core must load the exact window directly",
+                    );
+                    assert_eq!(
+                        code.windows(5)
+                            .filter(|bytes| {
+                                *bytes == [0x48, 0x89, 0x4c, 0x24, 0x28].as_slice()
+                            })
+                            .count(),
+                        1,
+                        "{target:?} copied exact start into the canonical slot",
+                    );
+                    assert_eq!(
+                        code.windows(5)
+                            .filter(|bytes| {
+                                *bytes == [0x4c, 0x89, 0x44, 0x24, 0x30].as_slice()
+                            })
+                            .count(),
+                        1,
+                        "{target:?} copied exact end into the canonical slot",
+                    );
                     assert!(code
                         .windows(5)
                         .any(|bytes| bytes == [0x48, 0x83, 0xc4, 88, 0xc3]));
@@ -21055,13 +21116,38 @@ mod tests {
                             u16::from(PARTIAL_PREFLIGHT_ENTER_STATUS),
                         )
                         .unwrap(),
-                        aarch64_load_x_imm(3, 31, 48).unwrap(),
-                        aarch64_load_x_imm(4, 31, 56).unwrap(),
-                        aarch64_store_x(3, 31, 24).unwrap(),
-                        aarch64_store_x(4, 31, 32).unwrap(),
                     ] {
                         assert!(words.contains(&instruction), "{target:?}/{instruction:#x}");
                     }
+                    assert_eq!(
+                        code[native_core_offset - 16..native_core_offset]
+                            .chunks_exact(4)
+                            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                            .collect::<Vec<_>>(),
+                        [
+                            aarch64_load_x_imm(0, 31, 8).unwrap(),
+                            aarch64_load_x_imm(1, 31, 16).unwrap(),
+                            aarch64_load_x_imm(2, 31, 48).unwrap(),
+                            aarch64_load_x_imm(3, 31, 56).unwrap(),
+                        ],
+                        "{target:?} native core must load the exact window directly",
+                    );
+                    assert_eq!(
+                        words
+                            .iter()
+                            .filter(|&&word| word == aarch64_store_x(3, 31, 24).unwrap())
+                            .count(),
+                        1,
+                        "{target:?} copied exact start into the canonical slot",
+                    );
+                    assert_eq!(
+                        words
+                            .iter()
+                            .filter(|&&word| word == aarch64_store_x(4, 31, 32).unwrap())
+                            .count(),
+                        1,
+                        "{target:?} copied exact end into the canonical slot",
+                    );
                     let eager_private_initialization = [80_u16, 88, 96, 104, 112]
                         .map(|offset| aarch64_store_x(31, 31, offset).unwrap());
                     assert!(
@@ -21130,6 +21216,18 @@ mod tests {
             let prepared_end = prepared_start + usize::try_from(prepared.size).unwrap();
             let text = compiled.module().sections()[TEXT_SECTION].bytes();
             let code = &text[prepared_start..prepared_end];
+            let native_core = compiled
+                .module()
+                .relocations()
+                .iter()
+                .find(|relocation| relocation.symbol == PARTIAL_NATIVE_CORE_SYMBOL)
+                .unwrap_or_else(|| panic!("missing partial native core: {target:?}"));
+            let native_core_offset = usize::try_from(native_core.offset).unwrap();
+            assert!(
+                (prepared_start..prepared_end).contains(&native_core_offset),
+                "{target:?}"
+            );
+            let local_native_core = native_core_offset - prepared_start;
             let recoveries = compiled
                 .module()
                 .relocations()
@@ -21148,7 +21246,61 @@ mod tests {
 
             match target.architecture {
                 Architecture::X86_64 => {
+                    assert_eq!(code.len(), 298, "{target:?} Span wrapper size");
+                    assert_eq!(code.get(local_native_core.wrapping_sub(1)), Some(&0xe8));
+                    assert_eq!(
+                        code.get(
+                            local_native_core.wrapping_sub(25)
+                                ..local_native_core.wrapping_sub(1)
+                        ),
+                        Some(
+                            [
+                                0x48, 0x8b, 0x7c, 0x24, 0x18, // haystack
+                                0x48, 0x8b, 0x74, 0x24, 0x20, // length
+                                0x48, 0x8b, 0x54, 0x24, 0x40, // exact start
+                                0x48, 0x8b, 0x4c, 0x24, 0x48, // exact end
+                                0x4c, 0x8d, 0x04, 0x24, // result
+                            ]
+                            .as_slice()
+                        ),
+                        "{target:?} Span core must load the exact window directly",
+                    );
                     assert_eq!(code.get(local_recovery.wrapping_sub(1)), Some(&0xe8));
+                    assert_eq!(
+                        code.get(
+                            local_recovery.wrapping_sub(31)..local_recovery.wrapping_sub(1)
+                        ),
+                        Some(
+                            [
+                                0x48, 0x8b, 0x7c, 0x24, 0x10, // handle
+                                0x48, 0x8b, 0x74, 0x24, 0x18, // haystack
+                                0x48, 0x8b, 0x54, 0x24, 0x20, // length
+                                0x48, 0x8b, 0x4c, 0x24, 0x40, // exact start
+                                0x4c, 0x8b, 0x44, 0x24, 0x48, // exact end
+                                0x4c, 0x8b, 0x4c, 0x24, 0x38, // result
+                            ]
+                            .as_slice()
+                        ),
+                        "{target:?} Span recovery must load the exact window directly",
+                    );
+                    assert_eq!(
+                        code.windows(5)
+                            .filter(|bytes| {
+                                *bytes == [0x48, 0x89, 0x4c, 0x24, 0x28].as_slice()
+                            })
+                            .count(),
+                        1,
+                        "{target:?} copied exact start into the canonical slot",
+                    );
+                    assert_eq!(
+                        code.windows(5)
+                            .filter(|bytes| {
+                                *bytes == [0x4c, 0x89, 0x44, 0x24, 0x30].as_slice()
+                            })
+                            .count(),
+                        1,
+                        "{target:?} copied exact end into the canonical slot",
+                    );
                     assert!(code.windows(3).any(|bytes| {
                         bytes
                             == [
@@ -21178,6 +21330,29 @@ mod tests {
                     );
                 }
                 Architecture::Aarch64 => {
+                    assert_eq!(code.len(), 296, "{target:?} Span wrapper size");
+                    assert_eq!(
+                        u32::from_le_bytes(
+                            code[local_native_core..local_native_core + 4]
+                                .try_into()
+                                .unwrap()
+                        ),
+                        0x9400_0000,
+                        "{target:?}"
+                    );
+                    assert_eq!(
+                        code[local_native_core - 16..local_native_core]
+                            .chunks_exact(4)
+                            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                            .collect::<Vec<_>>(),
+                        [
+                            aarch64_load_x_imm(0, 31, 8).unwrap(),
+                            aarch64_load_x_imm(1, 31, 16).unwrap(),
+                            aarch64_load_x_imm(2, 31, 48).unwrap(),
+                            aarch64_load_x_imm(3, 31, 56).unwrap(),
+                        ],
+                        "{target:?} Span core must load the exact window directly",
+                    );
                     assert_eq!(
                         u32::from_le_bytes(
                             code[local_recovery..local_recovery + 4]
@@ -21199,8 +21374,8 @@ mod tests {
                             aarch64_load_x_imm(0, 31, 0).unwrap(),
                             aarch64_load_x_imm(1, 31, 8).unwrap(),
                             aarch64_load_x_imm(2, 31, 16).unwrap(),
-                            aarch64_load_x_imm(3, 31, 24).unwrap(),
-                            aarch64_load_x_imm(4, 31, 32).unwrap(),
+                            aarch64_load_x_imm(3, 31, 48).unwrap(),
+                            aarch64_load_x_imm(4, 31, 56).unwrap(),
                             aarch64_load_x_imm(5, 31, 40).unwrap(),
                         ],
                         "{target:?}"
@@ -21209,6 +21384,22 @@ mod tests {
                         .chunks_exact(4)
                         .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
                         .collect::<Vec<_>>();
+                    assert_eq!(
+                        words
+                            .iter()
+                            .filter(|&&word| word == aarch64_store_x(3, 31, 24).unwrap())
+                            .count(),
+                        1,
+                        "{target:?} copied exact start into the canonical slot",
+                    );
+                    assert_eq!(
+                        words
+                            .iter()
+                            .filter(|&&word| word == aarch64_store_x(4, 31, 32).unwrap())
+                            .count(),
+                        1,
+                        "{target:?} copied exact end into the canonical slot",
+                    );
                     assert!(
                         words.contains(
                             &aarch64_cmp_w_imm(
