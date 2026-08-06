@@ -9735,10 +9735,24 @@ fn continue_warm_direct_exists_loop<const LOOP_SKIP: bool>(
     let mut adaptive_probe = AdaptiveStartProbe::default();
     let mut loop_probe = LazyLoopProbe::default();
     let mut active_loop_slot = None;
+    // The loopless read-only path has an unlimited work budget. Accumulate
+    // its already-published transitions locally and settle them only before
+    // scanner work, a mutable handoff, or a terminal result. This preserves
+    // the exact overflow/error contract without a checked meter update on
+    // every input byte. The loop-skip variant retains its interleaved meter
+    // because skipped source and scalar transitions share one ordered ledger.
+    let mut direct_steps = 0usize;
 
     loop {
         if state == initial_row {
             if let Some(scanner) = proof.scanner.as_ref() {
+                if !LOOP_SKIP {
+                    settle_warm_direct_exists_steps(
+                        &mut meter,
+                        &mut direct_steps,
+                        position,
+                    )?;
+                }
                 if position < window.end() {
                     if let (Some(probe), Some(candidate)) =
                         (proof.probe(), engine_candidate.take())
@@ -9807,6 +9821,9 @@ fn continue_warm_direct_exists_loop<const LOOP_SKIP: bool>(
             }
         }
         if position >= haystack.len() {
+            if !LOOP_SKIP {
+                settle_warm_direct_exists_steps(&mut meter, &mut direct_steps, position)?;
+            }
             return if position == haystack.len() {
                 Ok(Some(false))
             } else {
@@ -9816,11 +9833,23 @@ fn continue_warm_direct_exists_loop<const LOOP_SKIP: bool>(
             };
         }
 
-        meter.charge(1, position)?;
+        if LOOP_SKIP {
+            meter.charge(1, position)?;
+        }
         let byte = haystack[position];
         let class = automaton.byte_classes().class_of(byte);
         let cell = workspace.lazy.direct_cell(state, class)?;
         if cell == LAZY_CELL_UNFILLED {
+            let work = if LOOP_SKIP {
+                meter.consumed.checked_sub(1).ok_or(
+                    SearchError::InternalInvariant {
+                        detail: "warm existence continuation omitted its current transition work",
+                    },
+                )?
+            } else {
+                settle_warm_direct_exists_steps(&mut meter, &mut direct_steps, position)?;
+                meter.consumed
+            };
             return continue_mutable_warm_direct_exists(
                 automaton,
                 haystack,
@@ -9831,11 +9860,7 @@ fn continue_warm_direct_exists_loop<const LOOP_SKIP: bool>(
                     initial_row,
                     state,
                     position,
-                    work: meter.consumed.checked_sub(1).ok_or(
-                        SearchError::InternalInvariant {
-                            detail: "warm existence continuation omitted its current transition work",
-                        },
-                    )?,
+                    work,
                     engine_candidate,
                     retained_start_mask,
                     adaptive_probe,
@@ -9852,12 +9877,21 @@ fn continue_warm_direct_exists_loop<const LOOP_SKIP: bool>(
         )]
         {
             position += 1;
+            if !LOOP_SKIP {
+                direct_steps += 1;
+            }
         }
         if cell & LAZY_CELL_ACCEPT != 0 {
+            if !LOOP_SKIP {
+                settle_warm_direct_exists_steps(&mut meter, &mut direct_steps, position)?;
+            }
             return Ok(Some(true));
         }
         let encoded = cell & LAZY_CELL_STATE_MASK;
         if encoded == 0 {
+            if !LOOP_SKIP {
+                settle_warm_direct_exists_steps(&mut meter, &mut direct_steps, position)?;
+            }
             return Ok(Some(false));
         }
         state = encoded
@@ -9866,6 +9900,23 @@ fn continue_warm_direct_exists_loop<const LOOP_SKIP: bool>(
                 detail: "warm existence encoded state underflowed",
             })?;
     }
+}
+
+fn settle_warm_direct_exists_steps(
+    meter: &mut WorkMeter,
+    direct_steps: &mut usize,
+    position: usize,
+) -> Result<(), SearchError> {
+    if *direct_steps == 0 {
+        return Ok(());
+    }
+    let requested =
+        u64::try_from(*direct_steps).map_err(|_| SearchError::ArithmeticOverflow {
+            computation: "warm existence direct-step work conversion",
+        })?;
+    meter.charge(requested, position)?;
+    *direct_steps = 0;
+    Ok(())
 }
 
 fn complete_mutable_warm_direct_exists(
@@ -47168,6 +47219,25 @@ mod tests {
                 computation: "search work counter"
             })
         ));
+    }
+
+    #[test]
+    fn warm_exists_batched_direct_steps_preserve_unlimited_work_overflow() {
+        let mut meter = WorkMeter::new(u64::MAX, u64::MAX - 2);
+        let mut direct_steps = 2;
+        super::settle_warm_direct_exists_steps(&mut meter, &mut direct_steps, 19).unwrap();
+        assert_eq!(meter.consumed, u64::MAX);
+        assert_eq!(direct_steps, 0);
+
+        direct_steps = 1;
+        assert!(matches!(
+            super::settle_warm_direct_exists_steps(&mut meter, &mut direct_steps, 20),
+            Err(SearchError::ArithmeticOverflow {
+                computation: "search work counter"
+            })
+        ));
+        assert_eq!(meter.consumed, u64::MAX);
+        assert_eq!(direct_steps, 1);
     }
 
     #[test]
