@@ -951,6 +951,38 @@ impl ContextTransitionStore {
         Ok(None)
     }
 
+    /// Retain a dependency-proven transition whose associative bucket has no
+    /// free way. Planning already authenticated the owner and missing cell;
+    /// source validation and accounting still precede every live mutation.
+    fn publish_dense_only(
+        &mut self,
+        record: ContextTransitionSlot,
+        (dense_index, owner, remaining): (usize, usize, u16),
+        meter: &mut WorkMeter,
+        core_reserve: u64,
+    ) -> Result<(), SearchError> {
+        let source = usize::try_from(record.source).map_err(|_| {
+            SearchError::InternalInvariant {
+                detail: "contextual dense-only publication source does not fit usize",
+            }
+        })?;
+        self.hot.get(source).ok_or(SearchError::InternalInvariant {
+            detail: "contextual dense-only publication is outside its state domain",
+        })?;
+        // A full associative bucket contributes no publication work. The
+        // dependency-proven dense cell is therefore the entire optional
+        // transaction, and a decline leaves the row byte-for-byte intact.
+        if !meter.try_charge_optional(1, core_reserve) {
+            return Ok(());
+        }
+        self.dense[dense_index] = record.value;
+        self.dense_missing[owner] = remaining;
+        if remaining == 0 {
+            self.hot[source].dense_complete = 1;
+        }
+        Ok(())
+    }
+
     fn publish(
         &mut self,
         index: Option<usize>,
@@ -959,20 +991,32 @@ impl ContextTransitionStore {
         core_reserve: u64,
         _position: usize,
     ) -> Result<(), SearchError> {
-        let Some(index) = index else {
-            return Ok(());
+        let will_publish_associatively = if let Some(index) = index {
+            self.slots
+                .get(index)
+                .ok_or(SearchError::InternalInvariant {
+                    detail: "contextual transition publication is outside the fixed store",
+                })?
+                .source
+                == CONTEXT_EMPTY_SOURCE
+        } else {
+            false
         };
-        let slot = self
-            .slots
-            .get(index)
-            .ok_or(SearchError::InternalInvariant {
-                detail: "contextual transition publication is outside the fixed store",
-            })?;
-        let will_publish = slot.source == CONTEXT_EMPTY_SOURCE;
-        let dense_publication = if will_publish {
+        let dense_publication = if will_publish_associatively || index.is_none() {
             self.plan_dense_publication(record)?
         } else {
             None
+        };
+        let Some(index) = index else {
+            let Some((dense_index, owner, remaining)) = dense_publication else {
+                return Ok(());
+            };
+            return self.publish_dense_only(
+                record,
+                (dense_index, owner, remaining),
+                meter,
+                core_reserve,
+            );
         };
         // Associative publication and a newly initialized dense cell are one
         // optional transaction. If the caller cannot retain both while
@@ -24114,6 +24158,25 @@ mod tests {
         assert!(slot.is_some(), "the dense-row fixture exhausted a hash bucket");
     }
 
+    fn fill_context_bucket(
+        store: &mut super::ContextTransitionStore,
+        source: u32,
+        symbol: u32,
+    ) {
+        let bucket = super::contextual_transition_hash(source, symbol) & store.bucket_mask;
+        let begin = bucket
+            .checked_mul(super::CONTEXT_TRANSITION_WAYS)
+            .unwrap();
+        for way in 0..super::CONTEXT_TRANSITION_WAYS {
+            let index = begin.checked_add(way).unwrap();
+            store.slots[index] = ContextTransitionSlot::populated(
+                super::CONTEXT_INITIAL_SOURCE.checked_sub(1).unwrap(),
+                u32::try_from(way).unwrap(),
+                0,
+            );
+        }
+    }
+
     #[test]
     fn contextual_dense_rows_exhaustively_normalize_zero_one_and_two_bits() {
         const FIRST: u32 = 1 << 2;
@@ -24367,6 +24430,124 @@ mod tests {
         assert_eq!(store.dense, before_dense);
         assert_eq!(store.dense_missing, before_missing);
         assert_eq!(store.published, before_published);
+    }
+
+    #[test]
+    fn contextual_dense_full_bucket_publication_is_exact_atomic_and_completes() {
+        const CORE_RESERVE: u64 = 3;
+
+        let slots = super::contextual_transition_slots(4).unwrap();
+        let mut store =
+            super::ContextTransitionStore::new(slots, 1, 2, usize::MAX).unwrap();
+        let retained_symbol = super::contextual_class_symbol(0, 0);
+        let saturated_symbol = super::contextual_class_symbol(1, 0);
+        publish_context_record(&mut store, 0, retained_symbol, 7);
+        store.hot[0].dependency_mask = 0;
+        let mut claim = WorkMeter::new(u64::MAX, 0);
+        assert!(store.try_claim_dense_owner(0, &mut claim).unwrap());
+        assert_eq!(store.dense_missing[0], 1);
+        assert_eq!(store.hot[0].dense_complete, 0);
+
+        fill_context_bucket(&mut store, 0, saturated_symbol);
+        let mut lookup = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            store.lookup(0, saturated_symbol, &mut lookup, 43).unwrap(),
+            (None, None),
+        );
+        assert_eq!(
+            lookup.consumed,
+            u64::try_from(super::CONTEXT_TRANSITION_WAYS + 1).unwrap(),
+        );
+        let cell = 1 | super::LAZY_CELL_START_PROPAGATE;
+        let record = ContextTransitionSlot::populated(0, saturated_symbol, cell);
+        assert!(super::context_cell_is_nonaccepting_self_loop(record));
+        let retained_bytes = store.retained_bytes().unwrap();
+        let slots_before = store.slots.clone();
+        let hot_before = store.hot[0];
+        let dense_before = store.dense.clone();
+        let missing_before = store.dense_missing;
+        let published_before = store.published;
+        let loop_candidates_before = store.loop_candidates_published;
+
+        let mut one_below = WorkMeter::new(CORE_RESERVE, 0);
+        store
+            .publish(None, record, &mut one_below, CORE_RESERVE, 43)
+            .unwrap();
+        assert_eq!(one_below.consumed, 0);
+        assert_eq!(store.slots, slots_before);
+        assert_eq!(store.hot[0], hot_before);
+        assert_eq!(store.dense, dense_before);
+        assert_eq!(store.dense_missing, missing_before);
+        assert_eq!(store.published, published_before);
+        assert_eq!(store.loop_candidates_published, loop_candidates_before);
+
+        let mut exact = WorkMeter::new(CORE_RESERVE + 1, 0);
+        store
+            .publish(None, record, &mut exact, CORE_RESERVE, 43)
+            .unwrap();
+        assert_eq!(exact.consumed, 1);
+        assert_eq!(store.slots, slots_before);
+        let mut completed_hot = hot_before;
+        completed_hot.dense_complete = 1;
+        assert_eq!(store.hot[0], completed_hot);
+        assert_eq!(store.dense_missing[0], 0);
+        assert!(store.dense_row_is_complete(store.hot[0]));
+        assert_eq!(store.published, published_before);
+        assert_eq!(store.loop_candidates_published, loop_candidates_before);
+        assert_eq!(store.retained_bytes().unwrap(), retained_bytes);
+        assert_eq!(
+            store
+                .lookup_existing_prevalidated(0, saturated_symbol)
+                .unwrap(),
+            Some(cell),
+        );
+    }
+
+    #[test]
+    fn contextual_dense_full_bucket_conflict_is_failure_atomic() {
+        let slots = super::contextual_transition_slots(4).unwrap();
+        let mut store =
+            super::ContextTransitionStore::new(slots, 1, 1, usize::MAX).unwrap();
+        let retained_symbol = super::contextual_class_symbol(0, 0);
+        let alias_symbol = super::contextual_class_symbol(0, 1 << 11);
+        publish_context_record(&mut store, 0, retained_symbol, 7);
+        store.hot[0].dependency_mask = 0;
+        let mut claim = WorkMeter::new(u64::MAX, 0);
+        assert!(store.try_claim_dense_owner(0, &mut claim).unwrap());
+        assert!(store.dense_row_is_complete(store.hot[0]));
+        fill_context_bucket(&mut store, 0, alias_symbol);
+        let mut lookup = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            store.lookup(0, alias_symbol, &mut lookup, 47).unwrap(),
+            (None, None),
+        );
+
+        let slots_before = store.slots.clone();
+        let hot_before = store.hot[0];
+        let dense_before = store.dense.clone();
+        let missing_before = store.dense_missing;
+        let published_before = store.published;
+        let loop_candidates_before = store.loop_candidates_published;
+        let mut conflict = WorkMeter::new(u64::MAX, 0);
+        assert!(matches!(
+            store.publish(
+                None,
+                ContextTransitionSlot::populated(0, alias_symbol, 9),
+                &mut conflict,
+                0,
+                47,
+            ),
+            Err(SearchError::InternalInvariant {
+                detail: "contextual dense publication conflicts with dependency proof"
+            })
+        ));
+        assert_eq!(conflict.consumed, 0);
+        assert_eq!(store.slots, slots_before);
+        assert_eq!(store.hot[0], hot_before);
+        assert_eq!(store.dense, dense_before);
+        assert_eq!(store.dense_missing, missing_before);
+        assert_eq!(store.published, published_before);
+        assert_eq!(store.loop_candidates_published, loop_candidates_before);
     }
 
     #[test]
