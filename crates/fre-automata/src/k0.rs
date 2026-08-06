@@ -11184,10 +11184,34 @@ impl WarmContextWorkReceipt {
 
 /// Priority-ordered matching edges for one admitted consuming row.
 struct OrderedConsumingEdges<'a> {
-    transitions: &'a [crate::ordered_edge_dispatch::PackedOrderedTransition],
+    transitions: OrderedConsumingTransitions<'a>,
     cursor: usize,
-    tail_work: u32,
+    remaining_work: u32,
     tail_pending: bool,
+}
+
+enum OrderedConsumingTransitions<'a> {
+    Direct32 {
+        transitions: &'a [crate::ordered_edge_dispatch::PackedOrderedTransition32],
+        target_bits: u32,
+        target_mask: u32,
+    },
+    Direct64(&'a [crate::ordered_edge_dispatch::PackedOrderedTransition]),
+    Legacy {
+        edges: &'a [u32],
+        edge_targets: &'a [u32],
+        next_unaccounted: usize,
+    },
+}
+
+impl OrderedConsumingTransitions<'_> {
+    const fn len(&self) -> usize {
+        match self {
+            Self::Direct32 { transitions, .. } => transitions.len(),
+            Self::Direct64(transitions) => transitions.len(),
+            Self::Legacy { edges, .. } => edges.len(),
+        }
+    }
 }
 
 impl OrderedConsumingEdges<'_> {
@@ -11201,19 +11225,79 @@ impl OrderedConsumingEdges<'_> {
         meter: &mut WorkMeter,
         position: usize,
     ) -> Result<Option<u32>, SearchError> {
-        let Some(&transition) = self.transitions.get(self.cursor) else {
+        if self.cursor >= self.transitions.len() {
             if self.tail_pending {
-                charge_ordered_consuming_run(meter, self.tail_work, position)?;
+                charge_ordered_consuming_run(meter, self.remaining_work, position)?;
                 self.tail_pending = false;
+                self.remaining_work = 0;
             }
             return Ok(None);
+        }
+        let (target, work, legacy_next) = match &self.transitions {
+            OrderedConsumingTransitions::Direct32 {
+                transitions,
+                target_bits,
+                target_mask,
+            } => {
+                let transition = transitions[self.cursor];
+                (
+                    transition.target(*target_mask),
+                    transition.work(*target_bits),
+                    None,
+                )
+            }
+            OrderedConsumingTransitions::Direct64(transitions) => {
+                let transition = transitions[self.cursor];
+                (transition.target(), transition.work(), None)
+            }
+            OrderedConsumingTransitions::Legacy {
+                edges,
+                edge_targets,
+                next_unaccounted,
+            } => {
+                let edge = crate::plan::plan_index(edges[self.cursor]);
+                let next = edge.checked_add(1).ok_or(SearchError::ArithmeticOverflow {
+                    computation: "ordered consuming dispatch next edge",
+                })?;
+                let work = next.checked_sub(*next_unaccounted).ok_or(
+                    SearchError::InternalInvariant {
+                        detail: "legacy ordered dispatch edges are not increasing within their row",
+                    },
+                )?;
+                (
+                    edge_targets[edge],
+                    u32::try_from(work).map_err(|_| SearchError::ArithmeticOverflow {
+                        computation: "ordered consuming-row work conversion",
+                    })?,
+                    Some(next),
+                )
+            }
         };
-        // A successful slice lookup proves `cursor < len`, so its successor
-        // is representable. One packed load now supplies both exact abstract
-        // work and the direct graph target.
-        charge_ordered_consuming_run(meter, transition.work(), position)?;
-        self.cursor += 1;
-        Ok(Some(transition.target()))
+        charge_ordered_consuming_run(meter, work, position)?;
+        self.remaining_work = self.remaining_work.checked_sub(work).ok_or(
+            SearchError::InternalInvariant {
+                detail: "ordered consuming dispatch work exceeded its source row",
+            },
+        )?;
+        if let Some(next_unaccounted) = legacy_next {
+            let OrderedConsumingTransitions::Legacy {
+                next_unaccounted: retained,
+                ..
+            } = &mut self.transitions
+            else {
+                return Err(SearchError::InternalInvariant {
+                    detail: "legacy ordered dispatch changed representation",
+                });
+            };
+            *retained = next_unaccounted;
+        }
+        self.cursor = self
+            .cursor
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "ordered consuming dispatch cursor",
+            })?;
+        Ok(Some(target))
     }
 }
 
@@ -11265,10 +11349,32 @@ fn try_ordered_consuming_edges<'a>(
         return None;
     }
     let segment = dispatch.segment(state, byte)?;
+    let transitions = match segment.transitions {
+        crate::ordered_edge_dispatch::OrderedEdgeTransitions::Direct32 {
+            transitions,
+            target_bits,
+            target_mask,
+        } => OrderedConsumingTransitions::Direct32 {
+            transitions,
+            target_bits,
+            target_mask,
+        },
+        crate::ordered_edge_dispatch::OrderedEdgeTransitions::Direct64(transitions) => {
+            OrderedConsumingTransitions::Direct64(transitions)
+        }
+        crate::ordered_edge_dispatch::OrderedEdgeTransitions::Legacy(edges) => {
+            let row = automaton.state_edges(state);
+            OrderedConsumingTransitions::Legacy {
+                edges,
+                edge_targets: &automaton.edge_targets,
+                next_unaccounted: row.start,
+            }
+        }
+    };
     Some(OrderedConsumingEdges {
-        transitions: segment.transitions,
+        transitions,
         cursor: 0,
-        tail_work: segment.tail_work,
+        remaining_work: segment.row_work,
         tail_pending: true,
     })
 }

@@ -14420,6 +14420,33 @@ mod tests {
         }
     }
 
+    fn ordered_dispatch_legacy_ceiling_graph() -> RawPlan {
+        const STATES: usize = 65_537;
+        const HIGH_TARGET: u32 = 65_536;
+        const BROAD: usize = 32_650;
+        let mut byte_starts = vec![0; BROAD];
+        let mut byte_ends = vec![254; BROAD];
+        byte_starts.extend(u8::MIN..=254);
+        byte_ends.extend(u8::MIN..=254);
+        byte_starts.extend(core::iter::repeat(255).take(6));
+        byte_ends.extend(core::iter::repeat(255).take(6));
+        let edges = byte_starts.len();
+        let encoded_edges = u32::try_from(edges).unwrap();
+        let mut roles = vec![StateRole::Consume];
+        roles.resize(STATES, StateRole::Accept);
+        let mut edge_offsets = vec![0, encoded_edges];
+        edge_offsets.resize(STATES + 1, encoded_edges);
+        RawPlan {
+            start: 0,
+            roles,
+            edge_offsets,
+            edge_targets: vec![HIGH_TARGET; edges],
+            edge_kinds: vec![EdgeKind::ByteRange; edges],
+            byte_starts,
+            byte_ends,
+        }
+    }
+
     fn with_ordered_dispatch_dead_branch(mut raw: RawPlan) -> RawPlan {
         let old_start = raw.start;
         let wide = u32::try_from(raw.roles.len()).unwrap();
@@ -14674,6 +14701,61 @@ mod tests {
         assert!(coexist_restored.partial_dfa().is_some());
         assert!(coexist_restored.automaton.has_ordered_edge_dispatch());
         assert_eq!(coexist_restored.serialize().unwrap(), coexist_bytes);
+    }
+
+    #[test]
+    fn ordered_edge_dispatch_v5_rederives_an_old_fit_direct_overflow_graph() {
+        let raw = ordered_dispatch_legacy_ceiling_graph();
+        let fallback_limits = DeterminizeLimits {
+            max_states: 0,
+            ..DeterminizeLimits::default()
+        };
+        let optimized = raw_program(
+            &raw,
+            OutputContract::SelectedEnd,
+            CompileMode::Optimizing,
+            fallback_limits,
+        );
+        assert_eq!(optimized.engine_kind(), EngineKind::OrderedNfa);
+        assert!(optimized.automaton.has_ordered_edge_dispatch());
+        let expected_retained = 8 * 65_537
+            + 256
+            + 4 * 257
+            + 4 * 8_326_011
+            + 9 * core::mem::size_of::<usize>();
+        assert_eq!(
+            optimized.automaton.ordered_edge_dispatch_retained_bytes(),
+            expected_retained
+        );
+        assert!(expected_retained < 64 * 1024 * 1024);
+        assert!(expected_retained + 4 * 8_326_011 > 64 * 1024 * 1024);
+
+        let bytes = optimized.serialize().unwrap();
+        assert_eq!(
+            u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+            PROGRAM_FORMAT_VERSION_V5
+        );
+        let restored = CompiledProgram::deserialize(&bytes).unwrap();
+        assert!(restored.automaton.has_ordered_edge_dispatch());
+        assert_eq!(
+            restored.automaton.ordered_edge_dispatch_retained_bytes(),
+            expected_retained
+        );
+        assert_eq!(restored.serialize().unwrap(), bytes);
+
+        let reference = raw_program(
+            &raw,
+            OutputContract::SelectedEnd,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        for haystack in [b"".as_slice(), b"\0", b"\xfe", b"\xff", b"x\xff"] {
+            let window = SearchWindow::full(haystack);
+            assert_eq!(
+                restored.search(haystack, window).unwrap(),
+                reference.search(haystack, window).unwrap()
+            );
+        }
     }
 
     #[test]
