@@ -1,4 +1,8 @@
-use core::{fmt, mem::size_of};
+use core::{
+    fmt,
+    mem::size_of,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use fre_simd_kernels::{
     classify_byte_delta_16, AsciiByteSet, AsciiByteSetClassifier, ByteSet256, ByteSetClassifier,
@@ -31,6 +35,25 @@ use crate::{
 };
 
 const INVOCATION_RESET_WORK: u64 = 3;
+// A resume-set hint may move between compatible workspaces. Give every live
+// allocated lazy cache a process-unique, nonzero identity so a hint returning
+// to the same append-only cache can skip a linear frontier comparison. If the
+// counter is ever exhausted, zero permanently selects the checked fallback.
+static NEXT_LAZY_WORKSPACE_CACHE_ID: AtomicU64 = AtomicU64::new(1);
+const PRISTINE_RESUME_CACHE_ID: u64 = u64::MAX;
+const RESUME_CACHE_IDENTITY_CHECK_WORK: u64 = 1;
+
+fn next_lazy_workspace_cache_id() -> u64 {
+    claim_lazy_workspace_cache_id(&NEXT_LAZY_WORKSPACE_CACHE_ID)
+}
+
+fn claim_lazy_workspace_cache_id(counter: &AtomicU64) -> u64 {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .unwrap_or(0)
+}
 // A contextual bidirectional invocation consumes at most three generations
 // per source byte plus the fixed boundary and cold start-proof closures. Use
 // that universal ceiling while the retained generation is comfortably below
@@ -1956,6 +1979,7 @@ enum LazyInitialKind {
 #[derive(Debug)]
 struct LazyWorkspace {
     automaton_identity: u64,
+    cache_identity: u64,
     scratch: Vec<u32>,
     scratch_len: usize,
     frontier: Vec<u32>,
@@ -2012,6 +2036,7 @@ impl LazyWorkspace {
         };
         Ok(Self {
             automaton_identity: automaton.identity(),
+            cache_identity: next_lazy_workspace_cache_id(),
             scratch: allocate_slots(layout.states, 0_u32, total_bytes)?,
             scratch_len: 0,
             frontier: allocate_slots(layout.states, 0_u32, total_bytes)?,
@@ -2058,6 +2083,7 @@ impl LazyWorkspace {
     const fn disabled(direct_row_stride: u32) -> Self {
         Self {
             automaton_identity: 0,
+            cache_identity: 0,
             scratch: Vec::new(),
             scratch_len: 0,
             frontier: Vec::new(),
@@ -3630,9 +3656,10 @@ impl ReverseWorkspace {
 /// proof; the AOT producer authenticates that proof by canonically regenerating
 /// its partial table before this set is constructed.
 ///
-/// Cached lazy-state IDs are only hints. Every hint is content-checked against
-/// the paired workspace before reuse, so moving a set between compatible
-/// workspaces cannot cross an unauthenticated state identity.
+/// Cached lazy-state IDs are only hints. Every hint carries the process-unique
+/// identity of its append-only workspace cache, so moving a set between
+/// compatible workspaces invalidates only the selected entry in constant
+/// time. Counter exhaustion falls back to content checking.
 #[derive(Debug)]
 pub struct K0ResumeSet {
     automaton_identity: u64,
@@ -3641,6 +3668,7 @@ pub struct K0ResumeSet {
     modes: Vec<u8>,
     items: Vec<u32>,
     cached_states: Vec<u32>,
+    cached_workspace_identities: Vec<u64>,
     retained_bytes: usize,
 }
 
@@ -3697,6 +3725,11 @@ impl K0ResumeSet {
                     .and_then(|more| bytes.checked_add(more))
             })
             .and_then(|bytes| {
+                state_count
+                    .checked_mul(size_of::<u64>())
+                    .and_then(|more| bytes.checked_add(more))
+            })
+            .and_then(|bytes| {
                 total_items
                     .checked_mul(size_of::<u32>())
                     .and_then(|more| bytes.checked_add(more))
@@ -3709,6 +3742,8 @@ impl K0ResumeSet {
         let mut modes = allocate_slots(state_count, 0_u8, retained_bytes)?;
         let mut items = allocate_slots(total_items, 0_u32, retained_bytes)?;
         let cached_states = allocate_slots(state_count, LAZY_NO_STATE, retained_bytes)?;
+        let cached_workspace_identities =
+            allocate_slots(state_count, PRISTINE_RESUME_CACHE_ID, retained_bytes)?;
 
         let mut frontiers = frontiers.into_iter();
         let mut item_cursor = 0usize;
@@ -3789,6 +3824,12 @@ impl K0ResumeSet {
                     .and_then(|more| bytes.checked_add(more))
             })
             .and_then(|bytes| {
+                cached_workspace_identities
+                    .capacity()
+                    .checked_mul(size_of::<u64>())
+                    .and_then(|more| bytes.checked_add(more))
+            })
+            .and_then(|bytes| {
                 items
                     .capacity()
                     .checked_mul(size_of::<u32>())
@@ -3805,6 +3846,7 @@ impl K0ResumeSet {
             modes,
             items,
             cached_states,
+            cached_workspace_identities,
             retained_bytes,
         })
     }
@@ -7176,9 +7218,9 @@ enum WarmResumeSpan {
 }
 
 /// Exact immutable forward position reached before the first unpublished
-/// lazy cell. `work` includes the ordinary invocation reset, authenticated
-/// cached-frontier comparison, and every already-consumed direct byte, but
-/// excludes the still-unconsumed cell that caused the handoff.
+/// lazy cell. `work` includes the ordinary invocation reset, cached-state
+/// authentication, and every already-consumed direct byte, but excludes the
+/// still-unconsumed cell that caused the handoff.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct WarmResumeForwardContinuation {
     row: u32,
@@ -7200,17 +7242,20 @@ struct WarmResumeReverseContinuation {
     work: u64,
 }
 
-fn initial_accounted_warm_resume_work(seed_items: usize) -> Result<u64, SearchError> {
-    let seed_items = u64::try_from(seed_items)
+fn resume_cached_state_comparison_work(seed_items: usize) -> Result<u64, SearchError> {
+    u64::try_from(seed_items)
         .map_err(|_| SearchError::ArithmeticOverflow {
-            computation: "warm resume seed-item conversion",
+            computation: "resume cached-state seed-item conversion",
         })?
         .checked_add(1)
         .ok_or(SearchError::ArithmeticOverflow {
-            computation: "warm resume cached-state comparison work",
-        })?;
+            computation: "resume cached-state comparison work",
+        })
+}
+
+fn initial_accounted_warm_resume_work(authentication_work: u64) -> Result<u64, SearchError> {
     INVOCATION_RESET_WORK
-        .checked_add(seed_items)
+        .checked_add(authentication_work)
         .ok_or(SearchError::ArithmeticOverflow {
             computation: "search work counter",
         })
@@ -7236,12 +7281,13 @@ fn charge_accounted_warm_resume_step(work: &mut u64) -> Result<(), SearchError> 
 }
 
 /// Read a fully warmed continuation without rebuilding accounting or mutating
-/// the lazy cache. The cached hint remains only a hint: its exact pending bit
-/// and ordered frontier are content-checked before any input is consumed.
-/// Encountering an unfilled cell returns the exact cached row, byte position,
-/// pending endpoint, and already-accounted work. The value-only entry can then
-/// initialize mutable invocation scratch and continue at that cell without
-/// replaying the immutable warm prefix.
+/// the lazy cache. A nonzero per-entry workspace identity authenticates its
+/// append-only cached state ID; exhausted identity zero falls back to checking
+/// the exact pending bit and ordered frontier. Encountering an unfilled cell
+/// returns the exact cached row, byte position, pending endpoint, and
+/// already-accounted work. The value-only entry can then initialize mutable
+/// invocation scratch and continue at that cell without replaying the
+/// immutable warm prefix.
 #[allow(
     clippy::too_many_arguments,
     reason = "the warmed continuation keeps its authenticated frontier and committed prefix explicit"
@@ -7263,6 +7309,12 @@ fn try_accounted_warm_ordered_resume_endpoint(
             detail: "resume cached-state hint is outside its metadata",
         },
     )?;
+    let cached_workspace_identity = *resume_set
+        .cached_workspace_identities
+        .get(resume_state)
+        .ok_or(SearchError::InternalInvariant {
+            detail: "resume cached-workspace identity is outside its metadata",
+        })?;
     if cached_hint == LAZY_NO_STATE {
         return Ok(AccountedWarmResumeEndpoint::Declined);
     }
@@ -7273,21 +7325,34 @@ fn try_accounted_warm_ordered_resume_endpoint(
     if !cached_hint_in_bounds {
         return Ok(AccountedWarmResumeEndpoint::Declined);
     }
-    // The ordinary valid-hint path charges the pending-mode comparison plus
-    // every frontier item after its fixed invocation reset. Establish that
-    // exact total before reading the retained state contents.
-    let mut work = initial_accounted_warm_resume_work(seed.len())?;
-    let (cached_offset, cached_length, cached_pending) =
-        resume_lazy_state_bounds(&workspace.lazy, cached_hint)?;
-    let cached_end = cached_offset.checked_add(cached_length).ok_or(
-        SearchError::ArithmeticOverflow {
-            computation: "warm resume cached-state item end",
-        },
-    )?;
-    if cached_pending != seed_pending
-        || workspace.lazy.items.get(cached_offset..cached_end) != Some(seed)
-    {
+    let cache_identity = workspace.lazy.cache_identity;
+    let trusted_cache = cache_identity != 0;
+    if trusted_cache && cached_workspace_identity != cache_identity {
         return Ok(AccountedWarmResumeEndpoint::Declined);
+    }
+    // Mirror `seed_lazy_resume_state`: a same-cache nonzero ID costs one
+    // identity/bounds unit, while exhausted identity zero compares the mode
+    // and every frontier item. A different nonzero cache must return to the
+    // mutable seed path so it can publish a correctly tagged entry.
+    let authentication_work = if trusted_cache {
+        RESUME_CACHE_IDENTITY_CHECK_WORK
+    } else {
+        resume_cached_state_comparison_work(seed.len())?
+    };
+    let mut work = initial_accounted_warm_resume_work(authentication_work)?;
+    if !trusted_cache {
+        let (cached_offset, cached_length, cached_pending) =
+            resume_lazy_state_bounds(&workspace.lazy, cached_hint)?;
+        let cached_end = cached_offset.checked_add(cached_length).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "warm resume cached-state item end",
+            },
+        )?;
+        if cached_pending != seed_pending
+            || workspace.lazy.items.get(cached_offset..cached_end) != Some(seed)
+        {
+            return Ok(AccountedWarmResumeEndpoint::Declined);
+        }
     }
 
     let mut row = workspace.lazy.row_offset(cached_hint)?;
@@ -9937,6 +10002,8 @@ fn seed_lazy_resume_state(
     position: usize,
     may_intern: bool,
 ) -> Result<LazyState, SearchError> {
+    let cache_identity = workspace.lazy.cache_identity;
+    let trusted_cache = cache_identity != 0;
     let (offset, length, pending) = {
         let offset = *resume_set
             .offsets
@@ -9979,31 +10046,40 @@ fn seed_lazy_resume_state(
         .ok_or(SearchError::InternalInvariant {
             detail: "resume cached-state hint is outside its metadata",
         })?;
+    let cached_workspace_identity = *resume_set
+        .cached_workspace_identities
+        .get(resume_state)
+        .ok_or(SearchError::InternalInvariant {
+            detail: "resume cached-workspace identity is outside its metadata",
+        })?;
     if cached_hint != LAZY_NO_STATE
         && usize::try_from(cached_hint)
             .ok()
             .is_some_and(|state| state < workspace.lazy.state_len)
     {
-        let comparison_work = u64::try_from(length.saturating_add(1)).map_err(|_| {
-            SearchError::ArithmeticOverflow {
-                computation: "resume cached-state comparison work",
+        if trusted_cache && cached_workspace_identity == cache_identity {
+            meter.charge(RESUME_CACHE_IDENTITY_CHECK_WORK, position)?;
+            return Ok(LazyState::Cached(
+                workspace.lazy.row_offset(cached_hint)?,
+            ));
+        }
+        if !trusted_cache {
+            let comparison_work = resume_cached_state_comparison_work(length)?;
+            meter.charge(comparison_work, position)?;
+            let (cached_offset, cached_length, cached_pending) =
+                resume_lazy_state_bounds(&workspace.lazy, cached_hint)?;
+            let cached_end = cached_offset.checked_add(cached_length).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "resume cached-state item end",
+                },
+            )?;
+            if cached_pending == pending
+                && workspace.lazy.items.get(cached_offset..cached_end) == Some(seed)
+            {
+                return Ok(LazyState::Cached(workspace.lazy.row_offset(cached_hint)?));
             }
-        })?;
-        meter.charge(comparison_work, position)?;
-        let (cached_offset, cached_length, cached_pending) =
-            resume_lazy_state_bounds(&workspace.lazy, cached_hint)?;
-        let cached_end = cached_offset.checked_add(cached_length).ok_or(
-            SearchError::ArithmeticOverflow {
-                computation: "resume cached-state item end",
-            },
-        )?;
-        if cached_pending == pending
-            && workspace.lazy.items.get(cached_offset..cached_end) == Some(seed)
-        {
-            return Ok(LazyState::Cached(workspace.lazy.row_offset(cached_hint)?));
         }
     }
-    resume_set.cached_states[resume_state] = LAZY_NO_STATE;
 
     let copy_work = u64::try_from(length).map_err(|_| SearchError::ArithmeticOverflow {
         computation: "resume frontier copy work",
@@ -10023,6 +10099,7 @@ fn seed_lazy_resume_state(
         {
             LazyInterned::State(state) => {
                 resume_set.cached_states[resume_state] = state;
+                resume_set.cached_workspace_identities[resume_state] = cache_identity;
                 return Ok(LazyState::Cached(workspace.lazy.row_offset(state)?));
             }
             LazyInterned::BudgetDeclined => {
@@ -18712,7 +18789,7 @@ fn capacity_bytes<T>(vector: &Vec<T>, computation: &'static str) -> Result<usize
 mod tests {
     use core::mem::size_of;
     use std::{
-        sync::{Arc, Barrier},
+        sync::{atomic::AtomicU64, Arc, Barrier},
         thread,
     };
 
@@ -39323,6 +39400,561 @@ mod tests {
         (workspace, resume)
     }
 
+    #[test]
+    fn ordered_resume_hint_is_trusted_only_in_its_append_only_workspace_cache() {
+        let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b')]);
+        let haystack = b"zzabzzab";
+        let window = SearchWindow::full(haystack);
+        let frontier = [1_u32];
+        let mut resume = K0ResumeSet::new(&plan, 1, 1, [(&frontier[..], false)]).unwrap();
+        let mut first = K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+
+        let first_result = super::search_from_resume_with_workspace(
+            &plan,
+            haystack,
+            window,
+            &mut first,
+            &mut resume,
+            0,
+            3,
+            None,
+            SearchLimits::unlimited(),
+            OutputContract::SelectedEnd,
+        )
+        .unwrap()
+        .found;
+        let first_identity = first.lazy.cache_identity;
+        assert_ne!(first_identity, 0);
+        assert_eq!(resume.cached_workspace_identities[0], first_identity);
+        assert_ne!(resume.cached_states[0], super::LAZY_NO_STATE);
+
+        // A same-workspace hit authenticates the stable state ID itself. The
+        // one unit is the identity/bounds check; no frontier item is compared
+        // or copied regardless of its length.
+        let mut meter = super::WorkMeter::new(1, 0);
+        assert!(matches!(
+            super::seed_lazy_resume_state(
+                &plan,
+                &mut first,
+                &mut resume,
+                0,
+                &mut meter,
+                0,
+                3,
+                true,
+            )
+            .unwrap(),
+            super::LazyState::Cached(_)
+        ));
+        assert_eq!(meter.consumed, 1);
+
+        let mut second =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let second_identity = second.lazy.cache_identity;
+        assert_ne!(second_identity, 0);
+        assert_ne!(second_identity, first_identity);
+        let second_result = super::search_from_resume_with_workspace(
+            &plan,
+            haystack,
+            window,
+            &mut second,
+            &mut resume,
+            0,
+            3,
+            None,
+            SearchLimits::unlimited(),
+            OutputContract::SelectedEnd,
+        )
+        .unwrap()
+        .found;
+        assert_eq!(second_result, first_result);
+        assert_eq!(resume.cached_workspace_identities[0], second_identity);
+        assert_ne!(resume.cached_states[0], super::LAZY_NO_STATE);
+
+        let returned_result = super::search_from_resume_with_workspace(
+            &plan,
+            haystack,
+            window,
+            &mut first,
+            &mut resume,
+            0,
+            3,
+            None,
+            SearchLimits::unlimited(),
+            OutputContract::SelectedEnd,
+        )
+        .unwrap()
+        .found;
+        assert_eq!(returned_result, first_result);
+        assert_eq!(resume.cached_workspace_identities[0], first_identity);
+    }
+
+    #[test]
+    fn lazy_workspace_cache_identity_exhaustion_is_sticky_and_concurrent_claims_are_unique() {
+        const THREADS: usize = 8;
+        const CLAIMS_PER_THREAD: usize = 64;
+        let counter = Arc::new(AtomicU64::new(1));
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let mut workers = Vec::new();
+        for _ in 0..THREADS {
+            let counter = Arc::clone(&counter);
+            let barrier = Arc::clone(&barrier);
+            workers.push(thread::spawn(move || {
+                barrier.wait();
+                (0..CLAIMS_PER_THREAD)
+                    .map(|_| super::claim_lazy_workspace_cache_id(counter.as_ref()))
+                    .collect::<Vec<_>>()
+            }));
+        }
+        let mut identities = workers
+            .into_iter()
+            .flat_map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        identities.sort_unstable();
+        assert_eq!(
+            identities,
+            (1..=u64::try_from(THREADS * CLAIMS_PER_THREAD).unwrap()).collect::<Vec<_>>()
+        );
+
+        let exhausted = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(
+            super::claim_lazy_workspace_cache_id(&exhausted),
+            u64::MAX - 1
+        );
+        assert_eq!(
+            exhausted.load(core::sync::atomic::Ordering::Relaxed),
+            super::PRISTINE_RESUME_CACHE_ID
+        );
+        assert_eq!(super::claim_lazy_workspace_cache_id(&exhausted), 0);
+        assert_eq!(super::claim_lazy_workspace_cache_id(&exhausted), 0);
+        assert_eq!(
+            exhausted.load(core::sync::atomic::Ordering::Relaxed),
+            super::PRISTINE_RESUME_CACHE_ID
+        );
+    }
+
+    #[test]
+    fn resume_cache_owners_remain_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_send_sync::<K0Workspace>();
+        assert_send_sync::<K0ResumeSet>();
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the regression keeps retained-byte accounting, many unrelated hints, and the exact failed seed transaction together"
+    )]
+    fn failed_workspace_switch_does_not_clear_many_unrelated_resume_hints() {
+        const FRONTIERS: usize = 64;
+        let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b')]);
+        let haystack = b"zzabzzab";
+        let window = SearchWindow::full(haystack);
+        let frontier = [1_u32];
+        let mut resume = K0ResumeSet::new(
+            &plan,
+            FRONTIERS,
+            FRONTIERS,
+            core::iter::repeat((&frontier[..], false)).take(FRONTIERS),
+        )
+        .unwrap();
+        assert!(
+            resume
+                .cached_workspace_identities
+                .iter()
+                .all(|&identity| identity == super::PRISTINE_RESUME_CACHE_ID)
+        );
+        let retained = resume
+            .offsets
+            .capacity()
+            .checked_mul(size_of::<usize>())
+            .and_then(|bytes| {
+                resume
+                    .lengths
+                    .capacity()
+                    .checked_mul(size_of::<u32>())
+                    .and_then(|more| bytes.checked_add(more))
+            })
+            .and_then(|bytes| bytes.checked_add(resume.modes.capacity()))
+            .and_then(|bytes| {
+                resume
+                    .cached_states
+                    .capacity()
+                    .checked_mul(size_of::<u32>())
+                    .and_then(|more| bytes.checked_add(more))
+            })
+            .and_then(|bytes| {
+                resume
+                    .cached_workspace_identities
+                    .capacity()
+                    .checked_mul(size_of::<u64>())
+                    .and_then(|more| bytes.checked_add(more))
+            })
+            .and_then(|bytes| {
+                resume
+                    .items
+                    .capacity()
+                    .checked_mul(size_of::<u32>())
+                    .and_then(|more| bytes.checked_add(more))
+            })
+            .unwrap();
+        assert_eq!(resume.retained_bytes(), retained);
+
+        let mut first =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        for state in 0..FRONTIERS {
+            super::search_from_resume_with_workspace(
+                &plan,
+                haystack,
+                window,
+                &mut first,
+                &mut resume,
+                state,
+                3,
+                None,
+                SearchLimits::unlimited(),
+                OutputContract::SelectedEnd,
+            )
+            .unwrap();
+        }
+        assert!(
+            resume
+                .cached_states
+                .iter()
+                .all(|&state| state != super::LAZY_NO_STATE)
+        );
+        assert!(
+            resume
+                .cached_workspace_identities
+                .iter()
+                .all(|&identity| identity == first.lazy.cache_identity)
+        );
+        let states_before = resume.cached_states.clone();
+        let identities_before = resume.cached_workspace_identities.clone();
+
+        let mut second =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        assert_ne!(first.lazy.cache_identity, second.lazy.cache_identity);
+        let mut meter = super::WorkMeter::new(0, 0);
+        let error = super::seed_lazy_resume_state(
+            &plan,
+            &mut second,
+            &mut resume,
+            0,
+            &mut meter,
+            0,
+            3,
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            SearchError::WorkLimitExceeded {
+                limit: 0,
+                consumed: 0,
+                requested: 1,
+                position: 3,
+            }
+        ));
+        assert_eq!(resume.cached_states, states_before);
+        assert_eq!(resume.cached_workspace_identities, identities_before);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the regression follows two independently tagged frontiers through immutable warm probes and a workspace round trip"
+    )]
+    fn per_frontier_cache_identities_preserve_unrelated_and_returned_workspace_hints() {
+        let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b')]);
+        let haystack = b"zzabzzab";
+        let window = SearchWindow::full(haystack);
+        let frontier = [1_u32];
+        let mut resume = K0ResumeSet::new(
+            &plan,
+            2,
+            2,
+            [(&frontier[..], false), (&frontier[..], false)],
+        )
+        .unwrap();
+        let mut first =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let mut expected = None;
+        for state in 0..2 {
+            expected = Some(
+                super::search_from_resume_with_workspace(
+                    &plan,
+                    haystack,
+                    window,
+                    &mut first,
+                    &mut resume,
+                    state,
+                    3,
+                    None,
+                    SearchLimits::unlimited(),
+                    OutputContract::SelectedEnd,
+                )
+                .unwrap()
+                .found,
+            );
+        }
+        let expected = expected.unwrap();
+        let first_identity = first.lazy.cache_identity;
+        let unrelated_state = resume.cached_states[1];
+
+        let mut second =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let second_identity = second.lazy.cache_identity;
+        let second_result = super::search_from_resume_with_workspace(
+            &plan,
+            haystack,
+            window,
+            &mut second,
+            &mut resume,
+            0,
+            3,
+            None,
+            SearchLimits::unlimited(),
+            OutputContract::SelectedEnd,
+        )
+        .unwrap()
+        .found;
+        assert_eq!(second_result, expected);
+        assert_eq!(
+            resume.cached_workspace_identities,
+            [second_identity, first_identity]
+        );
+        assert_eq!(resume.cached_states[1], unrelated_state);
+
+        let states_before_probe = resume.cached_states.clone();
+        let identities_before_probe = resume.cached_workspace_identities.clone();
+        let (trusted_found, trusted_work) = match super::try_accounted_warm_ordered_resume_endpoint(
+            &plan,
+            haystack,
+            window,
+            &first,
+            &resume,
+            1,
+            3,
+            None,
+            false,
+        )
+        .unwrap()
+        {
+            super::AccountedWarmResumeEndpoint::Complete { found, work } => (found, work),
+            outcome => panic!("returned-workspace warm hint did not complete: {outcome:?}"),
+        };
+        assert_eq!(trusted_found, expected.map(MatchSpan::end));
+
+        // Identity exhaustion preserves correctness by checking the retained
+        // mode and frontier. Its accounting differs from the trusted path by
+        // exactly one work unit per frontier item.
+        first.lazy.cache_identity = 0;
+        let (checked_found, checked_work) = match super::try_accounted_warm_ordered_resume_endpoint(
+            &plan,
+            haystack,
+            window,
+            &first,
+            &resume,
+            1,
+            3,
+            None,
+            false,
+        )
+        .unwrap()
+        {
+            super::AccountedWarmResumeEndpoint::Complete { found, work } => (found, work),
+            outcome => panic!("zero-identity warm hint did not content-authenticate: {outcome:?}"),
+        };
+        first.lazy.cache_identity = first_identity;
+        assert_eq!(checked_found, trusted_found);
+        assert_eq!(
+            checked_work,
+            trusted_work + u64::try_from(frontier.len()).unwrap()
+        );
+        assert_eq!(resume.cached_states, states_before_probe);
+        assert_eq!(
+            resume.cached_workspace_identities,
+            identities_before_probe
+        );
+
+        // The public value path may consume the still-valid entry for `first`
+        // without disturbing entry zero, which is tagged for `second`.
+        assert_eq!(
+            plan.prepare::<SelectedEnd>()
+                .search_prevalidated_selected_end_value_from_ordered_resume_with_authenticated_workspace(
+                    haystack,
+                    window,
+                    &mut first,
+                    &mut resume,
+                    1,
+                    3,
+                    None,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            expected.map(MatchSpan::end)
+        );
+        assert_eq!(resume.cached_states, states_before_probe);
+        assert_eq!(
+            resume.cached_workspace_identities,
+            identities_before_probe
+        );
+
+        // Both caches happened to assign the identical semantic frontier the
+        // same in-bounds numeric state ID. The different nonzero entry tag is
+        // nevertheless authoritative: the immutable probe must decline and
+        // leave publication to the mutable seed path.
+        assert_eq!(resume.cached_states[0], resume.cached_states[1]);
+        assert!(usize::try_from(resume.cached_states[1])
+            .ok()
+            .is_some_and(|state| state < second.lazy.state_len));
+        assert_eq!(
+            super::try_accounted_warm_ordered_resume_endpoint(
+                &plan,
+                haystack,
+                window,
+                &second,
+                &resume,
+                1,
+                3,
+                None,
+                false,
+            )
+            .unwrap(),
+            super::AccountedWarmResumeEndpoint::Declined
+        );
+        assert_eq!(resume.cached_states, states_before_probe);
+        assert_eq!(
+            resume.cached_workspace_identities,
+            identities_before_probe
+        );
+
+        let mut meter = super::WorkMeter::new(1, 0);
+        assert!(matches!(
+            super::seed_lazy_resume_state(
+                &plan,
+                &mut first,
+                &mut resume,
+                1,
+                &mut meter,
+                0,
+                3,
+                true,
+            )
+            .unwrap(),
+            super::LazyState::Cached(_)
+        ));
+        assert_eq!(meter.consumed, 1);
+
+        let returned = super::search_from_resume_with_workspace(
+            &plan,
+            haystack,
+            window,
+            &mut first,
+            &mut resume,
+            0,
+            3,
+            None,
+            SearchLimits::unlimited(),
+            OutputContract::SelectedEnd,
+        )
+        .unwrap()
+        .found;
+        assert_eq!(returned, expected);
+        assert_eq!(
+            resume.cached_workspace_identities,
+            [first_identity, first_identity]
+        );
+        let mut meter = super::WorkMeter::new(1, 0);
+        assert!(matches!(
+            super::seed_lazy_resume_state(
+                &plan,
+                &mut first,
+                &mut resume,
+                0,
+                &mut meter,
+                0,
+                3,
+                true,
+            )
+            .unwrap(),
+            super::LazyState::Cached(_)
+        ));
+        assert_eq!(meter.consumed, 1);
+    }
+
+    #[test]
+    fn exhausted_zero_cache_identity_authenticates_hint_contents() {
+        let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b')]);
+        let haystack = b"zzabzzab";
+        let window = SearchWindow::full(haystack);
+        let frontier = [1_u32];
+        let mut resume = K0ResumeSet::new(&plan, 1, 1, [(&frontier[..], false)]).unwrap();
+        let mut first =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        first.lazy.cache_identity = 0;
+        let expected = super::search_from_resume_with_workspace(
+            &plan,
+            haystack,
+            window,
+            &mut first,
+            &mut resume,
+            0,
+            3,
+            None,
+            SearchLimits::unlimited(),
+            OutputContract::SelectedEnd,
+        )
+        .unwrap()
+        .found;
+        let stale_hint = resume.cached_states[0];
+
+        let mut second =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        second.lazy.cache_identity = 0;
+        let mut pending_resume =
+            K0ResumeSet::new(&plan, 1, 1, [(&frontier[..], true)]).unwrap();
+        super::search_from_resume_with_workspace(
+            &plan,
+            haystack,
+            window,
+            &mut second,
+            &mut pending_resume,
+            0,
+            3,
+            Some(2),
+            SearchLimits::unlimited(),
+            OutputContract::SelectedEnd,
+        )
+        .unwrap();
+        assert_eq!(pending_resume.cached_states[0], stale_hint);
+        assert!(super::resume_lazy_state_bounds(&second.lazy, stale_hint)
+            .unwrap()
+            .2);
+
+        let actual = super::search_from_resume_with_workspace(
+            &plan,
+            haystack,
+            window,
+            &mut second,
+            &mut resume,
+            0,
+            3,
+            None,
+            SearchLimits::unlimited(),
+            OutputContract::SelectedEnd,
+        )
+        .unwrap()
+        .found;
+        assert_eq!(actual, expected);
+        assert_ne!(resume.cached_states[0], stale_hint);
+        assert!(!super::resume_lazy_state_bounds(&second.lazy, resume.cached_states[0])
+            .unwrap()
+            .2);
+    }
+
     fn assert_resume_batch_exit_shape(
         plan: &Automaton,
         haystack: &[u8],
@@ -40728,7 +41360,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn warmed_resume_value_paths_reauthenticate_stale_and_out_of_range_hints() {
+    fn warmed_resume_value_paths_zero_identity_reauthenticates_stale_and_out_of_range_hints() {
         let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b')]);
         let frontier = [1_u32];
         let haystack = b"xxab!";
@@ -40753,6 +41385,12 @@ mod tests {
             pending
                 || stale_workspace.lazy.items.get(offset..end) != Some(frontier.as_slice())
         );
+        // Exhausted workspace identity zero cannot authenticate a numeric ID,
+        // so both the immutable warm probe and ordinary seed path must compare
+        // the retained state contents before using this deliberately stale
+        // in-bounds hint.
+        stale_workspace.lazy.cache_identity = 0;
+        stale_resume.cached_workspace_identities[0] = 0;
         stale_resume.cached_states[0] = stale_hint;
         assert_eq!(
             super::try_warm_ordered_resume_endpoint(
@@ -41152,7 +41790,9 @@ mod tests {
 
     #[test]
     fn warmed_resume_span_continues_exact_forward_accounting_through_reverse_steps() {
-        let mut completed_work = super::initial_accounted_warm_resume_work(2).unwrap();
+        let comparison_work = super::resume_cached_state_comparison_work(2).unwrap();
+        let mut completed_work =
+            super::initial_accounted_warm_resume_work(comparison_work).unwrap();
         for _ in 0..5 {
             super::charge_accounted_warm_resume_step(&mut completed_work).unwrap();
         }
