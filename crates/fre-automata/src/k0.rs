@@ -9907,6 +9907,7 @@ fn settle_warm_direct_exists_steps(
     direct_steps: &mut usize,
     position: usize,
 ) -> Result<(), SearchError> {
+    debug_assert_eq!(meter.limit, u64::MAX);
     if *direct_steps == 0 {
         return Ok(());
     }
@@ -9914,6 +9915,23 @@ fn settle_warm_direct_exists_steps(
         u64::try_from(*direct_steps).map_err(|_| SearchError::ArithmeticOverflow {
             computation: "warm existence direct-step work conversion",
         })?;
+    let remaining = meter.remaining();
+    if requested > remaining {
+        // Reproduce the scalar loop's successful prefix before its next
+        // one-unit charge overflows. Besides preserving the terminal error,
+        // this keeps the internal ledger exact for adversarial near-u64
+        // starts instead of leaving the whole batch unsettled.
+        meter.charge(remaining, position)?;
+        *direct_steps = usize::try_from(requested - remaining).map_err(|_| {
+            SearchError::ArithmeticOverflow {
+                computation: "warm existence unsettled direct-step conversion",
+            }
+        })?;
+        meter.charge(1, position)?;
+        return Err(SearchError::InternalInvariant {
+            detail: "warm existence direct-step overflow was not reported",
+        });
+    }
     meter.charge(requested, position)?;
     *direct_steps = 0;
     Ok(())
@@ -47223,6 +47241,17 @@ mod tests {
 
     #[test]
     fn warm_exists_batched_direct_steps_preserve_unlimited_work_overflow() {
+        let mut meter = WorkMeter::new(u64::MAX, u64::MAX - 2);
+        let mut direct_steps = 3;
+        assert!(matches!(
+            super::settle_warm_direct_exists_steps(&mut meter, &mut direct_steps, 18),
+            Err(SearchError::ArithmeticOverflow {
+                computation: "search work counter"
+            })
+        ));
+        assert_eq!(meter.consumed, u64::MAX);
+        assert_eq!(direct_steps, 1);
+
         let mut meter = WorkMeter::new(u64::MAX, u64::MAX - 2);
         let mut direct_steps = 2;
         super::settle_warm_direct_exists_steps(&mut meter, &mut direct_steps, 19).unwrap();
