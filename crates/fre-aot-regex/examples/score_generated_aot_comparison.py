@@ -3,10 +3,11 @@
 
 The scorer consumes stdout TSV files from generated_aot_upstream_comparison.
 It never generates patterns or invokes a benchmark. Final acceptance uses only
-self-contained direct_dfa and direct_context_dfa rows. Runtime-backed rows are
-retained in coverage reports but excluded from the performance score. Final
-acceptance requires every generated source under every output contract to meet
-the direct-compilation coverage gate and every contract to meet the speed gate.
+self-contained direct_dfa and direct_context_dfa rows by default. An explicit
+score scope can instead evaluate every compiled route or only resource-fallback
+routes while the direct-compilation coverage gate remains independently
+configurable. Final acceptance requires every selected family and output
+contract to meet the speed gate.
 """
 
 from __future__ import annotations
@@ -30,7 +31,14 @@ DEFAULT_FEATURES = {
     "linux-aarch64": "asimd",
     "linux-x86_64": "avx2",
 }
-DIRECT_ROUTES = {"direct_dfa", "direct_context_dfa"}
+DIRECT_ROUTES = frozenset({"direct_dfa", "direct_context_dfa"})
+RESOURCE_FALLBACK_ROUTES = frozenset(
+    {
+        "direct_resource_fallback",
+        "ordinary_runtime_resource_fallback",
+        "prepared_runtime_resource_fallback",
+    }
+)
 OUTPUT_MATRIX_MODES = {
     "assigned_v1": ({"span", "exists"}, 1),
     "span_exists_selected_end_v1": ({"span", "exists", "selected_end"}, 3),
@@ -38,11 +46,25 @@ OUTPUT_MATRIX_MODES = {
 ROUTE_METADATA = {
     "direct_dfa": ("ordered_dfa", "complete_dfa"),
     "direct_context_dfa": ("ordered_context_dfa", "complete_context_dfa"),
+    "direct_resource_fallback": (
+        "ordered_nfa",
+        "determinization_resource_limit",
+    ),
     "prepared_runtime_assertion": ("ordered_nfa", "context_assertions"),
+    "ordinary_runtime_resource_fallback": (
+        "ordered_nfa",
+        "determinization_resource_limit",
+    ),
     "prepared_runtime_resource_fallback": (
         "ordered_nfa",
         "determinization_resource_limit",
     ),
+}
+ALL_COMPILED_ROUTES = frozenset(ROUTE_METADATA)
+SCORE_SCOPES = {
+    "direct": DIRECT_ROUTES,
+    "all-compiled": ALL_COMPILED_ROUTES,
+    "resource-fallback": RESOURCE_FALLBACK_ROUTES,
 }
 MODE_SPECS = {
     "grammar_generated_out_of_sample": {
@@ -130,11 +152,6 @@ class Cell:
     route: str
     window_bytes: int
     rust_over_aot: float
-
-    @property
-    def scoreable(self) -> bool:
-        return self.route in DIRECT_ROUTES
-
 
 def geometric_mean(values: Iterable[float]) -> float:
     samples = list(values)
@@ -525,12 +542,13 @@ def report(
     cells: Sequence[Cell],
     minimum_speedup: float,
     minimum_direct_coverage: float = 1.0,
+    score_routes: frozenset[str] = DIRECT_ROUTES,
 ) -> bool:
     hosts = sorted({cell.host for cell in cells})
     roots = sorted({cell.seed for cell in cells})
     print(
         "#coverage\thost\tgenerator\tseed\tcells\tscoreable_cells\tdirect_dfa_cells"
-        "\tdirect_context_dfa_cells\truntime_excluded_cells\tunique_patterns"
+        "\tdirect_context_dfa_cells\tunscored_cells\tunique_patterns"
         "\tfully_direct_patterns\tdirect_pattern_coverage\tminimum_required"
         "\tfamilies\tscoreable_families\tstatus"
     )
@@ -548,7 +566,7 @@ def report(
                     for cell in cells
                     if (cell.host, cell.generator, cell.seed) == (host, generator, seed)
                 ]
-                scoreable = [cell for cell in group if cell.scoreable]
+                scoreable = [cell for cell in group if cell.route in score_routes]
                 direct = sum(cell.route == "direct_dfa" for cell in group)
                 context = sum(cell.route == "direct_context_dfa" for cell in group)
                 families = {cell.family for cell in group}
@@ -583,7 +601,11 @@ def report(
                     else "fail"
                 )
                 coverage_accepted[host] &= coverage_status == "pass"
-                if direct == 0 or context == 0 or len(scoreable_families) != expected_families:
+                if not scoreable or len(scoreable_families) != expected_families:
+                    raise ValidationError(
+                        f"{host}/{generator}/{seed}: incomplete selected-route family coverage"
+                    )
+                if score_routes == DIRECT_ROUTES and (direct == 0 or context == 0):
                     raise ValidationError(
                         f"{host}/{generator}/{seed}: incomplete direct/context compiled coverage"
                     )
@@ -679,19 +701,24 @@ def report(
     accepted = True
     for host in hosts:
         host_accepted = coverage_accepted[host]
-        host_cells = [cell for cell in cells if cell.host == host and cell.scoreable]
+        host_cells = [
+            cell
+            for cell in cells
+            if cell.host == host and cell.route in score_routes
+        ]
+        if not host_cells:
+            raise ValidationError(f"{host}: selected score scope has no cells")
         for scope, value, scoped in [
             ("compiled_primary", "all", host_cells),
-            (
-                "route",
-                "direct_dfa",
-                [cell for cell in host_cells if cell.route == "direct_dfa"],
-            ),
-            (
-                "route",
-                "direct_context_dfa",
-                [cell for cell in host_cells if cell.route == "direct_context_dfa"],
-            ),
+            *[
+                (
+                    "route",
+                    route,
+                    [cell for cell in host_cells if cell.route == route],
+                )
+                for route in sorted(score_routes)
+                if any(cell.route == route for cell in host_cells)
+            ],
         ]:
             print(
                 "p10",
@@ -776,7 +803,7 @@ def report(
                 ]
                 if not contract_generator_cells:
                     raise ValidationError(
-                        f"{host}/{generator}/{output}: no direct compiled cells"
+                        f"{host}/{generator}/{output}: no selected compiled cells"
                     )
                 (
                     contract_family_scores,
@@ -862,7 +889,7 @@ def report(
 
         route_totals: dict[str, list[float]] = defaultdict(list)
         for generator in sorted(generator_scores):
-            for route in sorted(DIRECT_ROUTES):
+            for route in sorted(score_routes):
                 route_generator_cells = [
                     cell
                     for cell in host_cells
@@ -894,30 +921,29 @@ def report(
                     route_generator_status,
                     sep="\t",
                 )
-        if set(route_totals) == DIRECT_ROUTES:
-            for route in sorted(DIRECT_ROUTES):
-                route_cells = [cell for cell in host_cells if cell.route == route]
-                route_score = geometric_mean(route_totals[route])
-                route_status = "pass" if route_score >= minimum_speedup else "fail"
-                host_accepted &= route_status == "pass"
-                print(
-                    "route_score",
-                    host,
-                    route,
-                    len(route_totals[route]),
-                    len({(cell.generator, cell.seed) for cell in route_cells}),
-                    len(
-                        {
-                            (cell.generator, cell.seed, cell.family)
-                            for cell in route_cells
-                        }
-                    ),
-                    len(route_cells),
-                    f"{route_score:.6f}",
-                    f"{minimum_speedup:.6f}",
-                    route_status,
-                    sep="\t",
-                )
+        for route in sorted(route_totals):
+            route_cells = [cell for cell in host_cells if cell.route == route]
+            route_score = geometric_mean(route_totals[route])
+            route_status = "pass" if route_score >= minimum_speedup else "fail"
+            host_accepted &= route_status == "pass"
+            print(
+                "route_score",
+                host,
+                route,
+                len(route_totals[route]),
+                len({(cell.generator, cell.seed) for cell in route_cells}),
+                len(
+                    {
+                        (cell.generator, cell.seed, cell.family)
+                        for cell in route_cells
+                    }
+                ),
+                len(route_cells),
+                f"{route_score:.6f}",
+                f"{minimum_speedup:.6f}",
+                route_status,
+                sep="\t",
+            )
         status = "pass" if score >= minimum_speedup and host_accepted else "fail"
         accepted &= status == "pass"
         print(
@@ -1058,6 +1084,41 @@ def self_test() -> None:
         line.startswith("contract_score\th\tselected_end\t")
         and line.endswith("\tfail")
         for line in contract_output.getvalue().splitlines()
+    )
+
+    fallback_routes = sorted(RESOURCE_FALLBACK_ROUTES)
+    fallback_cells = [
+        Cell(
+            cell.host,
+            cell.target,
+            cell.feature_bits,
+            cell.generator,
+            cell.seed,
+            cell.case,
+            cell.pattern_name,
+            cell.family,
+            cell.output,
+            fallback_routes[index % len(fallback_routes)],
+            cell.window_bytes,
+            cell.rust_over_aot,
+        )
+        for index, cell in enumerate(adversarial_cells())
+    ]
+    fallback_output = io.StringIO()
+    with contextlib.redirect_stdout(fallback_output):
+        assert report(
+            fallback_cells,
+            minimum_speedup=1.5,
+            minimum_direct_coverage=0.0,
+            score_routes=RESOURCE_FALLBACK_ROUTES,
+        )
+    assert all(
+        any(
+            line.startswith(f"route_score\th\t{route}\t")
+            and line.endswith("\tpass")
+            for line in fallback_output.getvalue().splitlines()
+        )
+        for route in RESOURCE_FALLBACK_ROUTES
     )
 
     incomplete_coverage = adversarial_cells()
@@ -1309,7 +1370,21 @@ def main(argv: Sequence[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("results", nargs="*", type=Path, help="benchmark stdout TSV files")
     parser.add_argument("--minimum-speedup", type=float, default=1.5)
-    parser.add_argument("--minimum-direct-coverage", type=float, default=1.0)
+    parser.add_argument(
+        "--minimum-direct-coverage",
+        type=float,
+        default=None,
+        help=(
+            "minimum all-contract direct pattern coverage; defaults to 1 for "
+            "--score-scope=direct and 0 for broader scopes"
+        ),
+    )
+    parser.add_argument(
+        "--score-scope",
+        choices=tuple(SCORE_SCOPES),
+        default="direct",
+        help="routes included in performance acceptance (default: direct)",
+    )
     parser.add_argument(
         "--expected-targets",
         default=",".join(sorted(DEFAULT_TARGETS)),
@@ -1328,9 +1403,12 @@ def main(argv: Sequence[str]) -> int:
     if not arguments.results:
         parser.error("at least one result TSV is required")
     expected_targets = {target for target in arguments.expected_targets.split(",") if target}
+    minimum_direct_coverage = arguments.minimum_direct_coverage
+    if minimum_direct_coverage is None:
+        minimum_direct_coverage = 1.0 if arguments.score_scope == "direct" else 0.0
     if (
         arguments.minimum_speedup <= 0.0
-        or not 0.0 <= arguments.minimum_direct_coverage <= 1.0
+        or not 0.0 <= minimum_direct_coverage <= 1.0
         or not expected_targets
     ):
         parser.error(
@@ -1349,7 +1427,8 @@ def main(argv: Sequence[str]) -> int:
             if report(
                 cells,
                 arguments.minimum_speedup,
-                arguments.minimum_direct_coverage,
+                minimum_direct_coverage,
+                SCORE_SCOPES[arguments.score_scope],
             )
             else 1
         )
