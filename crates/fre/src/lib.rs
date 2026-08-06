@@ -13619,11 +13619,10 @@ mod tests {
 
     #[test]
     fn k0_mandatory_suffix_rescans_same_address_after_candidate_mutation() {
-        let regex = PortableBuilder::new("a.*XYZ")
-            .unicode(false)
-            .plan_selection(PlanSelection::ForceK0)
-            .build()
-            .expect("focused suffix pattern builds through K0");
+        // Optional facade sidecars compete for bounded planner work. Exercise
+        // the suffix state contract with a self-consistent suffix-only plan
+        // instead of depending on the facade's current sidecar priority.
+        let regex = forced_k0_with_only_mandatory_suffix("a.*XYZ");
         let PortablePlan::K0(plan) = &regex.plan else {
             panic!("forced suffix pattern did not retain K0");
         };
