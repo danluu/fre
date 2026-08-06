@@ -6,13 +6,13 @@ use fre::{
 
 const ONE_ANCHOR_PATTERN: &str = r"Q[ab][cd][ef][gh][ij][kl][mn][op][rs][tu][vw][xy][01]";
 const TWO_ANCHOR_PATTERN: &str = r"[ab][cd][ef][gh][ij][kl][mn][op][rs][tu][vw][xy][01]";
-const SHIFT_AND_PATTERN: &str = r"[abc][def][ghi][jkl][mno][pqr][stu][vwx]";
+const GENERAL_PAIR_PATTERN: &str = r"[abc][def][ghi][jkl][mno][pqr][stu][vwx]";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MatrixReducer {
     One,
     Two,
-    ShiftAnd,
+    GeneralPair,
 }
 
 fn matrix_pattern(width: usize, reducer: MatrixReducer, anchor_offset: Option<usize>) -> String {
@@ -26,7 +26,9 @@ fn matrix_pattern(width: usize, reducer: MatrixReducer, anchor_offset: Option<us
                 (MatrixReducer::Two, 0) => "[e0]",
                 (MatrixReducer::Two, _) if position + 1 == width => "[/0]",
                 (MatrixReducer::Two, _) => r"[\x01\x02]",
-                (MatrixReducer::ShiftAnd, _) => panic!("ShiftAnd has no anchor offset"),
+                (MatrixReducer::GeneralPair, _) => {
+                    panic!("general pair has no exact-anchor offset")
+                }
             };
             pattern.push_str(anchor);
         } else {
@@ -40,6 +42,10 @@ fn matrix_pattern(width: usize, reducer: MatrixReducer, anchor_offset: Option<us
     pattern
 }
 
+fn raw_shift_and_pattern(width: usize) -> String {
+    r"[\x00-\x7E]".repeat(width)
+}
+
 fn matrix_word(width: usize, reducer: MatrixReducer, anchor_offset: Option<usize>) -> Vec<u8> {
     (0..width)
         .map(|position| {
@@ -49,7 +55,9 @@ fn matrix_word(width: usize, reducer: MatrixReducer, anchor_offset: Option<usize
                     (MatrixReducer::One, _) if position + 1 == width => b'/',
                     (MatrixReducer::Two, _) if position + 1 == width => b'/',
                     (MatrixReducer::One | MatrixReducer::Two, _) => 1,
-                    (MatrixReducer::ShiftAnd, _) => panic!("ShiftAnd has no anchor offset"),
+                    (MatrixReducer::GeneralPair, _) => {
+                        panic!("general pair has no exact-anchor offset")
+                    }
                 }
             } else {
                 match position % 3 {
@@ -82,7 +90,7 @@ fn span(matched: Option<fre::Match>) -> Option<(usize, usize)> {
 }
 
 #[test]
-fn default_large_cartesian_languages_select_only_certified_anchor_reducers() {
+fn default_large_cartesian_languages_select_certified_fixed_reducers() {
     let cases: [(&str, &[u8], Option<FixedPredicateWord64Reducer>); 3] = [
         (
             ONE_ANCHOR_PATTERN,
@@ -94,7 +102,11 @@ fn default_large_cartesian_languages_select_only_certified_anchor_reducers() {
             b"--acegikmortvx0--",
             Some(FixedPredicateWord64Reducer::TwoByteAnchor),
         ),
-        (SHIFT_AND_PATTERN, b"--adgjmpsv--", None),
+        (
+            GENERAL_PAIR_PATTERN,
+            b"--adgjmpsv--",
+            Some(FixedPredicateWord64Reducer::ShiftAnd),
+        ),
     ];
     for (pattern, haystack, reducer) in cases {
         let regex = build_auto(pattern);
@@ -118,6 +130,10 @@ fn default_large_cartesian_languages_select_only_certified_anchor_reducers() {
                 panic!("fixed-predicate route published another accounting family");
             };
             assert_eq!(accounting.identity.reducer, reducer);
+            assert_eq!(
+                accounting.identity.primary_finder.is_some(),
+                pattern == GENERAL_PAIR_PATTERN
+            );
             assert_eq!(accounting.upper_bounds.scratch_bytes, 0);
             assert_eq!(accounting.actual.scratch_bytes, 0);
         } else {
@@ -128,18 +144,18 @@ fn default_large_cartesian_languages_select_only_certified_anchor_reducers() {
 }
 
 #[test]
-fn fixed_predicate_auto_route_matrix_admits_anchored_words_through_width_64() {
+fn fixed_predicate_auto_route_matrix_admits_selective_words_through_width_64() {
     for width in [12, 15, 16, 17, 24, 32, 48, 64] {
         for reducer in [
             MatrixReducer::One,
             MatrixReducer::Two,
-            MatrixReducer::ShiftAnd,
+            MatrixReducer::GeneralPair,
         ] {
             let offsets = match reducer {
                 MatrixReducer::One | MatrixReducer::Two => {
                     vec![Some(0), Some(width / 2), Some(width - 1)]
                 }
-                MatrixReducer::ShiftAnd => vec![None],
+                MatrixReducer::GeneralPair => vec![None],
             };
             for anchor_offset in offsets {
                 let pattern = matrix_pattern(width, reducer, anchor_offset);
@@ -153,38 +169,30 @@ fn fixed_predicate_auto_route_matrix_admits_anchored_words_through_width_64() {
                         )
                     });
                 assert_eq!(span(matched), Some((0, width)));
-                match reducer {
-                    MatrixReducer::One | MatrixReducer::Two => {
-                        assert_eq!(
-                            regex.build_report().plan,
-                            PlanKind::FixedPredicateWord64,
-                            "width={width} reducer={reducer:?} offset={anchor_offset:?}"
-                        );
-                        let SearchAccounting::FixedPredicateWord64(accounting) = accounting else {
-                            panic!(
-                                "admitted matrix route lost fixed accounting width={width} reducer={reducer:?} offset={anchor_offset:?}"
-                            );
-                        };
-                        let expected = match reducer {
-                            MatrixReducer::One => FixedPredicateWord64Reducer::OneByteAnchor,
-                            MatrixReducer::Two => FixedPredicateWord64Reducer::TwoByteAnchor,
-                            MatrixReducer::ShiftAnd => unreachable!(),
-                        };
-                        assert_eq!(accounting.identity.reducer, expected);
-                        let session = regex
-                            .search_session(SearchSessionLimits::unlimited())
-                            .unwrap();
-                        assert_eq!(session.workspace_setup_accounting(), None);
-                    }
-                    MatrixReducer::ShiftAnd => {
-                        assert_eq!(regex.build_report().plan, PlanKind::K0);
-                        assert!(matches!(accounting, SearchAccounting::K0(_)));
-                        let session = regex
-                            .search_session(SearchSessionLimits::unlimited())
-                            .unwrap();
-                        assert!(session.workspace_setup_accounting().is_some());
-                    }
-                }
+                assert_eq!(
+                    regex.build_report().plan,
+                    PlanKind::FixedPredicateWord64,
+                    "width={width} reducer={reducer:?} offset={anchor_offset:?}"
+                );
+                let SearchAccounting::FixedPredicateWord64(accounting) = accounting else {
+                    panic!(
+                        "admitted matrix route lost fixed accounting width={width} reducer={reducer:?} offset={anchor_offset:?}"
+                    );
+                };
+                let expected = match reducer {
+                    MatrixReducer::One => FixedPredicateWord64Reducer::OneByteAnchor,
+                    MatrixReducer::Two => FixedPredicateWord64Reducer::TwoByteAnchor,
+                    MatrixReducer::GeneralPair => FixedPredicateWord64Reducer::ShiftAnd,
+                };
+                assert_eq!(accounting.identity.reducer, expected);
+                assert_eq!(
+                    accounting.identity.primary_finder.is_some(),
+                    reducer == MatrixReducer::GeneralPair
+                );
+                let session = regex
+                    .search_session(SearchSessionLimits::unlimited())
+                    .unwrap();
+                assert_eq!(session.workspace_setup_accounting(), None);
             }
         }
     }
@@ -466,7 +474,7 @@ fn fixed_predicate_v2_routes_match_k0_across_search_session_and_window_apis() {
         (12, MatrixReducer::One, Some(0)),
         (15, MatrixReducer::Two, Some(15 / 2)),
         (16, MatrixReducer::One, Some(15)),
-        (16, MatrixReducer::ShiftAnd, None),
+        (16, MatrixReducer::GeneralPair, None),
         (17, MatrixReducer::One, Some(17 / 2)),
         (24, MatrixReducer::Two, Some(24 / 2)),
     ];
@@ -474,15 +482,7 @@ fn fixed_predicate_v2_routes_match_k0_across_search_session_and_window_apis() {
         let pattern = matrix_pattern(width, reducer, anchor_offset);
         let auto = build_auto(&pattern);
         let k0 = build_k0(&pattern);
-        let admitted = reducer != MatrixReducer::ShiftAnd;
-        assert_eq!(
-            auto.build_report().plan,
-            if admitted {
-                PlanKind::FixedPredicateWord64
-            } else {
-                PlanKind::K0
-            }
-        );
+        assert_eq!(auto.build_report().plan, PlanKind::FixedPredicateWord64);
         for haystack in matrix_haystacks(width, reducer, anchor_offset) {
             let limits = SearchLimits::unlimited();
             assert_eq!(
@@ -522,10 +522,7 @@ fn fixed_predicate_v2_routes_match_k0_across_search_session_and_window_apis() {
                 .search_session(SearchSessionLimits::unlimited())
                 .unwrap();
             let mut k0_session = k0.search_session(SearchSessionLimits::unlimited()).unwrap();
-            assert_eq!(
-                auto_session.workspace_setup_accounting().is_none(),
-                admitted
-            );
+            assert!(auto_session.workspace_setup_accounting().is_none());
             assert_eq!(
                 span(auto_session.find_value(&haystack, limits).unwrap()),
                 span(k0_session.find_value(&haystack, limits).unwrap())
@@ -768,9 +765,9 @@ fn fixed_predicate_limits_close_at_exact_planner_persistent_and_search_bounds() 
 #[test]
 fn declined_fixed_predicate_inspections_preserve_exact_cumulative_planner_work() {
     let cases = [
-        matrix_pattern(16, MatrixReducer::ShiftAnd, None),
-        matrix_pattern(17, MatrixReducer::ShiftAnd, None),
-        matrix_pattern(24, MatrixReducer::ShiftAnd, None),
+        raw_shift_and_pattern(16),
+        raw_shift_and_pattern(17),
+        raw_shift_and_pattern(24),
     ];
     for pattern in cases {
         let baseline = build_auto(&pattern);
@@ -795,7 +792,8 @@ fn declined_fixed_predicate_inspections_preserve_exact_cumulative_planner_work()
                 .unicode(false)
                 .limits(below_limits)
                 .build(),
-            Err(BuildError::PlannerWorkLimit { .. })
+            Err(BuildError::PlannerWorkLimit { needed, limit })
+                if needed == report.planner_work && limit == report.planner_work - 1
         ));
     }
 }
@@ -829,9 +827,9 @@ fn fixed_predicate_admission_preserves_finite_incumbents_and_structural_refusals
     }
     assert_eq!(build_auto(&width_65).build_report().plan, PlanKind::K0);
 
-    let asserted = format!("{SHIFT_AND_PATTERN}$");
+    let asserted = format!("{GENERAL_PAIR_PATTERN}$");
     assert_eq!(build_auto(&asserted).build_report().plan, PlanKind::K0);
-    let alternation = format!("(?:{SHIFT_AND_PATTERN}|[xyz]{SHIFT_AND_PATTERN})");
+    let alternation = format!("(?:{GENERAL_PAIR_PATTERN}|[xyz]{GENERAL_PAIR_PATTERN})");
     assert_eq!(build_auto(&alternation).build_report().plan, PlanKind::K0);
     assert_eq!(
         build_auto("[abc]{8,9}[def]{8,9}").build_report().plan,
@@ -847,6 +845,21 @@ fn fixed_predicate_precedes_finite_products_but_not_true_alternation() {
         .build()
         .unwrap();
     assert_eq!(fixed.build_report().plan, PlanKind::FixedPredicateWord64);
+
+    let two_byte_anchor = build_auto("[ab][cde]");
+    assert_eq!(
+        two_byte_anchor.build_report().plan,
+        PlanKind::FixedPredicateWord64,
+        "an exact two-byte anchor preserves precedence over a fitting finite product"
+    );
+    let (_, two_byte_accounting) = two_byte_anchor
+        .find(b"--ad--", SearchLimits::unlimited())
+        .unwrap();
+    assert!(matches!(
+        two_byte_accounting,
+        SearchAccounting::FixedPredicateWord64(accounting)
+            if accounting.identity.reducer == FixedPredicateWord64Reducer::TwoByteAnchor
+    ));
 
     let alternation = PortableBuilder::new("(?:alpha|beta|gamma)")
         .unicode(false)
@@ -903,28 +916,83 @@ fn cost_declined_fixed_product_preserves_finite_route_and_planner_receipt() {
     let finite = build_auto(pattern);
     assert_eq!(finite.build_report().plan, PlanKind::PackedLiteralSet);
 
-    let required = finite.build_report().planner_work;
-    assert!(required > 0);
-    let exact = PortableBuilder::new(pattern)
-        .unicode(false)
-        .limits(BuildLimits {
-            max_planner_work: required,
-            ..BuildLimits::default()
-        })
-        .build()
-        .unwrap();
-    assert_eq!(exact.build_report().plan, PlanKind::PackedLiteralSet);
-    assert_eq!(exact.build_report().planner_work, required);
-    assert!(matches!(
+    let build_with_finite_envelope = |max_patterns, max_pattern_bytes| {
         PortableBuilder::new(pattern)
             .unicode(false)
             .limits(BuildLimits {
-                max_planner_work: required - 1,
+                literal_set: fre_kernels::LiteralSetBuildLimits {
+                    max_patterns,
+                    max_pattern_bytes,
+                    ..fre_kernels::LiteralSetBuildLimits::default()
+                },
                 ..BuildLimits::default()
             })
-            .build(),
-        Err(BuildError::PlannerWorkLimit { .. })
-    ));
+            .build()
+            .unwrap()
+    };
+    assert_eq!(
+        build_with_finite_envelope(4, 24).build_report().plan,
+        PlanKind::FixedPredicateWord64,
+        "a configured four-pattern envelope cannot retain the finite incumbent"
+    );
+    assert_eq!(
+        build_with_finite_envelope(15, 24).build_report().plan,
+        PlanKind::PackedLiteralSet,
+        "the exact finite construction peak preserves incumbent precedence"
+    );
+    for (max_patterns, max_pattern_bytes) in [(14, 24), (15, 23), (9, 18)] {
+        assert_eq!(
+            build_with_finite_envelope(max_patterns, max_pattern_bytes)
+                .build_report()
+                .plan,
+            PlanKind::FixedPredicateWord64,
+            "envelope={max_patterns} patterns/{max_pattern_bytes} bytes"
+        );
+    }
+
+    for (limits, expected_plan) in [
+        (BuildLimits::default(), PlanKind::PackedLiteralSet),
+        (
+            BuildLimits {
+                literal_set: fre_kernels::LiteralSetBuildLimits {
+                    max_patterns: 4,
+                    max_pattern_bytes: 24,
+                    ..fre_kernels::LiteralSetBuildLimits::default()
+                },
+                ..BuildLimits::default()
+            },
+            PlanKind::FixedPredicateWord64,
+        ),
+    ] {
+        let baseline = PortableBuilder::new(pattern)
+            .unicode(false)
+            .limits(limits)
+            .build()
+            .unwrap();
+        let required = baseline.build_report().planner_work;
+        assert!(required > 0);
+        let exact = PortableBuilder::new(pattern)
+            .unicode(false)
+            .limits(BuildLimits {
+                max_planner_work: required,
+                ..limits
+            })
+            .build()
+            .unwrap();
+        assert_eq!(exact.build_report().plan, expected_plan);
+        assert_eq!(exact.build_report().planner_work, required);
+        assert!(matches!(
+            PortableBuilder::new(pattern)
+                .unicode(false)
+                .limits(BuildLimits {
+                    max_planner_work: required - 1,
+                    ..limits
+                })
+                .build(),
+            Err(BuildError::PlannerWorkLimit { needed, limit })
+                if needed == required && limit == required - 1
+        ));
+    }
 }
 
 #[test]
@@ -1004,6 +1072,6 @@ fn fixed_predicate_capture_metadata_and_explicit_capture_refusal_are_preserved()
 }
 
 #[test]
-fn fixed_predicate_schema_is_pinned_to_thirteen() {
-    assert_eq!(EXPLAIN_SCHEMA_VERSION, 13);
+fn fixed_predicate_schema_is_pinned_to_fourteen() {
+    assert_eq!(EXPLAIN_SCHEMA_VERSION, 14);
 }

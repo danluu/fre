@@ -779,13 +779,15 @@ pub use unicode_word_run::{
 };
 
 /// Stable schema for facade-level explanation records.
-pub const EXPLAIN_SCHEMA_VERSION: u32 = 13;
+pub const EXPLAIN_SCHEMA_VERSION: u32 = 14;
 
-// Automatic ordinary search admits every fixed-width plan with an exact
-// one- or two-byte anchor. Construction already proves a word width of at
-// most 64, so one primary anchor leaves at most 63 non-universal verification
-// predicates. The retained adaptive finder and final Shift-And handoff keep
-// dense rejection streams inside the kernel's closed linear bound.
+// Automatic ordinary search admits exact anchors and general plans with two
+// independently selective predicate finders. The kernel's source-derived
+// cardinality gate leaves broad or single-finder shapes on K0. Construction
+// proves a word width of at most 64, so one primary finder leaves at most 63
+// non-universal verification predicates. The retained second finder and final
+// Shift-And handoff keep dense rejection streams inside the closed linear
+// bound.
 const FIXED_PREDICATE_SEARCH_AUTO_MAX_VERIFICATION_PREDICATES: usize =
     FIXED_PREDICATE_WORD64_MAX_WIDTH - 1;
 
@@ -1086,7 +1088,8 @@ pub enum PlanKind {
     UnicodeFoldedLiteral,
     /// Linear ASCII or Unicode word-boundary class-run scan.
     UnicodeWordRun,
-    /// Fixed-width Cartesian byte predicates backed by one 64-bit Shift-And state.
+    /// Fixed-width Cartesian byte predicates backed by selective paired
+    /// finders or one 64-bit Shift-And state.
     FixedPredicateWord64,
 }
 
@@ -2346,6 +2349,8 @@ fn try_fixed_predicate_word64_before_finite(
     explicit_captures: usize,
     initial_work: u64,
     planner_work_limit: u64,
+    finite_max_patterns: usize,
+    finite_max_pattern_bytes: usize,
     source_storage_bytes: usize,
     capture_name_storage_bytes: usize,
     persistent_byte_limit: usize,
@@ -2436,14 +2441,18 @@ fn try_fixed_predicate_word64_before_finite(
         ));
     }
     let (plan, _) = attempt.into_parts();
-    let reducer = plan
-        .search_operation_identity(FixedPredicateWord64SearchOperation::Exists)
-        .reducer;
-    let anchored = matches!(
+    let strategy =
+        plan.search_operation_identity(FixedPredicateWord64SearchOperation::Exists);
+    let reducer = strategy.reducer;
+    let exact_anchor = matches!(
         reducer,
         FixedPredicateWord64Reducer::OneByteAnchor | FixedPredicateWord64Reducer::TwoByteAnchor
     );
-    let auto_admitted = anchored
+    let general_pair = matches!(reducer, FixedPredicateWord64Reducer::ShiftAnd)
+        && strategy.primary_finder.is_some()
+        && fixed.has_non_universal_predicate()
+        && fixed.finite_incumbent_cannot_fit(finite_max_patterns, finite_max_pattern_bytes);
+    let auto_admitted = (exact_anchor || general_pair)
         && plan.max_verification_predicates()
             <= FIXED_PREDICATE_SEARCH_AUTO_MAX_VERIFICATION_PREDICATES;
     if !auto_admitted {
@@ -4723,6 +4732,8 @@ impl PortableBuilder {
             explicit_captures,
             bounded_byte_class_repeat_work,
             self.limits.max_planner_work,
+            self.limits.literal_set.max_patterns,
+            self.limits.literal_set.max_pattern_bytes,
             source_storage_bytes,
             capture_name_storage_bytes,
             self.limits.max_persistent_bytes,
@@ -5464,11 +5475,14 @@ impl PortableBuilder {
         // those sidecars as one exclusive plan: its adaptive comparison and
         // fallback are deliberately against raw K0, so retaining another
         // route here would bypass and mis-train that incumbent.
-        // Every planner after the generic K0 lowering is optional. A preceding
-        // sidecar may consume the final admitted work unit while declining its
-        // own publication; in that case there is no authority to begin this
-        // independent inspection. Preserve the already-valid K0 plan instead
-        // of turning one-below optional admission into a hard build failure.
+        // Every planner after the generic K0 lowering is normally optional. A
+        // preceding sidecar may consume the final admitted work unit while
+        // declining its own publication; in that case there is no authority
+        // to begin this independent inspection. A completed fixed-predicate
+        // proof is different: its declined receipt is already part of this
+        // facade transaction, so a later exact one-below replay must not hide
+        // the final correlated-inspection charge by publishing shorter K0
+        // work.
         let correlated_terminal_inspection = if self.selection == PlanSelection::Auto
             && fallback_planner_work < self.limits.max_planner_work
         {
@@ -5494,6 +5508,9 @@ impl PortableBuilder {
                     limit,
                 }) => {
                     debug_assert!(actual <= limit && needed > limit);
+                    if fixed_predicate_declined {
+                        return Err(BuildError::PlannerWorkLimit { needed, limit });
+                    }
                     fallback_planner_work = actual;
                     None
                 }
@@ -15481,6 +15498,48 @@ mod tests {
             accounting,
             SearchAccounting::FixedPredicateWord64(_)
         ));
+    }
+
+    #[test]
+    fn selective_general_pair_routes_before_k0_but_broad_shapes_preserve_k0() {
+        let limits = BuildLimits {
+            literal_set: fre_kernels::LiteralSetBuildLimits {
+                max_patterns: 4,
+                ..fre_kernels::LiteralSetBuildLimits::default()
+            },
+            ..BuildLimits::default()
+        };
+        let paired = PortableBuilder::new("[a-c][d-f]")
+            .unicode(false)
+            .limits(limits)
+            .build()
+            .unwrap();
+        assert_eq!(paired.build_report().plan, PlanKind::FixedPredicateWord64);
+        let (matched, accounting) = paired
+            .find(b"xxbe", SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(matched, Some(Match { start: 2, end: 4 }));
+        let SearchAccounting::FixedPredicateWord64(accounting) = accounting else {
+            panic!("selective general pair lost its fixed-predicate accounting")
+        };
+        assert_eq!(
+            accounting.identity.reducer,
+            FixedPredicateWord64Reducer::ShiftAnd
+        );
+        assert!(accounting.identity.primary_finder.is_some());
+        assert!(matches!(
+            accounting.identity.adaptive_handoff,
+            FixedPredicateWord64AdaptiveHandoffIdentity::Finder { .. }
+        ));
+
+        for pattern in [r"[\x00-\x7E][\x00-\x7E]", r"[a-c][\x00-\xFF]"] {
+            let broad = PortableBuilder::new(pattern)
+                .unicode(false)
+                .limits(limits)
+                .build()
+                .unwrap();
+            assert_eq!(broad.build_report().plan, PlanKind::K0, "pattern={pattern}");
+        }
     }
 
     #[test]

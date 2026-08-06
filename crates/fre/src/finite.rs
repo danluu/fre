@@ -872,6 +872,9 @@ pub(crate) struct FixedPredicateWord64Source {
     positions: [FixedPredicate; FIXED_PREDICATE_WORD64_MAX_WIDTH],
     width: usize,
     variable_predicates: usize,
+    non_universal_predicates: usize,
+    cartesian_product: Option<usize>,
+    finite_incumbent: Analysis,
     hir_nodes: usize,
     captures: usize,
 }
@@ -881,6 +884,9 @@ impl FixedPredicateWord64Source {
         positions: [FixedPredicate::EMPTY; FIXED_PREDICATE_WORD64_MAX_WIDTH],
         width: 0,
         variable_predicates: 0,
+        non_universal_predicates: 0,
+        cartesian_product: Some(1),
+        finite_incumbent: Analysis::Unsupported,
         hir_nodes: 0,
         captures: 0,
     };
@@ -900,6 +906,30 @@ impl FixedPredicateWord64Source {
         self.variable_predicates
     }
 
+    /// Whether at least one position rejects a byte from the full domain.
+    pub(crate) const fn has_non_universal_predicate(&self) -> bool {
+        self.non_universal_predicates != 0
+    }
+
+    /// Exact Cartesian word count, or `None` after authenticated `usize`
+    /// overflow proves that the count exceeds every configurable finite cap.
+    pub(crate) const fn cartesian_product(&self) -> Option<usize> {
+        self.cartesian_product
+    }
+
+    /// Whether the finite extractor cannot retain this language inside the
+    /// caller's complete construction envelope, including transient peaks.
+    pub(crate) const fn finite_incumbent_cannot_fit(
+        &self,
+        max_patterns: usize,
+        max_pattern_bytes: usize,
+    ) -> bool {
+        match self.finite_incumbent {
+            Analysis::Fits(shape) => !shape.fits(max_patterns, max_pattern_bytes),
+            Analysis::TooLargeFixedSequence | Analysis::Unsupported => true,
+        }
+    }
+
     pub(crate) const fn hir_nodes(&self) -> usize {
         self.hir_nodes
     }
@@ -908,26 +938,46 @@ impl FixedPredicateWord64Source {
         self.captures
     }
 
-    fn push(&mut self, predicate: FixedPredicate, is_variable: bool) -> Result<bool, BuildError> {
+    fn push(&mut self, predicate: FixedPredicate) -> Result<bool, BuildError> {
         let index = self.width();
         if index == FIXED_PREDICATE_WORD64_MAX_WIDTH {
             return Ok(false);
         }
-        self.positions[index] = predicate;
-        self.width = self
+        let member_count = predicate.member_count();
+        if member_count == 0 {
+            return Err(BuildError::InternalInvariant(
+                "fixed predicate lost its member cardinality",
+            ));
+        }
+        let width = self
             .width
             .checked_add(1)
             .ok_or(BuildError::InternalInvariant(
                 "fixed-predicate width accounting overflow",
             ))?;
-        if is_variable {
-            self.variable_predicates =
-                self.variable_predicates
-                    .checked_add(1)
-                    .ok_or(BuildError::InternalInvariant(
-                        "fixed-predicate variable-position accounting overflow",
-                    ))?;
-        }
+        let variable_predicates = self
+            .variable_predicates
+            .checked_add(usize::from(member_count > 1))
+            .ok_or(BuildError::InternalInvariant(
+                "fixed-predicate variable-position accounting overflow",
+            ))?;
+        let non_universal_predicates = self
+            .non_universal_predicates
+            .checked_add(usize::from(!predicate.is_universal()))
+            .ok_or(BuildError::InternalInvariant(
+                "fixed-predicate non-universal-position accounting overflow",
+            ))?;
+        let cartesian_product = self
+            .cartesian_product
+            .and_then(|product| product.checked_mul(member_count));
+        // Every caller has already charged this predicate insertion. Retain
+        // the finite-incumbent facts here so admission needs neither an
+        // uncharged post-receipt scan nor a second HIR traversal.
+        self.positions[index] = predicate;
+        self.width = width;
+        self.variable_predicates = variable_predicates;
+        self.non_universal_predicates = non_universal_predicates;
+        self.cartesian_product = cartesian_product;
         Ok(true)
     }
 }
@@ -936,12 +986,14 @@ impl FixedPredicateWord64Source {
 struct FixedPredicate {
     ranges: [(u8, u8); FIXED_PREDICATE_MAX_RANGES],
     range_count: u8,
+    member_count: u16,
 }
 
 impl FixedPredicate {
     const EMPTY: Self = Self {
         ranges: [(0, 0); FIXED_PREDICATE_MAX_RANGES],
         range_count: 0,
+        member_count: 0,
     };
 
     fn singleton(byte: u8) -> Self {
@@ -950,10 +1002,11 @@ impl FixedPredicate {
         Self {
             ranges,
             range_count: 1,
+            member_count: 1,
         }
     }
 
-    fn from_byte_class(class: &regex_syntax::hir::ClassBytes) -> Option<(Self, bool)> {
+    fn from_byte_class(class: &regex_syntax::hir::ClassBytes) -> Option<Self> {
         let ranges = class.ranges();
         if ranges.is_empty() || ranges.len() > FIXED_PREDICATE_MAX_RANGES {
             return None;
@@ -969,13 +1022,14 @@ impl FixedPredicate {
                 .checked_add(1)?;
             members = members.checked_add(inclusive_members)?;
         }
-        Some((
-            Self {
-                ranges: normalized,
-                range_count: u8::try_from(ranges.len()).ok()?,
-            },
-            members > 1,
-        ))
+        if members > 256 {
+            return None;
+        }
+        Some(Self {
+            ranges: normalized,
+            range_count: u8::try_from(ranges.len()).ok()?,
+            member_count: u16::try_from(members).ok()?,
+        })
     }
 
     fn ranges(self) -> FixedPredicateRanges {
@@ -985,9 +1039,12 @@ impl FixedPredicate {
         }
     }
 
-    fn is_variable(self) -> bool {
-        let ranges = self.ranges();
-        ranges.ranges().len() > 1 || ranges.ranges().iter().any(|(start, end)| start != end)
+    const fn member_count(self) -> usize {
+        self.member_count as usize
+    }
+
+    const fn is_universal(self) -> bool {
+        self.member_count == 256
     }
 }
 
@@ -1213,6 +1270,7 @@ fn finite_words_capacity_bytes(words: &Vec<Vec<u8>>) -> Option<usize> {
         )
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Analysis {
     Fits(Shape),
     TooLargeFixedSequence,
@@ -1309,7 +1367,7 @@ impl Drop for Language<'_> {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Shape {
     words: usize,
     bytes: usize,
@@ -1464,14 +1522,20 @@ fn inspect_fixed_predicate_word64(
     tasks.reserve_planner(1, "fixed-predicate task stack")?;
     tasks.push_reserved(FixedPredicateTask::Visit(hir))?;
     let mut source = FixedPredicateWord64Source::EMPTY;
+    let mut finite_analyses = FixedPredicateAnalysisStack::new();
     while let Some(task) = tasks.pop() {
         context.charge(1)?;
         let node = match task {
             FixedPredicateTask::Visit(node) => node,
+            FixedPredicateTask::FinishConcat(children) => {
+                finite_analyses.finish_concat(children, context)?;
+                continue;
+            }
             FixedPredicateTask::FinishExactRepetition { start, repetitions } => {
                 if !repeat_fixed_predicate_suffix(&mut source, start, repetitions, context)? {
                     return Ok(None);
                 }
+                finite_analyses.mark_top_unsupported()?;
                 continue;
             }
         };
@@ -1494,7 +1558,14 @@ fn inspect_fixed_predicate_word64(
                 tasks.push_reserved(FixedPredicateTask::Visit(capture.sub.as_ref()))?;
             }
             HirKind::Concat(children) if !children.is_empty() => {
-                tasks.reserve_planner(children.len(), "fixed-predicate task stack")?;
+                let additional = children.len().checked_add(1).ok_or(
+                    BuildError::PlannerWorkLimit {
+                        needed: u64::MAX,
+                        limit: context.work_limit,
+                    },
+                )?;
+                tasks.reserve_planner(additional, "fixed-predicate task stack")?;
+                tasks.push_reserved(FixedPredicateTask::FinishConcat(children.len()))?;
                 tasks.extend_reserved(
                     children.iter().rev().map(FixedPredicateTask::Visit),
                     children.len(),
@@ -1522,11 +1593,15 @@ fn inspect_fixed_predicate_word64(
                 if !push_fixed_byte_literal(&mut source, &literal.0, context)? {
                     return Ok(None);
                 }
+                finite_analyses.push(Analysis::Fits(Shape::leaf(1, literal.0.len())))?;
             }
             HirKind::Class(Class::Bytes(class)) => {
+                let index = source.width();
                 if !push_fixed_byte_class(&mut source, class, context)? {
                     return Ok(None);
                 }
+                let members = source.positions[index].member_count();
+                finite_analyses.push(Analysis::Fits(Shape::leaf(members, members)))?;
             }
             _ => return Ok(None),
         }
@@ -1534,13 +1609,104 @@ fn inspect_fixed_predicate_word64(
     if source.width() < FIXED_PREDICATE_WORD64_MIN_WIDTH || source.variable_predicates() == 0 {
         return Ok(None);
     }
+    let finite_incumbent = finite_analyses.into_single()?;
+    if let Analysis::Fits(shape) = finite_incumbent {
+        let words = source
+            .cartesian_product()
+            .ok_or(BuildError::InternalInvariant(
+                "finite-incumbent shape fit after Cartesian overflow",
+            ))?;
+        let bytes = words
+            .checked_mul(source.width())
+            .ok_or(BuildError::InternalInvariant(
+                "finite-incumbent bytes fit after Cartesian-byte overflow",
+            ))?;
+        if shape.words != words || shape.bytes != bytes {
+            return Err(BuildError::InternalInvariant(
+                "finite-incumbent shape differs from fixed-predicate Cartesian source",
+            ));
+        }
+    }
+    source.finite_incumbent = finite_incumbent;
     Ok(Some(source))
 }
 
 #[derive(Clone, Copy)]
 enum FixedPredicateTask<'hir> {
     Visit(&'hir Hir),
+    FinishConcat(usize),
     FinishExactRepetition { start: usize, repetitions: usize },
+}
+
+struct FixedPredicateAnalysisStack {
+    values: [Analysis; FIXED_PREDICATE_WORD64_MAX_WIDTH],
+    len: usize,
+}
+
+impl FixedPredicateAnalysisStack {
+    const fn new() -> Self {
+        Self {
+            values: [Analysis::Unsupported; FIXED_PREDICATE_WORD64_MAX_WIDTH],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, analysis: Analysis) -> Result<(), BuildError> {
+        let Some(slot) = self.values.get_mut(self.len) else {
+            return Err(BuildError::InternalInvariant(
+                "fixed-predicate finite-analysis stack exceeded word width",
+            ));
+        };
+        *slot = analysis;
+        self.len = self
+            .len
+            .checked_add(1)
+            .ok_or(BuildError::InternalInvariant(
+                "fixed-predicate finite-analysis stack length overflow",
+            ))?;
+        Ok(())
+    }
+
+    fn finish_concat(
+        &mut self,
+        children: usize,
+        context: &FiniteExtractionContext,
+    ) -> Result<(), BuildError> {
+        let start = self
+            .len
+            .checked_sub(children)
+            .ok_or(BuildError::InternalInvariant(
+                "fixed-predicate concat analysis stack underflow",
+            ))?;
+        context.charge(u64::try_from(children).unwrap_or(u64::MAX))?;
+        let combined = combine_analysis(
+            &self.values[start..self.len],
+            true,
+            usize::MAX,
+            usize::MAX,
+        );
+        self.len = start;
+        self.push(combined)
+    }
+
+    fn mark_top_unsupported(&mut self) -> Result<(), BuildError> {
+        let Some(index) = self.len.checked_sub(1) else {
+            return Err(BuildError::InternalInvariant(
+                "fixed-predicate repetition analysis stack underflow",
+            ));
+        };
+        self.values[index] = Analysis::Unsupported;
+        Ok(())
+    }
+
+    fn into_single(self) -> Result<Analysis, BuildError> {
+        if self.len != 1 {
+            return Err(BuildError::InternalInvariant(
+                "fixed-predicate inspection did not produce one finite analysis",
+            ));
+        }
+        Ok(self.values[0])
+    }
 }
 
 fn repeat_fixed_predicate_suffix(
@@ -1578,7 +1744,7 @@ fn repeat_fixed_predicate_suffix(
     for _ in 1..repetitions {
         for index in start..end {
             let predicate = source.positions[index];
-            if !source.push(predicate, predicate.is_variable())? {
+            if !source.push(predicate)? {
                 return Ok(false);
             }
         }
@@ -1603,7 +1769,7 @@ fn push_fixed_byte_literal(
     context.charge(u64::try_from(literal.len()).unwrap_or(u64::MAX))?;
     for &byte in literal {
         context.charge(1)?;
-        if !source.push(FixedPredicate::singleton(byte), false)? {
+        if !source.push(FixedPredicate::singleton(byte))? {
             return Ok(false);
         }
     }
@@ -1622,11 +1788,11 @@ fn push_fixed_byte_class(
         return Ok(false);
     }
     context.charge(u64::try_from(class.ranges().len()).unwrap_or(u64::MAX))?;
-    let Some((predicate, is_variable)) = FixedPredicate::from_byte_class(class) else {
+    let Some(predicate) = FixedPredicate::from_byte_class(class) else {
         return Ok(false);
     };
     context.charge(1)?;
-    source.push(predicate, is_variable)
+    source.push(predicate)
 }
 
 enum PlainFailure {
@@ -4943,6 +5109,75 @@ mod tests {
             .source
             .is_none()
         );
+    }
+
+    #[test]
+    fn compact_predicate_inspection_retains_exact_finite_incumbent_shape() {
+        let finite = super::inspect_fixed_predicate_word64_after_finite_refusal(
+            &parse("[abc][def]"),
+            0,
+            u64::MAX,
+        )
+        .unwrap()
+        .source
+        .expect("small Cartesian language has a compact predicate proof");
+        assert_eq!(finite.width(), 2);
+        assert_eq!(finite.cartesian_product(), Some(9));
+        assert!(finite.has_non_universal_predicate());
+        assert!(!finite.finite_incumbent_cannot_fit(15, 24));
+        assert!(finite.finite_incumbent_cannot_fit(14, 24));
+        assert!(finite.finite_incumbent_cannot_fit(15, 23));
+        assert!(finite.finite_incumbent_cannot_fit(9, 18));
+
+        let four_by_eight = super::inspect_fixed_predicate_word64_after_finite_refusal(
+            &parse("[abcdefgh][abcdefgh][abcdefgh][abcdefgh]"),
+            0,
+            u64::MAX,
+        )
+        .unwrap()
+        .source
+        .expect("four eight-member columns have a compact predicate proof");
+        assert_eq!(four_by_eight.cartesian_product(), Some(4_096));
+        assert!(!four_by_eight.finite_incumbent_cannot_fit(4_128, 16_416));
+        assert!(four_by_eight.finite_incumbent_cannot_fit(4_127, 16_416));
+        assert!(four_by_eight.finite_incumbent_cannot_fit(4_128, 16_415));
+        assert!(four_by_eight.finite_incumbent_cannot_fit(4_096, 16_384));
+
+        let universal = super::inspect_fixed_predicate_word64_after_finite_refusal(
+            &parse(r"[\x00-\xFF][\x00-\xFF]"),
+            0,
+            u64::MAX,
+        )
+        .unwrap()
+        .source
+        .expect("all-universal positions remain a valid compact kernel source");
+        assert_eq!(universal.cartesian_product(), Some(65_536));
+        assert!(!universal.has_non_universal_predicate());
+        assert!(universal.finite_incumbent_cannot_fit(4_096, usize::MAX));
+
+        let overflow_pattern = r"[\x00-\xFE]".repeat(64);
+        let overflow = super::inspect_fixed_predicate_word64_after_finite_refusal(
+            &parse(&overflow_pattern),
+            0,
+            u64::MAX,
+        )
+        .unwrap()
+        .source
+        .expect("width-64 Cartesian overflow retains its compact predicate proof");
+        assert_eq!(overflow.width(), 64);
+        assert_eq!(overflow.cartesian_product(), None);
+        assert!(overflow.has_non_universal_predicate());
+        assert!(overflow.finite_incumbent_cannot_fit(usize::MAX, usize::MAX));
+
+        let repetition = super::inspect_fixed_predicate_word64_after_finite_refusal(
+            &parse("[ab]{2}"),
+            0,
+            u64::MAX,
+        )
+        .unwrap()
+        .source
+        .expect("exact repetition remains a compact predicate proof");
+        assert!(repetition.finite_incumbent_cannot_fit(usize::MAX, usize::MAX));
     }
 
     #[test]
