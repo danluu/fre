@@ -669,8 +669,10 @@ impl TypedPlan<'_, SelectedEnd> {
     /// caller-validated workspace.
     ///
     /// An unlimited exact-identity call may read already-filled forward rows
-    /// without constructing diagnostic accounting. Every finite, cold,
-    /// contextual, unfilled, or unauthenticated case uses the ordinary
+    /// without constructing diagnostic accounting. Its first unavailable
+    /// direct transition can continue mutably at that exact byte without
+    /// replaying the filled prefix. Every finite, cold, contextual,
+    /// unauthenticated, or otherwise ineligible case uses the ordinary
     /// report-producing executor with unchanged error behavior.
     ///
     /// # Errors

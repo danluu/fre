@@ -4992,11 +4992,11 @@ impl<'a> K0SearchSession<'a> {
 
     /// Project a warmed assertion-free selected endpoint without diagnostics.
     ///
-    /// The direct reader is transactional: it mutates neither retained rows
-    /// nor invocation scratch and declines on any missing transition. The
-    /// ordinary executor then restarts from the original window and remains
-    /// authoritative for finite limits, cold publication, contextual graphs,
-    /// and every hard error.
+    /// A complete direct read mutates neither retained rows nor invocation
+    /// scratch. Its first unavailable transition hands off mutably at the exact
+    /// unread byte without replaying the filled prefix. The ordinary executor
+    /// remains authoritative for finite limits, cold publication, contextual
+    /// graphs, retained loop plans, and every hard error.
     pub(crate) fn search_selected_end_value_untyped(
         &mut self,
         haystack: &[u8],
@@ -5023,7 +5023,7 @@ impl<'a> K0SearchSession<'a> {
                             self.automaton,
                             haystack,
                             window,
-                            &self.workspace.lazy,
+                            &mut self.workspace,
                             proof,
                         )?
                     {
@@ -5634,6 +5634,21 @@ enum WarmBoundedStart {
 enum WarmDirectSelectedEnd {
     Declined,
     Complete(Option<usize>),
+}
+
+/// Exact invocation-local state at the first unavailable transition of one
+/// warm selected-end projection.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct WarmDirectSelectedEndContinuation {
+    initial_row: u32,
+    state: u32,
+    position: usize,
+    work: u64,
+    direct_steps: usize,
+    pending_end: Option<usize>,
+    engine_candidate: Option<usize>,
+    retained_start_mask: RetainedStartMaskCursor,
+    adaptive_probe: AdaptiveStartProbe,
 }
 
 /// Exact invocation-local state at the first unpublished direct transition of
@@ -6294,8 +6309,8 @@ fn complete_warm_direct_selected_end(
     Ok(WarmDirectSelectedEnd::Complete(pending_end))
 }
 
-/// Read a complete warmed assertion-free selected-end machine without
-/// changing retained state.
+/// Read a warmed assertion-free selected-end machine, handing off mutably at
+/// its exact first unavailable transition when no retained loop plan applies.
 ///
 /// [`WarmDirectSelectedEnd::Declined`] requests the ordinary executor;
 /// [`WarmDirectSelectedEnd::Complete`] authenticates either the selected
@@ -6308,13 +6323,13 @@ fn try_warm_direct_selected_end(
     automaton: &Automaton,
     haystack: &[u8],
     window: SearchWindow,
-    lazy: &LazyWorkspace,
+    workspace: &mut K0Workspace,
     proof: &StartFilterProof,
 ) -> Result<WarmDirectSelectedEnd, SearchError> {
     // The ordinary selected-end executor is plan-aware. Decline rather than
     // shadowing an authenticated loop scanner with this scalar read-only
     // projection.
-    if lazy.saturated || !lazy.loop_skip_plans.is_empty() {
+    if workspace.lazy.saturated || !workspace.lazy.loop_skip_plans.is_empty() {
         return Ok(WarmDirectSelectedEnd::Declined);
     }
     let haystack = haystack
@@ -6322,17 +6337,17 @@ fn try_warm_direct_selected_end(
         .ok_or(SearchError::InternalInvariant {
             detail: "warm selected-end window exceeds the validated haystack",
         })?;
-    let (initial_pending, initial_terminal) = match lazy.initial_kind {
+    let (initial_pending, initial_terminal) = match workspace.lazy.initial_kind {
         LazyInitialKind::Positive | LazyInitialKind::PositiveSingle => (false, false),
         LazyInitialKind::NullablePrefix => (true, false),
         LazyInitialKind::NullableTerminal => (true, true),
         LazyInitialKind::Uninitialized => return Ok(WarmDirectSelectedEnd::Declined),
     };
-    if lazy.initial == LAZY_NO_STATE {
+    if workspace.lazy.initial == LAZY_NO_STATE {
         return Ok(WarmDirectSelectedEnd::Declined);
     }
 
-    let initial_row = lazy.row_offset(lazy.initial)?;
+    let initial_row = workspace.lazy.row_offset(workspace.lazy.initial)?;
     let mut state = initial_row;
     let mut position = window.start();
     let mut pending_end = initial_pending.then_some(window.start());
@@ -6402,9 +6417,27 @@ fn try_warm_direct_selected_end(
         )]
         let byte = haystack[position];
         let class = automaton.byte_classes().class_of(byte);
-        let cell = lazy.direct_cell(state, class)?;
+        let cell = workspace.lazy.direct_cell(state, class)?;
         if cell == LAZY_CELL_UNFILLED {
-            return Ok(WarmDirectSelectedEnd::Declined);
+            return continue_mutable_warm_direct_selected_end(
+                automaton,
+                haystack,
+                window,
+                workspace,
+                proof,
+                WarmDirectSelectedEndContinuation {
+                    initial_row,
+                    state,
+                    position,
+                    work: meter.consumed,
+                    direct_steps,
+                    pending_end,
+                    engine_candidate,
+                    retained_start_mask,
+                    adaptive_probe,
+                },
+            )
+            .map(WarmDirectSelectedEnd::Complete);
         }
         #[allow(
             clippy::arithmetic_side_effects,
@@ -6426,6 +6459,221 @@ fn try_warm_direct_selected_end(
             .ok_or(SearchError::InternalInvariant {
                 detail: "warm selected-end encoded state underflowed",
             })?;
+    }
+}
+
+fn complete_mutable_warm_direct_selected_end(
+    automaton: &Automaton,
+    workspace: &mut K0Workspace,
+    window: SearchWindow,
+    meter: &mut WorkMeter,
+    pending_end: Option<usize>,
+) -> Result<Option<usize>, SearchError> {
+    if window.end().saturating_sub(window.start()) >= LAZY_LOOP_SKIP_MIN_BYTES {
+        try_derive_lazy_loop_skip(automaton, workspace, meter)?;
+    }
+    Ok(pending_end)
+}
+
+/// Continue a selected-end projection from its exact first unavailable direct
+/// transition. The immutable prefix's synthetic reset is replaced by actual
+/// invocation setup, and its scanner plus filled-transition work is restored
+/// once before the current byte is built.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the mutable handoff retains endpoint priority and every scanner cursor"
+)]
+#[inline(never)]
+fn continue_mutable_warm_direct_selected_end(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    proof: &StartFilterProof,
+    continuation: WarmDirectSelectedEndContinuation,
+) -> Result<Option<usize>, SearchError> {
+    let haystack = haystack
+        .get(..window.end())
+        .ok_or(SearchError::InternalInvariant {
+            detail: "warm selected-end mutable handoff exceeded the validated haystack",
+        })?;
+    let mut setup = SetupAccounting::empty(workspace.retained_bytes, true);
+    let (mut meter, _) = prepare_bound_invocation(
+        automaton,
+        workspace,
+        window,
+        SearchLimits::unlimited(),
+        &mut setup,
+        true,
+        false,
+    )?;
+    let scanner_work = continuation.work.checked_sub(INVOCATION_RESET_WORK).ok_or(
+        SearchError::InternalInvariant {
+            detail: "warm selected-end handoff omitted its invocation reset",
+        },
+    )?;
+    let direct_work =
+        u64::try_from(continuation.direct_steps).map_err(|_| SearchError::ArithmeticOverflow {
+            computation: "warm selected-end handoff direct-step conversion",
+        })?;
+    let completed_work = scanner_work
+        .checked_add(direct_work)
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "warm selected-end handoff completed work",
+        })?;
+    meter.charge(completed_work, continuation.position)?;
+    if !workspace.lazy.is_bound_to(automaton)
+        || !workspace.lazy.initialized
+        || workspace.lazy.declined
+        || !workspace.lazy.loop_skip_plans.is_empty()
+    {
+        return Err(SearchError::InternalInvariant {
+            detail: "warm selected-end handoff lost its authenticated direct workspace",
+        });
+    }
+
+    let mut state = LazyState::Cached(continuation.state);
+    let mut position = continuation.position;
+    let mut pending_end = continuation.pending_end;
+    let mut engine_candidate = continuation.engine_candidate;
+    let mut retained_start_mask = continuation.retained_start_mask;
+    let mut adaptive_probe = continuation.adaptive_probe;
+    // The immutable reader already made the scanner decision for the current
+    // unavailable byte. Resume scanner selection only after that transition.
+    let mut first_unfilled = true;
+
+    loop {
+        if !first_unfilled
+            && pending_end.is_none()
+            && state == LazyState::Cached(continuation.initial_row)
+        {
+            if let Some(scanner) = proof.scanner.as_ref() {
+                if position < window.end() {
+                    if let (Some(probe), Some(candidate)) =
+                        (proof.probe(), engine_candidate.take())
+                    {
+                        adaptive_probe.observe_restartable_rejection(
+                            probe,
+                            haystack,
+                            candidate,
+                            window.end(),
+                            &mut meter,
+                        )?;
+                    }
+                } else {
+                    engine_candidate = None;
+                }
+                position = next_start_candidate_adaptive(
+                    scanner,
+                    haystack,
+                    position,
+                    window.end(),
+                    proof.guard(),
+                    proof.probe(),
+                    &mut meter,
+                    &mut retained_start_mask,
+                    &mut adaptive_probe,
+                )?;
+                if position == window.end() {
+                    return complete_mutable_warm_direct_selected_end(
+                        automaton,
+                        workspace,
+                        window,
+                        &mut meter,
+                        None,
+                    );
+                }
+                if proof.probe().is_some() && adaptive_probe.samples_rejections() {
+                    engine_candidate = Some(position);
+                }
+            }
+        }
+
+        if position >= haystack.len() {
+            if position == haystack.len() {
+                return complete_mutable_warm_direct_selected_end(
+                    automaton,
+                    workspace,
+                    window,
+                    &mut meter,
+                    pending_end,
+                );
+            }
+            return Err(SearchError::InternalInvariant {
+                detail: "mutable warm selected-end position exceeded the validated window",
+            });
+        }
+
+        meter.charge(1, position)?;
+        let byte = haystack[position];
+        let transition = match state {
+            LazyState::Cached(cached) => {
+                let class = automaton.byte_classes().class_of(byte);
+                let cell = workspace.lazy.direct_cell(cached, class)?;
+                if cell == LAZY_CELL_UNFILLED {
+                    build_lazy_cached_transition(
+                        automaton,
+                        workspace.lazy.row_state(cached),
+                        byte,
+                        class,
+                        workspace,
+                        &mut meter,
+                        0,
+                        position,
+                    )?
+                } else {
+                    LazyTransition::Ready(cell)
+                }
+            }
+            LazyState::Inline { pending } => build_lazy_inline_transition(
+                automaton,
+                byte,
+                pending,
+                workspace,
+                &mut meter,
+                position,
+            )?,
+        };
+        first_unfilled = false;
+        position = position
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "mutable warm selected-end source progress",
+            })?;
+        let (accepted, next) = match transition {
+            LazyTransition::Ready(cell) => {
+                let encoded = cell & LAZY_CELL_STATE_MASK;
+                (
+                    cell & LAZY_CELL_ACCEPT != 0,
+                    if encoded == 0 {
+                        None
+                    } else {
+                        Some(LazyState::Cached(encoded.checked_sub(1).ok_or(
+                            SearchError::InternalInvariant {
+                                detail: "mutable warm selected-end state encoding underflowed",
+                            },
+                        )?))
+                    },
+                )
+            }
+            LazyTransition::Inline { accepted, pending } => {
+                (accepted, Some(LazyState::Inline { pending }))
+            }
+        };
+        if accepted {
+            pending_end = Some(position);
+        }
+        let Some(next) = next else {
+            return complete_mutable_warm_direct_selected_end(
+                automaton,
+                workspace,
+                window,
+                &mut meter,
+                pending_end,
+            );
+        };
+        state = next;
     }
 }
 
@@ -7177,7 +7425,7 @@ pub(crate) fn search_prevalidated_selected_end_value_with_authenticated_workspac
                         automaton,
                         haystack,
                         window,
-                        &workspace.lazy,
+                        workspace,
                         proof,
                     )?
                 {
@@ -37157,7 +37405,7 @@ mod tests {
                 &plan,
                 haystack,
                 window,
-                &session.workspace.lazy,
+                &mut session.workspace,
                 proof,
             ),
             Ok(super::WarmDirectSelectedEnd::Complete(expected)),
@@ -37167,7 +37415,7 @@ mod tests {
                 &plan,
                 absent,
                 absent_window,
-                &session.workspace.lazy,
+                &mut session.workspace,
                 proof,
             ),
             Ok(super::WarmDirectSelectedEnd::Complete(None)),
@@ -37266,6 +37514,359 @@ mod tests {
         ));
         assert_eq!(session.workspace.generation, before_invalid_generation);
         assert_eq!(session.workspace.lazy.rows, before_invalid_rows);
+    }
+
+    #[test]
+    fn warm_value_selected_end_hands_off_without_prefix_replay_and_keeps_pending() {
+        let match_len = WARM_EXISTS_INLINE_BYTES.checked_add(4).unwrap();
+        let plan = byte_chain(&vec![(b'a', b'a'); match_len]);
+        let warm = vec![b'a'; match_len];
+        let mut novel = warm.clone();
+        *novel.last_mut().unwrap() = b'x';
+        let window = SearchWindow::full(&novel);
+        let branch_row = |workspace: &K0Workspace| {
+            let mut row = workspace.lazy.row_offset(workspace.lazy.initial).unwrap();
+            for _ in 0..match_len - 1 {
+                let cell = workspace
+                    .lazy
+                    .direct_cell(row, byte_class(&plan, b'a'))
+                    .unwrap();
+                row = (cell & super::LAZY_CELL_STATE_MASK)
+                    .checked_sub(1)
+                    .expect("the warmed selected-end prefix remains live");
+            }
+            row
+        };
+
+        let mut direct =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                .unwrap();
+        assert_eq!(
+            direct
+                .search_window::<SelectedEnd>(
+                    &warm,
+                    SearchWindow::full(&warm),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .into_output(),
+            Some(match_len),
+        );
+        let proof = plan.start_filter_proof.get().unwrap();
+        let initial_row = direct
+            .workspace
+            .lazy
+            .row_offset(direct.workspace.lazy.initial)
+            .unwrap();
+        let row = branch_row(&direct.workspace);
+        let novel_class = byte_class(&plan, b'x');
+        assert_eq!(
+            direct.workspace.lazy.direct_cell(row, novel_class).unwrap(),
+            super::LAZY_CELL_UNFILLED,
+        );
+        let consumed_prefix_cell = usize::try_from(initial_row)
+            .unwrap()
+            .checked_add(usize::from(byte_class(&plan, b'a')))
+            .unwrap();
+        direct.workspace.lazy.rows[consumed_prefix_cell] = super::LAZY_CELL_UNFILLED;
+        assert_eq!(
+            super::continue_mutable_warm_direct_selected_end(
+                &plan,
+                &novel,
+                window,
+                &mut direct.workspace,
+                proof,
+                super::WarmDirectSelectedEndContinuation {
+                    initial_row,
+                    state: row,
+                    position: match_len - 1,
+                    work: INVOCATION_RESET_WORK,
+                    direct_steps: match_len - 1,
+                    ..super::WarmDirectSelectedEndContinuation::default()
+                },
+            )
+            .unwrap(),
+            None,
+        );
+        assert_ne!(
+            direct.workspace.lazy.direct_cell(row, novel_class).unwrap(),
+            super::LAZY_CELL_UNFILLED,
+            "selected-end continuation did not publish its first missing cell",
+        );
+        assert_eq!(
+            direct.workspace.lazy.rows[consumed_prefix_cell],
+            super::LAZY_CELL_UNFILLED,
+            "selected-end continuation replayed an already-consumed prefix edge",
+        );
+
+        let pending_plan = greedy_a_plus_or_a();
+        let pending_warm = b"aaaa";
+        let pending_novel = b"aaax";
+        let pending_window = SearchWindow::full(pending_novel);
+        let mut pending = K0SearchSession::new_selected(
+            &pending_plan,
+            WorkspaceLimits::unlimited(),
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            pending
+                .search_window::<SelectedEnd>(
+                    pending_warm,
+                    SearchWindow::full(pending_warm),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .into_output(),
+            Some(4),
+        );
+        assert!(pending.workspace.lazy.loop_skip_plans.is_empty());
+        assert_eq!(
+            pending
+                .search_selected_end_value(
+                    pending_novel,
+                    pending_window,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            Some(3),
+        );
+        let rows = pending.workspace.lazy.rows.clone();
+        let generation = pending.workspace.generation;
+        assert_eq!(
+            pending
+                .search_selected_end_value(
+                    pending_novel,
+                    pending_window,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            Some(3),
+        );
+        assert_eq!(pending.workspace.lazy.rows, rows);
+        assert_eq!(pending.workspace.generation, generation);
+    }
+
+    #[test]
+    fn warm_value_selected_end_matches_reports_after_same_address_source_changes() {
+        let plans = [
+            ascii_root_bytes(b"a"),
+            ascii_root_bytes(b"ac"),
+            ascii_root_bytes(b"abc"),
+            ascii_root_bytes(b"aceg"),
+            byte_chain(&[(b'A', b'Z'), (b'a', b'z'), (b'0', b'9')]),
+            a_star(true),
+            empty_or_ab(false),
+            asserted_line_a(),
+        ];
+        let haystacks = bounded_words(&[0x00, b'A', b'a', b'b', b'1', 0x80, 0xff], 3);
+        let mut mutable_handoffs = 0usize;
+        let mut comparisons = 0usize;
+
+        for plan in &plans {
+            let mut value =
+                K0SearchSession::new_selected(plan, WorkspaceLimits::unlimited(), true, true)
+                    .unwrap();
+            let mut reported =
+                K0SearchSession::new_selected(plan, WorkspaceLimits::unlimited(), true, true)
+                    .unwrap();
+            for haystack in &haystacks {
+                let mut source = haystack.clone();
+                for byte in &mut source {
+                    *byte = byte.wrapping_add(1);
+                }
+                let address = source.as_ptr();
+                for start in 0..=source.len() {
+                    for end in start..=source.len() {
+                        let window = SearchWindow::new(start, end);
+                        value
+                            .search_window::<SelectedEnd>(
+                                &source,
+                                window,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap();
+                        source.copy_from_slice(haystack);
+                        assert_eq!(source.as_ptr(), address);
+                        let published = value.workspace.lazy.direct_cells_published;
+                        let actual = value
+                            .search_selected_end_value(
+                                &source,
+                                window,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap();
+                        mutable_handoffs = mutable_handoffs.saturating_add(usize::from(
+                            value.workspace.lazy.direct_cells_published > published,
+                        ));
+                        let expected = reported
+                            .search_window::<SelectedEnd>(
+                                haystack,
+                                window,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap()
+                            .into_output();
+                        assert_eq!(actual, expected);
+                        comparisons = comparisons.saturating_add(1);
+                        for byte in &mut source {
+                            *byte = byte.wrapping_add(1);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(mutable_handoffs != 0);
+        assert!(comparisons > 29_000);
+    }
+
+    #[test]
+    fn warm_value_selected_end_first_miss_matches_ordinary_cache_mutation() {
+        let assert_equivalent = |left: &K0Workspace, right: &K0Workspace| {
+            assert_resume_cache_equivalent(left, right);
+            assert_eq!(
+                left.lazy.loop_skip_analyzed_at_cells,
+                right.lazy.loop_skip_analyzed_at_cells,
+            );
+            assert_eq!(
+                left.lazy.loop_skip_plans.state_members,
+                right.lazy.loop_skip_plans.state_members,
+            );
+            assert_eq!(
+                direct_loop_cache_signature(left),
+                direct_loop_cache_signature(right),
+            );
+        };
+
+        let match_len = WARM_EXISTS_INLINE_BYTES.checked_add(4).unwrap();
+        let plan = byte_chain(&vec![(b'a', b'a'); match_len]);
+        let warm = vec![b'a'; match_len];
+        let mut novel = warm.clone();
+        *novel.last_mut().unwrap() = b'x';
+        let mut proof_owner =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                .unwrap();
+        proof_owner
+            .search_window::<SelectedEnd>(
+                &warm,
+                SearchWindow::full(&warm),
+                SearchLimits::unlimited(),
+            )
+            .unwrap();
+        let mut value =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                .unwrap();
+        let mut ordinary =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                .unwrap();
+        for session in [&mut value, &mut ordinary] {
+            assert_eq!(
+                session
+                    .search_window::<SelectedEnd>(
+                        &warm,
+                        SearchWindow::full(&warm),
+                        SearchLimits::unlimited(),
+                    )
+                    .unwrap()
+                    .into_output(),
+                Some(match_len),
+            );
+        }
+        assert_eq!(
+            value
+                .search_selected_end_value(
+                    &novel,
+                    SearchWindow::full(&novel),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            None,
+        );
+        assert_eq!(
+            ordinary
+                .search_window::<SelectedEnd>(
+                    &novel,
+                    SearchWindow::full(&novel),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .into_output(),
+            None,
+        );
+        assert_equivalent(&value.workspace, &ordinary.workspace);
+
+        let mut retained_states = 0usize;
+        let mut retained_items = 0usize;
+        loop {
+            let next_states = retained_states.checked_add(1).unwrap();
+            let next_items = retained_items.checked_add(next_states).unwrap();
+            if next_states > super::LAZY_MAX_STATES || next_items > super::LAZY_MAX_ITEMS {
+                break;
+            }
+            retained_states = next_states;
+            retained_items = next_items;
+        }
+        let depth = retained_states.checked_add(1).unwrap();
+        let plan = byte_chain(&vec![(b'a', b'a'); depth]);
+        let warm = vec![b'a'; retained_states.checked_sub(1).unwrap()];
+        let novel = vec![b'a'; retained_states];
+        let mut proof_owner =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                .unwrap();
+        proof_owner
+            .search_window::<SelectedEnd>(
+                &warm,
+                SearchWindow::full(&warm),
+                SearchLimits::unlimited(),
+            )
+            .unwrap();
+        let mut value =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                .unwrap();
+        let mut ordinary =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                .unwrap();
+        for session in [&mut value, &mut ordinary] {
+            assert_eq!(
+                session
+                    .search_window::<SelectedEnd>(
+                        &warm,
+                        SearchWindow::full(&warm),
+                        SearchLimits::unlimited(),
+                    )
+                    .unwrap()
+                    .into_output(),
+                None,
+            );
+            assert_eq!(session.workspace.lazy.state_len, retained_states);
+            assert_eq!(session.workspace.lazy.item_len, retained_items);
+            assert!(!session.workspace.lazy.saturated);
+        }
+        assert_eq!(
+            value
+                .search_selected_end_value(
+                    &novel,
+                    SearchWindow::full(&novel),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            None,
+        );
+        assert_eq!(
+            ordinary
+                .search_window::<SelectedEnd>(
+                    &novel,
+                    SearchWindow::full(&novel),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .into_output(),
+            None,
+        );
+        assert!(value.workspace.lazy.saturated);
+        assert!(ordinary.workspace.lazy.saturated);
+        assert_equivalent(&value.workspace, &ordinary.workspace);
     }
 
     #[test]
