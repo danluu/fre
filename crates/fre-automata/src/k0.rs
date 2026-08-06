@@ -5651,6 +5651,17 @@ struct WarmDirectSelectedEndContinuation {
     adaptive_probe: AdaptiveStartProbe,
 }
 
+#[cfg(test)]
+std::thread_local! {
+    /// Last first-miss handoff extracted by the public warm selected-end path
+    /// on this test thread. Release builds contain neither the slot nor its
+    /// update; tests use it only to distinguish an exact continuation from an
+    /// ordinary full-window replay that happens to publish the same row.
+    static WARM_DIRECT_SELECTED_END_HANDOFF:
+        std::cell::Cell<Option<WarmDirectSelectedEndContinuation>> =
+            const { std::cell::Cell::new(None) };
+}
+
 /// Exact invocation-local state at the first unpublished direct transition of
 /// a warm existence projection. Source-derived scanner cursors live only until
 /// the mutable handoff completes this same call.
@@ -6419,23 +6430,26 @@ fn try_warm_direct_selected_end(
         let class = automaton.byte_classes().class_of(byte);
         let cell = workspace.lazy.direct_cell(state, class)?;
         if cell == LAZY_CELL_UNFILLED {
+            let continuation = WarmDirectSelectedEndContinuation {
+                initial_row,
+                state,
+                position,
+                work: meter.consumed,
+                direct_steps,
+                pending_end,
+                engine_candidate,
+                retained_start_mask,
+                adaptive_probe,
+            };
+            #[cfg(test)]
+            WARM_DIRECT_SELECTED_END_HANDOFF.with(|slot| slot.set(Some(continuation)));
             return continue_mutable_warm_direct_selected_end(
                 automaton,
                 haystack,
                 window,
                 workspace,
                 proof,
-                WarmDirectSelectedEndContinuation {
-                    initial_row,
-                    state,
-                    position,
-                    work: meter.consumed,
-                    direct_steps,
-                    pending_end,
-                    engine_candidate,
-                    retained_start_mask,
-                    adaptive_probe,
-                },
+                continuation,
             )
             .map(WarmDirectSelectedEnd::Complete);
         }
@@ -37655,6 +37669,106 @@ mod tests {
         );
         assert_eq!(pending.workspace.lazy.rows, rows);
         assert_eq!(pending.workspace.generation, generation);
+    }
+
+    #[test]
+    fn warm_value_selected_end_public_handoff_publishes_loop_plan_without_replay() {
+        let plan = ascii_loop_class(1);
+        pin_without_start_filter(&plan);
+        let run_len = super::LAZY_LOOP_SKIP_MIN_BYTES * 2;
+        let warm = vec![0_u8; run_len];
+        let mut novel = warm.clone();
+        novel.push(1);
+        let finite = SearchLimits {
+            max_work: u64::MAX - 1,
+            max_scratch_bytes: usize::MAX,
+        };
+        let mut value =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                .unwrap();
+        let mut ordinary =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                .unwrap();
+
+        for session in [&mut value, &mut ordinary] {
+            assert_eq!(
+                session
+                    .search_window::<SelectedEnd>(
+                        &warm,
+                        SearchWindow::full(&warm),
+                        finite,
+                    )
+                    .unwrap()
+                    .into_output(),
+                None,
+            );
+            assert!(session.workspace.lazy.loop_skip_plans.is_empty());
+            let initial_row = session
+                .workspace
+                .lazy
+                .row_offset(session.workspace.lazy.initial)
+                .unwrap();
+            assert_ne!(
+                session
+                    .workspace
+                    .lazy
+                    .direct_cell(initial_row, byte_class(&plan, 0))
+                    .unwrap(),
+                super::LAZY_CELL_UNFILLED,
+            );
+            assert_eq!(
+                session
+                    .workspace
+                    .lazy
+                    .direct_cell(initial_row, byte_class(&plan, 1))
+                    .unwrap(),
+                super::LAZY_CELL_UNFILLED,
+            );
+        }
+
+        super::WARM_DIRECT_SELECTED_END_HANDOFF.with(|slot| slot.set(None));
+        assert_eq!(
+            value
+                .search_selected_end_value(
+                    &novel,
+                    SearchWindow::full(&novel),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            Some(run_len + 1),
+        );
+        let handoff = super::WARM_DIRECT_SELECTED_END_HANDOFF
+            .with(std::cell::Cell::get)
+            .expect("the public value facade must continue its exact first missing transition");
+        assert_eq!(handoff.position, run_len);
+        assert_eq!(handoff.direct_steps, run_len);
+        assert_eq!(handoff.pending_end, None);
+        assert_eq!(
+            ordinary
+                .search_window::<SelectedEnd>(
+                    &novel,
+                    SearchWindow::full(&novel),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .into_output(),
+            Some(run_len + 1),
+        );
+
+        assert_resume_cache_equivalent(&value.workspace, &ordinary.workspace);
+        assert_eq!(
+            value.workspace.lazy.loop_skip_analyzed_at_cells,
+            ordinary.workspace.lazy.loop_skip_analyzed_at_cells,
+        );
+        assert_eq!(
+            direct_loop_cache_signature(&value.workspace),
+            direct_loop_cache_signature(&ordinary.workspace),
+        );
+        assert!(!value.workspace.lazy.loop_skip_plans.is_empty());
+        assert_eq!(
+            value.workspace.lazy.loop_skip_analyzed_at_cells,
+            value.workspace.lazy.direct_cells_published,
+        );
     }
 
     #[test]
