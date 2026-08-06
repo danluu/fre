@@ -387,8 +387,11 @@ impl PreparedAotRegex {
     }
 
     fn from_program(program: CompiledProgram) -> Result<Self, PrepareError> {
-        let workspace = program
+        let mut workspace = program
             .prepare_workspace()
+            .map_err(PrepareError::Workspace)?;
+        program
+            .compiler_private_try_prefill_retained_fallback_with_workspace(&mut workspace)
             .map_err(PrepareError::Workspace)?;
         Ok(Self { program, workspace })
     }

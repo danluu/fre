@@ -46802,13 +46802,17 @@ mod tests {
         workspace.layout.lazy_state_capacity = 1;
         workspace.layout.lazy_item_capacity = 1;
         let rows = workspace.lazy.rows.clone();
+        let cached_workspace_identities = resume.cached_workspace_identities.clone();
         assert!(!workspace.compiler_private_try_prefill_resume_caches(&plan, &mut resume));
         assert_eq!(workspace.lazy.rows, rows);
         assert_eq!(workspace.lazy.state_len, 0);
         assert_eq!(workspace.lazy.item_len, 0);
         assert!(!workspace.lazy.initialized);
         assert_eq!(resume.cached_states.as_slice(), &[super::LAZY_NO_STATE]);
-        assert_eq!(resume.cached_workspace_identities.as_slice(), &[0]);
+        assert_eq!(
+            resume.cached_workspace_identities,
+            cached_workspace_identities
+        );
         workspace.layout = layout;
     }
 

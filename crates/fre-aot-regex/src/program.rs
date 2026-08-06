@@ -13312,6 +13312,83 @@ mod tests {
     }
 
     #[test]
+    fn prepared_partial_prefill_completes_before_matching_for_every_output() {
+        let pattern = r"a+Q|[b-c][a-b]{1,5}(?:x+|y+)";
+        let limits = DeterminizeLimits {
+            max_states: 8,
+            ..DeterminizeLimits::default()
+        };
+        let mut haystack = vec![b'x'; PARTIAL_DFA_MIN_INPUT_BYTES];
+        haystack.extend_from_slice(b"cbbbbx");
+        let window = SearchWindow::full(&haystack);
+
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let compiled = program(pattern, output, CompileMode::Optimizing, limits);
+            assert!(compiled.partial_dfa().is_some(), "{output:?}");
+            let reference = program(
+                pattern,
+                output,
+                CompileMode::Fast,
+                DeterminizeLimits::default(),
+            );
+            let mut workspace = compiled.prepare_workspace().unwrap();
+            assert!(
+                workspace
+                    .nfa
+                    .as_ref()
+                    .and_then(|nfa| nfa.dynamic_root_projection(&compiled.automaton))
+                    .is_none(),
+                "fresh workspace was already warm for {output:?}"
+            );
+            assert!(
+                compiled
+                    .compiler_private_try_prefill_retained_fallback_with_workspace(
+                        &mut workspace,
+                    )
+                    .unwrap(),
+                "prefill declined for {output:?}"
+            );
+            let projection = workspace
+                .nfa
+                .as_ref()
+                .and_then(|nfa| nfa.dynamic_root_projection(&compiled.automaton))
+                .unwrap_or_else(|| panic!("prefill did not publish rows for {output:?}"));
+            let cache_identity = projection.cache_identity();
+            let state_count = projection.state_count();
+            assert_ne!(cache_identity, 0, "{output:?}");
+            assert!(state_count != 0, "{output:?}");
+            assert!(
+                !compiled
+                    .compiler_private_try_prefill_retained_fallback_with_workspace(
+                        &mut workspace,
+                    )
+                    .unwrap(),
+                "prefill replaced a live cache for {output:?}"
+            );
+
+            let expected = reference.search(&haystack, window).unwrap();
+            assert_eq!(
+                compiled
+                    .search_optimized_with_workspace(&haystack, window, &mut workspace)
+                    .unwrap(),
+                expected,
+                "{output:?}"
+            );
+            let after = workspace
+                .nfa
+                .as_ref()
+                .and_then(|nfa| nfa.dynamic_root_projection(&compiled.automaton))
+                .unwrap();
+            assert_eq!(after.cache_identity(), cache_identity, "{output:?}");
+            assert_eq!(after.state_count(), state_count, "{output:?}");
+        }
+    }
+
+    #[test]
     fn retained_entry_preserves_complete_nfa_accelerators() {
         let pattern = r"[b-c][a-b]{1,10}z";
         let limits = DeterminizeLimits {
