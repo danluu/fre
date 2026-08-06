@@ -1683,6 +1683,10 @@ enum K0MandatorySuffixRecoveryPlan {
         maximum_match_bytes: usize,
         prefix_hedge_bytes: usize,
     },
+    FiniteMaximumSpanOnly {
+        maximum_match_bytes: usize,
+        prefix_hedge_bytes: usize,
+    },
 }
 
 #[derive(Debug)]
@@ -1727,7 +1731,8 @@ impl K0MandatorySuffixPlan {
 
     fn finite_maximum_match_bytes(&self) -> Option<usize> {
         match &self.recovery {
-            K0MandatorySuffixRecoveryPlan::FiniteMaximum {
+            K0MandatorySuffixRecoveryPlan::FiniteMaximum { maximum_match_bytes, .. }
+            | K0MandatorySuffixRecoveryPlan::FiniteMaximumSpanOnly {
                 maximum_match_bytes,
                 ..
             } => Some(*maximum_match_bytes),
@@ -1736,9 +1741,22 @@ impl K0MandatorySuffixPlan {
         }
     }
 
-    fn finite_prefix_hedge_bytes(&self) -> Option<usize> {
+    fn finite_exists_maximum_match_bytes(&self) -> Option<usize> {
         match &self.recovery {
             K0MandatorySuffixRecoveryPlan::FiniteMaximum {
+                maximum_match_bytes,
+                ..
+            } => Some(*maximum_match_bytes),
+            K0MandatorySuffixRecoveryPlan::None
+            | K0MandatorySuffixRecoveryPlan::ConsumptionRun(_)
+            | K0MandatorySuffixRecoveryPlan::FiniteMaximumSpanOnly { .. } => None,
+        }
+    }
+
+    fn finite_prefix_hedge_bytes(&self) -> Option<usize> {
+        match &self.recovery {
+            K0MandatorySuffixRecoveryPlan::FiniteMaximum { prefix_hedge_bytes, .. }
+            | K0MandatorySuffixRecoveryPlan::FiniteMaximumSpanOnly {
                 prefix_hedge_bytes,
                 ..
             } => Some(*prefix_hedge_bytes),
@@ -1879,10 +1897,13 @@ fn try_build_k0_mandatory_suffix(
             "mandatory suffix exceeds the HIR maximum match width",
         ));
     }
-    // The existing three-byte-or-longer sidecar remains authoritative. Finite
-    // recovery fills only its short-suffix admission gap, so incumbent plans
-    // retain their exact construction and runtime routing.
-    let finite_recovery_maximum_match_bytes = if candidate.len()
+    // Short finite suffixes have no incumbent suffix sidecar, so finite
+    // recovery remains their first choice. Longer suffixes first retain the
+    // existing consumption-run recovery exactly; if that proof declines, the
+    // already-authenticated finite maximum is still sufficient to bound exact
+    // reverse start recovery instead of leaving the retained suffix unused by
+    // Span operations.
+    let short_finite_recovery_maximum_match_bytes = if candidate.len()
         < K0_MANDATORY_SUFFIX_MIN_NEEDLE_BYTES
     {
         maximum_match_bytes
@@ -1913,19 +1934,36 @@ fn try_build_k0_mandatory_suffix(
     if !try_charge_k0_negative_prefilter_work(&mut planner_work, 1, limits.max_planner_work)? {
         return Ok(declined(planner_work));
     }
-    let recovery = if let Some(maximum_match_bytes) = finite_recovery_maximum_match_bytes {
-        K0MandatorySuffixRecoveryPlan::FiniteMaximum {
+    let finite_recovery = |maximum_match_bytes| K0MandatorySuffixRecoveryPlan::FiniteMaximum {
+        maximum_match_bytes,
+        prefix_hedge_bytes: k0_finite_suffix_prefix_hedge_bytes(
+            maximum_match_bytes,
+            candidate.len(),
+            mandatory_cut,
+        ),
+    };
+    let finite_span_recovery =
+        |maximum_match_bytes| K0MandatorySuffixRecoveryPlan::FiniteMaximumSpanOnly {
             maximum_match_bytes,
             prefix_hedge_bytes: k0_finite_suffix_prefix_hedge_bytes(
                 maximum_match_bytes,
                 candidate.len(),
                 mandatory_cut,
             ),
-        }
+        };
+    let recovery = if let Some(maximum_match_bytes) = short_finite_recovery_maximum_match_bytes {
+        finite_recovery(maximum_match_bytes)
     } else {
         match try_build_k0_consumption_run(raw, &mut planner_work, limits.max_planner_work)? {
             Some(run) => K0MandatorySuffixRecoveryPlan::ConsumptionRun(run),
-            None => K0MandatorySuffixRecoveryPlan::None,
+            // A semantic decline (the union is empty or covers every byte)
+            // and a planner-resource refusal are both safe here. The HIR's
+            // finite maximum was authenticated before this optional scan and
+            // the Span-only recovery needs no additional planner work. In
+            // particular, rebuilding at the refused attempt's reported work
+            // limit deterministically makes the same choice.
+            None => maximum_match_bytes
+                .map_or(K0MandatorySuffixRecoveryPlan::None, finite_span_recovery),
         }
     };
     let storage_bytes = core::mem::size_of::<K0MandatorySuffixPlan>()
@@ -9436,7 +9474,7 @@ fn try_k0_mandatory_suffix_exists(
     limits: SearchLimits,
     finite_incumbent_candidate_floor: Option<usize>,
 ) -> Result<K0MandatorySuffixAttempt, SearchError> {
-    let finite_recovery = suffix.finite_maximum_match_bytes().is_some();
+    let finite_recovery = suffix.finite_exists_maximum_match_bytes().is_some();
     let unchanged = |outcome| K0MandatorySuffixAttempt {
         outcome,
         state_after_success: state,
@@ -10693,7 +10731,9 @@ impl<'r> PortableSearchSession<'r> {
                 let mut suffix_state_after_success = *mandatory_suffix_exists_state;
                 let mut finite_suffix_incumbent = None;
                 if let Some(suffix) = *mandatory_suffix {
-                    if let Some(maximum_match_bytes) = suffix.finite_maximum_match_bytes() {
+                    if let Some(maximum_match_bytes) =
+                        suffix.finite_exists_maximum_match_bytes()
+                    {
                         if window.end().checked_sub(window.start()).is_some_and(|bytes| {
                             bytes < K0_NEGATIVE_PREFILTER_MIN_WINDOW_BYTES
                         }) {
@@ -10801,7 +10841,7 @@ impl<'r> PortableSearchSession<'r> {
                         .copied()
                         .expect("finite suffix retry requires its retained plan");
                     let maximum_match_bytes = suffix
-                        .finite_maximum_match_bytes()
+                        .finite_exists_maximum_match_bytes()
                         .expect("finite suffix retry retains its maximum width");
                     let prefix_hedge_bytes = suffix
                         .finite_prefix_hedge_bytes()
@@ -12688,8 +12728,9 @@ mod tests {
         run_k0_finite_prefix_exists_hedge, run_k0_finite_prefix_span_hedge,
         run_k0_negative_prefilter, select_k0_finite_suffix_direct_route,
         select_k0_finite_suffix_route, try_build_k0_mandatory_cut,
+        try_build_k0_mandatory_suffix,
         try_box_bounded_literal_class_run_owner, try_k0_mandatory_suffix_span_start,
-        BYTE_SET_BLOCK_BYTES, K0_FINITE_SUFFIX_INCUMBENT_ROUTE,
+        ASCII_RUN_SCANNER_BUILD_WORK, BYTE_SET_BLOCK_BYTES, K0_FINITE_SUFFIX_INCUMBENT_ROUTE,
         K0_FINITE_SUFFIX_SINGLE_PASS_NEGATIVE,
     };
     use fre_automata::{MandatoryCutAnalysisLimits, MaximumConsumedDistance};
@@ -12728,7 +12769,7 @@ mod tests {
 
     fn lowered_k0_mandatory_cut(
         pattern: &str,
-    ) -> (fre_automata::RawPlan, BuildLimits, u8) {
+    ) -> (fre_automata::RawPlan, BuildLimits, u8, Option<usize>) {
         let builder = PortableBuilder::new(pattern).unicode(false);
         let profile = CompatibilityProfile::RustBytes(builder.profile.clone());
         let request = fre_syntax::ParseRequest::rust(pattern, profile)
@@ -12739,6 +12780,7 @@ mod tests {
         let CanonicalPattern::Rust(rust) = parsed.pattern else {
             panic!("Rust bytes request produced a non-Rust canonical pattern");
         };
+        let maximum_match_bytes = rust.hir.properties().maximum_len();
         let raw = fre_lower::lower_raw(
             &rust,
             OperationSemantics::CaptureFree,
@@ -12750,11 +12792,12 @@ mod tests {
             raw,
             builder.limits,
             builder.profile.options.line_terminator,
+            maximum_match_bytes,
         )
     }
 
     fn analyzed_k0_mandatory_cut(pattern: &str) -> (K0MandatoryCutPlan, Automaton) {
-        let (raw, limits, line_terminator) = lowered_k0_mandatory_cut(pattern);
+        let (raw, limits, line_terminator, _) = lowered_k0_mandatory_cut(pattern);
         let cut = try_build_k0_mandatory_cut(&raw, limits, 0)
             .expect("focused mandatory-cut analysis completes")
             .plan
@@ -12786,12 +12829,62 @@ mod tests {
         regex
     }
 
+    fn forced_k0_with_only_mandatory_suffix(pattern: &str) -> PortableRegex {
+        let (raw, limits, line_terminator, maximum_match_bytes) =
+            lowered_k0_mandatory_cut(pattern);
+        let suffix_build = try_build_k0_mandatory_suffix(
+            &raw,
+            maximum_match_bytes,
+            None,
+            limits,
+            0,
+        )
+        .expect("focused mandatory-suffix analysis completes");
+        let suffix_storage_bytes = suffix_build.storage_bytes;
+        let suffix_planner_work = suffix_build.planner_work;
+        let suffix = suffix_build
+            .plan
+            .expect("focused pattern retains a mandatory-suffix proof");
+        let automaton = Automaton::from_raw(raw, limits.lowering.automata)
+            .expect("focused mandatory-suffix graph validates")
+            .with_line_terminator(line_terminator);
+        let automaton_storage_bytes = automaton.stats().storage_bytes();
+        let mut regex = PortableBuilder::new(pattern)
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .expect("focused mandatory-suffix pattern builds through K0");
+        let PortablePlan::K0(plan) = &mut regex.plan else {
+            panic!("forced mandatory-suffix pattern did not retain K0");
+        };
+        plan.automaton = automaton;
+        plan.correlated_terminal = None;
+        plan.mandatory_suffix = Some(suffix);
+        plan.mandatory_cut = None;
+        plan.negative_prefilter = None;
+        regex.report.planner_work = suffix_planner_work;
+        regex.report.plan_storage_bytes = automaton_storage_bytes
+            .checked_add(suffix_storage_bytes)
+            .expect("synthetic mandatory-suffix storage accounting does not overflow");
+        regex.report.charged_persistent_bytes = regex
+            .report
+            .source_storage_bytes
+            .checked_add(regex.report.capture_name_storage_bytes)
+            .and_then(|bytes| bytes.checked_add(regex.report.plan_storage_bytes))
+            .expect("synthetic mandatory-suffix persistent accounting does not overflow");
+        assert!(
+            regex.report.charged_persistent_bytes <= regex.report.persistent_byte_limit,
+            "synthetic mandatory-suffix plan remains within the builder limit",
+        );
+        regex
+    }
+
     #[test]
     fn k0_mandatory_cut_construction_work_is_exact_and_transactional() {
         for (pattern, expected_retained_bytes) in
             [("Z", 1_u64), ("[XZ]", 2), ("[XYZ]", 3)]
         {
-            let (raw, limits, _) = lowered_k0_mandatory_cut(pattern);
+            let (raw, limits, _, _) = lowered_k0_mandatory_cut(pattern);
             let mut analysis_limits = MandatoryCutAnalysisLimits::default();
             analysis_limits.max_work = analysis_limits.max_work.min(limits.max_planner_work);
             analysis_limits.max_allocation_items = analysis_limits
@@ -14124,6 +14217,257 @@ mod tests {
                 .unwrap(),
             None,
         );
+    }
+
+    #[test]
+    fn finite_long_suffix_recovers_only_after_consumption_run_declines() {
+        #[allow(dead_code)]
+        enum IncumbentRecoveryLayout {
+            None,
+            ConsumptionRun(super::K0ConsumptionRunPlan),
+            FiniteMaximum {
+                maximum_match_bytes: usize,
+                prefix_hedge_bytes: usize,
+            },
+        }
+
+        assert_eq!(
+            core::mem::size_of::<super::K0MandatorySuffixRecoveryPlan>(),
+            core::mem::size_of::<IncumbentRecoveryLayout>(),
+        );
+        assert_eq!(
+            core::mem::align_of::<super::K0MandatorySuffixRecoveryPlan>(),
+            core::mem::align_of::<IncumbentRecoveryLayout>(),
+        );
+
+        let wide = forced_k0_with_only_mandatory_suffix(r"(?s-u:.{4,16}XYZ)");
+        let PortablePlan::K0(wide_plan) = &wide.plan else {
+            panic!("forced finite full-byte prefix fixture did not retain K0");
+        };
+        let wide_suffix = wide_plan
+            .mandatory_suffix
+            .as_ref()
+            .expect("finite long suffix is retained");
+        assert_eq!(wide_suffix.needle(), b"XYZ");
+        assert_eq!(wide_suffix.finite_maximum_match_bytes(), Some(19));
+        assert_eq!(wide_suffix.finite_exists_maximum_match_bytes(), None);
+        assert!(!wide_suffix.has_consumption_run());
+
+        let short = forced_k0_with_only_mandatory_suffix(r"(?s-u:.{4,16}Z)");
+        let PortablePlan::K0(short_plan) = &short.plan else {
+            panic!("forced short finite fixture did not retain K0");
+        };
+        let short_suffix = short_plan
+            .mandatory_suffix
+            .as_ref()
+            .expect("short finite suffix is retained");
+        assert_eq!(short_suffix.needle(), b"Z");
+        assert_eq!(short_suffix.finite_maximum_match_bytes(), Some(17));
+        assert_eq!(short_suffix.finite_exists_maximum_match_bytes(), Some(17));
+
+        let narrow = forced_k0_with_only_mandatory_suffix(r"(?-u:a{4,16}XYZ)");
+        let PortablePlan::K0(narrow_plan) = &narrow.plan else {
+            panic!("forced finite narrow-prefix fixture did not retain K0");
+        };
+        let narrow_suffix = narrow_plan
+            .mandatory_suffix
+            .as_ref()
+            .expect("incumbent long suffix is retained");
+        assert_eq!(narrow_suffix.needle(), b"XYZ");
+        assert!(narrow_suffix.has_consumption_run());
+        assert_eq!(narrow_suffix.finite_maximum_match_bytes(), None);
+
+        let mut haystack = vec![b'q'; 4_096];
+        haystack[1..4].copy_from_slice(b"XYZ");
+        haystack[3_000..3_003].copy_from_slice(b"XYZ");
+        let expected = wide
+            .find_window_value(
+                &haystack,
+                SearchWindow::full(&haystack),
+                SearchLimits::unlimited(),
+            )
+            .expect("authoritative finite K0 search succeeds");
+        assert_eq!(
+            expected,
+            Some(Match {
+                start: 3_000 - 16,
+                end: 3_003,
+            }),
+        );
+
+        let mut session = wide
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("finite long-suffix session constructs");
+        for call in 0..3 {
+            assert_eq!(
+                session
+                    .find_window_value(
+                        &haystack,
+                        SearchWindow::full(&haystack),
+                        SearchLimits::unlimited(),
+                    )
+                    .unwrap(),
+                expected,
+                "cold and warmed finite long-suffix calls agree: call={call}",
+            );
+        }
+
+        let address = haystack.as_ptr();
+        haystack[3_000..3_003].copy_from_slice(b"qqq");
+        assert_eq!(haystack.as_ptr(), address);
+        assert_eq!(
+            session
+                .find_window_value(
+                    &haystack,
+                    SearchWindow::full(&haystack),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            None,
+        );
+    }
+
+    #[test]
+    fn finite_long_suffix_resource_refusal_is_exact_and_replayable() {
+        let pattern = r"(?-u:a{4,16}XYZ)";
+        let (raw, limits, _, maximum_match_bytes) = lowered_k0_mandatory_cut(pattern);
+        assert_eq!(maximum_match_bytes, Some(19));
+
+        let complete = try_build_k0_mandatory_suffix(
+            &raw,
+            maximum_match_bytes,
+            None,
+            limits,
+            0,
+        )
+        .expect("default work completes mandatory-suffix planning");
+        assert!(
+            complete
+                .plan
+                .as_ref()
+                .is_some_and(K0MandatorySuffixPlan::has_consumption_run),
+            "the default budget retains the incumbent consumption-run recovery",
+        );
+        let exact_work = complete.planner_work;
+        let exact = try_build_k0_mandatory_suffix(
+            &raw,
+            maximum_match_bytes,
+            None,
+            BuildLimits {
+                max_planner_work: exact_work,
+                ..limits
+            },
+            0,
+        )
+        .expect("the exact incumbent budget completes");
+        assert_eq!(exact.planner_work, exact_work);
+        assert_eq!(exact.storage_bytes, complete.storage_bytes);
+        assert!(
+            exact
+                .plan
+                .as_ref()
+                .is_some_and(K0MandatorySuffixPlan::has_consumption_run),
+        );
+
+        let one_below_limit = exact_work
+            .checked_sub(1)
+            .expect("the incumbent recovery consumes positive planner work");
+        let one_below = try_build_k0_mandatory_suffix(
+            &raw,
+            maximum_match_bytes,
+            None,
+            BuildLimits {
+                max_planner_work: one_below_limit,
+                ..limits
+            },
+            0,
+        )
+        .expect("one-below refusal publishes finite Span recovery");
+        let one_below_plan = one_below
+            .plan
+            .as_ref()
+            .expect("the authenticated suffix remains retained");
+        let scanner_work = u64::try_from(ASCII_RUN_SCANNER_BUILD_WORK)
+            .expect("ASCII run-scanner work fits u64");
+        let work_before_scanner = exact_work
+            .checked_sub(scanner_work)
+            .expect("completed recovery includes scanner construction");
+        assert!(!one_below_plan.has_consumption_run());
+        assert_eq!(one_below_plan.finite_maximum_match_bytes(), Some(19));
+        assert_eq!(one_below_plan.finite_exists_maximum_match_bytes(), None);
+        assert_eq!(one_below.planner_work, work_before_scanner);
+        assert_eq!(one_below.storage_bytes, complete.storage_bytes);
+
+        let replay = try_build_k0_mandatory_suffix(
+            &raw,
+            maximum_match_bytes,
+            None,
+            BuildLimits {
+                max_planner_work: one_below.planner_work,
+                ..limits
+            },
+            0,
+        )
+        .expect("reported refused work replays deterministically");
+        let replay_plan = replay
+            .plan
+            .as_ref()
+            .expect("replayed finite Span recovery remains retained");
+        assert_eq!(replay.planner_work, one_below.planner_work);
+        assert_eq!(replay.storage_bytes, one_below.storage_bytes);
+        assert!(!replay_plan.has_consumption_run());
+        assert_eq!(replay_plan.finite_maximum_match_bytes(), Some(19));
+        assert_eq!(replay_plan.finite_exists_maximum_match_bytes(), None);
+
+        let edge_work = u64::try_from(raw.edge_kinds.len())
+            .expect("test graph edge count fits u64");
+        let work_before_edges = work_before_scanner
+            .checked_sub(edge_work)
+            .expect("completed recovery includes edge inspection");
+        let edge_one_below_limit = work_before_scanner
+            .checked_sub(1)
+            .expect("edge inspection consumes positive planner work");
+        let edge_refused = try_build_k0_mandatory_suffix(
+            &raw,
+            maximum_match_bytes,
+            None,
+            BuildLimits {
+                max_planner_work: edge_one_below_limit,
+                ..limits
+            },
+            0,
+        )
+        .expect("edge-inspection refusal publishes finite Span recovery");
+        let edge_refused_plan = edge_refused
+            .plan
+            .as_ref()
+            .expect("edge-refused suffix remains retained");
+        assert_eq!(edge_refused.planner_work, work_before_edges);
+        assert_eq!(edge_refused.storage_bytes, complete.storage_bytes);
+        assert!(!edge_refused_plan.has_consumption_run());
+        assert_eq!(edge_refused_plan.finite_maximum_match_bytes(), Some(19));
+        assert_eq!(edge_refused_plan.finite_exists_maximum_match_bytes(), None);
+
+        let edge_replay = try_build_k0_mandatory_suffix(
+            &raw,
+            maximum_match_bytes,
+            None,
+            BuildLimits {
+                max_planner_work: edge_refused.planner_work,
+                ..limits
+            },
+            0,
+        )
+        .expect("reported edge-refusal work replays deterministically");
+        let edge_replay_plan = edge_replay
+            .plan
+            .as_ref()
+            .expect("replayed edge-refused suffix remains retained");
+        assert_eq!(edge_replay.planner_work, edge_refused.planner_work);
+        assert_eq!(edge_replay.storage_bytes, edge_refused.storage_bytes);
+        assert!(!edge_replay_plan.has_consumption_run());
+        assert_eq!(edge_replay_plan.finite_maximum_match_bytes(), Some(19));
+        assert_eq!(edge_replay_plan.finite_exists_maximum_match_bytes(), None);
     }
 
     #[test]
