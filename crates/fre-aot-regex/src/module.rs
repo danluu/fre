@@ -1584,23 +1584,39 @@ impl CompiledModule {
                     size: 0,
                 });
                 // Slot 12 remains the established dynamic continuation slot.
-                // Variable Span keeps it present even for scanner-owned rows,
-                // where no continuation relocation references it, so the new
-                // recovery helper has one deterministic cross-target index.
+                // Variable Span keeps a defined local placeholder there for
+                // scanner-owned rows, where no continuation relocation exists,
+                // so the recovery helper has one deterministic cross-target
+                // index without publishing a false undefined dependency.
                 if needs_dynamic_rows_continue_symbol || prepared.span_recovery {
                     if symbols.len() != DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL {
                         return Err(ObjectError::InvalidModule(
                             "dynamic-row continuation symbol order is inconsistent",
                         ));
                     }
-                    symbols.push(ModuleSymbol {
-                        name: DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL_NAME.to_owned(),
-                        binding: SymbolBinding::Global,
-                        kind: SymbolKind::Function,
-                        section: None,
-                        offset: 0,
-                        size: 0,
-                    });
+                    if needs_dynamic_rows_continue_symbol {
+                        symbols.push(ModuleSymbol {
+                            name: DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL_NAME.to_owned(),
+                            binding: SymbolBinding::Global,
+                            kind: SymbolKind::Function,
+                            section: None,
+                            offset: 0,
+                            size: 0,
+                        });
+                    } else {
+                        symbols.push(ModuleSymbol {
+                            name: ".Lfre_aot_regex_dynamic_rows_no_continue_v1".to_owned(),
+                            binding: SymbolBinding::Local,
+                            kind: SymbolKind::Object,
+                            section: Some(PROGRAM_SECTION),
+                            offset: u64::try_from(prepared.identity_offset).map_err(|_| {
+                                ObjectError::ArithmeticOverflow(
+                                    "dynamic-row continuation placeholder offset",
+                                )
+                            })?,
+                            size: 0,
+                        });
+                    }
                 }
                 if prepared.span_recovery {
                     if symbols.len() != DYNAMIC_ROWS_SPAN_RECOVERY_RUNTIME_SYMBOL {
@@ -1934,15 +1950,17 @@ fn lower_native_dynamic_rows_prepared(
 ) -> Result<(NativeLowering, PreparedEntryLayout), ObjectError> {
     let exact_span_width = match (view.output, view.exact_match_width) {
         (OutputContract::Exists | OutputContract::SelectedEnd, _) => None,
-        (OutputContract::Span, Some(width)) if width != 0 => Some(
-            u64::try_from(width)
-                .map_err(|_| ObjectError::ArithmeticOverflow("dynamic native Span width"))?,
-        ),
         (OutputContract::Span, None) => None,
-        (OutputContract::Span, Some(0)) => {
-            return Err(ObjectError::InvalidModule(
-                "dynamic native Span rejects a proved zero width",
-            ));
+        (OutputContract::Span, Some(width)) => {
+            if width == 0 {
+                return Err(ObjectError::InvalidModule(
+                    "dynamic native Span rejects a proved zero width",
+                ));
+            }
+            Some(
+                u64::try_from(width)
+                    .map_err(|_| ObjectError::ArithmeticOverflow("dynamic native Span width"))?,
+            )
         }
     };
     let variable_span_recovery =
@@ -26610,6 +26628,14 @@ mod tests {
                     .required_prepared_dynamic_rows_continue_runtime_symbol(),
                 None,
                 "scanner-owned holes retain whole-search deopt on {target:?}"
+            );
+            assert!(
+                compiled
+                    .module()
+                    .symbols()
+                    .iter()
+                    .all(|symbol| symbol.name != DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL_NAME),
+                "scanner-owned variable Span must not publish a false continuation dependency on {target:?}"
             );
             assert_eq!(
                 compiled
