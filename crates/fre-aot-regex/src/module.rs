@@ -45959,8 +45959,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
         );
         assert_eq!(
             occurrences(&x86.code, &[0x4e, 0x8d, 0x04, 0x16]),
-            10,
-            "V8 and every mapped V3 loop need a state-ordinal backedge"
+            48,
+            "V8/V6 and both ordered V3/V10/V12 transitions need state-ordinal backedges"
         );
         assert_eq!(
             occurrences(&x86.code, &[0x49, 0x89, 0xf0]),
@@ -45974,8 +45974,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
         );
         assert_eq!(
             occurrences(&x86.code, &[0x4e, 0x8d, 0x44, 0x56, 0xfe]),
-            7,
-            "V14, V13, singleton, mapped V4, and V9 need direct rows+token*2-2 backedges"
+            9,
+            "three V14 alphabets plus V13, singleton, mapped V4, and V9 need direct rows+token*2-2 backedges"
         );
         let mut v2_flag = vec![
             0x81,
@@ -46505,8 +46505,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 .iter()
                 .filter(|&&word| word == aarch64_add_x_uxtw(11, 15, 8, 1).unwrap())
                 .count(),
-            7,
-            "V14, V13, singleton, mapped V4, and V9 need biased-base cell-offset backedges"
+            9,
+            "three V14 alphabets plus V13, singleton, mapped V4, and V9 need biased-base cell-offset backedges"
         );
         assert_eq!(
             arm_words
