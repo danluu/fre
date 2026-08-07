@@ -1554,6 +1554,7 @@ struct K0MandatoryCutBuild {
     plan: Option<K0MandatoryCutPlan>,
     planner_work: u64,
     analysis_work: u64,
+    packed_frontier_eligible: bool,
     storage_bytes: usize,
 }
 
@@ -1573,6 +1574,7 @@ fn try_build_k0_mandatory_cut(
             plan: None,
             planner_work: incumbent_planner_work,
             analysis_work: 0,
+            packed_frontier_eligible: false,
             storage_bytes: 0,
         });
     }
@@ -1623,6 +1625,19 @@ fn try_build_k0_mandatory_cut(
             }
         },
     };
+    // The optional frontier can only publish for a four-to-thirty-two-byte
+    // mandatory root. Preserve that scalar fact from this already-charged
+    // exact-graph receipt so ineligible plans do not rerun the complete
+    // mandatory-cut analysis merely to rediscover it. Eligible plans still
+    // reauthenticate the candidate against `raw` below. Displacement remains
+    // a later concern because the HIR can supply a finite global bound when
+    // the graph distance proof is conservatively unbounded.
+    let packed_frontier_eligible = candidate.is_some_and(|candidate| {
+        let cardinality = usize::from(candidate.byte_class().cardinality());
+        cardinality > 3
+            && cardinality
+                <= fre_automata::MAX_MANDATORY_LITERAL_FRONTIER_ROOT_BYTES
+    });
     let plan = match candidate {
         Some(candidate) => K0MandatoryCutPlan::try_from_candidate(
             candidate,
@@ -1636,6 +1651,7 @@ fn try_build_k0_mandatory_cut(
         plan,
         planner_work,
         analysis_work: stats.work(),
+        packed_frontier_eligible,
     })
 }
 
@@ -1684,6 +1700,19 @@ struct K0PackedFrontierBuild {
     storage_bytes: usize,
 }
 
+fn k0_packed_frontier_maximum_before_root(
+    graph_maximum: MaximumConsumedDistance,
+    maximum_match_bytes: Option<usize>,
+) -> Option<usize> {
+    match graph_maximum {
+        MaximumConsumedDistance::Finite(maximum) => usize::try_from(maximum).ok(),
+        // Every byte before the mandatory root belongs to the selected match,
+        // so a finite whole-match maximum is a conservative upper bound even
+        // when the graph distance analysis cannot prove its tighter value.
+        MaximumConsumedDistance::Unbounded => maximum_match_bytes,
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "one optional transaction closes graph analysis, packed construction, and owner accounting before publication"
@@ -1693,12 +1722,17 @@ fn try_build_k0_packed_frontier(
     limits: BuildLimits,
     incumbent_planner_work: u64,
     mandatory_cut_analysis_work: u64,
+    mandatory_cut_frontier_eligible: bool,
+    maximum_match_bytes: Option<usize>,
 ) -> Result<K0PackedFrontierBuild, BuildError> {
     let declined = |planner_work| K0PackedFrontierBuild {
         plan: None,
         planner_work,
         storage_bytes: 0,
     };
+    if !mandatory_cut_frontier_eligible {
+        return Ok(declined(incumbent_planner_work));
+    }
     let owner_bytes = core::mem::size_of::<K0PackedFrontierPlan>();
     if limits.packed_literal_set.max_patterns < 2
         || limits.packed_literal_set.max_pattern_bytes < 4
@@ -1793,12 +1827,10 @@ fn try_build_k0_packed_frontier(
     let Some(candidate) = report.candidate() else {
         return Ok(declined(planner_work));
     };
-    let MaximumConsumedDistance::Finite(maximum_before_root) =
-        candidate.maximum_before_root()
-    else {
-        return Ok(declined(planner_work));
-    };
-    let Ok(maximum_before_root) = usize::try_from(maximum_before_root) else {
+    let Some(maximum_before_root) = k0_packed_frontier_maximum_before_root(
+        candidate.maximum_before_root(),
+        maximum_match_bytes,
+    ) else {
         return Ok(declined(planner_work));
     };
     if candidate.len() < 2 {
@@ -6270,6 +6302,7 @@ impl PortableBuilder {
                 plan: None,
                 planner_work: fallback_planner_work,
                 analysis_work: 0,
+                packed_frontier_eligible: false,
                 storage_bytes: 0,
             }
         };
@@ -6303,6 +6336,8 @@ impl PortableBuilder {
                 self.limits,
                 fallback_planner_work,
                 mandatory_cut.analysis_work,
+                mandatory_cut.packed_frontier_eligible,
+                rust.hir.properties().maximum_len(),
             )?
         } else {
             K0PackedFrontierBuild {
@@ -15811,14 +15846,21 @@ mod tests {
     fn analyzed_k0_packed_frontier(
         pattern: &str,
     ) -> (Box<K0PackedFrontierPlan>, Automaton, u64, usize) {
-        let (raw, limits, line_terminator, _, _) = lowered_k0_mandatory_cut(pattern);
+        let (raw, limits, line_terminator, _, maximum_match_bytes) =
+            lowered_k0_mandatory_cut(pattern);
         let cut = try_build_k0_mandatory_cut(&raw, limits, 0)
             .expect("focused packed-frontier prerequisite cut completes");
+        assert!(
+            cut.packed_frontier_eligible,
+            "focused packed-frontier shape lost its cheap prerequisite gate",
+        );
         let build = try_build_k0_packed_frontier(
             &raw,
             limits,
             cut.planner_work,
             cut.analysis_work,
+            cut.packed_frontier_eligible,
+            maximum_match_bytes,
         )
         .expect("focused packed-frontier analysis completes");
         let planner_work = build.planner_work;
@@ -16077,13 +16119,12 @@ mod tests {
 
     #[test]
     fn k0_packed_frontier_auto_publication_covers_bounded_alternation() {
-        let regex = PortableBuilder::new(
-            r"(?s-u:.{0,256}[abcd](?:XYZ|QRS|UVW|LMN)\b)",
-        )
-        .unicode(false)
-        .plan_selection(PlanSelection::Auto)
-        .build()
-        .expect("bounded-alternation packed-frontier fixture builds");
+        const PATTERN: &str = r"(?s-u:.{0,256}[abcd](?:XYZ|QRS|UVW|LMN)\b)";
+        let regex = PortableBuilder::new(PATTERN)
+            .unicode(false)
+            .plan_selection(PlanSelection::Auto)
+            .build()
+            .expect("bounded-alternation packed-frontier fixture builds");
         let PortablePlan::K0(plan) = &regex.plan else {
             panic!("bounded-alternation fixture did not retain K0");
         };
@@ -16092,6 +16133,71 @@ mod tests {
             .expect("automatic K0 plan retains the bounded-alternation frontier");
         assert!(frontier.is_bound_to(&plan.automaton));
         assert!(plan.correlated_terminal().is_none());
+        assert_eq!(
+            frontier.maximum_before_root, 260,
+            "the finite whole-match cap authenticates the conservative graph displacement",
+        );
+
+        // Put the only mandatory root exactly 256 bytes after the window
+        // boundary, and make the window exactly large enough for packed-route
+        // admission. The residual K0 floor derived from the conservative
+        // whole-match cap must retain that boundary match.
+        let window_start = 17_usize;
+        let root = window_start + 256;
+        let window_end = window_start + frontier.minimum_window_bytes;
+        let mut haystack = vec![b'!'; window_end + 13];
+        haystack[root..root + 5].copy_from_slice(b"aXYZ!");
+        let window = SearchWindow::new(window_start, window_end);
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("bounded-alternation differential session constructs");
+        let expected = session
+            .is_match_window(&haystack, window, SearchLimits::unlimited())
+            .expect("authoritative boundary K0 search succeeds")
+            .0;
+        assert!(expected);
+        assert_eq!(
+            session
+                .is_match_window_value(&haystack, window, SearchLimits::unlimited())
+                .expect("packed boundary search succeeds"),
+            expected,
+        );
+    }
+
+    #[test]
+    fn k0_packed_frontier_prerequisite_gate_skips_ineligible_roots_without_replay() {
+        for (shape, pattern) in [
+            ("existing small root", r"(?s-u:.{2,16}.{2,48}XYZ)"),
+            ("root class too wide", r"(?s-u:....\b)"),
+            (
+                "no shared consuming root",
+                r"(?-u:(?:[a-z]{4,16}XYZ|[0-9]{4,16}QRS))",
+            ),
+        ] {
+            let (raw, limits, _, _, maximum_match_bytes) =
+                lowered_k0_mandatory_cut(pattern);
+            let cut = try_build_k0_mandatory_cut(&raw, limits, 0)
+                .expect("focused ineligible prerequisite completes");
+            assert!(
+                !cut.packed_frontier_eligible,
+                "{shape} unexpectedly passed the packed-frontier prerequisite gate",
+            );
+            let build = try_build_k0_packed_frontier(
+                &raw,
+                limits,
+                cut.planner_work,
+                cut.analysis_work,
+                cut.packed_frontier_eligible,
+                maximum_match_bytes,
+            )
+            .expect("focused ineligible packed-frontier transaction completes");
+            assert!(build.plan.is_none(), "{shape} published a frontier");
+            assert_eq!(build.storage_bytes, 0, "{shape} retained storage");
+            assert_eq!(
+                build.planner_work, cut.planner_work,
+                "{shape} replayed analysis after a decisive prerequisite",
+            );
+        }
     }
 
     #[test]
@@ -16331,7 +16437,8 @@ mod tests {
     #[test]
     fn k0_packed_frontier_exact_and_one_below_resources_are_transactional() {
         let pattern = r"(?s-u:...[abcd][12345]+\b)";
-        let (raw, limits, _, _, _) = lowered_k0_mandatory_cut(pattern);
+        let (raw, limits, _, _, maximum_match_bytes) =
+            lowered_k0_mandatory_cut(pattern);
         let cut = try_build_k0_mandatory_cut(&raw, limits, 0)
             .expect("packed-frontier resource prerequisite completes");
         let complete = try_build_k0_packed_frontier(
@@ -16339,6 +16446,8 @@ mod tests {
             limits,
             cut.planner_work,
             cut.analysis_work,
+            cut.packed_frontier_eligible,
+            maximum_match_bytes,
         )
         .expect("packed-frontier resource baseline completes");
         assert!(complete.plan.is_some());
@@ -16355,6 +16464,8 @@ mod tests {
             exact_limits,
             exact_cut.planner_work,
             exact_cut.analysis_work,
+            exact_cut.packed_frontier_eligible,
+            maximum_match_bytes,
         )
         .expect("exact packed-frontier build completes");
         assert!(exact.plan.is_some());
@@ -16372,6 +16483,8 @@ mod tests {
             one_below_limits,
             one_below_cut.planner_work,
             one_below_cut.analysis_work,
+            one_below_cut.packed_frontier_eligible,
+            maximum_match_bytes,
         )
         .expect("one-below packed-frontier refusal closes");
         assert!(one_below.plan.is_none());
@@ -16392,6 +16505,8 @@ mod tests {
             pattern_limited,
             cut.planner_work,
             cut.analysis_work,
+            cut.packed_frontier_eligible,
+            maximum_match_bytes,
         )
         .expect("pattern-limited packed frontier declines transactionally");
         assert!(declined.plan.is_none());
@@ -16411,25 +16526,35 @@ mod tests {
             owner_limited,
             cut.planner_work,
             cut.analysis_work,
+            cut.packed_frontier_eligible,
+            maximum_match_bytes,
         )
         .expect("owner-limited packed frontier declines transactionally");
         assert!(declined.plan.is_none());
         assert_eq!(declined.storage_bytes, 0);
         assert_eq!(declined.planner_work, cut.planner_work);
 
-        let (unbounded_raw, unbounded_limits, _, _, _) =
+        let (unbounded_raw, unbounded_limits, _, _, unbounded_maximum_match_bytes) =
             lowered_k0_mandatory_cut(r"(?s-u:.*[abcd][1234])");
         let unbounded_cut = try_build_k0_mandatory_cut(&unbounded_raw, unbounded_limits, 0)
             .expect("unbounded packed-frontier prerequisite completes");
+        assert!(unbounded_cut.packed_frontier_eligible);
+        assert_eq!(unbounded_maximum_match_bytes, None);
         let unbounded = try_build_k0_packed_frontier(
             &unbounded_raw,
             unbounded_limits,
             unbounded_cut.planner_work,
             unbounded_cut.analysis_work,
+            unbounded_cut.packed_frontier_eligible,
+            unbounded_maximum_match_bytes,
         )
         .expect("unbounded packed frontier declines transactionally");
         assert!(unbounded.plan.is_none());
         assert_eq!(unbounded.storage_bytes, 0);
+        assert!(
+            unbounded.planner_work > unbounded_cut.planner_work,
+            "an eligible-width root is reauthenticated before its truly unbounded displacement declines",
+        );
     }
 
     #[test]
