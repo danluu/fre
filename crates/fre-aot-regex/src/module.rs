@@ -21376,6 +21376,42 @@ mod tests {
         }
     }
 
+    fn x86_v3_initial_state_body_count(code: &[u8]) -> usize {
+        let compact_load = [0x47, 0x0f, 0xb7, 0x14, 0x50];
+        let compare = [
+            0x45,
+            0x3b,
+            0x53,
+            u8::try_from(FROZEN_DYNAMIC_ROWS_V3_INITIAL_STATE_OFFSET).unwrap(),
+        ];
+        code.windows(compact_load.len())
+            .enumerate()
+            .filter_map(|(offset, bytes)| (bytes == compact_load).then_some(offset))
+            .zip(1_u8..=9)
+            .filter(|&(load, shift)| {
+                let tail_shift = [0x49, 0xc1, 0xe2, shift];
+                let Some(tail) = code.get(load..) else {
+                    return false;
+                };
+                let Some(relative_tail) = tail
+                    .windows(tail_shift.len())
+                    .position(|bytes| bytes == tail_shift)
+                else {
+                    return false;
+                };
+                let Some(tail_start) = load.checked_add(relative_tail) else {
+                    return false;
+                };
+                let Some(tail_end) = tail_start.checked_add(tail_shift.len()) else {
+                    return false;
+                };
+                code.get(load..tail_end).is_some_and(|body| {
+                    body.windows(compare.len()).any(|bytes| bytes == compare)
+                })
+            })
+            .count()
+    }
+
     #[allow(
         clippy::arithmetic_side_effects,
         reason = "bounded exhaustive-test permutation arithmetic stays within u32 and 256-byte arrays"
@@ -25292,15 +25328,7 @@ mod tests {
                 "the {accelerator:?} scanner must feed every compact row shift"
             );
             assert_eq!(
-                occurrences(
-                    code,
-                    &[
-                        0x45,
-                        0x3b,
-                        0x53,
-                        u8::try_from(FROZEN_DYNAMIC_ROWS_V3_INITIAL_STATE_OFFSET).unwrap(),
-                    ],
-                ),
+                x86_v3_initial_state_body_count(code),
                 9,
                 "each compact shift must return the initial state to {accelerator:?}"
             );
@@ -25323,7 +25351,7 @@ mod tests {
                 .expect("shared V2/V3 scanner candidate dispatcher");
             assert!(
                 (0..code.len())
-                    .filter(|&offset| code[offset] == 0xe9)
+                    .filter(|&offset| matches!(code[offset], 0xeb | 0xe9))
                     .filter_map(|offset| x86_test_branch_target(code, offset))
                     .filter(|&(target, _)| target == candidate)
                     .count()
@@ -25526,20 +25554,7 @@ mod tests {
                     "exact {accelerator:?} scanner must feed every compact row shift"
                 );
                 assert_eq!(
-                    emission
-                        .code
-                        .windows(4)
-                        .filter(|bytes| {
-                            *bytes
-                                == [
-                                    0x45,
-                                    0x3b,
-                                    0x53,
-                                    u8::try_from(FROZEN_DYNAMIC_ROWS_V3_INITIAL_STATE_OFFSET)
-                                        .unwrap(),
-                                ]
-                        })
-                        .count(),
+                    x86_v3_initial_state_body_count(&emission.code),
                     9,
                     "exact {accelerator:?} compact rows must re-enter the same scanner"
                 );
