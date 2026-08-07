@@ -9454,6 +9454,7 @@ const fn k0_finite_suffix_incumbent_single_pass_negative(
     state.next_predicate & K0_FINITE_SUFFIX_SINGLE_PASS_NEGATIVE != 0
 }
 
+#[inline]
 fn select_k0_universal_finite_suffix_incumbent(
     session: &K0SearchSession<'_>,
     suffix: &K0MandatorySuffixPlan,
@@ -9470,18 +9471,36 @@ fn select_k0_universal_finite_suffix_incumbent(
     {
         return None;
     }
+    let Some(window_bytes) = window.end().checked_sub(window.start()) else {
+        return None;
+    };
+    let window_size_class = usize::BITS - window_bytes.leading_zeros();
+    let class_index = state
+        .classes
+        .iter()
+        .position(|class| class.window_size_class == Some(window_size_class))?;
+    let class = &state.classes[class_index];
+    let route = class.next_predicate;
+    let selected = if route & K0_FINITE_SUFFIX_UNIVERSAL_INCUMBENT_ROUTE != 0 {
+        K0UniversalFiniteSuffixIncumbentRoute::Retained { class_index }
+    } else if route & K0_FINITE_SUFFIX_UNIVERSAL_INCUMBENT_CALIBRATION != 0
+        && class.disabled_calls == 0
+    {
+        K0UniversalFiniteSuffixIncumbentRoute::Calibration { class_index }
+    } else {
+        return None;
+    };
+
+    // The ordinary exact-suffix route is overwhelmingly common for positive
+    // traffic. Reject it from the compact adaptive record before deriving the
+    // full competing-route envelope; only a scheduled or retained incumbent
+    // pays those source-independent qualification checks.
     let (minimum_match_bytes, maximum_match_bytes) =
         suffix.universal_finite_match_byte_bounds()?;
     if minimum_match_bytes == 0
         || minimum_match_bytes > maximum_match_bytes
         || suffix.needle().len() > minimum_match_bytes
-    {
-        return None;
-    }
-    let Some(window_bytes) = window.end().checked_sub(window.start()) else {
-        return None;
-    };
-    if window_bytes < K0_NEGATIVE_PREFILTER_MIN_WINDOW_BYTES
+        || window_bytes < K0_NEGATIVE_PREFILTER_MIN_WINDOW_BYTES
         || maximum_match_bytes > window_bytes / K0_SUFFIX_FINITE_WIDTH_WINDOW_FACTOR
         || !k0_negative_prefilter_admitted(
             mandatory_cut,
@@ -9494,22 +9513,7 @@ fn select_k0_universal_finite_suffix_incumbent(
     {
         return None;
     }
-    let window_size_class = usize::BITS - window_bytes.leading_zeros();
-    let class_index = state
-        .classes
-        .iter()
-        .position(|class| class.window_size_class == Some(window_size_class))?;
-    let class = &state.classes[class_index];
-    let route = class.next_predicate;
-    if route & K0_FINITE_SUFFIX_UNIVERSAL_INCUMBENT_ROUTE != 0 {
-        Some(K0UniversalFiniteSuffixIncumbentRoute::Retained { class_index })
-    } else if route & K0_FINITE_SUFFIX_UNIVERSAL_INCUMBENT_CALIBRATION != 0
-        && class.disabled_calls == 0
-    {
-        Some(K0UniversalFiniteSuffixIncumbentRoute::Calibration { class_index })
-    } else {
-        None
-    }
+    Some(selected)
 }
 
 fn observe_k0_universal_finite_suffix_incumbent(
@@ -12665,7 +12669,7 @@ impl<'r> PortableSearchSession<'r> {
                     // calibrates whether the lower-dispatch prefilter should
                     // own stable negative traffic.
                     let mut suffix_state_after_success = *mandatory_suffix_span_state;
-                    let mut prefilter_state_after_success = *negative_prefilter_span_state;
+                    let mut prefilter_state_after_success = None;
                     let mut incumbent_candidate_floor = None;
                     let mut failed_incumbent = None;
                     if let Some(incumbent_route) =
@@ -12691,12 +12695,12 @@ impl<'r> PortableSearchSession<'r> {
                         let attempt = run_k0_negative_prefilter(
                             *mandatory_cut,
                             *negative_prefilter,
-                            prefilter_state_after_success,
+                            *negative_prefilter_span_state,
                             haystack,
                             window,
                             limits,
                         );
-                        prefilter_state_after_success = attempt.state_after_success;
+                        prefilter_state_after_success = Some(attempt.state_after_success);
                         let certified_absent = attempt.outcome
                             == K0NegativePrefilterOutcome::Absent
                             && window.end().checked_sub(window.start()).is_some_and(
@@ -12718,7 +12722,7 @@ impl<'r> PortableSearchSession<'r> {
                                 );
                             }
                             *mandatory_suffix_span_state = suffix_state_after_success;
-                            *negative_prefilter_span_state = prefilter_state_after_success;
+                            *negative_prefilter_span_state = attempt.state_after_success;
                             return Ok(None);
                         }
                         incumbent_candidate_floor = attempt.candidate_floor;
@@ -12832,7 +12836,11 @@ impl<'r> PortableSearchSession<'r> {
                         }
                         if result.is_ok() {
                             *mandatory_suffix_span_state = suffix_state_after_success;
-                            *negative_prefilter_span_state = prefilter_state_after_success;
+                            if let Some(prefilter_state_after_success) =
+                                prefilter_state_after_success
+                            {
+                                *negative_prefilter_span_state = prefilter_state_after_success;
+                            }
                         }
                         return result;
                     }
