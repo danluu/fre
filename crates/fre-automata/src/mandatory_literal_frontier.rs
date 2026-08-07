@@ -2,12 +2,12 @@
 //!
 //! This analysis starts from the independently proven root selected by
 //! [`analyze_mandatory_cut`]. For roots too broad for the existing one-to-three
-//! byte scanners, it enumerates every productive graph trace until either an
-//! accepting state or four consumed bytes. The retained literals form a
-//! prefix antichain: every structurally accepting trace below the root starts
-//! with at least one retained literal. Assertions are conservatively relaxed
-//! as zero-width edges, so this can add impossible traces but cannot omit a
-//! semantic match.
+//! byte scanners, it enumerates every productive graph trace until either the
+//! current prefix can reach an accepting state without another byte or four
+//! bytes have been consumed. The retained literals form a prefix antichain:
+//! every structurally accepting trace below the root starts with at least one
+//! retained literal. Assertions are conservatively relaxed as zero-width
+//! edges, so this can add impossible traces but cannot omit a semantic match.
 //!
 //! The result is only a graph proof. In particular, it does not authorize an
 //! unconditional auxiliary haystack pass. A runtime owner must additionally
@@ -17,8 +17,10 @@
 //! Frontier work charges one unit for each initialized slot, graph role, graph
 //! edge, expanded byte, configuration comparison/insertion, prefix-antichain
 //! comparison/insertion, retained-literal accounting visit, and deterministic
-//! ordering comparison/swap. Checked conversions and scalar receipt writes do
-//! not carry a separate work charge. The nested mandatory-cut receipt remains
+//! ordering comparison/swap. Productive and zero-consume-accepting reverse
+//! closures charge their independently visited roles, edges, queues and
+//! initialized slots. Checked conversions and scalar receipt writes do not
+//! carry a separate work charge. The nested mandatory-cut receipt remains
 //! separate so its accounting convention is not counted twice.
 
 #![allow(
@@ -36,7 +38,7 @@ use crate::{
 
 /// Stable identity for this frontier proof and its accounting convention.
 pub const MANDATORY_LITERAL_FRONTIER_ACCOUNTING_ID: &str =
-    "fre.automata.mandatory-literal-frontier.v1";
+    "fre.automata.mandatory-literal-frontier.v2";
 /// Shortest literal useful to a packed literal-set scanner.
 pub const MIN_MANDATORY_LITERAL_FRONTIER_BYTES: usize = 2;
 /// Longest literal inspected by this first bounded proof.
@@ -706,6 +708,38 @@ struct Configuration {
     literal: Literal,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct IncomingEdge {
+    source: u32,
+    context_assertion: bool,
+}
+
+const NULLABLE_TO_ACCEPT: u8 = 1 << 0;
+const NULLABLE_THROUGH_CONTEXT_ASSERTION: u8 = 1 << 1;
+
+struct FrontierReachability {
+    productive: Vec<bool>,
+    nullable_acceptance: Vec<u8>,
+}
+
+impl FrontierReachability {
+    fn is_productive(&self, state: usize) -> bool {
+        self.productive.get(state).copied().unwrap_or(false)
+    }
+
+    fn is_nullable_to_accept(&self, state: usize) -> bool {
+        self.nullable_acceptance
+            .get(state)
+            .is_some_and(|&flags| flags & NULLABLE_TO_ACCEPT != 0)
+    }
+
+    fn nullable_uses_context_assertion(&self, state: usize) -> bool {
+        self.nullable_acceptance.get(state).is_some_and(|&flags| {
+            flags & NULLABLE_THROUGH_CONTEXT_ASSERTION != 0
+        })
+    }
+}
+
 enum FrontierOutcome {
     Candidate(Vec<Literal>),
     Short(u8),
@@ -720,9 +754,9 @@ fn analyze_frontier_inner(
     root: u32,
     budget: &mut Budget,
 ) -> Result<FrontierOutcome, MandatoryLiteralFrontierDeclineReason> {
-    let productive = productive_states(raw, budget)?;
+    let reachability = frontier_reachability(raw, budget)?;
     let root_index = to_usize(root, "mandatory-literal-frontier root index")?;
-    if !productive.get(root_index).copied().unwrap_or(false) {
+    if !reachability.is_productive(root_index) {
         return Err(MandatoryLiteralFrontierDeclineReason::InternalInvariant {
             detail: "mandatory root is not productive",
         });
@@ -749,15 +783,30 @@ fn analyze_frontier_inner(
             },
         )?;
         let state = to_usize(configuration.state, "mandatory-literal-frontier state index")?;
+        // A zero-consume path to Accept authenticates this exact prefix. It
+        // therefore covers every longer accepting trace reachable from the
+        // same configuration, including a consuming repetition beside the
+        // accepting branch. Publish (or reject) the minimal prefix now rather
+        // than expanding descendants that prefix canonicalization must later
+        // discard.
+        if reachability.is_nullable_to_accept(state) {
+            if reachability.nullable_uses_context_assertion(state) {
+                budget.stats.context_assertions = true;
+            }
+            if usize::from(configuration.literal.len)
+                < MIN_MANDATORY_LITERAL_FRONTIER_BYTES
+            {
+                snapshot_literals(&literals, budget)?;
+                return Ok(FrontierOutcome::Short(configuration.literal.len));
+            }
+            retain_literal(configuration.literal, &mut literals, budget)?;
+            continue;
+        }
         match raw.roles[state] {
             StateRole::Accept => {
-                if usize::from(configuration.literal.len)
-                    < MIN_MANDATORY_LITERAL_FRONTIER_BYTES
-                {
-                    snapshot_literals(&literals, budget)?;
-                    return Ok(FrontierOutcome::Short(configuration.literal.len));
-                }
-                retain_literal(configuration.literal, &mut literals, budget)?;
+                return Err(MandatoryLiteralFrontierDeclineReason::InternalInvariant {
+                    detail: "accept state was absent from zero-consume closure",
+                });
             }
             StateRole::Split => {
                 let (start, end) = state_edges(raw, state)?;
@@ -770,7 +819,7 @@ fn analyze_frontier_inner(
                         raw.edge_targets[edge],
                         "mandatory-literal-frontier split target",
                     )?;
-                    if productive[target] {
+                    if reachability.is_productive(target) {
                         push_configuration(
                             &mut configurations,
                             Configuration {
@@ -790,7 +839,7 @@ fn analyze_frontier_inner(
                         raw.edge_targets[edge],
                         "mandatory-literal-frontier consume target",
                     )?;
-                    if !productive[target] {
+                    if !reachability.is_productive(target) {
                         continue;
                     }
                     for byte in raw.byte_starts[edge]..=raw.byte_ends[edge] {
@@ -843,12 +892,12 @@ fn state_edges(
 
 #[allow(
     clippy::too_many_lines,
-    reason = "one bounded construction builds reverse CSR and its accept-reachability bitmap under a shared exact budget"
+    reason = "one bounded construction builds reverse CSR plus productive and zero-consume accept closures under a shared exact budget"
 )]
-fn productive_states(
+fn frontier_reachability(
     raw: &RawPlan,
     budget: &mut Budget,
-) -> Result<Vec<bool>, MandatoryLiteralFrontierDeclineReason> {
+) -> Result<FrontierReachability, MandatoryLiteralFrontierDeclineReason> {
     let states = raw.roles.len();
     let edges = raw.edge_targets.len();
     let mut incoming_counts = budget.filled(
@@ -893,8 +942,11 @@ fn productive_states(
     }
     let mut incoming = budget.filled(
         edges,
-        0_u32,
-        "mandatory-literal-frontier incoming sources",
+        IncomingEdge {
+            source: 0,
+            context_assertion: false,
+        },
+        "mandatory-literal-frontier incoming edges",
     )?;
     let mut cursors = Vec::new();
     budget.reserve(
@@ -913,11 +965,14 @@ fn productive_states(
                 "mandatory-literal-frontier reverse target",
             )?;
             let slot = cursors[target];
-            incoming[slot] = u32::try_from(source).map_err(|_| {
-                MandatoryLiteralFrontierDeclineReason::ArithmeticOverflow {
-                    computation: "mandatory-literal-frontier reverse source",
-                }
-            })?;
+            incoming[slot] = IncomingEdge {
+                source: u32::try_from(source).map_err(|_| {
+                    MandatoryLiteralFrontierDeclineReason::ArithmeticOverflow {
+                        computation: "mandatory-literal-frontier reverse source",
+                    }
+                })?,
+                context_assertion: raw.edge_kinds[edge] != EdgeKind::Epsilon,
+            };
             cursors[target] = slot.checked_add(1).ok_or(
                 MandatoryLiteralFrontierDeclineReason::ArithmeticOverflow {
                     computation: "mandatory-literal-frontier reverse cursor",
@@ -959,9 +1014,12 @@ fn productive_states(
                 computation: "mandatory-literal-frontier productive queue cursor",
             },
         )?;
-        for &source in &incoming[incoming_offsets[state]..incoming_offsets[state + 1]] {
+        for incoming_edge in &incoming[incoming_offsets[state]..incoming_offsets[state + 1]] {
             budget.charge(1)?;
-            let source = to_usize(source, "mandatory-literal-frontier productive source")?;
+            let source = to_usize(
+                incoming_edge.source,
+                "mandatory-literal-frontier productive source",
+            )?;
             if !productive[source] {
                 productive[source] = true;
                 budget.push(
@@ -988,7 +1046,83 @@ fn productive_states(
         }
     }
     budget.stats.productive_states = productive_states;
-    Ok(productive)
+
+    // Compute the least fixed point of states that can reach Accept without
+    // consuming another byte. Only Split predecessors propagate nullability;
+    // Consume predecessors must first contribute their byte to the literal.
+    // The second bit records whether any relaxed zero-width path represented
+    // by the closure crosses a context assertion. A state is re-enqueued when
+    // that monotone bit arrives after its nullable bit, so assertion receipts
+    // propagate through zero-width cycles as well.
+    let mut nullable_acceptance = budget.filled(
+        states,
+        0_u8,
+        "mandatory-literal-frontier nullable acceptance flags",
+    )?;
+    queue.clear();
+    for (state, role) in raw.roles.iter().enumerate() {
+        budget.charge(1)?;
+        if *role == StateRole::Accept {
+            nullable_acceptance[state] = NULLABLE_TO_ACCEPT;
+            budget.push(
+                &mut queue,
+                u32::try_from(state).map_err(|_| {
+                    MandatoryLiteralFrontierDeclineReason::ArithmeticOverflow {
+                        computation: "mandatory-literal-frontier nullable accept state",
+                    }
+                })?,
+                "mandatory-literal-frontier nullable queue",
+            )?;
+        }
+    }
+    queue_cursor = 0;
+    while queue_cursor < queue.len() {
+        budget.charge(1)?;
+        let state = to_usize(
+            queue[queue_cursor],
+            "mandatory-literal-frontier nullable queue state",
+        )?;
+        queue_cursor = queue_cursor.checked_add(1).ok_or(
+            MandatoryLiteralFrontierDeclineReason::ArithmeticOverflow {
+                computation: "mandatory-literal-frontier nullable queue cursor",
+            },
+        )?;
+        let target_flags = nullable_acceptance[state];
+        for incoming_edge in &incoming[incoming_offsets[state]..incoming_offsets[state + 1]] {
+            budget.charge(1)?;
+            let source = to_usize(
+                incoming_edge.source,
+                "mandatory-literal-frontier nullable source",
+            )?;
+            if raw.roles[source] != StateRole::Split {
+                continue;
+            }
+            let context_flags = (target_flags & NULLABLE_THROUGH_CONTEXT_ASSERTION)
+                | if incoming_edge.context_assertion {
+                    NULLABLE_THROUGH_CONTEXT_ASSERTION
+                } else {
+                    0
+                };
+            let propagated = NULLABLE_TO_ACCEPT | context_flags;
+            let updated = nullable_acceptance[source] | propagated;
+            if updated != nullable_acceptance[source] {
+                nullable_acceptance[source] = updated;
+                budget.push(
+                    &mut queue,
+                    u32::try_from(source).map_err(|_| {
+                        MandatoryLiteralFrontierDeclineReason::ArithmeticOverflow {
+                            computation: "mandatory-literal-frontier nullable source state",
+                        }
+                    })?,
+                    "mandatory-literal-frontier nullable queue",
+                )?;
+            }
+        }
+    }
+    Ok(FrontierReachability {
+        productive,
+        nullable_acceptance,
+    })
 }
 
 fn push_configuration(
@@ -1423,6 +1557,72 @@ mod tests {
         )
     }
 
+    fn nullable_class_loop() -> RawPlan {
+        raw(
+            0,
+            vec![
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Split,
+                StateRole::Accept,
+            ],
+            vec![
+                vec![byte_range(1, 0, 255)],
+                vec![byte_range(2, 0, 255)],
+                vec![byte_range(3, 0, 255)],
+                vec![byte_range(4, b'a', b'd')],
+                vec![byte_range(5, b'1', b'5')],
+                vec![epsilon(4), assertion(6)],
+                vec![],
+            ],
+        )
+    }
+
+    fn correlated_width_four() -> RawPlan {
+        raw(
+            0,
+            vec![
+                StateRole::Consume,
+                StateRole::Split,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Split,
+                StateRole::Accept,
+            ],
+            vec![
+                vec![byte_range(1, b'a', b'd')],
+                vec![epsilon(2), epsilon(5), epsilon(8), epsilon(11)],
+                vec![byte(3, b'X')],
+                vec![byte(4, b'Y')],
+                vec![byte(14, b'Z')],
+                vec![byte(6, b'Q')],
+                vec![byte(7, b'R')],
+                vec![byte(14, b'S')],
+                vec![byte(9, b'U')],
+                vec![byte(10, b'V')],
+                vec![byte(14, b'W')],
+                vec![byte(12, b'L')],
+                vec![byte(13, b'M')],
+                vec![byte(14, b'N')],
+                vec![assertion(15)],
+                vec![],
+            ],
+        )
+    }
+
     fn complete(
         graph: &RawPlan,
         limits: MandatoryLiteralFrontierAnalysisLimits,
@@ -1461,6 +1661,65 @@ mod tests {
         );
         assert_eq!(report.stop_reason(), MandatoryLiteralFrontierStopReason::Candidate);
         assert!(report.stats().closes(MandatoryLiteralFrontierAnalysisLimits::default()));
+    }
+
+    #[test]
+    fn nullable_accepting_class_loop_retains_only_minimal_prefixes() {
+        let graph = nullable_class_loop();
+        let limits = MandatoryLiteralFrontierAnalysisLimits::default();
+        let first = complete(&graph, limits);
+        let second = complete(&graph, limits);
+        assert_eq!(first, second, "nullable closure remains deterministic");
+        let frontier = first.candidate().expect("nullable loop frontier");
+        let mut expected = Vec::new();
+        for first in b'a'..=b'd' {
+            for second in b'1'..=b'5' {
+                expected.push(vec![first, second]);
+            }
+        }
+        assert_eq!(literals(frontier), expected);
+        assert_eq!(frontier.root_state(), 3);
+        assert_eq!(
+            frontier.maximum_before_root(),
+            MaximumConsumedDistance::Finite(3),
+        );
+        assert_eq!(frontier.len(), 20);
+        assert_eq!(first.stats().raw_literals(), 20);
+        assert_eq!(first.stats().retained_literals(), 20);
+        assert_eq!(first.stats().retained_literal_bytes(), 40);
+        assert_eq!(first.stats().maximum_literal_bytes(), 2);
+        assert_eq!(
+            first.stats().configurations(),
+            25,
+            "accepted prefixes never enqueue consuming descendants",
+        );
+        assert!(first.stats().context_assertions());
+        assert!(first.stats().closes(limits));
+    }
+
+    #[test]
+    fn nullable_pruning_preserves_correlated_width_four_frontier() {
+        let graph = correlated_width_four();
+        let limits = MandatoryLiteralFrontierAnalysisLimits::default();
+        let report = complete(&graph, limits);
+        let frontier = report.candidate().expect("correlated width-four frontier");
+        let mut expected = Vec::new();
+        for first in b'a'..=b'd' {
+            for tail in [b"LMN", b"QRS", b"UVW", b"XYZ"] {
+                let mut literal = vec![first];
+                literal.extend_from_slice(tail);
+                expected.push(literal);
+            }
+        }
+        assert_eq!(literals(frontier), expected);
+        assert_eq!(frontier.len(), 16);
+        assert_eq!(report.stats().raw_literals(), 16);
+        assert_eq!(report.stats().retained_literals(), 16);
+        assert_eq!(report.stats().retained_literal_bytes(), 64);
+        assert_eq!(report.stats().maximum_literal_bytes(), 4);
+        assert_eq!(report.stats().configurations(), 53);
+        assert!(!report.stats().context_assertions());
+        assert!(report.stats().closes(limits));
     }
 
     #[test]
@@ -1624,6 +1883,34 @@ mod tests {
             report.stop_reason(),
             MandatoryLiteralFrontierStopReason::ShortAcceptingTrace { bytes: 1 }
         );
+    }
+
+    #[test]
+    fn nullable_zero_width_cycle_preserves_short_trace_refusal() {
+        let graph = raw(
+            0,
+            vec![
+                StateRole::Consume,
+                StateRole::Split,
+                StateRole::Split,
+                StateRole::Accept,
+            ],
+            vec![
+                vec![byte_range(1, b'a', b'd')],
+                vec![epsilon(2)],
+                vec![epsilon(1), assertion(3)],
+                vec![],
+            ],
+        );
+        let limits = MandatoryLiteralFrontierAnalysisLimits::default();
+        let report = complete(&graph, limits);
+        assert!(report.candidate().is_none());
+        assert_eq!(
+            report.stop_reason(),
+            MandatoryLiteralFrontierStopReason::ShortAcceptingTrace { bytes: 1 }
+        );
+        assert!(report.stats().context_assertions());
+        assert!(report.stats().closes(limits));
     }
 
     #[test]
@@ -1864,6 +2151,48 @@ mod tests {
                 ..baseline_limits
             },
             MandatoryLiteralFrontierResource::LiteralBytes,
+        );
+    }
+
+    #[test]
+    fn nullable_closure_exact_and_one_below_work_and_allocation_close() {
+        let graph = nullable_class_loop();
+        let baseline_limits = MandatoryLiteralFrontierAnalysisLimits::default();
+        let baseline = complete(&graph, baseline_limits);
+        let stats = baseline.stats();
+        let exact = MandatoryLiteralFrontierAnalysisLimits {
+            max_work: stats.work(),
+            max_allocation_items: stats.allocation_items(),
+            max_allocation_attempts: stats.allocation_attempts(),
+            ..baseline_limits
+        };
+        let exact_report = complete(&graph, exact);
+        assert_eq!(exact_report, baseline);
+        assert!(exact_report.stats().closes(exact));
+
+        assert_resource(
+            &graph,
+            MandatoryLiteralFrontierAnalysisLimits {
+                max_work: stats.work() - 1,
+                ..baseline_limits
+            },
+            MandatoryLiteralFrontierResource::Work,
+        );
+        assert_resource(
+            &graph,
+            MandatoryLiteralFrontierAnalysisLimits {
+                max_allocation_items: stats.allocation_items() - 1,
+                ..baseline_limits
+            },
+            MandatoryLiteralFrontierResource::AllocationItems,
+        );
+        assert_resource(
+            &graph,
+            MandatoryLiteralFrontierAnalysisLimits {
+                max_allocation_attempts: stats.allocation_attempts() - 1,
+                ..baseline_limits
+            },
+            MandatoryLiteralFrontierResource::AllocationAttempts,
         );
     }
 
