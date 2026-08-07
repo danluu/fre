@@ -16445,6 +16445,239 @@ mod tests {
     }
 
     #[test]
+    fn slow_context_candidate_is_structural_fresh_and_restorable_across_targets() {
+        let pattern = r"(?-u:\b(?:foo|bar)\b)";
+        let fast = program(
+            pattern,
+            OutputContract::Span,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        assert!(matches!(fast.engine, ProgramEngine::OrderedNfa));
+        assert!(fast.context_dfa.is_none());
+        assert!(fast.automaton.stats().has_assertions());
+
+        let candidate = fast
+            .native_slow_context_program(DeterminizeLimits::default(), 16 * 1024 * 1024)
+            .expect("fresh Fast slow contextual determinization")
+            .expect("fresh Fast contextual candidate");
+        assert_eq!(
+            candidate.required_literals,
+            required_literals::derive(&fast.raw),
+            "the transient candidate must own a fresh graph-derived analysis"
+        );
+        assert!(candidate.stats().forward_states > 0);
+        assert!(candidate.allocation_bytes() > 0);
+        assert!(candidate.work_completed() > 0);
+
+        let restored = CompiledProgram::deserialize(&fast.serialize().unwrap())
+            .expect("restore Fast contextual fallback");
+        let restored_candidate = restored
+            .native_slow_context_program(DeterminizeLimits::default(), 16 * 1024 * 1024)
+            .expect("restored slow contextual determinization")
+            .expect("restored contextual candidate");
+        assert_eq!(restored_candidate.stats(), candidate.stats());
+        assert_eq!(
+            restored_candidate.allocation_bytes(),
+            candidate.allocation_bytes()
+        );
+        assert_eq!(restored_candidate.work_completed(), candidate.work_completed());
+        assert_eq!(
+            restored_candidate.required_literals,
+            required_literals::derive(&restored.raw)
+        );
+
+        let x86_avx512 = crate::FeatureSet::of(crate::CpuFeature::X86Avx2)
+            .with(crate::CpuFeature::X86Avx512F)
+            .with(crate::CpuFeature::X86Avx512Bw)
+            .with(crate::CpuFeature::X86Avx512Vl);
+        let arm_sve2 = crate::FeatureSet::of(crate::CpuFeature::Aarch64Sve)
+            .with(crate::CpuFeature::Aarch64Sve2);
+        let targets = [
+            crate::Target::x86_64_linux()
+                .with_features(crate::FeatureSet::of(crate::CpuFeature::X86Avx2))
+                .expect("x86-64 Linux AVX2 target"),
+            crate::Target::x86_64_macos()
+                .with_features(x86_avx512)
+                .expect("x86-64 macOS AVX-512 target"),
+            crate::Target::aarch64_linux()
+                .with_features(arm_sve2)
+                .expect("AArch64 Linux SVE2 target"),
+            crate::Target::aarch64_macos()
+                .with_features(crate::FeatureSet::of(crate::CpuFeature::Aarch64Asimd))
+                .expect("AArch64 macOS ASIMD target"),
+        ];
+        for target in targets {
+            let fresh_module = crate::CompiledModule::lower_optimizing(&fast, target)
+                .unwrap_or_else(|error| panic!("fresh slow context {target:?}: {error}"));
+            let restored_module = crate::CompiledModule::lower_optimizing(&restored, target)
+                .unwrap_or_else(|error| panic!("restored slow context {target:?}: {error}"));
+            assert_eq!(fresh_module, restored_module, "{target:?}");
+            assert!(fresh_module.slow_context_aot_report().is_some(), "{target:?}");
+            assert!(fresh_module.slow_aot_report().is_none(), "{target:?}");
+            assert!(fresh_module.required_runtime_program().is_none(), "{target:?}");
+        }
+
+        let retained = program(
+            pattern,
+            OutputContract::Span,
+            CompileMode::Optimizing,
+            DeterminizeLimits::default(),
+        );
+        assert!(retained.context_dfa.is_some());
+        assert!(
+            retained
+                .native_slow_context_program(DeterminizeLimits::default(), usize::MAX)
+                .expect("retained-context eligibility check")
+                .is_none()
+        );
+        let assertion_free = program(
+            "(?:foo|bar)",
+            OutputContract::Span,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        assert!(
+            assertion_free
+                .native_slow_context_program(DeterminizeLimits::default(), usize::MAX)
+                .expect("assertion-free eligibility check")
+                .is_none()
+        );
+        assert!(
+            fast.native_slow_context_program(DeterminizeLimits::default(), 0)
+                .expect("zero contextual allocation cap")
+                .is_none()
+        );
+        assert!(
+            fast.native_slow_context_program(
+                DeterminizeLimits {
+                    max_states: 0,
+                    ..DeterminizeLimits::default()
+                },
+                usize::MAX,
+            )
+            .expect("zero contextual state cap")
+            .is_none()
+        );
+        let unsupported = program(
+            r"\bfoo\b",
+            OutputContract::Exists,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        assert!(
+            unsupported
+                .native_slow_context_program(DeterminizeLimits::default(), usize::MAX)
+                .expect("unsupported contextual assertion decline")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn contextual_passes_name_only_the_installed_start_recovery_proof() {
+        let pattern = r"(?-u:\b)abc(?-u:\b)";
+        let fallback = program(
+            pattern,
+            OutputContract::Span,
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+        );
+        assert!(matches!(fallback.engine, ProgramEngine::OrderedNfa));
+        assert_eq!(fallback.exact_match_width(), Some(3));
+
+        let candidate_at = |max_states| {
+            fallback
+                .native_slow_context_program(
+                    DeterminizeLimits {
+                        max_states,
+                        max_transitions: usize::MAX,
+                        max_work: u64::MAX,
+                    },
+                    usize::MAX,
+                )
+                .expect("bounded exact-width contextual determinization")
+        };
+        let mut high = 1_usize;
+        while candidate_at(high).is_none() {
+            high = high
+                .checked_mul(2)
+                .expect("exact-width contextual state bound");
+        }
+        let mut low = 0_usize;
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if candidate_at(middle).is_some() {
+                high = middle;
+            } else {
+                low = middle + 1;
+            }
+        }
+        let slow_limits = crate::SlowAotLimits {
+            determinize: DeterminizeLimits {
+                max_states: low,
+                max_transitions: usize::MAX,
+                max_work: u64::MAX,
+            },
+            max_allocation_bytes: usize::MAX,
+            max_native_data_bytes: usize::MAX,
+        };
+        let exact_candidate = candidate_at(low).expect("minimum complete context candidate");
+        assert_eq!(
+            exact_candidate.stats().reverse_states,
+            0,
+            "the minimum exact-width candidate should be the forward-only rescue"
+        );
+        let exact_module = crate::CompiledModule::lower_optimizing_with_limits(
+            &fallback,
+            crate::Target::x86_64_linux(),
+            slow_limits,
+        )
+        .expect("lower exact-width forward-only contextual candidate");
+        assert_eq!(
+            exact_module
+                .slow_context_aot_report()
+                .expect("installed exact-width slow context report")
+                .dfa
+                .reverse_states,
+            0
+        );
+        let exact_passes = crate::selected_passes(&fallback, &exact_module);
+        assert!(
+            exact_passes.contains(&crate::OptimizationPass::ExactWidthStartRecovery)
+        );
+        assert!(!exact_passes.contains(&crate::OptimizationPass::ReverseStartRecovery));
+        assert!(exact_passes.contains(&crate::OptimizationPass::UniversalOrderedTnfa));
+        assert!(exact_passes.contains(&crate::OptimizationPass::ContextNativeLowering));
+        assert!(!exact_passes.contains(&crate::OptimizationPass::RuntimeAdapterLowering));
+
+        let endpoint = program(
+            pattern,
+            OutputContract::SelectedEnd,
+            CompileMode::Optimizing,
+            DeterminizeLimits::default(),
+        );
+        assert_eq!(endpoint.engine_kind(), EngineKind::OrderedContextDfa);
+        assert!(
+            endpoint
+                .context_dfa_stats()
+                .is_some_and(|stats| stats.reverse_states != 0),
+            "the target-neutral endpoint machine deliberately retains reverse data"
+        );
+        let endpoint_module = crate::CompiledModule::lower(
+            &endpoint,
+            crate::Target::x86_64_linux(),
+        )
+        .expect("lower endpoint contextual machine");
+        let endpoint_passes = crate::selected_passes(&endpoint, &endpoint_module);
+        assert!(!endpoint_passes.contains(&crate::OptimizationPass::ReverseStartRecovery));
+        assert!(!endpoint_passes.contains(&crate::OptimizationPass::ExactWidthStartRecovery));
+        assert!(endpoint_passes.contains(&crate::OptimizationPass::ContextNativeLowering));
+    }
+
+    #[test]
     fn zero_state_materialization_is_optimizing_only_and_survives_restore() {
         let pattern = r"a+Q|[b-c][a-b]{1,5}(?:x+|y+)";
         let limits = DeterminizeLimits {

@@ -83,6 +83,176 @@ fn slow_aot_receipts_second_determinization_and_both_memory_caps() {
 }
 
 #[test]
+fn slow_context_aot_receipt_is_distinct_and_only_names_an_installed_candidate() {
+    let pattern = r"(?-u:\b)abc(?-u:\b)";
+    let mut compile_limits = CompileLimitsV1::default();
+    compile_limits.determinize.max_states = 0;
+    let slow_limits = SlowAotLimits::default();
+    let request = || {
+        CompileRequest::new(pattern, Target::x86_64_linux())
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Span)
+            .limits(compile_limits)
+    };
+    let compiled = compile_with_slow_aot_limits(request(), slow_limits)
+        .expect("slow contextual native compile");
+
+    assert_eq!(compiled.receipt().engine, EngineKind::OrderedNfa);
+    assert_eq!(
+        compiled.receipt().engine_selection_reason,
+        EngineSelectionReason::ContextAssertions
+    );
+    assert!(
+        compiled
+            .receipt()
+            .context_determinization
+            .as_ref()
+            .is_some_and(|report| report.decline.is_some()),
+        "semantic contextual decline must remain visible"
+    );
+    assert!(compiled.receipt().slow_aot.is_none());
+    let report = compiled
+        .receipt()
+        .slow_context_aot
+        .as_ref()
+        .expect("installed slow contextual receipt");
+    assert_eq!(report.requested_limits, slow_limits);
+    assert_eq!(
+        report.effective_native_data_limit_bytes,
+        slow_limits
+            .max_native_data_bytes
+            .min(compile_limits.max_object_bytes)
+            .min(crate::context_native::MAX_CONTEXT_NATIVE_DATA_BYTES)
+    );
+    assert!(report.dfa.forward_states > 0);
+    assert!(report.allocation_bytes <= slow_limits.max_allocation_bytes);
+    assert!(report.work_completed <= slow_limits.determinize.max_work);
+    assert!(report.native_data_bytes <= report.effective_native_data_limit_bytes);
+    assert_eq!(report.native_data_bytes, compiled.receipt().data_bytes);
+    assert!(!compiled.receipt().runtime_helper_required);
+    assert!(
+        compiled
+            .receipt()
+            .passes
+            .contains(&OptimizationPass::UniversalOrderedTnfa)
+    );
+    assert!(
+        compiled
+            .receipt()
+            .passes
+            .contains(&OptimizationPass::ContextOrderedDeterminization)
+    );
+    assert!(
+        compiled
+            .receipt()
+            .passes
+            .contains(&OptimizationPass::ContextNativeLowering)
+    );
+    assert!(
+        compiled
+            .receipt()
+            .passes
+            .contains(&OptimizationPass::ExactWidthStartRecovery)
+    );
+    assert!(
+        !compiled
+            .receipt()
+            .passes
+            .contains(&OptimizationPass::ReverseStartRecovery)
+    );
+    assert!(
+        !compiled
+            .receipt()
+            .passes
+            .contains(&OptimizationPass::RuntimeAdapterLowering)
+    );
+
+    for declined_limits in [
+        SlowAotLimits {
+            max_allocation_bytes: 0,
+            ..slow_limits
+        },
+        SlowAotLimits {
+            max_native_data_bytes: 0,
+            ..slow_limits
+        },
+        SlowAotLimits {
+            determinize: crate::DeterminizeLimits {
+                max_states: 0,
+                ..slow_limits.determinize
+            },
+            ..slow_limits
+        },
+    ] {
+        let declined = compile_with_slow_aot_limits(request(), declined_limits)
+            .expect("ordinary fallback after optional slow-context decline");
+        assert!(declined.receipt().slow_context_aot.is_none());
+        assert!(declined.receipt().slow_aot.is_none());
+        assert!(declined.receipt().runtime_helper_required);
+        assert!(
+            declined
+                .receipt()
+                .context_determinization
+                .as_ref()
+                .is_some_and(|semantic| semantic.decline.is_some())
+        );
+    }
+}
+
+#[test]
+fn slow_context_object_size_fallback_clears_optimizer_only_provenance() {
+    let pattern = r"(?-u:\b)(?:abc|def|ghi)(?-u:\b)";
+    let target = Target::aarch64_macos()
+        .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+        .expect("ASIMD target");
+    let mut limits = CompileLimitsV1::default();
+    limits.determinize.max_states = 0;
+    let request = |limits| {
+        CompileRequest::new(pattern, target)
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Span)
+            .limits(limits)
+    };
+    let optimized = compile(request(limits)).expect("unbounded slow contextual object");
+    let selected = optimized
+        .receipt()
+        .slow_context_aot
+        .as_ref()
+        .expect("selected slow contextual candidate");
+    assert!(!optimized.receipt().runtime_helper_required);
+
+    let fallback = crate::CompiledModule::lower(optimized.program(), target)
+        .expect("ordinary contextual-fallback module");
+    assert!(fallback.required_runtime_symbol().is_some());
+    assert!(fallback.slow_context_aot_report().is_none());
+    let fallback_object = emit_object(
+        &fallback,
+        crate::ObjectFormat::for_target(target),
+        usize::MAX,
+    )
+    .expect("ordinary contextual-fallback object");
+    assert!(optimized.object().len() > fallback_object.len());
+
+    limits.max_object_bytes = fallback_object.len().max(selected.native_data_bytes);
+    assert!(limits.max_object_bytes < optimized.object().len());
+    let constrained = compile(request(limits))
+        .expect("ordinary module fits after slow contextual object refusal");
+    assert_eq!(constrained.module(), &fallback);
+    assert_eq!(constrained.object(), fallback_object);
+    assert!(constrained.receipt().slow_context_aot.is_none());
+    assert!(constrained.receipt().slow_aot.is_none());
+    assert!(constrained.receipt().runtime_helper_required);
+    assert!(
+        constrained
+            .receipt()
+            .context_determinization
+            .as_ref()
+            .is_some_and(|report| report.decline.is_some()),
+        "the final receipt must retain semantic decline provenance"
+    );
+}
+
+#[test]
 fn slow_decline_tries_k0_before_the_ordinary_runtime_route() {
     let mut compile_limits = CompileLimitsV1::default();
     compile_limits.determinize.max_states = 0;
