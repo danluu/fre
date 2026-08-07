@@ -3107,6 +3107,14 @@ fn frozen_dynamic_source_rows_are_normalizable(rows: &[u32], stride: usize) -> b
             })
 }
 
+fn frozen_dynamic_class_map_is_identity(class_map: &[u8; 256]) -> bool {
+    class_map
+        .iter()
+        .copied()
+        .enumerate()
+        .all(|(byte, class)| usize::from(class) == byte)
+}
+
 /// Map one source-state ordinal into a compact table whose initial state is
 /// physical row zero. Swapping zero with the source initial is its own inverse,
 /// so the same operation selects source rows and rewrites destination tokens.
@@ -3471,7 +3479,11 @@ impl FrozenDynamicRowsStorageV3 {
             }
             represented[class] = true;
         }
-        if represented[..class_count].iter().any(|&present| !present) {
+        if represented[..class_count].iter().any(|&present| !present)
+            || (format == FrozenCompactRowsFormat::CellOffsetV4
+                && class_count == 256
+                && !frozen_dynamic_class_map_is_identity(&self.class_map))
+        {
             return false;
         }
 
@@ -4328,6 +4340,10 @@ pub(crate) struct NativeDynamicRowsProgramView {
     /// selection. Zero-width `Span` artifacts decline the dynamic-row entry.
     pub(crate) exact_match_width: Option<usize>,
     pub(crate) artifact_identity: [u8; 32],
+    /// Exact immutable byte-boundary class count of the source automaton.
+    /// Frozen normalization may merge columns but cannot split them, so only
+    /// a 256-class source can ever publish byte-ordered direct V4 rows.
+    pub(crate) source_class_count: usize,
     /// Exact match-relative byte class selected from the Thompson graph.
     /// Target lowering may use it only while the authenticated cache is in
     /// its initial row; unsupported shapes retain the scalar row entry.
@@ -5416,6 +5432,10 @@ impl CompiledProgram {
             output: self.output,
             exact_match_width: self.exact_match_width,
             artifact_identity: self.artifact_identity(),
+            source_class_count: dfa_boundary_starts(&self.raw)
+                .iter()
+                .filter(|&&start| start)
+                .count(),
             root_requirement,
         })
     }
@@ -10560,7 +10580,7 @@ impl DfaAlphabetShape {
     }
 }
 
-fn dfa_alphabet_shape(raw: &RawPlan) -> Result<DfaAlphabetShape, ProgramFormatError> {
+fn dfa_boundary_starts(raw: &RawPlan) -> [bool; 256] {
     let mut boundary_starts = [false; 256];
     boundary_starts[0] = true;
     for (edge, &kind) in raw.edge_kinds.iter().enumerate() {
@@ -10571,6 +10591,11 @@ fn dfa_alphabet_shape(raw: &RawPlan) -> Result<DfaAlphabetShape, ProgramFormatEr
             }
         }
     }
+    boundary_starts
+}
+
+fn dfa_alphabet_shape(raw: &RawPlan) -> Result<DfaAlphabetShape, ProgramFormatError> {
+    let boundary_starts = dfa_boundary_starts(raw);
     let boundary_classes = boundary_starts.iter().filter(|&&start| start).count();
     if boundary_classes == 0 {
         return Err(ProgramFormatError::Malformed(
@@ -11443,6 +11468,11 @@ mod tests {
     #[test]
     fn dynamic_native_rows_first_hole_continuation_covers_value_contracts() {
         let raw = scanner_free_branching_pair_raw();
+        let source_class_count = dfa_boundary_starts(&raw)
+            .iter()
+            .filter(|&&start| start)
+            .count();
+        assert!(source_class_count < 256);
         for (output, expected) in [
             (OutputContract::Exists, MatchResult::Exists(true)),
             (
@@ -11460,6 +11490,7 @@ mod tests {
             let view = compiled
                 .native_dynamic_rows_view()
                 .expect("scanner-free resource fallback view");
+            assert_eq!(view.source_class_count, source_class_count);
             assert_eq!(view.root_requirement, None);
             assert_eq!(view.exact_match_width, Some(2));
 
@@ -19357,6 +19388,171 @@ mod tests {
                 None
             );
         }
+    }
+
+    #[test]
+    fn source_boundary_partition_identifies_the_only_direct_byte_candidate() {
+        let singleton_starts = (0_u16..=u16::from(u8::MAX))
+            .step_by(2)
+            .map(|byte| u8::try_from(byte).unwrap())
+            .collect::<Vec<_>>();
+        let singleton_count = singleton_starts.len();
+        let raw = RawPlan {
+            start: 0,
+            roles: vec![StateRole::Consume, StateRole::Accept],
+            edge_offsets: vec![
+                0,
+                u32::try_from(singleton_count).unwrap(),
+                u32::try_from(singleton_count).unwrap(),
+            ],
+            edge_targets: vec![1; singleton_count],
+            edge_kinds: vec![EdgeKind::ByteRange; singleton_count],
+            byte_starts: singleton_starts.clone(),
+            byte_ends: singleton_starts,
+        };
+        assert_eq!(
+            dfa_boundary_starts(&raw)
+                .iter()
+                .filter(|&&start| start)
+                .count(),
+            256,
+            "alternating singleton ranges split every raw byte"
+        );
+
+        let narrow = scanner_free_branching_pair_raw();
+        assert!(
+            dfa_boundary_starts(&narrow)
+                .iter()
+                .filter(|&&start| start)
+                .count()
+                < 256,
+            "ordinary source alphabets cannot publish a direct-byte table"
+        );
+    }
+
+    #[test]
+    fn direct_byte_v4_columns_preserve_raw_byte_semantics_and_require_identity() {
+        let mut source_class_map = [0_u8; 256];
+        for (byte, class) in source_class_map.iter_mut().enumerate() {
+            *class = u8::try_from(255_usize.checked_sub(byte).unwrap()).unwrap();
+        }
+        let state_count = 8_usize;
+        let class_count = 256_usize;
+        let mut source_rows = vec![0_u32; state_count * class_count];
+        for state in 0..state_count {
+            for class in 0..class_count {
+                let token = u32::try_from(state * class_count + 1).unwrap();
+                let accepted = if class & (1 << state) != 0 {
+                    DYNAMIC_NATIVE_ROWS_V1_ACCEPT_MASK
+                } else {
+                    0
+                };
+                source_rows[state * class_count + class] = token | accepted;
+            }
+        }
+        let projection = coalesce_frozen_compact_columns(
+            &source_rows,
+            &source_class_map,
+            class_count,
+            state_count,
+            0,
+        )
+        .expect("complete 256-class projection");
+        assert_eq!(projection.class_count, 256);
+        assert!(frozen_dynamic_class_map_is_identity(&projection.class_map));
+        assert_eq!(projection.source_classes, source_class_map);
+
+        let mut reordered = Vec::with_capacity(source_rows.len());
+        for state in 0..state_count {
+            for &source_class in &projection.source_classes {
+                let semantic = frozen_compact_semantic_cell(
+                    source_rows[state * class_count + usize::from(source_class)],
+                    class_count,
+                    state_count,
+                    0,
+                )
+                .unwrap();
+                let destination = semantic & DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK;
+                let token = if destination == 0 {
+                    0
+                } else {
+                    u16::try_from((usize::from(destination) - 1) * class_count + 1).unwrap()
+                };
+                reordered.push(token | (semantic & DYNAMIC_NATIVE_ROWS_V3_ACCEPT_MASK));
+            }
+        }
+        for state in 0..state_count {
+            for byte in u8::MIN..=u8::MAX {
+                let source_class = usize::from(source_class_map[usize::from(byte)]);
+                let published_class = usize::from(projection.class_map[usize::from(byte)]);
+                let semantic = frozen_compact_semantic_cell(
+                    source_rows[state * class_count + source_class],
+                    class_count,
+                    state_count,
+                    0,
+                )
+                .unwrap();
+                let destination = semantic & DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK;
+                let token = if destination == 0 {
+                    0
+                } else {
+                    u16::try_from((usize::from(destination) - 1) * class_count + 1).unwrap()
+                };
+                assert_eq!(
+                    reordered[state * class_count + published_class],
+                    token | (semantic & DYNAMIC_NATIVE_ROWS_V3_ACCEPT_MASK),
+                    "state={state}, byte={byte}"
+                );
+            }
+        }
+
+        let compiled = program(
+            "ab",
+            OutputContract::Exists,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        let rows = reordered.into_boxed_slice();
+        let descriptor = FrozenDynamicRowsV3 {
+            ready_seal: 0,
+            rows_address: rows.as_ptr().expose_provenance(),
+            cache_identity: 1,
+            state_count: u32::try_from(state_count).unwrap(),
+            class_count: u32::try_from(class_count).unwrap(),
+            row_shift: 0,
+            initial_state: 0,
+            learned_loop_state_count: 0,
+            learned_loop_states: [u32::MAX; 4],
+            format_version: FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION,
+        };
+        let mut storage = FrozenDynamicRowsStorageV3 {
+            program_instance: compiled.identity.instance,
+            artifact_identity: compiled.identity.artifact,
+            rows,
+            class_map: projection.class_map,
+            descriptor,
+        };
+        assert!(storage.descriptor_is_valid_for(compiled.identity));
+        let workspace = compiled.prepare_workspace().unwrap();
+        let header =
+            compiled.compiler_private_frozen_prepared_header_v3(&workspace, None, Some(&storage));
+        assert!(header.has_dynamic_rows());
+        assert_eq!(
+            header.v1.flags,
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V4
+        );
+        assert_eq!(header.v1.row_stride, 256);
+        assert!(frozen_dynamic_class_map_is_identity(&header.v1.class_map));
+        storage.class_map.swap(0, 1);
+        let mut represented = [false; 256];
+        for &class in &storage.class_map {
+            represented[usize::from(class)] = true;
+        }
+        assert!(represented.into_iter().all(|present| present));
+        assert!(
+            !storage.descriptor_is_valid_for(compiled.identity),
+            "a 256-class V4 owner must reject a nonidentity permutation"
+        );
     }
 
     #[test]

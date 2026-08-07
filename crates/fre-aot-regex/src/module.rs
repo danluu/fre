@@ -1956,6 +1956,11 @@ fn lower_native_dynamic_rows_prepared(
     view: NativeDynamicRowsProgramView,
     target: Target,
 ) -> Result<(NativeLowering, PreparedEntryLayout), ObjectError> {
+    if !(1..=256).contains(&view.source_class_count) {
+        return Err(ObjectError::InvalidModule(
+            "dynamic source class count is outside the byte alphabet",
+        ));
+    }
     let exact_span_width = match (view.output, view.exact_match_width) {
         (OutputContract::Exists | OutputContract::SelectedEnd, _) => None,
         (OutputContract::Span, None) => None,
@@ -2049,6 +2054,7 @@ fn lower_native_dynamic_rows_prepared(
                 view.output,
                 exact_span_width,
                 true,
+                view.source_class_count == 256,
             )?
         }
         Architecture::Aarch64 => lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
@@ -2056,6 +2062,7 @@ fn lower_native_dynamic_rows_prepared(
             view.output,
             exact_span_width,
             true,
+            view.source_class_count == 256,
         )?,
     };
     let installed_root = match target.architecture {
@@ -13661,6 +13668,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output(
         output,
         exact_span_width,
         allow_direct_hole_continuation,
+        true,
     )
 }
 
@@ -13676,6 +13684,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     output: OutputContract,
     exact_span_width: Option<u64>,
     allow_direct_hole_continuation: bool,
+    direct_byte_v4_possible: bool,
 ) -> Result<NativeDynamicRowsEmission, ObjectError> {
     const SCANNER_FREE_FRAME_BYTES: u8 = 104;
     const ROOT_SCANNER_FRAME_BYTES: u8 = 120;
@@ -13684,6 +13693,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     const ROOT_SCANNER_OFFSET_ROWS: u8 = 1;
     const ROOT_SCANNER_COMPACT_V3: u8 = 2;
     const ROOT_SCANNER_COMPACT_V4: u8 = 3;
+    const ROOT_SCANNER_COMPACT_V4_DIRECT_BYTE: u8 = 4;
     let tracks_root_scanner_hits = allow_direct_hole_continuation && root_plan.is_some();
     // Every compact entry starts with a nonempty window. Scanner-free entries
     // inherit that proof from the public boundary. Rooted entries inherit it
@@ -13775,6 +13785,9 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     let v4_enter = assembler.label()?;
     let v4_scan = assembler.label()?;
     let v4_table_scan = assembler.label()?;
+    let v4_direct_byte_enter = assembler.label()?;
+    let v4_direct_byte_scan = assembler.label()?;
+    let v4_direct_byte_table_scan = assembler.label()?;
     let v3_enter = assembler.label()?;
     let v3_dispatch = assembler.label()?;
     let mut v3_shift_entries = [0_usize; 9];
@@ -13934,6 +13947,44 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     assembler.instruction(&[0x48, 0x83, 0xc4, frame_bytes])?;
     assembler.instruction(&[0xc3])?;
 
+    let emit_v4_transition_tail =
+        |assembler: &mut X86Assembler, backedge: X86Label| -> Result<(), ObjectError> {
+            assembler.instruction(&[0x48, 0xff, 0xc2])?;
+            if output == OutputContract::Exists {
+                // MOVZX retains the complete cell in R10D. One 16-bit TEST
+                // makes the accept bit SF and the exact dead cell ZF. A
+                // non-accepting live V4 token feeds the biased LEA directly.
+                assembler.instruction(&[0x66, 0x45, 0x85, 0xd2])?;
+                assembler.branch(&[0x0f, 0x88], native_match)?;
+                assembler.branch(
+                    &[0x0f, 0x84],
+                    native_complete.unwrap_or(native_no_match),
+                )?;
+            } else {
+                assembler.instruction(&[0x41, 0xf7, 0xc2, 0x00, 0x80, 0x00, 0x00])?;
+                let not_accepting = assembler.label()?;
+                assembler.branch(&[0x0f, 0x84], not_accepting)?;
+                assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x60])?;
+                assembler.bind(not_accepting)?;
+                assembler.instruction(&[0x41, 0x81, 0xe2, 0xff, 0x7f, 0x00, 0x00])?;
+                assembler.instruction(&[0x45, 0x85, 0xd2])?;
+                assembler.branch(
+                    &[0x0f, 0x84],
+                    native_complete.unwrap_or(native_no_match),
+                )?;
+            }
+            // V4 tokens are one-based destination cell-row offsets. This LEA
+            // performs the complete state update for either column lookup.
+            assembler.instruction(&[0x4e, 0x8d, 0x44, 0x56, 0xfe])?;
+            assembler.instruction(&[0x48, 0x39, 0xca])?;
+            assembler.branch(&[0x0f, 0x82], backedge)?;
+            assembler.branch(
+                &[0xe9],
+                native_complete.unwrap_or(native_no_match),
+            )?;
+            Ok(())
+        };
+
     assembler.bind(v4_enter)?;
     assembler.instruction(&[
         0x49,
@@ -13999,6 +14050,20 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
         )?;
         assembler.bind(class_mapped)?;
     }
+    if direct_byte_v4_possible {
+        assembler.instruction(&[
+            0x41,
+            0x81,
+            0x7b,
+            u8::try_from(FROZEN_DYNAMIC_ROWS_V3_CLASS_COUNT_OFFSET)
+                .map_err(|_| ObjectError::ArithmeticOverflow("x86 V4 class count"))?,
+            0x00,
+            0x01,
+            0x00,
+            0x00,
+        ])?;
+        assembler.branch(&[0x0f, 0x84], v4_direct_byte_enter)?;
+    }
     let class_map_offset = i32::try_from(FROZEN_PREPARED_HEADER_V1_CLASS_MAP_OFFSET)
         .map_err(|_| ObjectError::ArithmeticOverflow("x86 V4 inline class map"))?;
     let mut inline_class_map = vec![0x4c, 0x8d, 0x8f];
@@ -14050,41 +14115,57 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
     assembler.instruction(&[0x47, 0x0f, 0xb6, 0x14, 0x11])?;
     assembler.instruction(&[0x47, 0x0f, 0xb7, 0x14, 0x50])?;
-    assembler.instruction(&[0x48, 0xff, 0xc2])?;
-    if output == OutputContract::Exists {
-        // MOVZX retains the complete cell in R10D. One 16-bit TEST makes the
-        // accept bit SF and the exact dead cell ZF. A non-accepting live V4
-        // token can feed the biased LEA directly, without masking or DEC.
-        assembler.instruction(&[0x66, 0x45, 0x85, 0xd2])?;
-        assembler.branch(&[0x0f, 0x88], native_match)?;
-        assembler.branch(
-            &[0x0f, 0x84],
-            native_complete.unwrap_or(native_no_match),
-        )?;
-    } else {
-        assembler.instruction(&[0x41, 0xf7, 0xc2, 0x00, 0x80, 0x00, 0x00])?;
-        let not_accepting = assembler.label()?;
-        assembler.branch(&[0x0f, 0x84], not_accepting)?;
-        assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x60])?;
-        assembler.bind(not_accepting)?;
-        assembler.instruction(&[0x41, 0x81, 0xe2, 0xff, 0x7f, 0x00, 0x00])?;
-        assembler.instruction(&[0x45, 0x85, 0xd2])?;
-        assembler.branch(
-            &[0x0f, 0x84],
-            native_complete.unwrap_or(native_no_match),
-        )?;
-    }
-    // V4 tokens are one-based destination cell-row offsets. This single LEA
-    // performs the complete state update with no ordinal scaling dispatch.
-    assembler.instruction(&[0x4e, 0x8d, 0x44, 0x56, 0xfe])?;
-    assembler.instruction(&[0x48, 0x39, 0xca])?;
     // Re-enter through root dispatch. For scanner-free entries v4_scan and
     // v4_table_scan are co-located, preserving the established machine bytes.
-    assembler.branch(&[0x0f, 0x82], v4_scan)?;
-    assembler.branch(
-        &[0xe9],
-        native_complete.unwrap_or(native_no_match),
-    )?;
+    emit_v4_transition_tail(&mut assembler, v4_scan)?;
+
+    if direct_byte_v4_possible {
+        assembler.bind(v4_direct_byte_enter)?;
+        // A 256-class V4 owner publishes byte-ordered columns and an identity
+        // map. The row pointer can therefore index the raw haystack byte
+        // directly.
+        assembler.instruction(&[0x49, 0x89, 0xf0])?; // mov rsi, r8
+        if root_setup.is_some() {
+            assembler.instruction(&[
+                0x48,
+                0xc7,
+                0x44,
+                0x24,
+                ROOT_SCANNER_REPRESENTATION_OFFSET,
+                ROOT_SCANNER_COMPACT_V4_DIRECT_BYTE,
+                0,
+                0,
+                0,
+            ])?;
+            assembler.instruction(&[0x4c, 0x89, 0x44, 0x24, 0x50])?;
+        }
+        assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x18])?;
+        assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x40])?;
+        assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x48])?;
+        if let Some(root_setup) = root_setup {
+            assembler.branch(&[0xe9], root_setup)?;
+        } else if output != OutputContract::Exists {
+            assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x60, 0, 0, 0, 0])?;
+        }
+
+        assembler.bind(v4_direct_byte_scan)?;
+        if let Some(root_vector) = root_vector {
+            let non_root = assembler.label()?;
+            assembler.instruction(&[0x4c, 0x3b, 0x44, 0x24, 0x50])?;
+            assembler.branch(&[0x0f, 0x85], non_root)?;
+            if output != OutputContract::Exists {
+                assembler.instruction(&[0x48, 0x83, 0x7c, 0x24, 0x60, 0])?;
+                assembler.branch(&[0x0f, 0x85], non_root)?;
+            }
+            assembler.branch(&[0xe9], root_vector)?;
+            assembler.bind(non_root)?;
+        }
+
+        assembler.bind(v4_direct_byte_table_scan)?;
+        assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
+        assembler.instruction(&[0x47, 0x0f, 0xb7, 0x14, 0x50])?;
+        emit_v4_transition_tail(&mut assembler, v4_direct_byte_scan)?;
+    }
 
     assembler.bind(v3_enter)?;
     if root_plan.is_some() {
@@ -14449,6 +14530,9 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     assembler.branch(&[0xe9], pointer_table_scan)?;
 
     if let Some(root_candidate) = root_candidate {
+        let v4_direct_byte_candidate = direct_byte_v4_possible
+            .then(|| assembler.label())
+            .transpose()?;
         let v4_candidate = assembler.label()?;
         let v3_candidate = assembler.label()?;
         let offset_candidate = assembler.label()?;
@@ -14460,6 +14544,15 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
             0x24,
             ROOT_SCANNER_REPRESENTATION_OFFSET,
         ])?;
+        if let Some(v4_direct_byte_candidate) = v4_direct_byte_candidate {
+            assembler.instruction(&[
+                0x48,
+                0x83,
+                0xf8,
+                ROOT_SCANNER_COMPACT_V4_DIRECT_BYTE,
+            ])?;
+            assembler.branch(&[0x0f, 0x84], v4_direct_byte_candidate)?;
+        }
         assembler.instruction(&[0x48, 0x83, 0xf8, ROOT_SCANNER_COMPACT_V4])?;
         assembler.branch(&[0x0f, 0x84], v4_candidate)?;
         assembler.instruction(&[0x48, 0x83, 0xf8, ROOT_SCANNER_COMPACT_V3])?;
@@ -14477,6 +14570,20 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
         assembler.bind(offset_candidate)?;
         assembler.instruction(&[0x41, 0x8b, 0x43, NATIVE_ROWS_LOOP_COUNT as u8])?;
         assembler.branch(&[0xe9], table_scan)?;
+
+        if let Some(v4_direct_byte_candidate) = v4_direct_byte_candidate {
+            assembler.bind(v4_direct_byte_candidate)?;
+            assembler.instruction(&[
+                0x49,
+                0x8b,
+                0x73,
+                u8::try_from(FROZEN_DYNAMIC_ROWS_V3_ROWS_ADDRESS_OFFSET).map_err(|_| {
+                    ObjectError::ArithmeticOverflow("x86 direct-byte V4 candidate rows")
+                })?,
+            ])?;
+            assembler.instruction(&[0x49, 0x89, 0xf0])?; // canonical V4 row zero
+            assembler.branch(&[0xe9], v4_direct_byte_table_scan)?;
+        }
 
         assembler.bind(v4_candidate)?;
         assembler.instruction(&[
@@ -22013,6 +22120,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output(
         output,
         exact_span_width,
         allow_direct_hole_continuation,
+        true,
     )
 }
 
@@ -22025,6 +22133,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     output: OutputContract,
     exact_span_width: Option<u64>,
     allow_direct_hole_continuation: bool,
+    direct_byte_v4_possible: bool,
 ) -> Result<NativeDynamicRowsEmission, ObjectError> {
     const SCANNER_FREE_FRAME_BYTES: u16 = 96;
     const ROOT_SCANNER_FRAME_BYTES: u16 = 112;
@@ -22033,6 +22142,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     const ROOT_SCANNER_OFFSET_ROWS: u16 = 1;
     const ROOT_SCANNER_COMPACT_V3: u16 = 2;
     const ROOT_SCANNER_COMPACT_V4: u16 = 3;
+    const ROOT_SCANNER_COMPACT_V4_DIRECT_BYTE: u16 = 4;
     let tracks_root_scanner_hits = allow_direct_hole_continuation && root_plan.is_some();
     // Every compact entry starts with a nonempty window. Scanner-free entries
     // inherit that proof from the public boundary. Rooted entries inherit it
@@ -22082,6 +22192,9 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     let v4_enter = assembler.label()?;
     let v4_scan = assembler.label()?;
     let v4_table_scan = assembler.label()?;
+    let v4_direct_byte_enter = assembler.label()?;
+    let v4_direct_byte_scan = assembler.label()?;
+    let v4_direct_byte_table_scan = assembler.label()?;
     let v3_enter = assembler.label()?;
     let v3_dispatch = assembler.label()?;
     let mut v3_shift_entries = [0_usize; 9];
@@ -22255,6 +22368,31 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     assembler.instruction(aarch64_add_x_imm(31, 31, frame_bytes)?)?;
     assembler.instruction(0xd65f_03c0)?;
 
+    let emit_v4_transition_tail =
+        |assembler: &mut Aarch64Assembler, backedge: Aarch64Label| -> Result<(), ObjectError> {
+            if !scanner_free_exists_pointer_cursor {
+                assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
+            }
+            if output == OutputContract::Exists {
+                assembler.branch_bit_set_w(8, 15, native_match)?;
+                // The not-taken accept branch proves bit 15 clear. Test the
+                // original cell for dead and feed a live V4 cell to ADD.
+                assembler.branch_zero_w(8, native_complete.unwrap_or(native_no_match))?;
+            } else {
+                let not_accepting = assembler.label()?;
+                assembler.branch_bit_clear_w(8, 15, not_accepting)?;
+                assembler.instruction(aarch64_store_x(2, 31, 80)?)?;
+                assembler.bind(not_accepting)?;
+                assembler.instruction(aarch64_and_low_w(8, 8, 15)?)?;
+                assembler.branch_zero_w(8, native_complete.unwrap_or(native_no_match))?;
+            }
+            assembler.instruction(aarch64_add_x_uxtw(11, 15, 8, 1)?)?;
+            assembler.instruction(aarch64_cmp_x(2, 3)?)?;
+            assembler.branch_cond(AARCH64_LO, backedge)?;
+            assembler.branch(native_complete.unwrap_or(native_no_match))?;
+            Ok(())
+        };
+
     assembler.bind(v4_enter)?;
     assembler.instruction(aarch64_load_x_imm(
         15,
@@ -22310,6 +22448,16 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
         assembler.branch_cond(AARCH64_LO, singleton_scan)?;
         assembler.branch(native_complete.unwrap_or(native_no_match))?;
         assembler.bind(class_mapped)?;
+    }
+    if direct_byte_v4_possible {
+        assembler.instruction(aarch64_load_w_imm(
+            8,
+            13,
+            u16::try_from(FROZEN_DYNAMIC_ROWS_V3_CLASS_COUNT_OFFSET)
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 V4 class count"))?,
+        )?)?;
+        assembler.instruction(aarch64_cmp_w_imm(8, 256)?)?;
+        assembler.branch_cond(AARCH64_EQ, v4_direct_byte_enter)?;
     }
     // Setup canonicalized the initial row before choosing V4. Preserve its
     // direct pointer before biasing the base for one-based transition tokens.
@@ -22367,28 +22515,66 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     }
     assembler.instruction(aarch64_load_byte_reg(8, 14, 8)?)?;
     assembler.instruction(aarch64_load_h_uxtw(8, 11, 8)?)?;
-    if !scanner_free_exists_pointer_cursor {
-        assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
-    }
-    if output == OutputContract::Exists {
-        assembler.branch_bit_set_w(8, 15, native_match)?;
-        // The not-taken accept branch proves bit 15 clear. Test the original
-        // cell for dead and feed a live V4 cell straight to the biased ADD.
-        assembler.branch_zero_w(8, native_complete.unwrap_or(native_no_match))?;
-    } else {
-        let not_accepting = assembler.label()?;
-        assembler.branch_bit_clear_w(8, 15, not_accepting)?;
-        assembler.instruction(aarch64_store_x(2, 31, 80)?)?;
-        assembler.bind(not_accepting)?;
-        assembler.instruction(aarch64_and_low_w(8, 8, 15)?)?;
-        assembler.branch_zero_w(8, native_complete.unwrap_or(native_no_match))?;
-    }
-    assembler.instruction(aarch64_add_x_uxtw(11, 15, 8, 1)?)?;
-    assembler.instruction(aarch64_cmp_x(2, 3)?)?;
     // Re-enter through root dispatch. For scanner-free entries v4_scan and
     // v4_table_scan are co-located, preserving the established machine words.
-    assembler.branch_cond(AARCH64_LO, v4_scan)?;
-    assembler.branch(native_complete.unwrap_or(native_no_match))?;
+    emit_v4_transition_tail(&mut assembler, v4_scan)?;
+
+    if direct_byte_v4_possible {
+        assembler.bind(v4_direct_byte_enter)?;
+        // The owner reordered every 256-class V4 row into raw-byte order, so
+        // this path deliberately leaves X14 free and indexes the u16 row with
+        // the byte.
+        assembler.instruction(aarch64_mov_x(11, 15)?)?;
+        assembler.instruction(aarch64_sub_x_imm(15, 15, 2)?)?;
+        assembler.instruction(aarch64_mov_x(1, 11)?)?;
+        if root_plan.is_some() {
+            assembler.instruction(aarch64_movz_x(
+                8,
+                ROOT_SCANNER_COMPACT_V4_DIRECT_BYTE,
+                0,
+            )?)?;
+            assembler.instruction(aarch64_store_x(
+                8,
+                31,
+                ROOT_SCANNER_REPRESENTATION_OFFSET,
+            )?)?;
+        }
+        assembler.instruction(aarch64_load_x_imm(0, 31, 8)?)?;
+        assembler.instruction(aarch64_load_x_imm(2, 31, 48)?)?;
+        assembler.instruction(aarch64_load_x_imm(3, 31, 56)?)?;
+        if scanner_free_exists_pointer_cursor {
+            assembler.instruction(aarch64_add_x_reg(2, 0, 2)?)?;
+            assembler.instruction(aarch64_add_x_reg(3, 0, 3)?)?;
+        }
+        if let Some(root_setup) = root_setup {
+            assembler.branch(root_setup)?;
+        } else if output != OutputContract::Exists {
+            assembler.instruction(aarch64_store_x(31, 31, 80)?)?;
+        }
+
+        assembler.bind(v4_direct_byte_scan)?;
+        if let Some(root_dispatch) = root_dispatch {
+            let non_root = assembler.label()?;
+            assembler.instruction(aarch64_cmp_x(11, 1)?)?;
+            assembler.branch_cond(AARCH64_NE, non_root)?;
+            if output != OutputContract::Exists {
+                assembler.instruction(aarch64_load_x_imm(12, 31, 80)?)?;
+                assembler.instruction(aarch64_cmp_x_imm(12, 0)?)?;
+                assembler.branch_cond(AARCH64_NE, non_root)?;
+            }
+            assembler.branch(root_dispatch)?;
+            assembler.bind(non_root)?;
+        }
+
+        assembler.bind(v4_direct_byte_table_scan)?;
+        if scanner_free_exists_pointer_cursor {
+            assembler.instruction(aarch64_load_byte_post_imm(8, 2, 1)?)?;
+        } else {
+            assembler.instruction(aarch64_load_byte_reg(8, 0, 2)?)?;
+        }
+        assembler.instruction(aarch64_load_h_uxtw(8, 11, 8)?)?;
+        emit_v4_transition_tail(&mut assembler, v4_direct_byte_scan)?;
+    }
 
     assembler.bind(v3_enter)?;
     if root_plan.is_some() {
@@ -22758,6 +22944,9 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     assembler.branch(pointer_table_scan)?;
 
     if let Some(root_candidate) = root_candidate {
+        let v4_direct_byte_candidate = direct_byte_v4_possible
+            .then(|| assembler.label())
+            .transpose()?;
         let v4_candidate = assembler.label()?;
         let v3_candidate = assembler.label()?;
         let offset_candidate = assembler.label()?;
@@ -22767,6 +22956,13 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
             31,
             ROOT_SCANNER_REPRESENTATION_OFFSET,
         )?)?;
+        if let Some(v4_direct_byte_candidate) = v4_direct_byte_candidate {
+            assembler.instruction(aarch64_cmp_x_imm(
+                8,
+                ROOT_SCANNER_COMPACT_V4_DIRECT_BYTE,
+            )?)?;
+            assembler.branch_cond(AARCH64_EQ, v4_direct_byte_candidate)?;
+        }
         assembler.instruction(aarch64_cmp_x_imm(8, ROOT_SCANNER_COMPACT_V4)?)?;
         assembler.branch_cond(AARCH64_EQ, v4_candidate)?;
         assembler.instruction(aarch64_cmp_x_imm(8, ROOT_SCANNER_COMPACT_V3)?)?;
@@ -22788,6 +22984,20 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
                 .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic loop count"))?,
         )?)?;
         assembler.branch(table_scan)?;
+
+        if let Some(v4_direct_byte_candidate) = v4_direct_byte_candidate {
+            assembler.bind(v4_direct_byte_candidate)?;
+            assembler.instruction(aarch64_load_x_imm(
+                15,
+                13,
+                u16::try_from(FROZEN_DYNAMIC_ROWS_V3_ROWS_ADDRESS_OFFSET).map_err(|_| {
+                    ObjectError::ArithmeticOverflow("AArch64 direct-byte V4 candidate rows")
+                })?,
+            )?)?;
+            assembler.instruction(aarch64_mov_x(11, 15)?)?;
+            assembler.instruction(aarch64_sub_x_imm(15, 15, 2)?)?;
+            assembler.branch(v4_direct_byte_table_scan)?;
+        }
 
         assembler.bind(v4_candidate)?;
         assembler.instruction(aarch64_load_x_imm(8, 31, 0)?)?;
@@ -28228,8 +28438,8 @@ mod tests {
 
             assert_eq!(
                 occurrences(code, &[0x47, 0x0f, 0xb7, 0x14, 0x50]),
-                10,
-                "the {accelerator:?} scanner must feed V4 and every V3 row shift"
+                11,
+                "the {accelerator:?} scanner must feed both V4 loops and every V3 row shift"
             );
             assert_eq!(
                 x86_v3_root_zero_test_body_count(code),
@@ -28238,13 +28448,13 @@ mod tests {
             );
             assert_eq!(
                 occurrences(code, &[0x49, 0x89, 0xf0]),
-                11,
-                "V4 entry/candidate and all V3 shifts must install canonical row zero"
+                13,
+                "both V4 entries/candidates and all V3 shifts must install canonical row zero"
             );
             assert_eq!(
                 occurrences(code, &[0x4e, 0x8d, 0x44, 0x56, 0xfe]),
-                1,
-                "V4 transitions must retain one direct cell-offset backedge"
+                2,
+                "both V4 transitions must retain direct cell-offset backedges"
             );
             let candidate_prefix = [
                 0x48,
@@ -28255,12 +28465,12 @@ mod tests {
                 0x48,
                 0x83,
                 0xf8,
-                0x03,
+                0x04,
             ];
             let candidate = code
                 .windows(candidate_prefix.len())
                 .position(|bytes| bytes == candidate_prefix)
-                .expect("tagged pointer/offset/V3/V4 scanner candidate dispatcher");
+                .expect("tagged pointer/offset/V3/V4/direct-byte scanner candidate dispatcher");
             // The assembler may invert the scalar membership diamond, making
             // its hit edge conditional, while the vector hit remains an
             // unconditional jump. Restrict the audit to the scanner bodies,
@@ -28794,6 +29004,7 @@ mod tests {
                     output,
                     width,
                     false,
+                    true,
                 )
                 .unwrap();
                 let scanner = emission.scanner.expect("x86 exact scanner receipt");
@@ -28807,8 +29018,8 @@ mod tests {
                         .windows(5)
                         .filter(|bytes| *bytes == [0x47, 0x0f, 0xb7, 0x14, 0x50])
                         .count(),
-                    10,
-                    "exact {accelerator:?} scanner must feed V4 and every V3 row shift"
+                    11,
+                    "exact {accelerator:?} scanner must feed both V4 loops and every V3 row shift"
                 );
                 assert_eq!(
                     x86_v3_root_zero_test_body_count(&emission.code),
@@ -28862,6 +29073,7 @@ mod tests {
             FeatureSet::EMPTY,
             OutputContract::Exists,
             None,
+            true,
             true,
         )
         .unwrap();
@@ -28994,6 +29206,7 @@ mod tests {
                     output,
                     width,
                     false,
+                    true,
                 )
                 .unwrap();
                 assert_eq!(emission.scanner, Some(installed.scanner));
@@ -29015,15 +29228,15 @@ mod tests {
                         .iter()
                         .filter(|&&word| word == aarch64_load_h_uxtw(8, 11, 8).unwrap())
                         .count(),
-                    1,
-                    "{target:?}/{output:?} scanner must feed direct V4 rows"
+                    2,
+                    "{target:?}/{output:?} scanner must feed generic and direct-byte V4 rows"
                 );
                 assert_eq!(
                     words
                         .iter()
                         .filter(|&&word| word == aarch64_mov_x(11, 15).unwrap())
                         .count(),
-                    11,
+                    13,
                     "{target:?}/{output:?} compact entries must install canonical row zero"
                 );
                 assert_eq!(
@@ -29031,8 +29244,8 @@ mod tests {
                         .iter()
                         .filter(|&&word| word == aarch64_add_x_uxtw(11, 15, 8, 1).unwrap())
                         .count(),
-                    1,
-                    "{target:?}/{output:?} V4 needs one direct cell-offset backedge"
+                    2,
+                    "{target:?}/{output:?} both V4 loops need direct cell-offset backedges"
                 );
                 assert_eq!(
                     aarch64_v3_root_zero_test_body_count(&words, output),
@@ -29072,12 +29285,12 @@ mod tests {
                 );
                 let candidate_prefix = [
                     aarch64_load_x_imm(8, 31, 88).unwrap(),
-                    aarch64_cmp_x_imm(8, 3).unwrap(),
+                    aarch64_cmp_x_imm(8, 4).unwrap(),
                 ];
                 let candidate = words
                     .windows(candidate_prefix.len())
                     .position(|window| window == candidate_prefix)
-                    .expect("tagged AArch64 pointer/offset/V3/V4 scanner candidate dispatcher");
+                    .expect("tagged AArch64 pointer/offset/V3/V4/direct-byte candidate dispatcher");
                 assert!(
                     (0..words.len())
                         .filter_map(|index| unconditional_target(&words, index))
@@ -29095,24 +29308,44 @@ mod tests {
                             ]
                     })
                     .expect("canonical V2 table transition");
-                let v4_candidate = conditional_target(
+                let direct_v4_candidate = conditional_target(
                     &words,
                     candidate + candidate_prefix.len(),
                 )
-                .expect("tagged V4 candidate edge");
+                .expect("tagged direct-byte V4 candidate edge");
+                assert_eq!(
+                    words[direct_v4_candidate],
+                    aarch64_load_x_imm(
+                        15,
+                        13,
+                        u16::try_from(FROZEN_DYNAMIC_ROWS_V3_ROWS_ADDRESS_OFFSET).unwrap(),
+                    )
+                    .unwrap(),
+                    "direct-byte V4 selection must restore its rows"
+                );
+                assert_eq!(
+                    words[candidate + candidate_prefix.len() + 1],
+                    aarch64_cmp_x_imm(8, 3).unwrap(),
+                    "direct-byte V4 fallthrough must select the mapped V4 tag"
+                );
+                let v4_candidate = conditional_target(
+                    &words,
+                    candidate + candidate_prefix.len() + 2,
+                )
+                .expect("tagged mapped V4 candidate edge");
                 assert_eq!(
                     words[v4_candidate],
                     aarch64_load_x_imm(8, 31, 0).unwrap(),
                     "V4 selection must restore its header representation"
                 );
                 assert_eq!(
-                    words[candidate + candidate_prefix.len() + 1],
+                    words[candidate + candidate_prefix.len() + 3],
                     aarch64_cmp_x_imm(8, 2).unwrap(),
                     "V4 fallthrough must select the exact V3 tag"
                 );
                 let v3_candidate = conditional_target(
                     &words,
-                    candidate + candidate_prefix.len() + 2,
+                    candidate + candidate_prefix.len() + 4,
                 )
                 .expect("tagged V3 candidate edge");
                 assert_eq!(
@@ -29212,6 +29445,7 @@ mod tests {
                 Some(Aarch64DynamicScannerPlan::Exact(installed)),
                 OutputContract::Exists,
                 None,
+                true,
                 true,
             )
             .unwrap();
@@ -29590,8 +29824,8 @@ mod tests {
                 );
                 assert_eq!(
                     byte_occurrences(&code, &[0x48, 0x89, 0x54, 0x24, 0x60]),
-                    12,
-                    "offset, pointer, V4, and nine V3 loops each publish an accepting endpoint"
+                    13,
+                    "offset, pointer, both V4 loops, and nine V3 loops each publish an accepting endpoint"
                 );
                 assert_eq!(
                     byte_occurrences(&code, &[0x4c, 0x8b, 0x5c, 0x24, 0x60]),
@@ -29646,7 +29880,7 @@ mod tests {
                     .collect::<Vec<_>>();
                 for (instruction, expected, detail) in [
                     (aarch64_store_x(31, 31, 80).unwrap(), 1, "pending initialization"),
-                    (aarch64_store_x(2, 31, 80).unwrap(), 12, "pending update"),
+                    (aarch64_store_x(2, 31, 80).unwrap(), 13, "pending update"),
                     (aarch64_load_x_imm(7, 31, 80).unwrap(), 1, "pending completion"),
                 ] {
                     assert_eq!(
@@ -37834,8 +38068,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             let bounds = x86_bound_pairs(code, 0x82, true);
             assert_eq!(
                 bounds.len(),
-                10,
-                "{context}: rooted V4 plus all nine V3 shifts need conditional backedges"
+                11,
+                "{context}: both rooted V4 loops plus all nine V3 shifts need conditional backedges"
             );
             for &(compare, target) in &bounds {
                 assert_ne!(
@@ -37859,42 +38093,57 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             }
 
             let v4_update_bytes = [0x4e, 0x8d, 0x44, 0x56, 0xfe];
-            let v4_update = code
+            let v4_updates = code
                 .windows(v4_update_bytes.len())
-                .position(|window| window == v4_update_bytes)
-                .expect("rooted x86 V4 cell-offset update");
-            let v4_compare = v4_update + v4_update_bytes.len();
-            assert_eq!(
-                &code[v4_compare..v4_compare + compare_bytes.len()],
-                compare_bytes.as_slice(),
-                "{context}: V4 update must be followed by its bottom bound"
-            );
-            assert_eq!(
-                x86_test_normalized_branch_opcode(code, v4_compare + compare_bytes.len()),
-                Some(0x82),
-                "{context}: V4 bottom bound must be position < end"
-            );
-            let (v4_scan, _) = x86_test_branch_target(
-                code,
-                v4_compare + compare_bytes.len(),
-            )
-            .expect("rooted x86 V4 bottom backedge");
+                .enumerate()
+                .filter_map(|(offset, window)| (window == v4_update_bytes).then_some(offset))
+                .collect::<Vec<_>>();
+            assert_eq!(v4_updates.len(), 2, "{context}: exact rooted V4 loop count");
             let root_compare = [0x4c, 0x3b, 0x44, 0x24, 0x50];
-            assert_eq!(
-                &code[v4_scan..v4_scan + root_compare.len()],
-                root_compare.as_slice(),
-                "{context}: V4 backedge must reach compact root dispatch"
-            );
-            let table_load = [0x44, 0x0f, 0xb6, 0x14, 0x17];
-            let v4_table_scan = v4_scan
-                + code[v4_scan..v4_update]
-                    .windows(table_load.len())
-                    .position(|window| window == table_load)
-                    .expect("rooted x86 V4 table body");
-            assert!(
-                v4_scan < v4_table_scan,
-                "{context}: root dispatch must precede the V4 table body"
-            );
+            let raw_load = [0x44, 0x0f, 0xb6, 0x14, 0x17];
+            let map_load = [0x47, 0x0f, 0xb6, 0x14, 0x11];
+            let cell_load = [0x47, 0x0f, 0xb7, 0x14, 0x50];
+            let mut mapped = 0_usize;
+            let mut direct = 0_usize;
+            for v4_update in v4_updates {
+                let v4_compare = v4_update + v4_update_bytes.len();
+                assert_eq!(
+                    &code[v4_compare..v4_compare + compare_bytes.len()],
+                    compare_bytes.as_slice(),
+                    "{context}: V4 update must be followed by its bottom bound"
+                );
+                assert_eq!(
+                    x86_test_normalized_branch_opcode(code, v4_compare + compare_bytes.len()),
+                    Some(0x82),
+                    "{context}: V4 bottom bound must be position < end"
+                );
+                let (v4_scan, _) = x86_test_branch_target(
+                    code,
+                    v4_compare + compare_bytes.len(),
+                )
+                .expect("rooted x86 V4 bottom backedge");
+                assert_eq!(
+                    &code[v4_scan..v4_scan + root_compare.len()],
+                    root_compare.as_slice(),
+                    "{context}: V4 backedge must reach compact root dispatch"
+                );
+                let body = &code[v4_scan..v4_update];
+                let raw = body
+                    .windows(raw_load.len())
+                    .position(|window| window == raw_load)
+                    .expect("rooted x86 V4 raw-byte load");
+                let after_raw = raw + raw_load.len();
+                if body[after_raw..].starts_with(&map_load) {
+                    let after_map = after_raw + map_load.len();
+                    assert!(body[after_map..].starts_with(&cell_load));
+                    mapped += 1;
+                } else {
+                    assert!(body[after_raw..].starts_with(&cell_load));
+                    direct += 1;
+                }
+            }
+            assert_eq!(mapped, 1, "{context}: exact mapped V4 loop count");
+            assert_eq!(direct, 1, "{context}: exact direct-byte V4 loop count");
         }
 
         fn assert_rooted_aarch64_compact_bounds(words: &[u32], context: &str) {
@@ -37902,8 +38151,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             let bounds = aarch64_bound_pairs(words, AARCH64_LO, true);
             assert_eq!(
                 bounds.len(),
-                10,
-                "{context}: rooted V4 plus all nine V3 shifts need conditional backedges"
+                11,
+                "{context}: both rooted V4 loops plus all nine V3 shifts need conditional backedges"
             );
             for &(compare_index, target) in &bounds {
                 assert_ne!(
@@ -37921,36 +38170,50 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             }
 
             let v4_update_word = aarch64_add_x_uxtw(11, 15, 8, 1).unwrap();
-            let v4_update = words
+            let v4_updates = words
                 .iter()
-                .position(|&word| word == v4_update_word)
-                .expect("rooted AArch64 V4 cell-offset update");
-            assert_eq!(
-                words[v4_update + 1],
-                compare,
-                "{context}: V4 update must be followed by its bottom bound"
-            );
-            assert_eq!(
-                words[v4_update + 2] & 0xff00_001f,
-                0x5400_0000 | u32::from(AARCH64_LO),
-                "{context}: V4 bottom bound must be position < end"
-            );
-            let v4_scan = aarch64_conditional_branch_target(words, v4_update + 2)
-                .expect("rooted AArch64 V4 bottom backedge");
-            assert_eq!(
-                words[v4_scan],
-                aarch64_cmp_x(11, 1).unwrap(),
-                "{context}: V4 backedge must reach compact root dispatch"
-            );
-            let v4_table_scan = v4_scan
-                + words[v4_scan..v4_update]
+                .enumerate()
+                .filter_map(|(index, &word)| (word == v4_update_word).then_some(index))
+                .collect::<Vec<_>>();
+            assert_eq!(v4_updates.len(), 2, "{context}: exact rooted V4 loop count");
+            let raw_load = aarch64_load_byte_reg(8, 0, 2).unwrap();
+            let map_load = aarch64_load_byte_reg(8, 14, 8).unwrap();
+            let cell_load = aarch64_load_h_uxtw(8, 11, 8).unwrap();
+            let mut mapped = 0_usize;
+            let mut direct = 0_usize;
+            for v4_update in v4_updates {
+                assert_eq!(
+                    words[v4_update + 1],
+                    compare,
+                    "{context}: V4 update must be followed by its bottom bound"
+                );
+                assert_eq!(
+                    words[v4_update + 2] & 0xff00_001f,
+                    0x5400_0000 | u32::from(AARCH64_LO),
+                    "{context}: V4 bottom bound must be position < end"
+                );
+                let v4_scan = aarch64_conditional_branch_target(words, v4_update + 2)
+                    .expect("rooted AArch64 V4 bottom backedge");
+                assert_eq!(
+                    words[v4_scan],
+                    aarch64_cmp_x(11, 1).unwrap(),
+                    "{context}: V4 backedge must reach compact root dispatch"
+                );
+                let body = &words[v4_scan..v4_update];
+                let raw = body
                     .iter()
-                    .position(|&word| word == aarch64_load_byte_reg(8, 0, 2).unwrap())
-                    .expect("rooted AArch64 V4 table body");
-            assert!(
-                v4_scan < v4_table_scan,
-                "{context}: root dispatch must precede the V4 table body"
-            );
+                    .position(|&word| word == raw_load)
+                    .expect("rooted AArch64 V4 raw-byte load");
+                if body.get(raw + 1) == Some(&map_load) {
+                    assert_eq!(body.get(raw + 2), Some(&cell_load));
+                    mapped += 1;
+                } else {
+                    assert_eq!(body.get(raw + 1), Some(&cell_load));
+                    direct += 1;
+                }
+            }
+            assert_eq!(mapped, 1, "{context}: exact mapped V4 loop count");
+            assert_eq!(direct, 1, "{context}: exact direct-byte V4 loop count");
         }
 
         let v4_postindexed = aarch64_load_byte_post_imm(8, 2, 1).unwrap();
@@ -37962,6 +38225,10 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             aarch64_load_byte_reg(8, 14, 8).unwrap(),
             aarch64_load_h_uxtw(8, 11, 8).unwrap(),
         ];
+        let v4_direct_postindexed_body = [
+            v4_postindexed,
+            aarch64_load_h_uxtw(8, 11, 8).unwrap(),
+        ];
         let v3_postindexed_body = [
             v3_postindexed,
             aarch64_load_byte_reg(6, 14, 6).unwrap(),
@@ -37970,6 +38237,10 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
         let v4_indexed_body = [
             v4_indexed,
             aarch64_load_byte_reg(8, 14, 8).unwrap(),
+            aarch64_load_h_uxtw(8, 11, 8).unwrap(),
+        ];
+        let v4_direct_indexed_body = [
+            v4_indexed,
             aarch64_load_h_uxtw(8, 11, 8).unwrap(),
         ];
         let v3_indexed_body = [
@@ -37997,8 +38268,31 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             .unwrap();
             assert_eq!(
                 x86_bound_tests(&x86.code, 0x82, true),
-                11,
-                "x86 singleton/general V4 plus all nine V3 shifts need one conditional backedge for {output:?}"
+                12,
+                "x86 singleton, mapped/direct V4, and all nine V3 shifts need one conditional backedge for {output:?}"
+            );
+            let x86_mapped_v4 = [
+                0x44, 0x0f, 0xb6, 0x14, 0x17, 0x47, 0x0f, 0xb6, 0x14, 0x11, 0x47, 0x0f,
+                0xb7, 0x14, 0x50,
+            ];
+            let x86_direct_v4 = [
+                0x44, 0x0f, 0xb6, 0x14, 0x17, 0x47, 0x0f, 0xb7, 0x14, 0x50,
+            ];
+            assert_eq!(
+                x86.code
+                    .windows(x86_mapped_v4.len())
+                    .filter(|window| *window == x86_mapped_v4)
+                    .count(),
+                10,
+                "x86 mapped V4 and nine V3 bodies for {output:?}"
+            );
+            assert_eq!(
+                x86.code
+                    .windows(x86_direct_v4.len())
+                    .filter(|window| *window == x86_direct_v4)
+                    .count(),
+                1,
+                "x86 direct-byte V4 body for {output:?}"
             );
 
             let arm = lower_aarch64_dynamic_rows_prepared_for_output(
@@ -38010,8 +38304,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             .unwrap();
             assert_eq!(
                 aarch64_bound_tests(&arm.code, AARCH64_LO, true),
-                11,
-                "AArch64 singleton/general V4 plus all nine V3 shifts need one conditional backedge for {output:?}"
+                12,
+                "AArch64 singleton, mapped/direct V4, and all nine V3 shifts need one conditional backedge for {output:?}"
             );
             let words = aarch64_words(&arm.code);
             let setup_count = words
@@ -38023,6 +38317,13 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                     words
                         .windows(3)
                         .filter(|body| *body == v4_postindexed_body)
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    words
+                        .windows(2)
+                        .filter(|body| *body == v4_direct_postindexed_body)
                         .count(),
                     1
                 );
@@ -38042,20 +38343,34 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 );
                 assert_eq!(
                     words
+                        .windows(2)
+                        .filter(|body| *body == v4_direct_indexed_body)
+                        .count(),
+                    0
+                );
+                assert_eq!(
+                    words
                         .windows(3)
                         .filter(|body| *body == v3_indexed_body)
                         .count(),
                     0
                 );
                 assert_eq!(
-                    setup_count, 3,
-                    "singleton V4, general V4, and V3 convert their selected cursors exactly once"
+                    setup_count, 4,
+                    "singleton, mapped/direct V4, and V3 convert their selected cursors exactly once"
                 );
             } else {
                 assert_eq!(
                     words
                         .windows(3)
                         .filter(|body| *body == v4_postindexed_body)
+                        .count(),
+                    0
+                );
+                assert_eq!(
+                    words
+                        .windows(2)
+                        .filter(|body| *body == v4_direct_postindexed_body)
                         .count(),
                     0
                 );
@@ -38070,6 +38385,13 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                     words
                         .windows(3)
                         .filter(|body| *body == v4_indexed_body)
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    words
+                        .windows(2)
+                        .filter(|body| *body == v4_direct_indexed_body)
                         .count(),
                     1
                 );
@@ -38467,6 +38789,161 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
     }
 
     #[test]
+    fn direct_byte_v4_codegen_requires_a_256_class_source_partition() {
+        fn byte_occurrences(code: &[u8], needle: &[u8]) -> usize {
+            code.windows(needle.len())
+                .filter(|window| *window == needle)
+                .count()
+        }
+
+        fn word_occurrences(words: &[u32], needle: &[u32]) -> usize {
+            words
+                .windows(needle.len())
+                .filter(|window| *window == needle)
+                .count()
+        }
+
+        let filter = dynamic_root_test_filter(b"a", 0);
+        let x86_gate = [
+            0x41,
+            0x81,
+            0x7b,
+            u8::try_from(FROZEN_DYNAMIC_ROWS_V3_CLASS_COUNT_OFFSET).unwrap(),
+            0x00,
+            0x01,
+            0x00,
+            0x00,
+        ];
+        let x86_mapped_body = [
+            0x44, 0x0f, 0xb6, 0x14, 0x17, 0x47, 0x0f, 0xb6, 0x14, 0x11, 0x47, 0x0f, 0xb7, 0x14,
+            0x50,
+        ];
+        let x86_direct_body = [0x44, 0x0f, 0xb6, 0x14, 0x17, 0x47, 0x0f, 0xb7, 0x14, 0x50];
+        for (context, root) in [
+            ("scanner-free", None),
+            ("rooted", Some(X86DynamicRootPlan::Range(filter))),
+        ] {
+            let without = lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
+                root,
+                FeatureSet::EMPTY,
+                OutputContract::Exists,
+                None,
+                true,
+                false,
+            )
+            .unwrap();
+            let with = lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
+                root,
+                FeatureSet::EMPTY,
+                OutputContract::Exists,
+                None,
+                true,
+                true,
+            )
+            .unwrap();
+            assert!(without.code.len() < with.code.len(), "x86 {context}");
+            for (emission, direct_count, gate_count) in [(&without, 0, 0), (&with, 1, 1)] {
+                assert_eq!(
+                    byte_occurrences(&emission.code, &x86_gate),
+                    gate_count,
+                    "x86 {context}: C=256 descriptor gate"
+                );
+                assert_eq!(
+                    byte_occurrences(&emission.code, &x86_direct_body),
+                    direct_count,
+                    "x86 {context}: raw-byte direct body"
+                );
+                assert_eq!(
+                    byte_occurrences(&emission.code, &x86_mapped_body),
+                    10,
+                    "x86 {context}: mapped V4 and V3 bodies"
+                );
+                assert_eq!(
+                    byte_occurrences(&emission.code, &[0x48, 0x83, 0xf8, 0x04]),
+                    if root.is_some() { direct_count } else { 0 },
+                    "x86 {context}: direct-byte root representation"
+                );
+            }
+        }
+
+        let arm_gate = [
+            aarch64_load_w_imm(
+                8,
+                13,
+                u16::try_from(FROZEN_DYNAMIC_ROWS_V3_CLASS_COUNT_OFFSET).unwrap(),
+            )
+            .unwrap(),
+            aarch64_cmp_w_imm(8, 256).unwrap(),
+        ];
+        let mut data = vec![0_u8; 32];
+        let rooted =
+            install_aarch64_dynamic_root_plan(&mut data, 0, filter, Target::aarch64_linux())
+                .unwrap();
+        for (context, root) in [
+            ("scanner-free", None),
+            ("rooted", Some(Aarch64DynamicScannerPlan::Range(rooted))),
+        ] {
+            let without = lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
+                root,
+                OutputContract::Exists,
+                None,
+                true,
+                false,
+            )
+            .unwrap();
+            let with = lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
+                root,
+                OutputContract::Exists,
+                None,
+                true,
+                true,
+            )
+            .unwrap();
+            assert!(without.code.len() < with.code.len(), "AArch64 {context}");
+            let raw_load = if root.is_some() {
+                aarch64_load_byte_reg(8, 0, 2).unwrap()
+            } else {
+                aarch64_load_byte_post_imm(8, 2, 1).unwrap()
+            };
+            let mapped_body = [
+                raw_load,
+                aarch64_load_byte_reg(8, 14, 8).unwrap(),
+                aarch64_load_h_uxtw(8, 11, 8).unwrap(),
+            ];
+            let direct_body = [raw_load, aarch64_load_h_uxtw(8, 11, 8).unwrap()];
+            for (emission, direct_count, gate_count) in [(&without, 0, 0), (&with, 1, 1)] {
+                let words = emission
+                    .code
+                    .chunks_exact(4)
+                    .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    word_occurrences(&words, &arm_gate),
+                    gate_count,
+                    "AArch64 {context}: C=256 descriptor gate"
+                );
+                assert_eq!(
+                    word_occurrences(&words, &direct_body),
+                    direct_count,
+                    "AArch64 {context}: raw-byte direct body"
+                );
+                assert_eq!(
+                    word_occurrences(&words, &mapped_body),
+                    1,
+                    "AArch64 {context}: mapped V4 body"
+                );
+                assert_eq!(
+                    words
+                        .iter()
+                        .filter(|&&word| word == aarch64_cmp_x_imm(8, 4).unwrap())
+                        .count(),
+                    if root.is_some() { direct_count } else { 0 },
+                    "AArch64 {context}: direct-byte root representation"
+                );
+            }
+        }
+    }
+    #[test]
     fn frozen_dynamic_stride_arithmetic_has_exact_cross_isa_encodings() {
         assert_eq!(aarch64_udiv_x(11, 10, 8).unwrap(), 0x9ac8_094b);
         assert_eq!(aarch64_msub_x(12, 11, 8, 10).unwrap(), 0x9b08_a96c);
@@ -38789,8 +39266,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
         let x86 = lower_x86_64_dynamic_rows_prepared(None, FeatureSet::EMPTY).unwrap();
         assert_eq!(
             occurrences(&x86.code, &[0x47, 0x0f, 0xb7, 0x14, 0x50]),
-            10,
-            "V4 plus every authenticated V3 byte-row shift needs one scaled u16 cell load"
+            11,
+            "both V4 loops plus every authenticated V3 byte-row shift need scaled u16 cell loads"
         );
         assert_eq!(
             occurrences(&x86.code, &[0x4e, 0x8d, 0x04, 0x16]),
@@ -38799,8 +39276,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
         );
         assert_eq!(
             occurrences(&x86.code, &[0x49, 0x89, 0xf0]),
-            11,
-            "singleton/general V4 and every V3 entry install canonical row zero directly"
+            12,
+            "singleton, mapped/direct V4, and every V3 entry install canonical row zero directly"
         );
         assert_eq!(
             occurrences(&x86.code, &[0x4e, 0x8d, 0x04, 0x46]),
@@ -38809,8 +39286,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
         );
         assert_eq!(
             occurrences(&x86.code, &[0x4e, 0x8d, 0x44, 0x56, 0xfe]),
-            2,
-            "singleton and class-mapped V4 need direct rows+token*2-2 backedges"
+            3,
+            "singleton and mapped/direct V4 need direct rows+token*2-2 backedges"
         );
         let mut v2_flag = vec![
             0x81,
@@ -39244,15 +39721,15 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 .iter()
                 .filter(|&&word| word == aarch64_load_h_uxtw(8, 11, 8).unwrap())
                 .count(),
-            1
+            2
         );
         assert_eq!(
             arm_words
                 .iter()
                 .filter(|&&word| word == aarch64_add_x_uxtw(11, 15, 8, 1).unwrap())
                 .count(),
-            2,
-            "singleton and class-mapped V4 need biased-base cell-offset backedges"
+            3,
+            "singleton and mapped/direct V4 need biased-base cell-offset backedges"
         );
         assert_eq!(
             arm_words
@@ -39277,8 +39754,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 .iter()
                 .filter(|&&word| word == aarch64_mov_x(11, 15).unwrap())
                 .count(),
-            11,
-            "singleton/general V4 and every V3 entry install canonical row zero directly"
+            12,
+            "singleton, mapped/direct V4, and every V3 entry install canonical row zero directly"
         );
         assert!(arm_words.contains(
             &aarch64_add_x_imm(
@@ -39546,11 +40023,11 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 (v3, v4)
             };
             assert_eq!(v3_decoders, 9, "{context}: exact V3 decoder count");
-            assert_eq!(v4_decoders, 1, "{context}: exact V4 decoder count");
+            assert_eq!(v4_decoders, 2, "{context}: exact V4 decoder count");
             assert_eq!(
                 v3_decoders + v4_decoders,
-                10,
-                "{context}: V4 plus nine V3 loops need ten compact decoders"
+                11,
+                "{context}: two V4 plus nine V3 loops need eleven compact decoders"
             );
             assert_eq!(
                 code.windows(FORMER_MAX_COMPARE.len())
@@ -39673,11 +40150,11 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 v3_decoders, 9,
                 "{context}: every immediate-shift V3 loop needs its exact decoder"
             );
-            assert_eq!(v4_decoders, 1, "{context}: V4 needs one exact decoder");
+            assert_eq!(v4_decoders, 2, "{context}: V4 needs two exact decoders");
             assert_eq!(
                 v3_decoders + v4_decoders,
-                10,
-                "{context}: V4 plus nine V3 loops need ten compact decoders"
+                11,
+                "{context}: two V4 plus nine V3 loops need eleven compact decoders"
             );
 
             let v1_mask = aarch64_and_low_w(8, 8, 29).unwrap();
