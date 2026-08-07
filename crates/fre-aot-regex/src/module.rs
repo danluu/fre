@@ -15792,6 +15792,7 @@ fn aarch64_and_w(destination: u8, left: u8, right: u8) -> Result<u32, ObjectErro
     )
 }
 
+#[cfg(test)]
 fn aarch64_tst_w(left: u8, right: u8) -> Result<u32, ObjectError> {
     Ok(0x6a00_001f | aarch64_reg(right, 16)? | aarch64_reg(left, 5)?)
 }
