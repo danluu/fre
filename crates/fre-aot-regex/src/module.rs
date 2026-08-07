@@ -36304,8 +36304,8 @@ int main(void) {{
         };
         let base = native_module_digest(program, target, &lowering).unwrap();
         let mut legacy = Sha256::new();
-        legacy.update(NATIVE_MODULE_IDENTITY_DOMAIN);
-        legacy.update(NATIVE_LOWERING_VERSION.to_le_bytes());
+        legacy.update(b"fre-aot-regex/native-module-identity\0");
+        legacy.update(1_u32.to_le_bytes());
         legacy.update([1, 1, 1]);
         legacy.update(target.features.bits().to_le_bytes());
         for bytes in [
@@ -36316,7 +36316,7 @@ int main(void) {{
             legacy.update(u64::try_from(bytes.len()).unwrap().to_le_bytes());
             legacy.update(bytes);
         }
-        legacy.update([0, start_accelerator_tag(StartAccelerator::None), 0]);
+        legacy.update([0, 0, 0]);
         legacy.update(0_u64.to_le_bytes());
         let legacy: [u8; 32] = legacy.finalize().into();
         assert_eq!(base, legacy, "ordinary V1 digest stream changed");
