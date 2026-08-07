@@ -747,12 +747,12 @@ fn append_native_context_passes(
         OptimizationPass::AlphabetPartition,
         OptimizationPass::ContextOrderedDeterminization,
     ]);
-    if stats.reverse_states != 0 {
-        passes.push(OptimizationPass::ReverseStartRecovery);
-    } else if program.output_contract() == OutputContract::Span
-        && program.exact_match_width().is_some()
-    {
-        passes.push(OptimizationPass::ExactWidthStartRecovery);
+    if program.output_contract() == OutputContract::Span {
+        if program.exact_match_width().is_some() {
+            passes.push(OptimizationPass::ExactWidthStartRecovery);
+        } else if stats.reverse_states != 0 {
+            passes.push(OptimizationPass::ReverseStartRecovery);
+        }
     }
     passes.extend_from_slice(&[
         OptimizationPass::OutputContractSpecialization,
