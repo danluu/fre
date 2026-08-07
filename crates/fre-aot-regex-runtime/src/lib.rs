@@ -406,13 +406,16 @@ impl PreparedAotRegex {
         let fully_prefilled_fallback = program
             .compiler_private_try_prefill_retained_fallback_with_workspace_receipt(&mut workspace)
             .map_err(PrepareError::Workspace)?;
-        let mut frozen_dynamic_rows = fully_prefilled_fallback.is_none().then(|| {
-            program.compiler_private_frozen_dynamic_rows_storage(
-                &workspace,
-                FROZEN_DYNAMIC_SIDECAR_MAX_K0_BYTES,
-                FROZEN_DYNAMIC_SIDECAR_MAX_PACKED_BYTES,
-            )
-        }).flatten();
+        let mut frozen_dynamic_rows = fully_prefilled_fallback
+            .is_none()
+            .then(|| {
+                program.compiler_private_frozen_dynamic_rows_storage(
+                    &workspace,
+                    FROZEN_DYNAMIC_SIDECAR_MAX_K0_BYTES,
+                    FROZEN_DYNAMIC_SIDECAR_MAX_PACKED_BYTES,
+                )
+            })
+            .flatten();
         let frozen_header = program.compiler_private_frozen_prepared_header_v2(
             &workspace,
             fully_prefilled_fallback,
@@ -4206,6 +4209,7 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
 
         let mut direct = PreparedAotRegex::deserialize(&serialized).expect("prepare direct Rust");
         assert!(direct.fully_prefilled_fallback.is_some());
+        assert!(direct.frozen_dynamic_rows.is_none());
         assert!(direct.frozen_header.is_active());
         assert_eq!(*direct.frozen_header.artifact_identity(), identity);
         assert_eq!(
@@ -4321,6 +4325,36 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
             unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(wrong_artifact) },
             STATUS_SUCCESS
         );
+    }
+
+    #[test]
+    fn compact_dynamic_owner_survives_moves_and_legacy_revocation() {
+        let mut limits = CompileLimitsV1::default();
+        limits.determinize.max_states = 0;
+        let compiled = compile(
+            CompileRequest::new("(?:ab|ac)+z", Target::x86_64_linux())
+                .mode(CompileMode::Optimizing)
+                .limits(limits)
+                .output(OutputContract::Exists),
+        )
+        .expect("compile compact dynamic owner fixture");
+        let serialized = compiled.program().serialize().expect("serialize fixture");
+        let haystack = b"xxabacz";
+        let window = SearchWindow::full(haystack);
+        let expected = compiled.search(haystack, window).expect("portable result");
+
+        let prepared = PreparedAotRegex::deserialize(&serialized).expect("prepare compact owner");
+        assert!(prepared.fully_prefilled_fallback.is_none());
+        assert!(prepared.frozen_dynamic_rows.is_some());
+        assert!(prepared.frozen_header.has_dynamic_rows());
+        let mut owners = vec![prepared];
+        let mut prepared = owners.pop().expect("move prepared owner through a container");
+        assert!(prepared.frozen_header.has_dynamic_rows());
+        assert_eq!(prepared.search(haystack, window).unwrap(), expected);
+        assert!(!prepared.frozen_header.is_active());
+        assert!(prepared.frozen_dynamic_rows.is_some());
+        assert_eq!(prepared.search(haystack, window).unwrap(), expected);
+        assert!(!prepared.frozen_header.is_active());
     }
 
     #[test]

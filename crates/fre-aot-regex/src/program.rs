@@ -2816,8 +2816,10 @@ fn frozen_dynamic_rows_are_closed(rows: &[u32], stride: usize) -> bool {
     if stride == 0 || rows.is_empty() || rows.len().checked_rem(stride) != Some(0) {
         return false;
     }
+    let allowed_cell_mask =
+        DYNAMIC_NATIVE_ROWS_V1_ACCEPT_MASK | DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK;
     rows.iter().copied().all(|cell| {
-        if cell == DYNAMIC_NATIVE_ROWS_V1_UNFILLED_CELL {
+        if cell == DYNAMIC_NATIVE_ROWS_V1_UNFILLED_CELL || cell & !allowed_cell_mask != 0 {
             return false;
         }
         let encoded = cell & DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK;
@@ -15862,6 +15864,21 @@ mod tests {
                 );
             }
 
+            let additive = compiled.compiler_private_frozen_prepared_header_v2(
+                &workspace,
+                Some(receipt),
+                None,
+            );
+            assert!(additive.is_active(), "{output:?}");
+            assert!(!additive.has_dynamic_rows(), "{output:?}");
+            assert_eq!(additive.v1.header_bytes, FROZEN_PREPARED_HEADER_V1_BYTES);
+            assert_eq!(
+                additive.v1.flags & FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS,
+                0,
+                "the retained static projection keeps precedence for {output:?}"
+            );
+            assert_eq!(additive.dynamic_rows_v1, DynamicNativeRowsV1::default());
+
             let inactive =
                 compiled.compiler_private_frozen_prepared_header_v1(&workspace, None);
             assert!(!inactive.is_active());
@@ -15904,6 +15921,11 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::items_after_statements,
+        clippy::too_many_lines,
+        reason = "the local rejection macro keeps the complete immutable-sidecar validation matrix auditable"
+    )]
     fn compact_frozen_dynamic_sidecar_is_bounded_pointer_stable_and_fail_closed() {
         let compiled = program(
             r"(?:ab|ac)+z",
@@ -15950,7 +15972,12 @@ mod tests {
             .expect("complete low-class compact sidecar");
         assert!(storage.descriptor_is_valid_for(compiled.identity));
         assert!(storage.descriptor.row_stride < 128);
-        let packed_bytes = storage.rows.len() * core::mem::size_of::<u32>() + 256;
+        let packed_bytes = storage
+            .rows
+            .len()
+            .checked_mul(core::mem::size_of::<u32>())
+            .and_then(|bytes| bytes.checked_add(256))
+            .expect("compact fixture payload size");
         assert!(
             compiled
                 .compiler_private_frozen_dynamic_rows_storage(
@@ -15961,11 +15988,20 @@ mod tests {
                 .is_none(),
             "the final compact payload cap must be exact"
         );
+        assert!(
+            compiled
+                .compiler_private_frozen_dynamic_rows_storage(
+                    &workspace,
+                    retained_bytes,
+                    packed_bytes,
+                )
+                .is_some(),
+            "the exact final compact payload cap must be admitted"
+        );
 
         let rows_address = storage.descriptor.rows_address;
         let class_map_address = storage.descriptor.class_map_address;
-        let mut owners = Vec::new();
-        owners.push(storage);
+        let mut owners = vec![storage];
         storage = owners.pop().expect("move storage owner through a container");
         assert_eq!(storage.descriptor.rows_address, rows_address);
         assert_eq!(storage.descriptor.class_map_address, class_map_address);
@@ -15991,8 +16027,105 @@ mod tests {
             "publishing immutable rows must leave the live workspace cold"
         );
 
-        storage.descriptor.initial_row = storage.descriptor.initial_row.saturating_add(1);
+        let valid_descriptor = storage.descriptor;
+        macro_rules! reject_descriptor {
+            ($mutation:block) => {{
+                storage.descriptor = valid_descriptor;
+                $mutation
+                assert!(!storage.descriptor_is_valid_for(compiled.identity));
+            }};
+        }
+        reject_descriptor!({ storage.descriptor.rows_address = 0; });
+        reject_descriptor!({ storage.descriptor.class_map_address = 0; });
+        reject_descriptor!({ storage.descriptor.live_cells = 0; });
+        reject_descriptor!({
+            storage.descriptor.live_cells = valid_descriptor.live_cells.saturating_add(1);
+        });
+        reject_descriptor!({ storage.descriptor.row_stride = 0; });
+        reject_descriptor!({ storage.descriptor.row_stride = 257; });
+        reject_descriptor!({
+            storage.descriptor.initial_row = valid_descriptor.initial_row.saturating_add(1);
+        });
+        reject_descriptor!({
+            storage.descriptor.initial_row = u32::try_from(valid_descriptor.live_cells).unwrap();
+        });
+        reject_descriptor!({ storage.descriptor.unfilled_cell = 0; });
+        reject_descriptor!({ storage.descriptor.accept_mask = 0; });
+        reject_descriptor!({ storage.descriptor.next_row_token_mask = 0; });
+        reject_descriptor!({ storage.descriptor.cache_identity = 0; });
+        reject_descriptor!({ storage.descriptor.initial_flags = 1; });
+        reject_descriptor!({ storage.descriptor.learned_loop_row_count = 5; });
+        reject_descriptor!({
+            storage.descriptor.learned_loop_row_count = 0;
+            storage.descriptor.learned_loop_rows[0] = 0;
+        });
+        reject_descriptor!({
+            storage.descriptor.learned_loop_row_count = 1;
+            storage.descriptor.learned_loop_rows = [
+                u32::try_from(valid_descriptor.live_cells).unwrap(),
+                u32::MAX,
+                u32::MAX,
+                u32::MAX,
+            ];
+        });
+        reject_descriptor!({
+            storage.descriptor.learned_loop_row_count = 2;
+            storage.descriptor.learned_loop_rows = [0, 0, u32::MAX, u32::MAX];
+        });
+        if valid_descriptor.row_stride > 1 {
+            reject_descriptor!({
+                storage.descriptor.learned_loop_row_count = 1;
+                storage.descriptor.learned_loop_rows = [1, u32::MAX, u32::MAX, u32::MAX];
+            });
+        }
+
+        storage.descriptor = valid_descriptor;
+        let first_cell = storage.rows[0];
+        storage.rows[0] = DYNAMIC_NATIVE_ROWS_V1_UNFILLED_CELL;
         assert!(!storage.descriptor_is_valid_for(compiled.identity));
+        storage.rows[0] = DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK;
+        assert!(!storage.descriptor_is_valid_for(compiled.identity));
+        storage.rows[0] = first_cell | (1 << 29);
+        assert!(!storage.descriptor_is_valid_for(compiled.identity));
+        storage.rows[0] = first_cell | (1 << 30);
+        assert!(!storage.descriptor_is_valid_for(compiled.identity));
+        storage.rows[0] = first_cell;
+        let original_class_map = *storage.class_map;
+        storage.class_map[0] = u8::try_from(valid_descriptor.row_stride).unwrap();
+        assert!(!storage.descriptor_is_valid_for(compiled.identity));
+        *storage.class_map = original_class_map;
+        if valid_descriptor.row_stride > 1 {
+            let absent_class = u8::try_from(
+                valid_descriptor
+                    .row_stride
+                    .checked_sub(1)
+                    .expect("nonzero multi-class stride"),
+            )
+            .unwrap();
+            for class in storage.class_map.iter_mut() {
+                if *class == absent_class {
+                    *class = 0;
+                }
+            }
+            assert!(!storage.descriptor_is_valid_for(compiled.identity));
+            *storage.class_map = original_class_map;
+        }
+        let mut foreign_identity = compiled.identity;
+        foreign_identity.instance ^= u64::MAX;
+        assert!(!storage.descriptor_is_valid_for(foreign_identity));
+        foreign_identity = compiled.identity;
+        foreign_identity.artifact[0] ^= 1;
+        assert!(!storage.descriptor_is_valid_for(foreign_identity));
+        let storage_program_instance = storage.program_instance;
+        storage.program_instance ^= u64::MAX;
+        assert!(!storage.descriptor_is_valid_for(compiled.identity));
+        storage.program_instance = storage_program_instance;
+        storage.artifact_identity[0] ^= 1;
+        assert!(!storage.descriptor_is_valid_for(compiled.identity));
+        storage.artifact_identity[0] ^= 1;
+        assert!(storage.descriptor_is_valid_for(compiled.identity));
+
+        storage.descriptor.initial_row = storage.descriptor.initial_row.saturating_add(1);
         assert!(
             !compiled
                 .compiler_private_frozen_prepared_header_v2(
@@ -16003,6 +16136,7 @@ mod tests {
                 .is_active(),
             "a malformed sidecar descriptor must fail closed"
         );
+        storage.descriptor = valid_descriptor;
     }
 
     #[test]

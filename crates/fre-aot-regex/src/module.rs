@@ -27,10 +27,33 @@ use crate::{
     prefix_relation::{self, PrefixRelation},
     program::{
         AnchoredByteSet, CompiledProgram, DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES,
-        DynamicNativeRowsV1, MAX_ANCHORED_PREFIX_BYTES, NativeContextProgramView,
-        NativeDynamicRootRequirement, NativeDynamicRowsProgramView, NativePartialProgramView,
-        NativeProgramView, NativeRetainedPrefixRequirement, NativeRetainedSuffixRequirement,
-        OutputContract, PARTIAL_DFA_MIN_INPUT_BYTES,
+        DYNAMIC_NATIVE_ROWS_V1_ACCEPT_MASK, DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK,
+        DYNAMIC_NATIVE_ROWS_V1_UNFILLED_CELL, DynamicNativeRowsV1,
+        FROZEN_PREPARED_HEADER_V1_ABI_VERSION,
+        FROZEN_PREPARED_HEADER_V1_ABI_VERSION_OFFSET,
+        FROZEN_PREPARED_HEADER_V1_ACCEPT_MASK_OFFSET,
+        FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL,
+        FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL_OFFSET,
+        FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET,
+        FROZEN_PREPARED_HEADER_V1_CACHE_IDENTITY_OFFSET,
+        FROZEN_PREPARED_HEADER_V1_FLAGS_OFFSET,
+        FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS,
+        FROZEN_PREPARED_HEADER_V1_FORWARD_INITIAL_ROW_OFFSET,
+        FROZEN_PREPARED_HEADER_V1_FORWARD_LIVE_CELLS_OFFSET,
+        FROZEN_PREPARED_HEADER_V1_FORWARD_ROWS_ADDRESS_OFFSET,
+        FROZEN_PREPARED_HEADER_V1_HEADER_BYTES_OFFSET, FROZEN_PREPARED_HEADER_V1_MAGIC,
+        FROZEN_PREPARED_HEADER_V1_MAGIC_OFFSET,
+        FROZEN_PREPARED_HEADER_V1_NEXT_ROW_TOKEN_MASK_OFFSET,
+        FROZEN_PREPARED_HEADER_V1_NO_REVERSE_ROW,
+        FROZEN_PREPARED_HEADER_V1_REVERSE_INITIAL_ROW_OFFSET,
+        FROZEN_PREPARED_HEADER_V1_REVERSE_LIVE_CELLS_OFFSET,
+        FROZEN_PREPARED_HEADER_V1_REVERSE_ROWS_ADDRESS_OFFSET,
+        FROZEN_PREPARED_HEADER_V1_ROW_STRIDE_OFFSET,
+        FROZEN_PREPARED_HEADER_V1_UNFILLED_CELL_OFFSET, FROZEN_PREPARED_HEADER_V2_BYTES,
+        FROZEN_PREPARED_HEADER_V2_DYNAMIC_ROWS_OFFSET, MAX_ANCHORED_PREFIX_BYTES,
+        NativeContextProgramView, NativeDynamicRootRequirement, NativeDynamicRowsProgramView,
+        NativePartialProgramView, NativeProgramView, NativeRetainedPrefixRequirement,
+        NativeRetainedSuffixRequirement, OutputContract, PARTIAL_DFA_MIN_INPUT_BYTES,
     },
     required_literals::{MaximumConsumedDistance, RequiredInteriorCandidate, RequiredLiteralSet},
     seeded_reverse::{
@@ -839,6 +862,14 @@ const NATIVE_ROWS_INITIAL_ROW: usize =
 const NATIVE_ROWS_INITIAL_FLAGS: usize =
     core::mem::offset_of!(DynamicNativeRowsV1, initial_flags);
 const _: () = assert!(core::mem::size_of::<DynamicNativeRowsV1>() <= 127);
+// Compact frozen rows are a short-window prepared-entry optimization. At
+// 4 KiB, canonical K0 begins considering its whole-window accelerators.
+const FROZEN_DYNAMIC_ROWS_MAX_INPUT_BYTES: usize = 4_095;
+const _: () = assert!(DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES <= FROZEN_DYNAMIC_ROWS_MAX_INPUT_BYTES);
+const _: () = assert!(DYNAMIC_NATIVE_ROWS_V1_UNFILLED_CELL == u32::MAX);
+const _: () = assert!(DYNAMIC_NATIVE_ROWS_V1_ACCEPT_MASK == 1 << 31);
+const _: () = assert!(DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK == (1 << 29) - 1);
+const _: () = assert!(FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL_OFFSET == 0);
 
 fn native_rows_loop_row_offset(loop_row: usize) -> Result<usize, ObjectError> {
     let delta = loop_row
@@ -11536,6 +11567,330 @@ fn lower_x86_64_runtime_adapter() -> Result<(Vec<u8>, Vec<ModuleRelocation>), Ob
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     clippy::too_many_lines,
+    reason = "the offset-zero compact descriptor is authenticated as one fail-closed machine-code transaction"
+)]
+fn x86_emit_frozen_dynamic_entry(
+    assembler: &mut X86Assembler,
+    call_preflight: X86Label,
+    preflight_enter: X86Label,
+    has_root_scanner: bool,
+) -> Result<(), ObjectError> {
+    let branch_failed = |assembler: &mut X86Assembler| {
+        assembler.branch(&[0x0f, 0x85], call_preflight)
+    };
+
+    let mut load_seal = vec![0x49, 0xba];
+    load_seal.extend_from_slice(&FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL.to_le_bytes());
+    assembler.instruction(&load_seal)?;
+    assembler.instruction(&[0x4c, 0x3b, 0x17])?;
+    branch_failed(assembler)?;
+    let mut load_magic = vec![0x49, 0xba];
+    load_magic.extend_from_slice(&FROZEN_PREPARED_HEADER_V1_MAGIC.to_le_bytes());
+    assembler.instruction(&load_magic)?;
+    assembler.instruction(&[
+        0x4c,
+        0x3b,
+        0x57,
+        u8::try_from(FROZEN_PREPARED_HEADER_V1_MAGIC_OFFSET)
+            .map_err(|_| ObjectError::ArithmeticOverflow("x86 frozen magic offset"))?,
+    ])?;
+    branch_failed(assembler)?;
+    for (offset, expected, context) in [
+        (
+            FROZEN_PREPARED_HEADER_V1_ABI_VERSION_OFFSET,
+            FROZEN_PREPARED_HEADER_V1_ABI_VERSION,
+            "x86 frozen ABI version",
+        ),
+        (
+            FROZEN_PREPARED_HEADER_V1_FLAGS_OFFSET,
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS,
+            "x86 frozen flags",
+        ),
+    ] {
+        let mut compare = vec![
+            0x81,
+            0x7f,
+            u8::try_from(offset).map_err(|_| ObjectError::ArithmeticOverflow(context))?,
+        ];
+        compare.extend_from_slice(&expected.to_le_bytes());
+        assembler.instruction(&compare)?;
+        branch_failed(assembler)?;
+    }
+    let mut compare_header_bytes = vec![
+        0x48,
+        0x81,
+        0x7f,
+        u8::try_from(FROZEN_PREPARED_HEADER_V1_HEADER_BYTES_OFFSET)
+            .map_err(|_| ObjectError::ArithmeticOverflow("x86 frozen header extent offset"))?,
+    ];
+    compare_header_bytes.extend_from_slice(
+        &u32::try_from(FROZEN_PREPARED_HEADER_V2_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("x86 frozen header extent"))?
+            .to_le_bytes(),
+    );
+    assembler.instruction(&compare_header_bytes)?;
+    branch_failed(assembler)?;
+    for identity_word in 0_usize..4 {
+        let word_offset = identity_word
+            .checked_mul(core::mem::size_of::<u64>())
+            .ok_or(ObjectError::ArithmeticOverflow("x86 frozen identity word"))?;
+        if word_offset == 0 {
+            assembler.instruction(&[0x4c, 0x8b, 0x10])?;
+        } else {
+            assembler.instruction(&[
+                0x4c,
+                0x8b,
+                0x50,
+                u8::try_from(word_offset)
+                    .map_err(|_| ObjectError::ArithmeticOverflow("x86 identity word offset"))?,
+            ])?;
+        }
+        let header_offset = FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET
+            .checked_add(word_offset)
+            .ok_or(ObjectError::ArithmeticOverflow("x86 frozen header identity"))?;
+        assembler.instruction(&[
+            0x4c,
+            0x3b,
+            0x57,
+            u8::try_from(header_offset)
+                .map_err(|_| ObjectError::ArithmeticOverflow("x86 header identity offset"))?,
+        ])?;
+        branch_failed(assembler)?;
+    }
+
+    for (offset, context) in [
+        (
+            FROZEN_PREPARED_HEADER_V1_REVERSE_ROWS_ADDRESS_OFFSET,
+            "x86 frozen reverse rows",
+        ),
+        (
+            FROZEN_PREPARED_HEADER_V1_REVERSE_LIVE_CELLS_OFFSET,
+            "x86 frozen reverse cells",
+        ),
+    ] {
+        assembler.instruction(&[
+            0x48,
+            0x83,
+            0x7f,
+            u8::try_from(offset).map_err(|_| ObjectError::ArithmeticOverflow(context))?,
+            0,
+        ])?;
+        branch_failed(assembler)?;
+    }
+    let mut compare_no_reverse = vec![
+        0x81,
+        0x7f,
+        u8::try_from(FROZEN_PREPARED_HEADER_V1_REVERSE_INITIAL_ROW_OFFSET)
+            .map_err(|_| ObjectError::ArithmeticOverflow("x86 frozen reverse initial offset"))?,
+    ];
+    compare_no_reverse.extend_from_slice(&FROZEN_PREPARED_HEADER_V1_NO_REVERSE_ROW.to_le_bytes());
+    assembler.instruction(&compare_no_reverse)?;
+    branch_failed(assembler)?;
+
+    let tail_offset = i32::try_from(FROZEN_PREPARED_HEADER_V2_DYNAMIC_ROWS_OFFSET)
+        .map_err(|_| ObjectError::ArithmeticOverflow("x86 frozen descriptor offset"))?;
+    let mut tail_address = vec![0x4c, 0x8d, 0x9f];
+    tail_address.extend_from_slice(&tail_offset.to_le_bytes());
+    assembler.instruction(&tail_address)?;
+    for (header_offset, tail_field, context) in [
+        (
+            FROZEN_PREPARED_HEADER_V1_FORWARD_ROWS_ADDRESS_OFFSET,
+            NATIVE_ROWS_ROWS_ADDRESS,
+            "x86 frozen rows",
+        ),
+        (
+            FROZEN_PREPARED_HEADER_V1_FORWARD_LIVE_CELLS_OFFSET,
+            NATIVE_ROWS_LIVE_CELLS,
+            "x86 frozen live cells",
+        ),
+        (
+            FROZEN_PREPARED_HEADER_V1_CACHE_IDENTITY_OFFSET,
+            NATIVE_ROWS_CACHE_IDENTITY,
+            "x86 frozen cache identity",
+        ),
+    ] {
+        assembler.instruction(&[
+            0x4c,
+            0x8b,
+            0x57,
+            u8::try_from(header_offset).map_err(|_| ObjectError::ArithmeticOverflow(context))?,
+        ])?;
+        assembler.instruction(&[
+            0x4d,
+            0x3b,
+            0x53,
+            u8::try_from(tail_field).map_err(|_| ObjectError::ArithmeticOverflow(context))?,
+        ])?;
+        branch_failed(assembler)?;
+    }
+    for (header_offset, tail_field, context) in [
+        (
+            FROZEN_PREPARED_HEADER_V1_ROW_STRIDE_OFFSET,
+            NATIVE_ROWS_ROW_STRIDE,
+            "x86 frozen stride",
+        ),
+        (
+            FROZEN_PREPARED_HEADER_V1_FORWARD_INITIAL_ROW_OFFSET,
+            NATIVE_ROWS_INITIAL_ROW,
+            "x86 frozen initial row",
+        ),
+        (
+            FROZEN_PREPARED_HEADER_V1_UNFILLED_CELL_OFFSET,
+            NATIVE_ROWS_UNFILLED_CELL,
+            "x86 frozen unfilled cell",
+        ),
+        (
+            FROZEN_PREPARED_HEADER_V1_ACCEPT_MASK_OFFSET,
+            NATIVE_ROWS_ACCEPT_MASK,
+            "x86 frozen accept mask",
+        ),
+        (
+            FROZEN_PREPARED_HEADER_V1_NEXT_ROW_TOKEN_MASK_OFFSET,
+            NATIVE_ROWS_NEXT_ROW_TOKEN_MASK,
+            "x86 frozen next-row mask",
+        ),
+    ] {
+        assembler.instruction(&[
+            0x44,
+            0x8b,
+            0x57,
+            u8::try_from(header_offset).map_err(|_| ObjectError::ArithmeticOverflow(context))?,
+        ])?;
+        assembler.instruction(&[
+            0x45,
+            0x3b,
+            0x53,
+            u8::try_from(tail_field).map_err(|_| ObjectError::ArithmeticOverflow(context))?,
+        ])?;
+        branch_failed(assembler)?;
+    }
+
+    assembler.instruction(&[0x4d, 0x8b, 0x13])?;
+    assembler.instruction(&[0x4d, 0x85, 0xd2])?;
+    assembler.branch(&[0x0f, 0x84], call_preflight)?;
+    assembler.instruction(&[0x41, 0xf6, 0xc2, 0x03])?;
+    assembler.branch(&[0x0f, 0x85], call_preflight)?;
+    assembler.instruction(&[0x4d, 0x8b, 0x53, NATIVE_ROWS_CLASS_MAP_ADDRESS as u8])?;
+    assembler.instruction(&[0x4d, 0x85, 0xd2])?;
+    assembler.branch(&[0x0f, 0x84], call_preflight)?;
+    assembler.instruction(&[0x4d, 0x8b, 0x53, NATIVE_ROWS_CACHE_IDENTITY as u8])?;
+    assembler.instruction(&[0x4d, 0x85, 0xd2])?;
+    assembler.branch(&[0x0f, 0x84], call_preflight)?;
+    assembler.instruction(&[0x41, 0x83, 0x7b, NATIVE_ROWS_INITIAL_FLAGS as u8, 0])?;
+    branch_failed(assembler)?;
+    for (field, expected, context) in [
+        (
+            NATIVE_ROWS_UNFILLED_CELL,
+            DYNAMIC_NATIVE_ROWS_V1_UNFILLED_CELL,
+            "x86 frozen unfilled value",
+        ),
+        (
+            NATIVE_ROWS_ACCEPT_MASK,
+            DYNAMIC_NATIVE_ROWS_V1_ACCEPT_MASK,
+            "x86 frozen accept value",
+        ),
+        (
+            NATIVE_ROWS_NEXT_ROW_TOKEN_MASK,
+            DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK,
+            "x86 frozen next-row value",
+        ),
+    ] {
+        let mut compare = vec![
+            0x41,
+            0x81,
+            0x7b,
+            u8::try_from(field).map_err(|_| ObjectError::ArithmeticOverflow(context))?,
+        ];
+        compare.extend_from_slice(&expected.to_le_bytes());
+        assembler.instruction(&compare)?;
+        branch_failed(assembler)?;
+    }
+
+    assembler.instruction(&[0x49, 0x8b, 0x43, NATIVE_ROWS_LIVE_CELLS as u8])?;
+    assembler.instruction(&[0x48, 0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x84], call_preflight)?;
+    let mut compare_live_ceiling = vec![0x48, 0x3d];
+    compare_live_ceiling.extend_from_slice(
+        &DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK.to_le_bytes(),
+    );
+    assembler.instruction(&compare_live_ceiling)?;
+    assembler.branch(&[0x0f, 0x87], call_preflight)?;
+    assembler.instruction(&[0x41, 0x8b, 0x4b, NATIVE_ROWS_ROW_STRIDE as u8])?;
+    assembler.instruction(&[0x85, 0xc9])?;
+    assembler.branch(&[0x0f, 0x84], call_preflight)?;
+    assembler.instruction(&[0x81, 0xf9, 0x00, 0x01, 0x00, 0x00])?;
+    assembler.branch(&[0x0f, 0x87], call_preflight)?;
+    assembler.instruction(&[0x31, 0xd2])?;
+    assembler.instruction(&[0x48, 0xf7, 0xf1])?;
+    assembler.instruction(&[0x48, 0x85, 0xd2])?;
+    assembler.branch(&[0x0f, 0x85], call_preflight)?;
+    assembler.instruction(&[0x45, 0x8b, 0x53, NATIVE_ROWS_INITIAL_ROW as u8])?;
+    assembler.instruction(&[0x4c, 0x89, 0xd0])?;
+    assembler.instruction(&[0x31, 0xd2])?;
+    assembler.instruction(&[0x48, 0xf7, 0xf1])?;
+    assembler.instruction(&[0x48, 0x85, 0xd2])?;
+    assembler.branch(&[0x0f, 0x85], call_preflight)?;
+    assembler.instruction(&[0x45, 0x8b, 0x53, NATIVE_ROWS_INITIAL_ROW as u8])?;
+    assembler.instruction(&[0x49, 0x01, 0xca])?;
+    assembler.instruction(&[0x4d, 0x3b, 0x53, NATIVE_ROWS_LIVE_CELLS as u8])?;
+    assembler.branch(&[0x0f, 0x87], call_preflight)?;
+
+    assembler.instruction(&[0x45, 0x8b, 0x43, NATIVE_ROWS_LOOP_COUNT as u8])?;
+    if has_root_scanner {
+        assembler.instruction(&[0x41, 0x83, 0xf8, NATIVE_ROWS_LOOP_ROW_CAPACITY as u8])?;
+        assembler.branch(&[0x0f, 0x87], call_preflight)?;
+    } else {
+        assembler.instruction(&[0x45, 0x85, 0xc0])?;
+        assembler.branch(&[0x0f, 0x85], call_preflight)?;
+    }
+    for loop_index in 0..NATIVE_ROWS_LOOP_ROW_CAPACITY {
+        let inactive = assembler.label()?;
+        let checked = assembler.label()?;
+        assembler.instruction(&[0x41, 0x83, 0xf8, loop_index as u8])?;
+        assembler.branch(&[0x0f, 0x86], inactive)?;
+        let row_offset = native_rows_loop_row_offset(loop_index)? as u8;
+        assembler.instruction(&[0x45, 0x8b, 0x53, row_offset])?;
+        assembler.instruction(&[0x4c, 0x89, 0xd0])?;
+        assembler.instruction(&[0x31, 0xd2])?;
+        assembler.instruction(&[0x48, 0xf7, 0xf1])?;
+        assembler.instruction(&[0x48, 0x85, 0xd2])?;
+        assembler.branch(&[0x0f, 0x85], call_preflight)?;
+        assembler.instruction(&[0x45, 0x8b, 0x53, row_offset])?;
+        assembler.instruction(&[0x49, 0x01, 0xca])?;
+        assembler.instruction(&[0x4d, 0x3b, 0x53, NATIVE_ROWS_LIVE_CELLS as u8])?;
+        assembler.branch(&[0x0f, 0x87], call_preflight)?;
+        assembler.instruction(&[0x45, 0x8b, 0x53, row_offset])?;
+        for prior in 0..loop_index {
+            assembler.instruction(&[
+                0x45,
+                0x3b,
+                0x53,
+                native_rows_loop_row_offset(prior)? as u8,
+            ])?;
+            assembler.branch(&[0x0f, 0x84], call_preflight)?;
+        }
+        assembler.branch(&[0xe9], checked)?;
+        assembler.bind(inactive)?;
+        assembler.instruction(&[0x41, 0x83, 0x7b, row_offset, 0xff])?;
+        assembler.branch(&[0x0f, 0x85], call_preflight)?;
+        assembler.bind(checked)?;
+    }
+
+    assembler.instruction(&[0x4c, 0x8b, 0x54, 0x24, 0x28])?;
+    assembler.instruction(&[0x4c, 0x89, 0x54, 0x24, 0x40])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x54, 0x24, 0x30])?;
+    assembler.instruction(&[0x4c, 0x89, 0x54, 0x24, 0x48])?;
+    assembler.instruction(&[0x4c, 0x89, 0x5c, 0x24, 0x50])?;
+    assembler.instruction(&[0x4d, 0x8b, 0x53, NATIVE_ROWS_CACHE_IDENTITY as u8])?;
+    assembler.instruction(&[0x4c, 0x89, 0x54, 0x24, 0x58])?;
+    assembler.branch(&[0xe9], preflight_enter)?;
+    Ok(())
+}
+
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::too_many_lines,
     reason = "the compile-time descriptor size assertion proves every encoded positive disp8 offset"
 )]
 #[cfg(test)]
@@ -11660,11 +12015,27 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     let native_continue = allow_direct_hole_continuation
         .then(|| assembler.label())
         .transpose()?;
+    let call_preflight = assembler.label()?;
     let framed_fallback = assembler.label()?;
+    let adaptive_fallback = assembler.label()?;
     let short_fallback = assembler.label()?;
 
-    // Preserve the public ABI on the short path; the ordinary helper remains
-    // the sole validator when the wrapping length selects it.
+    // Reject malformed public arguments before reading the offset-zero header.
+    // The ordinary helper remains authoritative for status/result semantics.
+    assembler.instruction(&[0x48, 0x85, 0xff])?;
+    assembler.branch(&[0x0f, 0x84], short_fallback)?;
+    assembler.instruction(&[0x48, 0x85, 0xf6])?;
+    assembler.branch(&[0x0f, 0x84], short_fallback)?;
+    assembler.instruction(&[0x4d, 0x85, 0xc9])?;
+    assembler.branch(&[0x0f, 0x84], short_fallback)?;
+    assembler.instruction(&[0x41, 0xf6, 0xc1, 0x07])?;
+    assembler.branch(&[0x0f, 0x85], short_fallback)?;
+    assembler.instruction(&[0x48, 0x85, 0xd2])?;
+    assembler.branch(&[0x0f, 0x88], short_fallback)?;
+    assembler.instruction(&[0x4c, 0x39, 0xc1])?;
+    assembler.branch(&[0x0f, 0x87], short_fallback)?;
+    assembler.instruction(&[0x4c, 0x39, 0xc2])?;
+    assembler.branch(&[0x0f, 0x82], short_fallback)?;
     assembler.instruction(&[0x4c, 0x89, 0xc0])?; // mov r8, rax
     assembler.instruction(&[0x48, 0x29, 0xc8])?; // sub rcx, rax
     let minimum = u32::try_from(DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES)
@@ -11673,6 +12044,12 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     compare_minimum.extend_from_slice(&minimum.to_le_bytes());
     assembler.instruction(&compare_minimum)?;
     assembler.branch(&[0x0f, 0x82], short_fallback)?;
+    let maximum = u32::try_from(FROZEN_DYNAMIC_ROWS_MAX_INPUT_BYTES)
+        .map_err(|_| ObjectError::ArithmeticOverflow("frozen dynamic row input ceiling"))?;
+    let mut compare_maximum = vec![0x48, 0x3d];
+    compare_maximum.extend_from_slice(&maximum.to_le_bytes());
+    assembler.instruction(&compare_maximum)?;
+    assembler.branch(&[0x0f, 0x87], short_fallback)?;
 
     // Entry RSP is 8 modulo 16. The frame aligns calls, retains all six
     // public arguments, and reserves the four-word private preflight record.
@@ -11691,6 +12068,21 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     assembler.bind(identity_displacement_label)?;
     push_bytes(&mut assembler.code, &[0; 4])?;
     assembler.instruction(&[0x48, 0x89, 0x04, 0x24])?;
+
+    x86_emit_frozen_dynamic_entry(
+        &mut assembler,
+        call_preflight,
+        preflight_enter,
+        root_plan.is_some(),
+    )?;
+
+    assembler.bind(call_preflight)?;
+    assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x10])?;
+    assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x18])?;
+    assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x20])?;
+    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x28])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x30])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x38])?;
     assembler.instruction(&[0x48, 0x8d, 0x44, 0x24, 0x40])?;
     assembler.instruction(&[0x48, 0x89, 0x44, 0x24, 0x08])?;
     assembler.instruction(&[0xe8])?;
@@ -12039,6 +12431,12 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     let mut continuation_displacement_label = None;
     if let Some(native_continue) = native_continue {
         assembler.bind(native_continue)?;
+        assembler.instruction(&[0x4c, 0x8b, 0x54, 0x24, 0x10])?;
+        let mut load_seal = vec![0x49, 0xbb];
+        load_seal.extend_from_slice(&FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL.to_le_bytes());
+        assembler.instruction(&load_seal)?;
+        assembler.instruction(&[0x4d, 0x3b, 0x1a])?;
+        assembler.branch(&[0x0f, 0x84], framed_fallback)?;
         // The scanner-free route has no vector state or loop ledger. Preserve
         // the exact row and unread byte, then reuse the five preflight/output
         // words as the compiler-private continuation record.
@@ -12089,6 +12487,22 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     if filter_kind.is_some_and(X86StartFilterKind::needs_vzeroupper) {
         assembler.instruction(&[0xc5, 0xf8, 0x77])?;
     }
+    assembler.instruction(&[0x4c, 0x8b, 0x54, 0x24, 0x10])?;
+    let mut load_seal = vec![0x49, 0xbb];
+    load_seal.extend_from_slice(&FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL.to_le_bytes());
+    assembler.instruction(&load_seal)?;
+    assembler.instruction(&[0x4d, 0x3b, 0x1a])?;
+    assembler.branch(&[0x0f, 0x85], adaptive_fallback)?;
+    assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x10])?;
+    assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x18])?;
+    assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x20])?;
+    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x28])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x30])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x38])?;
+    assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+    assembler.branch(&[0xe9], short_fallback)?;
+
+    assembler.bind(adaptive_fallback)?;
     assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x10])?;
     assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x18])?;
     assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x20])?;
@@ -13421,6 +13835,26 @@ fn aarch64_sub_x_reg(destination: u8, left: u8, right: u8) -> Result<u32, Object
             | aarch64_reg(left, 5)?
             | aarch64_reg(destination, 0)?,
     )
+}
+
+fn aarch64_udiv_x(destination: u8, numerator: u8, denominator: u8) -> Result<u32, ObjectError> {
+    Ok(0x9ac0_0800
+        | aarch64_reg(denominator, 16)?
+        | aarch64_reg(numerator, 5)?
+        | aarch64_reg(destination, 0)?)
+}
+
+fn aarch64_msub_x(
+    destination: u8,
+    left: u8,
+    right: u8,
+    minuend: u8,
+) -> Result<u32, ObjectError> {
+    Ok(0x9b00_8000
+        | aarch64_reg(right, 16)?
+        | aarch64_reg(minuend, 10)?
+        | aarch64_reg(left, 5)?
+        | aarch64_reg(destination, 0)?)
 }
 
 fn aarch64_add_x_imm(destination: u8, source: u8, immediate: u16) -> Result<u32, ObjectError> {
@@ -17989,6 +18423,381 @@ fn lower_aarch64_runtime_adapter() -> Result<(Vec<u8>, Vec<ModuleRelocation>), O
 
 #[allow(
     clippy::too_many_lines,
+    reason = "the offset-zero compact descriptor is authenticated as one fail-closed machine-code transaction"
+)]
+fn aarch64_emit_frozen_dynamic_entry(
+    assembler: &mut Aarch64Assembler,
+    call_preflight: Aarch64Label,
+    preflight_enter: Aarch64Label,
+    has_root_scanner: bool,
+) -> Result<(), ObjectError> {
+    let offset = |value: usize, context| {
+        u16::try_from(value).map_err(|_| ObjectError::ArithmeticOverflow(context))
+    };
+
+    aarch64_load_u64_constant(assembler, 8, FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL)?;
+    assembler.instruction(aarch64_load_x_imm(
+        9,
+        0,
+        offset(
+            FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL_OFFSET,
+            "AArch64 frozen seal offset",
+        )?,
+    )?)?;
+    assembler.instruction(aarch64_cmp_x(9, 8)?)?;
+    assembler.branch_cond(AARCH64_NE, call_preflight)?;
+    aarch64_load_u64_constant(assembler, 8, FROZEN_PREPARED_HEADER_V1_MAGIC)?;
+    assembler.instruction(aarch64_load_x_imm(
+        9,
+        0,
+        offset(
+            FROZEN_PREPARED_HEADER_V1_MAGIC_OFFSET,
+            "AArch64 frozen magic offset",
+        )?,
+    )?)?;
+    assembler.instruction(aarch64_cmp_x(9, 8)?)?;
+    assembler.branch_cond(AARCH64_NE, call_preflight)?;
+
+    for (field, expected, context) in [
+        (
+            FROZEN_PREPARED_HEADER_V1_ABI_VERSION_OFFSET,
+            FROZEN_PREPARED_HEADER_V1_ABI_VERSION,
+            "AArch64 frozen ABI version",
+        ),
+        (
+            FROZEN_PREPARED_HEADER_V1_FLAGS_OFFSET,
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS,
+            "AArch64 frozen flags",
+        ),
+    ] {
+        assembler.instruction(aarch64_load_w_imm(9, 0, offset(field, context)?)?)?;
+        aarch64_load_u32_constant(assembler, 8, expected)?;
+        assembler.instruction(aarch64_cmp_w(9, 8)?)?;
+        assembler.branch_cond(AARCH64_NE, call_preflight)?;
+    }
+    assembler.instruction(aarch64_load_x_imm(
+        9,
+        0,
+        offset(
+            FROZEN_PREPARED_HEADER_V1_HEADER_BYTES_OFFSET,
+            "AArch64 frozen header extent offset",
+        )?,
+    )?)?;
+    aarch64_load_u64_constant(
+        assembler,
+        8,
+        u64::try_from(FROZEN_PREPARED_HEADER_V2_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 frozen header extent"))?,
+    )?;
+    assembler.instruction(aarch64_cmp_x(9, 8)?)?;
+    assembler.branch_cond(AARCH64_NE, call_preflight)?;
+
+    for identity_word in 0_usize..4 {
+        let word_offset = identity_word
+            .checked_mul(core::mem::size_of::<u64>())
+            .ok_or(ObjectError::ArithmeticOverflow("AArch64 frozen identity word"))?;
+        assembler.instruction(aarch64_load_x_imm(
+            8,
+            6,
+            offset(word_offset, "AArch64 linked identity offset")?,
+        )?)?;
+        let header_offset = FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET
+            .checked_add(word_offset)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "AArch64 frozen header identity",
+            ))?;
+        assembler.instruction(aarch64_load_x_imm(
+            9,
+            0,
+            offset(header_offset, "AArch64 header identity offset")?,
+        )?)?;
+        assembler.instruction(aarch64_cmp_x(9, 8)?)?;
+        assembler.branch_cond(AARCH64_NE, call_preflight)?;
+    }
+
+    for (field, context) in [
+        (
+            FROZEN_PREPARED_HEADER_V1_REVERSE_ROWS_ADDRESS_OFFSET,
+            "AArch64 frozen reverse rows",
+        ),
+        (
+            FROZEN_PREPARED_HEADER_V1_REVERSE_LIVE_CELLS_OFFSET,
+            "AArch64 frozen reverse cells",
+        ),
+    ] {
+        assembler.instruction(aarch64_load_x_imm(8, 0, offset(field, context)?)?)?;
+        assembler.instruction(aarch64_cmp_x_imm(8, 0)?)?;
+        assembler.branch_cond(AARCH64_NE, call_preflight)?;
+    }
+    assembler.instruction(aarch64_load_w_imm(
+        8,
+        0,
+        offset(
+            FROZEN_PREPARED_HEADER_V1_REVERSE_INITIAL_ROW_OFFSET,
+            "AArch64 frozen reverse initial offset",
+        )?,
+    )?)?;
+    aarch64_load_u32_constant(assembler, 9, FROZEN_PREPARED_HEADER_V1_NO_REVERSE_ROW)?;
+    assembler.instruction(aarch64_cmp_w(8, 9)?)?;
+    assembler.branch_cond(AARCH64_NE, call_preflight)?;
+
+    assembler.instruction(aarch64_add_x_imm(
+        13,
+        0,
+        offset(
+            FROZEN_PREPARED_HEADER_V2_DYNAMIC_ROWS_OFFSET,
+            "AArch64 frozen descriptor offset",
+        )?,
+    )?)?;
+    for (header_field, tail_field, context) in [
+        (
+            FROZEN_PREPARED_HEADER_V1_FORWARD_ROWS_ADDRESS_OFFSET,
+            NATIVE_ROWS_ROWS_ADDRESS,
+            "AArch64 frozen rows",
+        ),
+        (
+            FROZEN_PREPARED_HEADER_V1_FORWARD_LIVE_CELLS_OFFSET,
+            NATIVE_ROWS_LIVE_CELLS,
+            "AArch64 frozen live cells",
+        ),
+        (
+            FROZEN_PREPARED_HEADER_V1_CACHE_IDENTITY_OFFSET,
+            NATIVE_ROWS_CACHE_IDENTITY,
+            "AArch64 frozen cache identity",
+        ),
+    ] {
+        assembler.instruction(aarch64_load_x_imm(
+            8,
+            0,
+            offset(header_field, context)?,
+        )?)?;
+        assembler.instruction(aarch64_load_x_imm(
+            9,
+            13,
+            offset(tail_field, context)?,
+        )?)?;
+        assembler.instruction(aarch64_cmp_x(9, 8)?)?;
+        assembler.branch_cond(AARCH64_NE, call_preflight)?;
+    }
+    for (header_field, tail_field, context) in [
+        (
+            FROZEN_PREPARED_HEADER_V1_ROW_STRIDE_OFFSET,
+            NATIVE_ROWS_ROW_STRIDE,
+            "AArch64 frozen stride",
+        ),
+        (
+            FROZEN_PREPARED_HEADER_V1_FORWARD_INITIAL_ROW_OFFSET,
+            NATIVE_ROWS_INITIAL_ROW,
+            "AArch64 frozen initial row",
+        ),
+        (
+            FROZEN_PREPARED_HEADER_V1_UNFILLED_CELL_OFFSET,
+            NATIVE_ROWS_UNFILLED_CELL,
+            "AArch64 frozen unfilled cell",
+        ),
+        (
+            FROZEN_PREPARED_HEADER_V1_ACCEPT_MASK_OFFSET,
+            NATIVE_ROWS_ACCEPT_MASK,
+            "AArch64 frozen accept mask",
+        ),
+        (
+            FROZEN_PREPARED_HEADER_V1_NEXT_ROW_TOKEN_MASK_OFFSET,
+            NATIVE_ROWS_NEXT_ROW_TOKEN_MASK,
+            "AArch64 frozen next-row mask",
+        ),
+    ] {
+        assembler.instruction(aarch64_load_w_imm(
+            8,
+            0,
+            offset(header_field, context)?,
+        )?)?;
+        assembler.instruction(aarch64_load_w_imm(
+            9,
+            13,
+            offset(tail_field, context)?,
+        )?)?;
+        assembler.instruction(aarch64_cmp_w(9, 8)?)?;
+        assembler.branch_cond(AARCH64_NE, call_preflight)?;
+    }
+
+    assembler.instruction(aarch64_load_x_imm(
+        8,
+        13,
+        offset(NATIVE_ROWS_ROWS_ADDRESS, "AArch64 frozen rows address")?,
+    )?)?;
+    assembler.instruction(aarch64_cmp_x_imm(8, 0)?)?;
+    assembler.branch_cond(AARCH64_EQ, call_preflight)?;
+    assembler.instruction(aarch64_and_low_x(12, 8, 2)?)?;
+    assembler.instruction(aarch64_cmp_x_imm(12, 0)?)?;
+    assembler.branch_cond(AARCH64_NE, call_preflight)?;
+    assembler.instruction(aarch64_load_x_imm(
+        9,
+        13,
+        offset(
+            NATIVE_ROWS_CLASS_MAP_ADDRESS,
+            "AArch64 frozen class map address",
+        )?,
+    )?)?;
+    assembler.instruction(aarch64_cmp_x_imm(9, 0)?)?;
+    assembler.branch_cond(AARCH64_EQ, call_preflight)?;
+    assembler.instruction(aarch64_load_x_imm(
+        9,
+        13,
+        offset(
+            NATIVE_ROWS_CACHE_IDENTITY,
+            "AArch64 frozen cache identity",
+        )?,
+    )?)?;
+    assembler.instruction(aarch64_cmp_x_imm(9, 0)?)?;
+    assembler.branch_cond(AARCH64_EQ, call_preflight)?;
+    assembler.instruction(aarch64_load_w_imm(
+        9,
+        13,
+        offset(NATIVE_ROWS_INITIAL_FLAGS, "AArch64 frozen initial flags")?,
+    )?)?;
+    assembler.branch_nonzero_w(9, call_preflight)?;
+
+    for (field, expected, context) in [
+        (
+            NATIVE_ROWS_UNFILLED_CELL,
+            DYNAMIC_NATIVE_ROWS_V1_UNFILLED_CELL,
+            "AArch64 frozen unfilled value",
+        ),
+        (
+            NATIVE_ROWS_ACCEPT_MASK,
+            DYNAMIC_NATIVE_ROWS_V1_ACCEPT_MASK,
+            "AArch64 frozen accept value",
+        ),
+        (
+            NATIVE_ROWS_NEXT_ROW_TOKEN_MASK,
+            DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK,
+            "AArch64 frozen next-row value",
+        ),
+    ] {
+        assembler.instruction(aarch64_load_w_imm(9, 13, offset(field, context)?)?)?;
+        aarch64_load_u32_constant(assembler, 12, expected)?;
+        assembler.instruction(aarch64_cmp_w(9, 12)?)?;
+        assembler.branch_cond(AARCH64_NE, call_preflight)?;
+    }
+
+    assembler.instruction(aarch64_load_x_imm(
+        10,
+        13,
+        offset(NATIVE_ROWS_LIVE_CELLS, "AArch64 frozen live cells")?,
+    )?)?;
+    assembler.instruction(aarch64_cmp_x_imm(10, 0)?)?;
+    assembler.branch_cond(AARCH64_EQ, call_preflight)?;
+    aarch64_load_u32_constant(assembler, 12, DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK)?;
+    assembler.instruction(aarch64_cmp_x(10, 12)?)?;
+    assembler.branch_cond(AARCH64_HI, call_preflight)?;
+    assembler.instruction(aarch64_load_w_imm(
+        8,
+        13,
+        offset(NATIVE_ROWS_ROW_STRIDE, "AArch64 frozen row stride")?,
+    )?)?;
+    assembler.branch_zero_w(8, call_preflight)?;
+    assembler.instruction(aarch64_cmp_w_imm(8, 256)?)?;
+    assembler.branch_cond(AARCH64_HI, call_preflight)?;
+
+    assembler.instruction(aarch64_udiv_x(11, 10, 8)?)?;
+    assembler.instruction(aarch64_msub_x(12, 11, 8, 10)?)?;
+    assembler.instruction(aarch64_cmp_x_imm(12, 0)?)?;
+    assembler.branch_cond(AARCH64_NE, call_preflight)?;
+    assembler.instruction(aarch64_load_w_imm(
+        9,
+        13,
+        offset(NATIVE_ROWS_INITIAL_ROW, "AArch64 frozen initial row")?,
+    )?)?;
+    assembler.instruction(aarch64_udiv_x(11, 9, 8)?)?;
+    assembler.instruction(aarch64_msub_x(12, 11, 8, 9)?)?;
+    assembler.instruction(aarch64_cmp_x_imm(12, 0)?)?;
+    assembler.branch_cond(AARCH64_NE, call_preflight)?;
+    assembler.instruction(aarch64_add_x_reg(12, 9, 8)?)?;
+    assembler.instruction(aarch64_cmp_x(12, 10)?)?;
+    assembler.branch_cond(AARCH64_HI, call_preflight)?;
+
+    assembler.instruction(aarch64_load_w_imm(
+        7,
+        13,
+        offset(NATIVE_ROWS_LOOP_COUNT, "AArch64 frozen loop count")?,
+    )?)?;
+    if has_root_scanner {
+        assembler.instruction(aarch64_cmp_w_imm(
+            7,
+            u16::try_from(NATIVE_ROWS_LOOP_ROW_CAPACITY)
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 frozen loop capacity"))?,
+        )?)?;
+        assembler.branch_cond(AARCH64_HI, call_preflight)?;
+    } else {
+        assembler.branch_nonzero_w(7, call_preflight)?;
+    }
+    for loop_index in 0..NATIVE_ROWS_LOOP_ROW_CAPACITY {
+        let inactive = assembler.label()?;
+        let checked = assembler.label()?;
+        assembler.instruction(aarch64_cmp_w_imm(
+            7,
+            u16::try_from(loop_index)
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 frozen loop index"))?,
+        )?)?;
+        assembler.branch_cond(AARCH64_LS, inactive)?;
+        let row_offset = native_rows_loop_row_offset(loop_index)?;
+        assembler.instruction(aarch64_load_w_imm(
+            9,
+            13,
+            offset(row_offset, "AArch64 frozen loop row")?,
+        )?)?;
+        assembler.instruction(aarch64_udiv_x(11, 9, 8)?)?;
+        assembler.instruction(aarch64_msub_x(12, 11, 8, 9)?)?;
+        assembler.instruction(aarch64_cmp_x_imm(12, 0)?)?;
+        assembler.branch_cond(AARCH64_NE, call_preflight)?;
+        assembler.instruction(aarch64_add_x_reg(12, 9, 8)?)?;
+        assembler.instruction(aarch64_cmp_x(12, 10)?)?;
+        assembler.branch_cond(AARCH64_HI, call_preflight)?;
+        for prior in 0..loop_index {
+            assembler.instruction(aarch64_load_w_imm(
+                11,
+                13,
+                offset(
+                    native_rows_loop_row_offset(prior)?,
+                    "AArch64 frozen prior loop row",
+                )?,
+            )?)?;
+            assembler.instruction(aarch64_cmp_w(9, 11)?)?;
+            assembler.branch_cond(AARCH64_EQ, call_preflight)?;
+        }
+        assembler.branch(checked)?;
+        assembler.bind(inactive)?;
+        assembler.instruction(aarch64_load_w_imm(
+            9,
+            13,
+            offset(row_offset, "AArch64 frozen inactive loop row")?,
+        )?)?;
+        aarch64_load_u32_constant(assembler, 11, u32::MAX)?;
+        assembler.instruction(aarch64_cmp_w(9, 11)?)?;
+        assembler.branch_cond(AARCH64_NE, call_preflight)?;
+        assembler.bind(checked)?;
+    }
+
+    assembler.instruction(aarch64_load_x_imm(8, 31, 24)?)?;
+    assembler.instruction(aarch64_store_x(8, 31, 48)?)?;
+    assembler.instruction(aarch64_load_x_imm(8, 31, 32)?)?;
+    assembler.instruction(aarch64_store_x(8, 31, 56)?)?;
+    assembler.instruction(aarch64_store_x(13, 31, 64)?)?;
+    assembler.instruction(aarch64_load_x_imm(
+        8,
+        13,
+        offset(
+            NATIVE_ROWS_CACHE_IDENTITY,
+            "AArch64 frozen cache identity output",
+        )?,
+    )?)?;
+    assembler.instruction(aarch64_store_x(8, 31, 72)?)?;
+    assembler.branch(preflight_enter)?;
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
     reason = "the authenticated preflight, scanner, local exits, and whole-search deopt form one ABI transaction"
 )]
 #[cfg(test)]
@@ -18083,14 +18892,35 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     let native_continue = allow_direct_hole_continuation
         .then(|| assembler.label())
         .transpose()?;
+    let call_preflight = assembler.label()?;
     let framed_fallback = assembler.label()?;
+    let adaptive_fallback = assembler.label()?;
     let short_fallback = assembler.label()?;
 
+    assembler.instruction(aarch64_cmp_x_imm(0, 0)?)?;
+    assembler.branch_cond(AARCH64_EQ, short_fallback)?;
+    assembler.instruction(aarch64_cmp_x_imm(1, 0)?)?;
+    assembler.branch_cond(AARCH64_EQ, short_fallback)?;
+    assembler.instruction(aarch64_cmp_x_imm(5, 0)?)?;
+    assembler.branch_cond(AARCH64_EQ, short_fallback)?;
+    assembler.instruction(aarch64_and_low_x(6, 5, 3)?)?;
+    assembler.instruction(aarch64_cmp_x_imm(6, 0)?)?;
+    assembler.branch_cond(AARCH64_NE, short_fallback)?;
+    assembler.instruction(aarch64_cmp_x_imm(2, 0)?)?;
+    assembler.branch_cond(AARCH64_MI, short_fallback)?;
+    assembler.instruction(aarch64_cmp_x(3, 4)?)?;
+    assembler.branch_cond(AARCH64_HI, short_fallback)?;
+    assembler.instruction(aarch64_cmp_x(4, 2)?)?;
+    assembler.branch_cond(AARCH64_HI, short_fallback)?;
     assembler.instruction(aarch64_sub_x_reg(6, 4, 3)?)?;
     let minimum = u16::try_from(DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES)
         .map_err(|_| ObjectError::ArithmeticOverflow("dynamic row input floor"))?;
     assembler.instruction(aarch64_cmp_x_imm(6, minimum)?)?;
     assembler.branch_cond(AARCH64_LO, short_fallback)?;
+    let maximum = u16::try_from(FROZEN_DYNAMIC_ROWS_MAX_INPUT_BYTES)
+        .map_err(|_| ObjectError::ArithmeticOverflow("frozen dynamic row input ceiling"))?;
+    assembler.instruction(aarch64_cmp_x_imm(6, maximum)?)?;
+    assembler.branch_cond(AARCH64_HI, short_fallback)?;
 
     assembler.instruction(aarch64_sub_x_imm(31, 31, FRAME_BYTES)?)?;
     assembler.instruction(aarch64_store_x(30, 31, 88)?)?;
@@ -18107,6 +18937,22 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     // address in the spare word at SP+80 so table-backed scanners can recover
     // their post-identity base after the helper clobbers caller-saved X6.
     assembler.instruction(aarch64_store_x(6, 31, 80)?)?;
+
+    aarch64_emit_frozen_dynamic_entry(
+        &mut assembler,
+        call_preflight,
+        preflight_enter,
+        root_plan.is_some(),
+    )?;
+
+    assembler.bind(call_preflight)?;
+    assembler.instruction(aarch64_load_x_imm(0, 31, 0)?)?;
+    assembler.instruction(aarch64_load_x_imm(1, 31, 8)?)?;
+    assembler.instruction(aarch64_load_x_imm(2, 31, 16)?)?;
+    assembler.instruction(aarch64_load_x_imm(3, 31, 24)?)?;
+    assembler.instruction(aarch64_load_x_imm(4, 31, 32)?)?;
+    assembler.instruction(aarch64_load_x_imm(5, 31, 40)?)?;
+    assembler.instruction(aarch64_load_x_imm(6, 31, 80)?)?;
     assembler.instruction(aarch64_add_x_imm(7, 31, 48)?)?;
     let preflight_branch = assembler.instruction(0x9400_0000)?;
     assembler.instruction(aarch64_cmp_w_imm(
@@ -18649,6 +19495,11 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     let mut continuation_branch = None;
     if let Some(native_continue) = native_continue {
         assembler.bind(native_continue)?;
+        assembler.instruction(aarch64_load_x_imm(12, 31, 0)?)?;
+        aarch64_load_u64_constant(&mut assembler, 10, FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL)?;
+        assembler.instruction(aarch64_load_x_imm(8, 12, 0)?)?;
+        assembler.instruction(aarch64_cmp_x(8, 10)?)?;
+        assembler.branch_cond(AARCH64_EQ, framed_fallback)?;
         // Preserve the exact scalar frontier, then reuse the five preflight
         // words as the compiler-private continuation record.
         assembler.instruction(aarch64_load_x_imm(9, 31, 72)?)?; // cache identity
@@ -18690,6 +19541,22 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     }
 
     assembler.bind(framed_fallback)?;
+    assembler.instruction(aarch64_load_x_imm(12, 31, 0)?)?;
+    aarch64_load_u64_constant(&mut assembler, 10, FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL)?;
+    assembler.instruction(aarch64_load_x_imm(8, 12, 0)?)?;
+    assembler.instruction(aarch64_cmp_x(8, 10)?)?;
+    assembler.branch_cond(AARCH64_NE, adaptive_fallback)?;
+    assembler.instruction(aarch64_load_x_imm(0, 31, 0)?)?;
+    assembler.instruction(aarch64_load_x_imm(1, 31, 8)?)?;
+    assembler.instruction(aarch64_load_x_imm(2, 31, 16)?)?;
+    assembler.instruction(aarch64_load_x_imm(3, 31, 24)?)?;
+    assembler.instruction(aarch64_load_x_imm(4, 31, 32)?)?;
+    assembler.instruction(aarch64_load_x_imm(5, 31, 40)?)?;
+    assembler.instruction(aarch64_load_x_imm(30, 31, 88)?)?;
+    assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.branch(short_fallback)?;
+
+    assembler.bind(adaptive_fallback)?;
     assembler.instruction(aarch64_load_x_imm(0, 31, 0)?)?;
     assembler.instruction(aarch64_load_x_imm(1, 31, 8)?)?;
     assembler.instruction(aarch64_load_x_imm(2, 31, 16)?)?;
@@ -23973,9 +24840,18 @@ mod tests {
             let continuation = x86_unfilled_target(&x86.code);
             assert_eq!(
                 &x86.code[continuation..continuation + 5],
-                &[0x4c, 0x8b, 0x5c, 0x24, 0x58],
-                "x86 {output:?} branches directly to cache-identity capture"
+                &[0x4c, 0x8b, 0x54, 0x24, 0x10],
+                "x86 {output:?} authenticates the frozen seal before continuation"
             );
+            let cache_capture = continuation
+                .checked_add(
+                    x86.code[continuation..]
+                        .windows(5)
+                        .position(|bytes| bytes == [0x4c, 0x8b, 0x5c, 0x24, 0x58])
+                        .expect("x86 cache-identity capture after frozen-seal guard"),
+                )
+                .expect("x86 cache-identity offset");
+            assert!(continuation < cache_capture);
             for instruction in [
                 [0x4c, 0x89, 0x44, 0x24, 0x40],
                 [0x48, 0x89, 0x54, 0x24, 0x48],
@@ -24022,9 +24898,18 @@ mod tests {
             let continuation = aarch64_conditional_target(&words, compare + 1);
             assert_eq!(
                 words[continuation],
-                aarch64_load_x_imm(9, 31, 72).unwrap(),
-                "AArch64 {output:?} branches directly to cache-identity capture"
+                aarch64_load_x_imm(12, 31, 0).unwrap(),
+                "AArch64 {output:?} authenticates the frozen seal before continuation"
             );
+            let cache_capture = continuation
+                .checked_add(
+                    words[continuation..]
+                        .iter()
+                        .position(|&word| word == aarch64_load_x_imm(9, 31, 72).unwrap())
+                        .expect("AArch64 cache-identity capture after frozen-seal guard"),
+                )
+                .expect("AArch64 cache-identity offset");
+            assert!(continuation < cache_capture);
             for instruction in [
                 aarch64_store_x(11, 31, 48).unwrap(),
                 aarch64_store_x(2, 31, 56).unwrap(),
@@ -24057,8 +24942,8 @@ mod tests {
         let fallback = x86_unfilled_target(&x86_deopt.code);
         assert_eq!(
             &x86_deopt.code[fallback..fallback + 5],
-            &[0x48, 0x8b, 0x7c, 0x24, 0x10],
-            "an unauthenticated scanner-free lowering retains whole-window deopt"
+            &[0x4c, 0x8b, 0x54, 0x24, 0x10],
+            "a scanner-free side exit authenticates the frozen seal before choosing fallback"
         );
 
         let arm_deopt = lower_aarch64_dynamic_rows_prepared_for_output(
@@ -24093,8 +24978,8 @@ mod tests {
         let fallback = aarch64_conditional_target(&words, compare + 1);
         assert_eq!(
             words[fallback],
-            aarch64_load_x_imm(0, 31, 0).unwrap(),
-            "unauthenticated AArch64 lowering retains whole-window deopt"
+            aarch64_load_x_imm(12, 31, 0).unwrap(),
+            "AArch64 side exit authenticates the frozen seal before choosing fallback"
         );
     }
 
@@ -24796,12 +25681,12 @@ mod tests {
     while(position<69){{
       uint32_t cell=cells[state];position++;
       if((cell&UINT32_C(0x80000000))!=0)pending=position;
-      uint32_t next=cell&UINT32_C(0x7fffffff);
+      uint32_t next=cell&UINT32_C(0x1fffffff);
       if(next==0)break;
       state=next-1;
     }}
     r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;
-    status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,69,&r);
+    status={symbol}((handle_t)&frozen,haystack,sizeof(haystack),5,69,&r);
     if(status!=(pending?1u:0u)||r.start!=pending||r.end!=pending||fallback_calls!=0||deopt_calls!=0||preflight_calls!=1)return 22;
   }}
 "
@@ -24809,6 +25694,12 @@ mod tests {
         } else {
             String::new()
         };
+        let frozen_active_seal = FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL;
+        let frozen_magic = FROZEN_PREPARED_HEADER_V1_MAGIC;
+        let frozen_abi_version = FROZEN_PREPARED_HEADER_V1_ABI_VERSION;
+        let frozen_dynamic_flag = FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS;
+        let frozen_header_bytes = FROZEN_PREPARED_HEADER_V2_BYTES;
+        let frozen_next_row_mask = DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK;
         let source = format!(
             r"#include <stddef.h>
 #include <stdint.h>
@@ -24825,22 +25716,67 @@ typedef struct {{
 typedef struct {{
   size_t start; size_t end; size_t native_rows_address; uint64_t cache_generation;
 }} preflight_t;
+typedef struct {{
+  uint64_t active_seal; uint64_t magic; uint32_t abi_version; uint32_t flags;
+  size_t header_bytes; unsigned char artifact_identity[32];
+  size_t forward_rows_address; size_t reverse_rows_address;
+  size_t forward_live_cells; size_t reverse_live_cells; uint64_t cache_identity;
+  uint32_t row_stride; uint32_t forward_initial_row; uint32_t reverse_initial_row;
+  uint32_t unfilled_cell; uint32_t accept_mask; uint32_t next_row_token_mask;
+  unsigned char class_map[256];
+}} frozen_v1_t;
+typedef struct {{ frozen_v1_t v1; rows_t rows; }} frozen_v2_t;
+_Static_assert(offsetof(frozen_v2_t,rows)==384,"frozen V2 tail offset");
+_Static_assert(sizeof(frozen_v2_t)==464,"frozen V2 extent");
 extern uint32_t {symbol}(handle_t,const unsigned char*,size_t,size_t,size_t,result_t*);
 static const unsigned char identity[32] = {{{identity}}};
 static unsigned char haystack[80];
+static unsigned char boundary_haystack[4101];
 static unsigned char classes[256];
-static uint32_t cells[2];
+static uint32_t cells[65792];
 static rows_t rows;
+static frozen_v2_t frozen;
 static int mode, preflight_calls, fallback_calls, deopt_calls;
+static int direct_routes, preflight_routes, ordinary_routes;
 static void init_rows(void) {{
   memset(haystack,'a',sizeof(haystack));
+  memset(boundary_haystack,'a',sizeof(boundary_haystack));
+  memset(classes,0,sizeof(classes));
   memset(cells,0,sizeof(cells));
   memset(&rows,0,sizeof(rows));
   rows.rows_address=(size_t)(uintptr_t)cells;
   rows.class_map_address=(size_t)(uintptr_t)classes;
   rows.live_cells=2; rows.row_stride=1; rows.initial_row=0;
   rows.unfilled_cell=UINT32_MAX; rows.accept_mask=UINT32_C(0x80000000);
-  rows.next_row_token_mask=UINT32_C(0x7fffffff); rows.cache_identity=77;
+  rows.next_row_token_mask=UINT32_C({frozen_next_row_mask}); rows.cache_identity=77;
+  for(size_t i=0;i<4;i++)rows.learned_loop_rows[i]=UINT32_MAX;
+}}
+static void init_frozen(uint32_t stride,size_t states,int matching) {{
+  init_rows();memset(&frozen,0,sizeof(frozen));
+  size_t live=states*(size_t)stride;
+  size_t initial=(states-2U)*(size_t)stride;
+  for(size_t byte=0;byte<sizeof(classes);byte++)classes[byte]=(unsigned char)(byte%(size_t)stride);
+  uint32_t class_id=classes[(unsigned char)'a'];
+  rows.live_cells=live;rows.row_stride=stride;rows.initial_row=(uint32_t)initial;
+  cells[initial+(size_t)class_id]=(uint32_t)(initial+(size_t)stride+1U);
+  cells[initial+(size_t)stride+(size_t)class_id]=matching?UINT32_C(0x80000000):0;
+  frozen.rows=rows;
+  frozen.v1.active_seal=UINT64_C({frozen_active_seal});
+  frozen.v1.magic=UINT64_C({frozen_magic});
+  frozen.v1.abi_version=UINT32_C({frozen_abi_version});
+  frozen.v1.flags=UINT32_C({frozen_dynamic_flag});
+  frozen.v1.header_bytes={frozen_header_bytes}U;
+  memcpy(frozen.v1.artifact_identity,identity,sizeof(identity));
+  frozen.v1.forward_rows_address=rows.rows_address;
+  frozen.v1.forward_live_cells=rows.live_cells;
+  frozen.v1.cache_identity=rows.cache_identity;
+  frozen.v1.row_stride=rows.row_stride;
+  frozen.v1.forward_initial_row=rows.initial_row;
+  frozen.v1.reverse_initial_row=UINT32_MAX;
+  frozen.v1.unfilled_cell=rows.unfilled_cell;
+  frozen.v1.accept_mask=rows.accept_mask;
+  frozen.v1.next_row_token_mask=rows.next_row_token_mask;
+  memcpy(frozen.v1.class_map,classes,sizeof(classes));
 }}
 uint32_t fre_aot_regex_runtime_search_v1(const unsigned char*a,const unsigned char*b,size_t n,size_t s,size_t e,result_t*r) {{
   (void)a;(void)b;(void)n;(void)s;(void)e;(void)r;return 98;
@@ -24848,50 +25784,172 @@ uint32_t fre_aot_regex_runtime_search_v1(const unsigned char*a,const unsigned ch
 uint32_t fre_aot_regex_runtime_search_exclusive_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r) {{
   fallback_calls++;
   if(h==NULL)return 5;
+  if(p==NULL||r==NULL||(((uintptr_t)r)&7U)!=0||n>((size_t)-1>>1)||s>e||e>n)return 2;
+  if(h!=(handle_t)&frozen)return 90;
+  frozen.v1.active_seal=0;
+  if(mode>=20){{r->start=123;r->end=456;return 77;}}
   if(p!=haystack||n!=sizeof(haystack)||s!=5||e!=36||mode!=1)return 89;
   r->start=123;r->end=456;return 77;
 }}
 uint32_t fre_aot_regex_runtime_search_exclusive_dynamic_rows_deopt_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r) {{
   deopt_calls++;
   if(h==NULL)return 5;
+  if(h!=(handle_t)&frozen)return 90;
   if(p!=haystack||n!=sizeof(haystack)||s!=5||e!=69||mode<5||mode>11)return 87;
   r->start=123;r->end=456;return 77;
 }}
 uint32_t fre_aot_regex_runtime_search_exclusive_dynamic_rows_preflight_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*d,preflight_t*out) {{
   preflight_calls++;
   if(h==NULL)return 5;
+  if(h!=(handle_t)&frozen)return 90;
+  frozen.v1.active_seal=0;
   if(p!=haystack||n!=sizeof(haystack)||s!=5||e!=69||d==NULL||out==NULL||memcmp(d,identity,32)!=0)return 88;
   if(mode==2){{r->start=321;r->end=654;return 76;}}
   out->start=s;out->end=e;out->native_rows_address=(size_t)(uintptr_t)&rows;
   out->cache_generation=(mode==6)?78:77;return 6;
 }}
+static int run_direct(uint32_t stride,size_t states,int matching,const unsigned char*p,size_t n,size_t s,size_t e,int base) {{
+  init_frozen(stride,states,matching);mode=20;
+  result_t r={{91,92}};fallback_calls=preflight_calls=deopt_calls=0;
+  uint32_t status={symbol}((handle_t)&frozen,p,n,s,e,&r);
+  uint32_t expected=matching?1U:0U;
+  size_t expected_start=matching?{match_start}U:0U;
+  size_t expected_end=matching?{match_end}U:0U;
+  if(status!=expected||r.start!=expected_start||r.end!=expected_end)return base;
+  if(fallback_calls!=0||preflight_calls!=0||deopt_calls!=0)return base+1;
+  if(frozen.v1.active_seal!=UINT64_C({frozen_active_seal}))return base+2;
+  direct_routes++;return 0;
+}}
+static int run_bad_header(int kind,int base) {{
+  init_frozen(127,256,1);mode=20;
+  switch(kind) {{
+    case 0:frozen.v1.active_seal=0;break;
+    case 1:frozen.v1.magic^=1;break;
+    case 2:frozen.v1.abi_version^=1;break;
+    case 3:frozen.v1.flags^=1;break;
+    case 4:frozen.v1.header_bytes-=1;break;
+    case 5:frozen.v1.artifact_identity[0]^=1;break;
+    case 6:frozen.v1.reverse_rows_address=1;break;
+    case 7:frozen.v1.reverse_live_cells=1;break;
+    case 8:frozen.v1.reverse_initial_row=0;break;
+    case 9:frozen.rows.rows_address^=4;break;
+    case 10:frozen.rows.live_cells-=127;break;
+    case 11:frozen.rows.cache_identity^=1;break;
+    case 12:frozen.rows.row_stride=128;break;
+    case 13:frozen.rows.initial_row-=127;break;
+    case 14:frozen.rows.unfilled_cell=0;break;
+    case 15:frozen.rows.accept_mask=0;break;
+    case 16:frozen.rows.next_row_token_mask=0;break;
+    case 17:frozen.rows.rows_address=0;frozen.v1.forward_rows_address=0;break;
+    case 18:frozen.rows.rows_address=(size_t)(uintptr_t)((unsigned char*)cells+1);frozen.v1.forward_rows_address=frozen.rows.rows_address;break;
+    case 19:frozen.rows.class_map_address=0;break;
+    case 20:frozen.rows.cache_identity=0;frozen.v1.cache_identity=0;break;
+    case 21:frozen.rows.initial_flags=1;break;
+    case 22:frozen.rows.unfilled_cell=0;frozen.v1.unfilled_cell=0;break;
+    case 23:frozen.rows.accept_mask=0;frozen.v1.accept_mask=0;break;
+    case 24:frozen.rows.next_row_token_mask=0;frozen.v1.next_row_token_mask=0;break;
+    case 25:frozen.rows.live_cells=0;frozen.v1.forward_live_cells=0;break;
+    case 26:frozen.rows.live_cells=(size_t)UINT32_C({frozen_next_row_mask})+1U;frozen.v1.forward_live_cells=frozen.rows.live_cells;break;
+    case 27:frozen.rows.row_stride=0;frozen.v1.row_stride=0;break;
+    case 28:frozen.rows.row_stride=257;frozen.v1.row_stride=257;break;
+    case 29:frozen.rows.live_cells+=1;frozen.v1.forward_live_cells=frozen.rows.live_cells;break;
+    case 30:frozen.rows.initial_row+=1;frozen.v1.forward_initial_row=frozen.rows.initial_row;break;
+    case 31:frozen.rows.initial_row=(uint32_t)frozen.rows.live_cells;frozen.v1.forward_initial_row=frozen.rows.initial_row;break;
+    case 32:frozen.rows.learned_loop_row_count=5;break;
+    case 33:frozen.rows.learned_loop_rows[0]=0;break;
+    case 34:frozen.rows.learned_loop_row_count=1;frozen.rows.learned_loop_rows[0]=1;break;
+    case 35:frozen.rows.learned_loop_row_count=1;frozen.rows.learned_loop_rows[0]=(uint32_t)frozen.rows.live_cells;break;
+    case 36:frozen.rows.learned_loop_row_count=2;frozen.rows.learned_loop_rows[0]=0;frozen.rows.learned_loop_rows[1]=0;break;
+    default:return base+3;
+  }}
+  result_t r={{91,92}};fallback_calls=preflight_calls=deopt_calls=0;
+  uint32_t status={symbol}((handle_t)&frozen,haystack,sizeof(haystack),5,69,&r);
+  if(status!=1||r.start!={match_start}U||r.end!={match_end}U)return base;
+  if(fallback_calls!=0||preflight_calls!=1||deopt_calls!=0)return base+1;
+  if(frozen.v1.active_seal!=0)return base+2;
+  preflight_routes++;return 0;
+}}
+static int run_active_hole(int base) {{
+  init_frozen(1,255,1);mode=20;
+  cells[frozen.rows.initial_row+(size_t)classes[(unsigned char)'a']]=UINT32_MAX;
+  result_t r={{91,92}};fallback_calls=preflight_calls=deopt_calls=0;
+  uint32_t status={symbol}((handle_t)&frozen,haystack,sizeof(haystack),5,69,&r);
+  if(status!=77||r.start!=123||r.end!=456)return base;
+  if(fallback_calls!=1||preflight_calls!=0||deopt_calls!=0)return base+1;
+  if(frozen.v1.active_seal!=0)return base+2;
+  ordinary_routes++;return 0;
+}}
+static int run_ordinary_window(size_t window,int base) {{
+  init_frozen(1,255,1);mode=20;
+  result_t r={{91,92}};fallback_calls=preflight_calls=deopt_calls=0;
+  uint32_t status={symbol}((handle_t)&frozen,boundary_haystack,sizeof(boundary_haystack),5,5+window,&r);
+  if(status!=77||r.start!=123||r.end!=456)return base;
+  if(fallback_calls!=1||preflight_calls!=0||deopt_calls!=0)return base+1;
+  if(frozen.v1.active_seal!=0)return base+2;
+  ordinary_routes++;return 0;
+}}
+static int run_invalid_public(int kind,int base) {{
+  init_frozen(1,255,1);mode=20;
+  result_t r={{91,92}};union{{uint64_t align;unsigned char bytes[sizeof(result_t)+8];}} raw;
+  handle_t h=(handle_t)(uintptr_t)0x1234;const unsigned char*p=boundary_haystack;
+  size_t n=sizeof(boundary_haystack),s=5,e=69;result_t*out=&r;
+  switch(kind) {{
+    case 0:p=NULL;break;
+    case 1:out=NULL;break;
+    case 2:out=(result_t*)(void*)(raw.bytes+1);break;
+    case 3:n=((size_t)1<<(sizeof(size_t)*8-1));s=0;e=0;break;
+    case 4:s=70;e=69;break;
+    case 5:s=n;e=n+1;break;
+    default:return base+3;
+  }}
+  fallback_calls=preflight_calls=deopt_calls=0;
+  uint32_t status={symbol}(h,p,n,s,e,out);
+  if(status!=2)return base;
+  if(fallback_calls!=1||preflight_calls!=0||deopt_calls!=0)return base+1;
+  if(out==&r&&(r.start!=91||r.end!=92))return base+2;
+  ordinary_routes++;return 0;
+}}
 int main(void) {{
-  init_rows(); result_t r={{91,92}}; uint32_t status;
-  mode=1;fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,36,&r);
+  init_rows();memset(&frozen,0,sizeof(frozen));result_t r={{91,92}};uint32_t status;
+  mode=1;fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)&frozen,haystack,sizeof(haystack),5,36,&r);
   if(status!=77||r.start!=123||r.end!=456||fallback_calls!=1||deopt_calls!=0||preflight_calls!=0)return 10;
-  mode=2;r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,69,&r);
+  mode=2;r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)&frozen,haystack,sizeof(haystack),5,69,&r);
   if(status!=76||r.start!=321||r.end!=654||fallback_calls!=0||deopt_calls!=0||preflight_calls!=1)return 11;
-  mode=3;cells[0]={first_match_cell};cells[1]=UINT32_C(0x80000000);r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,69,&r);
+  mode=3;cells[0]={first_match_cell};cells[1]=UINT32_C(0x80000000);r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)&frozen,haystack,sizeof(haystack),5,69,&r);
   if(status!=1||r.start!={match_start}||r.end!={match_end}||fallback_calls!=0||deopt_calls!=0||preflight_calls!=1)return 12;
-  mode=4;cells[0]=0;cells[1]=0;r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,69,&r);
+  mode=4;cells[0]=0;cells[1]=0;r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)&frozen,haystack,sizeof(haystack),5,69,&r);
   if(status!=0||r.start!=0||r.end!=0||fallback_calls!=0||deopt_calls!=0||preflight_calls!=1)return 13;
-  mode=5;cells[0]=UINT32_MAX;r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,69,&r);
+  mode=5;cells[0]=UINT32_MAX;r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)&frozen,haystack,sizeof(haystack),5,69,&r);
   if(status!=77||r.start!=123||r.end!=456||fallback_calls!=0||deopt_calls!=1||preflight_calls!=1)return 14;
-  mode=6;cells[0]=UINT32_C(0x80000000);r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,69,&r);
+  mode=6;cells[0]=UINT32_C(0x80000000);r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)&frozen,haystack,sizeof(haystack),5,69,&r);
   if(status!=77||r.start!=123||r.end!=456||fallback_calls!=0||deopt_calls!=1||preflight_calls!=1)return 15;
-  mode=7;rows.initial_flags=1;r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,69,&r);
+  mode=7;rows.initial_flags=1;r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)&frozen,haystack,sizeof(haystack),5,69,&r);
   if(status!=77||r.start!=123||r.end!=456||fallback_calls!=0||deopt_calls!=1||preflight_calls!=1)return 16;
-  init_rows();mode=8;cells[0]=2;cells[1]=2;r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,69,&r);
+  init_rows();mode=8;cells[0]=2;cells[1]=2;r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)&frozen,haystack,sizeof(haystack),5,69,&r);
   if(status!=0||r.start!=0||r.end!=0||fallback_calls!=0||deopt_calls!=0||preflight_calls!=1)return 18;
-  init_rows();mode=9;rows.learned_loop_row_count=1;rows.learned_loop_rows[0]=0;cells[0]=2;cells[1]=UINT32_C(0x80000000);r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,69,&r);
+  init_rows();mode=9;rows.learned_loop_row_count=1;rows.learned_loop_rows[0]=0;cells[0]=2;cells[1]=UINT32_C(0x80000000);r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)&frozen,haystack,sizeof(haystack),5,69,&r);
   {initial_loop_assertion}
-  init_rows();mode=10;rows.learned_loop_row_count=1;rows.learned_loop_rows[0]=1;cells[0]={pending_deopt_cell};cells[1]=UINT32_C(0x80000000);r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,69,&r);
+  init_rows();mode=10;rows.learned_loop_row_count=1;rows.learned_loop_rows[0]=1;cells[0]={pending_deopt_cell};cells[1]=UINT32_C(0x80000000);r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)&frozen,haystack,sizeof(haystack),5,69,&r);
   if(status!=77||r.start!=123||r.end!=456||fallback_calls!=0||deopt_calls!=1||preflight_calls!=1)return 20;
-  init_rows();mode=11;rows.learned_loop_row_count=5;r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)(uintptr_t)0x1234,haystack,sizeof(haystack),5,69,&r);
+  init_rows();mode=11;rows.learned_loop_row_count=5;r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)&frozen,haystack,sizeof(haystack),5,69,&r);
   if(status!=77||r.start!=123||r.end!=456||fallback_calls!=0||deopt_calls!=1||preflight_calls!=1)return 21;
   mode=0;rows.initial_flags=0;r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}(NULL,haystack,sizeof(haystack),5,69,&r);
-  if(status!=5||r.start!=91||r.end!=92||fallback_calls!=0||deopt_calls!=0||preflight_calls!=1)return 17;
+  if(status!=5||r.start!=91||r.end!=92||fallback_calls!=1||deopt_calls!=0||preflight_calls!=0)return 17;
   {exhaustive_selected}
+  int route_status=0;
+  route_status=run_direct(1,255,1,haystack,sizeof(haystack),5,69,100);if(route_status)return route_status;
+  route_status=run_direct(127,256,1,haystack,sizeof(haystack),5,69,104);if(route_status)return route_status;
+  route_status=run_direct(128,257,1,haystack,sizeof(haystack),5,69,108);if(route_status)return route_status;
+  route_status=run_direct(256,257,1,haystack,sizeof(haystack),5,69,112);if(route_status)return route_status;
+  route_status=run_direct(256,255,0,haystack,sizeof(haystack),5,69,116);if(route_status)return route_status;
+  route_status=run_direct(1,255,1,boundary_haystack,sizeof(boundary_haystack),5,37,120);if(route_status)return route_status;
+  route_status=run_direct(1,255,1,boundary_haystack,sizeof(boundary_haystack),5,4100,124);if(route_status)return route_status;
+  route_status=run_ordinary_window(31,128);if(route_status)return route_status;
+  route_status=run_ordinary_window(4096,132);if(route_status)return route_status;
+  route_status=run_active_hole(136);if(route_status)return route_status;
+  for(int kind=0;kind<=5;kind++){{route_status=run_invalid_public(kind,60+kind*4);if(route_status)return route_status;}}
+  for(int kind=0;kind<=36;kind++){{route_status=run_bad_header(kind,144+kind*3);if(route_status)return route_status;}}
+  if(direct_routes!=7||preflight_routes!=37||ordinary_routes!=9)return 140;
   return 0;
 }}
 ",
@@ -24946,6 +26004,156 @@ int main(void) {{
             Architecture::Aarch64 => StartAccelerator::Scalar,
         };
         linked_dynamic_rows_entry_for_target(target, expected);
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    #[ignore = "requires `cargo build -p fre-aot-regex-runtime --lib`; links the first-call frozen sidecar to the real runtime"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the linked production-owner differential keeps both exact admission boundaries in one lifecycle oracle"
+    )]
+    fn linked_host_frozen_compact_sidecar_matches_real_runtime_at_boundaries() {
+        use std::{fs, process::Command, time::SystemTime};
+
+        let target = if cfg!(target_arch = "x86_64") {
+            if cfg!(target_os = "linux") {
+                Target::x86_64_linux()
+            } else {
+                Target::x86_64_macos()
+            }
+        } else if cfg!(target_os = "linux") {
+            Target::aarch64_linux()
+        } else {
+            Target::aarch64_macos()
+        };
+        let limits = CompileLimitsV1 {
+            determinize: DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+            ..CompileLimitsV1::default()
+        };
+        let compiled = crate::compile_raw(
+            0,
+            scanner_free_correlated_pair_raw(),
+            OutputContract::Exists,
+            target,
+            CompileMode::Optimizing,
+            limits,
+        )
+        .expect("compile scanner-free frozen dynamic fixture");
+        let dynamic_view = compiled
+            .program()
+            .native_dynamic_rows_view()
+            .expect("scanner-free frozen dynamic view");
+        assert_eq!(dynamic_view.root_requirement, None);
+        assert_eq!(dynamic_view.exact_match_width, Some(2));
+        let module = lower_without_materialized_k0(compiled.program(), target);
+        let symbol = module
+            .prepared_entry_symbol()
+            .expect("frozen dynamic prepared symbol");
+        let (program_symbol, program_len) = module
+            .required_runtime_program()
+            .expect("frozen dynamic runtime program");
+        let workspace = compiled.program().prepare_workspace().unwrap();
+        assert!(
+            compiled
+                .program()
+                .compiler_private_frozen_dynamic_rows_storage(
+                    &workspace,
+                    524_288,
+                    524_288,
+                )
+                .is_some(),
+            "the linked fixture must publish the production compact owner"
+        );
+
+        let current_exe = std::env::current_exe().expect("current test executable");
+        let profile_dir = current_exe
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("Cargo profile directory");
+        let static_runtime = profile_dir.join("libfre_aot_regex_runtime.a");
+        assert!(
+            static_runtime.is_file(),
+            "build the linked runtime first: cargo build -p fre-aot-regex-runtime --lib ({})",
+            static_runtime.display()
+        );
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "fre-aot-frozen-dynamic-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("create frozen dynamic linker directory");
+        let object = directory.join("frozen.o");
+        let object_bytes = crate::emit_object(
+            &module,
+            ObjectFormat::for_target(target),
+            usize::MAX,
+        )
+        .expect("emit scanner-free frozen dynamic object");
+        fs::write(&object, object_bytes).expect("write frozen dynamic object");
+        let source = format!(
+            "#include <stddef.h>\n#include <stdint.h>\n#include <string.h>\n\
+             typedef void *handle_t;typedef struct{{size_t start;size_t end;}} result_t;\n\
+             extern const unsigned char {program_symbol}[];\n\
+             extern uint32_t {symbol}(handle_t,const unsigned char*,size_t,size_t,size_t,result_t*);\n\
+             extern uint32_t fre_aot_regex_runtime_prepare_exclusive_v1(const unsigned char*,size_t,handle_t*);\n\
+             extern uint32_t fre_aot_regex_runtime_search_exclusive_v1(handle_t,const unsigned char*,size_t,size_t,size_t,result_t*);\n\
+             extern uint32_t fre_aot_regex_runtime_destroy_exclusive_v1(handle_t);\n\
+             static unsigned char matching[4101],absent[4101];\n\
+             static int prepare(handle_t*h){{return fre_aot_regex_runtime_prepare_exclusive_v1({program_symbol},{program_len}U,h)==0U;}}\n\
+             static int destroy(handle_t h){{return fre_aot_regex_runtime_destroy_exclusive_v1(h)==0U;}}\n\
+             static int compare(const unsigned char*p,size_t s,size_t e,int base){{\
+               handle_t native=0,baseline=0;result_t nr={{91U,92U}},br={{93U,94U}};\
+               if(!prepare(&native)||!prepare(&baseline))return base;\
+               uint32_t ns={symbol}(native,p,sizeof(matching),s,e,&nr);\
+               uint32_t bs=fre_aot_regex_runtime_search_exclusive_v1(baseline,p,sizeof(matching),s,e,&br);\
+               if(ns!=bs||nr.start!=br.start||nr.end!=br.end)return base+1;\
+               if(!destroy(native)||!destroy(baseline))return base+2;return 0;}}\n\
+             int main(void){{for(size_t i=0;i<sizeof(matching);i++){{matching[i]=(i&1U)?'c':'a';absent[i]=matching[i];}}\
+               matching[5]='a';matching[6]='a';int status=compare(matching,5U,37U,10);if(status)return status;\
+               status=compare(absent,5U,37U,20);if(status)return status;\
+               status=compare(matching,5U,4100U,30);if(status)return status;\
+               status=compare(matching,5U,36U,40);if(status)return status;\
+               return compare(matching,5U,4101U,50);}}\n"
+        );
+        let c_path = directory.join("frozen.c");
+        let executable = directory.join("frozen");
+        fs::write(&c_path, source).expect("write frozen dynamic C harness");
+        let c_compiler = if cfg!(target_os = "macos") {
+            "clang"
+        } else {
+            "cc"
+        };
+        let status = Command::new(c_compiler)
+            .arg("-O0")
+            .arg(&c_path)
+            .arg(&object)
+            .arg(&static_runtime)
+            .arg("-o")
+            .arg(&executable)
+            .status()
+            .expect("link frozen dynamic real-runtime harness");
+        assert!(status.success(), "frozen dynamic harness failed to link");
+        let output = Command::new(&executable)
+            .output()
+            .expect("execute frozen dynamic real-runtime harness");
+        assert!(
+            output.status.success(),
+            "status={:?} stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::remove_dir_all(&directory).expect("remove frozen dynamic linker directory");
     }
 
     #[cfg(all(
@@ -28349,6 +29557,54 @@ int main(void) {{
         let label = invalid.label().unwrap();
         assert!(invalid.branch_bit_set_w(8, 32, label).is_err());
         assert!(invalid.branch_bit_clear_w(8, 32, label).is_err());
+    }
+
+    #[test]
+    fn frozen_dynamic_stride_arithmetic_has_exact_cross_isa_encodings() {
+        assert_eq!(aarch64_udiv_x(11, 10, 8).unwrap(), 0x9ac8_094b);
+        assert_eq!(aarch64_msub_x(12, 11, 8, 10).unwrap(), 0x9b08_a96c);
+        assert!(aarch64_udiv_x(32, 10, 8).is_err());
+        assert!(aarch64_msub_x(12, 11, 32, 10).is_err());
+
+        let x86 = lower_x86_64_dynamic_rows_prepared(None, FeatureSet::EMPTY).unwrap();
+        assert_eq!(
+            x86.code
+                .windows(3)
+                .filter(|bytes| *bytes == [0x48, 0xf7, 0xf1])
+                .count(),
+            6,
+            "live, initial, and four loop rows each require an unsigned remainder check"
+        );
+        assert!(
+            x86.code
+                .windows(6)
+                .any(|bytes| bytes == [0x81, 0xf9, 0x00, 0x01, 0x00, 0x00]),
+            "x86 must admit the inclusive 256-class stride boundary"
+        );
+
+        let arm = lower_aarch64_dynamic_rows_prepared(None).unwrap();
+        let words = arm
+            .code
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            words
+                .iter()
+                .filter(|&&word| word == aarch64_udiv_x(11, 10, 8).unwrap())
+                .count(),
+            1,
+            "AArch64 live-cell divisibility check"
+        );
+        assert_eq!(
+            words
+                .iter()
+                .filter(|&&word| word == aarch64_udiv_x(11, 9, 8).unwrap())
+                .count(),
+            5,
+            "AArch64 initial and loop-row divisibility checks"
+        );
+        assert!(words.contains(&aarch64_cmp_w_imm(8, 256).unwrap()));
     }
 
     #[test]
