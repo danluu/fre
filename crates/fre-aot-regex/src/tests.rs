@@ -317,9 +317,12 @@ fn program_byte_cap_rejects_before_canonical_serialization() {
 
 #[test]
 fn optimizing_object_cap_falls_back_to_the_bounded_module() {
-    let target = Target::aarch64_macos()
-        .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
-        .expect("ASIMD target");
+    // Keep this cap-ordering fixture on the wider x86 table. The AArch64
+    // byte-compact native object can now be smaller than its runtime adapter,
+    // in which case no object-byte ceiling can admit only the adapter.
+    let target = Target::x86_64_macos()
+        .with_features(FeatureSet::of(CpuFeature::X86Sse2))
+        .expect("x86-64 baseline target");
     let mut limits = CompileLimitsV1::default();
     limits.determinize.max_states = 0;
     let request = |limits| {
