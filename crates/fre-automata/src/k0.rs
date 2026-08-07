@@ -5,12 +5,11 @@ use core::{
 };
 
 use fre_simd_kernels::{
-    classify_byte_delta_16, AsciiByteSet, AsciiByteSetClassifier, ByteSet256, ByteSetClassifier,
-    ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, BYTE_SET_BLOCK_BYTES,
+    classify_byte_delta_16, AsciiByteSet, AsciiByteSetClassifier, AsciiByteSetRunScanner,
+    ByteSet256, ByteSetClassifier, DispatchPolicy, SimdDispatchContext, ASCII_NARROW_BYTES,
+    ASCII_RUN_SCANNER_BUILD_WORK, ASCII_WIDE_BYTES, BYTE_SET_BLOCK_BYTES,
     BYTE_SET_CLASSIFIER_BUILD_WORK, BYTE_SET_WIDE_BLOCK_BYTES,
 };
-#[cfg(not(target_arch = "x86_64"))]
-use fre_simd_kernels::{AsciiByteSetRunScanner, ASCII_RUN_SCANNER_BUILD_WORK};
 use memchr::{memchr, memchr2, memchr3};
 
 use crate::{
@@ -2657,17 +2656,18 @@ enum LazyStartAction {
 
 /// One immutable scanner for a graph-proved byte-class member run.
 ///
-/// ASCII-only classes retain the operation-specific run scanner on non-x86
-/// targets. On x86-64 they use the exact 256-byte classifier too, so the same
-/// graph proof can reach its native 32-byte AVX2 candidate leaf instead of an
-/// otherwise scalar run scanner. The universal class needs no source
-/// classification at all: the graph proof already says every byte has the
-/// same transition. Construction fixes the dispatch choice before this
-/// scanner enters a warmed executor.
+/// ASCII-only classes retain the operation-specific whole-slice run scanner.
+/// Its immutable dispatch owns qualified AVX2, AVX-512, NEON, SVE, and SVE2
+/// leaves and selects the target/tuning-specific choice once, rather than
+/// returning through this executor for every block. Dense ASCII sets may use
+/// the scanner's equivalent small-complement table because the exact member
+/// bitmap proves every high byte terminates the run. Sets containing high
+/// bytes retain the general 256-byte classifier. The universal class needs no
+/// source classification at all: the graph proof already says every byte has
+/// the same transition.
 #[derive(Clone, Copy, Debug)]
 enum LazyLoopScanner {
     All,
-    #[cfg(not(target_arch = "x86_64"))]
     Ascii(AsciiByteSetRunScanner),
     Set(ByteSetClassifier),
 }
@@ -2679,16 +2679,14 @@ impl LazyLoopScanner {
             return Self::All;
         }
         if words[2] == 0 && words[3] == 0 {
-            #[cfg(target_arch = "x86_64")]
-            {
-                return Self::Set(ByteSetClassifier::new(ByteSet256::from_words(words)));
-            }
-            #[cfg(not(target_arch = "x86_64"))]
-            {
-                return Self::Ascii(AsciiByteSetRunScanner::new(AsciiByteSet::from_words([
-                    words[0], words[1],
-                ])));
-            }
+            let set = AsciiByteSet::from_words([words[0], words[1]]);
+            let scanner = SimdDispatchContext::capture()
+                .ascii_byte_set_run_scanner_prefer_small_complement(
+                    set,
+                    DispatchPolicy::Auto,
+                )
+                .expect("automatic ASCII run dispatch always retains a scalar fallback");
+            return Self::Ascii(scanner);
         }
         Self::Set(ByteSetClassifier::new(ByteSet256::from_words(words)))
     }
@@ -2701,14 +2699,7 @@ impl LazyLoopScanner {
         {
             0
         } else if words[2] == 0 && words[3] == 0 {
-            #[cfg(target_arch = "x86_64")]
-            {
-                BYTE_SET_CLASSIFIER_BUILD_WORK as u64
-            }
-            #[cfg(not(target_arch = "x86_64"))]
-            {
-                ASCII_RUN_SCANNER_BUILD_WORK as u64
-            }
+            ASCII_RUN_SCANNER_BUILD_WORK as u64
         } else {
             BYTE_SET_CLASSIFIER_BUILD_WORK as u64
         }
@@ -2717,7 +2708,6 @@ impl LazyLoopScanner {
     fn scan_forward(&self, source: &[u8]) -> usize {
         match self {
             Self::All => source.len(),
-            #[cfg(not(target_arch = "x86_64"))]
             Self::Ascii(scanner) => scanner.scan_forward(source).member_run_len(),
             Self::Set(classifier) => scan_full_byte_member_prefix(classifier, source),
         }
@@ -2726,7 +2716,6 @@ impl LazyLoopScanner {
     fn words(&self) -> [u64; 4] {
         match self {
             Self::All => [u64::MAX; 4],
-            #[cfg(not(target_arch = "x86_64"))]
             Self::Ascii(scanner) => {
                 let words = scanner.set().words();
                 [words[0], words[1], 0, 0]
@@ -2739,7 +2728,6 @@ impl LazyLoopScanner {
     fn contains(&self, byte: u8) -> bool {
         match self {
             Self::All => true,
-            #[cfg(not(target_arch = "x86_64"))]
             Self::Ascii(scanner) => {
                 byte.is_ascii() && scanner.set().contains(byte)
             }
@@ -2751,7 +2739,6 @@ impl LazyLoopScanner {
     fn cardinality(&self) -> u32 {
         match self {
             Self::All => 256,
-            #[cfg(not(target_arch = "x86_64"))]
             Self::Ascii(scanner) => {
                 let words = scanner.set().words();
                 words[0].count_ones() + words[1].count_ones()
@@ -43321,52 +43308,120 @@ mod tests {
     }
 
     #[test]
-    fn ascii_loop_scanner_selection_and_prefix_are_target_exact() {
-        let mut words = [0_u64; 4];
-        let members = [b'a', b'c', b'x'];
-        for byte in members {
-            super::byte_bitmap_insert(&mut words, byte);
+    fn ascii_loop_scanners_are_architecture_neutral_and_boundary_exact() {
+        fn words(bytes: &[u8]) -> [u64; 4] {
+            let mut words = [0_u64; 4];
+            for &byte in bytes {
+                super::byte_bitmap_insert(&mut words, byte);
+            }
+            words
         }
-        let scanner = super::LazyLoopScanner::new(words);
 
-        #[cfg(target_arch = "x86_64")]
-        {
-            assert!(matches!(scanner, super::LazyLoopScanner::Set(_)));
-            assert_eq!(
-                super::LazyLoopScanner::build_work(words),
-                u64::try_from(super::BYTE_SET_CLASSIFIER_BUILD_WORK).unwrap()
-            );
+        fn scalar_prefix(words: [u64; 4], source: &[u8]) -> usize {
+            source
+                .iter()
+                .take_while(|&&byte| super::byte_bitmap_contains(words, byte))
+                .count()
         }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
+
+        let sparse_words = words(&[b'a', b'c', b'x']);
+        let mut dense_words = [u64::MAX, u64::MAX, 0, 0];
+        for byte in [b'\n', b'\r'] {
+            let index = usize::from(byte);
+            dense_words[index / 64] &= !(1_u64 << (index % 64));
+        }
+        // Exercise the run scanner's small-member, generic, and preferred
+        // small-complement table shapes through the same K0 strategy.
+        let cases = [
+            ("sparse", sparse_words, b'a', [b'!', b'z', 0x80]),
+            (
+                "balanced-generic",
+                [0x5555_5555_5555_5555, 0x5555_5555_5555_5555, 0, 0],
+                b'b',
+                [b'a', b'!', 0x80],
+            ),
+            (
+                "dense-complement",
+                dense_words,
+                b'a',
+                [b'\n', b'\r', 0x80],
+            ),
+        ];
+        let boundaries = [
+            0_usize, 1, 2, 15, 16, 17, 31, 32, 33, 47, 48, 49, 63, 64, 65, 95,
+            96, 97, 127, 128, 129, 255, 256, 257,
+        ];
+
+        for (name, words, member, nonmembers) in cases {
+            let scanner = super::LazyLoopScanner::new(words);
             assert!(matches!(scanner, super::LazyLoopScanner::Ascii(_)));
             assert_eq!(
                 super::LazyLoopScanner::build_work(words),
                 u64::try_from(super::ASCII_RUN_SCANNER_BUILD_WORK).unwrap()
             );
+            assert_eq!(scanner.words(), words, "{name}/member-set");
+            assert!(scanner.contains(member), "{name}/member-witness");
+
+            for offset in [0_usize, 1, 7, 15, 16, 31] {
+                for length in boundaries {
+                    let mut members = vec![0xcc; offset];
+                    members.extend(std::iter::repeat_n(member, length));
+                    let source = &members[offset..];
+                    assert_eq!(
+                        scanner.scan_forward(source),
+                        scalar_prefix(words, source),
+                        "{name}/members/offset-{offset}/length-{length}"
+                    );
+
+                    for nonmember in nonmembers {
+                        assert!(!scanner.contains(nonmember), "{name}/nonmember-witness");
+                        let mut terminated = vec![0xcc; offset];
+                        terminated.extend(std::iter::repeat_n(member, length));
+                        terminated.push(nonmember);
+                        terminated.extend(std::iter::repeat_n(member, 37));
+                        let source = &terminated[offset..];
+                        assert_eq!(
+                            scanner.scan_forward(source),
+                            scalar_prefix(words, source),
+                            "{name}/terminator-{nonmember:#04x}/offset-{offset}/prefix-{length}"
+                        );
+                    }
+                }
+            }
         }
+    }
 
-        for len in [31, 32, 33, 63, 64, 65] {
-            let mut source = (0..len)
-                .map(|index| members[index % members.len()])
-                .collect::<Vec<_>>();
-            let scalar_prefix = |source: &[u8]| {
-                source
-                    .iter()
-                    .position(|&byte| !super::byte_bitmap_contains(words, byte))
-                    .unwrap_or(source.len())
-            };
-            assert_eq!(scanner.scan_forward(&source), scalar_prefix(&source));
+    #[test]
+    fn ascii_loop_scanner_matches_scalar_at_every_short_stop() {
+        let mut words = [0_u64; 4];
+        for byte in [b'a', b'c', b'x'] {
+            super::byte_bitmap_insert(&mut words, byte);
+        }
+        let scanner = super::LazyLoopScanner::new(words);
+        let scalar_prefix = |source: &[u8]| {
+            source
+                .iter()
+                .take_while(|&&byte| super::byte_bitmap_contains(words, byte))
+                .count()
+        };
 
-            for (stop, nonmember) in [(0, b'!'), (len / 2, 0x80), (len - 1, b'z')] {
-                let saved = source[stop];
-                source[stop] = nonmember;
+        for len in 1..=super::ASCII_WIDE_BYTES * 2 + 1 {
+            for stop in 0..len {
+                let mut source = vec![b'a'; len];
+                for nonmember in [b'!', 0x80] {
+                    source[stop] = nonmember;
+                    assert_eq!(
+                        scanner.scan_forward(&source),
+                        scalar_prefix(&source),
+                        "len={len} stop={stop} nonmember={nonmember:#04x}"
+                    );
+                }
+                source[stop] = b'a';
                 assert_eq!(
                     scanner.scan_forward(&source),
                     scalar_prefix(&source),
-                    "len={len} stop={stop} nonmember={nonmember:#04x}"
+                    "len={len} all-members"
                 );
-                source[stop] = saved;
             }
         }
     }
