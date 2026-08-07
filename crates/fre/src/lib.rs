@@ -7436,6 +7436,7 @@ impl PortableRegex {
                     mandatory_suffix: k0.mandatory_suffix.as_ref(),
                     mandatory_cut: k0.mandatory_cut.as_ref(),
                     negative_prefilter: k0.negative_prefilter.as_deref(),
+                    packed_frontier_exists_state: K0PackedFrontierExistsState::default(),
                     mandatory_suffix_exists_state: K0NegativePrefilterState::default(),
                     mandatory_suffix_span_state: K0NegativePrefilterState::default(),
                     negative_prefilter_exists_state: K0NegativePrefilterState::default(),
@@ -9763,6 +9764,7 @@ enum PortableSearchSessionPlan<'a> {
         mandatory_suffix: Option<&'a K0MandatorySuffixPlan>,
         mandatory_cut: Option<&'a K0MandatoryCutPlan>,
         negative_prefilter: Option<&'a K0NegativePrefilterPlan>,
+        packed_frontier_exists_state: K0PackedFrontierExistsState,
         mandatory_suffix_exists_state: K0NegativePrefilterState,
         mandatory_suffix_span_state: K0NegativePrefilterState,
         negative_prefilter_exists_state: K0NegativePrefilterState,
@@ -9902,14 +9904,159 @@ fn try_k0_absolute_end_span(
     }
 }
 
+const K0_PACKED_FRONTIER_EXISTS_STATE_SLOTS: usize = 4;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum K0PackedFrontierExistsPreference {
+    #[default]
+    ObservePacked,
+    TrialIncumbent,
+    RetainIncumbent,
+    RetainPacked,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct K0PackedFrontierExistsClassState {
+    window: Option<SearchWindow>,
+    packed_positive: Option<K0PackedFrontierPositiveObservation>,
+    preference: K0PackedFrontierExistsPreference,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum K0PackedFrontierExistsRoute {
+    Packed { class_index: usize },
+    Incumbent {
+        class_index: usize,
+        packed_positive: K0PackedFrontierPositiveObservation,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct K0PackedFrontierExistsState {
+    classes: [K0PackedFrontierExistsClassState; K0_PACKED_FRONTIER_EXISTS_STATE_SLOTS],
+    next_replacement: u8,
+}
+
+impl K0PackedFrontierExistsState {
+    fn class_for(&mut self, window: SearchWindow) -> usize {
+        if let Some(index) = self
+            .classes
+            .iter()
+            .position(|state| state.window == Some(window))
+        {
+            return index;
+        }
+        if let Some(index) = self
+            .classes
+            .iter()
+            .position(|state| state.window.is_none())
+        {
+            self.classes[index].window = Some(window);
+            return index;
+        }
+        let index = usize::from(self.next_replacement) % self.classes.len();
+        self.next_replacement = self.next_replacement.wrapping_add(1)
+            % u8::try_from(self.classes.len()).expect("packed Exists state count fits u8");
+        self.classes[index] = K0PackedFrontierExistsClassState {
+            window: Some(window),
+            ..K0PackedFrontierExistsClassState::default()
+        };
+        index
+    }
+
+    fn select(&mut self, window: SearchWindow) -> K0PackedFrontierExistsRoute {
+        let class_index = self.class_for(window);
+        let class = &mut self.classes[class_index];
+        match class.preference {
+            K0PackedFrontierExistsPreference::ObservePacked
+            | K0PackedFrontierExistsPreference::RetainPacked => {
+                K0PackedFrontierExistsRoute::Packed { class_index }
+            }
+            K0PackedFrontierExistsPreference::TrialIncumbent
+            | K0PackedFrontierExistsPreference::RetainIncumbent => {
+                let packed_positive = class
+                    .packed_positive
+                    .expect("an incumbent route retains its packed-positive receipt");
+                // A selected trial is speculative until its authoritative
+                // executor succeeds and publishes a measured win below.
+                class.preference = K0PackedFrontierExistsPreference::RetainPacked;
+                K0PackedFrontierExistsRoute::Incumbent {
+                    class_index,
+                    packed_positive,
+                }
+            }
+        }
+    }
+
+    fn observe_packed(
+        &mut self,
+        class_index: usize,
+        window: SearchWindow,
+        positive: Option<K0PackedFrontierPositiveObservation>,
+    ) {
+        let class = &mut self.classes[class_index];
+        debug_assert_eq!(class.window, Some(window));
+        if class.preference != K0PackedFrontierExistsPreference::ObservePacked {
+            return;
+        }
+        let Some(positive) = positive.filter(|observation| observation.floor == window.start())
+        else {
+            class.packed_positive = None;
+            class.preference = K0PackedFrontierExistsPreference::RetainPacked;
+            return;
+        };
+        // Only an identical-range K0 receipt is comparable. Mere frontier
+        // presence, including a late positive that removed source, never arms
+        // the incumbent.
+        class.packed_positive = Some(positive);
+        class.preference = K0PackedFrontierExistsPreference::TrialIncumbent;
+    }
+
+    fn observe_incumbent(
+        &mut self,
+        class_index: usize,
+        packed_positive: K0PackedFrontierPositiveObservation,
+        measured_work: Option<u64>,
+    ) {
+        let class = &mut self.classes[class_index];
+        debug_assert_eq!(class.packed_positive, Some(packed_positive));
+        if measured_work.is_some_and(|work| work < packed_positive.residual_work) {
+            // Only a strict improvement in identical K0 work units is a
+            // measured win. Packed-kernel work is deliberately not mixed into
+            // this comparison, even though Direct omits that additional pass.
+            class.packed_positive = Some(packed_positive);
+            class.preference = K0PackedFrontierExistsPreference::RetainIncumbent;
+        } else {
+            // Sidecar-complete calls have no comparable aggregate work receipt.
+            // Treat every such call, and every measured loss, conservatively.
+            class.packed_positive = None;
+            class.preference = K0PackedFrontierExistsPreference::RetainPacked;
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct K0PackedFrontierPositiveObservation {
+    floor: usize,
+    residual_work: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct K0PackedFrontierExistsAttempt {
+    output: bool,
+    positive: Option<K0PackedFrontierPositiveObservation>,
+}
+
 /// One replacement-only Exists call bound to one immutable K0 plan and one
-/// immutably borrowed source. The receipt is call-local: neither a literal
-/// position nor a source identity can survive into another invocation.
+/// immutably borrowed source. The source-bearing receipt is call-local. Only
+/// its window geometry and numeric floor/work observation may enter policy
+/// state, and those coordinates are never used to narrow a later search.
 struct K0PackedFrontierExistsReceipt<'p, 'h> {
     plan: &'p K0PackedFrontierPlan,
     automaton: &'p Automaton,
     haystack: &'h [u8],
     window: SearchWindow,
+    search_limits: SearchLimits,
     packed_limits: PackedLiteralSetSearchLimits,
 }
 
@@ -9952,16 +10099,25 @@ impl<'p, 'h> K0PackedFrontierExistsReceipt<'p, 'h> {
             automaton: &k0_plan.automaton,
             haystack,
             window,
+            search_limits: limits,
             packed_limits: PackedLiteralSetSearchLimits::unlimited(),
         }))
     }
 
-    fn execute(self, session: &mut K0SearchSession<'_>) -> Result<bool, SearchError> {
+    fn validate_execution(&self, session: &K0SearchSession<'_>) -> Result<(), SearchError> {
         if !self.plan.is_bound_to(self.automaton) || !session.is_bound_to(self.automaton) {
             return Err(SearchError::K0(K0SearchError::InternalInvariant {
                 detail: "K0 packed-frontier execution crossed immutable plans",
             }));
         }
+        Ok(())
+    }
+
+    fn execute_packed(
+        self,
+        session: &mut K0SearchSession<'_>,
+    ) -> Result<K0PackedFrontierExistsAttempt, SearchError> {
+        self.validate_execution(session)?;
         // The packed owner returns its first frontier occurrence. Thus the
         // added work of an early positive is bounded by that early prefix,
         // while complete absence is the case that earns a whole-window K0
@@ -9974,7 +10130,10 @@ impl<'p, 'h> K0PackedFrontierExistsReceipt<'p, 'h> {
         let Some((literal_start, literal_end)) = found else {
             // The graph proof covers every accepting trace below its mandatory
             // root, so exact complete-window packed absence completes Exists.
-            return Ok(false);
+            return Ok(K0PackedFrontierExistsAttempt {
+                output: false,
+                positive: None,
+            });
         };
         if literal_start < self.window.start()
             || literal_start >= self.window.end()
@@ -9992,14 +10151,74 @@ impl<'p, 'h> K0PackedFrontierExistsReceipt<'p, 'h> {
         let floor = literal_start
             .saturating_sub(self.plan.maximum_before_root)
             .max(self.window.start());
-        session
-            .search_exists_value(
+        let report = session
+            .search_window::<Exists>(
                 self.haystack,
                 SearchWindow::new(floor, self.window.end()),
-                SearchLimits::unlimited(),
+                self.search_limits,
             )
-            .map_err(SearchError::from)
+            .map_err(SearchError::from)?;
+        let residual_work = report.accounting().work();
+        Ok(K0PackedFrontierExistsAttempt {
+            output: report.into_output(),
+            positive: Some(K0PackedFrontierPositiveObservation {
+                floor,
+                residual_work,
+            }),
+        })
     }
+}
+
+fn execute_k0_packed_frontier_exists_route<F>(
+    receipt: K0PackedFrontierExistsReceipt<'_, '_>,
+    session: &mut K0SearchSession<'_>,
+    state: &mut K0PackedFrontierExistsState,
+    execute_incumbent: F,
+) -> Result<bool, SearchError>
+where
+    F: FnOnce(
+        &mut K0SearchSession<'_>,
+        &[u8],
+        SearchWindow,
+        SearchLimits,
+        &mut Option<u64>,
+    ) -> Result<bool, SearchError>,
+{
+    receipt.validate_execution(session)?;
+    // Route selection and observations remain speculative until the sole
+    // authoritative executor succeeds. Errors preserve the complete policy
+    // state, including a pending incumbent retry.
+    let mut state_after_success = *state;
+    let route = state_after_success.select(receipt.window);
+    let output = match route {
+        K0PackedFrontierExistsRoute::Packed { class_index } => {
+            let window = receipt.window;
+            let attempt = receipt.execute_packed(session)?;
+            state_after_success.observe_packed(class_index, window, attempt.positive);
+            attempt.output
+        }
+        K0PackedFrontierExistsRoute::Incumbent {
+            class_index,
+            packed_positive,
+        } => {
+            let mut measured_work = None;
+            let output = execute_incumbent(
+                session,
+                receipt.haystack,
+                receipt.window,
+                receipt.search_limits,
+                &mut measured_work,
+            )?;
+            state_after_success.observe_incumbent(
+                class_index,
+                packed_positive,
+                measured_work,
+            );
+            output
+        }
+    };
+    *state = state_after_success;
+    Ok(output)
 }
 
 // A negative literal pass pays for itself only on a reusable, sufficiently
@@ -12873,6 +13092,347 @@ fn try_k0_universal_finite_suffix_incumbent(
     Ok(outcome)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the incumbent closes one immutable K0 sidecar and transactional-state envelope"
+)]
+fn execute_k0_exists_incumbent(
+    session: &mut K0SearchSession<'_>,
+    reverse_inner: &mut Option<Box<k0_general_reverse_inner::SearchSession<'_>>>,
+    mandatory_suffix: Option<&K0MandatorySuffixPlan>,
+    mandatory_cut: Option<&K0MandatoryCutPlan>,
+    negative_prefilter: Option<&K0NegativePrefilterPlan>,
+    mandatory_suffix_exists_state: &mut K0NegativePrefilterState,
+    negative_prefilter_exists_state: &mut K0NegativePrefilterState,
+    absolute_end_proof: Option<K0AbsoluteEndProof>,
+    haystack: &[u8],
+    window: SearchWindow,
+    limits: SearchLimits,
+    mut measured_work: Option<&mut Option<u64>>,
+) -> Result<bool, SearchError> {
+    // Only raw K0 over the exact original window has work units directly
+    // comparable with a packed-positive residual receipt. Any sidecar can add
+    // source work that its value-only API does not report, so fail closed.
+    let measure_full_window_k0 = measured_work.is_some()
+        && reverse_inner.is_none()
+        && mandatory_suffix.is_none()
+        && mandatory_cut.is_none()
+        && negative_prefilter.is_none()
+        && absolute_end_proof.is_none();
+
+    let mut suffix_state_after_success = *mandatory_suffix_exists_state;
+    let mut finite_suffix_incumbent = None;
+    if let Some(suffix) = mandatory_suffix {
+        if let Some(maximum_match_bytes) =
+            suffix.finite_exists_maximum_match_bytes()
+        {
+            if window.end().checked_sub(window.start()).is_some_and(|bytes| {
+                bytes < K0_NEGATIVE_PREFILTER_MIN_WINDOW_BYTES
+            }) {
+                return session
+                    .search_exists_value(haystack, window, limits)
+                    .map_err(SearchError::from);
+            }
+            if let Some(direct_route) = select_k0_finite_suffix_direct_route(
+                session,
+                &mut suffix_state_after_success,
+                maximum_match_bytes,
+                haystack.len(),
+                window,
+                limits,
+                false,
+            ) {
+                let result = match direct_route {
+                    K0FiniteSuffixDirectRoute::FreshClass { class_index } => {
+                        match session
+                            .search_window::<Exists>(haystack, window, limits)
+                        {
+                            Ok(report) => {
+                                let single_pass_negative = !*report.output()
+                                    && report.accounting().boundaries() == 0
+                                    && session
+                                        .negative_terminal_has_small_start_scanner();
+                                observe_k0_finite_suffix_direct_incumbent(
+                                    &mut suffix_state_after_success.classes
+                                        [class_index],
+                                    single_pass_negative,
+                                );
+                                Ok(report.into_output())
+                            }
+                            Err(error) => Err(SearchError::from(error)),
+                        }
+                    }
+                    K0FiniteSuffixDirectRoute::ExactLossBackoff => session
+                        .search_exists_value(haystack, window, limits)
+                        .map_err(SearchError::from),
+                };
+                if result.is_ok() {
+                    *mandatory_suffix_exists_state = suffix_state_after_success;
+                }
+                return result;
+            }
+        }
+        let suffix_attempt = try_k0_mandatory_suffix_exists(
+            session,
+            suffix,
+            suffix_state_after_success,
+            haystack,
+            window,
+            limits,
+            None,
+        )?;
+        suffix_state_after_success = suffix_attempt.state_after_success;
+        match suffix_attempt.outcome {
+            K0MandatorySuffixOutcome::Incumbent {
+                class_index,
+                may_switch_to_suffix,
+            } => {
+                finite_suffix_incumbent =
+                    Some((class_index, may_switch_to_suffix));
+            }
+            K0MandatorySuffixOutcome::Found(found) => {
+                *mandatory_suffix_exists_state = suffix_state_after_success;
+                return Ok(found);
+            }
+            K0MandatorySuffixOutcome::Fallback => {
+                let result = session
+                    .search_exists_value(haystack, window, limits)
+                    .map_err(SearchError::from);
+                if result.is_ok() {
+                    *mandatory_suffix_exists_state = suffix_state_after_success;
+                }
+                return result;
+            }
+            K0MandatorySuffixOutcome::Bypass
+            | K0MandatorySuffixOutcome::GeometryBypass => {}
+        }
+    }
+    let attempt = run_k0_negative_prefilter(
+        mandatory_cut,
+        negative_prefilter,
+        *negative_prefilter_exists_state,
+        haystack,
+        window,
+        limits,
+    );
+    let retry_finite_suffix = finite_suffix_incumbent.is_some_and(
+        |(class_index, may_switch_to_suffix)| {
+            observe_k0_finite_suffix_incumbent(
+                &mut suffix_state_after_success,
+                class_index,
+                may_switch_to_suffix,
+                attempt.outcome,
+                attempt.candidate_floor,
+                window,
+            )
+        },
+    );
+    let mut search_candidate_floor = attempt.candidate_floor;
+    if retry_finite_suffix {
+        let suffix = mandatory_suffix
+            .as_ref()
+            .copied()
+            .expect("finite suffix retry requires its retained plan");
+        let maximum_match_bytes = suffix
+            .finite_exists_maximum_match_bytes()
+            .expect("finite suffix retry retains its maximum width");
+        let prefix_hedge_bytes = suffix
+            .finite_prefix_hedge_bytes()
+            .expect("finite suffix retry retains its prefix hedge");
+        match run_k0_finite_prefix_exists_hedge(
+            session,
+            haystack,
+            window,
+            limits,
+            search_candidate_floor,
+            maximum_match_bytes,
+            prefix_hedge_bytes,
+        )? {
+            K0FinitePrefixExistsHedge::Found => {
+                let (class_index, _) = finite_suffix_incumbent
+                    .expect("finite suffix hedge retains its class");
+                observe_k0_finite_suffix_loss(
+                    &mut suffix_state_after_success.classes[class_index],
+                );
+                *mandatory_suffix_exists_state = suffix_state_after_success;
+                *negative_prefilter_exists_state = attempt.state_after_success;
+                return Ok(true);
+            }
+            K0FinitePrefixExistsHedge::ResumeAt(resume_start) => {
+                if resume_start >= window.end() {
+                    let (class_index, _) = finite_suffix_incumbent
+                        .expect("finite suffix hedge retains its class");
+                    observe_k0_finite_suffix_loss(
+                        &mut suffix_state_after_success.classes[class_index],
+                    );
+                    *mandatory_suffix_exists_state = suffix_state_after_success;
+                    *negative_prefilter_exists_state = attempt.state_after_success;
+                    return Ok(false);
+                }
+                search_candidate_floor = Some(resume_start);
+            }
+        }
+        let suffix_attempt = try_k0_mandatory_suffix_exists(
+            session,
+            suffix,
+            suffix_state_after_success,
+            haystack,
+            window,
+            limits,
+            search_candidate_floor,
+        )?;
+        suffix_state_after_success = suffix_attempt.state_after_success;
+        match suffix_attempt.outcome {
+            K0MandatorySuffixOutcome::Found(found) => {
+                *mandatory_suffix_exists_state = suffix_state_after_success;
+                *negative_prefilter_exists_state = attempt.state_after_success;
+                return Ok(found);
+            }
+            K0MandatorySuffixOutcome::Fallback => {}
+            K0MandatorySuffixOutcome::Incumbent { class_index, .. } => {
+                observe_k0_finite_suffix_loss(
+                    &mut suffix_state_after_success.classes[class_index],
+                );
+            }
+            K0MandatorySuffixOutcome::Bypass
+            | K0MandatorySuffixOutcome::GeometryBypass => {
+                let (class_index, _) = finite_suffix_incumbent
+                    .expect("finite suffix retry retains its class");
+                observe_k0_finite_suffix_loss(
+                    &mut suffix_state_after_success.classes[class_index],
+                );
+            }
+        }
+    }
+    if attempt.outcome == K0NegativePrefilterOutcome::Absent {
+        let certified = window
+            .end()
+            .checked_sub(window.start())
+            .is_some_and(|input_bytes| {
+                session.negative_terminal_has_reused_work_certificate(input_bytes)
+            });
+        if certified {
+            *mandatory_suffix_exists_state = suffix_state_after_success;
+            *negative_prefilter_exists_state = attempt.state_after_success;
+            return Ok(false);
+        }
+    }
+    // The reverse-inner proof owns no semantic continuation: a
+    // fresh leftmost-start enumeration is created for this exact
+    // plan, haystack and original window. Other K0 filters have
+    // already retained first refusal of their cheap negatives.
+    // A narrowed candidate floor would change the proof context,
+    // so that case keeps the incumbent. The runtime absolute-end
+    // guard is defensive closure over the construction exclusion.
+    if absolute_end_proof.is_none()
+        && limits == SearchLimits::unlimited()
+        && search_candidate_floor.is_none()
+        && let Some(reverse_inner) = reverse_inner.as_mut()
+    {
+        let window_bytes = window.end().saturating_sub(window.start());
+        let mut next_state = reverse_inner.staged_exists_route_state();
+        match next_state.select(window_bytes) {
+            k0_general_reverse_inner::Route::Bypass => {
+                let result = session
+                    .search_exists_value(haystack, window, limits)
+                    .map_err(SearchError::from);
+                if result.is_ok() {
+                    reverse_inner.publish_exists_route_state(next_state);
+                    *mandatory_suffix_exists_state = suffix_state_after_success;
+                    *negative_prefilter_exists_state = attempt.state_after_success;
+                }
+                return result;
+            }
+            k0_general_reverse_inner::Route::Learn { class_index } => {
+                let report = session
+                    .search_window::<Exists>(haystack, window, limits)
+                    .map_err(SearchError::from)?;
+                next_state.observe_incumbent(
+                    class_index,
+                    window_bytes,
+                    report.accounting().work(),
+                );
+                reverse_inner.publish_exists_route_state(next_state);
+                *mandatory_suffix_exists_state = suffix_state_after_success;
+                *negative_prefilter_exists_state = attempt.state_after_success;
+                return Ok(report.into_output());
+            }
+            k0_general_reverse_inner::Route::Candidate {
+                class_index,
+                incumbent_work,
+            } => match k0_general_reverse_inner::try_exists(
+                session,
+                reverse_inner,
+                haystack,
+                window,
+                incumbent_work,
+            )? {
+                k0_general_reverse_inner::Attempt::Complete { output, won } => {
+                    next_state.observe_candidate_complete(class_index, won);
+                    reverse_inner.publish_exists_route_state(next_state);
+                    *mandatory_suffix_exists_state = suffix_state_after_success;
+                    *negative_prefilter_exists_state = attempt.state_after_success;
+                    return Ok(output);
+                }
+                k0_general_reverse_inner::Attempt::Fallback => {
+                    let result = session
+                        .search_exists_value(haystack, window, limits)
+                        .map_err(SearchError::from);
+                    if result.is_ok() {
+                        // A bounded candidate refusal is a loss,
+                        // not an unobserved trial. Publish its
+                        // backoff only after the authoritative
+                        // incumbent succeeds so errors remain
+                        // transactional and repeated steady calls
+                        // do not repay the same failed candidate.
+                        next_state.observe_candidate_complete(class_index, false);
+                        reverse_inner.publish_exists_route_state(next_state);
+                        *mandatory_suffix_exists_state = suffix_state_after_success;
+                        *negative_prefilter_exists_state =
+                            attempt.state_after_success;
+                    }
+                    return result;
+                }
+            },
+        }
+    }
+    let search_window = search_candidate_floor
+        .map_or(window, |start| SearchWindow::new(start, window.end()));
+    let absolute_end_result = try_k0_absolute_end_exists(
+        session,
+        absolute_end_proof,
+        haystack,
+        search_window,
+        limits,
+    )?;
+    let result = if let Some(output) = absolute_end_result {
+        Ok(output)
+    } else if measure_full_window_k0
+        && search_window.start() == window.start()
+        && search_window.end() == window.end()
+    {
+        match session.search_window::<Exists>(haystack, search_window, limits) {
+            Ok(report) => {
+                if let Some(measured_work) = measured_work.as_mut() {
+                    **measured_work = Some(report.accounting().work());
+                }
+                Ok(report.into_output())
+            }
+            Err(error) => Err(SearchError::from(error)),
+        }
+    } else {
+        session
+            .search_exists_value(haystack, search_window, limits)
+            .map_err(SearchError::from)
+    };
+    if result.is_ok() {
+        *mandatory_suffix_exists_state = suffix_state_after_success;
+        *negative_prefilter_exists_state = attempt.state_after_success;
+    }
+    result
+}
+
 impl<'r> PortableSearchSession<'r> {
     /// Stable runtime identity of the borrowed matcher.
     #[must_use]
@@ -13010,6 +13570,7 @@ impl<'r> PortableSearchSession<'r> {
                 mandatory_cut,
                 negative_prefilter,
                 correlated_terminal_exists_state,
+                packed_frontier_exists_state,
                 mandatory_suffix_exists_state,
                 negative_prefilter_exists_state,
                 ..
@@ -13071,11 +13632,32 @@ impl<'r> PortableSearchSession<'r> {
                     window,
                     limits,
                 )? {
-                    // Admission transfers complete ownership of this call to
-                    // the packed frontier. Kernel or residual-K0 errors are
-                    // returned directly; no second whole-window fallback is
-                    // permitted after the replacement has begun.
-                    return receipt.execute(session);
+                    // Admission transfers complete ownership to exactly one
+                    // packed or incumbent executor. The incumbent callback is
+                    // the same tail used below when packed admission declines;
+                    // staged policy state is published only after it succeeds.
+                    debug_assert!(correlated_terminal.is_none());
+                    return execute_k0_packed_frontier_exists_route(
+                        receipt,
+                        session,
+                        packed_frontier_exists_state,
+                        |session, haystack, window, limits, measured_work| {
+                            execute_k0_exists_incumbent(
+                                session,
+                                reverse_inner,
+                                *mandatory_suffix,
+                                *mandatory_cut,
+                                *negative_prefilter,
+                                mandatory_suffix_exists_state,
+                                negative_prefilter_exists_state,
+                                absolute_end_proof,
+                                haystack,
+                                window,
+                                limits,
+                                Some(measured_work),
+                            )
+                        },
+                    );
                 }
                 if let Some(plan) = correlated_terminal {
                     if k0_correlated_exact_delimited_allows(
@@ -13161,303 +13743,20 @@ impl<'r> PortableSearchSession<'r> {
                         }
                     }
                 }
-                let mut suffix_state_after_success = *mandatory_suffix_exists_state;
-                let mut finite_suffix_incumbent = None;
-                if let Some(suffix) = *mandatory_suffix {
-                    if let Some(maximum_match_bytes) =
-                        suffix.finite_exists_maximum_match_bytes()
-                    {
-                        if window.end().checked_sub(window.start()).is_some_and(|bytes| {
-                            bytes < K0_NEGATIVE_PREFILTER_MIN_WINDOW_BYTES
-                        }) {
-                            return session
-                                .search_exists_value(haystack, window, limits)
-                                .map_err(SearchError::from);
-                        }
-                        if let Some(direct_route) = select_k0_finite_suffix_direct_route(
-                            session,
-                            &mut suffix_state_after_success,
-                            maximum_match_bytes,
-                            haystack.len(),
-                            window,
-                            limits,
-                            false,
-                        ) {
-                            let result = match direct_route {
-                                K0FiniteSuffixDirectRoute::FreshClass { class_index } => {
-                                    match session
-                                        .search_window::<Exists>(haystack, window, limits)
-                                    {
-                                        Ok(report) => {
-                                            let single_pass_negative = !*report.output()
-                                                && report.accounting().boundaries() == 0
-                                                && session
-                                                    .negative_terminal_has_small_start_scanner();
-                                            observe_k0_finite_suffix_direct_incumbent(
-                                                &mut suffix_state_after_success.classes
-                                                    [class_index],
-                                                single_pass_negative,
-                                            );
-                                            Ok(report.into_output())
-                                        }
-                                        Err(error) => Err(SearchError::from(error)),
-                                    }
-                                }
-                                K0FiniteSuffixDirectRoute::ExactLossBackoff => session
-                                    .search_exists_value(haystack, window, limits)
-                                    .map_err(SearchError::from),
-                            };
-                            if result.is_ok() {
-                                *mandatory_suffix_exists_state = suffix_state_after_success;
-                            }
-                            return result;
-                        }
-                    }
-                    let suffix_attempt = try_k0_mandatory_suffix_exists(
-                        session,
-                        suffix,
-                        suffix_state_after_success,
-                        haystack,
-                        window,
-                        limits,
-                        None,
-                    )?;
-                    suffix_state_after_success = suffix_attempt.state_after_success;
-                    match suffix_attempt.outcome {
-                        K0MandatorySuffixOutcome::Incumbent {
-                            class_index,
-                            may_switch_to_suffix,
-                        } => {
-                            finite_suffix_incumbent =
-                                Some((class_index, may_switch_to_suffix));
-                        }
-                        K0MandatorySuffixOutcome::Found(found) => {
-                            *mandatory_suffix_exists_state = suffix_state_after_success;
-                            return Ok(found);
-                        }
-                        K0MandatorySuffixOutcome::Fallback => {
-                            let result = session
-                                .search_exists_value(haystack, window, limits)
-                                .map_err(SearchError::from);
-                            if result.is_ok() {
-                                *mandatory_suffix_exists_state = suffix_state_after_success;
-                            }
-                            return result;
-                        }
-                        K0MandatorySuffixOutcome::Bypass
-                        | K0MandatorySuffixOutcome::GeometryBypass => {}
-                    }
-                }
-                let attempt = run_k0_negative_prefilter(
+                execute_k0_exists_incumbent(
+                    session,
+                    reverse_inner,
+                    *mandatory_suffix,
                     *mandatory_cut,
                     *negative_prefilter,
-                    *negative_prefilter_exists_state,
+                    mandatory_suffix_exists_state,
+                    negative_prefilter_exists_state,
+                    absolute_end_proof,
                     haystack,
                     window,
                     limits,
-                );
-                let retry_finite_suffix = finite_suffix_incumbent.is_some_and(
-                    |(class_index, may_switch_to_suffix)| {
-                        observe_k0_finite_suffix_incumbent(
-                            &mut suffix_state_after_success,
-                            class_index,
-                            may_switch_to_suffix,
-                            attempt.outcome,
-                            attempt.candidate_floor,
-                            window,
-                        )
-                    },
-                );
-                let mut search_candidate_floor = attempt.candidate_floor;
-                if retry_finite_suffix {
-                    let suffix = mandatory_suffix
-                        .as_ref()
-                        .copied()
-                        .expect("finite suffix retry requires its retained plan");
-                    let maximum_match_bytes = suffix
-                        .finite_exists_maximum_match_bytes()
-                        .expect("finite suffix retry retains its maximum width");
-                    let prefix_hedge_bytes = suffix
-                        .finite_prefix_hedge_bytes()
-                        .expect("finite suffix retry retains its prefix hedge");
-                    match run_k0_finite_prefix_exists_hedge(
-                        session,
-                        haystack,
-                        window,
-                        limits,
-                        search_candidate_floor,
-                        maximum_match_bytes,
-                        prefix_hedge_bytes,
-                    )? {
-                        K0FinitePrefixExistsHedge::Found => {
-                            let (class_index, _) = finite_suffix_incumbent
-                                .expect("finite suffix hedge retains its class");
-                            observe_k0_finite_suffix_loss(
-                                &mut suffix_state_after_success.classes[class_index],
-                            );
-                            *mandatory_suffix_exists_state = suffix_state_after_success;
-                            *negative_prefilter_exists_state = attempt.state_after_success;
-                            return Ok(true);
-                        }
-                        K0FinitePrefixExistsHedge::ResumeAt(resume_start) => {
-                            if resume_start >= window.end() {
-                                let (class_index, _) = finite_suffix_incumbent
-                                    .expect("finite suffix hedge retains its class");
-                                observe_k0_finite_suffix_loss(
-                                    &mut suffix_state_after_success.classes[class_index],
-                                );
-                                *mandatory_suffix_exists_state = suffix_state_after_success;
-                                *negative_prefilter_exists_state = attempt.state_after_success;
-                                return Ok(false);
-                            }
-                            search_candidate_floor = Some(resume_start);
-                        }
-                    }
-                    let suffix_attempt = try_k0_mandatory_suffix_exists(
-                        session,
-                        suffix,
-                        suffix_state_after_success,
-                        haystack,
-                        window,
-                        limits,
-                        search_candidate_floor,
-                    )?;
-                    suffix_state_after_success = suffix_attempt.state_after_success;
-                    match suffix_attempt.outcome {
-                        K0MandatorySuffixOutcome::Found(found) => {
-                            *mandatory_suffix_exists_state = suffix_state_after_success;
-                            *negative_prefilter_exists_state = attempt.state_after_success;
-                            return Ok(found);
-                        }
-                        K0MandatorySuffixOutcome::Fallback => {}
-                        K0MandatorySuffixOutcome::Incumbent { class_index, .. } => {
-                            observe_k0_finite_suffix_loss(
-                                &mut suffix_state_after_success.classes[class_index],
-                            );
-                        }
-                        K0MandatorySuffixOutcome::Bypass
-                        | K0MandatorySuffixOutcome::GeometryBypass => {
-                            let (class_index, _) = finite_suffix_incumbent
-                                .expect("finite suffix retry retains its class");
-                            observe_k0_finite_suffix_loss(
-                                &mut suffix_state_after_success.classes[class_index],
-                            );
-                        }
-                    }
-                }
-                if attempt.outcome == K0NegativePrefilterOutcome::Absent {
-                    let certified = window
-                        .end()
-                        .checked_sub(window.start())
-                        .is_some_and(|input_bytes| {
-                            session.negative_terminal_has_reused_work_certificate(input_bytes)
-                        });
-                    if certified {
-                        *mandatory_suffix_exists_state = suffix_state_after_success;
-                        *negative_prefilter_exists_state = attempt.state_after_success;
-                        return Ok(false);
-                    }
-                }
-                // The reverse-inner proof owns no semantic continuation: a
-                // fresh leftmost-start enumeration is created for this exact
-                // plan, haystack and original window. Other K0 filters have
-                // already retained first refusal of their cheap negatives.
-                // A narrowed candidate floor would change the proof context,
-                // so that case keeps the incumbent. The runtime absolute-end
-                // guard is defensive closure over the construction exclusion.
-                if absolute_end_proof.is_none()
-                    && limits == SearchLimits::unlimited()
-                    && search_candidate_floor.is_none()
-                    && let Some(reverse_inner) = reverse_inner.as_mut()
-                {
-                    let window_bytes = window.end().saturating_sub(window.start());
-                    let mut next_state = reverse_inner.staged_exists_route_state();
-                    match next_state.select(window_bytes) {
-                        k0_general_reverse_inner::Route::Bypass => {
-                            let result = session
-                                .search_exists_value(haystack, window, limits)
-                                .map_err(SearchError::from);
-                            if result.is_ok() {
-                                reverse_inner.publish_exists_route_state(next_state);
-                                *mandatory_suffix_exists_state = suffix_state_after_success;
-                                *negative_prefilter_exists_state = attempt.state_after_success;
-                            }
-                            return result;
-                        }
-                        k0_general_reverse_inner::Route::Learn { class_index } => {
-                            let report = session
-                                .search_window::<Exists>(haystack, window, limits)
-                                .map_err(SearchError::from)?;
-                            next_state.observe_incumbent(
-                                class_index,
-                                window_bytes,
-                                report.accounting().work(),
-                            );
-                            reverse_inner.publish_exists_route_state(next_state);
-                            *mandatory_suffix_exists_state = suffix_state_after_success;
-                            *negative_prefilter_exists_state = attempt.state_after_success;
-                            return Ok(report.into_output());
-                        }
-                        k0_general_reverse_inner::Route::Candidate {
-                            class_index,
-                            incumbent_work,
-                        } => match k0_general_reverse_inner::try_exists(
-                            session,
-                            reverse_inner,
-                            haystack,
-                            window,
-                            incumbent_work,
-                        )? {
-                            k0_general_reverse_inner::Attempt::Complete { output, won } => {
-                                next_state.observe_candidate_complete(class_index, won);
-                                reverse_inner.publish_exists_route_state(next_state);
-                                *mandatory_suffix_exists_state = suffix_state_after_success;
-                                *negative_prefilter_exists_state = attempt.state_after_success;
-                                return Ok(output);
-                            }
-                            k0_general_reverse_inner::Attempt::Fallback => {
-                                let result = session
-                                    .search_exists_value(haystack, window, limits)
-                                    .map_err(SearchError::from);
-                                if result.is_ok() {
-                                    // A bounded candidate refusal is a loss,
-                                    // not an unobserved trial. Publish its
-                                    // backoff only after the authoritative
-                                    // incumbent succeeds so errors remain
-                                    // transactional and repeated steady calls
-                                    // do not repay the same failed candidate.
-                                    next_state.observe_candidate_complete(class_index, false);
-                                    reverse_inner.publish_exists_route_state(next_state);
-                                    *mandatory_suffix_exists_state = suffix_state_after_success;
-                                    *negative_prefilter_exists_state =
-                                        attempt.state_after_success;
-                                }
-                                return result;
-                            }
-                        },
-                    }
-                }
-                let search_window = search_candidate_floor
-                    .map_or(window, |start| SearchWindow::new(start, window.end()));
-                let absolute_end_result = try_k0_absolute_end_exists(
-                    session,
-                    absolute_end_proof,
-                    haystack,
-                    search_window,
-                    limits,
-                )?;
-                let result = if let Some(output) = absolute_end_result {
-                    Ok(output)
-                } else {
-                    session
-                        .search_exists_value(haystack, search_window, limits)
-                        .map_err(SearchError::from)
-                };
-                if result.is_ok() {
-                    *mandatory_suffix_exists_state = suffix_state_after_success;
-                    *negative_prefilter_exists_state = attempt.state_after_success;
-                }
-                result
+                    None,
+                )
             }
         }
     }
@@ -16006,6 +16305,31 @@ mod tests {
         regex
     }
 
+    fn forced_k0_with_packed_frontier_and_mandatory_cut(pattern: &str) -> PortableRegex {
+        let cut = forced_k0_mandatory_cut(pattern);
+        let mut regex = forced_k0_with_only_packed_frontier(pattern);
+        let PortablePlan::K0(plan) = &mut regex.plan else {
+            panic!("forced packed-frontier pattern did not retain K0");
+        };
+        plan.mandatory_cut = Some(cut);
+        regex.report.plan_storage_bytes = regex
+            .report
+            .plan_storage_bytes
+            .checked_add(core::mem::size_of::<K0MandatoryCutPlan>())
+            .expect("synthetic packed-plus-cut storage accounting does not overflow");
+        regex.report.charged_persistent_bytes = regex
+            .report
+            .source_storage_bytes
+            .checked_add(regex.report.capture_name_storage_bytes)
+            .and_then(|bytes| bytes.checked_add(regex.report.plan_storage_bytes))
+            .expect("synthetic packed-plus-cut facade storage accounting does not overflow");
+        assert!(
+            regex.report.charged_persistent_bytes <= regex.report.persistent_byte_limit,
+            "synthetic packed-plus-cut plan remains within the builder limit",
+        );
+        regex
+    }
+
     fn forced_k0_with_only_mandatory_cut(pattern: &str) -> PortableRegex {
         let (cut, automaton) = analyzed_k0_mandatory_cut(pattern);
         let mut regex = PortableBuilder::new(pattern)
@@ -16628,6 +16952,199 @@ mod tests {
     }
 
     #[test]
+    fn k0_packed_frontier_policy_requires_comparable_floor_and_reverts_on_shift() {
+        const WINDOW_BYTES: usize = 2_048;
+        const WINDOW_START: usize = 37;
+        let policy_window = SearchWindow::new(WINDOW_START, WINDOW_START + WINDOW_BYTES);
+
+        let mut late = super::K0PackedFrontierExistsState::default();
+        let late_class = match late.select(policy_window) {
+            super::K0PackedFrontierExistsRoute::Packed { class_index } => class_index,
+            super::K0PackedFrontierExistsRoute::Incumbent { .. } => {
+                panic!("an unobserved class selected the incumbent")
+            }
+        };
+        late.observe_packed(
+            late_class,
+            policy_window,
+            Some(super::K0PackedFrontierPositiveObservation {
+                floor: WINDOW_START + 1,
+                residual_work: 17,
+            }),
+        );
+        assert_eq!(late.classes[late_class].packed_positive, None);
+        assert!(matches!(
+            late.select(policy_window),
+            super::K0PackedFrontierExistsRoute::Packed { .. }
+        ));
+
+        let mut shifted = super::K0PackedFrontierExistsState::default();
+        let class_index = match shifted.select(policy_window) {
+            super::K0PackedFrontierExistsRoute::Packed { class_index } => class_index,
+            super::K0PackedFrontierExistsRoute::Incumbent { .. } => unreachable!(),
+        };
+        let packed_positive = super::K0PackedFrontierPositiveObservation {
+            floor: WINDOW_START,
+            residual_work: 23,
+        };
+        shifted.observe_packed(class_index, policy_window, Some(packed_positive));
+        assert_eq!(
+            shifted.classes[class_index].packed_positive,
+            Some(packed_positive),
+            "the floor and residual work remain one indivisible receipt",
+        );
+        assert!(matches!(
+            shifted.select(SearchWindow::new(
+                WINDOW_START + 1,
+                WINDOW_START + WINDOW_BYTES + 1,
+            )),
+            super::K0PackedFrontierExistsRoute::Packed { .. }
+        ));
+        let retained = match shifted.select(policy_window) {
+            super::K0PackedFrontierExistsRoute::Incumbent {
+                class_index: selected_class,
+                packed_positive: selected_positive,
+            } => {
+                assert_eq!(selected_class, class_index);
+                assert_eq!(selected_positive, packed_positive);
+                selected_positive
+            }
+            super::K0PackedFrontierExistsRoute::Packed { .. } => {
+                panic!("a comparable early-positive receipt did not arm one trial")
+            }
+        };
+        shifted.observe_incumbent(
+            class_index,
+            retained,
+            Some(retained.residual_work - 1),
+        );
+        let retained = match shifted.select(policy_window) {
+            super::K0PackedFrontierExistsRoute::Incumbent {
+                packed_positive, ..
+            } => packed_positive,
+            super::K0PackedFrontierExistsRoute::Packed { .. } => {
+                panic!("a measured incumbent win was not retained")
+            }
+        };
+        shifted.observe_incumbent(
+            class_index,
+            retained,
+            Some(retained.residual_work),
+        );
+        assert_eq!(shifted.classes[class_index].packed_positive, None);
+        assert!(matches!(
+            shifted.select(policy_window),
+            super::K0PackedFrontierExistsRoute::Packed { .. }
+        ));
+
+        let mut unmeasured = super::K0PackedFrontierExistsState::default();
+        let class_index = match unmeasured.select(policy_window) {
+            super::K0PackedFrontierExistsRoute::Packed { class_index } => class_index,
+            super::K0PackedFrontierExistsRoute::Incumbent { .. } => unreachable!(),
+        };
+        unmeasured.observe_packed(class_index, policy_window, Some(packed_positive));
+        let packed_positive = match unmeasured.select(policy_window) {
+            super::K0PackedFrontierExistsRoute::Incumbent {
+                packed_positive, ..
+            } => packed_positive,
+            super::K0PackedFrontierExistsRoute::Packed { .. } => unreachable!(),
+        };
+        unmeasured.observe_incumbent(class_index, packed_positive, None);
+        assert!(matches!(
+            unmeasured.select(policy_window),
+            super::K0PackedFrontierExistsRoute::Packed { .. }
+        ));
+    }
+
+    #[test]
+    fn k0_packed_frontier_direct_uses_downstream_tail_then_returns_to_packed() {
+        let regex = forced_k0_with_packed_frontier_and_mandatory_cut(
+            r"(?s-u:...Z[12345]+\b)",
+        );
+        let PortablePlan::K0(plan) = &regex.plan else {
+            unreachable!();
+        };
+        let frontier = plan
+            .packed_frontier()
+            .expect("packed-plus-cut fixture retains its frontier");
+        assert!(plan.mandatory_cut.is_some());
+        assert_eq!(frontier.maximum_before_root, 3);
+        let window_bytes = frontier
+            .minimum_window_bytes
+            .max(super::K0_NEGATIVE_PREFILTER_MIN_WINDOW_BYTES);
+        let mut haystack = vec![b'!'; window_bytes];
+        haystack[3..6].copy_from_slice(b"Z1!");
+        let window = SearchWindow::full(&haystack);
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("packed-plus-cut session constructs");
+
+        assert!(session
+            .is_match_window_value(&haystack, window, SearchLimits::unlimited())
+            .expect("early packed-positive call succeeds"));
+        {
+            let PortableSearchSessionPlan::K0 {
+                packed_frontier_exists_state,
+                negative_prefilter_exists_state,
+                ..
+            } = &session.plan
+            else {
+                unreachable!();
+            };
+            let class = packed_frontier_exists_state
+                .classes
+                .iter()
+                .find(|class| class.window == Some(window))
+                .expect("early positive retains its exact window class");
+            assert_eq!(
+                class.preference,
+                super::K0PackedFrontierExistsPreference::TrialIncumbent,
+            );
+            assert_eq!(
+                class
+                    .packed_positive
+                    .expect("early positive retains its receipt")
+                    .floor,
+                window.start(),
+            );
+            assert!(negative_prefilter_exists_state
+                .classes
+                .iter()
+                .all(|class| class.window_size_class.is_none()));
+        }
+
+        assert!(session
+            .is_match_window_value(&haystack, window, SearchLimits::unlimited())
+            .expect("factored incumbent-tail call succeeds"));
+        let PortableSearchSessionPlan::K0 {
+            packed_frontier_exists_state,
+            negative_prefilter_exists_state,
+            ..
+        } = &session.plan
+        else {
+            unreachable!();
+        };
+        let packed_class = packed_frontier_exists_state
+            .classes
+            .iter()
+            .find(|class| class.window == Some(window))
+            .expect("packed policy retains its exact window class");
+        assert_eq!(
+            packed_class.preference,
+            super::K0PackedFrontierExistsPreference::RetainPacked,
+            "sidecar work has no misleading K0-only comparison",
+        );
+        assert_eq!(packed_class.packed_positive, None);
+        let window_size_class = usize::BITS - window_bytes.leading_zeros();
+        let downstream_class = negative_prefilter_exists_state
+            .classes
+            .iter()
+            .find(|class| class.window_size_class == Some(window_size_class))
+            .expect("the Direct route participates in downstream cut state");
+        assert_eq!(downstream_class.present_streak, 1);
+    }
+
+    #[test]
     fn k0_packed_frontier_errors_are_transactional_and_never_fallback() {
         let regex = forced_k0_with_only_packed_frontier(
             r"(?s-u:...[abcd][12345]+\b)",
@@ -16642,6 +17159,7 @@ mod tests {
             let PortableSearchSessionPlan::K0 {
                 session,
                 k0_plan,
+                packed_frontier_exists_state,
                 ..
             } = &mut public_session.plan
             else {
@@ -16657,16 +17175,80 @@ mod tests {
             .expect("packed-frontier admission remains valid")
             .expect("large unlimited window admits the packed replacement");
             receipt.packed_limits = fre_kernels::PackedLiteralSetSearchLimits { max_work: 0 };
+            let state_before = *packed_frontier_exists_state;
+            let incumbent_calls = std::cell::Cell::new(0_u8);
             assert!(matches!(
-                receipt.execute(session),
+                super::execute_k0_packed_frontier_exists_route(
+                    receipt,
+                    session,
+                    packed_frontier_exists_state,
+                    |_, _, _, _, _| {
+                        incumbent_calls.set(incumbent_calls.get().saturating_add(1));
+                        Ok(false)
+                    },
+                ),
                 Err(SearchError::PackedLiteralSet(
                     fre_kernels::PackedLiteralSetError::WorkLimit { .. }
                 ))
             ));
+            assert_eq!(*packed_frontier_exists_state, state_before);
+            assert_eq!(incumbent_calls.get(), 0, "failed packed execution did not fallback");
         }
         assert!(public_session
             .is_match_window_value(&haystack, window, SearchLimits::unlimited())
             .expect("a later source-bound call is re-executed normally"));
+
+        let mut direct_session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("packed-frontier direct-error session constructs");
+        {
+            let PortableSearchSessionPlan::K0 {
+                session,
+                k0_plan,
+                packed_frontier_exists_state,
+                ..
+            } = &mut direct_session.plan
+            else {
+                unreachable!();
+            };
+            let receipt = K0PackedFrontierExistsReceipt::admit(
+                k0_plan,
+                session,
+                &haystack,
+                window,
+                SearchLimits::unlimited(),
+            )
+            .expect("direct-error packed admission remains valid")
+            .expect("direct-error window admits the packed replacement");
+            let class_index = packed_frontier_exists_state.class_for(window);
+            packed_frontier_exists_state.classes[class_index].packed_positive =
+                Some(super::K0PackedFrontierPositiveObservation {
+                    floor: window.start(),
+                    residual_work: 1,
+                });
+            packed_frontier_exists_state.classes[class_index].preference =
+                super::K0PackedFrontierExistsPreference::TrialIncumbent;
+            let state_before = *packed_frontier_exists_state;
+            let incumbent_calls = std::cell::Cell::new(0_u8);
+            assert!(matches!(
+                super::execute_k0_packed_frontier_exists_route(
+                    receipt,
+                    session,
+                    packed_frontier_exists_state,
+                    |_, _, _, _, _| {
+                        incumbent_calls.set(incumbent_calls.get().saturating_add(1));
+                        Err(SearchError::K0(super::K0SearchError::InternalInvariant {
+                            detail: "focused incumbent failure",
+                        }))
+                    },
+                ),
+                Err(SearchError::K0(super::K0SearchError::InternalInvariant {
+                    detail: "focused incumbent failure",
+                }))
+            ));
+            assert_eq!(incumbent_calls.get(), 1, "one incumbent owns the failed call");
+            assert_eq!(*packed_frontier_exists_state, state_before);
+        }
 
         let other = forced_k0_with_only_packed_frontier(
             r"(?s-u:...[efgh][67890]+\b)",
@@ -16697,7 +17279,7 @@ mod tests {
     }
 
     #[test]
-    fn k0_packed_frontier_retains_no_source_position_across_same_address_mutation() {
+    fn k0_packed_frontier_never_reuses_retained_floor_across_same_address_mutation() {
         let first = forced_k0_with_only_packed_frontier(
             r"(?s-u:...[abcd][12345]+\b)",
         );
@@ -16713,16 +17295,40 @@ mod tests {
         let mut haystack = vec![b'!'; 4_096];
         let address = haystack.as_ptr();
         let window = SearchWindow::new(512, 3_584);
+        let early_root = window.start() + 3;
 
-        haystack[2_000..2_003].copy_from_slice(b"a1!");
+        haystack[early_root..early_root + 3].copy_from_slice(b"a1!");
         assert!(first_session
             .is_match_window_value(&haystack, window, SearchLimits::unlimited())
             .unwrap());
         assert!(!second_session
             .is_match_window_value(&haystack, window, SearchLimits::unlimited())
             .unwrap());
+        let PortableSearchSessionPlan::K0 {
+            packed_frontier_exists_state,
+            ..
+        } = &first_session.plan
+        else {
+            unreachable!();
+        };
+        let first_class = packed_frontier_exists_state
+            .classes
+            .iter()
+            .find(|class| class.window == Some(window))
+            .expect("early positive retains its exact-window policy state");
+        assert_eq!(
+            first_class.preference,
+            super::K0PackedFrontierExistsPreference::TrialIncumbent,
+        );
+        assert_eq!(
+            first_class
+                .packed_positive
+                .expect("early positive retains its comparable receipt")
+                .floor,
+            window.start(),
+        );
 
-        haystack[2_000..2_003].copy_from_slice(b"e6!");
+        haystack[early_root..early_root + 3].copy_from_slice(b"e6!");
         assert_eq!(haystack.as_ptr(), address);
         assert!(second_session
             .is_match_window_value(&haystack, window, SearchLimits::unlimited())
@@ -16731,7 +17337,7 @@ mod tests {
             .is_match_window_value(&haystack, window, SearchLimits::unlimited())
             .unwrap());
 
-        haystack[2_000..2_003].fill(b'!');
+        haystack[early_root..early_root + 3].fill(b'!');
         haystack[1_200..1_203].copy_from_slice(b"d5!");
         assert_eq!(haystack.as_ptr(), address);
         assert_eq!(
@@ -16741,7 +17347,7 @@ mod tests {
             first
                 .is_match_window_value(&haystack, window, SearchLimits::unlimited())
                 .unwrap(),
-            "same-address mutation is scanned again instead of reusing a literal position",
+            "same-address mutation is scanned again instead of reusing the retained floor",
         );
     }
 
