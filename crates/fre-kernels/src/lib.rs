@@ -11,7 +11,7 @@ use core::fmt;
 
 use fre_exact_alloc::CopyError;
 use fre_kernel_ir::CheckedSearchWindow;
-use memchr::memmem::{Finder, FinderBuilder};
+use memchr::memmem::{Finder, FinderBuilder, rfind};
 
 pub use fre_simd_kernels::{
     ASCII_CLASSIFIER_BUILD_WORK, ASCII_NARROW_BYTES,
@@ -1202,6 +1202,28 @@ impl LiteralPlan {
         Ok((matched, accounting))
     }
 
+    /// Find the last occurrence wholly inside a range.
+    ///
+    /// Overlapping occurrences participate independently. In particular, a
+    /// reverse search for `aa` in `aaa` returns the occurrence beginning at
+    /// byte one. The same checked linear bound as [`Self::find_window`] is
+    /// admitted before the haystack is inspected.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LiteralError::InvalidWindow`] or a checked limit/arithmetic
+    /// error before invoking the native primitive.
+    pub fn rfind_window(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: LiteralSearchLimits,
+    ) -> Result<(Option<(usize, usize)>, LiteralAccounting), LiteralError> {
+        let accounting = self.preflight_window(haystack.len(), window, limits)?;
+        let matched = self.rfind_after_preflight(haystack, window)?;
+        Ok((matched, accounting))
+    }
+
     fn find_after_preflight(
         &self,
         haystack: &[u8],
@@ -1220,6 +1242,34 @@ impl LiteralPlan {
                 let end = start.checked_add(self.needle_bytes).ok_or(
                     LiteralError::ArithmeticOverflow {
                         computation: "literal match end",
+                    },
+                )?;
+                Ok((start, end))
+            })
+            .transpose()
+    }
+
+    fn rfind_after_preflight(
+        &self,
+        haystack: &[u8],
+        window: Window,
+    ) -> Result<Option<(usize, usize)>, LiteralError> {
+        let relative = rfind(
+            &haystack[window.start..window.end],
+            self.finder.needle(),
+        );
+        relative
+            .map(|relative| {
+                let start =
+                    window
+                        .start
+                        .checked_add(relative)
+                        .ok_or(LiteralError::ArithmeticOverflow {
+                            computation: "reverse literal match start",
+                        })?;
+                let end = start.checked_add(self.needle_bytes).ok_or(
+                    LiteralError::ArithmeticOverflow {
+                        computation: "reverse literal match end",
                     },
                 )?;
                 Ok((start, end))
@@ -1359,6 +1409,90 @@ mod tests {
                 .0,
             Some((2, 2))
         );
+    }
+
+    #[test]
+    fn reverse_literal_search_keeps_last_overlapping_offset_inside_the_window() {
+        let plan = LiteralPlan::new(b"aa", LiteralBuildLimits::default()).unwrap();
+        let haystack = b"zaaaaQ";
+        assert_eq!(
+            plan.rfind_window(
+                haystack,
+                Window::new(1, 5),
+                LiteralSearchLimits::unlimited(),
+            )
+            .unwrap()
+            .0,
+            Some((3, 5))
+        );
+        assert_eq!(
+            plan.rfind_window(
+                haystack,
+                Window::new(1, 4),
+                LiteralSearchLimits::unlimited(),
+            )
+            .unwrap()
+            .0,
+            Some((2, 4))
+        );
+
+        let empty = LiteralPlan::new(b"", LiteralBuildLimits::default()).unwrap();
+        assert_eq!(
+            empty
+                .rfind_window(
+                    haystack,
+                    Window::new(1, 5),
+                    LiteralSearchLimits::unlimited(),
+                )
+                .unwrap()
+                .0,
+            Some((5, 5))
+        );
+    }
+
+    #[test]
+    fn reverse_literal_search_closes_at_the_exact_linear_limit() {
+        let plan = LiteralPlan::new(b"aa", LiteralBuildLimits::default()).unwrap();
+        let haystack = b"zaaaaQ";
+        let window = Window::new(1, 5);
+        let expected = LiteralAccounting {
+            needle_bytes: 2,
+            searched_bytes: 4,
+            linear_terms: 6,
+            scratch_bytes: 0,
+        };
+        let exact = LiteralSearchLimits {
+            max_linear_terms: expected.linear_terms,
+        };
+        assert_eq!(
+            plan.rfind_window(haystack, window, exact),
+            Ok((Some((3, 5)), expected))
+        );
+
+        let one_below = LiteralSearchLimits {
+            max_linear_terms: expected
+                .linear_terms
+                .checked_sub(1)
+                .expect("positive reverse literal work"),
+        };
+        assert!(matches!(
+            plan.rfind_window(haystack, window, one_below),
+            Err(LiteralError::LinearTermLimit { needed, limit })
+                if needed == expected.linear_terms
+                    && limit == one_below.max_linear_terms
+        ));
+        assert!(matches!(
+            plan.rfind_window(
+                haystack,
+                Window::new(5, 4),
+                LiteralSearchLimits::unlimited(),
+            ),
+            Err(LiteralError::InvalidWindow {
+                start: 5,
+                end: 4,
+                haystack_len: 6,
+            })
+        ));
     }
 
     #[test]
