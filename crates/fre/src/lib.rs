@@ -14509,7 +14509,7 @@ mod tests {
     fn finite_long_suffix_span_runs_the_negative_prefilter_first() {
         let regex = PortableBuilder::new(r"(?s-u:.{2,16}.{2,48}XYZ)")
             .unicode(false)
-            .plan_selection(PlanSelection::ForceK0)
+            .plan_selection(PlanSelection::Auto)
             .build()
             .expect("finite long-suffix prefilter fixture builds through K0");
         let PortablePlan::K0(plan) = &regex.plan else {
