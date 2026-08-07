@@ -6115,6 +6115,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit(
                                 retained_reverse_states,
                                 cells,
                             )?,
+                            cells,
                         )?;
                     }
                     let row_end = row_start.checked_add(row_bytes).ok_or(
