@@ -4112,6 +4112,39 @@ fn promote_frozen_compact_raw_byte_projection(
     (projection, format)
 }
 
+/// Summarize the unique byte orbit of one canonical unary compact table.
+///
+/// The returned value is one based because acceptance belongs to the edge
+/// that consumes a byte. Zero is reserved for an orbit that can never accept.
+/// Inspecting at most `state_count` edges is complete: an earlier dead token
+/// terminates the orbit, while a live path with no accepting edge after that
+/// many transitions must have repeated a state and can only repeat the same
+/// nonaccepting cycle forever.
+fn frozen_unary_exists_first_accept_step(rows: &[u16], state_count: usize) -> Option<u32> {
+    if state_count == 0
+        || state_count > usize::from(DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK)
+        || rows.len() != state_count
+    {
+        return None;
+    }
+    let mut state = 0_usize;
+    for consumed in 1..=state_count {
+        let cell = *rows.get(state)?;
+        let token = cell & DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK;
+        if usize::from(token) > state_count {
+            return None;
+        }
+        if cell & DYNAMIC_NATIVE_ROWS_V3_ACCEPT_MASK != 0 {
+            return u32::try_from(consumed).ok();
+        }
+        if token == 0 {
+            return Some(0);
+        }
+        state = usize::from(token).checked_sub(1)?;
+    }
+    Some(0)
+}
+
 impl FrozenDynamicRowsStorage {
     fn descriptor_is_valid_for(&self, identity: ProgramIdentity) -> bool {
         let rows = self.descriptor;
