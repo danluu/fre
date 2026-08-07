@@ -5,6 +5,9 @@ use regex_syntax::hir::{Class, Hir, HirKind, Look};
 
 use crate::{BuildError, charge_planner, reserve_planner};
 
+const NORMALIZED_BYTE_CLASS_EQUALITY_WORK: u64 = 4;
+const REPEAT_BOUND_ADD_WORK: u64 = 1;
+
 pub(crate) struct Extraction {
     pub(crate) shape: Option<Shape>,
     pub(crate) work: u64,
@@ -18,7 +21,8 @@ pub(crate) struct Shape {
 }
 
 /// Recognize exactly
-/// `[absolute-start]? BYTE_CLASS{positive greedy bounds} LITERAL [absolute-end]?`.
+/// `[absolute-start]? BYTE_CLASS{positive greedy bounds}+ LITERAL [absolute-end]?`,
+/// where every adjacent repetition has the same normalized byte class.
 ///
 /// Capture nodes may be erased because every public operation on
 /// `PortableRegex` is capture-free. No alternation, surrounding concatenation,
@@ -99,46 +103,75 @@ pub(crate) fn extract(
         ))?;
     }
 
-    let Some(repetition_node) = children.get(index) else {
+    let mut class = None;
+    let mut repeat = RequiredLiteralClassRepeat {
+        min: 0,
+        max: Some(0),
+    };
+    let suffix_node = loop {
+        let Some(node) = children.get(index) else {
+            return Ok(Extraction { shape: None, work });
+        };
+        let node = strip_captures(node, &mut work, work_limit)?;
+        let HirKind::Repetition(repetition) = node.kind() else {
+            break node;
+        };
+        charge_planner(&mut work, 1, work_limit)?;
+        if repetition.min == 0 || !repetition.greedy {
+            return Ok(Extraction { shape: None, work });
+        }
+        let Ok(repeat_min) = usize::try_from(repetition.min) else {
+            return Ok(Extraction { shape: None, work });
+        };
+        let repeat_max = match repetition.max {
+            Some(max) => {
+                let Ok(max) = usize::try_from(max) else {
+                    return Ok(Extraction { shape: None, work });
+                };
+                Some(max)
+            }
+            None => None,
+        };
+        if repeat_max.is_some_and(|max| max < repeat_min) {
+            return Ok(Extraction { shape: None, work });
+        }
+        let class_node = strip_captures(&repetition.sub, &mut work, work_limit)?;
+        let Some(repetition_class) =
+            extract_byte_class(class_node, &mut work, work_limit)?
+        else {
+            return Ok(Extraction { shape: None, work });
+        };
+        if let Some(expected) = class {
+            charge_planner(
+                &mut work,
+                NORMALIZED_BYTE_CLASS_EQUALITY_WORK,
+                work_limit,
+            )?;
+            if expected != repetition_class {
+                return Ok(Extraction { shape: None, work });
+            }
+        } else {
+            class = Some(repetition_class);
+        }
+        let Some(coalesced) = checked_sum_repeat(
+            repeat,
+            RequiredLiteralClassRepeat {
+                min: repeat_min,
+                max: repeat_max,
+            },
+            &mut work,
+            work_limit,
+        )? else {
+            return Ok(Extraction { shape: None, work });
+        };
+        repeat = coalesced;
+        index = index.checked_add(1).ok_or(BuildError::InternalInvariant(
+            "required-literal child index overflow",
+        ))?;
+    };
+    let Some(class) = class else {
         return Ok(Extraction { shape: None, work });
     };
-    let repetition_node = strip_captures(repetition_node, &mut work, work_limit)?;
-    let HirKind::Repetition(repetition) = repetition_node.kind() else {
-        return Ok(Extraction { shape: None, work });
-    };
-    charge_planner(&mut work, 1, work_limit)?;
-    if repetition.min == 0 || !repetition.greedy {
-        return Ok(Extraction { shape: None, work });
-    }
-    let repeat_min = usize::try_from(repetition.min).map_err(|_| {
-        BuildError::InternalInvariant("required-literal repetition minimum does not fit usize")
-    })?;
-    let repeat_max = repetition
-        .max
-        .map(usize::try_from)
-        .transpose()
-        .map_err(|_| {
-            BuildError::InternalInvariant("required-literal repetition maximum does not fit usize")
-        })?;
-    if repeat_max.is_some_and(|max| max < repeat_min) {
-        return Ok(Extraction { shape: None, work });
-    }
-    let repeat = RequiredLiteralClassRepeat {
-        min: repeat_min,
-        max: repeat_max,
-    };
-    let class_node = strip_captures(&repetition.sub, &mut work, work_limit)?;
-    let Some(class) = extract_byte_class(class_node, &mut work, work_limit)? else {
-        return Ok(Extraction { shape: None, work });
-    };
-    index = index.checked_add(1).ok_or(BuildError::InternalInvariant(
-        "required-literal child index overflow",
-    ))?;
-
-    let Some(suffix_node) = children.get(index) else {
-        return Ok(Extraction { shape: None, work });
-    };
-    let suffix_node = strip_captures(suffix_node, &mut work, work_limit)?;
     let HirKind::Literal(literal) = suffix_node.kind() else {
         return Ok(Extraction { shape: None, work });
     };
@@ -179,6 +212,29 @@ pub(crate) fn extract(
         }),
         work,
     })
+}
+
+fn checked_sum_repeat(
+    left: RequiredLiteralClassRepeat,
+    right: RequiredLiteralClassRepeat,
+    work: &mut u64,
+    work_limit: u64,
+) -> Result<Option<RequiredLiteralClassRepeat>, BuildError> {
+    charge_planner(work, REPEAT_BOUND_ADD_WORK, work_limit)?;
+    let Some(min) = left.min.checked_add(right.min) else {
+        return Ok(None);
+    };
+    let max = match (left.max, right.max) {
+        (Some(left), Some(right)) => {
+            charge_planner(work, REPEAT_BOUND_ADD_WORK, work_limit)?;
+            let Some(max) = left.checked_add(right) else {
+                return Ok(None);
+            };
+            Some(max)
+        }
+        (None, _) | (_, None) => None,
+    };
+    Ok(Some(RequiredLiteralClassRepeat { min, max }))
 }
 
 fn child_is_look(
@@ -238,7 +294,8 @@ fn extract_byte_class(
 
 #[cfg(test)]
 mod tests {
-    use super::extract;
+    use super::{checked_sum_repeat, extract};
+    use fre_kernels::{RequiredLiteralByteClass, RequiredLiteralClassRepeat};
     use regex_syntax::ParserBuilder;
 
     fn hir(pattern: &str) -> regex_syntax::hir::Hir {
@@ -276,5 +333,124 @@ mod tests {
         ] {
             assert!(extract(&hir(pattern), 0, u64::MAX).unwrap().shape.is_none());
         }
+    }
+
+    #[test]
+    fn coalesces_equivalent_adjacent_repetitions_and_capture_wrappers() {
+        for (pattern, min, max, suffix, anchors) in [
+            (
+                r"[ab]{2,5}[ba]{3,7}END",
+                5,
+                Some(12),
+                b"END".as_slice(),
+                (false, false),
+            ),
+            (
+                r"[ab]{1,2}[a-b]{3}[ba]{4,}XYZ",
+                8,
+                None,
+                b"XYZ".as_slice(),
+                (false, false),
+            ),
+            (
+                r"[ab]{2,}[ba]{3,7}XYZ",
+                5,
+                None,
+                b"XYZ".as_slice(),
+                (false, false),
+            ),
+            (
+                r"\A((([ab])){2,5})(([ba]){3,7})END\z",
+                5,
+                Some(12),
+                b"END".as_slice(),
+                (true, true),
+            ),
+        ] {
+            let shape = extract(&hir(pattern), 0, u64::MAX)
+                .unwrap()
+                .shape
+                .unwrap_or_else(|| panic!("pattern={pattern:?}"));
+            assert_eq!(
+                shape.class,
+                RequiredLiteralByteClass::from_bytes(b"ab"),
+                "pattern={pattern:?}",
+            );
+            assert_eq!(
+                shape.repeat,
+                RequiredLiteralClassRepeat { min, max },
+                "pattern={pattern:?}",
+            );
+            assert_eq!(shape.suffix, suffix, "pattern={pattern:?}");
+            assert_eq!(
+                (shape.anchors.start, shape.anchors.end),
+                anchors,
+                "pattern={pattern:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_non_equivalent_or_non_adjacent_repetition_sequences() {
+        for pattern in [
+            r"[ab]{2}[ac]{3}XYZ",
+            r"[ab]{2}?[ab]{3}XYZ",
+            r"[ab]{2}[ab]{3}?XYZ",
+            r"[ab]{2}Q[ab]{3}XYZ",
+            r"[ab]{2}\b[ab]{3}XYZ",
+            r"[ab]{0,2}[ab]{3}XYZ",
+            r"[ab]{2}[ab]{0,3}XYZ",
+            r"(?:ab){2}[ab]{3}XYZ",
+            r"[ab]{2}[ab]{3}[XY]",
+        ] {
+            assert!(
+                extract(&hir(pattern), 0, u64::MAX).unwrap().shape.is_none(),
+                "pattern={pattern:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn repeat_sum_distinguishes_unbounded_from_overflow() {
+        fn sum(
+            left: RequiredLiteralClassRepeat,
+            right: RequiredLiteralClassRepeat,
+        ) -> Option<RequiredLiteralClassRepeat> {
+            let mut work = 0;
+            checked_sum_repeat(left, right, &mut work, u64::MAX).unwrap()
+        }
+        assert_eq!(
+            sum(
+                RequiredLiteralClassRepeat {
+                    min: 2,
+                    max: Some(5),
+                },
+                RequiredLiteralClassRepeat { min: 3, max: None },
+            ),
+            Some(RequiredLiteralClassRepeat { min: 5, max: None }),
+        );
+        assert_eq!(
+            sum(
+                RequiredLiteralClassRepeat {
+                    min: usize::MAX,
+                    max: None,
+                },
+                RequiredLiteralClassRepeat { min: 1, max: None },
+            ),
+            None,
+        );
+        assert_eq!(
+            sum(
+                RequiredLiteralClassRepeat {
+                    min: 1,
+                    max: Some(usize::MAX),
+                },
+                RequiredLiteralClassRepeat {
+                    min: 1,
+                    max: Some(1),
+                },
+            ),
+            None,
+        );
     }
 }

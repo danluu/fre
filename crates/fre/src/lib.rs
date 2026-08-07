@@ -23525,6 +23525,431 @@ mod tests {
     }
 
     #[test]
+    fn coalesced_required_literal_selects_bounded_plan_and_matches_upstream_priority() {
+        let target_pattern = r"(?-u:[a-z]{4,64}[a-z]{12,192}XYZ)";
+        let target = PortableBuilder::new(target_pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert_eq!(target.build_report().plan, PlanKind::RequiredLiteral);
+        assert!(matches!(
+            &target.plan,
+            PortablePlan::BoundedRequiredLiteral(_)
+                | PortablePlan::DispatchedBoundedRequiredLiteral(_)
+        ));
+        let identity = target
+            .required_literal_cache_identity(
+                CaptureFreeOperation::Span,
+                SearchLimits::unlimited(),
+            )
+            .unwrap();
+        assert_eq!(
+            identity.repeat,
+            fre_kernels::RequiredLiteralClassRepeat {
+                min: 16,
+                max: Some(256),
+            },
+        );
+
+        let patterns = [
+            r"(?-u:[ab]{1,4}[ba]{2,5}XYZ)",
+            r"(?-u:(([ab]){1,2})(([ba]){2,3})([a-b]{1,})XYZ)",
+            r"(?-u:[ab]{2,4}[ba]{3}[a-b]{1,2}XYZ)",
+        ];
+        let haystacks = [
+            b"".as_slice(),
+            b"aaXYZ".as_slice(),
+            b"__aaaXYZ__bbbbbbXYZ__".as_slice(),
+            b"abababababXYZ!aaaXYZ".as_slice(),
+            b"bbbXYZaaaXYZbbbbbbbbXYZ".as_slice(),
+        ];
+        for pattern in patterns {
+            let fre = PortableBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            assert_eq!(
+                fre.build_report().plan,
+                PlanKind::RequiredLiteral,
+                "pattern={pattern:?}",
+            );
+            let upstream = regex::bytes::RegexBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            for haystack in haystacks {
+                let expected = upstream
+                    .find(haystack)
+                    .map(|matched| (matched.start(), matched.end()));
+                assert_eq!(
+                    fre.find(haystack, SearchLimits::unlimited())
+                        .unwrap()
+                        .0
+                        .map(|matched| (matched.start(), matched.end())),
+                    expected,
+                    "pattern={pattern:?} haystack={haystack:?}",
+                );
+                assert_eq!(
+                    fre.is_match(haystack, SearchLimits::unlimited()).unwrap().0,
+                    expected.is_some(),
+                    "pattern={pattern:?} haystack={haystack:?}",
+                );
+                assert_eq!(
+                    fre.selected_end(haystack, SearchLimits::unlimited())
+                        .unwrap()
+                        .0,
+                    expected.map(|(_, end)| end),
+                    "pattern={pattern:?} haystack={haystack:?}",
+                );
+                assert_eq!(
+                    fre.shortest_match(haystack, SearchLimits::unlimited())
+                        .unwrap()
+                        .0,
+                    upstream.shortest_match(haystack),
+                    "pattern={pattern:?} haystack={haystack:?}",
+                );
+                let expected_iter: Vec<_> = upstream
+                    .find_iter(haystack)
+                    .map(|matched| (matched.start(), matched.end()))
+                    .collect();
+                let actual_iter: Vec<_> = fre
+                    .find_iter(haystack, PortableFindIterLimits::unlimited())
+                    .unwrap()
+                    .map(|matched| {
+                        let matched = matched.unwrap();
+                        (matched.start(), matched.end())
+                    })
+                    .collect();
+                assert_eq!(
+                    actual_iter, expected_iter,
+                    "pattern={pattern:?} haystack={haystack:?}",
+                );
+                for start in 0..=haystack.len() {
+                    let expected_at = upstream
+                        .find_at(haystack, start)
+                        .map(|matched| (matched.start(), matched.end()));
+                    assert_eq!(
+                        fre.find_at(haystack, start, SearchLimits::unlimited())
+                            .unwrap()
+                            .0
+                            .map(|matched| (matched.start(), matched.end())),
+                        expected_at,
+                        "pattern={pattern:?} haystack={haystack:?} start={start}",
+                    );
+                    assert_eq!(
+                        fre.shortest_match_at(haystack, start, SearchLimits::unlimited())
+                            .unwrap()
+                            .0,
+                        upstream.shortest_match_at(haystack, start),
+                        "pattern={pattern:?} haystack={haystack:?} start={start}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn coalesced_required_literal_session_rechecks_same_address_and_iterates_fresh_source() {
+        let pattern = r"(?-u:[ab]{1,4}[ba]{2,5}XYZ)";
+        let regex = PortableBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert_eq!(regex.build_report().plan, PlanKind::RequiredLiteral);
+        let upstream = regex::bytes::RegexBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        let mut haystack = vec![b'!'; 96];
+        let address = haystack.as_ptr();
+
+        haystack[16..25].copy_from_slice(b"abababXYZ");
+        assert_eq!(
+            session
+                .find_window_value(
+                    &haystack,
+                    SearchWindow::full(&haystack),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .map(|matched| (matched.start(), matched.end())),
+            upstream
+                .find(&haystack)
+                .map(|matched| (matched.start(), matched.end())),
+        );
+
+        haystack[16..25].fill(b'!');
+        haystack[48..55].copy_from_slice(b"abbaXYZ");
+        assert_eq!(haystack.as_ptr(), address);
+        assert_eq!(
+            session
+                .find_window_value(
+                    &haystack,
+                    SearchWindow::full(&haystack),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .map(|matched| (matched.start(), matched.end())),
+            upstream
+                .find(&haystack)
+                .map(|matched| (matched.start(), matched.end())),
+        );
+
+        haystack.fill(b'!');
+        haystack[4..10].copy_from_slice(b"aaaXYZ");
+        haystack[32..40].copy_from_slice(b"bbbbbXYZ");
+        assert_eq!(haystack.as_ptr(), address);
+        let expected: Vec<_> = upstream
+            .find_iter(&haystack)
+            .map(|matched| (matched.start(), matched.end()))
+            .collect();
+        let actual: Vec<_> = session
+            .find_iter_value(&haystack, PortableFindIterRunLimits::unlimited())
+            .map(|matched| {
+                let matched = matched.unwrap();
+                (matched.start(), matched.end())
+            })
+            .collect();
+        assert_eq!(actual, expected);
+
+        haystack.fill(b'!');
+        haystack[24..31].copy_from_slice(b"abbaXYZ");
+        haystack[72..81].copy_from_slice(b"abababXYZ");
+        assert_eq!(haystack.as_ptr(), address);
+        let expected: Vec<_> = upstream
+            .find_iter(&haystack)
+            .map(|matched| (matched.start(), matched.end()))
+            .collect();
+        let actual: Vec<_> = session
+            .find_iter(&haystack, PortableFindIterRunLimits::unlimited())
+            .map(|matched| {
+                let matched = matched.unwrap();
+                (matched.start(), matched.end())
+            })
+            .collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn coalesced_required_literal_planner_work_closes_exactly_before_publication() {
+        let pattern = r"(?-u:[a-z]{4,64}[a-z]{12,192}XYZ)";
+        let baseline = PortableBuilder::new(pattern)
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert_eq!(baseline.build_report().plan, PlanKind::RequiredLiteral);
+        let required = baseline.build_report().planner_work;
+        assert!(required > 0);
+
+        let exact = PortableBuilder::new(pattern)
+            .unicode(false)
+            .limits(BuildLimits {
+                max_planner_work: required,
+                ..BuildLimits::default()
+            })
+            .build()
+            .unwrap();
+        assert_eq!(exact.build_report(), baseline.build_report());
+
+        let one_below = required.checked_sub(1).unwrap();
+        let error = PortableBuilder::new(pattern)
+            .unicode(false)
+            .limits(BuildLimits {
+                max_planner_work: one_below,
+                ..BuildLimits::default()
+            })
+            .build()
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            BuildError::PlannerWorkLimit { needed, limit }
+                if needed > limit && limit == one_below
+        ));
+    }
+
+    #[test]
+    fn coalesced_required_literal_is_exhaustively_capture_free_equivalent() {
+        let cores = [
+            r"[ab]{1,2}[ba]{1,3}X",
+            r"(([ab]){2})(([ba]){2})X",
+            r"(([ab]{1,2}))(([ba]{2,}))X",
+            r"[ab]{1,}[ba]{2,3}X",
+            r"[ab]{1,2}[ba]{1,2}[a-b]{1,2}X",
+        ];
+        let haystacks = byte_words(&[b'a', b'b', b'X'], 6);
+        let mut comparisons = 0_usize;
+        for core in cores {
+            for start_anchor in [false, true] {
+                for end_anchor in [false, true] {
+                    let pattern = format!(
+                        "(?-u:{}{}{})",
+                        if start_anchor { r"\A" } else { "" },
+                        core,
+                        if end_anchor { r"\z" } else { "" },
+                    );
+                    let fre = PortableBuilder::new(&pattern)
+                        .unicode(false)
+                        .plan_selection(PlanSelection::ForceRequiredLiteral)
+                        .build()
+                        .unwrap();
+                    assert_eq!(fre.build_report().plan, PlanKind::RequiredLiteral);
+                    let upstream = regex::bytes::RegexBuilder::new(&pattern)
+                        .unicode(false)
+                        .build()
+                        .unwrap();
+                    for haystack in &haystacks {
+                        let expected = upstream
+                            .find(haystack)
+                            .map(|matched| (matched.start(), matched.end()));
+                        assert_eq!(
+                            fre.find(haystack, SearchLimits::unlimited())
+                                .unwrap()
+                                .0
+                                .map(|matched| (matched.start(), matched.end())),
+                            expected,
+                            "pattern={pattern:?} haystack={haystack:?}",
+                        );
+                        assert_eq!(
+                            fre.is_match(haystack, SearchLimits::unlimited()).unwrap().0,
+                            expected.is_some(),
+                            "pattern={pattern:?} haystack={haystack:?}",
+                        );
+                        assert_eq!(
+                            fre.selected_end(haystack, SearchLimits::unlimited())
+                                .unwrap()
+                                .0,
+                            expected.map(|(_, end)| end),
+                            "pattern={pattern:?} haystack={haystack:?}",
+                        );
+                        assert_eq!(
+                            fre.shortest_match(haystack, SearchLimits::unlimited())
+                                .unwrap()
+                                .0,
+                            upstream.shortest_match(haystack),
+                            "pattern={pattern:?} haystack={haystack:?}",
+                        );
+                        let expected_iter: Vec<_> = upstream
+                            .find_iter(haystack)
+                            .map(|matched| (matched.start(), matched.end()))
+                            .collect();
+                        let actual_iter: Vec<_> = fre
+                            .find_iter(haystack, PortableFindIterLimits::unlimited())
+                            .unwrap()
+                            .map(|matched| {
+                                let matched = matched.unwrap();
+                                (matched.start(), matched.end())
+                            })
+                            .collect();
+                        assert_eq!(
+                            actual_iter, expected_iter,
+                            "pattern={pattern:?} haystack={haystack:?}",
+                        );
+                        for start in 0..=haystack.len() {
+                            let expected_at = upstream
+                                .find_at(haystack, start)
+                                .map(|matched| (matched.start(), matched.end()));
+                            assert_eq!(
+                                fre.find_at(haystack, start, SearchLimits::unlimited())
+                                    .unwrap()
+                                    .0
+                                    .map(|matched| (matched.start(), matched.end())),
+                                expected_at,
+                                "pattern={pattern:?} haystack={haystack:?} start={start}",
+                            );
+                            assert_eq!(
+                                fre.shortest_match_at(
+                                    haystack,
+                                    start,
+                                    SearchLimits::unlimited(),
+                                )
+                                .unwrap()
+                                .0,
+                                upstream.shortest_match_at(haystack, start),
+                                "pattern={pattern:?} haystack={haystack:?} start={start}",
+                            );
+                            comparisons = comparisons.saturating_add(1);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(comparisons > 100_000);
+
+        let core = cores[0];
+        for start_anchor in [false, true] {
+            for end_anchor in [false, true] {
+                let pattern = format!(
+                    "(?-u:{}{}{})",
+                    if start_anchor { r"\A" } else { "" },
+                    core,
+                    if end_anchor { r"\z" } else { "" },
+                );
+                let fre = PortableBuilder::new(&pattern)
+                    .unicode(false)
+                    .plan_selection(PlanSelection::ForceRequiredLiteral)
+                    .build()
+                    .unwrap();
+                let upstream = regex::bytes::RegexBuilder::new(&pattern)
+                    .unicode(false)
+                    .build()
+                    .unwrap();
+                for haystack in [
+                    b"abX".as_slice(),
+                    b"XabX".as_slice(),
+                    b"abXabX".as_slice(),
+                    b"abX!".as_slice(),
+                ] {
+                    for window_start in 0..=haystack.len() {
+                        for window_end in window_start..=haystack.len() {
+                            let window = SearchWindow::new(window_start, window_end);
+                            let expected = upstream
+                                .find_at(haystack, window_start)
+                                .filter(|matched| matched.end() <= window_end)
+                                .map(|matched| (matched.start(), matched.end()));
+                            assert_eq!(
+                                fre.find_window(haystack, window, SearchLimits::unlimited())
+                                    .unwrap()
+                                    .0
+                                    .map(|matched| (matched.start(), matched.end())),
+                                expected,
+                                "pattern={pattern:?} haystack={haystack:?} window={window_start}..{window_end}",
+                            );
+                            assert_eq!(
+                                fre.find_window_value(
+                                    haystack,
+                                    window,
+                                    SearchLimits::unlimited(),
+                                )
+                                .unwrap()
+                                .map(|matched| (matched.start(), matched.end())),
+                                expected,
+                                "value pattern={pattern:?} haystack={haystack:?} window={window_start}..{window_end}",
+                            );
+                            let expected_shortest = upstream
+                                .shortest_match_at(haystack, window_start)
+                                .filter(|end| *end <= window_end);
+                            assert_eq!(
+                                fre.shortest_match_window(
+                                    haystack,
+                                    window,
+                                    SearchLimits::unlimited(),
+                                )
+                                .unwrap()
+                                .0,
+                                expected_shortest,
+                                "shortest pattern={pattern:?} haystack={haystack:?} window={window_start}..{window_end}",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn bounded_required_literal_matches_upstream_across_steady_operations() {
         let haystacks = byte_words(&[b'a', b'b', b'Z', b'!'], 6);
         let mut comparisons = 0_usize;
