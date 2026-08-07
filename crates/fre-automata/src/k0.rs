@@ -3320,10 +3320,65 @@ pub struct K0DynamicRootProjection<'a> {
     initial_terminal: bool,
     cache_identity: u64,
     learned_loop_rows: [u32; LAZY_LOOP_SKIP_PLAN_CAPACITY],
+    learned_loop_plans: [K0DynamicLoopPlan; LAZY_LOOP_SKIP_PLAN_CAPACITY],
     learned_loop_row_count: usize,
     unfilled_cell: u32,
     accept_mask: u32,
     next_row_token_mask: u32,
+}
+
+/// Exact source-provenance effect retained by one immutable direct self-loop.
+///
+/// `Reset` is deliberately absent: K0's assertion-free nonrestarting loop
+/// proof rejects it before publishing a plan. Compact consumers must still
+/// authenticate this value together with the raw-byte membership set.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum K0DynamicLoopStartAction {
+    Drop = 0,
+    Propagate = 1,
+}
+
+/// One copied graph proof for an immutable nonaccepting direct self-loop.
+///
+/// The row offset names the original fully-prefilled K0 row. Bit `b` in
+/// `members` is set exactly when byte `b` takes the proved self-loop with the
+/// retained start action. The projection owns this value rather than exposing
+/// K0's private scanner layout.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C)]
+pub struct K0DynamicLoopPlan {
+    row_offset: u32,
+    start_action: K0DynamicLoopStartAction,
+    members: [u64; 4],
+}
+
+impl K0DynamicLoopPlan {
+    const EMPTY: Self = Self {
+        row_offset: u32::MAX,
+        start_action: K0DynamicLoopStartAction::Drop,
+        members: [0; 4],
+    };
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn row_offset(self) -> u32 {
+        self.row_offset
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn start_action(self) -> K0DynamicLoopStartAction {
+        self.start_action
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn members(self) -> [u64; 4] {
+        self.members
+    }
 }
 
 impl K0DynamicRootProjection<'_> {
@@ -3385,6 +3440,14 @@ impl K0DynamicRootProjection<'_> {
     #[must_use]
     pub fn learned_loop_row_offsets(&self) -> &[u32] {
         &self.learned_loop_rows[..self.learned_loop_row_count]
+    }
+
+    /// Exact immutable loop proofs corresponding one-for-one with
+    /// [`Self::learned_loop_row_offsets`].
+    #[doc(hidden)]
+    #[must_use]
+    pub fn learned_loop_plans(&self) -> &[K0DynamicLoopPlan] {
+        &self.learned_loop_plans[..self.learned_loop_row_count]
     }
 
     #[doc(hidden)]
@@ -6261,6 +6324,8 @@ impl K0Workspace {
         };
 
         let mut learned_loop_rows = [0_u32; LAZY_LOOP_SKIP_PLAN_CAPACITY];
+        let mut learned_loop_plans =
+            [K0DynamicLoopPlan::EMPTY; LAZY_LOOP_SKIP_PLAN_CAPACITY];
         let mut learned_loop_row_count = 0usize;
         for plan in lazy.loop_skip_plans.entries.iter().flatten() {
             let row = usize::try_from(plan.row_offset).ok()?;
@@ -6271,6 +6336,15 @@ impl K0Workspace {
                 return None;
             }
             *learned_loop_rows.get_mut(learned_loop_row_count)? = plan.row_offset;
+            *learned_loop_plans.get_mut(learned_loop_row_count)? = K0DynamicLoopPlan {
+                row_offset: plan.row_offset,
+                start_action: match plan.start_action {
+                    LazyStartAction::Drop => K0DynamicLoopStartAction::Drop,
+                    LazyStartAction::Propagate => K0DynamicLoopStartAction::Propagate,
+                    LazyStartAction::Reset => return None,
+                },
+                members: plan.scanner.words(),
+            };
             learned_loop_row_count = learned_loop_row_count.checked_add(1)?;
         }
 
@@ -6283,6 +6357,7 @@ impl K0Workspace {
             initial_terminal,
             cache_identity: lazy.cache_identity,
             learned_loop_rows,
+            learned_loop_plans,
             learned_loop_row_count,
             unfilled_cell: LAZY_CELL_UNFILLED,
             accept_mask: LAZY_CELL_ACCEPT,

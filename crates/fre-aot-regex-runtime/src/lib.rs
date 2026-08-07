@@ -68,12 +68,12 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex, OnceLock, TryLockError};
 
 use fre_aot_regex::{
-    CompileError, CompiledProgram, FrozenDynamicRowsStorageV3, FrozenPreparedHeaderV3,
+    CompileError, CompiledProgram, FrozenDynamicRowsStorageV3, FrozenPreparedHeaderV6,
     FullyPrefilledFallbackReceipt, MatchResult, OutputContract, PROGRAM_HEADER_LEN,
     ProgramFormatError, ProgramWorkspace, RetainedPartialPreflight, SearchWindow,
 };
 #[cfg(test)]
-use fre_aot_regex::FrozenPreparedHeaderV2;
+use fre_aot_regex::{FrozenPreparedHeaderV2, FrozenPreparedHeaderV3};
 
 /// No match was selected.
 pub const STATUS_NO_MATCH: u32 = 0;
@@ -378,7 +378,7 @@ impl Default for FreAotRegexExclusiveHandleV1 {
 #[derive(Debug)]
 #[repr(C)]
 pub struct PreparedAotRegex {
-    frozen_header: FrozenPreparedHeaderV3,
+    frozen_header: FrozenPreparedHeaderV6,
     program: CompiledProgram,
     workspace: ProgramWorkspace,
     frozen_dynamic_rows: Option<FrozenDynamicRowsStorageV3>,
@@ -423,7 +423,7 @@ impl PreparedAotRegex {
                 )
             })
             .flatten();
-        let frozen_header = program.compiler_private_frozen_prepared_header_v3(
+        let frozen_header = program.compiler_private_frozen_prepared_header_v6(
             &workspace,
             fully_prefilled_fallback,
             frozen_dynamic_rows.as_ref(),
@@ -828,6 +828,16 @@ impl PreparedAotRegex {
         })
     }
 
+    fn scan_frozen_loop(&self, scanner_address: usize, source: &[u8]) -> Option<usize> {
+        if !self.frozen_header.is_active() || !self.frozen_header.has_dynamic_rows() {
+            return None;
+        }
+        let artifact_identity = *self.frozen_header.artifact_identity();
+        self.frozen_dynamic_rows
+            .as_ref()?
+            .compiler_private_scan_frozen_loop(artifact_identity, scanner_address, source)
+    }
+
     fn require_span_output(&self) -> Result<(), AotRegexFindError> {
         let actual = self.program.output_contract();
         if actual == OutputContract::Span {
@@ -864,6 +874,60 @@ impl PreparedAotRegex {
         })
         .transpose()
     }
+}
+
+/// Failure result returned by the private frozen-loop scan helper.
+///
+/// Generated code compares the result with the unchanged requested length and
+/// enters its existing framed fallback before advancing position when this
+/// sentinel is observed.
+pub const FROZEN_LOOP_SCAN_FAILURE: usize = usize::MAX;
+
+/// Scan one immutable graph-proved loop member prefix.
+///
+/// This is a private generated-object ABI. The opaque scanner address is never
+/// dereferenced directly: it must match the exact pointer retained by the live
+/// prepared handle, whose artifact identity and active header are checked by
+/// the safe owner method. A mismatch, panic, invalid extent, or inactive owner
+/// returns [`FROZEN_LOOP_SCAN_FAILURE`].
+///
+/// # Safety
+///
+/// `handle` must name the live exclusive prepared session that entered the
+/// generated matcher. `source_ptr` must be non-null and readable for exactly
+/// `source_len` bytes during this call. No mutable operation may overlap the
+/// call or release either owner.
+#[unsafe(no_mangle)]
+#[allow(
+    unsafe_code,
+    reason = "the generated loop helper validates its raw handle and source at the C ABI boundary"
+)]
+pub unsafe extern "C" fn fre_aot_regex_runtime_scan_frozen_loop_v1(
+    handle: FreAotRegexExclusiveHandleV1,
+    scanner_address: usize,
+    source_ptr: *const u8,
+    source_len: usize,
+) -> usize {
+    if handle.is_invalid()
+        || scanner_address == 0
+        || source_ptr.is_null()
+        || source_len > isize::MAX.unsigned_abs()
+    {
+        return FROZEN_LOOP_SCAN_FAILURE;
+    }
+    catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: the function contract supplies both live extents. The
+        // prepared owner validates the opaque scanner address before following
+        // its own independently retained pointer.
+        let prepared = unsafe { &*handle.0.cast::<PreparedAotRegex>() };
+        // SAFETY: the caller guarantees this exact readable source extent.
+        let source = unsafe { std::slice::from_raw_parts(source_ptr, source_len) };
+        prepared
+            .scan_frozen_loop(scanner_address, source)
+            .filter(|&consumed| consumed <= source_len)
+            .unwrap_or(FROZEN_LOOP_SCAN_FAILURE)
+    }))
+    .unwrap_or(FROZEN_LOOP_SCAN_FAILURE)
 }
 
 /// Fallible iterator over non-overlapping matches from a prepared AOT Span
@@ -2494,8 +2558,16 @@ fn encode_match_result(result: MatchResult) -> (u32, FreAotRegexResultV1) {
 )]
 mod tests {
     use fre_aot_regex::{
-        CompileLimitsV1, CompileMode, CompileRequest, EngineKind, EngineSelectionReason,
-        MatchResult, OutputContract, Target, compile,
+        CompileLimitsV1, CompileMode, CompileRequest, DeterminizeLimits, EngineKind,
+        EngineSelectionReason,
+        FROZEN_COMPACT_LOOP_PLAN_V1_BYTES, FROZEN_COMPACT_LOOP_PLAN_V1_MEMBERS_OFFSET,
+        FROZEN_COMPACT_LOOP_PLAN_V1_SCANNER_ADDRESS_OFFSET,
+        FROZEN_DYNAMIC_ROWS_V6_LOOP_PLAN_COUNT_OFFSET, FROZEN_DYNAMIC_ROWS_V6_LOOP_PLANS_OFFSET,
+        FROZEN_PREPARED_HEADER_V1_FLAGS_OFFSET,
+        FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V6,
+        FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V7,
+        FROZEN_PREPARED_HEADER_V6_DYNAMIC_ROWS_OFFSET, MatchResult, OutputContract, Target,
+        compile,
     };
 
     use super::*;
@@ -2971,6 +3043,10 @@ mod tests {
             fre_aot_regex::FROZEN_PREPARED_HEADER_V3_BYTES
         );
         assert_eq!(
+            size_of::<FrozenPreparedHeaderV6>(),
+            fre_aot_regex::FROZEN_PREPARED_HEADER_V6_BYTES
+        );
+        assert_eq!(
             fre_aot_regex::FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL_OFFSET,
             0
         );
@@ -3039,6 +3115,7 @@ mod tests {
             "fre_aot_regex_runtime_search_exclusive_dynamic_rows_deopt_v1",
             "fre_aot_regex_runtime_search_exclusive_dynamic_rows_continue_v1",
             "fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1",
+            "fre_aot_regex_runtime_scan_frozen_loop_v1",
             "native_rows_address",
             "cache_generation",
             "current_row",
@@ -3088,6 +3165,12 @@ mod tests {
             usize,
             *mut FreAotRegexResultV1,
         ) -> u32 = fre_aot_regex_runtime_search_exclusive_dynamic_rows_deopt_v1;
+        let _: unsafe extern "C" fn(
+            FreAotRegexExclusiveHandleV1,
+            usize,
+            *const u8,
+            usize,
+        ) -> usize = fre_aot_regex_runtime_scan_frozen_loop_v1;
         let _: unsafe extern "C" fn(
             FreAotRegexExclusiveHandleV1,
             *const u8,
@@ -3251,6 +3334,178 @@ mod tests {
         ) -> u32 = fre_aot_regex_runtime_search_exclusive_partial_native_root_preflight_v1;
         let _: unsafe extern "C" fn(FreAotRegexExclusiveHandleV1) -> u32 =
             fre_aot_regex_runtime_destroy_exclusive_v1;
+    }
+
+    #[test]
+    fn frozen_loop_scan_boundary_authenticates_owner_pointer_and_extent() {
+        let limits = CompileLimitsV1 {
+            determinize: DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+            ..CompileLimitsV1::default()
+        };
+        let compiled = compile(
+            CompileRequest::new(
+                r"a+Q|[b-c][a-b]{1,5}(?:x+|y+)",
+                Target::x86_64_linux(),
+            )
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::SelectedEnd)
+            .limits(limits),
+        )
+        .expect("compile compact-loop helper fixture");
+        let serialized = compiled.program().serialize().expect("serialize fixture");
+        let handle = prepare_exclusive(&serialized);
+        let base = handle.0.cast::<u8>();
+
+        // SAFETY: the exclusive handle owns a live PreparedAotRegex whose
+        // offset-zero V6 header has the public target-native layout.
+        let flags = unsafe {
+            std::ptr::read_unaligned(
+                base.add(FROZEN_PREPARED_HEADER_V1_FLAGS_OFFSET)
+                    .cast::<u32>(),
+            )
+        };
+        assert!(matches!(
+            flags,
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V6
+                | FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V7
+        ));
+        let tail = FROZEN_PREPARED_HEADER_V6_DYNAMIC_ROWS_OFFSET;
+        // SAFETY: the authenticated flag above proves the complete V6/V7
+        // extent remains live in this exclusively owned prepared allocation.
+        let plan_count = unsafe {
+            std::ptr::read_unaligned(
+                base.add(tail + FROZEN_DYNAMIC_ROWS_V6_LOOP_PLAN_COUNT_OFFSET)
+                    .cast::<u32>(),
+            )
+        };
+        assert!((1..=4).contains(&plan_count));
+
+        let mut selected = None;
+        for slot in 0..usize::try_from(plan_count).unwrap() {
+            let plan = tail
+                + FROZEN_DYNAMIC_ROWS_V6_LOOP_PLANS_OFFSET
+                + slot * FROZEN_COMPACT_LOOP_PLAN_V1_BYTES;
+            let mut members = [0_u64; 4];
+            for (word, value) in members.iter_mut().enumerate() {
+                // SAFETY: every active plan is wholly inside the authenticated
+                // fixed-capacity header extent.
+                *value = unsafe {
+                    std::ptr::read_unaligned(
+                        base.add(
+                            plan
+                                + FROZEN_COMPACT_LOOP_PLAN_V1_MEMBERS_OFFSET
+                                + word * std::mem::size_of::<u64>(),
+                        )
+                        .cast::<u64>(),
+                    )
+                };
+            }
+            if members != [u64::MAX; 4] {
+                // SAFETY: the scanner-address field is inside this same plan.
+                let scanner_address = unsafe {
+                    std::ptr::read_unaligned(
+                        base.add(plan + FROZEN_COMPACT_LOOP_PLAN_V1_SCANNER_ADDRESS_OFFSET)
+                            .cast::<usize>(),
+                    )
+                };
+                selected = Some((members, scanner_address));
+                break;
+            }
+        }
+        let (members, scanner_address) =
+            selected.expect("the fixture must publish a proper loop subset");
+        assert_ne!(scanner_address, 0);
+        let member = (u8::MIN..=u8::MAX)
+            .find(|&byte| {
+                members[usize::from(byte >> 6)] & (1_u64 << u32::from(byte & 63)) != 0
+            })
+            .unwrap();
+        let nonmember = (u8::MIN..=u8::MAX)
+            .find(|&byte| {
+                members[usize::from(byte >> 6)] & (1_u64 << u32::from(byte & 63)) == 0
+            })
+            .unwrap();
+
+        for prefix in [0_usize, 1, 31, 63, 64, 65, 129] {
+            let mut source = vec![member; prefix];
+            source.push(nonmember);
+            source.extend(std::iter::repeat_n(member, 7));
+            // SAFETY: the handle, exact opaque address, and source extent are
+            // all live and exclusively owned for this synchronous call.
+            let consumed = unsafe {
+                fre_aot_regex_runtime_scan_frozen_loop_v1(
+                    handle,
+                    scanner_address,
+                    source.as_ptr(),
+                    source.len(),
+                )
+            };
+            assert_eq!(consumed, prefix);
+            assert!(consumed <= source.len());
+        }
+
+        let source = [member; 64];
+        // SAFETY: all raw extents are live; only the opaque address is
+        // deliberately foreign and must be rejected before dereference.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_scan_frozen_loop_v1(
+                    handle,
+                    scanner_address.wrapping_add(1),
+                    source.as_ptr(),
+                    source.len(),
+                )
+            },
+            FROZEN_LOOP_SCAN_FAILURE
+        );
+        // SAFETY: malformed arguments are rejected before either raw pointer
+        // is followed or a slice is formed.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_scan_frozen_loop_v1(
+                    FreAotRegexExclusiveHandleV1::INVALID,
+                    scanner_address,
+                    std::ptr::null(),
+                    0,
+                )
+            },
+            FROZEN_LOOP_SCAN_FAILURE
+        );
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_scan_frozen_loop_v1(
+                    handle,
+                    scanner_address,
+                    source.as_ptr(),
+                    isize::MAX.unsigned_abs().saturating_add(1),
+                )
+            },
+            FROZEN_LOOP_SCAN_FAILURE
+        );
+
+        // Revocation makes the once-valid address inert before the helper can
+        // reach the immutable owner.
+        // SAFETY: this test uniquely owns the live prepared allocation.
+        unsafe { &mut *handle.0.cast::<PreparedAotRegex>() }.deactivate_frozen_header();
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_scan_frozen_loop_v1(
+                    handle,
+                    scanner_address,
+                    source.as_ptr(),
+                    source.len(),
+                )
+            },
+            FROZEN_LOOP_SCAN_FAILURE
+        );
+        // SAFETY: this test uniquely owns the now-revoked session.
+        assert_eq!(
+            unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(handle) },
+            STATUS_SUCCESS
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

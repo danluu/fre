@@ -37,7 +37,8 @@ pub use contract::{
 pub use epsilon_closure_dispatch::EpsilonClosureDispatchAllocationError;
 pub use error::{CompileError, MalformedPlan, ResourceKind, SearchError};
 pub use k0::{
-    K0DynamicRootProjection, K0FullyPrefilledResumeCacheReceipt,
+    K0DynamicLoopPlan, K0DynamicLoopStartAction, K0DynamicRootProjection,
+    K0FullyPrefilledResumeCacheReceipt,
     K0FullyPrefilledResumeMapProjection, K0FullyPrefilledRootProjection, K0PositiveEndLimits,
     K0PositiveEndOutcome, K0PositiveEndReceipt, K0PositiveEndStartOutcome,
     K0PositiveEndStartVerification, K0PositiveEndVerification, K0ResumeSet, K0SearchSession,
