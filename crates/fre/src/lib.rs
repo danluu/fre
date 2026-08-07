@@ -9190,6 +9190,11 @@ const K0_FINITE_SUFFIX_EXACT_ROUTE: u8 = 1;
 const K0_FINITE_SUFFIX_UNIVERSAL_INCUMBENT_CALIBRATION: u8 = 1 << 5;
 const K0_FINITE_SUFFIX_UNIVERSAL_INCUMBENT_ROUTE: u8 = 1 << 6;
 const K0_FINITE_SUFFIX_SINGLE_PASS_NEGATIVE: u8 = 1 << 7;
+// `next_replacement` needs only two low bits for four size-class records.
+// Once a universal suffix schedules an independent-predicate trial, retain a
+// monotonic high-bit receipt there. Positive-only sessions can then reject the
+// entire adaptive selector with one load instead of scanning every class.
+const K0_NEGATIVE_PREFILTER_UNIVERSAL_INCUMBENT_POSSIBLE: u8 = 1 << 7;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct K0NegativePrefilterClassState {
@@ -9246,11 +9251,15 @@ impl K0NegativePrefilterState {
             self.classes[index].window_size_class = Some(window_size_class);
             return index;
         }
-        let index = usize::from(self.next_replacement) % self.classes.len();
-        self.next_replacement = self
-            .next_replacement
+        let retained_flags = self.next_replacement
+            & K0_NEGATIVE_PREFILTER_UNIVERSAL_INCUMBENT_POSSIBLE;
+        let replacement_ordinal = self.next_replacement
+            & !K0_NEGATIVE_PREFILTER_UNIVERSAL_INCUMBENT_POSSIBLE;
+        let index = usize::from(replacement_ordinal) % self.classes.len();
+        let next_replacement = replacement_ordinal
             .wrapping_add(1)
             % u8::try_from(self.classes.len()).expect("size-class state count fits u8");
+        self.next_replacement = retained_flags | next_replacement;
         self.classes[index] = K0NegativePrefilterClassState {
             window_size_class: Some(window_size_class),
             ..K0NegativePrefilterClassState::default()
@@ -9465,7 +9474,8 @@ fn select_k0_universal_finite_suffix_incumbent(
     window: SearchWindow,
     limits: SearchLimits,
 ) -> Option<K0UniversalFiniteSuffixIncumbentRoute> {
-    if limits != SearchLimits::unlimited()
+    if state.next_replacement & K0_NEGATIVE_PREFILTER_UNIVERSAL_INCUMBENT_POSSIBLE == 0
+        || limits != SearchLimits::unlimited()
         || window.start() > window.end()
         || window.end() > haystack_len
     {
@@ -9569,6 +9579,7 @@ fn schedule_k0_universal_finite_suffix_incumbent_calibration(
     if class.next_predicate & K0_FINITE_SUFFIX_UNIVERSAL_INCUMBENT_CALIBRATION == 0 {
         class.next_predicate = K0_FINITE_SUFFIX_UNIVERSAL_INCUMBENT_CALIBRATION;
     }
+    state.next_replacement |= K0_NEGATIVE_PREFILTER_UNIVERSAL_INCUMBENT_POSSIBLE;
 }
 
 fn observe_k0_mandatory_suffix_loss(
@@ -15940,6 +15951,8 @@ mod tests {
         let class_index = state.class_for(window_size_class);
         state.classes[class_index].next_predicate =
             super::K0_FINITE_SUFFIX_UNIVERSAL_INCUMBENT_CALIBRATION;
+        state.next_replacement |=
+            super::K0_NEGATIVE_PREFILTER_UNIVERSAL_INCUMBENT_POSSIBLE;
 
         assert_eq!(
             super::select_k0_universal_finite_suffix_incumbent(
@@ -19681,15 +19694,31 @@ mod tests {
             );
         }
 
+        state.next_replacement |=
+            super::K0_NEGATIVE_PREFILTER_UNIVERSAL_INCUMBENT_POSSIBLE;
         let replacement = state.class_for(99);
         assert_eq!(replacement, 0);
         assert_eq!(state.classes[replacement].window_size_class, Some(99));
         assert_eq!(state.classes[replacement].present_backoff, 0);
+        assert_ne!(
+            state.next_replacement
+                & super::K0_NEGATIVE_PREFILTER_UNIVERSAL_INCUMBENT_POSSIBLE,
+            0,
+        );
         for size_class in 11..10 + state_count {
             assert!(state
                 .classes
                 .iter()
                 .any(|entry| entry.window_size_class == Some(size_class)));
+        }
+        for (expected_index, size_class) in [(1, 100), (2, 101), (3, 102), (0, 103)] {
+            assert_eq!(state.class_for(size_class), expected_index);
+            assert_ne!(
+                state.next_replacement
+                    & super::K0_NEGATIVE_PREFILTER_UNIVERSAL_INCUMBENT_POSSIBLE,
+                0,
+                "packed universal-incumbent receipt survives replacement",
+            );
         }
     }
 
