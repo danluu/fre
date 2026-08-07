@@ -17858,6 +17858,48 @@ mod tests {
     }
 
     #[test]
+    fn k0_packed_frontier_exact_witness_is_byte_exact_and_window_bound() {
+        let mut haystack = b"!abXYZq!".to_vec();
+        let address = haystack.as_ptr();
+        let full = SearchWindow::full(&haystack);
+        for (start, length) in [(1_usize, 2_usize), (3, 3), (3, 4)] {
+            let end = start + length;
+            let witness = super::K0PackedFrontierExactWitness::from_match(
+                &haystack,
+                start,
+                end,
+            )
+            .expect("a two-to-four-byte exact witness constructs");
+            assert!(witness.is_present(&haystack, full));
+            assert!(!witness.is_present(
+                &haystack,
+                SearchWindow::new(start + 1, full.end()),
+            ));
+            assert!(!witness.is_present(
+                &haystack,
+                SearchWindow::new(full.start(), end - 1),
+            ));
+
+            let original = haystack[start];
+            haystack[start] ^= 1;
+            assert_eq!(haystack.as_ptr(), address);
+            assert!(!witness.is_present(&haystack, full));
+            haystack[start] = original;
+            assert!(witness.is_present(&haystack, full));
+        }
+        assert!(super::K0PackedFrontierExactWitness::from_match(&haystack, 1, 1).is_none());
+        assert!(super::K0PackedFrontierExactWitness::from_match(&haystack, 0, 5).is_none());
+        assert!(
+            super::K0PackedFrontierExactWitness::from_match(
+                &haystack,
+                haystack.len(),
+                haystack.len() + 1,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
     fn k0_packed_frontier_exact_witness_renews_epochs_and_detects_mutation() {
         let regex = forced_k0_with_only_packed_frontier(
             r"(?s-u:...[abcd][12345]+\b)",
@@ -17925,7 +17967,7 @@ mod tests {
         assert_eq!(haystack.as_ptr(), address);
         assert!(!session
             .is_match_window_value(&haystack, window, SearchLimits::unlimited())
-            .expect("mutated boundary call reprobes Packed exactly"));
+            .expect("mutated boundary Direct call stays exact and expires its route"));
         match &session.plan {
             PortableSearchSessionPlan::K0 {
                 exclusive_route_state: super::K0ExclusiveRouteState::Packed(state),
@@ -19072,6 +19114,51 @@ mod tests {
                 *packed_frontier_exists_state,
                 retained_before,
                 "a retained-call error preserves its structural bit, preference, and countdown",
+            );
+
+            packed_frontier_exists_state.set_exact_floor_witness(
+                class_index,
+                super::K0PackedFrontierExactWitness::from_match(&haystack, 1_000, 1_002),
+            );
+            packed_frontier_exists_state.set_preference(
+                class_index,
+                super::K0PackedFrontierExistsPreference::RetainExactFloor,
+            );
+            packed_frontier_exists_state.direct_remaining[class_index] = 1;
+            let exact_boundary_before = *packed_frontier_exists_state;
+            let exact_boundary_receipt = K0PackedFrontierExistsReceipt::admit(
+                k0_plan,
+                session,
+                &haystack,
+                window,
+                SearchLimits::unlimited(),
+            )
+            .expect("exact-boundary error admission remains valid")
+            .expect("exact-boundary error window admits the packed replacement");
+            assert!(matches!(
+                super::execute_k0_packed_frontier_exists_route(
+                    exact_boundary_receipt,
+                    packed_frontier_exists_state,
+                    |_, _, _, _, observation| {
+                        assert!(
+                            observation.is_none(),
+                            "an exact retained epoch must use the report-free executor",
+                        );
+                        Err(SearchError::K0(
+                            super::K0SearchError::InternalInvariant {
+                                detail: "focused exact-boundary incumbent failure",
+                            },
+                        ))
+                    },
+                ),
+                Err(SearchError::K0(super::K0SearchError::InternalInvariant {
+                    detail: "focused exact-boundary incumbent failure",
+                }))
+            ));
+            assert_eq!(
+                *packed_frontier_exists_state,
+                exact_boundary_before,
+                "an exact epoch-boundary error preserves its witness, stage, and countdown",
             );
         }
 
