@@ -23871,8 +23871,22 @@ mod tests {
             .count()
     }
 
-    fn aarch64_v3_root_zero_test_body_count(words: &[u32]) -> usize {
+    fn aarch64_v3_root_zero_test_body_count(
+        words: &[u32],
+        output: OutputContract,
+    ) -> usize {
         let compact_load = aarch64_load_h_uxtw(8, 11, 6).unwrap();
+        // Exists tests dead on the unmodified W8 cell, then CFG compaction
+        // turns `CBNZ W6, non_root; B root_dispatch` into one CBZ selecting
+        // the scanner. Endpoint-producing contracts use W6 for both the
+        // masked dead token and the decoded-root test, so their exact sequence
+        // is CBZ(dead), CBNZ(non-root).
+        let expected_token_tests: &[u32] = match output {
+            OutputContract::Exists => &[0x3400_0006],
+            OutputContract::SelectedEnd | OutputContract::Span => {
+                &[0x3400_0006, 0x3500_0006]
+            }
+        };
         words
             .iter()
             .enumerate()
@@ -23890,8 +23904,11 @@ mod tests {
                     return false;
                 };
                 words.get(load..tail_start).is_some_and(|body| {
-                    body.iter()
-                        .any(|&word| word & 0xff00_001f == 0x3500_0006)
+                    let token_tests = body.iter().filter_map(|&word| {
+                        let opcode = word & 0xff00_001f;
+                        matches!(opcode, 0x3400_0006 | 0x3500_0006).then_some(opcode)
+                    });
+                    token_tests.eq(expected_token_tests.iter().copied())
                 })
             })
             .count()
@@ -28850,9 +28867,9 @@ mod tests {
                     "{target:?}/{output:?} V4 needs one direct cell-offset backedge"
                 );
                 assert_eq!(
-                    aarch64_v3_root_zero_test_body_count(&words),
+                    aarch64_v3_root_zero_test_body_count(&words, output),
                     9,
-                    "{target:?}/{output:?} V3 rows must test canonical root zero"
+                    "{target:?}/{output:?} V3 rows must use the exact canonical-root branch"
                 );
                 let authenticated_loop_count = words
                     .iter()
