@@ -10381,23 +10381,24 @@ struct K0PackedFrontierExistsAttempt {
     observation: K0PackedFrontierObservation,
 }
 
-/// One replacement-only Exists call bound to one immutable K0 plan and one
-/// immutably borrowed source. The source-bearing receipt is call-local. Only
-/// its window geometry and numeric floor/work observation may enter policy
-/// state, and those coordinates are never used to narrow a later search.
-struct K0PackedFrontierExistsReceipt<'p, 'h> {
+/// One replacement-only Exists call bound to one immutable K0 plan, its exact
+/// mutable session, and one immutably borrowed source. The source-bearing
+/// receipt is call-local. Only its window geometry and numeric floor/work
+/// observation may enter policy state, and those coordinates are never used
+/// to narrow a later search.
+struct K0PackedFrontierExistsReceipt<'p, 's, 'a, 'h> {
     plan: &'p K0PackedFrontierPlan,
-    automaton: &'p Automaton,
+    session: &'s mut K0SearchSession<'a>,
     haystack: &'h [u8],
     window: SearchWindow,
     search_limits: SearchLimits,
     packed_limits: PackedLiteralSetSearchLimits,
 }
 
-impl<'p, 'h> K0PackedFrontierExistsReceipt<'p, 'h> {
+impl<'p, 's, 'a, 'h> K0PackedFrontierExistsReceipt<'p, 's, 'a, 'h> {
     fn admit(
         k0_plan: &'p PortableK0Plan,
-        session: &K0SearchSession<'_>,
+        session: &'s mut K0SearchSession<'a>,
         haystack: &'h [u8],
         window: SearchWindow,
         limits: SearchLimits,
@@ -10430,7 +10431,7 @@ impl<'p, 'h> K0PackedFrontierExistsReceipt<'p, 'h> {
         }
         Ok(Some(Self {
             plan,
-            automaton: &k0_plan.automaton,
+            session,
             haystack,
             window,
             search_limits: limits,
@@ -10438,18 +10439,8 @@ impl<'p, 'h> K0PackedFrontierExistsReceipt<'p, 'h> {
         }))
     }
 
-    fn validate_execution(&self, session: &K0SearchSession<'_>) -> Result<(), SearchError> {
-        if !self.plan.is_bound_to(self.automaton) || !session.is_bound_to(self.automaton) {
-            return Err(SearchError::K0(K0SearchError::InternalInvariant {
-                detail: "K0 packed-frontier execution crossed immutable plans",
-            }));
-        }
-        Ok(())
-    }
-
     fn execute_packed<F>(
         self,
-        session: &mut K0SearchSession<'_>,
         execute_incumbent: F,
     ) -> Result<K0PackedFrontierExistsAttempt, SearchError>
     where
@@ -10461,7 +10452,6 @@ impl<'p, 'h> K0PackedFrontierExistsReceipt<'p, 'h> {
             Option<&mut K0PackedFrontierIncumbentObservation>,
         ) -> Result<bool, SearchError>,
     {
-        self.validate_execution(session)?;
         // The packed owner returns its first frontier occurrence. Thus the
         // added work of an early positive is bounded by that early prefix,
         // while complete absence is the case that earns a whole-window K0
@@ -10499,7 +10489,7 @@ impl<'p, 'h> K0PackedFrontierExistsReceipt<'p, 'h> {
         let mut incumbent_observation =
             K0PackedFrontierIncumbentObservation::Incomparable;
         let output = execute_incumbent(
-            session,
+            self.session,
             self.haystack,
             SearchWindow::new(floor, self.window.end()),
             self.search_limits,
@@ -10519,8 +10509,7 @@ impl<'p, 'h> K0PackedFrontierExistsReceipt<'p, 'h> {
 }
 
 fn execute_k0_packed_frontier_exists_route<F>(
-    receipt: K0PackedFrontierExistsReceipt<'_, '_>,
-    session: &mut K0SearchSession<'_>,
+    receipt: K0PackedFrontierExistsReceipt<'_, '_, '_, '_>,
     state: &mut K0PackedFrontierExistsState,
     execute_incumbent: F,
 ) -> Result<bool, SearchError>
@@ -10533,7 +10522,6 @@ where
         Option<&mut K0PackedFrontierIncumbentObservation>,
     ) -> Result<bool, SearchError>,
 {
-    receipt.validate_execution(session)?;
     // A retained Direct epoch is already bound to this immutable packed plan
     // and exact source window by this validated receipt. Execute it before
     // transactionally copying the whole four-class policy. Structural epochs
@@ -10550,7 +10538,7 @@ where
             Some(&mut incumbent_observation)
         };
         let output = execute_incumbent(
-            session,
+            &mut *receipt.session,
             receipt.haystack,
             receipt.window,
             receipt.search_limits,
@@ -10571,7 +10559,7 @@ where
     let output = match route {
         K0PackedFrontierExistsRoute::Packed { class_index } => {
             let window = receipt.window;
-            let attempt = receipt.execute_packed(session, execute_incumbent)?;
+            let attempt = receipt.execute_packed(execute_incumbent)?;
             state_after_success.observe_packed(class_index, window, attempt.observation);
             attempt.output
         }
@@ -10583,7 +10571,7 @@ where
             let mut incumbent_observation =
                 K0PackedFrontierIncumbentObservation::Incomparable;
             let output = execute_incumbent(
-                session,
+                &mut *receipt.session,
                 receipt.haystack,
                 receipt.window,
                 receipt.search_limits,
@@ -14043,7 +14031,6 @@ impl<'r> PortableSearchSession<'r> {
                         }))?;
                     return execute_k0_packed_frontier_exists_route(
                         receipt,
-                        session,
                         packed_frontier_exists_state,
                         |session, haystack, window, limits, measured_work| {
                             execute_k0_exists_incumbent(
@@ -17446,7 +17433,6 @@ mod tests {
         let calls = std::cell::Cell::new(0_u8);
         let output = super::execute_k0_packed_frontier_exists_route(
             receipt,
-            session,
             packed_state,
             |session, actual_haystack, actual_window, limits, observation| {
                 calls.set(calls.get().saturating_add(1));
@@ -17503,7 +17489,6 @@ mod tests {
         let calls = std::cell::Cell::new(0_u8);
         let output = super::execute_k0_packed_frontier_exists_route(
             receipt,
-            session,
             packed_state,
             |_, _, _, _, _| {
                 calls.set(calls.get().saturating_add(1));
@@ -18077,7 +18062,6 @@ mod tests {
         let calls = std::cell::Cell::new(0_u8);
         let output = super::execute_k0_packed_frontier_exists_route(
             receipt,
-            session,
             packed_frontier_exists_state,
             |session, actual_haystack, actual_window, limits, observation| {
                 calls.set(calls.get().saturating_add(1));
@@ -18464,7 +18448,6 @@ mod tests {
             assert!(matches!(
                 super::execute_k0_packed_frontier_exists_route(
                     receipt,
-                    session,
                     packed_frontier_exists_state,
                     |_, _, _, _, _| {
                         incumbent_calls.set(incumbent_calls.get().saturating_add(1));
@@ -18520,7 +18503,6 @@ mod tests {
             assert!(matches!(
                 super::execute_k0_packed_frontier_exists_route(
                     receipt,
-                    session,
                     packed_frontier_exists_state,
                     |_, _, _, _, _| {
                         incumbent_calls.set(incumbent_calls.get().saturating_add(1));
@@ -18554,7 +18536,6 @@ mod tests {
             assert!(matches!(
                 super::execute_k0_packed_frontier_exists_route(
                     measured_retained_receipt,
-                    session,
                     packed_frontier_exists_state,
                     |_, _, _, _, observation| {
                         assert!(
@@ -18597,7 +18578,6 @@ mod tests {
             assert!(matches!(
                 super::execute_k0_packed_frontier_exists_route(
                     retained_receipt,
-                    session,
                     packed_frontier_exists_state,
                     |_, _, _, _, observation| {
                         assert!(
@@ -18711,7 +18691,6 @@ mod tests {
         let absolute_end_proof = k0_plan.absolute_end_proof;
         let result = super::execute_k0_packed_frontier_exists_route(
             receipt,
-            session,
             packed_state,
             |session, haystack, tail_window, limits, observation| {
                 super::execute_k0_exists_incumbent(
