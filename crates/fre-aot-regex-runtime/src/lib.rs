@@ -141,7 +141,7 @@ pub struct FreAotRegexDynamicRowsPreflightV1 {
 
 /// Compiler-private payload for one exact first-unpublished-cell handoff.
 ///
-/// The original window remains in the search helper's ordinary arguments.
+/// The exact admitted window remains in the search helper's ordinary arguments.
 /// This record carries only the dynamic cache frontier and committed endpoint;
 /// generated code allocates it in its synchronous call frame.
 #[doc(hidden)]
@@ -703,10 +703,19 @@ impl PreparedAotRegex {
         )
     }
 
-    fn observe_dynamic_native_rows_deopt(&mut self) {
+    fn search_after_dynamic_native_rows_deopt(
+        &mut self,
+        haystack: &[u8],
+        window: SearchWindow,
+    ) -> Result<MatchResult, CompileError> {
         self.deactivate_frozen_header();
         self.program
-            .observe_dynamic_native_rows_deopt_with_workspace(&mut self.workspace);
+            .search_after_dynamic_native_rows_deopt_with_workspace(
+                haystack,
+                window,
+                &mut self.workspace,
+                self.fully_prefilled_fallback,
+            )
     }
 
     fn settle_dynamic_native_rows_local_completion(&mut self) {
@@ -1300,19 +1309,24 @@ fn search_exclusive_with_dynamic_rows_outcome(
     catch_unwind(AssertUnwindSafe(|| unsafe {
         let prepared = &mut *handle.0.cast::<PreparedAotRegex>();
         let haystack = std::slice::from_raw_parts(haystack_ptr, haystack_len);
-        match dynamic_rows_outcome {
+        let searched = match dynamic_rows_outcome {
             DynamicNativeRowsFallbackOutcome::LocalCompletion => {
                 prepared.settle_dynamic_native_rows_local_completion();
+                prepared.search_exclusive(
+                    haystack,
+                    SearchWindow::new(window_start, window_end),
+                )
             }
-            DynamicNativeRowsFallbackOutcome::Deopt => {
-                prepared.observe_dynamic_native_rows_deopt();
-            }
-        }
-        let Ok((status, result)) =
-            execute_exclusive_search(prepared, haystack, window_start, window_end)
-        else {
+            DynamicNativeRowsFallbackOutcome::Deopt => prepared
+                .search_after_dynamic_native_rows_deopt(
+                    haystack,
+                    SearchWindow::new(window_start, window_end),
+                ),
+        };
+        let Ok(found) = searched else {
             return STATUS_RUNTIME_FAILURE;
         };
+        let (status, result) = encode_match_result(found);
         result_ptr.write(result);
         status
     }))
@@ -1432,7 +1446,9 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_search_exclusive_frozen_fallback_
 /// scanner. This private compiler/runtime seam has the same raw ABI and
 /// semantic result contract as [`fre_aot_regex_runtime_search_exclusive_v1`],
 /// but records adaptive deopt feedback instead of settling a prior local
-/// native completion.
+/// native completion. Its admission ticket also preserves any already-run
+/// mandatory cut and the original input-length profitability basis, so the
+/// fallback starts at the exact admitted window without replaying that cut.
 ///
 /// # Safety
 ///
@@ -2054,7 +2070,7 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_search_exclusive_partial_prefligh
 /// Authenticate and project an ordinary warmed K0 root for generated code.
 ///
 /// On status [`STATUS_PARTIAL_PREFLIGHT_ENTER`], `preflight_out` contains the
-/// exact original search window, a pointer-stable fixed-layout descriptor,
+/// exact admitted search window, a pointer-stable fixed-layout descriptor,
 /// and the immutable cache identity that must equal the descriptor's identity
 /// before either projected address is read. These exposed-provenance addresses
 /// are live only until the admitted native scan returns or calls a runtime

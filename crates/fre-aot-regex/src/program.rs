@@ -3309,28 +3309,53 @@ struct DynamicNativeRowsState {
     consecutive_deopts: u8,
     bypass_remaining: u16,
     native_entry_window: Option<SearchWindow>,
+    native_entry_original_input_bytes: usize,
+    native_entry_after_mandatory_cut: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DynamicNativeRowsAdmission {
+    window: SearchWindow,
+    original_input_bytes: usize,
+    after_mandatory_cut: bool,
 }
 
 impl DynamicNativeRowsState {
     fn settle_unobserved_local_entry(&mut self) {
-        if self.native_entry_window.take().is_some() {
+        if self.take_native_entry_admission().is_some() {
             self.consecutive_deopts = 0;
             self.bypass_remaining = 0;
         }
     }
 
+    #[cfg(test)]
     fn claim(&mut self, window: SearchWindow) -> bool {
+        self.claim_with_provenance(
+            window,
+            window.end.saturating_sub(window.start),
+            false,
+        )
+    }
+
+    fn claim_with_provenance(
+        &mut self,
+        window: SearchWindow,
+        original_input_bytes: usize,
+        after_mandatory_cut: bool,
+    ) -> bool {
         self.settle_unobserved_local_entry();
         if self.bypass_remaining != 0 {
             self.bypass_remaining = self.bypass_remaining.saturating_sub(1);
             return false;
         }
         self.native_entry_window = Some(window);
+        self.native_entry_original_input_bytes = original_input_bytes;
+        self.native_entry_after_mandatory_cut = after_mandatory_cut;
         true
     }
 
     fn observe_deopt(&mut self) {
-        let claimed = self.native_entry_window.take().is_some();
+        let claimed = self.take_native_entry_admission().is_some();
         self.observe_consumed_deopt(claimed);
     }
 
@@ -3349,15 +3374,30 @@ impl DynamicNativeRowsState {
 
     fn settle_consumed_local_completion(&mut self) {
         debug_assert!(self.native_entry_window.is_none());
+        debug_assert_eq!(self.native_entry_original_input_bytes, 0);
+        debug_assert!(!self.native_entry_after_mandatory_cut);
         self.consecutive_deopts = 0;
         self.bypass_remaining = 0;
+    }
+
+    fn take_native_entry_admission(&mut self) -> Option<DynamicNativeRowsAdmission> {
+        let window = self.native_entry_window.take()?;
+        let admission = DynamicNativeRowsAdmission {
+            window,
+            original_input_bytes: self.native_entry_original_input_bytes,
+            after_mandatory_cut: self.native_entry_after_mandatory_cut,
+        };
+        self.native_entry_original_input_bytes = 0;
+        self.native_entry_after_mandatory_cut = false;
+        Some(admission)
     }
 
     /// Consume the exact window admitted for one generated dynamic-row scan.
     /// Every private continuation or postflight attempt takes the capability,
     /// including a malformed attempt, so it cannot be replayed.
     fn take_native_entry_window(&mut self) -> Option<SearchWindow> {
-        self.native_entry_window.take()
+        self.take_native_entry_admission()
+            .map(|admission| admission.window)
     }
 }
 
@@ -5010,7 +5050,7 @@ impl CompiledProgram {
             || self.context_dfa.is_some()
             || !matches!(self.engine, ProgramEngine::OrderedNfa)
             || self.automaton.stats().has_assertions()
-            || self.nfa_mandatory_cut.is_some()
+            || self.has_nfa_exact_product()
         {
             return None;
         }
@@ -6952,7 +6992,7 @@ impl CompiledProgram {
             || self.context_dfa.is_some()
             || !matches!(self.engine, ProgramEngine::OrderedNfa)
             || self.automaton.stats().has_assertions()
-            || self.nfa_mandatory_cut.is_some()
+            || self.has_nfa_exact_product()
         {
             return Err(CompileError::InternalInvariant(
                 "dynamic native rows require assertion-free ordered-NFA endpoint output or nonzero Span",
@@ -6960,6 +7000,25 @@ impl CompiledProgram {
         }
 
         let input_bytes = window.end.saturating_sub(window.start);
+        let has_mandatory_cut = self.nfa_mandatory_cut.is_some();
+        workspace
+            .dynamic_native_rows
+            .as_deref_mut()
+            .ok_or(CompileError::InternalInvariant(
+                "dynamic native-row preflight has no prepared descriptor workspace",
+            ))?
+            .state
+            .settle_unobserved_local_entry();
+        let window = if has_mandatory_cut {
+            match self.search_nfa_with_mandatory_cut(haystack, window) {
+                NfaMandatoryCutOutcome::Complete(found) => {
+                    return Ok((RetainedPartialPreflight::Complete(found), 0, 0));
+                }
+                NfaMandatoryCutOutcome::Continue(narrowed) => narrowed,
+            }
+        } else {
+            window
+        };
         let mut initial_pending = false;
         let mut enter = None;
         {
@@ -6973,8 +7032,7 @@ impl CompiledProgram {
                     "dynamic native-row preflight has no prepared descriptor workspace",
                 ),
             )?;
-            dynamic.state.settle_unobserved_local_entry();
-            if input_bytes >= DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES {
+            if window.start < window.end && input_bytes >= DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES {
                 let nfa = nfa.as_ref().ok_or(CompileError::InternalInvariant(
                     "dynamic native-row preflight has no prepared K0 workspace",
                 ))?;
@@ -6983,7 +7041,13 @@ impl CompiledProgram {
                 if descriptor_ready {
                     initial_pending =
                         dynamic.native_rows.initial_flags & NATIVE_ROWS_INITIAL_PENDING != 0;
-                    if !initial_pending && dynamic.state.claim(window) {
+                    if !initial_pending
+                        && dynamic.state.claim_with_provenance(
+                            window,
+                            input_bytes,
+                            has_mandatory_cut,
+                        )
+                    {
                         enter = Some((
                             (&raw const dynamic.native_rows).expose_provenance(),
                             dynamic.native_rows.cache_identity,
@@ -7002,8 +7066,18 @@ impl CompiledProgram {
                 cache_identity,
             ));
         }
-        self.search_optimized_with_workspace(haystack, window, workspace)
-            .map(|found| (RetainedPartialPreflight::Complete(found), 0, 0))
+        let found = if has_mandatory_cut {
+            self.search_nfa_after_dynamic_mandatory_cut(
+                haystack,
+                window,
+                input_bytes,
+                workspace,
+                None,
+            )
+        } else {
+            self.search_optimized_with_workspace(haystack, window, workspace)
+        }?;
+        Ok((RetainedPartialPreflight::Complete(found), 0, 0))
     }
 
     /// Continue the exact first unpublished cell reached by an admitted
@@ -7016,7 +7090,7 @@ impl CompiledProgram {
     /// mutable first-miss handoff and resets adaptive deopt state. Any stale or
     /// malformed callback consumes the outstanding ticket, records the same
     /// deopt feedback as the established whole-window side exit, and completes
-    /// through the canonical optimizing executor on the original window.
+    /// through the canonical optimizing executor on the admitted window.
     #[doc(hidden)]
     #[allow(
         clippy::too_many_arguments,
@@ -7038,11 +7112,12 @@ impl CompiledProgram {
         // Consume before any validation that could reach mutable K0 state. An
         // independently invoked private ABI therefore cannot borrow a live
         // admission indefinitely or substitute a different search window.
-        let admitted_window = workspace
+        let admission = workspace
             .dynamic_native_rows
             .as_deref_mut()
-            .and_then(|dynamic| dynamic.state.take_native_entry_window());
-        let had_claim = admitted_window.is_some();
+            .and_then(|dynamic| dynamic.state.take_native_entry_admission());
+        let admitted_window = admission.map(|admission| admission.window);
+        let had_claim = admission.is_some();
 
         let continued = (|| -> Result<MatchResult, CompileError> {
             if admitted_window != Some(window) {
@@ -7203,7 +7278,17 @@ impl CompiledProgram {
         // only a callback with no outstanding ticket falls back to its
         // ordinary validated arguments.
         let fallback_window = admitted_window.unwrap_or(window);
-        self.search_optimized_with_workspace(haystack, fallback_window, workspace)
+        if let Some(admission) = admission.filter(|admission| admission.after_mandatory_cut) {
+            self.search_nfa_after_dynamic_mandatory_cut(
+                haystack,
+                fallback_window,
+                admission.original_input_bytes,
+                workspace,
+                None,
+            )
+        } else {
+            self.search_optimized_with_workspace(haystack, fallback_window, workspace)
+        }
     }
 
     /// Recover a variable-width Span start after an admitted dynamic-row scan
@@ -7297,6 +7382,78 @@ impl CompiledProgram {
             dynamic.state.settle_consumed_local_completion();
         }
         Ok(MatchResult::Span(Some((recovered_start, selected_end))))
+    }
+
+    /// Complete a generated dynamic-row whole-search side exit without
+    /// replaying an ordinary mandatory cut already executed by preflight.
+    /// The single-use admission retains the original byte count so retained
+    /// partial-row selection uses the same profitability basis as admission,
+    /// even when the proved post-cut window is short.
+    #[doc(hidden)]
+    pub fn search_after_dynamic_native_rows_deopt_with_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+        receipt: Option<FullyPrefilledFallbackReceipt>,
+    ) -> Result<MatchResult, CompileError> {
+        if window.start > window.end || window.end > haystack.len() {
+            return Err(CompileError::InvalidWindow {
+                start: window.start,
+                end: window.end,
+                haystack_len: haystack.len(),
+            });
+        }
+        if !workspace.identity.compatible(&self.identity) {
+            return Err(CompileError::InternalInvariant(
+                "dynamic native-row deopt workspace belongs to a different semantic program",
+            ));
+        }
+
+        let admission = workspace
+            .dynamic_native_rows
+            .as_deref_mut()
+            .and_then(|dynamic| {
+                let admission = dynamic.state.take_native_entry_admission();
+                dynamic
+                    .state
+                    .observe_consumed_deopt(admission.is_some());
+                dynamic.native_rows_dirty = true;
+                admission
+            });
+        let fallback_window = admission.map_or(window, |admission| admission.window);
+        if let Some(admission) = admission.filter(|admission| admission.after_mandatory_cut) {
+            if self.nfa_mandatory_cut.is_none()
+                || admission.original_input_bytes
+                    < fallback_window.end.saturating_sub(fallback_window.start)
+            {
+                return Err(CompileError::InternalInvariant(
+                    "dynamic native-row deopt has invalid mandatory-cut provenance",
+                ));
+            }
+            return self.search_nfa_after_dynamic_mandatory_cut(
+                haystack,
+                fallback_window,
+                admission.original_input_bytes,
+                workspace,
+                receipt,
+            );
+        }
+
+        if let Some(receipt) = receipt {
+            self.search_exclusive_optimized_with_fully_prefilled_fallback_workspace(
+                haystack,
+                fallback_window,
+                workspace,
+                receipt,
+            )
+        } else {
+            self.search_exclusive_optimized_with_workspace(
+                haystack,
+                fallback_window,
+                workspace,
+            )
+        }
     }
 
     /// Record that an admitted dynamic root took its dedicated whole-search
@@ -7498,6 +7655,62 @@ impl CompiledProgram {
             start: narrowed_start,
             end: window.end,
         })
+    }
+
+    /// Complete a dynamic-row search after its ordinary mandatory cut has
+    /// already proved the exact lower boundary. Re-entering the optimizing
+    /// search here would repeat that whole-window proof. Instead, retain the
+    /// original input-length admission policy while executing partial rows or
+    /// K0 directly on the narrowed semantic window.
+    #[inline(never)]
+    fn search_nfa_after_dynamic_mandatory_cut(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        original_input_bytes: usize,
+        workspace: &mut ProgramWorkspace,
+        receipt: Option<FullyPrefilledFallbackReceipt>,
+    ) -> Result<MatchResult, CompileError> {
+        if window.start > window.end || window.end > haystack.len() {
+            return Err(CompileError::InvalidWindow {
+                start: window.start,
+                end: window.end,
+                haystack_len: haystack.len(),
+            });
+        }
+        if !workspace.identity.compatible(&self.identity) {
+            return Err(CompileError::InternalInvariant(
+                "dynamic mandatory-cut fallback workspace belongs to a different semantic program",
+            ));
+        }
+        if self.nfa_mandatory_cut.is_none()
+            || original_input_bytes < window.end.saturating_sub(window.start)
+        {
+            return Err(CompileError::InternalInvariant(
+                "dynamic mandatory-cut fallback has invalid post-cut provenance",
+            ));
+        }
+        workspace.mark_dynamic_native_rows_dirty();
+        let ProgramWorkspace { nfa, partial, .. } = workspace;
+        let nfa = nfa.as_mut().ok_or(CompileError::InternalInvariant(
+            "dynamic mandatory-cut fallback has no prepared K0 workspace",
+        ))?;
+        if original_input_bytes >= PARTIAL_DFA_MIN_INPUT_BYTES
+            && let Some(partial_dfa) = self.partial_dfa()
+            && let Some(partial_workspace) = partial.as_deref_mut()
+            && let Some(found) = self.search_nfa_with_partial_dfa_and_fallback_receipt(
+                partial_dfa,
+                haystack,
+                window,
+                nfa,
+                &mut partial_workspace.resume,
+                &mut partial_workspace.state,
+                receipt,
+            )?
+        {
+            return Ok(found);
+        }
+        self.search_nfa_unaccelerated(haystack, window, nfa)
     }
 
     /// Execute retained, canonical subset rows until they either decide the
@@ -12053,6 +12266,7 @@ mod tests {
                     .is_some()
             );
             assert!(accelerated.nfa_mandatory_suffix.is_none());
+            assert!(accelerated.native_dynamic_rows_view().is_none());
             let serialized = accelerated
                 .serialize()
                 .expect("serialize exact-product sidecar");
@@ -12072,6 +12286,7 @@ mod tests {
                     .and_then(NfaMandatoryCut::exact_product)
                     .is_some()
             );
+            assert!(restored.native_dynamic_rows_view().is_none());
 
             let reference = program(
                 "a[0-2]Z",
@@ -12088,8 +12303,10 @@ mod tests {
             );
             let mut accelerated_workspace = accelerated.prepare_workspace().unwrap();
             assert!(accelerated_workspace.nfa.is_none());
+            assert!(accelerated_workspace.dynamic_native_rows.is_none());
             let mut restored_workspace = restored.prepare_workspace().unwrap();
             assert!(restored_workspace.nfa.is_none());
+            assert!(restored_workspace.dynamic_native_rows.is_none());
             let mut reference_workspace = reference.prepare_workspace().unwrap();
             for haystack in &haystacks {
                 for start in 0..=haystack.len() {
@@ -16038,6 +16255,7 @@ mod tests {
         );
         let partial = limited.partial_dfa().expect("retained rows");
         assert!(limited.nfa_mandatory_suffix.is_some());
+        assert!(limited.native_dynamic_rows_view().is_some());
         let (prefix_plan, supported) = PartialDfaPrefixPlan::derive(limited.anchored_prefix.sets());
         assert!(supported);
         let haystack = b"cbbbbbbbbbbz";
@@ -16069,6 +16287,7 @@ mod tests {
             .search(haystack, SearchWindow::full(haystack))
             .expect("reference search");
         let mut workspace = limited.prepare_workspace().expect("workspace");
+        assert!(workspace.dynamic_native_rows.is_some());
         for attempt in 0..2 {
             assert_eq!(
                 limited
@@ -16262,6 +16481,12 @@ mod tests {
                 "{output:?}"
             );
             assert!(narrowed.start <= witness_start, "{output:?}");
+            assert!(original.end - original.start >= PARTIAL_DFA_MIN_INPUT_BYTES);
+            assert!(
+                narrowed.end - narrowed.start < DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES,
+                "{output:?} fixture must prove admission uses the original byte count"
+            );
+            assert!(limited.native_dynamic_rows_view().is_some(), "{output:?}");
 
             let bytes = limited.serialize().expect("serialize retained finite cut");
             assert_eq!(
@@ -16271,6 +16496,7 @@ mod tests {
             );
             let restored =
                 CompiledProgram::deserialize(&bytes).expect("restore retained finite cut");
+            assert!(restored.native_dynamic_rows_view().is_some(), "{output:?}");
             assert_eq!(
                 restored.search_nfa_with_mandatory_cut(&haystack, original),
                 NfaMandatoryCutOutcome::Continue(narrowed),
@@ -16284,6 +16510,288 @@ mod tests {
                 DeterminizeLimits::default(),
             );
             let expected = reference.search(&haystack, original).unwrap();
+            let mut dynamic_workspace = limited.prepare_workspace().unwrap();
+            assert!(dynamic_workspace.dynamic_native_rows.is_some(), "{output:?}");
+            let (cold, address, cache_identity) = limited
+                .preflight_dynamic_native_rows_with_workspace(
+                    &haystack,
+                    original,
+                    &mut dynamic_workspace,
+                    limited.artifact_identity(),
+                )
+                .unwrap();
+            assert_eq!(
+                cold,
+                RetainedPartialPreflight::Complete(expected),
+                "cold {output:?}"
+            );
+            assert_eq!((address, cache_identity), (0, 0), "cold {output:?}");
+            assert_eq!(
+                dynamic_workspace
+                    .partial
+                    .as_deref()
+                    .expect("dynamic retained workspace")
+                    .state
+                    .resumed,
+                1,
+                "cold {output:?} did not retain the original partial-DFA input floor"
+            );
+            assert_eq!(
+                limited
+                    .search_with_workspace(&haystack, original, &mut dynamic_workspace)
+                    .unwrap(),
+                expected,
+                "warm K0 {output:?}"
+            );
+            let (entered, address, cache_identity) = limited
+                .preflight_dynamic_native_rows_with_workspace(
+                    &haystack,
+                    original,
+                    &mut dynamic_workspace,
+                    limited.artifact_identity(),
+                )
+                .unwrap();
+            assert_eq!(
+                entered,
+                RetainedPartialPreflight::Enter(narrowed),
+                "warm {output:?}"
+            );
+            assert_ne!((address, cache_identity), (0, 0), "warm {output:?}");
+            assert_eq!(
+                dynamic_workspace
+                    .dynamic_native_rows
+                    .as_deref()
+                    .expect("dynamic descriptor")
+                    .state
+                    .native_entry_window,
+                Some(narrowed),
+                "warm {output:?} ticket"
+            );
+            let dynamic_state = &dynamic_workspace
+                .dynamic_native_rows
+                .as_deref()
+                .expect("dynamic descriptor")
+                .state;
+            assert_eq!(
+                dynamic_state.native_entry_original_input_bytes,
+                original.end - original.start,
+                "warm {output:?} original byte basis"
+            );
+            assert!(
+                dynamic_state.native_entry_after_mandatory_cut,
+                "warm {output:?} must retain post-cut provenance"
+            );
+
+            let absent = vec![b'!'; haystack.len()];
+            let (exhausted, address, cache_identity) = limited
+                .preflight_dynamic_native_rows_with_workspace(
+                    &absent,
+                    original,
+                    &mut dynamic_workspace,
+                    limited.artifact_identity(),
+                )
+                .unwrap();
+            let no_match = match output {
+                OutputContract::Exists => MatchResult::Exists(false),
+                OutputContract::SelectedEnd => MatchResult::SelectedEnd(None),
+                OutputContract::Span => MatchResult::Span(None),
+            };
+            assert_eq!(
+                exhausted,
+                RetainedPartialPreflight::Complete(no_match),
+                "exhausted {output:?}"
+            );
+            assert_eq!((address, cache_identity), (0, 0), "exhausted {output:?}");
+            assert_eq!(
+                dynamic_workspace
+                    .dynamic_native_rows
+                    .as_deref()
+                    .expect("dynamic descriptor")
+                    .state
+                    .native_entry_window,
+                None,
+                "exhausted {output:?} must settle the prior ticket"
+            );
+
+            let mut restored_dynamic_workspace = restored.prepare_workspace().unwrap();
+            assert_eq!(
+                restored
+                    .search_with_workspace(&haystack, original, &mut restored_dynamic_workspace)
+                    .unwrap(),
+                expected,
+                "wire warm K0 {output:?}"
+            );
+            let (wire_entered, address, cache_identity) = restored
+                .preflight_dynamic_native_rows_with_workspace(
+                    &haystack,
+                    original,
+                    &mut restored_dynamic_workspace,
+                    restored.artifact_identity(),
+                )
+                .unwrap();
+            assert_eq!(
+                wire_entered,
+                RetainedPartialPreflight::Enter(narrowed),
+                "wire warm {output:?}"
+            );
+            assert_ne!((address, cache_identity), (0, 0), "wire warm {output:?}");
+            let resumed_before_deopt = restored_dynamic_workspace
+                .partial
+                .as_deref()
+                .expect("wire dynamic retained workspace")
+                .state
+                .resumed;
+            assert_eq!(
+                restored
+                    .search_after_dynamic_native_rows_deopt_with_workspace(
+                        &haystack,
+                        narrowed,
+                        &mut restored_dynamic_workspace,
+                        None,
+                    )
+                    .unwrap(),
+                expected,
+                "wire post-cut deopt {output:?}"
+            );
+            assert_eq!(
+                restored_dynamic_workspace
+                    .partial
+                    .as_deref()
+                    .expect("wire dynamic retained workspace")
+                    .state
+                    .resumed,
+                resumed_before_deopt + 1,
+                "wire deopt {output:?} must retain the original partial-row floor"
+            );
+            let deopt_state = restored_dynamic_workspace
+                .dynamic_native_rows
+                .as_deref()
+                .expect("wire dynamic descriptor")
+                .state;
+            assert_eq!(deopt_state.native_entry_window, None, "wire deopt {output:?}");
+            assert_eq!(deopt_state.consecutive_deopts, 1, "wire deopt {output:?}");
+            assert_eq!(
+                deopt_state.native_entry_original_input_bytes,
+                0,
+                "wire deopt {output:?} consumed original byte provenance"
+            );
+            assert!(
+                !deopt_state.native_entry_after_mandatory_cut,
+                "wire deopt {output:?} consumed post-cut provenance"
+            );
+            let (wire_reentered, _, wire_cache_identity) = restored
+                .preflight_dynamic_native_rows_with_workspace(
+                    &haystack,
+                    original,
+                    &mut restored_dynamic_workspace,
+                    restored.artifact_identity(),
+                )
+                .unwrap();
+            assert_eq!(
+                wire_reentered,
+                RetainedPartialPreflight::Enter(narrowed),
+                "wire re-entry {output:?}"
+            );
+            let wire_descriptor = restored_dynamic_workspace
+                .dynamic_native_rows
+                .as_deref()
+                .expect("wire dynamic descriptor")
+                .native_rows;
+            restored_dynamic_workspace
+                .partial
+                .as_deref_mut()
+                .expect("wire dynamic retained workspace")
+                .state
+                .bypass_remaining = 7;
+            assert_eq!(
+                restored
+                    .search_from_dynamic_native_rows_hole_with_workspace(
+                        &haystack,
+                        narrowed,
+                        &mut restored_dynamic_workspace,
+                        restored.artifact_identity(),
+                        usize::try_from(wire_descriptor.initial_row).unwrap(),
+                        narrowed.start,
+                        0,
+                        0,
+                        wire_cache_identity.wrapping_add(1),
+                    )
+                    .unwrap(),
+                expected,
+                "wire malformed post-cut continuation {output:?}"
+            );
+            assert_eq!(
+                restored_dynamic_workspace
+                    .partial
+                    .as_deref()
+                    .expect("wire dynamic retained workspace")
+                    .state
+                    .bypass_remaining,
+                6,
+                "malformed continuation {output:?} did not preserve the original partial-row floor"
+            );
+            let malformed_state = restored_dynamic_workspace
+                .dynamic_native_rows
+                .as_deref()
+                .expect("wire dynamic descriptor")
+                .state;
+            assert_eq!(
+                malformed_state.consecutive_deopts, 2,
+                "wire malformed continuation {output:?}"
+            );
+            assert_eq!(
+                malformed_state.bypass_remaining, 16,
+                "wire malformed continuation {output:?}"
+            );
+
+            let mut foreign_workspace = restored.prepare_workspace().unwrap();
+            assert_eq!(
+                restored
+                    .search_with_workspace(&haystack, original, &mut foreign_workspace)
+                    .unwrap(),
+                expected,
+                "foreign witness warm {output:?}"
+            );
+            let (foreign_entered, _, foreign_cache_identity) = restored
+                .preflight_dynamic_native_rows_with_workspace(
+                    &haystack,
+                    original,
+                    &mut foreign_workspace,
+                    restored.artifact_identity(),
+                )
+                .unwrap();
+            assert_eq!(
+                foreign_entered,
+                RetainedPartialPreflight::Enter(narrowed),
+                "foreign witness admission {output:?}"
+            );
+            let foreign_descriptor = foreign_workspace
+                .dynamic_native_rows
+                .as_deref()
+                .expect("foreign dynamic descriptor")
+                .native_rows;
+            foreign_workspace.identity.artifact[0] ^= 1;
+            foreign_workspace.identity.instance = foreign_workspace
+                .identity
+                .instance
+                .checked_add(1)
+                .expect("small test instance identity");
+            assert!(
+                restored
+                    .search_from_dynamic_native_rows_hole_with_workspace(
+                        &haystack,
+                        narrowed,
+                        &mut foreign_workspace,
+                        restored.artifact_identity(),
+                        usize::try_from(foreign_descriptor.initial_row).unwrap(),
+                        narrowed.start,
+                        0,
+                        0,
+                        foreign_cache_identity.wrapping_add(1),
+                    )
+                    .is_err(),
+                "malformed continuation must not enter post-cut K0 with a foreign workspace: {output:?}"
+            );
             let mut limited_workspace = limited.prepare_workspace().unwrap();
             let mut restored_workspace = restored.prepare_workspace().unwrap();
             assert_eq!(

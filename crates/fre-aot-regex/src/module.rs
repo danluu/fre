@@ -13847,6 +13847,13 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     }
 
     assembler.bind(preflight_enter)?;
+    // Canonicalize the ordinary helper arguments to the exact window admitted
+    // by preflight. Continuation payloads overwrite the preflight record, so
+    // every later deopt/hole path reloads this durable narrowed alias.
+    assembler.instruction(&[0x4c, 0x8b, 0x54, 0x24, 0x40])?;
+    assembler.instruction(&[0x4c, 0x89, 0x54, 0x24, 0x28])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x54, 0x24, 0x48])?;
+    assembler.instruction(&[0x4c, 0x89, 0x54, 0x24, 0x30])?;
     // R11 retains the authenticated descriptor while the shared scanner
     // helpers use RAX for constants, remaining lengths, and candidate masks.
     assembler.instruction(&[0x4c, 0x8b, 0x5c, 0x24, 0x50])?; // descriptor
@@ -21631,6 +21638,12 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     }
 
     assembler.bind(preflight_enter)?;
+    // Preserve the exact preflight window in the ordinary helper arguments;
+    // the continuation record later reuses the preflight stack slots.
+    assembler.instruction(aarch64_load_x_imm(8, 31, 48)?)?;
+    assembler.instruction(aarch64_store_x(8, 31, 24)?)?;
+    assembler.instruction(aarch64_load_x_imm(8, 31, 56)?)?;
+    assembler.instruction(aarch64_store_x(8, 31, 32)?)?;
     // Caller-saved registers remain disjoint across the root scanners:
     // X13 descriptor, X14/X15 map/rows, W11 current row, W1 initial row,
     // X2/X3 position/end, W4/W7/W9 cell masks, and X8/X10/X12 scratch.
@@ -25779,10 +25792,19 @@ mod tests {
         );
         assert!(cut.program().native_dfa_view().is_none());
         assert!(cut.program().native_partial_dfa_view().is_none());
+        assert!(cut.program().native_dynamic_rows_view().is_some());
         let cut_module = CompiledModule::lower(cut.program(), target)
             .expect("ordinary mandatory-cut fallback lowering");
         assert!(cut_module.required_runtime_symbol().is_some());
-        assert!(cut_module.prepared_entry_symbol().is_none());
+        assert!(cut_module.prepared_entry_symbol().is_some());
+        assert_eq!(
+            cut_module.required_prepared_preflight_runtime_symbol(),
+            Some(DYNAMIC_ROWS_PREFLIGHT_RUNTIME_SYMBOL_NAME)
+        );
+        assert_eq!(
+            cut_module.required_prepared_dynamic_rows_deopt_runtime_symbol(),
+            Some(DYNAMIC_ROWS_DEOPT_RUNTIME_SYMBOL_NAME)
+        );
 
         let compiled = complete_forward_resource_fallback(
             "[b-c][a-b]{1,10}z",
@@ -25875,6 +25897,92 @@ mod tests {
             declined_module.required_prepared_dynamic_rows_deopt_runtime_symbol(),
             Some(DYNAMIC_ROWS_DEOPT_RUNTIME_SYMBOL_NAME)
         );
+    }
+
+    #[test]
+    fn ordinary_mandatory_cut_publishes_dynamic_rows_on_every_target() {
+        let pattern = "[b-c][a-b]{1,10}7[A-Za-z]{1,2}";
+        for target in identity_target_matrix() {
+            for output in [
+                OutputContract::Exists,
+                OutputContract::SelectedEnd,
+                OutputContract::Span,
+            ] {
+                let compiled = complete_forward_resource_fallback(pattern, output, target);
+                assert!(
+                    compiled.program().native_dfa_view().is_none(),
+                    "{target:?}/{output:?}"
+                );
+                assert!(
+                    compiled.program().native_partial_dfa_view().is_none(),
+                    "{target:?}/{output:?}"
+                );
+                assert!(
+                    !compiled.program().has_nfa_exact_product(),
+                    "{target:?}/{output:?}"
+                );
+                let dynamic = compiled
+                    .program()
+                    .native_dynamic_rows_view()
+                    .unwrap_or_else(|| panic!("missing dynamic cut view: {target:?}/{output:?}"));
+                assert!(dynamic.root_requirement.is_some(), "{target:?}/{output:?}");
+
+                let module = CompiledModule::lower(compiled.program(), target)
+                    .unwrap_or_else(|error| {
+                        panic!("dynamic cut lowering {target:?}/{output:?}: {error}")
+                    });
+                assert!(
+                    module.required_runtime_symbol().is_some(),
+                    "{target:?}/{output:?}"
+                );
+                assert!(
+                    module.prepared_entry_symbol().is_some(),
+                    "{target:?}/{output:?}"
+                );
+                assert_eq!(
+                    module.required_prepared_preflight_runtime_symbol(),
+                    Some(DYNAMIC_ROWS_PREFLIGHT_RUNTIME_SYMBOL_NAME),
+                    "{target:?}/{output:?}"
+                );
+                assert_eq!(
+                    module.required_prepared_dynamic_rows_deopt_runtime_symbol(),
+                    Some(DYNAMIC_ROWS_DEOPT_RUNTIME_SYMBOL_NAME),
+                    "{target:?}/{output:?}"
+                );
+                assert_eq!(
+                    module.required_prepared_dynamic_rows_continue_runtime_symbol(),
+                    None,
+                    "root scanner must retain whole-window deopt: {target:?}/{output:?}"
+                );
+                let expected_accelerator = match target.architecture {
+                    Architecture::X86_64 => match x86_start_filter_kind(target.features) {
+                        X86StartFilterKind::Sse2 => StartAccelerator::X86Sse2,
+                        X86StartFilterKind::Avx2 => StartAccelerator::X86Avx2,
+                        X86StartFilterKind::Avx512Bw => StartAccelerator::X86Avx512Bw,
+                    },
+                    Architecture::Aarch64
+                        if target.operating_system == OperatingSystem::Linux
+                            && target.features.has(CpuFeature::Aarch64Sve) =>
+                    {
+                        // This contiguous range uses base-SVE comparisons even
+                        // when the target also supports SVE2 MATCH. Sparse
+                        // exact roots exercise the SVE2 route elsewhere.
+                        StartAccelerator::Aarch64Sve
+                    }
+                    Architecture::Aarch64
+                        if target.features.has(CpuFeature::Aarch64Asimd) =>
+                    {
+                        StartAccelerator::Aarch64Asimd
+                    }
+                    Architecture::Aarch64 => StartAccelerator::Scalar,
+                };
+                assert_eq!(
+                    module.start_accelerator(),
+                    expected_accelerator,
+                    "dynamic cut scanner receipt: {target:?}/{output:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -28055,6 +28163,23 @@ mod tests {
                 true,
             )
             .unwrap();
+            let x86_window_alias = [
+                0x4c, 0x8b, 0x54, 0x24, 0x40, // preflight start
+                0x4c, 0x89, 0x54, 0x24, 0x28, // ordinary start
+                0x4c, 0x8b, 0x54, 0x24, 0x48, // preflight end
+                0x4c, 0x89, 0x54, 0x24, 0x30, // ordinary end
+            ];
+            let alias = x86
+                .code
+                .windows(x86_window_alias.len())
+                .position(|bytes| bytes == x86_window_alias)
+                .unwrap_or_else(|| panic!("x86 {output:?} missing admitted-window alias"));
+            let descriptor = x86
+                .code
+                .windows(5)
+                .position(|bytes| bytes == [0x4c, 0x8b, 0x5c, 0x24, 0x50])
+                .expect("x86 dynamic descriptor load");
+            assert!(alias < descriptor, "x86 {output:?}");
             assert_eq!(
                 x86.relocations
                     .iter()
@@ -28114,6 +28239,21 @@ mod tests {
                 .chunks_exact(4)
                 .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
                 .collect::<Vec<_>>();
+            let arm_window_alias = [
+                aarch64_load_x_imm(8, 31, 48).unwrap(),
+                aarch64_store_x(8, 31, 24).unwrap(),
+                aarch64_load_x_imm(8, 31, 56).unwrap(),
+                aarch64_store_x(8, 31, 32).unwrap(),
+            ];
+            let alias = words
+                .windows(arm_window_alias.len())
+                .position(|window| window == arm_window_alias)
+                .unwrap_or_else(|| panic!("AArch64 {output:?} missing admitted-window alias"));
+            let descriptor = words
+                .iter()
+                .position(|&word| word == aarch64_load_x_imm(13, 31, 64).unwrap())
+                .expect("AArch64 dynamic descriptor load");
+            assert!(alias < descriptor, "AArch64 {output:?}");
             let table_byte = words
                 .iter()
                 .position(|&word| word == aarch64_load_byte_reg(8, 0, 2).unwrap())
