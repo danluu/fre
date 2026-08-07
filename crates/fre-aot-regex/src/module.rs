@@ -24789,16 +24789,21 @@ mod tests {
     )]
     fn dynamic_first_hole_codegen_marshals_exact_frontier_on_both_architectures() {
         fn x86_unfilled_target(code: &[u8]) -> usize {
+            let table_byte = code
+                .windows(5)
+                .position(|bytes| bytes == [0x44, 0x0f, 0xb6, 0x14, 0x17])
+                .expect("x86 dynamic table byte");
             let comparison = [
                 0x45,
                 0x3b,
                 0x53,
                 u8::try_from(NATIVE_ROWS_UNFILLED_CELL).unwrap(),
             ];
-            let compare = code
-                .windows(comparison.len())
-                .position(|bytes| bytes == comparison)
-                .expect("x86 dynamic unfilled-cell comparison");
+            let compare = table_byte
+                + code[table_byte..]
+                    .windows(comparison.len())
+                    .position(|bytes| bytes == comparison)
+                    .expect("x86 dynamic unfilled-cell comparison");
             x86_test_branch_target(code, compare + comparison.len())
                 .expect("x86 dynamic unfilled branch")
                 .0
