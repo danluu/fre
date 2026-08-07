@@ -663,6 +663,20 @@ fn selected_passes(program: &CompiledProgram, module: &CompiledModule) -> Vec<Op
         }
     }
     match program.engine_kind() {
+        EngineKind::OrderedNfa if module.slow_aot_report().is_some() => {
+            // A selected slow candidate leaves the stable semantic engine as
+            // the universal ordered TNFA. Report both the native DFA passes
+            // physically present in the object and, for a transient prefix,
+            // its whole-search runtime fallback adapter.
+            passes.push(OptimizationPass::UniversalOrderedTnfa);
+            let reverse_unused = module
+                .slow_aot_report()
+                .is_some_and(|report| report.dfa.reverse_states == 0);
+            append_native_dfa_passes(&mut passes, program, module, reverse_unused);
+            if module.required_runtime_symbol().is_some() {
+                passes.push(OptimizationPass::RuntimeAdapterLowering);
+            }
+        }
         EngineKind::OrderedNfa if module.required_runtime_symbol().is_some() => passes
             .extend_from_slice(&[
                 OptimizationPass::UniversalOrderedTnfa,

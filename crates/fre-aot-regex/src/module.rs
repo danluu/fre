@@ -1,12 +1,13 @@
 //! Target description and the object-writer-neutral compiled module.
 //!
 //! Fast semantic programs are frozen in read-only data behind a small ABI
-//! adapter to the versioned runtime. Complete optimized DFAs, including
-//! resource-fallback artifacts whose retained forward construction actually
-//! finished, can instead lower to self-contained PIC machine code and compact
-//! transition tables. Native optimizations are derived from DFA structure,
-//! including a start-state byte filter selected solely from non-accepting
-//! self-loop behavior.
+//! adapter to the versioned runtime. Complete optimized DFAs can lower to
+//! self-contained PIC machine code and compact transition tables. An
+//! explicitly selected slow pass may also keep a bounded completed-row prefix
+//! behind a public wrapper whose one synthetic hole restarts the whole search.
+//! Native optimizations are derived from DFA structure, including a
+//! start-state byte filter selected solely from non-accepting self-loop
+//! behavior.
 
 use core::fmt::Write as _;
 
@@ -105,7 +106,8 @@ impl Default for SlowAotLimits {
     }
 }
 
-/// Provenance for a slow DFA selected into a native module.
+/// Provenance for a slow complete DFA or transient completed-row prefix
+/// selected into a native module.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SlowAotReport {
     /// Limits requested at the optimizing compiler API boundary.
@@ -116,8 +118,9 @@ pub struct SlowAotReport {
     pub dfa: DfaStats,
     /// Peak conservative logical allocation charged by determinization.
     pub allocation_bytes: usize,
-    /// Complete read-only native DFA payload, including all installed
-    /// auxiliary scanner and target-specific sidecar tables.
+    /// Read-only native DFA payload, including alignment, installed auxiliary
+    /// scanners, and target-specific sidecar tables. The semantic program
+    /// bytes used by a partial wrapper's whole-search deopt are excluded.
     pub native_data_bytes: usize,
 }
 
@@ -952,10 +955,10 @@ impl CompiledModule {
     ///
     /// In addition to every route considered by [`Self::lower`], this may
     /// re-run general ordered determinization under the stable compiler
-    /// ceiling, or complete an assertion-free resource fallback's bounded K0
-    /// state graph when determinization still declines, and lower the result
-    /// as a runtime-free native DFA. This can take substantially longer than
-    /// ordinary lowering.
+    /// ceiling. A numeric refusal after completing rows may lower that prefix
+    /// with whole-search runtime deoptimization; otherwise the compiler may
+    /// complete an assertion-free resource fallback's bounded K0 state graph.
+    /// This can take substantially longer than ordinary lowering.
     /// Callers re-lowering a restored or otherwise untrusted program must opt
     /// in explicitly; a serialized optimizer marker never authorizes this
     /// work by itself.
@@ -1027,19 +1030,38 @@ impl CompiledModule {
         let mut slow_aot_report = None;
         let mut optional_lowering = if let Some(candidate) = slow_determinized.as_ref() {
             let view = program.native_slow_determinized_view(candidate);
-            match lower_optional_native_dfa_with_data_limit(
-                view,
-                target,
-                effective_native_data_limit_bytes,
-            ) {
+            let lowered = if candidate.is_partial() {
+                lower_optional_native_slow_partial_with_data_limit(
+                    &program_bytes,
+                    view,
+                    target,
+                    effective_native_data_limit_bytes,
+                )
+            } else {
+                lower_optional_native_dfa_with_data_limit(
+                    view,
+                    target,
+                    effective_native_data_limit_bytes,
+                )
+            };
+            match lowered {
                 Ok(Some(lowering)) => {
+                    let native_data_bytes = if candidate.is_partial() {
+                        lowering.data.len().checked_sub(program_bytes.len()).ok_or(
+                            CompileError::InternalInvariant(
+                                "slow partial native data precedes its serialized program",
+                            ),
+                        )?
+                    } else {
+                        lowering.data.len()
+                    };
                     slow_aot_report = Some(SlowAotReport {
                         requested_limits,
                         effective_native_data_limit_bytes,
                         determinization: candidate.report().clone(),
                         dfa: candidate.stats(),
                         allocation_bytes: candidate.allocation_bytes(),
-                        native_data_bytes: lowering.data.len(),
+                        native_data_bytes,
                     });
                     Some(lowering)
                 }
@@ -1474,9 +1496,10 @@ impl CompiledModule {
         self.target
     }
 
-    /// Return provenance for a slow complete DFA actually selected into this
-    /// module. A declined slow attempt or a later K0/prepared fallback returns
-    /// `None`.
+    /// Return provenance for a slow DFA candidate actually selected into this
+    /// module. This can describe either a complete DFA or a decline-bearing
+    /// transient completed-row prefix with whole-search deoptimization. An
+    /// unselected slow attempt or a later K0/prepared fallback returns `None`.
     #[must_use]
     pub const fn slow_aot_report(&self) -> Option<&SlowAotReport> {
         self.slow_aot_report.as_ref()
@@ -1869,6 +1892,196 @@ fn lower_native_dynamic_rows_prepared(
             dynamic_rows: true,
         },
     ))
+}
+
+struct NativeSlowPartialWrapper {
+    code: Vec<u8>,
+    relocations: Vec<ModuleRelocation>,
+    core_call_offset: usize,
+}
+
+/// Lower a transient slow-compiler prefix behind the ordinary public search
+/// ABI. The wrapper never exposes the private partial continuation contract:
+/// a hole, a variable-width Span endpoint, or any unexpected core status
+/// reloads the untouched original arguments and tailcalls the semantic
+/// runtime for the whole search.
+#[allow(
+    clippy::too_many_lines,
+    reason = "program, transient table, wrapper, core, and relocation addends form one transaction"
+)]
+fn lower_native_slow_partial_with_data_limit(
+    mut program_bytes: Vec<u8>,
+    view: NativeProgramView<'_>,
+    target: Target,
+    max_native_data_bytes: usize,
+) -> Result<Option<NativeLowering>, ObjectError> {
+    if !view.collapse_partial_holes || view.partial_discovered_states.is_none() {
+        return Err(ObjectError::InvalidModule(
+            "slow partial lowering has no collapsed-hole extent",
+        ));
+    }
+    let Some(native) = lower_native_dfa_with_entry_contract_and_data_limit(
+        view,
+        target,
+        NativeDfaEntryContract::PreparedPartialCore,
+        max_native_data_bytes,
+    )? else {
+        return Ok(None);
+    };
+    if native.needs_runtime {
+        return Err(ObjectError::InvalidModule(
+            "slow partial native core unexpectedly requires a runtime",
+        ));
+    }
+
+    let table_offset = program_bytes
+        .len()
+        .checked_add(15)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "slow partial table alignment",
+        ))?
+        & !15;
+    let final_data_len = table_offset
+        .checked_add(native.data.len())
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "slow partial final data size",
+        ))?;
+    let native_data_bytes = final_data_len
+        .checked_sub(program_bytes.len())
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "slow partial native data size",
+        ))?;
+    if native_data_bytes > max_native_data_bytes {
+        return Ok(None);
+    }
+    program_bytes
+        .try_reserve_exact(native_data_bytes)
+        .map_err(|_| ObjectError::Allocation("slow partial combined data"))?;
+    program_bytes.resize(table_offset, 0);
+    push_bytes(&mut program_bytes, &native.data)?;
+    if program_bytes.len() != final_data_len {
+        return Err(ObjectError::InvalidModule(
+            "slow partial combined data length changed",
+        ));
+    }
+
+    let wrapper = match target.architecture {
+        Architecture::X86_64 => lower_x86_64_slow_partial_wrapper(view.output)?,
+        Architecture::Aarch64 => lower_aarch64_slow_partial_wrapper(view.output)?,
+    };
+    let NativeSlowPartialWrapper {
+        mut code,
+        mut relocations,
+        core_call_offset,
+    } = wrapper;
+    let code_alignment_mask = match target.architecture {
+        Architecture::X86_64 => 15,
+        Architecture::Aarch64 => 3,
+    };
+    let native_core_offset = code
+        .len()
+        .checked_add(code_alignment_mask)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "slow partial native core alignment",
+        ))?
+        & !code_alignment_mask;
+    let final_code_len = native_core_offset
+        .checked_add(native.code.len())
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "slow partial final code size",
+        ))?;
+    let additional_code = final_code_len
+        .checked_sub(code.len())
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "slow partial additional code size",
+        ))?;
+    code.try_reserve_exact(additional_code)
+        .map_err(|_| ObjectError::Allocation("slow partial combined code"))?;
+    match target.architecture {
+        Architecture::X86_64 => code.resize(native_core_offset, 0x90),
+        Architecture::Aarch64 => {
+            while code.len() < native_core_offset {
+                push_bytes(&mut code, &0xd503_201f_u32.to_le_bytes())?;
+            }
+        }
+    }
+    match target.architecture {
+        Architecture::X86_64 => {
+            patch_x86_64_local_call(&mut code, core_call_offset, native_core_offset)?;
+        }
+        Architecture::Aarch64 => {
+            patch_aarch64_local_call(&mut code, core_call_offset, native_core_offset)?;
+        }
+    }
+    push_bytes(&mut code, &native.code)?;
+    if code.len() != final_code_len {
+        return Err(ObjectError::InvalidModule(
+            "slow partial combined code length changed",
+        ));
+    }
+
+    let table_addend = i64::try_from(table_offset)
+        .map_err(|_| ObjectError::ArithmeticOverflow("slow partial table relocation addend"))?;
+    relocations
+        .try_reserve_exact(native.relocations.len())
+        .map_err(|_| ObjectError::Allocation("slow partial combined relocations"))?;
+    for mut relocation in native.relocations {
+        if relocation.symbol != PROGRAM_SYMBOL {
+            return Err(ObjectError::InvalidModule(
+                "slow partial native core has an unexpected relocation target",
+            ));
+        }
+        relocation.offset = relocation
+            .offset
+            .checked_add(offset_u64(
+                native_core_offset,
+                "slow partial native core relocation base",
+            )?)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "slow partial native core relocation offset",
+            ))?;
+        relocation.addend = relocation
+            .addend
+            .checked_add(table_addend)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "slow partial native table relocation addend",
+            ))?;
+        relocations.push(relocation);
+    }
+
+    Ok(Some(NativeLowering {
+        code,
+        data: program_bytes,
+        relocations,
+        needs_runtime: true,
+        start_accelerator: native.start_accelerator,
+        anchored_prefix_filter_bytes: native.anchored_prefix_filter_bytes,
+    }))
+}
+
+/// Apply the optional-native decline policy to the complete slow-prefix
+/// transaction, including table emission, wrapper composition, local fixups,
+/// and relocation rebasing.
+fn lower_optional_native_slow_partial_with_data_limit(
+    program_bytes: &[u8],
+    view: NativeProgramView<'_>,
+    target: Target,
+    max_native_data_bytes: usize,
+) -> Result<Option<NativeLowering>, ObjectError> {
+    let outcome = (|| {
+        let mut owned_program = Vec::new();
+        owned_program
+            .try_reserve_exact(program_bytes.len())
+            .map_err(|_| ObjectError::Allocation("slow partial semantic program copy"))?;
+        owned_program.extend_from_slice(program_bytes);
+        lower_native_slow_partial_with_data_limit(
+            owned_program,
+            view,
+            target,
+            max_native_data_bytes,
+        )
+    })();
+    optional_native_lowering_outcome(outcome)
 }
 
 #[allow(
@@ -3151,7 +3364,12 @@ impl NativePrefixFilter {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct NativePartialDfaLayout {
     hole_token_base: u32,
+    /// Number of graph destinations outside the completed prefix. This
+    /// authenticates every named target even when they share one token.
     resume_states: u32,
+    /// Transient slow-AOT prefixes restart the entire public search, so every
+    /// unfinished graph destination maps to the same synthetic hole.
+    collapse_holes: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3397,7 +3615,17 @@ fn lower_optional_native_dfa_with_data_limit(
     target: Target,
     max_native_data_bytes: usize,
 ) -> Result<Option<NativeLowering>, ObjectError> {
-    match lower_native_dfa_with_data_limit(view, target, max_native_data_bytes) {
+    optional_native_lowering_outcome(lower_native_dfa_with_data_limit(
+        view,
+        target,
+        max_native_data_bytes,
+    ))
+}
+
+fn optional_native_lowering_outcome(
+    outcome: Result<Option<NativeLowering>, ObjectError>,
+) -> Result<Option<NativeLowering>, ObjectError> {
+    match outcome {
         Ok(lowering) => Ok(lowering),
         Err(ObjectError::Allocation(_) | ObjectError::Resource {
             resource: crate::CompileResource::ProgramBytes,
@@ -4636,38 +4864,58 @@ fn build_native_dfa_table_with_cost_model_and_data_limit(
     } else {
         0
     };
+    if view.collapse_partial_holes && view.partial_discovered_states.is_none() {
+        return Err(ObjectError::InvalidModule(
+            "collapsed native holes have no discovered-state extent",
+        ));
+    }
     let resume_states = view
         .partial_discovered_states
         .map(|discovered| {
-            discovered
-                .checked_sub(forward_states)
-                .filter(|&count| count != 0)
-                .ok_or(ObjectError::InvalidModule(
-                    "native partial DFA discovered extent does not follow completed rows",
-                ))
+            discovered.checked_sub(forward_states).ok_or(
+                ObjectError::InvalidModule(
+                    "native partial DFA discovered extent precedes completed rows",
+                ),
+            )
         })
         .transpose()?
         .unwrap_or(0);
+    if view.partial_discovered_states.is_some()
+        && resume_states == 0
+        && !view.collapse_partial_holes
+    {
+        return Err(ObjectError::InvalidModule(
+            "native partial DFA has no incomplete destination",
+        ));
+    }
     if view.partial_discovered_states.is_some()
         && dfa.forward_cells.iter().any(|cell| {
             cell.next != NO_DFA_STATE
                 && usize::try_from(cell.next)
                     .ok()
-                    .is_none_or(|next| next >= forward_states.saturating_add(resume_states))
+                    .is_none_or(|next| {
+                        view.partial_discovered_states
+                            .is_none_or(|discovered| next >= discovered)
+                    })
         })
     {
         return Err(ObjectError::InvalidModule(
             "native partial DFA transition exceeds its discovered extent",
         ));
     }
-    let (transitions, cells) = if resume_states == 0 {
+    let encoded_hole_states = if view.collapse_partial_holes {
+        1
+    } else {
+        resume_states
+    };
+    let (transitions, cells) = if encoded_hole_states == 0 {
         select_native_table_encoding(dfa.class_count, forward_states, retained_reverse_states)
     } else {
         select_native_table_encoding_with_holes(
             dfa.class_count,
             forward_states,
             retained_reverse_states,
-            resume_states,
+            encoded_hole_states,
         )
     };
     let row_cells = transitions.row_cells(dfa.class_count);
@@ -4680,7 +4928,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit(
             .ok_or(ObjectError::ArithmeticOverflow(
                 "native forward table bytes",
             ))?;
-    let partial_layout = if resume_states == 0 {
+    let partial_layout = if encoded_hole_states == 0 {
         None
     } else {
         let last_row_offset = forward_states
@@ -4701,9 +4949,11 @@ fn build_native_dfa_table_with_cost_model_and_data_limit(
             ))?;
         let resume_states = u32::try_from(resume_states)
             .map_err(|_| ObjectError::ArithmeticOverflow("native partial resume states"))?;
+        let encoded_hole_states = u32::try_from(encoded_hole_states)
+            .map_err(|_| ObjectError::ArithmeticOverflow("native partial encoded holes"))?;
         let final_hole = hole_token_base
             .checked_add(
-                resume_states
+                encoded_hole_states
                     .checked_sub(1)
                     .ok_or(ObjectError::InvalidModule(
                         "native partial resume state count is zero",
@@ -4720,6 +4970,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit(
         Some(NativePartialDfaLayout {
             hole_token_base,
             resume_states,
+            collapse_holes: view.collapse_partial_holes,
         })
     };
     let reverse_bytes =
@@ -7323,10 +7574,14 @@ fn pack_native_partial_forward_cell(
             "native partial destination exceeds resume-key extent",
         ));
     }
-    let token = partial
-        .hole_token_base
-        .checked_add(resume)
-        .ok_or(ObjectError::ArithmeticOverflow("native partial hole token"))?;
+    let token = if partial.collapse_holes {
+        partial.hole_token_base
+    } else {
+        partial
+            .hole_token_base
+            .checked_add(resume)
+            .ok_or(ObjectError::ArithmeticOverflow("native partial hole token"))?
+    };
     if token == 0 || token > cells.next_mask() {
         return Err(ObjectError::InvalidModule(
             "native partial hole token exceeds its cell encoding",
@@ -11583,6 +11838,176 @@ fn lower_x86_64_runtime_adapter() -> Result<(Vec<u8>, Vec<ModuleRelocation>), Ob
             },
         ],
     ))
+}
+
+fn patch_x86_64_local_call(
+    code: &mut [u8],
+    displacement_offset: usize,
+    target: usize,
+) -> Result<(), ObjectError> {
+    let instruction_end = displacement_offset
+        .checked_add(4)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "x86 local call instruction end",
+        ))?;
+    if displacement_offset == 0
+        || code.get(displacement_offset - 1) != Some(&0xe8)
+        || code.get(displacement_offset..instruction_end) != Some(&[0, 0, 0, 0])
+    {
+        return Err(ObjectError::InvalidModule(
+            "x86 local call placeholder is malformed",
+        ));
+    }
+    let target = i64::try_from(target)
+        .map_err(|_| ObjectError::ArithmeticOverflow("x86 local call target"))?;
+    let instruction_end = i64::try_from(instruction_end)
+        .map_err(|_| ObjectError::ArithmeticOverflow("x86 local call source"))?;
+    let displacement = target
+        .checked_sub(instruction_end)
+        .and_then(|displacement| i32::try_from(displacement).ok())
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "x86 local call displacement",
+        ))?;
+    code.get_mut(displacement_offset..displacement_offset + 4)
+        .ok_or(ObjectError::InvalidModule(
+            "x86 local call displacement is outside code",
+        ))?
+        .copy_from_slice(&displacement.to_le_bytes());
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the public ABI checks, local outcomes, and whole-search tail deopt stay contiguous"
+)]
+fn lower_x86_64_slow_partial_wrapper(
+    output: OutputContract,
+) -> Result<NativeSlowPartialWrapper, ObjectError> {
+    const FRAME_BYTES: u8 = 40;
+    let mut assembler = X86Assembler::new();
+    let no_match = assembler.label()?;
+    let matched = assembler.label()?;
+    let deopt = assembler.label()?;
+    let invalid = assembler.label()?;
+
+    // Validate the complete public SysV boundary before saving or calling.
+    assembler.instruction(&[0x48, 0x85, 0xf6])?; // test length sign bit
+    assembler.branch(&[0x0f, 0x88], invalid)?;
+    assembler.instruction(&[0x48, 0x39, 0xf1])?; // cmp end, length
+    assembler.branch(&[0x0f, 0x87], invalid)?;
+    assembler.instruction(&[0x48, 0x39, 0xca])?; // cmp start, end
+    assembler.branch(&[0x0f, 0x87], invalid)?;
+    assembler.instruction(&[0x4d, 0x85, 0xc0])?; // result != null
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+    assembler.instruction(&[0x41, 0xf6, 0xc0, 0x07])?; // result alignment
+    assembler.branch(&[0x0f, 0x85], invalid)?;
+    assembler.instruction(&[0x48, 0x85, 0xff])?; // haystack != null
+    assembler.branch(&[0x0f, 0x84], invalid)?;
+
+    // Entry RSP is 8 mod 16; 40 bytes aligns the local core call and saves
+    // every original public argument for an exact whole-search restart.
+    assembler.instruction(&[0x48, 0x83, 0xec, FRAME_BYTES])?;
+    assembler.instruction(&[0x48, 0x89, 0x3c, 0x24])?;
+    assembler.instruction(&[0x48, 0x89, 0x74, 0x24, 0x08])?;
+    assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x10])?;
+    assembler.instruction(&[0x48, 0x89, 0x4c, 0x24, 0x18])?;
+    assembler.instruction(&[0x4c, 0x89, 0x44, 0x24, 0x20])?;
+
+    assembler.instruction(&[0xe8])?;
+    let core_call_displacement_label = assembler.label()?;
+    assembler.bind(core_call_displacement_label)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    assembler.instruction(&[0x85, 0xc0])?; // status == no match
+    assembler.branch(&[0x0f, 0x84], no_match)?;
+    assembler.instruction(&[0x83, 0xf8, 0x01])?; // status == local match
+    assembler.branch(&[0x0f, 0x84], matched)?;
+    assembler.branch(&[0xe9], deopt)?;
+
+    assembler.bind(no_match)?;
+    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x20])?;
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.instruction(&[0x49, 0x89, 0x01])?;
+    assembler.instruction(&[0x49, 0x89, 0x41, 0x08])?;
+    assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+    assembler.instruction(&[0xc3])?;
+
+    assembler.bind(matched)?;
+    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x20])?;
+    match output {
+        OutputContract::Exists => {
+            assembler.instruction(&[0x31, 0xc0])?;
+            assembler.instruction(&[0x49, 0x89, 0x01])?;
+            assembler.instruction(&[0x49, 0x89, 0x41, 0x08])?;
+        }
+        OutputContract::SelectedEnd => {
+            assembler.instruction(&[0x4d, 0x89, 0x19])?;
+            assembler.instruction(&[0x4d, 0x89, 0x59, 0x08])?;
+        }
+        OutputContract::Span => {
+            assembler.instruction(&[0x4d, 0x89, 0x11])?;
+            assembler.instruction(&[0x4d, 0x89, 0x59, 0x08])?;
+        }
+    }
+    assembler.instruction(&[0xb8, 0x01, 0, 0, 0])?;
+    assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+    assembler.instruction(&[0xc3])?;
+
+    assembler.bind(deopt)?;
+    assembler.instruction(&[0x48, 0x8b, 0x3c, 0x24])?;
+    assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x08])?;
+    assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x10])?;
+    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x18])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x20])?;
+    assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+    // Shift the original public arguments right for runtime(program, ...).
+    assembler.instruction(&[0x4d, 0x89, 0xc1])?;
+    assembler.instruction(&[0x49, 0x89, 0xc8])?;
+    assembler.instruction(&[0x48, 0x89, 0xd1])?;
+    assembler.instruction(&[0x48, 0x89, 0xf2])?;
+    assembler.instruction(&[0x48, 0x89, 0xfe])?;
+    assembler.instruction(&[0x48, 0x8d, 0x3d])?;
+    let program_displacement_label = assembler.label()?;
+    assembler.bind(program_displacement_label)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    assembler.instruction(&[0xe9])?;
+    let runtime_displacement_label = assembler.label()?;
+    assembler.bind(runtime_displacement_label)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+
+    assembler.bind(invalid)?;
+    assembler.instruction(&[0xb8, 0x02, 0, 0, 0])?;
+    assembler.instruction(&[0xc3])?;
+
+    let finished = assembler.finish_with_label_offsets()?;
+    let core_call_offset = finished.label_offset(core_call_displacement_label)?;
+    let program_displacement = finished.label_offset(program_displacement_label)?;
+    let runtime_displacement = finished.label_offset(runtime_displacement_label)?;
+    Ok(NativeSlowPartialWrapper {
+        code: finished.code,
+        relocations: vec![
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(
+                    program_displacement,
+                    "x86 slow partial program relocation",
+                )?,
+                kind: RelocationKind::X86PcRelative32,
+                symbol: PROGRAM_SYMBOL,
+                addend: -4,
+            },
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(
+                    runtime_displacement,
+                    "x86 slow partial runtime relocation",
+                )?,
+                kind: RelocationKind::X86PltRelative32,
+                symbol: RUNTIME_SYMBOL,
+                addend: -4,
+            },
+        ],
+        core_call_offset,
+    })
 }
 
 #[allow(
@@ -19006,6 +19431,179 @@ fn lower_aarch64_runtime_adapter() -> Result<(Vec<u8>, Vec<ModuleRelocation>), O
             },
         ],
     ))
+}
+
+fn patch_aarch64_local_call(
+    code: &mut [u8],
+    instruction_offset: usize,
+    target: usize,
+) -> Result<(), ObjectError> {
+    let end = instruction_offset
+        .checked_add(4)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "AArch64 local call instruction end",
+        ))?;
+    let slot = code
+        .get_mut(instruction_offset..end)
+        .ok_or(ObjectError::InvalidModule(
+            "AArch64 local call is outside code",
+        ))?;
+    let instruction = u32::from_le_bytes([slot[0], slot[1], slot[2], slot[3]]);
+    if instruction != 0x9400_0000 {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 local call placeholder is malformed",
+        ));
+    }
+    let words = Aarch64Assembler::fixup_words(instruction_offset, target)?;
+    if !Aarch64Assembler::fixup_words_fit(words, 26)? {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 local call is out of range",
+        ));
+    }
+    let modulus = 1_i64 << 26;
+    let immediate = u32::try_from(words.rem_euclid(modulus))
+        .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 local call immediate"))?;
+    slot.copy_from_slice(&(0x9400_0000 | immediate).to_le_bytes());
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the public ABI checks, local outcomes, and whole-search tail deopt stay contiguous"
+)]
+fn lower_aarch64_slow_partial_wrapper(
+    output: OutputContract,
+) -> Result<NativeSlowPartialWrapper, ObjectError> {
+    const FRAME_BYTES: u16 = 48;
+    let mut assembler = Aarch64Assembler::new();
+    let no_match = assembler.label()?;
+    let matched = assembler.label()?;
+    let deopt = assembler.label()?;
+    let invalid = assembler.label()?;
+
+    assembler.instruction(0xf100_003f)?; // cmp length, #0
+    assembler.branch_cond(AARCH64_MI, invalid)?;
+    assembler.instruction(aarch64_cmp_x(3, 1)?)?;
+    assembler.branch_cond(AARCH64_HI, invalid)?;
+    assembler.instruction(aarch64_cmp_x(2, 3)?)?;
+    assembler.branch_cond(AARCH64_HI, invalid)?;
+    assembler.instruction(0xf100_009f)?; // result != null
+    assembler.branch_cond(AARCH64_EQ, invalid)?;
+    assembler.instruction(aarch64_and_low_x(5, 4, 3)?)?;
+    assembler.instruction(0xf100_00bf)?; // result alignment
+    assembler.branch_cond(AARCH64_NE, invalid)?;
+    assembler.instruction(0xf100_001f)?; // haystack != null
+    assembler.branch_cond(AARCH64_EQ, invalid)?;
+
+    assembler.instruction(aarch64_sub_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(aarch64_store_x(0, 31, 0)?)?;
+    assembler.instruction(aarch64_store_x(1, 31, 8)?)?;
+    assembler.instruction(aarch64_store_x(2, 31, 16)?)?;
+    assembler.instruction(aarch64_store_x(3, 31, 24)?)?;
+    assembler.instruction(aarch64_store_x(4, 31, 32)?)?;
+    assembler.instruction(aarch64_store_x(30, 31, 40)?)?;
+
+    let core_call_offset = assembler.instruction(0x9400_0000)?;
+    assembler.instruction(aarch64_cmp_w_imm(0, 0)?)?;
+    assembler.branch_cond(AARCH64_EQ, no_match)?;
+    assembler.instruction(aarch64_cmp_w_imm(0, 1)?)?;
+    assembler.branch_cond(AARCH64_EQ, matched)?;
+    assembler.branch(deopt)?;
+
+    assembler.bind(no_match)?;
+    assembler.instruction(aarch64_load_x_imm(5, 31, 32)?)?;
+    assembler.instruction(aarch64_store_x(31, 5, 0)?)?;
+    assembler.instruction(aarch64_store_x(31, 5, 8)?)?;
+    assembler.instruction(aarch64_movz_w(0, 0)?)?;
+    assembler.instruction(aarch64_load_x_imm(30, 31, 40)?)?;
+    assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    assembler.bind(matched)?;
+    assembler.instruction(aarch64_load_x_imm(5, 31, 32)?)?;
+    match output {
+        OutputContract::Exists => {
+            assembler.instruction(aarch64_store_x(31, 5, 0)?)?;
+            assembler.instruction(aarch64_store_x(31, 5, 8)?)?;
+        }
+        OutputContract::SelectedEnd => {
+            assembler.instruction(aarch64_store_x(7, 5, 0)?)?;
+            assembler.instruction(aarch64_store_x(7, 5, 8)?)?;
+        }
+        OutputContract::Span => {
+            assembler.instruction(aarch64_store_x(6, 5, 0)?)?;
+            assembler.instruction(aarch64_store_x(7, 5, 8)?)?;
+        }
+    }
+    assembler.instruction(aarch64_movz_w(0, 1)?)?;
+    assembler.instruction(aarch64_load_x_imm(30, 31, 40)?)?;
+    assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    assembler.bind(deopt)?;
+    assembler.instruction(aarch64_load_x_imm(0, 31, 0)?)?;
+    assembler.instruction(aarch64_load_x_imm(1, 31, 8)?)?;
+    assembler.instruction(aarch64_load_x_imm(2, 31, 16)?)?;
+    assembler.instruction(aarch64_load_x_imm(3, 31, 24)?)?;
+    assembler.instruction(aarch64_load_x_imm(4, 31, 32)?)?;
+    assembler.instruction(aarch64_load_x_imm(30, 31, 40)?)?;
+    assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(aarch64_mov_x(5, 4)?)?;
+    assembler.instruction(aarch64_mov_x(4, 3)?)?;
+    assembler.instruction(aarch64_mov_x(3, 2)?)?;
+    assembler.instruction(aarch64_mov_x(2, 1)?)?;
+    assembler.instruction(aarch64_mov_x(1, 0)?)?;
+    let program_page = assembler.instruction(0x9000_0000)?;
+    let program_page_offset = assembler.instruction(0x9100_0000)?;
+    let runtime_branch = assembler.instruction(0x1400_0000)?;
+
+    assembler.bind(invalid)?;
+    assembler.instruction(aarch64_movz_w(0, 2)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    let mut relocation_offsets = [
+        program_page,
+        program_page_offset,
+        runtime_branch,
+        core_call_offset,
+    ];
+    let code = assembler.finish_with_offsets(&mut relocation_offsets)?;
+    Ok(NativeSlowPartialWrapper {
+        code,
+        relocations: vec![
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(
+                    relocation_offsets[0],
+                    "AArch64 slow partial program ADRP",
+                )?,
+                kind: RelocationKind::Aarch64Page21,
+                symbol: PROGRAM_SYMBOL,
+                addend: 0,
+            },
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(
+                    relocation_offsets[1],
+                    "AArch64 slow partial program ADD",
+                )?,
+                kind: RelocationKind::Aarch64PageOff12,
+                symbol: PROGRAM_SYMBOL,
+                addend: 0,
+            },
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(
+                    relocation_offsets[2],
+                    "AArch64 slow partial runtime branch",
+                )?,
+                kind: RelocationKind::Aarch64Branch26,
+                symbol: RUNTIME_SYMBOL,
+                addend: 0,
+            },
+        ],
+        core_call_offset: relocation_offsets[3],
+    })
 }
 
 #[allow(
@@ -28052,6 +28650,755 @@ int main(void) {{
         assert!(slow_from_fast.prepared_entry_symbol().is_none());
     }
 
+    fn slow_partial_limits(max_states: usize) -> SlowAotLimits {
+        SlowAotLimits {
+            determinize: DeterminizeLimits {
+                max_states,
+                ..DeterminizeLimits::default()
+            },
+            max_allocation_bytes: 32 * 1024 * 1024,
+            max_native_data_bytes: 32 * 1024 * 1024,
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one matrix authenticates transient holes, public symbols, and both backends"
+    )]
+    fn slow_partial_uses_one_whole_search_hole_on_every_target() {
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let fast = compile(
+                CompileRequest::new(PARTIAL_LOOP_PATTERN, Target::x86_64_linux())
+                    .mode(CompileMode::Fast)
+                    .output(output),
+            )
+            .expect("fast slow-partial fixture");
+            let (slow_limits, candidate) = (1..=64)
+                .find_map(|max_states| {
+                    let limits = slow_partial_limits(max_states);
+                    let candidate = fast
+                        .program()
+                        .native_slow_determinized_program(
+                            limits.determinize,
+                            limits.max_allocation_bytes,
+                        )
+                        .expect("bounded slow determinization")?;
+                    let (complete, discovered) = candidate.retained_dimensions()?;
+                    (complete > 0 && complete < discovered).then_some((limits, candidate))
+                })
+                .unwrap_or_else(|| panic!("no interior slow prefix for {output:?}"));
+            assert!(candidate.is_partial(), "{output:?}");
+            let (complete_rows, discovered_states) = candidate
+                .retained_dimensions()
+                .expect("transient retained dimensions");
+            assert!(complete_rows > 0, "{output:?}");
+            assert!(complete_rows < discovered_states, "{output:?}");
+            let view = fast.program().native_slow_determinized_view(&candidate);
+            assert!(view.collapse_partial_holes);
+            assert_eq!(view.partial_discovered_states, Some(discovered_states));
+
+            for architecture in [Architecture::X86_64, Architecture::Aarch64] {
+                let (_, layout) = build_native_dfa_table_for_architecture(view, architecture)
+                    .expect("collapsed slow-partial table");
+                let partial = layout.partial.expect("synthetic hole layout");
+                assert!(partial.collapse_holes);
+                assert_eq!(
+                    usize::try_from(partial.resume_states).unwrap(),
+                    discovered_states - complete_rows
+                );
+                let row_cells = layout.transitions.row_cells(view.dfa.class_count);
+                let row_bytes = row_cells * layout.cells.bytes();
+                let mut saw_hole = false;
+                for &cell in view.dfa.forward_cells {
+                    if cell.next == NO_DFA_STATE
+                        || usize::try_from(cell.next)
+                            .ok()
+                            .is_some_and(|next| next < complete_rows)
+                    {
+                        continue;
+                    }
+                    saw_hole = true;
+                    let packed = pack_native_partial_forward_cell(
+                        cell.next,
+                        cell.accepted,
+                        usize::try_from(layout.forward_offset).unwrap(),
+                        row_bytes,
+                        complete_rows,
+                        false,
+                        None,
+                        partial,
+                        layout.cells,
+                    )
+                    .expect("collapsed hole packing");
+                    assert_eq!(packed & layout.cells.next_mask(), partial.hole_token_base);
+                }
+                assert!(saw_hole, "{output:?}/{architecture:?}");
+            }
+
+            let serialized = fast.program().serialize().unwrap();
+            let table_offset = serialized
+                .len()
+                .checked_add(15)
+                .expect("slow partial table alignment")
+                & !15;
+            let table_addend = i64::try_from(table_offset).unwrap();
+            for target in identity_target_matrix() {
+                let module = CompiledModule::lower_optimizing_with_limits(
+                    fast.program(),
+                    target,
+                    slow_limits,
+                )
+                .unwrap_or_else(|error| panic!("slow partial {output:?}/{target:?}: {error}"));
+                let report = module
+                    .slow_aot_report()
+                    .unwrap_or_else(|| panic!("missing slow report: {output:?}/{target:?}"));
+                assert!(report.determinization.decline.is_some());
+                assert_eq!(
+                    report.dfa.build_work,
+                    report.determinization.work_completed
+                );
+                assert!(report.allocation_bytes <= slow_limits.max_allocation_bytes);
+                assert!(report.native_data_bytes <= slow_limits.max_native_data_bytes);
+                assert_eq!(
+                    report.native_data_bytes,
+                    module.sections()[PROGRAM_SECTION].bytes().len() - serialized.len(),
+                    "alignment padding and table accounting: {output:?}/{target:?}"
+                );
+                assert_eq!(module.required_runtime_symbol(), Some(RUNTIME_SYMBOL_NAME));
+                assert!(module.prepared_entry_symbol().is_none());
+                assert_eq!(module.symbols().len(), 4, "{output:?}/{target:?}");
+                assert!(module.symbols().iter().all(|symbol| {
+                    !symbol.name.contains("exclusive")
+                        && !symbol.name.contains("partial_table")
+                        && !symbol.name.contains("partial_identity")
+                }));
+                assert!(module.relocations().iter().all(|relocation| {
+                    relocation.symbol == PROGRAM_SYMBOL || relocation.symbol == RUNTIME_SYMBOL
+                }));
+                assert_eq!(
+                    module
+                        .relocations()
+                        .iter()
+                        .filter(|relocation| relocation.symbol == RUNTIME_SYMBOL)
+                        .count(),
+                    1
+                );
+                let program_addends = module
+                    .relocations()
+                    .iter()
+                    .filter(|relocation| relocation.symbol == PROGRAM_SYMBOL)
+                    .map(|relocation| relocation.addend)
+                    .collect::<Vec<_>>();
+                let expected_program_addends = match target.architecture {
+                    Architecture::X86_64 => vec![-4, table_addend - 4],
+                    Architecture::Aarch64 => {
+                        vec![0, 0, table_addend, table_addend]
+                    }
+                };
+                assert_eq!(
+                    program_addends, expected_program_addends,
+                    "wrapper/core program addends: {output:?}/{target:?}"
+                );
+                assert!(module.sections()[PROGRAM_SECTION]
+                    .bytes()
+                    .starts_with(&serialized));
+            }
+
+            let compiled = crate::compile_with_slow_aot_limits(
+                CompileRequest::new(PARTIAL_LOOP_PATTERN, Target::x86_64_linux())
+                    .mode(CompileMode::Optimizing)
+                    .output(output)
+                    .limits(CompileLimitsV1 {
+                        determinize: DeterminizeLimits {
+                            max_states: 0,
+                            ..DeterminizeLimits::default()
+                        },
+                        ..CompileLimitsV1::default()
+                    }),
+                slow_limits,
+            )
+            .expect("receipt-bearing slow partial compile");
+            assert!(compiled
+                .receipt()
+                .slow_aot
+                .as_ref()
+                .is_some_and(|report| report.determinization.decline.is_some()));
+            for pass in [
+                crate::OptimizationPass::UniversalOrderedTnfa,
+                crate::OptimizationPass::RemoveUnusedReverseMachine,
+                crate::OptimizationPass::OutputContractSpecialization,
+                crate::OptimizationPass::TargetInstructionSelection,
+                crate::OptimizationPass::FixedRegisterAssignment,
+                crate::OptimizationPass::CheckedBranchFixup,
+                crate::OptimizationPass::RuntimeAdapterLowering,
+            ] {
+                assert!(compiled.receipt().passes.contains(&pass), "{output:?}/{pass:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn slow_partial_native_resource_failures_decline_transactionally() {
+        assert!(matches!(
+            optional_native_lowering_outcome(Err(ObjectError::Allocation(
+                "synthetic slow-prefix allocation"
+            ))),
+            Ok(None)
+        ));
+        assert!(matches!(
+            optional_native_lowering_outcome(Err(ObjectError::Resource {
+                resource: crate::CompileResource::ProgramBytes,
+                limit: 0,
+                required: 1,
+            })),
+            Ok(None)
+        ));
+        assert!(matches!(
+            optional_native_lowering_outcome(Err(ObjectError::InvalidModule(
+                "synthetic structural failure"
+            ))),
+            Err(ObjectError::InvalidModule("synthetic structural failure"))
+        ));
+
+        let target = Target::x86_64_linux();
+        let fast = compile(
+            CompileRequest::new(PARTIAL_LOOP_PATTERN, target)
+                .mode(CompileMode::Fast)
+                .output(OutputContract::Exists),
+        )
+        .expect("fast resource-decline fixture");
+        let slow_limits = (1..=64)
+            .find_map(|max_states| {
+                let limits = slow_partial_limits(max_states);
+                let candidate = fast
+                    .program()
+                    .native_slow_determinized_program(
+                        limits.determinize,
+                        limits.max_allocation_bytes,
+                    )
+                    .expect("bounded slow-prefix candidate")?;
+                let (complete, discovered) = candidate.retained_dimensions()?;
+                (complete > 0 && complete < discovered).then_some(limits)
+            })
+            .expect("interior slow prefix for resource-decline fixture");
+        let declined = CompiledModule::lower_optimizing_with_limits_and_native_data_limit(
+            fast.program(),
+            target,
+            slow_limits,
+            0,
+        )
+        .expect("native-data refusal preserves established fallback");
+        let fallback = CompiledModule::lower_k0_optimizing_with_data_limit(
+            fast.program(),
+            target,
+            0,
+        )
+        .expect("established zero-data fallback");
+        assert!(declined.slow_aot_report().is_none());
+        assert_eq!(declined.sections(), fallback.sections());
+        assert_eq!(declined.symbols(), fallback.symbols());
+        assert_eq!(declined.relocations(), fallback.relocations());
+    }
+
+    #[test]
+    fn slow_complete_forward_decline_keeps_synthetic_span_status_hole() {
+        let pattern = "a+Q|[b-c][a-b]{1,5}(?:x+|y+)";
+        let fast = compile(
+            CompileRequest::new(pattern, Target::x86_64_linux())
+                .mode(CompileMode::Fast)
+                .output(OutputContract::Span),
+        )
+        .expect("fast variable Span fixture");
+        let complete = fast
+            .program()
+            .native_slow_determinized_program(
+                SlowAotLimits::default().determinize,
+                SlowAotLimits::default().max_allocation_bytes,
+            )
+            .expect("complete slow Span determinization")
+            .expect("complete slow Span candidate");
+        assert!(!complete.is_partial());
+        let final_work = complete.report().work_completed;
+        let limits = SlowAotLimits {
+            determinize: DeterminizeLimits {
+                max_work: final_work.checked_sub(1).expect("nonzero slow work"),
+                ..SlowAotLimits::default().determinize
+            },
+            ..SlowAotLimits::default()
+        };
+        let partial = fast
+            .program()
+            .native_slow_determinized_program(
+                limits.determinize,
+                limits.max_allocation_bytes,
+            )
+            .expect("post-forward slow Span refusal")
+            .expect("post-forward transient Span candidate");
+        assert!(partial.is_partial());
+        let (complete_rows, discovered_states) = partial.retained_dimensions().unwrap();
+        assert_eq!(complete_rows, discovered_states);
+        assert!(partial.report().decline.as_ref().is_some_and(|decline| {
+            decline.stage != crate::DeterminizationStage::ForwardSubsetConstruction
+        }));
+        let view = fast.program().native_slow_determinized_view(&partial);
+        assert!(view.collapse_partial_holes);
+        assert_eq!(view.exact_match_width, None);
+        for target in [
+            Target::x86_64_linux(),
+            Target::x86_64_macos(),
+            Target::aarch64_linux(),
+            Target::aarch64_macos(),
+        ] {
+            let (_, layout) = build_native_dfa_table_for_architecture(view, target.architecture)
+                .expect("complete-prefix synthetic Span layout");
+            let hole = layout.partial.expect("synthetic selected-end status layout");
+            assert!(hole.collapse_holes);
+            assert_eq!(hole.resume_states, 0);
+            assert!(!layout.has_reverse);
+            assert!(layout.exact_span_width.is_none());
+            let module = CompiledModule::lower_optimizing_with_limits(
+                fast.program(),
+                target,
+                limits,
+            )
+            .expect("complete-prefix slow Span module");
+            assert!(module.slow_aot_report().is_some(), "{target:?}");
+            assert_eq!(module.required_runtime_symbol(), Some(RUNTIME_SYMBOL_NAME));
+            assert!(module.prepared_entry_symbol().is_none());
+        }
+    }
+
+    #[test]
+    fn slow_partial_public_wrappers_preserve_normal_abi() {
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let x86 = lower_x86_64_slow_partial_wrapper(output).unwrap();
+            assert_eq!(
+                x86.relocations
+                    .iter()
+                    .map(|relocation| relocation.symbol)
+                    .collect::<Vec<_>>(),
+                [PROGRAM_SYMBOL, RUNTIME_SYMBOL]
+            );
+            assert_eq!(
+                x86.code.get(x86.core_call_offset.wrapping_sub(1)),
+                Some(&0xe8)
+            );
+            assert_eq!(
+                x86.code
+                    .get(x86.core_call_offset..x86.core_call_offset + 4),
+                Some([0, 0, 0, 0].as_slice())
+            );
+            let x86_before_core = &x86.code[..x86.core_call_offset - 1];
+            for validation in [
+                [0x48, 0x85, 0xf6].as_slice(),
+                [0x48, 0x39, 0xf1].as_slice(),
+                [0x48, 0x39, 0xca].as_slice(),
+                [0x4d, 0x85, 0xc0].as_slice(),
+                [0x41, 0xf6, 0xc0, 0x07].as_slice(),
+                [0x48, 0x85, 0xff].as_slice(),
+            ] {
+                assert!(
+                    x86_before_core
+                        .windows(validation.len())
+                        .any(|bytes| bytes == validation),
+                    "missing x86 validation {validation:02x?}"
+                );
+            }
+            for save in [
+                [0x48, 0x89, 0x3c, 0x24].as_slice(),
+                [0x48, 0x89, 0x74, 0x24, 0x08].as_slice(),
+                [0x48, 0x89, 0x54, 0x24, 0x10].as_slice(),
+                [0x48, 0x89, 0x4c, 0x24, 0x18].as_slice(),
+                [0x4c, 0x89, 0x44, 0x24, 0x20].as_slice(),
+            ] {
+                assert!(x86_before_core.windows(save.len()).any(|bytes| bytes == save));
+            }
+            for restore_or_shift in [
+                [0x48, 0x8b, 0x3c, 0x24].as_slice(),
+                [0x48, 0x8b, 0x74, 0x24, 0x08].as_slice(),
+                [0x48, 0x8b, 0x54, 0x24, 0x10].as_slice(),
+                [0x48, 0x8b, 0x4c, 0x24, 0x18].as_slice(),
+                [0x4c, 0x8b, 0x44, 0x24, 0x20].as_slice(),
+                [0x4d, 0x89, 0xc1].as_slice(),
+                [0x49, 0x89, 0xc8].as_slice(),
+                [0x48, 0x89, 0xd1].as_slice(),
+                [0x48, 0x89, 0xf2].as_slice(),
+                [0x48, 0x89, 0xfe].as_slice(),
+            ] {
+                assert!(x86
+                    .code
+                    .windows(restore_or_shift.len())
+                    .any(|bytes| bytes == restore_or_shift));
+            }
+            assert!(x86.code.windows(2).any(|bytes| bytes == [0x85, 0xc0]));
+            assert!(x86
+                .code
+                .windows(3)
+                .any(|bytes| bytes == [0x83, 0xf8, 0x01]));
+            assert!(x86
+                .code
+                .windows(7)
+                .any(|bytes| bytes == [0x49, 0x89, 0x01, 0x49, 0x89, 0x41, 0x08]));
+            let x86_match_payload: &[u8] = match output {
+                OutputContract::Exists => &[0x49, 0x89, 0x01],
+                OutputContract::SelectedEnd => &[0x4d, 0x89, 0x19],
+                OutputContract::Span => &[0x4d, 0x89, 0x11],
+            };
+            assert!(x86
+                .code
+                .windows(x86_match_payload.len())
+                .any(|bytes| bytes == x86_match_payload));
+            assert!(x86
+                .code
+                .windows(6)
+                .any(|bytes| bytes == [0xb8, 0x02, 0, 0, 0, 0xc3]));
+
+            let aarch64 = lower_aarch64_slow_partial_wrapper(output).unwrap();
+            assert_eq!(
+                aarch64
+                    .relocations
+                    .iter()
+                    .map(|relocation| relocation.symbol)
+                    .collect::<Vec<_>>(),
+                [PROGRAM_SYMBOL, PROGRAM_SYMBOL, RUNTIME_SYMBOL]
+            );
+            let words = aarch64
+                .code
+                .chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            assert_eq!(words[aarch64.core_call_offset / 4], 0x9400_0000);
+            let before_core = &words[..aarch64.core_call_offset / 4];
+            for validation in [
+                0xf100_003f,
+                aarch64_cmp_x(3, 1).unwrap(),
+                aarch64_cmp_x(2, 3).unwrap(),
+                0xf100_009f,
+                aarch64_and_low_x(5, 4, 3).unwrap(),
+                0xf100_00bf,
+                0xf100_001f,
+            ] {
+                assert!(before_core.contains(&validation));
+            }
+            for save in [
+                aarch64_store_x(0, 31, 0).unwrap(),
+                aarch64_store_x(1, 31, 8).unwrap(),
+                aarch64_store_x(2, 31, 16).unwrap(),
+                aarch64_store_x(3, 31, 24).unwrap(),
+                aarch64_store_x(4, 31, 32).unwrap(),
+                aarch64_store_x(30, 31, 40).unwrap(),
+            ] {
+                assert!(before_core.contains(&save));
+            }
+            for restore_or_shift in [
+                aarch64_load_x_imm(0, 31, 0).unwrap(),
+                aarch64_load_x_imm(1, 31, 8).unwrap(),
+                aarch64_load_x_imm(2, 31, 16).unwrap(),
+                aarch64_load_x_imm(3, 31, 24).unwrap(),
+                aarch64_load_x_imm(4, 31, 32).unwrap(),
+                aarch64_load_x_imm(30, 31, 40).unwrap(),
+                aarch64_mov_x(5, 4).unwrap(),
+                aarch64_mov_x(4, 3).unwrap(),
+                aarch64_mov_x(3, 2).unwrap(),
+                aarch64_mov_x(2, 1).unwrap(),
+                aarch64_mov_x(1, 0).unwrap(),
+            ] {
+                assert!(words.contains(&restore_or_shift));
+            }
+            assert!(words.contains(&aarch64_cmp_w_imm(0, 0).unwrap()));
+            assert!(words.contains(&aarch64_cmp_w_imm(0, 1).unwrap()));
+            assert!(words.contains(&aarch64_movz_w(0, 2).unwrap()));
+            assert!(words.contains(&aarch64_store_x(31, 5, 0).unwrap()));
+            assert!(words.contains(&aarch64_store_x(31, 5, 8).unwrap()));
+            let aarch64_match_payload = match output {
+                OutputContract::Exists => aarch64_store_x(31, 5, 0).unwrap(),
+                OutputContract::SelectedEnd => aarch64_store_x(7, 5, 0).unwrap(),
+                OutputContract::Span => aarch64_store_x(6, 5, 0).unwrap(),
+            };
+            assert!(words.contains(&aarch64_match_payload));
+        }
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    #[ignore = "links and executes transient slow-partial public wrappers on the host ISA"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the linked ABI oracle covers validation, local outcomes, holes, and Span deopt"
+    )]
+    fn linked_host_slow_partial_wrapper_preserves_whole_search_transactions() {
+        use std::{collections::VecDeque, fmt::Write as _, fs, process::Command};
+
+        fn c_bytes(bytes: &[u8]) -> String {
+            bytes
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+
+        fn local_match_and_hole(view: NativeProgramView<'_>) -> (Vec<u8>, Vec<u8>) {
+            let classes = view.dfa.class_count;
+            let complete_rows = view.dfa.forward_cells.len() / classes;
+            let mut queue = VecDeque::from([(0_usize, Vec::<u8>::new())]);
+            let mut visited = vec![false; complete_rows];
+            visited[0] = true;
+            let mut matched = None;
+            let mut hole = None;
+            while let Some((state, prefix)) = queue.pop_front() {
+                let row = state * classes;
+                for class in 0..classes {
+                    let cell = view.dfa.forward_cells[row + class];
+                    let mut path = prefix.clone();
+                    path.push(view.dfa.class_representatives[class]);
+                    if cell.accepted && matched.is_none() {
+                        matched = Some(path.clone());
+                    }
+                    if cell.next == NO_DFA_STATE {
+                        continue;
+                    }
+                    let next = usize::try_from(cell.next).unwrap();
+                    if next >= complete_rows {
+                        if hole.is_none() {
+                            path.push(b'!');
+                            hole = Some(path);
+                        }
+                    } else if !visited[next] {
+                        visited[next] = true;
+                        queue.push_back((next, path));
+                    }
+                }
+            }
+            (
+                matched.expect("reachable local accepting transition"),
+                hole.expect("reachable interior whole-search hole"),
+            )
+        }
+
+        let target = if cfg!(target_arch = "x86_64") {
+            if cfg!(target_os = "linux") {
+                Target::x86_64_linux()
+            } else {
+                Target::x86_64_macos()
+            }
+        } else if cfg!(target_os = "linux") {
+            Target::aarch64_linux()
+        } else {
+            Target::aarch64_macos()
+        };
+
+        let exists_probe_request = CompileRequest::new(PARTIAL_LOOP_PATTERN, target)
+            .mode(CompileMode::Fast)
+            .output(OutputContract::Exists);
+        let exists_fast = compile(exists_probe_request).expect("fast Exists fixture");
+        let (exists_limits, exists_candidate) = (1..=64)
+            .find_map(|max_states| {
+                let limits = slow_partial_limits(max_states);
+                let candidate = exists_fast
+                    .program()
+                    .native_slow_determinized_program(
+                        limits.determinize,
+                        limits.max_allocation_bytes,
+                    )
+                    .expect("bounded Exists candidate")?;
+                let (complete, discovered) = candidate.retained_dimensions()?;
+                (complete > 0 && complete < discovered).then_some((limits, candidate))
+            })
+            .expect("host Exists interior prefix");
+        let exists_view = exists_fast
+            .program()
+            .native_slow_determinized_view(&exists_candidate);
+        let (match_bytes, hole_bytes) = local_match_and_hole(exists_view);
+        let exists = crate::compile_with_slow_aot_limits(
+            CompileRequest::new(PARTIAL_LOOP_PATTERN, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists)
+                .limits(CompileLimitsV1 {
+                    determinize: DeterminizeLimits {
+                        max_states: 0,
+                        ..DeterminizeLimits::default()
+                    },
+                    ..CompileLimitsV1::default()
+                }),
+            exists_limits,
+        )
+        .expect("linked Exists slow partial");
+        assert!(exists.module().slow_aot_report().is_some());
+        assert!(exists.module().prepared_entry_symbol().is_none());
+
+        let span_probe_request = CompileRequest::new("a+", target)
+            .mode(CompileMode::Fast)
+            .output(OutputContract::Span);
+        let span_fast = compile(span_probe_request).expect("fast Span fixture");
+        let complete_span = span_fast
+            .program()
+            .native_slow_determinized_program(
+                SlowAotLimits::default().determinize,
+                SlowAotLimits::default().max_allocation_bytes,
+            )
+            .expect("complete Span determinization")
+            .expect("complete Span candidate");
+        let span_limits = SlowAotLimits {
+            determinize: DeterminizeLimits {
+                max_work: complete_span.report().work_completed - 1,
+                ..SlowAotLimits::default().determinize
+            },
+            ..SlowAotLimits::default()
+        };
+        let span = crate::compile_with_slow_aot_limits(
+            CompileRequest::new("a+", target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span)
+                .limits(CompileLimitsV1 {
+                    determinize: DeterminizeLimits {
+                        max_states: 0,
+                        ..DeterminizeLimits::default()
+                    },
+                    ..CompileLimitsV1::default()
+                }),
+            span_limits,
+        )
+        .expect("linked variable Span slow partial");
+        assert!(span.module().slow_aot_report().is_some());
+        assert!(span.module().prepared_entry_symbol().is_none());
+
+        let directory = std::env::temp_dir().join(format!(
+            "fre-aot-slow-partial-wrapper-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("create slow-partial linker directory");
+        let exists_object = directory.join("exists.o");
+        let span_object = directory.join("span.o");
+        fs::write(&exists_object, exists.object()).expect("write Exists object");
+        fs::write(&span_object, span.object()).expect("write Span object");
+        let exists_symbol = exists.module().entry_symbol();
+        let span_symbol = span.module().entry_symbol();
+        let exists_serialized = exists.program().serialize().expect("serialize Exists program");
+        let span_serialized = span.program().serialize().expect("serialize Span program");
+        let exists_header = &exists_serialized[..crate::PROGRAM_HEADER_LEN];
+        let span_header = &span_serialized[..crate::PROGRAM_HEADER_LEN];
+        let mut source = format!(
+            "#include <stddef.h>\n#include <stdint.h>\n\
+             typedef struct{{size_t start;size_t end;}} result_t;\n\
+             extern uint32_t {exists_symbol}(const unsigned char*,size_t,size_t,size_t,result_t*);\n\
+             extern uint32_t {span_symbol}(const unsigned char*,size_t,size_t,size_t,result_t*);\n\
+             static const unsigned char match_h[]={{{match_bytes}}};\n\
+             static const unsigned char hole_h[]={{{hole_bytes}}};\n\
+             static const unsigned char span_h[]={{97}};\n\
+             static const unsigned char exists_header[]={{{exists_header}}};\n\
+             static const unsigned char span_header[]={{{span_header}}};\n\
+             static int runtime_calls;\n\
+             static int same_bytes(const unsigned char*a,const unsigned char*b,size_t n){{size_t i;for(i=0U;i<n;i++)if(a[i]!=b[i])return 0;return 1;}}\n\
+             uint32_t fre_aot_regex_runtime_search_v1(const unsigned char*program,const unsigned char*h,size_t n,size_t s,size_t e,result_t*r){{\
+               runtime_calls++;if(program==NULL||r==NULL||s>e||e>n)return 90U;\
+               if(h==hole_h&&n==sizeof(hole_h)&&s==0U&&e==sizeof(hole_h)){{if(!same_bytes(program,exists_header,sizeof(exists_header)))return 92U;r->start=123U;r->end=456U;return 77U;}}\
+               if(h==span_h&&n==sizeof(span_h)&&s==0U&&e==sizeof(span_h)){{if(!same_bytes(program,span_header,sizeof(span_header)))return 93U;r->start=10U;r->end=11U;return 78U;}}\
+               return 91U;}}\n\
+             int main(void){{result_t r;uint32_t status;\n",
+            match_bytes = c_bytes(&match_bytes),
+            hole_bytes = c_bytes(&hole_bytes),
+            exists_header = c_bytes(exists_header),
+            span_header = c_bytes(span_header),
+        );
+        writeln!(
+            source,
+            "runtime_calls=0;r=(result_t){{91U,92U}};status={exists_symbol}(match_h,sizeof(match_h),0U,sizeof(match_h),&r);if(status!=1U||r.start!=0U||r.end!=0U||runtime_calls!=0)return 10;"
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "runtime_calls=0;r=(result_t){{91U,92U}};status={exists_symbol}(match_h,sizeof(match_h),0U,0U,&r);if(status!=0U||r.start!=0U||r.end!=0U||runtime_calls!=0)return 11;"
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "runtime_calls=0;r=(result_t){{91U,92U}};status={exists_symbol}(hole_h,sizeof(hole_h),0U,sizeof(hole_h),&r);if(status!=77U||r.start!=123U||r.end!=456U||runtime_calls!=1)return 12;"
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "runtime_calls=0;r=(result_t){{91U,92U}};status={span_symbol}(span_h,sizeof(span_h),0U,sizeof(span_h),&r);if(status!=78U||r.start!=10U||r.end!=11U||runtime_calls!=1)return 13;"
+        )
+        .unwrap();
+        for (failure, call) in [
+            (
+                20,
+                format!("{exists_symbol}(NULL,sizeof(match_h),0U,0U,&r)"),
+            ),
+            (
+                21,
+                format!("{exists_symbol}(match_h,sizeof(match_h),1U,0U,&r)"),
+            ),
+            (
+                22,
+                format!(
+                    "{exists_symbol}(match_h,sizeof(match_h),0U,sizeof(match_h)+1U,&r)"
+                ),
+            ),
+            (
+                23,
+                format!("{exists_symbol}(match_h,(size_t)-1,0U,0U,&r)"),
+            ),
+        ] {
+            writeln!(
+                source,
+                "runtime_calls=0;r=(result_t){{91U,92U}};status={call};if(status!=2U||r.start!=91U||r.end!=92U||runtime_calls!=0)return {failure};"
+            )
+            .unwrap();
+        }
+        writeln!(
+            source,
+            "unsigned char misaligned[24] __attribute__((aligned(8)));runtime_calls=0;status={exists_symbol}(match_h,sizeof(match_h),0U,0U,(result_t*)(void*)(misaligned+1));if(status!=2U||runtime_calls!=0)return 24;"
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "runtime_calls=0;status={exists_symbol}(match_h,sizeof(match_h),0U,0U,NULL);if(status!=2U||runtime_calls!=0)return 25;return 0;}}"
+        )
+        .unwrap();
+
+        let c_path = directory.join("slow_partial.c");
+        let executable = directory.join("slow_partial");
+        fs::write(&c_path, source).expect("write slow-partial C harness");
+        let compiler = if cfg!(target_os = "macos") {
+            "clang"
+        } else {
+            "cc"
+        };
+        let status = Command::new(compiler)
+            .arg("-O0")
+            .arg(&c_path)
+            .arg(&exists_object)
+            .arg(&span_object)
+            .arg("-o")
+            .arg(&executable)
+            .status()
+            .expect("invoke host C compiler");
+        assert!(status.success());
+        let output = Command::new(&executable)
+            .output()
+            .expect("execute slow-partial wrapper oracle");
+        assert!(
+            output.status.success(),
+            "status={:?} stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn complete_retained_ordered_nfa_is_still_slow_minimization_input() {
         let compiled = complete_forward_resource_fallback(
@@ -28549,6 +29896,7 @@ int main(void) {{
             let partial = NativePartialDfaLayout {
                 hole_token_base,
                 resume_states: 4,
+                collapse_holes: false,
             };
             let completed = u32::try_from(complete_states).unwrap();
             for accepted in [false, true] {
@@ -39641,6 +40989,7 @@ int main(void) {{
             NativePartialDfaLayout {
                 hole_token_base,
                 resume_states,
+                collapse_holes: false,
             }
         }
 

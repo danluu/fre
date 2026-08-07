@@ -23,8 +23,9 @@ use crate::{
     },
     dfa::{
         self, DeterminizationReport, DeterminizeLimits, DeterminizeOutcome, DfaReplayOrder,
-        DfaStats, ForwardCell, NativeDfaView, NativePartialDfaView, NO_STATE, OrderedDfa,
-        PartialDfa, PartialDfaPrefixPlan, PartialDfaResult, PartialDfaResume, ReverseCell,
+        DfaStats, ForwardCell, NativeDfaView, NativePartialDfaView, NativeSlowPartial, NO_STATE,
+        OrderedDfa, PartialDfa, PartialDfaPrefixPlan, PartialDfaResult, PartialDfaResume,
+        ReverseCell,
     },
     error::{CompileError, CompileResource},
     required_literals::{self, RequiredLiterals},
@@ -3583,6 +3584,10 @@ pub(crate) struct NativeProgramView<'a> {
     /// destinations in the remaining suffix name authenticated K0 resume
     /// states.
     pub(crate) partial_discovered_states: Option<usize>,
+    /// Collapse every destination outside the completed prefix to one
+    /// synthetic native hole. This is set only by transient slow-AOT IR; a
+    /// serialized partial DFA retains distinct authenticated resume states.
+    pub(crate) collapse_partial_holes: bool,
     pub(crate) anchored_prefix: &'a AnchoredPrefix,
     pub(crate) anchored_suffix: &'a AnchoredSuffix,
     pub(crate) required_literals: &'a RequiredLiterals,
@@ -3626,14 +3631,20 @@ pub(crate) struct NativeFullyPrefilledProgram {
 /// Owned target-neutral result of the explicitly bounded slow compiler.
 ///
 /// Fast and restored programs may not retain optimizer-only literal sidecars,
-/// so this candidate owns a freshly derived general analysis alongside the
-/// complete minimized DFA.
+/// so this candidate owns a freshly derived general analysis alongside either
+/// the complete minimized DFA or a transient completed-row prefix.
 #[derive(Debug)]
 pub(crate) struct NativeSlowDfaProgram {
-    machine: OrderedDfa,
+    machine: NativeSlowMachine,
     required_literals: RequiredLiterals,
     report: DeterminizationReport,
     allocation_bytes: usize,
+}
+
+#[derive(Debug)]
+enum NativeSlowMachine {
+    Complete(OrderedDfa),
+    Partial(NativeSlowPartial),
 }
 
 impl NativeSlowDfaProgram {
@@ -3641,12 +3652,41 @@ impl NativeSlowDfaProgram {
         &self.report
     }
 
-    pub(crate) const fn stats(&self) -> DfaStats {
-        self.machine.stats()
+    pub(crate) fn stats(&self) -> DfaStats {
+        match &self.machine {
+            NativeSlowMachine::Complete(machine) => machine.stats(),
+            NativeSlowMachine::Partial(partial) => partial.stats(self.report.work_completed),
+        }
     }
 
     pub(crate) const fn allocation_bytes(&self) -> usize {
         self.allocation_bytes
+    }
+
+    pub(crate) fn is_partial(&self) -> bool {
+        matches!(&self.machine, NativeSlowMachine::Partial(_))
+    }
+
+    pub(crate) fn retained_dimensions(&self) -> Option<(usize, usize)> {
+        match &self.machine {
+            NativeSlowMachine::Complete(_) => None,
+            NativeSlowMachine::Partial(partial) => Some(partial.retained_dimensions()),
+        }
+    }
+
+    fn native_view(&self) -> NativeDfaView<'_> {
+        match &self.machine {
+            NativeSlowMachine::Complete(machine) => machine.native_view(),
+            NativeSlowMachine::Partial(partial) => partial.native_view(),
+        }
+    }
+
+    #[cfg(test)]
+    fn complete_machine(&self) -> Option<&OrderedDfa> {
+        match &self.machine {
+            NativeSlowMachine::Complete(machine) => Some(machine),
+            NativeSlowMachine::Partial(_) => None,
+        }
     }
 }
 
@@ -4003,7 +4043,9 @@ impl CompiledProgram {
                     None,
                     None,
                 ),
-                DeterminizeOutcome::Declined { report, partial } => (
+                DeterminizeOutcome::Declined {
+                    report, partial, ..
+                } => (
                     ProgramEngine::OrderedNfa,
                     EngineSelectionReason::DeterminizationResourceLimit,
                     report,
@@ -4586,7 +4628,9 @@ impl CompiledProgram {
     /// construction over the validated `RawPlan`; no source spelling or
     /// pattern identity participates in eligibility or construction.
     ///
-    /// Allocation or stable resource exhaustion is an optimization decline.
+    /// Allocation exhaustion is an optimization decline. A state,
+    /// transition, or work refusal after at least one complete row may retain
+    /// that already-owned prefix for native whole-search deoptimization.
     /// Structural compiler failures remain typed errors.
     pub(crate) fn native_slow_determinized_program(
         &self,
@@ -4609,12 +4653,31 @@ impl CompiledProgram {
         )?;
         match outcome {
             DeterminizeOutcome::Complete { machine, report } => Ok(Some(NativeSlowDfaProgram {
-                machine,
+                machine: NativeSlowMachine::Complete(machine),
                 required_literals: required_literals::derive(&self.raw),
                 report,
                 allocation_bytes,
             })),
-            DeterminizeOutcome::Declined { .. } => Ok(None),
+            DeterminizeOutcome::Declined {
+                report,
+                partial: None,
+                native_slow_partial: Some(machine),
+            } => Ok(Some(NativeSlowDfaProgram {
+                machine: NativeSlowMachine::Partial(machine),
+                required_literals: required_literals::derive(&self.raw),
+                report,
+                allocation_bytes,
+            })),
+            DeterminizeOutcome::Declined {
+                partial: None,
+                native_slow_partial: None,
+                ..
+            } => Ok(None),
+            DeterminizeOutcome::Declined {
+                partial: Some(_), ..
+            } => Err(CompileError::InternalInvariant(
+                "slow determinization returned a stable partial artifact",
+            )),
         }
     }
 
@@ -4622,12 +4685,16 @@ impl CompiledProgram {
         &'a self,
         candidate: &'a NativeSlowDfaProgram,
     ) -> NativeProgramView<'a> {
-        let dfa = candidate.machine.native_view();
+        let dfa = candidate.native_view();
+        let partial_discovered_states = candidate
+            .retained_dimensions()
+            .map(|(_, discovered_states)| discovered_states);
         NativeProgramView {
             output: self.output,
             raw: &self.raw,
             dfa,
-            partial_discovered_states: None,
+            partial_discovered_states,
+            collapse_partial_holes: candidate.is_partial(),
             anchored_prefix: &self.anchored_prefix,
             anchored_suffix: &self.anchored_suffix,
             required_literals: &candidate.required_literals,
@@ -4648,6 +4715,7 @@ impl CompiledProgram {
             raw: &self.raw,
             dfa: materialized.dfa_view(),
             partial_discovered_states: None,
+            collapse_partial_holes: false,
             anchored_prefix: &self.anchored_prefix,
             anchored_suffix: &self.anchored_suffix,
             required_literals: &self.required_literals,
@@ -4717,6 +4785,7 @@ impl CompiledProgram {
             raw: &self.raw,
             dfa,
             partial_discovered_states: None,
+            collapse_partial_holes: false,
             anchored_prefix: &self.anchored_prefix,
             anchored_suffix: &self.anchored_suffix,
             required_literals: &self.required_literals,
@@ -4770,6 +4839,7 @@ impl CompiledProgram {
                 raw: &self.raw,
                 dfa,
                 partial_discovered_states: Some(partial.discovered_states),
+                collapse_partial_holes: false,
                 anchored_prefix: &self.anchored_prefix,
                 anchored_suffix: &self.anchored_suffix,
                 required_literals: &self.required_literals,
@@ -4866,6 +4936,7 @@ impl CompiledProgram {
                 reverse_cells: &[],
             },
             partial_discovered_states: None,
+            collapse_partial_holes: false,
             anchored_prefix: &self.anchored_prefix,
             anchored_suffix: &self.anchored_suffix,
             required_literals: &self.required_literals,
@@ -14397,6 +14468,7 @@ mod tests {
                 DeterminizeOutcome::Declined {
                     report,
                     partial: Some(partial),
+                    ..
                 } => (partial, report),
                 DeterminizeOutcome::Complete { .. } => {
                     panic!("legacy limits unexpectedly completed")
@@ -16145,12 +16217,14 @@ mod tests {
         let mut matching = vec![b'b'; 32];
         matching[3] = b'a';
         assert!(machine
-            .machine
+            .complete_machine()
+            .expect("complete slow machine")
             .exists(&matching, 0, matching.len())
             .unwrap());
         let nonmatching = vec![b'b'; 32];
         assert!(!machine
-            .machine
+            .complete_machine()
+            .expect("complete slow machine")
             .exists(&nonmatching, 0, nonmatching.len())
             .unwrap());
 

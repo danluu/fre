@@ -127,8 +127,8 @@ impl Default for DeterminizeLimits {
 /// Charges are monotonic within one construction attempt. This deliberately
 /// over-counts short-lived scratch rather than trying to infer allocator
 /// metadata or lifetime from `Vec` and `HashMap`. A declined ordered endpoint
-/// attempt owns no retained machine in the slow compiler, so its checkpoint
-/// can be restored before the mutually exclusive endpoint-pruned rescue.
+/// attempt restores its checkpoint before the mutually exclusive
+/// endpoint-pruned rescue only when it retained no transient native prefix.
 #[derive(Clone, Debug)]
 pub(crate) struct DeterminizeAllocationLedger {
     state: Rc<Cell<DeterminizeAllocationState>>,
@@ -779,7 +779,19 @@ impl PackedForwardCell {
 
 enum ForwardBuildOutcome {
     Complete(ForwardDfa),
-    Declined(Option<PartialForwardDfa>),
+    Declined {
+        partial: Option<PartialForwardDfa>,
+        native_slow_partial: Option<NativeSlowPartialForward>,
+    },
+}
+
+impl ForwardBuildOutcome {
+    const fn declined() -> Self {
+        Self::Declined {
+            partial: None,
+            native_slow_partial: None,
+        }
+    }
 }
 
 impl ForwardDfa {
@@ -832,6 +844,30 @@ pub(crate) struct PartialDfa {
     alphabet: Alphabet,
     forward: PartialForwardDfa,
     effective_limits: DeterminizeLimits,
+}
+
+/// Compiler-owned completed-row prefix retained by the bounded slow AOT pass.
+///
+/// This is deliberately not a [`PartialDfa`]. It carries no resume keys,
+/// portable packing, start certificates, stable limits, or serialization ABI.
+/// Native lowering treats every destination outside `complete_rows` as one
+/// synthetic whole-search-deoptimization hole.
+#[derive(Debug)]
+pub(crate) struct NativeSlowPartial {
+    alphabet: Alphabet,
+    forward: NativeSlowPartialForward,
+    boundary_classes: usize,
+    graph_classes: usize,
+}
+
+#[derive(Debug)]
+struct NativeSlowPartialForward {
+    initial_pending: bool,
+    initial_terminal: bool,
+    transitions: Vec<ForwardCell>,
+    complete_rows: usize,
+    discovered_states: usize,
+    states_before_minimization: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2180,7 +2216,9 @@ impl PartialDfa {
                     "partial DFA limits canonically produce a complete machine",
                 ));
             }
-            DeterminizeOutcome::Declined { report, partial } => {
+            DeterminizeOutcome::Declined {
+                report, partial, ..
+            } => {
                 if matches!(
                     report.decline,
                     Some(DeterminizationDecline {
@@ -2214,6 +2252,78 @@ impl PartialDfa {
             && self.forward.discovered_states == other.forward.discovered_states
             && self.forward.complete_rows == other.forward.complete_rows
             && self.forward.resume_keys == other.forward.resume_keys
+    }
+}
+
+impl NativeSlowPartial {
+    fn from_incomplete_forward(
+        alphabet: Alphabet,
+        forward: NativeSlowPartialForward,
+        boundary_classes: usize,
+        graph_classes: usize,
+    ) -> Self {
+        Self {
+            alphabet,
+            forward,
+            boundary_classes,
+            graph_classes,
+        }
+    }
+
+    fn from_complete_forward(
+        alphabet: Alphabet,
+        forward: ForwardDfa,
+        boundary_classes: usize,
+        graph_classes: usize,
+        states_before_minimization: usize,
+    ) -> Self {
+        let states = forward.states;
+        Self {
+            alphabet,
+            forward: NativeSlowPartialForward {
+                initial_pending: forward.initial_pending,
+                initial_terminal: forward.initial_terminal,
+                transitions: forward.transitions,
+                complete_rows: states,
+                discovered_states: states,
+                states_before_minimization,
+            },
+            boundary_classes,
+            graph_classes,
+        }
+    }
+
+    pub(crate) fn native_view(&self) -> NativeDfaView<'_> {
+        NativeDfaView {
+            initial_state: 0,
+            initial_pending: self.forward.initial_pending,
+            initial_terminal: self.forward.initial_terminal,
+            byte_classes: &self.alphabet.byte_to_class,
+            class_count: self.alphabet.classes(),
+            class_representatives: &self.alphabet.representatives,
+            forward_cells: &self.forward.transitions,
+            reverse_initial: None,
+            reverse_cells: &[],
+        }
+    }
+
+    pub(crate) const fn retained_dimensions(&self) -> (usize, usize) {
+        (self.forward.complete_rows, self.forward.discovered_states)
+    }
+
+    pub(crate) fn stats(&self, build_work: u64) -> DfaStats {
+        DfaStats {
+            boundary_classes: self.boundary_classes,
+            graph_classes: self.graph_classes,
+            alphabet_classes: self.alphabet.classes(),
+            forward_states_before_minimization: self.forward.states_before_minimization,
+            forward_states: self.forward.complete_rows,
+            forward_transitions: self.forward.transitions.len(),
+            reverse_states_before_minimization: 0,
+            reverse_states: 0,
+            reverse_transitions: 0,
+            build_work,
+        }
     }
 }
 
@@ -3108,6 +3218,7 @@ pub(crate) enum DeterminizeOutcome {
     Declined {
         report: DeterminizationReport,
         partial: Option<PartialDfa>,
+        native_slow_partial: Option<NativeSlowPartial>,
     },
 }
 
@@ -3115,27 +3226,33 @@ impl DeterminizeOutcome {
     fn from_budget(
         machine: Option<OrderedDfa>,
         partial: Option<PartialDfa>,
+        native_slow_partial: Option<NativeSlowPartial>,
         budget: BuildBudget,
     ) -> Self {
         // Allocation refusal is environmental rather than a canonical
         // consequence of the recorded numeric limits. Retaining such a table
         // would make strict replay depend on allocator history, so only
-        // state/transition/work refusals publish a stable partial machine.
-        let partial = if matches!(
+        // state/transition/work refusals publish a stable partial machine or
+        // a transient native-only completed-row prefix.
+        let allocation_declined = matches!(
             budget.decline,
             Some(DeterminizationDecline {
                 resource: DeterminizationResource::Allocation { .. },
                 ..
             })
-        ) {
-            None
-        } else {
-            partial
-        };
+        );
+        let partial = (!allocation_declined).then_some(partial).flatten();
+        let native_slow_partial = (!allocation_declined)
+            .then_some(native_slow_partial)
+            .flatten();
         let report = budget.into_report();
         match machine {
             Some(machine) => Self::Complete { machine, report },
-            None => Self::Declined { report, partial },
+            None => Self::Declined {
+                report,
+                partial,
+                native_slow_partial,
+            },
         }
     }
 
@@ -3155,7 +3272,11 @@ impl DeterminizeOutcome {
         let effective_limits = requested_limits.effective_for_stable_artifact();
         let report = match self {
             Self::Complete { report, .. } => report,
-            Self::Declined { report, partial } => {
+            Self::Declined {
+                report,
+                partial,
+                ..
+            } => {
                 if let Some(partial) = partial {
                     partial.effective_limits = effective_limits;
                 }
@@ -3203,6 +3324,33 @@ impl DeterminizeOutcome {
     }
 }
 
+fn retain_complete_forward_after_decline(
+    alphabet: Alphabet,
+    forward: ForwardDfa,
+    boundary_classes: usize,
+    graph_classes: usize,
+    states_before_minimization: usize,
+    budget: &mut BuildBudget,
+) -> Result<(Option<PartialDfa>, Option<NativeSlowPartial>), CompileError> {
+    match budget.partial_retention {
+        PartialRetention::Stable => Ok((
+            PartialDfa::from_complete_forward(alphabet, forward, budget)?,
+            None,
+        )),
+        PartialRetention::NativeSlow if budget.decline_allows_native_slow_partial() => Ok((
+            None,
+            Some(NativeSlowPartial::from_complete_forward(
+                alphabet,
+                forward,
+                boundary_classes,
+                graph_classes,
+                states_before_minimization,
+            )),
+        )),
+        PartialRetention::NativeSlow => Ok((None, None)),
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the failure-atomic determinization stages and their partial-artifact policy stay adjacent"
@@ -3231,7 +3379,7 @@ fn determinize_impl_with_allocation_ledger(
     );
     budget.begin_stage(DeterminizationStage::AlphabetPartition);
     let Some(built_alphabet) = Alphabet::build(raw, &mut budget)? else {
-        return Ok(DeterminizeOutcome::from_budget(None, None, budget));
+        return Ok(DeterminizeOutcome::from_budget(None, None, None, budget));
     };
     let BuiltAlphabet {
         mut alphabet,
@@ -3242,53 +3390,100 @@ fn determinize_impl_with_allocation_ledger(
     budget.begin_stage(DeterminizationStage::ForwardSubsetConstruction);
     let mut forward = match build_forward(raw, &alphabet, &mut budget, semantics, replay_order)? {
         ForwardBuildOutcome::Complete(forward) => forward,
-        ForwardBuildOutcome::Declined(partial) => {
-            let partial = budget.retain_partial.then(|| {
-                partial.map(|forward| PartialDfa {
+        ForwardBuildOutcome::Declined {
+            partial,
+            native_slow_partial,
+        } => {
+            let (partial, native_slow_partial) = match (partial, native_slow_partial) {
+                (Some(forward), None) => (Some(PartialDfa {
                     alphabet,
                     forward,
                     effective_limits: budget.limits,
-                })
-            }).flatten();
-            return Ok(DeterminizeOutcome::from_budget(None, partial, budget));
+                }), None),
+                (None, Some(forward)) => (
+                    None,
+                    Some(NativeSlowPartial::from_incomplete_forward(
+                        alphabet,
+                        forward,
+                        boundary_classes,
+                        graph_classes,
+                    )),
+                ),
+                (None, None) => (None, None),
+                (Some(_), Some(_)) => {
+                    return Err(CompileError::InternalInvariant(
+                        "determinization retained two incompatible partial artifacts",
+                    ));
+                }
+            };
+            return Ok(DeterminizeOutcome::from_budget(
+                None,
+                partial,
+                native_slow_partial,
+                budget,
+            ));
         }
     };
     budget.complete_stage(DeterminizationStage::ForwardSubsetConstruction)?;
+    let forward_states_before_minimization = forward.states;
     let mut reverse = if wants_span && !forward.initial_pending {
         budget.begin_stage(DeterminizationStage::ReverseSubsetConstruction);
         let Some(reverse) = build_reverse(raw, &alphabet, &mut budget)? else {
-            let partial = if budget.retain_partial {
-                PartialDfa::from_complete_forward(alphabet, forward, &mut budget)?
-            } else {
-                None
-            };
-            return Ok(DeterminizeOutcome::from_budget(None, partial, budget));
+            let (partial, native_slow_partial) = retain_complete_forward_after_decline(
+                alphabet,
+                forward,
+                boundary_classes,
+                graph_classes,
+                forward_states_before_minimization,
+                &mut budget,
+            )?;
+            return Ok(DeterminizeOutcome::from_budget(
+                None,
+                partial,
+                native_slow_partial,
+                budget,
+            ));
         };
         budget.complete_stage(DeterminizationStage::ReverseSubsetConstruction)?;
         Some(reverse)
     } else {
         None
     };
-    let forward_states_before_minimization = forward.states;
     let reverse_states_before_minimization = reverse.as_ref().map_or(0, |machine| machine.states);
     budget.begin_stage(DeterminizationStage::DfaStateMinimization);
     if !minimize_dfa_states(&mut forward, &mut reverse, alphabet.classes(), &mut budget)? {
-        let partial = if budget.retain_partial {
-            PartialDfa::from_complete_forward(alphabet, forward, &mut budget)?
-        } else {
-            None
-        };
-        return Ok(DeterminizeOutcome::from_budget(None, partial, budget));
+        let (partial, native_slow_partial) = retain_complete_forward_after_decline(
+            alphabet,
+            forward,
+            boundary_classes,
+            graph_classes,
+            forward_states_before_minimization,
+            &mut budget,
+        )?;
+        return Ok(DeterminizeOutcome::from_budget(
+            None,
+            partial,
+            native_slow_partial,
+            budget,
+        ));
     }
     budget.complete_stage(DeterminizationStage::DfaStateMinimization)?;
     budget.begin_stage(DeterminizationStage::AlphabetColumnCoalescing);
     if !coalesce_alphabet_columns(&mut alphabet, &mut forward, &mut reverse, &mut budget)? {
-        let partial = if budget.retain_partial {
-            PartialDfa::from_complete_forward(alphabet, forward, &mut budget)?
-        } else {
-            None
-        };
-        return Ok(DeterminizeOutcome::from_budget(None, partial, budget));
+        let (partial, native_slow_partial) = retain_complete_forward_after_decline(
+            alphabet,
+            forward,
+            boundary_classes,
+            graph_classes,
+            forward_states_before_minimization,
+            &mut budget,
+        )?;
+        return Ok(DeterminizeOutcome::from_budget(
+            None,
+            partial,
+            native_slow_partial,
+            budget,
+        ));
     }
     budget.complete_stage(DeterminizationStage::AlphabetColumnCoalescing)?;
     let forward_transitions = forward.transitions.len();
@@ -3319,7 +3514,12 @@ fn determinize_impl_with_allocation_ledger(
         reverse,
         stats,
     };
-    Ok(DeterminizeOutcome::from_budget(Some(machine), None, budget))
+    Ok(DeterminizeOutcome::from_budget(
+        Some(machine),
+        None,
+        None,
+        budget,
+    ))
 }
 
 fn determinize_impl(
@@ -3404,8 +3604,9 @@ pub(crate) fn determinize_for_output(
 /// fallible logical allocation made by the slow compiler.
 ///
 /// The returned byte count is the maximum charged extent of either mutually
-/// exclusive endpoint construction attempt. No partial artifact is retained
-/// on decline, because the caller already owns the original semantic fallback.
+/// exclusive endpoint construction attempt. A numeric refusal may retain the
+/// already-charged completed forward prefix for transient native lowering;
+/// allocation refusal never does.
 pub(crate) fn determinize_for_output_with_allocation_limit(
     raw: &RawPlan,
     output: OutputContract,
@@ -3496,6 +3697,21 @@ fn determinize_for_output_with_ledger(
             "slow endpoint determinization retained a partial machine",
         ));
     }
+    let retained_native_slow_partial = matches!(
+        ordered,
+        DeterminizeOutcome::Declined {
+            native_slow_partial: Some(_),
+            ..
+        }
+    );
+    if retained_native_slow_partial {
+        // The ordered prefix remains live and owns allocations charged after
+        // the checkpoint. Restoring that checkpoint for a simultaneous
+        // endpoint-pruned attempt would make the ledger cease to be a hard
+        // peak cap. The whole-search-deopt prefix is already useful, so keep
+        // it and skip the mutually exclusive rescue.
+        return Ok(ordered);
+    }
 
     let effective_limits = requested_limits.effective_for_stable_artifact();
     let ordered_work = ordered.work_completed();
@@ -3507,9 +3723,10 @@ fn determinize_for_output_with_ledger(
     }
 
     if let Some(ledger) = allocation_ledger {
-        // Slow attempts retain no partial rows. The ordered construction is
-        // fully dropped here, so the endpoint-pruned rescue may reuse the same
-        // hard logical byte budget without allowing simultaneous ownership.
+        // The retained-prefix case returned above. The ordered construction
+        // reaching this point is fully dropped, so the endpoint-pruned rescue
+        // may reuse the same hard logical byte budget without simultaneous
+        // ownership.
         ledger.restore(allocation_checkpoint);
     }
 
@@ -4334,6 +4551,38 @@ fn compact_partial_forward(
     })
 }
 
+/// Retain the slow compiler's already-owned completed rows without making a
+/// fallible allocation after the resource refusal. Worklist keys and start
+/// actions are intentionally dropped: a synthetic native hole restarts the
+/// original whole search and therefore consumes neither continuation ABI.
+fn retain_native_slow_partial_forward(
+    mut transitions: Vec<ForwardCell>,
+    states: Vec<ForwardKey>,
+    complete_rows: usize,
+    classes: usize,
+    initial_pending: bool,
+    initial_terminal: bool,
+) -> Option<NativeSlowPartialForward> {
+    if complete_rows == 0 || complete_rows > states.len() || classes == 0 {
+        return None;
+    }
+    let completed_cells = complete_rows.checked_mul(classes)?;
+    if transitions.len() < completed_cells {
+        return None;
+    }
+    transitions.truncate(completed_cells);
+    let discovered_states = states.len();
+    drop(states);
+    Some(NativeSlowPartialForward {
+        initial_pending,
+        initial_terminal,
+        transitions,
+        complete_rows,
+        discovered_states,
+        states_before_minimization: discovered_states,
+    })
+}
+
 /// Maximum synchronized anchored-state pairs explored for one endpoint
 /// dominance proof.
 ///
@@ -4803,29 +5052,29 @@ fn build_forward(
 ) -> Result<ForwardBuildOutcome, CompileError> {
     let Some(class_visit_order) = ForwardClassVisitOrder::build(alphabet, replay_order, budget)?
     else {
-        return Ok(ForwardBuildOutcome::Declined(None));
+        return Ok(ForwardBuildOutcome::declined());
     };
     let existence_only = semantics == ForwardSemantics::Exists;
     let mut endpoint_dominance = None;
     let Some(mut closure) = ForwardClosure::new(raw, budget) else {
-        return Ok(ForwardBuildOutcome::Declined(None));
+        return Ok(ForwardBuildOutcome::declined());
     };
     let initial_accepted = closure.expand(raw, raw.start, budget)?;
     if budget.declined {
-        return Ok(ForwardBuildOutcome::Declined(None));
+        return Ok(ForwardBuildOutcome::declined());
     }
     let mut initial_items = if existence_only {
         if initial_accepted {
             Vec::new()
         } else {
             let Some(items) = closure.copy_items_canonical(raw, budget)? else {
-                return Ok(ForwardBuildOutcome::Declined(None));
+                return Ok(ForwardBuildOutcome::declined());
             };
             items
         }
     } else {
         let Some(items) = closure.copy_items(budget) else {
-            return Ok(ForwardBuildOutcome::Declined(None));
+            return Ok(ForwardBuildOutcome::declined());
         };
         items
     };
@@ -4839,7 +5088,7 @@ fn build_forward(
         )?
         .is_none()
     {
-        return Ok(ForwardBuildOutcome::Declined(None));
+        return Ok(ForwardBuildOutcome::declined());
     }
     let initial_terminal = initial_accepted && initial_items.is_empty();
     let initial = ForwardKey {
@@ -4847,43 +5096,57 @@ fn build_forward(
         pending: initial_accepted,
     };
     if !budget.reserve_state(alphabet.classes()) {
-        return Ok(ForwardBuildOutcome::Declined(None));
+        return Ok(ForwardBuildOutcome::declined());
     }
 
     let Some(mut states) = build_vec(1, budget) else {
-        return Ok(ForwardBuildOutcome::Declined(None));
+        return Ok(ForwardBuildOutcome::declined());
     };
     let Some(initial_state) = clone_forward_key(&initial, budget) else {
-        return Ok(ForwardBuildOutcome::Declined(None));
+        return Ok(ForwardBuildOutcome::declined());
     };
     states.push(initial_state);
     let Some(mut interned) = build_map(1, budget) else {
-        return Ok(ForwardBuildOutcome::Declined(None));
+        return Ok(ForwardBuildOutcome::declined());
     };
     interned.insert(initial, 0_u32);
     let Some(mut transitions) = build_vec(alphabet.classes(), budget) else {
-        return Ok(ForwardBuildOutcome::Declined(None));
+        return Ok(ForwardBuildOutcome::declined());
     };
     let Some(mut start_actions) = build_vec(alphabet.classes(), budget) else {
-        return Ok(ForwardBuildOutcome::Declined(None));
+        return Ok(ForwardBuildOutcome::declined());
     };
     let mut cursor = 0usize;
     macro_rules! decline_with_complete_rows {
         () => {{
-            let partial = if budget.retain_partial {
-                compact_partial_forward(
-                    &transitions,
-                    &start_actions,
-                    states,
-                    cursor,
-                    alphabet.classes(),
-                    initial_accepted,
-                    initial_terminal,
-                )
-            } else {
-                None
-            };
-            return Ok(ForwardBuildOutcome::Declined(partial));
+            return Ok(match budget.partial_retention {
+                PartialRetention::NativeSlow if budget.decline_allows_native_slow_partial() => {
+                    ForwardBuildOutcome::Declined {
+                        partial: None,
+                        native_slow_partial: retain_native_slow_partial_forward(
+                            transitions,
+                            states,
+                            cursor,
+                            alphabet.classes(),
+                            initial_accepted,
+                            initial_terminal,
+                        ),
+                    }
+                }
+                PartialRetention::NativeSlow => ForwardBuildOutcome::declined(),
+                PartialRetention::Stable => ForwardBuildOutcome::Declined {
+                    partial: compact_partial_forward(
+                        &transitions,
+                        &start_actions,
+                        states,
+                        cursor,
+                        alphabet.classes(),
+                        initial_accepted,
+                        initial_terminal,
+                    ),
+                    native_slow_partial: None,
+                },
+            });
         }};
     }
     while cursor < states.len() {
@@ -5231,7 +5494,7 @@ struct BuildBudget {
     requested_limits: DeterminizeLimits,
     limits: DeterminizeLimits,
     allocation_ledger: Option<DeterminizeAllocationLedger>,
-    retain_partial: bool,
+    partial_retention: PartialRetention,
     work: u64,
     states: usize,
     transitions: usize,
@@ -5246,13 +5509,19 @@ struct BuildBudget {
     completed_stages: Vec<DeterminizationStage>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PartialRetention {
+    Stable,
+    NativeSlow,
+}
+
 impl BuildBudget {
     fn new(requested_limits: DeterminizeLimits) -> Self {
         Self {
             requested_limits,
             limits: requested_limits.effective_for_stable_artifact(),
             allocation_ledger: None,
-            retain_partial: true,
+            partial_retention: PartialRetention::Stable,
             work: 0,
             states: 0,
             transitions: 0,
@@ -5272,7 +5541,7 @@ impl BuildBudget {
             requested_limits,
             limits: requested_limits.effective_for_stable_artifact(),
             allocation_ledger: Some(allocation_ledger),
-            retain_partial: false,
+            partial_retention: PartialRetention::NativeSlow,
             work: 0,
             states: 0,
             transitions: 0,
@@ -5289,6 +5558,23 @@ impl BuildBudget {
         debug_assert!(self.current_stage.is_none());
         self.current_stage = Some(stage);
         self.attempted_stages.push(stage);
+    }
+
+    const fn retains_native_slow_partial(&self) -> bool {
+        matches!(self.partial_retention, PartialRetention::NativeSlow)
+    }
+
+    fn decline_allows_native_slow_partial(&self) -> bool {
+        self.retains_native_slow_partial()
+            && matches!(
+                self.decline,
+                Some(DeterminizationDecline {
+                    resource: DeterminizationResource::States { .. }
+                        | DeterminizationResource::Transitions { .. }
+                        | DeterminizationResource::Work { .. },
+                    ..
+                })
+            )
     }
 
     fn complete_stage(&mut self, stage: DeterminizationStage) -> Result<(), CompileError> {
@@ -5920,6 +6206,7 @@ mod tests {
             DeterminizeOutcome::Declined {
                 report,
                 partial: Some(partial),
+                ..
             } => {
                 assert_eq!(
                     report.decline.map(|decline| decline.resource),
@@ -5930,7 +6217,11 @@ mod tests {
                 );
                 partial
             }
-            DeterminizeOutcome::Declined { report, partial: None } => {
+            DeterminizeOutcome::Declined {
+                report,
+                partial: None,
+                ..
+            } => {
                 panic!("bounded construction retained no rows: {report:?}")
             }
             DeterminizeOutcome::Complete { .. } => {
@@ -6024,10 +6315,13 @@ mod tests {
             .find(|&limit| {
                 matches!(
                     forward_with_work_limit(&raw, &alphabet, limit).0,
-                    ForwardBuildOutcome::Declined(Some(PartialForwardDfa {
-                        complete_rows: 1,
+                    ForwardBuildOutcome::Declined {
+                        partial: Some(PartialForwardDfa {
+                            complete_rows: 1,
+                            ..
+                        }),
                         ..
-                    }))
+                    }
                 )
             })
             .expect("a bounded work limit commits exactly the initial row");
@@ -6035,11 +6329,21 @@ mod tests {
 
         let (one_short, one_short_budget) =
             forward_with_work_limit(&raw, &alphabet, exact - 1);
-        assert!(matches!(one_short, ForwardBuildOutcome::Declined(None)));
+        assert!(matches!(
+            one_short,
+            ForwardBuildOutcome::Declined {
+                partial: None,
+                native_slow_partial: None,
+            }
+        ));
         assert_eq!(one_short_budget.work, exact - 1);
 
         let (outcome, budget) = forward_with_work_limit(&raw, &alphabet, exact);
-        let ForwardBuildOutcome::Declined(Some(partial)) = outcome else {
+        let ForwardBuildOutcome::Declined {
+            partial: Some(partial),
+            ..
+        } = outcome
+        else {
             panic!("exact first-row work did not retain one row")
         };
         assert_eq!(partial.complete_rows, 1);
@@ -6605,8 +6909,13 @@ mod tests {
         .expect("bounded slow determinization");
         assert_eq!(peak, 0);
         match outcome {
-            DeterminizeOutcome::Declined { report, partial } => {
+            DeterminizeOutcome::Declined {
+                report,
+                partial,
+                native_slow_partial,
+            } => {
                 assert!(partial.is_none());
+                assert!(native_slow_partial.is_none());
                 assert!(matches!(
                     report.decline,
                     Some(DeterminizationDecline {
@@ -6619,6 +6928,95 @@ mod tests {
                 panic!("zero-byte slow allocation cap unexpectedly completed")
             }
         }
+    }
+
+    #[test]
+    fn slow_numeric_decline_retains_only_the_charged_forward_prefix() {
+        let raw = weighted_branch_graph();
+        let allocation_limit = 16 * 1024 * 1024;
+        let (outcome, peak) = determinize_for_output_with_allocation_limit(
+            &raw,
+            OutputContract::SelectedEnd,
+            false,
+            DeterminizeLimits {
+                max_states: 4,
+                ..DeterminizeLimits::unlimited()
+            },
+            allocation_limit,
+        )
+        .expect("bounded slow ordered construction");
+        assert!(peak <= allocation_limit);
+        let DeterminizeOutcome::Declined {
+            report,
+            partial: None,
+            native_slow_partial: Some(partial),
+        } = outcome
+        else {
+            panic!("numeric slow refusal did not retain transient native rows")
+        };
+        assert!(matches!(
+            report.decline,
+            Some(DeterminizationDecline {
+                stage: DeterminizationStage::ForwardSubsetConstruction,
+                resource: DeterminizationResource::States { .. },
+                ..
+            })
+        ));
+        let (complete_rows, discovered_states) = partial.retained_dimensions();
+        assert!(complete_rows > 0);
+        assert!(complete_rows < discovered_states);
+        assert_eq!(
+            partial.native_view().forward_cells.len(),
+            complete_rows * partial.native_view().class_count
+        );
+        assert!(partial.native_view().forward_cells.iter().all(|cell| {
+            cell.next == NO_STATE
+                || usize::try_from(cell.next)
+                    .ok()
+                    .is_some_and(|next| next < discovered_states)
+        }));
+    }
+
+    #[test]
+    fn slow_later_stage_decline_retains_a_complete_forward_owner() {
+        let raw = lowered_assertion_free("a+Q|[b-c][a-b]{1,5}(?:x+|y+)");
+        let forward_only_work = determinize_impl(
+            &raw,
+            false,
+            DeterminizeLimits::unlimited(),
+            ForwardSemantics::Ordered,
+            DfaReplayOrder::DescendingClassMass,
+        )
+        .expect("complete forward-only work oracle")
+        .work_completed();
+        let allocation_limit = 32 * 1024 * 1024;
+        let (outcome, peak) = determinize_for_output_with_allocation_limit(
+            &raw,
+            OutputContract::Span,
+            true,
+            DeterminizeLimits {
+                max_work: forward_only_work,
+                ..DeterminizeLimits::unlimited()
+            },
+            allocation_limit,
+        )
+        .expect("bounded slow Span construction");
+        assert!(peak <= allocation_limit);
+        let DeterminizeOutcome::Declined {
+            report,
+            partial: None,
+            native_slow_partial: Some(partial),
+        } = outcome
+        else {
+            panic!("post-forward slow refusal did not retain transient native rows")
+        };
+        assert!(report.decline.is_some_and(|decline| {
+            decline.stage != DeterminizationStage::ForwardSubsetConstruction
+                && matches!(decline.resource, DeterminizationResource::Work { .. })
+        }));
+        let (complete_rows, discovered_states) = partial.retained_dimensions();
+        assert!(complete_rows > 0);
+        assert_eq!(complete_rows, discovered_states);
     }
 
     #[test]
