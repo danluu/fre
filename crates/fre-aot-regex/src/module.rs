@@ -31512,6 +31512,705 @@ int main(void) {{
         any(target_arch = "x86_64", target_arch = "aarch64"),
         any(target_os = "linux", target_os = "macos")
     ))]
+    struct LinkedFrozenV4Graph {
+        label: &'static str,
+        raw: fre_automata::RawPlan,
+        accepted: Vec<Vec<u8>>,
+        rejected: Vec<u8>,
+        width: usize,
+        exact_root: bool,
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    fn linked_frozen_v4_graphs() -> Vec<LinkedFrozenV4Graph> {
+        use fre_automata::{EdgeKind, RawPlan, StateRole};
+
+        // `m0Q|o2Q`: two disjoint arms converge on a required suffix. The
+        // first two columns are correlated, so this cannot collapse into an
+        // exact Cartesian product even though every match has width three.
+        let converging_suffix = LinkedFrozenV4Graph {
+            label: "converging-suffix",
+            raw: RawPlan {
+                start: 0,
+                roles: vec![
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Accept,
+                ],
+                edge_offsets: vec![0, 2, 3, 4, 5, 6, 7, 7],
+                edge_targets: vec![1, 2, 3, 4, 5, 5, 6],
+                edge_kinds: vec![
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                ],
+                byte_starts: vec![0, 0, b'm', b'o', b'0', b'2', b'Q'],
+                byte_ends: vec![0, 0, b'm', b'o', b'0', b'2', b'Q'],
+            },
+            accepted: vec![b"m0Q".to_vec(), b"o2Q".to_vec()],
+            rejected: b"m2Q".to_vec(),
+            width: 3,
+            exact_root: false,
+        };
+
+        // `a(?:bd|ce)`: a selective shared prefix fans out and the arms merge
+        // at accept. Correlation after the split again defeats exact-product
+        // selection while retaining a fixed-width Span proof.
+        let prefix_diamond = LinkedFrozenV4Graph {
+            label: "prefix-diamond",
+            raw: RawPlan {
+                start: 0,
+                roles: vec![
+                    StateRole::Consume,
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Accept,
+                ],
+                edge_offsets: vec![0, 1, 3, 4, 5, 6, 7, 7],
+                edge_targets: vec![1, 2, 3, 4, 5, 6, 6],
+                edge_kinds: vec![
+                    EdgeKind::ByteRange,
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                ],
+                byte_starts: vec![b'a', 0, 0, b'b', b'c', b'd', b'e'],
+                byte_ends: vec![b'a', 0, 0, b'b', b'c', b'd', b'e'],
+            },
+            accepted: vec![b"abd".to_vec(), b"ace".to_vec()],
+            rejected: b"abe".to_vec(),
+            width: 3,
+            exact_root: false,
+        };
+
+        // Ten separated root bytes exceed the compact range planner's eight
+        // slots. Each root owns a different second-byte partition and those
+        // partitions cover the full byte domain, so position zero must use
+        // the general exact-set root plan and the language remains correlated.
+        let roots = [b'a', b'c', b'e', b'g', b'i', b'k', b'm', b'o', b'q', b's'];
+        let suffixes = [
+            (0_u8, 24_u8),
+            (25, 49),
+            (50, 74),
+            (75, 99),
+            (100, 124),
+            (125, 149),
+            (150, 174),
+            (175, 199),
+            (200, 224),
+            (225, u8::MAX),
+        ];
+        let branch_count = roots.len();
+        let accept_state = 1_usize
+            .checked_add(branch_count.checked_mul(2).unwrap())
+            .unwrap();
+        let mut roles = Vec::with_capacity(accept_state + 1);
+        roles.push(StateRole::Split);
+        roles.extend(std::iter::repeat_n(StateRole::Consume, branch_count * 2));
+        roles.push(StateRole::Accept);
+        let mut edge_offsets = vec![0_u32, u32::try_from(branch_count).unwrap()];
+        for edge in 1..=branch_count * 2 {
+            edge_offsets.push(u32::try_from(branch_count + edge).unwrap());
+        }
+        edge_offsets.push(u32::try_from(branch_count * 3).unwrap());
+        let mut edge_targets = (1..=branch_count)
+            .map(|state| u32::try_from(state).unwrap())
+            .collect::<Vec<_>>();
+        edge_targets.extend(
+            (0..branch_count)
+                .map(|branch| u32::try_from(1 + branch_count + branch).unwrap()),
+        );
+        edge_targets.extend(std::iter::repeat_n(
+            u32::try_from(accept_state).unwrap(),
+            branch_count,
+        ));
+        let mut edge_kinds = vec![EdgeKind::Epsilon; branch_count];
+        edge_kinds.extend(std::iter::repeat_n(EdgeKind::ByteRange, branch_count * 2));
+        let mut byte_starts = vec![0_u8; branch_count];
+        byte_starts.extend(roots);
+        byte_starts.extend(suffixes.iter().map(|&(start, _)| start));
+        let mut byte_ends = vec![0_u8; branch_count];
+        byte_ends.extend(roots);
+        byte_ends.extend(suffixes.iter().map(|&(_, end)| end));
+        let fragmented_partition = LinkedFrozenV4Graph {
+            label: "fragmented-correlated-partition",
+            raw: RawPlan {
+                start: 0,
+                roles,
+                edge_offsets,
+                edge_targets,
+                edge_kinds,
+                byte_starts,
+                byte_ends,
+            },
+            accepted: roots
+                .into_iter()
+                .zip(suffixes)
+                .map(|(root, (start, end))| vec![root, start + (end - start) / 2])
+                .collect(),
+            rejected: vec![roots[0], suffixes[1].0],
+            width: 2,
+            exact_root: true,
+        };
+
+        vec![converging_suffix, prefix_diamond, fragmented_partition]
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    fn linked_raw_ordered_accept(
+        raw: &fre_automata::RawPlan,
+        haystack: &[u8],
+        end: usize,
+        state: usize,
+        position: usize,
+        active: &mut Vec<(usize, usize)>,
+    ) -> Option<usize> {
+        use fre_automata::{EdgeKind, StateRole};
+
+        let role = *raw.roles.get(state)?;
+        if role == StateRole::Accept {
+            return Some(position);
+        }
+        if active.contains(&(state, position)) {
+            return None;
+        }
+        active.push((state, position));
+        let first = usize::try_from(*raw.edge_offsets.get(state)?).ok()?;
+        let last = usize::try_from(*raw.edge_offsets.get(state + 1)?).ok()?;
+        let mut accepted = None;
+        for edge in first..last {
+            let target = usize::try_from(*raw.edge_targets.get(edge)?).ok()?;
+            let next_position = match *raw.edge_kinds.get(edge)? {
+                EdgeKind::Epsilon if role == StateRole::Split => Some(position),
+                EdgeKind::ByteRange if role == StateRole::Consume => {
+                    if position >= end {
+                        None
+                    } else {
+                        haystack.get(position).copied().and_then(|byte| {
+                            let lower = *raw.byte_starts.get(edge)?;
+                            let upper = *raw.byte_ends.get(edge)?;
+                            (lower..=upper)
+                                .contains(&byte)
+                                .then(|| position.checked_add(1))
+                                .flatten()
+                        })
+                    }
+                }
+                _ => panic!("linked reference accepts only canonical assertion-free graphs"),
+            };
+            if let Some(next_position) = next_position
+                && let Some(found) = linked_raw_ordered_accept(
+                    raw,
+                    haystack,
+                    end,
+                    target,
+                    next_position,
+                    active,
+                )
+            {
+                accepted = Some(found);
+                break;
+            }
+        }
+        assert_eq!(active.pop(), Some((state, position)));
+        accepted
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    fn linked_raw_reference_span(
+        raw: &fre_automata::RawPlan,
+        haystack: &[u8],
+        window: SearchWindow,
+    ) -> Option<(usize, usize)> {
+        assert!(window.start() <= window.end());
+        assert!(window.end() <= haystack.len());
+        let start_state = usize::try_from(raw.start).ok()?;
+        for start in window.start()..=window.end() {
+            let mut active = Vec::new();
+            if let Some(end) = linked_raw_ordered_accept(
+                raw,
+                haystack,
+                window.end(),
+                start_state,
+                start,
+                &mut active,
+            ) {
+                return Some((start, end));
+            }
+        }
+        None
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    fn linked_frozen_v4_cases(
+        graph: &LinkedFrozenV4Graph,
+    ) -> Vec<(Vec<u8>, SearchWindow)> {
+        let length = DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES + 101;
+        let window = SearchWindow::new(7, length - 9);
+        let mut at_start = vec![b'!'; length];
+        at_start[window.start()..window.start() + graph.width]
+            .copy_from_slice(&graph.accepted[0]);
+
+        let mut after_false_root = vec![b'!'; length];
+        after_false_root[window.start() + 3..window.start() + 3 + graph.width]
+            .copy_from_slice(&graph.rejected);
+        after_false_root[window.start() + 29..window.start() + 29 + graph.width]
+            .copy_from_slice(&graph.accepted[1]);
+
+        let mut at_end = vec![b'!'; length];
+        at_end[window.end() - graph.width..window.end()]
+            .copy_from_slice(graph.accepted.last().unwrap());
+
+        let mut absent = vec![b'!'; length];
+        absent[window.start() + 17..window.start() + 17 + graph.width]
+            .copy_from_slice(&graph.rejected);
+
+        let mut outside = vec![b'!'; length];
+        outside[1..1 + graph.width].copy_from_slice(&graph.accepted[0]);
+
+        let mut leftmost = vec![b'!'; length];
+        leftmost[window.start() + 11..window.start() + 11 + graph.width]
+            .copy_from_slice(&graph.accepted[1]);
+        leftmost[window.start() + 41..window.start() + 41 + graph.width]
+            .copy_from_slice(&graph.accepted[0]);
+
+        vec![
+            (at_start, window),
+            (after_false_root, window),
+            (at_end, window),
+            (absent, window),
+            (outside, window),
+            (leftmost, window),
+        ]
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    #[ignore = "requires `cargo build -p fre-aot-regex-runtime --lib`; links first-call V4 root plans to the real runtime"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one linked fixture keeps independent graph interpretation, V4 ownership, first-call execution, and both endpoint contracts together"
+    )]
+    fn linked_host_frozen_v4_root_plans_execute_selected_end_and_span_on_first_call() {
+        use std::{fs, process::Command, time::SystemTime};
+
+        fn c_bytes(bytes: &[u8]) -> String {
+            bytes
+                .iter()
+                .map(u8::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+
+        fn expected_result(
+            output: OutputContract,
+            span: Option<(usize, usize)>,
+        ) -> MatchResult {
+            match output {
+                OutputContract::Exists => MatchResult::Exists(span.is_some()),
+                OutputContract::SelectedEnd => {
+                    MatchResult::SelectedEnd(span.map(|(_, end)| end))
+                }
+                OutputContract::Span => MatchResult::Span(span),
+            }
+        }
+
+        fn expected_native_result(
+            output: OutputContract,
+            span: Option<(usize, usize)>,
+        ) -> (u32, usize, usize) {
+            match (output, span) {
+                (_, None) => (0, 0, 0),
+                (OutputContract::Exists, Some(_)) => (1, 0, 0),
+                (OutputContract::SelectedEnd, Some((_, end))) => (1, end, end),
+                (OutputContract::Span, Some((start, end))) => (1, start, end),
+            }
+        }
+
+        let target = if cfg!(target_arch = "x86_64") {
+            if cfg!(target_os = "linux") {
+                Target::x86_64_linux()
+            } else {
+                Target::x86_64_macos()
+            }
+        } else if cfg!(target_os = "linux") {
+            Target::aarch64_linux()
+        } else {
+            Target::aarch64_macos()
+        };
+        let current_exe = std::env::current_exe().expect("current test executable");
+        let profile_dir = current_exe
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("Cargo profile directory");
+        let static_runtime = profile_dir.join("libfre_aot_regex_runtime.a");
+        assert!(
+            static_runtime.is_file(),
+            "build the linked runtime first: cargo build -p fre-aot-regex-runtime --lib ({})",
+            static_runtime.display()
+        );
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "fre-aot-frozen-v4-roots-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("create linked V4 root directory");
+
+        let mut saw_range_root = false;
+        let mut saw_exact_root = false;
+        for (graph_index, graph) in linked_frozen_v4_graphs().into_iter().enumerate() {
+            let automaton = fre_automata::Automaton::from_raw(
+                graph.raw.clone(),
+                fre_automata::CompileLimits::default(),
+            )
+            .unwrap_or_else(|error| panic!("validate {}: {error}", graph.label));
+            let cases = linked_frozen_v4_cases(&graph);
+            for (output_index, output) in [
+                OutputContract::SelectedEnd,
+                OutputContract::Span,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let program = CompiledProgram::build(
+                    graph.raw.clone(),
+                    automaton.clone(),
+                    output,
+                    CompileMode::Fast,
+                    DeterminizeLimits {
+                        max_states: 0,
+                        ..DeterminizeLimits::default()
+                    },
+                    usize::MAX,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("compile {}/{output:?}: {error}", graph.label)
+                });
+                assert!(program.native_dfa_view().is_none(), "{}", graph.label);
+                assert!(
+                    program.native_partial_dfa_view().is_none(),
+                    "{}",
+                    graph.label
+                );
+                assert!(
+                    !program.has_nfa_exact_product(),
+                    "the correlated {} graph must retain the general dynamic-row route",
+                    graph.label
+                );
+                let view = program
+                    .native_dynamic_rows_view()
+                    .unwrap_or_else(|| panic!("missing dynamic view for {}", graph.label));
+                assert_eq!(view.output, output, "{}", graph.label);
+                assert_eq!(
+                    view.exact_match_width,
+                    Some(graph.width),
+                    "{}",
+                    graph.label
+                );
+                let requirement = view
+                    .root_requirement
+                    .unwrap_or_else(|| panic!("missing root plan for {}", graph.label));
+                let plan = plan_dynamic_root_scanner(requirement)
+                    .unwrap_or_else(|error| panic!("plan {}: {error}", graph.label))
+                    .unwrap_or_else(|| panic!("declined root plan for {}", graph.label));
+                match plan {
+                    NativeDynamicRootPlan::Range(_) => {
+                        assert!(!graph.exact_root, "{}", graph.label);
+                        saw_range_root = true;
+                    }
+                    NativeDynamicRootPlan::Exact(_) => {
+                        assert!(graph.exact_root, "{}", graph.label);
+                        saw_exact_root = true;
+                    }
+                }
+
+                let workspace = program
+                    .prepare_workspace()
+                    .unwrap_or_else(|error| panic!("prepare {}: {error}", graph.label));
+                let storage = program
+                    .compiler_private_frozen_dynamic_rows_storage_v3(
+                        &workspace,
+                        512 * 1024,
+                        512 * 1024,
+                    )
+                    .unwrap_or_else(|| panic!("missing compact rows for {}", graph.label));
+                let header = program.compiler_private_frozen_prepared_header_v3(
+                    &workspace,
+                    None,
+                    Some(&storage),
+                );
+                assert!(header.is_active(), "{}", graph.label);
+                assert!(header.has_dynamic_rows(), "{}", graph.label);
+
+                let module = lower_without_materialized_k0(&program, target);
+                assert!(module.prepared_entry_symbol().is_some(), "{}", graph.label);
+                assert_ne!(
+                    module.start_accelerator(),
+                    StartAccelerator::None,
+                    "{}",
+                    graph.label
+                );
+                let entry = module.prepared_entry_symbol().unwrap();
+                let (program_symbol, program_len) = module
+                    .required_runtime_program()
+                    .expect("V4 root runtime program alias");
+                let object = directory.join(format!(
+                    "v4-{graph_index}-{output_index}.o"
+                ));
+                let object_bytes = crate::emit_object(
+                    &module,
+                    ObjectFormat::for_target(target),
+                    usize::MAX,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("emit {}/{output:?}: {error}", graph.label)
+                });
+                fs::write(&object, object_bytes).expect("write linked V4 object");
+
+                let mut source = String::from(
+                    "#include <stddef.h>\n#include <stdint.h>\n#include <string.h>\n\
+                     typedef void *handle_t;typedef struct{size_t start;size_t end;} result_t;\n",
+                );
+                writeln!(source, "extern const unsigned char {program_symbol}[];")
+                    .expect("write runtime program declaration");
+                writeln!(
+                    source,
+                    "extern uint32_t {entry}(handle_t,const unsigned char*,size_t,size_t,size_t,result_t*);"
+                )
+                .expect("write native entry declaration");
+                source.push_str(
+                    "extern uint32_t fre_aot_regex_runtime_prepare_exclusive_v1(const unsigned char*,size_t,handle_t*);\n\
+                     extern uint32_t fre_aot_regex_runtime_destroy_exclusive_v1(handle_t);\n",
+                );
+                writeln!(source, "#define PROGRAM_BYTES {program_symbol}")
+                    .expect("write program macro");
+                writeln!(source, "#define PROGRAM_LENGTH {program_len}U")
+                    .expect("write program length");
+                writeln!(source, "#define NATIVE_ENTRY {entry}").expect("write entry macro");
+                for (name, value) in [
+                    ("ACTIVE_OFFSET", FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL_OFFSET),
+                    ("MAGIC_OFFSET", FROZEN_PREPARED_HEADER_V1_MAGIC_OFFSET),
+                    ("ABI_OFFSET", FROZEN_PREPARED_HEADER_V1_ABI_VERSION_OFFSET),
+                    ("FLAGS_OFFSET", FROZEN_PREPARED_HEADER_V1_FLAGS_OFFSET),
+                    ("HEADER_BYTES_OFFSET", FROZEN_PREPARED_HEADER_V1_HEADER_BYTES_OFFSET),
+                    (
+                        "FORWARD_ROWS_OFFSET",
+                        FROZEN_PREPARED_HEADER_V1_FORWARD_ROWS_ADDRESS_OFFSET,
+                    ),
+                    (
+                        "FORWARD_CELLS_OFFSET",
+                        FROZEN_PREPARED_HEADER_V1_FORWARD_LIVE_CELLS_OFFSET,
+                    ),
+                    ("ROW_STRIDE_OFFSET", FROZEN_PREPARED_HEADER_V1_ROW_STRIDE_OFFSET),
+                    (
+                        "INITIAL_ROW_OFFSET",
+                        FROZEN_PREPARED_HEADER_V1_FORWARD_INITIAL_ROW_OFFSET,
+                    ),
+                    ("V4_TAIL_OFFSET", FROZEN_PREPARED_HEADER_V4_DYNAMIC_ROWS_OFFSET),
+                    ("V4_READY_OFFSET", FROZEN_DYNAMIC_ROWS_V3_READY_SEAL_OFFSET),
+                    ("V4_ROWS_OFFSET", FROZEN_DYNAMIC_ROWS_V3_ROWS_ADDRESS_OFFSET),
+                    ("V4_STATES_OFFSET", FROZEN_DYNAMIC_ROWS_V3_STATE_COUNT_OFFSET),
+                    ("V4_CLASSES_OFFSET", FROZEN_DYNAMIC_ROWS_V3_CLASS_COUNT_OFFSET),
+                    ("V4_SHIFT_OFFSET", FROZEN_DYNAMIC_ROWS_V3_ROW_SHIFT_OFFSET),
+                    ("V4_INITIAL_OFFSET", FROZEN_DYNAMIC_ROWS_V3_INITIAL_STATE_OFFSET),
+                    ("V4_FORMAT_OFFSET", FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION_OFFSET),
+                ] {
+                    writeln!(source, "#define {name} {value}U").expect("write V4 offset");
+                }
+                writeln!(
+                    source,
+                    "#define ACTIVE_SEAL UINT64_C({FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL})"
+                )
+                .expect("write active seal");
+                writeln!(
+                    source,
+                    "#define HEADER_MAGIC UINT64_C({FROZEN_PREPARED_HEADER_V1_MAGIC})"
+                )
+                .expect("write header magic");
+                writeln!(
+                    source,
+                    "#define HEADER_ABI UINT32_C({FROZEN_PREPARED_HEADER_V1_ABI_VERSION})"
+                )
+                .expect("write header ABI");
+                writeln!(
+                    source,
+                    "#define V4_FLAG UINT32_C({FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V4})"
+                )
+                .expect("write V4 flag");
+                writeln!(source, "#define V4_BYTES {FROZEN_PREPARED_HEADER_V4_BYTES}U")
+                    .expect("write V4 extent");
+                writeln!(
+                    source,
+                    "#define V4_READY_SEAL UINT64_C({FROZEN_PREPARED_HEADER_V4_READY_SEAL})"
+                )
+                .expect("write V4 ready seal");
+                writeln!(
+                    source,
+                    "#define V4_FORMAT UINT32_C({FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION})"
+                )
+                .expect("write V4 format");
+                // Every case owns a fresh prepared handle. The exact V4 flag,
+                // extent, format, geometry, and both publication seals are
+                // checked before its only generated call and again after it.
+                // Every mutable preflight, continuation, or fallback helper
+                // revokes those seals, so a surviving header proves that the
+                // first call actually completed in the immutable V4 loop.
+                source.push_str(
+                    r#"
+static uint32_t read_u32(handle_t h,size_t offset){uint32_t value=0;memcpy(&value,(const unsigned char*)h+offset,sizeof(value));return value;}
+static uint64_t read_u64(handle_t h,size_t offset){uint64_t value=0;memcpy(&value,(const unsigned char*)h+offset,sizeof(value));return value;}
+static size_t read_size(handle_t h,size_t offset){size_t value=0;memcpy(&value,(const unsigned char*)h+offset,sizeof(value));return value;}
+static int owns_v4(handle_t h){
+  if(h==NULL)return 0;
+  if(read_u64(h,ACTIVE_OFFSET)!=ACTIVE_SEAL||read_u64(h,MAGIC_OFFSET)!=HEADER_MAGIC)return 0;
+  if(read_u32(h,ABI_OFFSET)!=HEADER_ABI||read_u32(h,FLAGS_OFFSET)!=V4_FLAG)return 0;
+  if(read_size(h,HEADER_BYTES_OFFSET)!=V4_BYTES)return 0;
+  if(read_u64(h,V4_TAIL_OFFSET+V4_READY_OFFSET)!=V4_READY_SEAL)return 0;
+  if(read_u32(h,V4_TAIL_OFFSET+V4_FORMAT_OFFSET)!=V4_FORMAT)return 0;
+  if(read_u32(h,V4_TAIL_OFFSET+V4_SHIFT_OFFSET)!=0U)return 0;
+  size_t rows=read_size(h,V4_TAIL_OFFSET+V4_ROWS_OFFSET);
+  uint32_t states=read_u32(h,V4_TAIL_OFFSET+V4_STATES_OFFSET);
+  uint32_t classes=read_u32(h,V4_TAIL_OFFSET+V4_CLASSES_OFFSET);
+  uint32_t initial=read_u32(h,V4_TAIL_OFFSET+V4_INITIAL_OFFSET);
+  size_t cells=read_size(h,FORWARD_CELLS_OFFSET);
+  if(rows==0U||rows!=read_size(h,FORWARD_ROWS_OFFSET)||states==0U||classes==0U)return 0;
+  if(cells!=(size_t)states*(size_t)classes)return 0;
+  if(read_u32(h,ROW_STRIDE_OFFSET)!=classes)return 0;
+  return read_u32(h,INITIAL_ROW_OFFSET)==initial*classes;
+}
+static int prepare(handle_t *h){return fre_aot_regex_runtime_prepare_exclusive_v1(PROGRAM_BYTES,PROGRAM_LENGTH,h)==0U;}
+static int destroy(handle_t h){return fre_aot_regex_runtime_destroy_exclusive_v1(h)==0U;}
+static int run_case(const unsigned char *p,size_t n,size_t s,size_t e,uint32_t expected_status,size_t expected_start,size_t expected_end,int base){
+  handle_t h=0;result_t result={91U,92U};
+  if(!prepare(&h))return base;
+  if(!owns_v4(h)){destroy(h);return base+1;}
+  uint32_t status=NATIVE_ENTRY(h,p,n,s,e,&result);
+  if(status!=expected_status||result.start!=expected_start||result.end!=expected_end){destroy(h);return base+2;}
+  if(!owns_v4(h)){destroy(h);return base+3;}
+  if(!destroy(h))return base+4;
+  return 0;
+}
+"#,
+                );
+
+                let mut expected_cases = Vec::with_capacity(cases.len());
+                for (case_index, (haystack, window)) in cases.iter().enumerate() {
+                    let span = linked_raw_reference_span(&graph.raw, haystack, *window);
+                    let expected = expected_result(output, span);
+                    let mut oracle_workspace = program
+                        .prepare_workspace()
+                        .expect("prepare portable graph oracle workspace");
+                    assert_eq!(
+                        program
+                            .search_with_workspace(haystack, *window, &mut oracle_workspace)
+                            .expect("execute portable graph oracle"),
+                        expected,
+                        "{}/{output:?}/case {case_index}",
+                        graph.label
+                    );
+                    expected_cases.push(expected_native_result(output, span));
+                    writeln!(
+                        source,
+                        "static const unsigned char h{case_index}[]={{{}}};",
+                        c_bytes(haystack)
+                    )
+                    .expect("write V4 graph haystack");
+                }
+                source.push_str("int main(void){int status;\n");
+                for (case_index, ((haystack, window), expected)) in
+                    cases.iter().zip(&expected_cases).enumerate()
+                {
+                    let base = 10 + case_index * 10;
+                    writeln!(
+                        source,
+                        "status=run_case(h{case_index},sizeof(h{case_index}),{}U,{}U,{}U,{}U,{}U,{base});if(status!=0)return status;",
+                        window.start(),
+                        window.end(),
+                        expected.0,
+                        expected.1,
+                        expected.2,
+                    )
+                    .expect("write V4 graph case");
+                    assert_eq!(haystack.len(), DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES + 101);
+                }
+                source.push_str("return 0;}\n");
+
+                let c_path = directory.join(format!(
+                    "v4-{graph_index}-{output_index}.c"
+                ));
+                let executable = directory.join(format!(
+                    "v4-{graph_index}-{output_index}"
+                ));
+                fs::write(&c_path, source).expect("write linked V4 C harness");
+                let c_compiler = if cfg!(target_os = "macos") {
+                    "clang"
+                } else {
+                    "cc"
+                };
+                let status = Command::new(c_compiler)
+                    .arg("-O0")
+                    .arg(&c_path)
+                    .arg(&object)
+                    .arg(&static_runtime)
+                    .arg("-o")
+                    .arg(&executable)
+                    .status()
+                    .unwrap_or_else(|error| panic!("link {}/{output:?}: {error}", graph.label));
+                assert!(status.success(), "failed to link {}/{output:?}", graph.label);
+                let result = Command::new(&executable)
+                    .output()
+                    .unwrap_or_else(|error| panic!("execute {}/{output:?}: {error}", graph.label));
+                assert!(
+                    result.status.success(),
+                    "{}/{output:?}: status={:?} stdout={} stderr={}",
+                    graph.label,
+                    result.status.code(),
+                    String::from_utf8_lossy(&result.stdout),
+                    String::from_utf8_lossy(&result.stderr)
+                );
+            }
+        }
+        assert!(saw_range_root, "the fixture must execute a range root plan");
+        assert!(saw_exact_root, "the fixture must execute an exact-set root plan");
+        fs::remove_dir_all(&directory).expect("remove linked V4 root directory");
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
     #[test]
     #[ignore = "requires `cargo build -p fre-aot-regex-runtime --lib`; links the first-call frozen sidecar to the real runtime"]
     #[allow(
