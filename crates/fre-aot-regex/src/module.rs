@@ -46643,8 +46643,16 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 .iter()
                 .filter(|&&word| word == aarch64_load_h_uxtw(8, 11, 6).unwrap())
                 .count(),
-            21,
-            "V6/V8, both V3 cells for every shift, and the shared V3 scalar tail"
+            12,
+            "V6/V8, the first V3 cell for every shift, and the shared V3 scalar tail"
+        );
+        assert_eq!(
+            arm_words
+                .iter()
+                .filter(|&&word| word == aarch64_load_h_uxtw(8, 11, 10).unwrap())
+                .count(),
+            10,
+            "the second unrolled V3 cell for every shift plus paired V4 use their independently mapped classes"
         );
         assert_eq!(
             arm_words

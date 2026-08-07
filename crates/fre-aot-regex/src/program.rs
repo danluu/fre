@@ -22533,7 +22533,6 @@ mod tests {
         fn dense_pair_selected_end(rows: &[u16], input: &[u8]) -> Option<usize> {
             let class_count = 2_usize;
             let pair_cells = class_count * class_count;
-            let block_cells = pair_cells + 1;
             let mut block = 0_usize;
             let mut position = 0_usize;
             let mut selected_end = None;
@@ -24742,7 +24741,7 @@ mod tests {
             );
             let state_count = usize::try_from(broad_storage.descriptor.state_count).unwrap();
             let class_count = usize::try_from(broad_storage.descriptor.class_count).unwrap();
-            let (_, block_cells, total_cells, pair_bytes) =
+            let (_, _, _, pair_bytes) =
                 frozen_pair_rows_v13_geometry(state_count, class_count).unwrap();
             let storage = compiled
                 .compiler_private_frozen_dynamic_rows_storage_v3(
