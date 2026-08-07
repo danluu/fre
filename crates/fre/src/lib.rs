@@ -9054,6 +9054,21 @@ fn k0_absolute_end_window_is_proven_empty(
 }
 
 #[inline]
+fn k0_finite_minimum_window_is_proven_empty(
+    suffix: Option<&K0MandatorySuffixPlan>,
+    haystack_len: usize,
+    window: SearchWindow,
+) -> bool {
+    // Validate the complete public range before using this O(1) theorem.
+    // Invalid windows must still reach ordinary K0's authoritative error.
+    window.start() <= window.end()
+        && window.end() <= haystack_len
+        && suffix
+            .and_then(K0MandatorySuffixPlan::finite_minimum_match_bytes)
+            .is_some_and(|minimum| window.end() - window.start() < minimum)
+}
+
+#[inline]
 fn try_k0_absolute_end_exists(
     session: &mut K0SearchSession<'_>,
     proof: Option<K0AbsoluteEndProof>,
@@ -10123,7 +10138,9 @@ fn try_k0_universal_finite_greedy_suffix_endpoint(
     clippy::too_many_arguments,
     reason = "the universal finite corridor keeps its immutable geometry, floor, and adaptive state together"
 )]
-fn try_k0_universal_finite_mandatory_suffix_span_start(
+fn try_k0_universal_finite_mandatory_suffix_span_start<
+    const ITERATOR_CONTINUATION: bool,
+>(
     suffix: &K0MandatorySuffixPlan,
     minimum_match_bytes: usize,
     maximum_match_bytes: usize,
@@ -10152,8 +10169,9 @@ fn try_k0_universal_finite_mandatory_suffix_span_start(
     let Some(window_bytes) = window.end().checked_sub(window.start()) else {
         return Ok(unchanged(K0MandatorySuffixSpanOutcome::Bypass));
     };
-    if window_bytes < K0_NEGATIVE_PREFILTER_MIN_WINDOW_BYTES
-        || maximum_match_bytes > window_bytes / K0_SUFFIX_FINITE_WIDTH_WINDOW_FACTOR
+    if !ITERATOR_CONTINUATION
+        && (window_bytes < K0_NEGATIVE_PREFILTER_MIN_WINDOW_BYTES
+            || maximum_match_bytes > window_bytes / K0_SUFFIX_FINITE_WIDTH_WINDOW_FACTOR)
     {
         return Ok(unchanged(K0MandatorySuffixSpanOutcome::GeometryBypass));
     }
@@ -10162,7 +10180,9 @@ fn try_k0_universal_finite_mandatory_suffix_span_start(
     let mut next_state = state;
     let class_index = next_state.class_for(window_size_class);
     let class = &mut next_state.classes[class_index];
-    if class.next_predicate & K0_FINITE_SUFFIX_EXCEPTIONAL_ROUTE_MASK != 0 {
+    if class.next_predicate & K0_FINITE_SUFFIX_EXCEPTIONAL_ROUTE_MASK != 0
+        && !ITERATOR_CONTINUATION
+    {
         let decision = resolve_k0_universal_finite_suffix_route(class);
         match decision {
             K0UniversalFiniteSuffixRouteDecision::ContinueExact => {}
@@ -10215,9 +10235,10 @@ fn try_k0_universal_finite_mandatory_suffix_span_start(
     };
     let Some((occurrence_start, endpoint)) = occurrence else {
         let class = &mut next_state.classes[class_index];
-        if class.next_predicate
-            & K0_FINITE_SUFFIX_UNIVERSAL_INCUMBENT_CALIBRATION
-            != 0
+        if !ITERATOR_CONTINUATION
+            && class.next_predicate
+                & K0_FINITE_SUFFIX_UNIVERSAL_INCUMBENT_CALIBRATION
+                != 0
         {
             // The exact suffix remains authoritative while a failed
             // incumbent calibration drains its bounded retry clock. Preserve
@@ -10584,10 +10605,60 @@ fn try_k0_mandatory_suffix_span_start(
     limits: SearchLimits,
     finite_incumbent_candidate_floor: Option<usize>,
 ) -> Result<K0MandatorySuffixSpanAttempt, SearchError> {
+    try_k0_mandatory_suffix_span_start_with_universal_admission::<false>(
+        session,
+        suffix,
+        state,
+        haystack,
+        window,
+        limits,
+        finite_incumbent_candidate_floor,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "iteration retains the same suffix proof while relaxing only standalone performance geometry"
+)]
+fn try_k0_mandatory_suffix_span_start_for_iteration(
+    session: &mut K0SearchSession<'_>,
+    suffix: &K0MandatorySuffixPlan,
+    state: K0NegativePrefilterState,
+    haystack: &[u8],
+    window: SearchWindow,
+    limits: SearchLimits,
+    finite_incumbent_candidate_floor: Option<usize>,
+) -> Result<K0MandatorySuffixSpanAttempt, SearchError> {
+    try_k0_mandatory_suffix_span_start_with_universal_admission::<true>(
+        session,
+        suffix,
+        state,
+        haystack,
+        window,
+        limits,
+        finite_incumbent_candidate_floor,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "finite suffix admission carries the incumbent's sound candidate-floor evidence"
+)]
+fn try_k0_mandatory_suffix_span_start_with_universal_admission<
+    const ITERATOR_CONTINUATION: bool,
+>(
+    session: &mut K0SearchSession<'_>,
+    suffix: &K0MandatorySuffixPlan,
+    state: K0NegativePrefilterState,
+    haystack: &[u8],
+    window: SearchWindow,
+    limits: SearchLimits,
+    finite_incumbent_candidate_floor: Option<usize>,
+) -> Result<K0MandatorySuffixSpanAttempt, SearchError> {
     if let Some((minimum_match_bytes, maximum_match_bytes)) =
         suffix.universal_finite_match_byte_bounds()
     {
-        return try_k0_universal_finite_mandatory_suffix_span_start(
+        return try_k0_universal_finite_mandatory_suffix_span_start::<ITERATOR_CONTINUATION>(
             suffix,
             minimum_match_bytes,
             maximum_match_bytes,
@@ -12111,6 +12182,13 @@ impl<'r> PortableSearchSession<'r> {
             } => {
                 let absolute_end_proof = k0_plan.absolute_end_proof;
                 let correlated_terminal = k0_plan.correlated_terminal.as_ref();
+                if k0_finite_minimum_window_is_proven_empty(
+                    *mandatory_suffix,
+                    haystack.len(),
+                    window,
+                ) {
+                    return Ok(false);
+                }
                 if k0_absolute_end_window_is_proven_empty(
                     absolute_end_proof,
                     haystack.len(),
@@ -12618,11 +12696,19 @@ impl<'r> PortableSearchSession<'r> {
             PortableSearchSessionPlan::K0 {
                 session,
                 k0_plan,
+                mandatory_suffix,
                 correlated_terminal_earliest_end_state,
                 ..
             } => {
                 let absolute_end_proof = k0_plan.absolute_end_proof;
                 let correlated_terminal = k0_plan.correlated_terminal.as_ref();
+                if k0_finite_minimum_window_is_proven_empty(
+                    *mandatory_suffix,
+                    haystack.len(),
+                    window,
+                ) {
+                    return Ok(None);
+                }
                 if k0_absolute_end_window_is_proven_empty(
                     absolute_end_proof,
                     haystack.len(),
@@ -12953,6 +13039,13 @@ impl<'r> PortableSearchSession<'r> {
             } => {
                 let absolute_end_proof = k0_plan.absolute_end_proof;
                 let correlated_terminal = k0_plan.correlated_terminal.as_ref();
+                if k0_finite_minimum_window_is_proven_empty(
+                    *mandatory_suffix,
+                    haystack.len(),
+                    window,
+                ) {
+                    return Ok(None);
+                }
                 if k0_absolute_end_window_is_proven_empty(
                     absolute_end_proof,
                     haystack.len(),
@@ -13849,6 +13942,107 @@ impl<'r> PortableSearchSession<'r> {
         }
     }
 
+    fn find_iter_universal_finite_suffix_at(
+        &mut self,
+        haystack: &[u8],
+        start: usize,
+        limits: SearchLimits,
+    ) -> Option<Result<Option<Match>, SearchError>> {
+        let window = SearchWindow::new(start, haystack.len());
+        let PortableSearchSessionPlan::K0 {
+            session,
+            k0_plan,
+            mandatory_suffix,
+            mandatory_suffix_span_state,
+            ..
+        } = &mut self.plan
+        else {
+            return None;
+        };
+        let Some(suffix) = *mandatory_suffix else {
+            return None;
+        };
+        if suffix.universal_finite_match_byte_bounds().is_none() {
+            return None;
+        }
+        if k0_finite_minimum_window_is_proven_empty(Some(suffix), haystack.len(), window)
+            || k0_absolute_end_window_is_proven_empty(
+                k0_plan.absolute_end_proof,
+                haystack.len(),
+                window,
+            )
+        {
+            return Some(Ok(None));
+        }
+
+        // A positive-width iterator continuation owns a monotone residual
+        // window. The graph-proved universal corridor is exact there even
+        // when the standalone 1-KiB/4x performance heuristic declines. Keep
+        // this separate entry point so standalone search retains its original
+        // linked hot path and the compiler specializes the proof mode.
+        let mut suffix_state_after_success = *mandatory_suffix_span_state;
+        let suffix_attempt = match try_k0_mandatory_suffix_span_start_for_iteration(
+            session,
+            suffix,
+            suffix_state_after_success,
+            haystack,
+            window,
+            limits,
+            None,
+        ) {
+            Ok(attempt) => attempt,
+            Err(error) => return Some(Err(error)),
+        };
+        suffix_state_after_success = suffix_attempt.state_after_success;
+        let result = match suffix_attempt.outcome {
+            K0MandatorySuffixSpanOutcome::ProvedAbsent => Ok(None),
+            K0MandatorySuffixSpanOutcome::ProvedSpan { start, end } => {
+                Ok(Some(Match { start, end }))
+            }
+            K0MandatorySuffixSpanOutcome::ProvedStart {
+                start,
+                maximum_match_bytes,
+            } => match replay_k0_finite_proved_start_with_exact_receipt(
+                session,
+                haystack,
+                window,
+                limits,
+                start,
+                maximum_match_bytes,
+            ) {
+                Ok((output, exact_receipt)) => {
+                    if !exact_receipt {
+                        observe_k0_finite_suffix_span_replay_fallback(
+                            &mut suffix_state_after_success,
+                            window,
+                        );
+                    }
+                    Ok(output)
+                }
+                Err(error) => Err(error),
+            },
+            K0MandatorySuffixSpanOutcome::Fallback
+            | K0MandatorySuffixSpanOutcome::Bypass
+            | K0MandatorySuffixSpanOutcome::GeometryBypass
+            | K0MandatorySuffixSpanOutcome::UniversalIncumbent { .. }
+            | K0MandatorySuffixSpanOutcome::Absent
+            | K0MandatorySuffixSpanOutcome::Narrowed(_)
+            | K0MandatorySuffixSpanOutcome::Incumbent { .. } => session
+                .search_span_value(haystack, window, limits)
+                .map(|found| {
+                    found.map(|span| Match {
+                        start: span.start(),
+                        end: span.end(),
+                    })
+                })
+                .map_err(SearchError::from),
+        };
+        if result.is_ok() {
+            *mandatory_suffix_span_state = suffix_state_after_success;
+        }
+        Some(result)
+    }
+
     fn find_iter_value_at(
         &mut self,
         source: &mut K0SpanSourceCursor<'_>,
@@ -13879,6 +14073,12 @@ impl<'r> PortableSearchSession<'r> {
                 start: span.start(),
                 end: span.end(),
             }));
+        }
+        if start != 0
+            && let Some(result) =
+                self.find_iter_universal_finite_suffix_at(source.haystack(), start, limits)
+        {
+            return result;
         }
         self.find_at_value(source.haystack(), start, limits)
     }
@@ -14736,6 +14936,7 @@ mod tests {
         try_build_k0_mandatory_suffix,
         try_box_bounded_literal_class_run_owner, try_k0_mandatory_suffix_exists,
         try_k0_mandatory_suffix_span_start,
+        try_k0_mandatory_suffix_span_start_for_iteration,
         ASCII_RUN_SCANNER_BUILD_WORK, BYTE_SET_BLOCK_BYTES, K0_FINITE_SUFFIX_INCUMBENT_ROUTE,
         K0_FINITE_SUFFIX_SINGLE_PASS_NEGATIVE,
     };
@@ -18791,6 +18992,180 @@ mod tests {
     }
 
     #[test]
+    fn universal_corridor_iteration_closes_short_residuals_across_source_mutation() {
+        const PATTERN: &str = r"(?s-u:(?:[\x00-\x1F]|[^\x00-\x1F]){8,128}(?:[A-Za-z0-9_]|[^A-Za-z0-9_]){8,128}(?:[\x00-\x7F]|[\x80-\xFF]){16,256}.{32,512}SUFFIX88)";
+        const SUFFIX: &[u8] = b"SUFFIX88";
+        let regex = forced_k0_with_structural_mandatory_suffix(PATTERN);
+        let upstream = regex::bytes::RegexBuilder::new(PATTERN).build().unwrap();
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("large-corridor iteration session constructs");
+        let mut haystack = vec![b'q'; 8_192];
+        let address = haystack.as_ptr();
+
+        // One late maximum-width match leaves a 1,016-byte terminal tail:
+        // below both standalone admission gates, but still covered by the
+        // immutable universal-corridor theorem.
+        haystack[7_168..7_176].copy_from_slice(SUFFIX);
+        {
+            let mut early = session
+                .find_iter_value(&haystack, PortableFindIterRunLimits::unlimited());
+            assert_eq!(
+                early.next().unwrap().unwrap(),
+                Match {
+                    start: 6_144,
+                    end: 7_176,
+                },
+            );
+        }
+        let sparse: Vec<_> = session
+            .find_iter_value(&haystack, PortableFindIterRunLimits::unlimited())
+            .map(|matched| matched.unwrap())
+            .collect();
+        assert_eq!(
+            sparse,
+            vec![Match {
+                start: 6_144,
+                end: 7_176,
+            }],
+        );
+        let PortableSearchSessionPlan::K0 {
+            mandatory_suffix_span_state,
+            ..
+        } = &session.plan
+        else {
+            panic!("large-corridor iteration session lost K0")
+        };
+        assert!(mandatory_suffix_span_state.classes.iter().any(|class| {
+            class.window_size_class == Some(usize::BITS - 1_016usize.leading_zeros())
+        }));
+
+        // Reuse the same allocation and session for a dense population that
+        // crosses the admission boundary multiple times. Compare the whole
+        // selected sequence with the independent regex implementation.
+        haystack.fill(b'q');
+        let mut suffix_start = 1_024usize;
+        while suffix_start + SUFFIX.len() <= haystack.len() {
+            haystack[suffix_start..suffix_start + SUFFIX.len()].copy_from_slice(SUFFIX);
+            suffix_start = suffix_start.saturating_add(1_063);
+        }
+        assert_eq!(haystack.as_ptr(), address);
+        let expected: Vec<_> = upstream
+            .find_iter(&haystack)
+            .map(|matched| Match {
+                start: matched.start(),
+                end: matched.end(),
+            })
+            .collect();
+        let actual: Vec<_> = session
+            .find_iter_value(&haystack, PortableFindIterRunLimits::unlimited())
+            .map(|matched| matched.unwrap())
+            .collect();
+        assert_eq!(actual, expected);
+
+        // A second immutable plan at the same source address remains wholly
+        // independent, and removing every suffix invalidates no retained
+        // source position because this route keeps none.
+        let other_pattern = PATTERN.replace("SUFFIX88", "OTHER888");
+        let other = forced_k0_with_structural_mandatory_suffix(&other_pattern);
+        let mut other_session = other
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("cross-plan continuation session constructs");
+        assert!(other_session
+            .find_iter_value(&haystack, PortableFindIterRunLimits::unlimited())
+            .next()
+            .is_none());
+        haystack.fill(b'q');
+        assert_eq!(haystack.as_ptr(), address);
+        assert!(session
+            .find_iter_value(&haystack, PortableFindIterRunLimits::unlimited())
+            .next()
+            .is_none());
+    }
+
+    #[test]
+    fn universal_corridor_iteration_does_not_retain_inadmissible_calibration() {
+        const PATTERN: &str = r"(?s-u:(?:[\x00-\x1F]|[^\x00-\x1F]){8,128}(?:[A-Za-z0-9_]|[^A-Za-z0-9_]){8,128}(?:[\x00-\x7F]|[\x80-\xFF]){16,256}.{32,512}SUFFIX88)";
+        const MATCH_END: usize = 6_192;
+        const TAIL_BYTES: usize = 2_000;
+        let regex = forced_k0_with_structural_suffix_and_negative_prefilter(PATTERN);
+        let PortablePlan::K0(plan) = &regex.plan else {
+            panic!("calibration fixture did not retain K0")
+        };
+        assert!(plan.negative_prefilter.is_some());
+        let mut haystack = vec![b'q'; MATCH_END + TAIL_BYTES];
+        haystack[MATCH_END - 8..MATCH_END].copy_from_slice(b"SUFFIX88");
+        let expected = vec![Match {
+            start: MATCH_END - 1_032,
+            end: MATCH_END,
+        }];
+        let tail_window = SearchWindow::new(MATCH_END, haystack.len());
+        let tail_size_class = usize::BITS - TAIL_BYTES.leading_zeros();
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("calibration iteration session constructs");
+
+        let first: Vec<_> = session
+            .find_iter_value(&haystack, PortableFindIterRunLimits::unlimited())
+            .map(|matched| matched.unwrap())
+            .collect();
+        assert_eq!(first, expected);
+        let PortableSearchSessionPlan::K0 {
+            mandatory_suffix_span_state,
+            ..
+        } = &mut session.plan
+        else {
+            panic!("calibration iteration session lost K0")
+        };
+        let tail_class = mandatory_suffix_span_state
+            .classes
+            .iter()
+            .position(|class| class.window_size_class == Some(tail_size_class))
+            .expect("relaxed terminal proof retains its size class");
+        assert_eq!(
+            mandatory_suffix_span_state.classes[tail_class].next_predicate
+                & super::K0_FINITE_SUFFIX_UNIVERSAL_INCUMBENT_MASK,
+            0,
+            "a width-relaxed continuation must not schedule an incumbent that rejects its geometry",
+        );
+
+        // Model a calibration retained earlier by another window in this
+        // coarse size class. Continuation owns the exact graph theorem, so it
+        // must ignore and clear that performance-only route instead of
+        // falling into K0 for every repeated iterator.
+        super::schedule_k0_universal_finite_suffix_incumbent_calibration(
+            mandatory_suffix_span_state,
+            tail_window,
+        );
+        assert_ne!(
+            mandatory_suffix_span_state.classes[tail_class].next_predicate
+                & super::K0_FINITE_SUFFIX_UNIVERSAL_INCUMBENT_CALIBRATION,
+            0,
+        );
+        let second: Vec<_> = session
+            .find_iter_value(&haystack, PortableFindIterRunLimits::unlimited())
+            .map(|matched| matched.unwrap())
+            .collect();
+        assert_eq!(second, expected);
+        let PortableSearchSessionPlan::K0 {
+            mandatory_suffix_span_state,
+            ..
+        } = &session.plan
+        else {
+            panic!("calibration iteration session lost K0 after replay")
+        };
+        assert_eq!(
+            mandatory_suffix_span_state.classes[tail_class].next_predicate
+                & super::K0_FINITE_SUFFIX_UNIVERSAL_INCUMBENT_MASK,
+            0,
+        );
+        assert_eq!(
+            mandatory_suffix_span_state.classes[tail_class].disabled_calls,
+            0,
+        );
+    }
+
+    #[test]
     fn structural_greedy_corridor_does_not_change_lazy_or_ordered_priority() {
         for pattern in [r"(?s-u:.{1,4}?Z)", r"(?s-u:(?:.{1}|.{3})Z)"] {
             let regex = forced_k0_with_bound_hir_mandatory_suffix(pattern);
@@ -18802,6 +19177,68 @@ mod tests {
                 .as_ref()
                 .expect("priority-refusal fixture retains its graph suffix");
             assert!(!suffix.has_universal_finite_greedy_corridor());
+        }
+    }
+
+    #[test]
+    fn universal_corridor_iteration_continuation_preserves_selected_end_priority() {
+        for pattern in [
+            r"(?s-u:.{1,4}?Z)",
+            r"(?s-u:(?:.{1}|.{2}|.{3})Z)",
+        ] {
+            let regex = forced_k0_with_bound_hir_mandatory_suffix(pattern);
+            let PortablePlan::K0(plan) = &regex.plan else {
+                panic!("priority continuation fixture did not retain K0: {pattern:?}");
+            };
+            assert!(plan
+                .mandatory_suffix
+                .as_ref()
+                .and_then(K0MandatorySuffixPlan::universal_finite_match_byte_bounds)
+                .is_some());
+            let upstream = regex::bytes::RegexBuilder::new(pattern).build().unwrap();
+            let mut haystack = vec![b'q'; 512];
+            haystack[100..104].copy_from_slice(b"ZZZZ");
+            let mut proof_session = regex
+                .search_session(SearchSessionLimits::unlimited())
+                .expect("priority proof session constructs");
+            let PortableSearchSessionPlan::K0 {
+                session: k0_session,
+                mandatory_suffix: Some(suffix),
+                ..
+            } = &mut proof_session.plan
+            else {
+                panic!("priority proof session did not retain K0")
+            };
+            let continuation = try_k0_mandatory_suffix_span_start_for_iteration(
+                k0_session,
+                suffix,
+                K0NegativePrefilterState::default(),
+                &haystack,
+                SearchWindow::new(99, haystack.len()),
+                SearchLimits::unlimited(),
+                None,
+            )
+            .unwrap();
+            assert!(matches!(
+                continuation.outcome,
+                K0MandatorySuffixSpanOutcome::ProvedStart { start: 99, .. }
+            ));
+            let expected: Vec<_> = upstream
+                .find_iter(&haystack)
+                .map(|matched| Match {
+                    start: matched.start(),
+                    end: matched.end(),
+                })
+                .collect();
+            let mut session = regex
+                .search_session(SearchSessionLimits::unlimited())
+                .expect("priority continuation session constructs");
+            let actual: Vec<_> = session
+                .find_iter_value(&haystack, PortableFindIterRunLimits::unlimited())
+                .map(|matched| matched.unwrap())
+                .collect();
+            assert_eq!(actual, expected, "pattern={pattern:?}");
+            assert!(actual.len() >= 2, "fixture must exercise a positive continuation");
         }
     }
 
@@ -19333,6 +19770,59 @@ mod tests {
     }
 
     #[test]
+    fn finite_minimum_proves_short_value_windows_empty_without_touching_k0() {
+        let regex = forced_k0_with_only_mandatory_suffix(r"(?s-u:.{4,16}XYZ)");
+        let mut haystack = vec![b'!'; 64];
+        let limited = SearchLimits {
+            max_work: 0,
+            max_scratch_bytes: 0,
+        };
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("finite-minimum session constructs");
+
+        // The retained graph proof has minimum width seven. A six-byte tail
+        // is therefore empty without consulting K0 or consuming search work.
+        assert_eq!(
+            session.find_at_value(&haystack, 58, limited).unwrap(),
+            None,
+        );
+        assert!(!session.is_match_value_at(&haystack, 58, limited).unwrap());
+        assert_eq!(
+            session
+                .shortest_match_at_value(&haystack, 58, limited)
+                .unwrap(),
+            None,
+        );
+        let PortableSearchSessionPlan::K0 {
+            mandatory_suffix_exists_state,
+            mandatory_suffix_span_state,
+            ..
+        } = &session.plan
+        else {
+            panic!("finite-minimum session did not retain K0")
+        };
+        assert_eq!(
+            (*mandatory_suffix_exists_state, *mandatory_suffix_span_state),
+            (
+                K0NegativePrefilterState::default(),
+                K0NegativePrefilterState::default(),
+            ),
+        );
+
+        // Range validation remains authoritative, and equality with the
+        // minimum is not misclassified as an empty window.
+        assert!(session.find_at_value(&haystack, 65, limited).is_err());
+        haystack[61..64].copy_from_slice(b"XYZ");
+        assert_eq!(
+            session
+                .find_at_value(&haystack, 57, SearchLimits::unlimited())
+                .unwrap(),
+            Some(Match { start: 57, end: 64 }),
+        );
+    }
+
+    #[test]
     fn universal_finite_corridor_finite_search_limits_bypass_transactionally() {
         let regex = forced_k0_with_only_mandatory_suffix(r"(?s-u:.{4,16}XYZ)");
         let mut haystack = vec![b'!'; 4_096];
@@ -19473,6 +19963,167 @@ mod tests {
                 K0NegativePrefilterState::default(),
             ),
             "a refused authoritative Exists fallback publishes no adaptive state",
+        );
+    }
+
+    #[test]
+    fn universal_finite_corridor_iteration_relaxes_only_performance_geometry() {
+        let short = forced_k0_with_only_mandatory_suffix(r"(?s-u:.{4,16}XYZ)");
+        let short_haystack = vec![b'!'; 1_024];
+        let mut short_session = short
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("short continuation session constructs");
+        let PortableSearchSessionPlan::K0 {
+            session: k0_session,
+            mandatory_suffix: Some(suffix),
+            ..
+        } = &mut short_session.plan
+        else {
+            panic!("short continuation session did not retain K0")
+        };
+        let short_window = SearchWindow::new(0, 512);
+        let standalone = try_k0_mandatory_suffix_span_start(
+            k0_session,
+            suffix,
+            K0NegativePrefilterState::default(),
+            &short_haystack,
+            short_window,
+            SearchLimits::unlimited(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            standalone.outcome,
+            K0MandatorySuffixSpanOutcome::GeometryBypass,
+        );
+        let continuation = try_k0_mandatory_suffix_span_start_for_iteration(
+            k0_session,
+            suffix,
+            K0NegativePrefilterState::default(),
+            &short_haystack,
+            short_window,
+            SearchLimits::unlimited(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            continuation.outcome,
+            K0MandatorySuffixSpanOutcome::ProvedAbsent,
+        );
+        let limited = try_k0_mandatory_suffix_span_start_for_iteration(
+            k0_session,
+            suffix,
+            K0NegativePrefilterState::default(),
+            &short_haystack,
+            short_window,
+            SearchLimits {
+                max_work: 0,
+                max_scratch_bytes: 0,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(limited.outcome, K0MandatorySuffixSpanOutcome::Bypass);
+        assert_eq!(
+            limited.state_after_success,
+            K0NegativePrefilterState::default(),
+        );
+
+        // At the standalone size boundary the old route remains unchanged.
+        let below_size_boundary = try_k0_mandatory_suffix_span_start(
+            k0_session,
+            suffix,
+            K0NegativePrefilterState::default(),
+            &short_haystack,
+            SearchWindow::new(0, 1_023),
+            SearchLimits::unlimited(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            below_size_boundary.outcome,
+            K0MandatorySuffixSpanOutcome::GeometryBypass,
+        );
+        let at_size_boundary = try_k0_mandatory_suffix_span_start(
+            k0_session,
+            suffix,
+            K0NegativePrefilterState::default(),
+            &short_haystack,
+            SearchWindow::new(0, 1_024),
+            SearchLimits::unlimited(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            at_size_boundary.outcome,
+            K0MandatorySuffixSpanOutcome::ProvedAbsent,
+        );
+
+        let wide = forced_k0_with_only_mandatory_suffix(r"(?s-u:.{4,300}XYZ)");
+        let mut wide_haystack = vec![b'!'; 1_212];
+        wide_haystack[900..903].copy_from_slice(b"XYZ");
+        let mut wide_session = wide
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("wide continuation session constructs");
+        let PortableSearchSessionPlan::K0 {
+            session: k0_session,
+            mandatory_suffix: Some(suffix),
+            ..
+        } = &mut wide_session.plan
+        else {
+            panic!("wide continuation session did not retain K0")
+        };
+        assert_eq!(
+            suffix.universal_finite_match_byte_bounds(),
+            Some((7, 303)),
+        );
+        let width_bypass = try_k0_mandatory_suffix_span_start(
+            k0_session,
+            suffix,
+            K0NegativePrefilterState::default(),
+            &wide_haystack,
+            SearchWindow::new(0, 1_211),
+            SearchLimits::unlimited(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            width_bypass.outcome,
+            K0MandatorySuffixSpanOutcome::GeometryBypass,
+        );
+        let continuation = try_k0_mandatory_suffix_span_start_for_iteration(
+            k0_session,
+            suffix,
+            K0NegativePrefilterState::default(),
+            &wide_haystack,
+            SearchWindow::new(0, 1_211),
+            SearchLimits::unlimited(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            continuation.outcome,
+            K0MandatorySuffixSpanOutcome::ProvedSpan {
+                start: 600,
+                end: 903,
+            },
+        );
+        let at_width_boundary = try_k0_mandatory_suffix_span_start(
+            k0_session,
+            suffix,
+            K0NegativePrefilterState::default(),
+            &wide_haystack,
+            SearchWindow::new(0, 1_212),
+            SearchLimits::unlimited(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            at_width_boundary.outcome,
+            K0MandatorySuffixSpanOutcome::ProvedSpan {
+                start: 600,
+                end: 903,
+            },
         );
     }
 
