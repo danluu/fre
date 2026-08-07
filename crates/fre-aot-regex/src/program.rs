@@ -2566,7 +2566,7 @@ pub struct FrozenPreparedHeaderV2 {
     dynamic_rows_v1: DynamicNativeRowsV1,
 }
 
-/// Additive prepared-header storage for one immutable padded compact table.
+/// Additive prepared-header storage for one immutable compact table.
 ///
 /// The complete V1 record remains the offset-zero prefix. Its distinct flag
 /// and exact extent select this tail before any overlapping V2 field is read;
@@ -2584,12 +2584,14 @@ pub struct FrozenPreparedHeaderV3 {
     dynamic_rows_v3: FrozenDynamicRowsV3,
 }
 
-/// Immutable compact-row descriptor stored in the additive V3 tail.
+/// Immutable compact-row descriptor stored in the additive compact tail.
 ///
-/// Rows contain padded power-of-two arrays of little-endian `u16` cells. Bit
-/// 15 is acceptance and bits 0..14 hold a one-based destination-state
-/// ordinal; zero is the closed dead transition. The raw-byte class map stays
-/// inline in the V1 prefix, so the hot loop follows only the rows pointer.
+/// Format V3 rows contain padded power-of-two arrays whose low 15 bits hold a
+/// one-based destination-state ordinal. Format V4 rows are unpadded and hold
+/// the one-based destination cell-row offset directly. Both formats retain
+/// acceptance in bit 15 and zero as the closed dead transition. The exact V1
+/// flag, format version, ready seal, and geometry distinguish the overlapping
+/// interpretations before generated code follows the rows pointer.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[repr(C)]
@@ -2622,7 +2624,7 @@ pub struct FrozenDynamicRowsStorage {
     descriptor: DynamicNativeRowsV1,
 }
 
-/// Pointer-stable immutable ownership for a padded compact V3 table.
+/// Pointer-stable immutable ownership for a compact V3 or V4 table.
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct FrozenDynamicRowsStorageV3 {
@@ -2657,6 +2659,9 @@ pub const FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS: u32 = 1 << 3;
 /// An authenticated immutable [`FrozenDynamicRowsV3`] tail is present.
 #[doc(hidden)]
 pub const FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3: u32 = 1 << 4;
+/// An authenticated immutable cell-offset V4 tail is present.
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V4: u32 = 1 << 5;
 /// Sentinel used when no reverse root row exists.
 #[doc(hidden)]
 pub const FROZEN_PREPARED_HEADER_V1_NO_REVERSE_ROW: u32 = u32::MAX;
@@ -2753,9 +2758,22 @@ pub const FROZEN_PREPARED_HEADER_V3_BYTES: usize = std::mem::size_of::<FrozenPre
 /// Final publication seal for a fully initialized V3 tail.
 #[doc(hidden)]
 pub const FROZEN_PREPARED_HEADER_V3_READY_SEAL: u64 = 0x4f2b_d1a9_763c_85e7;
+/// Final publication seal for a fully initialized cell-offset V4 tail.
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V4_READY_SEAL: u64 = 0x9bc7_520e_41ad_f638;
 /// Exact compact tail format selected by the V3 flag and extent.
 #[doc(hidden)]
 pub const FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION: u32 = 3;
+/// Exact unpadded cell-offset tail format selected by the V4 flag and extent.
+#[doc(hidden)]
+pub const FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION: u32 = 4;
+/// V4 reuses the additive compact envelope without changing V3's byte ABI.
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V4_DYNAMIC_ROWS_OFFSET: usize =
+    FROZEN_PREPARED_HEADER_V3_DYNAMIC_ROWS_OFFSET;
+/// V4 reuses the additive compact envelope without changing V3's byte ABI.
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V4_BYTES: usize = FROZEN_PREPARED_HEADER_V3_BYTES;
 /// Closed dead transition in a compact V3 row.
 #[doc(hidden)]
 pub const DYNAMIC_NATIVE_ROWS_V3_DEAD_CELL: u16 = 0;
@@ -2765,6 +2783,52 @@ pub const DYNAMIC_NATIVE_ROWS_V3_ACCEPT_MASK: u16 = 1 << 15;
 /// One-based destination-state field in a compact V3 row.
 #[doc(hidden)]
 pub const DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK: u16 = (1 << 15) - 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FrozenCompactRowsFormat {
+    StateOrdinalV3,
+    CellOffsetV4,
+}
+
+impl FrozenCompactRowsFormat {
+    const fn format_version(self) -> u32 {
+        match self {
+            Self::StateOrdinalV3 => FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION,
+            Self::CellOffsetV4 => FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION,
+        }
+    }
+
+    const fn ready_seal(self) -> u64 {
+        match self {
+            Self::StateOrdinalV3 => FROZEN_PREPARED_HEADER_V3_READY_SEAL,
+            Self::CellOffsetV4 => FROZEN_PREPARED_HEADER_V4_READY_SEAL,
+        }
+    }
+
+    const fn header_flag(self) -> u32 {
+        match self {
+            Self::StateOrdinalV3 => FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3,
+            Self::CellOffsetV4 => FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V4,
+        }
+    }
+}
+
+fn select_frozen_compact_rows_format(
+    state_count: usize,
+    class_count: usize,
+) -> Option<FrozenCompactRowsFormat> {
+    let live_cells = state_count.checked_mul(class_count)?;
+    if state_count == 0 || class_count == 0 || class_count > 256 {
+        return None;
+    }
+    if live_cells <= usize::from(DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK) {
+        Some(FrozenCompactRowsFormat::CellOffsetV4)
+    } else if state_count <= usize::from(DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK) {
+        Some(FrozenCompactRowsFormat::StateOrdinalV3)
+    } else {
+        None
+    }
+}
 
 /// V3 tail field offsets used by target-native lowering.
 #[doc(hidden)]
@@ -2835,6 +2899,17 @@ const _: () = {
     assert!(
         FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION_OFFSET < std::mem::size_of::<FrozenDynamicRowsV3>()
     );
+    assert!(
+        FROZEN_PREPARED_HEADER_V4_DYNAMIC_ROWS_OFFSET
+            == FROZEN_PREPARED_HEADER_V3_DYNAMIC_ROWS_OFFSET
+    );
+    assert!(FROZEN_PREPARED_HEADER_V4_BYTES == FROZEN_PREPARED_HEADER_V3_BYTES);
+    assert!(
+        FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V4
+            != FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3
+    );
+    assert!(FROZEN_PREPARED_HEADER_V4_READY_SEAL != FROZEN_PREPARED_HEADER_V3_READY_SEAL);
+    assert!(FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION != FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION);
 };
 
 #[cfg(target_pointer_width = "64")]
@@ -2848,6 +2923,7 @@ const _: () = {
     assert!(FROZEN_PREPARED_HEADER_V3_DYNAMIC_ROWS_OFFSET == 384);
     assert!(std::mem::size_of::<FrozenDynamicRowsV3>() == 64);
     assert!(FROZEN_PREPARED_HEADER_V3_BYTES == 448);
+    assert!(FROZEN_PREPARED_HEADER_V4_BYTES == 448);
 };
 
 impl FrozenPreparedHeaderV1 {
@@ -2954,23 +3030,33 @@ impl FrozenPreparedHeaderV3 {
         self.v1.artifact_identity()
     }
 
-    /// Return whether the active header owns the padded compact V3 sidecar.
+    /// Return whether the active header owns an authenticated compact sidecar.
     #[doc(hidden)]
     #[must_use]
     pub const fn has_dynamic_rows(&self) -> bool {
-        self.v1.is_active()
-            && self.v1.flags == FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3
-            && self.v1.header_bytes == FROZEN_PREPARED_HEADER_V3_BYTES
-            && self.dynamic_rows_v3.ready_seal == FROZEN_PREPARED_HEADER_V3_READY_SEAL
+        if !self.v1.is_active() || self.v1.header_bytes != FROZEN_PREPARED_HEADER_V3_BYTES {
+            return false;
+        }
+        match self.v1.flags {
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3 => {
+                self.dynamic_rows_v3.format_version == FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION
+                    && self.dynamic_rows_v3.ready_seal == FROZEN_PREPARED_HEADER_V3_READY_SEAL
+            }
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V4 => {
+                self.dynamic_rows_v3.format_version == FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION
+                    && self.dynamic_rows_v3.ready_seal == FROZEN_PREPARED_HEADER_V4_READY_SEAL
+            }
+            _ => false,
+        }
     }
 
     /// Permanently revoke every projection published through this header.
     #[doc(hidden)]
     pub fn deactivate(&mut self) {
         // Clear the offset-zero authorization first. A native entry always
-        // authenticates it before following or interpreting the V3 tail. All
-        // geometry remains write-once, so an active seal is also a capability
-        // for the setup-validated immutable geometry.
+        // authenticates it before following or interpreting the compact V3/V4
+        // tail. All geometry remains write-once, so an active seal is also a
+        // capability for the setup-validated immutable geometry.
         self.v1.deactivate();
         self.dynamic_rows_v3.ready_seal = 0;
     }
@@ -3103,14 +3189,37 @@ impl FrozenDynamicRowsStorageV3 {
         let Ok(class_count) = usize::try_from(rows.class_count) else {
             return false;
         };
-        let row_shift = rows.row_shift;
         let Ok(initial_state) = usize::try_from(rows.initial_state) else {
             return false;
         };
-        let Some(cell_shift) = row_shift.checked_sub(1) else {
-            return false;
+        let format = match rows.format_version {
+            FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION => FrozenCompactRowsFormat::StateOrdinalV3,
+            FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION => FrozenCompactRowsFormat::CellOffsetV4,
+            _ => return false,
         };
-        let Some(physical_cells) = 1_usize.checked_shl(cell_shift) else {
+        let physical_cells = match format {
+            FrozenCompactRowsFormat::StateOrdinalV3 => {
+                let Some(cell_shift) = rows.row_shift.checked_sub(1) else {
+                    return false;
+                };
+                let Some(physical_cells) = 1_usize.checked_shl(cell_shift) else {
+                    return false;
+                };
+                if class_count.checked_next_power_of_two() != Some(physical_cells)
+                    || rows.row_shift > 9
+                {
+                    return false;
+                }
+                physical_cells
+            }
+            FrozenCompactRowsFormat::CellOffsetV4 => {
+                if rows.row_shift != 0 {
+                    return false;
+                }
+                class_count
+            }
+        };
+        let Some(live_cells) = state_count.checked_mul(physical_cells) else {
             return false;
         };
         if self.program_instance != identity.instance
@@ -3119,22 +3228,23 @@ impl FrozenDynamicRowsStorageV3 {
             || rows.rows_address != self.rows.as_ptr().expose_provenance()
             || rows.cache_identity == 0
             || state_count == 0
-            || state_count
-                > usize::from(DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK)
             || class_count == 0
             || class_count > 256
-            || class_count.checked_next_power_of_two() != Some(physical_cells)
-            || row_shift > 9
-            || state_count
-                .checked_mul(physical_cells)
-                .is_none_or(|cells| cells != self.rows.len())
+            || live_cells != self.rows.len()
+            || match format {
+                FrozenCompactRowsFormat::StateOrdinalV3 => {
+                    state_count > usize::from(DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK)
+                }
+                FrozenCompactRowsFormat::CellOffsetV4 => {
+                    live_cells > usize::from(DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK)
+                }
+            }
             || initial_state >= state_count
             || rows.learned_loop_state_count != 0
             || rows
                 .learned_loop_states
                 .iter()
                 .any(|&state| state != u32::MAX)
-            || rows.format_version != FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION
         {
             return false;
         }
@@ -3155,12 +3265,28 @@ impl FrozenDynamicRowsStorageV3 {
             if row[class_count..]
                 .iter()
                 .any(|&cell| cell != DYNAMIC_NATIVE_ROWS_V3_DEAD_CELL)
-                || row[..class_count].iter().any(|&cell| {
-                    let token = cell & DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK;
-                    token != 0 && usize::from(token) > state_count
-                })
             {
                 return false;
+            }
+            for &cell in &row[..class_count] {
+                let token = cell & DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK;
+                let valid = match format {
+                    FrozenCompactRowsFormat::StateOrdinalV3 => {
+                        token == 0 || usize::from(token) <= state_count
+                    }
+                    FrozenCompactRowsFormat::CellOffsetV4 => {
+                        token == 0
+                            || usize::from(token)
+                                .checked_sub(1)
+                                .is_some_and(|destination| {
+                                    destination < live_cells
+                                        && destination.checked_rem(class_count) == Some(0)
+                                })
+                    }
+                };
+                if !valid {
+                    return false;
+                }
             }
         }
 
@@ -5602,7 +5728,7 @@ impl CompiledProgram {
             || full.accept_mask() != direct.accept_mask()
             || full.next_row_token_mask() != direct.next_row_token_mask()
             || full.reverse_rows().is_some()
-            // Both compact V2 and V3 entries begin with no selected endpoint.
+            // Compact V2, V3, and V4 entries begin with no selected endpoint.
             // A nullable or terminal root requires the portable setup
             // settlement before consuming a byte and therefore stays on the
             // authenticated preflight route instead of entering either hot
@@ -5669,8 +5795,10 @@ impl CompiledProgram {
             .then_some(storage)
     }
 
-    /// Build a pointer-stable immutable padded `u16` copy of one complete K0
-    /// root. The class map is retained inline for later V1-prefix publication.
+    /// Build a pointer-stable immutable `u16` copy of one complete K0 root.
+    /// Cell-offset V4 is preferred whenever the complete live-cell extent fits
+    /// its 15-bit token. Larger tables retain the padded state-ordinal V3 ABI.
+    /// The class map is retained inline for later V1-prefix publication.
     #[doc(hidden)]
     #[must_use]
     #[allow(
@@ -5690,7 +5818,7 @@ impl CompiledProgram {
         if retained_bytes == 0 || retained_bytes > max_k0_bytes {
             return None;
         }
-        // V3 eligibility is semantic and proof-driven. Every assertion-free
+        // Compact V3/V4 eligibility is semantic and proof-driven. Every assertion-free
         // ordered-NFA program accepted by the dynamic-row view may attempt the
         // setup-only transaction, irrespective of compile mode or which
         // optional determinization sidecar happened to be retained. The
@@ -5722,11 +5850,10 @@ impl CompiledProgram {
         let class_count = usize::try_from(full.row_stride()).ok()?;
         let source_cells = direct.state_count().checked_mul(class_count)?;
         let state_count = direct.state_count();
+        let format = select_frozen_compact_rows_format(state_count, class_count)?;
         if class_count == 0
             || class_count > 256
             || state_count == 0
-            || state_count
-                > usize::from(DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK)
             || source_cells == 0
             || source_cells != full.forward_rows().len()
             || source_cells > direct.initialized_cells()
@@ -5751,7 +5878,10 @@ impl CompiledProgram {
             return None;
         }
 
-        let physical_cells = class_count.checked_next_power_of_two()?;
+        let physical_cells = match format {
+            FrozenCompactRowsFormat::StateOrdinalV3 => class_count.checked_next_power_of_two()?,
+            FrozenCompactRowsFormat::CellOffsetV4 => class_count,
+        };
         let compact_cells = state_count.checked_mul(physical_cells)?;
         let packed_bytes = compact_cells
             .checked_mul(core::mem::size_of::<u16>())?
@@ -5768,7 +5898,7 @@ impl CompiledProgram {
         for row in full.forward_rows().chunks_exact(class_count) {
             for &cell in row {
                 // Source-only start provenance was authenticated above and
-                // has no V3 representation. Selecting just the one-based row
+                // has no compact V3/V4 representation. Selecting just the one-based row
                 // token and accept bit strips both mutually-exclusive modes.
                 let source_token = cell & DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK;
                 let compact_token = if source_token == 0 {
@@ -5778,8 +5908,15 @@ impl CompiledProgram {
                     if source_row.checked_rem(class_count) != Some(0) {
                         return None;
                     }
-                    let destination = source_row.checked_div(class_count)?;
-                    u16::try_from(destination.checked_add(1)?).ok()?
+                    match format {
+                        FrozenCompactRowsFormat::StateOrdinalV3 => {
+                            let destination = source_row.checked_div(class_count)?;
+                            u16::try_from(destination.checked_add(1)?).ok()?
+                        }
+                        FrozenCompactRowsFormat::CellOffsetV4 => {
+                            u16::try_from(source_row.checked_add(1)?).ok()?
+                        }
+                    }
                 };
                 let accepted = if cell & DYNAMIC_NATIVE_ROWS_V1_ACCEPT_MASK != 0 {
                     DYNAMIC_NATIVE_ROWS_V3_ACCEPT_MASK
@@ -5788,8 +5925,13 @@ impl CompiledProgram {
                 };
                 owned_rows.push(compact_token | accepted);
             }
-            let row_end = owned_rows.len().checked_sub(class_count)?.checked_add(physical_cells)?;
-            owned_rows.resize(row_end, DYNAMIC_NATIVE_ROWS_V3_DEAD_CELL);
+            if physical_cells != class_count {
+                let row_end = owned_rows
+                    .len()
+                    .checked_sub(class_count)?
+                    .checked_add(physical_cells)?;
+                owned_rows.resize(row_end, DYNAMIC_NATIVE_ROWS_V3_DEAD_CELL);
+            }
         }
         if owned_rows.len() != compact_cells {
             return None;
@@ -5804,12 +5946,17 @@ impl CompiledProgram {
         }
         let initial_state = initial_row.checked_div(class_count)?;
         // Learned-loop ownership is mutable-K0 accelerator metadata, not DFA
-        // semantics. V3 copies every authenticated complete row into a closed
+        // semantics. V3/V4 copy every authenticated complete row into a closed
         // immutable table and may therefore scalar-step those states without
         // following or racing an overlay. Publish the normalized table with
         // no loop owner rather than rejecting otherwise eligible programs.
         let learned_loop_states = [u32::MAX; 4];
-        let row_shift = physical_cells.trailing_zeros().checked_add(1)?;
+        let row_shift = match format {
+            FrozenCompactRowsFormat::StateOrdinalV3 => {
+                physical_cells.trailing_zeros().checked_add(1)?
+            }
+            FrozenCompactRowsFormat::CellOffsetV4 => 0,
+        };
         let descriptor = FrozenDynamicRowsV3 {
             ready_seal: 0,
             rows_address: rows.as_ptr().expose_provenance(),
@@ -5820,7 +5967,7 @@ impl CompiledProgram {
             initial_state: u32::try_from(initial_state).ok()?,
             learned_loop_state_count: 0,
             learned_loop_states,
-            format_version: FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION,
+            format_version: format.format_version(),
         };
         let storage = FrozenDynamicRowsStorageV3 {
             program_instance: self.identity.instance,
@@ -5834,9 +5981,9 @@ impl CompiledProgram {
             .then_some(storage)
     }
 
-    /// Publish either the existing retained V1 projection or the additive
-    /// padded compact V3 sidecar. Retained static rows always win, and V2
-    /// remains independently constructible for older prepared owners.
+    /// Publish either the existing retained V1 projection or an additive
+    /// compact V3/V4 sidecar. Retained static rows always win, and V2 remains
+    /// independently constructible for older prepared owners.
     #[doc(hidden)]
     #[must_use]
     pub fn compiler_private_frozen_prepared_header_v3(
@@ -5860,11 +6007,27 @@ impl CompiledProgram {
         }
 
         let rows = storage.descriptor();
-        let Some(cell_shift) = rows.row_shift.checked_sub(1) else {
-            return header;
+        let format = match rows.format_version {
+            FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION => FrozenCompactRowsFormat::StateOrdinalV3,
+            FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION => FrozenCompactRowsFormat::CellOffsetV4,
+            _ => return header,
         };
-        let Some(physical_cells) = 1_usize.checked_shl(cell_shift) else {
-            return header;
+        let physical_cells = match format {
+            FrozenCompactRowsFormat::StateOrdinalV3 => {
+                let Some(cell_shift) = rows.row_shift.checked_sub(1) else {
+                    return header;
+                };
+                let Some(physical_cells) = 1_usize.checked_shl(cell_shift) else {
+                    return header;
+                };
+                physical_cells
+            }
+            FrozenCompactRowsFormat::CellOffsetV4 => {
+                let Ok(class_count) = usize::try_from(rows.class_count) else {
+                    return header;
+                };
+                class_count
+            }
         };
         let Some(initial_row) = usize::try_from(rows.initial_state)
             .ok()
@@ -5881,8 +6044,11 @@ impl CompiledProgram {
         };
 
         header.dynamic_rows_v3 = rows;
-        header.v1.flags = FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3;
-        header.v1.header_bytes = FROZEN_PREPARED_HEADER_V3_BYTES;
+        header.v1.flags = format.header_flag();
+        header.v1.header_bytes = match format {
+            FrozenCompactRowsFormat::StateOrdinalV3 => FROZEN_PREPARED_HEADER_V3_BYTES,
+            FrozenCompactRowsFormat::CellOffsetV4 => FROZEN_PREPARED_HEADER_V4_BYTES,
+        };
         header.v1.forward_rows_address = rows.rows_address;
         header.v1.forward_live_cells = storage.rows.len();
         header.v1.cache_identity = rows.cache_identity;
@@ -5896,7 +6062,7 @@ impl CompiledProgram {
         header.v1.active_seal = FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL;
         // This is the final publication write. Every pointer, bound, mirror,
         // inline map byte, and immutable row has already been authenticated.
-        header.dynamic_rows_v3.ready_seal = FROZEN_PREPARED_HEADER_V3_READY_SEAL;
+        header.dynamic_rows_v3.ready_seal = format.ready_seal();
         header
     }
 
@@ -18595,7 +18761,115 @@ mod tests {
     }
 
     #[test]
-    fn frozen_v3_promotion_is_governed_by_dynamic_semantics_and_closed_rows() {
+    fn compact_format_selection_and_cell_offset_algebra_are_exhaustive_at_boundaries() {
+        let token_limit = usize::from(DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK);
+        assert_eq!(select_frozen_compact_rows_format(0, 1), None);
+        assert_eq!(select_frozen_compact_rows_format(1, 0), None);
+        assert_eq!(select_frozen_compact_rows_format(1, 257), None);
+        assert_eq!(select_frozen_compact_rows_format(usize::MAX, 2), None);
+
+        for class_count in 1_usize..=256 {
+            let maximum_v4_states = token_limit / class_count;
+            for state_count in 1_usize..=maximum_v4_states {
+                assert_eq!(
+                    select_frozen_compact_rows_format(state_count, class_count),
+                    Some(FrozenCompactRowsFormat::CellOffsetV4)
+                );
+                let destination = state_count
+                    .checked_sub(1)
+                    .and_then(|state| state.checked_mul(class_count))
+                    .unwrap();
+                let token = destination.checked_add(1).unwrap();
+                assert!(token <= token_limit);
+                let destination_bytes = destination.checked_mul(2).unwrap();
+                let x86_direct_bytes = token.checked_mul(2).unwrap().checked_sub(2).unwrap();
+                let arm_biased_bytes = token.checked_mul(2).unwrap().checked_sub(2).unwrap();
+                assert_eq!(x86_direct_bytes, destination_bytes);
+                assert_eq!(arm_biased_bytes, destination_bytes);
+            }
+            if maximum_v4_states < token_limit {
+                let first_larger = maximum_v4_states.checked_add(1).unwrap();
+                assert_eq!(
+                    select_frozen_compact_rows_format(first_larger, class_count),
+                    Some(FrozenCompactRowsFormat::StateOrdinalV3)
+                );
+            }
+            assert_eq!(
+                select_frozen_compact_rows_format(token_limit, class_count),
+                if class_count == 1 {
+                    Some(FrozenCompactRowsFormat::CellOffsetV4)
+                } else {
+                    Some(FrozenCompactRowsFormat::StateOrdinalV3)
+                }
+            );
+            assert_eq!(
+                select_frozen_compact_rows_format(token_limit + 1, class_count),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn state_ordinal_v3_remains_valid_for_tables_larger_than_v4_token_extent() {
+        let compiled = program(
+            r"(?:ab|ac)+z",
+            OutputContract::Exists,
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+        );
+        let workspace = compiled.prepare_workspace().unwrap();
+        let state_count = 16_384_usize;
+        let class_count = 2_usize;
+        assert_eq!(
+            select_frozen_compact_rows_format(state_count, class_count),
+            Some(FrozenCompactRowsFormat::StateOrdinalV3)
+        );
+        let mut class_map = [0_u8; 256];
+        class_map[255] = 1;
+        let rows = vec![DYNAMIC_NATIVE_ROWS_V3_DEAD_CELL; state_count * class_count]
+            .into_boxed_slice();
+        let descriptor = FrozenDynamicRowsV3 {
+            ready_seal: 0,
+            rows_address: rows.as_ptr().expose_provenance(),
+            cache_identity: 1,
+            state_count: u32::try_from(state_count).unwrap(),
+            class_count: u32::try_from(class_count).unwrap(),
+            row_shift: 2,
+            initial_state: 0,
+            learned_loop_state_count: 0,
+            learned_loop_states: [u32::MAX; 4],
+            format_version: FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION,
+        };
+        let storage = FrozenDynamicRowsStorageV3 {
+            program_instance: compiled.identity.instance,
+            artifact_identity: compiled.identity.artifact,
+            rows,
+            class_map,
+            descriptor,
+        };
+        assert!(storage.descriptor_is_valid_for(compiled.identity));
+        let mut header = compiled.compiler_private_frozen_prepared_header_v3(
+            &workspace,
+            None,
+            Some(&storage),
+        );
+        assert!(header.has_dynamic_rows());
+        assert_eq!(header.v1.flags, FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3);
+        assert_eq!(header.v1.header_bytes, FROZEN_PREPARED_HEADER_V3_BYTES);
+        assert_eq!(header.v1.forward_live_cells, storage.rows.len());
+        assert_eq!(header.v1.row_stride, u32::try_from(class_count).unwrap());
+        assert_eq!(header.dynamic_rows_v3.ready_seal, FROZEN_PREPARED_HEADER_V3_READY_SEAL);
+        header.deactivate();
+        assert!(!header.is_active());
+        assert!(!header.has_dynamic_rows());
+        assert_eq!(header.dynamic_rows_v3.ready_seal, 0);
+    }
+
+    #[test]
+    fn frozen_compact_promotion_is_governed_by_dynamic_semantics_and_closed_rows() {
         fn assert_promoted(compiled: &CompiledProgram, label: &str) {
             assert_eq!(compiled.engine_kind(), EngineKind::OrderedNfa, "{label}");
             assert!(compiled.native_dynamic_rows_view().is_some(), "{label}");
@@ -18606,7 +18880,7 @@ mod tests {
                     .as_ref()
                     .and_then(|nfa| nfa.dynamic_root_projection(&compiled.automaton))
                     .is_none(),
-                "V3 setup must leave the live workspace cold for {label}"
+                "compact setup must leave the live workspace cold for {label}"
             );
             let storage = compiled
                 .compiler_private_frozen_dynamic_rows_storage_v3(
@@ -18625,7 +18899,7 @@ mod tests {
             assert!(header.has_dynamic_rows(), "{label}");
             assert_eq!(
                 header.v1.flags,
-                FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3,
+                FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V4,
                 "{label}"
             );
         }
@@ -18649,7 +18923,7 @@ mod tests {
                 .expect("no-sidecar dynamic view")
                 .root_requirement,
             None,
-            "the no-sidecar witness must also exercise scanner-free V3"
+            "the no-sidecar witness must also exercise scanner-free compact rows"
         );
         assert_promoted(&no_sidecar, "fresh fast no-sidecar program");
         let restored_no_sidecar =
@@ -18703,7 +18977,7 @@ mod tests {
                     usize::MAX,
                 )
                 .is_none(),
-            "the exact-product route must retain precedence over V3 promotion"
+            "the exact-product route must retain precedence over compact promotion"
         );
     }
 
@@ -18711,9 +18985,9 @@ mod tests {
     #[allow(
         clippy::items_after_statements,
         clippy::too_many_lines,
-        reason = "one compact oracle covers V3 packing, publication, coexistence, and fail-closed ownership"
+        reason = "one compact oracle covers V4 packing, publication, coexistence, and fail-closed ownership"
     )]
-    fn padded_compact_frozen_dynamic_v3_is_closed_inline_and_additive() {
+    fn unpadded_cell_offset_v4_is_closed_inline_and_additive() {
         let compiled = program(
             r"(?:ab|ac)+z",
             OutputContract::Exists,
@@ -18731,31 +19005,25 @@ mod tests {
                 retained_bytes,
                 usize::MAX,
             )
-            .expect("complete padded compact V3 sidecar");
+            .expect("complete unpadded compact V4 sidecar");
         assert!(storage.descriptor_is_valid_for(compiled.identity));
         assert_eq!(storage.descriptor.ready_seal, 0);
         assert_eq!(
             storage.descriptor.format_version,
-            FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION
+            FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION
         );
         assert_eq!(storage.descriptor.learned_loop_state_count, 0);
         assert_eq!(storage.descriptor.learned_loop_states, [u32::MAX; 4]);
 
         let state_count = usize::try_from(storage.descriptor.state_count).unwrap();
         let class_count = usize::try_from(storage.descriptor.class_count).unwrap();
-        let physical_cells = 1_usize
-            .checked_shl(storage.descriptor.row_shift.checked_sub(1).unwrap())
-            .unwrap();
-        assert_eq!(physical_cells, class_count.next_power_of_two());
-        assert_eq!(storage.rows.len(), state_count * physical_cells);
         assert!(
-            storage
-                .rows
-                .chunks_exact(physical_cells)
-                .all(|row| row[class_count..]
-                    .iter()
-                    .all(|&cell| cell == DYNAMIC_NATIVE_ROWS_V3_DEAD_CELL))
+            !class_count.is_power_of_two(),
+            "the fixture must prove V4 does not pad a non-power-of-two alphabet"
         );
+        assert_eq!(storage.descriptor.row_shift, 0);
+        let physical_cells = class_count;
+        assert_eq!(storage.rows.len(), state_count * physical_cells);
         let packed_bytes = storage
             .rows
             .len()
@@ -18790,7 +19058,7 @@ mod tests {
             .expect("coexisting V2 sidecar");
         assert_ne!(
             wide.descriptor.learned_loop_row_count, 0,
-            "the fixture must prove V3 keeps a graph whose mutable projection owns learned loops"
+            "the fixture must prove V4 keeps a graph whose mutable projection owns learned loops"
         );
         assert_eq!(storage.descriptor.learned_loop_state_count, 0);
         assert_eq!(storage.descriptor.learned_loop_states, [u32::MAX; 4]);
@@ -18805,10 +19073,7 @@ mod tests {
                 let expected_token = if source_token == 0 {
                     0
                 } else {
-                    u16::try_from(
-                        usize::try_from(source_token - 1).unwrap() / class_count + 1,
-                    )
-                    .unwrap()
+                    u16::try_from(source_token).unwrap()
                 };
                 assert_eq!(
                     compact_cell & DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK,
@@ -18834,8 +19099,8 @@ mod tests {
         );
         assert!(header.is_active());
         assert!(header.has_dynamic_rows());
-        assert_eq!(header.v1.flags, FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3);
-        assert_eq!(header.v1.header_bytes, FROZEN_PREPARED_HEADER_V3_BYTES);
+        assert_eq!(header.v1.flags, FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V4);
+        assert_eq!(header.v1.header_bytes, FROZEN_PREPARED_HEADER_V4_BYTES);
         assert_eq!(header.v1.artifact_identity, compiled.identity.artifact);
         assert_eq!(header.v1.forward_rows_address, rows_address);
         assert_eq!(header.v1.forward_live_cells, storage.rows.len());
@@ -18843,8 +19108,38 @@ mod tests {
         assert_eq!(header.v1.class_map, storage.class_map);
         assert_eq!(
             header.dynamic_rows_v3.ready_seal,
-            FROZEN_PREPARED_HEADER_V3_READY_SEAL
+            FROZEN_PREPARED_HEADER_V4_READY_SEAL
         );
+        let mut cross_format = compiled.compiler_private_frozen_prepared_header_v3(
+            &workspace,
+            None,
+            Some(&storage),
+        );
+        cross_format.v1.flags = FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3;
+        assert!(!cross_format.has_dynamic_rows());
+        cross_format = compiled.compiler_private_frozen_prepared_header_v3(
+            &workspace,
+            None,
+            Some(&storage),
+        );
+        cross_format.dynamic_rows_v3.format_version = FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION;
+        assert!(!cross_format.has_dynamic_rows());
+        cross_format = compiled.compiler_private_frozen_prepared_header_v3(
+            &workspace,
+            None,
+            Some(&storage),
+        );
+        cross_format.dynamic_rows_v3.ready_seal = FROZEN_PREPARED_HEADER_V3_READY_SEAL;
+        assert!(!cross_format.has_dynamic_rows());
+        let mut revoked = compiled.compiler_private_frozen_prepared_header_v3(
+            &workspace,
+            None,
+            Some(&storage),
+        );
+        revoked.deactivate();
+        assert!(!revoked.is_active());
+        assert!(!revoked.has_dynamic_rows());
+        assert_eq!(revoked.dynamic_rows_v3.ready_seal, 0);
 
         // The active V3 seal is a revocable capability for setup-validated
         // write-once geometry. Revocation changes only the two seals; every
@@ -18894,7 +19189,7 @@ mod tests {
         reject_descriptor!({ storage.descriptor.cache_identity = 0; });
         reject_descriptor!({ storage.descriptor.state_count = 0; });
         reject_descriptor!({ storage.descriptor.class_count = 0; });
-        reject_descriptor!({ storage.descriptor.row_shift = 0; });
+        reject_descriptor!({ storage.descriptor.row_shift = 1; });
         reject_descriptor!({ storage.descriptor.initial_state = storage.descriptor.state_count; });
         reject_descriptor!({ storage.descriptor.learned_loop_state_count = 5; });
         reject_descriptor!({ storage.descriptor.learned_loop_states[0] = 0; });
@@ -18902,14 +19197,13 @@ mod tests {
 
         storage.descriptor = valid_descriptor;
         let first_cell = storage.rows[0];
-        storage.rows[0] = u16::try_from(state_count.checked_add(1).unwrap()).unwrap();
+        storage.rows[0] = if class_count > 1 {
+            2
+        } else {
+            u16::try_from(storage.rows.len().checked_add(1).unwrap()).unwrap()
+        };
         assert!(!storage.descriptor_is_valid_for(compiled.identity));
         storage.rows[0] = first_cell;
-        if physical_cells > class_count {
-            storage.rows[class_count] = 1;
-            assert!(!storage.descriptor_is_valid_for(compiled.identity));
-            storage.rows[class_count] = 0;
-        }
         let original_class = storage.class_map[0];
         storage.class_map[0] = u8::try_from(class_count).unwrap();
         assert!(!storage.descriptor_is_valid_for(compiled.identity));

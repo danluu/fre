@@ -42,7 +42,7 @@ use crate::{
         FROZEN_DYNAMIC_ROWS_V3_INITIAL_STATE_OFFSET, FROZEN_DYNAMIC_ROWS_V3_LOOP_COUNT_OFFSET,
         FROZEN_DYNAMIC_ROWS_V3_LOOP_STATES_OFFSET, FROZEN_DYNAMIC_ROWS_V3_READY_SEAL_OFFSET,
         FROZEN_DYNAMIC_ROWS_V3_ROWS_ADDRESS_OFFSET, FROZEN_DYNAMIC_ROWS_V3_ROW_SHIFT_OFFSET,
-        FROZEN_DYNAMIC_ROWS_V3_STATE_COUNT_OFFSET,
+        FROZEN_DYNAMIC_ROWS_V3_STATE_COUNT_OFFSET, FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION,
         FROZEN_PREPARED_HEADER_V1_ABI_VERSION,
         FROZEN_PREPARED_HEADER_V1_ABI_VERSION_OFFSET,
         FROZEN_PREPARED_HEADER_V1_ACCEPT_MASK_OFFSET,
@@ -54,6 +54,7 @@ use crate::{
         FROZEN_PREPARED_HEADER_V1_FLAGS_OFFSET,
         FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS,
         FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3,
+        FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V4,
         FROZEN_PREPARED_HEADER_V1_FORWARD_INITIAL_ROW_OFFSET,
         FROZEN_PREPARED_HEADER_V1_FORWARD_LIVE_CELLS_OFFSET,
         FROZEN_PREPARED_HEADER_V1_FORWARD_ROWS_ADDRESS_OFFSET,
@@ -68,6 +69,8 @@ use crate::{
         FROZEN_PREPARED_HEADER_V1_UNFILLED_CELL_OFFSET, FROZEN_PREPARED_HEADER_V2_BYTES,
         FROZEN_PREPARED_HEADER_V2_DYNAMIC_ROWS_OFFSET, FROZEN_PREPARED_HEADER_V3_BYTES,
         FROZEN_PREPARED_HEADER_V3_DYNAMIC_ROWS_OFFSET, FROZEN_PREPARED_HEADER_V3_READY_SEAL,
+        FROZEN_PREPARED_HEADER_V4_BYTES, FROZEN_PREPARED_HEADER_V4_DYNAMIC_ROWS_OFFSET,
+        FROZEN_PREPARED_HEADER_V4_READY_SEAL,
         MAX_ANCHORED_PREFIX_BYTES,
         NativeContextProgramView, NativeDynamicRootRequirement, NativeDynamicRowsProgramView,
         NativePartialProgramView, NativeProgramView, NativeRetainedPrefixRequirement,
@@ -920,9 +923,9 @@ const NATIVE_ROWS_INITIAL_FLAGS: usize =
 const _: () = assert!(core::mem::size_of::<DynamicNativeRowsV1>() <= 127);
 // Mutable/scanner-free dynamic rows remain a short-window prepared-entry
 // optimization. At 4 KiB, canonical K0 begins considering its whole-window
-// accelerators. An authenticated closed immutable V3 table is already the
-// complete machine, just as a graph-proven native root scanner owns its scan,
-// so either may retain native execution for longer windows.
+// accelerators. An authenticated closed immutable compact table is already
+// the complete machine, just as a graph-proven native root scanner owns its
+// scan, so either may retain native execution for longer windows.
 const FROZEN_SCANNER_FREE_DYNAMIC_ROWS_MAX_INPUT_BYTES: usize = 4_095;
 const _: () = assert!(
     DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES <= FROZEN_SCANNER_FREE_DYNAMIC_ROWS_MAX_INPUT_BYTES
@@ -12804,7 +12807,7 @@ fn lower_x86_64_slow_partial_wrapper(
     })
 }
 
-/// Per-call authentication policy for one already-published compact V3
+/// Per-call authentication policy for one already-published compact V3/V4
 /// projection.
 ///
 /// Production exclusive handles use `ActiveCapability`: construction fully
@@ -12818,21 +12821,65 @@ fn lower_x86_64_slow_partial_wrapper(
     dead_code,
     reason = "the full verifier remains an explicit non-production audit and test path"
 )]
-enum FrozenCompactV3GuardMode {
+enum FrozenCompactGuardMode {
     ActiveCapability,
     FullVerifier,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FrozenCompactNativeFormat {
+    StateOrdinalV3,
+    CellOffsetV4,
+}
+
+impl FrozenCompactNativeFormat {
+    const fn flag(self) -> u32 {
+        match self {
+            Self::StateOrdinalV3 => FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3,
+            Self::CellOffsetV4 => FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V4,
+        }
+    }
+
+    const fn header_bytes(self) -> usize {
+        match self {
+            Self::StateOrdinalV3 => FROZEN_PREPARED_HEADER_V3_BYTES,
+            Self::CellOffsetV4 => FROZEN_PREPARED_HEADER_V4_BYTES,
+        }
+    }
+
+    const fn tail_offset(self) -> usize {
+        match self {
+            Self::StateOrdinalV3 => FROZEN_PREPARED_HEADER_V3_DYNAMIC_ROWS_OFFSET,
+            Self::CellOffsetV4 => FROZEN_PREPARED_HEADER_V4_DYNAMIC_ROWS_OFFSET,
+        }
+    }
+
+    const fn ready_seal(self) -> u64 {
+        match self {
+            Self::StateOrdinalV3 => FROZEN_PREPARED_HEADER_V3_READY_SEAL,
+            Self::CellOffsetV4 => FROZEN_PREPARED_HEADER_V4_READY_SEAL,
+        }
+    }
+
+    const fn format_version(self) -> u32 {
+        match self {
+            Self::StateOrdinalV3 => FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION,
+            Self::CellOffsetV4 => FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION,
+        }
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
-    reason = "the additive V3 capability and full verifier share one explicit fail-closed target lowering"
+    reason = "compact capabilities and full verifiers share one explicit fail-closed target lowering"
 )]
-fn x86_emit_frozen_compact_v3_entry(
+fn x86_emit_frozen_compact_entry(
     assembler: &mut X86Assembler,
-    try_v2: X86Label,
+    format: FrozenCompactNativeFormat,
+    try_older: X86Label,
     call_preflight: X86Label,
-    v3_enter: X86Label,
-    guard_mode: FrozenCompactV3GuardMode,
+    compact_enter: X86Label,
+    guard_mode: FrozenCompactGuardMode,
 ) -> Result<(), ObjectError> {
     let branch_failed = |assembler: &mut X86Assembler| {
         assembler.branch(&[0x0f, 0x85], call_preflight)
@@ -12845,15 +12892,16 @@ fn x86_emit_frozen_compact_v3_entry(
     };
 
     // Select the overlapping tail exclusively through its distinct V1 flag.
-    // A V1/V2 header reaches the unchanged V2 validator without any V3 read.
+    // A different-generation header reaches the older validator without
+    // consuming this format's extent or tail fields.
     let mut compare_flags = vec![
         0x81,
         0x7f,
         header_disp(FROZEN_PREPARED_HEADER_V1_FLAGS_OFFSET, "x86 V3 flags")?,
     ];
-    compare_flags.extend_from_slice(&FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3.to_le_bytes());
+    compare_flags.extend_from_slice(&format.flag().to_le_bytes());
     assembler.instruction(&compare_flags)?;
-    assembler.branch(&[0x0f, 0x85], try_v2)?;
+    assembler.branch(&[0x0f, 0x85], try_older)?;
 
     let mut compare_extent = vec![
         0x48,
@@ -12865,8 +12913,8 @@ fn x86_emit_frozen_compact_v3_entry(
         )?,
     ];
     compare_extent.extend_from_slice(
-        &u32::try_from(FROZEN_PREPARED_HEADER_V3_BYTES)
-            .map_err(|_| ObjectError::ArithmeticOverflow("x86 V3 header extent"))?
+        &u32::try_from(format.header_bytes())
+            .map_err(|_| ObjectError::ArithmeticOverflow("x86 compact header extent"))?
             .to_le_bytes(),
     );
     assembler.instruction(&compare_extent)?;
@@ -12927,7 +12975,7 @@ fn x86_emit_frozen_compact_v3_entry(
         branch_failed(assembler)?;
     }
 
-    if guard_mode == FrozenCompactV3GuardMode::FullVerifier {
+    if guard_mode == FrozenCompactGuardMode::FullVerifier {
         for (field, context) in [
             (
                 FROZEN_PREPARED_HEADER_V1_REVERSE_ROWS_ADDRESS_OFFSET,
@@ -12955,14 +13003,14 @@ fn x86_emit_frozen_compact_v3_entry(
         branch_failed(assembler)?;
     }
 
-    let tail_offset = i32::try_from(FROZEN_PREPARED_HEADER_V3_DYNAMIC_ROWS_OFFSET)
-        .map_err(|_| ObjectError::ArithmeticOverflow("x86 V3 tail offset"))?;
+    let tail_offset = i32::try_from(format.tail_offset())
+        .map_err(|_| ObjectError::ArithmeticOverflow("x86 compact tail offset"))?;
     let mut tail_address = vec![0x4c, 0x8d, 0x9f];
     tail_address.extend_from_slice(&tail_offset.to_le_bytes());
     assembler.instruction(&tail_address)?;
 
     let mut load_ready = vec![0x49, 0xba];
-    load_ready.extend_from_slice(&FROZEN_PREPARED_HEADER_V3_READY_SEAL.to_le_bytes());
+    load_ready.extend_from_slice(&format.ready_seal().to_le_bytes());
     assembler.instruction(&load_ready)?;
     assembler.instruction(&[
         0x4d,
@@ -12983,11 +13031,11 @@ fn x86_emit_frozen_compact_v3_entry(
             "x86 V3 format version",
         )?,
     ];
-    compare_format.extend_from_slice(&FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION.to_le_bytes());
+    compare_format.extend_from_slice(&format.format_version().to_le_bytes());
     assembler.instruction(&compare_format)?;
     branch_failed(assembler)?;
 
-    if guard_mode == FrozenCompactV3GuardMode::FullVerifier {
+    if guard_mode == FrozenCompactGuardMode::FullVerifier {
         // These mirrors, pointer constraints, and the complete geometry below
         // were proved when the private owner was built. Production entries may
         // rely on the still-active capability; the full verifier remains an
@@ -13048,7 +13096,7 @@ fn x86_emit_frozen_compact_v3_entry(
     assembler.instruction(&[0x4d, 0x85, 0xd2])?;
     assembler.branch(&[0x0f, 0x84], call_preflight)?;
 
-    if guard_mode == FrozenCompactV3GuardMode::FullVerifier {
+    if guard_mode == FrozenCompactGuardMode::FullVerifier {
         assembler.instruction(&[
             0x41,
             0x8b,
@@ -13057,8 +13105,10 @@ fn x86_emit_frozen_compact_v3_entry(
         ])?;
         assembler.instruction(&[0x85, 0xc0])?;
         assembler.branch(&[0x0f, 0x84], call_preflight)?;
-        assembler.instruction(&[0x3d, 0xff, 0x7f, 0x00, 0x00])?;
-        assembler.branch(&[0x0f, 0x87], call_preflight)?;
+        if format == FrozenCompactNativeFormat::StateOrdinalV3 {
+            assembler.instruction(&[0x3d, 0xff, 0x7f, 0x00, 0x00])?;
+            assembler.branch(&[0x0f, 0x87], call_preflight)?;
+        }
         assembler.instruction(&[
             0x45,
             0x8b,
@@ -13069,28 +13119,45 @@ fn x86_emit_frozen_compact_v3_entry(
         assembler.branch(&[0x0f, 0x84], call_preflight)?;
         assembler.instruction(&[0x41, 0x81, 0xf8, 0x00, 0x01, 0x00, 0x00])?;
         assembler.branch(&[0x0f, 0x87], call_preflight)?;
-        assembler.instruction(&[
-            0x41,
-            0x8b,
-            0x4b,
-            tail_disp(FROZEN_DYNAMIC_ROWS_V3_ROW_SHIFT_OFFSET, "x86 V3 row shift")?,
-        ])?;
-        assembler.instruction(&[0x83, 0xf9, 0x01])?;
-        assembler.branch(&[0x0f, 0x82], call_preflight)?;
-        assembler.instruction(&[0x83, 0xf9, 0x09])?;
-        assembler.branch(&[0x0f, 0x87], call_preflight)?;
+        match format {
+            FrozenCompactNativeFormat::StateOrdinalV3 => {
+                assembler.instruction(&[
+                    0x41,
+                    0x8b,
+                    0x4b,
+                    tail_disp(FROZEN_DYNAMIC_ROWS_V3_ROW_SHIFT_OFFSET, "x86 V3 row shift")?,
+                ])?;
+                assembler.instruction(&[0x83, 0xf9, 0x01])?;
+                assembler.branch(&[0x0f, 0x82], call_preflight)?;
+                assembler.instruction(&[0x83, 0xf9, 0x09])?;
+                assembler.branch(&[0x0f, 0x87], call_preflight)?;
 
-        // Reconstruct the exact physical geometry: cells=2^(byte_shift-1),
-        // cells>=classes>cells/2. This is precisely next_power_of_two(classes).
-        assembler.instruction(&[0xba, 0x01, 0x00, 0x00, 0x00])?;
-        assembler.instruction(&[0xff, 0xc9])?;
-        assembler.instruction(&[0x48, 0xd3, 0xe2])?;
-        assembler.instruction(&[0x44, 0x39, 0xc2])?;
-        assembler.branch(&[0x0f, 0x82], call_preflight)?;
-        assembler.instruction(&[0x41, 0x89, 0xd2])?;
-        assembler.instruction(&[0x41, 0xd1, 0xea])?;
-        assembler.instruction(&[0x45, 0x39, 0xd0])?;
-        assembler.branch(&[0x0f, 0x86], call_preflight)?;
+                // Reconstruct the exact physical geometry: cells=2^(byte_shift-1),
+                // cells>=classes>cells/2. This is precisely next_power_of_two(classes).
+                assembler.instruction(&[0xba, 0x01, 0x00, 0x00, 0x00])?;
+                assembler.instruction(&[0xff, 0xc9])?;
+                assembler.instruction(&[0x48, 0xd3, 0xe2])?;
+                assembler.instruction(&[0x44, 0x39, 0xc2])?;
+                assembler.branch(&[0x0f, 0x82], call_preflight)?;
+                assembler.instruction(&[0x41, 0x89, 0xd2])?;
+                assembler.instruction(&[0x41, 0xd1, 0xea])?;
+                assembler.instruction(&[0x45, 0x39, 0xd0])?;
+                assembler.branch(&[0x0f, 0x86], call_preflight)?;
+            }
+            FrozenCompactNativeFormat::CellOffsetV4 => {
+                assembler.instruction(&[
+                    0x41,
+                    0x83,
+                    0x7b,
+                    tail_disp(FROZEN_DYNAMIC_ROWS_V3_ROW_SHIFT_OFFSET, "x86 V4 row shift")?,
+                    0,
+                ])?;
+                branch_failed(assembler)?;
+                // V4 is deliberately unpadded. EDX becomes the physical/logical
+                // class count for the common live-cell and initial-row proofs.
+                assembler.instruction(&[0x44, 0x89, 0xc2])?;
+            }
+        }
         assembler.instruction(&[
             0x39,
             0x57,
@@ -13100,6 +13167,10 @@ fn x86_emit_frozen_compact_v3_entry(
 
         assembler.instruction(&[0x41, 0x89, 0xc2])?;
         assembler.instruction(&[0x48, 0x0f, 0xaf, 0xc2])?;
+        if format == FrozenCompactNativeFormat::CellOffsetV4 {
+            assembler.instruction(&[0x48, 0x3d, 0xff, 0x7f, 0x00, 0x00])?;
+            assembler.branch(&[0x0f, 0x87], call_preflight)?;
+        }
         assembler.instruction(&[
             0x48,
             0x39,
@@ -13131,9 +13202,7 @@ fn x86_emit_frozen_compact_v3_entry(
             )?,
         ])?;
         branch_failed(assembler)?;
-    }
 
-    if guard_mode == FrozenCompactV3GuardMode::FullVerifier {
         for (field, expected, context) in [
             (
                 FROZEN_PREPARED_HEADER_V1_UNFILLED_CELL_OFFSET,
@@ -13158,7 +13227,7 @@ fn x86_emit_frozen_compact_v3_entry(
         }
     }
 
-    // V3 normalizes complete immutable rows by suppressing mutable-K0
+    // Compact V3/V4 normalize complete immutable rows by suppressing mutable-K0
     // learned-loop ownership. Authenticate that normalization exactly: the
     // scalar loop below still executes every closed DFA row, including rows
     // that had learned-loop accelerator metadata in the mutable projection.
@@ -13192,8 +13261,42 @@ fn x86_emit_frozen_compact_v3_entry(
     assembler.instruction(&[0x4c, 0x89, 0x54, 0x24, 0x40])?;
     assembler.instruction(&[0x4c, 0x8b, 0x54, 0x24, 0x30])?;
     assembler.instruction(&[0x4c, 0x89, 0x54, 0x24, 0x48])?;
-    assembler.branch(&[0xe9], v3_enter)?;
+    assembler.branch(&[0xe9], compact_enter)?;
     Ok(())
+}
+
+fn x86_emit_frozen_compact_v3_entry(
+    assembler: &mut X86Assembler,
+    try_v2: X86Label,
+    call_preflight: X86Label,
+    v3_enter: X86Label,
+    guard_mode: FrozenCompactGuardMode,
+) -> Result<(), ObjectError> {
+    x86_emit_frozen_compact_entry(
+        assembler,
+        FrozenCompactNativeFormat::StateOrdinalV3,
+        try_v2,
+        call_preflight,
+        v3_enter,
+        guard_mode,
+    )
+}
+
+fn x86_emit_frozen_compact_v4_entry(
+    assembler: &mut X86Assembler,
+    try_v3: X86Label,
+    call_preflight: X86Label,
+    v4_enter: X86Label,
+    guard_mode: FrozenCompactGuardMode,
+) -> Result<(), ObjectError> {
+    x86_emit_frozen_compact_entry(
+        assembler,
+        FrozenCompactNativeFormat::CellOffsetV4,
+        try_v3,
+        call_preflight,
+        v4_enter,
+        guard_mode,
+    )
 }
 
 #[allow(
@@ -13576,6 +13679,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     const ROOT_SCANNER_REPRESENTATION_OFFSET: u8 = 112;
     const ROOT_SCANNER_OFFSET_ROWS: u8 = 1;
     const ROOT_SCANNER_COMPACT_V3: u8 = 2;
+    const ROOT_SCANNER_COMPACT_V4: u8 = 3;
     let tracks_root_scanner_hits = allow_direct_hole_continuation && root_plan.is_some();
     let frame_bytes = if root_plan.is_some() {
         ROOT_SCANNER_FRAME_BYTES
@@ -13655,7 +13759,11 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
         }
     };
     let preflight_enter = assembler.label()?;
+    let try_v3 = assembler.label()?;
     let try_v2 = assembler.label()?;
+    let v4_enter = assembler.label()?;
+    let v4_scan = assembler.label()?;
+    let v4_table_scan = assembler.label()?;
     let v3_enter = assembler.label()?;
     let v3_dispatch = assembler.label()?;
     let mut v3_shift_entries = [0_usize; 9];
@@ -13746,19 +13854,27 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     push_bytes(&mut assembler.code, &[0; 4])?;
     assembler.instruction(&[0x48, 0x89, 0x04, 0x24])?;
 
+    x86_emit_frozen_compact_v4_entry(
+        &mut assembler,
+        try_v3,
+        call_preflight,
+        v4_enter,
+        FrozenCompactGuardMode::ActiveCapability,
+    )?;
+    assembler.bind(try_v3)?;
     x86_emit_frozen_compact_v3_entry(
         &mut assembler,
         try_v2,
         call_preflight,
         v3_enter,
-        FrozenCompactV3GuardMode::ActiveCapability,
+        FrozenCompactGuardMode::ActiveCapability,
     )?;
     assembler.bind(try_v2)?;
     if root_plan.is_none() {
-        // Only a seal/identity-authenticated active V3 capability may bypass
-        // the historical scanner-free ceiling. V1/V2 headers still hand long
-        // windows to the canonical executor before following their mutable
-        // descriptors.
+        // Only a seal/identity-authenticated active compact capability may
+        // bypass the historical scanner-free ceiling. V1/V2 headers still
+        // hand long windows to the canonical executor before following their
+        // mutable descriptors.
         assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, 0x30])?;
         assembler.instruction(&[0x48, 0x2b, 0x44, 0x24, 0x28])?;
         let maximum = u32::try_from(FROZEN_SCANNER_FREE_DYNAMIC_ROWS_MAX_INPUT_BYTES)
@@ -13778,8 +13894,8 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     assembler.bind(call_preflight)?;
     if root_plan.is_none() {
         // Capability authentication failures and cold mutable rows preserve
-        // the same ceiling. Reaching this label proves that no closed V3 table
-        // was selected above.
+        // the same ceiling. Reaching this label proves that no closed compact
+        // table was selected above.
         assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, 0x30])?;
         assembler.instruction(&[0x48, 0x2b, 0x44, 0x24, 0x28])?;
         let maximum = u32::try_from(FROZEN_SCANNER_FREE_DYNAMIC_ROWS_MAX_INPUT_BYTES)
@@ -13806,6 +13922,98 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     restore_root_scanner_counter(&mut assembler)?;
     assembler.instruction(&[0x48, 0x83, 0xc4, frame_bytes])?;
     assembler.instruction(&[0xc3])?;
+
+    assembler.bind(v4_enter)?;
+    assembler.instruction(&[
+        0x49,
+        0x8b,
+        0x73,
+        u8::try_from(FROZEN_DYNAMIC_ROWS_V3_ROWS_ADDRESS_OFFSET)
+            .map_err(|_| ObjectError::ArithmeticOverflow("x86 V4 rows address"))?,
+    ])?;
+    assembler.instruction(&[0x48, 0x85, 0xf6])?;
+    assembler.branch(&[0x0f, 0x84], framed_fallback)?;
+    let class_map_offset = i32::try_from(FROZEN_PREPARED_HEADER_V1_CLASS_MAP_OFFSET)
+        .map_err(|_| ObjectError::ArithmeticOverflow("x86 V4 inline class map"))?;
+    let mut inline_class_map = vec![0x4c, 0x8d, 0x8f];
+    inline_class_map.extend_from_slice(&class_map_offset.to_le_bytes());
+    assembler.instruction(&inline_class_map)?;
+    let initial_row_offset = i32::try_from(FROZEN_PREPARED_HEADER_V1_FORWARD_INITIAL_ROW_OFFSET)
+        .map_err(|_| ObjectError::ArithmeticOverflow("x86 V4 initial row"))?;
+    let mut load_initial_row = vec![0x44, 0x8b, 0x87];
+    load_initial_row.extend_from_slice(&initial_row_offset.to_le_bytes());
+    assembler.instruction(&load_initial_row)?;
+    // R8 is the current row pointer. The guard proved that the header mirror
+    // is a class-aligned cell offset within the complete unpadded extent.
+    assembler.instruction(&[0x4e, 0x8d, 0x04, 0x46])?;
+    if root_setup.is_some() {
+        assembler.instruction(&[
+            0x48,
+            0xc7,
+            0x44,
+            0x24,
+            ROOT_SCANNER_REPRESENTATION_OFFSET,
+            ROOT_SCANNER_COMPACT_V4,
+            0,
+            0,
+            0,
+        ])?;
+        // Root scanners borrow every convenient caller-saved scalar. Retain
+        // the immutable root pointer in a compact-only frame word so the scan
+        // loop can recognize restartable root transitions with one compare.
+        assembler.instruction(&[0x4c, 0x89, 0x44, 0x24, 0x50])?;
+    }
+    assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x18])?;
+    assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x40])?;
+    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x48])?;
+    if let Some(root_setup) = root_setup {
+        assembler.branch(&[0xe9], root_setup)?;
+    } else if output != OutputContract::Exists {
+        assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x60, 0, 0, 0, 0])?;
+    }
+
+    assembler.bind(v4_scan)?;
+    assembler.instruction(&[0x48, 0x39, 0xca])?;
+    assembler.branch(
+        &[0x0f, 0x83],
+        native_complete.unwrap_or(native_no_match),
+    )?;
+    if let Some(root_vector) = root_vector {
+        let non_root = assembler.label()?;
+        assembler.instruction(&[0x4c, 0x3b, 0x44, 0x24, 0x50])?;
+        assembler.branch(&[0x0f, 0x85], non_root)?;
+        if output != OutputContract::Exists {
+            assembler.instruction(&[0x48, 0x83, 0x7c, 0x24, 0x60, 0])?;
+            assembler.branch(&[0x0f, 0x85], non_root)?;
+        }
+        assembler.branch(&[0xe9], root_vector)?;
+        assembler.bind(non_root)?;
+    }
+
+    assembler.bind(v4_table_scan)?;
+    assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
+    assembler.instruction(&[0x47, 0x0f, 0xb6, 0x14, 0x11])?;
+    assembler.instruction(&[0x47, 0x0f, 0xb7, 0x14, 0x50])?;
+    assembler.instruction(&[0x48, 0xff, 0xc2])?;
+    assembler.instruction(&[0x41, 0xf7, 0xc2, 0x00, 0x80, 0x00, 0x00])?;
+    if output == OutputContract::Exists {
+        assembler.branch(&[0x0f, 0x85], native_match)?;
+    } else {
+        let not_accepting = assembler.label()?;
+        assembler.branch(&[0x0f, 0x84], not_accepting)?;
+        assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x60])?;
+        assembler.bind(not_accepting)?;
+    }
+    assembler.instruction(&[0x41, 0x81, 0xe2, 0xff, 0x7f, 0x00, 0x00])?;
+    assembler.instruction(&[0x45, 0x85, 0xd2])?;
+    assembler.branch(
+        &[0x0f, 0x84],
+        native_complete.unwrap_or(native_no_match),
+    )?;
+    // V4 tokens are one-based destination cell-row offsets. This single LEA
+    // performs the complete state update with no ordinal scaling dispatch.
+    assembler.instruction(&[0x4e, 0x8d, 0x44, 0x56, 0xfe])?;
+    assembler.branch(&[0xe9], v4_scan)?;
 
     assembler.bind(v3_enter)?;
     if root_plan.is_some() {
@@ -14064,7 +14272,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
             (Some(X86DynamicRootPlan::Exact { storage, .. }), Some(_)) => {
                 // The relocated identity precedes the stable exact tables.
                 // Borrow R9 only during vector-constant installation, then
-                // restore the active V2 or inline-V3 class map.
+                // restore the active V2 or inline-V3/V4 class map.
                 assembler.instruction(&[0x48, 0x8b, 0x04, 0x24])?;
                 assembler.instruction(&[0x48, 0x83, 0xc0, 32])?;
                 assembler.instruction(&[0x48, 0x89, 0x44, 0x24, 0x08])?;
@@ -14175,8 +14383,9 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     assembler.branch(&[0xe9], pointer_table_scan)?;
 
     if let Some(root_candidate) = root_candidate {
-        let offset_candidate = assembler.label()?;
+        let v4_candidate = assembler.label()?;
         let v3_candidate = assembler.label()?;
+        let offset_candidate = assembler.label()?;
         assembler.bind(root_candidate)?;
         assembler.instruction(&[
             0x48,
@@ -14185,6 +14394,8 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
             0x24,
             ROOT_SCANNER_REPRESENTATION_OFFSET,
         ])?;
+        assembler.instruction(&[0x48, 0x83, 0xf8, ROOT_SCANNER_COMPACT_V4])?;
+        assembler.branch(&[0x0f, 0x84], v4_candidate)?;
         assembler.instruction(&[0x48, 0x83, 0xf8, ROOT_SCANNER_COMPACT_V3])?;
         assembler.branch(&[0x0f, 0x84], v3_candidate)?;
         if tracks_root_scanner_hits {
@@ -14200,6 +14411,29 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
         assembler.bind(offset_candidate)?;
         assembler.instruction(&[0x41, 0x8b, 0x43, NATIVE_ROWS_LOOP_COUNT as u8])?;
         assembler.branch(&[0xe9], table_scan)?;
+
+        assembler.bind(v4_candidate)?;
+        assembler.instruction(&[
+            0x49,
+            0x8b,
+            0x73,
+            u8::try_from(FROZEN_DYNAMIC_ROWS_V3_ROWS_ADDRESS_OFFSET)
+                .map_err(|_| ObjectError::ArithmeticOverflow("x86 V4 candidate rows"))?,
+        ])?;
+        assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, 0x10])?;
+        let class_map_offset = i32::try_from(FROZEN_PREPARED_HEADER_V1_CLASS_MAP_OFFSET)
+            .map_err(|_| ObjectError::ArithmeticOverflow("x86 V4 candidate class map"))?;
+        let mut inline_class_map = vec![0x4c, 0x8d, 0x88];
+        inline_class_map.extend_from_slice(&class_map_offset.to_le_bytes());
+        assembler.instruction(&inline_class_map)?;
+        let initial_row_offset =
+            i32::try_from(FROZEN_PREPARED_HEADER_V1_FORWARD_INITIAL_ROW_OFFSET)
+                .map_err(|_| ObjectError::ArithmeticOverflow("x86 V4 candidate row"))?;
+        let mut load_initial_row = vec![0x44, 0x8b, 0x80];
+        load_initial_row.extend_from_slice(&initial_row_offset.to_le_bytes());
+        assembler.instruction(&load_initial_row)?;
+        assembler.instruction(&[0x4e, 0x8d, 0x04, 0x46])?;
+        assembler.branch(&[0xe9], v4_table_scan)?;
 
         assembler.bind(v3_candidate)?;
         assembler.instruction(&[
@@ -15943,6 +16177,22 @@ fn aarch64_add_x_lsl(
         | aarch64_reg(destination, 0)?)
 }
 
+fn aarch64_add_x_uxtw(
+    destination: u8,
+    left: u8,
+    right: u8,
+    shift: u8,
+) -> Result<u32, ObjectError> {
+    if shift > 4 {
+        return Err(ObjectError::InvalidModule("AArch64 ADD X UXTW shift"));
+    }
+    Ok(0x8b20_4000
+        | aarch64_reg(right, 16)?
+        | (u32::from(shift) << 10)
+        | aarch64_reg(left, 5)?
+        | aarch64_reg(destination, 0)?)
+}
+
 fn aarch64_add_w_reg(destination: u8, left: u8, right: u8) -> Result<u32, ObjectError> {
     Ok(
         0x0b00_0000
@@ -15991,6 +16241,13 @@ fn aarch64_msub_x(
     Ok(0x9b00_8000
         | aarch64_reg(right, 16)?
         | aarch64_reg(minuend, 10)?
+        | aarch64_reg(left, 5)?
+        | aarch64_reg(destination, 0)?)
+}
+
+fn aarch64_mul_x(destination: u8, left: u8, right: u8) -> Result<u32, ObjectError> {
+    Ok(0x9b00_7c00
+        | aarch64_reg(right, 16)?
         | aarch64_reg(left, 5)?
         | aarch64_reg(destination, 0)?)
 }
@@ -20787,22 +21044,23 @@ fn lower_aarch64_slow_partial_wrapper(
 
 #[allow(
     clippy::too_many_lines,
-    reason = "the additive V3 capability and full verifier share one explicit fail-closed target lowering"
+    reason = "compact capabilities and full verifiers share one explicit fail-closed target lowering"
 )]
-fn aarch64_emit_frozen_compact_v3_entry(
+fn aarch64_emit_frozen_compact_entry(
     assembler: &mut Aarch64Assembler,
-    try_v2: Aarch64Label,
+    format: FrozenCompactNativeFormat,
+    try_older: Aarch64Label,
     call_preflight: Aarch64Label,
-    v3_enter: Aarch64Label,
-    guard_mode: FrozenCompactV3GuardMode,
+    compact_enter: Aarch64Label,
+    guard_mode: FrozenCompactGuardMode,
 ) -> Result<(), ObjectError> {
     let offset = |value: usize, context| {
         u16::try_from(value).map_err(|_| ObjectError::ArithmeticOverflow(context))
     };
 
-    // The tail layouts overlap, so select V3 solely through its distinct V1
-    // flag. V1/V2 objects branch to the unchanged V2 validator before any V3
-    // extent or tail field is consumed.
+    // The tail layouts overlap, so select the format solely through its
+    // distinct V1 flag. Other generations branch to the older validator
+    // before this format's extent or tail fields are consumed.
     assembler.instruction(aarch64_load_w_imm(
         8,
         0,
@@ -20811,10 +21069,10 @@ fn aarch64_emit_frozen_compact_v3_entry(
     aarch64_load_u32_constant(
         assembler,
         9,
-        FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3,
+        format.flag(),
     )?;
     assembler.instruction(aarch64_cmp_w(8, 9)?)?;
-    assembler.branch_cond(AARCH64_NE, try_v2)?;
+    assembler.branch_cond(AARCH64_NE, try_older)?;
 
     assembler.instruction(aarch64_load_x_imm(
         8,
@@ -20827,8 +21085,8 @@ fn aarch64_emit_frozen_compact_v3_entry(
     aarch64_load_u64_constant(
         assembler,
         9,
-        u64::try_from(FROZEN_PREPARED_HEADER_V3_BYTES)
-            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 V3 header extent"))?,
+        u64::try_from(format.header_bytes())
+            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 compact header extent"))?,
     )?;
     assembler.instruction(aarch64_cmp_x(8, 9)?)?;
     assembler.branch_cond(AARCH64_NE, call_preflight)?;
@@ -20887,7 +21145,7 @@ fn aarch64_emit_frozen_compact_v3_entry(
         assembler.branch_cond(AARCH64_NE, call_preflight)?;
     }
 
-    if guard_mode == FrozenCompactV3GuardMode::FullVerifier {
+    if guard_mode == FrozenCompactGuardMode::FullVerifier {
         for (field, context) in [
             (
                 FROZEN_PREPARED_HEADER_V1_REVERSE_ROWS_ADDRESS_OFFSET,
@@ -20919,8 +21177,8 @@ fn aarch64_emit_frozen_compact_v3_entry(
         13,
         0,
         offset(
-            FROZEN_PREPARED_HEADER_V3_DYNAMIC_ROWS_OFFSET,
-            "AArch64 V3 tail offset",
+            format.tail_offset(),
+            "AArch64 compact tail offset",
         )?,
     )?)?;
     assembler.instruction(aarch64_load_x_imm(
@@ -20931,7 +21189,7 @@ fn aarch64_emit_frozen_compact_v3_entry(
             "AArch64 V3 ready seal",
         )?,
     )?)?;
-    aarch64_load_u64_constant(assembler, 9, FROZEN_PREPARED_HEADER_V3_READY_SEAL)?;
+    aarch64_load_u64_constant(assembler, 9, format.ready_seal())?;
     assembler.instruction(aarch64_cmp_x(8, 9)?)?;
     assembler.branch_cond(AARCH64_NE, call_preflight)?;
     assembler.instruction(aarch64_load_w_imm(
@@ -20942,11 +21200,11 @@ fn aarch64_emit_frozen_compact_v3_entry(
             "AArch64 V3 format version",
         )?,
     )?)?;
-    aarch64_load_u32_constant(assembler, 9, FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION)?;
+    aarch64_load_u32_constant(assembler, 9, format.format_version())?;
     assembler.instruction(aarch64_cmp_w(8, 9)?)?;
     assembler.branch_cond(AARCH64_NE, call_preflight)?;
 
-    if guard_mode == FrozenCompactV3GuardMode::FullVerifier {
+    if guard_mode == FrozenCompactGuardMode::FullVerifier {
         // The active capability covers these setup-validated immutable
         // mirrors, pointer constraints, and the complete geometry below.
         // Retain this mode as an independently emitted full verifier.
@@ -21004,16 +21262,18 @@ fn aarch64_emit_frozen_compact_v3_entry(
     assembler.instruction(aarch64_cmp_x_imm(8, 0)?)?;
     assembler.branch_cond(AARCH64_EQ, call_preflight)?;
 
-    if guard_mode == FrozenCompactV3GuardMode::FullVerifier {
+    if guard_mode == FrozenCompactGuardMode::FullVerifier {
         assembler.instruction(aarch64_load_w_imm(
             10,
             13,
             offset(FROZEN_DYNAMIC_ROWS_V3_STATE_COUNT_OFFSET, "AArch64 V3 states")?,
         )?)?;
         assembler.branch_zero_w(10, call_preflight)?;
-        aarch64_load_u32_constant(assembler, 8, 0x7fff)?;
-        assembler.instruction(aarch64_cmp_w(10, 8)?)?;
-        assembler.branch_cond(AARCH64_HI, call_preflight)?;
+        if format == FrozenCompactNativeFormat::StateOrdinalV3 {
+            aarch64_load_u32_constant(assembler, 8, 0x7fff)?;
+            assembler.instruction(aarch64_cmp_w(10, 8)?)?;
+            assembler.branch_cond(AARCH64_HI, call_preflight)?;
+        }
         assembler.instruction(aarch64_load_w_imm(
             11,
             13,
@@ -21025,23 +21285,37 @@ fn aarch64_emit_frozen_compact_v3_entry(
         assembler.instruction(aarch64_load_w_imm(
             12,
             13,
-            offset(FROZEN_DYNAMIC_ROWS_V3_ROW_SHIFT_OFFSET, "AArch64 V3 row shift")?,
+            offset(
+                FROZEN_DYNAMIC_ROWS_V3_ROW_SHIFT_OFFSET,
+                "AArch64 compact row shift",
+            )?,
         )?)?;
-        assembler.instruction(aarch64_cmp_w_imm(12, 1)?)?;
-        assembler.branch_cond(AARCH64_LO, call_preflight)?;
-        assembler.instruction(aarch64_cmp_w_imm(12, 9)?)?;
-        assembler.branch_cond(AARCH64_HI, call_preflight)?;
+        match format {
+            FrozenCompactNativeFormat::StateOrdinalV3 => {
+                assembler.instruction(aarch64_cmp_w_imm(12, 1)?)?;
+                assembler.branch_cond(AARCH64_LO, call_preflight)?;
+                assembler.instruction(aarch64_cmp_w_imm(12, 9)?)?;
+                assembler.branch_cond(AARCH64_HI, call_preflight)?;
 
-        // Reconstruct next_power_of_two(class_count) exactly. The descriptor's
-        // row shift is in bytes, so its physical-cell exponent is shift-1.
-        assembler.instruction(aarch64_sub_w_imm(8, 12, 1)?)?;
-        assembler.instruction(aarch64_movz_x(9, 1, 0)?)?;
-        assembler.instruction(aarch64_lslv_x(9, 9, 8)?)?;
-        assembler.instruction(aarch64_cmp_x(9, 11)?)?;
-        assembler.branch_cond(AARCH64_LO, call_preflight)?;
-        assembler.instruction(aarch64_lsr_x_imm(7, 9, 1)?)?;
-        assembler.instruction(aarch64_cmp_x(11, 7)?)?;
-        assembler.branch_cond(AARCH64_LS, call_preflight)?;
+                // Reconstruct next_power_of_two(class_count) exactly. The
+                // descriptor's row shift is in bytes, so its physical-cell
+                // exponent is shift-1.
+                assembler.instruction(aarch64_sub_w_imm(8, 12, 1)?)?;
+                assembler.instruction(aarch64_movz_x(9, 1, 0)?)?;
+                assembler.instruction(aarch64_lslv_x(9, 9, 8)?)?;
+                assembler.instruction(aarch64_cmp_x(9, 11)?)?;
+                assembler.branch_cond(AARCH64_LO, call_preflight)?;
+                assembler.instruction(aarch64_lsr_x_imm(7, 9, 1)?)?;
+                assembler.instruction(aarch64_cmp_x(11, 7)?)?;
+                assembler.branch_cond(AARCH64_LS, call_preflight)?;
+            }
+            FrozenCompactNativeFormat::CellOffsetV4 => {
+                assembler.branch_nonzero_w(12, call_preflight)?;
+                // V4 is unpadded, so its physical and logical class counts are
+                // identical and need no shift reconstruction.
+                assembler.instruction(aarch64_mov_x(9, 11)?)?;
+            }
+        }
         assembler.instruction(aarch64_load_w_imm(
             7,
             0,
@@ -21053,7 +21327,17 @@ fn aarch64_emit_frozen_compact_v3_entry(
         assembler.instruction(aarch64_cmp_w(7, 9)?)?;
         assembler.branch_cond(AARCH64_NE, call_preflight)?;
 
-        assembler.instruction(aarch64_lslv_x(7, 10, 8)?)?;
+        match format {
+            FrozenCompactNativeFormat::StateOrdinalV3 => {
+                assembler.instruction(aarch64_lslv_x(7, 10, 8)?)?;
+            }
+            FrozenCompactNativeFormat::CellOffsetV4 => {
+                assembler.instruction(aarch64_mul_x(7, 10, 9)?)?;
+                aarch64_load_u32_constant(assembler, 8, 0x7fff)?;
+                assembler.instruction(aarch64_cmp_x(7, 8)?)?;
+                assembler.branch_cond(AARCH64_HI, call_preflight)?;
+            }
+        }
         assembler.instruction(aarch64_load_x_imm(
             12,
             0,
@@ -21074,7 +21358,14 @@ fn aarch64_emit_frozen_compact_v3_entry(
         )?)?;
         assembler.instruction(aarch64_cmp_w(6, 10)?)?;
         assembler.branch_cond(AARCH64_HS, call_preflight)?;
-        assembler.instruction(aarch64_lslv_x(12, 6, 8)?)?;
+        match format {
+            FrozenCompactNativeFormat::StateOrdinalV3 => {
+                assembler.instruction(aarch64_lslv_x(12, 6, 8)?)?;
+            }
+            FrozenCompactNativeFormat::CellOffsetV4 => {
+                assembler.instruction(aarch64_mul_x(12, 6, 9)?)?;
+            }
+        }
         assembler.instruction(aarch64_load_w_imm(
             7,
             0,
@@ -21085,9 +21376,7 @@ fn aarch64_emit_frozen_compact_v3_entry(
         )?)?;
         assembler.instruction(aarch64_cmp_w(7, 12)?)?;
         assembler.branch_cond(AARCH64_NE, call_preflight)?;
-    }
 
-    if guard_mode == FrozenCompactV3GuardMode::FullVerifier {
         for (field, expected, context) in [
             (
                 FROZEN_PREPARED_HEADER_V1_UNFILLED_CELL_OFFSET,
@@ -21112,7 +21401,7 @@ fn aarch64_emit_frozen_compact_v3_entry(
         }
     }
 
-    // The V3 owner normalizes complete immutable rows by suppressing mutable
+    // The compact V3/V4 owner normalizes complete immutable rows by suppressing mutable
     // learned-loop ownership. Exact zero/MAX metadata proves that this direct
     // loop may scalar-step all closed states without racing an overlay.
     assembler.instruction(aarch64_load_w_imm(
@@ -21143,8 +21432,42 @@ fn aarch64_emit_frozen_compact_v3_entry(
     assembler.instruction(aarch64_store_x(8, 31, 48)?)?;
     assembler.instruction(aarch64_load_x_imm(8, 31, 32)?)?;
     assembler.instruction(aarch64_store_x(8, 31, 56)?)?;
-    assembler.branch(v3_enter)?;
+    assembler.branch(compact_enter)?;
     Ok(())
+}
+
+fn aarch64_emit_frozen_compact_v3_entry(
+    assembler: &mut Aarch64Assembler,
+    try_v2: Aarch64Label,
+    call_preflight: Aarch64Label,
+    v3_enter: Aarch64Label,
+    guard_mode: FrozenCompactGuardMode,
+) -> Result<(), ObjectError> {
+    aarch64_emit_frozen_compact_entry(
+        assembler,
+        FrozenCompactNativeFormat::StateOrdinalV3,
+        try_v2,
+        call_preflight,
+        v3_enter,
+        guard_mode,
+    )
+}
+
+fn aarch64_emit_frozen_compact_v4_entry(
+    assembler: &mut Aarch64Assembler,
+    try_v3: Aarch64Label,
+    call_preflight: Aarch64Label,
+    v4_enter: Aarch64Label,
+    guard_mode: FrozenCompactGuardMode,
+) -> Result<(), ObjectError> {
+    aarch64_emit_frozen_compact_entry(
+        assembler,
+        FrozenCompactNativeFormat::CellOffsetV4,
+        try_v3,
+        call_preflight,
+        v4_enter,
+        guard_mode,
+    )
 }
 
 #[allow(
@@ -21635,6 +21958,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     const ROOT_SCANNER_SAVED_X19_OFFSET: u16 = 96;
     const ROOT_SCANNER_OFFSET_ROWS: u16 = 1;
     const ROOT_SCANNER_COMPACT_V3: u16 = 2;
+    const ROOT_SCANNER_COMPACT_V4: u16 = 3;
     let tracks_root_scanner_hits = allow_direct_hole_continuation && root_plan.is_some();
     let frame_bytes = if root_plan.is_some() {
         ROOT_SCANNER_FRAME_BYTES
@@ -21666,7 +21990,11 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
         Ok::<(), ObjectError>(())
     };
     let preflight_enter = assembler.label()?;
+    let try_v3 = assembler.label()?;
     let try_v2 = assembler.label()?;
+    let v4_enter = assembler.label()?;
+    let v4_scan = assembler.label()?;
+    let v4_table_scan = assembler.label()?;
     let v3_enter = assembler.label()?;
     let v3_dispatch = assembler.label()?;
     let mut v3_shift_entries = [0_usize; 9];
@@ -21772,17 +22100,26 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     // SP+88.
     assembler.instruction(aarch64_store_x(6, 31, 80)?)?;
 
+    aarch64_emit_frozen_compact_v4_entry(
+        &mut assembler,
+        try_v3,
+        call_preflight,
+        v4_enter,
+        FrozenCompactGuardMode::ActiveCapability,
+    )?;
+    assembler.bind(try_v3)?;
     aarch64_emit_frozen_compact_v3_entry(
         &mut assembler,
         try_v2,
         call_preflight,
         v3_enter,
-        FrozenCompactV3GuardMode::ActiveCapability,
+        FrozenCompactGuardMode::ActiveCapability,
     )?;
     assembler.bind(try_v2)?;
     if root_plan.is_none() {
-        // Only the seal/identity-authenticated active V3 capability may retain
-        // a scanner-free long window. V1/V2 descriptors preserve the canonical
+        // Only a seal/identity-authenticated active compact capability may
+        // retain a scanner-free long window. V1/V2 descriptors preserve the
+        // canonical
         // K0 crossover before any mutable row address is followed.
         assembler.instruction(aarch64_load_x_imm(8, 31, 32)?)?;
         assembler.instruction(aarch64_load_x_imm(9, 31, 24)?)?;
@@ -21801,9 +22138,9 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
 
     assembler.bind(call_preflight)?;
     if root_plan.is_none() {
-        // A failed V3 capability authentication and every cold/mutable
-        // preflight keep the historical ceiling. This path is unreachable
-        // from valid V3 entry.
+        // Failed compact capability authentication and every cold/mutable
+        // preflight keep the historical ceiling. Valid compact entries cannot
+        // reach here.
         assembler.instruction(aarch64_load_x_imm(8, 31, 32)?)?;
         assembler.instruction(aarch64_load_x_imm(9, 31, 24)?)?;
         assembler.instruction(aarch64_sub_x_reg(8, 8, 9)?)?;
@@ -21830,6 +22167,87 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     restore_root_scanner_counter(&mut assembler)?;
     assembler.instruction(aarch64_add_x_imm(31, 31, frame_bytes)?)?;
     assembler.instruction(0xd65f_03c0)?;
+
+    assembler.bind(v4_enter)?;
+    assembler.instruction(aarch64_load_x_imm(
+        15,
+        13,
+        u16::try_from(FROZEN_DYNAMIC_ROWS_V3_ROWS_ADDRESS_OFFSET)
+            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 V4 rows address"))?,
+    )?)?;
+    assembler.instruction(aarch64_cmp_x_imm(15, 0)?)?;
+    assembler.branch_cond(AARCH64_EQ, framed_fallback)?;
+    // Bias the immutable rows base once. A one-based V4 token can then become
+    // its destination pointer with one ADD Xd, Xbase, Wtoken, UXTW #1.
+    assembler.instruction(aarch64_sub_x_imm(15, 15, 2)?)?;
+    assembler.instruction(aarch64_add_x_imm(
+        14,
+        0,
+        u16::try_from(FROZEN_PREPARED_HEADER_V1_CLASS_MAP_OFFSET)
+            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 V4 inline class map"))?,
+    )?)?;
+    assembler.instruction(aarch64_load_w_imm(
+        11,
+        0,
+        u16::try_from(FROZEN_PREPARED_HEADER_V1_FORWARD_INITIAL_ROW_OFFSET)
+            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 V4 initial row"))?,
+    )?)?;
+    assembler.instruction(aarch64_add_x_imm(11, 11, 1)?)?;
+    assembler.instruction(aarch64_add_x_uxtw(11, 15, 11, 1)?)?;
+    assembler.instruction(aarch64_mov_x(1, 11)?)?;
+    if root_plan.is_some() {
+        assembler.instruction(aarch64_movz_x(8, ROOT_SCANNER_COMPACT_V4, 0)?)?;
+        assembler.instruction(aarch64_store_x(
+            8,
+            31,
+            ROOT_SCANNER_REPRESENTATION_OFFSET,
+        )?)?;
+    }
+    assembler.instruction(aarch64_load_x_imm(0, 31, 8)?)?;
+    assembler.instruction(aarch64_load_x_imm(2, 31, 48)?)?;
+    assembler.instruction(aarch64_load_x_imm(3, 31, 56)?)?;
+    if let Some(root_setup) = root_setup {
+        assembler.branch(root_setup)?;
+    } else if output != OutputContract::Exists {
+        assembler.instruction(aarch64_store_x(31, 31, 80)?)?;
+    }
+
+    assembler.bind(v4_scan)?;
+    assembler.instruction(aarch64_cmp_x(2, 3)?)?;
+    assembler.branch_cond(
+        AARCH64_HS,
+        native_complete.unwrap_or(native_no_match),
+    )?;
+    if let Some(root_dispatch) = root_dispatch {
+        let non_root = assembler.label()?;
+        assembler.instruction(aarch64_cmp_x(11, 1)?)?;
+        assembler.branch_cond(AARCH64_NE, non_root)?;
+        if output != OutputContract::Exists {
+            assembler.instruction(aarch64_load_x_imm(12, 31, 80)?)?;
+            assembler.instruction(aarch64_cmp_x_imm(12, 0)?)?;
+            assembler.branch_cond(AARCH64_NE, non_root)?;
+        }
+        assembler.branch(root_dispatch)?;
+        assembler.bind(non_root)?;
+    }
+
+    assembler.bind(v4_table_scan)?;
+    assembler.instruction(aarch64_load_byte_reg(8, 0, 2)?)?;
+    assembler.instruction(aarch64_load_byte_reg(8, 14, 8)?)?;
+    assembler.instruction(aarch64_load_h_uxtw(8, 11, 8)?)?;
+    assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
+    if output == OutputContract::Exists {
+        assembler.branch_bit_set_w(8, 15, native_match)?;
+    } else {
+        let not_accepting = assembler.label()?;
+        assembler.branch_bit_clear_w(8, 15, not_accepting)?;
+        assembler.instruction(aarch64_store_x(2, 31, 80)?)?;
+        assembler.bind(not_accepting)?;
+    }
+    assembler.instruction(aarch64_and_low_w(8, 8, 15)?)?;
+    assembler.branch_zero_w(8, native_complete.unwrap_or(native_no_match))?;
+    assembler.instruction(aarch64_add_x_uxtw(11, 15, 8, 1)?)?;
+    assembler.branch(v4_scan)?;
 
     assembler.bind(v3_enter)?;
     if root_plan.is_some() {
@@ -22110,12 +22528,12 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
             // The post-preflight setup has either materialized the
             // identity-backed table base in X5 or no longer needs the saved
             // identity address. Reuse its spare frame word as the pending
-            // selected endpoint for both V2 and compact V3.
+            // selected endpoint for V2 and both compact formats.
             assembler.instruction(aarch64_store_x(31, 31, 80)?)?;
         }
         // Keep the selected ASIMD/SVE/SVE2 or scalar graph scanner. Candidate
         // hits authenticate the active representation, reload its row state,
-        // and enter either the V2 table or immediate-shift compact V3 loop.
+        // and enter V2, direct cell-offset V4, or immediate-shift V3.
         assembler.branch(root_dispatch.ok_or(ObjectError::InvalidModule(
             "AArch64 dynamic root setup has no dispatch label",
         ))?)?;
@@ -22200,14 +22618,17 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     assembler.branch(pointer_table_scan)?;
 
     if let Some(root_candidate) = root_candidate {
-        let offset_candidate = assembler.label()?;
+        let v4_candidate = assembler.label()?;
         let v3_candidate = assembler.label()?;
+        let offset_candidate = assembler.label()?;
         assembler.bind(root_candidate)?;
         assembler.instruction(aarch64_load_x_imm(
             8,
             31,
             ROOT_SCANNER_REPRESENTATION_OFFSET,
         )?)?;
+        assembler.instruction(aarch64_cmp_x_imm(8, ROOT_SCANNER_COMPACT_V4)?)?;
+        assembler.branch_cond(AARCH64_EQ, v4_candidate)?;
         assembler.instruction(aarch64_cmp_x_imm(8, ROOT_SCANNER_COMPACT_V3)?)?;
         assembler.branch_cond(AARCH64_EQ, v3_candidate)?;
         if tracks_root_scanner_hits {
@@ -22227,6 +22648,31 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
                 .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic loop count"))?,
         )?)?;
         assembler.branch(table_scan)?;
+
+        assembler.bind(v4_candidate)?;
+        assembler.instruction(aarch64_load_x_imm(8, 31, 0)?)?;
+        assembler.instruction(aarch64_load_x_imm(
+            15,
+            13,
+            u16::try_from(FROZEN_DYNAMIC_ROWS_V3_ROWS_ADDRESS_OFFSET)
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 V4 candidate rows"))?,
+        )?)?;
+        assembler.instruction(aarch64_sub_x_imm(15, 15, 2)?)?;
+        assembler.instruction(aarch64_add_x_imm(
+            14,
+            8,
+            u16::try_from(FROZEN_PREPARED_HEADER_V1_CLASS_MAP_OFFSET)
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 V4 candidate class map"))?,
+        )?)?;
+        assembler.instruction(aarch64_load_w_imm(
+            11,
+            8,
+            u16::try_from(FROZEN_PREPARED_HEADER_V1_FORWARD_INITIAL_ROW_OFFSET)
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 V4 candidate row"))?,
+        )?)?;
+        assembler.instruction(aarch64_add_x_imm(11, 11, 1)?)?;
+        assembler.instruction(aarch64_add_x_uxtw(11, 15, 11, 1)?)?;
+        assembler.branch(v4_table_scan)?;
 
         assembler.bind(v3_candidate)?;
         assembler.instruction(aarch64_load_x_imm(8, 31, 0)?)?;
@@ -23444,6 +23890,7 @@ mod tests {
         code.windows(compact_load.len())
             .enumerate()
             .filter_map(|(offset, bytes)| (bytes == compact_load).then_some(offset))
+            .skip(1)
             .zip(1_u8..=9)
             .filter(|&(load, shift)| {
                 let tail_shift = [0x49, 0xc1, 0xe2, shift];
@@ -24606,8 +25053,15 @@ mod tests {
             })
             .expect("learned-row ownership load");
         let table_byte = words
-            .iter()
-            .position(|&word| word == aarch64_load_byte_reg(8, 0, 2).unwrap())
+            .windows(3)
+            .position(|window| {
+                window
+                    == [
+                        aarch64_load_byte_reg(8, 0, 2).unwrap(),
+                        aarch64_load_byte_reg(10, 14, 8).unwrap(),
+                        aarch64_add_w_reg(10, 11, 10).unwrap(),
+                    ]
+            })
             .expect("canonical table byte load");
         let first_consumption = table_byte
             + words[table_byte..]
@@ -27582,13 +28036,23 @@ mod tests {
 
             assert_eq!(
                 occurrences(code, &[0x47, 0x0f, 0xb7, 0x14, 0x50]),
-                9,
-                "the {accelerator:?} scanner must feed every compact row shift"
+                10,
+                "the {accelerator:?} scanner must feed V4 and every V3 row shift"
             );
             assert_eq!(
                 x86_v3_initial_state_body_count(code),
                 9,
                 "each compact shift must return the initial state to {accelerator:?}"
+            );
+            assert_eq!(
+                occurrences(code, &[0x4e, 0x8d, 0x04, 0x46]),
+                2,
+                "V4 entry and root-candidate reload must rebuild the same root pointer"
+            );
+            assert_eq!(
+                occurrences(code, &[0x4e, 0x8d, 0x44, 0x56, 0xfe]),
+                1,
+                "V4 transitions must retain one direct cell-offset backedge"
             );
             let candidate_prefix = [
                 0x48,
@@ -27599,12 +28063,12 @@ mod tests {
                 0x48,
                 0x83,
                 0xf8,
-                0x02,
+                0x03,
             ];
             let candidate = code
                 .windows(candidate_prefix.len())
                 .position(|bytes| bytes == candidate_prefix)
-                .expect("tagged pointer/offset/V3 scanner candidate dispatcher");
+                .expect("tagged pointer/offset/V3/V4 scanner candidate dispatcher");
             // The assembler may invert the scalar membership diamond, making
             // its hit edge conditional, while the vector hit remains an
             // unconditional jump. Restrict the audit to the scanner bodies,
@@ -27630,7 +28094,7 @@ mod tests {
             assert_eq!(
                 occurrences(code, &[0x49, 0xff, 0xc4]),
                 1,
-                "only a non-V3 scanner candidate counts one scanner hit: {accelerator:?}"
+                "only a mutable scanner candidate counts one scanner hit: {accelerator:?}"
             );
             assert_eq!(
                 occurrences(code, &[0xc5, 0xf8, 0x77]),
@@ -28151,8 +28615,8 @@ mod tests {
                         .windows(5)
                         .filter(|bytes| *bytes == [0x47, 0x0f, 0xb7, 0x14, 0x50])
                         .count(),
-                    9,
-                    "exact {accelerator:?} scanner must feed every compact row shift"
+                    10,
+                    "exact {accelerator:?} scanner must feed V4 and every V3 row shift"
                 );
                 assert_eq!(
                     x86_v3_initial_state_body_count(&emission.code),
@@ -28352,7 +28816,31 @@ mod tests {
                         .filter(|&&word| word == aarch64_load_h_uxtw(8, 11, 6).unwrap())
                         .count(),
                     9,
-                    "{target:?}/{output:?} scanner must feed all compact row shifts"
+                    "{target:?}/{output:?} scanner must feed all V3 row shifts"
+                );
+                assert_eq!(
+                    words
+                        .iter()
+                        .filter(|&&word| word == aarch64_load_h_uxtw(8, 11, 8).unwrap())
+                        .count(),
+                    1,
+                    "{target:?}/{output:?} scanner must feed direct V4 rows"
+                );
+                assert_eq!(
+                    words
+                        .iter()
+                        .filter(|&&word| word == aarch64_add_x_uxtw(11, 15, 11, 1).unwrap())
+                        .count(),
+                    2,
+                    "{target:?}/{output:?} V4 entry and candidate must rebuild the root pointer"
+                );
+                assert_eq!(
+                    words
+                        .iter()
+                        .filter(|&&word| word == aarch64_add_x_uxtw(11, 15, 8, 1).unwrap())
+                        .count(),
+                    1,
+                    "{target:?}/{output:?} V4 needs one direct cell-offset backedge"
                 );
                 assert_eq!(
                     words
@@ -28369,7 +28857,7 @@ mod tests {
                         })
                         .count(),
                     9,
-                    "{target:?}/{output:?} compact rows must re-enter the same scanner"
+                    "{target:?}/{output:?} V3 rows must re-enter the same scanner"
                 );
                 let authenticated_loop_count = words
                     .iter()
@@ -28404,12 +28892,12 @@ mod tests {
                 );
                 let candidate_prefix = [
                     aarch64_load_x_imm(8, 31, 88).unwrap(),
-                    aarch64_cmp_x_imm(8, 2).unwrap(),
+                    aarch64_cmp_x_imm(8, 3).unwrap(),
                 ];
                 let candidate = words
                     .windows(candidate_prefix.len())
                     .position(|window| window == candidate_prefix)
-                    .expect("tagged AArch64 pointer/offset/V3 scanner candidate dispatcher");
+                    .expect("tagged AArch64 pointer/offset/V3/V4 scanner candidate dispatcher");
                 assert!(
                     (0..words.len())
                         .filter_map(|index| unconditional_target(&words, index))
@@ -28417,15 +28905,40 @@ mod tests {
                     "{target:?}/{output:?} scanner hit must reach compact candidate dispatch"
                 );
                 let v2_table = words
-                    .iter()
-                    .position(|&word| word == aarch64_load_byte_reg(8, 0, 2).unwrap())
+                    .windows(3)
+                    .position(|window| {
+                        window
+                            == [
+                                aarch64_load_byte_reg(8, 0, 2).unwrap(),
+                                aarch64_load_byte_reg(10, 14, 8).unwrap(),
+                                aarch64_add_w_reg(10, 11, 10).unwrap(),
+                            ]
+                    })
                     .expect("canonical V2 table transition");
-                let v3_candidate = conditional_target(&words, candidate + candidate_prefix.len())
-                    .expect("tagged V3 candidate edge");
+                let v4_candidate = conditional_target(
+                    &words,
+                    candidate + candidate_prefix.len(),
+                )
+                .expect("tagged V4 candidate edge");
+                assert_eq!(
+                    words[v4_candidate],
+                    aarch64_load_x_imm(8, 31, 0).unwrap(),
+                    "V4 selection must restore its header representation"
+                );
+                assert_eq!(
+                    words[candidate + candidate_prefix.len() + 1],
+                    aarch64_cmp_x_imm(8, 2).unwrap(),
+                    "V4 fallthrough must select the exact V3 tag"
+                );
+                let v3_candidate = conditional_target(
+                    &words,
+                    candidate + candidate_prefix.len() + 2,
+                )
+                .expect("tagged V3 candidate edge");
                 assert_eq!(
                     words[v3_candidate],
                     aarch64_load_x_imm(8, 31, 0).unwrap(),
-                    "V3 selection must restore its own representation"
+                    "V3 selection must restore its header representation"
                 );
                 let pointer_prefix = [
                     aarch64_load_byte_reg(8, 0, 2).unwrap(),
@@ -28893,12 +29406,12 @@ mod tests {
                 assert_eq!(
                     byte_occurrences(&code, &[0x48, 0xc7, 0x44, 0x24, 0x60, 0, 0, 0, 0]),
                     1,
-                    "V2 and compact V3 share one scanner endpoint initialization"
+                    "V2 and compact V3/V4 share one scanner endpoint initialization"
                 );
                 assert_eq!(
                     byte_occurrences(&code, &[0x48, 0x89, 0x54, 0x24, 0x60]),
-                    11,
-                    "offset, pointer, and nine compact V3 loops each publish an accepting endpoint"
+                    12,
+                    "offset, pointer, V4, and nine V3 loops each publish an accepting endpoint"
                 );
                 assert_eq!(
                     byte_occurrences(&code, &[0x4c, 0x8b, 0x5c, 0x24, 0x60]),
@@ -31046,7 +31559,7 @@ int main(void) {{
                     524_288,
                 )
                 .is_some(),
-            "the linked fixture must publish the production padded-u16 V3 owner"
+            "the linked fixture must publish the production compact-u16 owner"
         );
 
         let current_exe = std::env::current_exe().expect("current test executable");
@@ -35926,9 +36439,9 @@ int main(void) {{
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "one cross-ISA audit keeps V3 selection, identity authentication, and all compact row shifts together"
+        reason = "one cross-ISA audit keeps V4/V3 selection, identity authentication, and compact row addressing together"
     )]
-    fn frozen_compact_v3_authentication_and_u16_hot_loops_are_exact_cross_isa() {
+    fn frozen_compact_authentication_and_u16_hot_loops_are_exact_cross_isa() {
         fn occurrences(code: &[u8], needle: &[u8]) -> usize {
             code.windows(needle.len())
                 .filter(|window| *window == needle)
@@ -35944,7 +36457,93 @@ int main(void) {{
             0x8b00_0000 | (6_u32 << 16) | (9_u32 << 10) | (15_u32 << 5) | 11
         );
         assert!(aarch64_add_x_lsl(11, 15, 6, 64).is_err());
+        assert_eq!(
+            aarch64_add_x_uxtw(11, 15, 8, 1).unwrap(),
+            0x8b20_4000 | (8_u32 << 16) | (1_u32 << 10) | (15_u32 << 5) | 11
+        );
+        assert!(aarch64_add_x_uxtw(11, 15, 8, 5).is_err());
+        assert_eq!(
+            aarch64_mul_x(7, 10, 9).unwrap(),
+            0x9b00_7c00 | (9_u32 << 16) | (10_u32 << 5) | 7
+        );
         assert_eq!(aarch64_lslv_x(9, 9, 8).unwrap(), 0x9ac8_2129);
+
+        let mut x86_v4_auth = X86Assembler::new();
+        let x86_v4_try_v3 = x86_v4_auth.label().unwrap();
+        let x86_v4_preflight = x86_v4_auth.label().unwrap();
+        let x86_v4_enter = x86_v4_auth.label().unwrap();
+        x86_emit_frozen_compact_v4_entry(
+            &mut x86_v4_auth,
+            x86_v4_try_v3,
+            x86_v4_preflight,
+            x86_v4_enter,
+            FrozenCompactGuardMode::FullVerifier,
+        )
+        .unwrap();
+        for label in [x86_v4_try_v3, x86_v4_preflight, x86_v4_enter] {
+            x86_v4_auth.bind(label).unwrap();
+            x86_v4_auth.instruction(&[0xc3]).unwrap();
+        }
+        let x86_v4_auth = x86_v4_auth.finish().unwrap();
+        let mut x86_v4_capability = X86Assembler::new();
+        let x86_v4_capability_try_v3 = x86_v4_capability.label().unwrap();
+        let x86_v4_capability_preflight = x86_v4_capability.label().unwrap();
+        let x86_v4_capability_enter = x86_v4_capability.label().unwrap();
+        x86_emit_frozen_compact_v4_entry(
+            &mut x86_v4_capability,
+            x86_v4_capability_try_v3,
+            x86_v4_capability_preflight,
+            x86_v4_capability_enter,
+            FrozenCompactGuardMode::ActiveCapability,
+        )
+        .unwrap();
+        for label in [
+            x86_v4_capability_try_v3,
+            x86_v4_capability_preflight,
+            x86_v4_capability_enter,
+        ] {
+            x86_v4_capability.bind(label).unwrap();
+            x86_v4_capability.instruction(&[0xc3]).unwrap();
+        }
+        let x86_v4_capability = x86_v4_capability.finish().unwrap();
+        let mut v4_flag = vec![
+            0x81,
+            0x7f,
+            u8::try_from(FROZEN_PREPARED_HEADER_V1_FLAGS_OFFSET).unwrap(),
+        ];
+        v4_flag.extend_from_slice(&FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V4.to_le_bytes());
+        assert_eq!(occurrences(&x86_v4_auth, &v4_flag), 1);
+        assert_eq!(occurrences(&x86_v4_capability, &v4_flag), 1);
+        let mut v4_ready_seal = vec![0x49, 0xba];
+        v4_ready_seal.extend_from_slice(&FROZEN_PREPARED_HEADER_V4_READY_SEAL.to_le_bytes());
+        assert_eq!(occurrences(&x86_v4_auth, &v4_ready_seal), 1);
+        assert_eq!(occurrences(&x86_v4_capability, &v4_ready_seal), 1);
+        assert_eq!(
+            occurrences(
+                &x86_v4_auth,
+                &[
+                    0x41,
+                    0x83,
+                    0x7b,
+                    u8::try_from(FROZEN_DYNAMIC_ROWS_V3_ROW_SHIFT_OFFSET).unwrap(),
+                    0,
+                ],
+            ),
+            1,
+            "V4 must authenticate its zero row-shift discriminator"
+        );
+        assert_eq!(occurrences(&x86_v4_auth, &[0x44, 0x89, 0xc2]), 1);
+        assert_eq!(occurrences(&x86_v4_auth, &[0x48, 0x0f, 0xaf, 0xc2]), 1);
+        assert_eq!(
+            occurrences(&x86_v4_auth, &[0x48, 0x3d, 0xff, 0x7f, 0x00, 0x00]),
+            1,
+            "V4 must prove the complete live-cell extent fits its token"
+        );
+        assert_eq!(
+            occurrences(&x86_v4_capability, &[0x48, 0x3d, 0xff, 0x7f, 0x00, 0x00]),
+            0,
+            "the V4 capability guard must omit setup-proven live-cell geometry"
+        );
 
         let mut x86_auth = X86Assembler::new();
         let x86_try_v2 = x86_auth.label().unwrap();
@@ -35955,7 +36554,7 @@ int main(void) {{
             x86_try_v2,
             x86_preflight,
             x86_v3_enter,
-            FrozenCompactV3GuardMode::FullVerifier,
+            FrozenCompactGuardMode::FullVerifier,
         )
         .unwrap();
         for label in [x86_try_v2, x86_preflight, x86_v3_enter] {
@@ -35973,7 +36572,7 @@ int main(void) {{
             x86_capability_try_v2,
             x86_capability_preflight,
             x86_capability_enter,
-            FrozenCompactV3GuardMode::ActiveCapability,
+            FrozenCompactGuardMode::ActiveCapability,
         )
         .unwrap();
         for label in [
@@ -36068,21 +36667,36 @@ int main(void) {{
             1,
             "the capability guard must retain semantic loop normalization"
         );
+        assert_eq!(occurrences(&x86_v4_auth, &x86_loop_normalization), 1);
+        assert_eq!(
+            occurrences(&x86_v4_capability, &x86_loop_normalization),
+            1,
+            "the V4 capability guard must retain semantic loop normalization"
+        );
         assert!(
             x86_capability.len().saturating_add(96) < x86_auth.len(),
             "the x86 capability guard must remove a material amount of per-call geometry work"
+        );
+        assert!(
+            x86_v4_capability.len().saturating_add(96) < x86_v4_auth.len(),
+            "the x86 V4 capability guard must remove a material amount of per-call geometry work"
         );
 
         let x86 = lower_x86_64_dynamic_rows_prepared(None, FeatureSet::EMPTY).unwrap();
         assert_eq!(
             occurrences(&x86.code, &[0x47, 0x0f, 0xb7, 0x14, 0x50]),
-            9,
-            "each setup-authenticated byte-row shift needs one scaled u16 cell load"
+            10,
+            "V4 plus every authenticated V3 byte-row shift needs one scaled u16 cell load"
         );
         assert_eq!(
             occurrences(&x86.code, &[0x4e, 0x8d, 0x04, 0x16]),
             9,
             "each compact loop needs one state-to-row backedge"
+        );
+        assert_eq!(
+            occurrences(&x86.code, &[0x4e, 0x8d, 0x44, 0x56, 0xfe]),
+            1,
+            "V4 needs one direct rows+token*2-2 backedge"
         );
         let mut v2_flag = vec![
             0x81,
@@ -36090,6 +36704,11 @@ int main(void) {{
             u8::try_from(FROZEN_PREPARED_HEADER_V1_FLAGS_OFFSET).unwrap(),
         ];
         v2_flag.extend_from_slice(&FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS.to_le_bytes());
+        let v4_selection = x86
+            .code
+            .windows(v4_flag.len())
+            .position(|window| window == v4_flag.as_slice())
+            .unwrap();
         let v3_selection = x86
             .code
             .windows(v3_flag.len())
@@ -36100,14 +36719,14 @@ int main(void) {{
             .windows(v2_flag.len())
             .position(|window| window == v2_flag.as_slice())
             .unwrap();
-        assert!(v3_selection < v2_selection, "V3 must fall through to V2, never overlap it");
+        assert!(
+            v4_selection < v3_selection && v3_selection < v2_selection,
+            "V4 must fall through to V3 and then V2 without overlapping either"
+        );
         assert_eq!(
-            occurrences(
-                &x86.code[v3_selection..v2_selection],
-                &x86_full_geometry,
-            ),
+            occurrences(&x86.code[v4_selection..v2_selection], &x86_full_geometry),
             0,
-            "production x86 V3 entry must use the active-capability guard"
+            "production x86 V4 and V3 entries must use active-capability guards"
         );
         let scanner_free_ceiling = [0x48, 0x3d, 0xff, 0x0f, 0x00, 0x00];
         assert_eq!(occurrences(&x86.code, &scanner_free_ceiling), 2);
@@ -36123,8 +36742,79 @@ int main(void) {{
             .unwrap();
         assert!(
             ready_selection < first_ceiling && first_ceiling < v2_selection,
-            "x86 must authenticate closed V3 before applying the legacy scanner-free ceiling"
+            "x86 must authenticate closed compact rows before applying the legacy scanner-free ceiling"
         );
+
+        let mut arm_v4_auth = Aarch64Assembler::new();
+        let arm_v4_try_v3 = arm_v4_auth.label().unwrap();
+        let arm_v4_preflight = arm_v4_auth.label().unwrap();
+        let arm_v4_enter = arm_v4_auth.label().unwrap();
+        aarch64_emit_frozen_compact_v4_entry(
+            &mut arm_v4_auth,
+            arm_v4_try_v3,
+            arm_v4_preflight,
+            arm_v4_enter,
+            FrozenCompactGuardMode::FullVerifier,
+        )
+        .unwrap();
+        for label in [arm_v4_try_v3, arm_v4_preflight, arm_v4_enter] {
+            arm_v4_auth.bind(label).unwrap();
+            arm_v4_auth.instruction(0xd503_201f).unwrap();
+        }
+        let arm_v4_auth = arm_v4_auth.finish().unwrap();
+        let arm_v4_auth_words = arm_v4_auth
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        let mut arm_v4_capability = Aarch64Assembler::new();
+        let arm_v4_capability_try_v3 = arm_v4_capability.label().unwrap();
+        let arm_v4_capability_preflight = arm_v4_capability.label().unwrap();
+        let arm_v4_capability_enter = arm_v4_capability.label().unwrap();
+        aarch64_emit_frozen_compact_v4_entry(
+            &mut arm_v4_capability,
+            arm_v4_capability_try_v3,
+            arm_v4_capability_preflight,
+            arm_v4_capability_enter,
+            FrozenCompactGuardMode::ActiveCapability,
+        )
+        .unwrap();
+        for label in [
+            arm_v4_capability_try_v3,
+            arm_v4_capability_preflight,
+            arm_v4_capability_enter,
+        ] {
+            arm_v4_capability.bind(label).unwrap();
+            arm_v4_capability.instruction(0xd503_201f).unwrap();
+        }
+        let arm_v4_capability = arm_v4_capability.finish().unwrap();
+        let arm_v4_capability_words = arm_v4_capability
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(arm_v4_auth_words.contains(
+            &aarch64_movz_x(
+                9,
+                u16::try_from(FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V4).unwrap(),
+                0,
+            )
+            .unwrap()
+        ));
+        assert!(arm_v4_auth_words.contains(
+            &aarch64_load_w_imm(
+                12,
+                13,
+                u16::try_from(FROZEN_DYNAMIC_ROWS_V3_ROW_SHIFT_OFFSET).unwrap(),
+            )
+            .unwrap()
+        ));
+        assert!(arm_v4_auth_words.contains(&aarch64_mul_x(7, 10, 9).unwrap()));
+        assert!(arm_v4_auth_words.contains(&aarch64_mul_x(12, 6, 9).unwrap()));
+        let mut arm_v4_ready = Aarch64Assembler::new();
+        aarch64_load_u64_constant(&mut arm_v4_ready, 9, FROZEN_PREPARED_HEADER_V4_READY_SEAL)
+            .unwrap();
+        let arm_v4_ready = arm_v4_ready.finish().unwrap();
+        assert_eq!(occurrences(&arm_v4_auth, &arm_v4_ready), 1);
+        assert_eq!(occurrences(&arm_v4_capability, &arm_v4_ready), 1);
 
         let mut arm_auth = Aarch64Assembler::new();
         let arm_try_v2 = arm_auth.label().unwrap();
@@ -36135,7 +36825,7 @@ int main(void) {{
             arm_try_v2,
             arm_preflight,
             arm_v3_enter,
-            FrozenCompactV3GuardMode::FullVerifier,
+            FrozenCompactGuardMode::FullVerifier,
         )
         .unwrap();
         for label in [arm_try_v2, arm_preflight, arm_v3_enter] {
@@ -36157,7 +36847,7 @@ int main(void) {{
             arm_capability_try_v2,
             arm_capability_preflight,
             arm_capability_enter,
-            FrozenCompactV3GuardMode::ActiveCapability,
+            FrozenCompactGuardMode::ActiveCapability,
         )
         .unwrap();
         for label in [
@@ -36288,6 +36978,20 @@ int main(void) {{
                 .count(),
             0
         );
+        assert_eq!(
+            arm_v4_auth_words
+                .iter()
+                .filter(|&&word| word == arm_full_geometry)
+                .count(),
+            1
+        );
+        assert_eq!(
+            arm_v4_capability_words
+                .iter()
+                .filter(|&&word| word == arm_full_geometry)
+                .count(),
+            0
+        );
         let arm_rows_mirror = [
             aarch64_load_x_imm(
                 8,
@@ -36317,6 +37021,20 @@ int main(void) {{
                 .count(),
             0
         );
+        assert_eq!(
+            arm_v4_auth_words
+                .windows(arm_rows_mirror.len())
+                .filter(|words| *words == arm_rows_mirror)
+                .count(),
+            1
+        );
+        assert_eq!(
+            arm_v4_capability_words
+                .windows(arm_rows_mirror.len())
+                .filter(|words| *words == arm_rows_mirror)
+                .count(),
+            0
+        );
         let arm_loop_normalization = aarch64_load_w_imm(
             7,
             13,
@@ -36331,9 +37049,28 @@ int main(void) {{
             1,
             "the capability guard must retain semantic loop normalization"
         );
+        assert_eq!(
+            arm_v4_auth_words
+                .iter()
+                .filter(|&&word| word == arm_loop_normalization)
+                .count(),
+            1
+        );
+        assert_eq!(
+            arm_v4_capability_words
+                .iter()
+                .filter(|&&word| word == arm_loop_normalization)
+                .count(),
+            1,
+            "the V4 capability guard must retain semantic loop normalization"
+        );
         assert!(
             arm_capability.len().saturating_add(96) < arm_auth.len(),
             "the AArch64 capability guard must remove a material amount of per-call geometry work"
+        );
+        assert!(
+            arm_v4_capability.len().saturating_add(96) < arm_v4_auth.len(),
+            "the AArch64 V4 capability guard must remove a material amount of per-call geometry work"
         );
 
         let arm = lower_aarch64_dynamic_rows_prepared(None).unwrap();
@@ -36348,6 +37085,21 @@ int main(void) {{
                 .filter(|&&word| word == aarch64_load_h_uxtw(8, 11, 6).unwrap())
                 .count(),
             9
+        );
+        assert_eq!(
+            arm_words
+                .iter()
+                .filter(|&&word| word == aarch64_load_h_uxtw(8, 11, 8).unwrap())
+                .count(),
+            1
+        );
+        assert_eq!(
+            arm_words
+                .iter()
+                .filter(|&&word| word == aarch64_add_x_uxtw(11, 15, 8, 1).unwrap())
+                .count(),
+            1,
+            "V4 needs one biased-base cell-offset backedge"
         );
         for shift in 1_u8..=9 {
             assert_eq!(
@@ -36390,6 +37142,29 @@ int main(void) {{
             1,
             "the AArch64 capability guard must select only the exact V3 flag"
         );
+        let arm_v4_flag = [
+            aarch64_load_w_imm(
+                8,
+                0,
+                u16::try_from(FROZEN_PREPARED_HEADER_V1_FLAGS_OFFSET).unwrap(),
+            )
+            .unwrap(),
+            aarch64_movz_x(
+                9,
+                u16::try_from(FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V4).unwrap(),
+                0,
+            )
+            .unwrap(),
+            aarch64_cmp_w(8, 9).unwrap(),
+        ];
+        assert_eq!(
+            arm_v4_capability_words
+                .windows(arm_v4_flag.len())
+                .filter(|words| *words == arm_v4_flag)
+                .count(),
+            1,
+            "the AArch64 capability guard must select only the exact V4 flag"
+        );
         let arm_v2_flag = [
             aarch64_load_w_imm(
                 9,
@@ -36405,6 +37180,10 @@ int main(void) {{
             .unwrap(),
             aarch64_cmp_w(9, 8).unwrap(),
         ];
+        let arm_v4_selection = arm_words
+            .windows(arm_v4_flag.len())
+            .position(|words| words == arm_v4_flag)
+            .unwrap();
         let arm_v3_selection = arm_words
             .windows(arm_v3_flag.len())
             .position(|words| words == arm_v3_flag)
@@ -36413,14 +37192,14 @@ int main(void) {{
             .windows(arm_v2_flag.len())
             .position(|words| words == arm_v2_flag)
             .unwrap();
-        assert!(arm_v3_selection < arm_v2_selection);
+        assert!(arm_v4_selection < arm_v3_selection && arm_v3_selection < arm_v2_selection);
         assert_eq!(
-            arm_words[arm_v3_selection..arm_v2_selection]
+            arm_words[arm_v4_selection..arm_v2_selection]
                 .iter()
                 .filter(|&&word| word == arm_full_geometry)
                 .count(),
             0,
-            "production AArch64 V3 entry must use the active-capability guard"
+            "production AArch64 V4 and V3 entries must use active-capability guards"
         );
         let arm_scanner_free_ceiling = aarch64_cmp_x_imm(
             8,
@@ -36446,7 +37225,7 @@ int main(void) {{
         assert!(
             arm_ready_selection < arm_first_ceiling * core::mem::size_of::<u32>()
                 && arm_first_ceiling < arm_v2_selection,
-            "AArch64 must authenticate closed V3 before applying the legacy scanner-free ceiling"
+            "AArch64 must authenticate closed compact rows before applying the legacy scanner-free ceiling"
         );
     }
 
