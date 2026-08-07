@@ -13685,13 +13685,13 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     const ROOT_SCANNER_COMPACT_V3: u8 = 2;
     const ROOT_SCANNER_COMPACT_V4: u8 = 3;
     let tracks_root_scanner_hits = allow_direct_hole_continuation && root_plan.is_some();
-    // Every scanner-free compact entry inherits the nonempty window proved at
-    // the public boundary, and its closed immutable table cannot side-exit on
-    // an unpublished cell. Rotate those loops so the end test is the single
-    // taken backedge instead of preceding a second unconditional backedge on
-    // every live transition. Rooted compact rows retain their top test because
-    // the graph scanner may re-enter at a candidate boundary.
-    let bottom_test_compact_rows = root_plan.is_none();
+    // Every compact entry starts with a nonempty window. Scanner-free entries
+    // inherit that proof from the public boundary. Rooted entries inherit it
+    // from the graph scanner: scalar hits prove position+offset < end, fixed
+    // vectors select a lane from an admitted block, and SVE active lanes are
+    // bounded below end-offset. Rotate all compact loops so the end test is the
+    // single taken backedge. Root-transition dispatch remains before that test,
+    // and scanner exhaustion at position == end is ordinary completion.
     let frame_bytes = if root_plan.is_some() {
         ROOT_SCANNER_FRAME_BYTES
     } else {
@@ -13979,13 +13979,6 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     }
 
     assembler.bind(v4_scan)?;
-    if !bottom_test_compact_rows {
-        assembler.instruction(&[0x48, 0x39, 0xca])?;
-        assembler.branch(
-            &[0x0f, 0x83],
-            native_complete.unwrap_or(native_no_match),
-        )?;
-    }
     if let Some(root_vector) = root_vector {
         let non_root = assembler.label()?;
         assembler.instruction(&[0x4c, 0x3b, 0x44, 0x24, 0x50])?;
@@ -14029,16 +14022,14 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     // V4 tokens are one-based destination cell-row offsets. This single LEA
     // performs the complete state update with no ordinal scaling dispatch.
     assembler.instruction(&[0x4e, 0x8d, 0x44, 0x56, 0xfe])?;
-    if bottom_test_compact_rows {
-        assembler.instruction(&[0x48, 0x39, 0xca])?;
-        assembler.branch(&[0x0f, 0x82], v4_table_scan)?;
-        assembler.branch(
-            &[0xe9],
-            native_complete.unwrap_or(native_no_match),
-        )?;
-    } else {
-        assembler.branch(&[0xe9], v4_scan)?;
-    }
+    assembler.instruction(&[0x48, 0x39, 0xca])?;
+    // Re-enter through root dispatch. For scanner-free entries v4_scan and
+    // v4_table_scan are co-located, preserving the established machine bytes.
+    assembler.branch(&[0x0f, 0x82], v4_scan)?;
+    assembler.branch(
+        &[0xe9],
+        native_complete.unwrap_or(native_no_match),
+    )?;
 
     assembler.bind(v3_enter)?;
     if root_plan.is_some() {
@@ -14111,13 +14102,6 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
         // Transition-derived ordinals below still use the immediate shift.
         assembler.instruction(&[0x49, 0x89, 0xf0])?; // mov rsi, r8
         assembler.bind(v3_scan)?;
-        if !bottom_test_compact_rows {
-            assembler.instruction(&[0x48, 0x39, 0xca])?;
-            assembler.branch(
-                &[0x0f, 0x83],
-                native_complete.unwrap_or(native_no_match),
-            )?;
-        }
         assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
         assembler.instruction(&[0x47, 0x0f, 0xb6, 0x14, 0x11])?;
         assembler.instruction(&[0x47, 0x0f, 0xb7, 0x14, 0x50])?;
@@ -14160,16 +14144,12 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
         }
         assembler.instruction(&[0x49, 0xc1, 0xe2, shift])?;
         assembler.instruction(&[0x4e, 0x8d, 0x04, 0x16])?;
-        if bottom_test_compact_rows {
-            assembler.instruction(&[0x48, 0x39, 0xca])?;
-            assembler.branch(&[0x0f, 0x82], v3_scan)?;
-            assembler.branch(
-                &[0xe9],
-                native_complete.unwrap_or(native_no_match),
-            )?;
-        } else {
-            assembler.branch(&[0xe9], v3_scan)?;
-        }
+        assembler.instruction(&[0x48, 0x39, 0xca])?;
+        assembler.branch(&[0x0f, 0x82], v3_scan)?;
+        assembler.branch(
+            &[0xe9],
+            native_complete.unwrap_or(native_no_match),
+        )?;
     }
 
     assembler.bind(preflight_enter)?;
@@ -21985,18 +21965,19 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     const ROOT_SCANNER_COMPACT_V3: u16 = 2;
     const ROOT_SCANNER_COMPACT_V4: u16 = 3;
     let tracks_root_scanner_hits = allow_direct_hole_continuation && root_plan.is_some();
-    // Closed scanner-free compact rows inherit the public nonempty-window
-    // proof and cannot encounter a mutable-table hole. Rotate their byte loops
-    // so one conditional backedge replaces the top bound branch plus an
-    // unconditional backedge on every live transition. Root-scanner retries
-    // keep the top-tested form because they may re-enter at a candidate edge.
-    let bottom_test_compact_rows = root_plan.is_none();
+    // Every compact entry starts with a nonempty window. Scanner-free entries
+    // inherit that proof from the public boundary. Rooted entries inherit it
+    // from the graph scanner: scalar hits prove position+offset < end, fixed
+    // vectors select a lane from an admitted block, and SVE active lanes are
+    // bounded below end-offset. Rotate all compact loops so the end test is the
+    // single taken backedge. Root-transition dispatch remains before that test,
+    // and scanner exhaustion at position == end is ordinary completion.
     // Exists exposes neither endpoint nor continuation state. In the same
     // scanner-free closed loops, retain position/end as pointers and fold the
     // byte advance into LDRB's post-index addressing mode. Endpoint-producing
     // and rooted entries keep their offset representation.
     let scanner_free_exists_pointer_cursor =
-        bottom_test_compact_rows && output == OutputContract::Exists;
+        root_plan.is_none() && output == OutputContract::Exists;
     let frame_bytes = if root_plan.is_some() {
         ROOT_SCANNER_FRAME_BYTES
     } else {
@@ -22249,13 +22230,6 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     }
 
     assembler.bind(v4_scan)?;
-    if !bottom_test_compact_rows {
-        assembler.instruction(aarch64_cmp_x(2, 3)?)?;
-        assembler.branch_cond(
-            AARCH64_HS,
-            native_complete.unwrap_or(native_no_match),
-        )?;
-    }
     if let Some(root_dispatch) = root_dispatch {
         let non_root = assembler.label()?;
         assembler.instruction(aarch64_cmp_x(11, 1)?)?;
@@ -22294,13 +22268,11 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
         assembler.branch_zero_w(8, native_complete.unwrap_or(native_no_match))?;
     }
     assembler.instruction(aarch64_add_x_uxtw(11, 15, 8, 1)?)?;
-    if bottom_test_compact_rows {
-        assembler.instruction(aarch64_cmp_x(2, 3)?)?;
-        assembler.branch_cond(AARCH64_LO, v4_table_scan)?;
-        assembler.branch(native_complete.unwrap_or(native_no_match))?;
-    } else {
-        assembler.branch(v4_scan)?;
-    }
+    assembler.instruction(aarch64_cmp_x(2, 3)?)?;
+    // Re-enter through root dispatch. For scanner-free entries v4_scan and
+    // v4_table_scan are co-located, preserving the established machine words.
+    assembler.branch_cond(AARCH64_LO, v4_scan)?;
+    assembler.branch(native_complete.unwrap_or(native_no_match))?;
 
     assembler.bind(v3_enter)?;
     if root_plan.is_some() {
@@ -22367,13 +22339,6 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
         // Transition-derived ordinals below still use the immediate shift.
         assembler.instruction(aarch64_mov_x(11, 15)?)?;
         assembler.bind(v3_scan)?;
-        if !bottom_test_compact_rows {
-            assembler.instruction(aarch64_cmp_x(2, 3)?)?;
-            assembler.branch_cond(
-                AARCH64_HS,
-                native_complete.unwrap_or(native_no_match),
-            )?;
-        }
         if scanner_free_exists_pointer_cursor {
             assembler.instruction(aarch64_load_byte_post_imm(6, 2, 1)?)?;
         } else {
@@ -22418,13 +22383,9 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
             assembler.bind(non_root)?;
         }
         assembler.instruction(aarch64_add_x_lsl(11, 15, 6, shift)?)?;
-        if bottom_test_compact_rows {
-            assembler.instruction(aarch64_cmp_x(2, 3)?)?;
-            assembler.branch_cond(AARCH64_LO, v3_scan)?;
-            assembler.branch(native_complete.unwrap_or(native_no_match))?;
-        } else {
-            assembler.branch(v3_scan)?;
-        }
+        assembler.instruction(aarch64_cmp_x(2, 3)?)?;
+        assembler.branch_cond(AARCH64_LO, v3_scan)?;
+        assembler.branch(native_complete.unwrap_or(native_no_match))?;
     }
 
     assembler.bind(preflight_enter)?;
@@ -37197,39 +37158,198 @@ static int run_case(const unsigned char *p,size_t n,size_t s,size_t e,uint32_t e
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "one cross-ISA audit proves the rotated boundary and pointer-cursor contracts"
+        reason = "one target-aware cross-ISA audit proves rotated bounds, root re-entry, and pointer-cursor contracts"
     )]
-    fn scanner_free_compact_hot_loops_are_bottom_tested_and_pointer_advanced_cross_isa() {
-        fn x86_bound_tests(code: &[u8], opcode: u8, backward: bool) -> usize {
+    fn compact_hot_loops_are_bottom_tested_and_pointer_advanced_cross_isa() {
+        fn x86_bound_pairs(
+            code: &[u8],
+            opcode: u8,
+            backward: bool,
+        ) -> Vec<(usize, usize)> {
             code.windows(3)
                 .enumerate()
-                .filter(|&(compare, window)| {
-                    window == [0x48, 0x39, 0xca]
-                        && x86_test_normalized_branch_opcode(code, compare + 3) == Some(opcode)
-                        && x86_test_branch_target(code, compare + 3)
-                            .is_some_and(|(target, _)| (target < compare) == backward)
+                .filter_map(|(compare, window)| {
+                    if window != [0x48, 0x39, 0xca]
+                        || x86_test_normalized_branch_opcode(code, compare + 3) != Some(opcode)
+                    {
+                        return None;
+                    }
+                    let (target, _) = x86_test_branch_target(code, compare + 3)?;
+                    ((target < compare) == backward).then_some((compare, target))
                 })
-                .count()
+                .collect()
         }
 
-        fn aarch64_bound_tests(code: &[u8], condition: u8) -> usize {
-            let compare = aarch64_cmp_x(2, 3).unwrap();
-            code.chunks_exact(4)
-                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
-                .collect::<Vec<_>>()
-                .windows(2)
-                .filter(|words| {
-                    words[0] == compare
-                        && words[1] & 0xff00_001f
-                            == 0x5400_0000 | u32::from(condition)
-                })
-                .count()
+        fn x86_bound_tests(code: &[u8], opcode: u8, backward: bool) -> usize {
+            x86_bound_pairs(code, opcode, backward).len()
         }
 
         fn aarch64_words(code: &[u8]) -> Vec<u32> {
             code.chunks_exact(4)
                 .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
                 .collect()
+        }
+
+        fn aarch64_conditional_branch_target(words: &[u32], branch: usize) -> Option<usize> {
+            let instruction = *words.get(branch)?;
+            if instruction & 0xff00_0010 != 0x5400_0000 {
+                return None;
+            }
+            let immediate = i32::try_from((instruction >> 5) & 0x7_ffff).ok()?;
+            let displacement = (immediate << 13) >> 13;
+            let branch = isize::try_from(branch).ok()?;
+            usize::try_from(branch.checked_add(isize::try_from(displacement).ok()?)?).ok()
+        }
+
+        fn aarch64_bound_pairs(
+            words: &[u32],
+            condition: u8,
+            backward: bool,
+        ) -> Vec<(usize, usize)> {
+            let compare = aarch64_cmp_x(2, 3).unwrap();
+            words
+                .windows(2)
+                .enumerate()
+                .filter_map(|(compare_index, pair)| {
+                    if pair[0] != compare
+                        || pair[1] & 0xff00_001f
+                            != 0x5400_0000 | u32::from(condition)
+                    {
+                        return None;
+                    }
+                    let target = aarch64_conditional_branch_target(words, compare_index + 1)?;
+                    ((target < compare_index) == backward)
+                        .then_some((compare_index, target))
+                })
+                .collect()
+        }
+
+        fn aarch64_bound_tests(code: &[u8], condition: u8, backward: bool) -> usize {
+            aarch64_bound_pairs(&aarch64_words(code), condition, backward).len()
+        }
+
+        fn assert_rooted_x86_compact_bounds(code: &[u8], context: &str) {
+            let compare_bytes = [0x48, 0x39, 0xca];
+            let bounds = x86_bound_pairs(code, 0x82, true);
+            assert_eq!(
+                bounds.len(),
+                10,
+                "{context}: rooted V4 plus all nine V3 shifts need conditional backedges"
+            );
+            for &(compare, target) in &bounds {
+                assert_ne!(
+                    &code[target..target + compare_bytes.len()],
+                    compare_bytes.as_slice(),
+                    "{context}: a compact backedge must not retain a top bound pair"
+                );
+                assert!(
+                    !code[target..compare]
+                        .windows(compare_bytes.len())
+                        .enumerate()
+                        .any(|(offset, window)| {
+                            window == compare_bytes
+                                && x86_test_normalized_branch_opcode(
+                                    code,
+                                    target + offset + compare_bytes.len(),
+                                ) == Some(0x83)
+                        }),
+                    "{context}: a rooted compact body must contain no top boundary test"
+                );
+            }
+
+            let v4_update_bytes = [0x4e, 0x8d, 0x44, 0x56, 0xfe];
+            let v4_update = code
+                .windows(v4_update_bytes.len())
+                .position(|window| window == v4_update_bytes)
+                .expect("rooted x86 V4 cell-offset update");
+            let v4_compare = v4_update + v4_update_bytes.len();
+            assert_eq!(
+                &code[v4_compare..v4_compare + compare_bytes.len()],
+                compare_bytes.as_slice(),
+                "{context}: V4 update must be followed by its bottom bound"
+            );
+            assert_eq!(
+                x86_test_normalized_branch_opcode(code, v4_compare + compare_bytes.len()),
+                Some(0x82),
+                "{context}: V4 bottom bound must be position < end"
+            );
+            let (v4_scan, _) = x86_test_branch_target(
+                code,
+                v4_compare + compare_bytes.len(),
+            )
+            .expect("rooted x86 V4 bottom backedge");
+            let root_compare = [0x4c, 0x3b, 0x44, 0x24, 0x50];
+            assert_eq!(
+                &code[v4_scan..v4_scan + root_compare.len()],
+                root_compare.as_slice(),
+                "{context}: V4 backedge must reach compact root dispatch"
+            );
+            let table_load = [0x44, 0x0f, 0xb6, 0x14, 0x17];
+            let v4_table_scan = v4_scan
+                + code[v4_scan..v4_update]
+                    .windows(table_load.len())
+                    .position(|window| window == table_load)
+                    .expect("rooted x86 V4 table body");
+            assert!(
+                v4_scan < v4_table_scan,
+                "{context}: root dispatch must precede the V4 table body"
+            );
+        }
+
+        fn assert_rooted_aarch64_compact_bounds(words: &[u32], context: &str) {
+            let compare = aarch64_cmp_x(2, 3).unwrap();
+            let bounds = aarch64_bound_pairs(words, AARCH64_LO, true);
+            assert_eq!(
+                bounds.len(),
+                10,
+                "{context}: rooted V4 plus all nine V3 shifts need conditional backedges"
+            );
+            for &(compare_index, target) in &bounds {
+                assert_ne!(
+                    words[target], compare,
+                    "{context}: a compact backedge must not retain a top bound pair"
+                );
+                assert!(
+                    !words[target..compare_index].windows(2).any(|pair| {
+                        pair[0] == compare
+                            && pair[1] & 0xff00_001f
+                                == 0x5400_0000 | u32::from(AARCH64_HS)
+                    }),
+                    "{context}: a rooted compact body must contain no top boundary test"
+                );
+            }
+
+            let v4_update_word = aarch64_add_x_uxtw(11, 15, 8, 1).unwrap();
+            let v4_update = words
+                .iter()
+                .position(|&word| word == v4_update_word)
+                .expect("rooted AArch64 V4 cell-offset update");
+            assert_eq!(
+                words[v4_update + 1],
+                compare,
+                "{context}: V4 update must be followed by its bottom bound"
+            );
+            assert_eq!(
+                words[v4_update + 2] & 0xff00_001f,
+                0x5400_0000 | u32::from(AARCH64_LO),
+                "{context}: V4 bottom bound must be position < end"
+            );
+            let v4_scan = aarch64_conditional_branch_target(words, v4_update + 2)
+                .expect("rooted AArch64 V4 bottom backedge");
+            assert_eq!(
+                words[v4_scan],
+                aarch64_cmp_x(11, 1).unwrap(),
+                "{context}: V4 backedge must reach compact root dispatch"
+            );
+            let v4_table_scan = v4_scan
+                + words[v4_scan..v4_update]
+                    .iter()
+                    .position(|&word| word == aarch64_load_byte_reg(8, 0, 2).unwrap())
+                    .expect("rooted AArch64 V4 table body");
+            assert!(
+                v4_scan < v4_table_scan,
+                "{context}: root dispatch must precede the V4 table body"
+            );
         }
 
         let v4_postindexed = aarch64_load_byte_post_imm(8, 2, 1).unwrap();
@@ -37288,7 +37408,7 @@ static int run_case(const unsigned char *p,size_t n,size_t s,size_t e,uint32_t e
             )
             .unwrap();
             assert_eq!(
-                aarch64_bound_tests(&arm.code, AARCH64_LO),
+                aarch64_bound_tests(&arm.code, AARCH64_LO, true),
                 10,
                 "AArch64 V4 plus all nine V3 shifts need one conditional backedge for {output:?}"
             );
@@ -37372,53 +37492,123 @@ static int run_case(const unsigned char *p,size_t n,size_t s,size_t e,uint32_t e
         })
         .unwrap()
         .expect("nontrivial compact-loop root filter");
-        let rooted_x86 = lower_x86_64_dynamic_rows_prepared_for_output(
-            Some(root_filter),
-            FeatureSet::EMPTY,
-            OutputContract::Exists,
-            None,
-            true,
-        )
-        .unwrap();
-        assert_eq!(x86_bound_tests(&rooted_x86.code, 0x82, true), 0);
-        assert!(
-            x86_bound_tests(&rooted_x86.code, 0x83, false) >= 10,
-            "all rooted compact loops must retain a top boundary test"
-        );
+        let avx512 = FeatureSet::of(CpuFeature::X86Avx512F)
+            .with(CpuFeature::X86Avx512Bw);
+        for (features, accelerator) in [
+            (FeatureSet::EMPTY, StartAccelerator::X86Sse2),
+            (
+                FeatureSet::of(CpuFeature::X86Avx2),
+                StartAccelerator::X86Avx2,
+            ),
+            (avx512, StartAccelerator::X86Avx512Bw),
+        ] {
+            for output in [
+                OutputContract::Exists,
+                OutputContract::SelectedEnd,
+                OutputContract::Span,
+            ] {
+                let rooted_x86 = lower_x86_64_dynamic_rows_prepared_for_output(
+                    Some(root_filter),
+                    features,
+                    output,
+                    None,
+                    true,
+                )
+                .unwrap();
+                assert_eq!(
+                    rooted_x86
+                        .scanner
+                        .expect("rooted x86 scanner receipt")
+                        .start_accelerator(),
+                    accelerator
+                );
+                let context = format!("x86/{accelerator:?}/{output:?}");
+                assert_rooted_x86_compact_bounds(&rooted_x86.code, &context);
+            }
+        }
 
-        let target = Target::aarch64_macos()
-            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+        let asimd = FeatureSet::of(CpuFeature::Aarch64Asimd);
+        let sve = FeatureSet::of(CpuFeature::Aarch64Sve);
+        let sve2 = sve.with(CpuFeature::Aarch64Sve2);
+        let arm_tiers = [
+            (
+                "scalar-linux",
+                Target::aarch64_linux(),
+                StartAccelerator::Scalar,
+            ),
+            (
+                "asimd-macos",
+                Target::aarch64_macos().with_features(asimd).unwrap(),
+                StartAccelerator::Aarch64Asimd,
+            ),
+            (
+                "sve-linux",
+                Target::aarch64_linux().with_features(sve).unwrap(),
+                StartAccelerator::Aarch64Sve,
+            ),
+            (
+                "sve2-linux",
+                Target::aarch64_linux().with_features(sve2).unwrap(),
+                StartAccelerator::Aarch64Sve2,
+            ),
+            (
+                "mixed-sve-linux",
+                Target::aarch64_linux()
+                    .with_features(asimd.with(CpuFeature::Aarch64Sve))
+                    .unwrap(),
+                StartAccelerator::Aarch64Sve,
+            ),
+            (
+                "mixed-sve2-linux",
+                Target::aarch64_linux()
+                    .with_features(asimd.union(sve2))
+                    .unwrap(),
+                StartAccelerator::Aarch64Sve2,
+            ),
+        ];
+        for (tier, target, accelerator) in arm_tiers {
+            let mut data = vec![0_u8; 32];
+            let root = install_aarch64_dynamic_root_plan(
+                &mut data,
+                0,
+                root_filter,
+                target,
+            )
             .unwrap();
-        let mut data = vec![0_u8; 32];
-        let root = install_aarch64_dynamic_root_plan(&mut data, 0, root_filter, target).unwrap();
-        let rooted_arm = lower_aarch64_dynamic_rows_prepared_for_output(
-            Some(root),
-            OutputContract::Exists,
-            None,
-            true,
-        )
-        .unwrap();
-        assert_eq!(aarch64_bound_tests(&rooted_arm.code, AARCH64_LO), 0);
-        assert!(
-            aarch64_bound_tests(&rooted_arm.code, AARCH64_HS) >= 10,
-            "all rooted compact loops must retain a top boundary test"
-        );
-        let rooted_words = aarch64_words(&rooted_arm.code);
-        assert_eq!(
-            rooted_words
-                .iter()
-                .filter(|&&word| word == v4_postindexed || word == v3_postindexed)
-                .count(),
-            0
-        );
-        assert_eq!(
-            rooted_words
-                .windows(pointer_setup.len())
-                .filter(|window| *window == pointer_setup)
-                .count(),
-            0,
-            "root re-entry retains offset cursors"
-        );
+            assert_eq!(root.scanner.start_accelerator(), accelerator, "{tier}");
+            for output in [
+                OutputContract::Exists,
+                OutputContract::SelectedEnd,
+                OutputContract::Span,
+            ] {
+                let rooted_arm = lower_aarch64_dynamic_rows_prepared_for_output(
+                    Some(root),
+                    output,
+                    None,
+                    true,
+                )
+                .unwrap();
+                let context = format!("AArch64/{tier}/{output:?}");
+                let rooted_words = aarch64_words(&rooted_arm.code);
+                assert_rooted_aarch64_compact_bounds(&rooted_words, &context);
+                assert_eq!(
+                    rooted_words
+                        .iter()
+                        .filter(|&&word| word == v4_postindexed || word == v3_postindexed)
+                        .count(),
+                    0,
+                    "{context}: rooted entries retain offset loads"
+                );
+                assert_eq!(
+                    rooted_words
+                        .windows(pointer_setup.len())
+                        .filter(|window| *window == pointer_setup)
+                        .count(),
+                    0,
+                    "{context}: root re-entry retains offset cursors"
+                );
+            }
+        }
     }
 
     #[test]
