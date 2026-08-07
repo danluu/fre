@@ -3120,6 +3120,202 @@ const fn canonicalize_frozen_state_ordinal(state: usize, source_initial: usize) 
     }
 }
 
+/// One canonical compact-table column projection.
+///
+/// `source_classes[..class_count]` names the source column retained for each
+/// semantic class. Classes are ordered by the lowest raw byte that observes a
+/// previously unseen semantic column, making the result independent of the
+/// source alphabet's class numbering.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FrozenCompactColumnProjection {
+    class_count: usize,
+    source_classes: [u8; 256],
+    class_map: [u8; 256],
+}
+
+/// Normalize one authenticated source cell into the format-independent u16
+/// semantics shared by compact V3 and V4: an accepting bit plus a one-based
+/// canonical destination-state ordinal. Start provenance is deliberately
+/// absent because eligibility has already proved that the selected output can
+/// reconstruct it (or does not observe it).
+fn frozen_compact_semantic_cell(
+    cell: u32,
+    source_class_count: usize,
+    state_count: usize,
+    source_initial_state: usize,
+) -> Option<u16> {
+    if source_class_count == 0
+        || state_count == 0
+        || source_initial_state >= state_count
+        || cell == DYNAMIC_NATIVE_ROWS_V1_UNFILLED_CELL
+        || cell & FROZEN_DYNAMIC_SOURCE_START_MASK == FROZEN_DYNAMIC_SOURCE_START_MASK
+    {
+        return None;
+    }
+    let source_token = cell & DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK;
+    let destination_token = if source_token == 0 {
+        0
+    } else {
+        let source_row = usize::try_from(source_token.checked_sub(1)?).ok()?;
+        if source_row.checked_rem(source_class_count) != Some(0) {
+            return None;
+        }
+        let source_destination = source_row.checked_div(source_class_count)?;
+        if source_destination >= state_count {
+            return None;
+        }
+        let destination =
+            canonicalize_frozen_state_ordinal(source_destination, source_initial_state);
+        u16::try_from(destination.checked_add(1)?).ok()?
+    };
+    let accepted = if cell & DYNAMIC_NATIVE_ROWS_V1_ACCEPT_MASK != 0 {
+        DYNAMIC_NATIVE_ROWS_V3_ACCEPT_MASK
+    } else {
+        0
+    };
+    Some(destination_token | accepted)
+}
+
+fn frozen_compact_columns_are_equal(
+    rows: &[u32],
+    source_class_count: usize,
+    state_count: usize,
+    source_initial_state: usize,
+    left: usize,
+    right: usize,
+) -> Option<bool> {
+    for canonical_state in 0..state_count {
+        let source_state =
+            canonicalize_frozen_state_ordinal(canonical_state, source_initial_state);
+        let source_row = source_state.checked_mul(source_class_count)?;
+        let left = *rows.get(source_row.checked_add(left)?)?;
+        let right = *rows.get(source_row.checked_add(right)?)?;
+        if frozen_compact_semantic_cell(
+            left,
+            source_class_count,
+            state_count,
+            source_initial_state,
+        )? != frozen_compact_semantic_cell(
+            right,
+            source_class_count,
+            state_count,
+            source_initial_state,
+        )? {
+            return Some(false);
+        }
+    }
+    Some(true)
+}
+
+/// Merge source byte classes only when their complete canonical semantic
+/// columns are equal. A deterministic hash limits exact column comparisons;
+/// equality is always checked cell by cell, so collisions affect setup work
+/// but never semantics.
+fn coalesce_frozen_compact_columns(
+    rows: &[u32],
+    source_class_map: &[u8],
+    source_class_count: usize,
+    state_count: usize,
+    source_initial_state: usize,
+) -> Option<FrozenCompactColumnProjection> {
+    if source_class_map.len() != 256
+        || source_class_count == 0
+        || source_class_count > 256
+        || state_count == 0
+        || source_initial_state >= state_count
+        || rows.len() != state_count.checked_mul(source_class_count)?
+    {
+        return None;
+    }
+
+    // Visit source classes by their least represented raw byte. This makes
+    // the output numbering canonical even if an equivalent source table used
+    // a different arbitrary class numbering.
+    let mut represented = [false; 256];
+    let mut source_order = [0_u8; 256];
+    let mut source_order_len = 0_usize;
+    for &source_class in source_class_map {
+        let source_class_index = usize::from(source_class);
+        if source_class_index >= source_class_count {
+            return None;
+        }
+        if !represented[source_class_index] {
+            represented[source_class_index] = true;
+            *source_order.get_mut(source_order_len)? = source_class;
+            source_order_len = source_order_len.checked_add(1)?;
+        }
+    }
+    if source_order_len != source_class_count {
+        return None;
+    }
+
+    // Hash the canonical u16 columns in one row-major pass. The exact compare
+    // below remains authoritative; this is solely a bounded lookup filter.
+    const COLUMN_HASH_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const COLUMN_HASH_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut column_hashes = [COLUMN_HASH_OFFSET; 256];
+    for canonical_state in 0..state_count {
+        let source_state =
+            canonicalize_frozen_state_ordinal(canonical_state, source_initial_state);
+        let source_row = source_state.checked_mul(source_class_count)?;
+        for source_class in 0..source_class_count {
+            let cell = *rows.get(source_row.checked_add(source_class)?)?;
+            let semantic = frozen_compact_semantic_cell(
+                cell,
+                source_class_count,
+                state_count,
+                source_initial_state,
+            )?;
+            let hash = column_hashes.get_mut(source_class)?;
+            *hash ^= u64::from(semantic);
+            *hash = hash.wrapping_mul(COLUMN_HASH_PRIME);
+        }
+    }
+
+    let mut source_classes = [0_u8; 256];
+    let mut source_to_compact = [0_u8; 256];
+    let mut compact_class_count = 0_usize;
+    for &source_class in &source_order[..source_order_len] {
+        let source_class_index = usize::from(source_class);
+        let mut equivalent = None;
+        for compact_class in 0..compact_class_count {
+            let representative = usize::from(*source_classes.get(compact_class)?);
+            if column_hashes[source_class_index] == column_hashes[representative]
+                && frozen_compact_columns_are_equal(
+                    rows,
+                    source_class_count,
+                    state_count,
+                    source_initial_state,
+                    source_class_index,
+                    representative,
+                )?
+            {
+                equivalent = Some(compact_class);
+                break;
+            }
+        }
+        let compact_class = if let Some(equivalent) = equivalent {
+            equivalent
+        } else {
+            let next = compact_class_count;
+            *source_classes.get_mut(next)? = source_class;
+            compact_class_count = compact_class_count.checked_add(1)?;
+            next
+        };
+        source_to_compact[source_class_index] = u8::try_from(compact_class).ok()?;
+    }
+
+    let mut class_map = [0_u8; 256];
+    for (destination, &source_class) in class_map.iter_mut().zip(source_class_map) {
+        *destination = source_to_compact[usize::from(source_class)];
+    }
+    Some(FrozenCompactColumnProjection {
+        class_count: compact_class_count,
+        source_classes,
+        class_map,
+    })
+}
+
 impl FrozenDynamicRowsStorage {
     fn descriptor_is_valid_for(&self, identity: ProgramIdentity) -> bool {
         let rows = self.descriptor;
@@ -5865,20 +6061,19 @@ impl CompiledProgram {
         )?;
         let direct = nfa.dynamic_root_projection(&self.automaton)?;
 
-        let class_count = usize::try_from(full.row_stride()).ok()?;
-        let source_cells = direct.state_count().checked_mul(class_count)?;
+        let source_class_count = usize::try_from(full.row_stride()).ok()?;
+        let source_cells = direct.state_count().checked_mul(source_class_count)?;
         let state_count = direct.state_count();
         let source_initial_row = usize::try_from(full.forward_initial_row()).ok()?;
-        if source_initial_row.checked_rem(class_count) != Some(0) {
+        if source_initial_row.checked_rem(source_class_count) != Some(0) {
             return None;
         }
-        let source_initial_state = source_initial_row.checked_div(class_count)?;
+        let source_initial_state = source_initial_row.checked_div(source_class_count)?;
         if source_initial_state >= state_count {
             return None;
         }
-        let format = select_frozen_compact_rows_format(state_count, class_count)?;
-        if class_count == 0
-            || class_count > 256
+        if source_class_count == 0
+            || source_class_count > 256
             || state_count == 0
             || source_cells == 0
             || source_cells != full.forward_rows().len()
@@ -5899,10 +6094,29 @@ impl CompiledProgram {
             || full.accept_mask() != DYNAMIC_NATIVE_ROWS_V1_ACCEPT_MASK
             || full.next_row_token_mask() != DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK
             || full.class_map().len() != 256
-            || !frozen_dynamic_source_rows_are_normalizable(full.forward_rows(), class_count)
+            || !frozen_dynamic_source_rows_are_normalizable(
+                full.forward_rows(),
+                source_class_count,
+            )
         {
             return None;
         }
+
+        // The graph alphabet is conservative for this exact reachable K0
+        // projection. Once every source cell and destination has been
+        // authenticated, collapse byte classes whose complete canonical u16
+        // transition columns are identical. Format selection then uses the
+        // smaller exact geometry, so the same general pass can turn a padded
+        // V3 table into an unpadded V4 table.
+        let columns = coalesce_frozen_compact_columns(
+            full.forward_rows(),
+            full.class_map(),
+            source_class_count,
+            state_count,
+            source_initial_state,
+        )?;
+        let class_count = columns.class_count;
+        let format = select_frozen_compact_rows_format(state_count, class_count)?;
 
         let physical_cells = match format {
             FrozenCompactRowsFormat::StateOrdinalV3 => class_count.checked_next_power_of_two()?,
@@ -5927,44 +6141,30 @@ impl CompiledProgram {
             // physical row zero as their exact initial-root capability.
             let source_state =
                 canonicalize_frozen_state_ordinal(canonical_state, source_initial_state);
-            let source_row = source_state.checked_mul(class_count)?;
-            let source_end = source_row.checked_add(class_count)?;
+            let source_row = source_state.checked_mul(source_class_count)?;
+            let source_end = source_row.checked_add(source_class_count)?;
             let row = full.forward_rows().get(source_row..source_end)?;
-            for &cell in row {
-                // Source-only start provenance was authenticated above and
-                // has no compact V3/V4 representation. Selecting just the
-                // one-based canonical row token and accept bit strips both
-                // mutually-exclusive modes.
-                let source_token = cell & DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK;
-                let compact_token = if source_token == 0 {
-                    0
-                } else {
-                    let source_row_offset =
-                        usize::try_from(source_token.checked_sub(1)?).ok()?;
-                    if source_row_offset.checked_rem(class_count) != Some(0) {
-                        return None;
-                    }
-                    let source_destination = source_row_offset.checked_div(class_count)?;
-                    let destination = canonicalize_frozen_state_ordinal(
-                        source_destination,
-                        source_initial_state,
-                    );
-                    match format {
-                        FrozenCompactRowsFormat::StateOrdinalV3 => {
-                            u16::try_from(destination.checked_add(1)?).ok()?
-                        }
-                        FrozenCompactRowsFormat::CellOffsetV4 => {
-                            let destination_row = destination.checked_mul(class_count)?;
-                            u16::try_from(destination_row.checked_add(1)?).ok()?
-                        }
+            for &source_class in &columns.source_classes[..class_count] {
+                let cell = *row.get(usize::from(source_class))?;
+                let semantic = frozen_compact_semantic_cell(
+                    cell,
+                    source_class_count,
+                    state_count,
+                    source_initial_state,
+                )?;
+                let destination = semantic & DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK;
+                let compact_token = match format {
+                    FrozenCompactRowsFormat::StateOrdinalV3 => destination,
+                    FrozenCompactRowsFormat::CellOffsetV4 if destination == 0 => 0,
+                    FrozenCompactRowsFormat::CellOffsetV4 => {
+                        let destination = usize::from(destination).checked_sub(1)?;
+                        let destination_row = destination.checked_mul(class_count)?;
+                        u16::try_from(destination_row.checked_add(1)?).ok()?
                     }
                 };
-                let accepted = if cell & DYNAMIC_NATIVE_ROWS_V1_ACCEPT_MASK != 0 {
-                    DYNAMIC_NATIVE_ROWS_V3_ACCEPT_MASK
-                } else {
-                    0
-                };
-                owned_rows.push(compact_token | accepted);
+                owned_rows.push(
+                    compact_token | (semantic & DYNAMIC_NATIVE_ROWS_V3_ACCEPT_MASK),
+                );
             }
             if physical_cells != class_count {
                 let row_end = owned_rows
@@ -5979,8 +6179,7 @@ impl CompiledProgram {
         }
         let rows = owned_rows.into_boxed_slice();
 
-        let mut class_map = [0_u8; 256];
-        class_map.copy_from_slice(full.class_map());
+        let class_map = columns.class_map;
         // Learned-loop ownership is mutable-K0 accelerator metadata, not DFA
         // semantics. V3/V4 copy every authenticated complete row into a closed
         // immutable table and may therefore scalar-step those states without
@@ -10724,6 +10923,26 @@ mod tests {
             usize::MAX,
         )
         .expect("compile")
+    }
+
+    fn frozen_test_source_cell(
+        destination: Option<usize>,
+        source_class_count: usize,
+        accepted: bool,
+        provenance: u32,
+    ) -> u32 {
+        let token = destination.map_or(0, |destination| {
+            u32::try_from(
+                destination
+                    .checked_mul(source_class_count)
+                    .and_then(|row| row.checked_add(1))
+                    .expect("test destination token"),
+            )
+            .expect("test destination fits source token")
+        });
+        token
+            | accepted.then_some(DYNAMIC_NATIVE_ROWS_V1_ACCEPT_MASK).unwrap_or(0)
+            | provenance
     }
 
     fn execute_native_program_view(
@@ -18794,6 +19013,279 @@ mod tests {
     }
 
     #[test]
+    fn frozen_compact_column_coalescing_is_exhaustively_semantic_for_small_tables() {
+        for state_count in 1_usize..=9 {
+            for source_class_count in 1_usize..=12 {
+                let source_class_map: [u8; 256] = core::array::from_fn(|byte| {
+                    u8::try_from(byte % source_class_count).unwrap()
+                });
+                for source_initial_state in 0..state_count {
+                    let mut rows = Vec::with_capacity(state_count * source_class_count);
+                    for source_state in 0..state_count {
+                        let canonical_state = canonicalize_frozen_state_ordinal(
+                            source_state,
+                            source_initial_state,
+                        );
+                        for source_class in 0..source_class_count {
+                            // Adjacent source classes deliberately differ in
+                            // stripped provenance but share all observable
+                            // transition semantics.
+                            let semantic_class = source_class / 2;
+                            let canonical_destination =
+                                (canonical_state + semantic_class + 1) % state_count;
+                            let source_destination = canonicalize_frozen_state_ordinal(
+                                canonical_destination,
+                                source_initial_state,
+                            );
+                            let accepted = (canonical_state + semantic_class) % 3 == 0;
+                            let provenance = if source_class % 2 == 0 {
+                                FROZEN_DYNAMIC_SOURCE_START_PROPAGATE
+                            } else {
+                                FROZEN_DYNAMIC_SOURCE_START_RESET
+                            };
+                            rows.push(frozen_test_source_cell(
+                                Some(source_destination),
+                                source_class_count,
+                                accepted,
+                                provenance,
+                            ));
+                        }
+                    }
+
+                    let projection = coalesce_frozen_compact_columns(
+                        &rows,
+                        &source_class_map,
+                        source_class_count,
+                        state_count,
+                        source_initial_state,
+                    )
+                    .expect("valid semantic projection");
+                    assert_eq!(
+                        projection,
+                        coalesce_frozen_compact_columns(
+                            &rows,
+                            &source_class_map,
+                            source_class_count,
+                            state_count,
+                            source_initial_state,
+                        )
+                        .expect("deterministic semantic projection")
+                    );
+                    assert!(projection.class_count <= source_class_count.div_ceil(2));
+                    assert_ne!(projection.class_count, 0);
+
+                    for source_class in 0..source_class_count {
+                        let first_byte = source_class;
+                        let compact_class =
+                            usize::from(projection.class_map[first_byte]);
+                        if source_class % 2 == 1 {
+                            assert_eq!(
+                                projection.class_map[source_class - 1],
+                                projection.class_map[source_class]
+                            );
+                        }
+                        for source_state in 0..state_count {
+                            let source_row = source_state * source_class_count;
+                            let representative = usize::from(
+                                projection.source_classes[compact_class],
+                            );
+                            assert_eq!(
+                                frozen_compact_semantic_cell(
+                                    rows[source_row + source_class],
+                                    source_class_count,
+                                    state_count,
+                                    source_initial_state,
+                                ),
+                                frozen_compact_semantic_cell(
+                                    rows[source_row + representative],
+                                    source_class_count,
+                                    state_count,
+                                    source_initial_state,
+                                )
+                            );
+                        }
+                    }
+                    for left in 0..projection.class_count {
+                        for right in 0..left {
+                            assert_eq!(
+                                frozen_compact_columns_are_equal(
+                                    &rows,
+                                    source_class_count,
+                                    state_count,
+                                    source_initial_state,
+                                    usize::from(projection.source_classes[left]),
+                                    usize::from(projection.source_classes[right]),
+                                ),
+                                Some(false),
+                                "distinct projected columns must remain distinct"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn frozen_compact_column_order_depends_on_raw_bytes_not_source_numbering() {
+        let state_count = 4_usize;
+        let source_class_count = 6_usize;
+        let source_initial_state = 3_usize;
+        let semantic_classes = [2_usize, 0, 2, 1, 0, 3];
+        let mut source_class_map = [4_u8; 256];
+        source_class_map[..6].copy_from_slice(&[4, 3, 1, 0, 2, 5]);
+        let mut rows = Vec::with_capacity(state_count * source_class_count);
+        for source_state in 0..state_count {
+            let canonical_state =
+                canonicalize_frozen_state_ordinal(source_state, source_initial_state);
+            for (source_class, &semantic_class) in semantic_classes.iter().enumerate() {
+                let canonical_destination = (canonical_state + semantic_class) % state_count;
+                let source_destination = canonicalize_frozen_state_ordinal(
+                    canonical_destination,
+                    source_initial_state,
+                );
+                rows.push(frozen_test_source_cell(
+                    Some(source_destination),
+                    source_class_count,
+                    (canonical_state + semantic_class) % 2 == 0,
+                    if source_class % 2 == 0 {
+                        FROZEN_DYNAMIC_SOURCE_START_PROPAGATE
+                    } else {
+                        FROZEN_DYNAMIC_SOURCE_START_RESET
+                    },
+                ));
+            }
+        }
+
+        let projection = coalesce_frozen_compact_columns(
+            &rows,
+            &source_class_map,
+            source_class_count,
+            state_count,
+            source_initial_state,
+        )
+        .expect("canonical class projection");
+        assert_eq!(projection.class_count, 4);
+        assert_eq!(&projection.source_classes[..4], &[4, 3, 0, 5]);
+        assert_eq!(&projection.class_map[..6], &[0, 1, 0, 2, 2, 3]);
+
+        // Apply an arbitrary permutation to source class numbers while
+        // preserving every raw-byte and transition semantic. The canonical
+        // projected byte map must be byte-for-byte identical.
+        let old_to_new = [3_usize, 5, 1, 4, 0, 2];
+        let mut permuted_map = [0_u8; 256];
+        for (destination, &source_class) in
+            permuted_map.iter_mut().zip(&source_class_map)
+        {
+            *destination = u8::try_from(old_to_new[usize::from(source_class)]).unwrap();
+        }
+        let mut permuted_rows = vec![0_u32; rows.len()];
+        for state in 0..state_count {
+            for (old_class, &new_class) in old_to_new.iter().enumerate() {
+                permuted_rows[state * source_class_count + new_class] =
+                    rows[state * source_class_count + old_class];
+            }
+        }
+        let permuted = coalesce_frozen_compact_columns(
+            &permuted_rows,
+            &permuted_map,
+            source_class_count,
+            state_count,
+            source_initial_state,
+        )
+        .expect("permuted canonical class projection");
+        assert_eq!(permuted.class_count, projection.class_count);
+        assert_eq!(permuted.class_map, projection.class_map);
+    }
+
+    #[test]
+    fn frozen_compact_column_shrink_can_promote_v3_geometry_to_v4() {
+        let state_count = 16_384_usize;
+        let source_class_count = 2_usize;
+        let source_initial_state = state_count - 1;
+        let mut rows = Vec::with_capacity(state_count * source_class_count);
+        for source_state in 0..state_count {
+            let destination = (source_state + 1) % state_count;
+            let accepted = source_state % 5 == 0;
+            rows.push(frozen_test_source_cell(
+                Some(destination),
+                source_class_count,
+                accepted,
+                FROZEN_DYNAMIC_SOURCE_START_PROPAGATE,
+            ));
+            rows.push(frozen_test_source_cell(
+                Some(destination),
+                source_class_count,
+                accepted,
+                FROZEN_DYNAMIC_SOURCE_START_RESET,
+            ));
+        }
+        let source_class_map: [u8; 256] =
+            core::array::from_fn(|byte| u8::from(byte >= 128));
+        assert_eq!(
+            select_frozen_compact_rows_format(state_count, source_class_count),
+            Some(FrozenCompactRowsFormat::StateOrdinalV3)
+        );
+        let projection = coalesce_frozen_compact_columns(
+            &rows,
+            &source_class_map,
+            source_class_count,
+            state_count,
+            source_initial_state,
+        )
+        .expect("duplicate columns shrink");
+        assert_eq!(projection.class_count, 1);
+        assert!(projection.class_map.iter().all(|&class| class == 0));
+        assert_eq!(
+            select_frozen_compact_rows_format(state_count, projection.class_count),
+            Some(FrozenCompactRowsFormat::CellOffsetV4)
+        );
+    }
+
+    #[test]
+    fn frozen_compact_column_coalescing_covers_class_and_validation_boundaries() {
+        let state_count = 8_usize;
+        let source_class_count = 256_usize;
+        let source_class_map: [u8; 256] =
+            core::array::from_fn(|byte| u8::try_from(byte).unwrap());
+        let mut rows = Vec::with_capacity(state_count * source_class_count);
+        for state in 0..state_count {
+            for source_class in 0..source_class_count {
+                rows.push(frozen_test_source_cell(
+                    None,
+                    source_class_count,
+                    source_class & (1 << state) != 0,
+                    0,
+                ));
+            }
+        }
+        let projection = coalesce_frozen_compact_columns(
+            &rows,
+            &source_class_map,
+            source_class_count,
+            state_count,
+            0,
+        )
+        .expect("all 256 semantic columns remain representable");
+        assert_eq!(projection.class_count, 256);
+        assert_eq!(projection.class_map, source_class_map);
+        assert_eq!(projection.source_classes, source_class_map);
+
+        let missing_class_map = [0_u8; 256];
+        assert!(coalesce_frozen_compact_columns(&[0, 0], &missing_class_map, 2, 1, 0).is_none());
+        let mut out_of_range_map = [0_u8; 256];
+        out_of_range_map[255] = 1;
+        assert!(coalesce_frozen_compact_columns(&[0], &out_of_range_map, 1, 1, 0).is_none());
+        let ambiguous = FROZEN_DYNAMIC_SOURCE_START_MASK;
+        assert!(coalesce_frozen_compact_columns(&[ambiguous], &[0_u8; 256], 1, 1, 0).is_none());
+        assert!(coalesce_frozen_compact_columns(&[0], &[0_u8; 255], 1, 1, 0).is_none());
+        assert!(coalesce_frozen_compact_columns(&[0], &[0_u8; 256], 0, 1, 0).is_none());
+        assert!(coalesce_frozen_compact_columns(&[0], &[0_u8; 256], 1, 0, 0).is_none());
+        assert!(coalesce_frozen_compact_columns(&[0], &[0_u8; 256], 1, 1, 1).is_none());
+        assert!(coalesce_frozen_compact_columns(&[], &[0_u8; 256], 1, 1, 0).is_none());
+    }
+
+    #[test]
     fn frozen_initial_state_canonicalization_is_an_exhaustive_involution() {
         for state_count in 1_usize..=257 {
             for source_initial in 0..state_count {
@@ -19076,10 +19568,6 @@ mod tests {
 
         let state_count = usize::try_from(storage.descriptor.state_count).unwrap();
         let class_count = usize::try_from(storage.descriptor.class_count).unwrap();
-        assert!(
-            !class_count.is_power_of_two(),
-            "the fixture must prove V4 does not pad a non-power-of-two alphabet"
-        );
         assert_eq!(storage.descriptor.row_shift, 0);
         let physical_cells = class_count;
         assert_eq!(storage.rows.len(), state_count * physical_cells);
@@ -19121,25 +19609,30 @@ mod tests {
         );
         assert_eq!(storage.descriptor.learned_loop_state_count, 0);
         assert_eq!(storage.descriptor.learned_loop_states, [u32::MAX; 4]);
-        assert_eq!(usize::try_from(wide.descriptor.row_stride).unwrap(), class_count);
-        assert_eq!(wide.rows.len() / class_count, state_count);
+        let source_class_count = usize::try_from(wide.descriptor.row_stride).unwrap();
+        assert!(source_class_count >= class_count);
+        assert_eq!(wide.rows.len() / source_class_count, state_count);
         assert!(packed_bytes <= wide.rows.len() * core::mem::size_of::<u32>() + 256);
         let source_initial_row = usize::try_from(wide.descriptor.initial_row).unwrap();
-        assert_eq!(source_initial_row % class_count, 0);
-        let source_initial_state = source_initial_row / class_count;
+        assert_eq!(source_initial_row % source_class_count, 0);
+        let source_initial_state = source_initial_row / source_class_count;
         assert!(source_initial_state < state_count);
         for state in 0..state_count {
             let source_state =
                 canonicalize_frozen_state_ordinal(state, source_initial_state);
-            for class in 0..class_count {
-                let wide_cell = wide.rows[source_state * class_count + class];
-                let compact_cell = storage.rows[state * physical_cells + class];
+            for byte in 0..=usize::from(u8::MAX) {
+                let source_class = usize::from(wide.class_map[byte]);
+                let compact_class = usize::from(storage.class_map[byte]);
+                let wide_cell =
+                    wide.rows[source_state * source_class_count + source_class];
+                let compact_cell =
+                    storage.rows[state * physical_cells + compact_class];
                 let source_token = wide_cell & DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK;
                 let expected_token = if source_token == 0 {
                     0
                 } else {
                     let source_destination =
-                        usize::try_from(source_token - 1).unwrap() / class_count;
+                        usize::try_from(source_token - 1).unwrap() / source_class_count;
                     let destination = canonicalize_frozen_state_ordinal(
                         source_destination,
                         source_initial_state,
