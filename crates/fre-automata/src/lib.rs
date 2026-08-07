@@ -21,6 +21,7 @@ mod error;
 mod k0;
 mod k0_root_corridor;
 mod mandatory_cut;
+mod mandatory_literal_frontier;
 mod mandatory_suffix;
 pub mod p16_grep_stream;
 mod plan;
@@ -45,6 +46,20 @@ pub use mandatory_cut::{
     MandatoryCutAnalysisStats, MandatoryCutByteClass, MandatoryCutCandidate,
     MandatoryCutDeclineReason, MandatoryCutGraphIssue, MandatoryCutResource,
     MaximumConsumedDistance, analyze_mandatory_cut,
+};
+pub use mandatory_literal_frontier::{
+    DEFAULT_MANDATORY_LITERAL_FRONTIER_MAX_ALLOCATION_ATTEMPTS,
+    DEFAULT_MANDATORY_LITERAL_FRONTIER_MAX_ALLOCATION_ITEMS,
+    DEFAULT_MANDATORY_LITERAL_FRONTIER_MAX_CONFIGURATIONS,
+    DEFAULT_MANDATORY_LITERAL_FRONTIER_MAX_WORK, MANDATORY_LITERAL_FRONTIER_ACCOUNTING_ID,
+    MAX_MANDATORY_LITERAL_FRONTIER_BYTES, MAX_MANDATORY_LITERAL_FRONTIER_LITERALS,
+    MAX_MANDATORY_LITERAL_FRONTIER_ROOT_BYTES, MAX_MANDATORY_LITERAL_FRONTIER_TOTAL_BYTES,
+    MIN_MANDATORY_LITERAL_FRONTIER_BYTES, MandatoryLiteralFrontierAnalysis,
+    MandatoryLiteralFrontierAnalysisDecline, MandatoryLiteralFrontierAnalysisLimits,
+    MandatoryLiteralFrontierAnalysisReport, MandatoryLiteralFrontierAnalysisStats,
+    MandatoryLiteralFrontierCandidate, MandatoryLiteralFrontierDeclineReason,
+    MandatoryLiteralFrontierIter, MandatoryLiteralFrontierResource,
+    MandatoryLiteralFrontierStopReason, analyze_mandatory_literal_frontier,
 };
 pub use mandatory_suffix::{
     DEFAULT_MANDATORY_SUFFIX_MAX_ALLOCATION_ATTEMPTS,
