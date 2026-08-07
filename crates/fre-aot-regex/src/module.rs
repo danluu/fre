@@ -25349,13 +25349,19 @@ mod tests {
                 .windows(candidate_prefix.len())
                 .position(|bytes| bytes == candidate_prefix.as_slice())
                 .expect("shared V2/V3 scanner candidate dispatcher");
+            // The assembler may invert the scalar membership diamond, making
+            // its hit edge conditional, while the vector hit remains an
+            // unconditional jump. Restrict the audit to the scanner bodies,
+            // which are laid out after the shared dispatcher, so unrelated
+            // loop-ownership branches that alias its offset cannot satisfy it.
+            let candidate_branches = (candidate + 1..code.len())
+                .filter_map(|offset| {
+                    x86_test_branch_target(code, offset)
+                        .filter(|&(target, _)| target == candidate)
+                })
+                .count();
             assert!(
-                (0..code.len())
-                    .filter(|&offset| matches!(code[offset], 0xeb | 0xe9))
-                    .filter_map(|offset| x86_test_branch_target(code, offset))
-                    .filter(|&(target, _)| target == candidate)
-                    .count()
-                    >= 2,
+                candidate_branches >= 2,
                 "vector and scalar {accelerator:?} hits must converge on compact dispatch"
             );
 
