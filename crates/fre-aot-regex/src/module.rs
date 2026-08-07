@@ -24686,6 +24686,136 @@ mod tests {
                 .count()
         }
 
+        fn aarch64_unconditional_target(words: &[u32], branch: usize) -> Option<usize> {
+            let instruction = *words.get(branch)?;
+            if instruction & 0xfc00_0000 != 0x1400_0000 {
+                return None;
+            }
+            let immediate = ((instruction & 0x03ff_ffff) << 6).cast_signed() >> 6;
+            usize::try_from(i32::try_from(branch).ok()?.checked_add(immediate)?).ok()
+        }
+
+        fn aarch64_relocation_word(
+            emission: &NativeDynamicRowsEmission,
+            symbol: usize,
+            context: &str,
+        ) -> usize {
+            let mut relocations = emission
+                .relocations
+                .iter()
+                .filter(|relocation| relocation.symbol == symbol);
+            let relocation = relocations
+                .next()
+                .unwrap_or_else(|| panic!("{context}: missing relocation {symbol}"));
+            assert!(
+                relocations.next().is_none(),
+                "{context}: duplicate relocation {symbol}"
+            );
+            assert_eq!(relocation.kind, RelocationKind::Aarch64Branch26, "{context}");
+            assert_eq!(relocation.offset % 4, 0, "{context}");
+            usize::try_from(relocation.offset / 4).unwrap()
+        }
+
+        fn assert_aarch64_framed_exits(
+            emission: &NativeDynamicRowsEmission,
+            words: &[u32],
+            target: Target,
+            output: OutputContract,
+        ) {
+            let context = format!("{target:?}/{output:?}");
+            let frame_open = aarch64_sub_x_imm(31, 31, 96).unwrap();
+            let frame_close = aarch64_add_x_imm(31, 31, 96).unwrap();
+            let restore_link = aarch64_load_x_imm(30, 31, 88).unwrap();
+            let return_instruction = 0xd65f_03c0;
+            let opens = words
+                .iter()
+                .enumerate()
+                .filter_map(|(index, &word)| (word == frame_open).then_some(index))
+                .collect::<Vec<_>>();
+            assert_eq!(opens.len(), 1, "{context}: one frame allocation");
+            let frame_open = opens[0];
+            let frozen_guard = words
+                .iter()
+                .enumerate()
+                .filter_map(|(index, &word)| {
+                    (word == aarch64_load_x_imm(12, 31, 0).unwrap()).then_some(index)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                frozen_guard.len(),
+                1,
+                "{context}: one frozen fallback authentication"
+            );
+            let frozen_guard = frozen_guard[0];
+            let deopt = aarch64_relocation_word(
+                emission,
+                DYNAMIC_ROWS_DEOPT_RUNTIME_SYMBOL,
+                &context,
+            );
+            let fallback = aarch64_relocation_word(
+                emission,
+                PREPARED_FALLBACK_RUNTIME_SYMBOL,
+                &context,
+            );
+            assert_eq!(words[deopt] & 0xfc00_0000, 0x1400_0000, "{context}");
+            assert_eq!(words[fallback] & 0xfc00_0000, 0x1400_0000, "{context}");
+
+            let mut ordinary_returns = 0;
+            let mut frozen_fallbacks = 0;
+            let mut adaptive_deopts = 0;
+            for (close, _) in words
+                .iter()
+                .enumerate()
+                .filter(|&(_, &word)| word == frame_close)
+            {
+                assert!(frame_open < close, "{context}: close before frame allocation");
+                assert_eq!(
+                    words.get(close.wrapping_sub(1)),
+                    Some(&restore_link),
+                    "{context}: frame close without link-register restore"
+                );
+                let terminal = close + 1;
+                if words.get(terminal) == Some(&return_instruction) {
+                    assert!(
+                        close < frozen_guard,
+                        "{context}: ordinary return follows the frozen fallback"
+                    );
+                    ordinary_returns += 1;
+                } else if terminal == deopt {
+                    assert!(
+                        frozen_guard < close,
+                        "{context}: adaptive deopt precedes frozen authentication"
+                    );
+                    adaptive_deopts += 1;
+                } else if aarch64_unconditional_target(words, terminal) == Some(fallback) {
+                    assert!(
+                        frozen_guard < close,
+                        "{context}: frozen fallback precedes its authentication"
+                    );
+                    frozen_fallbacks += 1;
+                } else {
+                    panic!("{context}: frame close has no authenticated terminal exit");
+                }
+            }
+            assert!(ordinary_returns > 0, "{context}: no ordinary framed return");
+            assert_eq!(
+                frozen_fallbacks, 1,
+                "{context}: authenticated frozen fallback exit"
+            );
+            assert_eq!(adaptive_deopts, 1, "{context}: adaptive deopt exit");
+            for (return_index, _) in words
+                .iter()
+                .enumerate()
+                .filter(|&(_, &word)| word == return_instruction)
+            {
+                assert_eq!(
+                    words.get(return_index.wrapping_sub(1)),
+                    Some(&frame_close),
+                    "{context}: framed return without frame close"
+                );
+            }
+        }
+
         let filter = dynamic_root_test_filter(b"a", 1);
         let avx512 = FeatureSet::of(CpuFeature::X86Avx512F)
             .with(CpuFeature::X86Avx512Bw)
@@ -24751,26 +24881,22 @@ mod tests {
                 (OutputContract::SelectedEnd, None),
                 (OutputContract::Span, Some(2)),
             ] {
-                let words = lower_aarch64_dynamic_rows_prepared_for_output(
+                let emission = lower_aarch64_dynamic_rows_prepared_for_output(
                     Some(plan),
                     output,
                     width,
                     false,
                 )
-                .unwrap()
-                .code
-                .chunks_exact(4)
-                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
-                .collect::<Vec<_>>();
+                .unwrap();
+                let words = emission
+                    .code
+                    .chunks_exact(4)
+                    .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                    .collect::<Vec<_>>();
                 for (instruction, expected, detail) in [
                     (aarch64_store_x(31, 31, 80).unwrap(), 1, "pending initialization"),
                     (aarch64_store_x(2, 31, 80).unwrap(), 1, "pending update"),
                     (aarch64_load_x_imm(7, 31, 80).unwrap(), 1, "pending completion"),
-                    (
-                        aarch64_add_x_imm(31, 31, 96).unwrap(),
-                        4,
-                        "all framed exits",
-                    ),
                 ] {
                     assert_eq!(
                         words.iter().filter(|&&word| word == instruction).count(),
@@ -24778,6 +24904,7 @@ mod tests {
                         "{target:?}/{output:?}: {detail}"
                     );
                 }
+                assert_aarch64_framed_exits(&emission, &words, target, output);
             }
         }
     }
