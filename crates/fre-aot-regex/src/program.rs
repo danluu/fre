@@ -2627,10 +2627,11 @@ pub struct FrozenPreparedHeaderV6 {
 /// acceptance and the low 7 bits hold a one-based destination-state ordinal.
 /// V11 stores mapped two-transition `u32` cells followed by one odd-tail
 /// acceptance bitmap per state block; V13 stores the exact dense C^2 pair
-/// space and bitmap in `u16` cells. Every format retains physical row or block
-/// zero as the canonical initial state. Exact V1 flags, versions, seals, and
-/// geometry distinguish the interpretations before generated code follows the
-/// rows pointer.
+/// space and bitmap in `u16` cells. V14 stores exact C^4 plus short-tail
+/// spaces and uses the same one-based block-cell-offset convention as V13.
+/// Every format retains physical row or block zero as the canonical initial
+/// state. Exact V1 flags, versions, seals, and geometry distinguish the
+/// interpretations before generated code follows the rows pointer.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[repr(C)]
@@ -3019,7 +3020,7 @@ pub const FROZEN_PREPARED_HEADER_V12_READY_SEAL: u64 = 0x3d91_f7a6_2be8_c405;
 pub const FROZEN_PREPARED_HEADER_V13_READY_SEAL: u64 = 0x95c1_7a4e_32bd_f608;
 /// Final publication seal for a dense mapped four-transition V14 tail.
 #[doc(hidden)]
-pub const FROZEN_PREPARED_HEADER_V14_READY_SEAL: u64 = 0xc27d_40a9_6e13_f85b;
+pub const FROZEN_PREPARED_HEADER_V14_READY_SEAL: u64 = 0x8db6_f249_31ae_c570;
 /// Exact mapped state-ordinal tail format selected by the V3 flag and extent.
 #[doc(hidden)]
 pub const FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION: u32 = 3;
@@ -3181,9 +3182,9 @@ pub const DYNAMIC_NATIVE_ROWS_V14_ANY_ACCEPT_MASK: u16 = 1 << 15;
 /// Two-bit distance from the last loaded byte to the latest accepting edge.
 #[doc(hidden)]
 pub const DYNAMIC_NATIVE_ROWS_V14_ACCEPT_DISTANCE_MASK: u16 = 0b11 << 13;
-/// One-based destination-state ordinal after four live V14 transitions.
+/// One-based destination V14 block-cell offset after four live transitions.
 #[doc(hidden)]
-pub const DYNAMIC_NATIVE_ROWS_V14_NEXT_STATE_TOKEN_MASK: u16 = (1 << 13) - 1;
+pub const DYNAMIC_NATIVE_ROWS_V14_NEXT_BLOCK_TOKEN_MASK: u16 = (1 << 13) - 1;
 /// Smallest semantic alphabet admitted to pair-supertransition V11.
 pub(crate) const FROZEN_PAIR_ROWS_V11_MIN_CLASSES: usize = 2;
 /// Largest semantic alphabet admitted to the initial V11 slice.
@@ -3646,18 +3647,17 @@ fn build_frozen_pair_rows_v13(
 
 /// Return `(quad, tail3, tail2, tail1, block, total, bytes)` for V14.
 ///
-/// V14 deliberately uses exact, unpadded base-C rows and state-ordinal
+/// V14 deliberately uses exact, unpadded base-C rows and cell-offset
 /// destinations. Padding these blocks to powers of two would inflate their
 /// exact sizes by 6.67%, 6.67%, and 50.59% for C=2,3,4 respectively, reducing
-/// coverage under the resident cap. One constant row-size multiply every four
-/// bytes preserves the full cache/resource envelope while remaining off the
-/// per-byte chain.
+/// coverage under the resident cap. Each nonzero token points directly at an
+/// aligned destination-block start, so target-native loops need no row-size
+/// multiply on their serial four-byte backedge.
 fn frozen_quad_rows_v14_geometry(
     state_count: usize,
     class_count: usize,
 ) -> Option<(usize, usize, usize, usize, usize, usize, usize)> {
     if state_count == 0
-        || state_count > usize::from(DYNAMIC_NATIVE_ROWS_V14_NEXT_STATE_TOKEN_MASK)
         || !(FROZEN_QUAD_ROWS_V14_MIN_CLASSES..=FROZEN_QUAD_ROWS_V14_MAX_CLASSES)
             .contains(&class_count)
     {
@@ -3672,6 +3672,13 @@ fn frozen_quad_rows_v14_geometry(
         .checked_add(tail2_cells)?
         .checked_add(tail1_cells)?;
     let total_cells = state_count.checked_mul(block_cells)?;
+    let last_block_token = state_count
+        .checked_sub(1)?
+        .checked_mul(block_cells)?
+        .checked_add(1)?;
+    if last_block_token > usize::from(DYNAMIC_NATIVE_ROWS_V14_NEXT_BLOCK_TOKEN_MASK) {
+        return None;
+    }
     let bytes = total_cells
         .checked_mul(core::mem::size_of::<u16>())?
         .checked_add(256)?;
@@ -3712,9 +3719,13 @@ fn frozen_quad_cell_v14(
     state: usize,
     classes: &[usize],
     class_count: usize,
+    block_cells: usize,
     include_destination: bool,
 ) -> Option<u16> {
-    if classes.is_empty() || classes.len() > 4 || state.checked_mul(class_count)? >= semantics.len()
+    if block_cells == 0
+        || classes.is_empty()
+        || classes.len() > 4
+        || state.checked_mul(class_count)? >= semantics.len()
     {
         return None;
     }
@@ -3747,8 +3758,9 @@ fn frozen_quad_cell_v14(
         summary |= DYNAMIC_NATIVE_ROWS_V14_ANY_ACCEPT_MASK | (distance << 13);
     }
     if include_destination && live_after_all {
-        let token = u16::try_from(state.checked_add(1)?).ok()?;
-        if token > DYNAMIC_NATIVE_ROWS_V14_NEXT_STATE_TOKEN_MASK {
+        let token = state.checked_mul(block_cells)?.checked_add(1)?;
+        let token = u16::try_from(token).ok()?;
+        if token > DYNAMIC_NATIVE_ROWS_V14_NEXT_BLOCK_TOKEN_MASK {
             return None;
         }
         summary |= token;
@@ -3799,6 +3811,7 @@ fn build_frozen_quad_rows_v14(
                     state,
                     &classes[..length],
                     class_count,
+                    block_cells,
                     length == 4,
                 )?);
             }
@@ -4164,7 +4177,7 @@ const _: () = {
     assert!(
         DYNAMIC_NATIVE_ROWS_V14_ANY_ACCEPT_MASK
             | DYNAMIC_NATIVE_ROWS_V14_ACCEPT_DISTANCE_MASK
-            | DYNAMIC_NATIVE_ROWS_V14_NEXT_STATE_TOKEN_MASK
+            | DYNAMIC_NATIVE_ROWS_V14_NEXT_BLOCK_TOKEN_MASK
             == u16::MAX
     );
     assert!(std::mem::offset_of!(FrozenPreparedHeaderV5, v1) == 0);
@@ -5297,7 +5310,13 @@ impl FrozenDynamicRowsStorageV3 {
             return false;
         };
         let token_extent_invalid = if format.is_quad_supertransition() {
-            state_count > usize::from(DYNAMIC_NATIVE_ROWS_V14_NEXT_STATE_TOKEN_MASK)
+            state_count
+                .checked_sub(1)
+                .and_then(|last_state| last_state.checked_mul(physical_cells))
+                .and_then(|last_block| last_block.checked_add(1))
+                .is_none_or(|token| {
+                    token > usize::from(DYNAMIC_NATIVE_ROWS_V14_NEXT_BLOCK_TOKEN_MASK)
+                })
         } else if format.is_dense_pair_supertransition() {
             live_cells > usize::from(DYNAMIC_NATIVE_ROWS_V13_NEXT_BLOCK_TOKEN_MASK)
         } else if format.is_pair_supertransition() {
@@ -5420,11 +5439,17 @@ impl FrozenDynamicRowsStorageV3 {
                         let accepts = cell & DYNAMIC_NATIVE_ROWS_V14_ANY_ACCEPT_MASK != 0;
                         let distance =
                             (cell & DYNAMIC_NATIVE_ROWS_V14_ACCEPT_DISTANCE_MASK) >> 13;
-                        let token = cell & DYNAMIC_NATIVE_ROWS_V14_NEXT_STATE_TOKEN_MASK;
+                        let token = cell & DYNAMIC_NATIVE_ROWS_V14_NEXT_BLOCK_TOKEN_MASK;
                         if (!accepts && distance != 0)
                             || distance >= length
                             || (!permits_token && token != 0)
-                            || (token != 0 && usize::from(token) > state_count)
+                            || (token != 0
+                                && usize::from(token)
+                                    .checked_sub(1)
+                                    .is_none_or(|destination| {
+                                        destination >= total_cells
+                                            || destination.checked_rem(block_cells) != Some(0)
+                                    }))
                         {
                             return false;
                         }
@@ -9185,7 +9210,7 @@ impl CompiledProgram {
             header.v1.unfilled_cell = 0;
             header.v1.accept_mask = u32::from(DYNAMIC_NATIVE_ROWS_V14_ANY_ACCEPT_MASK);
             header.v1.next_row_token_mask =
-                u32::from(DYNAMIC_NATIVE_ROWS_V14_NEXT_STATE_TOKEN_MASK);
+                u32::from(DYNAMIC_NATIVE_ROWS_V14_NEXT_BLOCK_TOKEN_MASK);
         } else if format.is_dense_pair_supertransition() {
             header.v1.unfilled_cell = 0;
             header.v1.accept_mask = u32::from(DYNAMIC_NATIVE_ROWS_V13_ANY_ACCEPT_MASK);
@@ -22177,20 +22202,20 @@ mod tests {
         assert!(frozen_quad_rows_v14_geometry(1, 1).is_none());
         assert!(frozen_quad_rows_v14_geometry(1, 5).is_none());
         assert_eq!(
-            frozen_quad_rows_v14_geometry(1_088, 2),
-            Some((16, 8, 4, 2, 30, 32_640, 65_536))
+            frozen_quad_rows_v14_geometry(274, 2),
+            Some((16, 8, 4, 2, 30, 8_220, 16_696))
         );
-        assert!(frozen_quad_rows_v14_geometry(1_089, 2).is_none());
+        assert!(frozen_quad_rows_v14_geometry(275, 2).is_none());
         assert_eq!(
-            frozen_quad_rows_v14_geometry(272, 3),
-            Some((81, 27, 9, 3, 120, 32_640, 65_536))
+            frozen_quad_rows_v14_geometry(69, 3),
+            Some((81, 27, 9, 3, 120, 8_280, 16_816))
         );
-        assert!(frozen_quad_rows_v14_geometry(273, 3).is_none());
+        assert!(frozen_quad_rows_v14_geometry(70, 3).is_none());
         assert_eq!(
-            frozen_quad_rows_v14_geometry(96, 4),
-            Some((256, 64, 16, 4, 340, 32_640, 65_536))
+            frozen_quad_rows_v14_geometry(25, 4),
+            Some((256, 64, 16, 4, 340, 8_500, 17_256))
         );
-        assert!(frozen_quad_rows_v14_geometry(97, 4).is_none());
+        assert!(frozen_quad_rows_v14_geometry(26, 4).is_none());
 
         type ModelCell = (bool, Option<usize>);
 
@@ -22217,7 +22242,7 @@ mod tests {
             let tail2_cells = class_count.pow(2);
             let tail1_cells = class_count;
             let block_cells = quad_cells + tail3_cells + tail2_cells + tail1_cells;
-            let mut state = 0_usize;
+            let mut block = 0_usize;
             let mut position = 0_usize;
             let mut selected_end = None;
             while position + 4 <= input.len() {
@@ -22226,7 +22251,7 @@ mod tests {
                     .fold(0_usize, |key, &class| {
                         key * class_count + usize::from(class)
                     });
-                let cell = rows[state * block_cells + key];
+                let cell = rows[block + key];
                 if cell & DYNAMIC_NATIVE_ROWS_V14_ANY_ACCEPT_MASK != 0 {
                     let distance = usize::from(
                         (cell & DYNAMIC_NATIVE_ROWS_V14_ACCEPT_DISTANCE_MASK) >> 13,
@@ -22234,11 +22259,13 @@ mod tests {
                     selected_end = Some(position + 4 - distance);
                 }
                 position += 4;
-                let token = cell & DYNAMIC_NATIVE_ROWS_V14_NEXT_STATE_TOKEN_MASK;
+                let token = cell & DYNAMIC_NATIVE_ROWS_V14_NEXT_BLOCK_TOKEN_MASK;
                 if token == 0 {
                     return selected_end;
                 }
-                state = usize::from(token) - 1;
+                block = usize::from(token) - 1;
+                assert!(block < rows.len());
+                assert_eq!(block % block_cells, 0);
             }
             let length = input.len() - position;
             if length == 0 {
@@ -22255,8 +22282,8 @@ mod tests {
                 .fold(0_usize, |key, &class| {
                     key * class_count + usize::from(class)
                 });
-            let cell = rows[state * block_cells + section + key];
-            assert_eq!(cell & DYNAMIC_NATIVE_ROWS_V14_NEXT_STATE_TOKEN_MASK, 0);
+            let cell = rows[block + section + key];
+            assert_eq!(cell & DYNAMIC_NATIVE_ROWS_V14_NEXT_BLOCK_TOKEN_MASK, 0);
             if cell & DYNAMIC_NATIVE_ROWS_V14_ANY_ACCEPT_MASK != 0 {
                 let distance = usize::from(
                     (cell & DYNAMIC_NATIVE_ROWS_V14_ACCEPT_DISTANCE_MASK) >> 13,
@@ -22372,7 +22399,7 @@ mod tests {
         );
         assert_eq!(
             header.v1.next_row_token_mask,
-            u32::from(DYNAMIC_NATIVE_ROWS_V14_NEXT_STATE_TOKEN_MASK)
+            u32::from(DYNAMIC_NATIVE_ROWS_V14_NEXT_BLOCK_TOKEN_MASK)
         );
         assert_eq!(header.dynamic_rows_v3.ready_seal, FROZEN_PREPARED_HEADER_V14_READY_SEAL);
 
@@ -22408,9 +22435,19 @@ mod tests {
         assert!(!storage.descriptor_is_valid_for(compiled.identity));
         storage.quad_rows_v14 = owned_quads;
 
+        for token in [1_u16, u16::try_from(block_cells + 1).unwrap()] {
+            let original = storage.quad_rows_v14[0];
+            storage.quad_rows_v14[0] = token;
+            assert!(
+                storage.descriptor_is_valid_for(compiled.identity),
+                "aligned V14 block token {token}"
+            );
+            storage.quad_rows_v14[0] = original;
+        }
         for (index, malformed) in [
             (0, 1_u16 << 13),
-            (0, u16::try_from(state_count + 1).unwrap()),
+            (0, 2),
+            (0, u16::try_from(total_cells + 1).unwrap()),
             (quad, 1),
             (quad, DYNAMIC_NATIVE_ROWS_V14_ANY_ACCEPT_MASK | (3 << 13)),
             (

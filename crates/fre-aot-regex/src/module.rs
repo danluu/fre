@@ -44,7 +44,7 @@ use crate::{
         DYNAMIC_NATIVE_ROWS_V13_ACCEPT_BACK_ONE_MASK, DYNAMIC_NATIVE_ROWS_V13_ANY_ACCEPT_MASK,
         DYNAMIC_NATIVE_ROWS_V13_NEXT_BLOCK_TOKEN_MASK,
         DYNAMIC_NATIVE_ROWS_V14_ACCEPT_DISTANCE_MASK, DYNAMIC_NATIVE_ROWS_V14_ANY_ACCEPT_MASK,
-        DYNAMIC_NATIVE_ROWS_V14_NEXT_STATE_TOKEN_MASK,
+        DYNAMIC_NATIVE_ROWS_V14_NEXT_BLOCK_TOKEN_MASK,
         DynamicNativeRowsV1, FROZEN_COMPACT_DIRECT_BYTE_MIN_CLASSES,
         FROZEN_COMPACT_LOOP_PLAN_V1_BYTES,
         FROZEN_COMPACT_LOOP_PLAN_V1_CANONICAL_STATE_OFFSET,
@@ -1005,7 +1005,7 @@ const _: () = assert!(DYNAMIC_NATIVE_ROWS_V13_ACCEPT_BACK_ONE_MASK == 1 << 14);
 const _: () = assert!(DYNAMIC_NATIVE_ROWS_V13_NEXT_BLOCK_TOKEN_MASK == (1 << 14) - 1);
 const _: () = assert!(DYNAMIC_NATIVE_ROWS_V14_ANY_ACCEPT_MASK == 1 << 15);
 const _: () = assert!(DYNAMIC_NATIVE_ROWS_V14_ACCEPT_DISTANCE_MASK == 0x6000);
-const _: () = assert!(DYNAMIC_NATIVE_ROWS_V14_NEXT_STATE_TOKEN_MASK == (1 << 13) - 1);
+const _: () = assert!(DYNAMIC_NATIVE_ROWS_V14_NEXT_BLOCK_TOKEN_MASK == (1 << 13) - 1);
 const _: () = assert!(FROZEN_PREPARED_HEADER_V3_DYNAMIC_ROWS_OFFSET == 384);
 const _: () = assert!(FROZEN_PREPARED_HEADER_V3_BYTES == 448);
 const _: () = assert!(FROZEN_PREPARED_HEADER_V11_DYNAMIC_ROWS_OFFSET == 384);
@@ -13631,7 +13631,14 @@ fn x86_emit_frozen_compact_entry(
         assembler.instruction(&[0x41, 0x89, 0xc2])?;
         assembler.instruction(&[0x48, 0x0f, 0xaf, 0xc2])?;
         if format.is_quad_supertransition() {
-            assembler.instruction(&[0x48, 0x3d, 0x80, 0x7f, 0x00, 0x00])?;
+            // V14 tokens address block starts rather than the full owned
+            // extent. Prove `(states - 1) * block_cells + 1 <= 8191`
+            // exactly; the independent live-cell mirror below authenticates
+            // the complete final block as well.
+            assembler.instruction(&[0x49, 0x89, 0xc2])?;
+            assembler.instruction(&[0x49, 0x29, 0xd2])?;
+            assembler.instruction(&[0x49, 0xff, 0xc2])?;
+            assembler.instruction(&[0x49, 0x81, 0xfa, 0xff, 0x1f, 0x00, 0x00])?;
             assembler.branch(&[0x0f, 0x87], call_preflight)?;
         } else if format.is_dense_pair_supertransition() {
             assembler.instruction(&[0x48, 0x3d, 0xff, 0x3f, 0x00, 0x00])?;
@@ -13683,7 +13690,7 @@ fn x86_emit_frozen_compact_entry(
             FrozenCompactNativeFormat::DenseQuadSupertransitionV14 => (
                 0,
                 u32::from(DYNAMIC_NATIVE_ROWS_V14_ANY_ACCEPT_MASK),
-                u32::from(DYNAMIC_NATIVE_ROWS_V14_NEXT_STATE_TOKEN_MASK),
+                u32::from(DYNAMIC_NATIVE_ROWS_V14_NEXT_BLOCK_TOKEN_MASK),
             ),
             FrozenCompactNativeFormat::PairSupertransitionV11 => (
                 0,
@@ -14998,7 +15005,6 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
 
         for (class_index, &entry) in v14_class_entries.iter().enumerate() {
             let class_count = class_index + 2;
-            let tail1_cells = class_count;
             let tail2_cells = class_count
                 .checked_pow(2)
                 .ok_or(ObjectError::ArithmeticOverflow("x86 V14 tail2 cells"))?;
@@ -15015,14 +15021,6 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
             let tail1_offset = tail2_offset
                 .checked_add(tail2_cells)
                 .ok_or(ObjectError::ArithmeticOverflow("x86 V14 tail1 offset"))?;
-            let block_cells = tail1_offset
-                .checked_add(tail1_cells)
-                .ok_or(ObjectError::ArithmeticOverflow("x86 V14 block cells"))?;
-            let block_bytes = block_cells
-                .checked_mul(core::mem::size_of::<u16>())
-                .ok_or(ObjectError::ArithmeticOverflow("x86 V14 block bytes"))?;
-            let block_bytes_u32 = u32::try_from(block_bytes)
-                .map_err(|_| ObjectError::ArithmeticOverflow("x86 V14 block bytes"))?;
             let main_scan = assembler.label()?;
             let tail_dispatch = assembler.label()?;
             let tail3 = assembler.label()?;
@@ -15031,11 +15029,6 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
             let complete = native_complete.unwrap_or(native_no_match);
 
             assembler.bind(entry)?;
-            // Bias the immutable table once. A one-based state token times
-            // the exact block byte size then forms the next block directly.
-            let mut bias_rows = vec![0x48, 0x81, 0xee];
-            bias_rows.extend_from_slice(&block_bytes_u32.to_le_bytes());
-            assembler.instruction(&bias_rows)?;
             assembler.instruction(&[0x48, 0x39, 0xca])?;
             assembler.branch(&[0x0f, 0x83], complete)?;
             assembler.instruction(&[0x4c, 0x8d, 0x5a, 0x03])?;
@@ -15066,10 +15059,9 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
             }
             assembler.instruction(&[0x41, 0x81, 0xe2, 0xff, 0x1f, 0x00, 0x00])?;
             assembler.branch(&[0x0f, 0x84], complete)?;
-            let mut scale_token = vec![0x45, 0x69, 0xd2];
-            scale_token.extend_from_slice(&block_bytes_u32.to_le_bytes());
-            assembler.instruction(&scale_token)?;
-            assembler.instruction(&[0x4e, 0x8d, 0x04, 0x16])?;
+            // The one-based cell-offset token folds the u16 scale and `-1`
+            // decode into one address-generation instruction.
+            assembler.instruction(&[0x4e, 0x8d, 0x44, 0x56, 0xfe])?;
             assembler.instruction(&[0x4c, 0x8d, 0x5a, 0x03])?;
             assembler.instruction(&[0x49, 0x39, 0xcb])?;
             assembler.branch(&[0x0f, 0x82], main_scan)?;
@@ -24084,8 +24076,16 @@ fn aarch64_emit_frozen_compact_entry(
             assembler.branch_cond(AARCH64_HI, call_preflight)?;
         } else if format.is_quad_supertransition() {
             assembler.instruction(aarch64_mul_x(7, 10, 9)?)?;
-            aarch64_load_u32_constant(assembler, 8, 32_640)?;
-            assembler.instruction(aarch64_cmp_x(7, 8)?)?;
+            // As on x86, authenticate the exact last block-start token while
+            // retaining X7 as the complete payload extent for the mirror.
+            assembler.instruction(aarch64_sub_x_reg(8, 7, 9)?)?;
+            assembler.instruction(aarch64_add_x_imm(8, 8, 1)?)?;
+            aarch64_load_u32_constant(
+                assembler,
+                6,
+                u32::from(DYNAMIC_NATIVE_ROWS_V14_NEXT_BLOCK_TOKEN_MASK),
+            )?;
+            assembler.instruction(aarch64_cmp_x(8, 6)?)?;
             assembler.branch_cond(AARCH64_HI, call_preflight)?;
         } else if format.is_state_ordinal() {
             assembler.instruction(aarch64_lslv_x(7, 10, 8)?)?;
@@ -24131,7 +24131,7 @@ fn aarch64_emit_frozen_compact_entry(
             FrozenCompactNativeFormat::DenseQuadSupertransitionV14 => (
                 0,
                 u32::from(DYNAMIC_NATIVE_ROWS_V14_ANY_ACCEPT_MASK),
-                u32::from(DYNAMIC_NATIVE_ROWS_V14_NEXT_STATE_TOKEN_MASK),
+                u32::from(DYNAMIC_NATIVE_ROWS_V14_NEXT_BLOCK_TOKEN_MASK),
             ),
             FrozenCompactNativeFormat::PairSupertransitionV11 => (
                 0,
@@ -25427,6 +25427,9 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
         assembler.instruction(aarch64_cmp_x_imm(15, 0)?)?;
         assembler.branch_cond(AARCH64_EQ, framed_fallback)?;
         assembler.instruction(aarch64_mov_x(11, 15)?)?;
+        // V14 block tokens are one-based u16 cell offsets. Bias the immutable
+        // table once so an extended-register ADD forms every next block.
+        assembler.instruction(aarch64_sub_x_imm(15, 15, 2)?)?;
         assembler.instruction(aarch64_add_x_imm(
             14,
             0,
@@ -25493,7 +25496,6 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
 
         for (class_index, &entry) in v14_class_entries.iter().enumerate() {
             let class_count = class_index + 2;
-            let tail1_cells = class_count;
             let tail2_cells = class_count
                 .checked_pow(2)
                 .ok_or(ObjectError::ArithmeticOverflow("AArch64 V14 tail2 cells"))?;
@@ -25510,14 +25512,6 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
             let tail1_offset = tail2_offset
                 .checked_add(tail2_cells)
                 .ok_or(ObjectError::ArithmeticOverflow("AArch64 V14 tail1 offset"))?;
-            let block_cells = tail1_offset
-                .checked_add(tail1_cells)
-                .ok_or(ObjectError::ArithmeticOverflow("AArch64 V14 block cells"))?;
-            let block_bytes = block_cells
-                .checked_mul(core::mem::size_of::<u16>())
-                .ok_or(ObjectError::ArithmeticOverflow("AArch64 V14 block bytes"))?;
-            let block_bytes_u16 = u16::try_from(block_bytes)
-                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 V14 block bytes"))?;
             let main_scan = assembler.label()?;
             let tail_dispatch = assembler.label()?;
             let tail3 = assembler.label()?;
@@ -25526,11 +25520,6 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
             let complete = native_complete.unwrap_or(native_no_match);
 
             assembler.bind(entry)?;
-            // X12 is invariant for the selected C=2/3/4 body. Biasing the
-            // immutable base lets token*block_bytes directly address the
-            // one-based destination state after each four-byte summary.
-            assembler.instruction(aarch64_movz_x(12, block_bytes_u16, 0)?)?;
-            assembler.instruction(aarch64_sub_x_imm(15, 15, block_bytes_u16)?)?;
             assembler.instruction(aarch64_cmp_x(2, 3)?)?;
             assembler.branch_cond(AARCH64_HS, complete)?;
             assembler.instruction(aarch64_add_x_imm(9, 2, 3)?)?;
@@ -25554,8 +25543,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
             }
             assembler.instruction(aarch64_and_low_w(8, 8, 13)?)?;
             assembler.branch_zero_w(8, complete)?;
-            assembler.instruction(aarch64_mul_x(8, 8, 12)?)?;
-            assembler.instruction(aarch64_add_x_reg(11, 15, 8)?)?;
+            assembler.instruction(aarch64_add_x_uxtw(11, 15, 8, 1)?)?;
             assembler.instruction(aarch64_add_x_imm(9, 2, 3)?)?;
             assembler.instruction(aarch64_cmp_x(9, 3)?)?;
             assembler.branch_cond(AARCH64_LO, main_scan)?;
@@ -45074,9 +45062,15 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
         assert_eq!(occurrences(&x86_guard, &[0x3d, 0xff, 0x1f, 0, 0]), 1);
         assert_eq!(occurrences(&x86_guard, &[0x41, 0x83, 0xf8, 0x04]), 1);
         assert_eq!(
-            occurrences(&x86_guard, &[0x48, 0x3d, 0x80, 0x7f, 0, 0]),
+            occurrences(
+                &x86_guard,
+                &[
+                    0x49, 0x89, 0xc2, 0x49, 0x29, 0xd2, 0x49, 0xff, 0xc2, 0x49, 0x81, 0xfa,
+                    0xff, 0x1f, 0, 0,
+                ],
+            ),
             1,
-            "V14 must prove its complete 64-KiB table/map envelope"
+            "V14 must prove its exact final aligned block-start token"
         );
 
         let mut arm_guard = Aarch64Assembler::new();
@@ -45124,7 +45118,15 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
         );
         assert!(arm_guard_words.contains(&aarch64_and_low_x(9, 8, 1).unwrap()));
         assert!(arm_guard_words.contains(&aarch64_cmp_w_imm(11, 4).unwrap()));
-        assert!(arm_guard_words.contains(&aarch64_movz_x(8, 32_640, 0).unwrap()));
+        assert!(arm_guard_words.windows(4).any(|words| {
+            words
+                == [
+                    aarch64_sub_x_reg(8, 7, 9).unwrap(),
+                    aarch64_add_x_imm(8, 8, 1).unwrap(),
+                    aarch64_movz_x(6, DYNAMIC_NATIVE_ROWS_V14_NEXT_BLOCK_TOKEN_MASK, 0).unwrap(),
+                    aarch64_cmp_x(8, 6).unwrap(),
+                ]
+        }));
         let mut arm_ready = Aarch64Assembler::new();
         aarch64_load_u64_constant(
             &mut arm_ready,
@@ -45174,12 +45176,12 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 scale.extend_from_slice(&block_bytes.to_le_bytes());
                 assert_eq!(
                     occurrences(&x86.code, &scale),
-                    1,
-                    "one V14 token scaling for block={block_bytes}: {context}"
+                    0,
+                    "V14 cell-offset tokens need no scaling for block={block_bytes}: {context}"
                 );
                 let mut bias = vec![0x48, 0x81, 0xee];
                 bias.extend_from_slice(&block_bytes.to_le_bytes());
-                assert_eq!(occurrences(&x86.code, &bias), 1, "{context}");
+                assert_eq!(occurrences(&x86.code, &bias), 0, "{context}");
             }
             for tail_offset in [16_u32, 24, 28, 81, 108, 117, 256, 320, 336] {
                 let mut add = vec![0x41, 0x81, 0xc2];
@@ -45187,8 +45189,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 assert!(occurrences(&x86.code, &add) >= 1, "{context}");
             }
             assert!(
-                occurrences(&x86.code, &[0x4e, 0x8d, 0x04, 0x16]) >= 3,
-                "every admitted alphabet needs a state-ordinal backedge: {context}"
+                occurrences(&x86.code, &[0x4e, 0x8d, 0x44, 0x56, 0xfe]) >= 3,
+                "every admitted alphabet needs a direct cell-offset backedge: {context}"
             );
             assert_eq!(
                 occurrences(&x86.code, &[0x41, 0xc1, 0xeb, 0x0d]),
@@ -45256,7 +45258,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                             word == aarch64_movz_x(12, block_bytes, 0).unwrap()
                         })
                         .count(),
-                    1,
+                    0,
                     "{context}"
                 );
                 assert_eq!(
@@ -45266,7 +45268,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                             word == aarch64_sub_x_imm(15, 15, block_bytes).unwrap()
                         })
                         .count(),
-                    1,
+                    0,
                     "{context}"
                 );
             }
@@ -45282,14 +45284,15 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                     "{context}"
                 );
             }
-            assert_eq!(
+            assert!(
                 arm_words
                     .iter()
-                    .filter(|&&word| word == aarch64_add_x_reg(11, 15, 8).unwrap())
-                    .count(),
-                3,
-                "one state-ordinal backedge per admitted alphabet: {context}"
+                    .filter(|&&word| word == aarch64_add_x_uxtw(11, 15, 8, 1).unwrap())
+                    .count()
+                    >= 3,
+                "one cell-offset backedge per admitted alphabet: {context}"
             );
+            assert!(!arm_words.contains(&aarch64_add_x_reg(11, 15, 8).unwrap()));
             assert_eq!(
                 arm_words
                     .iter()
@@ -46266,8 +46269,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
         );
         assert_eq!(
             occurrences(&x86.code, &[0x4e, 0x8d, 0x04, 0x16]),
-            51,
-            "three V14 alphabets, V8/V6, and both ordered V3/V10/V12 transitions need state-to-row updates"
+            10,
+            "V8 and every mapped V3 loop need a state-ordinal backedge"
         );
         assert_eq!(
             occurrences(&x86.code, &[0x49, 0x89, 0xf0]),
@@ -46281,8 +46284,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
         );
         assert_eq!(
             occurrences(&x86.code, &[0x4e, 0x8d, 0x44, 0x56, 0xfe]),
-            6,
-            "V13, singleton, V7, both mapped V4 transitions, and V9 need direct rows+token*2-2 updates"
+            7,
+            "V14, V13, singleton, mapped V4, and V9 need direct rows+token*2-2 backedges"
         );
         let mut v2_flag = vec![
             0x81,
@@ -46813,8 +46816,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 .iter()
                 .filter(|&&word| word == aarch64_add_x_uxtw(11, 15, 8, 1).unwrap())
                 .count(),
-            6,
-            "V13, singleton, V7, both mapped V4 transitions, and V9 need biased-base cell-offset updates"
+            7,
+            "V14, V13, singleton, mapped V4, and V9 need biased-base cell-offset backedges"
         );
         assert_eq!(
             arm_words
