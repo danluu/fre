@@ -25701,7 +25701,7 @@ mod tests {
         let frozen_header_bytes = FROZEN_PREPARED_HEADER_V2_BYTES;
         let frozen_next_row_mask = DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK;
         let source = format!(
-            r"#include <stddef.h>
+            r##"#include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 typedef void *handle_t;
@@ -25952,7 +25952,7 @@ int main(void) {{
   if(direct_routes!=7||preflight_routes!=37||ordinary_routes!=9)return 140;
   return 0;
 }}
-",
+"##,
         );
         fs::write(&c_path, source).expect("write dynamic C harness");
         let c_compiler = if cfg!(target_os = "macos") {
