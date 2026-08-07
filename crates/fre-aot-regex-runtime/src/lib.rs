@@ -65,11 +65,12 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex, OnceLock, TryLockError};
 
 use fre_aot_regex::{
-    CompileError, CompiledProgram, FrozenDynamicRowsStorageV3, FrozenPreparedHeaderV2,
-    FrozenPreparedHeaderV3, FullyPrefilledFallbackReceipt, MatchResult, OutputContract,
-    PROGRAM_HEADER_LEN, ProgramFormatError, ProgramWorkspace, RetainedPartialPreflight,
-    SearchWindow,
+    CompileError, CompiledProgram, FrozenDynamicRowsStorageV3, FrozenPreparedHeaderV3,
+    FullyPrefilledFallbackReceipt, MatchResult, OutputContract, PROGRAM_HEADER_LEN,
+    ProgramFormatError, ProgramWorkspace, RetainedPartialPreflight, SearchWindow,
 };
+#[cfg(test)]
+use fre_aot_regex::FrozenPreparedHeaderV2;
 
 /// No match was selected.
 pub const STATUS_NO_MATCH: u32 = 0;
