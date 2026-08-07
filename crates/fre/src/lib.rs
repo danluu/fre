@@ -14271,11 +14271,7 @@ mod tests {
     fn finite_k0_suffix_recovers_global_start_before_ordered_forward_replay() {
         const PREFIX: usize = 16_384;
         let pattern = r"(?-u:(?:[abZ]{5}|b)Z)";
-        let regex = PortableBuilder::new(pattern)
-            .unicode(false)
-            .plan_selection(PlanSelection::ForceK0)
-            .build()
-            .expect("finite suffix fixture builds through K0");
+        let regex = forced_k0_with_only_mandatory_suffix(pattern);
         let PortablePlan::K0(plan) = &regex.plan else {
             panic!("forced finite suffix fixture did not retain K0");
         };
