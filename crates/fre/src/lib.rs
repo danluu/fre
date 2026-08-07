@@ -16836,8 +16836,8 @@ mod tests {
             fre_automata::analyze_mandatory_suffix_universal_finite_corridor(
                 &raw,
                 corridor_limits,
-                minimum_match_bytes,
-                maximum_match_bytes,
+                minimum_match_bytes.expect("focused corridor pattern is non-empty"),
+                maximum_match_bytes.expect("focused corridor pattern is finite"),
             )
         {
             fre_automata::MandatorySuffixUniversalFiniteCorridorAnalysis::Complete(report) => {
