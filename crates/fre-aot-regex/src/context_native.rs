@@ -1108,7 +1108,7 @@ fn build_context_native_layout_with_reverse_mode(
 
     let mut data = Vec::new();
     data.try_reserve_exact(plan.total)
-        .map_err(|_| ObjectError::InvalidModule("context native allocation failed"))?;
+        .map_err(|_| ObjectError::Allocation("context native table"))?;
     data.resize(plan.total, 0);
     let classes_end = plan
         .byte_classes

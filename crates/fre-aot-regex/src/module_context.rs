@@ -51,7 +51,7 @@ use super::{
 #[cfg(test)]
 use crate::context_native::build_context_native_layout_with_reverse;
 use crate::{
-    ObjectError,
+    CompileResource, ObjectError,
     context_dfa::{NativeContextAnchoredForwardView, NativeContextDfaView},
     context_native::{
         CONTEXT_CELL_STATE_MASK, CONTEXT_FORWARD_CELL_FLAGS_SHIFT, CONTEXT_FORWARD_CELL_STATE_MASK,
@@ -1861,6 +1861,7 @@ fn install_context_known_span_start(
     layout: &mut ContextNativeLayout,
     proof: ContextKnownSpanStartProof,
     architecture: Architecture,
+    max_data_bytes: usize,
 ) -> Result<Option<ContextKnownSpanStartGuard>, ObjectError> {
     let passing_bytes = proof
         .following_words
@@ -1891,7 +1892,7 @@ fn install_context_known_span_start(
             .data
             .len()
             .checked_add(auxiliary_bytes)
-            .is_none_or(|total| total > MAX_CONTEXT_NATIVE_DATA_BYTES)
+            .is_none_or(|total| total > max_data_bytes)
         {
             return Ok(None);
         }
@@ -1950,7 +1951,7 @@ fn derive_context_terminal_suffix_search(
     let mut forward_sets = Vec::new();
     forward_sets
         .try_reserve_exact(suffix_sets.len())
-        .map_err(|_| ObjectError::InvalidModule("context suffix allocation failed"))?;
+        .map_err(|_| ObjectError::Allocation("context suffix sets"))?;
     forward_sets.extend(suffix_sets.iter().rev().copied());
     let Some(primary) = derive_anchored_prefix_start_filter(&forward_sets)? else {
         return Ok(None);
@@ -2197,7 +2198,11 @@ fn derive_context_state_skip(
                 ))?;
     }
 
-    let mut initial = vec![0_u64; state_count];
+    let mut initial = Vec::new();
+    initial
+        .try_reserve_exact(state_count)
+        .map_err(|_| ObjectError::Allocation("context state-skip initial weights"))?;
+    initial.resize(state_count, 0_u64);
     for entry in dfa.forward_initial {
         let state = usize::try_from(entry.state)
             .map_err(|_| ObjectError::ArithmeticOverflow("context skip initial state"))?;
@@ -2208,7 +2213,11 @@ fn derive_context_state_skip(
             "context skip initial weight",
         ))?;
     }
-    let mut incoming = vec![0_u64; state_count];
+    let mut incoming = Vec::new();
+    incoming
+        .try_reserve_exact(state_count)
+        .map_err(|_| ObjectError::Allocation("context state-skip incoming weights"))?;
+    incoming.resize(state_count, 0_u64);
     for source in 0..state_count {
         let begin = source
             .checked_mul(row_width)
@@ -2234,7 +2243,14 @@ fn derive_context_state_skip(
         }
     }
 
-    let mut row_groups = std::collections::BTreeMap::<(bool, Vec<u64>), Vec<usize>>::new();
+    // Sort explicitly by the former BTreeMap key and then by state. Besides
+    // preserving deterministic group order, this makes every potentially
+    // large scratch allocation fallible instead of relying on infallible map
+    // node and value-vector growth.
+    let mut row_groups = Vec::<(bool, Vec<u64>, usize)>::new();
+    row_groups
+        .try_reserve_exact(state_count)
+        .map_err(|_| ObjectError::Allocation("context state-skip row groups"))?;
     for (state, flags) in dfa.forward_states.iter().enumerate() {
         if flags.terminal {
             continue;
@@ -2245,7 +2261,7 @@ fn derive_context_state_skip(
         let mut signature = Vec::new();
         signature
             .try_reserve_exact(class_count)
-            .map_err(|_| ObjectError::InvalidModule("context skip signature allocation failed"))?;
+            .map_err(|_| ObjectError::Allocation("context state-skip signature"))?;
         for class in 0..class_count {
             let index = begin
                 .checked_add(class)
@@ -2258,19 +2274,29 @@ fn derive_context_state_skip(
                 ))?;
             signature.push(u64::from(cell.next) | (u64::from(cell.accepted) << 32));
         }
-        row_groups
-            .entry((flags.pending, signature))
-            .or_default()
-            .push(state);
+        row_groups.push((flags.pending, signature, state));
     }
+    row_groups.sort_unstable_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.cmp(&right.2))
+    });
 
     let mut selected = None;
     let mut selected_key = None;
-    for states in row_groups.values() {
-        if states.is_empty() {
-            continue;
+    let mut group_begin = 0_usize;
+    while group_begin < row_groups.len() {
+        let mut group_end = group_begin + 1;
+        while group_end < row_groups.len()
+            && row_groups[group_end].0 == row_groups[group_begin].0
+            && row_groups[group_end].1 == row_groups[group_begin].1
+        {
+            group_end += 1;
         }
-        let canonical = states[0];
+        let states = &row_groups[group_begin..group_end];
+        group_begin = group_end;
+        let canonical = states[0].2;
         let begin = canonical
             .checked_mul(row_width)
             .ok_or(ObjectError::ArithmeticOverflow(
@@ -2293,7 +2319,11 @@ fn derive_context_state_skip(
                 ))?;
             let target = usize::try_from(cell.next)
                 .map_err(|_| ObjectError::ArithmeticOverflow("context skip target state"))?;
-            if cell.accepted || states.binary_search(&target).is_err() {
+            if cell.accepted
+                || states
+                    .binary_search_by_key(&target, |record| record.2)
+                    .is_err()
+            {
                 words[byte / 64] |= 1_u64 << (byte % 64);
                 exit_bytes = exit_bytes
                     .checked_add(1)
@@ -2309,12 +2339,16 @@ fn derive_context_state_skip(
             Some(filter)
         };
         let mut initial_weight = 0_u64;
-        for &state in states {
+        for record in states {
+            let state = record.2;
             initial_weight = initial_weight.saturating_add(initial[state]);
         }
         let mut external_incoming = 0_u64;
         for source in 0..state_count {
-            if states.binary_search(&source).is_ok() {
+            if states
+                .binary_search_by_key(&source, |record| record.2)
+                .is_ok()
+            {
                 continue;
             }
             let source_begin = source
@@ -2335,7 +2369,10 @@ fn derive_context_state_skip(
                     ))?;
                 let target = usize::try_from(cell.next)
                     .map_err(|_| ObjectError::ArithmeticOverflow("context skip incoming target"))?;
-                if states.binary_search(&target).is_ok() {
+                if states
+                    .binary_search_by_key(&target, |record| record.2)
+                    .is_ok()
+                {
                     external_incoming = external_incoming.saturating_add(u64::from(cardinality));
                 }
             }
@@ -2355,14 +2392,18 @@ fn derive_context_state_skip(
             canonical_state,
         );
         if selected_key.is_none_or(|current| key < current) {
+            let mut selected_states = Vec::new();
+            selected_states
+                .try_reserve_exact(states.len())
+                .map_err(|_| ObjectError::Allocation("context state-skip selected states"))?;
+            for record in states {
+                selected_states.push(
+                    u32::try_from(record.2)
+                        .map_err(|_| ObjectError::ArithmeticOverflow("context skip state"))?,
+                );
+            }
             selected = Some(ContextStateSkipPlan {
-                states: states
-                    .iter()
-                    .map(|&state| {
-                        u32::try_from(state)
-                            .map_err(|_| ObjectError::ArithmeticOverflow("context skip state"))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?,
+                states: selected_states,
                 canonical_state,
                 exit_filter,
             });
@@ -2430,8 +2471,13 @@ fn derive_context_state_skip(
             canonical_state,
         );
         if selected_key.is_none_or(|current| key < current) {
+            let mut states = Vec::new();
+            states
+                .try_reserve_exact(1)
+                .map_err(|_| ObjectError::Allocation("context state-skip singleton"))?;
+            states.push(canonical_state);
             selected = Some(ContextStateSkipPlan {
-                states: vec![canonical_state],
+                states,
                 canonical_state,
                 exit_filter,
             });
@@ -2491,6 +2537,7 @@ fn use_empty_prefix_restart(
 fn install_context_state_skip(
     layout: &mut ContextNativeLayout,
     plan: Option<ContextStateSkipPlan>,
+    max_data_bytes: usize,
 ) -> Result<Option<ContextStateSkip>, ObjectError> {
     let Some(plan) = plan else {
         return Ok(None);
@@ -2514,7 +2561,7 @@ fn install_context_state_skip(
         let Ok(maximum) = usize::try_from(i32::MAX) else {
             return Ok(None);
         };
-        if total > maximum {
+        if total > maximum.min(max_data_bytes) {
             return Ok(None);
         }
         if layout.data.try_reserve_exact(membership_entries).is_err() {
@@ -2552,6 +2599,7 @@ fn install_context_asimd_lane_index(
     layout: &mut ContextNativeLayout,
     target: Target,
     has_vector_prepass: bool,
+    max_data_bytes: usize,
 ) -> Result<Option<u32>, ObjectError> {
     if target.architecture != Architecture::Aarch64
         || !target.features.has(CpuFeature::Aarch64Asimd)
@@ -2577,7 +2625,7 @@ fn install_context_asimd_lane_index(
         ))?;
     let maximum_table_bytes = usize::try_from(i32::MAX)
         .map_err(|_| ObjectError::ArithmeticOverflow("context table address limit"))?
-        .min(MAX_CONTEXT_NATIVE_DATA_BYTES);
+        .min(max_data_bytes);
     if total > maximum_table_bytes {
         return Ok(None);
     }
@@ -2603,6 +2651,7 @@ fn install_context_sve_filter_plan(
     primary: Option<NativeStartFilter>,
     vector_filter: Option<NativeVectorFilter>,
     sve_route_supported: bool,
+    max_data_bytes: usize,
 ) -> Result<Option<Aarch64SveFilterPlan>, ObjectError> {
     if target.architecture != Architecture::Aarch64
         || !aarch64_primary_scanner_uses_sve(aarch64_primary_scanner_isa(
@@ -2670,7 +2719,7 @@ fn install_context_sve_filter_plan(
         }
         let maximum_table_bytes = usize::try_from(i32::MAX)
             .map_err(|_| ObjectError::ArithmeticOverflow("context SVE2 table address limit"))?
-            .min(MAX_CONTEXT_NATIVE_DATA_BYTES);
+            .min(max_data_bytes);
         let additional = total.checked_sub(layout.data.len()).ok_or(
             ObjectError::ArithmeticOverflow("context SVE2 table reservation"),
         )?;
@@ -2830,14 +2879,58 @@ fn selected_context_start_accelerator(
 }
 
 /// Lower a complete contextual DFA without retaining a runtime dependency.
-#[allow(
-    clippy::too_many_lines,
-    reason = "native-plan selection and layout installation form one transactional lowering"
-)]
 pub(super) fn lower_native_context(
     view: NativeContextProgramView<'_>,
     target: Target,
 ) -> Result<NativeLowering, ObjectError> {
+    lower_native_context_impl(view, target, MAX_CONTEXT_NATIVE_DATA_BYTES)
+}
+
+/// Attempt contextual native lowering under a caller-owned data ceiling.
+///
+/// A native table resource refusal or environmental allocation failure is an
+/// optimization decline. Structural, arithmetic and target failures remain
+/// hard errors so the optional slow compiler cannot hide malformed input.
+#[allow(
+    dead_code,
+    reason = "consumed by the slow-context optimizing-routing composition"
+)]
+pub(super) fn lower_native_context_with_data_limit(
+    view: NativeContextProgramView<'_>,
+    target: Target,
+    max_data_bytes: usize,
+) -> Result<Option<NativeLowering>, ObjectError> {
+    optional_context_native_lowering_outcome(lower_native_context_impl(
+        view,
+        target,
+        max_data_bytes,
+    ))
+}
+
+fn optional_context_native_lowering_outcome(
+    outcome: Result<NativeLowering, ObjectError>,
+) -> Result<Option<NativeLowering>, ObjectError> {
+    match outcome {
+        Ok(lowering) => Ok(Some(lowering)),
+        Err(ObjectError::Allocation(_)
+        | ObjectError::Resource {
+            resource: CompileResource::ProgramBytes,
+            ..
+        }) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "native-plan selection and layout installation form one transactional lowering"
+)]
+fn lower_native_context_impl(
+    view: NativeContextProgramView<'_>,
+    target: Target,
+    max_data_bytes: usize,
+) -> Result<NativeLowering, ObjectError> {
+    let max_data_bytes = max_data_bytes.min(MAX_CONTEXT_NATIVE_DATA_BYTES);
     let boundary_pair_relation = derive_context_boundary_pair_relation(view)?;
     // Only scanners whose complete runtime route is pure SVE2 may price an
     // exact set as one table/one MATCH. The explicit seam is shared with a
@@ -2942,7 +3035,7 @@ pub(super) fn lower_native_context(
     let (mut layout, prefix_filter, anchored_prefix_filter, anchored_adaptive_guard) = loop {
         let mut candidate = build_context_native_layout_with_accelerators(
             view,
-            ContextNativeLimits::default(),
+            ContextNativeLimits { max_data_bytes },
             terminal_suffix_search.is_some(),
             anchored_forward_search.is_some(),
         )?;
@@ -2963,7 +3056,7 @@ pub(super) fn lower_native_context(
                 .data
                 .len()
                 .checked_add(auxiliary_bytes)
-                .is_none_or(|total| total > MAX_CONTEXT_NATIVE_DATA_BYTES)
+                .is_none_or(|total| total > max_data_bytes)
             {
                 anchored_forward_search = None;
                 continue;
@@ -3005,7 +3098,7 @@ pub(super) fn lower_native_context(
                     .data
                     .len()
                     .checked_add(auxiliary_bytes)
-                    .is_some_and(|total| total <= MAX_CONTEXT_NATIVE_DATA_BYTES)
+                    .is_some_and(|total| total <= max_data_bytes)
                     && candidate.data.try_reserve_exact(auxiliary_bytes).is_ok()
                 {
                     append_native_prefix_filter(
@@ -3034,7 +3127,7 @@ pub(super) fn lower_native_context(
                 .data
                 .len()
                 .checked_add(auxiliary_bytes)
-                .is_some_and(|total| total <= MAX_CONTEXT_NATIVE_DATA_BYTES)
+                .is_some_and(|total| total <= max_data_bytes)
                 && candidate.data.try_reserve_exact(auxiliary_bytes).is_ok()
             {
                 append_native_prefix_filter(
@@ -3053,7 +3146,14 @@ pub(super) fn lower_native_context(
         break (candidate, ordinary, None, None);
     };
     let known_span_start = known_span_start_proof
-        .map(|proof| install_context_known_span_start(&mut layout, proof, target.architecture))
+        .map(|proof| {
+            install_context_known_span_start(
+                &mut layout,
+                proof,
+                target.architecture,
+                max_data_bytes,
+            )
+        })
         .transpose()?
         .flatten();
     let ordinary_boundary_pair = match (boundary_pair_relation.as_ref(), start_filter) {
@@ -3071,13 +3171,13 @@ pub(super) fn lower_native_context(
         )?,
         _ => None,
     };
-    let state_skip = install_context_state_skip(&mut layout, state_skip_plan)?;
+    let state_skip = install_context_state_skip(&mut layout, state_skip_plan, max_data_bytes)?;
     let has_vector_prepass = start_filter.is_some_and(|filter| !filter.ranges().is_empty())
         || interior_guard.is_some_and(|guard| !guard.primary.ranges().is_empty())
         || anchored_forward_search.is_some_and(|search| !search.primary.ranges().is_empty())
         || terminal_suffix_search.is_some();
     let asimd_lane_index_offset =
-        install_context_asimd_lane_index(&mut layout, target, has_vector_prepass)?;
+        install_context_asimd_lane_index(&mut layout, target, has_vector_prepass, max_data_bytes)?;
     let sve_filter_plans = ContextSveFilterPlans {
         interior: install_context_sve_filter_plan(
             &mut layout,
@@ -3085,6 +3185,7 @@ pub(super) fn lower_native_context(
             interior_guard.map(|guard| guard.primary),
             interior_guard.and_then(|guard| guard.vector_filter),
             true,
+            max_data_bytes,
         )?,
         anchored: install_context_sve_filter_plan(
             &mut layout,
@@ -3092,6 +3193,7 @@ pub(super) fn lower_native_context(
             anchored_forward_search.map(|search| search.primary),
             anchored_forward_search.and_then(|search| search.vector_filter),
             anchored_boundary_pair.is_none(),
+            max_data_bytes,
         )?,
         ordinary: install_context_sve_filter_plan(
             &mut layout,
@@ -3099,8 +3201,16 @@ pub(super) fn lower_native_context(
             start_filter,
             vector_filter,
             ordinary_boundary_pair.is_none(),
+            max_data_bytes,
         )?,
     };
+    if layout.data.len() > max_data_bytes {
+        return Err(ObjectError::Resource {
+            resource: CompileResource::ProgramBytes,
+            limit: max_data_bytes,
+            required: layout.data.len(),
+        });
+    }
     let (code, relocations) = match target.architecture {
         Architecture::X86_64 => lower_x86_64_context(
             &layout,
@@ -4247,7 +4357,7 @@ fn x86_emit_prefix_prepass(
     let mut refinement_stubs = Vec::new();
     refinement_stubs
         .try_reserve_exact(7)
-        .map_err(|_| ObjectError::InvalidModule("x86 context stub allocation failed"))?;
+        .map_err(|_| ObjectError::Allocation("x86 context refinement stubs"))?;
     let complete = assembler.label()?;
     x86_emit_context_scanner_constants(assembler, primary, lazy_vector_filter, kind)?;
     if let Some(expression) = boundary_pair.filter(|pair| !pair.transient_constants) {
@@ -8063,6 +8173,43 @@ mod tests {
         AnchoredByteSet::from_words(words)
     }
 
+    fn assert_context_lowering_identity(
+        expected: &NativeLowering,
+        actual: &NativeLowering,
+        target: Target,
+    ) {
+        assert_eq!(actual.code, expected.code, "context code changed on {target:?}");
+        assert_eq!(actual.data, expected.data, "context data changed on {target:?}");
+        assert_eq!(actual.relocations, expected.relocations, "context relocations changed on {target:?}");
+        assert_eq!(actual.slow_partial_table, expected.slow_partial_table);
+        assert_eq!(actual.needs_runtime, expected.needs_runtime);
+        assert_eq!(actual.start_accelerator, expected.start_accelerator);
+        assert_eq!(
+            actual.anchored_prefix_filter_bytes,
+            expected.anchored_prefix_filter_bytes
+        );
+    }
+
+    fn assert_context_relocation_shape(lowering: &NativeLowering, target: Target) {
+        match target.architecture {
+            Architecture::X86_64 => {
+                assert_eq!(lowering.relocations.len(), 1);
+                assert_eq!(lowering.relocations[0].kind, RelocationKind::X86PcRelative32);
+            }
+            Architecture::Aarch64 => {
+                assert_eq!(lowering.relocations.len(), 2);
+                assert_eq!(lowering.relocations[0].kind, RelocationKind::Aarch64Page21);
+                assert_eq!(
+                    lowering.relocations[1].kind,
+                    RelocationKind::Aarch64PageOff12
+                );
+            }
+        }
+        assert!(lowering.relocations.iter().all(|relocation| {
+            relocation.section == TEXT_SECTION && relocation.symbol == PROGRAM_SYMBOL
+        }));
+    }
+
     fn anchored_guard_for(
         pattern: &str,
         target: Target,
@@ -8368,6 +8515,300 @@ mod tests {
             ("(?m)^.$", OutputContract::Span, b"\xff\nq"),
             ("\\A\\z", OutputContract::Span, b""),
         ]
+    }
+
+    #[test]
+    fn optional_context_native_lowering_declines_only_data_resources_and_allocations() {
+        assert!(matches!(
+            optional_context_native_lowering_outcome(Err(ObjectError::Allocation(
+                "synthetic context allocation"
+            ))),
+            Ok(None)
+        ));
+        assert!(matches!(
+            optional_context_native_lowering_outcome(Err(ObjectError::Resource {
+                resource: CompileResource::ProgramBytes,
+                limit: 0,
+                required: 1,
+            })),
+            Ok(None)
+        ));
+        assert!(matches!(
+            optional_context_native_lowering_outcome(Err(ObjectError::Resource {
+                resource: CompileResource::CodeBytes,
+                limit: 0,
+                required: 1,
+            })),
+            Err(ObjectError::Resource {
+                resource: CompileResource::CodeBytes,
+                ..
+            })
+        ));
+        assert!(matches!(
+            optional_context_native_lowering_outcome(Err(ObjectError::InvalidModule(
+                "synthetic context structure"
+            ))),
+            Err(ObjectError::InvalidModule("synthetic context structure"))
+        ));
+        assert!(matches!(
+            optional_context_native_lowering_outcome(Err(ObjectError::ArithmeticOverflow(
+                "synthetic context arithmetic"
+            ))),
+            Err(ObjectError::ArithmeticOverflow("synthetic context arithmetic"))
+        ));
+        assert!(matches!(
+            optional_context_native_lowering_outcome(Err(ObjectError::UnsupportedTarget)),
+            Err(ObjectError::UnsupportedTarget)
+        ));
+    }
+
+    #[test]
+    fn context_native_data_cap_has_exact_cross_target_boundaries_and_default_identity()
+    -> Result<(), ObjectError> {
+        let compiled = compile(
+            CompileRequest::new(
+                r"(?-u:\b)[ACEGIKMO][ACEGIKMO](?s:.)+?",
+                Target::x86_64_linux(),
+            )
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Span),
+        )
+        .unwrap();
+        let view = compiled.program().native_context_program_view().unwrap();
+        let avx512 = FeatureSet::of(CpuFeature::X86Avx512F).with(CpuFeature::X86Avx512Bw);
+        let sve2 = FeatureSet::of(CpuFeature::Aarch64Sve).with(CpuFeature::Aarch64Sve2);
+        let targets = [
+            Target::x86_64_linux(),
+            Target::x86_64_linux()
+                .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+                .unwrap(),
+            Target::x86_64_linux().with_features(avx512).unwrap(),
+            Target::aarch64_macos()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                .unwrap(),
+            Target::aarch64_linux().with_features(sve2).unwrap(),
+        ];
+
+        for target in targets {
+            let legacy = lower_native_context(view, target)?;
+            assert!(!legacy.data.is_empty());
+            assert_context_relocation_shape(&legacy, target);
+
+            let default_capped = lower_native_context_with_data_limit(
+                view,
+                target,
+                MAX_CONTEXT_NATIVE_DATA_BYTES,
+            )?
+            .expect("default context data ceiling must lower");
+            assert_context_lowering_identity(&legacy, &default_capped, target);
+
+            let exact = lower_native_context_with_data_limit(view, target, legacy.data.len())?
+                .expect("the exact final context data boundary must lower");
+            assert_context_lowering_identity(&legacy, &exact, target);
+
+            let mandatory_required = match lower_native_context_impl(view, target, 0) {
+                Err(ObjectError::Resource {
+                    resource: CompileResource::ProgramBytes,
+                    limit,
+                    required,
+                }) => {
+                    assert_eq!(limit, 0);
+                    required
+                }
+                Err(error) => panic!("zero context data ceiling returned {error} on {target:?}"),
+                Ok(_) => panic!("zero context data ceiling lowered on {target:?}"),
+            };
+            assert!(mandatory_required > 0);
+            let mandatory = lower_native_context_with_data_limit(
+                view,
+                target,
+                mandatory_required,
+            )?
+            .expect("the exact mandatory context data boundary must lower");
+            assert_eq!(mandatory.data.len(), mandatory_required);
+            assert_context_relocation_shape(&mandatory, target);
+            assert!(
+                lower_native_context_with_data_limit(view, target, mandatory_required - 1)?
+                    .is_none(),
+                "one byte below the mandatory context image lowered on {target:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn context_optional_data_installers_are_exact_and_transactional() -> Result<(), ObjectError> {
+        let compiled = compile(
+            CompileRequest::new(
+                r"(?-u:\bfoo(?:[ACEGIK]*)\b)",
+                Target::x86_64_linux(),
+            )
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Span),
+        )
+        .unwrap();
+        let view = compiled.program().native_context_program_view().unwrap();
+        let base = build_context_native_layout_with_accelerators(
+            view,
+            ContextNativeLimits::default(),
+            false,
+            false,
+        )?;
+
+        let mut following_words = [0_u64; 4];
+        for byte in [b'A', b'C', b'E', b'G', b'I', b'K'] {
+            let index = usize::from(byte);
+            following_words[index / 64] |= 1_u64 << (index % 64);
+        }
+        let proof = ContextKnownSpanStartProof {
+            guarded_bytes: 3,
+            following_words,
+            accepts_haystack_end: false,
+        };
+        let mut refused_known_start = base.clone();
+        let refused_limit = refused_known_start.data.len();
+        assert!(
+            install_context_known_span_start(
+                &mut refused_known_start,
+                proof,
+                Architecture::X86_64,
+                refused_limit,
+            )?
+            .is_none()
+        );
+        assert_eq!(refused_known_start, base);
+        let mut installed_known_start = base.clone();
+        let installed_guard = install_context_known_span_start(
+            &mut installed_known_start,
+            proof,
+            Architecture::X86_64,
+            MAX_CONTEXT_NATIVE_DATA_BYTES,
+        )?
+        .expect("known-start bitmap must install at the default ceiling");
+        assert!(installed_guard.following_filter.is_some());
+        assert!(installed_known_start.data.len() > base.data.len());
+        let known_start_exact = installed_known_start.data.len();
+        let mut exact_known_start = base.clone();
+        assert!(
+            install_context_known_span_start(
+                &mut exact_known_start,
+                proof,
+                Architecture::X86_64,
+                known_start_exact,
+            )?
+            .is_some()
+        );
+        assert_eq!(exact_known_start, installed_known_start);
+
+        let apple_asimd = Target::aarch64_macos()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .unwrap();
+        let mut refused_lane = base.clone();
+        let refused_limit = refused_lane.data.len();
+        assert!(
+            install_context_asimd_lane_index(&mut refused_lane, apple_asimd, true, refused_limit)?
+                .is_none()
+        );
+        assert_eq!(refused_lane, base);
+        let lane_aligned = base
+            .data
+            .len()
+            .checked_add(AARCH64_FIRST_LANE_INDEX.len() - 1)
+            .ok_or(ObjectError::ArithmeticOverflow("test lane alignment"))?
+            & !(AARCH64_FIRST_LANE_INDEX.len() - 1);
+        let lane_exact = lane_aligned
+            .checked_add(AARCH64_FIRST_LANE_INDEX.len())
+            .ok_or(ObjectError::ArithmeticOverflow("test lane bytes"))?;
+        let mut installed_lane = base.clone();
+        assert_eq!(
+            install_context_asimd_lane_index(&mut installed_lane, apple_asimd, true, lane_exact)?,
+            Some(
+                u32::try_from(lane_aligned)
+                    .map_err(|_| ObjectError::ArithmeticOverflow("test lane offset"))?
+            )
+        );
+        assert_eq!(installed_lane.data.len(), lane_exact);
+
+        let primary = derive_anchored_prefix_start_filter(view.anchored_prefix.sets())?
+            .expect("context cap test must derive a primary filter");
+        assert!(primary.is_exact());
+        let sve2_target = Target::aarch64_linux()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Sve).with(CpuFeature::Aarch64Sve2))
+            .unwrap();
+        let mut refused_sve = base.clone();
+        let refused_limit = refused_sve.data.len();
+        let refused_plan = install_context_sve_filter_plan(
+            &mut refused_sve,
+            sve2_target,
+            Some(primary),
+            None,
+            true,
+            refused_limit,
+        )?;
+        assert!(refused_plan.is_none_or(|plan| !plan.uses_sve2()));
+        assert_eq!(refused_sve, base);
+        let sve_aligned = base
+            .data
+            .len()
+            .checked_add(15)
+            .ok_or(ObjectError::ArithmeticOverflow("test SVE alignment"))?
+            & !15;
+        let sve_exact = sve_aligned
+            .checked_add(16)
+            .ok_or(ObjectError::ArithmeticOverflow("test SVE table bytes"))?;
+        let mut installed_sve = base.clone();
+        let installed_plan = install_context_sve_filter_plan(
+            &mut installed_sve,
+            sve2_target,
+            Some(primary),
+            None,
+            true,
+            sve_exact,
+        )?
+        .expect("exact SVE2 table boundary must retain the scanner");
+        assert!(installed_plan.uses_sve2());
+        assert_eq!(installed_sve.data.len(), sve_exact);
+
+        assert!(base.forward_states >= 2);
+        let state_skip_plan = ContextStateSkipPlan {
+            states: vec![0, 1],
+            canonical_state: 0,
+            exit_filter: None,
+        };
+        let state_base = base.clone();
+        let mut refused_state_skip = state_base.clone();
+        let refused_limit = refused_state_skip.data.len();
+        assert!(
+            install_context_state_skip(
+                &mut refused_state_skip,
+                Some(state_skip_plan.clone()),
+                refused_limit,
+            )?
+            .is_none()
+        );
+        assert_eq!(refused_state_skip, state_base);
+        let state_exact = state_base
+            .data
+            .len()
+            .checked_add(usize::try_from(state_base.forward_states).map_err(|_| {
+                ObjectError::ArithmeticOverflow("test state-skip membership bytes")
+            })?)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "test state-skip membership end",
+            ))?;
+        let mut installed_state_layout = state_base.clone();
+        let installed_state_skip = install_context_state_skip(
+            &mut installed_state_layout,
+            Some(state_skip_plan),
+            state_exact,
+        )?
+        .expect("exact state-skip table boundary must install");
+        assert!(matches!(
+            installed_state_skip.membership,
+            ContextStateMembership::Table { .. }
+        ));
+        assert_eq!(installed_state_layout.data.len(), state_exact);
+        Ok(())
     }
 
     #[test]
