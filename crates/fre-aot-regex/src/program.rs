@@ -3101,9 +3101,6 @@ impl FrozenDynamicRowsStorageV3 {
         let Ok(initial_state) = usize::try_from(rows.initial_state) else {
             return false;
         };
-        let Ok(loop_count) = usize::try_from(rows.learned_loop_state_count) else {
-            return false;
-        };
         let Some(cell_shift) = row_shift.checked_sub(1) else {
             return false;
         };
@@ -3126,8 +3123,9 @@ impl FrozenDynamicRowsStorageV3 {
                 .checked_mul(physical_cells)
                 .is_none_or(|cells| cells != self.rows.len())
             || initial_state >= state_count
-            || loop_count > rows.learned_loop_states.len()
-            || rows.learned_loop_states[loop_count..]
+            || rows.learned_loop_state_count != 0
+            || rows
+                .learned_loop_states
                 .iter()
                 .any(|&state| state != u32::MAX)
             || rows.format_version != FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION
@@ -3160,18 +3158,6 @@ impl FrozenDynamicRowsStorageV3 {
             }
         }
 
-        for (index, &state) in rows.learned_loop_states[..loop_count].iter().enumerate() {
-            let Ok(state) = usize::try_from(state) else {
-                return false;
-            };
-            if state >= state_count
-                || rows.learned_loop_states[..index]
-                    .iter()
-                    .any(|&prior| usize::try_from(prior).ok() == Some(state))
-            {
-                return false;
-            }
-        }
         true
     }
 
@@ -5453,7 +5439,7 @@ impl CompiledProgram {
         {
             return None;
         }
-        let dynamic_view = self.native_dynamic_rows_view()?;
+        self.native_dynamic_rows_view()?;
 
         let mut candidate = self.prepare_workspace().ok()?;
         if candidate.identity.instance != self.identity.instance
@@ -5473,7 +5459,6 @@ impl CompiledProgram {
         let class_count = usize::try_from(full.row_stride()).ok()?;
         let source_cells = direct.state_count().checked_mul(class_count)?;
         let state_count = direct.state_count();
-        let loop_rows = direct.learned_loop_row_offsets();
         if class_count == 0
             || class_count > 256
             || state_count == 0
@@ -5494,8 +5479,6 @@ impl CompiledProgram {
             || full.initial_terminal()
             || direct.initial_pending()
             || direct.initial_terminal()
-            || loop_rows.len() > 4
-            || (dynamic_view.root_requirement.is_none() && !loop_rows.is_empty())
             || full.unfilled_cell() != DYNAMIC_NATIVE_ROWS_V1_UNFILLED_CELL
             || full.accept_mask() != DYNAMIC_NATIVE_ROWS_V1_ACCEPT_MASK
             || full.next_row_token_mask() != DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK
@@ -5554,14 +5537,12 @@ impl CompiledProgram {
             return None;
         }
         let initial_state = initial_row.checked_div(class_count)?;
-        let mut learned_loop_states = [u32::MAX; 4];
-        for (output, &source_row) in learned_loop_states.iter_mut().zip(loop_rows) {
-            let source_row = usize::try_from(source_row).ok()?;
-            if source_row.checked_rem(class_count) != Some(0) {
-                return None;
-            }
-            *output = u32::try_from(source_row.checked_div(class_count)?).ok()?;
-        }
+        // Learned-loop ownership is mutable-K0 accelerator metadata, not DFA
+        // semantics. V3 copies every authenticated complete row into a closed
+        // immutable table and may therefore scalar-step those states without
+        // following or racing an overlay. Publish the normalized table with
+        // no loop owner rather than rejecting otherwise eligible programs.
+        let learned_loop_states = [u32::MAX; 4];
         let row_shift = physical_cells.trailing_zeros().checked_add(1)?;
         let descriptor = FrozenDynamicRowsV3 {
             ready_seal: 0,
@@ -5571,7 +5552,7 @@ impl CompiledProgram {
             class_count: u32::try_from(class_count).ok()?,
             row_shift,
             initial_state: u32::try_from(initial_state).ok()?,
-            learned_loop_state_count: u32::try_from(loop_rows.len()).ok()?,
+            learned_loop_state_count: 0,
             learned_loop_states,
             format_version: FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION,
         };
@@ -16788,6 +16769,8 @@ mod tests {
             storage.descriptor.format_version,
             FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION
         );
+        assert_eq!(storage.descriptor.learned_loop_state_count, 0);
+        assert_eq!(storage.descriptor.learned_loop_states, [u32::MAX; 4]);
 
         let state_count = usize::try_from(storage.descriptor.state_count).unwrap();
         let class_count = usize::try_from(storage.descriptor.class_count).unwrap();
@@ -16836,6 +16819,12 @@ mod tests {
                 usize::MAX,
             )
             .expect("coexisting V2 sidecar");
+        assert_ne!(
+            wide.descriptor.learned_loop_row_count, 0,
+            "the fixture must prove V3 keeps a graph whose mutable projection owns learned loops"
+        );
+        assert_eq!(storage.descriptor.learned_loop_state_count, 0);
+        assert_eq!(storage.descriptor.learned_loop_states, [u32::MAX; 4]);
         assert_eq!(usize::try_from(wide.descriptor.row_stride).unwrap(), class_count);
         assert_eq!(wide.rows.len() / class_count, state_count);
         assert!(packed_bytes <= wide.rows.len() * core::mem::size_of::<u32>() + 256);
@@ -16913,6 +16902,7 @@ mod tests {
         reject_descriptor!({ storage.descriptor.row_shift = 0; });
         reject_descriptor!({ storage.descriptor.initial_state = storage.descriptor.state_count; });
         reject_descriptor!({ storage.descriptor.learned_loop_state_count = 5; });
+        reject_descriptor!({ storage.descriptor.learned_loop_states[0] = 0; });
         reject_descriptor!({ storage.descriptor.format_version = 2; });
 
         storage.descriptor = valid_descriptor;
