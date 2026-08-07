@@ -9189,9 +9189,16 @@ const K0_FINITE_SUFFIX_EXACT_ROUTE: u8 = 1;
 // receipt.
 const K0_FINITE_SUFFIX_UNIVERSAL_INCUMBENT_CALIBRATION: u8 = 1 << 5;
 const K0_FINITE_SUFFIX_UNIVERSAL_INCUMBENT_ROUTE: u8 = 1 << 6;
+// Keep a compact receipt beside the route bits whenever this finite-suffix
+// class has a nonzero retry clock. The ordinary exact route can then reject
+// every exceptional state with one byte load; only the outlined decoder pays
+// to load and update the separate counter.
+const K0_FINITE_SUFFIX_BACKOFF_ROUTE: u8 = 1 << 4;
 const K0_FINITE_SUFFIX_UNIVERSAL_INCUMBENT_MASK: u8 =
     K0_FINITE_SUFFIX_UNIVERSAL_INCUMBENT_CALIBRATION
         | K0_FINITE_SUFFIX_UNIVERSAL_INCUMBENT_ROUTE;
+const K0_FINITE_SUFFIX_EXCEPTIONAL_ROUTE_MASK: u8 = K0_FINITE_SUFFIX_BACKOFF_ROUTE
+    | K0_FINITE_SUFFIX_UNIVERSAL_INCUMBENT_MASK;
 const K0_FINITE_SUFFIX_SINGLE_PASS_NEGATIVE: u8 = 1 << 7;
 // `next_replacement` needs only two low bits for four size-class records.
 // Once a universal suffix schedules an independent-predicate trial, retain a
@@ -9298,6 +9305,16 @@ enum K0UniversalFiniteSuffixRouteDecision {
     Retained,
 }
 
+#[inline]
+fn consume_k0_finite_suffix_backoff(class: &mut K0NegativePrefilterClassState) {
+    debug_assert_ne!(class.disabled_calls, 0);
+    debug_assert_ne!(class.next_predicate & K0_FINITE_SUFFIX_BACKOFF_ROUTE, 0);
+    class.disabled_calls -= 1;
+    if class.disabled_calls == 0 {
+        class.next_predicate &= !K0_FINITE_SUFFIX_BACKOFF_ROUTE;
+    }
+}
+
 #[inline(never)]
 fn resolve_k0_universal_finite_suffix_route(
     class: &mut K0NegativePrefilterClassState,
@@ -9308,13 +9325,13 @@ fn resolve_k0_universal_finite_suffix_route(
     }
     if route & K0_FINITE_SUFFIX_UNIVERSAL_INCUMBENT_CALIBRATION != 0 {
         if class.disabled_calls == 0 {
+            debug_assert_eq!(route & K0_FINITE_SUFFIX_BACKOFF_ROUTE, 0);
             return K0UniversalFiniteSuffixRouteDecision::Calibration;
         }
-        class.disabled_calls -= 1;
+        consume_k0_finite_suffix_backoff(class);
         return K0UniversalFiniteSuffixRouteDecision::ContinueExact;
     }
-    debug_assert_ne!(class.disabled_calls, 0);
-    class.disabled_calls -= 1;
+    consume_k0_finite_suffix_backoff(class);
     K0UniversalFiniteSuffixRouteDecision::Fallback
 }
 
@@ -9362,13 +9379,14 @@ fn select_k0_finite_suffix_direct_route(
         return Some(K0FiniteSuffixDirectRoute::FreshClass { class_index });
     };
     let class = &mut state.classes[class_index];
-    if class.disabled_calls != 0 {
+    if class.next_predicate & K0_FINITE_SUFFIX_BACKOFF_ROUTE != 0 {
         // An exact-route loss has already compared the incumbent and suffix
         // for this size class. Consume its retry clock without entering
         // either outlined sidecar or the independent negative prefilter;
         // ordinary K0 is the selected route for the complete call.
-        class.next_predicate &= K0_FINITE_SUFFIX_SINGLE_PASS_NEGATIVE;
-        class.disabled_calls -= 1;
+        class.next_predicate &=
+            K0_FINITE_SUFFIX_SINGLE_PASS_NEGATIVE | K0_FINITE_SUFFIX_BACKOFF_ROUTE;
+        consume_k0_finite_suffix_backoff(class);
         return Some(K0FiniteSuffixDirectRoute::ExactLossBackoff);
     }
     None
@@ -9391,19 +9409,23 @@ fn k0_finite_suffix_exact_loss_backoff_pending(
     };
     let window_size_class = usize::BITS - window_bytes.leading_zeros();
     state.classes.iter().any(|class| {
-        class.window_size_class == Some(window_size_class) && class.disabled_calls != 0
+        class.window_size_class == Some(window_size_class)
+            && class.next_predicate & K0_FINITE_SUFFIX_BACKOFF_ROUTE != 0
     })
 }
 
 fn select_k0_finite_suffix_route(
     state: &mut K0NegativePrefilterClassState,
 ) -> K0FiniteSuffixRoute {
-    if state.next_predicate & K0_FINITE_SUFFIX_EXACT_ROUTE != 0 && state.disabled_calls == 0 {
+    if state.next_predicate & K0_FINITE_SUFFIX_EXACT_ROUTE != 0
+        && state.next_predicate & K0_FINITE_SUFFIX_BACKOFF_ROUTE == 0
+    {
         return K0FiniteSuffixRoute::ExactSuffix;
     }
-    state.next_predicate &= K0_FINITE_SUFFIX_SINGLE_PASS_NEGATIVE;
-    if state.disabled_calls != 0 {
-        state.disabled_calls -= 1;
+    state.next_predicate &=
+        K0_FINITE_SUFFIX_SINGLE_PASS_NEGATIVE | K0_FINITE_SUFFIX_BACKOFF_ROUTE;
+    if state.next_predicate & K0_FINITE_SUFFIX_BACKOFF_ROUTE != 0 {
+        consume_k0_finite_suffix_backoff(state);
         K0FiniteSuffixRoute::Incumbent {
             may_switch_to_suffix: false,
         }
@@ -9422,6 +9444,8 @@ fn observe_k0_finite_suffix_loss(state: &mut K0NegativePrefilterClassState) {
     state.present_streak = K0_NEGATIVE_PREFILTER_PRESENT_STREAK_LIMIT - 1;
     state.observe_present();
     state.next_predicate &= K0_FINITE_SUFFIX_SINGLE_PASS_NEGATIVE;
+    debug_assert_ne!(state.disabled_calls, 0);
+    state.next_predicate |= K0_FINITE_SUFFIX_BACKOFF_ROUTE;
 }
 
 fn observe_k0_finite_suffix_win(state: &mut K0NegativePrefilterClassState) {
@@ -9603,6 +9627,7 @@ fn observe_k0_universal_finite_suffix_incumbent(
         // exponentially bounded backoff.
         observe_k0_finite_suffix_loss(class);
         class.next_predicate = K0_FINITE_SUFFIX_EXACT_ROUTE
+            | K0_FINITE_SUFFIX_BACKOFF_ROUTE
             | K0_FINITE_SUFFIX_UNIVERSAL_INCUMBENT_CALIBRATION;
     }
 }
@@ -9693,6 +9718,8 @@ fn observe_k0_finite_suffix_incumbent(
     window: SearchWindow,
 ) -> bool {
     let class = &mut state.classes[class_index];
+    debug_assert_eq!(class.disabled_calls, 0);
+    debug_assert_eq!(class.next_predicate & K0_FINITE_SUFFIX_BACKOFF_ROUTE, 0);
     class.next_predicate &= K0_FINITE_SUFFIX_SINGLE_PASS_NEGATIVE;
     // A finite graph cut publishes a sound lower bound for every possible
     // match start. If that bound removes at least as much source as it leaves,
@@ -9716,6 +9743,8 @@ fn observe_k0_finite_suffix_span_incumbent(
     outcome: K0NegativePrefilterOutcome,
 ) -> bool {
     let class = &mut state.classes[class_index];
+    debug_assert_eq!(class.disabled_calls, 0);
+    debug_assert_eq!(class.next_predicate & K0_FINITE_SUFFIX_BACKOFF_ROUTE, 0);
     class.next_predicate &= K0_FINITE_SUFFIX_SINGLE_PASS_NEGATIVE;
     // Span's exact route has a bounded candidate, reverse-byte, and verifier
     // envelope. After the one pure incumbent observation, let every
@@ -10133,10 +10162,7 @@ fn try_k0_universal_finite_mandatory_suffix_span_start(
     let mut next_state = state;
     let class_index = next_state.class_for(window_size_class);
     let class = &mut next_state.classes[class_index];
-    let exceptional_route = (class.next_predicate
-        & K0_FINITE_SUFFIX_UNIVERSAL_INCUMBENT_MASK)
-        | class.disabled_calls;
-    if exceptional_route != 0 {
+    if class.next_predicate & K0_FINITE_SUFFIX_EXCEPTIONAL_ROUTE_MASK != 0 {
         let decision = resolve_k0_universal_finite_suffix_route(class);
         match decision {
             K0UniversalFiniteSuffixRouteDecision::ContinueExact => {}
@@ -11832,6 +11858,7 @@ fn try_k0_universal_finite_suffix_incumbent(
 
     let class = &mut suffix_state_after_success.classes[class_index];
     debug_assert_eq!(class.disabled_calls, 0);
+    debug_assert_eq!(class.next_predicate & K0_FINITE_SUFFIX_BACKOFF_ROUTE, 0);
     let prior_backoff = class.present_backoff;
     // Let the exact suffix answer this same call before installing retry
     // backoff. Otherwise the universal helper would immediately consume the
@@ -15947,11 +15974,23 @@ mod tests {
         );
         observe_k0_finite_suffix_loss(&mut state.classes[class_index]);
         assert_eq!(state.classes[class_index].disabled_calls, 1);
+        assert_ne!(
+            state.classes[class_index].next_predicate
+                & super::K0_FINITE_SUFFIX_BACKOFF_ROUTE,
+            0,
+        );
         assert_eq!(
             select_k0_finite_suffix_route(&mut state.classes[class_index]),
             K0FiniteSuffixRoute::Incumbent {
                 may_switch_to_suffix: false,
             },
+        );
+        assert_eq!(state.classes[class_index].disabled_calls, 0);
+        assert_eq!(
+            state.classes[class_index].next_predicate
+                & super::K0_FINITE_SUFFIX_BACKOFF_ROUTE,
+            0,
+            "the finite selector clears the mirror with the final retry",
         );
         assert!(!observe_k0_finite_suffix_incumbent(
             &mut state,
@@ -16041,6 +16080,11 @@ mod tests {
             "the first ordinary result publishes its zero-boundary classification",
         );
         assert_eq!(state.classes[class_index].disabled_calls, 1);
+        assert_ne!(
+            state.classes[class_index].next_predicate
+                & super::K0_FINITE_SUFFIX_BACKOFF_ROUTE,
+            0,
+        );
         assert_eq!(
             select_k0_finite_suffix_direct_route(
                 k0_session,
@@ -16054,6 +16098,11 @@ mod tests {
             Some(K0FiniteSuffixDirectRoute::ExactLossBackoff),
         );
         assert_eq!(state.classes[class_index].disabled_calls, 0);
+        assert_eq!(
+            state.classes[class_index].next_predicate
+                & super::K0_FINITE_SUFFIX_BACKOFF_ROUTE,
+            0,
+        );
         assert_eq!(
             select_k0_finite_suffix_direct_route(
                 k0_session,
@@ -16087,6 +16136,11 @@ mod tests {
 
         observe_k0_finite_suffix_loss(&mut state.classes[class_index]);
         assert_eq!(state.classes[class_index].disabled_calls, 2);
+        assert_ne!(
+            state.classes[class_index].next_predicate
+                & super::K0_FINITE_SUFFIX_BACKOFF_ROUTE,
+            0,
+        );
         assert!(
             k0_finite_suffix_incumbent_single_pass_negative(&state.classes[class_index]),
             "an exact loss retains the receipt that made a zero-candidate rescan redundant",
@@ -16105,7 +16159,9 @@ mod tests {
         );
         assert_eq!(state.classes[class_index].disabled_calls, 1);
         assert_eq!(
-            state.classes[class_index].next_predicate & !K0_FINITE_SUFFIX_SINGLE_PASS_NEGATIVE,
+            state.classes[class_index].next_predicate
+                & !(K0_FINITE_SUFFIX_SINGLE_PASS_NEGATIVE
+                    | super::K0_FINITE_SUFFIX_BACKOFF_ROUTE),
             K0_FINITE_SUFFIX_INCUMBENT_ROUTE,
             "the packed receipt is independent of the selected route bits",
         );
@@ -16195,6 +16251,11 @@ mod tests {
         );
         assert_eq!(state.classes[class_index].disabled_calls, 1);
         assert_eq!(state.classes[class_index].present_backoff, 1);
+        assert_ne!(
+            state.classes[class_index].next_predicate
+                & super::K0_FINITE_SUFFIX_BACKOFF_ROUTE,
+            0,
+        );
         assert_eq!(
             super::select_k0_universal_finite_suffix_incumbent(
                 k0_session,
@@ -16210,6 +16271,8 @@ mod tests {
         );
 
         state.classes[class_index].disabled_calls = 0;
+        state.classes[class_index].next_predicate &=
+            !super::K0_FINITE_SUFFIX_BACKOFF_ROUTE;
         super::observe_k0_universal_finite_suffix_incumbent(
             &mut state,
             class_index,
@@ -16217,7 +16280,14 @@ mod tests {
         );
         assert_eq!(state.classes[class_index].disabled_calls, 2);
         assert_eq!(state.classes[class_index].present_backoff, 2);
+        assert_ne!(
+            state.classes[class_index].next_predicate
+                & super::K0_FINITE_SUFFIX_BACKOFF_ROUTE,
+            0,
+        );
         state.classes[class_index].disabled_calls = 0;
+        state.classes[class_index].next_predicate &=
+            !super::K0_FINITE_SUFFIX_BACKOFF_ROUTE;
         super::observe_k0_universal_finite_suffix_incumbent(
             &mut state,
             class_index,
@@ -16250,7 +16320,8 @@ mod tests {
     fn universal_prefilter_route_decoder_preserves_backoff_truth_table() {
         let mut retained = super::K0NegativePrefilterClassState {
             disabled_calls: 2,
-            next_predicate: super::K0_FINITE_SUFFIX_UNIVERSAL_INCUMBENT_ROUTE
+            next_predicate: super::K0_FINITE_SUFFIX_BACKOFF_ROUTE
+                | super::K0_FINITE_SUFFIX_UNIVERSAL_INCUMBENT_ROUTE
                 | super::K0_FINITE_SUFFIX_UNIVERSAL_INCUMBENT_CALIBRATION,
             ..super::K0NegativePrefilterClassState::default()
         };
@@ -16269,15 +16340,30 @@ mod tests {
             super::K0UniversalFiniteSuffixRouteDecision::Calibration,
         );
         calibration.disabled_calls = 2;
+        calibration.next_predicate |= super::K0_FINITE_SUFFIX_BACKOFF_ROUTE;
         assert_eq!(
             super::resolve_k0_universal_finite_suffix_route(&mut calibration),
             super::K0UniversalFiniteSuffixRouteDecision::ContinueExact,
         );
         assert_eq!(calibration.disabled_calls, 1);
+        assert_ne!(
+            calibration.next_predicate & super::K0_FINITE_SUFFIX_BACKOFF_ROUTE,
+            0,
+        );
+        assert_eq!(
+            super::resolve_k0_universal_finite_suffix_route(&mut calibration),
+            super::K0UniversalFiniteSuffixRouteDecision::ContinueExact,
+        );
+        assert_eq!(calibration.disabled_calls, 0);
+        assert_eq!(
+            calibration.next_predicate & super::K0_FINITE_SUFFIX_BACKOFF_ROUTE,
+            0,
+        );
 
         let mut fallback = super::K0NegativePrefilterClassState {
             disabled_calls: 2,
-            next_predicate: super::K0_FINITE_SUFFIX_EXACT_ROUTE,
+            next_predicate: super::K0_FINITE_SUFFIX_EXACT_ROUTE
+                | super::K0_FINITE_SUFFIX_BACKOFF_ROUTE,
             ..super::K0NegativePrefilterClassState::default()
         };
         assert_eq!(
@@ -16285,6 +16371,19 @@ mod tests {
             super::K0UniversalFiniteSuffixRouteDecision::Fallback,
         );
         assert_eq!(fallback.disabled_calls, 1);
+        assert_ne!(
+            fallback.next_predicate & super::K0_FINITE_SUFFIX_BACKOFF_ROUTE,
+            0,
+        );
+        assert_eq!(
+            super::resolve_k0_universal_finite_suffix_route(&mut fallback),
+            super::K0UniversalFiniteSuffixRouteDecision::Fallback,
+        );
+        assert_eq!(fallback.disabled_calls, 0);
+        assert_eq!(
+            fallback.next_predicate & super::K0_FINITE_SUFFIX_BACKOFF_ROUTE,
+            0,
+        );
 
         for ordinary_route in [
             super::K0_FINITE_SUFFIX_EXACT_ROUTE,
@@ -16294,9 +16393,8 @@ mod tests {
                 next_predicate: ordinary_route,
                 ..super::K0NegativePrefilterClassState::default()
             };
-            let exceptional = (ordinary.next_predicate
-                & super::K0_FINITE_SUFFIX_UNIVERSAL_INCUMBENT_MASK)
-                | ordinary.disabled_calls;
+            let exceptional = ordinary.next_predicate
+                & super::K0_FINITE_SUFFIX_EXCEPTIONAL_ROUTE_MASK;
             assert_eq!(exceptional, 0, "ordinary routes bypass the decoder");
         }
 
@@ -16309,12 +16407,209 @@ mod tests {
         histories.next_replacement |=
             super::K0_NEGATIVE_PREFILTER_UNIVERSAL_INCUMBENT_POSSIBLE;
         let exact = &histories.classes[exact_index];
-        let exceptional = (exact.next_predicate
-            & super::K0_FINITE_SUFFIX_UNIVERSAL_INCUMBENT_MASK)
-            | exact.disabled_calls;
+        let exceptional = exact.next_predicate
+            & super::K0_FINITE_SUFFIX_EXCEPTIONAL_ROUTE_MASK;
         assert_eq!(
             exceptional, 0,
             "another size class must not poison the current exact route",
+        );
+    }
+
+    #[test]
+    fn finite_suffix_backoff_receipt_covers_replay_and_size_class_replacement() {
+        let window = SearchWindow::new(0, 4_096);
+        let window_size_class = usize::BITS - 4_096_usize.leading_zeros();
+        let mut state = K0NegativePrefilterState::default();
+        let class_index = state.class_for(window_size_class);
+        assert_eq!(class_index, 0);
+        state.classes[class_index].next_predicate = super::K0_FINITE_SUFFIX_EXACT_ROUTE;
+
+        super::observe_k0_finite_suffix_span_replay_fallback(&mut state, window);
+        assert_ne!(state.classes[class_index].disabled_calls, 0);
+        assert_ne!(
+            state.classes[class_index].next_predicate
+                & super::K0_FINITE_SUFFIX_BACKOFF_ROUTE,
+            0,
+            "an exact-replay loss publishes the compact backoff mirror",
+        );
+
+        for size_class in (window_size_class + 1)
+            ..(window_size_class
+                + u32::try_from(K0_NEGATIVE_PREFILTER_SIZE_CLASS_STATES).unwrap())
+        {
+            state.class_for(size_class);
+        }
+        let replacement = state.class_for(window_size_class + 100);
+        assert_eq!(replacement, class_index);
+        assert_eq!(state.classes[replacement].disabled_calls, 0);
+        assert_eq!(
+            state.classes[replacement].next_predicate
+                & super::K0_FINITE_SUFFIX_BACKOFF_ROUTE,
+            0,
+            "replacing a size class clears both the retry clock and its mirror",
+        );
+    }
+
+    #[test]
+    fn packed_backoff_keeps_span_and_exists_histories_isolated() {
+        const MATCH_START: usize = 128;
+        const HAYSTACK_BYTES: usize = 4_096;
+        let regex = forced_k0_with_only_mandatory_suffix(
+            r"(?-u:\x6a\x6b(?:[\x30-\x39]{2}|[\x30-\x39]{4}|[\x30-\x39]{6})\x71\x72)",
+        );
+        let mut haystack = vec![b'x'; HAYSTACK_BYTES];
+        haystack[MATCH_START..MATCH_START + 8].copy_from_slice(b"jk1234qr");
+        let expected = Match {
+            start: MATCH_START,
+            end: MATCH_START + 8,
+        };
+        let window = SearchWindow::full(&haystack);
+        let window_size_class = usize::BITS - HAYSTACK_BYTES.leading_zeros();
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("cross-operation packed-backoff session constructs");
+
+        assert!(session
+            .is_match_window_value(&haystack, window, SearchLimits::unlimited())
+            .unwrap());
+        let exists_after_first = match &session.plan {
+            PortableSearchSessionPlan::K0 {
+                mandatory_suffix_exists_state,
+                mandatory_suffix_span_state,
+                ..
+            } => {
+                assert_eq!(
+                    *mandatory_suffix_span_state,
+                    K0NegativePrefilterState::default(),
+                    "Exists must not create a Span size class",
+                );
+                *mandatory_suffix_exists_state
+            }
+            PortableSearchSessionPlan::Native(_) => {
+                panic!("cross-operation fixture did not retain K0")
+            }
+        };
+
+        for _ in 0..2 {
+            assert_eq!(
+                session
+                    .find_window_value(&haystack, window, SearchLimits::unlimited())
+                    .unwrap(),
+                Some(expected),
+            );
+        }
+        let span_with_backoff = match &session.plan {
+            PortableSearchSessionPlan::K0 {
+                mandatory_suffix_exists_state,
+                mandatory_suffix_span_state,
+                ..
+            } => {
+                assert_eq!(
+                    *mandatory_suffix_exists_state, exists_after_first,
+                    "Span must not consume or rewrite the Exists history",
+                );
+                let class_index = mandatory_suffix_span_state
+                    .classes
+                    .iter()
+                    .position(|class| class.window_size_class == Some(window_size_class))
+                    .expect("Span retains its size class");
+                assert_ne!(
+                    mandatory_suffix_span_state.classes[class_index].next_predicate
+                        & super::K0_FINITE_SUFFIX_BACKOFF_ROUTE,
+                    0,
+                    "the second Span call must publish its packed retry clock",
+                );
+                *mandatory_suffix_span_state
+            }
+            PortableSearchSessionPlan::Native(_) => {
+                panic!("cross-operation fixture lost K0")
+            }
+        };
+
+        assert!(session
+            .is_match_window_value(&haystack, window, SearchLimits::unlimited())
+            .unwrap());
+        let PortableSearchSessionPlan::K0 {
+            mandatory_suffix_exists_state,
+            mandatory_suffix_span_state,
+            ..
+        } = &session.plan
+        else {
+            panic!("cross-operation fixture lost K0")
+        };
+        let exists_class = mandatory_suffix_exists_state
+            .classes
+            .iter()
+            .position(|class| class.window_size_class == Some(window_size_class))
+            .expect("Exists retains its size class");
+        assert_ne!(
+            mandatory_suffix_exists_state.classes[exists_class].next_predicate
+                & super::K0_FINITE_SUFFIX_BACKOFF_ROUTE,
+            0,
+            "the second Exists call must publish its own packed retry clock",
+        );
+        assert_eq!(
+            *mandatory_suffix_span_state, span_with_backoff,
+            "Exists must not consume or rewrite the Span retry clock",
+        );
+    }
+
+    #[test]
+    fn packed_backoff_isolates_resident_size_classes() {
+        const HAYSTACK_BYTES: usize = 4_096;
+        let regex = forced_k0_with_only_mandatory_suffix(r"(?s-u:.{4,16}XYZ)");
+        let PortablePlan::K0(plan) = &regex.plan else {
+            panic!("two-class packed-backoff fixture did not retain K0");
+        };
+        let suffix = plan
+            .mandatory_suffix
+            .as_ref()
+            .expect("two-class packed-backoff fixture retains its suffix");
+        let (minimum_match_bytes, maximum_match_bytes) = suffix
+            .universal_finite_match_byte_bounds()
+            .expect("two-class fixture retains a universal finite corridor");
+        let haystack = vec![b'x'; HAYSTACK_BYTES];
+        let window = SearchWindow::full(&haystack);
+        let selected_size_class = usize::BITS - HAYSTACK_BYTES.leading_zeros();
+        let mut state = K0NegativePrefilterState::default();
+        let backoff_class = state.class_for(selected_size_class + 1);
+        state.classes[backoff_class].next_predicate = super::K0_FINITE_SUFFIX_EXACT_ROUTE;
+        observe_k0_finite_suffix_loss(&mut state.classes[backoff_class]);
+        let backoff_before = state.classes[backoff_class];
+        let exact_class = state.class_for(selected_size_class);
+        state.classes[exact_class].next_predicate = super::K0_FINITE_SUFFIX_EXACT_ROUTE;
+
+        let attempt = super::try_k0_universal_finite_mandatory_suffix_span_start(
+            suffix,
+            minimum_match_bytes,
+            maximum_match_bytes,
+            suffix.has_universal_finite_greedy_corridor(),
+            state,
+            &haystack,
+            window,
+            SearchLimits::unlimited(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            attempt.outcome,
+            K0MandatorySuffixSpanOutcome::ProvedAbsent,
+            "resident class B must select and complete its ordinary exact route",
+        );
+        assert_eq!(
+            attempt.state_after_success.classes[backoff_class], backoff_before,
+            "selecting resident class B must not consume class A's packed clock",
+        );
+        let selected = attempt.state_after_success.classes[exact_class];
+        assert_eq!(selected.disabled_calls, 0);
+        assert_eq!(
+            selected.next_predicate & super::K0_FINITE_SUFFIX_BACKOFF_ROUTE,
+            0,
+        );
+        assert_ne!(
+            selected.next_predicate & super::K0_FINITE_SUFFIX_EXACT_ROUTE,
+            0,
+            "the completed exact proof remains selected for resident class B",
         );
     }
 
@@ -16380,6 +16675,11 @@ mod tests {
             .expect("failed calibration retains its suffix size class");
         assert_eq!(after_failure.classes[class_index].disabled_calls, 1);
         assert_eq!(after_failure.classes[class_index].present_backoff, 1);
+        assert_ne!(
+            after_failure.classes[class_index].next_predicate
+                & super::K0_FINITE_SUFFIX_BACKOFF_ROUTE,
+            0,
+        );
 
         assert_eq!(
             session
@@ -16402,6 +16702,11 @@ mod tests {
         };
         assert_eq!(after_intervening.classes[class_index].disabled_calls, 0);
         assert_eq!(after_intervening.classes[class_index].present_backoff, 1);
+        assert_eq!(
+            after_intervening.classes[class_index].next_predicate
+                & super::K0_FINITE_SUFFIX_BACKOFF_ROUTE,
+            0,
+        );
         assert_eq!(
             prefilter_after_intervening, prefilter_after_failure,
             "the intervening exact-suffix call must not touch prefilter state",
@@ -16428,6 +16733,11 @@ mod tests {
         };
         assert_eq!(after_retry.classes[class_index].disabled_calls, 2);
         assert_eq!(after_retry.classes[class_index].present_backoff, 2);
+        assert_ne!(
+            after_retry.classes[class_index].next_predicate
+                & super::K0_FINITE_SUFFIX_BACKOFF_ROUTE,
+            0,
+        );
         assert_ne!(
             prefilter_after_retry, prefilter_after_intervening,
             "the first call after the retry clock expires re-runs the predicate",
