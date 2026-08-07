@@ -44,7 +44,7 @@ pub use error::{CompileError, CompileResource, ObjectError};
 pub use module::{
     Architecture, CallAbi, CompiledModule, CpuFeature, FeatureSet, ModuleRelocation, ModuleSection,
     ModuleSymbol, OperatingSystem, RelocationKind, SectionKind, SlowAotLimits, SlowAotReport,
-    StartAccelerator, SymbolBinding, SymbolKind, Target,
+    SlowContextAotReport, StartAccelerator, SymbolBinding, SymbolKind, Target,
 };
 pub use object::{ObjectFormat, emit_object};
 pub use program::{
@@ -223,6 +223,11 @@ pub struct CompileReceipt {
     /// slow optimizing AOT compiler. The semantic-program report above is
     /// never overwritten, including when its first attempt declined.
     pub slow_aot: Option<SlowAotReport>,
+    /// A separately bounded contextual machine rebuilt from the retained
+    /// graph and actually selected into the native module. This never
+    /// overwrites `context_determinization` and is absent after a later
+    /// native-data or object-size fallback.
+    pub slow_context_aot: Option<SlowContextAotReport>,
     pub source_bytes: usize,
     pub thompson_states: usize,
     pub thompson_edges: usize,
@@ -589,6 +594,7 @@ fn compile_raw_with_line_terminator_and_slow_aot_limits(
         engine_selection_reason,
         determinization,
         slow_aot: module.slow_aot_report().cloned(),
+        slow_context_aot: module.slow_context_aot_report().cloned(),
         source_bytes,
         thompson_states: stats.states(),
         thompson_edges: stats.edges(),
@@ -672,6 +678,15 @@ fn selected_passes(program: &CompiledProgram, module: &CompiledModule) -> Vec<Op
         }
     }
     match program.engine_kind() {
+        EngineKind::OrderedNfa if module.slow_context_aot_report().is_some() => {
+            // The stable semantic program remains the universal ordered TNFA;
+            // the separately receipted contextual machine is transient native
+            // IR rebuilt from that same retained graph.
+            passes.push(OptimizationPass::UniversalOrderedTnfa);
+            if let Some(report) = module.slow_context_aot_report() {
+                append_native_context_passes(&mut passes, program, module, report.dfa);
+            }
+        }
         EngineKind::OrderedNfa if module.slow_aot_report().is_some() => {
             // A selected slow candidate leaves the stable semantic engine as
             // the universal ordered TNFA. Report both the native DFA passes
@@ -710,26 +725,9 @@ fn selected_passes(program: &CompiledProgram, module: &CompiledModule) -> Vec<Op
             append_native_dfa_passes(&mut passes, program, module, reverse_unused);
         }
         EngineKind::OrderedContextDfa => {
-            passes.extend_from_slice(&[
-                OptimizationPass::AlphabetPartition,
-                OptimizationPass::ContextOrderedDeterminization,
-                OptimizationPass::ReverseStartRecovery,
-                OptimizationPass::OutputContractSpecialization,
-                OptimizationPass::ConstantFold,
-                OptimizationPass::StrengthReduceRowAddressing,
-            ]);
-            if module.start_accelerator() != StartAccelerator::None {
-                passes.push(OptimizationPass::StartStateScanAcceleration);
+            if let Some(stats) = program.context_dfa_stats() {
+                append_native_context_passes(&mut passes, program, module, stats);
             }
-            if module.anchored_prefix_filter_bytes() != 0 {
-                passes.push(OptimizationPass::AnchoredPrefixCandidateFilter);
-            }
-            passes.extend_from_slice(&[
-                OptimizationPass::ContextNativeLowering,
-                OptimizationPass::TargetInstructionSelection,
-                OptimizationPass::FixedRegisterAssignment,
-                OptimizationPass::CheckedBranchFixup,
-            ]);
         }
     }
     passes.extend_from_slice(&[
@@ -737,6 +735,42 @@ fn selected_passes(program: &CompiledProgram, module: &CompiledModule) -> Vec<Op
         OptimizationPass::RelocatableObjectSerialization,
     ]);
     passes
+}
+
+fn append_native_context_passes(
+    passes: &mut Vec<OptimizationPass>,
+    program: &CompiledProgram,
+    module: &CompiledModule,
+    stats: ContextDfaStats,
+) {
+    passes.extend_from_slice(&[
+        OptimizationPass::AlphabetPartition,
+        OptimizationPass::ContextOrderedDeterminization,
+    ]);
+    if stats.reverse_states != 0 {
+        passes.push(OptimizationPass::ReverseStartRecovery);
+    } else if program.output_contract() == OutputContract::Span
+        && program.exact_match_width().is_some()
+    {
+        passes.push(OptimizationPass::ExactWidthStartRecovery);
+    }
+    passes.extend_from_slice(&[
+        OptimizationPass::OutputContractSpecialization,
+        OptimizationPass::ConstantFold,
+        OptimizationPass::StrengthReduceRowAddressing,
+    ]);
+    if module.start_accelerator() != StartAccelerator::None {
+        passes.push(OptimizationPass::StartStateScanAcceleration);
+    }
+    if module.anchored_prefix_filter_bytes() != 0 {
+        passes.push(OptimizationPass::AnchoredPrefixCandidateFilter);
+    }
+    passes.extend_from_slice(&[
+        OptimizationPass::ContextNativeLowering,
+        OptimizationPass::TargetInstructionSelection,
+        OptimizationPass::FixedRegisterAssignment,
+        OptimizationPass::CheckedBranchFixup,
+    ]);
 }
 
 fn append_native_dfa_passes(

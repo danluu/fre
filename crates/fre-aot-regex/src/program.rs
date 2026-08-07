@@ -18,8 +18,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::{
     CompileMode,
     context_dfa::{
-        self, ContextDfa, ContextDfaDecline, ContextDfaLimits, ContextDfaOutcome, ContextDfaStats,
-        NativeContextDfaView,
+        self, ContextDfa, ContextDfaDecline, ContextDfaLimits, ContextDfaOutcome,
+        ContextDfaResourceUsage, ContextDfaStats, NativeContextDfaView,
     },
     dfa::{
         self, DeterminizationReport, DeterminizeLimits, DeterminizeOutcome, DfaReplayOrder,
@@ -3641,6 +3641,34 @@ pub(crate) struct NativeSlowDfaProgram {
     allocation_bytes: usize,
 }
 
+/// Owned target-neutral result of explicitly bounded slow contextual
+/// determinization.
+///
+/// The stable semantic artifact intentionally omits contextual sidecars and
+/// optimizer-only literal analysis. Re-lowering therefore rebuilds both from
+/// the retained graph and owns them together until native lowering has copied
+/// every selected table.
+#[derive(Debug)]
+pub(crate) struct NativeSlowContextProgram {
+    machine: ContextDfa,
+    required_literals: RequiredLiterals,
+    usage: ContextDfaResourceUsage,
+}
+
+impl NativeSlowContextProgram {
+    pub(crate) const fn stats(&self) -> ContextDfaStats {
+        self.machine.stats()
+    }
+
+    pub(crate) const fn allocation_bytes(&self) -> usize {
+        self.usage.allocation_bytes
+    }
+
+    pub(crate) const fn work_completed(&self) -> u64 {
+        self.usage.work_completed
+    }
+}
+
 #[derive(Debug)]
 enum NativeSlowMachine {
     Complete(OrderedDfa),
@@ -3966,6 +3994,18 @@ const fn contextual_limits(requested: DeterminizeLimits) -> ContextDfaLimits {
         max_states: effective.max_states,
         max_transitions: effective.max_transitions,
         max_work: effective.max_work,
+    }
+}
+
+/// The explicitly selected slow contextual machine is transient native IR,
+/// not a stable serialized DFA. Honor its caller-owned numeric ceilings
+/// verbatim; checked native representations still reject dimensions they
+/// cannot encode.
+const fn slow_contextual_limits(requested: DeterminizeLimits) -> ContextDfaLimits {
+    ContextDfaLimits {
+        max_states: requested.max_states,
+        max_transitions: requested.max_transitions,
+        max_work: requested.max_work,
     }
 }
 
@@ -4623,6 +4663,62 @@ impl CompiledProgram {
             retained_prefix_requirement,
             retained_suffix_requirement,
         })
+    }
+
+    /// Re-run complete contextual determinization for an explicitly selected
+    /// slow AOT lowering.
+    ///
+    /// Eligibility is structural: only a universal ordered-NFA program whose
+    /// retained graph contains assertions and has no contextual machine may
+    /// enter. Fast, resource-fallback, and restored semantic programs all use
+    /// the same retained `RawPlan`; no source spelling, identity, target, or
+    /// benchmark fact participates. A structural, numeric, work, or logical
+    /// allocation refusal declines this optional candidate. Other compiler
+    /// failures remain typed errors.
+    pub(crate) fn native_slow_context_program(
+        &self,
+        limits: DeterminizeLimits,
+        max_allocation_bytes: usize,
+    ) -> Result<Option<NativeSlowContextProgram>, CompileError> {
+        if self.context_dfa.is_some()
+            || !matches!(self.engine, ProgramEngine::OrderedNfa)
+            || !self.automaton.stats().has_assertions()
+        {
+            return Ok(None);
+        }
+        let needs_reverse_span =
+            self.output == OutputContract::Span && self.exact_match_width.is_none();
+        let (outcome, usage) = context_dfa::determinize_for_output_with_allocation_limit(
+            &self.raw,
+            self.line_terminator,
+            slow_contextual_limits(limits),
+            self.output,
+            needs_reverse_span,
+            max_allocation_bytes,
+        )?;
+        match outcome {
+            ContextDfaOutcome::Complete(machine) => Ok(Some(NativeSlowContextProgram {
+                machine,
+                required_literals: required_literals::derive(&self.raw),
+                usage,
+            })),
+            ContextDfaOutcome::Declined(_) => Ok(None),
+        }
+    }
+
+    pub(crate) fn native_slow_context_view<'a>(
+        &'a self,
+        candidate: &'a NativeSlowContextProgram,
+    ) -> NativeContextProgramView<'a> {
+        NativeContextProgramView {
+            output: self.output,
+            dfa: candidate.machine.native_view(),
+            anchored_prefix: &self.anchored_prefix,
+            anchored_suffix: &self.anchored_suffix,
+            required_literals: &candidate.required_literals,
+            exact_match_width: self.exact_match_width,
+            max_match_width: self.max_match_width(),
+        }
     }
 
     /// Re-run the general ordered determinizer under the stable compiler

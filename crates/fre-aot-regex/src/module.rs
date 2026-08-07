@@ -20,6 +20,8 @@ use crate::{
     bounded_suffix_retry::{
         BoundedSuffixRetryPlan, select_bounded_interior_retry, select_bounded_suffix_retry,
     },
+    context_dfa::ContextDfaStats,
+    context_native::MAX_CONTEXT_NATIVE_DATA_BYTES,
     prefix_block::{self, PREFIX_BLOCK_ALIGNMENT, PREFIX_BLOCK_SERIALIZED_BYTES, PrefixBlockPlan},
     prefix_fast_forward,
     prefix_predicate::{
@@ -83,8 +85,9 @@ use crate::{
 ///
 /// These limits are independent of the earlier semantic-program build so an
 /// application may start with a small or zero DFA budget and later request a
-/// larger complete native graph. The stable replay ceilings still clamp the
-/// numeric determinization dimensions.
+/// larger complete native graph. Assertion-free replay remains bounded by its
+/// stable artifact representation; the transient contextual machine honors
+/// these numeric ceilings verbatim and relies on checked native encodings.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SlowAotLimits {
     pub determinize: DeterminizeLimits,
@@ -123,6 +126,30 @@ pub struct SlowAotReport {
     /// Read-only native DFA payload, including alignment, installed auxiliary
     /// scanners, and target-specific sidecar tables. The semantic program
     /// bytes used by a partial wrapper's whole-search deopt are excluded.
+    pub native_data_bytes: usize,
+}
+
+/// Provenance for a complete slow contextual candidate actually installed in
+/// a self-contained native module.
+///
+/// This is intentionally distinct from both [`SlowAotReport`] and the
+/// semantic program's fresh contextual report. A restored program can rebuild
+/// this transient machine from its retained graph, while serialization never
+/// claims that the optimizer-only sidecar survived.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SlowContextAotReport {
+    /// Limits requested at the optimizing compiler API boundary.
+    pub requested_limits: SlowAotLimits,
+    /// Native-data ceiling after any enclosing object-size limit clamps it.
+    pub effective_native_data_limit_bytes: usize,
+    /// Complete target-neutral contextual machine selected for lowering.
+    pub dfa: ContextDfaStats,
+    /// Peak conservative logical allocation charged by determinization.
+    pub allocation_bytes: usize,
+    /// Exact aggregate work across mandatory, retry, anchored, and quotient
+    /// contextual construction stages.
+    pub work_completed: u64,
+    /// Complete emitted contextual read-only native payload.
     pub native_data_bytes: usize,
 }
 
@@ -805,6 +832,7 @@ pub struct CompiledModule {
     start_accelerator: StartAccelerator,
     anchored_prefix_filter_bytes: u8,
     slow_aot_report: Option<SlowAotReport>,
+    slow_context_aot_report: Option<SlowContextAotReport>,
     slow_retained_forward_minimized: bool,
 }
 
@@ -970,12 +998,13 @@ impl CompiledModule {
     /// Lower with the slower optimizing fallback compiler enabled.
     ///
     /// In addition to every route considered by [`Self::lower`], this may
-    /// re-run general ordered determinization under the stable compiler
-    /// ceiling. A numeric refusal after completing rows may lower a complete
-    /// graph directly, including retained reverse start recovery, or place a
-    /// genuinely incomplete prefix behind whole-search runtime deoptimization.
-    /// Otherwise the compiler may complete an assertion-free resource
-    /// fallback's bounded K0 state graph.
+    /// re-run contextual or assertion-free ordered determinization under
+    /// explicit resource ceilings. A numeric refusal after completing
+    /// assertion-free rows may lower a complete graph directly, including
+    /// retained reverse start recovery, or place a genuinely incomplete
+    /// prefix behind whole-search runtime deoptimization. Otherwise the
+    /// compiler may complete an assertion-free resource fallback's bounded K0
+    /// state graph.
     /// This can take substantially longer than ordinary lowering.
     /// Callers re-lowering a restored or otherwise untrusted program must opt
     /// in explicitly; a serialized optimizer marker never authorizes this
@@ -984,8 +1013,8 @@ impl CompiledModule {
     /// # Errors
     ///
     /// Returns the same typed failures as [`Self::lower`]. Optional slow
-    /// determinization and K0 materialization declines preserve the ordinary
-    /// module route.
+    /// contextual determinization/lowering, assertion-free determinization,
+    /// and K0 materialization declines preserve the ordinary module route.
     pub fn lower_optimizing(
         program: &CompiledProgram,
         target: Target,
@@ -993,7 +1022,8 @@ impl CompiledModule {
         Self::lower_optimizing_with_limits(program, target, SlowAotLimits::default())
     }
 
-    /// Lower with explicit hard limits for the slow assertion-free DFA pass.
+    /// Lower with explicit hard limits for the slow contextual and
+    /// assertion-free DFA passes.
     ///
     /// Numeric or allocation exhaustion declines only this optional candidate;
     /// bounded K0 materialization and every established fallback remain
@@ -1020,6 +1050,8 @@ impl CompiledModule {
         target.validate()?;
         let effective_native_data_limit_bytes = effective_native_data_limit_bytes
             .min(requested_limits.max_native_data_bytes);
+        let effective_context_native_data_limit_bytes =
+            effective_native_data_limit_bytes.min(MAX_CONTEXT_NATIVE_DATA_BYTES);
         let program_bytes = program.serialize()?;
         let ordinary_native = program.native_dfa_view();
         let exact_product = program.native_exact_product_view();
@@ -1041,49 +1073,28 @@ impl CompiledModule {
             .map_err(CompileError::from);
         }
 
-        let slow_determinized = program.native_slow_determinized_program(
+        let slow_context = program.native_slow_context_program(
             requested_limits.determinize,
             requested_limits.max_allocation_bytes,
         )?;
-        let mut slow_aot_report = None;
-        let mut slow_retained_forward_minimized = false;
-        let mut optional_lowering = if let Some(candidate) = slow_determinized.as_ref() {
-            let view = program.native_slow_determinized_view(candidate);
-            let uses_partial_wrapper = view.collapse_partial_holes;
-            let lowered = if uses_partial_wrapper {
-                lower_optional_native_slow_partial_with_data_limit(
-                    &program_bytes,
-                    view,
-                    target,
-                    effective_native_data_limit_bytes,
-                )
-            } else {
-                lower_optional_native_dfa_with_data_limit(
-                    view,
-                    target,
-                    effective_native_data_limit_bytes,
-                )
-            };
-            match lowered {
+        let mut slow_context_aot_report = None;
+        let mut optional_lowering = if let Some(candidate) = slow_context.as_ref() {
+            let view = program.native_slow_context_view(candidate);
+            match module_context::lower_native_context_with_data_limit(
+                view,
+                target,
+                effective_context_native_data_limit_bytes,
+            ) {
                 Ok(Some(lowering)) => {
-                    let native_data_bytes = if uses_partial_wrapper {
-                        lowering.data.len().checked_sub(program_bytes.len()).ok_or(
-                            CompileError::InternalInvariant(
-                                "slow partial native data precedes its serialized program",
-                            ),
-                        )?
-                    } else {
-                        lowering.data.len()
-                    };
-                    slow_aot_report = Some(SlowAotReport {
+                    slow_context_aot_report = Some(SlowContextAotReport {
                         requested_limits,
-                        effective_native_data_limit_bytes,
-                        determinization: candidate.report().clone(),
+                        effective_native_data_limit_bytes:
+                            effective_context_native_data_limit_bytes,
                         dfa: candidate.stats(),
                         allocation_bytes: candidate.allocation_bytes(),
-                        native_data_bytes,
+                        work_completed: candidate.work_completed(),
+                        native_data_bytes: lowering.data.len(),
                     });
-                    slow_retained_forward_minimized = candidate.retained_forward_minimized();
                     Some(lowering)
                 }
                 Ok(None) => None,
@@ -1092,6 +1103,63 @@ impl CompiledModule {
         } else {
             None
         };
+
+        let slow_determinized = if optional_lowering.is_none() {
+            program.native_slow_determinized_program(
+                requested_limits.determinize,
+                requested_limits.max_allocation_bytes,
+            )?
+        } else {
+            None
+        };
+        let mut slow_aot_report = None;
+        let mut slow_retained_forward_minimized = false;
+        if optional_lowering.is_none() {
+            if let Some(candidate) = slow_determinized.as_ref() {
+                let view = program.native_slow_determinized_view(candidate);
+                let uses_partial_wrapper = view.collapse_partial_holes;
+                let lowered = if uses_partial_wrapper {
+                    lower_optional_native_slow_partial_with_data_limit(
+                        &program_bytes,
+                        view,
+                        target,
+                        effective_native_data_limit_bytes,
+                    )
+                } else {
+                    lower_optional_native_dfa_with_data_limit(
+                        view,
+                        target,
+                        effective_native_data_limit_bytes,
+                    )
+                };
+                match lowered {
+                    Ok(Some(lowering)) => {
+                        let native_data_bytes = if uses_partial_wrapper {
+                            lowering.data.len().checked_sub(program_bytes.len()).ok_or(
+                                CompileError::InternalInvariant(
+                                    "slow partial native data precedes its serialized program",
+                                ),
+                            )?
+                        } else {
+                            lowering.data.len()
+                        };
+                        slow_aot_report = Some(SlowAotReport {
+                            requested_limits,
+                            effective_native_data_limit_bytes,
+                            determinization: candidate.report().clone(),
+                            dfa: candidate.stats(),
+                            allocation_bytes: candidate.allocation_bytes(),
+                            native_data_bytes,
+                        });
+                        slow_retained_forward_minimized =
+                            candidate.retained_forward_minimized();
+                        optional_lowering = Some(lowering);
+                    }
+                    Ok(None) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
         if optional_lowering.is_none() {
             if let Some(materialized) = program.native_fully_prefilled_program() {
                 let view = program.native_fully_prefilled_view(&materialized);
@@ -1106,6 +1174,7 @@ impl CompiledModule {
             program_bytes,
             optional_lowering,
             slow_aot_report,
+            slow_context_aot_report,
             slow_retained_forward_minimized,
             ordinary_native,
             program.native_context_program_view(),
@@ -1158,6 +1227,7 @@ impl CompiledModule {
             program_bytes,
             optional_lowering,
             None,
+            None,
             false,
             native,
             program.native_context_program_view(),
@@ -1193,6 +1263,7 @@ impl CompiledModule {
             program_bytes,
             prelowered,
             None,
+            None,
             false,
             native,
             native_context,
@@ -1211,6 +1282,7 @@ impl CompiledModule {
         program_bytes: Vec<u8>,
         prelowered: Option<NativeLowering>,
         slow_aot_report: Option<SlowAotReport>,
+        slow_context_aot_report: Option<SlowContextAotReport>,
         slow_retained_forward_minimized: bool,
         native: Option<NativeProgramView<'_>>,
         native_context: Option<NativeContextProgramView<'_>>,
@@ -1221,6 +1293,16 @@ impl CompiledModule {
         if slow_retained_forward_minimized && slow_aot_report.is_none() {
             return Err(ObjectError::InvalidModule(
                 "partial slow minimization provenance has no selected report",
+            ));
+        }
+        if slow_aot_report.is_some() && slow_context_aot_report.is_some() {
+            return Err(ObjectError::InvalidModule(
+                "byte and contextual slow reports cannot share one module",
+            ));
+        }
+        if slow_context_aot_report.is_some() && prelowered.is_none() {
+            return Err(ObjectError::InvalidModule(
+                "slow contextual provenance has no selected native lowering",
             ));
         }
         let serialized_program_size = program_bytes.len();
@@ -1275,6 +1357,13 @@ impl CompiledModule {
             let native_digest = native_module_digest(&lowering.data, target, &lowering)?;
             (lowering, native_digest, None)
         };
+        if slow_context_aot_report.is_some()
+            && (lowering.needs_runtime || lowering.slow_partial_table.is_some())
+        {
+            return Err(ObjectError::InvalidModule(
+                "slow contextual lowering retained a runtime dependency",
+            ));
+        }
         if lowering.slow_partial_table.is_some() && prepared_layout.is_some() {
             return Err(ObjectError::InvalidModule(
                 "slow partial and prepared layouts cannot share one module",
@@ -1543,6 +1632,7 @@ impl CompiledModule {
             start_accelerator: lowering.start_accelerator,
             anchored_prefix_filter_bytes: lowering.anchored_prefix_filter_bytes,
             slow_aot_report,
+            slow_context_aot_report,
             slow_retained_forward_minimized,
         })
     }
@@ -1561,6 +1651,14 @@ impl CompiledModule {
     #[must_use]
     pub const fn slow_aot_report(&self) -> Option<&SlowAotReport> {
         self.slow_aot_report.as_ref()
+    }
+
+    /// Return provenance for a slow contextual candidate actually selected
+    /// into this self-contained module. Declined construction/lowering and a
+    /// later object-size fallback return `None`.
+    #[must_use]
+    pub const fn slow_context_aot_report(&self) -> Option<&SlowContextAotReport> {
+        self.slow_context_aot_report.as_ref()
     }
 
     pub(crate) const fn slow_retained_forward_minimized(&self) -> bool {
@@ -29323,6 +29421,7 @@ int main(void) {{
             let module = CompiledModule::lower_serialized_with_prelowered(
                 program,
                 Some(lowering),
+                None,
                 None,
                 false,
                 None,
