@@ -862,10 +862,14 @@ const NATIVE_ROWS_INITIAL_ROW: usize =
 const NATIVE_ROWS_INITIAL_FLAGS: usize =
     core::mem::offset_of!(DynamicNativeRowsV1, initial_flags);
 const _: () = assert!(core::mem::size_of::<DynamicNativeRowsV1>() <= 127);
-// Compact frozen rows are a short-window prepared-entry optimization. At
-// 4 KiB, canonical K0 begins considering its whole-window accelerators.
-const FROZEN_DYNAMIC_ROWS_MAX_INPUT_BYTES: usize = 4_095;
-const _: () = assert!(DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES <= FROZEN_DYNAMIC_ROWS_MAX_INPUT_BYTES);
+// Scanner-free compact frozen rows remain a short-window prepared-entry
+// optimization. At 4 KiB, canonical K0 begins considering its whole-window
+// accelerators. A graph-proven native root scanner already owns that role and
+// therefore keeps its frozen table for longer windows as well.
+const FROZEN_SCANNER_FREE_DYNAMIC_ROWS_MAX_INPUT_BYTES: usize = 4_095;
+const _: () = assert!(
+    DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES <= FROZEN_SCANNER_FREE_DYNAMIC_ROWS_MAX_INPUT_BYTES
+);
 const _: () = assert!(DYNAMIC_NATIVE_ROWS_V1_UNFILLED_CELL == u32::MAX);
 const _: () = assert!(DYNAMIC_NATIVE_ROWS_V1_ACCEPT_MASK == 1 << 31);
 const _: () = assert!(DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK == (1 << 29) - 1);
@@ -12044,12 +12048,14 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     compare_minimum.extend_from_slice(&minimum.to_le_bytes());
     assembler.instruction(&compare_minimum)?;
     assembler.branch(&[0x0f, 0x82], short_fallback)?;
-    let maximum = u32::try_from(FROZEN_DYNAMIC_ROWS_MAX_INPUT_BYTES)
-        .map_err(|_| ObjectError::ArithmeticOverflow("frozen dynamic row input ceiling"))?;
-    let mut compare_maximum = vec![0x48, 0x3d];
-    compare_maximum.extend_from_slice(&maximum.to_le_bytes());
-    assembler.instruction(&compare_maximum)?;
-    assembler.branch(&[0x0f, 0x87], short_fallback)?;
+    if root_plan.is_none() {
+        let maximum = u32::try_from(FROZEN_SCANNER_FREE_DYNAMIC_ROWS_MAX_INPUT_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("frozen dynamic row input ceiling"))?;
+        let mut compare_maximum = vec![0x48, 0x3d];
+        compare_maximum.extend_from_slice(&maximum.to_le_bytes());
+        assembler.instruction(&compare_maximum)?;
+        assembler.branch(&[0x0f, 0x87], short_fallback)?;
+    }
 
     // Entry RSP is 8 modulo 16. The frame aligns calls, retains all six
     // public arguments, and reserves the four-word private preflight record.
@@ -18917,10 +18923,12 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
         .map_err(|_| ObjectError::ArithmeticOverflow("dynamic row input floor"))?;
     assembler.instruction(aarch64_cmp_x_imm(6, minimum)?)?;
     assembler.branch_cond(AARCH64_LO, short_fallback)?;
-    let maximum = u16::try_from(FROZEN_DYNAMIC_ROWS_MAX_INPUT_BYTES)
-        .map_err(|_| ObjectError::ArithmeticOverflow("frozen dynamic row input ceiling"))?;
-    assembler.instruction(aarch64_cmp_x_imm(6, maximum)?)?;
-    assembler.branch_cond(AARCH64_HI, short_fallback)?;
+    if root_plan.is_none() {
+        let maximum = u16::try_from(FROZEN_SCANNER_FREE_DYNAMIC_ROWS_MAX_INPUT_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("frozen dynamic row input ceiling"))?;
+        assembler.instruction(aarch64_cmp_x_imm(6, maximum)?)?;
+        assembler.branch_cond(AARCH64_HI, short_fallback)?;
+    }
 
     assembler.instruction(aarch64_sub_x_imm(31, 31, FRAME_BYTES)?)?;
     assembler.instruction(aarch64_store_x(30, 31, 88)?)?;
@@ -21320,6 +21328,15 @@ mod tests {
             .chunks_exact(4)
             .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
             .collect::<Vec<_>>();
+        let scanner_free_ceiling = aarch64_cmp_x_imm(
+            6,
+            u16::try_from(FROZEN_SCANNER_FREE_DYNAMIC_ROWS_MAX_INPUT_BYTES).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !words.contains(&scanner_free_ceiling),
+            "an installed AArch64 root scanner must retain frozen rows for long windows"
+        );
         assert_eq!(
             words
                 .iter()
@@ -21385,6 +21402,7 @@ mod tests {
             .chunks_exact(4)
             .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
             .collect::<Vec<_>>();
+        assert!(scalar_words.contains(&scanner_free_ceiling));
         assert!(!scalar_words.contains(&aarch64_cmp_w(11, 1).unwrap()));
         assert!(!scalar_words.contains(&aarch64_sve_cntb(16).unwrap()));
     }
@@ -24122,6 +24140,13 @@ mod tests {
             assert_eq!(scanner.membership, membership);
             assert!(scanner.vectorized);
             let code = emission.code.as_slice();
+            let scanner_free_ceiling = [0x48, 0x3d, 0xff, 0x0f, 0x00, 0x00];
+            assert!(
+                !code
+                    .windows(scanner_free_ceiling.len())
+                    .any(|window| window == scanner_free_ceiling),
+                "an installed root scanner must retain frozen rows for long windows"
+            );
 
             let count_load = [0x41, 0x8b, 0x43, loop_count];
             assert_eq!(
@@ -24207,6 +24232,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(scalar.scanner, None);
+        assert!(scalar.code.windows(6).any(|window| {
+            window == [0x48, 0x3d, 0xff, 0x0f, 0x00, 0x00]
+        }));
         assert!(scalar.code.windows(5).any(|bytes| {
             bytes == [0x41, 0x83, 0x7b, loop_count, 0]
         }));
@@ -26081,11 +26109,11 @@ int main(void) {{
   route_status=run_direct(1,255,1,boundary_haystack,sizeof(boundary_haystack),5,37,120);if(route_status)return route_status;
   route_status=run_direct(1,255,1,boundary_haystack,sizeof(boundary_haystack),5,4100,124);if(route_status)return route_status;
   route_status=run_ordinary_window(31,128);if(route_status)return route_status;
-  route_status=run_ordinary_window(4096,132);if(route_status)return route_status;
+  route_status=run_direct(1,255,1,boundary_haystack,sizeof(boundary_haystack),5,4101,132);if(route_status)return route_status;
   route_status=run_active_hole(136);if(route_status)return route_status;
   for(int kind=0;kind<=5;kind++){{route_status=run_invalid_public(kind,60+kind*4);if(route_status)return route_status;}}
   for(int kind=0;kind<=36;kind++){{route_status=run_bad_header(kind,144+kind*3);if(route_status)return route_status;}}
-  if(direct_routes!=7||preflight_routes!=37||ordinary_routes!=9)return 140;
+  if(direct_routes!=8||preflight_routes!=37||ordinary_routes!=8)return 140;
   return 0;
 }}
 "##,
