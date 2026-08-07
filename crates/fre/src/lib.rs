@@ -1665,11 +1665,62 @@ fn try_build_k0_mandatory_cut<'a>(
 // This replacement scans only reusable windows large enough to amortize its
 // immutable graph-to-frontier displacement. The overlap is the farthest
 // possible root position plus the bytes needed to finish the longest packed
-// literal. Both the factor and floor are source-independent construction
-// constants; source contents never decide whether a call begins the packed
-// route.
+// literal. The ordinary floor and four-overlap margin remain unchanged for a
+// cheap fallback. A validated expensive fallback can reduce both margins by
+// an immutable structural scale, but never below one complete overlap or the
+// packed engine's SIMD minimum. Source contents never decide whether a call
+// begins the packed route.
 const K0_PACKED_FRONTIER_MIN_WINDOW_BYTES: usize = 1_024;
 const K0_PACKED_FRONTIER_OVERLAP_FACTOR: usize = 4;
+
+fn k0_packed_frontier_incremental_fallback_work(
+    automaton: &Automaton,
+    simd_minimum_haystack_bytes: usize,
+) -> Option<u64> {
+    if simd_minimum_haystack_bytes == 0 {
+        return None;
+    }
+    // Subtracting the zero-byte certificate removes cold start-proof work.
+    // The remainder is exactly the validated bound's monotone input term for
+    // one packed SIMD-admissible quantum of this immutable fallback graph.
+    let fixed = automaton.conservative_transition_work_bound(0).ok()?;
+    automaton
+        .conservative_transition_work_bound(simd_minimum_haystack_bytes)
+        .ok()?
+        .checked_sub(fixed)
+}
+
+fn k0_packed_frontier_amortization_scale(incremental_fallback_work: Option<u64>) -> usize {
+    let baseline = u64::try_from(K0_PACKED_FRONTIER_MIN_WINDOW_BYTES).unwrap_or(u64::MAX);
+    let Some(work) = incremental_fallback_work else {
+        return 1;
+    };
+    let rounded = work.div_ceil(baseline).max(1);
+    usize::try_from(rounded).unwrap_or(usize::MAX)
+}
+
+fn k0_packed_frontier_div_ceil(value: usize, divisor: usize) -> usize {
+    value.div_ceil(divisor)
+}
+
+fn k0_packed_frontier_minimum_window_bytes(
+    simd_minimum_haystack_bytes: usize,
+    overlap_bytes: usize,
+    overlap_admission_bytes: usize,
+    incremental_fallback_work: Option<u64>,
+) -> usize {
+    let scale = k0_packed_frontier_amortization_scale(incremental_fallback_work);
+    simd_minimum_haystack_bytes
+        .max(overlap_bytes)
+        .max(k0_packed_frontier_div_ceil(
+            K0_PACKED_FRONTIER_MIN_WINDOW_BYTES,
+            scale,
+        ))
+        .max(k0_packed_frontier_div_ceil(
+            overlap_admission_bytes,
+            scale,
+        ))
+}
 
 #[derive(Debug)]
 struct K0PackedFrontierPlan {
@@ -1686,6 +1737,24 @@ impl K0PackedFrontierPlan {
                 "K0 packed frontier was bound more than once",
             ));
         }
+        let packed_build = self.packed.build_accounting();
+        let overlap_bytes = self
+            .maximum_before_root
+            .checked_add(packed_build.max_pattern_bytes.saturating_sub(1))
+            .expect("a published K0 packed frontier proved its overlap");
+        let overlap_admission_bytes = overlap_bytes
+            .checked_mul(K0_PACKED_FRONTIER_OVERLAP_FACTOR)
+            .expect("a published K0 packed frontier proved its admission margin");
+        let incremental_fallback_work = k0_packed_frontier_incremental_fallback_work(
+            automaton,
+            packed_build.simd_minimum_haystack_bytes,
+        );
+        self.minimum_window_bytes = k0_packed_frontier_minimum_window_bytes(
+            packed_build.simd_minimum_haystack_bytes,
+            overlap_bytes,
+            overlap_admission_bytes,
+            incremental_fallback_work,
+        );
         self.automaton_identity = automaton.identity();
         Ok(())
     }
@@ -1946,9 +2015,15 @@ fn try_build_k0_packed_frontier(
         .ok_or(BuildError::InternalInvariant(
             "K0 packed-frontier admission overflowed",
         ))?;
-    let minimum_window_bytes = K0_PACKED_FRONTIER_MIN_WINDOW_BYTES
-        .max(packed_build.simd_minimum_haystack_bytes)
-        .max(overlap_admission);
+    // Until this owner is bound to the exact validated automaton, preserve
+    // the unscaled cheap-fallback admission. Binding may lower both margins
+    // from immutable transition complexity, before the plan is published.
+    let minimum_window_bytes = k0_packed_frontier_minimum_window_bytes(
+        packed_build.simd_minimum_haystack_bytes,
+        overlap_bytes,
+        overlap_admission,
+        None,
+    );
     let plan = K0PackedFrontierPlan {
         packed,
         automaton_identity: 0,
@@ -9887,6 +9962,10 @@ impl<'p, 'h> K0PackedFrontierExistsReceipt<'p, 'h> {
                 detail: "K0 packed-frontier execution crossed immutable plans",
             }));
         }
+        // The packed owner returns its first frontier occurrence. Thus the
+        // added work of an early positive is bounded by that early prefix,
+        // while complete absence is the case that earns a whole-window K0
+        // replacement. Cheap fallbacks cannot enter the scaled-short range.
         let (found, _) = self.plan.packed.find_window(
             self.haystack,
             LiteralWindow::new(self.window.start(), self.window.end()),
@@ -16094,6 +16173,17 @@ mod tests {
         let (frontier, automaton, _, storage_bytes) =
             analyzed_k0_packed_frontier(r"(?s-u:...[abcd][12345]+\b)");
         let packed = frontier.packed.build_accounting();
+        let overlap_bytes = frontier
+            .maximum_before_root
+            .checked_add(packed.max_pattern_bytes.saturating_sub(1))
+            .unwrap();
+        let unscaled_minimum = super::K0_PACKED_FRONTIER_MIN_WINDOW_BYTES
+            .max(packed.simd_minimum_haystack_bytes)
+            .max(
+                overlap_bytes
+                    .checked_mul(super::K0_PACKED_FRONTIER_OVERLAP_FACTOR)
+                    .unwrap(),
+            );
         assert!(frontier.is_bound_to(&automaton));
         assert!(frontier.maximum_before_root > 0);
         assert!(packed.patterns >= 2);
@@ -16102,8 +16192,216 @@ mod tests {
             core::mem::size_of::<K0PackedFrontierPlan>() + packed.persistent_bytes,
         );
         assert_eq!(frontier.storage_bytes(), storage_bytes);
+        assert!(frontier.minimum_window_bytes >= packed.simd_minimum_haystack_bytes);
+        assert!(frontier.minimum_window_bytes >= overlap_bytes);
+        assert!(frontier.minimum_window_bytes <= unscaled_minimum);
+    }
+
+    #[test]
+    fn k0_packed_frontier_complexity_scaling_is_monotone_and_keeps_cheap_margins() {
+        let baseline = u64::try_from(super::K0_PACKED_FRONTIER_MIN_WINDOW_BYTES).unwrap();
+        let simd_minimum = 32_usize;
+        let overlap = 257_usize;
+        let four_overlaps = overlap
+            .checked_mul(super::K0_PACKED_FRONTIER_OVERLAP_FACTOR)
+            .unwrap();
+        let minimum = |work| {
+            super::k0_packed_frontier_minimum_window_bytes(
+                simd_minimum,
+                overlap,
+                four_overlaps,
+                work,
+            )
+        };
+
+        // A cheap fallback, including the exact baseline-work boundary,
+        // retains both original conservative margins. Thus an early positive
+        // on a cheap graph never acquires new packed-frontier overhead.
+        assert_eq!(super::k0_packed_frontier_amortization_scale(None), 1);
+        assert_eq!(
+            super::k0_packed_frontier_amortization_scale(Some(baseline - 1)),
+            1,
+        );
+        assert_eq!(
+            super::k0_packed_frontier_amortization_scale(Some(baseline)),
+            1,
+        );
+        assert_eq!(minimum(None), four_overlaps);
+        assert_eq!(minimum(Some(baseline - 1)), four_overlaps);
+        assert_eq!(minimum(Some(baseline)), four_overlaps);
+
+        // Crossing one complete structural-work unit lowers both margins.
+        // Increasing immutable fallback cost can only lower admission, and
+        // four units reach exactly the correctness geometry rather than
+        // crossing below it.
+        assert_eq!(
+            super::k0_packed_frontier_amortization_scale(Some(baseline + 1)),
+            2,
+        );
+        assert_eq!(minimum(Some(baseline + 1)), 514);
+        assert_eq!(minimum(Some(baseline * 4)), overlap);
+        assert_eq!(minimum(Some(u64::MAX)), overlap);
+        let samples = [
+            baseline - 1,
+            baseline,
+            baseline + 1,
+            baseline * 2,
+            baseline * 3,
+            baseline * 4,
+            u64::MAX,
+        ];
+        for pair in samples.windows(2) {
+            assert!(minimum(Some(pair[1])) <= minimum(Some(pair[0])));
+        }
+    }
+
+    #[test]
+    fn k0_packed_frontier_scaled_boundary_and_early_positive_remain_exact() {
+        const PATTERN: &str = r"(?s-u:.{0,256}[abcd](?:XYZ|QRS|UVW|LMN)\b)";
+        let regex = forced_k0_with_only_packed_frontier(PATTERN);
+        let PortablePlan::K0(plan) = &regex.plan else {
+            unreachable!();
+        };
+        let frontier = plan
+            .packed_frontier()
+            .expect("complexity-boundary fixture retains its packed frontier");
+        let packed = frontier.packed.build_accounting();
+        let overlap = frontier
+            .maximum_before_root
+            .checked_add(packed.max_pattern_bytes.saturating_sub(1))
+            .unwrap();
+        let four_overlaps = overlap
+            .checked_mul(super::K0_PACKED_FRONTIER_OVERLAP_FACTOR)
+            .unwrap();
+        let incremental = super::k0_packed_frontier_incremental_fallback_work(
+            &plan.automaton,
+            packed.simd_minimum_haystack_bytes,
+        )
+        .expect("bounded fallback complexity fits its certified work type");
         assert!(
-            frontier.minimum_window_bytes >= super::K0_PACKED_FRONTIER_MIN_WINDOW_BYTES
+            super::k0_packed_frontier_amortization_scale(Some(incremental)) > 1,
+            "the large bounded fallback must pay for a reduced margin",
+        );
+        assert_eq!(
+            frontier.minimum_window_bytes,
+            super::k0_packed_frontier_minimum_window_bytes(
+                packed.simd_minimum_haystack_bytes,
+                overlap,
+                four_overlaps,
+                Some(incremental),
+            ),
+        );
+        assert!(frontier.minimum_window_bytes >= overlap);
+        assert!(frontier.minimum_window_bytes >= packed.simd_minimum_haystack_bytes);
+        assert!(
+            frontier.minimum_window_bytes
+                < super::K0_PACKED_FRONTIER_MIN_WINDOW_BYTES.max(four_overlaps),
+        );
+
+        let window_start = 11_usize;
+        let window_end = window_start
+            .checked_add(frontier.minimum_window_bytes)
+            .unwrap();
+        let exact_window = SearchWindow::new(window_start, window_end);
+        let one_below_window = SearchWindow::new(
+            window_start,
+            window_end.checked_sub(1).unwrap(),
+        );
+        let mut haystack = vec![b'!'; window_end + 7];
+        haystack[window_start..window_start + 5].copy_from_slice(b"aXYZ!");
+
+        let mut admission = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("boundary admission session constructs");
+        {
+            let PortableSearchSessionPlan::K0 {
+                session,
+                k0_plan,
+                ..
+            } = &mut admission.plan
+            else {
+                unreachable!();
+            };
+            assert!(
+                K0PackedFrontierExistsReceipt::admit(
+                    k0_plan,
+                    session,
+                    &haystack,
+                    one_below_window,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .is_none(),
+            );
+            assert!(
+                K0PackedFrontierExistsReceipt::admit(
+                    k0_plan,
+                    session,
+                    &haystack,
+                    exact_window,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .is_some(),
+            );
+            assert!(
+                K0PackedFrontierExistsReceipt::admit(
+                    k0_plan,
+                    session,
+                    &haystack,
+                    exact_window,
+                    SearchLimits {
+                        max_work: u64::MAX - 1,
+                        max_scratch_bytes: usize::MAX,
+                    },
+                )
+                .unwrap()
+                .is_none(),
+                "a scaled window must not bypass an exact finite K0 limit",
+            );
+        }
+
+        let mut authoritative = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("authoritative small-window session constructs");
+        let mut specialized = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("specialized small-window session constructs");
+        let expected = authoritative
+            .is_match_window(&haystack, exact_window, SearchLimits::unlimited())
+            .unwrap()
+            .0;
+        assert!(expected);
+        assert_eq!(
+            specialized
+                .is_match_window_value(
+                    &haystack,
+                    exact_window,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            expected,
+        );
+
+        // The early candidate is not retained: identical storage mutated to
+        // an absence is searched again through the same scaled admission.
+        let address = haystack.as_ptr();
+        haystack.fill(b'!');
+        assert_eq!(haystack.as_ptr(), address);
+        let expected = authoritative
+            .is_match_window(&haystack, exact_window, SearchLimits::unlimited())
+            .unwrap()
+            .0;
+        assert!(!expected);
+        assert_eq!(
+            specialized
+                .is_match_window_value(
+                    &haystack,
+                    exact_window,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            expected,
         );
     }
 
