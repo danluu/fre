@@ -2060,11 +2060,111 @@ mod tests {
 
     const PATTERN: &str = r"(?:[A-Za-z_][A-Za-z0-9_]*::)+item";
 
-    fn object(target: Target, mode: CompileMode) -> Vec<u8> {
-        compile(CompileRequest::new(PATTERN, target).mode(mode))
-            .unwrap()
-            .object()
-            .to_vec()
+    fn module_and_object(target: Target, mode: CompileMode) -> (CompiledModule, Vec<u8>) {
+        let compiled = compile(CompileRequest::new(PATTERN, target).mode(mode)).unwrap();
+        (compiled.module().clone(), compiled.object().to_vec())
+    }
+
+    fn expected_elf_relocation_types(module: &CompiledModule) -> Vec<u32> {
+        let section = module
+            .relocations()
+            .first()
+            .expect("object fixture has relocations")
+            .section;
+        assert!(
+            module
+                .relocations()
+                .iter()
+                .all(|relocation| relocation.section == section),
+            "the compact parser below audits one relocation section"
+        );
+        let mut relocations = module.relocations().iter().collect::<Vec<_>>();
+        relocations.sort_by_key(|relocation| {
+            (
+                relocation.offset,
+                relocation.symbol,
+                relocation_kind_order(relocation.kind),
+                relocation.addend,
+            )
+        });
+        relocations
+            .into_iter()
+            .map(|relocation| match relocation.kind {
+                RelocationKind::X86PcRelative32 => ELF_R_X86_64_PC32,
+                RelocationKind::X86PltRelative32 => ELF_R_X86_64_PLT32,
+                RelocationKind::Aarch64Page21 => ELF_R_AARCH64_ADR_PREL_PG_HI21,
+                RelocationKind::Aarch64PageOff12 => ELF_R_AARCH64_ADD_ABS_LO12_NC,
+                RelocationKind::Aarch64Branch26 => ELF_R_AARCH64_JUMP26,
+            })
+            .collect()
+    }
+
+    fn expected_mach_relocation_types(module: &CompiledModule) -> Vec<u8> {
+        let section = module
+            .relocations()
+            .first()
+            .expect("object fixture has relocations")
+            .section;
+        assert!(
+            module
+                .relocations()
+                .iter()
+                .all(|relocation| relocation.section == section),
+            "the compact parser below audits one relocation section"
+        );
+        let mut records = Vec::new();
+        for relocation in module.relocations() {
+            let kind = match relocation.kind {
+                RelocationKind::X86PcRelative32 => MACH_X86_RELOC_SIGNED,
+                RelocationKind::X86PltRelative32 => MACH_X86_RELOC_BRANCH,
+                RelocationKind::Aarch64Page21 => MACH_ARM64_RELOC_PAGE21,
+                RelocationKind::Aarch64PageOff12 => MACH_ARM64_RELOC_PAGEOFF12,
+                RelocationKind::Aarch64Branch26 => MACH_ARM64_RELOC_BRANCH26,
+            };
+            if matches!(
+                relocation.kind,
+                RelocationKind::Aarch64Page21
+                    | RelocationKind::Aarch64PageOff12
+                    | RelocationKind::Aarch64Branch26
+            ) && relocation.addend != 0
+            {
+                records.push((relocation.offset, 0_u8, MACH_ARM64_RELOC_ADDEND));
+            }
+            records.push((relocation.offset, 1_u8, kind));
+        }
+        records.sort_by(|left, right| {
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| left.2.cmp(&right.2))
+        });
+        records.into_iter().map(|(_, _, kind)| kind).collect()
+    }
+
+    fn expected_mach_symbol_types(module: &CompiledModule) -> Vec<u8> {
+        let mut types = Vec::with_capacity(module.symbols().len());
+        for (binding, section) in [
+            (SymbolBinding::Local, true),
+            (SymbolBinding::Global, true),
+            (SymbolBinding::Global, false),
+        ] {
+            types.extend(module.symbols().iter().filter_map(|symbol| {
+                (symbol.binding == binding && symbol.section.is_some() == section).then_some(
+                    if section {
+                        MACH_N_SECT
+                            | if binding == SymbolBinding::Global {
+                                MACH_N_EXT
+                            } else {
+                                0
+                            }
+                    } else {
+                        MACH_N_UNDF | MACH_N_EXT
+                    },
+                )
+            }));
+        }
+        types
     }
 
     fn track_object_allocations<T>(operation: impl FnOnce() -> T) -> (T, ObjectAllocationStats) {
@@ -2162,7 +2262,12 @@ mod tests {
         core::str::from_utf8(&field[..end]).unwrap()
     }
 
-    fn validate_macho(bytes: &[u8], cpu: u32, relocation_types: &[u8], expected_symbols: usize) {
+    fn validate_macho(
+        bytes: &[u8],
+        cpu: u32,
+        relocation_types: &[u8],
+        expected_symbol_types: &[u8],
+    ) {
         assert_eq!(u32_at(bytes, 0), MACH_MAGIC_64);
         assert_eq!(u32_at(bytes, 4), cpu);
         assert_eq!(u32_at(bytes, 12), MACH_MH_OBJECT);
@@ -2205,87 +2310,71 @@ mod tests {
         let symbol_count = usize::try_from(u32_at(bytes, symtab + 12)).unwrap();
         let strings = usize::try_from(u32_at(bytes, symtab + 16)).unwrap();
         let string_size = usize::try_from(u32_at(bytes, symtab + 20)).unwrap();
-        assert_eq!(symbol_count, expected_symbols);
+        assert_eq!(symbol_count, expected_symbol_types.len());
         assert!(symbols + symbol_count * MACH_NLIST_BYTES <= strings);
         assert!(strings + string_size <= bytes.len());
-        assert_eq!(bytes[symbols + 4], MACH_N_SECT);
-        assert_eq!(
-            bytes[symbols + MACH_NLIST_BYTES + 4],
-            MACH_N_SECT | MACH_N_EXT
-        );
-        if expected_symbols == 4 {
-            assert_eq!(
-                bytes[symbols + 2 * MACH_NLIST_BYTES + 4],
-                MACH_N_SECT | MACH_N_EXT
-            );
-            assert_eq!(
-                bytes[symbols + 3 * MACH_NLIST_BYTES + 4],
-                MACH_N_UNDF | MACH_N_EXT
-            );
-        }
+        let actual_symbol_types = (0..symbol_count)
+            .map(|index| bytes[symbols + index * MACH_NLIST_BYTES + 4])
+            .collect::<Vec<_>>();
+        assert_eq!(actual_symbol_types, expected_symbol_types);
     }
 
     #[test]
     fn elf_headers_sections_symbols_and_relocations_are_self_consistent() {
-        validate_elf(
-            &object(Target::x86_64_linux(), CompileMode::Fast),
-            ELF_EM_X86_64,
-            &[ELF_R_X86_64_PC32, ELF_R_X86_64_PLT32],
-        );
-        validate_elf(
-            &object(Target::aarch64_linux(), CompileMode::Fast),
-            ELF_EM_AARCH64,
-            &[
-                ELF_R_AARCH64_ADR_PREL_PG_HI21,
-                ELF_R_AARCH64_ADD_ABS_LO12_NC,
-                ELF_R_AARCH64_JUMP26,
-            ],
-        );
-        validate_elf(
-            &object(Target::x86_64_linux(), CompileMode::Optimizing),
-            ELF_EM_X86_64,
-            &[ELF_R_X86_64_PC32],
-        );
-        validate_elf(
-            &object(Target::aarch64_linux(), CompileMode::Optimizing),
-            ELF_EM_AARCH64,
-            &[
-                ELF_R_AARCH64_ADR_PREL_PG_HI21,
-                ELF_R_AARCH64_ADD_ABS_LO12_NC,
-            ],
-        );
+        for (target, mode, machine) in [
+            (Target::x86_64_linux(), CompileMode::Fast, ELF_EM_X86_64),
+            (Target::aarch64_linux(), CompileMode::Fast, ELF_EM_AARCH64),
+            (
+                Target::x86_64_linux(),
+                CompileMode::Optimizing,
+                ELF_EM_X86_64,
+            ),
+            (
+                Target::aarch64_linux(),
+                CompileMode::Optimizing,
+                ELF_EM_AARCH64,
+            ),
+        ] {
+            let (module, object) = module_and_object(target, mode);
+            let relocation_types = expected_elf_relocation_types(&module);
+            validate_elf(&object, machine, &relocation_types);
+        }
     }
 
     #[test]
     fn macho_commands_sections_symbols_and_relocations_are_self_consistent() {
-        validate_macho(
-            &object(Target::x86_64_macos(), CompileMode::Fast),
-            MACH_CPU_TYPE_X86_64,
-            &[MACH_X86_RELOC_BRANCH, MACH_X86_RELOC_SIGNED],
-            4,
-        );
-        validate_macho(
-            &object(Target::aarch64_macos(), CompileMode::Fast),
-            MACH_CPU_TYPE_ARM64,
-            &[
-                MACH_ARM64_RELOC_BRANCH26,
-                MACH_ARM64_RELOC_PAGEOFF12,
-                MACH_ARM64_RELOC_PAGE21,
-            ],
-            4,
-        );
-        validate_macho(
-            &object(Target::x86_64_macos(), CompileMode::Optimizing),
-            MACH_CPU_TYPE_X86_64,
-            &[MACH_X86_RELOC_SIGNED],
-            2,
-        );
-        validate_macho(
-            &object(Target::aarch64_macos(), CompileMode::Optimizing),
-            MACH_CPU_TYPE_ARM64,
-            &[MACH_ARM64_RELOC_PAGEOFF12, MACH_ARM64_RELOC_PAGE21],
-            2,
-        );
+        for (target, mode, cpu) in [
+            (
+                Target::x86_64_macos(),
+                CompileMode::Fast,
+                MACH_CPU_TYPE_X86_64,
+            ),
+            (
+                Target::aarch64_macos(),
+                CompileMode::Fast,
+                MACH_CPU_TYPE_ARM64,
+            ),
+            (
+                Target::x86_64_macos(),
+                CompileMode::Optimizing,
+                MACH_CPU_TYPE_X86_64,
+            ),
+            (
+                Target::aarch64_macos(),
+                CompileMode::Optimizing,
+                MACH_CPU_TYPE_ARM64,
+            ),
+        ] {
+            let (module, object) = module_and_object(target, mode);
+            let relocation_types = expected_mach_relocation_types(&module);
+            let symbol_types = expected_mach_symbol_types(&module);
+            validate_macho(
+                &object,
+                cpu,
+                &relocation_types,
+                &symbol_types,
+            );
+        }
     }
 
     #[test]

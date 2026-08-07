@@ -1081,11 +1081,22 @@ fn context_native_and_context_fallback_receipts_name_the_actual_routes() {
 
     let mut limits = CompileLimitsV1::default();
     limits.determinize.max_work = 0;
-    let declined = compile(
+    // Refuse both the ordinary contextual attempt and the separately
+    // budgeted slow-context retry. The latter can now recover this graph into
+    // a self-contained native module, so constraining only the first attempt
+    // no longer constructs the runtime-fallback route this test audits.
+    let declined = compile_with_slow_aot_limits(
         CompileRequest::new(pattern, Target::x86_64_linux())
             .mode(CompileMode::Optimizing)
             .output(OutputContract::Span)
             .limits(limits),
+        SlowAotLimits {
+            determinize: crate::DeterminizeLimits {
+                max_work: 0,
+                ..crate::DeterminizeLimits::default()
+            },
+            ..SlowAotLimits::default()
+        },
     )
     .unwrap();
     assert_eq!(declined.receipt().engine, EngineKind::OrderedNfa);
@@ -1093,6 +1104,7 @@ fn context_native_and_context_fallback_receipts_name_the_actual_routes() {
         declined.receipt().engine_selection_reason,
         EngineSelectionReason::ContextAssertions
     );
+    assert!(declined.receipt().slow_context_aot.is_none());
     assert!(declined.receipt().runtime_helper_required);
     let decline = declined
         .receipt()
@@ -1207,7 +1219,13 @@ fn receipt_reports_actual_native_acceleration_and_data_extent() {
     )
     .unwrap();
 
-    assert_eq!(fast.receipt().start_accelerator, StartAccelerator::None);
+    // Fast mode retains the universal runtime route, but assertion-free
+    // ordered NFAs can also publish a graph-derived prepared dynamic-row
+    // entry. This fixture's dynamic root has the baseline x86 SSE2 scanner.
+    assert_eq!(
+        fast.receipt().start_accelerator,
+        StartAccelerator::X86Sse2
+    );
     assert_eq!(
         fast.receipt().anchored_prefix,
         optimized.receipt().anchored_prefix

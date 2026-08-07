@@ -19213,7 +19213,7 @@ mod tests {
         assert!(!revoked.has_dynamic_rows());
         assert_eq!(revoked.dynamic_rows_v3.ready_seal, 0);
 
-        // The active V3 seal is a revocable capability for setup-validated
+        // The active V4 seal is a revocable capability for setup-validated
         // write-once geometry. Revocation changes only the two seals; every
         // field consumed by the compact native loop remains immutable and no
         // public operation can reactivate this allocation.
@@ -19226,8 +19226,8 @@ mod tests {
         let mut revoked_tail = published_tail;
         revoked_tail.ready_seal = 0;
         assert_eq!(header.dynamic_rows_v3, revoked_tail);
-        assert_eq!(header.v1.flags, FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3);
-        assert_eq!(header.v1.header_bytes, FROZEN_PREPARED_HEADER_V3_BYTES);
+        assert_eq!(header.v1.flags, FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V4);
+        assert_eq!(header.v1.header_bytes, FROZEN_PREPARED_HEADER_V4_BYTES);
         assert_eq!(header.v1.artifact_identity, compiled.identity.artifact);
         assert_eq!(header.v1.forward_rows_address, rows_address);
         assert_eq!(header.v1.forward_live_cells, storage.rows.len());

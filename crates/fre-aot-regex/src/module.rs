@@ -26497,10 +26497,14 @@ mod tests {
                 !variable_direct
             );
             assert_eq!(
-                variable_module.required_runtime_symbol().is_some(),
+                variable_module.prepared_entry_symbol().is_some(),
                 !variable_direct
+                    && variable_span
+                        .program()
+                        .native_dynamic_rows_view()
+                        .is_some(),
+                "{target:?}/variable Span dynamic fallback publication"
             );
-            assert!(variable_module.prepared_entry_symbol().is_none());
 
             for output in [
                 OutputContract::Exists,
@@ -26550,10 +26554,32 @@ mod tests {
                         StartAccelerator::None | StartAccelerator::Scalar
                     ));
                 } else if compiled.program().native_dynamic_rows_view().is_some() {
+                    let expected = match target.architecture {
+                        Architecture::X86_64 => match x86_start_filter_kind(target.features) {
+                            X86StartFilterKind::Sse2 => StartAccelerator::X86Sse2,
+                            X86StartFilterKind::Avx2 => StartAccelerator::X86Avx2,
+                            X86StartFilterKind::Avx512Bw => StartAccelerator::X86Avx512Bw,
+                        },
+                        Architecture::Aarch64
+                            if target.operating_system == OperatingSystem::Linux
+                                && target.features.has(CpuFeature::Aarch64Sve) =>
+                        {
+                            // This contiguous root range uses base-SVE
+                            // comparisons even on an SVE2 target. Sparse
+                            // exact roots exercise SVE2 MATCH elsewhere.
+                            StartAccelerator::Aarch64Sve
+                        }
+                        Architecture::Aarch64
+                            if target.features.has(CpuFeature::Aarch64Asimd) =>
+                        {
+                            StartAccelerator::Aarch64Asimd
+                        }
+                        Architecture::Aarch64 => StartAccelerator::Scalar,
+                    };
                     assert_eq!(
                         module.start_accelerator(),
-                        StartAccelerator::Scalar,
-                        "{target:?}/{output:?} dynamic root must receipt its scalar scanner"
+                        expected,
+                        "{target:?}/{output:?} dynamic root scanner receipt"
                     );
                 } else {
                     assert_eq!(module.start_accelerator(), StartAccelerator::None);
@@ -29435,7 +29461,7 @@ mod tests {
                     .collect::<Vec<_>>();
                 for (instruction, expected, detail) in [
                     (aarch64_store_x(31, 31, 80).unwrap(), 1, "pending initialization"),
-                    (aarch64_store_x(2, 31, 80).unwrap(), 11, "pending update"),
+                    (aarch64_store_x(2, 31, 80).unwrap(), 12, "pending update"),
                     (aarch64_load_x_imm(7, 31, 80).unwrap(), 1, "pending completion"),
                 ] {
                     assert_eq!(
@@ -37464,7 +37490,11 @@ int main(void) {{
                     let branch_bytes = match code.get(branch..) {
                         Some([0x74, _, ..]) => 2,
                         Some([0x0f, 0x84, _, _, _, _, ..]) => 6,
-                        _ => panic!("{context}: V1/V2 zero branch changed"),
+                        _ => panic!(
+                            "{context}: V1/V2 zero branch changed at {branch:#x}: {:02x?}",
+                            code.get(branch.saturating_sub(24)..branch.saturating_add(24))
+                                .unwrap_or_default()
+                        ),
                     };
                     branch + branch_bytes
                 })
@@ -40298,7 +40328,12 @@ int main(void) {{
                 identity
             );
 
-            assert_eq!(module.symbols().len(), 4);
+            // The runtime adapter ABI owns the first four deterministic
+            // symbols. A general ordered-NFA module may additionally publish
+            // a prepared dynamic-row entry and its private/runtime helpers;
+            // those route-specific symbols must not invalidate the alias
+            // contract being audited here.
+            assert!(module.symbols().len() > RUNTIME_PROGRAM_SYMBOL);
             let semantic = &module.symbols()[PROGRAM_SYMBOL];
             assert_eq!(semantic.binding, SymbolBinding::Local);
             assert_eq!(semantic.kind, SymbolKind::Object);
@@ -40326,7 +40361,28 @@ int main(void) {{
             assert_eq!(alias.offset, 0);
             assert_eq!(usize::try_from(alias.size).unwrap(), serialized.len());
             assert_eq!(alias_size, serialized.len());
-            assert_eq!(module.sections()[PROGRAM_SECTION].bytes(), serialized);
+            let program_data = module.sections()[PROGRAM_SECTION].bytes();
+            assert_eq!(
+                program_data.get(..serialized.len()),
+                Some(serialized.as_slice())
+            );
+            if module.prepared_entry_symbol().is_some() {
+                let identity = module
+                    .symbols()
+                    .iter()
+                    .find(|symbol| symbol.name == ".Lfre_aot_regex_partial_identity_v1")
+                    .expect("prepared route identity symbol");
+                assert_eq!(identity.section, Some(PROGRAM_SECTION));
+                assert_eq!(identity.size, 32);
+                let start = usize::try_from(identity.offset).unwrap();
+                let end = start.checked_add(32).unwrap();
+                assert_eq!(
+                    program_data.get(start..end),
+                    Some(compiled.program().artifact_identity().as_slice())
+                );
+            } else {
+                assert_eq!(program_data, serialized);
+            }
 
             assert!(
                 module
