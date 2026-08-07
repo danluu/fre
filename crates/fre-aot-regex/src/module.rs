@@ -41111,6 +41111,11 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 aarch64_load_byte_reg(8, 14, 8).unwrap(),
                 aarch64_load_h_uxtw(8, 11, 8).unwrap(),
             ];
+            let indexed_mapped_body = [
+                aarch64_load_byte_reg(8, 0, 2).unwrap(),
+                aarch64_load_byte_reg(8, 14, 8).unwrap(),
+                aarch64_load_h_uxtw(8, 11, 8).unwrap(),
+            ];
             let direct_v9_body = [raw_load, aarch64_load_h_uxtw(8, 11, 8).unwrap()];
             let v8_raw_load = if root.is_some() {
                 aarch64_load_byte_reg(6, 0, 2).unwrap()
@@ -41141,8 +41146,13 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 );
                 assert_eq!(
                     word_occurrences(&words, &mapped_body),
-                    2,
-                    "AArch64 {context}: mapped V7 and V4 bodies"
+                    if root.is_some() { 2 } else { 1 },
+                    "AArch64 {context}: mapped V4 plus indexed V7 when the cursor representation agrees"
+                );
+                assert_eq!(
+                    word_occurrences(&words, &indexed_mapped_body),
+                    if root.is_some() { 2 } else { 1 },
+                    "AArch64 {context}: V7 retains its offset cursor while rooted V4 shares that representation"
                 );
                 assert_eq!(
                     word_occurrences(&words, &arm_v8_flag),
