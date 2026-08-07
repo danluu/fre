@@ -13,7 +13,7 @@ use core::fmt::Write as _;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    CompileError, ObjectError,
+    CompileError, DeterminizationReport, DeterminizeLimits, DfaStats, ObjectError,
     bounded_suffix_retry::{
         BoundedSuffixRetryPlan, select_bounded_interior_retry, select_bounded_suffix_retry,
     },
@@ -38,6 +38,52 @@ use crate::{
         build_seeded_reverse_exact,
     },
 };
+
+/// Checked resources for the explicitly selected slow target-neutral AOT
+/// completion pass.
+///
+/// These limits are independent of the earlier semantic-program build so an
+/// application may start with a small or zero DFA budget and later request a
+/// larger complete native graph. The stable replay ceilings still clamp the
+/// numeric determinization dimensions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SlowAotLimits {
+    pub determinize: DeterminizeLimits,
+    pub max_allocation_bytes: usize,
+    /// Complete native read-only data, including DFA cells and every
+    /// auxiliary or target-specific sidecar installed by lowering.
+    pub max_native_data_bytes: usize,
+}
+
+impl Default for SlowAotLimits {
+    fn default() -> Self {
+        Self {
+            determinize: DeterminizeLimits {
+                max_states: 1_048_576,
+                max_transitions: 33_554_432,
+                max_work: crate::MAX_STABLE_DFA_BUILD_WORK,
+            },
+            max_allocation_bytes: 256 * 1024 * 1024,
+            max_native_data_bytes: 256 * 1024 * 1024,
+        }
+    }
+}
+
+/// Provenance for a slow DFA selected into a native module.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SlowAotReport {
+    /// Limits requested at the optimizing compiler API boundary.
+    pub requested_limits: SlowAotLimits,
+    /// Native-data ceiling after any enclosing object-size limit clamps it.
+    pub effective_native_data_limit_bytes: usize,
+    pub determinization: DeterminizationReport,
+    pub dfa: DfaStats,
+    /// Peak conservative logical allocation charged by determinization.
+    pub allocation_bytes: usize,
+    /// Complete read-only native DFA payload, including all installed
+    /// auxiliary scanner and target-specific sidecar tables.
+    pub native_data_bytes: usize,
+}
 
 #[path = "module_context.rs"]
 mod module_context;
@@ -717,6 +763,7 @@ pub struct CompiledModule {
     runtime_program_symbol_index: Option<usize>,
     start_accelerator: StartAccelerator,
     anchored_prefix_filter_bytes: u8,
+    slow_aot_report: Option<SlowAotReport>,
 }
 
 const TEXT_SECTION: usize = 0;
@@ -845,58 +892,179 @@ impl CompiledModule {
     /// Returns a typed compiler error if serialization fails, the target is
     /// incoherent, or section/symbol dimensions overflow their representation.
     pub fn lower(program: &CompiledProgram, target: Target) -> Result<Self, CompileError> {
-        Self::lower_with_k0_materialization(program, target, false)
+        Self::lower_without_slow_optimization(program, target, false, usize::MAX)
     }
 
     /// Lower with the slower optimizing fallback compiler enabled.
     ///
     /// In addition to every route considered by [`Self::lower`], this may
-    /// complete an assertion-free resource fallback's bounded K0 state graph
-    /// at compile time and lower the authenticated result as a runtime-free
-    /// native DFA. This can take substantially longer than ordinary lowering.
+    /// re-run general ordered determinization under the stable compiler
+    /// ceiling, or complete an assertion-free resource fallback's bounded K0
+    /// state graph when determinization still declines, and lower the result
+    /// as a runtime-free native DFA. This can take substantially longer than
+    /// ordinary lowering.
     /// Callers re-lowering a restored or otherwise untrusted program must opt
     /// in explicitly; a serialized optimizer marker never authorizes this
     /// work by itself.
     ///
     /// # Errors
     ///
-    /// Returns the same typed failures as [`Self::lower`]. Optional K0
-    /// materialization failures preserve the ordinary module route.
+    /// Returns the same typed failures as [`Self::lower`]. Optional slow
+    /// determinization and K0 materialization declines preserve the ordinary
+    /// module route.
     pub fn lower_optimizing(
         program: &CompiledProgram,
         target: Target,
     ) -> Result<Self, CompileError> {
-        Self::lower_with_k0_materialization(program, target, true)
+        Self::lower_optimizing_with_limits(program, target, SlowAotLimits::default())
     }
 
-    fn lower_with_k0_materialization(
+    /// Lower with explicit hard limits for the slow assertion-free DFA pass.
+    ///
+    /// Numeric or allocation exhaustion declines only this optional candidate;
+    /// bounded K0 materialization and every established fallback remain
+    /// available in the same transaction.
+    pub fn lower_optimizing_with_limits(
+        program: &CompiledProgram,
+        target: Target,
+        limits: SlowAotLimits,
+    ) -> Result<Self, CompileError> {
+        Self::lower_optimizing_with_limits_and_native_data_limit(
+            program,
+            target,
+            limits,
+            limits.max_native_data_bytes,
+        )
+    }
+
+    pub(crate) fn lower_optimizing_with_limits_and_native_data_limit(
+        program: &CompiledProgram,
+        target: Target,
+        requested_limits: SlowAotLimits,
+        effective_native_data_limit_bytes: usize,
+    ) -> Result<Self, CompileError> {
+        target.validate()?;
+        let effective_native_data_limit_bytes = effective_native_data_limit_bytes
+            .min(requested_limits.max_native_data_bytes);
+        let program_bytes = program.serialize()?;
+        let ordinary_native = program.native_dfa_view();
+        let exact_product = program.native_exact_product_view();
+        let semantic_native = match program.engine_kind() {
+            crate::EngineKind::OrderedDfa => ordinary_native,
+            crate::EngineKind::OrderedNfa => exact_product,
+            crate::EngineKind::OrderedContextDfa => None,
+        };
+        if semantic_native.is_some() {
+            return Self::lower_serialized(
+                program_bytes,
+                semantic_native,
+                false,
+                program.native_context_program_view(),
+                program.native_partial_dfa_view(),
+                program.native_dynamic_rows_view(),
+                target,
+            )
+            .map_err(CompileError::from);
+        }
+
+        let slow_determinized = program.native_slow_determinized_program(
+            requested_limits.determinize,
+            requested_limits.max_allocation_bytes,
+        )?;
+        let mut slow_aot_report = None;
+        let mut optional_lowering = if let Some(candidate) = slow_determinized.as_ref() {
+            let view = program.native_slow_determinized_view(candidate);
+            match lower_optional_native_dfa_with_data_limit(
+                view,
+                target,
+                effective_native_data_limit_bytes,
+            ) {
+                Ok(Some(lowering)) => {
+                    slow_aot_report = Some(SlowAotReport {
+                        requested_limits,
+                        effective_native_data_limit_bytes,
+                        determinization: candidate.report().clone(),
+                        dfa: candidate.stats(),
+                        allocation_bytes: candidate.allocation_bytes(),
+                        native_data_bytes: lowering.data.len(),
+                    });
+                    Some(lowering)
+                }
+                Ok(None) => None,
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            None
+        };
+        if optional_lowering.is_none() {
+            if let Some(materialized) = program.native_fully_prefilled_program() {
+                let view = program.native_fully_prefilled_view(&materialized);
+                optional_lowering = lower_optional_native_dfa_with_data_limit(
+                    view,
+                    target,
+                    effective_native_data_limit_bytes,
+                )?;
+            }
+        }
+        Self::lower_serialized_with_prelowered(
+            program_bytes,
+            optional_lowering,
+            slow_aot_report,
+            ordinary_native,
+            program.native_context_program_view(),
+            program.native_partial_dfa_view(),
+            program.native_dynamic_rows_view(),
+            target,
+        )
+        .map_err(CompileError::from)
+    }
+
+    pub(crate) fn lower_k0_optimizing_with_data_limit(
+        program: &CompiledProgram,
+        target: Target,
+        max_native_data_bytes: usize,
+    ) -> Result<Self, CompileError> {
+        Self::lower_without_slow_optimization(
+            program,
+            target,
+            true,
+            max_native_data_bytes,
+        )
+    }
+
+    fn lower_without_slow_optimization(
         program: &CompiledProgram,
         target: Target,
         materialize_k0: bool,
+        max_native_data_bytes: usize,
     ) -> Result<Self, CompileError> {
         target.validate()?;
         let program_bytes = program.serialize()?;
-        let direct_native = program
+        let native = program
             .native_dfa_view()
             .or_else(|| program.native_exact_product_view());
-        let materialized_native = (materialize_k0 && direct_native.is_none())
+        let materialized = materialize_k0
             .then(|| program.native_fully_prefilled_program())
             .flatten();
-        let native = direct_native.or_else(|| {
-            materialized_native
-                .as_ref()
-                .map(|materialized| program.native_fully_prefilled_view(materialized))
-        });
-        let native_context = program.native_context_program_view();
-        let native_partial = program.native_partial_dfa_view();
-        let native_dynamic_rows = program.native_dynamic_rows_view();
-        Self::lower_serialized(
+        let optional_lowering = materialized
+            .as_ref()
+            .map(|materialized| {
+                lower_optional_native_dfa_with_data_limit(
+                    program.native_fully_prefilled_view(materialized),
+                    target,
+                    max_native_data_bytes,
+                )
+            })
+            .transpose()?
+            .flatten();
+        Self::lower_serialized_with_prelowered(
             program_bytes,
+            optional_lowering,
+            None,
             native,
-            materialized_native.is_some(),
-            native_context,
-            native_partial,
-            native_dynamic_rows,
+            program.native_context_program_view(),
+            program.native_partial_dfa_view(),
+            program.native_dynamic_rows_view(),
             target,
         )
         .map_err(CompileError::from)
@@ -909,7 +1077,42 @@ impl CompiledModule {
     fn lower_serialized(
         program_bytes: Vec<u8>,
         native: Option<NativeProgramView<'_>>,
-        native_materialized_from_k0: bool,
+        native_materialized_fallback: bool,
+        native_context: Option<NativeContextProgramView<'_>>,
+        native_partial: Option<NativePartialProgramView<'_>>,
+        native_dynamic_rows: Option<NativeDynamicRowsProgramView>,
+        target: Target,
+    ) -> Result<Self, ObjectError> {
+        let prelowered = if native_materialized_fallback {
+            native
+                .map(|view| lower_native_dfa(view, target).unwrap_or(None))
+                .flatten()
+        } else {
+            None
+        };
+        let native = (!native_materialized_fallback).then_some(native).flatten();
+        Self::lower_serialized_with_prelowered(
+            program_bytes,
+            prelowered,
+            None,
+            native,
+            native_context,
+            native_partial,
+            native_dynamic_rows,
+            target,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "native/runtime section, symbol, relocation, and identity construction is one transaction"
+    )]
+    fn lower_serialized_with_prelowered(
+        program_bytes: Vec<u8>,
+        prelowered: Option<NativeLowering>,
+        slow_aot_report: Option<SlowAotReport>,
+        native: Option<NativeProgramView<'_>>,
         native_context: Option<NativeContextProgramView<'_>>,
         native_partial: Option<NativePartialProgramView<'_>>,
         native_dynamic_rows: Option<NativeDynamicRowsProgramView>,
@@ -918,58 +1121,14 @@ impl CompiledModule {
         let serialized_program_size = program_bytes.len();
         let program_digest = Sha256::digest(&program_bytes);
         let program_name = identity_symbol(PROGRAM_SYMBOL_PREFIX, program_digest.as_slice())?;
-        let (lowering, native_digest, prepared_layout) = if let Some(view) = native {
-            // K0 materialization is an optional, compiler-private analysis.
-            // A target table/code resource failure (including allocator
-            // pressure) must preserve the exact previously selected prepared
-            // or runtime module instead of turning a valid regex into a
-            // compilation failure. Direct serialized DFA errors remain hard
-            // failures because those rows are the program's semantic engine.
-            let native_lowering = if native_materialized_from_k0 {
-                lower_native_dfa(view, target).unwrap_or(None)
-            } else {
-                lower_native_dfa(view, target)?
-            };
+        let (lowering, native_digest, prepared_layout) = if let Some(lowering) = prelowered {
+            let native_digest = native_module_digest(&program_bytes, target, &lowering)?;
+            (lowering, native_digest, None)
+        } else if let Some(view) = native {
+            let native_lowering = lower_native_dfa(view, target)?;
             if let Some(lowering) = native_lowering {
                 let native_digest = native_module_digest(&program_bytes, target, &lowering)?;
                 (lowering, native_digest, None)
-            } else if native_materialized_from_k0 {
-                if let Some(view) = native_partial {
-                    if let Some((lowering, prepared_layout)) =
-                        lower_native_partial_prepared(program_bytes.clone(), &view, target)?
-                    {
-                        let native_digest =
-                            native_module_digest(&lowering.data, target, &lowering)?;
-                        (lowering, native_digest, Some(prepared_layout))
-                    } else if let Some(dynamic) = native_dynamic_rows {
-                        let (lowering, prepared_layout) = lower_native_dynamic_rows_prepared(
-                            program_bytes.clone(),
-                            dynamic,
-                            target,
-                        )?;
-                        let native_digest =
-                            native_module_digest(&lowering.data, target, &lowering)?;
-                        (lowering, native_digest, Some(prepared_layout))
-                    } else {
-                        let lowering =
-                            lower_runtime_adapter(program_bytes, target.architecture)?;
-                        let native_digest =
-                            native_module_digest(&lowering.data, target, &lowering)?;
-                        (lowering, native_digest, None)
-                    }
-                } else if let Some(dynamic) = native_dynamic_rows {
-                    let (lowering, prepared_layout) = lower_native_dynamic_rows_prepared(
-                        program_bytes.clone(),
-                        dynamic,
-                        target,
-                    )?;
-                    let native_digest = native_module_digest(&lowering.data, target, &lowering)?;
-                    (lowering, native_digest, Some(prepared_layout))
-                } else {
-                    let lowering = lower_runtime_adapter(program_bytes, target.architecture)?;
-                    let native_digest = native_module_digest(&lowering.data, target, &lowering)?;
-                    (lowering, native_digest, None)
-                }
             } else if let Some(dynamic) = native_dynamic_rows {
                 let (lowering, prepared_layout) =
                     lower_native_dynamic_rows_prepared(program_bytes.clone(), dynamic, target)?;
@@ -1252,6 +1411,7 @@ impl CompiledModule {
             runtime_program_symbol_index,
             start_accelerator: lowering.start_accelerator,
             anchored_prefix_filter_bytes: lowering.anchored_prefix_filter_bytes,
+            slow_aot_report,
         })
     }
 
@@ -1259,6 +1419,14 @@ impl CompiledModule {
     #[must_use]
     pub const fn target(&self) -> Target {
         self.target
+    }
+
+    /// Return provenance for a slow complete DFA actually selected into this
+    /// module. A declined slow attempt or a later K0/prepared fallback returns
+    /// `None`.
+    #[must_use]
+    pub const fn slow_aot_report(&self) -> Option<&SlowAotReport> {
+        self.slow_aot_report.as_ref()
     }
 
     /// Return all sections in deterministic object order.
@@ -3146,7 +3314,44 @@ fn lower_native_dfa(
     view: NativeProgramView<'_>,
     target: Target,
 ) -> Result<Option<NativeLowering>, ObjectError> {
-    lower_native_dfa_with_entry_contract(view, target, NativeDfaEntryContract::Public)
+    lower_native_dfa_with_entry_contract_and_data_limit(
+        view,
+        target,
+        NativeDfaEntryContract::Public,
+        usize::MAX,
+    )
+}
+
+fn lower_native_dfa_with_data_limit(
+    view: NativeProgramView<'_>,
+    target: Target,
+    max_native_data_bytes: usize,
+) -> Result<Option<NativeLowering>, ObjectError> {
+    lower_native_dfa_with_entry_contract_and_data_limit(
+        view,
+        target,
+        NativeDfaEntryContract::Public,
+        max_native_data_bytes,
+    )
+}
+
+/// Lower an optional optimizing candidate without hiding compiler defects.
+/// A caller-supplied native-data ceiling and fallible allocation are legitimate
+/// candidate declines; malformed layouts, arithmetic overflow, unsupported
+/// targets, and every other object error remain hard failures.
+fn lower_optional_native_dfa_with_data_limit(
+    view: NativeProgramView<'_>,
+    target: Target,
+    max_native_data_bytes: usize,
+) -> Result<Option<NativeLowering>, ObjectError> {
+    match lower_native_dfa_with_data_limit(view, target, max_native_data_bytes) {
+        Ok(lowering) => Ok(lowering),
+        Err(ObjectError::Allocation(_) | ObjectError::Resource {
+            resource: crate::CompileResource::ProgramBytes,
+            ..
+        }) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn lower_native_dfa_with_entry_contract(
@@ -3154,13 +3359,31 @@ fn lower_native_dfa_with_entry_contract(
     target: Target,
     entry_contract: NativeDfaEntryContract,
 ) -> Result<Option<NativeLowering>, ObjectError> {
+    lower_native_dfa_with_entry_contract_and_data_limit(
+        view,
+        target,
+        entry_contract,
+        usize::MAX,
+    )
+}
+
+fn lower_native_dfa_with_entry_contract_and_data_limit(
+    view: NativeProgramView<'_>,
+    target: Target,
+    entry_contract: NativeDfaEntryContract,
+    max_native_data_bytes: usize,
+) -> Result<Option<NativeLowering>, ObjectError> {
+    let maximum_native_data_bytes = usize::try_from(CELL_NEXT_MASK)
+        .map_err(|_| ObjectError::ArithmeticOverflow("native table address limit"))?
+        .min(max_native_data_bytes);
     let vector_cost_model = native_vector_filter_cost_model_for_target(target, true);
     let relation_vector_owns_route = direct_relation_vector_owns_route(target);
-    let (mut data, mut layout) = build_native_dfa_table_with_cost_model(
+    let (mut data, mut layout) = build_native_dfa_table_with_cost_model_and_data_limit(
         view,
         target.architecture,
         vector_cost_model,
         relation_vector_owns_route,
+        maximum_native_data_bytes,
     )?;
     // An optional exact-set allocation may decline transactionally. A
     // mandatory retained program must never reach a backend with the
@@ -3168,9 +3391,31 @@ fn lower_native_dfa_with_entry_contract(
     if view.retained_prefix_requirement.is_some() && !layout.has_start_scanner() {
         return Ok(None);
     }
-    let sve_filter_plan = install_aarch64_sve_filter_plan(&mut data, layout, target)?;
-    let sve_suffix_kind = install_aarch64_sve_suffix_kind(&mut data, layout, target)?;
-    install_aarch64_sve_loop_storage(&mut data, &mut layout, target)?;
+    let sve_filter_plan = install_aarch64_sve_filter_plan_with_limit(
+        &mut data,
+        layout,
+        target,
+        maximum_native_data_bytes,
+    )?;
+    let sve_suffix_kind = install_aarch64_sve_suffix_kind_with_limit(
+        &mut data,
+        layout,
+        target,
+        maximum_native_data_bytes,
+    )?;
+    install_aarch64_sve_loop_storage_with_limit(
+        &mut data,
+        &mut layout,
+        target,
+        maximum_native_data_bytes,
+    )?;
+    if data.len() > maximum_native_data_bytes {
+        return Err(ObjectError::Resource {
+            resource: crate::CompileResource::ProgramBytes,
+            limit: maximum_native_data_bytes,
+            required: data.len(),
+        });
+    }
     if entry_contract == NativeDfaEntryContract::PreparedPartialCore && layout.partial.is_none() {
         return Err(ObjectError::InvalidModule(
             "trusted prepared core has no partial continuation layout",
@@ -3926,16 +4171,6 @@ fn selected_aarch64_sve_loop_kind(
     }
 }
 
-fn install_aarch64_sve_suffix_kind(
-    data: &mut Vec<u8>,
-    layout: NativeDfaLayout,
-    target: Target,
-) -> Result<Option<Aarch64SveFilterKind>, ObjectError> {
-    let maximum_table_bytes = usize::try_from(i32::MAX)
-        .map_err(|_| ObjectError::ArithmeticOverflow("SVE2 suffix table address limit"))?;
-    install_aarch64_sve_suffix_kind_with_limit(data, layout, target, maximum_table_bytes)
-}
-
 fn install_aarch64_sve_suffix_kind_with_limit(
     data: &mut Vec<u8>,
     layout: NativeDfaLayout,
@@ -4005,10 +4240,22 @@ fn install_aarch64_sve_suffix_kind_with_limit(
 /// with immediate DUP constants in caller-saved Z24..Z27. Allocation and
 /// address pressure are therefore failure-atomic and retain that exact base
 /// lowering.
+#[cfg(test)]
 fn install_aarch64_sve_loop_storage(
     data: &mut Vec<u8>,
     layout: &mut NativeDfaLayout,
     target: Target,
+) -> Result<(), ObjectError> {
+    let maximum_table_bytes = usize::try_from(i32::MAX)
+        .map_err(|_| ObjectError::ArithmeticOverflow("SVE2 loop-skip address limit"))?;
+    install_aarch64_sve_loop_storage_with_limit(data, layout, target, maximum_table_bytes)
+}
+
+fn install_aarch64_sve_loop_storage_with_limit(
+    data: &mut Vec<u8>,
+    layout: &mut NativeDfaLayout,
+    target: Target,
+    maximum_table_bytes: usize,
 ) -> Result<(), ObjectError> {
     if target.architecture != Architecture::Aarch64
         || target.operating_system != OperatingSystem::Linux
@@ -4051,8 +4298,6 @@ fn install_aarch64_sve_loop_storage(
         .ok_or(ObjectError::ArithmeticOverflow(
             "SVE2 loop-skip table bytes",
         ))?;
-    let maximum_table_bytes = usize::try_from(i32::MAX)
-        .map_err(|_| ObjectError::ArithmeticOverflow("SVE2 loop-skip address limit"))?;
     if total > maximum_table_bytes {
         return Ok(());
     }
@@ -4075,6 +4320,7 @@ fn install_aarch64_sve_loop_storage(
     Ok(())
 }
 
+#[cfg(test)]
 fn install_aarch64_sve_filter_plan(
     data: &mut Vec<u8>,
     layout: NativeDfaLayout,
@@ -4231,11 +4477,33 @@ fn build_native_dfa_table_for_architecture(
     clippy::too_many_lines,
     reason = "checked table layout and fixed power-of-two alignment stay contiguous for auditability"
 )]
+#[cfg(test)]
 fn build_native_dfa_table_with_cost_model(
     view: NativeProgramView<'_>,
     architecture: Architecture,
     vector_cost_model: NativeVectorFilterCostModel,
     relation_vector_owns_route: bool,
+) -> Result<(Vec<u8>, NativeDfaLayout), ObjectError> {
+    build_native_dfa_table_with_cost_model_and_data_limit(
+        view,
+        architecture,
+        vector_cost_model,
+        relation_vector_owns_route,
+        usize::MAX,
+    )
+}
+
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::too_many_lines,
+    reason = "checked table layout and fixed power-of-two alignment stay contiguous for auditability"
+)]
+fn build_native_dfa_table_with_cost_model_and_data_limit(
+    view: NativeProgramView<'_>,
+    architecture: Architecture,
+    vector_cost_model: NativeVectorFilterCostModel,
+    relation_vector_owns_route: bool,
+    max_native_data_bytes: usize,
 ) -> Result<(Vec<u8>, NativeDfaLayout), ObjectError> {
     let dfa = view.dfa;
     if dfa.initial_state != 0 || dfa.class_count == 0 || dfa.class_count > 256 {
@@ -4666,8 +4934,9 @@ fn build_native_dfa_table_with_cost_model(
             })
         })
         .ok_or(ObjectError::ArithmeticOverflow("native DFA data bytes"))?;
-    let maximum_table_bytes = usize::try_from(CELL_NEXT_MASK)
-        .map_err(|_| ObjectError::ArithmeticOverflow("native table address limit"))?;
+    let maximum_native_data_bytes = usize::try_from(CELL_NEXT_MASK)
+        .map_err(|_| ObjectError::ArithmeticOverflow("native table address limit"))?
+        .min(max_native_data_bytes);
     let seeded_sidecar_alignment = core::mem::align_of::<u32>();
     let seeded_sidecar_start = auxiliary_total
         .checked_add(seeded_sidecar_alignment - 1)
@@ -4678,7 +4947,7 @@ fn build_native_dfa_table_with_cost_model(
     let seeded_sidecar_padding = seeded_sidecar_start.checked_sub(auxiliary_total).ok_or(
         ObjectError::ArithmeticOverflow("native seeded reverse padding"),
     )?;
-    let remaining_sidecar_bytes = maximum_table_bytes
+    let remaining_sidecar_bytes = maximum_native_data_bytes
         .checked_sub(auxiliary_total)
         .and_then(|remaining| remaining.checked_sub(seeded_sidecar_padding))
         .and_then(|remaining| remaining.checked_sub(CLASS_MAP_BYTES))
@@ -4737,7 +5006,7 @@ fn build_native_dfa_table_with_cost_model(
             .checked_mul(core::mem::size_of::<u32>())
             .and_then(|bytes| bytes.checked_add(CLASS_MAP_BYTES))
             .and_then(|bytes| bytes.checked_add(seeded_sidecar_padding))
-            .is_none_or(|bytes| bytes > maximum_table_bytes.saturating_sub(auxiliary_total))
+            .is_none_or(|bytes| bytes > maximum_native_data_bytes.saturating_sub(auxiliary_total))
     }) {
         // Optional analysis must never turn an otherwise valid native module
         // into a table-address failure.
@@ -4795,10 +5064,10 @@ fn build_native_dfa_table_with_cost_model(
     // Two high cell bits are reserved for acceptance and accelerator dispatch.
     // Keeping the complete compact table below 1 GiB makes every absolute
     // next-row token fit the remaining low bits on both native backends.
-    if total > maximum_table_bytes {
+    if total > maximum_native_data_bytes {
         return Err(ObjectError::Resource {
             resource: crate::CompileResource::ProgramBytes,
-            limit: maximum_table_bytes,
+            limit: maximum_native_data_bytes,
             required: total,
         });
     }
@@ -4814,9 +5083,9 @@ fn build_native_dfa_table_with_cost_model(
             total = auxiliary_total;
             bytes
                 .try_reserve_exact(total)
-                .map_err(|_| ObjectError::InvalidModule("native DFA allocation failed"))?;
+                .map_err(|_| ObjectError::Allocation("native DFA table"))?;
         } else {
-            return Err(ObjectError::InvalidModule("native DFA allocation failed"));
+            return Err(ObjectError::Allocation("native DFA table"));
         }
     }
     if transitions == TransitionLayout::ClassMapped {
@@ -5012,12 +5281,12 @@ fn build_native_dfa_table_with_cost_model(
         ));
     }
     let prefix_block = prefix_block_plan
-        .map(|plan| append_native_prefix_block(&mut bytes, plan, maximum_table_bytes))
+        .map(|plan| append_native_prefix_block(&mut bytes, plan, maximum_native_data_bytes))
         .transpose()?
         .flatten();
     let exact_start_storage = requested_exact_start_byte_set
         .map(|set| {
-            append_native_exact_byte_set(&mut bytes, set, architecture, maximum_table_bytes)
+            append_native_exact_byte_set(&mut bytes, set, architecture, maximum_native_data_bytes)
         })
         .transpose()?
         .flatten();
@@ -5064,7 +5333,7 @@ fn derive_native_prefix_plan(
     if enabled {
         inputs
             .try_reserve_exact(sets.len())
-            .map_err(|_| ObjectError::InvalidModule("native prefix-plan allocation failed"))?;
+            .map_err(|_| ObjectError::Allocation("native prefix plan"))?;
         for (position, set) in sets.iter().copied().enumerate() {
             if (relation_covers_first_two && position < 2)
                 || Some(position) == filtered_position
@@ -5796,7 +6065,7 @@ fn derive_retained_terminal_suffix_filter(
     let mut forward_sets = Vec::new();
     forward_sets
         .try_reserve_exact(suffix_sets.len())
-        .map_err(|_| ObjectError::InvalidModule("native retained suffix allocation failed"))?;
+        .map_err(|_| ObjectError::Allocation("native retained suffix"))?;
     forward_sets.extend(suffix_sets.iter().rev().copied());
     let mut vector_filter = derive_vector_filter(Some(filter), &forward_sets)?;
     if let Some(columns) = &mut vector_filter {
@@ -5869,7 +6138,7 @@ fn derive_terminal_suffix_filter(
     let mut forward_sets = Vec::new();
     forward_sets
         .try_reserve_exact(suffix_sets.len())
-        .map_err(|_| ObjectError::InvalidModule("native suffix-filter allocation failed"))?;
+        .map_err(|_| ObjectError::Allocation("native suffix filter"))?;
     forward_sets.extend(suffix_sets.iter().rev().copied());
     let Some((filter, vector_filter, scalar_filter)) =
         derive_aligned_mandatory_filter(&forward_sets)?
@@ -6012,7 +6281,7 @@ fn aligned_sets_from_required_literals(
     let mut words = Vec::new();
     words
         .try_reserve_exact(depth)
-        .map_err(|_| ObjectError::InvalidModule("native interior-filter allocation failed"))?;
+        .map_err(|_| ObjectError::Allocation("native interior filter"))?;
     words.resize(depth, [0_u64; 4]);
     for literal in literals.literals() {
         let bytes = literal.as_bytes();
@@ -7108,7 +7377,7 @@ impl X86Assembler {
         let label = self.labels.len();
         self.labels
             .try_reserve(1)
-            .map_err(|_| ObjectError::InvalidModule("x86 label allocation failed"))?;
+            .map_err(|_| ObjectError::Allocation("x86 labels"))?;
         self.labels.push(None);
         Ok(label)
     }
@@ -7129,7 +7398,7 @@ impl X86Assembler {
         let offset = self.code.len();
         self.instruction_offsets
             .try_reserve(1)
-            .map_err(|_| ObjectError::InvalidModule("x86 audit allocation failed"))?;
+            .map_err(|_| ObjectError::Allocation("x86 audit"))?;
         self.instruction_offsets.push(offset);
         push_bytes(&mut self.code, bytes)?;
         Ok(offset)
@@ -7153,7 +7422,7 @@ impl X86Assembler {
         push_bytes(&mut self.code, &[0; 4])?;
         self.fixups
             .try_reserve(1)
-            .map_err(|_| ObjectError::InvalidModule("x86 fixup allocation failed"))?;
+            .map_err(|_| ObjectError::Allocation("x86 fixups"))?;
         self.fixups.push(X86Fixup {
             instruction,
             displacement,
@@ -7210,7 +7479,7 @@ impl X86Assembler {
         let mut shortened = Vec::new();
         shortened
             .try_reserve_exact(self.fixups.len())
-            .map_err(|_| ObjectError::InvalidModule("x86 inversion allocation failed"))?;
+            .map_err(|_| ObjectError::Allocation("x86 inversion"))?;
         shortened.resize(self.fixups.len(), false);
         loop {
             let mut changed = false;
@@ -7292,11 +7561,11 @@ impl X86Assembler {
         let mut labels = Vec::new();
         labels
             .try_reserve_exact(self.fixups.len())
-            .map_err(|_| ObjectError::InvalidModule("x86 threading allocation failed"))?;
+            .map_err(|_| ObjectError::Allocation("x86 threading"))?;
         let mut shortened = Vec::new();
         shortened
             .try_reserve_exact(self.fixups.len())
-            .map_err(|_| ObjectError::InvalidModule("x86 threading allocation failed"))?;
+            .map_err(|_| ObjectError::Allocation("x86 threading"))?;
         shortened.resize(self.fixups.len(), false);
 
         for (index, fixup) in self.fixups.iter().enumerate() {
@@ -7415,12 +7684,12 @@ impl X86Assembler {
         let mut reachable = Vec::new();
         reachable
             .try_reserve_exact(instruction_count)
-            .map_err(|_| ObjectError::InvalidModule("x86 reachability allocation failed"))?;
+            .map_err(|_| ObjectError::Allocation("x86 reachability"))?;
         reachable.resize(instruction_count, false);
         let mut worklist = Vec::new();
         worklist
             .try_reserve_exact(instruction_count)
-            .map_err(|_| ObjectError::InvalidModule("x86 reachability allocation failed"))?;
+            .map_err(|_| ObjectError::Allocation("x86 reachability"))?;
         reachable[0] = true;
         worklist.push(0_usize);
 
@@ -7494,7 +7763,7 @@ impl X86Assembler {
 
     fn finish_with_label_offsets(mut self) -> Result<X86Finished, ObjectError> {
         self.instruction_offsets.try_reserve(1).map_err(|_| {
-            ObjectError::InvalidModule("x86 instruction sentinel allocation failed")
+            ObjectError::Allocation("x86 instruction sentinel")
         })?;
         self.instruction_offsets.push(self.code.len());
         for fixup in &self.fixups {
@@ -7516,7 +7785,7 @@ impl X86Assembler {
         let mut removed = Vec::new();
         removed
             .try_reserve_exact(self.fixups.len())
-            .map_err(|_| ObjectError::InvalidModule("x86 dead branch allocation failed"))?;
+            .map_err(|_| ObjectError::Allocation("x86 dead branches"))?;
         removed.resize(self.fixups.len(), false);
         self.invert_branch_fallthroughs(&mut removed)?;
         self.thread_branch_targets(&removed)?;
@@ -7524,7 +7793,7 @@ impl X86Assembler {
         let mut shortened = Vec::new();
         shortened
             .try_reserve_exact(self.fixups.len())
-            .map_err(|_| ObjectError::InvalidModule("x86 relaxation allocation failed"))?;
+            .map_err(|_| ObjectError::Allocation("x86 relaxation"))?;
         shortened.resize(self.fixups.len(), false);
 
         // Deletion is monotone too: removing one fallthrough edge can expose
@@ -7614,7 +7883,7 @@ impl X86Assembler {
 
         let mut code = Vec::new();
         code.try_reserve_exact(self.remap_offset(self.code.len(), &removed, &shortened)?)
-            .map_err(|_| ObjectError::InvalidModule("x86 relaxed code allocation failed"))?;
+            .map_err(|_| ObjectError::Allocation("x86 relaxed code"))?;
         let mut cursor = 0_usize;
         for (index, fixup) in self.fixups.iter().enumerate() {
             push_bytes(
@@ -7659,7 +7928,7 @@ impl X86Assembler {
         let mut label_offsets = Vec::new();
         label_offsets
             .try_reserve_exact(self.labels.len())
-            .map_err(|_| ObjectError::InvalidModule("x86 label remap allocation failed"))?;
+            .map_err(|_| ObjectError::Allocation("x86 label remap"))?;
         for &offset in &self.labels {
             label_offsets.push(
                 offset
@@ -12220,7 +12489,7 @@ impl Aarch64Assembler {
         let label = self.labels.len();
         self.labels
             .try_reserve(1)
-            .map_err(|_| ObjectError::InvalidModule("AArch64 label allocation failed"))?;
+            .map_err(|_| ObjectError::Allocation("AArch64 labels"))?;
         self.labels.push(None);
         Ok(label)
     }
@@ -12321,7 +12590,7 @@ impl Aarch64Assembler {
         let offset = self.instruction(instruction)?;
         self.fixups
             .try_reserve(1)
-            .map_err(|_| ObjectError::InvalidModule("AArch64 fixup allocation failed"))?;
+            .map_err(|_| ObjectError::Allocation("AArch64 fixups"))?;
         self.fixups.push(Aarch64Fixup {
             instruction: offset,
             label,
@@ -12505,20 +12774,20 @@ impl Aarch64Assembler {
         unconditional_targets
             .try_reserve_exact(instruction_count)
             .map_err(|_| {
-                ObjectError::InvalidModule("AArch64 branch target map allocation failed")
+                ObjectError::Allocation("AArch64 branch target map")
             })?;
         unconditional_targets.resize(instruction_count, None);
         let mut fixup_indices = Vec::new();
         fixup_indices
             .try_reserve_exact(instruction_count)
-            .map_err(|_| ObjectError::InvalidModule("AArch64 fixup map allocation failed"))?;
+            .map_err(|_| ObjectError::Allocation("AArch64 fixup map"))?;
         fixup_indices.resize(instruction_count, None);
 
         let mut relocation_anchors = Vec::new();
         relocation_anchors
             .try_reserve_exact(instruction_count)
             .map_err(|_| {
-                ObjectError::InvalidModule("AArch64 relocation anchor allocation failed")
+                ObjectError::Allocation("AArch64 relocation anchors")
             })?;
         relocation_anchors.resize(instruction_count, false);
         for &offset in relocation_offsets {
@@ -12593,19 +12862,19 @@ impl Aarch64Assembler {
         let mut fixups = Vec::new();
         fixups
             .try_reserve_exact(self.fixups.len())
-            .map_err(|_| ObjectError::InvalidModule("AArch64 fixup copy allocation failed"))?;
+            .map_err(|_| ObjectError::Allocation("AArch64 fixup copy"))?;
         fixups.extend_from_slice(&self.fixups);
 
         let mut removed = Vec::new();
         removed
             .try_reserve_exact(instruction_count)
-            .map_err(|_| ObjectError::InvalidModule("AArch64 branch removal allocation failed"))?;
+            .map_err(|_| ObjectError::Allocation("AArch64 branch removal"))?;
         removed.resize(instruction_count, false);
         let mut remove_this_round = Vec::new();
         remove_this_round
             .try_reserve_exact(instruction_count)
             .map_err(|_| {
-                ObjectError::InvalidModule("AArch64 branch relaxation allocation failed")
+                ObjectError::Allocation("AArch64 branch relaxation")
             })?;
         remove_this_round.resize(instruction_count, false);
 
@@ -12648,13 +12917,13 @@ impl Aarch64Assembler {
         let mut inversion_masks = Vec::new();
         inversion_masks
             .try_reserve_exact(instruction_count)
-            .map_err(|_| ObjectError::InvalidModule("AArch64 inversion map allocation failed"))?;
+            .map_err(|_| ObjectError::Allocation("AArch64 inversion map"))?;
         inversion_masks.resize(instruction_count, 0_u32);
         let mut targeted_instructions = Vec::new();
         targeted_instructions
             .try_reserve_exact(instruction_count)
             .map_err(|_| {
-                ObjectError::InvalidModule("AArch64 branch entry map allocation failed")
+                ObjectError::Allocation("AArch64 branch entry map")
             })?;
         targeted_instructions.resize(instruction_count, false);
         let mut removed_prefix = Vec::new();
@@ -12666,7 +12935,7 @@ impl Aarch64Assembler {
                 ))?;
         removed_prefix
             .try_reserve_exact(prefix_entries)
-            .map_err(|_| ObjectError::InvalidModule("AArch64 branch prefix allocation failed"))?;
+            .map_err(|_| ObjectError::Allocation("AArch64 branch prefix"))?;
 
         // Canonicalize every single-entry conditional diamond. Work one
         // diamond at a time so each decision sees exact current entry counts
@@ -12928,7 +13197,7 @@ impl Aarch64Assembler {
                 ))?;
         let mut code = Vec::new();
         code.try_reserve_exact(compacted_len)
-            .map_err(|_| ObjectError::InvalidModule("AArch64 code compaction allocation failed"))?;
+            .map_err(|_| ObjectError::Allocation("AArch64 code compaction"))?;
         for (instruction, bytes) in self.code.chunks_exact(4).enumerate() {
             if !removed.get(instruction).copied().unwrap_or(true) {
                 let inversion_mask = inversion_masks.get(instruction).copied().unwrap_or(0);
@@ -12952,7 +13221,7 @@ impl Aarch64Assembler {
         let mut labels = Vec::new();
         labels
             .try_reserve_exact(self.labels.len())
-            .map_err(|_| ObjectError::InvalidModule("AArch64 label remap allocation failed"))?;
+            .map_err(|_| ObjectError::Allocation("AArch64 label remap"))?;
         for &label in &self.labels {
             labels.push(label.map(&remap).transpose()?);
         }
@@ -12960,7 +13229,7 @@ impl Aarch64Assembler {
         let mut compacted_fixups = Vec::new();
         compacted_fixups
             .try_reserve_exact(fixups.len())
-            .map_err(|_| ObjectError::InvalidModule("AArch64 fixup remap allocation failed"))?;
+            .map_err(|_| ObjectError::Allocation("AArch64 fixup remap"))?;
         for mut fixup in fixups {
             let instruction = fixup.instruction / 4;
             if removed.get(instruction).copied().unwrap_or(true) {
@@ -12974,7 +13243,7 @@ impl Aarch64Assembler {
         compacted_relocations
             .try_reserve_exact(relocation_offsets.len())
             .map_err(|_| {
-                ObjectError::InvalidModule("AArch64 relocation remap allocation failed")
+                ObjectError::Allocation("AArch64 relocation remap")
             })?;
         for &offset in relocation_offsets {
             if offset < self.code.len() && removed.get(offset / 4).copied().unwrap_or(true) {
@@ -18887,6 +19156,19 @@ mod tests {
         .expect("test-only lowering without K0 materialization")
     }
 
+    /// Keep tests for the established K0/prepared route independent of the
+    /// new slow candidate that now correctly precedes it.
+    fn compile_with_k0_but_without_slow(request: CompileRequest) -> CompiledRegex {
+        crate::compile_with_slow_aot_limits(
+            request,
+            SlowAotLimits {
+                max_allocation_bytes: 0,
+                ..SlowAotLimits::default()
+            },
+        )
+        .expect("test-only K0 compilation after a forced slow decline")
+    }
+
     fn identity_target_matrix() -> Vec<Target> {
         let x86_features = [
             FeatureSet::of(CpuFeature::X86Sse2),
@@ -19821,6 +20103,8 @@ mod tests {
         for target in identity_target_matrix() {
             for (pattern, output) in cases {
                 let compiled = complete_forward_resource_fallback(pattern, output, target);
+                let module = CompiledModule::lower(compiled.program(), target)
+                    .expect("ordinary complete-retained lowering");
                 let requires_prefix_scanner = compiled
                     .program()
                     .native_dfa_view()
@@ -19832,37 +20116,22 @@ mod tests {
                         && target.features.has(CpuFeature::Aarch64Sve));
                 let expect_native = !requires_prefix_scanner || target_has_vector_start;
                 assert_eq!(
-                    !compiled.receipt().runtime_helper_required,
+                    module.required_runtime_symbol().is_none(),
                     expect_native,
                     "{pattern:?}/{output:?}/{target:?}; exact_width={:?} exact_product={}",
                     compiled.receipt().exact_match_width,
                     compiled.program().has_nfa_exact_product(),
                 );
                 assert_eq!(
-                    compiled.module().required_runtime_symbol().is_none(),
+                    module.required_runtime_symbol().is_none(),
                     expect_native,
                     "{pattern:?}/{output:?}/{target:?} runtime relocation"
                 );
                 assert_eq!(
-                    compiled.module().required_runtime_program().is_none(),
+                    module.required_runtime_program().is_none(),
                     expect_native,
                     "{pattern:?}/{output:?}/{target:?} runtime program alias"
                 );
-                assert_eq!(
-                    compiled
-                        .receipt()
-                        .passes
-                        .contains(&crate::OptimizationPass::RuntimeAdapterLowering),
-                    !expect_native
-                );
-                assert_eq!(
-                    compiled
-                        .receipt()
-                        .passes
-                        .contains(&crate::OptimizationPass::TargetInstructionSelection),
-                    expect_native
-                );
-
                 let restored = crate::CompiledProgram::deserialize(
                     &compiled.program().serialize().expect("serialize fallback"),
                 )
@@ -19873,13 +20142,10 @@ mod tests {
                     restored_module.required_runtime_symbol().is_none(),
                     expect_native
                 );
-                assert_eq!(restored_module.entry_symbol(), compiled.module().entry_symbol());
-                assert_eq!(restored_module.sections(), compiled.module().sections());
-                assert_eq!(restored_module.symbols(), compiled.module().symbols());
-                assert_eq!(
-                    restored_module.relocations(),
-                    compiled.module().relocations()
-                );
+                assert_eq!(restored_module.entry_symbol(), module.entry_symbol());
+                assert_eq!(restored_module.sections(), module.sections());
+                assert_eq!(restored_module.symbols(), module.symbols());
+                assert_eq!(restored_module.relocations(), module.relocations());
             }
         }
     }
@@ -21444,35 +21710,31 @@ mod tests {
             };
             for (target, accelerator) in targets {
                 let compiled = complete_forward_resource_fallback(pattern, output, target);
+                let module = CompiledModule::lower(compiled.program(), target)
+                    .expect("ordinary exact retained lowering");
                 assert!(
-                    !compiled.receipt().runtime_helper_required,
+                    module.required_runtime_symbol().is_none(),
                     "{output:?}/{target:?} did not publish its exact vector scanner; accelerator={:?}, reason={:?}, view={:?}",
-                    compiled.module().start_accelerator(),
+                    module.start_accelerator(),
                     compiled.receipt().engine_selection_reason,
                     compiled.program().native_dfa_view(),
                 );
-                assert!(compiled.module().required_runtime_symbol().is_none());
-                assert!(compiled.module().required_runtime_program().is_none());
+                assert!(module.required_runtime_symbol().is_none());
+                assert!(module.required_runtime_program().is_none());
                 assert_eq!(
-                    compiled.module().start_accelerator(),
+                    module.start_accelerator(),
                     accelerator,
                     "{output:?}/{target:?}"
                 );
                 assert!(
-                    compiled.module().relocations().iter().all(|relocation| {
+                    module.relocations().iter().all(|relocation| {
                         relocation.section == TEXT_SECTION
                             && relocation.symbol == PROGRAM_SYMBOL
                             && usize::try_from(relocation.offset).is_ok_and(|offset| {
-                                offset < compiled.module().sections()[TEXT_SECTION].bytes().len()
+                                offset < module.sections()[TEXT_SECTION].bytes().len()
                             })
                     }),
                     "{output:?}/{target:?} emitted an out-of-section or external exact-scanner relocation"
-                );
-                assert!(
-                    compiled
-                        .receipt()
-                        .passes
-                        .contains(&crate::OptimizationPass::TargetInstructionSelection)
                 );
             }
         }
@@ -21493,18 +21755,19 @@ mod tests {
                 r"(?-u:[ACEGIKMOQ])+"
             };
             let compiled = complete_forward_resource_fallback(pattern, output, sve2_target);
-            assert!(!compiled.receipt().runtime_helper_required, "{output:?}");
-            assert!(compiled.module().required_runtime_symbol().is_none());
-            assert!(compiled.module().required_runtime_program().is_none());
+            let module = CompiledModule::lower(compiled.program(), sve2_target)
+                .expect("ordinary exact SVE2 retained lowering");
+            assert!(module.required_runtime_symbol().is_none(), "{output:?}");
+            assert!(module.required_runtime_program().is_none());
             assert_eq!(
-                compiled.module().start_accelerator(),
+                module.start_accelerator(),
                 StartAccelerator::Aarch64Sve2
             );
-            assert!(compiled.module().relocations().iter().all(|relocation| {
+            assert!(module.relocations().iter().all(|relocation| {
                 relocation.section == TEXT_SECTION
                     && relocation.symbol == PROGRAM_SYMBOL
                     && usize::try_from(relocation.offset).is_ok_and(|offset| {
-                        offset < compiled.module().sections()[TEXT_SECTION].bytes().len()
+                        offset < module.sections()[TEXT_SECTION].bytes().len()
                     })
             }));
         }
@@ -21529,13 +21792,11 @@ mod tests {
                 OutputContract::Exists,
                 target,
             );
-            assert!(compiled.receipt().runtime_helper_required, "{target:?}");
-            assert!(compiled.module().required_runtime_symbol().is_some());
-            assert!(compiled.module().prepared_entry_symbol().is_some());
-            assert_eq!(
-                compiled.module().start_accelerator(),
-                StartAccelerator::Scalar
-            );
+            let module = CompiledModule::lower(compiled.program(), target)
+                .expect("ordinary scalar exact fallback lowering");
+            assert!(module.required_runtime_symbol().is_some(), "{target:?}");
+            assert!(module.prepared_entry_symbol().is_some());
+            assert_eq!(module.start_accelerator(), StartAccelerator::Scalar);
         }
     }
 
@@ -21567,10 +21828,12 @@ mod tests {
                 .expect("rebuilt exact layout");
             assert_eq!(original, rebuilt, "{architecture:?} exact layout drifted");
         }
+        let original_module = CompiledModule::lower(compiled.program(), target)
+            .expect("lower original retained exact primary");
         let restored_module = CompiledModule::lower(&restored, target).expect("lower restored");
-        assert_eq!(restored_module.sections(), compiled.module().sections());
-        assert_eq!(restored_module.symbols(), compiled.module().symbols());
-        assert_eq!(restored_module.relocations(), compiled.module().relocations());
+        assert_eq!(restored_module.sections(), original_module.sections());
+        assert_eq!(restored_module.symbols(), original_module.symbols());
+        assert_eq!(restored_module.relocations(), original_module.relocations());
         assert_eq!(restored_module.start_accelerator(), StartAccelerator::Scalar);
     }
 
@@ -21665,15 +21928,21 @@ mod tests {
                 .program()
                 .native_fully_prefilled_view(&variable_materialized);
             let variable_direct = lower_native_dfa(variable_view, target).unwrap().is_some();
+            let variable_module = CompiledModule::lower_k0_optimizing_with_data_limit(
+                variable_span.program(),
+                target,
+                usize::MAX,
+            )
+            .expect("explicit variable-Span K0 lowering");
             assert_eq!(
-                variable_span.receipt().runtime_helper_required,
+                variable_module.required_runtime_symbol().is_some(),
                 !variable_direct
             );
             assert_eq!(
-                variable_span.module().required_runtime_symbol().is_some(),
+                variable_module.required_runtime_symbol().is_some(),
                 !variable_direct
             );
-            assert!(variable_span.module().prepared_entry_symbol().is_none());
+            assert!(variable_module.prepared_entry_symbol().is_none());
 
             for output in [
                 OutputContract::Exists,
@@ -21684,24 +21953,27 @@ mod tests {
                     complete_forward_resource_fallback("[b-c][a-b]{1,10}z", output, target);
                 let direct_view = compiled.program().native_dfa_view();
                 assert_eq!(direct_view.is_some(), output != OutputContract::Span);
-                let materialized = direct_view
-                    .is_none()
-                    .then(|| compiled.program().native_fully_prefilled_program())
-                    .flatten();
-                let static_view = direct_view.or_else(|| {
-                    materialized.as_ref().map(|materialized| {
+                let materialized = compiled.program().native_fully_prefilled_program();
+                let static_view = materialized
+                    .as_ref()
+                    .map(|materialized| {
                         compiled
                             .program()
                             .native_fully_prefilled_view(materialized)
                     })
-                });
+                    .or(direct_view);
                 let direct = static_view
                     .is_some_and(|view| lower_native_dfa(view, target).unwrap().is_some());
-                assert_eq!(!compiled.receipt().runtime_helper_required, direct);
-                assert_eq!(compiled.module().required_runtime_symbol().is_none(), direct);
+                let module = CompiledModule::lower_k0_optimizing_with_data_limit(
+                    compiled.program(),
+                    target,
+                    usize::MAX,
+                )
+                .expect("explicit zero-frontier K0 lowering");
+                assert_eq!(module.required_runtime_symbol().is_none(), direct);
                 assert!(compiled.program().native_partial_dfa_view().is_none());
                 assert_eq!(
-                    compiled.module().prepared_entry_symbol().is_some(),
+                    module.prepared_entry_symbol().is_some(),
                     !direct && compiled.program().native_dynamic_rows_view().is_some(),
                     "{target:?}/{output:?} dynamic fallback publication"
                 );
@@ -21716,17 +21988,17 @@ mod tests {
                     assert!(layout.suffix_filter.is_some());
                     assert!(layout.prefix_fast_forward.is_some());
                     assert!(!matches!(
-                        compiled.module().start_accelerator(),
+                        module.start_accelerator(),
                         StartAccelerator::None | StartAccelerator::Scalar
                     ));
                 } else if compiled.program().native_dynamic_rows_view().is_some() {
                     assert_eq!(
-                        compiled.module().start_accelerator(),
+                        module.start_accelerator(),
                         StartAccelerator::Scalar,
                         "{target:?}/{output:?} dynamic root must receipt its scalar scanner"
                     );
                 } else {
-                    assert_eq!(compiled.module().start_accelerator(), StartAccelerator::None);
+                    assert_eq!(module.start_accelerator(), StartAccelerator::None);
                 }
             }
 
@@ -21745,16 +22017,14 @@ mod tests {
                     OutputContract::Exists,
                     target,
                 );
+                let module = CompiledModule::lower(prefix_accelerated.program(), target)
+                    .expect("ordinary exact prepared fallback lowering");
                 assert!(
-                    prefix_accelerated.receipt().runtime_helper_required,
+                    module.required_runtime_symbol().is_some(),
                     "{pattern:?}/{target:?} discarded the prepared fallback workspace"
                 );
-                assert!(prefix_accelerated.module().required_runtime_symbol().is_some());
-                assert!(prefix_accelerated.module().prepared_entry_symbol().is_some());
-                assert_eq!(
-                    prefix_accelerated.module().start_accelerator(),
-                    StartAccelerator::Scalar
-                );
+                assert!(module.prepared_entry_symbol().is_some());
+                assert_eq!(module.start_accelerator(), StartAccelerator::Scalar);
             }
         }
 
@@ -21775,9 +22045,11 @@ mod tests {
         assert!(nullable_view.partial_discovered_states.is_none());
         assert!(nullable_view.retained_suffix_requirement.is_none());
         assert!(!nullable_layout.has_reverse);
-        assert!(!nullable_span.receipt().runtime_helper_required);
+        let nullable_module = CompiledModule::lower(nullable_span.program(), target)
+            .expect("ordinary nullable retained lowering");
+        assert!(nullable_module.required_runtime_symbol().is_none());
         assert!(nullable_span.program().native_partial_dfa_view().is_none());
-        assert!(nullable_span.module().prepared_entry_symbol().is_none());
+        assert!(nullable_module.prepared_entry_symbol().is_none());
 
         let exact_span = complete_forward_resource_fallback(
             "(?:ab|cd)z",
@@ -21796,9 +22068,11 @@ mod tests {
         assert!(exact_view.retained_suffix_requirement.is_none());
         assert_eq!(exact_layout.exact_span_width, Some(3));
         assert!(!exact_layout.has_reverse);
-        assert!(!exact_span.receipt().runtime_helper_required);
+        let exact_module = CompiledModule::lower(exact_span.program(), target)
+            .expect("ordinary exact-width retained lowering");
+        assert!(exact_module.required_runtime_symbol().is_none());
         assert!(exact_span.program().native_partial_dfa_view().is_none());
-        assert!(exact_span.module().prepared_entry_symbol().is_none());
+        assert!(exact_module.prepared_entry_symbol().is_none());
 
         let cut = complete_forward_resource_fallback(
             "[b-c][a-b]{1,10}7[A-Za-z]{1,2}",
@@ -21807,8 +22081,10 @@ mod tests {
         );
         assert!(cut.program().native_dfa_view().is_none());
         assert!(cut.program().native_partial_dfa_view().is_none());
-        assert!(cut.receipt().runtime_helper_required);
-        assert!(cut.module().prepared_entry_symbol().is_none());
+        let cut_module = CompiledModule::lower(cut.program(), target)
+            .expect("ordinary mandatory-cut fallback lowering");
+        assert!(cut_module.required_runtime_symbol().is_some());
+        assert!(cut_module.prepared_entry_symbol().is_none());
 
         let compiled = complete_forward_resource_fallback(
             "[b-c][a-b]{1,10}z",
@@ -21826,10 +22102,12 @@ mod tests {
                 .native_dfa_view()
                 .and_then(|view| view.retained_suffix_requirement)
         );
+        let original_module = CompiledModule::lower(compiled.program(), target)
+            .expect("lower original suffix");
         let restored_module = CompiledModule::lower(&restored, target).expect("lower restored");
-        assert_eq!(restored_module.sections(), compiled.module().sections());
-        assert_eq!(restored_module.symbols(), compiled.module().symbols());
-        assert_eq!(restored_module.relocations(), compiled.module().relocations());
+        assert_eq!(restored_module.sections(), original_module.sections());
+        assert_eq!(restored_module.symbols(), original_module.symbols());
+        assert_eq!(restored_module.relocations(), original_module.relocations());
 
         let mut mismatched = compiled
             .program()
@@ -21887,18 +22165,16 @@ mod tests {
         assert!(lower_native_dfa(declined_view, declined_target)
             .unwrap()
             .is_none());
-        assert!(declined.module().required_runtime_symbol().is_some());
-        assert!(declined.module().prepared_entry_symbol().is_some());
+        let declined_module = CompiledModule::lower(declined.program(), declined_target)
+            .expect("ordinary declined retained lowering");
+        assert!(declined_module.required_runtime_symbol().is_some());
+        assert!(declined_module.prepared_entry_symbol().is_some());
         assert_eq!(
-            declined
-                .module()
-                .required_prepared_preflight_runtime_symbol(),
+            declined_module.required_prepared_preflight_runtime_symbol(),
             Some(DYNAMIC_ROWS_PREFLIGHT_RUNTIME_SYMBOL_NAME)
         );
         assert_eq!(
-            declined
-                .module()
-                .required_prepared_dynamic_rows_deopt_runtime_symbol(),
+            declined_module.required_prepared_dynamic_rows_deopt_runtime_symbol(),
             Some(DYNAMIC_ROWS_DEOPT_RUNTIME_SYMBOL_NAME)
         );
     }
@@ -24779,13 +25055,12 @@ int main(void) {{
                 },
                 ..CompileLimitsV1::default()
             };
-            let compiled = compile(
+            let compiled = compile_with_k0_but_without_slow(
                 CompileRequest::new("a+Q|[b-c][a-b]{1,5}(?:x+|y+)", target)
                     .mode(CompileMode::Optimizing)
                     .output(OutputContract::SelectedEnd)
                     .limits(limits),
-            )
-            .expect("incomplete retained fallback");
+            );
             let partial = compiled
                 .program()
                 .partial_dfa_stats()
@@ -24868,7 +25143,7 @@ int main(void) {{
                 OutputContract::SelectedEnd,
                 OutputContract::Span,
             ] {
-                let compiled = compile(
+                let compiled = compile_with_k0_but_without_slow(
                     CompileRequest::new(
                         "a+Q|[b-c][a-b]{1,5}(?:x+|y+)",
                         target,
@@ -24876,10 +25151,7 @@ int main(void) {{
                     .mode(CompileMode::Optimizing)
                     .output(output)
                     .limits(limits),
-                )
-                .unwrap_or_else(|error| {
-                    panic!("materialized K0 compile {target:?}/{output:?}: {error}")
-                });
+                );
                 let partial = compiled
                     .program()
                     .partial_dfa_stats()
@@ -24910,8 +25182,12 @@ int main(void) {{
 
                 let wire = compiled.program().serialize().unwrap();
                 let restored = crate::CompiledProgram::deserialize(&wire).unwrap();
-                let restored_module =
-                    CompiledModule::lower_optimizing(&restored, target).unwrap();
+                let restored_module = CompiledModule::lower_k0_optimizing_with_data_limit(
+                    &restored,
+                    target,
+                    usize::MAX,
+                )
+                .unwrap();
                 assert_eq!(restored_module.sections(), compiled.module().sections());
                 assert_eq!(restored_module.symbols(), compiled.module().symbols());
                 assert_eq!(restored_module.relocations(), compiled.module().relocations());
@@ -24931,7 +25207,7 @@ int main(void) {{
                 OutputContract::SelectedEnd,
                 OutputContract::Span,
             ] {
-                let compiled = compile(
+                let compiled = compile_with_k0_but_without_slow(
                     CompileRequest::new(
                         "a+Q|[b-c][a-b]{1,5}(?:x+|y+)",
                         target,
@@ -24939,10 +25215,7 @@ int main(void) {{
                     .mode(CompileMode::Optimizing)
                     .output(output)
                     .limits(root_only_limits),
-                )
-                .unwrap_or_else(|error| {
-                    panic!("root-only K0 compile {target:?}/{output:?}: {error}")
-                });
+                );
                 assert!(compiled.program().partial_dfa_stats().unwrap().is_none());
                 assert!(compiled.program().native_dfa_view().is_none());
                 assert!(compiled.program().native_exact_product_view().is_none());
@@ -24962,8 +25235,12 @@ int main(void) {{
                 let restored = crate::CompiledProgram::deserialize(&wire).unwrap();
                 let bounded_module = CompiledModule::lower(&restored, target).unwrap();
                 assert!(bounded_module.required_runtime_symbol().is_some());
-                let restored_module =
-                    CompiledModule::lower_optimizing(&restored, target).unwrap();
+                let restored_module = CompiledModule::lower_k0_optimizing_with_data_limit(
+                    &restored,
+                    target,
+                    usize::MAX,
+                )
+                .unwrap();
                 assert_eq!(restored_module.sections(), compiled.module().sections());
                 assert_eq!(restored_module.symbols(), compiled.module().symbols());
                 assert_eq!(restored_module.relocations(), compiled.module().relocations());
@@ -24975,7 +25252,7 @@ int main(void) {{
                 FeatureSet::of(CpuFeature::Aarch64Sve).with(CpuFeature::Aarch64Sve2),
             )
             .unwrap();
-        let sve2 = compile(
+        let sve2 = compile_with_k0_but_without_slow(
             CompileRequest::new(
                 r"(?-u:[\x00\x20\x40\x60\x80\xa0\xc0\xe0\xff])+Q|[b-c][a-b]{1,5}(?:x+|y+)",
                 sve2_target,
@@ -24983,8 +25260,7 @@ int main(void) {{
             .mode(CompileMode::Optimizing)
             .output(OutputContract::SelectedEnd)
             .limits(limits),
-        )
-        .unwrap();
+        );
         assert!(
             sve2.program()
                 .partial_dfa_stats()
@@ -24999,7 +25275,7 @@ int main(void) {{
         );
 
         let scalar_target = Target::aarch64_linux();
-        let scalar = compile(
+        let scalar = compile_with_k0_but_without_slow(
             CompileRequest::new(
                 "a+Q|[b-c][a-b]{1,5}(?:x+|y+)",
                 scalar_target,
@@ -25007,8 +25283,7 @@ int main(void) {{
             .mode(CompileMode::Optimizing)
             .output(OutputContract::Span)
             .limits(limits),
-        )
-        .unwrap();
+        );
         let materialized = scalar
             .program()
             .native_fully_prefilled_program()
@@ -25036,6 +25311,80 @@ int main(void) {{
     }
 
     #[test]
+    fn slow_determinization_lowers_a_graph_larger_than_the_k0_cache() {
+        let limits = CompileLimitsV1 {
+            determinize: DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+            ..CompileLimitsV1::default()
+        };
+        let compiled = compile(
+            CompileRequest::new(r"(?:a|b)*a(?:a|b){15}", Target::x86_64_linux())
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists)
+                .limits(limits),
+        )
+        .expect("slow optimizing compile");
+
+        assert!(compiled.program().native_dfa_view().is_none());
+        assert!(compiled.program().native_fully_prefilled_program().is_none());
+        let machine = compiled
+            .program()
+            .native_slow_determinized_program(
+                SlowAotLimits::default().determinize,
+                SlowAotLimits::default().max_allocation_bytes,
+            )
+            .unwrap()
+            .expect("slow complete DFA");
+        assert!(machine.stats().forward_states_before_minimization > 16_385);
+        assert!(machine.stats().forward_states < 32);
+        assert!(!compiled.receipt().runtime_helper_required);
+        assert!(compiled.module().required_runtime_symbol().is_none());
+        assert!(compiled.module().prepared_entry_symbol().is_none());
+
+        let fast = compile(
+            CompileRequest::new(r"(?:a|b)*a(?:a|b){15}", Target::x86_64_linux())
+                .mode(CompileMode::Fast)
+                .output(OutputContract::Exists),
+        )
+        .expect("fast compile");
+        assert!(fast.module().required_runtime_symbol().is_some());
+        let slow_from_fast =
+            CompiledModule::lower_optimizing(fast.program(), Target::x86_64_linux())
+                .expect("explicit slow lowering from Fast program");
+        assert!(slow_from_fast.required_runtime_symbol().is_none());
+        assert!(slow_from_fast.prepared_entry_symbol().is_none());
+    }
+
+    #[test]
+    fn complete_retained_ordered_nfa_is_still_slow_minimization_input() {
+        let compiled = complete_forward_resource_fallback(
+            r"(?:a|b)*a(?:a|b){5}",
+            OutputContract::Exists,
+            Target::x86_64_linux(),
+        );
+        let retained = compiled
+            .program()
+            .partial_dfa_stats()
+            .expect("partial-DFA statistics")
+            .expect("complete retained forward machine");
+        assert_eq!(retained.complete_rows, retained.discovered_states);
+        let slow = compiled
+            .receipt()
+            .slow_aot
+            .as_ref()
+            .expect("complete retained fallback remained slow-AOT eligible");
+        assert_eq!(slow.dfa.forward_states, retained.complete_rows);
+        assert!(
+            slow.dfa.forward_states < slow.dfa.forward_states_before_minimization,
+            "{:?}",
+            slow.dfa
+        );
+        assert!(compiled.module().required_runtime_symbol().is_none());
+    }
+
+    #[test]
     fn incomplete_retained_forward_with_complete_nfa_accelerator_publishes_preflight() {
         let limits = CompileLimitsV1 {
             determinize: DeterminizeLimits {
@@ -25054,13 +25403,12 @@ int main(void) {{
                 r"(?-u:[\x00-\xFF])*(?:a+Q|[b-c][a-b]{1,5}(?:x+|y+))Z",
                 r"(?-u:[\x00-\xFF])*[b-c][a-b]{1,10}7[A-Za-z]+",
             ] {
-                let compiled = compile(
+                let compiled = compile_with_k0_but_without_slow(
                     CompileRequest::new(pattern, target)
                         .mode(CompileMode::Optimizing)
                         .output(OutputContract::SelectedEnd)
                         .limits(limits),
-                )
-                .unwrap_or_else(|error| panic!("accelerated partial compile {target:?}: {error}"));
+                );
                 let partial = compiled
                     .program()
                     .partial_dfa_stats()
@@ -32563,17 +32911,29 @@ int main(void) {{
                 .with_features(mixed_sve2)
                 .unwrap(),
         );
+        let mac_exact_asimd_module = CompiledModule::lower(
+            mac_exact_asimd.program(),
+            Target::aarch64_macos().with_features(asimd).unwrap(),
+        )
+        .expect("ordinary ASIMD retained lowering");
+        let mac_exact_mixed_module = CompiledModule::lower(
+            mac_exact_mixed.program(),
+            Target::aarch64_macos()
+                .with_features(mixed_sve2)
+                .unwrap(),
+        )
+        .expect("ordinary mixed retained lowering");
         assert_eq!(
-            mac_exact_mixed.module().start_accelerator(),
+            mac_exact_mixed_module.start_accelerator(),
             StartAccelerator::Aarch64Asimd
         );
         assert_eq!(
-            mac_exact_mixed.module().sections(),
-            mac_exact_asimd.module().sections()
+            mac_exact_mixed_module.sections(),
+            mac_exact_asimd_module.sections()
         );
         assert_eq!(
-            mac_exact_mixed.module().relocations(),
-            mac_exact_asimd.module().relocations()
+            mac_exact_mixed_module.relocations(),
+            mac_exact_asimd_module.relocations()
         );
     }
 

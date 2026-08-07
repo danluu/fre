@@ -43,8 +43,8 @@ pub use dfa::{
 pub use error::{CompileError, CompileResource, ObjectError};
 pub use module::{
     Architecture, CallAbi, CompiledModule, CpuFeature, FeatureSet, ModuleRelocation, ModuleSection,
-    ModuleSymbol, OperatingSystem, RelocationKind, SectionKind, StartAccelerator, SymbolBinding,
-    SymbolKind, Target,
+    ModuleSymbol, OperatingSystem, RelocationKind, SectionKind, SlowAotLimits, SlowAotReport,
+    StartAccelerator, SymbolBinding, SymbolKind, Target,
 };
 pub use object::{ObjectFormat, emit_object};
 pub use program::{
@@ -203,6 +203,10 @@ pub struct CompileReceipt {
     /// Requested/effective limits, completed stages, and any exact resource
     /// decline from target-neutral determinization.
     pub determinization: DeterminizationReport,
+    /// A separately bounded second determinization actually selected by the
+    /// slow optimizing AOT compiler. The semantic-program report above is
+    /// never overwritten, including when its first attempt declined.
+    pub slow_aot: Option<SlowAotReport>,
     pub source_bytes: usize,
     pub thompson_states: usize,
     pub thompson_edges: usize,
@@ -351,6 +355,24 @@ impl CompiledModule {
 /// Returns a typed syntax, lowering, resource, determinization, target, or
 /// object-production failure.
 pub fn compile(request: CompileRequest) -> Result<CompiledRegex, CompileError> {
+    compile_with_slow_aot_limits(request, SlowAotLimits::default())
+}
+
+/// Compile with an explicit resource envelope for the separately selected
+/// slow assertion-free DFA completion pass.
+///
+/// This leaves [`CompileLimitsV1`] source-compatible and keeps its semantic
+/// program limits distinct from later AOT work. `CompileMode::Fast` never
+/// invokes the slow pass.
+///
+/// # Errors
+///
+/// Returns the same typed failures as [`compile`]. Exhausting a slow-AOT
+/// resource declines that optional candidate and preserves bounded fallbacks.
+pub fn compile_with_slow_aot_limits(
+    request: CompileRequest,
+    slow_aot_limits: SlowAotLimits,
+) -> Result<CompiledRegex, CompileError> {
     let CompileRequest {
         pattern,
         profile,
@@ -370,7 +392,7 @@ pub fn compile(request: CompileRequest) -> Result<CompiledRegex, CompileError> {
     };
     let lowered =
         fre_lower::lower_raw_general(&parsed, OperationSemantics::CaptureFree, limits.lower)?;
-    compile_raw_with_line_terminator(
+    compile_raw_with_line_terminator_and_slow_aot_limits(
         source_bytes,
         lowered.into_plan(),
         line_terminator,
@@ -378,6 +400,7 @@ pub fn compile(request: CompileRequest) -> Result<CompiledRegex, CompileError> {
         target,
         mode,
         limits,
+        slow_aot_limits,
     )
 }
 
@@ -398,7 +421,16 @@ pub fn compile_raw(
     mode: CompileMode,
     limits: CompileLimitsV1,
 ) -> Result<CompiledRegex, CompileError> {
-    compile_raw_with_line_terminator(source_bytes, raw, b'\n', output, target, mode, limits)
+    compile_raw_with_line_terminator_and_slow_aot_limits(
+        source_bytes,
+        raw,
+        b'\n',
+        output,
+        target,
+        mode,
+        limits,
+        SlowAotLimits::default(),
+    )
 }
 
 /// Compile an already-lowered canonical automaton with explicit line
@@ -420,6 +452,33 @@ pub fn compile_raw_with_line_terminator(
     target: Target,
     mode: CompileMode,
     limits: CompileLimitsV1,
+) -> Result<CompiledRegex, CompileError> {
+    compile_raw_with_line_terminator_and_slow_aot_limits(
+        source_bytes,
+        raw,
+        line_terminator,
+        output,
+        target,
+        mode,
+        limits,
+        SlowAotLimits::default(),
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the public request decomposition, lowering fallback order, and one final receipt stay one transaction"
+)]
+fn compile_raw_with_line_terminator_and_slow_aot_limits(
+    source_bytes: usize,
+    raw: RawPlan,
+    line_terminator: u8,
+    output: OutputContract,
+    target: Target,
+    mode: CompileMode,
+    limits: CompileLimitsV1,
+    slow_aot_limits: SlowAotLimits,
 ) -> Result<CompiledRegex, CompileError> {
     let digest = program::automaton_digest(&raw, line_terminator);
     let automaton = Automaton::from_raw(raw.clone(), limits.lower.automata)?
@@ -443,19 +502,43 @@ pub fn compile_raw_with_line_terminator(
             (module, object)
         }
         CompileMode::Optimizing => {
-            let optimized = CompiledModule::lower_optimizing(&program, target)?;
+            let effective_native_data_limit_bytes = slow_aot_limits
+                .max_native_data_bytes
+                .min(limits.max_object_bytes);
+            let optimized = CompiledModule::lower_optimizing_with_limits_and_native_data_limit(
+                &program,
+                target,
+                slow_aot_limits,
+                effective_native_data_limit_bytes,
+            )?;
             match emit_object(&optimized, format, limits.max_object_bytes) {
                 Ok(object) => (optimized, object),
                 Err(error @ ObjectError::Resource {
                     resource: CompileResource::ObjectBytes,
                     ..
                 }) => {
-                    let Ok(fallback) = CompiledModule::lower(&program, target) else {
-                        return Err(error.into());
-                    };
-                    match emit_object(&fallback, format, limits.max_object_bytes) {
-                        Ok(object) => (fallback, object),
-                        Err(_) => return Err(error.into()),
+                    let k0_fallback = CompiledModule::lower_k0_optimizing_with_data_limit(
+                        &program,
+                        target,
+                        effective_native_data_limit_bytes,
+                    )?;
+                    match emit_object(&k0_fallback, format, limits.max_object_bytes) {
+                        Ok(object) => (k0_fallback, object),
+                        Err(ObjectError::Resource {
+                            resource: CompileResource::ObjectBytes,
+                            ..
+                        }) => {
+                            let fallback = CompiledModule::lower(&program, target)?;
+                            match emit_object(&fallback, format, limits.max_object_bytes) {
+                                Ok(object) => (fallback, object),
+                                Err(ObjectError::Resource {
+                                    resource: CompileResource::ObjectBytes,
+                                    ..
+                                }) => return Err(error.into()),
+                                Err(fallback_error) => return Err(fallback_error.into()),
+                            }
+                        }
+                        Err(k0_error) => return Err(k0_error.into()),
                     }
                 }
                 Err(error) => return Err(error.into()),
@@ -489,6 +572,7 @@ pub fn compile_raw_with_line_terminator(
         engine: program.engine_kind(),
         engine_selection_reason,
         determinization,
+        slow_aot: module.slow_aot_report().cloned(),
         source_bytes,
         thompson_states: stats.states(),
         thompson_edges: stats.edges(),
@@ -543,6 +627,25 @@ fn selected_passes(program: &CompiledProgram, module: &CompiledModule) -> Vec<Op
             });
         }
     }
+    if let Some(report) = module.slow_aot_report() {
+        for &stage in report.determinization.completed_stages.as_ref() {
+            passes.push(match stage {
+                DeterminizationStage::AlphabetPartition => OptimizationPass::AlphabetPartition,
+                DeterminizationStage::ForwardSubsetConstruction => {
+                    OptimizationPass::OrderedDeterminization
+                }
+                DeterminizationStage::ReverseSubsetConstruction => {
+                    OptimizationPass::ReverseStartRecovery
+                }
+                DeterminizationStage::DfaStateMinimization => {
+                    OptimizationPass::DfaStateMinimization
+                }
+                DeterminizationStage::AlphabetColumnCoalescing => {
+                    OptimizationPass::AlphabetColumnCoalescing
+                }
+            });
+        }
+    }
     match program.engine_kind() {
         EngineKind::OrderedNfa if module.required_runtime_symbol().is_some() => passes
             .extend_from_slice(&[
@@ -556,7 +659,10 @@ fn selected_passes(program: &CompiledProgram, module: &CompiledModule) -> Vec<Op
             // report the native passes actually present in the object rather
             // than claiming that a runtime adapter was emitted.
             passes.push(OptimizationPass::UniversalOrderedTnfa);
-            append_native_dfa_passes(&mut passes, program, module, true);
+            let reverse_unused = module
+                .slow_aot_report()
+                .is_none_or(|report| report.dfa.reverse_states == 0);
+            append_native_dfa_passes(&mut passes, program, module, reverse_unused);
         }
         EngineKind::OrderedDfa => {
             let reverse_unused = program

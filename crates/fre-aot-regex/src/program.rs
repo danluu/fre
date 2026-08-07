@@ -3161,6 +3161,33 @@ pub(crate) struct NativeFullyPrefilledProgram {
     retained_suffix_requirement: Option<NativeRetainedSuffixRequirement>,
 }
 
+/// Owned target-neutral result of the explicitly bounded slow compiler.
+///
+/// Fast and restored programs may not retain optimizer-only literal sidecars,
+/// so this candidate owns a freshly derived general analysis alongside the
+/// complete minimized DFA.
+#[derive(Debug)]
+pub(crate) struct NativeSlowDfaProgram {
+    machine: OrderedDfa,
+    required_literals: RequiredLiterals,
+    report: DeterminizationReport,
+    allocation_bytes: usize,
+}
+
+impl NativeSlowDfaProgram {
+    pub(crate) const fn report(&self) -> &DeterminizationReport {
+        &self.report
+    }
+
+    pub(crate) const fn stats(&self) -> DfaStats {
+        self.machine.stats()
+    }
+
+    pub(crate) const fn allocation_bytes(&self) -> usize {
+        self.allocation_bytes
+    }
+}
+
 impl NativeFullyPrefilledProgram {
     fn dfa_view(&self) -> NativeDfaView<'_> {
         NativeDfaView {
@@ -4084,6 +4111,70 @@ impl CompiledProgram {
             retained_prefix_requirement,
             retained_suffix_requirement,
         })
+    }
+
+    /// Re-run the general ordered determinizer under the stable compiler
+    /// ceiling for an explicitly requested slow AOT lowering.
+    ///
+    /// The semantic compilation request may deliberately use a smaller DFA
+    /// budget so matching can begin quickly with retained partial rows. The
+    /// optimizing native compiler is a separate, explicitly selected phase:
+    /// it may spend substantially more time completing the same target-neutral
+    /// graph before instruction selection. This is ordinary subset
+    /// construction over the validated `RawPlan`; no source spelling or
+    /// pattern identity participates in eligibility or construction.
+    ///
+    /// Allocation or stable resource exhaustion is an optimization decline.
+    /// Structural compiler failures remain typed errors.
+    pub(crate) fn native_slow_determinized_program(
+        &self,
+        limits: DeterminizeLimits,
+        max_allocation_bytes: usize,
+    ) -> Result<Option<NativeSlowDfaProgram>, CompileError> {
+        if self.context_dfa.is_some()
+            || !matches!(self.engine, ProgramEngine::OrderedNfa)
+            || self.automaton.stats().has_assertions()
+        {
+            return Ok(None);
+        }
+        let wants_reverse = self.output == OutputContract::Span && self.exact_match_width.is_none();
+        let (outcome, allocation_bytes) = dfa::determinize_for_output_with_allocation_limit(
+            &self.raw,
+            self.output,
+            wants_reverse,
+            limits,
+            max_allocation_bytes,
+        )?;
+        match outcome {
+            DeterminizeOutcome::Complete { machine, report } => Ok(Some(NativeSlowDfaProgram {
+                machine,
+                required_literals: required_literals::derive(&self.raw),
+                report,
+                allocation_bytes,
+            })),
+            DeterminizeOutcome::Declined { .. } => Ok(None),
+        }
+    }
+
+    pub(crate) fn native_slow_determinized_view<'a>(
+        &'a self,
+        candidate: &'a NativeSlowDfaProgram,
+    ) -> NativeProgramView<'a> {
+        let dfa = candidate.machine.native_view();
+        NativeProgramView {
+            output: self.output,
+            raw: &self.raw,
+            dfa,
+            partial_discovered_states: None,
+            anchored_prefix: &self.anchored_prefix,
+            anchored_suffix: &self.anchored_suffix,
+            required_literals: &candidate.required_literals,
+            exact_match_width: self.exact_match_width,
+            max_match_width: self.max_match_width(),
+            exact_product_width: None,
+            retained_prefix_requirement: None,
+            retained_suffix_requirement: None,
+        }
     }
 
     pub(crate) fn native_fully_prefilled_view<'a>(
@@ -15101,6 +15192,140 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn slow_determinization_can_outgrow_the_fixed_k0_cache_layout() {
+        // The suffix remembers fifteen independent binary positions after a
+        // moving witness. Its subset graph is intentionally larger than the
+        // source-independent K0 cache ceiling, but remains small enough for a
+        // deterministic unit test of the separately selected slow compiler.
+        let pattern = r"(?:a|b)*a(?:a|b){15}";
+        let compiled = program(
+            pattern,
+            OutputContract::Exists,
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+        );
+        assert!(compiled.native_fully_prefilled_program().is_none());
+        assert!(matches!(compiled.engine, ProgramEngine::OrderedNfa));
+        assert_eq!(
+            compiled.engine_selection_reason,
+            Some(EngineSelectionReason::DeterminizationResourceLimit)
+        );
+        assert!(!compiled.automaton.stats().has_assertions());
+
+        let machine = compiled
+            .native_slow_determinized_program(DeterminizeLimits::default(), 256 * 1024 * 1024)
+            .unwrap()
+            .expect("slow compiler completes graph beyond the K0 cache");
+        assert!(
+            machine.stats().forward_states_before_minimization > 16_385,
+            "{:?}",
+            machine.stats()
+        );
+
+        let mut matching = vec![b'b'; 32];
+        matching[3] = b'a';
+        assert!(machine
+            .machine
+            .exists(&matching, 0, matching.len())
+            .unwrap());
+        let nonmatching = vec![b'b'; 32];
+        assert!(!machine
+            .machine
+            .exists(&nonmatching, 0, nonmatching.len())
+            .unwrap());
+
+        let restored = CompiledProgram::deserialize(&compiled.serialize().unwrap()).unwrap();
+        let restored_machine = restored
+            .native_slow_determinized_program(DeterminizeLimits::default(), 256 * 1024 * 1024)
+            .unwrap()
+            .expect("restored fallback retains explicit slow-compiler eligibility");
+        assert_eq!(restored_machine.stats(), machine.stats());
+
+        let fast = program(
+            pattern,
+            OutputContract::Exists,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        let fast_machine = fast
+            .native_slow_determinized_program(DeterminizeLimits::default(), 256 * 1024 * 1024)
+            .unwrap()
+            .expect("the explicit slow compiler accepts a fresh Fast artifact");
+        assert_eq!(fast_machine.stats(), machine.stats());
+        let fast_restored = CompiledProgram::deserialize(&fast.serialize().unwrap()).unwrap();
+        let fast_restored_machine = fast_restored
+            .native_slow_determinized_program(DeterminizeLimits::default(), 256 * 1024 * 1024)
+            .unwrap()
+            .expect("the explicit slow compiler accepts a restored Fast artifact");
+        assert_eq!(fast_restored_machine.stats(), machine.stats());
+    }
+
+    #[test]
+    fn slow_fast_and_restored_candidates_rederive_required_interior_literals() {
+        let pattern = r"(?s:.*)needle(?s:.*)";
+        let fast = program(
+            pattern,
+            OutputContract::Exists,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        assert!(fast.required_literals.interior().candidates().is_empty());
+        let candidate = fast
+            .native_slow_determinized_program(
+                DeterminizeLimits::default(),
+                16 * 1024 * 1024,
+            )
+            .expect("fresh Fast slow determinization")
+            .expect("fresh Fast complete slow candidate");
+        assert!(
+            !candidate
+                .required_literals
+                .interior()
+                .candidates()
+                .is_empty(),
+            "slow candidate did not rederive mandatory interior literals"
+        );
+
+        let target = crate::Target::x86_64_linux()
+            .with_features(crate::FeatureSet::of(crate::CpuFeature::X86Avx2))
+            .expect("AVX2 target");
+        let fresh_module = crate::CompiledModule::lower_optimizing(&fast, target)
+            .expect("fresh Fast slow native lowering");
+        assert_ne!(
+            fresh_module.start_accelerator(),
+            crate::StartAccelerator::None
+        );
+
+        let restored = CompiledProgram::deserialize(&fast.serialize().unwrap()).unwrap();
+        let restored_candidate = restored
+            .native_slow_determinized_program(
+                DeterminizeLimits::default(),
+                16 * 1024 * 1024,
+            )
+            .expect("restored Fast slow determinization")
+            .expect("restored Fast complete slow candidate");
+        assert!(
+            !restored_candidate
+                .required_literals
+                .interior()
+                .candidates()
+                .is_empty()
+        );
+        let restored_module = crate::CompiledModule::lower_optimizing(&restored, target)
+            .expect("restored Fast slow native lowering");
+        assert_eq!(restored_module.sections(), fresh_module.sections());
+        assert_eq!(restored_module.symbols(), fresh_module.symbols());
+        assert_eq!(restored_module.relocations(), fresh_module.relocations());
+        assert_eq!(
+            restored_module.start_accelerator(),
+            crate::StartAccelerator::X86Avx2
+        );
     }
 
     #[test]

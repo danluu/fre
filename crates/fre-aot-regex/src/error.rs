@@ -17,6 +17,12 @@ pub enum ObjectError {
     UnsupportedTarget,
     ArithmeticOverflow(&'static str),
     InvalidModule(&'static str),
+    /// Fallible compiler scratch or artifact allocation was refused.
+    ///
+    /// This is distinct from a malformed module so optional optimizing
+    /// candidates can decline memory pressure without hiding structural
+    /// compiler failures.
+    Allocation(&'static str),
     Resource {
         resource: CompileResource,
         limit: usize,
@@ -32,6 +38,7 @@ impl fmt::Display for ObjectError {
                 write!(formatter, "object arithmetic overflow at {site}")
             }
             Self::InvalidModule(detail) => write!(formatter, "invalid compiled module: {detail}"),
+            Self::Allocation(site) => write!(formatter, "object allocation failed at {site}"),
             Self::Resource {
                 resource,
                 limit,

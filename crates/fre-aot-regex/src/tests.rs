@@ -7,8 +7,117 @@ use crate::{
     ContextDfaResource, CpuFeature, DeterminizationResource, DeterminizationStage, EngineKind,
     EngineSelectionReason, FeatureSet,
     MAX_STABLE_DFA_BUILD_WORK, MatchResult, OperatingSystem, OptimizationPass, OutputContract,
-    SearchWindow, SectionKind, StartAccelerator, Target, compile, emit_object,
+    SearchWindow, SectionKind, SlowAotLimits, StartAccelerator, Target, compile,
+    compile_with_slow_aot_limits, emit_object,
 };
+
+#[test]
+fn slow_aot_receipts_second_determinization_and_both_memory_caps() {
+    let mut compile_limits = CompileLimitsV1::default();
+    compile_limits.determinize.max_states = 0;
+    let slow_limits = SlowAotLimits {
+        max_native_data_bytes: usize::MAX,
+        ..SlowAotLimits::default()
+    };
+    let compiled = compile_with_slow_aot_limits(
+        CompileRequest::new(r"(?:a|b)*a(?:a|b){15}", Target::x86_64_linux())
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Exists)
+            .limits(compile_limits),
+        slow_limits,
+    )
+    .expect("bounded slow AOT compile");
+
+    assert_eq!(compiled.receipt().engine, EngineKind::OrderedNfa);
+    assert!(compiled.receipt().determinization.decline.is_some());
+    let report = compiled
+        .receipt()
+        .slow_aot
+        .as_ref()
+        .expect("selected slow-AOT receipt");
+    assert_eq!(report.requested_limits, slow_limits);
+    assert_eq!(
+        report.effective_native_data_limit_bytes,
+        compile_limits.max_object_bytes
+    );
+    assert_eq!(report.determinization.decline, None);
+    assert!(report.allocation_bytes <= slow_limits.max_allocation_bytes);
+    assert!(report.native_data_bytes <= report.effective_native_data_limit_bytes);
+    assert_eq!(report.native_data_bytes, compiled.receipt().data_bytes);
+    assert!(!compiled.receipt().runtime_helper_required);
+
+    let allocation_declined = compile_with_slow_aot_limits(
+        CompileRequest::new(r"(?:a|b)*a(?:a|b){15}", Target::x86_64_linux())
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Exists)
+            .limits(compile_limits),
+        SlowAotLimits {
+            max_allocation_bytes: 0,
+            ..slow_limits
+        },
+    )
+    .expect("ordinary runtime fallback after slow allocation decline");
+    assert!(allocation_declined.receipt().slow_aot.is_none());
+    assert!(allocation_declined.receipt().runtime_helper_required);
+
+    let span = compile_with_slow_aot_limits(
+        CompileRequest::new("[ab]+z", Target::x86_64_linux())
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Span)
+            .limits(compile_limits),
+        slow_limits,
+    )
+    .expect("variable-width Span slow AOT compile");
+    assert!(
+        span.receipt()
+            .slow_aot
+            .as_ref()
+            .is_some_and(|report| report.dfa.reverse_states != 0)
+    );
+    assert!(
+        !span
+            .receipt()
+            .passes
+            .contains(&OptimizationPass::RemoveUnusedReverseMachine)
+    );
+}
+
+#[test]
+fn slow_decline_tries_k0_before_the_ordinary_runtime_route() {
+    let mut compile_limits = CompileLimitsV1::default();
+    compile_limits.determinize.max_states = 0;
+    let request = || {
+        CompileRequest::new(
+            "a+Q|[b-c][a-b]{1,5}(?:x+|y+)",
+            Target::x86_64_linux(),
+        )
+        .mode(CompileMode::Optimizing)
+        .output(OutputContract::SelectedEnd)
+        .limits(compile_limits)
+    };
+    let k0 = compile_with_slow_aot_limits(
+        request(),
+        SlowAotLimits {
+            max_allocation_bytes: 0,
+            ..SlowAotLimits::default()
+        },
+    )
+    .expect("K0 native fallback");
+    assert!(k0.receipt().slow_aot.is_none());
+    assert!(!k0.receipt().runtime_helper_required);
+
+    let ordinary = compile_with_slow_aot_limits(
+        request(),
+        SlowAotLimits {
+            max_allocation_bytes: 0,
+            max_native_data_bytes: 0,
+            ..SlowAotLimits::default()
+        },
+    )
+    .expect("ordinary fallback after slow and K0 native-data declines");
+    assert!(ordinary.receipt().slow_aot.is_none());
+    assert!(ordinary.receipt().runtime_helper_required);
+}
 
 #[test]
 fn program_byte_cap_rejects_before_canonical_serialization() {
@@ -51,6 +160,7 @@ fn optimizing_object_cap_falls_back_to_the_bounded_module() {
     };
     let optimized = compile(request(limits)).expect("unbounded optimizing compile");
     assert_eq!(optimized.module().required_runtime_symbol(), None);
+    assert!(optimized.receipt().slow_aot.is_some());
 
     let fallback = crate::CompiledModule::lower(optimized.program(), target)
         .expect("bounded fallback lowering");
@@ -63,14 +173,29 @@ fn optimizing_object_cap_falls_back_to_the_bounded_module() {
     .expect("unbounded fallback object");
     assert!(optimized.object().len() > fallback_object.len());
 
-    limits.max_object_bytes = fallback_object.len();
-    let constrained = compile(request(limits)).expect("fallback fits the exact object cap");
-    assert_eq!(constrained.module(), &fallback);
-    assert_eq!(constrained.object(), fallback_object);
-    assert!(constrained.receipt().runtime_helper_required);
-    assert_eq!(constrained.receipt().object_bytes, limits.max_object_bytes);
+    limits.max_object_bytes = fallback_object.len().max(
+        optimized
+            .receipt()
+            .slow_aot
+            .as_ref()
+            .expect("slow-AOT receipt")
+            .native_data_bytes,
+    );
+    assert!(limits.max_object_bytes < optimized.object().len());
+    let constrained = compile(request(limits)).expect("K0 fits after the slow object cap");
+    assert_ne!(constrained.module(), &fallback);
+    assert!(!constrained.receipt().runtime_helper_required);
+    assert!(constrained.receipt().slow_aot.is_none());
+    assert!(constrained.receipt().object_bytes <= limits.max_object_bytes);
 
-    limits.max_object_bytes -= 1;
+    limits.max_object_bytes = fallback_object.len();
+    let ordinary = compile(request(limits)).expect("ordinary module fits its exact object cap");
+    assert_eq!(ordinary.module(), &fallback);
+    assert_eq!(ordinary.object(), fallback_object);
+    assert!(ordinary.receipt().runtime_helper_required);
+    assert!(ordinary.receipt().slow_aot.is_none());
+
+    limits.max_object_bytes = fallback_object.len() - 1;
     assert!(matches!(
         compile(request(limits)),
         Err(CompileError::Object(crate::ObjectError::Resource {
@@ -293,6 +418,87 @@ fn every_target_tuple_emits_the_same_semantic_program() {
                     }
                 );
             }
+        }
+    }
+}
+
+#[test]
+fn slow_aot_is_target_neutral_across_os_and_feature_tiers() {
+    let x86_avx2 = Target::x86_64_linux()
+        .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+        .expect("AVX2 target");
+    let x86_avx512 = Target::x86_64_macos()
+        .with_features(
+            FeatureSet::of(CpuFeature::X86Avx512F)
+                .with(CpuFeature::X86Avx512Bw)
+                .with(CpuFeature::X86Avx512Vl),
+        )
+        .expect("AVX-512 target");
+    let aarch64_asimd = Target::aarch64_macos()
+        .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+        .expect("ASIMD target");
+    let aarch64_sve = Target::aarch64_linux()
+        .with_features(FeatureSet::of(CpuFeature::Aarch64Sve))
+        .expect("SVE target");
+    let aarch64_sve2 = Target::aarch64_linux()
+        .with_features(
+            FeatureSet::of(CpuFeature::Aarch64Sve).with(CpuFeature::Aarch64Sve2),
+        )
+        .expect("SVE2 target");
+    let targets = [
+        Target::x86_64_linux(),
+        Target::x86_64_macos(),
+        x86_avx2,
+        x86_avx512,
+        Target::aarch64_linux(),
+        Target::aarch64_macos(),
+        aarch64_asimd,
+        aarch64_sve,
+        aarch64_sve2,
+    ];
+    let mut limits = CompileLimitsV1::default();
+    limits.determinize.max_states = 0;
+    let mut program_digest = None;
+    let mut slow_determinization = None;
+    let mut slow_dfa = None;
+    let mut slow_allocation = None;
+    for target in targets {
+        let compiled = compile(
+            CompileRequest::new("a+Q|[b-c][a-b]{1,5}(?:x+|y+)", target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::SelectedEnd)
+                .limits(limits),
+        )
+        .unwrap_or_else(|error| panic!("slow AOT target {target:?}: {error}"));
+        let report = compiled
+            .receipt()
+            .slow_aot
+            .as_ref()
+            .unwrap_or_else(|| panic!("slow candidate was not selected for {target:?}"));
+        assert!(!compiled.receipt().runtime_helper_required, "{target:?}");
+        assert_ne!(compiled.receipt().start_accelerator, StartAccelerator::None);
+        assert!(report.native_data_bytes <= report.effective_native_data_limit_bytes);
+        assert_eq!(
+            compiled
+                .search(b"xxcbbbbx", SearchWindow::full(b"xxcbbbbx"))
+                .unwrap(),
+            MatchResult::SelectedEnd(Some(8))
+        );
+
+        if let Some(expected) = program_digest {
+            assert_eq!(compiled.receipt().program_sha256, expected, "{target:?}");
+            assert_eq!(
+                &report.determinization,
+                slow_determinization.as_ref().unwrap(),
+                "{target:?}"
+            );
+            assert_eq!(report.dfa, slow_dfa.unwrap(), "{target:?}");
+            assert_eq!(report.allocation_bytes, slow_allocation.unwrap(), "{target:?}");
+        } else {
+            program_digest = Some(compiled.receipt().program_sha256);
+            slow_determinization = Some(report.determinization.clone());
+            slow_dfa = Some(report.dfa);
+            slow_allocation = Some(report.allocation_bytes);
         }
     }
 }

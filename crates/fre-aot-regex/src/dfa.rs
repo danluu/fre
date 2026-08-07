@@ -1,6 +1,8 @@
 use core::hash::{BuildHasherDefault, Hash, Hasher};
+use core::cell::Cell;
 use memchr::{memchr, memchr2, memchr3};
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use fre_automata::{EdgeKind, RawPlan, StateRole};
 use fre_simd_kernels::{
@@ -116,6 +118,103 @@ impl Default for DeterminizeLimits {
             max_transitions: 16_777_216,
             max_work: MAX_STABLE_DFA_BUILD_WORK,
         }
+    }
+}
+
+/// Shared logical-allocation ledger for one explicitly selected slow
+/// determinization transaction.
+///
+/// Charges are monotonic within one construction attempt. This deliberately
+/// over-counts short-lived scratch rather than trying to infer allocator
+/// metadata or lifetime from `Vec` and `HashMap`. A declined ordered endpoint
+/// attempt owns no retained machine in the slow compiler, so its checkpoint
+/// can be restored before the mutually exclusive endpoint-pruned rescue.
+#[derive(Clone, Debug)]
+pub(crate) struct DeterminizeAllocationLedger {
+    state: Rc<Cell<DeterminizeAllocationState>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DeterminizeAllocationState {
+    limit: usize,
+    charged: usize,
+    peak: usize,
+    exhausted: bool,
+}
+
+impl DeterminizeAllocationLedger {
+    pub(crate) fn new(limit: usize) -> Self {
+        Self {
+            state: Rc::new(Cell::new(DeterminizeAllocationState {
+                limit,
+                charged: 0,
+                peak: 0,
+                exhausted: false,
+            })),
+        }
+    }
+
+    fn charge_bytes(&self, bytes: usize) -> bool {
+        let mut state = self.state.get();
+        let Some(charged) = state.charged.checked_add(bytes) else {
+            state.exhausted = true;
+            self.state.set(state);
+            return false;
+        };
+        if charged > state.limit {
+            state.exhausted = true;
+            self.state.set(state);
+            return false;
+        }
+        state.charged = charged;
+        state.peak = state.peak.max(charged);
+        self.state.set(state);
+        true
+    }
+
+    fn charge_elements<T>(&self, elements: usize) -> bool {
+        let Some(bytes) = elements.checked_mul(core::mem::size_of::<T>()) else {
+            let mut state = self.state.get();
+            state.exhausted = true;
+            self.state.set(state);
+            return false;
+        };
+        self.charge_bytes(bytes)
+    }
+
+    /// Conservatively account for hash buckets, control bytes, and load-factor
+    /// slack without depending on the standard library's private table layout.
+    fn charge_map_entries<K, V>(&self, entries: usize) -> bool {
+        let entry = core::mem::size_of::<K>()
+            .saturating_add(core::mem::size_of::<V>())
+            .saturating_add(1);
+        let Some(bytes) = entries.checked_mul(entry).and_then(|bytes| bytes.checked_mul(2)) else {
+            let mut state = self.state.get();
+            state.exhausted = true;
+            self.state.set(state);
+            return false;
+        };
+        self.charge_bytes(bytes)
+    }
+
+    fn checkpoint(&self) -> usize {
+        self.state.get().charged
+    }
+
+    fn restore(&self, checkpoint: usize) {
+        let mut state = self.state.get();
+        debug_assert!(checkpoint <= state.charged);
+        state.charged = checkpoint;
+        state.exhausted = false;
+        self.state.set(state);
+    }
+
+    fn exhausted(&self) -> bool {
+        self.state.get().exhausted
+    }
+
+    pub(crate) fn peak_bytes(&self) -> usize {
+        self.state.get().peak
     }
 }
 
@@ -2861,6 +2960,9 @@ fn dfa_reserve<T>(capacity: usize, table: &'static str) -> Result<Vec<T>, Progra
 }
 
 fn build_vec<T>(capacity: usize, budget: &mut BuildBudget) -> Option<Vec<T>> {
+    if !budget.charge_allocation::<T>(capacity) {
+        return None;
+    }
     let mut values = Vec::new();
     if values.try_reserve_exact(capacity).is_err() {
         budget.allocation::<T>(capacity);
@@ -2873,7 +2975,23 @@ fn ensure_vec_capacity<T>(values: &mut Vec<T>, capacity: usize, budget: &mut Bui
     if values.capacity() >= capacity {
         return true;
     }
-    let additional = capacity.saturating_sub(values.len());
+    let reserve_capacity = if budget.allocation_ledger.is_some() {
+        values
+            .capacity()
+            .saturating_mul(2)
+            .max(capacity)
+            .max(4)
+    } else {
+        capacity
+    };
+    // A reallocating allocator may keep the complete old buffer live while
+    // reserving its replacement. Charging every full prospective capacity,
+    // combined with geometric slow-path growth, bounds that transient peak
+    // without quadratic accounting for one-element worklist expansion.
+    if !budget.charge_allocation::<T>(reserve_capacity) {
+        return false;
+    }
+    let additional = reserve_capacity.saturating_sub(values.len());
     if values.try_reserve_exact(additional).is_err() {
         budget.allocation::<T>(capacity);
         return false;
@@ -2927,9 +3045,20 @@ fn build_map<K: Eq + Hash, V>(
     capacity: usize,
     budget: &mut BuildBudget,
 ) -> Option<StableMap<K, V>> {
+    // Hash tables allocate a minimum bucket group even for one requested
+    // entry. Keep the slow path's initial policy consistent with geometric
+    // growth so the conservative table charge cannot undercount that group.
+    let reserve_capacity = if budget.allocation_ledger.is_some() {
+        capacity.max(4)
+    } else {
+        capacity
+    };
+    if !budget.charge_map_allocation::<K, V>(reserve_capacity) {
+        return None;
+    }
     let mut values = StableMap::default();
-    if values.try_reserve(capacity).is_err() {
-        budget.allocation::<(K, V)>(capacity);
+    if values.try_reserve(reserve_capacity).is_err() {
+        budget.allocation::<(K, V)>(reserve_capacity);
         return None;
     }
     Some(values)
@@ -2940,8 +3069,28 @@ fn reserve_map<K: Eq + Hash, V>(
     additional: usize,
     budget: &mut BuildBudget,
 ) -> bool {
-    if values.try_reserve(additional).is_err() {
-        budget.allocation::<(K, V)>(values.len().saturating_add(additional));
+    let Some(required) = values.len().checked_add(additional) else {
+        budget.allocation::<(K, V)>(usize::MAX);
+        return false;
+    };
+    if values.capacity() >= required {
+        return true;
+    }
+    let reserve_capacity = if budget.allocation_ledger.is_some() {
+        values
+            .capacity()
+            .saturating_mul(2)
+            .max(required)
+            .max(4)
+    } else {
+        required
+    };
+    if !budget.charge_map_allocation::<K, V>(reserve_capacity) {
+        return false;
+    }
+    let reserve_additional = reserve_capacity.saturating_sub(values.len());
+    if values.try_reserve(reserve_additional).is_err() {
+        budget.allocation::<(K, V)>(reserve_capacity);
         return false;
     }
     true
@@ -3054,12 +3203,17 @@ impl DeterminizeOutcome {
     }
 }
 
-fn determinize_impl(
+#[allow(
+    clippy::too_many_lines,
+    reason = "the failure-atomic determinization stages and their partial-artifact policy stay adjacent"
+)]
+fn determinize_impl_with_allocation_ledger(
     raw: &RawPlan,
     wants_span: bool,
     requested_limits: DeterminizeLimits,
     semantics: ForwardSemantics,
     replay_order: DfaReplayOrder,
+    allocation_ledger: Option<DeterminizeAllocationLedger>,
 ) -> Result<DeterminizeOutcome, CompileError> {
     if raw
         .edge_kinds
@@ -3071,7 +3225,10 @@ fn determinize_impl(
         ));
     }
 
-    let mut budget = BuildBudget::new(requested_limits);
+    let mut budget = allocation_ledger.map_or_else(
+        || BuildBudget::new(requested_limits),
+        |ledger| BuildBudget::new_slow(requested_limits, ledger),
+    );
     budget.begin_stage(DeterminizationStage::AlphabetPartition);
     let Some(built_alphabet) = Alphabet::build(raw, &mut budget)? else {
         return Ok(DeterminizeOutcome::from_budget(None, None, budget));
@@ -3086,11 +3243,13 @@ fn determinize_impl(
     let mut forward = match build_forward(raw, &alphabet, &mut budget, semantics, replay_order)? {
         ForwardBuildOutcome::Complete(forward) => forward,
         ForwardBuildOutcome::Declined(partial) => {
-            let partial = partial.map(|forward| PartialDfa {
-                alphabet,
-                forward,
-                effective_limits: budget.limits,
-            });
+            let partial = budget.retain_partial.then(|| {
+                partial.map(|forward| PartialDfa {
+                    alphabet,
+                    forward,
+                    effective_limits: budget.limits,
+                })
+            }).flatten();
             return Ok(DeterminizeOutcome::from_budget(None, partial, budget));
         }
     };
@@ -3098,11 +3257,11 @@ fn determinize_impl(
     let mut reverse = if wants_span && !forward.initial_pending {
         budget.begin_stage(DeterminizationStage::ReverseSubsetConstruction);
         let Some(reverse) = build_reverse(raw, &alphabet, &mut budget)? else {
-            let partial = PartialDfa::from_complete_forward(
-                alphabet,
-                forward,
-                &mut budget,
-            )?;
+            let partial = if budget.retain_partial {
+                PartialDfa::from_complete_forward(alphabet, forward, &mut budget)?
+            } else {
+                None
+            };
             return Ok(DeterminizeOutcome::from_budget(None, partial, budget));
         };
         budget.complete_stage(DeterminizationStage::ReverseSubsetConstruction)?;
@@ -3114,13 +3273,21 @@ fn determinize_impl(
     let reverse_states_before_minimization = reverse.as_ref().map_or(0, |machine| machine.states);
     budget.begin_stage(DeterminizationStage::DfaStateMinimization);
     if !minimize_dfa_states(&mut forward, &mut reverse, alphabet.classes(), &mut budget)? {
-        let partial = PartialDfa::from_complete_forward(alphabet, forward, &mut budget)?;
+        let partial = if budget.retain_partial {
+            PartialDfa::from_complete_forward(alphabet, forward, &mut budget)?
+        } else {
+            None
+        };
         return Ok(DeterminizeOutcome::from_budget(None, partial, budget));
     }
     budget.complete_stage(DeterminizationStage::DfaStateMinimization)?;
     budget.begin_stage(DeterminizationStage::AlphabetColumnCoalescing);
     if !coalesce_alphabet_columns(&mut alphabet, &mut forward, &mut reverse, &mut budget)? {
-        let partial = PartialDfa::from_complete_forward(alphabet, forward, &mut budget)?;
+        let partial = if budget.retain_partial {
+            PartialDfa::from_complete_forward(alphabet, forward, &mut budget)?
+        } else {
+            None
+        };
         return Ok(DeterminizeOutcome::from_budget(None, partial, budget));
     }
     budget.complete_stage(DeterminizationStage::AlphabetColumnCoalescing)?;
@@ -3153,6 +3320,23 @@ fn determinize_impl(
         stats,
     };
     Ok(DeterminizeOutcome::from_budget(Some(machine), None, budget))
+}
+
+fn determinize_impl(
+    raw: &RawPlan,
+    wants_span: bool,
+    requested_limits: DeterminizeLimits,
+    semantics: ForwardSemantics,
+    replay_order: DfaReplayOrder,
+) -> Result<DeterminizeOutcome, CompileError> {
+    determinize_impl_with_allocation_ledger(
+        raw,
+        wants_span,
+        requested_limits,
+        semantics,
+        replay_order,
+        None,
+    )
 }
 
 /// Build the historical priority-preserving machine.
@@ -3213,38 +3397,104 @@ pub(crate) fn determinize_for_output(
     wants_span: bool,
     requested_limits: DeterminizeLimits,
 ) -> Result<DeterminizeOutcome, CompileError> {
+    determinize_for_output_with_ledger(raw, output, wants_span, requested_limits, None)
+}
+
+/// Build an output-specialized machine while conservatively bounding every
+/// fallible logical allocation made by the slow compiler.
+///
+/// The returned byte count is the maximum charged extent of either mutually
+/// exclusive endpoint construction attempt. No partial artifact is retained
+/// on decline, because the caller already owns the original semantic fallback.
+pub(crate) fn determinize_for_output_with_allocation_limit(
+    raw: &RawPlan,
+    output: OutputContract,
+    wants_span: bool,
+    requested_limits: DeterminizeLimits,
+    max_allocation_bytes: usize,
+) -> Result<(DeterminizeOutcome, usize), CompileError> {
+    let ledger = DeterminizeAllocationLedger::new(max_allocation_bytes);
+    let outcome = determinize_for_output_with_ledger(
+        raw,
+        output,
+        wants_span,
+        requested_limits,
+        Some(&ledger),
+    )?;
+    Ok((outcome, ledger.peak_bytes()))
+}
+
+fn determinize_for_output_with_ledger(
+    raw: &RawPlan,
+    output: OutputContract,
+    wants_span: bool,
+    requested_limits: DeterminizeLimits,
+    allocation_ledger: Option<&DeterminizeAllocationLedger>,
+) -> Result<DeterminizeOutcome, CompileError> {
     if output == OutputContract::Exists {
-        return determinize_impl(
+        return determinize_impl_with_allocation_ledger(
             raw,
             false,
             requested_limits,
             ForwardSemantics::Exists,
             DfaReplayOrder::DescendingClassMass,
+            allocation_ledger.cloned(),
         );
     }
-    let ordered = determinize_impl(
+    let allocation_checkpoint = allocation_ledger.map_or(0, DeterminizeAllocationLedger::checkpoint);
+    let ordered = determinize_impl_with_allocation_ledger(
         raw,
         wants_span,
         requested_limits,
         ForwardSemantics::Ordered,
         DfaReplayOrder::DescendingClassMass,
+        allocation_ledger.cloned(),
     )?;
+    let allocation_declined = matches!(
+        ordered,
+        DeterminizeOutcome::Declined {
+            report: DeterminizationReport {
+                decline: Some(DeterminizationDecline {
+                    resource: DeterminizationResource::Allocation { .. },
+                    ..
+                }),
+                ..
+            },
+            ..
+        }
+    );
     if matches!(ordered, DeterminizeOutcome::Complete { .. })
-        || matches!(
+        || (allocation_declined
+            && allocation_ledger.is_none_or(|ledger| !ledger.exhausted()))
+    {
+        return Ok(ordered);
+    }
+    if matches!(
+        ordered,
+        DeterminizeOutcome::Declined {
+            report: DeterminizationReport {
+                decline: None,
+                ..
+            },
+            ..
+        }
+    ) {
+        return Err(CompileError::InternalInvariant(
+            "declined endpoint determinization has no resource",
+        ));
+    }
+    if allocation_ledger.is_some()
+        && matches!(
             ordered,
             DeterminizeOutcome::Declined {
-                report: DeterminizationReport {
-                    decline: Some(DeterminizationDecline {
-                        resource: DeterminizationResource::Allocation { .. },
-                        ..
-                    }),
-                    ..
-                },
+                partial: Some(_),
                 ..
             }
         )
     {
-        return Ok(ordered);
+        return Err(CompileError::InternalInvariant(
+            "slow endpoint determinization retained a partial machine",
+        ));
     }
 
     let effective_limits = requested_limits.effective_for_stable_artifact();
@@ -3254,6 +3504,13 @@ pub(crate) fn determinize_for_output(
     )?;
     if remaining_work == 0 {
         return Ok(ordered);
+    }
+
+    if let Some(ledger) = allocation_ledger {
+        // Slow attempts retain no partial rows. The ordered construction is
+        // fully dropped here, so the endpoint-pruned rescue may reuse the same
+        // hard logical byte budget without allowing simultaneous ownership.
+        ledger.restore(allocation_checkpoint);
     }
 
     // Endpoint dominance is a failure-atomic rescue attempt, never a tax on a
@@ -3266,12 +3523,13 @@ pub(crate) fn determinize_for_output(
     // measured work never exceeds the caller's one hard limit.
     let mut rescue_limits = requested_limits;
     rescue_limits.max_work = remaining_work;
-    let mut pruned = determinize_impl(
+    let mut pruned = determinize_impl_with_allocation_ledger(
         raw,
         wants_span,
         rescue_limits,
         ForwardSemantics::EndpointPruned,
         DfaReplayOrder::DescendingClassMass,
+        allocation_ledger.cloned(),
     )?;
     if matches!(pruned, DeterminizeOutcome::Complete { .. }) {
         pruned.account_prior_attempt(ordered_work, requested_limits)?;
@@ -4612,15 +4870,19 @@ fn build_forward(
     let mut cursor = 0usize;
     macro_rules! decline_with_complete_rows {
         () => {{
-            let partial = compact_partial_forward(
-                &transitions,
-                &start_actions,
-                states,
-                cursor,
-                alphabet.classes(),
-                initial_accepted,
-                initial_terminal,
-            );
+            let partial = if budget.retain_partial {
+                compact_partial_forward(
+                    &transitions,
+                    &start_actions,
+                    states,
+                    cursor,
+                    alphabet.classes(),
+                    initial_accepted,
+                    initial_terminal,
+                )
+            } else {
+                None
+            };
             return Ok(ForwardBuildOutcome::Declined(partial));
         }};
     }
@@ -4968,12 +5230,18 @@ fn build_reverse(
 struct BuildBudget {
     requested_limits: DeterminizeLimits,
     limits: DeterminizeLimits,
+    allocation_ledger: Option<DeterminizeAllocationLedger>,
+    retain_partial: bool,
     work: u64,
     states: usize,
     transitions: usize,
     declined: bool,
     decline: Option<DeterminizationDecline>,
     current_stage: Option<DeterminizationStage>,
+    // These two fixed five-entry vectors are receipt metadata, not graph
+    // payload or construction scratch. They are deliberately outside the
+    // slow allocation ledger so a byte-ceiling decline can always describe
+    // the stage that declined.
     attempted_stages: Vec<DeterminizationStage>,
     completed_stages: Vec<DeterminizationStage>,
 }
@@ -4983,6 +5251,28 @@ impl BuildBudget {
         Self {
             requested_limits,
             limits: requested_limits.effective_for_stable_artifact(),
+            allocation_ledger: None,
+            retain_partial: true,
+            work: 0,
+            states: 0,
+            transitions: 0,
+            declined: false,
+            decline: None,
+            current_stage: None,
+            attempted_stages: Vec::with_capacity(5),
+            completed_stages: Vec::with_capacity(5),
+        }
+    }
+
+    fn new_slow(
+        requested_limits: DeterminizeLimits,
+        allocation_ledger: DeterminizeAllocationLedger,
+    ) -> Self {
+        Self {
+            requested_limits,
+            limits: requested_limits.effective_for_stable_artifact(),
+            allocation_ledger: Some(allocation_ledger),
+            retain_partial: false,
             work: 0,
             states: 0,
             transitions: 0,
@@ -5095,6 +5385,30 @@ impl BuildBudget {
             requested_elements,
             element_size: core::mem::size_of::<T>(),
         });
+    }
+
+    fn charge_allocation<T>(&mut self, elements: usize) -> bool {
+        let Some(ledger) = self.allocation_ledger.as_ref() else {
+            return true;
+        };
+        if ledger.charge_elements::<T>(elements) {
+            true
+        } else {
+            self.allocation::<T>(elements);
+            false
+        }
+    }
+
+    fn charge_map_allocation<K, V>(&mut self, entries: usize) -> bool {
+        let Some(ledger) = self.allocation_ledger.as_ref() else {
+            return true;
+        };
+        if ledger.charge_map_entries::<K, V>(entries) {
+            true
+        } else {
+            self.allocation::<(K, V)>(entries);
+            false
+        }
     }
 
     /// A retained sidecar is optional, but failure to allocate its final
@@ -5300,8 +5614,12 @@ impl Incoming {
             }
         }
         for (row, &degree) in by_target.iter_mut().zip(&degrees) {
-            if row.try_reserve_exact(degree).is_err() {
-                budget.allocation::<u32>(degree);
+            // Every incoming edge is retained in one inner row. Account for
+            // those separately allocated buffers as well as the outer
+            // `Vec<Vec<_>>`; otherwise a wide reverse graph could evade the
+            // slow compiler's byte ceiling even though its total row payload
+            // is proportional to all raw edges.
+            if !ensure_vec_capacity(row, degree, budget) {
                 return Ok(None);
             }
         }
@@ -6229,6 +6547,78 @@ mod tests {
             .complete_stage(DeterminizationStage::AlphabetPartition)
             .expect("complete graph alphabet stage");
         built.alphabet
+    }
+
+    #[test]
+    fn slow_allocation_ledger_charges_nested_reverse_incoming_rows() {
+        let raw = equivalent_consume_pair_graph();
+        let edge_count = raw.edge_targets.len();
+        let state_count = raw.roles.len();
+        let expected = edge_count * core::mem::size_of::<u32>()
+            + state_count * core::mem::size_of::<Vec<u32>>()
+            + state_count * core::mem::size_of::<usize>()
+            // Slow-path vector growth has a four-element minimum.
+            + 4 * core::mem::size_of::<u32>();
+
+        let ledger = DeterminizeAllocationLedger::new(expected);
+        let mut budget = BuildBudget::new_slow(DeterminizeLimits::unlimited(), ledger.clone());
+        budget.begin_stage(DeterminizationStage::ReverseSubsetConstruction);
+        assert!(
+            Incoming::build(&raw, &mut budget)
+                .expect("valid reverse graph")
+                .is_some()
+        );
+        assert_eq!(ledger.peak_bytes(), expected);
+        assert!(!budget.declined);
+
+        let ledger = DeterminizeAllocationLedger::new(expected - 1);
+        let mut budget = BuildBudget::new_slow(DeterminizeLimits::unlimited(), ledger);
+        budget.begin_stage(DeterminizationStage::ReverseSubsetConstruction);
+        assert!(
+            Incoming::build(&raw, &mut budget)
+                .expect("valid reverse graph")
+                .is_none()
+        );
+        assert!(matches!(
+            budget.decline,
+            Some(DeterminizationDecline {
+                stage: DeterminizationStage::ReverseSubsetConstruction,
+                resource: DeterminizationResource::Allocation {
+                    requested_elements: 4,
+                    element_size: 4,
+                },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn slow_allocation_decline_never_retains_a_partial_machine() {
+        let raw = lowered_assertion_free("a+Q|[b-c][a-b]{1,5}(?:x+|y+)");
+        let (outcome, peak) = determinize_for_output_with_allocation_limit(
+            &raw,
+            OutputContract::Span,
+            true,
+            DeterminizeLimits::unlimited(),
+            0,
+        )
+        .expect("bounded slow determinization");
+        assert_eq!(peak, 0);
+        match outcome {
+            DeterminizeOutcome::Declined { report, partial } => {
+                assert!(partial.is_none());
+                assert!(matches!(
+                    report.decline,
+                    Some(DeterminizationDecline {
+                        resource: DeterminizationResource::Allocation { .. },
+                        ..
+                    })
+                ));
+            }
+            DeterminizeOutcome::Complete { .. } => {
+                panic!("zero-byte slow allocation cap unexpectedly completed")
+            }
+        }
     }
 
     #[test]
