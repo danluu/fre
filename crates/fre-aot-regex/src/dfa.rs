@@ -7025,43 +7025,128 @@ mod tests {
         }));
     }
 
+    fn first_slow_reverse_completion_work(raw: &RawPlan, allocation_limit: usize) -> u64 {
+        let (complete, peak) = determinize_for_output_with_allocation_limit(
+            raw,
+            OutputContract::Span,
+            true,
+            DeterminizeLimits::unlimited(),
+            allocation_limit,
+        )
+        .expect("complete slow reverse-stage oracle");
+        assert!(peak <= allocation_limit);
+        let DeterminizeOutcome::Complete { report, .. } = complete else {
+            panic!("unlimited slow Span construction declined")
+        };
+        assert!(report
+            .completed_stages
+            .contains(&DeterminizationStage::ReverseSubsetConstruction));
+
+        let mut low = 0_u64;
+        let mut high = report.work_completed;
+        while low < high {
+            let middle = low + (high - low) / 2;
+            let (outcome, bounded_peak) = determinize_for_output_with_allocation_limit(
+                raw,
+                OutputContract::Span,
+                true,
+                DeterminizeLimits {
+                    max_work: middle,
+                    ..DeterminizeLimits::unlimited()
+                },
+                allocation_limit,
+            )
+            .expect("bounded slow reverse-stage search");
+            assert!(bounded_peak <= allocation_limit);
+            let bounded_report = match &outcome {
+                DeterminizeOutcome::Complete { report, .. }
+                | DeterminizeOutcome::Declined { report, .. } => report,
+            };
+            if bounded_report
+                .completed_stages
+                .contains(&DeterminizationStage::ReverseSubsetConstruction)
+            {
+                high = middle;
+            } else {
+                low = middle
+                    .checked_add(1)
+                    .expect("bounded reverse-stage midpoint");
+            }
+        }
+        low
+    }
+
     #[test]
     fn slow_reverse_decline_retains_a_complete_forward_without_reverse() {
         let raw = lowered_assertion_free("a+Q|[b-c][a-b]{1,5}(?:x+|y+)");
-        let forward_only_work = determinize_impl(
-            &raw,
-            false,
-            DeterminizeLimits::unlimited(),
-            ForwardSemantics::Ordered,
-            DfaReplayOrder::DescendingClassMass,
-        )
-        .expect("complete forward-only work oracle")
-        .work_completed();
         let allocation_limit = 32 * 1024 * 1024;
-        let (outcome, peak) = determinize_for_output_with_allocation_limit(
-            &raw,
-            OutputContract::Span,
-            true,
-            DeterminizeLimits {
-                max_work: forward_only_work,
-                ..DeterminizeLimits::unlimited()
-            },
-            allocation_limit,
-        )
-        .expect("bounded slow Span construction");
+        let reverse_completion_work =
+            first_slow_reverse_completion_work(&raw, allocation_limit);
+        assert_eq!(
+            first_slow_reverse_completion_work(&raw, allocation_limit),
+            reverse_completion_work,
+            "the exact reverse-stage boundary must be reproducible"
+        );
+        let decline_work = reverse_completion_work
+            .checked_sub(1)
+            .expect("reverse construction requires work");
+        let run_decline = || {
+            determinize_for_output_with_allocation_limit(
+                &raw,
+                OutputContract::Span,
+                true,
+                DeterminizeLimits {
+                    max_work: decline_work,
+                    ..DeterminizeLimits::unlimited()
+                },
+                allocation_limit,
+            )
+            .expect("bounded slow Span construction")
+        };
+        let (outcome, peak) = run_decline();
+        let (replayed_outcome, replayed_peak) = run_decline();
         assert!(peak <= allocation_limit);
-        let DeterminizeOutcome::Declined {
-            report,
-            partial: None,
-            native_slow_partial: Some(partial),
-        } = outcome
+        assert_eq!(peak, replayed_peak);
+        let (
+            DeterminizeOutcome::Declined {
+                report,
+                partial: None,
+                native_slow_partial: Some(partial),
+            },
+            DeterminizeOutcome::Declined {
+                report: replayed_report,
+                partial: None,
+                native_slow_partial: Some(replayed_partial),
+            },
+        ) = (&outcome, &replayed_outcome)
         else {
             panic!("post-forward slow refusal did not retain transient native rows")
         };
-        assert!(report.decline.as_ref().is_some_and(|decline| {
-            decline.stage == DeterminizationStage::ReverseSubsetConstruction
-                && matches!(decline.resource, DeterminizationResource::Work { .. })
-        }));
+        assert_eq!(report, replayed_report);
+        assert_eq!(
+            partial.retained_dimensions(),
+            replayed_partial.retained_dimensions()
+        );
+        assert_eq!(
+            partial.stats(report.work_completed),
+            replayed_partial.stats(replayed_report.work_completed)
+        );
+        assert!(report
+            .completed_stages
+            .contains(&DeterminizationStage::ForwardSubsetConstruction));
+        assert!(!report
+            .completed_stages
+            .contains(&DeterminizationStage::ReverseSubsetConstruction));
+        let decline = report.decline.expect("reverse-stage work decline");
+        assert_eq!(decline.stage, DeterminizationStage::ReverseSubsetConstruction);
+        assert_eq!(
+            decline.resource,
+            DeterminizationResource::Work {
+                limit: decline_work,
+                required: reverse_completion_work,
+            }
+        );
+        assert_eq!(decline.work_completed, decline_work);
         let (complete_rows, discovered_states) = partial.retained_dimensions();
         assert!(complete_rows > 0);
         assert_eq!(complete_rows, discovered_states);
