@@ -932,7 +932,7 @@ const DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL_NAME: &str =
 const DYNAMIC_ROWS_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_search_exclusive_dynamic_rows_recover_span_v1";
 const DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL_NAME: &str =
-    "fre_aot_regex_runtime_scan_frozen_loop_v1";
+    "fre_aot_regex_runtime_scan_frozen_loop_v2";
 const PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_search_exclusive_recover_partial_span_v1";
 const ENTRY_SYMBOL_PREFIX: &str = "fre_aot_regex_search_v1_";
@@ -15476,9 +15476,11 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     assembler.instruction(&[0x48, 0x83, 0xec, 0x10])?;
     assembler.instruction(&[0x4c, 0x89, 0x04, 0x24])?;
     assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x08])?;
-    assembler.instruction(&[0x48, 0x8d, 0x14, 0x17])?;
-    assembler.instruction(&[0x4c, 0x89, 0xd1])?;
-    assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x20])?;
+    // Trusted V2 ABI: RDI=source, RSI=the authenticated scanner retained
+    // from the immutable plan, RDX=remaining length. The active-capability
+    // checks and exact plan/key proof above are the safety boundary.
+    assembler.instruction(&[0x48, 0x8d, 0x3c, 0x17])?;
+    assembler.instruction(&[0x4c, 0x89, 0xd2])?;
     assembler.instruction(&[0xe8])?;
     let v7_loop_scan_displacement_label = assembler.label()?;
     assembler.bind(v7_loop_scan_displacement_label)?;
@@ -15682,9 +15684,9 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     assembler.instruction(&[0x48, 0x83, 0xec, 0x10])?;
     assembler.instruction(&[0x4c, 0x89, 0x14, 0x24])?;
     assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x08])?;
-    assembler.instruction(&[0x48, 0x8d, 0x14, 0x17])?;
-    assembler.instruction(&[0x4c, 0x89, 0xc1])?;
-    assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x20])?;
+    // Keep the same direct-pointer V2 register contract in the V6 body.
+    assembler.instruction(&[0x48, 0x8d, 0x3c, 0x17])?;
+    assembler.instruction(&[0x4c, 0x89, 0xc2])?;
     assembler.instruction(&[0xe8])?;
     let v6_loop_scan_displacement_label = assembler.label()?;
     assembler.bind(v6_loop_scan_displacement_label)?;
@@ -25769,9 +25771,11 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     assembler.instruction(aarch64_sub_x_imm(31, 31, 32)?)?;
     assembler.instruction(aarch64_store_x(11, 31, 0)?)?;
     assembler.instruction(aarch64_store_x(2, 31, 8)?)?;
-    assembler.instruction(aarch64_add_x_reg(2, 0, 2)?)?;
-    assembler.instruction(aarch64_mov_x(3, 12)?)?;
-    assembler.instruction(aarch64_load_x_imm(0, 31, 32)?)?;
+    // Trusted V2 ABI: X0=source, X1=the authenticated scanner retained from
+    // the immutable plan, X2=remaining length. The active-capability checks
+    // and exact plan/key proof above are the safety boundary.
+    assembler.instruction(aarch64_add_x_reg(0, 0, 2)?)?;
+    assembler.instruction(aarch64_mov_x(2, 12)?)?;
     let v7_loop_scan_branch = assembler.instruction(0x9400_0000)?;
     assembler.instruction(aarch64_mov_x(10, 0)?)?;
     assembler.instruction(aarch64_load_x_imm(11, 31, 0)?)?;
@@ -25971,9 +25975,9 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     assembler.instruction(aarch64_sub_x_imm(31, 31, 32)?)?;
     assembler.instruction(aarch64_store_x(11, 31, 0)?)?;
     assembler.instruction(aarch64_store_x(2, 31, 8)?)?;
-    assembler.instruction(aarch64_add_x_reg(2, 0, 2)?)?;
-    assembler.instruction(aarch64_mov_x(3, 12)?)?;
-    assembler.instruction(aarch64_load_x_imm(0, 31, 32)?)?;
+    // Keep the same direct-pointer V2 register contract in the V6 body.
+    assembler.instruction(aarch64_add_x_reg(0, 0, 2)?)?;
+    assembler.instruction(aarch64_mov_x(2, 12)?)?;
     let v6_loop_scan_branch = assembler.instruction(0x9400_0000)?;
     assembler.instruction(aarch64_mov_x(10, 0)?)?;
     assembler.instruction(aarch64_load_x_imm(11, 31, 0)?)?;
@@ -32110,6 +32114,167 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    #[ignore = "requires `cargo build -p fre-aot-regex-runtime --lib`; links V6/V7 generated code to the real trusted V2 loop helper"]
+    fn linked_host_frozen_loop_v2_matches_real_runtime() {
+        use std::{fs, process::Command, time::SystemTime};
+
+        let target = if cfg!(target_arch = "x86_64") {
+            if cfg!(target_os = "linux") {
+                Target::x86_64_linux()
+            } else {
+                Target::x86_64_macos()
+            }
+        } else if cfg!(target_os = "linux") {
+            Target::aarch64_linux()
+        } else {
+            Target::aarch64_macos()
+        };
+        let compiled = compile_with_k0_but_without_slow(
+            CompileRequest::new(
+                r"a+Q|[b-c][a-b]{1,5}(?:x+|y+)",
+                target,
+            )
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::SelectedEnd)
+            .limits(CompileLimitsV1 {
+                determinize: DeterminizeLimits {
+                    max_states: 0,
+                    ..DeterminizeLimits::default()
+                },
+                ..CompileLimitsV1::default()
+            }),
+        );
+        let workspace = compiled.program().prepare_workspace().unwrap();
+        let storage = compiled
+            .program()
+            .compiler_private_frozen_dynamic_rows_storage_v3(
+                &workspace,
+                512 * 1024,
+                512 * 1024,
+            )
+            .expect("linked trusted-loop fixture must retain a compact owner");
+        assert!(
+            storage.compiler_private_frozen_loop_plan_count() != 0,
+            "the linked fixture must publish at least one V6/V7 loop scanner"
+        );
+        let header = compiled
+            .program()
+            .compiler_private_frozen_prepared_header_v6(
+                &workspace,
+                None,
+                Some(&storage),
+            );
+        assert!(header.is_active());
+        assert!(header.has_dynamic_rows());
+
+        let module = lower_without_materialized_k0(compiled.program(), target);
+        assert_eq!(
+            module.required_prepared_dynamic_rows_loop_scan_runtime_symbol(),
+            Some("fre_aot_regex_runtime_scan_frozen_loop_v2")
+        );
+        let entry = module
+            .prepared_entry_symbol()
+            .expect("trusted-loop prepared entry");
+        let (program_symbol, program_len) = module
+            .required_runtime_program()
+            .expect("trusted-loop runtime program alias");
+
+        let current_exe = std::env::current_exe().expect("current test executable");
+        let profile_dir = current_exe
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("Cargo profile directory");
+        let static_runtime = profile_dir.join("libfre_aot_regex_runtime.a");
+        assert!(
+            static_runtime.is_file(),
+            "build the linked runtime first: cargo build -p fre-aot-regex-runtime --lib ({})",
+            static_runtime.display()
+        );
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "fre-aot-frozen-loop-v2-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("create trusted-loop linker directory");
+        let object = directory.join("frozen-loop-v2.o");
+        fs::write(
+            &object,
+            crate::emit_object(
+                &module,
+                ObjectFormat::for_target(target),
+                usize::MAX,
+            )
+            .expect("emit trusted-loop object"),
+        )
+        .expect("write trusted-loop object");
+
+        let source = format!(
+            "#include <stddef.h>\n#include <stdint.h>\n#include <string.h>\n\
+             typedef void *handle_t;typedef struct{{size_t start;size_t end;}} result_t;\n\
+             extern const unsigned char {program_symbol}[];\n\
+             extern uint32_t {entry}(handle_t,const unsigned char*,size_t,size_t,size_t,result_t*);\n\
+             extern uint32_t fre_aot_regex_runtime_prepare_exclusive_v1(const unsigned char*,size_t,handle_t*);\n\
+             extern uint32_t fre_aot_regex_runtime_search_exclusive_v1(handle_t,const unsigned char*,size_t,size_t,size_t,result_t*);\n\
+             extern uint32_t fre_aot_regex_runtime_destroy_exclusive_v1(handle_t);\n\
+             static unsigned char matching[1025],absent[1025];\n\
+             static int prepare(handle_t*h){{return fre_aot_regex_runtime_prepare_exclusive_v1({program_symbol},{program_len}U,h)==0U;}}\n\
+             static int destroy(handle_t h){{return fre_aot_regex_runtime_destroy_exclusive_v1(h)==0U;}}\n\
+             static int compare(const unsigned char*p,size_t s,size_t e,int base){{\
+               handle_t native=0,baseline=0;result_t nr={{91U,92U}},br={{93U,94U}};\
+               if(!prepare(&native)||!prepare(&baseline))return base;\
+               uint32_t ns={entry}(native,p,sizeof(matching),s,e,&nr);\
+               uint32_t bs=fre_aot_regex_runtime_search_exclusive_v1(baseline,p,sizeof(matching),s,e,&br);\
+               if(ns!=bs||nr.start!=br.start||nr.end!=br.end)return base+1;\
+               nr.start=95U;nr.end=96U;br.start=97U;br.end=98U;\
+               ns={entry}(native,p,sizeof(matching),s,e,&nr);\
+               bs=fre_aot_regex_runtime_search_exclusive_v1(baseline,p,sizeof(matching),s,e,&br);\
+               if(ns!=bs||nr.start!=br.start||nr.end!=br.end)return base+2;\
+               if(!destroy(native)||!destroy(baseline))return base+3;return 0;}}\n\
+             int main(void){{memset(matching,'a',sizeof(matching));memset(absent,'a',sizeof(absent));\
+               matching[sizeof(matching)-1U]='Q';absent[sizeof(absent)-1U]='R';\
+               int status=compare(matching,0U,sizeof(matching),10);if(status)return status;\
+               status=compare(absent,0U,sizeof(absent),20);if(status)return status;\
+               return compare(matching,17U,sizeof(matching),30);}}\n"
+        );
+        let c_path = directory.join("frozen-loop-v2.c");
+        let executable = directory.join("frozen-loop-v2");
+        fs::write(&c_path, source).expect("write trusted-loop C harness");
+        let c_compiler = if cfg!(target_os = "macos") {
+            "clang"
+        } else {
+            "cc"
+        };
+        let status = Command::new(c_compiler)
+            .arg("-O0")
+            .arg(&c_path)
+            .arg(&object)
+            .arg(&static_runtime)
+            .arg("-o")
+            .arg(&executable)
+            .status()
+            .expect("link trusted-loop real-runtime harness");
+        assert!(status.success(), "trusted-loop harness failed to link");
+        let output = Command::new(&executable)
+            .output()
+            .expect("execute trusted-loop real-runtime harness");
+        assert!(
+            output.status.success(),
+            "status={:?} stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::remove_dir_all(&directory).expect("remove trusted-loop linker directory");
     }
 
     #[cfg(all(
@@ -46802,6 +46967,26 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
         );
         assert_eq!(occurrences(&x86.code, &v7_threshold), 1);
         assert_eq!(occurrences(&x86.code, &v6_threshold), 1);
+        let x86_loop_calls = x86
+            .relocations
+            .iter()
+            .filter(|relocation| relocation.symbol == DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL)
+            .collect::<Vec<_>>();
+        for (relocation, remaining_move) in x86_loop_calls
+            .iter()
+            .zip([[0x4c, 0x89, 0xd2], [0x4c, 0x89, 0xc2]])
+        {
+            let displacement = usize::try_from(relocation.offset).unwrap();
+            let abi_start = displacement.checked_sub(8).unwrap();
+            let mut expected = vec![0x48, 0x8d, 0x3c, 0x17];
+            expected.extend_from_slice(&remaining_move);
+            expected.push(0xe8);
+            assert_eq!(
+                &x86.code[abi_start..displacement],
+                expected.as_slice(),
+                "the trusted V2 call must pass source/scanner/length without reloading the prepared handle"
+            );
+        }
         for word in 0_usize..4 {
             let offset = FROZEN_COMPACT_LOOP_PLAN_V1_MEMBERS_OFFSET
                 + word * core::mem::size_of::<u64>();
@@ -46851,6 +47036,22 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 .count(),
             2,
             "both compact formats use an O(1) immutable byte index"
+        );
+        let arm_loop_calls = arm
+            .relocations
+            .iter()
+            .filter(|relocation| relocation.symbol == DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL)
+            .collect::<Vec<_>>();
+        let arm_source = aarch64_add_x_reg(0, 0, 2).unwrap().to_le_bytes();
+        let arm_length = aarch64_mov_x(2, 12).unwrap().to_le_bytes();
+        for relocation in arm_loop_calls {
+            let branch = usize::try_from(relocation.offset).unwrap();
+            assert_eq!(&arm.code[branch - 8..branch - 4], &arm_source);
+            assert_eq!(&arm.code[branch - 4..branch], &arm_length);
+        }
+        assert_eq!(
+            DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL_NAME,
+            "fre_aot_regex_runtime_scan_frozen_loop_v2"
         );
 
         let avx2 = FeatureSet::of(CpuFeature::X86Sse2).with(CpuFeature::X86Avx2);

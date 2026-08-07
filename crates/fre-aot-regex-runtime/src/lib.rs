@@ -68,9 +68,10 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex, OnceLock, TryLockError};
 
 use fre_aot_regex::{
-    CompileError, CompiledProgram, FrozenDynamicRowsStorageV3, FrozenPreparedHeaderV6,
-    FullyPrefilledFallbackReceipt, MatchResult, OutputContract, PROGRAM_HEADER_LEN,
-    ProgramFormatError, ProgramWorkspace, RetainedPartialPreflight, SearchWindow,
+    CompileError, CompiledProgram, FrozenCompactLoopScanner, FrozenDynamicRowsStorageV3,
+    FrozenPreparedHeaderV6, FullyPrefilledFallbackReceipt, MatchResult, OutputContract,
+    PROGRAM_HEADER_LEN, ProgramFormatError, ProgramWorkspace, RetainedPartialPreflight,
+    SearchWindow,
 };
 #[cfg(test)]
 use fre_aot_regex::{FrozenPreparedHeaderV2, FrozenPreparedHeaderV3};
@@ -876,11 +877,11 @@ impl PreparedAotRegex {
     }
 }
 
-/// Failure result returned by the private frozen-loop scan helper.
+/// Failure result returned by the fully validating private V1 loop helper.
 ///
-/// Generated code compares the result with the unchanged requested length and
-/// enters its existing framed fallback before advancing position when this
-/// sentinel is observed.
+/// Current generated code calls the trusted V2 helper and still compares its
+/// result with the unchanged requested length before advancing position. Older
+/// V1 callers observe this sentinel after any recoverable boundary failure.
 pub const FROZEN_LOOP_SCAN_FAILURE: usize = usize::MAX;
 
 /// Scan one immutable graph-proved loop member prefix.
@@ -928,6 +929,51 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_scan_frozen_loop_v1(
             .unwrap_or(FROZEN_LOOP_SCAN_FAILURE)
     }))
     .unwrap_or(FROZEN_LOOP_SCAN_FAILURE)
+}
+
+/// Scan one already-authenticated immutable loop member prefix.
+///
+/// This private V2 generated-object ABI deliberately takes no prepared handle.
+/// Generated V6/V7 code has already authenticated the exclusive active
+/// capability, selected an in-range frozen plan, checked the plan's canonical
+/// state against the live table key, and loaded the non-null scanner address
+/// published by that immutable owner. Omitting the handle prevents repeating
+/// owner/header/identity/plan-list validation and panic framing inside every
+/// profitable loop scan. The source pointer is first in this private ABI so
+/// both supported ISAs can form it in place while retaining the authenticated
+/// scanner in their second argument register.
+///
+/// The V1 helper remains the fully validating boundary for older generated
+/// objects and callers that do not carry the active-capability proof.
+///
+/// # Safety
+///
+/// `scanner` must be non-null, aligned, and point to the exact
+/// [`FrozenCompactLoopScanner`] retained by the live exclusive prepared owner
+/// whose V6/V7 capability was authenticated by the calling generated entry.
+/// That owner must remain exclusively live and immutable for the complete
+/// call. `source_ptr` must be non-null and readable for exactly `source_len`
+/// bytes, `source_len` must not exceed `isize::MAX`, and the extent must remain
+/// live for the complete call. Violating this trusted private ABI is undefined
+/// behavior.
+#[unsafe(no_mangle)]
+#[allow(
+    unsafe_code,
+    reason = "authenticated generated code supplies one typed immutable scanner and exact readable source extent"
+)]
+pub unsafe extern "C" fn fre_aot_regex_runtime_scan_frozen_loop_v2(
+    source_ptr: *const u8,
+    scanner: *const FrozenCompactLoopScanner,
+    source_len: usize,
+) -> usize {
+    // SAFETY: the private V2 contract supplies the exact live typed owner and
+    // readable byte extent. `scan_prefix` is total for every byte sequence and
+    // returns a value no greater than the supplied source length.
+    let scanner = std::ptr::with_exposed_provenance::<FrozenCompactLoopScanner>(scanner.addr());
+    let scanner = unsafe { &*scanner };
+    // SAFETY: guaranteed by the same private V2 contract.
+    let source = unsafe { std::slice::from_raw_parts(source_ptr, source_len) };
+    scanner.scan_prefix(source)
 }
 
 /// Fallible iterator over non-overlapping matches from a prepared AOT Span
@@ -3116,6 +3162,7 @@ mod tests {
             "fre_aot_regex_runtime_search_exclusive_dynamic_rows_continue_v1",
             "fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1",
             "fre_aot_regex_runtime_scan_frozen_loop_v1",
+            "fre_aot_regex_runtime_scan_frozen_loop_v2",
             "native_rows_address",
             "cache_generation",
             "current_row",
@@ -3171,6 +3218,11 @@ mod tests {
             *const u8,
             usize,
         ) -> usize = fre_aot_regex_runtime_scan_frozen_loop_v1;
+        let _: unsafe extern "C" fn(
+            *const u8,
+            *const FrozenCompactLoopScanner,
+            usize,
+        ) -> usize = fre_aot_regex_runtime_scan_frozen_loop_v2;
         let _: unsafe extern "C" fn(
             FreAotRegexExclusiveHandleV1,
             *const u8,
@@ -3418,6 +3470,9 @@ mod tests {
         let (members, scanner_address) =
             selected.expect("the fixture must publish a proper loop subset");
         assert_ne!(scanner_address, 0);
+        let scanner = std::ptr::with_exposed_provenance::<FrozenCompactLoopScanner>(
+            scanner_address,
+        );
         let member = (u8::MIN..=u8::MAX)
             .find(|&byte| {
                 members[usize::from(byte >> 6)] & (1_u64 << u32::from(byte & 63)) != 0
@@ -3445,6 +3500,18 @@ mod tests {
             };
             assert_eq!(consumed, prefix);
             assert!(consumed <= source.len());
+            // SAFETY: setup authenticated this exact typed scanner pointer,
+            // the exclusively owned prepared allocation remains active, and
+            // `source` supplies the complete synchronous readable extent.
+            let trusted = unsafe {
+                fre_aot_regex_runtime_scan_frozen_loop_v2(
+                    source.as_ptr(),
+                    scanner,
+                    source.len(),
+                )
+            };
+            assert_eq!(trusted, prefix);
+            assert!(trusted <= source.len());
         }
 
         let source = [member; 64];

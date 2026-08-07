@@ -2747,6 +2747,7 @@ impl FrozenCompactLoopScanner {
     /// Return the exact member-prefix length, never exceeding `source.len()`.
     #[doc(hidden)]
     #[must_use]
+    #[inline]
     #[allow(
         clippy::arithmetic_side_effects,
         reason = "each addition is bounded by the immediately preceding remaining-length proof"
