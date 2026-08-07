@@ -25730,21 +25730,21 @@ mod tests {
             },
             ..CompileLimitsV1::default()
         };
-        let (pattern, mode) = if fragmented_exact_root {
+        let pattern = if fragmented_exact_root {
             const CLASS: &str = r"(?-u:[acegikmoqsuwy\x80\x82\xF0\xFF])";
             if output == OutputContract::Span {
-                (format!("{CLASS}(?-u:.)"), CompileMode::Fast)
+                format!("{CLASS}(?-u:.)")
             } else {
-                (format!("(?:{CLASS})+"), CompileMode::Optimizing)
+                format!("(?:{CLASS})+")
             }
         } else if output == OutputContract::Span {
-            ("(?:ab|ac)".to_owned(), CompileMode::Fast)
+            "(?:ab|ac)".to_owned()
         } else {
-            ("(?:ab|ac)+z".to_owned(), CompileMode::Optimizing)
+            "(?:ab|ac)+z".to_owned()
         };
         let compiled = compile(
             CompileRequest::new(&pattern, target)
-                .mode(mode)
+                .mode(CompileMode::Fast)
                 .output(output)
                 .limits(limits),
         )
@@ -25756,6 +25756,10 @@ mod tests {
                 .native_dynamic_rows_view()
                 .is_some_and(|view| view.root_requirement.is_some()),
             "linked feature fixture must retain a graph-derived dynamic root: {target:?}",
+        );
+        assert!(
+            compiled.module().slow_aot_report().is_none(),
+            "linked dynamic fixture must not publish an optional complete route: {target:?}",
         );
         assert_eq!(
             compiled.module().start_accelerator(),
