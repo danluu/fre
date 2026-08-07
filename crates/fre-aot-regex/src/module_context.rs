@@ -11888,6 +11888,27 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "links and executes slow contextual AOT objects over every search window"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the established contextual linker oracle is reused without weakening its case matrix"
+    )]
+    fn linked_host_slow_context_aot_differential() {
+        for target in host_differential_targets() {
+            let directory = std::env::temp_dir().join(format!(
+                "fre-aot-slow-context-native-{}-{}",
+                std::process::id(),
+                if cfg!(target_arch = "aarch64") {
+                    "aarch64"
+                } else {
+                    "x86_64"
+                }
+            ));
+            build_context_differential_bundle(target, directory, true, true);
+        }
+    }
+
+    #[test]
     #[ignore = "generates a base-SVE AArch64 Linux context differential bundle"]
     fn generate_aarch64_linux_sve_context_differential_bundle() {
         let directory = std::env::var_os("FRE_AOT_AARCH64_SVE_CONTEXT_BUNDLE").map_or_else(
@@ -11904,6 +11925,7 @@ mod tests {
                 .with_features(FeatureSet::of(CpuFeature::Aarch64Sve))
                 .unwrap(),
             directory,
+            false,
             false,
         );
     }
@@ -11925,6 +11947,7 @@ mod tests {
                 .with_features(FeatureSet::of(CpuFeature::Aarch64Sve).with(CpuFeature::Aarch64Sve2))
                 .unwrap(),
             directory,
+            false,
             false,
         );
     }
@@ -11952,6 +11975,7 @@ mod tests {
                 .unwrap(),
             directory,
             false,
+            false,
         );
     }
 
@@ -11970,7 +11994,7 @@ mod tests {
                 "x86_64"
             }
         ));
-        build_context_differential_bundle(target, directory, true);
+        build_context_differential_bundle(target, directory, true, false);
     }
 
     #[allow(
@@ -11982,6 +12006,7 @@ mod tests {
         target: Target,
         directory: std::path::PathBuf,
         execute: bool,
+        force_slow_context: bool,
     ) {
         fs::create_dir_all(&directory).unwrap();
         let mut source = String::from(
@@ -11994,13 +12019,24 @@ mod tests {
         let mut first_length = 0;
         let mut saw_sve = false;
         for (index, (pattern, output, haystack)) in cases().into_iter().enumerate() {
-            let compiled = compile(
-                CompileRequest::new(pattern, target)
-                    .mode(CompileMode::Optimizing)
-                    .output(output),
-            )
-            .unwrap();
-            assert!(compiled.program().native_context_program_view().is_some());
+            let request = CompileRequest::new(pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(output);
+            let request = if force_slow_context {
+                let mut limits = crate::CompileLimitsV1::default();
+                limits.determinize.max_states = 0;
+                request.limits(limits)
+            } else {
+                request
+            };
+            let compiled = compile(request).unwrap();
+            if force_slow_context {
+                assert!(compiled.program().native_context_program_view().is_none());
+                assert!(compiled.receipt().slow_context_aot.is_some());
+            } else {
+                assert!(compiled.program().native_context_program_view().is_some());
+                assert!(compiled.receipt().slow_context_aot.is_none());
+            }
             assert_eq!(compiled.module().required_runtime_program(), None);
             saw_sve |= matches!(
                 compiled.module().start_accelerator(),
