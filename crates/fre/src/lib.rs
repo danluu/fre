@@ -781,7 +781,7 @@ pub use unicode_word_run::{
 };
 
 /// Stable schema for facade-level explanation records.
-pub const EXPLAIN_SCHEMA_VERSION: u32 = 14;
+pub const EXPLAIN_SCHEMA_VERSION: u32 = 15;
 
 // Automatic ordinary search admits exact anchors and staged general plans with
 // a three-member primary plus an independently selective predicate finder.
@@ -1071,7 +1071,8 @@ pub enum PlanKind {
     LiteralSetDfa,
     /// Proof-restricted required-tail native searches, including
     /// `CLASS{min,max} SUFFIX`, tail-head-disjoint nullable optional chains,
-    /// and bounded finite-token repetitions. This is not JIT.
+    /// bounded finite-token repetitions, and finite greedy universal-byte
+    /// corridors. This is not JIT.
     RequiredLiteral,
     /// Canonical literal/class-run search backed by one native literal anchor.
     LiteralClassRunLiteral,
@@ -3855,6 +3856,27 @@ fn try_box_bounded_literal_class_run_owner(
     })
 }
 
+fn try_box_universal_finite_greedy_corridor_owner(
+    plan: universal_finite_greedy_corridor::Plan,
+    allocate: impl FnOnce(
+        universal_finite_greedy_corridor::Plan,
+    ) -> Result<
+        Box<universal_finite_greedy_corridor::Plan>,
+        (
+            fre_exact_alloc::CopyError,
+            universal_finite_greedy_corridor::Plan,
+        ),
+    >,
+) -> Result<Option<Box<universal_finite_greedy_corridor::Plan>>, BuildError> {
+    match allocate(plan) {
+        Ok(plan) => Ok(Some(plan)),
+        Err((fre_exact_alloc::CopyError::AllocationFailed, _)) => Ok(None),
+        Err((fre_exact_alloc::CopyError::LayoutOverflow, _)) => Err(
+            BuildError::InternalInvariant("native universal-corridor owner layout overflowed"),
+        ),
+    }
+}
+
 impl PortableBuilder {
     /// Start from pinned Rust-regex defaults. Because the current lowerer has
     /// no Unicode-class compiler, callers commonly select [`Self::unicode`]
@@ -5785,6 +5807,150 @@ impl PortableBuilder {
                 });
             }
         }
+        // This capture-free source theorem is the final native candidate. It
+        // reuses the exact metered corridor inspection otherwise consumed by
+        // the late K0 suffix sidecar, but publishes before generic lowering.
+        // Every established native family above therefore keeps precedence;
+        // ForceK0 returned before this selection pipeline began.
+        if self.selection == PlanSelection::Auto
+            && self.pure_byte_class_repeat_allowed
+            && explicit_captures == 0
+            && fallback_planner_work < self.limits.max_planner_work
+        {
+            let native_inspection = match universal_finite_greedy_corridor::inspect_native(
+                &rust.hir,
+                fallback_planner_work,
+                self.limits.max_planner_work,
+            ) {
+                Ok(inspection) => {
+                    fallback_planner_work = inspection.planner_work();
+                    Some(inspection)
+                }
+                Err(universal_finite_greedy_corridor::InspectionError::WorkLimit {
+                    actual,
+                    needed,
+                    limit,
+                }) => {
+                    if actual < fallback_planner_work
+                        || actual > limit
+                        || needed <= limit
+                        || limit != self.limits.max_planner_work
+                    {
+                        return Err(BuildError::InternalInvariant(
+                            "native universal-corridor work refusal did not close",
+                        ));
+                    }
+                    fallback_planner_work = actual;
+                    None
+                }
+                Err(universal_finite_greedy_corridor::InspectionError::ArithmeticOverflow) => {
+                    return Err(BuildError::InternalInvariant(
+                        "native universal-corridor inspection overflowed",
+                    ));
+                }
+            };
+            if let Some(
+                universal_finite_greedy_corridor::NativeInspectionOutcome::Eligible(inspection),
+            ) = native_inspection
+            {
+                let descriptor = inspection.descriptor();
+                if minimum_match_bytes != Some(descriptor.minimum_match_bytes())
+                    || rust.hir.properties().maximum_len()
+                        != Some(descriptor.maximum_match_bytes())
+                {
+                    return Err(BuildError::InternalInvariant(
+                        "native universal-corridor geometry differs from HIR properties",
+                    ));
+                }
+                let plan_storage_bytes =
+                    universal_finite_greedy_corridor::Plan::projected_storage_bytes(
+                        inspection.suffix().len(),
+                    )
+                    .ok_or(BuildError::PersistentBytesOverflow)?;
+                let charged_persistent_bytes = source_storage_bytes
+                    .checked_add(capture_name_storage_bytes)
+                    .and_then(|bytes| bytes.checked_add(plan_storage_bytes))
+                    .ok_or(BuildError::PersistentBytesOverflow)?;
+                let copy_work = u64::try_from(inspection.suffix().len())
+                    .ok()
+                    .and_then(|work| work.checked_add(1))
+                    .ok_or(BuildError::InternalInvariant(
+                        "native universal-corridor copy work overflowed",
+                    ))?;
+                let completed_work = fallback_planner_work.checked_add(copy_work).ok_or(
+                    BuildError::InternalInvariant(
+                        "native universal-corridor planner work overflowed",
+                    ),
+                )?;
+                let resources_fit = completed_work <= self.limits.max_planner_work
+                    && inspection.suffix().len() <= self.limits.literal.max_needle_bytes
+                    && charged_persistent_bytes <= self.limits.max_persistent_bytes;
+                if resources_fit {
+                    fallback_planner_work = completed_work;
+                    let plan = match universal_finite_greedy_corridor::Plan::build(
+                        inspection,
+                        self.limits.literal,
+                    ) {
+                        Ok(plan) => Some(plan),
+                        Err(LiteralError::NeedleLimit { .. }
+                        | LiteralError::AllocationFailed { .. }) => None,
+                        Err(LiteralError::ArithmeticOverflow { .. }) => {
+                            return Err(BuildError::InternalInvariant(
+                                "native universal-corridor literal construction overflowed",
+                            ));
+                        }
+                        Err(_) => {
+                            return Err(BuildError::InternalInvariant(
+                                "native universal-corridor literal construction returned an impossible error",
+                            ));
+                        }
+                    };
+                    if let Some(plan) = plan {
+                        if plan.storage_bytes() != Some(plan_storage_bytes) {
+                            return Err(BuildError::InternalInvariant(
+                                "native universal-corridor storage projection changed during construction",
+                            ));
+                        }
+                        if let Some(plan) = try_box_universal_finite_greedy_corridor_owner(
+                            plan,
+                            fre_exact_alloc::try_box_preserve,
+                        )? {
+                            return Ok(PortableRegex {
+                                source,
+                                capture_names,
+                                line_total_grep_plan,
+                                plan: PortablePlan::UniversalFiniteGreedyCorridor(plan),
+                                profile: profile.clone(),
+                                limits: self.limits,
+                                selection: self.selection,
+                                report: BuildReport {
+                                    profile: profile.clone(),
+                                    admission,
+                                    syntax,
+                                    plan: PlanKind::RequiredLiteral,
+                                    planner_work: fallback_planner_work,
+                                    lowering: None,
+                                    states: 0,
+                                    edges: 0,
+                                    plan_storage_bytes,
+                                    source_storage_bytes,
+                                    capture_name_storage_bytes,
+                                    charged_persistent_bytes: 0,
+                                    persistent_byte_limit: 0,
+                                    captures_len,
+                                    static_captures_len,
+                                    minimum_match_bytes,
+                                    required_literal: None,
+                                    literal_class_run_literal: None,
+                                    forward_anchored: None,
+                                }
+                                .enforce_persistent_limit(self.limits.max_persistent_bytes)?,
+                            });
+                        }
+                    }
+                }
+            }
+        }
         let lowered = fre_lower::lower_raw(
             &rust,
             OperationSemantics::CaptureFree,
@@ -6362,6 +6528,7 @@ enum PortablePlan {
     ReverseInner(ReverseInnerPlan),
     PrefixClassAlternation(PrefixClassAlternationPlan),
     DispatchedPrefixClassAlternation(DispatchedPrefixClassAlternationPlan),
+    UniversalFiniteGreedyCorridor(Box<universal_finite_greedy_corridor::Plan>),
 }
 
 impl PortablePlan {
@@ -6395,6 +6562,7 @@ impl PortablePlan {
             Self::ReverseInner(plan) => plan.plan_id(),
             Self::PrefixClassAlternation(_) => PREFIX_CLASS_ALTERNATION_PLAN_ID,
             Self::DispatchedPrefixClassAlternation(plan) => plan.search_identity().plan_id,
+            Self::UniversalFiniteGreedyCorridor(plan) => plan.plan_id(),
         }
     }
 }
@@ -6951,6 +7119,14 @@ impl PortableRegex {
                     SearchAccounting::RequiredLiteral(accounting),
                 ))
             }
+            PortablePlan::UniversalFiniteGreedyCorridor(plan) => {
+                let (matched, accounting) = plan.is_match_window(
+                    haystack,
+                    window,
+                    required_literal_limits(limits),
+                )?;
+                Ok((matched, SearchAccounting::RequiredLiteral(accounting)))
+            }
             PortablePlan::LiteralClassRunLiteral(plan) => {
                 let (matched, accounting) = plan.shortest_window(
                     haystack,
@@ -7206,6 +7382,9 @@ impl PortableRegex {
                     required_literal_limits(limits),
                 )
                 .map(|(matched, _)| matched.is_some())
+                .map_err(SearchError::from),
+            PortablePlan::UniversalFiniteGreedyCorridor(plan) => plan
+                .is_match_window_value(haystack, window, required_literal_limits(limits))
                 .map_err(SearchError::from),
             PortablePlan::LiteralClassRunLiteral(plan) => plan
                 .shortest_window(
@@ -7512,6 +7691,14 @@ impl PortableRegex {
                     SearchAccounting::RequiredLiteral(accounting),
                 ))
             }
+            PortablePlan::UniversalFiniteGreedyCorridor(plan) => {
+                let (end, accounting) = plan.shortest_window(
+                    haystack,
+                    window,
+                    required_literal_limits(limits),
+                )?;
+                Ok((end, SearchAccounting::RequiredLiteral(accounting)))
+            }
             PortablePlan::LiteralClassRunLiteral(plan) => {
                 let (end, accounting) = plan.shortest_window(
                     haystack,
@@ -7743,6 +7930,17 @@ impl PortableRegex {
             PortablePlan::DispatchedBoundedRequiredLiteral(required) => {
                 let (matched, accounting) =
                     required.find(haystack, required_literal_limits(limits))?;
+                Ok((
+                    matched.map(|(_, end)| end),
+                    SearchAccounting::RequiredLiteral(accounting),
+                ))
+            }
+            PortablePlan::UniversalFiniteGreedyCorridor(plan) => {
+                let (matched, accounting) = plan.find_window(
+                    haystack,
+                    SearchWindow::full(haystack),
+                    required_literal_limits(limits),
+                )?;
                 Ok((
                     matched.map(|(_, end)| end),
                     SearchAccounting::RequiredLiteral(accounting),
@@ -8228,6 +8426,17 @@ impl PortableRegex {
                     SearchAccounting::RequiredLiteral(accounting),
                 ))
             }
+            PortablePlan::UniversalFiniteGreedyCorridor(plan) => {
+                let (matched, accounting) = plan.find_window(
+                    haystack,
+                    window,
+                    required_literal_limits(limits),
+                )?;
+                Ok((
+                    matched.map(|(start, end)| Match { start, end }),
+                    SearchAccounting::RequiredLiteral(accounting),
+                ))
+            }
             PortablePlan::LiteralClassRunLiteral(plan) => {
                 let (matched, accounting) = plan.find_window(
                     haystack,
@@ -8493,6 +8702,10 @@ impl PortableRegex {
                 )
                 .map(|(matched, _)| matched.map(|(start, end)| Match { start, end }))
                 .map_err(SearchError::from),
+            PortablePlan::UniversalFiniteGreedyCorridor(plan) => plan
+                .find_window_value(haystack, window, required_literal_limits(limits))
+                .map(|matched| matched.map(|(start, end)| Match { start, end }))
+                .map_err(SearchError::from),
             PortablePlan::LiteralClassRunLiteral(plan) => plan
                 .find_window(
                     haystack,
@@ -8721,6 +8934,17 @@ impl PortableRegex {
             PortablePlan::DispatchedBoundedRequiredLiteral(required) => {
                 let (matched, accounting) =
                     required.find_window(haystack, window, required_literal_limits(limits))?;
+                Ok((
+                    matched.map(|(start, end)| Match { start, end }),
+                    accounting.work_upper_bound,
+                ))
+            }
+            PortablePlan::UniversalFiniteGreedyCorridor(plan) => {
+                let (matched, accounting) = plan.find_window(
+                    haystack,
+                    SearchWindow::new(start, haystack.len()),
+                    required_literal_limits(limits),
+                )?;
                 Ok((
                     matched.map(|(start, end)| Match { start, end }),
                     accounting.work_upper_bound,
@@ -14941,7 +15165,8 @@ mod tests {
         select_k0_finite_suffix_direct_route, select_k0_finite_suffix_route,
         try_build_k0_mandatory_cut,
         try_build_k0_mandatory_suffix,
-        try_box_bounded_literal_class_run_owner, try_k0_mandatory_suffix_exists,
+        try_box_bounded_literal_class_run_owner,
+        try_box_universal_finite_greedy_corridor_owner, try_k0_mandatory_suffix_exists,
         try_k0_mandatory_suffix_span_start,
         try_k0_mandatory_suffix_span_start_for_iteration,
         ASCII_RUN_SCANNER_BUILD_WORK, BYTE_SET_BLOCK_BYTES, K0_FINITE_SUFFIX_INCUMBENT_ROUTE,
@@ -18773,6 +18998,288 @@ mod tests {
             Some((72, 1_032)),
         );
         assert!(suffix.has_universal_finite_greedy_corridor());
+    }
+
+    #[test]
+    fn native_universal_corridor_precedes_k0_and_matches_upstream_operations() {
+        const PATTERN: &str = r"(?s-u:.{0,2}.{0,3}aa)";
+        let regex = PortableBuilder::new(PATTERN)
+            .unicode(false)
+            .build()
+            .expect("native universal corridor builds");
+        assert_eq!(regex.build_report().plan, PlanKind::RequiredLiteral);
+        assert_eq!(regex.build_report().lowering, None);
+        assert_eq!(
+            regex.build_report().charged_persistent_bytes,
+            regex
+                .build_report()
+                .source_storage_bytes
+                .checked_add(regex.build_report().capture_name_storage_bytes)
+                .and_then(|bytes| bytes.checked_add(regex.build_report().plan_storage_bytes))
+                .unwrap(),
+        );
+        assert_eq!(
+            regex.build_report().persistent_byte_limit,
+            BuildLimits::default().max_persistent_bytes,
+        );
+        assert_eq!(
+            regex.runtime_implementation_id(),
+            super::universal_finite_greedy_corridor::PLAN_ID,
+        );
+        let upstream = regex::bytes::RegexBuilder::new(PATTERN)
+            .unicode(false)
+            .build()
+            .unwrap();
+
+        for haystack in [
+            b"".as_slice(),
+            b"aa".as_slice(),
+            b"aaaaaaa".as_slice(),
+            b"qaaZaaaaa".as_slice(),
+            b"\xff\x00aa\xffaaaa".as_slice(),
+        ] {
+            let expected = upstream
+                .find(haystack)
+                .map(|matched| Match {
+                    start: matched.start(),
+                    end: matched.end(),
+                });
+            assert_eq!(
+                regex
+                    .find_value(haystack, SearchLimits::unlimited())
+                    .unwrap(),
+                expected,
+            );
+            assert_eq!(
+                regex
+                    .is_match_value(haystack, SearchLimits::unlimited())
+                    .unwrap(),
+                expected.is_some(),
+            );
+            assert_eq!(
+                regex
+                    .shortest_match_value(haystack, SearchLimits::unlimited())
+                    .unwrap(),
+                upstream.shortest_match(haystack),
+            );
+            assert_eq!(
+                regex
+                    .selected_end_value(haystack, SearchLimits::unlimited())
+                    .unwrap(),
+                expected.map(Match::end),
+            );
+            for start in 0..=haystack.len() {
+                for end in start..=haystack.len() {
+                    let window = SearchWindow::new(start, end);
+                    let expected_window = upstream.find(&haystack[start..end]).map(|matched| {
+                        Match {
+                            start: start + matched.start(),
+                            end: start + matched.end(),
+                        }
+                    });
+                    let expected_shortest = upstream
+                        .shortest_match(&haystack[start..end])
+                        .map(|offset| start + offset);
+                    assert_eq!(
+                        regex
+                            .find_window_value(
+                                haystack,
+                                window,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap(),
+                        expected_window,
+                        "haystack={haystack:?} window={start}..{end}",
+                    );
+                    assert_eq!(
+                        regex
+                            .is_match_window_value(
+                                haystack,
+                                window,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap(),
+                        expected_window.is_some(),
+                    );
+                    assert_eq!(
+                        regex
+                            .shortest_match_window(
+                                haystack,
+                                window,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap()
+                            .0,
+                        expected_shortest,
+                    );
+                }
+            }
+
+            let expected_iter = upstream
+                .find_iter(haystack)
+                .map(|matched| (matched.start(), matched.end()))
+                .collect::<Vec<_>>();
+            let actual_iter = regex
+                .find_iter_value(haystack, PortableFindIterLimits::unlimited())
+                .unwrap()
+                .map(|matched| {
+                    let matched = matched.unwrap();
+                    (matched.start(), matched.end())
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(actual_iter, expected_iter);
+
+            let mut session = regex
+                .search_session(SearchSessionLimits::unlimited())
+                .unwrap();
+            let session_iter = session
+                .find_iter_value(haystack, PortableFindIterRunLimits::unlimited())
+                .map(|matched| {
+                    let matched = matched.unwrap();
+                    (matched.start(), matched.end())
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(session_iter, expected_iter);
+        }
+
+        let mut mutable = b"qaaZaaaaa".to_vec();
+        let address = mutable.as_ptr();
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        assert_eq!(
+            session
+                .find_value(&mutable, SearchLimits::unlimited())
+                .unwrap(),
+            regex
+                .find_value(&mutable, SearchLimits::unlimited())
+                .unwrap(),
+        );
+        mutable[1..3].copy_from_slice(b"bb");
+        mutable[4..6].copy_from_slice(b"aa");
+        assert_eq!(mutable.as_ptr(), address);
+        let expected_after_mutation = upstream.find(&mutable).map(|matched| Match {
+            start: matched.start(),
+            end: matched.end(),
+        });
+        assert_eq!(
+            session
+                .find_value(&mutable, SearchLimits::unlimited())
+                .unwrap(),
+            expected_after_mutation,
+        );
+    }
+
+    #[test]
+    fn native_universal_corridor_admission_is_auto_only_and_transactional() {
+        const PATTERN: &str = r"(?s-u:.{0,2}.{0,3}aa)";
+        let complete = PortableBuilder::new(PATTERN)
+            .unicode(false)
+            .build()
+            .unwrap();
+        assert_eq!(
+            complete.runtime_implementation_id(),
+            super::universal_finite_greedy_corridor::PLAN_ID,
+        );
+        let exact_work = complete.build_report().planner_work;
+        let exact = PortableBuilder::new(PATTERN)
+            .unicode(false)
+            .limits(BuildLimits {
+                max_planner_work: exact_work,
+                ..BuildLimits::default()
+            })
+            .build()
+            .unwrap();
+        assert_eq!(
+            exact.runtime_implementation_id(),
+            super::universal_finite_greedy_corridor::PLAN_ID,
+        );
+        assert_eq!(exact.build_report().planner_work, exact_work);
+        let exact_persistent = PortableBuilder::new(PATTERN)
+            .unicode(false)
+            .limits(BuildLimits {
+                max_persistent_bytes: complete.build_report().charged_persistent_bytes,
+                ..BuildLimits::default()
+            })
+            .build()
+            .unwrap();
+        assert_eq!(
+            exact_persistent.runtime_implementation_id(),
+            super::universal_finite_greedy_corridor::PLAN_ID,
+        );
+        assert_eq!(
+            exact_persistent.build_report().charged_persistent_bytes,
+            complete.build_report().charged_persistent_bytes,
+        );
+
+        let one_below = PortableBuilder::new(PATTERN)
+            .unicode(false)
+            .limits(BuildLimits {
+                max_planner_work: exact_work - 1,
+                ..BuildLimits::default()
+            })
+            .build()
+            .unwrap();
+        assert_eq!(one_below.build_report().plan, PlanKind::K0);
+        assert_ne!(
+            one_below.runtime_implementation_id(),
+            super::universal_finite_greedy_corridor::PLAN_ID,
+        );
+
+        let forced = PortableBuilder::new(PATTERN)
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .unwrap();
+        assert_eq!(forced.build_report().plan, PlanKind::K0);
+        for pattern in [
+            r"(?s-u:(.{0,2}.{0,3})aa)",
+            r"(?s-u:(?:.{1}|.{2})aa)",
+            r"(?s-u:.{1,3}?aa)",
+            r"(?s-u:.*aa)",
+            r"(?s-u:.{1,3}\baa)",
+        ] {
+            let declined = PortableBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            assert_ne!(
+                declined.runtime_implementation_id(),
+                super::universal_finite_greedy_corridor::PLAN_ID,
+                "early native route admitted {pattern:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn native_universal_corridor_owner_failures_are_transactional() {
+        const PATTERN: &str = r"(?s-u:.{0,2}.{0,3}aa)";
+        for source in [
+            fre_exact_alloc::CopyError::LayoutOverflow,
+            fre_exact_alloc::CopyError::AllocationFailed,
+        ] {
+            let regex = PortableBuilder::new(PATTERN)
+                .unicode(false)
+                .build()
+                .unwrap();
+            let PortablePlan::UniversalFiniteGreedyCorridor(plan) = regex.plan else {
+                panic!("native universal-corridor fixture selected another plan");
+            };
+            let result = try_box_universal_finite_greedy_corridor_owner(*plan, |plan| {
+                Err((source, plan))
+            });
+            match source {
+                fre_exact_alloc::CopyError::LayoutOverflow => assert!(matches!(
+                    result,
+                    Err(BuildError::InternalInvariant(
+                        "native universal-corridor owner layout overflowed"
+                    ))
+                )),
+                fre_exact_alloc::CopyError::AllocationFailed => {
+                    assert!(matches!(result, Ok(None)))
+                }
+            }
+        }
     }
 
     #[test]
