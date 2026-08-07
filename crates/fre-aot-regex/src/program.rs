@@ -22436,13 +22436,13 @@ mod tests {
         storage.quad_rows_v14 = owned_quads;
 
         for token in [1_u16, u16::try_from(block_cells + 1).unwrap()] {
-            let original = storage.quad_rows_v14[0];
-            storage.quad_rows_v14[0] = token;
+            let original = storage.quad_rows_v14.as_ref().unwrap()[0];
+            storage.quad_rows_v14.as_mut().unwrap()[0] = token;
             assert!(
                 storage.descriptor_is_valid_for(compiled.identity),
                 "aligned V14 block token {token}"
             );
-            storage.quad_rows_v14[0] = original;
+            storage.quad_rows_v14.as_mut().unwrap()[0] = original;
         }
         for (index, malformed) in [
             (0, 1_u16 << 13),
