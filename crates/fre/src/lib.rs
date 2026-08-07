@@ -14529,7 +14529,7 @@ mod tests {
             None,
         );
 
-        let clipped_end = 8;
+        let clipped_end: usize = 8;
         let clipped_start = clipped_end.saturating_sub(2);
         haystack[clipped_start..clipped_end].copy_from_slice(b"ab");
         let clipped = SearchWindow::new(2, clipped_end);
@@ -14622,7 +14622,7 @@ mod tests {
         .unicode(false)
         .build()
         .expect("absolute-end mandatory-suffix fixture builds automatically");
-        assert_eq!(regex.build_report().plan(), PlanKind::K0);
+        assert_eq!(regex.build_report().plan, PlanKind::K0);
         let PortablePlan::K0(plan) = &regex.plan else {
             unreachable!();
         };
@@ -14690,10 +14690,10 @@ mod tests {
         );
         assert!(
             plan_size.abs_diff(previous_plan_size) <= plan_alignment,
-            concat!(
-                "the inline tag may occupy at most one plan-alignment slot: ",
-                "previous={previous_plan_size}, current={plan_size}, alignment={plan_alignment}",
-            ),
+            "the inline tag may occupy at most one plan-alignment slot: previous={}, current={}, alignment={}",
+            previous_plan_size,
+            plan_size,
+            plan_alignment,
         );
         let pattern = r"(?-u:(?:ab|c+))";
         let plain = PortableBuilder::new(pattern)
