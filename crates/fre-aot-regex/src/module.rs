@@ -13685,6 +13685,13 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     const ROOT_SCANNER_COMPACT_V3: u8 = 2;
     const ROOT_SCANNER_COMPACT_V4: u8 = 3;
     let tracks_root_scanner_hits = allow_direct_hole_continuation && root_plan.is_some();
+    // Every scanner-free compact entry inherits the nonempty window proved at
+    // the public boundary, and its closed immutable table cannot side-exit on
+    // an unpublished cell. Rotate those loops so the end test is the single
+    // taken backedge instead of preceding a second unconditional backedge on
+    // every live transition. Rooted compact rows retain their top test because
+    // the graph scanner may re-enter at a candidate boundary.
+    let bottom_test_compact_rows = root_plan.is_none();
     let frame_bytes = if root_plan.is_some() {
         ROOT_SCANNER_FRAME_BYTES
     } else {
@@ -13972,11 +13979,13 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     }
 
     assembler.bind(v4_scan)?;
-    assembler.instruction(&[0x48, 0x39, 0xca])?;
-    assembler.branch(
-        &[0x0f, 0x83],
-        native_complete.unwrap_or(native_no_match),
-    )?;
+    if !bottom_test_compact_rows {
+        assembler.instruction(&[0x48, 0x39, 0xca])?;
+        assembler.branch(
+            &[0x0f, 0x83],
+            native_complete.unwrap_or(native_no_match),
+        )?;
+    }
     if let Some(root_vector) = root_vector {
         let non_root = assembler.label()?;
         assembler.instruction(&[0x4c, 0x3b, 0x44, 0x24, 0x50])?;
@@ -14020,7 +14029,16 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     // V4 tokens are one-based destination cell-row offsets. This single LEA
     // performs the complete state update with no ordinal scaling dispatch.
     assembler.instruction(&[0x4e, 0x8d, 0x44, 0x56, 0xfe])?;
-    assembler.branch(&[0xe9], v4_scan)?;
+    if bottom_test_compact_rows {
+        assembler.instruction(&[0x48, 0x39, 0xca])?;
+        assembler.branch(&[0x0f, 0x82], v4_table_scan)?;
+        assembler.branch(
+            &[0xe9],
+            native_complete.unwrap_or(native_no_match),
+        )?;
+    } else {
+        assembler.branch(&[0xe9], v4_scan)?;
+    }
 
     assembler.bind(v3_enter)?;
     if root_plan.is_some() {
@@ -14093,11 +14111,13 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
         // Transition-derived ordinals below still use the immediate shift.
         assembler.instruction(&[0x49, 0x89, 0xf0])?; // mov rsi, r8
         assembler.bind(v3_scan)?;
-        assembler.instruction(&[0x48, 0x39, 0xca])?;
-        assembler.branch(
-            &[0x0f, 0x83],
-            native_complete.unwrap_or(native_no_match),
-        )?;
+        if !bottom_test_compact_rows {
+            assembler.instruction(&[0x48, 0x39, 0xca])?;
+            assembler.branch(
+                &[0x0f, 0x83],
+                native_complete.unwrap_or(native_no_match),
+            )?;
+        }
         assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
         assembler.instruction(&[0x47, 0x0f, 0xb6, 0x14, 0x11])?;
         assembler.instruction(&[0x47, 0x0f, 0xb7, 0x14, 0x50])?;
@@ -14140,7 +14160,16 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
         }
         assembler.instruction(&[0x49, 0xc1, 0xe2, shift])?;
         assembler.instruction(&[0x4e, 0x8d, 0x04, 0x16])?;
-        assembler.branch(&[0xe9], v3_scan)?;
+        if bottom_test_compact_rows {
+            assembler.instruction(&[0x48, 0x39, 0xca])?;
+            assembler.branch(&[0x0f, 0x82], v3_scan)?;
+            assembler.branch(
+                &[0xe9],
+                native_complete.unwrap_or(native_no_match),
+            )?;
+        } else {
+            assembler.branch(&[0xe9], v3_scan)?;
+        }
     }
 
     assembler.bind(preflight_enter)?;
@@ -16308,6 +16337,20 @@ fn aarch64_load_byte_reg(destination: u8, base: u8, index: u8) -> Result<u32, Ob
             | aarch64_reg(base, 5)?
             | aarch64_reg(destination, 0)?,
     )
+}
+
+fn aarch64_load_byte_post_imm(
+    destination: u8,
+    base: u8,
+    byte_offset: u16,
+) -> Result<u32, ObjectError> {
+    if byte_offset > 0x00ff {
+        return Err(ObjectError::InvalidModule("AArch64 LDRB post-index"));
+    }
+    Ok(0x3840_0400
+        | (u32::from(byte_offset) << 12)
+        | aarch64_reg(base, 5)?
+        | aarch64_reg(destination, 0)?)
 }
 
 fn aarch64_load_halfword_reg(destination: u8, base: u8, index: u8) -> Result<u32, ObjectError> {
@@ -21942,6 +21985,18 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     const ROOT_SCANNER_COMPACT_V3: u16 = 2;
     const ROOT_SCANNER_COMPACT_V4: u16 = 3;
     let tracks_root_scanner_hits = allow_direct_hole_continuation && root_plan.is_some();
+    // Closed scanner-free compact rows inherit the public nonempty-window
+    // proof and cannot encounter a mutable-table hole. Rotate their byte loops
+    // so one conditional backedge replaces the top bound branch plus an
+    // unconditional backedge on every live transition. Root-scanner retries
+    // keep the top-tested form because they may re-enter at a candidate edge.
+    let bottom_test_compact_rows = root_plan.is_none();
+    // Exists exposes neither endpoint nor continuation state. In the same
+    // scanner-free closed loops, retain position/end as pointers and fold the
+    // byte advance into LDRB's post-index addressing mode. Endpoint-producing
+    // and rooted entries keep their offset representation.
+    let scanner_free_exists_pointer_cursor =
+        bottom_test_compact_rows && output == OutputContract::Exists;
     let frame_bytes = if root_plan.is_some() {
         ROOT_SCANNER_FRAME_BYTES
     } else {
@@ -22183,6 +22238,10 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     assembler.instruction(aarch64_load_x_imm(0, 31, 8)?)?;
     assembler.instruction(aarch64_load_x_imm(2, 31, 48)?)?;
     assembler.instruction(aarch64_load_x_imm(3, 31, 56)?)?;
+    if scanner_free_exists_pointer_cursor {
+        assembler.instruction(aarch64_add_x_reg(2, 0, 2)?)?;
+        assembler.instruction(aarch64_add_x_reg(3, 0, 3)?)?;
+    }
     if let Some(root_setup) = root_setup {
         assembler.branch(root_setup)?;
     } else if output != OutputContract::Exists {
@@ -22190,11 +22249,13 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     }
 
     assembler.bind(v4_scan)?;
-    assembler.instruction(aarch64_cmp_x(2, 3)?)?;
-    assembler.branch_cond(
-        AARCH64_HS,
-        native_complete.unwrap_or(native_no_match),
-    )?;
+    if !bottom_test_compact_rows {
+        assembler.instruction(aarch64_cmp_x(2, 3)?)?;
+        assembler.branch_cond(
+            AARCH64_HS,
+            native_complete.unwrap_or(native_no_match),
+        )?;
+    }
     if let Some(root_dispatch) = root_dispatch {
         let non_root = assembler.label()?;
         assembler.instruction(aarch64_cmp_x(11, 1)?)?;
@@ -22209,10 +22270,16 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     }
 
     assembler.bind(v4_table_scan)?;
-    assembler.instruction(aarch64_load_byte_reg(8, 0, 2)?)?;
+    if scanner_free_exists_pointer_cursor {
+        assembler.instruction(aarch64_load_byte_post_imm(8, 2, 1)?)?;
+    } else {
+        assembler.instruction(aarch64_load_byte_reg(8, 0, 2)?)?;
+    }
     assembler.instruction(aarch64_load_byte_reg(8, 14, 8)?)?;
     assembler.instruction(aarch64_load_h_uxtw(8, 11, 8)?)?;
-    assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
+    if !scanner_free_exists_pointer_cursor {
+        assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
+    }
     if output == OutputContract::Exists {
         assembler.branch_bit_set_w(8, 15, native_match)?;
         // The not-taken accept branch proves bit 15 clear. Test the original
@@ -22227,7 +22294,13 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
         assembler.branch_zero_w(8, native_complete.unwrap_or(native_no_match))?;
     }
     assembler.instruction(aarch64_add_x_uxtw(11, 15, 8, 1)?)?;
-    assembler.branch(v4_scan)?;
+    if bottom_test_compact_rows {
+        assembler.instruction(aarch64_cmp_x(2, 3)?)?;
+        assembler.branch_cond(AARCH64_LO, v4_table_scan)?;
+        assembler.branch(native_complete.unwrap_or(native_no_match))?;
+    } else {
+        assembler.branch(v4_scan)?;
+    }
 
     assembler.bind(v3_enter)?;
     if root_plan.is_some() {
@@ -22259,6 +22332,10 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     assembler.instruction(aarch64_load_x_imm(0, 31, 8)?)?;
     assembler.instruction(aarch64_load_x_imm(2, 31, 48)?)?;
     assembler.instruction(aarch64_load_x_imm(3, 31, 56)?)?;
+    if scanner_free_exists_pointer_cursor {
+        assembler.instruction(aarch64_add_x_reg(2, 0, 2)?)?;
+        assembler.instruction(aarch64_add_x_reg(3, 0, 3)?)?;
+    }
     if let Some(root_setup) = root_setup {
         assembler.branch(root_setup)?;
     } else if output != OutputContract::Exists {
@@ -22290,15 +22367,23 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
         // Transition-derived ordinals below still use the immediate shift.
         assembler.instruction(aarch64_mov_x(11, 15)?)?;
         assembler.bind(v3_scan)?;
-        assembler.instruction(aarch64_cmp_x(2, 3)?)?;
-        assembler.branch_cond(
-            AARCH64_HS,
-            native_complete.unwrap_or(native_no_match),
-        )?;
-        assembler.instruction(aarch64_load_byte_reg(6, 0, 2)?)?;
+        if !bottom_test_compact_rows {
+            assembler.instruction(aarch64_cmp_x(2, 3)?)?;
+            assembler.branch_cond(
+                AARCH64_HS,
+                native_complete.unwrap_or(native_no_match),
+            )?;
+        }
+        if scanner_free_exists_pointer_cursor {
+            assembler.instruction(aarch64_load_byte_post_imm(6, 2, 1)?)?;
+        } else {
+            assembler.instruction(aarch64_load_byte_reg(6, 0, 2)?)?;
+        }
         assembler.instruction(aarch64_load_byte_reg(6, 14, 6)?)?;
         assembler.instruction(aarch64_load_h_uxtw(8, 11, 6)?)?;
-        assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
+        if !scanner_free_exists_pointer_cursor {
+            assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
+        }
         // V3 setup authenticated every nonzero low token against state_count,
         // so zero is the only closed transition and every live token may be
         // decremented directly into its zero-based state ordinal.
@@ -22333,7 +22418,13 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
             assembler.bind(non_root)?;
         }
         assembler.instruction(aarch64_add_x_lsl(11, 15, 6, shift)?)?;
-        assembler.branch(v3_scan)?;
+        if bottom_test_compact_rows {
+            assembler.instruction(aarch64_cmp_x(2, 3)?)?;
+            assembler.branch_cond(AARCH64_LO, v3_scan)?;
+            assembler.branch(native_complete.unwrap_or(native_no_match))?;
+        } else {
+            assembler.branch(v3_scan)?;
+        }
     }
 
     assembler.bind(preflight_enter)?;
@@ -37079,6 +37170,10 @@ static int run_case(const unsigned char *p,size_t n,size_t s,size_t e,uint32_t e
 
     #[test]
     fn aarch64_compare_and_test_branch_fixups_have_exact_encodings() {
+        assert_eq!(aarch64_load_byte_post_imm(6, 2, 1).unwrap(), 0x3840_1446);
+        assert_eq!(aarch64_load_byte_post_imm(8, 2, 1).unwrap(), 0x3840_1448);
+        assert!(aarch64_load_byte_post_imm(6, 2, 256).is_err());
+
         let mut assembler = Aarch64Assembler::new();
         let target = assembler.label().unwrap();
         assembler.branch_bit_set_w(8, 31, target).unwrap();
@@ -37097,6 +37192,165 @@ static int run_case(const unsigned char *p,size_t n,size_t s,size_t e,uint32_t e
         let label = invalid.label().unwrap();
         assert!(invalid.branch_bit_set_w(8, 32, label).is_err());
         assert!(invalid.branch_bit_clear_w(8, 32, label).is_err());
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one cross-ISA audit proves the rotated boundary and pointer-cursor contracts"
+    )]
+    fn scanner_free_compact_hot_loops_are_bottom_tested_and_pointer_advanced_cross_isa() {
+        fn x86_bottom_tests(code: &[u8]) -> usize {
+            code.windows(5)
+                .filter(|window| *window == [0x48, 0x39, 0xca, 0x0f, 0x82])
+                .count()
+        }
+
+        fn x86_top_tests(code: &[u8]) -> usize {
+            code.windows(5)
+                .filter(|window| *window == [0x48, 0x39, 0xca, 0x0f, 0x83])
+                .count()
+        }
+
+        fn aarch64_bound_tests(code: &[u8], condition: u8) -> usize {
+            let compare = aarch64_cmp_x(2, 3).unwrap();
+            code.chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>()
+                .windows(2)
+                .filter(|words| {
+                    words[0] == compare
+                        && words[1] & 0xff00_001f
+                            == 0x5400_0000 | u32::from(condition)
+                })
+                .count()
+        }
+
+        fn aarch64_words(code: &[u8]) -> Vec<u32> {
+            code.chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect()
+        }
+
+        let v4_postindexed = aarch64_load_byte_post_imm(8, 2, 1).unwrap();
+        let v3_postindexed = aarch64_load_byte_post_imm(6, 2, 1).unwrap();
+        let v4_indexed = aarch64_load_byte_reg(8, 0, 2).unwrap();
+        let v3_indexed = aarch64_load_byte_reg(6, 0, 2).unwrap();
+        let pointer_setup = [
+            aarch64_add_x_reg(2, 0, 2).unwrap(),
+            aarch64_add_x_reg(3, 0, 3).unwrap(),
+        ];
+
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let x86 = lower_x86_64_dynamic_rows_prepared_for_output(
+                None,
+                FeatureSet::EMPTY,
+                output,
+                None,
+                true,
+            )
+            .unwrap();
+            assert_eq!(
+                x86_bottom_tests(&x86.code),
+                10,
+                "x86 V4 plus all nine V3 shifts need one conditional backedge for {output:?}"
+            );
+
+            let arm = lower_aarch64_dynamic_rows_prepared_for_output(
+                None,
+                output,
+                None,
+                true,
+            )
+            .unwrap();
+            assert_eq!(
+                aarch64_bound_tests(&arm.code, AARCH64_LO),
+                10,
+                "AArch64 V4 plus all nine V3 shifts need one conditional backedge for {output:?}"
+            );
+            let words = aarch64_words(&arm.code);
+            let setup_count = words
+                .windows(pointer_setup.len())
+                .filter(|window| *window == pointer_setup)
+                .count();
+            if output == OutputContract::Exists {
+                assert_eq!(words.iter().filter(|&&word| word == v4_postindexed).count(), 1);
+                assert_eq!(words.iter().filter(|&&word| word == v3_postindexed).count(), 9);
+                assert_eq!(words.iter().filter(|&&word| word == v4_indexed).count(), 0);
+                assert_eq!(words.iter().filter(|&&word| word == v3_indexed).count(), 0);
+                assert_eq!(
+                    setup_count, 2,
+                    "each compact format entry converts its selected cursor exactly once"
+                );
+            } else {
+                assert_eq!(words.iter().filter(|&&word| word == v4_postindexed).count(), 0);
+                assert_eq!(words.iter().filter(|&&word| word == v3_postindexed).count(), 0);
+                assert_eq!(words.iter().filter(|&&word| word == v4_indexed).count(), 1);
+                assert_eq!(words.iter().filter(|&&word| word == v3_indexed).count(), 9);
+                assert_eq!(setup_count, 0, "endpoint contracts retain offset cursors");
+            }
+        }
+
+        let mut membership = [0_u64; 4];
+        let byte = usize::from(b'a');
+        membership[byte / 64] |= 1_u64 << (byte % 64);
+        let root_filter = plan_dynamic_root_filter(NativeDynamicRootRequirement {
+            scan_offset: 0,
+            membership,
+        })
+        .unwrap()
+        .expect("nontrivial compact-loop root filter");
+        let rooted_x86 = lower_x86_64_dynamic_rows_prepared_for_output(
+            Some(root_filter),
+            FeatureSet::EMPTY,
+            OutputContract::Exists,
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(x86_bottom_tests(&rooted_x86.code), 0);
+        assert!(
+            x86_top_tests(&rooted_x86.code) >= 10,
+            "all rooted compact loops must retain a top boundary test"
+        );
+
+        let target = Target::aarch64_macos()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .unwrap();
+        let mut data = vec![0_u8; 32];
+        let root = install_aarch64_dynamic_root_plan(&mut data, 0, root_filter, target).unwrap();
+        let rooted_arm = lower_aarch64_dynamic_rows_prepared_for_output(
+            Some(root),
+            OutputContract::Exists,
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(aarch64_bound_tests(&rooted_arm.code, AARCH64_LO), 0);
+        assert!(
+            aarch64_bound_tests(&rooted_arm.code, AARCH64_HS) >= 10,
+            "all rooted compact loops must retain a top boundary test"
+        );
+        let rooted_words = aarch64_words(&rooted_arm.code);
+        assert_eq!(
+            rooted_words
+                .iter()
+                .filter(|&&word| word == v4_postindexed || word == v3_postindexed)
+                .count(),
+            0
+        );
+        assert_eq!(
+            rooted_words
+                .windows(pointer_setup.len())
+                .filter(|window| *window == pointer_setup)
+                .count(),
+            0,
+            "root re-entry retains offset cursors"
+        );
     }
 
     #[test]
