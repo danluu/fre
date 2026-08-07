@@ -2589,9 +2589,10 @@ pub struct FrozenPreparedHeaderV3 {
 /// Format V3 rows contain padded power-of-two arrays whose low 15 bits hold a
 /// one-based destination-state ordinal. Format V4 rows are unpadded and hold
 /// the one-based destination cell-row offset directly. Both formats retain
-/// acceptance in bit 15 and zero as the closed dead transition. The exact V1
-/// flag, format version, ready seal, and geometry distinguish the overlapping
-/// interpretations before generated code follows the rows pointer.
+/// acceptance in bit 15, zero as the closed dead transition, and physical row
+/// zero as the canonical initial state. The exact V1 flag, format version,
+/// ready seal, and geometry distinguish the overlapping interpretations
+/// before generated code follows the rows pointer.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[repr(C)]
@@ -3106,6 +3107,19 @@ fn frozen_dynamic_source_rows_are_normalizable(rows: &[u32], stride: usize) -> b
             })
 }
 
+/// Map one source-state ordinal into a compact table whose initial state is
+/// physical row zero. Swapping zero with the source initial is its own inverse,
+/// so the same operation selects source rows and rewrites destination tokens.
+const fn canonicalize_frozen_state_ordinal(state: usize, source_initial: usize) -> usize {
+    if state == 0 {
+        source_initial
+    } else if state == source_initial {
+        0
+    } else {
+        state
+    }
+}
+
 impl FrozenDynamicRowsStorage {
     fn descriptor_is_valid_for(&self, identity: ProgramIdentity) -> bool {
         let rows = self.descriptor;
@@ -3239,7 +3253,11 @@ impl FrozenDynamicRowsStorageV3 {
                     live_cells > usize::from(DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK)
                 }
             }
-            || initial_state >= state_count
+            // Compact native code treats row zero as the root capability.
+            // Tightening the existing exact-format authentication keeps an
+            // older noncanonical producer fail-closed on the V2/preflight
+            // route instead of following its descriptor in the hot loop.
+            || initial_state != 0
             || rows.learned_loop_state_count != 0
             || rows
                 .learned_loop_states
@@ -5850,6 +5868,14 @@ impl CompiledProgram {
         let class_count = usize::try_from(full.row_stride()).ok()?;
         let source_cells = direct.state_count().checked_mul(class_count)?;
         let state_count = direct.state_count();
+        let source_initial_row = usize::try_from(full.forward_initial_row()).ok()?;
+        if source_initial_row.checked_rem(class_count) != Some(0) {
+            return None;
+        }
+        let source_initial_state = source_initial_row.checked_div(class_count)?;
+        if source_initial_state >= state_count {
+            return None;
+        }
         let format = select_frozen_compact_rows_format(state_count, class_count)?;
         if class_count == 0
             || class_count > 256
@@ -5895,26 +5921,41 @@ impl CompiledProgram {
 
         let mut owned_rows = Vec::new();
         owned_rows.try_reserve_exact(compact_cells).ok()?;
-        for row in full.forward_rows().chunks_exact(class_count) {
+        for canonical_state in 0..state_count {
+            // Canonicalize the graph before either compact representation is
+            // encoded. Both V3 ordinals and V4 cell offsets therefore share
+            // physical row zero as their exact initial-root capability.
+            let source_state =
+                canonicalize_frozen_state_ordinal(canonical_state, source_initial_state);
+            let source_row = source_state.checked_mul(class_count)?;
+            let source_end = source_row.checked_add(class_count)?;
+            let row = full.forward_rows().get(source_row..source_end)?;
             for &cell in row {
                 // Source-only start provenance was authenticated above and
-                // has no compact V3/V4 representation. Selecting just the one-based row
-                // token and accept bit strips both mutually-exclusive modes.
+                // has no compact V3/V4 representation. Selecting just the
+                // one-based canonical row token and accept bit strips both
+                // mutually-exclusive modes.
                 let source_token = cell & DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK;
                 let compact_token = if source_token == 0 {
                     0
                 } else {
-                    let source_row = usize::try_from(source_token.checked_sub(1)?).ok()?;
-                    if source_row.checked_rem(class_count) != Some(0) {
+                    let source_row_offset =
+                        usize::try_from(source_token.checked_sub(1)?).ok()?;
+                    if source_row_offset.checked_rem(class_count) != Some(0) {
                         return None;
                     }
+                    let source_destination = source_row_offset.checked_div(class_count)?;
+                    let destination = canonicalize_frozen_state_ordinal(
+                        source_destination,
+                        source_initial_state,
+                    );
                     match format {
                         FrozenCompactRowsFormat::StateOrdinalV3 => {
-                            let destination = source_row.checked_div(class_count)?;
                             u16::try_from(destination.checked_add(1)?).ok()?
                         }
                         FrozenCompactRowsFormat::CellOffsetV4 => {
-                            u16::try_from(source_row.checked_add(1)?).ok()?
+                            let destination_row = destination.checked_mul(class_count)?;
+                            u16::try_from(destination_row.checked_add(1)?).ok()?
                         }
                     }
                 };
@@ -5940,11 +5981,6 @@ impl CompiledProgram {
 
         let mut class_map = [0_u8; 256];
         class_map.copy_from_slice(full.class_map());
-        let initial_row = usize::try_from(full.forward_initial_row()).ok()?;
-        if initial_row.checked_rem(class_count) != Some(0) {
-            return None;
-        }
-        let initial_state = initial_row.checked_div(class_count)?;
         // Learned-loop ownership is mutable-K0 accelerator metadata, not DFA
         // semantics. V3/V4 copy every authenticated complete row into a closed
         // immutable table and may therefore scalar-step those states without
@@ -5964,7 +6000,7 @@ impl CompiledProgram {
             state_count: u32::try_from(state_count).ok()?,
             class_count: u32::try_from(class_count).ok()?,
             row_shift,
-            initial_state: u32::try_from(initial_state).ok()?,
+            initial_state: 0,
             learned_loop_state_count: 0,
             learned_loop_states,
             format_version: format.format_version(),
@@ -6029,17 +6065,14 @@ impl CompiledProgram {
                 class_count
             }
         };
-        let Some(initial_row) = usize::try_from(rows.initial_state)
-            .ok()
-            .and_then(|state| state.checked_mul(physical_cells))
-        else {
+        // Owner authentication canonicalized both compact formats before
+        // selection. Keep publication fail-closed if a future producer ever
+        // attempts to revive a nonzero initial-state interpretation.
+        if rows.initial_state != 0 {
             return header;
-        };
+        }
 
         let Ok(row_stride) = u32::try_from(physical_cells) else {
-            return header;
-        };
-        let Ok(initial_row) = u32::try_from(initial_row) else {
             return header;
         };
 
@@ -6053,7 +6086,7 @@ impl CompiledProgram {
         header.v1.forward_live_cells = storage.rows.len();
         header.v1.cache_identity = rows.cache_identity;
         header.v1.row_stride = row_stride;
-        header.v1.forward_initial_row = initial_row;
+        header.v1.forward_initial_row = 0;
         header.v1.unfilled_cell = u32::from(DYNAMIC_NATIVE_ROWS_V3_DEAD_CELL);
         header.v1.accept_mask = u32::from(DYNAMIC_NATIVE_ROWS_V3_ACCEPT_MASK);
         header.v1.next_row_token_mask =
@@ -18761,6 +18794,31 @@ mod tests {
     }
 
     #[test]
+    fn frozen_initial_state_canonicalization_is_an_exhaustive_involution() {
+        for state_count in 1_usize..=257 {
+            for source_initial in 0..state_count {
+                let mut represented = vec![false; state_count];
+                for state in 0..state_count {
+                    let canonical =
+                        canonicalize_frozen_state_ordinal(state, source_initial);
+                    assert!(canonical < state_count);
+                    assert!(!represented[canonical]);
+                    represented[canonical] = true;
+                    assert_eq!(
+                        canonicalize_frozen_state_ordinal(canonical, source_initial),
+                        state
+                    );
+                }
+                assert!(represented.into_iter().all(|present| present));
+                assert_eq!(
+                    canonicalize_frozen_state_ordinal(source_initial, source_initial),
+                    0
+                );
+            }
+        }
+    }
+
+    #[test]
     fn compact_format_selection_and_cell_offset_algebra_are_exhaustive_at_boundaries() {
         let token_limit = usize::from(DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK);
         assert_eq!(select_frozen_compact_rows_format(0, 1), None);
@@ -19014,6 +19072,7 @@ mod tests {
         );
         assert_eq!(storage.descriptor.learned_loop_state_count, 0);
         assert_eq!(storage.descriptor.learned_loop_states, [u32::MAX; 4]);
+        assert_eq!(storage.descriptor.initial_state, 0);
 
         let state_count = usize::try_from(storage.descriptor.state_count).unwrap();
         let class_count = usize::try_from(storage.descriptor.class_count).unwrap();
@@ -19065,15 +19124,27 @@ mod tests {
         assert_eq!(usize::try_from(wide.descriptor.row_stride).unwrap(), class_count);
         assert_eq!(wide.rows.len() / class_count, state_count);
         assert!(packed_bytes <= wide.rows.len() * core::mem::size_of::<u32>() + 256);
+        let source_initial_row = usize::try_from(wide.descriptor.initial_row).unwrap();
+        assert_eq!(source_initial_row % class_count, 0);
+        let source_initial_state = source_initial_row / class_count;
+        assert!(source_initial_state < state_count);
         for state in 0..state_count {
+            let source_state =
+                canonicalize_frozen_state_ordinal(state, source_initial_state);
             for class in 0..class_count {
-                let wide_cell = wide.rows[state * class_count + class];
+                let wide_cell = wide.rows[source_state * class_count + class];
                 let compact_cell = storage.rows[state * physical_cells + class];
                 let source_token = wide_cell & DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK;
                 let expected_token = if source_token == 0 {
                     0
                 } else {
-                    u16::try_from(source_token).unwrap()
+                    let source_destination =
+                        usize::try_from(source_token - 1).unwrap() / class_count;
+                    let destination = canonicalize_frozen_state_ordinal(
+                        source_destination,
+                        source_initial_state,
+                    );
+                    u16::try_from(destination * class_count + 1).unwrap()
                 };
                 assert_eq!(
                     compact_cell & DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK,
@@ -19105,6 +19176,7 @@ mod tests {
         assert_eq!(header.v1.forward_rows_address, rows_address);
         assert_eq!(header.v1.forward_live_cells, storage.rows.len());
         assert_eq!(usize::try_from(header.v1.row_stride).unwrap(), physical_cells);
+        assert_eq!(header.v1.forward_initial_row, 0);
         assert_eq!(header.v1.class_map, storage.class_map);
         assert_eq!(
             header.dynamic_rows_v3.ready_seal,
@@ -19190,7 +19262,9 @@ mod tests {
         reject_descriptor!({ storage.descriptor.state_count = 0; });
         reject_descriptor!({ storage.descriptor.class_count = 0; });
         reject_descriptor!({ storage.descriptor.row_shift = 1; });
-        reject_descriptor!({ storage.descriptor.initial_state = storage.descriptor.state_count; });
+        if storage.descriptor.state_count > 1 {
+            reject_descriptor!({ storage.descriptor.initial_state = 1; });
+        }
         reject_descriptor!({ storage.descriptor.learned_loop_state_count = 5; });
         reject_descriptor!({ storage.descriptor.learned_loop_states[0] = 0; });
         reject_descriptor!({ storage.descriptor.format_version = 2; });
