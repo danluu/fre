@@ -14,11 +14,12 @@ use core::{
     cmp::Ordering,
     hash::{BuildHasherDefault, Hash, Hasher},
 };
-use std::collections::HashMap;
+use std::{cell::Cell, collections::HashMap, rc::Rc};
 
 use fre_automata::{EdgeKind, RawPlan, StateRole};
 
 use crate::{
+    dfa::DeterminizeAllocationLedger,
     error::CompileError,
     program::{MatchResult, OutputContract, SearchWindow},
 };
@@ -209,6 +210,67 @@ pub struct ContextDfaStats {
 pub(crate) enum ContextDfaOutcome {
     Complete(ContextDfa),
     Declined(ContextDfaDecline),
+}
+
+/// Exact resource use of one explicitly selected slow contextual build.
+///
+/// Work is shared by the mandatory bidirectional attempt, its mutually
+/// exclusive forward-only rescue, the optional exact-start sidecar, and every
+/// late quotient attempt. Allocation bytes are a conservative logical peak:
+/// short-lived scratch may be over-counted, while a discarded mandatory
+/// attempt is restored before its mutually exclusive rescue.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ContextDfaResourceUsage {
+    pub(crate) allocation_bytes: usize,
+    pub(crate) work_completed: u64,
+}
+
+/// Shared work ledger for one explicitly selected slow contextual build.
+///
+/// Unlike allocation ownership, discarded work is never restored. Optional
+/// stages receive only the caller's remaining aggregate work and decline
+/// transactionally when it is exhausted.
+#[derive(Clone, Debug)]
+struct DeterminizeWorkLedger {
+    state: Rc<Cell<DeterminizeWorkState>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DeterminizeWorkState {
+    limit: u64,
+    completed: u64,
+}
+
+impl DeterminizeWorkLedger {
+    fn new(limit: u64) -> Self {
+        Self {
+            state: Rc::new(Cell::new(DeterminizeWorkState {
+                limit,
+                completed: 0,
+            })),
+        }
+    }
+
+    fn charge(&self, amount: u64) -> Result<(), u64> {
+        let mut state = self.state.get();
+        let Some(required) = state.completed.checked_add(amount) else {
+            return Err(u64::MAX);
+        };
+        if required > state.limit {
+            return Err(required);
+        }
+        state.completed = required;
+        self.state.set(state);
+        Ok(())
+    }
+
+    fn limit(&self) -> u64 {
+        self.state.get().limit
+    }
+
+    fn completed(&self) -> u64 {
+        self.state.get().completed
+    }
 }
 
 /// An explicit classification of one original-haystack boundary.
@@ -897,6 +959,9 @@ struct LateQuotientBudget {
     work: u64,
     max_work: u64,
     exhausted: bool,
+    allocation_ledger: Option<DeterminizeAllocationLedger>,
+    work_ledger: Option<DeterminizeWorkLedger>,
+    decline: Option<ContextDfaResource>,
 }
 
 impl LateQuotientBudget {
@@ -905,20 +970,64 @@ impl LateQuotientBudget {
             work: 0,
             max_work,
             exhausted: false,
+            allocation_ledger: None,
+            work_ledger: None,
+            decline: None,
+        }
+    }
+
+    fn new_slow(
+        max_work: u64,
+        allocation_ledger: &DeterminizeAllocationLedger,
+        work_ledger: &DeterminizeWorkLedger,
+    ) -> Self {
+        Self {
+            work: 0,
+            max_work,
+            exhausted: false,
+            allocation_ledger: Some(allocation_ledger.clone()),
+            work_ledger: Some(work_ledger.clone()),
+            decline: None,
+        }
+    }
+
+    fn decline(&mut self, resource: ContextDfaResource) {
+        self.exhausted = true;
+        if self.decline.is_none() {
+            self.decline = Some(resource);
         }
     }
 
     fn charge(&mut self, amount: usize) -> bool {
         let Ok(amount) = u64::try_from(amount) else {
-            self.exhausted = true;
+            self.decline(ContextDfaResource::Work {
+                limit: self.max_work,
+                required: u64::MAX,
+            });
             return false;
         };
         let Some(required) = self.work.checked_add(amount) else {
-            self.exhausted = true;
+            self.decline(ContextDfaResource::Work {
+                limit: self.max_work,
+                required: u64::MAX,
+            });
             return false;
         };
         if required > self.max_work {
-            self.exhausted = true;
+            self.decline(ContextDfaResource::Work {
+                limit: self.max_work,
+                required,
+            });
+            return false;
+        }
+        let shared_decline = self.work_ledger.as_ref().and_then(|ledger| {
+            ledger
+                .charge(amount)
+                .err()
+                .map(|required| (ledger.limit(), required))
+        });
+        if let Some((limit, required)) = shared_decline {
+            self.decline(ContextDfaResource::Work { limit, required });
             return false;
         }
         self.work = required;
@@ -934,18 +1043,51 @@ impl LateQuotientBudget {
     }
 
     fn reserve_vec<T>(&mut self, capacity: usize) -> Option<Vec<T>> {
+        if self
+            .allocation_ledger
+            .as_ref()
+            .is_some_and(|ledger| !ledger.charge_elements::<T>(capacity))
+        {
+            self.decline(ContextDfaResource::Allocation {
+                requested_elements: capacity,
+                element_size: core::mem::size_of::<T>(),
+            });
+            return None;
+        }
         let mut values = Vec::new();
         if values.try_reserve_exact(capacity).is_err() {
-            self.exhausted = true;
+            self.decline(ContextDfaResource::Allocation {
+                requested_elements: capacity,
+                element_size: core::mem::size_of::<T>(),
+            });
             return None;
         }
         Some(values)
     }
 
     fn reserve_map<K: Eq + Hash, V>(&mut self, capacity: usize) -> Option<StableMap<K, V>> {
+        let reserve_capacity = if self.allocation_ledger.is_some() {
+            capacity.max(4)
+        } else {
+            capacity
+        };
+        if self
+            .allocation_ledger
+            .as_ref()
+            .is_some_and(|ledger| !ledger.charge_map_entries::<K, V>(reserve_capacity))
+        {
+            self.decline(ContextDfaResource::Allocation {
+                requested_elements: reserve_capacity,
+                element_size: core::mem::size_of::<(K, V)>(),
+            });
+            return None;
+        }
         let mut values = StableMap::default();
-        if values.try_reserve(capacity).is_err() {
-            self.exhausted = true;
+        if values.try_reserve(reserve_capacity).is_err() {
+            self.decline(ContextDfaResource::Allocation {
+                requested_elements: reserve_capacity,
+                element_size: core::mem::size_of::<(K, V)>(),
+            });
             return None;
         }
         Some(values)
@@ -1714,6 +1856,8 @@ fn late_context_quotient_with_work_limit(
     anchored_forward: Option<&AnchoredForwardDfa>,
     width: usize,
     max_work: u64,
+    allocation_ledger: Option<&DeterminizeAllocationLedger>,
+    work_ledger: Option<&DeterminizeWorkLedger>,
 ) -> Result<Option<ContextDfaQuotient>, CompileError> {
     let Some(total_states) = forward.states.len().checked_add(reverse.states.len()) else {
         return Ok(None);
@@ -1727,7 +1871,12 @@ fn late_context_quotient_with_work_limit(
         return Ok(None);
     }
 
-    let mut budget = LateQuotientBudget::new(max_work);
+    debug_assert_eq!(allocation_ledger.is_some(), work_ledger.is_some());
+    let new_budget = |limit| match (allocation_ledger, work_ledger) {
+        (Some(allocation), Some(work)) => LateQuotientBudget::new_slow(limit, allocation, work),
+        _ => LateQuotientBudget::new(limit),
+    };
+    let mut budget = new_budget(max_work);
     let Some(mut no_external) = budget.reserve_vec(forward.states.len()) else {
         return Ok(None);
     };
@@ -1765,7 +1914,7 @@ fn late_context_quotient_with_work_limit(
     // its remapped state-index function must remain single-valued.
     let mut anchored_reduced = false;
     let anchored_update = if let Some(source) = anchored_forward {
-        let mut anchored_budget = LateQuotientBudget::new(max_work);
+        let mut anchored_budget = new_budget(max_work);
         let anchored_partition = if source.forward.states.len() <= LATE_ANCHORED_QUOTIENT_MAX_STATES
             && source.forward.cells.len() <= LATE_ANCHORED_QUOTIENT_MAX_TRANSITIONS
         {
@@ -1798,10 +1947,11 @@ fn late_context_quotient_with_work_limit(
         } else {
             None
         };
-        // Mapping is linear in the already-bounded mandatory state arena. A
-        // fresh fixed ceiling makes `None` below an allocation failure rather
-        // than an ambiguous carry-over from optional refinement work.
-        let mut mapping_budget = LateQuotientBudget::new(LATE_CONTEXT_QUOTIENT_MAX_WORK);
+        // Mapping is linear in the already-bounded mandatory state arena. Its
+        // fresh local ceiling distinguishes a normal-path allocation failure;
+        // the slow path additionally preserves a shared work/allocation
+        // decline when the aggregate transaction is exhausted.
+        let mut mapping_budget = new_budget(LATE_CONTEXT_QUOTIENT_MAX_WORK);
         let remapped = remap_anchored_initial_states(
             &source.main_initial_to_anchored,
             forward_reduced.then_some(&main_partition),
@@ -1832,12 +1982,14 @@ fn late_context_quotient_with_work_limit(
                 first_anchored_state,
                 second_anchored_state,
             }),
-            None if forward_reduced => {
-                AnchoredQuotientUpdate::Omit(ContextDfaResource::Allocation {
-                    requested_elements: main_partition.representatives.len(),
-                    element_size: core::mem::size_of::<u32>(),
-                })
-            }
+            None if forward_reduced => AnchoredQuotientUpdate::Omit(
+                mapping_budget
+                    .decline
+                    .unwrap_or(ContextDfaResource::Allocation {
+                        requested_elements: main_partition.representatives.len(),
+                        element_size: core::mem::size_of::<u32>(),
+                    }),
+            ),
             None => AnchoredQuotientUpdate::Preserve,
         }
     } else {
@@ -1859,6 +2011,8 @@ fn late_context_quotient(
     reverse: &ReverseDfa,
     anchored_forward: Option<&AnchoredForwardDfa>,
     width: usize,
+    allocation_ledger: Option<&DeterminizeAllocationLedger>,
+    work_ledger: Option<&DeterminizeWorkLedger>,
 ) -> Result<Option<ContextDfaQuotient>, CompileError> {
     late_context_quotient_with_work_limit(
         forward,
@@ -1866,6 +2020,8 @@ fn late_context_quotient(
         anchored_forward,
         width,
         LATE_CONTEXT_QUOTIENT_MAX_WORK,
+        allocation_ledger,
+        work_ledger,
     )
 }
 
@@ -2328,12 +2484,85 @@ pub(crate) fn determinize_for_output(
     limits: ContextDfaLimits,
     output: OutputContract,
 ) -> Result<ContextDfaOutcome, CompileError> {
-    let first = determinize(raw, line_terminator, limits)?;
+    determinize_for_output_with_ledgers(
+        raw,
+        line_terminator,
+        limits,
+        output,
+        output == OutputContract::Span,
+        None,
+        None,
+    )
+}
+
+/// Build an output-specialized contextual machine while conservatively
+/// bounding every fallible logical allocation and all deterministic work.
+///
+/// `needs_reverse_span` is false only when the caller has a separate exact
+/// width proof that recovers a selected start without reverse traversal. The
+/// allocation ledger is restored before a mutually exclusive forward-only
+/// retry; discarded work remains charged. Optional anchored and quotient
+/// stages receive only the remaining aggregate work and never turn a complete
+/// mandatory machine into a top-level decline.
+pub(crate) fn determinize_for_output_with_allocation_limit(
+    raw: &RawPlan,
+    line_terminator: u8,
+    limits: ContextDfaLimits,
+    output: OutputContract,
+    needs_reverse_span: bool,
+    max_allocation_bytes: usize,
+) -> Result<(ContextDfaOutcome, ContextDfaResourceUsage), CompileError> {
+    let allocation_ledger = DeterminizeAllocationLedger::new(max_allocation_bytes);
+    let work_ledger = DeterminizeWorkLedger::new(limits.max_work);
+    let outcome = determinize_for_output_with_ledgers(
+        raw,
+        line_terminator,
+        limits,
+        output,
+        needs_reverse_span,
+        Some(&allocation_ledger),
+        Some(&work_ledger),
+    )?;
+    Ok((
+        outcome,
+        ContextDfaResourceUsage {
+            allocation_bytes: allocation_ledger.peak_bytes(),
+            work_completed: work_ledger.completed(),
+        },
+    ))
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "output, reverse observability, and the two optional slow ledgers independently select construction policy"
+)]
+fn determinize_for_output_with_ledgers(
+    raw: &RawPlan,
+    line_terminator: u8,
+    limits: ContextDfaLimits,
+    output: OutputContract,
+    needs_reverse_span: bool,
+    allocation_ledger: Option<&DeterminizeAllocationLedger>,
+    work_ledger: Option<&DeterminizeWorkLedger>,
+) -> Result<ContextDfaOutcome, CompileError> {
+    debug_assert_eq!(allocation_ledger.is_some(), work_ledger.is_some());
+    debug_assert!(output == OutputContract::Span || !needs_reverse_span);
+    let allocation_checkpoint =
+        allocation_ledger.map_or(0, DeterminizeAllocationLedger::checkpoint);
+    let first = determinize_with_directions_and_ledgers(
+        raw,
+        line_terminator,
+        limits,
+        AnchoredForwardLimits::default(),
+        true,
+        allocation_ledger,
+        work_ledger,
+    )?;
     let decline = match first {
         ContextDfaOutcome::Complete(machine) => return Ok(ContextDfaOutcome::Complete(machine)),
         ContextDfaOutcome::Declined(decline) => decline,
     };
-    if output == OutputContract::Span
+    if needs_reverse_span
         || matches!(
             decline.resource,
             ContextDfaResource::UnsupportedAssertion(_)
@@ -2341,22 +2570,39 @@ pub(crate) fn determinize_for_output(
     {
         return Ok(ContextDfaOutcome::Declined(decline));
     }
-    let remaining_work = limits.max_work.checked_sub(decline.work_completed).ok_or(
+    if matches!(decline.resource, ContextDfaResource::Allocation { .. })
+        && allocation_ledger.is_some_and(|ledger| !ledger.exhausted())
+    {
+        // The logical cap was not reached, so this is an allocator refusal,
+        // not a potentially-smaller mutually exclusive retry opportunity.
+        return Ok(ContextDfaOutcome::Declined(decline));
+    }
+    let completed_work =
+        work_ledger.map_or(decline.work_completed, DeterminizeWorkLedger::completed);
+    let remaining_work = limits.max_work.checked_sub(completed_work).ok_or(
         CompileError::InternalInvariant("contextual decline work exceeded its limit"),
     )?;
     if remaining_work == 0 {
         return Ok(ContextDfaOutcome::Declined(decline));
     }
+    if let Some(ledger) = allocation_ledger {
+        // A contextual decline owns no partial machine. The first attempt is
+        // fully dropped here, so its mutually exclusive forward-only rescue
+        // may reuse the hard logical byte budget while peak history remains.
+        ledger.restore(allocation_checkpoint);
+    }
     let retry_limits = ContextDfaLimits {
         max_work: remaining_work,
         ..limits
     };
-    match determinize_with_directions(
+    match determinize_with_directions_and_ledgers(
         raw,
         line_terminator,
         retry_limits,
         AnchoredForwardLimits::default(),
         false,
+        allocation_ledger,
+        work_ledger,
     )? {
         ContextDfaOutcome::Complete(mut machine) => {
             machine.stats.build_work = machine
@@ -2399,6 +2645,31 @@ fn determinize_with_directions(
     anchored_limits: AnchoredForwardLimits,
     retain_reverse: bool,
 ) -> Result<ContextDfaOutcome, CompileError> {
+    determinize_with_directions_and_ledgers(
+        raw,
+        line_terminator,
+        limits,
+        anchored_limits,
+        retain_reverse,
+        None,
+        None,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "direction policy, independent sidecar limits, and optional slow ledgers are explicit transaction inputs"
+)]
+fn determinize_with_directions_and_ledgers(
+    raw: &RawPlan,
+    line_terminator: u8,
+    limits: ContextDfaLimits,
+    anchored_limits: AnchoredForwardLimits,
+    retain_reverse: bool,
+    allocation_ledger: Option<&DeterminizeAllocationLedger>,
+    work_ledger: Option<&DeterminizeWorkLedger>,
+) -> Result<ContextDfaOutcome, CompileError> {
+    debug_assert_eq!(allocation_ledger.is_some(), work_ledger.is_some());
     let needs = match ContextNeeds::inspect(raw) {
         Ok(needs) => needs,
         Err(kind) => {
@@ -2410,7 +2681,10 @@ fn determinize_with_directions(
             }));
         }
     };
-    let mut budget = BuildBudget::new(limits);
+    let mut budget = match (allocation_ledger, work_ledger) {
+        (Some(allocation), Some(work)) => BuildBudget::new_slow(limits, allocation, work),
+        _ => BuildBudget::new(limits),
+    };
     let Some(alphabet) = Alphabet::build(raw, line_terminator, needs, &mut budget)? else {
         return Ok(ContextDfaOutcome::Declined(budget.finish_decline()?));
     };
@@ -2426,7 +2700,14 @@ fn determinize_with_directions(
         None
     };
     let initial_dispatch = NativeContextInitialDispatch::new(alphabet.classes())?;
-    let mut anchored = build_anchored_forward(raw, &alphabet, &forward, anchored_limits)?;
+    let mut anchored = build_anchored_forward(
+        raw,
+        &alphabet,
+        &forward,
+        anchored_limits,
+        allocation_ledger,
+        work_ledger,
+    )?;
     let row_width = alphabet
         .classes()
         .checked_add(1)
@@ -2437,7 +2718,14 @@ fn determinize_with_directions(
     let quotient = reverse
         .as_ref()
         .map(|reverse| {
-            late_context_quotient(&forward, reverse, anchored.machine.as_ref(), row_width)
+            late_context_quotient(
+                &forward,
+                reverse,
+                anchored.machine.as_ref(),
+                row_width,
+                allocation_ledger,
+                work_ledger,
+            )
         })
         .transpose()?
         .flatten();
@@ -2866,8 +3154,16 @@ fn build_anchored_forward(
     alphabet: &Alphabet,
     main: &ForwardDfa,
     limits: AnchoredForwardLimits,
+    allocation_ledger: Option<&DeterminizeAllocationLedger>,
+    work_ledger: Option<&DeterminizeWorkLedger>,
 ) -> Result<AnchoredForwardBuild, CompileError> {
-    let mut budget = BuildBudget::new(limits.into());
+    debug_assert_eq!(allocation_ledger.is_some(), work_ledger.is_some());
+    let mut budget = match (allocation_ledger, work_ledger) {
+        (Some(allocation), Some(work)) => {
+            BuildBudget::new_slow(limits.into(), allocation, work)
+        }
+        _ => BuildBudget::new(limits.into()),
+    };
     let built = build_anchored_forward_with_budget(raw, alphabet, main, &mut budget)?;
     match built {
         Some(machine) => Ok(AnchoredForwardBuild::completed(machine, budget)),
@@ -2962,8 +3258,7 @@ fn build_anchored_forward_with_budget(
             ));
         }
         *mapped = anchored_state;
-        if initial.try_reserve(1).is_err() {
-            budget.allocation::<(ForwardBoundary, u32)>(initial.len().saturating_add(1));
+        if !ensure_map_capacity(&mut initial, 1, budget) {
             return Ok(None);
         }
         if initial.insert(boundary, anchored_state).is_some() {
@@ -3556,8 +3851,7 @@ fn seed_forward_initial(
     let Some(state) = intern_forward(key, states, rows, interned, budget)? else {
         return Ok(None);
     };
-    if initial.try_reserve(1).is_err() {
-        budget.allocation::<(ForwardBoundary, u32)>(initial.len().saturating_add(1));
+    if !ensure_map_capacity(initial, 1, budget) {
         return Ok(None);
     }
     if initial.insert(boundary, state).is_some() {
@@ -3649,12 +3943,10 @@ fn intern_forward(
     let Some(stored) = clone_forward_key(&key, budget)? else {
         return Ok(None);
     };
-    if states.try_reserve(1).is_err() || rows.try_reserve(1).is_err() {
-        budget.allocation::<ForwardKey>(states.len().saturating_add(1));
+    if !ensure_vec_capacity(states, 1, budget) || !ensure_vec_capacity(rows, 1, budget) {
         return Ok(None);
     }
-    if interned.try_reserve(1).is_err() {
-        budget.allocation::<(ForwardKey, u32)>(interned.len().saturating_add(1));
+    if !ensure_map_capacity(interned, 1, budget) {
         return Ok(None);
     }
     let id = u32::try_from(states.len()).map_err(|_| {
@@ -3708,8 +4000,7 @@ impl Incoming {
             }
         }
         for (row, &degree) in by_target.iter_mut().zip(&degrees) {
-            if row.try_reserve_exact(degree).is_err() {
-                budget.allocation::<u32>(degree);
+            if !ensure_vec_capacity_exact(row, degree, budget) {
                 return Ok(None);
             }
         }
@@ -4242,8 +4533,7 @@ fn seed_reverse_initial(
     if budget.declined.is_some() {
         return Ok(None);
     }
-    if initial.try_reserve(1).is_err() {
-        budget.allocation::<(ReverseBoundary, ReverseInitial)>(initial.len().saturating_add(1));
+    if !ensure_map_capacity(initial, 1, budget) {
         return Ok(None);
     }
     if initial
@@ -4339,12 +4629,10 @@ fn intern_reverse(
     let Some(stored) = clone_reverse_key(&key, budget)? else {
         return Ok(None);
     };
-    if states.try_reserve(1).is_err() || rows.try_reserve(1).is_err() {
-        budget.allocation::<ReverseKey>(states.len().saturating_add(1));
+    if !ensure_vec_capacity(states, 1, budget) || !ensure_vec_capacity(rows, 1, budget) {
         return Ok(None);
     }
-    if interned.try_reserve(1).is_err() {
-        budget.allocation::<(ReverseKey, u32)>(interned.len().saturating_add(1));
+    if !ensure_map_capacity(interned, 1, budget) {
         return Ok(None);
     }
     let id = u32::try_from(states.len()).map_err(|_| {
@@ -4358,6 +4646,8 @@ fn intern_reverse(
 
 struct BuildBudget {
     limits: ContextDfaLimits,
+    allocation_ledger: Option<DeterminizeAllocationLedger>,
+    work_ledger: Option<DeterminizeWorkLedger>,
     work: u64,
     states: usize,
     transitions: usize,
@@ -4368,6 +4658,24 @@ impl BuildBudget {
     const fn new(limits: ContextDfaLimits) -> Self {
         Self {
             limits,
+            allocation_ledger: None,
+            work_ledger: None,
+            work: 0,
+            states: 0,
+            transitions: 0,
+            declined: None,
+        }
+    }
+
+    fn new_slow(
+        limits: ContextDfaLimits,
+        allocation_ledger: &DeterminizeAllocationLedger,
+        work_ledger: &DeterminizeWorkLedger,
+    ) -> Self {
+        Self {
+            limits,
+            allocation_ledger: Some(allocation_ledger.clone()),
+            work_ledger: Some(work_ledger.clone()),
             work: 0,
             states: 0,
             transitions: 0,
@@ -4388,6 +4696,16 @@ impl BuildBudget {
                 limit: self.limits.max_work,
                 required,
             });
+            return false;
+        }
+        let shared_decline = self.work_ledger.as_ref().and_then(|ledger| {
+            ledger
+                .charge(amount)
+                .err()
+                .map(|required| (ledger.limit(), required))
+        });
+        if let Some((limit, required)) = shared_decline {
+            self.decline(ContextDfaResource::Work { limit, required });
             return false;
         }
         self.work = required;
@@ -4463,6 +4781,28 @@ impl BuildBudget {
         });
     }
 
+    fn charge_allocation<T>(&mut self, elements: usize) -> bool {
+        let accepted = self
+            .allocation_ledger
+            .as_ref()
+            .is_none_or(|ledger| ledger.charge_elements::<T>(elements));
+        if !accepted {
+            self.allocation::<T>(elements);
+        }
+        accepted
+    }
+
+    fn charge_map_allocation<K, V>(&mut self, entries: usize) -> bool {
+        let accepted = self
+            .allocation_ledger
+            .as_ref()
+            .is_none_or(|ledger| ledger.charge_map_entries::<K, V>(entries));
+        if !accepted {
+            self.allocation::<(K, V)>(entries);
+        }
+        accepted
+    }
+
     fn decline(&mut self, resource: ContextDfaResource) {
         if self.declined.is_none() {
             self.declined = Some(resource);
@@ -4489,6 +4829,9 @@ fn reserve_vec<T>(
     capacity: usize,
     budget: &mut BuildBudget,
 ) -> Result<Option<Vec<T>>, CompileError> {
+    if !budget.charge_allocation::<T>(capacity) {
+        return Ok(None);
+    }
     let mut values = Vec::new();
     if values.try_reserve_exact(capacity).is_err() {
         budget.allocation::<T>(capacity);
@@ -4505,12 +4848,113 @@ fn reserve_map<K: Eq + Hash, V>(
     capacity: usize,
     budget: &mut BuildBudget,
 ) -> Result<Option<StableMap<K, V>>, CompileError> {
+    let reserve_capacity = if budget.allocation_ledger.is_some() {
+        capacity.max(4)
+    } else {
+        capacity
+    };
+    if !budget.charge_map_allocation::<K, V>(reserve_capacity) {
+        return Ok(None);
+    }
     let mut values = StableMap::default();
-    if values.try_reserve(capacity).is_err() {
-        budget.allocation::<(K, V)>(capacity);
+    if values.try_reserve(reserve_capacity).is_err() {
+        budget.allocation::<(K, V)>(reserve_capacity);
         return Ok(None);
     }
     Ok(Some(values))
+}
+
+fn ensure_vec_capacity<T>(
+    values: &mut Vec<T>,
+    additional: usize,
+    budget: &mut BuildBudget,
+) -> bool {
+    let Some(required) = values.len().checked_add(additional) else {
+        budget.allocation::<T>(usize::MAX);
+        return false;
+    };
+    if values.capacity() >= required {
+        return true;
+    }
+    if budget.allocation_ledger.is_none() {
+        if values.try_reserve(additional).is_err() {
+            budget.allocation::<T>(required);
+            return false;
+        }
+        return true;
+    }
+    let reserve_capacity = values
+        .capacity()
+        .saturating_mul(2)
+        .max(required)
+        .max(4);
+    // A reallocating allocator may retain the old buffer until its
+    // replacement succeeds. Charging the full prospective capacity bounds
+    // that transient peak conservatively while geometric growth avoids
+    // quadratic one-element accounting.
+    if !budget.charge_allocation::<T>(reserve_capacity) {
+        return false;
+    }
+    let reserve_additional = reserve_capacity.saturating_sub(values.len());
+    if values.try_reserve_exact(reserve_additional).is_err() {
+        budget.allocation::<T>(reserve_capacity);
+        return false;
+    }
+    true
+}
+
+fn ensure_vec_capacity_exact<T>(
+    values: &mut Vec<T>,
+    additional: usize,
+    budget: &mut BuildBudget,
+) -> bool {
+    let Some(required) = values.len().checked_add(additional) else {
+        budget.allocation::<T>(usize::MAX);
+        return false;
+    };
+    if values.capacity() >= required {
+        return true;
+    }
+    if !budget.charge_allocation::<T>(required) {
+        return false;
+    }
+    if values.try_reserve_exact(additional).is_err() {
+        budget.allocation::<T>(required);
+        return false;
+    }
+    true
+}
+
+fn ensure_map_capacity<K: Eq + Hash, V>(
+    values: &mut StableMap<K, V>,
+    additional: usize,
+    budget: &mut BuildBudget,
+) -> bool {
+    let Some(required) = values.len().checked_add(additional) else {
+        budget.allocation::<(K, V)>(usize::MAX);
+        return false;
+    };
+    if values.capacity() >= required {
+        return true;
+    }
+    let reserve_capacity = if budget.allocation_ledger.is_some() {
+        values
+            .capacity()
+            .saturating_mul(2)
+            .max(required)
+            .max(4)
+    } else {
+        required
+    };
+    if !budget.charge_map_allocation::<K, V>(reserve_capacity) {
+        return false;
+    }
+    let reserve_additional = reserve_capacity.saturating_sub(values.len());
+    if values.try_reserve(reserve_additional).is_err() {
+        budget.allocation::<(K, V)>(reserve_capacity);
+        return false;
+    }
+    true
 }
 
 fn clone_u32s(values: &[u32], budget: &mut BuildBudget) -> Result<Option<Vec<u32>>, CompileError> {
@@ -4894,6 +5338,230 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn slow_context_zero_allocation_cap_is_a_typed_decline() {
+        let raw = raw_plan(r"(?-u:\b)abc(?-u:\b)", b'\n');
+        let (outcome, usage) = determinize_for_output_with_allocation_limit(
+            &raw,
+            b'\n',
+            ContextDfaLimits {
+                max_states: usize::MAX,
+                max_transitions: usize::MAX,
+                max_work: u64::MAX,
+            },
+            OutputContract::Span,
+            true,
+            0,
+        )
+        .expect("zero-byte contextual construction");
+        assert_eq!(
+            usage,
+            ContextDfaResourceUsage {
+                allocation_bytes: 0,
+                work_completed: 0,
+            }
+        );
+        assert!(matches!(
+            outcome,
+            ContextDfaOutcome::Declined(ContextDfaDecline {
+                resource: ContextDfaResource::Allocation { .. },
+                work_completed: 0,
+                states_completed: 0,
+                transitions_completed: 0,
+            })
+        ));
+    }
+
+    #[test]
+    fn slow_context_work_limit_is_shared_by_every_optional_stage() {
+        let raw = raw_plan(r"(?m:^)(?:ab|a)+?(?m:$)", b'\n');
+        let unlimited = ContextDfaLimits {
+            max_states: usize::MAX,
+            max_transitions: usize::MAX,
+            max_work: u64::MAX,
+        };
+        let (baseline, baseline_usage) = determinize_for_output_with_allocation_limit(
+            &raw,
+            b'\n',
+            unlimited,
+            OutputContract::Span,
+            true,
+            usize::MAX,
+        )
+        .expect("unlimited slow contextual construction");
+        let baseline = complete(baseline);
+        assert!(baseline_usage.work_completed >= baseline.stats().build_work);
+        assert!(baseline_usage.allocation_bytes > 0);
+
+        let exact_limits = ContextDfaLimits {
+            max_work: baseline_usage.work_completed,
+            ..unlimited
+        };
+        let (exact, exact_usage) = determinize_for_output_with_allocation_limit(
+            &raw,
+            b'\n',
+            exact_limits,
+            OutputContract::Span,
+            true,
+            baseline_usage.allocation_bytes,
+        )
+        .expect("exact slow contextual work and allocation limits");
+        let exact = complete(exact);
+        assert_eq!(exact_usage, baseline_usage);
+        assert_eq!(exact.native_view().forward_cells, baseline.native_view().forward_cells);
+        assert_eq!(exact.native_view().reverse_cells, baseline.native_view().reverse_cells);
+
+        let one_below_work = baseline_usage
+            .work_completed
+            .checked_sub(1)
+            .expect("contextual construction performs work");
+        let (_, one_below_usage) = determinize_for_output_with_allocation_limit(
+            &raw,
+            b'\n',
+            ContextDfaLimits {
+                max_work: one_below_work,
+                ..unlimited
+            },
+            OutputContract::Span,
+            true,
+            baseline_usage.allocation_bytes,
+        )
+        .expect("one-below aggregate slow contextual work");
+        assert!(one_below_usage.work_completed <= one_below_work);
+    }
+
+    #[test]
+    fn slow_context_retry_reuses_allocation_but_not_work() {
+        let raw = raw_plan(r"(?-u:\b)abc(?-u:\b)", b'\n');
+        let unlimited = ContextDfaLimits {
+            max_states: usize::MAX,
+            max_transitions: usize::MAX,
+            max_work: u64::MAX,
+        };
+        let minimum_state_limit = |retain_reverse| {
+            let mut low = 0usize;
+            let mut high = 1usize;
+            while !matches!(
+                determinize_with_directions(
+                    &raw,
+                    b'\n',
+                    ContextDfaLimits {
+                        max_states: high,
+                        ..unlimited
+                    },
+                    AnchoredForwardLimits::default(),
+                    retain_reverse,
+                )
+                .expect("bounded contextual state oracle"),
+                ContextDfaOutcome::Complete(_)
+            ) {
+                high = high.checked_mul(2).expect("contextual state oracle bound");
+            }
+            while low < high {
+                let middle = low + (high - low) / 2;
+                if matches!(
+                    determinize_with_directions(
+                        &raw,
+                        b'\n',
+                        ContextDfaLimits {
+                            max_states: middle,
+                            ..unlimited
+                        },
+                        AnchoredForwardLimits::default(),
+                        retain_reverse,
+                    )
+                    .expect("bounded contextual state oracle"),
+                    ContextDfaOutcome::Complete(_)
+                ) {
+                    high = middle;
+                } else {
+                    low = middle + 1;
+                }
+            }
+            low
+        };
+        let forward_limit = minimum_state_limit(false);
+        let bidirectional_limit = minimum_state_limit(true);
+        assert!(forward_limit < bidirectional_limit);
+        let limits = ContextDfaLimits {
+            max_states: bidirectional_limit - 1,
+            ..unlimited
+        };
+
+        let first_allocation = DeterminizeAllocationLedger::new(usize::MAX);
+        let first_work = DeterminizeWorkLedger::new(u64::MAX);
+        let first = determinize_with_directions_and_ledgers(
+            &raw,
+            b'\n',
+            limits,
+            AnchoredForwardLimits::default(),
+            true,
+            Some(&first_allocation),
+            Some(&first_work),
+        )
+        .expect("metered bidirectional refusal");
+        let ContextDfaOutcome::Declined(first_decline) = first else {
+            panic!("bounded bidirectional oracle unexpectedly completed")
+        };
+
+        let retry_allocation = DeterminizeAllocationLedger::new(usize::MAX);
+        let retry_work = DeterminizeWorkLedger::new(u64::MAX);
+        let retry = complete(
+            determinize_with_directions_and_ledgers(
+                &raw,
+                b'\n',
+                limits,
+                AnchoredForwardLimits::default(),
+                false,
+                Some(&retry_allocation),
+                Some(&retry_work),
+            )
+            .expect("metered forward-only oracle"),
+        );
+
+        let (rescued, usage) = determinize_for_output_with_allocation_limit(
+            &raw,
+            b'\n',
+            limits,
+            OutputContract::Span,
+            false,
+            usize::MAX,
+        )
+        .expect("reverse-free fixed-width Span rescue");
+        let rescued = complete(rescued);
+        assert_eq!(rescued.stats().reverse_states, 0);
+        assert_eq!(rescued.native_view().reverse_row_offsets, [0]);
+        assert_eq!(
+            usage.allocation_bytes,
+            first_allocation
+                .peak_bytes()
+                .max(retry_allocation.peak_bytes())
+        );
+        assert_eq!(
+            usage.work_completed,
+            first_decline
+                .work_completed
+                .checked_add(retry_work.completed())
+                .expect("aggregate retry work")
+        );
+        assert_eq!(usage.work_completed, rescued.stats().build_work);
+        assert_eq!(rescued.native_view().forward_cells, retry.native_view().forward_cells);
+
+        assert!(matches!(
+            determinize_for_output_with_allocation_limit(
+                &raw,
+                b'\n',
+                limits,
+                OutputContract::Span,
+                true,
+                usize::MAX,
+            )
+            .expect("reverse-required bounded Span construction")
+            .0,
+            ContextDfaOutcome::Declined(_)
+        ));
     }
 
     fn assert_every_window(pattern: &str, line_terminator: u8, haystacks: &[Vec<u8>]) {

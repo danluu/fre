@@ -172,7 +172,7 @@ impl DeterminizeAllocationLedger {
         true
     }
 
-    fn charge_elements<T>(&self, elements: usize) -> bool {
+    pub(crate) fn charge_elements<T>(&self, elements: usize) -> bool {
         let Some(bytes) = elements.checked_mul(core::mem::size_of::<T>()) else {
             let mut state = self.state.get();
             state.exhausted = true;
@@ -184,7 +184,7 @@ impl DeterminizeAllocationLedger {
 
     /// Conservatively account for hash buckets, control bytes, and load-factor
     /// slack without depending on the standard library's private table layout.
-    fn charge_map_entries<K, V>(&self, entries: usize) -> bool {
+    pub(crate) fn charge_map_entries<K, V>(&self, entries: usize) -> bool {
         let entry = core::mem::size_of::<K>()
             .saturating_add(core::mem::size_of::<V>())
             .saturating_add(1);
@@ -197,11 +197,11 @@ impl DeterminizeAllocationLedger {
         self.charge_bytes(bytes)
     }
 
-    fn checkpoint(&self) -> usize {
+    pub(crate) fn checkpoint(&self) -> usize {
         self.state.get().charged
     }
 
-    fn restore(&self, checkpoint: usize) {
+    pub(crate) fn restore(&self, checkpoint: usize) {
         let mut state = self.state.get();
         debug_assert!(checkpoint <= state.charged);
         state.charged = checkpoint;
@@ -209,7 +209,7 @@ impl DeterminizeAllocationLedger {
         self.state.set(state);
     }
 
-    fn exhausted(&self) -> bool {
+    pub(crate) fn exhausted(&self) -> bool {
         self.state.get().exhausted
     }
 
