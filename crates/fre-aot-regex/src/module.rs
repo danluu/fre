@@ -2868,6 +2868,14 @@ const CELL_NEXT_MASK: u32 = CELL_ACCELERATED - 1;
 const COMPACT_CELL_ACCEPTS: u32 = 1_u32 << 15;
 const COMPACT_CELL_ACCELERATED: u32 = 1_u32 << 14;
 const COMPACT_CELL_NEXT_MASK: u32 = COMPACT_CELL_ACCELERATED - 1;
+/// Indexed compact rows add one dependent shift to the x86-64 transition
+/// path. Their ideal cell-width saving is one half of the Wide32 footprint;
+/// require at least half of that ideal saving before admitting an incomplete
+/// table, and require the former wide table to exceed the same conservative
+/// L1 share used by direct-row admission. These target-structural margins are
+/// independent of benchmark inputs.
+const X86_PARTIAL_INDEXED_MAX_WIDE_FOOTPRINT_NUMERATOR: usize = 3;
+const X86_PARTIAL_INDEXED_MAX_WIDE_FOOTPRINT_DENOMINATOR: usize = 4;
 const NO_DFA_STATE: u32 = u32::MAX;
 /// Optional reverse sidecars remain a bounded optimization artifact. The
 /// portable constructor accounts for eight-byte logical cells, while native
@@ -3001,56 +3009,61 @@ enum TransitionLayout {
 
 /// Width of one packed transition cell in the ordinary native DFA tables.
 ///
-/// Both encodings retain the same two flag bits. Wide tokens store an absolute
-/// table-relative byte offset plus one; compact tokens store
+/// All encodings retain the same two flag bits. Wide tokens store an absolute
+/// table-relative byte offset plus one; ordinary compact tokens store
 /// `(absolute_byte_offset / 2) + 1` after proving every row is halfword-aligned
-/// and every forward and retained reverse token fits in 14 bits.
+/// and every forward and retained reverse token fits in 14 bits. A class
+/// table may instead pad its physical row to a power of two and scale its
+/// token by that whole row; this keeps the same compact classifier while
+/// extending it to larger complete machines and retained incomplete prefixes
+/// without growing the former wide table.
 /// Seeded-reverse sidecars have an independent representation and remain wide.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NativeCellEncoding {
     Compact16,
+    Compact16Indexed(u8),
     Wide32,
 }
 
 impl NativeCellEncoding {
     const fn bytes(self) -> usize {
         match self {
-            Self::Compact16 => core::mem::size_of::<u16>(),
+            Self::Compact16 | Self::Compact16Indexed(_) => core::mem::size_of::<u16>(),
             Self::Wide32 => core::mem::size_of::<u32>(),
         }
     }
 
     const fn accepts(self) -> u32 {
         match self {
-            Self::Compact16 => COMPACT_CELL_ACCEPTS,
+            Self::Compact16 | Self::Compact16Indexed(_) => COMPACT_CELL_ACCEPTS,
             Self::Wide32 => CELL_ACCEPTS,
         }
     }
 
     const fn accelerated(self) -> u32 {
         match self {
-            Self::Compact16 => COMPACT_CELL_ACCELERATED,
+            Self::Compact16 | Self::Compact16Indexed(_) => COMPACT_CELL_ACCELERATED,
             Self::Wide32 => CELL_ACCELERATED,
         }
     }
 
     const fn next_mask(self) -> u32 {
         match self {
-            Self::Compact16 => COMPACT_CELL_NEXT_MASK,
+            Self::Compact16 | Self::Compact16Indexed(_) => COMPACT_CELL_NEXT_MASK,
             Self::Wide32 => CELL_NEXT_MASK,
         }
     }
 
     const fn accepts_bit(self) -> u8 {
         match self {
-            Self::Compact16 => 15,
+            Self::Compact16 | Self::Compact16Indexed(_) => 15,
             Self::Wide32 => 31,
         }
     }
 
     const fn accelerated_bit(self) -> u8 {
         match self {
-            Self::Compact16 => 14,
+            Self::Compact16 | Self::Compact16Indexed(_) => 14,
             Self::Wide32 => 30,
         }
     }
@@ -3062,14 +3075,19 @@ impl NativeCellEncoding {
     const fn row_token_scale(self) -> usize {
         match self {
             Self::Compact16 => core::mem::size_of::<u16>(),
+            Self::Compact16Indexed(shift) => 1_usize << shift,
             Self::Wide32 => 1,
         }
+    }
+
+    const fn is_compact(self) -> bool {
+        matches!(self, Self::Compact16 | Self::Compact16Indexed(_))
     }
 
     const fn x86_accept_branch(self) -> u8 {
         match self {
             // The compact accept flag is not the sign bit of EAX.
-            Self::Compact16 => 0x85, // JNZ
+            Self::Compact16 | Self::Compact16Indexed(_) => 0x85, // JNZ
             Self::Wide32 => 0x88,    // JS
         }
     }
@@ -3091,6 +3109,44 @@ impl TransitionLayout {
     }
 }
 
+fn native_row_bytes(
+    transitions: TransitionLayout,
+    cells: NativeCellEncoding,
+    class_count: usize,
+) -> Option<usize> {
+    match (transitions, cells) {
+        (TransitionLayout::ClassMapped, NativeCellEncoding::Compact16Indexed(shift)) => {
+            let logical_row_bytes = class_count
+                .checked_mul(core::mem::size_of::<u16>())
+                .filter(|&bytes| bytes != 0)?;
+            let physical_row_bytes = logical_row_bytes.checked_next_power_of_two()?;
+            (1_usize.checked_shl(u32::from(shift))? == physical_row_bytes)
+                .then_some(physical_row_bytes)
+        }
+        (TransitionLayout::DirectByte, NativeCellEncoding::Compact16Indexed(_)) => None,
+        _ => transitions.row_cells(class_count).checked_mul(cells.bytes()),
+    }
+}
+
+fn native_table_prefix_bytes(
+    transitions: TransitionLayout,
+    cells: NativeCellEncoding,
+    class_count: usize,
+) -> Option<usize> {
+    let prefix = transitions.table_prefix_bytes();
+    match (transitions, cells) {
+        (TransitionLayout::ClassMapped, NativeCellEncoding::Compact16Indexed(_)) => {
+            let row_bytes = native_row_bytes(transitions, cells, class_count)?;
+            let prefix_bytes = prefix.max(row_bytes);
+            prefix_bytes
+                .is_multiple_of(row_bytes)
+                .then_some(prefix_bytes)
+        }
+        (TransitionLayout::DirectByte, NativeCellEncoding::Compact16Indexed(_)) => None,
+        _ => Some(prefix),
+    }
+}
+
 fn native_machine_bytes(
     transitions: TransitionLayout,
     cells: NativeCellEncoding,
@@ -3098,13 +3154,12 @@ fn native_machine_bytes(
     forward_states: usize,
     retained_reverse_states: usize,
 ) -> Option<usize> {
-    let row_bytes = transitions
-        .row_cells(class_count)
-        .checked_mul(cells.bytes())?;
+    let row_bytes = native_row_bytes(transitions, cells, class_count)?;
+    let prefix_bytes = native_table_prefix_bytes(transitions, cells, class_count)?;
     forward_states
         .checked_add(retained_reverse_states)
         .and_then(|states| states.checked_mul(row_bytes))
-        .and_then(|bytes| transitions.table_prefix_bytes().checked_add(bytes))
+        .and_then(|bytes| prefix_bytes.checked_add(bytes))
 }
 
 fn encode_native_row_offset(row_offset: usize, cells: NativeCellEncoding) -> Option<usize> {
@@ -3119,21 +3174,40 @@ fn encode_native_row_offset(row_offset: usize, cells: NativeCellEncoding) -> Opt
 /// ordinary machine. The proof uses exact byte offsets for both the forward
 /// and retained reverse tables; arithmetic failure conservatively retains the
 /// wide representation.
+#[cfg(test)]
 fn select_native_cell_encoding(
     transitions: TransitionLayout,
     class_count: usize,
     forward_states: usize,
     retained_reverse_states: usize,
 ) -> NativeCellEncoding {
-    select_native_cell_encoding_with_holes(
+    select_native_cell_encoding_for_architecture(
+        transitions,
+        class_count,
+        forward_states,
+        retained_reverse_states,
+        Architecture::X86_64,
+    )
+}
+
+fn select_native_cell_encoding_for_architecture(
+    transitions: TransitionLayout,
+    class_count: usize,
+    forward_states: usize,
+    retained_reverse_states: usize,
+    architecture: Architecture,
+) -> NativeCellEncoding {
+    select_native_cell_encoding_with_holes_for_architecture(
         transitions,
         class_count,
         forward_states,
         retained_reverse_states,
         0,
+        architecture,
     )
 }
 
+#[cfg(test)]
 fn select_native_cell_encoding_with_holes(
     transitions: TransitionLayout,
     class_count: usize,
@@ -3141,31 +3215,61 @@ fn select_native_cell_encoding_with_holes(
     retained_reverse_states: usize,
     resume_states: usize,
 ) -> NativeCellEncoding {
-    let row_cells = transitions.row_cells(class_count);
-    let Some(row_bytes) = row_cells.checked_mul(core::mem::size_of::<u16>()) else {
-        return NativeCellEncoding::Wide32;
-    };
-    let forward_offset = transitions.table_prefix_bytes();
-    let Some(reverse_offset) = forward_states
-        .checked_mul(row_bytes)
-        .and_then(|bytes| forward_offset.checked_add(bytes))
+    select_native_cell_encoding_with_holes_for_architecture(
+        transitions,
+        class_count,
+        forward_states,
+        retained_reverse_states,
+        resume_states,
+        Architecture::X86_64,
+    )
+}
+
+fn select_native_cell_encoding_with_holes_for_architecture(
+    transitions: TransitionLayout,
+    class_count: usize,
+    forward_states: usize,
+    retained_reverse_states: usize,
+    resume_states: usize,
+    architecture: Architecture,
+) -> NativeCellEncoding {
+    let Some(compact_row_bytes) = transitions
+        .row_cells(class_count)
+        .checked_mul(core::mem::size_of::<u16>())
     else {
         return NativeCellEncoding::Wide32;
     };
-    let last_token = |offset: usize, states: usize| {
+    let compact_forward_offset = transitions.table_prefix_bytes();
+    let Some(compact_reverse_offset) = forward_states
+        .checked_mul(compact_row_bytes)
+        .and_then(|bytes| compact_forward_offset.checked_add(bytes))
+    else {
+        return NativeCellEncoding::Wide32;
+    };
+    let last_token = |offset: usize, states: usize, row_bytes: usize, cells| {
         states
             .checked_sub(1)
             .and_then(|state| state.checked_mul(row_bytes))
             .and_then(|bytes| offset.checked_add(bytes))
-            .and_then(|row| encode_native_row_offset(row, NativeCellEncoding::Compact16))
+            .and_then(|row| encode_native_row_offset(row, cells))
     };
-    let Some(forward_token) = last_token(forward_offset, forward_states) else {
+    let Some(forward_token) = last_token(
+        compact_forward_offset,
+        forward_states,
+        compact_row_bytes,
+        NativeCellEncoding::Compact16,
+    ) else {
         return NativeCellEncoding::Wide32;
     };
     let reverse_token = if retained_reverse_states == 0 {
         Some(0)
     } else {
-        last_token(reverse_offset, retained_reverse_states)
+        last_token(
+            compact_reverse_offset,
+            retained_reverse_states,
+            compact_row_bytes,
+            NativeCellEncoding::Compact16,
+        )
     };
     if reverse_token
         .map(|token| token.max(forward_token))
@@ -3174,24 +3278,143 @@ fn select_native_cell_encoding_with_holes(
         .is_some_and(|token| token <= COMPACT_CELL_NEXT_MASK)
     {
         NativeCellEncoding::Compact16
+    } else if transitions == TransitionLayout::ClassMapped
+        && (resume_states == 0 || retained_reverse_states == 0)
+    {
+        // In an incomplete table, materialized row tokens and retained hole
+        // tokens share one ordinal space. The first hole immediately follows
+        // the final padded row, so subtracting `hole_token_base` still yields
+        // the existing zero-based continuation key. Bit 14 keeps every hole
+        // on the exceptional edge before generated code can decode it as an
+        // address. Partial native views never retain reverse rows.
+        compact_row_bytes
+            .checked_next_power_of_two()
+            .and_then(|indexed_row_bytes| {
+                let shift = u8::try_from(indexed_row_bytes.trailing_zeros()).ok()?;
+                let cells = NativeCellEncoding::Compact16Indexed(shift);
+                let forward_offset = CLASS_MAP_BYTES.max(indexed_row_bytes);
+                let reverse_offset = forward_states
+                    .checked_mul(indexed_row_bytes)
+                    .and_then(|bytes| forward_offset.checked_add(bytes))?;
+                let forward = last_token(
+                    forward_offset,
+                    forward_states,
+                    indexed_row_bytes,
+                    cells,
+                );
+                let reverse = if retained_reverse_states == 0 {
+                    Some(0)
+                } else {
+                    last_token(
+                        reverse_offset,
+                        retained_reverse_states,
+                        indexed_row_bytes,
+                        cells,
+                    )
+                };
+                let fits_token = reverse
+                    .zip(forward)
+                    .and_then(|(reverse, forward)| {
+                        reverse.max(forward).checked_add(resume_states)
+                    })
+                    .and_then(|token| u32::try_from(token).ok())
+                    .is_some_and(|token| token <= COMPACT_CELL_NEXT_MASK);
+                let footprints = native_machine_bytes(
+                    transitions,
+                    cells,
+                    class_count,
+                    forward_states,
+                    retained_reverse_states,
+                )
+                .zip(native_machine_bytes(
+                    transitions,
+                    NativeCellEncoding::Wide32,
+                    class_count,
+                    forward_states,
+                    retained_reverse_states,
+                ));
+                let target_worthwhile = footprints.is_some_and(|(indexed, wide)| {
+                    if indexed > wide {
+                        return false;
+                    }
+                    if resume_states == 0 || architecture == Architecture::Aarch64 {
+                        return true;
+                    }
+                    // x86-64 pays one dependent shift to turn an ordinal into
+                    // a padded row address. Admit an incomplete table only
+                    // when it retains at least half of Compact16's ideal
+                    // one-half footprint saving over Wide32 and the former
+                    // table is already outside the conservative L1 share.
+                    indexed < wide
+                        && wide > DIRECT_BYTE_TABLE_BUDGET
+                        && indexed
+                            .checked_mul(X86_PARTIAL_INDEXED_MAX_WIDE_FOOTPRINT_DENOMINATOR)
+                            .zip(
+                                wide.checked_mul(
+                                    X86_PARTIAL_INDEXED_MAX_WIDE_FOOTPRINT_NUMERATOR,
+                                ),
+                            )
+                            .is_some_and(|(indexed, wide)| indexed <= wide)
+                });
+                (fits_token && target_worthwhile).then_some(cells)
+            })
+            .unwrap_or(NativeCellEncoding::Wide32)
     } else {
         NativeCellEncoding::Wide32
     }
 }
 
+#[cfg(test)]
 fn select_native_table_encoding(
     class_count: usize,
     forward_states: usize,
     retained_reverse_states: usize,
 ) -> (TransitionLayout, NativeCellEncoding) {
-    select_native_table_encoding_with_holes(class_count, forward_states, retained_reverse_states, 0)
+    select_native_table_encoding_for_architecture(
+        class_count,
+        forward_states,
+        retained_reverse_states,
+        Architecture::X86_64,
+    )
 }
 
+fn select_native_table_encoding_for_architecture(
+    class_count: usize,
+    forward_states: usize,
+    retained_reverse_states: usize,
+    architecture: Architecture,
+) -> (TransitionLayout, NativeCellEncoding) {
+    select_native_table_encoding_with_holes_for_architecture(
+        class_count,
+        forward_states,
+        retained_reverse_states,
+        0,
+        architecture,
+    )
+}
+
+#[cfg(test)]
 fn select_native_table_encoding_with_holes(
     class_count: usize,
     forward_states: usize,
     retained_reverse_states: usize,
     resume_states: usize,
+) -> (TransitionLayout, NativeCellEncoding) {
+    select_native_table_encoding_with_holes_for_architecture(
+        class_count,
+        forward_states,
+        retained_reverse_states,
+        resume_states,
+        Architecture::X86_64,
+    )
+}
+
+fn select_native_table_encoding_with_holes_for_architecture(
+    class_count: usize,
+    forward_states: usize,
+    retained_reverse_states: usize,
+    resume_states: usize,
+    architecture: Architecture,
 ) -> (TransitionLayout, NativeCellEncoding) {
     // One dependency is removed from every direct transition. Evaluate the
     // prospective narrow geometry itself, rather than a wide-cell proxy. Keep
@@ -3200,19 +3423,21 @@ fn select_native_table_encoding_with_holes(
     // so width selection cannot buy a dependency reduction by growing data.
     let select_cells = |transitions| {
         if resume_states == 0 {
-            select_native_cell_encoding(
+            select_native_cell_encoding_for_architecture(
                 transitions,
                 class_count,
                 forward_states,
                 retained_reverse_states,
+                architecture,
             )
         } else {
-            select_native_cell_encoding_with_holes(
+            select_native_cell_encoding_with_holes_for_architecture(
                 transitions,
                 class_count,
                 forward_states,
                 retained_reverse_states,
                 resume_states,
+                architecture,
             )
         }
     };
@@ -5240,19 +5465,25 @@ fn build_native_dfa_table_with_cost_model_and_data_limit(
         resume_states
     };
     let (transitions, cells) = if encoded_hole_states == 0 {
-        select_native_table_encoding(dfa.class_count, forward_states, retained_reverse_states)
+        select_native_table_encoding_for_architecture(
+            dfa.class_count,
+            forward_states,
+            retained_reverse_states,
+            architecture,
+        )
     } else {
-        select_native_table_encoding_with_holes(
+        select_native_table_encoding_with_holes_for_architecture(
             dfa.class_count,
             forward_states,
             retained_reverse_states,
             encoded_hole_states,
+            architecture,
         )
     };
-    let row_cells = transitions.row_cells(dfa.class_count);
-    let row_bytes = row_cells
-        .checked_mul(cells.bytes())
-        .ok_or(ObjectError::ArithmeticOverflow("native DFA row bytes"))?;
+    let row_bytes = native_row_bytes(transitions, cells, dfa.class_count)
+        .ok_or(ObjectError::InvalidModule("native DFA row encoding"))?;
+    let forward_offset = native_table_prefix_bytes(transitions, cells, dfa.class_count)
+        .ok_or(ObjectError::InvalidModule("native DFA table prefix"))?;
     let forward_bytes =
         forward_states
             .checked_mul(row_bytes)
@@ -5265,7 +5496,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit(
         let last_row_offset = forward_states
             .checked_sub(1)
             .and_then(|state| state.checked_mul(row_bytes))
-            .and_then(|offset| transitions.table_prefix_bytes().checked_add(offset))
+            .and_then(|offset| forward_offset.checked_add(offset))
             .ok_or(ObjectError::ArithmeticOverflow(
                 "native partial final completed row",
             ))?;
@@ -5371,7 +5602,6 @@ fn build_native_dfa_table_with_cost_model_and_data_limit(
         selected_suffix_filter = None;
     }
     let suffix_filter = selected_suffix_filter;
-    let forward_offset = transitions.table_prefix_bytes();
     // A retained partial exposes only completed rows in `dfa.forward_cells`.
     // Hole destinations are outside that prefix and therefore cannot be
     // mistaken for self-loops; they simply belong to a selected loop's exact
@@ -5725,35 +5955,46 @@ fn build_native_dfa_table_with_cost_model_and_data_limit(
     }
     if transitions == TransitionLayout::ClassMapped {
         bytes.extend_from_slice(dfa.byte_classes);
+        bytes.resize(forward_offset, 0);
     }
     match transitions {
         TransitionLayout::ClassMapped => {
-            for &cell in dfa.forward_cells {
-                let packed = if let Some(partial) = partial_layout {
-                    pack_native_partial_forward_cell(
-                        cell.next,
-                        cell.accepted,
-                        forward_offset,
-                        row_bytes,
-                        forward_states,
-                        has_start_scanner,
-                        loop_skip.map(|plan| plan.state),
-                        partial,
-                        cells,
-                    )?
-                } else {
-                    pack_native_forward_cell(
-                        cell.next,
-                        cell.accepted,
-                        forward_offset,
-                        row_bytes,
-                        forward_states,
-                        has_start_scanner,
-                        loop_skip.map(|plan| plan.state),
-                        cells,
-                    )?
-                };
-                append_native_packed_cell(&mut bytes, packed, cells)?;
+            for row in dfa.forward_cells.chunks_exact(dfa.class_count) {
+                let row_start = bytes.len();
+                for &cell in row {
+                    let packed = if let Some(partial) = partial_layout {
+                        pack_native_partial_forward_cell(
+                            cell.next,
+                            cell.accepted,
+                            forward_offset,
+                            row_bytes,
+                            forward_states,
+                            has_start_scanner,
+                            loop_skip.map(|plan| plan.state),
+                            partial,
+                            cells,
+                        )?
+                    } else {
+                        pack_native_forward_cell(
+                            cell.next,
+                            cell.accepted,
+                            forward_offset,
+                            row_bytes,
+                            forward_states,
+                            has_start_scanner,
+                            loop_skip.map(|plan| plan.state),
+                            cells,
+                        )?
+                    };
+                    append_native_packed_cell(&mut bytes, packed, cells)?;
+                }
+                let row_end = row_start
+                    .checked_add(row_bytes)
+                    .ok_or(ObjectError::ArithmeticOverflow("native forward row padding"))?;
+                if bytes.len() > row_end {
+                    return Err(ObjectError::InvalidModule("native forward row overflow"));
+                }
+                bytes.resize(row_end, 0);
             }
         }
         TransitionLayout::DirectByte => {
@@ -5801,19 +6042,29 @@ fn build_native_dfa_table_with_cost_model_and_data_limit(
     if wants_reverse {
         match transitions {
             TransitionLayout::ClassMapped => {
-                for &cell in dfa.reverse_cells {
-                    append_native_packed_cell(
-                        &mut bytes,
-                        pack_native_cell(
-                            cell.next,
-                            cell.reaches_start,
-                            reverse_offset,
-                            row_bytes,
-                            retained_reverse_states,
+                for row in dfa.reverse_cells.chunks_exact(dfa.class_count) {
+                    let row_start = bytes.len();
+                    for &cell in row {
+                        append_native_packed_cell(
+                            &mut bytes,
+                            pack_native_cell(
+                                cell.next,
+                                cell.reaches_start,
+                                reverse_offset,
+                                row_bytes,
+                                retained_reverse_states,
+                                cells,
+                            )?,
                             cells,
-                        )?,
-                        cells,
+                        )?;
+                    }
+                    let row_end = row_start.checked_add(row_bytes).ok_or(
+                        ObjectError::ArithmeticOverflow("native reverse row padding"),
                     )?;
+                    if bytes.len() > row_end {
+                        return Err(ObjectError::InvalidModule("native reverse row overflow"));
+                    }
+                    bytes.resize(row_end, 0);
                 }
             }
             TransitionLayout::DirectByte => {
@@ -7959,7 +8210,7 @@ fn append_native_packed_cell(
     cells: NativeCellEncoding,
 ) -> Result<(), ObjectError> {
     match cells {
-        NativeCellEncoding::Compact16 => {
+        NativeCellEncoding::Compact16 | NativeCellEncoding::Compact16Indexed(_) => {
             let packed = u16::try_from(packed)
                 .map_err(|_| ObjectError::InvalidModule("compact native cell overflowed"))?;
             bytes.extend_from_slice(&packed.to_le_bytes());
@@ -8687,7 +8938,7 @@ fn x86_emit_table_lookup(
         TransitionLayout::DirectByte => {}
     }
     match cells {
-        NativeCellEncoding::Compact16 => {
+        NativeCellEncoding::Compact16 | NativeCellEncoding::Compact16Indexed(_) => {
             // eax = zero_extend(packed_row[class_or_byte])
             assembler.instruction(&[0x41, 0x0f, 0xb7, 0x04, 0x42])?;
         }
@@ -8727,6 +8978,12 @@ fn x86_emit_set_row_from_cell(
         NativeCellEncoding::Compact16 => {
             assembler.instruction(&[0x4d, 0x8d, 0x54, 0x41, 0xfe])?;
         }
+        // r10 = table + (encoded - 1) * row_bytes
+        NativeCellEncoding::Compact16Indexed(shift) => {
+            assembler.instruction(&[0xff, 0xc8])?; // dec eax
+            assembler.instruction(&[0xc1, 0xe0, shift])?; // shl eax, row shift
+            assembler.instruction(&[0x4d, 0x8d, 0x14, 0x01])?;
+        }
         // r10 = table + encoded - 1
         NativeCellEncoding::Wide32 => {
             assembler.instruction(&[0x4d, 0x8d, 0x54, 0x01, 0xff])?;
@@ -8737,9 +8994,24 @@ fn x86_emit_set_row_from_cell(
 
 fn x86_emit_set_row_from_compact_zero_based_cell(
     assembler: &mut X86Assembler,
+    cells: NativeCellEncoding,
 ) -> Result<(), ObjectError> {
-    // r10 = table + zero_based_token * 2
-    assembler.instruction(&[0x4d, 0x8d, 0x14, 0x41])?;
+    match cells {
+        NativeCellEncoding::Compact16 => {
+            // r10 = table + zero_based_token * 2
+            assembler.instruction(&[0x4d, 0x8d, 0x14, 0x41])?;
+        }
+        NativeCellEncoding::Compact16Indexed(shift) => {
+            // r10 = table + zero_based_token * row_bytes
+            assembler.instruction(&[0xc1, 0xe0, shift])?; // shl eax, row shift
+            assembler.instruction(&[0x4d, 0x8d, 0x14, 0x01])?;
+        }
+        NativeCellEncoding::Wide32 => {
+            return Err(ObjectError::InvalidModule(
+                "wide cell entered compact row addressing",
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -11772,14 +12044,14 @@ fn lower_x86_64_dfa_with_entry_contract(
     x86_emit_table_lookup(&mut assembler, layout.transitions, layout.cells)?;
     assembler.instruction(&[0x48, 0xff, 0xc2])?; // position += 1
     match layout.cells {
-        NativeCellEncoding::Compact16 => {
+        NativeCellEncoding::Compact16 | NativeCellEncoding::Compact16Indexed(_) => {
             // After decrement, every ordinary live token is in 0..=0x3ffe.
             // Dead underflows and either metadata bit moves the value above
             // that range, so one unsigned branch classifies every exception.
             assembler.instruction(&[0xff, 0xc8])?; // dec eax
             assembler.instruction(&[0x3d, 0xfe, 0x3f, 0x00, 0x00])?;
             assembler.branch(&[0x0f, 0x87], compact_exception)?; // ja
-            x86_emit_set_row_from_compact_zero_based_cell(&mut assembler)?;
+            x86_emit_set_row_from_compact_zero_based_cell(&mut assembler, layout.cells)?;
             assembler.branch(&[0xe9], scalar_backedge)?;
         }
         NativeCellEncoding::Wide32 => {
@@ -11850,7 +12122,7 @@ fn lower_x86_64_dfa_with_entry_contract(
     }
 
     assembler.bind(compact_exception)?;
-    if layout.cells == NativeCellEncoding::Compact16 {
+    if layout.cells.is_compact() {
         assembler.instruction(&[0xff, 0xc0])?; // restore packed cell
         x86_emit_test_eax_mask(&mut assembler, layout.cells.accepts())?;
         assembler.branch(&[0x0f, 0x85], accept)?;
@@ -11871,7 +12143,7 @@ fn lower_x86_64_dfa_with_entry_contract(
         assembler.instruction(&[0x85, 0xc0])?;
         assembler.branch(&[0x0f, 0x84], finish)?;
         match layout.cells {
-            NativeCellEncoding::Compact16 => {
+            NativeCellEncoding::Compact16 | NativeCellEncoding::Compact16Indexed(_) => {
                 x86_emit_test_eax_mask(&mut assembler, layout.cells.accelerated())?;
                 assembler.branch(&[0x0f, 0x85], accelerated_transition)?;
                 // With both metadata bits disproved, EAX is an encoded token.
@@ -11943,11 +12215,14 @@ fn lower_x86_64_dfa_with_entry_contract(
             assembler.instruction(&[0x48, 0xff, 0xca])?;
             x86_emit_table_lookup(&mut assembler, layout.transitions, layout.cells)?;
             match layout.cells {
-                NativeCellEncoding::Compact16 => {
+                NativeCellEncoding::Compact16 | NativeCellEncoding::Compact16Indexed(_) => {
                     assembler.instruction(&[0xff, 0xc8])?; // zero-based token
                     assembler.instruction(&[0x3d, 0xfe, 0x3f, 0x00, 0x00])?;
                     assembler.branch(&[0x0f, 0x87], reverse_exception)?;
-                    x86_emit_set_row_from_compact_zero_based_cell(&mut assembler)?;
+                    x86_emit_set_row_from_compact_zero_based_cell(
+                        &mut assembler,
+                        layout.cells,
+                    )?;
                     assembler.branch(&[0xe9], reverse_loop)?;
                 }
                 NativeCellEncoding::Wide32 => {
@@ -11961,7 +12236,7 @@ fn lower_x86_64_dfa_with_entry_contract(
             assembler.branch(&[0xe9], reverse_loop)?;
 
             assembler.bind(reverse_exception)?;
-            if layout.cells == NativeCellEncoding::Compact16 {
+            if layout.cells.is_compact() {
                 assembler.instruction(&[0xff, 0xc0])?; // restore packed cell
                 x86_emit_test_eax_mask(&mut assembler, layout.cells.accepts())?;
                 assembler.branch(&[0x0f, 0x85], record_reverse_start)?;
@@ -15776,6 +16051,7 @@ fn aarch64_set_row_from_cell(
 ) -> Result<(), ObjectError> {
     let shift = match cells {
         NativeCellEncoding::Compact16 => 1_u32,
+        NativeCellEncoding::Compact16Indexed(shift) => u32::from(shift),
         NativeCellEncoding::Wide32 => 0_u32,
     };
     assembler.instruction(
@@ -15801,7 +16077,7 @@ fn aarch64_emit_table_lookup(
         TransitionLayout::DirectByte => {}
     }
     match cells {
-        NativeCellEncoding::Compact16 => {
+        NativeCellEncoding::Compact16 | NativeCellEncoding::Compact16Indexed(_) => {
             assembler.instruction(aarch64_load_h_uxtw(8, 11, 8)?)?;
         }
         NativeCellEncoding::Wide32 => {
@@ -19409,7 +19685,7 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
     aarch64_emit_table_lookup(&mut assembler, layout.transitions, layout.cells)?;
     assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
     match layout.cells {
-        NativeCellEncoding::Compact16 => {
+        NativeCellEncoding::Compact16 | NativeCellEncoding::Compact16Indexed(_) => {
             // W6 becomes the zero-based row token. Bits 14 and above are all
             // zero exactly for ordinary live compact cells; dead underflows.
             assembler.instruction(aarch64_sub_w_imm(6, 8, 1)?)?;
@@ -19474,7 +19750,7 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
     }
 
     assembler.bind(compact_exception)?;
-    if layout.cells == NativeCellEncoding::Compact16 {
+    if layout.cells.is_compact() {
         assembler.branch_bit_set_w(8, layout.cells.accepts_bit(), accept)?;
         assembler.branch_zero_w(8, finish)?;
         // A live compact exception without the accept bit is accelerated.
@@ -19491,7 +19767,7 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
         assembler.instruction(aarch64_and_low_w(8, 8, layout.cells.accepts_bit())?)?;
         assembler.branch_zero_w(8, finish)?;
         match layout.cells {
-            NativeCellEncoding::Compact16 => {
+            NativeCellEncoding::Compact16 | NativeCellEncoding::Compact16Indexed(_) => {
                 assembler.branch_bit_set_w(
                     8,
                     layout.cells.accelerated_bit(),
@@ -19560,7 +19836,7 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
             assembler.instruction(aarch64_sub_x_imm(2, 2, 1)?)?;
             aarch64_emit_table_lookup(&mut assembler, layout.transitions, layout.cells)?;
             match layout.cells {
-                NativeCellEncoding::Compact16 => {
+                NativeCellEncoding::Compact16 | NativeCellEncoding::Compact16Indexed(_) => {
                     assembler.instruction(aarch64_sub_w_imm(6, 8, 1)?)?;
                     assembler.instruction(aarch64_lsr_w_imm(12, 6, 14)?)?;
                     assembler.branch_nonzero_w(12, reverse_exception)?;
@@ -19584,7 +19860,7 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
             assembler.branch(reverse_scan)?;
 
             assembler.bind(reverse_exception)?;
-            if layout.cells == NativeCellEncoding::Compact16 {
+            if layout.cells.is_compact() {
                 assembler.branch_bit_set_w(8, layout.cells.accepts_bit(), record_reverse_start)?;
                 // The only non-accepting compact exception is dead.
                 assembler.branch(reverse_finish)?;
@@ -29162,8 +29438,12 @@ int main(void) {{
                     usize::try_from(partial.resume_states).unwrap(),
                     discovered_states - complete_rows
                 );
-                let row_cells = layout.transitions.row_cells(view.dfa.class_count);
-                let row_bytes = row_cells * layout.cells.bytes();
+                let row_bytes = native_row_bytes(
+                    layout.transitions,
+                    layout.cells,
+                    view.dfa.class_count,
+                )
+                .expect("collapsed slow-partial row geometry");
                 let mut saw_hole = false;
                 for &cell in view.dfa.forward_cells {
                     if cell.next == NO_DFA_STATE
@@ -30914,7 +31194,12 @@ int main(void) {{
             assert!(usize::try_from(plan.state).unwrap() < view.complete_rows);
 
             let row_cells = layout.transitions.row_cells(view.dfa.class_count);
-            let row_bytes = row_cells * layout.cells.bytes();
+            let row_bytes = native_row_bytes(
+                layout.transitions,
+                layout.cells,
+                view.dfa.class_count,
+            )
+            .unwrap();
             let forward_offset = usize::try_from(layout.forward_offset).unwrap();
             let mut saw_hole = false;
             let mut saw_loop_hole = false;
@@ -30935,7 +31220,8 @@ int main(void) {{
                         + state * row_bytes
                         + physical_column * layout.cells.bytes();
                     let packed = match layout.cells {
-                        NativeCellEncoding::Compact16 => u32::from(u16::from_le_bytes(
+                        NativeCellEncoding::Compact16
+                        | NativeCellEncoding::Compact16Indexed(_) => u32::from(u16::from_le_bytes(
                             data[offset..offset + 2].try_into().unwrap(),
                         )),
                         NativeCellEncoding::Wide32 => {
@@ -31777,11 +32063,12 @@ int main(void) {{
                 );
                 state = cell.next;
             }
-            let row_bytes = layout
-                .transitions
-                .row_cells(partial.dfa.class_count)
-                .checked_mul(layout.cells.bytes())
-                .unwrap();
+            let row_bytes = native_row_bytes(
+                layout.transitions,
+                layout.cells,
+                partial.dfa.class_count,
+            )
+            .unwrap();
             let expected_target = usize::try_from(layout.forward_offset)
                 .unwrap()
                 .checked_add(usize::try_from(state).unwrap().checked_mul(row_bytes).unwrap())
@@ -31916,11 +32203,12 @@ int main(void) {{
                 .prefix_fast_forward
                 .unwrap_or_else(|| panic!("{output:?} discarded the safe prefix before a hole"));
             assert_eq!(fast_forward.consumed_bytes, 9, "{output:?}");
-            let row_bytes = layout
-                .transitions
-                .row_cells(partial.dfa.class_count)
-                .checked_mul(layout.cells.bytes())
-                .unwrap();
+            let row_bytes = native_row_bytes(
+                layout.transitions,
+                layout.cells,
+                partial.dfa.class_count,
+            )
+            .unwrap();
             let target = usize::try_from(fast_forward.target_row_offset)
                 .unwrap()
                 .checked_sub(usize::try_from(layout.forward_offset).unwrap())
@@ -41536,7 +41824,12 @@ int main(void) {{
         assert!(layout.has_reverse);
 
         let row_cells = layout.transitions.row_cells(view.dfa.class_count);
-        let row_bytes = row_cells * layout.cells.bytes();
+        let row_bytes = native_row_bytes(
+            layout.transitions,
+            layout.cells,
+            view.dfa.class_count,
+        )
+        .unwrap();
         let forward_states = view.dfa.forward_cells.len() / view.dfa.class_count;
         let forward_offset = usize::try_from(layout.forward_offset).unwrap();
         for state in 0..forward_states {
@@ -41551,7 +41844,8 @@ int main(void) {{
                 let offset =
                     forward_offset + state * row_bytes + physical_column * layout.cells.bytes();
                 let packed = match layout.cells {
-                    NativeCellEncoding::Compact16 => u32::from(u16::from_le_bytes(
+                    NativeCellEncoding::Compact16
+                    | NativeCellEncoding::Compact16Indexed(_) => u32::from(u16::from_le_bytes(
                         data[offset..offset + 2].try_into().unwrap(),
                     )),
                     NativeCellEncoding::Wide32 => {
@@ -41594,7 +41888,8 @@ int main(void) {{
                 let offset =
                     reverse_offset + state * row_bytes + physical_column * layout.cells.bytes();
                 let packed = match layout.cells {
-                    NativeCellEncoding::Compact16 => u32::from(u16::from_le_bytes(
+                    NativeCellEncoding::Compact16
+                    | NativeCellEncoding::Compact16Indexed(_) => u32::from(u16::from_le_bytes(
                         data[offset..offset + 2].try_into().unwrap(),
                     )),
                     NativeCellEncoding::Wide32 => {
@@ -41738,6 +42033,179 @@ int main(void) {{
     #[test]
     fn transition_layout_and_cell_selection_are_cache_bounded_and_graph_only() {
         assert_eq!(
+            native_row_bytes(
+                TransitionLayout::ClassMapped,
+                NativeCellEncoding::Compact16Indexed(3),
+                7,
+            ),
+            None,
+            "indexed rows reject a shift smaller than their padded geometry"
+        );
+        assert_eq!(
+            native_row_bytes(
+                TransitionLayout::ClassMapped,
+                NativeCellEncoding::Compact16Indexed(0),
+                0,
+            ),
+            None,
+            "indexed rows reject an empty alphabet"
+        );
+        assert_eq!(
+            native_row_bytes(
+                TransitionLayout::DirectByte,
+                NativeCellEncoding::Compact16Indexed(9),
+                256,
+            ),
+            None,
+            "indexed cells remain private to class-mapped rows"
+        );
+        assert_eq!(
+            select_native_cell_encoding(TransitionLayout::ClassMapped, 8, 16_367, 0),
+            NativeCellEncoding::Compact16Indexed(4)
+        );
+        assert_eq!(
+            select_native_cell_encoding(TransitionLayout::ClassMapped, 8, 16_368, 0),
+            NativeCellEncoding::Wide32
+        );
+        assert_eq!(
+            select_native_cell_encoding_with_holes(
+                TransitionLayout::ClassMapped,
+                8,
+                4_096,
+                0,
+                1,
+            ),
+            NativeCellEncoding::Compact16Indexed(4),
+            "incomplete rows and holes share the padded ordinal token space"
+        );
+        assert_eq!(
+            select_native_cell_encoding_with_holes_for_architecture(
+                TransitionLayout::ClassMapped,
+                64,
+                1,
+                0,
+                16_380,
+                Architecture::Aarch64,
+            ),
+            NativeCellEncoding::Compact16Indexed(7),
+            "the final indexed partial token remains inclusive"
+        );
+        assert_eq!(
+            select_native_cell_encoding_with_holes_for_architecture(
+                TransitionLayout::ClassMapped,
+                64,
+                1,
+                0,
+                16_381,
+                Architecture::Aarch64,
+            ),
+            NativeCellEncoding::Wide32,
+            "the first token beyond the indexed partial range stays wide"
+        );
+        assert_eq!(
+            select_native_cell_encoding_with_holes_for_architecture(
+                TransitionLayout::ClassMapped,
+                64,
+                1,
+                0,
+                16_380,
+                Architecture::X86_64,
+            ),
+            NativeCellEncoding::Wide32,
+            "x86 declines an exact-threshold saving while the wide table fits its L1 share"
+        );
+        assert_eq!(
+            select_native_cell_encoding_with_holes_for_architecture(
+                TransitionLayout::ClassMapped,
+                43,
+                400,
+                0,
+                1,
+                Architecture::X86_64,
+            ),
+            NativeCellEncoding::Compact16Indexed(7),
+            "x86 admits a large partial table with at least one-quarter footprint saving"
+        );
+        assert_eq!(
+            select_native_cell_encoding_with_holes_for_architecture(
+                TransitionLayout::ClassMapped,
+                42,
+                400,
+                0,
+                1,
+                Architecture::X86_64,
+            ),
+            NativeCellEncoding::Wide32,
+            "x86 keeps a partial table wide below the structural saving threshold"
+        );
+        assert_eq!(
+            select_native_cell_encoding_with_holes_for_architecture(
+                TransitionLayout::ClassMapped,
+                65,
+                1,
+                0,
+                16_255,
+                Architecture::X86_64,
+            ),
+            NativeCellEncoding::Wide32,
+            "x86 declines marginal padding that cannot amortize its row shift"
+        );
+        assert_eq!(
+            select_native_cell_encoding_with_holes_for_architecture(
+                TransitionLayout::ClassMapped,
+                65,
+                1,
+                0,
+                16_255,
+                Architecture::Aarch64,
+            ),
+            NativeCellEncoding::Compact16Indexed(8),
+            "AArch64 folds the same no-growth ordinal scale into its row ADD"
+        );
+        assert_eq!(
+            select_native_cell_encoding_with_holes_for_architecture(
+                TransitionLayout::ClassMapped,
+                64,
+                1,
+                1,
+                16_255,
+                Architecture::Aarch64,
+            ),
+            NativeCellEncoding::Wide32,
+            "an incomplete machine cannot combine retained reverse rows with ordinal holes"
+        );
+        assert_eq!(
+            select_native_table_encoding_with_holes_for_architecture(
+                64,
+                256,
+                0,
+                1,
+                Architecture::X86_64,
+            ),
+            (
+                TransitionLayout::ClassMapped,
+                NativeCellEncoding::Compact16Indexed(7),
+            ),
+            "a broad incomplete class table keeps native compact lowering"
+        );
+        assert_eq!(
+            select_native_cell_encoding(TransitionLayout::ClassMapped, 7, 4_096, 0),
+            NativeCellEncoding::Compact16Indexed(4),
+            "non-power-of-two logical rows use footprint-bounded physical padding"
+        );
+        assert_eq!(
+            select_native_cell_encoding(TransitionLayout::ClassMapped, 129, 128, 0),
+            NativeCellEncoding::Compact16Indexed(9),
+            "large logical rows align both the class-map prefix and compact rows"
+        );
+        assert_eq!(
+            select_native_table_encoding(8, 4_096, 0),
+            (
+                TransitionLayout::ClassMapped,
+                NativeCellEncoding::Compact16Indexed(4),
+            )
+        );
+        assert_eq!(
             select_native_table_encoding(1, 24, 0),
             (TransitionLayout::DirectByte, NativeCellEncoding::Compact16)
         );
@@ -41828,7 +42296,8 @@ int main(void) {{
                 .unwrap();
                 let offset = state * direct_row_bytes + byte * direct_layout.cells.bytes();
                 let actual = match direct_layout.cells {
-                    NativeCellEncoding::Compact16 => u32::from(u16::from_le_bytes(
+                    NativeCellEncoding::Compact16
+                    | NativeCellEncoding::Compact16Indexed(_) => u32::from(u16::from_le_bytes(
                         direct_data[offset..offset + 2].try_into().unwrap(),
                     )),
                     NativeCellEncoding::Wide32 => {
@@ -41871,7 +42340,8 @@ int main(void) {{
                     })
                     .unwrap();
                 let actual = match variable_layout.cells {
-                    NativeCellEncoding::Compact16 => u32::from(u16::from_le_bytes(
+                    NativeCellEncoding::Compact16
+                    | NativeCellEncoding::Compact16Indexed(_) => u32::from(u16::from_le_bytes(
                         variable_data[offset..offset + 2].try_into().unwrap(),
                     )),
                     NativeCellEncoding::Wide32 => {
@@ -42114,14 +42584,193 @@ int main(void) {{
     }
 
     #[test]
-    fn nonfitting_compact_tokens_fall_back_to_wide_cells_on_both_isas() {
+    fn indexed_partial_cells_preserve_padded_rows_and_resume_ordinals() {
+        let cells = NativeCellEncoding::Compact16Indexed(7);
+        let class_count = 64_usize;
+        let complete_states = 256_usize;
+        let resume_states = 2_u32;
+        let row_bytes = native_row_bytes(TransitionLayout::ClassMapped, cells, class_count)
+            .expect("indexed partial row bytes");
+        let forward_offset =
+            native_table_prefix_bytes(TransitionLayout::ClassMapped, cells, class_count)
+                .expect("indexed partial table prefix");
+        assert_eq!(row_bytes, 128);
+        assert_eq!(forward_offset, CLASS_MAP_BYTES);
+
+        let last_row_offset = complete_states
+            .checked_sub(1)
+            .and_then(|state| state.checked_mul(row_bytes))
+            .and_then(|offset| forward_offset.checked_add(offset))
+            .expect("indexed partial final row");
+        let last_live_token = encode_native_row_offset(last_row_offset, cells)
+            .and_then(|token| u32::try_from(token).ok())
+            .expect("indexed partial final live token");
+        let partial = NativePartialDfaLayout {
+            hole_token_base: last_live_token + 1,
+            resume_states,
+            collapse_holes: false,
+        };
+
+        let live = pack_native_partial_forward_cell(
+            u32::try_from(complete_states - 1).unwrap(),
+            true,
+            forward_offset,
+            row_bytes,
+            complete_states,
+            false,
+            None,
+            partial,
+            cells,
+        )
+        .expect("pack indexed partial live row");
+        assert_eq!(live & cells.next_mask(), last_live_token);
+        assert_ne!(live & cells.accepts(), 0);
+        assert_eq!(live & cells.accelerated(), 0);
+        let decoded_last_row = usize::try_from((live & cells.next_mask()) - 1)
+            .ok()
+            .and_then(|token| token.checked_mul(cells.row_token_scale()))
+            .expect("decode indexed partial live row");
+        assert_eq!(decoded_last_row, last_row_offset);
+
+        for resume in 0..resume_states {
+            let next = u32::try_from(complete_states).unwrap() + resume;
+            let packed = pack_native_partial_forward_cell(
+                next,
+                resume != 0,
+                forward_offset,
+                row_bytes,
+                complete_states,
+                false,
+                None,
+                partial,
+                cells,
+            )
+            .expect("pack indexed partial hole");
+            let token = packed & cells.next_mask();
+            assert_eq!(token, partial.hole_token_base + resume);
+            assert_eq!(token - partial.hole_token_base, resume);
+            assert_ne!(packed & cells.accelerated(), 0);
+            assert_eq!(packed & cells.accepts() != 0, resume != 0);
+
+            let collapsed = pack_native_partial_forward_cell(
+                next,
+                resume != 0,
+                forward_offset,
+                row_bytes,
+                complete_states,
+                false,
+                None,
+                NativePartialDfaLayout {
+                    collapse_holes: true,
+                    ..partial
+                },
+                cells,
+            )
+            .expect("pack collapsed indexed slow hole");
+            assert_eq!(collapsed & cells.next_mask(), partial.hole_token_base);
+            assert_eq!(collapsed & cells.accepts() != 0, resume != 0);
+        }
+
+        let indexed_bytes = native_machine_bytes(
+            TransitionLayout::ClassMapped,
+            cells,
+            class_count,
+            complete_states,
+            0,
+        )
+        .expect("indexed partial footprint");
+        let wide_bytes = native_machine_bytes(
+            TransitionLayout::ClassMapped,
+            NativeCellEncoding::Wide32,
+            class_count,
+            complete_states,
+            0,
+        )
+        .expect("wide partial footprint");
+        assert!(indexed_bytes < wide_bytes);
+        assert!(wide_bytes > DIRECT_BYTE_TABLE_BUDGET);
+        assert!(
+            indexed_bytes * X86_PARTIAL_INDEXED_MAX_WIDE_FOOTPRINT_DENOMINATOR
+                <= wide_bytes * X86_PARTIAL_INDEXED_MAX_WIDE_FOOTPRINT_NUMERATOR
+        );
+    }
+
+    #[test]
+    fn indexed_compact_cells_scale_complete_power_of_two_class_rows() {
+        let cells = NativeCellEncoding::Compact16Indexed(4);
+        let row_bytes = 16;
+        let states = 4_096;
+        let packed = pack_native_cell_with_acceleration(
+            4_095,
+            true,
+            CLASS_MAP_BYTES,
+            row_bytes,
+            states,
+            true,
+            cells,
+        )
+        .expect("pack indexed compact final row");
+        assert_eq!(packed & cells.next_mask(), 4_112);
+        assert_ne!(packed & cells.accepts(), 0);
+        assert_ne!(packed & cells.accelerated(), 0);
+        let mut bytes = Vec::new();
+        append_native_packed_cell(&mut bytes, packed, cells).unwrap();
+        assert_eq!(bytes.len(), 2);
+        assert_eq!(
+            u32::from(u16::from_le_bytes(bytes.try_into().unwrap())),
+            packed
+        );
+
+        let compiled = compile(
+            CompileRequest::new("abc", Target::x86_64_linux())
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists),
+        )
+        .unwrap();
+        let mut layout = build_native_dfa_table(compiled.program().native_dfa_view().unwrap())
+            .unwrap()
+            .1;
+        layout.transitions = TransitionLayout::ClassMapped;
+        layout.cells = cells;
+        layout.forward_offset = u32::try_from(CLASS_MAP_BYTES).unwrap();
+        layout.reverse_offset = layout.forward_offset;
+        layout.has_reverse = false;
+
+        let x86 = lower_x86_64_dfa(layout, FeatureSet::EMPTY).unwrap().0;
+        assert!(
+            x86.windows(5)
+                .any(|window| window == [0x41, 0x0f, 0xb7, 0x04, 0x42])
+        );
+        assert!(
+            x86.windows(3)
+                .any(|window| window == [0xc1, 0xe0, 0x04])
+        );
+
+        let aarch64 = lower_aarch64_dfa(layout, FeatureSet::EMPTY).unwrap().0;
+        let words = aarch64
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(words.contains(&aarch64_load_h_uxtw(8, 11, 8).unwrap()));
+        let scaled_row = 0x8b00_0000
+            | (4_u32 << 10)
+            | aarch64_reg(6, 16).unwrap()
+            | aarch64_reg(5, 5).unwrap()
+            | aarch64_reg(11, 0).unwrap();
+        assert!(words.contains(&scaled_row));
+    }
+
+    #[test]
+    fn row_indexing_keeps_large_complete_tables_compact_on_both_isas() {
         use core::fmt::Write as _;
 
-        // Distinguish every byte at every literal position. This constructs a
+        // Distinguish enough bytes at successive literal positions to exceed
+        // absolute Compact16 addressing with a non-power-of-two logical row.
+        // This constructs a
         // large semantic state-by-class product without relying on source
         // identity or an optimizer route outside the ordinary DFA.
         let mut pattern = String::from("(?-u:");
-        for byte in u8::MIN..=u8::MAX {
+        for byte in u8::MIN..=128 {
             write!(&mut pattern, "\\x{byte:02x}").unwrap();
         }
         pattern.push(')');
@@ -42134,11 +42783,38 @@ int main(void) {{
         let view = compiled.program().native_dfa_view().unwrap();
         let (data, layout) = build_native_dfa_table(view).unwrap();
         assert_eq!(layout.transitions, TransitionLayout::ClassMapped);
-        assert_eq!(layout.cells, NativeCellEncoding::Wide32);
+        let NativeCellEncoding::Compact16Indexed(shift) = layout.cells else {
+            panic!("large complete class table did not use indexed compact cells");
+        };
 
         let states = view.dfa.forward_cells.len() / view.dfa.class_count;
-        let row_bytes = view.dfa.class_count * layout.cells.bytes();
-        let machine_bytes = CLASS_MAP_BYTES + states * row_bytes;
+        let row_bytes = native_row_bytes(layout.transitions, layout.cells, view.dfa.class_count)
+            .unwrap();
+        assert_eq!(row_bytes, 1_usize << shift);
+        assert!(row_bytes >= view.dfa.class_count * layout.cells.bytes());
+        let prefix_bytes =
+            native_table_prefix_bytes(layout.transitions, layout.cells, view.dfa.class_count)
+                .unwrap();
+        let machine_bytes = prefix_bytes + states * row_bytes;
+        let logical_row_bytes = view.dfa.class_count * layout.cells.bytes();
+        assert!(
+            row_bytes > logical_row_bytes,
+            "fixture must exercise physical row padding"
+        );
+        assert!(
+            (0..states).all(|state| {
+                let padding_start = prefix_bytes + state * row_bytes + logical_row_bytes;
+                let padding_end = prefix_bytes + (state + 1) * row_bytes;
+                data[padding_start..padding_end].iter().all(|&byte| byte == 0)
+            }),
+            "physical power-of-two padding must not contain transition data"
+        );
+        assert!(
+            machine_bytes
+                <= CLASS_MAP_BYTES
+                    + states * view.dfa.class_count * NativeCellEncoding::Wide32.bytes(),
+            "indexed compact layout must not grow its former wide machine"
+        );
         assert_eq!(
             usize::try_from(layout.reverse_offset).unwrap(),
             machine_bytes
@@ -42147,12 +42823,12 @@ int main(void) {{
 
         let x86 = lower_x86_64_dfa(layout, FeatureSet::EMPTY).unwrap().0;
         assert!(
-            x86.windows(4)
-                .any(|bytes| bytes == [0x41, 0x8b, 0x04, 0x82])
+            x86.windows(5)
+                .any(|bytes| bytes == [0x41, 0x0f, 0xb7, 0x04, 0x42])
         );
         assert!(
-            !x86.windows(5)
-                .any(|bytes| bytes == [0x41, 0x0f, 0xb7, 0x04, 0x42])
+            x86.windows(3)
+                .any(|bytes| bytes == [0xc1, 0xe0, shift])
         );
 
         let aarch64 = lower_aarch64_dfa(layout, FeatureSet::EMPTY).unwrap().0;
@@ -42160,8 +42836,13 @@ int main(void) {{
             .chunks_exact(4)
             .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
             .collect::<Vec<_>>();
-        assert!(words.contains(&aarch64_load_w_uxtw(8, 11, 8).unwrap()));
-        assert!(!words.contains(&aarch64_load_h_uxtw(8, 11, 8).unwrap()));
+        assert!(words.contains(&aarch64_load_h_uxtw(8, 11, 8).unwrap()));
+        let scaled_row = 0x8b00_0000
+            | (u32::from(shift) << 10)
+            | aarch64_reg(6, 16).unwrap()
+            | aarch64_reg(5, 5).unwrap()
+            | aarch64_reg(11, 0).unwrap();
+        assert!(words.contains(&scaled_row));
     }
 
     #[test]
