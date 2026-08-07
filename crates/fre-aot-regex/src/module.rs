@@ -14960,22 +14960,6 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
                 assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
                 assembler.instruction(&[0x47, 0x0f, 0xb6, 0x14, 0x11])?;
                 for offset in 1..length {
-                    match class_count {
-                        2 => {
-                            assembler.instruction(&[0x41, 0xd1, 0xe2])?;
-                        }
-                        3 => {
-                            assembler.instruction(&[0x45, 0x6b, 0xd2, 0x03])?;
-                        }
-                        4 => {
-                            assembler.instruction(&[0x41, 0xc1, 0xe2, 0x02])?;
-                        }
-                        _ => {
-                            return Err(ObjectError::InvalidModule(
-                                "x86 V14 key has unsupported class count",
-                            ));
-                        }
-                    }
                     assembler.instruction(&[
                         0x44,
                         0x0f,
@@ -14987,7 +14971,27 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
                         })?,
                     ])?;
                     assembler.instruction(&[0x47, 0x0f, 0xb6, 0x1c, 0x19])?;
-                    assembler.instruction(&[0x45, 0x01, 0xda])?;
+                    match class_count {
+                        // Fold the next mapped class into the base-C Horner
+                        // step. These LEAs remove a dependent shift/add pair
+                        // from every C=2/C=4 byte and avoid IMUL latency for
+                        // C=3 without introducing target-feature assumptions.
+                        2 => {
+                            assembler.instruction(&[0x47, 0x8d, 0x14, 0x53])?;
+                        }
+                        3 => {
+                            assembler.instruction(&[0x47, 0x8d, 0x14, 0x52])?;
+                            assembler.instruction(&[0x45, 0x01, 0xda])?;
+                        }
+                        4 => {
+                            assembler.instruction(&[0x47, 0x8d, 0x14, 0x93])?;
+                        }
+                        _ => {
+                            return Err(ObjectError::InvalidModule(
+                                "x86 V14 key has unsupported class count",
+                            ));
+                        }
+                    }
                 }
                 Ok::<(), ObjectError>(())
             };
@@ -15066,11 +15070,14 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
             scale_token.extend_from_slice(&block_bytes_u32.to_le_bytes());
             assembler.instruction(&scale_token)?;
             assembler.instruction(&[0x4e, 0x8d, 0x04, 0x16])?;
-            assembler.instruction(&[0x48, 0x39, 0xca])?;
-            assembler.branch(&[0x0f, 0x83], complete)?;
             assembler.instruction(&[0x4c, 0x8d, 0x5a, 0x03])?;
             assembler.instruction(&[0x49, 0x39, 0xcb])?;
             assembler.branch(&[0x0f, 0x82], main_scan)?;
+            // The common path has another complete quad. Test that bound
+            // first; only the terminal/tail edge needs the separate empty
+            // check.
+            assembler.instruction(&[0x48, 0x39, 0xca])?;
+            assembler.branch(&[0x0f, 0x83], complete)?;
             assembler.branch(&[0xe9], tail_dispatch)?;
 
             assembler.bind(tail_dispatch)?;
@@ -18782,6 +18789,22 @@ fn aarch64_add_w_reg(destination: u8, left: u8, right: u8) -> Result<u32, Object
             | aarch64_reg(left, 5)?
             | aarch64_reg(destination, 0)?,
     )
+}
+
+fn aarch64_add_w_lsl(
+    destination: u8,
+    left: u8,
+    right: u8,
+    shift: u8,
+) -> Result<u32, ObjectError> {
+    if shift > 31 {
+        return Err(ObjectError::InvalidModule("AArch64 ADD W shift"));
+    }
+    Ok(0x0b00_0000
+        | aarch64_reg(right, 16)?
+        | (u32::from(shift) << 10)
+        | aarch64_reg(left, 5)?
+        | aarch64_reg(destination, 0)?)
 }
 
 fn aarch64_and_w(destination: u8, left: u8, right: u8) -> Result<u32, ObjectError> {
@@ -25406,29 +25429,31 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
 
         let emit_v14_key =
             |assembler: &mut Aarch64Assembler, class_count: usize, length: usize| {
-                assembler.instruction(aarch64_load_byte_reg(8, 0, 2)?)?;
+                // Materialize the haystack cursor once, then use immediate
+                // byte offsets. The prior form rebuilt base+position for
+                // bytes two through four on every serial table step.
+                assembler.instruction(aarch64_add_x_reg(9, 0, 2)?)?;
+                assembler.instruction(aarch64_load_byte_imm(8, 9, 0)?)?;
                 assembler.instruction(aarch64_load_byte_reg(8, 14, 8)?)?;
                 for byte_offset in 1..length {
-                    assembler.instruction(aarch64_add_x_imm(
+                    assembler.instruction(aarch64_load_byte_imm(
+                        10,
                         9,
-                        2,
                         u16::try_from(byte_offset).map_err(|_| {
                             ObjectError::ArithmeticOverflow("AArch64 V14 key byte offset")
                         })?,
                     )?)?;
-                    assembler.instruction(aarch64_load_byte_reg(10, 0, 9)?)?;
                     assembler.instruction(aarch64_load_byte_reg(10, 14, 10)?)?;
                     match class_count {
                         2 => {
-                            assembler.instruction(aarch64_add_w_reg(8, 8, 8)?)?;
+                            assembler.instruction(aarch64_add_w_lsl(8, 10, 8, 1)?)?;
                         }
                         3 => {
-                            assembler.instruction(aarch64_add_w_reg(9, 8, 8)?)?;
-                            assembler.instruction(aarch64_add_w_reg(8, 9, 8)?)?;
+                            assembler.instruction(aarch64_add_w_lsl(8, 8, 8, 1)?)?;
+                            assembler.instruction(aarch64_add_w_reg(8, 8, 10)?)?;
                         }
                         4 => {
-                            assembler.instruction(aarch64_add_w_reg(8, 8, 8)?)?;
-                            assembler.instruction(aarch64_add_w_reg(8, 8, 8)?)?;
+                            assembler.instruction(aarch64_add_w_lsl(8, 10, 8, 2)?)?;
                         }
                         _ => {
                             return Err(ObjectError::InvalidModule(
@@ -25436,7 +25461,6 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
                             ));
                         }
                     }
-                    assembler.instruction(aarch64_add_w_reg(8, 8, 10)?)?;
                 }
                 Ok::<(), ObjectError>(())
             };
@@ -25506,11 +25530,13 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
             assembler.branch_zero_w(8, complete)?;
             assembler.instruction(aarch64_mul_x(8, 8, 12)?)?;
             assembler.instruction(aarch64_add_x_reg(11, 15, 8)?)?;
-            assembler.instruction(aarch64_cmp_x(2, 3)?)?;
-            assembler.branch_cond(AARCH64_HS, complete)?;
             assembler.instruction(aarch64_add_x_imm(9, 2, 3)?)?;
             assembler.instruction(aarch64_cmp_x(9, 3)?)?;
             assembler.branch_cond(AARCH64_LO, main_scan)?;
+            // Favor the complete-quad backedge: the separate empty test is
+            // needed only once the four-byte bound fails.
+            assembler.instruction(aarch64_cmp_x(2, 3)?)?;
+            assembler.branch_cond(AARCH64_HS, complete)?;
             assembler.branch(tail_dispatch)?;
 
             assembler.bind(tail_dispatch)?;
@@ -45093,6 +45119,24 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             assert_eq!(occurrences(&x86.code, &x86_flag), 1, "{context}");
             assert_eq!(occurrences(&x86.code, &x86_version), 1, "{context}");
             assert_eq!(occurrences(&x86.code, &x86_ready), 1, "{context}");
+            assert_eq!(
+                occurrences(&x86.code, &[0x47, 0x8d, 0x14, 0x53]),
+                6,
+                "C=2 fused Horner LEAs: {context}"
+            );
+            assert_eq!(
+                occurrences(
+                    &x86.code,
+                    &[0x47, 0x8d, 0x14, 0x52, 0x45, 0x01, 0xda],
+                ),
+                6,
+                "C=3 Horner LEA/add pairs: {context}"
+            );
+            assert_eq!(
+                occurrences(&x86.code, &[0x47, 0x8d, 0x14, 0x93]),
+                6,
+                "C=4 fused Horner LEAs: {context}"
+            );
             for block_bytes in [60_u32, 240, 680] {
                 let mut scale = vec![0x45, 0x69, 0xd2];
                 scale.extend_from_slice(&block_bytes.to_le_bytes());
@@ -45142,6 +45186,36 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 "{context}"
             );
             assert_eq!(occurrences(&arm.code, &arm_ready), 1, "{context}");
+            assert_eq!(
+                arm_words
+                    .iter()
+                    .filter(|&&word| word == aarch64_add_w_lsl(8, 10, 8, 1).unwrap())
+                    .count(),
+                6,
+                "C=2 fused Horner ADDs: {context}"
+            );
+            assert_eq!(
+                arm_words
+                    .windows(2)
+                    .filter(|words| {
+                        *words
+                            == [
+                                aarch64_add_w_lsl(8, 8, 8, 1).unwrap(),
+                                aarch64_add_w_reg(8, 8, 10).unwrap(),
+                            ]
+                    })
+                    .count(),
+                6,
+                "C=3 Horner shifted-ADD pairs: {context}"
+            );
+            assert_eq!(
+                arm_words
+                    .iter()
+                    .filter(|&&word| word == aarch64_add_w_lsl(8, 10, 8, 2).unwrap())
+                    .count(),
+                6,
+                "C=4 fused Horner ADDs: {context}"
+            );
             for block_bytes in [60_u16, 240, 680] {
                 assert_eq!(
                     arm_words
@@ -45861,6 +45935,11 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             0x8b00_0000 | (6_u32 << 16) | (9_u32 << 10) | (15_u32 << 5) | 11
         );
         assert!(aarch64_add_x_lsl(11, 15, 6, 64).is_err());
+        assert_eq!(
+            aarch64_add_w_lsl(8, 10, 8, 2).unwrap(),
+            0x0b00_0000 | (8_u32 << 16) | (2_u32 << 10) | (10_u32 << 5) | 8
+        );
+        assert!(aarch64_add_w_lsl(8, 10, 8, 32).is_err());
         assert_eq!(
             aarch64_add_x_uxtw(11, 15, 8, 1).unwrap(),
             0x8b20_4000 | (8_u32 << 16) | (1_u32 << 10) | (15_u32 << 5) | 11
