@@ -37200,15 +37200,15 @@ static int run_case(const unsigned char *p,size_t n,size_t s,size_t e,uint32_t e
         reason = "one cross-ISA audit proves the rotated boundary and pointer-cursor contracts"
     )]
     fn scanner_free_compact_hot_loops_are_bottom_tested_and_pointer_advanced_cross_isa() {
-        fn x86_bottom_tests(code: &[u8]) -> usize {
-            code.windows(5)
-                .filter(|window| *window == [0x48, 0x39, 0xca, 0x0f, 0x82])
-                .count()
-        }
-
-        fn x86_top_tests(code: &[u8]) -> usize {
-            code.windows(5)
-                .filter(|window| *window == [0x48, 0x39, 0xca, 0x0f, 0x83])
+        fn x86_bound_tests(code: &[u8], opcode: u8, backward: bool) -> usize {
+            code.windows(3)
+                .enumerate()
+                .filter(|&(compare, window)| {
+                    window == [0x48, 0x39, 0xca]
+                        && x86_test_normalized_branch_opcode(code, compare + 3) == Some(opcode)
+                        && x86_test_branch_target(code, compare + 3)
+                            .is_some_and(|(target, _)| (target < compare) == backward)
+                })
                 .count()
         }
 
@@ -37236,6 +37236,26 @@ static int run_case(const unsigned char *p,size_t n,size_t s,size_t e,uint32_t e
         let v3_postindexed = aarch64_load_byte_post_imm(6, 2, 1).unwrap();
         let v4_indexed = aarch64_load_byte_reg(8, 0, 2).unwrap();
         let v3_indexed = aarch64_load_byte_reg(6, 0, 2).unwrap();
+        let v4_postindexed_body = [
+            v4_postindexed,
+            aarch64_load_byte_reg(8, 14, 8).unwrap(),
+            aarch64_load_h_uxtw(8, 11, 8).unwrap(),
+        ];
+        let v3_postindexed_body = [
+            v3_postindexed,
+            aarch64_load_byte_reg(6, 14, 6).unwrap(),
+            aarch64_load_h_uxtw(8, 11, 6).unwrap(),
+        ];
+        let v4_indexed_body = [
+            v4_indexed,
+            aarch64_load_byte_reg(8, 14, 8).unwrap(),
+            aarch64_load_h_uxtw(8, 11, 8).unwrap(),
+        ];
+        let v3_indexed_body = [
+            v3_indexed,
+            aarch64_load_byte_reg(6, 14, 6).unwrap(),
+            aarch64_load_h_uxtw(8, 11, 6).unwrap(),
+        ];
         let pointer_setup = [
             aarch64_add_x_reg(2, 0, 2).unwrap(),
             aarch64_add_x_reg(3, 0, 3).unwrap(),
@@ -37255,7 +37275,7 @@ static int run_case(const unsigned char *p,size_t n,size_t s,size_t e,uint32_t e
             )
             .unwrap();
             assert_eq!(
-                x86_bottom_tests(&x86.code),
+                x86_bound_tests(&x86.code, 0x82, true),
                 10,
                 "x86 V4 plus all nine V3 shifts need one conditional backedge for {output:?}"
             );
@@ -37278,19 +37298,67 @@ static int run_case(const unsigned char *p,size_t n,size_t s,size_t e,uint32_t e
                 .filter(|window| *window == pointer_setup)
                 .count();
             if output == OutputContract::Exists {
-                assert_eq!(words.iter().filter(|&&word| word == v4_postindexed).count(), 1);
-                assert_eq!(words.iter().filter(|&&word| word == v3_postindexed).count(), 9);
-                assert_eq!(words.iter().filter(|&&word| word == v4_indexed).count(), 0);
-                assert_eq!(words.iter().filter(|&&word| word == v3_indexed).count(), 0);
+                assert_eq!(
+                    words
+                        .windows(3)
+                        .filter(|body| *body == v4_postindexed_body)
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    words
+                        .windows(3)
+                        .filter(|body| *body == v3_postindexed_body)
+                        .count(),
+                    9
+                );
+                assert_eq!(
+                    words
+                        .windows(3)
+                        .filter(|body| *body == v4_indexed_body)
+                        .count(),
+                    0
+                );
+                assert_eq!(
+                    words
+                        .windows(3)
+                        .filter(|body| *body == v3_indexed_body)
+                        .count(),
+                    0
+                );
                 assert_eq!(
                     setup_count, 2,
                     "each compact format entry converts its selected cursor exactly once"
                 );
             } else {
-                assert_eq!(words.iter().filter(|&&word| word == v4_postindexed).count(), 0);
-                assert_eq!(words.iter().filter(|&&word| word == v3_postindexed).count(), 0);
-                assert_eq!(words.iter().filter(|&&word| word == v4_indexed).count(), 1);
-                assert_eq!(words.iter().filter(|&&word| word == v3_indexed).count(), 9);
+                assert_eq!(
+                    words
+                        .windows(3)
+                        .filter(|body| *body == v4_postindexed_body)
+                        .count(),
+                    0
+                );
+                assert_eq!(
+                    words
+                        .windows(3)
+                        .filter(|body| *body == v3_postindexed_body)
+                        .count(),
+                    0
+                );
+                assert_eq!(
+                    words
+                        .windows(3)
+                        .filter(|body| *body == v4_indexed_body)
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    words
+                        .windows(3)
+                        .filter(|body| *body == v3_indexed_body)
+                        .count(),
+                    9
+                );
                 assert_eq!(setup_count, 0, "endpoint contracts retain offset cursors");
             }
         }
@@ -37312,9 +37380,9 @@ static int run_case(const unsigned char *p,size_t n,size_t s,size_t e,uint32_t e
             true,
         )
         .unwrap();
-        assert_eq!(x86_bottom_tests(&rooted_x86.code), 0);
+        assert_eq!(x86_bound_tests(&rooted_x86.code, 0x82, true), 0);
         assert!(
-            x86_top_tests(&rooted_x86.code) >= 10,
+            x86_bound_tests(&rooted_x86.code, 0x83, false) >= 10,
             "all rooted compact loops must retain a top boundary test"
         );
 
