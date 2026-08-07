@@ -13724,12 +13724,72 @@ fn try_k0_universal_finite_suffix_incumbent(
     Ok(outcome)
 }
 
+#[inline]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the dispatcher preserves the incumbent's immutable sidecar envelope"
+)]
+fn execute_k0_exists_incumbent(
+    session: &mut K0SearchSession<'_>,
+    reverse_inner: &mut Option<Box<k0_general_reverse_inner::SearchSession<'_>>>,
+    mandatory_suffix: Option<&K0MandatorySuffixPlan>,
+    mandatory_cut: Option<&K0MandatoryCutPlan>,
+    negative_prefilter: Option<&K0NegativePrefilterPlan>,
+    mandatory_suffix_exists_state: &mut K0NegativePrefilterState,
+    negative_prefilter_exists_state: &mut K0NegativePrefilterState,
+    absolute_end_proof: Option<K0AbsoluteEndProof>,
+    haystack: &[u8],
+    window: SearchWindow,
+    limits: SearchLimits,
+    incumbent_observation: Option<&mut K0PackedFrontierIncumbentObservation>,
+) -> Result<bool, SearchError> {
+    // A sidecar-free immutable plan has no policy state to stage or publish.
+    // Dispatch it before entering the outlined transaction so steady raw K0
+    // calls do not inherit the general suffix/prefilter/reverse frame.
+    if reverse_inner.is_none()
+        && mandatory_suffix.is_none()
+        && mandatory_cut.is_none()
+        && negative_prefilter.is_none()
+        && absolute_end_proof.is_none()
+    {
+        return match incumbent_observation {
+            Some(observation) => match session.search_window::<Exists>(haystack, window, limits) {
+                Ok(report) => {
+                    *observation = K0PackedFrontierIncumbentObservation::RawK0 {
+                        work: report.accounting().work(),
+                    };
+                    Ok(report.into_output())
+                }
+                Err(error) => Err(SearchError::from(error)),
+            },
+            None => session
+                .search_exists_value(haystack, window, limits)
+                .map_err(SearchError::from),
+        };
+    }
+    execute_k0_exists_incumbent_general(
+        session,
+        reverse_inner,
+        mandatory_suffix,
+        mandatory_cut,
+        negative_prefilter,
+        mandatory_suffix_exists_state,
+        negative_prefilter_exists_state,
+        absolute_end_proof,
+        haystack,
+        window,
+        limits,
+        incumbent_observation,
+    )
+}
+
+#[inline(never)]
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
     reason = "the incumbent closes one immutable K0 sidecar and transactional-state envelope"
 )]
-fn execute_k0_exists_incumbent(
+fn execute_k0_exists_incumbent_general(
     session: &mut K0SearchSession<'_>,
     reverse_inner: &mut Option<Box<k0_general_reverse_inner::SearchSession<'_>>>,
     mandatory_suffix: Option<&K0MandatorySuffixPlan>,
