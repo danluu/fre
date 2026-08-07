@@ -14074,11 +14074,18 @@ impl<'r> PortableSearchSession<'r> {
                 end: span.end(),
             }));
         }
-        if start != 0
-            && let Some(result) =
-                self.find_iter_universal_finite_suffix_at(source.haystack(), start, limits)
-        {
-            return result;
+        let universal_suffix_continuation = start != 0
+            && matches!(
+                &self.plan,
+                PortableSearchSessionPlan::K0 {
+                    mandatory_suffix: Some(suffix),
+                    ..
+                } if suffix.universal_finite_match_byte_bounds().is_some()
+            );
+        if universal_suffix_continuation {
+            return self
+                .find_iter_universal_finite_suffix_at(source.haystack(), start, limits)
+                .expect("universal finite suffix eligibility was checked above");
         }
         self.find_at_value(source.haystack(), start, limits)
     }
@@ -16780,7 +16787,7 @@ mod tests {
         let exact_class = state.class_for(selected_size_class);
         state.classes[exact_class].next_predicate = super::K0_FINITE_SUFFIX_EXACT_ROUTE;
 
-        let attempt = super::try_k0_universal_finite_mandatory_suffix_span_start(
+        let attempt = super::try_k0_universal_finite_mandatory_suffix_span_start::<false>(
             suffix,
             minimum_match_bytes,
             maximum_match_bytes,
