@@ -3663,6 +3663,7 @@ impl NativeSlowDfaProgram {
         self.allocation_bytes
     }
 
+    #[cfg(test)]
     pub(crate) fn is_partial(&self) -> bool {
         matches!(&self.machine, NativeSlowMachine::Partial(_))
     }
