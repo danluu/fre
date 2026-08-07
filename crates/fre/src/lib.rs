@@ -15408,18 +15408,19 @@ mod tests {
 
     #[test]
     fn finite_suffix_direct_route_owns_fresh_classes_and_exact_loss_backoff() {
-        let regex = PortableBuilder::new(r"(?-u:\x6a\x6b[\x30-\x39]{2,6}\x71\x72)")
-            .unicode(false)
-            .plan_selection(PlanSelection::ForceK0)
-            .build()
-            .expect("finite direct-route fixture builds through K0");
+        let regex = forced_k0_with_only_mandatory_suffix(
+            r"(?-u:\x6a\x6b(?:[\x30-\x39]{2}|[\x30-\x39]{4}|[\x30-\x39]{6})\x71\x72)",
+        );
         let PortablePlan::K0(plan) = &regex.plan else {
             panic!("finite direct-route fixture did not retain K0");
         };
-        let maximum_match_bytes = plan
+        let suffix = plan
             .mandatory_suffix
             .as_ref()
-            .and_then(K0MandatorySuffixPlan::finite_maximum_match_bytes)
+            .expect("finite direct-route fixture retains its mandatory suffix");
+        assert_eq!(suffix.universal_finite_match_byte_bounds(), None);
+        let maximum_match_bytes = suffix
+            .finite_maximum_match_bytes()
             .expect("finite direct-route fixture retains its maximum width");
         let mut session = regex
             .search_session(SearchSessionLimits::unlimited())
@@ -15519,8 +15520,9 @@ mod tests {
         );
         assert_eq!(state.classes[class_index].disabled_calls, 1);
         assert_eq!(
-            state.classes[class_index].next_predicate,
+            state.classes[class_index].next_predicate & !K0_FINITE_SUFFIX_SINGLE_PASS_NEGATIVE,
             K0_FINITE_SUFFIX_INCUMBENT_ROUTE,
+            "the packed receipt is independent of the selected route bits",
         );
         let before_limited = state;
         assert_eq!(
@@ -15562,11 +15564,9 @@ mod tests {
     #[test]
     fn finite_suffix_first_incumbent_distinguishes_exhausted_and_dense_start_scans() {
         const HAYSTACK_BYTES: usize = 4_096;
-        let exhausted = PortableBuilder::new(r"(?-u:(?:\x21\x31|\x21\x32|\x22){0,5}\x7d)")
-            .unicode(false)
-            .plan_selection(PlanSelection::ForceK0)
-            .build()
-            .expect("finite exhausted-scanner fixture builds through K0");
+        let exhausted = forced_k0_with_only_mandatory_suffix(
+            r"(?-u:(?:\x21\x31|\x21\x32|\x22){0,5}\x7d)",
+        );
         let absent = vec![b'x'; HAYSTACK_BYTES];
         let window = SearchWindow::full(&absent);
         let window_size_class = usize::BITS - HAYSTACK_BYTES.leading_zeros();
@@ -15619,11 +15619,9 @@ mod tests {
             );
         }
 
-        let dense = PortableBuilder::new(r"(?-u:\x61\xfe[\x30-\x40]{0,8}\x7f)")
-            .unicode(false)
-            .plan_selection(PlanSelection::ForceK0)
-            .build()
-            .expect("finite dense-scanner fixture builds through K0");
+        let dense = forced_k0_with_only_mandatory_suffix(
+            r"(?-u:\x61\xfe[\x30-\x40]{0,8}\x7f)",
+        );
         let mut decoys = Vec::with_capacity(HAYSTACK_BYTES);
         while decoys.len() < HAYSTACK_BYTES {
             decoys.extend_from_slice(&[b'a', 0xfe, b'0', b'0', b'x']);
@@ -15837,12 +15835,8 @@ mod tests {
 
     #[test]
     fn finite_k0_exists_prefix_hedge_resumes_at_the_first_unproved_start() {
-        let pattern = r"(?-u:\x6a\x6b[\x30-\x39]{2,6}\x71\x72)";
-        let regex = PortableBuilder::new(pattern)
-            .unicode(false)
-            .plan_selection(PlanSelection::ForceK0)
-            .build()
-            .expect("finite prefix-hedge fixture builds through K0");
+        let pattern = r"(?-u:\x6a\x6b(?:[\x30-\x39]{2}|[\x30-\x39]{4}|[\x30-\x39]{6})\x71\x72)";
+        let regex = forced_k0_with_only_mandatory_suffix(pattern);
         let PortablePlan::K0(plan) = &regex.plan else {
             panic!("forced finite prefix-hedge fixture did not retain K0");
         };
@@ -15851,6 +15845,7 @@ mod tests {
             .as_ref()
             .expect("finite two-byte suffix is retained");
         assert_eq!(suffix.needle(), b"qr");
+        assert_eq!(suffix.universal_finite_match_byte_bounds(), None);
         let maximum_match_bytes = suffix
             .finite_maximum_match_bytes()
             .expect("finite suffix retains its maximum width");
@@ -15951,12 +15946,16 @@ mod tests {
     fn finite_k0_bounded_routes_keep_early_matches_on_the_incumbent_engine() {
         const MATCH_START: usize = 128;
         const HAYSTACK_BYTES: usize = 4_096;
-        let pattern = r"(?-u:\x6a\x6b[\x30-\x39]{2,6}\x71\x72)";
-        let regex = PortableBuilder::new(pattern)
-            .unicode(false)
-            .plan_selection(PlanSelection::ForceK0)
-            .build()
-            .expect("finite early-match fixture builds through K0");
+        let pattern = r"(?-u:\x6a\x6b(?:[\x30-\x39]{2}|[\x30-\x39]{4}|[\x30-\x39]{6})\x71\x72)";
+        let regex = forced_k0_with_only_mandatory_suffix(pattern);
+        let PortablePlan::K0(plan) = &regex.plan else {
+            panic!("finite early-match fixture did not retain K0");
+        };
+        let suffix = plan
+            .mandatory_suffix
+            .as_ref()
+            .expect("finite early-match fixture retains its mandatory suffix");
+        assert_eq!(suffix.universal_finite_match_byte_bounds(), None);
         let mut haystack = vec![b'x'; HAYSTACK_BYTES];
         haystack[MATCH_START..MATCH_START + 8].copy_from_slice(b"jk1234qr");
         let expected = Match {
@@ -18452,37 +18451,44 @@ mod tests {
                 .is_some_and(K0MandatorySuffixPlan::has_consumption_run),
         );
 
-        let one_below_limit = exact_work
+        let scanner_work = u64::try_from(ASCII_RUN_SCANNER_BUILD_WORK)
+            .expect("ASCII run-scanner work fits u64");
+        let work_before_scanner = exact_work
+            .checked_sub(scanner_work)
+            .expect("completed recovery includes scanner construction");
+        let scanner_one_below_limit = exact_work
             .checked_sub(1)
             .expect("the incumbent recovery consumes positive planner work");
-        let one_below = try_build_k0_mandatory_suffix(
+        let scanner_refused = try_build_k0_mandatory_suffix(
             &raw,
             None,
             minimum_match_bytes,
             maximum_match_bytes,
             None,
             BuildLimits {
-                max_planner_work: one_below_limit,
+                max_planner_work: scanner_one_below_limit,
                 ..limits
             },
             0,
         )
-        .expect("one-below refusal publishes finite Span recovery");
-        let one_below_plan = one_below
+        .expect("scanner refusal publishes finite Span recovery");
+        let scanner_refused_plan = scanner_refused
             .plan
             .as_ref()
             .expect("the authenticated suffix remains retained");
-        let scanner_work = u64::try_from(ASCII_RUN_SCANNER_BUILD_WORK)
-            .expect("ASCII run-scanner work fits u64");
-        let work_before_scanner = exact_work
-            .checked_sub(scanner_work)
-            .expect("completed recovery includes scanner construction");
-        assert!(!one_below_plan.has_consumption_run());
-        assert_eq!(one_below_plan.finite_minimum_match_bytes(), Some(7));
-        assert_eq!(one_below_plan.finite_maximum_match_bytes(), Some(19));
-        assert_eq!(one_below_plan.finite_exists_maximum_match_bytes(), None);
-        assert_eq!(one_below.planner_work, work_before_scanner);
-        assert_eq!(one_below.storage_bytes, complete.storage_bytes);
+        assert!(!scanner_refused_plan.has_consumption_run());
+        assert_eq!(scanner_refused_plan.finite_minimum_match_bytes(), Some(7));
+        assert_eq!(scanner_refused_plan.finite_maximum_match_bytes(), Some(19));
+        assert_eq!(
+            scanner_refused_plan.finite_exists_maximum_match_bytes(),
+            None
+        );
+        // The scanner's all-or-nothing charge stops at its component
+        // checkpoint. A later independent corridor attempt may legitimately
+        // consume part of the residual transaction-wide allowance.
+        assert!(scanner_refused.planner_work > work_before_scanner);
+        assert!(scanner_refused.planner_work <= scanner_one_below_limit);
+        assert_eq!(scanner_refused.storage_bytes, complete.storage_bytes);
 
         let replay = try_build_k0_mandatory_suffix(
             &raw,
@@ -18491,7 +18497,7 @@ mod tests {
             maximum_match_bytes,
             None,
             BuildLimits {
-                max_planner_work: one_below.planner_work,
+                max_planner_work: scanner_refused.planner_work,
                 ..limits
             },
             0,
@@ -18501,8 +18507,8 @@ mod tests {
             .plan
             .as_ref()
             .expect("replayed finite Span recovery remains retained");
-        assert_eq!(replay.planner_work, one_below.planner_work);
-        assert_eq!(replay.storage_bytes, one_below.storage_bytes);
+        assert_eq!(replay.planner_work, scanner_refused.planner_work);
+        assert_eq!(replay.storage_bytes, scanner_refused.storage_bytes);
         assert!(!replay_plan.has_consumption_run());
         assert_eq!(replay_plan.finite_minimum_match_bytes(), Some(7));
         assert_eq!(replay_plan.finite_maximum_match_bytes(), Some(19));
@@ -18533,7 +18539,8 @@ mod tests {
             .plan
             .as_ref()
             .expect("edge-refused suffix remains retained");
-        assert_eq!(edge_refused.planner_work, work_before_edges);
+        assert!(edge_refused.planner_work > work_before_edges);
+        assert!(edge_refused.planner_work <= edge_one_below_limit);
         assert_eq!(edge_refused.storage_bytes, complete.storage_bytes);
         assert!(!edge_refused_plan.has_consumption_run());
         assert_eq!(edge_refused_plan.finite_minimum_match_bytes(), Some(7));
@@ -18750,16 +18757,24 @@ mod tests {
 
     #[test]
     fn k0_negative_prefilter_probes_the_longest_conjunctive_literal_first() {
-        let regex = PortableBuilder::new("LONGNEEDLE.*abc")
-            .unicode(false)
-            .plan_selection(PlanSelection::ForceK0)
-            .build()
-            .expect("focused conjunctive pattern builds through K0");
-        let PortablePlan::K0(plan) = &regex.plan else {
-            panic!("forced conjunctive pattern did not retain K0");
-        };
-        let prefilter = plan
-            .negative_prefilter
+        let (raw, hir, limits, _, minimum_match_bytes, _) =
+            lowered_k0_mandatory_suffix_with_hir("LONGNEEDLE.*abc");
+        let automaton_storage_bytes = Automaton::from_raw(raw, limits.lowering.automata)
+            .expect("focused conjunctive graph validates")
+            .stats()
+            .storage_bytes();
+        let prefilter_build = super::try_build_k0_negative_prefilter(
+            &hir,
+            minimum_match_bytes,
+            limits,
+            0,
+            0,
+            0,
+            automaton_storage_bytes,
+        )
+        .expect("focused conjunctive prefilter planning completes");
+        let prefilter = prefilter_build
+            .plan
             .as_deref()
             .expect("focused conjunctive pattern retains a negative prefilter");
         assert_eq!(prefilter.literals.len(), 2);
