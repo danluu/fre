@@ -21,8 +21,13 @@ use crate::{EdgeKind, RawPlan, StateRole};
 
 /// Stable identity for the proof and its accounting convention.
 pub const MANDATORY_SUFFIX_ACCOUNTING_ID: &str = "fre.automata.mandatory-suffix.v2";
+/// Stable identity for the optional universal-corridor proof and accounting.
+pub const MANDATORY_SUFFIX_UNIVERSAL_FINITE_CORRIDOR_ACCOUNTING_ID: &str =
+    "fre.automata.mandatory-suffix-universal-finite-corridor.v1";
 /// Maximum exact suffix bytes representable inline by this implementation.
 pub const MAX_MANDATORY_SUFFIX_BYTES: usize = 32;
+/// Hard maximum prefix depth inspected by the optional universal corridor.
+pub const MAX_MANDATORY_SUFFIX_UNIVERSAL_CORRIDOR_PREFIX_BYTES: usize = 65_536;
 /// Default number of exact suffix bytes requested.
 pub const DEFAULT_MANDATORY_SUFFIX_MAX_BYTES: usize = 16;
 /// Default maximum abstract work for one optional analysis.
@@ -281,6 +286,167 @@ pub struct MandatorySuffixCandidate {
     len: u8,
 }
 
+/// A finite prefix-width corridor whose every byte string reaches the exact
+/// retained mandatory-suffix frontier.
+///
+/// This certificate is deliberately stronger than a finite maximum. For
+/// every byte length in the inclusive interval, every possible byte string
+/// has an assertion-free path from the raw start state to the suffix
+/// frontier. It is tied to the same immutable [`RawPlan`] as the suffix.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MandatorySuffixUniversalFiniteCorridor {
+    minimum_prefix_bytes: usize,
+    maximum_prefix_bytes: usize,
+}
+
+impl MandatorySuffixUniversalFiniteCorridor {
+    /// Smallest universally accepted prefix width.
+    #[must_use]
+    pub const fn minimum_prefix_bytes(self) -> usize {
+        self.minimum_prefix_bytes
+    }
+
+    /// Largest universally accepted prefix width.
+    #[must_use]
+    pub const fn maximum_prefix_bytes(self) -> usize {
+        self.maximum_prefix_bytes
+    }
+}
+
+/// Exact resource receipt for one independent universal-corridor attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MandatorySuffixUniversalFiniteCorridorStats {
+    accounting_id: &'static str,
+    work: u64,
+    allocation_items: usize,
+    allocation_attempts: usize,
+}
+
+impl MandatorySuffixUniversalFiniteCorridorStats {
+    /// Stable identity of this independent proof and accounting convention.
+    #[must_use]
+    pub const fn accounting_id(self) -> &'static str {
+        self.accounting_id
+    }
+
+    /// Exact abstract work completed, including re-authentication of the
+    /// suffix frontier against the supplied immutable raw plan.
+    #[must_use]
+    pub const fn work(self) -> u64 {
+        self.work
+    }
+
+    /// Cumulative logical scratch-vector slots requested.
+    #[must_use]
+    pub const fn allocation_items(self) -> usize {
+        self.allocation_items
+    }
+
+    /// Fallible scratch reservation attempts completed or attempted.
+    #[must_use]
+    pub const fn allocation_attempts(self) -> usize {
+        self.allocation_attempts
+    }
+
+    /// Whether this independent receipt closes under `limits`.
+    #[must_use]
+    pub fn closes(self, limits: MandatorySuffixAnalysisLimits) -> bool {
+        self.accounting_id == MANDATORY_SUFFIX_UNIVERSAL_FINITE_CORRIDOR_ACCOUNTING_ID
+            && self.work <= limits.max_work
+            && self.allocation_items <= limits.max_allocation_items
+            && self.allocation_attempts <= limits.max_allocation_attempts
+    }
+}
+
+/// Transactional reason no universal finite corridor was published.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum MandatorySuffixUniversalFiniteCorridorDeclineReason {
+    /// Suffix-frontier authentication or corridor traversal declined.
+    Analysis(MandatorySuffixDeclineReason),
+    /// The graph is valid but the requested corridor is not pointwise
+    /// universal under this conservative proof.
+    NotUniversal,
+    /// Requested maximum prefix depth exceeds the implementation hard cap.
+    PrefixDepthLimit {
+        /// Requested maximum prefix bytes.
+        needed: usize,
+        /// Hard implementation maximum.
+        limit: usize,
+    },
+    /// Independent corridor accounting failed to close.
+    InternalReceiptInvariant,
+}
+
+/// Completed universal corridor tied to one re-authenticated exact suffix.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MandatorySuffixUniversalFiniteCorridorReport {
+    candidate: MandatorySuffixCandidate,
+    corridor: MandatorySuffixUniversalFiniteCorridor,
+    stats: MandatorySuffixUniversalFiniteCorridorStats,
+}
+
+impl MandatorySuffixUniversalFiniteCorridorReport {
+    /// Exact suffix whose saved pre-suffix frontier the corridor reaches.
+    #[must_use]
+    pub const fn candidate(self) -> MandatorySuffixCandidate {
+        self.candidate
+    }
+
+    /// Pointwise-universal finite prefix corridor.
+    #[must_use]
+    pub const fn corridor(self) -> MandatorySuffixUniversalFiniteCorridor {
+        self.corridor
+    }
+
+    /// Exact independent proof accounting.
+    #[must_use]
+    pub const fn stats(self) -> MandatorySuffixUniversalFiniteCorridorStats {
+        self.stats
+    }
+}
+
+/// Closed universal-corridor refusal with exact completed accounting.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MandatorySuffixUniversalFiniteCorridorDecline {
+    reason: MandatorySuffixUniversalFiniteCorridorDeclineReason,
+    stats: MandatorySuffixUniversalFiniteCorridorStats,
+}
+
+impl MandatorySuffixUniversalFiniteCorridorDecline {
+    /// Why no corridor was published.
+    #[must_use]
+    pub const fn reason(self) -> MandatorySuffixUniversalFiniteCorridorDeclineReason {
+        self.reason
+    }
+
+    /// Exact independent proof accounting.
+    #[must_use]
+    pub const fn stats(self) -> MandatorySuffixUniversalFiniteCorridorStats {
+        self.stats
+    }
+}
+
+/// Transactional result of one independent universal-corridor attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MandatorySuffixUniversalFiniteCorridorAnalysis {
+    /// The exact suffix frontier and every requested prefix width were proved.
+    Complete(MandatorySuffixUniversalFiniteCorridorReport),
+    /// No partial corridor may be consumed.
+    Declined(MandatorySuffixUniversalFiniteCorridorDecline),
+}
+
+impl MandatorySuffixUniversalFiniteCorridorAnalysis {
+    /// Accounting shared by complete and declined outcomes.
+    #[must_use]
+    pub const fn stats(&self) -> MandatorySuffixUniversalFiniteCorridorStats {
+        match self {
+            Self::Complete(report) => report.stats(),
+            Self::Declined(decline) => decline.stats(),
+        }
+    }
+}
+
 impl MandatorySuffixCandidate {
     /// Required bytes in forward haystack order.
     #[must_use]
@@ -385,7 +551,8 @@ pub fn analyze_mandatory_suffix(
     let mut budget = Budget::new(limits);
     let outcome = analyze_mandatory_suffix_inner(raw, &mut budget);
     match outcome {
-        Ok((candidate, stop_reason)) => {
+        Ok(inner) => {
+            let candidate = inner.candidate;
             budget.stats.completed_suffix_layers = candidate.len();
             budget.stats.candidates = 1;
             budget.stats.retained_bytes = candidate.len();
@@ -399,7 +566,7 @@ pub fn analyze_mandatory_suffix(
             }
             MandatorySuffixAnalysis::Complete(MandatorySuffixAnalysisReport {
                 candidate,
-                stop_reason,
+                stop_reason: inner.stop_reason,
                 stats: budget.stats,
             })
         }
@@ -416,6 +583,116 @@ pub fn analyze_mandatory_suffix(
     }
 }
 
+/// Independently re-authenticate an exact mandatory suffix frontier and prove
+/// that every byte string at every requested finite prefix width reaches it.
+///
+/// This analysis has a separate v1 receipt. It never augments or consumes a
+/// completed [`MandatorySuffixAnalysis`] receipt, so callers can first retain
+/// the generic suffix and then spend only otherwise-available optional work
+/// on this stronger certificate. Its work intentionally includes the complete
+/// second suffix/frontier authentication as well as the corridor traversal.
+#[must_use]
+pub fn analyze_mandatory_suffix_universal_finite_corridor(
+    raw: &RawPlan,
+    limits: MandatorySuffixAnalysisLimits,
+    minimum_match_bytes: usize,
+    maximum_match_bytes: usize,
+) -> MandatorySuffixUniversalFiniteCorridorAnalysis {
+    let mut budget = Budget::new(limits);
+    let inner = match analyze_mandatory_suffix_inner(raw, &mut budget) {
+        Ok(inner) => inner,
+        Err(reason) => {
+            return decline_universal_finite_corridor(
+                MandatorySuffixUniversalFiniteCorridorDeclineReason::Analysis(reason),
+                corridor_stats(budget.stats),
+                limits,
+            );
+        }
+    };
+    budget.stats.completed_suffix_layers = inner.candidate.len();
+    budget.stats.candidates = 1;
+    budget.stats.retained_bytes = inner.candidate.len();
+    if let Some(maximum_prefix_bytes) = maximum_match_bytes.checked_sub(inner.candidate.len()) {
+        if maximum_prefix_bytes > MAX_MANDATORY_SUFFIX_UNIVERSAL_CORRIDOR_PREFIX_BYTES {
+            return decline_universal_finite_corridor(
+                MandatorySuffixUniversalFiniteCorridorDeclineReason::PrefixDepthLimit {
+                    needed: maximum_prefix_bytes,
+                    limit: MAX_MANDATORY_SUFFIX_UNIVERSAL_CORRIDOR_PREFIX_BYTES,
+                },
+                corridor_stats(budget.stats),
+                limits,
+            );
+        }
+    }
+    let corridor = match prove_universal_finite_corridor(
+        raw,
+        &inner.frontier,
+        inner.candidate.len(),
+        FiniteCorridorRequest {
+            minimum_match_bytes,
+            maximum_match_bytes,
+        },
+        &mut budget,
+    ) {
+        Ok(Some(corridor)) => corridor,
+        Ok(None) => {
+            return decline_universal_finite_corridor(
+                MandatorySuffixUniversalFiniteCorridorDeclineReason::NotUniversal,
+                corridor_stats(budget.stats),
+                limits,
+            );
+        }
+        Err(reason) => {
+            return decline_universal_finite_corridor(
+                MandatorySuffixUniversalFiniteCorridorDeclineReason::Analysis(reason),
+                corridor_stats(budget.stats),
+                limits,
+            );
+        }
+    };
+    let stats = corridor_stats(budget.stats);
+    if !budget.stats.closes(limits) || !stats.closes(limits) {
+        return decline_universal_finite_corridor(
+            MandatorySuffixUniversalFiniteCorridorDeclineReason::InternalReceiptInvariant,
+            stats,
+            limits,
+        );
+    }
+    MandatorySuffixUniversalFiniteCorridorAnalysis::Complete(
+        MandatorySuffixUniversalFiniteCorridorReport {
+            candidate: inner.candidate,
+            corridor,
+            stats,
+        },
+    )
+}
+
+const fn corridor_stats(
+    stats: MandatorySuffixAnalysisStats,
+) -> MandatorySuffixUniversalFiniteCorridorStats {
+    MandatorySuffixUniversalFiniteCorridorStats {
+        accounting_id: MANDATORY_SUFFIX_UNIVERSAL_FINITE_CORRIDOR_ACCOUNTING_ID,
+        work: stats.work,
+        allocation_items: stats.allocation_items,
+        allocation_attempts: stats.allocation_attempts,
+    }
+}
+
+fn decline_universal_finite_corridor(
+    reason: MandatorySuffixUniversalFiniteCorridorDeclineReason,
+    stats: MandatorySuffixUniversalFiniteCorridorStats,
+    limits: MandatorySuffixAnalysisLimits,
+) -> MandatorySuffixUniversalFiniteCorridorAnalysis {
+    let reason = if stats.closes(limits) {
+        reason
+    } else {
+        MandatorySuffixUniversalFiniteCorridorDeclineReason::InternalReceiptInvariant
+    };
+    MandatorySuffixUniversalFiniteCorridorAnalysis::Declined(
+        MandatorySuffixUniversalFiniteCorridorDecline { reason, stats },
+    )
+}
+
 const fn decline(
     reason: MandatorySuffixDeclineReason,
     stats: MandatorySuffixAnalysisStats,
@@ -423,10 +700,17 @@ const fn decline(
     MandatorySuffixAnalysis::Declined(MandatorySuffixAnalysisDecline { reason, stats })
 }
 
+#[derive(Debug)]
+struct MandatorySuffixInner {
+    candidate: MandatorySuffixCandidate,
+    stop_reason: MandatorySuffixStopReason,
+    frontier: Vec<usize>,
+}
+
 fn analyze_mandatory_suffix_inner(
     raw: &RawPlan,
     budget: &mut Budget,
-) -> Result<(MandatorySuffixCandidate, MandatorySuffixStopReason), MandatorySuffixDeclineReason> {
+) -> Result<MandatorySuffixInner, MandatorySuffixDeclineReason> {
     if budget.limits.max_suffix_bytes == 0
         || budget.limits.max_suffix_bytes > MAX_MANDATORY_SUFFIX_BYTES
     {
@@ -573,19 +857,25 @@ fn analyze_mandatory_suffix_inner(
             if depth == 0 {
                 return Err(MandatorySuffixDeclineReason::NullableLanguage);
             }
-            return Ok((
-                make_candidate(&reverse_bytes, depth, budget)?,
+            return finish_mandatory_suffix_candidate(
+                &reverse_bytes,
+                depth,
                 MandatorySuffixStopReason::StartBoundary,
-            ));
+                frontier,
+                budget,
+            );
         }
         if ambiguous {
             if depth == 0 {
                 return Err(MandatorySuffixDeclineReason::AmbiguousSuffixLayer);
             }
-            return Ok((
-                make_candidate(&reverse_bytes, depth, budget)?,
+            return finish_mandatory_suffix_candidate(
+                &reverse_bytes,
+                depth,
                 MandatorySuffixStopReason::AmbiguousLayer,
-            ));
+                frontier,
+                budget,
+            );
         }
         let byte = layer_byte.ok_or(MandatorySuffixDeclineReason::InternalInvariant {
             detail: "reachable reverse frontier had neither start nor consuming predecessor",
@@ -600,10 +890,272 @@ fn analyze_mandatory_suffix_inner(
         core::mem::swap(&mut frontier, &mut next);
     }
 
-    Ok((
-        make_candidate(&reverse_bytes, budget.limits.max_suffix_bytes, budget)?,
+    finish_mandatory_suffix_candidate(
+        &reverse_bytes,
+        budget.limits.max_suffix_bytes,
         MandatorySuffixStopReason::MaximumBytes,
-    ))
+        frontier,
+        budget,
+    )
+}
+
+fn finish_mandatory_suffix_candidate(
+    reverse_bytes: &[u8; MAX_MANDATORY_SUFFIX_BYTES],
+    len: usize,
+    stop_reason: MandatorySuffixStopReason,
+    frontier: Vec<usize>,
+    budget: &mut Budget,
+) -> Result<MandatorySuffixInner, MandatorySuffixDeclineReason> {
+    let candidate = make_candidate(reverse_bytes, len, budget)?;
+    Ok(MandatorySuffixInner {
+        candidate,
+        stop_reason,
+        frontier,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FiniteCorridorRequest {
+    minimum_match_bytes: usize,
+    maximum_match_bytes: usize,
+}
+
+/// Prove a deliberately strong, path-stable universal corridor.
+///
+/// Every state retained in `current` is reachable after every possible byte
+/// string of the current width. Epsilon closure preserves that invariant. A
+/// consuming state advances it only when all 256 bytes go to one common
+/// target. Reaching the exact reverse-analysis frontier therefore proves that
+/// every string of that width can begin the retained suffix. Treating frontier
+/// states as terminal prevents suffix bytes from being mistaken for prefix
+/// bytes. Requiring every requested width rejects finite languages with holes.
+/// Equivalent non-canonical NFAs that distribute one full alphabet across
+/// multiple consuming states conservatively decline rather than weakening the
+/// pointwise invariant.
+fn prove_universal_finite_corridor(
+    raw: &RawPlan,
+    frontier: &[usize],
+    suffix_bytes: usize,
+    request: FiniteCorridorRequest,
+    budget: &mut Budget,
+) -> Result<Option<MandatorySuffixUniversalFiniteCorridor>, MandatorySuffixDeclineReason> {
+    if budget.stats.assertion_edges != 0
+        || request.minimum_match_bytes == 0
+        || request.minimum_match_bytes > request.maximum_match_bytes
+        || suffix_bytes > request.minimum_match_bytes
+    {
+        return Ok(None);
+    }
+    let minimum_prefix_bytes = request.minimum_match_bytes - suffix_bytes;
+    let maximum_prefix_bytes = request.maximum_match_bytes.checked_sub(suffix_bytes).ok_or(
+        MandatorySuffixDeclineReason::ArithmeticOverflow {
+            computation: "mandatory-suffix universal corridor maximum prefix",
+        },
+    )?;
+    if maximum_prefix_bytes > MAX_MANDATORY_SUFFIX_UNIVERSAL_CORRIDOR_PREFIX_BYTES {
+        return Ok(None);
+    }
+    let Some(layer_count) = maximum_prefix_bytes.checked_add(1) else {
+        return Ok(None);
+    };
+    let Ok(minimum_layer_work) = u64::try_from(layer_count) else {
+        return Ok(None);
+    };
+    let remaining_work = budget.limits.max_work.saturating_sub(budget.stats.work);
+    if minimum_layer_work > remaining_work {
+        let needed = budget.stats.work.checked_add(minimum_layer_work).ok_or(
+            MandatorySuffixDeclineReason::ArithmeticOverflow {
+                computation: "mandatory-suffix universal corridor minimum layer work",
+            },
+        )?;
+        return Err(MandatorySuffixDeclineReason::Resource {
+            resource: MandatorySuffixResource::Work,
+            needed,
+            limit: budget.limits.max_work,
+        });
+    }
+
+    let states = raw.roles.len();
+    let mut frontier_members = budget.filled(
+        states,
+        0_u8,
+        "mandatory-suffix universal corridor frontier membership",
+    )?;
+    for &state in frontier {
+        budget.charge(1)?;
+        let member = frontier_members.get_mut(state).ok_or(
+            MandatorySuffixDeclineReason::InternalInvariant {
+                detail: "mandatory-suffix frontier escaped the validated state table",
+            },
+        )?;
+        *member = 1;
+    }
+
+    let mut current = budget.empty(states, "mandatory-suffix universal corridor current")?;
+    let start = to_usize(raw.start, "mandatory-suffix universal corridor start")?;
+    budget.push_bounded(
+        &mut current,
+        start,
+        states,
+        "mandatory-suffix universal corridor root",
+    )?;
+    let mut next = budget.empty(states, "mandatory-suffix universal corridor next")?;
+    let mut closure_stack =
+        budget.empty(states, "mandatory-suffix universal corridor closure stack")?;
+    let mut closure_seen = budget.filled(
+        states,
+        0_u8,
+        "mandatory-suffix universal corridor closure membership",
+    )?;
+    let mut next_seen = budget.filled(
+        states,
+        0_u8,
+        "mandatory-suffix universal corridor next membership",
+    )?;
+
+    for width in 0..=maximum_prefix_bytes {
+        budget.charge(1)?;
+        closure_stack.clear();
+        next.clear();
+        let reset_work = to_u64(
+            states
+                .checked_mul(2)
+                .ok_or(MandatorySuffixDeclineReason::ArithmeticOverflow {
+                    computation: "mandatory-suffix universal corridor membership reset",
+                })?,
+            "mandatory-suffix universal corridor reset work",
+        )?;
+        budget.charge(reset_work)?;
+        closure_seen.fill(0);
+        next_seen.fill(0);
+        for &state in &current {
+            if closure_seen[state] == 0 {
+                closure_seen[state] = 1;
+                budget.push_bounded(
+                    &mut closure_stack,
+                    state,
+                    states,
+                    "mandatory-suffix universal corridor closure seeds",
+                )?;
+            }
+        }
+
+        let mut reached_frontier = false;
+        while let Some(state) = closure_stack.pop() {
+            budget.charge(1)?;
+            if frontier_members[state] != 0 {
+                reached_frontier = true;
+                continue;
+            }
+            match raw.roles[state] {
+                StateRole::Split => {
+                    for edge in state_edges(raw, state)? {
+                        budget.charge(1)?;
+                        if raw.edge_kinds[edge] != EdgeKind::Epsilon {
+                            return Err(MandatorySuffixDeclineReason::InternalInvariant {
+                                detail: "assertion-free universal corridor retained a non-epsilon split",
+                            });
+                        }
+                        let target = to_usize(
+                            raw.edge_targets[edge],
+                            "mandatory-suffix universal corridor epsilon target",
+                        )?;
+                        if closure_seen[target] == 0 {
+                            closure_seen[target] = 1;
+                            budget.push_bounded(
+                                &mut closure_stack,
+                                target,
+                                states,
+                                "mandatory-suffix universal corridor epsilon closure",
+                            )?;
+                        }
+                    }
+                }
+                StateRole::Consume => {
+                    if let Some(target) = universal_consume_target(raw, state, budget)? {
+                        if next_seen[target] == 0 {
+                            next_seen[target] = 1;
+                            budget.push_bounded(
+                                &mut next,
+                                target,
+                                states,
+                                "mandatory-suffix universal corridor byte target",
+                            )?;
+                        }
+                    }
+                }
+                StateRole::Accept => {}
+            }
+        }
+
+        if width >= minimum_prefix_bytes && !reached_frontier {
+            return Ok(None);
+        }
+        if width == maximum_prefix_bytes {
+            return Ok(Some(MandatorySuffixUniversalFiniteCorridor {
+                minimum_prefix_bytes,
+                maximum_prefix_bytes,
+            }));
+        }
+        core::mem::swap(&mut current, &mut next);
+    }
+
+    Err(MandatorySuffixDeclineReason::InternalInvariant {
+        detail: "universal finite corridor escaped its inclusive width loop",
+    })
+}
+
+fn universal_consume_target(
+    raw: &RawPlan,
+    state: usize,
+    budget: &mut Budget,
+) -> Result<Option<usize>, MandatorySuffixDeclineReason> {
+    let mut target = None;
+    let mut coverage = [0_u64; 4];
+    for edge in state_edges(raw, state)? {
+        budget.charge(1)?;
+        if raw.edge_kinds[edge] != EdgeKind::ByteRange {
+            return Err(MandatorySuffixDeclineReason::InternalInvariant {
+                detail: "validated universal corridor consume retained a non-byte edge",
+            });
+        }
+        let edge_target = raw.edge_targets[edge];
+        if target.is_some_and(|retained| retained != edge_target) {
+            return Ok(None);
+        }
+        target = Some(edge_target);
+        insert_universal_byte_range(
+            &mut coverage,
+            raw.byte_starts[edge],
+            raw.byte_ends[edge],
+        );
+    }
+    if coverage != [u64::MAX; 4] {
+        return Ok(None);
+    }
+    target
+        .map(|target| to_usize(target, "mandatory-suffix universal corridor byte target"))
+        .transpose()
+}
+
+fn insert_universal_byte_range(words: &mut [u64; 4], start: u8, end: u8) {
+    let first_word = usize::from(start / 64);
+    let last_word = usize::from(end / 64);
+    for word in first_word..=last_word {
+        let lower = if word == first_word {
+            u32::from(start % 64)
+        } else {
+            0
+        };
+        let upper = if word == last_word {
+            u32::from(end % 64)
+        } else {
+            63
+        };
+        let lower_mask = u64::MAX << lower;
+        let upper_mask = u64::MAX >> (63 - upper);
+        words[word] |= lower_mask & upper_mask;
+    }
 }
 
 fn make_candidate(
@@ -1185,6 +1737,44 @@ mod tests {
         }
     }
 
+    fn complete_with_corridor(
+        plan: &RawPlan,
+        minimum_match_bytes: usize,
+        maximum_match_bytes: usize,
+        limits: MandatorySuffixAnalysisLimits,
+    ) -> MandatorySuffixUniversalFiniteCorridorReport {
+        match analyze_mandatory_suffix_universal_finite_corridor(
+            plan,
+            limits,
+            minimum_match_bytes,
+            maximum_match_bytes,
+        ) {
+            MandatorySuffixUniversalFiniteCorridorAnalysis::Complete(report) => report,
+            MandatorySuffixUniversalFiniteCorridorAnalysis::Declined(decline) => {
+                panic!("unexpected corridor-analysis decline: {:?}", decline.reason())
+            }
+        }
+    }
+
+    fn declined_corridor(
+        plan: &RawPlan,
+        minimum_match_bytes: usize,
+        maximum_match_bytes: usize,
+        limits: MandatorySuffixAnalysisLimits,
+    ) -> MandatorySuffixUniversalFiniteCorridorDecline {
+        match analyze_mandatory_suffix_universal_finite_corridor(
+            plan,
+            limits,
+            minimum_match_bytes,
+            maximum_match_bytes,
+        ) {
+            MandatorySuffixUniversalFiniteCorridorAnalysis::Complete(report) => {
+                panic!("unexpected universal corridor: {:?}", report.corridor())
+            }
+            MandatorySuffixUniversalFiniteCorridorAnalysis::Declined(decline) => decline,
+        }
+    }
+
     fn declined(plan: &RawPlan) -> MandatorySuffixAnalysisDecline {
         match analyze_mandatory_suffix(plan, MandatorySuffixAnalysisLimits::default()) {
             MandatorySuffixAnalysis::Complete(report) => {
@@ -1217,6 +1807,415 @@ mod tests {
                 .stats()
                 .closes(MandatorySuffixAnalysisLimits::default())
         );
+        assert_eq!(
+            report.stats().accounting_id(),
+            MANDATORY_SUFFIX_ACCOUNTING_ID,
+        );
+    }
+
+    #[test]
+    fn full_byte_prefix_corridor_is_proved_at_every_requested_width() {
+        let full = |target| (target, EdgeKind::ByteRange, 0, u8::MAX);
+        // Every byte string of length one, two, or three reaches state 4,
+        // which is the retained entry frontier for the exact suffix `Z`.
+        let plan = raw(
+            0,
+            &[
+                StateRole::Consume,
+                StateRole::Split,
+                StateRole::Consume,
+                StateRole::Split,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Accept,
+            ],
+            &[
+                &[full(1)],
+                &[epsilon(2), epsilon(4)],
+                &[full(3)],
+                &[epsilon(5), epsilon(4)],
+                &[byte(6, b'Z')],
+                &[full(4)],
+                &[],
+            ],
+        );
+        let report = complete_with_corridor(
+            &plan,
+            2,
+            4,
+            MandatorySuffixAnalysisLimits::default(),
+        );
+        assert_eq!(report.candidate().as_bytes(), b"Z");
+        let corridor = report.corridor();
+        assert_eq!(corridor.minimum_prefix_bytes(), 1);
+        assert_eq!(corridor.maximum_prefix_bytes(), 3);
+        assert!(
+            report
+                .stats()
+                .closes(MandatorySuffixAnalysisLimits::default())
+        );
+        assert_eq!(
+            report.stats().accounting_id(),
+            MANDATORY_SUFFIX_UNIVERSAL_FINITE_CORRIDOR_ACCOUNTING_ID,
+        );
+
+        let fragmented = raw(
+            0,
+            &[StateRole::Consume, StateRole::Consume, StateRole::Accept],
+            &[
+                &[
+                    (1, EdgeKind::ByteRange, 0, 63),
+                    (1, EdgeKind::ByteRange, 64, 127),
+                    (1, EdgeKind::ByteRange, 128, 191),
+                    (1, EdgeKind::ByteRange, 192, u8::MAX),
+                ],
+                &[byte(2, b'Z')],
+                &[],
+            ],
+        );
+        let fragmented = complete_with_corridor(
+            &fragmented,
+            2,
+            2,
+            MandatorySuffixAnalysisLimits::default(),
+        );
+        assert_eq!(fragmented.candidate().as_bytes(), b"Z");
+        assert_eq!(
+            fragmented.corridor(),
+            MandatorySuffixUniversalFiniteCorridor {
+                minimum_prefix_bytes: 1,
+                maximum_prefix_bytes: 1,
+            },
+            "same-target byte ranges may jointly cover the full domain",
+        );
+
+        let nullable_prefix = raw(
+            0,
+            &[
+                StateRole::Split,
+                StateRole::Consume,
+                StateRole::Split,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Accept,
+            ],
+            &[
+                &[epsilon(1), epsilon(4)],
+                &[full(2)],
+                &[epsilon(3), epsilon(4)],
+                &[full(4)],
+                &[byte(5, b'Z')],
+                &[],
+            ],
+        );
+        let nullable_prefix = complete_with_corridor(
+            &nullable_prefix,
+            1,
+            3,
+            MandatorySuffixAnalysisLimits::default(),
+        );
+        assert_eq!(nullable_prefix.candidate().as_bytes(), b"Z");
+        let corridor = nullable_prefix.corridor();
+        assert_eq!(corridor.minimum_prefix_bytes(), 0);
+        assert_eq!(corridor.maximum_prefix_bytes(), 2);
+    }
+
+    #[test]
+    fn universal_corridor_rejects_length_holes_and_cross_state_byte_unions() {
+        let full = |target| (target, EdgeKind::ByteRange, 0, u8::MAX);
+        let holes = raw(
+            0,
+            &[
+                StateRole::Split,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Accept,
+            ],
+            &[
+                &[epsilon(1), epsilon(2)],
+                &[full(5)],
+                &[full(3)],
+                &[full(4)],
+                &[full(5)],
+                &[byte(6, b'Z')],
+                &[],
+            ],
+        );
+        assert_eq!(
+            complete(&holes, MandatorySuffixAnalysisLimits::default())
+                .candidate()
+                .as_bytes(),
+            b"Z",
+        );
+        let holes = declined_corridor(
+            &holes,
+            2,
+            4,
+            MandatorySuffixAnalysisLimits::default(),
+        );
+        assert_eq!(
+            holes.reason(),
+            MandatorySuffixUniversalFiniteCorridorDeclineReason::NotUniversal,
+        );
+
+        // The two sources jointly cover 256 bytes, but neither source is
+        // pointwise universal. Unioning their ranges would lose correlation
+        // across successive bytes and would be unsound.
+        let correlated_halves = raw(
+            0,
+            &[
+                StateRole::Split,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Accept,
+            ],
+            &[
+                &[epsilon(1), epsilon(3)],
+                &[(2, EdgeKind::ByteRange, 0, 0x7f)],
+                &[(5, EdgeKind::ByteRange, 0, 0x7f)],
+                &[(4, EdgeKind::ByteRange, 0x80, u8::MAX)],
+                &[(5, EdgeKind::ByteRange, 0x80, u8::MAX)],
+                &[byte(6, b'Z')],
+                &[],
+            ],
+        );
+        assert_eq!(
+            complete(
+                &correlated_halves,
+                MandatorySuffixAnalysisLimits::default(),
+            )
+            .candidate()
+            .as_bytes(),
+            b"Z",
+        );
+        let correlated_halves = declined_corridor(
+            &correlated_halves,
+            3,
+            3,
+            MandatorySuffixAnalysisLimits::default(),
+        );
+        assert_eq!(
+            correlated_halves.reason(),
+            MandatorySuffixUniversalFiniteCorridorDeclineReason::NotUniversal,
+        );
+
+        let differing_targets = raw(
+            0,
+            &[
+                StateRole::Consume,
+                StateRole::Split,
+                StateRole::Split,
+                StateRole::Consume,
+                StateRole::Accept,
+            ],
+            &[
+                &[
+                    (1, EdgeKind::ByteRange, 0, 0x7f),
+                    (2, EdgeKind::ByteRange, 0x80, u8::MAX),
+                ],
+                &[epsilon(3)],
+                &[epsilon(3)],
+                &[byte(4, b'Z')],
+                &[],
+            ],
+        );
+        assert_eq!(
+            complete(
+                &differing_targets,
+                MandatorySuffixAnalysisLimits::default(),
+            )
+            .candidate()
+            .as_bytes(),
+            b"Z",
+        );
+        let differing_targets = declined_corridor(
+            &differing_targets,
+            2,
+            2,
+            MandatorySuffixAnalysisLimits::default(),
+        );
+        assert_eq!(
+            differing_targets.reason(),
+            MandatorySuffixUniversalFiniteCorridorDeclineReason::NotUniversal,
+            "full coverage split across distinct targets conservatively declines",
+        );
+    }
+
+    #[test]
+    fn universal_corridor_refuses_narrow_ranges_and_assertions() {
+        let narrow = raw(
+            0,
+            &[StateRole::Consume, StateRole::Consume, StateRole::Accept],
+            &[
+                &[(1, EdgeKind::ByteRange, 0, u8::MAX - 1)],
+                &[byte(2, b'Z')],
+                &[],
+            ],
+        );
+        assert_eq!(
+            complete(&narrow, MandatorySuffixAnalysisLimits::default())
+                .candidate()
+                .as_bytes(),
+            b"Z",
+        );
+        let narrow = declined_corridor(
+            &narrow,
+            2,
+            2,
+            MandatorySuffixAnalysisLimits::default(),
+        );
+        assert_eq!(
+            narrow.reason(),
+            MandatorySuffixUniversalFiniteCorridorDeclineReason::NotUniversal,
+        );
+
+        let asserted = raw(
+            0,
+            &[
+                StateRole::Split,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Accept,
+            ],
+            &[
+                &[assertion(1, EdgeKind::AssertHaystackStart)],
+                &[(2, EdgeKind::ByteRange, 0, u8::MAX)],
+                &[byte(3, b'Z')],
+                &[],
+            ],
+        );
+        let asserted_suffix = complete(&asserted, MandatorySuffixAnalysisLimits::default());
+        assert_eq!(asserted_suffix.candidate().as_bytes(), b"Z");
+        assert_eq!(asserted_suffix.stats().assertion_edges(), 1);
+        let asserted = declined_corridor(
+            &asserted,
+            2,
+            2,
+            MandatorySuffixAnalysisLimits::default(),
+        );
+        assert_eq!(
+            asserted.reason(),
+            MandatorySuffixUniversalFiniteCorridorDeclineReason::NotUniversal,
+        );
+    }
+
+    #[test]
+    fn corridor_resource_refusal_preserves_the_generic_suffix() {
+        let plan = raw(
+            0,
+            &[StateRole::Consume, StateRole::Consume, StateRole::Accept],
+            &[
+                &[(1, EdgeKind::ByteRange, 0, u8::MAX)],
+                &[byte(2, b'Z')],
+                &[],
+            ],
+        );
+        let generic = complete(&plan, MandatorySuffixAnalysisLimits::default());
+        let limits = MandatorySuffixAnalysisLimits {
+            max_work: generic.stats().work(),
+            ..MandatorySuffixAnalysisLimits::default()
+        };
+        let refused = declined_corridor(&plan, 2, 2, limits);
+        assert!(matches!(
+            refused.reason(),
+            MandatorySuffixUniversalFiniteCorridorDeclineReason::Analysis(
+                MandatorySuffixDeclineReason::Resource {
+                    resource: MandatorySuffixResource::Work,
+                    ..
+                }
+            )
+        ));
+        assert!(refused.stats().closes(limits));
+
+        let depth_refused = declined_corridor(
+            &plan,
+            2,
+            MAX_MANDATORY_SUFFIX_UNIVERSAL_CORRIDOR_PREFIX_BYTES + 2,
+            MandatorySuffixAnalysisLimits::default(),
+        );
+        assert_eq!(
+            depth_refused.reason(),
+            MandatorySuffixUniversalFiniteCorridorDeclineReason::PrefixDepthLimit {
+                needed: MAX_MANDATORY_SUFFIX_UNIVERSAL_CORRIDOR_PREFIX_BYTES + 1,
+                limit: MAX_MANDATORY_SUFFIX_UNIVERSAL_CORRIDOR_PREFIX_BYTES,
+            },
+        );
+    }
+
+    #[test]
+    fn universal_corridor_exact_and_one_below_resource_receipts_close() {
+        let plan = raw(
+            0,
+            &[StateRole::Consume, StateRole::Consume, StateRole::Accept],
+            &[
+                &[(1, EdgeKind::ByteRange, 0, u8::MAX)],
+                &[byte(2, b'Z')],
+                &[],
+            ],
+        );
+        let generous = MandatorySuffixAnalysisLimits::default();
+        let report = complete_with_corridor(&plan, 2, 2, generous);
+        let stats = report.stats();
+        assert!(stats.closes(generous));
+        assert_ne!(stats.work(), 0);
+        assert_ne!(stats.allocation_items(), 0);
+        assert_ne!(stats.allocation_attempts(), 0);
+
+        let exact_limits = MandatorySuffixAnalysisLimits {
+            max_work: stats.work(),
+            max_allocation_items: stats.allocation_items(),
+            max_allocation_attempts: stats.allocation_attempts(),
+            ..generous
+        };
+        let exact = complete_with_corridor(&plan, 2, 2, exact_limits);
+        assert_eq!(exact.candidate().as_bytes(), b"Z");
+        assert_eq!(exact.corridor().minimum_prefix_bytes(), 1);
+        assert_eq!(exact.corridor().maximum_prefix_bytes(), 1);
+        assert!(exact.stats().closes(exact_limits));
+
+        let one_below = [
+            (
+                MandatorySuffixAnalysisLimits {
+                    max_work: stats.work() - 1,
+                    ..generous
+                },
+                MandatorySuffixResource::Work,
+            ),
+            (
+                MandatorySuffixAnalysisLimits {
+                    max_allocation_items: stats.allocation_items() - 1,
+                    ..generous
+                },
+                MandatorySuffixResource::AllocationItems,
+            ),
+            (
+                MandatorySuffixAnalysisLimits {
+                    max_allocation_attempts: stats.allocation_attempts() - 1,
+                    ..generous
+                },
+                MandatorySuffixResource::AllocationAttempts,
+            ),
+        ];
+        for (limits, expected_resource) in one_below {
+            let MandatorySuffixUniversalFiniteCorridorAnalysis::Declined(decline) =
+                analyze_mandatory_suffix_universal_finite_corridor(&plan, limits, 2, 2)
+            else {
+                panic!("one-below universal-corridor ceiling unexpectedly completed")
+            };
+            assert!(matches!(
+                decline.reason(),
+                MandatorySuffixUniversalFiniteCorridorDeclineReason::Analysis(
+                    MandatorySuffixDeclineReason::Resource { resource, .. }
+                ) if resource == expected_resource
+            ));
+            assert!(decline.stats().closes(limits));
+        }
     }
 
     #[test]
