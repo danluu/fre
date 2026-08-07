@@ -13573,8 +13573,11 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     const SCANNER_FREE_FRAME_BYTES: u8 = 104;
     const ROOT_SCANNER_FRAME_BYTES: u8 = 120;
     const ROOT_SCANNER_SAVED_R12_OFFSET: u8 = 104;
+    const ROOT_SCANNER_REPRESENTATION_OFFSET: u8 = 112;
+    const ROOT_SCANNER_OFFSET_ROWS: u8 = 1;
+    const ROOT_SCANNER_COMPACT_V3: u8 = 2;
     let tracks_root_scanner_hits = allow_direct_hole_continuation && root_plan.is_some();
-    let frame_bytes = if tracks_root_scanner_hits {
+    let frame_bytes = if root_plan.is_some() {
         ROOT_SCANNER_FRAME_BYTES
     } else {
         SCANNER_FREE_FRAME_BYTES
@@ -13661,6 +13664,8 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     }
     let scan = assembler.label()?;
     let table_scan = assembler.label()?;
+    let pointer_scan = assembler.label()?;
+    let pointer_table_scan = assembler.label()?;
     let root_setup = root_plan.map(|_| assembler.label()).transpose()?;
     let root_candidate = root_plan.map(|_| assembler.label()).transpose()?;
     let root_vector = root_plan.map(|_| assembler.label()).transpose()?;
@@ -13675,6 +13680,9 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
         .transpose()?;
     let native_continue = allow_direct_hole_continuation
         .then(|| assembler.label())
+        .transpose()?;
+    let pointer_continue = native_continue
+        .map(|_| assembler.label())
         .transpose()?;
     let call_preflight = assembler.label()?;
     let framed_fallback = assembler.label()?;
@@ -13708,7 +13716,8 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     assembler.branch(&[0x0f, 0x82], short_fallback)?;
     // Entry RSP is 8 modulo 16. The frame aligns calls, retains all six
     // public arguments, and reserves the four-word private preflight record.
-    // Root-scanner entries also spill one callee-saved hit-counter register.
+    // Root-scanner entries also retain one representation tag/pointer and,
+    // when continuation accounting is active, one callee-saved hit counter.
     assembler.instruction(&[0x48, 0x83, 0xec, frame_bytes])?;
     assembler.instruction(&[0x48, 0x89, 0x7c, 0x24, 0x10])?;
     assembler.instruction(&[0x48, 0x89, 0x74, 0x24, 0x18])?;
@@ -13799,6 +13808,23 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     assembler.instruction(&[0xc3])?;
 
     assembler.bind(v3_enter)?;
+    if root_plan.is_some() {
+        // Freeze the authenticated representation for this invocation. Root
+        // scanners may revisit their candidate edge many times; they must not
+        // reread the public header merely to rediscover the already selected
+        // compact machine.
+        assembler.instruction(&[
+            0x48,
+            0xc7,
+            0x44,
+            0x24,
+            ROOT_SCANNER_REPRESENTATION_OFFSET,
+            ROOT_SCANNER_COMPACT_V3,
+            0,
+            0,
+            0,
+        ])?;
+    }
     assembler.instruction(&[
         0x49,
         0x8b,
@@ -13964,11 +13990,13 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
         assembler.branch(&[0x0f, 0x85], framed_fallback)?;
     }
     if root_plan.is_some() {
+        // Cache the overlay count only long enough to select one invocation
+        // representation. The nonzero path retains its ordered ownership
+        // checks; zero-overlay rows enter a pointer-row loop below.
+        assembler.instruction(&[0x41, 0x8b, 0x43, NATIVE_ROWS_LOOP_COUNT as u8])?;
         assembler.instruction(&[
-            0x41,
             0x83,
-            0x7b,
-            NATIVE_ROWS_LOOP_COUNT as u8,
+            0xf8,
             u8::try_from(NATIVE_ROWS_LOOP_ROW_CAPACITY)
                 .map_err(|_| ObjectError::ArithmeticOverflow("x86 dynamic loop capacity"))?,
         ])?;
@@ -13989,10 +14017,42 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x40])?; // position
     assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x48])?; // exact end
     if let Some(root_setup) = root_setup {
+        let pointer_enter = assembler.label()?;
+        assembler.instruction(&[0x85, 0xc0])?;
+        assembler.branch(&[0x0f, 0x84], pointer_enter)?;
+        assembler.instruction(&[
+            0x48,
+            0xc7,
+            0x44,
+            0x24,
+            ROOT_SCANNER_REPRESENTATION_OFFSET,
+            ROOT_SCANNER_OFFSET_ROWS,
+            0,
+            0,
+            0,
+        ])?;
         assembler.branch(&[0xe9], root_setup)?;
-    } else if output != OutputContract::Exists {
-        // A non-nullable admitted descriptor has no pending endpoint yet.
-        assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x60, 0, 0, 0, 0])?;
+        assembler.bind(pointer_enter)?;
+        // R8 becomes the exact current-row pointer. RAX mirrors the initial
+        // pointer while native transitions run and the frame slot preserves it
+        // across every scalar/SIMD root scan.
+        assembler.instruction(&[0x4e, 0x8d, 0x04, 0x86])?;
+        assembler.instruction(&[0x4c, 0x89, 0xc0])?;
+        assembler.instruction(&[
+            0x48,
+            0x89,
+            0x44,
+            0x24,
+            ROOT_SCANNER_REPRESENTATION_OFFSET,
+        ])?;
+        assembler.branch(&[0xe9], root_setup)?;
+    } else {
+        assembler.instruction(&[0x4e, 0x8d, 0x04, 0x86])?;
+        if output != OutputContract::Exists {
+            // A non-nullable admitted descriptor has no pending endpoint yet.
+            assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x60, 0, 0, 0, 0])?;
+        }
+        assembler.branch(&[0xe9], pointer_scan)?;
     }
 
     if let Some(root_setup) = root_setup {
@@ -14088,21 +14148,60 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
         assembler.bind(loop_rows_checked)?;
     }
 
+    assembler.bind(pointer_scan)?;
+    assembler.instruction(&[0x48, 0x39, 0xca])?;
+    assembler.branch(
+        &[0x0f, 0x83],
+        native_complete.unwrap_or(native_no_match),
+    )?;
+    if root_plan.is_some() {
+        // The zero-overlay representation compares two authenticated row
+        // pointers. No descriptor field or ownership count is read per byte.
+        assembler.instruction(&[0x49, 0x39, 0xc0])?; // cmp r8, rax
+        let root_vector = root_vector.ok_or(ObjectError::InvalidModule(
+            "x86 pointer-row root vector label is absent",
+        ))?;
+        if output == OutputContract::Exists {
+            assembler.branch(&[0x0f, 0x84], root_vector)?;
+        } else {
+            let non_root = assembler.label()?;
+            assembler.branch(&[0x0f, 0x85], non_root)?;
+            assembler.instruction(&[0x48, 0x83, 0x7c, 0x24, 0x60, 0])?;
+            assembler.branch(&[0x0f, 0x85], pointer_table_scan)?;
+            assembler.branch(&[0xe9], root_vector)?;
+            assembler.bind(non_root)?;
+        }
+    }
+    assembler.branch(&[0xe9], pointer_table_scan)?;
+
     if let Some(root_candidate) = root_candidate {
-        let v2_candidate = assembler.label()?;
+        let offset_candidate = assembler.label()?;
+        let v3_candidate = assembler.label()?;
         assembler.bind(root_candidate)?;
-        assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, 0x10])?;
-        let mut compare_v3 = vec![
-            0x81,
-            0x78,
-            u8::try_from(FROZEN_PREPARED_HEADER_V1_FLAGS_OFFSET)
-                .map_err(|_| ObjectError::ArithmeticOverflow("x86 V3 candidate flag"))?,
-        ];
-        compare_v3.extend_from_slice(
-            &FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3.to_le_bytes(),
-        );
-        assembler.instruction(&compare_v3)?;
-        assembler.branch(&[0x0f, 0x85], v2_candidate)?;
+        assembler.instruction(&[
+            0x48,
+            0x8b,
+            0x44,
+            0x24,
+            ROOT_SCANNER_REPRESENTATION_OFFSET,
+        ])?;
+        assembler.instruction(&[0x48, 0x83, 0xf8, ROOT_SCANNER_COMPACT_V3])?;
+        assembler.branch(&[0x0f, 0x84], v3_candidate)?;
+        if tracks_root_scanner_hits {
+            assembler.instruction(&[0x49, 0xff, 0xc4])?; // inc r12
+        }
+        assembler.instruction(&[0x48, 0x83, 0xf8, ROOT_SCANNER_OFFSET_ROWS])?;
+        assembler.branch(&[0x0f, 0x84], offset_candidate)?;
+        // Every other tag is the authenticated, naturally aligned initial-row
+        // pointer installed before the first scanner dispatch.
+        assembler.instruction(&[0x49, 0x89, 0xc0])?;
+        assembler.branch(&[0xe9], pointer_table_scan)?;
+
+        assembler.bind(offset_candidate)?;
+        assembler.instruction(&[0x41, 0x8b, 0x43, NATIVE_ROWS_LOOP_COUNT as u8])?;
+        assembler.branch(&[0xe9], table_scan)?;
+
+        assembler.bind(v3_candidate)?;
         assembler.instruction(&[
             0x49,
             0x8b,
@@ -14130,15 +14229,6 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
                 .map_err(|_| ObjectError::ArithmeticOverflow("x86 V3 candidate shift"))?,
         ])?;
         assembler.branch(&[0xe9], v3_dispatch)?;
-
-        assembler.bind(v2_candidate)?;
-        if tracks_root_scanner_hits {
-            // Complete compact V3 rows have no unpublished cells, so only
-            // V2/mutable candidates need continuation accounting.
-            assembler.instruction(&[0x49, 0xff, 0xc4])?; // inc r12
-        }
-        assembler.instruction(&[0x41, 0x8b, 0x43, NATIVE_ROWS_LOOP_COUNT as u8])?;
-        assembler.branch(&[0xe9], table_scan)?;
     }
 
     assembler.bind(table_scan)?;
@@ -14171,6 +14261,47 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     assembler.instruction(&[0x41, 0xff, 0xc8])?;
     assembler.branch(&[0xe9], scan)?;
 
+    assembler.bind(pointer_table_scan)?;
+    assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
+    assembler.instruction(&[0x47, 0x0f, 0xb6, 0x14, 0x11])?;
+    // R8 is the current row itself, so the class indexes the cell directly.
+    assembler.instruction(&[0x47, 0x8b, 0x14, 0x90])?;
+    assembler.instruction(&[0x41, 0x83, 0xfa, 0xff])?; // cmp r10d, -1
+    assembler.branch(
+        &[0x0f, 0x84],
+        pointer_continue.unwrap_or(framed_fallback),
+    )?;
+    assembler.instruction(&[0x48, 0xff, 0xc2])?;
+    assembler.instruction(&[0x45, 0x85, 0xd2])?;
+    if output == OutputContract::Exists {
+        assembler.branch(&[0x0f, 0x88], native_match)?;
+    } else {
+        let not_accepting = assembler.label()?;
+        assembler.branch(&[0x0f, 0x89], not_accepting)?;
+        assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x60])?;
+        assembler.bind(not_accepting)?;
+    }
+    assembler.instruction(&[0x41, 0x81, 0xe2, 0xff, 0xff, 0xff, 0x1f])?;
+    assembler.instruction(&[0x45, 0x85, 0xd2])?;
+    assembler.branch(
+        &[0x0f, 0x84],
+        native_complete.unwrap_or(native_no_match),
+    )?;
+    // The one-based token folds token-to-offset and row-base formation into
+    // one LEA. There is no row-plus-class ADD and no MOV/DEC state update.
+    assembler.instruction(&[0x4e, 0x8d, 0x44, 0x96, 0xfc])?;
+    assembler.branch(&[0xe9], pointer_scan)?;
+
+    if let (Some(pointer_continue), Some(native_continue)) =
+        (pointer_continue, native_continue)
+    {
+        assembler.bind(pointer_continue)?;
+        // Continuation's private ABI names the zero-based cell-row offset, not
+        // a process pointer. Convert only on the cold unpublished-cell edge.
+        assembler.instruction(&[0x49, 0x29, 0xf0])?; // current -= rows
+        assembler.instruction(&[0x49, 0xc1, 0xe8, 0x02])?; // bytes -> cells
+        assembler.branch(&[0xe9], native_continue)?;
+    }
     if let (Some(X86DynamicRootPlan::Range(filter)), Some(kind)) = (root_plan, filter_kind) {
         let vector = root_vector.ok_or(ObjectError::InvalidModule(
             "x86 dynamic root vector label is absent",
@@ -21500,9 +21631,12 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
 ) -> Result<NativeDynamicRowsEmission, ObjectError> {
     const SCANNER_FREE_FRAME_BYTES: u16 = 96;
     const ROOT_SCANNER_FRAME_BYTES: u16 = 112;
+    const ROOT_SCANNER_REPRESENTATION_OFFSET: u16 = 88;
     const ROOT_SCANNER_SAVED_X19_OFFSET: u16 = 96;
+    const ROOT_SCANNER_OFFSET_ROWS: u16 = 1;
+    const ROOT_SCANNER_COMPACT_V3: u16 = 2;
     let tracks_root_scanner_hits = allow_direct_hole_continuation && root_plan.is_some();
-    let frame_bytes = if tracks_root_scanner_hits {
+    let frame_bytes = if root_plan.is_some() {
         ROOT_SCANNER_FRAME_BYTES
     } else {
         SCANNER_FREE_FRAME_BYTES
@@ -21541,6 +21675,8 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     }
     let scan = assembler.label()?;
     let table_scan = assembler.label()?;
+    let pointer_scan = assembler.label()?;
+    let pointer_table_scan = assembler.label()?;
     let root_setup = root_plan.map(|_| assembler.label()).transpose()?;
     let root_candidate = root_plan.map(|_| assembler.label()).transpose()?;
     let root_dispatch = root_plan.map(|_| assembler.label()).transpose()?;
@@ -21580,6 +21716,9 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
         .transpose()?;
     let native_continue = allow_direct_hole_continuation
         .then(|| assembler.label())
+        .transpose()?;
+    let pointer_continue = native_continue
+        .map(|_| assembler.label())
         .transpose()?;
     let call_preflight = assembler.label()?;
     let framed_fallback = assembler.label()?;
@@ -21628,7 +21767,9 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     let identity_page_offset = assembler.instruction(aarch64_add_x_imm(6, 6, 0)?)?;
     // The private preflight record occupies SP+48..SP+79. Retain the identity
     // address in the spare word at SP+80 so table-backed scanners can recover
-    // their post-identity base after the helper clobbers caller-saved X6.
+    // their post-identity base after the helper clobbers caller-saved X6. A
+    // root-scanner frame keeps its invocation representation separately at
+    // SP+88.
     assembler.instruction(aarch64_store_x(6, 31, 80)?)?;
 
     aarch64_emit_frozen_compact_v3_entry(
@@ -21691,6 +21832,14 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     assembler.instruction(0xd65f_03c0)?;
 
     assembler.bind(v3_enter)?;
+    if root_plan.is_some() {
+        assembler.instruction(aarch64_movz_x(8, ROOT_SCANNER_COMPACT_V3, 0)?)?;
+        assembler.instruction(aarch64_store_x(
+            8,
+            31,
+            ROOT_SCANNER_REPRESENTATION_OFFSET,
+        )?)?;
+    }
     assembler.instruction(aarch64_load_x_imm(
         15,
         13,
@@ -21805,8 +21954,9 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     assembler.instruction(aarch64_load_x_imm(8, 31, 56)?)?;
     assembler.instruction(aarch64_store_x(8, 31, 32)?)?;
     // Caller-saved registers remain disjoint across the root scanners:
-    // X13 descriptor, X14/X15 map/rows, W11 current row, W1 initial row,
-    // X2/X3 position/end, and X4/X7/X8/X9/X10/X12 scratch.
+    // X13 descriptor, X14/X15 map/rows, X11 current row, X1 initial row,
+    // X2/X3 position/end, and X4/X7/X8/X9/X10/X12 scratch. X11/X1 are cell
+    // offsets for the overlay representation and pointers for zero-overlay.
     assembler.instruction(aarch64_load_x_imm(13, 31, 64)?)?; // descriptor
     assembler.instruction(aarch64_cmp_x_imm(13, 0)?)?;
     assembler.branch_cond(AARCH64_EQ, framed_fallback)?;
@@ -21868,14 +22018,14 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     assembler.instruction(aarch64_cmp_x_imm(8, 0)?)?;
     assembler.branch_cond(AARCH64_NE, framed_fallback)?;
     assembler.instruction(aarch64_load_w_imm(
-        10,
+        12,
         13,
         u16::try_from(NATIVE_ROWS_LOOP_COUNT)
             .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic loop count"))?,
     )?)?;
     if root_plan.is_some() {
         assembler.instruction(aarch64_cmp_w_imm(
-            10,
+            12,
             u16::try_from(NATIVE_ROWS_LOOP_ROW_CAPACITY)
                 .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic loop capacity"))?,
         )?)?;
@@ -21883,7 +22033,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     } else {
         // Without an independent root scanner, preserve the established
         // conservative decline for every learned-loop overlay.
-        assembler.branch_nonzero_w(10, framed_fallback)?;
+        assembler.branch_nonzero_w(12, framed_fallback)?;
     }
     assembler.instruction(aarch64_load_w_imm(
         8,
@@ -21909,12 +22059,43 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     assembler.instruction(aarch64_load_x_imm(0, 31, 8)?)?; // haystack
     assembler.instruction(aarch64_load_x_imm(2, 31, 48)?)?;
     assembler.instruction(aarch64_load_x_imm(3, 31, 56)?)?;
-    assembler.instruction(aarch64_and_w(11, 1, 1)?)?;
 
     if let Some(root_setup) = root_setup {
+        let pointer_enter = assembler.label()?;
+        // X10 was reused for the authenticated live-cell bound above. Keep
+        // the already-authenticated loop count in W12 so zero-overlay roots
+        // select the pointer representation before root setup consumes it.
+        assembler.branch_zero_w(12, pointer_enter)?;
+        assembler.instruction(aarch64_movz_x(8, ROOT_SCANNER_OFFSET_ROWS, 0)?)?;
+        assembler.instruction(aarch64_store_x(
+            8,
+            31,
+            ROOT_SCANNER_REPRESENTATION_OFFSET,
+        )?)?;
+        assembler.instruction(aarch64_and_w(11, 1, 1)?)?;
         assembler.branch(root_setup)?;
-    } else if output != OutputContract::Exists {
-        assembler.instruction(aarch64_store_x(31, 31, 80)?)?;
+        assembler.bind(pointer_enter)?;
+        // Bias the immutable rows base by one cell. A nonzero one-based token
+        // can then form the next row pointer with one shifted ADD.
+        assembler.instruction(aarch64_sub_x_imm(15, 15, 4)?)?;
+        assembler.instruction(aarch64_add_x_imm(11, 1, 1)?)?;
+        assembler.instruction(aarch64_add_x_lsl(11, 15, 11, 2)?)?;
+        assembler.instruction(aarch64_mov_x(1, 11)?)?;
+        assembler.instruction(aarch64_store_x(
+            1,
+            31,
+            ROOT_SCANNER_REPRESENTATION_OFFSET,
+        )?)?;
+        assembler.branch(root_setup)?;
+    } else {
+        assembler.instruction(aarch64_sub_x_imm(15, 15, 4)?)?;
+        assembler.instruction(aarch64_add_x_imm(11, 1, 1)?)?;
+        assembler.instruction(aarch64_add_x_lsl(11, 15, 11, 2)?)?;
+        assembler.instruction(aarch64_mov_x(1, 11)?)?;
+        if output != OutputContract::Exists {
+            assembler.instruction(aarch64_store_x(31, 31, 80)?)?;
+        }
+        assembler.branch(pointer_scan)?;
     }
 
     if let Some(root_setup) = root_setup {
@@ -21993,23 +22174,62 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
         }
     }
 
+    assembler.bind(pointer_scan)?;
+    assembler.instruction(aarch64_cmp_x(2, 3)?)?;
+    assembler.branch_cond(
+        AARCH64_HS,
+        native_complete.unwrap_or(native_no_match),
+    )?;
+    if root_plan.is_some() {
+        assembler.instruction(aarch64_cmp_x(11, 1)?)?;
+        let root_dispatch = root_dispatch.ok_or(ObjectError::InvalidModule(
+            "AArch64 pointer-row root dispatch is absent",
+        ))?;
+        if output == OutputContract::Exists {
+            assembler.branch_cond(AARCH64_EQ, root_dispatch)?;
+        } else {
+            let non_root = assembler.label()?;
+            assembler.branch_cond(AARCH64_NE, non_root)?;
+            assembler.instruction(aarch64_load_x_imm(8, 31, 80)?)?;
+            assembler.instruction(aarch64_cmp_x_imm(8, 0)?)?;
+            assembler.branch_cond(AARCH64_NE, pointer_table_scan)?;
+            assembler.branch(root_dispatch)?;
+            assembler.bind(non_root)?;
+        }
+    }
+    assembler.branch(pointer_table_scan)?;
+
     if let Some(root_candidate) = root_candidate {
-        let v2_candidate = assembler.label()?;
+        let offset_candidate = assembler.label()?;
+        let v3_candidate = assembler.label()?;
         assembler.bind(root_candidate)?;
-        assembler.instruction(aarch64_load_x_imm(8, 31, 0)?)?;
-        assembler.instruction(aarch64_load_w_imm(
-            9,
+        assembler.instruction(aarch64_load_x_imm(
             8,
-            u16::try_from(FROZEN_PREPARED_HEADER_V1_FLAGS_OFFSET)
-                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 V3 candidate flag"))?,
+            31,
+            ROOT_SCANNER_REPRESENTATION_OFFSET,
         )?)?;
-        aarch64_load_u32_constant(
-            &mut assembler,
+        assembler.instruction(aarch64_cmp_x_imm(8, ROOT_SCANNER_COMPACT_V3)?)?;
+        assembler.branch_cond(AARCH64_EQ, v3_candidate)?;
+        if tracks_root_scanner_hits {
+            assembler.instruction(aarch64_add_x_imm(19, 19, 1)?)?;
+        }
+        assembler.instruction(aarch64_cmp_x_imm(8, ROOT_SCANNER_OFFSET_ROWS)?)?;
+        assembler.branch_cond(AARCH64_EQ, offset_candidate)?;
+        assembler.instruction(aarch64_mov_x(11, 8)?)?;
+        assembler.instruction(aarch64_mov_x(1, 8)?)?;
+        assembler.branch(pointer_table_scan)?;
+
+        assembler.bind(offset_candidate)?;
+        assembler.instruction(aarch64_load_w_imm(
             10,
-            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3,
-        )?;
-        assembler.instruction(aarch64_cmp_w(9, 10)?)?;
-        assembler.branch_cond(AARCH64_NE, v2_candidate)?;
+            13,
+            u16::try_from(NATIVE_ROWS_LOOP_COUNT)
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic loop count"))?,
+        )?)?;
+        assembler.branch(table_scan)?;
+
+        assembler.bind(v3_candidate)?;
+        assembler.instruction(aarch64_load_x_imm(8, 31, 0)?)?;
         assembler.instruction(aarch64_load_x_imm(
             15,
             13,
@@ -22035,14 +22255,6 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
                 .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 V3 candidate shift"))?,
         )?)?;
         assembler.branch(v3_dispatch)?;
-
-        assembler.bind(v2_candidate)?;
-        if tracks_root_scanner_hits {
-            // Complete compact V3 rows have no unpublished cells, so only
-            // V2/mutable candidates need continuation accounting.
-            assembler.instruction(aarch64_add_x_imm(19, 19, 1)?)?;
-        }
-        assembler.branch(table_scan)?;
     }
 
     assembler.bind(table_scan)?;
@@ -22068,6 +22280,43 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     assembler.branch_zero_w(8, native_complete.unwrap_or(native_no_match))?;
     assembler.instruction(aarch64_sub_w_imm(11, 8, 1)?)?;
     assembler.branch(scan)?;
+
+    assembler.bind(pointer_table_scan)?;
+    assembler.instruction(aarch64_load_byte_reg(8, 0, 2)?)?;
+    assembler.instruction(aarch64_load_byte_reg(10, 14, 8)?)?;
+    assembler.instruction(aarch64_load_w_uxtw(8, 11, 10)?)?;
+    assembler.instruction(aarch64_cmn_w_imm(8, 1)?)?;
+    assembler.branch_cond(
+        AARCH64_EQ,
+        pointer_continue.unwrap_or(framed_fallback),
+    )?;
+    assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
+    if output == OutputContract::Exists {
+        assembler.branch_bit_set_w(8, 31, native_match)?;
+    } else {
+        let not_accepting = assembler.label()?;
+        assembler.branch_bit_clear_w(8, 31, not_accepting)?;
+        assembler.instruction(aarch64_store_x(2, 31, 80)?)?;
+        assembler.bind(not_accepting)?;
+    }
+    assembler.instruction(aarch64_and_low_w(8, 8, 29)?)?;
+    assembler.branch_zero_w(8, native_complete.unwrap_or(native_no_match))?;
+    // X15 is rows-4 and W8 is the nonzero one-based token. One ADD therefore
+    // forms the next row directly, with no row-plus-class or token decrement.
+    assembler.instruction(aarch64_add_x_lsl(11, 15, 8, 2)?)?;
+    assembler.branch(pointer_scan)?;
+
+    if let (Some(pointer_continue), Some(native_continue)) =
+        (pointer_continue, native_continue)
+    {
+        assembler.bind(pointer_continue)?;
+        // Reconstruct the exact zero-based cell-row offset only for the cold
+        // continuation ABI. X15 is biased by one u32 cell.
+        assembler.instruction(aarch64_sub_x_reg(11, 11, 15)?)?;
+        assembler.instruction(aarch64_lsr_x_imm(11, 11, 2)?)?;
+        assembler.instruction(aarch64_sub_w_imm(11, 11, 1)?)?;
+        assembler.branch(native_continue)?;
+    }
 
     if let Some(plan) = root_plan {
         let dispatch = root_dispatch.ok_or(ObjectError::InvalidModule(
@@ -27341,23 +27590,21 @@ mod tests {
                 9,
                 "each compact shift must return the initial state to {accelerator:?}"
             );
-            let mut candidate_prefix = vec![
+            let candidate_prefix = [
                 0x48,
                 0x8b,
                 0x44,
                 0x24,
-                0x10,
-                0x81,
-                0x78,
-                u8::try_from(FROZEN_PREPARED_HEADER_V1_FLAGS_OFFSET).unwrap(),
+                0x70,
+                0x48,
+                0x83,
+                0xf8,
+                0x02,
             ];
-            candidate_prefix.extend_from_slice(
-                &FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3.to_le_bytes(),
-            );
             let candidate = code
                 .windows(candidate_prefix.len())
-                .position(|bytes| bytes == candidate_prefix.as_slice())
-                .expect("shared V2/V3 scanner candidate dispatcher");
+                .position(|bytes| bytes == candidate_prefix)
+                .expect("tagged pointer/offset/V3 scanner candidate dispatcher");
             // The assembler may invert the scalar membership diamond, making
             // its hit edge conditional, while the vector hit remains an
             // unconditional jump. Restrict the audit to the scanner bodies,
@@ -27377,15 +27624,13 @@ mod tests {
             let count_load = [0x41, 0x8b, 0x43, loop_count];
             assert_eq!(
                 occurrences(code, &count_load),
-                1,
-                "one shared V2/V3 candidate-dispatch reload: {accelerator:?}"
+                2,
+                "entry selection and the nonzero-offset candidate are the only count loads: {accelerator:?}"
             );
-            let mut mutable_candidate = vec![0x49, 0xff, 0xc4]; // inc r12
-            mutable_candidate.extend_from_slice(&count_load);
             assert_eq!(
-                occurrences(code, &mutable_candidate),
+                occurrences(code, &[0x49, 0xff, 0xc4]),
                 1,
-                "only the mutable V2 candidate path counts scanner hits: {accelerator:?}"
+                "only a non-V3 scanner candidate counts one scanner hit: {accelerator:?}"
             );
             assert_eq!(
                 occurrences(code, &[0xc5, 0xf8, 0x77]),
@@ -27450,6 +27695,40 @@ mod tests {
                 }
             }
             assert!(previous_loop_compare < table_start);
+
+            let pointer_prefix = [
+                0x44, 0x0f, 0xb6, 0x14, 0x17, // byte
+                0x47, 0x0f, 0xb6, 0x14, 0x11, // class
+                0x47, 0x8b, 0x14, 0x90, // [current row + class * 4]
+            ];
+            let pointer_table = code
+                .windows(pointer_prefix.len())
+                .position(|bytes| bytes == pointer_prefix)
+                .expect("zero-overlay pointer-row transition");
+            let pointer_update = pointer_table
+                + code[pointer_table..]
+                    .windows(5)
+                    .position(|bytes| bytes == [0x4e, 0x8d, 0x44, 0x96, 0xfc])
+                    .expect("one-based token pointer update");
+            let (pointer_scan, _) = x86_test_branch_target(code, pointer_update + 5)
+                .expect("pointer-row backedge");
+            assert_eq!(&code[pointer_scan..pointer_scan + 3], &[0x48, 0x39, 0xca]);
+            let pointer_scan_body = &code[pointer_scan..candidate];
+            assert!(pointer_scan_body
+                .windows(3)
+                .any(|bytes| bytes == [0x49, 0x39, 0xc0]));
+            assert!(!pointer_scan_body
+                .windows(count_load.len())
+                .any(|bytes| bytes == count_load));
+            assert!(!pointer_scan_body
+                .windows(4)
+                .any(|bytes| bytes == [0x45, 0x3b, 0x43, initial_row]));
+            assert!(!code[pointer_table..pointer_update]
+                .windows(3)
+                .any(|bytes| bytes == [0x4d, 0x01, 0xc2]));
+            assert!(code.windows(7).any(|bytes| {
+                bytes == [0x49, 0x29, 0xf0, 0x49, 0xc1, 0xe8, 0x02]
+            }));
             assert_eq!(
                 emission
                     .relocations
@@ -27542,14 +27821,13 @@ mod tests {
             let x86_table_prefix = [
                 0x44, 0x0f, 0xb6, 0x14, 0x17, // byte
                 0x47, 0x0f, 0xb6, 0x14, 0x11, // class
-                0x4d, 0x01, 0xc2, // row + class
-                0x46, 0x8b, 0x14, 0x96, // cell
+                0x47, 0x8b, 0x14, 0x90, // pointer-row cell
                 0x41, 0x83, 0xfa, 0xff, // cmp cell, -1
             ];
             let x86_table = x86
                 .windows(x86_table_prefix.len())
                 .position(|bytes| bytes == x86_table_prefix)
-                .expect("x86 immediate V1 transition");
+                .expect("x86 immediate pointer-row V1/V2 transition");
             assert!(x86_entry < x86_table, "{output:?}");
             let descriptor_null_branch = x86_entry + 8;
             let descriptor_fallback = x86_test_branch_target(&x86, descriptor_null_branch)
@@ -27624,6 +27902,12 @@ mod tests {
                     "x86 {output:?} hot loop rereads a descriptor constant"
                 );
             }
+            assert!(!hot
+                .windows(3)
+                .any(|bytes| bytes == [0x4d, 0x01, 0xc2]));
+            assert!(x86[mask..]
+                .windows(5)
+                .any(|bytes| bytes == [0x4e, 0x8d, 0x44, 0x96, 0xfc]));
 
             let arm = lower_aarch64_dynamic_rows_prepared_for_output(
                 None,
@@ -27644,14 +27928,13 @@ mod tests {
             let arm_table_prefix = [
                 aarch64_load_byte_reg(8, 0, 2).unwrap(),
                 aarch64_load_byte_reg(10, 14, 8).unwrap(),
-                aarch64_add_w_reg(10, 11, 10).unwrap(),
-                aarch64_load_w_uxtw(8, 15, 10).unwrap(),
+                aarch64_load_w_uxtw(8, 11, 10).unwrap(),
                 aarch64_cmn_w_imm(8, 1).unwrap(),
             ];
             let arm_table = words
                 .windows(arm_table_prefix.len())
                 .position(|window| window == arm_table_prefix)
-                .expect("AArch64 immediate V1 transition");
+                .expect("AArch64 immediate pointer-row V1/V2 transition");
             assert!(arm_entry < arm_table, "{output:?}");
             let descriptor_fallback = aarch64_conditional_target(&words, arm_entry + 2);
             let unfilled_load = aarch64_load_w_imm(
@@ -27733,11 +28016,59 @@ mod tests {
                 aarch64_cmp_w(8, 4).unwrap(),
                 aarch64_tst_w(8, 7).unwrap(),
                 aarch64_and_w(8, 8, 9).unwrap(),
+                aarch64_add_w_reg(10, 11, 10).unwrap(),
             ] {
                 assert!(
                     !hot.contains(&removed),
                     "AArch64 {output:?} hot loop retains a descriptor-valued operation"
                 );
+            }
+            assert!(words[mask..]
+                .contains(&aarch64_add_x_lsl(11, 15, 8, 2).unwrap()));
+        }
+    }
+
+    #[test]
+    fn dynamic_zero_overlay_pointer_rows_preserve_exact_token_and_hole_algebra() {
+        assert_eq!(
+            aarch64_load_w_uxtw(8, 11, 10).unwrap(),
+            0xb86a_5968,
+            "pointer-row class load must scale a 32-bit class by one u32 cell"
+        );
+        assert_eq!(
+            aarch64_add_x_lsl(11, 15, 8, 2).unwrap(),
+            0x8b08_09eb,
+            "one-based row token must use one shifted pointer ADD"
+        );
+        assert_eq!(aarch64_sub_x_imm(15, 15, 4).unwrap(), 0xd100_11ef);
+
+        let token_mask = u64::from(DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK);
+        for stride in [1_u64, 7, 64, 256] {
+            let maximum_row = ((token_mask - 1) / stride) * stride;
+            for row in [0, stride, stride * 17, maximum_row] {
+                let token = row + 1;
+                assert!(token <= token_mask);
+                for rows in [4_u64, 0x1000, 0x1_0000_0000] {
+                    let pointer = rows + row * 4;
+                    let x86_pointer = rows + token * 4 - 4;
+                    let aarch64_biased_rows = rows - 4;
+                    let aarch64_pointer = aarch64_biased_rows + token * 4;
+                    assert_eq!(x86_pointer, pointer);
+                    assert_eq!(aarch64_pointer, pointer);
+
+                    let x86_hole_row = (pointer - rows) >> 2;
+                    let aarch64_hole_row = ((pointer - aarch64_biased_rows) >> 2) - 1;
+                    assert_eq!(x86_hole_row, row);
+                    assert_eq!(aarch64_hole_row, row);
+
+                    for class in [0_u64, stride - 1] {
+                        assert_eq!(
+                            pointer + class * 4,
+                            rows + (row + class) * 4,
+                            "pointer-row and offset-row cell addresses diverged"
+                        );
+                    }
+                }
             }
         }
     }
@@ -28040,27 +28371,45 @@ mod tests {
                     9,
                     "{target:?}/{output:?} compact rows must re-enter the same scanner"
                 );
+                let authenticated_loop_count = words
+                    .iter()
+                    .position(|&word| {
+                        word
+                            == aarch64_load_w_imm(
+                                12,
+                                13,
+                                u16::try_from(NATIVE_ROWS_LOOP_COUNT).unwrap(),
+                            )
+                            .unwrap()
+                    })
+                    .expect("AArch64 root must authenticate its loop count into W12");
+                let authenticated_live_cells = authenticated_loop_count
+                    + words[authenticated_loop_count..]
+                    .iter()
+                    .position(|&word| {
+                        word
+                            == aarch64_load_x_imm(
+                                10,
+                                13,
+                                u16::try_from(NATIVE_ROWS_LIVE_CELLS).unwrap(),
+                            )
+                            .unwrap()
+                    })
+                    .expect("AArch64 root must authenticate its live-cell bound");
+                assert!(authenticated_loop_count < authenticated_live_cells);
+                assert_eq!(
+                    words[authenticated_live_cells + 6] & 0xff00_001f,
+                    0x3400_000c,
+                    "zero-overlay selection must use the preserved W12 loop count after X10 is reused"
+                );
                 let candidate_prefix = [
-                    aarch64_load_x_imm(8, 31, 0).unwrap(),
-                    aarch64_load_w_imm(
-                        9,
-                        8,
-                        u16::try_from(FROZEN_PREPARED_HEADER_V1_FLAGS_OFFSET).unwrap(),
-                    )
-                    .unwrap(),
-                    aarch64_movz_x(
-                        10,
-                        u16::try_from(FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3)
-                            .unwrap(),
-                        0,
-                    )
-                    .unwrap(),
-                    aarch64_cmp_w(9, 10).unwrap(),
+                    aarch64_load_x_imm(8, 31, 88).unwrap(),
+                    aarch64_cmp_x_imm(8, 2).unwrap(),
                 ];
                 let candidate = words
                     .windows(candidate_prefix.len())
                     .position(|window| window == candidate_prefix)
-                    .expect("shared AArch64 V2/V3 scanner candidate dispatcher");
+                    .expect("tagged AArch64 pointer/offset/V3 scanner candidate dispatcher");
                 assert!(
                     (0..words.len())
                         .filter_map(|index| unconditional_target(&words, index))
@@ -28071,10 +28420,53 @@ mod tests {
                     .iter()
                     .position(|&word| word == aarch64_load_byte_reg(8, 0, 2).unwrap())
                     .expect("canonical V2 table transition");
+                let v3_candidate = conditional_target(&words, candidate + candidate_prefix.len())
+                    .expect("tagged V3 candidate edge");
                 assert_eq!(
-                    conditional_target(&words, candidate + candidate_prefix.len()),
-                    Some(v2_table),
-                    "V2 selection must rejoin the immediate-only table transition"
+                    words[v3_candidate],
+                    aarch64_load_x_imm(8, 31, 0).unwrap(),
+                    "V3 selection must restore its own representation"
+                );
+                let pointer_prefix = [
+                    aarch64_load_byte_reg(8, 0, 2).unwrap(),
+                    aarch64_load_byte_reg(10, 14, 8).unwrap(),
+                    aarch64_load_w_uxtw(8, 11, 10).unwrap(),
+                ];
+                let pointer_table = words
+                    .windows(pointer_prefix.len())
+                    .position(|window| window == pointer_prefix)
+                    .expect("AArch64 zero-overlay pointer-row table");
+                let pointer_update = pointer_table
+                    + words[pointer_table..]
+                        .iter()
+                        .position(|&word| word == aarch64_add_x_lsl(11, 15, 8, 2).unwrap())
+                        .expect("AArch64 one-based pointer update");
+                let pointer_scan = unconditional_target(&words, pointer_update + 1)
+                    .expect("AArch64 pointer-row backedge");
+                assert_eq!(words[pointer_scan], aarch64_cmp_x(2, 3).unwrap());
+                assert!(words[pointer_scan..candidate]
+                    .contains(&aarch64_cmp_x(11, 1).unwrap()));
+                assert!(!words[pointer_scan..candidate].contains(
+                    &aarch64_load_w_imm(
+                        10,
+                        13,
+                        u16::try_from(NATIVE_ROWS_LOOP_COUNT).unwrap(),
+                    )
+                    .unwrap()
+                ));
+                let pointer_moves = [
+                    aarch64_mov_x(11, 8).unwrap(),
+                    aarch64_mov_x(1, 8).unwrap(),
+                ];
+                let pointer_candidate = words[candidate..pointer_table]
+                    .windows(pointer_moves.len())
+                    .position(|window| window == pointer_moves)
+                    .map(|offset| candidate + offset)
+                    .expect("AArch64 pointer candidate restore");
+                assert_eq!(
+                    unconditional_target(&words, pointer_candidate + pointer_moves.len()),
+                    Some(pointer_table),
+                    "zero-overlay candidates must enter the pointer loop directly"
                 );
                 assert!(
                     !words[candidate..v2_table].contains(
@@ -28387,9 +28779,9 @@ mod tests {
             output: OutputContract,
         ) {
             let context = format!("{target:?}/{output:?}");
-            let frame_open = aarch64_sub_x_imm(31, 31, 96).unwrap();
-            let frame_close = aarch64_add_x_imm(31, 31, 96).unwrap();
-            let restore_link = aarch64_load_x_imm(30, 31, 88).unwrap();
+            let frame_open = aarch64_sub_x_imm(31, 31, 112).unwrap();
+            let frame_close = aarch64_add_x_imm(31, 31, 112).unwrap();
+            let restore_link = aarch64_load_x_imm(30, 31, 104).unwrap();
             let return_instruction = 0xd65f_03c0;
             let opens = words
                 .iter()
@@ -28505,8 +28897,8 @@ mod tests {
                 );
                 assert_eq!(
                     byte_occurrences(&code, &[0x48, 0x89, 0x54, 0x24, 0x60]),
-                    10,
-                    "V2 plus nine immediate-shift V3 loops each publish an accepting endpoint"
+                    11,
+                    "offset, pointer, and nine compact V3 loops each publish an accepting endpoint"
                 );
                 assert_eq!(
                     byte_occurrences(&code, &[0x4c, 0x8b, 0x5c, 0x24, 0x60]),
@@ -28561,7 +28953,7 @@ mod tests {
                     .collect::<Vec<_>>();
                 for (instruction, expected, detail) in [
                     (aarch64_store_x(31, 31, 80).unwrap(), 1, "pending initialization"),
-                    (aarch64_store_x(2, 31, 80).unwrap(), 10, "pending update"),
+                    (aarch64_store_x(2, 31, 80).unwrap(), 11, "pending update"),
                     (aarch64_load_x_imm(7, 31, 80).unwrap(), 1, "pending completion"),
                 ] {
                     assert_eq!(
@@ -28581,19 +28973,35 @@ mod tests {
         reason = "the cross-ISA ABI audit keeps the exact branch targets and record stores together"
     )]
     fn dynamic_first_hole_codegen_marshals_exact_frontier_on_both_architectures() {
-        fn x86_unfilled_target(code: &[u8]) -> usize {
+        fn x86_unfilled_target(code: &[u8], converts_pointer: bool) -> usize {
+            let pointer_table = [
+                0x44, 0x0f, 0xb6, 0x14, 0x17, // byte
+                0x47, 0x0f, 0xb6, 0x14, 0x11, // class
+                0x47, 0x8b, 0x14, 0x90, // pointer-row cell
+            ];
             let table_byte = code
-                .windows(5)
-                .position(|bytes| bytes == [0x44, 0x0f, 0xb6, 0x14, 0x17])
-                .expect("x86 dynamic table byte");
+                .windows(pointer_table.len())
+                .position(|bytes| bytes == pointer_table)
+                .expect("x86 dynamic pointer-row table");
             let comparison = [0x41, 0x83, 0xfa, 0xff];
             let compare = table_byte
                 + code[table_byte..]
                     .windows(comparison.len())
                     .position(|bytes| bytes == comparison)
                     .expect("x86 dynamic unfilled-cell comparison");
-            x86_test_branch_target(code, compare + comparison.len())
+            let pointer_continue = x86_test_branch_target(code, compare + comparison.len())
                 .expect("x86 dynamic unfilled branch")
+                .0;
+            if !converts_pointer {
+                return pointer_continue;
+            }
+            assert_eq!(
+                &code[pointer_continue..pointer_continue + 7],
+                &[0x49, 0x29, 0xf0, 0x49, 0xc1, 0xe8, 0x02],
+                "x86 pointer hole must recover the zero-based cell-row offset"
+            );
+            x86_test_branch_target(code, pointer_continue + 7)
+                .expect("x86 pointer-hole continuation branch")
                 .0
         }
 
@@ -28605,6 +29013,16 @@ mod tests {
             branch
                 .checked_add_signed(isize::try_from(signed).unwrap())
                 .expect("AArch64 conditional target")
+        }
+
+        fn aarch64_unconditional_target(words: &[u32], branch: usize) -> usize {
+            let instruction = words[branch];
+            assert_eq!(instruction & 0xfc00_0000, 0x1400_0000);
+            let immediate = instruction & 0x03ff_ffff;
+            let signed = i32::try_from(immediate << 6).unwrap() >> 6;
+            branch
+                .checked_add_signed(isize::try_from(signed).unwrap())
+                .expect("AArch64 unconditional target")
         }
 
         for (output, width) in [
@@ -28647,7 +29065,7 @@ mod tests {
                 1,
                 "x86 {output:?}"
             );
-            let continuation = x86_unfilled_target(&x86.code);
+            let continuation = x86_unfilled_target(&x86.code, true);
             assert_eq!(
                 &x86.code[continuation..continuation + 5],
                 &[0x4c, 0x8b, 0x54, 0x24, 0x10],
@@ -28711,16 +29129,29 @@ mod tests {
                 .position(|&word| word == aarch64_load_x_imm(13, 31, 64).unwrap())
                 .expect("AArch64 dynamic descriptor load");
             assert!(alias < descriptor, "AArch64 {output:?}");
+            let pointer_table = [
+                aarch64_load_byte_reg(8, 0, 2).unwrap(),
+                aarch64_load_byte_reg(10, 14, 8).unwrap(),
+                aarch64_load_w_uxtw(8, 11, 10).unwrap(),
+            ];
             let table_byte = words
-                .iter()
-                .position(|&word| word == aarch64_load_byte_reg(8, 0, 2).unwrap())
-                .expect("AArch64 dynamic table byte");
-            let compare = table_byte
-                + words[table_byte..]
-                    .iter()
-                    .position(|&word| word == aarch64_cmn_w_imm(8, 1).unwrap())
-                    .expect("AArch64 dynamic unfilled comparison");
-            let continuation = aarch64_conditional_target(&words, compare + 1);
+                .windows(pointer_table.len())
+                .position(|window| window == pointer_table)
+                .expect("AArch64 dynamic pointer-row table");
+            let compare = table_byte + pointer_table.len();
+            assert_eq!(words[compare], aarch64_cmn_w_imm(8, 1).unwrap());
+            let pointer_continue = aarch64_conditional_target(&words, compare + 1);
+            assert_eq!(
+                &words[pointer_continue..pointer_continue + 3],
+                &[
+                    aarch64_sub_x_reg(11, 11, 15).unwrap(),
+                    aarch64_lsr_x_imm(11, 11, 2).unwrap(),
+                    aarch64_sub_w_imm(11, 11, 1).unwrap(),
+                ],
+                "AArch64 pointer hole must recover the zero-based cell-row offset"
+            );
+            let continuation =
+                aarch64_unconditional_target(&words, pointer_continue + 3);
             assert_eq!(
                 words[continuation],
                 aarch64_load_x_imm(12, 31, 0).unwrap(),
@@ -28813,6 +29244,20 @@ mod tests {
                     4,
                     "root x86 continuation must clean AVX state: {features:?}/{output:?}/{width:?}"
                 );
+                let pointer_lookup = [
+                    0x44, 0x0f, 0xb6, 0x14, 0x17, 0x47, 0x0f, 0xb6, 0x14, 0x11, 0x47, 0x8b,
+                    0x14, 0x90,
+                ];
+                assert!(
+                    root.code
+                        .windows(pointer_lookup.len())
+                        .any(|bytes| bytes == pointer_lookup),
+                    "root x86 pointer-row loop missing: {features:?}/{output:?}/{width:?}"
+                );
+                assert!(root
+                    .code
+                    .windows(5)
+                    .any(|bytes| bytes == [0x4e, 0x8d, 0x44, 0x96, 0xfc]));
             }
         }
 
@@ -28901,6 +29346,18 @@ mod tests {
                         .count(),
                     "root AArch64 must restore X19 at every framed exit: {target:?}/{output:?}/{width:?}"
                 );
+                let pointer_lookup = [
+                    aarch64_load_byte_reg(8, 0, 2).unwrap(),
+                    aarch64_load_byte_reg(10, 14, 8).unwrap(),
+                    aarch64_load_w_uxtw(8, 11, 10).unwrap(),
+                ];
+                assert!(
+                    words
+                        .windows(pointer_lookup.len())
+                        .any(|window| window == pointer_lookup),
+                    "root AArch64 pointer-row loop missing: {target:?}/{output:?}/{width:?}"
+                );
+                assert!(words.contains(&aarch64_add_x_lsl(11, 15, 8, 2).unwrap()));
             }
         }
 
@@ -28920,7 +29377,7 @@ mod tests {
                 .count(),
             0
         );
-        let fallback = x86_unfilled_target(&x86_deopt.code);
+        let fallback = x86_unfilled_target(&x86_deopt.code, false);
         assert_eq!(
             &x86_deopt.code[fallback..fallback + 5],
             &[0x4c, 0x8b, 0x54, 0x24, 0x10],
@@ -28947,15 +29404,17 @@ mod tests {
             .chunks_exact(4)
             .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
             .collect::<Vec<_>>();
+        let pointer_table = [
+            aarch64_load_byte_reg(8, 0, 2).unwrap(),
+            aarch64_load_byte_reg(10, 14, 8).unwrap(),
+            aarch64_load_w_uxtw(8, 11, 10).unwrap(),
+        ];
         let table_byte = words
-            .iter()
-            .position(|&word| word == aarch64_load_byte_reg(8, 0, 2).unwrap())
+            .windows(pointer_table.len())
+            .position(|window| window == pointer_table)
             .unwrap();
-        let compare = table_byte
-            + words[table_byte..]
-                .iter()
-                .position(|&word| word == aarch64_cmn_w_imm(8, 1).unwrap())
-                .unwrap();
+        let compare = table_byte + pointer_table.len();
+        assert_eq!(words[compare], aarch64_cmn_w_imm(8, 1).unwrap());
         let fallback = aarch64_conditional_target(&words, compare + 1);
         assert_eq!(
             words[fallback],
