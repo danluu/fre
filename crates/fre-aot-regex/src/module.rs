@@ -918,10 +918,11 @@ const NATIVE_ROWS_INITIAL_ROW: usize =
 const NATIVE_ROWS_INITIAL_FLAGS: usize =
     core::mem::offset_of!(DynamicNativeRowsV1, initial_flags);
 const _: () = assert!(core::mem::size_of::<DynamicNativeRowsV1>() <= 127);
-// Scanner-free compact frozen rows remain a short-window prepared-entry
+// Mutable/scanner-free dynamic rows remain a short-window prepared-entry
 // optimization. At 4 KiB, canonical K0 begins considering its whole-window
-// accelerators. A graph-proven native root scanner already owns that role and
-// therefore keeps its frozen table for longer windows as well.
+// accelerators. An authenticated closed immutable V3 table is already the
+// complete machine, just as a graph-proven native root scanner owns its scan,
+// so either may retain native execution for longer windows.
 const FROZEN_SCANNER_FREE_DYNAMIC_ROWS_MAX_INPUT_BYTES: usize = 4_095;
 const _: () = assert!(
     DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES <= FROZEN_SCANNER_FREE_DYNAMIC_ROWS_MAX_INPUT_BYTES
@@ -13637,6 +13638,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
         .transpose()?;
     let call_preflight = assembler.label()?;
     let framed_fallback = assembler.label()?;
+    let framed_short_fallback = assembler.label()?;
     let adaptive_fallback = assembler.label()?;
     let short_fallback = assembler.label()?;
 
@@ -13664,15 +13666,6 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     compare_minimum.extend_from_slice(&minimum.to_le_bytes());
     assembler.instruction(&compare_minimum)?;
     assembler.branch(&[0x0f, 0x82], short_fallback)?;
-    if root_plan.is_none() {
-        let maximum = u32::try_from(FROZEN_SCANNER_FREE_DYNAMIC_ROWS_MAX_INPUT_BYTES)
-            .map_err(|_| ObjectError::ArithmeticOverflow("frozen dynamic row input ceiling"))?;
-        let mut compare_maximum = vec![0x48, 0x3d];
-        compare_maximum.extend_from_slice(&maximum.to_le_bytes());
-        assembler.instruction(&compare_maximum)?;
-        assembler.branch(&[0x0f, 0x87], short_fallback)?;
-    }
-
     // Entry RSP is 8 modulo 16. The frame aligns calls, retains all six
     // public arguments, and reserves the four-word private preflight record.
     // Root-scanner entries also spill one callee-saved hit-counter register.
@@ -13711,6 +13704,19 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
         v3_enter,
     )?;
     assembler.bind(try_v2)?;
+    if root_plan.is_none() {
+        // Only a fully authenticated V3 table may bypass the historical
+        // scanner-free ceiling. V1/V2 headers still hand long windows to the
+        // canonical executor before following their mutable descriptors.
+        assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, 0x30])?;
+        assembler.instruction(&[0x48, 0x2b, 0x44, 0x24, 0x28])?;
+        let maximum = u32::try_from(FROZEN_SCANNER_FREE_DYNAMIC_ROWS_MAX_INPUT_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("frozen dynamic row input ceiling"))?;
+        let mut compare_maximum = vec![0x48, 0x3d];
+        compare_maximum.extend_from_slice(&maximum.to_le_bytes());
+        assembler.instruction(&compare_maximum)?;
+        assembler.branch(&[0x0f, 0x87], framed_short_fallback)?;
+    }
     x86_emit_frozen_dynamic_entry(
         &mut assembler,
         call_preflight,
@@ -13719,6 +13725,19 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     )?;
 
     assembler.bind(call_preflight)?;
+    if root_plan.is_none() {
+        // Authentication failures and cold mutable rows preserve the same
+        // ceiling. Reaching this label proves that no closed V3 table was
+        // selected above.
+        assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, 0x30])?;
+        assembler.instruction(&[0x48, 0x2b, 0x44, 0x24, 0x28])?;
+        let maximum = u32::try_from(FROZEN_SCANNER_FREE_DYNAMIC_ROWS_MAX_INPUT_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("dynamic preflight input ceiling"))?;
+        let mut compare_maximum = vec![0x48, 0x3d];
+        compare_maximum.extend_from_slice(&maximum.to_le_bytes());
+        assembler.instruction(&compare_maximum)?;
+        assembler.branch(&[0x0f, 0x87], framed_short_fallback)?;
+    }
     assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x10])?;
     assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x18])?;
     assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x20])?;
@@ -14358,6 +14377,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     assembler.instruction(&load_seal)?;
     assembler.instruction(&[0x4d, 0x3b, 0x1a])?;
     assembler.branch(&[0x0f, 0x85], adaptive_fallback)?;
+    assembler.bind(framed_short_fallback)?;
     assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x10])?;
     assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x18])?;
     assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x20])?;
@@ -21442,6 +21462,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
         .transpose()?;
     let call_preflight = assembler.label()?;
     let framed_fallback = assembler.label()?;
+    let framed_short_fallback = assembler.label()?;
     let adaptive_fallback = assembler.label()?;
     let short_fallback = assembler.label()?;
 
@@ -21465,13 +21486,6 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
         .map_err(|_| ObjectError::ArithmeticOverflow("dynamic row input floor"))?;
     assembler.instruction(aarch64_cmp_x_imm(6, minimum)?)?;
     assembler.branch_cond(AARCH64_LO, short_fallback)?;
-    if root_plan.is_none() {
-        let maximum = u16::try_from(FROZEN_SCANNER_FREE_DYNAMIC_ROWS_MAX_INPUT_BYTES)
-            .map_err(|_| ObjectError::ArithmeticOverflow("frozen dynamic row input ceiling"))?;
-        assembler.instruction(aarch64_cmp_x_imm(6, maximum)?)?;
-        assembler.branch_cond(AARCH64_HI, short_fallback)?;
-    }
-
     assembler.instruction(aarch64_sub_x_imm(31, 31, frame_bytes)?)?;
     assembler.instruction(aarch64_store_x(30, 31, link_offset)?)?;
     assembler.instruction(aarch64_store_x(0, 31, 0)?)?;
@@ -21503,6 +21517,18 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
         v3_enter,
     )?;
     assembler.bind(try_v2)?;
+    if root_plan.is_none() {
+        // Only the closed V3 transaction authenticated above may retain a
+        // scanner-free long window. V1/V2 descriptors preserve the canonical
+        // K0 crossover before any mutable row address is followed.
+        assembler.instruction(aarch64_load_x_imm(8, 31, 32)?)?;
+        assembler.instruction(aarch64_load_x_imm(9, 31, 24)?)?;
+        assembler.instruction(aarch64_sub_x_reg(8, 8, 9)?)?;
+        let maximum = u16::try_from(FROZEN_SCANNER_FREE_DYNAMIC_ROWS_MAX_INPUT_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("frozen dynamic row input ceiling"))?;
+        assembler.instruction(aarch64_cmp_x_imm(8, maximum)?)?;
+        assembler.branch_cond(AARCH64_HI, framed_short_fallback)?;
+    }
     aarch64_emit_frozen_dynamic_entry(
         &mut assembler,
         call_preflight,
@@ -21511,6 +21537,17 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     )?;
 
     assembler.bind(call_preflight)?;
+    if root_plan.is_none() {
+        // A failed V3 authentication and every cold/mutable preflight keep the
+        // historical ceiling. This path is unreachable from valid V3 entry.
+        assembler.instruction(aarch64_load_x_imm(8, 31, 32)?)?;
+        assembler.instruction(aarch64_load_x_imm(9, 31, 24)?)?;
+        assembler.instruction(aarch64_sub_x_reg(8, 8, 9)?)?;
+        let maximum = u16::try_from(FROZEN_SCANNER_FREE_DYNAMIC_ROWS_MAX_INPUT_BYTES)
+            .map_err(|_| ObjectError::ArithmeticOverflow("dynamic preflight input ceiling"))?;
+        assembler.instruction(aarch64_cmp_x_imm(8, maximum)?)?;
+        assembler.branch_cond(AARCH64_HI, framed_short_fallback)?;
+    }
     assembler.instruction(aarch64_load_x_imm(0, 31, 0)?)?;
     assembler.instruction(aarch64_load_x_imm(1, 31, 8)?)?;
     assembler.instruction(aarch64_load_x_imm(2, 31, 16)?)?;
@@ -22281,6 +22318,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     assembler.instruction(aarch64_load_x_imm(8, 12, 0)?)?;
     assembler.instruction(aarch64_cmp_x(8, 10)?)?;
     assembler.branch_cond(AARCH64_NE, adaptive_fallback)?;
+    assembler.bind(framed_short_fallback)?;
     assembler.instruction(aarch64_load_x_imm(0, 31, 0)?)?;
     assembler.instruction(aarch64_load_x_imm(1, 31, 8)?)?;
     assembler.instruction(aarch64_load_x_imm(2, 31, 16)?)?;
@@ -24154,7 +24192,7 @@ mod tests {
             .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
             .collect::<Vec<_>>();
         let scanner_free_ceiling = aarch64_cmp_x_imm(
-            6,
+            8,
             u16::try_from(FROZEN_SCANNER_FREE_DYNAMIC_ROWS_MAX_INPUT_BYTES).unwrap(),
         )
         .unwrap();
@@ -24228,7 +24266,14 @@ mod tests {
             .chunks_exact(4)
             .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
             .collect::<Vec<_>>();
-        assert!(scalar_words.contains(&scanner_free_ceiling));
+        assert_eq!(
+            scalar_words
+                .iter()
+                .filter(|&&word| word == scanner_free_ceiling)
+                .count(),
+            2,
+            "V1/V2 selection and failed/cold preflight retain the scanner-free ceiling"
+        );
         assert!(!scalar_words.contains(&aarch64_cmp_w(11, 1).unwrap()));
         assert!(!scalar_words.contains(&aarch64_sve_cntb(16).unwrap()));
     }
@@ -30148,10 +30193,10 @@ int main(void) {{
             scanner_free_correlated_pair_raw(),
             OutputContract::Exists,
             target,
-            CompileMode::Optimizing,
+            CompileMode::Fast,
             limits,
         )
-        .expect("compile scanner-free frozen dynamic fixture");
+        .expect("compile scanner-free no-sidecar frozen dynamic fixture");
         let dynamic_view = compiled
             .program()
             .native_dynamic_rows_view()
@@ -35159,6 +35204,22 @@ int main(void) {{
             .position(|window| window == v2_flag.as_slice())
             .unwrap();
         assert!(v3_selection < v2_selection, "V3 must fall through to V2, never overlap it");
+        let scanner_free_ceiling = [0x48, 0x3d, 0xff, 0x0f, 0x00, 0x00];
+        assert_eq!(occurrences(&x86.code, &scanner_free_ceiling), 2);
+        let ready_selection = x86
+            .code
+            .windows(ready_seal.len())
+            .position(|window| window == ready_seal.as_slice())
+            .unwrap();
+        let first_ceiling = x86
+            .code
+            .windows(scanner_free_ceiling.len())
+            .position(|window| window == scanner_free_ceiling)
+            .unwrap();
+        assert!(
+            ready_selection < first_ceiling && first_ceiling < v2_selection,
+            "x86 must authenticate closed V3 before applying the legacy scanner-free ceiling"
+        );
 
         let mut arm_auth = Aarch64Assembler::new();
         let arm_try_v2 = arm_auth.label().unwrap();
@@ -35280,15 +35341,40 @@ int main(void) {{
             .unwrap(),
             aarch64_cmp_w(9, 8).unwrap(),
         ];
-        assert!(
+        let arm_v3_selection = arm_words
+            .windows(arm_v3_flag.len())
+            .position(|words| words == arm_v3_flag)
+            .unwrap();
+        let arm_v2_selection = arm_words
+            .windows(arm_v2_flag.len())
+            .position(|words| words == arm_v2_flag)
+            .unwrap();
+        assert!(arm_v3_selection < arm_v2_selection);
+        let arm_scanner_free_ceiling = aarch64_cmp_x_imm(
+            8,
+            u16::try_from(FROZEN_SCANNER_FREE_DYNAMIC_ROWS_MAX_INPUT_BYTES).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
             arm_words
-                .windows(arm_v3_flag.len())
-                .position(|words| words == arm_v3_flag)
-                .unwrap()
-                < arm_words
-                    .windows(arm_v2_flag.len())
-                    .position(|words| words == arm_v2_flag)
-                    .unwrap()
+                .iter()
+                .filter(|&&word| word == arm_scanner_free_ceiling)
+                .count(),
+            2
+        );
+        let arm_ready_selection = arm
+            .code
+            .windows(arm_ready.len())
+            .position(|window| window == arm_ready.as_slice())
+            .unwrap();
+        let arm_first_ceiling = arm_words
+            .iter()
+            .position(|&word| word == arm_scanner_free_ceiling)
+            .unwrap();
+        assert!(
+            arm_ready_selection < arm_first_ceiling * core::mem::size_of::<u32>()
+                && arm_first_ceiling < arm_v2_selection,
+            "AArch64 must authenticate closed V3 before applying the legacy scanner-free ceiling"
         );
     }
 

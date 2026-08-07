@@ -5685,19 +5685,13 @@ impl CompiledProgram {
         if retained_bytes == 0 || retained_bytes > max_k0_bytes {
             return None;
         }
-        let complete_retained_root = self.partial_dfa().is_some_and(|partial| {
-            let (complete, discovered) = partial.retained_dimensions();
-            complete != 0
-                && complete == discovered
-                && partial.resume_frontier_count() == 0
-        });
-        if !(self
-            .optimization_sidecar
-            .is_optimizing_fallback_without_dfa()
-            || complete_retained_root)
-        {
-            return None;
-        }
+        // V3 eligibility is semantic and proof-driven. Every assertion-free
+        // ordered-NFA program accepted by the dynamic-row view may attempt the
+        // setup-only transaction, irrespective of compile mode or which
+        // optional determinization sidecar happened to be retained. The
+        // complete K0 projection authenticated below is the sole authority
+        // for publishing immutable rows; an incomplete cache still declines
+        // transactionally.
         let dynamic_view = self.native_dynamic_rows_view()?;
         if dynamic_view.output == OutputContract::Span
             && dynamic_view.exact_match_width.is_none()
@@ -18593,6 +18587,119 @@ mod tests {
             &unfilled,
             stride
         ));
+    }
+
+    #[test]
+    fn frozen_v3_promotion_is_governed_by_dynamic_semantics_and_closed_rows() {
+        fn assert_promoted(compiled: &CompiledProgram, label: &str) {
+            assert_eq!(compiled.engine_kind(), EngineKind::OrderedNfa, "{label}");
+            assert!(compiled.native_dynamic_rows_view().is_some(), "{label}");
+            let workspace = compiled.prepare_workspace().unwrap();
+            assert!(
+                workspace
+                    .nfa
+                    .as_ref()
+                    .and_then(|nfa| nfa.dynamic_root_projection(&compiled.automaton))
+                    .is_none(),
+                "V3 setup must leave the live workspace cold for {label}"
+            );
+            let storage = compiled
+                .compiler_private_frozen_dynamic_rows_storage_v3(
+                    &workspace,
+                    usize::MAX,
+                    usize::MAX,
+                )
+                .unwrap_or_else(|| panic!("closed dynamic rows did not promote for {label}"));
+            assert!(storage.descriptor_is_valid_for(compiled.identity), "{label}");
+            let header = compiled.compiler_private_frozen_prepared_header_v3(
+                &workspace,
+                None,
+                Some(&storage),
+            );
+            assert!(header.is_active(), "{label}");
+            assert!(header.has_dynamic_rows(), "{label}");
+            assert_eq!(
+                header.v1.flags,
+                FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3,
+                "{label}"
+            );
+        }
+
+        let no_sidecar = raw_program(
+            &scanner_free_correlated_pair_raw(),
+            OutputContract::Exists,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        assert!(
+            matches!(
+                &no_sidecar.optimization_sidecar,
+                ProgramOptimizationSidecar::None
+            ),
+            "the generalization witness must not receive an optimizer sidecar"
+        );
+        assert_eq!(
+            no_sidecar
+                .native_dynamic_rows_view()
+                .expect("no-sidecar dynamic view")
+                .root_requirement,
+            None,
+            "the no-sidecar witness must also exercise scanner-free V3"
+        );
+        assert_promoted(&no_sidecar, "fresh fast no-sidecar program");
+        let restored_no_sidecar =
+            CompiledProgram::deserialize(&no_sidecar.serialize().unwrap()).unwrap();
+        assert!(matches!(
+            &restored_no_sidecar.optimization_sidecar,
+            ProgramOptimizationSidecar::None
+        ));
+        assert_promoted(&restored_no_sidecar, "restored fast no-sidecar program");
+
+        let mandatory_cut = program(
+            "(?:x|yz)7[A-Za-z]+",
+            OutputContract::Exists,
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+        );
+        assert!(mandatory_cut.nfa_mandatory_suffix.is_none());
+        assert!(
+            mandatory_cut
+                .nfa_mandatory_cut
+                .as_ref()
+                .is_some_and(|cut| cut.exact_product().is_none()),
+            "the composition witness must retain an ordinary mandatory cut"
+        );
+        assert_promoted(&mandatory_cut, "ordinary mandatory-cut fallback");
+        let restored_cut =
+            CompiledProgram::deserialize(&mandatory_cut.serialize().unwrap()).unwrap();
+        assert!(restored_cut.nfa_mandatory_cut.is_some());
+        assert_promoted(&restored_cut, "restored mandatory-cut fallback");
+
+        let exact_product = program(
+            "a[0-2]Z",
+            OutputContract::Exists,
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+        );
+        assert!(exact_product.has_nfa_exact_product());
+        assert!(exact_product.native_dynamic_rows_view().is_none());
+        let exact_workspace = exact_product.prepare_workspace().unwrap();
+        assert!(
+            exact_product
+                .compiler_private_frozen_dynamic_rows_storage_v3(
+                    &exact_workspace,
+                    usize::MAX,
+                    usize::MAX,
+                )
+                .is_none(),
+            "the exact-product route must retain precedence over V3 promotion"
+        );
     }
 
     #[test]
