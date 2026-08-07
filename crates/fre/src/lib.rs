@@ -1406,6 +1406,11 @@ fn charge_unicode_folded_planner_work(
 const K0_NEGATIVE_PREFILTER_MIN_NEEDLE_BYTES: usize = 1;
 const K0_MANDATORY_SUFFIX_MIN_NEEDLE_BYTES: usize = 3;
 const K0_NEGATIVE_PREFILTER_MAX_NEEDLE_BYTES: usize = 1_024;
+// The allocation-free HIR proof is speculative. This independent ceiling
+// admits far more universal byte runs than ordinary syntax produces while
+// preserving planner budget for the broader graph and reverse-inner routes
+// after a late semantic refusal.
+const K0_UNIVERSAL_FINITE_GREEDY_CORRIDOR_MAX_WORK: u64 = 262_144;
 // Mandatory-cut materialization charges one operation per bitmap word read,
 // byte-domain membership test, retained byte write and final inline plan.
 const K0_MANDATORY_CUT_CARDINALITY_WORK: u64 = 4;
@@ -2136,20 +2141,22 @@ fn try_build_k0_mandatory_suffix(
                 | K0MandatorySuffixRecoveryPlan::FiniteMaximumSpanOnly { .. }
         );
         let mut greedy_corridor_completed = false;
-        let mut greedy_corridor_exhausted_work = false;
         if baseline_can_be_upgraded && assertion_edges == 0 {
             if let Some(hir) = structural_hir {
                 if planner_work < limits.max_planner_work {
+                    let structural_limit = planner_work
+                        .saturating_add(K0_UNIVERSAL_FINITE_GREEDY_CORRIDOR_MAX_WORK)
+                        .min(limits.max_planner_work);
                     match universal_finite_greedy_corridor::inspect(
                         hir,
                         candidate.as_bytes(),
                         planner_work,
-                        limits.max_planner_work,
+                        structural_limit,
                     ) {
                         Ok(outcome) => {
                             let inspected_work = outcome.planner_work();
                             if inspected_work < planner_work
-                                || inspected_work > limits.max_planner_work
+                                || inspected_work > structural_limit
                             {
                                 return Err(BuildError::InternalInvariant(
                                     "greedy universal-corridor work receipt did not close",
@@ -2197,13 +2204,12 @@ fn try_build_k0_mandatory_suffix(
                             actual,
                             ..
                         }) => {
-                            if actual < planner_work || actual > limits.max_planner_work {
+                            if actual < planner_work || actual > structural_limit {
                                 return Err(BuildError::InternalInvariant(
                                     "greedy universal-corridor refusal receipt did not close",
                                 ));
                             }
                             planner_work = actual;
-                            greedy_corridor_exhausted_work = true;
                         }
                         Err(
                             universal_finite_greedy_corridor::InspectionError::ArithmeticOverflow,
@@ -2219,7 +2225,6 @@ fn try_build_k0_mandatory_suffix(
         let remaining_corridor_work = limits.max_planner_work.saturating_sub(planner_work);
         if baseline_can_be_upgraded
             && !greedy_corridor_completed
-            && !greedy_corridor_exhausted_work
             && remaining_corridor_work != 0
         {
             let mut corridor_limits = MandatorySuffixAnalysisLimits::default();
@@ -17137,6 +17142,62 @@ mod tests {
                 "pattern={pattern:?}",
             );
         }
+
+        let asymmetric =
+            forced_k0_with_structural_mandatory_suffix(r"(?s-u:.{0,1}.{0,100}X)");
+        let mut asymmetric_haystack = vec![b'q'; FLOOR + 2_048];
+        asymmetric_haystack[FLOOR + 1] = b'X';
+        asymmetric_haystack[FLOOR + 100] = b'X';
+        assert_eq!(
+            asymmetric
+                .find_window_value(
+                    &asymmetric_haystack,
+                    SearchWindow::new(FLOOR, asymmetric_haystack.len()),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            Some(Match {
+                start: FLOOR,
+                end: FLOOR + 101,
+            }),
+            "unequal greedy runs select the latest feasible suffix, not the first arbitrary length vector",
+        );
+
+        let clipped = forced_k0_with_structural_mandatory_suffix(r"(?s-u:.{0,3}aa)");
+        let mut clipped_haystack = vec![b'q'; 4_096];
+        let clipped_end = 3_072;
+        let clipped_floor = clipped_end - 4;
+        clipped_haystack[clipped_floor..clipped_floor + 5].fill(b'a');
+        let clipped_window = SearchWindow::new(0, clipped_end);
+        let mut clipped_session = clipped
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("clipped structural greedy session constructs");
+        let PortableSearchSessionPlan::K0 {
+            session: clipped_k0,
+            mandatory_suffix: Some(clipped_suffix),
+            ..
+        } = &mut clipped_session.plan
+        else {
+            panic!("clipped structural greedy session did not retain K0");
+        };
+        let clipped_attempt = try_k0_mandatory_suffix_span_start(
+            clipped_k0,
+            clipped_suffix,
+            K0NegativePrefilterState::default(),
+            &clipped_haystack,
+            clipped_window,
+            SearchLimits::unlimited(),
+            Some(clipped_floor),
+        )
+        .unwrap();
+        assert_eq!(
+            clipped_attempt.outcome,
+            K0MandatorySuffixSpanOutcome::ProvedSpan {
+                start: clipped_floor,
+                end: clipped_end,
+            },
+            "reverse recovery cannot select a suffix that crosses the caller's window end",
+        );
     }
 
     #[test]

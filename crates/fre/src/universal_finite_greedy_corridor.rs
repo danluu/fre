@@ -4,10 +4,13 @@
 //! finite greedy repetitions (or fixed one-byte terms) whose body accepts every
 //! byte independently, followed by one nonempty exact literal. Multiple prefix
 //! terms remain safe even though their byte languages overlap completely. For
-//! any fixed match start, greedy repetition priority orders their feasible
-//! length vectors lexicographically from greatest to least; over contiguous
-//! finite length intervals, that orders accepted suffix positions from latest
-//! to earliest.
+//! any fixed match start, each attainable total prefix width has one
+//! lexicographically greatest feasible length vector. Those representatives
+//! are monotone in total width because every remaining sum of finite integer
+//! intervals is itself an interval. Greedy backtracking therefore reaches the
+//! latest suffix position that can match before any earlier one. (The raw
+//! lexicographic order of every feasible vector is not, by itself, total-width
+//! order.)
 //!
 //! This proof deliberately does not infer universality from a whole-graph union
 //! of consuming edges. Each repeated position must independently accept all 256
