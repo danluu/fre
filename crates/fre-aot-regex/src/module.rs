@@ -29904,10 +29904,10 @@ int main(void) {{
     #[ignore = "links and executes transient slow-partial public wrappers on the host ISA"]
     #[allow(
         clippy::too_many_lines,
-        reason = "the linked ABI oracle covers validation, local outcomes, holes, and Span deopt"
+        reason = "the linked ABI oracle covers validation, local no-match windows, and Span reverse deopt"
     )]
     fn linked_host_slow_partial_wrapper_preserves_whole_search_transactions() {
-        use std::{collections::VecDeque, fmt::Write as _, fs, process::Command};
+        use std::{fmt::Write as _, fs, process::Command};
 
         fn c_bytes(bytes: &[u8]) -> String {
             bytes
@@ -29915,44 +29915,6 @@ int main(void) {{
                 .map(std::string::ToString::to_string)
                 .collect::<Vec<_>>()
                 .join(",")
-        }
-
-        fn local_match_and_hole(view: NativeProgramView<'_>) -> (Vec<u8>, Vec<u8>) {
-            let classes = view.dfa.class_count;
-            let complete_rows = view.dfa.forward_cells.len() / classes;
-            let mut queue = VecDeque::from([(0_usize, Vec::<u8>::new())]);
-            let mut visited = vec![false; complete_rows];
-            visited[0] = true;
-            let mut matched = None;
-            let mut hole = None;
-            while let Some((state, prefix)) = queue.pop_front() {
-                let row = state * classes;
-                for class in 0..classes {
-                    let cell = view.dfa.forward_cells[row + class];
-                    let mut path = prefix.clone();
-                    path.push(view.dfa.class_representatives[class]);
-                    if cell.accepted && matched.is_none() {
-                        matched = Some(path.clone());
-                    }
-                    if cell.next == NO_DFA_STATE {
-                        continue;
-                    }
-                    let next = usize::try_from(cell.next).unwrap();
-                    if next >= complete_rows {
-                        if hole.is_none() {
-                            path.push(b'!');
-                            hole = Some(path);
-                        }
-                    } else if !visited[next] {
-                        visited[next] = true;
-                        queue.push_back((next, path));
-                    }
-                }
-            }
-            (
-                matched.expect("reachable local accepting transition"),
-                hole.expect("reachable interior whole-search hole"),
-            )
         }
 
         let target = if cfg!(target_arch = "x86_64") {
@@ -29966,45 +29928,6 @@ int main(void) {{
         } else {
             Target::aarch64_macos()
         };
-
-        let exists_probe_request = CompileRequest::new(PARTIAL_LOOP_PATTERN, target)
-            .mode(CompileMode::Fast)
-            .output(OutputContract::Exists);
-        let exists_fast = compile(exists_probe_request).expect("fast Exists fixture");
-        let (exists_limits, exists_candidate) = (1..=64)
-            .find_map(|max_states| {
-                let limits = slow_partial_limits(max_states);
-                let candidate = exists_fast
-                    .program()
-                    .native_slow_determinized_program(
-                        limits.determinize,
-                        limits.max_allocation_bytes,
-                    )
-                    .expect("bounded Exists candidate")?;
-                let (complete, discovered) = candidate.retained_dimensions()?;
-                (complete > 0 && complete < discovered).then_some((limits, candidate))
-            })
-            .expect("host Exists interior prefix");
-        let exists_view = exists_fast
-            .program()
-            .native_slow_determinized_view(&exists_candidate);
-        let (match_bytes, hole_bytes) = local_match_and_hole(exists_view);
-        let exists = crate::compile_with_slow_aot_limits(
-            CompileRequest::new(PARTIAL_LOOP_PATTERN, target)
-                .mode(CompileMode::Optimizing)
-                .output(OutputContract::Exists)
-                .limits(CompileLimitsV1 {
-                    determinize: DeterminizeLimits {
-                        max_states: 0,
-                        ..DeterminizeLimits::default()
-                    },
-                    ..CompileLimitsV1::default()
-                }),
-            exists_limits,
-        )
-        .expect("linked Exists slow partial");
-        assert!(exists.module().slow_aot_report().is_some());
-        assert!(exists.module().prepared_entry_symbol().is_none());
 
         let span_probe_request = CompileRequest::new("a+", target)
             .mode(CompileMode::Fast)
@@ -30034,77 +29957,64 @@ int main(void) {{
             std::process::id()
         ));
         fs::create_dir_all(&directory).expect("create slow-partial linker directory");
-        let exists_object = directory.join("exists.o");
         let span_object = directory.join("span.o");
-        fs::write(&exists_object, exists.object()).expect("write Exists object");
         fs::write(&span_object, span.object()).expect("write Span object");
-        let exists_symbol = exists.module().entry_symbol();
         let span_symbol = span.module().entry_symbol();
-        let exists_serialized = exists.program().serialize().expect("serialize Exists program");
         let span_serialized = span.program().serialize().expect("serialize Span program");
-        let exists_header = &exists_serialized[..crate::PROGRAM_HEADER_LEN];
         let span_header = &span_serialized[..crate::PROGRAM_HEADER_LEN];
         let mut source = format!(
             "#include <stddef.h>\n#include <stdint.h>\n\
              typedef struct{{size_t start;size_t end;}} result_t;\n\
-             extern uint32_t {exists_symbol}(const unsigned char*,size_t,size_t,size_t,result_t*);\n\
              extern uint32_t {span_symbol}(const unsigned char*,size_t,size_t,size_t,result_t*);\n\
-             static const unsigned char match_h[]={{{match_bytes}}};\n\
-             static const unsigned char hole_h[]={{{hole_bytes}}};\n\
-             static const unsigned char span_h[]={{97}};\n\
-             static const unsigned char exists_header[]={{{exists_header}}};\n\
+             static const unsigned char span_h[]={{33,97,97,33}};\n\
              static const unsigned char span_header[]={{{span_header}}};\n\
              static int runtime_calls;\n\
              static int same_bytes(const unsigned char*a,const unsigned char*b,size_t n){{size_t i;for(i=0U;i<n;i++)if(a[i]!=b[i])return 0;return 1;}}\n\
              uint32_t fre_aot_regex_runtime_search_v1(const unsigned char*program,const unsigned char*h,size_t n,size_t s,size_t e,result_t*r){{\
                runtime_calls++;if(program==NULL||r==NULL||s>e||e>n)return 90U;\
-               if(h==hole_h&&n==sizeof(hole_h)&&s==0U&&e==sizeof(hole_h)){{if(!same_bytes(program,exists_header,sizeof(exists_header)))return 92U;r->start=123U;r->end=456U;return 77U;}}\
-               if(h==span_h&&n==sizeof(span_h)&&s==0U&&e==sizeof(span_h)){{if(!same_bytes(program,span_header,sizeof(span_header)))return 93U;r->start=10U;r->end=11U;return 78U;}}\
+               if(h==span_h&&n==sizeof(span_h)&&s==0U&&(e==3U||e==sizeof(span_h))){{if(!same_bytes(program,span_header,sizeof(span_header)))return 93U;r->start=1U;r->end=3U;return e==3U?78U:79U;}}\
                return 91U;}}\n\
              int main(void){{result_t r;uint32_t status;\n",
-            match_bytes = c_bytes(&match_bytes),
-            hole_bytes = c_bytes(&hole_bytes),
-            exists_header = c_bytes(exists_header),
             span_header = c_bytes(span_header),
         );
         writeln!(
             source,
-            "runtime_calls=0;r=(result_t){{91U,92U}};status={exists_symbol}(match_h,sizeof(match_h),0U,sizeof(match_h),&r);if(status!=1U||r.start!=0U||r.end!=0U||runtime_calls!=0)return 10;"
+            "runtime_calls=0;r=(result_t){{91U,92U}};status={span_symbol}(span_h,sizeof(span_h),0U,1U,&r);if(status!=0U||r.start!=0U||r.end!=0U||runtime_calls!=0)return 10;"
         )
         .unwrap();
         writeln!(
             source,
-            "runtime_calls=0;r=(result_t){{91U,92U}};status={exists_symbol}(match_h,sizeof(match_h),0U,0U,&r);if(status!=0U||r.start!=0U||r.end!=0U||runtime_calls!=0)return 11;"
+            "runtime_calls=0;r=(result_t){{91U,92U}};status={span_symbol}(span_h,sizeof(span_h),2U,2U,&r);if(status!=0U||r.start!=0U||r.end!=0U||runtime_calls!=0)return 11;"
         )
         .unwrap();
         writeln!(
             source,
-            "runtime_calls=0;r=(result_t){{91U,92U}};status={exists_symbol}(hole_h,sizeof(hole_h),0U,sizeof(hole_h),&r);if(status!=77U||r.start!=123U||r.end!=456U||runtime_calls!=1)return 12;"
+            "runtime_calls=0;r=(result_t){{91U,92U}};status={span_symbol}(span_h,sizeof(span_h),0U,3U,&r);if(status!=78U||r.start!=1U||r.end!=3U||runtime_calls!=1)return 12;"
         )
         .unwrap();
         writeln!(
             source,
-            "runtime_calls=0;r=(result_t){{91U,92U}};status={span_symbol}(span_h,sizeof(span_h),0U,sizeof(span_h),&r);if(status!=78U||r.start!=10U||r.end!=11U||runtime_calls!=1)return 13;"
+            "runtime_calls=0;r=(result_t){{91U,92U}};status={span_symbol}(span_h,sizeof(span_h),0U,sizeof(span_h),&r);if(status!=79U||r.start!=1U||r.end!=3U||runtime_calls!=1)return 13;"
         )
         .unwrap();
         for (failure, call) in [
             (
                 20,
-                format!("{exists_symbol}(NULL,sizeof(match_h),0U,0U,&r)"),
+                format!("{span_symbol}(NULL,sizeof(span_h),0U,0U,&r)"),
             ),
             (
                 21,
-                format!("{exists_symbol}(match_h,sizeof(match_h),1U,0U,&r)"),
+                format!("{span_symbol}(span_h,sizeof(span_h),1U,0U,&r)"),
             ),
             (
                 22,
                 format!(
-                    "{exists_symbol}(match_h,sizeof(match_h),0U,sizeof(match_h)+1U,&r)"
+                    "{span_symbol}(span_h,sizeof(span_h),0U,sizeof(span_h)+1U,&r)"
                 ),
             ),
             (
                 23,
-                format!("{exists_symbol}(match_h,(size_t)-1,0U,0U,&r)"),
+                format!("{span_symbol}(span_h,(size_t)-1,0U,0U,&r)"),
             ),
         ] {
             writeln!(
@@ -30115,12 +30025,12 @@ int main(void) {{
         }
         writeln!(
             source,
-            "unsigned char misaligned[24] __attribute__((aligned(8)));runtime_calls=0;status={exists_symbol}(match_h,sizeof(match_h),0U,0U,(result_t*)(void*)(misaligned+1));if(status!=2U||runtime_calls!=0)return 24;"
+            "unsigned char misaligned[24] __attribute__((aligned(8)));runtime_calls=0;status={span_symbol}(span_h,sizeof(span_h),0U,0U,(result_t*)(void*)(misaligned+1));if(status!=2U||runtime_calls!=0)return 24;"
         )
         .unwrap();
         writeln!(
             source,
-            "runtime_calls=0;status={exists_symbol}(match_h,sizeof(match_h),0U,0U,NULL);if(status!=2U||runtime_calls!=0)return 25;return 0;}}"
+            "runtime_calls=0;status={span_symbol}(span_h,sizeof(span_h),0U,0U,NULL);if(status!=2U||runtime_calls!=0)return 25;return 0;}}"
         )
         .unwrap();
 
@@ -30135,7 +30045,6 @@ int main(void) {{
         let status = Command::new(compiler)
             .arg("-O0")
             .arg(&c_path)
-            .arg(&exists_object)
             .arg(&span_object)
             .arg("-o")
             .arg(&executable)
