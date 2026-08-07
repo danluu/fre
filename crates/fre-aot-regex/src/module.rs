@@ -25790,9 +25790,11 @@ mod tests {
                     .iter()
                     .position(|&word| word == aarch64_load_byte_reg(8, 0, 2).unwrap())
                     .expect("canonical V2 table transition");
+                let v2_rejoin = unconditional_target(&words, v2_mask_restore + 1)
+                    .unwrap_or(v2_mask_restore + 1);
                 assert_eq!(
-                    unconditional_target(&words, v2_mask_restore + 1),
-                    Some(v2_table),
+                    v2_rejoin,
+                    v2_table,
                     "V2 mask restoration must immediately rejoin its table transition"
                 );
                 assert!(
