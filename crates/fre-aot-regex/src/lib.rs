@@ -380,7 +380,7 @@ pub fn compile(request: CompileRequest) -> Result<CompiledRegex, CompileError> {
 }
 
 /// Compile with an explicit resource envelope for the separately selected
-/// slow assertion-free DFA completion pass.
+/// slow contextual and assertion-free DFA completion passes.
 ///
 /// This leaves [`CompileLimitsV1`] source-compatible and keeps its semantic
 /// program limits distinct from later AOT work. `CompileMode::Fast` never
