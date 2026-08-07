@@ -361,6 +361,10 @@ pub const DYNAMIC_NATIVE_ROWS_V1_ACCEPT_MASK: u32 = 1 << 31;
 /// Encoded next-row field required by [`DynamicNativeRowsV1`].
 #[doc(hidden)]
 pub const DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK: u32 = (1 << 29) - 1;
+const FROZEN_DYNAMIC_SOURCE_START_PROPAGATE: u32 = 1 << 29;
+const FROZEN_DYNAMIC_SOURCE_START_RESET: u32 = 1 << 30;
+const FROZEN_DYNAMIC_SOURCE_START_MASK: u32 =
+    FROZEN_DYNAMIC_SOURCE_START_PROPAGATE | FROZEN_DYNAMIC_SOURCE_START_RESET;
 
 impl SearchWindow {
     #[must_use]
@@ -2812,14 +2816,12 @@ impl FrozenPreparedHeaderV2 {
     clippy::arithmetic_side_effects,
     reason = "validated compact row tokens use an exact one-based row encoding"
 )]
-fn frozen_dynamic_rows_are_closed(rows: &[u32], stride: usize) -> bool {
+fn frozen_dynamic_rows_have_closed_targets(rows: &[u32], stride: usize) -> bool {
     if stride == 0 || rows.is_empty() || rows.len().checked_rem(stride) != Some(0) {
         return false;
     }
-    let allowed_cell_mask =
-        DYNAMIC_NATIVE_ROWS_V1_ACCEPT_MASK | DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK;
     rows.iter().copied().all(|cell| {
-        if cell == DYNAMIC_NATIVE_ROWS_V1_UNFILLED_CELL || cell & !allowed_cell_mask != 0 {
+        if cell == DYNAMIC_NATIVE_ROWS_V1_UNFILLED_CELL {
             return false;
         }
         let encoded = cell & DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK;
@@ -2829,6 +2831,29 @@ fn frozen_dynamic_rows_are_closed(rows: &[u32], stride: usize) -> bool {
                 .and_then(|row| usize::try_from(row).ok())
                 .is_some_and(|row| row < rows.len() && row.checked_rem(stride) == Some(0))
     })
+}
+
+fn frozen_dynamic_rows_are_closed(rows: &[u32], stride: usize) -> bool {
+    let allowed_cell_mask =
+        DYNAMIC_NATIVE_ROWS_V1_ACCEPT_MASK | DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK;
+    frozen_dynamic_rows_have_closed_targets(rows, stride)
+        && rows
+            .iter()
+            .all(|&cell| cell & !allowed_cell_mask == 0)
+}
+
+/// Return whether authenticated K0 rows can discard their Span-only start
+/// provenance and enter the smaller frozen row ABI. Dynamic `Span` requires a
+/// positive exact width, while `Exists` and `SelectedEnd` never observe these
+/// two bits. The row token already identifies the exact post-transition
+/// frontier for every supported output.
+fn frozen_dynamic_source_rows_are_normalizable(rows: &[u32], stride: usize) -> bool {
+    frozen_dynamic_rows_have_closed_targets(rows, stride)
+        && rows
+            .iter()
+            .all(|&cell| {
+                cell & FROZEN_DYNAMIC_SOURCE_START_MASK != FROZEN_DYNAMIC_SOURCE_START_MASK
+            })
 }
 
 impl FrozenDynamicRowsStorage {
@@ -5076,7 +5101,7 @@ impl CompiledProgram {
             || full.unfilled_cell() != DYNAMIC_NATIVE_ROWS_V1_UNFILLED_CELL
             || full.accept_mask() != DYNAMIC_NATIVE_ROWS_V1_ACCEPT_MASK
             || full.next_row_token_mask() != DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK
-            || !frozen_dynamic_rows_are_closed(full.forward_rows(), stride)
+            || !frozen_dynamic_source_rows_are_normalizable(full.forward_rows(), stride)
         {
             return None;
         }
@@ -5090,7 +5115,9 @@ impl CompiledProgram {
 
         let mut owned_rows = Vec::new();
         owned_rows.try_reserve_exact(live_cells).ok()?;
-        owned_rows.extend_from_slice(full.forward_rows());
+        let frozen_cell_mask =
+            DYNAMIC_NATIVE_ROWS_V1_ACCEPT_MASK | DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK;
+        owned_rows.extend(full.forward_rows().iter().map(|&cell| cell & frozen_cell_mask));
         let rows = owned_rows.into_boxed_slice();
 
         let mut owned_class_map = Vec::new();
