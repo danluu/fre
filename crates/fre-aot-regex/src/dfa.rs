@@ -344,16 +344,127 @@ pub(crate) struct SelectedMatch {
     pub(crate) end: usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ForwardCell {
-    pub(crate) next: u32,
-    pub(crate) accepted: bool,
-}
+// Stable DFA state ordinals are bounded far below bit 31. Keep the semantic
+// transition vectors in one word per cell instead of paying four bytes of
+// struct padding for a one-bit outcome flag. The serialized representation is
+// deliberately unchanged: it still writes a u32 destination, one Boolean,
+// and three zero bytes per cell.
+const SEMANTIC_CELL_FLAG: u32 = 1 << 31;
+const SEMANTIC_CELL_NEXT_MASK: u32 = SEMANTIC_CELL_FLAG - 1;
+const SEMANTIC_CELL_NO_STATE: u32 = SEMANTIC_CELL_NEXT_MASK;
+const _: () = assert!(MAX_STABLE_DFA_STATES < SEMANTIC_CELL_NO_STATE as usize);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ReverseCell {
-    pub(crate) next: u32,
-    pub(crate) reaches_start: bool,
+#[repr(transparent)]
+pub(crate) struct ForwardCell(u32);
+
+impl ForwardCell {
+    pub(crate) const fn try_new(next: u32, accepted: bool) -> Option<Self> {
+        let encoded_next = if next == NO_STATE {
+            SEMANTIC_CELL_NO_STATE
+        } else {
+            if next >= SEMANTIC_CELL_NO_STATE {
+                return None;
+            }
+            next
+        };
+        Some(Self(
+            encoded_next | if accepted { SEMANTIC_CELL_FLAG } else { 0 },
+        ))
+    }
+
+    pub(crate) const fn new(next: u32, accepted: bool) -> Self {
+        let Some(cell) = Self::try_new(next, accepted) else {
+            panic!("forward DFA state exceeds packed cell");
+        };
+        cell
+    }
+
+    pub(crate) const fn next(self) -> u32 {
+        let next = self.0 & SEMANTIC_CELL_NEXT_MASK;
+        if next == SEMANTIC_CELL_NO_STATE {
+            NO_STATE
+        } else {
+            next
+        }
+    }
+
+    pub(crate) const fn accepted(self) -> bool {
+        self.0 & SEMANTIC_CELL_FLAG != 0
+    }
+
+    pub(crate) const fn with_next(self, next: u32) -> Self {
+        Self::new(next, self.accepted())
+    }
+}
+
+macro_rules! forward_cell {
+    (next: $next:expr, accepted: $accepted:expr $(,)?) => {
+        $crate::dfa::ForwardCell::new($next, $accepted)
+    };
+    (next: $next:expr, $accepted:ident $(,)?) => {
+        $crate::dfa::ForwardCell::new($next, $accepted)
+    };
+    ($next:ident, accepted: $accepted:expr $(,)?) => {
+        $crate::dfa::ForwardCell::new($next, $accepted)
+    };
+    ($next:ident, $accepted:ident $(,)?) => {
+        $crate::dfa::ForwardCell::new($next, $accepted)
+    };
+}
+pub(crate) use forward_cell;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(transparent)]
+pub(crate) struct ReverseCell(u32);
+
+impl ReverseCell {
+    pub(crate) const fn try_new(next: u32, reaches_start: bool) -> Option<Self> {
+        let encoded_next = if next == NO_STATE {
+            SEMANTIC_CELL_NO_STATE
+        } else {
+            if next >= SEMANTIC_CELL_NO_STATE {
+                return None;
+            }
+            next
+        };
+        Some(Self(
+            encoded_next | if reaches_start { SEMANTIC_CELL_FLAG } else { 0 },
+        ))
+    }
+
+    pub(crate) const fn new(next: u32, reaches_start: bool) -> Self {
+        let Some(cell) = Self::try_new(next, reaches_start) else {
+            panic!("reverse DFA state exceeds packed cell");
+        };
+        cell
+    }
+
+    pub(crate) const fn next(self) -> u32 {
+        let next = self.0 & SEMANTIC_CELL_NEXT_MASK;
+        if next == SEMANTIC_CELL_NO_STATE {
+            NO_STATE
+        } else {
+            next
+        }
+    }
+
+    pub(crate) const fn reaches_start(self) -> bool {
+        self.0 & SEMANTIC_CELL_FLAG != 0
+    }
+
+    pub(crate) const fn with_next(self, next: u32) -> Self {
+        Self::new(next, self.reaches_start())
+    }
+}
+
+macro_rules! reverse_cell {
+    (next: $next:expr, reaches_start: $reaches_start:expr $(,)?) => {
+        $crate::dfa::ReverseCell::new($next, $reaches_start)
+    };
+    ($next:ident, $reaches_start:ident $(,)?) => {
+        $crate::dfa::ReverseCell::new($next, $reaches_start)
+    };
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -732,10 +843,10 @@ impl PackedForwardCell {
         if classes == 0 {
             return None;
         }
-        let next = if cell.next == NO_STATE {
+        let next = if cell.next() == NO_STATE {
             PARTIAL_CELL_DEAD
         } else {
-            let state = usize::try_from(cell.next).ok()?;
+            let state = usize::try_from(cell.next()).ok()?;
             if state < complete_rows {
                 let row = u32::try_from(state.checked_mul(classes)?).ok()?;
                 if row >= PARTIAL_CELL_HOLE_BASE {
@@ -751,7 +862,7 @@ impl PackedForwardCell {
                 hole
             }
         };
-        Some(Self(next | (u32::from(cell.accepted) * PARTIAL_CELL_ACCEPTED)))
+        Some(Self(next | (u32::from(cell.accepted()) * PARTIAL_CELL_ACCEPTED)))
     }
 
     const fn accepted(self) -> bool {
@@ -1186,10 +1297,10 @@ impl NativeDfaView<'_> {
             let mut accepting = NativeByteMask256::default();
             for (class, &class_mask) in class_masks[..self.class_count].iter().enumerate() {
                 let cell = *self.forward_cells.get(row.checked_add(class)?)?;
-                if cell.next != state_u32 {
+                if cell.next() != state_u32 {
                     continue;
                 }
-                if cell.accepted {
+                if cell.accepted() {
                     accepting.union_with(class_mask);
                 } else {
                     non_accepting.union_with(class_mask);
@@ -1272,14 +1383,14 @@ impl NativeDfaView<'_> {
                 .enumerate()
             {
                 let cell = *self.forward_cells.get(row.checked_add(class)?)?;
-                if cell.next != NO_STATE
-                    && usize::try_from(cell.next)
+                if cell.next() != NO_STATE
+                    && usize::try_from(cell.next())
                         .ok()
                         .is_none_or(|next| next >= state_count)
                 {
                     return None;
                 }
-                if cell.accepted || cell.next != self.initial_state {
+                if cell.accepted() || cell.next() != self.initial_state {
                     *qualifies = false;
                 }
             }
@@ -1503,8 +1614,8 @@ impl PartialDfa {
                     )
                 });
         let bounded_targets = self.forward.transitions.iter().all(|cell| {
-            cell.next == NO_STATE
-                || usize::try_from(cell.next)
+            cell.next() == NO_STATE
+                || usize::try_from(cell.next())
                     .ok()
                     .is_some_and(|next| next < self.forward.discovered_states)
         });
@@ -1914,8 +2025,8 @@ impl PartialDfa {
             u64::try_from(self.resume_item_count().unwrap_or(usize::MAX)).unwrap_or(u64::MAX),
         );
         for cell in &self.forward.transitions {
-            put_u32(bytes, cell.next);
-            bytes.push(u8::from(cell.accepted));
+            put_u32(bytes, cell.next());
+            bytes.push(u8::from(cell.accepted()));
             bytes.extend_from_slice(&[0; 3]);
         }
         for key in &self.forward.resume_keys {
@@ -2102,7 +2213,7 @@ impl PartialDfa {
             }
             let accepted = reader.boolean("partial DFA accepted flag is invalid")?;
             reader.zeros(3, "partial DFA cell reserved bytes are non-zero")?;
-            let cell = ForwardCell { next, accepted };
+            let cell = forward_cell! { next, accepted };
             transitions.push(cell);
         }
         let mut resume_keys = dfa_reserve(resume_state_count, "partial DFA resume state")?;
@@ -2466,16 +2577,16 @@ impl OrderedDfa {
                 .ok_or(CompileError::InternalInvariant(
                     "DFA input position overflowed",
                 ))?;
-            if cell.accepted {
+            if cell.accepted() {
                 pending_end = Some(position);
                 if earliest {
                     return Ok(pending_end);
                 }
             }
-            if cell.next == NO_STATE {
+            if cell.next() == NO_STATE {
                 return Ok(pending_end);
             }
-            state = cell.next;
+            state = cell.next();
         }
         Ok(pending_end)
     }
@@ -2506,15 +2617,15 @@ impl OrderedDfa {
                     "reverse DFA transition is outside the complete table",
                 ))?;
             cursor = source;
-            if cell.reaches_start {
+            if cell.reaches_start() {
                 // Execution moves right-to-left, so replacing the candidate
                 // retains the earliest start that reaches the selected end.
                 candidate = Some(cursor);
             }
-            if cell.next == NO_STATE {
+            if cell.next() == NO_STATE {
                 break;
             }
-            state = cell.next;
+            state = cell.next();
         }
         Ok(candidate)
     }
@@ -2582,8 +2693,8 @@ impl OrderedDfa {
             u32::try_from(self.stats.forward_states_before_minimization).unwrap_or(u32::MAX),
         );
         for cell in &self.forward.transitions {
-            put_u32(bytes, cell.next);
-            bytes.push(u8::from(cell.accepted));
+            put_u32(bytes, cell.next());
+            bytes.push(u8::from(cell.accepted()));
             bytes.extend_from_slice(&[0; 3]);
         }
 
@@ -2599,8 +2710,8 @@ impl OrderedDfa {
             u32::try_from(self.stats.reverse_states_before_minimization).unwrap_or(u32::MAX),
         );
         for cell in transitions {
-            put_u32(bytes, cell.next);
-            bytes.push(u8::from(cell.reaches_start));
+            put_u32(bytes, cell.next());
+            bytes.push(u8::from(cell.reaches_start()));
             bytes.extend_from_slice(&[0; 3]);
         }
     }
@@ -2756,7 +2867,7 @@ impl OrderedDfa {
             }
             let accepted = reader.boolean("forward DFA accepted flag is invalid")?;
             reader.zeros(3, "forward DFA cell reserved bytes are non-zero")?;
-            forward_cells.push(ForwardCell { next, accepted });
+            forward_cells.push(forward_cell! { next, accepted });
         }
 
         let reverse_states =
@@ -2817,7 +2928,7 @@ impl OrderedDfa {
                 }
                 let reaches_start = reader.boolean("reverse DFA reaches-start flag is invalid")?;
                 reader.zeros(3, "reverse DFA cell reserved bytes are non-zero")?;
-                reverse_cells.push(ReverseCell {
+                reverse_cells.push(reverse_cell! {
                     next,
                     reaches_start,
                 });
@@ -3813,35 +3924,29 @@ trait RefinementCell: Copy + Eq {
 
 impl RefinementCell for ForwardCell {
     fn next(self) -> u32 {
-        self.next
+        ForwardCell::next(self)
     }
 
     fn observable(self) -> bool {
-        self.accepted
+        self.accepted()
     }
 
     fn with_next(self, next: u32) -> Self {
-        Self {
-            next,
-            accepted: self.accepted,
-        }
+        ForwardCell::with_next(self, next)
     }
 }
 
 impl RefinementCell for ReverseCell {
     fn next(self) -> u32 {
-        self.next
+        ReverseCell::next(self)
     }
 
     fn observable(self) -> bool {
-        self.reaches_start
+        self.reaches_start()
     }
 
     fn with_next(self, next: u32) -> Self {
-        Self {
-            next,
-            reaches_start: self.reaches_start,
-        }
+        ReverseCell::with_next(self, next)
     }
 }
 
@@ -5206,7 +5311,7 @@ fn build_forward(
         ) else {
             decline_with_complete_rows!();
         };
-        let mut row_cells = [ForwardCell {
+        let mut row_cells = [forward_cell! {
             next: NO_STATE,
             accepted: false,
         }; 256];
@@ -5338,7 +5443,7 @@ fn build_forward(
                     id
                 }
             };
-            row_cells[class] = ForwardCell { next, accepted };
+            row_cells[class] = forward_cell! { next, accepted };
             row_start_actions[class] = start_action;
         }
         // Discovery order is independent of the retained table layout. Every
@@ -5508,7 +5613,7 @@ fn build_reverse(
                     id
                 }
             };
-            transitions.push(ReverseCell {
+            transitions.push(reverse_cell! {
                 next,
                 reaches_start,
             });
@@ -6290,7 +6395,7 @@ mod tests {
             .byte_to_class
             .iter()
             .filter(|&&class| {
-                let next = row[usize::from(class)].next;
+                let next = row[usize::from(class)].next();
                 next != NO_STATE
                     && usize::try_from(next)
                         .ok()
@@ -6327,10 +6432,10 @@ mod tests {
         // class was evaluated first: its initial destination is state one.
         let wide_class = ranked.alphabet.class(b'b');
         let narrow_class = ranked.alphabet.class(b'a');
-        assert_eq!(ranked.forward.transitions[wide_class].next, 1);
-        assert_eq!(ranked.forward.transitions[narrow_class].next, 2);
-        assert_eq!(fifo.forward.transitions[narrow_class].next, 1);
-        assert_eq!(fifo.forward.transitions[wide_class].next, 2);
+        assert_eq!(ranked.forward.transitions[wide_class].next(), 1);
+        assert_eq!(ranked.forward.transitions[narrow_class].next(), 2);
+        assert_eq!(fifo.forward.transitions[narrow_class].next(), 1);
+        assert_eq!(fifo.forward.transitions[wide_class].next(), 2);
     }
 
     fn forward_with_work_limit(
@@ -6411,7 +6516,25 @@ mod tests {
 
     #[test]
     fn packed_partial_cells_round_trip_every_semantic_boundary() {
+        assert_eq!(core::mem::size_of::<ForwardCell>(), 4);
+        assert_eq!(core::mem::size_of::<ReverseCell>(), 4);
         assert_eq!(core::mem::size_of::<PackedForwardCell>(), 4);
+        for next in [SEMANTIC_CELL_NO_STATE, SEMANTIC_CELL_FLAG] {
+            for flag in [false, true] {
+                assert!(ForwardCell::try_new(next, flag).is_none());
+                assert!(ReverseCell::try_new(next, flag).is_none());
+            }
+        }
+        for next in [0, MAX_STABLE_DFA_STATES as u32 - 1, NO_STATE] {
+            for flag in [false, true] {
+                let forward = ForwardCell::new(next, flag);
+                assert_eq!(forward.next(), next);
+                assert_eq!(forward.accepted(), flag);
+                let reverse = ReverseCell::new(next, flag);
+                assert_eq!(reverse.next(), next);
+                assert_eq!(reverse.reaches_start(), flag);
+            }
+        }
         for (next, expected) in [
             (0, 0),
             (1, 3),
@@ -6421,19 +6544,19 @@ mod tests {
         ] {
             for accepted in [false, true] {
                 let packed =
-                    PackedForwardCell::from_cell(ForwardCell { next, accepted }, 2, 3)
+                    PackedForwardCell::from_cell(forward_cell! { next, accepted }, 2, 3)
                         .expect("stable partial state fits packed cell");
                 assert_eq!(packed.accepted(), accepted);
                 assert_eq!(packed.0 & (PARTIAL_CELL_ACCEPTED - 1), expected);
             }
         }
-        let outside_stable_range = ForwardCell {
-            next: u32::MAX - 1,
+        let outside_stable_range = forward_cell! {
+            next: SEMANTIC_CELL_NO_STATE - 1,
             accepted: false,
         };
         assert!(PackedForwardCell::from_cell(outside_stable_range, 0, 1).is_none());
 
-        let complete = ForwardCell {
+        let complete = forward_cell! {
             next: 1,
             accepted: false,
         };
@@ -6456,7 +6579,7 @@ mod tests {
         let last_hole_state = PARTIAL_CELL_DEAD - PARTIAL_CELL_HOLE_BASE - 1;
         assert_eq!(
             PackedForwardCell::from_cell(
-                ForwardCell {
+                forward_cell! {
                     next: last_hole_state,
                     accepted: false,
                 },
@@ -6469,7 +6592,7 @@ mod tests {
         );
         assert!(
             PackedForwardCell::from_cell(
-                ForwardCell {
+                forward_cell! {
                     next: last_hole_state + 1,
                     accepted: false,
                 },
@@ -6478,6 +6601,45 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn semantic_cell_allocation_ledger_charges_one_word_per_transition() {
+        const CELLS: usize = 17;
+        const BYTES: usize = CELLS * core::mem::size_of::<u32>();
+
+        let forward_ledger = DeterminizeAllocationLedger::new(BYTES);
+        let mut forward_budget = BuildBudget::new_slow(
+            DeterminizeLimits::unlimited(),
+            forward_ledger.clone(),
+        );
+        forward_budget.begin_stage(DeterminizationStage::ForwardSubsetConstruction);
+        let forward = build_vec::<ForwardCell>(CELLS, &mut forward_budget)
+            .expect("one-word forward cells fit the exact byte ceiling");
+        assert!(forward.capacity() >= CELLS);
+        assert_eq!(forward_ledger.peak_bytes(), BYTES);
+        assert!(!forward_budget.charge_allocation::<ForwardCell>(1));
+        assert!(matches!(
+            forward_budget.decline,
+            Some(DeterminizationDecline {
+                resource: DeterminizationResource::Allocation {
+                    requested_elements: 1,
+                    element_size: 4,
+                },
+                ..
+            })
+        ));
+
+        let reverse_ledger = DeterminizeAllocationLedger::new(BYTES);
+        let mut reverse_budget = BuildBudget::new_slow(
+            DeterminizeLimits::unlimited(),
+            reverse_ledger.clone(),
+        );
+        reverse_budget.begin_stage(DeterminizationStage::ReverseSubsetConstruction);
+        let reverse = build_vec::<ReverseCell>(CELLS, &mut reverse_budget)
+            .expect("one-word reverse cells fit the exact byte ceiling");
+        assert!(reverse.capacity() >= CELLS);
+        assert_eq!(reverse_ledger.peak_bytes(), BYTES);
     }
 
     #[test]
@@ -6545,7 +6707,7 @@ mod tests {
 
     fn one_row_hole(accepted: bool) -> PartialDfa {
         synthetic_partial(
-            vec![ForwardCell { next: 1, accepted }],
+            vec![forward_cell! { next: 1, accepted }],
             vec![ForwardStartAction::Propagate],
             1,
             2,
@@ -6559,7 +6721,7 @@ mod tests {
     #[test]
     fn complete_zero_frontier_view_requires_authenticated_packing() {
         let complete = synthetic_partial(
-            vec![ForwardCell {
+            vec![forward_cell! {
                 next: 0,
                 accepted: true,
             }],
@@ -6606,7 +6768,7 @@ mod tests {
         }
 
         let accepted_dead = synthetic_partial(
-            vec![ForwardCell {
+            vec![forward_cell! {
                 next: NO_STATE,
                 accepted: true,
             }],
@@ -6682,11 +6844,11 @@ mod tests {
         ] {
             let partial = synthetic_partial(
                 vec![
-                    ForwardCell {
+                    forward_cell! {
                         next: 1,
                         accepted: false,
                     },
-                    ForwardCell {
+                    forward_cell! {
                         next: 2,
                         accepted: true,
                     },
@@ -6760,7 +6922,7 @@ mod tests {
     #[test]
     fn partial_publication_drops_abandoned_bfs_capacity() {
         let mut transitions = Vec::with_capacity(4_096);
-        transitions.extend((0_u32..12).map(|next| ForwardCell {
+        transitions.extend((0_u32..12).map(|next| forward_cell! {
             next,
             accepted: next % 2 == 0,
         }));
@@ -7018,8 +7180,8 @@ mod tests {
             complete_rows * partial.native_view().class_count
         );
         assert!(partial.native_view().forward_cells.iter().all(|cell| {
-            cell.next == NO_STATE
-                || usize::try_from(cell.next)
+            cell.next() == NO_STATE
+                || usize::try_from(cell.next())
                     .ok()
                     .is_some_and(|next| next < discovered_states)
         }));
@@ -7436,35 +7598,35 @@ mod tests {
     #[test]
     fn structural_refinement_merges_equivalent_forward_states() {
         let cells = [
-            ForwardCell {
+            forward_cell! {
                 next: 1,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: 2,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: 3,
                 accepted: true,
             },
-            ForwardCell {
+            forward_cell! {
                 next: NO_STATE,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: 3,
                 accepted: true,
             },
-            ForwardCell {
+            forward_cell! {
                 next: NO_STATE,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: NO_STATE,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: NO_STATE,
                 accepted: false,
             },
@@ -7478,27 +7640,27 @@ mod tests {
         assert_eq!(
             minimized.transitions.as_slice(),
             &[
-                ForwardCell {
+                forward_cell! {
                     next: 1,
                     accepted: false,
                 },
-                ForwardCell {
+                forward_cell! {
                     next: 1,
                     accepted: false,
                 },
-                ForwardCell {
+                forward_cell! {
                     next: 2,
                     accepted: true,
                 },
-                ForwardCell {
+                forward_cell! {
                     next: NO_STATE,
                     accepted: false,
                 },
-                ForwardCell {
+                forward_cell! {
                     next: NO_STATE,
                     accepted: false,
                 },
-                ForwardCell {
+                forward_cell! {
                     next: NO_STATE,
                     accepted: false,
                 },
@@ -7509,27 +7671,27 @@ mod tests {
     #[test]
     fn observable_flags_and_dead_sentinel_participate_in_equivalence() {
         let cells = [
-            ReverseCell {
+            reverse_cell! {
                 next: 1,
                 reaches_start: false,
             },
-            ReverseCell {
+            reverse_cell! {
                 next: 2,
                 reaches_start: false,
             },
-            ReverseCell {
+            reverse_cell! {
                 next: NO_STATE,
                 reaches_start: false,
             },
-            ReverseCell {
+            reverse_cell! {
                 next: 2,
                 reaches_start: false,
             },
-            ReverseCell {
+            reverse_cell! {
                 next: NO_STATE,
                 reaches_start: true,
             },
-            ReverseCell {
+            reverse_cell! {
                 next: NO_STATE,
                 reaches_start: false,
             },
@@ -7547,35 +7709,35 @@ mod tests {
     #[test]
     fn quotient_numbering_is_class_order_bfs_with_initial_state_zero() {
         let cells = [
-            ForwardCell {
+            forward_cell! {
                 next: 3,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: 1,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: NO_STATE,
                 accepted: true,
             },
-            ForwardCell {
+            forward_cell! {
                 next: NO_STATE,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: NO_STATE,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: NO_STATE,
                 accepted: true,
             },
-            ForwardCell {
+            forward_cell! {
                 next: 2,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: NO_STATE,
                 accepted: true,
             },
@@ -7588,15 +7750,15 @@ mod tests {
         assert_eq!(minimized.states, 4);
         // Old state 3 is reached through the first class and therefore
         // becomes state 1; old state 1 becomes state 2.
-        assert_eq!(minimized.transitions[0].next, 1);
-        assert_eq!(minimized.transitions[1].next, 2);
+        assert_eq!(minimized.transitions[0].next(), 1);
+        assert_eq!(minimized.transitions[1].next(), 2);
         // Processing new state 1 then discovers old state 2 as new state 3.
-        assert_eq!(minimized.transitions[2].next, 3);
+        assert_eq!(minimized.transitions[2].next(), 3);
     }
 
     #[test]
     fn minimization_declines_cleanly_when_work_is_exhausted() {
-        let cells = [ForwardCell {
+        let cells = [forward_cell! {
             next: NO_STATE,
             accepted: false,
         }];
@@ -7647,7 +7809,7 @@ mod tests {
                 } else {
                     u32::try_from(random_usize(&mut seed, states)).expect("state fits u32")
                 };
-                cells.push(ForwardCell {
+                cells.push(forward_cell! {
                     next,
                     accepted: next_random(&mut seed) & 1 != 0,
                 });
@@ -7691,27 +7853,27 @@ mod tests {
         byte_classes[192..].fill(2);
         let representatives = [0_u8, 64, 192];
         let cells = [
-            ForwardCell {
+            forward_cell! {
                 next: 0,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: 0,
                 accepted: true,
             },
-            ForwardCell {
+            forward_cell! {
                 next: 1,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: NO_STATE,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: NO_STATE,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: 1,
                 accepted: false,
             },
@@ -7749,67 +7911,67 @@ mod tests {
             representatives: vec![0_u8, 1, 2, 3].into_boxed_slice(),
         };
         let cells = [
-            ForwardCell {
+            forward_cell! {
                 next: 1,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: 1,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: 2,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: 0,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: 3,
                 accepted: true,
             },
-            ForwardCell {
+            forward_cell! {
                 next: 3,
                 accepted: true,
             },
-            ForwardCell {
+            forward_cell! {
                 next: NO_STATE,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: 1,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: 3,
                 accepted: true,
             },
-            ForwardCell {
+            forward_cell! {
                 next: 3,
                 accepted: true,
             },
-            ForwardCell {
+            forward_cell! {
                 next: NO_STATE,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: 2,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: NO_STATE,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: NO_STATE,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: NO_STATE,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: 3,
                 accepted: true,
             },
@@ -7881,7 +8043,7 @@ mod tests {
                         _ => u32::try_from(random_usize(&mut seed, states))
                             .expect("small destination"),
                     };
-                    cells.push(ForwardCell {
+                    cells.push(forward_cell! {
                         next,
                         accepted: next_random(&mut seed) & 1 != 0,
                     });
@@ -7929,51 +8091,51 @@ mod tests {
         byte_classes[192..].fill(3);
         let representatives = [0_u8, 32, 96, 192];
         let cells = [
-            ForwardCell {
+            forward_cell! {
                 next: 0,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: 0,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: 0,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: NO_STATE,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: 0,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: 0,
                 accepted: true,
             },
-            ForwardCell {
+            forward_cell! {
                 next: 1,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: NO_STATE,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: 0,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: 0,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: 0,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: NO_STATE,
                 accepted: false,
             },
@@ -7992,7 +8154,7 @@ mod tests {
     fn synchronizing_reset_reports_full_empty_and_nullable_edge_cases() {
         let byte_classes = [0_u8; 256];
         let representatives = [0_u8];
-        let resetting_cells = [ForwardCell {
+        let resetting_cells = [forward_cell! {
             next: 0,
             accepted: false,
         }];
@@ -8002,11 +8164,11 @@ mod tests {
         assert_eq!(full.membership.words, [u64::MAX; 4]);
 
         let nonzero_initial_cells = [
-            ForwardCell {
+            forward_cell! {
                 next: 1,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: 1,
                 accepted: false,
             },
@@ -8018,11 +8180,11 @@ mod tests {
         assert_eq!(nonzero_full.cardinality, 256);
 
         for cell in [
-            ForwardCell {
+            forward_cell! {
                 next: 0,
                 accepted: true,
             },
-            ForwardCell {
+            forward_cell! {
                 next: NO_STATE,
                 accepted: false,
             },
@@ -8052,18 +8214,18 @@ mod tests {
         let mut cells = Vec::with_capacity(states.checked_mul(2).expect("small table"));
         for state in 0..states {
             let state_u32 = u32::try_from(state).expect("small state");
-            cells.push(ForwardCell {
+            cells.push(forward_cell! {
                 next: state_u32,
                 accepted: false,
             });
             let next_state = state.checked_add(1).expect("small state successor");
             cells.push(if next_state < states {
-                ForwardCell {
+                forward_cell! {
                     next: u32::try_from(next_state).expect("small state successor"),
                     accepted: false,
                 }
             } else {
-                ForwardCell {
+                forward_cell! {
                     next: NO_STATE,
                     accepted: true,
                 }
@@ -8119,7 +8281,7 @@ mod tests {
     fn malformed_native_views_conservatively_decline_self_loop_analysis() {
         let byte_classes = [0_u8; 256];
         let representatives = [0_u8];
-        let cells = [ForwardCell {
+        let cells = [forward_cell! {
             next: 0,
             accepted: false,
         }];
@@ -8141,7 +8303,7 @@ mod tests {
     fn malformed_native_views_conservatively_decline_reset_analysis() {
         let byte_classes = [0_u8; 256];
         let representatives = [0_u8];
-        let cells = [ForwardCell {
+        let cells = [forward_cell! {
             next: 0,
             accepted: false,
         }];
@@ -8152,7 +8314,7 @@ mod tests {
         absent_initial.initial_state = 1;
         assert!(absent_initial.synchronizing_reset_bytes().is_none());
 
-        let invalid_destination_cells = [ForwardCell {
+        let invalid_destination_cells = [forward_cell! {
             next: 1,
             accepted: false,
         }];
@@ -8164,11 +8326,11 @@ mod tests {
         two_classes[128..].fill(1);
         let duplicate_representatives = [0_u8, 0];
         let two_cells = [
-            ForwardCell {
+            forward_cell! {
                 next: 0,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: 0,
                 accepted: false,
             },
@@ -8231,8 +8393,8 @@ mod tests {
                         .expect("small test table row");
                     let index = row.checked_add(class).expect("small test table index");
                     let cell = view.forward_cells[index];
-                    if cell.next == u32::try_from(state).expect("test state")
-                        && cell.accepted
+                    if cell.next() == u32::try_from(state).expect("test state")
+                        && cell.accepted()
                             == matches!(acceptance, NativeSelfLoopAcceptance::Accepting)
                     {
                         membership.insert(byte);
@@ -8298,8 +8460,8 @@ mod tests {
                     .expect("small test table row");
                 let index = row.checked_add(class).expect("small test table index");
                 let cell = view.forward_cells[index];
-                let claimed = cell.next == actual.state
-                    && cell.accepted
+                let claimed = cell.next() == actual.state
+                    && cell.accepted()
                         == matches!(actual.acceptance, NativeSelfLoopAcceptance::Accepting);
                 assert_eq!(actual.membership.contains(byte), claimed);
                 assert_eq!(actual.complement.contains(byte), !claimed);
@@ -8328,7 +8490,7 @@ mod tests {
                     .expect("small test table row");
                 let index = row.checked_add(class).expect("small test table index");
                 let cell = view.forward_cells[index];
-                if cell.accepted || cell.next != view.initial_state {
+                if cell.accepted() || cell.next() != view.initial_state {
                     qualifies = false;
                     break;
                 }

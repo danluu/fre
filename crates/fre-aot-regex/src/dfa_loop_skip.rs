@@ -199,7 +199,7 @@ mod tests {
         DfaLoopSkipPlan, MAX_DFA_LOOP_EXIT_RANGES, MAX_DFA_LOOP_VECTOR_CONSTANTS,
         encode_exit_ranges, mask_contains, select_dfa_loop_skip,
     };
-    use crate::dfa::{ForwardCell, NativeDfaView};
+    use crate::dfa::{ForwardCell, NativeDfaView, forward_cell};
     use crate::{CompileMode, CompileRequest, OutputContract, Target, compile};
 
     const NO_STATE: u32 = u32::MAX;
@@ -231,7 +231,7 @@ mod tests {
     fn assert_plan_exact(view: &NativeDfaView<'_>, plan: &DfaLoopSkipPlan) {
         for byte in u8::MIN..=u8::MAX {
             let cell = semantic_cell(view, plan.state, byte);
-            let semantic_exit = cell.next != plan.state || cell.accepted != plan.accepting;
+            let semantic_exit = cell.next() != plan.state || cell.accepted() != plan.accepting;
             assert_eq!(
                 plan.exits_on(byte),
                 semantic_exit,
@@ -247,27 +247,27 @@ mod tests {
         classes[usize::from(b'Z')] = 2;
         let representatives = [0, b'Q', b'Z'];
         let cells = [
-            ForwardCell {
+            forward_cell! {
                 next: 0,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: 1,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: NO_STATE,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: 1,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: NO_STATE,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: NO_STATE,
                 accepted: true,
             },
@@ -331,19 +331,19 @@ mod tests {
         classes[usize::from(b'X')] = 1;
         let representatives = [0, b'X'];
         let cells = [
-            ForwardCell {
+            forward_cell! {
                 next: 0,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: 1,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: 1,
                 accepted: true,
             },
-            ForwardCell {
+            forward_cell! {
                 next: NO_STATE,
                 accepted: false,
             },
@@ -392,35 +392,35 @@ mod tests {
         classes[7..=8].fill(3);
         let representatives = [0, 1, 4, 7];
         let cells = [
-            ForwardCell {
+            forward_cell! {
                 next: 0,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: 1,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: 0,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: 0,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: 1,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: NO_STATE,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: NO_STATE,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: NO_STATE,
                 accepted: false,
             },
@@ -468,13 +468,13 @@ mod tests {
         let mut accepted = None;
         for (position, &byte) in haystack.iter().enumerate() {
             let cell = semantic_cell(view, state, byte);
-            if cell.accepted {
+            if cell.accepted() {
                 accepted = position.checked_add(1);
             }
-            if cell.next == NO_STATE {
+            if cell.next() == NO_STATE {
                 break;
             }
-            state = cell.next;
+            state = cell.next();
         }
         (state, accepted)
     }
@@ -503,13 +503,13 @@ mod tests {
             }
             let cell = semantic_cell(view, state, haystack[position]);
             position = position.checked_add(1).expect("small trace");
-            if cell.accepted {
+            if cell.accepted() {
                 accepted = Some(position);
             }
-            if cell.next == NO_STATE {
+            if cell.next() == NO_STATE {
                 break;
             }
-            state = cell.next;
+            state = cell.next();
         }
         (state, accepted)
     }
@@ -522,35 +522,35 @@ mod tests {
         classes[usize::from(b'Z')] = 3;
         let representatives = [0, b'A', b'Q', b'Z'];
         let cells = [
-            ForwardCell {
+            forward_cell! {
                 next: 0,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: 1,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: 0,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: 0,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: 1,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: 1,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: 0,
                 accepted: false,
             },
-            ForwardCell {
+            forward_cell! {
                 next: NO_STATE,
                 accepted: true,
             },

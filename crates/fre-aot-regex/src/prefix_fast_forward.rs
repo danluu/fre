@@ -297,8 +297,8 @@ fn checked_step(
     }
     let row = state.checked_mul(view.dfa.class_count)?;
     let cell: ForwardCell = *view.dfa.forward_cells.get(row.checked_add(class)?)?;
-    if cell.next != NO_STATE {
-        let next = usize::try_from(cell.next).ok()?;
+    if cell.next() != NO_STATE {
+        let next = usize::try_from(cell.next()).ok()?;
         // A destination outside the declared discovered domain is malformed.
         // A destination inside that domain but beyond the complete row prefix
         // is a real partial-DFA hole and safely terminates prefix retention.
@@ -309,10 +309,10 @@ fn checked_step(
             return Some(CheckedStep::Hole);
         }
     }
-    if cell.accepted || cell.next == NO_STATE {
+    if cell.accepted() || cell.next() == NO_STATE {
         Some(CheckedStep::AcceptOrDead)
     } else {
-        Some(CheckedStep::Live(cell.next))
+        Some(CheckedStep::Live(cell.next()))
     }
 }
 
@@ -502,7 +502,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        CompileMode, DeterminizeLimits, OutputContract, dfa::NativeDfaView,
+        CompileMode, DeterminizeLimits, OutputContract,
+        dfa::{NativeDfaView, forward_cell},
         program::CompiledProgram,
     };
 
@@ -630,11 +631,11 @@ mod tests {
                 let mut state = view.dfa.initial_state;
                 for byte in prefix {
                     let cell = transition(view, state, byte);
-                    if cell.accepted || cell.next == NO_STATE {
+                    if cell.accepted() || cell.next() == NO_STATE {
                         unsafe_transition = true;
                         break;
                     }
-                    state = cell.next;
+                    state = cell.next();
                 }
                 if unsafe_transition {
                     break;
@@ -666,9 +667,9 @@ mod tests {
             let mut state = view.dfa.initial_state;
             for byte in prefix {
                 let cell = transition(view, state, byte);
-                assert!(!cell.accepted, "fast-forward traversed acceptance");
-                assert_ne!(cell.next, NO_STATE, "fast-forward traversed death");
-                state = cell.next;
+                assert!(!cell.accepted(), "fast-forward traversed acceptance");
+                assert_ne!(cell.next(), NO_STATE, "fast-forward traversed death");
+                state = cell.next();
             }
             assert_eq!(state, plan.target_state);
         }
@@ -687,10 +688,10 @@ mod tests {
             let mut state = view.dfa.initial_state;
             for byte in prefix {
                 let cell = transition(view, state, byte);
-                if cell.accepted || cell.next == NO_STATE {
+                if cell.accepted() || cell.next() == NO_STATE {
                     return None;
                 }
-                state = cell.next;
+                state = cell.next();
             }
             if common.is_some_and(|existing| existing != state) {
                 return None;
@@ -717,16 +718,16 @@ mod tests {
                     break;
                 }
                 let cell = view.dfa.forward_cells[index];
-                assert!(!cell.accepted, "test prefix accepted before hole depth");
-                assert_ne!(cell.next, NO_STATE, "test prefix died before hole depth");
-                state = cell.next;
+                assert!(!cell.accepted(), "test prefix accepted before hole depth");
+                assert_ne!(cell.next(), NO_STATE, "test prefix died before hole depth");
+                state = cell.next();
             }
         }
         indices.sort_unstable();
         indices.dedup();
         assert!(!indices.is_empty(), "guarded depth has no transitions");
         for index in indices {
-            cells[index] = ForwardCell {
+            cells[index] = forward_cell! {
                 next: destination,
                 accepted: false,
             };
@@ -958,7 +959,7 @@ mod tests {
             let mut cells = Vec::with_capacity(states * 256);
             for _ in 0..states * 256 {
                 let roll = rng.bounded(32);
-                cells.push(ForwardCell {
+                cells.push(forward_cell! {
                     next: if roll == 0 {
                         NO_STATE
                     } else {
@@ -979,7 +980,7 @@ mod tests {
                                 .checked_mul(256)
                                 .and_then(|row| row.checked_add(usize::from(byte)))
                                 .expect("forced cell");
-                            cells[index] = ForwardCell {
+                            cells[index] = forward_cell! {
                                 next: u32::try_from(
                                     position
                                         .checked_add(1)

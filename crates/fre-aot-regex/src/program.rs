@@ -25,7 +25,7 @@ use crate::{
         self, DeterminizationReport, DeterminizeLimits, DeterminizeOutcome, DfaReplayOrder,
         DfaStats, ForwardCell, NativeDfaView, NativePartialDfaView, NativeSlowPartial, NO_STATE,
         OrderedDfa, PartialDfa, PartialDfaPrefixPlan, PartialDfaResult, PartialDfaResume,
-        ReverseCell,
+        ReverseCell, forward_cell,
     },
     error::{CompileError, CompileResource},
     required_literals::{self, RequiredLiterals},
@@ -3786,15 +3786,15 @@ fn decode_fully_prefilled_forward_rows(
         if cell == unfilled_cell {
             return None;
         }
-        decoded.push(ForwardCell {
-            next: decode_fully_prefilled_next_state(
+        decoded.push(ForwardCell::try_new(
+            decode_fully_prefilled_next_state(
                 cell,
                 row_stride,
                 state_count,
                 next_row_token_mask,
             )?,
-            accepted: cell & accept_mask != 0,
-        });
+            cell & accept_mask != 0,
+        )?);
     }
     Some(decoded.into_boxed_slice())
 }
@@ -3821,15 +3821,15 @@ fn decode_fully_prefilled_reverse_rows(
         if cell == unfilled_cell {
             return None;
         }
-        decoded.push(ReverseCell {
-            next: decode_fully_prefilled_next_state(
+        decoded.push(ReverseCell::try_new(
+            decode_fully_prefilled_next_state(
                 cell,
                 row_stride,
                 state_count,
                 next_row_token_mask,
             )?,
-            reaches_start: cell & accept_mask != 0,
-        });
+            cell & accept_mask != 0,
+        )?);
     }
     Some(decoded.into_boxed_slice())
 }
@@ -3852,10 +3852,10 @@ fn canonicalize_fully_prefilled_forward_initial(
         cells.swap(class, initial_row.checked_add(class)?);
     }
     for cell in &mut cells {
-        if cell.next == 0 {
-            cell.next = initial_state;
-        } else if cell.next == initial_state {
-            cell.next = 0;
+        if cell.next() == 0 {
+            *cell = cell.with_next(initial_state);
+        } else if cell.next() == initial_state {
+            *cell = cell.with_next(0);
         }
     }
     Some(cells)
@@ -3879,10 +3879,10 @@ fn canonicalize_fully_prefilled_reverse_initial(
         cells.swap(class, initial_row.checked_add(class)?);
     }
     for cell in &mut cells {
-        if cell.next == 0 {
-            cell.next = initial_state;
-        } else if cell.next == initial_state {
-            cell.next = 0;
+        if cell.next() == 0 {
+            *cell = cell.with_next(initial_state);
+        } else if cell.next() == initial_state {
+            *cell = cell.with_next(0);
         }
     }
     Some(cells)
@@ -3955,7 +3955,7 @@ pub(crate) struct NativeDynamicRootRequirement {
 // interpreting a general DFA.
 const NATIVE_EXACT_PRODUCT_BYTE_CLASSES: [u8; 256] = [0; 256];
 const NATIVE_EXACT_PRODUCT_CLASS_REPRESENTATIVES: [u8; 1] = [0];
-const NATIVE_EXACT_PRODUCT_REJECTING_ROW: [ForwardCell; 1] = [ForwardCell {
+const NATIVE_EXACT_PRODUCT_REJECTING_ROW: [ForwardCell; 1] = [forward_cell! {
     next: u32::MAX,
     accepted: false,
 }];
@@ -10191,16 +10191,16 @@ mod tests {
                 .unwrap();
             let cell = dfa.forward_cells[row + class];
             position += 1;
-            if cell.accepted {
+            if cell.accepted() {
                 pending_end = Some(position);
                 if view.output == OutputContract::Exists {
                     return MatchResult::Exists(true);
                 }
             }
-            if cell.next == NO_STATE {
+            if cell.next() == NO_STATE {
                 break;
             }
-            state = cell.next;
+            state = cell.next();
         }
 
         match view.output {
@@ -10228,13 +10228,13 @@ mod tests {
                         .checked_mul(dfa.class_count)
                         .unwrap();
                     let cell = dfa.reverse_cells[row + class];
-                    if cell.reaches_start {
+                    if cell.reaches_start() {
                         candidate = Some(cursor);
                     }
-                    if cell.next == NO_STATE {
+                    if cell.next() == NO_STATE {
                         break;
                     }
-                    reverse_state = cell.next;
+                    reverse_state = cell.next();
                 }
                 MatchResult::Span(Some((
                     candidate.expect("materialized reverse recovered start"),

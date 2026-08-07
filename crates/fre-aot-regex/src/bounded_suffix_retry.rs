@@ -373,13 +373,13 @@ fn verify_exists(
                 .checked_add(class)?,
         )?;
         trace.verifier_transitions = trace.verifier_transitions.checked_add(1)?;
-        if cell.accepted {
+        if cell.accepted() {
             return Some(true);
         }
-        if cell.next == u32::MAX {
+        if cell.next() == u32::MAX {
             return Some(false);
         }
-        state = cell.next;
+        state = cell.next();
     }
     Some(false)
 }

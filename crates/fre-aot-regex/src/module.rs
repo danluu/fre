@@ -5499,8 +5499,8 @@ fn build_native_dfa_table_with_cost_model_and_data_limit(
     }
     if view.partial_discovered_states.is_some()
         && dfa.forward_cells.iter().any(|cell| {
-            cell.next != NO_DFA_STATE
-                && usize::try_from(cell.next)
+            cell.next() != NO_DFA_STATE
+                && usize::try_from(cell.next())
                     .ok()
                     .is_none_or(|next| {
                         view.partial_discovered_states
@@ -6024,8 +6024,8 @@ fn build_native_dfa_table_with_cost_model_and_data_limit(
                 for &cell in row {
                     let packed = if let Some(partial) = partial_layout {
                         pack_native_partial_forward_cell(
-                            cell.next,
-                            cell.accepted,
+                            cell.next(),
+                            cell.accepted(),
                             forward_offset,
                             row_bytes,
                             forward_states,
@@ -6036,8 +6036,8 @@ fn build_native_dfa_table_with_cost_model_and_data_limit(
                         )?
                     } else {
                         pack_native_forward_cell(
-                            cell.next,
-                            cell.accepted,
+                            cell.next(),
+                            cell.accepted(),
                             forward_offset,
                             row_bytes,
                             forward_states,
@@ -6072,8 +6072,8 @@ fn build_native_dfa_table_with_cost_model_and_data_limit(
                         .ok_or(ObjectError::InvalidModule("native forward cell"))?;
                     let packed = if let Some(partial) = partial_layout {
                         pack_native_partial_forward_cell(
-                            cell.next,
-                            cell.accepted,
+                            cell.next(),
+                            cell.accepted(),
                             forward_offset,
                             row_bytes,
                             forward_states,
@@ -6084,8 +6084,8 @@ fn build_native_dfa_table_with_cost_model_and_data_limit(
                         )?
                     } else {
                         pack_native_forward_cell(
-                            cell.next,
-                            cell.accepted,
+                            cell.next(),
+                            cell.accepted(),
                             forward_offset,
                             row_bytes,
                             forward_states,
@@ -6108,14 +6108,13 @@ fn build_native_dfa_table_with_cost_model_and_data_limit(
                         append_native_packed_cell(
                             &mut bytes,
                             pack_native_cell(
-                                cell.next,
-                                cell.reaches_start,
+                                cell.next(),
+                                cell.reaches_start(),
                                 reverse_offset,
                                 row_bytes,
                                 retained_reverse_states,
                                 cells,
                             )?,
-                            cells,
                         )?;
                     }
                     let row_end = row_start.checked_add(row_bytes).ok_or(
@@ -6142,8 +6141,8 @@ fn build_native_dfa_table_with_cost_model_and_data_limit(
                         append_native_packed_cell(
                             &mut bytes,
                             pack_native_cell(
-                                cell.next,
-                                cell.reaches_start,
+                                cell.next(),
+                                cell.reaches_start(),
                                 reverse_offset,
                                 row_bytes,
                                 retained_reverse_states,
@@ -7763,25 +7762,25 @@ fn derive_exact_prefix_product_width(view: NativeProgramView<'_>) -> Option<u8> 
                 let class = usize::from(*view.dfa.byte_classes.get(byte_index)?);
                 let cell = *view.dfa.forward_cells.get(row.checked_add(class)?)?;
                 if final_depth {
-                    if !cell.accepted {
+                    if !cell.accepted() {
                         return None;
                     }
                     // A terminal accepted transition may use the dead-state
                     // sentinel because no successor is semantically visited.
                     // Any concrete successor must nevertheless be valid.
-                    if cell.next != NO_DFA_STATE {
-                        let target = usize::try_from(cell.next).ok()?;
+                    if cell.next() != NO_DFA_STATE {
+                        let target = usize::try_from(cell.next()).ok()?;
                         seen.get(target)?;
                     }
                 } else {
-                    if cell.accepted || cell.next == NO_DFA_STATE {
+                    if cell.accepted() || cell.next() == NO_DFA_STATE {
                         return None;
                     }
-                    let target = usize::try_from(cell.next).ok()?;
+                    let target = usize::try_from(cell.next()).ok()?;
                     let target_seen = seen.get_mut(target)?;
                     if !*target_seen {
                         *target_seen = true;
-                        next.push(cell.next);
+                        next.push(cell.next());
                     }
                 }
             }
@@ -7953,7 +7952,7 @@ fn initial_start_membership_words(
         let cell = initial_row
             .get(class)
             .ok_or(ObjectError::InvalidModule("native DFA initial class"))?;
-        if !cell.accepted && cell.next == dfa.initial_state {
+        if !cell.accepted() && cell.next() == dfa.initial_state {
             continue;
         }
         words[byte_index / 64] |= 1_u64 << (byte_index % 64);
@@ -29578,8 +29577,8 @@ int main(void) {{
                 .expect("collapsed slow-partial row geometry");
                 let mut saw_hole = false;
                 for &cell in view.dfa.forward_cells {
-                    if cell.next == NO_DFA_STATE
-                        || usize::try_from(cell.next)
+                    if cell.next() == NO_DFA_STATE
+                        || usize::try_from(cell.next())
                             .ok()
                             .is_some_and(|next| next < complete_rows)
                     {
@@ -29587,8 +29586,8 @@ int main(void) {{
                     }
                     saw_hole = true;
                     let packed = pack_native_partial_forward_cell(
-                        cell.next,
-                        cell.accepted,
+                        cell.next(),
+                        cell.accepted(),
                         usize::try_from(layout.forward_offset).unwrap(),
                         row_bytes,
                         complete_rows,
@@ -31361,16 +31360,16 @@ int main(void) {{
                             u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap())
                         }
                     };
-                    let semantic_hole = cell.next != NO_DFA_STATE
-                        && usize::try_from(cell.next).unwrap() >= view.complete_rows;
+                    let semantic_hole = cell.next() != NO_DFA_STATE
+                        && usize::try_from(cell.next()).unwrap() >= view.complete_rows;
                     let expected_token = if semantic_hole {
                         partial.hole_token_base
-                            + cell.next
+                            + cell.next()
                             - u32::try_from(view.complete_rows).unwrap()
                     } else {
                         u32::try_from(
                             encode_native_next(
-                                cell.next,
+                                cell.next(),
                                 forward_offset,
                                 row_bytes,
                                 view.complete_rows,
@@ -31381,19 +31380,19 @@ int main(void) {{
                         .unwrap()
                     };
                     let expected_accelerated = semantic_hole
-                        || (cell.next != NO_DFA_STATE
-                            && ((layout.has_start_scanner() && cell.next == 0)
-                                || cell.next == plan.state));
+                        || (cell.next() != NO_DFA_STATE
+                            && ((layout.has_start_scanner() && cell.next() == 0)
+                                || cell.next() == plan.state));
                     assert_eq!(packed & layout.cells.next_mask(), expected_token);
                     assert_eq!(
                         packed & layout.cells.accelerated() != 0,
                         expected_accelerated
                     );
-                    assert_eq!(packed & layout.cells.accepts() != 0, cell.accepted);
+                    assert_eq!(packed & layout.cells.accepts() != 0, cell.accepted());
                     saw_hole |= semantic_hole;
                     saw_loop_hole |= semantic_hole && u32::try_from(state).unwrap() == plan.state;
-                    saw_loop_target |= cell.next == plan.state;
-                    saw_accept |= cell.accepted;
+                    saw_loop_target |= cell.next() == plan.state;
+                    saw_accept |= cell.accepted();
                 }
             }
             assert!(saw_hole, "{architecture:?}");
@@ -31405,7 +31404,7 @@ int main(void) {{
                 let class = usize::from(view.dfa.byte_classes[usize::from(byte)]);
                 let cell = view.dfa.dfa.forward_cells
                     [usize::try_from(plan.state).unwrap() * view.dfa.class_count + class];
-                let semantic_exit = cell.next != plan.state || cell.accepted != plan.accepting;
+                let semantic_exit = cell.next() != plan.state || cell.accepted() != plan.accepting;
                 let encoded_exit = plan
                     .filter
                     .ranges()
@@ -32188,13 +32187,13 @@ int main(void) {{
                     .unwrap();
                 let class = usize::from(partial.dfa.byte_classes[usize::from(byte)]);
                 let cell = partial.dfa.dfa.forward_cells[row + class];
-                assert!(!cell.accepted, "fast-forward crossed acceptance");
-                assert_ne!(cell.next, NO_DFA_STATE, "fast-forward crossed death");
+                assert!(!cell.accepted(), "fast-forward crossed acceptance");
+                assert_ne!(cell.next(), NO_DFA_STATE, "fast-forward crossed death");
                 assert!(
-                    usize::try_from(cell.next).unwrap() < partial.complete_rows,
+                    usize::try_from(cell.next()).unwrap() < partial.complete_rows,
                     "fast-forward crossed an incomplete frontier"
                 );
-                state = cell.next;
+                state = cell.next();
             }
             let row_bytes = native_row_bytes(
                 layout.transitions,
@@ -32349,8 +32348,8 @@ int main(void) {{
                 .unwrap();
             assert!(target < partial.complete_rows, "{output:?}");
             assert!(partial.dfa.dfa.forward_cells.iter().any(|cell| {
-                cell.next != NO_DFA_STATE
-                    && usize::try_from(cell.next)
+                cell.next() != NO_DFA_STATE
+                    && usize::try_from(cell.next())
                         .ok()
                         .is_some_and(|next| {
                             next >= partial.complete_rows
@@ -41986,16 +41985,16 @@ int main(void) {{
                         u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap())
                     }
                 };
-                let expected_tag = cell.next != NO_DFA_STATE
-                    && ((cell.next == 0 && layout.start_filter.is_some())
-                        || loop_state == Some(cell.next));
+                let expected_tag = cell.next() != NO_DFA_STATE
+                    && ((cell.next() == 0 && layout.start_filter.is_some())
+                        || loop_state == Some(cell.next()));
                 assert_eq!(packed & layout.cells.accelerated() != 0, expected_tag);
-                assert_eq!(packed & layout.cells.accepts() != 0, cell.accepted);
+                assert_eq!(packed & layout.cells.accepts() != 0, cell.accepted());
                 assert_eq!(
                     packed & layout.cells.next_mask(),
                     u32::try_from(
                         encode_native_next(
-                            cell.next,
+                            cell.next(),
                             forward_offset,
                             row_bytes,
                             forward_states,
@@ -42032,12 +42031,12 @@ int main(void) {{
                     }
                 };
                 assert_eq!(packed & layout.cells.accelerated(), 0);
-                assert_eq!(packed & layout.cells.accepts() != 0, cell.reaches_start);
+                assert_eq!(packed & layout.cells.accepts() != 0, cell.reaches_start());
                 assert_eq!(
                     packed & layout.cells.next_mask(),
                     u32::try_from(
                         encode_native_next(
-                            cell.next,
+                            cell.next(),
                             reverse_offset,
                             row_bytes,
                             reverse_states,
@@ -42103,15 +42102,15 @@ int main(void) {{
                         .1;
                     let loop_state = layout.loop_skip.map(|plan| plan.state);
                     for cell in view.dfa.forward_cells {
-                        if !cell.accepted {
+                        if !cell.accepted() {
                             continue;
                         }
-                        if cell.next == NO_DFA_STATE {
+                        if cell.next() == NO_DFA_STATE {
                             forward[output_index].dead = true;
                         } else {
                             forward[output_index].live = true;
-                            if (layout.start_filter.is_some() && cell.next == 0)
-                                || loop_state == Some(cell.next)
+                            if (layout.start_filter.is_some() && cell.next() == 0)
+                                || loop_state == Some(cell.next())
                             {
                                 forward[output_index].accelerated = true;
                             }
@@ -42119,10 +42118,10 @@ int main(void) {{
                     }
                     if layout.has_reverse {
                         for cell in view.dfa.reverse_cells {
-                            if !cell.reaches_start {
+                            if !cell.reaches_start() {
                                 continue;
                             }
-                            if cell.next == NO_DFA_STATE {
+                            if cell.next() == NO_DFA_STATE {
                                 reverse.dead = true;
                             } else {
                                 reverse.live = true;
@@ -42566,8 +42565,8 @@ int main(void) {{
                 let cell =
                     direct_view.dfa.forward_cells[state * direct_view.dfa.class_count + class];
                 let expected = pack_native_forward_cell(
-                    cell.next,
-                    cell.accepted,
+                    cell.next(),
+                    cell.accepted(),
                     0,
                     direct_row_bytes,
                     states,
@@ -42608,8 +42607,8 @@ int main(void) {{
                     .unwrap();
                 let cell = variable_view.dfa.reverse_cells[source_index];
                 let expected = pack_native_cell(
-                    cell.next,
-                    cell.reaches_start,
+                    cell.next(),
+                    cell.reaches_start(),
                     reverse_offset,
                     direct_row_bytes,
                     reverse_states,
@@ -42926,8 +42925,8 @@ int main(void) {{
                     let class = usize::from(view.dfa.byte_classes[byte]);
                     let cell = view.dfa.forward_cells[state * view.dfa.class_count + class];
                     let expected = pack_native_forward_cell(
-                        cell.next,
-                        cell.accepted,
+                        cell.next(),
+                        cell.accepted(),
                         0,
                         row_bytes,
                         states,
@@ -45782,15 +45781,15 @@ int main(void) {{
             };
             let loop_state = native_layout.loop_skip.map(|plan| plan.state);
             for cell in native_view.dfa.forward_cells {
-                if !cell.accepted {
+                if !cell.accepted() {
                     continue;
                 }
-                if cell.next == NO_DFA_STATE {
+                if cell.next() == NO_DFA_STATE {
                     saw_forward_accept_dead[output_index] = true;
                 } else {
                     saw_forward_accept_live[output_index] = true;
-                    if (native_layout.start_filter.is_some() && cell.next == 0)
-                        || loop_state == Some(cell.next)
+                    if (native_layout.start_filter.is_some() && cell.next() == 0)
+                        || loop_state == Some(cell.next())
                     {
                         saw_forward_accept_accelerated[output_index] = true;
                     }
@@ -45798,10 +45797,10 @@ int main(void) {{
             }
             if native_layout.has_reverse {
                 for cell in native_view.dfa.reverse_cells {
-                    if !cell.reaches_start {
+                    if !cell.reaches_start() {
                         continue;
                     }
-                    if cell.next == NO_DFA_STATE {
+                    if cell.next() == NO_DFA_STATE {
                         saw_reverse_accept_dead = true;
                     } else {
                         saw_reverse_accept_live = true;
