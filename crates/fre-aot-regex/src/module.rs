@@ -14614,11 +14614,6 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     for entry in &mut v12_shift_entries {
         *entry = assembler.label()?;
     }
-    // V13 strictly dominates V11 under the shared resident and token caps:
-    // every table the compiler can publish as V11 is smaller as V13. Keep
-    // the legacy V11 verifier/lowering available for direct ABI audits, but
-    // do not put its unreachable guard or body in every generated entry.
-    let v11_enter: Option<X86Label> = None;
     let v13_enter = pair_supertransition_possible
         .then(|| assembler.label())
         .transpose()?;
@@ -14630,7 +14625,6 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     } else {
         None
     };
-    let v11_shift_entries: Option<[X86Label; 2]> = None;
     let v3_enter = assembler.label()?;
     let v3_dispatch = assembler.label()?;
     let v8_enter = assembler.label()?;
@@ -15212,146 +15206,6 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
             assembler.bind(tail_accept)?;
             assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x60])?;
             assembler.branch(&[0xe9], native_complete.unwrap())?;
-        }
-    }
-
-    if let (Some(v11_enter), Some(v11_shift_entries)) = (v11_enter, v11_shift_entries) {
-        assembler.bind(v11_enter)?;
-        assembler.instruction(&[
-            0x49,
-            0x8b,
-            0x73,
-            u8::try_from(FROZEN_DYNAMIC_ROWS_V3_ROWS_ADDRESS_OFFSET)
-                .map_err(|_| ObjectError::ArithmeticOverflow("x86 V11 rows address"))?,
-        ])?;
-        assembler.instruction(&[0x48, 0x85, 0xf6])?;
-        assembler.branch(&[0x0f, 0x84], framed_fallback)?;
-        assembler.instruction(&[0x49, 0x89, 0xf0])?;
-        let class_map_offset = i32::try_from(FROZEN_PREPARED_HEADER_V1_CLASS_MAP_OFFSET)
-            .map_err(|_| ObjectError::ArithmeticOverflow("x86 V11 inline class map"))?;
-        let mut inline_class_map = vec![0x4c, 0x8d, 0x8f];
-        inline_class_map.extend_from_slice(&class_map_offset.to_le_bytes());
-        assembler.instruction(&inline_class_map)?;
-        assembler.instruction(&[
-            0x41,
-            0x8b,
-            0x43,
-            u8::try_from(FROZEN_DYNAMIC_ROWS_V3_ROW_SHIFT_OFFSET)
-                .map_err(|_| ObjectError::ArithmeticOverflow("x86 V11 class shift"))?,
-        ])?;
-        assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x18])?;
-        assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x40])?;
-        assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x48])?;
-        if output != OutputContract::Exists {
-            assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x60, 0, 0, 0, 0])?;
-        }
-        assembler.instruction(&[0x83, 0xf8, 0x01])?;
-        assembler.branch(&[0x0f, 0x84], v11_shift_entries[0])?;
-        assembler.instruction(&[0x83, 0xf8, 0x02])?;
-        assembler.branch(&[0x0f, 0x85], framed_fallback)?;
-        assembler.branch(&[0xe9], v11_shift_entries[1])?;
-
-        for (index, &entry) in v11_shift_entries.iter().enumerate() {
-            let class_shift = u8::try_from(index + 1)
-                .map_err(|_| ObjectError::ArithmeticOverflow("x86 V11 class shift"))?;
-            let pair_cells = 1_usize
-                .checked_shl(u32::from(class_shift) * 2)
-                .ok_or(ObjectError::ArithmeticOverflow("x86 V11 pair cells"))?;
-            let tail_offset = u8::try_from(
-                pair_cells
-                    .checked_mul(core::mem::size_of::<u32>())
-                    .ok_or(ObjectError::ArithmeticOverflow("x86 V11 tail bitmap"))?,
-            )
-            .map_err(|_| ObjectError::ArithmeticOverflow("x86 V11 tail bitmap"))?;
-            let pair_scan = assembler.label()?;
-            let tail = assembler.label()?;
-            assembler.bind(entry)?;
-            assembler.instruction(&[0x4c, 0x8d, 0x5a, 0x01])?;
-            assembler.instruction(&[0x49, 0x39, 0xcb])?;
-            assembler.branch(&[0x0f, 0x83], tail)?;
-            assembler.bind(pair_scan)?;
-            assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
-            assembler.instruction(&[0x47, 0x0f, 0xb6, 0x14, 0x11])?;
-            assembler.instruction(&[0x44, 0x0f, 0xb6, 0x5c, 0x17, 0x01])?;
-            assembler.instruction(&[0x47, 0x0f, 0xb6, 0x1c, 0x19])?;
-            // V11 admits only C=2/C=4, so one LEA forms first*C+second
-            // without a dependent shift/OR pair.
-            match class_shift {
-                1 => {
-                    assembler.instruction(&[0x47, 0x8d, 0x14, 0x53])?;
-                }
-                2 => {
-                    assembler.instruction(&[0x47, 0x8d, 0x14, 0x93])?;
-                }
-                _ => {
-                    return Err(ObjectError::InvalidModule(
-                        "x86 V11 key has unsupported class shift",
-                    ));
-                }
-            }
-            assembler.instruction(&[0x47, 0x8b, 0x14, 0x90])?;
-
-            if output == OutputContract::Exists {
-                assembler.instruction(&[0x45, 0x85, 0xd2])?;
-                assembler.branch(&[0x0f, 0x88], native_match)?;
-                assembler.instruction(&[0x41, 0x81, 0xe2, 0xff, 0xff, 0xff, 0x1f])?;
-                assembler.branch(&[0x0f, 0x84], native_no_match)?;
-                assembler.instruction(&[0x48, 0x83, 0xc2, 0x02])?;
-            } else {
-                let normal_pair = assembler.label()?;
-                assembler.instruction(&[0x41, 0xf7, 0xc2, 0x00, 0x00, 0x00, 0x20])?;
-                assembler.branch(&[0x0f, 0x84], normal_pair)?;
-                assembler.instruction(&[0x48, 0xff, 0xc2])?;
-                assembler.instruction(&[0x45, 0x85, 0xd2])?;
-                assembler.branch(&[0x0f, 0x89], native_complete.unwrap())?;
-                assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x60])?;
-                assembler.branch(&[0xe9], native_complete.unwrap())?;
-
-                assembler.bind(normal_pair)?;
-                assembler.instruction(&[0x48, 0x83, 0xc2, 0x02])?;
-                let no_accept = assembler.label()?;
-                assembler.instruction(&[0x45, 0x85, 0xd2])?;
-                assembler.branch(&[0x0f, 0x89], no_accept)?;
-                let accept_current = assembler.label()?;
-                let accepted = assembler.label()?;
-                assembler.instruction(&[0x41, 0xf7, 0xc2, 0x00, 0x00, 0x00, 0x40])?;
-                assembler.branch(&[0x0f, 0x84], accept_current)?;
-                assembler.instruction(&[0x4c, 0x8d, 0x5a, 0xff])?;
-                assembler.instruction(&[0x4c, 0x89, 0x5c, 0x24, 0x60])?;
-                assembler.branch(&[0xe9], accepted)?;
-                assembler.bind(accept_current)?;
-                assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x60])?;
-                assembler.bind(accepted)?;
-                assembler.bind(no_accept)?;
-                assembler.instruction(&[0x41, 0x81, 0xe2, 0xff, 0xff, 0xff, 0x1f])?;
-                assembler.branch(&[0x0f, 0x84], native_complete.unwrap())?;
-            }
-
-            assembler.instruction(&[0x4e, 0x8d, 0x44, 0x96, 0xfc])?;
-            assembler.instruction(&[0x4c, 0x8d, 0x5a, 0x01])?;
-            assembler.instruction(&[0x49, 0x39, 0xcb])?;
-            assembler.branch(&[0x0f, 0x82], pair_scan)?;
-            assembler.instruction(&[0x48, 0x39, 0xca])?;
-            assembler.branch(&[0x0f, 0x82], tail)?;
-            assembler.branch(&[0xe9], native_complete.unwrap_or(native_no_match))?;
-
-            assembler.bind(tail)?;
-            assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
-            assembler.instruction(&[0x47, 0x0f, 0xb6, 0x14, 0x11])?;
-            assembler.instruction(&[0x45, 0x8b, 0x58, tail_offset])?;
-            assembler.instruction(&[0x45, 0x0f, 0xa3, 0xd3])?;
-            assembler.instruction(&[0x48, 0xff, 0xc2])?;
-            if output == OutputContract::Exists {
-                assembler.branch(&[0x0f, 0x82], native_match)?;
-                assembler.branch(&[0xe9], native_no_match)?;
-            } else {
-                let tail_accept = assembler.label()?;
-                assembler.branch(&[0x0f, 0x82], tail_accept)?;
-                assembler.branch(&[0xe9], native_complete.unwrap())?;
-                assembler.bind(tail_accept)?;
-                assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x60])?;
-                assembler.branch(&[0xe9], native_complete.unwrap())?;
-            }
         }
     }
 
@@ -25076,10 +24930,6 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     for entry in &mut v12_shift_entries {
         *entry = assembler.label()?;
     }
-    // V13 strictly dominates V11 under the shared resident and token caps.
-    // Omitting the unreachable V11 guard/body keeps the common generated
-    // entry smaller without weakening the direct legacy-format verifier.
-    let v11_enter: Option<Aarch64Label> = None;
     let v13_enter = pair_supertransition_possible
         .then(|| assembler.label())
         .transpose()?;
@@ -25091,7 +24941,6 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     } else {
         None
     };
-    let v11_shift_entries: Option<[Aarch64Label; 2]> = None;
     let v3_enter = assembler.label()?;
     let v3_dispatch = assembler.label()?;
     let v8_enter = assembler.label()?;
@@ -25664,134 +25513,6 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
             assembler.bind(tail_accept)?;
             assembler.instruction(aarch64_store_x(2, 31, 80)?)?;
             assembler.branch(native_complete.unwrap())?;
-        }
-    }
-
-    if let (Some(v11_enter), Some(v11_shift_entries)) = (v11_enter, v11_shift_entries) {
-        assembler.bind(v11_enter)?;
-        assembler.instruction(aarch64_load_x_imm(
-            15,
-            13,
-            u16::try_from(FROZEN_DYNAMIC_ROWS_V3_ROWS_ADDRESS_OFFSET)
-                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 V11 rows address"))?,
-        )?)?;
-        assembler.instruction(aarch64_cmp_x_imm(15, 0)?)?;
-        assembler.branch_cond(AARCH64_EQ, framed_fallback)?;
-        assembler.instruction(aarch64_mov_x(11, 15)?)?;
-        assembler.instruction(aarch64_sub_x_imm(15, 15, 4)?)?;
-        assembler.instruction(aarch64_add_x_imm(
-            14,
-            0,
-            u16::try_from(FROZEN_PREPARED_HEADER_V1_CLASS_MAP_OFFSET)
-                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 V11 class map"))?,
-        )?)?;
-        assembler.instruction(aarch64_load_w_imm(
-            12,
-            13,
-            u16::try_from(FROZEN_DYNAMIC_ROWS_V3_ROW_SHIFT_OFFSET)
-                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 V11 class shift"))?,
-        )?)?;
-        assembler.instruction(aarch64_load_x_imm(0, 31, 8)?)?;
-        assembler.instruction(aarch64_load_x_imm(2, 31, 48)?)?;
-        assembler.instruction(aarch64_load_x_imm(3, 31, 56)?)?;
-        if output != OutputContract::Exists {
-            assembler.instruction(aarch64_store_x(31, 31, 80)?)?;
-        }
-        assembler.instruction(aarch64_cmp_w_imm(12, 1)?)?;
-        assembler.branch_cond(AARCH64_EQ, v11_shift_entries[0])?;
-        assembler.instruction(aarch64_cmp_w_imm(12, 2)?)?;
-        assembler.branch_cond(AARCH64_NE, framed_fallback)?;
-        assembler.branch(v11_shift_entries[1])?;
-
-        for (index, &entry) in v11_shift_entries.iter().enumerate() {
-            let class_shift = u32::try_from(index + 1)
-                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 V11 class shift"))?;
-            let pair_cells = 1_usize
-                .checked_shl(class_shift * 2)
-                .ok_or(ObjectError::ArithmeticOverflow("AArch64 V11 pair cells"))?;
-            let tail_offset = u16::try_from(
-                pair_cells
-                    .checked_mul(core::mem::size_of::<u32>())
-                    .ok_or(ObjectError::ArithmeticOverflow("AArch64 V11 tail bitmap"))?,
-            )
-            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 V11 tail bitmap"))?;
-            let pair_scan = assembler.label()?;
-            let tail = assembler.label()?;
-            assembler.bind(entry)?;
-            assembler.instruction(aarch64_add_x_imm(9, 2, 1)?)?;
-            assembler.instruction(aarch64_cmp_x(9, 3)?)?;
-            assembler.branch_cond(AARCH64_HS, tail)?;
-            assembler.bind(pair_scan)?;
-            assembler.instruction(aarch64_load_byte_reg(8, 0, 2)?)?;
-            assembler.instruction(aarch64_load_byte_reg(8, 14, 8)?)?;
-            // The entry/backedge pair bound leaves position+1 live in X9.
-            assembler.instruction(aarch64_load_byte_reg(10, 0, 9)?)?;
-            assembler.instruction(aarch64_load_byte_reg(10, 14, 10)?)?;
-            assembler.instruction(aarch64_add_w_lsl(
-                8,
-                10,
-                8,
-                u8::try_from(class_shift)
-                    .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 V11 class shift"))?,
-            )?)?;
-            assembler.instruction(aarch64_load_w_uxtw(8, 11, 8)?)?;
-
-            if output == OutputContract::Exists {
-                assembler.branch_bit_set_w(8, 31, native_match)?;
-                assembler.instruction(aarch64_and_low_w(8, 8, 29)?)?;
-                assembler.branch_zero_w(8, native_no_match)?;
-                assembler.instruction(aarch64_add_x_imm(2, 2, 2)?)?;
-            } else {
-                let normal_pair = assembler.label()?;
-                assembler.branch_bit_clear_w(8, 29, normal_pair)?;
-                assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
-                assembler.branch_bit_clear_w(8, 31, native_complete.unwrap())?;
-                assembler.instruction(aarch64_store_x(2, 31, 80)?)?;
-                assembler.branch(native_complete.unwrap())?;
-
-                assembler.bind(normal_pair)?;
-                assembler.instruction(aarch64_add_x_imm(2, 2, 2)?)?;
-                let no_accept = assembler.label()?;
-                assembler.branch_bit_clear_w(8, 31, no_accept)?;
-                let accept_current = assembler.label()?;
-                let accepted = assembler.label()?;
-                assembler.branch_bit_clear_w(8, 30, accept_current)?;
-                assembler.instruction(aarch64_sub_x_imm(9, 2, 1)?)?;
-                assembler.instruction(aarch64_store_x(9, 31, 80)?)?;
-                assembler.branch(accepted)?;
-                assembler.bind(accept_current)?;
-                assembler.instruction(aarch64_store_x(2, 31, 80)?)?;
-                assembler.bind(accepted)?;
-                assembler.bind(no_accept)?;
-                assembler.instruction(aarch64_and_low_w(8, 8, 29)?)?;
-                assembler.branch_zero_w(8, native_complete.unwrap())?;
-            }
-
-            assembler.instruction(aarch64_add_x_uxtw(11, 15, 8, 2)?)?;
-            assembler.instruction(aarch64_add_x_imm(9, 2, 1)?)?;
-            assembler.instruction(aarch64_cmp_x(9, 3)?)?;
-            assembler.branch_cond(AARCH64_LO, pair_scan)?;
-            assembler.instruction(aarch64_cmp_x(2, 3)?)?;
-            assembler.branch_cond(AARCH64_LO, tail)?;
-            assembler.branch(native_complete.unwrap_or(native_no_match))?;
-
-            assembler.bind(tail)?;
-            assembler.instruction(aarch64_load_byte_reg(8, 0, 2)?)?;
-            assembler.instruction(aarch64_load_byte_reg(8, 14, 8)?)?;
-            assembler.instruction(aarch64_load_w_imm(10, 11, tail_offset)?)?;
-            assembler.instruction(aarch64_lsrv_x(10, 10, 8)?)?;
-            assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
-            if output == OutputContract::Exists {
-                assembler.branch_bit_set_w(10, 0, native_match)?;
-                assembler.branch(native_no_match)?;
-            } else {
-                let tail_accept = assembler.label()?;
-                assembler.branch_bit_set_w(10, 0, tail_accept)?;
-                assembler.branch(native_complete.unwrap())?;
-                assembler.bind(tail_accept)?;
-                assembler.instruction(aarch64_store_x(2, 31, 80)?)?;
-                assembler.branch(native_complete.unwrap())?;
-            }
         }
     }
 
