@@ -2572,7 +2572,10 @@ pub struct FrozenPreparedHeaderV2 {
 /// and exact extent select this tail before any overlapping V2 field is read;
 /// an older V2 entry therefore rejects the record and uses its authenticated
 /// preflight path. The tail ready seal is published only after every mirror
-/// in the V1 prefix has been initialized.
+/// in the V1 prefix has been initialized. After that publication all geometry,
+/// mirrors, the inline class map, and the owned rows are immutable for the
+/// prepared allocation's lifetime. Revocation clears the active seal before
+/// clearing the ready seal, and no operation republishes either seal.
 #[doc(hidden)]
 #[derive(Debug, Eq, PartialEq)]
 #[repr(C)]
@@ -2965,7 +2968,9 @@ impl FrozenPreparedHeaderV3 {
     #[doc(hidden)]
     pub fn deactivate(&mut self) {
         // Clear the offset-zero authorization first. A native entry always
-        // authenticates it before following or interpreting the V3 tail.
+        // authenticates it before following or interpreting the V3 tail. All
+        // geometry remains write-once, so an active seal is also a capability
+        // for the setup-validated immutable geometry.
         self.v1.deactivate();
         self.dynamic_rows_v3.ready_seal = 0;
     }
@@ -18822,7 +18827,7 @@ mod tests {
         assert_eq!(storage.descriptor.rows_address, rows_address);
         assert!(storage.descriptor_is_valid_for(compiled.identity));
 
-        let header = compiled.compiler_private_frozen_prepared_header_v3(
+        let mut header = compiled.compiler_private_frozen_prepared_header_v3(
             &workspace,
             None,
             Some(&storage),
@@ -18840,6 +18845,32 @@ mod tests {
             header.dynamic_rows_v3.ready_seal,
             FROZEN_PREPARED_HEADER_V3_READY_SEAL
         );
+
+        // The active V3 seal is a revocable capability for setup-validated
+        // write-once geometry. Revocation changes only the two seals; every
+        // field consumed by the compact native loop remains immutable and no
+        // public operation can reactivate this allocation.
+        let published_tail = header.dynamic_rows_v3;
+        let published_class_map = header.v1.class_map;
+        header.deactivate();
+        assert!(!header.is_active());
+        assert!(!header.has_dynamic_rows());
+        assert_eq!(header.v1.active_seal, 0);
+        let mut revoked_tail = published_tail;
+        revoked_tail.ready_seal = 0;
+        assert_eq!(header.dynamic_rows_v3, revoked_tail);
+        assert_eq!(header.v1.flags, FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3);
+        assert_eq!(header.v1.header_bytes, FROZEN_PREPARED_HEADER_V3_BYTES);
+        assert_eq!(header.v1.artifact_identity, compiled.identity.artifact);
+        assert_eq!(header.v1.forward_rows_address, rows_address);
+        assert_eq!(header.v1.forward_live_cells, storage.rows.len());
+        assert_eq!(header.v1.cache_identity, published_tail.cache_identity);
+        assert_eq!(usize::try_from(header.v1.row_stride).unwrap(), physical_cells);
+        assert_eq!(
+            usize::try_from(header.v1.forward_initial_row).unwrap(),
+            usize::try_from(published_tail.initial_state).unwrap() * physical_cells
+        );
+        assert_eq!(header.v1.class_map, published_class_map);
 
         let v2 = compiled.compiler_private_frozen_prepared_header_v2(
             &workspace,
