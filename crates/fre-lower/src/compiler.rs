@@ -200,6 +200,19 @@ pub(crate) fn compile_general(
     compile_with_nullable_policy(hir, operation, limits, utf8_start_guarded, true)
 }
 
+pub(crate) fn compile_concat_slice(
+    parts: &[Hir],
+    operation: OperationSemantics,
+    limits: LowerLimits,
+) -> Result<(RawPlan, LowerStats), LowerError> {
+    if operation == OperationSemantics::CaptureSensitive {
+        return Err(LowerError::Unsupported(
+            UnsupportedFeature::CaptureSensitiveOperation,
+        ));
+    }
+    Compiler::new(limits, 0, false, false).run_concat_slice(parts)
+}
+
 fn compile_with_nullable_policy(
     hir: &Hir,
     operation: OperationSemantics,
@@ -274,6 +287,28 @@ impl<'h> Compiler<'h> {
             hir
         };
         self.push_task(Task::Visit(root))?;
+        self.finish()
+    }
+
+    fn run_concat_slice(mut self, parts: &'h [Hir]) -> Result<(RawPlan, LowerStats), LowerError> {
+        let mut erased_captures = 0usize;
+        for part in parts {
+            self.charge(1, "borrowed concatenation capture census")?;
+            erased_captures = erased_captures
+                .checked_add(part.properties().explicit_captures_len())
+                .ok_or(LowerError::ArithmeticOverflow {
+                    computation: "borrowed concatenation capture census",
+                })?;
+        }
+        self.erased_captures = erased_captures;
+        self.push_task(Task::FinishConcat(parts.len()))?;
+        for part in parts.iter().rev() {
+            self.push_task(Task::Visit(part))?;
+        }
+        self.finish()
+    }
+
+    fn finish(mut self) -> Result<(RawPlan, LowerStats), LowerError> {
         while let Some(task) = self.tasks.pop() {
             self.charge(1, "task dispatch")?;
             match task {

@@ -1,11 +1,9 @@
 //! General capture-free K0 reverse-inner acceleration for value-only Exists.
 //!
-//! Admission deliberately recognizes only `Concat([P, S0, tail...])`, where
-//! `S0` is a nonempty literal or a literal-only alternation. Looking for a
-//! split later in the concatenation would require constructing an owned HIR
-//! for all preceding children. HIR cloning is not fallible or resource-
-//! receipted, so that broader extraction is intentionally deferred until the
-//! lowerer accepts a borrowed concat slice or an equivalent checked builder.
+//! Admission recognizes `Concat([P..., S, tail...])`, where the borrowed
+//! prefix `P...` has positive minimum width and `S` is the first eligible
+//! nonempty literal or literal-only alternation. The prefix is lowered from
+//! its original concat slice, without an unreceipted HIR clone.
 //! A leftmost-first literal matcher enumerates every distinct split boundary
 //! in increasing start order. A separate reverse-capable K0 session
 //! authenticates `P` ending at that boundary, and the original full K0
@@ -67,7 +65,7 @@ impl InspectionOutcome<'_> {
 }
 
 pub(crate) struct Inspection<'hir> {
-    prefix: &'hir Hir,
+    prefix_parts: &'hir [Hir],
     literals: [&'hir [u8]; MAX_LITERALS],
     literal_count: usize,
     literal_bytes: usize,
@@ -380,60 +378,27 @@ pub(crate) fn inspect(
     if parts.len() < 2 {
         return Ok(InspectionOutcome::Ineligible { planner_work: work });
     }
-    let prefix = &parts[0];
+    let first = &parts[0];
     charge(&mut work, NODE_WORK, max_planner_work)?;
-    if !matches!(prefix.properties().minimum_len(), Some(minimum) if minimum > 0) {
+    if !matches!(first.properties().minimum_len(), Some(minimum) if minimum > 0) {
         return Ok(InspectionOutcome::Ineligible { planner_work: work });
     }
-
-    let mut literals = [&[][..]; MAX_LITERALS];
-    let mut literal_count = 0usize;
-    let mut literal_bytes = 0usize;
-    let split = &parts[1];
-    charge(&mut work, NODE_WORK, max_planner_work)?;
-    match split.kind() {
-        HirKind::Literal(literal) => {
-            if !record_literal(
-                literal.0.as_ref(),
-                &mut literals,
-                &mut literal_count,
-                &mut literal_bytes,
-                &mut work,
-                max_planner_work,
-            )? {
-                return Ok(InspectionOutcome::Ineligible { planner_work: work });
-            }
+    for split_index in 1..parts.len() {
+        let split = &parts[split_index];
+        charge(&mut work, NODE_WORK, max_planner_work)?;
+        if let Some((literals, literal_count, literal_bytes)) =
+            inspect_literal_split(split, &mut work, max_planner_work)?
+        {
+            return Ok(InspectionOutcome::Eligible(Inspection {
+                prefix_parts: &parts[..split_index],
+                literals,
+                literal_count,
+                literal_bytes,
+                planner_work: work,
+            }));
         }
-        HirKind::Alternation(branches) if (1..=MAX_LITERALS).contains(&branches.len()) => {
-            for branch in branches {
-                charge(&mut work, NODE_WORK, max_planner_work)?;
-                let HirKind::Literal(literal) = branch.kind() else {
-                    return Ok(InspectionOutcome::Ineligible { planner_work: work });
-                };
-                if !record_literal(
-                    literal.0.as_ref(),
-                    &mut literals,
-                    &mut literal_count,
-                    &mut literal_bytes,
-                    &mut work,
-                    max_planner_work,
-                )? {
-                    return Ok(InspectionOutcome::Ineligible { planner_work: work });
-                }
-            }
-        }
-        _ => return Ok(InspectionOutcome::Ineligible { planner_work: work }),
     }
-    if literal_count == 0 || literal_bytes == 0 || literal_bytes > MAX_LITERAL_BYTES {
-        return Ok(InspectionOutcome::Ineligible { planner_work: work });
-    }
-    Ok(InspectionOutcome::Eligible(Inspection {
-        prefix,
-        literals,
-        literal_count,
-        literal_bytes,
-        planner_work: work,
-    }))
+    Ok(InspectionOutcome::Ineligible { planner_work: work })
 }
 
 impl Inspection<'_> {
@@ -524,8 +489,8 @@ impl Inspection<'_> {
             .automata
             .max_storage_bytes
             .min(prefix_budget);
-        let lowered = match fre_lower::lower_hir(
-            self.prefix,
+        let lowered = match fre_lower::lower_hir_concat_slice(
+            self.prefix_parts,
             OperationSemantics::CaptureFree,
             prefix_limits,
         ) {
@@ -757,6 +722,53 @@ pub(crate) fn try_exists(
     })
 }
 
+fn inspect_literal_split<'hir>(
+    split: &'hir Hir,
+    work: &mut u64,
+    max_work: u64,
+) -> Result<Option<([&'hir [u8]; MAX_LITERALS], usize, usize)>, InspectionError> {
+    let mut literals = [&[][..]; MAX_LITERALS];
+    let mut literal_count = 0usize;
+    let mut literal_bytes = 0usize;
+    match split.kind() {
+        HirKind::Literal(literal) => {
+            if !record_literal(
+                literal.0.as_ref(),
+                &mut literals,
+                &mut literal_count,
+                &mut literal_bytes,
+                work,
+                max_work,
+            )? {
+                return Ok(None);
+            }
+        }
+        HirKind::Alternation(branches) if (1..=MAX_LITERALS).contains(&branches.len()) => {
+            for branch in branches {
+                charge(work, NODE_WORK, max_work)?;
+                let HirKind::Literal(literal) = branch.kind() else {
+                    return Ok(None);
+                };
+                if !record_literal(
+                    literal.0.as_ref(),
+                    &mut literals,
+                    &mut literal_count,
+                    &mut literal_bytes,
+                    work,
+                    max_work,
+                )? {
+                    return Ok(None);
+                }
+            }
+        }
+        _ => return Ok(None),
+    }
+    if literal_count == 0 || literal_bytes == 0 || literal_bytes > MAX_LITERAL_BYTES {
+        return Ok(None);
+    }
+    Ok(Some((literals, literal_count, literal_bytes)))
+}
+
 fn record_literal<'hir>(
     bytes: &'hir [u8],
     literals: &mut [&'hir [u8]; MAX_LITERALS],
@@ -902,8 +914,13 @@ mod tests {
     }
 
     #[test]
-    fn inspector_requires_the_direct_capture_free_split() {
-        for pattern in ["q+(?:abcd|bc)Z", "[a-z]+needle.*tail"] {
+    fn inspector_requires_a_capture_free_positive_prefix_and_exact_split() {
+        for pattern in [
+            "q+(?:abcd|bc)Z",
+            "[a-z]+needle.*tail",
+            "q+[0-9]+needleZ",
+            "q+[0-9]+(?:needle|marker)Z",
+        ] {
             let rust = parsed(pattern);
             assert!(matches!(
                 inspect(&rust.hir, 0, 0, u64::MAX).unwrap(),
@@ -917,9 +934,7 @@ mod tests {
             "q*(?:abcd|bc)Z",
             "q+(?:a|bc)Z",
             "q+(?:ab|b[cd])Z",
-            // A later split is semantically eligible in principle, but would
-            // require an owned, fallible and accounted concat-prefix copy.
-            "q+[0-9]+needleZ",
+            "q+[0-9]+[A-Z]+",
         ] {
             let rust = parsed(pattern);
             assert!(matches!(
@@ -936,11 +951,50 @@ mod tests {
     }
 
     #[test]
+    fn inspector_selects_the_first_eligible_later_split_and_receipts_rejections() {
+        let first = parsed("q+[0-9]+needle(?:marker|signal)Z");
+        let InspectionOutcome::Eligible(first) =
+            inspect(&first.hir, 0, 0, u64::MAX).unwrap()
+        else {
+            panic!("later exact literal must be admitted");
+        };
+        assert_eq!(first.prefix_parts.len(), 2);
+        assert_eq!(first.literal_count, 1);
+        assert_eq!(first.literals[0], b"needle");
+
+        let alternation = parsed("q+[0-9]+(?:needle|marker)Z");
+        let InspectionOutcome::Eligible(alternation) =
+            inspect(&alternation.hir, 0, 0, u64::MAX).unwrap()
+        else {
+            panic!("later literal alternation must be admitted");
+        };
+        assert_eq!(alternation.prefix_parts.len(), 2);
+        assert_eq!(alternation.literal_count, 2);
+        assert_eq!(alternation.literals[0], b"needle");
+        assert_eq!(alternation.literals[1], b"marker");
+
+        let direct = parsed("q+needle(?:marker|signal)Z");
+        let direct_work = inspect(&direct.hir, 0, 0, u64::MAX)
+            .unwrap()
+            .planner_work();
+        let rejected = parsed("q+(?:a+|b[cd])needle(?:marker|signal)Z");
+        let InspectionOutcome::Eligible(rejected) =
+            inspect(&rejected.hir, 0, 0, u64::MAX).unwrap()
+        else {
+            panic!("inspection must continue beyond an ineligible child");
+        };
+        assert_eq!(rejected.prefix_parts.len(), 2);
+        assert_eq!(rejected.literals[0], b"needle");
+        assert!(rejected.planner_work > direct_work);
+    }
+
+    #[test]
     fn inspector_work_limit_closes_before_overrun() {
         let rust = parsed("q+(?:abcd|bc)Z");
         let exact = inspect(&rust.hir, 0, 0, u64::MAX)
             .unwrap()
             .planner_work();
+        assert_eq!(exact, 13);
         assert_eq!(
             inspect(&rust.hir, 0, 0, exact).unwrap().planner_work(),
             exact
@@ -980,6 +1034,124 @@ mod tests {
             ),
             Attempt::Complete { output: true, .. }
         ));
+    }
+
+    #[test]
+    fn later_split_authenticates_the_whole_prefix_tail_overlaps_and_window() {
+        let pattern = "q+[0-9]+(?:abab|bab)Z";
+        for (haystack, window, expected) in [
+            (
+                &b"xxqq12ababZyy"[..],
+                SearchWindow::new(2, 11),
+                true,
+            ),
+            (
+                &b"xxqq12ababZyy"[..],
+                SearchWindow::new(4, 11),
+                false,
+            ),
+            (
+                &b"xxqq12ababZyy"[..],
+                SearchWindow::new(2, 10),
+                false,
+            ),
+            (
+                &b"qq12XababZ"[..],
+                SearchWindow::new(0, 10),
+                false,
+            ),
+            (
+                &b"qq12ababQ"[..],
+                SearchWindow::new(0, 9),
+                false,
+            ),
+        ] {
+            assert!(matches!(
+                attempt(pattern, false, haystack, window, u64::MAX / 4),
+                Attempt::Complete { output, .. } if output == expected
+            ));
+        }
+    }
+
+    #[test]
+    fn later_split_candidate_exhaustion_falls_back_without_publishing_a_result() {
+        let haystack = b"needle".repeat(9);
+        assert_eq!(
+            attempt(
+                "q+[0-9]+needle[A-Z]",
+                false,
+                &haystack,
+                SearchWindow::full(&haystack),
+                u64::MAX / 4,
+            ),
+            Attempt::Fallback,
+        );
+    }
+
+    #[test]
+    fn later_split_candidate_matches_authoritative_k0_on_bounded_inputs() {
+        const ALPHABET: &[u8] = b"q1abZ";
+        let (full, sidecar) = plans("q+[0-9]+(?:ab|ba)Z", false);
+        let mut full_session = K0SearchSession::new_selected(
+            &full,
+            SearchSessionLimits::unlimited(),
+            true,
+            true,
+        )
+        .unwrap();
+        let mut sidecar_session = SearchSession::try_new(
+            &sidecar,
+            &full,
+            &full_session,
+            SearchSessionLimits::unlimited(),
+        )
+        .unwrap()
+        .unwrap();
+        let mut complete = 0usize;
+        let mut matched = 0usize;
+        for len in 0..=5usize {
+            let cases = ALPHABET.len().pow(u32::try_from(len).unwrap());
+            for mut encoded in 0..cases {
+                let mut haystack = vec![0u8; len];
+                for byte in &mut haystack {
+                    *byte = ALPHABET[encoded % ALPHABET.len()];
+                    encoded /= ALPHABET.len();
+                }
+                for start in 0..=len {
+                    for end in start..=len {
+                        let window = SearchWindow::new(start, end);
+                        let expected = full_session
+                            .search_exists_value(
+                                &haystack,
+                                window,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap();
+                        match try_exists(
+                            &mut full_session,
+                            &mut sidecar_session,
+                            &haystack,
+                            window,
+                            u64::MAX / 4,
+                        )
+                        .unwrap()
+                        {
+                            Attempt::Complete { output, .. } => {
+                                assert_eq!(
+                                    output, expected,
+                                    "haystack={haystack:?}, start={start}, end={end}",
+                                );
+                                complete += 1;
+                                matched += usize::from(output);
+                            }
+                            Attempt::Fallback => {}
+                        }
+                    }
+                }
+            }
+        }
+        assert!(complete > 0);
+        assert!(matched > 0);
     }
 
     #[test]
@@ -1328,7 +1500,7 @@ mod tests {
 
     #[test]
     fn component_build_receipts_close_exact_and_one_below_limits() {
-        let pattern = "q+(?:abcd|bc)Z";
+        let pattern = "q+[0-9]+(?:abcd|bc)Z";
         let (rust, limits, line_terminator) = parsed_with(pattern, false);
         let full = full_automaton(&rust, limits, line_terminator);
         let InspectionOutcome::Eligible(inspection) =
@@ -1336,6 +1508,14 @@ mod tests {
         else {
             panic!("fixture must be eligible");
         };
+        assert_eq!(inspection.prefix_parts.len(), 2);
+        let expected_prefix_lowering = fre_lower::lower_hir_concat_slice(
+            inspection.prefix_parts,
+            fre_lower::OperationSemantics::CaptureFree,
+            limits.lowering,
+        )
+        .expect("borrowed prefix lowers independently")
+        .stats();
         let cumulative_planner_work = inspection.planner_work;
         let plan = inspection
             .build(&full, line_terminator, limits, usize::MAX)
@@ -1344,7 +1524,8 @@ mod tests {
         let accounting = plan.build_accounting();
         assert_eq!(accounting.cumulative_planner_work, cumulative_planner_work);
         assert!(accounting.literal_set.build_work_upper_bound > 0);
-        assert!(accounting.prefix_lowering.work() > 0);
+        assert_eq!(accounting.prefix_lowering, expected_prefix_lowering);
+        assert_eq!(accounting.prefix_lowering.erased_captures(), 0);
         assert_eq!(
             accounting.prefix_storage_bytes,
             plan.prefix().stats().storage_bytes(),
@@ -1442,7 +1623,8 @@ mod tests {
 
     #[test]
     fn persistent_census_accepts_exact_and_refuses_one_below() {
-        let (rust, limits, line_terminator) = parsed_with("q+(?:abcd|bc)Z", false);
+        let pattern = "q+[0-9]+(?:abcd|bc)Z";
+        let (rust, limits, line_terminator) = parsed_with(pattern, false);
         let full = full_automaton(&rust, limits, line_terminator);
         let inspection = match inspect(&rust.hir, 0, 0, u64::MAX).unwrap() {
             InspectionOutcome::Eligible(inspection) => inspection,
@@ -1454,7 +1636,7 @@ mod tests {
             .unwrap();
         let exact = plan.build_accounting().persistent_bytes;
 
-        let (rust, limits, line_terminator) = parsed_with("q+(?:abcd|bc)Z", false);
+        let (rust, limits, line_terminator) = parsed_with(pattern, false);
         let full = full_automaton(&rust, limits, line_terminator);
         let InspectionOutcome::Eligible(inspection) =
             inspect(&rust.hir, 0, 0, u64::MAX).unwrap()
@@ -1465,7 +1647,7 @@ mod tests {
             .build(&full, line_terminator, limits, exact)
             .unwrap()
             .is_some());
-        let (rust, limits, line_terminator) = parsed_with("q+(?:abcd|bc)Z", false);
+        let (rust, limits, line_terminator) = parsed_with(pattern, false);
         let full = full_automaton(&rust, limits, line_terminator);
         let InspectionOutcome::Eligible(inspection) =
             inspect(&rust.hir, 0, 0, u64::MAX).unwrap()
@@ -1656,6 +1838,36 @@ mod tests {
         let mut haystack = vec![b'0'; 4_096];
         haystack[128..135].copy_from_slice(b"needleX");
         haystack[4_084..4_096].copy_from_slice(b"abcmarker123");
+        assert!(session
+            .is_match_value(&haystack, SearchLimits::unlimited())
+            .unwrap());
+        assert!(session
+            .is_match_value(&haystack, SearchLimits::unlimited())
+            .unwrap());
+    }
+
+    #[test]
+    fn facade_retains_and_executes_a_later_split_sidecar() {
+        let mut regex = PortableBuilder::new("q+[0-9]+(?:needle|marker)[A-Z]+")
+            .unicode(false)
+            .build()
+            .expect("later-split facade fixture builds");
+        let PortablePlan::K0(plan) = &mut regex.plan else {
+            panic!("later-split fixture must retain generic K0");
+        };
+        assert!(plan.reverse_inner.is_some());
+        plan.mandatory_suffix = None;
+        plan.mandatory_cut = None;
+        plan.negative_prefilter = None;
+
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("later-split facade session constructs");
+        let mut haystack = vec![b'!'; 512];
+        assert!(!session
+            .is_match_value(&haystack, SearchLimits::unlimited())
+            .unwrap());
+        haystack[400..411].copy_from_slice(b"qq12needleA");
         assert!(session
             .is_match_value(&haystack, SearchLimits::unlimited())
             .unwrap());
