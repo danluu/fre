@@ -9192,8 +9192,8 @@ const K0_FINITE_SUFFIX_UNIVERSAL_INCUMBENT_ROUTE: u8 = 1 << 6;
 const K0_FINITE_SUFFIX_SINGLE_PASS_NEGATIVE: u8 = 1 << 7;
 // `next_replacement` needs only two low bits for four size-class records.
 // Once a universal suffix schedules an independent-predicate trial, retain a
-// monotonic high-bit receipt there. Positive-only sessions can then reject the
-// entire adaptive selector with one load instead of scanning every class.
+// monotonic high-bit receipt there. Positive-only sessions can then skip the
+// adaptive route decode with one load instead of testing every route flag.
 const K0_NEGATIVE_PREFILTER_UNIVERSAL_INCUMBENT_POSSIBLE: u8 = 1 << 7;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -9463,7 +9463,57 @@ const fn k0_finite_suffix_incumbent_single_pass_negative(
     state.next_predicate & K0_FINITE_SUFFIX_SINGLE_PASS_NEGATIVE != 0
 }
 
-#[inline]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the incumbent must close the same immutable suffix, predicate, source, and search-limit envelope before it may run"
+)]
+fn k0_universal_finite_suffix_incumbent_admitted(
+    session: &K0SearchSession<'_>,
+    suffix: &K0MandatorySuffixPlan,
+    mandatory_cut: Option<&K0MandatoryCutPlan>,
+    negative_prefilter: Option<&K0NegativePrefilterPlan>,
+    haystack_len: usize,
+    window: SearchWindow,
+    limits: SearchLimits,
+) -> bool {
+    if limits != SearchLimits::unlimited()
+        || window.start() > window.end()
+        || window.end() > haystack_len
+    {
+        return false;
+    }
+    let Some(window_bytes) = window.end().checked_sub(window.start()) else {
+        return false;
+    };
+    let Some((minimum_match_bytes, maximum_match_bytes)) =
+        suffix.universal_finite_match_byte_bounds()
+    else {
+        return false;
+    };
+    if minimum_match_bytes == 0
+        || minimum_match_bytes > maximum_match_bytes
+        || suffix.needle().len() > minimum_match_bytes
+        || window_bytes < K0_NEGATIVE_PREFILTER_MIN_WINDOW_BYTES
+        || maximum_match_bytes > window_bytes / K0_SUFFIX_FINITE_WIDTH_WINDOW_FACTOR
+        || !k0_negative_prefilter_admitted(
+            mandatory_cut,
+            negative_prefilter,
+            haystack_len,
+            window,
+            limits,
+        )
+        || !session.negative_terminal_has_reused_work_certificate(window_bytes)
+    {
+        return false;
+    }
+    true
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the test selector exercises the complete production incumbent admission envelope"
+)]
 fn select_k0_universal_finite_suffix_incumbent(
     session: &K0SearchSession<'_>,
     suffix: &K0MandatorySuffixPlan,
@@ -9474,16 +9524,10 @@ fn select_k0_universal_finite_suffix_incumbent(
     window: SearchWindow,
     limits: SearchLimits,
 ) -> Option<K0UniversalFiniteSuffixIncumbentRoute> {
-    if state.next_replacement & K0_NEGATIVE_PREFILTER_UNIVERSAL_INCUMBENT_POSSIBLE == 0
-        || limits != SearchLimits::unlimited()
-        || window.start() > window.end()
-        || window.end() > haystack_len
-    {
+    if state.next_replacement & K0_NEGATIVE_PREFILTER_UNIVERSAL_INCUMBENT_POSSIBLE == 0 {
         return None;
     }
-    let Some(window_bytes) = window.end().checked_sub(window.start()) else {
-        return None;
-    };
+    let window_bytes = window.end().checked_sub(window.start())?;
     let window_size_class = usize::BITS - window_bytes.leading_zeros();
     let class_index = state
         .classes
@@ -9500,30 +9544,16 @@ fn select_k0_universal_finite_suffix_incumbent(
     } else {
         return None;
     };
-
-    // The ordinary exact-suffix route is overwhelmingly common for positive
-    // traffic. Reject it from the compact adaptive record before deriving the
-    // full competing-route envelope; only a scheduled or retained incumbent
-    // pays those source-independent qualification checks.
-    let (minimum_match_bytes, maximum_match_bytes) =
-        suffix.universal_finite_match_byte_bounds()?;
-    if minimum_match_bytes == 0
-        || minimum_match_bytes > maximum_match_bytes
-        || suffix.needle().len() > minimum_match_bytes
-        || window_bytes < K0_NEGATIVE_PREFILTER_MIN_WINDOW_BYTES
-        || maximum_match_bytes > window_bytes / K0_SUFFIX_FINITE_WIDTH_WINDOW_FACTOR
-        || !k0_negative_prefilter_admitted(
-            mandatory_cut,
-            negative_prefilter,
-            haystack_len,
-            window,
-            limits,
-        )
-        || !session.negative_terminal_has_reused_work_certificate(window_bytes)
-    {
-        return None;
-    }
-    Some(selected)
+    k0_universal_finite_suffix_incumbent_admitted(
+        session,
+        suffix,
+        mandatory_cut,
+        negative_prefilter,
+        haystack_len,
+        window,
+        limits,
+    )
+    .then_some(selected)
 }
 
 fn observe_k0_universal_finite_suffix_incumbent(
@@ -9896,6 +9926,10 @@ enum K0MandatorySuffixSpanOutcome {
         start: usize,
         maximum_match_bytes: usize,
     },
+    UniversalIncumbent {
+        class_index: usize,
+        calibration: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -10066,20 +10100,40 @@ fn try_k0_universal_finite_mandatory_suffix_span_start(
     let window_size_class = usize::BITS - window_bytes.leading_zeros();
     let mut next_state = state;
     let class_index = next_state.class_for(window_size_class);
-    let route = next_state.classes[class_index].next_predicate;
-    if route & K0_FINITE_SUFFIX_UNIVERSAL_INCUMBENT_ROUTE != 0
-        || (route & K0_FINITE_SUFFIX_UNIVERSAL_INCUMBENT_CALIBRATION != 0
-            && next_state.classes[class_index].disabled_calls == 0)
-    {
-        return Ok(K0MandatorySuffixSpanAttempt {
-            outcome: K0MandatorySuffixSpanOutcome::Fallback,
-            state_after_success: next_state,
-        });
-    }
-    if route & K0_FINITE_SUFFIX_UNIVERSAL_INCUMBENT_CALIBRATION != 0
-        && next_state.classes[class_index].disabled_calls != 0
-    {
-        next_state.classes[class_index].disabled_calls -= 1;
+    if next_state.next_replacement & K0_NEGATIVE_PREFILTER_UNIVERSAL_INCUMBENT_POSSIBLE != 0 {
+        let route = next_state.classes[class_index].next_predicate;
+        if route & K0_FINITE_SUFFIX_UNIVERSAL_INCUMBENT_ROUTE != 0 {
+            return Ok(K0MandatorySuffixSpanAttempt {
+                outcome: K0MandatorySuffixSpanOutcome::UniversalIncumbent {
+                    class_index,
+                    calibration: false,
+                },
+                state_after_success: next_state,
+            });
+        }
+        if route & K0_FINITE_SUFFIX_UNIVERSAL_INCUMBENT_CALIBRATION != 0 {
+            if next_state.classes[class_index].disabled_calls == 0 {
+                return Ok(K0MandatorySuffixSpanAttempt {
+                    outcome: K0MandatorySuffixSpanOutcome::UniversalIncumbent {
+                        class_index,
+                        calibration: true,
+                    },
+                    state_after_success: next_state,
+                });
+            }
+            next_state.classes[class_index].disabled_calls -= 1;
+        } else if next_state.classes[class_index].disabled_calls != 0 {
+            // A literal/preflight or exact-replay loss clears the calibration
+            // bit while retaining its bounded retry clock. Honor that
+            // defensive state by selecting authoritative K0 directly until
+            // the clock expires instead of repeating suffix work on every
+            // call.
+            next_state.classes[class_index].disabled_calls -= 1;
+            return Ok(K0MandatorySuffixSpanAttempt {
+                outcome: K0MandatorySuffixSpanOutcome::Fallback,
+                state_after_success: next_state,
+            });
+        }
     } else if next_state.classes[class_index].disabled_calls != 0 {
         // A literal/preflight or exact-replay loss clears the calibration
         // bit while retaining its bounded retry clock. Honor that defensive
@@ -11697,6 +11751,7 @@ fn try_k0_universal_finite_suffix_incumbent(
     mandatory_cut: Option<&K0MandatoryCutPlan>,
     negative_prefilter: Option<&K0NegativePrefilterPlan>,
     mandatory_suffix_span_state: &mut K0NegativePrefilterState,
+    mut suffix_state_after_success: K0NegativePrefilterState,
     negative_prefilter_span_state: &mut K0NegativePrefilterState,
     incumbent_route: K0UniversalFiniteSuffixIncumbentRoute,
     haystack: &[u8],
@@ -11704,11 +11759,21 @@ fn try_k0_universal_finite_suffix_incumbent(
     limits: SearchLimits,
     matched: &mut Match,
 ) -> Result<K0UniversalFiniteSuffixIncumbentOutcome, SearchError> {
+    if !k0_universal_finite_suffix_incumbent_admitted(
+        session,
+        suffix,
+        mandatory_cut,
+        negative_prefilter,
+        haystack.len(),
+        window,
+        limits,
+    ) {
+        return Ok(K0UniversalFiniteSuffixIncumbentOutcome::GeometryBypass);
+    }
     let class_index = match incumbent_route {
         K0UniversalFiniteSuffixIncumbentRoute::Calibration { class_index }
         | K0UniversalFiniteSuffixIncumbentRoute::Retained { class_index } => class_index,
     };
-    let mut suffix_state_after_success = *mandatory_suffix_span_state;
     let attempt = run_k0_negative_prefilter(
         mandatory_cut,
         negative_prefilter,
@@ -11820,6 +11885,7 @@ fn try_k0_universal_finite_suffix_incumbent(
         K0MandatorySuffixSpanOutcome::Fallback
         | K0MandatorySuffixSpanOutcome::Bypass
         | K0MandatorySuffixSpanOutcome::GeometryBypass
+        | K0MandatorySuffixSpanOutcome::UniversalIncumbent { .. }
         | K0MandatorySuffixSpanOutcome::Absent
         | K0MandatorySuffixSpanOutcome::Narrowed(_)
         | K0MandatorySuffixSpanOutcome::Incumbent { .. } => {
@@ -12852,43 +12918,8 @@ impl<'r> PortableSearchSession<'r> {
                     // suffix proof, one independent mandatory-predicate pass
                     // calibrates whether the lower-dispatch prefilter should
                     // own stable negative traffic.
-                    if let Some(incumbent_route) =
-                        select_k0_universal_finite_suffix_incumbent(
-                            session,
-                            suffix,
-                            *mandatory_cut,
-                            *negative_prefilter,
-                            mandatory_suffix_span_state,
-                            haystack.len(),
-                            window,
-                            limits,
-                        )
-                    {
-                        let mut matched = Match { start: 0, end: 0 };
-                        match try_k0_universal_finite_suffix_incumbent(
-                            session,
-                            suffix,
-                            *mandatory_cut,
-                            *negative_prefilter,
-                            mandatory_suffix_span_state,
-                            negative_prefilter_span_state,
-                            incumbent_route,
-                            haystack,
-                            window,
-                            limits,
-                            &mut matched,
-                        )? {
-                            K0UniversalFiniteSuffixIncumbentOutcome::GeometryBypass => {}
-                            K0UniversalFiniteSuffixIncumbentOutcome::ProvedAbsent => {
-                                return Ok(None);
-                            }
-                            K0UniversalFiniteSuffixIncumbentOutcome::ProvedMatch => {
-                                return Ok(Some(matched));
-                            }
-                        }
-                    }
                     let mut suffix_state_after_success = *mandatory_suffix_span_state;
-                    let suffix_attempt = try_k0_mandatory_suffix_span_start(
+                    let mut suffix_attempt = try_k0_mandatory_suffix_span_start(
                         session,
                         suffix,
                         suffix_state_after_success,
@@ -12898,6 +12929,44 @@ impl<'r> PortableSearchSession<'r> {
                         None,
                     )?;
                     suffix_state_after_success = suffix_attempt.state_after_success;
+                    if let K0MandatorySuffixSpanOutcome::UniversalIncumbent {
+                        class_index,
+                        calibration,
+                    } = suffix_attempt.outcome
+                    {
+                        let incumbent_route = if calibration {
+                            K0UniversalFiniteSuffixIncumbentRoute::Calibration { class_index }
+                        } else {
+                            K0UniversalFiniteSuffixIncumbentRoute::Retained { class_index }
+                        };
+                        let mut matched = Match { start: 0, end: 0 };
+                        match try_k0_universal_finite_suffix_incumbent(
+                            session,
+                            suffix,
+                            *mandatory_cut,
+                            *negative_prefilter,
+                            mandatory_suffix_span_state,
+                            suffix_state_after_success,
+                            negative_prefilter_span_state,
+                            incumbent_route,
+                            haystack,
+                            window,
+                            limits,
+                            &mut matched,
+                        )? {
+                            K0UniversalFiniteSuffixIncumbentOutcome::GeometryBypass => {
+                                // The old caller-side selector declined into
+                                // this same authoritative whole-window route.
+                                suffix_attempt.outcome = K0MandatorySuffixSpanOutcome::Fallback;
+                            }
+                            K0UniversalFiniteSuffixIncumbentOutcome::ProvedAbsent => {
+                                return Ok(None);
+                            }
+                            K0UniversalFiniteSuffixIncumbentOutcome::ProvedMatch => {
+                                return Ok(Some(matched));
+                            }
+                        }
+                    }
                     if suffix_attempt.outcome
                         != K0MandatorySuffixSpanOutcome::GeometryBypass
                     {
@@ -12959,6 +13028,7 @@ impl<'r> PortableSearchSession<'r> {
                                 .map_err(SearchError::from),
                             K0MandatorySuffixSpanOutcome::Bypass
                             | K0MandatorySuffixSpanOutcome::GeometryBypass
+                            | K0MandatorySuffixSpanOutcome::UniversalIncumbent { .. }
                             | K0MandatorySuffixSpanOutcome::Absent
                             | K0MandatorySuffixSpanOutcome::Narrowed(_)
                             | K0MandatorySuffixSpanOutcome::Incumbent { .. } => session
@@ -13250,7 +13320,8 @@ impl<'r> PortableSearchSession<'r> {
                                 Err(error) => return Err(error),
                             }
                         }
-                        K0MandatorySuffixSpanOutcome::Fallback => true,
+                        K0MandatorySuffixSpanOutcome::Fallback
+                        | K0MandatorySuffixSpanOutcome::UniversalIncumbent { .. } => true,
                         K0MandatorySuffixSpanOutcome::Bypass
                         | K0MandatorySuffixSpanOutcome::GeometryBypass => false,
                     };
@@ -13481,6 +13552,7 @@ impl<'r> PortableSearchSession<'r> {
                             }
                         }
                         K0MandatorySuffixSpanOutcome::Fallback
+                        | K0MandatorySuffixSpanOutcome::UniversalIncumbent { .. }
                         | K0MandatorySuffixSpanOutcome::Bypass
                         | K0MandatorySuffixSpanOutcome::GeometryBypass => {}
                     }
@@ -13587,7 +13659,8 @@ impl<'r> PortableSearchSession<'r> {
                                 Err(error) => return Err(error),
                             }
                         }
-                        K0MandatorySuffixSpanOutcome::Fallback => {}
+                        K0MandatorySuffixSpanOutcome::Fallback
+                        | K0MandatorySuffixSpanOutcome::UniversalIncumbent { .. } => {}
                         K0MandatorySuffixSpanOutcome::Incumbent { class_index, .. } => {
                             observe_k0_finite_suffix_loss(
                                 &mut suffix_state_after_success.classes[class_index],
