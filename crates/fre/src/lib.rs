@@ -16076,6 +16076,25 @@ mod tests {
     }
 
     #[test]
+    fn k0_packed_frontier_auto_publication_covers_bounded_alternation() {
+        let regex = PortableBuilder::new(
+            r"(?s-u:.{0,256}[abcd](?:XYZ|QRS|UVW|LMN)\b)",
+        )
+        .unicode(false)
+        .plan_selection(PlanSelection::Auto)
+        .build()
+        .expect("bounded-alternation packed-frontier fixture builds");
+        let PortablePlan::K0(plan) = &regex.plan else {
+            panic!("bounded-alternation fixture did not retain K0");
+        };
+        let frontier = plan
+            .packed_frontier()
+            .expect("automatic K0 plan retains the bounded-alternation frontier");
+        assert!(frontier.is_bound_to(&plan.automaton));
+        assert!(plan.correlated_terminal().is_none());
+    }
+
+    #[test]
     fn k0_packed_frontier_is_not_retained_beside_absolute_end_proof() {
         let regex = PortableBuilder::new(r"(?s-u:...[abcd][12345]+\b$)")
             .unicode(false)
