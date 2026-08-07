@@ -18,7 +18,9 @@
 //! Unicode scalar classes, lazy repetition and a merely partial literal tail
 //! all fail closed. The late K0 caller supplies the exact graph-proved suffix
 //! and admission binds it to the entire HIR tail. The stricter early native
-//! route instead retains that exact tail directly from the same metered walk.
+//! route retains a one-byte exact tail directly from the same metered walk;
+//! multi-byte tails remain eligible for K0's existing mandatory-cut and
+//! suffix machinery.
 
 use core::mem::size_of;
 
@@ -41,6 +43,7 @@ const SUFFIX_BYTE_WORK: u64 = 1;
 const UNIVERSAL_WORDS: [u64; 4] = [u64::MAX; 4];
 const SEARCH_BASE_WORK: u64 = 8;
 const SEARCH_CALL_WORK: u64 = 8;
+const NATIVE_SUFFIX_BYTES: usize = 1;
 
 /// Stable identity for the early source-proved native owner.
 pub(crate) const PLAN_ID: &str = "required-literal.universal-finite-greedy-corridor.v1";
@@ -233,8 +236,11 @@ pub(crate) fn inspect(
 ///
 /// The caller separately authenticates that the parsed source has no explicit
 /// captures before publishing this capture-erasing owner. This stricter route
-/// also declines every retained HIR alternation, even a byte-universal union; the existing
-/// late K0 theorem remains available for those more permissive shapes.
+/// also declines every retained HIR alternation, even a byte-universal union,
+/// and every multi-byte suffix. Single-byte suffixes use `LiteralPlan`'s direct
+/// byte finder; multi-byte suffixes retain the existing K0 mandatory-cut and
+/// adaptive negative-proof routes. The late K0 theorem remains available for
+/// every source shape declined here.
 pub(crate) fn inspect_native(
     hir: &Hir,
     initial_work: u64,
@@ -243,12 +249,14 @@ pub(crate) fn inspect_native(
     let mut meter = Meter::new(initial_work, max_planner_work)?;
     let inspected = inspect_inner(hir, None, false, &mut meter)?;
     Ok(match inspected {
-        Some((descriptor, suffix)) => NativeInspectionOutcome::Eligible(NativeInspection {
-            descriptor,
-            suffix,
-            planner_work: meter.work,
-        }),
-        None => NativeInspectionOutcome::Ineligible {
+        Some((descriptor, suffix)) if suffix.len() == NATIVE_SUFFIX_BYTES => {
+            NativeInspectionOutcome::Eligible(NativeInspection {
+                descriptor,
+                suffix,
+                planner_work: meter.work,
+            })
+        }
+        Some(_) | None => NativeInspectionOutcome::Ineligible {
             planner_work: meter.work,
         },
     })
@@ -971,13 +979,13 @@ mod tests {
 
     #[test]
     fn native_source_route_is_stricter_and_closes_its_work_receipt() {
-        let hir = parse_bytes(r"(?s-u:.{2,16}.{2,48}XYZ)");
+        let hir = parse_bytes(r"(?s-u:.{2,16}.{2,48}X)");
         let NativeInspectionOutcome::Eligible(unlimited) =
             inspect_native(&hir, 7, u64::MAX).unwrap()
         else {
             panic!("direct universal corridor was refused");
         };
-        assert_eq!(unlimited.suffix(), b"XYZ");
+        assert_eq!(unlimited.suffix(), b"X");
         assert_eq!(unlimited.descriptor().minimum_prefix_bytes(), 4);
         assert_eq!(unlimited.descriptor().maximum_prefix_bytes(), 64);
         let exact_work = unlimited.planner_work();
@@ -993,6 +1001,24 @@ mod tests {
                 limit: exact_work - 1,
             }),
         );
+
+        let multi_byte = parse_bytes(r"(?s-u:.{2,16}.{2,48}XYZ)");
+        let declined = inspect_native(&multi_byte, 7, u64::MAX).unwrap();
+        assert!(matches!(
+            declined,
+            NativeInspectionOutcome::Ineligible { .. },
+        ));
+        let declined_work = declined.planner_work();
+        assert_eq!(
+            inspect_native(&multi_byte, 7, declined_work)
+                .unwrap()
+                .planner_work(),
+            declined_work,
+        );
+        assert!(matches!(
+            inspect(&multi_byte, b"XYZ", 7, u64::MAX).unwrap(),
+            InspectionOutcome::Eligible(_),
+        ));
 
         for pattern in [
             r"(?s-u:(?:.{1}|.{2})X)",
@@ -1024,9 +1050,9 @@ mod tests {
     fn native_span_exists_and_earliest_end_match_upstream_for_every_small_window() {
         let alphabet = [b'a', b'b', b'X'];
         for pattern in [
-            r"(?s-u:.{0,3}aa)",
+            r"(?s-u:.{0,3}X)",
             r"(?s-u:.{1,2}.{0,2}X)",
-            r"(?s-u:[\x00-\xFF]{2,4}ab)",
+            r"(?s-u:[\x00-\xFF]{2,4}X)",
         ] {
             let plan = native_plan(pattern);
             let upstream = regex::bytes::RegexBuilder::new(pattern)
@@ -1092,13 +1118,13 @@ mod tests {
 
     #[test]
     fn native_search_limits_close_before_source_reads() {
-        let plan = native_plan(r"(?s-u:.{0,3}aa)");
-        let haystack = b"aaaaa";
+        let plan = native_plan(r"(?s-u:.{0,3}X)");
+        let haystack = b"aaaaX";
         let window = SearchWindow::full(haystack);
         let (matched, accounting) = plan
             .find_window(haystack, window, SearchLimits::unlimited())
             .unwrap();
-        assert_eq!(matched, Some((0, 5)));
+        assert_eq!(matched, Some((1, 5)));
         assert_eq!(accounting.finder_calls, 2);
         assert_eq!(accounting.candidate_visits, 2);
 

@@ -19002,7 +19002,7 @@ mod tests {
 
     #[test]
     fn native_universal_corridor_precedes_k0_and_matches_upstream_operations() {
-        const PATTERN: &str = r"(?s-u:.{0,2}.{0,3}aa)";
+        const PATTERN: &str = r"(?s-u:.{0,2}.{0,3}X)";
         let regex = PortableBuilder::new(PATTERN)
             .unicode(false)
             .build()
@@ -19033,10 +19033,10 @@ mod tests {
 
         for haystack in [
             b"".as_slice(),
-            b"aa".as_slice(),
+            b"X".as_slice(),
             b"aaaaaaa".as_slice(),
-            b"qaaZaaaaa".as_slice(),
-            b"\xff\x00aa\xffaaaa".as_slice(),
+            b"qXZXaaaaa".as_slice(),
+            b"\xff\x00X\xffXaaa".as_slice(),
         ] {
             let expected = upstream
                 .find(haystack)
@@ -19142,7 +19142,7 @@ mod tests {
             assert_eq!(session_iter, expected_iter);
         }
 
-        let mut mutable = b"qaaZaaaaa".to_vec();
+        let mut mutable = b"qXqqqqqqq".to_vec();
         let address = mutable.as_ptr();
         let mut session = regex
             .search_session(SearchSessionLimits::unlimited())
@@ -19155,8 +19155,8 @@ mod tests {
                 .find_value(&mutable, SearchLimits::unlimited())
                 .unwrap(),
         );
-        mutable[1..3].copy_from_slice(b"bb");
-        mutable[4..6].copy_from_slice(b"aa");
+        mutable[1] = b'q';
+        mutable[6] = b'X';
         assert_eq!(mutable.as_ptr(), address);
         let expected_after_mutation = upstream.find(&mutable).map(|matched| Match {
             start: matched.start(),
@@ -19171,8 +19171,28 @@ mod tests {
     }
 
     #[test]
-    fn native_universal_corridor_admission_is_auto_only_and_transactional() {
+    fn native_universal_corridor_multi_byte_suffix_falls_through_to_k0() {
         const PATTERN: &str = r"(?s-u:.{0,2}.{0,3}aa)";
+        let regex = PortableBuilder::new(PATTERN)
+            .unicode(false)
+            .build()
+            .expect("multi-byte universal corridor falls through to K0");
+        assert_eq!(regex.build_report().plan, PlanKind::K0);
+        assert!(regex.build_report().lowering.is_some());
+        assert_eq!(regex.runtime_implementation_id(), "k0");
+        let PortablePlan::K0(plan) = &regex.plan else {
+            panic!("multi-byte universal corridor did not retain K0");
+        };
+        assert_eq!(
+            plan.mandatory_cut.as_ref().map(|cut| cut.cardinality()),
+            Some(1),
+            "the existing one-byte mandatory cut remains available to K0",
+        );
+    }
+
+    #[test]
+    fn native_universal_corridor_admission_is_auto_only_and_transactional() {
+        const PATTERN: &str = r"(?s-u:.{0,2}.{0,3}X)";
         let complete = PortableBuilder::new(PATTERN)
             .unicode(false)
             .build()
@@ -19233,11 +19253,11 @@ mod tests {
             .unwrap();
         assert_eq!(forced.build_report().plan, PlanKind::K0);
         for pattern in [
-            r"(?s-u:(.{0,2}.{0,3})aa)",
-            r"(?s-u:(?:.{1}|.{2})aa)",
-            r"(?s-u:.{1,3}?aa)",
-            r"(?s-u:.*aa)",
-            r"(?s-u:.{1,3}\baa)",
+            r"(?s-u:(.{0,2}.{0,3})X)",
+            r"(?s-u:(?:.{1}|.{2})X)",
+            r"(?s-u:.{1,3}?X)",
+            r"(?s-u:.*X)",
+            r"(?s-u:.{1,3}\bX)",
         ] {
             let declined = PortableBuilder::new(pattern)
                 .unicode(false)
@@ -19253,7 +19273,7 @@ mod tests {
 
     #[test]
     fn native_universal_corridor_owner_failures_are_transactional() {
-        const PATTERN: &str = r"(?s-u:.{0,2}.{0,3}aa)";
+        const PATTERN: &str = r"(?s-u:.{0,2}.{0,3}X)";
         for source in [
             fre_exact_alloc::CopyError::LayoutOverflow,
             fre_exact_alloc::CopyError::AllocationFailed,
