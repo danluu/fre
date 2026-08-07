@@ -9931,6 +9931,41 @@ impl K0PackedFrontierExistsClassState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct K0PackedFrontierExactWitness {
+    start: usize,
+    bytes: u32,
+    length: u8,
+}
+
+impl K0PackedFrontierExactWitness {
+    fn from_match(haystack: &[u8], start: usize, end: usize) -> Option<Self> {
+        let matched = haystack.get(start..end)?;
+        if matched.is_empty() || matched.len() > core::mem::size_of::<u32>() {
+            return None;
+        }
+        let mut bytes = [0_u8; core::mem::size_of::<u32>()];
+        bytes[..matched.len()].copy_from_slice(matched);
+        Some(Self {
+            start,
+            bytes: u32::from_le_bytes(bytes),
+            length: u8::try_from(matched.len()).ok()?,
+        })
+    }
+
+    fn is_present(self, haystack: &[u8], window: SearchWindow) -> bool {
+        let length = usize::from(self.length);
+        let Some(end) = self.start.checked_add(length) else {
+            return false;
+        };
+        if length == 0 || self.start < window.start() || end > window.end() {
+            return false;
+        }
+        let expected = self.bytes.to_le_bytes();
+        haystack.get(self.start..end) == Some(&expected[..length])
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum K0PackedFrontierExistsRoute {
     Packed { class_index: usize },
     Incumbent {
@@ -9942,17 +9977,18 @@ enum K0PackedFrontierExistsRoute {
 
 /// Four exact-window classes without `Option` inflation. The immutable K0 plan
 /// selects this state only for its mutually exclusive packed-frontier route;
-/// on 64-bit targets its 144-byte layout is no larger than the correlated
+/// on 64-bit targets its 160-byte layout is no larger than the correlated
 /// Exists policy it replaces in the session.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct K0PackedFrontierExistsState {
     classes: [K0PackedFrontierExistsClassState; K0_PACKED_FRONTIER_EXISTS_STATE_SLOTS],
     exact_floor_witness_starts: [usize; K0_PACKED_FRONTIER_EXISTS_STATE_SLOTS],
+    exact_floor_witness_bytes: [u32; K0_PACKED_FRONTIER_EXISTS_STATE_SLOTS],
+    exact_floor_witness_lengths: [u8; K0_PACKED_FRONTIER_EXISTS_STATE_SLOTS],
     // Low four bits are occupied classes. High four bits mark classes whose
     // most recent non-decisive packed observation was structurally shallow.
     occupied: u8,
-    exact_floor_witnesses: u8,
     preferences: u8,
     direct_remaining: [u8; K0_PACKED_FRONTIER_EXISTS_STATE_SLOTS],
     structural_epoch_stage: [u8; K0_PACKED_FRONTIER_EXISTS_STATE_SLOTS],
@@ -9965,8 +10001,9 @@ impl Default for K0PackedFrontierExistsState {
             classes: [K0PackedFrontierExistsClassState::EMPTY;
                 K0_PACKED_FRONTIER_EXISTS_STATE_SLOTS],
             exact_floor_witness_starts: [0; K0_PACKED_FRONTIER_EXISTS_STATE_SLOTS],
+            exact_floor_witness_bytes: [0; K0_PACKED_FRONTIER_EXISTS_STATE_SLOTS],
+            exact_floor_witness_lengths: [0; K0_PACKED_FRONTIER_EXISTS_STATE_SLOTS],
             occupied: 0,
-            exact_floor_witnesses: 0,
             preferences: 0,
             direct_remaining: [0; K0_PACKED_FRONTIER_EXISTS_STATE_SLOTS],
             structural_epoch_stage: [0; K0_PACKED_FRONTIER_EXISTS_STATE_SLOTS],
@@ -9995,19 +10032,28 @@ impl K0PackedFrontierExistsState {
         }
     }
 
-    fn exact_floor_witness(&self, index: usize) -> Option<usize> {
-        (self.exact_floor_witnesses & (1_u8 << index) != 0)
-            .then_some(self.exact_floor_witness_starts[index])
+    fn exact_floor_witness(&self, index: usize) -> Option<K0PackedFrontierExactWitness> {
+        let length = self.exact_floor_witness_lengths[index];
+        (length != 0).then_some(K0PackedFrontierExactWitness {
+            start: self.exact_floor_witness_starts[index],
+            bytes: self.exact_floor_witness_bytes[index],
+            length,
+        })
     }
 
-    fn set_exact_floor_witness(&mut self, index: usize, witness_start: Option<usize>) {
-        let mask = 1_u8 << index;
-        if let Some(witness_start) = witness_start {
-            self.exact_floor_witness_starts[index] = witness_start;
-            self.exact_floor_witnesses |= mask;
+    fn set_exact_floor_witness(
+        &mut self,
+        index: usize,
+        witness: Option<K0PackedFrontierExactWitness>,
+    ) {
+        if let Some(witness) = witness {
+            self.exact_floor_witness_starts[index] = witness.start;
+            self.exact_floor_witness_bytes[index] = witness.bytes;
+            self.exact_floor_witness_lengths[index] = witness.length;
         } else {
             self.exact_floor_witness_starts[index] = 0;
-            self.exact_floor_witnesses &= !mask;
+            self.exact_floor_witness_bytes[index] = 0;
+            self.exact_floor_witness_lengths[index] = 0;
         }
     }
 
@@ -10232,7 +10278,7 @@ impl K0PackedFrontierExistsState {
                 self.reset_direct_stability(class_index);
                 return;
             }
-            K0PackedFrontierObservation::ExactFloorDirect { witness_start } => {
+            K0PackedFrontierObservation::ExactFloorDirect { witness } => {
                 // This packed-positive call executed the incumbent over the
                 // exact original window after paying an additional packed
                 // pass. Direct therefore dominates structurally without a
@@ -10240,7 +10286,7 @@ impl K0PackedFrontierExistsState {
                 // epoch so a same-address source mutation is still reprobed.
                 self.classes[class_index].packed_residual_work = 0;
                 self.set_structural_direct(class_index, true);
-                self.set_exact_floor_witness(class_index, Some(witness_start));
+                self.set_exact_floor_witness(class_index, Some(witness));
                 self.set_preference(
                     class_index,
                     K0PackedFrontierExistsPreference::RetainIncumbent,
@@ -10416,7 +10462,7 @@ impl K0PackedFrontierIncumbentObservation {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum K0PackedFrontierObservation {
     Absent,
-    ExactFloorDirect { witness_start: usize },
+    ExactFloorDirect { witness: K0PackedFrontierExactWitness },
     Comparable(K0PackedFrontierPositiveObservation),
     ShallowCompletion(K0PackedFrontierPositiveObservation),
     ProductiveOrDeep,
@@ -10424,7 +10470,7 @@ enum K0PackedFrontierObservation {
 
 fn classify_k0_packed_frontier_positive(
     window_start: usize,
-    witness_start: usize,
+    witness: K0PackedFrontierExactWitness,
     floor: usize,
     minimum_useful_progress_bytes: usize,
     residual_work: u64,
@@ -10434,7 +10480,7 @@ fn classify_k0_packed_frontier_positive(
         .checked_sub(window_start)
         .expect("the packed-frontier floor was window-validated");
     if progress == 0 {
-        K0PackedFrontierObservation::ExactFloorDirect { witness_start }
+        K0PackedFrontierObservation::ExactFloorDirect { witness }
     } else if progress < minimum_useful_progress_bytes {
         K0PackedFrontierObservation::ShallowCompletion(positive)
     } else {
@@ -10506,27 +10552,6 @@ impl<'p, 's, 'a, 'h> K0PackedFrontierExistsReceipt<'p, 's, 'a, 'h> {
         }))
     }
 
-    fn exact_floor_witness_present(
-        &self,
-        witness_start: usize,
-    ) -> Result<bool, SearchError> {
-        if witness_start < self.window.start() || witness_start >= self.window.end() {
-            return Ok(false);
-        }
-        let Some(witness_end) = witness_start
-            .checked_add(self.plan.packed.build_accounting().max_pattern_bytes)
-            .map(|end| end.min(self.window.end()))
-        else {
-            return Ok(false);
-        };
-        let (found, _) = self.plan.packed.find_window(
-            self.haystack,
-            LiteralWindow::new(witness_start, witness_end),
-            self.packed_limits,
-        )?;
-        Ok(found.is_some_and(|(start, _)| start == witness_start))
-    }
-
     fn execute_packed<F>(
         self,
         execute_incumbent: F,
@@ -10574,6 +10599,14 @@ impl<'p, 's, 'a, 'h> K0PackedFrontierExistsReceipt<'p, 's, 'a, 'h> {
         let floor = literal_start
             .saturating_sub(self.plan.maximum_before_root)
             .max(self.window.start());
+        let witness = K0PackedFrontierExactWitness::from_match(
+            self.haystack,
+            literal_start,
+            literal_end,
+        )
+        .ok_or(SearchError::K0(K0SearchError::InternalInvariant {
+            detail: "K0 packed-frontier witness exceeded its proved four-byte bound",
+        }))?;
         let mut incumbent_observation =
             K0PackedFrontierIncumbentObservation::Incomparable;
         let measured_work = if floor == self.window.start() {
@@ -10590,7 +10623,7 @@ impl<'p, 's, 'a, 'h> K0PackedFrontierExistsReceipt<'p, 's, 'a, 'h> {
         )?;
         let observation = classify_k0_packed_frontier_positive(
             self.window.start(),
-            literal_start,
+            witness,
             floor,
             self.plan.minimum_useful_progress_bytes(),
             incumbent_observation.raw_k0_work().unwrap_or(0),
@@ -10626,9 +10659,9 @@ where
     {
         if structural_direct
             && state.direct_remaining[class_index] == 1
-            && let Some(witness_start) = state.exact_floor_witness(class_index)
+            && let Some(witness) = state.exact_floor_witness(class_index)
         {
-            if receipt.exact_floor_witness_present(witness_start)? {
+            if witness.is_present(receipt.haystack, receipt.window) {
                 let output = execute_incumbent(
                     &mut *receipt.session,
                     receipt.haystack,
@@ -17038,6 +17071,11 @@ mod tests {
     fn k0_packed_frontier_progress_threshold_is_exact() {
         let window_start = 41_usize;
         let witness_start = window_start + 3;
+        let witness = super::K0PackedFrontierExactWitness {
+            start: witness_start,
+            bytes: u32::from_le_bytes([b'a', b'1', 0, 0]),
+            length: 2,
+        };
         let threshold = 1_024_usize;
         let positive = super::K0PackedFrontierPositiveObservation {
             residual_work: 17,
@@ -17045,17 +17083,17 @@ mod tests {
         assert_eq!(
             super::classify_k0_packed_frontier_positive(
                 window_start,
-                witness_start,
+                witness,
                 window_start,
                 threshold,
                 positive.residual_work,
             ),
-            super::K0PackedFrontierObservation::ExactFloorDirect { witness_start },
+            super::K0PackedFrontierObservation::ExactFloorDirect { witness },
         );
         assert_eq!(
             super::classify_k0_packed_frontier_positive(
                 window_start,
-                witness_start,
+                witness,
                 window_start + threshold - 1,
                 threshold,
                 positive.residual_work,
@@ -17065,7 +17103,7 @@ mod tests {
         assert_eq!(
             super::classify_k0_packed_frontier_positive(
                 window_start,
-                witness_start,
+                witness,
                 window_start + threshold,
                 threshold,
                 positive.residual_work,
@@ -17611,12 +17649,14 @@ mod tests {
         )
         .expect("exact-floor admission succeeds")
         .expect("exact-floor window admits packed search");
-        assert!(receipt
-            .exact_floor_witness_present(3)
-            .expect("exact witness lookup succeeds"));
-        assert!(!receipt
-            .exact_floor_witness_present(2)
-            .expect("shifted witness lookup succeeds"));
+        let witness = super::K0PackedFrontierExactWitness::from_match(&haystack, 3, 5)
+            .expect("exact witness constructs");
+        assert!(witness.is_present(&haystack, window));
+        assert!(!super::K0PackedFrontierExactWitness {
+            start: 2,
+            ..witness
+        }
+        .is_present(&haystack, window));
         let calls = std::cell::Cell::new(0_u8);
         let output = super::execute_k0_packed_frontier_exists_route(
             receipt,
@@ -17794,7 +17834,7 @@ mod tests {
         );
         #[cfg(target_pointer_width = "64")]
         {
-            assert_eq!(packed, 144);
+            assert_eq!(packed, 160);
             assert_eq!(correlated_bundle, 192);
             assert_eq!(exclusive, 200);
             assert!(exclusive < 3 * 104, "the pre-compaction bundle was 312 bytes");
@@ -17837,18 +17877,21 @@ mod tests {
         let packed_positive = super::K0PackedFrontierPositiveObservation {
             residual_work: 23,
         };
+        let witness = super::K0PackedFrontierExactWitness {
+            start: policy_window.start() + 3,
+            bytes: u32::from_le_bytes([b'a', b'1', 0, 0]),
+            length: 2,
+        };
         let exact_floor = super::classify_k0_packed_frontier_positive(
             policy_window.start(),
-            policy_window.start() + 3,
+            witness,
             policy_window.start(),
             1_024,
             packed_positive.residual_work,
         );
         assert_eq!(
             exact_floor,
-            super::K0PackedFrontierObservation::ExactFloorDirect {
-                witness_start: policy_window.start() + 3,
-            },
+            super::K0PackedFrontierObservation::ExactFloorDirect { witness },
             "a packed pass that cannot narrow executed the exact Direct incumbent",
         );
         shifted.observe_packed(
