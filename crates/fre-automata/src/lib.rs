@@ -38,10 +38,10 @@ pub use epsilon_closure_dispatch::EpsilonClosureDispatchAllocationError;
 pub use error::{CompileError, MalformedPlan, ResourceKind, SearchError};
 pub use k0::{
     K0DynamicRootProjection, K0FullyPrefilledResumeCacheReceipt,
-    K0FullyPrefilledRootProjection, K0PositiveEndLimits, K0PositiveEndOutcome,
-    K0PositiveEndReceipt, K0PositiveEndStartOutcome, K0PositiveEndStartVerification,
-    K0PositiveEndVerification, K0ResumeSet, K0SearchSession, K0SpanSourceCursor, K0Workspace,
-    WorkspaceLayout, WorkspaceLimits,
+    K0FullyPrefilledResumeMapProjection, K0FullyPrefilledRootProjection, K0PositiveEndLimits,
+    K0PositiveEndOutcome, K0PositiveEndReceipt, K0PositiveEndStartOutcome,
+    K0PositiveEndStartVerification, K0PositiveEndVerification, K0ResumeSet, K0SearchSession,
+    K0SpanSourceCursor, K0Workspace, WorkspaceLayout, WorkspaceLimits,
 };
 pub use mandatory_cut::{
     DEFAULT_MANDATORY_CUT_MAX_ALLOCATION_ATTEMPTS, DEFAULT_MANDATORY_CUT_MAX_ALLOCATION_ITEMS,

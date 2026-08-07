@@ -5616,6 +5616,95 @@ impl K0FullyPrefilledResumeCacheReceipt {
     }
 }
 
+/// Immutable resume-map projection from one setup-authenticated complete K0
+/// cache.
+///
+/// Construction revalidates the opaque prefill receipt and every retained
+/// resume entry, including its cache identity, state bounds, pending mode, and
+/// semantic frontier. Duplicate cached-state IDs remain valid because equal
+/// frontiers may intentionally share one interned state. The slices borrow
+/// the fixed resume-set allocation and remain stable only while neither the
+/// workspace nor resume set is mutably entered; compiler-private exclusive
+/// runtimes must treat such an entry as revoking their external seal.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct K0FullyPrefilledResumeMapProjection<'a> {
+    cached_state_ids: &'a [u32],
+    pending_modes: &'a [u8],
+    compact_row_stride: u32,
+    raw_byte_row_base: Option<u32>,
+    cache_identity: u64,
+}
+
+impl K0FullyPrefilledResumeMapProjection<'_> {
+    /// Stable K0 state IDs, indexed by the producer's resume-state ID.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn cached_state_ids(&self) -> &[u32] {
+        self.cached_state_ids
+    }
+
+    /// Canonical zero-or-one pending-end modes parallel to the state IDs.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn pending_modes(&self) -> &[u8] {
+        self.pending_modes
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn count(&self) -> usize {
+        self.cached_state_ids.len()
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn compact_row_stride(&self) -> u32 {
+        self.compact_row_stride
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn raw_byte_row_base(&self) -> Option<u32> {
+        self.raw_byte_row_base
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn cache_identity(&self) -> u64 {
+        self.cache_identity
+    }
+
+    /// Decode one canonical pending mode without interpreting endpoint zero
+    /// as absence.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn pending(&self, resume_state: usize) -> Option<bool> {
+        self.pending_modes
+            .get(resume_state)
+            .copied()
+            .map(|mode| mode != 0)
+    }
+
+    /// Compute the compact direct-row offset for one projected resume state.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn compact_row(&self, resume_state: usize) -> Option<u32> {
+        let state = *self.cached_state_ids.get(resume_state)?;
+        direct_row_offset(state, self.compact_row_stride).ok()
+    }
+
+    /// Compute the raw-byte row offset when the frozen cache published that
+    /// optional layout.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn raw_byte_row(&self, resume_state: usize) -> Option<u32> {
+        let base = usize::try_from(self.raw_byte_row_base?).ok()?;
+        let state = *self.cached_state_ids.get(resume_state)?;
+        fully_prefilled_byte_row_offset(base, state).ok()
+    }
+}
+
 /// Immutable native projection of one setup-authenticated complete K0 cache.
 ///
 /// Construction revalidates the opaque prefill receipt, exact forward and
@@ -6342,6 +6431,89 @@ impl K0Workspace {
             }
         }
         Some(())
+    }
+
+    /// Authenticate every ordered-resume entry and borrow its frozen K0 map
+    /// for a versioned exclusive-runtime header.
+    ///
+    /// This is a setup-time linear validation pass. It allocates nothing and
+    /// exposes no mutable cache state. The returned projection borrows both
+    /// owners under the same lifetime; any later mutable entry into either
+    /// owner ends the caller's external receipt lifecycle.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn compiler_private_fully_prefilled_resume_map_projection<'a>(
+        &'a self,
+        automaton: &Automaton,
+        resume_set: &'a K0ResumeSet,
+        receipt: K0FullyPrefilledResumeCacheReceipt,
+    ) -> Option<K0FullyPrefilledResumeMapProjection<'a>> {
+        self.fully_prefilled_cache_is_live(automaton, resume_set, receipt, false)?;
+        let count = resume_set.cached_states.len();
+        let stride = usize::try_from(receipt.direct_row_stride).ok()?;
+        if count == 0
+            || resume_set.cached_workspace_identities.len() != count
+            || resume_set.modes.len() != count
+            || resume_set.offsets.len() != count
+            || resume_set.lengths.len() != count
+        {
+            return None;
+        }
+
+        let raw_byte_row_base = if receipt.has_forward_byte_rows() {
+            Some(u32::try_from(receipt.forward_cells).ok()?)
+        } else {
+            None
+        };
+        for resume_state in 0..count {
+            let mode = *resume_set.modes.get(resume_state)?;
+            let cached_state = *resume_set.cached_states.get(resume_state)?;
+            let cached_identity = *resume_set
+                .cached_workspace_identities
+                .get(resume_state)?;
+            let cached_state_index = usize::try_from(cached_state).ok()?;
+            if mode > 1
+                || cached_identity != receipt.cache_identity
+                || cached_state == LAZY_NO_STATE
+                || cached_state_index >= receipt.forward_state_len
+                || self.lazy.modes.get(cached_state_index).copied()? > 1
+            {
+                return None;
+            }
+
+            let (frontier, pending) = resume_set.frontier(resume_state).ok()?;
+            let (cached_offset, cached_length, cached_pending) =
+                resume_lazy_state_bounds(&self.lazy, cached_state).ok()?;
+            let cached_end = cached_offset.checked_add(cached_length)?;
+            if pending != (mode != 0)
+                || cached_pending != pending
+                || self.lazy.items.get(cached_offset..cached_end) != Some(frontier)
+            {
+                return None;
+            }
+
+            let compact_row = usize::try_from(self.lazy.row_offset(cached_state).ok()?).ok()?;
+            if compact_row.checked_add(stride)? > receipt.forward_cells {
+                return None;
+            }
+            if receipt.has_forward_byte_rows() {
+                let raw_row = usize::try_from(
+                    fully_prefilled_byte_row_offset(receipt.forward_cells, cached_state).ok()?,
+                )
+                .ok()?;
+                if raw_row.checked_add(BYTE_ALPHABET)? > self.lazy.rows.len() {
+                    return None;
+                }
+            }
+        }
+
+        Some(K0FullyPrefilledResumeMapProjection {
+            cached_state_ids: &resume_set.cached_states,
+            pending_modes: &resume_set.modes,
+            compact_row_stride: receipt.direct_row_stride,
+            raw_byte_row_base,
+            cache_identity: receipt.cache_identity,
+        })
     }
 
     /// Authenticate a complete setup receipt once and project root-start
@@ -48465,6 +48637,237 @@ mod tests {
         assert_eq!(workspace.lazy.state_len, forward_states);
         assert_eq!(workspace.reverse.state_len, reverse_states);
         assert_eq!(workspace.lazy.direct_cells_published, published);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the setup projection regression exhaustively corrupts every parallel map entry"
+    )]
+    fn fully_prefilled_resume_map_projects_all_compact_entries_and_fails_closed() {
+        let plan = direct_split_loop_then_terminal();
+        let loop_frontier = [0_u32];
+        let side_frontier = [2_u32];
+        let mut resume = K0ResumeSet::new(
+            &plan,
+            4,
+            4,
+            [
+                (&loop_frontier[..], false),
+                (&loop_frontier[..], true),
+                (&loop_frontier[..], false),
+                (&side_frontier[..], false),
+            ],
+        )
+        .unwrap();
+        let mut workspace =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let receipt = workspace
+            .compiler_private_try_prefill_resume_caches_with_receipt(&plan, &mut resume)
+            .expect("the complete compact graph must publish its resume map");
+        assert!(!receipt.has_forward_byte_rows());
+
+        {
+            let projection = workspace
+                .compiler_private_fully_prefilled_resume_map_projection(
+                    &plan, &resume, receipt,
+                )
+                .expect("the fresh receipt must authenticate every resume entry");
+            assert_eq!(projection.count(), 4);
+            assert_eq!(projection.cached_state_ids().as_ptr(), resume.cached_states.as_ptr());
+            assert_eq!(projection.pending_modes().as_ptr(), resume.modes.as_ptr());
+            assert_eq!(projection.pending_modes(), &[0, 1, 0, 0]);
+            assert_eq!(projection.compact_row_stride(), receipt.direct_row_stride);
+            assert_eq!(projection.raw_byte_row_base(), None);
+            assert_eq!(projection.cache_identity(), receipt.cache_identity);
+            assert_eq!(projection.cached_state_ids()[0], projection.cached_state_ids()[2]);
+            assert_ne!(projection.cached_state_ids()[0], projection.cached_state_ids()[1]);
+            for resume_state in 0..projection.count() {
+                let cached_state = projection.cached_state_ids()[resume_state];
+                assert_eq!(
+                    projection.pending(resume_state),
+                    Some(projection.pending_modes()[resume_state] != 0)
+                );
+                assert_eq!(
+                    projection.compact_row(resume_state),
+                    cached_state.checked_mul(projection.compact_row_stride())
+                );
+                assert_eq!(projection.raw_byte_row(resume_state), None);
+            }
+            assert_eq!(projection.pending(projection.count()), None);
+            assert_eq!(projection.compact_row(projection.count()), None);
+            assert_eq!(projection.raw_byte_row(projection.count()), None);
+        }
+
+        let empty = b"";
+        assert_eq!(
+            plan.prepare::<SelectedEnd>()
+                .search_prevalidated_selected_end_value_from_fully_prefilled_ordered_resume_with_authenticated_workspace_with_completion(
+                    empty,
+                    SearchWindow::full(empty),
+                    &mut workspace,
+                    &mut resume,
+                    1,
+                    0,
+                    Some(0),
+                    SearchLimits::unlimited(),
+                    receipt,
+                )
+                .unwrap()
+                .into_parts(),
+            (Some(0), K0OrderedResumeCompletion::FullyWarmRows),
+            "pending mode must preserve an endpoint at absolute offset zero"
+        );
+
+        for resume_state in 0..resume.cached_states.len() {
+            let saved_identity = resume.cached_workspace_identities[resume_state];
+            resume.cached_workspace_identities[resume_state] = 0;
+            assert!(
+                workspace
+                    .compiler_private_fully_prefilled_resume_map_projection(
+                        &plan, &resume, receipt,
+                    )
+                    .is_none(),
+                "stale workspace identity at resume index {resume_state} must fail closed"
+            );
+            resume.cached_workspace_identities[resume_state] = saved_identity;
+
+            let saved_state = resume.cached_states[resume_state];
+            resume.cached_states[resume_state] = super::LAZY_NO_STATE;
+            assert!(
+                workspace
+                    .compiler_private_fully_prefilled_resume_map_projection(
+                        &plan, &resume, receipt,
+                    )
+                    .is_none(),
+                "missing cached state at resume index {resume_state} must fail closed"
+            );
+            resume.cached_states[resume_state] = saved_state;
+
+            let saved_mode = resume.modes[resume_state];
+            resume.modes[resume_state] = 2;
+            assert!(
+                workspace
+                    .compiler_private_fully_prefilled_resume_map_projection(
+                        &plan, &resume, receipt,
+                    )
+                    .is_none(),
+                "noncanonical pending mode at resume index {resume_state} must fail closed"
+            );
+            resume.modes[resume_state] = saved_mode;
+        }
+
+        let saved_pending_state = resume.cached_states[1];
+        resume.cached_states[1] = resume.cached_states[0];
+        assert!(
+            workspace
+                .compiler_private_fully_prefilled_resume_map_projection(&plan, &resume, receipt)
+                .is_none(),
+            "an in-bounds cached state with the wrong pending mode must fail closed"
+        );
+        resume.cached_states[1] = saved_pending_state;
+        let saved_side_state = resume.cached_states[3];
+        resume.cached_states[3] = resume.cached_states[0];
+        assert!(
+            workspace
+                .compiler_private_fully_prefilled_resume_map_projection(&plan, &resume, receipt)
+                .is_none(),
+            "an in-bounds cached state with the wrong frontier must fail closed"
+        );
+        resume.cached_states[3] = saved_side_state;
+        assert!(
+            workspace
+                .compiler_private_fully_prefilled_resume_map_projection(&plan, &resume, receipt)
+                .is_some()
+        );
+
+        let haystack = b"z";
+        let mut foreign =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        assert_eq!(
+            plan.prepare::<SelectedEnd>()
+                .search_prevalidated_selected_end_value_from_ordered_resume_with_authenticated_workspace(
+                    haystack,
+                    SearchWindow::full(haystack),
+                    &mut foreign,
+                    &mut resume,
+                    0,
+                    0,
+                    None,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(resume.fully_prefilled_cache_identity, 0);
+        assert!(
+            workspace
+                .compiler_private_fully_prefilled_resume_map_projection(&plan, &resume, receipt)
+                .is_none(),
+            "ordinary hint repair must revoke the authenticated resume map"
+        );
+    }
+
+    #[test]
+    fn fully_prefilled_resume_map_projects_compact_and_raw_row_formulas() {
+        let plan = byte_chain(&[
+            (b'a', b'a'),
+            (b'b', b'b'),
+            (b'c', b'c'),
+            (b'd', b'd'),
+            (b'e', b'e'),
+            (b'f', b'f'),
+            (b'g', b'g'),
+        ]);
+        let first_frontier = [1_u32];
+        let second_frontier = [2_u32];
+        let mut resume = K0ResumeSet::new(
+            &plan,
+            4,
+            4,
+            [
+                (&first_frontier[..], false),
+                (&first_frontier[..], true),
+                (&first_frontier[..], false),
+                (&second_frontier[..], false),
+            ],
+        )
+        .unwrap();
+        let mut workspace =
+            K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let receipt = workspace
+            .compiler_private_try_prefill_resume_caches_with_receipt(&plan, &mut resume)
+            .expect("the complete chain must publish compact and raw-byte resume rows");
+        assert!(receipt.has_forward_byte_rows());
+        let projection = workspace
+            .compiler_private_fully_prefilled_resume_map_projection(&plan, &resume, receipt)
+            .expect("the raw-byte receipt must authenticate every resume entry");
+        let raw_base = projection
+            .raw_byte_row_base()
+            .expect("the forward raw-byte layout must expose its base");
+        assert_eq!(raw_base, u32::try_from(receipt.forward_cells).unwrap());
+        assert_eq!(projection.cached_state_ids()[0], projection.cached_state_ids()[2]);
+        for resume_state in 0..projection.count() {
+            let cached_state = projection.cached_state_ids()[resume_state];
+            let compact_row = cached_state
+                .checked_mul(projection.compact_row_stride())
+                .unwrap();
+            let raw_row = raw_base
+                .checked_add(
+                    cached_state
+                        .checked_mul(u32::try_from(super::BYTE_ALPHABET).unwrap())
+                        .unwrap(),
+                )
+                .unwrap();
+            assert_eq!(projection.compact_row(resume_state), Some(compact_row));
+            assert_eq!(projection.raw_byte_row(resume_state), Some(raw_row));
+            assert!(
+                usize::try_from(raw_row)
+                    .unwrap()
+                    .checked_add(super::BYTE_ALPHABET)
+                    .is_some_and(|end| end <= workspace.lazy.rows.len())
+            );
+        }
     }
 
     #[test]
