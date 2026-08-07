@@ -9905,6 +9905,7 @@ fn try_k0_absolute_end_span(
 
 const K0_PACKED_FRONTIER_EXISTS_STATE_SLOTS: usize = 4;
 const K0_PACKED_FRONTIER_DIRECT_EPOCH_CALLS: u8 = 8;
+const K0_PACKED_FRONTIER_STRUCTURAL_EPOCH_CALLS: [u8; 4] = [8, 16, 32, 64];
 const K0_PACKED_FRONTIER_DIRECT_LOSS_BACKOFF_CALLS: u8 = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -9941,7 +9942,7 @@ enum K0PackedFrontierExistsRoute {
 
 /// Four exact-window classes without `Option` inflation. The immutable K0 plan
 /// selects this state only for its mutually exclusive packed-frontier route;
-/// on 64-bit targets its 104-byte layout is no larger than the correlated
+/// on 64-bit targets its 112-byte layout is no larger than the correlated
 /// Exists policy it replaces in the session.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -9952,6 +9953,7 @@ struct K0PackedFrontierExistsState {
     occupied: u8,
     preferences: u8,
     direct_remaining: [u8; K0_PACKED_FRONTIER_EXISTS_STATE_SLOTS],
+    structural_epoch_stage: [u8; K0_PACKED_FRONTIER_EXISTS_STATE_SLOTS],
     next_replacement: u8,
 }
 
@@ -9963,6 +9965,7 @@ impl Default for K0PackedFrontierExistsState {
             occupied: 0,
             preferences: 0,
             direct_remaining: [0; K0_PACKED_FRONTIER_EXISTS_STATE_SLOTS],
+            structural_epoch_stage: [0; K0_PACKED_FRONTIER_EXISTS_STATE_SLOTS],
             next_replacement: 0,
         }
     }
@@ -10010,6 +10013,25 @@ impl K0PackedFrontierExistsState {
         self.preferences = (self.preferences & !mask) | (value << shift);
     }
 
+    fn next_direct_epoch_calls(&mut self, index: usize) -> u8 {
+        if !self.is_structural_direct(index) {
+            return K0_PACKED_FRONTIER_DIRECT_EPOCH_CALLS;
+        }
+        let stage = usize::from(self.structural_epoch_stage[index])
+            .min(K0_PACKED_FRONTIER_STRUCTURAL_EPOCH_CALLS.len() - 1);
+        self.structural_epoch_stage[index] = u8::try_from(
+            stage
+                .saturating_add(1)
+                .min(K0_PACKED_FRONTIER_STRUCTURAL_EPOCH_CALLS.len() - 1),
+        )
+        .expect("bounded structural Direct stage fits u8");
+        K0_PACKED_FRONTIER_STRUCTURAL_EPOCH_CALLS[stage]
+    }
+
+    fn reset_direct_stability(&mut self, index: usize) {
+        self.structural_epoch_stage[index] = 0;
+    }
+
     fn reset_class(&mut self, index: usize, window: SearchWindow) {
         self.classes[index] = K0PackedFrontierExistsClassState {
             window,
@@ -10022,6 +10044,7 @@ impl K0PackedFrontierExistsState {
             K0PackedFrontierExistsPreference::ObserveColdPacked,
         );
         self.direct_remaining[index] = 0;
+        self.reset_direct_stability(index);
     }
 
     fn class_for(&mut self, window: SearchWindow) -> usize {
@@ -10081,6 +10104,60 @@ impl K0PackedFrontierExistsState {
         }
     }
 
+    #[inline]
+    fn retained_incumbent(
+        &self,
+        window: SearchWindow,
+    ) -> Option<(usize, K0PackedFrontierPositiveObservation, bool)> {
+        // Each class owns two adjacent preference bits and RetainIncumbent is
+        // `0b11`. Reject the overwhelmingly common no-retained-state case
+        // before comparing any exact windows. This is derived from the
+        // authoritative packed preference byte, so it adds no shadow state or
+        // publication obligation.
+        let low_preference_bits = self.preferences & 0x55;
+        let high_preference_bits = (self.preferences >> 1) & 0x55;
+        if low_preference_bits & high_preference_bits == 0 {
+            return None;
+        }
+        let class_index = (0..self.classes.len()).find(|&index| {
+            self.is_occupied(index)
+                && self.classes[index].window == window
+                && self.preference(index)
+                    == K0PackedFrontierExistsPreference::RetainIncumbent
+                && self.direct_remaining[index] != 0
+        })?;
+        Some((
+            class_index,
+            K0PackedFrontierPositiveObservation {
+                residual_work: self.classes[class_index].packed_residual_work,
+            },
+            self.is_structural_direct(class_index),
+        ))
+    }
+
+    #[inline]
+    fn observe_retained_incumbent(
+        &mut self,
+        class_index: usize,
+        packed_positive: K0PackedFrontierPositiveObservation,
+        observation: K0PackedFrontierIncumbentObservation,
+    ) {
+        debug_assert_eq!(
+            self.preference(class_index),
+            K0PackedFrontierExistsPreference::RetainIncumbent,
+        );
+        debug_assert_ne!(self.direct_remaining[class_index], 0);
+        self.direct_remaining[class_index] =
+            self.direct_remaining[class_index].saturating_sub(1);
+        if self.direct_remaining[class_index] == 0 {
+            self.set_preference(
+                class_index,
+                K0PackedFrontierExistsPreference::ObserveColdPacked,
+            );
+        }
+        self.observe_incumbent(class_index, packed_positive, false, observation);
+    }
+
     fn observe_packed(
         &mut self,
         class_index: usize,
@@ -10107,6 +10184,7 @@ impl K0PackedFrontierExistsState {
                     K0PackedFrontierExistsPreference::ObserveColdPacked,
                 );
                 self.direct_remaining[class_index] = 0;
+                self.reset_direct_stability(class_index);
                 return;
             }
             K0PackedFrontierObservation::ShallowCompletion(positive) => {
@@ -10125,11 +10203,12 @@ impl K0PackedFrontierExistsState {
             }
             K0PackedFrontierObservation::Comparable(positive) => positive,
         };
-        let was_structural_direct = self.is_structural_direct(class_index);
         // An exact floor has made no residual-K0 progress. Keep its numerical
-        // cold/warm receipt, but remember the structural fact so a sidecar
-        // that completes without comparable K0 work cannot turn the Direct
-        // trial into a false loss.
+        // receipt and remember the structural fact so a sidecar that completes
+        // without comparable K0 work cannot turn the Direct trial into a false
+        // loss. The packed-positive call already executed the exact incumbent
+        // tail over the original window, so the next Direct trial is warm and
+        // needs no redundant second packed observation.
         self.set_structural_direct(class_index, true);
         if preference == K0PackedFrontierExistsPreference::ObserveColdPacked
             && self.direct_remaining[class_index] != 0
@@ -10141,15 +10220,7 @@ impl K0PackedFrontierExistsState {
         self.classes[class_index].packed_residual_work = positive.residual_work;
         self.set_preference(
             class_index,
-            if preference == K0PackedFrontierExistsPreference::ObserveColdPacked
-                && !was_structural_direct
-            {
-                // The first call may publish lazy K0 state. A second packed
-                // call supplies the warm baseline used by the direct trial.
-                K0PackedFrontierExistsPreference::ObserveWarmPacked
-            } else {
-                K0PackedFrontierExistsPreference::TrialIncumbent
-            },
+            K0PackedFrontierExistsPreference::TrialIncumbent,
         );
     }
 
@@ -10172,7 +10243,8 @@ impl K0PackedFrontierExistsState {
                     class_index,
                     K0PackedFrontierExistsPreference::RetainIncumbent,
                 );
-                self.direct_remaining[class_index] = K0_PACKED_FRONTIER_DIRECT_EPOCH_CALLS;
+                self.direct_remaining[class_index] =
+                    self.next_direct_epoch_calls(class_index);
                 return;
             }
         }
@@ -10192,7 +10264,8 @@ impl K0PackedFrontierExistsState {
                     class_index,
                     K0PackedFrontierExistsPreference::RetainIncumbent,
                 );
-                self.direct_remaining[class_index] = K0_PACKED_FRONTIER_DIRECT_EPOCH_CALLS;
+                self.direct_remaining[class_index] =
+                    self.next_direct_epoch_calls(class_index);
             }
         } else {
             // Incomparable execution includes every sidecar decline or
@@ -10200,6 +10273,7 @@ impl K0PackedFrontierExistsState {
             // conservatively before another calibration.
             self.classes[class_index].packed_residual_work = 0;
             self.set_structural_direct(class_index, false);
+            self.reset_direct_stability(class_index);
             self.set_preference(
                 class_index,
                 K0PackedFrontierExistsPreference::ObserveColdPacked,
@@ -10384,7 +10458,7 @@ impl<'p, 'h> K0PackedFrontierExistsReceipt<'p, 'h> {
             &[u8],
             SearchWindow,
             SearchLimits,
-            &mut K0PackedFrontierIncumbentObservation,
+            Option<&mut K0PackedFrontierIncumbentObservation>,
         ) -> Result<bool, SearchError>,
     {
         self.validate_execution(session)?;
@@ -10429,7 +10503,7 @@ impl<'p, 'h> K0PackedFrontierExistsReceipt<'p, 'h> {
             self.haystack,
             SearchWindow::new(floor, self.window.end()),
             self.search_limits,
-            &mut incumbent_observation,
+            Some(&mut incumbent_observation),
         )?;
         let observation = classify_k0_packed_frontier_positive(
             self.window.start(),
@@ -10456,10 +10530,39 @@ where
         &[u8],
         SearchWindow,
         SearchLimits,
-        &mut K0PackedFrontierIncumbentObservation,
+        Option<&mut K0PackedFrontierIncumbentObservation>,
     ) -> Result<bool, SearchError>,
 {
     receipt.validate_execution(session)?;
+    // A retained Direct epoch is already bound to this immutable packed plan
+    // and exact source window by this validated receipt. Execute it before
+    // transactionally copying the whole four-class policy. Structural epochs
+    // deliberately ignore later work comparisons until their bounded
+    // reprobe, so their raw K0 tail can use the report-free value executor.
+    if let Some((class_index, packed_positive, structural_direct)) =
+        state.retained_incumbent(receipt.window)
+    {
+        let mut incumbent_observation =
+            K0PackedFrontierIncumbentObservation::Incomparable;
+        let measure_incumbent = if structural_direct {
+            None
+        } else {
+            Some(&mut incumbent_observation)
+        };
+        let output = execute_incumbent(
+            session,
+            receipt.haystack,
+            receipt.window,
+            receipt.search_limits,
+            measure_incumbent,
+        )?;
+        state.observe_retained_incumbent(
+            class_index,
+            packed_positive,
+            incumbent_observation,
+        );
+        return Ok(output);
+    }
     // Route selection and observations remain speculative until the sole
     // authoritative executor succeeds. Errors preserve the complete policy
     // state, including a pending incumbent retry.
@@ -10484,7 +10587,7 @@ where
                 receipt.haystack,
                 receipt.window,
                 receipt.search_limits,
-                &mut incumbent_observation,
+                Some(&mut incumbent_observation),
             )?;
             state_after_success.observe_incumbent(
                 class_index,
@@ -13955,7 +14058,7 @@ impl<'r> PortableSearchSession<'r> {
                                 haystack,
                                 window,
                                 limits,
-                                Some(measured_work),
+                                measured_work,
                             )
                         },
                     );
@@ -17350,6 +17453,8 @@ mod tests {
                 assert_eq!(actual_haystack.as_ptr(), haystack.as_ptr());
                 assert_eq!(actual_window, expected_tail);
                 assert_eq!(limits, SearchLimits::unlimited());
+                let observation = observation
+                    .expect("a packed-positive tail retains its work observation");
                 assert_eq!(
                     *observation,
                     super::K0PackedFrontierIncumbentObservation::Incomparable,
@@ -17425,7 +17530,7 @@ mod tests {
         );
         #[cfg(target_pointer_width = "64")]
         {
-            assert_eq!(packed, 104);
+            assert_eq!(packed, 112);
             assert_eq!(correlated_bundle, 192);
             assert_eq!(exclusive, 200);
             assert!(exclusive < 3 * 104, "the pre-compaction bundle was 312 bytes");
@@ -17433,7 +17538,7 @@ mod tests {
     }
 
     #[test]
-    fn k0_packed_frontier_exact_floor_still_observes_two_packed_calls_before_direct() {
+    fn k0_packed_frontier_exact_floor_arms_one_warm_direct_trial() {
         const WINDOW_BYTES: usize = 2_048;
         const WINDOW_START: usize = 37;
         let policy_window = SearchWindow::new(WINDOW_START, WINDOW_START + WINDOW_BYTES);
@@ -17468,15 +17573,26 @@ mod tests {
         let packed_positive = super::K0PackedFrontierPositiveObservation {
             residual_work: 23,
         };
+        let exact_floor = super::classify_k0_packed_frontier_positive(
+            policy_window.start(),
+            policy_window.start(),
+            1_024,
+            packed_positive.residual_work,
+        );
+        assert_eq!(
+            exact_floor,
+            super::K0PackedFrontierObservation::Comparable(packed_positive),
+            "a packed pass that cannot narrow has already warmed its incumbent tail",
+        );
         shifted.observe_packed(
             class_index,
             policy_window,
-            super::K0PackedFrontierObservation::Comparable(packed_positive),
+            exact_floor,
         );
         assert_eq!(
             shifted.preference(class_index),
-            super::K0PackedFrontierExistsPreference::ObserveWarmPacked,
-            "one possibly-cold packed call cannot arm a direct trial",
+            super::K0PackedFrontierExistsPreference::TrialIncumbent,
+            "the same-call incumbent tail makes the next Direct trial warm",
         );
         assert!(matches!(
             shifted.select(SearchWindow::new(
@@ -17485,25 +17601,6 @@ mod tests {
             )),
             super::K0PackedFrontierExistsRoute::Packed { .. }
         ));
-        let warm_packed_positive = super::K0PackedFrontierPositiveObservation {
-            residual_work: 19,
-        };
-        let warm_class = match shifted.select(policy_window) {
-            super::K0PackedFrontierExistsRoute::Packed { class_index } => class_index,
-            super::K0PackedFrontierExistsRoute::Incumbent { .. } => {
-                panic!("the second observation must still use packed execution")
-            }
-        };
-        assert_eq!(warm_class, class_index);
-        shifted.observe_packed(
-            class_index,
-            policy_window,
-            super::K0PackedFrontierObservation::Comparable(warm_packed_positive),
-        );
-        assert_eq!(
-            shifted.preference(class_index),
-            super::K0PackedFrontierExistsPreference::TrialIncumbent,
-        );
         let retained = match shifted.select(policy_window) {
             super::K0PackedFrontierExistsRoute::Incumbent {
                 class_index: selected_class,
@@ -17511,7 +17608,7 @@ mod tests {
                 trial,
             } => {
                 assert_eq!(selected_class, class_index);
-                assert_eq!(selected_positive, warm_packed_positive);
+                assert_eq!(selected_positive, packed_positive);
                 assert!(trial);
                 selected_positive
             }
@@ -17537,15 +17634,6 @@ mod tests {
             super::K0PackedFrontierExistsRoute::Packed { class_index } => class_index,
             super::K0PackedFrontierExistsRoute::Incumbent { .. } => unreachable!(),
         };
-        incomparable.observe_packed(
-            class_index,
-            policy_window,
-            super::K0PackedFrontierObservation::Comparable(packed_positive),
-        );
-        assert!(matches!(
-            incomparable.select(policy_window),
-            super::K0PackedFrontierExistsRoute::Packed { .. }
-        ));
         incomparable.observe_packed(
             class_index,
             policy_window,
@@ -17632,8 +17720,20 @@ mod tests {
             super::K0_PACKED_FRONTIER_DIRECT_EPOCH_CALLS,
         );
 
+        let mut staged_reference = state;
         for expected_remaining in (0..super::K0_PACKED_FRONTIER_DIRECT_EPOCH_CALLS).rev() {
-            let packed_positive = match state.select(window) {
+            let (fast_class, packed_positive, structural_direct) = state
+                .retained_incumbent(window)
+                .expect("the fast retained route must own the same exact window");
+            assert_eq!(fast_class, class_index);
+            assert!(structural_direct);
+            state.observe_retained_incumbent(
+                class_index,
+                packed_positive,
+                super::K0PackedFrontierIncumbentObservation::SpecializedComplete,
+            );
+
+            let reference_positive = match staged_reference.select(window) {
                 super::K0PackedFrontierExistsRoute::Incumbent {
                     packed_positive,
                     trial,
@@ -17646,12 +17746,19 @@ mod tests {
                     panic!("the bounded Direct epoch ended early")
                 }
             };
-            assert_eq!(state.direct_remaining[class_index], expected_remaining);
-            state.observe_incumbent(
+            assert_eq!(
+                staged_reference.direct_remaining[class_index],
+                expected_remaining,
+            );
+            staged_reference.observe_incumbent(
                 class_index,
-                packed_positive,
+                reference_positive,
                 false,
                 super::K0PackedFrontierIncumbentObservation::SpecializedComplete,
+            );
+            assert_eq!(
+                state, staged_reference,
+                "fast retained publication must equal staged select/observe",
             );
         }
         let reprobe_class = match state.select(window) {
@@ -17693,22 +17800,13 @@ mod tests {
             window,
             super::K0PackedFrontierObservation::Comparable(positive),
         );
-        assert!(matches!(
-            state.select(window),
-            super::K0PackedFrontierExistsRoute::Packed { .. }
-        ));
-        state.observe_packed(
-            class_index,
-            window,
-            super::K0PackedFrontierObservation::Comparable(positive),
-        );
         let trial_positive = match state.select(window) {
             super::K0PackedFrontierExistsRoute::Incumbent {
                 packed_positive,
                 trial: true,
                 ..
             } => packed_positive,
-            _ => panic!("two comparable packed calls did not arm the trial"),
+            _ => panic!("one comparable packed call did not arm the warm trial"),
         };
         state.observe_incumbent(
             class_index,
@@ -17754,6 +17852,84 @@ mod tests {
     }
 
     #[test]
+    fn k0_packed_frontier_stable_structural_epochs_widen_and_remain_bounded() {
+        let window = SearchWindow::new(23, 23 + 4_096);
+        let positive = super::K0PackedFrontierPositiveObservation {
+            residual_work: 29,
+        };
+        let mut state = super::K0PackedFrontierExistsState::default();
+        let mut class_index = match state.select(window) {
+            super::K0PackedFrontierExistsRoute::Packed { class_index } => class_index,
+            super::K0PackedFrontierExistsRoute::Incumbent { .. } => unreachable!(),
+        };
+
+        for expected_epoch in [8_u8, 16, 32, 64, 64] {
+            state.observe_packed(
+                class_index,
+                window,
+                super::K0PackedFrontierObservation::ShallowCompletion(positive),
+            );
+            let trial_positive = match state.select(window) {
+                super::K0PackedFrontierExistsRoute::Incumbent {
+                    class_index: selected_class,
+                    packed_positive,
+                    trial: true,
+                } => {
+                    assert_eq!(selected_class, class_index);
+                    packed_positive
+                }
+                _ => panic!("a stable structural reprobe did not arm Direct"),
+            };
+            state.observe_incumbent(
+                class_index,
+                trial_positive,
+                true,
+                super::K0PackedFrontierIncumbentObservation::SpecializedComplete,
+            );
+            assert_eq!(state.direct_remaining[class_index], expected_epoch);
+            for expected_remaining in (0..expected_epoch).rev() {
+                let retained_positive = match state.select(window) {
+                    super::K0PackedFrontierExistsRoute::Incumbent {
+                        class_index: selected_class,
+                        packed_positive,
+                        trial: false,
+                    } => {
+                        assert_eq!(selected_class, class_index);
+                        packed_positive
+                    }
+                    _ => panic!("a stable structural epoch ended early"),
+                };
+                assert_eq!(state.direct_remaining[class_index], expected_remaining);
+                state.observe_incumbent(
+                    class_index,
+                    retained_positive,
+                    false,
+                    super::K0PackedFrontierIncumbentObservation::SpecializedComplete,
+                );
+            }
+            class_index = match state.select(window) {
+                super::K0PackedFrontierExistsRoute::Packed { class_index } => class_index,
+                super::K0PackedFrontierExistsRoute::Incumbent { .. } => {
+                    panic!("a completed structural epoch did not schedule one reprobe")
+                }
+            };
+        }
+
+        assert_eq!(
+            state.structural_epoch_stage[class_index],
+            u8::try_from(super::K0_PACKED_FRONTIER_STRUCTURAL_EPOCH_CALLS.len() - 1)
+                .expect("bounded structural stage fits u8"),
+        );
+        state.observe_packed(
+            class_index,
+            window,
+            super::K0PackedFrontierObservation::Absent,
+        );
+        assert_eq!(state.structural_epoch_stage[class_index], 0);
+        assert!(!state.is_structural_direct(class_index));
+    }
+
+    #[test]
     fn k0_packed_frontier_class_replacement_clears_structural_state() {
         let mut state = super::K0PackedFrontierExistsState::default();
         for ordinal in 0..super::K0_PACKED_FRONTIER_EXISTS_STATE_SLOTS {
@@ -17767,6 +17943,7 @@ mod tests {
                 super::K0PackedFrontierExistsPreference::RetainIncumbent,
             );
             state.direct_remaining[class_index] = 5;
+            state.structural_epoch_stage[class_index] = 3;
         }
         let replacement_window = SearchWindow::new(10_000, 12_048);
         let replaced = state.class_for(replacement_window);
@@ -17778,6 +17955,7 @@ mod tests {
             super::K0PackedFrontierExistsPreference::ObserveColdPacked,
         );
         assert_eq!(state.direct_remaining[replaced], 0);
+        assert_eq!(state.structural_epoch_stage[replaced], 0);
     }
 
     #[test]
@@ -17822,9 +18000,11 @@ mod tests {
                 super::K0PackedFrontierExistsRoute::Incumbent { .. } => unreachable!(),
             };
             state.set_structural_direct(class_index, true);
+            state.structural_epoch_stage[class_index] = 3;
             state.observe_packed(selected_class, window, decisive);
             assert_eq!(state.classes[class_index].packed_residual_work, 0);
             assert_eq!(state.direct_remaining[class_index], 0);
+            assert_eq!(state.structural_epoch_stage[class_index], 0);
             assert!(!state.is_structural_direct(class_index));
             assert_eq!(
                 state.preference(class_index),
@@ -17904,6 +18084,8 @@ mod tests {
                 assert_eq!(actual_haystack.as_ptr(), haystack.as_ptr());
                 assert_eq!(actual_window, window);
                 assert_eq!(limits, SearchLimits::unlimited());
+                let observation = observation
+                    .expect("a non-retained incumbent trial remains measured");
                 assert_eq!(
                     *observation,
                     super::K0PackedFrontierIncumbentObservation::Incomparable,
@@ -18354,6 +18536,48 @@ mod tests {
             assert_eq!(incumbent_calls.get(), 1, "one incumbent owns the failed call");
             assert_eq!(*packed_frontier_exists_state, state_before);
 
+            packed_frontier_exists_state.set_preference(
+                class_index,
+                super::K0PackedFrontierExistsPreference::RetainIncumbent,
+            );
+            packed_frontier_exists_state.direct_remaining[class_index] = 5;
+            let measured_retained_before = *packed_frontier_exists_state;
+            let measured_retained_receipt = K0PackedFrontierExistsReceipt::admit(
+                k0_plan,
+                session,
+                &haystack,
+                window,
+                SearchLimits::unlimited(),
+            )
+            .expect("measured-retained admission remains valid")
+            .expect("measured-retained window admits the packed replacement");
+            assert!(matches!(
+                super::execute_k0_packed_frontier_exists_route(
+                    measured_retained_receipt,
+                    session,
+                    packed_frontier_exists_state,
+                    |_, _, _, _, observation| {
+                        assert!(
+                            observation.is_some(),
+                            "a nonstructural retained epoch preserves its comparison receipt",
+                        );
+                        Err(SearchError::K0(
+                            super::K0SearchError::InternalInvariant {
+                                detail: "focused measured retained incumbent failure",
+                            },
+                        ))
+                    },
+                ),
+                Err(SearchError::K0(super::K0SearchError::InternalInvariant {
+                    detail: "focused measured retained incumbent failure",
+                }))
+            ));
+            assert_eq!(
+                *packed_frontier_exists_state,
+                measured_retained_before,
+                "a measured retained-call error preserves its complete policy state",
+            );
+
             packed_frontier_exists_state.set_structural_direct(class_index, true);
             packed_frontier_exists_state.set_preference(
                 class_index,
@@ -18375,11 +18599,17 @@ mod tests {
                     retained_receipt,
                     session,
                     packed_frontier_exists_state,
-                    |_, _, _, _, _| Err(SearchError::K0(
-                        super::K0SearchError::InternalInvariant {
-                            detail: "focused retained incumbent failure",
-                        },
-                    )),
+                    |_, _, _, _, observation| {
+                        assert!(
+                            observation.is_none(),
+                            "a structural retained epoch must use the report-free executor",
+                        );
+                        Err(SearchError::K0(
+                            super::K0SearchError::InternalInvariant {
+                                detail: "focused retained incumbent failure",
+                            },
+                        ))
+                    },
                 ),
                 Err(SearchError::K0(super::K0SearchError::InternalInvariant {
                     detail: "focused retained incumbent failure",
@@ -18496,7 +18726,7 @@ mod tests {
                     haystack,
                     tail_window,
                     limits,
-                    Some(observation),
+                    observation,
                 )
             },
         );
@@ -18559,7 +18789,8 @@ mod tests {
             .expect("early positive retains its exact-window policy state");
         assert_eq!(
             packed_frontier_exists_state.preference(first_class),
-            super::K0PackedFrontierExistsPreference::ObserveWarmPacked,
+            super::K0PackedFrontierExistsPreference::TrialIncumbent,
+            "the packed call already executed and warmed the exact incumbent tail",
         );
         assert!(
             packed_frontier_exists_state.classes[first_class].packed_residual_work != 0,
