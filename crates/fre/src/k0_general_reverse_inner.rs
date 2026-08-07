@@ -2182,12 +2182,7 @@ mod tests {
                 mandatory_suffix_span_state: K0NegativePrefilterState,
                 negative_prefilter_exists_state: K0NegativePrefilterState,
                 negative_prefilter_span_state: K0NegativePrefilterState,
-                correlated_terminal_exists_state:
-                    crate::correlated_bounded_alternation::RouteState,
-                correlated_terminal_earliest_end_state:
-                    crate::correlated_bounded_alternation::RouteState,
-                correlated_terminal_span_state:
-                    crate::correlated_bounded_alternation::RouteState,
+                exclusive_route_state: crate::K0ExclusiveRouteState,
             },
         }
 

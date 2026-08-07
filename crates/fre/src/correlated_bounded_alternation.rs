@@ -557,22 +557,27 @@ fn authenticate_delimited_branch(
     Some((match_start, endpoint))
 }
 
+#[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct RouteClassState {
-    window_size_class: Option<u32>,
     incumbent_transition_work: u64,
+    // Window size classes are 1..=usize::BITS, so zero is an exact vacant
+    // sentinel and avoids `Option<u32>` padding in every hot route class.
+    window_size_class: u8,
     learned: bool,
     prefer_terminal: bool,
     disabled_calls: u8,
     backoff: u8,
     terminal_epoch: u8,
     terminal_remaining: u8,
+    // Only classes[0] owns the shared replacement cursor. Its former padding
+    // byte keeps each class at two machine words on 64-bit targets.
+    replacement_cursor: u8,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct RouteState {
     classes: [RouteClassState; SIZE_CLASS_STATES],
-    next_replacement: u8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -590,7 +595,8 @@ impl RouteState {
         if window_bytes == 0 {
             return Route::Bypass;
         }
-        let window_size_class = usize::BITS - window_bytes.leading_zeros();
+        let window_size_class = u8::try_from(usize::BITS - window_bytes.leading_zeros())
+            .expect("usize window size class fits u8");
         let class_index = self.class_for(window_size_class);
         let class = &mut self.classes[class_index];
         if class.disabled_calls != 0 {
@@ -692,29 +698,30 @@ impl RouteState {
         class.disabled_calls = class.backoff;
     }
 
-    fn class_for(&mut self, window_size_class: u32) -> usize {
+    fn class_for(&mut self, window_size_class: u8) -> usize {
         if let Some(index) = self
             .classes
             .iter()
-            .position(|state| state.window_size_class == Some(window_size_class))
+            .position(|state| state.window_size_class == window_size_class)
         {
             return index;
         }
         if let Some(index) = self
             .classes
             .iter()
-            .position(|state| state.window_size_class.is_none())
+            .position(|state| state.window_size_class == 0)
         {
-            self.classes[index].window_size_class = Some(window_size_class);
+            self.classes[index].window_size_class = window_size_class;
             return index;
         }
-        let index = usize::from(self.next_replacement) % self.classes.len();
-        self.next_replacement = self.next_replacement.wrapping_add(1)
+        let index = usize::from(self.classes[0].replacement_cursor) % self.classes.len();
+        let next_replacement = self.classes[0].replacement_cursor.wrapping_add(1)
             % u8::try_from(self.classes.len()).expect("size-class count fits u8");
         self.classes[index] = RouteClassState {
-            window_size_class: Some(window_size_class),
+            window_size_class,
             ..RouteClassState::default()
         };
+        self.classes[0].replacement_cursor = next_replacement;
         index
     }
 }
@@ -1779,6 +1786,20 @@ mod tests {
                 ),
                 "unexpected exact-delimited admission: {pattern:?}",
             );
+        }
+    }
+
+    #[test]
+    fn route_state_uses_two_words_per_size_class_on_64_bit_targets() {
+        assert_eq!(
+            core::mem::size_of::<super::RouteState>(),
+            core::mem::size_of::<super::RouteClassState>() * super::SIZE_CLASS_STATES,
+            "the shared replacement cursor must remain inside class-zero padding",
+        );
+        #[cfg(target_pointer_width = "64")]
+        {
+            assert_eq!(core::mem::size_of::<super::RouteClassState>(), 16);
+            assert_eq!(core::mem::size_of::<super::RouteState>(), 64);
         }
     }
 
