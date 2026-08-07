@@ -850,12 +850,18 @@ pub(crate) struct PartialDfa {
 ///
 /// This is deliberately not a [`PartialDfa`]. It carries no resume keys,
 /// portable packing, start certificates, stable limits, or serialization ABI.
-/// Native lowering treats every destination outside `complete_rows` as one
-/// synthetic whole-search-deoptimization hole.
+/// A genuinely incomplete forward prefix treats every destination outside
+/// `complete_rows` as one synthetic whole-search-deoptimization hole. A
+/// later-stage numeric decline can instead retain a complete forward machine
+/// plus the already-built optional reverse machine for ordinary direct native
+/// lowering.
 #[derive(Debug)]
 pub(crate) struct NativeSlowPartial {
     alphabet: Alphabet,
     forward: NativeSlowPartialForward,
+    reverse: Option<ReverseDfa>,
+    reverse_states_before_minimization: usize,
+    retained_forward_minimized: bool,
     boundary_classes: usize,
     graph_classes: usize,
 }
@@ -2265,6 +2271,9 @@ impl NativeSlowPartial {
         Self {
             alphabet,
             forward,
+            reverse: None,
+            reverse_states_before_minimization: 0,
+            retained_forward_minimized: false,
             boundary_classes,
             graph_classes,
         }
@@ -2273,9 +2282,12 @@ impl NativeSlowPartial {
     fn from_complete_forward(
         alphabet: Alphabet,
         forward: ForwardDfa,
+        reverse: Option<ReverseDfa>,
         boundary_classes: usize,
         graph_classes: usize,
         states_before_minimization: usize,
+        reverse_states_before_minimization: usize,
+        retained_forward_minimized: bool,
     ) -> Self {
         let states = forward.states;
         Self {
@@ -2288,6 +2300,9 @@ impl NativeSlowPartial {
                 discovered_states: states,
                 states_before_minimization,
             },
+            reverse,
+            reverse_states_before_minimization,
+            retained_forward_minimized,
             boundary_classes,
             graph_classes,
         }
@@ -2302,13 +2317,20 @@ impl NativeSlowPartial {
             class_count: self.alphabet.classes(),
             class_representatives: &self.alphabet.representatives,
             forward_cells: &self.forward.transitions,
-            reverse_initial: None,
-            reverse_cells: &[],
+            reverse_initial: self.reverse.as_ref().map(|_| 0),
+            reverse_cells: self
+                .reverse
+                .as_ref()
+                .map_or(&[], |reverse| reverse.transitions.as_ref()),
         }
     }
 
     pub(crate) const fn retained_dimensions(&self) -> (usize, usize) {
         (self.forward.complete_rows, self.forward.discovered_states)
+    }
+
+    pub(crate) const fn retained_forward_minimized(&self) -> bool {
+        self.retained_forward_minimized
     }
 
     pub(crate) fn stats(&self, build_work: u64) -> DfaStats {
@@ -2319,9 +2341,12 @@ impl NativeSlowPartial {
             forward_states_before_minimization: self.forward.states_before_minimization,
             forward_states: self.forward.complete_rows,
             forward_transitions: self.forward.transitions.len(),
-            reverse_states_before_minimization: 0,
-            reverse_states: 0,
-            reverse_transitions: 0,
+            reverse_states_before_minimization: self.reverse_states_before_minimization,
+            reverse_states: self.reverse.as_ref().map_or(0, |reverse| reverse.states),
+            reverse_transitions: self
+                .reverse
+                .as_ref()
+                .map_or(0, |reverse| reverse.transitions.len()),
             build_work,
         }
     }
@@ -3327,24 +3352,33 @@ impl DeterminizeOutcome {
 fn retain_complete_forward_after_decline(
     alphabet: Alphabet,
     forward: ForwardDfa,
+    reverse: Option<ReverseDfa>,
     boundary_classes: usize,
     graph_classes: usize,
     states_before_minimization: usize,
+    reverse_states_before_minimization: usize,
+    retained_forward_minimized: bool,
     budget: &mut BuildBudget,
 ) -> Result<(Option<PartialDfa>, Option<NativeSlowPartial>), CompileError> {
     match budget.partial_retention {
-        PartialRetention::Stable => Ok((
-            PartialDfa::from_complete_forward(alphabet, forward, budget)?,
-            None,
-        )),
+        PartialRetention::Stable => {
+            drop(reverse);
+            Ok((
+                PartialDfa::from_complete_forward(alphabet, forward, budget)?,
+                None,
+            ))
+        }
         PartialRetention::NativeSlow if budget.decline_allows_native_slow_partial() => Ok((
             None,
             Some(NativeSlowPartial::from_complete_forward(
                 alphabet,
                 forward,
+                reverse,
                 boundary_classes,
                 graph_classes,
                 states_before_minimization,
+                reverse_states_before_minimization,
+                retained_forward_minimized,
             )),
         )),
         PartialRetention::NativeSlow => Ok((None, None)),
@@ -3432,9 +3466,12 @@ fn determinize_impl_with_allocation_ledger(
             let (partial, native_slow_partial) = retain_complete_forward_after_decline(
                 alphabet,
                 forward,
+                None,
                 boundary_classes,
                 graph_classes,
                 forward_states_before_minimization,
+                0,
+                false,
                 &mut budget,
             )?;
             return Ok(DeterminizeOutcome::from_budget(
@@ -3451,13 +3488,18 @@ fn determinize_impl_with_allocation_ledger(
     };
     let reverse_states_before_minimization = reverse.as_ref().map_or(0, |machine| machine.states);
     budget.begin_stage(DeterminizationStage::DfaStateMinimization);
-    if !minimize_dfa_states(&mut forward, &mut reverse, alphabet.classes(), &mut budget)? {
+    let (minimization_complete, retained_forward_minimized) =
+        minimize_dfa_states(&mut forward, &mut reverse, alphabet.classes(), &mut budget)?;
+    if !minimization_complete {
         let (partial, native_slow_partial) = retain_complete_forward_after_decline(
             alphabet,
             forward,
+            reverse,
             boundary_classes,
             graph_classes,
             forward_states_before_minimization,
+            reverse_states_before_minimization,
+            retained_forward_minimized,
             &mut budget,
         )?;
         return Ok(DeterminizeOutcome::from_budget(
@@ -3473,9 +3515,12 @@ fn determinize_impl_with_allocation_ledger(
         let (partial, native_slow_partial) = retain_complete_forward_after_decline(
             alphabet,
             forward,
+            reverse,
             boundary_classes,
             graph_classes,
             forward_states_before_minimization,
+            reverse_states_before_minimization,
+            false,
             &mut budget,
         )?;
         return Ok(DeterminizeOutcome::from_budget(
@@ -3814,16 +3859,18 @@ struct CanonicalPartitionOrder {
 /// This pass has no access to the source pattern or Thompson-state identity.
 /// It computes the fixed point of complete transition signatures, including
 /// the per-transition observable bit and a distinct dead-state sentinel.
+/// The second result bit records that the forward quotient committed even if
+/// the following reverse quotient declined under the shared numeric budget.
 fn minimize_dfa_states(
     forward: &mut ForwardDfa,
     reverse: &mut Option<ReverseDfa>,
     classes: usize,
     budget: &mut BuildBudget,
-) -> Result<bool, CompileError> {
+) -> Result<(bool, bool), CompileError> {
     let Some(minimized_forward) =
         minimize_complete_machine(&forward.transitions, forward.states, classes, budget)?
     else {
-        return Ok(false);
+        return Ok((false, false));
     };
     forward.transitions = minimized_forward.transitions;
     forward.states = minimized_forward.states;
@@ -3832,12 +3879,12 @@ fn minimize_dfa_states(
         let Some(minimized_reverse) =
             minimize_complete_machine(&machine.transitions, machine.states, classes, budget)?
         else {
-            return Ok(false);
+            return Ok((false, true));
         };
         machine.transitions = minimized_reverse.transitions;
         machine.states = minimized_reverse.states;
     }
-    Ok(true)
+    Ok((true, true))
 }
 
 /// Iteratively refine a Mealy-machine partition and emit its canonical
@@ -6978,7 +7025,7 @@ mod tests {
     }
 
     #[test]
-    fn slow_later_stage_decline_retains_a_complete_forward_owner() {
+    fn slow_reverse_decline_retains_a_complete_forward_without_reverse() {
         let raw = lowered_assertion_free("a+Q|[b-c][a-b]{1,5}(?:x+|y+)");
         let forward_only_work = determinize_impl(
             &raw,
@@ -7010,13 +7057,73 @@ mod tests {
         else {
             panic!("post-forward slow refusal did not retain transient native rows")
         };
-        assert!(report.decline.is_some_and(|decline| {
-            decline.stage != DeterminizationStage::ForwardSubsetConstruction
+        assert!(report.decline.as_ref().is_some_and(|decline| {
+            decline.stage == DeterminizationStage::ReverseSubsetConstruction
                 && matches!(decline.resource, DeterminizationResource::Work { .. })
         }));
         let (complete_rows, discovered_states) = partial.retained_dimensions();
         assert!(complete_rows > 0);
         assert_eq!(complete_rows, discovered_states);
+        assert_eq!(partial.stats(report.work_completed).reverse_states, 0);
+        assert_eq!(partial.native_view().reverse_initial, None);
+        assert!(partial.native_view().reverse_cells.is_empty());
+        assert!(!partial.retained_forward_minimized());
+    }
+
+    #[test]
+    fn slow_late_decline_retains_the_completed_reverse_machine() {
+        let raw = lowered_assertion_free("a+Q|[b-c][a-b]{1,5}(?:x+|y+)");
+        let allocation_limit = 32 * 1024 * 1024;
+        let (complete, _) = determinize_for_output_with_allocation_limit(
+            &raw,
+            OutputContract::Span,
+            true,
+            DeterminizeLimits::unlimited(),
+            allocation_limit,
+        )
+        .expect("complete slow Span construction");
+        let DeterminizeOutcome::Complete { report, .. } = complete else {
+            panic!("unlimited slow Span construction declined")
+        };
+        let (outcome, peak) = determinize_for_output_with_allocation_limit(
+            &raw,
+            OutputContract::Span,
+            true,
+            DeterminizeLimits {
+                max_work: report.work_completed.checked_sub(1).expect("nonzero slow work"),
+                ..DeterminizeLimits::unlimited()
+            },
+            allocation_limit,
+        )
+        .expect("late bounded slow Span construction");
+        assert!(peak <= allocation_limit);
+        let DeterminizeOutcome::Declined {
+            report,
+            partial: None,
+            native_slow_partial: Some(partial),
+        } = outcome
+        else {
+            panic!("late slow refusal did not retain transient native rows")
+        };
+        assert!(report.decline.as_ref().is_some_and(|decline| {
+            matches!(
+                decline.stage,
+                DeterminizationStage::DfaStateMinimization
+                    | DeterminizationStage::AlphabetColumnCoalescing
+            ) && matches!(decline.resource, DeterminizationResource::Work { .. })
+        }));
+        let (complete_rows, discovered_states) = partial.retained_dimensions();
+        assert_eq!(complete_rows, discovered_states);
+        let stats = partial.stats(report.work_completed);
+        assert!(stats.reverse_states_before_minimization > 0);
+        assert!(stats.reverse_states > 0);
+        let view = partial.native_view();
+        assert_eq!(view.reverse_initial, Some(0));
+        assert!(!view.reverse_cells.is_empty());
+        assert_eq!(
+            view.reverse_cells.len(),
+            stats.reverse_states * view.class_count
+        );
     }
 
     #[test]

@@ -3674,6 +3674,13 @@ impl NativeSlowDfaProgram {
         }
     }
 
+    pub(crate) fn retained_forward_minimized(&self) -> bool {
+        match &self.machine {
+            NativeSlowMachine::Complete(_) => false,
+            NativeSlowMachine::Partial(partial) => partial.retained_forward_minimized(),
+        }
+    }
+
     fn native_view(&self) -> NativeDfaView<'_> {
         match &self.machine {
             NativeSlowMachine::Complete(machine) => machine.native_view(),
@@ -4630,8 +4637,9 @@ impl CompiledProgram {
     ///
     /// Allocation exhaustion is an optimization decline. A state,
     /// transition, or work refusal after at least one complete row may retain
-    /// that already-owned prefix for native whole-search deoptimization.
-    /// Structural compiler failures remain typed errors.
+    /// that already-owned prefix. A complete late-stage artifact can lower
+    /// directly; a genuinely incomplete prefix requires native whole-search
+    /// deoptimization. Structural compiler failures remain typed errors.
     pub(crate) fn native_slow_determinized_program(
         &self,
         limits: DeterminizeLimits,
@@ -4686,15 +4694,38 @@ impl CompiledProgram {
         candidate: &'a NativeSlowDfaProgram,
     ) -> NativeProgramView<'a> {
         let dfa = candidate.native_view();
-        let partial_discovered_states = candidate
-            .retained_dimensions()
-            .map(|(_, discovered_states)| discovered_states);
+        let retained_dimensions = candidate.retained_dimensions();
+        let has_complete_reverse = dfa.reverse_initial == Some(0)
+            && dfa.class_count != 0
+            && !dfa.reverse_cells.is_empty()
+            && dfa.reverse_cells.len().is_multiple_of(dfa.class_count);
+        let needs_reverse_start = self.output == OutputContract::Span
+            && self.exact_match_width.is_none()
+            && !dfa.initial_pending
+            && !has_complete_reverse;
+        let collapse_partial_holes = retained_dimensions.is_some_and(
+            |(complete_rows, discovered_states)| {
+                complete_rows != discovered_states || needs_reverse_start
+            },
+        );
+        // A numeric decline can occur after forward subset construction has
+        // closed every discovered row. That forward transducer fully decides
+        // Exists and SelectedEnd, plus Span whenever its start is graph-known
+        // from an exact width, an initial pending match, or a retained complete
+        // reverse machine. Present those cases to ordinary native lowering;
+        // only a real unfinished suffix or missing variable-width Span reverse
+        // recovery needs whole-search deopt.
+        let partial_discovered_states = if collapse_partial_holes {
+            retained_dimensions.map(|(_, discovered_states)| discovered_states)
+        } else {
+            None
+        };
         NativeProgramView {
             output: self.output,
             raw: &self.raw,
             dfa,
             partial_discovered_states,
-            collapse_partial_holes: candidate.is_partial(),
+            collapse_partial_holes,
             anchored_prefix: &self.anchored_prefix,
             anchored_suffix: &self.anchored_suffix,
             required_literals: &candidate.required_literals,

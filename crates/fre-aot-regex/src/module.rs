@@ -3,8 +3,10 @@
 //! Fast semantic programs are frozen in read-only data behind a small ABI
 //! adapter to the versioned runtime. Complete optimized DFAs can lower to
 //! self-contained PIC machine code and compact transition tables. An
-//! explicitly selected slow pass may also keep a bounded completed-row prefix
-//! behind a public wrapper whose one synthetic hole restarts the whole search.
+//! explicitly selected slow pass may also keep a bounded completed-row prefix.
+//! A complete late-decline graph lowers directly; a genuinely incomplete
+//! prefix stays behind a public wrapper whose one synthetic hole restarts the
+//! whole search.
 //! Native optimizations are derived from DFA structure, including a
 //! start-state byte filter selected solely from non-accepting self-loop
 //! behavior.
@@ -803,6 +805,7 @@ pub struct CompiledModule {
     start_accelerator: StartAccelerator,
     anchored_prefix_filter_bytes: u8,
     slow_aot_report: Option<SlowAotReport>,
+    slow_retained_forward_minimized: bool,
 }
 
 const TEXT_SECTION: usize = 0;
@@ -811,6 +814,10 @@ const ENTRY_SYMBOL: usize = 0;
 const PROGRAM_SYMBOL: usize = 1;
 const RUNTIME_SYMBOL: usize = 2;
 const RUNTIME_PROGRAM_SYMBOL: usize = 3;
+// Slow partial modules and prepared-entry modules are mutually exclusive.
+// Their first layout-specific local symbol therefore occupies the same
+// deterministic slot without expanding either module's preceding ABI.
+const SLOW_PARTIAL_TABLE_SYMBOL: usize = 4;
 const PREPARED_ENTRY_SYMBOL: usize = 4;
 const PARTIAL_TABLE_SYMBOL: usize = 5;
 const PARTIAL_IDENTITY_SYMBOL: usize = 6;
@@ -845,6 +852,8 @@ const PROGRAM_SYMBOL_PREFIX: &str = "fre_aot_regex_program_v1_";
 const RUNTIME_PROGRAM_SYMBOL_PREFIX: &str = "fre_aot_regex_runtime_program_v1_";
 const NATIVE_LOWERING_VERSION: u32 = 1;
 const NATIVE_MODULE_IDENTITY_DOMAIN: &[u8] = b"fre-aot-regex/native-module-identity\0";
+const NATIVE_SLOW_PARTIAL_TABLE_IDENTITY_DOMAIN: &[u8] =
+    b"fre-aot-regex/native-module-identity/slow-partial-table\0";
 const PARTIAL_CELL_ACCEPTED: u32 = 1 << 31;
 const PARTIAL_CELL_HOLE_BASE: u32 = 1 << 30;
 const PARTIAL_CELL_DEAD: u32 = PARTIAL_CELL_ACCEPTED - 1;
@@ -913,9 +922,16 @@ struct NativeLowering {
     code: Vec<u8>,
     data: Vec<u8>,
     relocations: Vec<ModuleRelocation>,
+    slow_partial_table: Option<NativeSlowPartialTableLayout>,
     needs_runtime: bool,
     start_accelerator: StartAccelerator,
     anchored_prefix_filter_bytes: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeSlowPartialTableLayout {
+    offset: usize,
+    size: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -955,9 +971,11 @@ impl CompiledModule {
     ///
     /// In addition to every route considered by [`Self::lower`], this may
     /// re-run general ordered determinization under the stable compiler
-    /// ceiling. A numeric refusal after completing rows may lower that prefix
-    /// with whole-search runtime deoptimization; otherwise the compiler may
-    /// complete an assertion-free resource fallback's bounded K0 state graph.
+    /// ceiling. A numeric refusal after completing rows may lower a complete
+    /// graph directly, including retained reverse start recovery, or place a
+    /// genuinely incomplete prefix behind whole-search runtime deoptimization.
+    /// Otherwise the compiler may complete an assertion-free resource
+    /// fallback's bounded K0 state graph.
     /// This can take substantially longer than ordinary lowering.
     /// Callers re-lowering a restored or otherwise untrusted program must opt
     /// in explicitly; a serialized optimizer marker never authorizes this
@@ -1028,9 +1046,11 @@ impl CompiledModule {
             requested_limits.max_allocation_bytes,
         )?;
         let mut slow_aot_report = None;
+        let mut slow_retained_forward_minimized = false;
         let mut optional_lowering = if let Some(candidate) = slow_determinized.as_ref() {
             let view = program.native_slow_determinized_view(candidate);
-            let lowered = if candidate.is_partial() {
+            let uses_partial_wrapper = view.collapse_partial_holes;
+            let lowered = if uses_partial_wrapper {
                 lower_optional_native_slow_partial_with_data_limit(
                     &program_bytes,
                     view,
@@ -1046,7 +1066,7 @@ impl CompiledModule {
             };
             match lowered {
                 Ok(Some(lowering)) => {
-                    let native_data_bytes = if candidate.is_partial() {
+                    let native_data_bytes = if uses_partial_wrapper {
                         lowering.data.len().checked_sub(program_bytes.len()).ok_or(
                             CompileError::InternalInvariant(
                                 "slow partial native data precedes its serialized program",
@@ -1063,6 +1083,7 @@ impl CompiledModule {
                         allocation_bytes: candidate.allocation_bytes(),
                         native_data_bytes,
                     });
+                    slow_retained_forward_minimized = candidate.retained_forward_minimized();
                     Some(lowering)
                 }
                 Ok(None) => None,
@@ -1085,6 +1106,7 @@ impl CompiledModule {
             program_bytes,
             optional_lowering,
             slow_aot_report,
+            slow_retained_forward_minimized,
             ordinary_native,
             program.native_context_program_view(),
             program.native_partial_dfa_view(),
@@ -1136,6 +1158,7 @@ impl CompiledModule {
             program_bytes,
             optional_lowering,
             None,
+            false,
             native,
             program.native_context_program_view(),
             program.native_partial_dfa_view(),
@@ -1170,6 +1193,7 @@ impl CompiledModule {
             program_bytes,
             prelowered,
             None,
+            false,
             native,
             native_context,
             native_partial,
@@ -1187,16 +1211,23 @@ impl CompiledModule {
         program_bytes: Vec<u8>,
         prelowered: Option<NativeLowering>,
         slow_aot_report: Option<SlowAotReport>,
+        slow_retained_forward_minimized: bool,
         native: Option<NativeProgramView<'_>>,
         native_context: Option<NativeContextProgramView<'_>>,
         native_partial: Option<NativePartialProgramView<'_>>,
         native_dynamic_rows: Option<NativeDynamicRowsProgramView>,
         target: Target,
     ) -> Result<Self, ObjectError> {
+        if slow_retained_forward_minimized && slow_aot_report.is_none() {
+            return Err(ObjectError::InvalidModule(
+                "partial slow minimization provenance has no selected report",
+            ));
+        }
         let serialized_program_size = program_bytes.len();
         let program_digest = Sha256::digest(&program_bytes);
         let program_name = identity_symbol(PROGRAM_SYMBOL_PREFIX, program_digest.as_slice())?;
         let (lowering, native_digest, prepared_layout) = if let Some(lowering) = prelowered {
+            validate_native_slow_partial_table_layout(&program_bytes, &lowering, target)?;
             let native_digest = native_module_digest(&program_bytes, target, &lowering)?;
             (lowering, native_digest, None)
         } else if let Some(view) = native {
@@ -1244,6 +1275,12 @@ impl CompiledModule {
             let native_digest = native_module_digest(&lowering.data, target, &lowering)?;
             (lowering, native_digest, None)
         };
+        if lowering.slow_partial_table.is_some() && prepared_layout.is_some() {
+            return Err(ObjectError::InvalidModule(
+                "slow partial and prepared layouts cannot share one module",
+            ));
+        }
+        let slow_partial_table = lowering.slow_partial_table;
         let entry_name = identity_symbol(ENTRY_SYMBOL_PREFIX, &native_digest)?;
         let prepared_entry_name = prepared_layout
             .map(|_| identity_symbol(PREPARED_ENTRY_SYMBOL_PREFIX, &native_digest))
@@ -1334,6 +1371,25 @@ impl CompiledModule {
         } else {
             (None, None)
         };
+        if let Some(table) = slow_partial_table {
+            if symbols.len() != SLOW_PARTIAL_TABLE_SYMBOL {
+                return Err(ObjectError::InvalidModule(
+                    "slow partial table symbol order is inconsistent",
+                ));
+            }
+            symbols.push(ModuleSymbol {
+                name: ".Lfre_aot_regex_slow_partial_table_v1".to_owned(),
+                binding: SymbolBinding::Local,
+                kind: SymbolKind::Object,
+                section: Some(PROGRAM_SECTION),
+                offset: u64::try_from(table.offset).map_err(|_| {
+                    ObjectError::ArithmeticOverflow("slow partial table symbol offset")
+                })?,
+                size: u64::try_from(table.size).map_err(|_| {
+                    ObjectError::ArithmeticOverflow("slow partial table symbol size")
+                })?,
+            });
+        }
         let prepared_entry_symbol_index = if let Some(prepared) = prepared_layout {
             if symbols.len() != PREPARED_ENTRY_SYMBOL {
                 return Err(ObjectError::InvalidModule(
@@ -1487,6 +1543,7 @@ impl CompiledModule {
             start_accelerator: lowering.start_accelerator,
             anchored_prefix_filter_bytes: lowering.anchored_prefix_filter_bytes,
             slow_aot_report,
+            slow_retained_forward_minimized,
         })
     }
 
@@ -1497,12 +1554,17 @@ impl CompiledModule {
     }
 
     /// Return provenance for a slow DFA candidate actually selected into this
-    /// module. This can describe either a complete DFA or a decline-bearing
-    /// transient completed-row prefix with whole-search deoptimization. An
-    /// unselected slow attempt or a later K0/prepared fallback returns `None`.
+    /// module. This can describe a complete DFA, a decline-bearing complete
+    /// graph lowered directly, or a genuinely incomplete completed-row prefix
+    /// behind whole-search deoptimization. An unselected slow attempt or a
+    /// later K0/prepared fallback returns `None`.
     #[must_use]
     pub const fn slow_aot_report(&self) -> Option<&SlowAotReport> {
         self.slow_aot_report.as_ref()
+    }
+
+    pub(crate) const fn slow_retained_forward_minimized(&self) -> bool {
+        self.slow_retained_forward_minimized
     }
 
     /// Return all sections in deterministic object order.
@@ -1714,6 +1776,7 @@ fn lower_runtime_adapter(
         code,
         data: program_bytes,
         relocations,
+        slow_partial_table: None,
         needs_runtime: true,
         start_accelerator: StartAccelerator::None,
         anchored_prefix_filter_bytes: 0,
@@ -1876,6 +1939,7 @@ fn lower_native_dynamic_rows_prepared(
             code,
             data: program_bytes,
             relocations,
+            slow_partial_table: None,
             needs_runtime: true,
             start_accelerator,
             anchored_prefix_filter_bytes: 0,
@@ -1933,6 +1997,7 @@ fn lower_native_slow_partial_with_data_limit(
             "slow partial native core unexpectedly requires a runtime",
         ));
     }
+    let table_size = native.data.len();
 
     let table_offset = program_bytes
         .len()
@@ -2020,15 +2085,36 @@ fn lower_native_slow_partial_with_data_limit(
         ));
     }
 
-    let table_addend = i64::try_from(table_offset)
-        .map_err(|_| ObjectError::ArithmeticOverflow("slow partial table relocation addend"))?;
+    let expected_core_relocations = match target.architecture {
+        Architecture::X86_64 => 1,
+        Architecture::Aarch64 => 2,
+    };
+    if native.relocations.len() != expected_core_relocations {
+        return Err(ObjectError::InvalidModule(
+            "slow partial native core has an unexpected relocation count",
+        ));
+    }
     relocations
         .try_reserve_exact(native.relocations.len())
         .map_err(|_| ObjectError::Allocation("slow partial combined relocations"))?;
     for mut relocation in native.relocations {
-        if relocation.symbol != PROGRAM_SYMBOL {
+        let valid_shape = match target.architecture {
+            Architecture::X86_64 => {
+                relocation.kind == RelocationKind::X86PcRelative32 && relocation.addend == -4
+            }
+            Architecture::Aarch64 => {
+                matches!(
+                    relocation.kind,
+                    RelocationKind::Aarch64Page21 | RelocationKind::Aarch64PageOff12
+                ) && relocation.addend == 0
+            }
+        };
+        if relocation.section != TEXT_SECTION
+            || relocation.symbol != PROGRAM_SYMBOL
+            || !valid_shape
+        {
             return Err(ObjectError::InvalidModule(
-                "slow partial native core has an unexpected relocation target",
+                "slow partial native core has an unexpected relocation shape",
             ));
         }
         relocation.offset = relocation
@@ -2040,12 +2126,7 @@ fn lower_native_slow_partial_with_data_limit(
             .ok_or(ObjectError::ArithmeticOverflow(
                 "slow partial native core relocation offset",
             ))?;
-        relocation.addend = relocation
-            .addend
-            .checked_add(table_addend)
-            .ok_or(ObjectError::ArithmeticOverflow(
-                "slow partial native table relocation addend",
-            ))?;
+        relocation.symbol = SLOW_PARTIAL_TABLE_SYMBOL;
         relocations.push(relocation);
     }
 
@@ -2053,6 +2134,10 @@ fn lower_native_slow_partial_with_data_limit(
         code,
         data: program_bytes,
         relocations,
+        slow_partial_table: Some(NativeSlowPartialTableLayout {
+            offset: table_offset,
+            size: table_size,
+        }),
         needs_runtime: true,
         start_accelerator: native.start_accelerator,
         anchored_prefix_filter_bytes: native.anchored_prefix_filter_bytes,
@@ -2061,7 +2146,7 @@ fn lower_native_slow_partial_with_data_limit(
 
 /// Apply the optional-native decline policy to the complete slow-prefix
 /// transaction, including table emission, wrapper composition, local fixups,
-/// and relocation rebasing.
+/// and relocation retargeting.
 fn lower_optional_native_slow_partial_with_data_limit(
     program_bytes: &[u8],
     view: NativeProgramView<'_>,
@@ -2082,6 +2167,132 @@ fn lower_optional_native_slow_partial_with_data_limit(
         )
     })();
     optional_native_lowering_outcome(outcome)
+}
+
+fn validate_native_slow_partial_table_layout(
+    program_bytes: &[u8],
+    lowering: &NativeLowering,
+    target: Target,
+) -> Result<(), ObjectError> {
+    let Some(table) = lowering.slow_partial_table else {
+        return Ok(());
+    };
+    let table_end = table
+        .offset
+        .checked_add(table.size)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "slow partial table symbol extent",
+        ))?;
+    let canonical_table_offset = program_bytes
+        .len()
+        .checked_add(15)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "slow partial table symbol alignment",
+        ))?
+        & !15;
+    if !lowering.needs_runtime
+        || table.size == 0
+        || table.offset != canonical_table_offset
+        || table_end != lowering.data.len()
+        || !lowering.data.starts_with(program_bytes)
+        || lowering.data[program_bytes.len()..table.offset]
+            .iter()
+            .any(|&byte| byte != 0)
+    {
+        return Err(ObjectError::InvalidModule(
+            "slow partial table layout is inconsistent",
+        ));
+    }
+
+    let mut program_page = 0_usize;
+    let mut program_page_offset = 0_usize;
+    let mut table_page = 0_usize;
+    let mut table_page_offset = 0_usize;
+    let mut runtime_branches = 0_usize;
+    for relocation in &lowering.relocations {
+        if relocation.section != TEXT_SECTION {
+            return Err(ObjectError::InvalidModule(
+                "slow partial relocation is outside text",
+            ));
+        }
+        match (
+            target.architecture,
+            relocation.symbol,
+            relocation.kind,
+            relocation.addend,
+        ) {
+            (
+                Architecture::X86_64,
+                PROGRAM_SYMBOL,
+                RelocationKind::X86PcRelative32,
+                -4,
+            ) => program_page += 1,
+            (
+                Architecture::X86_64,
+                SLOW_PARTIAL_TABLE_SYMBOL,
+                RelocationKind::X86PcRelative32,
+                -4,
+            ) => table_page += 1,
+            (
+                Architecture::X86_64,
+                RUNTIME_SYMBOL,
+                RelocationKind::X86PltRelative32,
+                -4,
+            ) => runtime_branches += 1,
+            (
+                Architecture::Aarch64,
+                PROGRAM_SYMBOL,
+                RelocationKind::Aarch64Page21,
+                0,
+            ) => program_page += 1,
+            (
+                Architecture::Aarch64,
+                PROGRAM_SYMBOL,
+                RelocationKind::Aarch64PageOff12,
+                0,
+            ) => program_page_offset += 1,
+            (
+                Architecture::Aarch64,
+                SLOW_PARTIAL_TABLE_SYMBOL,
+                RelocationKind::Aarch64Page21,
+                0,
+            ) => table_page += 1,
+            (
+                Architecture::Aarch64,
+                SLOW_PARTIAL_TABLE_SYMBOL,
+                RelocationKind::Aarch64PageOff12,
+                0,
+            ) => table_page_offset += 1,
+            (
+                Architecture::Aarch64,
+                RUNTIME_SYMBOL,
+                RelocationKind::Aarch64Branch26,
+                0,
+            ) => runtime_branches += 1,
+            _ => {
+                return Err(ObjectError::InvalidModule(
+                    "slow partial relocation shape is inconsistent",
+                ));
+            }
+        }
+    }
+    let expected = match target.architecture {
+        Architecture::X86_64 => (1, 0, 1, 0, 1),
+        Architecture::Aarch64 => (1, 1, 1, 1, 1),
+    };
+    if (
+        program_page,
+        program_page_offset,
+        table_page,
+        table_page_offset,
+        runtime_branches,
+    ) != expected
+    {
+        return Err(ObjectError::InvalidModule(
+            "slow partial relocation counts are inconsistent",
+        ));
+    }
+    Ok(())
 }
 
 #[allow(
@@ -2300,6 +2511,7 @@ fn lower_native_partial_prepared(
             code,
             data: program_bytes,
             relocations,
+            slow_partial_table: None,
             needs_runtime: true,
             start_accelerator: native.start_accelerator,
             anchored_prefix_filter_bytes: native.anchored_prefix_filter_bytes,
@@ -2470,6 +2682,26 @@ fn native_module_digest(
         digest.update([relocation_kind_tag(relocation.kind)]);
         digest.update(symbol.to_le_bytes());
         digest.update(relocation.addend.to_le_bytes());
+    }
+    if let Some(table) = lowering.slow_partial_table {
+        // Preserve the V1 digest stream byte-for-byte for every established
+        // lowering. Only the new slow-table layout appends a domain-separated
+        // symbol-boundary commitment after the legacy relocation stream.
+        digest.update(NATIVE_SLOW_PARTIAL_TABLE_IDENTITY_DOMAIN);
+        digest.update(
+            u64::try_from(table.offset)
+                .map_err(|_| {
+                    ObjectError::ArithmeticOverflow("slow partial identity table offset")
+                })?
+                .to_le_bytes(),
+        );
+        digest.update(
+            u64::try_from(table.size)
+                .map_err(|_| {
+                    ObjectError::ArithmeticOverflow("slow partial identity table size")
+                })?
+                .to_le_bytes(),
+        );
     }
     Ok(digest.finalize().into())
 }
@@ -3767,6 +3999,7 @@ fn lower_native_dfa_with_entry_contract_and_data_limit(
         code: emission.code,
         data,
         relocations: emission.relocations,
+        slow_partial_table: None,
         needs_runtime: false,
         start_accelerator,
         anchored_prefix_filter_bytes: layout
@@ -28661,6 +28894,126 @@ int main(void) {{
         }
     }
 
+    fn slow_forward_minimized_reverse_decline_limits(
+        program: &crate::CompiledProgram,
+    ) -> SlowAotLimits {
+        let defaults = SlowAotLimits::default();
+        let complete = program
+            .native_slow_determinized_program(
+                defaults.determinize,
+                defaults.max_allocation_bytes,
+            )
+            .expect("complete slow minimization oracle")
+            .expect("complete slow minimization candidate");
+        assert!(complete.report().completed_stages.contains(
+            &crate::DeterminizationStage::DfaStateMinimization
+        ));
+        let mut low = 0_u64;
+        let mut high = complete.report().work_completed;
+        while low < high {
+            let middle = low + (high - low) / 2;
+            let stage_completed = program
+                .native_slow_determinized_program(
+                    DeterminizeLimits {
+                        max_work: middle,
+                        ..defaults.determinize
+                    },
+                    defaults.max_allocation_bytes,
+                )
+                .expect("bounded minimization-stage search")
+                .is_some_and(|candidate| {
+                    candidate.report().completed_stages.contains(
+                        &crate::DeterminizationStage::DfaStateMinimization,
+                    )
+                });
+            if stage_completed {
+                high = middle;
+            } else {
+                low = middle.checked_add(1).expect("bounded minimization midpoint");
+            }
+        }
+        let limits = SlowAotLimits {
+            determinize: DeterminizeLimits {
+                max_work: low
+                    .checked_sub(1)
+                    .expect("minimization completion requires work"),
+                ..defaults.determinize
+            },
+            ..defaults
+        };
+        let retained = program
+            .native_slow_determinized_program(
+                limits.determinize,
+                limits.max_allocation_bytes,
+            )
+            .expect("forced partial minimization")
+            .expect("forced retained minimization candidate");
+        assert!(retained.report().decline.as_ref().is_some_and(|decline| {
+            decline.stage == crate::DeterminizationStage::DfaStateMinimization
+        }));
+        assert!(!retained.report().completed_stages.contains(
+            &crate::DeterminizationStage::DfaStateMinimization
+        ));
+        assert!(retained.retained_forward_minimized());
+        assert!(retained.stats().reverse_states > 0);
+        limits
+    }
+
+    fn slow_reverse_decline_limits(program: &crate::CompiledProgram) -> SlowAotLimits {
+        let defaults = SlowAotLimits::default();
+        let complete = program
+            .native_slow_determinized_program(
+                defaults.determinize,
+                defaults.max_allocation_bytes,
+            )
+            .expect("complete reverse-stage oracle")
+            .expect("complete reverse-stage candidate");
+        let mut low = 0_u64;
+        let mut high = complete
+            .report()
+            .work_completed
+            .checked_sub(1)
+            .expect("reverse construction requires work");
+        while low < high {
+            let middle = low + (high - low) / 2;
+            let owns_complete_forward = program
+                .native_slow_determinized_program(
+                    DeterminizeLimits {
+                        max_work: middle,
+                        ..defaults.determinize
+                    },
+                    defaults.max_allocation_bytes,
+                )
+                .expect("bounded reverse-stage search")
+                .and_then(|candidate| candidate.retained_dimensions())
+                .is_some_and(|(rows, discovered)| rows == discovered);
+            if owns_complete_forward {
+                high = middle;
+            } else {
+                low = middle.checked_add(1).expect("bounded reverse-stage midpoint");
+            }
+        }
+        let limits = SlowAotLimits {
+            determinize: DeterminizeLimits {
+                max_work: low,
+                ..defaults.determinize
+            },
+            ..defaults
+        };
+        let retained = program
+            .native_slow_determinized_program(
+                limits.determinize,
+                limits.max_allocation_bytes,
+            )
+            .expect("forced reverse-stage decline")
+            .expect("forced reverse-stage candidate");
+        assert!(retained.report().decline.as_ref().is_some_and(|decline| {
+            decline.stage == crate::DeterminizationStage::ReverseSubsetConstruction
+        }));
+        assert_eq!(retained.stats().reverse_states, 0);
+        limits
+    }
+
     #[test]
     #[allow(
         clippy::too_many_lines,
@@ -28746,7 +29099,6 @@ int main(void) {{
                 .checked_add(15)
                 .expect("slow partial table alignment")
                 & !15;
-            let table_addend = i64::try_from(table_offset).unwrap();
             for target in identity_target_matrix() {
                 let module = CompiledModule::lower_optimizing_with_limits(
                     fast.program(),
@@ -28771,14 +29123,34 @@ int main(void) {{
                 );
                 assert_eq!(module.required_runtime_symbol(), Some(RUNTIME_SYMBOL_NAME));
                 assert!(module.prepared_entry_symbol().is_none());
-                assert_eq!(module.symbols().len(), 4, "{output:?}/{target:?}");
-                assert!(module.symbols().iter().all(|symbol| {
-                    !symbol.name.contains("exclusive")
-                        && !symbol.name.contains("partial_table")
-                        && !symbol.name.contains("partial_identity")
+                assert_eq!(module.symbols().len(), 5, "{output:?}/{target:?}");
+                let table_symbol = &module.symbols()[SLOW_PARTIAL_TABLE_SYMBOL];
+                assert_eq!(
+                    table_symbol.name,
+                    ".Lfre_aot_regex_slow_partial_table_v1"
+                );
+                assert_eq!(table_symbol.binding, SymbolBinding::Local);
+                assert_eq!(table_symbol.kind, SymbolKind::Object);
+                assert_eq!(table_symbol.section, Some(PROGRAM_SECTION));
+                assert_eq!(table_symbol.offset, u64::try_from(table_offset).unwrap());
+                assert_eq!(
+                    table_symbol.size,
+                    u64::try_from(
+                        module.sections()[PROGRAM_SECTION].bytes().len() - table_offset
+                    )
+                    .unwrap()
+                );
+                assert!(module.symbols().iter().enumerate().all(|(index, symbol)| {
+                    index == SLOW_PARTIAL_TABLE_SYMBOL
+                        || (!symbol.name.contains("exclusive")
+                            && !symbol.name.contains("partial_table")
+                            && !symbol.name.contains("partial_identity"))
                 }));
                 assert!(module.relocations().iter().all(|relocation| {
-                    relocation.symbol == PROGRAM_SYMBOL || relocation.symbol == RUNTIME_SYMBOL
+                    matches!(
+                        relocation.symbol,
+                        PROGRAM_SYMBOL | RUNTIME_SYMBOL | SLOW_PARTIAL_TABLE_SYMBOL
+                    )
                 }));
                 assert_eq!(
                     module
@@ -28788,21 +29160,34 @@ int main(void) {{
                         .count(),
                     1
                 );
-                let program_addends = module
+                let program_relocations = module
                     .relocations()
                     .iter()
                     .filter(|relocation| relocation.symbol == PROGRAM_SYMBOL)
-                    .map(|relocation| relocation.addend)
+                    .map(|relocation| (relocation.kind, relocation.addend))
                     .collect::<Vec<_>>();
-                let expected_program_addends = match target.architecture {
-                    Architecture::X86_64 => vec![-4, table_addend - 4],
-                    Architecture::Aarch64 => {
-                        vec![0, 0, table_addend, table_addend]
+                let table_relocations = module
+                    .relocations()
+                    .iter()
+                    .filter(|relocation| relocation.symbol == SLOW_PARTIAL_TABLE_SYMBOL)
+                    .map(|relocation| (relocation.kind, relocation.addend))
+                    .collect::<Vec<_>>();
+                let expected_data_relocations = match target.architecture {
+                    Architecture::X86_64 => {
+                        vec![(RelocationKind::X86PcRelative32, -4)]
                     }
+                    Architecture::Aarch64 => vec![
+                        (RelocationKind::Aarch64Page21, 0),
+                        (RelocationKind::Aarch64PageOff12, 0),
+                    ],
                 };
                 assert_eq!(
-                    program_addends, expected_program_addends,
-                    "wrapper/core program addends: {output:?}/{target:?}"
+                    program_relocations, expected_data_relocations,
+                    "wrapper program relocations: {output:?}/{target:?}"
+                );
+                assert_eq!(
+                    table_relocations, expected_data_relocations,
+                    "core table relocations: {output:?}/{target:?}"
                 );
                 assert!(module.sections()[PROGRAM_SECTION]
                     .bytes()
@@ -28839,6 +29224,124 @@ int main(void) {{
             ] {
                 assert!(compiled.receipt().passes.contains(&pass), "{output:?}/{pass:?}");
             }
+        }
+    }
+
+    #[test]
+    fn slow_partial_local_table_symbol_crosses_arm64_signed24_boundary() {
+        const PROGRAM_BYTES: usize = 1 << 23;
+        const TABLE_BYTES: usize = 16;
+        for target in [
+            Target::x86_64_linux(),
+            Target::x86_64_macos(),
+            Target::aarch64_linux(),
+            Target::aarch64_macos(),
+        ] {
+            let program = vec![0_u8; PROGRAM_BYTES];
+            let mut data = program.clone();
+            data.extend_from_slice(&[0_u8; TABLE_BYTES]);
+            let (code, relocations) = match target.architecture {
+                Architecture::X86_64 => (
+                    vec![0_u8; 12],
+                    vec![
+                        ModuleRelocation {
+                            section: TEXT_SECTION,
+                            offset: 0,
+                            kind: RelocationKind::X86PcRelative32,
+                            symbol: PROGRAM_SYMBOL,
+                            addend: -4,
+                        },
+                        ModuleRelocation {
+                            section: TEXT_SECTION,
+                            offset: 4,
+                            kind: RelocationKind::X86PltRelative32,
+                            symbol: RUNTIME_SYMBOL,
+                            addend: -4,
+                        },
+                        ModuleRelocation {
+                            section: TEXT_SECTION,
+                            offset: 8,
+                            kind: RelocationKind::X86PcRelative32,
+                            symbol: SLOW_PARTIAL_TABLE_SYMBOL,
+                            addend: -4,
+                        },
+                    ],
+                ),
+                Architecture::Aarch64 => (
+                    vec![0_u8; 20],
+                    vec![
+                        ModuleRelocation {
+                            section: TEXT_SECTION,
+                            offset: 0,
+                            kind: RelocationKind::Aarch64Page21,
+                            symbol: PROGRAM_SYMBOL,
+                            addend: 0,
+                        },
+                        ModuleRelocation {
+                            section: TEXT_SECTION,
+                            offset: 4,
+                            kind: RelocationKind::Aarch64PageOff12,
+                            symbol: PROGRAM_SYMBOL,
+                            addend: 0,
+                        },
+                        ModuleRelocation {
+                            section: TEXT_SECTION,
+                            offset: 8,
+                            kind: RelocationKind::Aarch64Branch26,
+                            symbol: RUNTIME_SYMBOL,
+                            addend: 0,
+                        },
+                        ModuleRelocation {
+                            section: TEXT_SECTION,
+                            offset: 12,
+                            kind: RelocationKind::Aarch64Page21,
+                            symbol: SLOW_PARTIAL_TABLE_SYMBOL,
+                            addend: 0,
+                        },
+                        ModuleRelocation {
+                            section: TEXT_SECTION,
+                            offset: 16,
+                            kind: RelocationKind::Aarch64PageOff12,
+                            symbol: SLOW_PARTIAL_TABLE_SYMBOL,
+                            addend: 0,
+                        },
+                    ],
+                ),
+            };
+            let lowering = NativeLowering {
+                code,
+                data,
+                relocations,
+                slow_partial_table: Some(NativeSlowPartialTableLayout {
+                    offset: PROGRAM_BYTES,
+                    size: TABLE_BYTES,
+                }),
+                needs_runtime: true,
+                start_accelerator: StartAccelerator::None,
+                anchored_prefix_filter_bytes: 0,
+            };
+            let module = CompiledModule::lower_serialized_with_prelowered(
+                program,
+                Some(lowering),
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+                target,
+            )
+            .unwrap_or_else(|error| panic!("large slow table {target:?}: {error}"));
+            let table_symbol = &module.symbols()[SLOW_PARTIAL_TABLE_SYMBOL];
+            assert_eq!(table_symbol.offset, u64::try_from(PROGRAM_BYTES).unwrap());
+            assert_eq!(table_symbol.size, u64::try_from(TABLE_BYTES).unwrap());
+            assert!(module
+                .relocations()
+                .iter()
+                .filter(|relocation| relocation.symbol == SLOW_PARTIAL_TABLE_SYMBOL)
+                .all(|relocation| relocation.addend <= 0));
+            emit_object(&module, ObjectFormat::for_target(target), usize::MAX)
+                .unwrap_or_else(|error| panic!("large slow object {target:?}: {error}"));
         }
     }
 
@@ -28906,7 +29409,7 @@ int main(void) {{
     }
 
     #[test]
-    fn slow_complete_forward_decline_keeps_synthetic_span_status_hole() {
+    fn slow_late_decline_retains_reverse_for_direct_span_lowering() {
         let pattern = "a+Q|[b-c][a-b]{1,5}(?:x+|y+)";
         let fast = compile(
             CompileRequest::new(pattern, Target::x86_64_linux())
@@ -28943,10 +29446,16 @@ int main(void) {{
         let (complete_rows, discovered_states) = partial.retained_dimensions().unwrap();
         assert_eq!(complete_rows, discovered_states);
         assert!(partial.report().decline.as_ref().is_some_and(|decline| {
-            decline.stage != crate::DeterminizationStage::ForwardSubsetConstruction
+            matches!(
+                decline.stage,
+                crate::DeterminizationStage::DfaStateMinimization
+                    | crate::DeterminizationStage::AlphabetColumnCoalescing
+            )
         }));
+        assert!(partial.stats().reverse_states > 0);
         let view = fast.program().native_slow_determinized_view(&partial);
-        assert!(view.collapse_partial_holes);
+        assert!(!view.collapse_partial_holes);
+        assert_eq!(view.partial_discovered_states, None);
         assert_eq!(view.exact_match_width, None);
         for target in [
             Target::x86_64_linux(),
@@ -28955,21 +29464,280 @@ int main(void) {{
             Target::aarch64_macos(),
         ] {
             let (_, layout) = build_native_dfa_table_for_architecture(view, target.architecture)
-                .expect("complete-prefix synthetic Span layout");
-            let hole = layout.partial.expect("synthetic selected-end status layout");
-            assert!(hole.collapse_holes);
-            assert_eq!(hole.resume_states, 0);
-            assert!(!layout.has_reverse);
+                .expect("direct retained-reverse Span layout");
+            assert!(layout.partial.is_none());
+            assert!(layout.has_reverse);
             assert!(layout.exact_span_width.is_none());
             let module = CompiledModule::lower_optimizing_with_limits(
                 fast.program(),
                 target,
                 limits,
             )
-            .expect("complete-prefix slow Span module");
-            assert!(module.slow_aot_report().is_some(), "{target:?}");
+            .expect("retained-reverse slow Span module");
+            let report = module
+                .slow_aot_report()
+                .unwrap_or_else(|| panic!("missing slow report: {target:?}"));
+            assert!(report.determinization.decline.is_some());
+            assert!(report.dfa.reverse_states > 0);
+            assert_eq!(
+                report.native_data_bytes,
+                module.sections()[PROGRAM_SECTION].bytes().len()
+            );
+            assert!(module.required_runtime_symbol().is_none());
+            assert!(module.prepared_entry_symbol().is_none());
+            assert_eq!(module.symbols().len(), 2);
+            assert!(module
+                .relocations()
+                .iter()
+                .all(|relocation| relocation.symbol == PROGRAM_SYMBOL));
+        }
+
+        let compiled = crate::compile_with_slow_aot_limits(
+            CompileRequest::new(pattern, Target::x86_64_linux())
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span)
+                .limits(CompileLimitsV1 {
+                    determinize: DeterminizeLimits {
+                        max_states: 0,
+                        ..DeterminizeLimits::default()
+                    },
+                    ..CompileLimitsV1::default()
+                }),
+            limits,
+        )
+        .expect("receipt-bearing retained-reverse slow compile");
+        assert!(!compiled.receipt().runtime_helper_required);
+        assert!(compiled
+            .receipt()
+            .passes
+            .contains(&crate::OptimizationPass::ReverseStartRecovery));
+        assert!(compiled
+            .receipt()
+            .passes
+            .contains(&crate::OptimizationPass::DfaStateMinimization));
+        assert!(!compiled
+            .receipt()
+            .passes
+            .contains(&crate::OptimizationPass::RuntimeAdapterLowering));
+    }
+
+    #[test]
+    fn slow_partial_forward_minimization_is_receipted_once() {
+        let pattern = "a+Q|[b-c][a-b]{1,5}(?:x+|y+)";
+        let fast = compile(
+            CompileRequest::new(pattern, Target::x86_64_linux())
+                .mode(CompileMode::Fast)
+                .output(OutputContract::Span),
+        )
+        .expect("fast minimization-provenance fixture");
+        let limits = slow_forward_minimized_reverse_decline_limits(fast.program());
+        let module = CompiledModule::lower_optimizing_with_limits(
+            fast.program(),
+            Target::x86_64_linux(),
+            limits,
+        )
+        .expect("direct mixed-minimization slow module");
+        assert!(module.slow_retained_forward_minimized());
+        assert!(module.required_runtime_symbol().is_none());
+
+        let compiled = crate::compile_with_slow_aot_limits(
+            CompileRequest::new(pattern, Target::x86_64_linux())
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span)
+                .limits(CompileLimitsV1 {
+                    determinize: DeterminizeLimits {
+                        max_states: 0,
+                        ..DeterminizeLimits::default()
+                    },
+                    ..CompileLimitsV1::default()
+                }),
+            limits,
+        )
+        .expect("receipt-bearing mixed-minimization slow module");
+        let slow = compiled.receipt().slow_aot.as_ref().expect("slow receipt");
+        assert!(!slow.determinization.completed_stages.contains(
+            &crate::DeterminizationStage::DfaStateMinimization
+        ));
+        assert!(compiled.module().slow_retained_forward_minimized());
+        assert!(!compiled.receipt().runtime_helper_required);
+        assert_eq!(
+            compiled
+                .receipt()
+                .passes
+                .iter()
+                .filter(|&&pass| pass == crate::OptimizationPass::DfaStateMinimization)
+                .count(),
+            1
+        );
+        let reverse_position = compiled
+            .receipt()
+            .passes
+            .iter()
+            .position(|&pass| pass == crate::OptimizationPass::ReverseStartRecovery)
+            .expect("reverse recovery receipt");
+        let minimization_position = compiled
+            .receipt()
+            .passes
+            .iter()
+            .position(|&pass| pass == crate::OptimizationPass::DfaStateMinimization)
+            .expect("partial forward minimization receipt");
+        assert!(reverse_position < minimization_position);
+    }
+
+    #[test]
+    fn slow_reverse_construction_decline_still_uses_whole_search_wrapper() {
+        let pattern = "a+Q|[b-c][a-b]{1,5}(?:x+|y+)";
+        let fast = compile(
+            CompileRequest::new(pattern, Target::x86_64_linux())
+                .mode(CompileMode::Fast)
+                .output(OutputContract::Span),
+        )
+        .expect("fast variable Span fixture");
+        let limits = slow_reverse_decline_limits(fast.program());
+        let partial = fast
+            .program()
+            .native_slow_determinized_program(
+                limits.determinize,
+                limits.max_allocation_bytes,
+            )
+            .expect("reverse-stage slow refusal")
+            .expect("reverse-stage retained forward");
+        assert!(partial.report().decline.as_ref().is_some_and(|decline| {
+            decline.stage == crate::DeterminizationStage::ReverseSubsetConstruction
+        }));
+        assert_eq!(partial.stats().reverse_states, 0);
+        let view = fast.program().native_slow_determinized_view(&partial);
+        assert!(view.collapse_partial_holes);
+        assert_eq!(
+            view.partial_discovered_states,
+            partial.retained_dimensions().map(|(_, discovered)| discovered)
+        );
+        for target in [
+            Target::x86_64_linux(),
+            Target::x86_64_macos(),
+            Target::aarch64_linux(),
+            Target::aarch64_macos(),
+        ] {
+            let module = CompiledModule::lower_optimizing_with_limits(
+                fast.program(),
+                target,
+                limits,
+            )
+            .unwrap_or_else(|error| panic!("reverse-stage wrapper {target:?}: {error}"));
             assert_eq!(module.required_runtime_symbol(), Some(RUNTIME_SYMBOL_NAME));
             assert!(module.prepared_entry_symbol().is_none());
+            assert_eq!(module.symbols().len(), 5);
+            assert_eq!(
+                module.symbols()[SLOW_PARTIAL_TABLE_SYMBOL].name,
+                ".Lfre_aot_regex_slow_partial_table_v1"
+            );
+        }
+    }
+
+    #[test]
+    fn slow_complete_forward_declines_lower_directly_when_start_is_known() {
+        let semantic_limits = CompileLimitsV1 {
+            determinize: DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+            ..CompileLimitsV1::default()
+        };
+        for (pattern, output, expect_exact_width, expect_initial_pending) in [
+            (
+                "a+Q|[b-c][a-b]{1,5}(?:x+|y+)",
+                OutputContract::Exists,
+                false,
+                false,
+            ),
+            (
+                "a+Q|[b-c][a-b]{1,5}(?:x+|y+)",
+                OutputContract::SelectedEnd,
+                false,
+                false,
+            ),
+            ("(?:ab|cd){2}", OutputContract::Span, true, false),
+            ("a*", OutputContract::Span, false, true),
+        ] {
+            let fast = compile(
+                CompileRequest::new(pattern, Target::x86_64_linux())
+                    .mode(CompileMode::Fast)
+                    .output(output)
+                    .limits(semantic_limits),
+            )
+            .unwrap_or_else(|error| panic!("direct slow fixture {output:?}: {error}"));
+            assert_eq!(fast.receipt().engine, EngineKind::OrderedNfa);
+            let complete = fast
+                .program()
+                .native_slow_determinized_program(
+                    SlowAotLimits::default().determinize,
+                    SlowAotLimits::default().max_allocation_bytes,
+                )
+                .expect("complete slow determinization")
+                .expect("complete slow candidate");
+            let limits = SlowAotLimits {
+                determinize: DeterminizeLimits {
+                    max_work: complete
+                        .report()
+                        .work_completed
+                        .checked_sub(1)
+                        .expect("nonzero slow work"),
+                    ..SlowAotLimits::default().determinize
+                },
+                ..SlowAotLimits::default()
+            };
+            let declined = fast
+                .program()
+                .native_slow_determinized_program(
+                    limits.determinize,
+                    limits.max_allocation_bytes,
+                )
+                .expect("late slow refusal")
+                .expect("late retained slow candidate");
+            let (rows, discovered) = declined
+                .retained_dimensions()
+                .expect("decline-bearing complete forward");
+            assert_eq!(rows, discovered, "{pattern}/{output:?}");
+            assert!(declined.report().decline.as_ref().is_some_and(|decline| {
+                matches!(
+                    decline.stage,
+                    crate::DeterminizationStage::DfaStateMinimization
+                        | crate::DeterminizationStage::AlphabetColumnCoalescing
+                )
+            }));
+            let view = fast.program().native_slow_determinized_view(&declined);
+            assert_eq!(view.exact_match_width.is_some(), expect_exact_width);
+            assert_eq!(view.dfa.initial_pending, expect_initial_pending);
+            assert!(!view.collapse_partial_holes);
+            assert_eq!(view.partial_discovered_states, None);
+            for target in [
+                Target::x86_64_linux(),
+                Target::x86_64_macos(),
+                Target::aarch64_linux(),
+                Target::aarch64_macos(),
+            ] {
+                let module = CompiledModule::lower_optimizing_with_limits(
+                    fast.program(),
+                    target,
+                    limits,
+                )
+                .unwrap_or_else(|error| panic!("direct slow {output:?}/{target:?}: {error}"));
+                let report = module
+                    .slow_aot_report()
+                    .unwrap_or_else(|| panic!("missing direct slow report: {output:?}/{target:?}"));
+                assert!(report.determinization.decline.is_some());
+                assert_eq!(
+                    report.native_data_bytes,
+                    module.sections()[PROGRAM_SECTION].bytes().len()
+                );
+                assert!(module.required_runtime_symbol().is_none());
+                assert!(module.prepared_entry_symbol().is_none());
+                assert_eq!(module.symbols().len(), 2);
+                assert!(module
+                    .relocations()
+                    .iter()
+                    .all(|relocation| relocation.symbol == PROGRAM_SYMBOL));
+            }
         }
     }
 
@@ -29242,21 +30010,7 @@ int main(void) {{
             .mode(CompileMode::Fast)
             .output(OutputContract::Span);
         let span_fast = compile(span_probe_request).expect("fast Span fixture");
-        let complete_span = span_fast
-            .program()
-            .native_slow_determinized_program(
-                SlowAotLimits::default().determinize,
-                SlowAotLimits::default().max_allocation_bytes,
-            )
-            .expect("complete Span determinization")
-            .expect("complete Span candidate");
-        let span_limits = SlowAotLimits {
-            determinize: DeterminizeLimits {
-                max_work: complete_span.report().work_completed - 1,
-                ..SlowAotLimits::default().determinize
-            },
-            ..SlowAotLimits::default()
-        };
+        let span_limits = slow_reverse_decline_limits(span_fast.program());
         let span = crate::compile_with_slow_aot_limits(
             CompileRequest::new("a+", target)
                 .mode(CompileMode::Optimizing)
@@ -29273,6 +30027,7 @@ int main(void) {{
         .expect("linked variable Span slow partial");
         assert!(span.module().slow_aot_report().is_some());
         assert!(span.module().prepared_entry_symbol().is_none());
+        assert_eq!(span.module().required_runtime_symbol(), Some(RUNTIME_SYMBOL_NAME));
 
         let directory = std::env::temp_dir().join(format!(
             "fre-aot-slow-partial-wrapper-{}",
@@ -29390,6 +30145,150 @@ int main(void) {{
         let output = Command::new(&executable)
             .output()
             .expect("execute slow-partial wrapper oracle");
+        assert!(
+            output.status.success(),
+            "status={:?} stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    #[ignore = "links and executes a direct late-decline retained-reverse object on the host ISA"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the linked differential covers mixed forward/reverse minimization across all windows"
+    )]
+    fn linked_host_direct_slow_retained_reverse_matches_portable_program() {
+        use std::{fmt::Write as _, fs, process::Command};
+
+        let target = if cfg!(target_arch = "x86_64") {
+            if cfg!(target_os = "linux") {
+                Target::x86_64_linux()
+            } else {
+                Target::x86_64_macos()
+            }
+        } else if cfg!(target_os = "linux") {
+            Target::aarch64_linux()
+        } else {
+            Target::aarch64_macos()
+        };
+        let pattern = "a+Q|[b-c][a-b]{1,5}(?:x+|y+)";
+        let probe = compile(
+            CompileRequest::new(pattern, target)
+                .mode(CompileMode::Fast)
+                .output(OutputContract::Span),
+        )
+        .expect("fast linked retained-reverse fixture");
+        let slow_limits = slow_forward_minimized_reverse_decline_limits(probe.program());
+        let compiled = crate::compile_with_slow_aot_limits(
+            CompileRequest::new(pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span)
+                .limits(CompileLimitsV1 {
+                    determinize: DeterminizeLimits {
+                        max_states: 0,
+                        ..DeterminizeLimits::default()
+                    },
+                    ..CompileLimitsV1::default()
+                }),
+            slow_limits,
+        )
+        .expect("direct linked retained-reverse compile");
+        assert!(compiled.module().slow_retained_forward_minimized());
+        assert!(compiled.module().required_runtime_symbol().is_none());
+        assert!(compiled
+            .receipt()
+            .slow_aot
+            .as_ref()
+            .is_some_and(|report| report.dfa.reverse_states > 0));
+
+        let haystacks = [
+            b"!".as_slice(),
+            b"xxaaaQyy".as_slice(),
+            b"zzcbbxx!!".as_slice(),
+            b"QbaayyyyQ".as_slice(),
+        ];
+        let directory = std::env::temp_dir().join(format!(
+            "fre-aot-slow-direct-reverse-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("create direct slow linker directory");
+        let object = directory.join("direct_reverse.o");
+        fs::write(&object, compiled.object()).expect("write direct slow object");
+        let symbol = compiled.module().entry_symbol();
+        let mut source = format!(
+            "#include <stddef.h>\n#include <stdint.h>\n\
+             typedef struct{{size_t start;size_t end;}} result_t;\n\
+             extern uint32_t {symbol}(const unsigned char*,size_t,size_t,size_t,result_t*);\n"
+        );
+        let mut main = String::from("int main(void){result_t r;uint32_t s;\n");
+        for (case, haystack) in haystacks.iter().enumerate() {
+            let bytes = haystack
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            writeln!(source, "static const unsigned char h{case}[]={{{bytes}}};")
+                .expect("write direct slow haystack");
+            for start in 0..=haystack.len() {
+                for end in start..=haystack.len() {
+                    let expected = compiled
+                        .search(haystack, SearchWindow::new(start, end))
+                        .expect("portable retained-reverse result");
+                    writeln!(
+                        main,
+                        "r.start=99U;r.end=99U;s={symbol}(h{case},{},{start},{end},&r);",
+                        haystack.len()
+                    )
+                    .expect("write direct slow call");
+                    match expected {
+                        MatchResult::Span(Some((match_start, match_end))) => writeln!(
+                            main,
+                            "if(s!=1U||r.start!={match_start}U||r.end!={match_end}U)return {};",
+                            case + 10
+                        )
+                        .expect("write direct slow match assertion"),
+                        MatchResult::Span(None) => writeln!(
+                            main,
+                            "if(s!=0U||r.start!=0U||r.end!=0U)return {};",
+                            case + 10
+                        )
+                        .expect("write direct slow no-match assertion"),
+                        MatchResult::Exists(_) | MatchResult::SelectedEnd(_) => {
+                            panic!("Span program returned a different output contract")
+                        }
+                    }
+                }
+            }
+        }
+        main.push_str("return 0;}\n");
+        source.push_str(&main);
+        let c_path = directory.join("direct_reverse.c");
+        let executable = directory.join("direct_reverse");
+        fs::write(&c_path, source).expect("write direct slow C harness");
+        let compiler = if cfg!(target_os = "macos") {
+            "clang"
+        } else {
+            "cc"
+        };
+        let status = Command::new(compiler)
+            .arg("-O0")
+            .arg(&c_path)
+            .arg(&object)
+            .arg("-o")
+            .arg(&executable)
+            .status()
+            .expect("invoke host C compiler");
+        assert!(status.success());
+        let output = Command::new(&executable)
+            .output()
+            .expect("execute direct retained-reverse oracle");
         assert!(
             output.status.success(),
             "status={:?} stdout={} stderr={}",
@@ -35398,11 +36297,29 @@ int main(void) {{
             code: vec![1, 2, 3],
             data: vec![4, 5, 6],
             relocations: Vec::new(),
+            slow_partial_table: None,
             needs_runtime: false,
             start_accelerator: StartAccelerator::None,
             anchored_prefix_filter_bytes: 0,
         };
         let base = native_module_digest(program, target, &lowering).unwrap();
+        let mut legacy = Sha256::new();
+        legacy.update(NATIVE_MODULE_IDENTITY_DOMAIN);
+        legacy.update(NATIVE_LOWERING_VERSION.to_le_bytes());
+        legacy.update([1, 1, 1]);
+        legacy.update(target.features.bits().to_le_bytes());
+        for bytes in [
+            &program[..],
+            lowering.code.as_slice(),
+            lowering.data.as_slice(),
+        ] {
+            legacy.update(u64::try_from(bytes.len()).unwrap().to_le_bytes());
+            legacy.update(bytes);
+        }
+        legacy.update([0, start_accelerator_tag(StartAccelerator::None), 0]);
+        legacy.update(0_u64.to_le_bytes());
+        let legacy: [u8; 32] = legacy.finalize().into();
+        assert_eq!(base, legacy, "ordinary V1 digest stream changed");
         assert_ne!(
             base,
             native_module_digest(b"semantic program!", target, &lowering).unwrap()
@@ -35443,6 +36360,20 @@ int main(void) {{
             native_module_digest(program, target, &lowering).unwrap()
         );
         lowering.data.pop();
+        lowering.slow_partial_table = Some(NativeSlowPartialTableLayout { offset: 1, size: 2 });
+        let table_layout = native_module_digest(program, target, &lowering).unwrap();
+        assert_ne!(base, table_layout);
+        lowering.slow_partial_table = Some(NativeSlowPartialTableLayout { offset: 2, size: 2 });
+        assert_ne!(
+            table_layout,
+            native_module_digest(program, target, &lowering).unwrap()
+        );
+        lowering.slow_partial_table = Some(NativeSlowPartialTableLayout { offset: 1, size: 1 });
+        assert_ne!(
+            table_layout,
+            native_module_digest(program, target, &lowering).unwrap()
+        );
+        lowering.slow_partial_table = None;
         lowering.relocations.push(ModuleRelocation {
             section: TEXT_SECTION,
             offset: 1,

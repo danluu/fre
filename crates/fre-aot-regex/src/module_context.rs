@@ -3155,6 +3155,7 @@ pub(super) fn lower_native_context(
         code,
         data: layout.data,
         relocations,
+        slow_partial_table: None,
         needs_runtime: false,
         start_accelerator,
         anchored_prefix_filter_bytes: anchored_forward_search.map_or_else(

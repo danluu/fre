@@ -661,13 +661,22 @@ fn selected_passes(program: &CompiledProgram, module: &CompiledModule) -> Vec<Op
                 }
             });
         }
+        // Forward minimization can commit before reverse minimization reaches
+        // a numeric refusal. The combined determinization stage correctly
+        // remains incomplete, while this private selected-artifact bit keeps
+        // the receipt faithful to the useful forward quotient in the object.
+        if module.slow_retained_forward_minimized()
+            && !passes.contains(&OptimizationPass::DfaStateMinimization)
+        {
+            passes.push(OptimizationPass::DfaStateMinimization);
+        }
     }
     match program.engine_kind() {
         EngineKind::OrderedNfa if module.slow_aot_report().is_some() => {
             // A selected slow candidate leaves the stable semantic engine as
             // the universal ordered TNFA. Report both the native DFA passes
-            // physically present in the object and, for a transient prefix,
-            // its whole-search runtime fallback adapter.
+            // physically present in the object and, only for a genuinely
+            // incomplete transient prefix, its whole-search runtime adapter.
             passes.push(OptimizationPass::UniversalOrderedTnfa);
             let reverse_unused = module
                 .slow_aot_report()
