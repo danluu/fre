@@ -5078,7 +5078,17 @@ impl CompiledProgram {
 
         let stride = usize::try_from(full.row_stride()).ok()?;
         let live_cells = direct.state_count().checked_mul(stride)?;
-        let loop_rows = direct.learned_loop_row_offsets();
+        let source_loop_rows = direct.learned_loop_row_offsets();
+        // Learned-loop rows are mutable-K0 ownership metadata. Once every
+        // copied cell is closed, a scanner-free frozen table can execute the
+        // canonical transitions directly and must publish the loop-free ABI
+        // expected by its scalar entry. Root-scanner entries retain the exact
+        // ownership rows because their scanner consumes those skips.
+        let frozen_loop_rows = if dynamic_view.root_requirement.is_some() {
+            source_loop_rows
+        } else {
+            &[]
+        };
         if stride == 0
             || stride > 256
             || live_cells == 0
@@ -5096,8 +5106,7 @@ impl CompiledProgram {
             || full.initial_terminal()
             || direct.initial_pending()
             || direct.initial_terminal()
-            || loop_rows.len() > 4
-            || (dynamic_view.root_requirement.is_none() && !loop_rows.is_empty())
+            || frozen_loop_rows.len() > 4
             || full.unfilled_cell() != DYNAMIC_NATIVE_ROWS_V1_UNFILLED_CELL
             || full.accept_mask() != DYNAMIC_NATIVE_ROWS_V1_ACCEPT_MASK
             || full.next_row_token_mask() != DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK
@@ -5126,7 +5135,9 @@ impl CompiledProgram {
         let class_map = Box::<[u8; 256]>::try_from(owned_class_map.into_boxed_slice()).ok()?;
 
         let mut learned_loop_rows = [u32::MAX; 4];
-        learned_loop_rows.get_mut(..loop_rows.len())?.copy_from_slice(loop_rows);
+        learned_loop_rows
+            .get_mut(..frozen_loop_rows.len())?
+            .copy_from_slice(frozen_loop_rows);
         let descriptor = DynamicNativeRowsV1 {
             rows_address: rows.as_ptr().expose_provenance(),
             class_map_address: class_map.as_ptr().expose_provenance(),
@@ -5136,7 +5147,7 @@ impl CompiledProgram {
             accept_mask: full.accept_mask(),
             next_row_token_mask: full.next_row_token_mask(),
             cache_identity: full.cache_identity(),
-            learned_loop_row_count: u32::try_from(loop_rows.len()).ok()?,
+            learned_loop_row_count: u32::try_from(frozen_loop_rows.len()).ok()?,
             learned_loop_rows,
             initial_row: full.forward_initial_row(),
             initial_flags: 0,
@@ -9604,6 +9615,34 @@ mod tests {
             ],
             byte_starts: vec![0, 0, b'a', 0, 0, b'b', 0],
             byte_ends: vec![0, 0, b'a', 0xff, b'`', 0xff, 0xff],
+        }
+    }
+
+    fn scanner_free_correlated_pair_raw() -> RawPlan {
+        RawPlan {
+            start: 0,
+            roles: vec![
+                StateRole::Split,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Accept,
+            ],
+            edge_offsets: vec![0, 2, 3, 4, 6, 8, 8],
+            edge_targets: vec![1, 3, 2, 5, 4, 4, 5, 5],
+            edge_kinds: vec![
+                EdgeKind::Epsilon,
+                EdgeKind::Epsilon,
+                EdgeKind::ByteRange,
+                EdgeKind::ByteRange,
+                EdgeKind::ByteRange,
+                EdgeKind::ByteRange,
+                EdgeKind::ByteRange,
+                EdgeKind::ByteRange,
+            ],
+            byte_starts: vec![0, 0, b'a', b'a', 0, b'b', 0, b'c'],
+            byte_ends: vec![0, 0, b'a', b'b', b'`', u8::MAX, b'`', u8::MAX],
         }
     }
 
@@ -16164,6 +16203,58 @@ mod tests {
             "a malformed sidecar descriptor must fail closed"
         );
         storage.descriptor = valid_descriptor;
+    }
+
+    #[test]
+    fn scanner_free_frozen_sidecar_discards_mutable_loop_ownership() {
+        let compiled = raw_program(
+            &scanner_free_correlated_pair_raw(),
+            OutputContract::Exists,
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+        );
+        assert_eq!(
+            compiled
+                .native_dynamic_rows_view()
+                .expect("scanner-free dynamic view")
+                .root_requirement,
+            None
+        );
+
+        let mut candidate = compiled.prepare_workspace().unwrap();
+        let nfa = candidate.nfa.as_mut().unwrap();
+        let receipt = nfa
+            .compiler_private_try_prefill_root_cache_with_receipt(&compiled.automaton)
+            .expect("complete scanner-free root receipt");
+        assert!(
+            nfa.compiler_private_fully_prefilled_root_projection_without_resume(
+                &compiled.automaton,
+                receipt,
+            )
+            .is_some()
+        );
+        assert!(
+            !nfa.dynamic_root_projection(&compiled.automaton)
+                .expect("complete scanner-free projection")
+                .learned_loop_row_offsets()
+                .is_empty(),
+            "the source projection must exercise loop-ownership normalization"
+        );
+
+        let workspace = compiled.prepare_workspace().unwrap();
+        let storage = compiled
+            .compiler_private_frozen_dynamic_rows_storage(
+                &workspace,
+                usize::MAX,
+                usize::MAX,
+            )
+            .expect("closed scanner-free compact sidecar");
+        assert_eq!(storage.descriptor.learned_loop_row_count, 0);
+        assert_eq!(storage.descriptor.learned_loop_rows, [u32::MAX; 4]);
+        assert!(storage.descriptor_is_valid_for(compiled.identity));
     }
 
     #[test]
