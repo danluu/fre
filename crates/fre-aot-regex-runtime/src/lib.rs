@@ -3666,11 +3666,19 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
         .expect("compile scanner-free variable Span fixture");
         assert_eq!(compiled.program().engine_kind(), EngineKind::OrderedNfa);
         assert_eq!(compiled.program().exact_match_width(), None);
-        let view = compiled
-            .program()
-            .native_dynamic_rows_view()
-            .expect("variable Span dynamic view");
-        assert_eq!(view.root_requirement, None);
+        assert!(compiled.module().prepared_entry_symbol().is_some());
+        assert_eq!(
+            compiled
+                .module()
+                .required_prepared_dynamic_rows_continue_runtime_symbol(),
+            Some("fre_aot_regex_runtime_search_exclusive_dynamic_rows_continue_v1")
+        );
+        assert_eq!(
+            compiled
+                .module()
+                .required_prepared_dynamic_rows_span_recovery_runtime_symbol(),
+            Some("fre_aot_regex_runtime_search_exclusive_dynamic_rows_recover_span_v1")
+        );
 
         let identity = compiled.receipt().program_sha256;
         let serialized = compiled.program().serialize().unwrap();
