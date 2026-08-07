@@ -2793,10 +2793,11 @@ impl FrozenCompactLoopScanner {
 
 /// Pointer-stable immutable ownership for a compact frozen dynamic table.
 ///
-/// The descriptor addresses the two boxed payloads, whose allocations remain
-/// fixed when this owner or its containing prepared runtime moves. The owner
-/// is never exposed through a matching API and is retained for the complete
-/// prepared-runtime lifetime whenever construction succeeds.
+/// The descriptor addresses exactly one of the boxed payloads, whose
+/// allocation remains fixed when this owner or its containing prepared
+/// runtime moves. The owner is never exposed through a matching API and is
+/// retained for the complete prepared-runtime lifetime whenever construction
+/// succeeds.
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct FrozenDynamicRowsStorage {
@@ -2808,12 +2809,12 @@ pub struct FrozenDynamicRowsStorage {
 }
 
 /// Pointer-stable immutable ownership for a compact
-/// V3/V4/V8/V9/V10/V11/V12/V13 table.
+/// V3/V4/V8/V9/V10/V11/V12/V13/V14 table.
 ///
 /// V10 and V12 own a separately allocated byte table, while V11 owns `u32`
-/// pair blocks and V13 owns dense `u16` pair blocks. No generation reinterprets
-/// an allocation at a wider or differently aligned type, and exactly one row
-/// owner is populated for any published generation.
+/// pair blocks and V13/V14 own dense `u16` supertransition blocks. No
+/// generation reinterprets an allocation at a wider or differently aligned
+/// type, and exactly one row owner is populated for any published generation.
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct FrozenDynamicRowsStorageV3 {
@@ -2823,6 +2824,7 @@ pub struct FrozenDynamicRowsStorageV3 {
     rows_u8: Option<Box<[u8]>>,
     pair_rows_v11: Option<Box<[u32]>>,
     pair_rows_v13: Option<Box<[u16]>>,
+    quad_rows_v14: Option<Box<[u16]>>,
     class_map: [u8; 256],
     descriptor: FrozenDynamicRowsV3,
     unary_exists_first_accept_step: Option<u32>,
@@ -2886,6 +2888,9 @@ pub const FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V12: u32 = 1 << 13;
 /// An authenticated dense mapped pair-supertransition V13 tail is present.
 #[doc(hidden)]
 pub const FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V13: u32 = 1 << 14;
+/// An authenticated dense mapped four-transition V14 tail is present.
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V14: u32 = 1 << 15;
 /// Sentinel used when no reverse root row exists.
 #[doc(hidden)]
 pub const FROZEN_PREPARED_HEADER_V1_NO_REVERSE_ROW: u32 = u32::MAX;
@@ -3012,6 +3017,9 @@ pub const FROZEN_PREPARED_HEADER_V12_READY_SEAL: u64 = 0x3d91_f7a6_2be8_c405;
 /// Final publication seal for a dense mapped pair-supertransition V13 tail.
 #[doc(hidden)]
 pub const FROZEN_PREPARED_HEADER_V13_READY_SEAL: u64 = 0x95c1_7a4e_32bd_f608;
+/// Final publication seal for a dense mapped four-transition V14 tail.
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V14_READY_SEAL: u64 = 0xc27d_40a9_6e13_f85b;
 /// Exact mapped state-ordinal tail format selected by the V3 flag and extent.
 #[doc(hidden)]
 pub const FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION: u32 = 3;
@@ -3045,6 +3053,9 @@ pub const FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION: u32 = 12;
 /// Exact dense mapped pair-supertransition tail format selected by the V13 flag.
 #[doc(hidden)]
 pub const FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION: u32 = 13;
+/// Exact dense mapped four-transition tail format selected by the V14 flag.
+#[doc(hidden)]
+pub const FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION: u32 = 14;
 /// V4 reuses the additive compact envelope without changing V3's byte ABI.
 #[doc(hidden)]
 pub const FROZEN_PREPARED_HEADER_V4_DYNAMIC_ROWS_OFFSET: usize =
@@ -3115,6 +3126,13 @@ pub const FROZEN_PREPARED_HEADER_V13_DYNAMIC_ROWS_OFFSET: usize =
 /// Exact V13 logical extent inside the physical V6 envelope.
 #[doc(hidden)]
 pub const FROZEN_PREPARED_HEADER_V13_BYTES: usize = FROZEN_PREPARED_HEADER_V3_BYTES;
+/// V14 reuses the compact logical extent inside the physical V6 envelope.
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V14_DYNAMIC_ROWS_OFFSET: usize =
+    FROZEN_PREPARED_HEADER_V3_DYNAMIC_ROWS_OFFSET;
+/// Exact V14 logical extent inside the physical V6 envelope.
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V14_BYTES: usize = FROZEN_PREPARED_HEADER_V3_BYTES;
 /// General minimum suffix length at which a frozen loop invokes its SIMD helper.
 #[doc(hidden)]
 pub const FROZEN_COMPACT_LOOP_SCAN_MIN_BYTES: usize = BYTE_SET_WIDE_BLOCK_BYTES * 2;
@@ -3157,6 +3175,15 @@ pub const DYNAMIC_NATIVE_ROWS_V13_ACCEPT_BACK_ONE_MASK: u16 = 1 << 14;
 /// One-based destination V13 block-cell offset; zero is terminal/dead.
 #[doc(hidden)]
 pub const DYNAMIC_NATIVE_ROWS_V13_NEXT_BLOCK_TOKEN_MASK: u16 = (1 << 14) - 1;
+/// At least one semantically consumed transition in a V14 cell accepts.
+#[doc(hidden)]
+pub const DYNAMIC_NATIVE_ROWS_V14_ANY_ACCEPT_MASK: u16 = 1 << 15;
+/// Two-bit distance from the last loaded byte to the latest accepting edge.
+#[doc(hidden)]
+pub const DYNAMIC_NATIVE_ROWS_V14_ACCEPT_DISTANCE_MASK: u16 = 0b11 << 13;
+/// One-based destination-state ordinal after four live V14 transitions.
+#[doc(hidden)]
+pub const DYNAMIC_NATIVE_ROWS_V14_NEXT_STATE_TOKEN_MASK: u16 = (1 << 13) - 1;
 /// Smallest semantic alphabet admitted to pair-supertransition V11.
 pub(crate) const FROZEN_PAIR_ROWS_V11_MIN_CLASSES: usize = 2;
 /// Largest semantic alphabet admitted to the initial V11 slice.
@@ -3169,6 +3196,12 @@ pub(crate) const FROZEN_PAIR_ROWS_V13_MIN_CLASSES: usize = 2;
 pub(crate) const FROZEN_PAIR_ROWS_V13_MAX_CLASSES: usize = 8;
 /// Independent resident allocation ceiling for V13, including its byte map.
 pub(crate) const FROZEN_PAIR_ROWS_V13_MAX_BYTES: usize = 64 * 1024;
+/// Smallest semantic alphabet admitted to four-transition V14.
+pub(crate) const FROZEN_QUAD_ROWS_V14_MIN_CLASSES: usize = 2;
+/// Largest semantic alphabet admitted to four-transition V14.
+pub(crate) const FROZEN_QUAD_ROWS_V14_MAX_CLASSES: usize = 4;
+/// Independent resident allocation ceiling for V14, including its byte map.
+pub(crate) const FROZEN_QUAD_ROWS_V14_MAX_BYTES: usize = 64 * 1024;
 /// Closed dead transition in a mapped compact-u8 V12 row.
 #[doc(hidden)]
 pub const DYNAMIC_NATIVE_ROWS_V12_DEAD_CELL: u8 = DYNAMIC_NATIVE_ROWS_V10_DEAD_CELL;
@@ -3196,6 +3229,7 @@ enum FrozenCompactRowsFormat {
     PairSupertransitionV11,
     StateOrdinalMappedU8V12,
     DensePairSupertransitionV13,
+    DenseQuadSupertransitionV14,
 }
 
 #[derive(Clone, Copy)]
@@ -3216,6 +3250,7 @@ impl FrozenCompactRowsFormat {
             Self::PairSupertransitionV11 => FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION,
             Self::StateOrdinalMappedU8V12 => FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION,
             Self::DensePairSupertransitionV13 => FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION,
+            Self::DenseQuadSupertransitionV14 => FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION,
         }
     }
 
@@ -3229,6 +3264,7 @@ impl FrozenCompactRowsFormat {
             Self::PairSupertransitionV11 => FROZEN_PREPARED_HEADER_V11_READY_SEAL,
             Self::StateOrdinalMappedU8V12 => FROZEN_PREPARED_HEADER_V12_READY_SEAL,
             Self::DensePairSupertransitionV13 => FROZEN_PREPARED_HEADER_V13_READY_SEAL,
+            Self::DenseQuadSupertransitionV14 => FROZEN_PREPARED_HEADER_V14_READY_SEAL,
         }
     }
 
@@ -3249,6 +3285,9 @@ impl FrozenCompactRowsFormat {
             }
             Self::DensePairSupertransitionV13 => {
                 FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V13
+            }
+            Self::DenseQuadSupertransitionV14 => {
+                FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V14
             }
         }
     }
@@ -3294,6 +3333,10 @@ impl FrozenCompactRowsFormat {
         matches!(self, Self::DensePairSupertransitionV13)
     }
 
+    const fn is_quad_supertransition(self) -> bool {
+        matches!(self, Self::DenseQuadSupertransitionV14)
+    }
+
     const fn direct_byte(self) -> Self {
         match self {
             Self::StateOrdinalV3 | Self::StateOrdinalDirectV8 => Self::StateOrdinalDirectV8,
@@ -3302,6 +3345,7 @@ impl FrozenCompactRowsFormat {
             Self::PairSupertransitionV11 => Self::PairSupertransitionV11,
             Self::StateOrdinalMappedU8V12 => Self::StateOrdinalMappedU8V12,
             Self::DensePairSupertransitionV13 => Self::DensePairSupertransitionV13,
+            Self::DenseQuadSupertransitionV14 => Self::DenseQuadSupertransitionV14,
         }
     }
 }
@@ -3600,6 +3644,175 @@ fn build_frozen_pair_rows_v13(
     Some(pair_rows.into_boxed_slice())
 }
 
+/// Return `(quad, tail3, tail2, tail1, block, total, bytes)` for V14.
+///
+/// V14 deliberately uses exact, unpadded base-C rows and state-ordinal
+/// destinations. Padding these blocks to powers of two would inflate their
+/// exact sizes by 6.67%, 6.67%, and 50.59% for C=2,3,4 respectively, reducing
+/// coverage under the resident cap. One constant row-size multiply every four
+/// bytes preserves the full cache/resource envelope while remaining off the
+/// per-byte chain.
+fn frozen_quad_rows_v14_geometry(
+    state_count: usize,
+    class_count: usize,
+) -> Option<(usize, usize, usize, usize, usize, usize, usize)> {
+    if state_count == 0
+        || state_count > usize::from(DYNAMIC_NATIVE_ROWS_V14_NEXT_STATE_TOKEN_MASK)
+        || !(FROZEN_QUAD_ROWS_V14_MIN_CLASSES..=FROZEN_QUAD_ROWS_V14_MAX_CLASSES)
+            .contains(&class_count)
+    {
+        return None;
+    }
+    let tail1_cells = class_count;
+    let tail2_cells = class_count.checked_pow(2)?;
+    let tail3_cells = class_count.checked_pow(3)?;
+    let quad_cells = class_count.checked_pow(4)?;
+    let block_cells = quad_cells
+        .checked_add(tail3_cells)?
+        .checked_add(tail2_cells)?
+        .checked_add(tail1_cells)?;
+    let total_cells = state_count.checked_mul(block_cells)?;
+    let bytes = total_cells
+        .checked_mul(core::mem::size_of::<u16>())?
+        .checked_add(256)?;
+    (bytes <= FROZEN_QUAD_ROWS_V14_MAX_BYTES).then_some((
+        quad_cells,
+        tail3_cells,
+        tail2_cells,
+        tail1_cells,
+        block_cells,
+        total_cells,
+        bytes,
+    ))
+}
+
+fn frozen_quad_classes_v14(
+    mut key: usize,
+    length: usize,
+    class_count: usize,
+) -> Option<[usize; 4]> {
+    if length == 0 || length > 4 || class_count == 0 {
+        return None;
+    }
+    let mut classes = [0_usize; 4];
+    for index in (0..length).rev() {
+        classes[index] = key.checked_rem(class_count)?;
+        key = key.checked_div(class_count)?;
+    }
+    (key == 0).then_some(classes)
+}
+
+/// Summarize one one-to-four-byte trace. Semantic traversal stops at the first
+/// dead edge even though generated code may load the remainder after proving
+/// the full input bound. Distance is measured from the final loaded byte, so a
+/// byte-one acceptance in a four-byte cell has distance three. Tail summaries
+/// use the same field relative to their actual final byte and carry no token.
+fn frozen_quad_cell_v14(
+    semantics: &[u16],
+    state: usize,
+    classes: &[usize],
+    class_count: usize,
+    include_destination: bool,
+) -> Option<u16> {
+    if classes.is_empty() || classes.len() > 4 || state.checked_mul(class_count)? >= semantics.len()
+    {
+        return None;
+    }
+    let mut state = state;
+    let mut last_accept = None;
+    let mut live_after_all = true;
+    for (index, &class) in classes.iter().enumerate() {
+        if class >= class_count {
+            return None;
+        }
+        let cell = *semantics.get(state.checked_mul(class_count)?.checked_add(class)?)?;
+        if cell & DYNAMIC_NATIVE_ROWS_V3_ACCEPT_MASK != 0 {
+            last_accept = Some(index);
+        }
+        let token = cell & DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK;
+        if token == 0 {
+            live_after_all = false;
+            break;
+        }
+        state = usize::from(token).checked_sub(1)?;
+        if state.checked_mul(class_count)? >= semantics.len() {
+            return None;
+        }
+    }
+
+    let mut summary = 0_u16;
+    if let Some(last_accept) = last_accept {
+        let distance = classes.len().checked_sub(1)?.checked_sub(last_accept)?;
+        let distance = u16::try_from(distance).ok()?;
+        summary |= DYNAMIC_NATIVE_ROWS_V14_ANY_ACCEPT_MASK | (distance << 13);
+    }
+    if include_destination && live_after_all {
+        let token = u16::try_from(state.checked_add(1)?).ok()?;
+        if token > DYNAMIC_NATIVE_ROWS_V14_NEXT_STATE_TOKEN_MASK {
+            return None;
+        }
+        summary |= token;
+    }
+    Some(summary)
+}
+
+fn build_frozen_quad_rows_v14(
+    source_rows: &[u32],
+    columns: &FrozenCompactColumnProjection,
+    source_class_count: usize,
+    state_count: usize,
+    source_initial_state: usize,
+) -> Option<Box<[u16]>> {
+    let class_count = columns.class_count;
+    let (_, _, _, _, block_cells, total_cells, _) =
+        frozen_quad_rows_v14_geometry(state_count, class_count)?;
+    let semantic_cells = state_count.checked_mul(class_count)?;
+    let mut semantics = Vec::new();
+    semantics.try_reserve_exact(semantic_cells).ok()?;
+    for canonical_state in 0..state_count {
+        let source_state =
+            canonicalize_frozen_state_ordinal(canonical_state, source_initial_state);
+        let source_row = source_state.checked_mul(source_class_count)?;
+        for &source_class in &columns.source_classes[..class_count] {
+            let cell = *source_rows.get(source_row.checked_add(usize::from(source_class))?)?;
+            semantics.push(frozen_compact_semantic_cell(
+                cell,
+                source_class_count,
+                state_count,
+                source_initial_state,
+            )?);
+        }
+    }
+    if semantics.len() != semantic_cells {
+        return None;
+    }
+
+    let mut rows = Vec::new();
+    rows.try_reserve_exact(total_cells).ok()?;
+    for state in 0..state_count {
+        for length in [4_usize, 3, 2, 1] {
+            let key_count = class_count.checked_pow(u32::try_from(length).ok()?)?;
+            for key in 0..key_count {
+                let classes = frozen_quad_classes_v14(key, length, class_count)?;
+                rows.push(frozen_quad_cell_v14(
+                    &semantics,
+                    state,
+                    &classes[..length],
+                    class_count,
+                    length == 4,
+                )?);
+            }
+        }
+        if rows.len().checked_rem(block_cells) != Some(0) {
+            return None;
+        }
+    }
+    if rows.len() != total_cells {
+        return None;
+    }
+    Some(rows.into_boxed_slice())
+}
+
 /// V3 tail field offsets used by target-native lowering.
 #[doc(hidden)]
 pub const FROZEN_DYNAMIC_ROWS_V3_READY_SEAL_OFFSET: usize =
@@ -3774,6 +3987,11 @@ const _: () = {
     );
     assert!(FROZEN_PREPARED_HEADER_V13_BYTES == FROZEN_PREPARED_HEADER_V3_BYTES);
     assert!(
+        FROZEN_PREPARED_HEADER_V14_DYNAMIC_ROWS_OFFSET
+            == FROZEN_PREPARED_HEADER_V3_DYNAMIC_ROWS_OFFSET
+    );
+    assert!(FROZEN_PREPARED_HEADER_V14_BYTES == FROZEN_PREPARED_HEADER_V3_BYTES);
+    assert!(
         FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V4
             != FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3
     );
@@ -3817,6 +4035,17 @@ const _: () = {
     assert!(FROZEN_PREPARED_HEADER_V13_READY_SEAL != FROZEN_PREPARED_HEADER_V10_READY_SEAL);
     assert!(FROZEN_PREPARED_HEADER_V13_READY_SEAL != FROZEN_PREPARED_HEADER_V11_READY_SEAL);
     assert!(FROZEN_PREPARED_HEADER_V13_READY_SEAL != FROZEN_PREPARED_HEADER_V12_READY_SEAL);
+    assert!(FROZEN_PREPARED_HEADER_V14_READY_SEAL != FROZEN_PREPARED_HEADER_V3_READY_SEAL);
+    assert!(FROZEN_PREPARED_HEADER_V14_READY_SEAL != FROZEN_PREPARED_HEADER_V4_READY_SEAL);
+    assert!(FROZEN_PREPARED_HEADER_V14_READY_SEAL != FROZEN_PREPARED_HEADER_V5_READY_SEAL);
+    assert!(FROZEN_PREPARED_HEADER_V14_READY_SEAL != FROZEN_PREPARED_HEADER_V6_READY_SEAL);
+    assert!(FROZEN_PREPARED_HEADER_V14_READY_SEAL != FROZEN_PREPARED_HEADER_V7_READY_SEAL);
+    assert!(FROZEN_PREPARED_HEADER_V14_READY_SEAL != FROZEN_PREPARED_HEADER_V8_READY_SEAL);
+    assert!(FROZEN_PREPARED_HEADER_V14_READY_SEAL != FROZEN_PREPARED_HEADER_V9_READY_SEAL);
+    assert!(FROZEN_PREPARED_HEADER_V14_READY_SEAL != FROZEN_PREPARED_HEADER_V10_READY_SEAL);
+    assert!(FROZEN_PREPARED_HEADER_V14_READY_SEAL != FROZEN_PREPARED_HEADER_V11_READY_SEAL);
+    assert!(FROZEN_PREPARED_HEADER_V14_READY_SEAL != FROZEN_PREPARED_HEADER_V12_READY_SEAL);
+    assert!(FROZEN_PREPARED_HEADER_V14_READY_SEAL != FROZEN_PREPARED_HEADER_V13_READY_SEAL);
     assert!(FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION != FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION);
     assert!(FROZEN_DYNAMIC_ROWS_V8_FORMAT_VERSION != FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION);
     assert!(FROZEN_DYNAMIC_ROWS_V8_FORMAT_VERSION != FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION);
@@ -3848,6 +4077,17 @@ const _: () = {
     assert!(FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION != FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION);
     assert!(FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION != FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION);
     assert!(FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION != FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION);
+    assert!(FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION != FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION);
+    assert!(FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION != FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION);
+    assert!(FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION != FROZEN_DYNAMIC_ROWS_V5_FORMAT_VERSION);
+    assert!(FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION != FROZEN_DYNAMIC_ROWS_V6_FORMAT_VERSION);
+    assert!(FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION != FROZEN_DYNAMIC_ROWS_V7_FORMAT_VERSION);
+    assert!(FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION != FROZEN_DYNAMIC_ROWS_V8_FORMAT_VERSION);
+    assert!(FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION != FROZEN_DYNAMIC_ROWS_V9_FORMAT_VERSION);
+    assert!(FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION != FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION);
+    assert!(FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION != FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION);
+    assert!(FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION != FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION);
+    assert!(FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION != FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION);
     assert!(
         (FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3
             | FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V4
@@ -3859,9 +4099,10 @@ const _: () = {
             | FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V10
             | FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V11
             | FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V12
-            | FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V13)
+            | FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V13
+            | FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V14)
             .count_ones()
-            == 11
+            == 12
     );
     assert!(
         FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V8
@@ -3904,6 +4145,10 @@ const _: () = {
             != FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V12
     );
     assert!(
+        FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V14
+            != FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V13
+    );
+    assert!(
         DYNAMIC_NATIVE_ROWS_V11_ANY_ACCEPT_MASK
             | DYNAMIC_NATIVE_ROWS_V11_ACCEPT_BACK_ONE_MASK
             | DYNAMIC_NATIVE_ROWS_V11_FIRST_DEAD_MASK
@@ -3914,6 +4159,12 @@ const _: () = {
         DYNAMIC_NATIVE_ROWS_V13_ANY_ACCEPT_MASK
             | DYNAMIC_NATIVE_ROWS_V13_ACCEPT_BACK_ONE_MASK
             | DYNAMIC_NATIVE_ROWS_V13_NEXT_BLOCK_TOKEN_MASK
+            == u16::MAX
+    );
+    assert!(
+        DYNAMIC_NATIVE_ROWS_V14_ANY_ACCEPT_MASK
+            | DYNAMIC_NATIVE_ROWS_V14_ACCEPT_DISTANCE_MASK
+            | DYNAMIC_NATIVE_ROWS_V14_NEXT_STATE_TOKEN_MASK
             == u16::MAX
     );
     assert!(std::mem::offset_of!(FrozenPreparedHeaderV5, v1) == 0);
@@ -3959,6 +4210,7 @@ const _: () = {
     assert!(FROZEN_PREPARED_HEADER_V11_BYTES == 448);
     assert!(FROZEN_PREPARED_HEADER_V12_BYTES == 448);
     assert!(FROZEN_PREPARED_HEADER_V13_BYTES == 448);
+    assert!(FROZEN_PREPARED_HEADER_V14_BYTES == 448);
 };
 
 impl FrozenPreparedHeaderV1 {
@@ -4104,6 +4356,10 @@ impl FrozenPreparedHeaderV3 {
             FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V13 => {
                 self.dynamic_rows_v3.format_version == FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION
                     && self.dynamic_rows_v3.ready_seal == FROZEN_PREPARED_HEADER_V13_READY_SEAL
+            }
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V14 => {
+                self.dynamic_rows_v3.format_version == FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION
+                    && self.dynamic_rows_v3.ready_seal == FROZEN_PREPARED_HEADER_V14_READY_SEAL
             }
             _ => false,
         }
@@ -4356,6 +4612,11 @@ impl FrozenPreparedHeaderV6 {
                 self.v1.header_bytes == FROZEN_PREPARED_HEADER_V13_BYTES
                     && rows.compact.format_version == FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION
                     && rows.compact.ready_seal == FROZEN_PREPARED_HEADER_V13_READY_SEAL
+            }
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V14 => {
+                self.v1.header_bytes == FROZEN_PREPARED_HEADER_V14_BYTES
+                    && rows.compact.format_version == FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION
+                    && rows.compact.ready_seal == FROZEN_PREPARED_HEADER_V14_READY_SEAL
             }
             _ => false,
         }
@@ -4963,9 +5224,22 @@ impl FrozenDynamicRowsStorageV3 {
             FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION => {
                 FrozenCompactRowsFormat::DensePairSupertransitionV13
             }
+            FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION => {
+                FrozenCompactRowsFormat::DenseQuadSupertransitionV14
+            }
             _ => return false,
         };
-        let physical_cells = if format.is_dense_pair_supertransition() {
+        let physical_cells = if format.is_quad_supertransition() {
+            if rows.row_shift != 0 {
+                return false;
+            }
+            let Some((_, _, _, _, block_cells, _, _)) =
+                frozen_quad_rows_v14_geometry(state_count, class_count)
+            else {
+                return false;
+            };
+            block_cells
+        } else if format.is_dense_pair_supertransition() {
             if rows.row_shift != 0 {
                 return false;
             }
@@ -5022,7 +5296,9 @@ impl FrozenDynamicRowsStorageV3 {
         let Some(live_cells) = state_count.checked_mul(physical_cells) else {
             return false;
         };
-        let token_extent_invalid = if format.is_dense_pair_supertransition() {
+        let token_extent_invalid = if format.is_quad_supertransition() {
+            state_count > usize::from(DYNAMIC_NATIVE_ROWS_V14_NEXT_STATE_TOKEN_MASK)
+        } else if format.is_dense_pair_supertransition() {
             live_cells > usize::from(DYNAMIC_NATIVE_ROWS_V13_NEXT_BLOCK_TOKEN_MASK)
         } else if format.is_pair_supertransition() {
             live_cells
@@ -5035,11 +5311,21 @@ impl FrozenDynamicRowsStorageV3 {
         } else {
             live_cells > usize::from(DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK)
         };
-        let owner_is_invalid = if format.is_dense_pair_supertransition() {
+        let owner_is_invalid = if format.is_quad_supertransition() {
+            self.quad_rows_v14.as_ref().is_none_or(|quad_rows| {
+                !self.rows.is_empty()
+                    || self.rows_u8.is_some()
+                    || self.pair_rows_v11.is_some()
+                    || self.pair_rows_v13.is_some()
+                    || rows.rows_address != quad_rows.as_ptr().expose_provenance()
+                    || live_cells != quad_rows.len()
+            })
+        } else if format.is_dense_pair_supertransition() {
             self.pair_rows_v13.as_ref().is_none_or(|pair_rows| {
                 !self.rows.is_empty()
                     || self.rows_u8.is_some()
                     || self.pair_rows_v11.is_some()
+                    || self.quad_rows_v14.is_some()
                     || rows.rows_address != pair_rows.as_ptr().expose_provenance()
                     || live_cells != pair_rows.len()
             })
@@ -5048,6 +5334,7 @@ impl FrozenDynamicRowsStorageV3 {
                 !self.rows.is_empty()
                     || self.rows_u8.is_some()
                     || self.pair_rows_v13.is_some()
+                    || self.quad_rows_v14.is_some()
                     || rows.rows_address != pair_rows.as_ptr().expose_provenance()
                     || live_cells != pair_rows.len()
             })
@@ -5056,6 +5343,7 @@ impl FrozenDynamicRowsStorageV3 {
                 !self.rows.is_empty()
                     || self.pair_rows_v11.is_some()
                     || self.pair_rows_v13.is_some()
+                    || self.quad_rows_v14.is_some()
                     || rows.rows_address != byte_rows.as_ptr().expose_provenance()
                     || live_cells != byte_rows.len()
             })
@@ -5063,6 +5351,7 @@ impl FrozenDynamicRowsStorageV3 {
             self.rows_u8.is_some()
                 || self.pair_rows_v11.is_some()
                 || self.pair_rows_v13.is_some()
+                || self.quad_rows_v14.is_some()
                 || rows.rows_address != self.rows.as_ptr().expose_provenance()
                 || live_cells != self.rows.len()
         };
@@ -5102,6 +5391,50 @@ impl FrozenDynamicRowsStorageV3 {
                 && (class_count != 256 || !frozen_dynamic_class_map_is_identity(&self.class_map)))
         {
             return false;
+        }
+
+        if format.is_quad_supertransition() {
+            let Some(quad_rows) = self.quad_rows_v14.as_ref() else {
+                return false;
+            };
+            let Some((quad, tail3, tail2, tail1, block_cells, total_cells, bytes)) =
+                frozen_quad_rows_v14_geometry(state_count, class_count)
+            else {
+                return false;
+            };
+            if physical_cells != block_cells
+                || live_cells != total_cells
+                || bytes > FROZEN_QUAD_ROWS_V14_MAX_BYTES
+            {
+                return false;
+            }
+            for block in quad_rows.chunks_exact(block_cells) {
+                let sections = [
+                    (0_usize, quad, 4_u16, true),
+                    (quad, tail3, 3, false),
+                    (quad + tail3, tail2, 2, false),
+                    (quad + tail3 + tail2, tail1, 1, false),
+                ];
+                for (start, count, length, permits_token) in sections {
+                    for &cell in &block[start..start + count] {
+                        let accepts = cell & DYNAMIC_NATIVE_ROWS_V14_ANY_ACCEPT_MASK != 0;
+                        let distance =
+                            (cell & DYNAMIC_NATIVE_ROWS_V14_ACCEPT_DISTANCE_MASK) >> 13;
+                        let token = cell & DYNAMIC_NATIVE_ROWS_V14_NEXT_STATE_TOKEN_MASK;
+                        if (!accepts && distance != 0)
+                            || distance >= length
+                            || (!permits_token && token != 0)
+                            || (token != 0 && usize::from(token) > state_count)
+                        {
+                            return false;
+                        }
+                    }
+                }
+            }
+            return self.unary_exists_first_accept_step.is_none()
+                && self.descriptor_v6.is_none()
+                && self.loop_index.is_empty()
+                && self.loop_scanners.is_empty();
         }
 
         if format.is_dense_pair_supertransition() {
@@ -5311,7 +5644,8 @@ impl FrozenDynamicRowsStorageV3 {
             | FrozenCompactRowsFormat::StateOrdinalDirectU8V10
             | FrozenCompactRowsFormat::PairSupertransitionV11
             | FrozenCompactRowsFormat::StateOrdinalMappedU8V12
-            | FrozenCompactRowsFormat::DensePairSupertransitionV13 => return false,
+            | FrozenCompactRowsFormat::DensePairSupertransitionV13
+            | FrozenCompactRowsFormat::DenseQuadSupertransitionV14 => return false,
         };
         let Some(live_cells) = state_count.checked_mul(physical_cells) else {
             return false;
@@ -5327,7 +5661,8 @@ impl FrozenDynamicRowsStorageV3 {
             | FrozenCompactRowsFormat::StateOrdinalDirectU8V10
             | FrozenCompactRowsFormat::PairSupertransitionV11
             | FrozenCompactRowsFormat::StateOrdinalMappedU8V12
-            | FrozenCompactRowsFormat::DensePairSupertransitionV13 => return false,
+            | FrozenCompactRowsFormat::DensePairSupertransitionV13
+            | FrozenCompactRowsFormat::DenseQuadSupertransitionV14 => return false,
         };
         if rows.compact != expected_compact
             || rows.reserved != 0
@@ -5378,7 +5713,8 @@ impl FrozenDynamicRowsStorageV3 {
                 | FrozenCompactRowsFormat::StateOrdinalDirectU8V10
                 | FrozenCompactRowsFormat::PairSupertransitionV11
                 | FrozenCompactRowsFormat::StateOrdinalMappedU8V12
-                | FrozenCompactRowsFormat::DensePairSupertransitionV13 => return false,
+                | FrozenCompactRowsFormat::DensePairSupertransitionV13
+                | FrozenCompactRowsFormat::DenseQuadSupertransitionV14 => return false,
             };
             let expected_index = slot
                 .checked_add(1)
@@ -5414,7 +5750,8 @@ impl FrozenDynamicRowsStorageV3 {
                 | FrozenCompactRowsFormat::StateOrdinalDirectU8V10
                 | FrozenCompactRowsFormat::PairSupertransitionV11
                 | FrozenCompactRowsFormat::StateOrdinalMappedU8V12
-                | FrozenCompactRowsFormat::DensePairSupertransitionV13 => return false,
+                | FrozenCompactRowsFormat::DensePairSupertransitionV13
+                | FrozenCompactRowsFormat::DenseQuadSupertransitionV14 => return false,
             };
             for byte in u8::MIN..=u8::MAX {
                 let word = usize::from(byte >> 6);
@@ -5451,7 +5788,8 @@ impl FrozenDynamicRowsStorageV3 {
                             | FrozenCompactRowsFormat::StateOrdinalDirectU8V10
                             | FrozenCompactRowsFormat::PairSupertransitionV11
                             | FrozenCompactRowsFormat::StateOrdinalMappedU8V12
-                            | FrozenCompactRowsFormat::DensePairSupertransitionV13 => false,
+                            | FrozenCompactRowsFormat::DensePairSupertransitionV13
+                            | FrozenCompactRowsFormat::DenseQuadSupertransitionV14 => false,
                         }
                     })
                 })
@@ -5470,7 +5808,9 @@ impl FrozenDynamicRowsStorageV3 {
     }
 
     fn live_cells(&self) -> usize {
-        if let Some(rows) = self.pair_rows_v13.as_ref() {
+        if let Some(rows) = self.quad_rows_v14.as_ref() {
+            rows.len()
+        } else if let Some(rows) = self.pair_rows_v13.as_ref() {
             rows.len()
         } else if let Some(rows) = self.pair_rows_v11.as_ref() {
             rows.len()
@@ -8053,8 +8393,10 @@ impl CompiledProgram {
     /// Build a pointer-stable immutable compact copy of one complete K0 root.
     /// V13 may replace scanner-free fixed-width rows with exact dense
     /// two-transition `u16` cells when its independent resident budget fits;
-    /// V11 is the wider fallback pair form. Otherwise V10/V12 use byte cells
-    /// whenever all state ordinals and inherited byte budgets fit; V4 is
+    /// V11 remains an authenticated compatibility pair form, but V13's exact
+    /// geometry and equally wide resident cap dominate it for C=2..=4.
+    /// Otherwise V10/V12 use byte cells whenever all state ordinals and
+    /// inherited byte budgets fit; V4 is
     /// preferred when cell offsets fit and larger tables retain V3. The class
     /// map is retained inline for publication.
     #[doc(hidden)]
@@ -8181,11 +8523,11 @@ impl CompiledProgram {
         // Perform this arbitration against the original K0 row geometry
         // before an optional raw-byte expansion changes the compact stride.
         // V5 is more specific than V6/V7, and V6/V7 are more profitable than
-        // V13/V11/V10/V12/V9/V8 for rows with loop evidence. V13 is then
-        // preferred over V11 and the one-symbol compact formats when its
-        // scanner-free fixed-width proof and independent resident budget both
-        // fit. General compact promotion remains the fallback when no
-        // specialized proof is retained.
+        // V14/V13/V11/V10/V12/V9/V8 for rows with loop evidence. V14 and V13
+        // are then preferred over V11 and the one-symbol compact formats when
+        // their scanner-free proofs and independent resident budgets fit.
+        // General compact promotion remains the fallback when no specialized
+        // proof is retained.
         let mut loop_candidates = [None; 4];
         let mut loop_candidate_count = 0usize;
         for plan in direct.learned_loop_plans() {
@@ -8257,6 +8599,63 @@ impl CompiledProgram {
                 .checked_add(loop_payload_bytes)
                 .is_some_and(|bytes| bytes <= max_packed_bytes);
 
+        // V14 amortizes four serial DFA transitions into one exact table
+        // access. Exact base-C blocks retain more state coverage than padded
+        // rows; one constant block-size multiply is paid only once per four
+        // bytes. Selection is entirely geometry/resource driven and remains
+        // scanner-free so no root or continuation boundary can be crossed.
+        if !unary_v5_eligible
+            && !retain_loop_extension
+            && dynamic_view.root_requirement.is_none()
+            && let Some((_, _, _, _, _, total_cells, quad_bytes)) =
+                frozen_quad_rows_v14_geometry(state_count, semantic_class_count)
+            && quad_bytes <= retained_bytes
+            && quad_bytes <= max_packed_bytes
+            && let Some(quad_rows_v14) = build_frozen_quad_rows_v14(
+                full.forward_rows(),
+                &columns,
+                source_class_count,
+                state_count,
+                source_initial_state,
+            )
+            && quad_rows_v14.len() == total_cells
+            && let Ok(state_count_u32) = u32::try_from(state_count)
+            && let Ok(class_count_u32) = u32::try_from(semantic_class_count)
+        {
+            let descriptor = FrozenDynamicRowsV3 {
+                ready_seal: 0,
+                rows_address: quad_rows_v14.as_ptr().expose_provenance(),
+                cache_identity: full.cache_identity(),
+                state_count: state_count_u32,
+                class_count: class_count_u32,
+                row_shift: 0,
+                initial_state: 0,
+                learned_loop_state_count: 0,
+                learned_loop_states: [u32::MAX; 4],
+                format_version: FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION,
+            };
+            let storage = FrozenDynamicRowsStorageV3 {
+                program_instance: self.identity.instance,
+                artifact_identity: self.identity.artifact,
+                rows: Box::default(),
+                rows_u8: None,
+                pair_rows_v11: None,
+                pair_rows_v13: None,
+                quad_rows_v14: Some(quad_rows_v14),
+                class_map: columns.class_map,
+                descriptor,
+                unary_exists_first_accept_step: None,
+                loop_index: Box::default(),
+                loop_scanners: Box::default(),
+                descriptor_v6: None,
+            };
+            if storage.descriptor_is_valid_for(self.identity)
+                && storage.descriptor_v6_is_valid_for(self.identity)
+            {
+                return Some(storage);
+            }
+        }
+
         // V13 is the dense two-symbol form. Its exact C^2 key space removes
         // V11's power-of-two padding and its u16 cell halves resident traffic.
         // Unary V5 and admitted V6/V7 loop owners retain priority. Pair
@@ -8300,6 +8699,7 @@ impl CompiledProgram {
                 rows_u8: None,
                 pair_rows_v11: None,
                 pair_rows_v13: Some(pair_rows_v13),
+                quad_rows_v14: None,
                 class_map: columns.class_map,
                 descriptor,
                 unary_exists_first_accept_step: None,
@@ -8359,6 +8759,7 @@ impl CompiledProgram {
                 rows_u8: None,
                 pair_rows_v11: Some(pair_rows_v11),
                 pair_rows_v13: None,
+                quad_rows_v14: None,
                 class_map: columns.class_map,
                 descriptor,
                 unary_exists_first_accept_step: None,
@@ -8524,7 +8925,8 @@ impl CompiledProgram {
                 | FrozenCompactRowsFormat::StateOrdinalDirectU8V10
                 | FrozenCompactRowsFormat::PairSupertransitionV11
                 | FrozenCompactRowsFormat::StateOrdinalMappedU8V12
-                | FrozenCompactRowsFormat::DensePairSupertransitionV13 => return None,
+                | FrozenCompactRowsFormat::DensePairSupertransitionV13
+                | FrozenCompactRowsFormat::DenseQuadSupertransitionV14 => return None,
             }
         } else {
             0
@@ -8553,7 +8955,8 @@ impl CompiledProgram {
                     | FrozenCompactRowsFormat::StateOrdinalDirectU8V10
                     | FrozenCompactRowsFormat::PairSupertransitionV11
                     | FrozenCompactRowsFormat::StateOrdinalMappedU8V12
-                    | FrozenCompactRowsFormat::DensePairSupertransitionV13 => return None,
+                    | FrozenCompactRowsFormat::DensePairSupertransitionV13
+                    | FrozenCompactRowsFormat::DenseQuadSupertransitionV14 => return None,
                 };
                 let plan_index = u8::try_from(loop_scanners.len().checked_add(1)?).ok()?;
                 let entry = loop_index.get_mut(key)?;
@@ -8579,7 +8982,8 @@ impl CompiledProgram {
                 | FrozenCompactRowsFormat::StateOrdinalDirectU8V10
                 | FrozenCompactRowsFormat::PairSupertransitionV11
                 | FrozenCompactRowsFormat::StateOrdinalMappedU8V12
-                | FrozenCompactRowsFormat::DensePairSupertransitionV13 => {
+                | FrozenCompactRowsFormat::DensePairSupertransitionV13
+                | FrozenCompactRowsFormat::DenseQuadSupertransitionV14 => {
                     unreachable!("loop retention excludes direct-byte formats")
                 }
             };
@@ -8618,6 +9022,7 @@ impl CompiledProgram {
             rows_u8,
             pair_rows_v11: None,
             pair_rows_v13: None,
+            quad_rows_v14: None,
             class_map,
             descriptor,
             unary_exists_first_accept_step,
@@ -8631,7 +9036,7 @@ impl CompiledProgram {
     }
 
     /// Publish either the existing retained V1 projection or an additive
-    /// compact V3/V4/V8/V9/V10/V11/V12/V13 sidecar. Retained static rows
+    /// compact V3/V4/V8/V9/V10/V11/V12/V13/V14 sidecar. Retained static rows
     /// always win, and V2 remains independently constructible for older
     /// prepared owners.
     #[doc(hidden)]
@@ -8674,9 +9079,25 @@ impl CompiledProgram {
             FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION => {
                 FrozenCompactRowsFormat::DensePairSupertransitionV13
             }
+            FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION => {
+                FrozenCompactRowsFormat::DenseQuadSupertransitionV14
+            }
             _ => return header,
         };
-        let physical_cells = if format.is_dense_pair_supertransition() {
+        let physical_cells = if format.is_quad_supertransition() {
+            let Ok(class_count) = usize::try_from(rows.class_count) else {
+                return header;
+            };
+            let Ok(state_count) = usize::try_from(rows.state_count) else {
+                return header;
+            };
+            let Some((_, _, _, _, block_cells, _, _)) =
+                frozen_quad_rows_v14_geometry(state_count, class_count)
+            else {
+                return header;
+            };
+            block_cells
+        } else if format.is_dense_pair_supertransition() {
             let Ok(class_count) = usize::try_from(rows.class_count) else {
                 return header;
             };
@@ -8751,13 +9172,21 @@ impl CompiledProgram {
             FrozenCompactRowsFormat::DensePairSupertransitionV13 => {
                 FROZEN_PREPARED_HEADER_V13_BYTES
             }
+            FrozenCompactRowsFormat::DenseQuadSupertransitionV14 => {
+                FROZEN_PREPARED_HEADER_V14_BYTES
+            }
         };
         header.v1.forward_rows_address = rows.rows_address;
         header.v1.forward_live_cells = storage.live_cells();
         header.v1.cache_identity = rows.cache_identity;
         header.v1.row_stride = row_stride;
         header.v1.forward_initial_row = 0;
-        if format.is_dense_pair_supertransition() {
+        if format.is_quad_supertransition() {
+            header.v1.unfilled_cell = 0;
+            header.v1.accept_mask = u32::from(DYNAMIC_NATIVE_ROWS_V14_ANY_ACCEPT_MASK);
+            header.v1.next_row_token_mask =
+                u32::from(DYNAMIC_NATIVE_ROWS_V14_NEXT_STATE_TOKEN_MASK);
+        } else if format.is_dense_pair_supertransition() {
             header.v1.unfilled_cell = 0;
             header.v1.accept_mask = u32::from(DYNAMIC_NATIVE_ROWS_V13_ANY_ACCEPT_MASK);
             header.v1.next_row_token_mask =
@@ -13791,8 +14220,8 @@ mod tests {
 
     /// Fixed-width correlated pairs whose complete DFA has three semantic
     /// byte columns but no nonaccepting learned-loop owner. This exercises the
-    /// general V11 arbitration path after the independently profitable V6/V7
-    /// loop formats have had a chance to claim their rows.
+    /// general dense-supertransition arbitration path after the independently
+    /// profitable V6/V7 loop formats have had a chance to claim their rows.
     fn scanner_free_nonloop_pair_raw() -> RawPlan {
         const BIT_COUNT: usize = 2;
         const ACCEPT: usize = BIT_COUNT + 1;
@@ -21741,6 +22170,283 @@ mod tests {
     #[test]
     #[allow(
         clippy::too_many_lines,
+        reason = "the four-byte model exhausts every two-state transition graph and all exact tails"
+    )]
+    fn frozen_quad_supertransition_v14_is_exhaustively_exact_for_small_models() {
+        assert!(frozen_quad_rows_v14_geometry(0, 2).is_none());
+        assert!(frozen_quad_rows_v14_geometry(1, 1).is_none());
+        assert!(frozen_quad_rows_v14_geometry(1, 5).is_none());
+        assert_eq!(
+            frozen_quad_rows_v14_geometry(1_088, 2),
+            Some((16, 8, 4, 2, 30, 32_640, 65_536))
+        );
+        assert!(frozen_quad_rows_v14_geometry(1_089, 2).is_none());
+        assert_eq!(
+            frozen_quad_rows_v14_geometry(272, 3),
+            Some((81, 27, 9, 3, 120, 32_640, 65_536))
+        );
+        assert!(frozen_quad_rows_v14_geometry(273, 3).is_none());
+        assert_eq!(
+            frozen_quad_rows_v14_geometry(96, 4),
+            Some((256, 64, 16, 4, 340, 32_640, 65_536))
+        );
+        assert!(frozen_quad_rows_v14_geometry(97, 4).is_none());
+
+        type ModelCell = (bool, Option<usize>);
+
+        fn scalar_selected_end(cells: &[ModelCell], input: &[u8]) -> Option<usize> {
+            let mut state = 0_usize;
+            let mut selected_end = None;
+            for (position, &class) in input.iter().enumerate() {
+                let (accepts, destination) = cells[state * 2 + usize::from(class)];
+                if accepts {
+                    selected_end = Some(position + 1);
+                }
+                let Some(destination) = destination else {
+                    break;
+                };
+                state = destination;
+            }
+            selected_end
+        }
+
+        fn quad_selected_end(rows: &[u16], input: &[u8]) -> Option<usize> {
+            let class_count = 2_usize;
+            let quad_cells = class_count.pow(4);
+            let tail3_cells = class_count.pow(3);
+            let tail2_cells = class_count.pow(2);
+            let tail1_cells = class_count;
+            let block_cells = quad_cells + tail3_cells + tail2_cells + tail1_cells;
+            let mut state = 0_usize;
+            let mut position = 0_usize;
+            let mut selected_end = None;
+            while position + 4 <= input.len() {
+                let key = input[position..position + 4]
+                    .iter()
+                    .fold(0_usize, |key, &class| {
+                        key * class_count + usize::from(class)
+                    });
+                let cell = rows[state * block_cells + key];
+                if cell & DYNAMIC_NATIVE_ROWS_V14_ANY_ACCEPT_MASK != 0 {
+                    let distance = usize::from(
+                        (cell & DYNAMIC_NATIVE_ROWS_V14_ACCEPT_DISTANCE_MASK) >> 13,
+                    );
+                    selected_end = Some(position + 4 - distance);
+                }
+                position += 4;
+                let token = cell & DYNAMIC_NATIVE_ROWS_V14_NEXT_STATE_TOKEN_MASK;
+                if token == 0 {
+                    return selected_end;
+                }
+                state = usize::from(token) - 1;
+            }
+            let length = input.len() - position;
+            if length == 0 {
+                return selected_end;
+            }
+            let section = match length {
+                3 => quad_cells,
+                2 => quad_cells + tail3_cells,
+                1 => quad_cells + tail3_cells + tail2_cells,
+                _ => unreachable!(),
+            };
+            let key = input[position..]
+                .iter()
+                .fold(0_usize, |key, &class| {
+                    key * class_count + usize::from(class)
+                });
+            let cell = rows[state * block_cells + section + key];
+            assert_eq!(cell & DYNAMIC_NATIVE_ROWS_V14_NEXT_STATE_TOKEN_MASK, 0);
+            if cell & DYNAMIC_NATIVE_ROWS_V14_ANY_ACCEPT_MASK != 0 {
+                let distance = usize::from(
+                    (cell & DYNAMIC_NATIVE_ROWS_V14_ACCEPT_DISTANCE_MASK) >> 13,
+                );
+                selected_end = Some(position + length - distance);
+            }
+            selected_end
+        }
+
+        let class_map: [u8; 256] = core::array::from_fn(|byte| u8::try_from(byte & 1).unwrap());
+        let mut source_classes = [0_u8; 256];
+        source_classes[1] = 1;
+        let columns = FrozenCompactColumnProjection {
+            class_count: 2,
+            source_classes,
+            class_map,
+        };
+        // Each of four transitions has six semantic values: dead/live-to-0/
+        // live-to-1 crossed with accepting/nonaccepting. Inputs through seven
+        // bytes cover dead edges at every main position, all four acceptance
+        // distances, and every exact one/two/three-byte tail.
+        for mut graph_code in 0_usize..6_usize.pow(4) {
+            let mut cells = Vec::with_capacity(4);
+            let mut source_rows = Vec::with_capacity(4);
+            for _ in 0..4 {
+                let category = graph_code % 6;
+                graph_code /= 6;
+                let accepts = category & 1 != 0;
+                let destination = match category / 2 {
+                    0 => None,
+                    1 => Some(0),
+                    2 => Some(1),
+                    _ => unreachable!(),
+                };
+                cells.push((accepts, destination));
+                source_rows.push(frozen_test_source_cell(destination, 2, accepts, 0));
+            }
+            let rows = build_frozen_quad_rows_v14(&source_rows, &columns, 2, 2, 0)
+                .expect("exact two-state four-byte table");
+            for length in 0_u32..=7 {
+                for input_bits in 0_usize..1_usize.checked_shl(length).unwrap() {
+                    let input: Vec<u8> = (0..length)
+                        .map(|index| u8::from(input_bits & (1 << index) != 0))
+                        .collect();
+                    assert_eq!(
+                        quad_selected_end(&rows, &input),
+                        scalar_selected_end(&cells, &input),
+                        "graph={cells:?}, input={input:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn frozen_quad_supertransition_v14_is_bounded_and_fail_closed() {
+        let compiled = program(
+            "ab",
+            OutputContract::Exists,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        let workspace = compiled.prepare_workspace().unwrap();
+        let state_count = 2_usize;
+        let class_count = 3_usize;
+        let (quad, tail3, tail2, _, block_cells, total_cells, _) =
+            frozen_quad_rows_v14_geometry(state_count, class_count).unwrap();
+        let quad_rows_v14 = vec![0_u16; total_cells].into_boxed_slice();
+        let class_map =
+            core::array::from_fn(|byte| u8::try_from(byte % class_count).unwrap());
+        let descriptor = FrozenDynamicRowsV3 {
+            ready_seal: 0,
+            rows_address: quad_rows_v14.as_ptr().expose_provenance(),
+            cache_identity: 1,
+            state_count: u32::try_from(state_count).unwrap(),
+            class_count: u32::try_from(class_count).unwrap(),
+            row_shift: 0,
+            initial_state: 0,
+            learned_loop_state_count: 0,
+            learned_loop_states: [u32::MAX; 4],
+            format_version: FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION,
+        };
+        let mut storage = FrozenDynamicRowsStorageV3 {
+            program_instance: compiled.identity.instance,
+            artifact_identity: compiled.identity.artifact,
+            rows: Box::default(),
+            rows_u8: None,
+            pair_rows_v11: None,
+            pair_rows_v13: None,
+            quad_rows_v14: Some(quad_rows_v14),
+            class_map,
+            descriptor,
+            unary_exists_first_accept_step: None,
+            loop_index: Box::default(),
+            loop_scanners: Box::default(),
+            descriptor_v6: None,
+        };
+        assert!(storage.descriptor_is_valid_for(compiled.identity));
+        let header = compiled.compiler_private_frozen_prepared_header_v3(
+            &workspace,
+            None,
+            Some(&storage),
+        );
+        assert!(header.has_dynamic_rows());
+        assert_eq!(header.v1.flags, FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V14);
+        assert_eq!(header.v1.header_bytes, FROZEN_PREPARED_HEADER_V14_BYTES);
+        assert_eq!(header.v1.forward_live_cells, total_cells);
+        assert_eq!(header.v1.row_stride, u32::try_from(block_cells).unwrap());
+        assert_eq!(header.v1.unfilled_cell, 0);
+        assert_eq!(
+            header.v1.accept_mask,
+            u32::from(DYNAMIC_NATIVE_ROWS_V14_ANY_ACCEPT_MASK)
+        );
+        assert_eq!(
+            header.v1.next_row_token_mask,
+            u32::from(DYNAMIC_NATIVE_ROWS_V14_NEXT_STATE_TOKEN_MASK)
+        );
+        assert_eq!(header.dynamic_rows_v3.ready_seal, FROZEN_PREPARED_HEADER_V14_READY_SEAL);
+
+        let valid_descriptor = storage.descriptor;
+        macro_rules! reject_descriptor {
+            ($mutation:block) => {{
+                storage.descriptor = valid_descriptor;
+                $mutation
+                assert!(!storage.descriptor_is_valid_for(compiled.identity));
+            }};
+        }
+        reject_descriptor!({ storage.descriptor.rows_address = 0; });
+        reject_descriptor!({ storage.descriptor.cache_identity = 0; });
+        reject_descriptor!({ storage.descriptor.state_count = 0; });
+        reject_descriptor!({ storage.descriptor.class_count = 1; });
+        reject_descriptor!({ storage.descriptor.class_count = 5; });
+        reject_descriptor!({ storage.descriptor.row_shift = 1; });
+        reject_descriptor!({ storage.descriptor.initial_state = 1; });
+        reject_descriptor!({ storage.descriptor.learned_loop_state_count = 1; });
+        reject_descriptor!({ storage.descriptor.format_version = FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION; });
+        storage.descriptor = valid_descriptor;
+
+        storage.rows = vec![0_u16].into_boxed_slice();
+        assert!(!storage.descriptor_is_valid_for(compiled.identity));
+        storage.rows = Box::default();
+        storage.pair_rows_v11 = Some(vec![0_u32].into_boxed_slice());
+        assert!(!storage.descriptor_is_valid_for(compiled.identity));
+        storage.pair_rows_v11 = None;
+        storage.pair_rows_v13 = Some(vec![0_u16].into_boxed_slice());
+        assert!(!storage.descriptor_is_valid_for(compiled.identity));
+        storage.pair_rows_v13 = None;
+        let owned_quads = core::mem::take(&mut storage.quad_rows_v14);
+        assert!(!storage.descriptor_is_valid_for(compiled.identity));
+        storage.quad_rows_v14 = owned_quads;
+
+        for (index, malformed) in [
+            (0, 1_u16 << 13),
+            (0, u16::try_from(state_count + 1).unwrap()),
+            (quad, 1),
+            (quad, DYNAMIC_NATIVE_ROWS_V14_ANY_ACCEPT_MASK | (3 << 13)),
+            (
+                quad + tail3,
+                DYNAMIC_NATIVE_ROWS_V14_ANY_ACCEPT_MASK | (2 << 13),
+            ),
+            (
+                quad + tail3 + tail2,
+                DYNAMIC_NATIVE_ROWS_V14_ANY_ACCEPT_MASK | (1 << 13),
+            ),
+        ] {
+            let original = storage.quad_rows_v14.as_ref().unwrap()[index];
+            storage.quad_rows_v14.as_mut().unwrap()[index] = malformed;
+            assert!(
+                !storage.descriptor_is_valid_for(compiled.identity),
+                "malformed V14 cell at {index}"
+            );
+            storage.quad_rows_v14.as_mut().unwrap()[index] = original;
+        }
+        assert!(storage.descriptor_is_valid_for(compiled.identity));
+
+        let mut cross_generation = header;
+        cross_generation.v1.flags = FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V13;
+        assert!(!cross_generation.has_dynamic_rows());
+        cross_generation = compiled.compiler_private_frozen_prepared_header_v3(
+            &workspace,
+            None,
+            Some(&storage),
+        );
+        cross_generation.dynamic_rows_v3.ready_seal = FROZEN_PREPARED_HEADER_V13_READY_SEAL;
+        assert!(!cross_generation.has_dynamic_rows());
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
         reason = "the dense pair model exhausts every two-state transition graph and short binary input"
     )]
     fn frozen_dense_pair_supertransition_v13_is_exhaustively_exact_for_small_models() {
@@ -21939,6 +22645,7 @@ mod tests {
             rows_u8: None,
             pair_rows_v11: None,
             pair_rows_v13: Some(pair_rows_v13),
+            quad_rows_v14: None,
             class_map,
             descriptor,
             unary_exists_first_accept_step: None,
@@ -23052,6 +23759,7 @@ mod tests {
                 rows_u8: None,
                 pair_rows_v11: None,
                 pair_rows_v13: None,
+                quad_rows_v14: None,
                 class_map,
                 descriptor,
                 unary_exists_first_accept_step: None,
@@ -23210,6 +23918,7 @@ mod tests {
             rows_u8: Some(byte_rows),
             pair_rows_v11: None,
             pair_rows_v13: None,
+            quad_rows_v14: None,
             class_map: core::array::from_fn(|byte| u8::try_from(byte).unwrap()),
             descriptor,
             unary_exists_first_accept_step: None,
@@ -23323,6 +24032,7 @@ mod tests {
             rows_u8: None,
             pair_rows_v11: None,
             pair_rows_v13: None,
+            quad_rows_v14: None,
             class_map,
             descriptor,
             unary_exists_first_accept_step: None,
@@ -23387,6 +24097,7 @@ mod tests {
                         | FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V11
                         | FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V12
                         | FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V13
+                        | FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V14
                 ),
                 "unexpected compact generation for {label}"
             );
@@ -23426,7 +24137,7 @@ mod tests {
         );
         assert_eq!(
             assert_promoted(&no_sidecar, "fresh fast no-sidecar program"),
-            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V13
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V14
         );
         let restored_no_sidecar =
             CompiledProgram::deserialize(&no_sidecar.serialize().unwrap()).unwrap();
@@ -23436,7 +24147,7 @@ mod tests {
         ));
         assert_eq!(
             assert_promoted(&restored_no_sidecar, "restored fast no-sidecar program"),
-            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V13
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V14
         );
 
         let mandatory_cut = program(
@@ -23966,9 +24677,38 @@ mod tests {
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "one pair-format ownership audit covers dense V13 selection and preserved V11 corruption rejection"
+        reason = "one ownership audit covers V14 precedence, V13/V11 resource dominance, and the preserved V11 ABI"
     )]
-    fn pair_supertransition_v11_is_scanner_free_bounded_and_fail_closed() {
+    fn dense_supertransitions_dominate_v11_while_its_abi_remains_fail_closed() {
+        // Under the shared 64-KiB resident cap, every V11-eligible C=2..=4
+        // table also admits V13. V13 uses no padding and half-width cells, so
+        // general arbitration must never choose the inferior compatibility
+        // format merely to manufacture V11 coverage.
+        for class_count in
+            FROZEN_PAIR_ROWS_V11_MIN_CLASSES..=FROZEN_PAIR_ROWS_V11_MAX_CLASSES
+        {
+            let (_, _, block_words, _, _) =
+                frozen_pair_rows_v11_geometry(1, class_count).unwrap();
+            let maximum_v11_states = FROZEN_PAIR_ROWS_V11_MAX_BYTES
+                .checked_sub(256)
+                .and_then(|bytes| bytes.checked_div(core::mem::size_of::<u32>()))
+                .and_then(|words| words.checked_div(block_words))
+                .unwrap();
+            assert_ne!(maximum_v11_states, 0);
+            for state_count in 1..=maximum_v11_states {
+                let (_, _, _, v11_words, v11_bytes) =
+                    frozen_pair_rows_v11_geometry(state_count, class_count)
+                        .expect("V11 resident-cap geometry");
+                assert!(v11_bytes <= FROZEN_PAIR_ROWS_V11_MAX_BYTES);
+                let (_, _, v13_cells, v13_bytes) =
+                    frozen_pair_rows_v13_geometry(state_count, class_count)
+                        .expect("every admitted V11 table must admit denser V13");
+                assert!(v13_cells <= v11_words);
+                assert!(v13_bytes <= v11_bytes);
+                assert!(v13_bytes <= FROZEN_PAIR_ROWS_V13_MAX_BYTES);
+            }
+        }
+
         for output in [
             OutputContract::Exists,
             OutputContract::SelectedEnd,
@@ -23988,13 +24728,29 @@ mod tests {
             assert_eq!(dynamic.exact_match_width, Some(2), "{output:?}");
             let workspace = compiled.prepare_workspace().unwrap();
             let retained_bytes = workspace.compiler_private_k0_retained_bytes();
-            let storage = compiled
+            let broad_storage = compiled
                 .compiler_private_frozen_dynamic_rows_storage_v3(
                     &workspace,
                     retained_bytes,
                     usize::MAX,
                 )
-                .unwrap_or_else(|| panic!("V13 storage for {output:?}"));
+                .unwrap_or_else(|| panic!("V14 storage for {output:?}"));
+            assert_eq!(
+                broad_storage.descriptor.format_version,
+                FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION,
+                "{output:?}"
+            );
+            let state_count = usize::try_from(broad_storage.descriptor.state_count).unwrap();
+            let class_count = usize::try_from(broad_storage.descriptor.class_count).unwrap();
+            let (_, block_cells, total_cells, pair_bytes) =
+                frozen_pair_rows_v13_geometry(state_count, class_count).unwrap();
+            let storage = compiled
+                .compiler_private_frozen_dynamic_rows_storage_v3(
+                    &workspace,
+                    retained_bytes,
+                    pair_bytes,
+                )
+                .unwrap_or_else(|| panic!("exact-budget V13 storage for {output:?}"));
             assert_eq!(
                 storage.descriptor.format_version,
                 FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION,
@@ -24160,6 +24916,7 @@ mod tests {
             rows_u8: None,
             pair_rows_v11: Some(pair_rows_v11),
             pair_rows_v13: None,
+            quad_rows_v14: None,
             class_map,
             descriptor,
             unary_exists_first_accept_step: None,
