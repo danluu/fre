@@ -8704,6 +8704,27 @@ fn select_k0_finite_suffix_direct_route(
     None
 }
 
+#[inline]
+fn k0_finite_suffix_exact_loss_backoff_pending(
+    state: &K0NegativePrefilterState,
+    window: SearchWindow,
+) -> bool {
+    // A negative-first session never creates a suffix class, so keep that hot
+    // path to one predictable load. Once a positive call has compared and
+    // rejected the exact route, recover the incumbent's existing direct
+    // backoff before entering an independent whole-window prefilter.
+    if state.classes[0].window_size_class.is_none() {
+        return false;
+    }
+    let Some(window_bytes) = window.end().checked_sub(window.start()) else {
+        return false;
+    };
+    let window_size_class = usize::BITS - window_bytes.leading_zeros();
+    state.classes.iter().any(|class| {
+        class.window_size_class == Some(window_size_class) && class.disabled_calls != 0
+    })
+}
+
 fn select_k0_finite_suffix_route(
     state: &mut K0NegativePrefilterClassState,
 ) -> K0FiniteSuffixRoute {
@@ -11622,6 +11643,42 @@ impl<'r> PortableSearchSession<'r> {
                             *mandatory_suffix_span_state = suffix_state_after_success;
                         }
                         return result;
+                    }
+                }
+                if let Some(suffix) = deferred_finite_span_only {
+                    if k0_finite_suffix_exact_loss_backoff_pending(
+                        &suffix_state_after_success,
+                        window,
+                    ) {
+                        let maximum_match_bytes = suffix
+                            .finite_span_only_maximum_match_bytes()
+                            .expect("deferred finite Span suffix retains its maximum width");
+                        if matches!(
+                            select_k0_finite_suffix_direct_route(
+                                session,
+                                &mut suffix_state_after_success,
+                                maximum_match_bytes,
+                                haystack.len(),
+                                window,
+                                limits,
+                                true,
+                            ),
+                            Some(K0FiniteSuffixDirectRoute::ExactLossBackoff)
+                        ) {
+                            let result = session
+                                .search_span_value(haystack, window, limits)
+                                .map(|found| {
+                                    found.map(|span| Match {
+                                        start: span.start(),
+                                        end: span.end(),
+                                    })
+                                })
+                                .map_err(SearchError::from);
+                            if result.is_ok() {
+                                *mandatory_suffix_span_state = suffix_state_after_success;
+                            }
+                            return result;
+                        }
                     }
                 }
                 let attempt = run_k0_negative_prefilter(
@@ -14598,9 +14655,10 @@ mod tests {
                 .is_some(),
         );
         let window_size_class = usize::BITS - haystack.len().leading_zeros();
-        let suffix_after_positive = match &mut session.plan {
+        let (suffix_after_positive, prefilter_before_backoff) = match &mut session.plan {
             PortableSearchSessionPlan::K0 {
                 mandatory_suffix_span_state,
+                negative_prefilter_span_state,
                 ..
             } => {
                 let class_index = mandatory_suffix_span_state
@@ -14627,13 +14685,112 @@ mod tests {
                     0,
                     "the explicit loss primes bounded direct backoff",
                 );
-                *mandatory_suffix_span_state
+                (
+                    *mandatory_suffix_span_state,
+                    *negative_prefilter_span_state,
+                )
             }
             PortableSearchSessionPlan::Native(_) => {
                 panic!("finite long-suffix prefilter session did not retain K0")
             }
         };
 
+        assert!(
+            session
+                .find_window_value(&haystack, SearchWindow::full(&haystack), limited)
+                .is_err(),
+            "a limited call refuses while the learned backoff remains staged",
+        );
+        let states_after_pending_error = match &session.plan {
+            PortableSearchSessionPlan::K0 {
+                mandatory_suffix_span_state,
+                negative_prefilter_span_state,
+                ..
+            } => (
+                *mandatory_suffix_span_state,
+                *negative_prefilter_span_state,
+            ),
+            PortableSearchSessionPlan::Native(_) => {
+                panic!("finite long-suffix prefilter session did not retain K0")
+            }
+        };
+        assert_eq!(
+            states_after_pending_error,
+            (suffix_after_positive, prefilter_before_backoff),
+            "an error publishes neither the pending backoff nor prefilter state",
+        );
+
+        haystack[4_000..4_007].fill(b'q');
+        assert_eq!(haystack.as_ptr(), address);
+        assert_eq!(
+            session
+                .find_window_value(
+                    &haystack,
+                    SearchWindow::full(&haystack),
+                    SearchLimits::unlimited(),
+                )
+                .unwrap(),
+            None,
+        );
+        let (suffix_after_changed_backoff, prefilter_after_changed_backoff) =
+            match &session.plan {
+                PortableSearchSessionPlan::K0 {
+                    mandatory_suffix_span_state,
+                    negative_prefilter_span_state,
+                    ..
+                } => (
+                    *mandatory_suffix_span_state,
+                    *negative_prefilter_span_state,
+                ),
+                PortableSearchSessionPlan::Native(_) => {
+                    panic!("finite long-suffix prefilter session did not retain K0")
+                }
+            };
+        let class_index = suffix_after_changed_backoff
+            .classes
+            .iter()
+            .position(|class| class.window_size_class == Some(window_size_class))
+            .expect("the changed-source backoff retained its suffix size class");
+        assert_eq!(
+            suffix_after_changed_backoff.classes[class_index].disabled_calls,
+            suffix_after_positive.classes[class_index]
+                .disabled_calls
+                .saturating_sub(1),
+            "the changed-source backoff consumes exactly one retry",
+        );
+        assert_eq!(
+            prefilter_after_changed_backoff, prefilter_before_backoff,
+            "a learned backoff does not consult the prefilter after mutation",
+        );
+
+        haystack[4_000..4_007].copy_from_slice(b"abcdXYZ");
+        assert_eq!(haystack.as_ptr(), address);
+        let (suffix_before_positive_backoff, prefilter_before_positive_backoff) =
+            match &mut session.plan {
+                PortableSearchSessionPlan::K0 {
+                    mandatory_suffix_span_state,
+                    negative_prefilter_span_state,
+                    ..
+                } => {
+                    let class_index = mandatory_suffix_span_state
+                        .classes
+                        .iter()
+                        .position(|class| {
+                            class.window_size_class == Some(window_size_class)
+                        })
+                        .expect("the positive backoff retained its suffix size class");
+                    observe_k0_finite_suffix_loss(
+                        &mut mandatory_suffix_span_state.classes[class_index],
+                    );
+                    (
+                        *mandatory_suffix_span_state,
+                        *negative_prefilter_span_state,
+                    )
+                }
+                PortableSearchSessionPlan::Native(_) => {
+                    panic!("finite long-suffix prefilter session did not retain K0")
+                }
+            };
         assert!(
             session
                 .find_window_value(
@@ -14644,9 +14801,10 @@ mod tests {
                 .unwrap()
                 .is_some(),
         );
-        let suffix_after_backoff = match &mut session.plan {
+        let (_suffix_after_backoff, prefilter_after_backoff) = match &session.plan {
             PortableSearchSessionPlan::K0 {
                 mandatory_suffix_span_state,
+                negative_prefilter_span_state,
                 ..
             } => {
                 let class_index = mandatory_suffix_span_state
@@ -14656,7 +14814,7 @@ mod tests {
                     .expect("the backoff call retained its suffix size class");
                 assert_eq!(
                     mandatory_suffix_span_state.classes[class_index].disabled_calls,
-                    suffix_after_positive.classes[class_index]
+                    suffix_before_positive_backoff.classes[class_index]
                         .disabled_calls
                         .saturating_sub(1),
                     "the Present backoff call consumes exactly one retry",
@@ -14666,6 +14824,56 @@ mod tests {
                         & super::K0_FINITE_SUFFIX_EXACT_ROUTE,
                     0,
                 );
+                (
+                    *mandatory_suffix_span_state,
+                    *negative_prefilter_span_state,
+                )
+            }
+            PortableSearchSessionPlan::Native(_) => {
+                panic!("finite long-suffix prefilter session did not retain K0")
+            }
+        };
+        assert_eq!(
+            prefilter_after_backoff, prefilter_before_positive_backoff,
+            "an exact-loss backoff returns directly to K0 before the prefilter",
+        );
+
+        for _ in 0..=usize::from(super::K0_NEGATIVE_PREFILTER_MAX_DISABLED_CALLS) {
+            let pending = match &session.plan {
+                PortableSearchSessionPlan::K0 {
+                    mandatory_suffix_span_state,
+                    ..
+                } => super::k0_finite_suffix_exact_loss_backoff_pending(
+                    mandatory_suffix_span_state,
+                    SearchWindow::full(&haystack),
+                ),
+                PortableSearchSessionPlan::Native(_) => {
+                    panic!("finite long-suffix prefilter session did not retain K0")
+                }
+            };
+            if !pending {
+                break;
+            }
+            assert!(
+                session
+                    .find_window_value(
+                        &haystack,
+                        SearchWindow::full(&haystack),
+                        SearchLimits::unlimited(),
+                    )
+                    .unwrap()
+                    .is_some(),
+            );
+        }
+        let suffix_after_drained_backoff = match &session.plan {
+            PortableSearchSessionPlan::K0 {
+                mandatory_suffix_span_state,
+                ..
+            } => {
+                assert!(!super::k0_finite_suffix_exact_loss_backoff_pending(
+                    mandatory_suffix_span_state,
+                    SearchWindow::full(&haystack),
+                ));
                 *mandatory_suffix_span_state
             }
             PortableSearchSessionPlan::Native(_) => {
@@ -14695,7 +14903,7 @@ mod tests {
             }
         };
         assert_eq!(
-            suffix_after_second_negative, suffix_after_backoff,
+            suffix_after_second_negative, suffix_after_drained_backoff,
             "an absent incumbent leaves prior reverse history untouched",
         );
     }
