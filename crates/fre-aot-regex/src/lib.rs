@@ -450,9 +450,8 @@ pub fn compile_raw_with_line_terminator(
                     resource: CompileResource::ObjectBytes,
                     ..
                 }) => {
-                    let fallback = match CompiledModule::lower(&program, target) {
-                        Ok(fallback) => fallback,
-                        Err(_) => return Err(error.into()),
+                    let Ok(fallback) = CompiledModule::lower(&program, target) else {
+                        return Err(error.into());
                     };
                     match emit_object(&fallback, format, limits.max_object_bytes) {
                         Ok(object) => (fallback, object),
