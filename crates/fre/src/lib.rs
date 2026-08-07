@@ -10635,6 +10635,64 @@ impl<'p, 's, 'a, 'h> K0PackedFrontierExistsReceipt<'p, 's, 'a, 'h> {
     }
 }
 
+#[inline(never)]
+fn execute_k0_packed_frontier_exists_slow<F>(
+    receipt: K0PackedFrontierExistsReceipt<'_, '_, '_, '_>,
+    state: &mut K0PackedFrontierExistsState,
+    expired_exact_class: Option<usize>,
+    execute_incumbent: F,
+) -> Result<bool, SearchError>
+where
+    F: FnOnce(
+        &mut K0SearchSession<'_>,
+        &[u8],
+        SearchWindow,
+        SearchLimits,
+        Option<&mut K0PackedFrontierIncumbentObservation>,
+    ) -> Result<bool, SearchError>,
+{
+    // Route selection and observations remain speculative until the sole
+    // authoritative executor succeeds. Errors preserve the complete policy
+    // state, including a pending incumbent retry or expired content witness.
+    let mut state_after_success = *state;
+    if let Some(class_index) = expired_exact_class {
+        state_after_success.expire_exact_floor_direct(class_index);
+    }
+    let route = state_after_success.select(receipt.window);
+    let output = match route {
+        K0PackedFrontierExistsRoute::Packed { class_index } => {
+            let window = receipt.window;
+            let attempt = receipt.execute_packed(execute_incumbent)?;
+            state_after_success.observe_packed(class_index, window, attempt.observation);
+            attempt.output
+        }
+        K0PackedFrontierExistsRoute::Incumbent {
+            class_index,
+            packed_positive,
+            trial,
+        } => {
+            let mut incumbent_observation =
+                K0PackedFrontierIncumbentObservation::Incomparable;
+            let output = execute_incumbent(
+                &mut *receipt.session,
+                receipt.haystack,
+                receipt.window,
+                receipt.search_limits,
+                Some(&mut incumbent_observation),
+            )?;
+            state_after_success.observe_incumbent(
+                class_index,
+                packed_positive,
+                trial,
+                incumbent_observation,
+            );
+            output
+        }
+    };
+    *state = state_after_success;
+    Ok(output)
+}
+
 fn execute_k0_packed_frontier_exists_route<F>(
     receipt: K0PackedFrontierExistsReceipt<'_, '_, '_, '_>,
     state: &mut K0PackedFrontierExistsState,
@@ -10675,27 +10733,36 @@ where
             // A changed current source invalidates the exact-floor theorem.
             // Reprobe Packed on this boundary call and publish both the reset
             // and its new observation only after its executor succeeds.
-            let mut state_after_success = *state;
-            state_after_success.expire_exact_floor_direct(class_index);
-            let window = receipt.window;
-            let attempt = receipt.execute_packed(execute_incumbent)?;
-            state_after_success.observe_packed(class_index, window, attempt.observation);
-            *state = state_after_success;
-            return Ok(attempt.output);
+            return execute_k0_packed_frontier_exists_slow(
+                receipt,
+                state,
+                Some(class_index),
+                execute_incumbent,
+            );
+        }
+        if structural_direct {
+            let output = execute_incumbent(
+                &mut *receipt.session,
+                receipt.haystack,
+                receipt.window,
+                receipt.search_limits,
+                None,
+            )?;
+            state.observe_retained_incumbent(
+                class_index,
+                packed_positive,
+                K0PackedFrontierIncumbentObservation::Incomparable,
+            );
+            return Ok(output);
         }
         let mut incumbent_observation =
             K0PackedFrontierIncumbentObservation::Incomparable;
-        let measure_incumbent = if structural_direct {
-            None
-        } else {
-            Some(&mut incumbent_observation)
-        };
         let output = execute_incumbent(
             &mut *receipt.session,
             receipt.haystack,
             receipt.window,
             receipt.search_limits,
-            measure_incumbent,
+            Some(&mut incumbent_observation),
         )?;
         state.observe_retained_incumbent(
             class_index,
@@ -10704,43 +10771,7 @@ where
         );
         return Ok(output);
     }
-    // Route selection and observations remain speculative until the sole
-    // authoritative executor succeeds. Errors preserve the complete policy
-    // state, including a pending incumbent retry.
-    let mut state_after_success = *state;
-    let route = state_after_success.select(receipt.window);
-    let output = match route {
-        K0PackedFrontierExistsRoute::Packed { class_index } => {
-            let window = receipt.window;
-            let attempt = receipt.execute_packed(execute_incumbent)?;
-            state_after_success.observe_packed(class_index, window, attempt.observation);
-            attempt.output
-        }
-        K0PackedFrontierExistsRoute::Incumbent {
-            class_index,
-            packed_positive,
-            trial,
-        } => {
-            let mut incumbent_observation =
-                K0PackedFrontierIncumbentObservation::Incomparable;
-            let output = execute_incumbent(
-                &mut *receipt.session,
-                receipt.haystack,
-                receipt.window,
-                receipt.search_limits,
-                Some(&mut incumbent_observation),
-            )?;
-            state_after_success.observe_incumbent(
-                class_index,
-                packed_positive,
-                trial,
-                incumbent_observation,
-            );
-            output
-        }
-    };
-    *state = state_after_success;
-    Ok(output)
+    execute_k0_packed_frontier_exists_slow(receipt, state, None, execute_incumbent)
 }
 
 // A negative literal pass pays for itself only on a reusable, sufficiently
