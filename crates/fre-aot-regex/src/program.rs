@@ -13789,6 +13789,66 @@ mod tests {
         }
     }
 
+    /// Fixed-width correlated pairs whose complete DFA has three semantic
+    /// byte columns but no nonaccepting learned-loop owner. This exercises the
+    /// general V11 arbitration path after the independently profitable V6/V7
+    /// loop formats have had a chance to claim their rows.
+    fn scanner_free_nonloop_pair_raw() -> RawPlan {
+        const BIT_COUNT: usize = 2;
+        const ACCEPT: usize = BIT_COUNT + 1;
+
+        let mut roles = Vec::with_capacity(ACCEPT + 1);
+        roles.extend(std::iter::repeat_n(StateRole::Consume, ACCEPT));
+        roles.push(StateRole::Accept);
+
+        let mut edge_offsets = Vec::with_capacity(roles.len() + 1);
+        let mut edge_targets = Vec::new();
+        let mut edge_kinds = Vec::new();
+        let mut byte_starts = Vec::new();
+        let mut byte_ends = Vec::new();
+        edge_offsets.push(0);
+
+        let column_codes: [usize; 256] =
+            core::array::from_fn(|byte| byte % ((1_usize << BIT_COUNT) - 1) + 1);
+        for byte in u8::MIN..=u8::MAX {
+            let code = column_codes[usize::from(byte)];
+            let bit = usize::try_from(code.trailing_zeros()).unwrap();
+            edge_targets.push(u32::try_from(bit + 1).unwrap());
+            edge_kinds.push(EdgeKind::ByteRange);
+            byte_starts.push(byte);
+            byte_ends.push(byte);
+        }
+        edge_offsets.push(u32::try_from(edge_targets.len()).unwrap());
+
+        // An unanchored restart can return to a selected bit-state only on a
+        // byte whose semantic code carries that bit. Such a self-loop accepts,
+        // so it cannot become a nonaccepting V6/V7 scan owner.
+        for bit in 0..BIT_COUNT {
+            for byte in u8::MIN..=u8::MAX {
+                let code = column_codes[usize::from(byte)];
+                if code & (1_usize << bit) == 0 {
+                    continue;
+                }
+                edge_targets.push(u32::try_from(ACCEPT).unwrap());
+                edge_kinds.push(EdgeKind::ByteRange);
+                byte_starts.push(byte);
+                byte_ends.push(byte);
+            }
+            edge_offsets.push(u32::try_from(edge_targets.len()).unwrap());
+        }
+        edge_offsets.push(u32::try_from(edge_targets.len()).unwrap());
+
+        RawPlan {
+            start: 0,
+            roles,
+            edge_offsets,
+            edge_targets,
+            edge_kinds,
+            byte_starts,
+            byte_ends,
+        }
+    }
+
     fn dynamic_rows(workspace: &ProgramWorkspace) -> &DynamicNativeRowsWorkspace {
         workspace
             .dynamic_native_rows
