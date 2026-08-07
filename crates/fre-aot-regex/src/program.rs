@@ -7090,7 +7090,8 @@ impl CompiledProgram {
     /// mutable first-miss handoff and resets adaptive deopt state. Any stale or
     /// malformed callback consumes the outstanding ticket, records the same
     /// deopt feedback as the established whole-window side exit, and completes
-    /// through the canonical optimizing executor on the admitted window.
+    /// through the canonical post-cut or ordinary executor on the admitted
+    /// window.
     #[doc(hidden)]
     #[allow(
         clippy::too_many_arguments,
@@ -7486,6 +7487,11 @@ impl CompiledProgram {
     #[cfg(test)]
     pub(crate) const fn has_retained_partial_dfa(&self) -> bool {
         self.optimization_sidecar.has_partial_dfa()
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn has_nfa_mandatory_cut(&self) -> bool {
+        self.nfa_mandatory_cut.is_some()
     }
 
     fn search_nfa(

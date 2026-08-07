@@ -25951,8 +25951,8 @@ mod tests {
                 );
                 assert_eq!(
                     module.required_prepared_dynamic_rows_continue_runtime_symbol(),
-                    None,
-                    "root scanner must retain whole-window deopt: {target:?}/{output:?}"
+                    Some(DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL_NAME),
+                    "root scanner must publish exact first-hole continuation: {target:?}/{output:?}"
                 );
                 let expected_accelerator = match target.architecture {
                     Architecture::X86_64 => match x86_start_filter_kind(target.features) {
@@ -29372,6 +29372,60 @@ mod tests {
                 },
             ],
         );
+
+        let cut_pattern = "[b-c][a-b]{1,10}7[A-Za-z]{1,2}";
+        let cut_window_start = 3_usize;
+        let cut_candidate = PARTIAL_DFA_MIN_INPUT_BYTES + 17;
+        let cut_window_end = cut_candidate + 8;
+        let cut_window = SearchWindow::new(cut_window_start, cut_window_end);
+        let mut cut_warm = vec![b'!'; cut_window_end + 2];
+        cut_warm[cut_candidate..cut_candidate + 5].copy_from_slice(b"ba7AZ");
+        let mut cut_match = cut_warm.clone();
+        cut_match[cut_candidate..cut_candidate + 5].copy_from_slice(b"ca7AZ");
+        let mut cut_no_match = cut_warm.clone();
+        cut_no_match[cut_candidate..cut_candidate + 5].copy_from_slice(b"cx7AZ");
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let cut = complete_forward_resource_fallback(cut_pattern, output, target);
+            let view = cut
+                .program()
+                .native_dynamic_rows_view()
+                .expect("mandatory-cut dynamic view");
+            assert!(view.root_requirement.is_some());
+            assert!(cut.program().has_nfa_mandatory_cut());
+            assert!(!cut.program().has_nfa_exact_product());
+            let (expected_start, expected_end) = match output {
+                OutputContract::Exists => (0, 0),
+                OutputContract::SelectedEnd => (cut_candidate + 5, cut_candidate + 5),
+                OutputContract::Span => (cut_candidate, cut_candidate + 5),
+            };
+            link_real_dynamic_first_hole_cases(
+                cut.program(),
+                target,
+                true,
+                &format!("CutRoot{output:?}"),
+                cut_window,
+                &[
+                    LinkedDynamicFirstHoleCase {
+                        warm: &cut_warm,
+                        novel: &cut_match,
+                        expected_status: 1,
+                        expected_start,
+                        expected_end,
+                    },
+                    LinkedDynamicFirstHoleCase {
+                        warm: &cut_warm,
+                        novel: &cut_no_match,
+                        expected_status: 0,
+                        expected_start: 0,
+                        expected_end: 0,
+                    },
+                ],
+            );
+        }
     }
 
     #[cfg(all(
