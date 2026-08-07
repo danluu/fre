@@ -65,9 +65,10 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex, OnceLock, TryLockError};
 
 use fre_aot_regex::{
-    CompileError, CompiledProgram, FrozenDynamicRowsStorage, FrozenPreparedHeaderV2,
-    FullyPrefilledFallbackReceipt, MatchResult, OutputContract, PROGRAM_HEADER_LEN,
-    ProgramFormatError, ProgramWorkspace, RetainedPartialPreflight, SearchWindow,
+    CompileError, CompiledProgram, FrozenDynamicRowsStorageV3, FrozenPreparedHeaderV2,
+    FrozenPreparedHeaderV3, FullyPrefilledFallbackReceipt, MatchResult, OutputContract,
+    PROGRAM_HEADER_LEN, ProgramFormatError, ProgramWorkspace, RetainedPartialPreflight,
+    SearchWindow,
 };
 
 /// No match was selected.
@@ -371,10 +372,10 @@ impl Default for FreAotRegexExclusiveHandleV1 {
 #[derive(Debug)]
 #[repr(C)]
 pub struct PreparedAotRegex {
-    frozen_header: FrozenPreparedHeaderV2,
+    frozen_header: FrozenPreparedHeaderV3,
     program: CompiledProgram,
     workspace: ProgramWorkspace,
-    frozen_dynamic_rows: Option<FrozenDynamicRowsStorage>,
+    frozen_dynamic_rows: Option<FrozenDynamicRowsStorageV3>,
     fully_prefilled_fallback: Option<FullyPrefilledFallbackReceipt>,
 }
 
@@ -409,14 +410,14 @@ impl PreparedAotRegex {
         let mut frozen_dynamic_rows = fully_prefilled_fallback
             .is_none()
             .then(|| {
-                program.compiler_private_frozen_dynamic_rows_storage(
+                program.compiler_private_frozen_dynamic_rows_storage_v3(
                     &workspace,
                     FROZEN_DYNAMIC_SIDECAR_MAX_K0_BYTES,
                     FROZEN_DYNAMIC_SIDECAR_MAX_PACKED_BYTES,
                 )
             })
             .flatten();
-        let frozen_header = program.compiler_private_frozen_prepared_header_v2(
+        let frozen_header = program.compiler_private_frozen_prepared_header_v3(
             &workspace,
             fully_prefilled_fallback,
             frozen_dynamic_rows.as_ref(),
@@ -2815,6 +2816,10 @@ mod tests {
         assert_eq!(
             size_of::<FrozenPreparedHeaderV2>(),
             fre_aot_regex::FROZEN_PREPARED_HEADER_V2_BYTES
+        );
+        assert_eq!(
+            size_of::<FrozenPreparedHeaderV3>(),
+            fre_aot_regex::FROZEN_PREPARED_HEADER_V3_BYTES
         );
         assert_eq!(
             fre_aot_regex::FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL_OFFSET,
