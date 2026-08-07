@@ -17196,6 +17196,56 @@ mod tests {
     }
 
     #[test]
+    fn structural_greedy_corridor_public_at_and_iteration_surfaces_match_replay() {
+        let structural = forced_k0_with_structural_mandatory_suffix(r"(?s-u:.{0,3}aa)");
+        let replay = forced_k0_with_only_mandatory_suffix(r"(?s-u:.{0,3}aa)");
+        let mut haystack = vec![b'q'; 4_096];
+        haystack[1_000..1_005].copy_from_slice(b"aaaaa");
+        haystack[3_000..3_005].copy_from_slice(b"aaaaa");
+
+        for start in [0, 997, 1_000, 1_002, 2_500, 3_000, 3_004, 4_000] {
+            assert_eq!(
+                structural
+                    .find_at_value(&haystack, start, SearchLimits::unlimited())
+                    .unwrap(),
+                replay
+                    .find_at_value(&haystack, start, SearchLimits::unlimited())
+                    .unwrap(),
+                "start={start}",
+            );
+        }
+
+        let structural_cold: Vec<_> = structural
+            .find_iter(&haystack, PortableFindIterLimits::unlimited())
+            .unwrap()
+            .map(|matched| matched.unwrap())
+            .collect();
+        let replay_cold: Vec<_> = replay
+            .find_iter(&haystack, PortableFindIterLimits::unlimited())
+            .unwrap()
+            .map(|matched| matched.unwrap())
+            .collect();
+        assert_eq!(structural_cold, replay_cold);
+
+        let mut structural_session = structural
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("structural iteration session constructs");
+        let mut replay_session = replay
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("replay iteration session constructs");
+        let structural_warm: Vec<_> = structural_session
+            .find_iter_value(&haystack, PortableFindIterRunLimits::unlimited())
+            .map(|matched| matched.unwrap())
+            .collect();
+        let replay_warm: Vec<_> = replay_session
+            .find_iter_value(&haystack, PortableFindIterRunLimits::unlimited())
+            .map(|matched| matched.unwrap())
+            .collect();
+        assert_eq!(structural_warm, replay_warm);
+        assert_eq!(structural_warm, structural_cold);
+    }
+
+    #[test]
     fn structural_greedy_corridor_does_not_change_lazy_or_ordered_priority() {
         for pattern in [r"(?s-u:.{1,4}?Z)", r"(?s-u:(?:.{1}|.{3})Z)"] {
             let regex = forced_k0_with_bound_hir_mandatory_suffix(pattern);
