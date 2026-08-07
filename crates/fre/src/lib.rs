@@ -9189,6 +9189,9 @@ const K0_FINITE_SUFFIX_EXACT_ROUTE: u8 = 1;
 // receipt.
 const K0_FINITE_SUFFIX_UNIVERSAL_INCUMBENT_CALIBRATION: u8 = 1 << 5;
 const K0_FINITE_SUFFIX_UNIVERSAL_INCUMBENT_ROUTE: u8 = 1 << 6;
+const K0_FINITE_SUFFIX_UNIVERSAL_INCUMBENT_MASK: u8 =
+    K0_FINITE_SUFFIX_UNIVERSAL_INCUMBENT_CALIBRATION
+        | K0_FINITE_SUFFIX_UNIVERSAL_INCUMBENT_ROUTE;
 const K0_FINITE_SUFFIX_SINGLE_PASS_NEGATIVE: u8 = 1 << 7;
 // `next_replacement` needs only two low bits for four size-class records.
 // Once a universal suffix schedules an independent-predicate trial, retain a
@@ -9284,6 +9287,35 @@ enum K0FiniteSuffixDirectRoute {
 enum K0UniversalFiniteSuffixIncumbentRoute {
     Calibration { class_index: usize },
     Retained { class_index: usize },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum K0UniversalFiniteSuffixRouteDecision {
+    ContinueExact,
+    Fallback,
+    Calibration,
+    Retained,
+}
+
+#[inline(never)]
+fn resolve_k0_universal_finite_suffix_route(
+    class: &mut K0NegativePrefilterClassState,
+) -> K0UniversalFiniteSuffixRouteDecision {
+    let route = class.next_predicate;
+    if route & K0_FINITE_SUFFIX_UNIVERSAL_INCUMBENT_ROUTE != 0 {
+        return K0UniversalFiniteSuffixRouteDecision::Retained;
+    }
+    if route & K0_FINITE_SUFFIX_UNIVERSAL_INCUMBENT_CALIBRATION != 0 {
+        if class.disabled_calls == 0 {
+            return K0UniversalFiniteSuffixRouteDecision::Calibration;
+        }
+        class.disabled_calls -= 1;
+        return K0UniversalFiniteSuffixRouteDecision::ContinueExact;
+    }
+    debug_assert_ne!(class.disabled_calls, 0);
+    class.disabled_calls -= 1;
+    K0UniversalFiniteSuffixRouteDecision::Fallback
 }
 
 #[allow(
@@ -10100,19 +10132,25 @@ fn try_k0_universal_finite_mandatory_suffix_span_start(
     let window_size_class = usize::BITS - window_bytes.leading_zeros();
     let mut next_state = state;
     let class_index = next_state.class_for(window_size_class);
-    if next_state.next_replacement & K0_NEGATIVE_PREFILTER_UNIVERSAL_INCUMBENT_POSSIBLE != 0 {
-        let route = next_state.classes[class_index].next_predicate;
-        if route & K0_FINITE_SUFFIX_UNIVERSAL_INCUMBENT_ROUTE != 0 {
-            return Ok(K0MandatorySuffixSpanAttempt {
-                outcome: K0MandatorySuffixSpanOutcome::UniversalIncumbent {
-                    class_index,
-                    calibration: false,
-                },
-                state_after_success: next_state,
-            });
-        }
-        if route & K0_FINITE_SUFFIX_UNIVERSAL_INCUMBENT_CALIBRATION != 0 {
-            if next_state.classes[class_index].disabled_calls == 0 {
+    let class = &mut next_state.classes[class_index];
+    let exceptional_route = (class.next_predicate
+        & K0_FINITE_SUFFIX_UNIVERSAL_INCUMBENT_MASK)
+        | class.disabled_calls;
+    if exceptional_route != 0 {
+        let decision = resolve_k0_universal_finite_suffix_route(class);
+        match decision {
+            K0UniversalFiniteSuffixRouteDecision::ContinueExact => {}
+            K0UniversalFiniteSuffixRouteDecision::Fallback => {
+                // A literal/preflight or exact-replay loss clears the
+                // calibration bit while retaining its bounded retry clock.
+                // Honor that defensive state by selecting authoritative K0
+                // until the clock expires instead of repeating suffix work.
+                return Ok(K0MandatorySuffixSpanAttempt {
+                    outcome: K0MandatorySuffixSpanOutcome::Fallback,
+                    state_after_success: next_state,
+                });
+            }
+            K0UniversalFiniteSuffixRouteDecision::Calibration => {
                 return Ok(K0MandatorySuffixSpanAttempt {
                     outcome: K0MandatorySuffixSpanOutcome::UniversalIncumbent {
                         class_index,
@@ -10121,29 +10159,16 @@ fn try_k0_universal_finite_mandatory_suffix_span_start(
                     state_after_success: next_state,
                 });
             }
-            next_state.classes[class_index].disabled_calls -= 1;
-        } else if next_state.classes[class_index].disabled_calls != 0 {
-            // A literal/preflight or exact-replay loss clears the calibration
-            // bit while retaining its bounded retry clock. Honor that
-            // defensive state by selecting authoritative K0 directly until
-            // the clock expires instead of repeating suffix work on every
-            // call.
-            next_state.classes[class_index].disabled_calls -= 1;
-            return Ok(K0MandatorySuffixSpanAttempt {
-                outcome: K0MandatorySuffixSpanOutcome::Fallback,
-                state_after_success: next_state,
-            });
+            K0UniversalFiniteSuffixRouteDecision::Retained => {
+                return Ok(K0MandatorySuffixSpanAttempt {
+                    outcome: K0MandatorySuffixSpanOutcome::UniversalIncumbent {
+                        class_index,
+                        calibration: false,
+                    },
+                    state_after_success: next_state,
+                });
+            }
         }
-    } else if next_state.classes[class_index].disabled_calls != 0 {
-        // A literal/preflight or exact-replay loss clears the calibration
-        // bit while retaining its bounded retry clock. Honor that defensive
-        // state by selecting authoritative K0 directly until the clock
-        // expires instead of repeating suffix work on every call.
-        next_state.classes[class_index].disabled_calls -= 1;
-        return Ok(K0MandatorySuffixSpanAttempt {
-            outcome: K0MandatorySuffixSpanOutcome::Fallback,
-            state_after_success: next_state,
-        });
     }
 
     let proof_start = incumbent_candidate_floor.unwrap_or(window.start());
@@ -16218,6 +16243,78 @@ mod tests {
             Some(super::K0UniversalFiniteSuffixIncumbentRoute::Retained {
                 class_index,
             }),
+        );
+    }
+
+    #[test]
+    fn universal_prefilter_route_decoder_preserves_backoff_truth_table() {
+        let mut retained = super::K0NegativePrefilterClassState {
+            disabled_calls: 2,
+            next_predicate: super::K0_FINITE_SUFFIX_UNIVERSAL_INCUMBENT_ROUTE
+                | super::K0_FINITE_SUFFIX_UNIVERSAL_INCUMBENT_CALIBRATION,
+            ..super::K0NegativePrefilterClassState::default()
+        };
+        assert_eq!(
+            super::resolve_k0_universal_finite_suffix_route(&mut retained),
+            super::K0UniversalFiniteSuffixRouteDecision::Retained,
+        );
+        assert_eq!(retained.disabled_calls, 2, "retained has priority over backoff");
+
+        let mut calibration = super::K0NegativePrefilterClassState {
+            next_predicate: super::K0_FINITE_SUFFIX_UNIVERSAL_INCUMBENT_CALIBRATION,
+            ..super::K0NegativePrefilterClassState::default()
+        };
+        assert_eq!(
+            super::resolve_k0_universal_finite_suffix_route(&mut calibration),
+            super::K0UniversalFiniteSuffixRouteDecision::Calibration,
+        );
+        calibration.disabled_calls = 2;
+        assert_eq!(
+            super::resolve_k0_universal_finite_suffix_route(&mut calibration),
+            super::K0UniversalFiniteSuffixRouteDecision::ContinueExact,
+        );
+        assert_eq!(calibration.disabled_calls, 1);
+
+        let mut fallback = super::K0NegativePrefilterClassState {
+            disabled_calls: 2,
+            next_predicate: super::K0_FINITE_SUFFIX_EXACT_ROUTE,
+            ..super::K0NegativePrefilterClassState::default()
+        };
+        assert_eq!(
+            super::resolve_k0_universal_finite_suffix_route(&mut fallback),
+            super::K0UniversalFiniteSuffixRouteDecision::Fallback,
+        );
+        assert_eq!(fallback.disabled_calls, 1);
+
+        for ordinary_route in [
+            super::K0_FINITE_SUFFIX_EXACT_ROUTE,
+            super::K0_FINITE_SUFFIX_SINGLE_PASS_NEGATIVE,
+        ] {
+            let ordinary = super::K0NegativePrefilterClassState {
+                next_predicate: ordinary_route,
+                ..super::K0NegativePrefilterClassState::default()
+            };
+            let exceptional = (ordinary.next_predicate
+                & super::K0_FINITE_SUFFIX_UNIVERSAL_INCUMBENT_MASK)
+                | ordinary.disabled_calls;
+            assert_eq!(exceptional, 0, "ordinary routes bypass the decoder");
+        }
+
+        let mut histories = super::K0NegativePrefilterState::default();
+        let adaptive_index = histories.class_for(10);
+        let exact_index = histories.class_for(11);
+        histories.classes[adaptive_index].next_predicate =
+            super::K0_FINITE_SUFFIX_UNIVERSAL_INCUMBENT_ROUTE;
+        histories.classes[exact_index].next_predicate = super::K0_FINITE_SUFFIX_EXACT_ROUTE;
+        histories.next_replacement |=
+            super::K0_NEGATIVE_PREFILTER_UNIVERSAL_INCUMBENT_POSSIBLE;
+        let exact = &histories.classes[exact_index];
+        let exceptional = (exact.next_predicate
+            & super::K0_FINITE_SUFFIX_UNIVERSAL_INCUMBENT_MASK)
+            | exact.disabled_calls;
+        assert_eq!(
+            exceptional, 0,
+            "another size class must not poison the current exact route",
         );
     }
 
