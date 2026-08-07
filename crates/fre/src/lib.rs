@@ -9911,7 +9911,7 @@ const K0_PACKED_FRONTIER_DIRECT_LOSS_BACKOFF_CALLS: u8 = 8;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum K0PackedFrontierExistsPreference {
     ObserveColdPacked,
-    ObserveWarmPacked,
+    RetainExactFloor,
     TrialIncumbent,
     RetainIncumbent,
 }
@@ -10060,7 +10060,7 @@ impl K0PackedFrontierExistsState {
     fn preference(&self, index: usize) -> K0PackedFrontierExistsPreference {
         match (self.preferences >> (index * 2)) & 0b11 {
             0 => K0PackedFrontierExistsPreference::ObserveColdPacked,
-            1 => K0PackedFrontierExistsPreference::ObserveWarmPacked,
+            1 => K0PackedFrontierExistsPreference::RetainExactFloor,
             2 => K0PackedFrontierExistsPreference::TrialIncumbent,
             3 => K0PackedFrontierExistsPreference::RetainIncumbent,
             _ => unreachable!("two policy bits have exactly four values"),
@@ -10072,7 +10072,7 @@ impl K0PackedFrontierExistsState {
         let mask = 0b11_u8 << shift;
         let value = match preference {
             K0PackedFrontierExistsPreference::ObserveColdPacked => 0,
-            K0PackedFrontierExistsPreference::ObserveWarmPacked => 1,
+            K0PackedFrontierExistsPreference::RetainExactFloor => 1,
             K0PackedFrontierExistsPreference::TrialIncumbent => 2,
             K0PackedFrontierExistsPreference::RetainIncumbent => 3,
         };
@@ -10134,11 +10134,11 @@ impl K0PackedFrontierExistsState {
     fn select(&mut self, window: SearchWindow) -> K0PackedFrontierExistsRoute {
         let class_index = self.class_for(window);
         match self.preference(class_index) {
-            K0PackedFrontierExistsPreference::ObserveColdPacked
-            | K0PackedFrontierExistsPreference::ObserveWarmPacked => {
+            K0PackedFrontierExistsPreference::ObserveColdPacked => {
                 K0PackedFrontierExistsRoute::Packed { class_index }
             }
-            preference @ (K0PackedFrontierExistsPreference::TrialIncumbent
+            preference @ (K0PackedFrontierExistsPreference::RetainExactFloor
+            | K0PackedFrontierExistsPreference::TrialIncumbent
             | K0PackedFrontierExistsPreference::RetainIncumbent) => {
                 let packed_positive = K0PackedFrontierPositiveObservation {
                     residual_work: self.classes[class_index].packed_residual_work,
@@ -10175,30 +10175,33 @@ impl K0PackedFrontierExistsState {
     fn retained_incumbent(
         &self,
         window: SearchWindow,
-    ) -> Option<(usize, K0PackedFrontierPositiveObservation, bool)> {
-        // Each class owns two adjacent preference bits and RetainIncumbent is
-        // `0b11`. Reject the overwhelmingly common no-retained-state case
-        // before comparing any exact windows. This is derived from the
-        // authoritative packed preference byte, so it adds no shadow state or
-        // publication obligation.
-        let low_preference_bits = self.preferences & 0x55;
-        let high_preference_bits = (self.preferences >> 1) & 0x55;
-        if low_preference_bits & high_preference_bits == 0 {
+    ) -> Option<(usize, K0PackedFrontierPositiveObservation, bool, bool)> {
+        // Both retained preferences have their low policy bit set. Reject the
+        // overwhelmingly common no-retained-state case before comparing any
+        // exact windows, without adding shadow publication state.
+        if self.preferences & 0x55 == 0 {
             return None;
         }
         let class_index = (0..self.classes.len()).find(|&index| {
+            let preference = self.preference(index);
             self.is_occupied(index)
                 && self.classes[index].window == window
-                && self.preference(index)
-                    == K0PackedFrontierExistsPreference::RetainIncumbent
+                && matches!(
+                    preference,
+                    K0PackedFrontierExistsPreference::RetainExactFloor
+                        | K0PackedFrontierExistsPreference::RetainIncumbent
+                )
                 && self.direct_remaining[index] != 0
         })?;
+        let exact_floor = self.preference(class_index)
+            == K0PackedFrontierExistsPreference::RetainExactFloor;
         Some((
             class_index,
             K0PackedFrontierPositiveObservation {
                 residual_work: self.classes[class_index].packed_residual_work,
             },
             self.is_structural_direct(class_index),
+            exact_floor,
         ))
     }
 
@@ -10208,31 +10211,38 @@ impl K0PackedFrontierExistsState {
         class_index: usize,
         packed_positive: K0PackedFrontierPositiveObservation,
         observation: K0PackedFrontierIncumbentObservation,
-    ) {
-        debug_assert_eq!(
+    ) -> bool {
+        debug_assert!(matches!(
             self.preference(class_index),
-            K0PackedFrontierExistsPreference::RetainIncumbent,
-        );
+            K0PackedFrontierExistsPreference::RetainExactFloor
+                | K0PackedFrontierExistsPreference::RetainIncumbent,
+        ));
         debug_assert_ne!(self.direct_remaining[class_index], 0);
         self.direct_remaining[class_index] =
             self.direct_remaining[class_index].saturating_sub(1);
-        if self.direct_remaining[class_index] == 0 {
+        let expired = self.direct_remaining[class_index] == 0;
+        if expired {
             self.set_preference(
                 class_index,
                 K0PackedFrontierExistsPreference::ObserveColdPacked,
             );
         }
         self.observe_incumbent(class_index, packed_positive, false, observation);
+        expired
     }
 
     fn renew_exact_floor_direct(&mut self, class_index: usize) {
         debug_assert_eq!(
             self.preference(class_index),
-            K0PackedFrontierExistsPreference::RetainIncumbent,
+            K0PackedFrontierExistsPreference::ObserveColdPacked,
         );
-        debug_assert_eq!(self.direct_remaining[class_index], 1);
+        debug_assert_eq!(self.direct_remaining[class_index], 0);
         debug_assert!(self.is_structural_direct(class_index));
         debug_assert!(self.exact_floor_witness(class_index).is_some());
+        self.set_preference(
+            class_index,
+            K0PackedFrontierExistsPreference::RetainExactFloor,
+        );
         self.direct_remaining[class_index] = self.next_direct_epoch_calls(class_index);
     }
 
@@ -10260,7 +10270,6 @@ impl K0PackedFrontierExistsState {
         debug_assert!(matches!(
             preference,
             K0PackedFrontierExistsPreference::ObserveColdPacked
-                | K0PackedFrontierExistsPreference::ObserveWarmPacked
         ));
         let positive = match observation {
             K0PackedFrontierObservation::Absent
@@ -10289,7 +10298,7 @@ impl K0PackedFrontierExistsState {
                 self.set_exact_floor_witness(class_index, Some(witness));
                 self.set_preference(
                     class_index,
-                    K0PackedFrontierExistsPreference::RetainIncumbent,
+                    K0PackedFrontierExistsPreference::RetainExactFloor,
                 );
                 self.direct_remaining[class_index] =
                     self.next_direct_epoch_calls(class_index);
@@ -10639,7 +10648,6 @@ impl<'p, 's, 'a, 'h> K0PackedFrontierExistsReceipt<'p, 's, 'a, 'h> {
 fn execute_k0_packed_frontier_exists_slow<F>(
     receipt: K0PackedFrontierExistsReceipt<'_, '_, '_, '_>,
     state: &mut K0PackedFrontierExistsState,
-    expired_exact_class: Option<usize>,
     execute_incumbent: F,
 ) -> Result<bool, SearchError>
 where
@@ -10653,11 +10661,8 @@ where
 {
     // Route selection and observations remain speculative until the sole
     // authoritative executor succeeds. Errors preserve the complete policy
-    // state, including a pending incumbent retry or expired content witness.
+    // state, including a pending incumbent retry.
     let mut state_after_success = *state;
-    if let Some(class_index) = expired_exact_class {
-        state_after_success.expire_exact_floor_direct(class_index);
-    }
     let route = state_after_success.select(receipt.window);
     let output = match route {
         K0PackedFrontierExistsRoute::Packed { class_index } => {
@@ -10712,34 +10717,9 @@ where
     // transactionally copying the whole four-class policy. Structural epochs
     // deliberately ignore later work comparisons until their bounded
     // reprobe, so their raw K0 tail can use the report-free value executor.
-    if let Some((class_index, packed_positive, structural_direct)) =
+    if let Some((class_index, packed_positive, structural_direct, exact_floor)) =
         state.retained_incumbent(receipt.window)
     {
-        if structural_direct
-            && state.direct_remaining[class_index] == 1
-            && let Some(witness) = state.exact_floor_witness(class_index)
-        {
-            if witness.is_present(receipt.haystack, receipt.window) {
-                let output = execute_incumbent(
-                    &mut *receipt.session,
-                    receipt.haystack,
-                    receipt.window,
-                    receipt.search_limits,
-                    None,
-                )?;
-                state.renew_exact_floor_direct(class_index);
-                return Ok(output);
-            }
-            // A changed current source invalidates the exact-floor theorem.
-            // Reprobe Packed on this boundary call and publish both the reset
-            // and its new observation only after its executor succeeds.
-            return execute_k0_packed_frontier_exists_slow(
-                receipt,
-                state,
-                Some(class_index),
-                execute_incumbent,
-            );
-        }
         if structural_direct {
             let output = execute_incumbent(
                 &mut *receipt.session,
@@ -10748,11 +10728,21 @@ where
                 receipt.search_limits,
                 None,
             )?;
-            state.observe_retained_incumbent(
+            let expired = state.observe_retained_incumbent(
                 class_index,
                 packed_positive,
                 K0PackedFrontierIncumbentObservation::Incomparable,
             );
+            if expired && exact_floor {
+                if state
+                    .exact_floor_witness(class_index)
+                    .is_some_and(|witness| witness.is_present(receipt.haystack, receipt.window))
+                {
+                    state.renew_exact_floor_direct(class_index);
+                } else {
+                    state.expire_exact_floor_direct(class_index);
+                }
+            }
             return Ok(output);
         }
         let mut incumbent_observation =
@@ -10764,14 +10754,14 @@ where
             receipt.search_limits,
             Some(&mut incumbent_observation),
         )?;
-        state.observe_retained_incumbent(
+        let _ = state.observe_retained_incumbent(
             class_index,
             packed_positive,
             incumbent_observation,
         );
         return Ok(output);
     }
-    execute_k0_packed_frontier_exists_slow(receipt, state, None, execute_incumbent)
+    execute_k0_packed_frontier_exists_slow(receipt, state, execute_incumbent)
 }
 
 // A negative literal pass pays for itself only on a reusable, sufficiently
@@ -17710,7 +17700,7 @@ mod tests {
         assert!(packed_state.is_structural_direct(class_index));
         assert_eq!(
             packed_state.preference(class_index),
-            super::K0PackedFrontierExistsPreference::RetainIncumbent,
+            super::K0PackedFrontierExistsPreference::RetainExactFloor,
         );
         assert_eq!(
             packed_state.direct_remaining[class_index],
@@ -17932,7 +17922,7 @@ mod tests {
         );
         assert_eq!(
             shifted.preference(class_index),
-            super::K0PackedFrontierExistsPreference::RetainIncumbent,
+            super::K0PackedFrontierExistsPreference::RetainExactFloor,
             "the same-call exact incumbent proves Direct without another trial",
         );
         assert!(shifted.is_structural_direct(class_index));
@@ -17947,12 +17937,13 @@ mod tests {
             )),
             super::K0PackedFrontierExistsRoute::Packed { .. }
         ));
-        let (selected_class, selected_positive, structural_direct) = shifted
+        let (selected_class, selected_positive, structural_direct, exact_floor) = shifted
             .retained_incumbent(policy_window)
             .expect("the exact-floor Direct epoch owns its exact window");
         assert_eq!(selected_class, class_index);
         assert_eq!(selected_positive.residual_work, 0);
         assert!(structural_direct);
+        assert!(exact_floor);
         let mut incomparable = super::K0PackedFrontierExistsState::default();
         let class_index = match incomparable.select(policy_window) {
             super::K0PackedFrontierExistsRoute::Packed { class_index } => class_index,
@@ -18046,12 +18037,13 @@ mod tests {
 
         let mut staged_reference = state;
         for expected_remaining in (0..super::K0_PACKED_FRONTIER_DIRECT_EPOCH_CALLS).rev() {
-            let (fast_class, packed_positive, structural_direct) = state
+            let (fast_class, packed_positive, structural_direct, exact_floor) = state
                 .retained_incumbent(window)
                 .expect("the fast retained route must own the same exact window");
             assert_eq!(fast_class, class_index);
             assert!(structural_direct);
-            state.observe_retained_incumbent(
+            assert!(!exact_floor);
+            let _ = state.observe_retained_incumbent(
                 class_index,
                 packed_positive,
                 super::K0PackedFrontierIncumbentObservation::SpecializedComplete,
@@ -19107,7 +19099,7 @@ mod tests {
             .expect("early positive retains its exact-window policy state");
         assert_eq!(
             packed_frontier_exists_state.preference(first_class),
-            super::K0PackedFrontierExistsPreference::RetainIncumbent,
+            super::K0PackedFrontierExistsPreference::RetainExactFloor,
             "the packed call already executed the exact incumbent tail",
         );
         assert_eq!(
