@@ -9809,6 +9809,63 @@ fn finish_k0_finite_mandatory_suffix_absent(
     }
 }
 
+#[cold]
+#[inline(never)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "greedy endpoint refinement carries one already-authenticated corridor window"
+)]
+fn try_k0_universal_finite_greedy_suffix_endpoint(
+    suffix: &K0MandatorySuffixPlan,
+    haystack: &[u8],
+    start: usize,
+    proof_start: usize,
+    search_start: usize,
+    minimum_prefix_bytes: usize,
+    maximum_prefix_bytes: usize,
+    maximum_suffix_start: usize,
+    window_end: usize,
+) -> Result<Option<usize>, SearchError> {
+    if start != proof_start {
+        return Err(SearchError::K0(K0SearchError::InternalInvariant {
+            detail: "near-floor greedy suffix did not retain the proved floor",
+        }));
+    }
+    let reverse_end = maximum_suffix_start
+        .checked_add(suffix.needle().len())
+        .ok_or(SearchError::K0(K0SearchError::ArithmeticOverflow {
+            computation: "universal finite greedy suffix horizon",
+        }))?
+        .min(window_end);
+    if search_start > reverse_end {
+        return Err(SearchError::K0(K0SearchError::InternalInvariant {
+            detail: "universal finite greedy suffix window inverted",
+        }));
+    }
+    let Ok(Some((selected_suffix_start, selected_endpoint))) =
+        suffix.rfind_window(haystack, search_start, reverse_end)
+    else {
+        return Ok(None);
+    };
+    let selected_prefix_bytes = selected_suffix_start.checked_sub(start).ok_or(
+        SearchError::K0(K0SearchError::InternalInvariant {
+            detail: "greedy suffix preceded its proved start",
+        }),
+    )?;
+    if selected_suffix_start < search_start
+        || selected_suffix_start > maximum_suffix_start
+        || selected_prefix_bytes < minimum_prefix_bytes
+        || selected_prefix_bytes > maximum_prefix_bytes
+        || selected_suffix_start.checked_add(suffix.needle().len()) != Some(selected_endpoint)
+        || selected_endpoint > reverse_end
+    {
+        return Err(SearchError::K0(K0SearchError::InternalInvariant {
+            detail: "universal finite greedy suffix escaped its proved horizon",
+        }));
+    }
+    Ok(Some(selected_endpoint))
+}
+
 #[inline(never)]
 #[allow(
     clippy::too_many_arguments,
@@ -9923,43 +9980,17 @@ fn try_k0_universal_finite_mandatory_suffix_span_start(
         ));
     }
     if greedy_corridor {
-        if start != proof_start {
-            return Err(SearchError::K0(K0SearchError::InternalInvariant {
-                detail: "near-floor greedy suffix did not retain the proved floor",
-            }));
-        }
-        let reverse_end = maximum_suffix_start
-            .checked_add(suffix.needle().len())
-            .ok_or(SearchError::K0(K0SearchError::ArithmeticOverflow {
-                computation: "universal finite greedy suffix horizon",
-            }))?
-            .min(window.end());
-        if search_start > reverse_end {
-            return Err(SearchError::K0(K0SearchError::InternalInvariant {
-                detail: "universal finite greedy suffix window inverted",
-            }));
-        }
-        if let Ok(Some((selected_suffix_start, selected_endpoint))) =
-            suffix.rfind_window(haystack, search_start, reverse_end)
-        {
-            let selected_prefix_bytes = selected_suffix_start.checked_sub(start).ok_or(
-                SearchError::K0(K0SearchError::InternalInvariant {
-                    detail: "greedy suffix preceded its proved start",
-                }),
-            )?;
-            if selected_suffix_start < search_start
-                || selected_suffix_start > maximum_suffix_start
-                || selected_prefix_bytes < minimum_prefix_bytes
-                || selected_prefix_bytes > maximum_prefix_bytes
-                || selected_suffix_start
-                    .checked_add(suffix.needle().len())
-                    != Some(selected_endpoint)
-                || selected_endpoint > reverse_end
-            {
-                return Err(SearchError::K0(K0SearchError::InternalInvariant {
-                    detail: "universal finite greedy suffix escaped its proved horizon",
-                }));
-            }
+        if let Some(selected_endpoint) = try_k0_universal_finite_greedy_suffix_endpoint(
+            suffix,
+            haystack,
+            start,
+            proof_start,
+            search_start,
+            minimum_prefix_bytes,
+            maximum_prefix_bytes,
+            maximum_suffix_start,
+            window.end(),
+        )? {
             return Ok(finish_k0_universal_finite_mandatory_suffix_span(
                 next_state,
                 class_index,
