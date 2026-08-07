@@ -6,7 +6,8 @@ use fre_automata::{
 };
 use fre_simd_kernels::{
     ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, AsciiByteSet, AsciiByteSetClassifier,
-    BYTE_SET_BLOCK_BYTES, BYTE_SET_WIDE_BLOCK_BYTES, ByteSet256, ByteSetClassifier,
+    AsciiByteSetRunScanner, BYTE_SET_BLOCK_BYTES, BYTE_SET_WIDE_BLOCK_BYTES, ByteSet256,
+    ByteSetClassifier, DispatchPolicy, SimdDispatchContext,
 };
 use memchr::{memchr, memchr2, memchr3};
 use sha2::{Digest, Sha256};
@@ -2722,26 +2723,57 @@ impl Default for FrozenDynamicRowsV6 {
     }
 }
 
-/// Pointer-stable host-selected classifier for one frozen compact loop.
+/// Pointer-stable host-selected scanner for one frozen compact loop.
+///
+/// The strategy is derived solely from the exact loop-member set. Universal
+/// loops need no classifier, ASCII-only loops retain the operation-specific
+/// whole-slice run scanner, and sets containing any high byte retain the
+/// general 256-byte classifier. Keeping the mutually exclusive payloads in an
+/// enum avoids retaining a second copy of the member set beside either
+/// classifier. The compact-sidecar budget charges the exact enum size.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug)]
 pub struct FrozenCompactLoopScanner {
-    classifier: Option<ByteSetClassifier>,
-    members: ByteSet256,
+    strategy: FrozenCompactLoopScannerStrategy,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FrozenCompactLoopScannerStrategy {
+    All,
+    Ascii(AsciiByteSetRunScanner),
+    Full(ByteSetClassifier),
 }
 
 impl FrozenCompactLoopScanner {
     fn new(members: [u64; 4]) -> Self {
-        let members = ByteSet256::from_words(members);
-        Self {
-            classifier: (members.words() != [u64::MAX; 4])
-                .then(|| ByteSetClassifier::new(members)),
-            members,
-        }
+        let strategy = if members == [u64::MAX; 4] {
+            FrozenCompactLoopScannerStrategy::All
+        } else if members[2] == 0 && members[3] == 0 {
+            let set = AsciiByteSet::from_words([members[0], members[1]]);
+            let scanner = SimdDispatchContext::capture()
+                .ascii_byte_set_run_scanner_prefer_small_complement(
+                    set,
+                    DispatchPolicy::Auto,
+                )
+                .expect("automatic ASCII run dispatch always retains a scalar fallback");
+            FrozenCompactLoopScannerStrategy::Ascii(scanner)
+        } else {
+            FrozenCompactLoopScannerStrategy::Full(ByteSetClassifier::new(
+                ByteSet256::from_words(members),
+            ))
+        };
+        Self { strategy }
     }
 
-    const fn words(&self) -> [u64; 4] {
-        self.members.words()
+    fn words(&self) -> [u64; 4] {
+        match &self.strategy {
+            FrozenCompactLoopScannerStrategy::All => [u64::MAX; 4],
+            FrozenCompactLoopScannerStrategy::Ascii(scanner) => {
+                let words = scanner.set().words();
+                [words[0], words[1], 0, 0]
+            }
+            FrozenCompactLoopScannerStrategy::Full(classifier) => classifier.set().words(),
+        }
     }
 
     /// Return the exact member-prefix length, never exceeding `source.len()`.
@@ -2753,8 +2785,12 @@ impl FrozenCompactLoopScanner {
         reason = "each addition is bounded by the immediately preceding remaining-length proof"
     )]
     pub fn scan_prefix(&self, source: &[u8]) -> usize {
-        let Some(classifier) = self.classifier.as_ref() else {
-            return source.len();
+        let classifier = match &self.strategy {
+            FrozenCompactLoopScannerStrategy::All => return source.len(),
+            FrozenCompactLoopScannerStrategy::Ascii(scanner) => {
+                return scanner.scan_forward(source).member_run_len();
+            }
+            FrozenCompactLoopScannerStrategy::Full(classifier) => classifier,
         };
         let mut position = 0usize;
         if classifier.candidate_block_bytes() == BYTE_SET_WIDE_BLOCK_BYTES {
@@ -2788,7 +2824,7 @@ impl FrozenCompactLoopScanner {
         position
             + source[position..]
                 .iter()
-                .take_while(|&&byte| self.members.contains(byte))
+                .take_while(|&&byte| classifier.set().contains(byte))
                 .count()
     }
 }
@@ -25324,6 +25360,137 @@ mod tests {
                     .is_none(),
                 "a nullable/terminal {output:?} root must retain portable initial settlement"
             );
+        }
+    }
+
+    #[test]
+    fn frozen_compact_loop_scanners_select_by_set_and_are_boundary_exact() {
+        #[allow(dead_code)]
+        struct PreviousFrozenCompactLoopScannerLayout {
+            classifier: Option<ByteSetClassifier>,
+            members: ByteSet256,
+        }
+
+        fn words(bytes: &[u8]) -> [u64; 4] {
+            let mut words = [0_u64; 4];
+            for &byte in bytes {
+                let index = usize::from(byte);
+                words[index / 64] |= 1_u64 << (index % 64);
+            }
+            words
+        }
+
+        fn contains(words: [u64; 4], byte: u8) -> bool {
+            let index = usize::from(byte);
+            words[index / 64] & (1_u64 << (index % 64)) != 0
+        }
+
+        fn scalar_prefix(words: [u64; 4], source: &[u8]) -> usize {
+            source
+                .iter()
+                .take_while(|&&byte| contains(words, byte))
+                .count()
+        }
+
+        let all_words = [u64::MAX; 4];
+        let sparse_ascii_words = words(&[0, b'A', b'z', 0x7f]);
+        let mut dense_ascii_words = [u64::MAX, u64::MAX, 0, 0];
+        for byte in [b'\n', b'\r'] {
+            let index = usize::from(byte);
+            dense_ascii_words[index / 64] &= !(1_u64 << (index % 64));
+        }
+        let high_words = words(&[b'a', 0x80, 0xfe]);
+
+        let all = FrozenCompactLoopScanner::new(all_words);
+        let sparse_ascii = FrozenCompactLoopScanner::new(sparse_ascii_words);
+        let dense_ascii = FrozenCompactLoopScanner::new(dense_ascii_words);
+        let high = FrozenCompactLoopScanner::new(high_words);
+        assert!(matches!(
+            &all.strategy,
+            FrozenCompactLoopScannerStrategy::All
+        ));
+        assert!(matches!(
+            &sparse_ascii.strategy,
+            FrozenCompactLoopScannerStrategy::Ascii(_)
+        ));
+        assert!(matches!(
+            &dense_ascii.strategy,
+            FrozenCompactLoopScannerStrategy::Ascii(_)
+        ));
+        assert!(matches!(
+            &high.strategy,
+            FrozenCompactLoopScannerStrategy::Full(_)
+        ));
+
+        // The retained-byte admission uses this exact type size. Reproducing
+        // the former fields locally proves that the disjoint enum payload
+        // really removes their duplicated set storage on this build rather
+        // than merely moving it behind another wrapper.
+        assert_eq!(
+            core::mem::size_of::<FrozenCompactLoopScanner>(),
+            core::mem::size_of::<FrozenCompactLoopScannerStrategy>()
+        );
+        assert!(
+            core::mem::size_of::<FrozenCompactLoopScanner>()
+                < core::mem::size_of::<PreviousFrozenCompactLoopScannerLayout>()
+        );
+
+        let cases = [
+            ("all", all, all_words, 0xa5, [0_u8; 2], 0_usize),
+            (
+                "sparse-ascii",
+                sparse_ascii,
+                sparse_ascii_words,
+                b'A',
+                [b'!', 0x80],
+                2,
+            ),
+            (
+                "dense-ascii-complement",
+                dense_ascii,
+                dense_ascii_words,
+                b'A',
+                [b'\n', 0x80],
+                2,
+            ),
+            ("full-byte", high, high_words, 0x80, [b'!', 0], 1),
+        ];
+        let boundaries = [
+            0_usize, 1, 2, 15, 16, 17, 31, 32, 33, 47, 48, 49, 63, 64, 65, 95,
+            96, 97, 127, 128, 129, 255, 256, 257,
+        ];
+        for (name, scanner, member_words, member, nonmembers, nonmember_count) in cases {
+            assert_eq!(scanner.words(), member_words, "{name}/member-set");
+            assert!(contains(member_words, member), "{name}/member-witness");
+            for offset in [0_usize, 1, 7, 15, 16, 31] {
+                for length in boundaries {
+                    let mut backing = vec![0xcc; offset];
+                    backing.extend(std::iter::repeat_n(member, length));
+                    let source = &backing[offset..];
+                    assert_eq!(
+                        scanner.scan_prefix(source),
+                        scalar_prefix(member_words, source),
+                        "{name}/members/offset-{offset}/length-{length}"
+                    );
+
+                    for &nonmember in &nonmembers[..nonmember_count] {
+                        assert!(
+                            !contains(member_words, nonmember),
+                            "{name}/nonmember-witness-{nonmember}"
+                        );
+                        let mut terminated = vec![0xcc; offset];
+                        terminated.extend(std::iter::repeat_n(member, length));
+                        terminated.push(nonmember);
+                        terminated.extend(std::iter::repeat_n(member, 37));
+                        let source = &terminated[offset..];
+                        assert_eq!(
+                            scanner.scan_prefix(source),
+                            scalar_prefix(member_words, source),
+                            "{name}/terminator-{nonmember}/offset-{offset}/prefix-{length}"
+                        );
+                    }
+                }
+            }
         }
     }
 
