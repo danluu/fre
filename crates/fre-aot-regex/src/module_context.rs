@@ -54,13 +54,15 @@ use crate::{
     CompileResource, ObjectError,
     context_dfa::{NativeContextAnchoredForwardView, NativeContextDfaView},
     context_native::{
-        CONTEXT_CELL_STATE_MASK, CONTEXT_FORWARD_CELL_FLAGS_SHIFT, CONTEXT_FORWARD_CELL_STATE_MASK,
-        CONTEXT_RAW_FORWARD_EMPTY, CONTEXT_RAW_FORWARD_STATE_MASK, CONTEXT_RAW_FORWARD_VALID,
-        CONTEXT_RAW_REVERSE_EVENT, CONTEXT_RAW_REVERSE_STATE_MASK, CONTEXT_RAW_REVERSE_VALID,
-        CONTEXT_STATE_EMPTY, CONTEXT_STATE_PENDING, CONTEXT_STATE_TERMINAL,
-        ContextAnchoredForwardLayout, ContextNativeLayout, ContextNativeLimits,
-        ContextRawPairInitialLayout, ContextRawPairReverseInitialLayout,
-        MAX_CONTEXT_NATIVE_DATA_BYTES, build_context_native_layout_with_accelerators,
+        CONTEXT_CELL_STATE_MASK, CONTEXT_COMPACT_FORWARD_CELL_FLAGS_SHIFT,
+        CONTEXT_COMPACT_FORWARD_CELL_STATE_MASK, CONTEXT_FORWARD_CELL_FLAGS_SHIFT,
+        CONTEXT_FORWARD_CELL_STATE_MASK, CONTEXT_RAW_FORWARD_EMPTY, CONTEXT_RAW_FORWARD_STATE_MASK,
+        CONTEXT_RAW_FORWARD_VALID, CONTEXT_RAW_REVERSE_EVENT, CONTEXT_RAW_REVERSE_STATE_MASK,
+        CONTEXT_RAW_REVERSE_VALID, CONTEXT_STATE_EMPTY, CONTEXT_STATE_PENDING,
+        CONTEXT_STATE_TERMINAL, ContextAnchoredForwardLayout, ContextNativeLayout,
+        ContextNativeLimits, ContextRawPairInitialLayout, ContextRawPairReverseInitialLayout,
+        ContextTransitionCellFormat, MAX_CONTEXT_NATIVE_DATA_BYTES,
+        build_context_native_layout_with_accelerators,
     },
     prefix_predicate::{
         AARCH64_SCALAR_PREFIX_COSTS, PrefixPredicateInput, ScalarPrefixConjunctionPlan,
@@ -91,6 +93,14 @@ struct ContextSveFilterPlans {
     interior: Option<Aarch64SveFilterPlan>,
     anchored: Option<Aarch64SveFilterPlan>,
     ordinary: Option<Aarch64SveFilterPlan>,
+}
+
+fn context_reverse_cell_format(
+    layout: &ContextNativeLayout,
+) -> Result<ContextTransitionCellFormat, ObjectError> {
+    layout.reverse_cell_format.ok_or(ObjectError::InvalidModule(
+        "context reverse transition has no physical format",
+    ))
 }
 
 /// Candidate scanner selected for the exact-start contextual verifier.
@@ -3359,11 +3369,20 @@ fn x86_emit_populated_transition_valid_mode(
     assembler: &mut X86Assembler,
     invalid: usize,
     trust: bool,
+    format: ContextTransitionCellFormat,
 ) -> Result<(), ObjectError> {
     if trust {
         Ok(())
     } else {
-        x86_emit_test_valid(assembler, invalid)
+        let valid = match format {
+            ContextTransitionCellFormat::Compact16 => u32::from(CONTEXT_RAW_REVERSE_VALID),
+            ContextTransitionCellFormat::Wide32 => 1_u32 << 30,
+        };
+        let mut instruction = vec![0xa9];
+        instruction.extend_from_slice(&valid.to_le_bytes());
+        assembler.instruction(&instruction)?;
+        assembler.branch(&[0x0f, 0x84], invalid)?;
+        Ok(())
     }
 }
 
@@ -3371,10 +3390,17 @@ fn x86_emit_decode_populated_forward_transition_mode(
     assembler: &mut X86Assembler,
     invalid: usize,
     trust: bool,
+    format: ContextTransitionCellFormat,
 ) -> Result<(), ObjectError> {
     assembler.instruction(&[0x41, 0x89, 0xc3])?; // preserve event bit
     let mut payload = vec![0x25];
-    payload.extend_from_slice(&CONTEXT_FORWARD_CELL_STATE_MASK.to_le_bytes());
+    let state_mask = match format {
+        ContextTransitionCellFormat::Compact16 => {
+            u32::from(CONTEXT_COMPACT_FORWARD_CELL_STATE_MASK)
+        }
+        ContextTransitionCellFormat::Wide32 => CONTEXT_FORWARD_CELL_STATE_MASK,
+    };
+    payload.extend_from_slice(&state_mask.to_le_bytes());
     assembler.instruction(&payload)?;
     if !trust {
         assembler.instruction(&[0x85, 0xc0])?;
@@ -3383,7 +3409,40 @@ fn x86_emit_decode_populated_forward_transition_mode(
     assembler.instruction(&[0xff, 0xc8])?; // state = payload - 1
     assembler.instruction(&[0x41, 0x89, 0xc2])?; // r10d = state
     assembler.instruction(&[0x44, 0x89, 0xd8])?; // packed cell
-    assembler.instruction(&[0xc1, 0xe8, CONTEXT_FORWARD_CELL_FLAGS_SHIFT])?;
+    let flags_shift = match format {
+        ContextTransitionCellFormat::Compact16 => CONTEXT_COMPACT_FORWARD_CELL_FLAGS_SHIFT,
+        ContextTransitionCellFormat::Wide32 => CONTEXT_FORWARD_CELL_FLAGS_SHIFT,
+    };
+    assembler.instruction(&[0xc1, 0xe8, flags_shift])?;
+    Ok(())
+}
+
+fn x86_emit_test_transition_event(
+    assembler: &mut X86Assembler,
+    format: ContextTransitionCellFormat,
+) -> Result<(), ObjectError> {
+    match format {
+        ContextTransitionCellFormat::Compact16 => {
+            assembler.instruction(&[0x66, 0x45, 0x85, 0xdb])?;
+        }
+        ContextTransitionCellFormat::Wide32 => {
+            assembler.instruction(&[0x45, 0x85, 0xdb])?;
+        }
+    }
+    Ok(())
+}
+
+fn x86_emit_mask_reverse_payload(
+    assembler: &mut X86Assembler,
+    format: ContextTransitionCellFormat,
+) -> Result<(), ObjectError> {
+    let mask = match format {
+        ContextTransitionCellFormat::Compact16 => u32::from(CONTEXT_RAW_REVERSE_STATE_MASK),
+        ContextTransitionCellFormat::Wide32 => CONTEXT_CELL_STATE_MASK,
+    };
+    let mut instruction = vec![0x25];
+    instruction.extend_from_slice(&mask.to_le_bytes());
+    assembler.instruction(&instruction)?;
     Ok(())
 }
 
@@ -3634,6 +3693,7 @@ fn x86_emit_context_cell(
     table_offset: u32,
     row_width: u16,
     symbol_in_r11d: bool,
+    format: ContextTransitionCellFormat,
 ) -> Result<(), ObjectError> {
     assembler.instruction(&[0x44, 0x89, 0xd0])?; // eax = state
     if row_width <= 0x7f {
@@ -3646,8 +3706,12 @@ fn x86_emit_context_cell(
     if symbol_in_r11d {
         assembler.instruction(&[0x44, 0x01, 0xd8])?; // eax += r11d
     }
-    // mov eax, dword ptr [r9 + rax*4 + table_offset]
-    let mut instruction = vec![0x41, 0x8b, 0x84, 0x81];
+    let mut instruction = match format {
+        // movzx eax, word ptr [r9 + rax*2 + table_offset]
+        ContextTransitionCellFormat::Compact16 => vec![0x41, 0x0f, 0xb7, 0x84, 0x41],
+        // mov eax, dword ptr [r9 + rax*4 + table_offset]
+        ContextTransitionCellFormat::Wide32 => vec![0x41, 0x8b, 0x84, 0x81],
+    };
     instruction.extend_from_slice(&x86_disp32(table_offset));
     assembler.instruction(&instruction)?;
     Ok(())
@@ -3657,6 +3721,7 @@ fn x86_emit_reverse_context_cell(
     assembler: &mut X86Assembler,
     table_offset: u32,
     row_width: u16,
+    format: ContextTransitionCellFormat,
 ) -> Result<(), ObjectError> {
     assembler.instruction(&[0x41, 0x8d, 0x42, 0xff])?; // eax = payload - 1
     if row_width <= 0x7f {
@@ -3667,7 +3732,10 @@ fn x86_emit_reverse_context_cell(
         assembler.instruction(&multiply)?;
     }
     assembler.instruction(&[0x44, 0x01, 0xd8])?;
-    let mut load = vec![0x41, 0x8b, 0x84, 0x81];
+    let mut load = match format {
+        ContextTransitionCellFormat::Compact16 => vec![0x41, 0x0f, 0xb7, 0x84, 0x41],
+        ContextTransitionCellFormat::Wide32 => vec![0x41, 0x8b, 0x84, 0x81],
+    };
     load.extend_from_slice(&table_offset.to_le_bytes());
     assembler.instruction(&load)?;
     Ok(())
@@ -3676,12 +3744,16 @@ fn x86_emit_reverse_context_cell(
 fn x86_emit_direct_byte_context_cell(
     assembler: &mut X86Assembler,
     table_offset: u32,
+    format: ContextTransitionCellFormat,
 ) -> Result<(), ObjectError> {
     // eax is the raw byte. The old state dies at this transition, so scale
     // r10d destructively and let the ordinary decoder install its successor.
     assembler.instruction(&[0x41, 0xc1, 0xe2, 0x08])?;
     assembler.instruction(&[0x44, 0x01, 0xd0])?;
-    let mut load = vec![0x41, 0x8b, 0x84, 0x81];
+    let mut load = match format {
+        ContextTransitionCellFormat::Compact16 => vec![0x41, 0x0f, 0xb7, 0x84, 0x41],
+        ContextTransitionCellFormat::Wide32 => vec![0x41, 0x8b, 0x84, 0x81],
+    };
     load.extend_from_slice(&table_offset.to_le_bytes());
     assembler.instruction(&load)?;
     Ok(())
@@ -3690,8 +3762,12 @@ fn x86_emit_direct_byte_context_cell(
 fn x86_emit_direct_sentinel_context_cell(
     assembler: &mut X86Assembler,
     table_offset: u32,
+    format: ContextTransitionCellFormat,
 ) -> Result<(), ObjectError> {
-    let mut load = vec![0x43, 0x8b, 0x84, 0x91];
+    let mut load = match format {
+        ContextTransitionCellFormat::Compact16 => vec![0x43, 0x0f, 0xb7, 0x84, 0x51],
+        ContextTransitionCellFormat::Wide32 => vec![0x43, 0x8b, 0x84, 0x91],
+    };
     load.extend_from_slice(&table_offset.to_le_bytes());
     assembler.instruction(&load)?;
     Ok(())
@@ -3707,6 +3783,7 @@ fn x86_emit_forward_transition_cell_at(
     layout: &ContextNativeLayout,
     cells_offset: u32,
     byte_sentinel_offset: Option<u32>,
+    format: ContextTransitionCellFormat,
 ) -> Result<(), ObjectError> {
     let sentinel = assembler.label()?;
     let ready = assembler.label()?;
@@ -3714,14 +3791,14 @@ fn x86_emit_forward_transition_cell_at(
     assembler.branch(&[0x0f, 0x84], sentinel)?;
     if let Some(sentinel_offset) = byte_sentinel_offset {
         assembler.instruction(&[0x0f, 0xb6, 0x04, 0x17])?; // raw byte
-        x86_emit_direct_byte_context_cell(assembler, cells_offset)?;
+        x86_emit_direct_byte_context_cell(assembler, cells_offset, format)?;
         assembler.branch(&[0xe9], ready)?;
         assembler.bind(sentinel)?;
-        x86_emit_direct_sentinel_context_cell(assembler, sentinel_offset)?;
+        x86_emit_direct_sentinel_context_cell(assembler, sentinel_offset, format)?;
     } else {
         x86_emit_class_at_position(assembler, layout.byte_classes_offset)?;
         assembler.instruction(&[0x41, 0x89, 0xc3])?;
-        x86_emit_context_cell(assembler, cells_offset, layout.row_width, true)?;
+        x86_emit_context_cell(assembler, cells_offset, layout.row_width, true, format)?;
         assembler.branch(&[0xe9], ready)?;
         assembler.bind(sentinel)?;
         assembler.instruction(&[0x41, 0xbb])?;
@@ -3729,7 +3806,7 @@ fn x86_emit_forward_transition_cell_at(
             &mut assembler.code,
             &u32::from(layout.class_count).to_le_bytes(),
         )?;
-        x86_emit_context_cell(assembler, cells_offset, layout.row_width, true)?;
+        x86_emit_context_cell(assembler, cells_offset, layout.row_width, true, format)?;
     }
     assembler.bind(ready)?;
     Ok(())
@@ -3744,6 +3821,7 @@ fn x86_emit_forward_transition_cell(
         layout,
         layout.forward_cells_offset,
         layout.forward_byte_sentinel_offset,
+        layout.forward_cell_format,
     )
 }
 
@@ -3757,6 +3835,7 @@ fn x86_emit_anchored_forward_transition_cell(
         layout,
         anchored.cells_offset,
         anchored.byte_sentinel_offset,
+        anchored.cell_format,
     )
 }
 
@@ -3770,6 +3849,11 @@ fn x86_emit_reverse_transition_cell(
         .ok_or(ObjectError::InvalidModule(
             "context reverse transition has no rows",
         ))?;
+    let format = layout
+        .reverse_cell_format
+        .ok_or(ObjectError::InvalidModule(
+            "context reverse transition has no physical format",
+        ))?;
     let sentinel = assembler.label()?;
     let ready = assembler.label()?;
     if layout.reverse_byte_sentinel_offset.is_some() {
@@ -3779,14 +3863,14 @@ fn x86_emit_reverse_transition_cell(
     assembler.branch(&[0x0f, 0x84], sentinel)?;
     if let Some(sentinel_offset) = layout.reverse_byte_sentinel_offset {
         assembler.instruction(&[0x0f, 0xb6, 0x44, 0x17, 0xff])?; // raw byte
-        x86_emit_direct_byte_context_cell(assembler, reverse_cells)?;
+        x86_emit_direct_byte_context_cell(assembler, reverse_cells, format)?;
         assembler.branch(&[0xe9], ready)?;
         assembler.bind(sentinel)?;
-        x86_emit_direct_sentinel_context_cell(assembler, sentinel_offset)?;
+        x86_emit_direct_sentinel_context_cell(assembler, sentinel_offset, format)?;
     } else {
         x86_emit_class_before_position(assembler, layout.byte_classes_offset)?;
         assembler.instruction(&[0x41, 0x89, 0xc3])?;
-        x86_emit_reverse_context_cell(assembler, reverse_cells, layout.row_width)?;
+        x86_emit_reverse_context_cell(assembler, reverse_cells, layout.row_width, format)?;
         assembler.branch(&[0xe9], ready)?;
         assembler.bind(sentinel)?;
         assembler.instruction(&[0x41, 0xbb])?;
@@ -3794,7 +3878,7 @@ fn x86_emit_reverse_transition_cell(
             &mut assembler.code,
             &u32::from(layout.class_count).to_le_bytes(),
         )?;
-        x86_emit_reverse_context_cell(assembler, reverse_cells, layout.row_width)?;
+        x86_emit_reverse_context_cell(assembler, reverse_cells, layout.row_width, format)?;
     }
     assembler.bind(ready)?;
     Ok(())
@@ -4628,11 +4712,12 @@ fn x86_emit_exists_suffix_reverse(
         assembler,
         invalid,
         ENABLE_CONTEXT_TRUST_POPULATED_TRANSITIONS,
+        context_reverse_cell_format(layout)?,
     )?;
     assembler.instruction(&[0x41, 0x89, 0xc3])?;
-    assembler.instruction(&[0x25, 0xff, 0xff, 0xff, 0x3f])?;
+    x86_emit_mask_reverse_payload(assembler, context_reverse_cell_format(layout)?)?;
     assembler.instruction(&[0x41, 0x89, 0xc2])?;
-    assembler.instruction(&[0x45, 0x85, 0xdb])?;
+    x86_emit_test_transition_event(assembler, context_reverse_cell_format(layout)?)?;
     assembler.branch(&[0x0f, 0x88], matched)?;
     assembler.branch(&[0xe9], reverse_loop)?;
 
@@ -4780,11 +4865,12 @@ fn x86_emit_ordered_suffix_reverse(
         assembler,
         invalid,
         ENABLE_CONTEXT_TRUST_POPULATED_TRANSITIONS,
+        context_reverse_cell_format(layout)?,
     )?;
     assembler.instruction(&[0x41, 0x89, 0xc3])?;
-    assembler.instruction(&[0x25, 0xff, 0xff, 0xff, 0x3f])?;
+    x86_emit_mask_reverse_payload(assembler, context_reverse_cell_format(layout)?)?;
     assembler.instruction(&[0x41, 0x89, 0xc2])?;
-    assembler.instruction(&[0x45, 0x85, 0xdb])?;
+    x86_emit_test_transition_event(assembler, context_reverse_cell_format(layout)?)?;
     assembler.branch(&[0x0f, 0x89], no_event)?;
     x86_emit_ordered_suffix_update_best(assembler, complete)?;
     assembler.bind(no_event)?;
@@ -5250,9 +5336,10 @@ fn x86_emit_anchored_forward_search(
         assembler,
         invalid,
         ENABLE_CONTEXT_TRUST_POPULATED_TRANSITIONS,
+        anchored.cell_format,
     )?;
     assembler.instruction(&[0x41, 0xff, 0xcd])?; // dec r13d
-    assembler.instruction(&[0x45, 0x85, 0xdb])?;
+    x86_emit_test_transition_event(assembler, anchored.cell_format)?;
     assembler.branch(&[0x0f, 0x89], no_event)?;
     assembler.instruction(&[0x49, 0x89, 0x50, 0x08])?;
     assembler.bind(no_event)?;
@@ -5593,8 +5680,9 @@ fn lower_x86_64_context(
         &mut assembler,
         invalid_initialized,
         ENABLE_CONTEXT_TRUST_POPULATED_TRANSITIONS,
+        layout.forward_cell_format,
     )?;
-    assembler.instruction(&[0x45, 0x85, 0xdb])?;
+    x86_emit_test_transition_event(&mut assembler, layout.forward_cell_format)?;
     assembler.branch(&[0x0f, 0x89], forward_no_event)?;
     assembler.instruction(&[0x49, 0x89, 0x50, 0x08])?;
     if layout.output == OutputContract::Exists {
@@ -5701,11 +5789,18 @@ fn lower_x86_64_context(
                     &mut assembler,
                     invalid_initialized,
                     ENABLE_CONTEXT_TRUST_POPULATED_TRANSITIONS,
+                    context_reverse_cell_format(layout)?,
                 )?;
                 assembler.instruction(&[0x41, 0x89, 0xc3])?;
-                assembler.instruction(&[0x25, 0xff, 0xff, 0xff, 0x3f])?;
+                x86_emit_mask_reverse_payload(
+                    &mut assembler,
+                    context_reverse_cell_format(layout)?,
+                )?;
                 assembler.instruction(&[0x41, 0x89, 0xc2])?;
-                assembler.instruction(&[0x45, 0x85, 0xdb])?;
+                x86_emit_test_transition_event(
+                    &mut assembler,
+                    context_reverse_cell_format(layout)?,
+                )?;
                 assembler.branch(&[0x0f, 0x89], reverse_no_event)?;
                 assembler.instruction(&[0x48, 0x89, 0xd1])?;
                 assembler.bind(reverse_no_event)?;
@@ -6082,11 +6177,17 @@ fn aarch64_context_emit_populated_transition_valid_mode(
     assembler: &mut Aarch64Assembler,
     invalid: usize,
     trust: bool,
+    format: ContextTransitionCellFormat,
 ) -> Result<(), ObjectError> {
     if trust {
         Ok(())
     } else {
-        aarch64_context_emit_valid(assembler, invalid)
+        let bit = match format {
+            ContextTransitionCellFormat::Compact16 => 14,
+            ContextTransitionCellFormat::Wide32 => 30,
+        };
+        assembler.branch_bit_clear_w(8, bit, invalid)?;
+        Ok(())
     }
 }
 
@@ -6094,15 +6195,34 @@ fn aarch64_context_emit_decode_populated_forward_transition_mode(
     assembler: &mut Aarch64Assembler,
     invalid: usize,
     trust: bool,
+    format: ContextTransitionCellFormat,
 ) -> Result<(), ObjectError> {
     assembler.instruction(aarch64_mov_x(12, 8)?)?; // preserve event bit
-    assembler.instruction(aarch64_context_and_low_w(6, 8, 28)?)?;
+    let (payload_bits, flags_shift) = match format {
+        ContextTransitionCellFormat::Compact16 => (12, CONTEXT_COMPACT_FORWARD_CELL_FLAGS_SHIFT),
+        ContextTransitionCellFormat::Wide32 => (28, CONTEXT_FORWARD_CELL_FLAGS_SHIFT),
+    };
+    assembler.instruction(aarch64_context_and_low_w(6, 8, payload_bits)?)?;
     if !trust {
         assembler.branch_zero_w(6, invalid)?;
     }
     assembler.instruction(aarch64_sub_w_imm(6, 6, 1)?)?;
-    assembler.instruction(aarch64_lsr_x_imm(8, 8, CONTEXT_FORWARD_CELL_FLAGS_SHIFT)?)?;
+    assembler.instruction(aarch64_lsr_x_imm(8, 8, flags_shift)?)?;
     Ok(())
+}
+
+const fn context_transition_event_bit(format: ContextTransitionCellFormat) -> u8 {
+    match format {
+        ContextTransitionCellFormat::Compact16 => 15,
+        ContextTransitionCellFormat::Wide32 => 31,
+    }
+}
+
+const fn context_reverse_payload_bits(format: ContextTransitionCellFormat) -> u8 {
+    match format {
+        ContextTransitionCellFormat::Compact16 => 14,
+        ContextTransitionCellFormat::Wide32 => 30,
+    }
 }
 
 fn aarch64_context_emit_clear_result(assembler: &mut Aarch64Assembler) -> Result<(), ObjectError> {
@@ -6957,9 +7077,18 @@ fn aarch64_context_emit_exists_suffix_reverse(
         assembler,
         invalid,
         ENABLE_CONTEXT_TRUST_POPULATED_TRANSITIONS,
+        context_reverse_cell_format(layout)?,
     )?;
-    assembler.instruction(aarch64_context_and_low_w(6, 8, 30)?)?;
-    assembler.branch_bit_set_w(8, 31, matched)?;
+    assembler.instruction(aarch64_context_and_low_w(
+        6,
+        8,
+        context_reverse_payload_bits(context_reverse_cell_format(layout)?),
+    )?)?;
+    assembler.branch_bit_set_w(
+        8,
+        context_transition_event_bit(context_reverse_cell_format(layout)?),
+        matched,
+    )?;
     assembler.branch(reverse_loop)?;
 
     assembler.bind(failed)?;
@@ -7068,9 +7197,18 @@ fn aarch64_context_emit_ordered_suffix_reverse(
         assembler,
         invalid,
         ENABLE_CONTEXT_TRUST_POPULATED_TRANSITIONS,
+        context_reverse_cell_format(layout)?,
     )?;
-    assembler.instruction(aarch64_context_and_low_w(6, 8, 30)?)?;
-    assembler.branch_bit_set_w(8, 31, event)?;
+    assembler.instruction(aarch64_context_and_low_w(
+        6,
+        8,
+        context_reverse_payload_bits(context_reverse_cell_format(layout)?),
+    )?)?;
+    assembler.branch_bit_set_w(
+        8,
+        context_transition_event_bit(context_reverse_cell_format(layout)?),
+        event,
+    )?;
     assembler.branch(reverse_loop)?;
 
     assembler.bind(event)?;
@@ -7415,12 +7553,17 @@ fn aarch64_context_emit_row_cell(
     state: u8,
     symbol: u8,
     row_width: u16,
+    format: ContextTransitionCellFormat,
 ) -> Result<(), ObjectError> {
     aarch64_set_table_address(assembler, 15, table_offset)?;
     aarch64_load_u32_constant(assembler, 13, u32::from(row_width))?;
     assembler.instruction(aarch64_context_mul_x(16, state, 13)?)?;
     assembler.instruction(aarch64_add_x_reg(16, 16, symbol)?)?;
-    assembler.instruction(aarch64_context_load_w_lsl2(8, 15, 16)?)?;
+    let load = match format {
+        ContextTransitionCellFormat::Compact16 => aarch64_context_load_h_lsl1(8, 15, 16)?,
+        ContextTransitionCellFormat::Wide32 => aarch64_context_load_w_lsl2(8, 15, 16)?,
+    };
+    assembler.instruction(load)?;
     Ok(())
 }
 
@@ -7428,19 +7571,29 @@ fn aarch64_context_emit_direct_byte_cell(
     assembler: &mut Aarch64Assembler,
     state: u8,
     byte: u8,
+    format: ContextTransitionCellFormat,
 ) -> Result<(), ObjectError> {
     // x15 is pinned to the 256-cell rows for the duration of this loop.
     assembler.instruction(aarch64_context_add_x_lsl(16, byte, state, 8)?)?;
-    assembler.instruction(aarch64_context_load_w_lsl2(8, 15, 16)?)?;
+    let load = match format {
+        ContextTransitionCellFormat::Compact16 => aarch64_context_load_h_lsl1(8, 15, 16)?,
+        ContextTransitionCellFormat::Wide32 => aarch64_context_load_w_lsl2(8, 15, 16)?,
+    };
+    assembler.instruction(load)?;
     Ok(())
 }
 
 fn aarch64_context_emit_direct_sentinel_cell(
     assembler: &mut Aarch64Assembler,
     state: u8,
+    format: ContextTransitionCellFormat,
 ) -> Result<(), ObjectError> {
     // x13 is pinned to one absolute-boundary cell per state.
-    assembler.instruction(aarch64_context_load_w_lsl2(8, 13, state)?)?;
+    let load = match format {
+        ContextTransitionCellFormat::Compact16 => aarch64_context_load_h_lsl1(8, 13, state)?,
+        ContextTransitionCellFormat::Wide32 => aarch64_context_load_w_lsl2(8, 13, state)?,
+    };
+    assembler.instruction(load)?;
     Ok(())
 }
 
@@ -7487,6 +7640,7 @@ fn aarch64_context_emit_forward_transition_cell_at(
     layout: &ContextNativeLayout,
     cells_offset: u32,
     byte_sentinel_offset: Option<u32>,
+    format: ContextTransitionCellFormat,
 ) -> Result<(), ObjectError> {
     let sentinel = assembler.label()?;
     let ready = assembler.label()?;
@@ -7494,17 +7648,17 @@ fn aarch64_context_emit_forward_transition_cell_at(
     assembler.branch_cond(AARCH64_EQ, sentinel)?;
     if byte_sentinel_offset.is_some() {
         assembler.instruction(aarch64_load_byte_reg(11, 0, 2)?)?;
-        aarch64_context_emit_direct_byte_cell(assembler, 6, 11)?;
+        aarch64_context_emit_direct_byte_cell(assembler, 6, 11, format)?;
         assembler.branch(ready)?;
         assembler.bind(sentinel)?;
-        aarch64_context_emit_direct_sentinel_cell(assembler, 6)?;
+        aarch64_context_emit_direct_sentinel_cell(assembler, 6, format)?;
     } else {
         aarch64_context_emit_class_at(assembler, layout, 2, 11)?;
-        aarch64_context_emit_row_cell(assembler, cells_offset, 6, 11, layout.row_width)?;
+        aarch64_context_emit_row_cell(assembler, cells_offset, 6, 11, layout.row_width, format)?;
         assembler.branch(ready)?;
         assembler.bind(sentinel)?;
         assembler.instruction(aarch64_mov_x(11, 14)?)?;
-        aarch64_context_emit_row_cell(assembler, cells_offset, 6, 11, layout.row_width)?;
+        aarch64_context_emit_row_cell(assembler, cells_offset, 6, 11, layout.row_width, format)?;
     }
     assembler.bind(ready)?;
     Ok(())
@@ -7519,6 +7673,7 @@ fn aarch64_context_emit_forward_transition_cell(
         layout,
         layout.forward_cells_offset,
         layout.forward_byte_sentinel_offset,
+        layout.forward_cell_format,
     )
 }
 
@@ -7532,6 +7687,7 @@ fn aarch64_context_emit_anchored_forward_transition_cell(
         layout,
         anchored.cells_offset,
         anchored.byte_sentinel_offset,
+        anchored.cell_format,
     )
 }
 
@@ -7544,6 +7700,7 @@ fn aarch64_context_emit_reverse_transition_cell(
         .ok_or(ObjectError::InvalidModule(
             "context reverse transition has no rows",
         ))?;
+    let format = context_reverse_cell_format(layout)?;
     let sentinel = assembler.label()?;
     let ready = assembler.label()?;
     if layout.reverse_byte_sentinel_offset.is_some() {
@@ -7554,19 +7711,19 @@ fn aarch64_context_emit_reverse_transition_cell(
     assembler.instruction(aarch64_sub_x_imm(12, 2, 1)?)?;
     if layout.reverse_byte_sentinel_offset.is_some() {
         assembler.instruction(aarch64_load_byte_reg(12, 0, 12)?)?;
-        aarch64_context_emit_direct_byte_cell(assembler, 6, 12)?;
+        aarch64_context_emit_direct_byte_cell(assembler, 6, 12, format)?;
         assembler.branch(ready)?;
         assembler.bind(sentinel)?;
-        aarch64_context_emit_direct_sentinel_cell(assembler, 6)?;
+        aarch64_context_emit_direct_sentinel_cell(assembler, 6, format)?;
     } else {
         aarch64_context_emit_class_at(assembler, layout, 12, 12)?;
         assembler.instruction(aarch64_sub_w_imm(6, 6, 1)?)?;
-        aarch64_context_emit_row_cell(assembler, reverse_cells, 6, 12, layout.row_width)?;
+        aarch64_context_emit_row_cell(assembler, reverse_cells, 6, 12, layout.row_width, format)?;
         assembler.branch(ready)?;
         assembler.bind(sentinel)?;
         assembler.instruction(aarch64_mov_x(12, 14)?)?;
         assembler.instruction(aarch64_sub_w_imm(6, 6, 1)?)?;
-        aarch64_context_emit_row_cell(assembler, reverse_cells, 6, 12, layout.row_width)?;
+        aarch64_context_emit_row_cell(assembler, reverse_cells, 6, 12, layout.row_width, format)?;
     }
     assembler.bind(ready)?;
     Ok(())
@@ -7654,9 +7811,14 @@ fn aarch64_context_emit_anchored_forward_search(
         assembler,
         invalid,
         ENABLE_CONTEXT_TRUST_POPULATED_TRANSITIONS,
+        anchored.cell_format,
     )?;
     assembler.instruction(aarch64_sub_w_imm(10, 10, 1)?)?;
-    assembler.branch_bit_set_w(12, 31, event)?;
+    assembler.branch_bit_set_w(
+        12,
+        context_transition_event_bit(anchored.cell_format),
+        event,
+    )?;
     assembler.branch(no_event)?;
     assembler.bind(event)?;
     assembler.instruction(aarch64_store_x(2, 4, 8)?)?;
@@ -7988,8 +8150,13 @@ fn lower_aarch64_context(
         &mut assembler,
         invalid_initialized,
         ENABLE_CONTEXT_TRUST_POPULATED_TRANSITIONS,
+        layout.forward_cell_format,
     )?;
-    assembler.branch_bit_set_w(12, 31, forward_no_event)?;
+    assembler.branch_bit_set_w(
+        12,
+        context_transition_event_bit(layout.forward_cell_format),
+        forward_no_event,
+    )?;
     assembler.branch(forward_loop)?;
     assembler.bind(forward_no_event)?;
     assembler.instruction(aarch64_store_x(2, 4, 8)?)?;
@@ -8097,9 +8264,18 @@ fn lower_aarch64_context(
                     &mut assembler,
                     invalid_initialized,
                     ENABLE_CONTEXT_TRUST_POPULATED_TRANSITIONS,
+                    context_reverse_cell_format(layout)?,
                 )?;
-                assembler.instruction(aarch64_context_and_low_w(6, 8, 30)?)?;
-                assembler.branch_bit_set_w(8, 31, reverse_no_event)?;
+                assembler.instruction(aarch64_context_and_low_w(
+                    6,
+                    8,
+                    context_reverse_payload_bits(context_reverse_cell_format(layout)?),
+                )?)?;
+                assembler.branch_bit_set_w(
+                    8,
+                    context_transition_event_bit(context_reverse_cell_format(layout)?),
+                    reverse_no_event,
+                )?;
                 assembler.branch(reverse_loop)?;
                 assembler.bind(reverse_no_event)?;
                 assembler.instruction(aarch64_mov_x(17, 2)?)?;
@@ -11332,7 +11508,12 @@ mod tests {
         const OFFSET: u32 = 0x4433_2211;
 
         let mut x86_byte = X86Assembler::new();
-        x86_emit_direct_byte_context_cell(&mut x86_byte, OFFSET).unwrap();
+        x86_emit_direct_byte_context_cell(
+            &mut x86_byte,
+            OFFSET,
+            ContextTransitionCellFormat::Wide32,
+        )
+        .unwrap();
         assert_eq!(
             x86_byte.finish().unwrap(),
             [
@@ -11342,27 +11523,200 @@ mod tests {
             ]
         );
         let mut x86_sentinel = X86Assembler::new();
-        x86_emit_direct_sentinel_context_cell(&mut x86_sentinel, OFFSET).unwrap();
+        x86_emit_direct_sentinel_context_cell(
+            &mut x86_sentinel,
+            OFFSET,
+            ContextTransitionCellFormat::Wide32,
+        )
+        .unwrap();
         assert_eq!(
             x86_sentinel.finish().unwrap(),
             [0x43, 0x8b, 0x84, 0x91, 0x11, 0x22, 0x33, 0x44]
         );
 
+        let mut x86_compact_byte = X86Assembler::new();
+        x86_emit_direct_byte_context_cell(
+            &mut x86_compact_byte,
+            OFFSET,
+            ContextTransitionCellFormat::Compact16,
+        )
+        .unwrap();
+        assert_eq!(
+            x86_compact_byte.finish().unwrap(),
+            [
+                0x41, 0xc1, 0xe2, 0x08, // shl r10d, 8
+                0x44, 0x01, 0xd0, // add eax, r10d
+                0x41, 0x0f, 0xb7, 0x84, 0x41, 0x11, 0x22, 0x33, 0x44,
+            ]
+        );
+        let mut x86_compact_sentinel = X86Assembler::new();
+        x86_emit_direct_sentinel_context_cell(
+            &mut x86_compact_sentinel,
+            OFFSET,
+            ContextTransitionCellFormat::Compact16,
+        )
+        .unwrap();
+        assert_eq!(
+            x86_compact_sentinel.finish().unwrap(),
+            [0x43, 0x0f, 0xb7, 0x84, 0x51, 0x11, 0x22, 0x33, 0x44]
+        );
+
+        let mut x86_compact_row = X86Assembler::new();
+        x86_emit_context_cell(
+            &mut x86_compact_row,
+            OFFSET,
+            5,
+            true,
+            ContextTransitionCellFormat::Compact16,
+        )
+        .unwrap();
+        assert_eq!(
+            x86_compact_row.finish().unwrap(),
+            [
+                0x44, 0x89, 0xd0, // eax = r10d
+                0x6b, 0xc0, 0x05, // eax *= row width
+                0x44, 0x01, 0xd8, // eax += r11d
+                0x41, 0x0f, 0xb7, 0x84, 0x41, 0x11, 0x22, 0x33, 0x44,
+            ]
+        );
+
         let mut aarch64_forward = Aarch64Assembler::new();
-        aarch64_context_emit_direct_byte_cell(&mut aarch64_forward, 6, 11).unwrap();
+        aarch64_context_emit_direct_byte_cell(
+            &mut aarch64_forward,
+            6,
+            11,
+            ContextTransitionCellFormat::Wide32,
+        )
+        .unwrap();
         assert_eq!(
             aarch64_forward.finish().unwrap(),
             [0x70, 0x21, 0x06, 0x8b, 0xe8, 0x79, 0x70, 0xb8]
         );
         let mut aarch64_reverse = Aarch64Assembler::new();
-        aarch64_context_emit_direct_byte_cell(&mut aarch64_reverse, 6, 12).unwrap();
+        aarch64_context_emit_direct_byte_cell(
+            &mut aarch64_reverse,
+            6,
+            12,
+            ContextTransitionCellFormat::Wide32,
+        )
+        .unwrap();
         assert_eq!(
             aarch64_reverse.finish().unwrap(),
             [0x90, 0x21, 0x06, 0x8b, 0xe8, 0x79, 0x70, 0xb8]
         );
         let mut aarch64_sentinel = Aarch64Assembler::new();
-        aarch64_context_emit_direct_sentinel_cell(&mut aarch64_sentinel, 6).unwrap();
+        aarch64_context_emit_direct_sentinel_cell(
+            &mut aarch64_sentinel,
+            6,
+            ContextTransitionCellFormat::Wide32,
+        )
+        .unwrap();
         assert_eq!(aarch64_sentinel.finish().unwrap(), [0xa8, 0x79, 0x66, 0xb8]);
+
+        let mut aarch64_compact_byte = Aarch64Assembler::new();
+        aarch64_context_emit_direct_byte_cell(
+            &mut aarch64_compact_byte,
+            6,
+            11,
+            ContextTransitionCellFormat::Compact16,
+        )
+        .unwrap();
+        let compact_byte_words = aarch64_compact_byte
+            .finish()
+            .unwrap()
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            compact_byte_words,
+            [
+                aarch64_context_add_x_lsl(16, 11, 6, 8).unwrap(),
+                aarch64_context_load_h_lsl1(8, 15, 16).unwrap(),
+            ]
+        );
+
+        let mut aarch64_compact_sentinel = Aarch64Assembler::new();
+        aarch64_context_emit_direct_sentinel_cell(
+            &mut aarch64_compact_sentinel,
+            6,
+            ContextTransitionCellFormat::Compact16,
+        )
+        .unwrap();
+        assert_eq!(
+            aarch64_compact_sentinel.finish().unwrap(),
+            aarch64_context_load_h_lsl1(8, 13, 6).unwrap().to_le_bytes()
+        );
+    }
+
+    #[test]
+    fn contextual_compact_cells_are_feature_tier_independent() {
+        let avx512 = FeatureSet::of(CpuFeature::X86Avx512F).with(CpuFeature::X86Avx512Bw);
+        let targets = [
+            Target::x86_64_linux(),
+            Target::x86_64_linux()
+                .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+                .unwrap(),
+            Target::x86_64_linux().with_features(avx512).unwrap(),
+            Target::aarch64_linux(),
+            Target::aarch64_linux()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                .unwrap(),
+            Target::aarch64_linux()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Sve).with(CpuFeature::Aarch64Sve2))
+                .unwrap(),
+        ];
+        for target in targets {
+            let compiled = compile(
+                CompileRequest::new(r"(?-u:\b)(?:ab|a)+(?-u:\b)", target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span),
+            )
+            .unwrap();
+            let view = compiled
+                .program()
+                .native_context_program_view()
+                .expect("feature-tier case must retain its contextual DFA");
+            let physical = build_context_native_layout_with_accelerators(
+                view,
+                ContextNativeLimits::default(),
+                false,
+                true,
+            )
+            .unwrap();
+            assert_eq!(
+                physical.forward_cell_format,
+                ContextTransitionCellFormat::Compact16,
+                "target={target:?}",
+            );
+            assert_eq!(
+                physical.reverse_cell_format,
+                Some(ContextTransitionCellFormat::Compact16),
+                "target={target:?}",
+            );
+            assert_eq!(
+                physical.anchored_forward.map(|layout| layout.cell_format),
+                Some(ContextTransitionCellFormat::Compact16),
+                "target={target:?}",
+            );
+
+            let code = compiled.module().sections()[TEXT_SECTION].bytes();
+            match target.architecture {
+                Architecture::X86_64 => assert!(
+                    code.windows(5)
+                        .any(|window| window == [0x41, 0x0f, 0xb7, 0x84, 0x41]),
+                    "x86 target lacks compact class/direct transition load: {target:?}",
+                ),
+                Architecture::Aarch64 => {
+                    let compact_load = aarch64_context_load_h_lsl1(8, 15, 16).unwrap();
+                    assert!(
+                        code.chunks_exact(4)
+                            .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+                            .any(|word| word == compact_load),
+                        "AArch64 target lacks compact class/direct transition load: {target:?}",
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -11375,6 +11729,7 @@ mod tests {
             &mut x86_checked,
             x86_checked_invalid,
             false,
+            ContextTransitionCellFormat::Wide32,
         )
         .unwrap();
         x86_checked.bind(x86_checked_invalid).unwrap();
@@ -11397,6 +11752,7 @@ mod tests {
             &mut x86_trusted,
             x86_trusted_invalid,
             true,
+            ContextTransitionCellFormat::Wide32,
         )
         .unwrap();
         x86_trusted.bind(x86_trusted_invalid).unwrap();
@@ -11411,12 +11767,33 @@ mod tests {
                 0xc1, 0xe8, 0x1c, // successor flags
             ]
         );
+        let mut x86_compact = X86Assembler::new();
+        let x86_compact_invalid = x86_compact.label().unwrap();
+        x86_emit_decode_populated_forward_transition_mode(
+            &mut x86_compact,
+            x86_compact_invalid,
+            false,
+            ContextTransitionCellFormat::Compact16,
+        )
+        .unwrap();
+        x86_compact.bind(x86_compact_invalid).unwrap();
+        assert_eq!(
+            x86_compact.finish().unwrap(),
+            [
+                0x41, 0x89, 0xc3, // preserve compact event bit
+                0x25, 0xff, 0x0f, 0x00, 0x00, // compact forward payload
+                0x85, 0xc0, 0x74, 0x0b, // compact payload is zero
+                0xff, 0xc8, 0x41, 0x89, 0xc2, 0x44, 0x89, 0xd8, 0xc1, 0xe8,
+                0x0c, // compact successor flags
+            ]
+        );
         let mut x86_reverse_checked = X86Assembler::new();
         let x86_reverse_invalid = x86_reverse_checked.label().unwrap();
         x86_emit_populated_transition_valid_mode(
             &mut x86_reverse_checked,
             x86_reverse_invalid,
             false,
+            ContextTransitionCellFormat::Wide32,
         )
         .unwrap();
         x86_reverse_checked.bind(x86_reverse_invalid).unwrap();
@@ -11424,12 +11801,50 @@ mod tests {
             x86_reverse_checked.finish().unwrap(),
             [0xa9, 0x00, 0x00, 0x00, 0x40]
         );
+        let mut x86_compact_reverse_checked = X86Assembler::new();
+        let x86_compact_reverse_invalid = x86_compact_reverse_checked.label().unwrap();
+        x86_emit_populated_transition_valid_mode(
+            &mut x86_compact_reverse_checked,
+            x86_compact_reverse_invalid,
+            false,
+            ContextTransitionCellFormat::Compact16,
+        )
+        .unwrap();
+        x86_compact_reverse_checked
+            .bind(x86_compact_reverse_invalid)
+            .unwrap();
+        assert_eq!(
+            x86_compact_reverse_checked.finish().unwrap(),
+            [0xa9, 0x00, 0x40, 0x00, 0x00],
+            "the immediately-bound invalid edge is elided after the compact valid-bit test",
+        );
+        let mut x86_compact_reverse_payload = X86Assembler::new();
+        x86_emit_mask_reverse_payload(
+            &mut x86_compact_reverse_payload,
+            ContextTransitionCellFormat::Compact16,
+        )
+        .unwrap();
+        assert_eq!(
+            x86_compact_reverse_payload.finish().unwrap(),
+            [0x25, 0xff, 0x3f, 0x00, 0x00]
+        );
+        let mut x86_compact_event = X86Assembler::new();
+        x86_emit_test_transition_event(
+            &mut x86_compact_event,
+            ContextTransitionCellFormat::Compact16,
+        )
+        .unwrap();
+        assert_eq!(
+            x86_compact_event.finish().unwrap(),
+            [0x66, 0x45, 0x85, 0xdb]
+        );
         let mut x86_reverse_trusted = X86Assembler::new();
         let x86_reverse_trusted_invalid = x86_reverse_trusted.label().unwrap();
         x86_emit_populated_transition_valid_mode(
             &mut x86_reverse_trusted,
             x86_reverse_trusted_invalid,
             true,
+            ContextTransitionCellFormat::Wide32,
         )
         .unwrap();
         x86_reverse_trusted
@@ -11443,6 +11858,7 @@ mod tests {
             &mut aarch64_checked,
             aarch64_checked_invalid,
             false,
+            ContextTransitionCellFormat::Wide32,
         )
         .unwrap();
         aarch64_checked.bind(aarch64_checked_invalid).unwrap();
@@ -11470,6 +11886,7 @@ mod tests {
             &mut aarch64_trusted,
             aarch64_trusted_invalid,
             true,
+            ContextTransitionCellFormat::Wide32,
         )
         .unwrap();
         aarch64_trusted.bind(aarch64_trusted_invalid).unwrap();
@@ -11487,24 +11904,71 @@ mod tests {
                 aarch64_lsr_x_imm(8, 8, CONTEXT_FORWARD_CELL_FLAGS_SHIFT).unwrap(),
             ]
         );
+        let mut aarch64_compact = Aarch64Assembler::new();
+        let aarch64_compact_invalid = aarch64_compact.label().unwrap();
+        aarch64_context_emit_decode_populated_forward_transition_mode(
+            &mut aarch64_compact,
+            aarch64_compact_invalid,
+            false,
+            ContextTransitionCellFormat::Compact16,
+        )
+        .unwrap();
+        aarch64_compact.bind(aarch64_compact_invalid).unwrap();
+        let compact_words = aarch64_compact
+            .finish()
+            .unwrap()
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(compact_words[0], aarch64_mov_x(12, 8).unwrap());
+        assert_eq!(
+            compact_words[1],
+            aarch64_context_and_low_w(6, 8, 12).unwrap()
+        );
+        assert_eq!(compact_words[2] & 0xff00_001f, 0x3400_0006);
+        assert_eq!(compact_words[3], aarch64_sub_w_imm(6, 6, 1).unwrap());
+        assert_eq!(
+            compact_words[4],
+            aarch64_lsr_x_imm(8, 8, CONTEXT_COMPACT_FORWARD_CELL_FLAGS_SHIFT).unwrap()
+        );
         let mut aarch64_reverse_checked = Aarch64Assembler::new();
         let aarch64_reverse_invalid = aarch64_reverse_checked.label().unwrap();
         aarch64_context_emit_populated_transition_valid_mode(
             &mut aarch64_reverse_checked,
             aarch64_reverse_invalid,
             false,
+            ContextTransitionCellFormat::Wide32,
         )
         .unwrap();
         aarch64_reverse_checked
             .bind(aarch64_reverse_invalid)
             .unwrap();
         assert_eq!(aarch64_reverse_checked.finish().unwrap().len(), 4);
+        let mut aarch64_compact_reverse_checked = Aarch64Assembler::new();
+        let aarch64_compact_reverse_invalid = aarch64_compact_reverse_checked.label().unwrap();
+        aarch64_context_emit_populated_transition_valid_mode(
+            &mut aarch64_compact_reverse_checked,
+            aarch64_compact_reverse_invalid,
+            false,
+            ContextTransitionCellFormat::Compact16,
+        )
+        .unwrap();
+        aarch64_compact_reverse_checked
+            .bind(aarch64_compact_reverse_invalid)
+            .unwrap();
+        let compact_reverse_valid = u32::from_le_bytes(
+            aarch64_compact_reverse_checked.finish().unwrap()[..4]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(compact_reverse_valid & 0xfff8_001f, 0x3670_0008);
         let mut aarch64_reverse_trusted = Aarch64Assembler::new();
         let aarch64_reverse_trusted_invalid = aarch64_reverse_trusted.label().unwrap();
         aarch64_context_emit_populated_transition_valid_mode(
             &mut aarch64_reverse_trusted,
             aarch64_reverse_trusted_invalid,
             true,
+            ContextTransitionCellFormat::Wide32,
         )
         .unwrap();
         aarch64_reverse_trusted
@@ -11979,6 +12443,14 @@ mod tests {
         );
     }
 
+    #[test]
+    #[ignore = "cross-links x86-64 Mach-O objects and executes them under Rosetta when needed"]
+    fn linked_x86_macos_context_differential() {
+        if cfg!(target_os = "macos") {
+            linked_host_context_differential_for_target(Target::x86_64_macos());
+        }
+    }
+
     #[allow(
         clippy::arithmetic_side_effects,
         clippy::too_many_lines,
@@ -11988,10 +12460,9 @@ mod tests {
         let directory = std::env::temp_dir().join(format!(
             "fre-aot-context-native-{}-{}",
             std::process::id(),
-            if cfg!(target_arch = "aarch64") {
-                "aarch64"
-            } else {
-                "x86_64"
+            match target.architecture {
+                Architecture::Aarch64 => "aarch64",
+                Architecture::X86_64 => "x86_64",
             }
         ));
         build_context_differential_bundle(target, directory, true, false);
@@ -12041,7 +12512,28 @@ mod tests {
                 assert!(compiled.program().native_context_program_view().is_none());
                 assert!(compiled.receipt().slow_context_aot.is_some());
             } else {
-                assert!(compiled.program().native_context_program_view().is_some());
+                let view = compiled
+                    .program()
+                    .native_context_program_view()
+                    .expect("linked differential case must retain its contextual DFA");
+                let physical = build_context_native_layout_with_reverse(
+                    view,
+                    ContextNativeLimits::default(),
+                    false,
+                )
+                .unwrap();
+                assert_eq!(
+                    physical.forward_cell_format,
+                    ContextTransitionCellFormat::Compact16,
+                    "linked differential must execute compact forward cells for {pattern:?}",
+                );
+                if physical.reverse_cells_offset.is_some() {
+                    assert_eq!(
+                        physical.reverse_cell_format,
+                        Some(ContextTransitionCellFormat::Compact16),
+                        "linked differential must execute compact reverse cells for {pattern:?}",
+                    );
+                }
                 assert!(compiled.receipt().slow_context_aot.is_none());
             }
             assert_eq!(compiled.module().required_runtime_program(), None);
@@ -12160,9 +12652,12 @@ mod tests {
         }
         let executable = directory.join("harness");
         let compiler = std::env::var_os("CC").unwrap_or_else(|| "cc".into());
-        let output = Command::new(compiler)
-            .arg("-O2")
-            .arg("-std=c11")
+        let mut command = Command::new(compiler);
+        command.arg("-O2").arg("-std=c11");
+        if cfg!(target_os = "macos") && target.architecture == Architecture::X86_64 {
+            command.arg("-arch").arg("x86_64");
+        }
+        let output = command
             .arg(&harness)
             .args(&objects)
             .arg("-o")

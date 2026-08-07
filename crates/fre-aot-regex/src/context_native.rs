@@ -2,11 +2,12 @@
 //!
 //! The contextual graph uses a 16-bit boundary key. Native initial-state
 //! dispatch can therefore be a complete direct-index table rather than a
-//! target-specific hash or comparison chain. Initial and reverse words retain
-//! explicit validity/event bits and a 30-bit `state + 1` payload. Complete
-//! forward rows instead carry the successor's three state flags beside the
-//! event and a 28-bit nonzero payload, eliminating a dependent flag-table load
-//! from the native forward loop.
+//! target-specific hash or comparison chain. Initial words retain explicit
+//! validity/event bits and a 30-bit `state + 1` payload. Complete transition
+//! rows independently use 16-bit cells whenever their direction's state count
+//! fits, with a checked 32-bit fallback. Forward rows carry the successor's
+//! three state flags beside the event and payload, eliminating a dependent
+//! flag-table load from the native forward loop.
 
 #![allow(
     dead_code,
@@ -37,6 +38,14 @@ pub(crate) const CONTEXT_FORWARD_CELL_FLAGS_SHIFT: u8 = 28;
 pub(crate) const CONTEXT_FORWARD_CELL_FLAGS_MASK: u32 = 0x7000_0000;
 /// Explicit invalid/unpopulated direct-dispatch entry.
 pub(crate) const CONTEXT_INVALID_CELL: u32 = 0;
+/// Compact complete-forward payload. Zero is invalid; nonzero is `state + 1`.
+pub(crate) const CONTEXT_COMPACT_FORWARD_CELL_STATE_MASK: u16 = 0x0fff;
+/// Shift of the three successor-state flags in a compact forward cell.
+pub(crate) const CONTEXT_COMPACT_FORWARD_CELL_FLAGS_SHIFT: u8 = 12;
+/// Packed successor-state flags in a compact forward cell.
+pub(crate) const CONTEXT_COMPACT_FORWARD_CELL_FLAGS_MASK: u16 = 0x7000;
+/// Acceptance event in a compact forward or reverse transition cell.
+pub(crate) const CONTEXT_COMPACT_CELL_EVENT: u16 = 1 << 15;
 /// Maximum representable number of states (last index is one less).
 pub(crate) const MAX_PACKED_CONTEXT_STATES: usize = 0x3fff_ffff;
 /// Maximum state count representable by a complete packed forward row.
@@ -44,6 +53,12 @@ pub(crate) const MAX_PACKED_CONTEXT_STATES: usize = 0x3fff_ffff;
 /// A table approaching this limit already exceeds the native data ceiling by
 /// orders of magnitude because every state has at least two four-byte cells.
 pub(crate) const MAX_PACKED_CONTEXT_FORWARD_STATES: usize = 0x0fff_ffff;
+/// Maximum complete-forward state count representable by a compact cell.
+pub(crate) const MAX_COMPACT_CONTEXT_FORWARD_STATES: usize =
+    CONTEXT_COMPACT_FORWARD_CELL_STATE_MASK as usize;
+/// Maximum reverse state count representable by a compact cell.
+pub(crate) const MAX_COMPACT_CONTEXT_REVERSE_STATES: usize =
+    CONTEXT_RAW_REVERSE_STATE_MASK as usize;
 /// Addressable native data ceiling shared by current x86-64/AArch64 lowering.
 pub(crate) const MAX_CONTEXT_NATIVE_DATA_BYTES: usize = 0x7fff_ffff;
 
@@ -88,8 +103,10 @@ const CONTEXT_RAW_BOUNDARY_ENTRIES: usize = 257;
 const CONTEXT_RAW_START_BYTES: usize = CONTEXT_RAW_BOUNDARY_ENTRIES * core::mem::size_of::<u16>();
 const CONTEXT_RAW_END_BYTES: usize = 256 * core::mem::size_of::<u16>();
 pub(crate) const CONTEXT_DIRECT_BYTE_ROW_CELLS: usize = 256;
-pub(crate) const CONTEXT_DIRECT_BYTE_ROW_BYTES: usize =
+pub(crate) const CONTEXT_DIRECT_BYTE_WIDE_ROW_BYTES: usize =
     CONTEXT_DIRECT_BYTE_ROW_CELLS * core::mem::size_of::<u32>();
+pub(crate) const CONTEXT_DIRECT_BYTE_COMPACT_ROW_BYTES: usize =
+    CONTEXT_DIRECT_BYTE_ROW_CELLS * core::mem::size_of::<u16>();
 const CONTEXT_DIRECT_BYTE_MAX_STATES: usize = 512;
 const CONTEXT_DIRECT_BYTE_MAX_COMBINED_BYTES: usize = 1 << 20;
 const CONTEXT_ANCHORED_DIRECT_BYTE_MAX_BYTES: usize = 256 * 1024;
@@ -101,6 +118,33 @@ fn raw_forward_initial_state_payload_fits(states: usize) -> bool {
 
 fn raw_reverse_initial_state_payload_fits(states: usize) -> bool {
     states <= usize::from(CONTEXT_RAW_REVERSE_STATE_MASK)
+}
+
+/// Physical width of one complete contextual transition cell.
+///
+/// Direction-specific packing assigns different flag bits, but lookup width
+/// and address scaling are shared by forward, reverse and anchored rows.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ContextTransitionCellFormat {
+    Compact16,
+    Wide32,
+}
+
+impl ContextTransitionCellFormat {
+    pub(crate) const fn bytes(self) -> usize {
+        match self {
+            Self::Compact16 => core::mem::size_of::<u16>(),
+            Self::Wide32 => core::mem::size_of::<u32>(),
+        }
+    }
+
+    const fn alignment(self) -> usize {
+        self.bytes()
+    }
+
+    pub(crate) const fn is_compact(self) -> bool {
+        matches!(self, Self::Compact16)
+    }
 }
 
 /// Caller-controlled resource ceiling for the owned packed data image.
@@ -120,9 +164,10 @@ impl Default for ContextNativeLimits {
 /// Deterministic, little-endian table image and target-independent offsets.
 ///
 /// `byte_classes` and `class_properties` are fixed 256-byte tables. Forward
-/// and retained reverse transitions have `row_width` packed `u32` cells per
-/// state. Initial dispatch is either the complete semantic-key table or a
-/// cost-gated raw adjacent-byte table plus bounded absolute-edge tables.
+/// and retained reverse transitions have `row_width` independently selected
+/// compact or wide cells per state. Initial dispatch is either the complete
+/// semantic-key table or a cost-gated raw adjacent-byte table plus bounded
+/// absolute-edge tables.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ContextNativeLayout {
     pub(crate) output: OutputContract,
@@ -136,9 +181,11 @@ pub(crate) struct ContextNativeLayout {
     pub(crate) class_properties_offset: u32,
     pub(crate) forward_state_flags_offset: u32,
     pub(crate) forward_cells_offset: u32,
+    pub(crate) forward_cell_format: ContextTransitionCellFormat,
     /// Separate per-state absolute-boundary cells for DirectByte forward rows.
     pub(crate) forward_byte_sentinel_offset: Option<u32>,
     pub(crate) reverse_cells_offset: Option<u32>,
+    pub(crate) reverse_cell_format: Option<ContextTransitionCellFormat>,
     /// Separate per-state absolute-boundary cells for DirectByte reverse rows.
     pub(crate) reverse_byte_sentinel_offset: Option<u32>,
     pub(crate) forward_initial_offset: u32,
@@ -161,6 +208,7 @@ pub(crate) struct ContextAnchoredForwardLayout {
     pub(crate) main_initial_to_anchored_offset: u32,
     pub(crate) state_flags_offset: u32,
     pub(crate) cells_offset: u32,
+    pub(crate) cell_format: ContextTransitionCellFormat,
     pub(crate) byte_sentinel_offset: Option<u32>,
     pub(crate) max_resolution_steps: Option<u32>,
 }
@@ -291,8 +339,10 @@ struct ContextLayoutPlan {
     class_properties: usize,
     forward_state_flags: usize,
     forward_cells: usize,
+    forward_cell_format: ContextTransitionCellFormat,
     forward_byte_sentinel: Option<usize>,
     reverse_cells: Option<usize>,
+    reverse_cell_format: Option<ContextTransitionCellFormat>,
     reverse_byte_sentinel: Option<usize>,
     forward_initial: usize,
     reverse_initial: Option<usize>,
@@ -598,9 +648,17 @@ impl ContextNativeLayout {
     }
 
     pub(crate) fn forward_cell(&self, state: u32, symbol: u16) -> Option<u32> {
+        let format = self.forward_cell_format;
         if let Some(sentinel) = self.forward_byte_sentinel_offset {
             if symbol == self.class_count {
-                return direct_byte_sentinel_cell(&self.data, sentinel, self.forward_states, state);
+                return direct_byte_sentinel_cell(
+                    &self.data,
+                    sentinel,
+                    self.forward_states,
+                    state,
+                    format,
+                )
+                .map(|word| expand_forward_transition_word(word, format));
             }
             let byte = self.raw_byte_for_class(symbol)?;
             return direct_byte_table_cell(
@@ -609,7 +667,9 @@ impl ContextNativeLayout {
                 self.forward_states,
                 state,
                 byte,
-            );
+                format,
+            )
+            .map(|word| expand_forward_transition_word(word, format));
         }
         packed_table_cell(
             &self.data,
@@ -618,13 +678,23 @@ impl ContextNativeLayout {
             self.row_width,
             state,
             symbol,
+            format,
         )
+        .map(|word| expand_forward_transition_word(word, format))
     }
 
     pub(crate) fn reverse_cell(&self, state: u32, symbol: u16) -> Option<u32> {
+        let format = self.reverse_cell_format?;
         if let Some(sentinel) = self.reverse_byte_sentinel_offset {
             if symbol == self.class_count {
-                return direct_byte_sentinel_cell(&self.data, sentinel, self.reverse_states, state);
+                return direct_byte_sentinel_cell(
+                    &self.data,
+                    sentinel,
+                    self.reverse_states,
+                    state,
+                    format,
+                )
+                .map(|word| expand_reverse_transition_word(word, format));
             }
             let byte = self.raw_byte_for_class(symbol)?;
             return direct_byte_table_cell(
@@ -633,7 +703,9 @@ impl ContextNativeLayout {
                 self.reverse_states,
                 state,
                 byte,
-            );
+                format,
+            )
+            .map(|word| expand_reverse_transition_word(word, format));
         }
         packed_table_cell(
             &self.data,
@@ -642,7 +714,9 @@ impl ContextNativeLayout {
             self.row_width,
             state,
             symbol,
+            format,
         )
+        .map(|word| expand_reverse_transition_word(word, format))
     }
 
     pub(crate) const fn forward_direct_bytes(&self) -> bool {
@@ -678,6 +752,7 @@ impl ContextNativeLayout {
 
     pub(crate) fn anchored_cell_for_byte(&self, state: u32, byte: Option<u8>) -> Option<u32> {
         let anchored = self.anchored_forward?;
+        let format = anchored.cell_format;
         if let Some(sentinel) = anchored.byte_sentinel_offset {
             return match byte {
                 Some(byte) => direct_byte_table_cell(
@@ -686,9 +761,13 @@ impl ContextNativeLayout {
                     anchored.states,
                     state,
                     byte,
+                    format,
                 ),
-                None => direct_byte_sentinel_cell(&self.data, sentinel, anchored.states, state),
-            };
+                None => {
+                    direct_byte_sentinel_cell(&self.data, sentinel, anchored.states, state, format)
+                }
+            }
+            .map(|word| expand_forward_transition_word(word, format));
         }
         let symbol = byte.map_or(self.class_count, |byte| {
             u16::from(self.class_for_byte(byte))
@@ -700,10 +779,13 @@ impl ContextNativeLayout {
             self.row_width,
             state,
             symbol,
+            format,
         )
+        .map(|word| expand_forward_transition_word(word, format))
     }
 
     fn forward_cell_for_byte(&self, state: u32, byte: Option<u8>) -> Option<u32> {
+        let format = self.forward_cell_format;
         if let Some(sentinel) = self.forward_byte_sentinel_offset {
             return match byte {
                 Some(byte) => direct_byte_table_cell(
@@ -712,9 +794,17 @@ impl ContextNativeLayout {
                     self.forward_states,
                     state,
                     byte,
+                    format,
                 ),
-                None => direct_byte_sentinel_cell(&self.data, sentinel, self.forward_states, state),
-            };
+                None => direct_byte_sentinel_cell(
+                    &self.data,
+                    sentinel,
+                    self.forward_states,
+                    state,
+                    format,
+                ),
+            }
+            .map(|word| expand_forward_transition_word(word, format));
         }
         let symbol = byte.map_or(self.class_count, |byte| {
             u16::from(self.class_for_byte(byte))
@@ -723,6 +813,7 @@ impl ContextNativeLayout {
     }
 
     fn reverse_cell_for_byte(&self, state: u32, byte: Option<u8>) -> Option<u32> {
+        let format = self.reverse_cell_format?;
         if let Some(sentinel) = self.reverse_byte_sentinel_offset {
             return match byte {
                 Some(byte) => direct_byte_table_cell(
@@ -731,9 +822,17 @@ impl ContextNativeLayout {
                     self.reverse_states,
                     state,
                     byte,
+                    format,
                 ),
-                None => direct_byte_sentinel_cell(&self.data, sentinel, self.reverse_states, state),
-            };
+                None => direct_byte_sentinel_cell(
+                    &self.data,
+                    sentinel,
+                    self.reverse_states,
+                    state,
+                    format,
+                ),
+            }
+            .map(|word| expand_reverse_transition_word(word, format));
         }
         let symbol = byte.map_or(self.class_count, |byte| {
             u16::from(self.class_for_byte(byte))
@@ -1076,11 +1175,15 @@ fn build_context_native_layout_with_reverse_mode(
         && ENABLE_CONTEXT_RAW_PAIR_REVERSE_INITIAL_DISPATCH
         && raw_reverse_initial_state_payload_fits(reverse_states);
     let effective_limit = limits.max_data_bytes.min(MAX_CONTEXT_NATIVE_DATA_BYTES);
+    let forward_cell_format = select_forward_cell_format(forward_states);
+    let reverse_cell_format = select_reverse_cell_format(reverse_states);
     let (mut direct_forward, mut direct_reverse) = select_direct_byte_directions(
         forward_states,
         reverse_states,
         retain_reverse,
         enable_direct_bytes,
+        forward_cell_format,
+        reverse_cell_format,
     )?;
     let plan = loop {
         match plan_context_layout(
@@ -1092,6 +1195,8 @@ fn build_context_native_layout_with_reverse_mode(
             raw_pair_reverse_initial,
             direct_forward,
             direct_reverse,
+            forward_cell_format,
+            reverse_cell_format,
             effective_limit,
         ) {
             Err(ObjectError::Resource {
@@ -1139,6 +1244,7 @@ fn build_context_native_layout_with_reverse_mode(
         dfa,
         forward_states,
         row_width,
+        plan.forward_cell_format,
     )?;
     if let Some(reverse_cells) = plan.reverse_cells {
         populate_reverse_transition_cells(
@@ -1148,6 +1254,9 @@ fn build_context_native_layout_with_reverse_mode(
             dfa,
             reverse_states,
             row_width,
+            plan.reverse_cell_format.ok_or(ObjectError::InvalidModule(
+                "context reverse cells have no physical format",
+            ))?,
         )?;
     }
     if let Some(raw) = plan.raw_pair_initial {
@@ -1238,6 +1347,7 @@ fn build_context_native_layout_with_reverse_mode(
             "context forward flags",
         )?,
         forward_cells_offset: checked_offset(plan.forward_cells, "context forward cells")?,
+        forward_cell_format: plan.forward_cell_format,
         forward_byte_sentinel_offset: plan
             .forward_byte_sentinel
             .map(|value| checked_offset(value, "context forward byte sentinel cells"))
@@ -1246,6 +1356,7 @@ fn build_context_native_layout_with_reverse_mode(
             .reverse_cells
             .map(|value| checked_offset(value, "context reverse cells"))
             .transpose()?,
+        reverse_cell_format: plan.reverse_cell_format,
         reverse_byte_sentinel_offset: plan
             .reverse_byte_sentinel
             .map(|value| checked_offset(value, "context reverse byte sentinel cells"))
@@ -1287,6 +1398,7 @@ fn append_anchored_forward_layout_mode(
     };
     let states = anchored.states.len();
     check_state_count(states)?;
+    let cell_format = select_forward_cell_format(states);
     let row_width = usize::try_from(dfa.initial_dispatch.row_width)
         .map_err(|_| ObjectError::ArithmeticOverflow("context anchored row width"))?;
     let start = data.len();
@@ -1316,7 +1428,7 @@ fn append_anchored_forward_layout_mode(
     };
     let Some(aligned_cells) = align_up(
         after_flags,
-        core::mem::align_of::<u32>(),
+        cell_format.alignment(),
         "context anchored cell alignment",
     )
     .ok() else {
@@ -1324,20 +1436,16 @@ fn append_anchored_forward_layout_mode(
     };
     cursor = aligned_cells;
     let cells = cursor;
-    let direct_bytes = direct_byte_transition_bytes(states).ok();
+    let direct_bytes = direct_byte_transition_bytes(states, cell_format).ok();
     let direct = enable_direct_bytes
         && direct_bytes.is_some_and(|bytes| bytes <= CONTEXT_ANCHORED_DIRECT_BYTE_MAX_BYTES);
     let cell_bytes = if direct {
-        let Some(bytes) = states.checked_mul(CONTEXT_DIRECT_BYTE_ROW_BYTES) else {
+        let Some(bytes) = states.checked_mul(direct_byte_row_bytes(cell_format)?) else {
             return Ok(None);
         };
         bytes
     } else {
-        let Some(bytes) = anchored
-            .cells
-            .len()
-            .checked_mul(core::mem::size_of::<u32>())
-        else {
+        let Some(bytes) = anchored.cells.len().checked_mul(cell_format.bytes()) else {
             return Ok(None);
         };
         bytes
@@ -1348,7 +1456,7 @@ fn append_anchored_forward_layout_mode(
     cursor = after_cells;
     let byte_sentinel = if direct {
         let offset = cursor;
-        let Some(bytes) = states.checked_mul(core::mem::size_of::<u32>()) else {
+        let Some(bytes) = states.checked_mul(cell_format.bytes()) else {
             return Ok(None);
         };
         let Some(after_sentinel) = cursor.checked_add(bytes) else {
@@ -1384,7 +1492,16 @@ fn append_anchored_forward_layout_mode(
             ))?;
         data[destination] = context_forward_flags(state)?;
     }
-    populate_anchored_forward_cells(data, cells, byte_sentinel, dfa, anchored, states, row_width)?;
+    populate_anchored_forward_cells(
+        data,
+        cells,
+        byte_sentinel,
+        dfa,
+        anchored,
+        states,
+        row_width,
+        cell_format,
+    )?;
 
     Ok(Some(ContextAnchoredForwardLayout {
         states: u32::try_from(states)
@@ -1395,6 +1512,7 @@ fn append_anchored_forward_layout_mode(
         )?,
         state_flags_offset: checked_offset(state_flags, "context anchored state flags")?,
         cells_offset: checked_offset(cells, "context anchored cells")?,
+        cell_format,
         byte_sentinel_offset: byte_sentinel
             .map(|offset| checked_offset(offset, "context anchored sentinel cells"))
             .transpose()?,
@@ -1410,6 +1528,7 @@ fn populate_anchored_forward_cells(
     anchored: NativeContextAnchoredForwardView<'_>,
     states: usize,
     row_width: usize,
+    format: ContextTransitionCellFormat,
 ) -> Result<(), ObjectError> {
     let Some(byte_sentinel) = byte_sentinel else {
         for (index, cell) in anchored.cells.iter().enumerate() {
@@ -1423,13 +1542,16 @@ fn populate_anchored_forward_cells(
                     .ok_or(ObjectError::InvalidModule(
                         "context anchored successor is out of range",
                     ))?;
-            let packed = pack_forward_transition_cell(
+            put_forward_transition_cell(
+                data,
+                table,
+                index,
+                format,
                 cell.next,
                 cell.accepted,
                 context_forward_flags(successor)?,
                 states,
             )?;
-            put_table_word(data, table, index, packed)?;
         }
         return Ok(());
     };
@@ -1457,13 +1579,16 @@ fn populate_anchored_forward_cells(
                     .ok_or(ObjectError::InvalidModule(
                         "context anchored successor is out of range",
                     ))?;
-            let packed = pack_forward_transition_cell(
+            put_forward_transition_cell(
+                data,
+                table,
+                destination_row + usize::from(byte),
+                format,
                 cell.next,
                 cell.accepted,
                 context_forward_flags(successor)?,
                 states,
             )?;
-            put_table_word(data, table, destination_row + usize::from(byte), packed)?;
         }
         let cell = anchored.cells[source_row + sentinel];
         let successor = anchored
@@ -1476,13 +1601,16 @@ fn populate_anchored_forward_cells(
             .ok_or(ObjectError::InvalidModule(
                 "context anchored successor is out of range",
             ))?;
-        let packed = pack_forward_transition_cell(
+        put_forward_transition_cell(
+            data,
+            byte_sentinel,
+            state,
+            format,
             cell.next,
             cell.accepted,
             context_forward_flags(successor)?,
             states,
         )?;
-        put_table_word(data, byte_sentinel, state, packed)?;
     }
     Ok(())
 }
@@ -1767,11 +1895,37 @@ fn check_state_count(states: usize) -> Result<(), ObjectError> {
     Ok(())
 }
 
-fn direct_byte_transition_bytes(states: usize) -> Result<usize, ObjectError> {
+fn select_forward_cell_format(states: usize) -> ContextTransitionCellFormat {
+    if states <= MAX_COMPACT_CONTEXT_FORWARD_STATES {
+        ContextTransitionCellFormat::Compact16
+    } else {
+        ContextTransitionCellFormat::Wide32
+    }
+}
+
+fn select_reverse_cell_format(states: usize) -> ContextTransitionCellFormat {
+    if states <= MAX_COMPACT_CONTEXT_REVERSE_STATES {
+        ContextTransitionCellFormat::Compact16
+    } else {
+        ContextTransitionCellFormat::Wide32
+    }
+}
+
+fn direct_byte_row_bytes(format: ContextTransitionCellFormat) -> Result<usize, ObjectError> {
+    Ok(match format {
+        ContextTransitionCellFormat::Compact16 => CONTEXT_DIRECT_BYTE_COMPACT_ROW_BYTES,
+        ContextTransitionCellFormat::Wide32 => CONTEXT_DIRECT_BYTE_WIDE_ROW_BYTES,
+    })
+}
+
+fn direct_byte_transition_bytes(
+    states: usize,
+    format: ContextTransitionCellFormat,
+) -> Result<usize, ObjectError> {
     states
         .checked_mul(
-            CONTEXT_DIRECT_BYTE_ROW_BYTES
-                .checked_add(core::mem::size_of::<u32>())
+            direct_byte_row_bytes(format)?
+                .checked_add(format.bytes())
                 .ok_or(ObjectError::ArithmeticOverflow(
                     "context direct-byte row and sentinel bytes",
                 ))?,
@@ -1786,20 +1940,22 @@ fn select_direct_byte_directions(
     reverse_states: usize,
     retain_reverse: bool,
     enabled: bool,
+    forward_format: ContextTransitionCellFormat,
+    reverse_format: ContextTransitionCellFormat,
 ) -> Result<(bool, bool), ObjectError> {
     if !enabled {
         return Ok((false, false));
     }
     let direct_forward = forward_states != 0 && forward_states <= CONTEXT_DIRECT_BYTE_MAX_STATES;
     let forward_bytes = if direct_forward {
-        direct_byte_transition_bytes(forward_states)?
+        direct_byte_transition_bytes(forward_states, forward_format)?
     } else {
         0
     };
     let reverse_eligible =
         retain_reverse && reverse_states != 0 && reverse_states <= CONTEXT_DIRECT_BYTE_MAX_STATES;
     let reverse_bytes = if reverse_eligible {
-        direct_byte_transition_bytes(reverse_states)?
+        direct_byte_transition_bytes(reverse_states, reverse_format)?
     } else {
         0
     };
@@ -1823,6 +1979,8 @@ fn plan_context_layout(
     raw_pair_reverse_initial: bool,
     direct_forward: bool,
     direct_reverse: bool,
+    forward_cell_format: ContextTransitionCellFormat,
+    reverse_cell_format: ContextTransitionCellFormat,
     limit: usize,
 ) -> Result<ContextLayoutPlan, ObjectError> {
     check_state_count(forward_states)?;
@@ -1832,9 +1990,12 @@ fn plan_context_layout(
             "direct-byte reverse cells require retained reverse rows",
         ));
     }
-    let row_bytes = row_width
-        .checked_mul(core::mem::size_of::<u32>())
-        .ok_or(ObjectError::ArithmeticOverflow("context row bytes"))?;
+    let forward_row_bytes = row_width
+        .checked_mul(forward_cell_format.bytes())
+        .ok_or(ObjectError::ArithmeticOverflow("context forward row bytes"))?;
+    let reverse_row_bytes = row_width
+        .checked_mul(reverse_cell_format.bytes())
+        .ok_or(ObjectError::ArithmeticOverflow("context reverse row bytes"))?;
     let mut cursor = 0;
     let byte_classes = reserve_section(&mut cursor, CLASS_TABLE_BYTES, "context class map")?;
     let class_properties = reserve_section(&mut cursor, CLASS_TABLE_BYTES, "context property map")?;
@@ -1842,18 +2003,18 @@ fn plan_context_layout(
         reserve_section(&mut cursor, forward_states, "context forward state flags")?;
     cursor = align_up(
         cursor,
-        core::mem::align_of::<u32>(),
+        forward_cell_format.alignment(),
         "context cell alignment",
     )?;
     let forward_cell_bytes = if direct_forward {
         forward_states
-            .checked_mul(CONTEXT_DIRECT_BYTE_ROW_BYTES)
+            .checked_mul(direct_byte_row_bytes(forward_cell_format)?)
             .ok_or(ObjectError::ArithmeticOverflow(
                 "context direct-byte forward cell bytes",
             ))?
     } else {
         forward_states
-            .checked_mul(row_bytes)
+            .checked_mul(forward_row_bytes)
             .ok_or(ObjectError::ArithmeticOverflow(
                 "context forward cell bytes",
             ))?
@@ -1863,7 +2024,7 @@ fn plan_context_layout(
         Some(reserve_section(
             &mut cursor,
             forward_states
-                .checked_mul(core::mem::size_of::<u32>())
+                .checked_mul(forward_cell_format.bytes())
                 .ok_or(ObjectError::ArithmeticOverflow(
                     "context direct-byte forward sentinel bytes",
                 ))?,
@@ -1872,20 +2033,24 @@ fn plan_context_layout(
     } else {
         None
     };
+    cursor = align_up(
+        cursor,
+        reverse_cell_format.alignment(),
+        "context reverse cell alignment",
+    )?;
     let reverse_cells = if retain_reverse {
-        let reverse_cell_bytes = if direct_reverse {
-            reverse_states
-                .checked_mul(CONTEXT_DIRECT_BYTE_ROW_BYTES)
-                .ok_or(ObjectError::ArithmeticOverflow(
-                    "context direct-byte reverse cell bytes",
-                ))?
-        } else {
-            reverse_states
-                .checked_mul(row_bytes)
-                .ok_or(ObjectError::ArithmeticOverflow(
-                    "context reverse cell bytes",
-                ))?
-        };
+        let reverse_cell_bytes =
+            if direct_reverse {
+                reverse_states
+                    .checked_mul(direct_byte_row_bytes(reverse_cell_format)?)
+                    .ok_or(ObjectError::ArithmeticOverflow(
+                        "context direct-byte reverse cell bytes",
+                    ))?
+            } else {
+                reverse_states.checked_mul(reverse_row_bytes).ok_or(
+                    ObjectError::ArithmeticOverflow("context reverse cell bytes"),
+                )?
+            };
         Some(reserve_section(
             &mut cursor,
             reverse_cell_bytes,
@@ -1898,7 +2063,7 @@ fn plan_context_layout(
         Some(reserve_section(
             &mut cursor,
             reverse_states
-                .checked_mul(core::mem::size_of::<u32>())
+                .checked_mul(reverse_cell_format.bytes())
                 .ok_or(ObjectError::ArithmeticOverflow(
                     "context direct-byte reverse sentinel bytes",
                 ))?,
@@ -1907,6 +2072,11 @@ fn plan_context_layout(
     } else {
         None
     };
+    cursor = align_up(
+        cursor,
+        core::mem::align_of::<u32>(),
+        "context initial dispatch alignment",
+    )?;
     let forward_initial_bytes = if raw_pair_initial {
         CONTEXT_RAW_PAIR_BYTES
     } else {
@@ -1984,8 +2154,10 @@ fn plan_context_layout(
         class_properties,
         forward_state_flags,
         forward_cells,
+        forward_cell_format,
         forward_byte_sentinel,
         reverse_cells,
+        reverse_cell_format: retain_reverse.then_some(reverse_cell_format),
         reverse_byte_sentinel,
         forward_initial,
         reverse_initial,
@@ -2065,6 +2237,108 @@ fn pack_forward_transition_cell(
         | payload)
 }
 
+fn pack_compact_forward_transition_cell(
+    next: u32,
+    event: bool,
+    flags: u8,
+    states: usize,
+) -> Result<u16, ObjectError> {
+    check_state_count(states)?;
+    if states > MAX_COMPACT_CONTEXT_FORWARD_STATES {
+        return Err(ObjectError::InvalidModule(
+            "context forward states exceed compact transition payload",
+        ));
+    }
+    validate_state(next, states)?;
+    let flags = validate_forward_state_flags(flags).ok_or(ObjectError::InvalidModule(
+        "invalid compact contextual forward successor flags",
+    ))?;
+    let payload = next
+        .checked_add(1)
+        .and_then(|encoded| u16::try_from(encoded).ok())
+        .filter(|&encoded| encoded <= CONTEXT_COMPACT_FORWARD_CELL_STATE_MASK)
+        .ok_or(ObjectError::InvalidModule(
+            "context state exceeds compact forward transition payload",
+        ))?;
+    Ok(if event { CONTEXT_COMPACT_CELL_EVENT } else { 0 }
+        | (u16::from(flags) << CONTEXT_COMPACT_FORWARD_CELL_FLAGS_SHIFT)
+        | payload)
+}
+
+fn pack_compact_reverse_transition_cell(
+    next: Option<u32>,
+    event: bool,
+    states: usize,
+) -> Result<u16, ObjectError> {
+    check_state_count(states)?;
+    if states > MAX_COMPACT_CONTEXT_REVERSE_STATES {
+        return Err(ObjectError::InvalidModule(
+            "context reverse states exceed compact transition payload",
+        ));
+    }
+    let payload = match next {
+        None => 0,
+        Some(next) => {
+            validate_state(next, states)?;
+            next.checked_add(1)
+                .and_then(|encoded| u16::try_from(encoded).ok())
+                .filter(|&encoded| encoded <= CONTEXT_RAW_REVERSE_STATE_MASK)
+                .ok_or(ObjectError::InvalidModule(
+                    "context state exceeds compact reverse transition payload",
+                ))?
+        }
+    };
+    Ok(CONTEXT_RAW_REVERSE_VALID | if event { CONTEXT_COMPACT_CELL_EVENT } else { 0 } | payload)
+}
+
+fn put_forward_transition_cell(
+    data: &mut [u8],
+    table: usize,
+    index: usize,
+    format: ContextTransitionCellFormat,
+    next: u32,
+    event: bool,
+    flags: u8,
+    states: usize,
+) -> Result<(), ObjectError> {
+    match format {
+        ContextTransitionCellFormat::Compact16 => put_table_halfword(
+            data,
+            table,
+            index,
+            pack_compact_forward_transition_cell(next, event, flags, states)?,
+        ),
+        ContextTransitionCellFormat::Wide32 => put_table_word(
+            data,
+            table,
+            index,
+            pack_forward_transition_cell(next, event, flags, states)?,
+        ),
+    }
+}
+
+fn put_reverse_transition_cell(
+    data: &mut [u8],
+    table: usize,
+    index: usize,
+    format: ContextTransitionCellFormat,
+    next: Option<u32>,
+    event: bool,
+    states: usize,
+) -> Result<(), ObjectError> {
+    match format {
+        ContextTransitionCellFormat::Compact16 => put_table_halfword(
+            data,
+            table,
+            index,
+            pack_compact_reverse_transition_cell(next, event, states)?,
+        ),
+        ContextTransitionCellFormat::Wide32 => {
+            put_table_word(data, table, index, pack_context_cell(next, event, states)?)
+        }
+    }
+}
+
 fn populate_forward_transition_cells(
     data: &mut [u8],
     table: usize,
@@ -2072,6 +2346,7 @@ fn populate_forward_transition_cells(
     dfa: NativeContextDfaView<'_>,
     states: usize,
     row_width: usize,
+    format: ContextTransitionCellFormat,
 ) -> Result<(), ObjectError> {
     let Some(byte_sentinel) = byte_sentinel else {
         for (index, cell) in dfa.forward_cells.iter().enumerate() {
@@ -2084,13 +2359,16 @@ fn populate_forward_transition_cells(
                     .ok_or(ObjectError::InvalidModule(
                         "context forward successor is out of range",
                     ))?;
-            let packed = pack_forward_transition_cell(
+            put_forward_transition_cell(
+                data,
+                table,
+                index,
+                format,
                 cell.next,
                 cell.accepted,
                 context_forward_flags(successor)?,
                 states,
             )?;
-            put_table_word(data, table, index, packed)?;
         }
         return Ok(());
     };
@@ -2117,13 +2395,16 @@ fn populate_forward_transition_cells(
                     .ok_or(ObjectError::InvalidModule(
                         "context forward successor is out of range",
                     ))?;
-            let packed = pack_forward_transition_cell(
+            put_forward_transition_cell(
+                data,
+                table,
+                destination_row + usize::from(byte),
+                format,
                 cell.next,
                 cell.accepted,
                 context_forward_flags(successor)?,
                 states,
             )?;
-            put_table_word(data, table, destination_row + usize::from(byte), packed)?;
         }
         let cell = dfa.forward_cells[source_row + sentinel];
         let successor = dfa
@@ -2136,13 +2417,16 @@ fn populate_forward_transition_cells(
             .ok_or(ObjectError::InvalidModule(
                 "context forward successor is out of range",
             ))?;
-        let packed = pack_forward_transition_cell(
+        put_forward_transition_cell(
+            data,
+            byte_sentinel,
+            state,
+            format,
             cell.next,
             cell.accepted,
             context_forward_flags(successor)?,
             states,
         )?;
-        put_table_word(data, byte_sentinel, state, packed)?;
     }
     Ok(())
 }
@@ -2154,14 +2438,19 @@ fn populate_reverse_transition_cells(
     dfa: NativeContextDfaView<'_>,
     states: usize,
     row_width: usize,
+    format: ContextTransitionCellFormat,
 ) -> Result<(), ObjectError> {
-    let pack = |cell: crate::context_dfa::NativeContextReverseCell| {
-        let next = (cell.next != VIEW_NO_STATE).then_some(cell.next);
-        pack_context_cell(next, cell.reaches_start, states)
-    };
     let Some(byte_sentinel) = byte_sentinel else {
         for (index, &cell) in dfa.reverse_cells.iter().enumerate() {
-            put_table_word(data, table, index, pack(cell)?)?;
+            put_reverse_transition_cell(
+                data,
+                table,
+                index,
+                format,
+                (cell.next != VIEW_NO_STATE).then_some(cell.next),
+                cell.reaches_start,
+                states,
+            )?;
         }
         return Ok(());
     };
@@ -2178,18 +2467,26 @@ fn populate_reverse_transition_cells(
         )?;
         for byte in u8::MIN..=u8::MAX {
             let class = usize::from(dfa.byte_classes[usize::from(byte)]);
-            put_table_word(
+            let cell = dfa.reverse_cells[source_row + class];
+            put_reverse_transition_cell(
                 data,
                 table,
                 destination_row + usize::from(byte),
-                pack(dfa.reverse_cells[source_row + class])?,
+                format,
+                (cell.next != VIEW_NO_STATE).then_some(cell.next),
+                cell.reaches_start,
+                states,
             )?;
         }
-        put_table_word(
+        let cell = dfa.reverse_cells[source_row + sentinel];
+        put_reverse_transition_cell(
             data,
             byte_sentinel,
             state,
-            pack(dfa.reverse_cells[source_row + sentinel])?,
+            format,
+            (cell.next != VIEW_NO_STATE).then_some(cell.next),
+            cell.reaches_start,
+            states,
         )?;
     }
     Ok(())
@@ -2576,6 +2873,56 @@ fn table_word(data: &[u8], table: usize, index: usize) -> u32 {
     )
 }
 
+fn transition_table_word(
+    data: &[u8],
+    table: usize,
+    index: usize,
+    format: ContextTransitionCellFormat,
+) -> u32 {
+    match format {
+        ContextTransitionCellFormat::Compact16 => u32::from(table_halfword(data, table, index)),
+        ContextTransitionCellFormat::Wide32 => table_word(data, table, index),
+    }
+}
+
+fn expand_forward_transition_word(word: u32, format: ContextTransitionCellFormat) -> u32 {
+    match format {
+        ContextTransitionCellFormat::Compact16 => {
+            let word = u16::try_from(word).expect("compact contextual forward cell");
+            u32::from(word & CONTEXT_COMPACT_FORWARD_CELL_STATE_MASK)
+                | (u32::from(word & CONTEXT_COMPACT_FORWARD_CELL_FLAGS_MASK)
+                    << (CONTEXT_FORWARD_CELL_FLAGS_SHIFT
+                        - CONTEXT_COMPACT_FORWARD_CELL_FLAGS_SHIFT))
+                | if word & CONTEXT_COMPACT_CELL_EVENT != 0 {
+                    CONTEXT_CELL_EVENT
+                } else {
+                    0
+                }
+        }
+        ContextTransitionCellFormat::Wide32 => word,
+    }
+}
+
+fn expand_reverse_transition_word(word: u32, format: ContextTransitionCellFormat) -> u32 {
+    match format {
+        ContextTransitionCellFormat::Compact16 => {
+            let word = u16::try_from(word).expect("compact contextual reverse cell");
+            u32::from(word & CONTEXT_RAW_REVERSE_STATE_MASK)
+                | if word & CONTEXT_RAW_REVERSE_VALID != 0 {
+                    CONTEXT_CELL_VALID
+                } else {
+                    0
+                }
+                | if word & CONTEXT_COMPACT_CELL_EVENT != 0 {
+                    CONTEXT_CELL_EVENT
+                } else {
+                    0
+                }
+        }
+        ContextTransitionCellFormat::Wide32 => word,
+    }
+}
+
 fn packed_table_cell(
     data: &[u8],
     table: u32,
@@ -2583,6 +2930,7 @@ fn packed_table_cell(
     row_width: u16,
     state: u32,
     symbol: u16,
+    format: ContextTransitionCellFormat,
 ) -> Option<u32> {
     if state >= states || symbol >= row_width {
         return None;
@@ -2591,7 +2939,7 @@ fn packed_table_cell(
         .ok()?
         .checked_mul(usize::from(row_width))?
         .checked_add(usize::from(symbol))?;
-    Some(table_word(data, offset(table), index))
+    Some(transition_table_word(data, offset(table), index, format))
 }
 
 fn direct_byte_table_cell(
@@ -2600,6 +2948,7 @@ fn direct_byte_table_cell(
     states: u32,
     state: u32,
     byte: u8,
+    format: ContextTransitionCellFormat,
 ) -> Option<u32> {
     if state >= states {
         return None;
@@ -2608,17 +2957,24 @@ fn direct_byte_table_cell(
         .ok()?
         .checked_mul(CONTEXT_DIRECT_BYTE_ROW_CELLS)?
         .checked_add(usize::from(byte))?;
-    Some(table_word(data, offset(table), index))
+    Some(transition_table_word(data, offset(table), index, format))
 }
 
-fn direct_byte_sentinel_cell(data: &[u8], table: u32, states: u32, state: u32) -> Option<u32> {
+fn direct_byte_sentinel_cell(
+    data: &[u8],
+    table: u32,
+    states: u32,
+    state: u32,
+    format: ContextTransitionCellFormat,
+) -> Option<u32> {
     if state >= states {
         return None;
     }
-    Some(table_word(
+    Some(transition_table_word(
         data,
         offset(table),
         usize::try_from(state).ok()?,
+        format,
     ))
 }
 
@@ -3036,14 +3392,24 @@ mod tests {
         assert!(first.forward_direct_bytes());
         assert!(first.reverse_direct_bytes());
         assert_eq!(
+            first.forward_cell_format,
+            ContextTransitionCellFormat::Compact16
+        );
+        assert_eq!(
+            first.reverse_cell_format,
+            Some(ContextTransitionCellFormat::Compact16)
+        );
+        assert_eq!(
             offset(first.forward_byte_sentinel_offset.unwrap()),
             offset(first.forward_cells_offset)
-                + usize::try_from(first.forward_states).unwrap() * CONTEXT_DIRECT_BYTE_ROW_BYTES
+                + usize::try_from(first.forward_states).unwrap()
+                    * direct_byte_row_bytes(first.forward_cell_format).unwrap()
         );
         assert_eq!(
             offset(first.reverse_byte_sentinel_offset.unwrap()),
             offset(first.reverse_cells_offset.unwrap())
-                + usize::try_from(first.reverse_states).unwrap() * CONTEXT_DIRECT_BYTE_ROW_BYTES
+                + usize::try_from(first.reverse_states).unwrap()
+                    * direct_byte_row_bytes(first.reverse_cell_format.unwrap()).unwrap()
         );
 
         for byte in u8::MIN..=u8::MAX {
@@ -3110,16 +3476,17 @@ mod tests {
                         first.forward_states,
                         u32::try_from(state).unwrap(),
                         byte,
+                        first.forward_cell_format,
                     ),
-                    Some(
-                        pack_forward_transition_cell(
+                    Some(u32::from(
+                        pack_compact_forward_transition_cell(
                             source.next,
                             source.accepted,
                             context_forward_flags(successor).unwrap(),
                             view.dfa.forward_states.len(),
                         )
                         .unwrap()
-                    ),
+                    )),
                     "physical forward DirectByte mismatch: state={state} byte={byte:#04x}"
                 );
             }
@@ -3132,16 +3499,17 @@ mod tests {
                     first.forward_byte_sentinel_offset.unwrap(),
                     first.forward_states,
                     u32::try_from(state).unwrap(),
+                    first.forward_cell_format,
                 ),
-                Some(
-                    pack_forward_transition_cell(
+                Some(u32::from(
+                    pack_compact_forward_transition_cell(
                         source.next,
                         source.accepted,
                         context_forward_flags(successor).unwrap(),
                         view.dfa.forward_states.len(),
                     )
                     .unwrap()
-                ),
+                )),
                 "physical forward DirectByte sentinel mismatch: state={state}"
             );
         }
@@ -3169,8 +3537,16 @@ mod tests {
                         first.reverse_states,
                         u32::try_from(state).unwrap(),
                         byte,
+                        first.reverse_cell_format.unwrap(),
                     ),
-                    Some(pack_context_cell(next, source.reaches_start, reverse_states).unwrap()),
+                    Some(u32::from(
+                        pack_compact_reverse_transition_cell(
+                            next,
+                            source.reaches_start,
+                            reverse_states,
+                        )
+                        .unwrap()
+                    )),
                     "physical reverse DirectByte mismatch: state={state} byte={byte:#04x}"
                 );
             }
@@ -3183,8 +3559,16 @@ mod tests {
                     first.reverse_byte_sentinel_offset.unwrap(),
                     first.reverse_states,
                     u32::try_from(state).unwrap(),
+                    first.reverse_cell_format.unwrap(),
                 ),
-                Some(pack_context_cell(next, source.reaches_start, reverse_states).unwrap()),
+                Some(u32::from(
+                    pack_compact_reverse_transition_cell(
+                        next,
+                        source.reaches_start,
+                        reverse_states,
+                    )
+                    .unwrap()
+                )),
                 "physical reverse DirectByte sentinel mismatch: state={state}"
             );
         }
@@ -3366,6 +3750,159 @@ mod tests {
     }
 
     #[test]
+    fn forced_compact_and_wide_transition_tables_are_exhaustively_equivalent() {
+        let patterns = [
+            r"(?:(?-u:\b)a|ab)+?",
+            r"(?:a(?m:$)|(?m:^)b|ab)+?",
+            r"(?-u:\b)(?:ab|a)+(?-u:\b)",
+        ];
+        for pattern in patterns {
+            let program = contextual_program(pattern, b'\n', OutputContract::Span);
+            let dfa = program.native_context_program_view().unwrap().dfa;
+            let row_width = usize::try_from(dfa.initial_dispatch.row_width).unwrap();
+            let forward_states = dfa.forward_states.len();
+            assert!(forward_states <= MAX_COMPACT_CONTEXT_FORWARD_STATES);
+            let mut compact_forward =
+                vec![0; dfa.forward_cells.len() * ContextTransitionCellFormat::Compact16.bytes()];
+            let mut wide_forward =
+                vec![0; dfa.forward_cells.len() * ContextTransitionCellFormat::Wide32.bytes()];
+            populate_forward_transition_cells(
+                &mut compact_forward,
+                0,
+                None,
+                dfa,
+                forward_states,
+                row_width,
+                ContextTransitionCellFormat::Compact16,
+            )
+            .unwrap();
+            populate_forward_transition_cells(
+                &mut wide_forward,
+                0,
+                None,
+                dfa,
+                forward_states,
+                row_width,
+                ContextTransitionCellFormat::Wide32,
+            )
+            .unwrap();
+            for index in 0..dfa.forward_cells.len() {
+                assert_eq!(
+                    expand_forward_transition_word(
+                        transition_table_word(
+                            &compact_forward,
+                            0,
+                            index,
+                            ContextTransitionCellFormat::Compact16,
+                        ),
+                        ContextTransitionCellFormat::Compact16,
+                    ),
+                    transition_table_word(
+                        &wide_forward,
+                        0,
+                        index,
+                        ContextTransitionCellFormat::Wide32,
+                    ),
+                    "forced forward format mismatch: pattern={pattern:?} cell={index}",
+                );
+            }
+
+            let reverse_states = dfa.reverse_row_offsets.len() - 1;
+            assert!(reverse_states <= MAX_COMPACT_CONTEXT_REVERSE_STATES);
+            let mut compact_reverse =
+                vec![0; dfa.reverse_cells.len() * ContextTransitionCellFormat::Compact16.bytes()];
+            let mut wide_reverse =
+                vec![0; dfa.reverse_cells.len() * ContextTransitionCellFormat::Wide32.bytes()];
+            populate_reverse_transition_cells(
+                &mut compact_reverse,
+                0,
+                None,
+                dfa,
+                reverse_states,
+                row_width,
+                ContextTransitionCellFormat::Compact16,
+            )
+            .unwrap();
+            populate_reverse_transition_cells(
+                &mut wide_reverse,
+                0,
+                None,
+                dfa,
+                reverse_states,
+                row_width,
+                ContextTransitionCellFormat::Wide32,
+            )
+            .unwrap();
+            for index in 0..dfa.reverse_cells.len() {
+                assert_eq!(
+                    expand_reverse_transition_word(
+                        transition_table_word(
+                            &compact_reverse,
+                            0,
+                            index,
+                            ContextTransitionCellFormat::Compact16,
+                        ),
+                        ContextTransitionCellFormat::Compact16,
+                    ),
+                    transition_table_word(
+                        &wide_reverse,
+                        0,
+                        index,
+                        ContextTransitionCellFormat::Wide32,
+                    ),
+                    "forced reverse format mismatch: pattern={pattern:?} cell={index}",
+                );
+            }
+
+            if let Some(anchored) = dfa.anchored_forward {
+                let anchored_states = anchored.states.len();
+                assert!(anchored_states <= MAX_COMPACT_CONTEXT_FORWARD_STATES);
+                let mut compact =
+                    vec![0; anchored.cells.len() * ContextTransitionCellFormat::Compact16.bytes()];
+                let mut wide =
+                    vec![0; anchored.cells.len() * ContextTransitionCellFormat::Wide32.bytes()];
+                populate_anchored_forward_cells(
+                    &mut compact,
+                    0,
+                    None,
+                    dfa,
+                    anchored,
+                    anchored_states,
+                    row_width,
+                    ContextTransitionCellFormat::Compact16,
+                )
+                .unwrap();
+                populate_anchored_forward_cells(
+                    &mut wide,
+                    0,
+                    None,
+                    dfa,
+                    anchored,
+                    anchored_states,
+                    row_width,
+                    ContextTransitionCellFormat::Wide32,
+                )
+                .unwrap();
+                for index in 0..anchored.cells.len() {
+                    assert_eq!(
+                        expand_forward_transition_word(
+                            transition_table_word(
+                                &compact,
+                                0,
+                                index,
+                                ContextTransitionCellFormat::Compact16,
+                            ),
+                            ContextTransitionCellFormat::Compact16,
+                        ),
+                        transition_table_word(&wide, 0, index, ContextTransitionCellFormat::Wide32,),
+                        "forced anchored format mismatch: pattern={pattern:?} cell={index}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn anchored_forward_layout_is_optional_exact_and_physically_equivalent() {
         let program = contextual_program(r"(?-u:\b)(?:ab|a)+(?-u:\b)", b'\n', OutputContract::Span);
         let view = program.native_context_program_view().unwrap();
@@ -3385,7 +3922,17 @@ mod tests {
         let layout = accelerated
             .anchored_forward
             .expect("anchored layout was retained");
+        assert_eq!(layout.cell_format, ContextTransitionCellFormat::Compact16);
         assert!(layout.byte_sentinel_offset.is_some());
+        assert_eq!(
+            offset(layout.cells_offset) % core::mem::align_of::<u16>(),
+            0
+        );
+        assert_eq!(
+            offset(layout.byte_sentinel_offset.unwrap()),
+            offset(layout.cells_offset)
+                + usize::try_from(layout.states).unwrap() * CONTEXT_DIRECT_BYTE_COMPACT_ROW_BYTES,
+        );
         assert_eq!(usize::try_from(layout.states).unwrap(), native.states.len());
         assert_eq!(layout.max_resolution_steps, native.max_resolution_steps);
         let mut compact = mandatory.clone();
@@ -3396,12 +3943,15 @@ mod tests {
             false,
         )
         .unwrap();
-        assert!(
-            compact
-                .anchored_forward
-                .expect("compact anchored layout")
-                .byte_sentinel_offset
-                .is_none()
+        let compact_anchored = compact.anchored_forward.expect("compact anchored layout");
+        assert_eq!(
+            compact_anchored.cell_format,
+            ContextTransitionCellFormat::Compact16
+        );
+        assert!(compact_anchored.byte_sentinel_offset.is_none());
+        assert_eq!(
+            offset(compact_anchored.cells_offset) % core::mem::align_of::<u16>(),
+            0
         );
         for physical in [&accelerated, &compact] {
             for (main, &expected) in native.main_initial_to_anchored.iter().enumerate() {
@@ -3540,22 +4090,16 @@ mod tests {
         let view = program.native_context_program_view().unwrap();
         assert!(view.exact_match_width.is_none());
 
-        let compact = build_context_native_layout_with_reverse(
-            view,
-            ContextNativeLimits::default(),
-            false,
-        )
-        .unwrap();
+        let compact =
+            build_context_native_layout_with_reverse(view, ContextNativeLimits::default(), false)
+                .unwrap();
         assert_eq!(compact.reverse_states, 0);
         assert!(compact.reverse_cells_offset.is_none());
         assert!(compact.reverse_initial_offset.is_none());
 
-        let suffix = build_context_native_layout_with_reverse(
-            view,
-            ContextNativeLimits::default(),
-            true,
-        )
-        .unwrap();
+        let suffix =
+            build_context_native_layout_with_reverse(view, ContextNativeLimits::default(), true)
+                .unwrap();
         assert!(suffix.reverse_states > 0);
         assert!(suffix.reverse_cells_offset.is_some());
         assert!(suffix.reverse_initial_offset.is_some());
@@ -3865,6 +4409,94 @@ mod tests {
             pack_forward_transition_cell(0, false, 0, MAX_PACKED_CONTEXT_FORWARD_STATES + 1,),
             Err(ObjectError::InvalidModule(_))
         ));
+
+        let last_compact_forward = u32::try_from(MAX_COMPACT_CONTEXT_FORWARD_STATES - 1).unwrap();
+        assert_eq!(
+            select_forward_cell_format(MAX_COMPACT_CONTEXT_FORWARD_STATES),
+            ContextTransitionCellFormat::Compact16
+        );
+        assert_eq!(
+            select_forward_cell_format(MAX_COMPACT_CONTEXT_FORWARD_STATES + 1),
+            ContextTransitionCellFormat::Wide32
+        );
+        for event in [false, true] {
+            for flags in [
+                0,
+                CONTEXT_STATE_EMPTY,
+                CONTEXT_STATE_PENDING,
+                CONTEXT_STATE_PENDING | CONTEXT_STATE_EMPTY | CONTEXT_STATE_TERMINAL,
+            ] {
+                let packed = pack_compact_forward_transition_cell(
+                    last_compact_forward,
+                    event,
+                    flags,
+                    MAX_COMPACT_CONTEXT_FORWARD_STATES,
+                )
+                .unwrap();
+                assert_eq!(
+                    packed & CONTEXT_COMPACT_FORWARD_CELL_STATE_MASK,
+                    CONTEXT_COMPACT_FORWARD_CELL_STATE_MASK
+                );
+                assert_eq!(packed & CONTEXT_COMPACT_CELL_EVENT != 0, event);
+                assert_eq!(
+                    decode_forward_transition_cell(expand_forward_transition_word(
+                        u32::from(packed),
+                        ContextTransitionCellFormat::Compact16,
+                    )),
+                    Some(DecodedForwardCell {
+                        next: last_compact_forward,
+                        event,
+                        flags,
+                    })
+                );
+            }
+        }
+        assert!(matches!(
+            pack_compact_forward_transition_cell(
+                0,
+                false,
+                0,
+                MAX_COMPACT_CONTEXT_FORWARD_STATES + 1,
+            ),
+            Err(ObjectError::InvalidModule(_))
+        ));
+
+        let last_compact_reverse = u32::try_from(MAX_COMPACT_CONTEXT_REVERSE_STATES - 1).unwrap();
+        assert_eq!(
+            select_reverse_cell_format(MAX_COMPACT_CONTEXT_REVERSE_STATES),
+            ContextTransitionCellFormat::Compact16
+        );
+        assert_eq!(
+            select_reverse_cell_format(MAX_COMPACT_CONTEXT_REVERSE_STATES + 1),
+            ContextTransitionCellFormat::Wide32
+        );
+        for event in [false, true] {
+            for next in [None, Some(last_compact_reverse)] {
+                let packed = pack_compact_reverse_transition_cell(
+                    next,
+                    event,
+                    MAX_COMPACT_CONTEXT_REVERSE_STATES,
+                )
+                .unwrap();
+                assert_ne!(packed & CONTEXT_RAW_REVERSE_VALID, 0);
+                assert_eq!(packed & CONTEXT_COMPACT_CELL_EVENT != 0, event);
+                assert_eq!(
+                    decode_context_cell(expand_reverse_transition_word(
+                        u32::from(packed),
+                        ContextTransitionCellFormat::Compact16,
+                    )),
+                    Some(DecodedContextCell { next, event })
+                );
+            }
+        }
+        assert!(matches!(
+            pack_compact_reverse_transition_cell(
+                None,
+                false,
+                MAX_COMPACT_CONTEXT_REVERSE_STATES + 1,
+            ),
+            Err(ObjectError::InvalidModule(_))
+        ));
     }
 
     #[test]
@@ -3898,8 +4530,20 @@ mod tests {
         reason = "all layout byte-accounting boundaries stay in one audit"
     )]
     fn layout_accounting_limits_and_arithmetic_are_exact() {
-        let with_reverse =
-            plan_context_layout(3, 4, 5, true, false, false, false, false, usize::MAX).unwrap();
+        let with_reverse = plan_context_layout(
+            3,
+            4,
+            5,
+            true,
+            false,
+            false,
+            false,
+            false,
+            ContextTransitionCellFormat::Wide32,
+            ContextTransitionCellFormat::Wide32,
+            usize::MAX,
+        )
+        .unwrap();
         assert_eq!(with_reverse.byte_classes, 0);
         assert_eq!(with_reverse.class_properties, 256);
         assert_eq!(with_reverse.forward_state_flags, 512);
@@ -3908,6 +4552,74 @@ mod tests {
         assert_eq!(with_reverse.forward_initial, 656);
         assert_eq!(with_reverse.reverse_initial, Some(262_800));
         assert_eq!(with_reverse.total, 524_944);
+
+        let compact_forward_wide_reverse = plan_context_layout(
+            3,
+            4,
+            5,
+            true,
+            false,
+            false,
+            false,
+            false,
+            ContextTransitionCellFormat::Compact16,
+            ContextTransitionCellFormat::Wide32,
+            usize::MAX,
+        )
+        .unwrap();
+        assert_eq!(compact_forward_wide_reverse.forward_cells, 516);
+        assert_eq!(compact_forward_wide_reverse.reverse_cells, Some(548));
+        assert_eq!(compact_forward_wide_reverse.forward_initial, 628);
+        assert_eq!(compact_forward_wide_reverse.reverse_initial, Some(262_772));
+        assert_eq!(compact_forward_wide_reverse.total, 524_916);
+        assert_eq!(
+            compact_forward_wide_reverse.forward_cell_format,
+            ContextTransitionCellFormat::Compact16
+        );
+        assert_eq!(
+            compact_forward_wide_reverse.reverse_cell_format,
+            Some(ContextTransitionCellFormat::Wide32)
+        );
+
+        let wide_forward_compact_reverse = plan_context_layout(
+            3,
+            4,
+            5,
+            true,
+            false,
+            false,
+            false,
+            false,
+            ContextTransitionCellFormat::Wide32,
+            ContextTransitionCellFormat::Compact16,
+            usize::MAX,
+        )
+        .unwrap();
+        assert_eq!(wide_forward_compact_reverse.forward_cells, 516);
+        assert_eq!(wide_forward_compact_reverse.reverse_cells, Some(576));
+        assert_eq!(wide_forward_compact_reverse.forward_initial, 616);
+        assert_eq!(wide_forward_compact_reverse.reverse_initial, Some(262_760));
+        assert_eq!(wide_forward_compact_reverse.total, 524_904);
+
+        let compact_both = plan_context_layout(
+            3,
+            4,
+            5,
+            true,
+            false,
+            false,
+            false,
+            false,
+            ContextTransitionCellFormat::Compact16,
+            ContextTransitionCellFormat::Compact16,
+            usize::MAX,
+        )
+        .unwrap();
+        assert_eq!(compact_both.forward_cells, 516);
+        assert_eq!(compact_both.reverse_cells, Some(546));
+        assert_eq!(compact_both.forward_initial, 588);
+        assert_eq!(compact_both.reverse_initial, Some(262_732));
+        assert_eq!(compact_both.total, 524_876);
         assert_eq!(
             plan_context_layout(
                 3,
@@ -3918,6 +4630,8 @@ mod tests {
                 false,
                 false,
                 false,
+                ContextTransitionCellFormat::Wide32,
+                ContextTransitionCellFormat::Wide32,
                 with_reverse.total,
             )
             .unwrap(),
@@ -3933,6 +4647,8 @@ mod tests {
                 false,
                 false,
                 false,
+                ContextTransitionCellFormat::Wide32,
+                ContextTransitionCellFormat::Wide32,
                 with_reverse.total - 1,
             ),
             Err(ObjectError::Resource {
@@ -3942,15 +4658,39 @@ mod tests {
             }) if limit == with_reverse.total - 1 && required == with_reverse.total
         ));
 
-        let forward_only =
-            plan_context_layout(3, 4, 5, false, false, false, false, false, usize::MAX).unwrap();
+        let forward_only = plan_context_layout(
+            3,
+            4,
+            5,
+            false,
+            false,
+            false,
+            false,
+            false,
+            ContextTransitionCellFormat::Wide32,
+            ContextTransitionCellFormat::Wide32,
+            usize::MAX,
+        )
+        .unwrap();
         assert_eq!(forward_only.reverse_cells, None);
         assert_eq!(forward_only.forward_initial, 576);
         assert_eq!(forward_only.reverse_initial, None);
         assert_eq!(forward_only.total, 262_720);
 
-        let raw_forward_with_reverse =
-            plan_context_layout(3, 4, 5, true, true, false, false, false, usize::MAX).unwrap();
+        let raw_forward_with_reverse = plan_context_layout(
+            3,
+            4,
+            5,
+            true,
+            true,
+            false,
+            false,
+            false,
+            ContextTransitionCellFormat::Wide32,
+            ContextTransitionCellFormat::Wide32,
+            usize::MAX,
+        )
+        .unwrap();
         assert_eq!(raw_forward_with_reverse.forward_initial, 656);
         assert_eq!(raw_forward_with_reverse.reverse_initial, Some(131_728));
         assert_eq!(
@@ -3963,8 +4703,20 @@ mod tests {
         assert_eq!(raw_forward_with_reverse.total, 394_898);
         assert!(raw_forward_with_reverse.total < with_reverse.total);
 
-        let raw_with_reverse =
-            plan_context_layout(3, 4, 5, true, true, true, false, false, usize::MAX).unwrap();
+        let raw_with_reverse = plan_context_layout(
+            3,
+            4,
+            5,
+            true,
+            true,
+            true,
+            false,
+            false,
+            ContextTransitionCellFormat::Wide32,
+            ContextTransitionCellFormat::Wide32,
+            usize::MAX,
+        )
+        .unwrap();
         assert_eq!(raw_with_reverse.forward_initial, 656);
         assert_eq!(raw_with_reverse.reverse_initial, Some(131_728));
         assert_eq!(
@@ -3984,8 +4736,20 @@ mod tests {
         assert_eq!(raw_with_reverse.total, 264_852);
         assert!(raw_with_reverse.total < with_reverse.total);
 
-        let raw_forward_only =
-            plan_context_layout(3, 4, 5, false, true, false, false, false, usize::MAX).unwrap();
+        let raw_forward_only = plan_context_layout(
+            3,
+            4,
+            5,
+            false,
+            true,
+            false,
+            false,
+            false,
+            ContextTransitionCellFormat::Wide32,
+            ContextTransitionCellFormat::Wide32,
+            usize::MAX,
+        )
+        .unwrap();
         assert_eq!(raw_forward_only.forward_initial, 576);
         assert_eq!(raw_forward_only.reverse_initial, None);
         assert_eq!(raw_forward_only.total, 132_674);
@@ -4009,50 +4773,122 @@ mod tests {
     #[test]
     fn direct_byte_direction_gates_and_program_caps_are_exact() {
         assert_eq!(
-            select_direct_byte_directions(512, 508, true, true).unwrap(),
+            select_direct_byte_directions(
+                512,
+                508,
+                true,
+                true,
+                ContextTransitionCellFormat::Wide32,
+                ContextTransitionCellFormat::Wide32,
+            )
+            .unwrap(),
             (true, true),
             "1020 maximum-sized rows consume exactly 1,048,560 bytes"
         );
         assert_eq!(
-            direct_byte_transition_bytes(512).unwrap() + direct_byte_transition_bytes(508).unwrap(),
+            direct_byte_transition_bytes(512, ContextTransitionCellFormat::Wide32).unwrap()
+                + direct_byte_transition_bytes(508, ContextTransitionCellFormat::Wide32).unwrap(),
             1_048_560
         );
         assert_eq!(
-            select_direct_byte_directions(512, 509, true, true).unwrap(),
+            select_direct_byte_directions(
+                512,
+                509,
+                true,
+                true,
+                ContextTransitionCellFormat::Wide32,
+                ContextTransitionCellFormat::Wide32,
+            )
+            .unwrap(),
             (true, false),
             "reverse DirectByte must independently decline above the combined cap"
         );
         assert_eq!(
-            select_direct_byte_directions(513, 512, true, true).unwrap(),
+            select_direct_byte_directions(
+                513,
+                512,
+                true,
+                true,
+                ContextTransitionCellFormat::Wide32,
+                ContextTransitionCellFormat::Wide32,
+            )
+            .unwrap(),
             (false, true),
             "an oversized forward machine must not disable an eligible reverse machine"
         );
         assert_eq!(
-            select_direct_byte_directions(512, 512, false, true).unwrap(),
+            select_direct_byte_directions(
+                512,
+                512,
+                false,
+                true,
+                ContextTransitionCellFormat::Compact16,
+                ContextTransitionCellFormat::Compact16,
+            )
+            .unwrap(),
             (true, false)
         );
         assert_eq!(
-            select_direct_byte_directions(1, 1, true, false).unwrap(),
+            select_direct_byte_directions(
+                1,
+                1,
+                true,
+                false,
+                ContextTransitionCellFormat::Compact16,
+                ContextTransitionCellFormat::Compact16,
+            )
+            .unwrap(),
             (false, false)
         );
 
-        let direct =
-            plan_context_layout(3, 4, 5, true, false, false, true, true, usize::MAX).unwrap();
+        assert_eq!(
+            select_direct_byte_directions(
+                512,
+                512,
+                true,
+                true,
+                ContextTransitionCellFormat::Compact16,
+                ContextTransitionCellFormat::Compact16,
+            )
+            .unwrap(),
+            (true, true),
+            "compact direct rows keep both maximum-sized eligible directions"
+        );
+
+        let direct = plan_context_layout(
+            3,
+            4,
+            5,
+            true,
+            false,
+            false,
+            true,
+            true,
+            ContextTransitionCellFormat::Compact16,
+            ContextTransitionCellFormat::Compact16,
+            usize::MAX,
+        )
+        .unwrap();
         assert_eq!(
             direct.forward_byte_sentinel,
-            Some(direct.forward_cells + 3 * CONTEXT_DIRECT_BYTE_ROW_BYTES)
+            Some(direct.forward_cells + 3 * CONTEXT_DIRECT_BYTE_COMPACT_ROW_BYTES)
         );
         assert_eq!(
             direct.reverse_cells,
-            Some(direct.forward_byte_sentinel.unwrap() + 3 * core::mem::size_of::<u32>())
+            Some(direct.forward_byte_sentinel.unwrap() + 3 * core::mem::size_of::<u16>())
         );
         assert_eq!(
             direct.reverse_byte_sentinel,
-            Some(direct.reverse_cells.unwrap() + 4 * CONTEXT_DIRECT_BYTE_ROW_BYTES)
+            Some(direct.reverse_cells.unwrap() + 4 * CONTEXT_DIRECT_BYTE_COMPACT_ROW_BYTES)
         );
         assert_eq!(
             direct.forward_initial,
-            direct.reverse_byte_sentinel.unwrap() + 4 * core::mem::size_of::<u32>()
+            align_up(
+                direct.reverse_byte_sentinel.unwrap() + 4 * core::mem::size_of::<u16>(),
+                core::mem::align_of::<u32>(),
+                "test initial alignment",
+            )
+            .unwrap()
         );
 
         let program = contextual_program(r"(?:(?-u:\b)a|ab)+?", b'\n', OutputContract::Span);
