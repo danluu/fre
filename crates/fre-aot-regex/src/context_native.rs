@@ -109,6 +109,8 @@ pub(crate) const CONTEXT_DIRECT_BYTE_COMPACT_ROW_BYTES: usize =
     CONTEXT_DIRECT_BYTE_ROW_CELLS * core::mem::size_of::<u16>();
 const CONTEXT_DIRECT_BYTE_MAX_STATES: usize = 512;
 const CONTEXT_DIRECT_BYTE_MAX_COMBINED_BYTES: usize = 1 << 20;
+const CONTEXT_DIRECT_BYTE_SMALL_IMAGE_BYTES: usize = 24 * 1024;
+const CONTEXT_DIRECT_BYTE_MAX_CLASS_EXPANSION: usize = 4;
 const CONTEXT_ANCHORED_DIRECT_BYTE_MAX_BYTES: usize = 256 * 1024;
 const CONTEXT_ANCHORED_MAX_ADDED_BYTES: usize = 1 << 20;
 
@@ -1180,6 +1182,7 @@ fn build_context_native_layout_with_reverse_mode(
     let (mut direct_forward, mut direct_reverse) = select_direct_byte_directions(
         forward_states,
         reverse_states,
+        row_width,
         retain_reverse,
         enable_direct_bytes,
         forward_cell_format,
@@ -1438,7 +1441,11 @@ fn append_anchored_forward_layout_mode(
     let cells = cursor;
     let direct_bytes = direct_byte_transition_bytes(states, cell_format).ok();
     let direct = enable_direct_bytes
-        && direct_bytes.is_some_and(|bytes| bytes <= CONTEXT_ANCHORED_DIRECT_BYTE_MAX_BYTES);
+        && direct_bytes.is_some_and(|bytes| bytes <= CONTEXT_ANCHORED_DIRECT_BYTE_MAX_BYTES)
+        && matches!(
+            direct_byte_footprint_is_profitable(states, row_width, cell_format),
+            Ok(true)
+        );
     let cell_bytes = if direct {
         let Some(bytes) = states.checked_mul(direct_byte_row_bytes(cell_format)?) else {
             return Ok(None);
@@ -1935,9 +1942,41 @@ fn direct_byte_transition_bytes(
         ))
 }
 
+fn class_transition_bytes(
+    states: usize,
+    row_width: usize,
+    format: ContextTransitionCellFormat,
+) -> Result<usize, ObjectError> {
+    states
+        .checked_mul(row_width)
+        .and_then(|cells| cells.checked_mul(format.bytes()))
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "context class transition bytes",
+        ))
+}
+
+fn direct_byte_footprint_is_profitable(
+    states: usize,
+    row_width: usize,
+    format: ContextTransitionCellFormat,
+) -> Result<bool, ObjectError> {
+    let direct_bytes = direct_byte_transition_bytes(states, format)?;
+    if direct_bytes <= CONTEXT_DIRECT_BYTE_SMALL_IMAGE_BYTES {
+        return Ok(true);
+    }
+    // `row_width` includes the absolute-boundary sentinel, just as the
+    // DirectByte image includes its separate per-state sentinel cell. Compare
+    // complete selected-encoding images, rather than only their byte rows.
+    let class_bytes = class_transition_bytes(states, row_width, format)?;
+    Ok(class_bytes
+        .checked_mul(CONTEXT_DIRECT_BYTE_MAX_CLASS_EXPANSION)
+        .is_none_or(|maximum| direct_bytes <= maximum))
+}
+
 fn select_direct_byte_directions(
     forward_states: usize,
     reverse_states: usize,
+    row_width: usize,
     retain_reverse: bool,
     enabled: bool,
     forward_format: ContextTransitionCellFormat,
@@ -1946,14 +1985,18 @@ fn select_direct_byte_directions(
     if !enabled {
         return Ok((false, false));
     }
-    let direct_forward = forward_states != 0 && forward_states <= CONTEXT_DIRECT_BYTE_MAX_STATES;
+    let forward_eligible = forward_states != 0 && forward_states <= CONTEXT_DIRECT_BYTE_MAX_STATES;
+    let direct_forward = forward_eligible
+        && direct_byte_footprint_is_profitable(forward_states, row_width, forward_format)?;
     let forward_bytes = if direct_forward {
         direct_byte_transition_bytes(forward_states, forward_format)?
     } else {
         0
     };
-    let reverse_eligible =
+    let reverse_state_eligible =
         retain_reverse && reverse_states != 0 && reverse_states <= CONTEXT_DIRECT_BYTE_MAX_STATES;
+    let reverse_eligible = reverse_state_eligible
+        && direct_byte_footprint_is_profitable(reverse_states, row_width, reverse_format)?;
     let reverse_bytes = if reverse_eligible {
         direct_byte_transition_bytes(reverse_states, reverse_format)?
     } else {
@@ -4771,11 +4814,140 @@ mod tests {
     }
 
     #[test]
+    fn direct_byte_footprint_gate_has_exact_small_and_growth_boundaries() {
+        assert_eq!(
+            direct_byte_transition_bytes(47, ContextTransitionCellFormat::Compact16).unwrap(),
+            24_158,
+        );
+        assert!(
+            direct_byte_footprint_is_profitable(47, 1, ContextTransitionCellFormat::Compact16,)
+                .unwrap()
+        );
+        assert_eq!(
+            direct_byte_transition_bytes(48, ContextTransitionCellFormat::Compact16).unwrap(),
+            24_672,
+        );
+        assert!(
+            !direct_byte_footprint_is_profitable(48, 64, ContextTransitionCellFormat::Compact16,)
+                .unwrap()
+        );
+        assert!(
+            direct_byte_footprint_is_profitable(48, 65, ContextTransitionCellFormat::Compact16,)
+                .unwrap()
+        );
+
+        assert_eq!(
+            direct_byte_transition_bytes(23, ContextTransitionCellFormat::Wide32).unwrap(),
+            23_644,
+        );
+        assert!(
+            direct_byte_footprint_is_profitable(23, 1, ContextTransitionCellFormat::Wide32,)
+                .unwrap()
+        );
+        assert_eq!(
+            direct_byte_transition_bytes(24, ContextTransitionCellFormat::Wide32).unwrap(),
+            24_672,
+        );
+        assert!(
+            !direct_byte_footprint_is_profitable(24, 64, ContextTransitionCellFormat::Wide32,)
+                .unwrap()
+        );
+        assert!(
+            direct_byte_footprint_is_profitable(24, 65, ContextTransitionCellFormat::Wide32,)
+                .unwrap()
+        );
+
+        for format in [
+            ContextTransitionCellFormat::Compact16,
+            ContextTransitionCellFormat::Wide32,
+        ] {
+            assert_eq!(
+                direct_byte_transition_bytes(512, format).unwrap(),
+                class_transition_bytes(512, 257, format).unwrap(),
+                "a complete 257-symbol class image has exactly zero DirectByte growth",
+            );
+            assert!(direct_byte_footprint_is_profitable(512, 257, format).unwrap());
+        }
+    }
+
+    #[test]
     fn direct_byte_direction_gates_and_program_caps_are_exact() {
+        assert_eq!(
+            select_direct_byte_directions(
+                48,
+                47,
+                64,
+                true,
+                true,
+                ContextTransitionCellFormat::Compact16,
+                ContextTransitionCellFormat::Compact16,
+            )
+            .unwrap(),
+            (false, true),
+            "forward footprint rejection must not suppress eligible reverse rows",
+        );
+        assert_eq!(
+            select_direct_byte_directions(
+                47,
+                48,
+                64,
+                true,
+                true,
+                ContextTransitionCellFormat::Compact16,
+                ContextTransitionCellFormat::Compact16,
+            )
+            .unwrap(),
+            (true, false),
+            "reverse footprint rejection must not suppress eligible forward rows",
+        );
+        let declined = select_direct_byte_directions(
+            48,
+            48,
+            64,
+            true,
+            true,
+            ContextTransitionCellFormat::Compact16,
+            ContextTransitionCellFormat::Compact16,
+        )
+        .unwrap();
+        assert_eq!(declined, (false, false));
+        assert_eq!(
+            plan_context_layout(
+                48,
+                48,
+                64,
+                true,
+                false,
+                false,
+                declined.0,
+                declined.1,
+                ContextTransitionCellFormat::Compact16,
+                ContextTransitionCellFormat::Compact16,
+                usize::MAX,
+            )
+            .unwrap(),
+            plan_context_layout(
+                48,
+                48,
+                64,
+                true,
+                false,
+                false,
+                false,
+                false,
+                ContextTransitionCellFormat::Compact16,
+                ContextTransitionCellFormat::Compact16,
+                usize::MAX,
+            )
+            .unwrap(),
+            "declining both images must add no bytes over class rows",
+        );
+
         assert_eq!(
             select_direct_byte_directions(
                 512,
                 508,
+                257,
                 true,
                 true,
                 ContextTransitionCellFormat::Wide32,
@@ -4794,6 +4966,7 @@ mod tests {
             select_direct_byte_directions(
                 512,
                 509,
+                257,
                 true,
                 true,
                 ContextTransitionCellFormat::Wide32,
@@ -4807,6 +4980,7 @@ mod tests {
             select_direct_byte_directions(
                 513,
                 512,
+                257,
                 true,
                 true,
                 ContextTransitionCellFormat::Wide32,
@@ -4820,6 +4994,7 @@ mod tests {
             select_direct_byte_directions(
                 512,
                 512,
+                257,
                 false,
                 true,
                 ContextTransitionCellFormat::Compact16,
@@ -4832,6 +5007,7 @@ mod tests {
             select_direct_byte_directions(
                 1,
                 1,
+                257,
                 true,
                 false,
                 ContextTransitionCellFormat::Compact16,
@@ -4845,6 +5021,7 @@ mod tests {
             select_direct_byte_directions(
                 512,
                 512,
+                257,
                 true,
                 true,
                 ContextTransitionCellFormat::Compact16,
