@@ -930,6 +930,10 @@ const _: () = assert!(
 const _: () = assert!(DYNAMIC_NATIVE_ROWS_V1_UNFILLED_CELL == u32::MAX);
 const _: () = assert!(DYNAMIC_NATIVE_ROWS_V1_ACCEPT_MASK == 1 << 31);
 const _: () = assert!(DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK == (1 << 29) - 1);
+const _: () = assert!(
+    NATIVE_ROWS_ACCEPT_MASK + core::mem::size_of::<u32>()
+        == NATIVE_ROWS_NEXT_ROW_TOKEN_MASK
+);
 const _: () = assert!(FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL_OFFSET == 0);
 const _: () = assert!(DYNAMIC_NATIVE_ROWS_V3_DEAD_CELL == 0);
 const _: () = assert!(DYNAMIC_NATIVE_ROWS_V3_ACCEPT_MASK == 1 << 15);
@@ -13891,6 +13895,36 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     assembler.branch(&[0x0f, 0x85], framed_fallback)?;
     assembler.instruction(&[0x41, 0x83, 0x7b, NATIVE_ROWS_INITIAL_FLAGS as u8, 0])?;
     assembler.branch(&[0x0f, 0x85], framed_fallback)?;
+    // The mutable V1 producer has one canonical cell encoding. Authenticate
+    // it once at the descriptor boundary so the byte loop can use immediate
+    // cell operations without rereading three cold descriptor fields.
+    for (field, expected, context) in [
+        (
+            NATIVE_ROWS_UNFILLED_CELL,
+            DYNAMIC_NATIVE_ROWS_V1_UNFILLED_CELL,
+            "x86 dynamic unfilled value",
+        ),
+        (
+            NATIVE_ROWS_ACCEPT_MASK,
+            DYNAMIC_NATIVE_ROWS_V1_ACCEPT_MASK,
+            "x86 dynamic accept value",
+        ),
+        (
+            NATIVE_ROWS_NEXT_ROW_TOKEN_MASK,
+            DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK,
+            "x86 dynamic next-row value",
+        ),
+    ] {
+        let mut compare = vec![
+            0x41,
+            0x81,
+            0x7b,
+            u8::try_from(field).map_err(|_| ObjectError::ArithmeticOverflow(context))?,
+        ];
+        compare.extend_from_slice(&expected.to_le_bytes());
+        assembler.instruction(&compare)?;
+        assembler.branch(&[0x0f, 0x85], framed_fallback)?;
+    }
     if root_plan.is_some() {
         assembler.instruction(&[
             0x41,
@@ -14074,22 +14108,22 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     assembler.instruction(&[0x47, 0x0f, 0xb6, 0x14, 0x11])?;
     assembler.instruction(&[0x4d, 0x01, 0xc2])?;
     assembler.instruction(&[0x46, 0x8b, 0x14, 0x96])?;
-    assembler.instruction(&[0x45, 0x3b, 0x53, NATIVE_ROWS_UNFILLED_CELL as u8])?;
+    assembler.instruction(&[0x41, 0x83, 0xfa, 0xff])?; // cmp r10d, -1
     assembler.branch(
         &[0x0f, 0x84],
         native_continue.unwrap_or(framed_fallback),
     )?;
     assembler.instruction(&[0x48, 0xff, 0xc2])?;
-    assembler.instruction(&[0x45, 0x85, 0x53, NATIVE_ROWS_ACCEPT_MASK as u8])?;
+    assembler.instruction(&[0x45, 0x85, 0xd2])?; // test r10d, r10d
     if output == OutputContract::Exists {
-        assembler.branch(&[0x0f, 0x85], native_match)?;
+        assembler.branch(&[0x0f, 0x88], native_match)?; // js
     } else {
         let not_accepting = assembler.label()?;
-        assembler.branch(&[0x0f, 0x84], not_accepting)?;
+        assembler.branch(&[0x0f, 0x89], not_accepting)?; // jns
         assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x60])?;
         assembler.bind(not_accepting)?;
     }
-    assembler.instruction(&[0x45, 0x23, 0x53, NATIVE_ROWS_NEXT_ROW_TOKEN_MASK as u8])?;
+    assembler.instruction(&[0x41, 0x81, 0xe2, 0xff, 0xff, 0xff, 0x1f])?;
     assembler.instruction(&[0x45, 0x85, 0xd2])?;
     assembler.branch(
         &[0x0f, 0x84],
@@ -15685,6 +15719,13 @@ fn aarch64_cmp_w_imm(register: u8, immediate: u16) -> Result<u32, ObjectError> {
     Ok(0x7100_001f | (u32::from(immediate) << 10) | aarch64_reg(register, 5)?)
 }
 
+fn aarch64_cmn_w_imm(register: u8, immediate: u16) -> Result<u32, ObjectError> {
+    if immediate > 0x0fff {
+        return Err(ObjectError::InvalidModule("AArch64 CMN W immediate"));
+    }
+    Ok(0x3100_001f | (u32::from(immediate) << 10) | aarch64_reg(register, 5)?)
+}
+
 fn aarch64_cmp_x_imm(register: u8, immediate: u16) -> Result<u32, ObjectError> {
     if immediate > 0x0fff {
         return Err(ObjectError::InvalidModule("AArch64 CMP X immediate"));
@@ -16212,6 +16253,32 @@ fn aarch64_and_low_w(destination: u8, source: u8, bits: u8) -> Result<u32, Objec
         .filter(|&value| value < 31)
         .ok_or(ObjectError::InvalidModule("AArch64 low-bit mask"))?;
     Ok(0x1200_0000
+        | (u32::from(mask_end) << 10)
+        | aarch64_reg(source, 5)?
+        | aarch64_reg(destination, 0)?)
+}
+
+fn aarch64_eor_contiguous_x(
+    destination: u8,
+    source: u8,
+    first_bit: u8,
+    bit_count: u8,
+) -> Result<u32, ObjectError> {
+    let end = first_bit
+        .checked_add(bit_count)
+        .filter(|&value| value <= 64)
+        .ok_or(ObjectError::InvalidModule(
+            "AArch64 contiguous logical immediate",
+        ))?;
+    if bit_count == 0 || bit_count == 64 || end == 0 {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 contiguous logical immediate",
+        ));
+    }
+    let rotate = (64_u8 - first_bit) & 63;
+    let mask_end = bit_count - 1;
+    Ok(0xd240_0000
+        | (u32::from(rotate) << 16)
         | (u32::from(mask_end) << 10)
         | aarch64_reg(source, 5)?
         | aarch64_reg(destination, 0)?)
@@ -21683,7 +21750,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     assembler.instruction(aarch64_store_x(8, 31, 32)?)?;
     // Caller-saved registers remain disjoint across the root scanners:
     // X13 descriptor, X14/X15 map/rows, W11 current row, W1 initial row,
-    // X2/X3 position/end, W4/W7/W9 cell masks, and X8/X10/X12 scratch.
+    // X2/X3 position/end, and X4/X7/X8/X9/X10/X12 scratch.
     assembler.instruction(aarch64_load_x_imm(13, 31, 64)?)?; // descriptor
     assembler.instruction(aarch64_cmp_x_imm(13, 0)?)?;
     assembler.branch_cond(AARCH64_EQ, framed_fallback)?;
@@ -21721,6 +21788,29 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
             .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic initial flags"))?,
     )?)?;
     assembler.branch_nonzero_w(8, framed_fallback)?;
+    // Validate the mutable V1 cell encoding once. On every supported
+    // little-endian target, the adjacent accepting and token fields form one
+    // 64-bit run of bits 31..=60, so one logical immediate authenticates both
+    // without materializing either constant. The transition loop can then
+    // release three invariant registers and use CMN, TBNZ/TBZ, and an
+    // immediate low-29 mask.
+    assembler.instruction(aarch64_load_w_imm(
+        8,
+        13,
+        u16::try_from(NATIVE_ROWS_UNFILLED_CELL)
+            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic unfilled value"))?,
+    )?)?;
+    assembler.instruction(aarch64_cmn_w_imm(8, 1)?)?;
+    assembler.branch_cond(AARCH64_NE, framed_fallback)?;
+    assembler.instruction(aarch64_load_x_imm(
+        8,
+        13,
+        u16::try_from(NATIVE_ROWS_ACCEPT_MASK)
+            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic cell masks"))?,
+    )?)?;
+    assembler.instruction(aarch64_eor_contiguous_x(8, 8, 31, 30)?)?;
+    assembler.instruction(aarch64_cmp_x_imm(8, 0)?)?;
+    assembler.branch_cond(AARCH64_NE, framed_fallback)?;
     assembler.instruction(aarch64_load_w_imm(
         10,
         13,
@@ -21760,24 +21850,6 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     )?)?;
     assembler.instruction(aarch64_cmp_x(1, 10)?)?;
     assembler.branch_cond(AARCH64_HS, framed_fallback)?;
-    assembler.instruction(aarch64_load_w_imm(
-        4,
-        13,
-        u16::try_from(NATIVE_ROWS_UNFILLED_CELL)
-            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic unfilled cell"))?,
-    )?)?;
-    assembler.instruction(aarch64_load_w_imm(
-        7,
-        13,
-        u16::try_from(NATIVE_ROWS_ACCEPT_MASK)
-            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic accept mask"))?,
-    )?)?;
-    assembler.instruction(aarch64_load_w_imm(
-        9,
-        13,
-        u16::try_from(NATIVE_ROWS_NEXT_ROW_TOKEN_MASK)
-            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic next-row mask"))?,
-    )?)?;
     assembler.instruction(aarch64_load_x_imm(0, 31, 8)?)?; // haystack
     assembler.instruction(aarch64_load_x_imm(2, 31, 48)?)?;
     assembler.instruction(aarch64_load_x_imm(3, 31, 56)?)?;
@@ -21914,15 +21986,6 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
             // V2/mutable candidates need continuation accounting.
             assembler.instruction(aarch64_add_x_imm(19, 19, 1)?)?;
         }
-        // The discriminator borrows W9, which otherwise carries V2's live
-        // next-row token mask. Restore the authenticated descriptor value
-        // before the canonical V2 transition consumes it.
-        assembler.instruction(aarch64_load_w_imm(
-            9,
-            13,
-            u16::try_from(NATIVE_ROWS_NEXT_ROW_TOKEN_MASK)
-                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 V2 candidate mask"))?,
-        )?)?;
         assembler.branch(table_scan)?;
     }
 
@@ -21931,22 +21994,21 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     assembler.instruction(aarch64_load_byte_reg(10, 14, 8)?)?;
     assembler.instruction(aarch64_add_w_reg(10, 11, 10)?)?;
     assembler.instruction(aarch64_load_w_uxtw(8, 15, 10)?)?;
-    assembler.instruction(aarch64_cmp_w(8, 4)?)?;
+    assembler.instruction(aarch64_cmn_w_imm(8, 1)?)?;
     assembler.branch_cond(
         AARCH64_EQ,
         native_continue.unwrap_or(framed_fallback),
     )?;
     assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
-    assembler.instruction(aarch64_tst_w(8, 7)?)?;
     if output == OutputContract::Exists {
-        assembler.branch_cond(AARCH64_NE, native_match)?;
+        assembler.branch_bit_set_w(8, 31, native_match)?;
     } else {
         let not_accepting = assembler.label()?;
-        assembler.branch_cond(AARCH64_EQ, not_accepting)?;
+        assembler.branch_bit_clear_w(8, 31, not_accepting)?;
         assembler.instruction(aarch64_store_x(2, 31, 80)?)?;
         assembler.bind(not_accepting)?;
     }
-    assembler.instruction(aarch64_and_w(8, 8, 9)?)?;
+    assembler.instruction(aarch64_and_low_w(8, 8, 29)?)?;
     assembler.branch_zero_w(8, native_complete.unwrap_or(native_no_match))?;
     assembler.instruction(aarch64_sub_w_imm(11, 8, 1)?)?;
     assembler.branch(scan)?;
@@ -27379,6 +27441,254 @@ mod tests {
     #[test]
     #[allow(
         clippy::too_many_lines,
+        reason = "the cross-ISA cell specialization audit keeps entry authentication and the exact hot-loop encodings together"
+    )]
+    fn dynamic_v1_cells_are_authenticated_before_both_immediate_hot_loops() {
+        fn aarch64_conditional_target(words: &[u32], branch: usize) -> usize {
+            let instruction = words[branch];
+            assert_eq!(instruction & 0xff00_0010, 0x5400_0000);
+            let immediate = (instruction >> 5) & 0x7_ffff;
+            let signed = i32::try_from(immediate << 13).unwrap() >> 13;
+            branch
+                .checked_add_signed(isize::try_from(signed).unwrap())
+                .expect("AArch64 conditional target")
+        }
+
+        assert_eq!(aarch64_cmn_w_imm(8, 1).unwrap(), 0x3100_051f);
+        assert_eq!(aarch64_and_low_w(8, 8, 29).unwrap(), 0x1200_7108);
+        assert_eq!(
+            aarch64_eor_contiguous_x(8, 8, 31, 30).unwrap(),
+            0xd261_7508
+        );
+        assert!(aarch64_cmn_w_imm(8, 0x1000).is_err());
+        assert!(aarch64_eor_contiguous_x(8, 8, 0, 0).is_err());
+        assert!(aarch64_eor_contiguous_x(8, 8, 0, 64).is_err());
+        assert!(aarch64_eor_contiguous_x(8, 8, 63, 2).is_err());
+
+        for (output, width) in [
+            (OutputContract::Exists, None),
+            (OutputContract::SelectedEnd, None),
+            (OutputContract::Span, Some(2)),
+        ] {
+            let x86 = lower_x86_64_dynamic_rows_prepared_for_output(
+                None,
+                FeatureSet::EMPTY,
+                output,
+                width,
+                true,
+            )
+            .unwrap()
+            .code;
+            let x86_entry = x86
+                .windows(5)
+                .position(|bytes| bytes == [0x4c, 0x8b, 0x5c, 0x24, 0x50])
+                .expect("x86 mutable descriptor entry");
+            let x86_table_prefix = [
+                0x44, 0x0f, 0xb6, 0x14, 0x17, // byte
+                0x47, 0x0f, 0xb6, 0x14, 0x11, // class
+                0x4d, 0x01, 0xc2, // row + class
+                0x46, 0x8b, 0x14, 0x96, // cell
+                0x41, 0x83, 0xfa, 0xff, // cmp cell, -1
+            ];
+            let x86_table = x86
+                .windows(x86_table_prefix.len())
+                .position(|bytes| bytes == x86_table_prefix)
+                .expect("x86 immediate V1 transition");
+            assert!(x86_entry < x86_table, "{output:?}");
+            let descriptor_null_branch = x86_entry + 8;
+            let descriptor_fallback = x86_test_branch_target(&x86, descriptor_null_branch)
+                .expect("x86 descriptor-null fallback")
+                .0;
+            for (field, expected) in [
+                (
+                    NATIVE_ROWS_UNFILLED_CELL,
+                    DYNAMIC_NATIVE_ROWS_V1_UNFILLED_CELL,
+                ),
+                (NATIVE_ROWS_ACCEPT_MASK, DYNAMIC_NATIVE_ROWS_V1_ACCEPT_MASK),
+                (
+                    NATIVE_ROWS_NEXT_ROW_TOKEN_MASK,
+                    DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK,
+                ),
+            ] {
+                let mut guard = vec![0x41, 0x81, 0x7b, u8::try_from(field).unwrap()];
+                guard.extend_from_slice(&expected.to_le_bytes());
+                let guard = x86_entry
+                    + x86[x86_entry..x86_table]
+                        .windows(guard.len())
+                        .position(|bytes| bytes == guard)
+                        .unwrap_or_else(|| panic!("x86 {output:?} missing canonical guard"));
+                let branch = guard + 8;
+                assert_eq!(x86_test_normalized_branch_opcode(&x86, branch), Some(0x85));
+                assert_eq!(
+                    x86_test_branch_target(&x86, branch)
+                        .expect("x86 malformed-cell fallback")
+                        .0,
+                    descriptor_fallback,
+                    "x86 {output:?} malformed descriptor must share the framed fallback"
+                );
+            }
+            let unfilled_branch = x86_table + x86_table_prefix.len();
+            assert_eq!(
+                x86_test_normalized_branch_opcode(&x86, unfilled_branch),
+                Some(0x84)
+            );
+            let accept_test = x86_table
+                + x86[x86_table..]
+                    .windows(3)
+                    .position(|bytes| bytes == [0x45, 0x85, 0xd2])
+                    .expect("x86 sign-bit test");
+            assert_eq!(
+                x86_test_normalized_branch_opcode(&x86, accept_test + 3),
+                Some(if output == OutputContract::Exists {
+                    0x88
+                } else {
+                    0x89
+                }),
+                "x86 {output:?} accepts from the cell sign bit"
+            );
+            let next_mask = [0x41, 0x81, 0xe2, 0xff, 0xff, 0xff, 0x1f];
+            let mask = x86_table
+                + x86[x86_table..]
+                    .windows(next_mask.len())
+                    .position(|bytes| bytes == next_mask)
+                    .expect("x86 low-29 immediate mask");
+            let hot = &x86[x86_table..mask + next_mask.len()];
+            for removed in [
+                [0x45, 0x3b, 0x53, u8::try_from(NATIVE_ROWS_UNFILLED_CELL).unwrap()],
+                [0x45, 0x85, 0x53, u8::try_from(NATIVE_ROWS_ACCEPT_MASK).unwrap()],
+                [
+                    0x45,
+                    0x23,
+                    0x53,
+                    u8::try_from(NATIVE_ROWS_NEXT_ROW_TOKEN_MASK).unwrap(),
+                ],
+            ] {
+                assert!(
+                    !hot.windows(removed.len()).any(|bytes| bytes == removed),
+                    "x86 {output:?} hot loop rereads a descriptor constant"
+                );
+            }
+
+            let arm = lower_aarch64_dynamic_rows_prepared_for_output(
+                None,
+                output,
+                width,
+                true,
+            )
+            .unwrap();
+            let words = arm
+                .code
+                .chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            let arm_entry = words
+                .iter()
+                .position(|&word| word == aarch64_load_x_imm(13, 31, 64).unwrap())
+                .expect("AArch64 mutable descriptor entry");
+            let arm_table_prefix = [
+                aarch64_load_byte_reg(8, 0, 2).unwrap(),
+                aarch64_load_byte_reg(10, 14, 8).unwrap(),
+                aarch64_add_w_reg(10, 11, 10).unwrap(),
+                aarch64_load_w_uxtw(8, 15, 10).unwrap(),
+                aarch64_cmn_w_imm(8, 1).unwrap(),
+            ];
+            let arm_table = words
+                .windows(arm_table_prefix.len())
+                .position(|window| window == arm_table_prefix)
+                .expect("AArch64 immediate V1 transition");
+            assert!(arm_entry < arm_table, "{output:?}");
+            let descriptor_fallback = aarch64_conditional_target(&words, arm_entry + 2);
+            let unfilled_load = aarch64_load_w_imm(
+                8,
+                13,
+                u16::try_from(NATIVE_ROWS_UNFILLED_CELL).unwrap(),
+            )
+            .unwrap();
+            let unfilled_guard = arm_entry
+                + words[arm_entry..arm_table]
+                    .iter()
+                    .position(|&word| word == unfilled_load)
+                    .unwrap_or_else(|| {
+                        panic!("AArch64 {output:?} missing canonical sentinel guard")
+                    });
+            assert_eq!(
+                words[unfilled_guard + 1],
+                aarch64_cmn_w_imm(8, 1).unwrap()
+            );
+            assert_eq!(words[unfilled_guard + 2] & 0xf, u32::from(AARCH64_NE));
+            assert_eq!(
+                aarch64_conditional_target(&words, unfilled_guard + 2),
+                descriptor_fallback,
+                "AArch64 {output:?} malformed sentinel must use the framed fallback"
+            );
+
+            let pair_load = aarch64_load_x_imm(
+                8,
+                13,
+                u16::try_from(NATIVE_ROWS_ACCEPT_MASK).unwrap(),
+            )
+            .unwrap();
+            let pair_guard = unfilled_guard
+                + words[unfilled_guard..arm_table]
+                    .iter()
+                    .position(|&word| word == pair_load)
+                    .unwrap_or_else(|| {
+                        panic!("AArch64 {output:?} missing canonical mask-pair guard")
+                    });
+            assert_eq!(
+                words[pair_guard + 1],
+                aarch64_eor_contiguous_x(8, 8, 31, 30).unwrap()
+            );
+            assert_eq!(words[pair_guard + 2], aarch64_cmp_x_imm(8, 0).unwrap());
+            assert_eq!(words[pair_guard + 3] & 0xf, u32::from(AARCH64_NE));
+            assert_eq!(
+                aarch64_conditional_target(&words, pair_guard + 3),
+                descriptor_fallback,
+                "AArch64 {output:?} malformed cell masks must use the framed fallback"
+            );
+            for field in [NATIVE_ROWS_ACCEPT_MASK, NATIVE_ROWS_NEXT_ROW_TOKEN_MASK] {
+                assert!(
+                    !words[arm_entry..arm_table].contains(
+                        &aarch64_load_w_imm(8, 13, u16::try_from(field).unwrap())
+                            .unwrap()
+                    ),
+                    "AArch64 {output:?} must authenticate adjacent masks together"
+                );
+            }
+            assert_eq!(words[arm_table + arm_table_prefix.len()] & 0xf, 0);
+            let accept = arm_table + arm_table_prefix.len() + 2;
+            let expected_accept = if output == OutputContract::Exists {
+                0x37f8_0008
+            } else {
+                0x36f8_0008
+            };
+            assert_eq!(
+                words[accept] & 0xfff8_001f,
+                expected_accept,
+                "AArch64 {output:?} accepts through bit 31"
+            );
+            let mask = words[accept..accept + 4]
+                .iter()
+                .position(|&word| word == aarch64_and_low_w(8, 8, 29).unwrap())
+                .map(|offset| accept + offset)
+                .expect("AArch64 low-29 logical immediate");
+            let hot = &words[arm_table..=mask];
+            for removed in [
+                aarch64_cmp_w(8, 4).unwrap(),
+                aarch64_tst_w(8, 7).unwrap(),
+                aarch64_and_w(8, 8, 9).unwrap(),
+            ] {
+                assert!(
+                    !hot.contains(&removed),
+                    "AArch64 {output:?} hot loop retains a descriptor-valued operation"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
         reason = "the exact dynamic-root target matrix audits one shared ABI and storage contract"
     )]
     fn x86_dynamic_exact_root_reuses_canonical_storage_at_every_vector_tier() {
@@ -27542,6 +27852,16 @@ mod tests {
             index.checked_add_signed(isize::try_from(signed).ok()?)
         }
 
+        fn conditional_target(words: &[u32], index: usize) -> Option<usize> {
+            let instruction = *words.get(index)?;
+            if instruction & 0xff00_0010 != 0x5400_0000 {
+                return None;
+            }
+            let immediate = i32::try_from((instruction >> 5) & 0x7_ffff).ok()?;
+            let signed = (immediate << 13) >> 13;
+            index.checked_add_signed(isize::try_from(signed).ok()?)
+        }
+
         let set = dynamic_exact_test_set(3);
         let asimd_target = Target::aarch64_macos()
             .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
@@ -27691,29 +28011,25 @@ mod tests {
                         .any(|target| target == candidate),
                     "{target:?}/{output:?} scanner hit must reach compact candidate dispatch"
                 );
-                let v2_mask_restore = candidate
-                    + words[candidate..]
-                        .iter()
-                        .position(|&word| {
-                            word
-                                == aarch64_load_w_imm(
-                                    9,
-                                    13,
-                                    u16::try_from(NATIVE_ROWS_NEXT_ROW_TOKEN_MASK).unwrap(),
-                                )
-                                .unwrap()
-                        })
-                        .expect("V2 candidate restores its borrowed next-row mask");
                 let v2_table = words
                     .iter()
                     .position(|&word| word == aarch64_load_byte_reg(8, 0, 2).unwrap())
                     .expect("canonical V2 table transition");
-                let v2_rejoin = unconditional_target(&words, v2_mask_restore + 1)
-                    .unwrap_or(v2_mask_restore + 1);
                 assert_eq!(
-                    v2_rejoin,
-                    v2_table,
-                    "V2 mask restoration must immediately rejoin its table transition"
+                    conditional_target(&words, candidate + candidate_prefix.len()),
+                    Some(v2_table),
+                    "V2 selection must rejoin the immediate-only table transition"
+                );
+                assert!(
+                    !words[candidate..v2_table].contains(
+                        &aarch64_load_w_imm(
+                            9,
+                            13,
+                            u16::try_from(NATIVE_ROWS_NEXT_ROW_TOKEN_MASK).unwrap(),
+                        )
+                        .unwrap()
+                    ),
+                    "V2 selection must not reload a canonical cell mask"
                 );
                 assert!(
                     words.contains(&aarch64_load_byte_reg(8, 6, 8).unwrap()),
@@ -28214,12 +28530,7 @@ mod tests {
                 .windows(5)
                 .position(|bytes| bytes == [0x44, 0x0f, 0xb6, 0x14, 0x17])
                 .expect("x86 dynamic table byte");
-            let comparison = [
-                0x45,
-                0x3b,
-                0x53,
-                u8::try_from(NATIVE_ROWS_UNFILLED_CELL).unwrap(),
-            ];
+            let comparison = [0x41, 0x83, 0xfa, 0xff];
             let compare = table_byte
                 + code[table_byte..]
                     .windows(comparison.len())
@@ -28351,7 +28662,7 @@ mod tests {
             let compare = table_byte
                 + words[table_byte..]
                     .iter()
-                    .position(|&word| word == aarch64_cmp_w(8, 4).unwrap())
+                    .position(|&word| word == aarch64_cmn_w_imm(8, 1).unwrap())
                     .expect("AArch64 dynamic unfilled comparison");
             let continuation = aarch64_conditional_target(&words, compare + 1);
             assert_eq!(
@@ -28587,7 +28898,7 @@ mod tests {
         let compare = table_byte
             + words[table_byte..]
                 .iter()
-                .position(|&word| word == aarch64_cmp_w(8, 4).unwrap())
+                .position(|&word| word == aarch64_cmn_w_imm(8, 1).unwrap())
                 .unwrap();
         let fallback = aarch64_conditional_target(&words, compare + 1);
         assert_eq!(
