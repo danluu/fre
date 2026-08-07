@@ -125,6 +125,11 @@ mod text_set;
 mod token_phrase;
 mod unicode_folded_literal;
 mod unicode_word_run;
+#[allow(
+    dead_code,
+    reason = "the reusable corridor proof is staged separately from its K0 facade consumer"
+)]
+mod universal_finite_greedy_corridor;
 
 pub use pure_byte_class_repeat::{
     Accounting as PureByteClassRepeatAccounting, Error as PureByteClassRepeatSearchError,
