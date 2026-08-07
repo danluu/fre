@@ -11677,6 +11677,179 @@ fn run_k0_finite_prefix_exists_hedge(
     }))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum K0UniversalFiniteSuffixIncumbentOutcome {
+    GeometryBypass,
+    ProvedAbsent,
+    ProvedMatch,
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the outlined incumbent transaction keeps its immutable plans, staged adaptive states, and exact search window together without widening the common caller"
+)]
+#[inline(never)]
+fn try_k0_universal_finite_suffix_incumbent(
+    session: &mut K0SearchSession<'_>,
+    suffix: &K0MandatorySuffixPlan,
+    mandatory_cut: Option<&K0MandatoryCutPlan>,
+    negative_prefilter: Option<&K0NegativePrefilterPlan>,
+    mandatory_suffix_span_state: &mut K0NegativePrefilterState,
+    negative_prefilter_span_state: &mut K0NegativePrefilterState,
+    incumbent_route: K0UniversalFiniteSuffixIncumbentRoute,
+    haystack: &[u8],
+    window: SearchWindow,
+    limits: SearchLimits,
+    matched: &mut Match,
+) -> Result<K0UniversalFiniteSuffixIncumbentOutcome, SearchError> {
+    let class_index = match incumbent_route {
+        K0UniversalFiniteSuffixIncumbentRoute::Calibration { class_index }
+        | K0UniversalFiniteSuffixIncumbentRoute::Retained { class_index } => class_index,
+    };
+    let mut suffix_state_after_success = *mandatory_suffix_span_state;
+    let attempt = run_k0_negative_prefilter(
+        mandatory_cut,
+        negative_prefilter,
+        *negative_prefilter_span_state,
+        haystack,
+        window,
+        limits,
+    );
+    let certified_absent = attempt.outcome == K0NegativePrefilterOutcome::Absent
+        && window
+            .end()
+            .checked_sub(window.start())
+            .is_some_and(|window_bytes| {
+                session.negative_terminal_has_reused_work_certificate(window_bytes)
+            });
+    if certified_absent {
+        if matches!(
+            incumbent_route,
+            K0UniversalFiniteSuffixIncumbentRoute::Calibration { .. }
+        ) {
+            observe_k0_universal_finite_suffix_incumbent(
+                &mut suffix_state_after_success,
+                class_index,
+                true,
+            );
+        }
+        *mandatory_suffix_span_state = suffix_state_after_success;
+        *negative_prefilter_span_state = attempt.state_after_success;
+        return Ok(K0UniversalFiniteSuffixIncumbentOutcome::ProvedAbsent);
+    }
+
+    let class = &mut suffix_state_after_success.classes[class_index];
+    debug_assert_eq!(class.disabled_calls, 0);
+    let prior_backoff = class.present_backoff;
+    // Let the exact suffix answer this same call before installing retry
+    // backoff. Otherwise the universal helper would immediately consume the
+    // clock that this failed calibration just created.
+    class.next_predicate = K0_FINITE_SUFFIX_EXACT_ROUTE;
+    let suffix_attempt = try_k0_mandatory_suffix_span_start(
+        session,
+        suffix,
+        suffix_state_after_success,
+        haystack,
+        window,
+        limits,
+        attempt.candidate_floor,
+    )?;
+    suffix_state_after_success = suffix_attempt.state_after_success;
+    if suffix_attempt.outcome == K0MandatorySuffixSpanOutcome::GeometryBypass {
+        return Ok(K0UniversalFiniteSuffixIncumbentOutcome::GeometryBypass);
+    }
+
+    let mut suffix_completed_exact_proof = matches!(
+        suffix_attempt.outcome,
+        K0MandatorySuffixSpanOutcome::ProvedSpan { .. }
+    );
+    let outcome = match suffix_attempt.outcome {
+        K0MandatorySuffixSpanOutcome::ProvedAbsent => {
+            if k0_negative_prefilter_admitted(
+                mandatory_cut,
+                negative_prefilter,
+                haystack.len(),
+                window,
+                limits,
+            ) && window
+                .end()
+                .checked_sub(window.start())
+                .is_some_and(|window_bytes| {
+                    session.negative_terminal_has_reused_work_certificate(window_bytes)
+                })
+            {
+                schedule_k0_universal_finite_suffix_incumbent_calibration(
+                    &mut suffix_state_after_success,
+                    window,
+                );
+            }
+            K0UniversalFiniteSuffixIncumbentOutcome::ProvedAbsent
+        }
+        K0MandatorySuffixSpanOutcome::ProvedSpan { start, end } => {
+            *matched = Match { start, end };
+            K0UniversalFiniteSuffixIncumbentOutcome::ProvedMatch
+        }
+        K0MandatorySuffixSpanOutcome::ProvedStart {
+            start,
+            maximum_match_bytes,
+        } => {
+            let (output, exact_receipt) = replay_k0_finite_proved_start_with_exact_receipt(
+                session,
+                haystack,
+                window,
+                limits,
+                start,
+                maximum_match_bytes,
+            )?;
+            if !exact_receipt {
+                observe_k0_finite_suffix_span_replay_fallback(
+                    &mut suffix_state_after_success,
+                    window,
+                );
+            }
+            suffix_completed_exact_proof = exact_receipt;
+            if let Some(output) = output {
+                *matched = output;
+                K0UniversalFiniteSuffixIncumbentOutcome::ProvedMatch
+            } else {
+                K0UniversalFiniteSuffixIncumbentOutcome::ProvedAbsent
+            }
+        }
+        K0MandatorySuffixSpanOutcome::Fallback
+        | K0MandatorySuffixSpanOutcome::Bypass
+        | K0MandatorySuffixSpanOutcome::GeometryBypass
+        | K0MandatorySuffixSpanOutcome::Absent
+        | K0MandatorySuffixSpanOutcome::Narrowed(_)
+        | K0MandatorySuffixSpanOutcome::Incumbent { .. } => {
+            match session
+                .search_span_value(haystack, window, limits)
+                .map_err(SearchError::from)?
+            {
+                Some(span) => {
+                    *matched = Match {
+                        start: span.start(),
+                        end: span.end(),
+                    };
+                    K0UniversalFiniteSuffixIncumbentOutcome::ProvedMatch
+                }
+                None => K0UniversalFiniteSuffixIncumbentOutcome::ProvedAbsent,
+            }
+        }
+    };
+    finish_k0_universal_finite_suffix_incumbent_failure(
+        &mut suffix_state_after_success,
+        class_index,
+        prior_backoff,
+        outcome == K0UniversalFiniteSuffixIncumbentOutcome::ProvedMatch,
+        suffix_completed_exact_proof,
+    );
+    *mandatory_suffix_span_state = suffix_state_after_success;
+    *negative_prefilter_span_state = attempt.state_after_success;
+    Ok(outcome)
+}
+
 impl<'r> PortableSearchSession<'r> {
     /// Stable runtime identity of the borrowed matcher.
     #[must_use]
@@ -12679,73 +12852,42 @@ impl<'r> PortableSearchSession<'r> {
                     // suffix proof, one independent mandatory-predicate pass
                     // calibrates whether the lower-dispatch prefilter should
                     // own stable negative traffic.
-                    let mut suffix_state_after_success = *mandatory_suffix_span_state;
-                    let mut prefilter_state_after_success = None;
-                    let mut incumbent_candidate_floor = None;
-                    let mut failed_incumbent = None;
                     if let Some(incumbent_route) =
                         select_k0_universal_finite_suffix_incumbent(
                             session,
                             suffix,
                             *mandatory_cut,
                             *negative_prefilter,
-                            &suffix_state_after_success,
+                            mandatory_suffix_span_state,
                             haystack.len(),
                             window,
                             limits,
                         )
                     {
-                        let class_index = match incumbent_route {
-                            K0UniversalFiniteSuffixIncumbentRoute::Calibration {
-                                class_index,
-                            }
-                            | K0UniversalFiniteSuffixIncumbentRoute::Retained {
-                                class_index,
-                            } => class_index,
-                        };
-                        let attempt = run_k0_negative_prefilter(
+                        let mut matched = Match { start: 0, end: 0 };
+                        match try_k0_universal_finite_suffix_incumbent(
+                            session,
+                            suffix,
                             *mandatory_cut,
                             *negative_prefilter,
-                            *negative_prefilter_span_state,
+                            mandatory_suffix_span_state,
+                            negative_prefilter_span_state,
+                            incumbent_route,
                             haystack,
                             window,
                             limits,
-                        );
-                        prefilter_state_after_success = Some(attempt.state_after_success);
-                        let certified_absent = attempt.outcome
-                            == K0NegativePrefilterOutcome::Absent
-                            && window.end().checked_sub(window.start()).is_some_and(
-                                |window_bytes| {
-                                    session.negative_terminal_has_reused_work_certificate(
-                                        window_bytes,
-                                    )
-                                },
-                            );
-                        if certified_absent {
-                            if matches!(
-                                incumbent_route,
-                                K0UniversalFiniteSuffixIncumbentRoute::Calibration { .. }
-                            ) {
-                                observe_k0_universal_finite_suffix_incumbent(
-                                    &mut suffix_state_after_success,
-                                    class_index,
-                                    true,
-                                );
+                            &mut matched,
+                        )? {
+                            K0UniversalFiniteSuffixIncumbentOutcome::GeometryBypass => {}
+                            K0UniversalFiniteSuffixIncumbentOutcome::ProvedAbsent => {
+                                return Ok(None);
                             }
-                            *mandatory_suffix_span_state = suffix_state_after_success;
-                            *negative_prefilter_span_state = attempt.state_after_success;
-                            return Ok(None);
+                            K0UniversalFiniteSuffixIncumbentOutcome::ProvedMatch => {
+                                return Ok(Some(matched));
+                            }
                         }
-                        incumbent_candidate_floor = attempt.candidate_floor;
-                        let class = &mut suffix_state_after_success.classes[class_index];
-                        debug_assert_eq!(class.disabled_calls, 0);
-                        failed_incumbent = Some((class_index, class.present_backoff));
-                        // Let the exact suffix answer this same call before
-                        // installing retry backoff. Otherwise the universal
-                        // helper would immediately consume the clock that
-                        // this failed calibration just created.
-                        class.next_predicate = K0_FINITE_SUFFIX_EXACT_ROUTE;
                     }
+                    let mut suffix_state_after_success = *mandatory_suffix_span_state;
                     let suffix_attempt = try_k0_mandatory_suffix_span_start(
                         session,
                         suffix,
@@ -12753,16 +12895,12 @@ impl<'r> PortableSearchSession<'r> {
                         haystack,
                         window,
                         limits,
-                        incumbent_candidate_floor,
+                        None,
                     )?;
                     suffix_state_after_success = suffix_attempt.state_after_success;
                     if suffix_attempt.outcome
                         != K0MandatorySuffixSpanOutcome::GeometryBypass
                     {
-                        let mut suffix_completed_exact_proof = matches!(
-                            suffix_attempt.outcome,
-                            K0MandatorySuffixSpanOutcome::ProvedSpan { .. }
-                        );
                         let result = match suffix_attempt.outcome {
                             K0MandatorySuffixSpanOutcome::ProvedAbsent => {
                                 if k0_negative_prefilter_admitted(
@@ -12806,7 +12944,6 @@ impl<'r> PortableSearchSession<'r> {
                                             window,
                                         );
                                     }
-                                    suffix_completed_exact_proof = exact_receipt;
                                     Ok(output)
                                 }
                                 Err(error) => Err(error),
@@ -12834,24 +12971,8 @@ impl<'r> PortableSearchSession<'r> {
                                 })
                                 .map_err(SearchError::from),
                         };
-                        if let (Ok(found), Some((class_index, prior_backoff))) =
-                            (&result, failed_incumbent)
-                        {
-                            finish_k0_universal_finite_suffix_incumbent_failure(
-                                &mut suffix_state_after_success,
-                                class_index,
-                                prior_backoff,
-                                found.is_some(),
-                                suffix_completed_exact_proof,
-                            );
-                        }
                         if result.is_ok() {
                             *mandatory_suffix_span_state = suffix_state_after_success;
-                            if let Some(prefilter_state_after_success) =
-                                prefilter_state_after_success
-                            {
-                                *negative_prefilter_span_state = prefilter_state_after_success;
-                            }
                         }
                         return result;
                     }
