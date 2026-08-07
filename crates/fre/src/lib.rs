@@ -712,9 +712,10 @@ use fre_automata::{
     Automaton, EarliestEnd, Exists, K0PositiveEndLimits, K0PositiveEndOutcome, K0SearchSession,
     K0PositiveEndStartOutcome, K0SpanSourceCursor, MandatoryCutAnalysis,
     MandatoryCutAnalysisLimits, MandatoryCutCandidate, MandatoryCutDeclineReason,
-    MandatoryCutResource, MandatorySuffixAnalysis, MandatorySuffixAnalysisLimits,
-    MandatorySuffixDeclineReason, MandatorySuffixResource, MaximumConsumedDistance, SelectedEnd,
-    Span,
+    MandatoryCutResource, MandatoryLiteralFrontierAnalysis,
+    MandatoryLiteralFrontierAnalysisLimits, MandatoryLiteralFrontierDeclineReason,
+    MandatorySuffixAnalysis, MandatorySuffixAnalysisLimits, MandatorySuffixDeclineReason,
+    MandatorySuffixResource, MaximumConsumedDistance, SelectedEnd, Span,
 };
 use fre_kernels::{
     ASCII_RUN_SCANNER_BUILD_WORK, AbsoluteEndFixedPlan, AsciiByteSet, AsciiByteSetRunScanner,
@@ -731,6 +732,7 @@ use fre_kernels::{
     PackedLiteralSetSearchLimits, RequiredLiteralBuildAccounting, RequiredLiteralBuildError,
     RequiredLiteralBuildLimits, RequiredLiteralPlan, RequiredLiteralSearchAccounting,
     RequiredLiteralSearchError, RequiredLiteralSearchLimits, Window as LiteralWindow,
+    packed_literal_set_build_work_upper_bound_from_dimensions,
 };
 use fre_lower::{LowerLimits, LowerStats, OperationSemantics};
 use fre_syntax::{
@@ -1551,6 +1553,7 @@ fn try_charge_k0_mandatory_cut_work(
 struct K0MandatoryCutBuild {
     plan: Option<K0MandatoryCutPlan>,
     planner_work: u64,
+    analysis_work: u64,
     storage_bytes: usize,
 }
 
@@ -1569,6 +1572,7 @@ fn try_build_k0_mandatory_cut(
         return Ok(K0MandatoryCutBuild {
             plan: None,
             planner_work: incumbent_planner_work,
+            analysis_work: 0,
             storage_bytes: 0,
         });
     }
@@ -1631,6 +1635,305 @@ fn try_build_k0_mandatory_cut(
         storage_bytes: plan.map_or(0, |_| core::mem::size_of::<K0MandatoryCutPlan>()),
         plan,
         planner_work,
+        analysis_work: stats.work(),
+    })
+}
+
+// This replacement scans only reusable windows large enough to amortize its
+// immutable graph-to-frontier displacement. The overlap is the farthest
+// possible root position plus the bytes needed to finish the longest packed
+// literal. Both the factor and floor are source-independent construction
+// constants; source contents never decide whether a call begins the packed
+// route.
+const K0_PACKED_FRONTIER_MIN_WINDOW_BYTES: usize = 1_024;
+const K0_PACKED_FRONTIER_OVERLAP_FACTOR: usize = 4;
+
+#[derive(Debug)]
+struct K0PackedFrontierPlan {
+    packed: PackedLiteralSetPlan,
+    automaton_identity: u64,
+    maximum_before_root: usize,
+    minimum_window_bytes: usize,
+}
+
+impl K0PackedFrontierPlan {
+    fn bind_automaton(&mut self, automaton: &Automaton) -> Result<(), BuildError> {
+        if self.automaton_identity != 0 {
+            return Err(BuildError::InternalInvariant(
+                "K0 packed frontier was bound more than once",
+            ));
+        }
+        self.automaton_identity = automaton.identity();
+        Ok(())
+    }
+
+    const fn is_bound_to(&self, automaton: &Automaton) -> bool {
+        self.automaton_identity != 0 && self.automaton_identity == automaton.identity()
+    }
+
+    fn storage_bytes(&self) -> usize {
+        core::mem::size_of::<Self>()
+            .checked_add(self.packed.build_accounting().persistent_bytes)
+            .expect("a published K0 packed frontier proved its owner storage")
+    }
+}
+
+struct K0PackedFrontierBuild {
+    plan: Option<Box<K0PackedFrontierPlan>>,
+    planner_work: u64,
+    storage_bytes: usize,
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one optional transaction closes graph analysis, packed construction, and owner accounting before publication"
+)]
+fn try_build_k0_packed_frontier(
+    raw: &fre_automata::RawPlan,
+    limits: BuildLimits,
+    incumbent_planner_work: u64,
+    mandatory_cut_analysis_work: u64,
+) -> Result<K0PackedFrontierBuild, BuildError> {
+    let declined = |planner_work| K0PackedFrontierBuild {
+        plan: None,
+        planner_work,
+        storage_bytes: 0,
+    };
+    let owner_bytes = core::mem::size_of::<K0PackedFrontierPlan>();
+    if limits.packed_literal_set.max_patterns < 2
+        || limits.packed_literal_set.max_pattern_bytes < 4
+        || owner_bytes > limits.packed_literal_set.max_build_bytes
+        || owner_bytes > limits.packed_literal_set.max_persistent_bytes
+    {
+        return Ok(declined(incumbent_planner_work));
+    }
+    let remaining_work = limits
+        .max_planner_work
+        .checked_sub(incumbent_planner_work)
+        .ok_or(BuildError::InternalInvariant(
+            "incumbent planner work exceeded its enforced limit",
+        ))?;
+    if remaining_work == 0 {
+        return Ok(declined(incumbent_planner_work));
+    }
+
+    // The analyzer intentionally re-authenticates the mandatory cut against
+    // this exact RawPlan. The immediately preceding cut transaction supplies
+    // its exact completed work, so replay can reserve that nested receipt and
+    // give the frontier the remainder without either hidden work or a fixed
+    // partition that would fail at the completed plan's exact work limit.
+    if mandatory_cut_analysis_work == 0 || mandatory_cut_analysis_work > remaining_work {
+        return Ok(declined(incumbent_planner_work));
+    }
+    let mut analysis_limits = MandatoryLiteralFrontierAnalysisLimits::default();
+    analysis_limits.mandatory_cut.max_work = mandatory_cut_analysis_work;
+    analysis_limits.max_work = analysis_limits
+        .max_work
+        .min(remaining_work.saturating_sub(mandatory_cut_analysis_work));
+    analysis_limits.mandatory_cut.max_allocation_items = analysis_limits
+        .mandatory_cut
+        .max_allocation_items
+        .min(limits.lowering.max_stack_items);
+    analysis_limits.max_allocation_items = analysis_limits
+        .max_allocation_items
+        .min(limits.lowering.max_stack_items);
+    let analysis = fre_automata::analyze_mandatory_literal_frontier(raw, analysis_limits);
+    let stats = analysis.stats();
+    if !stats.closes(analysis_limits) {
+        return Err(BuildError::InternalInvariant(
+            "K0 packed-frontier analysis receipt did not close",
+        ));
+    }
+    let analysis_work = stats
+        .mandatory_cut()
+        .work()
+        .checked_add(stats.work())
+        .ok_or(BuildError::InternalInvariant(
+            "K0 packed-frontier analysis work overflowed",
+        ))?;
+    let mut planner_work = incumbent_planner_work
+        .checked_add(analysis_work)
+        .ok_or(BuildError::InternalInvariant(
+            "cumulative K0 packed-frontier planner work overflowed",
+        ))?;
+    if planner_work > limits.max_planner_work {
+        return Err(BuildError::InternalInvariant(
+            "K0 packed-frontier analysis exceeded its admitted planner work",
+        ));
+    }
+    let report = match analysis {
+        MandatoryLiteralFrontierAnalysis::Complete(report) => report,
+        MandatoryLiteralFrontierAnalysis::Declined(decline) => {
+            match decline.reason() {
+                MandatoryLiteralFrontierDeclineReason::Resource { .. }
+                | MandatoryLiteralFrontierDeclineReason::Allocation { .. }
+                | MandatoryLiteralFrontierDeclineReason::MandatoryCut(
+                    MandatoryCutDeclineReason::Resource { .. }
+                    | MandatoryCutDeclineReason::Allocation { .. },
+                ) => return Ok(declined(planner_work)),
+                MandatoryLiteralFrontierDeclineReason::MandatoryCut(
+                    MandatoryCutDeclineReason::MalformedGraph(_)
+                    | MandatoryCutDeclineReason::ArithmeticOverflow { .. }
+                    | MandatoryCutDeclineReason::InternalInvariant { .. },
+                )
+                | MandatoryLiteralFrontierDeclineReason::ArithmeticOverflow { .. }
+                | MandatoryLiteralFrontierDeclineReason::InternalInvariant { .. } => {
+                    return Err(BuildError::InternalInvariant(
+                        "lowered K0 graph failed packed-frontier analysis",
+                    ));
+                }
+                _ => {
+                    return Err(BuildError::InternalInvariant(
+                        "K0 packed-frontier analysis returned an unknown decline",
+                    ));
+                }
+            }
+        }
+    };
+    let Some(candidate) = report.candidate() else {
+        return Ok(declined(planner_work));
+    };
+    let MaximumConsumedDistance::Finite(maximum_before_root) =
+        candidate.maximum_before_root()
+    else {
+        return Ok(declined(planner_work));
+    };
+    let Ok(maximum_before_root) = usize::try_from(maximum_before_root) else {
+        return Ok(declined(planner_work));
+    };
+    if candidate.len() < 2 {
+        return Ok(declined(planner_work));
+    }
+
+    // The graph analyzer already publishes a deterministic prefix antichain.
+    // Recheck the runtime owner's stronger multi-literal contract while the
+    // candidate is still transaction-local, charging every compared member.
+    let comparison_work = u64::try_from(candidate.len()).map_err(|_| {
+        BuildError::InternalInvariant("K0 packed-frontier literal count does not fit work")
+    })?;
+    if !try_charge_k0_negative_prefilter_work(
+        &mut planner_work,
+        comparison_work,
+        limits.max_planner_work,
+    )? {
+        return Ok(declined(planner_work));
+    }
+    let first = candidate.literal(0).ok_or(BuildError::InternalInvariant(
+        "K0 packed-frontier candidate lost its first literal",
+    ))?;
+    if !candidate.iter().skip(1).any(|literal| literal != first) {
+        return Ok(declined(planner_work));
+    }
+
+    let packed_build_work =
+        packed_literal_set_build_work_upper_bound_from_dimensions(
+            candidate.len(),
+            stats.retained_literal_bytes(),
+        )
+        .map_err(|_| {
+            BuildError::InternalInvariant(
+                "authenticated K0 packed-frontier dimensions overflowed packed preflight",
+            )
+        })?;
+    let packed_build_work = u64::try_from(packed_build_work).map_err(|_| {
+        BuildError::InternalInvariant("K0 packed-frontier build work does not fit u64")
+    })?;
+    let publication_work = packed_build_work
+        .checked_add(1)
+        .ok_or(BuildError::InternalInvariant(
+            "K0 packed-frontier publication work overflowed",
+        ))?;
+    if !try_charge_k0_negative_prefilter_work(
+        &mut planner_work,
+        publication_work,
+        limits.max_planner_work,
+    )? {
+        return Ok(declined(planner_work));
+    }
+
+    let mut pattern_refs =
+        [&[][..]; fre_automata::MAX_MANDATORY_LITERAL_FRONTIER_LITERALS];
+    for (index, slot) in pattern_refs[..candidate.len()].iter_mut().enumerate() {
+        *slot = candidate.literal(index).ok_or(BuildError::InternalInvariant(
+            "K0 packed-frontier candidate lost a retained literal",
+        ))?;
+    }
+    let child_limits = PackedLiteralSetBuildLimits {
+        max_build_bytes: limits
+            .packed_literal_set
+            .max_build_bytes
+            .checked_sub(owner_bytes)
+            .expect("the packed-frontier owner build bytes were preflighted"),
+        max_persistent_bytes: limits
+            .packed_literal_set
+            .max_persistent_bytes
+            .checked_sub(owner_bytes)
+            .expect("the packed-frontier owner persistent bytes were preflighted"),
+        ..limits.packed_literal_set
+    };
+    let packed = match PackedLiteralSetPlan::new(
+        &pattern_refs[..candidate.len()],
+        child_limits,
+    ) {
+        Ok(packed) => packed,
+        Err(
+            PackedLiteralSetError::PatternLimit { .. }
+            | PackedLiteralSetError::PatternBytesLimit { .. }
+            | PackedLiteralSetError::BuildWorkLimit { .. }
+            | PackedLiteralSetError::BuildBytesLimit { .. }
+            | PackedLiteralSetError::PersistentBytesLimit { .. }
+            | PackedLiteralSetError::UnsupportedTargetOrShape,
+        ) => return Ok(declined(planner_work)),
+        Err(_) => {
+            return Err(BuildError::InternalInvariant(
+                "admitted K0 packed-frontier construction failed unexpectedly",
+            ));
+        }
+    };
+    let packed_build = packed.build_accounting();
+    if packed_build.patterns != candidate.len()
+        || packed_build.pattern_bytes != stats.retained_literal_bytes()
+        || packed_build.max_pattern_bytes != stats.maximum_literal_bytes()
+    {
+        return Err(BuildError::InternalInvariant(
+            "K0 packed-frontier owner disagreed with its graph receipt",
+        ));
+    }
+    let overlap_bytes = maximum_before_root
+        .checked_add(packed_build.max_pattern_bytes.saturating_sub(1))
+        .ok_or(BuildError::InternalInvariant(
+            "K0 packed-frontier overlap overflowed",
+        ))?;
+    let overlap_admission = overlap_bytes
+        .checked_mul(K0_PACKED_FRONTIER_OVERLAP_FACTOR)
+        .ok_or(BuildError::InternalInvariant(
+            "K0 packed-frontier admission overflowed",
+        ))?;
+    let minimum_window_bytes = K0_PACKED_FRONTIER_MIN_WINDOW_BYTES
+        .max(packed_build.simd_minimum_haystack_bytes)
+        .max(overlap_admission);
+    let plan = K0PackedFrontierPlan {
+        packed,
+        automaton_identity: 0,
+        maximum_before_root,
+        minimum_window_bytes,
+    };
+    let storage_bytes = plan.storage_bytes();
+    let plan = match fre_exact_alloc::try_box_preserve(plan) {
+        Ok(plan) => plan,
+        Err((fre_exact_alloc::CopyError::AllocationFailed, _)) => {
+            return Ok(declined(planner_work));
+        }
+        Err((fre_exact_alloc::CopyError::LayoutOverflow, _)) => {
+            return Err(BuildError::InternalInvariant(
+                "K0 packed-frontier owner layout overflowed",
+            ));
+        }
+    };
+    Ok(K0PackedFrontierBuild {
+        plan: Some(plan),
+        planner_work,
+        storage_bytes,
     })
 }
 
@@ -4167,7 +4470,7 @@ impl PortableBuilder {
                 plan: PortablePlan::K0(PortableK0Plan {
                     automaton,
                     absolute_end_proof: k0_absolute_end_proof,
-                    correlated_terminal: None,
+                    exclusive: K0ExclusivePlan::None,
                     reverse_inner: None,
                     mandatory_suffix: None,
                     mandatory_cut: None,
@@ -5966,6 +6269,7 @@ impl PortableBuilder {
             K0MandatoryCutBuild {
                 plan: None,
                 planner_work: fallback_planner_work,
+                analysis_work: 0,
                 storage_bytes: 0,
             }
         };
@@ -5990,6 +6294,24 @@ impl PortableBuilder {
             }
         };
         fallback_planner_work = mandatory_suffix.planner_work;
+        let packed_frontier = if k0_absolute_end_proof.is_none()
+            && matches!(minimum_match_bytes, Some(minimum) if minimum > 0)
+            && !rust.hir.properties().look_set_prefix().contains(Look::Start)
+        {
+            try_build_k0_packed_frontier(
+                &raw,
+                self.limits,
+                fallback_planner_work,
+                mandatory_cut.analysis_work,
+            )?
+        } else {
+            K0PackedFrontierBuild {
+                plan: None,
+                planner_work: fallback_planner_work,
+                storage_bytes: 0,
+            }
+        };
+        fallback_planner_work = packed_frontier.planner_work;
         let automaton = Automaton::from_raw(raw, self.limits.lowering.automata)
             .map_err(fre_lower::LowerError::from)?
             .with_line_terminator(self.profile.options.line_terminator);
@@ -6019,6 +6341,21 @@ impl PortableBuilder {
             mandatory_cut_plan = None;
             mandatory_cut_storage_bytes = 0;
         }
+        let mut packed_frontier_plan = packed_frontier.plan;
+        let mut packed_frontier_storage_bytes = packed_frontier_plan
+            .as_ref()
+            .map_or(0, |_| packed_frontier.storage_bytes);
+        let packed_frontier_fits = packed_frontier_storage_bytes
+            <= available_optional_bytes
+                .saturating_sub(mandatory_suffix_storage_bytes)
+                .saturating_sub(mandatory_cut_storage_bytes);
+        if !packed_frontier_fits {
+            packed_frontier_plan = None;
+            packed_frontier_storage_bytes = 0;
+        }
+        if let Some(plan) = packed_frontier_plan.as_mut() {
+            plan.bind_automaton(&automaton)?;
+        }
         let mut negative_prefilter = try_build_k0_negative_prefilter(
             &rust.hir,
             minimum_match_bytes,
@@ -6030,6 +6367,7 @@ impl PortableBuilder {
                 .storage_bytes()
                 .checked_add(mandatory_suffix_storage_bytes)
                 .and_then(|bytes| bytes.checked_add(mandatory_cut_storage_bytes))
+                .and_then(|bytes| bytes.checked_add(packed_frontier_storage_bytes))
                 .ok_or(BuildError::PersistentBytesOverflow)?,
         )?;
         fallback_planner_work = negative_prefilter.planner_work;
@@ -6115,6 +6453,8 @@ impl PortableBuilder {
             mandatory_suffix_storage_bytes = 0;
             mandatory_cut_plan = None;
             mandatory_cut_storage_bytes = 0;
+            packed_frontier_plan = None;
+            packed_frontier_storage_bytes = 0;
             negative_prefilter.plan = None;
             negative_prefilter.storage_bytes = 0;
         }
@@ -6175,6 +6515,7 @@ impl PortableBuilder {
         };
         let retained_optional_bytes = mandatory_suffix_storage_bytes
             .checked_add(mandatory_cut_storage_bytes)
+            .and_then(|bytes| bytes.checked_add(packed_frontier_storage_bytes))
             .and_then(|bytes| bytes.checked_add(negative_prefilter.storage_bytes))
             .and_then(|bytes| bytes.checked_add(correlated_terminal_storage_bytes))
             .ok_or(BuildError::PersistentBytesOverflow)?;
@@ -6213,10 +6554,21 @@ impl PortableBuilder {
             .storage_bytes()
             .checked_add(mandatory_suffix_storage_bytes)
             .and_then(|bytes| bytes.checked_add(mandatory_cut_storage_bytes))
+            .and_then(|bytes| bytes.checked_add(packed_frontier_storage_bytes))
             .and_then(|bytes| bytes.checked_add(negative_prefilter.storage_bytes))
             .and_then(|bytes| bytes.checked_add(correlated_terminal_storage_bytes))
             .and_then(|bytes| bytes.checked_add(reverse_inner_storage_bytes))
             .ok_or(BuildError::PersistentBytesOverflow)?;
+        let exclusive = match (correlated_terminal, packed_frontier_plan) {
+            (Some(plan), None) => K0ExclusivePlan::Correlated(plan),
+            (None, Some(plan)) => K0ExclusivePlan::Packed(plan),
+            (None, None) => K0ExclusivePlan::None,
+            (Some(_), Some(_)) => {
+                return Err(BuildError::InternalInvariant(
+                    "exclusive K0 sidecars were published together",
+                ));
+            }
+        };
         Ok(PortableRegex {
             source,
             capture_names,
@@ -6224,7 +6576,7 @@ impl PortableBuilder {
             plan: PortablePlan::K0(PortableK0Plan {
                 automaton,
                 absolute_end_proof: k0_absolute_end_proof,
-                correlated_terminal,
+                exclusive,
                 reverse_inner,
                 mandatory_suffix: mandatory_suffix_plan,
                 mandatory_cut: mandatory_cut_plan,
@@ -6484,17 +6836,50 @@ impl K0AbsoluteEndProof {
 }
 
 #[derive(Debug)]
+enum K0ExclusivePlan {
+    None,
+    Correlated(correlated_bounded_alternation::Plan),
+    Packed(Box<K0PackedFrontierPlan>),
+}
+
+impl K0ExclusivePlan {
+    fn correlated_terminal(&self) -> Option<&correlated_bounded_alternation::Plan> {
+        match self {
+            Self::Correlated(plan) => Some(plan),
+            Self::None | Self::Packed(_) => None,
+        }
+    }
+
+    fn packed_frontier(&self) -> Option<&K0PackedFrontierPlan> {
+        match self {
+            Self::Packed(plan) => Some(plan),
+            Self::None | Self::Correlated(_) => None,
+        }
+    }
+}
+
+#[derive(Debug)]
 struct PortableK0Plan {
     automaton: Automaton,
     // Inline construction proof: no HIR, source, haystack, or separately
     // allocated owner is retained, so logical persistent-byte accounting is
     // unchanged.
     absolute_end_proof: Option<K0AbsoluteEndProof>,
-    correlated_terminal: Option<correlated_bounded_alternation::Plan>,
+    exclusive: K0ExclusivePlan,
     reverse_inner: Option<Box<k0_general_reverse_inner::Plan>>,
     mandatory_suffix: Option<K0MandatorySuffixPlan>,
     mandatory_cut: Option<K0MandatoryCutPlan>,
     negative_prefilter: Option<Box<K0NegativePrefilterPlan>>,
+}
+
+impl PortableK0Plan {
+    fn correlated_terminal(&self) -> Option<&correlated_bounded_alternation::Plan> {
+        self.exclusive.correlated_terminal()
+    }
+
+    fn packed_frontier(&self) -> Option<&K0PackedFrontierPlan> {
+        self.exclusive.packed_frontier()
+    }
 }
 
 enum PortablePlan {
@@ -9389,6 +9774,102 @@ fn try_k0_absolute_end_span(
             Ok(K0AbsoluteEndSpanAttempt::Complete(None))
         }
         K0PositiveEndStartOutcome::Declined => Ok(K0AbsoluteEndSpanAttempt::Declined),
+    }
+}
+
+/// One replacement-only Exists call bound to one immutable K0 plan and one
+/// immutably borrowed source. The receipt is call-local: neither a literal
+/// position nor a source identity can survive into another invocation.
+struct K0PackedFrontierExistsReceipt<'p, 'h> {
+    plan: &'p K0PackedFrontierPlan,
+    automaton: &'p Automaton,
+    haystack: &'h [u8],
+    window: SearchWindow,
+    packed_limits: PackedLiteralSetSearchLimits,
+}
+
+impl<'p, 'h> K0PackedFrontierExistsReceipt<'p, 'h> {
+    fn admit(
+        k0_plan: &'p PortableK0Plan,
+        session: &K0SearchSession<'_>,
+        haystack: &'h [u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<Option<Self>, SearchError> {
+        let Some(plan) = k0_plan.packed_frontier() else {
+            return Ok(None);
+        };
+        if !plan.is_bound_to(&k0_plan.automaton)
+            || !session.is_bound_to(&k0_plan.automaton)
+        {
+            return Err(SearchError::K0(K0SearchError::InternalInvariant {
+                detail: "K0 packed-frontier receipt crossed immutable plans",
+            }));
+        }
+        // Preserve the existing constant-time absolute-end theorem and the
+        // public K0 error identity for invalid or explicitly limited calls.
+        if k0_plan.absolute_end_proof.is_some()
+            || limits != SearchLimits::unlimited()
+            || window.start() > window.end()
+            || window.end() > haystack.len()
+        {
+            return Ok(None);
+        }
+        let window_bytes = window
+            .end()
+            .checked_sub(window.start())
+            .expect("the packed-frontier window was validated");
+        if window_bytes < plan.minimum_window_bytes {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            plan,
+            automaton: &k0_plan.automaton,
+            haystack,
+            window,
+            packed_limits: PackedLiteralSetSearchLimits::unlimited(),
+        }))
+    }
+
+    fn execute(self, session: &mut K0SearchSession<'_>) -> Result<bool, SearchError> {
+        if !self.plan.is_bound_to(self.automaton) || !session.is_bound_to(self.automaton) {
+            return Err(SearchError::K0(K0SearchError::InternalInvariant {
+                detail: "K0 packed-frontier execution crossed immutable plans",
+            }));
+        }
+        let (found, _) = self.plan.packed.find_window(
+            self.haystack,
+            LiteralWindow::new(self.window.start(), self.window.end()),
+            self.packed_limits,
+        )?;
+        let Some((literal_start, literal_end)) = found else {
+            // The graph proof covers every accepting trace below its mandatory
+            // root, so exact complete-window packed absence completes Exists.
+            return Ok(false);
+        };
+        if literal_start < self.window.start()
+            || literal_start >= self.window.end()
+            || literal_end <= literal_start
+            || literal_end > self.window.end()
+        {
+            return Err(SearchError::K0(K0SearchError::InternalInvariant {
+                detail: "K0 packed-frontier kernel returned a match outside its window",
+            }));
+        }
+        // If a selected match starts at s and reaches its mandatory root at c,
+        // c - s <= M. The exact leftmost frontier occurrence p is no later
+        // than c, hence p - M <= s. One authoritative K0 pass over [F, E)
+        // sees every possible match and is the only post-positive executor.
+        let floor = literal_start
+            .saturating_sub(self.plan.maximum_before_root)
+            .max(self.window.start());
+        session
+            .search_exists_value(
+                self.haystack,
+                SearchWindow::new(floor, self.window.end()),
+                SearchLimits::unlimited(),
+            )
+            .map_err(SearchError::from)
     }
 }
 
@@ -12405,7 +12886,7 @@ impl<'r> PortableSearchSession<'r> {
                 ..
             } => {
                 let absolute_end_proof = k0_plan.absolute_end_proof;
-                let correlated_terminal = k0_plan.correlated_terminal.as_ref();
+                let correlated_terminal = k0_plan.correlated_terminal();
                 if k0_finite_minimum_window_is_proven_empty(
                     *mandatory_suffix,
                     haystack.len(),
@@ -12453,6 +12934,19 @@ impl<'r> PortableSearchSession<'r> {
                         }
                         return result;
                     }
+                }
+                if let Some(receipt) = K0PackedFrontierExistsReceipt::admit(
+                    k0_plan,
+                    session,
+                    haystack,
+                    window,
+                    limits,
+                )? {
+                    // Admission transfers complete ownership of this call to
+                    // the packed frontier. Kernel or residual-K0 errors are
+                    // returned directly; no second whole-window fallback is
+                    // permitted after the replacement has begun.
+                    return receipt.execute(session);
                 }
                 if let Some(plan) = correlated_terminal {
                     if k0_correlated_exact_delimited_allows(
@@ -12925,7 +13419,7 @@ impl<'r> PortableSearchSession<'r> {
                 ..
             } => {
                 let absolute_end_proof = k0_plan.absolute_end_proof;
-                let correlated_terminal = k0_plan.correlated_terminal.as_ref();
+                let correlated_terminal = k0_plan.correlated_terminal();
                 if k0_finite_minimum_window_is_proven_empty(
                     *mandatory_suffix,
                     haystack.len(),
@@ -13262,7 +13756,7 @@ impl<'r> PortableSearchSession<'r> {
                 ..
             } => {
                 let absolute_end_proof = k0_plan.absolute_end_proof;
-                let correlated_terminal = k0_plan.correlated_terminal.as_ref();
+                let correlated_terminal = k0_plan.correlated_terminal();
                 if k0_finite_minimum_window_is_proven_empty(
                     *mandatory_suffix,
                     haystack.len(),
@@ -14281,7 +14775,7 @@ impl<'r> PortableSearchSession<'r> {
                 mandatory_cut: None,
                 negative_prefilter: None,
                 ..
-            } if k0_plan.correlated_terminal.is_none()
+            } if k0_plan.correlated_terminal().is_none()
                 && k0_plan.absolute_end_proof.is_none() => {
                 session.retained_root_run_cursor_available()
             }
@@ -15144,7 +15638,8 @@ mod tests {
         CompatibilityProfile, GuardedLiteralSetSearchError, Hir, K0AbsoluteEndProof,
         K0FiniteSuffixRoute, K0MandatoryCutPlan, K0MandatorySuffixOutcome,
         K0MandatorySuffixPlan, K0MandatorySuffixSpanOutcome, K0NegativePrefilterOutcome, Match,
-        OperationSemantics, PlanKind, PlanSelection,
+        K0PackedFrontierExistsReceipt, K0PackedFrontierPlan, OperationSemantics, PlanKind,
+        PlanSelection,
         PortableBuilder, PortableFindIterAccounting, PortableFindIterError, PortableFindIterLimits,
         PortableFindIterRunLimits, PortablePlan, PortableRegex, SearchAccounting, SearchError,
         PortableSearchSessionPlan, SearchLimits, SearchSessionLimits, SearchWindow,
@@ -15164,7 +15659,7 @@ mod tests {
         run_k0_finite_prefix_exists_hedge, run_k0_negative_prefilter,
         select_k0_finite_suffix_direct_route, select_k0_finite_suffix_route,
         try_build_k0_mandatory_cut,
-        try_build_k0_mandatory_suffix,
+        try_build_k0_mandatory_suffix, try_build_k0_packed_frontier,
         try_box_bounded_literal_class_run_owner,
         try_box_universal_finite_greedy_corridor_owner, try_k0_mandatory_suffix_exists,
         try_k0_mandatory_suffix_span_start,
@@ -15313,6 +15808,69 @@ mod tests {
         analyzed_k0_mandatory_cut(pattern).0
     }
 
+    fn analyzed_k0_packed_frontier(
+        pattern: &str,
+    ) -> (Box<K0PackedFrontierPlan>, Automaton, u64, usize) {
+        let (raw, limits, line_terminator, _, _) = lowered_k0_mandatory_cut(pattern);
+        let cut = try_build_k0_mandatory_cut(&raw, limits, 0)
+            .expect("focused packed-frontier prerequisite cut completes");
+        let build = try_build_k0_packed_frontier(
+            &raw,
+            limits,
+            cut.planner_work,
+            cut.analysis_work,
+        )
+        .expect("focused packed-frontier analysis completes");
+        let planner_work = build.planner_work;
+        let storage_bytes = build.storage_bytes;
+        let mut frontier = build
+            .plan
+            .expect("focused pattern retains a packed frontier");
+        let automaton = Automaton::from_raw(raw, limits.lowering.automata)
+            .expect("focused packed-frontier graph validates")
+            .with_line_terminator(line_terminator);
+        frontier
+            .bind_automaton(&automaton)
+            .expect("focused packed frontier binds once");
+        (frontier, automaton, planner_work, storage_bytes)
+    }
+
+    fn forced_k0_with_only_packed_frontier(pattern: &str) -> PortableRegex {
+        let (frontier, automaton, planner_work, storage_bytes) =
+            analyzed_k0_packed_frontier(pattern);
+        let automaton_storage_bytes = automaton.stats().storage_bytes();
+        let mut regex = PortableBuilder::new(pattern)
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .expect("focused packed-frontier pattern builds through K0");
+        let PortablePlan::K0(plan) = &mut regex.plan else {
+            panic!("forced packed-frontier pattern did not retain K0");
+        };
+        plan.automaton = automaton;
+        plan.absolute_end_proof = None;
+        plan.exclusive = super::K0ExclusivePlan::Packed(frontier);
+        plan.reverse_inner = None;
+        plan.mandatory_suffix = None;
+        plan.mandatory_cut = None;
+        plan.negative_prefilter = None;
+        regex.report.planner_work = planner_work;
+        regex.report.plan_storage_bytes = automaton_storage_bytes
+            .checked_add(storage_bytes)
+            .expect("synthetic packed-frontier storage accounting does not overflow");
+        regex.report.charged_persistent_bytes = regex
+            .report
+            .source_storage_bytes
+            .checked_add(regex.report.capture_name_storage_bytes)
+            .and_then(|bytes| bytes.checked_add(regex.report.plan_storage_bytes))
+            .expect("synthetic packed-frontier facade storage accounting does not overflow");
+        assert!(
+            regex.report.charged_persistent_bytes <= regex.report.persistent_byte_limit,
+            "synthetic packed-frontier plan remains within the builder limit",
+        );
+        regex
+    }
+
     fn forced_k0_with_only_mandatory_cut(pattern: &str) -> PortableRegex {
         let (cut, automaton) = analyzed_k0_mandatory_cut(pattern);
         let mut regex = PortableBuilder::new(pattern)
@@ -15324,6 +15882,7 @@ mod tests {
             panic!("forced mandatory-cut pattern did not retain K0");
         };
         plan.automaton = automaton;
+        plan.exclusive = super::K0ExclusivePlan::None;
         plan.mandatory_cut = Some(cut);
         plan.mandatory_suffix = None;
         plan.negative_prefilter = None;
@@ -15361,7 +15920,7 @@ mod tests {
             panic!("forced mandatory-suffix pattern did not retain K0");
         };
         plan.automaton = automaton;
-        plan.correlated_terminal = None;
+        plan.exclusive = super::K0ExclusivePlan::None;
         plan.mandatory_suffix = Some(suffix);
         plan.mandatory_cut = None;
         plan.negative_prefilter = None;
@@ -15419,8 +15978,8 @@ mod tests {
             panic!("forced structural mandatory-suffix pattern did not retain K0");
         };
         plan.automaton = automaton;
+        plan.exclusive = super::K0ExclusivePlan::None;
         plan.mandatory_suffix = Some(suffix);
-        plan.correlated_terminal = None;
         plan.mandatory_cut = None;
         plan.negative_prefilter = None;
         regex.report.planner_work = suffix_planner_work;
@@ -15472,6 +16031,386 @@ mod tests {
         };
         plan.negative_prefilter = Some(negative_prefilter);
         regex
+    }
+
+    #[test]
+    fn k0_packed_frontier_owner_is_graph_bound_and_exactly_charged() {
+        let (frontier, automaton, _, storage_bytes) =
+            analyzed_k0_packed_frontier(r"(?s-u:...[abcd][12345]+\b)");
+        let packed = frontier.packed.build_accounting();
+        assert!(frontier.is_bound_to(&automaton));
+        assert!(frontier.maximum_before_root > 0);
+        assert!(packed.patterns >= 2);
+        assert_eq!(
+            storage_bytes,
+            core::mem::size_of::<K0PackedFrontierPlan>() + packed.persistent_bytes,
+        );
+        assert_eq!(frontier.storage_bytes(), storage_bytes);
+        assert!(
+            frontier.minimum_window_bytes >= super::K0_PACKED_FRONTIER_MIN_WINDOW_BYTES
+        );
+    }
+
+    #[test]
+    fn k0_packed_frontier_auto_publication_uses_the_same_immutable_k0_plan() {
+        let regex = PortableBuilder::new(r"(?s-u:...[abcd][12345]+\b)")
+            .unicode(false)
+            .plan_selection(PlanSelection::Auto)
+            .build()
+            .expect("automatic packed-frontier fixture builds");
+        let PortablePlan::K0(plan) = &regex.plan else {
+            panic!("automatic packed-frontier fixture did not retain K0");
+        };
+        let frontier = plan
+            .packed_frontier()
+            .expect("automatic K0 plan retains its packed frontier");
+        assert!(frontier.is_bound_to(&plan.automaton));
+        assert_eq!(
+            regex.report.plan_storage_bytes,
+            plan.automaton
+                .stats()
+                .storage_bytes()
+                .checked_add(frontier.storage_bytes())
+                .expect("focused automatic storage does not overflow"),
+        );
+    }
+
+    #[test]
+    fn k0_packed_frontier_is_not_retained_beside_absolute_end_proof() {
+        let regex = PortableBuilder::new(r"(?s-u:...[abcd][12345]+\b$)")
+            .unicode(false)
+            .plan_selection(PlanSelection::Auto)
+            .build()
+            .expect("absolute-end packed-frontier shape builds");
+        let PortablePlan::K0(plan) = &regex.plan else {
+            panic!("absolute-end packed-frontier shape did not retain K0");
+        };
+        assert!(plan.absolute_end_proof.is_some());
+        assert!(plan.packed_frontier().is_none());
+    }
+
+    #[test]
+    fn k0_packed_frontier_exists_matches_raw_k0_exhaustively() {
+        let regex = forced_k0_with_only_packed_frontier(
+            r"(?s-u:...[abcd][12345]+\b)",
+        );
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("packed-frontier differential session constructs");
+        let alphabet = [b'!', b'a', b'd', b'1', b'5', b'x'];
+        for length in 0_u32..=4 {
+            let cases = alphabet.len().pow(length);
+            for ordinal in 0..cases {
+                let mut value = ordinal;
+                let mut haystack = vec![b'!'; 2_048];
+                for index in 0..usize::try_from(length).expect("small exhaustive length") {
+                    haystack[1_000 + index] = alphabet[value % alphabet.len()];
+                    value /= alphabet.len();
+                }
+                for window in [
+                    SearchWindow::full(&haystack),
+                    SearchWindow::new(256, 1_792),
+                ] {
+                    let expected = session
+                        .is_match_window(&haystack, window, SearchLimits::unlimited())
+                        .expect("authoritative exhaustive K0 search succeeds")
+                        .0;
+                    let actual = session
+                        .is_match_window_value(
+                            &haystack,
+                            window,
+                            SearchLimits::unlimited(),
+                        )
+                        .expect("packed-frontier exhaustive search succeeds");
+                    assert_eq!(
+                        actual, expected,
+                        "length={length}, ordinal={ordinal}, window={window:?}",
+                    );
+                }
+            }
+        }
+
+        // The first packed literal is only a graph candidate: the trailing
+        // word assertion rejects it. The finite displacement floor must keep
+        // the later real match in the one authoritative residual K0 pass.
+        let mut haystack = vec![b'!'; 4_096];
+        haystack[1_200..1_203].copy_from_slice(b"a1x");
+        haystack[3_000..3_004].copy_from_slice(b"b22!");
+        let window = SearchWindow::new(512, 3_584);
+        let expected = session
+            .is_match_window(&haystack, window, SearchLimits::unlimited())
+            .expect("authoritative candidate-rejection search succeeds")
+            .0;
+        assert!(expected);
+        assert_eq!(
+            session
+                .is_match_window_value(&haystack, window, SearchLimits::unlimited())
+                .expect("packed candidate-rejection search succeeds"),
+            expected,
+        );
+
+        // This match begins exactly M bytes before its authenticated packed
+        // literal. Starting the residual K0 pass at the literal itself would
+        // miss the only match, so this case directly exercises F = p - M.
+        let mut floor_haystack = vec![b'!'; 4_096];
+        floor_haystack[2_997..3_002].copy_from_slice(b"!!!a1");
+        let PortablePlan::K0(plan) = &regex.plan else {
+            unreachable!();
+        };
+        let frontier = plan
+            .packed_frontier()
+            .expect("focused differential plan retains its frontier");
+        let (packed, _) = frontier
+            .packed
+            .find_window(
+                &floor_haystack,
+                super::LiteralWindow::new(window.start(), window.end()),
+                super::PackedLiteralSetSearchLimits::unlimited(),
+            )
+            .expect("focused finite-floor packed search succeeds");
+        let (literal_start, _) = packed.expect("the only match exposes its frontier literal");
+        assert_eq!(literal_start, 3_000);
+        assert_eq!(
+            literal_start.saturating_sub(frontier.maximum_before_root),
+            2_997,
+        );
+        let expected = session
+            .is_match_window(&floor_haystack, window, SearchLimits::unlimited())
+            .expect("authoritative finite-floor K0 search succeeds")
+            .0;
+        assert!(expected);
+        assert_eq!(
+            session
+                .is_match_window_value(
+                    &floor_haystack,
+                    window,
+                    SearchLimits::unlimited(),
+                )
+                .expect("packed finite-floor search succeeds"),
+            expected,
+        );
+    }
+
+    #[test]
+    fn k0_packed_frontier_errors_are_transactional_and_never_fallback() {
+        let regex = forced_k0_with_only_packed_frontier(
+            r"(?s-u:...[abcd][12345]+\b)",
+        );
+        let mut haystack = vec![b'!'; 2_048];
+        haystack[1_000..1_003].copy_from_slice(b"a1!");
+        let window = SearchWindow::full(&haystack);
+        let mut public_session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("packed-frontier error session constructs");
+        {
+            let PortableSearchSessionPlan::K0 {
+                session,
+                k0_plan,
+                ..
+            } = &mut public_session.plan
+            else {
+                panic!("packed-frontier error fixture lost K0");
+            };
+            let mut receipt = K0PackedFrontierExistsReceipt::admit(
+                k0_plan,
+                session,
+                &haystack,
+                window,
+                SearchLimits::unlimited(),
+            )
+            .expect("packed-frontier admission remains valid")
+            .expect("large unlimited window admits the packed replacement");
+            receipt.packed_limits = fre_kernels::PackedLiteralSetSearchLimits { max_work: 0 };
+            assert!(matches!(
+                receipt.execute(session),
+                Err(SearchError::PackedLiteralSet(
+                    fre_kernels::PackedLiteralSetError::WorkLimit { .. }
+                ))
+            ));
+        }
+        assert!(public_session
+            .is_match_window_value(&haystack, window, SearchLimits::unlimited())
+            .expect("a later source-bound call is re-executed normally"));
+
+        let other = forced_k0_with_only_packed_frontier(
+            r"(?s-u:...[efgh][67890]+\b)",
+        );
+        let PortablePlan::K0(first_plan) = &regex.plan else {
+            unreachable!();
+        };
+        let mut other_session = other
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("second packed-frontier session constructs");
+        let PortableSearchSessionPlan::K0 {
+            session: second_k0,
+            ..
+        } = &mut other_session.plan
+        else {
+            unreachable!();
+        };
+        assert!(matches!(
+            K0PackedFrontierExistsReceipt::admit(
+                first_plan,
+                second_k0,
+                &haystack,
+                window,
+                SearchLimits::unlimited(),
+            ),
+            Err(SearchError::K0(_))
+        ));
+    }
+
+    #[test]
+    fn k0_packed_frontier_retains_no_source_position_across_same_address_mutation() {
+        let first = forced_k0_with_only_packed_frontier(
+            r"(?s-u:...[abcd][12345]+\b)",
+        );
+        let second = forced_k0_with_only_packed_frontier(
+            r"(?s-u:...[efgh][67890]+\b)",
+        );
+        let mut first_session = first
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("first mutation session constructs");
+        let mut second_session = second
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("second mutation session constructs");
+        let mut haystack = vec![b'!'; 4_096];
+        let address = haystack.as_ptr();
+        let window = SearchWindow::new(512, 3_584);
+
+        haystack[2_000..2_003].copy_from_slice(b"a1!");
+        assert!(first_session
+            .is_match_window_value(&haystack, window, SearchLimits::unlimited())
+            .unwrap());
+        assert!(!second_session
+            .is_match_window_value(&haystack, window, SearchLimits::unlimited())
+            .unwrap());
+
+        haystack[2_000..2_003].copy_from_slice(b"e6!");
+        assert_eq!(haystack.as_ptr(), address);
+        assert!(second_session
+            .is_match_window_value(&haystack, window, SearchLimits::unlimited())
+            .unwrap());
+        assert!(!first_session
+            .is_match_window_value(&haystack, window, SearchLimits::unlimited())
+            .unwrap());
+
+        haystack[2_000..2_003].fill(b'!');
+        haystack[1_200..1_203].copy_from_slice(b"d5!");
+        assert_eq!(haystack.as_ptr(), address);
+        assert_eq!(
+            first_session
+                .is_match_window_value(&haystack, window, SearchLimits::unlimited())
+                .unwrap(),
+            first
+                .is_match_window_value(&haystack, window, SearchLimits::unlimited())
+                .unwrap(),
+            "same-address mutation is scanned again instead of reusing a literal position",
+        );
+    }
+
+    #[test]
+    fn k0_packed_frontier_exact_and_one_below_resources_are_transactional() {
+        let pattern = r"(?s-u:...[abcd][12345]+\b)";
+        let (raw, limits, _, _, _) = lowered_k0_mandatory_cut(pattern);
+        let cut = try_build_k0_mandatory_cut(&raw, limits, 0)
+            .expect("packed-frontier resource prerequisite completes");
+        let complete = try_build_k0_packed_frontier(
+            &raw,
+            limits,
+            cut.planner_work,
+            cut.analysis_work,
+        )
+        .expect("packed-frontier resource baseline completes");
+        assert!(complete.plan.is_some());
+        let required = complete.planner_work;
+
+        let exact_limits = BuildLimits {
+            max_planner_work: required,
+            ..limits
+        };
+        let exact_cut = try_build_k0_mandatory_cut(&raw, exact_limits, 0)
+            .expect("exact packed-frontier prerequisite completes");
+        let exact = try_build_k0_packed_frontier(
+            &raw,
+            exact_limits,
+            exact_cut.planner_work,
+            exact_cut.analysis_work,
+        )
+        .expect("exact packed-frontier build completes");
+        assert!(exact.plan.is_some());
+        assert_eq!(exact.planner_work, required);
+        assert_eq!(exact.storage_bytes, complete.storage_bytes);
+
+        let one_below_limits = BuildLimits {
+            max_planner_work: required.checked_sub(1).expect("positive required work"),
+            ..limits
+        };
+        let one_below_cut = try_build_k0_mandatory_cut(&raw, one_below_limits, 0)
+            .expect("one-below packed-frontier prerequisite completes");
+        let one_below = try_build_k0_packed_frontier(
+            &raw,
+            one_below_limits,
+            one_below_cut.planner_work,
+            one_below_cut.analysis_work,
+        )
+        .expect("one-below packed-frontier refusal closes");
+        assert!(one_below.plan.is_none());
+        assert_eq!(one_below.storage_bytes, 0);
+        assert!(one_below.planner_work <= one_below_limits.max_planner_work);
+
+        let pattern_limited = BuildLimits {
+            packed_literal_set: fre_kernels::PackedLiteralSetBuildLimits {
+                max_patterns: 19,
+                ..limits.packed_literal_set
+            },
+            ..limits
+        };
+        let cut = try_build_k0_mandatory_cut(&raw, pattern_limited, 0)
+            .expect("pattern-limited prerequisite completes");
+        let declined = try_build_k0_packed_frontier(
+            &raw,
+            pattern_limited,
+            cut.planner_work,
+            cut.analysis_work,
+        )
+        .expect("pattern-limited packed frontier declines transactionally");
+        assert!(declined.plan.is_none());
+        assert_eq!(declined.storage_bytes, 0);
+
+        let owner_limited = BuildLimits {
+            packed_literal_set: fre_kernels::PackedLiteralSetBuildLimits {
+                max_build_bytes: core::mem::size_of::<K0PackedFrontierPlan>() - 1,
+                ..limits.packed_literal_set
+            },
+            ..limits
+        };
+        let cut = try_build_k0_mandatory_cut(&raw, owner_limited, 0)
+            .expect("owner-limited prerequisite completes");
+        let declined = try_build_k0_packed_frontier(
+            &raw,
+            owner_limited,
+            cut.planner_work,
+            cut.analysis_work,
+        )
+        .expect("owner-limited packed frontier declines transactionally");
+        assert!(declined.plan.is_none());
+        assert_eq!(declined.storage_bytes, 0);
+        assert_eq!(declined.planner_work, cut.planner_work);
+
+        let (unbounded_raw, unbounded_limits, _, _, _) =
+            lowered_k0_mandatory_cut(r"(?s-u:.*[abcd][1234])");
+        let unbounded_cut = try_build_k0_mandatory_cut(&unbounded_raw, unbounded_limits, 0)
+            .expect("unbounded packed-frontier prerequisite completes");
+        let unbounded = try_build_k0_packed_frontier(
+            &unbounded_raw,
+            unbounded_limits,
+            unbounded_cut.planner_work,
+            unbounded_cut.analysis_work,
+        )
+        .expect("unbounded packed frontier declines transactionally");
+        assert!(unbounded.plan.is_none());
+        assert_eq!(unbounded.storage_bytes, 0);
     }
 
     #[test]
@@ -15714,7 +16653,7 @@ mod tests {
         #[allow(dead_code)]
         struct PortableK0PlanWithoutAbsoluteEndProof {
             automaton: Automaton,
-            correlated_terminal: Option<super::correlated_bounded_alternation::Plan>,
+            exclusive: super::K0ExclusivePlan,
             reverse_inner: Option<Box<super::k0_general_reverse_inner::Plan>>,
             mandatory_suffix: Option<K0MandatorySuffixPlan>,
             mandatory_cut: Option<K0MandatoryCutPlan>,
@@ -15864,7 +16803,7 @@ mod tests {
                 correlated_terminal_exists_state,
                 ..
             } => {
-                assert!(k0_plan.correlated_terminal.is_some());
+                assert!(k0_plan.correlated_terminal().is_some());
                 assert!(matches!(
                     correlated_terminal_exists_state.select(16),
                     super::correlated_bounded_alternation::Route::Learn { .. }
@@ -15892,7 +16831,7 @@ mod tests {
         else {
             unreachable!();
         };
-        assert!(k0_plan.correlated_terminal.is_none());
+        assert!(k0_plan.correlated_terminal().is_none());
         *correlated_terminal_exists_state = transplanted;
         *correlated_terminal_earliest_end_state = transplanted;
         *correlated_terminal_span_state = transplanted;
@@ -22924,7 +23863,7 @@ mod tests {
         else {
             panic!("root-run value fixture unexpectedly retained a facade sidecar");
         };
-        assert!(k0_plan.correlated_terminal.is_none());
+        assert!(k0_plan.correlated_terminal().is_none());
         assert!(k0_session.retained_root_run_cursor_available());
 
         {
@@ -23107,8 +24046,7 @@ mod tests {
             panic!("exact correlated alternation lost its K0 sidecar");
         };
         let plan = k0_plan
-            .correlated_terminal
-            .as_ref()
+            .correlated_terminal()
             .expect("exact correlated alternation lost its K0 sidecar");
         assert!(plan.is_exact_delimited());
 
@@ -23315,8 +24253,7 @@ mod tests {
                 panic!("cross-plan fixture lost its exact sidecar");
             };
             let plan = k0_plan
-                .correlated_terminal
-                .as_ref()
+                .correlated_terminal()
                 .expect("cross-plan fixture lost its exact sidecar");
             assert!(plan.is_exact_delimited());
         }
@@ -23423,7 +24360,7 @@ mod tests {
         else {
             panic!("correlated value-iterator fixture lost its facade sidecar");
         };
-        assert!(k0_plan.correlated_terminal.is_some());
+        assert!(k0_plan.correlated_terminal().is_some());
 
         // The first long, decoy-heavy search teaches the adaptive route. A
         // fresh iterator over the same immutable plan and source then starts

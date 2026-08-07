@@ -1670,7 +1670,7 @@ mod tests {
             panic!("absolute-end fixture must retain generic K0");
         };
         assert!(plan.absolute_end_proof.is_some());
-        assert!(plan.correlated_terminal.is_none());
+        assert!(plan.correlated_terminal().is_none());
         assert!(plan.reverse_inner.is_none());
 
         let mut session = regex
@@ -1944,7 +1944,7 @@ mod tests {
             panic!("bounded facade-composition fixture must retain generic K0");
         };
         assert!(plan.absolute_end_proof.is_none());
-        assert!(plan.correlated_terminal.is_none());
+        assert!(plan.correlated_terminal().is_none());
         assert!(plan.reverse_inner.is_some());
         regex
     }
@@ -2163,7 +2163,7 @@ mod tests {
         struct PortableK0PlanBeforeReverseInner {
             automaton: Automaton,
             absolute_end_proof: Option<crate::K0AbsoluteEndProof>,
-            correlated_terminal: Option<crate::correlated_bounded_alternation::Plan>,
+            exclusive: crate::K0ExclusivePlan,
             mandatory_suffix: Option<K0MandatorySuffixPlan>,
             mandatory_cut: Option<K0MandatoryCutPlan>,
             negative_prefilter: Option<Box<K0NegativePrefilterPlan>>,
@@ -2195,7 +2195,9 @@ mod tests {
             .saturating_sub(core::mem::size_of::<PortableK0PlanBeforeReverseInner>());
         assert!(
             plan_growth <= core::mem::size_of::<Option<Box<Plan>>>(),
-            "the immutable K0 owner may grow by at most one sidecar pointer",
+            "the immutable K0 owner may grow by at most one sidecar pointer: growth={plan_growth}, current={}, baseline={}",
+            core::mem::size_of::<crate::PortableK0Plan>(),
+            core::mem::size_of::<PortableK0PlanBeforeReverseInner>(),
         );
         let session_growth = core::mem::size_of::<PortableSearchSessionPlan<'static>>()
             .saturating_sub(core::mem::size_of::<
