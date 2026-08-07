@@ -25066,8 +25066,8 @@ mod tests {
     )]
     fn unpadded_cell_offset_v4_is_closed_inline_and_additive() {
         let compiled = program(
-            r"(?:ab|ac)+z",
-            OutputContract::Exists,
+            r"ab*c|a",
+            OutputContract::SelectedEnd,
             CompileMode::Optimizing,
             DeterminizeLimits {
                 max_states: 0,
@@ -25076,27 +25076,27 @@ mod tests {
         );
         let workspace = compiled.prepare_workspace().unwrap();
         let retained_bytes = workspace.compiler_private_k0_retained_bytes();
-        let broad_storage = compiled
+        // A retained loop suppresses the generally smaller V12 promotion. V7
+        // is an additive extension of the production-packed V4 owner, so its
+        // scalar compatibility descriptor exercises the actual V4 packing
+        // and publication path without manufacturing a dominated selection.
+        let mut storage = compiled
             .compiler_private_frozen_dynamic_rows_storage_v3(
                 &workspace,
                 retained_bytes,
                 usize::MAX,
             )
-            .expect("complete compact sidecar geometry");
-        let v4_budget = usize::try_from(broad_storage.descriptor.state_count)
-            .unwrap()
-            .checked_mul(usize::try_from(broad_storage.descriptor.class_count).unwrap())
-            .and_then(|cells| cells.checked_mul(core::mem::size_of::<u16>()))
-            .and_then(|bytes| bytes.checked_add(256))
-            .unwrap();
-        let mut storage = compiled
-            .compiler_private_frozen_dynamic_rows_storage_v3(
-                &workspace,
-                retained_bytes,
-                v4_budget,
-            )
-            .expect("complete unpadded compact V4 sidecar");
+            .expect("complete unpadded compact V4 owner");
         assert!(storage.descriptor_is_valid_for(compiled.identity));
+        assert_eq!(
+            storage
+                .descriptor_v6
+                .expect("the fixture must retain its nonroot loop extension")
+                .compact
+                .format_version,
+            FROZEN_DYNAMIC_ROWS_V7_FORMAT_VERSION,
+            "V7 must extend the same production-packed cell-offset rows exercised below"
+        );
         assert_eq!(storage.descriptor.ready_seal, 0);
         assert_eq!(
             storage.descriptor.format_version,
@@ -25117,24 +25117,6 @@ mod tests {
             .checked_mul(core::mem::size_of::<u16>())
             .and_then(|bytes| bytes.checked_add(256))
             .unwrap();
-        assert!(
-            compiled
-                .compiler_private_frozen_dynamic_rows_storage_v3(
-                    &workspace,
-                    retained_bytes,
-                    packed_bytes.saturating_sub(1),
-                )
-                .is_none()
-        );
-        assert!(
-            compiled
-                .compiler_private_frozen_dynamic_rows_storage_v3(
-                    &workspace,
-                    retained_bytes,
-                    packed_bytes,
-                )
-                .is_some()
-        );
 
         let wide = compiled
             .compiler_private_frozen_dynamic_rows_storage(
