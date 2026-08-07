@@ -3925,9 +3925,11 @@ pub(crate) struct NativePartialProgramView<'a> {
 /// post-consumption position and continues only the encoded higher-priority
 /// successor. A dead successor or the admitted window end commits the last
 /// such position. Once one is pending, an initial-row successor uses its exact
-/// table row instead of restarting the graph scanner. Holes and K0-owned loop
-/// rows tail-deopt before consuming their byte, so the ordinary executor can
-/// restart the saved original window transactionally. A `Span` start is
+/// table row instead of restarting the graph scanner. A hole continues
+/// through K0 at the exact unread cell; the scanner-owned initial loop row is
+/// admissible, while generated code tail-deopts before consuming a hole in
+/// any non-root learned-loop row. Later K0 loop plans remain optional
+/// accelerators. A `Span` start is
 /// recoverable from that endpoint either through the positive graph-proved
 /// width below or, for a non-nullable variable-width artifact, through the
 /// authenticated reverse-K0 postflight. A nullable root is completed inside
@@ -7029,7 +7031,7 @@ impl CompiledProgram {
         expected_artifact_identity: [u8; 32],
         current_row: usize,
         resume_position: usize,
-        pending_valid: usize,
+        packed_pending_and_scanner_hits: usize,
         pending_end: usize,
         cache_identity: u64,
     ) -> Result<MatchResult, CompileError> {
@@ -7063,14 +7065,22 @@ impl CompiledProgram {
                     "dynamic native-row continuation requires a supported assertion-free ordered-NFA artifact",
                 ),
             )?;
-            if dynamic_view.root_requirement.is_some() {
+            let pending_valid = packed_pending_and_scanner_hits & 1;
+            let scanner_hits = packed_pending_and_scanner_hits >> 1;
+            if (dynamic_view.root_requirement.is_some()) != (scanner_hits != 0) {
                 return Err(CompileError::InternalInvariant(
-                    "dynamic native-row continuation cannot inherit an emitted root scanner",
+                    "dynamic native-row continuation scanner-hit count disagrees with its emitted root",
                 ));
             }
-            if pending_valid > 1 {
+            let maximum_scanner_hits = resume_position
+                .checked_sub(window.start)
+                .and_then(|consumed| consumed.checked_add(1))
+                .ok_or(CompileError::InternalInvariant(
+                    "dynamic native-row continuation scanner-hit bound overflowed",
+                ))?;
+            if scanner_hits > maximum_scanner_hits {
                 return Err(CompileError::InternalInvariant(
-                    "dynamic native-row continuation pending discriminator is malformed",
+                    "dynamic native-row continuation scanner-hit count exceeds its consumed frontier",
                 ));
             }
             let pending = if pending_valid == 0 {
@@ -7108,6 +7118,7 @@ impl CompiledProgram {
                             nfa,
                             current_row,
                             resume_position,
+                            scanner_hits,
                             cache_identity,
                         )
                         .map(MatchResult::Exists)
@@ -7123,6 +7134,7 @@ impl CompiledProgram {
                         current_row,
                         resume_position,
                         pending,
+                        scanner_hits,
                         cache_identity,
                     )
                     .map(MatchResult::SelectedEnd)
@@ -7138,6 +7150,7 @@ impl CompiledProgram {
                             current_row,
                             resume_position,
                             pending,
+                            scanner_hits,
                             cache_identity,
                         )?;
                     let found = selected_end
@@ -10881,6 +10894,236 @@ mod tests {
                 "a mutable K0 continuation must invalidate the projected live extent"
             );
         }
+    }
+
+    #[test]
+    fn dynamic_native_rows_scanner_owned_first_hole_continuation_covers_value_contracts() {
+        let limits = DeterminizeLimits {
+            max_states: 0,
+            ..DeterminizeLimits::default()
+        };
+        let candidate = 37_usize;
+        for (output, absent, expected) in [
+            (
+                OutputContract::Exists,
+                MatchResult::Exists(false),
+                MatchResult::Exists(true),
+            ),
+            (
+                OutputContract::SelectedEnd,
+                MatchResult::SelectedEnd(None),
+                MatchResult::SelectedEnd(Some(candidate + 2)),
+            ),
+            (
+                OutputContract::Span,
+                MatchResult::Span(None),
+                MatchResult::Span(Some((candidate, candidate + 2))),
+            ),
+        ] {
+            let compiled = program("(?:ab|cd)", output, CompileMode::Fast, limits);
+            let view = compiled
+                .native_dynamic_rows_view()
+                .expect("scanner-owned resource fallback view");
+            assert!(view.root_requirement.is_some());
+            assert_eq!(view.exact_match_width, Some(2));
+
+            let mut workspace = compiled.prepare_workspace().expect("dynamic workspace");
+            let warm = vec![b'!'; DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES + 32];
+            let window = SearchWindow::full(&warm);
+            let identity = compiled.artifact_identity();
+            let (cold, address, cache_identity) = compiled
+                .preflight_dynamic_native_rows_with_workspace(
+                    &warm,
+                    window,
+                    &mut workspace,
+                    identity,
+                )
+                .expect("cold scanner-owned preflight");
+            assert_eq!(cold, RetainedPartialPreflight::Complete(absent));
+            assert_eq!((address, cache_identity), (0, 0));
+
+            let mut novel = warm.clone();
+            novel[candidate..candidate + 2].copy_from_slice(b"cd");
+            let (enter, address, cache_identity) = compiled
+                .preflight_dynamic_native_rows_with_workspace(
+                    &novel,
+                    window,
+                    &mut workspace,
+                    identity,
+                )
+                .expect("warm scanner-owned preflight");
+            assert_eq!(enter, RetainedPartialPreflight::Enter(window));
+            assert_ne!((address, cache_identity), (0, 0));
+            let descriptor = workspace
+                .dynamic_native_rows
+                .as_deref()
+                .expect("dynamic descriptor")
+                .native_rows;
+            let class = usize::from(
+                workspace
+                    .dynamic_native_rows
+                    .as_deref()
+                    .expect("dynamic class map")
+                    .class_map[usize::from(novel[candidate])],
+            );
+            {
+                let projection = workspace
+                    .nfa
+                    .as_ref()
+                    .and_then(|nfa| nfa.dynamic_root_projection(&compiled.automaton))
+                    .expect("warm scanner-owned root projection");
+                let initial = usize::try_from(projection.initial_row()).unwrap();
+                let cell = initial.checked_add(class).expect("root cell index");
+                assert_eq!(
+                    projection.cell(cell),
+                    Some(projection.unfilled_cell()),
+                    "the named novel root class must still be the first unpublished cell"
+                );
+            }
+            let found = compiled
+                .search_from_dynamic_native_rows_hole_with_workspace(
+                    &novel,
+                    window,
+                    &mut workspace,
+                    identity,
+                    usize::try_from(descriptor.initial_row).unwrap(),
+                    candidate,
+                    1 << 1,
+                    0,
+                    cache_identity,
+                )
+                .expect("scanner-owned exact first-hole continuation");
+            assert_eq!(found, expected, "{output:?}");
+            assert_eq!(
+                workspace
+                    .dynamic_native_rows
+                    .as_deref()
+                    .expect("settled dynamic descriptor")
+                    .state,
+                DynamicNativeRowsState::default(),
+                "successful scanner-owned continuation must not record a canonical deopt"
+            );
+            assert!(
+                workspace
+                    .dynamic_native_rows
+                    .as_deref()
+                    .expect("settled dynamic descriptor")
+                    .native_rows_dirty,
+                "mutable continuation invalidates the projected extent"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_native_rows_scanner_owned_variable_span_continues_the_named_root_hole() {
+        let limits = DeterminizeLimits {
+            max_states: 0,
+            ..DeterminizeLimits::default()
+        };
+        let candidate = 37_usize;
+        let compiled = program(
+            "(?:ab|cd)+z",
+            OutputContract::Span,
+            CompileMode::Fast,
+            limits,
+        );
+        let view = compiled
+            .native_dynamic_rows_view()
+            .expect("scanner-owned variable Span view");
+        assert!(view.root_requirement.is_some());
+        assert_eq!(view.exact_match_width, None);
+
+        let mut workspace = compiled.prepare_workspace().expect("dynamic workspace");
+        let mut warm = vec![b'!'; DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES + 32];
+        warm[candidate..candidate + 3].copy_from_slice(b"abz");
+        let window = SearchWindow::full(&warm);
+        let identity = compiled.artifact_identity();
+        let (cold, address, cache_identity) = compiled
+            .preflight_dynamic_native_rows_with_workspace(
+                &warm,
+                window,
+                &mut workspace,
+                identity,
+            )
+            .expect("cold scanner-owned variable Span preflight");
+        assert_eq!(
+            cold,
+            RetainedPartialPreflight::Complete(MatchResult::Span(Some((
+                candidate,
+                candidate + 3,
+            ))))
+        );
+        assert_eq!((address, cache_identity), (0, 0));
+
+        let mut novel = warm.clone();
+        novel[candidate..candidate + 3].copy_from_slice(b"cdz");
+        let (enter, address, cache_identity) = compiled
+            .preflight_dynamic_native_rows_with_workspace(
+                &novel,
+                window,
+                &mut workspace,
+                identity,
+            )
+            .expect("warm scanner-owned variable Span preflight");
+        assert_eq!(enter, RetainedPartialPreflight::Enter(window));
+        assert_ne!((address, cache_identity), (0, 0));
+        let descriptor = workspace
+            .dynamic_native_rows
+            .as_deref()
+            .expect("dynamic descriptor")
+            .native_rows;
+        let class = usize::from(
+            workspace
+                .dynamic_native_rows
+                .as_deref()
+                .expect("dynamic class map")
+                .class_map[usize::from(novel[candidate])],
+        );
+        {
+            let projection = workspace
+                .nfa
+                .as_ref()
+                .and_then(|nfa| nfa.dynamic_root_projection(&compiled.automaton))
+                .expect("warm scanner-owned root projection");
+            let initial = usize::try_from(projection.initial_row()).unwrap();
+            let cell = initial.checked_add(class).expect("root cell index");
+            assert_eq!(
+                projection.cell(cell),
+                Some(projection.unfilled_cell()),
+                "the novel scanner-owned variable root must still be unpublished"
+            );
+        }
+
+        let found = compiled
+            .search_from_dynamic_native_rows_hole_with_workspace(
+                &novel,
+                window,
+                &mut workspace,
+                identity,
+                usize::try_from(descriptor.initial_row).unwrap(),
+                candidate,
+                1 << 1,
+                0,
+                cache_identity,
+            )
+            .expect("scanner-owned variable Span first-hole continuation");
+        assert_eq!(
+            found,
+            MatchResult::Span(Some((candidate, candidate + 3)))
+        );
+        let dynamic = workspace
+            .dynamic_native_rows
+            .as_deref()
+            .expect("settled dynamic descriptor");
+        assert_eq!(
+            dynamic.state,
+            DynamicNativeRowsState::default(),
+            "successful scanner-owned variable continuation must not deopt"
+        );
+        assert!(
+            dynamic.native_rows_dirty,
+            "mutable variable continuation invalidates the projected extent"
+        );
     }
 
     #[test]

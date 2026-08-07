@@ -150,6 +150,8 @@ pub struct FreAotRegexDynamicRowsPreflightV1 {
 pub struct FreAotRegexDynamicRowsContinuationV1 {
     pub current_row: usize,
     pub resume_position: usize,
+    /// Low bit: pending endpoint present. Upper bits: emitted root-scanner
+    /// hits whose extra logical reads precede the unread DFA cell.
     pub pending_valid: usize,
     pub pending_end: usize,
     pub cache_identity: u64,

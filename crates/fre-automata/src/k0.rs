@@ -3341,6 +3341,12 @@ impl K0DynamicRootProjection<'_> {
 
     #[doc(hidden)]
     #[must_use]
+    pub fn cell(&self, index: usize) -> Option<u32> {
+        self.rows.get(index).copied()
+    }
+
+    #[doc(hidden)]
+    #[must_use]
     pub const fn row_stride(&self) -> u32 {
         self.row_stride
     }
@@ -11205,10 +11211,17 @@ fn complete_mutable_warm_direct_selected_end(
 }
 
 /// Authenticate the exact first unpublished direct cell reached by an
-/// external warmed-row executor. This seam is deliberately narrower than the
-/// ordinary warm projection: the caller owns no start scanner or learned-loop
-/// ledger, so both must be absent before its completed scalar prefix can be
-/// continued without replay.
+/// external warmed-row executor. The caller may have selected the current
+/// candidate with the same graph-proved root scanner owned by this automaton;
+/// the first unread transition is still consumed exactly once before the
+/// ordinary scanner resumes at a later initial row. A scanner-owned initial
+/// loop row is admissible; generated code side-exits before every non-root
+/// learned-loop row, while subsequent plans remain optional accelerators.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the private handoff authenticates every native frontier component together"
+)]
 fn validate_dynamic_direct_hole_request<'a>(
     automaton: &'a Automaton,
     haystack: &[u8],
@@ -11216,6 +11229,7 @@ fn validate_dynamic_direct_hole_request<'a>(
     workspace: &K0Workspace,
     current_row: u32,
     position: usize,
+    scanner_hits: usize,
     cache_identity: u64,
 ) -> Result<(u32, &'a StartFilterProof), SearchError> {
     validate_window(haystack, window)?;
@@ -11233,14 +11247,31 @@ fn validate_dynamic_direct_hole_request<'a>(
         .ok_or(SearchError::InvalidResumeState {
             detail: "dynamic direct continuation has no authenticated start proof",
         })?;
-    if proof.scanner.is_some() || proof.force_haystack_start || proof.relaxed_nullable {
+    if proof.force_haystack_start || proof.relaxed_nullable {
         return Err(SearchError::InvalidResumeState {
-            detail: "dynamic direct continuation cannot inherit a root scanner or nullable start",
+            detail: "dynamic direct continuation cannot inherit an anchored or nullable start",
         });
     }
     if position < window.start() || position >= window.end() {
         return Err(SearchError::InvalidResumeState {
             detail: "dynamic direct continuation position is not an unread byte in its window",
+        });
+    }
+    let consumed_prefix = position.checked_sub(window.start()).ok_or(
+        SearchError::InvalidResumeState {
+            detail: "dynamic direct continuation position preceded its window",
+        },
+    )?;
+    let maximum_scanner_hits = consumed_prefix.checked_add(1).ok_or(
+        SearchError::ArithmeticOverflow {
+            computation: "dynamic direct continuation scanner-hit bound",
+        },
+    )?;
+    if scanner_hits > maximum_scanner_hits
+        || (scanner_hits != 0 && proof.scanner.is_none())
+    {
+        return Err(SearchError::InvalidResumeState {
+            detail: "dynamic direct continuation scanner-hit count is not authenticated by its frontier",
         });
     }
 
@@ -11254,12 +11285,9 @@ fn validate_dynamic_direct_hole_request<'a>(
             detail: "dynamic direct continuation cache identity is stale",
         });
     }
-    if projection.initial_pending()
-        || projection.initial_terminal()
-        || !projection.learned_loop_row_offsets().is_empty()
-    {
+    if projection.initial_pending() || projection.initial_terminal() {
         return Err(SearchError::InvalidResumeState {
-            detail: "dynamic direct continuation requires a positive loop-free root cache",
+            detail: "dynamic direct continuation requires a positive root cache",
         });
     }
     let stride = usize::try_from(projection.row_stride()).map_err(|_| {
@@ -11279,6 +11307,15 @@ fn validate_dynamic_direct_hole_request<'a>(
     if stride == 0 || row.checked_rem(stride) != Some(0) || row >= live_cells {
         return Err(SearchError::InvalidResumeState {
             detail: "dynamic direct continuation row is misaligned or outside the live cache",
+        });
+    }
+    if projection
+        .learned_loop_row_offsets()
+        .contains(&current_row)
+        && (current_row != projection.initial_row() || scanner_hits == 0)
+    {
+        return Err(SearchError::InvalidResumeState {
+            detail: "dynamic direct continuation entered a K0-owned non-root loop row",
         });
     }
     let byte = *haystack
@@ -11315,6 +11352,10 @@ fn validate_dynamic_direct_hole_request<'a>(
 /// Continue an authenticated external Exists probe at its exact first
 /// unpublished direct cell. Every generated transition before `position` is
 /// restored to the mutable invocation meter exactly once.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the private continuation carries its complete authenticated frontier"
+)]
 pub(crate) fn search_prevalidated_exists_value_from_dynamic_direct_hole_with_authenticated_workspace(
     automaton: &Automaton,
     haystack: &[u8],
@@ -11322,6 +11363,7 @@ pub(crate) fn search_prevalidated_exists_value_from_dynamic_direct_hole_with_aut
     workspace: &mut K0Workspace,
     current_row: u32,
     position: usize,
+    scanner_hits: usize,
     cache_identity: u64,
 ) -> Result<bool, SearchError> {
     let (initial_row, proof) = validate_dynamic_direct_hole_request(
@@ -11331,6 +11373,7 @@ pub(crate) fn search_prevalidated_exists_value_from_dynamic_direct_hole_with_aut
         workspace,
         current_row,
         position,
+        scanner_hits,
         cache_identity,
     )?;
     let completed_steps = position
@@ -11343,7 +11386,17 @@ pub(crate) fn search_prevalidated_exists_value_from_dynamic_direct_hole_with_aut
             computation: "dynamic direct continuation completed steps",
         }
     })?;
-    let work = INVOCATION_RESET_WORK.checked_add(completed_steps).ok_or(
+    let scanner_hits = u64::try_from(scanner_hits).map_err(|_| {
+        SearchError::ArithmeticOverflow {
+            computation: "dynamic direct continuation scanner-hit conversion",
+        }
+    })?;
+    let completed_work = completed_steps.checked_add(scanner_hits).ok_or(
+        SearchError::ArithmeticOverflow {
+            computation: "dynamic direct continuation completed work",
+        },
+    )?;
+    let work = INVOCATION_RESET_WORK.checked_add(completed_work).ok_or(
         SearchError::ArithmeticOverflow {
             computation: "dynamic direct continuation completed work",
         },
@@ -11384,6 +11437,7 @@ pub(crate) fn search_prevalidated_selected_end_value_from_dynamic_direct_hole_wi
     current_row: u32,
     position: usize,
     pending_end: Option<usize>,
+    scanner_hits: usize,
     cache_identity: u64,
 ) -> Result<Option<usize>, SearchError> {
     let (initial_row, proof) = validate_dynamic_direct_hole_request(
@@ -11393,6 +11447,7 @@ pub(crate) fn search_prevalidated_selected_end_value_from_dynamic_direct_hole_wi
         workspace,
         current_row,
         position,
+        scanner_hits,
         cache_identity,
     )?;
     if pending_end.is_some_and(|end| end <= window.start() || end > position) {
@@ -11405,6 +11460,16 @@ pub(crate) fn search_prevalidated_selected_end_value_from_dynamic_direct_hole_wi
         .ok_or(SearchError::InvalidResumeState {
             detail: "dynamic direct continuation position preceded its window",
         })?;
+    let scanner_hits = u64::try_from(scanner_hits).map_err(|_| {
+        SearchError::ArithmeticOverflow {
+            computation: "dynamic selected-end continuation scanner-hit conversion",
+        }
+    })?;
+    let work = INVOCATION_RESET_WORK.checked_add(scanner_hits).ok_or(
+        SearchError::ArithmeticOverflow {
+            computation: "dynamic selected-end continuation scanner work",
+        },
+    )?;
     continue_mutable_warm_direct_selected_end(
         automaton,
         haystack,
@@ -11415,7 +11480,7 @@ pub(crate) fn search_prevalidated_selected_end_value_from_dynamic_direct_hole_wi
             initial_row,
             state: current_row,
             position,
-            work: INVOCATION_RESET_WORK,
+            work,
             direct_steps,
             pending_end,
             engine_candidate: None,
@@ -11476,7 +11541,6 @@ fn continue_mutable_warm_direct_selected_end(
     if !workspace.lazy.is_bound_to(automaton)
         || !workspace.lazy.initialized
         || workspace.lazy.declined
-        || !workspace.lazy.loop_skip_plans.is_empty()
     {
         return Err(SearchError::InternalInvariant {
             detail: "warm selected-end handoff lost its authenticated direct workspace",
@@ -44038,6 +44102,7 @@ mod tests {
                 &mut exists,
                 row,
                 1,
+                0,
                 cache_identity.wrapping_add(1),
             ),
             Err(SearchError::InvalidResumeState { .. })
@@ -44051,6 +44116,7 @@ mod tests {
                 &mut exists,
                 row,
                 1,
+                0,
                 cache_identity,
             )
             .unwrap()
@@ -44072,10 +44138,111 @@ mod tests {
                 row,
                 1,
                 None,
+                0,
                 cache_identity,
             )
             .unwrap(),
             Some(2)
+        );
+    }
+
+    #[test]
+    fn dynamic_direct_hole_continuation_accepts_scanner_owned_initial_hole() {
+        fn warmed(
+            plan: &Automaton,
+            contract: OutputContract,
+        ) -> (K0Workspace, u32, u64) {
+            let mut workspace =
+                K0Workspace::new_accelerated(plan, WorkspaceLimits::unlimited()).unwrap();
+            match contract {
+                OutputContract::Exists => assert!(
+                    !plan
+                        .prepare::<Exists>()
+                        .search_with_workspace(
+                            b"!!!!",
+                            &mut workspace,
+                            SearchLimits::unlimited(),
+                        )
+                        .unwrap()
+                        .into_output()
+                ),
+                OutputContract::SelectedEnd => assert_eq!(
+                    plan.prepare::<SelectedEnd>()
+                        .search_with_workspace(
+                            b"!!!!",
+                            &mut workspace,
+                            SearchLimits::unlimited(),
+                        )
+                        .unwrap()
+                        .into_output(),
+                    None
+                ),
+                _ => unreachable!("scanner-hole test uses value contracts"),
+            }
+            let proof = plan
+                .start_filter_proof
+                .get()
+                .expect("warm call publishes a start proof");
+            assert!(proof.scanner.is_some());
+            let projection = workspace
+                .dynamic_root_projection(plan)
+                .expect("warm scanner-owned projection");
+            let initial = projection.initial_row();
+            let class = usize::from(plan.byte_classes().class_of(b'a'));
+            assert_eq!(
+                projection.rows[usize::try_from(initial).unwrap() + class],
+                super::LAZY_CELL_UNFILLED
+            );
+            let cache_identity = projection.cache_identity();
+            (workspace, initial, cache_identity)
+        }
+
+        let plan = byte_chain(&[(b'a', b'a'), (b'b', b'c')]);
+        let window = SearchWindow::full(b"!ab!");
+        let (mut exists, initial, identity) = warmed(&plan, OutputContract::Exists);
+        assert!(matches!(
+            super::search_prevalidated_exists_value_from_dynamic_direct_hole_with_authenticated_workspace(
+                &plan,
+                b"!ab!",
+                window,
+                &mut exists,
+                initial,
+                1,
+                3,
+                identity,
+            ),
+            Err(SearchError::InvalidResumeState { .. })
+        ));
+        assert!(
+            super::search_prevalidated_exists_value_from_dynamic_direct_hole_with_authenticated_workspace(
+                &plan,
+                b"!ab!",
+                window,
+                &mut exists,
+                initial,
+                1,
+                1,
+                identity,
+            )
+            .unwrap()
+        );
+
+        let (mut selected, initial, identity) =
+            warmed(&plan, OutputContract::SelectedEnd);
+        assert_eq!(
+            super::search_prevalidated_selected_end_value_from_dynamic_direct_hole_with_authenticated_workspace(
+                &plan,
+                b"!ac!",
+                window,
+                &mut selected,
+                initial,
+                1,
+                None,
+                1,
+                identity,
+            )
+            .unwrap(),
+            Some(3)
         );
     }
 

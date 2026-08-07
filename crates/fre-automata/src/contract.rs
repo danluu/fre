@@ -682,6 +682,7 @@ impl TypedPlan<'_, Exists> {
         workspace: &mut K0Workspace,
         current_row: u32,
         position: usize,
+        scanner_hits: usize,
         cache_identity: u64,
     ) -> Result<bool, SearchError> {
         crate::k0::search_prevalidated_exists_value_from_dynamic_direct_hole_with_authenticated_workspace(
@@ -691,6 +692,7 @@ impl TypedPlan<'_, Exists> {
             workspace,
             current_row,
             position,
+            scanner_hits,
             cache_identity,
         )
     }
@@ -852,6 +854,7 @@ impl TypedPlan<'_, SelectedEnd> {
         current_row: u32,
         position: usize,
         pending_end: Option<usize>,
+        scanner_hits: usize,
         cache_identity: u64,
     ) -> Result<Option<usize>, SearchError> {
         crate::k0::search_prevalidated_selected_end_value_from_dynamic_direct_hole_with_authenticated_workspace(
@@ -862,6 +865,7 @@ impl TypedPlan<'_, SelectedEnd> {
             current_row,
             position,
             pending_end,
+            scanner_hits,
             cache_identity,
         )
     }
