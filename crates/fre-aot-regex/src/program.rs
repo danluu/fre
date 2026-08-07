@@ -2601,12 +2601,12 @@ pub struct FrozenPreparedHeaderV5 {
 
 /// Maximum prepared-header envelope for every immutable compact generation.
 ///
-/// The complete V3 record remains an offset-zero prefix. V3/V4/V8/V9 use only
-/// that 448-byte logical extent, V5 uses the first two extension words through
-/// byte 456, and V6/V7 authenticate the complete 664-byte envelope before
-/// reading loop ownership. The V5 summary words intentionally overlay the
-/// V6/V7 loop-count and reserved words; exact flags, extents, versions, and
-/// seals make the interpretations mutually exclusive.
+/// The complete V3 record remains an offset-zero prefix. V3/V4/V8/V9/V10/V12
+/// use only that 448-byte logical extent, V5 uses the first two extension words
+/// through byte 456, and V6/V7 authenticate the complete 664-byte envelope
+/// before reading loop ownership. The V5 summary words intentionally overlay
+/// the V6/V7 loop-count and reserved words; exact flags, extents, versions,
+/// and seals make the interpretations mutually exclusive.
 #[doc(hidden)]
 #[derive(Debug, Eq, PartialEq)]
 #[repr(C)]
@@ -2621,10 +2621,13 @@ pub struct FrozenPreparedHeaderV6 {
 /// hold a one-based destination-state ordinal. V4 rows are mapped and hold the
 /// one-based destination cell-row offset directly. V8 and V9 retain those two
 /// token encodings respectively but expand semantic columns into raw-byte
-/// order. Every format retains acceptance in bit 15, zero as the closed dead
-/// transition, and physical row zero as the canonical initial state. Exact V1
-/// flags, versions, seals, and geometry distinguish the interpretations before
-/// generated code follows the rows pointer.
+/// order. V10 stores those raw columns as `u8`, while V12 stores the exact
+/// mapped projection in padded `u8` rows. In both byte-cell formats bit 7 is
+/// acceptance and the low 7 bits hold a one-based destination-state ordinal.
+/// Every format retains zero as the closed dead transition and physical row
+/// zero as the canonical initial state. Exact V1 flags, versions, seals, and
+/// geometry distinguish the interpretations before generated code follows the
+/// rows pointer.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[repr(C)]
@@ -2801,13 +2804,18 @@ pub struct FrozenDynamicRowsStorage {
     descriptor: DynamicNativeRowsV1,
 }
 
-/// Pointer-stable immutable ownership for a compact V3/V4/V8/V9 table.
+/// Pointer-stable immutable ownership for a compact V3/V4/V8/V9/V10/V12 table.
+///
+/// V10 and V12 own a separately allocated byte table. They never reinterpret
+/// a u16 allocation at a wider or differently aligned type, and exactly one
+/// of the two row owners is populated for any published generation.
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct FrozenDynamicRowsStorageV3 {
     program_instance: u64,
     artifact_identity: [u8; 32],
     rows: Box<[u16]>,
+    rows_u8: Option<Box<[u8]>>,
     class_map: [u8; 256],
     descriptor: FrozenDynamicRowsV3,
     unary_exists_first_accept_step: Option<u32>,
@@ -2858,6 +2866,13 @@ pub const FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V8: u32 = 1 << 9;
 /// An authenticated raw-byte cell-offset V9 tail is present.
 #[doc(hidden)]
 pub const FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V9: u32 = 1 << 10;
+/// An authenticated raw-byte compact-u8 V10 tail is present.
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V10: u32 = 1 << 11;
+/// An authenticated mapped compact-u8 V12 tail is present. Bit 12 remains
+/// reserved for the independently versioned V11 specialization.
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V12: u32 = 1 << 13;
 /// Sentinel used when no reverse root row exists.
 #[doc(hidden)]
 pub const FROZEN_PREPARED_HEADER_V1_NO_REVERSE_ROW: u32 = u32::MAX;
@@ -2972,6 +2987,12 @@ pub const FROZEN_PREPARED_HEADER_V8_READY_SEAL: u64 = 0xd874_3b2f_91c6_5ae0;
 /// Final publication seal for a raw-byte cell-offset V9 tail.
 #[doc(hidden)]
 pub const FROZEN_PREPARED_HEADER_V9_READY_SEAL: u64 = 0x27ad_c4e8_6b15_f903;
+/// Final publication seal for a raw-byte compact-u8 V10 tail.
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V10_READY_SEAL: u64 = 0xa650_9e31_47dc_82bf;
+/// Final publication seal for a mapped compact-u8 V12 tail.
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V12_READY_SEAL: u64 = 0x3d91_f7a6_2be8_c405;
 /// Exact mapped state-ordinal tail format selected by the V3 flag and extent.
 #[doc(hidden)]
 pub const FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION: u32 = 3;
@@ -2993,6 +3014,12 @@ pub const FROZEN_DYNAMIC_ROWS_V8_FORMAT_VERSION: u32 = 8;
 /// Exact raw-byte cell-offset tail format selected by the V9 flag.
 #[doc(hidden)]
 pub const FROZEN_DYNAMIC_ROWS_V9_FORMAT_VERSION: u32 = 9;
+/// Exact raw-byte compact-u8 tail format selected by the V10 flag.
+#[doc(hidden)]
+pub const FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION: u32 = 10;
+/// Exact mapped compact-u8 tail format selected by the V12 flag.
+#[doc(hidden)]
+pub const FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION: u32 = 12;
 /// V4 reuses the additive compact envelope without changing V3's byte ABI.
 #[doc(hidden)]
 pub const FROZEN_PREPARED_HEADER_V4_DYNAMIC_ROWS_OFFSET: usize =
@@ -3035,6 +3062,20 @@ pub const FROZEN_PREPARED_HEADER_V9_DYNAMIC_ROWS_OFFSET: usize =
 /// V9 reuses the additive compact envelope without changing V3's byte ABI.
 #[doc(hidden)]
 pub const FROZEN_PREPARED_HEADER_V9_BYTES: usize = FROZEN_PREPARED_HEADER_V3_BYTES;
+/// V10 reuses the compact logical extent inside the physical V6 envelope.
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V10_DYNAMIC_ROWS_OFFSET: usize =
+    FROZEN_PREPARED_HEADER_V3_DYNAMIC_ROWS_OFFSET;
+/// Exact V10 logical extent inside the physical V6 envelope.
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V10_BYTES: usize = FROZEN_PREPARED_HEADER_V3_BYTES;
+/// V12 reuses the compact logical extent inside the physical V6 envelope.
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V12_DYNAMIC_ROWS_OFFSET: usize =
+    FROZEN_PREPARED_HEADER_V3_DYNAMIC_ROWS_OFFSET;
+/// Exact V12 logical extent inside the physical V6 envelope.
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V12_BYTES: usize = FROZEN_PREPARED_HEADER_V3_BYTES;
 /// General minimum suffix length at which a frozen loop invokes its SIMD helper.
 #[doc(hidden)]
 pub const FROZEN_COMPACT_LOOP_SCAN_MIN_BYTES: usize = BYTE_SET_WIDE_BLOCK_BYTES * 2;
@@ -3047,6 +3088,25 @@ pub const DYNAMIC_NATIVE_ROWS_V3_ACCEPT_MASK: u16 = 1 << 15;
 /// One-based destination-state field in a compact V3 row.
 #[doc(hidden)]
 pub const DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK: u16 = (1 << 15) - 1;
+/// Closed dead transition in a compact-u8 V10 row.
+#[doc(hidden)]
+pub const DYNAMIC_NATIVE_ROWS_V10_DEAD_CELL: u8 = 0;
+/// Accepting-transition bit in a compact-u8 V10 row.
+#[doc(hidden)]
+pub const DYNAMIC_NATIVE_ROWS_V10_ACCEPT_MASK: u8 = 1 << 7;
+/// One-based destination-state field in a compact-u8 V10 row.
+#[doc(hidden)]
+pub const DYNAMIC_NATIVE_ROWS_V10_NEXT_STATE_TOKEN_MASK: u8 = (1 << 7) - 1;
+/// Closed dead transition in a mapped compact-u8 V12 row.
+#[doc(hidden)]
+pub const DYNAMIC_NATIVE_ROWS_V12_DEAD_CELL: u8 = DYNAMIC_NATIVE_ROWS_V10_DEAD_CELL;
+/// Accepting-transition bit in a mapped compact-u8 V12 row.
+#[doc(hidden)]
+pub const DYNAMIC_NATIVE_ROWS_V12_ACCEPT_MASK: u8 = DYNAMIC_NATIVE_ROWS_V10_ACCEPT_MASK;
+/// One-based destination-state field in a mapped compact-u8 V12 row.
+#[doc(hidden)]
+pub const DYNAMIC_NATIVE_ROWS_V12_NEXT_STATE_TOKEN_MASK: u8 =
+    DYNAMIC_NATIVE_ROWS_V10_NEXT_STATE_TOKEN_MASK;
 /// Smallest exact semantic alphabet expanded into raw-byte order.
 ///
 /// Above 128 classes V3 already owns 256 physical cells per row, so V8 is a
@@ -3060,6 +3120,8 @@ enum FrozenCompactRowsFormat {
     CellOffsetV4,
     StateOrdinalDirectV8,
     CellOffsetDirectV9,
+    StateOrdinalDirectU8V10,
+    StateOrdinalMappedU8V12,
 }
 
 #[derive(Clone, Copy)]
@@ -3076,6 +3138,8 @@ impl FrozenCompactRowsFormat {
             Self::CellOffsetV4 => FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION,
             Self::StateOrdinalDirectV8 => FROZEN_DYNAMIC_ROWS_V8_FORMAT_VERSION,
             Self::CellOffsetDirectV9 => FROZEN_DYNAMIC_ROWS_V9_FORMAT_VERSION,
+            Self::StateOrdinalDirectU8V10 => FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION,
+            Self::StateOrdinalMappedU8V12 => FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION,
         }
     }
 
@@ -3085,6 +3149,8 @@ impl FrozenCompactRowsFormat {
             Self::CellOffsetV4 => FROZEN_PREPARED_HEADER_V4_READY_SEAL,
             Self::StateOrdinalDirectV8 => FROZEN_PREPARED_HEADER_V8_READY_SEAL,
             Self::CellOffsetDirectV9 => FROZEN_PREPARED_HEADER_V9_READY_SEAL,
+            Self::StateOrdinalDirectU8V10 => FROZEN_PREPARED_HEADER_V10_READY_SEAL,
+            Self::StateOrdinalMappedU8V12 => FROZEN_PREPARED_HEADER_V12_READY_SEAL,
         }
     }
 
@@ -3094,11 +3160,23 @@ impl FrozenCompactRowsFormat {
             Self::CellOffsetV4 => FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V4,
             Self::StateOrdinalDirectV8 => FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V8,
             Self::CellOffsetDirectV9 => FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V9,
+            Self::StateOrdinalDirectU8V10 => {
+                FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V10
+            }
+            Self::StateOrdinalMappedU8V12 => {
+                FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V12
+            }
         }
     }
 
     const fn is_state_ordinal(self) -> bool {
-        matches!(self, Self::StateOrdinalV3 | Self::StateOrdinalDirectV8)
+        matches!(
+            self,
+            Self::StateOrdinalV3
+                | Self::StateOrdinalDirectV8
+                | Self::StateOrdinalDirectU8V10
+                | Self::StateOrdinalMappedU8V12
+        )
     }
 
     const fn is_cell_offset(self) -> bool {
@@ -3106,13 +3184,27 @@ impl FrozenCompactRowsFormat {
     }
 
     const fn is_direct_byte(self) -> bool {
-        matches!(self, Self::StateOrdinalDirectV8 | Self::CellOffsetDirectV9)
+        matches!(
+            self,
+            Self::StateOrdinalDirectV8
+                | Self::CellOffsetDirectV9
+                | Self::StateOrdinalDirectU8V10
+        )
+    }
+
+    const fn is_u8(self) -> bool {
+        matches!(
+            self,
+            Self::StateOrdinalDirectU8V10 | Self::StateOrdinalMappedU8V12
+        )
     }
 
     const fn direct_byte(self) -> Self {
         match self {
             Self::StateOrdinalV3 | Self::StateOrdinalDirectV8 => Self::StateOrdinalDirectV8,
             Self::CellOffsetV4 | Self::CellOffsetDirectV9 => Self::CellOffsetDirectV9,
+            Self::StateOrdinalDirectU8V10 => Self::StateOrdinalDirectU8V10,
+            Self::StateOrdinalMappedU8V12 => Self::StateOrdinalMappedU8V12,
         }
     }
 }
@@ -3288,6 +3380,16 @@ const _: () = {
     );
     assert!(FROZEN_PREPARED_HEADER_V9_BYTES == FROZEN_PREPARED_HEADER_V3_BYTES);
     assert!(
+        FROZEN_PREPARED_HEADER_V10_DYNAMIC_ROWS_OFFSET
+            == FROZEN_PREPARED_HEADER_V3_DYNAMIC_ROWS_OFFSET
+    );
+    assert!(FROZEN_PREPARED_HEADER_V10_BYTES == FROZEN_PREPARED_HEADER_V3_BYTES);
+    assert!(
+        FROZEN_PREPARED_HEADER_V12_DYNAMIC_ROWS_OFFSET
+            == FROZEN_PREPARED_HEADER_V3_DYNAMIC_ROWS_OFFSET
+    );
+    assert!(FROZEN_PREPARED_HEADER_V12_BYTES == FROZEN_PREPARED_HEADER_V3_BYTES);
+    assert!(
         FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V4
             != FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3
     );
@@ -3297,12 +3399,36 @@ const _: () = {
     assert!(FROZEN_PREPARED_HEADER_V9_READY_SEAL != FROZEN_PREPARED_HEADER_V3_READY_SEAL);
     assert!(FROZEN_PREPARED_HEADER_V9_READY_SEAL != FROZEN_PREPARED_HEADER_V4_READY_SEAL);
     assert!(FROZEN_PREPARED_HEADER_V9_READY_SEAL != FROZEN_PREPARED_HEADER_V8_READY_SEAL);
+    assert!(FROZEN_PREPARED_HEADER_V10_READY_SEAL != FROZEN_PREPARED_HEADER_V3_READY_SEAL);
+    assert!(FROZEN_PREPARED_HEADER_V10_READY_SEAL != FROZEN_PREPARED_HEADER_V4_READY_SEAL);
+    assert!(FROZEN_PREPARED_HEADER_V10_READY_SEAL != FROZEN_PREPARED_HEADER_V8_READY_SEAL);
+    assert!(FROZEN_PREPARED_HEADER_V10_READY_SEAL != FROZEN_PREPARED_HEADER_V9_READY_SEAL);
+    assert!(FROZEN_PREPARED_HEADER_V10_READY_SEAL != FROZEN_PREPARED_HEADER_V5_READY_SEAL);
+    assert!(FROZEN_PREPARED_HEADER_V10_READY_SEAL != FROZEN_PREPARED_HEADER_V6_READY_SEAL);
+    assert!(FROZEN_PREPARED_HEADER_V10_READY_SEAL != FROZEN_PREPARED_HEADER_V7_READY_SEAL);
+    assert!(FROZEN_PREPARED_HEADER_V12_READY_SEAL != FROZEN_PREPARED_HEADER_V3_READY_SEAL);
+    assert!(FROZEN_PREPARED_HEADER_V12_READY_SEAL != FROZEN_PREPARED_HEADER_V4_READY_SEAL);
+    assert!(FROZEN_PREPARED_HEADER_V12_READY_SEAL != FROZEN_PREPARED_HEADER_V8_READY_SEAL);
+    assert!(FROZEN_PREPARED_HEADER_V12_READY_SEAL != FROZEN_PREPARED_HEADER_V9_READY_SEAL);
+    assert!(FROZEN_PREPARED_HEADER_V12_READY_SEAL != FROZEN_PREPARED_HEADER_V10_READY_SEAL);
+    assert!(FROZEN_PREPARED_HEADER_V12_READY_SEAL != FROZEN_PREPARED_HEADER_V5_READY_SEAL);
+    assert!(FROZEN_PREPARED_HEADER_V12_READY_SEAL != FROZEN_PREPARED_HEADER_V6_READY_SEAL);
+    assert!(FROZEN_PREPARED_HEADER_V12_READY_SEAL != FROZEN_PREPARED_HEADER_V7_READY_SEAL);
     assert!(FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION != FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION);
     assert!(FROZEN_DYNAMIC_ROWS_V8_FORMAT_VERSION != FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION);
     assert!(FROZEN_DYNAMIC_ROWS_V8_FORMAT_VERSION != FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION);
     assert!(FROZEN_DYNAMIC_ROWS_V9_FORMAT_VERSION != FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION);
     assert!(FROZEN_DYNAMIC_ROWS_V9_FORMAT_VERSION != FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION);
     assert!(FROZEN_DYNAMIC_ROWS_V9_FORMAT_VERSION != FROZEN_DYNAMIC_ROWS_V8_FORMAT_VERSION);
+    assert!(FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION != FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION);
+    assert!(FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION != FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION);
+    assert!(FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION != FROZEN_DYNAMIC_ROWS_V8_FORMAT_VERSION);
+    assert!(FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION != FROZEN_DYNAMIC_ROWS_V9_FORMAT_VERSION);
+    assert!(FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION != FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION);
+    assert!(FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION != FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION);
+    assert!(FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION != FROZEN_DYNAMIC_ROWS_V8_FORMAT_VERSION);
+    assert!(FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION != FROZEN_DYNAMIC_ROWS_V9_FORMAT_VERSION);
+    assert!(FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION != FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION);
     assert!(
         (FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3
             | FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V4
@@ -3310,9 +3436,11 @@ const _: () = {
             | FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V6
             | FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V7
             | FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V8
-            | FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V9)
+            | FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V9
+            | FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V10
+            | FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V12)
             .count_ones()
-            == 7
+            == 9
     );
     assert!(
         FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V8
@@ -3333,6 +3461,18 @@ const _: () = {
     assert!(
         FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V9
             != FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V8
+    );
+    assert!(
+        FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V10
+            != FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V8
+    );
+    assert!(
+        FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V10
+            != FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V9
+    );
+    assert!(
+        FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V12
+            != FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V10
     );
     assert!(std::mem::offset_of!(FrozenPreparedHeaderV5, v1) == 0);
     assert!(FROZEN_PREPARED_HEADER_V5_DYNAMIC_ROWS_OFFSET == FROZEN_PREPARED_HEADER_V1_BYTES);
@@ -3373,6 +3513,8 @@ const _: () = {
     assert!(FROZEN_PREPARED_HEADER_V7_BYTES == 664);
     assert!(FROZEN_PREPARED_HEADER_V8_BYTES == 448);
     assert!(FROZEN_PREPARED_HEADER_V9_BYTES == 448);
+    assert!(FROZEN_PREPARED_HEADER_V10_BYTES == 448);
+    assert!(FROZEN_PREPARED_HEADER_V12_BYTES == 448);
 };
 
 impl FrozenPreparedHeaderV1 {
@@ -3502,6 +3644,14 @@ impl FrozenPreparedHeaderV3 {
             FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V9 => {
                 self.dynamic_rows_v3.format_version == FROZEN_DYNAMIC_ROWS_V9_FORMAT_VERSION
                     && self.dynamic_rows_v3.ready_seal == FROZEN_PREPARED_HEADER_V9_READY_SEAL
+            }
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V10 => {
+                self.dynamic_rows_v3.format_version == FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION
+                    && self.dynamic_rows_v3.ready_seal == FROZEN_PREPARED_HEADER_V10_READY_SEAL
+            }
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V12 => {
+                self.dynamic_rows_v3.format_version == FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION
+                    && self.dynamic_rows_v3.ready_seal == FROZEN_PREPARED_HEADER_V12_READY_SEAL
             }
             _ => false,
         }
@@ -3734,6 +3884,16 @@ impl FrozenPreparedHeaderV6 {
                 self.v1.header_bytes == FROZEN_PREPARED_HEADER_V9_BYTES
                     && rows.compact.format_version == FROZEN_DYNAMIC_ROWS_V9_FORMAT_VERSION
                     && rows.compact.ready_seal == FROZEN_PREPARED_HEADER_V9_READY_SEAL
+            }
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V10 => {
+                self.v1.header_bytes == FROZEN_PREPARED_HEADER_V10_BYTES
+                    && rows.compact.format_version == FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION
+                    && rows.compact.ready_seal == FROZEN_PREPARED_HEADER_V10_READY_SEAL
+            }
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V12 => {
+                self.v1.header_bytes == FROZEN_PREPARED_HEADER_V12_BYTES
+                    && rows.compact.format_version == FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION
+                    && rows.compact.ready_seal == FROZEN_PREPARED_HEADER_V12_READY_SEAL
             }
             _ => false,
         }
@@ -4013,7 +4173,7 @@ fn coalesce_frozen_compact_columns(
 /// Each byte selects the representative of its already-coalesced semantic
 /// class. Duplicate representatives are intentional: the resulting 256-cell
 /// row can index the input byte directly, while the identity map records the
-/// exact V8/V9 ownership invariant authenticated before publication.
+/// exact V8/V9/V10 ownership invariant authenticated before publication.
 fn frozen_compact_raw_byte_projection(
     projection: &FrozenCompactColumnProjection,
 ) -> Option<FrozenCompactColumnProjection> {
@@ -4087,6 +4247,75 @@ fn frozen_compact_raw_byte_is_admissible(
     expanded_bytes <= former_bytes && expanded_bytes <= max_packed_bytes
 }
 
+/// Decide whether an exact raw-byte projection can use V10's compact byte
+/// cells. V10 is deliberately a narrower encoding than V8: its low seven
+/// bits must contain every one-based destination-state ordinal. The complete
+/// byte table and inline identity map must also remain within both the former
+/// K0 authority and the caller's explicit packed-byte budget.
+fn frozen_compact_raw_byte_u8_is_admissible(
+    class_count: usize,
+    state_count: usize,
+    former_bytes: usize,
+    max_packed_bytes: usize,
+) -> bool {
+    if !(FROZEN_COMPACT_DIRECT_BYTE_MIN_CLASSES..=256).contains(&class_count)
+        || state_count == 0
+        || state_count > usize::from(DYNAMIC_NATIVE_ROWS_V10_NEXT_STATE_TOKEN_MASK)
+    {
+        return false;
+    }
+    let Some(expanded_bytes) = state_count
+        .checked_mul(256)
+        .and_then(|cells| cells.checked_add(256))
+    else {
+        return false;
+    };
+    expanded_bytes <= former_bytes && expanded_bytes <= max_packed_bytes
+}
+
+/// Decide whether the exact coalesced projection can use V12 byte cells.
+/// V12 keeps the published class map and pads each row to the next power of
+/// two so a destination ordinal can become a row address with one shift. Its
+/// separate byte owner must fit both inherited resource authorities.
+fn frozen_compact_mapped_u8_is_admissible(
+    class_count: usize,
+    state_count: usize,
+    former_bytes: usize,
+    max_packed_bytes: usize,
+) -> bool {
+    if class_count == 0
+        || class_count > 256
+        || state_count == 0
+        || state_count > usize::from(DYNAMIC_NATIVE_ROWS_V10_NEXT_STATE_TOKEN_MASK)
+    {
+        return false;
+    }
+    let Some(physical_cells) = class_count.checked_next_power_of_two() else {
+        return false;
+    };
+    let Some(packed_bytes) = state_count
+        .checked_mul(physical_cells)
+        .and_then(|cells| cells.checked_add(256))
+    else {
+        return false;
+    };
+    packed_bytes <= former_bytes && packed_bytes <= max_packed_bytes
+}
+
+fn encode_frozen_compact_u8_cell(semantic: u16) -> Option<u8> {
+    let token = semantic & DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK;
+    if token > u16::from(DYNAMIC_NATIVE_ROWS_V10_NEXT_STATE_TOKEN_MASK) {
+        return None;
+    }
+    let token = u8::try_from(token).ok()?;
+    let accept = if semantic & DYNAMIC_NATIVE_ROWS_V3_ACCEPT_MASK != 0 {
+        DYNAMIC_NATIVE_ROWS_V10_ACCEPT_MASK
+    } else {
+        0
+    };
+    Some(token | accept)
+}
+
 /// Promote a mapped projection when every raw-byte ownership proof succeeds;
 /// otherwise return the original projection and format unchanged. The mapped
 /// owner is therefore never lost merely because the optional expansion is not
@@ -4098,6 +4327,30 @@ fn promote_frozen_compact_raw_byte_projection(
     former_bytes: usize,
     max_packed_bytes: usize,
 ) -> (FrozenCompactColumnProjection, FrozenCompactRowsFormat) {
+    if frozen_compact_raw_byte_u8_is_admissible(
+        projection.class_count,
+        state_count,
+        former_bytes,
+        max_packed_bytes,
+    ) {
+        if let Some(raw_byte_projection) = frozen_compact_raw_byte_projection(&projection) {
+            return (
+                raw_byte_projection,
+                FrozenCompactRowsFormat::StateOrdinalDirectU8V10,
+            );
+        }
+    }
+    if frozen_compact_mapped_u8_is_admissible(
+        projection.class_count,
+        state_count,
+        former_bytes,
+        max_packed_bytes,
+    ) {
+        return (
+            projection,
+            FrozenCompactRowsFormat::StateOrdinalMappedU8V12,
+        );
+    }
     if frozen_compact_raw_byte_is_admissible(
         format,
         projection.class_count,
@@ -4236,9 +4489,25 @@ impl FrozenDynamicRowsStorageV3 {
             FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION => FrozenCompactRowsFormat::CellOffsetV4,
             FROZEN_DYNAMIC_ROWS_V8_FORMAT_VERSION => FrozenCompactRowsFormat::StateOrdinalDirectV8,
             FROZEN_DYNAMIC_ROWS_V9_FORMAT_VERSION => FrozenCompactRowsFormat::CellOffsetDirectV9,
+            FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION => {
+                FrozenCompactRowsFormat::StateOrdinalDirectU8V10
+            }
+            FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION => {
+                FrozenCompactRowsFormat::StateOrdinalMappedU8V12
+            }
             _ => return false,
         };
-        let physical_cells = if format.is_state_ordinal() {
+        let physical_cells = if format.is_u8() {
+            let Some(physical_cells) = 1_usize.checked_shl(rows.row_shift) else {
+                return false;
+            };
+            if rows.row_shift > 8
+                || class_count.checked_next_power_of_two() != Some(physical_cells)
+            {
+                return false;
+            }
+            physical_cells
+        } else if format.is_state_ordinal() {
             let Some(cell_shift) = rows.row_shift.checked_sub(1) else {
                 return false;
             };
@@ -4259,20 +4528,32 @@ impl FrozenDynamicRowsStorageV3 {
         let Some(live_cells) = state_count.checked_mul(physical_cells) else {
             return false;
         };
-        let token_extent_invalid = if format.is_state_ordinal() {
+        let token_extent_invalid = if format.is_u8() {
+            state_count > usize::from(DYNAMIC_NATIVE_ROWS_V10_NEXT_STATE_TOKEN_MASK)
+        } else if format.is_state_ordinal() {
             state_count > usize::from(DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK)
         } else {
             live_cells > usize::from(DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK)
         };
+        let owner_is_invalid = if format.is_u8() {
+            self.rows_u8.as_ref().is_none_or(|byte_rows| {
+                !self.rows.is_empty()
+                    || rows.rows_address != byte_rows.as_ptr().expose_provenance()
+                    || live_cells != byte_rows.len()
+            })
+        } else {
+            self.rows_u8.is_some()
+                || rows.rows_address != self.rows.as_ptr().expose_provenance()
+                || live_cells != self.rows.len()
+        };
         if self.program_instance != identity.instance
             || self.artifact_identity != identity.artifact
             || rows.ready_seal != 0
-            || rows.rows_address != self.rows.as_ptr().expose_provenance()
+            || owner_is_invalid
             || rows.cache_identity == 0
             || state_count == 0
             || class_count == 0
             || class_count > 256
-            || live_cells != self.rows.len()
             || token_extent_invalid
             // Compact native code treats row zero as the root capability.
             // Tightening the existing exact-format authentication keeps an
@@ -4303,28 +4584,48 @@ impl FrozenDynamicRowsStorageV3 {
             return false;
         }
 
-        for row in self.rows.chunks_exact(physical_cells) {
-            if row[class_count..]
-                .iter()
-                .any(|&cell| cell != DYNAMIC_NATIVE_ROWS_V3_DEAD_CELL)
-            {
+        if format.is_u8() {
+            let Some(byte_rows) = self.rows_u8.as_ref() else {
                 return false;
-            }
-            for &cell in &row[..class_count] {
-                let token = cell & DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK;
-                let valid = if format.is_state_ordinal() {
-                    token == 0 || usize::from(token) <= state_count
-                } else {
-                    token == 0
-                        || usize::from(token)
-                            .checked_sub(1)
-                            .is_some_and(|destination| {
-                                destination < live_cells
-                                    && destination.checked_rem(class_count) == Some(0)
-                            })
-                };
-                if !valid {
+            };
+            for row in byte_rows.chunks_exact(physical_cells) {
+                if row[class_count..]
+                    .iter()
+                    .any(|&cell| cell != DYNAMIC_NATIVE_ROWS_V10_DEAD_CELL)
+                {
                     return false;
+                }
+                for &cell in &row[..class_count] {
+                    let token = cell & DYNAMIC_NATIVE_ROWS_V10_NEXT_STATE_TOKEN_MASK;
+                    if token != 0 && usize::from(token) > state_count {
+                        return false;
+                    }
+                }
+            }
+        } else {
+            for row in self.rows.chunks_exact(physical_cells) {
+                if row[class_count..]
+                    .iter()
+                    .any(|&cell| cell != DYNAMIC_NATIVE_ROWS_V3_DEAD_CELL)
+                {
+                    return false;
+                }
+                for &cell in &row[..class_count] {
+                    let token = cell & DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK;
+                    let valid = if format.is_state_ordinal() {
+                        token == 0 || usize::from(token) <= state_count
+                    } else {
+                        token == 0
+                            || usize::from(token)
+                                .checked_sub(1)
+                                .is_some_and(|destination| {
+                                    destination < live_cells
+                                        && destination.checked_rem(class_count) == Some(0)
+                                })
+                    };
+                    if !valid {
+                        return false;
+                    }
                 }
             }
         }
@@ -4378,7 +4679,9 @@ impl FrozenDynamicRowsStorageV3 {
             }
             FrozenCompactRowsFormat::CellOffsetV4 => class_count,
             FrozenCompactRowsFormat::StateOrdinalDirectV8
-            | FrozenCompactRowsFormat::CellOffsetDirectV9 => return false,
+            | FrozenCompactRowsFormat::CellOffsetDirectV9
+            | FrozenCompactRowsFormat::StateOrdinalDirectU8V10
+            | FrozenCompactRowsFormat::StateOrdinalMappedU8V12 => return false,
         };
         let Some(live_cells) = state_count.checked_mul(physical_cells) else {
             return false;
@@ -4390,7 +4693,9 @@ impl FrozenDynamicRowsStorageV3 {
             FrozenCompactRowsFormat::StateOrdinalV3 => state_count,
             FrozenCompactRowsFormat::CellOffsetV4 => live_cells,
             FrozenCompactRowsFormat::StateOrdinalDirectV8
-            | FrozenCompactRowsFormat::CellOffsetDirectV9 => return false,
+            | FrozenCompactRowsFormat::CellOffsetDirectV9
+            | FrozenCompactRowsFormat::StateOrdinalDirectU8V10
+            | FrozenCompactRowsFormat::StateOrdinalMappedU8V12 => return false,
         };
         if rows.compact != expected_compact
             || rows.reserved != 0
@@ -4437,7 +4742,9 @@ impl FrozenDynamicRowsStorageV3 {
                     key
                 }
                 FrozenCompactRowsFormat::StateOrdinalDirectV8
-                | FrozenCompactRowsFormat::CellOffsetDirectV9 => return false,
+                | FrozenCompactRowsFormat::CellOffsetDirectV9
+                | FrozenCompactRowsFormat::StateOrdinalDirectU8V10
+                | FrozenCompactRowsFormat::StateOrdinalMappedU8V12 => return false,
             };
             let expected_index = slot
                 .checked_add(1)
@@ -4469,7 +4776,9 @@ impl FrozenDynamicRowsStorageV3 {
                     }
                 }
                 FrozenCompactRowsFormat::StateOrdinalDirectV8
-                | FrozenCompactRowsFormat::CellOffsetDirectV9 => return false,
+                | FrozenCompactRowsFormat::CellOffsetDirectV9
+                | FrozenCompactRowsFormat::StateOrdinalDirectU8V10
+                | FrozenCompactRowsFormat::StateOrdinalMappedU8V12 => return false,
             };
             for byte in u8::MIN..=u8::MAX {
                 let word = usize::from(byte >> 6);
@@ -4502,7 +4811,9 @@ impl FrozenDynamicRowsStorageV3 {
                                 state.checked_mul(class_count) == Some(index)
                             }
                             FrozenCompactRowsFormat::StateOrdinalDirectV8
-                            | FrozenCompactRowsFormat::CellOffsetDirectV9 => false,
+                            | FrozenCompactRowsFormat::CellOffsetDirectV9
+                            | FrozenCompactRowsFormat::StateOrdinalDirectU8V10
+                            | FrozenCompactRowsFormat::StateOrdinalMappedU8V12 => false,
                         }
                     })
                 })
@@ -4518,6 +4829,12 @@ impl FrozenDynamicRowsStorageV3 {
 
     fn descriptor(&self) -> FrozenDynamicRowsV3 {
         self.descriptor
+    }
+
+    fn live_cells(&self) -> usize {
+        self.rows_u8
+            .as_ref()
+            .map_or_else(|| self.rows.len(), |rows| rows.len())
     }
 
     fn descriptor_v6(&self) -> Option<FrozenDynamicRowsV6> {
@@ -7082,10 +7399,10 @@ impl CompiledProgram {
             .then_some(storage)
     }
 
-    /// Build a pointer-stable immutable `u16` copy of one complete K0 root.
-    /// Cell-offset V4 is preferred whenever the complete live-cell extent fits
-    /// its 15-bit token. Larger tables retain the padded state-ordinal V3 ABI.
-    /// The class map is retained inline for later V1-prefix publication.
+    /// Build a pointer-stable immutable compact copy of one complete K0 root.
+    /// V10/V12 use byte cells whenever all state ordinals and inherited byte
+    /// budgets fit; otherwise V4 is preferred when cell offsets fit and larger
+    /// tables retain V3. The class map is retained inline for publication.
     #[doc(hidden)]
     #[must_use]
     #[allow(
@@ -7209,9 +7526,10 @@ impl CompiledProgram {
         // Copy only independently reauthenticated, nonroot K0 loop proofs.
         // Perform this arbitration against the original K0 row geometry
         // before an optional raw-byte expansion changes the compact stride.
-        // V5 is more specific than V6/V7, V6/V7 are more profitable than
-        // V8/V9 for rows with loop evidence, and direct promotion remains the
-        // general fallback when no loop extension is retained.
+        // V5 is more specific than V6/V7, and V6/V7 are more profitable than
+        // V10/V12/V9/V8 for rows with loop evidence. General compact
+        // promotion remains the fallback when neither specialized proof is
+        // retained.
         let mut loop_candidates = [None; 4];
         let mut loop_candidate_count = 0usize;
         for plan in direct.learned_loop_plans() {
@@ -7282,7 +7600,7 @@ impl CompiledProgram {
             && mapped_bytes
                 .checked_add(loop_payload_bytes)
                 .is_some_and(|bytes| bytes <= max_packed_bytes);
-        if !retain_loop_extension {
+        if !unary_v5_eligible && !retain_loop_extension {
             (columns, format) = promote_frozen_compact_raw_byte_projection(
                 columns,
                 format,
@@ -7293,21 +7611,32 @@ impl CompiledProgram {
         }
 
         let class_count = columns.class_count;
-        let physical_cells = if format.is_state_ordinal() {
+        let physical_cells = if format.is_u8() {
+            class_count.checked_next_power_of_two()?
+        } else if format.is_state_ordinal() {
             class_count.checked_next_power_of_two()?
         } else {
             class_count
         };
         let compact_cells = state_count.checked_mul(physical_cells)?;
         let packed_bytes = compact_cells
-            .checked_mul(core::mem::size_of::<u16>())?
+            .checked_mul(if format.is_u8() {
+                core::mem::size_of::<u8>()
+            } else {
+                core::mem::size_of::<u16>()
+            })?
             .checked_add(256)?;
         if packed_bytes > former_bytes || packed_bytes > max_packed_bytes {
             return None;
         }
 
-        let mut owned_rows = Vec::new();
-        owned_rows.try_reserve_exact(compact_cells).ok()?;
+        let mut owned_rows = Vec::<u16>::new();
+        let mut owned_rows_u8 = format.is_u8().then(Vec::<u8>::new);
+        if let Some(rows) = owned_rows_u8.as_mut() {
+            rows.try_reserve_exact(compact_cells).ok()?;
+        } else {
+            owned_rows.try_reserve_exact(compact_cells).ok()?;
+        }
         for canonical_state in 0..state_count {
             // Canonicalize the graph before either compact representation is
             // encoded. Both V3 ordinals and V4 cell offsets therefore share
@@ -7325,6 +7654,12 @@ impl CompiledProgram {
                     state_count,
                     source_initial_state,
                 )?;
+                if format.is_u8() {
+                    owned_rows_u8
+                        .as_mut()?
+                        .push(encode_frozen_compact_u8_cell(semantic)?);
+                    continue;
+                }
                 let destination = semantic & DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK;
                 let compact_token = if format.is_state_ordinal() {
                     destination
@@ -7340,17 +7675,30 @@ impl CompiledProgram {
                 );
             }
             if physical_cells != class_count {
-                let row_end = owned_rows
-                    .len()
-                    .checked_sub(class_count)?
-                    .checked_add(physical_cells)?;
-                owned_rows.resize(row_end, DYNAMIC_NATIVE_ROWS_V3_DEAD_CELL);
+                if let Some(rows) = owned_rows_u8.as_mut() {
+                    let row_end = rows
+                        .len()
+                        .checked_sub(class_count)?
+                        .checked_add(physical_cells)?;
+                    rows.resize(row_end, DYNAMIC_NATIVE_ROWS_V10_DEAD_CELL);
+                } else {
+                    let row_end = owned_rows
+                        .len()
+                        .checked_sub(class_count)?
+                        .checked_add(physical_cells)?;
+                    owned_rows.resize(row_end, DYNAMIC_NATIVE_ROWS_V3_DEAD_CELL);
+                }
             }
         }
-        if owned_rows.len() != compact_cells {
+        if owned_rows_u8
+            .as_ref()
+            .map_or_else(|| owned_rows.len(), Vec::len)
+            != compact_cells
+        {
             return None;
         }
         let rows = owned_rows.into_boxed_slice();
+        let rows_u8 = owned_rows_u8.map(Vec::into_boxed_slice);
 
         let unary_exists_first_accept_step =
             if dynamic_view.output == OutputContract::Exists && class_count == 1 {
@@ -7369,14 +7717,21 @@ impl CompiledProgram {
         // following or racing an overlay. Publish the normalized table with
         // no loop owner rather than rejecting otherwise eligible programs.
         let learned_loop_states = [u32::MAX; 4];
-        let row_shift = if format.is_state_ordinal() {
+        let row_shift = if format.is_u8() {
+            physical_cells.trailing_zeros()
+        } else if format.is_state_ordinal() {
             physical_cells.trailing_zeros().checked_add(1)?
         } else {
             0
         };
+        let rows_address = rows_u8
+            .as_ref()
+            .map_or_else(|| rows.as_ptr().expose_provenance(), |rows| {
+                rows.as_ptr().expose_provenance()
+            });
         let descriptor = FrozenDynamicRowsV3 {
             ready_seal: 0,
-            rows_address: rows.as_ptr().expose_provenance(),
+            rows_address,
             cache_identity: full.cache_identity(),
             state_count: u32::try_from(state_count).ok()?,
             class_count: u32::try_from(class_count).ok()?,
@@ -7392,7 +7747,9 @@ impl CompiledProgram {
                 FrozenCompactRowsFormat::StateOrdinalV3 => state_count,
                 FrozenCompactRowsFormat::CellOffsetV4 => compact_cells,
                 FrozenCompactRowsFormat::StateOrdinalDirectV8
-                | FrozenCompactRowsFormat::CellOffsetDirectV9 => return None,
+                | FrozenCompactRowsFormat::CellOffsetDirectV9
+                | FrozenCompactRowsFormat::StateOrdinalDirectU8V10
+                | FrozenCompactRowsFormat::StateOrdinalMappedU8V12 => return None,
             }
         } else {
             0
@@ -7417,7 +7774,9 @@ impl CompiledProgram {
                         candidate.canonical_state.checked_mul(class_count)?
                     }
                     FrozenCompactRowsFormat::StateOrdinalDirectV8
-                    | FrozenCompactRowsFormat::CellOffsetDirectV9 => return None,
+                    | FrozenCompactRowsFormat::CellOffsetDirectV9
+                    | FrozenCompactRowsFormat::StateOrdinalDirectU8V10
+                    | FrozenCompactRowsFormat::StateOrdinalMappedU8V12 => return None,
                 };
                 let plan_index = u8::try_from(loop_scanners.len().checked_add(1)?).ok()?;
                 let entry = loop_index.get_mut(key)?;
@@ -7439,7 +7798,9 @@ impl CompiledProgram {
                 }
                 FrozenCompactRowsFormat::CellOffsetV4 => FROZEN_DYNAMIC_ROWS_V7_FORMAT_VERSION,
                 FrozenCompactRowsFormat::StateOrdinalDirectV8
-                | FrozenCompactRowsFormat::CellOffsetDirectV9 => {
+                | FrozenCompactRowsFormat::CellOffsetDirectV9
+                | FrozenCompactRowsFormat::StateOrdinalDirectU8V10
+                | FrozenCompactRowsFormat::StateOrdinalMappedU8V12 => {
                     unreachable!("loop retention excludes direct-byte formats")
                 }
             };
@@ -7475,6 +7836,7 @@ impl CompiledProgram {
             program_instance: self.identity.instance,
             artifact_identity: self.identity.artifact,
             rows,
+            rows_u8,
             class_map,
             descriptor,
             unary_exists_first_accept_step,
@@ -7488,8 +7850,8 @@ impl CompiledProgram {
     }
 
     /// Publish either the existing retained V1 projection or an additive
-    /// compact V3/V4/V8/V9 sidecar. Retained static rows always win, and V2 remains
-    /// independently constructible for older prepared owners.
+    /// compact V3/V4/V8/V9/V10/V12 sidecar. Retained static rows always win,
+    /// and V2 remains independently constructible for older prepared owners.
     #[doc(hidden)]
     #[must_use]
     pub fn compiler_private_frozen_prepared_header_v3(
@@ -7518,9 +7880,20 @@ impl CompiledProgram {
             FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION => FrozenCompactRowsFormat::CellOffsetV4,
             FROZEN_DYNAMIC_ROWS_V8_FORMAT_VERSION => FrozenCompactRowsFormat::StateOrdinalDirectV8,
             FROZEN_DYNAMIC_ROWS_V9_FORMAT_VERSION => FrozenCompactRowsFormat::CellOffsetDirectV9,
+            FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION => {
+                FrozenCompactRowsFormat::StateOrdinalDirectU8V10
+            }
+            FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION => {
+                FrozenCompactRowsFormat::StateOrdinalMappedU8V12
+            }
             _ => return header,
         };
-        let physical_cells = if format.is_state_ordinal() {
+        let physical_cells = if format.is_u8() {
+            let Some(physical_cells) = 1_usize.checked_shl(rows.row_shift) else {
+                return header;
+            };
+            physical_cells
+        } else if format.is_state_ordinal() {
             let Some(cell_shift) = rows.row_shift.checked_sub(1) else {
                 return header;
             };
@@ -7552,16 +7925,29 @@ impl CompiledProgram {
             FrozenCompactRowsFormat::CellOffsetV4 => FROZEN_PREPARED_HEADER_V4_BYTES,
             FrozenCompactRowsFormat::StateOrdinalDirectV8 => FROZEN_PREPARED_HEADER_V8_BYTES,
             FrozenCompactRowsFormat::CellOffsetDirectV9 => FROZEN_PREPARED_HEADER_V9_BYTES,
+            FrozenCompactRowsFormat::StateOrdinalDirectU8V10 => {
+                FROZEN_PREPARED_HEADER_V10_BYTES
+            }
+            FrozenCompactRowsFormat::StateOrdinalMappedU8V12 => {
+                FROZEN_PREPARED_HEADER_V12_BYTES
+            }
         };
         header.v1.forward_rows_address = rows.rows_address;
-        header.v1.forward_live_cells = storage.rows.len();
+        header.v1.forward_live_cells = storage.live_cells();
         header.v1.cache_identity = rows.cache_identity;
         header.v1.row_stride = row_stride;
         header.v1.forward_initial_row = 0;
-        header.v1.unfilled_cell = u32::from(DYNAMIC_NATIVE_ROWS_V3_DEAD_CELL);
-        header.v1.accept_mask = u32::from(DYNAMIC_NATIVE_ROWS_V3_ACCEPT_MASK);
-        header.v1.next_row_token_mask =
-            u32::from(DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK);
+        if format.is_u8() {
+            header.v1.unfilled_cell = u32::from(DYNAMIC_NATIVE_ROWS_V10_DEAD_CELL);
+            header.v1.accept_mask = u32::from(DYNAMIC_NATIVE_ROWS_V10_ACCEPT_MASK);
+            header.v1.next_row_token_mask =
+                u32::from(DYNAMIC_NATIVE_ROWS_V10_NEXT_STATE_TOKEN_MASK);
+        } else {
+            header.v1.unfilled_cell = u32::from(DYNAMIC_NATIVE_ROWS_V3_DEAD_CELL);
+            header.v1.accept_mask = u32::from(DYNAMIC_NATIVE_ROWS_V3_ACCEPT_MASK);
+            header.v1.next_row_token_mask =
+                u32::from(DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK);
+        }
         header.v1.class_map = storage.class_map;
         header.v1.active_seal = FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL;
         // This is the final publication write. Every pointer, bound, mirror,
@@ -7672,8 +8058,8 @@ impl CompiledProgram {
 
     /// Publish the maximum compact-header envelope. Retained V1 rows remain
     /// authoritative, unary V5 wins when its exact proof exists, mapped loop
-    /// V6/V7 wins over direct-byte V8/V9, and every declined promotion keeps
-    /// the already authenticated lower-generation publication intact.
+    /// V6/V7 wins over V10/V12/V9/V8, and every declined promotion keeps the
+    /// already authenticated lower-generation publication intact.
     #[doc(hidden)]
     #[must_use]
     pub fn compiler_private_frozen_prepared_header_v6(
@@ -21107,6 +21493,7 @@ mod tests {
                 program_instance: compiled.identity.instance,
                 artifact_identity: compiled.identity.artifact,
                 rows,
+                rows_u8: None,
                 class_map,
                 descriptor,
                 unary_exists_first_accept_step: None,
@@ -21258,6 +21645,7 @@ mod tests {
             program_instance: compiled.identity.instance,
             artifact_identity: compiled.identity.artifact,
             rows,
+            rows_u8: None,
             class_map,
             descriptor,
             unary_exists_first_accept_step: None,

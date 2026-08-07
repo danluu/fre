@@ -35,6 +35,9 @@ use crate::{
         DYNAMIC_NATIVE_ROWS_V1_ACCEPT_MASK, DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK,
         DYNAMIC_NATIVE_ROWS_V1_UNFILLED_CELL, DYNAMIC_NATIVE_ROWS_V3_ACCEPT_MASK,
         DYNAMIC_NATIVE_ROWS_V3_DEAD_CELL, DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK,
+        DYNAMIC_NATIVE_ROWS_V10_ACCEPT_MASK, DYNAMIC_NATIVE_ROWS_V10_DEAD_CELL,
+        DYNAMIC_NATIVE_ROWS_V10_NEXT_STATE_TOKEN_MASK, DYNAMIC_NATIVE_ROWS_V12_ACCEPT_MASK,
+        DYNAMIC_NATIVE_ROWS_V12_DEAD_CELL, DYNAMIC_NATIVE_ROWS_V12_NEXT_STATE_TOKEN_MASK,
         DynamicNativeRowsV1, FROZEN_COMPACT_DIRECT_BYTE_MIN_CLASSES,
         FROZEN_COMPACT_LOOP_PLAN_V1_BYTES,
         FROZEN_COMPACT_LOOP_PLAN_V1_CANONICAL_STATE_OFFSET,
@@ -59,6 +62,7 @@ use crate::{
         FROZEN_DYNAMIC_ROWS_V6_LOOP_PLAN_COUNT_OFFSET, FROZEN_DYNAMIC_ROWS_V6_LOOP_PLANS_OFFSET,
         FROZEN_DYNAMIC_ROWS_V6_RESERVED_OFFSET, FROZEN_DYNAMIC_ROWS_V7_FORMAT_VERSION,
         FROZEN_DYNAMIC_ROWS_V8_FORMAT_VERSION, FROZEN_DYNAMIC_ROWS_V9_FORMAT_VERSION,
+        FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION, FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION,
         FROZEN_PREPARED_HEADER_V1_ABI_VERSION, FROZEN_PREPARED_HEADER_V1_ABI_VERSION_OFFSET,
         FROZEN_PREPARED_HEADER_V1_ACCEPT_MASK_OFFSET, FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL,
         FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL_OFFSET,
@@ -73,6 +77,8 @@ use crate::{
         FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V7,
         FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V8,
         FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V9,
+        FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V10,
+        FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V12,
         FROZEN_PREPARED_HEADER_V1_FORWARD_INITIAL_ROW_OFFSET,
         FROZEN_PREPARED_HEADER_V1_FORWARD_LIVE_CELLS_OFFSET,
         FROZEN_PREPARED_HEADER_V1_FORWARD_ROWS_ADDRESS_OFFSET,
@@ -96,7 +102,10 @@ use crate::{
         FROZEN_PREPARED_HEADER_V8_BYTES,
         FROZEN_PREPARED_HEADER_V8_DYNAMIC_ROWS_OFFSET, FROZEN_PREPARED_HEADER_V8_READY_SEAL,
         FROZEN_PREPARED_HEADER_V9_BYTES, FROZEN_PREPARED_HEADER_V9_DYNAMIC_ROWS_OFFSET,
-        FROZEN_PREPARED_HEADER_V9_READY_SEAL, MAX_ANCHORED_PREFIX_BYTES, NativeContextProgramView,
+        FROZEN_PREPARED_HEADER_V9_READY_SEAL, FROZEN_PREPARED_HEADER_V10_BYTES,
+        FROZEN_PREPARED_HEADER_V10_DYNAMIC_ROWS_OFFSET, FROZEN_PREPARED_HEADER_V10_READY_SEAL,
+        FROZEN_PREPARED_HEADER_V12_BYTES, FROZEN_PREPARED_HEADER_V12_DYNAMIC_ROWS_OFFSET,
+        FROZEN_PREPARED_HEADER_V12_READY_SEAL, MAX_ANCHORED_PREFIX_BYTES, NativeContextProgramView,
         NativeDynamicRootRequirement, NativeDynamicRowsProgramView, NativePartialProgramView,
         NativeProgramView, NativeRetainedPrefixRequirement, NativeRetainedSuffixRequirement,
         OutputContract, PARTIAL_DFA_MIN_INPUT_BYTES,
@@ -12916,7 +12925,7 @@ fn lower_x86_64_slow_partial_wrapper(
 }
 
 /// Per-call authentication policy for one already-published compact
-/// V3/V4/V8/V9 projection.
+/// V3 through V12 compact projection selected by its exact generation tag.
 ///
 /// Production exclusive handles use `ActiveCapability`: construction fully
 /// validates the private immutable owner before publishing both seals, and
@@ -12943,6 +12952,8 @@ enum FrozenCompactNativeFormat {
     CellOffsetV7,
     StateOrdinalDirectV8,
     CellOffsetDirectV9,
+    StateOrdinalDirectU8V10,
+    StateOrdinalMappedU8V12,
 }
 
 impl FrozenCompactNativeFormat {
@@ -12955,6 +12966,8 @@ impl FrozenCompactNativeFormat {
             Self::CellOffsetV7 => FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V7,
             Self::StateOrdinalDirectV8 => FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V8,
             Self::CellOffsetDirectV9 => FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V9,
+            Self::StateOrdinalDirectU8V10 => FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V10,
+            Self::StateOrdinalMappedU8V12 => FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V12,
         }
     }
 
@@ -12967,6 +12980,8 @@ impl FrozenCompactNativeFormat {
             Self::CellOffsetV7 => FROZEN_PREPARED_HEADER_V7_BYTES,
             Self::StateOrdinalDirectV8 => FROZEN_PREPARED_HEADER_V8_BYTES,
             Self::CellOffsetDirectV9 => FROZEN_PREPARED_HEADER_V9_BYTES,
+            Self::StateOrdinalDirectU8V10 => FROZEN_PREPARED_HEADER_V10_BYTES,
+            Self::StateOrdinalMappedU8V12 => FROZEN_PREPARED_HEADER_V12_BYTES,
         }
     }
 
@@ -12979,6 +12994,8 @@ impl FrozenCompactNativeFormat {
             Self::CellOffsetV7 => FROZEN_PREPARED_HEADER_V7_DYNAMIC_ROWS_OFFSET,
             Self::StateOrdinalDirectV8 => FROZEN_PREPARED_HEADER_V8_DYNAMIC_ROWS_OFFSET,
             Self::CellOffsetDirectV9 => FROZEN_PREPARED_HEADER_V9_DYNAMIC_ROWS_OFFSET,
+            Self::StateOrdinalDirectU8V10 => FROZEN_PREPARED_HEADER_V10_DYNAMIC_ROWS_OFFSET,
+            Self::StateOrdinalMappedU8V12 => FROZEN_PREPARED_HEADER_V12_DYNAMIC_ROWS_OFFSET,
         }
     }
 
@@ -12991,6 +13008,8 @@ impl FrozenCompactNativeFormat {
             Self::CellOffsetV7 => FROZEN_PREPARED_HEADER_V7_READY_SEAL,
             Self::StateOrdinalDirectV8 => FROZEN_PREPARED_HEADER_V8_READY_SEAL,
             Self::CellOffsetDirectV9 => FROZEN_PREPARED_HEADER_V9_READY_SEAL,
+            Self::StateOrdinalDirectU8V10 => FROZEN_PREPARED_HEADER_V10_READY_SEAL,
+            Self::StateOrdinalMappedU8V12 => FROZEN_PREPARED_HEADER_V12_READY_SEAL,
         }
     }
 
@@ -13003,13 +13022,19 @@ impl FrozenCompactNativeFormat {
             Self::CellOffsetV7 => FROZEN_DYNAMIC_ROWS_V7_FORMAT_VERSION,
             Self::StateOrdinalDirectV8 => FROZEN_DYNAMIC_ROWS_V8_FORMAT_VERSION,
             Self::CellOffsetDirectV9 => FROZEN_DYNAMIC_ROWS_V9_FORMAT_VERSION,
+            Self::StateOrdinalDirectU8V10 => FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION,
+            Self::StateOrdinalMappedU8V12 => FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION,
         }
     }
 
     const fn is_state_ordinal(self) -> bool {
         matches!(
             self,
-            Self::StateOrdinalV3 | Self::StateOrdinalV6 | Self::StateOrdinalDirectV8
+            Self::StateOrdinalV3
+                | Self::StateOrdinalV6
+                | Self::StateOrdinalDirectV8
+                | Self::StateOrdinalDirectU8V10
+                | Self::StateOrdinalMappedU8V12
         )
     }
 
@@ -13024,7 +13049,19 @@ impl FrozenCompactNativeFormat {
     }
 
     const fn is_direct_byte(self) -> bool {
-        matches!(self, Self::StateOrdinalDirectV8 | Self::CellOffsetDirectV9)
+        matches!(
+            self,
+            Self::StateOrdinalDirectV8
+                | Self::CellOffsetDirectV9
+                | Self::StateOrdinalDirectU8V10
+        )
+    }
+
+    const fn is_u8(self) -> bool {
+        matches!(
+            self,
+            Self::StateOrdinalDirectU8V10 | Self::StateOrdinalMappedU8V12
+        )
     }
 
     const fn has_loop_plans(self) -> bool {
@@ -13311,8 +13348,10 @@ fn x86_emit_frozen_compact_entry(
         ])?;
         assembler.instruction(&[0x4d, 0x85, 0xd2])?;
         assembler.branch(&[0x0f, 0x84], call_preflight)?;
-        assembler.instruction(&[0x41, 0xf6, 0xc2, 0x01])?;
-        branch_failed(assembler)?;
+        if !format.is_u8() {
+            assembler.instruction(&[0x41, 0xf6, 0xc2, 0x01])?;
+            branch_failed(assembler)?;
+        }
     }
 
     // Cache identity is a semantic generation token rather than row geometry;
@@ -13338,7 +13377,10 @@ fn x86_emit_frozen_compact_entry(
         ])?;
         assembler.instruction(&[0x85, 0xc0])?;
         assembler.branch(&[0x0f, 0x84], call_preflight)?;
-        if format.is_state_ordinal() {
+        if format.is_u8() {
+            assembler.instruction(&[0x83, 0xf8, 0x7f])?;
+            assembler.branch(&[0x0f, 0x87], call_preflight)?;
+        } else if format.is_state_ordinal() {
             assembler.instruction(&[0x3d, 0xff, 0x7f, 0x00, 0x00])?;
             assembler.branch(&[0x0f, 0x87], call_preflight)?;
         }
@@ -13356,7 +13398,27 @@ fn x86_emit_frozen_compact_entry(
             assembler.instruction(&[0x41, 0x81, 0xf8, 0x00, 0x01, 0x00, 0x00])?;
             branch_failed(assembler)?;
         }
-        if format.is_state_ordinal() {
+        if format.is_u8() {
+            assembler.instruction(&[
+                0x41,
+                0x8b,
+                0x4b,
+                tail_disp(
+                    FROZEN_DYNAMIC_ROWS_V3_ROW_SHIFT_OFFSET,
+                    "x86 compact-u8 row shift",
+                )?,
+            ])?;
+            assembler.instruction(&[0x83, 0xf9, 0x08])?;
+            assembler.branch(&[0x0f, 0x87], call_preflight)?;
+            assembler.instruction(&[0xba, 0x01, 0x00, 0x00, 0x00])?;
+            assembler.instruction(&[0x48, 0xd3, 0xe2])?;
+            assembler.instruction(&[0x44, 0x39, 0xc2])?;
+            assembler.branch(&[0x0f, 0x82], call_preflight)?;
+            assembler.instruction(&[0x41, 0x89, 0xd2])?;
+            assembler.instruction(&[0x41, 0xd1, 0xea])?;
+            assembler.instruction(&[0x45, 0x39, 0xd0])?;
+            assembler.branch(&[0x0f, 0x86], call_preflight)?;
+        } else if format.is_state_ordinal() {
             assembler.instruction(&[
                 0x41,
                 0x8b,
@@ -13415,8 +13477,8 @@ fn x86_emit_frozen_compact_entry(
             )?,
         ])?;
         branch_failed(assembler)?;
-        // Setup canonicalizes both compact encodings before selecting V3 or
-        // V4. The full verifier authenticates both mirrors exactly; the
+        // Setup canonicalizes every compact encoding before format selection.
+        // The full verifier authenticates both mirrors exactly; the
         // production active-capability guard relies on the same immutable
         // owner proof without redoing this geometry on every invocation.
         assembler.instruction(&[
@@ -13441,21 +13503,38 @@ fn x86_emit_frozen_compact_entry(
         ])?;
         branch_failed(assembler)?;
 
+        let (dead_cell, accept_mask, next_state_mask) = match format {
+            FrozenCompactNativeFormat::StateOrdinalDirectU8V10 => (
+                u32::from(DYNAMIC_NATIVE_ROWS_V10_DEAD_CELL),
+                u32::from(DYNAMIC_NATIVE_ROWS_V10_ACCEPT_MASK),
+                u32::from(DYNAMIC_NATIVE_ROWS_V10_NEXT_STATE_TOKEN_MASK),
+            ),
+            FrozenCompactNativeFormat::StateOrdinalMappedU8V12 => (
+                u32::from(DYNAMIC_NATIVE_ROWS_V12_DEAD_CELL),
+                u32::from(DYNAMIC_NATIVE_ROWS_V12_ACCEPT_MASK),
+                u32::from(DYNAMIC_NATIVE_ROWS_V12_NEXT_STATE_TOKEN_MASK),
+            ),
+            _ => (
+                u32::from(DYNAMIC_NATIVE_ROWS_V3_DEAD_CELL),
+                u32::from(DYNAMIC_NATIVE_ROWS_V3_ACCEPT_MASK),
+                u32::from(DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK),
+            ),
+        };
         for (field, expected, context) in [
             (
                 FROZEN_PREPARED_HEADER_V1_UNFILLED_CELL_OFFSET,
-                u32::from(DYNAMIC_NATIVE_ROWS_V3_DEAD_CELL),
-                "x86 V3 dead cell",
+                dead_cell,
+                "x86 compact dead cell",
             ),
             (
                 FROZEN_PREPARED_HEADER_V1_ACCEPT_MASK_OFFSET,
-                u32::from(DYNAMIC_NATIVE_ROWS_V3_ACCEPT_MASK),
-                "x86 V3 accept mask",
+                accept_mask,
+                "x86 compact accept mask",
             ),
             (
                 FROZEN_PREPARED_HEADER_V1_NEXT_ROW_TOKEN_MASK_OFFSET,
-                u32::from(DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK),
-                "x86 V3 next-state mask",
+                next_state_mask,
+                "x86 compact next-state mask",
             ),
         ] {
             let mut compare = vec![0x81, 0x7f, header_disp(field, context)?];
@@ -13465,8 +13544,9 @@ fn x86_emit_frozen_compact_entry(
         }
     }
 
-    // Compact V3/V4/V8/V9 normalize complete immutable rows by suppressing mutable-K0
-    // learned-loop ownership. Authenticate that normalization exactly: the
+    // Compact non-loop formats normalize complete immutable rows by
+    // suppressing mutable-K0 learned-loop ownership. Authenticate that
+    // normalization exactly: the
     // scalar loop below still executes every closed DFA row, including rows
     // that had learned-loop accelerator metadata in the mutable projection.
     assembler.instruction(&[
@@ -13712,6 +13792,40 @@ fn x86_emit_frozen_compact_v9_entry(
         try_older,
         call_preflight,
         v9_enter,
+        guard_mode,
+    )
+}
+
+fn x86_emit_frozen_compact_v10_entry(
+    assembler: &mut X86Assembler,
+    try_older: X86Label,
+    call_preflight: X86Label,
+    v10_enter: X86Label,
+    guard_mode: FrozenCompactGuardMode,
+) -> Result<(), ObjectError> {
+    x86_emit_frozen_compact_entry(
+        assembler,
+        FrozenCompactNativeFormat::StateOrdinalDirectU8V10,
+        try_older,
+        call_preflight,
+        v10_enter,
+        guard_mode,
+    )
+}
+
+fn x86_emit_frozen_compact_v12_entry(
+    assembler: &mut X86Assembler,
+    try_older: X86Label,
+    call_preflight: X86Label,
+    v12_enter: X86Label,
+    guard_mode: FrozenCompactGuardMode,
+) -> Result<(), ObjectError> {
+    x86_emit_frozen_compact_entry(
+        assembler,
+        FrozenCompactNativeFormat::StateOrdinalMappedU8V12,
+        try_older,
+        call_preflight,
+        v12_enter,
         guard_mode,
     )
 }
@@ -14103,6 +14217,8 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     const ROOT_SCANNER_COMPACT_V7: u8 = 5;
     const ROOT_SCANNER_COMPACT_V8_DIRECT_BYTE: u8 = 6;
     const ROOT_SCANNER_COMPACT_V9_DIRECT_BYTE: u8 = 7;
+    const ROOT_SCANNER_COMPACT_V10_DIRECT_U8: u8 = 8;
+    const ROOT_SCANNER_COMPACT_V12_MAPPED_U8: u8 = 9;
     let tracks_root_scanner_hits = allow_direct_hole_continuation && root_plan.is_some();
     // Every compact entry starts with a nonempty window. Scanner-free entries
     // inherit that proof from the public boundary. Rooted entries inherit it
@@ -14191,6 +14307,8 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     let preflight_enter = assembler.label()?;
     let try_v7 = assembler.label()?;
     let try_v6 = assembler.label()?;
+    let try_v10 = assembler.label()?;
+    let try_v12 = assembler.label()?;
     let try_v9 = assembler.label()?;
     let try_v8 = assembler.label()?;
     let try_v4 = assembler.label()?;
@@ -14218,6 +14336,15 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     let v9_enter = assembler.label()?;
     let v9_scan = assembler.label()?;
     let v9_table_scan = assembler.label()?;
+    let v10_enter = assembler.label()?;
+    let v10_scan = assembler.label()?;
+    let v10_table_scan = assembler.label()?;
+    let v12_enter = assembler.label()?;
+    let v12_dispatch = assembler.label()?;
+    let mut v12_shift_entries = [0_usize; 9];
+    for entry in &mut v12_shift_entries {
+        *entry = assembler.label()?;
+    }
     let v3_enter = assembler.label()?;
     let v3_dispatch = assembler.label()?;
     let v8_enter = assembler.label()?;
@@ -14331,13 +14458,39 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     assembler.bind(try_v6)?;
     x86_emit_frozen_compact_v6_entry(
         &mut assembler,
-        try_v9,
+        if direct_byte_formats_possible {
+            try_v10
+        } else {
+            try_v12
+        },
         call_preflight,
         v6_enter,
         FrozenCompactGuardMode::ActiveCapability,
     )?;
-    assembler.bind(try_v9)?;
     if direct_byte_formats_possible {
+        assembler.bind(try_v10)?;
+        x86_emit_frozen_compact_v10_entry(
+            &mut assembler,
+            try_v12,
+            call_preflight,
+            v10_enter,
+            FrozenCompactGuardMode::ActiveCapability,
+        )?;
+    }
+    assembler.bind(try_v12)?;
+    x86_emit_frozen_compact_v12_entry(
+        &mut assembler,
+        if direct_byte_formats_possible {
+            try_v9
+        } else {
+            try_v4
+        },
+        call_preflight,
+        v12_enter,
+        FrozenCompactGuardMode::ActiveCapability,
+    )?;
+    if direct_byte_formats_possible {
+        assembler.bind(try_v9)?;
         x86_emit_frozen_compact_v9_entry(
             &mut assembler,
             try_v8,
@@ -14353,8 +14506,8 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
             v8_enter,
             FrozenCompactGuardMode::ActiveCapability,
         )?;
-        assembler.bind(try_v4)?;
     }
+    assembler.bind(try_v4)?;
     x86_emit_frozen_compact_v4_entry(
         &mut assembler,
         try_v3,
@@ -14473,6 +14626,97 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
                 &[0xe9],
                 native_complete.unwrap_or(native_no_match),
             )?;
+            Ok(())
+        };
+
+    // V10 and V12 share the exact byte-cell decoder and state-ordinal update.
+    // Their table bodies differ only in whether a class-map load precedes the
+    // cell load and whether the authenticated row shift is fixed or dispatched.
+    let emit_u8_state_ordinal_transition_tail =
+        |assembler: &mut X86Assembler,
+         row_shift: u8,
+         backedge: X86Label|
+         -> Result<(), ObjectError> {
+            assembler.instruction(&[0x48, 0xff, 0xc2])?;
+            if output == OutputContract::Exists {
+                assembler.instruction(&[0x45, 0x84, 0xd2])?;
+                assembler.branch(&[0x0f, 0x88], native_match)?;
+                assembler.branch(
+                    &[0x0f, 0x84],
+                    native_complete.unwrap_or(native_no_match),
+                )?;
+            } else {
+                assembler.instruction(&[0x41, 0xf6, 0xc2, 0x80])?;
+                let not_accepting = assembler.label()?;
+                assembler.branch(&[0x0f, 0x84], not_accepting)?;
+                assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x60])?;
+                assembler.bind(not_accepting)?;
+                assembler.instruction(&[0x41, 0x83, 0xe2, 0x7f])?;
+                assembler.branch(
+                    &[0x0f, 0x84],
+                    native_complete.unwrap_or(native_no_match),
+                )?;
+            }
+            assembler.instruction(&[0x41, 0xff, 0xca])?;
+            if let Some(root_vector) = root_vector {
+                let non_root = assembler.label()?;
+                assembler.instruction(&[0x45, 0x85, 0xd2])?;
+                assembler.branch(&[0x0f, 0x85], non_root)?;
+                if output != OutputContract::Exists {
+                    assembler.instruction(&[0x48, 0x83, 0x7c, 0x24, 0x60, 0])?;
+                    assembler.branch(&[0x0f, 0x85], non_root)?;
+                }
+                assembler.branch(&[0xe9], root_vector)?;
+                assembler.bind(non_root)?;
+            }
+            if row_shift != 0 {
+                assembler.instruction(&[0x49, 0xc1, 0xe2, row_shift])?;
+            }
+            assembler.instruction(&[0x4e, 0x8d, 0x04, 0x16])?;
+            assembler.instruction(&[0x48, 0x39, 0xca])?;
+            assembler.branch(&[0x0f, 0x82], backedge)?;
+            assembler.branch(&[0xe9], native_complete.unwrap_or(native_no_match))?;
+            Ok(())
+        };
+
+    // V10 and V12 share one byte-cell decoder. V12 adds a class-map lookup
+    // before it and dispatches the authenticated power-of-two row shift.
+    let emit_u8_state_ordinal_transition_tail =
+        |assembler: &mut Aarch64Assembler,
+         row_shift: u8,
+         backedge: Aarch64Label|
+         -> Result<(), ObjectError> {
+            if !scanner_free_exists_pointer_cursor {
+                assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
+            }
+            if output == OutputContract::Exists {
+                assembler.branch_bit_set_w(8, 7, native_match)?;
+                assembler.branch_zero_w(8, native_complete.unwrap_or(native_no_match))?;
+                assembler.instruction(aarch64_sub_w_imm(6, 8, 1)?)?;
+            } else {
+                let not_accepting = assembler.label()?;
+                assembler.branch_bit_clear_w(8, 7, not_accepting)?;
+                assembler.instruction(aarch64_store_x(2, 31, 80)?)?;
+                assembler.bind(not_accepting)?;
+                assembler.instruction(aarch64_and_low_w(6, 8, 7)?)?;
+                assembler.branch_zero_w(6, native_complete.unwrap_or(native_no_match))?;
+                assembler.instruction(aarch64_sub_w_imm(6, 6, 1)?)?;
+            }
+            if let Some(root_dispatch) = root_dispatch {
+                let non_root = assembler.label()?;
+                assembler.branch_nonzero_w(6, non_root)?;
+                if output != OutputContract::Exists {
+                    assembler.instruction(aarch64_load_x_imm(12, 31, 80)?)?;
+                    assembler.instruction(aarch64_cmp_x_imm(12, 0)?)?;
+                    assembler.branch_cond(AARCH64_NE, non_root)?;
+                }
+                assembler.branch(root_dispatch)?;
+                assembler.bind(non_root)?;
+            }
+            assembler.instruction(aarch64_add_x_lsl(11, 15, 6, row_shift)?)?;
+            assembler.instruction(aarch64_cmp_x(2, 3)?)?;
+            assembler.branch_cond(AARCH64_LO, backedge)?;
+            assembler.branch(native_complete.unwrap_or(native_no_match))?;
             Ok(())
         };
 
@@ -15088,6 +15332,134 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
         emit_v4_transition_tail(&mut assembler, v9_scan)?;
     }
 
+    if direct_byte_formats_possible {
+        assembler.bind(v10_enter)?;
+        // V10 is an exact raw-byte table with one byte per cell. The private
+        // owner proof authenticates its identity map, seven-bit state extent,
+        // and fixed 256-byte rows before this entry can become active.
+        assembler.instruction(&[
+            0x49,
+            0x8b,
+            0x73,
+            u8::try_from(FROZEN_DYNAMIC_ROWS_V3_ROWS_ADDRESS_OFFSET)
+                .map_err(|_| ObjectError::ArithmeticOverflow("x86 V10 rows address"))?,
+        ])?;
+        assembler.instruction(&[0x48, 0x85, 0xf6])?;
+        assembler.branch(&[0x0f, 0x84], framed_fallback)?;
+        assembler.instruction(&[0x49, 0x89, 0xf0])?; // canonical row zero
+        if root_setup.is_some() {
+            assembler.instruction(&[
+                0x48,
+                0xc7,
+                0x44,
+                0x24,
+                ROOT_SCANNER_REPRESENTATION_OFFSET,
+                ROOT_SCANNER_COMPACT_V10_DIRECT_U8,
+                0,
+                0,
+                0,
+            ])?;
+            assembler.instruction(&[0x4c, 0x89, 0x44, 0x24, 0x50])?;
+        }
+        assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x18])?;
+        assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x40])?;
+        assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x48])?;
+        if let Some(root_setup) = root_setup {
+            assembler.branch(&[0xe9], root_setup)?;
+        } else if output != OutputContract::Exists {
+            assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x60, 0, 0, 0, 0])?;
+        }
+
+        assembler.bind(v10_scan)?;
+        if let Some(root_vector) = root_vector {
+            let non_root = assembler.label()?;
+            assembler.instruction(&[0x4c, 0x3b, 0x44, 0x24, 0x50])?;
+            assembler.branch(&[0x0f, 0x85], non_root)?;
+            if output != OutputContract::Exists {
+                assembler.instruction(&[0x48, 0x83, 0x7c, 0x24, 0x60, 0])?;
+                assembler.branch(&[0x0f, 0x85], non_root)?;
+            }
+            assembler.branch(&[0xe9], root_vector)?;
+            assembler.bind(non_root)?;
+        }
+
+        assembler.bind(v10_table_scan)?;
+        assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
+        assembler.instruction(&[0x47, 0x0f, 0xb6, 0x14, 0x10])?;
+        emit_u8_state_ordinal_transition_tail(&mut assembler, 8, v10_scan)?;
+    }
+
+    assembler.bind(v12_enter)?;
+    assembler.instruction(&[
+        0x49,
+        0x8b,
+        0x73,
+        u8::try_from(FROZEN_DYNAMIC_ROWS_V3_ROWS_ADDRESS_OFFSET)
+            .map_err(|_| ObjectError::ArithmeticOverflow("x86 V12 rows address"))?,
+    ])?;
+    assembler.instruction(&[0x48, 0x85, 0xf6])?;
+    assembler.branch(&[0x0f, 0x84], framed_fallback)?;
+    let class_map_offset = i32::try_from(FROZEN_PREPARED_HEADER_V1_CLASS_MAP_OFFSET)
+        .map_err(|_| ObjectError::ArithmeticOverflow("x86 V12 inline class map"))?;
+    let mut inline_class_map = vec![0x4c, 0x8d, 0x8f];
+    inline_class_map.extend_from_slice(&class_map_offset.to_le_bytes());
+    assembler.instruction(&inline_class_map)?;
+    assembler.instruction(&[
+        0x41,
+        0x8b,
+        0x43,
+        u8::try_from(FROZEN_DYNAMIC_ROWS_V3_ROW_SHIFT_OFFSET)
+            .map_err(|_| ObjectError::ArithmeticOverflow("x86 V12 row shift"))?,
+    ])?;
+    if root_setup.is_some() {
+        assembler.instruction(&[
+            0x48,
+            0xc7,
+            0x44,
+            0x24,
+            ROOT_SCANNER_REPRESENTATION_OFFSET,
+            ROOT_SCANNER_COMPACT_V12_MAPPED_U8,
+            0,
+            0,
+            0,
+        ])?;
+        assembler.instruction(&[0x49, 0x89, 0xf0])?;
+        assembler.instruction(&[0x4c, 0x89, 0x44, 0x24, 0x50])?;
+    }
+    assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x18])?;
+    assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x40])?;
+    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x48])?;
+    if let Some(root_setup) = root_setup {
+        assembler.branch(&[0xe9], root_setup)?;
+    } else if output != OutputContract::Exists {
+        assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x60, 0, 0, 0, 0])?;
+    }
+
+    assembler.bind(v12_dispatch)?;
+    for (shift, &entry) in v12_shift_entries.iter().enumerate() {
+        let shift = u8::try_from(shift)
+            .map_err(|_| ObjectError::ArithmeticOverflow("x86 V12 row shift dispatch"))?;
+        assembler.instruction(&[0x83, 0xf8, shift])?;
+        if shift == 8 {
+            assembler.branch(&[0xe9], entry)?;
+        } else {
+            assembler.branch(&[0x0f, 0x84], entry)?;
+        }
+    }
+
+    for (shift, &entry) in v12_shift_entries.iter().enumerate() {
+        let shift = u8::try_from(shift)
+            .map_err(|_| ObjectError::ArithmeticOverflow("x86 V12 immediate row shift"))?;
+        let v12_scan = assembler.label()?;
+        assembler.bind(entry)?;
+        assembler.instruction(&[0x49, 0x89, 0xf0])?;
+        assembler.bind(v12_scan)?;
+        assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
+        assembler.instruction(&[0x47, 0x0f, 0xb6, 0x14, 0x11])?;
+        assembler.instruction(&[0x47, 0x0f, 0xb6, 0x14, 0x10])?;
+        emit_u8_state_ordinal_transition_tail(&mut assembler, shift, v12_scan)?;
+    }
+
     assembler.bind(v3_enter)?;
     if root_plan.is_some() {
         // Freeze the authenticated representation for this invocation. Root
@@ -15537,6 +15909,10 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     if let Some(root_candidate) = root_candidate {
         let v7_candidate = assembler.label()?;
         let v6_candidate = assembler.label()?;
+        let v12_candidate = assembler.label()?;
+        let v10_candidate = direct_byte_formats_possible
+            .then(|| assembler.label())
+            .transpose()?;
         let v9_candidate = direct_byte_formats_possible
             .then(|| assembler.label())
             .transpose()?;
@@ -15552,6 +15928,17 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
         assembler.branch(&[0x0f, 0x84], v7_candidate)?;
         assembler.instruction(&[0x48, 0x83, 0xf8, ROOT_SCANNER_COMPACT_V6])?;
         assembler.branch(&[0x0f, 0x84], v6_candidate)?;
+        assembler.instruction(&[0x48, 0x83, 0xf8, ROOT_SCANNER_COMPACT_V12_MAPPED_U8])?;
+        assembler.branch(&[0x0f, 0x84], v12_candidate)?;
+        if let Some(v10_candidate) = v10_candidate {
+            assembler.instruction(&[
+                0x48,
+                0x83,
+                0xf8,
+                ROOT_SCANNER_COMPACT_V10_DIRECT_U8,
+            ])?;
+            assembler.branch(&[0x0f, 0x84], v10_candidate)?;
+        }
         if let Some(v9_candidate) = v9_candidate {
             assembler.instruction(&[0x48, 0x83, 0xf8, ROOT_SCANNER_COMPACT_V9_DIRECT_BYTE])?;
             assembler.branch(&[0x0f, 0x84], v9_candidate)?;
@@ -15616,6 +16003,42 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
                 .map_err(|_| ObjectError::ArithmeticOverflow("x86 V6 candidate shift"))?,
         ])?;
         assembler.branch(&[0xe9], v6_dispatch)?;
+
+        assembler.bind(v12_candidate)?;
+        assembler.instruction(&[
+            0x49,
+            0x8b,
+            0x73,
+            u8::try_from(FROZEN_DYNAMIC_ROWS_V3_ROWS_ADDRESS_OFFSET)
+                .map_err(|_| ObjectError::ArithmeticOverflow("x86 V12 candidate rows"))?,
+        ])?;
+        assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, 0x10])?;
+        let class_map_offset = i32::try_from(FROZEN_PREPARED_HEADER_V1_CLASS_MAP_OFFSET)
+            .map_err(|_| ObjectError::ArithmeticOverflow("x86 V12 candidate class map"))?;
+        let mut inline_class_map = vec![0x4c, 0x8d, 0x88];
+        inline_class_map.extend_from_slice(&class_map_offset.to_le_bytes());
+        assembler.instruction(&inline_class_map)?;
+        assembler.instruction(&[
+            0x41,
+            0x8b,
+            0x43,
+            u8::try_from(FROZEN_DYNAMIC_ROWS_V3_ROW_SHIFT_OFFSET)
+                .map_err(|_| ObjectError::ArithmeticOverflow("x86 V12 candidate shift"))?,
+        ])?;
+        assembler.branch(&[0xe9], v12_dispatch)?;
+
+        if let Some(v10_candidate) = v10_candidate {
+            assembler.bind(v10_candidate)?;
+            assembler.instruction(&[
+                0x49,
+                0x8b,
+                0x73,
+                u8::try_from(FROZEN_DYNAMIC_ROWS_V3_ROWS_ADDRESS_OFFSET)
+                    .map_err(|_| ObjectError::ArithmeticOverflow("x86 V10 candidate rows"))?,
+            ])?;
+            assembler.instruction(&[0x49, 0x89, 0xf0])?;
+            assembler.branch(&[0xe9], v10_table_scan)?;
+        }
 
         if let Some(v9_candidate) = v9_candidate {
             assembler.bind(v9_candidate)?;
@@ -22518,9 +22941,11 @@ fn aarch64_emit_frozen_compact_entry(
         )?)?;
         assembler.instruction(aarch64_cmp_x_imm(8, 0)?)?;
         assembler.branch_cond(AARCH64_EQ, call_preflight)?;
-        assembler.instruction(aarch64_and_low_x(9, 8, 1)?)?;
-        assembler.instruction(aarch64_cmp_x_imm(9, 0)?)?;
-        assembler.branch_cond(AARCH64_NE, call_preflight)?;
+        if !format.is_u8() {
+            assembler.instruction(aarch64_and_low_x(9, 8, 1)?)?;
+            assembler.instruction(aarch64_cmp_x_imm(9, 0)?)?;
+            assembler.branch_cond(AARCH64_NE, call_preflight)?;
+        }
     }
 
     // The cache identity is a semantic generation token, not row geometry.
@@ -22543,7 +22968,10 @@ fn aarch64_emit_frozen_compact_entry(
             offset(format.state_count_offset(), "AArch64 V3 states")?,
         )?)?;
         assembler.branch_zero_w(10, call_preflight)?;
-        if format.is_state_ordinal() {
+        if format.is_u8() {
+            assembler.instruction(aarch64_cmp_w_imm(10, 127)?)?;
+            assembler.branch_cond(AARCH64_HI, call_preflight)?;
+        } else if format.is_state_ordinal() {
             aarch64_load_u32_constant(assembler, 8, 0x7fff)?;
             assembler.instruction(aarch64_cmp_w(10, 8)?)?;
             assembler.branch_cond(AARCH64_HI, call_preflight)?;
@@ -22568,7 +22996,18 @@ fn aarch64_emit_frozen_compact_entry(
                 "AArch64 compact row shift",
             )?,
         )?)?;
-        if format.is_state_ordinal() {
+        if format.is_u8() {
+            assembler.instruction(aarch64_cmp_w_imm(12, 8)?)?;
+            assembler.branch_cond(AARCH64_HI, call_preflight)?;
+            assembler.instruction(aarch64_movz_x(9, 1, 0)?)?;
+            assembler.instruction(aarch64_lslv_x(9, 9, 12)?)?;
+            assembler.instruction(aarch64_cmp_x(9, 11)?)?;
+            assembler.branch_cond(AARCH64_LO, call_preflight)?;
+            assembler.instruction(aarch64_lsr_x_imm(7, 9, 1)?)?;
+            assembler.instruction(aarch64_cmp_x(11, 7)?)?;
+            assembler.branch_cond(AARCH64_LS, call_preflight)?;
+            assembler.instruction(aarch64_mov_x(8, 12)?)?;
+        } else if format.is_state_ordinal() {
             assembler.instruction(aarch64_cmp_w_imm(12, 1)?)?;
             assembler.branch_cond(AARCH64_LO, call_preflight)?;
             assembler.instruction(aarch64_cmp_w_imm(12, 9)?)?;
@@ -22620,7 +23059,7 @@ fn aarch64_emit_frozen_compact_entry(
         )?)?;
         assembler.instruction(aarch64_cmp_x(7, 12)?)?;
         assembler.branch_cond(AARCH64_NE, call_preflight)?;
-        // Setup canonicalizes both compact encodings before format selection.
+        // Setup canonicalizes every compact encoding before format selection.
         // Full verification authenticates the exact zero mirrors, while the
         // production active capability retains its setup-proven fast guard.
         assembler.instruction(aarch64_load_w_imm(
@@ -22642,21 +23081,38 @@ fn aarch64_emit_frozen_compact_entry(
         )?)?;
         assembler.branch_nonzero_w(7, call_preflight)?;
 
+        let (dead_cell, accept_mask, next_state_mask) = match format {
+            FrozenCompactNativeFormat::StateOrdinalDirectU8V10 => (
+                u32::from(DYNAMIC_NATIVE_ROWS_V10_DEAD_CELL),
+                u32::from(DYNAMIC_NATIVE_ROWS_V10_ACCEPT_MASK),
+                u32::from(DYNAMIC_NATIVE_ROWS_V10_NEXT_STATE_TOKEN_MASK),
+            ),
+            FrozenCompactNativeFormat::StateOrdinalMappedU8V12 => (
+                u32::from(DYNAMIC_NATIVE_ROWS_V12_DEAD_CELL),
+                u32::from(DYNAMIC_NATIVE_ROWS_V12_ACCEPT_MASK),
+                u32::from(DYNAMIC_NATIVE_ROWS_V12_NEXT_STATE_TOKEN_MASK),
+            ),
+            _ => (
+                u32::from(DYNAMIC_NATIVE_ROWS_V3_DEAD_CELL),
+                u32::from(DYNAMIC_NATIVE_ROWS_V3_ACCEPT_MASK),
+                u32::from(DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK),
+            ),
+        };
         for (field, expected, context) in [
             (
                 FROZEN_PREPARED_HEADER_V1_UNFILLED_CELL_OFFSET,
-                u32::from(DYNAMIC_NATIVE_ROWS_V3_DEAD_CELL),
-                "AArch64 V3 dead cell",
+                dead_cell,
+                "AArch64 compact dead cell",
             ),
             (
                 FROZEN_PREPARED_HEADER_V1_ACCEPT_MASK_OFFSET,
-                u32::from(DYNAMIC_NATIVE_ROWS_V3_ACCEPT_MASK),
-                "AArch64 V3 accept mask",
+                accept_mask,
+                "AArch64 compact accept mask",
             ),
             (
                 FROZEN_PREPARED_HEADER_V1_NEXT_ROW_TOKEN_MASK_OFFSET,
-                u32::from(DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK),
-                "AArch64 V3 next-state mask",
+                next_state_mask,
+                "AArch64 compact next-state mask",
             ),
         ] {
             assembler.instruction(aarch64_load_w_imm(7, 0, offset(field, context)?)?)?;
@@ -22666,7 +23122,7 @@ fn aarch64_emit_frozen_compact_entry(
         }
     }
 
-    // The compact V3/V4/V8/V9 owner normalizes complete immutable rows by suppressing mutable
+    // The compact V3/V4/V8/V9/V10/V12 owner normalizes complete immutable rows by suppressing mutable
     // learned-loop ownership. Exact zero/MAX metadata proves that this direct
     // loop may scalar-step all closed states without racing an overlay.
     assembler.instruction(aarch64_load_w_imm(
@@ -22894,6 +23350,40 @@ fn aarch64_emit_frozen_compact_v9_entry(
         try_older,
         call_preflight,
         v9_enter,
+        guard_mode,
+    )
+}
+
+fn aarch64_emit_frozen_compact_v10_entry(
+    assembler: &mut Aarch64Assembler,
+    try_older: Aarch64Label,
+    call_preflight: Aarch64Label,
+    v10_enter: Aarch64Label,
+    guard_mode: FrozenCompactGuardMode,
+) -> Result<(), ObjectError> {
+    aarch64_emit_frozen_compact_entry(
+        assembler,
+        FrozenCompactNativeFormat::StateOrdinalDirectU8V10,
+        try_older,
+        call_preflight,
+        v10_enter,
+        guard_mode,
+    )
+}
+
+fn aarch64_emit_frozen_compact_v12_entry(
+    assembler: &mut Aarch64Assembler,
+    try_older: Aarch64Label,
+    call_preflight: Aarch64Label,
+    v12_enter: Aarch64Label,
+    guard_mode: FrozenCompactGuardMode,
+) -> Result<(), ObjectError> {
+    aarch64_emit_frozen_compact_entry(
+        assembler,
+        FrozenCompactNativeFormat::StateOrdinalMappedU8V12,
+        try_older,
+        call_preflight,
+        v12_enter,
         guard_mode,
     )
 }
@@ -23393,6 +23883,8 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     const ROOT_SCANNER_COMPACT_V7: u16 = 5;
     const ROOT_SCANNER_COMPACT_V8_DIRECT_BYTE: u16 = 6;
     const ROOT_SCANNER_COMPACT_V9_DIRECT_BYTE: u16 = 7;
+    const ROOT_SCANNER_COMPACT_V10_DIRECT_U8: u16 = 8;
+    const ROOT_SCANNER_COMPACT_V12_MAPPED_U8: u16 = 9;
     let tracks_root_scanner_hits = allow_direct_hole_continuation && root_plan.is_some();
     // Every compact entry starts with a nonempty window. Scanner-free entries
     // inherit that proof from the public boundary. Rooted entries inherit it
@@ -23439,6 +23931,8 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     let preflight_enter = assembler.label()?;
     let try_v7 = assembler.label()?;
     let try_v6 = assembler.label()?;
+    let try_v10 = assembler.label()?;
+    let try_v12 = assembler.label()?;
     let try_v9 = assembler.label()?;
     let try_v8 = assembler.label()?;
     let try_v4 = assembler.label()?;
@@ -23457,6 +23951,15 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     let v9_enter = assembler.label()?;
     let v9_scan = assembler.label()?;
     let v9_table_scan = assembler.label()?;
+    let v10_enter = assembler.label()?;
+    let v10_scan = assembler.label()?;
+    let v10_table_scan = assembler.label()?;
+    let v12_enter = assembler.label()?;
+    let v12_dispatch = assembler.label()?;
+    let mut v12_shift_entries = [0_usize; 9];
+    for entry in &mut v12_shift_entries {
+        *entry = assembler.label()?;
+    }
     let v3_enter = assembler.label()?;
     let v3_dispatch = assembler.label()?;
     let v8_enter = assembler.label()?;
@@ -23585,13 +24088,39 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     assembler.bind(try_v6)?;
     aarch64_emit_frozen_compact_v6_entry(
         &mut assembler,
-        try_v9,
+        if direct_byte_formats_possible {
+            try_v10
+        } else {
+            try_v12
+        },
         call_preflight,
         v6_enter,
         FrozenCompactGuardMode::ActiveCapability,
     )?;
-    assembler.bind(try_v9)?;
     if direct_byte_formats_possible {
+        assembler.bind(try_v10)?;
+        aarch64_emit_frozen_compact_v10_entry(
+            &mut assembler,
+            try_v12,
+            call_preflight,
+            v10_enter,
+            FrozenCompactGuardMode::ActiveCapability,
+        )?;
+    }
+    assembler.bind(try_v12)?;
+    aarch64_emit_frozen_compact_v12_entry(
+        &mut assembler,
+        if direct_byte_formats_possible {
+            try_v9
+        } else {
+            try_v4
+        },
+        call_preflight,
+        v12_enter,
+        FrozenCompactGuardMode::ActiveCapability,
+    )?;
+    if direct_byte_formats_possible {
+        assembler.bind(try_v9)?;
         aarch64_emit_frozen_compact_v9_entry(
             &mut assembler,
             try_v8,
@@ -23607,8 +24136,8 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
             v8_enter,
             FrozenCompactGuardMode::ActiveCapability,
         )?;
-        assembler.bind(try_v4)?;
     }
+    assembler.bind(try_v4)?;
     aarch64_emit_frozen_compact_v4_entry(
         &mut assembler,
         try_v3,
@@ -24300,6 +24829,125 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
         emit_v4_transition_tail(&mut assembler, v9_scan)?;
     }
 
+    if direct_byte_formats_possible {
+        assembler.bind(v10_enter)?;
+        assembler.instruction(aarch64_load_x_imm(
+            15,
+            13,
+            u16::try_from(FROZEN_DYNAMIC_ROWS_V3_ROWS_ADDRESS_OFFSET)
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 V10 rows address"))?,
+        )?)?;
+        assembler.instruction(aarch64_cmp_x_imm(15, 0)?)?;
+        assembler.branch_cond(AARCH64_EQ, framed_fallback)?;
+        assembler.instruction(aarch64_mov_x(11, 15)?)?;
+        if root_plan.is_some() {
+            assembler.instruction(aarch64_movz_x(8, ROOT_SCANNER_COMPACT_V10_DIRECT_U8, 0)?)?;
+            assembler.instruction(aarch64_store_x(8, 31, ROOT_SCANNER_REPRESENTATION_OFFSET)?)?;
+        }
+        assembler.instruction(aarch64_load_x_imm(0, 31, 8)?)?;
+        assembler.instruction(aarch64_load_x_imm(2, 31, 48)?)?;
+        assembler.instruction(aarch64_load_x_imm(3, 31, 56)?)?;
+        if scanner_free_exists_pointer_cursor {
+            assembler.instruction(aarch64_add_x_reg(2, 0, 2)?)?;
+            assembler.instruction(aarch64_add_x_reg(3, 0, 3)?)?;
+        }
+        if let Some(root_setup) = root_setup {
+            assembler.branch(root_setup)?;
+        } else if output != OutputContract::Exists {
+            assembler.instruction(aarch64_store_x(31, 31, 80)?)?;
+        }
+
+        assembler.bind(v10_scan)?;
+        if let Some(root_dispatch) = root_dispatch {
+            let non_root = assembler.label()?;
+            assembler.instruction(aarch64_cmp_x(11, 15)?)?;
+            assembler.branch_cond(AARCH64_NE, non_root)?;
+            if output != OutputContract::Exists {
+                assembler.instruction(aarch64_load_x_imm(12, 31, 80)?)?;
+                assembler.instruction(aarch64_cmp_x_imm(12, 0)?)?;
+                assembler.branch_cond(AARCH64_NE, non_root)?;
+            }
+            assembler.branch(root_dispatch)?;
+            assembler.bind(non_root)?;
+        }
+
+        assembler.bind(v10_table_scan)?;
+        if scanner_free_exists_pointer_cursor {
+            assembler.instruction(aarch64_load_byte_post_imm(6, 2, 1)?)?;
+        } else {
+            assembler.instruction(aarch64_load_byte_reg(6, 0, 2)?)?;
+        }
+        assembler.instruction(aarch64_load_byte_reg(8, 11, 6)?)?;
+        emit_u8_state_ordinal_transition_tail(&mut assembler, 8, v10_scan)?;
+    }
+
+    assembler.bind(v12_enter)?;
+    assembler.instruction(aarch64_load_x_imm(
+        15,
+        13,
+        u16::try_from(FROZEN_DYNAMIC_ROWS_V3_ROWS_ADDRESS_OFFSET)
+            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 V12 rows address"))?,
+    )?)?;
+    assembler.instruction(aarch64_cmp_x_imm(15, 0)?)?;
+    assembler.branch_cond(AARCH64_EQ, framed_fallback)?;
+    assembler.instruction(aarch64_add_x_imm(
+        14,
+        0,
+        u16::try_from(FROZEN_PREPARED_HEADER_V1_CLASS_MAP_OFFSET)
+            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 V12 inline class map"))?,
+    )?)?;
+    assembler.instruction(aarch64_load_w_imm(
+        12,
+        13,
+        u16::try_from(FROZEN_DYNAMIC_ROWS_V3_ROW_SHIFT_OFFSET)
+            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 V12 row shift"))?,
+    )?)?;
+    if root_plan.is_some() {
+        assembler.instruction(aarch64_movz_x(8, ROOT_SCANNER_COMPACT_V12_MAPPED_U8, 0)?)?;
+        assembler.instruction(aarch64_store_x(8, 31, ROOT_SCANNER_REPRESENTATION_OFFSET)?)?;
+    }
+    assembler.instruction(aarch64_load_x_imm(0, 31, 8)?)?;
+    assembler.instruction(aarch64_load_x_imm(2, 31, 48)?)?;
+    assembler.instruction(aarch64_load_x_imm(3, 31, 56)?)?;
+    if scanner_free_exists_pointer_cursor {
+        assembler.instruction(aarch64_add_x_reg(2, 0, 2)?)?;
+        assembler.instruction(aarch64_add_x_reg(3, 0, 3)?)?;
+    }
+    if let Some(root_setup) = root_setup {
+        assembler.branch(root_setup)?;
+    } else if output != OutputContract::Exists {
+        assembler.instruction(aarch64_store_x(31, 31, 80)?)?;
+    }
+
+    assembler.bind(v12_dispatch)?;
+    for (shift, &entry) in v12_shift_entries.iter().enumerate() {
+        let shift = u16::try_from(shift)
+            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 V12 row shift dispatch"))?;
+        assembler.instruction(aarch64_cmp_w_imm(12, shift)?)?;
+        if shift == 8 {
+            assembler.branch(entry)?;
+        } else {
+            assembler.branch_cond(AARCH64_EQ, entry)?;
+        }
+    }
+
+    for (shift, &entry) in v12_shift_entries.iter().enumerate() {
+        let shift = u8::try_from(shift)
+            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 V12 immediate row shift"))?;
+        let v12_scan = assembler.label()?;
+        assembler.bind(entry)?;
+        assembler.instruction(aarch64_mov_x(11, 15)?)?;
+        assembler.bind(v12_scan)?;
+        if scanner_free_exists_pointer_cursor {
+            assembler.instruction(aarch64_load_byte_post_imm(6, 2, 1)?)?;
+        } else {
+            assembler.instruction(aarch64_load_byte_reg(6, 0, 2)?)?;
+        }
+        assembler.instruction(aarch64_load_byte_reg(6, 14, 6)?)?;
+        assembler.instruction(aarch64_load_byte_reg(8, 11, 6)?)?;
+        emit_u8_state_ordinal_transition_tail(&mut assembler, shift, v12_scan)?;
+    }
+
     assembler.bind(v3_enter)?;
     if root_plan.is_some() {
         assembler.instruction(aarch64_movz_x(8, ROOT_SCANNER_COMPACT_V3, 0)?)?;
@@ -24752,6 +25400,10 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     if let Some(root_candidate) = root_candidate {
         let v7_candidate = assembler.label()?;
         let v6_candidate = assembler.label()?;
+        let v12_candidate = assembler.label()?;
+        let v10_candidate = direct_byte_formats_possible
+            .then(|| assembler.label())
+            .transpose()?;
         let v9_candidate = direct_byte_formats_possible
             .then(|| assembler.label())
             .transpose()?;
@@ -24771,6 +25423,18 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
         assembler.branch_cond(AARCH64_EQ, v7_candidate)?;
         assembler.instruction(aarch64_cmp_x_imm(8, ROOT_SCANNER_COMPACT_V6)?)?;
         assembler.branch_cond(AARCH64_EQ, v6_candidate)?;
+        assembler.instruction(aarch64_cmp_x_imm(
+            8,
+            ROOT_SCANNER_COMPACT_V12_MAPPED_U8,
+        )?)?;
+        assembler.branch_cond(AARCH64_EQ, v12_candidate)?;
+        if let Some(v10_candidate) = v10_candidate {
+            assembler.instruction(aarch64_cmp_x_imm(
+                8,
+                ROOT_SCANNER_COMPACT_V10_DIRECT_U8,
+            )?)?;
+            assembler.branch_cond(AARCH64_EQ, v10_candidate)?;
+        }
         if let Some(v9_candidate) = v9_candidate {
             assembler.instruction(aarch64_cmp_x_imm(8, ROOT_SCANNER_COMPACT_V9_DIRECT_BYTE)?)?;
             assembler.branch_cond(AARCH64_EQ, v9_candidate)?;
@@ -24855,6 +25519,41 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
                 .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 V6 candidate shift"))?,
         )?)?;
         assembler.branch(v6_table_scan)?;
+
+        assembler.bind(v12_candidate)?;
+        assembler.instruction(aarch64_load_x_imm(8, 31, 0)?)?;
+        assembler.instruction(aarch64_load_x_imm(
+            15,
+            13,
+            u16::try_from(FROZEN_DYNAMIC_ROWS_V3_ROWS_ADDRESS_OFFSET)
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 V12 candidate rows"))?,
+        )?)?;
+        assembler.instruction(aarch64_add_x_imm(
+            14,
+            8,
+            u16::try_from(FROZEN_PREPARED_HEADER_V1_CLASS_MAP_OFFSET)
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 V12 candidate class map"))?,
+        )?)?;
+        assembler.instruction(aarch64_load_w_imm(
+            12,
+            13,
+            u16::try_from(FROZEN_DYNAMIC_ROWS_V3_ROW_SHIFT_OFFSET)
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 V12 candidate shift"))?,
+        )?)?;
+        assembler.branch(v12_dispatch)?;
+
+        if let Some(v10_candidate) = v10_candidate {
+            assembler.bind(v10_candidate)?;
+            assembler.instruction(aarch64_load_x_imm(
+                15,
+                13,
+                u16::try_from(FROZEN_DYNAMIC_ROWS_V3_ROWS_ADDRESS_OFFSET).map_err(|_| {
+                    ObjectError::ArithmeticOverflow("AArch64 V10 candidate rows")
+                })?,
+            )?)?;
+            assembler.instruction(aarch64_mov_x(11, 15)?)?;
+            assembler.branch(v10_table_scan)?;
+        }
 
         if let Some(v9_candidate) = v9_candidate {
             assembler.bind(v9_candidate)?;
@@ -32711,6 +33410,73 @@ mod tests {
         any(target_arch = "x86_64", target_arch = "aarch64"),
         any(target_os = "linux", target_os = "macos")
     ))]
+    fn scanner_free_compact_u8_columns_raw(bit_count: usize) -> fre_automata::RawPlan {
+        use fre_automata::{EdgeKind, RawPlan, StateRole};
+
+        assert!((1..=8).contains(&bit_count));
+        let accept = bit_count + 1;
+        let mut roles = Vec::with_capacity(accept + 1);
+        roles.extend(std::iter::repeat_n(StateRole::Consume, accept));
+        roles.push(StateRole::Accept);
+
+        let mut edge_offsets = Vec::with_capacity(roles.len() + 1);
+        let mut edge_targets = Vec::new();
+        let mut edge_kinds = Vec::new();
+        let mut byte_starts = Vec::new();
+        let mut byte_ends = Vec::new();
+        edge_offsets.push(0);
+
+        // The first byte selects one of `bit_count` correlated second-byte
+        // states. These disjoint intervals cover the complete byte alphabet,
+        // so the graph is scanner-free while still having a fixed width.
+        for bit in 0..bit_count {
+            let start = bit.checked_mul(256).unwrap().div_ceil(bit_count);
+            let end = (bit + 1)
+                .checked_mul(256)
+                .unwrap()
+                .div_ceil(bit_count)
+                - 1;
+            edge_targets.push(u32::try_from(bit + 1).unwrap());
+            edge_kinds.push(EdgeKind::ByteRange);
+            byte_starts.push(u8::try_from(start).unwrap());
+            byte_ends.push(u8::try_from(end).unwrap());
+        }
+        edge_offsets.push(u32::try_from(edge_targets.len()).unwrap());
+
+        // State `bit+1` accepts exactly the singleton bytes carrying that
+        // bit. With eight states, the complete transition-column vector is
+        // the raw byte itself, forcing 256 distinct semantic columns while
+        // retaining only a small state set. With three states, the same
+        // deterministic construction coalesces to a lower mapped alphabet.
+        for bit in 0..bit_count {
+            for byte in u8::MIN..=u8::MAX {
+                if byte & (1_u8 << bit) == 0 {
+                    continue;
+                }
+                edge_targets.push(u32::try_from(accept).unwrap());
+                edge_kinds.push(EdgeKind::ByteRange);
+                byte_starts.push(byte);
+                byte_ends.push(byte);
+            }
+            edge_offsets.push(u32::try_from(edge_targets.len()).unwrap());
+        }
+        edge_offsets.push(u32::try_from(edge_targets.len()).unwrap());
+
+        RawPlan {
+            start: 0,
+            roles,
+            edge_offsets,
+            edge_targets,
+            edge_kinds,
+            byte_starts,
+            byte_ends,
+        }
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
     fn scanner_free_dynamic_program(
         raw: fre_automata::RawPlan,
         output: OutputContract,
@@ -34875,6 +35641,400 @@ static int run_case(const unsigned char *p,size_t n,size_t s,size_t e,uint32_t e
         );
         fs::remove_dir_all(&directory).expect("remove unary V5 linker directory");
     }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    #[ignore = "requires `cargo build -p fre-aot-regex-runtime --lib`; links V10/V12 through the real runtime's unified maximum owner"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one opt-in linker differential authenticates both byte-cell owners and every output contract at the native boundary"
+    )]
+    fn linked_host_frozen_compact_u8_v10_v12_execute_all_output_contracts() {
+        use std::{fmt::Write as _, fs, process::Command, time::SystemTime};
+
+        fn c_bytes(bytes: &[u8]) -> String {
+            bytes
+                .iter()
+                .map(u8::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+
+        fn native_result(
+            output: OutputContract,
+            span: Option<(usize, usize)>,
+        ) -> (u32, usize, usize) {
+            match (output, span) {
+                (_, None) => (0, 0, 0),
+                (OutputContract::Exists, Some(_)) => (1, 0, 0),
+                (OutputContract::SelectedEnd, Some((_, end))) => (1, end, end),
+                (OutputContract::Span, Some((start, end))) => (1, start, end),
+            }
+        }
+
+        fn portable_result(
+            output: OutputContract,
+            span: Option<(usize, usize)>,
+        ) -> MatchResult {
+            match output {
+                OutputContract::Exists => MatchResult::Exists(span.is_some()),
+                OutputContract::SelectedEnd => {
+                    MatchResult::SelectedEnd(span.map(|(_, end)| end))
+                }
+                OutputContract::Span => MatchResult::Span(span),
+            }
+        }
+
+        fn case(window_len: usize, match_offset: Option<usize>) -> (Vec<u8>, SearchWindow) {
+            let start = 7_usize;
+            let end = start.checked_add(window_len).unwrap();
+            let mut haystack = vec![0_u8; end + 9];
+            if let Some(offset) = match_offset {
+                assert!(offset + 2 <= window_len);
+                haystack[start + offset] = 0;
+                haystack[start + offset + 1] = 1;
+            }
+            (haystack, SearchWindow::new(start, end))
+        }
+
+        let target = if cfg!(target_arch = "x86_64") {
+            if cfg!(target_os = "linux") {
+                Target::x86_64_linux()
+            } else {
+                Target::x86_64_macos()
+            }
+        } else if cfg!(target_os = "linux") {
+            Target::aarch64_linux()
+        } else {
+            Target::aarch64_macos()
+        };
+        let current_exe = std::env::current_exe().expect("current test executable");
+        let profile_dir = current_exe
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("Cargo profile directory");
+        let static_runtime = profile_dir.join("libfre_aot_regex_runtime.a");
+        assert!(
+            static_runtime.is_file(),
+            "build the linked runtime first: cargo build -p fre-aot-regex-runtime --lib ({})",
+            static_runtime.display()
+        );
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "fre-aot-frozen-u8-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("create compact-u8 linker directory");
+
+        let boundary = DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES;
+        let long_window = FROZEN_SCANNER_FREE_DYNAMIC_ROWS_MAX_INPUT_BYTES + 4_097;
+        let cases = vec![
+            case(boundary, Some(boundary - 2)),
+            case(boundary, None),
+            case(boundary + 1, Some(boundary - 1)),
+            case(long_window, Some(5_000)),
+            case(long_window, None),
+        ];
+
+        for (format_index, label, bit_count, direct, flag, version, ready_seal) in [
+            (
+                0_usize,
+                "v10",
+                8_usize,
+                true,
+                FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V10,
+                FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION,
+                FROZEN_PREPARED_HEADER_V10_READY_SEAL,
+            ),
+            (
+                1,
+                "v12",
+                3,
+                false,
+                FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V12,
+                FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION,
+                FROZEN_PREPARED_HEADER_V12_READY_SEAL,
+            ),
+        ] {
+            let raw = scanner_free_compact_u8_columns_raw(bit_count);
+            let automaton = fre_automata::Automaton::from_raw(
+                raw.clone(),
+                fre_automata::CompileLimits::default(),
+            )
+            .unwrap_or_else(|error| panic!("validate linked {label}: {error}"));
+
+            for (output_index, output) in [
+                OutputContract::Exists,
+                OutputContract::SelectedEnd,
+                OutputContract::Span,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let program = CompiledProgram::build(
+                    raw.clone(),
+                    automaton.clone(),
+                    output,
+                    CompileMode::Fast,
+                    DeterminizeLimits {
+                        max_states: 0,
+                        ..DeterminizeLimits::default()
+                    },
+                    usize::MAX,
+                )
+                .unwrap_or_else(|error| panic!("compile linked {label}/{output:?}: {error}"));
+                assert!(program.native_dfa_view().is_none(), "{label}/{output:?}");
+                assert!(
+                    program.native_partial_dfa_view().is_none(),
+                    "{label}/{output:?}"
+                );
+                assert!(
+                    !program.has_nfa_exact_product(),
+                    "the correlated {label} graph must retain general dynamic rows"
+                );
+                let view = program
+                    .native_dynamic_rows_view()
+                    .unwrap_or_else(|| panic!("missing {label}/{output:?} dynamic view"));
+                assert_eq!(view.root_requirement, None, "{label}/{output:?}");
+                assert_eq!(view.exact_match_width, Some(2), "{label}/{output:?}");
+                let workspace = program.prepare_workspace().unwrap();
+                let storage = program
+                    .compiler_private_frozen_dynamic_rows_storage_v3(
+                        &workspace,
+                        512 * 1024,
+                        512 * 1024,
+                    )
+                    .unwrap_or_else(|| panic!("missing {label}/{output:?} compact-u8 owner"));
+                let header = program.compiler_private_frozen_prepared_header_v6(
+                    &workspace,
+                    None,
+                    Some(&storage),
+                );
+                assert!(header.is_active(), "{label}/{output:?}");
+                assert!(header.has_dynamic_rows(), "{label}/{output:?}");
+                assert_eq!(
+                    std::mem::size_of_val(&header),
+                    FROZEN_PREPARED_HEADER_V6_BYTES,
+                    "{label}/{output:?} must use the physical maximum envelope"
+                );
+
+                let module = lower_without_materialized_k0(&program, target);
+                let entry = module
+                    .prepared_entry_symbol()
+                    .unwrap_or_else(|| panic!("missing {label}/{output:?} prepared entry"));
+                let (program_symbol, program_len) = module
+                    .required_runtime_program()
+                    .expect("compact-u8 runtime program alias");
+                let object = directory.join(format!(
+                    "compact-u8-{format_index}-{output_index}.o"
+                ));
+                let object_bytes = crate::emit_object(
+                    &module,
+                    ObjectFormat::for_target(target),
+                    usize::MAX,
+                )
+                .unwrap_or_else(|error| panic!("emit {label}/{output:?}: {error}"));
+                fs::write(&object, object_bytes).expect("write compact-u8 object");
+
+                let mut source = String::from(
+                    "#include <stddef.h>\n#include <stdint.h>\n#include <string.h>\n\
+                     typedef void *handle_t;typedef struct{size_t start;size_t end;} result_t;\n",
+                );
+                writeln!(source, "extern const unsigned char {program_symbol}[];").unwrap();
+                writeln!(
+                    source,
+                    "extern uint32_t {entry}(handle_t,const unsigned char*,size_t,size_t,size_t,result_t*);"
+                )
+                .unwrap();
+                source.push_str(
+                    "extern uint32_t fre_aot_regex_runtime_prepare_exclusive_v1(const unsigned char*,size_t,handle_t*);\n\
+                     extern uint32_t fre_aot_regex_runtime_search_exclusive_v1(handle_t,const unsigned char*,size_t,size_t,size_t,result_t*);\n\
+                     extern uint32_t fre_aot_regex_runtime_destroy_exclusive_v1(handle_t);\n",
+                );
+                writeln!(source, "#define PROGRAM_BYTES {program_symbol}").unwrap();
+                writeln!(source, "#define PROGRAM_LENGTH {program_len}U").unwrap();
+                writeln!(source, "#define NATIVE_ENTRY {entry}").unwrap();
+                for (name, value) in [
+                    ("ACTIVE_OFFSET", FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL_OFFSET),
+                    ("MAGIC_OFFSET", FROZEN_PREPARED_HEADER_V1_MAGIC_OFFSET),
+                    ("ABI_OFFSET", FROZEN_PREPARED_HEADER_V1_ABI_VERSION_OFFSET),
+                    ("FLAGS_OFFSET", FROZEN_PREPARED_HEADER_V1_FLAGS_OFFSET),
+                    ("HEADER_BYTES_OFFSET", FROZEN_PREPARED_HEADER_V1_HEADER_BYTES_OFFSET),
+                    ("ROWS_OFFSET", FROZEN_PREPARED_HEADER_V1_FORWARD_ROWS_ADDRESS_OFFSET),
+                    ("LIVE_OFFSET", FROZEN_PREPARED_HEADER_V1_FORWARD_LIVE_CELLS_OFFSET),
+                    ("CACHE_OFFSET", FROZEN_PREPARED_HEADER_V1_CACHE_IDENTITY_OFFSET),
+                    ("STRIDE_OFFSET", FROZEN_PREPARED_HEADER_V1_ROW_STRIDE_OFFSET),
+                    ("INITIAL_ROW_OFFSET", FROZEN_PREPARED_HEADER_V1_FORWARD_INITIAL_ROW_OFFSET),
+                    ("DEAD_OFFSET", FROZEN_PREPARED_HEADER_V1_UNFILLED_CELL_OFFSET),
+                    ("ACCEPT_OFFSET", FROZEN_PREPARED_HEADER_V1_ACCEPT_MASK_OFFSET),
+                    ("TOKEN_OFFSET", FROZEN_PREPARED_HEADER_V1_NEXT_ROW_TOKEN_MASK_OFFSET),
+                    ("CLASS_MAP_OFFSET", FROZEN_PREPARED_HEADER_V1_CLASS_MAP_OFFSET),
+                    ("TAIL_OFFSET", FROZEN_PREPARED_HEADER_V3_DYNAMIC_ROWS_OFFSET),
+                    ("READY_OFFSET", FROZEN_DYNAMIC_ROWS_V3_READY_SEAL_OFFSET),
+                    ("TAIL_ROWS_OFFSET", FROZEN_DYNAMIC_ROWS_V3_ROWS_ADDRESS_OFFSET),
+                    ("TAIL_CACHE_OFFSET", FROZEN_DYNAMIC_ROWS_V3_CACHE_IDENTITY_OFFSET),
+                    ("STATES_OFFSET", FROZEN_DYNAMIC_ROWS_V3_STATE_COUNT_OFFSET),
+                    ("CLASSES_OFFSET", FROZEN_DYNAMIC_ROWS_V3_CLASS_COUNT_OFFSET),
+                    ("SHIFT_OFFSET", FROZEN_DYNAMIC_ROWS_V3_ROW_SHIFT_OFFSET),
+                    ("INITIAL_STATE_OFFSET", FROZEN_DYNAMIC_ROWS_V3_INITIAL_STATE_OFFSET),
+                    ("LOOP_COUNT_OFFSET", FROZEN_DYNAMIC_ROWS_V3_LOOP_COUNT_OFFSET),
+                    ("FORMAT_OFFSET", FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION_OFFSET),
+                ] {
+                    writeln!(source, "#define {name} {value}U").unwrap();
+                }
+                for (name, value) in [
+                    ("ACTIVE_SEAL", FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL),
+                    ("HEADER_MAGIC", FROZEN_PREPARED_HEADER_V1_MAGIC),
+                    ("READY_SEAL", ready_seal),
+                ] {
+                    writeln!(source, "#define {name} UINT64_C({value})").unwrap();
+                }
+                for (name, value) in [
+                    ("HEADER_ABI", FROZEN_PREPARED_HEADER_V1_ABI_VERSION),
+                    ("EXPECTED_FLAG", flag),
+                    ("EXPECTED_FORMAT", version),
+                    ("EXPECTED_DIRECT", u32::from(u8::from(direct))),
+                    ("EXPECTED_BYTES", u32::try_from(FROZEN_PREPARED_HEADER_V3_BYTES).unwrap()),
+                ] {
+                    writeln!(source, "#define {name} UINT32_C({value})").unwrap();
+                }
+                source.push_str(
+                    r#"
+static uint8_t read_u8(handle_t h,size_t o){return *((const uint8_t*)h+o);}
+static uint32_t read_u32(handle_t h,size_t o){uint32_t v=0;memcpy(&v,(const uint8_t*)h+o,sizeof(v));return v;}
+static uint64_t read_u64(handle_t h,size_t o){uint64_t v=0;memcpy(&v,(const uint8_t*)h+o,sizeof(v));return v;}
+static size_t read_size(handle_t h,size_t o){size_t v=0;memcpy(&v,(const uint8_t*)h+o,sizeof(v));return v;}
+static int owns_expected_u8(handle_t h){
+  if(h==NULL||read_u64(h,ACTIVE_OFFSET)!=ACTIVE_SEAL||read_u64(h,MAGIC_OFFSET)!=HEADER_MAGIC)return 0;
+  if(read_u32(h,ABI_OFFSET)!=HEADER_ABI||read_u32(h,FLAGS_OFFSET)!=EXPECTED_FLAG)return 0;
+  if(read_size(h,HEADER_BYTES_OFFSET)!=(size_t)EXPECTED_BYTES)return 0;
+  if(read_u64(h,TAIL_OFFSET+READY_OFFSET)!=READY_SEAL)return 0;
+  if(read_u32(h,TAIL_OFFSET+FORMAT_OFFSET)!=EXPECTED_FORMAT)return 0;
+  size_t rows=read_size(h,ROWS_OFFSET),tail_rows=read_size(h,TAIL_OFFSET+TAIL_ROWS_OFFSET);
+  size_t live=read_size(h,LIVE_OFFSET),cache=read_size(h,CACHE_OFFSET);
+  if(rows==0U||rows!=tail_rows||cache==0U||cache!=read_size(h,TAIL_OFFSET+TAIL_CACHE_OFFSET))return 0;
+  uint32_t states=read_u32(h,TAIL_OFFSET+STATES_OFFSET),classes=read_u32(h,TAIL_OFFSET+CLASSES_OFFSET);
+  uint32_t shift=read_u32(h,TAIL_OFFSET+SHIFT_OFFSET),stride=read_u32(h,STRIDE_OFFSET);
+  if(states==0U||states>127U||classes==0U||classes>256U||shift>8U)return 0;
+  size_t physical=(size_t)1U<<shift;
+  if(stride!=physical||live!=(size_t)states*physical)return 0;
+  if(read_u32(h,TAIL_OFFSET+INITIAL_STATE_OFFSET)!=0U||read_u32(h,INITIAL_ROW_OFFSET)!=0U)return 0;
+  if(read_u32(h,TAIL_OFFSET+LOOP_COUNT_OFFSET)!=0U)return 0;
+  if(read_u32(h,DEAD_OFFSET)!=0U||read_u32(h,ACCEPT_OFFSET)!=128U||read_u32(h,TOKEN_OFFSET)!=127U)return 0;
+  unsigned char represented[256]={0};
+  for(size_t byte=0;byte<256U;byte++){
+    uint8_t cls=read_u8(h,CLASS_MAP_OFFSET+byte);if(cls>=classes)return 0;represented[cls]=1U;
+    if(EXPECTED_DIRECT&&cls!=(uint8_t)byte)return 0;
+  }
+  for(size_t cls=0;cls<classes;cls++)if(!represented[cls])return 0;
+  if(EXPECTED_DIRECT){if(classes!=256U||physical!=256U||shift!=8U)return 0;}
+  else {if(classes<=1U||classes>=129U||physical>=256U)return 0;}
+  const uint8_t *cells=(const uint8_t*)(uintptr_t)rows;
+  for(size_t state=0;state<states;state++){
+    for(size_t cls=0;cls<classes;cls++)if((cells[state*physical+cls]&127U)>states)return 0;
+    for(size_t pad=classes;pad<physical;pad++)if(cells[state*physical+pad]!=0U)return 0;
+  }
+  return 1;
+}
+static int prepare(handle_t*h){return fre_aot_regex_runtime_prepare_exclusive_v1(PROGRAM_BYTES,PROGRAM_LENGTH,h)==0U;}
+static int destroy(handle_t h){return fre_aot_regex_runtime_destroy_exclusive_v1(h)==0U;}
+static int run_case(const unsigned char*p,size_t n,size_t s,size_t e,uint32_t xs,size_t xb,size_t xe,int base){
+  handle_t native=0,baseline=0;result_t nr={91U,92U},br={93U,94U};
+  if(!prepare(&native)||!prepare(&baseline))return base;
+  if(!owns_expected_u8(native)){destroy(native);destroy(baseline);return base+1;}
+  uint32_t ns=NATIVE_ENTRY(native,p,n,s,e,&nr);
+  uint32_t bs=fre_aot_regex_runtime_search_exclusive_v1(baseline,p,n,s,e,&br);
+  if(ns!=bs||nr.start!=br.start||nr.end!=br.end){destroy(native);destroy(baseline);return base+2;}
+  if(ns!=xs||nr.start!=xb||nr.end!=xe){destroy(native);destroy(baseline);return base+3;}
+  if(!owns_expected_u8(native)){destroy(native);destroy(baseline);return base+4;}
+  if(!destroy(native)||!destroy(baseline))return base+5;return 0;
+}
+"#,
+                );
+
+                let mut expected_cases = Vec::with_capacity(cases.len());
+                for (case_index, (haystack, window)) in cases.iter().enumerate() {
+                    let span = linked_raw_reference_span(&raw, haystack, *window);
+                    let expected = portable_result(output, span);
+                    let mut oracle_workspace = program.prepare_workspace().unwrap();
+                    assert_eq!(
+                        program
+                            .search_with_workspace(haystack, *window, &mut oracle_workspace)
+                            .expect("execute compact-u8 portable oracle"),
+                        expected,
+                        "{label}/{output:?}/case {case_index}"
+                    );
+                    expected_cases.push(native_result(output, span));
+                    writeln!(
+                        source,
+                        "static const unsigned char h{case_index}[]={{{}}};",
+                        c_bytes(haystack)
+                    )
+                    .unwrap();
+                }
+                source.push_str("int main(void){int status;\n");
+                for (case_index, ((haystack, window), expected)) in
+                    cases.iter().zip(&expected_cases).enumerate()
+                {
+                    let base = 10 + case_index * 10;
+                    writeln!(
+                        source,
+                        "status=run_case(h{case_index},sizeof(h{case_index}),{}U,{}U,{}U,{}U,{}U,{base});if(status)return status;",
+                        window.start(),
+                        window.end(),
+                        expected.0,
+                        expected.1,
+                        expected.2,
+                    )
+                    .unwrap();
+                    assert_eq!(haystack.len(), window.end() + 9);
+                }
+                source.push_str("return 0;}\n");
+
+                let c_path = directory.join(format!(
+                    "compact-u8-{format_index}-{output_index}.c"
+                ));
+                let executable = directory.join(format!(
+                    "compact-u8-{format_index}-{output_index}"
+                ));
+                fs::write(&c_path, source).expect("write compact-u8 C harness");
+                let c_compiler = if cfg!(target_os = "macos") {
+                    "clang"
+                } else {
+                    "cc"
+                };
+                let status = Command::new(c_compiler)
+                    .arg("-O0")
+                    .arg(&c_path)
+                    .arg(&object)
+                    .arg(&static_runtime)
+                    .arg("-o")
+                    .arg(&executable)
+                    .status()
+                    .unwrap_or_else(|error| panic!("link {label}/{output:?}: {error}"));
+                assert!(status.success(), "failed to link {label}/{output:?}");
+                let result = Command::new(&executable)
+                    .output()
+                    .unwrap_or_else(|error| panic!("execute {label}/{output:?}: {error}"));
+                assert!(
+                    result.status.success(),
+                    "{label}/{output:?}: status={:?} stdout={} stderr={}",
+                    result.status.code(),
+                    String::from_utf8_lossy(&result.stdout),
+                    String::from_utf8_lossy(&result.stderr)
+                );
+            }
+        }
+        fs::remove_dir_all(&directory).expect("remove compact-u8 linker directory");
+    }
+
+
 
     #[cfg(all(
         any(target_arch = "x86_64", target_arch = "aarch64"),
