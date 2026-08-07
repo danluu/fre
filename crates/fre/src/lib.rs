@@ -13996,7 +13996,20 @@ mod tests {
         Option<usize>,
         Option<usize>,
     ) {
-        let builder = PortableBuilder::new(pattern).unicode(false);
+        lowered_k0_mandatory_cut_with_unicode(pattern, false)
+    }
+
+    fn lowered_k0_mandatory_cut_with_unicode(
+        pattern: &str,
+        unicode: bool,
+    ) -> (
+        fre_automata::RawPlan,
+        BuildLimits,
+        u8,
+        Option<usize>,
+        Option<usize>,
+    ) {
+        let builder = PortableBuilder::new(pattern).unicode(unicode);
         let profile = CompatibilityProfile::RustBytes(builder.profile.clone());
         let request = fre_syntax::ParseRequest::rust(pattern, profile)
             .with_admission(builder.limits.admission)
@@ -16765,17 +16778,20 @@ mod tests {
             );
         }
 
-        let unicode = PortableBuilder::new(r"(?s:.{1,2}Z)")
-            .plan_selection(PlanSelection::ForceK0)
-            .build()
-            .expect("Unicode scalar corridor-refusal fixture builds through K0");
-        let PortablePlan::K0(plan) = &unicode.plan else {
-            panic!("Unicode scalar corridor-refusal fixture did not retain K0");
-        };
-        let suffix = plan
-            .mandatory_suffix
-            .as_ref()
-            .expect("Unicode scalar fixture retains its generic suffix");
+        let (raw, limits, _, minimum_match_bytes, maximum_match_bytes) =
+            lowered_k0_mandatory_cut_with_unicode(r"(?s:.{1,2}Z)", true);
+        let suffix = try_build_k0_mandatory_suffix(
+            &raw,
+            minimum_match_bytes,
+            maximum_match_bytes,
+            None,
+            limits,
+            0,
+        )
+        .expect("Unicode scalar corridor-refusal analysis completes")
+        .plan
+        .expect("Unicode scalar fixture retains its generic suffix");
+        assert_eq!(suffix.needle(), b"Z");
         assert_eq!(suffix.universal_finite_match_byte_bounds(), None);
     }
 
