@@ -125,10 +125,6 @@ mod text_set;
 mod token_phrase;
 mod unicode_folded_literal;
 mod unicode_word_run;
-#[allow(
-    dead_code,
-    reason = "the reusable corridor proof is staged separately from its K0 facade consumer"
-)]
 mod universal_finite_greedy_corridor;
 
 pub use pure_byte_class_repeat::{
@@ -1690,6 +1686,11 @@ enum K0MandatorySuffixRecoveryPlan {
         maximum_match_bytes: usize,
         prefix_hedge_bytes: usize,
     },
+    UniversalFiniteGreedyCorridor {
+        minimum_match_bytes: usize,
+        maximum_match_bytes: usize,
+        prefix_hedge_bytes: usize,
+    },
     FiniteMaximum {
         minimum_match_bytes: usize,
         maximum_match_bytes: usize,
@@ -1728,6 +1729,21 @@ impl K0MandatorySuffixPlan {
             .map(|(matched, _)| matched)
     }
 
+    fn rfind_window(
+        &self,
+        haystack: &[u8],
+        start: usize,
+        end: usize,
+    ) -> Result<Option<(usize, usize)>, LiteralError> {
+        self.literal
+            .rfind_window(
+                haystack,
+                LiteralWindow::new(start, end),
+                LiteralSearchLimits::unlimited(),
+            )
+            .map(|(matched, _)| matched)
+    }
+
     fn narrowed_start_before(&self, haystack: &[u8], window_start: usize, end: usize) -> usize {
         let K0MandatorySuffixRecoveryPlan::ConsumptionRun(scanner) = &self.recovery else {
             return window_start;
@@ -1759,6 +1775,11 @@ impl K0MandatorySuffixPlan {
                 maximum_match_bytes,
                 ..
             }
+            | K0MandatorySuffixRecoveryPlan::UniversalFiniteGreedyCorridor {
+                minimum_match_bytes,
+                maximum_match_bytes,
+                ..
+            }
             | K0MandatorySuffixRecoveryPlan::FiniteMaximum {
                 minimum_match_bytes,
                 maximum_match_bytes,
@@ -1780,6 +1801,10 @@ impl K0MandatorySuffixPlan {
                 maximum_match_bytes,
                 ..
             }
+            | K0MandatorySuffixRecoveryPlan::UniversalFiniteGreedyCorridor {
+                maximum_match_bytes,
+                ..
+            }
             | K0MandatorySuffixRecoveryPlan::FiniteMaximum {
                 maximum_match_bytes,
                 ..
@@ -1796,12 +1821,24 @@ impl K0MandatorySuffixPlan {
                 minimum_match_bytes,
                 maximum_match_bytes,
                 ..
+            }
+            | K0MandatorySuffixRecoveryPlan::UniversalFiniteGreedyCorridor {
+                minimum_match_bytes,
+                maximum_match_bytes,
+                ..
             } => Some((*minimum_match_bytes, *maximum_match_bytes)),
             K0MandatorySuffixRecoveryPlan::None
             | K0MandatorySuffixRecoveryPlan::ConsumptionRun(_)
             | K0MandatorySuffixRecoveryPlan::FiniteMaximum { .. }
             | K0MandatorySuffixRecoveryPlan::FiniteMaximumSpanOnly { .. } => None,
         }
+    }
+
+    fn has_universal_finite_greedy_corridor(&self) -> bool {
+        matches!(
+            &self.recovery,
+            K0MandatorySuffixRecoveryPlan::UniversalFiniteGreedyCorridor { .. }
+        )
     }
 
     fn finite_span_only_maximum_match_bytes(&self) -> Option<usize> {
@@ -1813,6 +1850,7 @@ impl K0MandatorySuffixPlan {
             K0MandatorySuffixRecoveryPlan::None
             | K0MandatorySuffixRecoveryPlan::ConsumptionRun(_)
             | K0MandatorySuffixRecoveryPlan::UniversalFiniteCorridor { .. }
+            | K0MandatorySuffixRecoveryPlan::UniversalFiniteGreedyCorridor { .. }
             | K0MandatorySuffixRecoveryPlan::FiniteMaximum { .. } => None,
         }
     }
@@ -1820,6 +1858,10 @@ impl K0MandatorySuffixPlan {
     fn finite_prefix_hedge_bytes(&self) -> Option<usize> {
         match &self.recovery {
             K0MandatorySuffixRecoveryPlan::UniversalFiniteCorridor {
+                prefix_hedge_bytes,
+                ..
+            }
+            | K0MandatorySuffixRecoveryPlan::UniversalFiniteGreedyCorridor {
                 prefix_hedge_bytes,
                 ..
             }
@@ -1883,6 +1925,7 @@ fn k0_finite_suffix_prefix_hedge_bytes(
 
 fn try_build_k0_mandatory_suffix(
     raw: &fre_automata::RawPlan,
+    structural_hir: Option<&Hir>,
     minimum_match_bytes: Option<usize>,
     maximum_match_bytes: Option<usize>,
     mandatory_cut: Option<K0MandatoryCutPlan>,
@@ -1910,6 +1953,7 @@ fn try_build_k0_mandatory_suffix(
         .min(limits.lowering.max_stack_items);
     let analysis = fre_automata::analyze_mandatory_suffix(raw, analysis_limits);
     let stats = analysis.stats();
+    let assertion_edges = stats.assertion_edges();
     if !stats.closes(analysis_limits) {
         return Err(BuildError::InternalInvariant(
             "K0 mandatory-suffix analysis receipt did not close",
@@ -2054,6 +2098,17 @@ fn try_build_k0_mandatory_suffix(
             ),
         }
     };
+    let universal_finite_greedy_recovery = |(minimum_match_bytes, maximum_match_bytes)| {
+        K0MandatorySuffixRecoveryPlan::UniversalFiniteGreedyCorridor {
+            minimum_match_bytes,
+            maximum_match_bytes,
+            prefix_hedge_bytes: k0_finite_suffix_prefix_hedge_bytes(
+                maximum_match_bytes,
+                candidate.len(),
+                mandatory_cut,
+            ),
+        }
+    };
     let baseline_recovery = if let Some(bounds) = short_finite_recovery_bounds {
         finite_recovery(bounds)
     } else {
@@ -2080,8 +2135,93 @@ fn try_build_k0_mandatory_suffix(
             K0MandatorySuffixRecoveryPlan::FiniteMaximum { .. }
                 | K0MandatorySuffixRecoveryPlan::FiniteMaximumSpanOnly { .. }
         );
+        let mut greedy_corridor_completed = false;
+        let mut greedy_corridor_exhausted_work = false;
+        if baseline_can_be_upgraded && assertion_edges == 0 {
+            if let Some(hir) = structural_hir {
+                if planner_work < limits.max_planner_work {
+                    match universal_finite_greedy_corridor::inspect(
+                        hir,
+                        candidate.as_bytes(),
+                        planner_work,
+                        limits.max_planner_work,
+                    ) {
+                        Ok(outcome) => {
+                            let inspected_work = outcome.planner_work();
+                            if inspected_work < planner_work
+                                || inspected_work > limits.max_planner_work
+                            {
+                                return Err(BuildError::InternalInvariant(
+                                    "greedy universal-corridor work receipt did not close",
+                                ));
+                            }
+                            planner_work = inspected_work;
+                            if let universal_finite_greedy_corridor::InspectionOutcome::Eligible(
+                                inspection,
+                            ) = outcome
+                            {
+                                if inspection.planner_work() != planner_work {
+                                    return Err(BuildError::InternalInvariant(
+                                        "greedy universal-corridor eligible receipt diverged",
+                                    ));
+                                }
+                                let descriptor = inspection.descriptor();
+                                let expected_minimum_prefix = minimum
+                                    .checked_sub(candidate.len())
+                                    .ok_or(BuildError::InternalInvariant(
+                                        "greedy universal-corridor minimum prefix underflowed",
+                                    ))?;
+                                let expected_maximum_prefix = maximum
+                                    .checked_sub(candidate.len())
+                                    .ok_or(BuildError::InternalInvariant(
+                                        "greedy universal-corridor maximum prefix underflowed",
+                                    ))?;
+                                if descriptor.suffix_bytes() != candidate.len()
+                                    || descriptor.minimum_match_bytes() != minimum
+                                    || descriptor.maximum_match_bytes() != maximum
+                                    || descriptor.minimum_prefix_bytes()
+                                        != expected_minimum_prefix
+                                    || descriptor.maximum_prefix_bytes()
+                                        != expected_maximum_prefix
+                                {
+                                    return Err(BuildError::InternalInvariant(
+                                        "greedy universal corridor disagrees with authenticated K0 geometry",
+                                    ));
+                                }
+                                recovery =
+                                    universal_finite_greedy_recovery((minimum, maximum));
+                                greedy_corridor_completed = true;
+                            }
+                        }
+                        Err(universal_finite_greedy_corridor::InspectionError::WorkLimit {
+                            actual,
+                            ..
+                        }) => {
+                            if actual < planner_work || actual > limits.max_planner_work {
+                                return Err(BuildError::InternalInvariant(
+                                    "greedy universal-corridor refusal receipt did not close",
+                                ));
+                            }
+                            planner_work = actual;
+                            greedy_corridor_exhausted_work = true;
+                        }
+                        Err(
+                            universal_finite_greedy_corridor::InspectionError::ArithmeticOverflow,
+                        ) => {
+                            return Err(BuildError::InternalInvariant(
+                                "greedy universal-corridor inspection overflowed",
+                            ));
+                        }
+                    }
+                }
+            }
+        }
         let remaining_corridor_work = limits.max_planner_work.saturating_sub(planner_work);
-        if baseline_can_be_upgraded && remaining_corridor_work != 0 {
+        if baseline_can_be_upgraded
+            && !greedy_corridor_completed
+            && !greedy_corridor_exhausted_work
+            && remaining_corridor_work != 0
+        {
             let mut corridor_limits = MandatorySuffixAnalysisLimits::default();
             corridor_limits.max_work = corridor_limits.max_work.min(remaining_corridor_work);
             corridor_limits.max_allocation_items = corridor_limits
@@ -5664,6 +5804,7 @@ impl PortableBuilder {
         {
             try_build_k0_mandatory_suffix(
                 &raw,
+                Some(&rust.hir),
                 minimum_match_bytes,
                 rust.hir.properties().maximum_len(),
                 mandatory_cut.plan,
@@ -9672,6 +9813,7 @@ fn try_k0_universal_finite_mandatory_suffix_span_start(
     suffix: &K0MandatorySuffixPlan,
     minimum_match_bytes: usize,
     maximum_match_bytes: usize,
+    greedy_corridor: bool,
     state: K0NegativePrefilterState,
     haystack: &[u8],
     window: SearchWindow,
@@ -9762,16 +9904,64 @@ fn try_k0_universal_finite_mandatory_suffix_span_start(
     // plans. Equality at the horizon is sufficient. Below the horizon the
     // earliest start remains F, possibly for several suffix positions, so
     // exact-start selected-end replay remains necessary.
-    if proof_start
-        .checked_add(maximum_prefix_bytes)
-        .is_some_and(|horizon| occurrence_start >= horizon)
-    {
+    let maximum_suffix_start = proof_start.checked_add(maximum_prefix_bytes).ok_or(
+        SearchError::K0(K0SearchError::ArithmeticOverflow {
+            computation: "universal finite suffix-start horizon",
+        }),
+    )?;
+    if occurrence_start >= maximum_suffix_start {
         return Ok(finish_k0_universal_finite_mandatory_suffix_span(
             next_state,
             class_index,
             start,
             endpoint,
         ));
+    }
+    if greedy_corridor {
+        if start != proof_start {
+            return Err(SearchError::K0(K0SearchError::InternalInvariant {
+                detail: "near-floor greedy suffix did not retain the proved floor",
+            }));
+        }
+        let reverse_end = maximum_suffix_start
+            .checked_add(suffix.needle().len())
+            .ok_or(SearchError::K0(K0SearchError::ArithmeticOverflow {
+                computation: "universal finite greedy suffix horizon",
+            }))?
+            .min(window.end());
+        if search_start > reverse_end {
+            return Err(SearchError::K0(K0SearchError::InternalInvariant {
+                detail: "universal finite greedy suffix window inverted",
+            }));
+        }
+        if let Ok(Some((selected_suffix_start, selected_endpoint))) =
+            suffix.rfind_window(haystack, search_start, reverse_end)
+        {
+            let selected_prefix_bytes = selected_suffix_start.checked_sub(start).ok_or(
+                SearchError::K0(K0SearchError::InternalInvariant {
+                    detail: "greedy suffix preceded its proved start",
+                }),
+            )?;
+            if selected_suffix_start < search_start
+                || selected_suffix_start > maximum_suffix_start
+                || selected_prefix_bytes < minimum_prefix_bytes
+                || selected_prefix_bytes > maximum_prefix_bytes
+                || selected_suffix_start
+                    .checked_add(suffix.needle().len())
+                    != Some(selected_endpoint)
+                || selected_endpoint > reverse_end
+            {
+                return Err(SearchError::K0(K0SearchError::InternalInvariant {
+                    detail: "universal finite greedy suffix escaped its proved horizon",
+                }));
+            }
+            return Ok(finish_k0_universal_finite_mandatory_suffix_span(
+                next_state,
+                class_index,
+                start,
+                selected_endpoint,
+            ));
+        }
     }
     Ok(finish_k0_finite_mandatory_suffix_start(
         next_state,
@@ -10067,6 +10257,7 @@ fn try_k0_mandatory_suffix_span_start(
             suffix,
             minimum_match_bytes,
             maximum_match_bytes,
+            suffix.has_universal_finite_greedy_corridor(),
             state,
             haystack,
             window,
@@ -13927,7 +14118,7 @@ fn fixed_predicate_word64_search_limits(limits: SearchLimits) -> FixedPredicateW
 mod tests {
     use super::{
         Automaton, BuildError, BuildLimits, CanonicalPattern, CaptureFreeOperation,
-        CompatibilityProfile, GuardedLiteralSetSearchError, K0AbsoluteEndProof,
+        CompatibilityProfile, GuardedLiteralSetSearchError, Hir, K0AbsoluteEndProof,
         K0FiniteSuffixRoute, K0MandatoryCutPlan, K0MandatorySuffixOutcome,
         K0MandatorySuffixPlan, K0MandatorySuffixSpanOutcome, K0NegativePrefilterOutcome, Match,
         OperationSemantics, PlanKind, PlanSelection,
@@ -14042,6 +14233,45 @@ mod tests {
         )
     }
 
+    fn lowered_k0_mandatory_suffix_with_hir(
+        pattern: &str,
+    ) -> (
+        fre_automata::RawPlan,
+        Hir,
+        BuildLimits,
+        u8,
+        Option<usize>,
+        Option<usize>,
+    ) {
+        let builder = PortableBuilder::new(pattern).unicode(false);
+        let profile = CompatibilityProfile::RustBytes(builder.profile.clone());
+        let request = fre_syntax::ParseRequest::rust(pattern, profile)
+            .with_admission(builder.limits.admission)
+            .with_safety_envelope(builder.limits.syntax_safety);
+        let parsed = fre_syntax::parse(request)
+            .expect("focused structural mandatory-suffix pattern parses");
+        let CanonicalPattern::Rust(rust) = parsed.pattern else {
+            panic!("Rust bytes request produced a non-Rust canonical pattern");
+        };
+        let minimum_match_bytes = rust.hir.properties().minimum_len();
+        let maximum_match_bytes = rust.hir.properties().maximum_len();
+        let raw = fre_lower::lower_raw(
+            &rust,
+            OperationSemantics::CaptureFree,
+            builder.limits.lowering,
+        )
+        .expect("focused structural mandatory-suffix pattern lowers through K0")
+        .into_plan();
+        (
+            raw,
+            rust.hir,
+            builder.limits,
+            builder.profile.options.line_terminator,
+            minimum_match_bytes,
+            maximum_match_bytes,
+        )
+    }
+
     fn analyzed_k0_mandatory_cut(pattern: &str) -> (K0MandatoryCutPlan, Automaton) {
         let (raw, limits, line_terminator, _, _) = lowered_k0_mandatory_cut(pattern);
         let cut = try_build_k0_mandatory_cut(&raw, limits, 0)
@@ -14080,6 +14310,7 @@ mod tests {
             lowered_k0_mandatory_cut(pattern);
         let suffix_build = try_build_k0_mandatory_suffix(
             &raw,
+            None,
             minimum_match_bytes,
             maximum_match_bytes,
             None,
@@ -14122,6 +14353,73 @@ mod tests {
         assert!(
             regex.report.charged_persistent_bytes <= regex.report.persistent_byte_limit,
             "synthetic mandatory-suffix plan remains within the builder limit",
+        );
+        regex
+    }
+
+    fn forced_k0_with_bound_hir_mandatory_suffix(pattern: &str) -> PortableRegex {
+        let (
+            raw,
+            hir,
+            limits,
+            line_terminator,
+            minimum_match_bytes,
+            maximum_match_bytes,
+        ) = lowered_k0_mandatory_suffix_with_hir(pattern);
+        let suffix_build = try_build_k0_mandatory_suffix(
+            &raw,
+            Some(&hir),
+            minimum_match_bytes,
+            maximum_match_bytes,
+            None,
+            limits,
+            0,
+        )
+        .expect("focused bound-HIR mandatory-suffix analysis completes");
+        let suffix_storage_bytes = suffix_build.storage_bytes;
+        let suffix_planner_work = suffix_build.planner_work;
+        let suffix = suffix_build
+            .plan
+            .expect("focused pattern retains a bound-HIR mandatory-suffix proof");
+        let automaton = Automaton::from_raw(raw, limits.lowering.automata)
+            .expect("focused bound-HIR mandatory-suffix graph validates")
+            .with_line_terminator(line_terminator);
+        let automaton_storage_bytes = automaton.stats().storage_bytes();
+        let mut regex = PortableBuilder::new(pattern)
+            .unicode(false)
+            .plan_selection(PlanSelection::ForceK0)
+            .build()
+            .expect("focused structural mandatory-suffix pattern builds through K0");
+        let PortablePlan::K0(plan) = &mut regex.plan else {
+            panic!("forced structural mandatory-suffix pattern did not retain K0");
+        };
+        plan.automaton = automaton;
+        plan.mandatory_suffix = Some(suffix);
+        plan.correlated_terminal = None;
+        plan.mandatory_cut = None;
+        plan.negative_prefilter = None;
+        regex.report.planner_work = suffix_planner_work;
+        regex.report.plan_storage_bytes = automaton_storage_bytes
+            .checked_add(suffix_storage_bytes)
+            .expect("synthetic bound-HIR suffix storage accounting does not overflow");
+        regex.report.charged_persistent_bytes = regex
+            .report
+            .source_storage_bytes
+            .checked_add(regex.report.capture_name_storage_bytes)
+            .and_then(|bytes| bytes.checked_add(regex.report.plan_storage_bytes))
+            .expect("synthetic bound-HIR facade storage accounting does not overflow");
+        regex
+    }
+
+    fn forced_k0_with_structural_mandatory_suffix(pattern: &str) -> PortableRegex {
+        let regex = forced_k0_with_bound_hir_mandatory_suffix(pattern);
+        let PortablePlan::K0(plan) = &regex.plan else {
+            unreachable!("bound-HIR helper always installs K0");
+        };
+        assert!(
+            plan.mandatory_suffix
+                .as_ref()
+                .is_some_and(K0MandatorySuffixPlan::has_universal_finite_greedy_corridor),
         );
         regex
     }
@@ -16761,6 +17059,225 @@ mod tests {
     }
 
     #[test]
+    fn structural_greedy_corridor_admits_large_universal_graphs() {
+        let regex = forced_k0_with_structural_mandatory_suffix(
+            r"(?s-u:(?:[\x00-\x1F]|[^\x00-\x1F]){8,128}(?:[A-Za-z0-9_]|[^A-Za-z0-9_]){8,128}(?:[\x00-\x7F]|[\x80-\xFF]){16,256}.{32,512}SUFFIX88)",
+        );
+        let PortablePlan::K0(plan) = &regex.plan else {
+            panic!("large structural corridor fixture did not retain K0");
+        };
+        let suffix = plan
+            .mandatory_suffix
+            .as_ref()
+            .expect("large structural corridor retains its exact suffix");
+        assert_eq!(suffix.needle(), b"SUFFIX88");
+        assert_eq!(
+            suffix.universal_finite_match_byte_bounds(),
+            Some((72, 1_032)),
+        );
+        assert!(suffix.has_universal_finite_greedy_corridor());
+    }
+
+    #[test]
+    fn structural_greedy_corridor_selects_the_last_overlapping_near_floor_suffix() {
+        const FLOOR: usize = 1_024;
+        for (pattern, source, expected_end) in [
+            (r"(?s-u:.{0,3}aa)", b"aaaaa".as_slice(), FLOOR + 5),
+            (
+                r"(?s-u:.{0,2}.{0,3}aa)",
+                b"aaaaaaa".as_slice(),
+                FLOOR + 7,
+            ),
+            (r"(?s-u:.{2,4}aa)", b"bbaaaa".as_slice(), FLOOR + 6),
+        ] {
+            let regex = forced_k0_with_structural_mandatory_suffix(pattern);
+            let mut haystack = vec![b'q'; FLOOR + 2_048];
+            haystack[FLOOR..FLOOR + source.len()].copy_from_slice(source);
+            let window = SearchWindow::new(FLOOR, haystack.len());
+            let expected = Some(Match {
+                start: FLOOR,
+                end: expected_end,
+            });
+            assert_eq!(
+                regex
+                    .find_window_value(&haystack, window, SearchLimits::unlimited())
+                    .unwrap(),
+                expected,
+                "pattern={pattern:?}",
+            );
+
+            let mut session = regex
+                .search_session(SearchSessionLimits::unlimited())
+                .expect("structural greedy session constructs");
+            let PortableSearchSessionPlan::K0 {
+                session: k0_session,
+                mandatory_suffix: Some(suffix),
+                ..
+            } = &mut session.plan
+            else {
+                panic!("structural greedy session did not retain K0: {pattern:?}");
+            };
+            assert!(suffix.has_universal_finite_greedy_corridor());
+            let attempt = try_k0_mandatory_suffix_span_start(
+                k0_session,
+                suffix,
+                K0NegativePrefilterState::default(),
+                &haystack,
+                window,
+                SearchLimits::unlimited(),
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                attempt.outcome,
+                K0MandatorySuffixSpanOutcome::ProvedSpan {
+                    start: FLOOR,
+                    end: expected_end,
+                },
+                "pattern={pattern:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn structural_greedy_corridor_exhaustively_matches_exact_start_replay() {
+        const FLOOR: usize = 1_024;
+        for pattern in [
+            r"(?s-u:.{0,3}X)",
+            r"(?s-u:.{1,3}X)",
+            r"(?s-u:.{0,2}.{0,3}X)",
+            r"(?s-u:.{2}X)",
+        ] {
+            let structural = forced_k0_with_structural_mandatory_suffix(pattern);
+            let replay = forced_k0_with_only_mandatory_suffix(pattern);
+            let mut structural_session = structural
+                .search_session(SearchSessionLimits::unlimited())
+                .expect("structural differential session constructs");
+            let mut replay_session = replay
+                .search_session(SearchSessionLimits::unlimited())
+                .expect("replay differential session constructs");
+            let mut haystack = vec![b'q'; FLOOR + 2_048];
+            let address = haystack.as_ptr();
+            let window = SearchWindow::new(FLOOR, haystack.len());
+
+            for length in 0..=8_usize {
+                let populations = 1_usize << length;
+                for population in 0..populations {
+                    haystack[FLOOR..FLOOR + 9].fill(b'q');
+                    for offset in 0..length {
+                        haystack[FLOOR + offset] = if population & (1 << offset) == 0 {
+                            b'a'
+                        } else {
+                            b'X'
+                        };
+                    }
+                    assert_eq!(haystack.as_ptr(), address);
+                    let expected = replay_session
+                        .find_window_value(
+                            &haystack,
+                            window,
+                            SearchLimits::unlimited(),
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        structural_session
+                            .find_window_value(
+                                &haystack,
+                                window,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap(),
+                        expected,
+                        "pattern={pattern:?} length={length} population={population:#x}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn structural_greedy_corridor_does_not_change_lazy_or_ordered_priority() {
+        for pattern in [r"(?s-u:.{1,4}?Z)", r"(?s-u:(?:.{1}|.{3})Z)"] {
+            let regex = forced_k0_with_bound_hir_mandatory_suffix(pattern);
+            let PortablePlan::K0(plan) = &regex.plan else {
+                panic!("priority-refusal fixture did not retain K0: {pattern:?}");
+            };
+            let suffix = plan
+                .mandatory_suffix
+                .as_ref()
+                .expect("priority-refusal fixture retains its graph suffix");
+            assert!(!suffix.has_universal_finite_greedy_corridor());
+        }
+    }
+
+    #[test]
+    fn structural_greedy_corridor_closes_at_exact_and_one_below_planner_work() {
+        let (raw, hir, limits, _, minimum_match_bytes, maximum_match_bytes) =
+            lowered_k0_mandatory_suffix_with_hir(
+                r"(?s-u:(?:[\x00-\x7F]|[\x80-\xFF]){2,32}.{6,96}WXYZ)",
+            );
+        let complete = try_build_k0_mandatory_suffix(
+            &raw,
+            Some(&hir),
+            minimum_match_bytes,
+            maximum_match_bytes,
+            None,
+            limits,
+            0,
+        )
+        .expect("default work completes the structural greedy corridor");
+        let exact_work = complete.planner_work;
+        assert!(
+            complete
+                .plan
+                .as_ref()
+                .is_some_and(K0MandatorySuffixPlan::has_universal_finite_greedy_corridor),
+        );
+
+        let exact = try_build_k0_mandatory_suffix(
+            &raw,
+            Some(&hir),
+            minimum_match_bytes,
+            maximum_match_bytes,
+            None,
+            BuildLimits {
+                max_planner_work: exact_work,
+                ..limits
+            },
+            0,
+        )
+        .expect("exact structural greedy work completes");
+        assert_eq!(exact.planner_work, exact_work);
+        assert!(
+            exact
+                .plan
+                .as_ref()
+                .is_some_and(K0MandatorySuffixPlan::has_universal_finite_greedy_corridor),
+        );
+
+        let one_below_limit = exact_work
+            .checked_sub(1)
+            .expect("structural greedy inspection performs positive work");
+        let one_below = try_build_k0_mandatory_suffix(
+            &raw,
+            Some(&hir),
+            minimum_match_bytes,
+            maximum_match_bytes,
+            None,
+            BuildLimits {
+                max_planner_work: one_below_limit,
+                ..limits
+            },
+            0,
+        )
+        .expect("one-below structural work retains the baseline suffix");
+        assert_eq!(one_below.planner_work, one_below_limit);
+        assert!(one_below.plan.as_ref().is_some_and(|suffix| {
+            !suffix.has_universal_finite_greedy_corridor()
+        }));
+    }
+
+    #[test]
     fn universal_finite_corridor_refuses_holes_narrow_assertions_and_unicode_scalars() {
         for pattern in [
             r"(?s-u:(?:.{2}|.{4})XYZ)",
@@ -16787,6 +17304,7 @@ mod tests {
             lowered_k0_mandatory_cut_with_unicode(r"(?s:.{1,2}Z)", true);
         let suffix = try_build_k0_mandatory_suffix(
             &raw,
+            None,
             minimum_match_bytes,
             maximum_match_bytes,
             None,
@@ -16829,6 +17347,7 @@ mod tests {
         for max_planner_work in [baseline_work, one_extra_work] {
             let build = try_build_k0_mandatory_suffix(
                 &raw,
+                None,
                 minimum_match_bytes,
                 maximum_match_bytes,
                 None,
@@ -16878,6 +17397,7 @@ mod tests {
         ] {
             let build = try_build_k0_mandatory_suffix(
                 &raw,
+                None,
                 minimum_match_bytes,
                 maximum_match_bytes,
                 None,
@@ -16904,6 +17424,7 @@ mod tests {
 
         let complete = try_build_k0_mandatory_suffix(
             &raw,
+            None,
             minimum_match_bytes,
             maximum_match_bytes,
             None,
@@ -17782,6 +18303,7 @@ mod tests {
 
         let complete = try_build_k0_mandatory_suffix(
             &raw,
+            None,
             minimum_match_bytes,
             maximum_match_bytes,
             None,
@@ -17799,6 +18321,7 @@ mod tests {
         let exact_work = complete.planner_work;
         let exact = try_build_k0_mandatory_suffix(
             &raw,
+            None,
             minimum_match_bytes,
             maximum_match_bytes,
             None,
@@ -17823,6 +18346,7 @@ mod tests {
             .expect("the incumbent recovery consumes positive planner work");
         let one_below = try_build_k0_mandatory_suffix(
             &raw,
+            None,
             minimum_match_bytes,
             maximum_match_bytes,
             None,
@@ -17851,6 +18375,7 @@ mod tests {
 
         let replay = try_build_k0_mandatory_suffix(
             &raw,
+            None,
             minimum_match_bytes,
             maximum_match_bytes,
             None,
@@ -17882,6 +18407,7 @@ mod tests {
             .expect("edge inspection consumes positive planner work");
         let edge_refused = try_build_k0_mandatory_suffix(
             &raw,
+            None,
             minimum_match_bytes,
             maximum_match_bytes,
             None,
@@ -17905,6 +18431,7 @@ mod tests {
 
         let edge_replay = try_build_k0_mandatory_suffix(
             &raw,
+            None,
             minimum_match_bytes,
             maximum_match_bytes,
             None,
