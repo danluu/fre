@@ -14576,9 +14576,6 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     let try_v13 = pair_supertransition_possible
         .then(|| assembler.label())
         .transpose()?;
-    let try_v11 = pair_supertransition_possible
-        .then(|| assembler.label())
-        .transpose()?;
     let try_v10 = assembler.label()?;
     let try_v12 = assembler.label()?;
     let try_v9 = assembler.label()?;
@@ -14617,9 +14614,11 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     for entry in &mut v12_shift_entries {
         *entry = assembler.label()?;
     }
-    let v11_enter = pair_supertransition_possible
-        .then(|| assembler.label())
-        .transpose()?;
+    // V13 strictly dominates V11 under the shared resident and token caps:
+    // every table the compiler can publish as V11 is smaller as V13. Keep
+    // the legacy V11 verifier/lowering available for direct ABI audits, but
+    // do not put its unreachable guard or body in every generated entry.
+    let v11_enter: Option<X86Label> = None;
     let v13_enter = pair_supertransition_possible
         .then(|| assembler.label())
         .transpose()?;
@@ -14631,11 +14630,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     } else {
         None
     };
-    let v11_shift_entries = if pair_supertransition_possible {
-        Some([assembler.label()?, assembler.label()?])
-    } else {
-        None
-    };
+    let v11_shift_entries: Option<[X86Label; 2]> = None;
     let v3_enter = assembler.label()?;
     let v3_dispatch = assembler.label()?;
     let v8_enter = assembler.label()?;
@@ -14774,21 +14769,9 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
             FrozenCompactGuardMode::ActiveCapability,
         )?;
     }
-    if let (Some(try_v13), Some(v13_enter), Some(try_v11)) =
-        (try_v13, v13_enter, try_v11)
-    {
+    if let (Some(try_v13), Some(v13_enter)) = (try_v13, v13_enter) {
         assembler.bind(try_v13)?;
         x86_emit_frozen_compact_v13_entry(
-            &mut assembler,
-            try_v11,
-            call_preflight,
-            v13_enter,
-            FrozenCompactGuardMode::ActiveCapability,
-        )?;
-    }
-    if let (Some(try_v11), Some(v11_enter)) = (try_v11, v11_enter) {
-        assembler.bind(try_v11)?;
-        x86_emit_frozen_compact_v11_entry(
             &mut assembler,
             if direct_byte_formats_possible {
                 try_v10
@@ -14796,7 +14779,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
                 try_v12
             },
             call_preflight,
-            v11_enter,
+            v13_enter,
             FrozenCompactGuardMode::ActiveCapability,
         )?;
     }
@@ -25064,9 +25047,6 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     let try_v13 = pair_supertransition_possible
         .then(|| assembler.label())
         .transpose()?;
-    let try_v11 = pair_supertransition_possible
-        .then(|| assembler.label())
-        .transpose()?;
     let try_v10 = assembler.label()?;
     let try_v12 = assembler.label()?;
     let try_v9 = assembler.label()?;
@@ -25096,9 +25076,10 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     for entry in &mut v12_shift_entries {
         *entry = assembler.label()?;
     }
-    let v11_enter = pair_supertransition_possible
-        .then(|| assembler.label())
-        .transpose()?;
+    // V13 strictly dominates V11 under the shared resident and token caps.
+    // Omitting the unreachable V11 guard/body keeps the common generated
+    // entry smaller without weakening the direct legacy-format verifier.
+    let v11_enter: Option<Aarch64Label> = None;
     let v13_enter = pair_supertransition_possible
         .then(|| assembler.label())
         .transpose()?;
@@ -25110,11 +25091,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     } else {
         None
     };
-    let v11_shift_entries = if pair_supertransition_possible {
-        Some([assembler.label()?, assembler.label()?])
-    } else {
-        None
-    };
+    let v11_shift_entries: Option<[Aarch64Label; 2]> = None;
     let v3_enter = assembler.label()?;
     let v3_dispatch = assembler.label()?;
     let v8_enter = assembler.label()?;
@@ -25268,21 +25245,9 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
             FrozenCompactGuardMode::ActiveCapability,
         )?;
     }
-    if let (Some(try_v13), Some(v13_enter), Some(try_v11)) =
-        (try_v13, v13_enter, try_v11)
-    {
+    if let (Some(try_v13), Some(v13_enter)) = (try_v13, v13_enter) {
         assembler.bind(try_v13)?;
         aarch64_emit_frozen_compact_v13_entry(
-            &mut assembler,
-            try_v11,
-            call_preflight,
-            v13_enter,
-            FrozenCompactGuardMode::ActiveCapability,
-        )?;
-    }
-    if let (Some(try_v11), Some(v11_enter)) = (try_v11, v11_enter) {
-        assembler.bind(try_v11)?;
-        aarch64_emit_frozen_compact_v11_entry(
             &mut assembler,
             if direct_byte_formats_possible {
                 try_v10
@@ -25290,7 +25255,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
                 try_v12
             },
             call_preflight,
-            v11_enter,
+            v13_enter,
             FrozenCompactGuardMode::ActiveCapability,
         )?;
     }
@@ -29379,16 +29344,17 @@ mod tests {
                 .unwrap();
                 let code = emission.code.as_slice();
                 let context = format!("x86/{tier}/{output:?}");
+                let supertransitions = output != OutputContract::Span;
                 assert_eq!(byte_occurrences(code, &x86_pair_guard), 20, "{context}");
                 assert_eq!(
                     byte_occurrences(code, &x86_second_byte),
-                    22,
-                    "{context}: twenty ordinary paired bodies plus two V11 class shifts"
+                    if supertransitions { 30 } else { 20 },
+                    "{context}: all production paired bodies"
                 );
                 assert_eq!(
                     byte_occurrences(code, &x86_second_class),
-                    21,
-                    "{context}: nineteen mapped ordinary bodies plus two V11 class shifts"
+                    if supertransitions { 38 } else { 19 },
+                    "{context}: all production mapped paired bodies"
                 );
                 assert_eq!(
                     byte_occurrences(code, &x86_second_u16_cell),
@@ -29501,6 +29467,7 @@ mod tests {
             .unwrap();
             let words = aarch64_words(&emission.code);
             let context = format!("AArch64/{output:?}");
+            let supertransitions = output != OutputContract::Span;
             let guards = words
                 .windows(arm_pair_guard.len())
                 .enumerate()
@@ -29525,8 +29492,8 @@ mod tests {
                     .iter()
                     .filter(|&&word| word == arm_second_class)
                     .count(),
-                21,
-                "{context}: V3/V4/V12 plus both V11 shift second-class loads"
+                if supertransitions { 38 } else { 19 },
+                "{context}: production V3/V4/V12 mapped second-class loads"
             );
             assert_eq!(
                 words
@@ -45637,9 +45604,9 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "one structural audit covers the exact V11 capability and both target-native pair loops"
+        reason = "one structural audit covers the exact legacy V11 verifier and proves its dominated body is absent from production entries"
     )]
-    fn pair_supertransition_v11_is_exact_scanner_free_and_cross_isa() {
+    fn pair_supertransition_v11_verifier_is_exact_but_production_entries_omit_it() {
         fn occurrences(code: &[u8], needle: &[u8]) -> usize {
             code.windows(needle.len())
                 .filter(|window| *window == needle)
@@ -45773,29 +45740,31 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 false,
             )
             .unwrap();
-            assert_eq!(occurrences(&x86.code, &x86_flag), 1, "{context}");
-            assert_eq!(occurrences(&x86.code, &x86_version), 1, "{context}");
-            assert_eq!(occurrences(&x86.code, &x86_ready), 1, "{context}");
-            assert!(
-                occurrences(&x86.code, &[0x47, 0x8d, 0x14, 0x53]) >= 7,
-                "V14 plus V11 C=2 fused pair keys: {context}"
+            assert_eq!(occurrences(&x86.code, &x86_flag), 0, "{context}");
+            assert_eq!(occurrences(&x86.code, &x86_version), 0, "{context}");
+            assert_eq!(occurrences(&x86.code, &x86_ready), 0, "{context}");
+            assert_eq!(
+                occurrences(&x86.code, &[0x47, 0x8d, 0x14, 0x53]),
+                6,
+                "V14 C=2 fused pair keys: {context}"
             );
-            assert!(
-                occurrences(&x86.code, &[0x47, 0x8d, 0x14, 0x93]) >= 7,
-                "V14 plus V11 C=4 fused pair keys: {context}"
+            assert_eq!(
+                occurrences(&x86.code, &[0x47, 0x8d, 0x14, 0x93]),
+                6,
+                "V14 C=4 fused pair keys: {context}"
             );
             assert_eq!(
                 occurrences(&x86.code, &[0x47, 0x8b, 0x14, 0x90]),
-                3,
-                "two V11 u32 pair loads plus the legacy pointer-row load: {context}"
+                1,
+                "only the legacy pointer-row load remains: {context}"
             );
             assert_eq!(
                 occurrences(&x86.code, &[0x4e, 0x8d, 0x44, 0x96, 0xfc]),
-                3,
-                "two V11 block updates plus the legacy pointer-row update: {context}"
+                1,
+                "only the legacy pointer-row update remains: {context}"
             );
-            assert_eq!(occurrences(&x86.code, &[0x45, 0x8b, 0x58, 0x10]), 1);
-            assert_eq!(occurrences(&x86.code, &[0x45, 0x8b, 0x58, 0x40]), 1);
+            assert_eq!(occurrences(&x86.code, &[0x45, 0x8b, 0x58, 0x10]), 0);
+            assert_eq!(occurrences(&x86.code, &[0x45, 0x8b, 0x58, 0x40]), 0);
             let initial_bound_prefix = [0x4c, 0x8d, 0x5a, 0x01, 0x49, 0x39, 0xcb];
             assert_eq!(
                 x86.code
@@ -45811,8 +45780,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                         )
                     })
                     .count(),
-                3,
-                "dense V13 and both V11 class shifts must protect their second-byte load"
+                1,
+                "the dense V13 body must protect its second-byte load"
             );
 
             let arm = lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
@@ -45833,41 +45802,41 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                     .windows(arm_flag.len())
                     .filter(|words| *words == arm_flag)
                     .count(),
-                1,
+                0,
                 "{context}"
             );
-            assert_eq!(occurrences(&arm.code, &arm_ready), 1, "{context}");
-            assert!(
+            assert_eq!(occurrences(&arm.code, &arm_ready), 0, "{context}");
+            assert_eq!(
                 arm_words
                     .iter()
                     .filter(|&&word| word == aarch64_add_w_lsl(8, 10, 8, 1).unwrap())
-                    .count()
-                    >= 7,
-                "V14 plus V11 C=2 fused pair keys: {context}"
+                    .count(),
+                6,
+                "V14 C=2 fused pair keys: {context}"
             );
-            assert!(
+            assert_eq!(
                 arm_words
                     .iter()
                     .filter(|&&word| word == aarch64_add_w_lsl(8, 10, 8, 2).unwrap())
-                    .count()
-                    >= 7,
-                "V14 plus V11 C=4 fused pair keys: {context}"
+                    .count(),
+                6,
+                "V14 C=4 fused pair keys: {context}"
             );
             assert_eq!(
                 arm_words
                     .iter()
                     .filter(|&&word| word == aarch64_load_w_uxtw(8, 11, 8).unwrap())
                     .count(),
-                2,
-                "one u32 pair load for each admitted class shift: {context}"
+                0,
+                "dominated V11 u32 pair loads must be absent: {context}"
             );
             assert_eq!(
                 arm_words
                     .iter()
                     .filter(|&&word| word == aarch64_add_x_uxtw(11, 15, 8, 2).unwrap())
                     .count(),
-                2,
-                "one biased one-based block update for each class shift: {context}"
+                0,
+                "dominated V11 block updates must be absent: {context}"
             );
             assert_eq!(
                 arm_words
@@ -45877,8 +45846,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                             || word == aarch64_load_w_imm(10, 11, 64).unwrap()
                     })
                     .count(),
-                2,
-                "P=2 and P=4 odd-tail bitmaps: {context}"
+                0,
+                "dominated V11 odd-tail bitmaps must be absent: {context}"
             );
             let initial_bound_prefix = [
                 aarch64_add_x_imm(9, 2, 1).unwrap(),
@@ -45893,8 +45862,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                                 == 0x5400_0000 | u32::from(AARCH64_HS)
                     })
                     .count(),
-                3,
-                "dense V13 and both V11 class shifts must protect byte two: {context}"
+                1,
+                "the dense V13 body must protect byte two: {context}"
             );
         }
 
@@ -46274,8 +46243,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
         );
         assert_eq!(
             occurrences(&x86.code, &[0x49, 0x89, 0xf0]),
-            36,
-            "V14/V13/V11, singleton, V8/V9/V10/V12, V7/V4, and every V6/V3/V12 entry install row zero"
+            35,
+            "V14/V13, singleton, V8/V9/V10/V12, V7/V4, and every V6/V3/V12 entry install row zero"
         );
         assert_eq!(
             occurrences(&x86.code, &[0x4e, 0x8d, 0x04, 0x46]),
@@ -46337,11 +46306,11 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             .windows(v13_flag.len())
             .position(|window| window == v13_flag.as_slice())
             .unwrap();
-        let v11_selection = x86
-            .code
-            .windows(v11_flag.len())
-            .position(|window| window == v11_flag.as_slice())
-            .unwrap();
+        assert_eq!(
+            occurrences(&x86.code, &v11_flag),
+            0,
+            "the V13-dominated V11 capability must not occupy production entries"
+        );
         let v10_selection = x86
             .code
             .windows(v10_flag.len())
@@ -46382,15 +46351,14 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 && v7_selection < v6_selection
                 && v6_selection < v14_selection
                 && v14_selection < v13_selection
-                && v13_selection < v11_selection
-                && v11_selection < v10_selection
+                && v13_selection < v10_selection
                 && v10_selection < v12_selection
                 && v12_selection < v9_selection
                 && v9_selection < v8_selection
                 && v8_selection < v4_selection
                 && v4_selection < v3_selection
                 && v3_selection < v2_selection,
-            "V5, V7, V6, V14, V13, V11, V10, V12, V9, V8, V4, V3, and V2 must retain priority order"
+            "V5, V7, V6, V14, V13, V10, V12, V9, V8, V4, V3, and V2 must retain priority order"
         );
         assert_eq!(
             occurrences(&x86.code[v5_selection..v2_selection], &x86_full_geometry),
@@ -46855,8 +46823,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 .iter()
                 .filter(|&&word| word == aarch64_mov_x(11, 15).unwrap())
                 .count(),
-            28,
-            "V14/V13/V11, singleton, V8/V9/V10/V12, V7/V4, shared V6, and every V3/V12 entry install row zero"
+            27,
+            "V14/V13, singleton, V8/V9/V10/V12, V7/V4, shared V6, and every V3/V12 entry install row zero"
         );
         assert!(arm_words.contains(
             &aarch64_add_x_imm(
@@ -46997,10 +46965,14 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             .windows(arm_v13_flag.len())
             .position(|words| words == arm_v13_flag)
             .unwrap();
-        let arm_v11_selection = arm_words
-            .windows(arm_v11_flag.len())
-            .position(|words| words == arm_v11_flag)
-            .unwrap();
+        assert_eq!(
+            arm_words
+                .windows(arm_v11_flag.len())
+                .filter(|words| *words == arm_v11_flag)
+                .count(),
+            0,
+            "the V13-dominated V11 capability must not occupy production entries"
+        );
         let arm_v10_selection = arm_words
             .windows(arm_v10_flag.len())
             .position(|words| words == arm_v10_flag)
@@ -47034,8 +47006,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 && arm_v7_selection < arm_v6_selection
                 && arm_v6_selection < arm_v14_selection
                 && arm_v14_selection < arm_v13_selection
-                && arm_v13_selection < arm_v11_selection
-                && arm_v11_selection < arm_v10_selection
+                && arm_v13_selection < arm_v10_selection
                 && arm_v10_selection < arm_v12_selection
                 && arm_v12_selection < arm_v9_selection
                 && arm_v9_selection < arm_v8_selection
