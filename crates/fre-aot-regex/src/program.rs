@@ -2601,7 +2601,7 @@ pub struct FrozenPreparedHeaderV5 {
 
 /// Maximum prepared-header envelope for every immutable compact generation.
 ///
-/// The complete V3 record remains an offset-zero prefix. V3/V4/V8/V9/V10/V12
+/// The complete V3 record remains an offset-zero prefix. V3/V4/V8/V9/V10/V11/V12
 /// use only that 448-byte logical extent, V5 uses the first two extension words
 /// through byte 456, and V6/V7 authenticate the complete 664-byte envelope
 /// before reading loop ownership. The V5 summary words intentionally overlay
@@ -2624,10 +2624,11 @@ pub struct FrozenPreparedHeaderV6 {
 /// order. V10 stores those raw columns as `u8`, while V12 stores the exact
 /// mapped projection in padded `u8` rows. In both byte-cell formats bit 7 is
 /// acceptance and the low 7 bits hold a one-based destination-state ordinal.
-/// Every format retains zero as the closed dead transition and physical row
-/// zero as the canonical initial state. Exact V1 flags, versions, seals, and
-/// geometry distinguish the interpretations before generated code follows the
-/// rows pointer.
+/// V11 stores mapped two-transition `u32` cells followed by one odd-tail
+/// acceptance bitmap per state block. Every format retains physical row or
+/// block zero as the canonical initial state. Exact V1 flags, versions, seals,
+/// and geometry distinguish the interpretations before generated code follows
+/// the rows pointer.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[repr(C)]
@@ -2804,11 +2805,12 @@ pub struct FrozenDynamicRowsStorage {
     descriptor: DynamicNativeRowsV1,
 }
 
-/// Pointer-stable immutable ownership for a compact V3/V4/V8/V9/V10/V12 table.
+/// Pointer-stable immutable ownership for a compact V3/V4/V8/V9/V10/V11/V12 table.
 ///
-/// V10 and V12 own a separately allocated byte table. They never reinterpret
-/// a u16 allocation at a wider or differently aligned type, and exactly one
-/// of the two row owners is populated for any published generation.
+/// V10 and V12 own a separately allocated byte table, while V11 owns `u32`
+/// pair blocks. No generation reinterprets an allocation at a wider or
+/// differently aligned type, and exactly one row owner is populated for any
+/// published generation.
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct FrozenDynamicRowsStorageV3 {
@@ -2816,6 +2818,7 @@ pub struct FrozenDynamicRowsStorageV3 {
     artifact_identity: [u8; 32],
     rows: Box<[u16]>,
     rows_u8: Option<Box<[u8]>>,
+    pair_rows_v11: Option<Box<[u32]>>,
     class_map: [u8; 256],
     descriptor: FrozenDynamicRowsV3,
     unary_exists_first_accept_step: Option<u32>,
@@ -2869,8 +2872,11 @@ pub const FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V9: u32 = 1 << 10;
 /// An authenticated raw-byte compact-u8 V10 tail is present.
 #[doc(hidden)]
 pub const FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V10: u32 = 1 << 11;
+/// An authenticated mapped pair-supertransition V11 tail is present.
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V11: u32 = 1 << 12;
 /// An authenticated mapped compact-u8 V12 tail is present. Bit 12 remains
-/// reserved for the independently versioned V11 specialization.
+/// assigned to the independently versioned V11 specialization.
 #[doc(hidden)]
 pub const FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V12: u32 = 1 << 13;
 /// Sentinel used when no reverse root row exists.
@@ -2990,6 +2996,9 @@ pub const FROZEN_PREPARED_HEADER_V9_READY_SEAL: u64 = 0x27ad_c4e8_6b15_f903;
 /// Final publication seal for a raw-byte compact-u8 V10 tail.
 #[doc(hidden)]
 pub const FROZEN_PREPARED_HEADER_V10_READY_SEAL: u64 = 0xa650_9e31_47dc_82bf;
+/// Final publication seal for a mapped pair-supertransition V11 tail.
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V11_READY_SEAL: u64 = 0x6eb4_93d2_a17c_f805;
 /// Final publication seal for a mapped compact-u8 V12 tail.
 #[doc(hidden)]
 pub const FROZEN_PREPARED_HEADER_V12_READY_SEAL: u64 = 0x3d91_f7a6_2be8_c405;
@@ -3017,6 +3026,9 @@ pub const FROZEN_DYNAMIC_ROWS_V9_FORMAT_VERSION: u32 = 9;
 /// Exact raw-byte compact-u8 tail format selected by the V10 flag.
 #[doc(hidden)]
 pub const FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION: u32 = 10;
+/// Exact mapped pair-supertransition tail format selected by the V11 flag.
+#[doc(hidden)]
+pub const FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION: u32 = 11;
 /// Exact mapped compact-u8 tail format selected by the V12 flag.
 #[doc(hidden)]
 pub const FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION: u32 = 12;
@@ -3069,6 +3081,13 @@ pub const FROZEN_PREPARED_HEADER_V10_DYNAMIC_ROWS_OFFSET: usize =
 /// Exact V10 logical extent inside the physical V6 envelope.
 #[doc(hidden)]
 pub const FROZEN_PREPARED_HEADER_V10_BYTES: usize = FROZEN_PREPARED_HEADER_V3_BYTES;
+/// V11 reuses the compact logical extent inside the physical V6 envelope.
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V11_DYNAMIC_ROWS_OFFSET: usize =
+    FROZEN_PREPARED_HEADER_V3_DYNAMIC_ROWS_OFFSET;
+/// Exact V11 logical extent inside the physical V6 envelope.
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V11_BYTES: usize = FROZEN_PREPARED_HEADER_V3_BYTES;
 /// V12 reuses the compact logical extent inside the physical V6 envelope.
 #[doc(hidden)]
 pub const FROZEN_PREPARED_HEADER_V12_DYNAMIC_ROWS_OFFSET: usize =
@@ -3097,6 +3116,24 @@ pub const DYNAMIC_NATIVE_ROWS_V10_ACCEPT_MASK: u8 = 1 << 7;
 /// One-based destination-state field in a compact-u8 V10 row.
 #[doc(hidden)]
 pub const DYNAMIC_NATIVE_ROWS_V10_NEXT_STATE_TOKEN_MASK: u8 = (1 << 7) - 1;
+/// Any of the two V11 transitions accepts, including an accepting dead edge.
+#[doc(hidden)]
+pub const DYNAMIC_NATIVE_ROWS_V11_ANY_ACCEPT_MASK: u32 = 1 << 31;
+/// The first transition is the pair's latest accepting transition.
+#[doc(hidden)]
+pub const DYNAMIC_NATIVE_ROWS_V11_ACCEPT_BACK_ONE_MASK: u32 = 1 << 30;
+/// The first transition is dead, so only one input byte is consumed.
+#[doc(hidden)]
+pub const DYNAMIC_NATIVE_ROWS_V11_FIRST_DEAD_MASK: u32 = 1 << 29;
+/// One-based destination V11 block-word offset; zero is terminal/dead.
+#[doc(hidden)]
+pub const DYNAMIC_NATIVE_ROWS_V11_NEXT_BLOCK_TOKEN_MASK: u32 = (1 << 29) - 1;
+/// Smallest semantic alphabet admitted to pair-supertransition V11.
+pub(crate) const FROZEN_PAIR_ROWS_V11_MIN_CLASSES: usize = 2;
+/// Largest semantic alphabet admitted to the initial V11 slice.
+pub(crate) const FROZEN_PAIR_ROWS_V11_MAX_CLASSES: usize = 4;
+/// Independent resident allocation ceiling for the initial V11 slice.
+pub(crate) const FROZEN_PAIR_ROWS_V11_MAX_BYTES: usize = 64 * 1024;
 /// Closed dead transition in a mapped compact-u8 V12 row.
 #[doc(hidden)]
 pub const DYNAMIC_NATIVE_ROWS_V12_DEAD_CELL: u8 = DYNAMIC_NATIVE_ROWS_V10_DEAD_CELL;
@@ -3121,6 +3158,7 @@ enum FrozenCompactRowsFormat {
     StateOrdinalDirectV8,
     CellOffsetDirectV9,
     StateOrdinalDirectU8V10,
+    PairSupertransitionV11,
     StateOrdinalMappedU8V12,
 }
 
@@ -3139,6 +3177,7 @@ impl FrozenCompactRowsFormat {
             Self::StateOrdinalDirectV8 => FROZEN_DYNAMIC_ROWS_V8_FORMAT_VERSION,
             Self::CellOffsetDirectV9 => FROZEN_DYNAMIC_ROWS_V9_FORMAT_VERSION,
             Self::StateOrdinalDirectU8V10 => FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION,
+            Self::PairSupertransitionV11 => FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION,
             Self::StateOrdinalMappedU8V12 => FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION,
         }
     }
@@ -3150,6 +3189,7 @@ impl FrozenCompactRowsFormat {
             Self::StateOrdinalDirectV8 => FROZEN_PREPARED_HEADER_V8_READY_SEAL,
             Self::CellOffsetDirectV9 => FROZEN_PREPARED_HEADER_V9_READY_SEAL,
             Self::StateOrdinalDirectU8V10 => FROZEN_PREPARED_HEADER_V10_READY_SEAL,
+            Self::PairSupertransitionV11 => FROZEN_PREPARED_HEADER_V11_READY_SEAL,
             Self::StateOrdinalMappedU8V12 => FROZEN_PREPARED_HEADER_V12_READY_SEAL,
         }
     }
@@ -3162,6 +3202,9 @@ impl FrozenCompactRowsFormat {
             Self::CellOffsetDirectV9 => FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V9,
             Self::StateOrdinalDirectU8V10 => {
                 FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V10
+            }
+            Self::PairSupertransitionV11 => {
+                FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V11
             }
             Self::StateOrdinalMappedU8V12 => {
                 FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V12
@@ -3199,11 +3242,16 @@ impl FrozenCompactRowsFormat {
         )
     }
 
+    const fn is_pair_supertransition(self) -> bool {
+        matches!(self, Self::PairSupertransitionV11)
+    }
+
     const fn direct_byte(self) -> Self {
         match self {
             Self::StateOrdinalV3 | Self::StateOrdinalDirectV8 => Self::StateOrdinalDirectV8,
             Self::CellOffsetV4 | Self::CellOffsetDirectV9 => Self::CellOffsetDirectV9,
             Self::StateOrdinalDirectU8V10 => Self::StateOrdinalDirectU8V10,
+            Self::PairSupertransitionV11 => Self::PairSupertransitionV11,
             Self::StateOrdinalMappedU8V12 => Self::StateOrdinalMappedU8V12,
         }
     }
@@ -3224,6 +3272,147 @@ fn select_frozen_compact_rows_format(
     } else {
         None
     }
+}
+
+/// Return `(physical_classes, pair_cells, block_words, total_words, bytes)`
+/// for one bounded V11 table. The byte count includes the inline 256-byte map,
+/// matching the resource accounting used by the older compact formats.
+fn frozen_pair_rows_v11_geometry(
+    state_count: usize,
+    class_count: usize,
+) -> Option<(usize, usize, usize, usize, usize)> {
+    if state_count == 0
+        || !(FROZEN_PAIR_ROWS_V11_MIN_CLASSES..=FROZEN_PAIR_ROWS_V11_MAX_CLASSES)
+            .contains(&class_count)
+    {
+        return None;
+    }
+    let physical_classes = class_count.checked_next_power_of_two()?;
+    let pair_cells = physical_classes.checked_mul(physical_classes)?;
+    let block_words = pair_cells.checked_add(1)?;
+    let total_words = state_count.checked_mul(block_words)?;
+    if total_words > usize::try_from(DYNAMIC_NATIVE_ROWS_V11_NEXT_BLOCK_TOKEN_MASK).ok()? {
+        return None;
+    }
+    let bytes = total_words
+        .checked_mul(core::mem::size_of::<u32>())?
+        .checked_add(256)?;
+    Some((
+        physical_classes,
+        pair_cells,
+        block_words,
+        total_words,
+        bytes,
+    ))
+}
+
+/// Compose one pair cell from the canonical one-symbol semantics shared by V3
+/// and V4. A dead first transition deliberately ignores `second`: although the
+/// generated loop may safely fetch the second input byte, the DFA consumes
+/// only the first byte and never observes a successor transition.
+fn frozen_pair_cell_v11(first: u16, second: Option<u16>, block_words: usize) -> Option<u32> {
+    if block_words == 0 {
+        return None;
+    }
+    let first_accepts = first & DYNAMIC_NATIVE_ROWS_V3_ACCEPT_MASK != 0;
+    let first_token = first & DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK;
+    if first_token == 0 {
+        return Some(
+            (if first_accepts {
+                DYNAMIC_NATIVE_ROWS_V11_ANY_ACCEPT_MASK
+            } else {
+                0
+            }) | DYNAMIC_NATIVE_ROWS_V11_FIRST_DEAD_MASK,
+        );
+    }
+
+    let second = second?;
+    let second_accepts = second & DYNAMIC_NATIVE_ROWS_V3_ACCEPT_MASK != 0;
+    let second_token = second & DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK;
+    let mut pair = if first_accepts || second_accepts {
+        DYNAMIC_NATIVE_ROWS_V11_ANY_ACCEPT_MASK
+    } else {
+        0
+    };
+    if first_accepts && !second_accepts {
+        pair |= DYNAMIC_NATIVE_ROWS_V11_ACCEPT_BACK_ONE_MASK;
+    }
+    if second_token != 0 {
+        let destination = usize::from(second_token).checked_sub(1)?;
+        let token = destination.checked_mul(block_words)?.checked_add(1)?;
+        let token = u32::try_from(token).ok()?;
+        if token > DYNAMIC_NATIVE_ROWS_V11_NEXT_BLOCK_TOKEN_MASK {
+            return None;
+        }
+        pair |= token;
+    }
+    Some(pair)
+}
+
+fn build_frozen_pair_rows_v11(
+    source_rows: &[u32],
+    columns: &FrozenCompactColumnProjection,
+    source_class_count: usize,
+    state_count: usize,
+    source_initial_state: usize,
+) -> Option<Box<[u32]>> {
+    let class_count = columns.class_count;
+    let (physical_classes, _, block_words, total_words, _) =
+        frozen_pair_rows_v11_geometry(state_count, class_count)?;
+
+    let semantic_cells = state_count.checked_mul(class_count)?;
+    let mut semantics = Vec::new();
+    semantics.try_reserve_exact(semantic_cells).ok()?;
+    for canonical_state in 0..state_count {
+        let source_state =
+            canonicalize_frozen_state_ordinal(canonical_state, source_initial_state);
+        let source_row = source_state.checked_mul(source_class_count)?;
+        for &source_class in &columns.source_classes[..class_count] {
+            let cell = *source_rows.get(source_row.checked_add(usize::from(source_class))?)?;
+            semantics.push(frozen_compact_semantic_cell(
+                cell,
+                source_class_count,
+                state_count,
+                source_initial_state,
+            )?);
+        }
+    }
+    if semantics.len() != semantic_cells {
+        return None;
+    }
+
+    let mut pair_rows = Vec::new();
+    pair_rows.try_reserve_exact(total_words).ok()?;
+    for state in 0..state_count {
+        let semantic_row = state.checked_mul(class_count)?;
+        for first_class in 0..physical_classes {
+            for second_class in 0..physical_classes {
+                if first_class >= class_count || second_class >= class_count {
+                    pair_rows.push(0);
+                    continue;
+                }
+                let first = *semantics.get(semantic_row.checked_add(first_class)?)?;
+                let first_token = first & DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK;
+                let second = if first_token == 0 {
+                    None
+                } else {
+                    let first_destination = usize::from(first_token).checked_sub(1)?;
+                    let destination_row = first_destination.checked_mul(class_count)?;
+                    Some(*semantics.get(destination_row.checked_add(second_class)?)?)
+                };
+                pair_rows.push(frozen_pair_cell_v11(first, second, block_words)?);
+            }
+        }
+        let mut tail_accepts = 0_u32;
+        for class in 0..class_count {
+            let cell = *semantics.get(semantic_row.checked_add(class)?)?;
+            if cell & DYNAMIC_NATIVE_ROWS_V3_ACCEPT_MASK != 0 {
+                tail_accepts |= 1_u32.checked_shl(u32::try_from(class).ok()?)?;
+            }
+        }
+        pair_rows.push(tail_accepts);
+    }
+    (pair_rows.len() == total_words).then(|| pair_rows.into_boxed_slice())
 }
 
 /// V3 tail field offsets used by target-native lowering.
@@ -3385,6 +3574,11 @@ const _: () = {
     );
     assert!(FROZEN_PREPARED_HEADER_V10_BYTES == FROZEN_PREPARED_HEADER_V3_BYTES);
     assert!(
+        FROZEN_PREPARED_HEADER_V11_DYNAMIC_ROWS_OFFSET
+            == FROZEN_PREPARED_HEADER_V3_DYNAMIC_ROWS_OFFSET
+    );
+    assert!(FROZEN_PREPARED_HEADER_V11_BYTES == FROZEN_PREPARED_HEADER_V3_BYTES);
+    assert!(
         FROZEN_PREPARED_HEADER_V12_DYNAMIC_ROWS_OFFSET
             == FROZEN_PREPARED_HEADER_V3_DYNAMIC_ROWS_OFFSET
     );
@@ -3406,11 +3600,20 @@ const _: () = {
     assert!(FROZEN_PREPARED_HEADER_V10_READY_SEAL != FROZEN_PREPARED_HEADER_V5_READY_SEAL);
     assert!(FROZEN_PREPARED_HEADER_V10_READY_SEAL != FROZEN_PREPARED_HEADER_V6_READY_SEAL);
     assert!(FROZEN_PREPARED_HEADER_V10_READY_SEAL != FROZEN_PREPARED_HEADER_V7_READY_SEAL);
+    assert!(FROZEN_PREPARED_HEADER_V11_READY_SEAL != FROZEN_PREPARED_HEADER_V3_READY_SEAL);
+    assert!(FROZEN_PREPARED_HEADER_V11_READY_SEAL != FROZEN_PREPARED_HEADER_V4_READY_SEAL);
+    assert!(FROZEN_PREPARED_HEADER_V11_READY_SEAL != FROZEN_PREPARED_HEADER_V5_READY_SEAL);
+    assert!(FROZEN_PREPARED_HEADER_V11_READY_SEAL != FROZEN_PREPARED_HEADER_V6_READY_SEAL);
+    assert!(FROZEN_PREPARED_HEADER_V11_READY_SEAL != FROZEN_PREPARED_HEADER_V7_READY_SEAL);
+    assert!(FROZEN_PREPARED_HEADER_V11_READY_SEAL != FROZEN_PREPARED_HEADER_V8_READY_SEAL);
+    assert!(FROZEN_PREPARED_HEADER_V11_READY_SEAL != FROZEN_PREPARED_HEADER_V9_READY_SEAL);
+    assert!(FROZEN_PREPARED_HEADER_V11_READY_SEAL != FROZEN_PREPARED_HEADER_V10_READY_SEAL);
     assert!(FROZEN_PREPARED_HEADER_V12_READY_SEAL != FROZEN_PREPARED_HEADER_V3_READY_SEAL);
     assert!(FROZEN_PREPARED_HEADER_V12_READY_SEAL != FROZEN_PREPARED_HEADER_V4_READY_SEAL);
     assert!(FROZEN_PREPARED_HEADER_V12_READY_SEAL != FROZEN_PREPARED_HEADER_V8_READY_SEAL);
     assert!(FROZEN_PREPARED_HEADER_V12_READY_SEAL != FROZEN_PREPARED_HEADER_V9_READY_SEAL);
     assert!(FROZEN_PREPARED_HEADER_V12_READY_SEAL != FROZEN_PREPARED_HEADER_V10_READY_SEAL);
+    assert!(FROZEN_PREPARED_HEADER_V12_READY_SEAL != FROZEN_PREPARED_HEADER_V11_READY_SEAL);
     assert!(FROZEN_PREPARED_HEADER_V12_READY_SEAL != FROZEN_PREPARED_HEADER_V5_READY_SEAL);
     assert!(FROZEN_PREPARED_HEADER_V12_READY_SEAL != FROZEN_PREPARED_HEADER_V6_READY_SEAL);
     assert!(FROZEN_PREPARED_HEADER_V12_READY_SEAL != FROZEN_PREPARED_HEADER_V7_READY_SEAL);
@@ -3424,11 +3627,17 @@ const _: () = {
     assert!(FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION != FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION);
     assert!(FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION != FROZEN_DYNAMIC_ROWS_V8_FORMAT_VERSION);
     assert!(FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION != FROZEN_DYNAMIC_ROWS_V9_FORMAT_VERSION);
+    assert!(FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION != FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION);
+    assert!(FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION != FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION);
+    assert!(FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION != FROZEN_DYNAMIC_ROWS_V8_FORMAT_VERSION);
+    assert!(FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION != FROZEN_DYNAMIC_ROWS_V9_FORMAT_VERSION);
+    assert!(FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION != FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION);
     assert!(FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION != FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION);
     assert!(FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION != FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION);
     assert!(FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION != FROZEN_DYNAMIC_ROWS_V8_FORMAT_VERSION);
     assert!(FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION != FROZEN_DYNAMIC_ROWS_V9_FORMAT_VERSION);
     assert!(FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION != FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION);
+    assert!(FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION != FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION);
     assert!(
         (FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3
             | FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V4
@@ -3438,9 +3647,10 @@ const _: () = {
             | FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V8
             | FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V9
             | FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V10
+            | FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V11
             | FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V12)
             .count_ones()
-            == 9
+            == 10
     );
     assert!(
         FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V8
@@ -3471,8 +3681,19 @@ const _: () = {
             != FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V9
     );
     assert!(
-        FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V12
+        FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V11
             != FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V10
+    );
+    assert!(
+        FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V12
+            != FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V11
+    );
+    assert!(
+        DYNAMIC_NATIVE_ROWS_V11_ANY_ACCEPT_MASK
+            | DYNAMIC_NATIVE_ROWS_V11_ACCEPT_BACK_ONE_MASK
+            | DYNAMIC_NATIVE_ROWS_V11_FIRST_DEAD_MASK
+            | DYNAMIC_NATIVE_ROWS_V11_NEXT_BLOCK_TOKEN_MASK
+            == u32::MAX
     );
     assert!(std::mem::offset_of!(FrozenPreparedHeaderV5, v1) == 0);
     assert!(FROZEN_PREPARED_HEADER_V5_DYNAMIC_ROWS_OFFSET == FROZEN_PREPARED_HEADER_V1_BYTES);
@@ -3514,6 +3735,7 @@ const _: () = {
     assert!(FROZEN_PREPARED_HEADER_V8_BYTES == 448);
     assert!(FROZEN_PREPARED_HEADER_V9_BYTES == 448);
     assert!(FROZEN_PREPARED_HEADER_V10_BYTES == 448);
+    assert!(FROZEN_PREPARED_HEADER_V11_BYTES == 448);
     assert!(FROZEN_PREPARED_HEADER_V12_BYTES == 448);
 };
 
@@ -3648,6 +3870,10 @@ impl FrozenPreparedHeaderV3 {
             FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V10 => {
                 self.dynamic_rows_v3.format_version == FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION
                     && self.dynamic_rows_v3.ready_seal == FROZEN_PREPARED_HEADER_V10_READY_SEAL
+            }
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V11 => {
+                self.dynamic_rows_v3.format_version == FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION
+                    && self.dynamic_rows_v3.ready_seal == FROZEN_PREPARED_HEADER_V11_READY_SEAL
             }
             FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V12 => {
                 self.dynamic_rows_v3.format_version == FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION
@@ -3889,6 +4115,11 @@ impl FrozenPreparedHeaderV6 {
                 self.v1.header_bytes == FROZEN_PREPARED_HEADER_V10_BYTES
                     && rows.compact.format_version == FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION
                     && rows.compact.ready_seal == FROZEN_PREPARED_HEADER_V10_READY_SEAL
+            }
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V11 => {
+                self.v1.header_bytes == FROZEN_PREPARED_HEADER_V11_BYTES
+                    && rows.compact.format_version == FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION
+                    && rows.compact.ready_seal == FROZEN_PREPARED_HEADER_V11_READY_SEAL
             }
             FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V12 => {
                 self.v1.header_bytes == FROZEN_PREPARED_HEADER_V12_BYTES
@@ -4492,12 +4723,31 @@ impl FrozenDynamicRowsStorageV3 {
             FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION => {
                 FrozenCompactRowsFormat::StateOrdinalDirectU8V10
             }
+            FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION => {
+                FrozenCompactRowsFormat::PairSupertransitionV11
+            }
             FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION => {
                 FrozenCompactRowsFormat::StateOrdinalMappedU8V12
             }
             _ => return false,
         };
-        let physical_cells = if format.is_u8() {
+        let physical_cells = if format.is_pair_supertransition() {
+            let Some(physical_classes) = class_count.checked_next_power_of_two() else {
+                return false;
+            };
+            if !(FROZEN_PAIR_ROWS_V11_MIN_CLASSES..=FROZEN_PAIR_ROWS_V11_MAX_CLASSES)
+                .contains(&class_count)
+                || rows.row_shift != physical_classes.trailing_zeros()
+            {
+                return false;
+            }
+            let Some((_, _, block_words, _, _)) =
+                frozen_pair_rows_v11_geometry(state_count, class_count)
+            else {
+                return false;
+            };
+            block_words
+        } else if format.is_u8() {
             let Some(physical_cells) = 1_usize.checked_shl(rows.row_shift) else {
                 return false;
             };
@@ -4528,21 +4778,34 @@ impl FrozenDynamicRowsStorageV3 {
         let Some(live_cells) = state_count.checked_mul(physical_cells) else {
             return false;
         };
-        let token_extent_invalid = if format.is_u8() {
+        let token_extent_invalid = if format.is_pair_supertransition() {
+            live_cells
+                > usize::try_from(DYNAMIC_NATIVE_ROWS_V11_NEXT_BLOCK_TOKEN_MASK)
+                    .unwrap_or(usize::MAX)
+        } else if format.is_u8() {
             state_count > usize::from(DYNAMIC_NATIVE_ROWS_V10_NEXT_STATE_TOKEN_MASK)
         } else if format.is_state_ordinal() {
             state_count > usize::from(DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK)
         } else {
             live_cells > usize::from(DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK)
         };
-        let owner_is_invalid = if format.is_u8() {
+        let owner_is_invalid = if format.is_pair_supertransition() {
+            self.pair_rows_v11.as_ref().is_none_or(|pair_rows| {
+                !self.rows.is_empty()
+                    || self.rows_u8.is_some()
+                    || rows.rows_address != pair_rows.as_ptr().expose_provenance()
+                    || live_cells != pair_rows.len()
+            })
+        } else if format.is_u8() {
             self.rows_u8.as_ref().is_none_or(|byte_rows| {
                 !self.rows.is_empty()
+                    || self.pair_rows_v11.is_some()
                     || rows.rows_address != byte_rows.as_ptr().expose_provenance()
                     || live_cells != byte_rows.len()
             })
         } else {
             self.rows_u8.is_some()
+                || self.pair_rows_v11.is_some()
                 || rows.rows_address != self.rows.as_ptr().expose_provenance()
                 || live_cells != self.rows.len()
         };
@@ -4584,7 +4847,61 @@ impl FrozenDynamicRowsStorageV3 {
             return false;
         }
 
-        if format.is_u8() {
+        if format.is_pair_supertransition() {
+            let Some(pair_rows) = self.pair_rows_v11.as_ref() else {
+                return false;
+            };
+            let Some((physical_classes, pair_cells, block_words, total_words, bytes)) =
+                frozen_pair_rows_v11_geometry(state_count, class_count)
+            else {
+                return false;
+            };
+            if physical_cells != block_words
+                || live_cells != total_words
+                || bytes > FROZEN_PAIR_ROWS_V11_MAX_BYTES
+            {
+                return false;
+            }
+            let live_class_mask = (1_u32 << class_count) - 1;
+            for block in pair_rows.chunks_exact(block_words) {
+                let tail_accepts = block[pair_cells];
+                if tail_accepts & !live_class_mask != 0 {
+                    return false;
+                }
+                for first_class in 0..physical_classes {
+                    for second_class in 0..physical_classes {
+                        let pair_index = first_class * physical_classes + second_class;
+                        let cell = block[pair_index];
+                        if first_class >= class_count || second_class >= class_count {
+                            if cell != 0 {
+                                return false;
+                            }
+                            continue;
+                        }
+                        let accepts = cell & DYNAMIC_NATIVE_ROWS_V11_ANY_ACCEPT_MASK != 0;
+                        let back_one =
+                            cell & DYNAMIC_NATIVE_ROWS_V11_ACCEPT_BACK_ONE_MASK != 0;
+                        let first_dead = cell & DYNAMIC_NATIVE_ROWS_V11_FIRST_DEAD_MASK != 0;
+                        let first_accepts = tail_accepts & (1_u32 << first_class) != 0;
+                        let token = cell & DYNAMIC_NATIVE_ROWS_V11_NEXT_BLOCK_TOKEN_MASK;
+                        if (back_one && (!accepts || !first_accepts || first_dead))
+                            || (first_accepts && !accepts)
+                            || (first_dead && (accepts != first_accepts || token != 0))
+                            || (token != 0
+                                && usize::try_from(token)
+                                    .ok()
+                                    .and_then(|token| token.checked_sub(1))
+                                    .is_none_or(|destination| {
+                                        destination >= total_words
+                                            || destination.checked_rem(block_words) != Some(0)
+                                    }))
+                        {
+                            return false;
+                        }
+                    }
+                }
+            }
+        } else if format.is_u8() {
             let Some(byte_rows) = self.rows_u8.as_ref() else {
                 return false;
             };
@@ -4640,6 +4957,15 @@ impl FrozenDynamicRowsStorageV3 {
             }
         }
 
+        if format.is_pair_supertransition()
+            && (self.unary_exists_first_accept_step.is_some()
+                || self.descriptor_v6.is_some()
+                || !self.loop_index.is_empty()
+                || !self.loop_scanners.is_empty())
+        {
+            return false;
+        }
+
         true
     }
 
@@ -4681,6 +5007,7 @@ impl FrozenDynamicRowsStorageV3 {
             FrozenCompactRowsFormat::StateOrdinalDirectV8
             | FrozenCompactRowsFormat::CellOffsetDirectV9
             | FrozenCompactRowsFormat::StateOrdinalDirectU8V10
+            | FrozenCompactRowsFormat::PairSupertransitionV11
             | FrozenCompactRowsFormat::StateOrdinalMappedU8V12 => return false,
         };
         let Some(live_cells) = state_count.checked_mul(physical_cells) else {
@@ -4695,6 +5022,7 @@ impl FrozenDynamicRowsStorageV3 {
             FrozenCompactRowsFormat::StateOrdinalDirectV8
             | FrozenCompactRowsFormat::CellOffsetDirectV9
             | FrozenCompactRowsFormat::StateOrdinalDirectU8V10
+            | FrozenCompactRowsFormat::PairSupertransitionV11
             | FrozenCompactRowsFormat::StateOrdinalMappedU8V12 => return false,
         };
         if rows.compact != expected_compact
@@ -4744,6 +5072,7 @@ impl FrozenDynamicRowsStorageV3 {
                 FrozenCompactRowsFormat::StateOrdinalDirectV8
                 | FrozenCompactRowsFormat::CellOffsetDirectV9
                 | FrozenCompactRowsFormat::StateOrdinalDirectU8V10
+                | FrozenCompactRowsFormat::PairSupertransitionV11
                 | FrozenCompactRowsFormat::StateOrdinalMappedU8V12 => return false,
             };
             let expected_index = slot
@@ -4778,6 +5107,7 @@ impl FrozenDynamicRowsStorageV3 {
                 FrozenCompactRowsFormat::StateOrdinalDirectV8
                 | FrozenCompactRowsFormat::CellOffsetDirectV9
                 | FrozenCompactRowsFormat::StateOrdinalDirectU8V10
+                | FrozenCompactRowsFormat::PairSupertransitionV11
                 | FrozenCompactRowsFormat::StateOrdinalMappedU8V12 => return false,
             };
             for byte in u8::MIN..=u8::MAX {
@@ -4813,6 +5143,7 @@ impl FrozenDynamicRowsStorageV3 {
                             FrozenCompactRowsFormat::StateOrdinalDirectV8
                             | FrozenCompactRowsFormat::CellOffsetDirectV9
                             | FrozenCompactRowsFormat::StateOrdinalDirectU8V10
+                            | FrozenCompactRowsFormat::PairSupertransitionV11
                             | FrozenCompactRowsFormat::StateOrdinalMappedU8V12 => false,
                         }
                     })
@@ -4832,9 +5163,13 @@ impl FrozenDynamicRowsStorageV3 {
     }
 
     fn live_cells(&self) -> usize {
-        self.rows_u8
-            .as_ref()
-            .map_or_else(|| self.rows.len(), |rows| rows.len())
+        if let Some(rows) = self.pair_rows_v11.as_ref() {
+            rows.len()
+        } else {
+            self.rows_u8
+                .as_ref()
+                .map_or_else(|| self.rows.len(), |rows| rows.len())
+        }
     }
 
     fn descriptor_v6(&self) -> Option<FrozenDynamicRowsV6> {
@@ -7400,9 +7735,11 @@ impl CompiledProgram {
     }
 
     /// Build a pointer-stable immutable compact copy of one complete K0 root.
-    /// V10/V12 use byte cells whenever all state ordinals and inherited byte
-    /// budgets fit; otherwise V4 is preferred when cell offsets fit and larger
-    /// tables retain V3. The class map is retained inline for publication.
+    /// V11 may replace scanner-free fixed-width rows with exact two-transition
+    /// `u32` cells when its independent resident budget fits. Otherwise V10/V12
+    /// use byte cells whenever all state ordinals and inherited byte budgets
+    /// fit; V4 is preferred when cell offsets fit and larger tables retain V3.
+    /// The class map is retained inline for publication.
     #[doc(hidden)]
     #[must_use]
     #[allow(
@@ -7527,9 +7864,10 @@ impl CompiledProgram {
         // Perform this arbitration against the original K0 row geometry
         // before an optional raw-byte expansion changes the compact stride.
         // V5 is more specific than V6/V7, and V6/V7 are more profitable than
-        // V10/V12/V9/V8 for rows with loop evidence. General compact
-        // promotion remains the fallback when neither specialized proof is
-        // retained.
+        // V11/V10/V12/V9/V8 for rows with loop evidence. V11 is then preferred
+        // over the one-symbol compact formats when its scanner-free fixed-width
+        // proof and independent resident budget both fit. General compact
+        // promotion remains the fallback when no specialized proof is retained.
         let mut loop_candidates = [None; 4];
         let mut loop_candidate_count = 0usize;
         for plan in direct.learned_loop_plans() {
@@ -7600,6 +7938,65 @@ impl CompiledProgram {
             && mapped_bytes
                 .checked_add(loop_payload_bytes)
                 .is_some_and(|bytes| bytes <= max_packed_bytes);
+
+        // Pair-supertransition V11 is a scanner-free alternative to the
+        // ordinary one-symbol formats. Unary V5 and an admitted V6/V7 loop
+        // owner remain more specific; only after those proofs decline may the
+        // complete two-transition table own the same exact K0 projection.
+        // Its bounded expansion never exceeds the retained K0 allocation
+        // authority, the caller's packed-sidecar authority, or the independent
+        // resident cap.
+        if !unary_v5_eligible
+            && !retain_loop_extension
+            && dynamic_view.root_requirement.is_none()
+            && let Some((physical_classes, _, _, total_words, pair_bytes)) =
+                frozen_pair_rows_v11_geometry(state_count, semantic_class_count)
+            && pair_bytes <= retained_bytes
+            && pair_bytes <= max_packed_bytes
+            && pair_bytes <= FROZEN_PAIR_ROWS_V11_MAX_BYTES
+            && let Some(pair_rows_v11) = build_frozen_pair_rows_v11(
+                full.forward_rows(),
+                &columns,
+                source_class_count,
+                state_count,
+                source_initial_state,
+            )
+            && pair_rows_v11.len() == total_words
+            && let Ok(state_count_u32) = u32::try_from(state_count)
+            && let Ok(class_count_u32) = u32::try_from(semantic_class_count)
+        {
+            let descriptor = FrozenDynamicRowsV3 {
+                ready_seal: 0,
+                rows_address: pair_rows_v11.as_ptr().expose_provenance(),
+                cache_identity: full.cache_identity(),
+                state_count: state_count_u32,
+                class_count: class_count_u32,
+                row_shift: physical_classes.trailing_zeros(),
+                initial_state: 0,
+                learned_loop_state_count: 0,
+                learned_loop_states: [u32::MAX; 4],
+                format_version: FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION,
+            };
+            let storage = FrozenDynamicRowsStorageV3 {
+                program_instance: self.identity.instance,
+                artifact_identity: self.identity.artifact,
+                rows: Box::default(),
+                rows_u8: None,
+                pair_rows_v11: Some(pair_rows_v11),
+                class_map: columns.class_map,
+                descriptor,
+                unary_exists_first_accept_step: None,
+                loop_index: Box::default(),
+                loop_scanners: Box::default(),
+                descriptor_v6: None,
+            };
+            if storage.descriptor_is_valid_for(self.identity)
+                && storage.descriptor_v6_is_valid_for(self.identity)
+            {
+                return Some(storage);
+            }
+        }
+
         if !unary_v5_eligible && !retain_loop_extension {
             (columns, format) = promote_frozen_compact_raw_byte_projection(
                 columns,
@@ -7749,6 +8146,7 @@ impl CompiledProgram {
                 FrozenCompactRowsFormat::StateOrdinalDirectV8
                 | FrozenCompactRowsFormat::CellOffsetDirectV9
                 | FrozenCompactRowsFormat::StateOrdinalDirectU8V10
+                | FrozenCompactRowsFormat::PairSupertransitionV11
                 | FrozenCompactRowsFormat::StateOrdinalMappedU8V12 => return None,
             }
         } else {
@@ -7776,6 +8174,7 @@ impl CompiledProgram {
                     FrozenCompactRowsFormat::StateOrdinalDirectV8
                     | FrozenCompactRowsFormat::CellOffsetDirectV9
                     | FrozenCompactRowsFormat::StateOrdinalDirectU8V10
+                    | FrozenCompactRowsFormat::PairSupertransitionV11
                     | FrozenCompactRowsFormat::StateOrdinalMappedU8V12 => return None,
                 };
                 let plan_index = u8::try_from(loop_scanners.len().checked_add(1)?).ok()?;
@@ -7800,6 +8199,7 @@ impl CompiledProgram {
                 FrozenCompactRowsFormat::StateOrdinalDirectV8
                 | FrozenCompactRowsFormat::CellOffsetDirectV9
                 | FrozenCompactRowsFormat::StateOrdinalDirectU8V10
+                | FrozenCompactRowsFormat::PairSupertransitionV11
                 | FrozenCompactRowsFormat::StateOrdinalMappedU8V12 => {
                     unreachable!("loop retention excludes direct-byte formats")
                 }
@@ -7837,6 +8237,7 @@ impl CompiledProgram {
             artifact_identity: self.identity.artifact,
             rows,
             rows_u8,
+            pair_rows_v11: None,
             class_map,
             descriptor,
             unary_exists_first_accept_step,
@@ -7850,8 +8251,9 @@ impl CompiledProgram {
     }
 
     /// Publish either the existing retained V1 projection or an additive
-    /// compact V3/V4/V8/V9/V10/V12 sidecar. Retained static rows always win,
-    /// and V2 remains independently constructible for older prepared owners.
+    /// compact V3/V4/V8/V9/V10/V11/V12 sidecar. Retained static rows always
+    /// win, and V2 remains independently constructible for older prepared
+    /// owners.
     #[doc(hidden)]
     #[must_use]
     pub fn compiler_private_frozen_prepared_header_v3(
@@ -7883,12 +8285,28 @@ impl CompiledProgram {
             FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION => {
                 FrozenCompactRowsFormat::StateOrdinalDirectU8V10
             }
+            FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION => {
+                FrozenCompactRowsFormat::PairSupertransitionV11
+            }
             FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION => {
                 FrozenCompactRowsFormat::StateOrdinalMappedU8V12
             }
             _ => return header,
         };
-        let physical_cells = if format.is_u8() {
+        let physical_cells = if format.is_pair_supertransition() {
+            let Ok(class_count) = usize::try_from(rows.class_count) else {
+                return header;
+            };
+            let Ok(state_count) = usize::try_from(rows.state_count) else {
+                return header;
+            };
+            let Some((_, _, block_words, _, _)) =
+                frozen_pair_rows_v11_geometry(state_count, class_count)
+            else {
+                return header;
+            };
+            block_words
+        } else if format.is_u8() {
             let Some(physical_cells) = 1_usize.checked_shl(rows.row_shift) else {
                 return header;
             };
@@ -7928,6 +8346,9 @@ impl CompiledProgram {
             FrozenCompactRowsFormat::StateOrdinalDirectU8V10 => {
                 FROZEN_PREPARED_HEADER_V10_BYTES
             }
+            FrozenCompactRowsFormat::PairSupertransitionV11 => {
+                FROZEN_PREPARED_HEADER_V11_BYTES
+            }
             FrozenCompactRowsFormat::StateOrdinalMappedU8V12 => {
                 FROZEN_PREPARED_HEADER_V12_BYTES
             }
@@ -7937,7 +8358,11 @@ impl CompiledProgram {
         header.v1.cache_identity = rows.cache_identity;
         header.v1.row_stride = row_stride;
         header.v1.forward_initial_row = 0;
-        if format.is_u8() {
+        if format.is_pair_supertransition() {
+            header.v1.unfilled_cell = 0;
+            header.v1.accept_mask = DYNAMIC_NATIVE_ROWS_V11_ANY_ACCEPT_MASK;
+            header.v1.next_row_token_mask = DYNAMIC_NATIVE_ROWS_V11_NEXT_BLOCK_TOKEN_MASK;
+        } else if format.is_u8() {
             header.v1.unfilled_cell = u32::from(DYNAMIC_NATIVE_ROWS_V10_DEAD_CELL);
             header.v1.accept_mask = u32::from(DYNAMIC_NATIVE_ROWS_V10_ACCEPT_MASK);
             header.v1.next_row_token_mask =
@@ -8058,7 +8483,8 @@ impl CompiledProgram {
 
     /// Publish the maximum compact-header envelope. Retained V1 rows remain
     /// authoritative, unary V5 wins when its exact proof exists, mapped loop
-    /// V6/V7 wins over V10/V12/V9/V8, and every declined promotion keeps the
+    /// V6/V7 wins over V11/V10/V12/V9/V8, V11 wins over the remaining
+    /// one-symbol compact formats, and every declined promotion keeps the
     /// already authenticated lower-generation publication intact.
     #[doc(hidden)]
     #[must_use]
@@ -20849,6 +21275,277 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the bounded pair model exhausts every short input over every admitted V11 alphabet"
+    )]
+    fn frozen_pair_supertransition_v11_is_exhaustively_exact_for_small_models() {
+        assert!(frozen_pair_rows_v11_geometry(0, 2).is_none());
+        assert!(frozen_pair_rows_v11_geometry(1, 1).is_none());
+        assert!(frozen_pair_rows_v11_geometry(1, 5).is_none());
+        assert_eq!(
+            frozen_pair_rows_v11_geometry(960, 4),
+            Some((4, 16, 17, 16_320, FROZEN_PAIR_ROWS_V11_MAX_BYTES))
+        );
+        assert!(
+            frozen_pair_rows_v11_geometry(961, 4)
+                .is_some_and(|geometry| geometry.4 > FROZEN_PAIR_ROWS_V11_MAX_BYTES)
+        );
+
+        for block_words in [5_usize, 17] {
+            for first_token in 0_u16..=16 {
+                for second_token in 0_u16..=16 {
+                    for first_accepts in [false, true] {
+                        for second_accepts in [false, true] {
+                            let first = first_token
+                                | first_accepts
+                                    .then_some(DYNAMIC_NATIVE_ROWS_V3_ACCEPT_MASK)
+                                    .unwrap_or(0);
+                            let second = second_token
+                                | second_accepts
+                                    .then_some(DYNAMIC_NATIVE_ROWS_V3_ACCEPT_MASK)
+                                    .unwrap_or(0);
+                            let pair = frozen_pair_cell_v11(first, Some(second), block_words)
+                                .expect("bounded pair cell");
+                            let first_dead = first_token == 0;
+                            let expected_accepts =
+                                first_accepts || (!first_dead && second_accepts);
+                            let expected_back_one =
+                                !first_dead && first_accepts && !second_accepts;
+                            let expected_token = if first_dead || second_token == 0 {
+                                0
+                            } else {
+                                (usize::from(second_token) - 1) * block_words + 1
+                            };
+                            assert_eq!(
+                                pair & DYNAMIC_NATIVE_ROWS_V11_ANY_ACCEPT_MASK != 0,
+                                expected_accepts
+                            );
+                            assert_eq!(
+                                pair & DYNAMIC_NATIVE_ROWS_V11_ACCEPT_BACK_ONE_MASK != 0,
+                                expected_back_one
+                            );
+                            assert_eq!(
+                                pair & DYNAMIC_NATIVE_ROWS_V11_FIRST_DEAD_MASK != 0,
+                                first_dead
+                            );
+                            assert_eq!(
+                                usize::try_from(
+                                    pair & DYNAMIC_NATIVE_ROWS_V11_NEXT_BLOCK_TOKEN_MASK
+                                )
+                                .unwrap(),
+                                expected_token
+                            );
+                            if first_dead {
+                                assert_eq!(
+                                    frozen_pair_cell_v11(first, None, block_words),
+                                    Some(pair),
+                                    "a dead first edge must not observe byte two"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        type ModelCell = (bool, Option<usize>);
+        type ModelOutcome = (bool, Option<usize>, usize);
+
+        fn scalar_model(
+            cells: &[ModelCell],
+            class_count: usize,
+            input: &[u8],
+        ) -> ModelOutcome {
+            let mut state = 0_usize;
+            let mut position = 0_usize;
+            let mut any_accept = false;
+            let mut selected_end = None;
+            while let Some(&class) = input.get(position) {
+                let (accepts, destination) = cells[state * class_count + usize::from(class)];
+                position += 1;
+                if accepts {
+                    any_accept = true;
+                    selected_end = Some(position);
+                }
+                let Some(destination) = destination else {
+                    break;
+                };
+                state = destination;
+            }
+            (any_accept, selected_end, position)
+        }
+
+        fn pair_model(
+            rows: &[u32],
+            class_count: usize,
+            input: &[u8],
+        ) -> ModelOutcome {
+            let physical_classes = class_count.next_power_of_two();
+            let class_shift = physical_classes.trailing_zeros();
+            let pair_cells = physical_classes * physical_classes;
+            let mut block = 0_usize;
+            let mut position = 0_usize;
+            let mut live = true;
+            let mut any_accept = false;
+            let mut selected_end = None;
+            while live && position + 1 < input.len() {
+                let first_class = usize::from(input[position]);
+                let second_class = usize::from(input[position + 1]);
+                let pair_index = (first_class << class_shift) | second_class;
+                let pair = rows[block + pair_index];
+                let first_dead = pair & DYNAMIC_NATIVE_ROWS_V11_FIRST_DEAD_MASK != 0;
+                if pair & DYNAMIC_NATIVE_ROWS_V11_ANY_ACCEPT_MASK != 0 {
+                    any_accept = true;
+                    selected_end = Some(if first_dead
+                        || pair & DYNAMIC_NATIVE_ROWS_V11_ACCEPT_BACK_ONE_MASK != 0
+                    {
+                        position + 1
+                    } else {
+                        position + 2
+                    });
+                }
+                if first_dead {
+                    position += 1;
+                    live = false;
+                    break;
+                }
+                position += 2;
+                let token = pair & DYNAMIC_NATIVE_ROWS_V11_NEXT_BLOCK_TOKEN_MASK;
+                if token == 0 {
+                    live = false;
+                    break;
+                }
+                block = usize::try_from(token - 1).unwrap();
+            }
+            if live && position < input.len() {
+                let class = usize::from(input[position]);
+                let tail_accepts = rows[block + pair_cells];
+                position += 1;
+                if tail_accepts & (1_u32 << class) != 0 {
+                    any_accept = true;
+                    selected_end = Some(position);
+                }
+            }
+            (any_accept, selected_end, position)
+        }
+
+        let state_count = 5_usize;
+        let source_initial_state = 2_usize;
+        for class_count in FROZEN_PAIR_ROWS_V11_MIN_CLASSES..=FROZEN_PAIR_ROWS_V11_MAX_CLASSES {
+            let mut model = Vec::with_capacity(state_count * class_count);
+            for state in 0..state_count {
+                for class in 0..class_count {
+                    let accepts = (state + class * 2).is_multiple_of(3);
+                    let destination = (!(state * 5 + class).is_multiple_of(7))
+                        .then_some((state * 3 + class + 1) % state_count);
+                    model.push((accepts, destination));
+                }
+            }
+
+            let mut source_rows = Vec::with_capacity(state_count * class_count);
+            for source_state in 0..state_count {
+                let canonical_state =
+                    canonicalize_frozen_state_ordinal(source_state, source_initial_state);
+                for class in 0..class_count {
+                    let (accepts, canonical_destination) =
+                        model[canonical_state * class_count + class];
+                    let source_destination = canonical_destination.map(|destination| {
+                        canonicalize_frozen_state_ordinal(destination, source_initial_state)
+                    });
+                    source_rows.push(frozen_test_source_cell(
+                        source_destination,
+                        class_count,
+                        accepts,
+                        0,
+                    ));
+                }
+            }
+            let mut source_classes = [0_u8; 256];
+            for (class, source_class) in source_classes[..class_count].iter_mut().enumerate() {
+                *source_class = u8::try_from(class).unwrap();
+            }
+            let class_map =
+                core::array::from_fn(|byte| u8::try_from(byte % class_count).unwrap());
+            let projection = FrozenCompactColumnProjection {
+                class_count,
+                source_classes,
+                class_map,
+            };
+            let rows = build_frozen_pair_rows_v11(
+                &source_rows,
+                &projection,
+                class_count,
+                state_count,
+                source_initial_state,
+            )
+            .expect("valid V11 model table");
+            let (physical_classes, pair_cells, block_words, total_words, _) =
+                frozen_pair_rows_v11_geometry(state_count, class_count).unwrap();
+            assert_eq!(rows.len(), total_words);
+            for state in 0..state_count {
+                let block = &rows[state * block_words..(state + 1) * block_words];
+                let expected_tail = (0..class_count).fold(0_u32, |bitmap, class| {
+                    if model[state * class_count + class].0 {
+                        bitmap | (1_u32 << class)
+                    } else {
+                        bitmap
+                    }
+                });
+                assert_eq!(block[pair_cells], expected_tail);
+                for first_class in 0..physical_classes {
+                    for second_class in 0..physical_classes {
+                        let pair = block[first_class * physical_classes + second_class];
+                        if first_class >= class_count || second_class >= class_count {
+                            assert_eq!(pair, 0, "padded pair cells must remain inert");
+                            continue;
+                        }
+                        let (first_accepts, first_destination) =
+                            model[state * class_count + first_class];
+                        let (second_accepts, second_destination) = first_destination.map_or(
+                            (false, None),
+                            |destination| model[destination * class_count + second_class],
+                        );
+                        assert_eq!(
+                            pair & DYNAMIC_NATIVE_ROWS_V11_ANY_ACCEPT_MASK != 0,
+                            first_accepts || second_accepts
+                        );
+                        assert_eq!(
+                            pair & DYNAMIC_NATIVE_ROWS_V11_ACCEPT_BACK_ONE_MASK != 0,
+                            first_destination.is_some() && first_accepts && !second_accepts
+                        );
+                        assert_eq!(
+                            pair & DYNAMIC_NATIVE_ROWS_V11_FIRST_DEAD_MASK != 0,
+                            first_destination.is_none()
+                        );
+                        let expected_token = second_destination
+                            .map(|destination| destination * block_words + 1)
+                            .unwrap_or(0);
+                        assert_eq!(
+                            usize::try_from(
+                                pair & DYNAMIC_NATIVE_ROWS_V11_NEXT_BLOCK_TOKEN_MASK
+                            )
+                            .unwrap(),
+                            expected_token
+                        );
+                    }
+                }
+            }
+
+            let alphabet = (0..class_count)
+                .map(|class| u8::try_from(class).unwrap())
+                .collect::<Vec<_>>();
+            for input in generated_byte_strings(&alphabet, 6) {
+                assert_eq!(
+                    pair_model(&rows, class_count, &input),
+                    scalar_model(&model, class_count, &input),
+                    "C={class_count}, input={input:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn frozen_compact_column_coalescing_is_exhaustively_semantic_for_small_tables() {
         for state_count in 1_usize..=9 {
             for source_class_count in 1_usize..=12 {
@@ -21267,7 +21964,7 @@ mod tests {
                 .filter(|&&start| start)
                 .count()
                 < FROZEN_COMPACT_DIRECT_BYTE_MIN_CLASSES,
-            "narrow source alphabets omit V8/V9 code entirely"
+            "narrow source alphabets omit V8/V9/V10 raw-byte code entirely"
         );
     }
 
@@ -21605,6 +22302,7 @@ mod tests {
                 artifact_identity: compiled.identity.artifact,
                 rows,
                 rows_u8: None,
+                pair_rows_v11: None,
                 class_map,
                 descriptor,
                 unary_exists_first_accept_step: None,
@@ -21719,6 +22417,122 @@ mod tests {
     }
 
     #[test]
+    fn compact_u8_v10_authenticates_separate_storage_and_exact_geometry() {
+        let compiled = program(
+            "ab",
+            OutputContract::Exists,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        let workspace = compiled.prepare_workspace().unwrap();
+        let state_count = 2_usize;
+        let class_count = 256_usize;
+        let mut byte_rows = Vec::with_capacity(state_count * class_count);
+        for state in 0..state_count {
+            for byte in 0..class_count {
+                let token = u8::try_from((state + byte) % state_count + 1).unwrap();
+                byte_rows.push(
+                    token
+                        | if byte.is_multiple_of(3) {
+                            DYNAMIC_NATIVE_ROWS_V10_ACCEPT_MASK
+                        } else {
+                            0
+                        },
+                );
+            }
+        }
+        let byte_rows = byte_rows.into_boxed_slice();
+        let descriptor = FrozenDynamicRowsV3 {
+            ready_seal: 0,
+            rows_address: byte_rows.as_ptr().expose_provenance(),
+            cache_identity: 1,
+            state_count: u32::try_from(state_count).unwrap(),
+            class_count: u32::try_from(class_count).unwrap(),
+            row_shift: 8,
+            initial_state: 0,
+            learned_loop_state_count: 0,
+            learned_loop_states: [u32::MAX; 4],
+            format_version: FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION,
+        };
+        let mut storage = FrozenDynamicRowsStorageV3 {
+            program_instance: compiled.identity.instance,
+            artifact_identity: compiled.identity.artifact,
+            rows: Vec::new().into_boxed_slice(),
+            rows_u8: Some(byte_rows),
+            pair_rows_v11: None,
+            class_map: core::array::from_fn(|byte| u8::try_from(byte).unwrap()),
+            descriptor,
+            unary_exists_first_accept_step: None,
+            loop_index: Box::default(),
+            loop_scanners: Box::default(),
+            descriptor_v6: None,
+        };
+        assert!(storage.rows.is_empty());
+        assert!(storage.pair_rows_v11.is_none());
+        assert_eq!(storage.live_cells(), state_count * class_count);
+        assert!(storage.descriptor_is_valid_for(compiled.identity));
+        assert!(storage.descriptor_v6_is_valid_for(compiled.identity));
+
+        let header = compiled.compiler_private_frozen_prepared_header_v6(
+            &workspace,
+            None,
+            Some(&storage),
+        );
+        assert!(header.is_active());
+        assert!(header.has_dynamic_rows());
+        assert_eq!(std::mem::size_of_val(&header), FROZEN_PREPARED_HEADER_V6_BYTES);
+        assert_eq!(header.v1.flags, FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V10);
+        assert_eq!(header.v1.header_bytes, FROZEN_PREPARED_HEADER_V10_BYTES);
+        assert_eq!(
+            header.dynamic_rows_v6.compact.ready_seal,
+            FROZEN_PREPARED_HEADER_V10_READY_SEAL
+        );
+        assert_eq!(header.v1.forward_live_cells, state_count * class_count);
+        assert_eq!(header.v1.row_stride, 256);
+        assert_eq!(
+            header.v1.forward_rows_address,
+            storage
+                .rows_u8
+                .as_ref()
+                .unwrap()
+                .as_ptr()
+                .expose_provenance()
+        );
+        assert_eq!(
+            header.v1.accept_mask,
+            u32::from(DYNAMIC_NATIVE_ROWS_V10_ACCEPT_MASK)
+        );
+        assert_eq!(
+            header.v1.next_row_token_mask,
+            u32::from(DYNAMIC_NATIVE_ROWS_V10_NEXT_STATE_TOKEN_MASK)
+        );
+
+        storage.class_map.swap(0, 1);
+        assert!(!storage.descriptor_is_valid_for(compiled.identity));
+        storage.class_map.swap(0, 1);
+        storage.descriptor.row_shift = 9;
+        assert!(!storage.descriptor_is_valid_for(compiled.identity));
+        storage.descriptor.row_shift = 8;
+        storage.descriptor.state_count = 128;
+        assert!(!storage.descriptor_is_valid_for(compiled.identity));
+        storage.descriptor.state_count = u32::try_from(state_count).unwrap();
+        storage.descriptor.format_version = FROZEN_DYNAMIC_ROWS_V8_FORMAT_VERSION;
+        assert!(!storage.descriptor_is_valid_for(compiled.identity));
+        storage.descriptor.format_version = FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION;
+
+        let byte_owner = storage.rows_u8.take().unwrap();
+        assert!(!storage.descriptor_is_valid_for(compiled.identity));
+        storage.rows_u8 = Some(byte_owner);
+        storage.rows = vec![0].into_boxed_slice();
+        assert!(!storage.descriptor_is_valid_for(compiled.identity));
+        storage.rows = Vec::new().into_boxed_slice();
+        storage.rows_u8.as_mut().unwrap()[0] = 3;
+        assert!(!storage.descriptor_is_valid_for(compiled.identity));
+        storage.rows_u8.as_mut().unwrap()[0] = 1 | DYNAMIC_NATIVE_ROWS_V10_ACCEPT_MASK;
+        assert!(storage.descriptor_is_valid_for(compiled.identity));
+    }
+
+    #[test]
     fn state_ordinal_v3_remains_valid_for_tables_larger_than_v4_token_extent() {
         let compiled = program(
             r"(?:ab|ac)+z",
@@ -21757,6 +22571,7 @@ mod tests {
             artifact_identity: compiled.identity.artifact,
             rows,
             rows_u8: None,
+            pair_rows_v11: None,
             class_map,
             descriptor,
             unary_exists_first_accept_step: None,
@@ -21784,9 +22599,11 @@ mod tests {
 
     #[test]
     fn frozen_compact_promotion_is_governed_by_dynamic_semantics_and_closed_rows() {
-        fn assert_promoted(compiled: &CompiledProgram, label: &str) {
+        fn assert_promoted(compiled: &CompiledProgram, label: &str) -> u32 {
             assert_eq!(compiled.engine_kind(), EngineKind::OrderedNfa, "{label}");
-            assert!(compiled.native_dynamic_rows_view().is_some(), "{label}");
+            let dynamic = compiled
+                .native_dynamic_rows_view()
+                .unwrap_or_else(|| panic!("missing dynamic rows for {label}"));
             let workspace = compiled.prepare_workspace().unwrap();
             assert!(
                 workspace
@@ -21811,11 +22628,24 @@ mod tests {
             );
             assert!(header.is_active(), "{label}");
             assert!(header.has_dynamic_rows(), "{label}");
-            assert_eq!(
-                header.v1.flags,
-                FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V4,
-                "{label}"
+            assert!(
+                matches!(
+                    header.v1.flags,
+                    FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V4
+                        | FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V10
+                        | FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V11
+                        | FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V12
+                ),
+                "unexpected compact generation for {label}"
             );
+            if dynamic.root_requirement.is_some() {
+                assert_ne!(
+                    header.v1.flags,
+                    FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V11,
+                    "root-scanner ownership must exclude V11 for {label}"
+                );
+            }
+            header.v1.flags
         }
 
         let no_sidecar = raw_program(
@@ -21839,14 +22669,20 @@ mod tests {
             None,
             "the no-sidecar witness must also exercise scanner-free compact rows"
         );
-        assert_promoted(&no_sidecar, "fresh fast no-sidecar program");
+        assert_eq!(
+            assert_promoted(&no_sidecar, "fresh fast no-sidecar program"),
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V11
+        );
         let restored_no_sidecar =
             CompiledProgram::deserialize(&no_sidecar.serialize().unwrap()).unwrap();
         assert!(matches!(
             &restored_no_sidecar.optimization_sidecar,
             ProgramOptimizationSidecar::None
         ));
-        assert_promoted(&restored_no_sidecar, "restored fast no-sidecar program");
+        assert_eq!(
+            assert_promoted(&restored_no_sidecar, "restored fast no-sidecar program"),
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V11
+        );
 
         let mandatory_cut = program(
             "(?:x|yz)7[A-Za-z]+",
@@ -21865,11 +22701,11 @@ mod tests {
                 .is_some_and(|cut| cut.exact_product().is_none()),
             "the composition witness must retain an ordinary mandatory cut"
         );
-        assert_promoted(&mandatory_cut, "ordinary mandatory-cut fallback");
+        let _ = assert_promoted(&mandatory_cut, "ordinary mandatory-cut fallback");
         let restored_cut =
             CompiledProgram::deserialize(&mandatory_cut.serialize().unwrap()).unwrap();
         assert!(restored_cut.nfa_mandatory_cut.is_some());
-        assert_promoted(&restored_cut, "restored mandatory-cut fallback");
+        let _ = assert_promoted(&restored_cut, "restored mandatory-cut fallback");
 
         let exact_product = program(
             "a[0-2]Z",
@@ -22370,6 +23206,299 @@ mod tests {
             selected_header.dynamic_rows_v6.compact.ready_seal,
             FROZEN_PREPARED_HEADER_V12_READY_SEAL
         );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one V11 ownership audit covers selection, budget fallback, publication, and corruption rejection"
+    )]
+    fn pair_supertransition_v11_is_scanner_free_bounded_and_fail_closed() {
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let compiled = raw_program(
+                &scanner_free_correlated_pair_raw(),
+                output,
+                CompileMode::Fast,
+                DeterminizeLimits {
+                    max_states: 0,
+                    ..DeterminizeLimits::default()
+                },
+            );
+            let dynamic = compiled.native_dynamic_rows_view().unwrap();
+            assert_eq!(dynamic.root_requirement, None, "{output:?}");
+            assert_eq!(dynamic.exact_match_width, Some(2), "{output:?}");
+            let workspace = compiled.prepare_workspace().unwrap();
+            let retained_bytes = workspace.compiler_private_k0_retained_bytes();
+            let storage = compiled
+                .compiler_private_frozen_dynamic_rows_storage_v3(
+                    &workspace,
+                    retained_bytes,
+                    usize::MAX,
+                )
+                .unwrap_or_else(|| panic!("V11 storage for {output:?}"));
+            assert_eq!(
+                storage.descriptor.format_version,
+                FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION,
+                "{output:?}"
+            );
+            assert!(storage.rows.is_empty());
+            assert!(storage.rows_u8.is_none());
+            let pair_rows = storage.pair_rows_v11.as_ref().expect("V11 pair owner");
+            assert!(!pair_rows.is_empty());
+            let state_count = usize::try_from(storage.descriptor.state_count).unwrap();
+            let class_count = usize::try_from(storage.descriptor.class_count).unwrap();
+            let (_, _, block_words, total_words, pair_bytes) =
+                frozen_pair_rows_v11_geometry(state_count, class_count).unwrap();
+            assert_eq!(pair_rows.len(), total_words);
+            assert_eq!(
+                storage.descriptor.row_shift,
+                class_count.next_power_of_two().trailing_zeros()
+            );
+            assert!(pair_bytes <= retained_bytes);
+            assert!(pair_bytes <= FROZEN_PAIR_ROWS_V11_MAX_BYTES);
+
+            let below_pair_budget = compiled
+                .compiler_private_frozen_dynamic_rows_storage_v3(
+                    &workspace,
+                    retained_bytes,
+                    pair_bytes - 1,
+                )
+                .expect("declined V11 must preserve the smaller one-symbol format");
+            assert_ne!(
+                below_pair_budget.descriptor.format_version,
+                FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION
+            );
+            let exact_pair_budget = compiled
+                .compiler_private_frozen_dynamic_rows_storage_v3(
+                    &workspace,
+                    retained_bytes,
+                    pair_bytes,
+                )
+                .expect("exact V11 byte authority");
+            assert_eq!(
+                exact_pair_budget.descriptor.format_version,
+                FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION
+            );
+
+            let header = compiled.compiler_private_frozen_prepared_header_v3(
+                &workspace,
+                None,
+                Some(&storage),
+            );
+            assert!(header.is_active());
+            assert!(header.has_dynamic_rows());
+            assert_eq!(
+                header.v1.flags,
+                FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V11
+            );
+            assert_eq!(header.v1.header_bytes, FROZEN_PREPARED_HEADER_V11_BYTES);
+            assert_eq!(header.v1.forward_live_cells, total_words);
+            assert_eq!(
+                header.v1.row_stride,
+                u32::try_from(block_words).unwrap()
+            );
+            assert_eq!(header.v1.unfilled_cell, 0);
+            assert_eq!(
+                header.v1.accept_mask,
+                DYNAMIC_NATIVE_ROWS_V11_ANY_ACCEPT_MASK
+            );
+            assert_eq!(
+                header.v1.next_row_token_mask,
+                DYNAMIC_NATIVE_ROWS_V11_NEXT_BLOCK_TOKEN_MASK
+            );
+            assert_eq!(
+                header.dynamic_rows_v3.ready_seal,
+                FROZEN_PREPARED_HEADER_V11_READY_SEAL
+            );
+
+            let maximum = compiled.compiler_private_frozen_prepared_header_v6(
+                &workspace,
+                None,
+                Some(&storage),
+            );
+            assert!(maximum.has_dynamic_rows());
+            assert_eq!(
+                maximum.v1.flags,
+                FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V11
+            );
+            assert_eq!(maximum.v1.header_bytes, FROZEN_PREPARED_HEADER_V11_BYTES);
+        }
+
+        let variable_span = raw_program(
+            &scanner_free_variable_pair_raw(),
+            OutputContract::Span,
+            CompileMode::Fast,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+        );
+        let variable_view = variable_span.native_dynamic_rows_view().unwrap();
+        assert_eq!(variable_view.root_requirement, None);
+        assert_eq!(variable_view.exact_match_width, None);
+        let variable_workspace = variable_span.prepare_workspace().unwrap();
+        assert!(
+            variable_span
+                .compiler_private_frozen_dynamic_rows_storage_v3(
+                    &variable_workspace,
+                    usize::MAX,
+                    usize::MAX,
+                )
+                .is_none(),
+            "variable Span must retain synchronous reverse recovery"
+        );
+
+        let compiled = raw_program(
+            &scanner_free_correlated_pair_raw(),
+            OutputContract::Exists,
+            CompileMode::Fast,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+        );
+        let workspace = compiled.prepare_workspace().unwrap();
+        let state_count = 2_usize;
+        let class_count = 3_usize;
+        let (physical_classes, pair_cells, block_words, total_words, _) =
+            frozen_pair_rows_v11_geometry(state_count, class_count).unwrap();
+        let mut pair_rows_v11 = vec![0_u32; total_words].into_boxed_slice();
+        for state in 0..state_count {
+            let block = state * block_words;
+            for first_class in 0..class_count {
+                for second_class in 0..class_count {
+                    pair_rows_v11[block + first_class * physical_classes + second_class] =
+                        DYNAMIC_NATIVE_ROWS_V11_FIRST_DEAD_MASK;
+                }
+            }
+            assert_eq!(pair_rows_v11[block + pair_cells], 0);
+        }
+        let class_map =
+            core::array::from_fn(|byte| u8::try_from(byte % class_count).unwrap());
+        let descriptor = FrozenDynamicRowsV3 {
+            ready_seal: 0,
+            rows_address: pair_rows_v11.as_ptr().expose_provenance(),
+            cache_identity: 1,
+            state_count: u32::try_from(state_count).unwrap(),
+            class_count: u32::try_from(class_count).unwrap(),
+            row_shift: 2,
+            initial_state: 0,
+            learned_loop_state_count: 0,
+            learned_loop_states: [u32::MAX; 4],
+            format_version: FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION,
+        };
+        let mut storage = FrozenDynamicRowsStorageV3 {
+            program_instance: compiled.identity.instance,
+            artifact_identity: compiled.identity.artifact,
+            rows: Box::default(),
+            rows_u8: None,
+            pair_rows_v11: Some(pair_rows_v11),
+            class_map,
+            descriptor,
+            unary_exists_first_accept_step: None,
+            loop_index: Box::default(),
+            loop_scanners: Box::default(),
+            descriptor_v6: None,
+        };
+        assert!(storage.descriptor_is_valid_for(compiled.identity));
+        let header = compiled.compiler_private_frozen_prepared_header_v3(
+            &workspace,
+            None,
+            Some(&storage),
+        );
+        assert!(header.has_dynamic_rows());
+        assert_eq!(header.v1.flags, FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V11);
+        assert_eq!(
+            header.dynamic_rows_v3.format_version,
+            FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION
+        );
+        assert_eq!(
+            header.dynamic_rows_v3.ready_seal,
+            FROZEN_PREPARED_HEADER_V11_READY_SEAL
+        );
+
+        let mut cross_generation = header;
+        cross_generation.v1.flags = FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V10;
+        assert!(!cross_generation.has_dynamic_rows());
+        cross_generation = compiled.compiler_private_frozen_prepared_header_v3(
+            &workspace,
+            None,
+            Some(&storage),
+        );
+        cross_generation.dynamic_rows_v3.format_version = FROZEN_DYNAMIC_ROWS_V9_FORMAT_VERSION;
+        assert!(!cross_generation.has_dynamic_rows());
+        cross_generation = compiled.compiler_private_frozen_prepared_header_v3(
+            &workspace,
+            None,
+            Some(&storage),
+        );
+        cross_generation.dynamic_rows_v3.ready_seal = FROZEN_PREPARED_HEADER_V9_READY_SEAL;
+        assert!(!cross_generation.has_dynamic_rows());
+
+        let valid_descriptor = storage.descriptor;
+        macro_rules! reject_descriptor {
+            ($mutation:block) => {{
+                storage.descriptor = valid_descriptor;
+                $mutation
+                assert!(!storage.descriptor_is_valid_for(compiled.identity));
+            }};
+        }
+        reject_descriptor!({ storage.descriptor.rows_address = 0; });
+        reject_descriptor!({ storage.descriptor.cache_identity = 0; });
+        reject_descriptor!({ storage.descriptor.state_count = 0; });
+        reject_descriptor!({ storage.descriptor.class_count = 1; });
+        reject_descriptor!({ storage.descriptor.class_count = 5; });
+        reject_descriptor!({ storage.descriptor.row_shift = 1; });
+        reject_descriptor!({ storage.descriptor.initial_state = 1; });
+        reject_descriptor!({ storage.descriptor.learned_loop_state_count = 1; });
+        reject_descriptor!({ storage.descriptor.learned_loop_states[0] = 0; });
+        reject_descriptor!({
+            storage.descriptor.format_version = FROZEN_DYNAMIC_ROWS_V9_FORMAT_VERSION;
+        });
+        storage.descriptor = valid_descriptor;
+
+        let original_map = storage.class_map;
+        storage.class_map[0] = u8::try_from(class_count).unwrap();
+        assert!(!storage.descriptor_is_valid_for(compiled.identity));
+        storage.class_map = original_map;
+
+        storage.rows = vec![0_u16].into_boxed_slice();
+        assert!(!storage.descriptor_is_valid_for(compiled.identity));
+        storage.rows = Box::default();
+        let owned_pairs = core::mem::take(&mut storage.pair_rows_v11);
+        assert!(!storage.descriptor_is_valid_for(compiled.identity));
+        storage.pair_rows_v11 = owned_pairs;
+        assert!(storage.descriptor_is_valid_for(compiled.identity));
+
+        let live_cell = 0_usize;
+        let padded_cell = class_count;
+        let tail_bitmap = pair_cells;
+        for (index, malformed) in [
+            (
+                live_cell,
+                DYNAMIC_NATIVE_ROWS_V11_ANY_ACCEPT_MASK
+                    | DYNAMIC_NATIVE_ROWS_V11_ACCEPT_BACK_ONE_MASK,
+            ),
+            (live_cell, 2),
+            (live_cell, u32::try_from(total_words + 1).unwrap()),
+            (padded_cell, 1),
+            (tail_bitmap, 1_u32 << class_count),
+            (tail_bitmap, 1),
+        ] {
+            let pair_rows = storage.pair_rows_v11.as_mut().unwrap();
+            let original = pair_rows[index];
+            pair_rows[index] = malformed;
+            assert!(
+                !storage.descriptor_is_valid_for(compiled.identity),
+                "malformed V11 word at {index}"
+            );
+            storage.pair_rows_v11.as_mut().unwrap()[index] = original;
+        }
+        assert!(storage.descriptor_is_valid_for(compiled.identity));
     }
 
     #[test]
