@@ -3352,6 +3352,13 @@ impl DynamicNativeRowsState {
         self.consecutive_deopts = 0;
         self.bypass_remaining = 0;
     }
+
+    /// Consume the exact window admitted for one generated dynamic-row scan.
+    /// Every private continuation or postflight attempt takes the capability,
+    /// including a malformed attempt, so it cannot be replayed.
+    fn take_native_entry_window(&mut self) -> Option<SearchWindow> {
+        self.native_entry_window.take()
+    }
 }
 
 /// Per-prepared-workspace admission state for a retained partial table.
@@ -3921,14 +3928,17 @@ pub(crate) struct NativePartialProgramView<'a> {
 /// table row instead of restarting the graph scanner. Holes and K0-owned loop
 /// rows tail-deopt before consuming their byte, so the ordinary executor can
 /// restart the saved original window transactionally. A `Span` start is
-/// recoverable from that endpoint only through the positive graph-proved width
-/// below; every other `Span` provenance declines this entry.
+/// recoverable from that endpoint either through the positive graph-proved
+/// width below or, for a non-nullable variable-width artifact, through the
+/// authenticated reverse-K0 postflight. A nullable root is completed inside
+/// preflight and never publishes a native descriptor.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct NativeDynamicRowsProgramView {
     pub(crate) output: OutputContract,
     /// A fixed positive graph-proved width for `Span` output. `SelectedEnd` and
-    /// `Exists` do not consume this field. Variable- and zero-width `Span`
-    /// artifacts decline the dynamic-row entry.
+    /// `Exists` do not consume this field. `None` on `Span` selects
+    /// authenticated reverse-K0 start recovery after native endpoint
+    /// selection. Zero-width `Span` artifacts decline the dynamic-row entry.
     pub(crate) exact_match_width: Option<usize>,
     pub(crate) artifact_identity: [u8; 32],
     /// Exact match-relative byte class selected from the Thompson graph.
@@ -4992,7 +5002,7 @@ impl CompiledProgram {
     pub(crate) fn native_dynamic_rows_view(&self) -> Option<NativeDynamicRowsProgramView> {
         let output_supported = match self.output {
             OutputContract::Exists | OutputContract::SelectedEnd => true,
-            OutputContract::Span => self.exact_match_width.is_some_and(|width| width != 0),
+            OutputContract::Span => self.exact_match_width != Some(0),
         };
         if !output_supported
             || self.context_dfa.is_some()
@@ -5495,6 +5505,14 @@ impl CompiledProgram {
             return None;
         }
         let dynamic_view = self.native_dynamic_rows_view()?;
+        // A variable-width Span requires the synchronous admission ticket and
+        // mutable bidirectional K0 workspace after native endpoint selection.
+        // It must never enter the preflight-free immutable header route.
+        if dynamic_view.output == OutputContract::Span
+            && dynamic_view.exact_match_width.is_none()
+        {
+            return None;
+        }
 
         let mut candidate = self.prepare_workspace().ok()?;
         if candidate.identity.instance != self.identity.instance
@@ -5638,7 +5656,12 @@ impl CompiledProgram {
         {
             return None;
         }
-        self.native_dynamic_rows_view()?;
+        let dynamic_view = self.native_dynamic_rows_view()?;
+        if dynamic_view.output == OutputContract::Span
+            && dynamic_view.exact_match_width.is_none()
+        {
+            return None;
+        }
 
         let mut candidate = self.prepare_workspace().ok()?;
         if candidate.identity.instance != self.identity.instance
@@ -6921,7 +6944,7 @@ impl CompiledProgram {
         }
         let output_supported = match self.output {
             OutputContract::Exists | OutputContract::SelectedEnd => true,
-            OutputContract::Span => self.exact_match_width.is_some_and(|width| width != 0),
+            OutputContract::Span => self.exact_match_width != Some(0),
         };
         if !output_supported
             || self.context_dfa.is_some()
@@ -6930,7 +6953,7 @@ impl CompiledProgram {
             || self.nfa_mandatory_cut.is_some()
         {
             return Err(CompileError::InternalInvariant(
-                "dynamic native rows require assertion-free ordered-NFA endpoint output or positive fixed-width Span",
+                "dynamic native rows require assertion-free ordered-NFA endpoint output or nonzero Span",
             ));
         }
 
@@ -7016,7 +7039,7 @@ impl CompiledProgram {
         let admitted_window = workspace
             .dynamic_native_rows
             .as_deref_mut()
-            .and_then(|dynamic| dynamic.state.native_entry_window.take());
+            .and_then(|dynamic| dynamic.state.take_native_entry_window());
         let had_claim = admitted_window.is_some();
 
         let continued = (|| -> Result<MatchResult, CompileError> {
@@ -7105,12 +7128,7 @@ impl CompiledProgram {
                     .map(MatchResult::SelectedEnd)
                     .map_err(CompileError::from),
                 OutputContract::Span => {
-                    let width = dynamic_view.exact_match_width.filter(|width| *width != 0).ok_or(
-                        CompileError::InternalInvariant(
-                            "dynamic native-row Span continuation has no positive exact width",
-                        ),
-                    )?;
-                    let found = self
+                    let selected_end = self
                         .automaton
                         .prepare::<SelectedEnd>()
                         .search_prevalidated_selected_end_value_from_dynamic_direct_hole_with_authenticated_workspace(
@@ -7121,14 +7139,36 @@ impl CompiledProgram {
                             resume_position,
                             pending,
                             cache_identity,
-                        )?
+                        )?;
+                    let found = selected_end
                         .map(|end| {
-                            end.checked_sub(width)
-                                .filter(|start| *start >= window.start)
-                                .map(|start| (start, end))
-                                .ok_or(CompileError::InternalInvariant(
-                                    "dynamic native-row fixed-width endpoint preceded its admitted start",
-                                ))
+                            if let Some(width) = dynamic_view
+                                .exact_match_width
+                                .filter(|width| *width != 0)
+                            {
+                                let start = end
+                                    .checked_sub(width)
+                                    .filter(|start| *start >= window.start)
+                                    .ok_or(CompileError::InternalInvariant(
+                                        "dynamic native-row fixed-width endpoint preceded its admitted start",
+                                    ))?;
+                                Ok((start, end))
+                            } else {
+                                let start = self.recover_partial_span_start(
+                                    haystack,
+                                    window,
+                                    nfa,
+                                    None,
+                                    end,
+                                    None,
+                                )?;
+                                if start < window.start || start > end || end > window.end {
+                                    return Err(CompileError::InternalInvariant(
+                                        "reverse K0 did not recover a dynamic-row span inside its admitted window",
+                                    ));
+                                }
+                                Ok((start, end))
+                            }
                         })
                         .transpose()?;
                     Ok(MatchResult::Span(found))
@@ -7151,6 +7191,99 @@ impl CompiledProgram {
         // ordinary validated arguments.
         let fallback_window = admitted_window.unwrap_or(window);
         self.search_optimized_with_workspace(haystack, fallback_window, workspace)
+    }
+
+    /// Recover a variable-width Span start after an admitted dynamic-row scan
+    /// selected its authoritative endpoint natively.
+    ///
+    /// The exact admission ticket is single-use and is consumed before any
+    /// reverse work. The helper accepts only an assertion-free, non-nullable,
+    /// variable-width ordered-NFA Span artifact. No forward search is replayed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed invalid-window error before reading the haystack, or an
+    /// invariant/search error for a foreign artifact/workspace, stale or
+    /// cross-window ticket, unsupported route, malformed endpoint, or failed
+    /// reverse recovery.
+    #[doc(hidden)]
+    pub fn recover_dynamic_native_rows_span_from_selected_end_with_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+        expected_artifact_identity: [u8; 32],
+        selected_end: usize,
+    ) -> Result<MatchResult, CompileError> {
+        if window.start > window.end || window.end > haystack.len() {
+            return Err(CompileError::InvalidWindow {
+                start: window.start,
+                end: window.end,
+                haystack_len: haystack.len(),
+            });
+        }
+
+        // Take the capability before authenticating any caller-controlled
+        // payload. A malformed private call cannot retain and replay a live
+        // admission against a later endpoint.
+        let admitted_window = workspace
+            .dynamic_native_rows
+            .as_deref_mut()
+            .and_then(|dynamic| dynamic.state.take_native_entry_window());
+        if admitted_window != Some(window) {
+            return Err(CompileError::InternalInvariant(
+                "dynamic native-row Span recovery window was not admitted by preflight",
+            ));
+        }
+        if expected_artifact_identity != self.identity.artifact {
+            return Err(CompileError::InternalInvariant(
+                "dynamic native-row Span recovery artifact identity does not match the prepared program",
+            ));
+        }
+        if !workspace.identity.compatible(&self.identity) {
+            return Err(CompileError::InternalInvariant(
+                "dynamic native-row Span recovery workspace belongs to a different semantic program",
+            ));
+        }
+        let dynamic_view = self.native_dynamic_rows_view().ok_or(
+            CompileError::InternalInvariant(
+                "dynamic native-row Span recovery requires a supported assertion-free ordered-NFA artifact",
+            ),
+        )?;
+        if dynamic_view.output != OutputContract::Span
+            || dynamic_view.exact_match_width.is_some()
+        {
+            return Err(CompileError::InternalInvariant(
+                "dynamic native-row Span recovery requires variable-width Span output",
+            ));
+        }
+        if selected_end <= window.start || selected_end > window.end {
+            return Err(CompileError::InternalInvariant(
+                "dynamic native-row Span recovery endpoint is not inside the admitted window",
+            ));
+        }
+
+        workspace.mark_dynamic_native_rows_dirty();
+        let nfa = workspace.nfa.as_mut().ok_or(CompileError::InternalInvariant(
+            "dynamic native-row Span recovery has no prepared bidirectional K0 workspace",
+        ))?;
+        let recovered_start = self.recover_partial_span_start(
+            haystack,
+            window,
+            nfa,
+            None,
+            selected_end,
+            None,
+        )?;
+        if recovered_start < window.start || recovered_start > selected_end {
+            return Err(CompileError::InternalInvariant(
+                "reverse K0 did not recover a dynamic-row span inside its admitted window at the native-selected endpoint",
+            ));
+        }
+        if let Some(dynamic) = workspace.dynamic_native_rows.as_deref_mut() {
+            dynamic.state.settle_consumed_local_completion();
+        }
+        Ok(MatchResult::Span(Some((recovered_start, selected_end))))
     }
 
     /// Record that an admitted dynamic root took its dedicated whole-search
@@ -10290,6 +10423,35 @@ mod tests {
         }
     }
 
+    /// Nonnullable variable-width language with no selective common root:
+    /// `a` is accepted in one byte and every other first byte is followed by
+    /// one arbitrary byte. This is graph IR so dynamic-row tests exercise
+    /// structure rather than source spelling.
+    fn scanner_free_variable_pair_raw() -> RawPlan {
+        RawPlan {
+            start: 0,
+            roles: vec![
+                StateRole::Split,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Accept,
+            ],
+            edge_offsets: vec![0, 2, 3, 5, 6, 6],
+            edge_targets: vec![1, 2, 4, 3, 3, 4],
+            edge_kinds: vec![
+                EdgeKind::Epsilon,
+                EdgeKind::Epsilon,
+                EdgeKind::ByteRange,
+                EdgeKind::ByteRange,
+                EdgeKind::ByteRange,
+                EdgeKind::ByteRange,
+            ],
+            byte_starts: vec![0, 0, b'a', 0, b'b', 0],
+            byte_ends: vec![0, 0, b'a', b'`', u8::MAX, u8::MAX],
+        }
+    }
+
     fn scanner_free_correlated_pair_raw() -> RawPlan {
         RawPlan {
             start: 0,
@@ -10722,6 +10884,221 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_native_rows_variable_span_recovers_first_hole_without_forward_replay() {
+        let raw = scanner_free_variable_pair_raw();
+        let compiled = raw_program(
+            &raw,
+            OutputContract::Span,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        let view = compiled
+            .native_dynamic_rows_view()
+            .expect("variable-width dynamic-row view");
+        assert_eq!(view.output, OutputContract::Span);
+        assert_eq!(view.exact_match_width, None);
+        assert_eq!(view.root_requirement, None);
+
+        let mut workspace = compiled.prepare_workspace().expect("dynamic workspace");
+        assert!(compiled
+            .compiler_private_frozen_dynamic_rows_storage_v3(
+                &workspace,
+                usize::MAX,
+                usize::MAX,
+            )
+            .is_none());
+        let mut warmed = vec![b'!'; DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES];
+        warmed[0] = b'a';
+        let window = SearchWindow::full(&warmed);
+        let identity = compiled.artifact_identity();
+        let (cold, address, cache_identity) = compiled
+            .preflight_dynamic_native_rows_with_workspace(
+                &warmed,
+                window,
+                &mut workspace,
+                identity,
+            )
+            .expect("cold variable Span preflight");
+        assert_eq!(
+            cold,
+            RetainedPartialPreflight::Complete(MatchResult::Span(Some((0, 1))))
+        );
+        assert_eq!((address, cache_identity), (0, 0));
+
+        let mut novel = warmed.clone();
+        novel[..2].copy_from_slice(b"bq");
+        let (enter, address, cache_identity) = compiled
+            .preflight_dynamic_native_rows_with_workspace(
+                &novel,
+                window,
+                &mut workspace,
+                identity,
+            )
+            .expect("warm variable Span preflight");
+        assert_eq!(enter, RetainedPartialPreflight::Enter(window));
+        assert_ne!((address, cache_identity), (0, 0));
+        let descriptor = workspace
+            .dynamic_native_rows
+            .as_deref()
+            .expect("dynamic descriptor")
+            .native_rows;
+        let found = compiled
+            .search_from_dynamic_native_rows_hole_with_workspace(
+                &novel,
+                window,
+                &mut workspace,
+                identity,
+                usize::try_from(descriptor.initial_row).unwrap(),
+                window.start,
+                0,
+                0,
+                cache_identity,
+            )
+            .expect("variable Span first-hole continuation");
+        assert_eq!(found, MatchResult::Span(Some((0, 2))));
+        assert_eq!(
+            workspace
+                .dynamic_native_rows
+                .as_deref()
+                .expect("settled dynamic workspace")
+                .state,
+            DynamicNativeRowsState::default()
+        );
+    }
+
+    #[test]
+    fn dynamic_native_rows_variable_span_postflight_authenticates_one_exact_ticket() {
+        let raw = scanner_free_variable_pair_raw();
+        let compiled = raw_program(
+            &raw,
+            OutputContract::Span,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        let mut workspace = compiled.prepare_workspace().expect("dynamic workspace");
+        let mut haystack = vec![b'!'; DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES + 7];
+        haystack[3..5].copy_from_slice(b"bq");
+        let window = SearchWindow::new(3, haystack.len());
+        let identity = compiled.artifact_identity();
+
+        let (cold, address, cache_identity) = compiled
+            .preflight_dynamic_native_rows_with_workspace(
+                &haystack,
+                window,
+                &mut workspace,
+                identity,
+            )
+            .expect("cold variable Span preflight");
+        assert_eq!(
+            cold,
+            RetainedPartialPreflight::Complete(MatchResult::Span(Some((3, 5))))
+        );
+        assert_eq!((address, cache_identity), (0, 0));
+
+        let (entered, address, cache_identity) = compiled
+            .preflight_dynamic_native_rows_with_workspace(
+                &haystack,
+                window,
+                &mut workspace,
+                identity,
+            )
+            .expect("admitted variable Span preflight");
+        assert_eq!(entered, RetainedPartialPreflight::Enter(window));
+        assert_ne!((address, cache_identity), (0, 0));
+        assert_eq!(
+            compiled
+                .recover_dynamic_native_rows_span_from_selected_end_with_workspace(
+                    &haystack,
+                    window,
+                    &mut workspace,
+                    identity,
+                    5,
+                )
+                .expect("authenticated dynamic Span recovery"),
+            MatchResult::Span(Some((3, 5)))
+        );
+        assert!(compiled
+            .recover_dynamic_native_rows_span_from_selected_end_with_workspace(
+                &haystack,
+                window,
+                &mut workspace,
+                identity,
+                5,
+            )
+            .is_err(), "a consumed ticket must be stale");
+
+        let (entered, _, _) = compiled
+            .preflight_dynamic_native_rows_with_workspace(
+                &haystack,
+                window,
+                &mut workspace,
+                identity,
+            )
+            .expect("foreign-identity admission");
+        assert_eq!(entered, RetainedPartialPreflight::Enter(window));
+        let mut wrong_identity = identity;
+        wrong_identity[0] ^= 1;
+        assert!(compiled
+            .recover_dynamic_native_rows_span_from_selected_end_with_workspace(
+                &haystack,
+                window,
+                &mut workspace,
+                wrong_identity,
+                5,
+            )
+            .is_err());
+
+        let (entered, _, _) = compiled
+            .preflight_dynamic_native_rows_with_workspace(
+                &haystack,
+                window,
+                &mut workspace,
+                identity,
+            )
+            .expect("cross-window admission");
+        assert_eq!(entered, RetainedPartialPreflight::Enter(window));
+        let substituted = SearchWindow::new(window.start + 1, window.end);
+        assert!(compiled
+            .recover_dynamic_native_rows_span_from_selected_end_with_workspace(
+                &haystack,
+                substituted,
+                &mut workspace,
+                identity,
+                5,
+            )
+            .is_err());
+
+        let (entered, _, _) = compiled
+            .preflight_dynamic_native_rows_with_workspace(
+                &haystack,
+                window,
+                &mut workspace,
+                identity,
+            )
+            .expect("malformed-endpoint admission");
+        assert_eq!(entered, RetainedPartialPreflight::Enter(window));
+        assert!(compiled
+            .recover_dynamic_native_rows_span_from_selected_end_with_workspace(
+                &haystack,
+                window,
+                &mut workspace,
+                identity,
+                window.start,
+            )
+            .is_err());
+        assert_eq!(
+            workspace
+                .dynamic_native_rows
+                .as_deref()
+                .expect("dynamic state")
+                .state
+                .native_entry_window,
+            None,
+            "malformed postflight must consume the admission"
+        );
+    }
+
+    #[test]
     #[allow(
         clippy::too_many_lines,
         reason = "one test keeps exact-window substitution and stale-cache ticket consumption together"
@@ -11084,6 +11461,59 @@ mod tests {
             dynamic.native_rows_refreshes, 2,
             "an initial-pending Exists completion is read-only and reuses its projection"
         );
+    }
+
+    #[test]
+    fn dynamic_native_rows_nullable_variable_span_never_publishes_a_descriptor() {
+        let compiled = program(
+            "[ab]*",
+            OutputContract::Span,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        let view = compiled
+            .native_dynamic_rows_view()
+            .expect("nullable variable Span retains the guarded dynamic route");
+        assert_eq!(view.output, OutputContract::Span);
+        assert_eq!(view.exact_match_width, None);
+        let mut workspace = compiled.prepare_workspace().expect("prepared K0 workspace");
+        let haystack = vec![b'x'; DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES];
+        let window = SearchWindow::full(&haystack);
+        let identity = compiled.artifact_identity();
+
+        for phase in ["cold", "warm", "reused"] {
+            let (outcome, address, cache_identity) = compiled
+                .preflight_dynamic_native_rows_with_workspace(
+                    &haystack,
+                    window,
+                    &mut workspace,
+                    identity,
+                )
+                .unwrap_or_else(|error| panic!("{phase} nullable Span preflight: {error}"));
+            assert_eq!(
+                outcome,
+                RetainedPartialPreflight::Complete(MatchResult::Span(Some((0, 0)))),
+                "{phase}"
+            );
+            assert_eq!((address, cache_identity), (0, 0), "{phase}");
+            assert_eq!(
+                workspace
+                    .dynamic_native_rows
+                    .as_deref()
+                    .expect("nullable dynamic workspace")
+                    .state
+                    .native_entry_window,
+                None,
+                "{phase}"
+            );
+        }
+        assert!(compiled
+            .compiler_private_frozen_dynamic_rows_storage_v3(
+                &workspace,
+                usize::MAX,
+                usize::MAX,
+            )
+            .is_none());
     }
 
     #[test]

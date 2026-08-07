@@ -858,6 +858,7 @@ const PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL: usize = 11;
 // their one layout-specific helper occupies the same deterministic slot.
 const DYNAMIC_ROWS_DEOPT_RUNTIME_SYMBOL: usize = 11;
 const DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL: usize = 12;
+const DYNAMIC_ROWS_SPAN_RECOVERY_RUNTIME_SYMBOL: usize = 13;
 
 const RUNTIME_SYMBOL_NAME: &str = "fre_aot_regex_runtime_search_v1";
 const PARTIAL_RUNTIME_SYMBOL_NAME: &str =
@@ -872,6 +873,8 @@ const DYNAMIC_ROWS_DEOPT_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_search_exclusive_dynamic_rows_deopt_v1";
 const DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_search_exclusive_dynamic_rows_continue_v1";
+const DYNAMIC_ROWS_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME: &str =
+    "fre_aot_regex_runtime_search_exclusive_dynamic_rows_recover_span_v1";
 const PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_search_exclusive_recover_partial_span_v1";
 const ENTRY_SYMBOL_PREFIX: &str = "fre_aot_regex_search_v1_";
@@ -1566,11 +1569,6 @@ impl CompiledModule {
                 offset: 0,
                 size: 0,
             });
-            if prepared.dynamic_rows && prepared.span_recovery {
-                return Err(ObjectError::InvalidModule(
-                    "dynamic rows and partial Span recovery cannot share one prepared layout",
-                ));
-            }
             if prepared.dynamic_rows {
                 if symbols.len() != DYNAMIC_ROWS_DEOPT_RUNTIME_SYMBOL {
                     return Err(ObjectError::InvalidModule(
@@ -1585,7 +1583,11 @@ impl CompiledModule {
                     offset: 0,
                     size: 0,
                 });
-                if needs_dynamic_rows_continue_symbol {
+                // Slot 12 remains the established dynamic continuation slot.
+                // Variable Span keeps it present even for scanner-owned rows,
+                // where no continuation relocation references it, so the new
+                // recovery helper has one deterministic cross-target index.
+                if needs_dynamic_rows_continue_symbol || prepared.span_recovery {
                     if symbols.len() != DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL {
                         return Err(ObjectError::InvalidModule(
                             "dynamic-row continuation symbol order is inconsistent",
@@ -1593,6 +1595,21 @@ impl CompiledModule {
                     }
                     symbols.push(ModuleSymbol {
                         name: DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL_NAME.to_owned(),
+                        binding: SymbolBinding::Global,
+                        kind: SymbolKind::Function,
+                        section: None,
+                        offset: 0,
+                        size: 0,
+                    });
+                }
+                if prepared.span_recovery {
+                    if symbols.len() != DYNAMIC_ROWS_SPAN_RECOVERY_RUNTIME_SYMBOL {
+                        return Err(ObjectError::InvalidModule(
+                            "dynamic-row Span recovery symbol order is inconsistent",
+                        ));
+                    }
+                    symbols.push(ModuleSymbol {
+                        name: DYNAMIC_ROWS_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME.to_owned(),
                         binding: SymbolBinding::Global,
                         kind: SymbolKind::Function,
                         section: None,
@@ -1791,6 +1808,27 @@ impl CompiledModule {
             .map(|symbol| symbol.name.as_str())
     }
 
+    /// Return the authenticated selected-end-to-Span postflight required by a
+    /// variable-width dynamic-row entry, when that entry is present.
+    #[must_use]
+    pub fn required_prepared_dynamic_rows_span_recovery_runtime_symbol(&self) -> Option<&str> {
+        self.prepared_entry_symbol_index?;
+        if !self
+            .relocations
+            .iter()
+            .any(|relocation| relocation.symbol == DYNAMIC_ROWS_SPAN_RECOVERY_RUNTIME_SYMBOL)
+        {
+            return None;
+        }
+        self.symbols
+            .get(DYNAMIC_ROWS_SPAN_RECOVERY_RUNTIME_SYMBOL)
+            .filter(|symbol| {
+                symbol.section.is_none()
+                    && symbol.name == DYNAMIC_ROWS_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME
+            })
+            .map(|symbol| symbol.name.as_str())
+    }
+
     /// Return the authenticated selected-end-to-Span recovery helper required
     /// by a variable-width partial Span entry, when that entry is present.
     #[must_use]
@@ -1900,12 +1938,15 @@ fn lower_native_dynamic_rows_prepared(
             u64::try_from(width)
                 .map_err(|_| ObjectError::ArithmeticOverflow("dynamic native Span width"))?,
         ),
-        (OutputContract::Span, _) => {
+        (OutputContract::Span, None) => None,
+        (OutputContract::Span, Some(0)) => {
             return Err(ObjectError::InvalidModule(
-                "dynamic native Span requires a positive exact width",
+                "dynamic native Span rejects a proved zero width",
             ));
         }
     };
+    let variable_span_recovery =
+        view.output == OutputContract::Span && view.exact_match_width.is_none();
     let identity_offset =
         program_bytes
             .len()
@@ -2050,7 +2091,7 @@ fn lower_native_dynamic_rows_prepared(
             table_offset: identity_offset,
             table_size: 0,
             identity_offset,
-            span_recovery: false,
+            span_recovery: variable_span_recovery,
             dynamic_rows: true,
         },
     ))
@@ -2764,6 +2805,17 @@ fn native_module_digest(
                 &mut digest,
                 auxiliary_symbol_name.as_bytes(),
                 "prepared auxiliary runtime symbol identity byte length",
+            )?;
+        }
+        if lowering
+            .relocations
+            .iter()
+            .any(|relocation| relocation.symbol == DYNAMIC_ROWS_SPAN_RECOVERY_RUNTIME_SYMBOL)
+        {
+            update_bytes(
+                &mut digest,
+                DYNAMIC_ROWS_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME.as_bytes(),
+                "dynamic Span recovery runtime symbol identity byte length",
             )?;
         }
     }
@@ -13460,7 +13512,8 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     allow_direct_hole_continuation: bool,
 ) -> Result<NativeDynamicRowsEmission, ObjectError> {
     const FRAME_BYTES: u8 = 104;
-    if (output == OutputContract::Span) != exact_span_width.is_some()
+    let variable_span_recovery = output == OutputContract::Span && exact_span_width.is_none();
+    if (output != OutputContract::Span && exact_span_width.is_some())
         || exact_span_width == Some(0)
     {
         return Err(ObjectError::InvalidModule(
@@ -14105,6 +14158,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
     assembler.instruction(&[0xc3])?;
 
+    let mut span_recovery_relocation_labels = None;
     assembler.bind(native_match)?;
     if filter_kind.is_some_and(X86StartFilterKind::needs_vzeroupper) {
         assembler.instruction(&[0xc5, 0xf8, 0x77])?;
@@ -14120,6 +14174,31 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
             assembler.instruction(&[0x4d, 0x89, 0x19])?;
             assembler.instruction(&[0x4d, 0x89, 0x59, 0x08])?;
         }
+        OutputContract::Span if variable_span_recovery => {
+            // The native forward transducer left its authoritative endpoint
+            // in R11. Re-materialize the immutable identity because exact
+            // root setup may have borrowed both outgoing stack slots, then
+            // pass the exact admitted window to reverse-K0 postflight.
+            assembler.instruction(&[0x48, 0x8d, 0x05])?;
+            let identity = assembler.label()?;
+            assembler.bind(identity)?;
+            push_bytes(&mut assembler.code, &[0; 4])?;
+            assembler.instruction(&[0x48, 0x89, 0x04, 0x24])?;
+            assembler.instruction(&[0x4c, 0x89, 0x5c, 0x24, 0x08])?;
+            assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x10])?;
+            assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x18])?;
+            assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x20])?;
+            assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x40])?;
+            assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x48])?;
+            assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x38])?;
+            assembler.instruction(&[0xe8])?;
+            let runtime = assembler.label()?;
+            assembler.bind(runtime)?;
+            push_bytes(&mut assembler.code, &[0; 4])?;
+            assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+            assembler.instruction(&[0xc3])?;
+            span_recovery_relocation_labels = Some((identity, runtime));
+        }
         OutputContract::Span => {
             x86_emit_exact_span_start(
                 &mut assembler,
@@ -14131,9 +14210,11 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
             assembler.instruction(&[0x4d, 0x89, 0x59, 0x08])?;
         }
     }
-    assembler.instruction(&[0xb8, 1, 0, 0, 0])?;
-    assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
-    assembler.instruction(&[0xc3])?;
+    if !variable_span_recovery {
+        assembler.instruction(&[0xb8, 1, 0, 0, 0])?;
+        assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+        assembler.instruction(&[0xc3])?;
+    }
 
     let mut continuation_identity_displacement_label = None;
     let mut continuation_displacement_label = None;
@@ -14240,6 +14321,14 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     let continuation_displacement = continuation_displacement_label
         .map(|label| finished.label_offset(label))
         .transpose()?;
+    let span_recovery_displacements = span_recovery_relocation_labels
+        .map(|(identity, runtime)| {
+            Ok::<_, ObjectError>((
+                finished.label_offset(identity)?,
+                finished.label_offset(runtime)?,
+            ))
+        })
+        .transpose()?;
     let mut relocations = vec![
         ModuleRelocation {
             section: TEXT_SECTION,
@@ -14292,6 +14381,22 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
         return Err(ObjectError::InvalidModule(
             "x86 dynamic continuation relocation pair is incomplete",
         ));
+    }
+    if let Some((identity, runtime)) = span_recovery_displacements {
+        relocations.push(ModuleRelocation {
+            section: TEXT_SECTION,
+            offset: offset_u64(identity, "x86 dynamic Span recovery identity relocation")?,
+            kind: RelocationKind::X86PcRelative32,
+            symbol: PARTIAL_IDENTITY_SYMBOL,
+            addend: -4,
+        });
+        relocations.push(ModuleRelocation {
+            section: TEXT_SECTION,
+            offset: offset_u64(runtime, "x86 dynamic Span recovery runtime relocation")?,
+            kind: RelocationKind::X86PltRelative32,
+            symbol: DYNAMIC_ROWS_SPAN_RECOVERY_RUNTIME_SYMBOL,
+            addend: -4,
+        });
     }
     Ok(NativeDynamicRowsEmission {
         code: finished.code,
@@ -21175,7 +21280,8 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     allow_direct_hole_continuation: bool,
 ) -> Result<NativeDynamicRowsEmission, ObjectError> {
     const FRAME_BYTES: u16 = 96;
-    if (output == OutputContract::Span) != exact_span_width.is_some()
+    let variable_span_recovery = output == OutputContract::Span && exact_span_width.is_none();
+    if (output != OutputContract::Span && exact_span_width.is_some())
         || exact_span_width == Some(0)
     {
         return Err(ObjectError::InvalidModule(
@@ -21945,6 +22051,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
     assembler.instruction(0xd65f_03c0)?;
 
+    let mut span_recovery_relocation_offsets = None;
     assembler.bind(native_match)?;
     assembler.instruction(aarch64_load_x_imm(5, 31, 40)?)?;
     match output {
@@ -21955,6 +22062,26 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
         OutputContract::SelectedEnd => {
             assembler.instruction(aarch64_store_x(7, 5, 0)?)?;
             assembler.instruction(aarch64_store_x(7, 5, 8)?)?;
+        }
+        OutputContract::Span if variable_span_recovery => {
+            // X7 is the native-selected endpoint. Re-materialize the
+            // immutable identity in X6 and reload the exact admitted window
+            // before calling reverse-K0 postflight.
+            let identity_page = assembler.instruction(0x9000_0006)?;
+            let identity_page_offset =
+                assembler.instruction(aarch64_add_x_imm(6, 6, 0)?)?;
+            assembler.instruction(aarch64_load_x_imm(0, 31, 0)?)?;
+            assembler.instruction(aarch64_load_x_imm(1, 31, 8)?)?;
+            assembler.instruction(aarch64_load_x_imm(2, 31, 16)?)?;
+            assembler.instruction(aarch64_load_x_imm(3, 31, 48)?)?;
+            assembler.instruction(aarch64_load_x_imm(4, 31, 56)?)?;
+            assembler.instruction(aarch64_load_x_imm(5, 31, 40)?)?;
+            let runtime_branch = assembler.instruction(0x9400_0000)?;
+            assembler.instruction(aarch64_load_x_imm(30, 31, 88)?)?;
+            assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+            assembler.instruction(0xd65f_03c0)?;
+            span_recovery_relocation_offsets =
+                Some((identity_page, identity_page_offset, runtime_branch));
         }
         OutputContract::Span => {
             aarch64_emit_exact_span_start(
@@ -21967,10 +22094,12 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
             assembler.instruction(aarch64_store_x(7, 5, 8)?)?;
         }
     }
-    assembler.instruction(aarch64_movz_w(0, 1)?)?;
-    assembler.instruction(aarch64_load_x_imm(30, 31, 88)?)?;
-    assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
-    assembler.instruction(0xd65f_03c0)?;
+    if !variable_span_recovery {
+        assembler.instruction(aarch64_movz_w(0, 1)?)?;
+        assembler.instruction(aarch64_load_x_imm(30, 31, 88)?)?;
+        assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+        assembler.instruction(0xd65f_03c0)?;
+    }
 
     let mut continuation_identity_page = None;
     let mut continuation_identity_page_offset = None;
@@ -22077,6 +22206,17 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     } else {
         None
     };
+    let span_recovery_relocation_base = span_recovery_relocation_offsets.map(
+        |(identity_page, identity_page_offset, runtime_branch)| {
+            let base = relocation_offsets.len();
+            relocation_offsets.extend_from_slice(&[
+                identity_page,
+                identity_page_offset,
+                runtime_branch,
+            ]);
+            base
+        },
+    );
     let code = assembler.finish_with_offsets(&mut relocation_offsets)?;
     let mut relocations = vec![
             ModuleRelocation {
@@ -22160,6 +22300,55 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
                 )?,
                 kind: RelocationKind::Aarch64Branch26,
                 symbol: DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL,
+                addend: 0,
+            },
+        ]);
+    }
+    if let Some(base) = span_recovery_relocation_base {
+        let end = base
+            .checked_add(3)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "AArch64 dynamic Span recovery relocation indices",
+            ))?;
+        let &[identity_page, identity_offset, runtime_branch] = relocation_offsets
+            .get(base..end)
+            .ok_or(ObjectError::InvalidModule(
+                "AArch64 dynamic Span recovery relocation offsets are absent",
+            ))?
+        else {
+            return Err(ObjectError::InvalidModule(
+                "AArch64 dynamic Span recovery relocation offsets are malformed",
+            ));
+        };
+        relocations.extend_from_slice(&[
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(
+                    identity_page,
+                    "AArch64 dynamic Span recovery identity ADRP",
+                )?,
+                kind: RelocationKind::Aarch64Page21,
+                symbol: PARTIAL_IDENTITY_SYMBOL,
+                addend: 0,
+            },
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(
+                    identity_offset,
+                    "AArch64 dynamic Span recovery identity ADD",
+                )?,
+                kind: RelocationKind::Aarch64PageOff12,
+                symbol: PARTIAL_IDENTITY_SYMBOL,
+                addend: 0,
+            },
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(
+                    runtime_branch,
+                    "AArch64 dynamic Span recovery branch",
+                )?,
+                kind: RelocationKind::Aarch64Branch26,
+                symbol: DYNAMIC_ROWS_SPAN_RECOVERY_RUNTIME_SYMBOL,
                 addend: 0,
             },
         ]);
@@ -26371,6 +26560,78 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one cross-target audit keeps variable-Span admission, scanner tier, symbols, and relocations together"
+    )]
+    fn zero_retained_rows_publish_variable_span_dynamic_entry_on_every_target() {
+        let limits = CompileLimitsV1 {
+            determinize: DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+            ..CompileLimitsV1::default()
+        };
+        for target in identity_target_matrix() {
+            let compiled = compile(
+                CompileRequest::new("(?:ab|ac)+z", target)
+                    .mode(CompileMode::Fast)
+                    .output(OutputContract::Span)
+                    .limits(limits),
+            )
+            .unwrap_or_else(|error| panic!("variable Span dynamic rows {target:?}: {error}"));
+            assert_eq!(compiled.receipt().engine, EngineKind::OrderedNfa);
+            assert!(compiled.program().partial_dfa_stats().unwrap().is_none());
+            assert!(compiled.program().native_dfa_view().is_none());
+            assert!(compiled.program().native_partial_dfa_view().is_none());
+            let dynamic = compiled
+                .program()
+                .native_dynamic_rows_view()
+                .expect("variable Span dynamic graph view");
+            assert_eq!(dynamic.output, OutputContract::Span);
+            assert_eq!(dynamic.exact_match_width, None);
+            assert!(dynamic.root_requirement.is_some());
+            assert!(compiled.module().prepared_entry_symbol().is_some());
+            assert_ne!(
+                compiled.module().start_accelerator(),
+                StartAccelerator::None,
+                "{target:?}"
+            );
+            assert_eq!(
+                compiled
+                    .module()
+                    .required_prepared_dynamic_rows_span_recovery_runtime_symbol(),
+                Some(DYNAMIC_ROWS_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME),
+                "{target:?}"
+            );
+            assert_eq!(
+                compiled
+                    .module()
+                    .required_prepared_dynamic_rows_continue_runtime_symbol(),
+                None,
+                "scanner-owned holes retain whole-search deopt on {target:?}"
+            );
+            assert_eq!(
+                compiled
+                    .module()
+                    .relocations()
+                    .iter()
+                    .filter(|relocation| {
+                        relocation.symbol == DYNAMIC_ROWS_SPAN_RECOVERY_RUNTIME_SYMBOL
+                    })
+                    .count(),
+                1,
+                "{target:?}"
+            );
+            assert_eq!(
+                compiled.module().symbols()[DYNAMIC_ROWS_SPAN_RECOVERY_RUNTIME_SYMBOL].name,
+                DYNAMIC_ROWS_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME,
+                "{target:?}"
+            );
+        }
+    }
+
+    #[test]
     fn scanner_free_dynamic_first_hole_symbol_is_target_and_contract_general() {
         let pattern = r"(?-u:(?:a[\x00-\xFF]|[^a][\x00-\xFF]))";
         for target in identity_target_matrix() {
@@ -27804,6 +28065,109 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_variable_span_codegen_calls_recovery_on_both_architectures() {
+        let x86 = lower_x86_64_dynamic_rows_prepared_for_output(
+            None,
+            FeatureSet::of(CpuFeature::X86Avx2),
+            OutputContract::Span,
+            None,
+            true,
+        )
+        .expect("x86 variable Span dynamic lowering");
+        assert_eq!(
+            x86.relocations
+                .iter()
+                .filter(|relocation| {
+                    relocation.symbol == DYNAMIC_ROWS_SPAN_RECOVERY_RUNTIME_SYMBOL
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            x86.relocations
+                .iter()
+                .filter(|relocation| relocation.symbol == DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL)
+                .count(),
+            1,
+            "scanner-free variable Span keeps exact first-hole continuation"
+        );
+        let recovery = x86
+            .relocations
+            .iter()
+            .find(|relocation| {
+                relocation.symbol == DYNAMIC_ROWS_SPAN_RECOVERY_RUNTIME_SYMBOL
+            })
+            .expect("x86 recovery relocation");
+        assert_eq!(recovery.kind, RelocationKind::X86PltRelative32);
+        assert_eq!(recovery.addend, -4);
+        let recovery_offset = usize::try_from(recovery.offset).unwrap();
+        assert_eq!(x86.code[recovery_offset - 1], 0xe8);
+
+        let arm = lower_aarch64_dynamic_rows_prepared_for_output(
+            None,
+            OutputContract::Span,
+            None,
+            true,
+        )
+        .expect("AArch64 variable Span dynamic lowering");
+        assert_eq!(
+            arm.relocations
+                .iter()
+                .filter(|relocation| {
+                    relocation.symbol == DYNAMIC_ROWS_SPAN_RECOVERY_RUNTIME_SYMBOL
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            arm.relocations
+                .iter()
+                .filter(|relocation| relocation.symbol == DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL)
+                .count(),
+            1
+        );
+        let recovery = arm
+            .relocations
+            .iter()
+            .find(|relocation| {
+                relocation.symbol == DYNAMIC_ROWS_SPAN_RECOVERY_RUNTIME_SYMBOL
+            })
+            .expect("AArch64 recovery relocation");
+        assert_eq!(recovery.kind, RelocationKind::Aarch64Branch26);
+        assert_eq!(recovery.addend, 0);
+        let recovery_offset = usize::try_from(recovery.offset).unwrap();
+        let instruction = u32::from_le_bytes(
+            arm.code[recovery_offset..recovery_offset + 4]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(instruction & 0xfc00_0000, 0x9400_0000);
+
+        // Established fixed-width Span lowering remains self-contained and
+        // has no dependency on the new postflight symbol.
+        let exact_x86 = lower_x86_64_dynamic_rows_prepared_for_output(
+            None,
+            FeatureSet::of(CpuFeature::X86Avx2),
+            OutputContract::Span,
+            Some(2),
+            true,
+        )
+        .expect("x86 exact Span dynamic lowering");
+        let exact_arm = lower_aarch64_dynamic_rows_prepared_for_output(
+            None,
+            OutputContract::Span,
+            Some(2),
+            true,
+        )
+        .expect("AArch64 exact Span dynamic lowering");
+        for emission in [&exact_x86, &exact_arm] {
+            assert!(emission.relocations.iter().all(|relocation| {
+                relocation.symbol != DYNAMIC_ROWS_SPAN_RECOVERY_RUNTIME_SYMBOL
+            }));
+        }
+    }
+
+    #[test]
     fn fast_mode_publishes_general_dynamic_exists_entry_on_every_target() {
         for target in identity_target_matrix() {
             let compiled = compile(
@@ -27896,6 +28260,40 @@ mod tests {
             ],
             byte_starts: vec![0, 0, b'a', b'a', 0, b'b', 0, b'c'],
             byte_ends: vec![0, 0, b'a', b'b', b'`', u8::MAX, b'`', u8::MAX],
+        }
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    fn scanner_free_variable_pair_raw() -> fre_automata::RawPlan {
+        use fre_automata::{EdgeKind, RawPlan, StateRole};
+
+        // One `a` byte or two bytes beginning with any non-`a` byte. The
+        // initial alternatives cover the full byte alphabet, so this is a
+        // nonnullable variable-width graph with no selective root scanner.
+        RawPlan {
+            start: 0,
+            roles: vec![
+                StateRole::Split,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Accept,
+            ],
+            edge_offsets: vec![0, 2, 3, 5, 6, 6],
+            edge_targets: vec![1, 2, 4, 3, 3, 4],
+            edge_kinds: vec![
+                EdgeKind::Epsilon,
+                EdgeKind::Epsilon,
+                EdgeKind::ByteRange,
+                EdgeKind::ByteRange,
+                EdgeKind::ByteRange,
+                EdgeKind::ByteRange,
+            ],
+            byte_starts: vec![0, 0, b'a', 0, b'b', 0],
+            byte_ends: vec![0, 0, b'a', b'`', u8::MAX, u8::MAX],
         }
     }
 
@@ -28371,6 +28769,180 @@ mod tests {
                 expected_end: pending_end,
             }],
         );
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    #[ignore = "requires `cargo build -p fre-aot-regex-runtime --lib`; links variable-Span generated code to the real postflight runtime"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the opt-in host link test owns one exhaustive all-window C differential"
+    )]
+    fn linked_host_dynamic_variable_span_all_windows_uses_real_runtime() {
+        use std::{fmt::Write as _, fs, process::Command, time::SystemTime};
+
+        fn host_target() -> Target {
+            if cfg!(target_arch = "x86_64") {
+                if cfg!(target_os = "linux") {
+                    Target::x86_64_linux()
+                } else {
+                    Target::x86_64_macos()
+                }
+            } else if cfg!(target_os = "linux") {
+                Target::aarch64_linux()
+            } else {
+                Target::aarch64_macos()
+            }
+        }
+
+        fn c_bytes(bytes: &[u8]) -> String {
+            bytes
+                .iter()
+                .map(u8::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+
+        let target = host_target();
+        let program = scanner_free_dynamic_program(
+            scanner_free_variable_pair_raw(),
+            OutputContract::Span,
+        );
+        let view = program
+            .native_dynamic_rows_view()
+            .expect("variable Span dynamic view");
+        assert_eq!(view.exact_match_width, None);
+        assert_eq!(view.root_requirement, None);
+        let module = CompiledModule::lower(&program, target)
+            .expect("lower host variable Span dynamic object");
+        assert_eq!(
+            module.required_prepared_dynamic_rows_continue_runtime_symbol(),
+            Some(DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL_NAME)
+        );
+        assert_eq!(
+            module.required_prepared_dynamic_rows_span_recovery_runtime_symbol(),
+            Some(DYNAMIC_ROWS_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME)
+        );
+        let object = crate::emit_object(
+            &module,
+            ObjectFormat::for_target(target),
+            usize::MAX,
+        )
+        .expect("emit host variable Span object");
+        let entry = module
+            .prepared_entry_symbol()
+            .expect("variable Span prepared entry");
+        let (program_symbol, program_len) = module
+            .required_runtime_program()
+            .expect("variable Span runtime program alias");
+
+        let current_exe = std::env::current_exe().expect("current test executable");
+        let profile_dir = current_exe
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("Cargo profile directory");
+        let static_runtime = profile_dir.join("libfre_aot_regex_runtime.a");
+        assert!(
+            static_runtime.is_file(),
+            "build the linked runtime first: cargo build -p fre-aot-regex-runtime --lib ({})",
+            static_runtime.display()
+        );
+
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "fre-aot-real-dynamic-variable-span-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("create variable Span linker directory");
+        let object_path = directory.join("dynamic_span.o");
+        fs::write(&object_path, object).expect("write variable Span object");
+
+        let mut all_a = vec![b'a'; 40];
+        all_a[17] = b'b';
+        all_a[18] = b'q';
+        let alternating = (0..43)
+            .map(|index| if index % 3 == 0 { b'a' } else if index % 3 == 1 { b'b' } else { b'q' })
+            .collect::<Vec<_>>();
+        let mut boundaries = vec![b'!'; 47];
+        boundaries[0] = b'a';
+        boundaries[31..35].copy_from_slice(b"bqab");
+        let haystacks = [all_a, alternating, boundaries];
+
+        let mut source = format!(
+            "#include <stddef.h>\n#include <stdint.h>\n\
+             typedef void *handle_t;typedef struct{{size_t start;size_t end;}} result_t;\n\
+             extern const unsigned char {program_symbol}[];\n\
+             extern uint32_t {entry}(handle_t,const unsigned char*,size_t,size_t,size_t,result_t*);\n\
+             extern uint32_t fre_aot_regex_runtime_prepare_exclusive_v1(const unsigned char*,size_t,handle_t*);\n\
+             extern uint32_t fre_aot_regex_runtime_search_exclusive_v1(handle_t,const unsigned char*,size_t,size_t,size_t,result_t*);\n\
+             extern uint32_t fre_aot_regex_runtime_destroy_exclusive_v1(handle_t);\n\
+             static int prepare(handle_t *h){{return fre_aot_regex_runtime_prepare_exclusive_v1({program_symbol},{program_len}U,h)==0U;}}\n\
+             static int run(const unsigned char *h,size_t n,int base){{\n\
+               for(size_t start=0;start<=n;start++)for(size_t end=start;end<=n;end++){{\n\
+                 handle_t native=0,oracle=0;result_t warm={{91U,92U}},got={{93U,94U}},expected={{95U,96U}};\n\
+                 if(!prepare(&native)||!prepare(&oracle))return base;\n\
+                 uint32_t ws=fre_aot_regex_runtime_search_exclusive_v1(native,h,n,start,end,&warm);\n\
+                 uint32_t os=fre_aot_regex_runtime_search_exclusive_v1(oracle,h,n,start,end,&expected);\n\
+                 uint32_t ns={entry}(native,h,n,start,end,&got);\n\
+                 if(ws!=os||warm.start!=expected.start||warm.end!=expected.end)return base+1;\n\
+                 if(ns!=os||got.start!=expected.start||got.end!=expected.end)return base+2;\n\
+                 if(fre_aot_regex_runtime_destroy_exclusive_v1(native)!=0U||fre_aot_regex_runtime_destroy_exclusive_v1(oracle)!=0U)return base+3;\n\
+               }}return 0;}}\n"
+        );
+        for (index, haystack) in haystacks.iter().enumerate() {
+            writeln!(
+                source,
+                "static const unsigned char h{index}[]={{{}}};",
+                c_bytes(haystack)
+            )
+            .expect("write variable Span haystack");
+        }
+        source.push_str("int main(void){int s;\n");
+        for index in 0..haystacks.len() {
+            let base = 10 + index * 10;
+            writeln!(
+                source,
+                "s=run(h{index},sizeof(h{index}),{base});if(s!=0)return s;"
+            )
+            .expect("write all-window call");
+        }
+        source.push_str("return 0;}\n");
+
+        let c_path = directory.join("dynamic_span.c");
+        let executable = directory.join("dynamic_span");
+        fs::write(&c_path, source).expect("write variable Span C harness");
+        let c_compiler = if cfg!(target_os = "macos") {
+            "clang"
+        } else {
+            "cc"
+        };
+        let status = Command::new(c_compiler)
+            .arg("-O0")
+            .arg(&c_path)
+            .arg(&object_path)
+            .arg(&static_runtime)
+            .arg("-o")
+            .arg(&executable)
+            .status()
+            .expect("link variable Span runtime harness");
+        assert!(status.success(), "variable Span harness failed to link");
+        let output = Command::new(&executable)
+            .output()
+            .expect("execute variable Span all-window differential");
+        assert!(
+            output.status.success(),
+            "status={:?} stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::remove_dir_all(&directory).expect("remove variable Span linker directory");
     }
 
     #[cfg(all(

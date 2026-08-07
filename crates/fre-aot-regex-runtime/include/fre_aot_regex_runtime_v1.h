@@ -143,6 +143,28 @@ uint32_t fre_aot_regex_runtime_search_exclusive_recover_partial_span_v1(
     size_t selected_end);
 
 /*
+ * Recover the selected start after a variable-width, non-nullable dynamic-row
+ * scan completes locally with only its endpoint. The identity and exact
+ * window must match the immediately preceding successful dynamic-row
+ * preflight on this exclusive session. selected_end must lie strictly after
+ * window_start and at or before window_end. Success initializes result_out
+ * with the exact Span; every rejection leaves it untouched.
+ *
+ * This is a compiler-private object-linking ABI. It is declared here so
+ * embedders that resolve generated-object dependencies can provide the exact
+ * versioned runtime export without duplicating its signature.
+ */
+uint32_t fre_aot_regex_runtime_search_exclusive_dynamic_rows_recover_span_v1(
+    FreAotRegexExclusiveHandleV1 handle,
+    const uint8_t *haystack_ptr,
+    size_t haystack_len,
+    size_t window_start,
+    size_t window_end,
+    FreAotRegexResultV1 *result_ptr,
+    const uint8_t expected_artifact_identity[FRE_AOT_REGEX_ARTIFACT_IDENTITY_BYTES],
+    size_t selected_end);
+
+/*
  * Authenticate one native incomplete-retained search. The helper settles the
  * prior local native completion, runs suffix then cut, and consults adaptive
  * admission. Status 0 or 1 initializes result_out and completes the search.

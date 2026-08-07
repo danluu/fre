@@ -53,6 +53,9 @@
 //! endpoint uses
 //! [`fre_aot_regex_runtime_search_exclusive_recover_partial_span_v1`] to
 //! authenticate the preflight window and recover only the selected start.
+//! A variable-width dynamic-row entry uses the parallel
+//! [`fre_aot_regex_runtime_search_exclusive_dynamic_rows_recover_span_v1`]
+//! postflight after selecting its authoritative endpoint natively.
 //! [`fre_aot_regex_runtime_prepared_partial_should_enter_v1`] remains exported
 //! only for compatibility with older generated objects.
 
@@ -733,6 +736,24 @@ impl PreparedAotRegex {
                 continuation.pending_valid,
                 continuation.pending_end,
                 continuation.cache_identity,
+            )
+    }
+
+    fn recover_dynamic_native_rows_span_from_selected_end(
+        &mut self,
+        haystack: &[u8],
+        window: SearchWindow,
+        expected_artifact_identity: [u8; ARTIFACT_IDENTITY_BYTES],
+        selected_end: usize,
+    ) -> Result<MatchResult, CompileError> {
+        self.deactivate_frozen_header();
+        self.program
+            .recover_dynamic_native_rows_span_from_selected_end_with_workspace(
+                haystack,
+                window,
+                &mut self.workspace,
+                expected_artifact_identity,
+                selected_end,
             )
     }
 
@@ -1513,6 +1534,85 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_search_exclusive_dynamic_rows_con
         let (status, result) = encode_match_result(found);
         result_ptr.write(result);
         status
+    }))
+    .unwrap_or(STATUS_RUNTIME_FAILURE)
+}
+
+/// Recover a variable-width Span start after an authenticated dynamic-row
+/// scan selected only its authoritative endpoint.
+///
+/// The exact `window_start..window_end` must be the single-use window admitted
+/// by the immediately preceding successful dynamic-row preflight on this
+/// exclusive session. The artifact must be an assertion-free, non-nullable,
+/// variable-width ordered-NFA Span program, and `selected_end` must lie
+/// strictly after the admitted start and at or before its end. Reverse K0
+/// recovers only the start; the forward search is not replayed.
+///
+/// On success this function returns [`STATUS_MATCH`] and initializes
+/// `result_ptr` with the exact Span. Every rejection returns an error status
+/// and leaves `result_ptr` untouched.
+///
+/// # Safety
+///
+/// The handle, haystack, result, and identity pointer requirements are the
+/// same as for
+/// [`fre_aot_regex_runtime_search_exclusive_dynamic_rows_continue_v1`]. The
+/// caller must pass the exact admitted window and the endpoint produced by its
+/// synchronous native scan. No overlapping call or destroy may use any copy
+/// of `handle`.
+#[doc(hidden)]
+#[unsafe(no_mangle)]
+#[allow(
+    unsafe_code,
+    clippy::too_many_arguments,
+    reason = "this private generated-code postflight authenticates the exact dynamic admission and endpoint"
+)]
+pub unsafe extern "C" fn fre_aot_regex_runtime_search_exclusive_dynamic_rows_recover_span_v1(
+    handle: FreAotRegexExclusiveHandleV1,
+    haystack_ptr: *const u8,
+    haystack_len: usize,
+    window_start: usize,
+    window_end: usize,
+    result_ptr: *mut FreAotRegexResultV1,
+    expected_artifact_identity_ptr: *const u8,
+    selected_end: usize,
+) -> u32 {
+    if handle.is_invalid() {
+        return STATUS_INVALID_HANDLE;
+    }
+    if haystack_ptr.is_null()
+        || result_ptr.is_null()
+        || !result_ptr.is_aligned()
+        || expected_artifact_identity_ptr.is_null()
+        || haystack_len > isize::MAX.unsigned_abs()
+        || window_start > window_end
+        || window_end > haystack_len
+        || selected_end <= window_start
+        || selected_end > window_end
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+
+    // SAFETY: the caller guarantees one live exclusively owned session plus
+    // all readable and writable disjoint extents described above.
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        let prepared = &mut *handle.0.cast::<PreparedAotRegex>();
+        let haystack = std::slice::from_raw_parts(haystack_ptr, haystack_len);
+        let expected_artifact_identity = expected_artifact_identity_ptr
+            .cast::<[u8; ARTIFACT_IDENTITY_BYTES]>()
+            .read();
+        let Ok(MatchResult::Span(Some((start, end)))) = prepared
+            .recover_dynamic_native_rows_span_from_selected_end(
+                haystack,
+                SearchWindow::new(window_start, window_end),
+                expected_artifact_identity,
+                selected_end,
+            )
+        else {
+            return STATUS_RUNTIME_FAILURE;
+        };
+        result_ptr.write(FreAotRegexResultV1 { start, end });
+        STATUS_MATCH
     }))
     .unwrap_or(STATUS_RUNTIME_FAILURE)
 }
@@ -2712,6 +2812,36 @@ mod tests {
 
     #[allow(
         clippy::too_many_arguments,
+        reason = "the test helper mirrors the authenticated dynamic Span postflight ABI"
+    )]
+    fn call_exclusive_recover_dynamic_span(
+        handle: FreAotRegexExclusiveHandleV1,
+        haystack: &[u8],
+        start: usize,
+        end: usize,
+        result: &mut FreAotRegexResultV1,
+        expected_artifact_identity: &[u8; ARTIFACT_IDENTITY_BYTES],
+        selected_end: usize,
+    ) -> u32 {
+        // SAFETY: each test keeps exclusive ownership of the admitted live
+        // session; readable inputs and disjoint aligned output outlive the
+        // synchronous compiler-private postflight.
+        unsafe {
+            fre_aot_regex_runtime_search_exclusive_dynamic_rows_recover_span_v1(
+                handle,
+                haystack.as_ptr(),
+                haystack.len(),
+                start,
+                end,
+                result,
+                expected_artifact_identity.as_ptr(),
+                selected_end,
+            )
+        }
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
         reason = "the test helper mirrors the authenticated exact-window Span postflight ABI"
     )]
     fn call_exclusive_recover_partial_span(
@@ -2876,6 +3006,7 @@ mod tests {
             "fre_aot_regex_runtime_prepared_partial_should_enter_v1",
             "fre_aot_regex_runtime_search_exclusive_from_partial_v1",
             "fre_aot_regex_runtime_search_exclusive_recover_partial_span_v1",
+            "fre_aot_regex_runtime_search_exclusive_dynamic_rows_recover_span_v1",
             "fre_aot_regex_runtime_search_exclusive_partial_preflight_v1",
             "fre_aot_regex_runtime_search_exclusive_partial_native_root_preflight_v1",
             "fre_aot_regex_runtime_destroy_exclusive_v1",
@@ -2949,6 +3080,16 @@ mod tests {
             *const u8,
             *const FreAotRegexDynamicRowsContinuationV1,
         ) -> u32 = fre_aot_regex_runtime_search_exclusive_dynamic_rows_continue_v1;
+        let _: unsafe extern "C" fn(
+            FreAotRegexExclusiveHandleV1,
+            *const u8,
+            usize,
+            usize,
+            usize,
+            *mut FreAotRegexResultV1,
+            *const u8,
+            usize,
+        ) -> u32 = fre_aot_regex_runtime_search_exclusive_dynamic_rows_recover_span_v1;
         let _: unsafe extern "C" fn(FreAotRegexExclusiveHandleV1, usize) -> u32 =
             fre_aot_regex_runtime_prepared_partial_should_enter_v1;
         let _: unsafe extern "C" fn(
@@ -3506,6 +3647,214 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
                 STATUS_SUCCESS
             );
         }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "success and raw/private authentication failures share one single-use dynamic Span lifecycle"
+    )]
+    fn exclusive_dynamic_span_postflight_authenticates_and_recovers() {
+        let compiled = compile(
+            CompileRequest::new(
+                r"(?-u:(?:a|[^a][\x00-\xFF]))",
+                Target::x86_64_linux(),
+            )
+            .mode(CompileMode::Fast)
+            .output(OutputContract::Span),
+        )
+        .expect("compile scanner-free variable Span fixture");
+        assert_eq!(compiled.program().engine_kind(), EngineKind::OrderedNfa);
+        assert_eq!(compiled.program().exact_match_width(), None);
+        let view = compiled
+            .program()
+            .native_dynamic_rows_view()
+            .expect("variable Span dynamic view");
+        assert_eq!(view.root_requirement, None);
+
+        let identity = compiled.receipt().program_sha256;
+        let serialized = compiled.program().serialize().unwrap();
+        let handle = prepare_exclusive(&serialized);
+        let mut haystack = vec![b'!'; 80];
+        let start = 8_usize;
+        let end = 72_usize;
+        haystack[start..start + 2].copy_from_slice(b"bq");
+        let selected_end = start + 2;
+        let expected = FreAotRegexResultV1 {
+            start,
+            end: selected_end,
+        };
+        let sentinel = FreAotRegexResultV1 { start: 91, end: 92 };
+
+        let mut result = sentinel;
+        let mut preflight = FreAotRegexDynamicRowsPreflightV1::default();
+        assert_eq!(
+            call_exclusive_dynamic_rows_preflight(
+                handle,
+                &haystack,
+                start,
+                end,
+                &mut result,
+                &identity,
+                &mut preflight,
+            ),
+            STATUS_MATCH
+        );
+        assert_eq!(result, expected);
+
+        let preflight = || {
+            let mut result = sentinel;
+            let mut preflight = FreAotRegexDynamicRowsPreflightV1::default();
+            assert_eq!(
+                call_exclusive_dynamic_rows_preflight(
+                    handle,
+                    &haystack,
+                    start,
+                    end,
+                    &mut result,
+                    &identity,
+                    &mut preflight,
+                ),
+                STATUS_PARTIAL_PREFLIGHT_ENTER
+            );
+            assert_eq!(result, sentinel);
+            assert_eq!((preflight.start, preflight.end), (start, end));
+            preflight
+        };
+
+        preflight();
+        result = sentinel;
+        assert_eq!(
+            call_exclusive_recover_dynamic_span(
+                handle,
+                &haystack,
+                start,
+                end,
+                &mut result,
+                &identity,
+                selected_end,
+            ),
+            STATUS_MATCH
+        );
+        assert_eq!(result, expected);
+
+        // The exact dynamic admission is single use.
+        result = sentinel;
+        assert_eq!(
+            call_exclusive_recover_dynamic_span(
+                handle,
+                &haystack,
+                start,
+                end,
+                &mut result,
+                &identity,
+                selected_end,
+            ),
+            STATUS_RUNTIME_FAILURE
+        );
+        assert_eq!(result, sentinel);
+
+        // Raw pointer rejection happens before Rust can consume the otherwise
+        // valid ticket; the following authenticated call still succeeds.
+        preflight();
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_search_exclusive_dynamic_rows_recover_span_v1(
+                    handle,
+                    haystack.as_ptr(),
+                    haystack.len(),
+                    start,
+                    end,
+                    &raw mut result,
+                    std::ptr::null(),
+                    selected_end,
+                )
+            },
+            STATUS_INVALID_ARGUMENT
+        );
+        assert_eq!(result, sentinel);
+        assert_eq!(
+            call_exclusive_recover_dynamic_span(
+                handle,
+                &haystack,
+                start,
+                end,
+                &mut result,
+                &identity,
+                selected_end,
+            ),
+            STATUS_MATCH
+        );
+        assert_eq!(result, expected);
+
+        // A foreign identity consumes the capability before rejection.
+        preflight();
+        result = sentinel;
+        let mut wrong_identity = identity;
+        wrong_identity[0] ^= 1;
+        assert_eq!(
+            call_exclusive_recover_dynamic_span(
+                handle,
+                &haystack,
+                start,
+                end,
+                &mut result,
+                &wrong_identity,
+                selected_end,
+            ),
+            STATUS_RUNTIME_FAILURE
+        );
+        assert_eq!(result, sentinel);
+        assert_eq!(
+            call_exclusive_recover_dynamic_span(
+                handle,
+                &haystack,
+                start,
+                end,
+                &mut result,
+                &identity,
+                selected_end,
+            ),
+            STATUS_RUNTIME_FAILURE,
+            "foreign postflight must consume the ticket"
+        );
+
+        // A cross-window call and an in-range but semantically impossible
+        // endpoint are both authenticated failures that consume their ticket.
+        preflight();
+        assert_eq!(
+            call_exclusive_recover_dynamic_span(
+                handle,
+                &haystack,
+                start + 1,
+                end,
+                &mut result,
+                &identity,
+                selected_end,
+            ),
+            STATUS_RUNTIME_FAILURE
+        );
+        preflight();
+        result = sentinel;
+        assert_eq!(
+            call_exclusive_recover_dynamic_span(
+                handle,
+                &haystack,
+                start,
+                end,
+                &mut result,
+                &identity,
+                start + 1,
+            ),
+            STATUS_RUNTIME_FAILURE
+        );
+        assert_eq!(result, sentinel);
+
+        // SAFETY: the test uniquely owns the completed exclusive session.
+        assert_eq!(
+            unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(handle) },
+            STATUS_SUCCESS
+        );
     }
 
     #[test]
