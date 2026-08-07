@@ -5731,6 +5731,15 @@ pub struct K0FullyPrefilledRootProjection<'a> {
 }
 
 impl K0FullyPrefilledRootProjection<'_> {
+    /// Borrow the authenticated compact forward rows for an immediate
+    /// compiler-owned copy. The slice is valid under the same no-mutation
+    /// lifetime as the address/extent accessors below.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn forward_rows(&self) -> &[u32] {
+        self.forward_rows
+    }
+
     #[doc(hidden)]
     #[must_use]
     pub const fn forward_rows_address(&self) -> *const u32 {
@@ -5747,6 +5756,14 @@ impl K0FullyPrefilledRootProjection<'_> {
     #[must_use]
     pub fn reverse_rows_address(&self) -> Option<*const u32> {
         self.reverse_rows.map(<[u32]>::as_ptr)
+    }
+
+    /// Borrow the optional authenticated compact reverse rows for an
+    /// immediate compiler-owned copy.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn reverse_rows(&self) -> Option<&[u32]> {
+        self.reverse_rows
     }
 
     #[doc(hidden)]
@@ -6314,7 +6331,20 @@ impl K0Workspace {
         automaton: &Automaton,
         resume_set: &mut K0ResumeSet,
     ) -> Option<K0FullyPrefilledResumeCacheReceipt> {
-        prefill_bound_resume_caches_transaction(automaton, self, resume_set).unwrap_or(None)
+        prefill_complete_caches_transaction(automaton, self, Some(resume_set)).unwrap_or(None)
+    }
+
+    /// Complete every root-reachable forward and reverse row without a
+    /// retained continuation set. Optimizing AOT compilation uses this for
+    /// zero-row and zero-frontier resource fallbacks; ordinary runtime setup
+    /// continues to use the resume-bearing transaction above.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn compiler_private_try_prefill_root_cache_with_receipt(
+        &mut self,
+        automaton: &Automaton,
+    ) -> Option<K0FullyPrefilledResumeCacheReceipt> {
+        prefill_complete_caches_transaction(automaton, self, None).unwrap_or(None)
     }
 
     /// Authenticate a retained prefill receipt and return the exact cached row
@@ -6357,15 +6387,33 @@ impl K0Workspace {
         receipt: K0FullyPrefilledResumeCacheReceipt,
         require_reverse: bool,
     ) -> Option<()> {
+        self.fully_prefilled_root_cache_is_live(automaton, receipt, require_reverse)?;
+        if resume_set.automaton_identity != receipt.automaton_identity
+            || resume_set.fully_prefilled_cache_identity != receipt.cache_identity
+        {
+            return None;
+        }
+        Some(())
+    }
+
+    /// Authenticate the complete root cache without requiring continuation
+    /// metadata. This is the root-only counterpart used by compile-time AOT
+    /// materialization; it retains every cache, row, reverse, and byte-overlay
+    /// check shared by the runtime resume path.
+    #[inline]
+    fn fully_prefilled_root_cache_is_live(
+        &self,
+        automaton: &Automaton,
+        receipt: K0FullyPrefilledResumeCacheReceipt,
+        require_reverse: bool,
+    ) -> Option<()> {
         let stride = usize::try_from(receipt.direct_row_stride).ok()?;
         let forward_cells = receipt.forward_state_len.checked_mul(stride)?;
         if receipt.cache_identity == 0
             || receipt.automaton_identity != automaton.identity()
             || self.bound_automaton_identity != receipt.automaton_identity
-            || resume_set.automaton_identity != receipt.automaton_identity
             || self.lazy.automaton_identity != receipt.automaton_identity
             || self.lazy.cache_identity != receipt.cache_identity
-            || resume_set.fully_prefilled_cache_identity != receipt.cache_identity
             || self.lazy.direct_row_stride != receipt.direct_row_stride
             || self.lazy.context.is_allocated()
             || !self.lazy.initialized
@@ -6533,6 +6581,28 @@ impl K0Workspace {
         receipt: K0FullyPrefilledResumeCacheReceipt,
     ) -> Option<K0FullyPrefilledRootProjection<'_>> {
         self.fully_prefilled_cache_is_live(automaton, resume_set, receipt, false)?;
+        self.fully_prefilled_root_projection_after_authentication(automaton, receipt)
+    }
+
+    /// Root-only projection for an AOT setup transaction that had no retained
+    /// continuation set. Every row and receipt check is identical to the
+    /// resume-bearing projection; only resume-map lineage is absent.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn compiler_private_fully_prefilled_root_projection_without_resume(
+        &self,
+        automaton: &Automaton,
+        receipt: K0FullyPrefilledResumeCacheReceipt,
+    ) -> Option<K0FullyPrefilledRootProjection<'_>> {
+        self.fully_prefilled_root_cache_is_live(automaton, receipt, false)?;
+        self.fully_prefilled_root_projection_after_authentication(automaton, receipt)
+    }
+
+    fn fully_prefilled_root_projection_after_authentication(
+        &self,
+        automaton: &Automaton,
+        receipt: K0FullyPrefilledResumeCacheReceipt,
+    ) -> Option<K0FullyPrefilledRootProjection<'_>> {
         let stride = usize::try_from(receipt.direct_row_stride).ok()?;
         let forward_rows = self.lazy.rows.get(..receipt.forward_cells)?;
         if !frozen_direct_rows_are_closed(forward_rows, stride)
@@ -18308,13 +18378,12 @@ fn fully_prefilled_byte_loop_rows(
 )]
 #[cold]
 #[inline(never)]
-fn prefill_bound_resume_caches_transaction(
+fn prefill_complete_caches_transaction(
     automaton: &Automaton,
     live: &mut K0Workspace,
-    resume_set: &mut K0ResumeSet,
+    resume_set: Option<&mut K0ResumeSet>,
 ) -> Result<Option<K0FullyPrefilledResumeCacheReceipt>, SearchError> {
     if live.bound_automaton_identity != automaton.identity()
-        || !resume_set.is_bound_to(automaton)
         || automaton.stats().assertion_edges() != 0
         || !live.lazy.is_allocated()
         || live.lazy.context.is_allocated()
@@ -18330,10 +18399,13 @@ fn prefill_bound_resume_caches_transaction(
                 || live.reverse.item_len != 0
                 || live.reverse.declined
                 || live.reverse.saturated))
-        || resume_set
-            .cached_states
-            .iter()
-            .any(|&state| state != LAZY_NO_STATE)
+        || resume_set.as_deref().is_some_and(|resume_set| {
+            !resume_set.is_bound_to(automaton)
+                || resume_set
+                    .cached_states
+                    .iter()
+                    .any(|&state| state != LAZY_NO_STATE)
+        })
     {
         return Ok(None);
     }
@@ -18351,29 +18423,37 @@ fn prefill_bound_resume_caches_transaction(
         return Ok(None);
     }
 
-    let hint_count = resume_set.cached_states.len();
-    if hint_count == 0 {
+    let hint_count = resume_set
+        .as_deref()
+        .map_or(0, |resume_set| resume_set.cached_states.len());
+    if resume_set.is_some() && hint_count == 0 {
         return Ok(None);
     }
-    let mut staged_hints = allocate_slots(hint_count, LAZY_NO_STATE, resume_set.retained_bytes())?;
-    for (resume_state, hint) in staged_hints.iter_mut().enumerate() {
-        let (frontier, pending) = resume_set.frontier(resume_state)?;
-        let copy_work =
-            u64::try_from(frontier.len()).map_err(|_| SearchError::ArithmeticOverflow {
-                computation: "compiler-private resume prefill copy work",
-            })?;
-        meter.charge(copy_work, 0)?;
-        let scratch = staged.lazy.scratch.get_mut(..frontier.len()).ok_or(
-            SearchError::InternalInvariant {
-                detail: "compiler-private resume prefill exceeds lazy scratch",
-            },
-        )?;
-        scratch.copy_from_slice(frontier);
-        staged.lazy.scratch_len = frontier.len();
-        *hint = match staged.lazy.intern_speculative(pending, &mut meter, 0, 0)? {
-            LazyInterned::State(state) => state,
-            LazyInterned::BudgetDeclined | LazyInterned::CapacityFull => return Ok(None),
-        };
+    let mut staged_hints = if let Some(resume_set) = resume_set.as_deref() {
+        allocate_slots(hint_count, LAZY_NO_STATE, resume_set.retained_bytes())?
+    } else {
+        Vec::new()
+    };
+    if let Some(resume_set) = resume_set.as_deref() {
+        for (resume_state, hint) in staged_hints.iter_mut().enumerate() {
+            let (frontier, pending) = resume_set.frontier(resume_state)?;
+            let copy_work =
+                u64::try_from(frontier.len()).map_err(|_| SearchError::ArithmeticOverflow {
+                    computation: "compiler-private resume prefill copy work",
+                })?;
+            meter.charge(copy_work, 0)?;
+            let scratch = staged.lazy.scratch.get_mut(..frontier.len()).ok_or(
+                SearchError::InternalInvariant {
+                    detail: "compiler-private resume prefill exceeds lazy scratch",
+                },
+            )?;
+            scratch.copy_from_slice(frontier);
+            staged.lazy.scratch_len = frontier.len();
+            *hint = match staged.lazy.intern_speculative(pending, &mut meter, 0, 0)? {
+                LazyInterned::State(state) => state,
+                LazyInterned::BudgetDeclined | LazyInterned::CapacityFull => return Ok(None),
+            };
+        }
     }
 
     if !prefill_all_forward_direct_rows(automaton, &mut staged, &mut meter)? {
@@ -18492,12 +18572,14 @@ fn prefill_bound_resume_caches_transaction(
         false
     };
 
-    if staged_hints.len() != resume_set.cached_states.len()
-        || staged_hints.len() != resume_set.cached_workspace_identities.len()
-    {
-        return Err(SearchError::InternalInvariant {
-            detail: "compiler-private resume prefill hint shape changed before publication",
-        });
+    if let Some(resume_set) = resume_set.as_deref() {
+        if staged_hints.len() != resume_set.cached_states.len()
+            || staged_hints.len() != resume_set.cached_workspace_identities.len()
+        {
+            return Err(SearchError::InternalInvariant {
+                detail: "compiler-private resume prefill hint shape changed before publication",
+            });
+        }
     }
     if staged.lazy.retained_bytes()? != live.lazy.retained_bytes()?
         || staged.reverse.retained_bytes()? != live.reverse.retained_bytes()?
@@ -18539,11 +18621,13 @@ fn prefill_bound_resume_caches_transaction(
     };
     core::mem::swap(&mut live.lazy, &mut staged.lazy);
     core::mem::swap(&mut live.reverse, &mut staged.reverse);
-    resume_set.cached_states.copy_from_slice(&staged_hints);
-    resume_set
-        .cached_workspace_identities
-        .fill(staged_cache_identity);
-    resume_set.fully_prefilled_cache_identity = staged_cache_identity;
+    if let Some(resume_set) = resume_set {
+        resume_set.cached_states.copy_from_slice(&staged_hints);
+        resume_set
+            .cached_workspace_identities
+            .fill(staged_cache_identity);
+        resume_set.fully_prefilled_cache_identity = staged_cache_identity;
+    }
     Ok(Some(receipt))
 }
 
@@ -48637,6 +48721,54 @@ mod tests {
         assert_eq!(workspace.lazy.state_len, forward_states);
         assert_eq!(workspace.reverse.state_len, reverse_states);
         assert_eq!(workspace.lazy.direct_cells_published, published);
+    }
+
+    #[test]
+    fn compiler_private_root_prefill_projects_complete_rows_without_resume_metadata() {
+        let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b'), (b'c', b'c')]);
+        let mut workspace =
+            K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let retained = workspace.retained_bytes();
+        let receipt = workspace
+            .compiler_private_try_prefill_root_cache_with_receipt(&plan)
+            .expect("root-only complete cache");
+        assert_eq!(workspace.retained_bytes(), retained);
+        let projection = workspace
+            .compiler_private_fully_prefilled_root_projection_without_resume(&plan, receipt)
+            .expect("root-only complete projection");
+        assert!(!projection.forward_rows().is_empty());
+        assert!(projection.reverse_rows().is_some());
+        assert_eq!(projection.row_stride(), receipt.direct_row_stride);
+        assert_eq!(projection.cache_identity(), receipt.cache_identity);
+
+        let mut wrong = receipt;
+        wrong.cache_identity ^= u64::MAX;
+        assert!(
+            workspace
+                .compiler_private_fully_prefilled_root_projection_without_resume(&plan, wrong)
+                .is_none()
+        );
+        assert!(
+            workspace
+                .compiler_private_try_prefill_root_cache_with_receipt(&plan)
+                .is_none(),
+            "a live immutable cache must not be replaced"
+        );
+
+        let mut ordinary = K0Workspace::new(&plan, WorkspaceLimits::unlimited()).unwrap();
+        for haystack in [b"zabcx".as_slice(), b"abcabc", b"xxxx", b"ab"] {
+            let expected = plan
+                .prepare::<Span>()
+                .search_with_workspace(haystack, &mut ordinary, SearchLimits::unlimited())
+                .unwrap()
+                .into_output();
+            let actual = plan
+                .prepare::<Span>()
+                .search_with_workspace(haystack, &mut workspace, SearchLimits::unlimited())
+                .unwrap()
+                .into_output();
+            assert_eq!(actual, expected, "source={haystack:?}");
+        }
     }
 
     #[test]

@@ -4,10 +4,10 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     Architecture, CompileError, CompileLimitsV1, CompileMode, CompileRequest, CompileResource,
-    ContextDfaResource, DeterminizationResource, DeterminizationStage, EngineKind,
-    EngineSelectionReason,
+    ContextDfaResource, CpuFeature, DeterminizationResource, DeterminizationStage, EngineKind,
+    EngineSelectionReason, FeatureSet,
     MAX_STABLE_DFA_BUILD_WORK, MatchResult, OperatingSystem, OptimizationPass, OutputContract,
-    SearchWindow, SectionKind, StartAccelerator, Target, compile,
+    SearchWindow, SectionKind, StartAccelerator, Target, compile, emit_object,
 };
 
 #[test]
@@ -34,6 +34,51 @@ fn program_byte_cap_rejects_before_canonical_serialization() {
         0,
         "the bounded artifact must not allocate/serialize before cap rejection"
     );
+}
+
+#[test]
+fn optimizing_object_cap_falls_back_to_the_bounded_module() {
+    let target = Target::aarch64_macos()
+        .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+        .expect("ASIMD target");
+    let mut limits = CompileLimitsV1::default();
+    limits.determinize.max_states = 0;
+    let request = |limits| {
+        CompileRequest::new("a+Q|[b-c][a-b]{1,5}(?:x+|y+)", target)
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::SelectedEnd)
+            .limits(limits)
+    };
+    let optimized = compile(request(limits)).expect("unbounded optimizing compile");
+    assert_eq!(optimized.module().required_runtime_symbol(), None);
+
+    let fallback = crate::CompiledModule::lower(optimized.program(), target)
+        .expect("bounded fallback lowering");
+    assert!(fallback.required_runtime_symbol().is_some());
+    let fallback_object = emit_object(
+        &fallback,
+        crate::ObjectFormat::for_target(target),
+        usize::MAX,
+    )
+    .expect("unbounded fallback object");
+    assert!(optimized.object().len() > fallback_object.len());
+
+    limits.max_object_bytes = fallback_object.len();
+    let constrained = compile(request(limits)).expect("fallback fits the exact object cap");
+    assert_eq!(constrained.module(), &fallback);
+    assert_eq!(constrained.object(), fallback_object);
+    assert!(constrained.receipt().runtime_helper_required);
+    assert_eq!(constrained.receipt().object_bytes, limits.max_object_bytes);
+
+    limits.max_object_bytes -= 1;
+    assert!(matches!(
+        compile(request(limits)),
+        Err(CompileError::Object(crate::ObjectError::Resource {
+            resource: CompileResource::ObjectBytes,
+            limit,
+            required,
+        })) if limit == limits.max_object_bytes && required > limit
+    ));
 }
 
 fn oracle(pattern: &str, haystack: &[u8], start: usize, end: usize) -> Option<(usize, usize)> {

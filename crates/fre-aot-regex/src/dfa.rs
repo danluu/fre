@@ -12,7 +12,7 @@ use crate::{
     program::{AnchoredByteSet, OutputContract, ProgramFormatError},
 };
 
-const NO_STATE: u32 = u32::MAX;
+pub(crate) const NO_STATE: u32 = u32::MAX;
 /// Maximum determinization work that can be recorded in and safely replayed
 /// from a stable serialized DFA artifact.
 ///

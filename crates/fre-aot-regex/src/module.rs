@@ -845,17 +845,55 @@ impl CompiledModule {
     /// Returns a typed compiler error if serialization fails, the target is
     /// incoherent, or section/symbol dimensions overflow their representation.
     pub fn lower(program: &CompiledProgram, target: Target) -> Result<Self, CompileError> {
+        Self::lower_with_k0_materialization(program, target, false)
+    }
+
+    /// Lower with the slower optimizing fallback compiler enabled.
+    ///
+    /// In addition to every route considered by [`Self::lower`], this may
+    /// complete an assertion-free resource fallback's bounded K0 state graph
+    /// at compile time and lower the authenticated result as a runtime-free
+    /// native DFA. This can take substantially longer than ordinary lowering.
+    /// Callers re-lowering a restored or otherwise untrusted program must opt
+    /// in explicitly; a serialized optimizer marker never authorizes this
+    /// work by itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed failures as [`Self::lower`]. Optional K0
+    /// materialization failures preserve the ordinary module route.
+    pub fn lower_optimizing(
+        program: &CompiledProgram,
+        target: Target,
+    ) -> Result<Self, CompileError> {
+        Self::lower_with_k0_materialization(program, target, true)
+    }
+
+    fn lower_with_k0_materialization(
+        program: &CompiledProgram,
+        target: Target,
+        materialize_k0: bool,
+    ) -> Result<Self, CompileError> {
         target.validate()?;
         let program_bytes = program.serialize()?;
-        let native = program
+        let direct_native = program
             .native_dfa_view()
             .or_else(|| program.native_exact_product_view());
+        let materialized_native = (materialize_k0 && direct_native.is_none())
+            .then(|| program.native_fully_prefilled_program())
+            .flatten();
+        let native = direct_native.or_else(|| {
+            materialized_native
+                .as_ref()
+                .map(|materialized| program.native_fully_prefilled_view(materialized))
+        });
         let native_context = program.native_context_program_view();
         let native_partial = program.native_partial_dfa_view();
         let native_dynamic_rows = program.native_dynamic_rows_view();
         Self::lower_serialized(
             program_bytes,
             native,
+            materialized_native.is_some(),
             native_context,
             native_partial,
             native_dynamic_rows,
@@ -871,6 +909,7 @@ impl CompiledModule {
     fn lower_serialized(
         program_bytes: Vec<u8>,
         native: Option<NativeProgramView<'_>>,
+        native_materialized_from_k0: bool,
         native_context: Option<NativeContextProgramView<'_>>,
         native_partial: Option<NativePartialProgramView<'_>>,
         native_dynamic_rows: Option<NativeDynamicRowsProgramView>,
@@ -880,9 +919,57 @@ impl CompiledModule {
         let program_digest = Sha256::digest(&program_bytes);
         let program_name = identity_symbol(PROGRAM_SYMBOL_PREFIX, program_digest.as_slice())?;
         let (lowering, native_digest, prepared_layout) = if let Some(view) = native {
-            if let Some(lowering) = lower_native_dfa(view, target)? {
+            // K0 materialization is an optional, compiler-private analysis.
+            // A target table/code resource failure (including allocator
+            // pressure) must preserve the exact previously selected prepared
+            // or runtime module instead of turning a valid regex into a
+            // compilation failure. Direct serialized DFA errors remain hard
+            // failures because those rows are the program's semantic engine.
+            let native_lowering = if native_materialized_from_k0 {
+                lower_native_dfa(view, target).unwrap_or(None)
+            } else {
+                lower_native_dfa(view, target)?
+            };
+            if let Some(lowering) = native_lowering {
                 let native_digest = native_module_digest(&program_bytes, target, &lowering)?;
                 (lowering, native_digest, None)
+            } else if native_materialized_from_k0 {
+                if let Some(view) = native_partial {
+                    if let Some((lowering, prepared_layout)) =
+                        lower_native_partial_prepared(program_bytes.clone(), &view, target)?
+                    {
+                        let native_digest =
+                            native_module_digest(&lowering.data, target, &lowering)?;
+                        (lowering, native_digest, Some(prepared_layout))
+                    } else if let Some(dynamic) = native_dynamic_rows {
+                        let (lowering, prepared_layout) = lower_native_dynamic_rows_prepared(
+                            program_bytes.clone(),
+                            dynamic,
+                            target,
+                        )?;
+                        let native_digest =
+                            native_module_digest(&lowering.data, target, &lowering)?;
+                        (lowering, native_digest, Some(prepared_layout))
+                    } else {
+                        let lowering =
+                            lower_runtime_adapter(program_bytes, target.architecture)?;
+                        let native_digest =
+                            native_module_digest(&lowering.data, target, &lowering)?;
+                        (lowering, native_digest, None)
+                    }
+                } else if let Some(dynamic) = native_dynamic_rows {
+                    let (lowering, prepared_layout) = lower_native_dynamic_rows_prepared(
+                        program_bytes.clone(),
+                        dynamic,
+                        target,
+                    )?;
+                    let native_digest = native_module_digest(&lowering.data, target, &lowering)?;
+                    (lowering, native_digest, Some(prepared_layout))
+                } else {
+                    let lowering = lower_runtime_adapter(program_bytes, target.architecture)?;
+                    let native_digest = native_module_digest(&lowering.data, target, &lowering)?;
+                    (lowering, native_digest, None)
+                }
             } else if let Some(dynamic) = native_dynamic_rows {
                 let (lowering, prepared_layout) =
                     lower_native_dynamic_rows_prepared(program_bytes.clone(), dynamic, target)?;
@@ -18782,6 +18869,24 @@ mod tests {
         compiled
     }
 
+    fn lower_without_materialized_k0(
+        program: &crate::CompiledProgram,
+        target: Target,
+    ) -> CompiledModule {
+        CompiledModule::lower_serialized(
+            program.serialize().unwrap(),
+            program
+                .native_dfa_view()
+                .or_else(|| program.native_exact_product_view()),
+            false,
+            program.native_context_program_view(),
+            program.native_partial_dfa_view(),
+            program.native_dynamic_rows_view(),
+            target,
+        )
+        .expect("test-only lowering without K0 materialization")
+    }
+
     fn identity_target_matrix() -> Vec<Target> {
         let x86_features = [
             FeatureSet::of(CpuFeature::X86Sse2),
@@ -21550,10 +21655,24 @@ mod tests {
                 OutputContract::Span,
                 target,
             );
-            assert!(variable_span.receipt().runtime_helper_required);
-            assert!(variable_span.module().required_runtime_symbol().is_some());
             assert!(variable_span.program().native_dfa_view().is_none());
             assert!(variable_span.program().native_partial_dfa_view().is_none());
+            let variable_materialized = variable_span
+                .program()
+                .native_fully_prefilled_program()
+                .expect("zero-frontier variable Span K0 materialization");
+            let variable_view = variable_span
+                .program()
+                .native_fully_prefilled_view(&variable_materialized);
+            let variable_direct = lower_native_dfa(variable_view, target).unwrap().is_some();
+            assert_eq!(
+                variable_span.receipt().runtime_helper_required,
+                !variable_direct
+            );
+            assert_eq!(
+                variable_span.module().required_runtime_symbol().is_some(),
+                !variable_direct
+            );
             assert!(variable_span.module().prepared_entry_symbol().is_none());
 
             for output in [
@@ -21564,22 +21683,30 @@ mod tests {
                 let compiled =
                     complete_forward_resource_fallback("[b-c][a-b]{1,10}z", output, target);
                 let direct_view = compiled.program().native_dfa_view();
-                let vector_suffix = target.architecture == Architecture::X86_64
-                    || target.features.has(CpuFeature::Aarch64Asimd)
-                    || (target.operating_system == OperatingSystem::Linux
-                        && target.features.has(CpuFeature::Aarch64Sve));
-                let direct = output != OutputContract::Span && vector_suffix;
                 assert_eq!(direct_view.is_some(), output != OutputContract::Span);
+                let materialized = direct_view
+                    .is_none()
+                    .then(|| compiled.program().native_fully_prefilled_program())
+                    .flatten();
+                let static_view = direct_view.or_else(|| {
+                    materialized.as_ref().map(|materialized| {
+                        compiled
+                            .program()
+                            .native_fully_prefilled_view(materialized)
+                    })
+                });
+                let direct = static_view
+                    .is_some_and(|view| lower_native_dfa(view, target).unwrap().is_some());
                 assert_eq!(!compiled.receipt().runtime_helper_required, direct);
                 assert_eq!(compiled.module().required_runtime_symbol().is_none(), direct);
                 assert!(compiled.program().native_partial_dfa_view().is_none());
                 assert_eq!(
                     compiled.module().prepared_entry_symbol().is_some(),
-                    output != OutputContract::Span && !direct,
+                    !direct && compiled.program().native_dynamic_rows_view().is_some(),
                     "{target:?}/{output:?} dynamic fallback publication"
                 );
                 if direct {
-                    let view = direct_view.expect("direct complete suffix view");
+                    let view = static_view.expect("direct complete suffix view");
                     let (_, layout) =
                         build_native_dfa_table_for_architecture(view, target.architecture)
                             .expect("direct complete suffix layout");
@@ -21867,21 +21994,61 @@ mod tests {
                 "[ab]+",
                 OutputContract::Exists,
                 b"xxabbaaxbb".as_slice(),
+                None,
             ),
             (
                 "[ab]+",
                 OutputContract::SelectedEnd,
                 b"xxabbaaxbb".as_slice(),
+                None,
             ),
             (
                 "[ab]*",
                 OutputContract::Span,
                 b"xxabbaaxbb".as_slice(),
+                None,
             ),
             (
                 "[ab]cdefghij(?-u:.){8}",
                 OutputContract::Span,
                 b"xxacdefghij12345678yy".as_slice(),
+                None,
+            ),
+            (
+                "a+Q|[b-c][a-b]{1,5}(?:x+|y+)",
+                OutputContract::Exists,
+                b"!!aaaQ!!cbbbbxxx!!".as_slice(),
+                Some(8),
+            ),
+            (
+                "a+Q|[b-c][a-b]{1,5}(?:x+|y+)",
+                OutputContract::SelectedEnd,
+                b"!!aaaQ!!cbbbbxxx!!".as_slice(),
+                Some(8),
+            ),
+            (
+                "a+Q|[b-c][a-b]{1,5}(?:x+|y+)",
+                OutputContract::Span,
+                b"!!aaaQ!!cbbbbxxx!!".as_slice(),
+                Some(8),
+            ),
+            (
+                "a+Q|[b-c][a-b]{1,5}(?:x+|y+)",
+                OutputContract::Exists,
+                b"!!aaaQ!!cbbbbxxx!!".as_slice(),
+                Some(0),
+            ),
+            (
+                "a+Q|[b-c][a-b]{1,5}(?:x+|y+)",
+                OutputContract::SelectedEnd,
+                b"!!aaaQ!!cbbbbxxx!!".as_slice(),
+                Some(0),
+            ),
+            (
+                "a+Q|[b-c][a-b]{1,5}(?:x+|y+)",
+                OutputContract::Span,
+                b"!!aaaQ!!cbbbbxxx!!".as_slice(),
+                Some(0),
             ),
         ];
         let directory = std::env::temp_dir().join(format!(
@@ -21893,8 +22060,38 @@ mod tests {
         let mut calls = String::from("int main(void){size_t r[2];uint32_t s;\n");
         let mut objects = Vec::new();
 
-        for (case, (pattern, contract, haystack)) in cases.iter().enumerate() {
-            let compiled = complete_forward_resource_fallback(pattern, *contract, target);
+        for (case, (pattern, contract, haystack, materialized_max_states)) in
+            cases.iter().enumerate()
+        {
+            let compiled = if let Some(max_states) = materialized_max_states {
+                compile(
+                    CompileRequest::new(*pattern, target)
+                        .mode(CompileMode::Optimizing)
+                        .output(*contract)
+                        .limits(CompileLimitsV1 {
+                            determinize: DeterminizeLimits {
+                                max_states: *max_states,
+                                ..DeterminizeLimits::default()
+                            },
+                            ..CompileLimitsV1::default()
+                        }),
+                )
+                .expect("materialized K0 native differential")
+            } else {
+                complete_forward_resource_fallback(pattern, *contract, target)
+            };
+            if let Some(max_states) = materialized_max_states {
+                let partial = compiled.program().partial_dfa_stats().unwrap();
+                assert_eq!(
+                    partial.is_none(),
+                    *max_states == 0,
+                    "root-only and retained-frontier fixtures must remain distinct"
+                );
+                if let Some(partial) = partial {
+                    assert!(partial.resume_frontiers != 0);
+                }
+                assert!(compiled.program().native_fully_prefilled_program().is_some());
+            }
             assert!(compiled.module().required_runtime_symbol().is_none());
             let bytes = haystack
                 .iter()
@@ -22374,7 +22571,7 @@ mod tests {
         for target in identity_target_matrix() {
             let compiled = compile(
                 CompileRequest::new("(?:ab|ac)+z", target)
-                    .mode(CompileMode::Optimizing)
+                    .mode(CompileMode::Fast)
                     .output(OutputContract::Exists)
                     .limits(limits),
             )
@@ -22577,7 +22774,7 @@ mod tests {
         for target in identity_target_matrix() {
             let selected = compile(
                 CompileRequest::new("(?:ab|ac)+z", target)
-                    .mode(CompileMode::Optimizing)
+                    .mode(CompileMode::Fast)
                     .output(OutputContract::SelectedEnd)
                     .limits(zero_rows),
             )
@@ -23189,12 +23386,12 @@ mod tests {
                 (
                     OutputContract::Exists,
                     format!("(?:{CLASS})+"),
-                    CompileMode::Optimizing,
+                    CompileMode::Fast,
                 ),
                 (
                     OutputContract::SelectedEnd,
                     format!("(?:{CLASS})+"),
-                    CompileMode::Optimizing,
+                    CompileMode::Fast,
                 ),
                 (
                     OutputContract::Span,
@@ -24596,13 +24793,246 @@ int main(void) {{
                 .expect("incomplete retained table");
             assert!(partial.complete_rows < partial.discovered_states);
             assert!(partial.resume_frontiers > 0);
-            assert!(compiled.receipt().runtime_helper_required);
-            assert!(compiled.module().required_runtime_symbol().is_some());
-            assert!(
-                compiled.module().prepared_entry_symbol().is_some(),
-                "SelectedEnd must retain its general dynamic-row fallback: {target:?}"
-            );
+            let materialized = compiled
+                .program()
+                .native_fully_prefilled_program()
+                .expect("complete K0 cache");
+            let view = compiled
+                .program()
+                .native_fully_prefilled_view(&materialized);
+            let direct = lower_native_dfa(view, target).unwrap().is_some();
+            assert_eq!(compiled.receipt().runtime_helper_required, !direct);
+            assert_eq!(compiled.module().required_runtime_symbol().is_some(), !direct);
+            assert_eq!(compiled.module().prepared_entry_symbol().is_some(), !direct);
         }
+    }
+
+    #[test]
+    fn complete_k0_materialization_reuses_every_native_vector_tier_and_preserves_fallback() {
+        let limits = CompileLimitsV1 {
+            determinize: DeterminizeLimits {
+                max_states: 8,
+                ..DeterminizeLimits::default()
+            },
+            ..CompileLimitsV1::default()
+        };
+        let vector_targets = [
+            (
+                Target::x86_64_linux()
+                    .with_features(FeatureSet::of(CpuFeature::X86Sse2))
+                    .unwrap(),
+                StartAccelerator::X86Sse2,
+            ),
+            (
+                Target::x86_64_macos()
+                    .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+                    .unwrap(),
+                StartAccelerator::X86Avx2,
+            ),
+            (
+                Target::x86_64_linux()
+                    .with_features(
+                        FeatureSet::of(CpuFeature::X86Avx512F)
+                            .with(CpuFeature::X86Avx512Bw)
+                            .with(CpuFeature::X86Avx512Vl),
+                    )
+                    .unwrap(),
+                StartAccelerator::X86Avx512Bw,
+            ),
+            (
+                Target::aarch64_macos()
+                    .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                    .unwrap(),
+                StartAccelerator::Aarch64Asimd,
+            ),
+            (
+                Target::aarch64_linux()
+                    .with_features(FeatureSet::of(CpuFeature::Aarch64Sve))
+                    .unwrap(),
+                StartAccelerator::Aarch64Sve,
+            ),
+            (
+                Target::aarch64_linux()
+                    .with_features(
+                        FeatureSet::of(CpuFeature::Aarch64Sve)
+                            .with(CpuFeature::Aarch64Sve2),
+                    )
+                    .unwrap(),
+                StartAccelerator::Aarch64Sve,
+            ),
+        ];
+
+        for (target, accelerator) in vector_targets {
+            for output in [
+                OutputContract::Exists,
+                OutputContract::SelectedEnd,
+                OutputContract::Span,
+            ] {
+                let compiled = compile(
+                    CompileRequest::new(
+                        "a+Q|[b-c][a-b]{1,5}(?:x+|y+)",
+                        target,
+                    )
+                    .mode(CompileMode::Optimizing)
+                    .output(output)
+                    .limits(limits),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("materialized K0 compile {target:?}/{output:?}: {error}")
+                });
+                let partial = compiled
+                    .program()
+                    .partial_dfa_stats()
+                    .unwrap()
+                    .expect("retained partial statistics");
+                assert!(partial.resume_frontiers != 0, "{target:?}/{output:?}");
+                assert!(compiled.program().native_dfa_view().is_none());
+                assert!(compiled.program().native_exact_product_view().is_none());
+                let materialized = compiled
+                    .program()
+                    .native_fully_prefilled_program()
+                    .unwrap_or_else(|| panic!("missing materialized K0: {target:?}/{output:?}"));
+                let view = compiled
+                    .program()
+                    .native_fully_prefilled_view(&materialized);
+                let layout = build_native_dfa_table_for_architecture(view, target.architecture)
+                    .expect("materialized native table")
+                    .1;
+                assert_eq!(layout.has_reverse, output == OutputContract::Span);
+                assert!(
+                    lower_native_dfa(view, target).unwrap().is_some(),
+                    "{target:?}/{output:?}"
+                );
+                assert!(!compiled.receipt().runtime_helper_required);
+                assert!(compiled.module().required_runtime_symbol().is_none());
+                assert!(compiled.module().prepared_entry_symbol().is_none());
+                assert_eq!(compiled.module().start_accelerator(), accelerator);
+
+                let wire = compiled.program().serialize().unwrap();
+                let restored = crate::CompiledProgram::deserialize(&wire).unwrap();
+                let restored_module =
+                    CompiledModule::lower_optimizing(&restored, target).unwrap();
+                assert_eq!(restored_module.sections(), compiled.module().sections());
+                assert_eq!(restored_module.symbols(), compiled.module().symbols());
+                assert_eq!(restored_module.relocations(), compiled.module().relocations());
+            }
+        }
+
+        let root_only_limits = CompileLimitsV1 {
+            determinize: DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+            ..CompileLimitsV1::default()
+        };
+        for (target, accelerator) in vector_targets {
+            for output in [
+                OutputContract::Exists,
+                OutputContract::SelectedEnd,
+                OutputContract::Span,
+            ] {
+                let compiled = compile(
+                    CompileRequest::new(
+                        "a+Q|[b-c][a-b]{1,5}(?:x+|y+)",
+                        target,
+                    )
+                    .mode(CompileMode::Optimizing)
+                    .output(output)
+                    .limits(root_only_limits),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("root-only K0 compile {target:?}/{output:?}: {error}")
+                });
+                assert!(compiled.program().partial_dfa_stats().unwrap().is_none());
+                assert!(compiled.program().native_dfa_view().is_none());
+                assert!(compiled.program().native_exact_product_view().is_none());
+                assert!(
+                    compiled
+                        .program()
+                        .native_fully_prefilled_program()
+                        .is_some(),
+                    "{target:?}/{output:?}"
+                );
+                assert!(!compiled.receipt().runtime_helper_required);
+                assert!(compiled.module().required_runtime_symbol().is_none());
+                assert!(compiled.module().prepared_entry_symbol().is_none());
+                assert_eq!(compiled.module().start_accelerator(), accelerator);
+
+                let wire = compiled.program().serialize().unwrap();
+                let restored = crate::CompiledProgram::deserialize(&wire).unwrap();
+                let bounded_module = CompiledModule::lower(&restored, target).unwrap();
+                assert!(bounded_module.required_runtime_symbol().is_some());
+                let restored_module =
+                    CompiledModule::lower_optimizing(&restored, target).unwrap();
+                assert_eq!(restored_module.sections(), compiled.module().sections());
+                assert_eq!(restored_module.symbols(), compiled.module().symbols());
+                assert_eq!(restored_module.relocations(), compiled.module().relocations());
+            }
+        }
+
+        let sve2_target = Target::aarch64_linux()
+            .with_features(
+                FeatureSet::of(CpuFeature::Aarch64Sve).with(CpuFeature::Aarch64Sve2),
+            )
+            .unwrap();
+        let sve2 = compile(
+            CompileRequest::new(
+                r"(?-u:[\x00\x20\x40\x60\x80\xa0\xc0\xe0\xff])+Q|[b-c][a-b]{1,5}(?:x+|y+)",
+                sve2_target,
+            )
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::SelectedEnd)
+            .limits(limits),
+        )
+        .unwrap();
+        assert!(
+            sve2.program()
+                .partial_dfa_stats()
+                .unwrap()
+                .is_some_and(|stats| stats.resume_frontiers != 0)
+        );
+        assert!(sve2.program().native_fully_prefilled_program().is_some());
+        assert!(!sve2.receipt().runtime_helper_required);
+        assert_eq!(
+            sve2.module().start_accelerator(),
+            StartAccelerator::Aarch64Sve2
+        );
+
+        let scalar_target = Target::aarch64_linux();
+        let scalar = compile(
+            CompileRequest::new(
+                "a+Q|[b-c][a-b]{1,5}(?:x+|y+)",
+                scalar_target,
+            )
+            .mode(CompileMode::Optimizing)
+            .output(OutputContract::Span)
+            .limits(limits),
+        )
+        .unwrap();
+        let materialized = scalar
+            .program()
+            .native_fully_prefilled_program()
+            .expect("target-neutral K0 materialization");
+        let view = scalar
+            .program()
+            .native_fully_prefilled_view(&materialized);
+        assert!(lower_native_dfa(view, scalar_target).unwrap().is_none());
+        let scalar_program = scalar.program();
+        let baseline = CompiledModule::lower_serialized(
+            scalar_program.serialize().unwrap(),
+            scalar_program
+                .native_dfa_view()
+                .or_else(|| scalar_program.native_exact_product_view()),
+            false,
+            scalar_program.native_context_program_view(),
+            scalar_program.native_partial_dfa_view(),
+            scalar_program.native_dynamic_rows_view(),
+            scalar_target,
+        )
+        .unwrap();
+        assert_eq!(scalar.module().sections(), baseline.sections());
+        assert_eq!(scalar.module().symbols(), baseline.symbols());
+        assert_eq!(scalar.module().relocations(), baseline.relocations());
     }
 
     #[test]
@@ -24639,26 +25069,35 @@ int main(void) {{
                 assert!(partial.complete_rows < partial.discovered_states);
                 assert!(partial.resume_frontiers > 0);
                 assert!(compiled.program().native_partial_dfa_view().is_some());
-                assert!(compiled.module().prepared_entry_symbol().is_some());
-                assert!(compiled.module().required_runtime_program().is_some());
-                assert!(compiled.module().required_runtime_symbol().is_some());
-                assert!(compiled.module().required_prepared_runtime_symbol().is_some());
+                let materialized = compiled.program().native_fully_prefilled_program();
+                let direct = materialized.as_ref().is_some_and(|materialized| {
+                    let view = compiled
+                        .program()
+                        .native_fully_prefilled_view(materialized);
+                    lower_native_dfa(view, target).unwrap().is_some()
+                });
+                assert_eq!(compiled.receipt().runtime_helper_required, !direct);
+                assert_eq!(compiled.module().prepared_entry_symbol().is_some(), !direct);
+                assert_eq!(compiled.module().required_runtime_symbol().is_some(), !direct);
+
+                let prepared = lower_without_materialized_k0(compiled.program(), target);
+                if !direct {
+                    assert_eq!(compiled.module().sections(), prepared.sections());
+                    assert_eq!(compiled.module().symbols(), prepared.symbols());
+                    assert_eq!(compiled.module().relocations(), prepared.relocations());
+                }
+                assert!(prepared.prepared_entry_symbol().is_some());
+                assert!(prepared.required_runtime_program().is_some());
+                assert!(prepared.required_runtime_symbol().is_some());
+                assert!(prepared.required_prepared_runtime_symbol().is_some());
                 assert!(
-                    compiled
-                        .module()
-                        .required_prepared_fallback_runtime_symbol()
-                        .is_some()
+                    prepared.required_prepared_fallback_runtime_symbol().is_some()
                 );
                 assert!(
-                    compiled
-                        .module()
-                        .required_prepared_admission_runtime_symbol()
-                        .is_none()
+                    prepared.required_prepared_admission_runtime_symbol().is_none()
                 );
                 assert_eq!(
-                    compiled
-                        .module()
-                        .required_prepared_preflight_runtime_symbol(),
+                    prepared.required_prepared_preflight_runtime_symbol(),
                     Some(PREPARED_PREFLIGHT_RUNTIME_SYMBOL_NAME)
                 );
             }
@@ -24719,107 +25158,106 @@ int main(void) {{
                     "missing prepared view: {target:?}/{output:?}/{:?}",
                     compiled.program().anchored_prefix_stats()
                 );
-                let prepared = compiled
-                    .module()
+                assert!(compiled.program().native_fully_prefilled_program().is_some());
+                let fallback_module = lower_without_materialized_k0(compiled.program(), target);
+                let prepared = fallback_module
                     .prepared_entry_symbol()
                     .expect("prepared entry symbol");
                 assert!(prepared.starts_with(PREPARED_ENTRY_SYMBOL_PREFIX));
+                assert_eq!(fallback_module.start_accelerator(), StartAccelerator::None);
+                assert_eq!(fallback_module.anchored_prefix_filter_bytes(), 0);
+                assert_eq!(fallback_module.symbols().len(), 11);
                 assert_eq!(
-                    compiled.module().start_accelerator(),
-                    StartAccelerator::None
-                );
-                assert_eq!(compiled.module().anchored_prefix_filter_bytes(), 0);
-                assert_eq!(compiled.module().symbols().len(), 11);
-                assert_eq!(
-                    compiled.module().symbols()[PARTIAL_NATIVE_CORE_SYMBOL].section,
+                    fallback_module.symbols()[PARTIAL_NATIVE_CORE_SYMBOL].section,
                     Some(TEXT_SECTION)
                 );
                 assert_eq!(
-                    compiled.module().symbols()[PARTIAL_RUNTIME_SYMBOL].name,
+                    fallback_module.symbols()[PARTIAL_RUNTIME_SYMBOL].name,
                     PARTIAL_RUNTIME_SYMBOL_NAME
                 );
                 assert_eq!(
-                    compiled.module().symbols()[PARTIAL_RUNTIME_SYMBOL].section,
+                    fallback_module.symbols()[PARTIAL_RUNTIME_SYMBOL].section,
                     None
                 );
                 assert_eq!(
-                    compiled.module().required_prepared_runtime_symbol(),
+                    fallback_module.required_prepared_runtime_symbol(),
                     Some(PARTIAL_RUNTIME_SYMBOL_NAME)
                 );
                 assert_eq!(
-                    compiled.module().symbols()[PREPARED_FALLBACK_RUNTIME_SYMBOL].name,
+                    fallback_module.symbols()[PREPARED_FALLBACK_RUNTIME_SYMBOL].name,
                     PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME
                 );
                 assert_eq!(
-                    compiled.module().symbols()[PREPARED_FALLBACK_RUNTIME_SYMBOL].section,
+                    fallback_module.symbols()[PREPARED_FALLBACK_RUNTIME_SYMBOL].section,
                     None
                 );
                 assert_eq!(
-                    compiled
-                        .module()
-                        .required_prepared_fallback_runtime_symbol(),
+                    fallback_module.required_prepared_fallback_runtime_symbol(),
                     Some(PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME)
                 );
                 assert_eq!(
-                    compiled.module().symbols()[PREPARED_PREFLIGHT_RUNTIME_SYMBOL].name,
+                    fallback_module.symbols()[PREPARED_PREFLIGHT_RUNTIME_SYMBOL].name,
                     PREPARED_PREFLIGHT_RUNTIME_SYMBOL_NAME
                 );
                 assert_eq!(
-                    compiled.module().symbols()[PREPARED_PREFLIGHT_RUNTIME_SYMBOL].section,
+                    fallback_module.symbols()[PREPARED_PREFLIGHT_RUNTIME_SYMBOL].section,
                     None
                 );
                 assert_eq!(
-                    compiled.module().required_prepared_admission_runtime_symbol(),
+                    fallback_module.required_prepared_admission_runtime_symbol(),
                     None
                 );
                 assert_eq!(
-                    compiled
-                        .module()
-                        .required_prepared_preflight_runtime_symbol(),
+                    fallback_module.required_prepared_preflight_runtime_symbol(),
                     Some(PREPARED_PREFLIGHT_RUNTIME_SYMBOL_NAME)
                 );
-                assert!(compiled.module().relocations().iter().any(|relocation| {
+                assert!(fallback_module.relocations().iter().any(|relocation| {
                     relocation.symbol == PARTIAL_TABLE_SYMBOL
                 }));
-                assert!(compiled.module().relocations().iter().any(|relocation| {
+                assert!(fallback_module.relocations().iter().any(|relocation| {
                     relocation.symbol == PARTIAL_IDENTITY_SYMBOL
                 }));
-                assert!(compiled.module().relocations().iter().any(|relocation| {
+                assert!(fallback_module.relocations().iter().any(|relocation| {
                     relocation.symbol == PARTIAL_RUNTIME_SYMBOL
                 }));
-                assert!(compiled.module().relocations().iter().any(|relocation| {
+                assert!(fallback_module.relocations().iter().any(|relocation| {
                     relocation.symbol == PREPARED_FALLBACK_RUNTIME_SYMBOL
                 }));
-                assert!(compiled.module().relocations().iter().any(|relocation| {
+                assert!(fallback_module.relocations().iter().any(|relocation| {
                     relocation.symbol == PREPARED_PREFLIGHT_RUNTIME_SYMBOL
                 }));
                 let serialized = compiled.program().serialize().expect("serialize program");
                 assert_eq!(
-                    compiled.module().required_runtime_program().map(|(_, size)| size),
+                    fallback_module.required_runtime_program().map(|(_, size)| size),
                     Some(serialized.len())
                 );
                 assert!(
-                    compiled.module().sections()[PROGRAM_SECTION].bytes().len() > serialized.len()
+                    fallback_module.sections()[PROGRAM_SECTION].bytes().len() > serialized.len()
                 );
+                let fallback_object = emit_object(
+                    &fallback_module,
+                    ObjectFormat::for_target(target),
+                    usize::MAX,
+                )
+                .expect("emit prepared object");
                 assert_eq!(
                     emit_object(
-                        compiled.module(),
+                        &fallback_module,
                         ObjectFormat::for_target(target),
                         usize::MAX,
                     )
-                    .expect("emit prepared object"),
-                    compiled.object()
+                    .expect("re-emit prepared object"),
+                    fallback_object
                 );
                 let restored = crate::CompiledProgram::deserialize(&serialized)
                     .expect("restore prepared partial program");
-                let restored_module = CompiledModule::lower(&restored, target)
-                    .expect("lower restored prepared partial program");
-                assert_eq!(restored_module.sections(), compiled.module().sections());
-                assert_eq!(restored_module.symbols(), compiled.module().symbols());
-                assert_eq!(restored_module.relocations(), compiled.module().relocations());
+                let restored_module = lower_without_materialized_k0(&restored, target);
+                assert_eq!(restored_module.sections(), fallback_module.sections());
+                assert_eq!(restored_module.symbols(), fallback_module.symbols());
+                assert_eq!(restored_module.relocations(), fallback_module.relocations());
                 assert_eq!(
                     restored_module.prepared_entry_symbol(),
-                    compiled.module().prepared_entry_symbol()
+                    fallback_module.prepared_entry_symbol()
                 );
             }
         }
@@ -25516,13 +25954,14 @@ int main(void) {{
             .expect("variable-width partial Span native view");
         assert!(!span_view.dfa.initial_pending);
         assert!(span_view.exact_match_width.is_none());
+        let fallback_module =
+            lower_without_materialized_k0(span.program(), Target::x86_64_linux());
         assert_eq!(
-            span.module()
-                .required_prepared_span_recovery_runtime_symbol(),
+            fallback_module.required_prepared_span_recovery_runtime_symbol(),
             Some(PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME)
         );
         assert_eq!(
-            span.module()
+            fallback_module
                 .relocations()
                 .iter()
                 .filter(|relocation| {
@@ -26075,8 +26514,9 @@ int main(void) {{
             let restored_partial = restored.native_partial_dfa_view().unwrap();
             let restored_layout = build_native_dfa_table(restored_partial.native).unwrap().1;
             assert_eq!(restored_layout.prefix_fast_forward, Some(fast_forward));
-            let restored_module = CompiledModule::lower(&restored, Target::x86_64_linux())
-                .expect("re-lower restored partial program");
+            let restored_module =
+                CompiledModule::lower_optimizing(&restored, Target::x86_64_linux())
+                    .expect("re-lower restored partial program");
             assert_eq!(restored_module.sections(), compiled.module().sections());
             assert_eq!(restored_module.symbols(), compiled.module().symbols());
             assert_eq!(restored_module.relocations(), compiled.module().relocations());
@@ -26225,25 +26665,23 @@ int main(void) {{
                 .limits(limits),
             )
             .unwrap_or_else(|error| panic!("partial preflight {target:?}: {error}"));
-            assert!(compiled.module().prepared_entry_symbol().is_some(), "{target:?}");
+            let module = lower_without_materialized_k0(compiled.program(), target);
+            assert!(module.prepared_entry_symbol().is_some(), "{target:?}");
             assert_eq!(
-                compiled
-                    .module()
-                    .required_prepared_preflight_runtime_symbol(),
+                module.required_prepared_preflight_runtime_symbol(),
                 Some(PREPARED_PREFLIGHT_RUNTIME_SYMBOL_NAME),
                 "{target:?}"
             );
             assert_eq!(
-                compiled.module().required_prepared_admission_runtime_symbol(),
+                module.required_prepared_admission_runtime_symbol(),
                 None,
                 "{target:?}"
             );
-            assert!(compiled
-                .module()
+            assert!(module
                 .symbols()
                 .iter()
                 .all(|symbol| symbol.name != "fre_aot_regex_runtime_prepared_partial_should_enter_v1"));
-            let relocations = compiled.module().relocations();
+            let relocations = module.relocations();
             assert_eq!(
                 relocations
                     .iter()
@@ -26276,8 +26714,8 @@ int main(void) {{
                 1,
                 "{target:?}"
             );
-            let text = compiled.module().sections()[TEXT_SECTION].bytes();
-            let prepared = &compiled.module().symbols()[PREPARED_ENTRY_SYMBOL];
+            let text = module.sections()[TEXT_SECTION].bytes();
+            let prepared = &module.symbols()[PREPARED_ENTRY_SYMBOL];
             let prepared_start = usize::try_from(prepared.offset).unwrap();
             let prepared_end = prepared_start + usize::try_from(prepared.size).unwrap();
             let code = &text[prepared_start..prepared_end];
@@ -26493,21 +26931,19 @@ int main(void) {{
                 .unwrap_or_else(|| panic!("missing partial Span view: {target:?}"));
             assert!(!view.dfa.initial_pending, "{target:?}");
             assert!(view.exact_match_width.is_none(), "{target:?}");
+            let module = lower_without_materialized_k0(compiled.program(), target);
             assert_eq!(
-                compiled
-                    .module()
-                    .required_prepared_span_recovery_runtime_symbol(),
+                module.required_prepared_span_recovery_runtime_symbol(),
                 Some(PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME),
                 "{target:?}"
             );
 
-            let prepared = &compiled.module().symbols()[PREPARED_ENTRY_SYMBOL];
+            let prepared = &module.symbols()[PREPARED_ENTRY_SYMBOL];
             let prepared_start = usize::try_from(prepared.offset).unwrap();
             let prepared_end = prepared_start + usize::try_from(prepared.size).unwrap();
-            let text = compiled.module().sections()[TEXT_SECTION].bytes();
+            let text = module.sections()[TEXT_SECTION].bytes();
             let code = &text[prepared_start..prepared_end];
-            let native_core = compiled
-                .module()
+            let native_core = module
                 .relocations()
                 .iter()
                 .find(|relocation| relocation.symbol == PARTIAL_NATIVE_CORE_SYMBOL)
@@ -26518,8 +26954,7 @@ int main(void) {{
                 "{target:?}"
             );
             let local_native_core = native_core_offset - prepared_start;
-            let recoveries = compiled
-                .module()
+            let recoveries = module
                 .relocations()
                 .iter()
                 .filter(|relocation| {
@@ -26599,8 +27034,7 @@ int main(void) {{
                                 u8::try_from(NATIVE_PARTIAL_STATUS_SELECTED_END).unwrap(),
                             ]
                     }));
-                    let identity = compiled
-                        .module()
+                    let identity = module
                         .relocations()
                         .iter()
                         .filter(|relocation| {

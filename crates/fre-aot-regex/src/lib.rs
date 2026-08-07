@@ -435,9 +435,34 @@ pub fn compile_raw_with_line_terminator(
     )?;
     let program_bytes = program.serialized_len()?;
     let program_sha256 = program.artifact_identity();
-    let module = CompiledModule::lower(&program, target)?;
     let format = ObjectFormat::for_target(target);
-    let object = emit_object(&module, format, limits.max_object_bytes)?;
+    let (module, object) = match mode {
+        CompileMode::Fast => {
+            let module = CompiledModule::lower(&program, target)?;
+            let object = emit_object(&module, format, limits.max_object_bytes)?;
+            (module, object)
+        }
+        CompileMode::Optimizing => {
+            let optimized = CompiledModule::lower_optimizing(&program, target)?;
+            match emit_object(&optimized, format, limits.max_object_bytes) {
+                Ok(object) => (optimized, object),
+                Err(error @ ObjectError::Resource {
+                    resource: CompileResource::ObjectBytes,
+                    ..
+                }) => {
+                    let fallback = match CompiledModule::lower(&program, target) {
+                        Ok(fallback) => fallback,
+                        Err(_) => return Err(error.into()),
+                    };
+                    match emit_object(&fallback, format, limits.max_object_bytes) {
+                        Ok(object) => (fallback, object),
+                        Err(_) => return Err(error.into()),
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    };
     let object_sha256 = Sha256::digest(&object).into();
     let engine_selection_reason =
         program

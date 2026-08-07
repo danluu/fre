@@ -23,8 +23,8 @@ use crate::{
     },
     dfa::{
         self, DeterminizationReport, DeterminizeLimits, DeterminizeOutcome, DfaReplayOrder,
-        DfaStats, ForwardCell, NativeDfaView, NativePartialDfaView, OrderedDfa, PartialDfa,
-        PartialDfaPrefixPlan, PartialDfaResult, PartialDfaResume,
+        DfaStats, ForwardCell, NativeDfaView, NativePartialDfaView, NO_STATE, OrderedDfa,
+        PartialDfa, PartialDfaPrefixPlan, PartialDfaResult, PartialDfaResume, ReverseCell,
     },
     error::{CompileError, CompileResource},
     required_literals::{self, RequiredLiterals},
@@ -41,9 +41,14 @@ const PROGRAM_FORMAT_VERSION_V3: u32 = 3;
 const PROGRAM_FORMAT_VERSION_V4: u32 = 4;
 const PROGRAM_FORMAT_VERSION_V5: u32 = 5;
 const PROGRAM_FORMAT_VERSION_V6: u32 = 6;
+const PROGRAM_FORMAT_VERSION_V7: u32 = 7;
 // V4 remains the canonical FIFO format without a graph-dispatch marker. V5
 // adds canonically rederived graph dispatch while retaining FIFO DFA replay.
 // V6 binds fresh optimizing DFA artifacts to descending class-mass replay.
+// V7 marks an optimizing ordered-NFA fallback that has no retained DFA
+// payload, so an explicitly requested slow lowering can preserve that choice
+// after restore. This is artifact provenance, not authorization: module
+// lowering still requires a separate optimizing API call.
 const PROGRAM_FORMAT_VERSION: u32 = PROGRAM_FORMAT_VERSION_V4;
 const PROGRAM_FLAG_NFA_MANDATORY_SUFFIX: u8 = 1 << 0;
 const PROGRAM_FLAG_NFA_MANDATORY_CUT: u8 = 1 << 1;
@@ -51,6 +56,7 @@ const PROGRAM_FLAG_NFA_EXACT_PRODUCT: u8 = 1 << 2;
 const PROGRAM_FLAG_NFA_PARTIAL_DFA: u8 = 1 << 3;
 const PROGRAM_FLAG_NFA_ORDERED_EDGE_DISPATCH: u8 = 1 << 4;
 const PROGRAM_FLAG_NFA_EPSILON_CLOSURE_DISPATCH: u8 = 1 << 5;
+const PROGRAM_FLAG_NFA_OPTIMIZING_FALLBACK: u8 = 1 << 6;
 const PROGRAM_V3_KNOWN_FLAGS: u8 = PROGRAM_FLAG_NFA_MANDATORY_SUFFIX
     | PROGRAM_FLAG_NFA_MANDATORY_CUT
     | PROGRAM_FLAG_NFA_EXACT_PRODUCT;
@@ -62,6 +68,8 @@ const PROGRAM_V5_GRAPH_DISPATCH_FLAGS: u8 = PROGRAM_FLAG_NFA_ORDERED_EDGE_DISPAT
     | PROGRAM_FLAG_NFA_EPSILON_CLOSURE_DISPATCH;
 const PROGRAM_V5_KNOWN_FLAGS: u8 = PROGRAM_KNOWN_FLAGS | PROGRAM_V5_GRAPH_DISPATCH_FLAGS;
 const PROGRAM_V6_KNOWN_FLAGS: u8 = PROGRAM_V5_KNOWN_FLAGS;
+const PROGRAM_V7_KNOWN_FLAGS: u8 =
+    PROGRAM_V5_KNOWN_FLAGS | PROGRAM_FLAG_NFA_OPTIMIZING_FALLBACK;
 const DEFAULT_LINE_TERMINATOR: u8 = b'\n';
 
 static NEXT_PROGRAM_INSTANCE_IDENTITY: AtomicU64 = AtomicU64::new(1);
@@ -2414,6 +2422,8 @@ pub struct CompiledProgram {
 #[derive(Clone, Debug)]
 enum ProgramOptimizationSidecar {
     None,
+    /// Optimizing ordered-NFA fallback without a retained DFA payload.
+    OptimizingFallback,
     Context(ContextDeterminizationReport),
     /// Fresh V6 class-mass replay.
     Partial(Box<PartialDfa>),
@@ -2434,14 +2444,17 @@ impl ProgramOptimizationSidecar {
     const fn context_report(&self) -> Option<&ContextDeterminizationReport> {
         match self {
             Self::Context(report) => Some(report),
-            Self::None | Self::Partial(_) | Self::LegacyPartial(_) => None,
+            Self::None
+            | Self::OptimizingFallback
+            | Self::Partial(_)
+            | Self::LegacyPartial(_) => None,
         }
     }
 
     const fn partial_dfa(&self) -> Option<&PartialDfa> {
         match self {
             Self::Partial(partial) | Self::LegacyPartial(partial) => Some(partial),
-            Self::None | Self::Context(_) => None,
+            Self::None | Self::OptimizingFallback | Self::Context(_) => None,
         }
     }
 
@@ -2449,11 +2462,15 @@ impl ProgramOptimizationSidecar {
         matches!(self, Self::Partial(_) | Self::LegacyPartial(_))
     }
 
+    const fn is_optimizing_fallback_without_dfa(&self) -> bool {
+        matches!(self, Self::OptimizingFallback)
+    }
+
     const fn partial_replay_order(&self) -> Option<DfaReplayOrder> {
         match self {
             Self::Partial(_) => Some(DfaReplayOrder::DescendingClassMass),
             Self::LegacyPartial(_) => Some(DfaReplayOrder::Fifo),
-            Self::None | Self::Context(_) => None,
+            Self::None | Self::OptimizingFallback | Self::Context(_) => None,
         }
     }
 }
@@ -3126,6 +3143,186 @@ pub(crate) struct NativeProgramView<'a> {
     pub(crate) retained_suffix_requirement: Option<NativeRetainedSuffixRequirement>,
 }
 
+/// Compiler-owned complete DFA materialized from one setup-authenticated K0
+/// cache. This is transient lowering IR: it is neither serialized into the
+/// semantic program nor retained after the native object has copied its
+/// target-specific table.
+#[derive(Debug)]
+pub(crate) struct NativeFullyPrefilledProgram {
+    byte_classes: [u8; 256],
+    class_representatives: Box<[u8]>,
+    forward_cells: Box<[ForwardCell]>,
+    reverse_cells: Box<[ReverseCell]>,
+    initial_state: u32,
+    reverse_initial: Option<u32>,
+    initial_pending: bool,
+    initial_terminal: bool,
+    retained_prefix_requirement: Option<NativeRetainedPrefixRequirement>,
+    retained_suffix_requirement: Option<NativeRetainedSuffixRequirement>,
+}
+
+impl NativeFullyPrefilledProgram {
+    fn dfa_view(&self) -> NativeDfaView<'_> {
+        NativeDfaView {
+            initial_state: self.initial_state,
+            initial_pending: self.initial_pending,
+            initial_terminal: self.initial_terminal,
+            byte_classes: &self.byte_classes,
+            class_count: self.class_representatives.len(),
+            class_representatives: &self.class_representatives,
+            forward_cells: &self.forward_cells,
+            reverse_initial: self.reverse_initial,
+            reverse_cells: &self.reverse_cells,
+        }
+    }
+}
+
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "the checked nonzero stride and aligned encoded row make remainder and division exact"
+)]
+fn decode_fully_prefilled_next_state(
+    cell: u32,
+    row_stride: u32,
+    state_count: usize,
+    next_row_token_mask: u32,
+) -> Option<u32> {
+    let token = cell & next_row_token_mask;
+    if token == 0 {
+        return Some(NO_STATE);
+    }
+    let row = token.checked_sub(1)?;
+    if row_stride == 0 || row % row_stride != 0 {
+        return None;
+    }
+    let state = row / row_stride;
+    (usize::try_from(state).ok()? < state_count).then_some(state)
+}
+
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "the nonzero exact row extent proves the state-count division"
+)]
+fn decode_fully_prefilled_forward_rows(
+    rows: &[u32],
+    row_stride: u32,
+    unfilled_cell: u32,
+    accept_mask: u32,
+    next_row_token_mask: u32,
+) -> Option<Box<[ForwardCell]>> {
+    let stride = usize::try_from(row_stride).ok()?;
+    if stride == 0 || rows.is_empty() || !rows.len().is_multiple_of(stride) {
+        return None;
+    }
+    let state_count = rows.len() / stride;
+    let mut decoded = Vec::new();
+    decoded.try_reserve_exact(rows.len()).ok()?;
+    for &cell in rows {
+        if cell == unfilled_cell {
+            return None;
+        }
+        decoded.push(ForwardCell {
+            next: decode_fully_prefilled_next_state(
+                cell,
+                row_stride,
+                state_count,
+                next_row_token_mask,
+            )?,
+            accepted: cell & accept_mask != 0,
+        });
+    }
+    Some(decoded.into_boxed_slice())
+}
+
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "the nonzero exact row extent proves the state-count division"
+)]
+fn decode_fully_prefilled_reverse_rows(
+    rows: &[u32],
+    row_stride: u32,
+    unfilled_cell: u32,
+    accept_mask: u32,
+    next_row_token_mask: u32,
+) -> Option<Box<[ReverseCell]>> {
+    let stride = usize::try_from(row_stride).ok()?;
+    if stride == 0 || rows.is_empty() || !rows.len().is_multiple_of(stride) {
+        return None;
+    }
+    let state_count = rows.len() / stride;
+    let mut decoded = Vec::new();
+    decoded.try_reserve_exact(rows.len()).ok()?;
+    for &cell in rows {
+        if cell == unfilled_cell {
+            return None;
+        }
+        decoded.push(ReverseCell {
+            next: decode_fully_prefilled_next_state(
+                cell,
+                row_stride,
+                state_count,
+                next_row_token_mask,
+            )?,
+            reaches_start: cell & accept_mask != 0,
+        });
+    }
+    Some(decoded.into_boxed_slice())
+}
+
+fn canonicalize_fully_prefilled_forward_initial(
+    mut cells: Box<[ForwardCell]>,
+    class_count: usize,
+    initial_state: u32,
+) -> Option<Box<[ForwardCell]>> {
+    let state_count = cells.len().checked_div(class_count)?;
+    let initial = usize::try_from(initial_state).ok()?;
+    if class_count == 0 || initial >= state_count {
+        return None;
+    }
+    if initial == 0 {
+        return Some(cells);
+    }
+    let initial_row = initial.checked_mul(class_count)?;
+    for class in 0..class_count {
+        cells.swap(class, initial_row.checked_add(class)?);
+    }
+    for cell in &mut cells {
+        if cell.next == 0 {
+            cell.next = initial_state;
+        } else if cell.next == initial_state {
+            cell.next = 0;
+        }
+    }
+    Some(cells)
+}
+
+fn canonicalize_fully_prefilled_reverse_initial(
+    mut cells: Box<[ReverseCell]>,
+    class_count: usize,
+    initial_state: u32,
+) -> Option<Box<[ReverseCell]>> {
+    let state_count = cells.len().checked_div(class_count)?;
+    let initial = usize::try_from(initial_state).ok()?;
+    if class_count == 0 || initial >= state_count {
+        return None;
+    }
+    if initial == 0 {
+        return Some(cells);
+    }
+    let initial_row = initial.checked_mul(class_count)?;
+    for class in 0..class_count {
+        cells.swap(class, initial_row.checked_add(class)?);
+    }
+    for cell in &mut cells {
+        if cell.next == 0 {
+            cell.next = initial_state;
+        } else if cell.next == initial_state {
+            cell.next = 0;
+        }
+    }
+    Some(cells)
+}
+
 /// Authenticated incomplete retained rows eligible for a prepared native
 /// entry with exact K0 side exits.
 #[derive(Clone, Copy, Debug)]
@@ -3400,6 +3597,13 @@ impl CompiledProgram {
             (None, Some(partial)) if matches!(engine, ProgramEngine::OrderedNfa) => {
                 ProgramOptimizationSidecar::Partial(Box::new(partial))
             }
+            (None, None)
+                if mode == CompileMode::Optimizing
+                    && matches!(engine, ProgramEngine::OrderedNfa)
+                    && nfa_mandatory_cut.is_none() =>
+            {
+                ProgramOptimizationSidecar::OptimizingFallback
+            }
             (None, None) => ProgramOptimizationSidecar::None,
             (Some(_), Some(_)) => {
                 return Err(CompileError::InternalInvariant(
@@ -3492,6 +3696,12 @@ impl CompiledProgram {
         if self.automaton.has_epsilon_closure_dispatch() {
             flags |= PROGRAM_FLAG_NFA_EPSILON_CLOSURE_DISPATCH;
         }
+        if self
+            .optimization_sidecar
+            .is_optimizing_fallback_without_dfa()
+        {
+            flags |= PROGRAM_FLAG_NFA_OPTIMIZING_FALLBACK;
+        }
         flags
     }
 
@@ -3503,7 +3713,12 @@ impl CompiledProgram {
             self.optimization_sidecar.partial_replay_order(),
             Some(DfaReplayOrder::DescendingClassMass)
         );
-        if class_mass_dfa {
+        if self
+            .optimization_sidecar
+            .is_optimizing_fallback_without_dfa()
+        {
+            PROGRAM_FORMAT_VERSION_V7
+        } else if class_mass_dfa {
             PROGRAM_FORMAT_VERSION_V6
         } else if self.automaton.has_ordered_edge_dispatch()
             || self.automaton.has_epsilon_closure_dispatch()
@@ -3710,6 +3925,185 @@ impl CompiledProgram {
             anchored_prefix: self.anchored_prefix_stats(),
             max_match_width: self.max_match_width(),
         })
+    }
+
+    /// Materialize a complete assertion-free ordered K0 cache into transient
+    /// target-neutral DFA IR for the optimizing AOT lowering transaction.
+    ///
+    /// This deliberately honors the same fixed workspace and full-prefill
+    /// proof as the prepared runtime. Failure to allocate, complete, or
+    /// authenticate any row is an optimization decline, not a compilation
+    /// error. The returned rows are compiler-owned and can therefore be copied
+    /// into an ordinary runtime-free native object.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::too_many_lines,
+        reason = "one fail-closed transaction authenticates, decodes, and canonicalizes both complete directions"
+    )]
+    pub(crate) fn native_fully_prefilled_program(&self) -> Option<NativeFullyPrefilledProgram> {
+        if self.context_dfa.is_some()
+            || !matches!(self.engine, ProgramEngine::OrderedNfa)
+            || self.automaton.stats().has_assertions()
+            || self.nfa_mandatory_cut.is_some()
+            || !(self
+                .optimization_sidecar
+                .is_optimizing_fallback_without_dfa()
+                || self.partial_dfa().is_some())
+        {
+            return None;
+        }
+        let (prefix_plan, prefix_supported) =
+            PartialDfaPrefixPlan::derive(self.anchored_prefix.sets());
+        if !prefix_supported {
+            return None;
+        }
+
+        let mut workspace = self.prepare_workspace().ok()?;
+        let has_resume_frontier = self
+            .partial_dfa()
+            .is_some_and(|partial| partial.resume_frontier_count() != 0);
+        let (nfa_slot, partial_slot) = (&mut workspace.nfa, &mut workspace.partial);
+        let nfa = nfa_slot.as_mut()?;
+        let projection = if has_resume_frontier {
+            let resume = partial_slot.as_deref_mut()?.resume.as_mut()?;
+            let receipt = nfa.compiler_private_try_prefill_resume_caches_with_receipt(
+                &self.automaton,
+                resume,
+            )?;
+            nfa.compiler_private_fully_prefilled_root_projection(
+                &self.automaton,
+                resume,
+                receipt,
+            )?
+        } else {
+            let receipt = nfa.compiler_private_try_prefill_root_cache_with_receipt(&self.automaton)?;
+            nfa.compiler_private_fully_prefilled_root_projection_without_resume(
+                &self.automaton,
+                receipt,
+            )?
+        };
+        let row_stride = projection.row_stride();
+        let stride = usize::try_from(row_stride).ok()?;
+        if stride == 0 || stride > 256 {
+            return None;
+        }
+
+        let byte_classes = *projection.class_map();
+        let mut class_representatives = Vec::new();
+        class_representatives.try_reserve_exact(stride).ok()?;
+        class_representatives.resize(stride, 0);
+        let mut represented = [false; 256];
+        for byte in u8::MIN..=u8::MAX {
+            let class = usize::from(byte_classes[usize::from(byte)]);
+            if class >= stride {
+                return None;
+            }
+            if !represented[class] {
+                represented[class] = true;
+                class_representatives[class] = byte;
+            }
+        }
+        if represented[..stride].iter().any(|represented| !represented) {
+            return None;
+        }
+
+        let forward_cells = decode_fully_prefilled_forward_rows(
+            projection.forward_rows(),
+            row_stride,
+            projection.unfilled_cell(),
+            projection.accept_mask(),
+            projection.next_row_token_mask(),
+        )?;
+        let forward_state_count = forward_cells.len().checked_div(stride)?;
+        let forward_initial_row = projection.forward_initial_row();
+        if forward_initial_row % row_stride != 0 {
+            return None;
+        }
+        let initial_state = forward_initial_row / row_stride;
+        if usize::try_from(initial_state).ok()? >= forward_state_count {
+            return None;
+        }
+        let forward_cells = canonicalize_fully_prefilled_forward_initial(
+            forward_cells,
+            stride,
+            initial_state,
+        )?;
+
+        let reverse_required = self.output == OutputContract::Span
+            && !projection.initial_pending()
+            && self.exact_match_width.is_none();
+        let (reverse_cells, reverse_initial) = if reverse_required {
+            let rows = projection.reverse_rows()?;
+            let cells = decode_fully_prefilled_reverse_rows(
+                rows,
+                row_stride,
+                projection.unfilled_cell(),
+                projection.accept_mask(),
+                projection.next_row_token_mask(),
+            )?;
+            let state_count = cells.len().checked_div(stride)?;
+            let initial_row = projection.reverse_initial_row()?;
+            if initial_row % row_stride != 0 {
+                return None;
+            }
+            let initial = initial_row / row_stride;
+            if usize::try_from(initial).ok()? >= state_count {
+                return None;
+            }
+            let cells = canonicalize_fully_prefilled_reverse_initial(cells, stride, initial)?;
+            (cells, Some(0))
+        } else {
+            (Box::<[ReverseCell]>::default(), None)
+        };
+
+        let retained_prefix_requirement = if projection.initial_pending() {
+            None
+        } else if let Some(plan) = prefix_plan {
+            let depth = plan.primary_depth();
+            Some(NativeRetainedPrefixRequirement {
+                scan_offset: u8::try_from(depth).ok()?,
+                membership: self.anchored_prefix.sets().get(depth)?.words(),
+            })
+        } else {
+            None
+        };
+        let retained_suffix_requirement = match &self.nfa_mandatory_suffix {
+            Some(suffix) => Some(suffix.native_requirement()?),
+            None => None,
+        };
+
+        Some(NativeFullyPrefilledProgram {
+            byte_classes,
+            class_representatives: class_representatives.into_boxed_slice(),
+            forward_cells,
+            reverse_cells,
+            initial_state: 0,
+            reverse_initial,
+            initial_pending: projection.initial_pending(),
+            initial_terminal: projection.initial_terminal(),
+            retained_prefix_requirement,
+            retained_suffix_requirement,
+        })
+    }
+
+    pub(crate) fn native_fully_prefilled_view<'a>(
+        &'a self,
+        materialized: &'a NativeFullyPrefilledProgram,
+    ) -> NativeProgramView<'a> {
+        NativeProgramView {
+            output: self.output,
+            raw: &self.raw,
+            dfa: materialized.dfa_view(),
+            partial_discovered_states: None,
+            anchored_prefix: &self.anchored_prefix,
+            anchored_suffix: &self.anchored_suffix,
+            required_literals: &self.required_literals,
+            exact_match_width: self.exact_match_width,
+            max_match_width: self.max_match_width(),
+            exact_product_width: None,
+            retained_prefix_requirement: materialized.retained_prefix_requirement,
+            retained_suffix_requirement: materialized.retained_suffix_requirement,
+        }
     }
 
     #[allow(dead_code, reason = "structural handoff for native code generation")]
@@ -6618,6 +7012,15 @@ impl CompiledProgram {
                 "V6 program has no class-mass DFA replay identity",
             ));
         }
+        if version == PROGRAM_FORMAT_VERSION_V7
+            && (flags & PROGRAM_FLAG_NFA_OPTIMIZING_FALLBACK == 0
+                || flags & PROGRAM_FLAG_NFA_PARTIAL_DFA != 0
+                || engine_kind != EngineKind::OrderedNfa)
+        {
+            return Err(ProgramFormatError::Malformed(
+                "V7 program is not a payload-free optimizing ordered-NFA fallback",
+            ));
+        }
         let total = usize_from_u64(read_u64_at(header, 16)?, "program total length")?;
         if !(MIN_SERIALIZED_PROGRAM_BYTES..=MAX_SERIALIZED_PROGRAM_BYTES).contains(&total) {
             return Err(ProgramFormatError::Malformed(
@@ -6665,6 +7068,8 @@ impl CompiledProgram {
             program_flags & PROGRAM_FLAG_NFA_ORDERED_EDGE_DISPATCH != 0;
         let epsilon_closure_dispatch_enabled =
             program_flags & PROGRAM_FLAG_NFA_EPSILON_CLOSURE_DISPATCH != 0;
+        let optimizing_fallback_enabled =
+            program_flags & PROGRAM_FLAG_NFA_OPTIMIZING_FALLBACK != 0;
         let dfa_replay_order = if version == PROGRAM_FORMAT_VERSION_V6 {
             DfaReplayOrder::DescendingClassMass
         } else {
@@ -6702,6 +7107,11 @@ impl CompiledProgram {
                 "epsilon-closure dispatch flag requires an ordered-NFA engine",
             ));
         }
+        if optimizing_fallback_enabled && engine_kind != EngineKind::OrderedNfa {
+            return Err(ProgramFormatError::Malformed(
+                "optimizing-fallback flag requires an ordered-NFA engine",
+            ));
+        }
         if exact_product_enabled && program_flags & PROGRAM_FLAG_NFA_PARTIAL_DFA != 0 {
             return Err(ProgramFormatError::Malformed(
                 "exact-product and partial-DFA flags are mutually exclusive",
@@ -6713,25 +7123,47 @@ impl CompiledProgram {
                 .ok_or(ProgramFormatError::Malformed("program body is truncated"))?,
         );
         let raw = deserialize_raw(&mut reader)?;
+        if optimizing_fallback_enabled
+            && raw
+                .edge_kinds
+                .iter()
+                .any(|kind| !matches!(kind, EdgeKind::Epsilon | EdgeKind::ByteRange))
+        {
+            return Err(ProgramFormatError::Malformed(
+                "optimizing-fallback graph contains a context assertion",
+            ));
+        }
         let mut automaton = deserialize_automaton(&raw, line_terminator)?;
-        if ordered_edge_dispatch_enabled {
+        if ordered_edge_dispatch_enabled || optimizing_fallback_enabled {
             let derived = automaton
                 .try_enable_ordered_edge_dispatch()
                 .map_err(|_| ProgramFormatError::Allocation("ordered-edge dispatch"))?;
-            if !derived {
-                return Err(ProgramFormatError::Malformed(
-                    "ordered-edge dispatch marker is incompatible with the embedded graph",
-                ));
+            if derived != ordered_edge_dispatch_enabled {
+                return Err(if ordered_edge_dispatch_enabled {
+                    ProgramFormatError::Malformed(
+                        "ordered-edge dispatch marker is incompatible with the embedded graph",
+                    )
+                } else {
+                    ProgramFormatError::Malformed(
+                        "optimizing-fallback marker omits canonical ordered-edge dispatch",
+                    )
+                });
             }
         }
-        if epsilon_closure_dispatch_enabled {
+        if epsilon_closure_dispatch_enabled || optimizing_fallback_enabled {
             let derived = automaton
                 .try_enable_epsilon_closure_dispatch()
                 .map_err(|_| ProgramFormatError::Allocation("epsilon-closure dispatch"))?;
-            if !derived {
-                return Err(ProgramFormatError::Malformed(
-                    "epsilon-closure dispatch marker is incompatible with the embedded graph",
-                ));
+            if derived != epsilon_closure_dispatch_enabled {
+                return Err(if epsilon_closure_dispatch_enabled {
+                    ProgramFormatError::Malformed(
+                        "epsilon-closure dispatch marker is incompatible with the embedded graph",
+                    )
+                } else {
+                    ProgramFormatError::Malformed(
+                        "optimizing-fallback marker omits canonical epsilon-closure dispatch",
+                    )
+                });
             }
         }
         let exact_match_width = derive_exact_match_width(&raw);
@@ -6820,6 +7252,7 @@ impl CompiledProgram {
             || program_flags & PROGRAM_FLAG_NFA_PARTIAL_DFA != 0
             || ordered_edge_dispatch_enabled
             || epsilon_closure_dispatch_enabled
+            || optimizing_fallback_enabled
         {
             required_literals::derive(&raw)
         } else {
@@ -6875,8 +7308,14 @@ impl CompiledProgram {
                 "partial DFA was paired with a non-fallback engine",
             ));
         }
-        let optimization_sidecar = partial_dfa.map_or(
-            ProgramOptimizationSidecar::None,
+        let optimization_sidecar = partial_dfa.map_or_else(
+            || {
+                if optimizing_fallback_enabled {
+                    ProgramOptimizationSidecar::OptimizingFallback
+                } else {
+                    ProgramOptimizationSidecar::None
+                }
+            },
             |partial| match dfa_replay_order {
                 DfaReplayOrder::Fifo => ProgramOptimizationSidecar::LegacyPartial(partial),
                 DfaReplayOrder::DescendingClassMass => {
@@ -8287,7 +8726,8 @@ fn header_line_terminator(header: &[u8], version: u32) -> Result<u8, ProgramForm
         PROGRAM_FORMAT_VERSION_V3
         | PROGRAM_FORMAT_VERSION_V4
         | PROGRAM_FORMAT_VERSION_V5
-        | PROGRAM_FORMAT_VERSION_V6 => Ok(header[14]),
+        | PROGRAM_FORMAT_VERSION_V6
+        | PROGRAM_FORMAT_VERSION_V7 => Ok(header[14]),
         _ => Err(ProgramFormatError::Malformed(
             "unsupported program format version",
         )),
@@ -8329,6 +8769,15 @@ fn header_program_flags(header: &[u8], version: u32) -> Result<u8, ProgramFormat
             if flags & !PROGRAM_V6_KNOWN_FLAGS != 0 {
                 return Err(ProgramFormatError::Malformed(
                     "V6 program header contains unknown flags",
+                ));
+            }
+            Ok(flags)
+        }
+        PROGRAM_FORMAT_VERSION_V7 => {
+            let flags = header[15];
+            if flags & !PROGRAM_V7_KNOWN_FLAGS != 0 {
+                return Err(ProgramFormatError::Malformed(
+                    "V7 program header contains unknown flags",
                 ));
             }
             Ok(flags)
@@ -8529,6 +8978,87 @@ mod tests {
             usize::MAX,
         )
         .expect("compile")
+    }
+
+    fn execute_native_program_view(
+        view: NativeProgramView<'_>,
+        haystack: &[u8],
+        window: SearchWindow,
+    ) -> MatchResult {
+        let dfa = view.dfa;
+        let mut state = dfa.initial_state;
+        let mut position = window.start();
+        let mut pending_end = dfa.initial_pending.then_some(position);
+        if dfa.initial_pending
+            && (view.output == OutputContract::Exists || dfa.initial_terminal)
+        {
+            return match view.output {
+                OutputContract::Exists => MatchResult::Exists(true),
+                OutputContract::SelectedEnd => MatchResult::SelectedEnd(pending_end),
+                OutputContract::Span => MatchResult::Span(Some((position, position))),
+            };
+        }
+
+        while position < window.end() {
+            let byte = haystack[position];
+            let class = usize::from(dfa.byte_classes[usize::from(byte)]);
+            let row = usize::try_from(state)
+                .unwrap()
+                .checked_mul(dfa.class_count)
+                .unwrap();
+            let cell = dfa.forward_cells[row + class];
+            position += 1;
+            if cell.accepted {
+                pending_end = Some(position);
+                if view.output == OutputContract::Exists {
+                    return MatchResult::Exists(true);
+                }
+            }
+            if cell.next == NO_STATE {
+                break;
+            }
+            state = cell.next;
+        }
+
+        match view.output {
+            OutputContract::Exists => MatchResult::Exists(pending_end.is_some()),
+            OutputContract::SelectedEnd => MatchResult::SelectedEnd(pending_end),
+            OutputContract::Span => {
+                let Some(selected_end) = pending_end else {
+                    return MatchResult::Span(None);
+                };
+                if dfa.initial_pending {
+                    return MatchResult::Span(Some((window.start(), selected_end)));
+                }
+                if let Some(width) = view.exact_match_width {
+                    return MatchResult::Span(Some((selected_end - width, selected_end)));
+                }
+                let mut reverse_state = dfa.reverse_initial.expect("materialized reverse initial");
+                let mut cursor = selected_end;
+                let mut candidate = None;
+                while cursor > window.start() {
+                    cursor -= 1;
+                    let byte = haystack[cursor];
+                    let class = usize::from(dfa.byte_classes[usize::from(byte)]);
+                    let row = usize::try_from(reverse_state)
+                        .unwrap()
+                        .checked_mul(dfa.class_count)
+                        .unwrap();
+                    let cell = dfa.reverse_cells[row + class];
+                    if cell.reaches_start {
+                        candidate = Some(cursor);
+                    }
+                    if cell.next == NO_STATE {
+                        break;
+                    }
+                    reverse_state = cell.next;
+                }
+                MatchResult::Span(Some((
+                    candidate.expect("materialized reverse recovered start"),
+                    selected_end,
+                )))
+            }
+        }
     }
 
     fn raw_program(
@@ -10883,13 +11413,14 @@ mod tests {
             let bytes = compiled.serialize().expect("serialize fallback");
             assert_eq!(
                 u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
-                PROGRAM_FORMAT_VERSION_V5
+                PROGRAM_FORMAT_VERSION_V7
             );
             assert!(compiled.automaton.has_epsilon_closure_dispatch());
             assert_eq!(
                 bytes[15],
                 PROGRAM_FLAG_NFA_MANDATORY_SUFFIX
                     | PROGRAM_FLAG_NFA_EPSILON_CLOSURE_DISPATCH
+                    | PROGRAM_FLAG_NFA_OPTIMIZING_FALLBACK
             );
             let restored = CompiledProgram::deserialize(&bytes).expect("restore fallback");
             assert_eq!(restored.engine_kind(), EngineKind::OrderedNfa);
@@ -12017,6 +12548,7 @@ mod tests {
                 bytes[15],
                 PROGRAM_FLAG_NFA_MANDATORY_SUFFIX
                     | PROGRAM_FLAG_NFA_EPSILON_CLOSURE_DISPATCH
+                    | PROGRAM_FLAG_NFA_OPTIMIZING_FALLBACK
             );
             let restored = CompiledProgram::deserialize(&bytes).expect("restore fallback");
             assert!(restored.nfa_mandatory_suffix.is_some());
@@ -12053,6 +12585,7 @@ mod tests {
                 bytes[15],
                 PROGRAM_FLAG_NFA_MANDATORY_SUFFIX
                     | PROGRAM_FLAG_NFA_ORDERED_EDGE_DISPATCH
+                    | PROGRAM_FLAG_NFA_OPTIMIZING_FALLBACK
             );
             let restored = CompiledProgram::deserialize(&bytes).unwrap();
             assert_eq!(restored.serialize().unwrap(), bytes);
@@ -14517,6 +15050,136 @@ mod tests {
     }
 
     #[test]
+    fn materialized_k0_dfa_matches_every_small_window_for_every_output() {
+        let pattern = r"a+Q|[b-c][a-b]{1,5}(?:x+|y+)";
+        let limits = DeterminizeLimits {
+            max_states: 8,
+            ..DeterminizeLimits::default()
+        };
+        let haystacks = generated_byte_strings(b"abcxyQ!", 4);
+
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let compiled = program(pattern, output, CompileMode::Optimizing, limits);
+            let partial = compiled.partial_dfa().expect("retained partial DFA");
+            assert!(partial.resume_frontier_count() != 0, "{output:?}");
+            let materialized = compiled
+                .native_fully_prefilled_program()
+                .unwrap_or_else(|| panic!("full K0 materialization declined for {output:?}"));
+            let native = compiled.native_fully_prefilled_view(&materialized);
+            let reference = program(
+                pattern,
+                output,
+                CompileMode::Fast,
+                DeterminizeLimits::default(),
+            );
+            let mut reference_workspace = reference.prepare_workspace().unwrap();
+
+            for haystack in &haystacks {
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let window = SearchWindow::new(start, end);
+                        let expected = reference
+                            .search_with_workspace(haystack, window, &mut reference_workspace)
+                            .unwrap();
+                        assert_eq!(
+                            execute_native_program_view(native, haystack, window),
+                            expected,
+                            "{output:?} {haystack:?} {start}..{end}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn zero_state_materialization_is_optimizing_only_and_survives_restore() {
+        let pattern = r"a+Q|[b-c][a-b]{1,5}(?:x+|y+)";
+        let limits = DeterminizeLimits {
+            max_states: 0,
+            ..DeterminizeLimits::default()
+        };
+        let haystacks = generated_byte_strings(b"abcxyQ!", 3);
+
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let compiled = program(pattern, output, CompileMode::Optimizing, limits);
+            assert!(compiled.partial_dfa().is_none(), "{output:?}");
+            assert!(
+                compiled
+                    .optimization_sidecar
+                    .is_optimizing_fallback_without_dfa(),
+                "{output:?}"
+            );
+            let bytes = compiled.serialize().unwrap();
+            assert_eq!(compiled.program_format_version(), PROGRAM_FORMAT_VERSION_V7);
+            assert_ne!(bytes[15] & PROGRAM_FLAG_NFA_OPTIMIZING_FALLBACK, 0);
+
+            let restored = CompiledProgram::deserialize(&bytes).unwrap();
+            assert_eq!(restored.serialize().unwrap(), bytes);
+            let materialized = compiled
+                .native_fully_prefilled_program()
+                .unwrap_or_else(|| panic!("fresh root-only materialization declined for {output:?}"));
+            let restored_materialized = restored
+                .native_fully_prefilled_program()
+                .unwrap_or_else(|| {
+                    panic!("restored root-only materialization declined for {output:?}")
+                });
+            let native = compiled.native_fully_prefilled_view(&materialized);
+            let restored_native =
+                restored.native_fully_prefilled_view(&restored_materialized);
+
+            let fast = program(
+                pattern,
+                output,
+                CompileMode::Fast,
+                DeterminizeLimits::default(),
+            );
+            assert!(fast.native_fully_prefilled_program().is_none(), "{output:?}");
+            let fast_bytes = fast.serialize().unwrap();
+            assert_eq!(fast_bytes[15] & PROGRAM_FLAG_NFA_OPTIMIZING_FALLBACK, 0);
+            let fast_restored = CompiledProgram::deserialize(&fast_bytes).unwrap();
+            assert!(
+                fast_restored.native_fully_prefilled_program().is_none(),
+                "{output:?}"
+            );
+            let mut reference_workspace = fast.prepare_workspace().unwrap();
+
+            for haystack in &haystacks {
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let window = SearchWindow::new(start, end);
+                        let expected = fast
+                            .search_with_workspace(haystack, window, &mut reference_workspace)
+                            .unwrap();
+                        assert_eq!(
+                            execute_native_program_view(native, haystack, window),
+                            expected,
+                            "fresh {output:?} {haystack:?} {start}..{end}"
+                        );
+                        assert_eq!(
+                            execute_native_program_view(restored_native, haystack, window),
+                            expected,
+                            "restored {output:?} {haystack:?} {start}..{end}"
+                        );
+                    }
+                }
+            }
+
+            let mut unmarked = bytes;
+            unmarked[15] &= !PROGRAM_FLAG_NFA_OPTIMIZING_FALLBACK;
+            assert!(CompiledProgram::deserialize(&unmarked).is_err(), "{output:?}");
+        }
+    }
+
+    #[test]
     #[allow(
         clippy::too_many_lines,
         reason = "one setup ledger audits all output contracts, header fields, and stale or foreign lineage declines"
@@ -14870,6 +15533,24 @@ mod tests {
                     "family={family} output={output:?} max_states={max_states} has no derived loop plan"
                 );
 
+                let materialized = compiled
+                    .native_fully_prefilled_program()
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "family={family} output={output:?} max_states={max_states} did not materialize"
+                        )
+                    });
+                let native = compiled.native_fully_prefilled_view(&materialized);
+                assert_eq!(native.dfa.initial_state, 0);
+                assert_eq!(
+                    native.dfa.reverse_initial,
+                    (output == OutputContract::Span
+                        && !native.dfa.initial_pending
+                        && native.exact_match_width.is_none())
+                    .then_some(0),
+                    "family={family} output={output:?} max_states={max_states}"
+                );
+
                 let reference = program(
                     pattern,
                     output,
@@ -14892,6 +15573,11 @@ mod tests {
                             .unwrap(),
                         reference.search(&source, window).unwrap(),
                         "family={family} output={output:?} max_states={max_states} window={window:?}"
+                    );
+                    assert_eq!(
+                        execute_native_program_view(native, &source, window),
+                        reference.search(&source, window).unwrap(),
+                        "materialized family={family} output={output:?} max_states={max_states} window={window:?}"
                     );
                 }
             }
@@ -16861,9 +17547,9 @@ mod tests {
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "V5 strictness, canonical rederivation, all outputs, clone, and ineligible-engine rejection share one wire matrix"
+        reason = "versioned strictness, canonical rederivation, all outputs, clone, and ineligible-engine rejection share one wire matrix"
     )]
-    fn epsilon_closure_dispatch_v5_is_canonical_strict_and_general() {
+    fn epsilon_closure_dispatch_wire_is_canonical_strict_and_general() {
         let raw = epsilon_dispatch_wire_graph();
         let fallback_limits = DeterminizeLimits {
             max_states: 0,
@@ -16889,10 +17575,14 @@ mod tests {
             let bytes = optimized.serialize().unwrap();
             assert_eq!(
                 u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
-                PROGRAM_FORMAT_VERSION_V5
+                PROGRAM_FORMAT_VERSION_V7
             );
             assert_ne!(
                 bytes[15] & PROGRAM_FLAG_NFA_EPSILON_CLOSURE_DISPATCH,
+                0
+            );
+            assert_ne!(
+                bytes[15] & PROGRAM_FLAG_NFA_OPTIMIZING_FALLBACK,
                 0
             );
             let restored = CompiledProgram::deserialize(&bytes).unwrap();
@@ -17006,7 +17696,7 @@ mod tests {
         assert!(matches!(
             CompiledProgram::deserialize(&missing_marker),
             Err(ProgramFormatError::Malformed(
-                "V5 program has no graph-dispatch marker"
+                "optimizing-fallback marker omits canonical epsilon-closure dispatch"
             ))
         ));
 
@@ -17089,7 +17779,9 @@ mod tests {
         // sidecar: wire markers, never local optimizer availability, govern
         // canonical reconstruction.
         let mut old_v5 = both_bytes;
-        old_v5[15] &= !PROGRAM_FLAG_NFA_EPSILON_CLOSURE_DISPATCH;
+        old_v5[8..12].copy_from_slice(&PROGRAM_FORMAT_VERSION_V5.to_le_bytes());
+        old_v5[15] &= !(PROGRAM_FLAG_NFA_EPSILON_CLOSURE_DISPATCH
+            | PROGRAM_FLAG_NFA_OPTIMIZING_FALLBACK);
         let old_restored = CompiledProgram::deserialize(&old_v5).unwrap();
         assert!(old_restored.automaton.has_ordered_edge_dispatch());
         assert!(!old_restored.automaton.has_epsilon_closure_dispatch());
@@ -17325,7 +18017,7 @@ mod tests {
     }
 
     #[test]
-    fn ordered_edge_dispatch_v5_rederives_an_old_fit_direct_overflow_graph() {
+    fn ordered_edge_dispatch_wire_rederives_an_old_fit_direct_overflow_graph() {
         let raw = ordered_dispatch_legacy_ceiling_graph();
         let fallback_limits = DeterminizeLimits {
             max_states: 0,
@@ -17354,8 +18046,9 @@ mod tests {
         let bytes = optimized.serialize().unwrap();
         assert_eq!(
             u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
-            PROGRAM_FORMAT_VERSION_V5
+            PROGRAM_FORMAT_VERSION_V7
         );
+        assert_ne!(bytes[15] & PROGRAM_FLAG_NFA_OPTIMIZING_FALLBACK, 0);
         let restored = CompiledProgram::deserialize(&bytes).unwrap();
         assert!(restored.automaton.has_ordered_edge_dispatch());
         assert_eq!(
@@ -17434,7 +18127,12 @@ mod tests {
             bytes[15],
             PROGRAM_FLAG_NFA_MANDATORY_SUFFIX
                 | PROGRAM_FLAG_NFA_EPSILON_CLOSURE_DISPATCH
+                | PROGRAM_FLAG_NFA_OPTIMIZING_FALLBACK
         );
+
+        let mut missing_optimizing_marker = bytes.clone();
+        missing_optimizing_marker[15] &= !PROGRAM_FLAG_NFA_OPTIMIZING_FALLBACK;
+        assert!(CompiledProgram::deserialize(&missing_optimizing_marker).is_err());
 
         let mut unknown = bytes.clone();
         unknown[15] |= 1 << 7;
@@ -17498,6 +18196,7 @@ mod tests {
             unbounded_bytes[15],
             PROGRAM_FLAG_NFA_MANDATORY_SUFFIX
                 | PROGRAM_FLAG_NFA_EPSILON_CLOSURE_DISPATCH
+                | PROGRAM_FLAG_NFA_OPTIMIZING_FALLBACK
         );
         assert!(CompiledProgram::deserialize(&unbounded_bytes).is_ok());
 
@@ -17519,6 +18218,9 @@ mod tests {
         wrong_engine[15] = PROGRAM_FLAG_NFA_MANDATORY_CUT;
         assert!(CompiledProgram::deserialize(&wrong_engine).is_err());
         wrong_engine[15] = PROGRAM_FLAG_NFA_EXACT_PRODUCT;
+        assert!(CompiledProgram::deserialize(&wrong_engine).is_err());
+        wrong_engine[8..12].copy_from_slice(&PROGRAM_FORMAT_VERSION_V7.to_le_bytes());
+        wrong_engine[15] = PROGRAM_FLAG_NFA_OPTIMIZING_FALLBACK;
         assert!(CompiledProgram::deserialize(&wrong_engine).is_err());
     }
 
