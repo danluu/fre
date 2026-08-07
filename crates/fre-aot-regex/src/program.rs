@@ -16838,6 +16838,172 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "all value contracts share one direct proof that cut narrowing preserves an authentic scanner-owned root hole"
+    )]
+    fn mandatory_cut_narrowed_scanner_owned_root_hole_continues_every_contract() {
+        const MATCH_BYTES: usize = 15;
+
+        let pattern = r"(?:ba|cd)[a-b]{1,10}7[A-Za-z]{1,2}";
+        let candidate = DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES + 16;
+        let mut warm = vec![b'!'; candidate + MATCH_BYTES];
+        warm[candidate..candidate + 2].copy_from_slice(b"ba");
+        warm[candidate + 2..candidate + 12].fill(b'b');
+        warm[candidate + 12..candidate + MATCH_BYTES].copy_from_slice(b"7AZ");
+        let mut novel = warm.clone();
+        novel[candidate..candidate + 2].copy_from_slice(b"cd");
+        let original = SearchWindow::new(3, novel.len());
+
+        for (output, expected) in [
+            (OutputContract::Exists, MatchResult::Exists(true)),
+            (
+                OutputContract::SelectedEnd,
+                MatchResult::SelectedEnd(Some(candidate + MATCH_BYTES)),
+            ),
+            (
+                OutputContract::Span,
+                MatchResult::Span(Some((candidate, candidate + MATCH_BYTES))),
+            ),
+        ] {
+            let compiled = program(
+                pattern,
+                output,
+                CompileMode::Optimizing,
+                DeterminizeLimits {
+                    max_states: 0,
+                    ..DeterminizeLimits::default()
+                },
+            );
+            let view = compiled
+                .native_dynamic_rows_view()
+                .expect("cut-narrowed dynamic-row view");
+            let root = view
+                .root_requirement
+                .expect("cut-narrowed scanner-owned root");
+            assert!(compiled.has_nfa_mandatory_cut(), "{output:?}");
+            assert!(!compiled.has_nfa_exact_product(), "{output:?}");
+            assert_eq!(compiled.max_match_width(), Some(MATCH_BYTES));
+
+            let NfaMandatoryCutOutcome::Continue(narrowed) =
+                compiled.search_nfa_with_mandatory_cut(&novel, original)
+            else {
+                panic!("mandatory cut did not retain a narrowed search: {output:?}");
+            };
+            assert!(narrowed.start > original.start, "{output:?}");
+            assert!(narrowed.start <= candidate, "{output:?}");
+            assert_eq!(narrowed.end, original.end, "{output:?}");
+            assert!(
+                narrowed.end - narrowed.start < DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES,
+                "{output:?} must retain admission from the original byte count"
+            );
+            assert_eq!(
+                compiled.search_nfa_with_mandatory_cut(&warm, original),
+                NfaMandatoryCutOutcome::Continue(narrowed),
+                "{output:?}"
+            );
+            let scanner_source = candidate
+                .checked_add(usize::from(root.scan_offset))
+                .expect("scanner source position");
+            let scanner_byte = usize::from(novel[scanner_source]);
+            assert_ne!(
+                root.membership[scanner_byte / 64] & (1_u64 << (scanner_byte % 64)),
+                0,
+                "the novel match must be a graph-scanner candidate: {output:?}"
+            );
+
+            let mut workspace = compiled.prepare_workspace().expect("dynamic workspace");
+            let identity = compiled.artifact_identity();
+            let (cold, address, cache_identity) = compiled
+                .preflight_dynamic_native_rows_with_workspace(
+                    &warm,
+                    original,
+                    &mut workspace,
+                    identity,
+                )
+                .expect("cold post-cut preflight");
+            assert_eq!(cold, RetainedPartialPreflight::Complete(expected), "{output:?}");
+            assert_eq!((address, cache_identity), (0, 0), "{output:?}");
+
+            let (entered, address, cache_identity) = compiled
+                .preflight_dynamic_native_rows_with_workspace(
+                    &novel,
+                    original,
+                    &mut workspace,
+                    identity,
+                )
+                .expect("warm post-cut preflight");
+            assert_eq!(entered, RetainedPartialPreflight::Enter(narrowed), "{output:?}");
+            assert_ne!((address, cache_identity), (0, 0), "{output:?}");
+
+            let dynamic = workspace
+                .dynamic_native_rows
+                .as_deref()
+                .expect("dynamic descriptor");
+            let warm_class = usize::from(dynamic.class_map[usize::from(b'b')]);
+            let novel_class = usize::from(dynamic.class_map[usize::from(b'c')]);
+            assert_ne!(
+                warm_class, novel_class,
+                "the two branch roots must remain structurally distinct: {output:?}"
+            );
+            let descriptor = dynamic.native_rows;
+            assert_eq!(descriptor.cache_identity, cache_identity, "{output:?}");
+            assert_eq!(dynamic.state.native_entry_window, Some(narrowed), "{output:?}");
+            assert_eq!(
+                dynamic.state.native_entry_original_input_bytes,
+                original.end - original.start,
+                "{output:?}"
+            );
+            assert!(dynamic.state.native_entry_after_mandatory_cut, "{output:?}");
+            {
+                let projection = workspace
+                    .nfa
+                    .as_ref()
+                    .and_then(|nfa| nfa.dynamic_root_projection(&compiled.automaton))
+                    .expect("warm post-cut root projection");
+                assert_eq!(projection.initial_row(), descriptor.initial_row, "{output:?}");
+                let cell = usize::try_from(projection.initial_row())
+                    .expect("initial row")
+                    .checked_add(novel_class)
+                    .expect("novel root cell");
+                assert_eq!(
+                    projection.cell(cell),
+                    Some(projection.unfilled_cell()),
+                    "the named distinct root must be the first unpublished cell: {output:?}"
+                );
+            }
+
+            let found = compiled
+                .search_from_dynamic_native_rows_hole_with_workspace(
+                    &novel,
+                    narrowed,
+                    &mut workspace,
+                    identity,
+                    usize::try_from(descriptor.initial_row).expect("initial row"),
+                    candidate,
+                    1 << 1,
+                    0,
+                    cache_identity,
+                )
+                .expect("cut-narrowed scanner-owned continuation");
+            assert_eq!(found, expected, "{output:?}");
+            let dynamic = workspace
+                .dynamic_native_rows
+                .as_deref()
+                .expect("settled dynamic descriptor");
+            assert_eq!(
+                dynamic.state,
+                DynamicNativeRowsState::default(),
+                "successful cut-narrowed continuation must not deopt: {output:?}"
+            );
+            assert!(
+                dynamic.native_rows_dirty,
+                "the mutable continuation must invalidate the projection: {output:?}"
+            );
+        }
+    }
+
+    #[test]
     fn partial_cold_payloads_are_indirect_and_absent_without_retained_rows() {
         assert_eq!(
             core::mem::size_of::<Box<PartialDfa>>(),

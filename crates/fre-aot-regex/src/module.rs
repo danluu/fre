@@ -1803,8 +1803,8 @@ impl CompiledModule {
     }
 
     /// Return the exact first-unpublished-cell continuation helper required by
-    /// a scanner-free dynamically warmed-row entry, when that entry is
-    /// present.
+    /// a scanner-free or scanner-owned dynamically warmed-row entry, when that
+    /// entry is present.
     #[must_use]
     pub fn required_prepared_dynamic_rows_continue_runtime_symbol(&self) -> Option<&str> {
         self.prepared_entry_symbol_index?;
@@ -27459,6 +27459,26 @@ mod tests {
                 );
             }
         }
+        let direct = lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
+            Some(plan),
+            FeatureSet::EMPTY,
+            OutputContract::Exists,
+            None,
+            true,
+        )
+        .unwrap();
+        assert!(direct.code.windows(3).any(|bytes| bytes == [0x49, 0xff, 0xc4]));
+        assert_eq!(
+            direct
+                .relocations
+                .iter()
+                .filter(|relocation| {
+                    relocation.symbol == DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL
+                })
+                .count(),
+            1,
+            "an exact root with direct continuation must publish its first-hole helper"
+        );
     }
 
     #[test]
@@ -27685,6 +27705,31 @@ mod tests {
                     0
                 );
             }
+
+            let direct = lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
+                Some(Aarch64DynamicScannerPlan::Exact(installed)),
+                OutputContract::Exists,
+                None,
+                true,
+            )
+            .unwrap();
+            let words = direct
+                .code
+                .chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            assert!(words.contains(&aarch64_add_x_imm(19, 19, 1).unwrap()));
+            assert_eq!(
+                direct
+                    .relocations
+                    .iter()
+                    .filter(|relocation| {
+                        relocation.symbol == DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL
+                    })
+                    .count(),
+                1,
+                "an exact root with direct continuation must publish its first-hole helper: {target:?}"
+            );
         }
     }
 
