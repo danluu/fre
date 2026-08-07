@@ -3753,8 +3753,9 @@ fn determinize_for_output_with_ledger(
         // The ordered prefix remains live and owns allocations charged after
         // the checkpoint. Restoring that checkpoint for a simultaneous
         // endpoint-pruned attempt would make the ledger cease to be a hard
-        // peak cap. The whole-search-deopt prefix is already useful, so keep
-        // it and skip the mutually exclusive rescue.
+        // peak cap. The retained prefix is already useful either as a complete
+        // direct machine or behind whole-search deopt, so keep it and skip the
+        // mutually exclusive rescue.
         return Ok(ordered);
     }
 
