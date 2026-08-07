@@ -13841,12 +13841,14 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
             assembler.bind(not_accepting)?;
         }
         assembler.instruction(&[0x41, 0x81, 0xe2, 0xff, 0x7f, 0x00, 0x00])?;
-        assembler.instruction(&[0x41, 0xff, 0xca])?;
-        assembler.instruction(&[0x41, 0x81, 0xfa, 0xfe, 0x7f, 0x00, 0x00])?;
+        // V3 setup authenticated every nonzero low token against state_count,
+        // so zero is the only closed transition and every live token may be
+        // decremented directly into its zero-based state ordinal.
         assembler.branch(
-            &[0x0f, 0x87],
+            &[0x0f, 0x84],
             native_complete.unwrap_or(native_no_match),
         )?;
+        assembler.instruction(&[0x41, 0xff, 0xca])?;
         if let Some(root_vector) = root_vector {
             let non_root = assembler.label()?;
             assembler.instruction(&[
@@ -21714,12 +21716,14 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
             assembler.bind(not_accepting)?;
         }
         assembler.instruction(aarch64_and_low_w(6, 8, 15)?)?;
-        assembler.instruction(aarch64_sub_w_imm(6, 6, 1)?)?;
-        assembler.instruction(aarch64_lsr_w_imm(12, 6, 15)?)?;
-        assembler.branch_nonzero_w(
-            12,
+        // V3 setup authenticated every nonzero low token against state_count,
+        // so zero is the only closed transition and every live token may be
+        // decremented directly into its zero-based state ordinal.
+        assembler.branch_zero_w(
+            6,
             native_complete.unwrap_or(native_no_match),
         )?;
+        assembler.instruction(aarch64_sub_w_imm(6, 6, 1)?)?;
         if let Some(root_dispatch) = root_dispatch {
             let non_root = assembler.label()?;
             assembler.instruction(aarch64_load_w_imm(
@@ -35688,6 +35692,188 @@ int main(void) {{
                 && arm_first_ceiling < arm_v2_selection,
             "AArch64 must authenticate closed V3 before applying the legacy scanner-free ceiling"
         );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the exhaustive semantic proof and both production ISA encodings form one V3 decoder audit"
+    )]
+    fn frozen_compact_v3_dead_token_decoders_are_exact_cross_isa() {
+        type DecodedCell = (bool, Option<u32>);
+
+        fn former_x86_decode(cell: u16) -> DecodedCell {
+            let token = u32::from(cell & DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK);
+            let zero_based = token.wrapping_sub(1);
+            (
+                cell & DYNAMIC_NATIVE_ROWS_V3_ACCEPT_MASK != 0,
+                (zero_based
+                    <= u32::from(DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK - 1))
+                .then_some(zero_based),
+            )
+        }
+
+        fn former_aarch64_decode(cell: u16) -> DecodedCell {
+            let token = u32::from(cell & DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK);
+            let zero_based = token.wrapping_sub(1);
+            (
+                cell & DYNAMIC_NATIVE_ROWS_V3_ACCEPT_MASK != 0,
+                ((zero_based >> 15) == 0).then_some(zero_based),
+            )
+        }
+
+        fn zero_test_decode(cell: u16) -> DecodedCell {
+            let token = cell & DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK;
+            (
+                cell & DYNAMIC_NATIVE_ROWS_V3_ACCEPT_MASK != 0,
+                token.checked_sub(1).map(u32::from),
+            )
+        }
+
+        fn assert_x86_decode_shape(code: &[u8], context: &str) {
+            const TOKEN_MASK: [u8; 7] = [0x41, 0x81, 0xe2, 0xff, 0x7f, 0x00, 0x00];
+            const DECREMENT: [u8; 3] = [0x41, 0xff, 0xca];
+            const FORMER_MAX_COMPARE: [u8; 7] =
+                [0x41, 0x81, 0xfa, 0xfe, 0x7f, 0x00, 0x00];
+            const V1_TOKEN_MASK: [u8; 7] =
+                [0x41, 0x81, 0xe2, 0xff, 0xff, 0xff, 0x1f];
+            const V1_TEST: [u8; 3] = [0x45, 0x85, 0xd2];
+            const V1_SET_ROW: [u8; 6] = [0x45, 0x89, 0xd0, 0x41, 0xff, 0xc8];
+
+            let compact_decoders = code
+                .windows(TOKEN_MASK.len() + 6 + DECREMENT.len())
+                .filter(|window| {
+                    window.starts_with(&TOKEN_MASK)
+                        && window[TOKEN_MASK.len()..].starts_with(&[0x0f, 0x84])
+                        && window[TOKEN_MASK.len() + 6..].starts_with(&DECREMENT)
+                })
+                .count();
+            assert_eq!(
+                compact_decoders, 9,
+                "{context}: every immediate-shift V3 loop must branch on zero before decrement"
+            );
+            assert_eq!(
+                code.windows(FORMER_MAX_COMPARE.len())
+                    .filter(|window| *window == FORMER_MAX_COMPARE)
+                    .count(),
+                0,
+                "{context}: V3 must not retain the authenticated-range comparison"
+            );
+
+            let v1_prefix_bytes = V1_TOKEN_MASK.len() + V1_TEST.len();
+            let mut v1_decoders = code
+                .windows(v1_prefix_bytes)
+                .enumerate()
+                .filter(|(_, window)| {
+                    window.starts_with(&V1_TOKEN_MASK)
+                        && window[V1_TOKEN_MASK.len()..].starts_with(&V1_TEST)
+                });
+            let (v1_decoder, _) = v1_decoders
+                .next()
+                .unwrap_or_else(|| panic!("{context}: shared V1/V2 decoder is absent"));
+            assert_eq!(
+                v1_decoders.next(),
+                None,
+                "{context}: shared V1/V2 decoder must remain unique"
+            );
+            let branch = v1_decoder + v1_prefix_bytes;
+            let branch_bytes = match code.get(branch..) {
+                Some([0x74, _, ..]) => 2,
+                Some([0x0f, 0x84, _, _, _, _, ..]) => 6,
+                _ => panic!("{context}: shared V1/V2 zero branch changed"),
+            };
+            assert!(
+                code[branch + branch_bytes..].starts_with(&V1_SET_ROW),
+                "{context}: shared V1/V2 row decode changed after its zero branch"
+            );
+        }
+
+        fn assert_aarch64_decode_shape(code: &[u8], context: &str) {
+            let words = code
+                .chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            let compact_mask = aarch64_and_low_w(6, 8, 15).unwrap();
+            let compact_decrement = aarch64_sub_w_imm(6, 6, 1).unwrap();
+            let compact_decoders = words
+                .windows(3)
+                .filter(|window| {
+                    window[0] == compact_mask
+                        && window[1] & 0xff00_001f == 0x3400_0006
+                        && window[2] == compact_decrement
+                })
+                .count();
+            assert_eq!(
+                compact_decoders, 9,
+                "{context}: every immediate-shift V3 loop must CBZ before decrement"
+            );
+
+            let v1_mask = aarch64_and_low_w(8, 8, 29).unwrap();
+            let v1_set_row = aarch64_sub_w_imm(11, 8, 1).unwrap();
+            let v1_decoders = words
+                .windows(3)
+                .filter(|window| {
+                    window[0] == v1_mask
+                        && window[1] & 0xff00_001f == 0x3400_0008
+                        && window[2] == v1_set_row
+                })
+                .count();
+            assert_eq!(
+                v1_decoders, 1,
+                "{context}: the shared V1/V2 decoder must remain unchanged"
+            );
+        }
+
+        // A maximum-state V3 descriptor admits every low-token value in a
+        // logical cell, with either acceptance value. Iterating every raw u16
+        // therefore covers the union of all admitted logical cell classes.
+        // Padded cells have the stricter independently authenticated value 0.
+        for cell in u16::MIN..=u16::MAX {
+            let decoded = zero_test_decode(cell);
+            assert_eq!(former_x86_decode(cell), decoded, "x86 cell={cell:#06x}");
+            assert_eq!(
+                former_aarch64_decode(cell),
+                decoded,
+                "AArch64 cell={cell:#06x}"
+            );
+        }
+        for (cell, expected) in [
+            (0x0000_u16, (false, None)),
+            (0x8000_u16, (true, None)),
+            (0x0001_u16, (false, Some(0))),
+            (0x8001_u16, (true, Some(0))),
+            (0x7fff_u16, (false, Some(0x7ffe))),
+            (0xffff_u16, (true, Some(0x7ffe))),
+        ] {
+            assert_eq!(zero_test_decode(cell), expected);
+        }
+
+        for (output, exact_span_width) in [
+            (OutputContract::Exists, None),
+            (OutputContract::SelectedEnd, None),
+            (OutputContract::Span, Some(1)),
+            (OutputContract::Span, None),
+        ] {
+            let context = format!("{output:?}/width={exact_span_width:?}");
+            let x86 = lower_x86_64_dynamic_rows_prepared_for_output(
+                None,
+                FeatureSet::EMPTY,
+                output,
+                exact_span_width,
+                true,
+            )
+            .unwrap();
+            assert_x86_decode_shape(&x86.code, &context);
+
+            let arm = lower_aarch64_dynamic_rows_prepared_for_output(
+                None,
+                output,
+                exact_span_width,
+                true,
+            )
+            .unwrap();
+            assert_aarch64_decode_shape(&arm.code, &context);
+        }
     }
 
     #[test]
