@@ -21336,7 +21336,8 @@ mod tests {
 
     #[test]
     fn raw_byte_expansion_policy_preserves_mapped_fallbacks_and_exact_budgets() {
-        let packed_bytes = |state_count: usize| state_count * 256 * 2 + 256;
+        let packed_u16_bytes = |state_count: usize| state_count * 256 * 2 + 256;
+        let packed_u8_bytes = |state_count: usize| state_count * 256 + 256;
         assert!(!frozen_compact_raw_byte_is_admissible(
             FrozenCompactRowsFormat::StateOrdinalV3,
             128,
@@ -21345,7 +21346,7 @@ mod tests {
             usize::MAX,
         ));
 
-        let v3_bytes = packed_bytes(255);
+        let v3_bytes = packed_u16_bytes(255);
         assert!(frozen_compact_raw_byte_is_admissible(
             FrozenCompactRowsFormat::StateOrdinalV3,
             129,
@@ -21361,7 +21362,7 @@ mod tests {
             v3_bytes - 1,
         ));
 
-        let v9_bytes = packed_bytes(127);
+        let v9_bytes = packed_u16_bytes(127);
         assert!(frozen_compact_raw_byte_is_admissible(
             FrozenCompactRowsFormat::CellOffsetV4,
             129,
@@ -21387,6 +21388,70 @@ mod tests {
         ));
         assert!(mapped_v4_bytes <= v9_bytes - 1);
 
+        let v10_bytes = packed_u8_bytes(127);
+        assert!(v10_bytes < v9_bytes);
+        assert!(frozen_compact_raw_byte_u8_is_admissible(
+            129,
+            127,
+            v10_bytes,
+            v10_bytes,
+        ));
+        assert!(!frozen_compact_raw_byte_u8_is_admissible(
+            128,
+            127,
+            usize::MAX,
+            usize::MAX,
+        ));
+        assert!(!frozen_compact_raw_byte_u8_is_admissible(
+            129,
+            128,
+            usize::MAX,
+            usize::MAX,
+        ));
+        assert!(!frozen_compact_raw_byte_u8_is_admissible(
+            129,
+            127,
+            v10_bytes,
+            v10_bytes - 1,
+        ));
+        let mapped_v12_bytes = 127 * 128 + 256;
+        assert!(frozen_compact_mapped_u8_is_admissible(
+            65,
+            127,
+            mapped_v12_bytes,
+            mapped_v12_bytes,
+        ));
+        assert!(!frozen_compact_mapped_u8_is_admissible(
+            65,
+            128,
+            usize::MAX,
+            usize::MAX,
+        ));
+        assert!(!frozen_compact_mapped_u8_is_admissible(
+            65,
+            127,
+            mapped_v12_bytes,
+            mapped_v12_bytes - 1,
+        ));
+
+        let mapped_v12_projection = FrozenCompactColumnProjection {
+            class_count: 65,
+            source_classes: core::array::from_fn(|class| u8::try_from(class.min(64)).unwrap()),
+            class_map: core::array::from_fn(|byte| u8::try_from(byte % 65).unwrap()),
+        };
+        let (retained_v12, retained_v12_format) = promote_frozen_compact_raw_byte_projection(
+            mapped_v12_projection.clone(),
+            FrozenCompactRowsFormat::CellOffsetV4,
+            127,
+            mapped_v12_bytes,
+            mapped_v12_bytes,
+        );
+        assert_eq!(retained_v12, mapped_v12_projection);
+        assert_eq!(
+            retained_v12_format,
+            FrozenCompactRowsFormat::StateOrdinalMappedU8V12
+        );
+
         let mapped_projection = FrozenCompactColumnProjection {
             class_count: 129,
             source_classes: core::array::from_fn(|class| u8::try_from(class.min(128)).unwrap()),
@@ -21397,7 +21462,7 @@ mod tests {
             FrozenCompactRowsFormat::CellOffsetV4,
             127,
             usize::MAX,
-            v9_bytes - 1,
+            v10_bytes - 1,
         );
         assert_eq!(retained, mapped_projection);
         assert_eq!(retained_format, FrozenCompactRowsFormat::CellOffsetV4);
@@ -21405,12 +21470,29 @@ mod tests {
             mapped_projection.clone(),
             FrozenCompactRowsFormat::CellOffsetV4,
             127,
-            v9_bytes,
-            v9_bytes,
+            v10_bytes,
+            v10_bytes,
         );
         assert_eq!(expanded.class_count, 256);
         assert!(frozen_dynamic_class_map_is_identity(&expanded.class_map));
-        assert_eq!(expanded_format, FrozenCompactRowsFormat::CellOffsetDirectV9);
+        assert_eq!(
+            expanded_format,
+            FrozenCompactRowsFormat::StateOrdinalDirectU8V10
+        );
+        let (expanded, expanded_format) = promote_frozen_compact_raw_byte_projection(
+            mapped_projection.clone(),
+            FrozenCompactRowsFormat::StateOrdinalV3,
+            128,
+            packed_u16_bytes(128),
+            packed_u16_bytes(128),
+        );
+        assert_eq!(expanded.class_count, 256);
+        assert!(frozen_dynamic_class_map_is_identity(&expanded.class_map));
+        assert_eq!(
+            expanded_format,
+            FrozenCompactRowsFormat::StateOrdinalDirectV8,
+            "state 128 cannot fit V10 and must retain the exact u16 fallback"
+        );
         let (expanded, expanded_format) = promote_frozen_compact_raw_byte_projection(
             mapped_projection,
             FrozenCompactRowsFormat::StateOrdinalV3,
@@ -21431,6 +21513,35 @@ mod tests {
                 source_classes: [0; 256],
                 class_map: [0; 256],
             })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn compact_u8_v10_v12_cell_encoding_is_exhaustive_at_the_token_boundary() {
+        for token in 0_u16..=u16::from(DYNAMIC_NATIVE_ROWS_V10_NEXT_STATE_TOKEN_MASK) {
+            for accepting in [false, true] {
+                let semantic = token
+                    | if accepting {
+                        DYNAMIC_NATIVE_ROWS_V3_ACCEPT_MASK
+                    } else {
+                        0
+                    };
+                let compact = encode_frozen_compact_u8_cell(semantic).unwrap();
+                assert_eq!(
+                    compact & DYNAMIC_NATIVE_ROWS_V10_NEXT_STATE_TOKEN_MASK,
+                    u8::try_from(token).unwrap()
+                );
+                assert_eq!(
+                    compact & DYNAMIC_NATIVE_ROWS_V10_ACCEPT_MASK != 0,
+                    accepting
+                );
+            }
+        }
+        assert!(
+            encode_frozen_compact_u8_cell(
+                u16::from(DYNAMIC_NATIVE_ROWS_V10_NEXT_STATE_TOKEN_MASK) + 1
+            )
             .is_none()
         );
     }
@@ -21785,6 +21896,330 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::items_after_statements,
+        clippy::too_many_lines,
+        reason = "one compact oracle covers V12 packing, publication, coexistence, and fail-closed ownership"
+    )]
+    fn mapped_compact_u8_v12_is_closed_padded_inline_and_additive() {
+        let compiled = program(
+            r"(?:ab|ac)+z",
+            OutputContract::Exists,
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+        );
+        let workspace = compiled.prepare_workspace().unwrap();
+        let retained_bytes = workspace.compiler_private_k0_retained_bytes();
+        let maximum_owner = compiled
+            .compiler_private_frozen_dynamic_rows_storage_v3(
+                &workspace,
+                retained_bytes,
+                usize::MAX,
+            )
+            .expect("complete maximum compact owner");
+        assert!(maximum_owner.descriptor_is_valid_for(compiled.identity));
+        if maximum_owner.descriptor_v6.is_some() {
+            assert!(matches!(
+                maximum_owner.descriptor.format_version,
+                FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION
+                    | FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION
+            ));
+        } else {
+            assert_eq!(
+                maximum_owner.descriptor.format_version,
+                FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION
+            );
+        }
+        let state_count = usize::try_from(maximum_owner.descriptor.state_count).unwrap();
+        let class_count = usize::try_from(maximum_owner.descriptor.class_count).unwrap();
+        let mapped_format = select_frozen_compact_rows_format(state_count, class_count).unwrap();
+        let mapped_physical_cells = if mapped_format.is_state_ordinal() {
+            class_count.checked_next_power_of_two().unwrap()
+        } else {
+            class_count
+        };
+        let selection_budget = state_count
+            .checked_mul(mapped_physical_cells)
+            .and_then(|cells| cells.checked_mul(core::mem::size_of::<u16>()))
+            .and_then(|bytes| bytes.checked_add(256))
+            .unwrap();
+        drop(maximum_owner);
+
+        // The inherited mapped-u16 budget admits the general compact owner,
+        // but cannot also retain any V6/V7 loop payload. Arbitration therefore
+        // reaches V12 without weakening either resource authority.
+        assert!(
+            compiled
+                .compiler_private_frozen_dynamic_rows_storage_v3(
+                    &workspace,
+                    retained_bytes,
+                    selection_budget.saturating_sub(1),
+                )
+                .is_none()
+        );
+        let mut storage = compiled
+            .compiler_private_frozen_dynamic_rows_storage_v3(
+                &workspace,
+                retained_bytes,
+                selection_budget,
+            )
+            .expect("resource-arbitrated mapped compact-u8 V12 sidecar");
+        assert!(storage.descriptor_is_valid_for(compiled.identity));
+        assert!(storage.descriptor_v6_is_valid_for(compiled.identity));
+        assert!(storage.descriptor_v6.is_none());
+        assert!(storage.loop_index.is_empty());
+        assert!(storage.loop_scanners.is_empty());
+        assert_eq!(storage.descriptor.ready_seal, 0);
+        assert_eq!(
+            storage.descriptor.format_version,
+            FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION
+        );
+        assert_eq!(storage.descriptor.learned_loop_state_count, 0);
+        assert_eq!(storage.descriptor.learned_loop_states, [u32::MAX; 4]);
+        assert_eq!(storage.descriptor.initial_state, 0);
+
+        assert_eq!(
+            usize::try_from(storage.descriptor.state_count).unwrap(),
+            state_count
+        );
+        assert_eq!(
+            usize::try_from(storage.descriptor.class_count).unwrap(),
+            class_count
+        );
+        assert!(state_count <= usize::from(DYNAMIC_NATIVE_ROWS_V12_NEXT_STATE_TOKEN_MASK));
+        assert!(class_count < FROZEN_COMPACT_DIRECT_BYTE_MIN_CLASSES);
+        let physical_cells = class_count.checked_next_power_of_two().unwrap();
+        assert!(physical_cells < 256);
+        assert_eq!(storage.descriptor.row_shift, physical_cells.trailing_zeros());
+        assert!(storage.rows.is_empty());
+        assert_eq!(storage.rows_u8.as_ref().unwrap().len(), state_count * physical_cells);
+        let packed_bytes = storage.rows_u8.as_ref().unwrap().len() + 256;
+        assert!(packed_bytes <= selection_budget);
+
+        let wide = compiled
+            .compiler_private_frozen_dynamic_rows_storage(
+                &workspace,
+                retained_bytes,
+                usize::MAX,
+            )
+            .expect("coexisting V2 sidecar");
+        assert_ne!(
+            wide.descriptor.learned_loop_row_count, 0,
+            "the fixture must prove V12 keeps a graph whose mutable projection owns learned loops"
+        );
+        assert_eq!(storage.descriptor.learned_loop_state_count, 0);
+        assert_eq!(storage.descriptor.learned_loop_states, [u32::MAX; 4]);
+        let source_class_count = usize::try_from(wide.descriptor.row_stride).unwrap();
+        assert!(source_class_count >= class_count);
+        assert_eq!(wide.rows.len() / source_class_count, state_count);
+        assert!(packed_bytes <= wide.rows.len() * core::mem::size_of::<u32>() + 256);
+        let source_initial_row = usize::try_from(wide.descriptor.initial_row).unwrap();
+        assert_eq!(source_initial_row % source_class_count, 0);
+        let source_initial_state = source_initial_row / source_class_count;
+        assert!(source_initial_state < state_count);
+        for state in 0..state_count {
+            let source_state =
+                canonicalize_frozen_state_ordinal(state, source_initial_state);
+            for byte in 0..=usize::from(u8::MAX) {
+                let source_class = usize::from(wide.class_map[byte]);
+                let compact_class = usize::from(storage.class_map[byte]);
+                let wide_cell =
+                    wide.rows[source_state * source_class_count + source_class];
+                let compact_cell = storage.rows_u8.as_ref().unwrap()
+                    [state * physical_cells + compact_class];
+                let source_token = wide_cell & DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK;
+                let expected_token = if source_token == 0 {
+                    0
+                } else {
+                    let source_destination =
+                        usize::try_from(source_token - 1).unwrap() / source_class_count;
+                    let destination = canonicalize_frozen_state_ordinal(
+                        source_destination,
+                        source_initial_state,
+                    );
+                    u8::try_from(destination + 1).unwrap()
+                };
+                assert_eq!(
+                    compact_cell & DYNAMIC_NATIVE_ROWS_V12_NEXT_STATE_TOKEN_MASK,
+                    expected_token
+                );
+                assert_eq!(
+                    compact_cell & DYNAMIC_NATIVE_ROWS_V12_ACCEPT_MASK != 0,
+                    wide_cell & DYNAMIC_NATIVE_ROWS_V1_ACCEPT_MASK != 0
+                );
+            }
+            assert!(storage.rows_u8.as_ref().unwrap()
+                [state * physical_cells + class_count..(state + 1) * physical_cells]
+                .iter()
+                .all(|&cell| cell == DYNAMIC_NATIVE_ROWS_V12_DEAD_CELL));
+        }
+
+        let rows_address = storage.descriptor.rows_address;
+        let mut owners = vec![storage];
+        storage = owners.pop().unwrap();
+        assert_eq!(storage.descriptor.rows_address, rows_address);
+        assert!(storage.descriptor_is_valid_for(compiled.identity));
+
+        let mut header = compiled.compiler_private_frozen_prepared_header_v6(
+            &workspace,
+            None,
+            Some(&storage),
+        );
+        assert!(header.is_active());
+        assert!(header.has_dynamic_rows());
+        assert_eq!(std::mem::size_of_val(&header), FROZEN_PREPARED_HEADER_V6_BYTES);
+        assert_eq!(header.v1.flags, FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V12);
+        assert_eq!(header.v1.header_bytes, FROZEN_PREPARED_HEADER_V12_BYTES);
+        assert_eq!(header.v1.artifact_identity, compiled.identity.artifact);
+        assert_eq!(header.v1.forward_rows_address, rows_address);
+        assert_eq!(header.v1.forward_live_cells, storage.rows_u8.as_ref().unwrap().len());
+        assert_eq!(usize::try_from(header.v1.row_stride).unwrap(), physical_cells);
+        assert_eq!(header.v1.forward_initial_row, 0);
+        assert_eq!(header.v1.class_map, storage.class_map);
+        assert_eq!(
+            header.dynamic_rows_v6.compact.ready_seal,
+            FROZEN_PREPARED_HEADER_V12_READY_SEAL
+        );
+        let mut cross_format = compiled.compiler_private_frozen_prepared_header_v6(
+            &workspace,
+            None,
+            Some(&storage),
+        );
+        cross_format.v1.flags = FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3;
+        assert!(!cross_format.has_dynamic_rows());
+        cross_format = compiled.compiler_private_frozen_prepared_header_v6(
+            &workspace,
+            None,
+            Some(&storage),
+        );
+        cross_format.dynamic_rows_v6.compact.format_version = FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION;
+        assert!(!cross_format.has_dynamic_rows());
+        cross_format = compiled.compiler_private_frozen_prepared_header_v6(
+            &workspace,
+            None,
+            Some(&storage),
+        );
+        cross_format.dynamic_rows_v6.compact.ready_seal = FROZEN_PREPARED_HEADER_V3_READY_SEAL;
+        assert!(!cross_format.has_dynamic_rows());
+        let mut revoked = compiled.compiler_private_frozen_prepared_header_v6(
+            &workspace,
+            None,
+            Some(&storage),
+        );
+        revoked.deactivate();
+        assert!(!revoked.is_active());
+        assert!(!revoked.has_dynamic_rows());
+        assert_eq!(revoked.dynamic_rows_v6.compact.ready_seal, 0);
+
+        // The active V12 seal is a revocable capability for setup-validated
+        // write-once geometry. Revocation changes only the two seals; every
+        // field consumed by the compact native loop remains immutable and no
+        // public operation can reactivate this allocation.
+        let published_tail = header.dynamic_rows_v6.compact;
+        let published_class_map = header.v1.class_map;
+        header.deactivate();
+        assert!(!header.is_active());
+        assert!(!header.has_dynamic_rows());
+        assert_eq!(header.v1.active_seal, 0);
+        let mut revoked_tail = published_tail;
+        revoked_tail.ready_seal = 0;
+        assert_eq!(header.dynamic_rows_v6.compact, revoked_tail);
+        assert_eq!(header.v1.flags, FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V12);
+        assert_eq!(header.v1.header_bytes, FROZEN_PREPARED_HEADER_V12_BYTES);
+        assert_eq!(header.v1.artifact_identity, compiled.identity.artifact);
+        assert_eq!(header.v1.forward_rows_address, rows_address);
+        assert_eq!(header.v1.forward_live_cells, storage.rows_u8.as_ref().unwrap().len());
+        assert_eq!(header.v1.cache_identity, published_tail.cache_identity);
+        assert_eq!(usize::try_from(header.v1.row_stride).unwrap(), physical_cells);
+        assert_eq!(
+            usize::try_from(header.v1.forward_initial_row).unwrap(),
+            usize::try_from(published_tail.initial_state).unwrap() * physical_cells
+        );
+        assert_eq!(header.v1.class_map, published_class_map);
+
+        let v2 = compiled.compiler_private_frozen_prepared_header_v2(
+            &workspace,
+            None,
+            Some(&wide),
+        );
+        assert!(v2.has_dynamic_rows());
+        assert_eq!(v2.v1.flags, FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS);
+        assert_eq!(v2.v1.header_bytes, FROZEN_PREPARED_HEADER_V2_BYTES);
+
+        let valid_descriptor = storage.descriptor;
+        macro_rules! reject_descriptor {
+            ($mutation:block) => {{
+                storage.descriptor = valid_descriptor;
+                $mutation
+                assert!(!storage.descriptor_is_valid_for(compiled.identity));
+            }};
+        }
+        reject_descriptor!({ storage.descriptor.ready_seal = 1; });
+        reject_descriptor!({ storage.descriptor.rows_address = 0; });
+        reject_descriptor!({ storage.descriptor.cache_identity = 0; });
+        reject_descriptor!({ storage.descriptor.state_count = 0; });
+        reject_descriptor!({ storage.descriptor.class_count = 0; });
+        reject_descriptor!({ storage.descriptor.row_shift = 9; });
+        if storage.descriptor.state_count > 1 {
+            reject_descriptor!({ storage.descriptor.initial_state = 1; });
+        }
+        reject_descriptor!({ storage.descriptor.learned_loop_state_count = 5; });
+        reject_descriptor!({ storage.descriptor.learned_loop_states[0] = 0; });
+        reject_descriptor!({
+            storage.descriptor.format_version = FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION;
+        });
+        reject_descriptor!({ storage.descriptor.format_version = 2; });
+
+        storage.descriptor = valid_descriptor;
+        assert!(state_count < usize::from(DYNAMIC_NATIVE_ROWS_V12_NEXT_STATE_TOKEN_MASK));
+        let first_cell = storage.rows_u8.as_ref().unwrap()[0];
+        storage.rows_u8.as_mut().unwrap()[0] = u8::try_from(state_count + 1).unwrap();
+        assert!(!storage.descriptor_is_valid_for(compiled.identity));
+        storage.rows_u8.as_mut().unwrap()[0] = first_cell;
+        if physical_cells > class_count {
+            let padding = class_count;
+            storage.rows_u8.as_mut().unwrap()[padding] = 1;
+            assert!(!storage.descriptor_is_valid_for(compiled.identity));
+            storage.rows_u8.as_mut().unwrap()[padding] = DYNAMIC_NATIVE_ROWS_V12_DEAD_CELL;
+        }
+        let original_class = storage.class_map[0];
+        storage.class_map[0] = u8::try_from(class_count).unwrap();
+        assert!(!storage.descriptor_is_valid_for(compiled.identity));
+        storage.class_map[0] = original_class;
+        assert!(storage.descriptor_is_valid_for(compiled.identity));
+
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let nullable = program(
+                r"a*",
+                output,
+                CompileMode::Optimizing,
+                DeterminizeLimits {
+                    max_states: 0,
+                    ..DeterminizeLimits::default()
+                },
+            );
+            let nullable_workspace = nullable.prepare_workspace().unwrap();
+            assert!(
+                nullable
+                    .compiler_private_frozen_dynamic_rows_storage_v3(
+                        &nullable_workspace,
+                        usize::MAX,
+                        usize::MAX,
+                    )
+                    .is_none(),
+                "a nullable/terminal {output:?} root must retain portable initial settlement"
+            );
+        }
+    }
+
+    #[test]
     fn unary_exists_v5_is_distinct_exact_and_fail_closed() {
         let compiled = program(
             r"(?s-u:.{3,})",
@@ -21900,16 +22335,40 @@ mod tests {
             )
             .expect("SelectedEnd unary compact owner");
         assert_eq!(selected_storage.descriptor.class_count, 1);
+        assert_eq!(
+            selected_storage.descriptor.format_version,
+            FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION,
+            "without the Exists-only V5 proof, the general mapped-u8 promotion must remain available"
+        );
+        assert_eq!(selected_storage.descriptor.row_shift, 0);
+        assert!(selected_storage.rows.is_empty());
+        assert!(selected_storage.rows_u8.is_some());
         assert_eq!(selected_storage.unary_exists_first_accept_step, None);
-        let selected_header = selected.compiler_private_frozen_prepared_header_v5(
+        let selected_header = selected.compiler_private_frozen_prepared_header_v6(
             &selected_workspace,
             None,
             Some(&selected_storage),
         );
+        assert!(selected_header.is_active());
+        assert!(selected_header.has_dynamic_rows());
+        assert_eq!(
+            std::mem::size_of_val(&selected_header),
+            FROZEN_PREPARED_HEADER_V6_BYTES,
+            "the runtime retains one physical maximum compact owner"
+        );
         assert_eq!(
             selected_header.v1.flags,
-            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V4,
-            "non-Exists outputs retain their established compact loop"
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V12,
+            "non-Exists outputs must decline V5 without suppressing general V12 rows"
+        );
+        assert_eq!(selected_header.v1.header_bytes, FROZEN_PREPARED_HEADER_V12_BYTES);
+        assert_eq!(
+            selected_header.dynamic_rows_v6.compact.format_version,
+            FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION
+        );
+        assert_eq!(
+            selected_header.dynamic_rows_v6.compact.ready_seal,
+            FROZEN_PREPARED_HEADER_V12_READY_SEAL
         );
     }
 
