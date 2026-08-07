@@ -468,7 +468,11 @@ impl Inspection<'_> {
 
         let mut literal_limits: LiteralSetBuildLimits = limits.literal_set;
         literal_limits.max_pattern_bytes = literal_limits.max_pattern_bytes.min(MAX_LITERAL_BYTES);
-        literal_limits.max_build_bytes = literal_limits.max_build_bytes.min(component_budget);
+        // `available_persistent_bytes` is a retained-storage allowance. Do not
+        // also treat it as a transient construction allowance: the literal
+        // builder's separately supplied `max_build_bytes` already accounts for
+        // that resource, and its conservative build envelope may exceed the
+        // finished literal and prefix plans even when both fit exactly.
         literal_limits.max_persistent_bytes = literal_limits
             .max_persistent_bytes
             .min(component_budget);
@@ -1602,6 +1606,7 @@ mod tests {
             .search_session(exact_limits)
             .expect("exact aggregate session limits admit both owners");
         let PortableSearchSessionPlan::K0 {
+            session: exact_primary,
             aggregate_setup: exact_setup,
             reverse_inner: Some(_),
             ..
@@ -1609,14 +1614,31 @@ mod tests {
         else {
             panic!("exact aggregate limits must retain the sidecar");
         };
-        assert_eq!(*exact_setup, *aggregate_setup);
+        // A finite setup-work cap can decline an optional root-run inspection
+        // whose conservative prospective envelope fit under the unlimited
+        // construction. The same primary and sidecar storage must remain
+        // admitted, while actual setup work may consequently decrease.
+        assert!(exact_setup.work() <= aggregate_setup.work());
+        assert_eq!(
+            exact_setup.retained_bytes(),
+            aggregate_setup.retained_bytes()
+        );
+        assert_eq!(
+            exact_setup.allocated_bytes(),
+            aggregate_setup.allocated_bytes()
+        );
+        assert_eq!(
+            exact_setup.initialized_bytes(),
+            aggregate_setup.initialized_bytes()
+        );
 
-        assert!(primary_setup.work() < exact_limits.max_setup_work);
+        let exact_primary_setup = exact_primary.construction_accounting();
+        assert!(exact_primary_setup.work() < exact_limits.max_setup_work);
         let one_below = regex
             .search_session(SearchSessionLimits {
                 // This leaves zero work after the primary receipt, one below
                 // even the sidecar owner's mandatory publication charge.
-                max_setup_work: primary_setup.work(),
+                max_setup_work: exact_primary_setup.work(),
                 max_scratch_bytes: exact_limits.max_scratch_bytes,
             })
             .expect("optional sidecar decline preserves the primary session");
@@ -1697,8 +1719,11 @@ mod tests {
     }
 
     fn bounded_facade_composition_fixture() -> crate::PortableRegex {
+        // Spell every finite run without repetition combinators so the
+        // fixture's selected graph cut structurally retains the finite root
+        // distance required by the composition test below.
         let pattern =
-            r"(?:[a-h]{2}|[m-z]{3}){1,4}(?:ca|delta|echo777|foxtrot99)(?:_[A-Z]{2}|:[0-9]{3})Z";
+            r"(?:[a-h][a-h]|[m-z][m-z][m-z])(?:ca|delta|echo777|foxtrot99)(?:_[A-Z][A-Z]|:[0-9][0-9][0-9])Z";
         let regex = PortableBuilder::new(pattern)
             .unicode(false)
             .build()
