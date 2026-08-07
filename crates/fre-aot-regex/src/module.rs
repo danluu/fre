@@ -36495,6 +36495,7 @@ int main(void) {{
                 [0x41, 0x81, 0xe2, 0xff, 0xff, 0xff, 0x1f];
             const V1_TEST: [u8; 3] = [0x45, 0x85, 0xd2];
             const V1_SET_ROW: [u8; 6] = [0x45, 0x89, 0xd0, 0x41, 0xff, 0xc8];
+            const V1_SET_POINTER_ROW: [u8; 5] = [0x4e, 0x8d, 0x44, 0x96, 0xfc];
 
             let compact_decoders = code
                 .windows(TOKEN_MASK.len() + 6 + DECREMENT.len())
@@ -36517,30 +36518,47 @@ int main(void) {{
             );
 
             let v1_prefix_bytes = V1_TOKEN_MASK.len() + V1_TEST.len();
-            let mut v1_decoders = code
+            let v1_decoders = code
                 .windows(v1_prefix_bytes)
                 .enumerate()
                 .filter(|(_, window)| {
                     window.starts_with(&V1_TOKEN_MASK)
                         && window[V1_TOKEN_MASK.len()..].starts_with(&V1_TEST)
-                });
-            let (v1_decoder, _) = v1_decoders
-                .next()
-                .unwrap_or_else(|| panic!("{context}: shared V1/V2 decoder is absent"));
+                })
+                .map(|(decoder, _)| {
+                    let branch = decoder + v1_prefix_bytes;
+                    let branch_bytes = match code.get(branch..) {
+                        Some([0x74, _, ..]) => 2,
+                        Some([0x0f, 0x84, _, _, _, _, ..]) => 6,
+                        _ => panic!("{context}: V1/V2 zero branch changed"),
+                    };
+                    branch + branch_bytes
+                })
+                .collect::<Vec<_>>();
             assert_eq!(
-                v1_decoders.next(),
-                None,
-                "{context}: shared V1/V2 decoder must remain unique"
+                v1_decoders.len(),
+                2,
+                "{context}: offset-row and pointer-row V1/V2 decoders must remain disjoint"
             );
-            let branch = v1_decoder + v1_prefix_bytes;
-            let branch_bytes = match code.get(branch..) {
-                Some([0x74, _, ..]) => 2,
-                Some([0x0f, 0x84, _, _, _, _, ..]) => 6,
-                _ => panic!("{context}: shared V1/V2 zero branch changed"),
-            };
-            assert!(
-                code[branch + branch_bytes..].starts_with(&V1_SET_ROW),
-                "{context}: shared V1/V2 row decode changed after its zero branch"
+            assert_eq!(
+                v1_decoders
+                    .iter()
+                    .filter(|&&after_branch| {
+                        code[after_branch..].starts_with(&V1_SET_ROW)
+                    })
+                    .count(),
+                1,
+                "{context}: the offset-row V1/V2 decoder changed"
+            );
+            assert_eq!(
+                v1_decoders
+                    .iter()
+                    .filter(|&&after_branch| {
+                        code[after_branch..].starts_with(&V1_SET_POINTER_ROW)
+                    })
+                    .count(),
+                1,
+                "{context}: the pointer-row V1/V2 decoder changed"
             );
         }
 
@@ -36566,17 +36584,36 @@ int main(void) {{
 
             let v1_mask = aarch64_and_low_w(8, 8, 29).unwrap();
             let v1_set_row = aarch64_sub_w_imm(11, 8, 1).unwrap();
+            let v1_set_pointer_row = aarch64_add_x_lsl(11, 15, 8, 2).unwrap();
             let v1_decoders = words
-                .windows(3)
-                .filter(|window| {
+                .windows(2)
+                .enumerate()
+                .filter(|(_, window)| {
                     window[0] == v1_mask
                         && window[1] & 0xff00_001f == 0x3400_0008
-                        && window[2] == v1_set_row
                 })
-                .count();
+                .map(|(decoder, _)| decoder + 2)
+                .collect::<Vec<_>>();
             assert_eq!(
-                v1_decoders, 1,
-                "{context}: the shared V1/V2 decoder must remain unchanged"
+                v1_decoders.len(),
+                2,
+                "{context}: offset-row and pointer-row V1/V2 decoders must remain disjoint"
+            );
+            assert_eq!(
+                v1_decoders
+                    .iter()
+                    .filter(|&&after_branch| words[after_branch] == v1_set_row)
+                    .count(),
+                1,
+                "{context}: the offset-row V1/V2 decoder must remain unchanged"
+            );
+            assert_eq!(
+                v1_decoders
+                    .iter()
+                    .filter(|&&after_branch| words[after_branch] == v1_set_pointer_row)
+                    .count(),
+                1,
+                "{context}: the pointer-row V1/V2 decoder must remain unchanged"
             );
         }
 
