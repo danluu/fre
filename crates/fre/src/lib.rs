@@ -9942,15 +9942,17 @@ enum K0PackedFrontierExistsRoute {
 
 /// Four exact-window classes without `Option` inflation. The immutable K0 plan
 /// selects this state only for its mutually exclusive packed-frontier route;
-/// on 64-bit targets its 112-byte layout is no larger than the correlated
+/// on 64-bit targets its 144-byte layout is no larger than the correlated
 /// Exists policy it replaces in the session.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct K0PackedFrontierExistsState {
     classes: [K0PackedFrontierExistsClassState; K0_PACKED_FRONTIER_EXISTS_STATE_SLOTS],
+    exact_floor_witness_starts: [usize; K0_PACKED_FRONTIER_EXISTS_STATE_SLOTS],
     // Low four bits are occupied classes. High four bits mark classes whose
     // most recent non-decisive packed observation was structurally shallow.
     occupied: u8,
+    exact_floor_witnesses: u8,
     preferences: u8,
     direct_remaining: [u8; K0_PACKED_FRONTIER_EXISTS_STATE_SLOTS],
     structural_epoch_stage: [u8; K0_PACKED_FRONTIER_EXISTS_STATE_SLOTS],
@@ -9962,7 +9964,9 @@ impl Default for K0PackedFrontierExistsState {
         Self {
             classes: [K0PackedFrontierExistsClassState::EMPTY;
                 K0_PACKED_FRONTIER_EXISTS_STATE_SLOTS],
+            exact_floor_witness_starts: [0; K0_PACKED_FRONTIER_EXISTS_STATE_SLOTS],
             occupied: 0,
+            exact_floor_witnesses: 0,
             preferences: 0,
             direct_remaining: [0; K0_PACKED_FRONTIER_EXISTS_STATE_SLOTS],
             structural_epoch_stage: [0; K0_PACKED_FRONTIER_EXISTS_STATE_SLOTS],
@@ -9988,6 +9992,22 @@ impl K0PackedFrontierExistsState {
             self.occupied |= mask;
         } else {
             self.occupied &= !mask;
+        }
+    }
+
+    fn exact_floor_witness(&self, index: usize) -> Option<usize> {
+        (self.exact_floor_witnesses & (1_u8 << index) != 0)
+            .then_some(self.exact_floor_witness_starts[index])
+    }
+
+    fn set_exact_floor_witness(&mut self, index: usize, witness_start: Option<usize>) {
+        let mask = 1_u8 << index;
+        if let Some(witness_start) = witness_start {
+            self.exact_floor_witness_starts[index] = witness_start;
+            self.exact_floor_witnesses |= mask;
+        } else {
+            self.exact_floor_witness_starts[index] = 0;
+            self.exact_floor_witnesses &= !mask;
         }
     }
 
@@ -10039,6 +10059,7 @@ impl K0PackedFrontierExistsState {
         };
         self.occupied |= 1_u8 << index;
         self.set_structural_direct(index, false);
+        self.set_exact_floor_witness(index, None);
         self.set_preference(
             index,
             K0PackedFrontierExistsPreference::ObserveColdPacked,
@@ -10158,6 +10179,29 @@ impl K0PackedFrontierExistsState {
         self.observe_incumbent(class_index, packed_positive, false, observation);
     }
 
+    fn renew_exact_floor_direct(&mut self, class_index: usize) {
+        debug_assert_eq!(
+            self.preference(class_index),
+            K0PackedFrontierExistsPreference::RetainIncumbent,
+        );
+        debug_assert_eq!(self.direct_remaining[class_index], 1);
+        debug_assert!(self.is_structural_direct(class_index));
+        debug_assert!(self.exact_floor_witness(class_index).is_some());
+        self.direct_remaining[class_index] = self.next_direct_epoch_calls(class_index);
+    }
+
+    fn expire_exact_floor_direct(&mut self, class_index: usize) {
+        self.classes[class_index].packed_residual_work = 0;
+        self.set_structural_direct(class_index, false);
+        self.set_exact_floor_witness(class_index, None);
+        self.set_preference(
+            class_index,
+            K0PackedFrontierExistsPreference::ObserveColdPacked,
+        );
+        self.direct_remaining[class_index] = 0;
+        self.reset_direct_stability(class_index);
+    }
+
     fn observe_packed(
         &mut self,
         class_index: usize,
@@ -10179,6 +10223,7 @@ impl K0PackedFrontierExistsState {
                 // and a structural Direct preference immediately.
                 self.classes[class_index].packed_residual_work = 0;
                 self.set_structural_direct(class_index, false);
+                self.set_exact_floor_witness(class_index, None);
                 self.set_preference(
                     class_index,
                     K0PackedFrontierExistsPreference::ObserveColdPacked,
@@ -10187,7 +10232,7 @@ impl K0PackedFrontierExistsState {
                 self.reset_direct_stability(class_index);
                 return;
             }
-            K0PackedFrontierObservation::ExactFloorDirect => {
+            K0PackedFrontierObservation::ExactFloorDirect { witness_start } => {
                 // This packed-positive call executed the incumbent over the
                 // exact original window after paying an additional packed
                 // pass. Direct therefore dominates structurally without a
@@ -10195,6 +10240,7 @@ impl K0PackedFrontierExistsState {
                 // epoch so a same-address source mutation is still reprobed.
                 self.classes[class_index].packed_residual_work = 0;
                 self.set_structural_direct(class_index, true);
+                self.set_exact_floor_witness(class_index, Some(witness_start));
                 self.set_preference(
                     class_index,
                     K0PackedFrontierExistsPreference::RetainIncumbent,
@@ -10210,6 +10256,7 @@ impl K0PackedFrontierExistsState {
                 self.classes[class_index].packed_residual_work =
                     positive.residual_work;
                 self.set_structural_direct(class_index, true);
+                self.set_exact_floor_witness(class_index, None);
                 self.set_preference(
                     class_index,
                     K0PackedFrontierExistsPreference::TrialIncumbent,
@@ -10226,6 +10273,7 @@ impl K0PackedFrontierExistsState {
         // tail over the original window, so the next Direct trial is warm and
         // needs no redundant second packed observation.
         self.set_structural_direct(class_index, true);
+        self.set_exact_floor_witness(class_index, None);
         if preference == K0PackedFrontierExistsPreference::ObserveColdPacked
             && self.direct_remaining[class_index] != 0
         {
@@ -10289,6 +10337,7 @@ impl K0PackedFrontierExistsState {
             // conservatively before another calibration.
             self.classes[class_index].packed_residual_work = 0;
             self.set_structural_direct(class_index, false);
+            self.set_exact_floor_witness(class_index, None);
             self.reset_direct_stability(class_index);
             self.set_preference(
                 class_index,
@@ -10367,7 +10416,7 @@ impl K0PackedFrontierIncumbentObservation {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum K0PackedFrontierObservation {
     Absent,
-    ExactFloorDirect,
+    ExactFloorDirect { witness_start: usize },
     Comparable(K0PackedFrontierPositiveObservation),
     ShallowCompletion(K0PackedFrontierPositiveObservation),
     ProductiveOrDeep,
@@ -10375,6 +10424,7 @@ enum K0PackedFrontierObservation {
 
 fn classify_k0_packed_frontier_positive(
     window_start: usize,
+    witness_start: usize,
     floor: usize,
     minimum_useful_progress_bytes: usize,
     residual_work: u64,
@@ -10384,7 +10434,7 @@ fn classify_k0_packed_frontier_positive(
         .checked_sub(window_start)
         .expect("the packed-frontier floor was window-validated");
     if progress == 0 {
-        K0PackedFrontierObservation::ExactFloorDirect
+        K0PackedFrontierObservation::ExactFloorDirect { witness_start }
     } else if progress < minimum_useful_progress_bytes {
         K0PackedFrontierObservation::ShallowCompletion(positive)
     } else {
@@ -10456,6 +10506,27 @@ impl<'p, 's, 'a, 'h> K0PackedFrontierExistsReceipt<'p, 's, 'a, 'h> {
         }))
     }
 
+    fn exact_floor_witness_present(
+        &self,
+        witness_start: usize,
+    ) -> Result<bool, SearchError> {
+        if witness_start < self.window.start() || witness_start >= self.window.end() {
+            return Ok(false);
+        }
+        let Some(witness_end) = witness_start
+            .checked_add(self.plan.packed.build_accounting().max_pattern_bytes)
+            .map(|end| end.min(self.window.end()))
+        else {
+            return Ok(false);
+        };
+        let (found, _) = self.plan.packed.find_window(
+            self.haystack,
+            LiteralWindow::new(witness_start, witness_end),
+            self.packed_limits,
+        )?;
+        Ok(found.is_some_and(|(start, _)| start == witness_start))
+    }
+
     fn execute_packed<F>(
         self,
         execute_incumbent: F,
@@ -10519,6 +10590,7 @@ impl<'p, 's, 'a, 'h> K0PackedFrontierExistsReceipt<'p, 's, 'a, 'h> {
         )?;
         let observation = classify_k0_packed_frontier_positive(
             self.window.start(),
+            literal_start,
             floor,
             self.plan.minimum_useful_progress_bytes(),
             incumbent_observation.raw_k0_work().unwrap_or(0),
@@ -10552,6 +10624,32 @@ where
     if let Some((class_index, packed_positive, structural_direct)) =
         state.retained_incumbent(receipt.window)
     {
+        if structural_direct
+            && state.direct_remaining[class_index] == 1
+            && let Some(witness_start) = state.exact_floor_witness(class_index)
+        {
+            if receipt.exact_floor_witness_present(witness_start)? {
+                let output = execute_incumbent(
+                    &mut *receipt.session,
+                    receipt.haystack,
+                    receipt.window,
+                    receipt.search_limits,
+                    None,
+                )?;
+                state.renew_exact_floor_direct(class_index);
+                return Ok(output);
+            }
+            // A changed current source invalidates the exact-floor theorem.
+            // Reprobe Packed on this boundary call and publish both the reset
+            // and its new observation only after its executor succeeds.
+            let mut state_after_success = *state;
+            state_after_success.expire_exact_floor_direct(class_index);
+            let window = receipt.window;
+            let attempt = receipt.execute_packed(execute_incumbent)?;
+            state_after_success.observe_packed(class_index, window, attempt.observation);
+            *state = state_after_success;
+            return Ok(attempt.output);
+        }
         let mut incumbent_observation =
             K0PackedFrontierIncumbentObservation::Incomparable;
         let measure_incumbent = if structural_direct {
@@ -16939,6 +17037,7 @@ mod tests {
     #[test]
     fn k0_packed_frontier_progress_threshold_is_exact() {
         let window_start = 41_usize;
+        let witness_start = window_start + 3;
         let threshold = 1_024_usize;
         let positive = super::K0PackedFrontierPositiveObservation {
             residual_work: 17,
@@ -16946,15 +17045,17 @@ mod tests {
         assert_eq!(
             super::classify_k0_packed_frontier_positive(
                 window_start,
+                witness_start,
                 window_start,
                 threshold,
                 positive.residual_work,
             ),
-            super::K0PackedFrontierObservation::ExactFloorDirect,
+            super::K0PackedFrontierObservation::ExactFloorDirect { witness_start },
         );
         assert_eq!(
             super::classify_k0_packed_frontier_positive(
                 window_start,
+                witness_start,
                 window_start + threshold - 1,
                 threshold,
                 positive.residual_work,
@@ -16964,6 +17065,7 @@ mod tests {
         assert_eq!(
             super::classify_k0_packed_frontier_positive(
                 window_start,
+                witness_start,
                 window_start + threshold,
                 threshold,
                 positive.residual_work,
@@ -17509,6 +17611,12 @@ mod tests {
         )
         .expect("exact-floor admission succeeds")
         .expect("exact-floor window admits packed search");
+        assert!(receipt
+            .exact_floor_witness_present(3)
+            .expect("exact witness lookup succeeds"));
+        assert!(!receipt
+            .exact_floor_witness_present(2)
+            .expect("shifted witness lookup succeeds"));
         let calls = std::cell::Cell::new(0_u8);
         let output = super::execute_k0_packed_frontier_exists_route(
             receipt,
@@ -17537,6 +17645,93 @@ mod tests {
             packed_state.direct_remaining[class_index],
             super::K0_PACKED_FRONTIER_DIRECT_EPOCH_CALLS,
         );
+    }
+
+    #[test]
+    fn k0_packed_frontier_exact_witness_renews_epochs_and_detects_mutation() {
+        let regex = forced_k0_with_only_packed_frontier(
+            r"(?s-u:...[abcd][12345]+\b)",
+        );
+        let mut haystack = vec![b'!'; 4_096];
+        haystack[..6].copy_from_slice(b"!!!a1!");
+        let address = haystack.as_ptr();
+        let window = SearchWindow::full(&haystack);
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("witness-renewal session constructs");
+        assert!(session
+            .is_match_window_value(&haystack, window, SearchLimits::unlimited())
+            .expect("initial exact-floor call succeeds"));
+
+        let class_index = match &session.plan {
+            PortableSearchSessionPlan::K0 {
+                exclusive_route_state: super::K0ExclusiveRouteState::Packed(state),
+                ..
+            } => (0..state.classes.len())
+                .find(|&index| {
+                    state.is_occupied(index) && state.classes[index].window == window
+                })
+                .expect("initial exact-floor call retains its exact class"),
+            _ => panic!("witness-renewal fixture lost its packed state"),
+        };
+
+        for (current_epoch, next_epoch) in [(8_u8, 16_u8), (16, 32), (32, 64)] {
+            for _ in 1..current_epoch {
+                assert!(session
+                    .is_match_window_value(&haystack, window, SearchLimits::unlimited())
+                    .expect("pre-boundary Direct call succeeds"));
+            }
+            match &session.plan {
+                PortableSearchSessionPlan::K0 {
+                    exclusive_route_state: super::K0ExclusiveRouteState::Packed(state),
+                    ..
+                } => {
+                    assert_eq!(state.direct_remaining[class_index], 1);
+                    assert!(state.exact_floor_witness(class_index).is_some());
+                }
+                _ => unreachable!(),
+            }
+            assert!(session
+                .is_match_window_value(&haystack, window, SearchLimits::unlimited())
+                .expect("witness-renewal boundary call succeeds"));
+            match &session.plan {
+                PortableSearchSessionPlan::K0 {
+                    exclusive_route_state: super::K0ExclusiveRouteState::Packed(state),
+                    ..
+                } => {
+                    assert_eq!(state.direct_remaining[class_index], next_epoch);
+                    assert!(state.exact_floor_witness(class_index).is_some());
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        for _ in 1..64_u8 {
+            assert!(session
+                .is_match_window_value(&haystack, window, SearchLimits::unlimited())
+                .expect("cap-64 Direct call succeeds"));
+        }
+        haystack.fill(b'!');
+        assert_eq!(haystack.as_ptr(), address);
+        assert!(!session
+            .is_match_window_value(&haystack, window, SearchLimits::unlimited())
+            .expect("mutated boundary call reprobes Packed exactly"));
+        match &session.plan {
+            PortableSearchSessionPlan::K0 {
+                exclusive_route_state: super::K0ExclusiveRouteState::Packed(state),
+                ..
+            } => {
+                assert_eq!(state.direct_remaining[class_index], 0);
+                assert_eq!(state.structural_epoch_stage[class_index], 0);
+                assert!(!state.is_structural_direct(class_index));
+                assert!(state.exact_floor_witness(class_index).is_none());
+                assert_eq!(
+                    state.preference(class_index),
+                    super::K0PackedFrontierExistsPreference::ObserveColdPacked,
+                );
+            }
+            _ => unreachable!(),
+        }
     }
 
     #[test]
@@ -17599,7 +17794,7 @@ mod tests {
         );
         #[cfg(target_pointer_width = "64")]
         {
-            assert_eq!(packed, 112);
+            assert_eq!(packed, 144);
             assert_eq!(correlated_bundle, 192);
             assert_eq!(exclusive, 200);
             assert!(exclusive < 3 * 104, "the pre-compaction bundle was 312 bytes");
@@ -17644,13 +17839,16 @@ mod tests {
         };
         let exact_floor = super::classify_k0_packed_frontier_positive(
             policy_window.start(),
+            policy_window.start() + 3,
             policy_window.start(),
             1_024,
             packed_positive.residual_work,
         );
         assert_eq!(
             exact_floor,
-            super::K0PackedFrontierObservation::ExactFloorDirect,
+            super::K0PackedFrontierObservation::ExactFloorDirect {
+                witness_start: policy_window.start() + 3,
+            },
             "a packed pass that cannot narrow executed the exact Direct incumbent",
         );
         shifted.observe_packed(
