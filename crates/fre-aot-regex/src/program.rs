@@ -7064,6 +7064,7 @@ impl CompiledProgram {
         let mandatory_suffix_enabled = program_flags & PROGRAM_FLAG_NFA_MANDATORY_SUFFIX != 0;
         let mandatory_cut_enabled = program_flags & PROGRAM_FLAG_NFA_MANDATORY_CUT != 0;
         let exact_product_enabled = program_flags & PROGRAM_FLAG_NFA_EXACT_PRODUCT != 0;
+        let derive_canonical_nfa_sidecars = version == PROGRAM_FORMAT_VERSION_V7;
         let ordered_edge_dispatch_enabled =
             program_flags & PROGRAM_FLAG_NFA_ORDERED_EDGE_DISPATCH != 0;
         let epsilon_closure_dispatch_enabled =
@@ -7259,7 +7260,7 @@ impl CompiledProgram {
             RequiredLiterals::unavailable()
         };
         let max_match_width = derive_max_match_width(&raw);
-        let nfa_exact_product = exact_product_enabled
+        let nfa_exact_product = (derive_canonical_nfa_sidecars || exact_product_enabled)
             .then(|| {
                 NfaExactProductPlan::derive(&raw, &anchored_prefix, exact_match_width, &engine)
             })
@@ -7270,14 +7271,19 @@ impl CompiledProgram {
                 "exact-product flag is incompatible with the embedded graph",
             ));
         }
-        let nfa_mandatory_suffix = derive_nfa_suffix(
-            &raw,
-            &anchored_prefix,
-            &anchored_suffix,
-            max_match_width,
-            &engine,
-            mandatory_suffix_enabled,
-        );
+        let nfa_mandatory_suffix = nfa_exact_product
+            .is_none()
+            .then(|| {
+                derive_nfa_suffix(
+                    &raw,
+                    &anchored_prefix,
+                    &anchored_suffix,
+                    max_match_width,
+                    &engine,
+                    derive_canonical_nfa_sidecars || mandatory_suffix_enabled,
+                )
+            })
+            .flatten();
         if mandatory_suffix_enabled != nfa_mandatory_suffix.is_some() {
             return Err(ProgramFormatError::Malformed(
                 "mandatory-suffix flag is incompatible with the embedded graph",
@@ -7288,7 +7294,8 @@ impl CompiledProgram {
             &required_literals,
             &engine,
             nfa_mandatory_suffix.is_some(),
-            mandatory_cut_enabled && nfa_exact_product.is_none(),
+            (derive_canonical_nfa_sidecars || mandatory_cut_enabled)
+                && nfa_exact_product.is_none(),
         );
         if mandatory_cut_enabled != ordinary_mandatory_cut.is_some() {
             return Err(ProgramFormatError::Malformed(
@@ -18222,6 +18229,36 @@ mod tests {
         wrong_engine[8..12].copy_from_slice(&PROGRAM_FORMAT_VERSION_V7.to_le_bytes());
         wrong_engine[15] = PROGRAM_FLAG_NFA_OPTIMIZING_FALLBACK;
         assert!(CompiledProgram::deserialize(&wrong_engine).is_err());
+    }
+
+    #[test]
+    fn v7_rejects_stripped_canonical_nfa_sidecar_flags() {
+        let fallback_limits = DeterminizeLimits {
+            max_states: 0,
+            ..DeterminizeLimits::default()
+        };
+        for (pattern, sidecar_flag) in [
+            ("a[0-2]Z", PROGRAM_FLAG_NFA_EXACT_PRODUCT),
+            ("(?:a|bb)q[xz]", PROGRAM_FLAG_NFA_MANDATORY_SUFFIX),
+            ("(?:x|yz)7[A-Za-z]+", PROGRAM_FLAG_NFA_MANDATORY_CUT),
+        ] {
+            let mut bytes = program(
+                pattern,
+                OutputContract::Span,
+                CompileMode::Optimizing,
+                fallback_limits,
+            )
+            .serialize()
+            .expect("serialize canonical optimizing fallback");
+            assert_ne!(bytes[15] & sidecar_flag, 0, "{pattern}");
+            bytes[8..12].copy_from_slice(&PROGRAM_FORMAT_VERSION_V7.to_le_bytes());
+            bytes[15] &= !sidecar_flag;
+            bytes[15] |= PROGRAM_FLAG_NFA_OPTIMIZING_FALLBACK;
+            assert!(
+                CompiledProgram::deserialize(&bytes).is_err(),
+                "V7 accepted a stripped {sidecar_flag:#04x} sidecar flag for {pattern}"
+            );
+        }
     }
 
     #[test]
