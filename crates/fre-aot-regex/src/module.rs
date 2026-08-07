@@ -2870,12 +2870,12 @@ const COMPACT_CELL_ACCELERATED: u32 = 1_u32 << 14;
 const COMPACT_CELL_NEXT_MASK: u32 = COMPACT_CELL_ACCELERATED - 1;
 /// Indexed compact rows add one dependent shift to the x86-64 transition
 /// path. Their ideal cell-width saving is one half of the Wide32 footprint;
-/// require at least half of that ideal saving before admitting an incomplete
-/// table, and require the former wide table to exceed the same conservative
-/// L1 share used by direct-row admission. These target-structural margins are
-/// independent of benchmark inputs.
-const X86_PARTIAL_INDEXED_MAX_WIDE_FOOTPRINT_NUMERATOR: usize = 3;
-const X86_PARTIAL_INDEXED_MAX_WIDE_FOOTPRINT_DENOMINATOR: usize = 4;
+/// require at least half of that ideal saving on every x86-64 indexed table.
+/// Incomplete tables additionally require the former wide table to exceed the
+/// same conservative L1 share used by direct-row admission. These
+/// target-structural margins are independent of benchmark inputs.
+const X86_INDEXED_MAX_WIDE_FOOTPRINT_NUMERATOR: usize = 3;
+const X86_INDEXED_MAX_WIDE_FOOTPRINT_DENOMINATOR: usize = 4;
 const NO_DFA_STATE: u32 = u32::MAX;
 /// Optional reverse sidecars remain a bounded optimization artifact. The
 /// portable constructor accounts for eight-byte logical cells, while native
@@ -3337,24 +3337,27 @@ fn select_native_cell_encoding_with_holes_for_architecture(
                     if indexed > wide {
                         return false;
                     }
-                    if resume_states == 0 || architecture == Architecture::Aarch64 {
+                    if architecture == Architecture::Aarch64 {
                         return true;
+                    }
+                    let meaningfully_smaller = indexed < wide
+                        && indexed
+                            .checked_mul(X86_INDEXED_MAX_WIDE_FOOTPRINT_DENOMINATOR)
+                            .zip(
+                                wide.checked_mul(
+                                    X86_INDEXED_MAX_WIDE_FOOTPRINT_NUMERATOR,
+                                ),
+                            )
+                            .is_some_and(|(indexed, wide)| indexed <= wide);
+                    if resume_states == 0 {
+                        return meaningfully_smaller;
                     }
                     // x86-64 pays one dependent shift to turn an ordinal into
                     // a padded row address. Admit an incomplete table only
                     // when it retains at least half of Compact16's ideal
                     // one-half footprint saving over Wide32 and the former
                     // table is already outside the conservative L1 share.
-                    indexed < wide
-                        && wide > DIRECT_BYTE_TABLE_BUDGET
-                        && indexed
-                            .checked_mul(X86_PARTIAL_INDEXED_MAX_WIDE_FOOTPRINT_DENOMINATOR)
-                            .zip(
-                                wide.checked_mul(
-                                    X86_PARTIAL_INDEXED_MAX_WIDE_FOOTPRINT_NUMERATOR,
-                                ),
-                            )
-                            .is_some_and(|(indexed, wide)| indexed <= wide)
+                    meaningfully_smaller && wide > DIRECT_BYTE_TABLE_BUDGET
                 });
                 (fits_token && target_worthwhile).then_some(cells)
             })
@@ -42194,9 +42197,48 @@ int main(void) {{
             "non-power-of-two logical rows use footprint-bounded physical padding"
         );
         assert_eq!(
-            select_native_cell_encoding(TransitionLayout::ClassMapped, 129, 128, 0),
+            select_native_cell_encoding_for_architecture(
+                TransitionLayout::ClassMapped,
+                43,
+                400,
+                0,
+                Architecture::X86_64,
+            ),
+            NativeCellEncoding::Compact16Indexed(7),
+            "x86 admits a complete indexed row at the structural saving boundary"
+        );
+        assert_eq!(
+            select_native_cell_encoding_for_architecture(
+                TransitionLayout::ClassMapped,
+                42,
+                400,
+                0,
+                Architecture::X86_64,
+            ),
+            NativeCellEncoding::Wide32,
+            "x86 declines a complete indexed row just below the saving boundary"
+        );
+        assert_eq!(
+            select_native_cell_encoding_for_architecture(
+                TransitionLayout::ClassMapped,
+                129,
+                128,
+                0,
+                Architecture::X86_64,
+            ),
+            NativeCellEncoding::Wide32,
+            "x86 declines near-equal complete padding that cannot repay its row shift"
+        );
+        assert_eq!(
+            select_native_cell_encoding_for_architecture(
+                TransitionLayout::ClassMapped,
+                129,
+                128,
+                0,
+                Architecture::Aarch64,
+            ),
             NativeCellEncoding::Compact16Indexed(9),
-            "large logical rows align both the class-map prefix and compact rows"
+            "AArch64 folds the same no-growth row scale into its address ADD"
         );
         assert_eq!(
             select_native_table_encoding(8, 4_096, 0),
@@ -42690,8 +42732,8 @@ int main(void) {{
         assert!(indexed_bytes < wide_bytes);
         assert!(wide_bytes > DIRECT_BYTE_TABLE_BUDGET);
         assert!(
-            indexed_bytes * X86_PARTIAL_INDEXED_MAX_WIDE_FOOTPRINT_DENOMINATOR
-                <= wide_bytes * X86_PARTIAL_INDEXED_MAX_WIDE_FOOTPRINT_NUMERATOR
+            indexed_bytes * X86_INDEXED_MAX_WIDE_FOOTPRINT_DENOMINATOR
+                <= wide_bytes * X86_INDEXED_MAX_WIDE_FOOTPRINT_NUMERATOR
         );
     }
 
@@ -42764,14 +42806,16 @@ int main(void) {{
     fn row_indexing_keeps_large_complete_tables_compact_on_both_isas() {
         use core::fmt::Write as _;
 
-        // Distinguish enough bytes at successive literal positions to exceed
-        // absolute Compact16 addressing with a non-power-of-two logical row.
-        // This constructs a
-        // large semantic state-by-class product without relying on source
-        // identity or an optimizer route outside the ordinary DFA.
+        // Distinguish enough bytes at successive literal positions and repeat
+        // the sequence to exceed absolute Compact16 addressing with a
+        // non-power-of-two logical row. This constructs a large semantic
+        // state-by-class product without relying on source identity or an
+        // optimizer route outside the ordinary DFA.
         let mut pattern = String::from("(?-u:");
-        for byte in u8::MIN..=128 {
-            write!(&mut pattern, "\\x{byte:02x}").unwrap();
+        for _ in 0..2 {
+            for byte in u8::MIN..=94 {
+                write!(&mut pattern, "\\x{byte:02x}").unwrap();
+            }
         }
         pattern.push(')');
         let compiled = compile(
@@ -42810,10 +42854,11 @@ int main(void) {{
             "physical power-of-two padding must not contain transition data"
         );
         assert!(
-            machine_bytes
-                <= CLASS_MAP_BYTES
-                    + states * view.dfa.class_count * NativeCellEncoding::Wide32.bytes(),
-            "indexed compact layout must not grow its former wide machine"
+            machine_bytes * X86_INDEXED_MAX_WIDE_FOOTPRINT_DENOMINATOR
+                <= (CLASS_MAP_BYTES
+                    + states * view.dfa.class_count * NativeCellEncoding::Wide32.bytes())
+                    * X86_INDEXED_MAX_WIDE_FOOTPRINT_NUMERATOR,
+            "x86 indexed compact layout must meet its structural saving gate"
         );
         assert_eq!(
             usize::try_from(layout.reverse_offset).unwrap(),
