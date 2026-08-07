@@ -12985,6 +12985,10 @@ enum FrozenCompactNativeFormat {
     StateOrdinalV6,
     CellOffsetV7,
     StateOrdinalDirectV8,
+    #[allow(
+        dead_code,
+        reason = "V9 remains a standalone compatibility-verifier format without a production entry"
+    )]
     CellOffsetDirectV9,
     StateOrdinalDirectU8V10,
     PairSupertransitionV11,
@@ -13977,23 +13981,6 @@ fn x86_emit_frozen_compact_v8_entry(
     )
 }
 
-fn x86_emit_frozen_compact_v9_entry(
-    assembler: &mut X86Assembler,
-    try_older: X86Label,
-    call_preflight: X86Label,
-    v9_enter: X86Label,
-    guard_mode: FrozenCompactGuardMode,
-) -> Result<(), ObjectError> {
-    x86_emit_frozen_compact_entry(
-        assembler,
-        FrozenCompactNativeFormat::CellOffsetDirectV9,
-        try_older,
-        call_preflight,
-        v9_enter,
-        guard_mode,
-    )
-}
-
 fn x86_emit_frozen_compact_v10_entry(
     assembler: &mut X86Assembler,
     try_older: X86Label,
@@ -14465,7 +14452,6 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     const ROOT_SCANNER_COMPACT_V6: u8 = 4;
     const ROOT_SCANNER_COMPACT_V7: u8 = 5;
     const ROOT_SCANNER_COMPACT_V8_DIRECT_BYTE: u8 = 6;
-    const ROOT_SCANNER_COMPACT_V9_DIRECT_BYTE: u8 = 7;
     const ROOT_SCANNER_COMPACT_V10_DIRECT_U8: u8 = 8;
     const ROOT_SCANNER_COMPACT_V12_MAPPED_U8: u8 = 9;
     const _: () = assert!(
@@ -14475,11 +14461,10 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
             | (1_u16 << ROOT_SCANNER_COMPACT_V6)
             | (1_u16 << ROOT_SCANNER_COMPACT_V7)
             | (1_u16 << ROOT_SCANNER_COMPACT_V8_DIRECT_BYTE)
-            | (1_u16 << ROOT_SCANNER_COMPACT_V9_DIRECT_BYTE)
             | (1_u16 << ROOT_SCANNER_COMPACT_V10_DIRECT_U8)
             | (1_u16 << ROOT_SCANNER_COMPACT_V12_MAPPED_U8))
             .count_ones()
-            == 9
+            == 8
     );
     let tracks_root_scanner_hits = allow_direct_hole_continuation && root_plan.is_some();
     // Every compact entry starts with a nonempty window. Scanner-free entries
@@ -14578,7 +14563,6 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
         .transpose()?;
     let try_v10 = assembler.label()?;
     let try_v12 = assembler.label()?;
-    let try_v9 = assembler.label()?;
     let try_v8 = assembler.label()?;
     let try_v4 = assembler.label()?;
     let try_v3 = assembler.label()?;
@@ -14602,9 +14586,6 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     let v4_enter = assembler.label()?;
     let v4_scan = assembler.label()?;
     let v4_table_scan = assembler.label()?;
-    let v9_enter = assembler.label()?;
-    let v9_scan = assembler.label()?;
-    let v9_table_scan = assembler.label()?;
     let v10_enter = assembler.label()?;
     let v10_scan = assembler.label()?;
     let v10_table_scan = assembler.label()?;
@@ -14791,7 +14772,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     x86_emit_frozen_compact_v12_entry(
         &mut assembler,
         if direct_byte_formats_possible {
-            try_v9
+            try_v8
         } else {
             try_v4
         },
@@ -14800,14 +14781,6 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
         FrozenCompactGuardMode::ActiveCapability,
     )?;
     if direct_byte_formats_possible {
-        assembler.bind(try_v9)?;
-        x86_emit_frozen_compact_v9_entry(
-            &mut assembler,
-            try_v8,
-            call_preflight,
-            v9_enter,
-            FrozenCompactGuardMode::ActiveCapability,
-        )?;
         assembler.bind(try_v8)?;
         x86_emit_frozen_compact_v8_entry(
             &mut assembler,
@@ -15907,63 +15880,6 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     }
 
     if direct_byte_formats_possible {
-        assembler.bind(v9_enter)?;
-        // Only the exact V9 flag/version/seal capability may enter this raw-
-        // byte loop. Ordinary V4 remains mapped even when an older runtime
-        // publishes a 256-class table.
-        assembler.instruction(&[
-            0x49,
-            0x8b,
-            0x73,
-            u8::try_from(FROZEN_DYNAMIC_ROWS_V3_ROWS_ADDRESS_OFFSET)
-                .map_err(|_| ObjectError::ArithmeticOverflow("x86 V9 rows address"))?,
-        ])?;
-        assembler.instruction(&[0x48, 0x85, 0xf6])?;
-        assembler.branch(&[0x0f, 0x84], framed_fallback)?;
-        assembler.instruction(&[0x49, 0x89, 0xf0])?; // mov rsi, r8
-        if root_setup.is_some() {
-            assembler.instruction(&[
-                0x48,
-                0xc7,
-                0x44,
-                0x24,
-                ROOT_SCANNER_REPRESENTATION_OFFSET,
-                ROOT_SCANNER_COMPACT_V9_DIRECT_BYTE,
-                0,
-                0,
-                0,
-            ])?;
-            assembler.instruction(&[0x4c, 0x89, 0x44, 0x24, 0x50])?;
-        }
-        assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x18])?;
-        assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x40])?;
-        assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x48])?;
-        if let Some(root_setup) = root_setup {
-            assembler.branch(&[0xe9], root_setup)?;
-        } else if output != OutputContract::Exists {
-            assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x60, 0, 0, 0, 0])?;
-        }
-
-        assembler.bind(v9_scan)?;
-        if let Some(root_vector) = root_vector {
-            let non_root = assembler.label()?;
-            assembler.instruction(&[0x4c, 0x3b, 0x44, 0x24, 0x50])?;
-            assembler.branch(&[0x0f, 0x85], non_root)?;
-            if output != OutputContract::Exists {
-                assembler.instruction(&[0x48, 0x83, 0x7c, 0x24, 0x60, 0])?;
-                assembler.branch(&[0x0f, 0x85], non_root)?;
-            }
-            assembler.branch(&[0xe9], root_vector)?;
-            assembler.bind(non_root)?;
-        }
-
-        assembler.bind(v9_table_scan)?;
-        assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
-        assembler.instruction(&[0x47, 0x0f, 0xb7, 0x14, 0x50])?;
-        emit_v4_transition_tail(&mut assembler, v9_scan)?;
-    }
-
-    if direct_byte_formats_possible {
         assembler.bind(v10_enter)?;
         // V10 is an exact raw-byte table with one byte per cell. The private
         // owner proof authenticates its identity map, seven-bit state extent,
@@ -16687,9 +16603,6 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
         let v10_candidate = direct_byte_formats_possible
             .then(|| assembler.label())
             .transpose()?;
-        let v9_candidate = direct_byte_formats_possible
-            .then(|| assembler.label())
-            .transpose()?;
         let v8_candidate = direct_byte_formats_possible
             .then(|| assembler.label())
             .transpose()?;
@@ -16712,10 +16625,6 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
                 ROOT_SCANNER_COMPACT_V10_DIRECT_U8,
             ])?;
             assembler.branch(&[0x0f, 0x84], v10_candidate)?;
-        }
-        if let Some(v9_candidate) = v9_candidate {
-            assembler.instruction(&[0x48, 0x83, 0xf8, ROOT_SCANNER_COMPACT_V9_DIRECT_BYTE])?;
-            assembler.branch(&[0x0f, 0x84], v9_candidate)?;
         }
         if let Some(v8_candidate) = v8_candidate {
             assembler.instruction(&[0x48, 0x83, 0xf8, ROOT_SCANNER_COMPACT_V8_DIRECT_BYTE])?;
@@ -16812,19 +16721,6 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
             ])?;
             assembler.instruction(&[0x49, 0x89, 0xf0])?;
             assembler.branch(&[0xe9], v10_table_scan)?;
-        }
-
-        if let Some(v9_candidate) = v9_candidate {
-            assembler.bind(v9_candidate)?;
-            assembler.instruction(&[
-                0x49,
-                0x8b,
-                0x73,
-                u8::try_from(FROZEN_DYNAMIC_ROWS_V3_ROWS_ADDRESS_OFFSET)
-                    .map_err(|_| ObjectError::ArithmeticOverflow("x86 V9 candidate rows"))?,
-            ])?;
-            assembler.instruction(&[0x49, 0x89, 0xf0])?; // canonical V9 row zero
-            assembler.branch(&[0xe9], v9_table_scan)?;
         }
 
         if let Some(v8_candidate) = v8_candidate {
@@ -24238,23 +24134,6 @@ fn aarch64_emit_frozen_compact_v8_entry(
     )
 }
 
-fn aarch64_emit_frozen_compact_v9_entry(
-    assembler: &mut Aarch64Assembler,
-    try_older: Aarch64Label,
-    call_preflight: Aarch64Label,
-    v9_enter: Aarch64Label,
-    guard_mode: FrozenCompactGuardMode,
-) -> Result<(), ObjectError> {
-    aarch64_emit_frozen_compact_entry(
-        assembler,
-        FrozenCompactNativeFormat::CellOffsetDirectV9,
-        try_older,
-        call_preflight,
-        v9_enter,
-        guard_mode,
-    )
-}
-
 fn aarch64_emit_frozen_compact_v10_entry(
     assembler: &mut Aarch64Assembler,
     try_older: Aarch64Label,
@@ -24834,7 +24713,6 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     const ROOT_SCANNER_COMPACT_V6: u16 = 4;
     const ROOT_SCANNER_COMPACT_V7: u16 = 5;
     const ROOT_SCANNER_COMPACT_V8_DIRECT_BYTE: u16 = 6;
-    const ROOT_SCANNER_COMPACT_V9_DIRECT_BYTE: u16 = 7;
     const ROOT_SCANNER_COMPACT_V10_DIRECT_U8: u16 = 8;
     const ROOT_SCANNER_COMPACT_V12_MAPPED_U8: u16 = 9;
     const _: () = assert!(
@@ -24844,11 +24722,10 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
             | (1_u16 << ROOT_SCANNER_COMPACT_V6)
             | (1_u16 << ROOT_SCANNER_COMPACT_V7)
             | (1_u16 << ROOT_SCANNER_COMPACT_V8_DIRECT_BYTE)
-            | (1_u16 << ROOT_SCANNER_COMPACT_V9_DIRECT_BYTE)
             | (1_u16 << ROOT_SCANNER_COMPACT_V10_DIRECT_U8)
             | (1_u16 << ROOT_SCANNER_COMPACT_V12_MAPPED_U8))
             .count_ones()
-            == 9
+            == 8
     );
     let tracks_root_scanner_hits = allow_direct_hole_continuation && root_plan.is_some();
     // Every compact entry starts with a nonempty window. Scanner-free entries
@@ -24905,7 +24782,6 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
         .transpose()?;
     let try_v10 = assembler.label()?;
     let try_v12 = assembler.label()?;
-    let try_v9 = assembler.label()?;
     let try_v8 = assembler.label()?;
     let try_v4 = assembler.label()?;
     let try_v3 = assembler.label()?;
@@ -24920,9 +24796,6 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     let v4_enter = assembler.label()?;
     let v4_scan = assembler.label()?;
     let v4_table_scan = assembler.label()?;
-    let v9_enter = assembler.label()?;
-    let v9_scan = assembler.label()?;
-    let v9_table_scan = assembler.label()?;
     let v10_enter = assembler.label()?;
     let v10_scan = assembler.label()?;
     let v10_table_scan = assembler.label()?;
@@ -25124,7 +24997,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     aarch64_emit_frozen_compact_v12_entry(
         &mut assembler,
         if direct_byte_formats_possible {
-            try_v9
+            try_v8
         } else {
             try_v4
         },
@@ -25133,14 +25006,6 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
         FrozenCompactGuardMode::ActiveCapability,
     )?;
     if direct_byte_formats_possible {
-        assembler.bind(try_v9)?;
-        aarch64_emit_frozen_compact_v9_entry(
-            &mut assembler,
-            try_v8,
-            call_preflight,
-            v9_enter,
-            FrozenCompactGuardMode::ActiveCapability,
-        )?;
         assembler.bind(try_v8)?;
         aarch64_emit_frozen_compact_v8_entry(
             &mut assembler,
@@ -26182,63 +26047,6 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     }
 
     if direct_byte_formats_possible {
-        assembler.bind(v9_enter)?;
-        // Only the exact V9 flag/version/seal capability may enter this raw-
-        // byte loop. Ordinary V4 remains mapped even when an older runtime
-        // publishes a 256-class table.
-        assembler.instruction(aarch64_load_x_imm(
-            15,
-            13,
-            u16::try_from(FROZEN_DYNAMIC_ROWS_V3_ROWS_ADDRESS_OFFSET)
-                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 V9 rows address"))?,
-        )?)?;
-        assembler.instruction(aarch64_cmp_x_imm(15, 0)?)?;
-        assembler.branch_cond(AARCH64_EQ, framed_fallback)?;
-        assembler.instruction(aarch64_mov_x(11, 15)?)?;
-        assembler.instruction(aarch64_sub_x_imm(15, 15, 2)?)?;
-        assembler.instruction(aarch64_mov_x(1, 11)?)?;
-        if root_plan.is_some() {
-            assembler.instruction(aarch64_movz_x(8, ROOT_SCANNER_COMPACT_V9_DIRECT_BYTE, 0)?)?;
-            assembler.instruction(aarch64_store_x(8, 31, ROOT_SCANNER_REPRESENTATION_OFFSET)?)?;
-        }
-        assembler.instruction(aarch64_load_x_imm(0, 31, 8)?)?;
-        assembler.instruction(aarch64_load_x_imm(2, 31, 48)?)?;
-        assembler.instruction(aarch64_load_x_imm(3, 31, 56)?)?;
-        if scanner_free_exists_pointer_cursor {
-            assembler.instruction(aarch64_add_x_reg(2, 0, 2)?)?;
-            assembler.instruction(aarch64_add_x_reg(3, 0, 3)?)?;
-        }
-        if let Some(root_setup) = root_setup {
-            assembler.branch(root_setup)?;
-        } else if output != OutputContract::Exists {
-            assembler.instruction(aarch64_store_x(31, 31, 80)?)?;
-        }
-
-        assembler.bind(v9_scan)?;
-        if let Some(root_dispatch) = root_dispatch {
-            let non_root = assembler.label()?;
-            assembler.instruction(aarch64_cmp_x(11, 1)?)?;
-            assembler.branch_cond(AARCH64_NE, non_root)?;
-            if output != OutputContract::Exists {
-                assembler.instruction(aarch64_load_x_imm(12, 31, 80)?)?;
-                assembler.instruction(aarch64_cmp_x_imm(12, 0)?)?;
-                assembler.branch_cond(AARCH64_NE, non_root)?;
-            }
-            assembler.branch(root_dispatch)?;
-            assembler.bind(non_root)?;
-        }
-
-        assembler.bind(v9_table_scan)?;
-        if scanner_free_exists_pointer_cursor {
-            assembler.instruction(aarch64_load_byte_post_imm(8, 2, 1)?)?;
-        } else {
-            assembler.instruction(aarch64_load_byte_reg(8, 0, 2)?)?;
-        }
-        assembler.instruction(aarch64_load_h_uxtw(8, 11, 8)?)?;
-        emit_v4_transition_tail(&mut assembler, v9_scan)?;
-    }
-
-    if direct_byte_formats_possible {
         assembler.bind(v10_enter)?;
         assembler.instruction(aarch64_load_x_imm(
             15,
@@ -26870,7 +26678,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
         }
         // Keep the selected ASIMD/SVE/SVE2 or scalar graph scanner. Candidate
         // hits authenticate the active representation, reload its row state,
-        // and enter V2 or the authenticated V3/V4/V8/V9 representation.
+        // and enter V2 or an authenticated compact representation.
         assembler.branch(root_dispatch.ok_or(ObjectError::InvalidModule(
             "AArch64 dynamic root setup has no dispatch label",
         ))?)?;
@@ -26961,9 +26769,6 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
         let v10_candidate = direct_byte_formats_possible
             .then(|| assembler.label())
             .transpose()?;
-        let v9_candidate = direct_byte_formats_possible
-            .then(|| assembler.label())
-            .transpose()?;
         let v8_candidate = direct_byte_formats_possible
             .then(|| assembler.label())
             .transpose()?;
@@ -26991,10 +26796,6 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
                 ROOT_SCANNER_COMPACT_V10_DIRECT_U8,
             )?)?;
             assembler.branch_cond(AARCH64_EQ, v10_candidate)?;
-        }
-        if let Some(v9_candidate) = v9_candidate {
-            assembler.instruction(aarch64_cmp_x_imm(8, ROOT_SCANNER_COMPACT_V9_DIRECT_BYTE)?)?;
-            assembler.branch_cond(AARCH64_EQ, v9_candidate)?;
         }
         if let Some(v8_candidate) = v8_candidate {
             assembler.instruction(aarch64_cmp_x_imm(8, ROOT_SCANNER_COMPACT_V8_DIRECT_BYTE)?)?;
@@ -27110,19 +26911,6 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
             )?)?;
             assembler.instruction(aarch64_mov_x(11, 15)?)?;
             assembler.branch(v10_table_scan)?;
-        }
-
-        if let Some(v9_candidate) = v9_candidate {
-            assembler.bind(v9_candidate)?;
-            assembler.instruction(aarch64_load_x_imm(
-                15,
-                13,
-                u16::try_from(FROZEN_DYNAMIC_ROWS_V3_ROWS_ADDRESS_OFFSET)
-                    .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 V9 candidate rows"))?,
-            )?)?;
-            assembler.instruction(aarch64_mov_x(11, 15)?)?;
-            assembler.instruction(aarch64_sub_x_imm(15, 15, 2)?)?;
-            assembler.branch(v9_table_scan)?;
         }
 
         if let Some(v8_candidate) = v8_candidate {
@@ -28376,11 +28164,11 @@ mod tests {
         code.windows(compact_load.len())
             .enumerate()
             .filter_map(|(offset, bytes)| (bytes == compact_load).then_some(offset))
-            // V7, the nine immediate-shift V6 bodies, mapped V4, and direct
-            // V9 precede the nine mapped V3 bodies; direct V8 follows them.
+            // V7, the nine immediate-shift V6 bodies, and mapped V4 precede
+            // the nine mapped V3 bodies; direct V8 follows them.
             // Only V3 has the exact immediate state-ordinal shifts checked
             // below.
-            .skip(12)
+            .skip(11)
             .take(9)
             .zip(1_u8..=9)
             .filter(|&(load, shift)| {
@@ -33052,8 +32840,8 @@ mod tests {
 
             assert_eq!(
                 occurrences(code, &[0x47, 0x0f, 0xb7, 0x14, 0x50]),
-                22,
-                "the {accelerator:?} scanner must feed V8/V9, V7/V4, and every V6/V3 row shift"
+                21,
+                "the {accelerator:?} scanner must feed V8, V7/V4, and every V6/V3 row shift"
             );
             assert_eq!(
                 x86_v3_root_zero_test_body_count(code),
@@ -33062,19 +32850,19 @@ mod tests {
             );
             assert_eq!(
                 occurrences(code, &[0x49, 0x89, 0xf0]),
-                38,
-                "V8/V9/V10/V12 and V7/V4 entries/candidates plus all V6/V3/V12 shifts install row zero"
+                36,
+                "V8/V10/V12 and V7/V4 entries/candidates plus all V6/V3/V12 shifts install row zero"
             );
             assert_eq!(
                 occurrences(code, &[0x4e, 0x8d, 0x44, 0x56, 0xfe]),
-                3,
-                "V7, mapped V4, and V9 must retain direct cell-offset backedges"
+                2,
+                "V7 and mapped V4 must retain direct cell-offset backedges"
             );
             let candidate_prefix = [0x48, 0x8b, 0x44, 0x24, 0x70, 0x48, 0x83, 0xf8, 0x05];
             let candidate = code
                 .windows(candidate_prefix.len())
                 .position(|bytes| bytes == candidate_prefix)
-                .expect("tagged pointer/offset/V3/V4/V6/V7/V8/V9 scanner candidate dispatcher");
+                .expect("tagged pointer/offset/V3/V4/V6/V7/V8 scanner candidate dispatcher");
             // The assembler may invert the scalar membership diamond, making
             // its hit edge conditional, while the vector hit remains an
             // unconditional jump. Restrict the audit to the scanner bodies,
@@ -33641,8 +33429,8 @@ mod tests {
                         .windows(5)
                         .filter(|bytes| *bytes == [0x47, 0x0f, 0xb7, 0x14, 0x50])
                         .count(),
-                    22,
-                    "exact {accelerator:?} scanner must feed V8/V9, V7/V4, and every V6/V3 row shift"
+                    21,
+                    "exact {accelerator:?} scanner must feed V8, V7/V4, and every V6/V3 row shift"
                 );
                 assert_eq!(
                     x86_v3_root_zero_test_body_count(&emission.code),
@@ -33851,15 +33639,15 @@ mod tests {
                         .iter()
                         .filter(|&&word| word == aarch64_load_h_uxtw(8, 11, 8).unwrap())
                         .count(),
-                    3,
-                    "{target:?}/{output:?} scanner must feed V7/V4 and direct-byte V9 rows"
+                    2,
+                    "{target:?}/{output:?} scanner must feed V7/V4 rows"
                 );
                 assert_eq!(
                     words
                         .iter()
                         .filter(|&&word| word == aarch64_mov_x(11, 15).unwrap())
                         .count(),
-                    30,
+                    28,
                     "{target:?}/{output:?} V6/V7/V10/V12 and older compact entries/candidates must install canonical row zero"
                 );
                 assert_eq!(
@@ -33867,8 +33655,8 @@ mod tests {
                         .iter()
                         .filter(|&&word| word == aarch64_add_x_uxtw(11, 15, 8, 1).unwrap())
                         .count(),
-                    3,
-                    "{target:?}/{output:?} V7, mapped V4, and V9 need cell-offset backedges"
+                    2,
+                    "{target:?}/{output:?} V7 and mapped V4 need cell-offset backedges"
                 );
                 assert_eq!(
                     aarch64_v3_root_zero_test_body_count(&words, output),
@@ -33913,7 +33701,7 @@ mod tests {
                 let candidate = words
                     .windows(candidate_prefix.len())
                     .position(|window| window == candidate_prefix)
-                    .expect("tagged AArch64 pointer/offset/V3/V4/V6/V7/V8/V9/V10/V12 candidate dispatcher");
+                    .expect("tagged AArch64 pointer/offset/V3/V4/V6/V7/V8/V10/V12 candidate dispatcher");
                 assert!(
                     (0..words.len())
                         .filter_map(|index| unconditional_target(&words, index))
@@ -34005,34 +33793,11 @@ mod tests {
                 );
                 assert_eq!(
                     words[candidate + candidate_prefix.len() + 7],
-                    aarch64_cmp_x_imm(8, 7).unwrap(),
-                    "V10 fallthrough must select the exact V9 tag"
-                );
-                let v9_candidate =
-                    conditional_target(&words, candidate + candidate_prefix.len() + 8)
-                        .expect("tagged V9 candidate edge");
-                assert_eq!(
-                    words[v9_candidate],
-                    aarch64_load_x_imm(
-                        15,
-                        13,
-                        u16::try_from(FROZEN_DYNAMIC_ROWS_V3_ROWS_ADDRESS_OFFSET).unwrap(),
-                    )
-                    .unwrap(),
-                    "V9 selection must restore its rows"
-                );
-                assert_eq!(
-                    words[v9_candidate + 2],
-                    aarch64_sub_x_imm(15, 15, 2).unwrap(),
-                    "V9 selection must bias its cell-offset row base"
-                );
-                assert_eq!(
-                    words[candidate + candidate_prefix.len() + 9],
                     aarch64_cmp_x_imm(8, 6).unwrap(),
-                    "V9 fallthrough must select the exact V8 tag"
+                    "V10 fallthrough must select the exact V8 tag"
                 );
                 let v8_candidate =
-                    conditional_target(&words, candidate + candidate_prefix.len() + 10)
+                    conditional_target(&words, candidate + candidate_prefix.len() + 8)
                         .expect("tagged V8 candidate edge");
                 assert_eq!(
                     words[v8_candidate],
@@ -34050,7 +33815,7 @@ mod tests {
                     "V8 selection must retain its unbiased state-ordinal row base"
                 );
                 assert_eq!(
-                    words[candidate + candidate_prefix.len() + 11],
+                    words[candidate + candidate_prefix.len() + 9],
                     aarch64_cmp_x_imm(8, 3).unwrap(),
                     "V8 fallthrough must select the mapped V4 tag"
                 );
@@ -34557,12 +34322,12 @@ mod tests {
                 assert_eq!(
                     byte_occurrences(&code, &[0x48, 0xc7, 0x44, 0x24, 0x60, 0, 0, 0, 0]),
                     1,
-                    "V2 and compact V3/V4/V6/V7/V8/V9/V10/V12 share one scanner endpoint initialization"
+                    "V2 and compact V3/V4/V6/V7/V8/V10/V12 share one scanner endpoint initialization"
                 );
                 assert_eq!(
                     byte_occurrences(&code, &[0x48, 0x89, 0x54, 0x24, 0x60]),
-                    34,
-                    "offset, pointer, V8/V9/V10, V7/V4, and all V6/V3/V12 loops publish endpoints"
+                    33,
+                    "offset, pointer, V8/V10, V7/V4, and all V6/V3/V12 loops publish endpoints"
                 );
                 assert_eq!(
                     byte_occurrences(&code, &[0x4c, 0x8b, 0x5c, 0x24, 0x60]),
@@ -34623,8 +34388,8 @@ mod tests {
                     ),
                     (
                         aarch64_store_x(2, 31, 80).unwrap(),
-                        26,
-                        "pending update from offset/pointer, V8/V9/V10, V7/V4, shared V6, and V3/V12 loops",
+                        25,
+                        "pending update from offset/pointer, V8/V10, V7/V4, shared V6, and V3/V12 loops",
                     ),
                     (
                         aarch64_load_x_imm(7, 31, 80).unwrap(),
@@ -43498,8 +43263,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             let bounds = x86_bound_pairs(code, 0x82, true);
             assert_eq!(
                 bounds.len(),
-                33,
-                "{context}: two V7 resumes, V8/V9/V10/V4, and all V6/V3/V12 shifts need conditional backedges"
+                32,
+                "{context}: two V7 resumes, V8/V10/V4, and all V6/V3/V12 shifts need conditional backedges"
             );
             for &(compare, target) in &bounds {
                 assert_ne!(
@@ -43535,8 +43300,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 .collect::<Vec<_>>();
             assert_eq!(
                 v4_updates.len(),
-                2,
-                "{context}: exact rooted V4/V9 immediate-bottom loop count; V7 probes its loop index first"
+                1,
+                "{context}: exact rooted V4 immediate-bottom loop count; V7 probes its loop index first"
             );
             let root_compare = [0x4c, 0x3b, 0x44, 0x24, 0x50];
             let raw_load = [0x44, 0x0f, 0xb6, 0x14, 0x17];
@@ -43549,22 +43314,22 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 assert_eq!(
                     &code[v4_compare..v4_compare + compare_bytes.len()],
                     compare_bytes.as_slice(),
-                    "{context}: V4/V9 update must be followed by its bottom bound"
+                    "{context}: V4 update must be followed by its bottom bound"
                 );
                 assert_eq!(
                     x86_test_normalized_branch_opcode(code, v4_compare + compare_bytes.len()),
                     Some(0x82),
-                    "{context}: V4/V9 bottom bound must be position < end"
+                    "{context}: V4 bottom bound must be position < end"
                 );
                 let (v4_scan, _) = x86_test_branch_target(
                     code,
                     v4_compare + compare_bytes.len(),
                 )
-                .expect("rooted x86 V4/V9 bottom backedge");
+                .expect("rooted x86 V4 bottom backedge");
                 assert_eq!(
                     &code[v4_scan..v4_scan + root_compare.len()],
                     root_compare.as_slice(),
-                    "{context}: V4/V9 backedge must reach compact root dispatch"
+                    "{context}: V4 backedge must reach compact root dispatch"
                 );
                 let body = &code[v4_scan..v4_update];
                 let raw = body
@@ -43582,7 +43347,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 }
             }
             assert_eq!(mapped, 1, "{context}: exact mapped V4 loop count");
-            assert_eq!(direct, 1, "{context}: exact direct-byte V9 loop count");
+            assert_eq!(direct, 0, "{context}: dominated V9 loop must be absent");
         }
 
         fn assert_rooted_aarch64_compact_bounds(words: &[u32], context: &str) {
@@ -43590,8 +43355,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             let bounds = aarch64_bound_pairs(words, AARCH64_LO, true);
             assert_eq!(
                 bounds.len(),
-                26,
-                "{context}: two V7 and two shared V6 resumes plus V8/V9/V10/V4 and V3/V12 shifts need conditional backedges"
+                25,
+                "{context}: two V7 and two shared V6 resumes plus V8/V10/V4 and V3/V12 shifts need conditional backedges"
             );
             for &(compare_index, target) in &bounds {
                 assert_ne!(
@@ -43619,8 +43384,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 .collect::<Vec<_>>();
             assert_eq!(
                 v4_updates.len(),
-                2,
-                "{context}: exact rooted V4/V9 immediate-bottom loop count; V7 probes its loop index first"
+                1,
+                "{context}: exact rooted V4 immediate-bottom loop count; V7 probes its loop index first"
             );
             let raw_load = aarch64_load_byte_reg(8, 0, 2).unwrap();
             let map_load = aarch64_load_byte_reg(8, 14, 8).unwrap();
@@ -43631,19 +43396,19 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 assert_eq!(
                     words[v4_update + 1],
                     compare,
-                    "{context}: V4/V9 update must be followed by its bottom bound"
+                    "{context}: V4 update must be followed by its bottom bound"
                 );
                 assert_eq!(
                     words[v4_update + 2] & 0xff00_001f,
                     0x5400_0000 | u32::from(AARCH64_LO),
-                    "{context}: V4/V9 bottom bound must be position < end"
+                    "{context}: V4 bottom bound must be position < end"
                 );
                 let v4_scan = aarch64_conditional_branch_target(words, v4_update + 2)
-                    .expect("rooted AArch64 V4/V9 bottom backedge");
+                    .expect("rooted AArch64 V4 bottom backedge");
                 assert_eq!(
                     words[v4_scan],
                     aarch64_cmp_x(11, 1).unwrap(),
-                    "{context}: V4/V9 backedge must reach compact root dispatch"
+                    "{context}: V4 backedge must reach compact root dispatch"
                 );
                 let body = &words[v4_scan..v4_update];
                 let raw = body
@@ -43659,7 +43424,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 }
             }
             assert_eq!(mapped, 1, "{context}: exact mapped V4 loop count");
-            assert_eq!(direct, 1, "{context}: exact direct-byte V9 loop count");
+            assert_eq!(direct, 0, "{context}: dominated V9 loop must be absent");
         }
 
         let v4_postindexed = aarch64_load_byte_post_imm(8, 2, 1).unwrap();
@@ -43726,8 +43491,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             .unwrap();
             assert_eq!(
                 x86_bound_tests(&x86.code, 0x82, true),
-                14,
-                "x86 singleton, two V7 resumes, V8/V9, and all V6 shifts retain end-relative backedges while V3/V4/V10/V12 use exact pair bounds for {output:?}"
+                13,
+                "x86 singleton, two V7 resumes, V8, and all V6 shifts retain end-relative backedges while V3/V4/V10/V12 use exact pair bounds for {output:?}"
             );
             let x86_mapped_v4 = [
                 0x44, 0x0f, 0xb6, 0x14, 0x17, 0x47, 0x0f, 0xb6, 0x14, 0x11, 0x47, 0x0f,
@@ -43753,8 +43518,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                     .windows(x86_direct_v4.len())
                     .filter(|window| *window == x86_direct_v4)
                     .count(),
-                2,
-                "x86 direct-byte u16 V8/V9 bodies for {output:?}"
+                1,
+                "x86 direct-byte u16 V8 body for {output:?}"
             );
             assert_eq!(
                 x86.code
@@ -43774,8 +43539,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             .unwrap();
             assert_eq!(
                 aarch64_bound_tests(&arm.code, AARCH64_LO, true),
-                7,
-                "AArch64 singleton, two V7 and two shared V6 resumes, and V8/V9 retain end-relative backedges while V3/V4/V10/V12 use exact pair bounds for {output:?}"
+                6,
+                "AArch64 singleton, two V7 and two shared V6 resumes, and V8 retain end-relative backedges while V3/V4/V10/V12 use exact pair bounds for {output:?}"
             );
             let words = aarch64_words(&arm.code);
             let setup_count = words
@@ -43796,7 +43561,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                         .windows(2)
                         .filter(|body| *body == v4_direct_postindexed_body)
                         .count(),
-                    1
+                    0
                 );
                 assert_eq!(
                     words
@@ -43859,8 +43624,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                     0
                 );
                 assert_eq!(
-                    setup_count, 7,
-                    "singleton, V8/V9/V10/V12, mapped V4, and V3 convert selected cursors once while V6/V7 retain offsets"
+                    setup_count, 6,
+                    "singleton, V8/V10/V12, mapped V4, and V3 convert selected cursors once while V6/V7 retain offsets"
                 );
             } else {
                 assert_eq!(
@@ -43910,7 +43675,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                         .windows(2)
                         .filter(|body| *body == v4_direct_indexed_body)
                         .count(),
-                    1
+                    0
                 );
                 assert_eq!(
                     words
@@ -44322,7 +44087,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
     }
 
     #[test]
-    fn compact_u8_v12_and_direct_v8_v9_v10_codegen_are_exactly_flag_gated() {
+    fn compact_u8_v12_and_direct_v8_v10_codegen_omit_dead_v9_production() {
         fn byte_occurrences(code: &[u8], needle: &[u8]) -> usize {
             code.windows(needle.len())
                 .filter(|window| *window == needle)
@@ -44393,7 +44158,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             )
             .unwrap();
             assert!(without.code.len() < with.code.len(), "x86 {context}");
-            for (emission, direct_count, flag_count) in [(&without, 0, 0), (&with, 2, 1)] {
+            for (emission, direct_count, flag_count) in [(&without, 0, 0), (&with, 1, 1)] {
                 assert_eq!(
                     byte_occurrences(&emission.code, &x86_runtime_class_gate),
                     0,
@@ -44426,8 +44191,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 );
                 assert_eq!(
                     byte_occurrences(&emission.code, &x86_v9_flag),
-                    flag_count,
-                    "x86 {context}: exact V9 flag selector"
+                    0,
+                    "x86 {context}: dominated V9 has no production selector"
                 );
                 assert_eq!(
                     byte_occurrences(&emission.code, &x86_v10_flag),
@@ -44446,8 +44211,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 );
                 assert_eq!(
                     byte_occurrences(&emission.code, &[0x48, 0x83, 0xf8, 0x07]),
-                    if root.is_some() { flag_count } else { 0 },
-                    "x86 {context}: V9 root representation"
+                    0,
+                    "x86 {context}: dominated V9 has no root representation"
                 );
                 assert_eq!(
                     byte_occurrences(&emission.code, &[0x48, 0x83, 0xf8, 0x08]),
@@ -44569,8 +44334,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 );
                 assert_eq!(
                     word_occurrences(&words, &direct_v9_body),
-                    direct_count,
-                    "AArch64 {context}: raw-byte V9 body"
+                    0,
+                    "AArch64 {context}: dominated V9 has no production body"
                 );
                 assert_eq!(
                     word_occurrences(&words, &direct_v8_body),
@@ -44604,8 +44369,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 );
                 assert_eq!(
                     word_occurrences(&words, &arm_v9_flag),
-                    direct_count,
-                    "AArch64 {context}: exact V9 flag selector"
+                    0,
+                    "AArch64 {context}: dominated V9 has no production selector"
                 );
                 assert_eq!(
                     word_occurrences(&words, &arm_v10_flag),
@@ -44630,8 +44395,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                         .iter()
                         .filter(|&&word| word == aarch64_cmp_x_imm(8, 7).unwrap())
                         .count(),
-                    if root.is_some() { direct_count } else { 0 },
-                    "AArch64 {context}: V9 root representation"
+                    0,
+                    "AArch64 {context}: dominated V9 has no root representation"
                 );
                 assert_eq!(
                     words
@@ -46119,8 +45884,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
         let x86 = lower_x86_64_dynamic_rows_prepared(None, FeatureSet::EMPTY).unwrap();
         assert_eq!(
             occurrences(&x86.code, &[0x47, 0x0f, 0xb7, 0x14, 0x50]),
-            37,
-            "V14, V13, V8/V9, V7/V6, paired V3/V4 first cells, and their scalar tails need scaled u16 loads"
+            36,
+            "V14, V13, V8, V7/V6, paired V3/V4 first cells, and their scalar tails need scaled u16 loads"
         );
         assert_eq!(
             occurrences(&x86.code, &[0x4e, 0x8d, 0x04, 0x16]),
@@ -46129,8 +45894,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
         );
         assert_eq!(
             occurrences(&x86.code, &[0x49, 0x89, 0xf0]),
-            35,
-            "V14/V13, singleton, V8/V9/V10/V12, V7/V4, and every V6/V3/V12 entry install row zero"
+            34,
+            "V14/V13, singleton, V8/V10/V12, V7/V4, and every V6/V3/V12 entry install row zero"
         );
         assert_eq!(
             occurrences(&x86.code, &[0x4e, 0x8d, 0x04, 0x46]),
@@ -46139,8 +45904,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
         );
         assert_eq!(
             occurrences(&x86.code, &[0x4e, 0x8d, 0x44, 0x56, 0xfe]),
-            9,
-            "three V14 alphabets plus V13, singleton, mapped V4, and V9 need direct rows+token*2-2 backedges"
+            8,
+            "three V14 alphabets plus V13, singleton, and mapped V4 need direct rows+token*2-2 backedges"
         );
         let mut v2_flag = vec![
             0x81,
@@ -46207,11 +45972,11 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             .windows(v12_flag.len())
             .position(|window| window == v12_flag.as_slice())
             .unwrap();
-        let v9_selection = x86
-            .code
-            .windows(v9_flag.len())
-            .position(|window| window == v9_flag.as_slice())
-            .unwrap();
+        assert_eq!(
+            occurrences(&x86.code, &v9_flag),
+            0,
+            "the V10-dominated V9 capability must not occupy production entries"
+        );
         let v8_selection = x86
             .code
             .windows(v8_flag.len())
@@ -46239,12 +46004,11 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 && v14_selection < v13_selection
                 && v13_selection < v10_selection
                 && v10_selection < v12_selection
-                && v12_selection < v9_selection
-                && v9_selection < v8_selection
+                && v12_selection < v8_selection
                 && v8_selection < v4_selection
                 && v4_selection < v3_selection
                 && v3_selection < v2_selection,
-            "V5, V7, V6, V14, V13, V10, V12, V9, V8, V4, V3, and V2 must retain priority order"
+            "V5, V7, V6, V14, V13, V10, V12, V8, V4, V3, and V2 must retain priority order"
         );
         assert_eq!(
             occurrences(&x86.code[v5_selection..v2_selection], &x86_full_geometry),
@@ -46662,16 +46426,16 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 .iter()
                 .filter(|&&word| word == aarch64_load_h_uxtw(8, 11, 8).unwrap())
                 .count(),
-            17,
-            "V14/V13/V7/V9 plus paired V4 first cell and its scalar tail"
+            16,
+            "V14/V13/V7 plus paired V4 first cell and its scalar tail"
         );
         assert_eq!(
             arm_words
                 .iter()
                 .filter(|&&word| word == aarch64_add_x_uxtw(11, 15, 8, 1).unwrap())
                 .count(),
-            9,
-            "three V14 alphabets plus V13, singleton, mapped V4, and V9 need biased-base cell-offset backedges"
+            8,
+            "three V14 alphabets plus V13, singleton, and mapped V4 need biased-base cell-offset backedges"
         );
         assert_eq!(
             arm_words
@@ -46709,8 +46473,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 .iter()
                 .filter(|&&word| word == aarch64_mov_x(11, 15).unwrap())
                 .count(),
-            27,
-            "V14/V13, singleton, V8/V9/V10/V12, V7/V4, shared V6, and every V3/V12 entry install row zero"
+            26,
+            "V14/V13, singleton, V8/V10/V12, V7/V4, shared V6, and every V3/V12 entry install row zero"
         );
         assert!(arm_words.contains(
             &aarch64_add_x_imm(
@@ -46867,10 +46631,14 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             .windows(arm_v12_flag.len())
             .position(|words| words == arm_v12_flag)
             .unwrap();
-        let arm_v9_selection = arm_words
-            .windows(arm_v9_flag.len())
-            .position(|words| words == arm_v9_flag)
-            .unwrap();
+        assert_eq!(
+            arm_words
+                .windows(arm_v9_flag.len())
+                .filter(|words| *words == arm_v9_flag)
+                .count(),
+            0,
+            "the V10-dominated V9 capability must not occupy production entries"
+        );
         let arm_v8_selection = arm_words
             .windows(arm_v8_flag.len())
             .position(|words| words == arm_v8_flag)
@@ -46894,8 +46662,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 && arm_v14_selection < arm_v13_selection
                 && arm_v13_selection < arm_v10_selection
                 && arm_v10_selection < arm_v12_selection
-                && arm_v12_selection < arm_v9_selection
-                && arm_v9_selection < arm_v8_selection
+                && arm_v12_selection < arm_v8_selection
                 && arm_v8_selection < arm_v4_selection
                 && arm_v4_selection < arm_v3_selection
                 && arm_v3_selection < arm_v2_selection
@@ -47270,13 +47037,13 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 "{context}: exact V6/V8 and nine V3 decoder count"
             );
             assert_eq!(
-                v4_decoders, 3,
-                "{context}: exact V7/V4/V9 decoder count"
+                v4_decoders, 2,
+                "{context}: exact V7/V4 decoder count"
             );
             assert_eq!(
                 v3_decoders + v4_decoders,
-                22,
-                "{context}: V8/V9, V7/V4, and all nine V6/V3 loops need twenty-two decoders"
+                21,
+                "{context}: V8, V7/V4, and all nine V6/V3 loops need twenty-one decoders"
             );
             assert_eq!(
                 code.windows(FORMER_MAX_COMPARE.len())
@@ -47420,8 +47187,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 "{context}: V8, shared V6, and every immediate-shift V3 loop need exact decoders"
             );
             assert_eq!(
-                v4_decoders, 2,
-                "{context}: V4/V9 need two direct cell-offset decoders"
+                v4_decoders, 1,
+                "{context}: V4 needs one direct cell-offset decoder"
             );
             assert_eq!(
                 v7_decoders, 1,
@@ -47429,8 +47196,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             );
             assert_eq!(
                 v3_decoders + v4_decoders + v7_decoders,
-                14,
-                "{context}: V8/V9, V7/V4, shared V6, and nine V3 loops need fourteen decoders"
+                13,
+                "{context}: V8, V7/V4, shared V6, and nine V3 loops need thirteen decoders"
             );
 
             let v1_mask = aarch64_and_low_w(8, 8, 29).unwrap();
@@ -47653,7 +47420,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
         // its offset-row decoder is unreachable and stripped. A real graph
         // root keeps both older representations live while this audit checks
         // that the V6/V7 decoders remain distinct from compact u16
-        // V3/V4/V8/V9. The disjoint byte-width checks below count V10 and
+        // V3/V4/V8. The disjoint byte-width checks below count V10 and
         // every V12 shift separately.
         let mut membership = [0_u64; 4];
         let byte = usize::from(b'a');

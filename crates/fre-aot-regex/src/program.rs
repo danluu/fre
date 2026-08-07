@@ -3340,10 +3340,6 @@ impl FrozenCompactRowsFormat {
         )
     }
 
-    const fn is_cell_offset(self) -> bool {
-        matches!(self, Self::CellOffsetV4 | Self::CellOffsetDirectV9)
-    }
-
     const fn is_direct_byte(self) -> bool {
         matches!(
             self,
@@ -3375,17 +3371,6 @@ impl FrozenCompactRowsFormat {
         matches!(self, Self::DenseQuadSupertransitionV14)
     }
 
-    const fn direct_byte(self) -> Self {
-        match self {
-            Self::StateOrdinalV3 | Self::StateOrdinalDirectV8 => Self::StateOrdinalDirectV8,
-            Self::CellOffsetV4 | Self::CellOffsetDirectV9 => Self::CellOffsetDirectV9,
-            Self::StateOrdinalDirectU8V10 => Self::StateOrdinalDirectU8V10,
-            Self::PairSupertransitionV11 => Self::PairSupertransitionV11,
-            Self::StateOrdinalMappedU8V12 => Self::StateOrdinalMappedU8V12,
-            Self::DensePairSupertransitionV13 => Self::DensePairSupertransitionV13,
-            Self::DenseQuadSupertransitionV14 => Self::DenseQuadSupertransitionV14,
-        }
-    }
 }
 
 fn select_frozen_compact_rows_format(
@@ -4985,10 +4970,11 @@ fn frozen_compact_raw_byte_projection(
     })
 }
 
-/// Decide whether a mapped compact representation can be republished as an
-/// exact raw-byte V8/V9 capability without exceeding any existing resource
-/// authority. V8 additionally requires its already-padded 256-cell geometry;
-/// V9 must fit every expanded cell-row offset in the 15-bit token.
+/// Decide whether a mapped state-ordinal representation can be republished as
+/// an exact raw-byte V8 capability without exceeding any existing resource
+/// authority. Cell-offset V4 is deliberately excluded: every old V9-admissible
+/// geometry has at most 127 states and its strictly smaller byte-cell V10 owner
+/// is selected first.
 fn frozen_compact_raw_byte_is_admissible(
     format: FrozenCompactRowsFormat,
     class_count: usize,
@@ -5002,13 +4988,7 @@ fn frozen_compact_raw_byte_is_admissible(
     let Some(expanded_cells) = state_count.checked_mul(256) else {
         return false;
     };
-    if format.is_state_ordinal() {
-        if class_count.checked_next_power_of_two() != Some(256) {
-            return false;
-        }
-    } else if !format.is_cell_offset()
-        || expanded_cells > usize::from(DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK)
-    {
+    if !format.is_state_ordinal() || class_count.checked_next_power_of_two() != Some(256) {
         return false;
     }
     let Some(expanded_bytes) = expanded_cells
@@ -5124,6 +5104,11 @@ fn promote_frozen_compact_raw_byte_projection(
             FrozenCompactRowsFormat::StateOrdinalMappedU8V12,
         );
     }
+    // V9 has no producer here. Its 15-bit expanded cell-offset limit implies
+    // `state_count * 256 <= 32767`, hence `state_count <= 127`; V10 therefore
+    // fits every destination ordinal and consumes strictly fewer bytes. Keep
+    // V9's published verifier/ABI compatibility, but do not spend production
+    // code or selection work on an unreachable result.
     if frozen_compact_raw_byte_is_admissible(
         format,
         projection.class_count,
@@ -5132,7 +5117,10 @@ fn promote_frozen_compact_raw_byte_projection(
         max_packed_bytes,
     ) {
         if let Some(raw_byte_projection) = frozen_compact_raw_byte_projection(&projection) {
-            return (raw_byte_projection, format.direct_byte());
+            return (
+                raw_byte_projection,
+                FrozenCompactRowsFormat::StateOrdinalDirectV8,
+            );
         }
     }
     (projection, format)
@@ -23587,13 +23575,13 @@ mod tests {
             v3_bytes - 1,
         ));
 
-        let v9_bytes = packed_u16_bytes(127);
-        assert!(frozen_compact_raw_byte_is_admissible(
+        let former_v9_bytes = packed_u16_bytes(127);
+        assert!(!frozen_compact_raw_byte_is_admissible(
             FrozenCompactRowsFormat::CellOffsetV4,
             129,
             127,
-            v9_bytes,
-            v9_bytes,
+            former_v9_bytes,
+            former_v9_bytes,
         ));
         assert!(!frozen_compact_raw_byte_is_admissible(
             FrozenCompactRowsFormat::CellOffsetV4,
@@ -23603,18 +23591,18 @@ mod tests {
             usize::MAX,
         ));
         let mapped_v4_bytes = 127 * 129 * 2 + 256;
-        assert!(mapped_v4_bytes < v9_bytes);
+        assert!(mapped_v4_bytes < former_v9_bytes);
         assert!(!frozen_compact_raw_byte_is_admissible(
             FrozenCompactRowsFormat::CellOffsetV4,
             129,
             127,
             usize::MAX,
-            v9_bytes - 1,
+            former_v9_bytes - 1,
         ));
-        assert!(mapped_v4_bytes <= v9_bytes - 1);
+        assert!(mapped_v4_bytes <= former_v9_bytes - 1);
 
         let v10_bytes = packed_u8_bytes(127);
-        assert!(v10_bytes < v9_bytes);
+        assert!(v10_bytes < former_v9_bytes);
         assert!(frozen_compact_raw_byte_u8_is_admissible(
             129,
             127,
@@ -23740,6 +23728,52 @@ mod tests {
             })
             .is_none()
         );
+    }
+
+    #[test]
+    fn raw_byte_v9_production_is_exhaustively_dominated_by_v10() {
+        let cell_offset_limit = usize::from(DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK);
+        let v10_state_limit = usize::from(DYNAMIC_NATIVE_ROWS_V10_NEXT_STATE_TOKEN_MASK);
+        assert_eq!(cell_offset_limit / 256, v10_state_limit);
+
+        for class_count in FROZEN_COMPACT_DIRECT_BYTE_MIN_CLASSES..=256 {
+            let projection = FrozenCompactColumnProjection {
+                class_count,
+                source_classes: core::array::from_fn(|class| {
+                    u8::try_from(class.min(usize::from(u8::MAX))).unwrap()
+                }),
+                class_map: core::array::from_fn(|byte| {
+                    u8::try_from(byte % class_count).unwrap()
+                }),
+            };
+            for state_count in 1..=cell_offset_limit / 256 {
+                let former_v9_bytes = state_count * 256 * core::mem::size_of::<u16>() + 256;
+                let v10_bytes = state_count * 256 + 256;
+                assert!(v10_bytes < former_v9_bytes);
+                assert!(frozen_compact_raw_byte_u8_is_admissible(
+                    class_count,
+                    state_count,
+                    former_v9_bytes,
+                    former_v9_bytes,
+                ));
+                assert!(!frozen_compact_raw_byte_is_admissible(
+                    FrozenCompactRowsFormat::CellOffsetV4,
+                    class_count,
+                    state_count,
+                    former_v9_bytes,
+                    former_v9_bytes,
+                ));
+                let (_, selected) = promote_frozen_compact_raw_byte_projection(
+                    projection.clone(),
+                    FrozenCompactRowsFormat::CellOffsetV4,
+                    state_count,
+                    former_v9_bytes,
+                    former_v9_bytes,
+                );
+                assert_eq!(selected, FrozenCompactRowsFormat::StateOrdinalDirectU8V10);
+                assert_ne!(selected, FrozenCompactRowsFormat::CellOffsetDirectV9);
+            }
+        }
     }
 
     #[test]
