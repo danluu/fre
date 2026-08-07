@@ -13944,6 +13944,61 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     ])?;
     assembler.instruction(&[0x48, 0x85, 0xf6])?;
     assembler.branch(&[0x0f, 0x84], framed_fallback)?;
+    if root_plan.is_none() {
+        // The active V4 capability authenticates the immutable class count
+        // and every class-map byte before publication. A one-class alphabet
+        // therefore selects cell zero for every possible input byte. Keep a
+        // separate closed loop that consumes only the sole u16 cell, avoiding
+        // both the haystack-byte load and the dependent class-map load.
+        let class_mapped = assembler.label()?;
+        assembler.instruction(&[
+            0x41,
+            0x83,
+            0x7b,
+            u8::try_from(FROZEN_DYNAMIC_ROWS_V3_CLASS_COUNT_OFFSET)
+                .map_err(|_| ObjectError::ArithmeticOverflow("x86 V4 singleton classes"))?,
+            1,
+        ])?;
+        assembler.branch(&[0x0f, 0x85], class_mapped)?;
+        assembler.instruction(&[0x49, 0x89, 0xf0])?; // canonical V4 row zero
+        assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x40])?;
+        assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x48])?;
+        if output != OutputContract::Exists {
+            assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x60, 0, 0, 0, 0])?;
+        }
+        let singleton_scan = assembler.label()?;
+        assembler.bind(singleton_scan)?;
+        assembler.instruction(&[0x45, 0x0f, 0xb7, 0x10])?;
+        assembler.instruction(&[0x48, 0xff, 0xc2])?;
+        if output == OutputContract::Exists {
+            assembler.instruction(&[0x66, 0x45, 0x85, 0xd2])?;
+            assembler.branch(&[0x0f, 0x88], native_match)?;
+            assembler.branch(
+                &[0x0f, 0x84],
+                native_complete.unwrap_or(native_no_match),
+            )?;
+        } else {
+            assembler.instruction(&[0x41, 0xf7, 0xc2, 0x00, 0x80, 0x00, 0x00])?;
+            let not_accepting = assembler.label()?;
+            assembler.branch(&[0x0f, 0x84], not_accepting)?;
+            assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x60])?;
+            assembler.bind(not_accepting)?;
+            assembler.instruction(&[0x41, 0x81, 0xe2, 0xff, 0x7f, 0x00, 0x00])?;
+            assembler.instruction(&[0x45, 0x85, 0xd2])?;
+            assembler.branch(
+                &[0x0f, 0x84],
+                native_complete.unwrap_or(native_no_match),
+            )?;
+        }
+        assembler.instruction(&[0x4e, 0x8d, 0x44, 0x56, 0xfe])?;
+        assembler.instruction(&[0x48, 0x39, 0xca])?;
+        assembler.branch(&[0x0f, 0x82], singleton_scan)?;
+        assembler.branch(
+            &[0xe9],
+            native_complete.unwrap_or(native_no_match),
+        )?;
+        assembler.bind(class_mapped)?;
+    }
     let class_map_offset = i32::try_from(FROZEN_PREPARED_HEADER_V1_CLASS_MAP_OFFSET)
         .map_err(|_| ObjectError::ArithmeticOverflow("x86 V4 inline class map"))?;
     let mut inline_class_map = vec![0x4c, 0x8d, 0x8f];
@@ -16340,6 +16395,20 @@ fn aarch64_load_halfword_reg(destination: u8, base: u8, index: u8) -> Result<u32
             | aarch64_reg(base, 5)?
             | aarch64_reg(destination, 0)?,
     )
+}
+
+fn aarch64_load_halfword_imm(
+    destination: u8,
+    base: u8,
+    byte_offset: u16,
+) -> Result<u32, ObjectError> {
+    if !byte_offset.is_multiple_of(2) || byte_offset / 2 > 0x0fff {
+        return Err(ObjectError::InvalidModule("AArch64 LDRH offset"));
+    }
+    Ok(0x7940_0000
+        | (u32::from(byte_offset / 2) << 10)
+        | aarch64_reg(base, 5)?
+        | aarch64_reg(destination, 0)?)
 }
 
 fn aarch64_load_byte_imm(destination: u8, base: u8, byte_offset: u16) -> Result<u32, ObjectError> {
@@ -22195,6 +22264,53 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     )?)?;
     assembler.instruction(aarch64_cmp_x_imm(15, 0)?)?;
     assembler.branch_cond(AARCH64_EQ, framed_fallback)?;
+    if root_plan.is_none() {
+        // V4 publication authenticates the class map against this immutable
+        // count. When there is exactly one class, every byte selects the sole
+        // u16 cell, so neither the input byte nor the class map belongs in the
+        // steady-state dependency chain.
+        let class_mapped = assembler.label()?;
+        assembler.instruction(aarch64_load_w_imm(
+            8,
+            13,
+            u16::try_from(FROZEN_DYNAMIC_ROWS_V3_CLASS_COUNT_OFFSET).map_err(|_| {
+                ObjectError::ArithmeticOverflow("AArch64 V4 singleton classes")
+            })?,
+        )?)?;
+        assembler.instruction(aarch64_cmp_w_imm(8, 1)?)?;
+        assembler.branch_cond(AARCH64_NE, class_mapped)?;
+        assembler.instruction(aarch64_mov_x(11, 15)?)?;
+        assembler.instruction(aarch64_sub_x_imm(15, 15, 2)?)?;
+        assembler.instruction(aarch64_load_x_imm(2, 31, 48)?)?;
+        assembler.instruction(aarch64_load_x_imm(3, 31, 56)?)?;
+        if scanner_free_exists_pointer_cursor {
+            assembler.instruction(aarch64_load_x_imm(0, 31, 8)?)?;
+            assembler.instruction(aarch64_add_x_reg(2, 0, 2)?)?;
+            assembler.instruction(aarch64_add_x_reg(3, 0, 3)?)?;
+        } else {
+            assembler.instruction(aarch64_store_x(31, 31, 80)?)?;
+        }
+        let singleton_scan = assembler.label()?;
+        assembler.bind(singleton_scan)?;
+        assembler.instruction(aarch64_load_halfword_imm(8, 11, 0)?)?;
+        assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
+        if output == OutputContract::Exists {
+            assembler.branch_bit_set_w(8, 15, native_match)?;
+            assembler.branch_zero_w(8, native_complete.unwrap_or(native_no_match))?;
+        } else {
+            let not_accepting = assembler.label()?;
+            assembler.branch_bit_clear_w(8, 15, not_accepting)?;
+            assembler.instruction(aarch64_store_x(2, 31, 80)?)?;
+            assembler.bind(not_accepting)?;
+            assembler.instruction(aarch64_and_low_w(8, 8, 15)?)?;
+            assembler.branch_zero_w(8, native_complete.unwrap_or(native_no_match))?;
+        }
+        assembler.instruction(aarch64_add_x_uxtw(11, 15, 8, 1)?)?;
+        assembler.instruction(aarch64_cmp_x(2, 3)?)?;
+        assembler.branch_cond(AARCH64_LO, singleton_scan)?;
+        assembler.branch(native_complete.unwrap_or(native_no_match))?;
+        assembler.bind(class_mapped)?;
+    }
     // Setup canonicalized the initial row before choosing V4. Preserve its
     // direct pointer before biasing the base for one-based transition tokens.
     assembler.instruction(aarch64_mov_x(11, 15)?)?;
@@ -30204,6 +30320,66 @@ mod tests {
         any(target_arch = "x86_64", target_arch = "aarch64"),
         any(target_os = "linux", target_os = "macos")
     ))]
+    fn scanner_free_single_class_variable_raw() -> fre_automata::RawPlan {
+        use fre_automata::{EdgeKind, RawPlan, StateRole};
+
+        // Two prioritized all-byte chains recognize lengths 41 and 40. Every
+        // transition has the same 0..=255 predicate, so the authenticated K0
+        // projection has exactly one alphabet class. Different widths prevent
+        // exact-product lowering and retain the general scanner-free dynamic
+        // path. Lengths straddle the native minimum, allowing linked tests to
+        // exercise first-priority acceptance, second-priority acceptance, and
+        // no match without entering the short-input fallback.
+        let first_width = 41_usize;
+        let second_width = 40_usize;
+        let consume_states = first_width + second_width;
+        let second_start = 1 + first_width;
+        let accept = 1 + consume_states;
+
+        let mut roles = Vec::with_capacity(accept + 1);
+        roles.push(StateRole::Split);
+        roles.extend(std::iter::repeat_n(StateRole::Consume, consume_states));
+        roles.push(StateRole::Accept);
+
+        let mut edge_offsets = Vec::with_capacity(roles.len() + 1);
+        edge_offsets.push(0);
+        edge_offsets.push(2);
+        for edge_count in 1..=consume_states {
+            edge_offsets.push(u32::try_from(2 + edge_count).unwrap());
+        }
+        edge_offsets.push(u32::try_from(2 + consume_states).unwrap());
+
+        let mut edge_targets = vec![1_u32, u32::try_from(second_start).unwrap()];
+        for state in 1..=consume_states {
+            let target = if state == first_width || state == consume_states {
+                accept
+            } else {
+                state + 1
+            };
+            edge_targets.push(u32::try_from(target).unwrap());
+        }
+        let mut edge_kinds = vec![EdgeKind::Epsilon; 2];
+        edge_kinds.extend(std::iter::repeat_n(EdgeKind::ByteRange, consume_states));
+        let mut byte_starts = vec![0_u8; 2];
+        byte_starts.extend(std::iter::repeat_n(u8::MIN, consume_states));
+        let mut byte_ends = vec![0_u8; 2];
+        byte_ends.extend(std::iter::repeat_n(u8::MAX, consume_states));
+
+        RawPlan {
+            start: 0,
+            roles,
+            edge_offsets,
+            edge_targets,
+            edge_kinds,
+            byte_starts,
+            byte_ends,
+        }
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
     fn scanner_free_variable_pair_raw() -> fre_automata::RawPlan {
         use fre_automata::{EdgeKind, RawPlan, StateRole};
 
@@ -32407,6 +32583,431 @@ static int run_case(const unsigned char *p,size_t n,size_t s,size_t e,uint32_t e
             String::from_utf8_lossy(&output.stderr)
         );
         fs::remove_dir_all(&directory).expect("remove frozen dynamic linker directory");
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    #[ignore = "requires `cargo build -p fre-aot-regex-runtime --lib`; links an authenticated singleton-class V4 table to the real runtime"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one linked fixture proves V4 class-count ownership and both supported variable-width value contracts on real machine code"
+    )]
+    fn linked_host_frozen_v4_singleton_class_matches_real_runtime() {
+        use std::{fmt::Write as _, fs, process::Command, time::SystemTime};
+
+        let target = if cfg!(target_arch = "x86_64") {
+            if cfg!(target_os = "linux") {
+                Target::x86_64_linux()
+            } else {
+                Target::x86_64_macos()
+            }
+        } else if cfg!(target_os = "linux") {
+            Target::aarch64_linux()
+        } else {
+            Target::aarch64_macos()
+        };
+        let current_exe = std::env::current_exe().expect("current test executable");
+        let profile_dir = current_exe
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("Cargo profile directory");
+        let static_runtime = profile_dir.join("libfre_aot_regex_runtime.a");
+        assert!(
+            static_runtime.is_file(),
+            "build the linked runtime first: cargo build -p fre-aot-regex-runtime --lib ({})",
+            static_runtime.display()
+        );
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "fre-aot-frozen-v4-singleton-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("create singleton V4 linker directory");
+
+        for (output_index, output) in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let program = scanner_free_dynamic_program(
+                scanner_free_single_class_variable_raw(),
+                output,
+            );
+            assert!(program.native_dfa_view().is_none());
+            assert!(program.native_partial_dfa_view().is_none());
+            assert!(!program.has_nfa_exact_product());
+            let view = program
+                .native_dynamic_rows_view()
+                .expect("singleton-class scanner-free dynamic view");
+            assert_eq!(view.root_requirement, None);
+            assert_eq!(view.exact_match_width, None);
+            let workspace = program.prepare_workspace().unwrap();
+            let storage = program
+                .compiler_private_frozen_dynamic_rows_storage_v3(
+                    &workspace,
+                    512 * 1024,
+                    512 * 1024,
+                )
+                .expect("singleton-class compact storage");
+            let header = program.compiler_private_frozen_prepared_header_v3(
+                &workspace,
+                None,
+                Some(&storage),
+            );
+            assert!(header.is_active());
+            assert!(header.has_dynamic_rows());
+
+            let module = lower_without_materialized_k0(&program, target);
+            let entry = module
+                .prepared_entry_symbol()
+                .expect("singleton V4 prepared symbol");
+            let (program_symbol, program_len) = module
+                .required_runtime_program()
+                .expect("singleton V4 runtime program");
+            let object = directory.join(format!("singleton-{output_index}.o"));
+            let object_bytes = crate::emit_object(
+                &module,
+                ObjectFormat::for_target(target),
+                usize::MAX,
+            )
+            .expect("emit singleton V4 object");
+            fs::write(&object, object_bytes).expect("write singleton V4 object");
+
+            let mut source = String::from(
+                "#include <stddef.h>\n#include <stdint.h>\n#include <string.h>\n\
+                 typedef void *handle_t;typedef struct{size_t start;size_t end;} result_t;\n",
+            );
+            writeln!(source, "extern const unsigned char {program_symbol}[];").unwrap();
+            writeln!(
+                source,
+                "extern uint32_t {entry}(handle_t,const unsigned char*,size_t,size_t,size_t,result_t*);"
+            )
+            .unwrap();
+            source.push_str(
+                "extern uint32_t fre_aot_regex_runtime_prepare_exclusive_v1(const unsigned char*,size_t,handle_t*);\n\
+                 extern uint32_t fre_aot_regex_runtime_search_exclusive_v1(handle_t,const unsigned char*,size_t,size_t,size_t,result_t*);\n\
+                 extern uint32_t fre_aot_regex_runtime_destroy_exclusive_v1(handle_t);\n",
+            );
+            writeln!(source, "#define PROGRAM_BYTES {program_symbol}").unwrap();
+            writeln!(source, "#define PROGRAM_LENGTH {program_len}U").unwrap();
+            writeln!(source, "#define NATIVE_ENTRY {entry}").unwrap();
+            for (name, value) in [
+                ("ACTIVE_OFFSET", FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL_OFFSET),
+                ("FLAGS_OFFSET", FROZEN_PREPARED_HEADER_V1_FLAGS_OFFSET),
+                ("HEADER_BYTES_OFFSET", FROZEN_PREPARED_HEADER_V1_HEADER_BYTES_OFFSET),
+                ("ROWS_OFFSET", FROZEN_PREPARED_HEADER_V1_FORWARD_ROWS_ADDRESS_OFFSET),
+                ("CELLS_OFFSET", FROZEN_PREPARED_HEADER_V1_FORWARD_LIVE_CELLS_OFFSET),
+                ("ROW_STRIDE_OFFSET", FROZEN_PREPARED_HEADER_V1_ROW_STRIDE_OFFSET),
+                ("INITIAL_ROW_OFFSET", FROZEN_PREPARED_HEADER_V1_FORWARD_INITIAL_ROW_OFFSET),
+                ("CLASS_MAP_OFFSET", FROZEN_PREPARED_HEADER_V1_CLASS_MAP_OFFSET),
+                ("V4_TAIL_OFFSET", FROZEN_PREPARED_HEADER_V4_DYNAMIC_ROWS_OFFSET),
+                ("V4_READY_OFFSET", FROZEN_DYNAMIC_ROWS_V3_READY_SEAL_OFFSET),
+                ("V4_ROWS_OFFSET", FROZEN_DYNAMIC_ROWS_V3_ROWS_ADDRESS_OFFSET),
+                ("V4_CACHE_OFFSET", FROZEN_DYNAMIC_ROWS_V3_CACHE_IDENTITY_OFFSET),
+                ("V4_STATES_OFFSET", FROZEN_DYNAMIC_ROWS_V3_STATE_COUNT_OFFSET),
+                ("V4_CLASSES_OFFSET", FROZEN_DYNAMIC_ROWS_V3_CLASS_COUNT_OFFSET),
+                ("V4_SHIFT_OFFSET", FROZEN_DYNAMIC_ROWS_V3_ROW_SHIFT_OFFSET),
+                ("V4_INITIAL_OFFSET", FROZEN_DYNAMIC_ROWS_V3_INITIAL_STATE_OFFSET),
+                ("V4_FORMAT_OFFSET", FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION_OFFSET),
+            ] {
+                writeln!(source, "#define {name} {value}U").unwrap();
+            }
+            writeln!(
+                source,
+                "#define ACTIVE_SEAL UINT64_C({FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL})"
+            )
+            .unwrap();
+            writeln!(
+                source,
+                "#define V4_FLAG UINT32_C({FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V4})"
+            )
+            .unwrap();
+            writeln!(source, "#define V4_BYTES {FROZEN_PREPARED_HEADER_V4_BYTES}U").unwrap();
+            writeln!(
+                source,
+                "#define V4_READY_SEAL UINT64_C({FROZEN_PREPARED_HEADER_V4_READY_SEAL})"
+            )
+            .unwrap();
+            writeln!(
+                source,
+                "#define V4_FORMAT UINT32_C({FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION})"
+            )
+            .unwrap();
+            source.push_str(
+                r#"
+static uint32_t read_u32(handle_t h,size_t o){uint32_t v=0;memcpy(&v,(const unsigned char*)h+o,sizeof(v));return v;}
+static uint64_t read_u64(handle_t h,size_t o){uint64_t v=0;memcpy(&v,(const unsigned char*)h+o,sizeof(v));return v;}
+static size_t read_size(handle_t h,size_t o){size_t v=0;memcpy(&v,(const unsigned char*)h+o,sizeof(v));return v;}
+static int owns_singleton_v4(handle_t h){
+  if(h==NULL||read_u64(h,ACTIVE_OFFSET)!=ACTIVE_SEAL)return 0;
+  if(read_u32(h,FLAGS_OFFSET)!=V4_FLAG||read_size(h,HEADER_BYTES_OFFSET)!=V4_BYTES)return 0;
+  if(read_size(h,ROWS_OFFSET)==0U||read_size(h,V4_TAIL_OFFSET+V4_ROWS_OFFSET)!=read_size(h,ROWS_OFFSET))return 0;
+  if(read_u64(h,V4_TAIL_OFFSET+V4_CACHE_OFFSET)==0U)return 0;
+  if(read_u64(h,V4_TAIL_OFFSET+V4_READY_OFFSET)!=V4_READY_SEAL)return 0;
+  if(read_u32(h,V4_TAIL_OFFSET+V4_FORMAT_OFFSET)!=V4_FORMAT)return 0;
+  if(read_u32(h,V4_TAIL_OFFSET+V4_STATES_OFFSET)==0U)return 0;
+  if(read_u32(h,V4_TAIL_OFFSET+V4_CLASSES_OFFSET)!=1U)return 0;
+  if(read_u32(h,V4_TAIL_OFFSET+V4_SHIFT_OFFSET)!=0U)return 0;
+  if(read_u32(h,V4_TAIL_OFFSET+V4_INITIAL_OFFSET)!=0U)return 0;
+  if(read_u32(h,ROW_STRIDE_OFFSET)!=1U||read_u32(h,INITIAL_ROW_OFFSET)!=0U)return 0;
+  if(read_size(h,CELLS_OFFSET)!=(size_t)read_u32(h,V4_TAIL_OFFSET+V4_STATES_OFFSET))return 0;
+  for(size_t i=0;i<256U;i++)if(((const unsigned char*)h)[CLASS_MAP_OFFSET+i]!=0U)return 0;
+  return 1;
+}
+static int prepare(handle_t*h){return fre_aot_regex_runtime_prepare_exclusive_v1(PROGRAM_BYTES,PROGRAM_LENGTH,h)==0U;}
+static int destroy(handle_t h){return fre_aot_regex_runtime_destroy_exclusive_v1(h)==0U;}
+static int run_case(size_t s,size_t e,uint32_t xs,size_t xb,size_t xe,int base){
+  unsigned char p[80];for(size_t i=0;i<sizeof(p);i++)p[i]=(unsigned char)(i*37U+11U);
+  handle_t native=0,baseline=0;result_t nr={91U,92U},br={93U,94U};
+  if(!prepare(&native)||!prepare(&baseline))return base;
+  if(!owns_singleton_v4(native))return base+1;
+  uint32_t ns=NATIVE_ENTRY(native,p,sizeof(p),s,e,&nr);
+  uint32_t bs=fre_aot_regex_runtime_search_exclusive_v1(baseline,p,sizeof(p),s,e,&br);
+  if(ns!=bs||nr.start!=br.start||nr.end!=br.end)return base+2;
+  if(ns!=xs||nr.start!=xb||nr.end!=xe)return base+3;
+  if(!owns_singleton_v4(native))return base+4;
+  if(!destroy(native)||!destroy(baseline))return base+5;
+  return 0;
+}
+int main(void){int status;
+"#,
+            );
+            let (long_begin, long_end, short_begin, short_end) = match output {
+                OutputContract::Exists => (0, 0, 0, 0),
+                OutputContract::SelectedEnd => (46, 46, 45, 45),
+                OutputContract::Span => unreachable!(),
+            };
+            writeln!(
+                source,
+                "status=run_case(5U,55U,1U,{long_begin}U,{long_end}U,10);if(status)return status;"
+            )
+            .unwrap();
+            writeln!(
+                source,
+                "status=run_case(5U,45U,1U,{short_begin}U,{short_end}U,20);if(status)return status;"
+            )
+            .unwrap();
+            source.push_str(
+                "status=run_case(5U,44U,0U,0U,0U,30);if(status)return status;return 0;}\n",
+            );
+
+            let c_path = directory.join(format!("singleton-{output_index}.c"));
+            let executable = directory.join(format!("singleton-{output_index}"));
+            fs::write(&c_path, source).expect("write singleton V4 C harness");
+            let c_compiler = if cfg!(target_os = "macos") {
+                "clang"
+            } else {
+                "cc"
+            };
+            let status = Command::new(c_compiler)
+                .arg("-O0")
+                .arg(&c_path)
+                .arg(&object)
+                .arg(&static_runtime)
+                .arg("-o")
+                .arg(&executable)
+                .status()
+                .expect("link singleton V4 harness");
+            assert!(status.success(), "singleton V4 harness failed to link");
+            let result = Command::new(&executable)
+                .output()
+                .expect("execute singleton V4 real-runtime harness");
+            assert!(
+                result.status.success(),
+                "{output:?}: status={:?} stdout={} stderr={}",
+                result.status.code(),
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        fs::remove_dir_all(&directory).expect("remove singleton V4 linker directory");
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    #[ignore = "links a fully authenticated singleton-class V4 descriptor to the exact-width Span entry"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the direct descriptor fixture records every V4 publication invariant beside its real-machine Span oracle"
+    )]
+    fn linked_host_frozen_v4_singleton_class_executes_span() {
+        use std::{fs, process::Command, time::SystemTime};
+
+        let target = if cfg!(target_arch = "x86_64") {
+            if cfg!(target_os = "linux") {
+                Target::x86_64_linux()
+            } else {
+                Target::x86_64_macos()
+            }
+        } else if cfg!(target_os = "linux") {
+            Target::aarch64_linux()
+        } else {
+            Target::aarch64_macos()
+        };
+        // This general fixed-width correlated graph has no graph root scanner
+        // and no Cartesian exact-product proof. Its prepared entry therefore
+        // supplies the ordinary scanner-free exact-Span control flow. The C
+        // fixture below installs a complete two-state, one-class V4 machine
+        // satisfying every publication invariant to execute the singleton
+        // body directly; no runtime helper is allowed to observe the call.
+        let program = scanner_free_dynamic_program(
+            scanner_free_correlated_pair_raw(),
+            OutputContract::Span,
+        );
+        assert!(!program.has_nfa_exact_product());
+        let view = program
+            .native_dynamic_rows_view()
+            .expect("scanner-free exact Span dynamic view");
+        assert_eq!(view.root_requirement, None);
+        assert_eq!(view.exact_match_width, Some(2));
+        let module = lower_without_materialized_k0(&program, target);
+        assert!(
+            module
+                .required_prepared_dynamic_rows_span_recovery_runtime_symbol()
+                .is_none(),
+            "a fixed-width Span must recover its start without a helper"
+        );
+        let entry = module
+            .prepared_entry_symbol()
+            .expect("scanner-free exact Span prepared entry");
+        let identity = program
+            .artifact_identity()
+            .iter()
+            .map(u8::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "fre-aot-frozen-v4-singleton-span-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("create singleton Span linker directory");
+        let object = directory.join("singleton-span.o");
+        let object_bytes = crate::emit_object(
+            &module,
+            ObjectFormat::for_target(target),
+            usize::MAX,
+        )
+        .expect("emit singleton Span object");
+        fs::write(&object, object_bytes).expect("write singleton Span object");
+
+        let source = format!(
+            r##"#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+typedef void *handle_t;
+typedef struct {{ size_t start; size_t end; }} result_t;
+typedef struct {{
+  uint64_t active_seal; uint64_t magic; uint32_t abi_version; uint32_t flags;
+  size_t header_bytes; unsigned char artifact_identity[32];
+  size_t forward_rows_address; size_t reverse_rows_address;
+  size_t forward_live_cells; size_t reverse_live_cells; uint64_t cache_identity;
+  uint32_t row_stride; uint32_t forward_initial_row; uint32_t reverse_initial_row;
+  uint32_t unfilled_cell; uint32_t accept_mask; uint32_t next_row_token_mask;
+  unsigned char class_map[256];
+}} frozen_v1_t;
+typedef struct {{
+  uint64_t ready_seal; size_t rows_address; uint64_t cache_identity;
+  uint32_t state_count; uint32_t class_count; uint32_t row_shift;
+  uint32_t initial_state; uint32_t learned_loop_state_count;
+  uint32_t learned_loop_states[4]; uint32_t format_version;
+}} frozen_v4_tail_t;
+typedef struct {{ frozen_v1_t v1; frozen_v4_tail_t v4; }} frozen_v4_t;
+typedef struct {{ size_t start; size_t end; size_t rows; uint64_t generation; }} preflight_t;
+typedef struct {{ size_t row; size_t position; size_t pending; size_t end; uint64_t generation; }} continuation_t;
+_Static_assert(sizeof(frozen_v1_t)=={v1_bytes}U,"V1 extent");
+_Static_assert(offsetof(frozen_v4_t,v4)=={tail_offset}U,"V4 tail offset");
+_Static_assert(sizeof(frozen_v4_t)=={v4_bytes}U,"V4 extent");
+extern uint32_t {entry}(handle_t,const unsigned char*,size_t,size_t,size_t,result_t*);
+static const unsigned char identity[32]={{{identity}}};
+static uint16_t rows[2];
+static frozen_v4_t frozen;
+static unsigned helper_calls;
+uint32_t fre_aot_regex_runtime_search_v1(const unsigned char*a,const unsigned char*b,size_t n,size_t s,size_t e,result_t*r){{(void)a;(void)b;(void)n;(void)s;(void)e;(void)r;helper_calls++;return 97U;}}
+uint32_t fre_aot_regex_runtime_search_exclusive_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;helper_calls++;return 97U;}}
+uint32_t fre_aot_regex_runtime_search_exclusive_dynamic_rows_preflight_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,preflight_t*o){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;(void)i;(void)o;helper_calls++;return 97U;}}
+uint32_t fre_aot_regex_runtime_search_exclusive_dynamic_rows_deopt_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;helper_calls++;return 97U;}}
+uint32_t fre_aot_regex_runtime_search_exclusive_dynamic_rows_continue_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,const continuation_t*c){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;(void)i;(void)c;helper_calls++;return 97U;}}
+static void init(int matching){{
+  memset(&frozen,0,sizeof(frozen));rows[0]=matching?2U:0U;rows[1]=UINT16_C(0x8000);
+  frozen.v1.active_seal=UINT64_C({active_seal});frozen.v1.magic=UINT64_C({magic});
+  frozen.v1.abi_version=UINT32_C({abi});frozen.v1.flags=UINT32_C({v4_flag});
+  frozen.v1.header_bytes={v4_bytes}U;memcpy(frozen.v1.artifact_identity,identity,sizeof(identity));
+  frozen.v1.forward_rows_address=(size_t)(uintptr_t)rows;frozen.v1.forward_live_cells=2U;
+  frozen.v1.cache_identity=UINT64_C(77);frozen.v1.row_stride=1U;
+  frozen.v1.forward_initial_row=0U;frozen.v1.reverse_initial_row=UINT32_MAX;
+  frozen.v1.unfilled_cell=0U;frozen.v1.accept_mask=UINT32_C(0x8000);
+  frozen.v1.next_row_token_mask=UINT32_C(0x7fff);
+  frozen.v4.ready_seal=UINT64_C({ready_seal});frozen.v4.rows_address=(size_t)(uintptr_t)rows;
+  frozen.v4.cache_identity=UINT64_C(77);frozen.v4.state_count=2U;frozen.v4.class_count=1U;
+  frozen.v4.row_shift=0U;frozen.v4.initial_state=0U;frozen.v4.learned_loop_state_count=0U;
+  for(size_t i=0;i<4U;i++)frozen.v4.learned_loop_states[i]=UINT32_MAX;
+  frozen.v4.format_version=UINT32_C({v4_format});
+}}
+static int run(int matching,int base){{
+  unsigned char haystack[64];memset(haystack,'a',sizeof(haystack));init(matching);helper_calls=0;
+  result_t result={{91U,92U}};uint32_t status={entry}((handle_t)&frozen,haystack,sizeof(haystack),5U,37U,&result);
+  uint32_t expected=matching?1U:0U;size_t begin=matching?5U:0U;size_t end=matching?7U:0U;
+  if(status!=expected||result.start!=begin||result.end!=end)return base;
+  if(helper_calls!=0U)return base+1;
+  if(frozen.v1.active_seal!=UINT64_C({active_seal})||frozen.v4.ready_seal!=UINT64_C({ready_seal}))return base+2;
+  return 0;
+}}
+int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
+"##,
+            v1_bytes = FROZEN_PREPARED_HEADER_V4_DYNAMIC_ROWS_OFFSET,
+            tail_offset = FROZEN_PREPARED_HEADER_V4_DYNAMIC_ROWS_OFFSET,
+            v4_bytes = FROZEN_PREPARED_HEADER_V4_BYTES,
+            active_seal = FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL,
+            magic = FROZEN_PREPARED_HEADER_V1_MAGIC,
+            abi = FROZEN_PREPARED_HEADER_V1_ABI_VERSION,
+            v4_flag = FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V4,
+            ready_seal = FROZEN_PREPARED_HEADER_V4_READY_SEAL,
+            v4_format = FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION,
+        );
+        let c_path = directory.join("singleton-span.c");
+        let executable = directory.join("singleton-span");
+        fs::write(&c_path, source).expect("write singleton Span C harness");
+        let c_compiler = if cfg!(target_os = "macos") {
+            "clang"
+        } else {
+            "cc"
+        };
+        let status = Command::new(c_compiler)
+            .arg("-O0")
+            .arg(&c_path)
+            .arg(&object)
+            .arg("-o")
+            .arg(&executable)
+            .status()
+            .expect("link singleton Span harness");
+        assert!(status.success(), "singleton Span harness failed to link");
+        let result = Command::new(&executable)
+            .output()
+            .expect("execute singleton Span harness");
+        assert!(
+            result.status.success(),
+            "status={:?} stdout={} stderr={}",
+            result.status.code(),
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        fs::remove_dir_all(&directory).expect("remove singleton Span linker directory");
     }
 
     #[cfg(all(
@@ -37396,8 +37997,8 @@ static int run_case(const unsigned char *p,size_t n,size_t s,size_t e,uint32_t e
             .unwrap();
             assert_eq!(
                 x86_bound_tests(&x86.code, 0x82, true),
-                10,
-                "x86 V4 plus all nine V3 shifts need one conditional backedge for {output:?}"
+                11,
+                "x86 singleton/general V4 plus all nine V3 shifts need one conditional backedge for {output:?}"
             );
 
             let arm = lower_aarch64_dynamic_rows_prepared_for_output(
@@ -37409,8 +38010,8 @@ static int run_case(const unsigned char *p,size_t n,size_t s,size_t e,uint32_t e
             .unwrap();
             assert_eq!(
                 aarch64_bound_tests(&arm.code, AARCH64_LO, true),
-                10,
-                "AArch64 V4 plus all nine V3 shifts need one conditional backedge for {output:?}"
+                11,
+                "AArch64 singleton/general V4 plus all nine V3 shifts need one conditional backedge for {output:?}"
             );
             let words = aarch64_words(&arm.code);
             let setup_count = words
@@ -37447,8 +38048,8 @@ static int run_case(const unsigned char *p,size_t n,size_t s,size_t e,uint32_t e
                     0
                 );
                 assert_eq!(
-                    setup_count, 2,
-                    "each compact format entry converts its selected cursor exactly once"
+                    setup_count, 3,
+                    "singleton V4, general V4, and V3 convert their selected cursors exactly once"
                 );
             } else {
                 assert_eq!(
@@ -37607,6 +38208,260 @@ static int run_case(const unsigned char *p,size_t n,size_t s,size_t e,uint32_t e
                     0,
                     "{context}: root re-entry retains offset cursors"
                 );
+            }
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one cross-ISA shape audit proves the singleton selector, load elimination, decoder, and backedge together"
+    )]
+    fn scanner_free_v4_singleton_rows_have_byte_independent_hot_loops_cross_isa() {
+        fn byte_occurrences(code: &[u8], needle: &[u8]) -> usize {
+            code.windows(needle.len())
+                .filter(|window| *window == needle)
+                .count()
+        }
+
+        fn aarch64_conditional_target(words: &[u32], branch: usize) -> Option<usize> {
+            let instruction = *words.get(branch)?;
+            if instruction & 0xff00_0010 != 0x5400_0000 {
+                return None;
+            }
+            let immediate = i32::try_from((instruction >> 5) & 0x7_ffff).ok()?;
+            let displacement = (immediate << 13) >> 13;
+            usize::try_from(
+                isize::try_from(branch)
+                    .ok()?
+                    .checked_add(isize::try_from(displacement).ok()?)?,
+            )
+            .ok()
+        }
+
+        let class_count_offset = u8::try_from(FROZEN_DYNAMIC_ROWS_V3_CLASS_COUNT_OFFSET).unwrap();
+        let x86_class_guard = [0x41, 0x83, 0x7b, class_count_offset, 1];
+        let x86_singleton_load = [0x45, 0x0f, 0xb7, 0x10];
+        let x86_hay_load = [0x44, 0x0f, 0xb6, 0x14, 0x17];
+        let x86_class_load = [0x47, 0x0f, 0xb6, 0x14, 0x11];
+        let x86_update = [0x4e, 0x8d, 0x44, 0x56, 0xfe];
+        let avx512 = FeatureSet::of(CpuFeature::X86Avx512F)
+            .with(CpuFeature::X86Avx512Bw)
+            .with(CpuFeature::X86Avx512Vl);
+        for (tier, features) in [
+            ("sse2", FeatureSet::EMPTY),
+            ("avx2", FeatureSet::of(CpuFeature::X86Avx2)),
+            ("avx512", avx512),
+        ] {
+            for output in [
+                OutputContract::Exists,
+                OutputContract::SelectedEnd,
+                OutputContract::Span,
+            ] {
+                let emission = lower_x86_64_dynamic_rows_prepared_for_output(
+                    None,
+                    features,
+                    output,
+                    None,
+                    true,
+                )
+                .unwrap();
+                let code = emission.code.as_slice();
+                let context = format!("x86/{tier}/{output:?}");
+                assert_eq!(byte_occurrences(code, &x86_class_guard), 1, "{context}");
+                assert_eq!(
+                    byte_occurrences(code, &x86_singleton_load),
+                    1,
+                    "{context}: one singleton cell load"
+                );
+                let guard = code
+                    .windows(x86_class_guard.len())
+                    .position(|window| window == x86_class_guard)
+                    .unwrap();
+                let guard_branch = guard + x86_class_guard.len();
+                assert_eq!(
+                    x86_test_normalized_branch_opcode(code, guard_branch),
+                    Some(0x85),
+                    "{context}: non-singleton V4 must select the ordinary loop"
+                );
+                let (class_mapped, _) = x86_test_branch_target(code, guard_branch).unwrap();
+                assert_eq!(
+                    &code[class_mapped..class_mapped + 3],
+                    &[0x4c, 0x8d, 0x8f],
+                    "{context}: the failed singleton guard must install the class map"
+                );
+
+                let singleton = code
+                    .windows(x86_singleton_load.len())
+                    .position(|window| window == x86_singleton_load)
+                    .unwrap();
+                assert_eq!(
+                    &code[singleton..singleton + 7],
+                    &[0x45, 0x0f, 0xb7, 0x10, 0x48, 0xff, 0xc2],
+                    "{context}: the hot body must load only row[0] and advance"
+                );
+                let update = singleton
+                    + code[singleton..class_mapped]
+                        .windows(x86_update.len())
+                        .position(|window| window == x86_update)
+                        .unwrap();
+                assert_eq!(
+                    byte_occurrences(&code[singleton..update], &x86_hay_load),
+                    0,
+                    "{context}: singleton loop must not read a hay byte"
+                );
+                assert_eq!(
+                    byte_occurrences(&code[singleton..update], &x86_class_load),
+                    0,
+                    "{context}: singleton loop must not read the class map"
+                );
+                let compare = update + x86_update.len();
+                assert_eq!(&code[compare..compare + 3], &[0x48, 0x39, 0xca]);
+                assert_eq!(
+                    x86_test_normalized_branch_opcode(code, compare + 3),
+                    Some(0x82),
+                    "{context}: singleton backedge must use unsigned position < end"
+                );
+                assert_eq!(
+                    x86_test_branch_target(code, compare + 3).map(|(target, _)| target),
+                    Some(singleton),
+                    "{context}: singleton loop must be bottom-tested"
+                );
+                if output == OutputContract::Exists {
+                    assert!(code[singleton..update]
+                        .windows(4)
+                        .any(|window| window == [0x66, 0x45, 0x85, 0xd2]));
+                    assert_eq!(
+                        byte_occurrences(
+                            &code[singleton..update],
+                            &[0x41, 0x81, 0xe2, 0xff, 0x7f, 0, 0],
+                        ),
+                        0,
+                        "{context}: Exists keeps the unmasked live token"
+                    );
+                } else {
+                    assert_eq!(
+                        byte_occurrences(
+                            &code[singleton..update],
+                            &[0x48, 0x89, 0x54, 0x24, 0x60],
+                        ),
+                        1,
+                        "{context}: accepting cells publish the consumed endpoint"
+                    );
+                    assert_eq!(
+                        byte_occurrences(
+                            &code[singleton..update],
+                            &[0x41, 0x81, 0xe2, 0xff, 0x7f, 0, 0],
+                        ),
+                        1,
+                        "{context}: endpoint loops strip the accept bit"
+                    );
+                }
+            }
+        }
+
+        assert_eq!(aarch64_load_halfword_imm(8, 11, 0).unwrap(), 0x7940_0168);
+        assert!(aarch64_load_halfword_imm(8, 11, 1).is_err());
+        let arm_guard = [
+            aarch64_load_w_imm(
+                8,
+                13,
+                u16::try_from(FROZEN_DYNAMIC_ROWS_V3_CLASS_COUNT_OFFSET).unwrap(),
+            )
+            .unwrap(),
+            aarch64_cmp_w_imm(8, 1).unwrap(),
+        ];
+        let arm_singleton_load = aarch64_load_halfword_imm(8, 11, 0).unwrap();
+        let arm_hay_load = aarch64_load_byte_reg(8, 0, 2).unwrap();
+        let arm_class_load = aarch64_load_byte_reg(8, 14, 8).unwrap();
+        let arm_update = aarch64_add_x_uxtw(11, 15, 8, 1).unwrap();
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            // Scanner-free AArch64 lowering is deliberately tier-neutral: the
+            // same scalar row core is used by scalar, ASIMD, SVE, SVE2, and
+            // mixed-feature target entries because no root scanner is active.
+            let emission = lower_aarch64_dynamic_rows_prepared_for_output(
+                None,
+                output,
+                None,
+                true,
+            )
+            .unwrap();
+            let words = emission
+                .code
+                .chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            let context = format!("AArch64/{output:?}");
+            let guard = words
+                .windows(arm_guard.len())
+                .position(|window| window == arm_guard)
+                .unwrap();
+            assert_eq!(
+                words
+                    .windows(arm_guard.len())
+                    .filter(|window| *window == arm_guard)
+                    .count(),
+                1,
+                "{context}: one authenticated singleton selector"
+            );
+            assert_eq!(
+                words[guard + arm_guard.len()] & 0xff00_001f,
+                0x5400_0000 | u32::from(AARCH64_NE),
+                "{context}: non-singleton V4 must select the ordinary loop"
+            );
+            let class_mapped = aarch64_conditional_target(&words, guard + arm_guard.len())
+                .expect("AArch64 V4 class-mapped branch");
+            assert_eq!(
+                words[class_mapped],
+                aarch64_mov_x(11, 15).unwrap(),
+                "{context}: class-mapped V4 must install canonical row zero"
+            );
+            let singleton = words
+                .iter()
+                .position(|&word| word == arm_singleton_load)
+                .unwrap();
+            assert_eq!(
+                words.iter().filter(|&&word| word == arm_singleton_load).count(),
+                1,
+                "{context}: one immediate singleton cell load"
+            );
+            assert_eq!(words[singleton + 1], aarch64_add_x_imm(2, 2, 1).unwrap());
+            let update = singleton
+                + words[singleton..class_mapped]
+                    .iter()
+                    .position(|&word| word == arm_update)
+                    .unwrap();
+            assert!(!words[singleton..update].contains(&arm_hay_load), "{context}");
+            assert!(!words[singleton..update].contains(&arm_class_load), "{context}");
+            assert_eq!(words[update + 1], aarch64_cmp_x(2, 3).unwrap());
+            assert_eq!(
+                words[update + 2] & 0xff00_001f,
+                0x5400_0000 | u32::from(AARCH64_LO),
+                "{context}: singleton backedge must use position < end"
+            );
+            assert_eq!(
+                aarch64_conditional_target(&words, update + 2),
+                Some(singleton),
+                "{context}: singleton loop must be bottom-tested"
+            );
+            if output == OutputContract::Exists {
+                assert!(!words[singleton..update]
+                    .contains(&aarch64_and_low_w(8, 8, 15).unwrap()));
+            } else {
+                assert_eq!(
+                    words[singleton..update]
+                        .iter()
+                        .filter(|&&word| word == aarch64_store_x(2, 31, 80).unwrap())
+                        .count(),
+                    1,
+                    "{context}: accepting cells publish the consumed endpoint"
+                );
+                assert!(words[singleton..update]
+                    .contains(&aarch64_and_low_w(8, 8, 15).unwrap()));
             }
         }
     }
@@ -37944,8 +38799,8 @@ static int run_case(const unsigned char *p,size_t n,size_t s,size_t e,uint32_t e
         );
         assert_eq!(
             occurrences(&x86.code, &[0x49, 0x89, 0xf0]),
-            10,
-            "V4 and every V3 entry install canonical row zero directly"
+            11,
+            "singleton/general V4 and every V3 entry install canonical row zero directly"
         );
         assert_eq!(
             occurrences(&x86.code, &[0x4e, 0x8d, 0x04, 0x46]),
@@ -37954,8 +38809,8 @@ static int run_case(const unsigned char *p,size_t n,size_t s,size_t e,uint32_t e
         );
         assert_eq!(
             occurrences(&x86.code, &[0x4e, 0x8d, 0x44, 0x56, 0xfe]),
-            1,
-            "V4 needs one direct rows+token*2-2 backedge"
+            2,
+            "singleton and class-mapped V4 need direct rows+token*2-2 backedges"
         );
         let mut v2_flag = vec![
             0x81,
@@ -38396,8 +39251,8 @@ static int run_case(const unsigned char *p,size_t n,size_t s,size_t e,uint32_t e
                 .iter()
                 .filter(|&&word| word == aarch64_add_x_uxtw(11, 15, 8, 1).unwrap())
                 .count(),
-            1,
-            "V4 needs one biased-base cell-offset backedge"
+            2,
+            "singleton and class-mapped V4 need biased-base cell-offset backedges"
         );
         assert_eq!(
             arm_words
@@ -38422,8 +39277,8 @@ static int run_case(const unsigned char *p,size_t n,size_t s,size_t e,uint32_t e
                 .iter()
                 .filter(|&&word| word == aarch64_mov_x(11, 15).unwrap())
                 .count(),
-            10,
-            "V4 and every V3 entry install canonical row zero directly"
+            11,
+            "singleton/general V4 and every V3 entry install canonical row zero directly"
         );
         assert!(arm_words.contains(
             &aarch64_add_x_imm(
