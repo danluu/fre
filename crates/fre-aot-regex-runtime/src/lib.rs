@@ -65,9 +65,9 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex, OnceLock, TryLockError};
 
 use fre_aot_regex::{
-    CompileError, CompiledProgram, FrozenPreparedHeaderV1, FullyPrefilledFallbackReceipt,
-    MatchResult, OutputContract, PROGRAM_HEADER_LEN, ProgramFormatError, ProgramWorkspace,
-    RetainedPartialPreflight, SearchWindow,
+    CompileError, CompiledProgram, FrozenDynamicRowsStorage, FrozenPreparedHeaderV2,
+    FullyPrefilledFallbackReceipt, MatchResult, OutputContract, PROGRAM_HEADER_LEN,
+    ProgramFormatError, ProgramWorkspace, RetainedPartialPreflight, SearchWindow,
 };
 
 /// No match was selected.
@@ -371,13 +371,20 @@ impl Default for FreAotRegexExclusiveHandleV1 {
 #[derive(Debug)]
 #[repr(C)]
 pub struct PreparedAotRegex {
-    frozen_header: FrozenPreparedHeaderV1,
+    frozen_header: FrozenPreparedHeaderV2,
     program: CompiledProgram,
     workspace: ProgramWorkspace,
+    frozen_dynamic_rows: Option<FrozenDynamicRowsStorage>,
     fully_prefilled_fallback: Option<FullyPrefilledFallbackReceipt>,
 }
 
 const _: () = assert!(std::mem::offset_of!(PreparedAotRegex, frozen_header) == 0);
+
+// A complete compact sidecar is optional setup-only storage. Bound the
+// temporary second K0 workspace and its final immutable copy independently;
+// larger programs keep the ordinary adaptive executor and one live workspace.
+const FROZEN_DYNAMIC_SIDECAR_MAX_K0_BYTES: usize = 512 * 1024;
+const FROZEN_DYNAMIC_SIDECAR_MAX_PACKED_BYTES: usize = 512 * 1024;
 
 impl PreparedAotRegex {
     /// Validate, own, and prepare one serialized AOT semantic program.
@@ -399,20 +406,36 @@ impl PreparedAotRegex {
         let fully_prefilled_fallback = program
             .compiler_private_try_prefill_retained_fallback_with_workspace_receipt(&mut workspace)
             .map_err(PrepareError::Workspace)?;
-        let frozen_header = program.compiler_private_frozen_prepared_header_v1(
+        let mut frozen_dynamic_rows = fully_prefilled_fallback.is_none().then(|| {
+            program.compiler_private_frozen_dynamic_rows_storage(
+                &workspace,
+                FROZEN_DYNAMIC_SIDECAR_MAX_K0_BYTES,
+                FROZEN_DYNAMIC_SIDECAR_MAX_PACKED_BYTES,
+            )
+        }).flatten();
+        let frozen_header = program.compiler_private_frozen_prepared_header_v2(
             &workspace,
             fully_prefilled_fallback,
+            frozen_dynamic_rows.as_ref(),
         );
+        if !frozen_header.has_dynamic_rows() {
+            frozen_dynamic_rows = None;
+        }
         Ok(Self {
             frozen_header,
             program,
             workspace,
+            frozen_dynamic_rows,
             fully_prefilled_fallback,
         })
     }
 
     #[inline]
     fn deactivate_frozen_header(&mut self) {
+        debug_assert!(
+            !self.frozen_header.has_dynamic_rows() || self.frozen_dynamic_rows.is_some(),
+            "an active compact header must retain its immutable payload owner"
+        );
         if self.frozen_header.is_active() {
             self.frozen_header.deactivate();
         }
@@ -2783,8 +2806,12 @@ mod tests {
     fn c_abi_layout_declarations_and_function_types_are_stable() {
         assert_eq!(std::mem::offset_of!(PreparedAotRegex, frozen_header), 0);
         assert_eq!(
-            size_of::<FrozenPreparedHeaderV1>(),
+            size_of::<fre_aot_regex::FrozenPreparedHeaderV1>(),
             fre_aot_regex::FROZEN_PREPARED_HEADER_V1_BYTES
+        );
+        assert_eq!(
+            size_of::<FrozenPreparedHeaderV2>(),
+            fre_aot_regex::FROZEN_PREPARED_HEADER_V2_BYTES
         );
         assert_eq!(
             fre_aot_regex::FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL_OFFSET,

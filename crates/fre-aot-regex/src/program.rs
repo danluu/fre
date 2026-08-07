@@ -352,6 +352,16 @@ pub struct DynamicNativeRowsV1 {
     pub initial_flags: u32,
 }
 
+/// Unpublished-cell sentinel required by [`DynamicNativeRowsV1`].
+#[doc(hidden)]
+pub const DYNAMIC_NATIVE_ROWS_V1_UNFILLED_CELL: u32 = u32::MAX;
+/// Accepting-transition bit required by [`DynamicNativeRowsV1`].
+#[doc(hidden)]
+pub const DYNAMIC_NATIVE_ROWS_V1_ACCEPT_MASK: u32 = 1 << 31;
+/// Encoded next-row field required by [`DynamicNativeRowsV1`].
+#[doc(hidden)]
+pub const DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK: u32 = (1 << 29) - 1;
+
 impl SearchWindow {
     #[must_use]
     pub const fn new(start: usize, end: usize) -> Self {
@@ -2538,6 +2548,35 @@ pub struct FrozenPreparedHeaderV1 {
     class_map: [u8; 256],
 }
 
+/// Additive prepared-header storage for one immutable compact dynamic table.
+///
+/// The complete V1 record remains the offset-zero prefix. Existing retained-
+/// partial entries therefore keep their exact ABI, while a new entry follows
+/// the tail only after authenticating the additive flag and complete extent.
+#[doc(hidden)]
+#[derive(Debug, Eq, PartialEq)]
+#[repr(C)]
+pub struct FrozenPreparedHeaderV2 {
+    v1: FrozenPreparedHeaderV1,
+    dynamic_rows_v1: DynamicNativeRowsV1,
+}
+
+/// Pointer-stable immutable ownership for a compact frozen dynamic table.
+///
+/// The descriptor addresses the two boxed payloads, whose allocations remain
+/// fixed when this owner or its containing prepared runtime moves. The owner
+/// is never exposed through a matching API and is retained for the complete
+/// prepared-runtime lifetime whenever construction succeeds.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct FrozenDynamicRowsStorage {
+    program_instance: u64,
+    artifact_identity: [u8; 32],
+    rows: Box<[u32]>,
+    class_map: Box<[u8; 256]>,
+    descriptor: DynamicNativeRowsV1,
+}
+
 /// Stable preamble magic for [`FrozenPreparedHeaderV1`].
 #[doc(hidden)]
 pub const FROZEN_PREPARED_HEADER_V1_MAGIC: u64 = u64::from_le_bytes(*b"FREFRZ1\0");
@@ -2556,6 +2595,9 @@ pub const FROZEN_PREPARED_HEADER_V1_FLAG_INITIAL_PENDING: u32 = 1 << 1;
 /// The initial forward frontier is nullable and terminal.
 #[doc(hidden)]
 pub const FROZEN_PREPARED_HEADER_V1_FLAG_INITIAL_TERMINAL: u32 = 1 << 2;
+/// An authenticated immutable [`DynamicNativeRowsV1`] tail is present.
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS: u32 = 1 << 3;
 /// Sentinel used when no reverse root row exists.
 #[doc(hidden)]
 pub const FROZEN_PREPARED_HEADER_V1_NO_REVERSE_ROW: u32 = u32::MAX;
@@ -2635,6 +2677,13 @@ pub const FROZEN_PREPARED_HEADER_V1_CLASS_MAP_OFFSET: usize =
 /// Target-native byte extent of [`FrozenPreparedHeaderV1`].
 #[doc(hidden)]
 pub const FROZEN_PREPARED_HEADER_V1_BYTES: usize = std::mem::size_of::<FrozenPreparedHeaderV1>();
+/// Byte offset of the additive compact dynamic-row descriptor.
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V2_DYNAMIC_ROWS_OFFSET: usize =
+    std::mem::offset_of!(FrozenPreparedHeaderV2, dynamic_rows_v1);
+/// Target-native byte extent of [`FrozenPreparedHeaderV2`].
+#[doc(hidden)]
+pub const FROZEN_PREPARED_HEADER_V2_BYTES: usize = std::mem::size_of::<FrozenPreparedHeaderV2>();
 
 const _: () = {
     assert!(FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL_OFFSET == 0);
@@ -2657,6 +2706,14 @@ const _: () = {
             < FROZEN_PREPARED_HEADER_V1_CLASS_MAP_OFFSET
     );
     assert!(FROZEN_PREPARED_HEADER_V1_CLASS_MAP_OFFSET + 256 <= FROZEN_PREPARED_HEADER_V1_BYTES);
+    assert!(std::mem::offset_of!(FrozenPreparedHeaderV2, v1) == 0);
+    assert!(FROZEN_PREPARED_HEADER_V2_DYNAMIC_ROWS_OFFSET == FROZEN_PREPARED_HEADER_V1_BYTES);
+    assert!(match FROZEN_PREPARED_HEADER_V2_DYNAMIC_ROWS_OFFSET
+        .checked_add(std::mem::size_of::<DynamicNativeRowsV1>())
+    {
+        Some(end) => end <= FROZEN_PREPARED_HEADER_V2_BYTES,
+        None => false,
+    });
 };
 
 #[cfg(target_pointer_width = "64")]
@@ -2665,6 +2722,8 @@ const _: () = {
     assert!(FROZEN_PREPARED_HEADER_V1_FORWARD_ROWS_ADDRESS_OFFSET == 64);
     assert!(FROZEN_PREPARED_HEADER_V1_CLASS_MAP_OFFSET == 128);
     assert!(FROZEN_PREPARED_HEADER_V1_BYTES == 384);
+    assert!(FROZEN_PREPARED_HEADER_V2_DYNAMIC_ROWS_OFFSET == 384);
+    assert!(FROZEN_PREPARED_HEADER_V2_BYTES == 464);
 };
 
 impl FrozenPreparedHeaderV1 {
@@ -2712,9 +2771,149 @@ impl FrozenPreparedHeaderV1 {
     }
 }
 
+impl FrozenPreparedHeaderV2 {
+    fn from_v1(v1: FrozenPreparedHeaderV1) -> Self {
+        Self {
+            v1,
+            dynamic_rows_v1: DynamicNativeRowsV1::default(),
+        }
+    }
+
+    /// Return whether any offset-zero frozen projection remains authorized.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn is_active(&self) -> bool {
+        self.v1.is_active()
+    }
+
+    /// Return the exact semantic artifact identity authenticated at setup.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn artifact_identity(&self) -> &[u8; 32] {
+        self.v1.artifact_identity()
+    }
+
+    /// Return whether the active header owns the compact immutable sidecar.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn has_dynamic_rows(&self) -> bool {
+        self.v1.is_active()
+            && self.v1.flags & FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS != 0
+    }
+
+    /// Permanently revoke every projection published through this header.
+    #[doc(hidden)]
+    pub fn deactivate(&mut self) {
+        self.v1.deactivate();
+    }
+}
+
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "validated compact row tokens use an exact one-based row encoding"
+)]
+fn frozen_dynamic_rows_are_closed(rows: &[u32], stride: usize) -> bool {
+    if stride == 0 || rows.is_empty() || rows.len().checked_rem(stride) != Some(0) {
+        return false;
+    }
+    rows.iter().copied().all(|cell| {
+        if cell == DYNAMIC_NATIVE_ROWS_V1_UNFILLED_CELL {
+            return false;
+        }
+        let encoded = cell & DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK;
+        encoded == 0
+            || encoded
+                .checked_sub(1)
+                .and_then(|row| usize::try_from(row).ok())
+                .is_some_and(|row| row < rows.len() && row.checked_rem(stride) == Some(0))
+    })
+}
+
+impl FrozenDynamicRowsStorage {
+    fn descriptor_is_valid_for(&self, identity: ProgramIdentity) -> bool {
+        let rows = self.descriptor;
+        let Ok(stride) = usize::try_from(rows.row_stride) else {
+            return false;
+        };
+        let Ok(initial_row) = usize::try_from(rows.initial_row) else {
+            return false;
+        };
+        let Ok(loop_count) = usize::try_from(rows.learned_loop_row_count) else {
+            return false;
+        };
+        if self.program_instance != identity.instance
+            || self.artifact_identity != identity.artifact
+            || rows.rows_address != self.rows.as_ptr().expose_provenance()
+            || rows.class_map_address != self.class_map.as_ptr().expose_provenance()
+            || rows.live_cells != self.rows.len()
+            || rows.live_cells == 0
+            || rows.live_cells > usize::try_from(DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK)
+                .unwrap_or(usize::MAX)
+            || stride == 0
+            || stride > 256
+            || rows.live_cells.checked_rem(stride) != Some(0)
+            || initial_row.checked_rem(stride) != Some(0)
+            || initial_row
+                .checked_add(stride)
+                .is_none_or(|end| end > rows.live_cells)
+            || rows.unfilled_cell != DYNAMIC_NATIVE_ROWS_V1_UNFILLED_CELL
+            || rows.accept_mask != DYNAMIC_NATIVE_ROWS_V1_ACCEPT_MASK
+            || rows.next_row_token_mask != DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK
+            || rows.cache_identity == 0
+            || rows.initial_flags != 0
+            || loop_count > rows.learned_loop_rows.len()
+            || rows.learned_loop_rows[loop_count..]
+                .iter()
+                .any(|&row| row != u32::MAX)
+            || !frozen_dynamic_rows_are_closed(&self.rows, stride)
+        {
+            return false;
+        }
+
+        let mut represented = [false; 256];
+        for &class in self.class_map.iter() {
+            let class = usize::from(class);
+            if class >= stride {
+                return false;
+            }
+            represented[class] = true;
+        }
+        if represented[..stride].iter().any(|&present| !present) {
+            return false;
+        }
+
+        for (index, &row) in rows.learned_loop_rows[..loop_count].iter().enumerate() {
+            let Ok(row) = usize::try_from(row) else {
+                return false;
+            };
+            if row.checked_rem(stride) != Some(0)
+                || row.checked_add(stride).is_none_or(|end| end > rows.live_cells)
+                || rows.learned_loop_rows[..index]
+                    .iter()
+                    .any(|&prior| usize::try_from(prior).ok() == Some(row))
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn descriptor(&self) -> DynamicNativeRowsV1 {
+        self.descriptor
+    }
+}
+
 impl ProgramWorkspace {
     pub(crate) const fn has_retained_partial_workspace(&self) -> bool {
         self.partial.is_some()
+    }
+
+    /// Return the allocator-retained K0 payload used to bound an optional
+    /// immutable setup sidecar before allocating a second workspace.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn compiler_private_k0_retained_bytes(&self) -> usize {
+        self.nfa.as_ref().map_or(0, K0Workspace::retained_bytes)
     }
 
     /// Invalidate the prepared native projection before any route that may
@@ -4792,6 +4991,180 @@ impl CompiledProgram {
                 program_instance: self.identity.instance,
                 k0,
             }))
+    }
+
+    /// Build a pointer-stable immutable copy of one complete compact K0 root.
+    ///
+    /// This setup-only transaction is reserved for the general prepared
+    /// dynamic fallback after the retained static projection has declined.
+    /// Both the temporary K0 allocation and final packed payload are bounded
+    /// independently. Any eligibility, capacity, allocation, or validation
+    /// failure simply preserves the ordinary adaptive prepared route.
+    #[doc(hidden)]
+    #[must_use]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one fail-closed setup transaction authenticates and copies the complete compact projection"
+    )]
+    pub fn compiler_private_frozen_dynamic_rows_storage(
+        &self,
+        workspace: &ProgramWorkspace,
+        max_k0_bytes: usize,
+        max_packed_bytes: usize,
+    ) -> Option<FrozenDynamicRowsStorage> {
+        if workspace.identity.instance != self.identity.instance {
+            return None;
+        }
+        let retained_bytes = workspace.compiler_private_k0_retained_bytes();
+        if retained_bytes == 0 || retained_bytes > max_k0_bytes {
+            return None;
+        }
+        let complete_retained_root = self.partial_dfa().is_some_and(|partial| {
+            let (complete, discovered) = partial.retained_dimensions();
+            complete != 0
+                && complete == discovered
+                && partial.resume_frontier_count() == 0
+        });
+        if !(self
+            .optimization_sidecar
+            .is_optimizing_fallback_without_dfa()
+            || complete_retained_root)
+        {
+            return None;
+        }
+        let dynamic_view = self.native_dynamic_rows_view()?;
+
+        let mut candidate = self.prepare_workspace().ok()?;
+        if candidate.identity.instance != self.identity.instance
+            || candidate.compiler_private_k0_retained_bytes() == 0
+            || candidate.compiler_private_k0_retained_bytes() > max_k0_bytes
+        {
+            return None;
+        }
+        let nfa = candidate.nfa.as_mut()?;
+        let receipt = nfa.compiler_private_try_prefill_root_cache_with_receipt(&self.automaton)?;
+        let full = nfa.compiler_private_fully_prefilled_root_projection_without_resume(
+            &self.automaton,
+            receipt,
+        )?;
+        let direct = nfa.dynamic_root_projection(&self.automaton)?;
+
+        let stride = usize::try_from(full.row_stride()).ok()?;
+        let live_cells = direct.state_count().checked_mul(stride)?;
+        let loop_rows = direct.learned_loop_row_offsets();
+        if stride == 0
+            || stride > 256
+            || live_cells == 0
+            || live_cells != full.forward_rows().len()
+            || live_cells > direct.initialized_cells()
+            || full.forward_rows_address() != direct.rows_address()
+            || full.row_stride() != direct.row_stride()
+            || full.forward_initial_row() != direct.initial_row()
+            || full.cache_identity() != direct.cache_identity()
+            || full.unfilled_cell() != direct.unfilled_cell()
+            || full.accept_mask() != direct.accept_mask()
+            || full.next_row_token_mask() != direct.next_row_token_mask()
+            || full.reverse_rows().is_some()
+            || full.initial_pending()
+            || full.initial_terminal()
+            || direct.initial_pending()
+            || direct.initial_terminal()
+            || loop_rows.len() > 4
+            || (dynamic_view.root_requirement.is_none() && !loop_rows.is_empty())
+            || full.unfilled_cell() != DYNAMIC_NATIVE_ROWS_V1_UNFILLED_CELL
+            || full.accept_mask() != DYNAMIC_NATIVE_ROWS_V1_ACCEPT_MASK
+            || full.next_row_token_mask() != DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK
+            || !frozen_dynamic_rows_are_closed(full.forward_rows(), stride)
+        {
+            return None;
+        }
+
+        let packed_bytes = live_cells
+            .checked_mul(core::mem::size_of::<u32>())?
+            .checked_add(256)?;
+        if packed_bytes > max_packed_bytes {
+            return None;
+        }
+
+        let mut owned_rows = Vec::new();
+        owned_rows.try_reserve_exact(live_cells).ok()?;
+        owned_rows.extend_from_slice(full.forward_rows());
+        let rows = owned_rows.into_boxed_slice();
+
+        let mut owned_class_map = Vec::new();
+        owned_class_map.try_reserve_exact(256).ok()?;
+        owned_class_map.extend_from_slice(full.class_map());
+        let class_map = Box::<[u8; 256]>::try_from(owned_class_map.into_boxed_slice()).ok()?;
+
+        let mut learned_loop_rows = [u32::MAX; 4];
+        learned_loop_rows.get_mut(..loop_rows.len())?.copy_from_slice(loop_rows);
+        let descriptor = DynamicNativeRowsV1 {
+            rows_address: rows.as_ptr().expose_provenance(),
+            class_map_address: class_map.as_ptr().expose_provenance(),
+            live_cells,
+            row_stride: full.row_stride(),
+            unfilled_cell: full.unfilled_cell(),
+            accept_mask: full.accept_mask(),
+            next_row_token_mask: full.next_row_token_mask(),
+            cache_identity: full.cache_identity(),
+            learned_loop_row_count: u32::try_from(loop_rows.len()).ok()?,
+            learned_loop_rows,
+            initial_row: full.forward_initial_row(),
+            initial_flags: 0,
+        };
+        let storage = FrozenDynamicRowsStorage {
+            program_instance: self.identity.instance,
+            artifact_identity: self.identity.artifact,
+            rows,
+            class_map,
+            descriptor,
+        };
+        storage
+            .descriptor_is_valid_for(self.identity)
+            .then_some(storage)
+    }
+
+    /// Publish either the existing retained V1 projection or the additive
+    /// immutable compact dynamic sidecar. Retained static rows always win.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn compiler_private_frozen_prepared_header_v2(
+        &self,
+        workspace: &ProgramWorkspace,
+        receipt: Option<FullyPrefilledFallbackReceipt>,
+        dynamic_rows: Option<&FrozenDynamicRowsStorage>,
+    ) -> FrozenPreparedHeaderV2 {
+        let v1 = self.compiler_private_frozen_prepared_header_v1(workspace, receipt);
+        let mut header = FrozenPreparedHeaderV2::from_v1(v1);
+        if header.v1.is_active() || receipt.is_some() {
+            return header;
+        }
+        let Some(storage) = dynamic_rows else {
+            return header;
+        };
+        if workspace.identity.instance != self.identity.instance
+            || !storage.descriptor_is_valid_for(self.identity)
+        {
+            return header;
+        }
+
+        let rows = storage.descriptor();
+        header.dynamic_rows_v1 = rows;
+        header.v1.flags = FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS;
+        header.v1.header_bytes = FROZEN_PREPARED_HEADER_V2_BYTES;
+        header.v1.forward_rows_address = rows.rows_address;
+        header.v1.forward_live_cells = rows.live_cells;
+        header.v1.cache_identity = rows.cache_identity;
+        header.v1.row_stride = rows.row_stride;
+        header.v1.forward_initial_row = rows.initial_row;
+        header.v1.unfilled_cell = rows.unfilled_cell;
+        header.v1.accept_mask = rows.accept_mask;
+        header.v1.next_row_token_mask = rows.next_row_token_mask;
+        header.v1.class_map.copy_from_slice(storage.class_map.as_ref());
+        // The seal is the final publication write. The descriptor and both
+        // boxed payloads are immutable for the remaining owner lifetime.
+        header.v1.active_seal = FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL;
+        header
     }
 
     /// Build the versioned frozen-root header after one complete setup proof.
@@ -15528,6 +15901,108 @@ mod tests {
                 "an equal-artifact foreign runtime lineage must fail closed for {output:?}"
             );
         }
+    }
+
+    #[test]
+    fn compact_frozen_dynamic_sidecar_is_bounded_pointer_stable_and_fail_closed() {
+        let compiled = program(
+            r"(?:ab|ac)+z",
+            OutputContract::Exists,
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+        );
+        assert!(
+            compiled
+                .optimization_sidecar
+                .is_optimizing_fallback_without_dfa()
+        );
+        let workspace = compiled.prepare_workspace().unwrap();
+        assert!(
+            workspace
+                .nfa
+                .as_ref()
+                .and_then(|nfa| nfa.dynamic_root_projection(&compiled.automaton))
+                .is_none(),
+            "sidecar construction must not warm the live execution workspace"
+        );
+        let retained_bytes = workspace.compiler_private_k0_retained_bytes();
+        assert_ne!(retained_bytes, 0);
+        assert!(
+            compiled
+                .compiler_private_frozen_dynamic_rows_storage(
+                    &workspace,
+                    retained_bytes.saturating_sub(1),
+                    usize::MAX,
+                )
+                .is_none(),
+            "the temporary K0 cap must decline before allocating a candidate"
+        );
+
+        let mut storage = compiled
+            .compiler_private_frozen_dynamic_rows_storage(
+                &workspace,
+                retained_bytes,
+                usize::MAX,
+            )
+            .expect("complete low-class compact sidecar");
+        assert!(storage.descriptor_is_valid_for(compiled.identity));
+        assert!(storage.descriptor.row_stride < 128);
+        let packed_bytes = storage.rows.len() * core::mem::size_of::<u32>() + 256;
+        assert!(
+            compiled
+                .compiler_private_frozen_dynamic_rows_storage(
+                    &workspace,
+                    retained_bytes,
+                    packed_bytes.saturating_sub(1),
+                )
+                .is_none(),
+            "the final compact payload cap must be exact"
+        );
+
+        let rows_address = storage.descriptor.rows_address;
+        let class_map_address = storage.descriptor.class_map_address;
+        let mut owners = Vec::new();
+        owners.push(storage);
+        storage = owners.pop().expect("move storage owner through a container");
+        assert_eq!(storage.descriptor.rows_address, rows_address);
+        assert_eq!(storage.descriptor.class_map_address, class_map_address);
+        assert!(storage.descriptor_is_valid_for(compiled.identity));
+
+        let header = compiled.compiler_private_frozen_prepared_header_v2(
+            &workspace,
+            None,
+            Some(&storage),
+        );
+        assert!(header.has_dynamic_rows());
+        assert_eq!(header.v1.header_bytes, FROZEN_PREPARED_HEADER_V2_BYTES);
+        assert_eq!(header.v1.flags, FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS);
+        assert_eq!(header.v1.forward_rows_address, rows_address);
+        assert_eq!(header.dynamic_rows_v1, storage.descriptor);
+        assert_eq!(header.v1.class_map, *storage.class_map);
+        assert!(
+            workspace
+                .nfa
+                .as_ref()
+                .and_then(|nfa| nfa.dynamic_root_projection(&compiled.automaton))
+                .is_none(),
+            "publishing immutable rows must leave the live workspace cold"
+        );
+
+        storage.descriptor.initial_row = storage.descriptor.initial_row.saturating_add(1);
+        assert!(!storage.descriptor_is_valid_for(compiled.identity));
+        assert!(
+            !compiled
+                .compiler_private_frozen_prepared_header_v2(
+                    &workspace,
+                    None,
+                    Some(&storage),
+                )
+                .is_active(),
+            "a malformed sidecar descriptor must fail closed"
+        );
     }
 
     #[test]
