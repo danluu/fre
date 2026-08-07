@@ -11561,7 +11561,7 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_native_rows_decline_unsupported_endpoint_provenance() {
+    fn dynamic_native_rows_guard_nullable_endpoint_provenance() {
         let compiled = program(
             "[ab]*",
             OutputContract::SelectedEnd,
@@ -11597,12 +11597,33 @@ mod tests {
             CompileMode::Fast,
             DeterminizeLimits::default(),
         );
-        assert!(variable_span.native_dynamic_rows_view().is_none());
+        let span_view = variable_span
+            .native_dynamic_rows_view()
+            .expect("nullable variable Span retains guarded dynamic provenance");
+        assert_eq!(span_view.output, OutputContract::Span);
+        assert_eq!(span_view.exact_match_width, None);
+        let mut span_workspace = variable_span
+            .prepare_workspace()
+            .expect("prepared nullable Span K0 workspace");
+        let (span_outcome, address, cache_identity) = variable_span
+            .preflight_dynamic_native_rows_with_workspace(
+                &haystack,
+                window,
+                &mut span_workspace,
+                variable_span.artifact_identity(),
+            )
+            .expect("nullable Span preflight");
         assert_eq!(
-            variable_span
-                .search(&haystack, window)
-                .expect("ordinary nullable Span search"),
-            MatchResult::Span(Some((0, 0)))
+            span_outcome,
+            RetainedPartialPreflight::Complete(MatchResult::Span(Some((0, 0))))
+        );
+        assert_eq!((address, cache_identity), (0, 0));
+        assert!(
+            span_workspace
+                .dynamic_native_rows
+                .as_deref()
+                .is_some_and(|dynamic| dynamic.state.native_entry_window.is_none()),
+            "nullable Span must complete without publishing an admission ticket"
         );
     }
 

@@ -26769,7 +26769,20 @@ mod tests {
                     .output(OutputContract::Span),
             )
             .unwrap_or_else(|error| panic!("variable Span {target:?}: {error}"));
-            assert!(variable.program().native_dynamic_rows_view().is_none());
+            let variable_view = variable
+                .program()
+                .native_dynamic_rows_view()
+                .expect("variable Span dynamic graph view");
+            assert_eq!(variable_view.output, OutputContract::Span);
+            assert_eq!(variable_view.exact_match_width, None);
+            assert!(variable.module().prepared_entry_symbol().is_some());
+            assert_eq!(
+                variable
+                    .module()
+                    .required_prepared_dynamic_rows_span_recovery_runtime_symbol(),
+                Some(DYNAMIC_ROWS_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME),
+                "{target:?}"
+            );
         }
     }
 
