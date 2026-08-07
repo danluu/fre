@@ -33820,7 +33820,7 @@ mod tests {
                     "V8 fallthrough must select the mapped V4 tag"
                 );
                 let v4_candidate =
-                    conditional_target(&words, candidate + candidate_prefix.len() + 12)
+                    conditional_target(&words, candidate + candidate_prefix.len() + 10)
                         .expect("tagged mapped V4 candidate edge");
                 assert_eq!(
                     words[v4_candidate],
@@ -33833,12 +33833,12 @@ mod tests {
                     "V4 selection must install its mapped cell-offset row"
                 );
                 assert_eq!(
-                    words[candidate + candidate_prefix.len() + 13],
+                    words[candidate + candidate_prefix.len() + 11],
                     aarch64_cmp_x_imm(8, 2).unwrap(),
                     "V4 fallthrough must select the exact V3 tag"
                 );
                 let v3_candidate =
-                    conditional_target(&words, candidate + candidate_prefix.len() + 14)
+                    conditional_target(&words, candidate + candidate_prefix.len() + 12)
                         .expect("tagged V3 candidate edge");
                 assert_eq!(
                     words[v3_candidate],
