@@ -12018,7 +12018,14 @@ mod tests {
         let mut first_symbol = None;
         let mut first_length = 0;
         let mut saw_sve = false;
-        for (index, (pattern, output, haystack)) in cases().into_iter().enumerate() {
+        let cases = cases();
+        // The slow-route smoke test exhausts every window of one
+        // representative variable-width Span graph. Established architecture
+        // bundle generators retain the complete shared corpus.
+        let case_count = if force_slow_context { 1 } else { cases.len() };
+        for (index, (pattern, output, haystack)) in
+            cases.into_iter().take(case_count).enumerate()
+        {
             let request = CompileRequest::new(pattern, target)
                 .mode(CompileMode::Optimizing)
                 .output(output);
