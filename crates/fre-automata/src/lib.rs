@@ -44,8 +44,9 @@ pub use mandatory_cut::{
     DEFAULT_MANDATORY_CUT_MAX_WORK, MANDATORY_CUT_ACCOUNTING_ID, MandatoryCutAnalysis,
     MandatoryCutAnalysisDecline, MandatoryCutAnalysisLimits, MandatoryCutAnalysisReport,
     MandatoryCutAnalysisStats, MandatoryCutByteClass, MandatoryCutCandidate,
-    MandatoryCutDeclineReason, MandatoryCutGraphIssue, MandatoryCutResource,
-    MaximumConsumedDistance, analyze_mandatory_cut,
+    MandatoryCutContinuation, MandatoryCutContinuationAnalysis, MandatoryCutDeclineReason,
+    MandatoryCutGraphIssue, MandatoryCutResource, MaximumConsumedDistance,
+    analyze_mandatory_cut, analyze_mandatory_cut_continuation,
 };
 pub use mandatory_literal_frontier::{
     DEFAULT_MANDATORY_LITERAL_FRONTIER_MAX_ALLOCATION_ATTEMPTS,
@@ -60,6 +61,7 @@ pub use mandatory_literal_frontier::{
     MandatoryLiteralFrontierCandidate, MandatoryLiteralFrontierDeclineReason,
     MandatoryLiteralFrontierIter, MandatoryLiteralFrontierResource,
     MandatoryLiteralFrontierStopReason, analyze_mandatory_literal_frontier,
+    continue_mandatory_literal_frontier,
 };
 pub use mandatory_suffix::{
     DEFAULT_MANDATORY_SUFFIX_MAX_ALLOCATION_ATTEMPTS,

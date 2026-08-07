@@ -710,9 +710,9 @@ pub use text_set::{
 
 use fre_automata::{
     Automaton, EarliestEnd, Exists, K0PositiveEndLimits, K0PositiveEndOutcome, K0SearchSession,
-    K0PositiveEndStartOutcome, K0SpanSourceCursor, MandatoryCutAnalysis,
-    MandatoryCutAnalysisLimits, MandatoryCutCandidate, MandatoryCutDeclineReason,
-    MandatoryCutResource, MandatoryLiteralFrontierAnalysis,
+    K0PositiveEndStartOutcome, K0SpanSourceCursor, MandatoryCutAnalysisLimits,
+    MandatoryCutCandidate, MandatoryCutContinuation, MandatoryCutContinuationAnalysis,
+    MandatoryCutDeclineReason, MandatoryCutResource, MandatoryLiteralFrontierAnalysis,
     MandatoryLiteralFrontierAnalysisLimits, MandatoryLiteralFrontierDeclineReason,
     MandatorySuffixAnalysis, MandatorySuffixAnalysisLimits, MandatorySuffixDeclineReason,
     MandatorySuffixResource, MaximumConsumedDistance, SelectedEnd, Span,
@@ -1550,19 +1550,19 @@ fn try_charge_k0_mandatory_cut_work(
     Ok(true)
 }
 
-struct K0MandatoryCutBuild {
+struct K0MandatoryCutBuild<'a> {
     plan: Option<K0MandatoryCutPlan>,
     planner_work: u64,
     analysis_work: u64,
-    packed_frontier_eligible: bool,
+    frontier_continuation: Option<MandatoryCutContinuation<'a>>,
     storage_bytes: usize,
 }
 
-fn try_build_k0_mandatory_cut(
-    raw: &fre_automata::RawPlan,
+fn try_build_k0_mandatory_cut<'a>(
+    raw: &'a fre_automata::RawPlan,
     limits: BuildLimits,
     incumbent_planner_work: u64,
-) -> Result<K0MandatoryCutBuild, BuildError> {
+) -> Result<K0MandatoryCutBuild<'a>, BuildError> {
     let remaining_work = limits
         .max_planner_work
         .checked_sub(incumbent_planner_work)
@@ -1574,7 +1574,7 @@ fn try_build_k0_mandatory_cut(
             plan: None,
             planner_work: incumbent_planner_work,
             analysis_work: 0,
-            packed_frontier_eligible: false,
+            frontier_continuation: None,
             storage_bytes: 0,
         });
     }
@@ -1583,7 +1583,7 @@ fn try_build_k0_mandatory_cut(
     analysis_limits.max_allocation_items = analysis_limits
         .max_allocation_items
         .min(limits.lowering.max_stack_items);
-    let analysis = fre_automata::analyze_mandatory_cut(raw, analysis_limits);
+    let analysis = fre_automata::analyze_mandatory_cut_continuation(raw, analysis_limits);
     let stats = analysis.stats();
     if !stats.closes(analysis_limits) {
         return Err(BuildError::InternalInvariant(
@@ -1600,9 +1600,11 @@ fn try_build_k0_mandatory_cut(
             "K0 mandatory-cut analysis exceeded its admitted planner work",
         ));
     }
-    let candidate = match analysis {
-        MandatoryCutAnalysis::Complete(report) => report.candidate(),
-        MandatoryCutAnalysis::Declined(decline) => match decline.reason() {
+    let (candidate, continuation) = match analysis {
+        MandatoryCutContinuationAnalysis::Complete(continuation) => {
+            (continuation.candidate(), Some(continuation))
+        }
+        MandatoryCutContinuationAnalysis::Declined(decline) => match decline.reason() {
             MandatoryCutDeclineReason::Resource {
                 resource:
                     MandatoryCutResource::Work
@@ -1610,7 +1612,7 @@ fn try_build_k0_mandatory_cut(
                     | MandatoryCutResource::AllocationAttempts,
                 ..
             }
-            | MandatoryCutDeclineReason::Allocation { .. } => None,
+            | MandatoryCutDeclineReason::Allocation { .. } => (None, None),
             MandatoryCutDeclineReason::MalformedGraph(_)
             | MandatoryCutDeclineReason::ArithmeticOverflow { .. }
             | MandatoryCutDeclineReason::InternalInvariant { .. } => {
@@ -1626,10 +1628,11 @@ fn try_build_k0_mandatory_cut(
         },
     };
     // The optional frontier can only publish for a four-to-thirty-two-byte
-    // mandatory root. Preserve that scalar fact from this already-charged
-    // exact-graph receipt so ineligible plans do not rerun the complete
-    // mandatory-cut analysis merely to rediscover it. Eligible plans still
-    // reauthenticate the candidate against `raw` below. Displacement remains
+    // mandatory root. Preserve both that scalar fact and the one-shot,
+    // raw-plan-bound continuation from this already-charged exact-graph
+    // receipt. Ineligible plans retain neither; eligible plans can enumerate
+    // their frontier later, after the incumbent suffix has first refusal,
+    // without replaying dominator and distance analysis. Displacement remains
     // a later concern because the HIR can supply a finite global bound when
     // the graph distance proof is conservatively unbounded.
     let packed_frontier_eligible = candidate.is_some_and(|candidate| {
@@ -1651,7 +1654,11 @@ fn try_build_k0_mandatory_cut(
         plan,
         planner_work,
         analysis_work: stats.work(),
-        packed_frontier_eligible,
+        frontier_continuation: if packed_frontier_eligible {
+            continuation
+        } else {
+            None
+        },
     })
 }
 
@@ -1718,11 +1725,10 @@ fn k0_packed_frontier_maximum_before_root(
     reason = "one optional transaction closes graph analysis, packed construction, and owner accounting before publication"
 )]
 fn try_build_k0_packed_frontier(
-    raw: &fre_automata::RawPlan,
     limits: BuildLimits,
     incumbent_planner_work: u64,
     mandatory_cut_analysis_work: u64,
-    mandatory_cut_frontier_eligible: bool,
+    mandatory_cut_continuation: Option<MandatoryCutContinuation<'_>>,
     maximum_match_bytes: Option<usize>,
 ) -> Result<K0PackedFrontierBuild, BuildError> {
     let declined = |planner_work| K0PackedFrontierBuild {
@@ -1730,9 +1736,9 @@ fn try_build_k0_packed_frontier(
         planner_work,
         storage_bytes: 0,
     };
-    if !mandatory_cut_frontier_eligible {
+    let Some(mandatory_cut_continuation) = mandatory_cut_continuation else {
         return Ok(declined(incumbent_planner_work));
-    }
+    };
     let owner_bytes = core::mem::size_of::<K0PackedFrontierPlan>();
     if limits.packed_literal_set.max_patterns < 2
         || limits.packed_literal_set.max_pattern_bytes < 4
@@ -1751,19 +1757,22 @@ fn try_build_k0_packed_frontier(
         return Ok(declined(incumbent_planner_work));
     }
 
-    // The analyzer intentionally re-authenticates the mandatory cut against
-    // this exact RawPlan. The immediately preceding cut transaction supplies
-    // its exact completed work, so replay can reserve that nested receipt and
-    // give the frontier the remainder without either hidden work or a fixed
-    // partition that would fail at the completed plan's exact work limit.
-    if mandatory_cut_analysis_work == 0 || mandatory_cut_analysis_work > remaining_work {
-        return Ok(declined(incumbent_planner_work));
+    // The one-shot continuation retains the exact completed cut receipt and a
+    // shared borrow of the RawPlan that produced it. Continuing consumes that
+    // authority, so frontier enumeration cannot cross plans or observe a
+    // same-address mutation. The cut work was already charged before the
+    // incumbent suffix received first refusal; only new frontier work consumes
+    // the remaining facade budget here.
+    if mandatory_cut_analysis_work == 0
+        || mandatory_cut_continuation.stats().work() != mandatory_cut_analysis_work
+    {
+        return Err(BuildError::InternalInvariant(
+            "K0 packed-frontier continuation disagreed with its cut receipt",
+        ));
     }
     let mut analysis_limits = MandatoryLiteralFrontierAnalysisLimits::default();
     analysis_limits.mandatory_cut.max_work = mandatory_cut_analysis_work;
-    analysis_limits.max_work = analysis_limits
-        .max_work
-        .min(remaining_work.saturating_sub(mandatory_cut_analysis_work));
+    analysis_limits.max_work = analysis_limits.max_work.min(remaining_work);
     analysis_limits.mandatory_cut.max_allocation_items = analysis_limits
         .mandatory_cut
         .max_allocation_items
@@ -1771,22 +1780,18 @@ fn try_build_k0_packed_frontier(
     analysis_limits.max_allocation_items = analysis_limits
         .max_allocation_items
         .min(limits.lowering.max_stack_items);
-    let analysis = fre_automata::analyze_mandatory_literal_frontier(raw, analysis_limits);
+    let analysis = fre_automata::continue_mandatory_literal_frontier(
+        mandatory_cut_continuation,
+        analysis_limits,
+    );
     let stats = analysis.stats();
     if !stats.closes(analysis_limits) {
         return Err(BuildError::InternalInvariant(
             "K0 packed-frontier analysis receipt did not close",
         ));
     }
-    let analysis_work = stats
-        .mandatory_cut()
-        .work()
-        .checked_add(stats.work())
-        .ok_or(BuildError::InternalInvariant(
-            "K0 packed-frontier analysis work overflowed",
-        ))?;
     let mut planner_work = incumbent_planner_work
-        .checked_add(analysis_work)
+        .checked_add(stats.work())
         .ok_or(BuildError::InternalInvariant(
             "cumulative K0 packed-frontier planner work overflowed",
         ))?;
@@ -6293,7 +6298,13 @@ impl PortableBuilder {
         )?;
         let lowering = lowered.stats();
         let raw = lowered.into_plan();
-        let mandatory_cut = if matches!(minimum_match_bytes, Some(minimum) if minimum > 0)
+        let K0MandatoryCutBuild {
+            plan: mandatory_cut_plan,
+            planner_work: mandatory_cut_planner_work,
+            analysis_work: mandatory_cut_analysis_work,
+            frontier_continuation: mandatory_cut_frontier_continuation,
+            storage_bytes: mandatory_cut_build_storage_bytes,
+        } = if matches!(minimum_match_bytes, Some(minimum) if minimum > 0)
             && !rust.hir.properties().look_set_prefix().contains(Look::Start)
         {
             try_build_k0_mandatory_cut(&raw, self.limits, fallback_planner_work)?
@@ -6302,11 +6313,15 @@ impl PortableBuilder {
                 plan: None,
                 planner_work: fallback_planner_work,
                 analysis_work: 0,
-                packed_frontier_eligible: false,
+                frontier_continuation: None,
                 storage_bytes: 0,
             }
         };
-        fallback_planner_work = mandatory_cut.planner_work;
+        fallback_planner_work = mandatory_cut_planner_work;
+        // The cut continuation retains only its inline report and immutable
+        // RawPlan borrow. Keep it unconsumed across this established suffix
+        // transaction so suffix construction preserves exact first refusal;
+        // frontier enumeration begins only from the remaining planner budget.
         let mandatory_suffix = if matches!(minimum_match_bytes, Some(minimum) if minimum > 0)
             && !rust.hir.properties().look_set_prefix().contains(Look::Start)
         {
@@ -6315,7 +6330,7 @@ impl PortableBuilder {
                 Some(&rust.hir),
                 minimum_match_bytes,
                 rust.hir.properties().maximum_len(),
-                mandatory_cut.plan,
+                mandatory_cut_plan,
                 self.limits,
                 fallback_planner_work,
             )?
@@ -6332,14 +6347,14 @@ impl PortableBuilder {
             && !rust.hir.properties().look_set_prefix().contains(Look::Start)
         {
             try_build_k0_packed_frontier(
-                &raw,
                 self.limits,
                 fallback_planner_work,
-                mandatory_cut.analysis_work,
-                mandatory_cut.packed_frontier_eligible,
+                mandatory_cut_analysis_work,
+                mandatory_cut_frontier_continuation,
                 rust.hir.properties().maximum_len(),
             )?
         } else {
+            drop(mandatory_cut_frontier_continuation);
             K0PackedFrontierBuild {
                 plan: None,
                 planner_work: fallback_planner_work,
@@ -6367,9 +6382,9 @@ impl PortableBuilder {
             mandatory_suffix_plan = None;
             mandatory_suffix_storage_bytes = 0;
         }
-        let mut mandatory_cut_plan = mandatory_cut.plan;
-        let mut mandatory_cut_storage_bytes = mandatory_cut_plan
-            .map_or(0, |_| mandatory_cut.storage_bytes);
+        let mut mandatory_cut_plan = mandatory_cut_plan;
+        let mut mandatory_cut_storage_bytes =
+            mandatory_cut_plan.map_or(0, |_| mandatory_cut_build_storage_bytes);
         let cut_fits = mandatory_cut_storage_bytes
             <= available_optional_bytes.saturating_sub(mandatory_suffix_storage_bytes);
         if !cut_fits {
@@ -15851,15 +15866,14 @@ mod tests {
         let cut = try_build_k0_mandatory_cut(&raw, limits, 0)
             .expect("focused packed-frontier prerequisite cut completes");
         assert!(
-            cut.packed_frontier_eligible,
+            cut.frontier_continuation.is_some(),
             "focused packed-frontier shape lost its cheap prerequisite gate",
         );
         let build = try_build_k0_packed_frontier(
-            &raw,
             limits,
             cut.planner_work,
             cut.analysis_work,
-            cut.packed_frontier_eligible,
+            cut.frontier_continuation,
             maximum_match_bytes,
         )
         .expect("focused packed-frontier analysis completes");
@@ -16179,15 +16193,14 @@ mod tests {
             let cut = try_build_k0_mandatory_cut(&raw, limits, 0)
                 .expect("focused ineligible prerequisite completes");
             assert!(
-                !cut.packed_frontier_eligible,
+                cut.frontier_continuation.is_none(),
                 "{shape} unexpectedly passed the packed-frontier prerequisite gate",
             );
             let build = try_build_k0_packed_frontier(
-                &raw,
                 limits,
                 cut.planner_work,
                 cut.analysis_work,
-                cut.packed_frontier_eligible,
+                cut.frontier_continuation,
                 maximum_match_bytes,
             )
             .expect("focused ineligible packed-frontier transaction completes");
@@ -16435,6 +16448,50 @@ mod tests {
     }
 
     #[test]
+    fn k0_packed_frontier_continuation_enforces_receipt_and_remaining_work() {
+        let pattern = r"(?s-u:...[abcd][12345]+\b)";
+        let (raw, limits, _, _, maximum_match_bytes) =
+            lowered_k0_mandatory_cut(pattern);
+        let cut = try_build_k0_mandatory_cut(&raw, limits, 0)
+            .expect("focused continuation prerequisite completes");
+        let cut_work = cut.analysis_work;
+        let error = match try_build_k0_packed_frontier(
+            limits,
+            cut.planner_work,
+            cut_work.checked_add(1).expect("focused cut work is finite"),
+            cut.frontier_continuation,
+            maximum_match_bytes,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("mismatched continuation accounting did not fail closed"),
+        };
+        assert!(matches!(
+            error,
+            BuildError::InternalInvariant(
+                "K0 packed-frontier continuation disagreed with its cut receipt"
+            )
+        ));
+
+        let cut = try_build_k0_mandatory_cut(&raw, limits, 0)
+            .expect("zero-remainder continuation prerequisite completes");
+        let exact_cut_limit = BuildLimits {
+            max_planner_work: cut.planner_work,
+            ..limits
+        };
+        let declined = try_build_k0_packed_frontier(
+            exact_cut_limit,
+            cut.planner_work,
+            cut.analysis_work,
+            cut.frontier_continuation,
+            maximum_match_bytes,
+        )
+        .expect("zero-remainder continuation declines transactionally");
+        assert!(declined.plan.is_none());
+        assert_eq!(declined.storage_bytes, 0);
+        assert_eq!(declined.planner_work, exact_cut_limit.max_planner_work);
+    }
+
+    #[test]
     fn k0_packed_frontier_exact_and_one_below_resources_are_transactional() {
         let pattern = r"(?s-u:...[abcd][12345]+\b)";
         let (raw, limits, _, _, maximum_match_bytes) =
@@ -16442,11 +16499,10 @@ mod tests {
         let cut = try_build_k0_mandatory_cut(&raw, limits, 0)
             .expect("packed-frontier resource prerequisite completes");
         let complete = try_build_k0_packed_frontier(
-            &raw,
             limits,
             cut.planner_work,
             cut.analysis_work,
-            cut.packed_frontier_eligible,
+            cut.frontier_continuation,
             maximum_match_bytes,
         )
         .expect("packed-frontier resource baseline completes");
@@ -16460,11 +16516,10 @@ mod tests {
         let exact_cut = try_build_k0_mandatory_cut(&raw, exact_limits, 0)
             .expect("exact packed-frontier prerequisite completes");
         let exact = try_build_k0_packed_frontier(
-            &raw,
             exact_limits,
             exact_cut.planner_work,
             exact_cut.analysis_work,
-            exact_cut.packed_frontier_eligible,
+            exact_cut.frontier_continuation,
             maximum_match_bytes,
         )
         .expect("exact packed-frontier build completes");
@@ -16479,11 +16534,10 @@ mod tests {
         let one_below_cut = try_build_k0_mandatory_cut(&raw, one_below_limits, 0)
             .expect("one-below packed-frontier prerequisite completes");
         let one_below = try_build_k0_packed_frontier(
-            &raw,
             one_below_limits,
             one_below_cut.planner_work,
             one_below_cut.analysis_work,
-            one_below_cut.packed_frontier_eligible,
+            one_below_cut.frontier_continuation,
             maximum_match_bytes,
         )
         .expect("one-below packed-frontier refusal closes");
@@ -16501,11 +16555,10 @@ mod tests {
         let cut = try_build_k0_mandatory_cut(&raw, pattern_limited, 0)
             .expect("pattern-limited prerequisite completes");
         let declined = try_build_k0_packed_frontier(
-            &raw,
             pattern_limited,
             cut.planner_work,
             cut.analysis_work,
-            cut.packed_frontier_eligible,
+            cut.frontier_continuation,
             maximum_match_bytes,
         )
         .expect("pattern-limited packed frontier declines transactionally");
@@ -16522,11 +16575,10 @@ mod tests {
         let cut = try_build_k0_mandatory_cut(&raw, owner_limited, 0)
             .expect("owner-limited prerequisite completes");
         let declined = try_build_k0_packed_frontier(
-            &raw,
             owner_limited,
             cut.planner_work,
             cut.analysis_work,
-            cut.packed_frontier_eligible,
+            cut.frontier_continuation,
             maximum_match_bytes,
         )
         .expect("owner-limited packed frontier declines transactionally");
@@ -16538,14 +16590,13 @@ mod tests {
             lowered_k0_mandatory_cut(r"(?s-u:.*[abcd][1234])");
         let unbounded_cut = try_build_k0_mandatory_cut(&unbounded_raw, unbounded_limits, 0)
             .expect("unbounded packed-frontier prerequisite completes");
-        assert!(unbounded_cut.packed_frontier_eligible);
+        assert!(unbounded_cut.frontier_continuation.is_some());
         assert_eq!(unbounded_maximum_match_bytes, None);
         let unbounded = try_build_k0_packed_frontier(
-            &unbounded_raw,
             unbounded_limits,
             unbounded_cut.planner_work,
             unbounded_cut.analysis_work,
-            unbounded_cut.packed_frontier_eligible,
+            unbounded_cut.frontier_continuation,
             unbounded_maximum_match_bytes,
         )
         .expect("unbounded packed frontier declines transactionally");
@@ -16553,7 +16604,7 @@ mod tests {
         assert_eq!(unbounded.storage_bytes, 0);
         assert!(
             unbounded.planner_work > unbounded_cut.planner_work,
-            "an eligible-width root is reauthenticated before its truly unbounded displacement declines",
+            "an eligible-width root spends frontier-only work before its truly unbounded displacement declines",
         );
     }
 

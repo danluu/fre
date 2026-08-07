@@ -29,9 +29,9 @@
 use core::{cmp::Ordering, mem::size_of};
 
 use crate::{
-    EdgeKind, MandatoryCutAnalysis, MandatoryCutAnalysisLimits,
-    MandatoryCutAnalysisStats, MandatoryCutDeclineReason, MaximumConsumedDistance, RawPlan,
-    StateRole, analyze_mandatory_cut,
+    EdgeKind, MandatoryCutAnalysisLimits, MandatoryCutAnalysisStats, MandatoryCutContinuation,
+    MandatoryCutContinuationAnalysis, MandatoryCutDeclineReason, MaximumConsumedDistance,
+    RawPlan, StateRole, analyze_mandatory_cut_continuation,
 };
 
 /// Stable identity for this frontier proof and its accounting convention.
@@ -530,17 +530,44 @@ pub fn analyze_mandatory_literal_frontier(
     limits: MandatoryLiteralFrontierAnalysisLimits,
 ) -> MandatoryLiteralFrontierAnalysis {
     let mut budget = Budget::new(limits, raw.roles.len(), raw.edge_targets.len());
-    let cut = analyze_mandatory_cut(raw, limits.mandatory_cut);
+    let cut = analyze_mandatory_cut_continuation(raw, limits.mandatory_cut);
     budget.stats.mandatory_cut = cut.stats();
-    let cut_report = match cut {
-        MandatoryCutAnalysis::Complete(report) => report,
-        MandatoryCutAnalysis::Declined(decline) => {
+    match cut {
+        MandatoryCutContinuationAnalysis::Complete(continuation) => {
+            continue_mandatory_literal_frontier(continuation, limits)
+        }
+        MandatoryCutContinuationAnalysis::Declined(decline) => {
             return decline_result(
                 &budget,
                 MandatoryLiteralFrontierDeclineReason::MandatoryCut(decline.reason()),
             );
         }
-    };
+    }
+}
+
+/// Continue a frontier proof from one already-completed mandatory-cut proof.
+///
+/// The continuation owns the only raw-plan reference used here. Its shared
+/// borrow prevents safe mutation and this API accepts no replacement graph,
+/// so the prerequisite candidate remains bound to exactly the plan that
+/// produced it. Nested cut accounting is retained in the returned receipt but
+/// the cut algorithm and its scratch allocations are not repeated.
+#[must_use]
+pub fn continue_mandatory_literal_frontier(
+    continuation: MandatoryCutContinuation<'_>,
+    limits: MandatoryLiteralFrontierAnalysisLimits,
+) -> MandatoryLiteralFrontierAnalysis {
+    let (raw, cut_report) = continuation.into_parts();
+    let mut budget = Budget::new(limits, raw.roles.len(), raw.edge_targets.len());
+    budget.stats.mandatory_cut = cut_report.stats();
+    if !budget.stats.mandatory_cut.closes(limits.mandatory_cut) {
+        return decline_result(
+            &budget,
+            MandatoryLiteralFrontierDeclineReason::InternalInvariant {
+                detail: "continued mandatory-cut receipt did not close under frontier limits",
+            },
+        );
+    }
     let Some(root) = cut_report.candidate() else {
         return complete_result(
             budget,
@@ -1326,6 +1353,7 @@ fn to_usize(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyze_mandatory_cut;
 
     type TestEdge = (u32, EdgeKind, u8, u8);
 
@@ -1433,6 +1461,39 @@ mod tests {
         );
         assert_eq!(report.stop_reason(), MandatoryLiteralFrontierStopReason::Candidate);
         assert!(report.stats().closes(MandatoryLiteralFrontierAnalysisLimits::default()));
+    }
+
+    #[test]
+    fn bound_cut_continuation_matches_standalone_frontier_without_replay() {
+        let graph = four_by_four();
+        let limits = MandatoryLiteralFrontierAnalysisLimits::default();
+        let standalone = analyze_mandatory_literal_frontier(&graph, limits);
+        let continuation = match analyze_mandatory_cut_continuation(
+            &graph,
+            limits.mandatory_cut,
+        ) {
+            MandatoryCutContinuationAnalysis::Complete(continuation) => continuation,
+            MandatoryCutContinuationAnalysis::Declined(decline) => {
+                panic!("unexpected bound-cut decline: {decline:?}")
+            }
+        };
+        let cut_stats = continuation.stats();
+
+        // The continuation accepts no second RawPlan. Keeping an unrelated
+        // graph live therefore cannot redirect the proof, while the shared
+        // borrow of `graph` prevents safe same-address mutation until this
+        // one-shot authority is consumed.
+        let unrelated = raw(
+            0,
+            vec![StateRole::Consume, StateRole::Accept],
+            vec![vec![byte(1, b'Z')], vec![]],
+        );
+        assert_ne!(graph, unrelated);
+        let continued = continue_mandatory_literal_frontier(continuation, limits);
+
+        assert_eq!(continued, standalone);
+        assert_eq!(continued.stats().mandatory_cut(), cut_stats);
+        assert!(continued.stats().closes(limits));
     }
 
     #[test]

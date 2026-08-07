@@ -373,6 +373,78 @@ impl MandatoryCutAnalysis {
     }
 }
 
+/// One completed mandatory-cut proof bound to exactly the immutable raw plan
+/// that it analyzed.
+///
+/// This value is intentionally neither `Clone` nor `Copy`. A downstream graph
+/// proof may consume it once, and the retained shared borrow prevents safe
+/// mutation of the raw plan until that continuation completes. The raw plan is
+/// not accepted again by the continuation API, so a caller cannot substitute a
+/// different graph while reusing the candidate.
+#[derive(Debug)]
+pub struct MandatoryCutContinuation<'a> {
+    raw: &'a RawPlan,
+    report: MandatoryCutAnalysisReport,
+}
+
+impl<'a> MandatoryCutContinuation<'a> {
+    /// Best candidate selected from the bound raw plan.
+    #[must_use]
+    pub const fn candidate(&self) -> Option<MandatoryCutCandidate> {
+        self.report.candidate()
+    }
+
+    /// Exact completed accounting for the prerequisite proof.
+    #[must_use]
+    pub const fn stats(&self) -> MandatoryCutAnalysisStats {
+        self.report.stats()
+    }
+
+    pub(crate) const fn into_parts(self) -> (&'a RawPlan, MandatoryCutAnalysisReport) {
+        (self.raw, self.report)
+    }
+}
+
+/// Result of requesting a continuation-capable mandatory-cut proof.
+#[derive(Debug)]
+pub enum MandatoryCutContinuationAnalysis<'a> {
+    /// The complete proof and its immutable raw-plan binding.
+    Complete(MandatoryCutContinuation<'a>),
+    /// The prerequisite proof declined with its ordinary closed receipt.
+    Declined(MandatoryCutAnalysisDecline),
+}
+
+impl MandatoryCutContinuationAnalysis<'_> {
+    /// Accounting shared by successful and declined outcomes.
+    #[must_use]
+    pub const fn stats(&self) -> MandatoryCutAnalysisStats {
+        match self {
+            Self::Complete(continuation) => continuation.stats(),
+            Self::Declined(decline) => decline.stats(),
+        }
+    }
+}
+
+/// Analyze a raw plan once and retain authority for one bound continuation.
+///
+/// The graph algorithm and receipt are identical to [`analyze_mandatory_cut`].
+/// Only a completed report is wrapped in an immutable borrow so a downstream
+/// proof can reuse it without rerunning dominator and distance analysis.
+#[must_use]
+pub fn analyze_mandatory_cut_continuation(
+    raw: &RawPlan,
+    limits: MandatoryCutAnalysisLimits,
+) -> MandatoryCutContinuationAnalysis<'_> {
+    match analyze_mandatory_cut(raw, limits) {
+        MandatoryCutAnalysis::Complete(report) => {
+            MandatoryCutContinuationAnalysis::Complete(MandatoryCutContinuation { raw, report })
+        }
+        MandatoryCutAnalysis::Declined(decline) => {
+            MandatoryCutContinuationAnalysis::Declined(decline)
+        }
+    }
+}
+
 /// Analyze a raw Thompson graph for independently mandatory consuming roots.
 ///
 /// No source syntax, haystack, timing signal, or expected result participates
