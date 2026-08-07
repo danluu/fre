@@ -12380,12 +12380,15 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     let preflight_enter = assembler.label()?;
     let try_v2 = assembler.label()?;
     let v3_enter = assembler.label()?;
+    let v3_dispatch = assembler.label()?;
     let mut v3_shift_entries = [0_usize; 9];
     for entry in &mut v3_shift_entries {
         *entry = assembler.label()?;
     }
     let scan = assembler.label()?;
     let table_scan = assembler.label()?;
+    let root_setup = root_plan.map(|_| assembler.label()).transpose()?;
+    let root_candidate = root_plan.map(|_| assembler.label()).transpose()?;
     let root_vector = root_plan.map(|_| assembler.label()).transpose()?;
     let root_vector_hit = root_plan.map(|_| assembler.label()).transpose()?;
     let root_scalar = root_plan.map(|_| assembler.label()).transpose()?;
@@ -12519,9 +12522,13 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x18])?;
     assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x40])?;
     assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x48])?;
-    if output != OutputContract::Exists {
+    if let Some(root_setup) = root_setup {
+        assembler.branch(&[0xe9], root_setup)?;
+    } else if output != OutputContract::Exists {
         assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x60, 0, 0, 0, 0])?;
     }
+
+    assembler.bind(v3_dispatch)?;
     for (index, &entry) in v3_shift_entries.iter().enumerate() {
         let shift = u8::try_from(index.checked_add(1).ok_or(
             ObjectError::ArithmeticOverflow("x86 V3 row shift dispatch"),
@@ -12570,6 +12577,23 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
             &[0x0f, 0x87],
             native_complete.unwrap_or(native_no_match),
         )?;
+        if let Some(root_vector) = root_vector {
+            let non_root = assembler.label()?;
+            assembler.instruction(&[
+                0x45,
+                0x3b,
+                0x53,
+                u8::try_from(FROZEN_DYNAMIC_ROWS_V3_INITIAL_STATE_OFFSET)
+                    .map_err(|_| ObjectError::ArithmeticOverflow("x86 V3 initial state"))?,
+            ])?;
+            assembler.branch(&[0x0f, 0x85], non_root)?;
+            if output != OutputContract::Exists {
+                assembler.instruction(&[0x48, 0x83, 0x7c, 0x24, 0x60, 0])?;
+                assembler.branch(&[0x0f, 0x85], non_root)?;
+            }
+            assembler.branch(&[0xe9], root_vector)?;
+            assembler.bind(non_root)?;
+        }
         assembler.instruction(&[0x49, 0xc1, 0xe2, shift])?;
         assembler.instruction(&[0x4e, 0x8d, 0x04, 0x16])?;
         assembler.branch(&[0xe9], v3_scan)?;
@@ -12619,39 +12643,48 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x18])?; // haystack
     assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x40])?; // position
     assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x48])?; // exact end
-    match (root_plan, filter_kind) {
-        (Some(X86DynamicRootPlan::Range(filter)), Some(kind)) => {
-            x86_emit_start_filter_constants(&mut assembler, filter, kind, 1)?;
-            assembler.instruction(&[0x41, 0x8b, 0x43, NATIVE_ROWS_LOOP_COUNT as u8])?;
-        }
-        (Some(X86DynamicRootPlan::Exact { storage, .. }), Some(_)) => {
-            // The preflight's seventh stack argument still contains the
-            // relocated identity address. Convert it to the stable table
-            // base, retain that base in the now-dead eighth argument slot,
-            // and borrow R9 only while loading immutable vector constants.
-            assembler.instruction(&[0x48, 0x8b, 0x04, 0x24])?; // identity
-            assembler.instruction(&[0x48, 0x83, 0xc0, 32])?; // post-identity tables
-            assembler.instruction(&[0x48, 0x89, 0x44, 0x24, 0x08])?;
-            if let Some(kind) = exact_vector_kind {
-                assembler.instruction(&[0x4c, 0x89, 0x0c, 0x24])?; // save class map
-                assembler.instruction(&[0x49, 0x89, 0xc1])?; // exact table base -> r9
-                x86_emit_exact_vector_constants(&mut assembler, storage, kind)?;
-                assembler.instruction(&[0x4c, 0x8b, 0x0c, 0x24])?; // restore class map
-            }
-            assembler.instruction(&[0x41, 0x8b, 0x43, NATIVE_ROWS_LOOP_COUNT as u8])?;
-        }
-        (None, None) => {}
-        _ => {
-            return Err(ObjectError::InvalidModule(
-                "x86 dynamic root setup is inconsistent",
-            ));
-        }
-    }
-    if output != OutputContract::Exists {
+    if let Some(root_setup) = root_setup {
+        assembler.branch(&[0xe9], root_setup)?;
+    } else if output != OutputContract::Exists {
         // A non-nullable admitted descriptor has no pending endpoint yet.
-        // The final unused frame word retains it across vector/scalar root
-        // retries and direct-row transitions without consuming a hot GPR.
         assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x60, 0, 0, 0, 0])?;
+    }
+
+    if let Some(root_setup) = root_setup {
+        assembler.bind(root_setup)?;
+        match (root_plan, filter_kind) {
+            (Some(X86DynamicRootPlan::Range(filter)), Some(kind)) => {
+                x86_emit_start_filter_constants(&mut assembler, filter, kind, 1)?;
+            }
+            (Some(X86DynamicRootPlan::Exact { storage, .. }), Some(_)) => {
+                // The relocated identity precedes the stable exact tables.
+                // Borrow R9 only during vector-constant installation, then
+                // restore the active V2 or inline-V3 class map.
+                assembler.instruction(&[0x48, 0x8b, 0x04, 0x24])?;
+                assembler.instruction(&[0x48, 0x83, 0xc0, 32])?;
+                assembler.instruction(&[0x48, 0x89, 0x44, 0x24, 0x08])?;
+                if let Some(kind) = exact_vector_kind {
+                    assembler.instruction(&[0x4c, 0x89, 0x0c, 0x24])?;
+                    assembler.instruction(&[0x49, 0x89, 0xc1])?;
+                    x86_emit_exact_vector_constants(&mut assembler, storage, kind)?;
+                    assembler.instruction(&[0x4c, 0x8b, 0x0c, 0x24])?;
+                }
+            }
+            _ => {
+                return Err(ObjectError::InvalidModule(
+                    "x86 dynamic root setup is inconsistent",
+                ));
+            }
+        }
+        if output != OutputContract::Exists {
+            assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x60, 0, 0, 0, 0])?;
+        }
+        assembler.branch(
+            &[0xe9],
+            root_vector.ok_or(ObjectError::InvalidModule(
+                "x86 dynamic root vector label is absent",
+            ))?,
+        )?;
     }
 
     let loop_rows_checked = root_plan.map(|_| assembler.label()).transpose()?;
@@ -12710,6 +12743,54 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
         assembler.bind(loop_rows_checked)?;
     }
 
+    if let Some(root_candidate) = root_candidate {
+        let v2_candidate = assembler.label()?;
+        assembler.bind(root_candidate)?;
+        assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, 0x10])?;
+        let mut compare_v3 = vec![
+            0x81,
+            0x78,
+            u8::try_from(FROZEN_PREPARED_HEADER_V1_FLAGS_OFFSET)
+                .map_err(|_| ObjectError::ArithmeticOverflow("x86 V3 candidate flag"))?,
+        ];
+        compare_v3.extend_from_slice(
+            &FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3.to_le_bytes(),
+        );
+        assembler.instruction(&compare_v3)?;
+        assembler.branch(&[0x0f, 0x85], v2_candidate)?;
+        assembler.instruction(&[
+            0x49,
+            0x8b,
+            0x73,
+            u8::try_from(FROZEN_DYNAMIC_ROWS_V3_ROWS_ADDRESS_OFFSET)
+                .map_err(|_| ObjectError::ArithmeticOverflow("x86 V3 candidate rows"))?,
+        ])?;
+        let class_map_offset = i32::try_from(FROZEN_PREPARED_HEADER_V1_CLASS_MAP_OFFSET)
+            .map_err(|_| ObjectError::ArithmeticOverflow("x86 V3 candidate class map"))?;
+        let mut inline_class_map = vec![0x4c, 0x8d, 0x88];
+        inline_class_map.extend_from_slice(&class_map_offset.to_le_bytes());
+        assembler.instruction(&inline_class_map)?;
+        assembler.instruction(&[
+            0x45,
+            0x8b,
+            0x43,
+            u8::try_from(FROZEN_DYNAMIC_ROWS_V3_INITIAL_STATE_OFFSET)
+                .map_err(|_| ObjectError::ArithmeticOverflow("x86 V3 candidate state"))?,
+        ])?;
+        assembler.instruction(&[
+            0x41,
+            0x8b,
+            0x43,
+            u8::try_from(FROZEN_DYNAMIC_ROWS_V3_ROW_SHIFT_OFFSET)
+                .map_err(|_| ObjectError::ArithmeticOverflow("x86 V3 candidate shift"))?,
+        ])?;
+        assembler.branch(&[0xe9], v3_dispatch)?;
+
+        assembler.bind(v2_candidate)?;
+        assembler.instruction(&[0x41, 0x8b, 0x43, NATIVE_ROWS_LOOP_COUNT as u8])?;
+        assembler.branch(&[0xe9], table_scan)?;
+    }
+
     assembler.bind(table_scan)?;
     assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
     assembler.instruction(&[0x47, 0x0f, 0xb6, 0x14, 0x11])?;
@@ -12756,6 +12837,9 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
         let scalar_reject = root_scalar_reject.ok_or(ObjectError::InvalidModule(
             "x86 dynamic root scalar reject label is absent",
         ))?;
+        let candidate = root_candidate.ok_or(ObjectError::InvalidModule(
+            "x86 dynamic root candidate label is absent",
+        ))?;
         assembler.bind(vector)?;
         assembler.instruction(&[0x48, 0x89, 0xc8])?; // remaining = end
         assembler.instruction(&[0x48, 0x29, 0xd0])?; // remaining -= position
@@ -12778,15 +12862,13 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
             X86CandidateMask::for_filter(filter, kind),
         )?;
         assembler.instruction(&[0x48, 0x01, 0xc2])?; // position += first lane
-        assembler.instruction(&[0x41, 0x8b, 0x43, NATIVE_ROWS_LOOP_COUNT as u8])?;
-        assembler.branch(&[0xe9], table_scan)?;
+        assembler.branch(&[0xe9], candidate)?;
 
         assembler.bind(scalar)?;
         x86_emit_start_filter_scalar_bound(&mut assembler, filter.scan_offset, native_no_match)?;
         x86_emit_scalar_filter_membership(&mut assembler, filter, scalar_reject)?;
         assembler.bind(scalar_hit)?;
-        assembler.instruction(&[0x41, 0x8b, 0x43, NATIVE_ROWS_LOOP_COUNT as u8])?;
-        assembler.branch(&[0xe9], table_scan)?;
+        assembler.branch(&[0xe9], candidate)?;
         assembler.bind(scalar_reject)?;
         assembler.instruction(&[0x48, 0xff, 0xc2])?;
         assembler.branch(&[0xe9], scalar)?;
@@ -12807,6 +12889,9 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
         ))?;
         let scalar_reject = root_scalar_reject.ok_or(ObjectError::InvalidModule(
             "x86 dynamic exact root scalar reject label is absent",
+        ))?;
+        let candidate = root_candidate.ok_or(ObjectError::InvalidModule(
+            "x86 dynamic exact root candidate label is absent",
         ))?;
 
         assembler.bind(vector)?;
@@ -12835,8 +12920,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
             assembler.bind(vector_hit)?;
             x86_emit_first_candidate_lane(&mut assembler, mask)?;
             assembler.instruction(&[0x48, 0x01, 0xc2])?;
-            assembler.instruction(&[0x41, 0x8b, 0x43, NATIVE_ROWS_LOOP_COUNT as u8])?;
-            assembler.branch(&[0xe9], table_scan)?;
+            assembler.branch(&[0xe9], candidate)?;
         } else {
             assembler.branch(&[0xe9], scalar)?;
         }
@@ -12852,8 +12936,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
         x86_emit_exact_byte_set_test_with_base(&mut assembler, storage, 10, scalar_hit)?;
         assembler.branch(&[0xe9], scalar_reject)?;
         assembler.bind(scalar_hit)?;
-        assembler.instruction(&[0x41, 0x8b, 0x43, NATIVE_ROWS_LOOP_COUNT as u8])?;
-        assembler.branch(&[0xe9], table_scan)?;
+        assembler.branch(&[0xe9], candidate)?;
         assembler.bind(scalar_reject)?;
         assembler.instruction(&[0x48, 0xff, 0xc2])?;
         assembler.branch(&[0xe9], scalar)?;
@@ -19647,6 +19730,72 @@ fn aarch64_emit_frozen_dynamic_entry(
     Ok(())
 }
 
+fn aarch64_emit_dynamic_root_setup(
+    assembler: &mut Aarch64Assembler,
+    plan: Aarch64DynamicScannerPlan,
+) -> Result<(), ObjectError> {
+    if plan.has_tables() {
+        assembler.instruction(aarch64_load_x_imm(5, 31, 80)?)?;
+        assembler.instruction(aarch64_add_x_imm(5, 5, 32)?)?;
+    }
+    match plan {
+        Aarch64DynamicScannerPlan::Range(plan) => {
+            if plan.use_asimd {
+                aarch64_emit_start_filter_constants(
+                    assembler,
+                    plan.filter,
+                    AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
+                )?;
+            }
+            if plan.use_exact_asimd_lane {
+                aarch64_emit_first_lane_constants(
+                    assembler,
+                    plan.lane_index_offset.ok_or(ObjectError::InvalidModule(
+                        "dynamic ASIMD exact lane has no index table",
+                    ))?,
+                )?;
+            }
+            if let Some(kind) = plan.sve_kind.filter(|_| !plan.use_runtime_vl_dispatch) {
+                // A pure-SVE route never executes ASIMD, so its Z16..Z23
+                // constants survive scalar tails and compact/V2 transitions.
+                aarch64_emit_sve_filter_setup(assembler, plan.filter, kind, 0)?;
+            }
+            if plan.use_runtime_vl_dispatch {
+                assembler.instruction(aarch64_sve_cntb(16)?)?;
+                assembler.instruction(aarch64_sub_x_imm(
+                    17,
+                    16,
+                    AARCH64_SVE_MIN_VECTOR_BYTES,
+                )?)?;
+            }
+        }
+        Aarch64DynamicScannerPlan::Exact(plan) => {
+            if let Some(kind) = plan.sve_kind {
+                aarch64_emit_exact_sve_constants(assembler, plan.storage, kind)?;
+            } else if plan.use_asimd {
+                aarch64_emit_exact_asimd_constants(assembler, plan.storage)?;
+            }
+            if plan.use_exact_asimd_lane {
+                aarch64_emit_first_lane_constants(
+                    assembler,
+                    plan.lane_index_offset.ok_or(ObjectError::InvalidModule(
+                        "dynamic exact ASIMD lane has no index table",
+                    ))?,
+                )?;
+            }
+            if plan.use_runtime_vl_dispatch {
+                assembler.instruction(aarch64_sve_cntb(16)?)?;
+                assembler.instruction(aarch64_sub_x_imm(
+                    17,
+                    16,
+                    AARCH64_SVE_MIN_VECTOR_BYTES,
+                )?)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the authenticated preflight, scanner, local exits, and whole-search deopt form one ABI transaction"
@@ -19705,12 +19854,15 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     let preflight_enter = assembler.label()?;
     let try_v2 = assembler.label()?;
     let v3_enter = assembler.label()?;
+    let v3_dispatch = assembler.label()?;
     let mut v3_shift_entries = [0_usize; 9];
     for entry in &mut v3_shift_entries {
         *entry = assembler.label()?;
     }
     let scan = assembler.label()?;
     let table_scan = assembler.label()?;
+    let root_setup = root_plan.map(|_| assembler.label()).transpose()?;
+    let root_candidate = root_plan.map(|_| assembler.label()).transpose()?;
     let root_dispatch = root_plan.map(|_| assembler.label()).transpose()?;
     let root_sve = root_plan
         .filter(|plan| plan.uses_sve())
@@ -19860,9 +20012,13 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     assembler.instruction(aarch64_load_x_imm(0, 31, 8)?)?;
     assembler.instruction(aarch64_load_x_imm(2, 31, 48)?)?;
     assembler.instruction(aarch64_load_x_imm(3, 31, 56)?)?;
-    if output != OutputContract::Exists {
+    if let Some(root_setup) = root_setup {
+        assembler.branch(root_setup)?;
+    } else if output != OutputContract::Exists {
         assembler.instruction(aarch64_store_x(31, 31, 80)?)?;
     }
+
+    assembler.bind(v3_dispatch)?;
     for (index, &entry) in v3_shift_entries.iter().enumerate() {
         let shift = u16::try_from(index.checked_add(1).ok_or(
             ObjectError::ArithmeticOverflow("AArch64 V3 row shift dispatch"),
@@ -19911,6 +20067,24 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
             12,
             native_complete.unwrap_or(native_no_match),
         )?;
+        if let Some(root_dispatch) = root_dispatch {
+            let non_root = assembler.label()?;
+            assembler.instruction(aarch64_load_w_imm(
+                12,
+                13,
+                u16::try_from(FROZEN_DYNAMIC_ROWS_V3_INITIAL_STATE_OFFSET)
+                    .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 V3 initial state"))?,
+            )?)?;
+            assembler.instruction(aarch64_cmp_w(6, 12)?)?;
+            assembler.branch_cond(AARCH64_NE, non_root)?;
+            if output != OutputContract::Exists {
+                assembler.instruction(aarch64_load_x_imm(12, 31, 80)?)?;
+                assembler.instruction(aarch64_cmp_x_imm(12, 0)?)?;
+                assembler.branch_cond(AARCH64_NE, non_root)?;
+            }
+            assembler.branch(root_dispatch)?;
+            assembler.bind(non_root)?;
+        }
         assembler.instruction(aarch64_add_x_lsl(11, 15, 6, shift)?)?;
         assembler.branch(v3_scan)?;
     }
@@ -20018,72 +20192,33 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     assembler.instruction(aarch64_load_x_imm(3, 31, 56)?)?;
     assembler.instruction(aarch64_and_w(11, 1, 1)?)?;
 
-    if let Some(plan) = root_plan {
-        if plan.has_tables() {
-            assembler.instruction(aarch64_load_x_imm(5, 31, 80)?)?;
-            assembler.instruction(aarch64_add_x_imm(5, 5, 32)?)?;
-        }
-        match plan {
-            Aarch64DynamicScannerPlan::Range(plan) => {
-                if plan.use_asimd {
-                    aarch64_emit_start_filter_constants(
-                        &mut assembler,
-                        plan.filter,
-                        AARCH64_STANDALONE_FILTER_FIRST_CONSTANT,
-                    )?;
-                }
-                if plan.use_exact_asimd_lane {
-                    aarch64_emit_first_lane_constants(
-                        &mut assembler,
-                        plan.lane_index_offset.ok_or(ObjectError::InvalidModule(
-                            "dynamic ASIMD exact lane has no index table",
-                        ))?,
-                    )?;
-                }
-                if let Some(kind) = plan.sve_kind.filter(|_| !plan.use_runtime_vl_dispatch) {
-                    // A pure-SVE route never executes ASIMD, so its Z16..Z23
-                    // constants survive scalar tails and row transitions.
-                    aarch64_emit_sve_filter_setup(&mut assembler, plan.filter, kind, 0)?;
-                }
-                if plan.use_runtime_vl_dispatch {
-                    assembler.instruction(aarch64_sve_cntb(16)?)?;
-                    assembler.instruction(aarch64_sub_x_imm(
-                        17,
-                        16,
-                        AARCH64_SVE_MIN_VECTOR_BYTES,
-                    )?)?;
-                }
-            }
-            Aarch64DynamicScannerPlan::Exact(plan) => {
-                if let Some(kind) = plan.sve_kind {
-                    aarch64_emit_exact_sve_constants(&mut assembler, plan.storage, kind)?;
-                } else if plan.use_asimd {
-                    aarch64_emit_exact_asimd_constants(&mut assembler, plan.storage)?;
-                }
-                if plan.use_exact_asimd_lane {
-                    aarch64_emit_first_lane_constants(
-                        &mut assembler,
-                        plan.lane_index_offset.ok_or(ObjectError::InvalidModule(
-                            "dynamic exact ASIMD lane has no index table",
-                        ))?,
-                    )?;
-                }
-                if plan.use_runtime_vl_dispatch {
-                    assembler.instruction(aarch64_sve_cntb(16)?)?;
-                    assembler.instruction(aarch64_sub_x_imm(
-                        17,
-                        16,
-                        AARCH64_SVE_MIN_VECTOR_BYTES,
-                    )?)?;
-                }
-            }
-        }
-    }
-    if output != OutputContract::Exists {
-        // The post-preflight setup has either materialized the identity-backed
-        // table base in X5 or no longer needs the saved identity address.
-        // Reuse its spare frame word as the pending selected endpoint.
+    if let Some(root_setup) = root_setup {
+        assembler.branch(root_setup)?;
+    } else if output != OutputContract::Exists {
         assembler.instruction(aarch64_store_x(31, 31, 80)?)?;
+    }
+
+    if let Some(root_setup) = root_setup {
+        assembler.bind(root_setup)?;
+        aarch64_emit_dynamic_root_setup(
+            &mut assembler,
+            root_plan.ok_or(ObjectError::InvalidModule(
+                "AArch64 dynamic root setup has no scanner plan",
+            ))?,
+        )?;
+        if output != OutputContract::Exists {
+            // The post-preflight setup has either materialized the
+            // identity-backed table base in X5 or no longer needs the saved
+            // identity address. Reuse its spare frame word as the pending
+            // selected endpoint for both V2 and compact V3.
+            assembler.instruction(aarch64_store_x(31, 31, 80)?)?;
+        }
+        // Keep the selected ASIMD/SVE/SVE2 or scalar graph scanner. Candidate
+        // hits authenticate the active representation, reload its row state,
+        // and enter either the V2 table or immediate-shift compact V3 loop.
+        assembler.branch(root_dispatch.ok_or(ObjectError::InvalidModule(
+            "AArch64 dynamic root setup has no dispatch label",
+        ))?)?;
     }
 
     assembler.bind(scan)?;
@@ -20139,6 +20274,62 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
         }
     }
 
+    if let Some(root_candidate) = root_candidate {
+        let v2_candidate = assembler.label()?;
+        assembler.bind(root_candidate)?;
+        assembler.instruction(aarch64_load_x_imm(8, 31, 0)?)?;
+        assembler.instruction(aarch64_load_w_imm(
+            9,
+            8,
+            u16::try_from(FROZEN_PREPARED_HEADER_V1_FLAGS_OFFSET)
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 V3 candidate flag"))?,
+        )?)?;
+        aarch64_load_u32_constant(
+            &mut assembler,
+            10,
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3,
+        )?;
+        assembler.instruction(aarch64_cmp_w(9, 10)?)?;
+        assembler.branch_cond(AARCH64_NE, v2_candidate)?;
+        assembler.instruction(aarch64_load_x_imm(
+            15,
+            13,
+            u16::try_from(FROZEN_DYNAMIC_ROWS_V3_ROWS_ADDRESS_OFFSET)
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 V3 candidate rows"))?,
+        )?)?;
+        assembler.instruction(aarch64_add_x_imm(
+            14,
+            8,
+            u16::try_from(FROZEN_PREPARED_HEADER_V1_CLASS_MAP_OFFSET)
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 V3 candidate class map"))?,
+        )?)?;
+        assembler.instruction(aarch64_load_w_imm(
+            6,
+            13,
+            u16::try_from(FROZEN_DYNAMIC_ROWS_V3_INITIAL_STATE_OFFSET)
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 V3 candidate state"))?,
+        )?)?;
+        assembler.instruction(aarch64_load_w_imm(
+            12,
+            13,
+            u16::try_from(FROZEN_DYNAMIC_ROWS_V3_ROW_SHIFT_OFFSET)
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 V3 candidate shift"))?,
+        )?)?;
+        assembler.branch(v3_dispatch)?;
+
+        assembler.bind(v2_candidate)?;
+        // The discriminator borrows W9, which otherwise carries V2's live
+        // next-row token mask. Restore the authenticated descriptor value
+        // before the canonical V2 transition consumes it.
+        assembler.instruction(aarch64_load_w_imm(
+            9,
+            13,
+            u16::try_from(NATIVE_ROWS_NEXT_ROW_TOKEN_MASK)
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 V2 candidate mask"))?,
+        )?)?;
+        assembler.branch(table_scan)?;
+    }
+
     assembler.bind(table_scan)?;
     assembler.instruction(aarch64_load_byte_reg(8, 0, 2)?)?;
     assembler.instruction(aarch64_load_byte_reg(10, 14, 8)?)?;
@@ -20167,6 +20358,9 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     if let Some(plan) = root_plan {
         let dispatch = root_dispatch.ok_or(ObjectError::InvalidModule(
             "AArch64 dynamic root dispatch is absent",
+        ))?;
+        let candidate = root_candidate.ok_or(ObjectError::InvalidModule(
+            "AArch64 dynamic root candidate is absent",
         ))?;
         let scalar = root_scalar.ok_or(ObjectError::InvalidModule(
             "AArch64 dynamic root scalar tail is absent",
@@ -20211,7 +20405,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
                 plan.use_runtime_vl_dispatch,
                 sve,
                 scalar,
-                table_scan,
+                candidate,
             )?;
         }
 
@@ -20289,14 +20483,14 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
                 && let Some(first_candidates) = batch_first_candidates
             {
                 aarch64_emit_first_candidate_in_batch(&mut assembler, first_candidates)?;
-                assembler.branch(table_scan)?;
+                assembler.branch(candidate)?;
             } else {
                 assembler.branch(scalar)?;
             }
             assembler.bind(single_hit)?;
             if plan.use_exact_asimd_lane {
                 aarch64_emit_first_candidate_lane(&mut assembler, 24)?;
-                assembler.branch(table_scan)?;
+                assembler.branch(candidate)?;
             } else {
                 assembler.branch(scalar)?;
             }
@@ -20313,7 +20507,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
         // A scanner hit identifies the candidate start. Do not consume the
         // filtered byte here; the canonical table transition below owns the
         // byte at X2, including for nonzero proof offsets.
-        assembler.branch(table_scan)?;
+        assembler.branch(candidate)?;
         assembler.bind(scalar_reject)?;
         assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
         assembler.branch(scalar)?;
@@ -20345,7 +20539,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
                     plan.use_runtime_vl_dispatch.then_some(16),
                     sve,
                     scalar,
-                    table_scan,
+                    candidate,
                 )?;
             }
 
@@ -20365,7 +20559,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
                     plan.set,
                     asimd_scan,
                     scalar,
-                    table_scan,
+                    candidate,
                     plan.use_exact_asimd_lane,
                 )?;
             }
@@ -20389,7 +20583,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
             aarch64_emit_exact_byte_set_lut_test(&mut assembler, 6, scalar_hit)?;
             assembler.branch(scalar_reject)?;
             assembler.bind(scalar_hit)?;
-            assembler.branch(table_scan)?;
+            assembler.branch(candidate)?;
             assembler.bind(scalar_reject)?;
             assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
             assembler.branch(scalar_loop)?;
@@ -22322,10 +22516,11 @@ mod tests {
             .iter()
             .position(|&word| word == aarch64_load_byte_reg(8, 0, 2).unwrap())
             .expect("canonical table byte load");
-        let first_consumption = words
-            .iter()
-            .position(|&word| word == aarch64_add_x_imm(2, 2, 1).unwrap())
-            .expect("canonical byte consumption");
+        let first_consumption = table_byte
+            + words[table_byte..]
+                .iter()
+                .position(|&word| word == aarch64_add_x_imm(2, 2, 1).unwrap())
+                .expect("canonical byte consumption");
         assert!(root_compare < learned_row_load);
         assert!(learned_row_load < table_byte);
         assert!(table_byte < first_consumption);
@@ -25091,11 +25286,56 @@ mod tests {
                 "an installed root scanner must retain frozen rows for long windows"
             );
 
+            assert_eq!(
+                occurrences(code, &[0x47, 0x0f, 0xb7, 0x14, 0x50]),
+                9,
+                "the {accelerator:?} scanner must feed every compact row shift"
+            );
+            assert_eq!(
+                occurrences(
+                    code,
+                    &[
+                        0x45,
+                        0x3b,
+                        0x53,
+                        u8::try_from(FROZEN_DYNAMIC_ROWS_V3_INITIAL_STATE_OFFSET).unwrap(),
+                    ],
+                ),
+                9,
+                "each compact shift must return the initial state to {accelerator:?}"
+            );
+            let mut candidate_prefix = vec![
+                0x48,
+                0x8b,
+                0x44,
+                0x24,
+                0x10,
+                0x81,
+                0x78,
+                u8::try_from(FROZEN_PREPARED_HEADER_V1_FLAGS_OFFSET).unwrap(),
+            ];
+            candidate_prefix.extend_from_slice(
+                &FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3.to_le_bytes(),
+            );
+            let candidate = code
+                .windows(candidate_prefix.len())
+                .position(|bytes| bytes == candidate_prefix.as_slice())
+                .expect("shared V2/V3 scanner candidate dispatcher");
+            assert!(
+                (0..code.len())
+                    .filter(|&offset| code[offset] == 0xe9)
+                    .filter_map(|offset| x86_test_branch_target(code, offset))
+                    .filter(|&(target, _)| target == candidate)
+                    .count()
+                    >= 2,
+                "vector and scalar {accelerator:?} hits must converge on compact dispatch"
+            );
+
             let count_load = [0x41, 0x8b, 0x43, loop_count];
             assert_eq!(
                 occurrences(code, &count_load),
-                3,
-                "one entry load and one reload per vector/scalar candidate: {accelerator:?}"
+                1,
+                "one shared V2/V3 candidate-dispatch reload: {accelerator:?}"
             );
             assert_eq!(
                 occurrences(code, &[0xc5, 0xf8, 0x77]),
@@ -25103,9 +25343,13 @@ mod tests {
                 "every vectorized match/no-match/deopt exit needs cleanup: {accelerator:?}"
             );
 
+            let table_prefix = [
+                0x44, 0x0f, 0xb6, 0x14, 0x17, 0x47, 0x0f, 0xb6, 0x14, 0x11, 0x4d, 0x01,
+                0xc2,
+            ];
             let table_start = code
-                .windows(5)
-                .position(|bytes| bytes == [0x44, 0x0f, 0xb6, 0x14, 0x17])
+                .windows(table_prefix.len())
+                .position(|bytes| bytes == table_prefix)
                 .expect("dynamic table transition");
             let table_tail = table_start
                 + code[table_start..]
@@ -25272,6 +25516,33 @@ mod tests {
                 assert_eq!(scanner.scan_offset, set.scan_offset);
                 assert_eq!(scanner.membership, set.membership);
                 assert_eq!(scanner.vectorized, vector_opcode.is_some());
+                assert_eq!(
+                    emission
+                        .code
+                        .windows(5)
+                        .filter(|bytes| *bytes == [0x47, 0x0f, 0xb7, 0x14, 0x50])
+                        .count(),
+                    9,
+                    "exact {accelerator:?} scanner must feed every compact row shift"
+                );
+                assert_eq!(
+                    emission
+                        .code
+                        .windows(4)
+                        .filter(|bytes| {
+                            *bytes
+                                == [
+                                    0x45,
+                                    0x3b,
+                                    0x53,
+                                    u8::try_from(FROZEN_DYNAMIC_ROWS_V3_INITIAL_STATE_OFFSET)
+                                        .unwrap(),
+                                ]
+                        })
+                        .count(),
+                    9,
+                    "exact {accelerator:?} compact rows must re-enter the same scanner"
+                );
                 assert!(
                     emission
                         .code
@@ -25322,6 +25593,16 @@ mod tests {
         reason = "the exact dynamic-root matrix audits scalar, fixed, scalable, and mixed lowering"
     )]
     fn aarch64_dynamic_exact_root_uses_lut_asimd_sve_and_sve2_from_one_set() {
+        fn unconditional_target(words: &[u32], index: usize) -> Option<usize> {
+            let instruction = *words.get(index)?;
+            if instruction & 0xfc00_0000 != 0x1400_0000 {
+                return None;
+            }
+            let immediate = i32::try_from(instruction & 0x03ff_ffff).ok()?;
+            let signed = (immediate << 6) >> 6;
+            index.checked_add_signed(isize::try_from(signed).ok()?)
+        }
+
         let set = dynamic_exact_test_set(3);
         let asimd_target = Target::aarch64_macos()
             .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
@@ -25419,6 +25700,80 @@ mod tests {
                     .chunks_exact(4)
                     .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
                     .collect::<Vec<_>>();
+                assert_eq!(
+                    words
+                        .iter()
+                        .filter(|&&word| word == aarch64_load_h_uxtw(8, 11, 6).unwrap())
+                        .count(),
+                    9,
+                    "{target:?}/{output:?} scanner must feed all compact row shifts"
+                );
+                assert_eq!(
+                    words
+                        .iter()
+                        .filter(|&&word| {
+                            word
+                                == aarch64_load_w_imm(
+                                    12,
+                                    13,
+                                    u16::try_from(FROZEN_DYNAMIC_ROWS_V3_INITIAL_STATE_OFFSET)
+                                        .unwrap(),
+                                )
+                                .unwrap()
+                        })
+                        .count(),
+                    9,
+                    "{target:?}/{output:?} compact rows must re-enter the same scanner"
+                );
+                let candidate_prefix = [
+                    aarch64_load_x_imm(8, 31, 0).unwrap(),
+                    aarch64_load_w_imm(
+                        9,
+                        8,
+                        u16::try_from(FROZEN_PREPARED_HEADER_V1_FLAGS_OFFSET).unwrap(),
+                    )
+                    .unwrap(),
+                    aarch64_movz_x(
+                        10,
+                        u16::try_from(FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3)
+                            .unwrap(),
+                        0,
+                    )
+                    .unwrap(),
+                    aarch64_cmp_w(9, 10).unwrap(),
+                ];
+                let candidate = words
+                    .windows(candidate_prefix.len())
+                    .position(|window| window == candidate_prefix)
+                    .expect("shared AArch64 V2/V3 scanner candidate dispatcher");
+                assert!(
+                    (0..words.len())
+                        .filter_map(|index| unconditional_target(&words, index))
+                        .any(|target| target == candidate),
+                    "{target:?}/{output:?} scanner hit must reach compact candidate dispatch"
+                );
+                let v2_mask_restore = candidate
+                    + words[candidate..]
+                        .iter()
+                        .position(|&word| {
+                            word
+                                == aarch64_load_w_imm(
+                                    9,
+                                    13,
+                                    u16::try_from(NATIVE_ROWS_NEXT_ROW_TOKEN_MASK).unwrap(),
+                                )
+                                .unwrap()
+                        })
+                        .expect("V2 candidate restores its borrowed next-row mask");
+                let v2_table = words
+                    .iter()
+                    .position(|&word| word == aarch64_load_byte_reg(8, 0, 2).unwrap())
+                    .expect("canonical V2 table transition");
+                assert_eq!(
+                    unconditional_target(&words, v2_mask_restore + 1),
+                    Some(v2_table),
+                    "V2 mask restoration must immediately rejoin its table transition"
+                );
                 assert!(
                     words.contains(&aarch64_load_byte_reg(8, 6, 8).unwrap()),
                     "every tier retains an exact scalar LUT tail: {target:?}/{output:?}"
@@ -25807,8 +26162,8 @@ mod tests {
                 .code;
                 assert_eq!(
                     byte_occurrences(&code, &[0x48, 0xc7, 0x44, 0x24, 0x60, 0, 0, 0, 0]),
-                    2,
-                    "V2 and direct V3 each initialize their endpoint slot"
+                    1,
+                    "V2 and compact V3 share one scanner endpoint initialization"
                 );
                 assert_eq!(
                     byte_occurrences(&code, &[0x48, 0x89, 0x54, 0x24, 0x60]),
@@ -25867,7 +26222,7 @@ mod tests {
                     .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
                     .collect::<Vec<_>>();
                 for (instruction, expected, detail) in [
-                    (aarch64_store_x(31, 31, 80).unwrap(), 2, "pending initialization"),
+                    (aarch64_store_x(31, 31, 80).unwrap(), 1, "pending initialization"),
                     (aarch64_store_x(2, 31, 80).unwrap(), 10, "pending update"),
                     (aarch64_load_x_imm(7, 31, 80).unwrap(), 1, "pending completion"),
                 ] {
@@ -27172,13 +27527,13 @@ int main(void) {{
         assert!(
             compiled
                 .program()
-                .compiler_private_frozen_dynamic_rows_storage(
+                .compiler_private_frozen_dynamic_rows_storage_v3(
                     &workspace,
                     524_288,
                     524_288,
                 )
                 .is_some(),
-            "the linked fixture must publish the production compact owner"
+            "the linked fixture must publish the production padded-u16 V3 owner"
         );
 
         let current_exe = std::env::current_exe().expect("current test executable");

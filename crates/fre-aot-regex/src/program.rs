@@ -5483,7 +5483,7 @@ impl CompiledProgram {
             || full.accept_mask() != DYNAMIC_NATIVE_ROWS_V1_ACCEPT_MASK
             || full.next_row_token_mask() != DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK
             || full.class_map().len() != 256
-            || !frozen_dynamic_rows_are_closed(full.forward_rows(), class_count)
+            || !frozen_dynamic_source_rows_are_normalizable(full.forward_rows(), class_count)
         {
             return None;
         }
@@ -5504,6 +5504,9 @@ impl CompiledProgram {
         owned_rows.try_reserve_exact(compact_cells).ok()?;
         for row in full.forward_rows().chunks_exact(class_count) {
             for &cell in row {
+                // Source-only start provenance was authenticated above and
+                // has no V3 representation. Selecting just the one-based row
+                // token and accept bit strips both mutually-exclusive modes.
                 let source_token = cell & DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK;
                 let compact_token = if source_token == 0 {
                     0
@@ -16739,6 +16742,51 @@ mod tests {
     }
 
     #[test]
+    fn frozen_dynamic_source_provenance_normalizes_only_authenticated_modes() {
+        let stride = 2;
+        let base = [
+            1,
+            DYNAMIC_NATIVE_ROWS_V1_ACCEPT_MASK | 3,
+            0,
+            1,
+        ];
+        assert!(frozen_dynamic_source_rows_are_normalizable(&base, stride));
+        assert!(frozen_dynamic_rows_are_closed(&base, stride));
+
+        for provenance in [
+            FROZEN_DYNAMIC_SOURCE_START_PROPAGATE,
+            FROZEN_DYNAMIC_SOURCE_START_RESET,
+        ] {
+            let mut source = base;
+            source[0] |= provenance;
+            assert!(frozen_dynamic_source_rows_are_normalizable(&source, stride));
+            assert!(
+                !frozen_dynamic_rows_are_closed(&source, stride),
+                "owned descriptors must retain their stricter normalized-cell contract"
+            );
+        }
+
+        let mut ambiguous = base;
+        ambiguous[0] |= FROZEN_DYNAMIC_SOURCE_START_MASK;
+        assert!(!frozen_dynamic_source_rows_are_normalizable(
+            &ambiguous,
+            stride
+        ));
+        let mut unclosed = base;
+        unclosed[0] = 2;
+        assert!(!frozen_dynamic_source_rows_are_normalizable(
+            &unclosed,
+            stride
+        ));
+        let mut unfilled = base;
+        unfilled[0] = DYNAMIC_NATIVE_ROWS_V1_UNFILLED_CELL;
+        assert!(!frozen_dynamic_source_rows_are_normalizable(
+            &unfilled,
+            stride
+        ));
+    }
+
+    #[test]
     #[allow(
         clippy::items_after_statements,
         clippy::too_many_lines,
@@ -16944,9 +16992,9 @@ mod tests {
                         usize::MAX,
                     )
                     .is_none(),
-                 "a nullable/terminal {output:?} root must retain portable initial settlement"
-             );
-         }
+                "a nullable/terminal {output:?} root must retain portable initial settlement"
+            );
+        }
     }
 
     #[test]
