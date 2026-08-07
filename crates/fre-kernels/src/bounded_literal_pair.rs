@@ -16,8 +16,8 @@ use core::{fmt, mem::size_of};
 
 use fre_exact_alloc::{CopyError, ExactBoxOrUsize};
 use fre_simd_kernels::{
-    ASCII_NARROW_BYTES, ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD, AsciiByteSet,
-    AsciiByteSetRunScanner, DispatchPolicy, Feature, SelectionReceipt, SimdDispatchContext,
+    ASCII_NARROW_BYTES, AsciiByteSet, AsciiByteSetRunScanner, DispatchPolicy, Feature,
+    SelectionReceipt, SimdDispatchContext,
 };
 use memchr::memchr2;
 
@@ -853,11 +853,9 @@ impl BoundedLiteralPairPlan {
                 .ok_or(ReduceError::ArithmeticOverflow {
                     computation: "prefix comparisons",
                 })?;
-        let scanner_recovery = if self.class_run_scanner().is_some() {
-            ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD
-        } else {
-            0
-        };
+        let scanner_recovery = self
+            .class_run_scanner()
+            .map_or(0, AsciiByteSetRunScanner::max_classification_overhead);
         let gap_classifications = gap
             .checked_add(scanner_recovery)
             .and_then(|per_candidate| candidates.checked_mul(per_candidate))
@@ -1681,9 +1679,10 @@ fn checked_add(left: usize, right: usize, computation: &'static str) -> Result<u
 #[cfg(test)]
 mod tests {
     use super::{
-        ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD, BoundedLiteralPairPlan, BuildError, BuildLimits,
-        CLASSIFICATION_WORK, Operation, ReduceError, ReduceLimits, SIMD_RUN_SCANNER_BUILD_WORK,
+        BoundedLiteralPairPlan, BuildError, BuildLimits, CLASSIFICATION_WORK, Operation,
+        ReduceError, ReduceLimits, SIMD_RUN_SCANNER_BUILD_WORK,
     };
+    use fre_simd_kernels::AsciiByteSetRunScanner;
 
     fn plan() -> BoundedLiteralPairPlan {
         BoundedLiteralPairPlan::build(
@@ -1983,7 +1982,11 @@ mod tests {
             );
             let recovery = haystack
                 .len()
-                .checked_mul(ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD)
+                .checked_mul(
+                    accelerated
+                        .class_run_scanner()
+                        .map_or(0, AsciiByteSetRunScanner::max_classification_overhead),
+                )
                 .unwrap();
             assert_eq!(
                 accelerated_count

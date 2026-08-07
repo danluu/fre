@@ -28,8 +28,8 @@ use core::{fmt, mem::size_of};
 
 use fre_exact_alloc::{CopyError, ExactBoxOrUsize, copy_exact, zeroed_exact};
 use fre_simd_kernels::{
-    ASCII_NARROW_BYTES, ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD, AsciiByteSet,
-    AsciiByteSetRunScanner, DispatchPolicy, Feature, SelectionReceipt, SimdDispatchContext,
+    ASCII_NARROW_BYTES, AsciiByteSet, AsciiByteSetRunScanner, DispatchPolicy, Feature,
+    SelectionReceipt, SimdDispatchContext,
 };
 use memchr::memmem::{Finder, FinderBuilder};
 
@@ -46,9 +46,6 @@ const MIN_FIXED_WIDTH: u32 = 2;
 // and one exposed selection receipt. Static profiles reconstruct that receipt
 // without retaining it in every scanner.
 const SIMD_RUN_SCANNER_BUILD_WORK: usize = 128 + 1 + 1;
-// A failed run scan classifies its boundary once before the scalar control
-// loop consumes that same byte, in addition to the scanner's recovery lanes.
-const SIMD_RUN_MAX_RESCAN_INSPECTIONS: usize = ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD + 1;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct ByteClass {
@@ -298,16 +295,15 @@ pub struct ReduceUpperBounds {
     pub peak_bytes: usize,
 }
 
-fn run_scanner_recovery_bound_for_streams(
+fn run_scanner_recovery_bound_for_event_cost(
     input_bytes: usize,
-    scanner_streams: usize,
+    rescan_inspections_per_event: usize,
 ) -> Result<usize, ReduceError> {
     // Every vector entry is preceded by a disjoint 16-member scalar proof.
     // Thus each stream can enter the scanner at most floor(N/16) times.
     let run_events = input_bytes / ASCII_NARROW_BYTES;
     run_events
-        .checked_mul(scanner_streams)
-        .and_then(|value| value.checked_mul(SIMD_RUN_MAX_RESCAN_INSPECTIONS))
+        .checked_mul(rescan_inspections_per_event)
         .ok_or(ReduceError::ArithmeticOverflow {
             computation: "run scanner recovery classification bound",
         })
@@ -1631,23 +1627,33 @@ impl BoundedContextPlan {
     }
 
     fn run_scanner_recovery_bound(&self, input_bytes: usize) -> Result<usize, ReduceError> {
-        let scanner_streams = if self.bounded_affix {
-            usize::from(self.separator_run_scanner().is_some())
-        } else {
-            usize::from(self.prefix_run_scanner().is_some())
-                .checked_add(
-                    usize::from(self.separator_run_scanner().is_some())
-                        .checked_mul(2)
-                        .ok_or(ReduceError::ArithmeticOverflow {
-                            computation: "separator run scanner stream count",
-                        })?,
+        let scanner_rescan_cost = |scanner: Option<&AsciiByteSetRunScanner>| {
+            scanner.map_or(Ok(0), |scanner| {
+                scanner.max_classification_overhead().checked_add(1).ok_or(
+                    ReduceError::ArithmeticOverflow {
+                        computation: "run scanner boundary rescan cost",
+                    },
                 )
-                .and_then(|value| value.checked_add(usize::from(self.tail_run_scanner().is_some())))
+            })
+        };
+        let rescan_inspections_per_event = if self.bounded_affix {
+            scanner_rescan_cost(self.separator_run_scanner())?
+        } else {
+            let prefix = scanner_rescan_cost(self.prefix_run_scanner())?;
+            let separator = scanner_rescan_cost(self.separator_run_scanner())?;
+            let tail = scanner_rescan_cost(self.tail_run_scanner())?;
+            prefix
+                .checked_add(
+                    separator.checked_mul(2).ok_or(ReduceError::ArithmeticOverflow {
+                        computation: "separator run scanner recovery cost",
+                    })?,
+                )
+                .and_then(|value| value.checked_add(tail))
                 .ok_or(ReduceError::ArithmeticOverflow {
-                    computation: "bounded-context run scanner stream count",
+                    computation: "bounded-context run scanner recovery cost",
                 })?
         };
-        run_scanner_recovery_bound_for_streams(input_bytes, scanner_streams)
+        run_scanner_recovery_bound_for_event_cost(input_bytes, rescan_inspections_per_event)
     }
 
     #[must_use]
@@ -2948,8 +2954,8 @@ mod tests {
 
     use super::{
         BOUNDED_AFFIX_PLAN_ID, BoundedContextPlan, BuildError, BuildLimits, ReduceError,
-        ReduceLimits, RunScanners, SIMD_RUN_MAX_RESCAN_INSPECTIONS, SIMD_RUN_SCANNER_BUILD_WORK,
-        SPAN_SUM_OPERATION_ID, SpanSumLimits,
+        ReduceLimits, RunScanners, SIMD_RUN_SCANNER_BUILD_WORK, SPAN_SUM_OPERATION_ID,
+        SpanSumLimits,
     };
 
     #[test]
@@ -3328,7 +3334,22 @@ mod tests {
             let scalar_upper = scalar_count.accounting.upper_bounds;
             let accelerated_upper = accelerated_count.accounting.upper_bounds;
             let run_events = haystack.len() / fre_simd_kernels::ASCII_NARROW_BYTES;
-            let recovery = run_events * 4 * SIMD_RUN_MAX_RESCAN_INSPECTIONS;
+            let prefix_cost = accelerated
+                .prefix_run_scanner()
+                .unwrap()
+                .max_classification_overhead()
+                + 1;
+            let separator_cost = accelerated
+                .separator_run_scanner()
+                .unwrap()
+                .max_classification_overhead()
+                + 1;
+            let tail_cost = accelerated
+                .tail_run_scanner()
+                .unwrap()
+                .max_classification_overhead()
+                + 1;
+            let recovery = run_events * (prefix_cost + 2 * separator_cost + tail_cost);
             assert_eq!(
                 (
                     accelerated_upper.input_bytes,

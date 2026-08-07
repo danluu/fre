@@ -113,13 +113,22 @@ const ASCII_SPACE_VALUES: [u8; ASCII_NARROW_BYTES] = [
     b'\t', b'\t',
 ];
 
-/// Maximum physical classification work beyond the logically necessary run.
+/// Maximum physical classification work beyond the logically necessary run
+/// for any run-scanner variant compiled on this target.
 ///
 /// On failure, the logical minimum is `member_run_len + 1`; on an all-member
 /// input it is `member_run_len`. Scalar adds no overhead. SVE/SVE2 classify
 /// every active lane in the failed predicated load and therefore add at most
-/// 15. NEON adds exactly 16 when it scalar-recovers a failed full block and
-/// otherwise adds none.
+/// 15. NEON adds exactly 16 when it scalar-recovers a failed full block. On
+/// x86_64, AVX2 and AVX-512 classify the complete failed 32-byte block and
+/// recover its exact boundary from the lane mask, adding at most 31.
+///
+/// Admission decisions for one already-selected scanner should use
+/// [`AsciiByteSetRunScanner::max_classification_overhead`] so a scalar or
+/// narrow-vector receipt retains its 16-byte accounting envelope.
+#[cfg(target_arch = "x86_64")]
+pub const ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD: usize = ASCII_WIDE_BYTES - 1;
+#[cfg(not(target_arch = "x86_64"))]
 pub const ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD: usize = ASCII_NARROW_BYTES;
 
 const ASCII_NARROW_VECTOR_BYTES: u16 = 16;
@@ -441,10 +450,12 @@ impl AsciiRunResult {
 
     /// Exact number of physical byte classifications performed by the leaf.
     ///
-    /// This may exceed the source length when NEON classifies a failed block
-    /// once as a vector and again during scalar recovery. The excess over the
-    /// logically necessary run is bounded by
-    /// [`ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD`].
+    /// This may exceed the source length when a vector leaf classifies a
+    /// complete failed block or when NEON also scalar-recovers that block.
+    /// The excess over the logically necessary run is bounded by the owning
+    /// scanner's [`AsciiByteSetRunScanner::max_classification_overhead`], and
+    /// by [`ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD`] across all variants built
+    /// for the target.
     #[must_use]
     pub const fn examined_bytes(self) -> usize {
         self.examined_bytes
@@ -685,7 +696,7 @@ struct AsciiRunTables {
         all(feature = "static-dispatch", not(target_arch = "aarch64")),
         allow(
             dead_code,
-            reason = "non-AArch64 compiler-fixed run profiles select the scalar leaf and retain columns only for profile-independent construction accounting"
+            reason = "compiler-fixed profiles retain columns for profile-independent construction accounting even when their selected leaf does not read them"
         )
     )]
     columns: [u8; ASCII_NARROW_BYTES],
@@ -739,6 +750,10 @@ macro_rules! scan_run_entry {
 }
 
 const SCALAR_RUN_VARIANT_ID: &str = "ascii-byte-set.run.scalar.v1";
+#[cfg(target_arch = "x86_64")]
+const AVX2_RUN_VARIANT_ID: &str = "ascii-byte-set.run.avx2-fused.v1";
+#[cfg(target_arch = "x86_64")]
+const AVX512_RUN_VARIANT_ID: &str = "ascii-byte-set.run.avx512f-bw-vl-fused.v1";
 #[cfg(target_arch = "aarch64")]
 const NEON_RUN_VARIANT_ID: &str = "ascii-byte-set.run.neon.v1";
 #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
@@ -755,9 +770,9 @@ const SVE2_COMPLEMENT16_ARM_41_D84_RUN_VARIANT_ID: &str =
 
 /// A compiled ASCII byte-set run scanner with immutable one-time dispatch.
 ///
-/// The scanner accepts arbitrary slice lengths. Dispatch nevertheless uses the
-/// invariant 16-byte kernel block shape at construction, never a caller's
-/// varying slice length.
+/// The scanner accepts arbitrary slice lengths. Dispatch nevertheless uses a
+/// fixed 16-byte admission input at construction, never a caller's varying
+/// slice length. A selected leaf may classify wider complete blocks.
 #[derive(Clone, Copy)]
 pub struct AsciiByteSetRunScanner {
     tables: AsciiRunTables,
@@ -873,6 +888,19 @@ impl AsciiByteSetRunScanner {
         automatic_run_selection(self.table_mode)
     }
 
+    /// Maximum physical classification work beyond the logically necessary
+    /// run for this scanner's retained implementation.
+    ///
+    /// This receipt-specific bound keeps scalar and existing narrow-vector
+    /// admissions at 16 bytes even on x86_64 builds that also contain a
+    /// force-selectable 32-byte AVX-512 leaf. It is the stable admission
+    /// envelope, not necessarily the smallest mathematical bound for a leaf;
+    /// the scalar implementation itself adds no physical classifications.
+    #[must_use]
+    pub const fn max_classification_overhead(&self) -> usize {
+        run_max_classification_overhead(self.selection())
+    }
+
     /// Scan the maximal member prefix.
     ///
     /// The returned run length is in `0..=bytes.len()`. A nonempty slice with
@@ -922,6 +950,24 @@ impl AsciiByteSetRunScanner {
             unsafe { static_scan_run_backward(&self.tables, self.table_mode, bytes) }
         }
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+const fn run_max_classification_overhead(selection: SelectionReceipt) -> usize {
+    match selection.vector {
+        VectorKind::Fixed {
+            bytes: ASCII_WIDE_VECTOR_BYTES,
+        } => ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD,
+        VectorKind::Scalar | VectorKind::Fixed { .. } | VectorKind::Scalable => {
+            ASCII_NARROW_BYTES
+        }
+        _ => ASCII_NARROW_BYTES,
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+const fn run_max_classification_overhead(_selection: SelectionReceipt) -> usize {
+    ASCII_NARROW_BYTES
 }
 
 #[allow(
@@ -1665,6 +1711,27 @@ const fn static_run_variant_id(_table_mode: AsciiRunTableMode) -> &'static str {
 
 #[cfg(all(
     feature = "static-dispatch",
+    target_arch = "x86_64",
+    target_feature = "avx2"
+))]
+const fn static_run_variant_id(_table_mode: AsciiRunTableMode) -> &'static str {
+    AVX2_RUN_VARIANT_ID
+}
+
+#[cfg(all(
+    feature = "static-dispatch",
+    target_arch = "x86_64",
+    not(target_feature = "avx2"),
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vl"
+))]
+const fn static_run_variant_id(_table_mode: AsciiRunTableMode) -> &'static str {
+    AVX512_RUN_VARIANT_ID
+}
+
+#[cfg(all(
+    feature = "static-dispatch",
     not(any(
         feature = "static-dispatch-arm-41-d84",
         all(target_arch = "aarch64", target_feature = "neon"),
@@ -1674,6 +1741,14 @@ const fn static_run_variant_id(_table_mode: AsciiRunTableMode) -> &'static str {
             target_endian = "little",
             not(target_feature = "neon"),
             target_feature = "sve"
+        ),
+        all(target_arch = "x86_64", target_feature = "avx2"),
+        all(
+            target_arch = "x86_64",
+            not(target_feature = "avx2"),
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "avx512vl"
         )
     ))
 ))]
@@ -2051,6 +2126,45 @@ const fn automatic_run_selection(_table_mode: AsciiRunTableMode) -> SelectionRec
 
 #[cfg(all(
     feature = "static-dispatch",
+    target_arch = "x86_64",
+    target_feature = "avx2"
+))]
+const fn automatic_run_selection(_table_mode: AsciiRunTableMode) -> SelectionReceipt {
+    compiler_selection_receipt(
+        AVX2_RUN_VARIANT_ID,
+        None,
+        FeatureSet::of(Feature::X86Avx2),
+        VectorKind::Fixed {
+            bytes: ASCII_WIDE_VECTOR_BYTES,
+        },
+        ASCII_NARROW_BYTES,
+        ASCII_NARROW_BYTES,
+    )
+}
+
+#[cfg(all(
+    feature = "static-dispatch",
+    target_arch = "x86_64",
+    not(target_feature = "avx2"),
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vl"
+))]
+const fn automatic_run_selection(_table_mode: AsciiRunTableMode) -> SelectionReceipt {
+    compiler_selection_receipt(
+        AVX512_RUN_VARIANT_ID,
+        None,
+        X86_AVX512_MASK_FEATURES,
+        VectorKind::Fixed {
+            bytes: ASCII_WIDE_VECTOR_BYTES,
+        },
+        ASCII_NARROW_BYTES,
+        ASCII_NARROW_BYTES,
+    )
+}
+
+#[cfg(all(
+    feature = "static-dispatch",
     not(any(
         feature = "static-dispatch-arm-41-d84",
         all(target_arch = "aarch64", target_feature = "neon"),
@@ -2060,6 +2174,14 @@ const fn automatic_run_selection(_table_mode: AsciiRunTableMode) -> SelectionRec
             target_endian = "little",
             not(target_feature = "neon"),
             target_feature = "sve"
+        ),
+        all(target_arch = "x86_64", target_feature = "avx2"),
+        all(
+            target_arch = "x86_64",
+            not(target_feature = "avx2"),
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "avx512vl"
         )
     ))
 ))]
@@ -2596,6 +2718,86 @@ unsafe fn static_scan_run_backward(
 
 #[cfg(all(
     feature = "static-dispatch",
+    target_arch = "x86_64",
+    target_feature = "avx2"
+))]
+#[allow(
+    unsafe_code,
+    reason = "the static constructor requires the compiler-fixed fused AVX2 run receipt before this direct leaf is reachable"
+)]
+unsafe fn static_scan_run_forward(
+    tables: &AsciiRunTables,
+    _table_mode: AsciiRunTableMode,
+    bytes: &[u8],
+) -> AsciiRunResult {
+    // SAFETY: AVX2 is globally enabled and required by the accepted receipt.
+    unsafe { x86_64::scan_run_forward_avx2(tables, bytes) }
+}
+
+#[cfg(all(
+    feature = "static-dispatch",
+    target_arch = "x86_64",
+    target_feature = "avx2"
+))]
+#[allow(
+    unsafe_code,
+    reason = "the static constructor requires the compiler-fixed fused AVX2 run receipt before this direct leaf is reachable"
+)]
+unsafe fn static_scan_run_backward(
+    tables: &AsciiRunTables,
+    _table_mode: AsciiRunTableMode,
+    bytes: &[u8],
+) -> AsciiRunResult {
+    // SAFETY: AVX2 is globally enabled and required by the accepted receipt.
+    unsafe { x86_64::scan_run_backward_avx2(tables, bytes) }
+}
+
+#[cfg(all(
+    feature = "static-dispatch",
+    target_arch = "x86_64",
+    not(target_feature = "avx2"),
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vl"
+))]
+#[allow(
+    unsafe_code,
+    reason = "the static constructor requires the compiler-fixed fused AVX-512F/BW/VL run receipt before this direct leaf is reachable"
+)]
+unsafe fn static_scan_run_forward(
+    tables: &AsciiRunTables,
+    _table_mode: AsciiRunTableMode,
+    bytes: &[u8],
+) -> AsciiRunResult {
+    // SAFETY: all three AVX-512 features are globally enabled and required by
+    // the accepted receipt.
+    unsafe { x86_64::scan_run_forward_avx512(tables, bytes) }
+}
+
+#[cfg(all(
+    feature = "static-dispatch",
+    target_arch = "x86_64",
+    not(target_feature = "avx2"),
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512vl"
+))]
+#[allow(
+    unsafe_code,
+    reason = "the static constructor requires the compiler-fixed fused AVX-512F/BW/VL run receipt before this direct leaf is reachable"
+)]
+unsafe fn static_scan_run_backward(
+    tables: &AsciiRunTables,
+    _table_mode: AsciiRunTableMode,
+    bytes: &[u8],
+) -> AsciiRunResult {
+    // SAFETY: all three AVX-512 features are globally enabled and required by
+    // the accepted receipt.
+    unsafe { x86_64::scan_run_backward_avx512(tables, bytes) }
+}
+
+#[cfg(all(
+    feature = "static-dispatch",
     not(any(
         feature = "static-dispatch-arm-41-d84",
         all(target_arch = "aarch64", target_feature = "neon"),
@@ -2605,6 +2807,14 @@ unsafe fn static_scan_run_backward(
             target_endian = "little",
             not(target_feature = "neon"),
             target_feature = "sve"
+        ),
+        all(target_arch = "x86_64", target_feature = "avx2"),
+        all(
+            target_arch = "x86_64",
+            not(target_feature = "avx2"),
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "avx512vl"
         )
     ))
 ))]
@@ -2631,6 +2841,14 @@ unsafe fn static_scan_run_forward(
             target_endian = "little",
             not(target_feature = "neon"),
             target_feature = "sve"
+        ),
+        all(target_arch = "x86_64", target_feature = "avx2"),
+        all(
+            target_arch = "x86_64",
+            not(target_feature = "avx2"),
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "avx512vl"
         )
     ))
 ))]
@@ -2874,13 +3092,55 @@ const RUN_MATCH_VARIANTS: [KernelVariant<AsciiRunEntries>; 2] = RUN_VARIANTS;
 ))]
 const RUN_COMPLEMENT_VARIANTS: [KernelVariant<AsciiRunEntries>; 2] = RUN_VARIANTS;
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(target_arch = "x86_64")]
+const RUN_VARIANTS: [KernelVariant<AsciiRunEntries>; 3] = [
+    SCALAR_RUN,
+    // AVX-512 remains independently force-selectable. Automatic dispatch
+    // conservatively prefers AVX2 until hardware-specific qualification
+    // establishes a narrower AVX-512 tuning policy.
+    KernelVariant::new(
+        AVX512_RUN_VARIANT_ID,
+        ArchitectureRequirement::Exact(Architecture::X86_64),
+        X86_AVX512_MASK_FEATURES,
+        VectorKind::Fixed {
+            bytes: ASCII_WIDE_VECTOR_BYTES,
+        },
+        ASCII_NARROW_BYTES,
+        50,
+        AsciiRunEntries {
+            forward: scan_run_entry!(x86_64::scan_run_forward_avx512),
+            backward: scan_run_entry!(x86_64::scan_run_backward_avx512),
+        },
+    ),
+    KernelVariant::new(
+        AVX2_RUN_VARIANT_ID,
+        ArchitectureRequirement::Exact(Architecture::X86_64),
+        FeatureSet::of(Feature::X86Avx2),
+        VectorKind::Fixed {
+            bytes: ASCII_WIDE_VECTOR_BYTES,
+        },
+        ASCII_NARROW_BYTES,
+        100,
+        AsciiRunEntries {
+            forward: scan_run_entry!(x86_64::scan_run_forward_avx2),
+            backward: scan_run_entry!(x86_64::scan_run_backward_avx2),
+        },
+    ),
+];
+
+#[cfg(target_arch = "x86_64")]
+const RUN_MATCH_VARIANTS: [KernelVariant<AsciiRunEntries>; 3] = RUN_VARIANTS;
+
+#[cfg(target_arch = "x86_64")]
+const RUN_COMPLEMENT_VARIANTS: [KernelVariant<AsciiRunEntries>; 3] = RUN_VARIANTS;
+
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 const RUN_VARIANTS: [KernelVariant<AsciiRunEntries>; 1] = [SCALAR_RUN];
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 const RUN_MATCH_VARIANTS: [KernelVariant<AsciiRunEntries>; 1] = [SCALAR_RUN];
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 const RUN_COMPLEMENT_VARIANTS: [KernelVariant<AsciiRunEntries>; 1] = [SCALAR_RUN];
 
 #[allow(
@@ -3167,8 +3427,9 @@ fn select_run(
         AsciiRunTableMode::SmallMembers => &RUN_MATCH_VARIANTS[..],
         AsciiRunTableMode::SmallComplement => &RUN_COMPLEMENT_VARIANTS[..],
     };
-    // Sixteen bytes is the retained implementation's invariant block shape.
-    // Calls may contain any number of bytes and never participate in selection.
+    // Sixteen bytes is the operation's fixed admission input. Calls may
+    // contain any number of bytes, and a selected implementation may process
+    // wider blocks without making their lengths participate in selection.
     Ok(
         select_kernel(capabilities, policy, ASCII_NARROW_BYTES, variants)?
             .expect("the private table always contains its scalar fallback"),

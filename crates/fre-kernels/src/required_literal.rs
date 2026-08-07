@@ -13,8 +13,8 @@
 use core::{fmt, mem::size_of};
 
 use fre_simd_kernels::{
-    ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD, AsciiByteSet, AsciiByteSetRunScanner, DispatchPolicy,
-    Feature, SelectionReceipt, SimdDispatchContext,
+    AsciiByteSet, AsciiByteSetRunScanner, DispatchPolicy, Feature, SelectionReceipt,
+    SimdDispatchContext,
 };
 use memchr::memmem::{Finder, FinderBuilder};
 
@@ -996,9 +996,9 @@ impl RequiredLiteralPlan {
                 .ok_or(SearchError::ArithmeticOverflow {
                     computation: "candidate structural work",
                 })?;
-        let scanner_overhead = if backward_scanner.is_some() {
+        let scanner_overhead = if let Some(scanner) = backward_scanner {
             candidate_visits_upper_bound
-                .checked_mul(ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD)
+                .checked_mul(scanner.max_classification_overhead())
                 .ok_or(SearchError::ArithmeticOverflow {
                     computation: "backward scanner overhead upper bound",
                 })?
@@ -1517,9 +1517,9 @@ impl BoundedRequiredLiteralPlan {
             .ok_or(SearchError::ArithmeticOverflow {
                 computation: "bounded candidate structural work",
             })?;
-        let scanner_overhead = if backward_scanner.is_some() {
+        let scanner_overhead = if let Some(scanner) = backward_scanner {
             candidate_visits_upper_bound
-                .checked_mul(ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD)
+                .checked_mul(scanner.max_classification_overhead())
                 .ok_or(SearchError::ArithmeticOverflow {
                     computation: "backward scanner overhead upper bound",
                 })?
@@ -1800,11 +1800,11 @@ fn longest_border(suffix: &[u8]) -> Result<usize, BuildError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ASCII_BACKWARD_RUN_PLAN_ID, ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD, Anchors,
-        BOUNDED_ASCII_BACKWARD_RUN_PLAN_ID, BOUNDED_PLAN_ID, BoundedRequiredLiteralPlan,
-        BuildError, BuildLimits, ByteClass, ClassRepeat, DispatchedBoundedRequiredLiteralPlan,
-        DispatchedRequiredLiteralPlan, PLAN_ID, RequiredLiteralPlan, SIMD_RUN_SCANNER_BUILD_WORK,
-        SearchAccounting, SearchError, SearchLimits,
+        ASCII_BACKWARD_RUN_PLAN_ID, Anchors, BOUNDED_ASCII_BACKWARD_RUN_PLAN_ID, BOUNDED_PLAN_ID,
+        BoundedRequiredLiteralPlan, BuildError, BuildLimits, ByteClass, ClassRepeat,
+        DispatchedBoundedRequiredLiteralPlan, DispatchedRequiredLiteralPlan, PLAN_ID,
+        RequiredLiteralPlan, SIMD_RUN_SCANNER_BUILD_WORK, SearchAccounting, SearchError,
+        SearchLimits,
     };
     use crate::Window;
     use core::mem::size_of;
@@ -2842,7 +2842,15 @@ mod tests {
                             dispatched_result
                                 .1
                                 .candidate_visits
-                                .saturating_mul(ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD)
+                                .saturating_mul(
+                                    dispatched
+                                        .backward_scanner
+                                        .as_ref()
+                                        .map_or(
+                                            0,
+                                            AsciiByteSetRunScanner::max_classification_overhead,
+                                        ),
+                                )
                         )
                 );
             } else {
@@ -2910,7 +2918,7 @@ mod tests {
                     accelerated
                         .1
                         .candidate_visits_upper_bound
-                        .checked_mul(ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD)
+                        .checked_mul(scanner.max_classification_overhead())
                         .unwrap()
                 )
                 .unwrap()
@@ -2925,7 +2933,7 @@ mod tests {
                         accelerated
                             .1
                             .candidate_visits_upper_bound
-                            .checked_mul(ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD)
+                            .checked_mul(scanner.max_classification_overhead())
                             .unwrap()
                     )
                     .unwrap()

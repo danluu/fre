@@ -16,8 +16,8 @@ use core::{fmt, mem::size_of};
 
 use fre_exact_alloc::CopyError;
 use fre_simd_kernels::{
-    ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD, AsciiByteSet, AsciiByteSetRunScanner, DispatchPolicy,
-    Feature, SelectionReceipt, SimdDispatchContext,
+    AsciiByteSet, AsciiByteSetRunScanner, DispatchPolicy, Feature, SelectionReceipt,
+    SimdDispatchContext,
 };
 use memchr::{memchr, memrchr};
 
@@ -1455,8 +1455,8 @@ impl ForwardAnchoredPlan {
             self.implementation,
             ClassImplementation::InclusiveRange { start, end } if start != end
         ) && window_bytes >= START_RANGE_SWAR_MIN;
-        let rescan_margin = if bitset_scanner.is_some() && window_bytes != 0 {
-            ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD
+        let rescan_margin = if let Some(scanner) = bitset_scanner.filter(|_| window_bytes != 0) {
+            scanner.max_classification_overhead()
         } else if range_swar_bound {
             WORD_BYTES
         } else if block_scanner && window_bytes >= RANGE_BLOCK {
@@ -2893,8 +2893,8 @@ fn scan_fixed_range_prefix(
 mod tests {
     use super::{
         ABSOLUTE_END_FIXED_PLAN_ID, ASCII_BITSET_RUN_PLAN_ID,
-        ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD, AbsoluteEndFixedPlan, Anchors, BuildError,
-        BuildLimits, ByteClass, ClassImplementation, DispatchedForwardAnchoredPlan,
+        AbsoluteEndFixedPlan, Anchors, BuildError, BuildLimits, ByteClass, ClassImplementation,
+        DispatchedForwardAnchoredPlan,
         ForwardAnchoredPlan, PLAN_ID, RANGE_BLOCK, SIMD_RUN_SCANNER_BUILD_WORK, SearchError,
         SearchLimits, WORD_BYTES, asymmetric_suffix_witness, begin_edge_witness_trace,
         copy_suffix_exact, exact_suffix_copy_probe, finish_edge_witness_trace, map_copy_error,
@@ -2905,7 +2905,7 @@ mod tests {
     use fre_exact_alloc::CopyError;
     #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
     use fre_simd_kernels::{DispatchPolicy, FeatureSet};
-    use fre_simd_kernels::{Feature, SimdDispatchContext};
+    use fre_simd_kernels::{AsciiByteSetRunScanner, Feature, SimdDispatchContext};
 
     const ASCII_BITSET_MEMBERS: [u8; 6] = [b'0', b'_', b'a', b'c', b'e', b'g'];
 
@@ -3015,7 +3015,12 @@ mod tests {
                         <= legacy_result
                             .1
                             .prefix_bytes_examined
-                            .saturating_add(ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD)
+                            .saturating_add(
+                                dispatched
+                                    .bitset_scanner
+                                    .as_ref()
+                                    .map_or(0, AsciiByteSetRunScanner::max_classification_overhead),
+                            )
                 );
             }
         }
@@ -3139,8 +3144,10 @@ mod tests {
         assert_eq!(
             search.prefix_bytes_upper_bound,
             haystack.len()
-                + usize::from(baseline.run_scanner_selection().is_some())
-                    * ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD
+                + baseline
+                    .bitset_scanner
+                    .as_ref()
+                    .map_or(0, AsciiByteSetRunScanner::max_classification_overhead)
         );
         assert!(search.prefix_bytes_examined <= search.prefix_bytes_upper_bound);
         let exact_search = SearchLimits {

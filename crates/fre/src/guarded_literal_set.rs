@@ -26,14 +26,12 @@ use fre_kernels::{
     DispatchPolicy,
     PACKED_LITERAL_SET_CERTIFIED_MAX_PATTERNS, PackedLiteralSetBuildLimits,
     PackedLiteralSetError, PackedLiteralSetPlan, PackedLiteralSetSearchLimits,
-    SimdDispatchContext, Window as PackedWindow, classify_byte_delta_16,
+    SimdDispatchContext, VectorKind, Window as PackedWindow, classify_byte_delta_16,
     packed_literal_anchor_frequency_rank,
     packed_literal_set_build_work_upper_bound_from_dimensions,
 };
 #[cfg(target_arch = "aarch64")]
-use fre_kernels::{
-    ASCII_NONMEMBER_RUN_SCANNER_BUILD_WORK, AsciiByteSetNonMemberScanner, VectorKind,
-};
+use fre_kernels::{ASCII_NONMEMBER_RUN_SCANNER_BUILD_WORK, AsciiByteSetNonMemberScanner};
 
 use crate::{
     Match, SearchLimits, SearchWindow, finite,
@@ -1292,6 +1290,27 @@ impl WideByteAnchor {
 }
 
 impl WideByteAnchor {
+    #[inline]
+    fn use_bulk_nonmember_scanner(&self) -> bool {
+        prefer_bulk_nonmember_scanner(
+            self.nonmembers.selection().vector,
+            self.members.selection().wide().vector,
+        )
+    }
+}
+
+#[inline]
+fn prefer_bulk_nonmember_scanner(
+    scanner: VectorKind,
+    classifier: VectorKind,
+) -> bool {
+    // A scalar run leaf would discard an already-authenticated wide
+    // classifier after the first rejected block. Keep the run primitive
+    // when it is itself vectorized, or when there is no vector alternative.
+    !matches!(scanner, VectorKind::Scalar) || matches!(classifier, VectorKind::Scalar)
+}
+
+impl WideByteAnchor {
     fn find(&self, haystack: &[u8]) -> Option<usize> {
         match self.find_internal(haystack, false) {
             WideFindResult::Anchor(position) => Some(position),
@@ -1305,6 +1324,7 @@ impl WideByteAnchor {
 
     fn find_internal(&self, haystack: &[u8], signal_dense_high: bool) -> WideFindResult {
         let mut position = 0_usize;
+        let use_bulk_nonmember_scanner = self.use_bulk_nonmember_scanner();
         let prefix_end = haystack.len().min(WIDE_SCALAR_PREFIX_BYTES);
         while position < prefix_end {
             if self.members.set().contains(haystack[position]) {
@@ -1319,7 +1339,8 @@ impl WideByteAnchor {
         let mut fixed_block_proved = false;
         let mut high_byte_cooldown = 0_u8;
         while haystack.len().saturating_sub(position) >= ASCII_WIDE_BYTES {
-            if fixed_block_proved
+            if use_bulk_nonmember_scanner
+                && fixed_block_proved
                 && high_byte_cooldown == 0
                 && haystack.len().saturating_sub(position) >= WIDE_BULK_SKIP_MIN_BYTES
             {
@@ -3469,7 +3490,7 @@ mod tests {
         WIDE_CORRELATED_SAMPLE_BYTES, WIDE_RANKED_COLUMN_LIMIT,
         WIDE_REJECTION_PACKED_PROBE_BYTES,
         WIDE_SECONDARY_COLUMN_LIMIT, WideByteAnchor, WideFindResult,
-        correlated_columns_dimensions, extraction_limits,
+        correlated_columns_dimensions, extraction_limits, prefer_bulk_nonmember_scanner,
     };
     #[cfg(target_arch = "aarch64")]
     use super::{SingleByteMemberResult, SingleBytePrimary};
@@ -3480,7 +3501,7 @@ mod tests {
     use fre_kernels::{
         ASCII_CLASSIFIER_BUILD_WORK, ASCII_NONMEMBER_RUN_SCANNER_BUILD_WORK,
         ASCII_RUN_SCANNER_BUILD_WORK,
-        PackedLiteralSetBuildLimits, PackedLiteralSetError, PackedLiteralSetPlan,
+        PackedLiteralSetBuildLimits, PackedLiteralSetError, PackedLiteralSetPlan, VectorKind,
     };
 
     fn dictionary_with_guards(words: &[&[u8]], left: Guard, right: Guard) -> Dictionary {
@@ -3749,6 +3770,72 @@ mod tests {
                 .unwrap(),
                 expected,
             );
+        }
+    }
+
+    #[test]
+    fn wide_bulk_primitive_selection_preserves_the_widest_authenticated_route() {
+        let scalar = VectorKind::Scalar;
+        let fixed = VectorKind::Fixed { bytes: 32 };
+        let scalable = VectorKind::Scalable;
+
+        assert!(prefer_bulk_nonmember_scanner(scalar, scalar));
+        assert!(!prefer_bulk_nonmember_scanner(scalar, fixed));
+        assert!(!prefer_bulk_nonmember_scanner(scalar, scalable));
+        for classifier in [scalar, fixed, scalable] {
+            assert!(prefer_bulk_nonmember_scanner(fixed, classifier));
+            assert!(prefer_bulk_nonmember_scanner(scalable, classifier));
+        }
+
+        let plan = plan(&[b"aj", b"eq", b"tz", b"iQ"]);
+        let wide = plan.wide_anchor.as_ref().unwrap();
+        let scanner = wide.nonmembers.selection().vector;
+        let classifier = wide.members.selection().wide().vector;
+        assert_eq!(
+            wide.use_bulk_nonmember_scanner(),
+            prefer_bulk_nonmember_scanner(scanner, classifier),
+        );
+        if matches!(scanner, VectorKind::Scalar)
+            && !matches!(classifier, VectorKind::Scalar)
+        {
+            assert!(!wide.use_bulk_nonmember_scanner());
+        }
+        if !matches!(scanner, VectorKind::Scalar) {
+            assert!(wide.use_bulk_nonmember_scanner());
+        }
+    }
+
+    #[test]
+    fn selected_wide_bulk_route_matches_scalar_membership_across_blocks() {
+        let plan = plan(&[b"aj", b"eq", b"tz", b"iQ"]);
+        let wide = plan.wide_anchor.as_ref().unwrap();
+        let members = wide.members.set();
+        let reject = (u8::MIN..=0x7f)
+            .find(|&byte| !members.contains(byte))
+            .unwrap();
+        let member = (u8::MIN..=0x7f)
+            .find(|&byte| members.contains(byte))
+            .unwrap();
+
+        for alignment in 0..ASCII_WIDE_BYTES {
+            for len in 0..=ASCII_WIDE_BYTES * 6 {
+                let mut storage = vec![reject; alignment + len];
+                let haystack = &mut storage[alignment..];
+                if alignment % 2 != 0 {
+                    for position in (17..len).step_by(47) {
+                        haystack[position] = 0x80;
+                    }
+                }
+                if len % 2 != 0 {
+                    haystack[len - 1] = member;
+                }
+                let expected = haystack.iter().position(|&byte| members.contains(byte));
+                assert_eq!(
+                    wide.find(haystack),
+                    expected,
+                    "alignment={alignment} len={len}",
+                );
+            }
         }
     }
 

@@ -76,8 +76,8 @@ use fre_exact_alloc::{CopyError, try_box_preserve};
 #[cfg(not(feature = "static-dispatch"))]
 use fre_simd_kernels::FeatureSet;
 use fre_simd_kernels::{
-    ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD, AsciiByteSet, AsciiByteSetRunScanner, DispatchPolicy,
-    Feature, SelectionReceipt, SimdDispatchContext,
+    AsciiByteSet, AsciiByteSetRunScanner, DispatchPolicy, Feature, SelectionReceipt,
+    SimdDispatchContext,
 };
 use memchr::{memchr, memchr2};
 use memchr::memmem::{Finder, FinderBuilder};
@@ -127,7 +127,7 @@ enum ReduceImplementation {
     /// Scalar class extension.
     Scalar,
     /// One retained directional SIMD run scanner per alternative.
-    DispatchedRunScanners,
+    DispatchedRunScanners { max_classification_overhead: usize },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -460,8 +460,10 @@ fn derive_reduce_upper_bounds(
         })?;
     let scanner_overhead = match implementation {
         ReduceImplementation::Scalar => 0,
-        ReduceImplementation::DispatchedRunScanners => match_events
-            .checked_mul(ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD)
+        ReduceImplementation::DispatchedRunScanners {
+            max_classification_overhead,
+        } => match_events
+            .checked_mul(max_classification_overhead)
             .ok_or(ReduceError::ArithmeticOverflow {
                 computation: "run scanner classification overhead",
             })?,
@@ -509,6 +511,17 @@ fn derive_reduce_upper_bounds(
         persistent_bytes: build.persistent_bytes,
         peak_bytes: build.persistent_bytes,
     })
+}
+
+fn max_run_scanner_classification_overhead(
+    scanners: [Option<&AsciiByteSetRunScanner>; RUN_SCANNERS],
+) -> usize {
+    scanners
+        .into_iter()
+        .flatten()
+        .map(AsciiByteSetRunScanner::max_classification_overhead)
+        .max()
+        .unwrap_or(0)
 }
 
 /// Capture-aware identity for the direct uniform-participation operation.
@@ -1600,7 +1613,7 @@ impl PrefixClassAlternationPlan {
             haystack.len(),
             Operation::Count,
             limits,
-            run_scanners[0].is_some(),
+            max_run_scanner_classification_overhead(run_scanners),
         )?;
         let actual = self.scan_with_run_scanners(
             haystack,
@@ -1638,7 +1651,7 @@ impl PrefixClassAlternationPlan {
             haystack.len(),
             Operation::SpanSum,
             limits,
-            run_scanners[0].is_some(),
+            max_run_scanner_classification_overhead(run_scanners),
         )?;
         let actual = self.scan_with_run_scanners(
             haystack,
@@ -1759,7 +1772,7 @@ impl PrefixClassAlternationPlan {
             window,
             limits,
             Operation::Search,
-            run_scanners[0].is_some(),
+            max_run_scanner_classification_overhead(run_scanners),
         )?;
         let (matched, actual) = self.execute_union_search(
             haystack,
@@ -1788,7 +1801,7 @@ impl PrefixClassAlternationPlan {
         operation: Operation,
         identity: OperationIdentity,
     ) -> Result<(Option<(usize, usize)>, SearchAccounting), SearchError> {
-        let upper_bounds = self.search_preflight(haystack, window, limits, operation, false)?;
+        let upper_bounds = self.search_preflight(haystack, window, limits, operation, 0)?;
         let (matched, actual) = self.execute_union_search(
             haystack,
             window,
@@ -1870,7 +1883,7 @@ impl PrefixClassAlternationPlan {
             window,
             limits,
             Operation::Search,
-            run_scanners[0].is_some(),
+            max_run_scanner_classification_overhead(run_scanners),
         )?;
         let mut next = *state;
         let reset = next.prepare(window);
@@ -2085,7 +2098,7 @@ impl PrefixClassAlternationPlan {
         window: Window,
         limits: SearchLimits,
         operation: Operation,
-        run_scanners: bool,
+        max_classification_overhead: usize,
     ) -> Result<ReduceUpperBounds, SearchError> {
         if window.start() > window.end() || window.end() > haystack.len() {
             return Err(ReduceError::InvalidWindow {
@@ -2099,8 +2112,10 @@ impl PrefixClassAlternationPlan {
                 computation: "prefix/class search window byte length",
             },
         )?;
-        let implementation = if run_scanners {
-            ReduceImplementation::DispatchedRunScanners
+        let implementation = if max_classification_overhead != 0 {
+            ReduceImplementation::DispatchedRunScanners {
+                max_classification_overhead,
+            }
         } else {
             ReduceImplementation::Scalar
         };
@@ -2541,7 +2556,7 @@ impl PrefixClassAlternationPlan {
         haystack_len: usize,
         schema: UniformParticipationSchema,
     ) -> Result<UniformParticipationProspective, UniformParticipationError> {
-        self.uniform_participation_prospective_with_run_scanners(haystack_len, schema, false)
+        self.uniform_participation_prospective_with_run_scanners(haystack_len, schema, 0)
     }
 
     #[allow(
@@ -2552,7 +2567,7 @@ impl PrefixClassAlternationPlan {
         &self,
         haystack_len: usize,
         schema: UniformParticipationSchema,
-        run_scanners: bool,
+        max_classification_overhead: usize,
     ) -> Result<UniformParticipationProspective, UniformParticipationError> {
         if schema.participating_with_overall == 0
             || schema.capture_schema_slots < schema.participating_with_overall
@@ -2580,9 +2595,9 @@ impl PrefixClassAlternationPlan {
                 .ok_or(UniformParticipationError::ArithmeticOverflow {
                     computation: "first-class probes",
                 })?;
-        let scanner_overhead = if run_scanners {
+        let scanner_overhead = if max_classification_overhead != 0 {
             haystack_len
-                .checked_mul(ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD)
+                .checked_mul(max_classification_overhead)
                 .ok_or(UniformParticipationError::ArithmeticOverflow {
                     computation: "greedy extension scanner overhead",
                 })?
@@ -2854,7 +2869,7 @@ impl PrefixClassAlternationPlan {
             .uniform_participation_prospective_with_run_scanners(
                 haystack.len(),
                 schema,
-                run_scanners[0].is_some(),
+                max_run_scanner_classification_overhead(run_scanners),
             )
             .map_err(|source| uniform_attempt_error(source, receipt, identity, invocation))?;
         receipt.prospective = Some(prospective);
@@ -3076,7 +3091,7 @@ impl PrefixClassAlternationPlan {
         haystack_len: usize,
         limits: ReduceLimits,
     ) -> Result<ReduceUpperBounds, ReduceError> {
-        self.preflight_with_run_scanners(haystack_len, Operation::Count, limits, false)
+        self.preflight_with_run_scanners(haystack_len, Operation::Count, limits, 0)
     }
 
     fn preflight_with_run_scanners(
@@ -3084,10 +3099,12 @@ impl PrefixClassAlternationPlan {
         haystack_len: usize,
         operation: Operation,
         limits: ReduceLimits,
-        run_scanners: bool,
+        max_classification_overhead: usize,
     ) -> Result<ReduceUpperBounds, ReduceError> {
-        let implementation = if run_scanners {
-            ReduceImplementation::DispatchedRunScanners
+        let implementation = if max_classification_overhead != 0 {
+            ReduceImplementation::DispatchedRunScanners {
+                max_classification_overhead,
+            }
         } else {
             ReduceImplementation::Scalar
         };
@@ -3585,7 +3602,11 @@ impl DispatchedPrefixClassAlternationPlan {
         derive_reduce_upper_bounds(
             self.build_accounting(),
             haystack_len,
-            ReduceImplementation::DispatchedRunScanners,
+            ReduceImplementation::DispatchedRunScanners {
+                max_classification_overhead: max_run_scanner_classification_overhead(
+                    self.scanner_refs(),
+                ),
+            },
             Operation::Count,
         )
     }
@@ -3599,7 +3620,11 @@ impl DispatchedPrefixClassAlternationPlan {
         derive_reduce_upper_bounds(
             self.build_accounting(),
             haystack_len,
-            ReduceImplementation::DispatchedRunScanners,
+            ReduceImplementation::DispatchedRunScanners {
+                max_classification_overhead: max_run_scanner_classification_overhead(
+                    self.scanner_refs(),
+                ),
+            },
             Operation::SpanSum,
         )
     }
@@ -3736,7 +3761,11 @@ impl DispatchedPrefixClassAlternationPlan {
         schema: UniformParticipationSchema,
     ) -> Result<UniformParticipationProspective, UniformParticipationError> {
         self.plan()
-            .uniform_participation_prospective_with_run_scanners(haystack_len, schema, true)
+            .uniform_participation_prospective_with_run_scanners(
+                haystack_len,
+                schema,
+                max_run_scanner_classification_overhead(self.scanner_refs()),
+            )
     }
 
     pub fn enforce_uniform_participation(
@@ -5581,7 +5610,8 @@ mod tests {
                 assert_eq!(scalar.end, vector_result.end);
                 assert!(
                     vector_result.physical_classifications
-                        <= scalar.physical_classifications + ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD
+                        <= scalar.physical_classifications
+                            + scanner.max_classification_overhead()
                 );
             }
         }
@@ -5594,7 +5624,7 @@ mod tests {
             assert_eq!(scalar.end, vector_result.end);
             assert!(
                 vector_result.physical_classifications
-                    <= scalar.physical_classifications + ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD
+                    <= scalar.physical_classifications + scanner.max_classification_overhead()
             );
         }
     }
@@ -5745,9 +5775,11 @@ mod tests {
                 established_count.count
             );
             assert_eq!(established_count.count, dispatched_count.count);
+            let scanner_overhead =
+                max_run_scanner_classification_overhead(dispatched.scanner_refs());
             assert_eq!(
                 established_count.accounting.upper_bounds.work
-                    + haystack.len() * ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD,
+                    + haystack.len() * scanner_overhead,
                 dispatched_count.accounting.upper_bounds.work
             );
 
@@ -5781,7 +5813,7 @@ mod tests {
                     .accounting
                     .prospective
                     .greedy_extension_reads
-                    + haystack.len() * ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD,
+                    + haystack.len() * scanner_overhead,
                 dispatched_uniform
                     .accounting
                     .prospective

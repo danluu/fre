@@ -313,7 +313,7 @@ fn assert_run_result(
             .checked_add(usize::from(result.member_run_len() != bytes.len()))
             .unwrap();
         let maximum = logical
-            .checked_add(ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD)
+            .checked_add(scanner.max_classification_overhead())
             .unwrap();
         assert!(
             (logical..=maximum).contains(&result.examined_bytes()),
@@ -747,6 +747,7 @@ fn portable_run_scanner_random_sets_and_arbitrary_bytes_match_reference() {
     for _ in 0..10_000 {
         let set = AsciiByteSet::from_words([next_random(&mut state), next_random(&mut state)]);
         let scanner = AsciiByteSetRunScanner::with_policy(set, DispatchPolicy::Portable).unwrap();
+        assert_eq!(scanner.max_classification_overhead(), ASCII_NARROW_BYTES);
         let len = usize::from(next_random(&mut state).to_le_bytes()[0]);
         let offset = usize::from(next_random(&mut state).to_le_bytes()[0] & 0x1f);
         let mut storage = vec![0_u8; offset + len];
@@ -764,6 +765,43 @@ fn portable_run_scanner_random_sets_and_arbitrary_bytes_match_reference() {
         assert_eq!(
             backward.examined_bytes(),
             backward.member_run_len() + usize::from(backward.member_run_len() != bytes.len())
+        );
+    }
+}
+
+#[test]
+fn run_scanner_overhead_bound_tracks_the_retained_vector_receipt() {
+    let automatic = AsciiByteSetRunScanner::new(singleton(b'x'));
+    #[cfg(target_arch = "x86_64")]
+    assert_eq!(
+        ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD,
+        ASCII_WIDE_BYTES - 1
+    );
+    #[cfg(target_arch = "x86_64")]
+    let expected = match automatic.selection().vector {
+        VectorKind::Fixed {
+            bytes: ASCII_WIDE_VECTOR_BYTES,
+        } => ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD,
+        VectorKind::Scalar | VectorKind::Fixed { .. } | VectorKind::Scalable => {
+            ASCII_NARROW_BYTES
+        }
+        _ => ASCII_NARROW_BYTES,
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let expected = ASCII_NARROW_BYTES;
+    assert_eq!(automatic.max_classification_overhead(), expected);
+    assert!(automatic.max_classification_overhead() <= ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD);
+
+    #[cfg(not(feature = "static-dispatch"))]
+    {
+        let portable =
+            AsciiByteSetRunScanner::with_policy(singleton(b'x'), DispatchPolicy::Portable)
+                .unwrap();
+        assert_eq!(portable.selection().variant_id, SCALAR_RUN_VARIANT_ID);
+        assert_eq!(portable.selection().vector, VectorKind::Scalar);
+        assert_eq!(
+            portable.max_classification_overhead(),
+            ASCII_NARROW_BYTES
         );
     }
 }
@@ -923,7 +961,10 @@ fn host_auto_selection_receipt_matches_usable_features() {
 fn host_auto_run_selection_is_authorized_and_uses_only_qualified_tuning() {
     let sparse = AsciiByteSetRunScanner::new(singleton(b'x'));
     let dense = AsciiByteSetRunScanner::new(AsciiByteSet::ALL);
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(
+        target_arch = "aarch64",
+        all(target_arch = "x86_64", not(feature = "static-dispatch"))
+    ))]
     let usable = host().usable();
 
     #[cfg(target_arch = "aarch64")]
@@ -1009,7 +1050,75 @@ fn host_auto_run_selection_is_authorized_and_uses_only_qualified_tuning() {
         }
     }
 
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(all(target_arch = "x86_64", not(feature = "static-dispatch")))]
+    for scanner in [sparse, dense] {
+        let (variant_id, required, vector, overhead) = if usable.contains(Feature::X86Avx2) {
+            (
+                AVX2_RUN_VARIANT_ID,
+                FeatureSet::of(Feature::X86Avx2),
+                VectorKind::Fixed {
+                    bytes: u16::try_from(ASCII_WIDE_BYTES).unwrap(),
+                },
+                ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD,
+            )
+        } else if usable.contains_all(X86_AVX512_MASK_FEATURES) {
+            (
+                AVX512_RUN_VARIANT_ID,
+                X86_AVX512_MASK_FEATURES,
+                VectorKind::Fixed {
+                    bytes: u16::try_from(ASCII_WIDE_BYTES).unwrap(),
+                },
+                ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD,
+            )
+        } else {
+            (
+                SCALAR_RUN_VARIANT_ID,
+                FeatureSet::EMPTY,
+                VectorKind::Scalar,
+                ASCII_NARROW_BYTES,
+            )
+        };
+        assert_eq!(scanner.selection().variant_id, variant_id);
+        assert_eq!(scanner.selection().required, required);
+        assert_eq!(scanner.selection().vector, vector);
+        assert_eq!(scanner.max_classification_overhead(), overhead);
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "static-dispatch"))]
+    for scanner in [sparse, dense] {
+        let receipt = scanner.selection();
+        assert_eq!(
+            receipt.variant_id,
+            static_run_variant_id(scanner.table_mode)
+        );
+        let (required, vector, overhead) = match receipt.variant_id {
+            AVX2_RUN_VARIANT_ID => (
+                FeatureSet::of(Feature::X86Avx2),
+                VectorKind::Fixed {
+                    bytes: u16::try_from(ASCII_WIDE_BYTES).unwrap(),
+                },
+                ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD,
+            ),
+            AVX512_RUN_VARIANT_ID => (
+                X86_AVX512_MASK_FEATURES,
+                VectorKind::Fixed {
+                    bytes: u16::try_from(ASCII_WIDE_BYTES).unwrap(),
+                },
+                ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD,
+            ),
+            SCALAR_RUN_VARIANT_ID => (
+                FeatureSet::EMPTY,
+                VectorKind::Scalar,
+                ASCII_NARROW_BYTES,
+            ),
+            unexpected => panic!("unexpected compiler-fixed x86 run receipt: {unexpected}"),
+        };
+        assert_eq!(receipt.required, required);
+        assert_eq!(receipt.vector, vector);
+        assert_eq!(scanner.max_classification_overhead(), overhead);
+    }
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     for scanner in [sparse, dense] {
         assert_eq!(
             scanner.selection().variant_id,
@@ -1075,7 +1184,26 @@ fn host_auto_complement_selection_is_explicit_and_uses_only_qualified_tuning() {
         }
     }
 
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(all(target_arch = "x86_64", not(feature = "static-dispatch")))]
+    {
+        let usable = host().usable();
+        let expected = if usable.contains(Feature::X86Avx2) {
+            AVX2_RUN_VARIANT_ID
+        } else if usable.contains_all(X86_AVX512_MASK_FEATURES) {
+            AVX512_RUN_VARIANT_ID
+        } else {
+            SCALAR_RUN_VARIANT_ID
+        };
+        assert_eq!(complement.selection().variant_id, expected);
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "static-dispatch"))]
+    assert_eq!(
+        complement.selection().variant_id,
+        static_run_variant_id(complement.table_mode)
+    );
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     assert_eq!(
         complement.selection().variant_id,
         "ascii-byte-set.run.scalar.v1"
@@ -1338,6 +1466,223 @@ fn forced_neon_run_scanner_exhausts_boundaries_and_reports_recovery_work() {
                 );
             }
         }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[cfg(not(feature = "static-dispatch"))]
+#[allow(
+    unsafe_code,
+    reason = "the caller supplies private x86 leaves only after authenticating their exact retained feature receipt"
+)]
+fn exercise_forced_x86_run_scanner(
+    scanner: AsciiByteSetRunScanner,
+    direct_forward: unsafe fn(&AsciiRunTables, &[u8]) -> AsciiRunResult,
+    direct_backward: unsafe fn(&AsciiRunTables, &[u8]) -> AsciiRunResult,
+) {
+    let set = scanner.set();
+    let (tables, _) = set.run_tables(false);
+    let member = (0_u8..=0x7f)
+        .find(|&byte| set.contains(byte))
+        .expect("the exhaustive x86 sets are nonempty");
+    let outsider = (0_u8..=u8::MAX)
+        .find(|&byte| !set.contains(byte))
+        .expect("an ASCII set always rejects some byte");
+
+    for len in 0..=ASCII_WIDE_BYTES * 3 + 1 {
+        let vector_len = len / ASCII_WIDE_BYTES * ASCII_WIDE_BYTES;
+        for alignment_offset in 0..ASCII_WIDE_BYTES {
+            let mut storage = vec![0xcc; alignment_offset + len];
+            let bytes = &mut storage[alignment_offset..];
+
+            for prefix_len in 0..=len {
+                bytes.fill(member);
+                if prefix_len < len {
+                    bytes[prefix_len] = outsider;
+                }
+                let observed = scanner.scan_forward(bytes);
+                let expected = scalar::scan_run_forward(set, bytes);
+                assert_eq!(observed.member_run_len(), expected.member_run_len());
+                let expected_examined = if prefix_len == len {
+                    len
+                } else if prefix_len < vector_len {
+                    (prefix_len / ASCII_WIDE_BYTES + 1) * ASCII_WIDE_BYTES
+                } else {
+                    prefix_len + 1
+                };
+                assert_eq!(
+                    observed.examined_bytes(),
+                    expected_examined,
+                    "forward set={set:?} len={len} offset={alignment_offset} run={prefix_len}"
+                );
+                // SAFETY: each caller authenticates the exact leaf before
+                // passing it into this exhaustive source-extent audit.
+                assert_eq!(unsafe { direct_forward(&tables, bytes) }, observed);
+            }
+
+            for suffix_len in 0..=len {
+                bytes.fill(member);
+                if suffix_len < len {
+                    bytes[len - suffix_len - 1] = outsider;
+                }
+                let observed = scanner.scan_backward(bytes);
+                let expected = scalar::scan_run_backward(set, bytes);
+                assert_eq!(observed.member_run_len(), expected.member_run_len());
+                let expected_examined = if suffix_len == len {
+                    len
+                } else if suffix_len < vector_len {
+                    (suffix_len / ASCII_WIDE_BYTES + 1) * ASCII_WIDE_BYTES
+                } else {
+                    suffix_len + 1
+                };
+                assert_eq!(
+                    observed.examined_bytes(),
+                    expected_examined,
+                    "backward set={set:?} len={len} offset={alignment_offset} run={suffix_len}"
+                );
+                // SAFETY: identical feature and slice-extent proof to the
+                // forward direct-leaf assertion.
+                assert_eq!(unsafe { direct_backward(&tables, bytes) }, observed);
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[cfg(not(feature = "static-dispatch"))]
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "the immutable host snapshot gates both fused AVX2 direct leaves before the exhaustive audit enters them"
+)]
+fn forced_fused_avx2_run_scanners_exhaust_scalar_boundaries_and_alignments() {
+    let required = FeatureSet::of(Feature::X86Avx2);
+    if !host().usable().contains_all(required) {
+        return;
+    }
+    let sets = [
+        singleton(b'a'),
+        AsciiByteSet::from_words([0x5555_5555_5555_5555, 0xaaaa_aaaa_aaaa_aaaa]),
+        AsciiByteSet::ALL,
+    ];
+    for set in sets {
+        let scanner =
+            AsciiByteSetRunScanner::with_policy(set, DispatchPolicy::AllowOnly(required)).unwrap();
+        assert_eq!(scanner.selection().variant_id, AVX2_RUN_VARIANT_ID);
+        assert_eq!(scanner.selection().required, required);
+        assert_eq!(
+            scanner.selection().vector,
+            VectorKind::Fixed {
+                bytes: u16::try_from(ASCII_WIDE_BYTES).unwrap()
+            }
+        );
+        assert_eq!(
+            scanner.max_classification_overhead(),
+            ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD
+        );
+        exercise_forced_x86_run_scanner(
+            scanner,
+            x86_64::scan_run_forward_avx2,
+            x86_64::scan_run_backward_avx2,
+        );
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[cfg(not(feature = "static-dispatch"))]
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "the immutable host snapshot gates both fused AVX-512 direct leaves before the exhaustive audit enters them"
+)]
+fn forced_fused_avx512_run_scanners_exhaust_scalar_boundaries_and_alignments() {
+    if !host().usable().contains_all(X86_AVX512_MASK_FEATURES) {
+        return;
+    }
+    let sets = [
+        singleton(b'a'),
+        AsciiByteSet::from_words([0x5555_5555_5555_5555, 0xaaaa_aaaa_aaaa_aaaa]),
+        AsciiByteSet::ALL,
+    ];
+    for set in sets {
+        let scanner = AsciiByteSetRunScanner::with_policy(
+            set,
+            DispatchPolicy::AllowOnly(X86_AVX512_MASK_FEATURES),
+        )
+        .unwrap();
+        assert_eq!(scanner.selection().variant_id, AVX512_RUN_VARIANT_ID);
+        assert_eq!(scanner.selection().required, X86_AVX512_MASK_FEATURES);
+        assert_eq!(
+            scanner.selection().vector,
+            VectorKind::Fixed {
+                bytes: u16::try_from(ASCII_WIDE_BYTES).unwrap()
+            }
+        );
+        assert_eq!(
+            scanner.max_classification_overhead(),
+            ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD
+        );
+        exercise_forced_x86_run_scanner(
+            scanner,
+            x86_64::scan_run_forward_avx512,
+            x86_64::scan_run_backward_avx512,
+        );
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[cfg(not(feature = "static-dispatch"))]
+#[test]
+fn avx512_run_feature_lattice_requires_all_three_features_and_prefers_avx2() {
+    if !host().usable().contains_all(X86_AVX512_MASK_FEATURES) {
+        return;
+    }
+    let f = FeatureSet::of(Feature::X86Avx512F);
+    let bw = FeatureSet::of(Feature::X86Avx512Bw);
+    let vl = FeatureSet::of(Feature::X86Avx512Vl);
+    let proper_subsets = [
+        FeatureSet::EMPTY,
+        f,
+        bw,
+        vl,
+        f.union(bw),
+        f.union(vl),
+        bw.union(vl),
+    ];
+    let set = AsciiByteSet::from_words([0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210]);
+    for allowed in proper_subsets {
+        let fallback =
+            AsciiByteSetRunScanner::with_policy(set, DispatchPolicy::AllowOnly(allowed)).unwrap();
+        assert_eq!(
+            fallback.selection().variant_id,
+            SCALAR_RUN_VARIANT_ID,
+            "proper subset {allowed:?} authorized the AVX-512 run leaf"
+        );
+        assert!(fallback.selection().required.is_empty());
+        assert_eq!(fallback.max_classification_overhead(), ASCII_NARROW_BYTES);
+    }
+
+    let forced = AsciiByteSetRunScanner::with_policy(
+        set,
+        DispatchPolicy::AllowOnly(X86_AVX512_MASK_FEATURES),
+    )
+    .unwrap();
+    assert_eq!(forced.selection().variant_id, AVX512_RUN_VARIANT_ID);
+    assert_eq!(forced.selection().required, X86_AVX512_MASK_FEATURES);
+    assert_eq!(
+        forced.max_classification_overhead(),
+        ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD
+    );
+
+    if host().usable().contains(Feature::X86Avx2) {
+        let allowed = X86_AVX512_MASK_FEATURES.with(Feature::X86Avx2);
+        let generic =
+            AsciiByteSetRunScanner::with_policy(set, DispatchPolicy::AllowOnly(allowed)).unwrap();
+        assert_eq!(generic.selection().variant_id, AVX2_RUN_VARIANT_ID);
+        assert_eq!(
+            generic.selection().required,
+            FeatureSet::of(Feature::X86Avx2)
+        );
     }
 }
 

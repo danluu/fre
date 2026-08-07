@@ -5,7 +5,10 @@ use core::arch::x86_64::{
     _mm256_set1_epi8, _mm256_setzero_si256, _mm256_shuffle_epi8, _mm256_srli_epi16,
 };
 
-use super::{ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, AsciiMasks16, AsciiMasks32, HIGH_NIBBLE_BITS};
+use super::{
+    ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, AsciiMasks16, AsciiMasks32, AsciiRunResult,
+    AsciiRunTables, HIGH_NIBBLE_BITS, scalar,
+};
 use crate::{BYTE_SET_BLOCK_BYTES, BYTE_SET_WIDE_BLOCK_BYTES, ByteSetMask16, ByteSetMask32};
 
 #[allow(
@@ -392,7 +395,9 @@ pub(super) unsafe fn classify_32_avx512(
     // instruction has an all-lanes `k1` modifier, forcing its EVEX encoding.
     // The instruction set is exactly AVX-512F/BW/VL plus `vzeroupper`; it
     // contains no AVX2-only VEX broadcast or shuffle. The caller retained this
-    // entry only after proving all three AVX-512 features OS-usable.
+    // entry only after proving all three AVX-512 features OS-usable. The full
+    // YMM0..15 output list models every legacy vector register whose upper
+    // lanes `vzeroupper` changes.
     unsafe {
         core::arch::asm!(
             "kxnord k1, k1, k1",
@@ -424,6 +429,16 @@ pub(super) unsafe fn classify_32_avx512(
             out("ymm3") _,
             out("ymm4") _,
             out("ymm5") _,
+            out("ymm6") _,
+            out("ymm7") _,
+            out("ymm8") _,
+            out("ymm9") _,
+            out("ymm10") _,
+            out("ymm11") _,
+            out("ymm12") _,
+            out("ymm13") _,
+            out("ymm14") _,
+            out("ymm15") _,
             out("k1") _,
             out("k2") _,
             out("k3") _,
@@ -431,4 +446,365 @@ pub(super) unsafe fn classify_32_avx512(
         );
     }
     AsciiMasks32::new(ascii_mask, members)
+}
+
+#[allow(
+    unsafe_code,
+    reason = "this private fused run leaf reads complete 32-byte blocks only after retained dispatch proved AVX2 usable"
+)]
+#[allow(
+    clippy::cast_ptr_alignment,
+    reason = "the AVX2 unaligned loads explicitly accept byte-backed addresses"
+)]
+#[target_feature(enable = "avx2")]
+#[inline(never)]
+pub(super) unsafe fn scan_run_forward_avx2(
+    tables: &AsciiRunTables,
+    bytes: &[u8],
+) -> AsciiRunResult {
+    let vector_len = bytes.len() / ASCII_WIDE_BYTES * ASCII_WIDE_BYTES;
+    let mut offset = 0_usize;
+    if vector_len != 0 {
+        // Hoist both lookup tables and the nibble mask out of the block loop.
+        // AVX2 byte shuffles are lane-local, so each 16-byte table is
+        // broadcast into both halves once per complete run scan.
+        // SAFETY: both table loads read one initialized 16-byte object. The
+        // retained entry proves AVX2 usable before this target-feature leaf is
+        // entered.
+        let (columns, high_nibble_bits) = unsafe {
+            (
+                _mm256_broadcastsi128_si256(_mm_loadu_si128(
+                    tables.columns.as_ptr().cast::<__m128i>(),
+                )),
+                _mm256_broadcastsi128_si256(_mm_loadu_si128(
+                    HIGH_NIBBLE_BITS.as_ptr().cast::<__m128i>(),
+                )),
+            )
+        };
+        let nibble_mask = _mm256_set1_epi8(0x0f);
+        let zero = _mm256_setzero_si256();
+        while offset < vector_len {
+            // SAFETY: `offset < vector_len` and `vector_len` is rounded down
+            // to a multiple of 32, so this load stays within `bytes`.
+            let input = unsafe {
+                _mm256_loadu_si256(bytes.as_ptr().add(offset).cast::<__m256i>())
+            };
+            let low_nibbles = _mm256_and_si256(input, nibble_mask);
+            let high_nibbles =
+                _mm256_and_si256(_mm256_srli_epi16::<4>(input), nibble_mask);
+            let selected_columns = _mm256_shuffle_epi8(columns, low_nibbles);
+            let selected_high_bits = _mm256_shuffle_epi8(high_nibble_bits, high_nibbles);
+            let selected_bits = _mm256_and_si256(selected_columns, selected_high_bits);
+            let zero_lanes = _mm256_cmpeq_epi8(selected_bits, zero);
+            let members = !_mm256_movemask_epi8(zero_lanes).cast_unsigned();
+            let examined_bytes = offset
+                .checked_add(ASCII_WIDE_BYTES)
+                .expect("a complete AVX2 block stays within its slice");
+            if members != u32::MAX {
+                let prefix = usize::try_from(members.trailing_ones())
+                    .expect("a 32-lane prefix length fits in usize");
+                return AsciiRunResult::new(
+                    offset
+                        .checked_add(prefix)
+                        .expect("the failed block boundary stays within its slice"),
+                    examined_bytes,
+                );
+            }
+            offset = examined_bytes;
+        }
+    }
+
+    let tail = scalar::scan_run_forward(tables.set, &bytes[vector_len..]);
+    AsciiRunResult::new(
+        vector_len
+            .checked_add(tail.member_run_len())
+            .expect("the AVX2 prefix and scalar tail partition the slice"),
+        vector_len
+            .checked_add(tail.examined_bytes())
+            .expect("the AVX2 prefix and scalar tail partition the slice"),
+    )
+}
+
+#[allow(
+    unsafe_code,
+    reason = "this private fused run leaf reads complete 32-byte blocks only after retained dispatch proved AVX2 usable"
+)]
+#[allow(
+    clippy::cast_ptr_alignment,
+    reason = "the AVX2 unaligned loads explicitly accept byte-backed addresses"
+)]
+#[target_feature(enable = "avx2")]
+#[inline(never)]
+pub(super) unsafe fn scan_run_backward_avx2(
+    tables: &AsciiRunTables,
+    bytes: &[u8],
+) -> AsciiRunResult {
+    let head_len = bytes.len() % ASCII_WIDE_BYTES;
+    let vector_len = bytes.len() - head_len;
+    let mut offset = vector_len;
+    if vector_len != 0 {
+        // SAFETY: identical exact-table-load and AVX2 authorization proof to
+        // the forward leaf.
+        let (columns, high_nibble_bits) = unsafe {
+            (
+                _mm256_broadcastsi128_si256(_mm_loadu_si128(
+                    tables.columns.as_ptr().cast::<__m128i>(),
+                )),
+                _mm256_broadcastsi128_si256(_mm_loadu_si128(
+                    HIGH_NIBBLE_BITS.as_ptr().cast::<__m128i>(),
+                )),
+            )
+        };
+        let nibble_mask = _mm256_set1_epi8(0x0f);
+        let zero = _mm256_setzero_si256();
+        while offset != 0 {
+            offset = offset
+                .checked_sub(ASCII_WIDE_BYTES)
+                .expect("the reverse AVX2 cursor starts on a block boundary");
+            let block_start = head_len
+                .checked_add(offset)
+                .expect("the reverse AVX2 block stays within its slice");
+            // SAFETY: `block_start` identifies a complete 32-byte block in
+            // the vector suffix `[head_len..]`.
+            let input = unsafe {
+                _mm256_loadu_si256(bytes.as_ptr().add(block_start).cast::<__m256i>())
+            };
+            let low_nibbles = _mm256_and_si256(input, nibble_mask);
+            let high_nibbles =
+                _mm256_and_si256(_mm256_srli_epi16::<4>(input), nibble_mask);
+            let selected_columns = _mm256_shuffle_epi8(columns, low_nibbles);
+            let selected_high_bits = _mm256_shuffle_epi8(high_nibble_bits, high_nibbles);
+            let selected_bits = _mm256_and_si256(selected_columns, selected_high_bits);
+            let zero_lanes = _mm256_cmpeq_epi8(selected_bits, zero);
+            let members = !_mm256_movemask_epi8(zero_lanes).cast_unsigned();
+            let examined_bytes = vector_len
+                .checked_sub(offset)
+                .expect("the reverse cursor stays inside the vector suffix");
+            if members != u32::MAX {
+                let suffix = usize::try_from(members.leading_ones())
+                    .expect("a 32-lane suffix length fits in usize");
+                let completed = examined_bytes
+                    .checked_sub(ASCII_WIDE_BYTES)
+                    .expect("a failed AVX2 probe examined its complete block");
+                return AsciiRunResult::new(
+                    completed
+                        .checked_add(suffix)
+                        .expect("the failed reverse boundary stays within its slice"),
+                    examined_bytes,
+                );
+            }
+        }
+    }
+
+    let head = scalar::scan_run_backward(tables.set, &bytes[..head_len]);
+    AsciiRunResult::new(
+        vector_len
+            .checked_add(head.member_run_len())
+            .expect("the scalar head and AVX2 suffix partition the slice"),
+        vector_len
+            .checked_add(head.examined_bytes())
+            .expect("the scalar head and AVX2 suffix partition the slice"),
+    )
+}
+
+#[allow(
+    unsafe_code,
+    reason = "this private fused assembly loop is reachable only through a retained AVX-512F/BW/VL dispatch receipt"
+)]
+// Deliberately no `target_feature`: Rust's x86 contract implicitly enables
+// AVX2, FMA and F16C with AVX-512F. This assembly loop requires only the
+// independently receipted AVX-512F/BW/VL features and does not rely on those
+// implicit extras.
+#[inline(never)]
+pub(super) unsafe fn scan_run_forward_avx512(
+    tables: &AsciiRunTables,
+    bytes: &[u8],
+) -> AsciiRunResult {
+    let vector_len = bytes.len() / ASCII_WIDE_BYTES * ASCII_WIDE_BYTES;
+    if vector_len != 0 {
+        let vector_offset: usize;
+        let members: u32;
+        // SAFETY: the retained entry proves AVX-512F/BW/VL OS-usable. Each
+        // iteration reads exactly one of the `vector_len / 32` complete
+        // blocks. Table broadcasts happen before the backedge and
+        // `vzeroupper` executes exactly once after the loop, including its
+        // failed-block exit. YMM0..15 are all outputs because that final
+        // instruction changes every legacy vector register's upper lanes.
+        unsafe {
+            core::arch::asm!(
+                "kxnord k1, k1, k1",
+                "vbroadcasti32x4 ymm1 {{k1}}, xmmword ptr [{columns}]",
+                "vbroadcasti32x4 ymm2 {{k1}}, xmmword ptr [{high_bits}]",
+                "mov {scratch:e}, 0x0f0f0f0f",
+                "vpbroadcastd ymm3 {{k1}}, {scratch:e}",
+                "xor {offset}, {offset}",
+                "2:",
+                "vmovdqu8 ymm0 {{k1}}, ymmword ptr [{bytes} + {offset}]",
+                "vpandd ymm4 {{k1}}, ymm0, ymm3",
+                "vpsrlw ymm5 {{k1}}, ymm0, 4",
+                "vpandd ymm5 {{k1}}, ymm5, ymm3",
+                "vpshufb ymm4 {{k1}}, ymm1, ymm4",
+                "vpshufb ymm5 {{k1}}, ymm2, ymm5",
+                "vptestmb k2, ymm4, ymm5",
+                "kmovd {members:e}, k2",
+                "cmp {members:e}, -1",
+                "jne 3f",
+                "add {offset}, 32",
+                "cmp {offset}, {vector_len}",
+                "jb 2b",
+                "3:",
+                "vzeroupper",
+                bytes = in(reg) bytes.as_ptr(),
+                columns = in(reg) tables.columns.as_ptr(),
+                high_bits = in(reg) HIGH_NIBBLE_BITS.as_ptr(),
+                vector_len = in(reg) vector_len,
+                offset = out(reg) vector_offset,
+                members = out(reg) members,
+                scratch = out(reg) _,
+                out("ymm0") _,
+                out("ymm1") _,
+                out("ymm2") _,
+                out("ymm3") _,
+                out("ymm4") _,
+                out("ymm5") _,
+                out("ymm6") _,
+                out("ymm7") _,
+                out("ymm8") _,
+                out("ymm9") _,
+                out("ymm10") _,
+                out("ymm11") _,
+                out("ymm12") _,
+                out("ymm13") _,
+                out("ymm14") _,
+                out("ymm15") _,
+                out("k1") _,
+                out("k2") _,
+                options(nostack, readonly),
+            );
+        }
+        if members != u32::MAX {
+            let prefix = usize::try_from(members.trailing_ones())
+                .expect("a 32-lane prefix length fits in usize");
+            return AsciiRunResult::new(
+                vector_offset
+                    .checked_add(prefix)
+                    .expect("the failed AVX-512 block boundary stays within its slice"),
+                vector_offset
+                    .checked_add(ASCII_WIDE_BYTES)
+                    .expect("the failed AVX-512 probe examined one complete block"),
+            );
+        }
+        debug_assert_eq!(vector_offset, vector_len);
+    }
+
+    let tail = scalar::scan_run_forward(tables.set, &bytes[vector_len..]);
+    AsciiRunResult::new(
+        vector_len
+            .checked_add(tail.member_run_len())
+            .expect("the AVX-512 prefix and scalar tail partition the slice"),
+        vector_len
+            .checked_add(tail.examined_bytes())
+            .expect("the AVX-512 prefix and scalar tail partition the slice"),
+    )
+}
+
+#[allow(
+    unsafe_code,
+    reason = "this private fused assembly loop is reachable only through a retained AVX-512F/BW/VL dispatch receipt"
+)]
+// See the forward leaf for the deliberate feature-gating boundary.
+#[inline(never)]
+pub(super) unsafe fn scan_run_backward_avx512(
+    tables: &AsciiRunTables,
+    bytes: &[u8],
+) -> AsciiRunResult {
+    let head_len = bytes.len() % ASCII_WIDE_BYTES;
+    let vector_len = bytes.len() - head_len;
+    if vector_len != 0 {
+        let vector_offset: usize;
+        let members: u32;
+        // SAFETY: identical feature proof to the forward leaf. `block_base`
+        // starts the complete-block suffix, and the loop subtracts one block
+        // before each load. Broadcasts and `vzeroupper` remain outside the
+        // backedge.
+        unsafe {
+            core::arch::asm!(
+                "kxnord k1, k1, k1",
+                "vbroadcasti32x4 ymm1 {{k1}}, xmmword ptr [{columns}]",
+                "vbroadcasti32x4 ymm2 {{k1}}, xmmword ptr [{high_bits}]",
+                "mov {scratch:e}, 0x0f0f0f0f",
+                "vpbroadcastd ymm3 {{k1}}, {scratch:e}",
+                "mov {offset}, {vector_len}",
+                "2:",
+                "sub {offset}, 32",
+                "vmovdqu8 ymm0 {{k1}}, ymmword ptr [{block_base} + {offset}]",
+                "vpandd ymm4 {{k1}}, ymm0, ymm3",
+                "vpsrlw ymm5 {{k1}}, ymm0, 4",
+                "vpandd ymm5 {{k1}}, ymm5, ymm3",
+                "vpshufb ymm4 {{k1}}, ymm1, ymm4",
+                "vpshufb ymm5 {{k1}}, ymm2, ymm5",
+                "vptestmb k2, ymm4, ymm5",
+                "kmovd {members:e}, k2",
+                "cmp {members:e}, -1",
+                "jne 3f",
+                "test {offset}, {offset}",
+                "jnz 2b",
+                "3:",
+                "vzeroupper",
+                block_base = in(reg) bytes.as_ptr().add(head_len),
+                columns = in(reg) tables.columns.as_ptr(),
+                high_bits = in(reg) HIGH_NIBBLE_BITS.as_ptr(),
+                vector_len = in(reg) vector_len,
+                offset = out(reg) vector_offset,
+                members = out(reg) members,
+                scratch = out(reg) _,
+                out("ymm0") _,
+                out("ymm1") _,
+                out("ymm2") _,
+                out("ymm3") _,
+                out("ymm4") _,
+                out("ymm5") _,
+                out("ymm6") _,
+                out("ymm7") _,
+                out("ymm8") _,
+                out("ymm9") _,
+                out("ymm10") _,
+                out("ymm11") _,
+                out("ymm12") _,
+                out("ymm13") _,
+                out("ymm14") _,
+                out("ymm15") _,
+                out("k1") _,
+                out("k2") _,
+                options(nostack, readonly),
+            );
+        }
+        if members != u32::MAX {
+            let suffix = usize::try_from(members.leading_ones())
+                .expect("a 32-lane suffix length fits in usize");
+            let examined_bytes = vector_len
+                .checked_sub(vector_offset)
+                .expect("the reverse AVX-512 cursor stays inside its suffix");
+            let completed = examined_bytes
+                .checked_sub(ASCII_WIDE_BYTES)
+                .expect("a failed AVX-512 probe examined one complete block");
+            return AsciiRunResult::new(
+                completed
+                    .checked_add(suffix)
+                    .expect("the failed reverse AVX-512 boundary stays in its slice"),
+                examined_bytes,
+            );
+        }
+        debug_assert_eq!(vector_offset, 0);
+    }
+
+    let head = scalar::scan_run_backward(tables.set, &bytes[..head_len]);
+    AsciiRunResult::new(
+        vector_len
+            .checked_add(head.member_run_len())
+            .expect("the scalar head and AVX-512 suffix partition the slice"),
+        vector_len
+            .checked_add(head.examined_bytes())
+            .expect("the scalar head and AVX-512 suffix partition the slice"),
+    )
 }

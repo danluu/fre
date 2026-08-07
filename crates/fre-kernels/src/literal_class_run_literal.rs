@@ -56,8 +56,8 @@ use core::{fmt, mem::size_of};
 
 use fre_exact_alloc::CopyError;
 use fre_simd_kernels::{
-    ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD, ASCII_WIDE_BYTES, AsciiByteSet, AsciiByteSetClassifier,
-    AsciiByteSetRunScanner, DispatchPolicy, Feature, SimdDispatchContext, VectorKind,
+    ASCII_WIDE_BYTES, AsciiByteSet, AsciiByteSetClassifier, AsciiByteSetRunScanner,
+    DispatchPolicy, Feature, SimdDispatchContext, VectorKind,
 };
 use memchr::memmem::{Finder, FinderBuilder};
 
@@ -153,7 +153,7 @@ pub enum ClassScanIdentity {
 enum ClassScanKind {
     Scalar,
     Fixed,
-    Run,
+    Run { max_classification_overhead: usize },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1853,7 +1853,9 @@ impl LiteralClassRunLiteralPlan {
     ) -> Result<ReduceUpperBounds, ReduceError> {
         let class_scan = match self.ascii_scanner {
             Some(AsciiClassScanner::Fixed(_)) => ClassScanKind::Fixed,
-            Some(AsciiClassScanner::Run(_)) => ClassScanKind::Run,
+            Some(AsciiClassScanner::Run(scanner)) => ClassScanKind::Run {
+                max_classification_overhead: scanner.max_classification_overhead(),
+            },
             None => ClassScanKind::Scalar,
         };
         match self.boundary_semantics() {
@@ -3932,7 +3934,7 @@ impl BoundedLiteralClassRunPlan {
 
     const fn bounded_scan_classification_overhead(&self) -> usize {
         match self.ascii_scanner {
-            Some(AsciiClassScanner::Run(_)) => ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD,
+            Some(AsciiClassScanner::Run(scanner)) => scanner.max_classification_overhead(),
             Some(AsciiClassScanner::Fixed(_)) => ASCII_WIDE_BYTES - 1,
             None => 0,
         }
@@ -4970,7 +4972,9 @@ fn derive_reduce_upper_bounds(
         )
     };
     let classifications = match class_scan {
-        ClassScanKind::Run => logical_classifications
+        ClassScanKind::Run {
+            max_classification_overhead,
+        } => logical_classifications
             .checked_add(
                 simd_run_recoveries
                     .checked_mul(if suffix_inside_class && operation == Operation::SpanSum {
@@ -4979,7 +4983,7 @@ fn derive_reduce_upper_bounds(
                         1
                     })
                     .and_then(|candidates| {
-                        candidates.checked_mul(ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD)
+                        candidates.checked_mul(max_classification_overhead)
                     })
                     .ok_or(ReduceError::ArithmeticOverflow {
                         computation: "SIMD class-run recovery classification bound",
@@ -5139,7 +5143,9 @@ fn derive_complete_ascii_word_run_upper_bounds(
         Operation::Count => logical_classifications,
         Operation::SpanSum => {
             let overhead_per_recovery = match class_scan {
-                ClassScanKind::Run => ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD,
+                ClassScanKind::Run {
+                    max_classification_overhead,
+                } => max_classification_overhead,
                 // A terminating fixed-width block can physically classify at
                 // most 31 lanes outside its logical backward run.
                 ClassScanKind::Fixed => ASCII_WIDE_BYTES - 1,
@@ -6193,7 +6199,7 @@ fn scan_unicode_ascii_corridor_after_scalar_proof_value(
     start: usize,
 ) -> usize {
     let mut end = start;
-    for _ in 0..ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD {
+    for _ in 0..scanner.max_classification_overhead() {
         if end == haystack.len() || !class.contains(haystack[end]) {
             return end;
         }
@@ -6217,7 +6223,7 @@ fn resume_unicode_ascii_corridor(
         }
         Some(AsciiClassScanner::Run(scanner)) => {
             let mut end = start;
-            for _ in 0..ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD {
+            for _ in 0..scanner.max_classification_overhead() {
                 if end == haystack.len() {
                     return Ok(end);
                 }

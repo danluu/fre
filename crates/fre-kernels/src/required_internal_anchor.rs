@@ -21,8 +21,7 @@
 use core::{fmt, mem::size_of};
 
 use fre_simd_kernels::{
-    ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD, AsciiByteSet, AsciiByteSetRunScanner, DispatchPolicy,
-    Feature, SimdDispatchContext,
+    AsciiByteSet, AsciiByteSetRunScanner, DispatchPolicy, Feature, SimdDispatchContext,
 };
 use memchr::memchr;
 
@@ -653,10 +652,10 @@ impl RequiredInternalAnchorPlan {
                 mul(candidate_visits, per_candidate, "continuation bound")?,
                 "continuation bound",
             )?,
-            if self.tail_run_scanner.is_some() {
+            if let Some(scanner) = self.tail_run_scanner.as_ref() {
                 mul(
                     candidate_visits,
-                    ASCII_RUN_MAX_CLASSIFICATION_OVERHEAD,
+                    scanner.max_classification_overhead(),
                     "tail run classification overhead bound",
                 )?
             } else {
