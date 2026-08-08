@@ -1,0 +1,27 @@
+[package]
+name = "fre-unicode-fold-correlated-root-gate"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+publish = false
+
+[workspace]
+
+[features]
+default = ["zstd-eval-arm-static"]
+zstd-eval-arm-static = ["fre/static-dispatch-arm-41-d84"]
+portable-dispatch = []
+
+[dependencies]
+fre = { path = "../../crates/fre", default-features = false }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+arithmetic_side_effects = "warn"
+as_conversions = "warn"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
