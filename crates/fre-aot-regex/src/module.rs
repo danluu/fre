@@ -16827,6 +16827,10 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             }
         }
         assembler.bind(loop_rows_checked)?;
+        // Offset-row execution must remain in the offset table after the
+        // learned-loop ownership audit. Falling through here would reinterpret
+        // the row ordinal in R8 as a zero-overlay row pointer.
+        assembler.branch(&[0xe9], table_scan)?;
     }
 
     assembler.bind(pointer_scan)?;
@@ -16908,6 +16912,10 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         assembler.branch(&[0xe9], pointer_table_scan)?;
 
         assembler.bind(offset_candidate)?;
+        // The root scanner uses R8 for its representation tag. Restore the
+        // authenticated initial-row offset before re-entering the V1 table
+        // loop; otherwise the tag itself is consumed as a row offset.
+        assembler.instruction(&[0x45, 0x8b, 0x43, NATIVE_ROWS_INITIAL_ROW as u8])?;
         assembler.instruction(&[0x41, 0x8b, 0x43, NATIVE_ROWS_LOOP_COUNT as u8])?;
         assembler.branch(&[0xe9], table_scan)?;
 
@@ -27381,6 +27389,9 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
                 assembler.branch_cond(AARCH64_EQ, table_scan)?;
             }
         }
+        // W11 is still an offset-row ordinal. Keep it in the offset table;
+        // pointer_scan expects an authenticated zero-overlay row address.
+        assembler.branch(table_scan)?;
     }
 
     assembler.bind(pointer_scan)?;
@@ -27465,6 +27476,14 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         assembler.branch(pointer_table_scan)?;
 
         assembler.bind(offset_candidate)?;
+        // The root scanner uses W11/X11 while classifying its representation.
+        // Restore the authenticated initial-row offset before the V1 loop.
+        assembler.instruction(aarch64_load_w_imm(
+            11,
+            13,
+            u16::try_from(NATIVE_ROWS_INITIAL_ROW)
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic initial row"))?,
+        )?)?;
         assembler.instruction(aarch64_load_w_imm(
             10,
             13,
@@ -33785,6 +33804,21 @@ mod tests {
                 2,
                 "entry selection and the nonzero-offset candidate are the only count loads: {accelerator:?}"
             );
+            let offset_candidate_restore = [
+                0x45,
+                0x8b,
+                0x43,
+                initial_row,
+                0x41,
+                0x8b,
+                0x43,
+                loop_count,
+            ];
+            assert_eq!(
+                occurrences(code, &offset_candidate_restore),
+                1,
+                "the rooted offset-row candidate must restore its authenticated initial row before table reentry: {accelerator:?}"
+            );
             assert_eq!(
                 occurrences(code, &[0x49, 0xff, 0xc4]),
                 1,
@@ -33832,6 +33866,14 @@ mod tests {
                     .expect("cached learned-loop count test");
             assert!(root_compare < count_test);
             assert_eq!(occurrences(&code[scan..count_test], &count_load), 0);
+            let (loop_rows_checked, _) = x86_test_branch_target(code, count_test + 2)
+                .expect("zero learned-loop count reaches the audited offset-row continuation");
+            let (ordinary_table, _) = x86_test_branch_target(code, loop_rows_checked)
+                .expect("audited offset rows branch back to their table");
+            assert_eq!(
+                ordinary_table, table_start,
+                "offset rows must not fall through into the pointer-row scanner: {accelerator:?}"
+            );
 
             let mut previous_loop_compare = count_test;
             for loop_row in 0..NATIVE_ROWS_LOOP_ROW_CAPACITY {
@@ -34624,6 +34666,34 @@ mod tests {
                             ]
                     })
                     .expect("canonical V2 table transition");
+                let last_loop_row = words
+                    .iter()
+                    .position(|&word| {
+                        word
+                            == aarch64_load_w_imm(
+                                8,
+                                13,
+                                u16::try_from(
+                                    native_rows_loop_row_offset(
+                                        NATIVE_ROWS_LOOP_ROW_CAPACITY - 1,
+                                    )
+                                    .unwrap(),
+                                )
+                                .unwrap(),
+                            )
+                            .unwrap()
+                    })
+                    .expect("last learned offset-row ownership load");
+                assert_eq!(
+                    words[last_loop_row + 1],
+                    aarch64_cmp_w(11, 8).unwrap(),
+                    "the final learned row must compare against the live offset-row ordinal"
+                );
+                assert_eq!(
+                    unconditional_target(&words, last_loop_row + 3),
+                    Some(v2_table),
+                    "offset rows must not fall through into the pointer-row scanner"
+                );
                 let v7_candidate = conditional_target(&words, candidate + candidate_prefix.len())
                     .expect("tagged V7 candidate edge");
                 assert_eq!(
@@ -34759,6 +34829,35 @@ mod tests {
                     )
                     .unwrap(),
                     "V3 selection must retain its state-ordinal class map"
+                );
+                let offset_compare = candidate
+                    + words[candidate..v2_table]
+                        .iter()
+                        .position(|&word| {
+                            word == aarch64_cmp_x_imm(8, 1).unwrap()
+                        })
+                        .expect("tagged mutable offset-row candidate comparison");
+                let offset_candidate = conditional_target(&words, offset_compare + 1)
+                    .expect("tagged mutable offset-row candidate edge");
+                assert_eq!(
+                    words[offset_candidate],
+                    aarch64_load_w_imm(
+                        11,
+                        13,
+                        u16::try_from(NATIVE_ROWS_INITIAL_ROW).unwrap(),
+                    )
+                    .unwrap(),
+                    "the rooted offset-row candidate must restore its authenticated initial row"
+                );
+                assert_eq!(
+                    words[offset_candidate + 1],
+                    aarch64_load_w_imm(
+                        10,
+                        13,
+                        u16::try_from(NATIVE_ROWS_LOOP_COUNT).unwrap(),
+                    )
+                    .unwrap(),
+                    "the rooted offset-row candidate must restore its authenticated loop count after its row"
                 );
                 let pointer_prefix = [
                     aarch64_load_byte_reg(8, 0, 2).unwrap(),
