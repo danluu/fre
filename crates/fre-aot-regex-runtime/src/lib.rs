@@ -2796,6 +2796,39 @@ mod tests {
         handle
     }
 
+    fn prepare_exclusive_with_cold_dynamic_rows(program: &[u8]) -> FreAotRegexExclusiveHandleV1 {
+        let program = CompiledProgram::deserialize(program).expect("deserialize test program");
+        let mut workspace = program.prepare_workspace().expect("prepare test workspace");
+        let fully_prefilled_fallback = program
+            .compiler_private_try_prefill_retained_fallback_with_workspace_receipt(&mut workspace)
+            .expect("prefill cold dynamic-row test owner");
+        let frozen_dynamic_rows = program
+            .compiler_private_frozen_dynamic_rows_storage_v3_with_fallback_receipt(
+                &mut workspace,
+                fully_prefilled_fallback,
+                0,
+                0,
+            );
+        assert!(frozen_dynamic_rows.is_none());
+        assert!(fully_prefilled_fallback.is_none());
+        let frozen_header = program.compiler_private_frozen_prepared_header_v6(
+            &workspace,
+            fully_prefilled_fallback,
+            frozen_dynamic_rows.as_ref(),
+        );
+        assert!(!frozen_header.is_active());
+        let prepared = PreparedAotRegex {
+            frozen_header,
+            program,
+            workspace,
+            frozen_dynamic_rows,
+            fully_prefilled_fallback,
+        };
+        FreAotRegexExclusiveHandleV1(
+            Box::into_raw(Box::new(prepared)).cast::<std::ffi::c_void>(),
+        )
+    }
+
     fn call_exclusive(
         handle: FreAotRegexExclusiveHandleV1,
         haystack: &[u8],
@@ -3791,7 +3824,7 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
         .expect("compile dynamic-row runtime fixture");
         let identity = compiled.receipt().program_sha256;
         let serialized = compiled.program().serialize().unwrap();
-        let handle = prepare_exclusive(&serialized);
+        let handle = prepare_exclusive_with_cold_dynamic_rows(&serialized);
         let mut haystack = vec![b'!'; 80];
         for pair in haystack[8..70].chunks_exact_mut(2) {
             pair.copy_from_slice(b"ab");
@@ -3945,7 +3978,7 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
             );
             let identity = compiled.receipt().program_sha256;
             let serialized = compiled.program().serialize().unwrap();
-            let handle = prepare_exclusive(&serialized);
+            let handle = prepare_exclusive_with_cold_dynamic_rows(&serialized);
             let mut warmed = vec![b'!'; 80];
             warmed[8..10].copy_from_slice(b"aa");
             let start = 8;
@@ -4097,7 +4130,7 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
 
         let identity = compiled.receipt().program_sha256;
         let serialized = compiled.program().serialize().unwrap();
-        let handle = prepare_exclusive(&serialized);
+        let handle = prepare_exclusive_with_cold_dynamic_rows(&serialized);
         let mut haystack = vec![b'!'; 80];
         let start = 8_usize;
         let end = 72_usize;
@@ -4433,7 +4466,7 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
         .expect("compile scanner-free pending-end fixture");
         let identity = compiled.receipt().program_sha256;
         let serialized = compiled.program().serialize().unwrap();
-        let handle = prepare_exclusive(&serialized);
+        let handle = prepare_exclusive_with_cold_dynamic_rows(&serialized);
         let mut warmed = vec![b'!'; 80];
         let start = 8;
         let end = 72;
@@ -4531,7 +4564,7 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
         .expect("compile alternating dynamic-row fixture");
         let identity = compiled.receipt().program_sha256;
         let serialized = compiled.program().serialize().unwrap();
-        let handle = prepare_exclusive(&serialized);
+        let handle = prepare_exclusive_with_cold_dynamic_rows(&serialized);
         let mut haystack = vec![b'!'; 80];
         for pair in haystack[8..70].chunks_exact_mut(2) {
             pair.copy_from_slice(b"ab");
