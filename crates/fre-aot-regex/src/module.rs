@@ -2111,6 +2111,14 @@ fn lower_native_dynamic_rows_prepared(
     };
     let variable_span_recovery =
         view.output == OutputContract::Span && view.exact_match_width.is_none();
+    // Variable-width Span requires reverse-K0 recovery, while immutable
+    // compact rows deliberately retain no reverse owner. This semantic fact
+    // is target-neutral and must govern code emission even when a target
+    // cannot install the graph root that independently excludes fused
+    // supertransitions.
+    let immutable_compact_possible = !variable_span_recovery;
+    let supertransitions_possible =
+        immutable_compact_possible && view.root_requirement.is_none();
     let identity_offset =
         program_bytes
             .len()
@@ -2180,21 +2188,29 @@ fn lower_native_dynamic_rows_prepared(
     // scalar AArch64 route when the requested vector capabilities cannot
     // represent this graph column.
     let prepared = match target.architecture {
-        Architecture::X86_64 => lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
-            x86_root_plan,
-            target.features,
-            view.output,
-            exact_span_width,
-            true,
-            view.source_class_count >= FROZEN_COMPACT_DIRECT_BYTE_MIN_CLASSES,
-        )?,
-        Architecture::Aarch64 => lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
-            aarch64_root_plan,
-            view.output,
-            exact_span_width,
-            true,
-            view.source_class_count >= FROZEN_COMPACT_DIRECT_BYTE_MIN_CLASSES,
-        )?,
+        Architecture::X86_64 => {
+            lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
+                x86_root_plan,
+                target.features,
+                view.output,
+                exact_span_width,
+                true,
+                view.source_class_count >= FROZEN_COMPACT_DIRECT_BYTE_MIN_CLASSES,
+                immutable_compact_possible,
+                supertransitions_possible,
+            )?
+        },
+        Architecture::Aarch64 => {
+            lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
+                aarch64_root_plan,
+                view.output,
+                exact_span_width,
+                true,
+                view.source_class_count >= FROZEN_COMPACT_DIRECT_BYTE_MIN_CLASSES,
+                immutable_compact_possible,
+                supertransitions_possible,
+            )?
+        },
     };
     let installed_root = match target.architecture {
         Architecture::X86_64 => x86_root_plan.is_some(),
@@ -14434,6 +14450,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output(
     clippy::too_many_lines,
     reason = "the compile-time descriptor size assertion proves every encoded positive disp8 offset"
 )]
+#[cfg(test)]
 fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     root_plan: Option<X86DynamicRootPlan>,
     features: FeatureSet,
@@ -14441,6 +14458,38 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     exact_span_width: Option<u64>,
     allow_direct_hole_continuation: bool,
     direct_byte_formats_possible: bool,
+) -> Result<NativeDynamicRowsEmission, ObjectError> {
+    let immutable_compact_possible =
+        !(output == OutputContract::Span && exact_span_width.is_none());
+    let supertransitions_possible = immutable_compact_possible && root_plan.is_none();
+    lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
+        root_plan,
+        features,
+        output,
+        exact_span_width,
+        allow_direct_hole_continuation,
+        direct_byte_formats_possible,
+        immutable_compact_possible,
+        supertransitions_possible,
+    )
+}
+
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the compile-time descriptor size assertion proves every encoded positive disp8 offset"
+)]
+fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
+    root_plan: Option<X86DynamicRootPlan>,
+    features: FeatureSet,
+    output: OutputContract,
+    exact_span_width: Option<u64>,
+    allow_direct_hole_continuation: bool,
+    direct_byte_formats_possible: bool,
+    immutable_compact_possible: bool,
+    supertransitions_possible: bool,
 ) -> Result<NativeDynamicRowsEmission, ObjectError> {
     const SCANNER_FREE_FRAME_BYTES: u8 = 104;
     const ROOT_SCANNER_FRAME_BYTES: u8 = 120;
@@ -14480,7 +14529,14 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
         SCANNER_FREE_FRAME_BYTES
     };
     let variable_span_recovery = output == OutputContract::Span && exact_span_width.is_none();
-    let pair_supertransition_possible = root_plan.is_none() && !variable_span_recovery;
+    if immutable_compact_possible != !variable_span_recovery
+        || supertransitions_possible && (!immutable_compact_possible || root_plan.is_some())
+    {
+        return Err(ObjectError::InvalidModule(
+            "x86 dynamic compact capabilities are semantically inconsistent",
+        ));
+    }
+    let pair_supertransition_possible = supertransitions_possible;
     if (output != OutputContract::Span && exact_span_width.is_some())
         || exact_span_width == Some(0)
     {
@@ -14699,6 +14755,9 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     push_bytes(&mut assembler.code, &[0; 4])?;
     assembler.instruction(&[0x48, 0x89, 0x04, 0x24])?;
 
+    // Keep the complete V3--V14 selector lattice out of machine code when
+    // target-neutral output semantics make every immutable format impossible.
+    if immutable_compact_possible {
     if output == OutputContract::Exists {
         x86_emit_frozen_compact_v5_entry(
             &mut assembler,
@@ -14806,6 +14865,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
         v3_enter,
         FrozenCompactGuardMode::ActiveCapability,
     )?;
+    }
     assembler.bind(try_v2)?;
     if root_plan.is_none() {
         // Only a seal/identity-authenticated active compact capability may
@@ -14860,6 +14920,11 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     assembler.instruction(&[0x48, 0x83, 0xc4, frame_bytes])?;
     assembler.instruction(&[0xc3])?;
 
+    let mut v7_loop_scan_displacement_label = None;
+    let mut v6_loop_scan_displacement_label = None;
+    // Bodies share the selector's compile-time gate so unreachable labels do
+    // not leave cold decoder or helper-call bytes in a variable-Span entry.
+    if immutable_compact_possible {
     assembler.bind(v5_enter)?;
     if output == OutputContract::Exists {
         // R10D is the authenticated one-based first accepting step. Zero is
@@ -15455,8 +15520,9 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     assembler.instruction(&[0x48, 0x8d, 0x3c, 0x17])?;
     assembler.instruction(&[0x4c, 0x89, 0xd2])?;
     assembler.instruction(&[0xe8])?;
-    let v7_loop_scan_displacement_label = assembler.label()?;
-    assembler.bind(v7_loop_scan_displacement_label)?;
+    let v7_loop_scan_label = assembler.label()?;
+    v7_loop_scan_displacement_label = Some(v7_loop_scan_label);
+    assembler.bind(v7_loop_scan_label)?;
     push_bytes(&mut assembler.code, &[0; 4])?;
     assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x08])?;
     assembler.instruction(&[0x4c, 0x8b, 0x04, 0x24])?;
@@ -15661,8 +15727,9 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     assembler.instruction(&[0x48, 0x8d, 0x3c, 0x17])?;
     assembler.instruction(&[0x4c, 0x89, 0xc2])?;
     assembler.instruction(&[0xe8])?;
-    let v6_loop_scan_displacement_label = assembler.label()?;
-    assembler.bind(v6_loop_scan_displacement_label)?;
+    let v6_loop_scan_label = assembler.label()?;
+    v6_loop_scan_displacement_label = Some(v6_loop_scan_label);
+    assembler.bind(v6_loop_scan_label)?;
     push_bytes(&mut assembler.code, &[0; 4])?;
     assembler.instruction(&[0x4c, 0x8b, 0x14, 0x24])?;
     assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x08])?;
@@ -16355,6 +16422,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
         assembler.branch(&[0xe9], native_complete.unwrap_or(native_no_match))?;
     }
 
+    }
     assembler.bind(preflight_enter)?;
     // Canonicalize the ordinary helper arguments to the exact window admitted
     // by preflight. Continuation payloads overwrite the preflight record, so
@@ -16611,6 +16679,9 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
         let offset_candidate = assembler.label()?;
         assembler.bind(root_candidate)?;
         assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, ROOT_SCANNER_REPRESENTATION_OFFSET])?;
+        // A root can still accelerate mutable V1 rows. Compact representation
+        // tags are meaningful only when their bodies were emitted above.
+        if immutable_compact_possible {
         assembler.instruction(&[0x48, 0x83, 0xf8, ROOT_SCANNER_COMPACT_V7])?;
         assembler.branch(&[0x0f, 0x84], v7_candidate)?;
         assembler.instruction(&[0x48, 0x83, 0xf8, ROOT_SCANNER_COMPACT_V6])?;
@@ -16634,6 +16705,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
         assembler.branch(&[0x0f, 0x84], v4_candidate)?;
         assembler.instruction(&[0x48, 0x83, 0xf8, ROOT_SCANNER_COMPACT_V3])?;
         assembler.branch(&[0x0f, 0x84], v3_candidate)?;
+        }
         if tracks_root_scanner_hits {
             assembler.instruction(&[0x49, 0xff, 0xc4])?; // inc r12
         }
@@ -16648,6 +16720,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
         assembler.instruction(&[0x41, 0x8b, 0x43, NATIVE_ROWS_LOOP_COUNT as u8])?;
         assembler.branch(&[0xe9], table_scan)?;
 
+        if immutable_compact_possible {
         assembler.bind(v7_candidate)?;
         assembler.instruction(&[
             0x49,
@@ -16774,6 +16847,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
                 .map_err(|_| ObjectError::ArithmeticOverflow("x86 V3 candidate shift"))?,
         ])?;
         assembler.branch(&[0xe9], v3_dispatch)?;
+        }
     }
 
     assembler.bind(table_scan)?;
@@ -17161,10 +17235,12 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     let preflight_displacement = finished.label_offset(preflight_displacement_label)?;
     let deopt_displacement = finished.label_offset(deopt_displacement_label)?;
     let fallback_displacement = finished.label_offset(fallback_displacement_label)?;
-    let v7_loop_scan_displacement =
-        finished.label_offset(v7_loop_scan_displacement_label)?;
-    let v6_loop_scan_displacement =
-        finished.label_offset(v6_loop_scan_displacement_label)?;
+    let v7_loop_scan_displacement = v7_loop_scan_displacement_label
+        .map(|label| finished.label_offset(label))
+        .transpose()?;
+    let v6_loop_scan_displacement = v6_loop_scan_displacement_label
+        .map(|label| finished.label_offset(label))
+        .transpose()?;
     let continuation_identity_displacement = continuation_identity_displacement_label
         .map(|label| finished.label_offset(label))
         .transpose()?;
@@ -17208,21 +17284,21 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
             symbol: PREPARED_FALLBACK_RUNTIME_SYMBOL,
             addend: -4,
         },
-        ModuleRelocation {
-            section: TEXT_SECTION,
-            offset: offset_u64(v7_loop_scan_displacement, "x86 V7 loop scan relocation")?,
-            kind: RelocationKind::X86PltRelative32,
-            symbol: DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL,
-            addend: -4,
-        },
-        ModuleRelocation {
-            section: TEXT_SECTION,
-            offset: offset_u64(v6_loop_scan_displacement, "x86 V6 loop scan relocation")?,
-            kind: RelocationKind::X86PltRelative32,
-            symbol: DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL,
-            addend: -4,
-        },
     ];
+    for (displacement, context) in [
+        (v7_loop_scan_displacement, "x86 V7 loop scan relocation"),
+        (v6_loop_scan_displacement, "x86 V6 loop scan relocation"),
+    ] {
+        if let Some(displacement) = displacement {
+            relocations.push(ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(displacement, context)?,
+                kind: RelocationKind::X86PltRelative32,
+                symbol: DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL,
+                addend: -4,
+            });
+        }
+    }
     if let (Some(identity), Some(continuation)) = (
         continuation_identity_displacement,
         continuation_displacement,
@@ -24696,12 +24772,41 @@ fn lower_aarch64_dynamic_rows_prepared_for_output(
     clippy::too_many_lines,
     reason = "the authenticated preflight, scanner, local exits, and whole-search deopt form one ABI transaction"
 )]
+#[cfg(test)]
 fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     root_plan: Option<Aarch64DynamicScannerPlan>,
     output: OutputContract,
     exact_span_width: Option<u64>,
     allow_direct_hole_continuation: bool,
     direct_byte_formats_possible: bool,
+) -> Result<NativeDynamicRowsEmission, ObjectError> {
+    let immutable_compact_possible =
+        !(output == OutputContract::Span && exact_span_width.is_none());
+    let supertransitions_possible = immutable_compact_possible && root_plan.is_none();
+    lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
+        root_plan,
+        output,
+        exact_span_width,
+        allow_direct_hole_continuation,
+        direct_byte_formats_possible,
+        immutable_compact_possible,
+        supertransitions_possible,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the authenticated preflight, scanner, local exits, and whole-search deopt form one ABI transaction"
+)]
+fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
+    root_plan: Option<Aarch64DynamicScannerPlan>,
+    output: OutputContract,
+    exact_span_width: Option<u64>,
+    allow_direct_hole_continuation: bool,
+    direct_byte_formats_possible: bool,
+    immutable_compact_possible: bool,
+    supertransitions_possible: bool,
 ) -> Result<NativeDynamicRowsEmission, ObjectError> {
     const SCANNER_FREE_FRAME_BYTES: u16 = 96;
     const ROOT_SCANNER_FRAME_BYTES: u16 = 112;
@@ -24750,7 +24855,14 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
         .checked_sub(8)
         .ok_or(ObjectError::ArithmeticOverflow("AArch64 dynamic link offset"))?;
     let variable_span_recovery = output == OutputContract::Span && exact_span_width.is_none();
-    let pair_supertransition_possible = root_plan.is_none() && !variable_span_recovery;
+    if immutable_compact_possible != !variable_span_recovery
+        || supertransitions_possible && (!immutable_compact_possible || root_plan.is_some())
+    {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 dynamic compact capabilities are semantically inconsistent",
+        ));
+    }
+    let pair_supertransition_possible = supertransitions_possible;
     if (output != OutputContract::Span && exact_span_width.is_some())
         || exact_span_width == Some(0)
     {
@@ -24924,6 +25036,9 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     // SP+88.
     assembler.instruction(aarch64_store_x(6, 31, 80)?)?;
 
+    // Keep the complete V3--V14 selector lattice out of machine code when
+    // target-neutral output semantics make every immutable format impossible.
+    if immutable_compact_possible {
     if output == OutputContract::Exists {
         aarch64_emit_frozen_compact_v5_entry(
             &mut assembler,
@@ -25031,6 +25146,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
         v3_enter,
         FrozenCompactGuardMode::ActiveCapability,
     )?;
+    }
     assembler.bind(try_v2)?;
     if root_plan.is_none() {
         // Only a seal/identity-authenticated active compact capability may
@@ -25084,6 +25200,11 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     assembler.instruction(aarch64_add_x_imm(31, 31, frame_bytes)?)?;
     assembler.instruction(0xd65f_03c0)?;
 
+    let mut v7_loop_scan_branch = None;
+    let mut v6_loop_scan_branch = None;
+    // Bodies share the selector's compile-time gate so unreachable labels do
+    // not leave cold decoder or helper-call bytes in a variable-Span entry.
+    if immutable_compact_possible {
     assembler.bind(v5_enter)?;
     if output == OutputContract::Exists {
         // W7 is the authenticated one-based first accepting step. Zero means
@@ -25641,7 +25762,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     // and exact plan/key proof above are the safety boundary.
     assembler.instruction(aarch64_add_x_reg(0, 0, 2)?)?;
     assembler.instruction(aarch64_mov_x(2, 12)?)?;
-    let v7_loop_scan_branch = assembler.instruction(0x9400_0000)?;
+    v7_loop_scan_branch = Some(assembler.instruction(0x9400_0000)?);
     assembler.instruction(aarch64_mov_x(10, 0)?)?;
     assembler.instruction(aarch64_load_x_imm(11, 31, 0)?)?;
     assembler.instruction(aarch64_load_x_imm(2, 31, 8)?)?;
@@ -25843,7 +25964,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     // Keep the same direct-pointer V2 register contract in the V6 body.
     assembler.instruction(aarch64_add_x_reg(0, 0, 2)?)?;
     assembler.instruction(aarch64_mov_x(2, 12)?)?;
-    let v6_loop_scan_branch = assembler.instruction(0x9400_0000)?;
+    v6_loop_scan_branch = Some(assembler.instruction(0x9400_0000)?);
     assembler.instruction(aarch64_mov_x(10, 0)?)?;
     assembler.instruction(aarch64_load_x_imm(11, 31, 0)?)?;
     assembler.instruction(aarch64_load_x_imm(2, 31, 8)?)?;
@@ -26509,6 +26630,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
         assembler.branch(native_complete.unwrap_or(native_no_match))?;
     }
 
+    }
     assembler.bind(preflight_enter)?;
     // Preserve the exact preflight window in the ordinary helper arguments;
     // the continuation record later reuses the preflight stack slots.
@@ -26781,6 +26903,9 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
             31,
             ROOT_SCANNER_REPRESENTATION_OFFSET,
         )?)?;
+        // A root can still accelerate mutable V1 rows. Compact representation
+        // tags are meaningful only when their bodies were emitted above.
+        if immutable_compact_possible {
         assembler.instruction(aarch64_cmp_x_imm(8, ROOT_SCANNER_COMPACT_V7)?)?;
         assembler.branch_cond(AARCH64_EQ, v7_candidate)?;
         assembler.instruction(aarch64_cmp_x_imm(8, ROOT_SCANNER_COMPACT_V6)?)?;
@@ -26805,6 +26930,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
         assembler.branch_cond(AARCH64_EQ, v4_candidate)?;
         assembler.instruction(aarch64_cmp_x_imm(8, ROOT_SCANNER_COMPACT_V3)?)?;
         assembler.branch_cond(AARCH64_EQ, v3_candidate)?;
+        }
         if tracks_root_scanner_hits {
             assembler.instruction(aarch64_add_x_imm(19, 19, 1)?)?;
         }
@@ -26823,6 +26949,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
         )?)?;
         assembler.branch(table_scan)?;
 
+        if immutable_compact_possible {
         assembler.bind(v7_candidate)?;
         assembler.instruction(aarch64_load_x_imm(8, 31, 0)?)?;
         assembler.instruction(aarch64_add_x_imm(
@@ -26964,6 +27091,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
                 .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 V3 candidate shift"))?,
         )?)?;
         assembler.branch(v3_dispatch)?;
+        }
     }
 
     assembler.bind(table_scan)?;
@@ -27427,9 +27555,21 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
         preflight_branch,
         deopt_branch,
         fallback_branch,
-        v7_loop_scan_branch,
-        v6_loop_scan_branch,
     ];
+    let loop_scan_relocation_base =
+        if let (Some(v7_branch), Some(v6_branch)) =
+            (v7_loop_scan_branch, v6_loop_scan_branch)
+        {
+            let base = relocation_offsets.len();
+            relocation_offsets.extend_from_slice(&[v7_branch, v6_branch]);
+            Some(base)
+        } else if v7_loop_scan_branch.is_some() || v6_loop_scan_branch.is_some() {
+            return Err(ObjectError::InvalidModule(
+                "AArch64 dynamic loop-scan relocation set is incomplete",
+            ));
+        } else {
+            None
+        };
     let continuation_relocation_base = if let (Some(identity_page), Some(identity_offset), Some(branch)) = (
         continuation_identity_page,
         continuation_identity_page_offset,
@@ -27496,21 +27636,36 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
                 symbol: PREPARED_FALLBACK_RUNTIME_SYMBOL,
                 addend: 0,
             },
-            ModuleRelocation {
-                section: TEXT_SECTION,
-                offset: offset_u64(relocation_offsets[5], "AArch64 V7 loop scan branch")?,
-                kind: RelocationKind::Aarch64Branch26,
-                symbol: DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL,
-                addend: 0,
-            },
-            ModuleRelocation {
-                section: TEXT_SECTION,
-                offset: offset_u64(relocation_offsets[6], "AArch64 V6 loop scan branch")?,
-                kind: RelocationKind::Aarch64Branch26,
-                symbol: DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL,
-                addend: 0,
-            },
     ];
+    if let Some(base) = loop_scan_relocation_base {
+        let end = base
+            .checked_add(2)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "AArch64 dynamic loop-scan relocation indices",
+            ))?;
+        let &[v7_branch, v6_branch] = relocation_offsets
+            .get(base..end)
+            .ok_or(ObjectError::InvalidModule(
+                "AArch64 dynamic loop-scan relocation offsets are absent",
+            ))?
+        else {
+            return Err(ObjectError::InvalidModule(
+                "AArch64 dynamic loop-scan relocation offsets are malformed",
+            ));
+        };
+        for (branch, context) in [
+            (v7_branch, "AArch64 V7 loop scan branch"),
+            (v6_branch, "AArch64 V6 loop scan branch"),
+        ] {
+            relocations.push(ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(branch, context)?,
+                kind: RelocationKind::Aarch64Branch26,
+                symbol: DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL,
+                addend: 0,
+            });
+        }
+    }
     if let Some(base) = continuation_relocation_base {
         let end = base
             .checked_add(3)
@@ -28846,18 +29001,23 @@ mod tests {
             ("avx2", FeatureSet::of(CpuFeature::X86Avx2)),
             ("avx512", avx512),
         ] {
-            for output in [
-                OutputContract::Exists,
-                OutputContract::SelectedEnd,
-                OutputContract::Span,
+            for (output, exact_span_width) in [
+                (OutputContract::Exists, None),
+                (OutputContract::SelectedEnd, None),
+                (OutputContract::Span, Some(2)),
             ] {
                 let emission = lower_x86_64_dynamic_rows_prepared_for_output(
-                    None, features, output, None, true,
+                    None,
+                    features,
+                    output,
+                    exact_span_width,
+                    true,
                 )
                 .unwrap();
                 let code = emission.code.as_slice();
-                let context = format!("x86/{tier}/{output:?}");
-                let supertransitions = output != OutputContract::Span;
+                let context = format!("x86/{tier}/{output:?}/width={exact_span_width:?}");
+                let supertransitions =
+                    !(output == OutputContract::Span && exact_span_width.is_none());
                 assert_eq!(byte_occurrences(code, &x86_pair_guard), 20, "{context}");
                 assert_eq!(
                     byte_occurrences(code, &x86_second_byte),
@@ -28942,7 +29102,7 @@ mod tests {
                     Some(x86_root),
                     features,
                     output,
-                    None,
+                    exact_span_width,
                     true,
                 )
                 .unwrap();
@@ -28969,18 +29129,22 @@ mod tests {
             Target::aarch64_linux(),
         )
         .unwrap();
-        for output in [
-            OutputContract::Exists,
-            OutputContract::SelectedEnd,
-            OutputContract::Span,
+        for (output, exact_span_width) in [
+            (OutputContract::Exists, None),
+            (OutputContract::SelectedEnd, None),
+            (OutputContract::Span, Some(2)),
         ] {
             let emission = lower_aarch64_dynamic_rows_prepared_for_output(
-                None, output, None, true,
+                None,
+                output,
+                exact_span_width,
+                true,
             )
             .unwrap();
             let words = aarch64_words(&emission.code);
-            let context = format!("AArch64/{output:?}");
-            let supertransitions = output != OutputContract::Span;
+            let context = format!("AArch64/{output:?}/width={exact_span_width:?}");
+            let supertransitions =
+                !(output == OutputContract::Span && exact_span_width.is_none());
             let guards = words
                 .windows(arm_pair_guard.len())
                 .enumerate()
@@ -29049,7 +29213,7 @@ mod tests {
             let rooted = lower_aarch64_dynamic_rows_prepared_for_output(
                 Some(arm_root),
                 output,
-                None,
+                exact_span_width,
                 true,
             )
             .unwrap();
@@ -34865,7 +35029,61 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one cross-ISA audit proves variable Span code DCE and fixed-width preservation"
+    )]
     fn dynamic_variable_span_codegen_calls_recovery_on_both_architectures() {
+        fn byte_occurrences(code: &[u8], needle: &[u8]) -> usize {
+            code.windows(needle.len())
+                .filter(|window| *window == needle)
+                .count()
+        }
+
+        fn word_occurrences(words: &[u32], needle: &[u32]) -> usize {
+            words
+                .windows(needle.len())
+                .filter(|window| *window == needle)
+                .count()
+        }
+
+        const COMPACT_FLAGS: [u32; 12] = [
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3,
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V4,
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V5,
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V6,
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V7,
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V8,
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V9,
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V10,
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V11,
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V12,
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V13,
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V14,
+        ];
+
+        let x86_flag = |flag: u32| {
+            let mut selector = vec![
+                0x81,
+                0x7f,
+                u8::try_from(FROZEN_PREPARED_HEADER_V1_FLAGS_OFFSET).unwrap(),
+            ];
+            selector.extend_from_slice(&flag.to_le_bytes());
+            selector
+        };
+        let arm_flag = |flag: u32| {
+            [
+                aarch64_load_w_imm(
+                    8,
+                    0,
+                    u16::try_from(FROZEN_PREPARED_HEADER_V1_FLAGS_OFFSET).unwrap(),
+                )
+                .unwrap(),
+                aarch64_movz_x(9, u16::try_from(flag).unwrap(), 0).unwrap(),
+                aarch64_cmp_w(8, 9).unwrap(),
+            ]
+        };
+
         let x86 = lower_x86_64_dynamic_rows_prepared_for_output(
             None,
             FeatureSet::of(CpuFeature::X86Avx2),
@@ -34902,6 +35120,41 @@ mod tests {
         assert_eq!(recovery.addend, -4);
         let recovery_offset = usize::try_from(recovery.offset).unwrap();
         assert_eq!(x86.code[recovery_offset - 1], 0xe8);
+        assert_eq!(
+            x86.relocations
+                .iter()
+                .filter(|relocation| relocation.symbol == DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL)
+                .count(),
+            0,
+            "variable Span has no immutable V6/V7 loop bodies"
+        );
+        for flag in COMPACT_FLAGS {
+            assert_eq!(
+                byte_occurrences(&x86.code, &x86_flag(flag)),
+                0,
+                "x86 variable Span retained compact flag {flag:#x}"
+            );
+        }
+        assert_eq!(
+            byte_occurrences(
+                &x86.code,
+                &[
+                    0x48, 0x89, 0xc8, // remaining = end
+                    0x48, 0xff, 0xc8, // remaining - 1
+                    0x48, 0x39, 0xc2, // position vs final pair start
+                ],
+            ),
+            0,
+            "x86 variable Span retained paired compact bodies"
+        );
+        assert_eq!(
+            byte_occurrences(
+                &x86.code,
+                &x86_flag(FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS),
+            ),
+            1,
+            "x86 variable Span retains the ordinary V1/V2 entry"
+        );
 
         let arm = lower_aarch64_dynamic_rows_prepared_for_output(
             None,
@@ -34942,9 +35195,118 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(instruction & 0xfc00_0000, 0x9400_0000);
+        assert_eq!(
+            arm.relocations
+                .iter()
+                .filter(|relocation| relocation.symbol == DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL)
+                .count(),
+            0,
+            "variable Span has no immutable V6/V7 loop bodies"
+        );
+        let arm_words = arm
+            .code
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        for flag in COMPACT_FLAGS {
+            assert_eq!(
+                word_occurrences(&arm_words, &arm_flag(flag)),
+                0,
+                "AArch64 variable Span retained compact flag {flag:#x}"
+            );
+        }
+        assert_eq!(
+            word_occurrences(
+                &arm_words,
+                &[
+                    aarch64_sub_x_imm(9, 3, 1).unwrap(),
+                    aarch64_cmp_x(2, 9).unwrap(),
+                ],
+            ),
+            0,
+            "AArch64 variable Span retained paired compact bodies"
+        );
+        let arm_v2_flag = [
+            aarch64_load_w_imm(
+                9,
+                0,
+                u16::try_from(FROZEN_PREPARED_HEADER_V1_FLAGS_OFFSET).unwrap(),
+            )
+            .unwrap(),
+            aarch64_movz_x(
+                8,
+                u16::try_from(FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS).unwrap(),
+                0,
+            )
+            .unwrap(),
+            aarch64_cmp_w(9, 8).unwrap(),
+        ];
+        assert_eq!(
+            word_occurrences(&arm_words, &arm_v2_flag),
+            1,
+            "AArch64 variable Span retains the ordinary V1/V2 entry"
+        );
+
+        // A graph root still scans candidates for the ordinary mutable V1
+        // rows, but it must not retain representation tags whose immutable
+        // compact bodies cannot preserve a variable-width Span start.
+        let filter = dynamic_root_test_filter(b"a", 0);
+        let rooted_x86 = lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
+            Some(X86DynamicRootPlan::Range(filter)),
+            FeatureSet::of(CpuFeature::X86Avx2),
+            OutputContract::Span,
+            None,
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            byte_occurrences(
+                &rooted_x86.code,
+                &[
+                    0x48, 0x8b, 0x44, 0x24, 112, // invocation representation
+                    0x49, 0xff, 0xc4, // scanner-hit accounting
+                ],
+            ),
+            1,
+            "x86 variable Span must have no compact tag dispatch between representation load and V1 accounting"
+        );
+        let mut arm_data = vec![0_u8; 32];
+        let arm_root = install_aarch64_dynamic_root_plan(
+            &mut arm_data,
+            0,
+            filter,
+            Target::aarch64_linux(),
+        )
+        .unwrap();
+        let rooted_arm = lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
+            Some(Aarch64DynamicScannerPlan::Range(arm_root)),
+            OutputContract::Span,
+            None,
+            true,
+            true,
+        )
+        .unwrap();
+        let rooted_arm_words = rooted_arm
+            .code
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            word_occurrences(
+                &rooted_arm_words,
+                &[
+                    aarch64_load_x_imm(8, 31, 88).unwrap(),
+                    aarch64_add_x_imm(19, 19, 1).unwrap(),
+                ],
+            ),
+            1,
+            "AArch64 variable Span must have no compact tag dispatch between representation load and V1 accounting"
+        );
 
         // Established fixed-width Span lowering remains self-contained and
-        // has no dependency on the new postflight symbol.
+        // has no dependency on the new postflight symbol. Its compact rows
+        // and V6/V7 loop helpers remain available.
         let exact_x86 = lower_x86_64_dynamic_rows_prepared_for_output(
             None,
             FeatureSet::of(CpuFeature::X86Avx2),
@@ -34964,6 +35326,240 @@ mod tests {
             assert!(emission.relocations.iter().all(|relocation| {
                 relocation.symbol != DYNAMIC_ROWS_SPAN_RECOVERY_RUNTIME_SYMBOL
             }));
+            assert_eq!(
+                emission
+                    .relocations
+                    .iter()
+                    .filter(|relocation| {
+                        relocation.symbol == DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL
+                    })
+                    .count(),
+                2
+            );
+        }
+        assert_eq!(
+            byte_occurrences(
+                &exact_x86.code,
+                &x86_flag(FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3),
+            ),
+            1
+        );
+        let exact_arm_words = exact_arm
+            .code
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            word_occurrences(
+                &exact_arm_words,
+                &arm_flag(FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3),
+            ),
+            1
+        );
+        assert!(x86.code.len() < exact_x86.code.len());
+        assert!(arm.code.len() < exact_arm.code.len());
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the target-neutral semantic capability must be audited through both backends"
+    )]
+    fn semantic_root_without_backend_plan_omits_supertransitions_cross_isa() {
+        fn byte_occurrences(code: &[u8], needle: &[u8]) -> usize {
+            code.windows(needle.len())
+                .filter(|window| *window == needle)
+                .count()
+        }
+
+        fn word_occurrences(words: &[u32], needle: &[u32]) -> usize {
+            words
+                .windows(needle.len())
+                .filter(|window| *window == needle)
+                .count()
+        }
+
+        let semantic_root_view = NativeDynamicRowsProgramView {
+            output: OutputContract::Exists,
+            exact_match_width: None,
+            artifact_identity: [0x5a; 32],
+            source_class_count: 256,
+            // An empty exact graph column has semantic root ownership but no
+            // moving backend scanner to install. Supertransition legality is
+            // derived from this semantic requirement, not installation.
+            root_requirement: Some(NativeDynamicRootRequirement {
+                scan_offset: 0,
+                membership: [0; 4],
+            }),
+        };
+        let scanner_free_view = NativeDynamicRowsProgramView {
+            root_requirement: None,
+            ..semantic_root_view
+        };
+        let variable_span_view = NativeDynamicRowsProgramView {
+            output: OutputContract::Span,
+            exact_match_width: None,
+            root_requirement: None,
+            ..semantic_root_view
+        };
+
+        for target in [
+            Target::x86_64_linux(),
+            Target::x86_64_macos(),
+            Target::aarch64_linux(),
+            Target::aarch64_macos(),
+        ] {
+            let (semantic_root, semantic_layout) = lower_native_dynamic_rows_prepared(
+                Vec::new(),
+                semantic_root_view,
+                target,
+            )
+            .unwrap();
+            assert_eq!(semantic_root.start_accelerator, StartAccelerator::None);
+            let semantic_code = &semantic_root.code[semantic_layout.code_offset
+                ..semantic_layout.code_offset + semantic_layout.code_size];
+            let (scanner_free, scanner_free_layout) = lower_native_dynamic_rows_prepared(
+                Vec::new(),
+                scanner_free_view,
+                target,
+            )
+            .unwrap();
+            let scanner_free_code = &scanner_free.code[scanner_free_layout.code_offset
+                ..scanner_free_layout.code_offset + scanner_free_layout.code_size];
+            let (variable_span, variable_span_layout) = lower_native_dynamic_rows_prepared(
+                Vec::new(),
+                variable_span_view,
+                target,
+            )
+            .unwrap();
+            let variable_span_code = &variable_span.code[variable_span_layout.code_offset
+                ..variable_span_layout.code_offset + variable_span_layout.code_size];
+            assert!(variable_span_layout.span_recovery);
+            assert_eq!(
+                variable_span
+                    .relocations
+                    .iter()
+                    .filter(|relocation| {
+                        relocation.symbol == DYNAMIC_ROWS_SPAN_RECOVERY_RUNTIME_SYMBOL
+                    })
+                    .count(),
+                1,
+                "top-level variable Span recovery: {target:?}"
+            );
+            assert_eq!(
+                variable_span
+                    .relocations
+                    .iter()
+                    .filter(|relocation| {
+                        relocation.symbol == DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL
+                    })
+                    .count(),
+                0,
+                "top-level variable Span loop-body DCE: {target:?}"
+            );
+
+            match target.architecture {
+                Architecture::X86_64 => {
+                    let flag = |flag: u32| {
+                        let mut selector = vec![
+                            0x81,
+                            0x7f,
+                            u8::try_from(FROZEN_PREPARED_HEADER_V1_FLAGS_OFFSET).unwrap(),
+                        ];
+                        selector.extend_from_slice(&flag.to_le_bytes());
+                        selector
+                    };
+                    for supertransition_flag in [
+                        FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V13,
+                        FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V14,
+                    ] {
+                        assert_eq!(
+                            byte_occurrences(semantic_code, &flag(supertransition_flag)),
+                            0,
+                            "semantic root retained x86 supertransition {supertransition_flag:#x}"
+                        );
+                        assert_eq!(
+                            byte_occurrences(scanner_free_code, &flag(supertransition_flag)),
+                            1,
+                            "scanner-free x86 lost supertransition {supertransition_flag:#x}"
+                        );
+                    }
+                    assert_eq!(
+                        byte_occurrences(
+                            semantic_code,
+                            &flag(FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3),
+                        ),
+                        1,
+                        "semantic root must retain ordinary immutable compact rows"
+                    );
+                    assert_eq!(
+                        byte_occurrences(
+                            variable_span_code,
+                            &flag(FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3),
+                        ),
+                        0,
+                        "top-level x86 variable Span retained compact rows"
+                    );
+                }
+                Architecture::Aarch64 => {
+                    let flag = |flag: u32| {
+                        [
+                            aarch64_load_w_imm(
+                                8,
+                                0,
+                                u16::try_from(FROZEN_PREPARED_HEADER_V1_FLAGS_OFFSET).unwrap(),
+                            )
+                            .unwrap(),
+                            aarch64_movz_x(9, u16::try_from(flag).unwrap(), 0).unwrap(),
+                            aarch64_cmp_w(8, 9).unwrap(),
+                        ]
+                    };
+                    let semantic_words = semantic_code
+                        .chunks_exact(4)
+                        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                        .collect::<Vec<_>>();
+                    let scanner_free_words = scanner_free_code
+                        .chunks_exact(4)
+                        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                        .collect::<Vec<_>>();
+                    for supertransition_flag in [
+                        FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V13,
+                        FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V14,
+                    ] {
+                        assert_eq!(
+                            word_occurrences(&semantic_words, &flag(supertransition_flag)),
+                            0,
+                            "semantic root retained AArch64 supertransition {supertransition_flag:#x}"
+                        );
+                        assert_eq!(
+                            word_occurrences(&scanner_free_words, &flag(supertransition_flag)),
+                            1,
+                            "scanner-free AArch64 lost supertransition {supertransition_flag:#x}"
+                        );
+                    }
+                    assert_eq!(
+                        word_occurrences(
+                            &semantic_words,
+                            &flag(FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3),
+                        ),
+                        1,
+                        "semantic root must retain ordinary immutable compact rows"
+                    );
+                    let variable_span_words = variable_span_code
+                        .chunks_exact(4)
+                        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        word_occurrences(
+                            &variable_span_words,
+                            &flag(FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3),
+                        ),
+                        0,
+                        "top-level AArch64 variable Span retained compact rows"
+                    );
+                }
+            }
+            assert!(semantic_code.len() < scanner_free_code.len());
         }
     }
 
@@ -43476,16 +44072,16 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             aarch64_add_x_reg(3, 0, 3).unwrap(),
         ];
 
-        for output in [
-            OutputContract::Exists,
-            OutputContract::SelectedEnd,
-            OutputContract::Span,
+        for (output, exact_span_width) in [
+            (OutputContract::Exists, None),
+            (OutputContract::SelectedEnd, None),
+            (OutputContract::Span, Some(2)),
         ] {
             let x86 = lower_x86_64_dynamic_rows_prepared_for_output(
                 None,
                 FeatureSet::EMPTY,
                 output,
-                None,
+                exact_span_width,
                 true,
             )
             .unwrap();
@@ -43533,7 +44129,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             let arm = lower_aarch64_dynamic_rows_prepared_for_output(
                 None,
                 output,
-                None,
+                exact_span_width,
                 true,
             )
             .unwrap();
@@ -43723,16 +44319,16 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             ),
             (avx512, StartAccelerator::X86Avx512Bw),
         ] {
-            for output in [
-                OutputContract::Exists,
-                OutputContract::SelectedEnd,
-                OutputContract::Span,
+            for (output, exact_span_width) in [
+                (OutputContract::Exists, None),
+                (OutputContract::SelectedEnd, None),
+                (OutputContract::Span, Some(2)),
             ] {
                 let rooted_x86 = lower_x86_64_dynamic_rows_prepared_for_output(
                     Some(root_filter),
                     features,
                     output,
-                    None,
+                    exact_span_width,
                     true,
                 )
                 .unwrap();
@@ -43797,15 +44393,15 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             )
             .unwrap();
             assert_eq!(root.scanner.start_accelerator(), accelerator, "{tier}");
-            for output in [
-                OutputContract::Exists,
-                OutputContract::SelectedEnd,
-                OutputContract::Span,
+            for (output, exact_span_width) in [
+                (OutputContract::Exists, None),
+                (OutputContract::SelectedEnd, None),
+                (OutputContract::Span, Some(2)),
             ] {
                 let rooted_arm = lower_aarch64_dynamic_rows_prepared_for_output(
                     Some(root),
                     output,
-                    None,
+                    exact_span_width,
                     true,
                 )
                 .unwrap();
@@ -43873,16 +44469,16 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             ("avx2", FeatureSet::of(CpuFeature::X86Avx2)),
             ("avx512", avx512),
         ] {
-            for output in [
-                OutputContract::Exists,
-                OutputContract::SelectedEnd,
-                OutputContract::Span,
+            for (output, exact_span_width) in [
+                (OutputContract::Exists, None),
+                (OutputContract::SelectedEnd, None),
+                (OutputContract::Span, Some(2)),
             ] {
                 let emission = lower_x86_64_dynamic_rows_prepared_for_output(
                     None,
                     features,
                     output,
-                    None,
+                    exact_span_width,
                     true,
                 )
                 .unwrap();
@@ -43995,10 +44591,10 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
         let arm_hay_load = aarch64_load_byte_reg(8, 0, 2).unwrap();
         let arm_class_load = aarch64_load_byte_reg(8, 14, 8).unwrap();
         let arm_update = aarch64_add_x_uxtw(11, 15, 8, 1).unwrap();
-        for output in [
-            OutputContract::Exists,
-            OutputContract::SelectedEnd,
-            OutputContract::Span,
+        for (output, exact_span_width) in [
+            (OutputContract::Exists, None),
+            (OutputContract::SelectedEnd, None),
+            (OutputContract::Span, Some(2)),
         ] {
             // Scanner-free AArch64 lowering is deliberately tier-neutral: the
             // same scalar row core is used by scalar, ASIMD, SVE, SVE2, and
@@ -44006,7 +44602,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             let emission = lower_aarch64_dynamic_rows_prepared_for_output(
                 None,
                 output,
-                None,
+                exact_span_width,
                 true,
             )
             .unwrap();
@@ -46953,6 +47549,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
         fn assert_x86_decode_shape(
             code: &[u8],
             output: OutputContract,
+            compact_possible: bool,
             context: &str,
         ) {
             const TOKEN_MASK: [u8; 7] = [0x41, 0x81, 0xe2, 0xff, 0x7f, 0x00, 0x00];
@@ -47032,18 +47629,20 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 }
                 (v3, v4)
             };
+            let expected_v3_decoders = if compact_possible { 19 } else { 0 };
+            let expected_v4_decoders = if compact_possible { 2 } else { 0 };
             assert_eq!(
-                v3_decoders, 19,
-                "{context}: exact V6/V8 and nine V3 decoder count"
+                v3_decoders, expected_v3_decoders,
+                "{context}: exact reachable V6/V8 and V3 decoder count"
             );
             assert_eq!(
-                v4_decoders, 2,
-                "{context}: exact V7/V4 decoder count"
+                v4_decoders, expected_v4_decoders,
+                "{context}: exact reachable V7/V4 decoder count"
             );
             assert_eq!(
                 v3_decoders + v4_decoders,
-                21,
-                "{context}: V8, V7/V4, and all nine V6/V3 loops need twenty-one decoders"
+                expected_v3_decoders + expected_v4_decoders,
+                "{context}: only reachable immutable compact rows retain decoders"
             );
             assert_eq!(
                 code.windows(FORMER_MAX_COMPARE.len())
@@ -47105,6 +47704,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
         fn assert_aarch64_decode_shape(
             code: &[u8],
             output: OutputContract,
+            compact_possible: bool,
             context: &str,
         ) {
             let words = code
@@ -47147,7 +47747,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                         .iter()
                         .filter(|&&word| word == v3_mask || word == v4_mask)
                         .count(),
-                    1,
+                    usize::from(compact_possible),
                     "{context}: only V7 masks its live token to form the loop-index key"
                 );
                 (v3, v4, v7)
@@ -47182,22 +47782,25 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                     .count();
                 (v3, v4, v7)
             };
+            let expected_v3_decoders = if compact_possible { 11 } else { 0 };
+            let expected_v4_decoders = usize::from(compact_possible);
+            let expected_v7_decoders = usize::from(compact_possible);
             assert_eq!(
-                v3_decoders, 11,
-                "{context}: V8, shared V6, and every immediate-shift V3 loop need exact decoders"
+                v3_decoders, expected_v3_decoders,
+                "{context}: reachable V8, shared V6, and V3 loops need exact decoders"
             );
             assert_eq!(
-                v4_decoders, 1,
-                "{context}: V4 needs one direct cell-offset decoder"
+                v4_decoders, expected_v4_decoders,
+                "{context}: reachable V4 needs one direct cell-offset decoder"
             );
             assert_eq!(
-                v7_decoders, 1,
-                "{context}: V7 needs one cell-offset decoder with a separate loop-index key"
+                v7_decoders, expected_v7_decoders,
+                "{context}: reachable V7 needs a separate loop-index decoder"
             );
             assert_eq!(
                 v3_decoders + v4_decoders + v7_decoders,
-                13,
-                "{context}: V8, V7/V4, shared V6, and nine V3 loops need thirteen decoders"
+                expected_v3_decoders + expected_v4_decoders + expected_v7_decoders,
+                "{context}: only reachable immutable compact rows retain decoders"
             );
 
             let v1_mask = aarch64_and_low_w(8, 8, 29).unwrap();
@@ -47238,6 +47841,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
         fn assert_x86_u8_decode_shape(
             code: &[u8],
             output: OutputContract,
+            compact_possible: bool,
             context: &str,
         ) {
             const EXISTS_TEST: [u8; 3] = [0x45, 0x84, 0xd2];
@@ -47284,8 +47888,9 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 count
             };
             assert_eq!(
-                decoders, 10,
-                "{context}: V10 plus nine V12 shifts need ten byte-cell decoders"
+                decoders,
+                if compact_possible { 10 } else { 0 },
+                "{context}: reachable V10 and V12 shifts need byte-cell decoders"
             );
             assert_eq!(
                 code.windows(TOKEN_MASK.len())
@@ -47293,8 +47898,10 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                     .count(),
                 if output == OutputContract::Exists {
                     0
-                } else {
+                } else if compact_possible {
                     10
+                } else {
+                    0
                 },
                 "{context}: byte-token masks belong only to endpoint contracts"
             );
@@ -47303,6 +47910,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
         fn assert_aarch64_u8_decode_shape(
             code: &[u8],
             output: OutputContract,
+            compact_possible: bool,
             context: &str,
         ) {
             let words = code
@@ -47332,15 +47940,18 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                     .count()
             };
             assert_eq!(
-                decoders, 10,
-                "{context}: V10 plus nine V12 shifts need ten byte-cell decoders"
+                decoders,
+                if compact_possible { 10 } else { 0 },
+                "{context}: reachable V10 and V12 shifts need byte-cell decoders"
             );
             assert_eq!(
                 words.iter().filter(|&&word| word == token_mask).count(),
                 if output == OutputContract::Exists {
                     0
-                } else {
+                } else if compact_possible {
                     10
+                } else {
+                    0
                 },
                 "{context}: byte-token masks belong only to endpoint contracts"
             );
@@ -47450,6 +48061,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             (OutputContract::Span, None),
         ] {
             let context = format!("{output:?}/width={exact_span_width:?}");
+            let compact_possible =
+                !(output == OutputContract::Span && exact_span_width.is_none());
             let x86 = lower_x86_64_dynamic_rows_prepared_for_output(
                 Some(root_filter),
                 FeatureSet::EMPTY,
@@ -47458,8 +48071,18 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 true,
             )
             .unwrap();
-            assert_x86_decode_shape(&x86.code, output, &context);
-            assert_x86_u8_decode_shape(&x86.code, output, &context);
+            assert_x86_decode_shape(&x86.code, output, compact_possible, &context);
+            assert_x86_u8_decode_shape(&x86.code, output, compact_possible, &context);
+            assert_eq!(
+                x86.relocations
+                    .iter()
+                    .filter(|relocation| {
+                        relocation.symbol == DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL
+                    })
+                    .count(),
+                if compact_possible { 2 } else { 0 },
+                "x86/{context}: loop helper relocations follow compact reachability"
+            );
 
             let arm = lower_aarch64_dynamic_rows_prepared_for_output(
                 Some(arm_root),
@@ -47468,8 +48091,18 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 true,
             )
             .unwrap();
-            assert_aarch64_decode_shape(&arm.code, output, &context);
-            assert_aarch64_u8_decode_shape(&arm.code, output, &context);
+            assert_aarch64_decode_shape(&arm.code, output, compact_possible, &context);
+            assert_aarch64_u8_decode_shape(&arm.code, output, compact_possible, &context);
+            assert_eq!(
+                arm.relocations
+                    .iter()
+                    .filter(|relocation| {
+                        relocation.symbol == DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL
+                    })
+                    .count(),
+                if compact_possible { 2 } else { 0 },
+                "AArch64/{context}: loop helper relocations follow compact reachability"
+            );
         }
     }
 
