@@ -2061,7 +2061,10 @@ mod folded_long_tail_tests {
             .trie
             .root_candidate_single_pass_upper_bounds(64, required_width)
             .unwrap();
-        assert_eq!(guarded_single.source_byte_reads, 2 * guarded_single.input_bytes);
+        assert_eq!(
+            guarded_single.source_byte_reads,
+            2 * guarded_single.input_bytes + 2
+        );
         assert_eq!(
             guarded_single.work,
             guarded_single.candidate_starts + guarded_single.source_byte_reads
@@ -3215,6 +3218,36 @@ mod folded_long_tail_tests {
             later.receipt.actual.work,
             2 + BYTE_BUCKET_BLOCK_BYTES
         );
+    }
+
+    #[test]
+    fn guarded_root_settles_first_start_before_the_unchanged_scanner() {
+        let (_, accelerated) = wide_primary_guard_plans();
+        let tail = accelerated.folded_long_tail.as_deref().unwrap();
+        let input_bytes = folded_short_minimum_bytes(tail).unwrap();
+        let window = Window::new(7, 7 + input_bytes);
+        let upper = tail
+            .trie
+            .root_candidate_single_pass_upper_bounds(input_bytes, tail.max_pattern_bytes)
+            .unwrap();
+        assert_eq!(upper.source_byte_reads, 2 * input_bytes + 2);
+
+        let mut source = vec![b'z'; window.end()];
+        source[window.start()] = 0x1c;
+        source[window.start() + 1] = b' ';
+        let first = tail
+            .trie
+            .find_root_candidate_precharged(&source, window, upper)
+            .unwrap();
+        assert_eq!(
+            first.outcome,
+            RootCandidateOutcome::Candidate {
+                start: window.start(),
+            }
+        );
+        assert_eq!(first.receipt.actual.source_byte_reads, 2);
+        assert_eq!(first.receipt.actual.candidate_starts, 1);
+        assert_eq!(first.receipt.actual.work, 3);
     }
 
     #[test]

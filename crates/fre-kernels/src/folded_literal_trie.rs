@@ -914,8 +914,8 @@ impl FoldedLiteralTriePlan {
     /// Derive the exact linear envelope for one necessary-root pass.
     ///
     /// The primary classifier reads each source byte at most once, and a
-    /// retained guard reads at most one byte for each primary position. An
-    /// unguarded root may also read its first exact start once before the
+    /// retained guard reads at most one byte for each primary position. The
+    /// fixed columns at the first exact start may also be read once before the
     /// classifier. The attaching matcher has already authenticated that every
     /// retained fixed column is necessary and lies within `max_pattern_bytes`.
     pub(crate) fn root_candidate_single_pass_upper_bounds(
@@ -942,7 +942,7 @@ impl FoldedLiteralTriePlan {
             .ok_or(ScanError::ArithmeticOverflow {
                 computation: "folded root-candidate source passes",
             })?;
-        let root_start_probe_reads = usize::from(!prefilter.has_guard());
+        let root_start_probe_reads = source_passes;
         let source_byte_reads = input_bytes
             .checked_mul(source_passes)
             .and_then(|reads| reads.checked_add(root_start_probe_reads))
@@ -1748,14 +1748,20 @@ fn execute_root_candidate_find(
         ..ScanActual::default()
     };
     // The wide classifier reports even lane zero only after classifying its
-    // complete first block. Settle that exact start scalarly when no guard is
-    // required. A rejection deliberately leaves the original source and its
-    // alignment unchanged for the existing full-window scanner.
-    if !prefilter.has_guard()
-        && let Some(&primary_byte) = source.get(usize::from(prefilter.offset))
-    {
+    // complete first block. Settle that exact start from the retained one or
+    // two necessary columns. A rejection deliberately leaves the original
+    // source and its alignment unchanged for the existing full-window scanner.
+    if let Some(&primary_byte) = source.get(usize::from(prefilter.offset)) {
         actual.source_byte_reads = 1;
-        if prefilter.primary_matches(primary_byte) {
+        let mut qualified = prefilter.primary_matches(primary_byte);
+        if qualified && prefilter.has_guard() {
+            qualified = false;
+            if let Some(&guard_byte) = source.get(usize::from(prefilter.guard_offset)) {
+                actual.source_byte_reads = 2;
+                qualified = prefilter.guard_matches(guard_byte);
+            }
+        }
+        if qualified {
             actual.candidate_starts = 1;
             return Ok((
                 RootCandidateOutcome::Candidate {
