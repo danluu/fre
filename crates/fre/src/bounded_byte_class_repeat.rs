@@ -139,6 +139,22 @@ impl Plan {
         Ok((matched, accounting))
     }
 
+    pub(crate) fn is_match_window_value(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<bool, SearchError> {
+        if limits == SearchLimits::unlimited() {
+            validate_window(haystack, window)?;
+            if unmetered_work_fits(window) {
+                return Ok(self.qualifying_search_value(haystack, window).is_some());
+            }
+        }
+        self.is_match_window(haystack, window, limits)
+            .map(|(matched, _)| matched)
+    }
+
     pub(crate) fn earliest_end_window(
         &self,
         haystack: &[u8],
@@ -156,6 +172,24 @@ impl Plan {
             usize::from(end.is_some()),
         );
         Ok((end, accounting))
+    }
+
+    pub(crate) fn earliest_end_window_value(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<Option<usize>, SearchError> {
+        if limits == SearchLimits::unlimited() {
+            validate_window(haystack, window)?;
+            if unmetered_work_fits(window) {
+                return Ok(self
+                    .qualifying_search_value(haystack, window)
+                    .map(|qualified| qualified.minimum_end));
+            }
+        }
+        self.earliest_end_window(haystack, window, limits)
+            .map(|(end, _)| end)
     }
 
     pub(crate) fn selected_end_window(
@@ -177,6 +211,53 @@ impl Plan {
     ) -> Result<(Option<Match>, Accounting), SearchError> {
         let (span, accounting) = self.selected_window(haystack, window, limits, Operation::Span)?;
         Ok((span.map(|(start, end)| Match { start, end }), accounting))
+    }
+
+    pub(crate) fn find_window_value(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<Option<Match>, SearchError> {
+        if limits == SearchLimits::unlimited() {
+            validate_window(haystack, window)?;
+            if unmetered_work_fits(window) {
+                return Ok(self
+                    .selected_search_value(haystack, window)
+                    .map(|(start, end)| Match { start, end }));
+            }
+        }
+        self.find_window(haystack, window, limits)
+            .map(|(matched, _)| matched)
+    }
+
+    fn selected_search_value(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+    ) -> Option<(usize, usize)> {
+        let qualified = self.qualifying_search_value(haystack, window)?;
+        let owner = self.owner();
+        if !owner.greedy {
+            return Some((qualified.start, qualified.minimum_end));
+        }
+        let maximum = usize::try_from(owner.maximum)
+            .expect("one repetition maximum fits the target index width");
+        let maximum_end = qualified.start.saturating_add(maximum).min(window.end());
+        let end = if qualified.minimum_end < maximum_end {
+            owner
+                .run_end_seek
+                .seek_unmetered(
+                    haystack,
+                    qualified.minimum_end,
+                    maximum_end,
+                    owner.classifier.as_ref(),
+                )
+                .unwrap_or(maximum_end)
+        } else {
+            maximum_end
+        };
+        Some((qualified.start, end))
     }
 
     #[inline(never)]
@@ -303,6 +384,47 @@ impl Plan {
         }
     }
 
+    fn qualifying_search_value(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+    ) -> Option<Qualified> {
+        let owner = self.owner();
+        let minimum = usize::try_from(owner.minimum)
+            .expect("one repetition minimum fits the target index width");
+        let mut position = window.start();
+        loop {
+            let start = owner.member_seek.seek_unmetered(
+                haystack,
+                position,
+                window.end(),
+                owner.classifier.as_ref(),
+            )?;
+            if window.end().saturating_sub(start) < minimum {
+                return None;
+            }
+            let minimum_end = start
+                .checked_add(minimum)
+                .expect("the remaining-window proof bounds the minimum end");
+            if minimum > 1
+                && let Some(run_end) = owner.run_end_seek.seek_unmetered(
+                    haystack,
+                    start
+                        .checked_add(1)
+                        .expect("a member before the window end can advance once"),
+                    minimum_end,
+                    owner.classifier.as_ref(),
+                )
+            {
+                position = run_end
+                    .checked_add(1)
+                    .expect("a nonmember before the window end can advance once");
+                continue;
+            }
+            return Some(Qualified { start, minimum_end });
+        }
+    }
+
     #[inline(never)]
     fn finish_accounting(
         &self,
@@ -336,6 +458,18 @@ impl Plan {
             match_events,
         }
     }
+}
+
+fn unmetered_work_fits(window: SearchWindow) -> bool {
+    let window_width = window
+        .end()
+        .checked_sub(window.start())
+        .expect("a validated window has ordered bounds");
+    u64::try_from(window_width).ok().is_some_and(|width| {
+        width
+            .checked_mul(u64::try_from(BYTE_SET_BLOCK_BYTES).expect("block width fits u64"))
+            .is_some()
+    })
 }
 
 impl Inspection {
@@ -467,12 +601,12 @@ fn charge_planner(work: &mut u64, additional: u64, limit: u64) -> Result<(), Ins
 
 #[cfg(test)]
 mod tests {
-    use super::PLAN_ID;
+    use super::{BYTE_SET_BLOCK_BYTES, PLAN_ID};
     use crate::pure_byte_class_repeat::SetSeek;
     use crate::{
         BuildError, BuildLimits, PlanKind, PlanSelection, PortableBuilder, PortableFindIterLimits,
-        PortablePlan, PortableTextBuilder, SearchAccounting, SearchError as FacadeSearchError,
-        SearchLimits, SearchWindow,
+        PortableFindIterRunLimits, PortablePlan, PortableTextBuilder, SearchAccounting,
+        SearchError as FacadeSearchError, SearchLimits, SearchSessionLimits, SearchWindow,
     };
     use crate::{
         PureByteClassRepeatAccounting as Accounting, PureByteClassRepeatOperation as Operation,
@@ -624,9 +758,15 @@ mod tests {
             "(?-u:[\\x80-\\xff]){2,5}",
             "(?-u:[\\x80-\\xff]){2,5}?",
             "(?-u:[^\\x80-\\xff]){3,5}",
+            "(?-u:[ac]){2,4}",
+            "(?-u:[ac]){2,4}?",
+            "(?-u:[ace]){2,4}",
+            "(?-u:[ace]){2,4}?",
+            "(?-u:[abdz]){2,4}",
+            "(?-u:[abdz]){2,4}?",
             "(?s-u:.){2,4}",
         ];
-        let alphabet = [b'a', b'b', b'd', 0x80_u8];
+        let alphabet = [b'a', b'b', b'c', b'd', 0x80_u8];
         for pattern in patterns {
             let fre = build(pattern);
             let oracle = regex::bytes::RegexBuilder::new(pattern)
@@ -636,6 +776,9 @@ mod tests {
             let PortablePlan::BoundedByteClassRepeat(plan) = &fre.plan else {
                 panic!("expected bounded plan for {pattern:?}");
             };
+            let mut session = fre
+                .search_session(SearchSessionLimits::unlimited())
+                .expect("the native bounded session should build");
             for length in 0_u32..=4 {
                 let cases = alphabet.len().pow(length);
                 for encoded in 0..cases {
@@ -673,6 +816,16 @@ mod tests {
                             assert!(
                                 exists_accounting.actual_work <= exists_accounting.work_upper_bound
                             );
+                            assert_eq!(
+                                fre.is_match_window_value(
+                                    &haystack,
+                                    window,
+                                    SearchLimits::unlimited(),
+                                )
+                                .unwrap(),
+                                expected.is_some(),
+                                "value exists: {pattern:?} {haystack:?} {start}..{end}",
+                            );
 
                             let (earliest, earliest_accounting) = fre
                                 .shortest_match_window(&haystack, window, SearchLimits::unlimited())
@@ -684,6 +837,37 @@ mod tests {
                             assert_eq!(
                                 accounting(earliest_accounting).operation,
                                 Operation::EarliestEnd
+                            );
+                            assert_eq!(
+                                plan.earliest_end_window_value(
+                                    &haystack,
+                                    window,
+                                    SearchLimits::unlimited(),
+                                )
+                                .unwrap(),
+                                expected_earliest,
+                                "value earliest: {pattern:?} {haystack:?} {start}..{end}",
+                            );
+                            assert_eq!(
+                                fre.shortest_match_window_value(
+                                    &haystack,
+                                    window,
+                                    SearchLimits::unlimited(),
+                                )
+                                .unwrap(),
+                                expected_earliest,
+                                "facade value earliest: {pattern:?} {haystack:?} {start}..{end}",
+                            );
+                            assert_eq!(
+                                session
+                                    .shortest_match_window_value(
+                                        &haystack,
+                                        window,
+                                        SearchLimits::unlimited(),
+                                    )
+                                    .unwrap(),
+                                expected_earliest,
+                                "session value earliest: {pattern:?} {haystack:?} {start}..{end}",
                             );
 
                             let (selected_end, selected_accounting) = plan
@@ -705,6 +889,18 @@ mod tests {
                                 "span: {pattern:?} {haystack:?} {start}..{end}"
                             );
                             assert_eq!(accounting(found_accounting).operation, Operation::Span);
+                            assert_eq!(
+                                span(
+                                    fre.find_window_value(
+                                        &haystack,
+                                        window,
+                                        SearchLimits::unlimited(),
+                                    )
+                                    .unwrap(),
+                                ),
+                                expected,
+                                "value span: {pattern:?} {haystack:?} {start}..{end}",
+                            );
                         }
                     }
 
@@ -724,6 +920,106 @@ mod tests {
                         actual_iter, expected_iter,
                         "iterator: {pattern:?} {haystack:?}"
                     );
+                    let actual_value_iter = fre
+                        .find_iter_value(&haystack, PortableFindIterLimits::unlimited())
+                        .unwrap()
+                        .map(|matched| {
+                            let matched = matched.unwrap();
+                            (matched.start(), matched.end())
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        actual_value_iter, expected_iter,
+                        "value iterator: {pattern:?} {haystack:?}"
+                    );
+                    let session_value_iter = session
+                        .find_iter_value(&haystack, PortableFindIterRunLimits::unlimited())
+                        .map(|matched| {
+                            let matched = matched.unwrap();
+                            (matched.start(), matched.end())
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        session_value_iter, expected_iter,
+                        "session value iterator: {pattern:?} {haystack:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn value_paths_match_accounted_search_across_classifier_blocks() {
+        let patterns = [
+            "(?-u:[ac]){5,9}",
+            "(?-u:[ac]){5,9}?",
+            "(?-u:[ace]){5,9}",
+            "(?-u:[ace]){5,9}?",
+            "(?-u:[aceg]){5,9}",
+            "(?-u:[aceg]){5,9}?",
+            "(?-u:[a-z]){5,9}",
+            "(?-u:[a-z]){5,9}?",
+            "(?-u:[^x]){5,9}",
+            "(?-u:[^x]){5,9}?",
+            "(?-u:[\\x80\\x82\\x84\\x86]){5,9}",
+            "(?-u:[\\x80\\x82\\x84\\x86]){5,9}?",
+        ];
+        let mut ascii_decoys = Vec::new();
+        for _ in 0..20 {
+            ascii_decoys.extend_from_slice(b"aceg!");
+        }
+        ascii_decoys.extend_from_slice(b"acegace");
+
+        let mut high_decoys = Vec::new();
+        for _ in 0..20 {
+            high_decoys.extend_from_slice(&[0x80, 0x82, 0x84, 0x86, b'!']);
+        }
+        high_decoys.extend_from_slice(&[0x80, 0x82, 0x84, 0x86, 0x80, 0x82]);
+
+        let mut boundary = vec![b'!'; BYTE_SET_BLOCK_BYTES - 2];
+        boundary.extend_from_slice(b"acegacegaceg");
+        boundary.extend_from_slice(&[b'!'; BYTE_SET_BLOCK_BYTES + 3]);
+
+        for pattern in patterns {
+            let regex = build(pattern);
+            let PortablePlan::BoundedByteClassRepeat(plan) = &regex.plan else {
+                panic!("expected bounded plan for {pattern:?}");
+            };
+            for haystack in [&ascii_decoys, &high_decoys, &boundary] {
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let window = SearchWindow::new(start, end);
+                        let expected_match = plan
+                            .find_window(haystack, window, SearchLimits::unlimited())
+                            .unwrap()
+                            .0;
+                        let expected_exists = plan
+                            .is_match_window(haystack, window, SearchLimits::unlimited())
+                            .unwrap()
+                            .0;
+                        assert_eq!(
+                            span(
+                                plan.find_window_value(
+                                    haystack,
+                                    window,
+                                    SearchLimits::unlimited(),
+                                )
+                                .unwrap(),
+                            ),
+                            span(expected_match),
+                            "span: {pattern:?} window={start}..{end}",
+                        );
+                        assert_eq!(
+                            plan.is_match_window_value(
+                                haystack,
+                                window,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap(),
+                            expected_exists,
+                            "exists: {pattern:?} window={start}..{end}",
+                        );
+                    }
                 }
             }
         }
@@ -817,6 +1113,51 @@ mod tests {
                 FacadeSearchError::PureByteClassRepeat(Error::WorkLimit { limit, .. })
                     if limit == measured.actual_work - 1
             ));
+            match operation {
+                Operation::Exists => {
+                    assert!(
+                        plan.is_match_window_value(haystack, window, exact)
+                            .unwrap()
+                    );
+                    assert!(matches!(
+                        plan.is_match_window_value(haystack, window, one_below),
+                        Err(Error::WorkLimit { limit, .. })
+                            if limit == measured.actual_work - 1
+                    ));
+                }
+                Operation::Span => {
+                    let expected = regex
+                        .find_window(haystack, window, SearchLimits::unlimited())
+                        .unwrap()
+                        .0;
+                    assert_eq!(
+                        span(plan.find_window_value(haystack, window, exact).unwrap()),
+                        span(expected),
+                    );
+                    assert!(matches!(
+                        plan.find_window_value(haystack, window, one_below),
+                        Err(Error::WorkLimit { limit, .. })
+                            if limit == measured.actual_work - 1
+                    ));
+                }
+                Operation::EarliestEnd => {
+                    let expected = regex
+                        .shortest_match_window(haystack, window, SearchLimits::unlimited())
+                        .unwrap()
+                        .0;
+                    assert_eq!(
+                        plan.earliest_end_window_value(haystack, window, exact)
+                            .unwrap(),
+                        expected,
+                    );
+                    assert!(matches!(
+                        plan.earliest_end_window_value(haystack, window, one_below),
+                        Err(Error::WorkLimit { limit, .. })
+                            if limit == measured.actual_work - 1
+                    ));
+                }
+                Operation::SelectedEnd => {}
+            }
         }
 
         let measured_build = regex.build_report().clone();

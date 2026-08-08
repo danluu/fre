@@ -8526,8 +8526,7 @@ impl PortableRegex {
                 .is_match_window_value(haystack, window, limits)
                 .map_err(SearchError::from),
             PortablePlan::BoundedByteClassRepeat(plan) => plan
-                .is_match_window(haystack, window, limits)
-                .map(|(matched, _)| matched)
+                .is_match_window_value(haystack, window, limits)
                 .map_err(SearchError::from),
             PortablePlan::BoundedByteClassSequence(plan) => plan
                 .is_match_window_value(haystack, window, limits)
@@ -8656,26 +8655,7 @@ impl PortableRegex {
         haystack: &[u8],
         limits: SearchLimits,
     ) -> Result<Option<usize>, SearchError> {
-        if let PortablePlan::UnicodeScalarRun(plan) = &self.plan {
-            return plan
-                .shortest_match_window_value(
-                    haystack,
-                    fre_kernels::Window::full(haystack),
-                    unicode_scalar_search_limits(limits),
-                )
-                .map_err(SearchError::from);
-        }
-        if let PortablePlan::BoundedLiteralClassRun(plan) = &self.plan {
-            return plan
-                .shortest_window_value(
-                    haystack,
-                    LiteralWindow::full(haystack),
-                    literal_class_run_literal_limits(limits),
-                )
-                .map_err(SearchError::from);
-        }
-        self.shortest_match(haystack, limits)
-            .map(|(output, _)| output)
+        self.shortest_match_window_value(haystack, SearchWindow::full(haystack), limits)
     }
 
     /// Return only the first detected match end at or after `start`.
@@ -8689,11 +8669,24 @@ impl PortableRegex {
         start: usize,
         limits: SearchLimits,
     ) -> Result<Option<usize>, SearchError> {
+        self.shortest_match_window_value(
+            haystack,
+            SearchWindow::new(start, haystack.len()),
+            limits,
+        )
+    }
+
+    fn shortest_match_window_value(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        limits: SearchLimits,
+    ) -> Result<Option<usize>, SearchError> {
         if let PortablePlan::UnicodeScalarRun(plan) = &self.plan {
             return plan
                 .shortest_match_window_value(
                     haystack,
-                    fre_kernels::Window::new(start, haystack.len()),
+                    fre_kernels::Window::new(window.start(), window.end()),
                     unicode_scalar_search_limits(limits),
                 )
                 .map_err(SearchError::from);
@@ -8702,12 +8695,17 @@ impl PortableRegex {
             return plan
                 .shortest_window_value(
                     haystack,
-                    LiteralWindow::new(start, haystack.len()),
+                    LiteralWindow::new(window.start(), window.end()),
                     literal_class_run_literal_limits(limits),
                 )
                 .map_err(SearchError::from);
         }
-        self.shortest_match_at(haystack, start, limits)
+        if let PortablePlan::BoundedByteClassRepeat(plan) = &self.plan {
+            return plan
+                .earliest_end_window_value(haystack, window, limits)
+                .map_err(SearchError::from);
+        }
+        self.shortest_match_window(haystack, window, limits)
             .map(|(output, _)| output)
     }
 
@@ -10037,8 +10035,7 @@ impl PortableRegex {
                 .map(|(matched, _)| matched)
                 .map_err(SearchError::from),
             PortablePlan::BoundedByteClassRepeat(plan) => plan
-                .find_window(haystack, window, limits)
-                .map(|(matched, _)| matched)
+                .find_window_value(haystack, window, limits)
                 .map_err(SearchError::from),
             PortablePlan::BoundedByteClassSequence(plan) => plan
                 .find_window_value(haystack, window, limits)
@@ -15350,9 +15347,9 @@ impl<'r> PortableSearchSession<'r> {
                 )
                 .map(|(matched, _)| matched.map(|(_, end)| end))
                 .map_err(SearchError::from),
-            PortableSearchSessionPlan::Native(regex) => regex
-                .shortest_match_window(haystack, window, limits)
-                .map(|(output, _)| output),
+            PortableSearchSessionPlan::Native(regex) => {
+                regex.shortest_match_window_value(haystack, window, limits)
+            }
             PortableSearchSessionPlan::K0 {
                 session,
                 k0_plan,
