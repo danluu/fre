@@ -896,7 +896,7 @@ fn lower_x86_64_multiword_bit_parallel(
         if !use_avx2 && !use_avx512_rows && layout.constant_result.is_none() {
             Some(
                 layout
-                    .x86_root_vector_offset
+                    .root_vector_offset
                     .ok_or(ObjectError::InvalidModule("x86 SSE2 root vector is absent"))?,
             )
         } else {
@@ -2592,7 +2592,7 @@ mod tests {
                 let emission =
                     lower_x86_64_bit_parallel(&layout, target).expect("multiword SSE2 leaf");
                 let root_offset = layout
-                    .x86_root_vector_offset
+                    .root_vector_offset
                     .expect("SSE2 root vector offset");
                 for padding_word in words..MAX_BIT_PARALLEL_EXISTS_WORDS {
                     let offset = usize::try_from(root_offset).unwrap() + padding_word * 8;
