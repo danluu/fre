@@ -1,8 +1,8 @@
 use fre_automata::{
     Automaton, CompileLimits as AutomatonCompileLimits, EdgeKind, Exists,
-    K0DynamicLoopStartAction, K0FullyPrefilledResumeCacheReceipt, K0OrderedResumeCompletion,
-    K0ResumeSet, K0Workspace, RawPlan, SearchLimits, SearchWindow as K0SearchWindow, SelectedEnd,
-    Span, StateRole, WorkspaceLimits,
+    K0DynamicLoopStartAction, K0FullyPrefilledResumeCacheReceipt,
+    K0FullyPrefilledRootProjection, K0OrderedResumeCompletion, K0ResumeSet, K0Workspace, RawPlan,
+    SearchLimits, SearchWindow as K0SearchWindow, SelectedEnd, Span, StateRole, WorkspaceLimits,
 };
 use fre_simd_kernels::{
     ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, AsciiByteSet, AsciiByteSetClassifier,
@@ -2532,6 +2532,59 @@ pub struct FullyPrefilledFallbackReceipt {
 struct FullyPrefilledRootFallbackReceipt {
     program_instance: u64,
     k0: K0FullyPrefilledResumeCacheReceipt,
+    reverse: Option<FrozenRootReverseProjection>,
+}
+
+/// Exact live reverse-K0 geometry authenticated by a root-prefill receipt.
+///
+/// Compact forward rows are copied into a separately owned representation,
+/// but variable-width Span recovery intentionally retains the original K0
+/// reverse table. Keeping its complete geometry inside the opaque receipt
+/// lets header publication reauthenticate the same workspace generation
+/// immediately before exposing any address to generated code.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FrozenRootReverseProjection {
+    rows_address: usize,
+    live_cells: usize,
+    row_stride: u32,
+    initial_row: u32,
+    cache_identity: u64,
+}
+
+impl FrozenRootReverseProjection {
+    fn from_projection(projection: &K0FullyPrefilledRootProjection<'_>) -> Option<Self> {
+        Some(Self {
+            rows_address: projection.reverse_rows_address()?.expose_provenance(),
+            live_cells: projection.reverse_live_cells(),
+            row_stride: projection.row_stride(),
+            initial_row: projection.reverse_initial_row()?,
+            cache_identity: projection.cache_identity(),
+        })
+    }
+
+    fn is_valid(self) -> bool {
+        let Ok(stride) = usize::try_from(self.row_stride) else {
+            return false;
+        };
+        let Ok(initial) = usize::try_from(self.initial_row) else {
+            return false;
+        };
+        self.rows_address != 0
+            && self.rows_address.checked_rem(core::mem::align_of::<u32>()) == Some(0)
+            && self.cache_identity != 0
+            && stride != 0
+            && stride <= 256
+            && self.live_cells >= stride
+            && self.live_cells
+                <= usize::try_from(DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK)
+                    .unwrap_or(usize::MAX)
+            && self.live_cells.checked_rem(stride) == Some(0)
+            && self.initial_row != FROZEN_PREPARED_HEADER_V1_NO_REVERSE_ROW
+            && initial.checked_rem(stride) == Some(0)
+            && initial
+                .checked_add(stride)
+                .is_some_and(|end| end <= self.live_cells)
+    }
 }
 
 /// Versioned, target-native header for one setup-authenticated frozen K0 root.
@@ -2541,10 +2594,11 @@ struct FullyPrefilledRootFallbackReceipt {
 /// forward projection has been authenticated and copied into its immutable
 /// owner. Any legacy or fallback runtime entry clears that seal before it may
 /// mutate capability-owned state, and no public operation can restore it. A
-/// variable-Span compact postflight may retain the seal only while it mutates
-/// the disjoint live reverse-K0 workspace and leaves every header, sidecar,
-/// pointer, and publication field untouched. The inline class map deliberately
-/// follows every hot authentication and row-layout field.
+/// variable-Span compact postflight may retain the seal while it reads the
+/// separately authenticated live reverse projection; a recovery fallback may
+/// mutate only disjoint K0 scratch. Both leave every header, sidecar, pointer,
+/// and publication field untouched. The inline class map deliberately follows
+/// every hot authentication and row-layout field.
 #[doc(hidden)]
 #[derive(Debug, Eq, PartialEq)]
 #[repr(C)]
@@ -2885,9 +2939,10 @@ pub struct FrozenDynamicRowsStorage {
 /// generation reinterprets an allocation at a wider or differently aligned
 /// type, and exactly one row owner is populated for any published generation.
 /// For variable-width Span programs this owner contains only the closed
-/// forward projection. Reverse postflight uses the prepared runtime's
-/// independently allocated bidirectional K0 workspace, so it cannot alias or
-/// mutate these rows or their publication fields.
+/// forward projection. Reverse postflight reads the prepared runtime's
+/// independently allocated, fully prefilled reverse K0 projection; fallback
+/// recovery may mutate only its disjoint scratch. Neither can alias or mutate
+/// the copied forward rows or their publication fields.
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct FrozenDynamicRowsStorageV3 {
@@ -4732,13 +4787,16 @@ impl FrozenPreparedHeaderV6 {
         };
         let mut published_rows = self.dynamic_rows_v6.compact;
         published_rows.ready_seal = 0;
+        let reverse = owner.root_prefill_receipt.reverse?;
         if published_rows != owner_rows
             || self.v1.forward_rows_address != owner_rows.rows_address
             || self.v1.forward_live_cells != owner.live_cells()
             || self.v1.cache_identity != owner_rows.cache_identity
-            || self.v1.reverse_rows_address != 0
-            || self.v1.reverse_live_cells != 0
-            || self.v1.reverse_initial_row != FROZEN_PREPARED_HEADER_V1_NO_REVERSE_ROW
+            || !reverse.is_valid()
+            || reverse.cache_identity != owner_rows.cache_identity
+            || self.v1.reverse_rows_address != reverse.rows_address
+            || self.v1.reverse_live_cells != reverse.live_cells
+            || self.v1.reverse_initial_row != reverse.initial_row
         {
             return None;
         }
@@ -5495,6 +5553,13 @@ impl FrozenDynamicRowsStorageV3 {
         };
         if self.program_instance != identity.instance
             || self.artifact_identity != identity.artifact
+            || self.root_prefill_receipt.program_instance != identity.instance
+            || self
+                .root_prefill_receipt
+                .reverse
+                .is_some_and(|reverse| {
+                    !reverse.is_valid() || reverse.cache_identity != rows.cache_identity
+                })
             || rows.ready_seal != 0
             || owner_is_invalid
             || rows.cache_identity == 0
@@ -8618,10 +8683,7 @@ impl CompiledProgram {
             receipt,
         )?;
         let direct = nfa.dynamic_root_projection(&self.automaton)?;
-        let root_prefill_receipt = FullyPrefilledRootFallbackReceipt {
-            program_instance: self.identity.instance,
-            k0: receipt,
-        };
+        let reverse_projection = FrozenRootReverseProjection::from_projection(&full);
 
         let source_class_count = usize::try_from(full.row_stride()).ok()?;
         let source_cells = direct.state_count().checked_mul(source_class_count)?;
@@ -8650,10 +8712,13 @@ impl CompiledProgram {
             // A variable-width Span prepares bidirectional K0, so its setup
             // candidate must authenticate a complete reverse projection too.
             // Only the closed forward projection is copied into this immutable
-            // owner; the separately owned live workspace performs reverse-only
-            // postflight and cannot alias any copied row or publication field.
+            // owner. The separately owned live reverse projection is published
+            // from the same authenticated receipt and cannot alias any copied
+            // row or publication field.
             || full.reverse_rows().is_some() != variable_span_recovery
             || full.reverse_initial_row().is_some() != variable_span_recovery
+            || reverse_projection.is_some() != variable_span_recovery
+            || reverse_projection.is_some_and(|reverse| !reverse.is_valid())
             || full.initial_pending()
             || full.initial_terminal()
             || direct.initial_pending()
@@ -8669,6 +8734,11 @@ impl CompiledProgram {
         {
             return None;
         }
+        let root_prefill_receipt = FullyPrefilledRootFallbackReceipt {
+            program_instance: self.identity.instance,
+            k0: receipt,
+            reverse: reverse_projection,
+        };
 
         // The graph alphabet is conservative for this exact reachable K0
         // projection. Once every source cell and destination has been
@@ -9248,6 +9318,46 @@ impl CompiledProgram {
         }
 
         let rows = storage.descriptor();
+        // Reauthenticate the exact live K0 generation before publishing its
+        // reverse address. The compact forward representation may coalesce
+        // classes, so reverse geometry retains the original K0 stride and is
+        // authenticated independently of the compact V3--V14 row stride.
+        let Some(dynamic_view) = self.native_dynamic_rows_view() else {
+            return header;
+        };
+        let variable_span_recovery = dynamic_view.output == OutputContract::Span
+            && dynamic_view.exact_match_width.is_none();
+        let reverse_projection = if variable_span_recovery {
+            let Some(nfa) = workspace.nfa.as_ref() else {
+                return header;
+            };
+            let Some(root_projection) =
+                nfa.compiler_private_fully_prefilled_root_projection_without_resume(
+                    &self.automaton,
+                    storage.root_prefill_receipt.k0,
+                )
+            else {
+                return header;
+            };
+            let Some(reverse) = FrozenRootReverseProjection::from_projection(&root_projection)
+            else {
+                return header;
+            };
+            if root_projection.cache_identity() != rows.cache_identity
+                || storage.root_prefill_receipt.reverse != Some(reverse)
+            {
+                return header;
+            }
+            Some(reverse)
+        } else {
+            if storage.root_prefill_receipt.reverse.is_some() {
+                return header;
+            }
+            None
+        };
+        if storage.root_prefill_receipt.program_instance != self.identity.instance {
+            return header;
+        }
         let format = match rows.format_version {
             FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION => FrozenCompactRowsFormat::StateOrdinalV3,
             FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION => FrozenCompactRowsFormat::CellOffsetV4,
@@ -9367,6 +9477,11 @@ impl CompiledProgram {
         header.v1.cache_identity = rows.cache_identity;
         header.v1.row_stride = row_stride;
         header.v1.forward_initial_row = 0;
+        if let Some(reverse) = reverse_projection {
+            header.v1.reverse_rows_address = reverse.rows_address;
+            header.v1.reverse_live_cells = reverse.live_cells;
+            header.v1.reverse_initial_row = reverse.initial_row;
+        }
         if format.is_quad_supertransition() {
             header.v1.unfilled_cell = 0;
             header.v1.accept_mask = u32::from(DYNAMIC_NATIVE_ROWS_V14_ANY_ACCEPT_MASK);
@@ -14327,9 +14442,19 @@ mod tests {
             .expect("test program has a K0 workspace")
             .compiler_private_try_prefill_root_cache_with_receipt(&compiled.automaton)
             .expect("test program has a complete root prefill receipt");
+        let reverse = workspace
+            .nfa
+            .as_ref()
+            .expect("test program has a K0 workspace")
+            .compiler_private_fully_prefilled_root_projection_without_resume(
+                &compiled.automaton,
+                k0,
+            )
+            .and_then(|projection| FrozenRootReverseProjection::from_projection(&projection));
         FullyPrefilledRootFallbackReceipt {
             program_instance: compiled.identity.instance,
             k0,
+            reverse,
         }
     }
 
@@ -15461,14 +15586,14 @@ mod tests {
             DeterminizeLimits::default(),
         );
         let mut workspace = compiled.prepare_workspace().expect("dynamic workspace");
-        let storage = compiled
+        let mut storage = compiled
             .compiler_private_frozen_dynamic_rows_storage_v3(
                 &mut workspace,
                 usize::MAX,
                 usize::MAX,
             )
             .expect("closed variable-Span forward owner");
-        let (live_forward_rows, live_reverse_rows) = {
+        let (live_forward_rows, live_reverse) = {
             let nfa = workspace.nfa.as_ref().expect("bidirectional K0 workspace");
             let full = nfa
                 .compiler_private_fully_prefilled_root_projection_without_resume(
@@ -15476,32 +15601,55 @@ mod tests {
                     storage.root_prefill_receipt.k0,
                 )
                 .expect("authenticated bidirectional projection");
-            (
-                full.forward_rows_address().expose_provenance(),
-                full.reverse_rows_address()
-                    .expect("variable Span reverse rows")
-                    .expose_provenance(),
-            )
+            let reverse = FrozenRootReverseProjection::from_projection(&full)
+                .expect("variable Span reverse rows");
+            (full.forward_rows_address().expose_provenance(), reverse)
         };
-        assert_ne!(live_forward_rows, live_reverse_rows);
+        assert_eq!(storage.root_prefill_receipt.reverse, Some(live_reverse));
+        assert_ne!(live_forward_rows, live_reverse.rows_address);
         let frozen_rows = storage.descriptor().rows_address;
         assert_ne!(frozen_rows, live_forward_rows);
-        assert_ne!(frozen_rows, live_reverse_rows);
-        assert_ne!(storage.class_map.as_ptr().expose_provenance(), live_reverse_rows);
+        assert_ne!(frozen_rows, live_reverse.rows_address);
+        assert_ne!(
+            storage.class_map.as_ptr().expose_provenance(),
+            live_reverse.rows_address
+        );
 
         let identity = compiled.artifact_identity();
+        let authenticated_reverse = storage.root_prefill_receipt.reverse;
+        storage
+            .root_prefill_receipt
+            .reverse
+            .as_mut()
+            .expect("variable Span reverse receipt")
+            .live_cells = live_reverse.live_cells.saturating_sub(1);
+        let rejected = compiled.compiler_private_frozen_prepared_header_v6(
+            &workspace,
+            None,
+            Some(&storage),
+        );
+        assert!(
+            !rejected.is_active(),
+            "publication must reauthenticate exact live reverse geometry"
+        );
+        storage.root_prefill_receipt.reverse = authenticated_reverse;
         let mut header = compiled.compiler_private_frozen_prepared_header_v6(
             &workspace,
             None,
             Some(&storage),
         );
         assert!(header.has_dynamic_rows());
-        assert_eq!(header.v1.reverse_rows_address, 0);
-        assert_eq!(header.v1.reverse_live_cells, 0);
-        assert_eq!(
-            header.v1.reverse_initial_row,
-            FROZEN_PREPARED_HEADER_V1_NO_REVERSE_ROW
+        assert_eq!(header.v1.reverse_rows_address, live_reverse.rows_address);
+        assert_eq!(header.v1.reverse_live_cells, live_reverse.live_cells);
+        assert_eq!(header.v1.reverse_initial_row, live_reverse.initial_row);
+        header.v1.reverse_live_cells = live_reverse.live_cells.saturating_sub(1);
+        assert!(
+            header
+                .compiler_private_active_span_capability(&storage, identity)
+                .is_none(),
+            "post-publication geometry corruption must revoke Span authority"
         );
+        header.v1.reverse_live_cells = live_reverse.live_cells;
 
         let mut haystack = vec![b'!'; DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES + 8];
         haystack[3..5].copy_from_slice(b"bq");
@@ -25381,6 +25529,14 @@ mod tests {
             );
             assert!(header.is_active());
             assert!(header.has_dynamic_rows());
+            assert_eq!(storage.root_prefill_receipt.reverse, None, "{output:?}");
+            assert_eq!(header.v1.reverse_rows_address, 0, "{output:?}");
+            assert_eq!(header.v1.reverse_live_cells, 0, "{output:?}");
+            assert_eq!(
+                header.v1.reverse_initial_row,
+                FROZEN_PREPARED_HEADER_V1_NO_REVERSE_ROW,
+                "{output:?}"
+            );
             assert_eq!(
                 header.v1.flags,
                 FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V13
