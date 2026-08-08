@@ -17923,6 +17923,58 @@ impl Aarch64Assembler {
         Ok((minimum..=maximum).contains(&words))
     }
 
+    fn adjacent_pair_encoding(first: u32, second: u32) -> Result<Option<u32>, ObjectError> {
+        const UNSIGNED_X_MEMORY_MASK: u32 = 0xffc0_0000;
+        const STORE_X_UNSIGNED: u32 = 0xf900_0000;
+        const LOAD_X_UNSIGNED: u32 = 0xf940_0000;
+
+        let opcode = first & UNSIGNED_X_MEMORY_MASK;
+        if !matches!(opcode, STORE_X_UNSIGNED | LOAD_X_UNSIGNED)
+            || second & UNSIGNED_X_MEMORY_MASK != opcode
+        {
+            return Ok(None);
+        }
+        let base = u8::try_from((first >> 5) & 0x1f)
+            .map_err(|_| ObjectError::InvalidModule("AArch64 pair base register"))?;
+        if u8::try_from((second >> 5) & 0x1f)
+            .map_err(|_| ObjectError::InvalidModule("AArch64 pair base register"))?
+            != base
+        {
+            return Ok(None);
+        }
+        let first_scaled = (first >> 10) & 0x0fff;
+        let second_scaled = (second >> 10) & 0x0fff;
+        if first_scaled.checked_add(1) != Some(second_scaled) {
+            return Ok(None);
+        }
+        let byte_offset = first_scaled
+            .checked_mul(8)
+            .and_then(|offset| i16::try_from(offset).ok())
+            .filter(|offset| *offset <= 504);
+        let Some(byte_offset) = byte_offset else {
+            return Ok(None);
+        };
+        let first_register = u8::try_from(first & 0x1f)
+            .map_err(|_| ObjectError::InvalidModule("AArch64 pair first register"))?;
+        let second_register = u8::try_from(second & 0x1f)
+            .map_err(|_| ObjectError::InvalidModule("AArch64 pair second register"))?;
+        if opcode == LOAD_X_UNSIGNED
+            && (first_register == second_register
+                || first_register == base
+                || second_register == base)
+        {
+            // Sequential loads may overwrite a shared destination or the base
+            // before the second address is formed. LDP has simultaneous
+            // address generation, so those shapes are not equivalent.
+            return Ok(None);
+        }
+        if opcode == STORE_X_UNSIGNED {
+            aarch64_store_pair_x(first_register, second_register, base, byte_offset).map(Some)
+        } else {
+            aarch64_load_pair_x(first_register, second_register, base, byte_offset).map(Some)
+        }
+    }
+
     fn remove_fallthrough_branches(
         labels: &[Option<usize>],
         fixups: &[Aarch64Fixup],
@@ -18398,6 +18450,100 @@ impl Aarch64Assembler {
             break;
         }
 
+        // Pair adjacent ordinary 64-bit loads and stores after CFG rewriting
+        // has reached a fixed point. The second instruction must not be a
+        // branch entry, relocation anchor, or fixup. This is a target-wide
+        // machine peephole: lowering sites do not need to recognize a regex
+        // or opt in by recipe.
+        targeted_instructions.fill(false);
+        for fixup in &fixups {
+            let source = fixup.instruction / 4;
+            if removed.get(source).copied().unwrap_or(true)
+                || relocation_anchors.get(source).copied().unwrap_or(true)
+            {
+                continue;
+            }
+            let target = self
+                .labels
+                .get(fixup.label)
+                .copied()
+                .flatten()
+                .ok_or(ObjectError::InvalidModule("unbound AArch64 branch label"))?;
+            let mut target_instruction = target / 4;
+            while target_instruction < instruction_count
+                && removed.get(target_instruction).copied().unwrap_or(false)
+            {
+                target_instruction = target_instruction.checked_add(1).ok_or(
+                    ObjectError::ArithmeticOverflow("AArch64 pair entry compaction"),
+                )?;
+            }
+            if let Some(targeted) = targeted_instructions.get_mut(target_instruction) {
+                *targeted = true;
+            }
+        }
+
+        let mut pair_replacements = Vec::new();
+        pair_replacements
+            .try_reserve_exact(instruction_count)
+            .map_err(|_| ObjectError::Allocation("AArch64 pair replacements"))?;
+        pair_replacements.resize(instruction_count, None);
+        let mut instruction = 0_usize;
+        while let Some(second) = instruction.checked_add(1).filter(|&next| next < instruction_count)
+        {
+            if removed.get(instruction).copied().unwrap_or(true)
+                || removed.get(second).copied().unwrap_or(true)
+                || relocation_anchors.get(instruction).copied().unwrap_or(true)
+                || relocation_anchors.get(second).copied().unwrap_or(true)
+                || fixup_indices.get(instruction).copied().flatten().is_some()
+                || fixup_indices.get(second).copied().flatten().is_some()
+                || targeted_instructions.get(second).copied().unwrap_or(true)
+            {
+                instruction = second;
+                continue;
+            }
+            let first_offset = instruction.checked_mul(4).ok_or(
+                ObjectError::ArithmeticOverflow("AArch64 pair first offset"),
+            )?;
+            let second_offset = second.checked_mul(4).ok_or(
+                ObjectError::ArithmeticOverflow("AArch64 pair second offset"),
+            )?;
+            let first = self
+                .code
+                .get(first_offset..first_offset + 4)
+                .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+                .map(u32::from_le_bytes)
+                .ok_or(ObjectError::InvalidModule("AArch64 pair first instruction"))?;
+            let second_word = self
+                .code
+                .get(second_offset..second_offset + 4)
+                .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+                .map(u32::from_le_bytes)
+                .ok_or(ObjectError::InvalidModule("AArch64 pair second instruction"))?;
+            if let Some(pair) = Self::adjacent_pair_encoding(first, second_word)? {
+                pair_replacements[instruction] = Some(pair);
+                removed[second] = true;
+                instruction = second
+                    .checked_add(1)
+                    .ok_or(ObjectError::ArithmeticOverflow("AArch64 pair scan"))?;
+            } else {
+                instruction = second;
+            }
+        }
+
+        removed_prefix.clear();
+        removed_prefix.push(0_usize);
+        for &is_removed in &removed {
+            let previous = removed_prefix
+                .last()
+                .copied()
+                .ok_or(ObjectError::InvalidModule(
+                    "AArch64 pair prefix is unexpectedly empty",
+                ))?;
+            removed_prefix.push(previous.checked_add(usize::from(is_removed)).ok_or(
+                ObjectError::ArithmeticOverflow("AArch64 pair removed count"),
+            )?);
+        }
+
         let remap = |offset: usize| -> Result<usize, ObjectError> {
             if !offset.is_multiple_of(4) || offset > self.code.len() {
                 return Err(ObjectError::InvalidModule(
@@ -18439,7 +18585,18 @@ impl Aarch64Assembler {
         for (instruction, bytes) in self.code.chunks_exact(4).enumerate() {
             if !removed.get(instruction).copied().unwrap_or(true) {
                 let inversion_mask = inversion_masks.get(instruction).copied().unwrap_or(0);
-                if inversion_mask == 0 {
+                if let Some(replacement) = pair_replacements
+                    .get(instruction)
+                    .copied()
+                    .flatten()
+                {
+                    if inversion_mask != 0 {
+                        return Err(ObjectError::InvalidModule(
+                            "AArch64 pair replaced an inverted branch",
+                        ));
+                    }
+                    code.extend_from_slice(&replacement.to_le_bytes());
+                } else if inversion_mask == 0 {
                     code.extend_from_slice(bytes);
                 } else {
                     let encoded =
@@ -34249,7 +34406,12 @@ mod tests {
                     .expect("AArch64 root must authenticate its live-cell bound");
                 assert!(authenticated_loop_count < authenticated_live_cells);
                 assert_eq!(
-                    words[authenticated_live_cells + 6] & 0xff00_001f,
+                    words[authenticated_live_cells + 4],
+                    aarch64_load_pair_x(2, 3, 31, 48).unwrap(),
+                    "adjacent admitted bounds must be paired after live-cell authentication"
+                );
+                assert_eq!(
+                    words[authenticated_live_cells + 5] & 0xff00_001f,
                     0x3400_000c,
                     "zero-overlay selection must use the preserved W12 loop count after X10 is reused"
                 );
@@ -42773,7 +42935,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             .unwrap_or_else(|| panic!("{target:?} declined its trusted prepared scanner"));
             let (removed_code_bytes, removed_entry_bytes) = match target.architecture {
                 Architecture::X86_64 => (82, 64),
-                Architecture::Aarch64 => (84, 60),
+                Architecture::Aarch64 => (72, 56),
             };
             assert_eq!(
                 lowering.code.len().checked_sub(trusted.code.len()),
@@ -42827,8 +42989,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                         .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
                         .collect::<Vec<_>>();
                     for instruction in [
-                        aarch64_store_x(6, 4, 16).unwrap(),
-                        aarch64_store_x(2, 4, 24).unwrap(),
+                        aarch64_store_pair_x(6, 2, 4, 16).unwrap(),
                         aarch64_store_x(7, 4, 32).unwrap(),
                         aarch64_movz_w(0, 3).unwrap(),
                     ] {
@@ -42970,7 +43131,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
         .expect("trusted SVE2 fragmented scanner");
         assert_eq!(
             sve2_lowering.code.len().checked_sub(trusted_sve2.code.len()),
-            Some(84)
+            Some(72)
         );
         assert_eq!(
             trusted_sve2.start_accelerator,
@@ -44604,6 +44765,94 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
         assert!(aarch64_store_pair_x(32, 1, 2, 0).is_err());
         assert!(aarch64_load_pair_x(0, 32, 2, 0).is_err());
         assert!(aarch64_store_pair_x(0, 1, 32, 0).is_err());
+    }
+
+    #[test]
+    fn aarch64_machine_peephole_pairs_only_safe_unanchored_memory_operations() {
+        let words = |code: Vec<u8>| {
+            code.chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>()
+        };
+
+        let mut stores = Aarch64Assembler::new();
+        stores
+            .instruction(aarch64_store_x(0, 2, 0).unwrap())
+            .unwrap();
+        stores
+            .instruction(aarch64_store_x(1, 2, 8).unwrap())
+            .unwrap();
+        assert_eq!(
+            words(stores.finish().unwrap()),
+            [aarch64_store_pair_x(0, 1, 2, 0).unwrap()]
+        );
+
+        let mut loads = Aarch64Assembler::new();
+        loads
+            .instruction(aarch64_load_x_imm(0, 2, 0).unwrap())
+            .unwrap();
+        loads
+            .instruction(aarch64_load_x_imm(1, 2, 8).unwrap())
+            .unwrap();
+        assert_eq!(
+            words(loads.finish().unwrap()),
+            [aarch64_load_pair_x(0, 1, 2, 0).unwrap()]
+        );
+
+        for (first, second) in [
+            (
+                aarch64_load_x_imm(2, 2, 0).unwrap(),
+                aarch64_load_x_imm(1, 2, 8).unwrap(),
+            ),
+            (
+                aarch64_load_x_imm(0, 2, 0).unwrap(),
+                aarch64_load_x_imm(0, 2, 8).unwrap(),
+            ),
+            (
+                aarch64_store_x(0, 2, 512).unwrap(),
+                aarch64_store_x(1, 2, 520).unwrap(),
+            ),
+        ] {
+            let mut unsafe_pair = Aarch64Assembler::new();
+            unsafe_pair.instruction(first).unwrap();
+            unsafe_pair.instruction(second).unwrap();
+            assert_eq!(words(unsafe_pair.finish().unwrap()), [first, second]);
+        }
+
+        let mut targeted = Aarch64Assembler::new();
+        let second = targeted.label().unwrap();
+        targeted
+            .instruction(aarch64_store_x(0, 2, 0).unwrap())
+            .unwrap();
+        targeted.bind(second).unwrap();
+        targeted
+            .instruction(aarch64_store_x(1, 2, 8).unwrap())
+            .unwrap();
+        targeted.branch(second).unwrap();
+        let targeted_words = words(targeted.finish().unwrap());
+        assert_eq!(targeted_words[..2], [
+            aarch64_store_x(0, 2, 0).unwrap(),
+            aarch64_store_x(1, 2, 8).unwrap(),
+        ]);
+
+        let mut relocated = Aarch64Assembler::new();
+        relocated
+            .instruction(aarch64_store_x(0, 2, 0).unwrap())
+            .unwrap();
+        relocated
+            .instruction(aarch64_store_x(1, 2, 8).unwrap())
+            .unwrap();
+        let mut relocation_offsets = [4_usize];
+        let relocated_words = words(
+            relocated
+                .finish_with_offsets(&mut relocation_offsets)
+                .unwrap(),
+        );
+        assert_eq!(relocation_offsets, [4]);
+        assert_eq!(relocated_words, [
+            aarch64_store_x(0, 2, 0).unwrap(),
+            aarch64_store_x(1, 2, 8).unwrap(),
+        ]);
     }
 
     #[test]
@@ -56993,8 +57242,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             .collect::<Vec<_>>();
         let aarch64_span_success = [
             aarch64_add_x_imm(6, 2, 1).unwrap(),
-            aarch64_store_x(2, 4, 0).unwrap(),
-            aarch64_store_x(6, 4, 8).unwrap(),
+            aarch64_store_pair_x(2, 6, 4, 0).unwrap(),
         ];
         assert!(
             aarch64_words
@@ -57141,8 +57389,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             .collect::<Vec<_>>();
         let direct_span = [
             aarch64_add_x_imm(6, 2, 5).unwrap(),
-            aarch64_store_x(2, 4, 0).unwrap(),
-            aarch64_store_x(6, 4, 8).unwrap(),
+            aarch64_store_pair_x(2, 6, 4, 0).unwrap(),
         ];
         assert_eq!(
             words
