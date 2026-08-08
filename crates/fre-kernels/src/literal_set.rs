@@ -2024,7 +2024,7 @@ mod folded_long_tail_tests {
             .unwrap();
         assert_eq!(single.input_bytes, 64);
         assert_eq!(single.candidate_starts, 64);
-        assert_eq!(single.source_byte_reads, 65);
+        assert_eq!(single.source_byte_reads, 2 * single.input_bytes + 2);
         assert_eq!(single.work, single.candidate_starts + single.source_byte_reads);
         let input_bytes = folded_short_minimum_bytes(tail).unwrap();
         let prospective = folded_short_root_prospective(

@@ -23,7 +23,7 @@ use crate::{
 };
 
 /// Stable identity of the canonical folded-scalar trie primitive.
-pub const PLAN_ID: &str = "literal-candidate-stream.unicode-folded-trie.v5";
+pub const PLAN_ID: &str = "literal-candidate-stream.unicode-folded-trie.v6";
 
 const NONE: usize = usize::MAX;
 const CANDIDATE_WORK: usize = 2;
@@ -353,7 +353,9 @@ pub(crate) struct AdaptiveFindResult {
 /// A candidate is only a source-derived necessary fixed-column hit. The
 /// caller must still settle it with an authoritative matcher. `NoCandidate`
 /// proves that the complete window contains no possible folded start, while a
-/// dense guard rejection leaves an exact continuation at `resume_start`.
+/// a dense fixed-column guard rejection leaves an exact continuation at
+/// `resume_start`. A union-successor rejection is already a cheap necessary
+/// sentinel result and continues the ordered scan.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RootCandidateOutcome {
     Candidate { start: usize },
@@ -767,7 +769,7 @@ impl FoldedLiteralTriePlan {
         patterns: &[FoldedLiteral<'_>],
         limits: BuildLimits,
     ) -> Result<BuildAttempt, BuildError> {
-        let prospective = preflight_from_lengths(patterns)?;
+        let mut prospective = preflight_from_lengths(patterns)?;
         enforce_build_limits(&prospective, limits)?;
         let (fallback, canonical_comparisons) = fallback_reason(patterns)?;
         if let Some(reason) = fallback {
@@ -779,6 +781,24 @@ impl FoldedLiteralTriePlan {
                 accounting,
             }));
         }
+        // Base column selection is covered by the already-enforced v5
+        // prospective. Only a selected memchr-width primary can enter the
+        // optional successor pass, so charge and enforce that extra envelope
+        // after selection but before successor source work or allocation.
+        let (root_prefilter_columns, root_prefilter_base_work) =
+            select_root_prefilter_columns(patterns)?;
+        if root_prefilter_columns[0].is_some_and(|primary| {
+            usize::from(primary.needle_count) <= MEMCHR_ROOT_PREFILTER_NEEDLES
+        }) {
+            admit_root_prefilter_successor(&mut prospective)?;
+            enforce_build_limits(&prospective, limits)?;
+        }
+        let (root_prefilter, root_prefilter_work) = materialize_root_prefilter(
+            dispatch,
+            patterns,
+            root_prefilter_columns,
+            root_prefilter_base_work,
+        )?;
         build_probe::record_allocation_attempt();
         let mut nodes =
             ExactVec::try_with_capacity(prospective.states_upper_bound).map_err(|error| {
@@ -836,7 +856,6 @@ impl FoldedLiteralTriePlan {
         build.persistent_bytes =
             exact_retained_bytes(nodes.capacity(), edges.capacity(), outputs.capacity())?;
         build.peak_bytes = build.persistent_bytes;
-        let (root_prefilter, root_prefilter_work) = select_root_prefilter(dispatch, patterns)?;
         work = checked_build_add(
             work,
             root_prefilter_work,
@@ -2035,20 +2054,42 @@ struct PrefilterColumn {
     byte_set: [u64; ROOT_PREFILTER_BYTE_WORDS],
     high_nibbles: u16,
     offset: u8,
+    scalar_index: usize,
+    local_offset: u8,
     structural_leads: usize,
     frequency_score: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RootGuardCandidate {
+    byte_set: [u64; ROOT_PREFILTER_BYTE_WORDS],
+    needle_count: u16,
+    offset: u8,
+    structural_leads: usize,
+    frequency_score: u64,
+}
+
+impl RootGuardCandidate {
+    const fn fixed(column: PrefilterColumn) -> Self {
+        Self {
+            byte_set: column.byte_set,
+            needle_count: column.needle_count,
+            offset: column.offset,
+            structural_leads: column.structural_leads,
+            frequency_score: column.frequency_score,
+        }
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
-    reason = "one allocation-free traversal keeps fixed-column derivation, ranking and exact work accounting visibly coupled"
+    reason = "one allocation-free traversal keeps base fixed-column derivation, ranking and exact work accounting visibly coupled"
 )]
 #[cold]
 #[inline(never)]
-fn select_root_prefilter(
-    dispatch: SimdDispatchContext,
+fn select_root_prefilter_columns(
     patterns: &[FoldedLiteral<'_>],
-) -> Result<(Option<RootPrefilter>, usize), BuildError> {
+) -> Result<([Option<PrefilterColumn>; 2], usize), BuildError> {
     if patterns.is_empty() {
         return Err(BuildError::Invariant {
             detail: "folded prefilter language is empty",
@@ -2181,6 +2222,9 @@ fn select_root_prefilter(
                     byte_set,
                     high_nibbles,
                     offset,
+                    scalar_index,
+                    local_offset: u8::try_from(local_offset)
+                        .expect("a UTF-8 byte offset fits in u8"),
                     structural_leads,
                     frequency_score,
                 },
@@ -2206,8 +2250,32 @@ fn select_root_prefilter(
                 computation: "folded root prefilter scalar index",
             })?;
     }
-    let selected = if let Some(primary) = selected[0] {
-        let guard = selected[1];
+    Ok((selected, work))
+}
+
+#[cold]
+#[inline(never)]
+fn materialize_root_prefilter(
+    dispatch: SimdDispatchContext,
+    patterns: &[FoldedLiteral<'_>],
+    selected: [Option<PrefilterColumn>; 2],
+    mut work: usize,
+) -> Result<(Option<RootPrefilter>, usize), BuildError> {
+    let root_prefilter = if let Some(primary) = selected[0] {
+        let mut guard = selected[1].map(RootGuardCandidate::fixed);
+        // Scalar successor checks amortize naturally over memchr's ordered
+        // hits. A wide root already owns a block classifier; retaining a
+        // scalar successor there would turn rejected lanes back into callback
+        // traffic. That shape belongs in a fused multi-column classifier.
+        if usize::from(primary.needle_count) <= MEMCHR_ROOT_PREFILTER_NEEDLES {
+            if let Some(successor) = derive_union_successor_guard(patterns, primary, &mut work)? {
+                if guard.is_none_or(|fixed| {
+                    successor_guard_is_better(successor, fixed, primary.offset)
+                }) {
+                    guard = Some(successor);
+                }
+            }
+        }
         let classifier = if usize::from(primary.needle_count) > MEMCHR_ROOT_PREFILTER_NEEDLES {
             let (classifier, classifier_work) =
                 root_prefilter_classifier(dispatch, primary.byte_set, primary.high_nibbles)?;
@@ -2233,7 +2301,7 @@ fn select_root_prefilter(
     } else {
         None
     };
-    Ok((selected, work))
+    Ok((root_prefilter, work))
 }
 
 fn record_prefilter_column(
@@ -2258,6 +2326,227 @@ fn prefilter_column_is_better(candidate: PrefilterColumn, incumbent: PrefilterCo
         incumbent.frequency_score,
         core::cmp::Reverse(incumbent.offset),
     )
+}
+
+fn successor_guard_is_better(
+    candidate: RootGuardCandidate,
+    incumbent: RootGuardCandidate,
+    primary_offset: u8,
+) -> bool {
+    let candidate_score = (candidate.structural_leads, candidate.frequency_score);
+    let incumbent_score = (incumbent.structural_leads, incumbent.frequency_score);
+    candidate_score < incumbent_score
+        || (candidate_score == incumbent_score
+            && candidate.offset.abs_diff(primary_offset)
+                < incumbent.offset.abs_diff(primary_offset))
+}
+
+/// Derive one unconditional necessary byte column after the selected primary.
+///
+/// Each retained set is the union at one byte distance over every folded
+/// expansion of every pattern. Keeping the columns independent deliberately
+/// admits their cross-product: it can create false positives, but cannot
+/// reject a real folded expansion. Only the best selective column is retained,
+/// so runtime still reads at most one guard byte per primary hit.
+fn derive_union_successor_guard(
+    patterns: &[FoldedLiteral<'_>],
+    primary: PrefilterColumn,
+    work: &mut usize,
+) -> Result<Option<RootGuardCandidate>, BuildError> {
+    #[cfg(test)]
+    build_probe::record_successor_attempt();
+    let mut selected = None::<RootGuardCandidate>;
+    for distance in 1..=MAX_UTF8_WIDTH {
+        *work = checked_build_add(
+            *work,
+            ROOT_PREFILTER_OFFSET_WORK,
+            "folded root successor offset work",
+        )?;
+        let Some(offset) = usize::from(primary.offset).checked_add(distance) else {
+            return Err(BuildError::ArithmeticOverflow {
+                computation: "folded root successor absolute offset",
+            });
+        };
+        let Ok(offset) = u8::try_from(offset) else {
+            continue;
+        };
+        let mut byte_set = [0_u64; ROOT_PREFILTER_BYTE_WORDS];
+        let mut necessary = true;
+        for pattern in patterns {
+            if !collect_union_successor_bytes(
+                *pattern,
+                primary.scalar_index,
+                usize::from(primary.local_offset),
+                distance,
+                &mut byte_set,
+                work,
+            )? {
+                necessary = false;
+                break;
+            }
+        }
+        if !necessary {
+            continue;
+        }
+        let Some(candidate) = union_successor_guard_candidate(byte_set, offset, work)? else {
+            continue;
+        };
+        if selected.is_none_or(|best| {
+            successor_guard_is_better(candidate, best, primary.offset)
+        }) {
+            selected = Some(candidate);
+        }
+    }
+    Ok(selected)
+}
+
+fn collect_union_successor_bytes(
+    pattern: FoldedLiteral<'_>,
+    primary_scalar_index: usize,
+    primary_local_offset: usize,
+    distance: usize,
+    byte_set: &mut [u64; ROOT_PREFILTER_BYTE_WORDS],
+    work: &mut usize,
+) -> Result<bool, BuildError> {
+    let primary_class = pattern
+        .classes
+        .get(primary_scalar_index)
+        .ok_or(BuildError::Invariant {
+            detail: "folded root successor primary position disappeared",
+        })?;
+    let target_offset = primary_local_offset
+        .checked_add(distance)
+        .ok_or(BuildError::ArithmeticOverflow {
+            computation: "folded root successor target offset",
+        })?;
+    let mut remaining_offsets = 0_u8;
+    for &scalar in primary_class.equivalents {
+        *work = checked_build_add(
+            *work,
+            ROOT_PREFILTER_EDGE_WORK,
+            "folded root successor primary edge work",
+        )?;
+        let mut encoded = [0_u8; MAX_UTF8_WIDTH];
+        let bytes = scalar.encode_utf8(&mut encoded).as_bytes();
+        if let Some(&byte) = bytes.get(target_offset) {
+            byte_set_insert(byte_set, byte);
+            continue;
+        }
+        let remaining = target_offset
+            .checked_sub(bytes.len())
+            .ok_or(BuildError::Invariant {
+                detail: "folded root successor target moved before its primary scalar",
+            })?;
+        if remaining >= MAX_UTF8_WIDTH {
+            return Err(BuildError::Invariant {
+                detail: "folded root successor frontier escaped its bounded distance",
+            });
+        }
+        remaining_offsets |= 1_u8 << remaining;
+    }
+
+    let mut scalar_index = primary_scalar_index
+        .checked_add(1)
+        .ok_or(BuildError::ArithmeticOverflow {
+            computation: "folded root successor scalar index",
+        })?;
+    while remaining_offsets != 0 {
+        let Some(class) = pattern.classes.get(scalar_index) else {
+            return Ok(false);
+        };
+        let mut next_offsets = 0_u8;
+        let mut offsets = remaining_offsets;
+        while offsets != 0 {
+            let remaining = usize::try_from(offsets.trailing_zeros())
+                .expect("a bounded successor offset fits in usize");
+            offsets &= offsets.wrapping_sub(1);
+            for &scalar in class.equivalents {
+                *work = checked_build_add(
+                    *work,
+                    ROOT_PREFILTER_EDGE_WORK,
+                    "folded root successor frontier edge work",
+                )?;
+                let mut encoded = [0_u8; MAX_UTF8_WIDTH];
+                let bytes = scalar.encode_utf8(&mut encoded).as_bytes();
+                if let Some(&byte) = bytes.get(remaining) {
+                    byte_set_insert(byte_set, byte);
+                    continue;
+                }
+                let next = remaining
+                    .checked_sub(bytes.len())
+                    .ok_or(BuildError::Invariant {
+                        detail: "folded root successor frontier moved backwards",
+                    })?;
+                if next >= MAX_UTF8_WIDTH {
+                    return Err(BuildError::Invariant {
+                        detail: "folded root successor frontier exceeded its bounded distance",
+                    });
+                }
+                next_offsets |= 1_u8 << next;
+            }
+        }
+        remaining_offsets = next_offsets;
+        scalar_index = scalar_index
+            .checked_add(1)
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "folded root successor following scalar index",
+            })?;
+    }
+    Ok(true)
+}
+
+fn union_successor_guard_candidate(
+    byte_set: [u64; ROOT_PREFILTER_BYTE_WORDS],
+    offset: u8,
+    work: &mut usize,
+) -> Result<Option<RootGuardCandidate>, BuildError> {
+    let mut needle_count = 0_usize;
+    let mut structural_leads = 0_usize;
+    let mut frequency_score = 0_u64;
+    let mut high_nibbles = 0_u16;
+    for needle in byte_set_members(byte_set) {
+        *work = checked_build_add(
+            *work,
+            ROOT_PREFILTER_NEEDLE_WORK,
+            "folded root successor needle work",
+        )?;
+        needle_count = needle_count
+            .checked_add(1)
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "folded root successor needle count",
+            })?;
+        structural_leads = structural_leads
+            .checked_add(usize::from(matches!(needle, 0xC2..=0xF4)))
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "folded root successor structural leads",
+            })?;
+        frequency_score = frequency_score
+            .checked_add(u64::from(byte_frequency_rank(needle)).saturating_add(1))
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "folded root successor frequency score",
+            })?;
+        high_nibbles |= 1_u16 << (needle >> 4);
+    }
+    if needle_count == 0
+        || needle_count == ROOT_PREFILTER_BYTE_VALUES
+        || needle_count > ROOT_PREFILTER_BUCKETS
+        || structural_leads == needle_count
+        || (needle_count > MEMCHR_ROOT_PREFILTER_NEEDLES
+            && high_nibbles.count_ones()
+                > u32::try_from(ROOT_PREFILTER_BUCKETS)
+                    .expect("the fixed bucket count fits in u32"))
+    {
+        return Ok(None);
+    }
+    Ok(Some(RootGuardCandidate {
+        byte_set,
+        needle_count: u16::try_from(needle_count).map_err(|_| BuildError::Invariant {
+            detail: "folded root successor needle count does not fit u16",
+        })?,
+        offset,
+        structural_leads,
+        frequency_score,
+    }))
 }
 
 fn byte_set_insert(set: &mut [u64; ROOT_PREFILTER_BYTE_WORDS], byte: u8) {
@@ -2657,6 +2946,8 @@ fn preflight_from_lengths(patterns: &[FoldedLiteral<'_>]) -> Result<BuildAccount
     })
 }
 
+// This is the v5 base-column/classifier envelope. Successor work is admitted
+// separately only after source-derived selection proves the primary is narrow.
 fn preflight_root_prefilter_work_upper_bound(
     scalar_positions: usize,
     equivalent_scalars: usize,
@@ -2699,6 +2990,59 @@ fn preflight_root_prefilter_work_upper_bound(
         .ok_or(BuildError::ArithmeticOverflow {
             computation: "folded root prefilter upper work",
         })
+}
+
+fn root_prefilter_successor_work_upper_bound(
+    equivalent_scalars: usize,
+) -> Result<usize, BuildError> {
+    let offset_work = checked_build_mul(
+        MAX_UTF8_WIDTH,
+        ROOT_PREFILTER_OFFSET_WORK,
+        "folded root successor offset upper work",
+    )?;
+    let edge_work = checked_build_mul(
+        equivalent_scalars,
+        ROOT_PREFILTER_EDGE_WORK,
+        "folded root successor edge upper work",
+    )?
+    .checked_mul(MAX_UTF8_WIDTH)
+    .and_then(|work| work.checked_mul(MAX_UTF8_WIDTH))
+    .ok_or(BuildError::ArithmeticOverflow {
+        computation: "folded root successor frontier upper work",
+    })?;
+    let needle_work = checked_build_mul(
+        MAX_UTF8_WIDTH,
+        ROOT_PREFILTER_BYTE_VALUES,
+        "folded root successor byte upper bound",
+    )?
+    .checked_mul(ROOT_PREFILTER_NEEDLE_WORK)
+    .ok_or(BuildError::ArithmeticOverflow {
+        computation: "folded root successor needle upper work",
+    })?;
+    offset_work
+        .checked_add(edge_work)
+        .and_then(|work| work.checked_add(needle_work))
+        .ok_or(BuildError::ArithmeticOverflow {
+            computation: "folded root successor upper work",
+        })
+}
+
+fn admit_root_prefilter_successor(accounting: &mut BuildAccounting) -> Result<(), BuildError> {
+    let successor_work =
+        root_prefilter_successor_work_upper_bound(accounting.equivalent_scalars)?;
+    accounting.root_prefilter_work_upper_bound = accounting
+        .root_prefilter_work_upper_bound
+        .checked_add(successor_work)
+        .ok_or(BuildError::ArithmeticOverflow {
+            computation: "folded root successor prefilter upper work",
+        })?;
+    accounting.work_upper_bound = accounting
+        .work_upper_bound
+        .checked_add(successor_work)
+        .ok_or(BuildError::ArithmeticOverflow {
+            computation: "folded root successor construction work",
+        })?;
+    Ok(())
 }
 
 #[cold]
@@ -3198,6 +3542,7 @@ mod build_probe {
     std::thread_local! {
         static SCALAR_READS: Cell<usize> = const { Cell::new(0) };
         static ALLOCATION_ATTEMPTS: Cell<usize> = const { Cell::new(0) };
+        static SUCCESSOR_ATTEMPTS: Cell<usize> = const { Cell::new(0) };
     }
 
     pub(super) fn record_scalar_reads(reads: usize) {
@@ -3218,9 +3563,19 @@ mod build_probe {
         );
     }
 
+    pub(super) fn record_successor_attempt() {
+        SUCCESSOR_ATTEMPTS.set(
+            SUCCESSOR_ATTEMPTS
+                .get()
+                .checked_add(1)
+                .expect("folded successor probe overflow"),
+        );
+    }
+
     pub(super) fn reset() {
         SCALAR_READS.set(0);
         ALLOCATION_ATTEMPTS.set(0);
+        SUCCESSOR_ATTEMPTS.set(0);
     }
 
     pub(super) fn scalar_reads() -> usize {
@@ -3229,6 +3584,10 @@ mod build_probe {
 
     pub(super) fn allocation_attempts() -> usize {
         ALLOCATION_ATTEMPTS.get()
+    }
+
+    pub(super) fn successor_attempts() -> usize {
+        SUCCESSOR_ATTEMPTS.get()
     }
 }
 
@@ -3363,9 +3722,12 @@ const fn is_continuation(byte: u8) -> bool {
 mod tests {
     use super::{
         BuildAccounting, BuildAttempt, BuildError, BuildLimits, BuildResource, DenseFallbackReason,
-        FoldedLiteral, FoldedLiteralTriePlan, FoldedScalarClass, ScanActual, ScanError, ScanLimits,
-        ScanResource, ScanStop, ScanUpperBounds, build_probe, byte_set_members,
-        execute_folded_scan_impl, scan_source_probe,
+        FoldedLiteral, FoldedLiteralTriePlan, FoldedScalarClass, PrefilterColumn,
+        RootCandidateOutcome, RootGuardCandidate, ScanActual, ScanError, ScanLimits, ScanResource,
+        ScanStop, ScanUpperBounds, build_probe, byte_set_insert,
+        byte_set_members, collect_union_successor_bytes, derive_union_successor_guard,
+        execute_folded_scan_impl, scan_source_probe, successor_guard_is_better,
+        union_successor_guard_candidate,
     };
     use crate::{LiteralCandidate, Window};
     use fre_simd_kernels::{ByteBucketClassifier, DispatchPolicy, SimdDispatchContext};
@@ -3427,6 +3789,51 @@ mod tests {
         }
     }
 
+    fn synthetic_primary(
+        byte: u8,
+        offset: u8,
+        scalar_index: usize,
+        local_offset: u8,
+    ) -> PrefilterColumn {
+        let mut byte_set = [0_u64; 4];
+        byte_set_insert(&mut byte_set, byte);
+        PrefilterColumn {
+            needles: [byte, 0, 0],
+            needle_count: 1,
+            byte_set,
+            high_nibbles: 1_u16 << (byte >> 4),
+            offset,
+            scalar_index,
+            local_offset,
+            structural_leads: usize::from(matches!(byte, 0xC2..=0xF4)),
+            frequency_score: u64::from(super::byte_frequency_rank(byte)).saturating_add(1),
+        }
+    }
+
+    fn union_successor_members(
+        patterns: &[FoldedLiteral<'_>],
+        primary: PrefilterColumn,
+        distance: usize,
+    ) -> Option<Vec<u8>> {
+        let mut byte_set = [0_u64; 4];
+        let mut work = 0;
+        for pattern in patterns {
+            if !collect_union_successor_bytes(
+                *pattern,
+                primary.scalar_index,
+                usize::from(primary.local_offset),
+                distance,
+                &mut byte_set,
+                &mut work,
+            )
+            .unwrap()
+            {
+                return None;
+            }
+        }
+        Some(byte_set_members(byte_set).collect())
+    }
+
     #[test]
     fn kelvin_sigma_russian_and_duplicates_keep_original_byte_offsets() {
         let kelvin = FoldedScalarClass::new(&KELVIN);
@@ -3475,6 +3882,266 @@ mod tests {
         expected.sort_unstable();
         actual.sort_unstable();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn union_successor_frontier_covers_variable_widths_and_safe_cross_products() {
+        const A: [char; 1] = ['A'];
+        const B: [char; 1] = ['B'];
+        const C: [char; 1] = ['C'];
+        const D: [char; 1] = ['D'];
+        const P: [char; 1] = ['p'];
+        let left = [
+            FoldedScalarClass::new(&P),
+            FoldedScalarClass::new(&A),
+            FoldedScalarClass::new(&B),
+        ];
+        let right = [
+            FoldedScalarClass::new(&P),
+            FoldedScalarClass::new(&C),
+            FoldedScalarClass::new(&D),
+        ];
+        let alternatives = [FoldedLiteral::new(&left), FoldedLiteral::new(&right)];
+        let primary = synthetic_primary(b'p', 0, 0, 0);
+        assert_eq!(
+            union_successor_members(&alternatives, primary, 1).unwrap(),
+            [b'A', b'C']
+        );
+        assert_eq!(
+            union_successor_members(&alternatives, primary, 2).unwrap(),
+            [b'B', b'D']
+        );
+        let first = union_successor_members(&alternatives, primary, 1).unwrap();
+        let second = union_successor_members(&alternatives, primary, 2).unwrap();
+        for crossed in [b"pAD", b"pCB"] {
+            assert!(first.contains(&crossed[1]));
+            assert!(second.contains(&crossed[2]));
+        }
+
+        const X: [char; 1] = ['x'];
+        const Y: [char; 1] = ['y'];
+        const Z: [char; 1] = ['z'];
+        const Q: [char; 1] = ['q'];
+        let variable_width = [
+            FoldedScalarClass::new(&KELVIN),
+            FoldedScalarClass::new(&X),
+            FoldedScalarClass::new(&Y),
+            FoldedScalarClass::new(&Z),
+            FoldedScalarClass::new(&Q),
+        ];
+        let variable_width = [FoldedLiteral::new(&variable_width)];
+        let primary = synthetic_primary(b'K', 0, 0, 0);
+        assert_eq!(
+            union_successor_members(&variable_width, primary, 1).unwrap(),
+            [b'x', 0x84]
+        );
+        assert_eq!(
+            union_successor_members(&variable_width, primary, 2).unwrap(),
+            [b'y', 0xAA]
+        );
+        assert_eq!(
+            union_successor_members(&variable_width, primary, 3).unwrap(),
+            [b'x', b'z']
+        );
+        assert_eq!(
+            union_successor_members(&variable_width, primary, 4).unwrap(),
+            [b'q', b'y']
+        );
+
+        let terminal = [FoldedScalarClass::new(&KELVIN)];
+        let terminal = [FoldedLiteral::new(&terminal)];
+        assert!(union_successor_members(&terminal, primary, 1).is_none());
+        let mut work = 0;
+        assert_eq!(
+            derive_union_successor_guard(&terminal, primary, &mut work).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn union_successor_guard_is_authenticated_and_rejections_keep_scanning() {
+        const A: [char; 1] = ['a'];
+        const B: [char; 1] = ['b'];
+        let classes = [
+            FoldedScalarClass::new(&KELVIN),
+            FoldedScalarClass::new(&A),
+            FoldedScalarClass::new(&B),
+        ];
+        let patterns = [FoldedLiteral::new(&classes)];
+        let plan = admitted(&patterns);
+        let prefilter = plan.root_prefilter.as_ref().unwrap();
+        assert_eq!(prefilter.offset, 0);
+        assert!(prefilter.has_guard());
+        assert!((1..=4).contains(&prefilter.guard_offset));
+
+        let exact = [
+            b"Kab".to_vec(),
+            b"kab".to_vec(),
+            "\u{212A}ab".as_bytes().to_vec(),
+        ];
+        assert!(plan.root_prefilter_is_necessary_for(&exact));
+        let mut corrupted = exact.clone();
+        corrupted[0][usize::from(prefilter.guard_offset)] = 0xFF;
+        assert!(!plan.root_prefilter_is_necessary_for(&corrupted));
+
+        let false_roots = b"KxKxKxKxKxKxKxKx";
+        let upper = plan
+            .root_candidate_single_pass_upper_bounds(false_roots.len(), 5)
+            .unwrap();
+        let rejected = plan
+            .find_root_candidate_precharged(false_roots, Window::full(false_roots), upper)
+            .unwrap();
+        assert_eq!(rejected.outcome, RootCandidateOutcome::NoCandidate);
+        assert_eq!(rejected.receipt.actual.candidate_starts, 0);
+
+        let valid = b"xxKab";
+        let upper = plan
+            .root_candidate_single_pass_upper_bounds(valid.len(), 5)
+            .unwrap();
+        assert_eq!(
+            plan.find_root_candidate_precharged(valid, Window::full(valid), upper)
+                .unwrap()
+                .outcome,
+            RootCandidateOutcome::Candidate { start: 2 }
+        );
+    }
+
+    #[test]
+    fn wide_root_keeps_v5_prospective_and_exact_work_gate() {
+        const FOUR: [char; 4] = ['A', 'B', 'C', 'D'];
+        let classes = one_class(&FOUR);
+        let patterns = [FoldedLiteral::new(&classes)];
+        let accounting = admitted(&patterns).build_accounting();
+        assert_eq!(accounting.root_prefilter_needles, 4);
+        assert_eq!(accounting.root_prefilter_guard_needles, 0);
+        assert_eq!(accounting.root_prefilter_work_upper_bound, 2_696);
+        assert_eq!(accounting.work_upper_bound, 2_750);
+
+        build_probe::reset();
+        assert!(matches!(
+            FoldedLiteralTriePlan::build(&patterns, exact_build_limits(&accounting)).unwrap(),
+            BuildAttempt::Admitted(_)
+        ));
+        assert_eq!(build_probe::successor_attempts(), 0);
+
+        build_probe::reset();
+        assert!(matches!(
+            FoldedLiteralTriePlan::build(
+                &patterns,
+                BuildLimits {
+                    max_work: accounting.work_upper_bound - 1,
+                    ..BuildLimits::unlimited()
+                }
+            ),
+            Err(BuildError::Resource {
+                resource: BuildResource::Work,
+                needed: 2_750,
+                limit: 2_749,
+            })
+        ));
+        assert_eq!(build_probe::scalar_reads(), 0);
+        assert_eq!(build_probe::successor_attempts(), 0);
+        assert_eq!(build_probe::allocation_attempts(), 0);
+    }
+
+    #[test]
+    fn narrow_successor_upper_is_enforced_before_derivation_or_allocation() {
+        const A: [char; 1] = ['a'];
+        const B: [char; 1] = ['b'];
+        let classes = [
+            FoldedScalarClass::new(&KELVIN),
+            FoldedScalarClass::new(&A),
+            FoldedScalarClass::new(&B),
+        ];
+        let patterns = [FoldedLiteral::new(&classes)];
+        let base = super::preflight_from_lengths(&patterns).unwrap();
+        let successor = super::root_prefilter_successor_work_upper_bound(
+            base.equivalent_scalars,
+        )
+        .unwrap();
+        assert_eq!(base.root_prefilter_work_upper_bound, 6_836);
+        assert_eq!(base.work_upper_bound, 6_918);
+        assert_eq!(successor, 2_616);
+
+        let accounting = admitted(&patterns).build_accounting();
+        assert_eq!(accounting.root_prefilter_needles, 3);
+        assert_ne!(accounting.root_prefilter_guard_needles, 0);
+        assert_eq!(
+            accounting.root_prefilter_work_upper_bound,
+            base.root_prefilter_work_upper_bound + successor
+        );
+        assert_eq!(accounting.root_prefilter_work_upper_bound, 9_452);
+        assert_eq!(accounting.work_upper_bound, 9_534);
+
+        build_probe::reset();
+        assert!(matches!(
+            FoldedLiteralTriePlan::build(&patterns, exact_build_limits(&accounting)).unwrap(),
+            BuildAttempt::Admitted(_)
+        ));
+        assert_eq!(build_probe::successor_attempts(), 1);
+
+        build_probe::reset();
+        assert!(matches!(
+            FoldedLiteralTriePlan::build(
+                &patterns,
+                BuildLimits {
+                    max_work: accounting.work_upper_bound - 1,
+                    ..BuildLimits::unlimited()
+                }
+            ),
+            Err(BuildError::Resource {
+                resource: BuildResource::Work,
+                needed: 9_534,
+                limit: 9_533,
+            })
+        ));
+        assert_ne!(build_probe::scalar_reads(), 0);
+        assert_eq!(build_probe::successor_attempts(), 0);
+        assert_eq!(build_probe::allocation_attempts(), 0);
+    }
+
+    #[test]
+    fn successor_replacement_requires_better_score_or_an_equal_closer_column() {
+        let candidate = |offset, structural_leads, frequency_score| RootGuardCandidate {
+            byte_set: [0; 4],
+            needle_count: 1,
+            offset,
+            structural_leads,
+            frequency_score,
+        };
+        let primary_offset = 5;
+        let fixed = candidate(10, 0, 20);
+        let closer = candidate(6, 0, 20);
+        let equal_farther = candidate(11, 0, 20);
+        let better_farther = candidate(11, 0, 19);
+        let worse_closer = candidate(6, 0, 21);
+        assert!(successor_guard_is_better(closer, fixed, primary_offset));
+        assert!(!successor_guard_is_better(
+            equal_farther,
+            fixed,
+            primary_offset
+        ));
+        assert!(successor_guard_is_better(
+            better_farther,
+            fixed,
+            primary_offset
+        ));
+        assert!(!successor_guard_is_better(
+            worse_closer,
+            fixed,
+            primary_offset
+        ));
+
+        let mut broad = [0_u64; 4];
+        for byte in b'a'..=b'i' {
+            byte_set_insert(&mut broad, byte);
+        }
+        let mut work = 0;
+        assert_eq!(
+            union_successor_guard_candidate(broad, 1, &mut work).unwrap(),
+            None,
+            "a broad successor cannot justify a scalar load at every primary hit"
+        );
     }
 
     #[test]
