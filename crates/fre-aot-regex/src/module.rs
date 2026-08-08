@@ -16782,53 +16782,106 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x60, 0, 0, 0, 0])?;
         }
 
-        assembler.bind(v8_scan)?;
-        if let Some(root_vector) = root_vector {
-            let non_root = assembler.label()?;
-            assembler.instruction(&[0x4c, 0x3b, 0x44, 0x24, 0x50])?;
-            assembler.branch(&[0x0f, 0x85], non_root)?;
-            if output != OutputContract::Exists {
-                assembler.instruction(&[0x48, 0x83, 0x7c, 0x24, 0x60, 0])?;
-                assembler.branch(&[0x0f, 0x85], non_root)?;
+        let emit_v8_transition = |assembler: &mut X86Assembler| -> Result<(), ObjectError> {
+            assembler.instruction(&[0x48, 0xff, 0xc2])?;
+            if output == OutputContract::Exists {
+                assembler.instruction(&[0x66, 0x45, 0x85, 0xd2])?;
+                assembler.branch(&[0x0f, 0x88], native_match)?;
+                assembler.branch(
+                    &[0x0f, 0x84],
+                    native_complete.unwrap_or(native_no_match),
+                )?;
+            } else {
+                assembler.instruction(&[0x41, 0xf7, 0xc2, 0x00, 0x80, 0x00, 0x00])?;
+                let not_accepting = assembler.label()?;
+                assembler.branch(&[0x0f, 0x84], not_accepting)?;
+                assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x60])?;
+                assembler.bind(not_accepting)?;
+                assembler.instruction(&[0x41, 0x81, 0xe2, 0xff, 0x7f, 0x00, 0x00])?;
+                assembler.branch(
+                    &[0x0f, 0x84],
+                    native_complete.unwrap_or(native_no_match),
+                )?;
             }
-            assembler.branch(&[0xe9], root_vector)?;
-            assembler.bind(non_root)?;
-        }
+            assembler.instruction(&[0x41, 0xff, 0xca])?;
+            if let Some(root_vector) = root_vector {
+                let non_root = assembler.label()?;
+                assembler.instruction(&[0x45, 0x85, 0xd2])?;
+                assembler.branch(&[0x0f, 0x85], non_root)?;
+                if output != OutputContract::Exists {
+                    assembler.instruction(&[0x48, 0x83, 0x7c, 0x24, 0x60, 0])?;
+                    assembler.branch(&[0x0f, 0x85], non_root)?;
+                }
+                assembler.branch(&[0xe9], root_vector)?;
+                assembler.bind(non_root)?;
+            }
+            assembler.instruction(&[0x49, 0xc1, 0xe2, 9])?;
+            assembler.instruction(&[0x4e, 0x8d, 0x04, 0x16])?;
+            Ok(())
+        };
 
-        assembler.bind(v8_table_scan)?;
-        assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
-        assembler.instruction(&[0x47, 0x0f, 0xb7, 0x14, 0x50])?;
-        assembler.instruction(&[0x48, 0xff, 0xc2])?;
-        if output == OutputContract::Exists {
-            assembler.instruction(&[0x66, 0x45, 0x85, 0xd2])?;
-            assembler.branch(&[0x0f, 0x88], native_match)?;
-            assembler.branch(&[0x0f, 0x84], native_complete.unwrap_or(native_no_match))?;
-        } else {
-            assembler.instruction(&[0x41, 0xf7, 0xc2, 0x00, 0x80, 0x00, 0x00])?;
-            let not_accepting = assembler.label()?;
-            assembler.branch(&[0x0f, 0x84], not_accepting)?;
-            assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x60])?;
-            assembler.bind(not_accepting)?;
-            assembler.instruction(&[0x41, 0x81, 0xe2, 0xff, 0x7f, 0x00, 0x00])?;
-            assembler.branch(&[0x0f, 0x84], native_complete.unwrap_or(native_no_match))?;
-        }
-        assembler.instruction(&[0x41, 0xff, 0xca])?;
-        if let Some(root_vector) = root_vector {
-            let non_root = assembler.label()?;
-            assembler.instruction(&[0x45, 0x85, 0xd2])?;
-            assembler.branch(&[0x0f, 0x85], non_root)?;
-            if output != OutputContract::Exists {
-                assembler.instruction(&[0x48, 0x83, 0x7c, 0x24, 0x60, 0])?;
-                assembler.branch(&[0x0f, 0x85], non_root)?;
+        if root_plan.is_none() {
+            // V8 uses raw-byte columns and authenticated u16 state ordinals.
+            // Fetch two independent bytes before following either dependent
+            // transition, and retain one real byte for an exact scalar tail.
+            let scalar_tail = assembler.label()?;
+            assembler.instruction(&[0x48, 0x89, 0xc8])?; // mov rax, rcx
+            assembler.instruction(&[0x48, 0xff, 0xc8])?; // dec rax
+            assembler.instruction(&[0x48, 0x39, 0xc2])?; // cmp rdx, rax
+            assembler.branch(&[0x0f, 0x83], scalar_tail)?;
+
+            assembler.bind(v8_scan)?;
+            assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
+            assembler.instruction(&[0x44, 0x0f, 0xb6, 0x5c, 0x17, 0x01])?;
+            assembler.instruction(&[0x47, 0x0f, 0xb7, 0x14, 0x50])?;
+            emit_v8_transition(&mut assembler)?;
+            assembler.instruction(&[0x47, 0x0f, 0xb7, 0x14, 0x58])?;
+            emit_v8_transition(&mut assembler)?;
+            assembler.instruction(&[0x48, 0x39, 0xc2])?;
+            assembler.branch(&[0x0f, 0x82], v8_scan)?;
+
+            assembler.bind(scalar_tail)?;
+            assembler.instruction(&[0x48, 0x39, 0xca])?;
+            assembler.branch(
+                &[0x0f, 0x83],
+                native_complete.unwrap_or(native_no_match),
+            )?;
+            assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
+            assembler.instruction(&[0x47, 0x0f, 0xb7, 0x14, 0x50])?;
+            assembler.instruction(&[0x48, 0xff, 0xc2])?;
+            if output == OutputContract::Exists {
+                assembler.instruction(&[0x66, 0x45, 0x85, 0xd2])?;
+                assembler.branch(&[0x0f, 0x88], native_match)?;
+            } else {
+                assembler.instruction(&[0x41, 0xf7, 0xc2, 0x00, 0x80, 0x00, 0x00])?;
+                let not_accepting = assembler.label()?;
+                assembler.branch(&[0x0f, 0x84], not_accepting)?;
+                assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x60])?;
+                assembler.bind(not_accepting)?;
             }
-            assembler.branch(&[0xe9], root_vector)?;
-            assembler.bind(non_root)?;
+            assembler.branch(&[0xe9], native_complete.unwrap_or(native_no_match))?;
+        } else {
+            assembler.bind(v8_scan)?;
+            if let Some(root_vector) = root_vector {
+                let non_root = assembler.label()?;
+                assembler.instruction(&[0x4c, 0x3b, 0x44, 0x24, 0x50])?;
+                assembler.branch(&[0x0f, 0x85], non_root)?;
+                if output != OutputContract::Exists {
+                    assembler.instruction(&[0x48, 0x83, 0x7c, 0x24, 0x60, 0])?;
+                    assembler.branch(&[0x0f, 0x85], non_root)?;
+                }
+                assembler.branch(&[0xe9], root_vector)?;
+                assembler.bind(non_root)?;
+            }
+
+            assembler.bind(v8_table_scan)?;
+            assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
+            assembler.instruction(&[0x47, 0x0f, 0xb7, 0x14, 0x50])?;
+            emit_v8_transition(&mut assembler)?;
+            assembler.instruction(&[0x48, 0x39, 0xca])?;
+            assembler.branch(&[0x0f, 0x82], v8_scan)?;
+            assembler.branch(&[0xe9], native_complete.unwrap_or(native_no_match))?;
         }
-        assembler.instruction(&[0x49, 0xc1, 0xe2, 9])?;
-        assembler.instruction(&[0x4e, 0x8d, 0x04, 0x16])?;
-        assembler.instruction(&[0x48, 0x39, 0xca])?;
-        assembler.branch(&[0x0f, 0x82], v8_scan)?;
-        assembler.branch(&[0xe9], native_complete.unwrap_or(native_no_match))?;
     }
 
     }
@@ -27414,58 +27467,122 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             assembler.instruction(aarch64_store_x(31, 31, 80)?)?;
         }
 
-        assembler.bind(v8_scan)?;
-        if let Some(root_dispatch) = root_dispatch {
-            let non_root = assembler.label()?;
-            assembler.instruction(aarch64_cmp_x(11, 15)?)?;
-            assembler.branch_cond(AARCH64_NE, non_root)?;
-            if output != OutputContract::Exists {
-                assembler.instruction(aarch64_load_x_imm(12, 31, 80)?)?;
-                assembler.instruction(aarch64_cmp_x_imm(12, 0)?)?;
-                assembler.branch_cond(AARCH64_NE, non_root)?;
-            }
-            assembler.branch(root_dispatch)?;
-            assembler.bind(non_root)?;
-        }
+        let emit_v8_transition =
+            |assembler: &mut Aarch64Assembler,
+             cursor_already_advanced: bool|
+             -> Result<(), ObjectError> {
+                if !cursor_already_advanced {
+                    assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
+                }
+                if output == OutputContract::Exists {
+                    assembler.branch_bit_set_w(8, 15, native_match)?;
+                    assembler.branch_zero_w(
+                        8,
+                        native_complete.unwrap_or(native_no_match),
+                    )?;
+                    assembler.instruction(aarch64_sub_w_imm(6, 8, 1)?)?;
+                } else {
+                    let not_accepting = assembler.label()?;
+                    assembler.branch_bit_clear_w(8, 15, not_accepting)?;
+                    assembler.instruction(aarch64_store_x(2, 31, 80)?)?;
+                    assembler.bind(not_accepting)?;
+                    assembler.instruction(aarch64_and_low_w(6, 8, 15)?)?;
+                    assembler.branch_zero_w(
+                        6,
+                        native_complete.unwrap_or(native_no_match),
+                    )?;
+                    assembler.instruction(aarch64_sub_w_imm(6, 6, 1)?)?;
+                }
+                if let Some(root_dispatch) = root_dispatch {
+                    let non_root = assembler.label()?;
+                    assembler.branch_nonzero_w(6, non_root)?;
+                    if output != OutputContract::Exists {
+                        assembler.instruction(aarch64_load_x_imm(12, 31, 80)?)?;
+                        assembler.instruction(aarch64_cmp_x_imm(12, 0)?)?;
+                        assembler.branch_cond(AARCH64_NE, non_root)?;
+                    }
+                    assembler.branch(root_dispatch)?;
+                    assembler.bind(non_root)?;
+                }
+                assembler.instruction(aarch64_add_x_lsl(11, 15, 6, 9)?)?;
+                Ok(())
+            };
 
-        assembler.bind(v8_table_scan)?;
-        if scanner_free_exists_pointer_cursor {
-            assembler.instruction(aarch64_load_byte_post_imm(6, 2, 1)?)?;
-        } else {
-            assembler.instruction(aarch64_load_byte_reg(6, 0, 2)?)?;
-        }
-        assembler.instruction(aarch64_load_h_uxtw(8, 11, 6)?)?;
-        if !scanner_free_exists_pointer_cursor {
-            assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
-        }
-        if output == OutputContract::Exists {
-            assembler.branch_bit_set_w(8, 15, native_match)?;
-            assembler.branch_zero_w(8, native_complete.unwrap_or(native_no_match))?;
-            assembler.instruction(aarch64_sub_w_imm(6, 8, 1)?)?;
-        } else {
-            let not_accepting = assembler.label()?;
-            assembler.branch_bit_clear_w(8, 15, not_accepting)?;
-            assembler.instruction(aarch64_store_x(2, 31, 80)?)?;
-            assembler.bind(not_accepting)?;
-            assembler.instruction(aarch64_and_low_w(6, 8, 15)?)?;
-            assembler.branch_zero_w(6, native_complete.unwrap_or(native_no_match))?;
-            assembler.instruction(aarch64_sub_w_imm(6, 6, 1)?)?;
-        }
-        if let Some(root_dispatch) = root_dispatch {
-            let non_root = assembler.label()?;
-            assembler.branch_nonzero_w(6, non_root)?;
-            if output != OutputContract::Exists {
-                assembler.instruction(aarch64_load_x_imm(12, 31, 80)?)?;
-                assembler.instruction(aarch64_cmp_x_imm(12, 0)?)?;
-                assembler.branch_cond(AARCH64_NE, non_root)?;
+        if root_plan.is_none() {
+            // V8's two raw-byte loads are independent. Schedule both before
+            // the first dependent u16 cell, then preserve one exact scalar
+            // tail so no input byte is read outside the admitted window.
+            let scalar_tail = assembler.label()?;
+            assembler.instruction(aarch64_sub_x_imm(9, 3, 1)?)?;
+            assembler.instruction(aarch64_cmp_x(2, 9)?)?;
+            assembler.branch_cond(AARCH64_HS, scalar_tail)?;
+
+            assembler.bind(v8_scan)?;
+            if scanner_free_exists_pointer_cursor {
+                assembler.instruction(aarch64_load_byte_imm(6, 2, 0)?)?;
+                assembler.instruction(aarch64_load_byte_imm(10, 2, 1)?)?;
+            } else {
+                assembler.instruction(aarch64_load_byte_reg(6, 0, 2)?)?;
+                assembler.instruction(aarch64_add_x_imm(12, 2, 1)?)?;
+                assembler.instruction(aarch64_load_byte_reg(10, 0, 12)?)?;
             }
-            assembler.branch(root_dispatch)?;
-            assembler.bind(non_root)?;
+            assembler.instruction(aarch64_load_h_uxtw(8, 11, 6)?)?;
+            emit_v8_transition(&mut assembler, false)?;
+            assembler.instruction(aarch64_load_h_uxtw(8, 11, 10)?)?;
+            emit_v8_transition(&mut assembler, false)?;
+            assembler.instruction(aarch64_cmp_x(2, 9)?)?;
+            assembler.branch_cond(AARCH64_LO, v8_scan)?;
+
+            assembler.bind(scalar_tail)?;
+            assembler.instruction(aarch64_cmp_x(2, 3)?)?;
+            assembler.branch_cond(
+                AARCH64_HS,
+                native_complete.unwrap_or(native_no_match),
+            )?;
+            if scanner_free_exists_pointer_cursor {
+                assembler.instruction(aarch64_load_byte_imm(6, 2, 0)?)?;
+            } else {
+                assembler.instruction(aarch64_load_byte_reg(6, 0, 2)?)?;
+            }
+            assembler.instruction(aarch64_load_h_uxtw(8, 11, 6)?)?;
+            assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
+            if output == OutputContract::Exists {
+                assembler.branch_bit_set_w(8, 15, native_match)?;
+            } else {
+                let not_accepting = assembler.label()?;
+                assembler.branch_bit_clear_w(8, 15, not_accepting)?;
+                assembler.instruction(aarch64_store_x(2, 31, 80)?)?;
+                assembler.bind(not_accepting)?;
+            }
+            assembler.branch(native_complete.unwrap_or(native_no_match))?;
+        } else {
+            assembler.bind(v8_scan)?;
+            if let Some(root_dispatch) = root_dispatch {
+                let non_root = assembler.label()?;
+                assembler.instruction(aarch64_cmp_x(11, 15)?)?;
+                assembler.branch_cond(AARCH64_NE, non_root)?;
+                if output != OutputContract::Exists {
+                    assembler.instruction(aarch64_load_x_imm(12, 31, 80)?)?;
+                    assembler.instruction(aarch64_cmp_x_imm(12, 0)?)?;
+                    assembler.branch_cond(AARCH64_NE, non_root)?;
+                }
+                assembler.branch(root_dispatch)?;
+                assembler.bind(non_root)?;
+            }
+
+            assembler.bind(v8_table_scan)?;
+            let cursor_already_advanced = scanner_free_exists_pointer_cursor;
+            if cursor_already_advanced {
+                assembler.instruction(aarch64_load_byte_post_imm(6, 2, 1)?)?;
+            } else {
+                assembler.instruction(aarch64_load_byte_reg(6, 0, 2)?)?;
+            }
+            assembler.instruction(aarch64_load_h_uxtw(8, 11, 6)?)?;
+            emit_v8_transition(&mut assembler, cursor_already_advanced)?;
+            assembler.instruction(aarch64_cmp_x(2, 3)?)?;
+            assembler.branch_cond(AARCH64_LO, v8_scan)?;
+            assembler.branch(native_complete.unwrap_or(native_no_match))?;
         }
-        assembler.instruction(aarch64_add_x_lsl(11, 15, 6, 9)?)?;
-        assembler.instruction(aarch64_cmp_x(2, 3)?)?;
-        assembler.branch_cond(AARCH64_LO, v8_scan)?;
-        assembler.branch(native_complete.unwrap_or(native_no_match))?;
     }
 
     }
@@ -29976,9 +30093,9 @@ mod tests {
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "one cross-ISA audit keeps all four paired compact generations, scalar tails, and rooted scalar paths together"
+        reason = "one cross-ISA audit keeps all five paired compact generations, scalar tails, and rooted scalar paths together"
     )]
-    fn scanner_free_v3_v4_v10_v12_use_exact_two_byte_schedules_cross_isa() {
+    fn scanner_free_v3_v4_v8_v10_v12_use_exact_two_byte_schedules_cross_isa() {
         fn byte_occurrences(code: &[u8], needle: &[u8]) -> usize {
             code.windows(needle.len())
                 .filter(|window| *window == needle)
@@ -30023,6 +30140,11 @@ mod tests {
             0x47, 0x0f, 0xb6, 0x1c, 0x19, // second class
             0x47, 0x0f, 0xb7, 0x14, 0x50, // first u16 cell
         ];
+        let x86_direct_u16_prefix = [
+            0x44, 0x0f, 0xb6, 0x14, 0x17, // byte[position]
+            0x44, 0x0f, 0xb6, 0x5c, 0x17, 0x01, // byte[position + 1]
+            0x47, 0x0f, 0xb7, 0x14, 0x50, // first u16 cell
+        ];
         let x86_direct_u8_prefix = [
             0x44, 0x0f, 0xb6, 0x14, 0x17, // byte[position]
             0x44, 0x0f, 0xb6, 0x5c, 0x17, 0x01, // byte[position + 1]
@@ -30061,10 +30183,10 @@ mod tests {
                 let context = format!("x86/{tier}/{output:?}/width={exact_span_width:?}");
                 let supertransitions =
                     !(output == OutputContract::Span && exact_span_width.is_none());
-                assert_eq!(byte_occurrences(code, &x86_pair_guard), 20, "{context}");
+                assert_eq!(byte_occurrences(code, &x86_pair_guard), 21, "{context}");
                 assert_eq!(
                     byte_occurrences(code, &x86_second_byte),
-                    if supertransitions { 30 } else { 20 },
+                    if supertransitions { 31 } else { 21 },
                     "{context}: all production paired bodies"
                 );
                 assert_eq!(
@@ -30074,8 +30196,8 @@ mod tests {
                 );
                 assert_eq!(
                     byte_occurrences(code, &x86_second_u16_cell),
-                    10,
-                    "{context}: V4 plus all nine V3 shifts"
+                    11,
+                    "{context}: V4, V8, plus all nine V3 shifts"
                 );
                 assert_eq!(
                     byte_occurrences(code, &x86_second_u8_cell),
@@ -30086,6 +30208,11 @@ mod tests {
                     byte_occurrences(code, &x86_mapped_u16_prefix),
                     10,
                     "{context}: mapped u16 pair prefixes"
+                );
+                assert_eq!(
+                    byte_occurrences(code, &x86_direct_u16_prefix),
+                    1,
+                    "{context}: direct V8 pair prefix"
                 );
                 assert_eq!(
                     byte_occurrences(code, &x86_direct_u8_prefix),
@@ -30135,7 +30262,7 @@ mod tests {
                         x86_test_normalized_branch_opcode(code, after_branch) == Some(0xe9)
                     })
                     .count();
-                assert_eq!(pair_backedges.len(), 20, "{context}: exact pair backedges");
+                assert_eq!(pair_backedges.len(), 21, "{context}: exact pair backedges");
                 assert_eq!(
                     shared_tail_jumps, 16,
                     "{context}: every nonfinal V3/V12 shift must jump over later entries without resetting its current row; each final shift falls directly into the tail"
@@ -30193,7 +30320,7 @@ mod tests {
                 .enumerate()
                 .filter_map(|(offset, window)| (window == arm_pair_guard).then_some(offset))
                 .collect::<Vec<_>>();
-            assert_eq!(guards.len(), 20, "{context}: exact pair guards");
+            assert_eq!(guards.len(), 21, "{context}: exact pair guards");
             for guard in guards {
                 let branch = guard + arm_pair_guard.len();
                 assert_eq!(
@@ -30220,8 +30347,8 @@ mod tests {
                     .iter()
                     .filter(|&&word| word == arm_second_u16_cell)
                     .count(),
-                10,
-                "{context}: V4 plus all nine V3 second cells"
+                11,
+                "{context}: V4, V8, plus all nine V3 second cells"
             );
             assert_eq!(
                 words
@@ -30247,7 +30374,7 @@ mod tests {
                 .iter()
                 .filter(|&&after_branch| words[after_branch] & 0xfc00_0000 == 0x1400_0000)
                 .count();
-            assert_eq!(pair_backedges.len(), 20, "{context}: exact pair backedges");
+            assert_eq!(pair_backedges.len(), 21, "{context}: exact pair backedges");
             assert_eq!(
                 shared_tail_jumps, 16,
                 "{context}: every nonfinal V3/V12 shift must jump over later entries without resetting its current row; each final shift falls directly into the tail"
@@ -37565,6 +37692,97 @@ mod tests {
         any(target_arch = "x86_64", target_arch = "aarch64"),
         any(target_os = "linux", target_os = "macos")
     ))]
+    fn scanner_free_direct_u16_columns_raw() -> fre_automata::RawPlan {
+        use fre_automata::{EdgeKind, RawPlan, StateRole};
+
+        // Two eight-bit NFA layers recognize byte pairs whose one-based byte
+        // codes share a low bit. Bytes 0..=254 produce all 255 distinct
+        // nonempty second-layer subsets. Byte 255 reuses subset one in the
+        // first layer and subset three in the second, keeping every byte live at
+        // either position while its ordered membership pair stays distinct
+        // from every `(code, code)` column. Thus the combined vectors retain
+        // all 256 semantic input columns, and a compact 18-state NFA generally
+        // fills the 256-state K0 arena without a selective root scanner. Exact
+        // width two avoids a redundant reverse table, forcing the direct-u16
+        // V8 owner rather than a mapped or compact-u8 representation while
+        // staying within normal live and packed workspace budgets.
+        let bit_count = 8_usize;
+        let first_base = 1_usize;
+        let second_base = first_base + bit_count;
+        let accept = second_base + bit_count;
+        let mut roles = Vec::with_capacity(accept + 1);
+        roles.push(StateRole::Split);
+        roles.extend(std::iter::repeat_n(StateRole::Consume, bit_count));
+        roles.extend(std::iter::repeat_n(StateRole::Consume, bit_count));
+        roles.push(StateRole::Accept);
+
+        let mut edge_offsets = Vec::with_capacity(roles.len() + 1);
+        let mut edge_targets = Vec::new();
+        let mut edge_kinds = Vec::new();
+        let mut byte_starts = Vec::new();
+        let mut byte_ends = Vec::new();
+        edge_offsets.push(0);
+
+        for bit in 0..bit_count {
+            edge_targets.push(u32::try_from(first_base + bit).unwrap());
+            edge_kinds.push(EdgeKind::Epsilon);
+            byte_starts.push(0);
+            byte_ends.push(0);
+        }
+        edge_offsets.push(u32::try_from(edge_targets.len()).unwrap());
+
+        for bit in 0..bit_count {
+            for byte in u8::MIN..=u8::MAX {
+                let code = if byte == u8::MAX {
+                    1
+                } else {
+                    usize::from(byte) + 1
+                };
+                if code & (1_usize << bit) == 0 {
+                    continue;
+                }
+                edge_targets.push(u32::try_from(second_base + bit).unwrap());
+                edge_kinds.push(EdgeKind::ByteRange);
+                byte_starts.push(byte);
+                byte_ends.push(byte);
+            }
+            edge_offsets.push(u32::try_from(edge_targets.len()).unwrap());
+        }
+
+        for bit in 0..bit_count {
+            for byte in u8::MIN..=u8::MAX {
+                let code = if byte == u8::MAX {
+                    3
+                } else {
+                    usize::from(byte) + 1
+                };
+                if code & (1_usize << bit) == 0 {
+                    continue;
+                }
+                edge_targets.push(u32::try_from(accept).unwrap());
+                edge_kinds.push(EdgeKind::ByteRange);
+                byte_starts.push(byte);
+                byte_ends.push(byte);
+            }
+            edge_offsets.push(u32::try_from(edge_targets.len()).unwrap());
+        }
+        edge_offsets.push(u32::try_from(edge_targets.len()).unwrap());
+
+        RawPlan {
+            start: 0,
+            roles,
+            edge_offsets,
+            edge_targets,
+            edge_kinds,
+            byte_starts,
+            byte_ends,
+        }
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
     fn scanner_free_dynamic_program(
         raw: fre_automata::RawPlan,
         output: OutputContract,
@@ -37697,8 +37915,10 @@ mod tests {
         assert_eq!(view.root_requirement.is_some(), expects_root_scanner);
         assert!(!verify_retained_fallback || use_frozen_owner);
         if use_frozen_owner {
-            assert_eq!(view.output, OutputContract::Span);
-            assert_eq!(view.exact_match_width, None);
+            if verify_retained_fallback {
+                assert_eq!(view.output, OutputContract::Span);
+                assert_eq!(view.exact_match_width, None);
+            }
             let mut workspace = program
                 .prepare_workspace()
                 .expect("compact link-proof workspace");
@@ -38101,6 +38321,111 @@ mod tests {
                 expected_end: pending_end,
             }],
         );
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    #[ignore = "requires `cargo build -p fre-aot-regex-runtime --lib`; links the direct-u16 V8 generated loop to the real runtime"]
+    fn linked_host_scanner_free_direct_u16_v8_matches_real_runtime() {
+        fn host_target() -> Target {
+            if cfg!(target_arch = "x86_64") {
+                if cfg!(target_os = "linux") {
+                    Target::x86_64_linux()
+                } else {
+                    Target::x86_64_macos()
+                }
+            } else if cfg!(target_os = "linux") {
+                Target::aarch64_linux()
+            } else {
+                Target::aarch64_macos()
+            }
+        }
+
+        let window_start = 5_usize;
+        let window_end = window_start + DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES + 31;
+        let window = SearchWindow::new(window_start, window_end);
+        let haystack_len = window_end + 3;
+        let no_match = (0..haystack_len)
+            .map(|index| if index % 2 == 0 { 0_u8 } else { 1_u8 })
+            .collect::<Vec<_>>();
+        let warm = no_match.clone();
+        let candidate = window_start + 17;
+        let mut matching = no_match.clone();
+        matching[candidate..candidate + 2].copy_from_slice(&[3, 3]);
+        let tail_candidate = window_end - 2;
+        let mut tail_matching = no_match.clone();
+        tail_matching[tail_candidate..tail_candidate + 2].copy_from_slice(&[3, 3]);
+        let target = host_target();
+
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let program =
+                scanner_free_dynamic_program(scanner_free_direct_u16_columns_raw(), output);
+            let view = program
+                .native_dynamic_rows_view()
+                .expect("direct-u16 V8 dynamic view");
+            assert_eq!(view.root_requirement, None);
+            assert_eq!(view.exact_match_width, Some(2));
+            let mut workspace = program.prepare_workspace().expect("V8 proof workspace");
+            let storage = program
+                .compiler_private_frozen_dynamic_rows_storage_v3(
+                    &mut workspace,
+                    512 * 1024,
+                    512 * 1024,
+                )
+                .expect("direct-u16 V8 compact owner");
+            assert_eq!(
+                storage.format_version(),
+                FROZEN_DYNAMIC_ROWS_V8_FORMAT_VERSION
+            );
+
+            let expected = |start: usize, end: usize| match output {
+                OutputContract::Exists => (0, 0),
+                OutputContract::SelectedEnd => (end, end),
+                OutputContract::Span => (start, end),
+            };
+            let (expected_start, expected_end) = expected(candidate, candidate + 2);
+            let (tail_expected_start, tail_expected_end) =
+                expected(tail_candidate, tail_candidate + 2);
+            link_real_dynamic_first_hole_cases(
+                &program,
+                target,
+                false,
+                true,
+                false,
+                &format!("ScannerFreeDirectU16V8{output:?}"),
+                window,
+                &[
+                    LinkedDynamicFirstHoleCase {
+                        warm: &warm,
+                        novel: &matching,
+                        expected_status: 1,
+                        expected_start,
+                        expected_end,
+                    },
+                    LinkedDynamicFirstHoleCase {
+                        warm: &warm,
+                        novel: &tail_matching,
+                        expected_status: 1,
+                        expected_start: tail_expected_start,
+                        expected_end: tail_expected_end,
+                    },
+                    LinkedDynamicFirstHoleCase {
+                        warm: &warm,
+                        novel: &no_match,
+                        expected_status: 0,
+                        expected_start: 0,
+                        expected_end: 0,
+                    },
+                ],
+            );
+        }
     }
 
     #[cfg(all(
@@ -46132,8 +46457,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             .unwrap();
             assert_eq!(
                 x86_bound_tests(&x86.code, 0x82, true),
-                13,
-                "x86 singleton, two V7 resumes, V8, and all V6 shifts retain end-relative backedges while V3/V4/V10/V12 use exact pair bounds for {output:?}"
+                12,
+                "x86 singleton, two V7 resumes, and all V6 shifts retain end-relative backedges while V3/V4/V8/V10/V12 use exact pair bounds for {output:?}"
             );
             let x86_mapped_v4 = [
                 0x44, 0x0f, 0xb6, 0x14, 0x17, 0x47, 0x0f, 0xb6, 0x14, 0x11, 0x47, 0x0f,
@@ -46180,8 +46505,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             .unwrap();
             assert_eq!(
                 aarch64_bound_tests(&arm.code, AARCH64_LO, true),
-                6,
-                "AArch64 singleton, two V7 and two shared V6 resumes, and V8 retain end-relative backedges while V3/V4/V10/V12 use exact pair bounds for {output:?}"
+                5,
+                "AArch64 singleton, two V7 and two shared V6 resumes retain end-relative backedges while V3/V4/V8/V10/V12 use exact pair bounds for {output:?}"
             );
             let words = aarch64_words(&arm.code);
             let setup_count = words
@@ -46217,7 +46542,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                         .windows(2)
                         .filter(|body| *body == v8_postindexed_body)
                         .count(),
-                    1
+                    0,
+                    "scanner-free V8 uses explicit paired byte loads"
                 );
                 assert_eq!(
                     words
@@ -47036,7 +47362,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             let v8_raw_load = if root.is_some() {
                 aarch64_load_byte_reg(6, 0, 2).unwrap()
             } else {
-                aarch64_load_byte_post_imm(6, 2, 1).unwrap()
+                aarch64_load_byte_imm(6, 2, 0).unwrap()
             };
             let direct_v8_body = [v8_raw_load, aarch64_load_h_uxtw(8, 11, 6).unwrap()];
             let paired_u8_raw_load = if root.is_some() {
@@ -48787,12 +49113,12 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
         let x86 = lower_x86_64_dynamic_rows_prepared(None, FeatureSet::EMPTY).unwrap();
         assert_eq!(
             occurrences(&x86.code, &[0x47, 0x0f, 0xb7, 0x14, 0x50]),
-            36,
+            37,
             "V14, V13, V8, V7/V6, paired V3/V4 first cells, and their scalar tails need scaled u16 loads"
         );
         assert_eq!(
             occurrences(&x86.code, &[0x4e, 0x8d, 0x04, 0x16]),
-            48,
+            49,
             "V8/V6 and both ordered V3/V10/V12 transitions need state-ordinal backedges"
         );
         assert_eq!(
@@ -49449,7 +49775,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 .iter()
                 .filter(|&&word| word == aarch64_load_h_uxtw(8, 11, 6).unwrap())
                 .count(),
-            12,
+            13,
             "V6/V8, the first V3 cell for every shift, and the shared V3 scalar tail"
         );
         assert_eq!(
@@ -49457,8 +49783,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 .iter()
                 .filter(|&&word| word == aarch64_load_h_uxtw(8, 11, 10).unwrap())
                 .count(),
-            10,
-            "the second unrolled V3 cell for every shift plus paired V4 use their independently mapped classes"
+            11,
+            "the second unrolled V3 cell for every shift plus paired V4/V8 use their independently loaded columns"
         );
         assert_eq!(
             arm_words
@@ -49493,7 +49819,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 match shift {
                     1..=7 => 4,
                     8 => 6,
-                    9 => 3,
+                    9 => 4,
                     _ => unreachable!(),
                 },
                 "shift={shift} accounts exactly for both ordered V3/V10/V12 transitions and unchanged direct formats"
