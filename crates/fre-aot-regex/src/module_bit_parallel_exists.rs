@@ -954,13 +954,9 @@ fn lower_x86_64_multiword_bit_parallel(
                 assembler.instruction(&[0x62, 0xd1, 0xfe, 0x28, 0x6f, 0x02])?;
             }
         } else {
-            for word in 0..layout.words {
-                let row_offset = u8::try_from(word * 8)
-                    .map_err(|_| ObjectError::ArithmeticOverflow("x86 root row offset"))?;
-                let reached_offset = u8::try_from(32 + word * 8)
-                    .map_err(|_| ObjectError::ArithmeticOverflow("x86 reached stack offset"))?;
-                assembler.instruction(&[0x49, 0x8b, 0x72, row_offset])?;
-                assembler.instruction(&[0x48, 0x89, 0x74, 0x24, reached_offset])?;
+            assembler.instruction(&[0xf3, 0x41, 0x0f, 0x6f, 0x02])?; // root low -> xmm0
+            if layout.words > 2 {
+                assembler.instruction(&[0xf3, 0x45, 0x0f, 0x6f, 0x6a, 0x10])?; // high -> xmm13
             }
         }
         assembler.branch(&[0xe9], finish_reached)?;
@@ -987,13 +983,9 @@ fn lower_x86_64_multiword_bit_parallel(
                 assembler.instruction(&[0x62, 0xd1, 0xfe, 0x28, 0x6f, 0x02])?; // vmovdqu64
             }
         } else {
-            for word in 0..layout.words {
-                let row_offset = u8::try_from(word * 8)
-                    .map_err(|_| ObjectError::ArithmeticOverflow("x86 root row offset"))?;
-                let reached_offset = u8::try_from(32 + word * 8)
-                    .map_err(|_| ObjectError::ArithmeticOverflow("x86 reached stack offset"))?;
-                assembler.instruction(&[0x49, 0x8b, 0x72, row_offset])?; // [r10] -> rsi
-                assembler.instruction(&[0x48, 0x89, 0x74, 0x24, reached_offset])?;
+            assembler.instruction(&[0xf3, 0x41, 0x0f, 0x6f, 0x02])?; // root low -> xmm0
+            if layout.words > 2 {
+                assembler.instruction(&[0xf3, 0x45, 0x0f, 0x6f, 0x6a, 0x10])?; // high -> xmm13
             }
         }
 
@@ -1035,15 +1027,9 @@ fn lower_x86_64_multiword_bit_parallel(
             } else if use_avx512_rows {
                 assembler.instruction(&[0x62, 0xf1, 0x7d, 0x28, 0xeb, 0x06])?; // vpord
             } else {
-                for destination_word in 0..layout.words {
-                    let row_offset = u8::try_from(destination_word * 8).map_err(|_| {
-                        ObjectError::ArithmeticOverflow("x86 direct destination offset")
-                    })?;
-                    let reached_offset = u8::try_from(32 + destination_word * 8).map_err(|_| {
-                        ObjectError::ArithmeticOverflow("x86 reached destination offset")
-                    })?;
-                    assembler.instruction(&[0x4c, 0x8b, 0x56, row_offset])?;
-                    assembler.instruction(&[0x4c, 0x09, 0x54, 0x24, reached_offset])?;
+                assembler.instruction(&[0x66, 0x0f, 0xeb, 0x06])?; // por low row -> xmm0
+                if layout.words > 2 {
+                    assembler.instruction(&[0x66, 0x44, 0x0f, 0xeb, 0x6e, 0x10])?; // high
                 }
             }
             assembler.instruction(&[0x4c, 0x8d, 0x50, 0xff])?; // active - 1 -> r10
@@ -1069,6 +1055,11 @@ fn lower_x86_64_multiword_bit_parallel(
         } else {
             if use_avx512_rows {
                 assembler.instruction(&[0x62, 0xf1, 0xfe, 0x28, 0x7f, 0x44, 0x24, 0x01])?; // vmovdqu64
+            } else {
+                assembler.instruction(&[0xf3, 0x0f, 0x7f, 0x44, 0x24, 0x20])?; // reached low
+                if layout.words > 2 {
+                    assembler.instruction(&[0xf3, 0x44, 0x0f, 0x7f, 0x6c, 0x24, 0x30])?;
+                }
             }
             x86_emit_stack_load_rax(
                 &mut assembler,
@@ -2433,6 +2424,8 @@ mod tests {
             .expect("scalar dense x86 leaf");
         let vector = lower_x86_64_bit_parallel(&layout, avx2).expect("AVX2 dense x86 leaf");
         let wide = lower_x86_64_bit_parallel(&layout, avx512).expect("AVX-512 dense x86 leaf");
+        assert!(count_bytes(&scalar.code, &[0xf3, 0x41, 0x0f, 0x6f, 0x02]) > 0);
+        assert!(count_bytes(&scalar.code, &[0x66, 0x0f, 0xeb, 0x06]) > 0);
         assert_eq!(
             count_bytes(&scalar.code, &[0xc4, 0xc1, 0x7e, 0x6f, 0x02]),
             0
@@ -2951,6 +2944,22 @@ mod tests {
             }
             run_linked_bit_parallel_differential(scalar_target, false, 10);
             run_linked_bit_parallel_differential(scalar_target, false, 11);
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    #[test]
+    #[ignore = "executes the multiword bit-parallel leaf through every Linux SVE tier"]
+    fn linked_aarch64_sve_bit_parallel_exists_matches_portable_for_every_window() {
+        let sve = FeatureSet::of(CpuFeature::Aarch64Sve);
+        let sve2 = sve.with(CpuFeature::Aarch64Sve2);
+        let mixed_sve = FeatureSet::of(CpuFeature::Aarch64Asimd).with(CpuFeature::Aarch64Sve);
+        let mixed_sve2 = mixed_sve.with(CpuFeature::Aarch64Sve2);
+        for features in [sve, sve2, mixed_sve, mixed_sve2] {
+            let target = Target::aarch64_linux().with_features(features).unwrap();
+            for words in 2..=MAX_BIT_PARALLEL_EXISTS_WORDS {
+                run_linked_bit_parallel_differential(target, false, words);
+            }
         }
     }
 
