@@ -46,6 +46,15 @@ pub const SEARCH_EARLIEST_END_OPERATION_ID: &str = "unicode-scalar-run-search.ea
 /// Exact byte-value probes used to select a sparse or fixed-table leading
 /// search during construction.
 pub const SEARCH_LEADING_SELECTION_WORK: usize = 256;
+// `search_upper_bounds` can charge at most one scalar leading probe, one
+// fixed-block byte, four decode checks, one membership test, one reducer step,
+// and `usize::BITS + 1` range comparisons per input byte. A fixed block can
+// round its physical byte count up by at most 31 bytes. Below this threshold,
+// every checked upper-bound intermediate is therefore representable.
+const SEARCH_VALUE_PREFLIGHT_BLOCK_SLOP: usize = BYTE_SET_WIDE_BLOCK_BYTES - 1;
+const SEARCH_VALUE_PREFLIGHT_WORK_FACTOR: usize = size_of::<usize>() * 8 + 9;
+const SEARCH_VALUE_PREFLIGHT_MAX_INPUT_BYTES: usize =
+    (usize::MAX - SEARCH_VALUE_PREFLIGHT_BLOCK_SLOP) / SEARCH_VALUE_PREFLIGHT_WORK_FACTOR;
 /// Stable identity for symbolic counted/lower-bounded repetition.
 pub(crate) const REPEATED_RUN_PLAN_ID: &str =
     "unicode-scalar-aggregate.ascii-runs-utf8-stream-ranges.run-counted.v1";
@@ -3283,7 +3292,7 @@ impl LeadingByteSearch {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct UnicodeScalarSearchCursorState {
     cached_non_ascii_range: Option<usize>,
     leading_block_base: usize,
@@ -3563,6 +3572,26 @@ impl UnicodeScalarSearchPlan {
         window: Window,
         limits: SearchLimits,
     ) -> Result<SearchUpperBounds, SearchError> {
+        let input_bytes = Self::validated_window_bytes(haystack, window)?;
+        self.preflight_validated(input_bytes, limits)
+    }
+
+    fn preflight_value(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: SearchLimits,
+    ) -> Result<(), SearchError> {
+        let input_bytes = Self::validated_window_bytes(haystack, window)?;
+        if limits == SearchLimits::unlimited()
+            && input_bytes <= SEARCH_VALUE_PREFLIGHT_MAX_INPUT_BYTES
+        {
+            return Ok(());
+        }
+        self.preflight_validated(input_bytes, limits).map(drop)
+    }
+
+    fn validated_window_bytes(haystack: &[u8], window: Window) -> Result<usize, SearchError> {
         if window.start() > window.end() || window.end() > haystack.len() {
             return Err(SearchError::InvalidWindow {
                 start: window.start(),
@@ -3570,11 +3599,18 @@ impl UnicodeScalarSearchPlan {
                 haystack_len: haystack.len(),
             });
         }
-        let input_bytes = window.end().checked_sub(window.start()).ok_or(
+        window.end().checked_sub(window.start()).ok_or(
             SearchError::ArithmeticOverflow {
                 computation: "Unicode scalar search window bytes",
             },
-        )?;
+        )
+    }
+
+    fn preflight_validated(
+        &self,
+        input_bytes: usize,
+        limits: SearchLimits,
+    ) -> Result<SearchUpperBounds, SearchError> {
         let upper = self.search_upper_bounds(input_bytes)?;
         if upper.work > limits.max_work {
             return Err(SearchError::WorkLimit {
@@ -3749,12 +3785,11 @@ impl<'h> UnicodeScalarSearchCursor<'_, 'h> {
         window: Window,
         limits: SearchLimits,
     ) -> Result<Option<(usize, usize)>, SearchError> {
-        let upper = self.plan.preflight(self.haystack, window, limits)?;
+        self.plan.preflight_value(self.haystack, window, limits)?;
         let mut state = self.state_for_start(window.start());
         let (matched, _) = self.execute::<false, SELECTED>(window, &mut state);
         Self::publish_restart_floor(&mut state, window.start(), matched);
         self.state = state;
-        debug_assert!(upper.scratch_bytes == 0);
         Ok(matched)
     }
 
@@ -4177,9 +4212,11 @@ mod tests {
         DispatchedUnicodeScalarAggregatePlan, LeadingByteSearch, NoExecutionMeter, Operation, PLAN_ID,
         REPEATED_RUN_COUNT_OPERATION_ID, REPEATED_RUN_PLAN_ID, REPEATED_RUN_SPAN_SUM_OPERATION_ID,
         RUN_PLAN_ID, ReduceActualCounters, ReduceError, ReduceLimits, Repetition,
-        SEARCH_PLAN_ID, SIMD_ASCII_CLASSIFIER_BUILD_WORK, SearchError, SearchLimits,
-        UnicodeScalarAggregatePlan, UnicodeScalarSearchPlan, ValueReduction,
-        binary_search_comparison_bound, decode_scalar, decode_scalar_inline, decode_scalar_with,
+        SEARCH_PLAN_ID, SEARCH_VALUE_PREFLIGHT_BLOCK_SLOP,
+        SEARCH_VALUE_PREFLIGHT_MAX_INPUT_BYTES, SEARCH_VALUE_PREFLIGHT_WORK_FACTOR,
+        SIMD_ASCII_CLASSIFIER_BUILD_WORK, SearchError, SearchLimits, UnicodeScalarAggregatePlan,
+        UnicodeScalarSearchPlan, ValueReduction, binary_search_comparison_bound, decode_scalar,
+        decode_scalar_inline, decode_scalar_with,
     };
     #[cfg(all(
         feature = "static-dispatch-arm-41-d84",
@@ -5827,6 +5864,32 @@ mod tests {
                         .unwrap()
                         .0;
                     assert_eq!(actual, expected, "pattern={pattern:?} start={start}");
+                    assert_eq!(
+                        plan.find_window_value(
+                            haystack,
+                            Window::new(start, haystack.len()),
+                            SearchLimits::unlimited(),
+                        )
+                        .unwrap(),
+                        actual,
+                    );
+                    let exists = plan
+                        .is_match_window(
+                            haystack,
+                            Window::new(start, haystack.len()),
+                            SearchLimits::unlimited(),
+                        )
+                        .unwrap()
+                        .0;
+                    assert_eq!(
+                        plan.is_match_window_value(
+                            haystack,
+                            Window::new(start, haystack.len()),
+                            SearchLimits::unlimited(),
+                        )
+                        .unwrap(),
+                        exists,
+                    );
                     let shortest = plan
                         .shortest_match_window(
                             haystack,
@@ -5836,6 +5899,15 @@ mod tests {
                         .unwrap()
                         .0;
                     assert_eq!(shortest, upstream.shortest_match_at(haystack, start));
+                    assert_eq!(
+                        plan.shortest_match_window_value(
+                            haystack,
+                            Window::new(start, haystack.len()),
+                            SearchLimits::unlimited(),
+                        )
+                        .unwrap(),
+                        shortest,
+                    );
                 }
             }
         }
@@ -6065,6 +6137,7 @@ mod tests {
         assert_eq!(upper.leading_block_classifications, 0);
         assert_eq!(upper.leading_block_classification_bytes, 0);
         let mut cursor = plan.search_cursor(&haystack);
+        let initial_state = cursor.state;
         assert_eq!(
             cursor.find_at(haystack.len() + 1, SearchLimits::unlimited()),
             Err(SearchError::InvalidWindow {
@@ -6073,18 +6146,57 @@ mod tests {
                 haystack_len: haystack.len(),
             }),
         );
+        assert_eq!(cursor.state, initial_state);
         assert_eq!(
-            cursor.find_at(
-                0,
-                SearchLimits {
-                    max_work: upper.work - 1,
-                    max_scratch_bytes: 0,
-                },
+            cursor.find_at_value(haystack.len() + 1, SearchLimits::unlimited()),
+            Err(SearchError::InvalidWindow {
+                start: haystack.len() + 1,
+                end: haystack.len(),
+                haystack_len: haystack.len(),
+            }),
+        );
+        assert_eq!(cursor.state, initial_state);
+        assert_eq!(
+            cursor.search_window_value::<true>(
+                Window::new(0, haystack.len() + 1),
+                SearchLimits::unlimited(),
             ),
+            Err(SearchError::InvalidWindow {
+                start: 0,
+                end: haystack.len() + 1,
+                haystack_len: haystack.len(),
+            }),
+        );
+        assert_eq!(cursor.state, initial_state);
+        let refused = SearchLimits {
+            max_work: upper.work - 1,
+            max_scratch_bytes: 0,
+        };
+        assert_eq!(
+            cursor.find_at(0, refused),
             Err(SearchError::WorkLimit {
                 needed: upper.work,
                 limit: upper.work - 1,
             })
+        );
+        assert_eq!(cursor.state, initial_state);
+        assert_eq!(
+            cursor.find_at_value(0, refused),
+            Err(SearchError::WorkLimit {
+                needed: upper.work,
+                limit: upper.work - 1,
+            })
+        );
+        assert_eq!(cursor.state, initial_state);
+        assert_eq!(
+            cursor.find_at_value(
+                0,
+                SearchLimits {
+                    max_work: upper.work,
+                    max_scratch_bytes: 0,
+                },
+            ),
+            Ok(None),
         );
         let (matched, accounting) = cursor.find_at(0, SearchLimits::unlimited()).unwrap();
         assert_eq!(matched, None);
@@ -6092,6 +6204,46 @@ mod tests {
         assert_eq!(accounting.actual.leading_block_classifications, 0);
         assert_eq!(accounting.actual.leading_block_classification_bytes, 0);
         assert!(accounting.actual.work <= accounting.upper_bounds.work);
+    }
+
+    #[test]
+    fn scalar_run_unlimited_value_preflight_threshold_proves_all_upper_arithmetic() {
+        assert_eq!(SEARCH_VALUE_PREFLIGHT_BLOCK_SLOP, 31);
+        assert_eq!(
+            SEARCH_VALUE_PREFLIGHT_WORK_FACTOR,
+            usize::try_from(usize::BITS).unwrap().checked_add(9).unwrap(),
+        );
+        SEARCH_VALUE_PREFLIGHT_MAX_INPUT_BYTES
+            .checked_mul(SEARCH_VALUE_PREFLIGHT_WORK_FACTOR)
+            .and_then(|work| work.checked_add(SEARCH_VALUE_PREFLIGHT_BLOCK_SLOP))
+            .unwrap();
+        assert!(
+            SEARCH_VALUE_PREFLIGHT_MAX_INPUT_BYTES
+                .checked_add(1)
+                .unwrap()
+                .checked_mul(SEARCH_VALUE_PREFLIGHT_WORK_FACTOR)
+                .and_then(|work| work.checked_add(SEARCH_VALUE_PREFLIGHT_BLOCK_SLOP))
+                .is_none()
+        );
+
+        let sparse = greek_search_plan(true);
+        assert!(!sparse.leading_search.uses_block_classification());
+        sparse
+            .search_upper_bounds(SEARCH_VALUE_PREFLIGHT_MAX_INPUT_BYTES)
+            .unwrap();
+        let block = UnicodeScalarSearchPlan::build_repeated_with_dispatch(
+            SimdDispatchContext::capture(),
+            [('\u{80}', '\u{D7FF}'), ('\u{E000}', char::MAX)],
+            2,
+            Some(6),
+            true,
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        assert!(block.leading_search.uses_block_classification());
+        block
+            .search_upper_bounds(SEARCH_VALUE_PREFLIGHT_MAX_INPUT_BYTES)
+            .unwrap();
     }
 
     #[test]
