@@ -3,11 +3,13 @@ use fre_automata::{
 };
 use fre_lower::{
     LowerError, LowerLimits, LowerResource, OperationSemantics, UnsupportedFeature, lower,
-    lower_general, lower_hir_raw, lower_raw, lower_utf8_start_guarded,
+    lower_general, lower_hir, lower_hir_concat_slice, lower_hir_raw, lower_raw,
+    lower_utf8_start_guarded,
 };
 use fre_syntax::{
     CanonicalPattern, CompatibilityProfile, ParseRequest, RustParsed, RustProfile, parse,
 };
+use regex_syntax::hir::{Hir, HirKind};
 fn profile(unicode: bool) -> CompatibilityProfile {
     let mut profile = RustProfile::rebar_1_12_4();
     profile.options.unicode = unicode;
@@ -1729,6 +1731,197 @@ fn lf_and_ascii_word_assertions_retain_original_haystack_context() {
         find_window(r"\xFF\B", &[0xFF, b'-'], SearchWindow::new(0, 1)),
         Some((0, 1))
     );
+}
+
+#[test]
+fn borrowed_concat_slice_lowering_matches_owned_hir_and_censuses_captures() {
+    let parsed = parsed(r"(ab)(?:c|de)(f+)", false);
+    let HirKind::Concat(parts) = parsed.hir.kind() else {
+        panic!("focused borrowed-concat fixture must retain a concat root");
+    };
+    let borrowed = lower_hir_concat_slice(
+        parts,
+        OperationSemantics::CaptureFree,
+        LowerLimits::default(),
+    )
+    .expect("borrowed concat slice lowers");
+    let owned_hir = Hir::concat(parts.to_vec());
+    let owned = lower_hir(
+        &owned_hir,
+        OperationSemantics::CaptureFree,
+        LowerLimits::default(),
+    )
+    .expect("equivalent owned concat lowers");
+
+    assert_eq!(borrowed.stats().erased_captures(), 2);
+    assert_eq!(
+        borrowed.stats().erased_captures(),
+        owned.stats().erased_captures(),
+    );
+    assert_eq!(borrowed.stats().states(), owned.stats().states());
+    assert_eq!(borrowed.stats().edges(), owned.stats().edges());
+    assert_eq!(borrowed.automaton().stats(), owned.automaton().stats());
+    for haystack in [
+        &b"abcf"[..],
+        &b"xxabdeffffyy"[..],
+        &b"abdf"[..],
+        &b""[..],
+    ] {
+        let borrowed_output = borrowed
+            .automaton()
+            .prepare::<Span>()
+            .search(haystack, SearchLimits::unlimited())
+            .expect("borrowed concat search succeeds")
+            .into_output();
+        let owned_output = owned
+            .automaton()
+            .prepare::<Span>()
+            .search(haystack, SearchLimits::unlimited())
+            .expect("owned concat search succeeds")
+            .into_output();
+        assert_eq!(borrowed_output, owned_output, "haystack={haystack:?}");
+    }
+
+    assert!(matches!(
+        lower_hir_concat_slice(
+            parts,
+            OperationSemantics::CaptureSensitive,
+            LowerLimits::default(),
+        ),
+        Err(LowerError::Unsupported(
+            UnsupportedFeature::CaptureSensitiveOperation
+        ))
+    ));
+}
+
+#[test]
+fn borrowed_concat_slice_lowering_closes_every_reported_resource_axis() {
+    let parsed = parsed(r"(ab)(?:c|de)(f+)", false);
+    let HirKind::Concat(parts) = parsed.hir.kind() else {
+        panic!("focused borrowed-concat fixture must retain a concat root");
+    };
+    let baseline = lower_hir_concat_slice(
+        parts,
+        OperationSemantics::CaptureFree,
+        LowerLimits::default(),
+    )
+    .expect("borrowed concat baseline lowers");
+    let stats = baseline.stats();
+    let plan_stats = baseline.automaton().stats();
+    let exact = LowerLimits {
+        max_work: stats.work(),
+        max_stack_items: stats.peak_stack_items(),
+        automata: fre_automata::CompileLimits {
+            max_states: stats.states(),
+            max_edges: stats.edges(),
+            max_storage_bytes: plan_stats.storage_bytes(),
+            max_validation_work: plan_stats.validation_work(),
+        },
+    };
+    assert_eq!(
+        lower_hir_concat_slice(parts, OperationSemantics::CaptureFree, exact)
+            .expect("exact borrowed-concat limits replay")
+            .stats(),
+        stats,
+    );
+
+    let work_limit = stats.work().checked_sub(1).unwrap();
+    assert!(matches!(
+        lower_hir_concat_slice(
+            parts,
+            OperationSemantics::CaptureFree,
+            LowerLimits {
+                max_work: work_limit,
+                ..LowerLimits::default()
+            },
+        ),
+        Err(LowerError::ResourceLimit {
+            resource: LowerResource::Work,
+            needed,
+            limit,
+        }) if needed > limit && limit == work_limit
+    ));
+
+    let stack_limit = stats.peak_stack_items().checked_sub(1).unwrap();
+    assert!(matches!(
+        lower_hir_concat_slice(
+            parts,
+            OperationSemantics::CaptureFree,
+            LowerLimits {
+                max_stack_items: stack_limit,
+                ..LowerLimits::default()
+            },
+        ),
+        Err(LowerError::ResourceLimit {
+            resource: LowerResource::StackItems,
+            needed,
+            limit,
+        }) if needed > limit
+            && limit == u64::try_from(stack_limit).expect("small stack limit")
+    ));
+
+    let state_limit = stats.states().checked_sub(1).unwrap();
+    assert!(matches!(
+        lower_hir_concat_slice(
+            parts,
+            OperationSemantics::CaptureFree,
+            LowerLimits {
+                automata: fre_automata::CompileLimits {
+                    max_states: state_limit,
+                    ..fre_automata::CompileLimits::default()
+                },
+                ..LowerLimits::default()
+            },
+        ),
+        Err(LowerError::ResourceLimit {
+            resource: LowerResource::States,
+            needed,
+            limit,
+        }) if needed > limit
+            && limit == u64::try_from(state_limit).expect("small state limit")
+    ));
+
+    let edge_limit = stats.edges().checked_sub(1).unwrap();
+    assert!(matches!(
+        lower_hir_concat_slice(
+            parts,
+            OperationSemantics::CaptureFree,
+            LowerLimits {
+                automata: fre_automata::CompileLimits {
+                    max_edges: edge_limit,
+                    ..fre_automata::CompileLimits::default()
+                },
+                ..LowerLimits::default()
+            },
+        ),
+        Err(LowerError::ResourceLimit {
+            resource: LowerResource::Edges,
+            needed,
+            limit,
+        }) if needed > limit
+            && limit == u64::try_from(edge_limit).expect("small edge limit")
+    ));
+
+    let storage_limit = plan_stats.storage_bytes().checked_sub(1).unwrap();
+    assert!(matches!(
+        lower_hir_concat_slice(
+            parts,
+            OperationSemantics::CaptureFree,
+            LowerLimits {
+                automata: fre_automata::CompileLimits {
+                    max_storage_bytes: storage_limit,
+                    ..fre_automata::CompileLimits::default()
+                },
+                ..LowerLimits::default()
+            },
+        ),
+        Err(LowerError::ResourceLimit {
+            resource: LowerResource::StorageBytes,
+            needed,
+            limit,
+        }) if needed > limit
+            && limit == u64::try_from(storage_limit).expect("small storage limit")
+    ));
 }
 
 #[test]

@@ -326,6 +326,27 @@ pub fn lower_hir(
     Ok(LoweredAutomaton { automaton, stats })
 }
 
+/// Lower a borrowed sequence of HIR nodes as one concatenation and
+/// independently validate the result.
+///
+/// This avoids constructing or cloning an owned [`Hir`] when a caller already
+/// has a checked slice of a larger concatenation. The capture census, borrowed
+/// traversal, explicit compiler stacks and emitted graph all remain subject to
+/// this invocation's [`LowerLimits`].
+///
+/// # Errors
+///
+/// Returns [`LowerError`] under the same conditions as [`lower_hir`].
+pub fn lower_hir_concat_slice(
+    parts: &[Hir],
+    operation: OperationSemantics,
+    limits: LowerLimits,
+) -> Result<LoweredAutomaton, LowerError> {
+    let (plan, stats) = compiler::compile_concat_slice(parts, operation, limits)?;
+    let automaton = Automaton::from_raw(plan, limits.automata)?;
+    Ok(LoweredAutomaton { automaton, stats })
+}
+
 /// Lower and independently validate HIR through the general
 /// nullable-repetition construction.
 ///

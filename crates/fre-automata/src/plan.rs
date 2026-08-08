@@ -1032,7 +1032,14 @@ impl Automaton {
             .map_or(0, OrderedEdgeDispatch::retained_bytes)
     }
 
-    pub(crate) const fn identity(&self) -> u64 {
+    /// Process-local identity of this exact immutable automaton instance.
+    ///
+    /// This is exposed only so sibling facade proofs can bind separately
+    /// retained auxiliary plans to the one authoritative automaton they were
+    /// derived from. It is not a structural hash and must not be persisted.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn identity(&self) -> u64 {
         self.identity
     }
 
