@@ -49,6 +49,7 @@ const CONSUMING_BITS: u64 = ACCEPT_BIT - 1;
 // runtime until a stronger cost model proves otherwise.
 const MAX_ROOT_SKIP_CANDIDATE_BYTES: u16 = 32;
 const ROOT_SKIP_FIRST_LANE_BYTES: usize = 16;
+const X86_AVX2_STATE_CONSTANT_BYTES: usize = 2 * MAX_BIT_PARALLEL_EXISTS_WORDS * 8;
 
 // The sidecar itself proves a tighter retained-memory ceiling. These native
 // caps independently bound object growth and make a failed optional lowering
@@ -69,6 +70,8 @@ struct NativeBitParallelLayout {
     root_filter: Option<NativeStartFilter>,
     first_lane_table_offset: Option<u32>,
     sve2_match_table_offset: Option<u32>,
+    x86_root_vector_offset: Option<u32>,
+    x86_accept_vector_offset: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -341,6 +344,8 @@ fn build_native_bit_parallel_layout(
         root_filter,
         first_lane_table_offset,
         sve2_match_table_offset,
+        x86_root_vector_offset: None,
+        x86_accept_vector_offset: None,
     })
 }
 
@@ -519,7 +524,9 @@ fn build_native_multiword_bit_parallel_layout(
     let mut data = Vec::new();
     if constant_result.is_none() {
         data.try_reserve_exact(
-            table_bytes.checked_add(ROOT_SKIP_FIRST_LANE_BYTES.checked_mul(2)?)?,
+            table_bytes
+                .checked_add(ROOT_SKIP_FIRST_LANE_BYTES.checked_mul(2)?)?
+                .checked_add(X86_AVX2_STATE_CONSTANT_BYTES)?,
         )
         .ok()?;
         let class_stride = stats.consuming_states.checked_mul(native_row_bytes)?;
@@ -578,6 +585,19 @@ fn build_native_multiword_bit_parallel_layout(
             }
         }
     }
+    let mut x86_root_vector_offset = None;
+    let mut x86_accept_vector_offset = None;
+    if constant_result.is_none() {
+        x86_root_vector_offset = Some(u32::try_from(data.len()).ok()?);
+        for &root in &roots {
+            data.extend_from_slice(&root.to_le_bytes());
+        }
+        x86_accept_vector_offset = Some(u32::try_from(data.len()).ok()?);
+        for word in 0..MAX_BIT_PARALLEL_EXISTS_WORDS {
+            let accept = if word + 1 == words { ACCEPT_BIT } else { 0 };
+            data.extend_from_slice(&accept.to_le_bytes());
+        }
+    }
     if data.len() > MAX_NATIVE_BIT_PARALLEL_DATA_BYTES {
         return None;
     }
@@ -593,6 +613,8 @@ fn build_native_multiword_bit_parallel_layout(
         root_filter,
         first_lane_table_offset,
         sve2_match_table_offset,
+        x86_root_vector_offset,
+        x86_accept_vector_offset,
     })
 }
 
@@ -825,6 +847,20 @@ fn lower_x86_64_multiword_bit_parallel(
     let use_avx2 = features.has(CpuFeature::X86Avx2);
     let use_avx512_rows =
         !use_avx2 && features.has(CpuFeature::X86Avx512F) && features.has(CpuFeature::X86Avx512Vl);
+    let avx2_state_vectors = if use_avx2 && layout.constant_result.is_none() {
+        Some((
+            layout
+                .x86_root_vector_offset
+                .ok_or(ObjectError::InvalidModule("x86 AVX2 root vector is absent"))?,
+            layout
+                .x86_accept_vector_offset
+                .ok_or(ObjectError::InvalidModule(
+                    "x86 AVX2 accept vector is absent",
+                ))?,
+        ))
+    } else {
+        None
+    };
     let scan = assembler.label()?;
     let vector_scan = assembler.label()?;
     let vector_hit = assembler.label()?;
@@ -853,6 +889,17 @@ fn lower_x86_64_multiword_bit_parallel(
 
         assembler.instruction(&[0x48, 0x83, 0xec, 0x50])?; // active[4], reached[4], end
         assembler.instruction(&[0x48, 0x89, 0x4c, 0x24, 0x40])?; // save end index
+        if let Some((root_vector_offset, accept_vector_offset)) = avx2_state_vectors {
+            // This lowering reserves YMM13/YMM14 across its root scanner. The
+            // scanner owns YMM0..YMM12; both constants are caller-saved under
+            // the x86-64 Linux and macOS ABIs.
+            let mut root_vector_load = vec![0xc4, 0x41, 0x7e, 0x6f, 0xa9];
+            root_vector_load.extend_from_slice(&root_vector_offset.to_le_bytes());
+            assembler.instruction(&root_vector_load)?; // root vector -> ymm13
+            let mut accept_vector_load = vec![0xc4, 0x41, 0x7e, 0x6f, 0xb1];
+            accept_vector_load.extend_from_slice(&accept_vector_offset.to_le_bytes());
+            assembler.instruction(&accept_vector_load)?; // accept vector -> ymm14
+        }
         if let Some((filter, kind)) = scanner_filter.zip(filter_kind) {
             x86_emit_start_filter_constants(&mut assembler, filter, kind, 1)?;
 
@@ -1006,51 +1053,64 @@ fn lower_x86_64_multiword_bit_parallel(
         }
 
         assembler.bind(finish_reached)?;
-        if use_avx2 {
-            assembler.instruction(&[0xc5, 0xfe, 0x7f, 0x44, 0x24, 0x20])?; // vmovdqu
-        } else if use_avx512_rows {
-            assembler.instruction(&[0x62, 0xf1, 0xfe, 0x28, 0x7f, 0x44, 0x24, 0x01])?; // vmovdqu64
-        }
-        x86_emit_stack_load_rax(
-            &mut assembler,
-            u8::try_from(32 + (layout.words - 1) * 8)
-                .map_err(|_| ObjectError::ArithmeticOverflow("x86 accept stack offset"))?,
-        )?;
-        assembler.instruction(&[0x48, 0x85, 0xc0])?;
-        assembler.branch(&[0x0f, 0x88], matched)?;
-        if scanner_filter.is_some() {
-            assembler.instruction(&[0x31, 0xc9])?; // root-difference union -> rcx
-        }
-        for word in 0..layout.words {
+        if avx2_state_vectors.is_some() {
+            assembler.instruction(&[0xc4, 0xc2, 0x7d, 0x17, 0xc6])?; // vptest accept
+            assembler.branch(&[0x0f, 0x85], matched)?;
+            assembler.instruction(&[0xc5, 0x95, 0xeb, 0xc0])?; // reached | root -> ymm0
+            assembler.instruction(&[0xc5, 0xfe, 0x7f, 0x04, 0x24])?; // active vector
+            if scanner_filter.is_some() {
+                assembler.instruction(&[0xc5, 0x95, 0xef, 0xc0])?; // active ^ root
+                assembler.instruction(&[0xc4, 0xe2, 0x7d, 0x17, 0xc0])?; // vptest
+                assembler.branch(&[0x0f, 0x85], recurrence)?;
+                assembler.branch(&[0xe9], scan)?;
+            } else {
+                assembler.branch(&[0xe9], recurrence)?;
+            }
+        } else {
+            if use_avx512_rows {
+                assembler.instruction(&[0x62, 0xf1, 0xfe, 0x28, 0x7f, 0x44, 0x24, 0x01])?; // vmovdqu64
+            }
             x86_emit_stack_load_rax(
                 &mut assembler,
-                u8::try_from(32 + word * 8)
-                    .map_err(|_| ObjectError::ArithmeticOverflow("x86 next stack offset"))?,
+                u8::try_from(32 + (layout.words - 1) * 8)
+                    .map_err(|_| ObjectError::ArithmeticOverflow("x86 accept stack offset"))?,
             )?;
-            if layout.roots[word] != 0 {
-                x86_emit_movabs(&mut assembler, 0xba, layout.roots[word])?;
-                assembler.instruction(&[0x4c, 0x09, 0xd0])?;
-            }
-            x86_emit_stack_store_rax(
-                &mut assembler,
-                u8::try_from(word * 8)
-                    .map_err(|_| ObjectError::ArithmeticOverflow("x86 active update offset"))?,
-            )?;
+            assembler.instruction(&[0x48, 0x85, 0xc0])?;
+            assembler.branch(&[0x0f, 0x88], matched)?;
             if scanner_filter.is_some() {
-                if layout.roots[word] != 0 {
-                    assembler.instruction(&[0x4c, 0x31, 0xd0])?; // next active ^ root
-                }
-                assembler.instruction(&[0x48, 0x09, 0xc1])?; // accumulate non-root bits
+                assembler.instruction(&[0x31, 0xc9])?; // root-difference union -> rcx
             }
-        }
+            for word in 0..layout.words {
+                x86_emit_stack_load_rax(
+                    &mut assembler,
+                    u8::try_from(32 + word * 8)
+                        .map_err(|_| ObjectError::ArithmeticOverflow("x86 next stack offset"))?,
+                )?;
+                if layout.roots[word] != 0 {
+                    x86_emit_movabs(&mut assembler, 0xba, layout.roots[word])?;
+                    assembler.instruction(&[0x4c, 0x09, 0xd0])?;
+                }
+                x86_emit_stack_store_rax(
+                    &mut assembler,
+                    u8::try_from(word * 8)
+                        .map_err(|_| ObjectError::ArithmeticOverflow("x86 active update offset"))?,
+                )?;
+                if scanner_filter.is_some() {
+                    if layout.roots[word] != 0 {
+                        assembler.instruction(&[0x4c, 0x31, 0xd0])?; // next active ^ root
+                    }
+                    assembler.instruction(&[0x48, 0x09, 0xc1])?; // accumulate non-root bits
+                }
+            }
 
-        if scanner_filter.is_some() {
-            assembler.bind(check_root)?;
-            assembler.instruction(&[0x48, 0x85, 0xc9])?;
-            assembler.branch(&[0x0f, 0x85], recurrence)?;
-            assembler.branch(&[0xe9], scan)?;
-        } else {
-            assembler.branch(&[0xe9], recurrence)?;
+            if scanner_filter.is_some() {
+                assembler.bind(check_root)?;
+                assembler.instruction(&[0x48, 0x85, 0xc9])?;
+                assembler.branch(&[0x0f, 0x85], recurrence)?;
+                assembler.branch(&[0xe9], scan)?;
+            } else {
+                assembler.branch(&[0xe9], recurrence)?;
+            }
         }
 
         assembler.bind(no_match)?;
@@ -2237,6 +2297,41 @@ mod tests {
         assert!(filter.candidate_bytes <= MAX_ROOT_SKIP_CANDIDATE_BYTES);
         assert!(!filter.ranges().is_empty());
 
+        let root_vector_offset = usize::try_from(
+            layout
+                .x86_root_vector_offset
+                .expect("multiword AVX2 root vector"),
+        )
+        .unwrap();
+        let accept_vector_offset = usize::try_from(
+            layout
+                .x86_accept_vector_offset
+                .expect("multiword AVX2 accept vector"),
+        )
+        .unwrap();
+        assert_eq!(accept_vector_offset, root_vector_offset + 32);
+        for word in 0..MAX_BIT_PARALLEL_EXISTS_WORDS {
+            let packed_root = u64::from_le_bytes(
+                layout.data[root_vector_offset + word * 8..root_vector_offset + word * 8 + 8]
+                    .try_into()
+                    .unwrap(),
+            );
+            let packed_accept = u64::from_le_bytes(
+                layout.data[accept_vector_offset + word * 8..accept_vector_offset + word * 8 + 8]
+                    .try_into()
+                    .unwrap(),
+            );
+            assert_eq!(packed_root, layout.roots[word]);
+            assert_eq!(
+                packed_accept,
+                if word + 1 == layout.words {
+                    ACCEPT_BIT
+                } else {
+                    0
+                }
+            );
+        }
+
         for byte in 0..BYTE_VALUES {
             let classifier = byte * CLASSIFIER_ENTRY_BYTES;
             let class_row = usize::try_from(u32::from_le_bytes(
@@ -2267,6 +2362,9 @@ mod tests {
         .expect("x86 multiword leaf");
         assert_eq!(x86.emitted_words, layout.words);
         assert_eq!(x86.relocations.len(), 1);
+        assert!(count_bytes(&x86.code, &[0xc4, 0xc2, 0x7d, 0x17, 0xc6]) > 0);
+        assert!(count_bytes(&x86.code, &[0xc5, 0x95, 0xeb, 0xc0]) > 0);
+        assert!(count_bytes(&x86.code, &[0xc5, 0xfe, 0x7f, 0x04, 0x24]) > 0);
         let arm = lower_aarch64_bit_parallel(&layout, target).expect("AArch64 multiword leaf");
         assert_eq!(arm.emitted_words, layout.words);
         assert_eq!(arm.relocations.len(), 2);
