@@ -2628,8 +2628,10 @@ pub struct FrozenPreparedHeaderV6 {
 /// immutable sidecar owner. Legacy V1/V2 headers and mutable-row preflight
 /// transactions cannot construct it.
 #[doc(hidden)]
-#[derive(Debug, Eq, PartialEq)]
-pub struct FrozenDynamicRowsSpanCapability {
+#[derive(Debug)]
+pub struct FrozenDynamicRowsSpanCapability<'a> {
+    header: &'a FrozenPreparedHeaderV6,
+    owner: &'a FrozenDynamicRowsStorageV3,
     program_instance: u64,
     artifact_identity: [u8; 32],
 }
@@ -4687,11 +4689,11 @@ impl FrozenPreparedHeaderV6 {
     /// allocation disjoint from the runtime workspace that reverse K0 mutates.
     #[doc(hidden)]
     #[must_use]
-    pub fn compiler_private_active_span_capability(
-        &self,
-        owner: &FrozenDynamicRowsStorageV3,
+    pub fn compiler_private_active_span_capability<'a>(
+        &'a self,
+        owner: &'a FrozenDynamicRowsStorageV3,
         expected_artifact_identity: [u8; 32],
-    ) -> Option<FrozenDynamicRowsSpanCapability> {
+    ) -> Option<FrozenDynamicRowsSpanCapability<'a>> {
         if !self.has_dynamic_rows()
             || self.v1.flags == FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V5
             || self.v1.artifact_identity != expected_artifact_identity
@@ -4728,6 +4730,8 @@ impl FrozenPreparedHeaderV6 {
             return None;
         }
         Some(FrozenDynamicRowsSpanCapability {
+            header: self,
+            owner,
             program_instance: owner.program_instance,
             artifact_identity: expected_artifact_identity,
         })
@@ -10943,23 +10947,18 @@ impl CompiledProgram {
     /// instead binds the active header to the exact pointer-stable sidecar and
     /// program lineage. Reverse K0 receives only the separate live workspace;
     /// it cannot mutate the header or any sidecar allocation.
-    /// # Safety
-    ///
-    /// `capability` must have been minted synchronously from the still-active
-    /// [`FrozenPreparedHeaderV6`] and exact [`FrozenDynamicRowsStorageV3`]
-    /// owner retained by this prepared program. Neither the header nor owner
-    /// may be deactivated, replaced, mutated, moved out, or dropped before
-    /// this call returns. The selected endpoint must be the one produced by
-    /// the immediately preceding native scan of that owner over `window`.
+    /// The non-cloneable borrowed capability keeps its exact header and owner
+    /// live and immutable across this call. Recovery reauthenticates that the
+    /// header remains active immediately before reverse K0 begins.
     #[doc(hidden)]
-    pub unsafe fn recover_frozen_dynamic_rows_span_from_selected_end_with_workspace(
+    pub fn recover_frozen_dynamic_rows_span_from_selected_end_with_workspace(
         &self,
         haystack: &[u8],
         window: SearchWindow,
         workspace: &mut ProgramWorkspace,
         expected_artifact_identity: [u8; 32],
         selected_end: usize,
-        capability: FrozenDynamicRowsSpanCapability,
+        capability: FrozenDynamicRowsSpanCapability<'_>,
     ) -> Result<MatchResult, CompileError> {
         self.recover_dynamic_native_rows_span_from_selected_end_impl(
             haystack,
@@ -10978,7 +10977,7 @@ impl CompiledProgram {
         workspace: &mut ProgramWorkspace,
         expected_artifact_identity: [u8; 32],
         selected_end: usize,
-        compact_capability: Option<FrozenDynamicRowsSpanCapability>,
+        compact_capability: Option<FrozenDynamicRowsSpanCapability<'_>>,
     ) -> Result<MatchResult, CompileError> {
         if window.start > window.end || window.end > haystack.len() {
             return Err(CompileError::InvalidWindow {
@@ -10990,7 +10989,14 @@ impl CompiledProgram {
 
         let compact_recovery = compact_capability.is_some();
         if let Some(capability) = compact_capability {
-            if capability.program_instance != self.identity.instance
+            if capability
+                .header
+                .compiler_private_active_span_capability(
+                    capability.owner,
+                    expected_artifact_identity,
+                )
+                .is_none()
+                || capability.program_instance != self.identity.instance
                 || capability.artifact_identity != expected_artifact_identity
             {
                 return Err(CompileError::InternalInvariant(
@@ -15392,9 +15398,7 @@ mod tests {
             let capability = header
                 .compiler_private_active_span_capability(&storage, identity)
                 .expect("active exact compact owner");
-            // SAFETY: this test retains the exact active header and immutable
-            // owner that synchronously minted `capability` across the call.
-            let recovered = unsafe {
+            let recovered =
                 compiled.recover_frozen_dynamic_rows_span_from_selected_end_with_workspace(
                     &haystack,
                     window,
@@ -15402,8 +15406,7 @@ mod tests {
                     identity,
                     5,
                     capability,
-                )
-            };
+                );
             assert_eq!(
                 recovered
                     .unwrap_or_else(|error| panic!("compact invocation {invocation}: {error}")),

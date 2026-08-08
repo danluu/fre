@@ -36437,6 +36437,7 @@ mod tests {
         target: Target,
         expects_root_scanner: bool,
         use_frozen_owner: bool,
+        verify_retained_fallback: bool,
         label: &str,
         window: SearchWindow,
         cases: &[LinkedDynamicFirstHoleCase<'_>],
@@ -36455,6 +36456,7 @@ mod tests {
             .native_dynamic_rows_view()
             .expect("dynamic first-hole program view");
         assert_eq!(view.root_requirement.is_some(), expects_root_scanner);
+        assert!(!verify_retained_fallback || use_frozen_owner);
         if use_frozen_owner {
             assert_eq!(view.output, OutputContract::Span);
             assert_eq!(view.exact_match_width, None);
@@ -36467,7 +36469,7 @@ mod tests {
                     usize::MAX,
                     usize::MAX,
                 )
-                .expect("compact link-proof owner");
+                .unwrap_or_else(|| panic!("compact link-proof owner: {label}"));
             assert!(program
                 .compiler_private_frozen_prepared_header_v6(
                     &workspace,
@@ -36545,6 +36547,26 @@ mod tests {
         } else {
             String::new()
         };
+        let retained_fallback = if verify_retained_fallback {
+            format!(
+                "result_t fallback={{99U,100U}};uint32_t fs=fre_aot_regex_runtime_search_exclusive_v1(native,novel,length,{}U,{}U,&fallback);if(fs!=bs||fallback.start!=br.start||fallback.end!=br.end)return base+7;if(active_dynamic_owner(native))return base+8;",
+                window.start(),
+                window.end(),
+            )
+        } else {
+            String::new()
+        };
+        if verify_retained_fallback {
+            let mut receipt_workspace = program
+                .prepare_workspace()
+                .expect("retained fallback link-proof workspace");
+            assert!(program
+                .compiler_private_try_prefill_retained_fallback_with_workspace_receipt(
+                    &mut receipt_workspace,
+                )
+                .expect("retained fallback link-proof setup")
+                .is_some());
+        }
         let compact_flag_predicate = [
             FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3,
             FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V4,
@@ -36612,6 +36634,7 @@ mod tests {
                {require_frozen_owner}\
                {repeat_native}\
                {require_frozen_owner}\
+               {retained_fallback}\
                if(!destroy(native)||!destroy(baseline))return base+5;return 0;}}\n",
             active_seal = FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL,
             active_seal_offset = FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL_OFFSET,
@@ -36787,6 +36810,7 @@ mod tests {
                 target,
                 false,
                 false,
+                false,
                 &format!("{output:?}"),
                 window,
                 &[
@@ -36825,6 +36849,7 @@ mod tests {
         link_real_dynamic_first_hole_cases(
             &pending_program,
             target,
+            false,
             false,
             false,
             "SelectedEndPending",
@@ -36913,6 +36938,7 @@ mod tests {
                 target,
                 true,
                 false,
+                false,
                 &format!("Root{output:?}"),
                 window,
                 &[
@@ -36958,6 +36984,7 @@ mod tests {
             target,
             true,
             false,
+            false,
             "RootVariableSpan",
             window,
             &[
@@ -36982,6 +37009,7 @@ mod tests {
             target,
             true,
             true,
+            false,
             "RootVariableSpanCompact",
             window,
             &[
@@ -37002,17 +37030,17 @@ mod tests {
             ],
         );
 
-        let cut_pattern = "[b-c][a-b]{1,10}7[A-Za-z]{1,2}";
+        let cut_pattern = "(?:ba|cd)[a-b]{1,10}7[A-Za-z]{1,2}";
         let cut_window_start = 3_usize;
         let cut_candidate = PARTIAL_DFA_MIN_INPUT_BYTES + 17;
         let cut_window_end = cut_candidate + 8;
         let cut_window = SearchWindow::new(cut_window_start, cut_window_end);
         let mut cut_warm = vec![b'!'; cut_window_end + 2];
-        cut_warm[cut_candidate..cut_candidate + 5].copy_from_slice(b"ba7AZ");
+        cut_warm[cut_candidate..cut_candidate + 6].copy_from_slice(b"baa7AZ");
         let mut cut_match = cut_warm.clone();
-        cut_match[cut_candidate..cut_candidate + 5].copy_from_slice(b"ca7AZ");
+        cut_match[cut_candidate..cut_candidate + 6].copy_from_slice(b"cda7AZ");
         let mut cut_no_match = cut_warm.clone();
-        cut_no_match[cut_candidate..cut_candidate + 5].copy_from_slice(b"cx7AZ");
+        cut_no_match[cut_candidate..cut_candidate + 6].copy_from_slice(b"cdx7AZ");
         for output in [
             OutputContract::Exists,
             OutputContract::SelectedEnd,
@@ -37028,13 +37056,14 @@ mod tests {
             assert!(!cut.program().has_nfa_exact_product());
             let (expected_start, expected_end) = match output {
                 OutputContract::Exists => (0, 0),
-                OutputContract::SelectedEnd => (cut_candidate + 5, cut_candidate + 5),
-                OutputContract::Span => (cut_candidate, cut_candidate + 5),
+                OutputContract::SelectedEnd => (cut_candidate + 6, cut_candidate + 6),
+                OutputContract::Span => (cut_candidate, cut_candidate + 6),
             };
             link_real_dynamic_first_hole_cases(
                 cut.program(),
                 target,
                 true,
+                false,
                 false,
                 &format!("CutRoot{output:?}"),
                 cut_window,
@@ -37056,13 +37085,53 @@ mod tests {
                 ],
             );
             if output == OutputContract::Span {
+                let compact_cut = (2..=128)
+                    .find_map(|max_states| {
+                        let compiled = compile(
+                            CompileRequest::new(cut_pattern, target)
+                                .mode(CompileMode::Optimizing)
+                                .output(OutputContract::Span)
+                                .limits(CompileLimitsV1 {
+                                    determinize: DeterminizeLimits {
+                                        max_states,
+                                        ..DeterminizeLimits::default()
+                                    },
+                                    ..CompileLimitsV1::default()
+                                }),
+                        )
+                        .ok()?;
+                        let partial = compiled.program().partial_dfa_stats().ok()??;
+                        if partial.resume_frontiers == 0
+                            || !compiled.program().has_nfa_mandatory_cut()
+                            || compiled.program().has_nfa_exact_product()
+                        {
+                            return None;
+                        }
+                        let mut workspace = compiled.program().prepare_workspace().ok()?;
+                        compiled
+                            .program()
+                            .compiler_private_try_prefill_retained_fallback_with_workspace_receipt(
+                                &mut workspace,
+                            )
+                            .ok()??;
+                        compiled
+                            .program()
+                            .compiler_private_frozen_dynamic_rows_storage_v3(
+                                &workspace,
+                                usize::MAX,
+                                usize::MAX,
+                            )?;
+                        Some(compiled)
+                    })
+                    .expect("partial mandatory-cut fallback with independent compact owner");
                 // The integrated runtime retains both this optimizing
                 // fallback receipt and its independently closed compact
                 // owner. The active compact header wins generated entry while
                 // the receipt remains available to any later fallback.
                 link_real_dynamic_first_hole_cases(
-                    cut.program(),
+                    compact_cut.program(),
                     target,
+                    true,
                     true,
                     true,
                     "CutRootVariableSpanCompact",
@@ -46226,7 +46295,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             true,
         )
         .unwrap();
-        assert_eq!(occurrences(&variable_x86.code, &x86_flag), 0);
+        assert_eq!(occurrences(&variable_x86.code, &x86_flag), 1);
         let variable_arm = lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
             None,
             OutputContract::Span,
@@ -46245,7 +46314,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 .windows(arm_flag.len())
                 .filter(|words| *words == arm_flag)
                 .count(),
-            0
+            1
         );
         let mut membership = [0_u64; 4];
         membership[usize::from(b'a') / 64] |= 1_u64 << (usize::from(b'a') % 64);
@@ -46496,7 +46565,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             true,
         )
         .unwrap();
-        assert_eq!(occurrences(&variable_x86.code, &x86_flag), 0);
+        assert_eq!(occurrences(&variable_x86.code, &x86_flag), 1);
 
         let mut membership = [0_u64; 4];
         membership[usize::from(b'a') / 64] |= 1_u64 << (usize::from(b'a') % 64);
@@ -47160,7 +47229,11 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             0x24, 0x30, 0x4c, 0x89, 0x54, 0x24, 0x48,
         ];
         assert_eq!(occurrences(&x86_auth, &retained_window), 1);
-        assert_eq!(occurrences(&x86_capability, &retained_window), 1);
+        assert_eq!(
+            occurrences(&x86_capability, &retained_window),
+            0,
+            "production saves the exact public window once before format selection"
+        );
         for identity_word in 0_usize..4 {
             let byte_offset = u8::try_from(identity_word * core::mem::size_of::<u64>()).unwrap();
             let linked_load = if byte_offset == 0 {
@@ -47222,10 +47295,10 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
         );
         assert_eq!(
             x86_capability_instruction_count,
-            26,
-            "23 guard instructions plus three bound return sentinels"
+            22,
+            "19 guard instructions plus three bound return sentinels"
         );
-        assert_eq!(x86_v4_capability_instruction_count, 26);
+        assert_eq!(x86_v4_capability_instruction_count, 22);
         assert!(
             x86_capability.len().saturating_add(96) < x86_auth.len(),
             "the x86 capability guard must remove a material amount of per-call geometry work"
@@ -47765,7 +47838,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 .windows(arm_retained_window.len())
                 .filter(|words| *words == arm_retained_window)
                 .count(),
-            1
+            0,
+            "production saves the exact public window once before format selection"
         );
         let arm_full_geometry = aarch64_load_w_imm(
             10,
@@ -47875,10 +47949,10 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
         );
         assert_eq!(
             arm_capability_words.len(),
-            36,
-            "33 guard instructions plus three bound NOP sentinels"
+            32,
+            "29 guard instructions plus three bound NOP sentinels"
         );
-        assert_eq!(arm_v4_capability_words.len(), 36);
+        assert_eq!(arm_v4_capability_words.len(), 32);
         assert!(
             arm_capability.len().saturating_add(96) < arm_auth.len(),
             "the AArch64 capability guard must remove a material amount of per-call geometry work"
@@ -48275,7 +48349,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
         );
         assert_eq!(occurrences(&x86_v5_full, &x86_v5_complement), 1);
         assert_eq!(occurrences(&x86_v5_active, &x86_v5_complement), 0);
-        assert_eq!(x86_v5_active_instruction_count, 27);
+        assert_eq!(x86_v5_active_instruction_count, 23);
 
         let arm_v5_full = arm_entry(
             FrozenCompactNativeFormat::UnaryExistsV5,
@@ -48334,7 +48408,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 .count(),
             0
         );
-        assert_eq!(arm_v5_active_words.len(), 37);
+        assert_eq!(arm_v5_active_words.len(), 33);
 
         for format in [
             FrozenCompactNativeFormat::StateOrdinalV6,
@@ -48362,7 +48436,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             assert_eq!(occurrences(&x86_active, &x86_plan_count), 0, "{format:?}");
             assert_eq!(occurrences(&x86_full, &x86_plan_address), 1, "{format:?}");
             assert_eq!(occurrences(&x86_active, &x86_plan_address), 0, "{format:?}");
-            assert_eq!(x86_active_instruction_count, 26, "{format:?}");
+            assert_eq!(x86_active_instruction_count, 22, "{format:?}");
 
             let arm_full = arm_entry(format, FrozenCompactGuardMode::FullVerifier);
             let arm_active = arm_entry(format, FrozenCompactGuardMode::ActiveCapability);
@@ -48418,7 +48492,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 0,
                 "{format:?}"
             );
-            assert_eq!(arm_active_words.len(), 36, "{format:?}");
+            assert_eq!(arm_active_words.len(), 32, "{format:?}");
         }
     }
 
@@ -49184,8 +49258,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             (OutputContract::Span, None),
         ] {
             let context = format!("{output:?}/width={exact_span_width:?}");
-            let compact_possible =
-                !(output == OutputContract::Span && exact_span_width.is_none());
+            let compact_possible = true;
             let x86 = lower_x86_64_dynamic_rows_prepared_for_output(
                 Some(root_filter),
                 FeatureSet::EMPTY,

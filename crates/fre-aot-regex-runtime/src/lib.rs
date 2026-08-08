@@ -795,13 +795,8 @@ impl PreparedAotRegex {
         });
         let used_compact_capability = compact_capability.is_some();
         let recovered = if let Some(capability) = compact_capability {
-            // SAFETY: the token was minted synchronously from this prepared
-            // value's still-active header and exact retained owner. These are
-            // disjoint fields from `workspace`; neither is mutated, moved, or
-            // dropped until the synchronous reverse-only call returns.
-            unsafe {
-                self.program
-                    .recover_frozen_dynamic_rows_span_from_selected_end_with_workspace(
+            self.program
+                .recover_frozen_dynamic_rows_span_from_selected_end_with_workspace(
                     haystack,
                     window,
                     &mut self.workspace,
@@ -809,7 +804,6 @@ impl PreparedAotRegex {
                     selected_end,
                     capability,
                 )
-            }
         } else {
             // Legacy V1/V2 and mutable dynamic rows retain the original
             // revoke-then-consume single-use preflight transaction.
@@ -5080,22 +5074,12 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
             );
             if output == OutputContract::Span {
                 assert_eq!(compiled.program().exact_match_width(), None);
-                assert!(
-                    direct.frozen_dynamic_rows.is_none(),
-                    "variable-width Span must decline the compact owner"
-                );
-                assert!(direct.frozen_header.is_active());
-                assert!(
-                    !direct.frozen_header.has_dynamic_rows(),
-                    "a compact decline must recover the active retained V1 capability"
-                );
-            } else {
-                assert!(
-                    direct.frozen_dynamic_rows.is_some(),
-                    "eligible resource fallback must retain a compact owner for {output:?}"
-                );
-                assert!(direct.frozen_header.has_dynamic_rows(), "{output:?}");
             }
+            assert!(
+                direct.frozen_dynamic_rows.is_some(),
+                "eligible resource fallback must retain a compact owner for {output:?}"
+            );
+            assert!(direct.frozen_header.has_dynamic_rows(), "{output:?}");
             let exclusive = prepare_exclusive(&serialized);
             let short = b"cbbbbx";
             let mut long = vec![b'x'; 256];
