@@ -78,8 +78,9 @@ use std::{
 
 use fre_aot_regex::{
     Architecture, CompileLimitsV1, CompileMode, CompileRequest, CompiledRegex, CpuFeature,
-    EngineKind, EngineSelectionReason, FeatureSet, MatchResult, OperatingSystem, OutputContract,
-    PartialDfaStats, SearchWindow, StartAccelerator, Target, compile,
+    DeterminizationStage, EngineKind, EngineSelectionReason, FeatureSet, MatchResult,
+    OperatingSystem, OutputContract, PartialDfaStats, SearchWindow, SlowAotLimits,
+    StartAccelerator, Target, compile_with_slow_aot_limits,
 };
 use regex::bytes::Regex;
 
@@ -120,10 +121,12 @@ OPTIONS:
   --family NAME          Measure only this structural family.
   --pattern-name NAME    Measure only this generated pattern name.
   --route NAME           Measure only direct_dfa, direct_context_dfa,
-                         direct_resource_fallback,
+                         direct_context_fallback, direct_resource_fallback,
                          prepared_runtime_assertion,
+                         ordinary_runtime_assertion,
                          ordinary_runtime_resource_fallback, or
-                         prepared_runtime_resource_fallback. Authenticated
+                         prepared_runtime_resource_fallback, or
+                         slow_partial_resource_fallback. Authenticated
                          complete retained tables may use the self-contained
                          direct_resource_fallback route. A published prepared
                          optimizing entry owns the prepared route even when
@@ -144,10 +147,19 @@ OPTIONS:
   --force-retained-resource-fallback
                         Probe each source structurally, then force a canonical
                         decline that preserves nonempty DFA rows when the
-                        graph supports them. Incomplete rows publish a native
-                        prepared entry when eligible; authenticated complete
-                        rows may publish a self-contained direct entry. Keeps
-                        excluded exact-product and contextual diagnostic rows.
+                        graph supports them. The separate slow-AOT pass is
+                        bounded off so it cannot replace the retained ordinary
+                        rows. Incomplete rows publish a native prepared entry
+                        when eligible; authenticated complete rows may publish
+                        a self-contained direct entry. Keeps excluded exact-
+                        product and contextual diagnostic rows.
+  --force-slow-partial-resource-fallback
+                        Set the semantic DFA state budget to zero, probe the
+                        complete slow-AOT graph, then derive a deterministic
+                        slow state limit that retains a genuine incomplete
+                        forward prefix. Shapes without an interior prefix stay
+                        truthfully classified as exclusions. Select only the
+                        admitted rows with --route slow_partial_resource_fallback.
   --seed N               Measure one generated seed (decimal or 0x-prefixed).
                          Both grammar modes accept any new root seed.
   --grammar              Use the separate seeded grammar-generated diagnostic
@@ -184,6 +196,7 @@ struct Config {
     output_matrix: bool,
     force_resource_fallback: bool,
     force_retained_resource_fallback: bool,
+    force_slow_partial_resource_fallback: bool,
     seed_filter: Option<u64>,
     grammar: bool,
     nested_grammar: bool,
@@ -205,6 +218,7 @@ struct PartialConfig {
     output_matrix: bool,
     force_resource_fallback: bool,
     force_retained_resource_fallback: bool,
+    force_slow_partial_resource_fallback: bool,
     seed_filter: Option<u64>,
     grammar: bool,
     nested_grammar: bool,
@@ -222,6 +236,9 @@ impl Config {
                 Some("--force-resource-fallback") => partial.force_resource_fallback = true,
                 Some("--force-retained-resource-fallback") => {
                     partial.force_retained_resource_fallback = true;
+                }
+                Some("--force-slow-partial-resource-fallback") => {
+                    partial.force_slow_partial_resource_fallback = true;
                 }
                 Some("--grammar") => partial.grammar = true,
                 Some("--nested-grammar") => partial.nested_grammar = true,
@@ -286,29 +303,18 @@ impl Config {
         if partial.grammar && partial.nested_grammar {
             return Err("--grammar and --nested-grammar are mutually exclusive".to_owned());
         }
-        if partial.force_resource_fallback && partial.force_retained_resource_fallback {
-            return Err(
-                "--force-resource-fallback and --force-retained-resource-fallback are mutually exclusive"
-                    .to_owned(),
-            );
-        }
+        forced_fallback_mode(
+            partial.force_resource_fallback,
+            partial.force_retained_resource_fallback,
+            partial.force_slow_partial_resource_fallback,
+        )?;
         if warmup_rounds == 0 || bytes_per_trial == 0 || min_searches == 0 || min_trial_ns == 0 {
             return Err(
                 "warmup rounds, bytes per trial, searches, and trial duration must be non-zero"
                     .to_owned(),
             );
         }
-        if let Some(route) = partial.route_filter.as_deref()
-            && !matches!(
-                route,
-                "direct_dfa"
-                    | "direct_context_dfa"
-                    | "direct_resource_fallback"
-                    | "prepared_runtime_assertion"
-                    | "ordinary_runtime_resource_fallback"
-                    | "prepared_runtime_resource_fallback"
-            )
-        {
+        if let Some(route) = partial.route_filter.as_deref() && !is_known_route(route) {
             return Err(format!("unknown native route {route:?}\n\n{}", usage()));
         }
         let (mut target, target_name) = host_target()?;
@@ -334,10 +340,75 @@ impl Config {
             output_matrix: partial.output_matrix,
             force_resource_fallback: partial.force_resource_fallback,
             force_retained_resource_fallback: partial.force_retained_resource_fallback,
+            force_slow_partial_resource_fallback: partial
+                .force_slow_partial_resource_fallback,
             seed_filter: partial.seed_filter,
             grammar: partial.grammar,
             nested_grammar: partial.nested_grammar,
         }))
+    }
+}
+
+fn is_known_route(route: &str) -> bool {
+    matches!(
+        route,
+        "direct_dfa"
+            | "direct_context_dfa"
+            | "direct_context_fallback"
+            | "direct_resource_fallback"
+            | "prepared_runtime_assertion"
+            | "ordinary_runtime_assertion"
+            | "ordinary_runtime_resource_fallback"
+            | "prepared_runtime_resource_fallback"
+            | "slow_partial_resource_fallback"
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ForcedFallbackMode {
+    None,
+    ZeroRows,
+    RetainedRows,
+    SlowPartial,
+}
+
+impl ForcedFallbackMode {
+    const fn slow_aot_policy(self) -> &'static str {
+        match self {
+            Self::None => "default",
+            Self::ZeroRows => "disabled_for_zero_rows",
+            Self::RetainedRows => "disabled_for_retained_rows",
+            Self::SlowPartial => "derived_incomplete_forward_prefix",
+        }
+    }
+}
+
+fn forced_fallback_mode(
+    zero_rows: bool,
+    retained_rows: bool,
+    slow_partial: bool,
+) -> Result<ForcedFallbackMode, String> {
+    match (zero_rows, retained_rows, slow_partial) {
+        (false, false, false) => Ok(ForcedFallbackMode::None),
+        (true, false, false) => Ok(ForcedFallbackMode::ZeroRows),
+        (false, true, false) => Ok(ForcedFallbackMode::RetainedRows),
+        (false, false, true) => Ok(ForcedFallbackMode::SlowPartial),
+        _ => Err(
+            "--force-resource-fallback, --force-retained-resource-fallback, and \
+             --force-slow-partial-resource-fallback are mutually exclusive"
+                .to_owned(),
+        ),
+    }
+}
+
+impl Config {
+    fn forced_fallback_mode(&self) -> ForcedFallbackMode {
+        forced_fallback_mode(
+            self.force_resource_fallback,
+            self.force_retained_resource_fallback,
+            self.force_slow_partial_resource_fallback,
+        )
+        .expect("parsed force modes remain mutually exclusive")
     }
 }
 
@@ -1800,9 +1871,19 @@ impl CompiledShape {
         match self.aot.receipt().engine_selection_reason {
             EngineSelectionReason::CompleteDfa => "direct_dfa",
             EngineSelectionReason::CompleteContextDfa => "direct_context_dfa",
-            EngineSelectionReason::ContextAssertions => "prepared_runtime_assertion",
-            EngineSelectionReason::DeterminizationResourceLimit => {
+            EngineSelectionReason::ContextAssertions => {
                 if self.aot.module().prepared_entry_symbol().is_some() {
+                    "prepared_runtime_assertion"
+                } else if self.runtime_program.is_some() {
+                    "ordinary_runtime_assertion"
+                } else {
+                    "direct_context_fallback"
+                }
+            }
+            EngineSelectionReason::DeterminizationResourceLimit => {
+                if is_genuine_slow_partial(&self.aot) {
+                    "slow_partial_resource_fallback"
+                } else if self.aot.module().prepared_entry_symbol().is_some() {
                     "prepared_runtime_resource_fallback"
                 } else if self.runtime_program.is_some() {
                     "ordinary_runtime_resource_fallback"
@@ -1834,7 +1915,9 @@ impl CompiledShape {
     }
 
     fn score_scope(&self) -> &'static str {
-        if self.aot.module().prepared_entry_symbol().is_some() {
+        if is_genuine_slow_partial(&self.aot) {
+            "slow_aot_partial_generated_entry"
+        } else if self.aot.module().prepared_entry_symbol().is_some() {
             "prepared_compiled_all_windows"
         } else if self.runtime_program.is_some() && self.partial_dfa.is_some() {
             "runtime_dependent_partial_compiled_entry"
@@ -1857,18 +1940,66 @@ impl CompiledShape {
     }
 }
 
+fn compile_source_aot_with_slow_limits(
+    pattern: &str,
+    output: OutputKind,
+    target: Target,
+    limits: CompileLimitsV1,
+    slow_aot_limits: SlowAotLimits,
+) -> Result<CompiledRegex, String> {
+    compile_with_slow_aot_limits(
+        CompileRequest::new(pattern.to_owned(), target)
+            .mode(CompileMode::Optimizing)
+            .output(output.contract())
+            .limits(limits),
+        slow_aot_limits,
+    )
+    .map_err(|error| format!("AOT compilation failed: {error}"))
+}
+
 fn compile_shape_aot(
     spec: &SeededPatternSpec,
     target: Target,
     limits: CompileLimitsV1,
 ) -> Result<CompiledRegex, String> {
-    compile(
-        CompileRequest::new(spec.pattern.clone(), target)
-            .mode(CompileMode::Optimizing)
-            .output(spec.output.contract())
-            .limits(limits),
+    compile_shape_aot_with_slow_limits(spec, target, limits, SlowAotLimits::default())
+}
+
+fn compile_shape_aot_with_slow_limits(
+    spec: &SeededPatternSpec,
+    target: Target,
+    limits: CompileLimitsV1,
+    slow_aot_limits: SlowAotLimits,
+) -> Result<CompiledRegex, String> {
+    compile_source_aot_with_slow_limits(
+        &spec.pattern,
+        spec.output,
+        target,
+        limits,
+        slow_aot_limits,
     )
-    .map_err(|error| format!("{} AOT compilation failed: {error}", spec.name))
+    .map_err(|error| format!("{} {error}", spec.name))
+}
+
+fn disabled_slow_aot_limits() -> SlowAotLimits {
+    let mut limits = SlowAotLimits::default();
+    limits.determinize.max_states = 0;
+    limits.determinize.max_transitions = 0;
+    limits.determinize.max_work = 0;
+    limits.max_allocation_bytes = 0;
+    limits.max_native_data_bytes = 0;
+    limits
+}
+
+fn is_genuine_slow_partial(compiled: &CompiledRegex) -> bool {
+    compiled.receipt().slow_aot.as_ref().is_some_and(|report| {
+        report
+            .determinization
+            .decline
+            .is_some_and(|decline| decline.stage == DeterminizationStage::ForwardSubsetConstruction)
+            && report.dfa.forward_states > 0
+            && report.dfa.forward_states < report.dfa.forward_states_before_minimization
+    })
 }
 
 fn retained_partial_stats(compiled: &CompiledRegex) -> Result<Option<PartialDfaStats>, String> {
@@ -1876,6 +2007,12 @@ fn retained_partial_stats(compiled: &CompiledRegex) -> Result<Option<PartialDfaS
         .program()
         .partial_dfa_stats()
         .map_err(|error| format!("partial-DFA statistics failed: {error}"))
+}
+
+fn has_usable_retained_rows(compiled: &CompiledRegex) -> Result<bool, String> {
+    Ok(retained_partial_stats(compiled)?.is_some_and(|stats| {
+        stats.complete_rows > 0 && stats.optimized_entry_supported
+    }))
 }
 
 fn prepared_capability_format(compiled: &CompiledRegex) -> Result<&'static str, String> {
@@ -1935,7 +2072,7 @@ fn prepared_capability_format(compiled: &CompiledRegex) -> Result<&'static str, 
     }
 }
 
-fn is_self_contained_native_shape(compiled: &CompiledRegex) -> Result<bool, String> {
+fn is_self_contained_native_shape(compiled: &CompiledRegex) -> bool {
     let module = compiled.module();
     if module.required_runtime_program().is_some()
         || module.prepared_entry_symbol().is_some()
@@ -1959,61 +2096,160 @@ fn is_self_contained_native_shape(compiled: &CompiledRegex) -> Result<bool, Stri
         || module.required_prepared_span_recovery_runtime_symbol().is_some()
         || compiled.receipt().runtime_helper_required
     {
-        return Ok(false);
+        return false;
     }
-    let unresolved = module
+    let has_unresolved = module
         .symbols()
         .iter()
-        .filter(|symbol| symbol.section.is_none())
-        .map(|symbol| symbol.name.as_str())
-        .collect::<Vec<_>>();
-    if unresolved.is_empty() {
-        Ok(true)
-    } else {
-        Err(format!(
-            "native module has unclassified unresolved symbols: {}",
-            unresolved.join(",")
-        ))
-    }
+        .any(|symbol| symbol.section.is_none());
+    // The runtime static library is linked below and owns every public
+    // adapter ABI. Treat any unresolved symbol structurally as a runtime
+    // dependency so a newer partial-resume helper remains benchmarkable
+    // without teaching this example its private symbol name.
+    !has_unresolved
 }
 
 fn compile_retained_resource_probe(
     spec: &SeededPatternSpec,
     target: Target,
 ) -> Result<(CompiledRegex, &'static str), String> {
-    let probe = compile_shape_aot(spec, target, CompileLimitsV1::default())?;
+    compile_retained_resource_probe_with_limits(spec, target, CompileLimitsV1::default())
+}
+
+fn compile_retained_resource_probe_with_limits(
+    spec: &SeededPatternSpec,
+    target: Target,
+    probe_limits: CompileLimitsV1,
+) -> Result<(CompiledRegex, &'static str), String> {
+    let probe = compile_shape_aot(spec, target, probe_limits)?;
+    let bounded_probe = compile_shape_aot_with_slow_limits(
+        spec,
+        target,
+        probe_limits,
+        disabled_slow_aot_limits(),
+    )?;
     if probe.receipt().context_determinization.is_some() {
-        return Ok((probe, "excluded_contextual"));
+        return Ok((bounded_probe, "excluded_contextual"));
     }
     if retained_partial_stats(&probe)?.is_some_and(|stats| stats.complete_rows > 0) {
-        return Ok((probe, "natural_decline"));
+        if has_usable_retained_rows(&bounded_probe)? {
+            return Ok((bounded_probe, "natural_decline_slow_disabled"));
+        }
+        return Ok((bounded_probe, "excluded_unusable_natural_retained_rows"));
     }
     let Some(dfa) = probe.receipt().dfa else {
-        return Ok((probe, "excluded_non_dfa_probe"));
+        return Ok((bounded_probe, "excluded_non_dfa_probe"));
     };
 
     if let Some(max_states) = dfa.forward_states_before_minimization.checked_sub(1)
         && max_states > 0
     {
-        let mut limits = CompileLimitsV1::default();
+        let mut limits = probe_limits;
         limits.determinize.max_states = max_states;
-        let state_limited = compile_shape_aot(spec, target, limits)?;
-        if retained_partial_stats(&state_limited)?.is_some_and(|stats| stats.complete_rows > 0) {
+        let state_limited = compile_shape_aot_with_slow_limits(
+            spec,
+            target,
+            limits,
+            disabled_slow_aot_limits(),
+        )?;
+        if has_usable_retained_rows(&state_limited)? {
             return Ok((state_limited, "forward_state_limit"));
         }
     }
 
     let Some(max_work) = dfa.build_work.checked_sub(1) else {
-        return Ok((probe, "excluded_zero_build_work"));
+        return Ok((bounded_probe, "excluded_zero_build_work"));
     };
-    let mut limits = CompileLimitsV1::default();
+    let mut limits = probe_limits;
     limits.determinize.max_work = max_work;
-    let work_limited = compile_shape_aot(spec, target, limits)?;
-    if retained_partial_stats(&work_limited)?.is_some_and(|stats| stats.complete_rows > 0) {
+    let work_limited = compile_shape_aot_with_slow_limits(
+        spec,
+        target,
+        limits,
+        disabled_slow_aot_limits(),
+    )?;
+    if has_usable_retained_rows(&work_limited)? {
         Ok((work_limited, "final_work_limit"))
     } else {
-        Ok((work_limited, "excluded_no_retained_rows"))
+        Ok((work_limited, "excluded_no_usable_retained_rows"))
     }
+}
+
+fn compile_slow_partial_resource_probe(
+    pattern: &str,
+    output: OutputKind,
+    target: Target,
+) -> Result<(CompiledRegex, &'static str), String> {
+    let mut semantic_limits = CompileLimitsV1::default();
+    semantic_limits.determinize.max_states = 0;
+    let full_probe = compile_source_aot_with_slow_limits(
+        pattern,
+        output,
+        target,
+        semantic_limits,
+        SlowAotLimits::default(),
+    )?;
+    if full_probe.receipt().context_determinization.is_some() {
+        return Ok((full_probe, "excluded_contextual"));
+    }
+    if full_probe.receipt().engine_selection_reason
+        != EngineSelectionReason::DeterminizationResourceLimit
+    {
+        return Ok((full_probe, "excluded_non_resource_fallback"));
+    }
+    let (full_decline, full_forward_states) = {
+        let Some(report) = full_probe.receipt().slow_aot.as_ref() else {
+            let exact_product = full_probe.program().has_nfa_exact_product();
+            return Ok((
+                full_probe,
+                if exact_product {
+                    "excluded_exact_product"
+                } else {
+                    "excluded_no_complete_slow_probe"
+                },
+            ));
+        };
+        (
+            report.determinization.decline,
+            report.dfa.forward_states_before_minimization,
+        )
+    };
+    if is_genuine_slow_partial(&full_probe) {
+        return Ok((full_probe, "slow_natural_resource_limit"));
+    }
+    if full_decline.is_some() {
+        return Ok((full_probe, "excluded_no_complete_slow_probe"));
+    }
+    if full_forward_states <= 1 {
+        return Ok((full_probe, "excluded_no_interior_slow_state_limit"));
+    }
+
+    let primary_limit = full_forward_states - 1;
+    let candidate_limits = std::iter::once(primary_limit).chain(
+        (1..full_forward_states).filter(move |&max_states| max_states != primary_limit),
+    );
+    for max_states in candidate_limits {
+        let mut slow_limits = SlowAotLimits::default();
+        slow_limits.determinize.max_states = max_states;
+        let candidate = compile_source_aot_with_slow_limits(
+            pattern,
+            output,
+            target,
+            semantic_limits,
+            slow_limits,
+        )?;
+        if is_genuine_slow_partial(&candidate) {
+            return Ok((
+                candidate,
+                if max_states == primary_limit {
+                    "slow_forward_state_limit"
+                } else {
+                    "slow_forward_state_search"
+                },
+            ));
+        }
+    }
+    Ok((full_probe, "excluded_no_genuine_slow_partial"))
 }
 
 fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
@@ -2062,29 +2298,55 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
                     .is_none_or(|name| spec.base_name == name || spec.name == name)
         })
         .map(|spec| {
-            let force_runtime_fallback = spec.force_fallback || config.force_resource_fallback;
+            let forced_mode = config.forced_fallback_mode();
+            let force_runtime_fallback = spec.force_fallback
+                || matches!(
+                    forced_mode,
+                    ForcedFallbackMode::ZeroRows | ForcedFallbackMode::SlowPartial
+                );
             let upstream = Regex::new(&spec.pattern)
                 .map_err(|error| format!("{} upstream compilation failed: {error}", spec.name))?;
             let (aot, retained_limit_derivation) =
-                if config.force_retained_resource_fallback {
-                    compile_retained_resource_probe(&spec, config.target)?
-                } else {
-                    let mut limits = CompileLimitsV1::default();
-                    if force_runtime_fallback {
-                        limits.determinize.max_states = 0;
+                match forced_mode {
+                    ForcedFallbackMode::RetainedRows => {
+                        compile_retained_resource_probe(&spec, config.target)?
                     }
-                    (
-                        compile_shape_aot(&spec, config.target, limits)?,
+                    ForcedFallbackMode::SlowPartial => {
+                        compile_slow_partial_resource_probe(
+                            &spec.pattern,
+                            spec.output,
+                            config.target,
+                        )
+                        .map_err(|error| format!("{} {error}", spec.name))?
+                    }
+                    ForcedFallbackMode::None | ForcedFallbackMode::ZeroRows => {
+                        let mut limits = CompileLimitsV1::default();
                         if force_runtime_fallback {
-                            "legacy_zero_state"
+                            limits.determinize.max_states = 0;
+                        }
+                        let aot = if force_runtime_fallback {
+                            compile_shape_aot_with_slow_limits(
+                                &spec,
+                                config.target,
+                                limits,
+                                disabled_slow_aot_limits(),
+                            )?
                         } else {
-                            "not_requested"
-                        },
-                    )
+                            compile_shape_aot(&spec, config.target, limits)?
+                        };
+                        (
+                            aot,
+                            if force_runtime_fallback {
+                                "zero_state_slow_disabled"
+                            } else {
+                                "not_requested"
+                            },
+                        )
+                    }
                 };
             let has_context_assertions = aot.receipt().context_determinization.is_some();
             let force_ordinary_fallback = spec.force_fallback
-                || config.force_resource_fallback && !has_context_assertions;
+                || forced_mode == ForcedFallbackMode::ZeroRows && !has_context_assertions;
             let witness_upstream = upstream_search(&upstream, spec.output, &spec.fixture);
             let witness_aot = AbiResult::from_aot(
                 aot.search(&spec.fixture, SearchWindow::full(&spec.fixture))
@@ -2130,8 +2392,7 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
                 reason == EngineSelectionReason::DeterminizationResourceLimit;
             if runtime_program.is_some()
                 && !spec.force_fallback
-                && !config.force_resource_fallback
-                && !config.force_retained_resource_fallback
+                && forced_mode == ForcedFallbackMode::None
                 && !has_context_assertions
                 && !structurally_runtime_backed
             {
@@ -2140,7 +2401,7 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
                     spec.name
                 ));
             }
-            let self_contained_engine = is_self_contained_native_shape(&aot)?;
+            let self_contained_engine = is_self_contained_native_shape(&aot);
             if force_ordinary_fallback && runtime_program.is_none() && !self_contained_engine {
                 return Err(format!(
                     "{} forced resource fallback has neither a runtime program nor a self-contained native entry",
@@ -2176,7 +2437,9 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
             }
             let prepared_capability_format = prepared_capability_format(&aot)
                 .map_err(|error| format!("{} {error}", spec.name))?;
-            let fallback_artifact_kind = if partial_dfa.is_some() {
+            let fallback_artifact_kind = if is_genuine_slow_partial(&aot) {
+                "slow_aot_partial"
+            } else if partial_dfa.is_some() {
                 "retained_partial"
             } else if exact_product {
                 "exact_product"
@@ -2193,22 +2456,30 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
             } else {
                 "direct"
             };
-            if config.force_retained_resource_fallback {
-                if let Some(stats) = partial_dfa {
-                    if reason != EngineSelectionReason::DeterminizationResourceLimit
-                        || aot.receipt().engine != EngineKind::OrderedNfa
-                        || runtime_program.is_none() && !self_contained_engine
-                        || stats.complete_rows == 0
-                        || !stats.optimized_entry_supported
-                    {
-                        return Err(format!(
-                            "{} retained-row probe produced an inconsistent artifact: reason={reason:?}, engine={:?}, runtime={}, prepared_entry_published={prepared_entry_published}, stats={stats:?}",
-                            spec.name,
-                            aot.receipt().engine,
-                            runtime_program.is_some(),
-                        ));
-                    }
-                }
+            if config.force_retained_resource_fallback
+                && !retained_limit_derivation.starts_with("excluded_")
+                && let Some(stats) = partial_dfa
+                && (reason != EngineSelectionReason::DeterminizationResourceLimit
+                    || aot.receipt().engine != EngineKind::OrderedNfa
+                    || runtime_program.is_none() && !self_contained_engine
+                    || stats.complete_rows == 0
+                    || !stats.optimized_entry_supported)
+            {
+                return Err(format!(
+                    "{} retained-row probe produced an inconsistent artifact: reason={reason:?}, engine={:?}, runtime={}, prepared_entry_published={prepared_entry_published}, stats={stats:?}",
+                    spec.name,
+                    aot.receipt().engine,
+                    runtime_program.is_some(),
+                ));
+            }
+            if forced_mode == ForcedFallbackMode::SlowPartial
+                && !retained_limit_derivation.starts_with("excluded_")
+                && !is_genuine_slow_partial(&aot)
+            {
+                return Err(format!(
+                    "{} derived slow-partial row failed its public receipt admission criteria",
+                    spec.name
+                ));
             }
             Ok(CompiledShape {
                 spec,
@@ -2234,6 +2505,14 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
         {
             return Err(
                 "prepared runtime route selected an artifact without its native entry and serialized program"
+                    .to_owned(),
+            );
+        }
+        if route == "slow_partial_resource_fallback"
+            && shapes.iter().any(|shape| !is_genuine_slow_partial(&shape.aot))
+        {
+            return Err(
+                "slow-partial route selected an artifact without a genuine incomplete forward prefix"
                     .to_owned(),
             );
         }
@@ -3726,6 +4005,60 @@ fn print_partial_dfa_metadata(shapes: &[CompiledShape]) {
         ];
         println!("{}", fields.join("\t"));
     }
+
+    // Keep the established partial-DFA row schema stable for existing matrix
+    // consumers. Slow-AOT provenance is an additive comment-prefixed table.
+    println!(
+        "#slow_aot_header\tpattern\tfamily\tseed\toutput\tlimit_derivation\tpresent\tpartial_admitted\trequested_max_states\teffective_max_states\tcomplete_rows\tforward_states_before_minimization\tdecline_stage\tdecline_resource\twork_completed\truntime_helper_symbols\tstatus"
+    );
+    for shape in shapes {
+        let slow = shape.aot.receipt().slow_aot.as_ref();
+        let slow_decline = slow.and_then(|report| report.determinization.decline);
+        let number = |value: Option<u64>| {
+            value.map_or_else(|| "na".to_owned(), |value| value.to_string())
+        };
+        let runtime_helper_symbols = shape
+            .aot
+            .module()
+            .symbols()
+            .iter()
+            .filter(|symbol| symbol.section.is_none())
+            .map(|symbol| symbol.name.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        let fields = [
+            "#slow_aot".to_owned(),
+            shape.spec.name.clone(),
+            shape.spec.family.to_owned(),
+            format!("0x{:016x}", shape.spec.seed),
+            shape.spec.output.name().to_owned(),
+            shape.retained_limit_derivation.to_owned(),
+            slow.is_some().to_string(),
+            is_genuine_slow_partial(&shape.aot).to_string(),
+            number(slow.map(|report| report.requested_limits.determinize.max_states as u64)),
+            number(slow.map(|report| report.determinization.effective_limits.max_states as u64)),
+            number(slow.map(|report| report.dfa.forward_states as u64)),
+            number(
+                slow.map(|report| report.dfa.forward_states_before_minimization as u64),
+            ),
+            slow_decline.map_or_else(
+                || "none".to_owned(),
+                |decline| format!("{:?}", decline.stage),
+            ),
+            slow_decline.map_or_else(
+                || "none".to_owned(),
+                |decline| format!("{:?}", decline.resource).replace(' ', ""),
+            ),
+            number(slow.map(|report| report.determinization.work_completed)),
+            if runtime_helper_symbols.is_empty() {
+                "none".to_owned()
+            } else {
+                runtime_helper_symbols
+            },
+            "ok".to_owned(),
+        ];
+        println!("{}", fields.join("\t"));
+    }
 }
 
 fn print_environment(config: &Config, shapes: &[CompiledShape], scenario_count: usize) {
@@ -3836,6 +4169,14 @@ fn print_environment(config: &Config, shapes: &[CompiledShape], scenario_count: 
         "environment\tforce_retained_resource_fallback\t{}",
         config.force_retained_resource_fallback
     );
+    println!(
+        "environment\tforce_slow_partial_resource_fallback\t{}",
+        config.force_slow_partial_resource_fallback
+    );
+    println!(
+        "environment\tslow_aot_policy\t{}",
+        config.forced_fallback_mode().slow_aot_policy()
+    );
     let artifact_counts = shapes.iter().fold(BTreeMap::new(), |mut counts, shape| {
         *counts.entry(shape.fallback_artifact_kind).or_insert(0_usize) += 1;
         counts
@@ -3843,6 +4184,20 @@ fn print_environment(config: &Config, shapes: &[CompiledShape], scenario_count: 
     println!(
         "environment\tfallback_artifact_counts\t{}",
         artifact_counts
+            .into_iter()
+            .map(|(kind, count)| format!("{kind}={count}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let derivation_counts = shapes.iter().fold(BTreeMap::new(), |mut counts, shape| {
+        *counts
+            .entry(shape.retained_limit_derivation)
+            .or_insert(0_usize) += 1;
+        counts
+    });
+    println!(
+        "environment\tfallback_limit_derivation_counts\t{}",
+        derivation_counts
             .into_iter()
             .map(|(kind, count)| format!("{kind}={count}"))
             .collect::<Vec<_>>()
@@ -3868,7 +4223,7 @@ fn run(config: &Config) -> Result<(), String> {
     };
     let shapes = compile_shapes(config)?;
     eprintln!(
-        "generated comparison: {architecture}-{operating_system}, patterns={}, cells={}, feature_bits={:#x}, trials={}, bytes_per_trial={}, min_searches={}, min_trial_ns={}, smoke={}, grammar={}, nested_grammar={}, output_matrix={}, force_resource_fallback={}, force_retained_resource_fallback={}, family_filter={}, pattern_filter={}, route_filter={}, measurement_order={}, seed_filter={}",
+        "generated comparison: {architecture}-{operating_system}, patterns={}, cells={}, feature_bits={:#x}, trials={}, bytes_per_trial={}, min_searches={}, min_trial_ns={}, smoke={}, grammar={}, nested_grammar={}, output_matrix={}, force_resource_fallback={}, force_retained_resource_fallback={}, force_slow_partial_resource_fallback={}, slow_aot_policy={}, family_filter={}, pattern_filter={}, route_filter={}, measurement_order={}, seed_filter={}",
         shapes.len(),
         shapes.len() * sizes(config).len() * positions(config).len() * densities(config).len(),
         config.target.features.bits(),
@@ -3882,6 +4237,8 @@ fn run(config: &Config) -> Result<(), String> {
         config.output_matrix,
         config.force_resource_fallback,
         config.force_retained_resource_fallback,
+        config.force_slow_partial_resource_fallback,
+        config.forced_fallback_mode().slow_aot_policy(),
         config.family_filter.as_deref().unwrap_or("all"),
         config.pattern_filter.as_deref().unwrap_or("all"),
         config.route_filter.as_deref().unwrap_or("all"),
@@ -3930,6 +4287,7 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fre_aot_regex::compile;
 
     const UNSEEN_TEST_SEED: u64 = 0x510e_527f_ade6_82d1;
 
@@ -3950,6 +4308,7 @@ mod tests {
             output_matrix: false,
             force_resource_fallback: false,
             force_retained_resource_fallback: false,
+            force_slow_partial_resource_fallback: false,
             seed_filter,
             grammar: true,
             nested_grammar: false,
@@ -3967,6 +4326,47 @@ mod tests {
         config.grammar = !nested;
         config.nested_grammar = nested;
         config
+    }
+
+    fn renamed_test_spec(pattern: &str, output: OutputKind, name: &str) -> SeededPatternSpec {
+        let mut spec = grammar_patterns(&flat_grammar_config(Some(UNSEEN_TEST_SEED)))
+            .into_iter()
+            .next()
+            .expect("generated test shape");
+        spec.name = name.to_owned();
+        spec.base_name = name.to_owned();
+        spec.family = "structural_test";
+        spec.pattern = pattern.to_owned();
+        spec.fixture = b"AqqZ".to_vec();
+        spec.candidates = b"A".to_vec();
+        spec.output = output;
+        spec.force_fallback = false;
+        spec
+    }
+
+    fn compiled_test_shape(
+        spec: SeededPatternSpec,
+        aot: CompiledRegex,
+        fallback_artifact_kind: &'static str,
+        limit_derivation: &'static str,
+    ) -> CompiledShape {
+        let runtime_program = aot
+            .module()
+            .required_runtime_program()
+            .map(|(symbol, bytes)| (symbol.to_owned(), bytes));
+        let partial_dfa = retained_partial_stats(&aot).expect("test partial statistics");
+        let prepared_capability_format =
+            prepared_capability_format(&aot).expect("test prepared capability");
+        CompiledShape {
+            upstream: Regex::new(&spec.pattern).expect("test upstream regex"),
+            spec,
+            aot,
+            runtime_program,
+            partial_dfa,
+            prepared_capability_format,
+            fallback_artifact_kind,
+            retained_limit_derivation: limit_derivation,
+        }
     }
 
     fn generated_matrix_cardinality(config: &Config) -> (usize, usize) {
@@ -4051,6 +4451,190 @@ mod tests {
     }
 
     #[test]
+    fn forced_fallback_modes_and_new_routes_are_closed_and_mutually_exclusive() {
+        assert_eq!(
+            forced_fallback_mode(false, false, false),
+            Ok(ForcedFallbackMode::None)
+        );
+        assert_eq!(
+            forced_fallback_mode(true, false, false),
+            Ok(ForcedFallbackMode::ZeroRows)
+        );
+        assert_eq!(
+            forced_fallback_mode(false, true, false),
+            Ok(ForcedFallbackMode::RetainedRows)
+        );
+        assert_eq!(
+            forced_fallback_mode(false, false, true),
+            Ok(ForcedFallbackMode::SlowPartial)
+        );
+        for flags in [
+            (true, true, false),
+            (true, false, true),
+            (false, true, true),
+            (true, true, true),
+        ] {
+            assert!(forced_fallback_mode(flags.0, flags.1, flags.2).is_err());
+        }
+
+        for route in [
+            "prepared_runtime_assertion",
+            "ordinary_runtime_assertion",
+            "direct_context_fallback",
+            "slow_partial_resource_fallback",
+        ] {
+            assert!(is_known_route(route));
+        }
+        assert!(!is_known_route("prepared_by_pattern_name"));
+
+        let disabled = disabled_slow_aot_limits();
+        assert_eq!(disabled.determinize.max_states, 0);
+        assert_eq!(disabled.determinize.max_transitions, 0);
+        assert_eq!(disabled.determinize.max_work, 0);
+        assert_eq!(disabled.max_allocation_bytes, 0);
+        assert_eq!(disabled.max_native_data_bytes, 0);
+    }
+
+    #[test]
+    fn zero_and_natural_retained_force_modes_disable_slow_aot_at_final_compile() {
+        let target = Target::x86_64_linux();
+
+        let mut config = flat_grammar_config(Some(UNSEEN_TEST_SEED));
+        let selected_name = grammar_patterns(&config)[0].name.clone();
+        config.pattern_filter = Some(selected_name);
+        config.force_resource_fallback = true;
+        let zero_rows = compile_shapes(&config).expect("forced zero-row shape");
+        assert_eq!(zero_rows.len(), 1);
+        assert!(zero_rows[0].aot.receipt().slow_aot.is_none());
+        assert_eq!(
+            zero_rows[0]
+                .aot
+                .receipt()
+                .determinization
+                .requested_limits
+                .max_states,
+            0
+        );
+        assert_eq!(
+            zero_rows[0].retained_limit_derivation,
+            "zero_state_slow_disabled"
+        );
+
+        let spec = renamed_test_spec(
+            "a+Q|[b-c][a-b]{1,5}(?:x+|y+)|a*",
+            OutputKind::SelectedEnd,
+            "natural_retained_renamed",
+        );
+        let mut probe_limits = CompileLimitsV1::default();
+        probe_limits.determinize.max_states = 8;
+        let (retained, derivation) = compile_retained_resource_probe_with_limits(
+            &spec,
+            target,
+            probe_limits,
+        )
+        .expect("natural retained structural probe");
+        assert_eq!(derivation, "natural_decline_slow_disabled");
+        assert!(retained.receipt().slow_aot.is_none());
+        let stats = retained_partial_stats(&retained)
+            .expect("retained statistics")
+            .expect("nonempty natural retained rows");
+        assert!(stats.complete_rows > 0);
+    }
+
+    #[test]
+    fn slow_partial_derivation_is_structural_and_times_the_generated_entry() {
+        const PATTERN: &str = "A(?-u:[^Z])*Z|(?:ab|cd){2,8}";
+        let target = Target::x86_64_linux();
+        let derive_without_name: fn(
+            &str,
+            OutputKind,
+            Target,
+        ) -> Result<(CompiledRegex, &'static str), String> = compile_slow_partial_resource_probe;
+        let (aot, derivation) = derive_without_name(PATTERN, OutputKind::SelectedEnd, target)
+            .expect("derive genuine slow partial from source structure");
+        assert!(matches!(
+            derivation,
+            "slow_forward_state_limit"
+                | "slow_forward_state_search"
+                | "slow_natural_resource_limit"
+        ));
+        assert!(is_genuine_slow_partial(&aot));
+        let slow = aot.receipt().slow_aot.as_ref().expect("slow report");
+        assert_eq!(
+            slow
+                .determinization
+                .decline
+                .expect("slow decline")
+                .stage,
+            DeterminizationStage::ForwardSubsetConstruction
+        );
+        assert!(slow.dfa.forward_states > 0);
+        assert!(slow.dfa.forward_states < slow.dfa.forward_states_before_minimization);
+        assert_eq!(aot.receipt().determinization.requested_limits.max_states, 0);
+
+        let entry = aot.module().entry_symbol().to_owned();
+        let (runtime_symbol, runtime_bytes) = aot
+            .module()
+            .required_runtime_program()
+            .map(|(symbol, bytes)| (symbol.to_owned(), bytes))
+            .expect("current whole-search slow-partial wrapper program");
+        assert!(aot.module().prepared_entry_symbol().is_none());
+        let shape = compiled_test_shape(
+            renamed_test_spec(PATTERN, OutputKind::SelectedEnd, "arbitrary_renamed_source"),
+            aot,
+            "slow_aot_partial",
+            derivation,
+        );
+        assert_eq!(shape.route(), "slow_partial_resource_fallback");
+        assert_eq!(shape.score_scope(), "slow_aot_partial_generated_entry");
+        assert!(shape.is_compiled_primary());
+
+        let source = build_c_harness(&flat_grammar_config(None), &[shape], &[]);
+        assert!(source.contains(&format!(
+            "extern uint32_t {entry}(const unsigned char *"
+        )));
+        assert!(source.contains(&format!(
+            "{{\"arbitrary_renamed_source\", {entry}, NULL, {runtime_symbol}, {runtime_bytes}, 0"
+        )));
+        assert!(source.contains("return shape->direct(haystack, length, 0U, length, result);"));
+    }
+
+    #[test]
+    fn slow_context_completion_uses_the_direct_context_fallback_route() {
+        const PATTERN: &str = r"(?-u:\b)abc(?-u:\b)";
+        let (aot, derivation) = compile_slow_partial_resource_probe(
+            PATTERN,
+            OutputKind::Span,
+            Target::x86_64_linux(),
+        )
+        .expect("truthful excluded slow-context fallback");
+        assert_eq!(derivation, "excluded_contextual");
+        assert!(!is_genuine_slow_partial(&aot));
+        assert_eq!(
+            aot.receipt().engine_selection_reason,
+            EngineSelectionReason::ContextAssertions
+        );
+        assert!(aot.receipt().slow_context_aot.is_some());
+        assert!(aot.module().prepared_entry_symbol().is_none());
+        assert!(aot.module().required_runtime_program().is_none());
+        let entry = aot.module().entry_symbol().to_owned();
+        let shape = compiled_test_shape(
+            renamed_test_spec(PATTERN, OutputKind::Span, "renamed_context_source"),
+            aot,
+            "contextual",
+            derivation,
+        );
+        assert_eq!(shape.route(), "direct_context_fallback");
+        assert_eq!(shape.timed_entry_scope(), "self_contained_compiled");
+
+        let source = build_c_harness(&flat_grammar_config(None), &[shape], &[]);
+        assert!(source.contains(&format!(
+            "{{\"renamed_context_source\", {entry}, NULL, NULL, 0, 0"
+        )));
+        assert!(source.contains("return shape->direct(haystack, length, 0U, length, result);"));
+    }
+
+    #[test]
     fn direct_resource_fallback_is_classified_from_the_emitted_object_abi() {
         let target = Target::x86_64_linux();
         let mut limits = CompileLimitsV1::default();
@@ -4066,7 +4650,7 @@ mod tests {
         assert!(aot.program().has_nfa_exact_product());
         assert!(aot.module().required_runtime_program().is_none());
         assert!(aot.module().required_runtime_symbol().is_none());
-        assert!(is_self_contained_native_shape(&aot).unwrap());
+        assert!(is_self_contained_native_shape(&aot));
 
         let shape = CompiledShape {
             spec: grammar_patterns(&flat_grammar_config(Some(UNSEEN_TEST_SEED)))
@@ -4199,7 +4783,7 @@ mod tests {
         );
         assert!(retained_partial_stats(&aot).unwrap().is_none());
         assert!(aot.module().prepared_entry_symbol().is_none());
-        assert!(!is_self_contained_native_shape(&aot).unwrap());
+        assert!(!is_self_contained_native_shape(&aot));
         let entry = aot.module().entry_symbol().to_owned();
         let (runtime_symbol, runtime_bytes) = aot
             .module()
@@ -4296,7 +4880,7 @@ mod tests {
         assert_eq!(partial.resume_frontiers, 0);
         assert_eq!(partial.resume_items, 0);
         assert!(partial.optimized_entry_supported);
-        assert!(is_self_contained_native_shape(&retained).unwrap());
+        assert!(is_self_contained_native_shape(&retained));
     }
 
     #[test]
@@ -4349,7 +4933,7 @@ mod tests {
             assert!(partial_stats.complete_rows < partial_stats.discovered_states);
             assert_eq!(aot.module().prepared_entry_symbol().is_some(), prepared);
             assert_eq!(
-                is_self_contained_native_shape(&aot).unwrap(),
+                is_self_contained_native_shape(&aot),
                 !runtime_backed,
                 "{pattern:?}"
             );
