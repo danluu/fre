@@ -414,21 +414,41 @@ impl PreparedAotRegex {
         let fully_prefilled_fallback = program
             .compiler_private_try_prefill_retained_fallback_with_workspace_receipt(&mut workspace)
             .map_err(PrepareError::Workspace)?;
-        let mut frozen_dynamic_rows = fully_prefilled_fallback
-            .is_none()
-            .then(|| {
-                program.compiler_private_frozen_dynamic_rows_storage_v3(
-                    &workspace,
-                    FROZEN_DYNAMIC_SIDECAR_MAX_K0_BYTES,
-                    FROZEN_DYNAMIC_SIDECAR_MAX_PACKED_BYTES,
-                )
-            })
-            .flatten();
-        let frozen_header = program.compiler_private_frozen_prepared_header_v6(
+        // A retained-partial receipt is still valuable to every ordinary or
+        // continuation fallback, but it need not force the generated entry
+        // to execute the older wide K0 projection. The header publishers keep
+        // their established rule that a receipt wins when both candidates are
+        // supplied; this runtime owner instead presents only the independently
+        // closed compact projection first while retaining the receipt beside
+        // it. A compact construction or publication decline then presents the
+        // receipt alone and transactionally recovers the established V1
+        // capability. Both setup proofs remain immutable until revocation.
+        let mut frozen_dynamic_rows = program.compiler_private_frozen_dynamic_rows_storage_v3(
             &workspace,
-            fully_prefilled_fallback,
-            frozen_dynamic_rows.as_ref(),
+            FROZEN_DYNAMIC_SIDECAR_MAX_K0_BYTES,
+            FROZEN_DYNAMIC_SIDECAR_MAX_PACKED_BYTES,
         );
+        let mut frozen_header = if frozen_dynamic_rows.is_some() {
+            program.compiler_private_frozen_prepared_header_v6(
+                &workspace,
+                None,
+                frozen_dynamic_rows.as_ref(),
+            )
+        } else {
+            program.compiler_private_frozen_prepared_header_v6(
+                &workspace,
+                fully_prefilled_fallback,
+                None,
+            )
+        };
+        if frozen_dynamic_rows.is_some() && !frozen_header.has_dynamic_rows() {
+            frozen_dynamic_rows = None;
+            frozen_header = program.compiler_private_frozen_prepared_header_v6(
+                &workspace,
+                fully_prefilled_fallback,
+                None,
+            );
+        }
         if !frozen_header.has_dynamic_rows() {
             frozen_dynamic_rows = None;
         }
@@ -4851,10 +4871,46 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
 
             let serialized = compiled.program().serialize().expect("serialize partial");
             assert_ne!(serialized[15] & (1 << 3), 0, "V4 partial flag");
+            let mut direct =
+                PreparedAotRegex::deserialize(&serialized).expect("prepare direct resource owner");
+            assert!(
+                direct.fully_prefilled_fallback.is_some(),
+                "resource fallback must retain its setup receipt for {output:?}"
+            );
+            if output == OutputContract::Span {
+                assert_eq!(compiled.program().exact_match_width(), None);
+                assert!(
+                    direct.frozen_dynamic_rows.is_none(),
+                    "variable-width Span must decline the compact owner"
+                );
+                assert!(direct.frozen_header.is_active());
+                assert!(
+                    !direct.frozen_header.has_dynamic_rows(),
+                    "a compact decline must recover the active retained V1 capability"
+                );
+            } else {
+                assert!(
+                    direct.frozen_dynamic_rows.is_some(),
+                    "eligible resource fallback must retain a compact owner for {output:?}"
+                );
+                assert!(direct.frozen_header.has_dynamic_rows(), "{output:?}");
+            }
             let exclusive = prepare_exclusive(&serialized);
             let short = b"cbbbbx";
             let mut long = vec![b'x'; 256];
             long.extend_from_slice(short);
+            let long_expected = reference
+                .search(&long, SearchWindow::full(&long))
+                .expect("universal long reference search");
+            direct.deactivate_frozen_header();
+            assert_eq!(
+                direct
+                    .search_exclusive(&long, SearchWindow::full(&long))
+                    .expect("post-revocation receipt-backed search"),
+                long_expected,
+                "post-revocation {output:?}"
+            );
+            assert!(!direct.frozen_header.is_active());
             for haystack in [short.as_slice(), long.as_slice()] {
                 let expected = expected_ffi(
                     reference
@@ -4879,6 +4935,91 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
                 STATUS_SUCCESS
             );
         }
+
+        // Unlike the variable-width Span case above, an exact positive width
+        // needs no reverse-row capability and may safely prefer compact rows.
+        // Search a small ceiling range so the fixture remains a genuine
+        // retained-resource fallback as determinization evolves.
+        let fixed_pattern = r"(?:ab|ba|cd|dc|ef|fe){4}";
+        let (fixed, serialized, mut direct) = (2..=64)
+            .find_map(|max_states| {
+                let mut limits = CompileLimitsV1::default();
+                limits.determinize.max_states = max_states;
+                let candidate = compile(
+                    CompileRequest::new(fixed_pattern, Target::x86_64_linux())
+                        .mode(CompileMode::Optimizing)
+                        .limits(limits)
+                        .output(OutputContract::Span),
+                )
+                .ok()?;
+                if candidate.program().exact_match_width() != Some(8)
+                    || candidate.receipt().engine_selection_reason
+                        != EngineSelectionReason::DeterminizationResourceLimit
+                {
+                    return None;
+                }
+                let stats = candidate.program().partial_dfa_stats().ok()??;
+                if stats.complete_rows == 0
+                    || stats.complete_rows >= stats.discovered_states
+                    || stats.resume_frontiers == 0
+                {
+                    return None;
+                }
+                let serialized = candidate.program().serialize().ok()?;
+                let direct = PreparedAotRegex::deserialize(&serialized).ok()?;
+                (direct.fully_prefilled_fallback.is_some()
+                    && direct.frozen_dynamic_rows.is_some()
+                    && direct.frozen_header.has_dynamic_rows())
+                .then_some((candidate, serialized, direct))
+            })
+            .expect("fixed-width Span with retained receipt and compact owner");
+        assert_eq!(fixed.program().exact_match_width(), Some(8));
+        assert!(direct.fully_prefilled_fallback.is_some());
+        assert!(direct.frozen_dynamic_rows.is_some());
+        assert!(direct.frozen_header.has_dynamic_rows());
+
+        let reference = compile(
+            CompileRequest::new(fixed_pattern, Target::x86_64_linux())
+                .mode(CompileMode::Fast)
+                .output(OutputContract::Span),
+        )
+        .expect("compile fixed-width universal reference");
+        let mut haystack = vec![b'!'; 256];
+        haystack.extend_from_slice(b"abababab");
+        let window = SearchWindow::full(&haystack);
+        let expected = reference
+            .search(&haystack, window)
+            .expect("fixed-width universal reference search");
+        direct.deactivate_frozen_header();
+        assert_eq!(
+            direct
+                .search_exclusive(&haystack, window)
+                .expect("fixed-width post-revocation receipt-backed search"),
+            expected
+        );
+        assert!(!direct.frozen_header.is_active());
+
+        let exclusive = prepare_exclusive(&serialized);
+        let mut actual = FreAotRegexResultV1::default();
+        assert_eq!(
+            (
+                call_exclusive(
+                    exclusive,
+                    &haystack,
+                    window.start(),
+                    window.end(),
+                    &mut actual,
+                ),
+                actual,
+            ),
+            expected_ffi(expected)
+        );
+        // SAFETY: this test owns the unique live exclusive handle and no call
+        // overlaps destruction.
+        assert_eq!(
+            unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(exclusive) },
+            STATUS_SUCCESS
+        );
     }
 
     #[test]
@@ -4912,7 +5053,11 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
 
         let mut direct = PreparedAotRegex::deserialize(&serialized).expect("prepare direct Rust");
         assert!(direct.fully_prefilled_fallback.is_some());
-        assert!(direct.frozen_dynamic_rows.is_none());
+        assert!(
+            direct.frozen_dynamic_rows.is_some(),
+            "a closed compact projection should own the native entry while the retained receipt remains available to fallbacks"
+        );
+        assert!(direct.frozen_header.has_dynamic_rows());
         assert!(direct.frozen_header.is_active());
         assert_eq!(*direct.frozen_header.artifact_identity(), identity);
         assert_eq!(
