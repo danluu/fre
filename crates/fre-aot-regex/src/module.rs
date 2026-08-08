@@ -2209,6 +2209,7 @@ fn lower_native_dynamic_rows_prepared(
                 view.source_class_count >= FROZEN_COMPACT_DIRECT_BYTE_MIN_CLASSES,
                 immutable_compact_possible,
                 supertransitions_possible,
+                target.features.has(CpuFeature::Aarch64Asimd),
             )?
         },
     };
@@ -12977,9 +12978,13 @@ fn lower_x86_64_slow_partial_wrapper(
 /// Per-call authentication policy for one already-published compact
 /// V3 through V14 compact projection selected by its exact generation tag.
 ///
-/// Production exclusive handles use `ActiveCapability`: construction fully
-/// validates the private immutable owner before publishing both seals, and
-/// every route that can mutate prepared state clears the active seal first.
+/// Production exclusive handles use an active-capability mode: construction
+/// fully validates the private immutable owner before publishing both seals,
+/// and every route that can mutate prepared state clears the active seal first.
+/// Fixed-width SIMD modes preserve that proof while comparing the exact
+/// artifact identity with one branch. Portable AArch64 targets retain the
+/// scalar capability because ASIMD is an explicit target feature in this
+/// crate; x86-64 always has the SSE2 baseline.
 /// `FullVerifier` remains available to audit the complete descriptor geometry
 /// and to preserve fail-closed codegen coverage independently of that
 /// lifecycle proof.
@@ -12990,6 +12995,7 @@ fn lower_x86_64_slow_partial_wrapper(
 )]
 enum FrozenCompactGuardMode {
     ActiveCapability,
+    ActiveCapabilitySimdIdentity,
     FullVerifier,
 }
 
@@ -13317,32 +13323,61 @@ fn x86_emit_frozen_compact_entry(
         branch_failed(assembler)?;
     }
 
-    // The artifact comparison remains exact over all 256 bits. This scalar
-    // form is the correctness baseline for independently measured SIMD gates.
-    for identity_word in 0_usize..4 {
-        let word_offset = identity_word
-            .checked_mul(core::mem::size_of::<u64>())
-            .ok_or(ObjectError::ArithmeticOverflow("x86 V3 identity word"))?;
-        if word_offset == 0 {
-            assembler.instruction(&[0x4c, 0x8b, 0x10])?;
-        } else {
+    // The scalar verifier remains an independent correctness baseline. Every
+    // x86-64 has SSE2, so production capabilities compare both unaligned
+    // 128-bit halves, fold their byte-equality masks, and branch once on the
+    // exact 256-bit result. The linked identity address is already
+    // frame-resident, so the mask may consume EAX without weakening later
+    // preflight or table setup.
+    if guard_mode == FrozenCompactGuardMode::ActiveCapabilitySimdIdentity {
+        let first_header = header_disp(
+            FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET,
+            "x86 compact SSE2 identity offset",
+        )?;
+        let second_header = header_disp(
+            FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET
+                .checked_add(16)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "x86 compact SSE2 identity extent",
+                ))?,
+            "x86 compact SSE2 identity second half",
+        )?;
+        assembler.instruction(&[0xf3, 0x0f, 0x6f, 0x00])?; // movdqu xmm0, [rax]
+        assembler.instruction(&[0xf3, 0x0f, 0x6f, 0x48, 0x10])?; // movdqu xmm1, 16[rax]
+        assembler.instruction(&[0xf3, 0x0f, 0x6f, 0x57, first_header])?; // movdqu xmm2, identity[rdi]
+        assembler.instruction(&[0xf3, 0x0f, 0x6f, 0x5f, second_header])?; // movdqu xmm3, identity+16[rdi]
+        assembler.instruction(&[0x66, 0x0f, 0x74, 0xc2])?; // pcmpeqb xmm0, xmm2
+        assembler.instruction(&[0x66, 0x0f, 0x74, 0xcb])?; // pcmpeqb xmm1, xmm3
+        assembler.instruction(&[0x66, 0x0f, 0xdb, 0xc1])?; // pand xmm0, xmm1
+        assembler.instruction(&[0x66, 0x0f, 0xd7, 0xc0])?; // pmovmskb eax, xmm0
+        assembler.instruction(&[0x66, 0x3d, 0xff, 0xff])?; // cmp ax, 0xffff
+        branch_failed(assembler)?;
+    } else {
+        for identity_word in 0_usize..4 {
+            let word_offset = identity_word
+                .checked_mul(core::mem::size_of::<u64>())
+                .ok_or(ObjectError::ArithmeticOverflow("x86 V3 identity word"))?;
+            if word_offset == 0 {
+                assembler.instruction(&[0x4c, 0x8b, 0x10])?;
+            } else {
+                assembler.instruction(&[
+                    0x4c,
+                    0x8b,
+                    0x50,
+                    header_disp(word_offset, "x86 V3 linked identity word")?,
+                ])?;
+            }
+            let header_offset = FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET
+                .checked_add(word_offset)
+                .ok_or(ObjectError::ArithmeticOverflow("x86 V3 header identity"))?;
             assembler.instruction(&[
                 0x4c,
-                0x8b,
-                0x50,
-                header_disp(word_offset, "x86 V3 linked identity word")?,
+                0x3b,
+                0x57,
+                header_disp(header_offset, "x86 V3 header identity word")?,
             ])?;
+            branch_failed(assembler)?;
         }
-        let header_offset = FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET
-            .checked_add(word_offset)
-            .ok_or(ObjectError::ArithmeticOverflow("x86 V3 header identity"))?;
-        assembler.instruction(&[
-            0x4c,
-            0x3b,
-            0x57,
-            header_disp(header_offset, "x86 V3 header identity word")?,
-        ])?;
-        branch_failed(assembler)?;
     }
 
     if guard_mode == FrozenCompactGuardMode::FullVerifier {
@@ -14760,6 +14795,10 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     assembler.bind(identity_displacement_label)?;
     push_bytes(&mut assembler.code, &[0; 4])?;
     assembler.instruction(&[0x48, 0x89, 0x04, 0x24])?;
+    // SSE2 is part of the x86-64 architecture baseline, even when the explicit
+    // target-feature vocabulary is empty. Keeping this fixed-width guard also
+    // avoids introducing wide-vector transition state into scalar entries.
+    let compact_guard_mode = FrozenCompactGuardMode::ActiveCapabilitySimdIdentity;
 
     // Keep the complete V3--V14 selector lattice out of machine code when
     // target-neutral output semantics make every immutable format impossible.
@@ -14770,7 +14809,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             try_v7,
             call_preflight,
             v5_enter,
-            FrozenCompactGuardMode::ActiveCapability,
+            compact_guard_mode,
         )?;
     }
     assembler.bind(try_v7)?;
@@ -14779,7 +14818,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         try_v6,
         call_preflight,
         v7_enter,
-        FrozenCompactGuardMode::ActiveCapability,
+        compact_guard_mode,
     )?;
     assembler.bind(try_v6)?;
     x86_emit_frozen_compact_v6_entry(
@@ -14793,7 +14832,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         ),
         call_preflight,
         v6_enter,
-        FrozenCompactGuardMode::ActiveCapability,
+        compact_guard_mode,
     )?;
     if let (Some(try_v14), Some(v14_enter)) = (try_v14, v14_enter) {
         assembler.bind(try_v14)?;
@@ -14806,7 +14845,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             }),
             call_preflight,
             v14_enter,
-            FrozenCompactGuardMode::ActiveCapability,
+            compact_guard_mode,
         )?;
     }
     if let (Some(try_v13), Some(v13_enter)) = (try_v13, v13_enter) {
@@ -14820,7 +14859,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             },
             call_preflight,
             v13_enter,
-            FrozenCompactGuardMode::ActiveCapability,
+            compact_guard_mode,
         )?;
     }
     if direct_byte_formats_possible {
@@ -14830,7 +14869,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             try_v12,
             call_preflight,
             v10_enter,
-            FrozenCompactGuardMode::ActiveCapability,
+            compact_guard_mode,
         )?;
     }
     assembler.bind(try_v12)?;
@@ -14843,7 +14882,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         },
         call_preflight,
         v12_enter,
-        FrozenCompactGuardMode::ActiveCapability,
+        compact_guard_mode,
     )?;
     if direct_byte_formats_possible {
         assembler.bind(try_v8)?;
@@ -14852,7 +14891,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             try_v4,
             call_preflight,
             v8_enter,
-            FrozenCompactGuardMode::ActiveCapability,
+            compact_guard_mode,
         )?;
     }
     assembler.bind(try_v4)?;
@@ -14861,7 +14900,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         try_v3,
         call_preflight,
         v4_enter,
-        FrozenCompactGuardMode::ActiveCapability,
+        compact_guard_mode,
     )?;
     assembler.bind(try_v3)?;
     x86_emit_frozen_compact_v3_entry(
@@ -14869,7 +14908,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         try_v2,
         call_preflight,
         v3_enter,
-        FrozenCompactGuardMode::ActiveCapability,
+        compact_guard_mode,
     )?;
     }
     assembler.bind(try_v2)?;
@@ -19675,6 +19714,22 @@ fn aarch64_load_q(destination: u8, base: u8) -> Result<u32, ObjectError> {
     Ok(0x3dc0_0000 | aarch64_reg(base, 5)? | aarch64_reg(destination, 0)?)
 }
 
+fn aarch64_load_pair_q(
+    first_destination: u8,
+    second_destination: u8,
+    base: u8,
+    byte_offset: u16,
+) -> Result<u32, ObjectError> {
+    if !byte_offset.is_multiple_of(16) || byte_offset / 16 > 63 {
+        return Err(ObjectError::InvalidModule("AArch64 LDP Q offset"));
+    }
+    Ok(0xad40_0000
+        | (u32::from(byte_offset / 16) << 15)
+        | aarch64_reg(second_destination, 10)?
+        | aarch64_reg(base, 5)?
+        | aarch64_reg(first_destination, 0)?)
+}
+
 fn aarch64_ld1_three_16b(first_destination: u8, base: u8) -> Result<u32, ObjectError> {
     if first_destination > 29 {
         return Err(ObjectError::InvalidModule(
@@ -23608,29 +23663,48 @@ fn aarch64_emit_frozen_compact_entry(
         assembler.branch_cond(AARCH64_NE, call_preflight)?;
     }
 
-    // Compare all four u64 words; the linked identity address in X6 is not
-    // repurposed until the exact 256-bit comparison is complete.
-    for identity_word in 0_usize..4 {
-        let word_offset = identity_word
-            .checked_mul(core::mem::size_of::<u64>())
-            .ok_or(ObjectError::ArithmeticOverflow("AArch64 V3 identity word"))?;
-        assembler.instruction(aarch64_load_x_imm(
-            8,
-            6,
-            offset(word_offset, "AArch64 V3 linked identity word")?,
-        )?)?;
-        let header_offset = FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET
-            .checked_add(word_offset)
-            .ok_or(ObjectError::ArithmeticOverflow(
-                "AArch64 V3 header identity word",
-            ))?;
-        assembler.instruction(aarch64_load_x_imm(
-            9,
-            0,
-            offset(header_offset, "AArch64 V3 header identity word")?,
-        )?)?;
-        assembler.instruction(aarch64_cmp_x(8, 9)?)?;
-        assembler.branch_cond(AARCH64_NE, call_preflight)?;
+    // The scalar capability and full verifier remain valid for portable
+    // targets. An explicitly ASIMD-capable target loads both unaligned halves,
+    // OR-reduces their exact bytewise XOR, and branches once. V16..V19 are
+    // caller-saved and no scanner constants are live at this entry.
+    if guard_mode == FrozenCompactGuardMode::ActiveCapabilitySimdIdentity {
+        let header = offset(
+            FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET,
+            "AArch64 compact SIMD identity offset",
+        )?;
+        assembler.instruction(aarch64_load_pair_q(16, 17, 6, 0)?)?;
+        assembler.instruction(aarch64_load_pair_q(18, 19, 0, header)?)?;
+        assembler.instruction(aarch64_eor_16b(16, 16, 18)?)?;
+        assembler.instruction(aarch64_eor_16b(17, 17, 19)?)?;
+        assembler.instruction(aarch64_orr_16b(16, 16, 17)?)?;
+        assembler.instruction(aarch64_umaxv_16b(16, 16)?)?;
+        assembler.instruction(aarch64_umov_b0(8, 16)?)?;
+        assembler.branch_nonzero_w(8, call_preflight)?;
+    } else {
+        // Compare all four u64 words; the linked identity address in X6 is not
+        // repurposed until the exact 256-bit comparison is complete.
+        for identity_word in 0_usize..4 {
+            let word_offset = identity_word
+                .checked_mul(core::mem::size_of::<u64>())
+                .ok_or(ObjectError::ArithmeticOverflow("AArch64 V3 identity word"))?;
+            assembler.instruction(aarch64_load_x_imm(
+                8,
+                6,
+                offset(word_offset, "AArch64 V3 linked identity word")?,
+            )?)?;
+            let header_offset = FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET
+                .checked_add(word_offset)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "AArch64 V3 header identity word",
+                ))?;
+            assembler.instruction(aarch64_load_x_imm(
+                9,
+                0,
+                offset(header_offset, "AArch64 V3 header identity word")?,
+            )?)?;
+            assembler.instruction(aarch64_cmp_x(8, 9)?)?;
+            assembler.branch_cond(AARCH64_NE, call_preflight)?;
+        }
     }
 
     if guard_mode == FrozenCompactGuardMode::FullVerifier {
@@ -24810,6 +24884,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
         direct_byte_formats_possible,
         immutable_compact_possible,
         supertransitions_possible,
+        false,
     )
 }
 
@@ -24826,6 +24901,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     direct_byte_formats_possible: bool,
     immutable_compact_possible: bool,
     supertransitions_possible: bool,
+    use_asimd_identity: bool,
 ) -> Result<NativeDynamicRowsEmission, ObjectError> {
     const SCANNER_FREE_FRAME_BYTES: u16 = 96;
     const ROOT_SCANNER_FRAME_BYTES: u16 = 112;
@@ -25054,6 +25130,11 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     // root-scanner frame keeps its invocation representation separately at
     // SP+88.
     assembler.instruction(aarch64_store_x(6, 31, 80)?)?;
+    let compact_guard_mode = if use_asimd_identity {
+        FrozenCompactGuardMode::ActiveCapabilitySimdIdentity
+    } else {
+        FrozenCompactGuardMode::ActiveCapability
+    };
 
     // Keep the complete V3--V14 selector lattice out of machine code when
     // target-neutral output semantics make every immutable format impossible.
@@ -25064,7 +25145,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             try_v7,
             call_preflight,
             v5_enter,
-            FrozenCompactGuardMode::ActiveCapability,
+            compact_guard_mode,
         )?;
     }
     assembler.bind(try_v7)?;
@@ -25073,7 +25154,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         try_v6,
         call_preflight,
         v7_enter,
-        FrozenCompactGuardMode::ActiveCapability,
+        compact_guard_mode,
     )?;
     assembler.bind(try_v6)?;
     aarch64_emit_frozen_compact_v6_entry(
@@ -25087,7 +25168,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         ),
         call_preflight,
         v6_enter,
-        FrozenCompactGuardMode::ActiveCapability,
+        compact_guard_mode,
     )?;
     if let (Some(try_v14), Some(v14_enter)) = (try_v14, v14_enter) {
         assembler.bind(try_v14)?;
@@ -25100,7 +25181,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             }),
             call_preflight,
             v14_enter,
-            FrozenCompactGuardMode::ActiveCapability,
+            compact_guard_mode,
         )?;
     }
     if let (Some(try_v13), Some(v13_enter)) = (try_v13, v13_enter) {
@@ -25114,7 +25195,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             },
             call_preflight,
             v13_enter,
-            FrozenCompactGuardMode::ActiveCapability,
+            compact_guard_mode,
         )?;
     }
     if direct_byte_formats_possible {
@@ -25124,7 +25205,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             try_v12,
             call_preflight,
             v10_enter,
-            FrozenCompactGuardMode::ActiveCapability,
+            compact_guard_mode,
         )?;
     }
     assembler.bind(try_v12)?;
@@ -25137,7 +25218,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         },
         call_preflight,
         v12_enter,
-        FrozenCompactGuardMode::ActiveCapability,
+        compact_guard_mode,
     )?;
     if direct_byte_formats_possible {
         assembler.bind(try_v8)?;
@@ -25146,7 +25227,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             try_v4,
             call_preflight,
             v8_enter,
-            FrozenCompactGuardMode::ActiveCapability,
+            compact_guard_mode,
         )?;
     }
     assembler.bind(try_v4)?;
@@ -25155,7 +25236,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         try_v3,
         call_preflight,
         v4_enter,
-        FrozenCompactGuardMode::ActiveCapability,
+        compact_guard_mode,
     )?;
     assembler.bind(try_v3)?;
     aarch64_emit_frozen_compact_v3_entry(
@@ -25163,7 +25244,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         try_v2,
         call_preflight,
         v3_enter,
-        FrozenCompactGuardMode::ActiveCapability,
+        compact_guard_mode,
     )?;
     }
     assembler.bind(try_v2)?;
@@ -28947,6 +29028,234 @@ mod tests {
                 >= 2,
             "the ASIMD batch must load both primary and secondary columns"
         );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one structural audit proves exact SIMD reductions and target-aware production selection"
+    )]
+    fn frozen_compact_simd_identity_is_exact_and_target_aware() {
+        const LIVE_COMPACT_FORMATS: usize = 10;
+
+        fn occurrences(code: &[u8], needle: &[u8]) -> usize {
+            code.windows(needle.len())
+                .filter(|window| *window == needle)
+                .count()
+        }
+
+        let x86_guard = |mode| {
+            let mut assembler = X86Assembler::new();
+            let try_v2 = assembler.label().unwrap();
+            let preflight = assembler.label().unwrap();
+            let enter = assembler.label().unwrap();
+            x86_emit_frozen_compact_v3_entry(
+                &mut assembler,
+                try_v2,
+                preflight,
+                enter,
+                mode,
+            )
+            .unwrap();
+            for label in [try_v2, preflight, enter] {
+                assembler.bind(label).unwrap();
+                assembler.instruction(&[0xc3]).unwrap();
+            }
+            let raw = assembler.code.clone();
+            let instructions = assembler.instruction_offsets.len();
+            let branches = assembler.fixups.len();
+            assembler.finish().unwrap();
+            (raw, instructions, branches)
+        };
+        let (x86_scalar, x86_scalar_instructions, x86_scalar_branches) =
+            x86_guard(FrozenCompactGuardMode::ActiveCapability);
+        let (x86_sse2, x86_sse2_instructions, x86_sse2_branches) =
+            x86_guard(FrozenCompactGuardMode::ActiveCapabilitySimdIdentity);
+        let first_header =
+            u8::try_from(FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET).unwrap();
+        let second_header = first_header.checked_add(16).unwrap();
+        let x86_sse2_identity = [
+            0xf3,
+            0x0f,
+            0x6f,
+            0x00,
+            0xf3,
+            0x0f,
+            0x6f,
+            0x48,
+            0x10,
+            0xf3,
+            0x0f,
+            0x6f,
+            0x57,
+            first_header,
+            0xf3,
+            0x0f,
+            0x6f,
+            0x5f,
+            second_header,
+            0x66,
+            0x0f,
+            0x74,
+            0xc2,
+            0x66,
+            0x0f,
+            0x74,
+            0xcb,
+            0x66,
+            0x0f,
+            0xdb,
+            0xc1,
+            0x66,
+            0x0f,
+            0xd7,
+            0xc0,
+            0x66,
+            0x3d,
+            0xff,
+            0xff,
+        ];
+        assert_eq!(occurrences(&x86_scalar, &x86_sse2_identity), 0);
+        assert_eq!(occurrences(&x86_sse2, &x86_sse2_identity), 1);
+        assert_eq!(x86_scalar_instructions, x86_sse2_instructions + 2);
+        assert_eq!(x86_scalar_branches, x86_sse2_branches + 3);
+
+        assert_eq!(
+            aarch64_load_pair_q(16, 17, 6, 0).unwrap(),
+            0xad40_0000 | (17_u32 << 10) | (6_u32 << 5) | 16
+        );
+        assert!(aarch64_load_pair_q(16, 17, 6, 8).is_err());
+        let arm_guard = |mode| {
+            let mut assembler = Aarch64Assembler::new();
+            let try_v2 = assembler.label().unwrap();
+            let preflight = assembler.label().unwrap();
+            let enter = assembler.label().unwrap();
+            aarch64_emit_frozen_compact_v3_entry(
+                &mut assembler,
+                try_v2,
+                preflight,
+                enter,
+                mode,
+            )
+            .unwrap();
+            for label in [try_v2, preflight, enter] {
+                assembler.bind(label).unwrap();
+                assembler.instruction(0xd503_201f).unwrap();
+            }
+            let raw = assembler.code.clone();
+            let instructions = raw.len() / 4;
+            let branches = assembler.fixups.len();
+            assembler.finish().unwrap();
+            (raw, instructions, branches)
+        };
+        let (arm_scalar, arm_scalar_instructions, arm_scalar_branches) =
+            arm_guard(FrozenCompactGuardMode::ActiveCapability);
+        let (arm_simd, arm_simd_instructions, arm_simd_branches) =
+            arm_guard(FrozenCompactGuardMode::ActiveCapabilitySimdIdentity);
+        let arm_identity = [
+            aarch64_load_pair_q(16, 17, 6, 0).unwrap(),
+            aarch64_load_pair_q(
+                18,
+                19,
+                0,
+                u16::try_from(FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET).unwrap(),
+            )
+            .unwrap(),
+            aarch64_eor_16b(16, 16, 18).unwrap(),
+            aarch64_eor_16b(17, 17, 19).unwrap(),
+            aarch64_orr_16b(16, 16, 17).unwrap(),
+            aarch64_umaxv_16b(16, 16).unwrap(),
+            aarch64_umov_b0(8, 16).unwrap(),
+        ];
+        let arm_scalar_words = arm_scalar
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        let arm_simd_words = arm_simd
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            arm_scalar_words
+                .windows(arm_identity.len())
+                .filter(|words| *words == arm_identity)
+                .count(),
+            0
+        );
+        assert_eq!(
+            arm_simd_words
+                .windows(arm_identity.len())
+                .filter(|words| *words == arm_identity)
+                .count(),
+            1
+        );
+        assert_eq!(arm_scalar_instructions, arm_simd_instructions + 8);
+        assert_eq!(arm_scalar_branches, arm_simd_branches + 3);
+
+        let production_x86_sse2 =
+            lower_x86_64_dynamic_rows_prepared(None, FeatureSet::EMPTY).unwrap();
+        let production_x86_avx2 = lower_x86_64_dynamic_rows_prepared(
+            None,
+            FeatureSet::of(CpuFeature::X86Avx2),
+        )
+        .unwrap();
+        let avx512_without_avx2 = FeatureSet::of(CpuFeature::X86Avx512F)
+            .with(CpuFeature::X86Avx512Bw)
+            .with(CpuFeature::X86Avx512Vl);
+        let production_x86_avx512 =
+            lower_x86_64_dynamic_rows_prepared(None, avx512_without_avx2).unwrap();
+        for emission in [
+            &production_x86_sse2,
+            &production_x86_avx2,
+            &production_x86_avx512,
+        ] {
+            assert_eq!(
+                occurrences(&emission.code, &x86_sse2_identity),
+                LIVE_COMPACT_FORMATS
+            );
+        }
+
+        let portable_arm =
+            lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
+                None,
+                OutputContract::Exists,
+                None,
+                true,
+                true,
+                true,
+                true,
+                false,
+            )
+            .unwrap();
+        let asimd_arm =
+            lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
+                None,
+                OutputContract::Exists,
+                None,
+                true,
+                true,
+                true,
+                true,
+                true,
+            )
+            .unwrap();
+        for (emission, expected) in [
+            (&portable_arm, 0),
+            (&asimd_arm, LIVE_COMPACT_FORMATS),
+        ] {
+            let words = emission
+                .code
+                .chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                words
+                    .windows(arm_identity.len())
+                    .filter(|window| *window == arm_identity)
+                    .count(),
+                expected
+            );
+        }
     }
 
     #[test]
