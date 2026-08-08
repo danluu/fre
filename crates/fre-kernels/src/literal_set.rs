@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use aho_corasick::automaton::Automaton;
 use aho_corasick::dfa::DFA;
-use aho_corasick::{AhoCorasick, Input, MatchKind};
+use aho_corasick::{AhoCorasick, Anchored, Input, MatchKind};
 use fre_exact_alloc::try_box_preserve;
 use fre_simd_kernels::BYTE_BUCKET_BLOCK_BYTES;
 
@@ -702,13 +702,15 @@ impl LiteralSetPlan {
         // which the incumbent DFA reaches a real match with the least work.
         // The root proof still lets that DFA start at the candidate itself.
         if candidate_start - window.start() < tail.max_pattern_bytes {
-            return self.finish_folded_short_root_fallback(
+            return self.find_window_folded_short_early_candidate(
                 haystack,
-                Window::new(candidate_start, window.end()),
+                window,
                 limits,
                 incumbent_accounting,
+                tail,
+                candidate_start,
                 actual_work,
-                prospective.work,
+                prospective,
             );
         }
         self.find_window_folded_short_late_candidate(
@@ -720,6 +722,71 @@ impl LiteralSetPlan {
             candidate_start,
             actual_work,
             prospective,
+        )
+    }
+
+    #[inline(never)]
+    fn find_window_folded_short_early_candidate(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: LiteralSetSearchLimits,
+        incumbent_accounting: LiteralSetAccounting,
+        tail: &FoldedLongTail,
+        candidate_start: usize,
+        mut actual_work: usize,
+        prospective: FoldedShortRootProspective,
+    ) -> Result<(Option<(usize, usize)>, LiteralSetAccounting), LiteralSetError> {
+        let verify_end = candidate_start
+            .checked_add(tail.max_pattern_bytes)
+            .map_or(window.end(), |end| end.min(window.end()));
+        let verify = Window::new(candidate_start, verify_end);
+        let verify_accounting = search_accounting(verify, haystack.len(), limits)?;
+        let (bounded, _) =
+            self.find_window_incumbent_without_prefilter(haystack, verify, verify_accounting)?;
+        actual_work = actual_work
+            .checked_add(verify_accounting.transitions_upper_bound)
+            .ok_or(LiteralSetError::ArithmeticOverflow {
+                computation: "folded literal-set bounded-verifier work",
+            })?;
+        if let Some(matched) = bounded {
+            if matched.0 < candidate_start || matched.1 > verify_end {
+                return Err(invariant_error(
+                    "folded bounded verifier escaped its search window",
+                ));
+            }
+            // Only a match at the proved root start is globally authoritative.
+            // A later-start match at this artificial end may still be shadowed
+            // by an earlier maximum-width match that crosses `verify_end`.
+            if matched.0 == candidate_start {
+                let accounting = folded_long_accounting(
+                    incumbent_accounting,
+                    actual_work,
+                    prospective.work,
+                )?;
+                return Ok((Some(matched), accounting));
+            }
+        }
+        let resume_start = candidate_start.checked_add(1).ok_or(
+            LiteralSetError::ArithmeticOverflow {
+                computation: "folded literal-set bounded-verifier continuation",
+            },
+        )?;
+        if resume_start >= window.end() {
+            let accounting = folded_long_accounting(
+                incumbent_accounting,
+                actual_work,
+                prospective.work,
+            )?;
+            return Ok((None, accounting));
+        }
+        self.finish_folded_short_root_fallback(
+            haystack,
+            Window::new(resume_start, window.end()),
+            limits,
+            incumbent_accounting,
+            actual_work,
+            prospective.work,
         )
     }
 
@@ -1073,6 +1140,84 @@ impl LiteralSetPlan {
             .transpose()?;
         Ok((matched, accounting))
     }
+
+    /// Run the authoritative DFA from a necessary-root continuation without
+    /// consulting the DFA's independently retained heuristic prefilter.
+    ///
+    /// This mirrors `aho-corasick` 1.1.4's leftmost-first forward loop. The
+    /// DFA was built with an unanchored start state whose special-state set
+    /// still includes prefilter restart states, so those starts are explicitly
+    /// ignored while dead and delayed-match states retain their normal
+    /// semantics.
+    #[inline(never)]
+    fn find_window_incumbent_without_prefilter(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        accounting: LiteralSetAccounting,
+    ) -> Result<(Option<(usize, usize)>, LiteralSetAccounting), LiteralSetError> {
+        if self.build.match_semantics != LiteralSetMatchSemantics::LeftmostFirst
+            || window.start() > window.end()
+            || window.end() > haystack.len()
+        {
+            return Err(invariant_error(
+                "invalid folded authoritative DFA continuation",
+            ));
+        }
+        #[cfg(test)]
+        folded_short_stage_probe::record_bounded_verifier();
+        let automaton = self.automaton.as_ref();
+        let anchored = Anchored::No;
+        let mut state = automaton
+            .start_state(anchored)
+            .expect("the literal-set DFA retains its unanchored start state");
+        let mut matched = None;
+        if automaton.is_match(state) {
+            let pattern = automaton.match_pattern(state, 0);
+            let start = 0_usize.checked_sub(automaton.pattern_len(pattern)).ok_or(
+                LiteralSetError::ArithmeticOverflow {
+                    computation: "literal-set authoritative DFA match start",
+                },
+            )?;
+            matched = Some(aho_corasick::Match::new(pattern, start..0));
+        }
+        for (index, &byte) in haystack[window.start()..window.end()].iter().enumerate() {
+            state = automaton.next_state(anchored, state, byte);
+            if !automaton.is_special(state) {
+                continue;
+            }
+            if automaton.is_dead(state) {
+                break;
+            }
+            if automaton.is_match(state) {
+                let relative_end = index.checked_add(1).ok_or(
+                    LiteralSetError::ArithmeticOverflow {
+                        computation: "literal-set authoritative DFA relative end",
+                    },
+                )?;
+                let pattern = automaton.match_pattern(state, 0);
+                let relative_start = relative_end
+                    .checked_sub(automaton.pattern_len(pattern))
+                    .ok_or(LiteralSetError::ArithmeticOverflow {
+                        computation: "literal-set authoritative DFA match start",
+                    })?;
+                matched = Some(aho_corasick::Match::new(
+                    pattern,
+                    relative_start..relative_end,
+                ));
+                continue;
+            }
+            if !automaton.is_start(state) {
+                return Err(invariant_error(
+                    "literal-set DFA reached an unknown special state",
+                ));
+            }
+        }
+        let matched = matched
+            .map(|matched| absolute_match(window.start(), matched))
+            .transpose()?;
+        Ok((matched, accounting))
+    }
 }
 
 #[cfg(test)]
@@ -1155,16 +1300,17 @@ fn folded_short_root_prospective(
         .trie
         .root_candidate_single_pass_upper_bounds(input_bytes, tail.max_pattern_bytes)
         .ok()?;
-    let exact_probe_transitions = BYTE_BUCKET_BLOCK_BYTES
-        .checked_add(tail.max_pattern_bytes)?;
-    let incumbent_transitions = input_bytes.checked_add(1)?;
-    // Before inspecting source, cover every terminal outcome: one complete
-    // necessary-root pass; at most one authoritative exact block; and an
-    // incumbent continuation no longer than the original window.
+    let bounded_verify_transitions = tail.max_pattern_bytes.checked_add(1)?;
+    // Every early candidate pays at most W+1 verifier transitions, settles
+    // that start, then leaves at most N-1 bytes (N transitions including DFA
+    // initialization) to the incumbent. Dense fallback also resumes after at
+    // least one settled start. The retained late block plus its continuation
+    // is bounded more tightly by N+1, so this same envelope covers every route.
+    let incumbent_suffix_transitions = input_bytes;
     let work = trie
         .work
-        .checked_add(exact_probe_transitions)?
-        .checked_add(incumbent_transitions)?;
+        .checked_add(bounded_verify_transitions)?
+        .checked_add(incumbent_suffix_transitions)?;
     (work <= max_work).then_some(FoldedShortRootProspective { work, trie })
 }
 
@@ -1437,6 +1583,7 @@ mod folded_short_stage_probe {
     std::thread_local! {
         static SETTLED_SCANS: Cell<usize> = const { Cell::new(0) };
         static SHORT_PROSPECTIVES: Cell<usize> = const { Cell::new(0) };
+        static BOUNDED_VERIFIERS: Cell<usize> = const { Cell::new(0) };
     }
 
     pub(super) fn record_settled_scan() {
@@ -1457,9 +1604,19 @@ mod folded_short_stage_probe {
         );
     }
 
+    pub(super) fn record_bounded_verifier() {
+        BOUNDED_VERIFIERS.set(
+            BOUNDED_VERIFIERS
+                .get()
+                .checked_add(1)
+                .expect("folded bounded-verifier probe overflow"),
+        );
+    }
+
     pub(super) fn reset() {
         SETTLED_SCANS.set(0);
         SHORT_PROSPECTIVES.set(0);
+        BOUNDED_VERIFIERS.set(0);
     }
 
     pub(super) fn settled_scans() -> usize {
@@ -1468,6 +1625,10 @@ mod folded_short_stage_probe {
 
     pub(super) fn short_prospectives() -> usize {
         SHORT_PROSPECTIVES.get()
+    }
+
+    pub(super) fn bounded_verifiers() -> usize {
+        BOUNDED_VERIFIERS.get()
     }
 }
 
@@ -1483,6 +1644,7 @@ mod folded_long_tail_tests {
         LiteralSetError, LiteralSetFoldAttachment, LiteralSetPlan, LiteralSetSearchLimits, Window,
         folded_long_head, folded_long_prospective, folded_short_blocks_admitted,
         folded_short_minimum_bytes, folded_short_root_prospective, folded_short_stage_probe,
+        search_accounting,
     };
 
     fn patterns() -> [&'static [u8]; 3] {
@@ -1560,6 +1722,34 @@ mod folded_long_tail_tests {
             }
         };
         let patterns = vec![b"abc".to_vec()];
+        let incumbent = LiteralSetPlan::new(&patterns, LiteralSetBuildLimits::default()).unwrap();
+        let attachment =
+            LiteralSetFoldAttachment::new(&patterns, LiteralSetBuildLimits::default()).unwrap();
+        let (accelerated, attached) = attachment.try_attach(trie, usize::MAX).unwrap();
+        assert!(attached);
+        (incumbent, accelerated)
+    }
+
+    fn bounded_shadow_plans() -> (LiteralSetPlan, LiteralSetPlan) {
+        let a = ['a'];
+        let b = ['b'];
+        let mut long_classes = vec![FoldedScalarClass::new(&a); BYTE_BUCKET_BLOCK_BYTES];
+        long_classes[0] = FoldedScalarClass::new(&b);
+        let short_classes = [FoldedScalarClass::new(&a)];
+        let literals = [
+            FoldedLiteral::new(&long_classes),
+            FoldedLiteral::new(&short_classes),
+        ];
+        let trie = match FoldedLiteralTriePlan::build(&literals, BuildLimits::default()).unwrap() {
+            BuildAttempt::Admitted(plan) => plan,
+            BuildAttempt::DenseFallback(fallback) => {
+                panic!("synthetic bounded-shadow trie declined: {fallback:?}")
+            }
+        };
+        assert_eq!(trie.build_accounting().root_prefilter_offset, Some(0));
+        let mut long_pattern = vec![b'a'; BYTE_BUCKET_BLOCK_BYTES];
+        long_pattern[0] = b'b';
+        let patterns = vec![long_pattern, b"a".to_vec()];
         let incumbent = LiteralSetPlan::new(&patterns, LiteralSetBuildLimits::default()).unwrap();
         let attachment =
             LiteralSetFoldAttachment::new(&patterns, LiteralSetBuildLimits::default()).unwrap();
@@ -1697,6 +1887,60 @@ mod folded_long_tail_tests {
     }
 
     #[test]
+    fn bounded_dfa_driver_matches_try_find_exhaustively() {
+        let pattern_sets: [Vec<&[u8]>; 8] = [
+            vec![b"a", b"ab"],
+            vec![b"ab", b"a"],
+            vec![b"aba", b"ba", b"a"],
+            vec![b"abx", b"bx", b"x"],
+            vec![b"aa", b"aaa", b"aab"],
+            vec![b"cab", b"ab", b"b"],
+            vec![b"", b"a"],
+            vec![b"a", b""],
+        ];
+        let alphabet = [b'a', b'b', b'x'];
+        for (patterns_index, patterns) in pattern_sets.iter().enumerate() {
+            let plan = LiteralSetPlan::new(patterns, LiteralSetBuildLimits::default()).unwrap();
+            for haystack_len in 0..=6 {
+                let sources = alphabet.len().pow(u32::try_from(haystack_len).unwrap());
+                for encoded in 0..sources {
+                    let mut value = encoded;
+                    let mut haystack = vec![0_u8; haystack_len];
+                    for byte in &mut haystack {
+                        *byte = alphabet[value % alphabet.len()];
+                        value /= alphabet.len();
+                    }
+                    for start in 0..=haystack.len() {
+                        for end in start..=haystack.len() {
+                            let window = Window::new(start, end);
+                            let accounting = search_accounting(
+                                window,
+                                haystack.len(),
+                                LiteralSetSearchLimits::unlimited(),
+                            )
+                            .unwrap();
+                            let expected = plan
+                                .find_window_incumbent(&haystack, window, accounting)
+                                .unwrap();
+                            let actual = plan
+                                .find_window_incumbent_without_prefilter(
+                                    &haystack,
+                                    window,
+                                    accounting,
+                                )
+                                .unwrap();
+                            assert_eq!(
+                                actual, expected,
+                                "patterns={patterns_index}, source={haystack:?}, window={window:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn ordinary_and_sub_block_literal_sets_retain_incumbent_path_and_accounting() {
         let patterns = patterns();
         let ordinary = LiteralSetPlan::new(&patterns, LiteralSetBuildLimits::default()).unwrap();
@@ -1765,6 +2009,7 @@ mod folded_long_tail_tests {
         assert!(accounting.transitions_upper_bound <= prospective.work);
         assert_eq!(folded_short_stage_probe::settled_scans(), 0);
         assert_eq!(folded_short_stage_probe::short_prospectives(), 1);
+        assert_eq!(folded_short_stage_probe::bounded_verifiers(), 0);
         assert_eq!(root_candidate_dispatch_probe::dispatches(), 1);
         assert_eq!(expected.1.transitions_upper_bound, haystack.len() + 1);
     }
@@ -1780,6 +2025,18 @@ mod folded_long_tail_tests {
         assert_eq!(single.input_bytes, 64);
         assert_eq!(single.candidate_starts, 64);
         assert_eq!(single.work, single.candidate_starts + single.source_byte_reads);
+        let input_bytes = folded_short_minimum_bytes(tail).unwrap();
+        let prospective = folded_short_root_prospective(
+            tail,
+            Window::new(0, input_bytes),
+            usize::MAX,
+        )
+        .unwrap();
+        assert_eq!(
+            prospective.work,
+            prospective.trie.work + tail.max_pattern_bytes + 1 + input_bytes,
+            "one W-byte verifier and an incumbent suffix after one settled start are prepaid exactly"
+        );
         assert!(matches!(
             tail.trie.root_candidate_single_pass_upper_bounds(64, 0),
             Err(crate::folded_literal_trie::ScanError::Invariant { .. })
@@ -1987,11 +2244,12 @@ mod folded_long_tail_tests {
                 assert_eq!(matched, Some((start, start + 3)));
                 assert_eq!(
                     accounting.transitions_upper_bound,
-                    root.receipt.actual.work + window.end() - start + 1,
+                    root.receipt.actual.work + tail.max_pattern_bytes + 1,
                     "frame={frame}, residue={residue}"
                 );
                 assert_eq!(folded_short_stage_probe::settled_scans(), 0);
                 assert_eq!(folded_short_stage_probe::short_prospectives(), 1);
+                assert_eq!(folded_short_stage_probe::bounded_verifiers(), 1);
 
                 let later = frame + tail.max_pattern_bytes * 2;
                 let mut false_root = vec![b'!'; window.end() + tail.max_pattern_bytes];
@@ -2005,6 +2263,7 @@ mod folded_long_tail_tests {
                     )
                     .unwrap()
                     .0;
+                folded_short_stage_probe::reset();
                 let (matched, accounting) = accelerated
                     .find_window(
                         &false_root,
@@ -2014,7 +2273,15 @@ mod folded_long_tail_tests {
                     .unwrap();
                 assert_eq!(matched, expected, "frame={frame}, residue={residue}");
                 assert_eq!(matched, Some((later, later + 3)));
-                assert!(accounting.transitions_upper_bound <= prospective.work);
+                assert_eq!(
+                    accounting.transitions_upper_bound,
+                    root.receipt.actual.work
+                        + tail.max_pattern_bytes
+                        + 1
+                        + window.end()
+                        - start
+                );
+                assert_eq!(folded_short_stage_probe::bounded_verifiers(), 1);
             }
 
             let boundary = frame + tail.max_pattern_bytes;
@@ -2032,6 +2299,135 @@ mod folded_long_tail_tests {
             assert!(accounting.transitions_upper_bound <= prospective.work);
             assert_eq!(folded_short_stage_probe::settled_scans(), 1);
             assert_eq!(folded_short_stage_probe::short_prospectives(), 1);
+            assert_eq!(folded_short_stage_probe::bounded_verifiers(), 0);
+        }
+    }
+
+    #[test]
+    fn bounded_later_match_cannot_shadow_an_earlier_crossing_match() {
+        let (incumbent, accelerated) = bounded_shadow_plans();
+        let tail = accelerated.folded_long_tail.as_deref().unwrap();
+        let input_bytes = folded_short_minimum_bytes(tail).unwrap();
+        let mut long_pattern = vec![b'a'; tail.max_pattern_bytes];
+        long_pattern[0] = b'b';
+
+        for frame in 0..BYTE_BUCKET_BLOCK_BYTES {
+            let window = Window::new(frame, frame + input_bytes);
+            let candidate_start = frame;
+            let long_start = candidate_start + 1;
+            let mut haystack = vec![b'!'; window.end()];
+            haystack[candidate_start] = b'b';
+            haystack[long_start..long_start + long_pattern.len()]
+                .copy_from_slice(&long_pattern);
+            let prospective = folded_short_root_prospective(tail, window, usize::MAX).unwrap();
+            let root = tail
+                .trie
+                .find_root_candidate_precharged(&haystack, window, prospective.trie)
+                .unwrap();
+            assert_eq!(
+                root.outcome,
+                RootCandidateOutcome::Candidate {
+                    start: candidate_start,
+                }
+            );
+            let verify = Window::new(
+                candidate_start,
+                candidate_start + tail.max_pattern_bytes,
+            );
+            let verify_accounting = search_accounting(
+                verify,
+                haystack.len(),
+                LiteralSetSearchLimits::unlimited(),
+            )
+            .unwrap();
+            assert_eq!(
+                accelerated
+                    .find_window_incumbent_without_prefilter(
+                        &haystack,
+                        verify,
+                        verify_accounting,
+                    )
+                    .unwrap()
+                    .0,
+                Some((candidate_start + 2, candidate_start + 3)),
+                "the artificial W-byte end exposes the later short match"
+            );
+
+            folded_short_stage_probe::reset();
+            root_candidate_dispatch_probe::reset();
+            let actual = accelerated
+                .find_window(&haystack, window, LiteralSetSearchLimits::unlimited())
+                .unwrap();
+            let expected = incumbent
+                .find_window(&haystack, window, LiteralSetSearchLimits::unlimited())
+                .unwrap();
+            assert_eq!(actual.0, expected.0, "frame={frame}");
+            assert_eq!(
+                actual.0,
+                Some((long_start, long_start + tail.max_pattern_bytes))
+            );
+            assert_eq!(
+                actual.1.transitions_upper_bound,
+                root.receipt.actual.work + tail.max_pattern_bytes + 1 + input_bytes
+            );
+            assert!(actual.1.transitions_upper_bound <= prospective.work);
+            assert_eq!(folded_short_stage_probe::bounded_verifiers(), 1);
+            assert_eq!(folded_short_stage_probe::settled_scans(), 0);
+            assert_eq!(root_candidate_dispatch_probe::dispatches(), 1);
+        }
+    }
+
+    #[test]
+    fn bounded_false_root_storm_dispatches_once_then_resumes_the_incumbent() {
+        let (incumbent, accelerated) = three_column_plans();
+        let tail = accelerated.folded_long_tail.as_deref().unwrap();
+        let build = tail.trie.build_accounting();
+        let primary = build.root_prefilter_offset.unwrap();
+        let guard = build.root_prefilter_guard_offset.unwrap();
+        let changed = (0..3)
+            .find(|&offset| offset != primary && offset != guard)
+            .unwrap();
+        let mut rejected = *b"abc";
+        rejected[changed] = b'z';
+        let input_bytes = folded_short_minimum_bytes(tail).unwrap();
+
+        for frame in 0..BYTE_BUCKET_BLOCK_BYTES {
+            let window = Window::new(frame, frame + input_bytes);
+            let real_start = window.end() - 3;
+            let mut haystack = vec![b'!'; window.end()];
+            for start in (window.start()..real_start).step_by(3) {
+                haystack[start..start + 3].copy_from_slice(&rejected);
+            }
+            haystack[real_start..real_start + 3].copy_from_slice(b"abc");
+            let prospective = folded_short_root_prospective(tail, window, usize::MAX).unwrap();
+            let root = tail
+                .trie
+                .find_root_candidate_precharged(&haystack, window, prospective.trie)
+                .unwrap();
+            assert_eq!(
+                root.outcome,
+                RootCandidateOutcome::Candidate {
+                    start: window.start(),
+                }
+            );
+            folded_short_stage_probe::reset();
+            root_candidate_dispatch_probe::reset();
+            let actual = accelerated
+                .find_window(&haystack, window, LiteralSetSearchLimits::unlimited())
+                .unwrap();
+            let expected = incumbent
+                .find_window(&haystack, window, LiteralSetSearchLimits::unlimited())
+                .unwrap();
+            assert_eq!(actual.0, expected.0, "frame={frame}");
+            assert_eq!(actual.0, Some((real_start, real_start + 3)));
+            assert_eq!(
+                actual.1.transitions_upper_bound,
+                root.receipt.actual.work + tail.max_pattern_bytes + 1 + input_bytes
+            );
+            assert!(actual.1.transitions_upper_bound <= prospective.work);
+            assert_eq!(folded_short_stage_probe::bounded_verifiers(), 1);
+            assert_eq!(folded_short_stage_probe::settled_scans(), 0);
+            assert_eq!(root_candidate_dispatch_probe::dispatches(), 1);
         }
     }
 
@@ -2146,6 +2542,7 @@ mod folded_long_tail_tests {
             assert!(accounting.transitions_upper_bound <= prospective.work);
             assert_eq!(folded_short_stage_probe::settled_scans(), 1);
             assert_eq!(folded_short_stage_probe::short_prospectives(), 1);
+            assert_eq!(folded_short_stage_probe::bounded_verifiers(), 0);
         }
     }
 
@@ -2158,9 +2555,9 @@ mod folded_long_tail_tests {
         let window = Window::new(0, input_bytes);
         let prospective = folded_short_root_prospective(tail, window, usize::MAX).unwrap();
 
-        for (candidate_start, expected_settled_scans) in [
-            (tail.max_pattern_bytes - 1, 0),
-            (tail.max_pattern_bytes, 1),
+        for (candidate_start, expected_settled_scans, expected_bounded_verifiers) in [
+            (tail.max_pattern_bytes - 1, 0, 1),
+            (tail.max_pattern_bytes, 1, 0),
         ] {
             let mut haystack = vec![b'!'; input_bytes];
             haystack[candidate_start] = b'x';
@@ -2187,6 +2584,10 @@ mod folded_long_tail_tests {
             assert_eq!(
                 folded_short_stage_probe::settled_scans(),
                 expected_settled_scans
+            );
+            assert_eq!(
+                folded_short_stage_probe::bounded_verifiers(),
+                expected_bounded_verifiers
             );
             assert_eq!(root_candidate_dispatch_probe::dispatches(), 1);
         }
@@ -2217,6 +2618,7 @@ mod folded_long_tail_tests {
         assert_eq!(actual.0, Some((block_end, block_end + 1)));
         assert!(actual.1.transitions_upper_bound <= prospective.work);
         assert_eq!(folded_short_stage_probe::settled_scans(), 1);
+        assert_eq!(folded_short_stage_probe::bounded_verifiers(), 0);
         assert_eq!(root_candidate_dispatch_probe::dispatches(), 1);
     }
 
@@ -2266,6 +2668,7 @@ mod folded_long_tail_tests {
         assert!(actual.1.transitions_upper_bound <= prospective.work);
         assert_eq!(folded_short_stage_probe::settled_scans(), 0);
         assert_eq!(folded_short_stage_probe::short_prospectives(), 1);
+        assert_eq!(folded_short_stage_probe::bounded_verifiers(), 0);
         assert_eq!(root_candidate_dispatch_probe::dispatches(), 1);
     }
 
@@ -2350,6 +2753,18 @@ mod folded_long_tail_tests {
         assert!(attached);
         let tail = accelerated.folded_long_tail.as_deref().unwrap();
         let mut haystack = vec![b'!'; folded_short_minimum_bytes(tail).unwrap() + 5];
+        haystack[..3].copy_from_slice(b"abc");
+        folded_short_stage_probe::reset();
+        assert_eq!(
+            accelerated
+                .find(&haystack, LiteralSetSearchLimits::unlimited())
+                .unwrap()
+                .0,
+            Some((0, 3)),
+            "the bounded verifier must retain source-zero priority over its prefix"
+        );
+        assert_eq!(folded_short_stage_probe::bounded_verifiers(), 1);
+        haystack.fill(b'!');
         haystack[1..4].copy_from_slice(b"abc");
         haystack[0..2].copy_from_slice(b"ab");
         assert_eq!(
@@ -2381,6 +2796,7 @@ mod folded_long_tail_tests {
             Some((late_start, late_start + 3))
         );
         assert_eq!(folded_short_stage_probe::settled_scans(), 1);
+        assert_eq!(folded_short_stage_probe::bounded_verifiers(), 0);
         assert_eq!(root_candidate_dispatch_probe::dispatches(), 1);
     }
 
