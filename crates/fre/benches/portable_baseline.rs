@@ -124,6 +124,8 @@ fn compare_search(case: &Case) {
         PlanKind::LiteralSetDfa => "fre-literal-set-dfa",
         PlanKind::RequiredLiteral => "fre-required-literal",
         PlanKind::LiteralClassRunLiteral => "fre-literal-class-run-literal",
+        PlanKind::ReverseInner => "fre-reverse-inner",
+        PlanKind::PrefixClassAlternation => "fre-prefix-class-alternation",
         PlanKind::PureByteClassRepeat => "fre-pure-byte-class-repeat",
         PlanKind::BoundedByteClassSequence => "fre-bounded-byte-class-sequence",
         PlanKind::ForwardAnchored => "fre-forward-anchored",
@@ -131,6 +133,7 @@ fn compare_search(case: &Case) {
         PlanKind::UnicodeFoldedLiteral => "fre-unicode-folded-literal",
         PlanKind::UnicodeWordRun => "fre-unicode-word-run",
         PlanKind::FixedPredicateWord64 => "fre-fixed-predicate-word64",
+        PlanKind::UnicodeScalarRun => "fre-unicode-scalar-run",
     };
 
     warm(|| {

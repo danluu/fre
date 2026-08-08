@@ -172,6 +172,8 @@ fn emit(
         PlanKind::LiteralSetDfa => "literal-set-dfa",
         PlanKind::RequiredLiteral => "required-literal-v1",
         PlanKind::LiteralClassRunLiteral => "literal-class-run-literal-v1",
+        PlanKind::ReverseInner => "reverse-inner-v1",
+        PlanKind::PrefixClassAlternation => "prefix-class-alternation-v1",
         PlanKind::ForwardAnchored => "anchored-class-suffix-forward-v1",
         PlanKind::K0 => "k0",
         PlanKind::UnicodeFoldedLiteral => "unicode-folded-literal-first-start-v1",
@@ -179,6 +181,7 @@ fn emit(
         PlanKind::PureByteClassRepeat => "pure-byte-class-repeat-v1",
         PlanKind::BoundedByteClassSequence => "bounded-byte-class-sequence-search-v2",
         PlanKind::FixedPredicateWord64 => "fixed-predicate-word64-first-match-v1",
+        PlanKind::UnicodeScalarRun => "unicode-scalar-run-search-v1",
     };
     let per_iteration = elapsed_ns / u128::try_from(ITERATIONS).unwrap();
     let (start, end) = matched.map_or((String::new(), String::new()), |(start, end)| {

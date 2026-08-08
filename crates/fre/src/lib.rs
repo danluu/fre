@@ -57,10 +57,10 @@ use core::fmt;
 
 use fre_kernels::{
     DispatchedPrefixClassAlternationSearchCursor, FixedPredicateWord64SearchCursor,
-    PrefixClassAlternationSearchCursor,
+    PrefixClassAlternationSearchCursor, UnicodeScalarSearchCursor,
 };
 use memchr::{memchr, memchr2, memchr3};
-use regex_syntax::hir::{ClassBytesRange, Hir, HirKind, Look};
+use regex_syntax::hir::{Class, ClassBytesRange, ClassUnicode, Hir, HirKind, Look};
 
 mod aggregate;
 mod aggregate_construction;
@@ -621,8 +621,11 @@ pub use fre_kernels::{
     UnicodeScalarAggregateOperation, UnicodeScalarAggregateOperationIdentity,
     UnicodeScalarAggregateReduceAccounting, UnicodeScalarAggregateReduceError,
     UnicodeScalarAggregateReduceLimits, UnicodeScalarAggregateRepetition,
-    UnicodeScalarAggregateSemantics, UnicodeScalarAggregateUpperBounds, UrlAggregateReduceError,
-    UrlAggregateReduceUpperBounds, url_aggregate_reduce_upper_bounds,
+    UnicodeScalarAggregateSemantics, UnicodeScalarAggregateUpperBounds,
+    UnicodeScalarSearchAccounting, UnicodeScalarSearchBuildAccounting,
+    UnicodeScalarSearchError, UnicodeScalarSearchLimits, UnicodeScalarSearchPlan,
+    UNICODE_SCALAR_RUN_SEARCH_PLAN_ID, UrlAggregateReduceError, UrlAggregateReduceUpperBounds,
+    url_aggregate_reduce_upper_bounds,
 };
 pub use operation_session::hot::{
     HOT_BYTE_PROGRAM_ACCOUNTING_ID, HOT_BYTE_PROGRAM_ACCOUNTING_VERSION,
@@ -1097,6 +1100,9 @@ pub enum PlanKind {
     /// Fixed-width Cartesian byte predicates backed by selective paired
     /// finders or one 64-bit Shift-And state.
     FixedPredicateWord64,
+    /// Positive root Unicode scalar-class repetition with a bulk leading-byte
+    /// filter and exact scalar verification.
+    UnicodeScalarRun,
 }
 
 /// Construction failure without semantic fallback.
@@ -3759,6 +3765,8 @@ pub enum SearchAccounting {
     FixedPredicateWord64(FixedPredicateWord64SearchAccounting),
     /// Fixed-column candidate and exact maximal-word dictionary accounting.
     GuardedLiteralSet(GuardedLiteralSetSearchAccounting),
+    /// Complete Unicode scalar-run source-independent envelope and exact counters.
+    UnicodeScalarRun(UnicodeScalarSearchAccounting),
 }
 
 impl SearchAccounting {
@@ -3781,6 +3789,7 @@ impl SearchAccounting {
             Self::UnicodeFoldedLiteral(_) => PlanKind::UnicodeFoldedLiteral,
             Self::UnicodeWordRun(_) => PlanKind::UnicodeWordRun,
             Self::FixedPredicateWord64(_) => PlanKind::FixedPredicateWord64,
+            Self::UnicodeScalarRun(_) => PlanKind::UnicodeScalarRun,
         }
     }
 
@@ -3818,6 +3827,9 @@ impl SearchAccounting {
             }
             Self::UnicodeWordRun(accounting) => accounting.work(),
             Self::FixedPredicateWord64(accounting) => accounting.actual.work,
+            Self::UnicodeScalarRun(accounting) => {
+                u64::try_from(accounting.actual.work).unwrap_or(u64::MAX)
+            }
         }
     }
 }
@@ -3863,6 +3875,7 @@ pub enum SearchError {
     UnicodeWordRun(UnicodeWordRunError),
     FixedPredicateWord64(FixedPredicateWord64SearchError),
     GuardedLiteralSet(GuardedLiteralSetSearchError),
+    UnicodeScalarRun(UnicodeScalarSearchError),
 }
 
 impl fmt::Display for SearchError {
@@ -3904,6 +3917,7 @@ impl fmt::Display for SearchError {
             Self::FixedPredicateWord64(error) => {
                 write!(f, "fixed-predicate search failed: {error}")
             }
+            Self::UnicodeScalarRun(error) => write!(f, "Unicode scalar-run search failed: {error}"),
         }
     }
 }
@@ -3927,6 +3941,7 @@ impl std::error::Error for SearchError {
             Self::UnicodeFoldedLiteral(error) => Some(error),
             Self::UnicodeWordRun(error) => Some(error),
             Self::FixedPredicateWord64(error) => Some(error),
+            Self::UnicodeScalarRun(error) => Some(error),
         }
     }
 }
@@ -4028,6 +4043,12 @@ impl From<UnicodeWordRunError> for SearchError {
 impl From<FixedPredicateWord64SearchError> for SearchError {
     fn from(value: FixedPredicateWord64SearchError) -> Self {
         Self::FixedPredicateWord64(value)
+    }
+}
+
+impl From<UnicodeScalarSearchError> for SearchError {
+    fn from(value: UnicodeScalarSearchError) -> Self {
+        Self::UnicodeScalarRun(value)
     }
 }
 
@@ -4324,6 +4345,105 @@ fn try_box_bounded_delimited_segment_owner(
             BuildError::InternalInvariant("bounded-delimited segment owner layout overflowed"),
         ),
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct UnicodeScalarRunSearchInspection<'a> {
+    class: &'a ClassUnicode,
+    minimum: u32,
+    maximum: Option<u32>,
+    greedy: bool,
+    projected_kernel_work: usize,
+}
+
+fn inspect_unicode_scalar_run_search(
+    hir: &Hir,
+    initial_work: u64,
+    limit: u64,
+) -> Result<(Option<UnicodeScalarRunSearchInspection<'_>>, u64), BuildError> {
+    let mut work = initial_work;
+    let mut root = hir;
+    loop {
+        charge_planner(&mut work, 1, limit)?;
+        match root.kind() {
+            HirKind::Capture(capture) => root = &capture.sub,
+            _ => break,
+        }
+    }
+    let HirKind::Repetition(repetition) = root.kind() else {
+        return Ok((None, work));
+    };
+    if repetition.min == 0 || repetition.max.is_some_and(|maximum| maximum < repetition.min) {
+        return Ok((None, work));
+    }
+    let mut atom = &repetition.sub;
+    loop {
+        charge_planner(&mut work, 1, limit)?;
+        match atom.kind() {
+            HirKind::Capture(capture) => atom = &capture.sub,
+            _ => break,
+        }
+    }
+    let HirKind::Class(Class::Unicode(class)) = atom.kind() else {
+        return Ok((None, work));
+    };
+    let mut source_ranges = 0_usize;
+    let mut ascii_scalars = 0_usize;
+    let mut retained_non_ascii_ranges = 0_usize;
+    for range in class.iter() {
+        charge_planner(&mut work, 1, limit)?;
+        source_ranges = source_ranges.checked_add(1).ok_or(BuildError::InternalInvariant(
+            "Unicode scalar-run source-range count overflowed",
+        ))?;
+        if range.start().is_ascii() {
+            let end = u32::from(range.end()).min(0x7F);
+            let population = end
+                .checked_sub(u32::from(range.start()))
+                .and_then(|population| population.checked_add(1))
+                .ok_or(BuildError::InternalInvariant(
+                    "Unicode scalar-run ASCII population overflowed",
+                ))?;
+            ascii_scalars = ascii_scalars
+                .checked_add(usize::try_from(population).unwrap_or(usize::MAX))
+                .ok_or(BuildError::InternalInvariant(
+                    "Unicode scalar-run ASCII population did not fit usize",
+                ))?;
+        }
+        if !range.end().is_ascii() {
+            retained_non_ascii_ranges = retained_non_ascii_ranges.checked_add(1).ok_or(
+                BuildError::InternalInvariant(
+                    "Unicode scalar-run retained-range count overflowed",
+                ),
+            )?;
+        }
+    }
+    if retained_non_ascii_ranges == 0 {
+        return Ok((None, work));
+    }
+    let projected_kernel_work = source_ranges
+        .checked_add(ascii_scalars)
+        .and_then(|work| work.checked_add(retained_non_ascii_ranges))
+        .and_then(|work| work.checked_add(1))
+        .and_then(|work| work.checked_add(2))
+        .and_then(|work| work.checked_add(retained_non_ascii_ranges.checked_mul(51)?))
+        .and_then(|work| {
+            work.checked_add(fre_kernels::UNICODE_SCALAR_RUN_SEARCH_LEADING_SELECTION_WORK)
+        })
+        .and_then(|work| work.checked_add(fre_kernels::BYTE_SET_CLASSIFIER_BUILD_WORK))
+        .and_then(|work| work.checked_add(1))
+        .ok_or(BuildError::InternalInvariant(
+            "Unicode scalar-run projected kernel work overflowed",
+        ))?;
+    Ok((
+        Some(UnicodeScalarRunSearchInspection {
+            class,
+            minimum: repetition.min,
+            maximum: repetition.max,
+            greedy: repetition.greedy,
+            projected_kernel_work,
+        }),
+        work,
+    ))
 }
 
 impl PortableBuilder {
@@ -6501,6 +6621,167 @@ impl PortableBuilder {
                 }
             }
         }
+        if self.selection == PlanSelection::Auto {
+            let inspection_work_upper_bound = syntax.hir_nodes.checked_add(syntax.class_ranges);
+            let remaining_inspection_work = self
+                .limits
+                .max_planner_work
+                .saturating_sub(fallback_planner_work);
+            if inspection_work_upper_bound
+                .is_some_and(|work| work <= remaining_inspection_work)
+            {
+                let (inspection, inspected_work) = inspect_unicode_scalar_run_search(
+                    &rust.hir,
+                    fallback_planner_work,
+                    self.limits.max_planner_work,
+                )?;
+                fallback_planner_work = inspected_work;
+                if let Some(inspection) = inspection {
+                let retained_facade_bytes = source_storage_bytes
+                    .checked_add(capture_name_storage_bytes)
+                    .ok_or(BuildError::PersistentBytesOverflow)?;
+                let remaining_work = self
+                    .limits
+                    .max_planner_work
+                    .checked_sub(fallback_planner_work)
+                    .ok_or(BuildError::InternalInvariant(
+                        "Unicode scalar-run inspection exceeded its planner limit",
+                    ))?;
+                let required_work = u64::try_from(inspection.projected_kernel_work)
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(1);
+                if required_work <= remaining_work {
+                    let kernel_limits = UnicodeScalarAggregateBuildLimits {
+                        max_source_ranges: usize::MAX,
+                        max_build_work: inspection.projected_kernel_work,
+                        max_scratch_bytes: usize::MAX,
+                        max_persistent_bytes: usize::MAX,
+                        max_peak_bytes: usize::MAX,
+                    };
+                    let plan = UnicodeScalarSearchPlan::build_repeated_with_dispatch(
+                        SimdDispatchContext::capture(),
+                        inspection
+                            .class
+                            .iter()
+                            .map(|range| (range.start(), range.end())),
+                        inspection.minimum,
+                        inspection.maximum,
+                        inspection.greedy,
+                        kernel_limits,
+                    )
+                    .map_err(|error| match error {
+                        UnicodeScalarAggregateBuildError::WorkLimit { needed, .. } => {
+                            let needed = fallback_planner_work
+                                .checked_add(u64::try_from(needed).unwrap_or(u64::MAX))
+                                .and_then(|needed| needed.checked_add(1))
+                                .unwrap_or(u64::MAX);
+                            BuildError::PlannerWorkLimit {
+                                needed,
+                                limit: self.limits.max_planner_work,
+                            }
+                        }
+                        UnicodeScalarAggregateBuildError::AllocationFailed { additional }
+                        | UnicodeScalarAggregateBuildError::DispatchedOwnerAllocationFailed {
+                            bytes: additional,
+                        } => BuildError::AllocationFailed {
+                            structure: "Unicode scalar-run search owner",
+                            additional,
+                        },
+                        UnicodeScalarAggregateBuildError::ArithmeticOverflow { .. } => {
+                            BuildError::InternalInvariant(
+                                "Unicode scalar-run construction arithmetic overflowed",
+                            )
+                        }
+                        UnicodeScalarAggregateBuildError::EmptyClass
+                        | UnicodeScalarAggregateBuildError::AsciiClassifierDispatchUnavailable
+                        | UnicodeScalarAggregateBuildError::InvalidRepetition { .. }
+                        | UnicodeScalarAggregateBuildError::ReversedRange { .. }
+                        | UnicodeScalarAggregateBuildError::NonCanonicalRanges
+                        | UnicodeScalarAggregateBuildError::RangeLimit { .. }
+                        | UnicodeScalarAggregateBuildError::ScratchLimit { .. }
+                        | UnicodeScalarAggregateBuildError::PersistentLimit { .. }
+                        | UnicodeScalarAggregateBuildError::PeakLimit { .. } => {
+                            BuildError::InternalInvariant(
+                                "admitted Unicode scalar-run construction was rejected",
+                            )
+                        }
+                        _ => BuildError::InternalInvariant(
+                            "Unicode scalar-run construction returned an unknown refusal",
+                        ),
+                    })?;
+                    let plan_storage_bytes = plan.build_accounting().persistent_bytes;
+                    if plan.build_accounting().work != inspection.projected_kernel_work {
+                        return Err(BuildError::InternalInvariant(
+                            "Unicode scalar-run projected build work changed during construction",
+                        ));
+                    }
+                    let completed_work = fallback_planner_work
+                        .checked_add(
+                            u64::try_from(plan.build_accounting().work).unwrap_or(u64::MAX),
+                        )
+                        .and_then(|work| work.checked_add(1))
+                        .ok_or(BuildError::InternalInvariant(
+                            "Unicode scalar-run planner work overflowed",
+                        ))?;
+                    if completed_work > self.limits.max_planner_work {
+                        return Err(BuildError::PlannerWorkLimit {
+                            needed: completed_work,
+                            limit: self.limits.max_planner_work,
+                        });
+                    }
+                    fallback_planner_work = completed_work;
+                    let charged_persistent_bytes = retained_facade_bytes
+                        .checked_add(plan_storage_bytes)
+                        .ok_or(BuildError::PersistentBytesOverflow)?;
+                    if charged_persistent_bytes <= self.limits.max_persistent_bytes {
+                        match fre_exact_alloc::try_box_preserve(plan) {
+                            Ok(plan) => {
+                                return Ok(PortableRegex {
+                                    source,
+                                    capture_names,
+                                    line_total_grep_plan,
+                                    plan: PortablePlan::UnicodeScalarRun(plan),
+                                    profile: profile.clone(),
+                                    limits: self.limits,
+                                    selection: self.selection,
+                                    report: BuildReport {
+                                        profile: profile.clone(),
+                                        admission,
+                                        syntax,
+                                        plan: PlanKind::UnicodeScalarRun,
+                                        planner_work: fallback_planner_work,
+                                        lowering: None,
+                                        states: 0,
+                                        edges: 0,
+                                        plan_storage_bytes,
+                                        source_storage_bytes,
+                                        capture_name_storage_bytes,
+                                        charged_persistent_bytes: 0,
+                                        persistent_byte_limit: 0,
+                                        captures_len,
+                                        static_captures_len,
+                                        minimum_match_bytes,
+                                        required_literal: None,
+                                        literal_class_run_literal: None,
+                                        forward_anchored: None,
+                                    }
+                                    .enforce_persistent_limit(
+                                        self.limits.max_persistent_bytes,
+                                    )?,
+                                });
+                            }
+                            Err((fre_exact_alloc::CopyError::AllocationFailed, _)) => {}
+                            Err((fre_exact_alloc::CopyError::LayoutOverflow, _)) => {
+                                return Err(BuildError::InternalInvariant(
+                                    "Unicode scalar-run search owner layout overflowed",
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            }
+        }
         let lowered = fre_lower::lower_raw(
             &rust,
             OperationSemantics::CaptureFree,
@@ -7177,6 +7458,7 @@ enum PortablePlan {
     BoundedDelimitedSegmentRepeat(
         Box<universal_finite_greedy_corridor::BoundedDelimitedSegmentPlan>,
     ),
+    UnicodeScalarRun(Box<UnicodeScalarSearchPlan>),
 }
 
 impl PortablePlan {
@@ -7212,6 +7494,7 @@ impl PortablePlan {
             Self::DispatchedPrefixClassAlternation(plan) => plan.search_identity().plan_id,
             Self::UniversalFiniteGreedyCorridor(plan) => plan.plan_id(),
             Self::BoundedDelimitedSegmentRepeat(plan) => plan.plan_id(),
+            Self::UnicodeScalarRun(_) => UNICODE_SCALAR_RUN_SEARCH_PLAN_ID,
         }
     }
 }
@@ -7952,6 +8235,14 @@ impl PortableRegex {
                 )?;
                 Ok((matched, SearchAccounting::FixedPredicateWord64(accounting)))
             }
+            PortablePlan::UnicodeScalarRun(plan) => {
+                let (matched, accounting) = plan.is_match_window(
+                    haystack,
+                    fre_kernels::Window::new(window.start(), window.end()),
+                    unicode_scalar_search_limits(limits),
+                )?;
+                Ok((matched, SearchAccounting::UnicodeScalarRun(accounting)))
+            }
         }
     }
 
@@ -8160,6 +8451,13 @@ impl PortableRegex {
                     fixed_predicate_word64_search_limits(limits),
                 )
                 .map_err(SearchError::from),
+            PortablePlan::UnicodeScalarRun(plan) => plan
+                .is_match_window_value(
+                    haystack,
+                    fre_kernels::Window::new(window.start(), window.end()),
+                    unicode_scalar_search_limits(limits),
+                )
+                .map_err(SearchError::from),
         }
     }
 
@@ -8211,6 +8509,15 @@ impl PortableRegex {
         haystack: &[u8],
         limits: SearchLimits,
     ) -> Result<Option<usize>, SearchError> {
+        if let PortablePlan::UnicodeScalarRun(plan) = &self.plan {
+            return plan
+                .shortest_match_window_value(
+                    haystack,
+                    fre_kernels::Window::full(haystack),
+                    unicode_scalar_search_limits(limits),
+                )
+                .map_err(SearchError::from);
+        }
         if let PortablePlan::BoundedLiteralClassRun(plan) = &self.plan {
             return plan
                 .shortest_window_value(
@@ -8235,6 +8542,15 @@ impl PortableRegex {
         start: usize,
         limits: SearchLimits,
     ) -> Result<Option<usize>, SearchError> {
+        if let PortablePlan::UnicodeScalarRun(plan) = &self.plan {
+            return plan
+                .shortest_match_window_value(
+                    haystack,
+                    fre_kernels::Window::new(start, haystack.len()),
+                    unicode_scalar_search_limits(limits),
+                )
+                .map_err(SearchError::from);
+        }
         if let PortablePlan::BoundedLiteralClassRun(plan) = &self.plan {
             return plan
                 .shortest_window_value(
@@ -8517,6 +8833,14 @@ impl PortableRegex {
                 )?;
                 Ok((end, SearchAccounting::FixedPredicateWord64(accounting)))
             }
+            PortablePlan::UnicodeScalarRun(plan) => {
+                let (end, accounting) = plan.shortest_match_window(
+                    haystack,
+                    fre_kernels::Window::new(window.start(), window.end()),
+                    unicode_scalar_search_limits(limits),
+                )?;
+                Ok((end, SearchAccounting::UnicodeScalarRun(accounting)))
+            }
         }
     }
 
@@ -8770,6 +9094,17 @@ impl PortableRegex {
                 let (end, accounting) =
                     plan.selected_end(haystack, fixed_predicate_word64_search_limits(limits))?;
                 Ok((end, SearchAccounting::FixedPredicateWord64(accounting)))
+            }
+            PortablePlan::UnicodeScalarRun(plan) => {
+                let (matched, accounting) = plan.find_window(
+                    haystack,
+                    fre_kernels::Window::full(haystack),
+                    unicode_scalar_search_limits(limits),
+                )?;
+                Ok((
+                    matched.map(|(_, end)| end),
+                    SearchAccounting::UnicodeScalarRun(accounting),
+                ))
             }
         }
     }
@@ -9305,6 +9640,17 @@ impl PortableRegex {
                     SearchAccounting::FixedPredicateWord64(accounting),
                 ))
             }
+            PortablePlan::UnicodeScalarRun(plan) => {
+                let (matched, accounting) = plan.find_window(
+                    haystack,
+                    fre_kernels::Window::new(window.start(), window.end()),
+                    unicode_scalar_search_limits(limits),
+                )?;
+                Ok((
+                    matched.map(|(start, end)| Match { start, end }),
+                    SearchAccounting::UnicodeScalarRun(accounting),
+                ))
+            }
         }
     }
 
@@ -9528,6 +9874,14 @@ impl PortableRegex {
                 )
                 .map(|matched| matched.map(|(start, end)| Match { start, end }))
                 .map_err(SearchError::from),
+            PortablePlan::UnicodeScalarRun(plan) => plan
+                .find_window_value(
+                    haystack,
+                    fre_kernels::Window::new(window.start(), window.end()),
+                    unicode_scalar_search_limits(limits),
+                )
+                .map(|matched| matched.map(|(start, end)| Match { start, end }))
+                .map_err(SearchError::from),
         }
     }
 
@@ -9544,6 +9898,9 @@ impl PortableRegex {
             ),
             PortablePlan::DispatchedPrefixClassAlternation(plan) => Some(
                 PortableNativeSearchCursor::DispatchedPrefixClass(plan.search_cursor(haystack)),
+            ),
+            PortablePlan::UnicodeScalarRun(plan) => Some(
+                PortableNativeSearchCursor::UnicodeScalarRun(plan.search_cursor(haystack)),
             ),
             _ => None,
         }
@@ -9794,6 +10151,17 @@ impl PortableRegex {
                 Ok((
                     matched.map(|(start, end)| Match { start, end }),
                     accounting.actual.work,
+                ))
+            }
+            PortablePlan::UnicodeScalarRun(plan) => {
+                let (matched, accounting) = plan.find_window(
+                    haystack,
+                    fre_kernels::Window::new(start, haystack.len()),
+                    unicode_scalar_search_limits(limits),
+                )?;
+                Ok((
+                    matched.map(|(start, end)| Match { start, end }),
+                    u64::try_from(accounting.actual.work).unwrap_or(u64::MAX),
                 ))
             }
             PortablePlan::K0(_) => {
@@ -16256,6 +16624,7 @@ enum PortableNativeSearchCursor<'r, 'h> {
     FixedPredicate(FixedPredicateWord64SearchCursor<'r, 'h>),
     PrefixClass(PrefixClassAlternationSearchCursor<'r, 'h>),
     DispatchedPrefixClass(DispatchedPrefixClassAlternationSearchCursor<'r, 'h>),
+    UnicodeScalarRun(UnicodeScalarSearchCursor<'r, 'h>),
 }
 
 impl PortableNativeSearchCursor<'_, '_> {
@@ -16292,6 +16661,15 @@ impl PortableNativeSearchCursor<'_, '_> {
                     u64::try_from(prepaid_work).unwrap_or(u64::MAX),
                 ))
             }
+            Self::UnicodeScalarRun(cursor) => {
+                let (matched, accounting) = cursor
+                    .find_at(start, unicode_scalar_search_limits(limits))
+                    .map_err(SearchError::from)?;
+                Ok((
+                    matched.map(|(start, end)| Match { start, end }),
+                    u64::try_from(accounting.actual.work).unwrap_or(u64::MAX),
+                ))
+            }
         }
     }
 
@@ -16300,7 +16678,13 @@ impl PortableNativeSearchCursor<'_, '_> {
         start: usize,
         limits: SearchLimits,
     ) -> Result<Option<Match>, SearchError> {
-        self.find_at(start, limits).map(|(matched, _work)| matched)
+        match self {
+            Self::UnicodeScalarRun(cursor) => cursor
+                .find_at_value(start, unicode_scalar_search_limits(limits))
+                .map(|matched| matched.map(|(start, end)| Match { start, end }))
+                .map_err(SearchError::from),
+            _ => self.find_at(start, limits).map(|(matched, _work)| matched),
+        }
     }
 }
 
@@ -17134,6 +17518,13 @@ fn fixed_predicate_word64_search_limits(limits: SearchLimits) -> FixedPredicateW
     }
 }
 
+fn unicode_scalar_search_limits(limits: SearchLimits) -> UnicodeScalarSearchLimits {
+    UnicodeScalarSearchLimits {
+        max_work: usize::try_from(limits.max_work).unwrap_or(usize::MAX),
+        max_scratch_bytes: limits.max_scratch_bytes,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -17147,7 +17538,7 @@ mod tests {
         PortableFindIterRunLimits, PortablePlan, PortableRegex, PortableSearchSession,
         PortableSearchSessionPlan, SearchAccounting, SearchError, SearchLimits,
         SearchSessionLimits, SearchWindow,
-        SimdDispatchContext,
+        SimdDispatchContext, UNICODE_SCALAR_RUN_SEARCH_PLAN_ID,
         K0NegativePrefilterClassState, K0NegativePrefilterState,
         K0_NEGATIVE_PREFILTER_MAX_DISABLED_CALLS,
         K0_MANDATORY_CUT_BYTE_ENUMERATION_WORK, K0_MANDATORY_CUT_CARDINALITY_WORK,
@@ -17179,7 +17570,7 @@ mod tests {
         BoundedLiteralClassRunPlan, DispatchedPrefixClassAlternationSearchCursor,
         FixedPredicateWord64AdaptiveFinderKind, FixedPredicateWord64AdaptiveHandoffIdentity,
         FixedPredicateWord64Reducer, FixedPredicateWord64SearchCursor,
-        PrefixClassAlternationSearchCursor,
+        PrefixClassAlternationSearchCursor, UnicodeScalarSearchCursor,
     };
     use fre_lower::UnsupportedFeature;
     use std::fmt::Write as _;
@@ -27305,6 +27696,8 @@ mod tests {
             core::mem::size_of::<super::PortableValueMatchIterCore<'static>>();
         let baseline_source_cursor =
             core::mem::size_of::<BaselineK0SpanSourceCursor<'static>>();
+        let unicode_scalar_cursor =
+            core::mem::size_of::<UnicodeScalarSearchCursor<'static, 'static>>();
         let source_cursor = core::mem::size_of::<fre_automata::K0SpanSourceCursor<'static>>();
 
         assert_eq!(
@@ -27343,6 +27736,10 @@ mod tests {
         assert_eq!(
             value_state, baseline_value_state,
             "facade continuation changed the original value-state layout"
+        );
+        assert!(
+            unicode_scalar_cursor <= 10 * word,
+            "Unicode scalar cursor grew to {unicode_scalar_cursor} bytes"
         );
         assert!(
             accounted_state >= cursor + source_cursor,
@@ -30617,6 +31014,188 @@ mod tests {
                 .0;
             assert_eq!(forward_match, required_match, "haystack={haystack:?}");
         }
+    }
+
+    #[test]
+    fn unicode_scalar_run_auto_route_matches_rust_bytes_across_windows_and_malformed_utf8() {
+        let patterns = [
+            r"\p{Greek}{2,6}",
+            r"\p{Greek}{2,6}?",
+            r"[A\p{Greek}]{2,}",
+            r"(?:\p{Greek}){2,4}",
+            r"(\p{Greek}{2,4})",
+            r"(\p{Greek}){2,4}",
+        ];
+        let haystacks = [
+            b"".as_slice(),
+            b"plain ASCII without a member".as_slice(),
+            "xΑΒΓΔΕΖyαβz".as_bytes(),
+            &b"01234567890123456789012345678901\xCE\x91\xCE\x92z"[..],
+            &b"x\x80\xCE\x91\xCE\x92\xF4\x90\x80\x80\xCE\x93y"[..],
+            &b"\xCE\x91\xCE\x92\xCE\x93\xCE\x94\xCE\x95\xCE\x96\xCE\x97"[..],
+        ];
+        for pattern in patterns {
+            let fre = PortableBuilder::new(pattern).build().unwrap();
+            assert_eq!(fre.build_report().plan, PlanKind::UnicodeScalarRun);
+            assert_eq!(fre.runtime_implementation_id(), UNICODE_SCALAR_RUN_SEARCH_PLAN_ID);
+            let k0 = PortableBuilder::new(pattern)
+                .plan_selection(PlanSelection::ForceK0)
+                .build()
+                .unwrap();
+            let upstream = regex::bytes::Regex::new(pattern).unwrap();
+            for haystack in haystacks {
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let window = SearchWindow::new(start, end);
+                        let expected = upstream.find(&haystack[start..end]).map(|matched| {
+                            (start + matched.start(), start + matched.end())
+                        });
+                        let actual = fre
+                            .find_window(haystack, window, SearchLimits::unlimited())
+                            .unwrap()
+                            .0
+                            .map(|matched| (matched.start(), matched.end()));
+                        let k0_actual = k0
+                            .find_window(haystack, window, SearchLimits::unlimited())
+                            .unwrap()
+                            .0
+                            .map(|matched| (matched.start(), matched.end()));
+                        assert_eq!(actual, expected, "pattern={pattern:?} window={start}..{end}");
+                        assert_eq!(k0_actual, expected, "K0 pattern={pattern:?} window={start}..{end}");
+                        assert_eq!(
+                            fre.is_match_window_value(
+                                haystack,
+                                window,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap(),
+                            expected.is_some(),
+                        );
+                        let expected_shortest = upstream
+                            .shortest_match(&haystack[start..end])
+                            .map(|offset| start + offset);
+                        assert_eq!(
+                            fre.shortest_match_window(haystack, window, SearchLimits::unlimited())
+                                .unwrap()
+                                .0,
+                            expected_shortest,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unicode_scalar_run_admission_is_positive_root_capture_transparent_and_late() {
+        for pattern in [r"\p{Greek}{2,6}", r"(?:\p{Greek}){2,6}", r"(\p{Greek}){2,6}"] {
+            assert_eq!(
+                PortableBuilder::new(pattern).build().unwrap().build_report().plan,
+                PlanKind::UnicodeScalarRun,
+                "pattern={pattern:?}",
+            );
+        }
+        for pattern in [r"\p{Greek}", r"\p{Greek}*", r"\p{Greek}{2,6}x"] {
+            assert_ne!(
+                PortableBuilder::new(pattern).build().unwrap().build_report().plan,
+                PlanKind::UnicodeScalarRun,
+                "pattern={pattern:?}",
+            );
+        }
+        assert_eq!(
+            PortableBuilder::new(r"[a-z]{2,6}")
+                .unicode(false)
+                .build()
+                .unwrap()
+                .build_report()
+                .plan,
+            PlanKind::PureByteClassRepeat,
+        );
+        assert_eq!(
+            PortableBuilder::new(r"\p{Greek}{2,6}")
+                .plan_selection(PlanSelection::ForceK0)
+                .build()
+                .unwrap()
+                .build_report()
+                .plan,
+            PlanKind::K0,
+        );
+    }
+
+    #[test]
+    fn unicode_scalar_run_bulk_filter_limits_and_iterator_cursor_are_exact() {
+        let regex = PortableBuilder::new(r"\p{Greek}{2,6}").build().unwrap();
+        let mut haystack = vec![b'x'; 96];
+        haystack.extend_from_slice("ΑΒΓΔΕΖyαβ".as_bytes());
+        let (matched, accounting) = regex
+            .find(&haystack, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(matched.map(|matched| matched.range()), Some(96..108));
+        let SearchAccounting::UnicodeScalarRun(accounting) = accounting else {
+            panic!("Unicode scalar-run route returned another accounting family");
+        };
+        assert_eq!(accounting.actual.leading_block_classifications, 3);
+        assert_eq!(accounting.actual.leading_block_classification_bytes, 96);
+        let expected_scalar_probes = if cfg!(all(
+            feature = "static-dispatch-arm-41-d84",
+            target_arch = "aarch64",
+            target_os = "linux",
+            target_endian = "little",
+            target_feature = "sve",
+            target_feature = "sve2"
+        )) {
+            0
+        } else {
+            3
+        };
+        assert_eq!(accounting.actual.leading_scalar_probes, expected_scalar_probes);
+        let refused = SearchLimits {
+            max_work: u64::try_from(accounting.upper_bounds.work - 1).unwrap(),
+            max_scratch_bytes: usize::MAX,
+        };
+        assert!(matches!(
+            regex.find(&haystack, refused),
+            Err(SearchError::UnicodeScalarRun(
+                fre_kernels::UnicodeScalarSearchError::WorkLimit { .. }
+            ))
+        ));
+
+        let upstream = regex::bytes::Regex::new(r"\p{Greek}{2,6}").unwrap();
+        let expected: Vec<_> = upstream
+            .find_iter(&haystack)
+            .map(|matched| (matched.start(), matched.end()))
+            .collect();
+        let actual: Vec<_> = regex
+            .find_iter_value(&haystack, PortableFindIterLimits::unlimited())
+            .unwrap()
+            .map(|result| {
+                let matched = result.unwrap();
+                (matched.start(), matched.end())
+            })
+            .collect();
+        assert_eq!(actual, expected);
+
+        let mut reusable = "ΑΒxАБ".as_bytes().to_vec();
+        let original_address = reusable.as_ptr();
+        {
+            let mut cursor = regex.native_search_cursor(&reusable).unwrap();
+            assert_eq!(
+                cursor
+                    .find_at_value(0, SearchLimits::unlimited())
+                    .unwrap()
+                    .map(|matched| matched.range()),
+                Some(0..4),
+            );
+        }
+        reusable[..4].copy_from_slice("АБ".as_bytes());
+        assert_eq!(reusable.as_ptr(), original_address);
+        let mut cursor = regex.native_search_cursor(&reusable).unwrap();
+        assert_eq!(
+            cursor
+                .find_at_value(0, SearchLimits::unlimited())
+                .unwrap(),
+            None,
+        );
     }
 
     fn forward_pattern(class: &[u8], suffix: &[u8], lazy: bool, end: bool) -> String {

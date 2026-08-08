@@ -237,6 +237,71 @@ fre_byte_set4_mask32_sve2_asm:
     .size fre_byte_set4_mask32_sve2_asm, .-fre_byte_set4_mask32_sve2_asm
     .popsection
 
+    // Scan complete 32-byte blocks for a construction-time set of at most 16
+    // byte values. LD1RQB repeats the padded table in every 128-bit segment.
+    // Keeping the table, predicate spill slot, and outer zero-mask loop in one
+    // leaf avoids repeating fixed setup for long candidate-free prefixes. A
+    // hit returns its block-relative source offset in x0 and the complete block
+    // mask in x1; no hit returns the supplied complete length and a zero mask.
+    .pushsection .text.fre_byte_values16_first_mask32_sve2_asm, "ax", %progbits
+    .arch armv8-a+sve2
+    .p2align 2
+    .hidden fre_byte_values16_first_mask32_sve2_asm
+    .global fre_byte_values16_first_mask32_sve2_asm
+    .type fre_byte_values16_first_mask32_sve2_asm, %function
+fre_byte_values16_first_mask32_sve2_asm:
+    .cfi_startproc
+    sub sp, sp, #32
+    .cfi_def_cfa_offset 32
+    ptrue p2.b
+    ld1rqb z0.b, p2/z, [x0]
+    mov x8, #0
+    mov x14, #32
+    cntb x11
+1:
+    cmp x8, x2
+    b.hs 6f
+    mov x9, #0
+    mov x12, #0
+2:
+    whilelo p0.b, x9, x14
+    add x10, x8, x9
+    ld1b z1.b, p0/z, [x1, x10]
+    match p1.b, p0/z, z1.b, z0.b
+    ptest p0, p1.b
+    b.none 7f
+    str p1, [sp]
+    cmp x11, #32
+    b.lo 3f
+    ldr w13, [sp]
+    b 4f
+3:
+    ldrh w13, [sp]
+4:
+    lsl x15, x13, x9
+    orr x12, x12, x15
+7:
+    incb x9
+    cmp x9, #32
+    b.lo 2b
+    cbnz x12, 5f
+    add x8, x8, #32
+    b 1b
+5:
+    mov x0, x8
+    mov x1, x12
+    b 8f
+6:
+    mov x0, x2
+    mov x1, xzr
+8:
+    add sp, sp, #32
+    .cfi_def_cfa_offset 0
+    ret
+    .cfi_endproc
+    .size fre_byte_values16_first_mask32_sve2_asm, .-fre_byte_values16_first_mask32_sve2_asm
+    .popsection
+
     // Wide arbitrary full-byte-set classification. The two nibble tables
     // together represent all 256 byte values. SVE2 MATCH selects the lower or
     // upper high-nibble table without any input-dependent dispatch.
@@ -903,6 +968,13 @@ fre_ascii_run_backward_sve2_complement_asm:
     );
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct ByteValues16BlockScanResult {
+    block_start: usize,
+    member_mask: usize,
+}
+
 #[allow(
     unsafe_code,
     reason = "these private declarations are implemented by the reviewed base-SVE and SVE2 global assembly above"
@@ -914,6 +986,11 @@ unsafe extern "C" {
     fn fre_byte_set1_mask32_sve2_asm(member: u8, bytes: *const u8) -> u32;
     fn fre_byte_set2_mask32_sve2_asm(members: u16, bytes: *const u8) -> u32;
     fn fre_byte_set4_mask32_sve2_asm(members: u32, bytes: *const u8) -> u32;
+    fn fre_byte_values16_first_mask32_sve2_asm(
+        match_values: *const u8,
+        bytes: *const u8,
+        len: usize,
+    ) -> ByteValues16BlockScanResult;
     fn fre_byte_set_mask32_sve2_asm(
         lower_columns: *const u8,
         upper_columns: *const u8,
@@ -1089,6 +1166,38 @@ pub(super) unsafe fn classify_byte_set4_32_sve2(
     // supplies all 32 source bytes and the packed value contains the complete
     // unordered four-byte set.
     ByteSetMask32::new(unsafe { fre_byte_set4_mask32_sve2_asm(packed_members, bytes.as_ptr()) })
+}
+
+#[allow(
+    unsafe_code,
+    reason = "this private leaf is reachable only from the authenticated compiler-static SVE2 profile and scans complete fixed-width blocks from the supplied slice"
+)]
+#[inline]
+pub(super) unsafe fn find_byte_values16_32_block_sve2(
+    match_values: &[u8; 16],
+    bytes: &[u8],
+) -> Option<(usize, ByteSetMask32)> {
+    debug_assert_eq!(bytes.len() % BYTE_SET_WIDE_BLOCK_BYTES, 0);
+    // SAFETY: the caller proves SVE2 and supplies a slice containing only
+    // complete 32-byte blocks. The complete initialized table is repeated in
+    // every 128-bit segment; the assembly predicates every source load within
+    // the reported length and returns one complete mask from the first hit block.
+    let result = unsafe {
+        fre_byte_values16_first_mask32_sve2_asm(
+            match_values.as_ptr(),
+            bytes.as_ptr(),
+            bytes.len(),
+        )
+    };
+    if result.member_mask == 0 {
+        debug_assert_eq!(result.block_start, bytes.len());
+        return None;
+    }
+    debug_assert!(result.block_start < bytes.len());
+    debug_assert_eq!(result.block_start % BYTE_SET_WIDE_BLOCK_BYTES, 0);
+    let member_mask = u32::try_from(result.member_mask)
+        .expect("the exact 32-byte block mask occupies only the low 32 bits");
+    Some((result.block_start, ByteSetMask32::new(member_mask)))
 }
 
 #[allow(

@@ -60,6 +60,9 @@ pub const FRE_V1_PLAN_LITERAL_CLASS_RUN_LITERAL: u32 = 9;
 pub const FRE_V1_PLAN_PURE_BYTE_CLASS_REPEAT: u32 = 10;
 pub const FRE_V1_PLAN_FIXED_PREDICATE_WORD64: u32 = 11;
 pub const FRE_V1_PLAN_BOUNDED_BYTE_CLASS_SEQUENCE: u32 = 12;
+pub const FRE_V1_PLAN_REVERSE_INNER: u32 = 13;
+pub const FRE_V1_PLAN_PREFIX_CLASS_ALTERNATION: u32 = 14;
+pub const FRE_V1_PLAN_UNICODE_SCALAR_RUN: u32 = 15;
 
 /// Strict Rust constructor admission is still awaiting its pinned oracle.
 pub const FRE_V1_ADMISSION_UPSTREAM_ORACLE_PENDING: u32 = 1;

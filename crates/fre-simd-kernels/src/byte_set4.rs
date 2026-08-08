@@ -421,6 +421,78 @@ pub fn classify_byte_set4_32(
     split_32(bytes, |block| classify_byte_set4_16(members, block))
 }
 
+/// Find the first complete 32-byte block containing one of sixteen byte values.
+///
+/// Callers representing a smaller nonempty set fill unused table lanes with
+/// any retained member. Duplicate values do not change the result.
+/// An incomplete trailing block is deliberately ignored. The returned mask
+/// describes every member lane in the complete block at the returned byte
+/// offset. Compiler-static native profiles may fuse all preceding zero-mask
+/// blocks into one authenticated operation; other profiles retain the exact
+/// fixed-block classifier loop.
+#[must_use]
+#[allow(
+    unsafe_code,
+    reason = "the compiler-static SVE2 profile proves the private fused leaf and the slice proves every complete block extent"
+)]
+#[inline]
+pub fn find_byte_values16_32_block(
+    match_values: &[u8; 16],
+    bytes: &[u8],
+) -> Option<(usize, ByteSetMask32)> {
+    let complete_len = bytes.len() - bytes.len() % BYTE_SET_WIDE_BLOCK_BYTES;
+    #[cfg(all(
+        feature = "static-dispatch-arm-41-d84",
+        target_arch = "aarch64",
+        target_os = "linux",
+        target_endian = "little",
+        target_feature = "sve",
+        target_feature = "sve2"
+    ))]
+    {
+        // SAFETY: the authenticated compiler-static profile proves SVE2, and
+        // `complete_len` restricts the operation to complete 32-byte blocks.
+        return unsafe {
+            crate::aarch64_sve2::find_byte_values16_32_block_sve2(
+                match_values,
+                &bytes[..complete_len],
+            )
+        };
+    }
+    #[cfg(not(all(
+        feature = "static-dispatch-arm-41-d84",
+        target_arch = "aarch64",
+        target_os = "linux",
+        target_endian = "little",
+        target_feature = "sve",
+        target_feature = "sve2"
+    )))]
+    {
+        for (block_index, block) in bytes[..complete_len]
+            .chunks_exact(BYTE_SET_WIDE_BLOCK_BYTES)
+            .enumerate()
+        {
+            let block: &[u8; BYTE_SET_WIDE_BLOCK_BYTES] = block
+                .try_into()
+                .expect("an exact wide chunk has the fixed block extent");
+            let member_mask = block.iter().enumerate().fold(
+                0_u32,
+                |mask, (lane, &byte)| {
+                    mask | (u32::from(match_values.contains(&byte)) << lane)
+                },
+            );
+            let mask = ByteSetMask32::new(member_mask);
+            if mask.member_mask() != 0 {
+                let block_start = block_index
+                    .checked_mul(BYTE_SET_WIDE_BLOCK_BYTES)
+                    .expect("a complete block index is bounded by the source slice");
+                return Some((block_start, mask));
+            }
+        }
+        None
+    }
+}
+
 #[inline]
 #[cfg_attr(
     any(
@@ -495,7 +567,7 @@ mod tests {
         BYTE_SET_BLOCK_BYTES, BYTE_SET_WIDE_BLOCK_BYTES, ByteSetMask32, classify_byte_set1_16,
         classify_byte_set1_32, classify_byte_set2_16, classify_byte_set2_32, classify_byte_set3_16,
         classify_byte_set3_32, classify_byte_set4_16, classify_byte_set4_16_scalar,
-        classify_byte_set4_32,
+        classify_byte_set4_32, find_byte_values16_32_block,
     };
 
     fn classify_byte_set4_32_scalar(
@@ -506,6 +578,30 @@ mod tests {
             mask | (u32::from(members.contains(&byte)) << lane)
         });
         ByteSetMask32::new(member_mask)
+    }
+
+    fn find_byte_values16_32_block_scalar(
+        match_values: &[u8; 16],
+        bytes: &[u8],
+    ) -> Option<(usize, ByteSetMask32)> {
+        let complete_len = bytes.len() - bytes.len() % BYTE_SET_WIDE_BLOCK_BYTES;
+        bytes[..complete_len]
+            .chunks_exact(BYTE_SET_WIDE_BLOCK_BYTES)
+            .enumerate()
+            .find_map(|(block_index, block)| {
+                let member_mask = block.iter().enumerate().fold(
+                    0_u32,
+                    |mask, (lane, &byte)| {
+                        mask | (u32::from(match_values.contains(&byte)) << lane)
+                    },
+                );
+                (member_mask != 0).then(|| {
+                    (
+                        block_index * BYTE_SET_WIDE_BLOCK_BYTES,
+                        ByteSetMask32::new(member_mask),
+                    )
+                })
+            })
     }
 
     fn next_random(state: &mut u64) -> u64 {
@@ -598,6 +694,57 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn values16_block_finder_returns_the_first_complete_block_and_full_mask() {
+        for cardinality in [4_usize, 7, 16] {
+            let mut members = [0x80_u8; 16];
+            for (index, member) in members[..cardinality].iter_mut().enumerate() {
+                *member = 0x80_u8.checked_add(u8::try_from(index).unwrap()).unwrap();
+            }
+            let duplicate = members[0];
+            members[cardinality..].fill(duplicate);
+            for alignment in 0..=31 {
+                for len in [0_usize, 1, 31, 32, 33, 63, 64, 65, 96, 103] {
+                    let mut source = vec![0x55; alignment + len];
+                    let absent = &source[alignment..];
+                    assert_eq!(
+                        find_byte_values16_32_block(&members, absent),
+                        find_byte_values16_32_block_scalar(&members, absent),
+                    );
+                    for position in [0_usize, 15, 31, 32, 47, 63, 64, 95, 102] {
+                        if position >= len {
+                            continue;
+                        }
+                        source[alignment + position] = members[position % cardinality];
+                        let bytes = &source[alignment..];
+                        assert_eq!(
+                            find_byte_values16_32_block(&members, bytes),
+                            find_byte_values16_32_block_scalar(&members, bytes),
+                            "cardinality={cardinality} alignment={alignment} len={len} position={position}",
+                        );
+                        source[alignment + position] = 0x55;
+                    }
+                }
+            }
+        }
+
+        let mut members = [0x80_u8; 16];
+        for (index, member) in members.iter_mut().enumerate() {
+            *member = 0x80_u8.checked_add(u8::try_from(index).unwrap()).unwrap();
+        }
+        let mut bytes = vec![0x55; BYTE_SET_WIDE_BLOCK_BYTES * 3];
+        bytes[BYTE_SET_WIDE_BLOCK_BYTES + 3] = members[0];
+        bytes[BYTE_SET_WIDE_BLOCK_BYTES + 19] = members[15];
+        bytes[BYTE_SET_WIDE_BLOCK_BYTES * 2] = members[7];
+        let (block_start, mask) = find_byte_values16_32_block(&members, &bytes).unwrap();
+        assert_eq!(block_start, BYTE_SET_WIDE_BLOCK_BYTES);
+        assert_eq!(mask.member_mask(), (1_u32 << 3) | (1_u32 << 19));
+
+        let mut tail_only = vec![0x55; BYTE_SET_WIDE_BLOCK_BYTES + 7];
+        tail_only[BYTE_SET_WIDE_BLOCK_BYTES + 6] = members[0];
+        assert_eq!(find_byte_values16_32_block(&members, &tail_only), None);
     }
 
     #[test]
