@@ -11,8 +11,8 @@ use core::{fmt, marker::PhantomData, mem};
 
 use fre_exact_alloc::{CopyError, ExactVec};
 use fre_simd_kernels::{
-    BYTE_BUCKET_MAX_COLUMNS, ByteBucketClassifier, ByteBucketTables, DispatchPolicy,
-    SelectionReceipt, SimdDispatchContext,
+    BYTE_BUCKET_BLOCK_BYTES, BYTE_BUCKET_MAX_COLUMNS, ByteBucketClassifier, ByteBucketTables,
+    DispatchPolicy, SelectionReceipt, SimdDispatchContext,
 };
 use memchr::{memchr_iter, memchr2_iter, memchr3_iter};
 
@@ -23,7 +23,7 @@ use crate::{
 };
 
 /// Stable identity of the canonical folded-scalar trie primitive.
-pub const PLAN_ID: &str = "literal-candidate-stream.unicode-folded-trie.v6";
+pub const PLAN_ID: &str = "literal-candidate-stream.unicode-folded-trie.v7";
 
 const NONE: usize = usize::MAX;
 const CANDIDATE_WORK: usize = 2;
@@ -37,6 +37,13 @@ const ROOT_PREFILTER_CLASSIFIER_HIGH_WORK: usize = 16;
 // Matches the authenticated byte-bucket construction charge used by the
 // packed multi-literal owner. Host capture and Auto selection happen once.
 const ROOT_PREFILTER_CLASSIFIER_SELECTION_WORK: usize = 256;
+const ROOT_PREFILTER_FINGERPRINT_GAIN: u64 = 2;
+const ROOT_PREFILTER_FINGERPRINT_MAX_WORK: usize = 1 << 20;
+const ROOT_PREFILTER_FINGERPRINT_SCORE_WORK: usize =
+    2 * BYTE_BUCKET_MAX_COLUMNS * BYTE_BUCKET_MAX_COLUMNS * ROOT_PREFILTER_BYTE_VALUES
+        * ROOT_PREFILTER_BUCKETS;
+const ROOT_PREFILTER_FINGERPRINT_LAYOUT_WORK: usize =
+    ROOT_PREFILTER_BYTE_VALUES + ROOT_PREFILTER_BUCKETS * 16;
 const ROOT_PREFILTER_OFFSET_WORK: usize = 2;
 const ROOT_PREFILTER_EDGE_WORK: usize = 7;
 const ROOT_PREFILTER_NEEDLE_WORK: usize = 2;
@@ -510,6 +517,18 @@ struct RootPrefilter {
     guard_offset: u8,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RootPrefilterScanProgress {
+    primary_reads: usize,
+    correlated_reads: usize,
+}
+
+impl RootPrefilterScanProgress {
+    fn source_byte_reads(self) -> Option<usize> {
+        self.primary_reads.checked_add(self.correlated_reads)
+    }
+}
+
 impl RootPrefilter {
     const fn has_guard(&self) -> bool {
         self.guard_needle_count != 0
@@ -523,6 +542,12 @@ impl RootPrefilter {
         byte_set_contains(self.guard_byte_set, byte)
     }
 
+    fn classifier_columns(&self) -> usize {
+        self.classifier
+            .as_ref()
+            .map_or(1, |classifier| classifier.tables().columns())
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "the three memchr widths and retained full-byte classifier share one checked callback/error contract"
@@ -533,7 +558,7 @@ impl RootPrefilter {
         source: &[u8],
         invalid_actual: ScanActual,
         hit: &mut RootPrefilterHitState<'_, '_, '_, '_, S>,
-    ) -> Result<usize, ScanAttemptError>
+    ) -> Result<RootPrefilterScanProgress, ScanAttemptError>
     where
         S: LiteralCandidateSink + ?Sized,
     {
@@ -554,8 +579,12 @@ impl RootPrefilter {
                         },
                         actual: invalid_actual,
                     })?;
-                    if !hit.on_hit(position, scanned_through)? {
-                        return Ok(scanned_through);
+                    let progress = RootPrefilterScanProgress {
+                        primary_reads: scanned_through,
+                        correlated_reads: 0,
+                    };
+                    if !hit.on_hit(position, progress)? {
+                        return Ok(progress);
                     }
                 }
             }
@@ -567,8 +596,12 @@ impl RootPrefilter {
                         },
                         actual: invalid_actual,
                     })?;
-                    if !hit.on_hit(position, scanned_through)? {
-                        return Ok(scanned_through);
+                    let progress = RootPrefilterScanProgress {
+                        primary_reads: scanned_through,
+                        correlated_reads: 0,
+                    };
+                    if !hit.on_hit(position, progress)? {
+                        return Ok(progress);
                     }
                 }
             }
@@ -582,8 +615,12 @@ impl RootPrefilter {
                         },
                         actual: invalid_actual,
                     })?;
-                    if !hit.on_hit(position, scanned_through)? {
-                        return Ok(scanned_through);
+                    let progress = RootPrefilterScanProgress {
+                        primary_reads: scanned_through,
+                        correlated_reads: 0,
+                    };
+                    if !hit.on_hit(position, progress)? {
+                        return Ok(progress);
                     }
                 }
             }
@@ -596,63 +633,192 @@ impl RootPrefilter {
                         actual: invalid_actual,
                     });
                 };
+                let columns = classifier.tables().columns();
                 let mut block_start = 0_usize;
-                while let Some(masks) = classifier.classify_16(&source[block_start..]) {
-                    let scanned_through = block_start.checked_add(16).ok_or(ScanAttemptError {
-                        source: ScanError::ArithmeticOverflow {
-                            computation: "wide folded root prefilter scanned prefix",
-                        },
-                        actual: invalid_actual,
-                    })?;
-                    for (chunk_index, mut chunk) in masks.chunks().into_iter().enumerate() {
-                        while chunk != 0 {
-                            let lane = usize::try_from(chunk.trailing_zeros() / u8::BITS)
-                                .expect("a classified narrow lane fits in usize");
-                            let position = chunk_index
-                                .checked_mul(8)
-                                .and_then(|offset| offset.checked_add(lane))
-                                .and_then(|offset| block_start.checked_add(offset))
-                                .ok_or(ScanAttemptError {
-                                    source: ScanError::ArithmeticOverflow {
-                                        computation: "wide folded root prefilter hit",
-                                    },
-                                    actual: invalid_actual,
-                                })?;
-                            if !hit.on_hit(position, scanned_through)? {
-                                return Ok(scanned_through);
-                            }
-                            let shift = lane.checked_mul(8).ok_or(ScanAttemptError {
+                let mut correlated_reads = 0_usize;
+                if columns == 1 {
+                    // Keep the optional-width decision and the full-width
+                    // extent check out of the established one-column fallback
+                    // loop. Empty screens also skip lane iteration entirely.
+                    while let Some(masks) =
+                        classifier.classify_first_16(&source[block_start..])
+                    {
+                        let scanned_through =
+                            block_start.checked_add(16).ok_or(ScanAttemptError {
                                 source: ScanError::ArithmeticOverflow {
-                                    computation: "wide folded root prefilter lane shift",
+                                    computation: "wide folded root prefilter scanned prefix",
                                 },
                                 actual: invalid_actual,
                             })?;
-                            let lane_mask = u64::from(u8::MAX)
-                                .checked_shl(u32::try_from(shift).map_err(|_| {
-                                    ScanAttemptError {
+                        if masks.chunks() == [0, 0] {
+                            block_start = scanned_through;
+                            continue;
+                        }
+                        let progress = RootPrefilterScanProgress {
+                            primary_reads: scanned_through,
+                            correlated_reads: 0,
+                        };
+                        for (chunk_index, mut chunk) in masks.chunks().into_iter().enumerate() {
+                            while chunk != 0 {
+                                let lane = usize::try_from(chunk.trailing_zeros() / u8::BITS)
+                                    .expect("a classified narrow lane fits in usize");
+                                let position = chunk_index
+                                    .checked_mul(8)
+                                    .and_then(|offset| offset.checked_add(lane))
+                                    .and_then(|offset| block_start.checked_add(offset))
+                                    .ok_or(ScanAttemptError {
                                         source: ScanError::ArithmeticOverflow {
-                                            computation: "wide folded root prefilter lane shift",
+                                            computation: "wide folded root prefilter hit",
                                         },
                                         actual: invalid_actual,
-                                    }
-                                })?)
-                                .ok_or(ScanAttemptError {
+                                    })?;
+                                if !hit.on_hit(position, progress)? {
+                                    return Ok(progress);
+                                }
+                                let shift = lane.checked_mul(8).ok_or(ScanAttemptError {
                                     source: ScanError::ArithmeticOverflow {
-                                        computation: "wide folded root prefilter lane mask",
+                                        computation: "wide folded root prefilter lane shift",
                                     },
                                     actual: invalid_actual,
                                 })?;
-                            chunk &= !lane_mask;
+                                let lane_mask = u64::from(u8::MAX)
+                                    .checked_shl(u32::try_from(shift).map_err(|_| {
+                                        ScanAttemptError {
+                                            source: ScanError::ArithmeticOverflow {
+                                                computation: "wide folded root prefilter lane shift",
+                                            },
+                                            actual: invalid_actual,
+                                        }
+                                    })?)
+                                    .ok_or(ScanAttemptError {
+                                        source: ScanError::ArithmeticOverflow {
+                                            computation: "wide folded root prefilter lane mask",
+                                        },
+                                        actual: invalid_actual,
+                                    })?;
+                                chunk &= !lane_mask;
+                            }
                         }
+                        block_start = block_start.checked_add(16).ok_or(ScanAttemptError {
+                            source: ScanError::ArithmeticOverflow {
+                                computation: "wide folded root prefilter block start",
+                            },
+                            actual: invalid_actual,
+                        })?;
                     }
-                    block_start = block_start.checked_add(16).ok_or(ScanAttemptError {
-                        source: ScanError::ArithmeticOverflow {
-                            computation: "wide folded root prefilter block start",
-                        },
-                        actual: invalid_actual,
-                    })?;
+                } else {
+                    let required_input_bytes = classifier.tables().required_input_bytes();
+                    while source
+                        .len()
+                        .checked_sub(block_start)
+                        .is_some_and(|remaining| remaining >= required_input_bytes)
+                    {
+                        let scanned_through =
+                            block_start.checked_add(16).ok_or(ScanAttemptError {
+                                source: ScanError::ArithmeticOverflow {
+                                    computation: "wide folded root prefilter scanned prefix",
+                                },
+                                actual: invalid_actual,
+                            })?;
+                        let screening = classifier
+                            .classify_first_16(&source[block_start..])
+                            .ok_or(ScanAttemptError {
+                                source: ScanError::Invariant {
+                                    detail: "wide folded root screen lost its block extent",
+                                },
+                                actual: invalid_actual,
+                            })?;
+                        if screening.chunks() == [0, 0] {
+                            block_start = scanned_through;
+                            continue;
+                        }
+                        let masks = classifier
+                            .classify_16(&source[block_start..])
+                            .ok_or(ScanAttemptError {
+                                source: ScanError::Invariant {
+                                    detail: "wide folded root classifier lost its correlated extent",
+                                },
+                                actual: invalid_actual,
+                            })?;
+                        let block_reads = BYTE_BUCKET_BLOCK_BYTES
+                            .checked_mul(columns)
+                            .ok_or(ScanAttemptError {
+                                source: ScanError::ArithmeticOverflow {
+                                    computation: "wide folded root correlated block reads",
+                                },
+                                actual: invalid_actual,
+                            })?;
+                        correlated_reads = correlated_reads.checked_add(block_reads).ok_or(
+                            ScanAttemptError {
+                                source: ScanError::ArithmeticOverflow {
+                                    computation: "wide folded root correlated source reads",
+                                },
+                                actual: invalid_actual,
+                            },
+                        )?;
+                        let progress = RootPrefilterScanProgress {
+                            primary_reads: scanned_through,
+                            correlated_reads,
+                        };
+                        for (chunk_index, mut chunk) in masks.chunks().into_iter().enumerate() {
+                            while chunk != 0 {
+                                let lane = usize::try_from(chunk.trailing_zeros() / u8::BITS)
+                                    .expect("a classified narrow lane fits in usize");
+                                let position = chunk_index
+                                    .checked_mul(8)
+                                    .and_then(|offset| offset.checked_add(lane))
+                                    .and_then(|offset| block_start.checked_add(offset))
+                                    .ok_or(ScanAttemptError {
+                                        source: ScanError::ArithmeticOverflow {
+                                            computation: "wide folded root prefilter hit",
+                                        },
+                                        actual: invalid_actual,
+                                    })?;
+                                if !hit.on_hit(position, progress)? {
+                                    return Ok(progress);
+                                }
+                                let shift = lane.checked_mul(8).ok_or(ScanAttemptError {
+                                    source: ScanError::ArithmeticOverflow {
+                                        computation: "wide folded root prefilter lane shift",
+                                    },
+                                    actual: invalid_actual,
+                                })?;
+                                let lane_mask = u64::from(u8::MAX)
+                                    .checked_shl(u32::try_from(shift).map_err(|_| {
+                                        ScanAttemptError {
+                                            source: ScanError::ArithmeticOverflow {
+                                                computation: "wide folded root prefilter lane shift",
+                                            },
+                                            actual: invalid_actual,
+                                        }
+                                    })?)
+                                    .ok_or(ScanAttemptError {
+                                        source: ScanError::ArithmeticOverflow {
+                                            computation: "wide folded root prefilter lane mask",
+                                        },
+                                        actual: invalid_actual,
+                                    })?;
+                                chunk &= !lane_mask;
+                            }
+                        }
+                        block_start = block_start.checked_add(16).ok_or(ScanAttemptError {
+                            source: ScanError::ArithmeticOverflow {
+                                computation: "wide folded root prefilter block start",
+                            },
+                            actual: invalid_actual,
+                        })?;
+                    }
                 }
                 for (tail_offset, &byte) in source[block_start..].iter().enumerate() {
+                    let primary_reads = block_start
+                        .checked_add(tail_offset)
+                        .and_then(|position| position.checked_add(1))
+                        .ok_or(ScanAttemptError {
+                            source: ScanError::ArithmeticOverflow {
+                                computation: "wide folded root tail reads",
+                            },
+                            actual: invalid_actual,
+                        })?;
                     if byte_set_contains(self.byte_set, byte) {
                         let position =
                             block_start
@@ -663,17 +829,19 @@ impl RootPrefilter {
                                     },
                                     actual: invalid_actual,
                                 })?;
-                        let scanned_through = position.checked_add(1).ok_or(ScanAttemptError {
-                            source: ScanError::ArithmeticOverflow {
-                                computation: "wide folded root prefilter scanned prefix",
-                            },
-                            actual: invalid_actual,
-                        })?;
-                        if !hit.on_hit(position, scanned_through)? {
-                            return Ok(scanned_through);
+                        let progress = RootPrefilterScanProgress {
+                            primary_reads,
+                            correlated_reads,
+                        };
+                        if !hit.on_hit(position, progress)? {
+                            return Ok(progress);
                         }
                     }
                 }
+                return Ok(RootPrefilterScanProgress {
+                    primary_reads: source.len(),
+                    correlated_reads,
+                });
             }
             _ => {
                 return Err(ScanAttemptError {
@@ -684,7 +852,10 @@ impl RootPrefilter {
                 });
             }
         }
-        Ok(source.len())
+        Ok(RootPrefilterScanProgress {
+            primary_reads: source.len(),
+            correlated_reads: 0,
+        })
     }
 }
 
@@ -781,16 +952,25 @@ impl FoldedLiteralTriePlan {
                 accounting,
             }));
         }
-        // Base column selection is covered by the already-enforced v5
-        // prospective. Only a selected memchr-width primary can enter the
-        // optional successor pass, so charge and enforce that extra envelope
-        // after selection but before successor source work or allocation.
+        // Base column selection and the one-column classifier are covered by
+        // the already-enforced prospective. Charge either optional successor
+        // derivation only after selection, then enforce it before successor
+        // source work or allocation.
         let (root_prefilter_columns, root_prefilter_base_work) =
             select_root_prefilter_columns(patterns)?;
+        let fingerprint_admitted = if root_prefilter_columns[0].is_some_and(|primary| {
+            usize::from(primary.needle_count) > MEMCHR_ROOT_PREFILTER_NEEDLES
+        }) {
+            admit_root_prefilter_fingerprint(&mut prospective, limits.max_work)?
+        } else {
+            false
+        };
         if root_prefilter_columns[0].is_some_and(|primary| {
             usize::from(primary.needle_count) <= MEMCHR_ROOT_PREFILTER_NEEDLES
         }) {
             admit_root_prefilter_successor(&mut prospective)?;
+            enforce_build_limits(&prospective, limits)?;
+        } else if fingerprint_admitted {
             enforce_build_limits(&prospective, limits)?;
         }
         let (root_prefilter, root_prefilter_work) = materialize_root_prefilter(
@@ -798,6 +978,7 @@ impl FoldedLiteralTriePlan {
             patterns,
             root_prefilter_columns,
             root_prefilter_base_work,
+            fingerprint_admitted,
         )?;
         build_probe::record_allocation_attempt();
         let mut nodes =
@@ -906,6 +1087,14 @@ impl FoldedLiteralTriePlan {
         self.build
     }
 
+    #[cfg(test)]
+    fn root_prefilter_classifier_columns(&self) -> usize {
+        self.root_prefilter
+            .as_ref()
+            .and_then(|prefilter| prefilter.classifier.as_ref())
+            .map_or(0, |classifier| classifier.tables().columns())
+    }
+
     /// Authenticate that the retained root columns are necessary for every
     /// exact byte pattern owned by an attaching authoritative matcher.
     pub(crate) fn root_prefilter_is_necessary_for(
@@ -921,6 +1110,12 @@ impl FoldedLiteralTriePlan {
                 bytes
                     .get(usize::from(prefilter.offset))
                     .is_some_and(|&byte| byte_set_contains(prefilter.byte_set, byte))
+                    && prefilter.classifier.as_ref().is_none_or(|classifier| {
+                        bytes
+                            .get(usize::from(prefilter.offset)..)
+                            .and_then(|prefix| classifier.classify_prefix(prefix))
+                            .is_some_and(|buckets| buckets != 0)
+                    })
                     && (!prefilter.has_guard()
                         || bytes
                             .get(usize::from(prefilter.guard_offset))
@@ -932,11 +1127,12 @@ impl FoldedLiteralTriePlan {
 
     /// Derive the exact linear envelope for one necessary-root pass.
     ///
-    /// The primary classifier reads each source byte at most once, and a
-    /// retained guard reads at most one byte for each primary position. The
-    /// fixed columns at the first exact start may also be read once before the
-    /// classifier. The attaching matcher has already authenticated that every
-    /// retained fixed column is necessary and lies within `max_pattern_bytes`.
+    /// A correlated classifier first screens column zero, then reads all
+    /// retained columns only for a screen-positive block. A retained guard
+    /// reads at most one byte for each primary position. The fixed columns at
+    /// the first exact start may also be read once before the classifier. The
+    /// attaching matcher has already authenticated that every retained fixed
+    /// column is necessary and lies within `max_pattern_bytes`.
     pub(crate) fn root_candidate_single_pass_upper_bounds(
         &self,
         input_bytes: usize,
@@ -947,8 +1143,11 @@ impl FoldedLiteralTriePlan {
                 detail: "folded root-candidate envelope requires a retained root prefilter",
             });
         };
+        let classifier_columns = prefilter.classifier_columns();
         if max_pattern_bytes == 0
-            || usize::from(prefilter.offset) >= max_pattern_bytes
+            || usize::from(prefilter.offset)
+                .checked_add(classifier_columns)
+                .is_none_or(|end| end > max_pattern_bytes)
             || (prefilter.has_guard()
                 && usize::from(prefilter.guard_offset) >= max_pattern_bytes)
         {
@@ -956,12 +1155,17 @@ impl FoldedLiteralTriePlan {
                 detail: "folded root-candidate columns escaped the exact pattern width",
             });
         }
-        let source_passes = usize::from(prefilter.has_guard())
-            .checked_add(1)
+        let source_passes = classifier_columns
+            .checked_add(usize::from(classifier_columns > 1))
+            .and_then(|passes| passes.checked_add(usize::from(prefilter.has_guard())))
             .ok_or(ScanError::ArithmeticOverflow {
                 computation: "folded root-candidate source passes",
             })?;
-        let root_start_probe_reads = source_passes;
+        let root_start_probe_reads = classifier_columns
+            .checked_add(usize::from(prefilter.has_guard()))
+            .ok_or(ScanError::ArithmeticOverflow {
+                computation: "folded root-candidate start-probe reads",
+            })?;
         let source_byte_reads = input_bytes
             .checked_mul(source_passes)
             .and_then(|reads| reads.checked_add(root_start_probe_reads))
@@ -1009,15 +1213,17 @@ impl FoldedLiteralTriePlan {
             "folded scalar source byte reads",
         )?;
         let source_byte_reads = if self.root_prefilter.is_some() {
-            let prefilter_passes = usize::from(
-                self.root_prefilter
-                    .as_ref()
-                    .is_some_and(RootPrefilter::has_guard),
-            )
-            .checked_add(1)
-            .ok_or(ScanError::ArithmeticOverflow {
-                computation: "folded root-prefilter pass count",
-            })?;
+            let prefilter = self
+                .root_prefilter
+                .as_ref()
+                .expect("the checked folded root prefilter remains present");
+            let classifier_columns = prefilter.classifier_columns();
+            let prefilter_passes = classifier_columns
+                .checked_add(usize::from(classifier_columns > 1))
+                .and_then(|passes| passes.checked_add(usize::from(prefilter.has_guard())))
+                .ok_or(ScanError::ArithmeticOverflow {
+                    computation: "folded root-prefilter pass count",
+                })?;
             let prefilter_reads =
                 input_bytes
                     .checked_mul(prefilter_passes)
@@ -1405,8 +1611,18 @@ impl AdaptiveHitState<'_, '_> {
         reason = "the outlined adaptive transaction preserves every accounting and fallback branch"
     )]
     #[inline(never)]
-    fn on_hit(&mut self, hit: usize, scanned_through: usize) -> Result<bool, ScanAttemptError> {
-        let additional_reads = scanned_through
+    fn on_hit(
+        &mut self,
+        hit: usize,
+        progress: RootPrefilterScanProgress,
+    ) -> Result<bool, ScanAttemptError> {
+        let source_reads_through = progress.source_byte_reads().ok_or(ScanAttemptError {
+            source: ScanError::ArithmeticOverflow {
+                computation: "adaptive folded prefilter cumulative source reads",
+            },
+            actual: self.actual,
+        })?;
+        let additional_reads = source_reads_through
             .checked_sub(self.prefilter_source_reads)
             .ok_or(ScanAttemptError {
                 source: ScanError::Invariant {
@@ -1421,7 +1637,7 @@ impl AdaptiveHitState<'_, '_> {
             self.actual,
             "adaptive folded prefilter source reads",
         )?;
-        self.prefilter_source_reads = scanned_through;
+        self.prefilter_source_reads = source_reads_through;
         let Some(relative_start) = hit.checked_sub(self.offset) else {
             return Ok(true);
         };
@@ -1457,12 +1673,13 @@ impl AdaptiveHitState<'_, '_> {
                             "adaptive guard verification work",
                         )
                     })?;
-                let local_span = scanned_through
+                let local_span = progress
+                    .primary_reads
                     .checked_sub(self.previous_candidate_scanned_through)
                     .ok_or_else(|| {
                         attempt_overflow(self.upper, self.actual, "adaptive guard byte distance")
                     })?;
-                self.previous_candidate_scanned_through = scanned_through;
+                self.previous_candidate_scanned_through = progress.primary_reads;
                 if guard_work > local_span {
                     let resume_start = self
                         .absolute_base
@@ -1548,12 +1765,13 @@ impl AdaptiveHitState<'_, '_> {
             .ok_or_else(|| {
                 attempt_overflow(self.upper, self.actual, "adaptive verification work")
             })?;
-        let local_span = scanned_through
+        let local_span = progress
+            .primary_reads
             .checked_sub(self.previous_candidate_scanned_through)
             .ok_or_else(|| {
                 attempt_overflow(self.upper, self.actual, "adaptive candidate byte distance")
             })?;
-        self.previous_candidate_scanned_through = scanned_through;
+        self.previous_candidate_scanned_through = progress.primary_reads;
         if verification_work > local_span {
             let resume_start = self
                 .absolute_base
@@ -1611,11 +1829,19 @@ fn execute_adaptive_find(
         previous_candidate_scanned_through: 0,
         outcome: AdaptiveFindOutcome::NoMatch,
     };
-    let completed_source_reads = {
+    let completed_progress = {
         let mut hit_state: RootPrefilterHitState<'_, '_, '_, '_, LeftmostFirstSink<'_>> =
             RootPrefilterHitState::Adaptive(&mut state, PhantomData);
         prefilter.scan(source, invalid_actual, &mut hit_state)?
     };
+    let completed_source_reads = completed_progress.source_byte_reads().ok_or(
+        ScanAttemptError {
+            source: ScanError::ArithmeticOverflow {
+                computation: "adaptive folded prefilter completion cumulative reads",
+            },
+            actual: state.actual,
+        },
+    )?;
     let remaining_prefilter_reads = completed_source_reads
         .checked_sub(state.prefilter_source_reads)
         .ok_or(ScanAttemptError {
@@ -1648,8 +1874,18 @@ struct RootCandidateHitState<'plan, 'source> {
 
 impl RootCandidateHitState<'_, '_> {
     #[inline(never)]
-    fn on_hit(&mut self, hit: usize, scanned_through: usize) -> Result<bool, ScanAttemptError> {
-        let additional_reads = scanned_through
+    fn on_hit(
+        &mut self,
+        hit: usize,
+        progress: RootPrefilterScanProgress,
+    ) -> Result<bool, ScanAttemptError> {
+        let source_reads_through = progress.source_byte_reads().ok_or(ScanAttemptError {
+            source: ScanError::ArithmeticOverflow {
+                computation: "folded root-candidate cumulative source reads",
+            },
+            actual: self.actual,
+        })?;
+        let additional_reads = source_reads_through
             .checked_sub(self.prefilter_source_reads)
             .ok_or(ScanAttemptError {
                 source: ScanError::Invariant {
@@ -1664,7 +1900,7 @@ impl RootCandidateHitState<'_, '_> {
             self.actual,
             "folded root-candidate prefilter source reads",
         )?;
-        self.prefilter_source_reads = scanned_through;
+        self.prefilter_source_reads = source_reads_through;
         let Some(relative_start) = hit.checked_sub(self.offset) else {
             return Ok(true);
         };
@@ -1698,7 +1934,8 @@ impl RootCandidateHitState<'_, '_> {
                             "folded root-candidate guard work",
                         )
                     })?;
-                let local_span = scanned_through
+                let local_span = progress
+                    .primary_reads
                     .checked_sub(self.previous_candidate_scanned_through)
                     .ok_or_else(|| {
                         attempt_overflow(
@@ -1707,7 +1944,7 @@ impl RootCandidateHitState<'_, '_> {
                             "folded root-candidate guard byte distance",
                         )
                     })?;
-                self.previous_candidate_scanned_through = scanned_through;
+                self.previous_candidate_scanned_through = progress.primary_reads;
                 if guard_work > local_span {
                     let resume_start = self
                         .absolute_base
@@ -1767,16 +2004,34 @@ fn execute_root_candidate_find(
         ..ScanActual::default()
     };
     // The wide classifier reports even lane zero only after classifying its
-    // complete first block. Settle that exact start from the retained one or
-    // two necessary columns. A rejection deliberately leaves the original
-    // source and its alignment unchanged for the existing full-window scanner.
-    if let Some(&primary_byte) = source.get(usize::from(prefilter.offset)) {
-        actual.source_byte_reads = 1;
-        let mut qualified = prefilter.primary_matches(primary_byte);
+    // complete first block. Settle that exact start from the retained
+    // necessary columns. A rejection deliberately leaves the original source
+    // and its alignment unchanged for the existing full-window scanner.
+    let primary_offset = usize::from(prefilter.offset);
+    if let Some(&primary_byte) = source.get(primary_offset) {
+        let mut qualified = if let Some(classifier) = prefilter.classifier.as_ref()
+            && classifier.tables().columns() > 1
+            && source.len().saturating_sub(primary_offset) >= classifier.tables().columns()
+        {
+            actual.source_byte_reads = classifier.tables().columns();
+            classifier
+                .classify_prefix(&source[primary_offset..])
+                .is_some_and(|buckets| buckets != 0)
+        } else {
+            actual.source_byte_reads = 1;
+            prefilter.primary_matches(primary_byte)
+        };
         if qualified && prefilter.has_guard() {
             qualified = false;
             if let Some(&guard_byte) = source.get(usize::from(prefilter.guard_offset)) {
-                actual.source_byte_reads = 2;
+                actual.source_byte_reads = actual.source_byte_reads.checked_add(1).ok_or(
+                    ScanAttemptError {
+                        source: ScanError::ArithmeticOverflow {
+                            computation: "folded root-candidate start guard reads",
+                        },
+                        actual,
+                    },
+                )?;
                 qualified = prefilter.guard_matches(guard_byte);
             }
         }
@@ -1802,11 +2057,19 @@ fn execute_root_candidate_find(
         previous_candidate_scanned_through: 0,
         outcome: RootCandidateOutcome::NoCandidate,
     };
-    let completed_source_reads = {
+    let completed_progress = {
         let mut hit_state: RootPrefilterHitState<'_, '_, '_, '_, LeftmostFirstSink<'_>> =
             RootPrefilterHitState::RootCandidate(&mut state, PhantomData);
         prefilter.scan(source, invalid_actual, &mut hit_state)?
     };
+    let completed_source_reads = completed_progress.source_byte_reads().ok_or(
+        ScanAttemptError {
+            source: ScanError::ArithmeticOverflow {
+                computation: "folded root-candidate completion cumulative reads",
+            },
+            actual: state.actual,
+        },
+    )?;
     let remaining_prefilter_reads = completed_source_reads
         .checked_sub(state.prefilter_source_reads)
         .ok_or(ScanAttemptError {
@@ -1867,8 +2130,18 @@ where
         reason = "built-in operations share one static prefilter instantiation and avoid a call per hit"
     )]
     #[inline(always)]
-    fn on_hit(&mut self, hit: usize, scanned_through: usize) -> Result<bool, ScanAttemptError> {
-        let additional_reads = scanned_through
+    fn on_hit(
+        &mut self,
+        hit: usize,
+        progress: RootPrefilterScanProgress,
+    ) -> Result<bool, ScanAttemptError> {
+        let source_reads_through = progress.source_byte_reads().ok_or(ScanAttemptError {
+            source: ScanError::ArithmeticOverflow {
+                computation: "folded root prefilter cumulative source reads",
+            },
+            actual: self.actual,
+        })?;
+        let additional_reads = source_reads_through
             .checked_sub(self.prefilter_source_reads)
             .ok_or(ScanAttemptError {
                 source: ScanError::Invariant {
@@ -1883,7 +2156,7 @@ where
             self.actual,
             "folded root-prefilter source reads",
         )?;
-        self.prefilter_source_reads = scanned_through;
+        self.prefilter_source_reads = source_reads_through;
         let Some(relative_start) = hit.checked_sub(self.offset) else {
             return Ok(true);
         };
@@ -1953,11 +2226,15 @@ where
     S: LiteralCandidateSink + ?Sized,
 {
     #[inline(always)]
-    fn on_hit(&mut self, hit: usize, scanned_through: usize) -> Result<bool, ScanAttemptError> {
+    fn on_hit(
+        &mut self,
+        hit: usize,
+        progress: RootPrefilterScanProgress,
+    ) -> Result<bool, ScanAttemptError> {
         match self {
-            Self::Incumbent(state) => state.on_hit(hit, scanned_through),
-            Self::Adaptive(state, _) => state.on_hit(hit, scanned_through),
-            Self::RootCandidate(state, _) => state.on_hit(hit, scanned_through),
+            Self::Incumbent(state) => state.on_hit(hit, progress),
+            Self::Adaptive(state, _) => state.on_hit(hit, progress),
+            Self::RootCandidate(state, _) => state.on_hit(hit, progress),
         }
     }
 }
@@ -1996,10 +2273,18 @@ where
             stop,
             emit,
         };
-        let completed_source_reads = {
+        let completed_progress = {
             let mut hit_state = RootPrefilterHitState::Incumbent(&mut state);
             prefilter.scan(source, invalid_actual, &mut hit_state)?
         };
+        let completed_source_reads = completed_progress.source_byte_reads().ok_or(
+            ScanAttemptError {
+                source: ScanError::ArithmeticOverflow {
+                    computation: "folded root-prefilter completion cumulative reads",
+                },
+                actual: state.actual,
+            },
+        )?;
         let remaining_prefilter_reads = completed_source_reads
             .checked_sub(state.prefilter_source_reads)
             .ok_or(ScanAttemptError {
@@ -2260,6 +2545,7 @@ fn materialize_root_prefilter(
     patterns: &[FoldedLiteral<'_>],
     selected: [Option<PrefilterColumn>; 2],
     mut work: usize,
+    fingerprint_admitted: bool,
 ) -> Result<(Option<RootPrefilter>, usize), BuildError> {
     let root_prefilter = if let Some(primary) = selected[0] {
         let mut guard = selected[1].map(RootGuardCandidate::fixed);
@@ -2277,8 +2563,14 @@ fn materialize_root_prefilter(
             }
         }
         let classifier = if usize::from(primary.needle_count) > MEMCHR_ROOT_PREFILTER_NEEDLES {
-            let (classifier, classifier_work) =
-                root_prefilter_classifier(dispatch, primary.byte_set, primary.high_nibbles)?;
+            let (classifier, retained_guard, classifier_work) = root_prefilter_classifier(
+                dispatch,
+                patterns,
+                primary,
+                guard,
+                fingerprint_admitted,
+            )?;
+            guard = retained_guard;
             work = checked_build_add(
                 work,
                 classifier_work,
@@ -2596,11 +2888,96 @@ fn byte_set_members(set: [u64; ROOT_PREFILTER_BYTE_WORDS]) -> ByteSetMembers {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RootClassifierBucketLayout {
+    high_bucket_masks: [u8; 16],
+}
+
+impl RootClassifierBucketLayout {
+    fn next_bucket(
+        self,
+        byte: u8,
+        ordinals: &mut [usize; 16],
+    ) -> Result<u8, BuildError> {
+        let high_nibble = usize::from(byte >> 4);
+        let mut buckets = self.high_bucket_masks[high_nibble];
+        let bucket_count = usize::try_from(buckets.count_ones())
+            .expect("the fixed bucket count fits in usize");
+        if bucket_count == 0 {
+            return Err(BuildError::Invariant {
+                detail: "folded root classifier atom lost its high-nibble bucket",
+            });
+        }
+        let selected = ordinals[high_nibble] % bucket_count;
+        ordinals[high_nibble] = ordinals[high_nibble].checked_add(1).ok_or(
+            BuildError::ArithmeticOverflow {
+                computation: "folded root classifier atom ordinal",
+            },
+        )?;
+        for _ in 0..selected {
+            buckets &= buckets.wrapping_sub(1);
+        }
+        Ok(1_u8 << buckets.trailing_zeros())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RootClassifierVolume {
+    numerator: u64,
+    dimensions: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RootClassifierConfig {
+    columns: usize,
+    guard: Option<RootGuardCandidate>,
+    volume: RootClassifierVolume,
+}
+
 fn root_prefilter_classifier(
     dispatch: SimdDispatchContext,
+    patterns: &[FoldedLiteral<'_>],
+    primary: PrefilterColumn,
+    guard: Option<RootGuardCandidate>,
+    fingerprint_admitted: bool,
+) -> Result<(ByteBucketClassifier, Option<RootGuardCandidate>, usize), BuildError> {
+    let (single_column, members) = root_prefilter_one_column_tables(
+        primary.byte_set,
+        primary.high_nibbles,
+    )?;
+    let base_work = ROOT_PREFILTER_CLASSIFIER_HIGH_WORK
+        .checked_add(members)
+        .and_then(|work| work.checked_add(ROOT_PREFILTER_CLASSIFIER_SELECTION_WORK))
+        .ok_or(BuildError::ArithmeticOverflow {
+            computation: "folded root prefilter classifier work",
+        })?;
+    let mut fingerprint_work = 0_usize;
+    let (tables, guard) = if fingerprint_admitted {
+        correlated_root_prefilter_tables(
+            patterns,
+            primary,
+            guard,
+            &mut fingerprint_work,
+        )?
+        .map_or((single_column, guard), |(tables, guard)| (tables, guard))
+    } else {
+        (single_column, guard)
+    };
+    let work = base_work
+        .checked_add(fingerprint_work)
+        .ok_or(BuildError::ArithmeticOverflow {
+            computation: "folded correlated root classifier work",
+        })?;
+    let classifier = dispatch
+        .byte_bucket_classifier(tables, DispatchPolicy::Auto)
+        .expect("automatic byte-bucket dispatch retains a scalar fallback");
+    Ok((classifier, guard, work))
+}
+
+fn root_prefilter_one_column_tables(
     set: [u64; ROOT_PREFILTER_BYTE_WORDS],
     high_nibbles: u16,
-) -> Result<(ByteBucketClassifier, usize), BuildError> {
+) -> Result<(ByteBucketTables, usize), BuildError> {
     let mut low = [[0_u8; 16]; BYTE_BUCKET_MAX_COLUMNS];
     let mut high = [[0_u8; 16]; BYTE_BUCKET_MAX_COLUMNS];
     let mut high_buckets = [0_u8; 16];
@@ -2643,16 +3020,585 @@ fn root_prefilter_classifier(
     let tables = ByteBucketTables::new(1, low, high).map_err(|_| BuildError::Invariant {
         detail: "folded root prefilter retained invalid classifier tables",
     })?;
-    let work = ROOT_PREFILTER_CLASSIFIER_HIGH_WORK
-        .checked_add(members)
-        .and_then(|work| work.checked_add(ROOT_PREFILTER_CLASSIFIER_SELECTION_WORK))
-        .ok_or(BuildError::ArithmeticOverflow {
-            computation: "folded root prefilter classifier work",
+    Ok((tables, members))
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "fixed bucket allocation and bounded correlated-column materialization share one source-derived transaction"
+)]
+fn correlated_root_prefilter_tables(
+    patterns: &[FoldedLiteral<'_>],
+    primary: PrefilterColumn,
+    guard: Option<RootGuardCandidate>,
+    work: &mut usize,
+) -> Result<Option<(ByteBucketTables, Option<RootGuardCandidate>)>, BuildError> {
+    #[cfg(test)]
+    build_probe::record_fingerprint_attempt();
+    let layout = root_classifier_bucket_layout(patterns, primary, work)?;
+    let mut low = [[0_u8; 16]; BYTE_BUCKET_MAX_COLUMNS];
+    let mut high = [[0_u8; 16]; BYTE_BUCKET_MAX_COLUMNS];
+    let mut ordinals = [0_usize; 16];
+    for pattern in patterns {
+        let class = pattern
+            .classes
+            .get(primary.scalar_index)
+            .ok_or(BuildError::Invariant {
+                detail: "folded root classifier primary position disappeared",
+            })?;
+        for &scalar in class.equivalents {
+            *work = checked_build_add(
+                *work,
+                ROOT_PREFILTER_EDGE_WORK,
+                "folded root classifier primary table work",
+            )?;
+            let mut encoded = [0_u8; MAX_UTF8_WIDTH];
+            let bytes = scalar.encode_utf8(&mut encoded).as_bytes();
+            let byte = *bytes
+                .get(usize::from(primary.local_offset))
+                .ok_or(BuildError::Invariant {
+                    detail: "folded root classifier primary byte disappeared",
+                })?;
+            let bucket = layout.next_bucket(byte, &mut ordinals)?;
+            classifier_table_insert(&mut low[0], &mut high[0], byte, bucket);
+        }
+    }
+
+    let mut max_columns = 1_usize;
+    for distance in 1..BYTE_BUCKET_MAX_COLUMNS {
+        *work = checked_build_add(
+            *work,
+            ROOT_PREFILTER_OFFSET_WORK,
+            "folded correlated root offset work",
+        )?;
+        let mut column_ordinals = [0_usize; 16];
+        let mut necessary = true;
+        for pattern in patterns {
+            if !collect_bucketed_successor_column(
+                *pattern,
+                primary,
+                distance,
+                layout,
+                &mut column_ordinals,
+                &mut low[distance],
+                &mut high[distance],
+                work,
+            )? {
+                necessary = false;
+                break;
+            }
+        }
+        if !necessary {
+            break;
+        }
+        max_columns = distance.checked_add(1).ok_or(BuildError::ArithmeticOverflow {
+            computation: "folded correlated root column count",
         })?;
-    let classifier = dispatch
-        .byte_bucket_classifier(tables, DispatchPolicy::Auto)
-        .expect("automatic byte-bucket dispatch retains a scalar fallback");
-    Ok((classifier, work))
+    }
+    if max_columns == 1 {
+        return Ok(None);
+    }
+    *work = checked_build_add(
+        *work,
+        ROOT_PREFILTER_FINGERPRINT_SCORE_WORK,
+        "folded root fingerprint score work",
+    )?;
+    let baseline = root_classifier_baseline_volume(primary, guard)?;
+    let mut selected = None::<RootClassifierConfig>;
+    for columns in 2..=max_columns {
+        let without_guard = root_classifier_volume(low, high, columns, primary, None)?;
+        let candidate = if let Some(guard) = guard {
+            let with_guard = root_classifier_volume(low, high, columns, primary, Some(guard))?;
+            if volume_gain_at_least(
+                with_guard,
+                without_guard,
+                ROOT_PREFILTER_FINGERPRINT_GAIN,
+            )? {
+                RootClassifierConfig {
+                    columns,
+                    guard: Some(guard),
+                    volume: with_guard,
+                }
+            } else {
+                RootClassifierConfig {
+                    columns,
+                    guard: None,
+                    volume: without_guard,
+                }
+            }
+        } else {
+            RootClassifierConfig {
+                columns,
+                guard: None,
+                volume: without_guard,
+            }
+        };
+        // A primary behind an unchecked prefix gives the verifier an earlier,
+        // cheaper rejection point. One forward byte cannot amortize a second
+        // block classification, so leave that C2 shape on the established
+        // one-column route. Wider fingerprints must additionally prove that
+        // bucket identity rejects at least one tuple beyond the same columns
+        // treated as independent unions. The direct `(columns + 1)` density
+        // test below remains the runtime break-even gate.
+        if primary.offset != 0 {
+            if columns == 2 {
+                continue;
+            }
+            let independent = root_classifier_independent_volume(
+                low,
+                high,
+                columns,
+                primary,
+                candidate.guard,
+            )?;
+            if !volume_density_is_strictly_lower(candidate.volume, independent)? {
+                continue;
+            }
+        }
+        let direct_gain = u64::try_from(columns.checked_add(1).ok_or(
+            BuildError::ArithmeticOverflow {
+                computation: "folded root fingerprint runtime passes",
+            },
+        )?)
+        .map_err(|_| BuildError::ArithmeticOverflow {
+            computation: "folded root fingerprint runtime gain",
+        })?;
+        if !volume_gain_at_least(candidate.volume, baseline, direct_gain)? {
+            continue;
+        }
+        let replaces = if let Some(incumbent) = selected {
+            volume_gain_at_least(
+                candidate.volume,
+                incumbent.volume,
+                ROOT_PREFILTER_FINGERPRINT_GAIN,
+            )?
+        } else {
+            true
+        };
+        if replaces {
+            selected = Some(candidate);
+        }
+    }
+    let Some(selected) = selected else {
+        return Ok(None);
+    };
+    let tables = ByteBucketTables::new(selected.columns, low, high).map_err(|_| {
+        BuildError::Invariant {
+            detail: "folded root fingerprint retained invalid classifier tables",
+        }
+    })?;
+    Ok(Some((tables, selected.guard)))
+}
+
+fn root_classifier_bucket_layout(
+    patterns: &[FoldedLiteral<'_>],
+    primary: PrefilterColumn,
+    work: &mut usize,
+) -> Result<RootClassifierBucketLayout, BuildError> {
+    let mut atom_counts = [0_usize; 16];
+    for pattern in patterns {
+        let class = pattern
+            .classes
+            .get(primary.scalar_index)
+            .ok_or(BuildError::Invariant {
+                detail: "folded root classifier bucket position disappeared",
+            })?;
+        for &scalar in class.equivalents {
+            *work = checked_build_add(
+                *work,
+                ROOT_PREFILTER_EDGE_WORK,
+                "folded root classifier bucket atom work",
+            )?;
+            let mut encoded = [0_u8; MAX_UTF8_WIDTH];
+            let bytes = scalar.encode_utf8(&mut encoded).as_bytes();
+            let byte = *bytes
+                .get(usize::from(primary.local_offset))
+                .ok_or(BuildError::Invariant {
+                    detail: "folded root classifier bucket byte disappeared",
+                })?;
+            let high_nibble = usize::from(byte >> 4);
+            atom_counts[high_nibble] = atom_counts[high_nibble].checked_add(1).ok_or(
+                BuildError::ArithmeticOverflow {
+                    computation: "folded root classifier bucket atoms",
+                },
+            )?;
+        }
+    }
+    *work = checked_build_add(
+        *work,
+        ROOT_PREFILTER_FINGERPRINT_LAYOUT_WORK,
+        "folded root fingerprint layout work",
+    )?;
+    let mut bucket_counts = [0_u8; 16];
+    let mut assigned = 0_usize;
+    for (high_nibble, &atoms) in atom_counts.iter().enumerate() {
+        if atoms != 0 {
+            bucket_counts[high_nibble] = 1;
+            assigned = assigned.checked_add(1).ok_or(BuildError::ArithmeticOverflow {
+                computation: "folded root classifier assigned buckets",
+            })?;
+        }
+    }
+    if assigned == 0 || assigned > ROOT_PREFILTER_BUCKETS {
+        return Err(BuildError::Invariant {
+            detail: "folded root classifier bucket layout escaped its fixed capacity",
+        });
+    }
+    while assigned < ROOT_PREFILTER_BUCKETS {
+        let mut best = None::<(usize, usize)>;
+        for high_nibble in 0..16 {
+            let slots = usize::from(bucket_counts[high_nibble]);
+            if slots == 0 || slots >= atom_counts[high_nibble] {
+                continue;
+            }
+            let pressure = atom_counts[high_nibble]
+                .checked_add(slots.saturating_sub(1))
+                .and_then(|atoms| atoms.checked_div(slots))
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "folded root classifier bucket pressure",
+                })?;
+            if best.is_none_or(|(best_pressure, _)| pressure > best_pressure) {
+                best = Some((pressure, high_nibble));
+            }
+        }
+        let Some((_, high_nibble)) = best else {
+            break;
+        };
+        bucket_counts[high_nibble] = bucket_counts[high_nibble].checked_add(1).ok_or(
+            BuildError::ArithmeticOverflow {
+                computation: "folded root classifier high-nibble buckets",
+            },
+        )?;
+        assigned = assigned.checked_add(1).ok_or(BuildError::ArithmeticOverflow {
+            computation: "folded root classifier assigned buckets",
+        })?;
+    }
+    let mut high_bucket_masks = [0_u8; 16];
+    let mut next_bucket = 0_u32;
+    for high_nibble in 0..16 {
+        for _ in 0..bucket_counts[high_nibble] {
+            let bucket = 1_u8.checked_shl(next_bucket).ok_or(BuildError::Invariant {
+                detail: "folded root classifier bucket assignment overflowed",
+            })?;
+            high_bucket_masks[high_nibble] |= bucket;
+            next_bucket = next_bucket.checked_add(1).ok_or(
+                BuildError::ArithmeticOverflow {
+                    computation: "folded root classifier next bucket",
+                },
+            )?;
+        }
+    }
+    Ok(RootClassifierBucketLayout { high_bucket_masks })
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the bounded UTF-8 frontier keeps its source position, bucket identity and fixed output tables explicit"
+)]
+fn collect_bucketed_successor_column(
+    pattern: FoldedLiteral<'_>,
+    primary: PrefilterColumn,
+    distance: usize,
+    layout: RootClassifierBucketLayout,
+    ordinals: &mut [usize; 16],
+    low: &mut [u8; 16],
+    high: &mut [u8; 16],
+    work: &mut usize,
+) -> Result<bool, BuildError> {
+    let primary_class = pattern
+        .classes
+        .get(primary.scalar_index)
+        .ok_or(BuildError::Invariant {
+            detail: "folded root fingerprint primary position disappeared",
+        })?;
+    let target_offset = usize::from(primary.local_offset)
+        .checked_add(distance)
+        .ok_or(BuildError::ArithmeticOverflow {
+            computation: "folded root fingerprint target offset",
+        })?;
+    let mut frontier = [0_u8; MAX_UTF8_WIDTH];
+    for &scalar in primary_class.equivalents {
+        *work = checked_build_add(
+            *work,
+            ROOT_PREFILTER_EDGE_WORK,
+            "folded root fingerprint primary edge work",
+        )?;
+        let mut encoded = [0_u8; MAX_UTF8_WIDTH];
+        let bytes = scalar.encode_utf8(&mut encoded).as_bytes();
+        let primary_byte = *bytes
+            .get(usize::from(primary.local_offset))
+            .ok_or(BuildError::Invariant {
+                detail: "folded root fingerprint primary byte disappeared",
+            })?;
+        let bucket = layout.next_bucket(primary_byte, ordinals)?;
+        if let Some(&byte) = bytes.get(target_offset) {
+            classifier_table_insert(low, high, byte, bucket);
+            continue;
+        }
+        let remaining = target_offset.checked_sub(bytes.len()).ok_or(
+            BuildError::Invariant {
+                detail: "folded root fingerprint target moved before its scalar",
+            },
+        )?;
+        let entry = frontier.get_mut(remaining).ok_or(BuildError::Invariant {
+            detail: "folded root fingerprint frontier escaped its fixed width",
+        })?;
+        *entry |= bucket;
+    }
+
+    let mut scalar_index = primary
+        .scalar_index
+        .checked_add(1)
+        .ok_or(BuildError::ArithmeticOverflow {
+            computation: "folded root fingerprint scalar index",
+        })?;
+    while frontier.iter().any(|&buckets| buckets != 0) {
+        let Some(class) = pattern.classes.get(scalar_index) else {
+            return Ok(false);
+        };
+        let mut next_frontier = [0_u8; MAX_UTF8_WIDTH];
+        for (remaining, &buckets) in frontier.iter().enumerate() {
+            if buckets == 0 {
+                continue;
+            }
+            for &scalar in class.equivalents {
+                *work = checked_build_add(
+                    *work,
+                    ROOT_PREFILTER_EDGE_WORK,
+                    "folded root fingerprint frontier edge work",
+                )?;
+                let mut encoded = [0_u8; MAX_UTF8_WIDTH];
+                let bytes = scalar.encode_utf8(&mut encoded).as_bytes();
+                if let Some(&byte) = bytes.get(remaining) {
+                    classifier_table_insert(low, high, byte, buckets);
+                    continue;
+                }
+                let next = remaining.checked_sub(bytes.len()).ok_or(
+                    BuildError::Invariant {
+                        detail: "folded root fingerprint frontier moved backwards",
+                    },
+                )?;
+                let entry = next_frontier.get_mut(next).ok_or(BuildError::Invariant {
+                    detail: "folded root fingerprint next frontier escaped its fixed width",
+                })?;
+                *entry |= buckets;
+            }
+        }
+        frontier = next_frontier;
+        scalar_index = scalar_index.checked_add(1).ok_or(
+            BuildError::ArithmeticOverflow {
+                computation: "folded root fingerprint following scalar index",
+            },
+        )?;
+    }
+    Ok(true)
+}
+
+fn classifier_table_insert(
+    low: &mut [u8; 16],
+    high: &mut [u8; 16],
+    byte: u8,
+    buckets: u8,
+) {
+    low[usize::from(byte & 0x0F)] |= buckets;
+    high[usize::from(byte >> 4)] |= buckets;
+}
+
+fn root_classifier_baseline_volume(
+    primary: PrefilterColumn,
+    guard: Option<RootGuardCandidate>,
+) -> Result<RootClassifierVolume, BuildError> {
+    let primary_members = u64::from(primary.needle_count);
+    let Some(guard) = guard else {
+        return Ok(RootClassifierVolume {
+            numerator: primary_members,
+            dimensions: 1,
+        });
+    };
+    if guard.offset == primary.offset {
+        let intersection = byte_set_members(primary.byte_set)
+            .filter(|&byte| byte_set_contains(guard.byte_set, byte))
+            .count();
+        return Ok(RootClassifierVolume {
+            numerator: u64::try_from(intersection).map_err(|_| BuildError::ArithmeticOverflow {
+                computation: "folded root classifier baseline intersection",
+            })?,
+            dimensions: 1,
+        });
+    }
+    let numerator = primary_members
+        .checked_mul(u64::from(guard.needle_count))
+        .ok_or(BuildError::ArithmeticOverflow {
+            computation: "folded root classifier baseline volume",
+        })?;
+    Ok(RootClassifierVolume {
+        numerator,
+        dimensions: 2,
+    })
+}
+
+fn root_classifier_volume(
+    low: [[u8; 16]; BYTE_BUCKET_MAX_COLUMNS],
+    high: [[u8; 16]; BYTE_BUCKET_MAX_COLUMNS],
+    columns: usize,
+    primary: PrefilterColumn,
+    guard: Option<RootGuardCandidate>,
+) -> Result<RootClassifierVolume, BuildError> {
+    let guard_column = guard.and_then(|guard| {
+        usize::from(guard.offset)
+            .checked_sub(usize::from(primary.offset))
+            .filter(|&column| column < columns)
+    });
+    let mut numerator = 0_u64;
+    for bucket in 0..ROOT_PREFILTER_BUCKETS {
+        let bucket = 1_u8 << bucket;
+        let mut bucket_volume = 1_u64;
+        for column in 0..columns {
+            let mut members = 0_u64;
+            for byte in u8::MIN..=u8::MAX {
+                let admitted = low[column][usize::from(byte & 0x0F)]
+                    & high[column][usize::from(byte >> 4)]
+                    & bucket
+                    != 0;
+                let guard_admitted = guard_column != Some(column)
+                    || guard.is_some_and(|guard| byte_set_contains(guard.byte_set, byte));
+                members = members
+                    .checked_add(if admitted && guard_admitted { 1 } else { 0 })
+                    .ok_or(BuildError::ArithmeticOverflow {
+                        computation: "folded root classifier column volume",
+                    })?;
+            }
+            bucket_volume = bucket_volume.checked_mul(members).ok_or(
+                BuildError::ArithmeticOverflow {
+                    computation: "folded root classifier bucket volume",
+                },
+            )?;
+        }
+        numerator = numerator.checked_add(bucket_volume).ok_or(
+            BuildError::ArithmeticOverflow {
+                computation: "folded root classifier tuple volume",
+            },
+        )?;
+    }
+    let mut dimensions = columns;
+    if let Some(guard) = guard
+        && guard_column.is_none()
+    {
+        numerator = numerator
+            .checked_mul(u64::from(guard.needle_count))
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "folded root classifier outside-guard volume",
+            })?;
+        dimensions = dimensions.checked_add(1).ok_or(BuildError::ArithmeticOverflow {
+            computation: "folded root classifier volume dimensions",
+        })?;
+    }
+    Ok(RootClassifierVolume {
+        numerator,
+        dimensions,
+    })
+}
+
+fn root_classifier_independent_volume(
+    low: [[u8; 16]; BYTE_BUCKET_MAX_COLUMNS],
+    high: [[u8; 16]; BYTE_BUCKET_MAX_COLUMNS],
+    columns: usize,
+    primary: PrefilterColumn,
+    guard: Option<RootGuardCandidate>,
+) -> Result<RootClassifierVolume, BuildError> {
+    let guard_column = guard.and_then(|guard| {
+        usize::from(guard.offset)
+            .checked_sub(usize::from(primary.offset))
+            .filter(|&column| column < columns)
+    });
+    let mut numerator = 1_u64;
+    for column in 0..columns {
+        let mut members = 0_u64;
+        for byte in u8::MIN..=u8::MAX {
+            let admitted = low[column][usize::from(byte & 0x0F)]
+                & high[column][usize::from(byte >> 4)]
+                != 0;
+            let guard_admitted = guard_column != Some(column)
+                || guard.is_some_and(|guard| byte_set_contains(guard.byte_set, byte));
+            members = members
+                .checked_add(if admitted && guard_admitted { 1 } else { 0 })
+                .ok_or(BuildError::ArithmeticOverflow {
+                    computation: "folded independent classifier column volume",
+                })?;
+        }
+        numerator = numerator
+            .checked_mul(members)
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "folded independent classifier tuple volume",
+            })?;
+    }
+    let mut dimensions = columns;
+    if let Some(guard) = guard
+        && guard_column.is_none()
+    {
+        numerator = numerator
+            .checked_mul(u64::from(guard.needle_count))
+            .ok_or(BuildError::ArithmeticOverflow {
+                computation: "folded independent classifier outside-guard volume",
+            })?;
+        dimensions = dimensions.checked_add(1).ok_or(BuildError::ArithmeticOverflow {
+            computation: "folded independent classifier volume dimensions",
+        })?;
+    }
+    Ok(RootClassifierVolume {
+        numerator,
+        dimensions,
+    })
+}
+
+fn volume_density_is_strictly_lower(
+    candidate: RootClassifierVolume,
+    baseline: RootClassifierVolume,
+) -> Result<bool, BuildError> {
+    let candidate_scaled = scale_classifier_volume(
+        u128::from(candidate.numerator),
+        baseline.dimensions,
+    )
+    .ok_or(BuildError::ArithmeticOverflow {
+        computation: "folded root classifier strict candidate density",
+    })?;
+    let baseline_scaled = scale_classifier_volume(
+        u128::from(baseline.numerator),
+        candidate.dimensions,
+    )
+    .ok_or(BuildError::ArithmeticOverflow {
+        computation: "folded root classifier strict baseline density",
+    })?;
+    Ok(candidate_scaled < baseline_scaled)
+}
+
+fn volume_gain_at_least(
+    candidate: RootClassifierVolume,
+    baseline: RootClassifierVolume,
+    gain: u64,
+) -> Result<bool, BuildError> {
+    let candidate_scaled = u128::from(candidate.numerator)
+        .checked_mul(u128::from(gain))
+        .and_then(|volume| scale_classifier_volume(volume, baseline.dimensions))
+        .ok_or(BuildError::ArithmeticOverflow {
+            computation: "folded root classifier candidate density",
+        })?;
+    let baseline_scaled = scale_classifier_volume(
+        u128::from(baseline.numerator),
+        candidate.dimensions,
+    )
+    .ok_or(BuildError::ArithmeticOverflow {
+        computation: "folded root classifier baseline density",
+    })?;
+    Ok(candidate_scaled <= baseline_scaled)
+}
+
+fn scale_classifier_volume(mut volume: u128, dimensions: usize) -> Option<u128> {
+    let byte_values = u128::try_from(ROOT_PREFILTER_BYTE_VALUES).ok()?;
+    for _ in 0..dimensions {
+        volume = volume.checked_mul(byte_values)?;
+    }
+    Some(volume)
 }
 
 #[allow(
@@ -2990,6 +3936,75 @@ fn preflight_root_prefilter_work_upper_bound(
         .ok_or(BuildError::ArithmeticOverflow {
             computation: "folded root prefilter upper work",
         })
+}
+
+fn root_prefilter_fingerprint_work_upper_bound(
+    equivalent_scalars: usize,
+) -> Result<usize, BuildError> {
+    // Two complete primary-atom passes build the bucket layout and column
+    // zero. At each of three successor distances, one primary pass plus at
+    // most four merged remaining-offset frontiers can visit every equivalent
+    // scalar. Bucket identities are bitsets on those four frontier slots, so
+    // this bound does not multiply by the number of root alternatives.
+    let successor_passes = BYTE_BUCKET_MAX_COLUMNS
+        .saturating_sub(1)
+        .checked_mul(MAX_UTF8_WIDTH.saturating_add(1))
+        .ok_or(BuildError::ArithmeticOverflow {
+            computation: "folded root fingerprint successor passes",
+        })?;
+    let edge_passes = successor_passes.checked_add(2).ok_or(
+        BuildError::ArithmeticOverflow {
+            computation: "folded root fingerprint edge passes",
+        },
+    )?;
+    let edge_work = equivalent_scalars
+        .checked_mul(edge_passes)
+        .and_then(|work| work.checked_mul(ROOT_PREFILTER_EDGE_WORK))
+        .ok_or(BuildError::ArithmeticOverflow {
+            computation: "folded root fingerprint edge work",
+        })?;
+    let offset_work = BYTE_BUCKET_MAX_COLUMNS
+        .saturating_sub(1)
+        .checked_mul(ROOT_PREFILTER_OFFSET_WORK)
+        .ok_or(BuildError::ArithmeticOverflow {
+            computation: "folded root fingerprint offset work",
+        })?;
+    edge_work
+        .checked_add(offset_work)
+        .and_then(|work| work.checked_add(ROOT_PREFILTER_FINGERPRINT_LAYOUT_WORK))
+        .and_then(|work| work.checked_add(ROOT_PREFILTER_FINGERPRINT_SCORE_WORK))
+        .ok_or(BuildError::ArithmeticOverflow {
+            computation: "folded root fingerprint upper work",
+        })
+}
+
+fn admit_root_prefilter_fingerprint(
+    accounting: &mut BuildAccounting,
+    max_work: usize,
+) -> Result<bool, BuildError> {
+    let fingerprint_work =
+        root_prefilter_fingerprint_work_upper_bound(accounting.equivalent_scalars)?;
+    if fingerprint_work > ROOT_PREFILTER_FINGERPRINT_MAX_WORK {
+        return Ok(false);
+    }
+    let mut fingerprint = *accounting;
+    fingerprint.root_prefilter_work_upper_bound = fingerprint
+        .root_prefilter_work_upper_bound
+        .checked_add(fingerprint_work)
+        .ok_or(BuildError::ArithmeticOverflow {
+            computation: "folded root fingerprint prefilter upper work",
+        })?;
+    fingerprint.work_upper_bound = fingerprint
+        .work_upper_bound
+        .checked_add(fingerprint_work)
+        .ok_or(BuildError::ArithmeticOverflow {
+            computation: "folded root fingerprint construction work",
+        })?;
+    if fingerprint.work_upper_bound > max_work {
+        return Ok(false);
+    }
+    *accounting = fingerprint;
+    Ok(true)
 }
 
 fn root_prefilter_successor_work_upper_bound(
@@ -3543,6 +4558,7 @@ mod build_probe {
         static SCALAR_READS: Cell<usize> = const { Cell::new(0) };
         static ALLOCATION_ATTEMPTS: Cell<usize> = const { Cell::new(0) };
         static SUCCESSOR_ATTEMPTS: Cell<usize> = const { Cell::new(0) };
+        static FINGERPRINT_ATTEMPTS: Cell<usize> = const { Cell::new(0) };
     }
 
     pub(super) fn record_scalar_reads(reads: usize) {
@@ -3572,10 +4588,20 @@ mod build_probe {
         );
     }
 
+    pub(super) fn record_fingerprint_attempt() {
+        FINGERPRINT_ATTEMPTS.set(
+            FINGERPRINT_ATTEMPTS
+                .get()
+                .checked_add(1)
+                .expect("folded fingerprint probe overflow"),
+        );
+    }
+
     pub(super) fn reset() {
         SCALAR_READS.set(0);
         ALLOCATION_ATTEMPTS.set(0);
         SUCCESSOR_ATTEMPTS.set(0);
+        FINGERPRINT_ATTEMPTS.set(0);
     }
 
     pub(super) fn scalar_reads() -> usize {
@@ -3588,6 +4614,10 @@ mod build_probe {
 
     pub(super) fn successor_attempts() -> usize {
         SUCCESSOR_ATTEMPTS.get()
+    }
+
+    pub(super) fn fingerprint_attempts() -> usize {
+        FINGERPRINT_ATTEMPTS.get()
     }
 }
 
@@ -3725,12 +4755,18 @@ mod tests {
         FoldedLiteral, FoldedLiteralTriePlan, FoldedScalarClass, PrefilterColumn,
         RootCandidateOutcome, RootGuardCandidate, ScanActual, ScanError, ScanLimits, ScanResource,
         ScanStop, ScanUpperBounds, build_probe, byte_set_insert,
-        byte_set_members, collect_union_successor_bytes, derive_union_successor_guard,
-        execute_folded_scan_impl, scan_source_probe, successor_guard_is_better,
-        union_successor_guard_candidate,
+        byte_set_members, classifier_table_insert, collect_union_successor_bytes,
+        correlated_root_prefilter_tables, derive_union_successor_guard,
+        execute_folded_scan_impl, root_classifier_independent_volume, root_classifier_volume,
+        root_prefilter_fingerprint_work_upper_bound, scan_source_probe, successor_guard_is_better,
+        union_successor_guard_candidate, volume_density_is_strictly_lower, volume_gain_at_least,
+        RootClassifierVolume,
     };
     use crate::{LiteralCandidate, Window};
-    use fre_simd_kernels::{ByteBucketClassifier, DispatchPolicy, SimdDispatchContext};
+    use fre_simd_kernels::{
+        BYTE_BUCKET_BLOCK_BYTES, BYTE_BUCKET_MAX_COLUMNS, ByteBucketClassifier, ByteBucketTables,
+        DispatchPolicy, SimdDispatchContext,
+    };
 
     const KELVIN: [char; 3] = ['K', 'k', '\u{212A}'];
     const SIGMA: [char; 3] = ['Σ', 'ς', 'σ'];
@@ -3808,6 +4844,150 @@ mod tests {
             structural_leads: usize::from(matches!(byte, 0xC2..=0xF4)),
             frequency_score: u64::from(super::byte_frequency_rank(byte)).saturating_add(1),
         }
+    }
+
+    fn synthetic_wide_primary(bytes: &[u8]) -> PrefilterColumn {
+        let mut byte_set = [0_u64; 4];
+        let mut high_nibbles = 0_u16;
+        let mut frequency_score = 0_u64;
+        for &byte in bytes {
+            byte_set_insert(&mut byte_set, byte);
+            high_nibbles |= 1_u16 << (byte >> 4);
+            frequency_score = frequency_score
+                .checked_add(u64::from(super::byte_frequency_rank(byte)).saturating_add(1))
+                .unwrap();
+        }
+        PrefilterColumn {
+            needles: [0; 3],
+            needle_count: u16::try_from(bytes.len()).unwrap(),
+            byte_set,
+            high_nibbles,
+            offset: 0,
+            scalar_index: 0,
+            local_offset: 0,
+            structural_leads: bytes
+                .iter()
+                .filter(|&&byte| matches!(byte, 0xC2..=0xF4))
+                .count(),
+            frequency_score,
+        }
+    }
+
+    fn correlated_ascii_plan() -> FoldedLiteralTriePlan {
+        const ROOT_1: [char; 1] = ['\u{1}'];
+        const ROOT_2: [char; 1] = ['\u{2}'];
+        const ROOT_3: [char; 1] = ['\u{3}'];
+        const ROOT_4: [char; 1] = ['\u{4}'];
+        const A_D: [char; 4] = ['a', 'b', 'c', 'd'];
+        const E_H: [char; 4] = ['e', 'f', 'g', 'h'];
+        const I_L: [char; 4] = ['i', 'j', 'k', 'l'];
+        const M_P: [char; 4] = ['m', 'n', 'o', 'p'];
+        let first = [
+            FoldedScalarClass::new(&ROOT_1),
+            FoldedScalarClass::new(&A_D),
+        ];
+        let second = [
+            FoldedScalarClass::new(&ROOT_2),
+            FoldedScalarClass::new(&E_H),
+        ];
+        let third = [
+            FoldedScalarClass::new(&ROOT_3),
+            FoldedScalarClass::new(&I_L),
+        ];
+        let fourth = [
+            FoldedScalarClass::new(&ROOT_4),
+            FoldedScalarClass::new(&M_P),
+        ];
+        admitted(&[
+            FoldedLiteral::new(&first),
+            FoldedLiteral::new(&second),
+            FoldedLiteral::new(&third),
+            FoldedLiteral::new(&fourth),
+        ])
+    }
+
+    fn correlated_variable_width_plan(
+        columns: usize,
+    ) -> (FoldedLiteralTriePlan, [Vec<u8>; 4]) {
+        const ROOT_1: [char; 1] = ['\u{442}'];
+        const ROOT_2: [char; 1] = ['\u{7ff}'];
+        const ROOT_3: [char; 1] = ['\u{800}'];
+        const ROOT_4: [char; 1] = ['\u{1000}'];
+        const TAIL_1: [[char; 1]; 3] = [['a'], ['b'], ['c']];
+        const TAIL_2: [[char; 1]; 3] = [['e'], ['f'], ['g']];
+        const TAIL_3: [[char; 1]; 3] = [['i'], ['j'], ['k']];
+        const TAIL_4: [[char; 1]; 3] = [['m'], ['n'], ['o']];
+
+        assert!((2..=BYTE_BUCKET_MAX_COLUMNS).contains(&columns));
+        let tails = columns - 1;
+        let make_classes = |root: &'static [char], suffixes: &'static [[char; 1]; 3]| {
+            core::iter::once(FoldedScalarClass::new(root))
+                .chain(
+                    suffixes[..tails]
+                        .iter()
+                        .map(|class| FoldedScalarClass::new(class)),
+                )
+                .collect::<Vec<_>>()
+        };
+        let first = make_classes(&ROOT_1, &TAIL_1);
+        let second = make_classes(&ROOT_2, &TAIL_2);
+        let third = make_classes(&ROOT_3, &TAIL_3);
+        let fourth = make_classes(&ROOT_4, &TAIL_4);
+        let patterns = [
+            FoldedLiteral::new(&first),
+            FoldedLiteral::new(&second),
+            FoldedLiteral::new(&third),
+            FoldedLiteral::new(&fourth),
+        ];
+        let exact = patterns.map(|pattern| {
+            pattern
+                .classes()
+                .iter()
+                .flat_map(|class| {
+                    let mut encoded = [0_u8; 4];
+                    class.equivalents()[0]
+                        .encode_utf8(&mut encoded)
+                        .as_bytes()
+                        .to_vec()
+                })
+                .collect::<Vec<_>>()
+        });
+        (admitted(&patterns), exact)
+    }
+
+    fn assert_prefilter_matches_scalar(
+        plan: &FoldedLiteralTriePlan,
+        haystack: &[u8],
+        window: Window,
+        stop: ScanStop,
+    ) {
+        let source = &haystack[window.start()..window.end()];
+        let upper = plan.scan_upper_bounds(source.len()).unwrap();
+        let mut scalar = Vec::new();
+        let scalar_actual = execute_folded_scan_impl(
+            plan,
+            source,
+            window.start(),
+            upper,
+            None,
+            stop,
+            &mut |candidate| scalar.push(candidate),
+        )
+        .unwrap();
+        let mut prefetched = Vec::new();
+        let prefetched_actual = execute_folded_scan_impl(
+            plan,
+            source,
+            window.start(),
+            upper,
+            plan.root_prefilter.as_ref(),
+            stop,
+            &mut |candidate| prefetched.push(candidate),
+        )
+        .unwrap();
+        assert_eq!(prefetched, scalar);
+        assert!(super::actual_within(scalar_actual, upper));
+        assert!(super::actual_within(prefetched_actual, upper));
     }
 
     fn union_successor_members(
@@ -3959,6 +5139,493 @@ mod tests {
     }
 
     #[test]
+    fn correlated_fingerprint_carries_buckets_across_variable_width_utf8_frontiers() {
+        const UPPER_K: [char; 1] = ['K'];
+        const LOWER_K: [char; 1] = ['k'];
+        const KELVIN_ONLY: [char; 1] = ['\u{212A}'];
+        const Q: [char; 1] = ['Q'];
+        const A: [char; 1] = ['a'];
+        const B: [char; 1] = ['b'];
+        const C: [char; 1] = ['c'];
+        const D: [char; 1] = ['d'];
+        const E: [char; 1] = ['e'];
+        const F: [char; 1] = ['f'];
+        const G: [char; 1] = ['g'];
+        const H: [char; 1] = ['h'];
+        const I: [char; 1] = ['i'];
+        const J: [char; 1] = ['j'];
+        const L: [char; 1] = ['l'];
+        const M: [char; 1] = ['m'];
+        const N: [char; 1] = ['n'];
+        const O: [char; 1] = ['o'];
+        const P: [char; 1] = ['p'];
+        let upper = [
+            FoldedScalarClass::new(&UPPER_K),
+            FoldedScalarClass::new(&A),
+            FoldedScalarClass::new(&B),
+            FoldedScalarClass::new(&C),
+            FoldedScalarClass::new(&D),
+        ];
+        let lower = [
+            FoldedScalarClass::new(&LOWER_K),
+            FoldedScalarClass::new(&E),
+            FoldedScalarClass::new(&F),
+            FoldedScalarClass::new(&G),
+            FoldedScalarClass::new(&H),
+        ];
+        let kelvin = [
+            FoldedScalarClass::new(&KELVIN_ONLY),
+            FoldedScalarClass::new(&I),
+            FoldedScalarClass::new(&J),
+            FoldedScalarClass::new(&L),
+            FoldedScalarClass::new(&P),
+        ];
+        let q = [
+            FoldedScalarClass::new(&Q),
+            FoldedScalarClass::new(&M),
+            FoldedScalarClass::new(&N),
+            FoldedScalarClass::new(&O),
+            FoldedScalarClass::new(&P),
+        ];
+        let patterns = [
+            FoldedLiteral::new(&upper),
+            FoldedLiteral::new(&lower),
+            FoldedLiteral::new(&kelvin),
+            FoldedLiteral::new(&q),
+        ];
+        let primary = synthetic_wide_primary(&[b'K', b'k', 0xE2, b'Q']);
+        let mut work = 0_usize;
+        let (tables, guard) = correlated_root_prefilter_tables(
+            &patterns,
+            primary,
+            None,
+            &mut work,
+        )
+        .unwrap()
+        .expect("four source-distinct prefixes justify a correlated fingerprint");
+        assert_eq!(tables.columns(), BYTE_BUCKET_MAX_COLUMNS);
+        assert_eq!(guard, None);
+        let classifier = ByteBucketClassifier::new(tables);
+        for prefix in [
+            b"Kabc".as_slice(),
+            b"kefg".as_slice(),
+            "\u{212A}i".as_bytes(),
+            b"Qmno".as_slice(),
+        ] {
+            assert_ne!(classifier.classify_prefix(prefix), Some(0));
+        }
+        assert_eq!(classifier.classify_prefix(b"Kebc"), Some(0));
+        let equivalent_scalars = patterns
+            .iter()
+            .flat_map(|pattern| pattern.classes())
+            .map(|class| class.equivalents().len())
+            .sum();
+        assert!(
+            work <= root_prefilter_fingerprint_work_upper_bound(equivalent_scalars).unwrap()
+        );
+    }
+
+    #[test]
+    fn correlated_volume_normalizes_dimensions_thresholds_and_guard_positions() {
+        let equal_one_column = RootClassifierVolume {
+            numerator: 1,
+            dimensions: 1,
+        };
+        let equal_two_columns = RootClassifierVolume {
+            numerator: 256,
+            dimensions: 2,
+        };
+        assert!(volume_gain_at_least(equal_one_column, equal_two_columns, 1).unwrap());
+        assert!(volume_gain_at_least(equal_two_columns, equal_one_column, 1).unwrap());
+        assert!(!volume_gain_at_least(equal_two_columns, equal_one_column, 2).unwrap());
+        assert!(!volume_density_is_strictly_lower(equal_one_column, equal_two_columns).unwrap());
+        assert!(!volume_density_is_strictly_lower(equal_two_columns, equal_one_column).unwrap());
+
+        let strict_but_less_than_twofold = RootClassifierVolume {
+            numerator: 3,
+            dimensions: 2,
+        };
+        let strict_baseline = RootClassifierVolume {
+            numerator: 4,
+            dimensions: 2,
+        };
+        assert!(
+            volume_density_is_strictly_lower(strict_but_less_than_twofold, strict_baseline)
+                .unwrap()
+        );
+        assert!(
+            !volume_gain_at_least(strict_but_less_than_twofold, strict_baseline, 2).unwrap()
+        );
+
+        let threshold_baseline = RootClassifierVolume {
+            numerator: 3,
+            dimensions: 1,
+        };
+        assert!(
+            volume_gain_at_least(equal_two_columns, threshold_baseline, 3).unwrap()
+        );
+        assert!(
+            !volume_gain_at_least(equal_two_columns, threshold_baseline, 4).unwrap()
+        );
+
+        let primary = synthetic_wide_primary(&[1, 2, 3, 4]);
+        let mut low = [[0_u8; 16]; BYTE_BUCKET_MAX_COLUMNS];
+        let mut high = [[0_u8; 16]; BYTE_BUCKET_MAX_COLUMNS];
+        for root in 1_u8..=4 {
+            classifier_table_insert(&mut low[0], &mut high[0], root, 1);
+        }
+        for suffix in [b'a', b'b'] {
+            classifier_table_insert(&mut low[1], &mut high[1], suffix, 1);
+        }
+        let without_guard = root_classifier_volume(low, high, 2, primary, None).unwrap();
+        assert_eq!(
+            without_guard,
+            RootClassifierVolume {
+                numerator: 8,
+                dimensions: 2,
+            }
+        );
+        let independent =
+            root_classifier_independent_volume(low, high, 2, primary, None).unwrap();
+        assert_eq!(independent, without_guard);
+        assert!(!volume_density_is_strictly_lower(without_guard, independent).unwrap());
+
+        let mut correlated_low = [[0_u8; 16]; BYTE_BUCKET_MAX_COLUMNS];
+        let mut correlated_high = [[0_u8; 16]; BYTE_BUCKET_MAX_COLUMNS];
+        for (bucket, root, suffix) in [
+            (1_u8, 1_u8, b'a'),
+            (2_u8, 2_u8, b'b'),
+            (4_u8, 3_u8, b'c'),
+            (8_u8, 4_u8, b'd'),
+        ] {
+            classifier_table_insert(
+                &mut correlated_low[0],
+                &mut correlated_high[0],
+                root,
+                bucket,
+            );
+            classifier_table_insert(
+                &mut correlated_low[1],
+                &mut correlated_high[1],
+                suffix,
+                bucket,
+            );
+        }
+        let correlated = root_classifier_volume(
+            correlated_low,
+            correlated_high,
+            2,
+            primary,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            correlated,
+            RootClassifierVolume {
+                numerator: 4,
+                dimensions: 2,
+            }
+        );
+        let independent = root_classifier_independent_volume(
+            correlated_low,
+            correlated_high,
+            2,
+            primary,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            independent,
+            RootClassifierVolume {
+                numerator: 16,
+                dimensions: 2,
+            }
+        );
+        assert!(volume_density_is_strictly_lower(correlated, independent).unwrap());
+
+        let mut same_byte_set = [0_u64; 4];
+        byte_set_insert(&mut same_byte_set, 1);
+        byte_set_insert(&mut same_byte_set, 2);
+        let same_column = RootGuardCandidate {
+            byte_set: same_byte_set,
+            needle_count: 2,
+            offset: 0,
+            structural_leads: 0,
+            frequency_score: 0,
+        };
+        let same_volume =
+            root_classifier_volume(low, high, 2, primary, Some(same_column)).unwrap();
+        assert_eq!(
+            same_volume,
+            RootClassifierVolume {
+                numerator: 4,
+                dimensions: 2,
+            }
+        );
+        assert!(volume_gain_at_least(same_volume, without_guard, 2).unwrap());
+
+        let outside_selective = RootGuardCandidate {
+            offset: 3,
+            ..same_column
+        };
+        let outside_volume =
+            root_classifier_volume(low, high, 2, primary, Some(outside_selective)).unwrap();
+        assert_eq!(
+            outside_volume,
+            RootClassifierVolume {
+                numerator: 16,
+                dimensions: 3,
+            }
+        );
+        assert!(volume_gain_at_least(outside_volume, without_guard, 2).unwrap());
+
+        let outside_unselective = RootGuardCandidate {
+            byte_set: [u64::MAX; 4],
+            needle_count: 256,
+            offset: 3,
+            structural_leads: 0,
+            frequency_score: 0,
+        };
+        let unselective_volume =
+            root_classifier_volume(low, high, 2, primary, Some(outside_unselective)).unwrap();
+        assert_eq!(
+            unselective_volume,
+            RootClassifierVolume {
+                numerator: 2_048,
+                dimensions: 3,
+            }
+        );
+        assert!(
+            !volume_gain_at_least(unselective_volume, without_guard, 2).unwrap()
+        );
+    }
+
+    #[test]
+    fn admitted_correlated_root_publishes_columns_and_screens_absent_blocks_once() {
+        build_probe::reset();
+        let plan = correlated_ascii_plan();
+        assert_eq!(plan.build.root_prefilter_offset, Some(0));
+        assert_eq!(plan.build.root_prefilter_needles, 4);
+        assert_eq!(plan.root_prefilter_classifier_columns(), 2);
+        assert_eq!(plan.build.root_prefilter_guard_needles, 0);
+        assert_eq!(build_probe::fingerprint_attempts(), 1);
+
+        let absent = vec![b'q'; 64];
+        let upper = plan.scan_upper_bounds(absent.len()).unwrap();
+        let mut absent_candidates = Vec::new();
+        let absent_actual = execute_folded_scan_impl(
+            &plan,
+            &absent,
+            0,
+            upper,
+            plan.root_prefilter.as_ref(),
+            ScanStop::Never,
+            &mut |candidate| absent_candidates.push(candidate),
+        )
+        .unwrap();
+        assert!(absent_candidates.is_empty());
+        assert_eq!(absent_actual.source_byte_reads, absent.len());
+        assert!(super::actual_within(absent_actual, upper));
+
+        let mut false_root = absent.clone();
+        false_root[0] = 1;
+        false_root[1] = b'z';
+        let upper = plan.scan_upper_bounds(false_root.len()).unwrap();
+        let mut false_candidates = Vec::new();
+        let false_actual = execute_folded_scan_impl(
+            &plan,
+            &false_root,
+            0,
+            upper,
+            plan.root_prefilter.as_ref(),
+            ScanStop::Never,
+            &mut |candidate| false_candidates.push(candidate),
+        )
+        .unwrap();
+        assert!(false_candidates.is_empty());
+        assert_eq!(
+            false_actual.source_byte_reads,
+            false_root.len() + 2 * super::BYTE_BUCKET_BLOCK_BYTES
+        );
+        assert!(super::actual_within(false_actual, upper));
+
+        let mut early = vec![b'q'; 64];
+        early[0] = 1;
+        early[1] = b'a';
+        let upper = plan.scan_upper_bounds(early.len()).unwrap();
+        let mut early_candidates = Vec::new();
+        let early_actual = execute_folded_scan_impl(
+            &plan,
+            &early,
+            0,
+            upper,
+            plan.root_prefilter.as_ref(),
+            ScanStop::AfterMatchingStart,
+            &mut |candidate| early_candidates.push(candidate),
+        )
+        .unwrap();
+        assert_eq!(early_candidates, [LiteralCandidate::new(0, 0, 2)]);
+        assert_eq!(
+            early_actual.source_byte_reads,
+            3 * super::BYTE_BUCKET_BLOCK_BYTES + 2
+        );
+        assert!(super::actual_within(early_actual, upper));
+
+        let mut valid = absent;
+        valid[0] = 1;
+        valid[1] = b'a';
+        let upper = plan
+            .root_candidate_single_pass_upper_bounds(valid.len(), 2)
+            .unwrap();
+        let found = plan
+            .find_root_candidate_precharged(&valid, Window::full(&valid), upper)
+            .unwrap();
+        assert_eq!(found.outcome, RootCandidateOutcome::Candidate { start: 0 });
+        assert_eq!(found.receipt.actual.source_byte_reads, 2);
+        assert!(super::actual_within(found.receipt.actual, upper));
+
+        let mut tail = vec![b'q'; 18];
+        tail[16] = 1;
+        tail[17] = b'a';
+        let upper = plan.scan_upper_bounds(tail.len()).unwrap();
+        let mut scalar = Vec::new();
+        execute_folded_scan_impl(
+            &plan,
+            &tail,
+            0,
+            upper,
+            None,
+            ScanStop::Never,
+            &mut |candidate| scalar.push(candidate),
+        )
+        .unwrap();
+        let mut prefetched = Vec::new();
+        let actual = execute_folded_scan_impl(
+            &plan,
+            &tail,
+            0,
+            upper,
+            plan.root_prefilter.as_ref(),
+            ScanStop::Never,
+            &mut |candidate| prefetched.push(candidate),
+        )
+        .unwrap();
+        assert_eq!(prefetched, scalar);
+        assert_eq!(prefetched, [LiteralCandidate::new(0, 16, 18)]);
+        assert!(super::actual_within(actual, upper));
+    }
+
+    #[test]
+    fn correlated_variable_width_nonzero_offset_matches_scalar_across_extents() {
+        for columns in 2..=BYTE_BUCKET_MAX_COLUMNS {
+            let (plan, exact) = correlated_variable_width_plan(columns);
+            assert_eq!(plan.build.root_prefilter_offset, Some(1));
+            assert_eq!(plan.build.root_prefilter_guard_needles, 0);
+            assert_eq!(
+                plan.root_prefilter_classifier_columns(),
+                if columns == 2 { 1 } else { columns },
+                "nonzero-offset correlation needs two forward bytes and bucket discrimination"
+            );
+            assert!(plan.root_prefilter_is_necessary_for(&exact));
+
+            for len in 0..=18 {
+                let mut source = vec![b'!'; len];
+                let pattern = &exact[len % exact.len()];
+                if pattern.len() <= source.len() {
+                    let start = source.len().saturating_sub(pattern.len()) / 2;
+                    source[start..start + pattern.len()].copy_from_slice(pattern);
+                }
+                let window = Window::full(&source);
+                assert_prefilter_matches_scalar(&plan, &source, window, ScanStop::Never);
+                assert_prefilter_matches_scalar(
+                    &plan,
+                    &source,
+                    window,
+                    ScanStop::AfterMatchingStart,
+                );
+            }
+
+            for residue in 0..BYTE_BUCKET_BLOCK_BYTES {
+                let inner_len = 2 * BYTE_BUCKET_BLOCK_BYTES + residue;
+                let window_start = 3;
+                let window_end = window_start + inner_len;
+                let mut framed = vec![b'#'; window_end + 5];
+                framed[window_start..window_end].fill(b'!');
+                let first = &exact[residue % exact.len()];
+                let second = &exact[(residue + 1) % exact.len()];
+                let boundary_start = window_start + BYTE_BUCKET_BLOCK_BYTES - 1;
+                framed[boundary_start..boundary_start + first.len()].copy_from_slice(first);
+                let tail_start = window_end - second.len();
+                framed[tail_start..window_end].copy_from_slice(second);
+                let window = Window::new(window_start, window_end);
+                assert_prefilter_matches_scalar(&plan, &framed, window, ScanStop::Never);
+                assert_prefilter_matches_scalar(
+                    &plan,
+                    &framed,
+                    window,
+                    ScanStop::AfterMatchingStart,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn attachment_authenticates_correlated_bucket_identity_extent_and_offset() {
+        let mut plan = correlated_ascii_plan();
+        let exact = [
+            (1_u8, b"abcd".as_slice()),
+            (2_u8, b"efgh".as_slice()),
+            (3_u8, b"ijkl".as_slice()),
+            (4_u8, b"mnop".as_slice()),
+        ]
+        .into_iter()
+        .flat_map(|(root, suffixes)| {
+            suffixes
+                .iter()
+                .map(move |&suffix| vec![root, suffix])
+        })
+        .collect::<Vec<_>>();
+        assert!(plan.root_prefilter_is_necessary_for(&exact));
+
+        let mut low = [[0_u8; 16]; BYTE_BUCKET_MAX_COLUMNS];
+        let mut high = [[0_u8; 16]; BYTE_BUCKET_MAX_COLUMNS];
+        for (bucket, (root, suffixes)) in [
+            (1_u8, (1_u8, b"abcd".as_slice())),
+            (2_u8, (2_u8, b"efgh".as_slice())),
+            (4_u8, (3_u8, b"ijkl".as_slice())),
+            (8_u8, (4_u8, b"mnop".as_slice())),
+        ] {
+            classifier_table_insert(&mut low[0], &mut high[0], root, bucket);
+            for &suffix in suffixes {
+                if root != 1 {
+                    classifier_table_insert(&mut low[1], &mut high[1], suffix, bucket);
+                }
+            }
+        }
+        let corrupted = ByteBucketTables::new(2, low, high).unwrap();
+        plan.root_prefilter.as_mut().unwrap().classifier =
+            Some(ByteBucketClassifier::new(corrupted));
+        assert!(
+            exact.iter().all(|pattern| {
+                plan.root_prefilter
+                    .as_ref()
+                    .unwrap()
+                    .primary_matches(pattern[0])
+            }),
+            "all independent primary checks still pass"
+        );
+        assert!(!plan.root_prefilter_is_necessary_for(&exact));
+        assert!(matches!(
+            plan.root_candidate_single_pass_upper_bounds(64, 1),
+            Err(ScanError::Invariant { .. })
+        ));
+
+        let mut plan = correlated_ascii_plan();
+        plan.root_prefilter.as_mut().unwrap().offset = 1;
+        assert!(!plan.root_prefilter_is_necessary_for(&exact));
+    }
+
+    #[test]
     fn union_successor_guard_is_authenticated_and_rejections_keep_scanning() {
         const A: [char; 1] = ['a'];
         const B: [char; 1] = ['b'];
@@ -4007,41 +5674,94 @@ mod tests {
     }
 
     #[test]
-    fn wide_root_keeps_v5_prospective_and_exact_work_gate() {
+    fn one_column_empty_blocks_preserve_progress_and_early_stop_accounting() {
         const FOUR: [char; 4] = ['A', 'B', 'C', 'D'];
         let classes = one_class(&FOUR);
         let patterns = [FoldedLiteral::new(&classes)];
-        let accounting = admitted(&patterns).build_accounting();
+        let plan = admitted(&patterns);
+        assert_eq!(plan.root_prefilter_classifier_columns(), 1);
+
+        for len in [15, 16, 17, 32] {
+            let source = vec![b'!'; len];
+            let upper = plan.scan_upper_bounds(source.len()).unwrap();
+            let mut candidates = Vec::new();
+            let actual = execute_folded_scan_impl(
+                &plan,
+                &source,
+                0,
+                upper,
+                plan.root_prefilter.as_ref(),
+                ScanStop::AfterMatchingStart,
+                &mut |candidate| candidates.push(candidate),
+            )
+            .unwrap();
+            assert!(candidates.is_empty());
+            assert_eq!(actual.source_byte_reads, source.len());
+            assert!(super::actual_within(actual, upper));
+        }
+
+        let mut source = vec![b'!'; 48];
+        source[32] = b'A';
+        let upper = plan.scan_upper_bounds(source.len()).unwrap();
+        let mut candidates = Vec::new();
+        let actual = execute_folded_scan_impl(
+            &plan,
+            &source,
+            0,
+            upper,
+            plan.root_prefilter.as_ref(),
+            ScanStop::AfterMatchingStart,
+            &mut |candidate| candidates.push(candidate),
+        )
+        .unwrap();
+        assert_eq!(candidates, [LiteralCandidate::new(0, 32, 33)]);
+        assert_eq!(actual.source_byte_reads, 49);
+        assert_eq!(actual.candidate_starts, 1);
+        assert!(super::actual_within(actual, upper));
+    }
+
+    #[test]
+    fn wide_root_fingerprint_is_optional_under_the_baseline_work_limit() {
+        const FOUR: [char; 4] = ['A', 'B', 'C', 'D'];
+        let classes = one_class(&FOUR);
+        let patterns = [FoldedLiteral::new(&classes)];
+        let baseline = super::preflight_from_lengths(&patterns).unwrap();
+        assert_eq!(baseline.root_prefilter_work_upper_bound, 2_696);
+        assert_eq!(baseline.work_upper_bound, 2_750);
+
+        build_probe::reset();
+        let baseline_plan = match FoldedLiteralTriePlan::build(
+            &patterns,
+            exact_build_limits(&baseline),
+        )
+        .unwrap()
+        {
+            BuildAttempt::Admitted(plan) => plan,
+            BuildAttempt::DenseFallback(fallback) => {
+                panic!("unexpected fallback: {fallback:?}")
+            }
+        };
+        assert_eq!(baseline_plan.root_prefilter_classifier_columns(), 1);
+        assert_eq!(baseline_plan.build.work_upper_bound, baseline.work_upper_bound);
+        assert_eq!(build_probe::fingerprint_attempts(), 0);
+        assert_eq!(build_probe::successor_attempts(), 0);
+        assert_eq!(build_probe::allocation_attempts(), 3);
+
+        let plan = admitted(&patterns);
+        let accounting = plan.build_accounting();
         assert_eq!(accounting.root_prefilter_needles, 4);
         assert_eq!(accounting.root_prefilter_guard_needles, 0);
-        assert_eq!(accounting.root_prefilter_work_upper_bound, 2_696);
-        assert_eq!(accounting.work_upper_bound, 2_750);
+        assert_eq!(plan.root_prefilter_classifier_columns(), 1);
+        assert_eq!(accounting.root_prefilter_work_upper_bound, 69_098);
+        assert_eq!(accounting.work_upper_bound, 69_152);
 
         build_probe::reset();
         assert!(matches!(
             FoldedLiteralTriePlan::build(&patterns, exact_build_limits(&accounting)).unwrap(),
             BuildAttempt::Admitted(_)
         ));
+        assert_eq!(build_probe::fingerprint_attempts(), 1);
         assert_eq!(build_probe::successor_attempts(), 0);
-
-        build_probe::reset();
-        assert!(matches!(
-            FoldedLiteralTriePlan::build(
-                &patterns,
-                BuildLimits {
-                    max_work: accounting.work_upper_bound - 1,
-                    ..BuildLimits::unlimited()
-                }
-            ),
-            Err(BuildError::Resource {
-                resource: BuildResource::Work,
-                needed: 2_750,
-                limit: 2_749,
-            })
-        ));
-        assert_eq!(build_probe::scalar_reads(), 0);
-        assert_eq!(build_probe::successor_attempts(), 0);
-        assert_eq!(build_probe::allocation_attempts(), 0);
     }
 
     #[test]
@@ -4656,6 +6376,7 @@ mod tests {
             FoldedLiteral::new(&kelvin_classes),
             FoldedLiteral::new(&sigma_classes),
         ];
+        let mandatory = super::preflight_from_lengths(&patterns).unwrap();
         let accounting = admitted(&patterns).build_accounting();
         assert!(accounting.canonical_comparisons <= accounting.canonical_comparisons_upper_bound);
         assert!(accounting.insertion_probes <= accounting.insertion_probes_upper_bound);
@@ -4706,7 +6427,7 @@ mod tests {
             (
                 BuildResource::Work,
                 BuildLimits {
-                    max_work: accounting.work_upper_bound - 1,
+                    max_work: mandatory.work_upper_bound - 1,
                     ..BuildLimits::unlimited()
                 },
             ),

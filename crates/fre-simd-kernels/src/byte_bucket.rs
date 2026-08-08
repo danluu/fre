@@ -79,8 +79,12 @@ impl ByteBucketTables {
     /// Exact source extent required to classify sixteen candidate starts.
     #[must_use]
     pub fn required_input_bytes(self) -> usize {
+        self.required_input_bytes_for(self.columns())
+    }
+
+    fn required_input_bytes_for(self, columns: usize) -> usize {
         BYTE_BUCKET_BLOCK_BYTES
-            .checked_add(self.columns())
+            .checked_add(columns)
             .and_then(|bytes| bytes.checked_sub(1))
             .expect("the fixed block and column extents fit in usize")
     }
@@ -122,7 +126,7 @@ impl ByteBucketMasks16 {
     reason = "the private function-pointer type retains a target-feature proof selected from immutable host facts"
 )]
 #[cfg(not(feature = "static-dispatch"))]
-type ByteBucketEntry = unsafe fn(&ByteBucketTables, &[u8]) -> ByteBucketMasks16;
+type ByteBucketEntry = unsafe fn(&ByteBucketTables, &[u8], usize) -> ByteBucketMasks16;
 
 #[cfg(feature = "static-dispatch")]
 type ByteBucketEntry = ();
@@ -234,20 +238,60 @@ impl ByteBucketClassifier {
         reason = "construction retained this private entry only after proving its target features; the extent check proves every shifted fixed load"
     )]
     pub fn classify_16(&self, bytes: &[u8]) -> Option<ByteBucketMasks16> {
-        if bytes.len() < self.tables.required_input_bytes() {
+        self.classify_16_columns(bytes, self.tables.columns())
+    }
+
+    /// Classify sixteen starts from the first retained column only. This is a
+    /// cheap screen for a wider correlated classifier and uses the same
+    /// authenticated entry point and first-column tables.
+    #[must_use]
+    pub fn classify_first_16(&self, bytes: &[u8]) -> Option<ByteBucketMasks16> {
+        self.classify_16_columns(bytes, 1)
+    }
+
+    /// Classify one scalar prefix across every retained column. This is the
+    /// construction/authentication counterpart to [`Self::classify_16`]; it
+    /// performs no target-feature operation.
+    #[must_use]
+    #[allow(
+        clippy::inline_always,
+        reason = "the bounded one-through-four-byte exact-start classifier must specialize into its cross-crate hot caller"
+    )]
+    #[inline(always)]
+    pub fn classify_prefix(&self, bytes: &[u8]) -> Option<u8> {
+        match self.tables.columns() {
+            1 => classify_scalar_prefix::<1>(&self.tables, bytes),
+            2 => classify_scalar_prefix::<2>(&self.tables, bytes),
+            3 => classify_scalar_prefix::<3>(&self.tables, bytes),
+            4 => classify_scalar_prefix::<4>(&self.tables, bytes),
+            _ => unreachable!("authenticated bucket tables retain one through four columns"),
+        }
+    }
+
+    #[allow(
+        unsafe_code,
+        reason = "construction retained this private entry only after proving its target features; the extent check proves every shifted fixed load"
+    )]
+    fn classify_16_columns(
+        &self,
+        bytes: &[u8],
+        columns: usize,
+    ) -> Option<ByteBucketMasks16> {
+        debug_assert!((1..=self.tables.columns()).contains(&columns));
+        if bytes.len() < self.tables.required_input_bytes_for(columns) {
             return None;
         }
         #[cfg(not(feature = "static-dispatch"))]
         {
             // SAFETY: selection authenticated the entry, and the source check
             // above covers sixteen bytes at every compiled column.
-            Some(unsafe { (self.entry)(&self.tables, bytes) })
+            Some(unsafe { (self.entry)(&self.tables, bytes, columns) })
         }
         #[cfg(feature = "static-dispatch")]
         {
             // SAFETY: construction admitted only the compiler-fixed leaf and
             // the source extent is proved above.
-            Some(unsafe { static_classify(&self.tables, bytes) })
+            Some(unsafe { static_classify(&self.tables, bytes, columns) })
         }
     }
 }
@@ -263,8 +307,12 @@ impl ByteBucketClassifier {
         reason = "compiler-fixed builds call their direct static leaf instead of retaining the runtime scalar entry"
     )
 )]
-unsafe fn classify_scalar_entry(tables: &ByteBucketTables, bytes: &[u8]) -> ByteBucketMasks16 {
-    classify_scalar(tables, bytes)
+unsafe fn classify_scalar_entry(
+    tables: &ByteBucketTables,
+    bytes: &[u8],
+    columns: usize,
+) -> ByteBucketMasks16 {
+    classify_scalar(tables, bytes, columns)
 }
 
 #[cfg_attr(
@@ -274,9 +322,14 @@ unsafe fn classify_scalar_entry(tables: &ByteBucketTables, bytes: &[u8]) -> Byte
         reason = "AArch64 compiler-fixed production builds select the direct NEON leaf; tests retain the scalar oracle"
     )
 )]
-fn classify_scalar(tables: &ByteBucketTables, bytes: &[u8]) -> ByteBucketMasks16 {
+fn classify_scalar(
+    tables: &ByteBucketTables,
+    bytes: &[u8],
+    columns: usize,
+) -> ByteBucketMasks16 {
+    debug_assert!((1..=tables.columns()).contains(&columns));
     let mut lanes = [u8::MAX; BYTE_BUCKET_BLOCK_BYTES];
-    for column in 0..tables.columns() {
+    for column in 0..columns {
         for lane in 0..BYTE_BUCKET_BLOCK_BYTES {
             let byte = bytes[column
                 .checked_add(lane)
@@ -288,6 +341,23 @@ fn classify_scalar(tables: &ByteBucketTables, bytes: &[u8]) -> ByteBucketMasks16
     ByteBucketMasks16::from_lanes(lanes)
 }
 
+#[inline]
+fn classify_scalar_prefix<const COLUMNS: usize>(
+    tables: &ByteBucketTables,
+    bytes: &[u8],
+) -> Option<u8> {
+    if bytes.len() < COLUMNS {
+        return None;
+    }
+    let mut buckets = u8::MAX;
+    for column in 0..COLUMNS {
+        let byte = bytes[column];
+        buckets &= tables.low[column][usize::from(byte & 0x0f)]
+            & tables.high[column][usize::from(byte >> 4)];
+    }
+    Some(buckets)
+}
+
 #[cfg(target_arch = "aarch64")]
 #[allow(
     unsafe_code,
@@ -295,12 +365,16 @@ fn classify_scalar(tables: &ByteBucketTables, bytes: &[u8]) -> ByteBucketMasks16
     reason = "the private NEON leaf is reachable only through authenticated dispatch and fixed source/table extents"
 )]
 #[target_feature(enable = "neon")]
-unsafe fn classify_neon(tables: &ByteBucketTables, bytes: &[u8]) -> ByteBucketMasks16 {
+unsafe fn classify_neon(
+    tables: &ByteBucketTables,
+    bytes: &[u8],
+    columns: usize,
+) -> ByteBucketMasks16 {
     use core::arch::aarch64::{vandq_u8, vdupq_n_u8, vld1q_u8, vqtbl1q_u8, vshrq_n_u8, vst1q_u8};
 
     let mut candidates = vdupq_n_u8(u8::MAX);
     let nibble_mask = vdupq_n_u8(0x0f);
-    for column in 0..tables.columns() {
+    for column in 0..columns {
         let input = vld1q_u8(bytes.as_ptr().add(column));
         let low_nibbles = vandq_u8(input, nibble_mask);
         let high_nibbles = vshrq_n_u8::<4>(input);
@@ -402,10 +476,14 @@ const fn static_variant_id() -> &'static str {
     unsafe_code,
     reason = "the compiler-fixed profile proves NEON and the caller proves every source/table extent"
 )]
-unsafe fn static_classify(tables: &ByteBucketTables, bytes: &[u8]) -> ByteBucketMasks16 {
+unsafe fn static_classify(
+    tables: &ByteBucketTables,
+    bytes: &[u8],
+    columns: usize,
+) -> ByteBucketMasks16 {
     // SAFETY: this static leaf is compiled with NEON and classify_16 proved
     // the complete shifted source extent.
-    unsafe { classify_neon(tables, bytes) }
+    unsafe { classify_neon(tables, bytes, columns) }
 }
 
 #[cfg(all(
@@ -416,8 +494,12 @@ unsafe fn static_classify(tables: &ByteBucketTables, bytes: &[u8]) -> ByteBucket
     unsafe_code,
     reason = "the scalar function shares the compiler-fixed leaf ABI but performs no unsafe operation"
 )]
-unsafe fn static_classify(tables: &ByteBucketTables, bytes: &[u8]) -> ByteBucketMasks16 {
-    classify_scalar(tables, bytes)
+unsafe fn static_classify(
+    tables: &ByteBucketTables,
+    bytes: &[u8],
+    columns: usize,
+) -> ByteBucketMasks16 {
+    classify_scalar(tables, bytes, columns)
 }
 
 #[cfg(test)]
@@ -465,6 +547,13 @@ mod tests {
             let needed = BYTE_BUCKET_BLOCK_BYTES + columns - 1;
             assert!(classifier.classify_16(&vec![0; needed - 1]).is_none());
             assert!(classifier.classify_16(&vec![0; needed]).is_some());
+            assert!(
+                classifier
+                    .classify_first_16(&[0; BYTE_BUCKET_BLOCK_BYTES])
+                    .is_some()
+            );
+            assert!(classifier.classify_prefix(&vec![0; columns - 1]).is_none());
+            assert!(classifier.classify_prefix(&vec![0; columns]).is_some());
         }
     }
 
@@ -484,8 +573,19 @@ mod tests {
                 let bytes = &source[alignment..];
                 assert_eq!(
                     classifier.classify_16(bytes).unwrap(),
-                    classify_scalar(&tables, bytes)
+                    classify_scalar(&tables, bytes, columns)
                 );
+                assert_eq!(
+                    classifier.classify_first_16(bytes).unwrap(),
+                    classify_scalar(&tables, bytes, 1)
+                );
+                let classified = classifier.classify_16(bytes).unwrap().chunks();
+                for lane in 0..BYTE_BUCKET_BLOCK_BYTES {
+                    let chunk = classified[lane / 8];
+                    let shift = (lane % 8) * 8;
+                    let expected = u8::try_from((chunk >> shift) & u64::from(u8::MAX)).unwrap();
+                    assert_eq!(classifier.classify_prefix(&bytes[lane..]), Some(expected));
+                }
             }
         }
     }
@@ -512,7 +612,7 @@ mod tests {
                     .unwrap();
                 assert_eq!(
                     classifier.classify_16(&source).unwrap(),
-                    classify_scalar(&tables, &source)
+                    classify_scalar(&tables, &source, columns)
                 );
             }
         }
