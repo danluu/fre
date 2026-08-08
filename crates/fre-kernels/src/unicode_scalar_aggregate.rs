@@ -4044,6 +4044,11 @@ impl<'h> UnicodeScalarSearchCursor<'_, 'h> {
             let remaining = end - position;
             let complete_bytes = remaining - remaining % BYTE_SET_WIDE_BLOCK_BYTES;
             if complete_bytes != 0 {
+                // Avoid paying the fixed-block launch cost when the value-only
+                // search is already positioned on a possible scalar start.
+                if !METERED && self.plan.leading.set().contains(self.haystack[position]) {
+                    return Some(position);
+                }
                 let searched = &self.haystack[position..position + complete_bytes];
                 if let Some((relative, mask)) =
                     fre_simd_kernels::find_byte_values16_32_block(match_values, searched)
@@ -4235,7 +4240,7 @@ mod tests {
         target_feature = "sve",
         target_feature = "sve2"
     ))]
-    use fre_simd_kernels::ByteSet256;
+    use fre_simd_kernels::{BYTE_SET_WIDE_BLOCK_BYTES, ByteSet256};
     use crate::{
         ASCII_WIDE_BYTES, AsciiByteSet, AsciiByteSetClassifier, DispatchPolicy, Feature,
         SimdDispatchContext, Window,
@@ -5992,6 +5997,104 @@ mod tests {
         assert_eq!(
             select_leading_byte_search(ByteSet256::from_words([(1_u64 << 17) - 1, 0, 0, 0])),
             LeadingByteSearch::Classifier,
+        );
+    }
+
+    #[cfg(all(
+        feature = "static-dispatch-arm-41-d84",
+        target_arch = "aarch64",
+        target_os = "linux",
+        target_endian = "little",
+        target_feature = "sve",
+        target_feature = "sve2"
+    ))]
+    #[test]
+    fn scalar_run_small_table_value_head_probe_preserves_exact_search() {
+        let ranges = [
+            ('\u{80}', '\u{80}'),
+            ('\u{340}', '\u{340}'),
+            ('\u{380}', '\u{380}'),
+            ('\u{1000}', '\u{1000}'),
+            ('\u{2000}', '\u{2000}'),
+            ('\u{A000}', '\u{A000}'),
+            ('\u{10000}', '\u{10000}'),
+        ];
+        let plan = UnicodeScalarSearchPlan::build_repeated_with_dispatch(
+            SimdDispatchContext::capture(),
+            ranges,
+            2,
+            Some(4),
+            true,
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        assert!(matches!(plan.leading_search, LeadingByteSearch::Small(_)));
+
+        let mut dense = vec![b'x'];
+        dense.extend_from_slice("\u{80}\u{80}".as_bytes());
+        dense.resize(96, b'x');
+        let window = Window::full(&dense);
+        let (selected, accounting) = plan
+            .find_window(&dense, window, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(selected, Some((1, 5)));
+        assert_eq!(accounting.actual.leading_block_classifications, 1);
+        assert_eq!(
+            accounting.actual.leading_block_classification_bytes,
+            BYTE_SET_WIDE_BLOCK_BYTES,
+        );
+        assert_eq!(accounting.actual.leading_scalar_probes, 0);
+
+        let mut cursor = plan.search_cursor(&dense);
+        assert_eq!(
+            cursor.find_at_value(0, SearchLimits::unlimited()).unwrap(),
+            selected,
+        );
+        assert!(!cursor.state.leading_block_valid);
+        assert!(
+            plan.is_match_window_value(&dense, window, SearchLimits::unlimited())
+                .unwrap(),
+        );
+        assert_eq!(
+            plan.shortest_match_window_value(&dense, window, SearchLimits::unlimited())
+                .unwrap(),
+            Some(5),
+        );
+
+        let mut decoy = vec![b'x'];
+        decoy.extend_from_slice("\u{81}xx\u{80}\u{80}".as_bytes());
+        decoy.resize(96, b'x');
+        for start in [0, 2] {
+            let window = Window::new(start, decoy.len());
+            let expected = plan
+                .find_window(&decoy, window, SearchLimits::unlimited())
+                .unwrap()
+                .0;
+            assert_eq!(expected, Some((5, 9)));
+            assert_eq!(
+                plan.find_window_value(&decoy, window, SearchLimits::unlimited())
+                    .unwrap(),
+                expected,
+                "start={start}",
+            );
+            assert!(
+                plan.is_match_window_value(&decoy, window, SearchLimits::unlimited())
+                    .unwrap(),
+                "start={start}",
+            );
+        }
+
+        let absent = vec![b'x'; 96];
+        let absent_window = Window::full(&absent);
+        assert_eq!(
+            plan.find_window_value(&absent, absent_window, SearchLimits::unlimited())
+                .unwrap(),
+            None,
+        );
+        assert!(
+            !plan
+                .is_match_window_value(&absent, absent_window, SearchLimits::unlimited())
+                .unwrap(),
         );
     }
 
