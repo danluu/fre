@@ -16772,6 +16772,61 @@ mod tests {
         );
         assert!(wide.raw.roles.len() > MAX_BIT_PARALLEL_EXISTS_STATES);
         assert_eq!(wide.bit_parallel_exists_stats(), None);
+
+        let multiword_pattern = format!("{}z", "a".repeat(64));
+        let multiword = program(
+            &multiword_pattern,
+            OutputContract::Exists,
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+        );
+        let multiword_stats = multiword
+            .bit_parallel_exists_stats()
+            .expect("two-word graph-derived fallback");
+        assert_eq!(multiword_stats.words, 2);
+        assert!(multiword_stats.consuming_states >= 64);
+        assert_eq!(multiword_stats.source_nibbles, 0);
+        assert_eq!(multiword_stats.root_transition_entries, 2 * 256);
+        let multiword_bytes = multiword.serialize().unwrap();
+        let restored_multiword = CompiledProgram::deserialize(&multiword_bytes).unwrap();
+        assert_eq!(restored_multiword.serialize().unwrap(), multiword_bytes);
+        assert_eq!(
+            restored_multiword.bit_parallel_exists_stats(),
+            Some(multiword_stats)
+        );
+        let reference = program(
+            &multiword_pattern,
+            OutputContract::Exists,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        for haystack in [
+            b"".as_slice(),
+            b"z".as_slice(),
+            b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaz"
+                .as_slice(),
+            b"xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaax"
+                .as_slice(),
+        ] {
+            for start in 0..=haystack.len() {
+                for end in start..=haystack.len() {
+                    let window = SearchWindow::new(start, end);
+                    assert_eq!(
+                        multiword.search(haystack, window).unwrap(),
+                        reference.search(haystack, window).unwrap(),
+                        "multiword mismatch: {haystack:?}/{start}..{end}"
+                    );
+                    assert_eq!(
+                        restored_multiword.search(haystack, window).unwrap(),
+                        reference.search(haystack, window).unwrap(),
+                        "restored multiword mismatch: {haystack:?}/{start}..{end}"
+                    );
+                }
+            }
+        }
     }
 
     fn assert_exact_product_matches_fast_for_every_window(

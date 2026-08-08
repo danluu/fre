@@ -446,10 +446,6 @@ impl BitParallelExists {
         self.stats
     }
 
-    pub(crate) const fn is_multiword(&self) -> bool {
-        self.words > 1
-    }
-
     pub(crate) fn native_view(&self) -> NativeBitParallelExistsView<'_> {
         NativeBitParallelExistsView {
             byte_to_class: &self.byte_to_class,

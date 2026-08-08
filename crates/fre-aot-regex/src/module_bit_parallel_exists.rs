@@ -157,6 +157,7 @@ fn build_native_bit_parallel_layout(
     let stats = view.stats;
     if stats.thompson_states == 0
         || stats.thompson_states > MAX_BIT_PARALLEL_EXISTS_STATES
+        || stats.words != 1
         || stats.consuming_states > 63
         || !(1..=BYTE_VALUES).contains(&stats.byte_classes)
     {
@@ -172,7 +173,9 @@ fn build_native_bit_parallel_layout(
     let retained_bytes = core::mem::size_of::<BitParallelExists>().checked_add(transition_bytes)?;
     if stats.source_nibbles != source_nibbles
         || stats.transition_entries != transition_entries
+        || stats.root_transition_entries != 0
         || view.transition_masks.len() != transition_entries
+        || !view.root_transition_masks.is_empty()
         || stats.retained_bytes != retained_bytes
         || stats.peak_build_bytes < stats.retained_bytes
         || data_bytes > MAX_NATIVE_BIT_PARALLEL_DATA_BYTES
@@ -201,7 +204,7 @@ fn build_native_bit_parallel_layout(
             .checked_sub(1)?,
     };
     let valid_mask = consuming_mask | ACCEPT_BIT;
-    if view.initial & !valid_mask != 0 {
+    if view.initial[0] & !valid_mask != 0 || view.initial[1..].iter().any(|&word| word != 0) {
         return None;
     }
     for row in view.transition_masks.chunks_exact(NIBBLE_SUBSETS) {
@@ -217,8 +220,8 @@ fn build_native_bit_parallel_layout(
         }
     }
 
-    let root = view.initial & CONSUMING_BITS;
-    let constant_result = if view.initial & ACCEPT_BIT != 0 {
+    let root = view.initial[0] & CONSUMING_BITS;
+    let constant_result = if view.initial[0] & ACCEPT_BIT != 0 {
         Some(true)
     } else if root == 0 {
         Some(false)
@@ -831,14 +834,17 @@ mod tests {
         NativeBitParallelExistsView {
             byte_to_class,
             transition_masks: masks,
-            initial: 1,
+            root_transition_masks: &[],
+            initial: [1, 0, 0, 0],
             stats: crate::BitParallelExistsStats {
                 thompson_states: consuming_states.max(1),
                 thompson_edges: 0,
                 consuming_states,
                 byte_classes: 1,
+                words: 1,
                 source_nibbles,
                 transition_entries: masks.len(),
+                root_transition_entries: 0,
                 retained_bytes,
                 peak_build_bytes: retained_bytes,
                 derivation_work: 0,
@@ -988,9 +994,9 @@ mod tests {
         assert_eq!(aarch64.relocations.len(), 2);
 
         let byte_to_class = [0_u8; BYTE_VALUES];
-        for source_nibbles in 2..=MAX_BIT_PARALLEL_EXISTS_STATES / NIBBLE_BITS {
-            let consuming_states = if source_nibbles == MAX_BIT_PARALLEL_EXISTS_STATES / NIBBLE_BITS
-            {
+        let max_one_word_nibbles = 63_usize.div_ceil(NIBBLE_BITS);
+        for source_nibbles in 2..=max_one_word_nibbles {
+            let consuming_states = if source_nibbles == max_one_word_nibbles {
                 63
             } else {
                 source_nibbles * NIBBLE_BITS

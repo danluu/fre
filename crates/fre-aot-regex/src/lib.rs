@@ -37,7 +37,7 @@ use sha2::{Digest, Sha256};
 
 pub use bit_parallel_exists::{
     BitParallelExistsStats, MAX_BIT_PARALLEL_EXISTS_MEMORY_BYTES, MAX_BIT_PARALLEL_EXISTS_STATES,
-    MAX_BIT_PARALLEL_EXISTS_WORK,
+    MAX_BIT_PARALLEL_EXISTS_WORDS, MAX_BIT_PARALLEL_EXISTS_WORK,
 };
 pub use context_dfa::{ContextDfaDecline, ContextDfaResource, ContextDfaStats};
 pub use dfa::{
