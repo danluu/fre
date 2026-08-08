@@ -2024,6 +2024,7 @@ mod folded_long_tail_tests {
             .unwrap();
         assert_eq!(single.input_bytes, 64);
         assert_eq!(single.candidate_starts, 64);
+        assert_eq!(single.source_byte_reads, 65);
         assert_eq!(single.work, single.candidate_starts + single.source_byte_reads);
         let input_bytes = folded_short_minimum_bytes(tail).unwrap();
         let prospective = folded_short_root_prospective(
@@ -3156,6 +3157,64 @@ mod folded_long_tail_tests {
         check(&['a', 'b'], &[b"a", b"b"], b'b');
         check(&['a', 'b', 'c'], &[b"a", b"b", b"c"], b'c');
         check(&['a', 'b', 'c', 'd'], &[b"a", b"b", b"c", b"d"], b'd');
+    }
+
+    #[test]
+    fn unguarded_root_settles_first_start_before_the_unchanged_scanner() {
+        let (_, accelerated) =
+            singleton_class_plans(&['a', 'b', 'c', 'd'], &[b"a", b"b", b"c", b"d"]);
+        let tail = accelerated.folded_long_tail.as_deref().unwrap();
+        let input_bytes = folded_short_minimum_bytes(tail).unwrap();
+        let window = Window::new(5, 5 + input_bytes);
+        let upper = tail
+            .trie
+            .root_candidate_single_pass_upper_bounds(input_bytes, tail.max_pattern_bytes)
+            .unwrap();
+        assert_eq!(upper.source_byte_reads, input_bytes + 1);
+
+        let mut source = vec![b'z'; window.end()];
+        let absent = tail
+            .trie
+            .find_root_candidate_precharged(&source, window, upper)
+            .unwrap();
+        assert_eq!(absent.outcome, RootCandidateOutcome::NoCandidate);
+        assert_eq!(absent.receipt.actual.source_byte_reads, input_bytes + 1);
+        assert_eq!(absent.receipt.actual.candidate_starts, 0);
+        assert_eq!(absent.receipt.actual.work, input_bytes + 1);
+
+        source[window.start()] = b'd';
+        let first = tail
+            .trie
+            .find_root_candidate_precharged(&source, window, upper)
+            .unwrap();
+        assert_eq!(
+            first.outcome,
+            RootCandidateOutcome::Candidate {
+                start: window.start(),
+            }
+        );
+        assert_eq!(first.receipt.actual.source_byte_reads, 1);
+        assert_eq!(first.receipt.actual.candidate_starts, 1);
+        assert_eq!(first.receipt.actual.work, 2);
+
+        source[window.start()] = b'z';
+        source[window.start() + 1] = b'd';
+        let later = tail
+            .trie
+            .find_root_candidate_precharged(&source, window, upper)
+            .unwrap();
+        assert_eq!(
+            later.outcome,
+            RootCandidateOutcome::Candidate {
+                start: window.start() + 1,
+            }
+        );
+        assert_eq!(later.receipt.actual.source_byte_reads, 1 + BYTE_BUCKET_BLOCK_BYTES);
+        assert_eq!(later.receipt.actual.candidate_starts, 1);
+        assert_eq!(
+            later.receipt.actual.work,
+            2 + BYTE_BUCKET_BLOCK_BYTES
+        );
     }
 
     #[test]

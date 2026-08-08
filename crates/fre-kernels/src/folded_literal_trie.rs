@@ -513,6 +513,10 @@ impl RootPrefilter {
         self.guard_needle_count != 0
     }
 
+    fn primary_matches(&self, byte: u8) -> bool {
+        byte_set_contains(self.byte_set, byte)
+    }
+
     fn guard_matches(&self, byte: u8) -> bool {
         byte_set_contains(self.guard_byte_set, byte)
     }
@@ -910,9 +914,10 @@ impl FoldedLiteralTriePlan {
     /// Derive the exact linear envelope for one necessary-root pass.
     ///
     /// The primary classifier reads each source byte at most once, and a
-    /// retained guard reads at most one byte for each primary position. The
-    /// attaching matcher has already authenticated that both fixed columns are
-    /// necessary and lie within `max_pattern_bytes`.
+    /// retained guard reads at most one byte for each primary position. An
+    /// unguarded root may also read its first exact start once before the
+    /// classifier. The attaching matcher has already authenticated that every
+    /// retained fixed column is necessary and lies within `max_pattern_bytes`.
     pub(crate) fn root_candidate_single_pass_upper_bounds(
         &self,
         input_bytes: usize,
@@ -937,11 +942,13 @@ impl FoldedLiteralTriePlan {
             .ok_or(ScanError::ArithmeticOverflow {
                 computation: "folded root-candidate source passes",
             })?;
-        let source_byte_reads = input_bytes.checked_mul(source_passes).ok_or(
-            ScanError::ArithmeticOverflow {
+        let root_start_probe_reads = usize::from(!prefilter.has_guard());
+        let source_byte_reads = input_bytes
+            .checked_mul(source_passes)
+            .and_then(|reads| reads.checked_add(root_start_probe_reads))
+            .ok_or(ScanError::ArithmeticOverflow {
                 computation: "folded root-candidate source byte reads",
-            },
-        )?;
+            })?;
         let candidate_starts = input_bytes;
         let work = candidate_starts.checked_add(source_byte_reads).ok_or(
             ScanError::ArithmeticOverflow {
@@ -1736,10 +1743,28 @@ fn execute_root_candidate_find(
             actual: ScanActual::default(),
         });
     };
-    let actual = ScanActual {
+    let mut actual = ScanActual {
         input_bytes: source.len(),
         ..ScanActual::default()
     };
+    // The wide classifier reports even lane zero only after classifying its
+    // complete first block. Settle that exact start scalarly when no guard is
+    // required. A rejection deliberately leaves the original source and its
+    // alignment unchanged for the existing full-window scanner.
+    if !prefilter.has_guard()
+        && let Some(&primary_byte) = source.get(usize::from(prefilter.offset))
+    {
+        actual.source_byte_reads = 1;
+        if prefilter.primary_matches(primary_byte) {
+            actual.candidate_starts = 1;
+            return Ok((
+                RootCandidateOutcome::Candidate {
+                    start: absolute_base,
+                },
+                actual,
+            ));
+        }
+    }
     let invalid_actual = actual;
     let mut state = RootCandidateHitState {
         source,
