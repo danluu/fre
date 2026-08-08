@@ -55,7 +55,10 @@
 //! authenticate the preflight window and recover only the selected start.
 //! A variable-width dynamic-row entry uses the parallel
 //! [`fre_aot_regex_runtime_search_exclusive_dynamic_rows_recover_span_v1`]
-//! postflight after selecting its authoritative endpoint natively.
+//! postflight after selecting its authoritative endpoint natively. Mutable
+//! rows and legacy V1/V2 headers authenticate a single-use preflight window;
+//! an active immutable V3--V14 owner instead authenticates that same
+//! reverse-only postflight directly and remains reusable after success.
 //! [`fre_aot_regex_runtime_prepared_partial_should_enter_v1`] remains exported
 //! only for compatibility with older generated objects.
 
@@ -778,15 +781,54 @@ impl PreparedAotRegex {
         expected_artifact_identity: [u8; ARTIFACT_IDENTITY_BYTES],
         selected_end: usize,
     ) -> Result<MatchResult, CompileError> {
-        self.deactivate_frozen_header();
-        self.program
-            .recover_dynamic_native_rows_span_from_selected_end_with_workspace(
+        // Mint the no-preflight mode before any legacy revocation. The token
+        // proves an active V3--V14 header whose published row pointer matches
+        // this exact immutable owner. Reverse K0 receives only `workspace`, a
+        // disjoint field whose allocations were prepared independently from
+        // every header and sidecar allocation.
+        let compact_capability = self.frozen_dynamic_rows.as_ref().and_then(|owner| {
+            self.frozen_header
+                .compiler_private_active_span_capability(
+                    owner,
+                    expected_artifact_identity,
+                )
+        });
+        let used_compact_capability = compact_capability.is_some();
+        let recovered = if let Some(capability) = compact_capability {
+            // SAFETY: the token was minted synchronously from this prepared
+            // value's still-active header and exact retained owner. These are
+            // disjoint fields from `workspace`; neither is mutated, moved, or
+            // dropped until the synchronous reverse-only call returns.
+            unsafe {
+                self.program
+                    .recover_frozen_dynamic_rows_span_from_selected_end_with_workspace(
+                    haystack,
+                    window,
+                    &mut self.workspace,
+                    expected_artifact_identity,
+                    selected_end,
+                    capability,
+                )
+            }
+        } else {
+            // Legacy V1/V2 and mutable dynamic rows retain the original
+            // revoke-then-consume single-use preflight transaction.
+            self.deactivate_frozen_header();
+            self.program
+                .recover_dynamic_native_rows_span_from_selected_end_with_workspace(
                 haystack,
                 window,
                 &mut self.workspace,
                 expected_artifact_identity,
                 selected_end,
             )
+        };
+        if recovered.is_err() && used_compact_capability {
+            // A rejected compact postflight cannot leave a reusable capability
+            // behind for a later endpoint or fallback invocation.
+            self.deactivate_frozen_header();
+        }
+        recovered
     }
 
     /// Find the first selected span in `haystack`.
@@ -1689,12 +1731,16 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_search_exclusive_dynamic_rows_con
 /// Recover a variable-width Span start after an authenticated dynamic-row
 /// scan selected only its authoritative endpoint.
 ///
-/// The exact `window_start..window_end` must be the single-use window admitted
-/// by the immediately preceding successful dynamic-row preflight on this
-/// exclusive session. The artifact must be an assertion-free, non-nullable,
+/// For mutable rows or legacy V1/V2 headers, the exact
+/// `window_start..window_end` must be the single-use window admitted by the
+/// immediately preceding successful dynamic-row preflight on this exclusive
+/// session. An active immutable V3--V14 header may instead authorize the
+/// synchronous endpoint selected from its exact frozen owner, without a
+/// preflight ticket. The artifact must be an assertion-free, non-nullable,
 /// variable-width ordered-NFA Span program, and `selected_end` must lie
-/// strictly after the admitted start and at or before its end. Reverse K0
-/// recovers only the start; the forward search is not replayed.
+/// strictly after the window start and at or before its end. Reverse K0
+/// recovers only the start; the forward search is not replayed. Successful
+/// immutable recovery retains the header, while every rejection revokes it.
 ///
 /// On success this function returns [`STATUS_MATCH`] and initializes
 /// `result_ptr` with the exact Span. Every rejection returns an error status
@@ -1738,12 +1784,17 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_search_exclusive_dynamic_rows_rec
         || selected_end <= window_start
         || selected_end > window_end
     {
+        // A non-null exclusive handle is a live allocation by this unsafe
+        // API's contract. Even a malformed postflight payload must revoke a
+        // possibly active compact capability before the caller can fall back
+        // or retry with another endpoint.
+        unsafe { &mut *handle.0.cast::<PreparedAotRegex>() }.deactivate_frozen_header();
         return STATUS_INVALID_ARGUMENT;
     }
 
     // SAFETY: the caller guarantees one live exclusively owned session plus
     // all readable and writable disjoint extents described above.
-    catch_unwind(AssertUnwindSafe(|| unsafe {
+    let status = catch_unwind(AssertUnwindSafe(|| unsafe {
         let prepared = &mut *handle.0.cast::<PreparedAotRegex>();
         let haystack = std::slice::from_raw_parts(haystack_ptr, haystack_len);
         let expected_artifact_identity = expected_artifact_identity_ptr
@@ -1762,7 +1813,13 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_search_exclusive_dynamic_rows_rec
         result_ptr.write(FreAotRegexResultV1 { start, end });
         STATUS_MATCH
     }))
-    .unwrap_or(STATUS_RUNTIME_FAILURE)
+    .unwrap_or(STATUS_RUNTIME_FAILURE);
+    if status != STATUS_MATCH {
+        // This also covers an unwind before the Rust recovery wrapper could
+        // revoke its active compact capability.
+        unsafe { &mut *handle.0.cast::<PreparedAotRegex>() }.deactivate_frozen_header();
+    }
+    status
 }
 
 /// Decide whether a legacy exclusive prepared native entry should execute its
@@ -2979,9 +3036,10 @@ mod tests {
         expected_artifact_identity: &[u8; ARTIFACT_IDENTITY_BYTES],
         selected_end: usize,
     ) -> u32 {
-        // SAFETY: each test keeps exclusive ownership of the admitted live
-        // session; readable inputs and disjoint aligned output outlive the
-        // synchronous compiler-private postflight.
+        // SAFETY: each test keeps exclusive ownership of the live session;
+        // either its active immutable owner or its immediately preceding
+        // admission authenticates the synchronous compiler-private
+        // postflight. Readable inputs and disjoint aligned output outlive it.
         unsafe {
             fre_aot_regex_runtime_search_exclusive_dynamic_rows_recover_span_v1(
                 handle,
@@ -4221,6 +4279,149 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
         // SAFETY: the test uniquely owns the completed exclusive session.
         assert_eq!(
             unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(handle) },
+            STATUS_SUCCESS
+        );
+    }
+
+    #[test]
+    fn exclusive_frozen_dynamic_span_postflight_reuses_owner_across_windows_and_revokes() {
+        let compiled = compile(
+            CompileRequest::new(
+                r"(?-u:(?:a|[^a][\x00-\xFF]))",
+                Target::x86_64_linux(),
+            )
+            .mode(CompileMode::Fast)
+            .output(OutputContract::Span),
+        )
+        .expect("compile scanner-free variable Span fixture");
+        let identity = compiled.receipt().program_sha256;
+        let serialized = compiled.program().serialize().unwrap();
+        let handle = prepare_exclusive(&serialized);
+        // SAFETY: the test uniquely owns this live allocation until the
+        // explicit destroy below.
+        let prepared = unsafe { &*handle.0.cast::<PreparedAotRegex>() };
+        assert!(prepared.frozen_header.has_dynamic_rows());
+        assert!(prepared.frozen_dynamic_rows.is_some());
+
+        let mut haystack = vec![b'!'; 80];
+        let start = 8_usize;
+        let end = 72_usize;
+        haystack[start..start + 2].copy_from_slice(b"bq");
+        let selected_end = start + 2;
+        let expected = FreAotRegexResultV1 {
+            start,
+            end: selected_end,
+        };
+        let mut alternate = vec![b'!'; 96];
+        let alternate_start = 13_usize;
+        let alternate_end = 81_usize;
+        alternate[alternate_start] = b'a';
+        let alternate_selected_end = alternate_start + 1;
+        let alternate_expected = FreAotRegexResultV1 {
+            start: alternate_start,
+            end: alternate_selected_end,
+        };
+        let sentinel = FreAotRegexResultV1 { start: 91, end: 92 };
+
+        for (label, input, window_start, window_end, endpoint, expected) in [
+            ("two-byte", haystack.as_slice(), start, end, selected_end, expected),
+            (
+                "one-byte",
+                alternate.as_slice(),
+                alternate_start,
+                alternate_end,
+                alternate_selected_end,
+                alternate_expected,
+            ),
+        ] {
+            let mut result = sentinel;
+            assert_eq!(
+                call_exclusive_recover_dynamic_span(
+                    handle,
+                    input,
+                    window_start,
+                    window_end,
+                    &mut result,
+                    &identity,
+                    endpoint,
+                ),
+                STATUS_MATCH,
+                "compact {label} invocation"
+            );
+            assert_eq!(result, expected);
+            assert!(
+                exclusive_frozen_header_is_active(handle),
+                "successful reverse-only recovery must retain the compact owner"
+            );
+        }
+
+        // A foreign identity is authenticated before reverse K0 and revokes
+        // the otherwise reusable compact owner.
+        let mut rejected = sentinel;
+        let mut wrong_identity = identity;
+        wrong_identity[0] ^= 1;
+        assert_eq!(
+            call_exclusive_recover_dynamic_span(
+                handle,
+                &haystack,
+                start,
+                end,
+                &mut rejected,
+                &wrong_identity,
+                selected_end,
+            ),
+            STATUS_RUNTIME_FAILURE
+        );
+        assert_eq!(rejected, sentinel);
+        assert!(
+            !exclusive_frozen_header_is_active(handle),
+            "every compact rejection must permanently revoke the owner"
+        );
+
+        assert_eq!(
+            call_exclusive_recover_dynamic_span(
+                handle,
+                &haystack,
+                start,
+                end,
+                &mut rejected,
+                &identity,
+                selected_end,
+            ),
+            STATUS_RUNTIME_FAILURE,
+            "a revoked owner cannot bypass the missing mutable preflight ticket"
+        );
+        assert_eq!(rejected, sentinel);
+
+        // SAFETY: the test uniquely owns the completed exclusive session.
+        assert_eq!(
+            unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(handle) },
+            STATUS_SUCCESS
+        );
+
+        // An in-range endpoint that the language cannot produce likewise
+        // revokes a fresh owner rather than remaining replayable.
+        let impossible_handle = prepare_exclusive(&serialized);
+        assert!(exclusive_frozen_header_is_active(impossible_handle));
+        let impossible = vec![b'!'; 80];
+        let mut impossible_result = sentinel;
+        assert_eq!(
+            call_exclusive_recover_dynamic_span(
+                impossible_handle,
+                &impossible,
+                start,
+                end,
+                &mut impossible_result,
+                &identity,
+                start + 1,
+            ),
+            STATUS_RUNTIME_FAILURE
+        );
+        assert_eq!(impossible_result, sentinel);
+        assert!(!exclusive_frozen_header_is_active(impossible_handle));
+        // SAFETY: the test uniquely owns the rejected exclusive session.
+        assert_eq!(
+            unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(impossible_handle) },
             STATUS_SUCCESS
         );
     }

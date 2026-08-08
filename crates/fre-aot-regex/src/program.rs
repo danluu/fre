@@ -2526,10 +2526,13 @@ pub struct FullyPrefilledFallbackReceipt {
 ///
 /// Prepared exclusive runtimes place this record at byte offset zero of their
 /// opaque allocation. The active seal is published only after the complete
-/// forward/reverse projection has been authenticated. Any legacy or fallback
-/// runtime entry clears that seal before it may mutate the workspace, and no
-/// public operation can restore it. The inline class map deliberately follows
-/// every hot authentication and row-layout field.
+/// forward projection has been authenticated and copied into its immutable
+/// owner. Any legacy or fallback runtime entry clears that seal before it may
+/// mutate capability-owned state, and no public operation can restore it. A
+/// variable-Span compact postflight may retain the seal only while it mutates
+/// the disjoint live reverse-K0 workspace and leaves every header, sidecar,
+/// pointer, and publication field untouched. The inline class map deliberately
+/// follows every hot authentication and row-layout field.
 #[doc(hidden)]
 #[derive(Debug, Eq, PartialEq)]
 #[repr(C)]
@@ -2615,6 +2618,20 @@ pub struct FrozenPreparedHeaderV5 {
 pub struct FrozenPreparedHeaderV6 {
     v1: FrozenPreparedHeaderV1,
     dynamic_rows_v6: FrozenDynamicRowsV6,
+}
+
+/// Opaque authorization for one reverse-only variable-Span recovery after an
+/// active immutable V3--V14 forward table selected the endpoint.
+///
+/// Only [`FrozenPreparedHeaderV6`] can mint this value, after matching the
+/// active header, exact artifact/program lineage, and the pointer-stable
+/// immutable sidecar owner. Legacy V1/V2 headers and mutable-row preflight
+/// transactions cannot construct it.
+#[doc(hidden)]
+#[derive(Debug, Eq, PartialEq)]
+pub struct FrozenDynamicRowsSpanCapability {
+    program_instance: u64,
+    artifact_identity: [u8; 32],
 }
 
 /// Immutable compact-row descriptor stored in the additive compact tail.
@@ -2853,6 +2870,10 @@ pub struct FrozenDynamicRowsStorage {
 /// pair blocks and V13/V14 own dense `u16` supertransition blocks. No
 /// generation reinterprets an allocation at a wider or differently aligned
 /// type, and exactly one row owner is populated for any published generation.
+/// For variable-width Span programs this owner contains only the closed
+/// forward projection. Reverse postflight uses the prepared runtime's
+/// independently allocated bidirectional K0 workspace, so it cannot alias or
+/// mutate these rows or their publication fields.
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct FrozenDynamicRowsStorageV3 {
@@ -4657,6 +4678,61 @@ impl FrozenPreparedHeaderV6 {
         }
     }
 
+    /// Authenticate the exact immutable V3--V14 owner used by a generated
+    /// variable-Span forward scan and mint its reverse-only postflight token.
+    ///
+    /// V5 is Exists-only. V1/V2 and mutable descriptors are intentionally not
+    /// recognized here, so they retain their preflight admission requirement.
+    /// The owner comparison also binds every published row pointer to a live
+    /// allocation disjoint from the runtime workspace that reverse K0 mutates.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn compiler_private_active_span_capability(
+        &self,
+        owner: &FrozenDynamicRowsStorageV3,
+        expected_artifact_identity: [u8; 32],
+    ) -> Option<FrozenDynamicRowsSpanCapability> {
+        if !self.has_dynamic_rows()
+            || self.v1.flags == FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V5
+            || self.v1.artifact_identity != expected_artifact_identity
+            || owner.artifact_identity != expected_artifact_identity
+        {
+            return None;
+        }
+        let owner_rows = match self.v1.flags {
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V6
+            | FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V7 => {
+                owner.descriptor_v6?.compact
+            }
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3
+            | FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V4
+            | FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V8
+            | FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V9
+            | FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V10
+            | FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V11
+            | FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V12
+            | FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V13
+            | FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V14 => owner.descriptor,
+            _ => return None,
+        };
+        let mut published_rows = self.dynamic_rows_v6.compact;
+        published_rows.ready_seal = 0;
+        if published_rows != owner_rows
+            || self.v1.forward_rows_address != owner_rows.rows_address
+            || self.v1.forward_live_cells != owner.live_cells()
+            || self.v1.cache_identity != owner_rows.cache_identity
+            || self.v1.reverse_rows_address != 0
+            || self.v1.reverse_live_cells != 0
+            || self.v1.reverse_initial_row != FROZEN_PREPARED_HEADER_V1_NO_REVERSE_ROW
+        {
+            return None;
+        }
+        Some(FrozenDynamicRowsSpanCapability {
+            program_instance: owner.program_instance,
+            artifact_identity: expected_artifact_identity,
+        })
+    }
+
     /// Permanently revoke every projection published through this envelope.
     #[doc(hidden)]
     pub fn deactivate(&mut self) {
@@ -4696,10 +4772,11 @@ fn frozen_dynamic_rows_are_closed(rows: &[u32], stride: usize) -> bool {
 }
 
 /// Return whether authenticated K0 rows can discard their Span-only start
-/// provenance and enter the smaller frozen row ABI. Dynamic `Span` requires a
-/// positive exact width, while `Exists` and `SelectedEnd` never observe these
-/// two bits. The row token already identifies the exact post-transition
-/// frontier for every supported output.
+/// provenance and enter the smaller frozen row ABI. Exact-width Span derives
+/// the start arithmetically; variable-width Span reconstructs it in a
+/// capability-authenticated reverse-only postflight; `Exists` and
+/// `SelectedEnd` never observe it. The row token already identifies the exact
+/// post-transition frontier for every supported output.
 fn frozen_dynamic_source_rows_are_normalizable(rows: &[u32], stride: usize) -> bool {
     frozen_dynamic_rows_have_closed_targets(rows, stride)
         && rows
@@ -8323,9 +8400,10 @@ impl CompiledProgram {
             return None;
         }
         let dynamic_view = self.native_dynamic_rows_view()?;
-        // A variable-width Span requires the synchronous admission ticket and
-        // mutable bidirectional K0 workspace after native endpoint selection.
-        // It must never enter the preflight-free immutable header route.
+        // Legacy V2 has no immutable-owner capability for reverse-only
+        // variable-Span postflight. Keep that older publication route on its
+        // synchronous mutable-row admission ticket; V3 and newer are handled
+        // by `compiler_private_frozen_dynamic_rows_storage_v3` below.
         if dynamic_view.output == OutputContract::Span
             && dynamic_view.exact_match_width.is_none()
         {
@@ -8476,11 +8554,8 @@ impl CompiledProgram {
         // for publishing immutable rows; an incomplete cache still declines
         // transactionally.
         let dynamic_view = self.native_dynamic_rows_view()?;
-        if dynamic_view.output == OutputContract::Span
-            && dynamic_view.exact_match_width.is_none()
-        {
-            return None;
-        }
+        let variable_span_recovery = dynamic_view.output == OutputContract::Span
+            && dynamic_view.exact_match_width.is_none();
 
         let mut candidate = self.prepare_workspace().ok()?;
         if candidate.identity.instance != self.identity.instance
@@ -8521,7 +8596,13 @@ impl CompiledProgram {
             || full.unfilled_cell() != direct.unfilled_cell()
             || full.accept_mask() != direct.accept_mask()
             || full.next_row_token_mask() != direct.next_row_token_mask()
-            || full.reverse_rows().is_some()
+            // A variable-width Span prepares bidirectional K0, so its setup
+            // candidate must authenticate a complete reverse projection too.
+            // Only the closed forward projection is copied into this immutable
+            // owner; the separately owned live workspace performs reverse-only
+            // postflight and cannot alias any copied row or publication field.
+            || full.reverse_rows().is_some() != variable_span_recovery
+            || full.reverse_initial_row().is_some() != variable_span_recovery
             || full.initial_pending()
             || full.initial_terminal()
             || direct.initial_pending()
@@ -10845,6 +10926,60 @@ impl CompiledProgram {
         expected_artifact_identity: [u8; 32],
         selected_end: usize,
     ) -> Result<MatchResult, CompileError> {
+        self.recover_dynamic_native_rows_span_from_selected_end_impl(
+            haystack,
+            window,
+            workspace,
+            expected_artifact_identity,
+            selected_end,
+            None,
+        )
+    }
+
+    /// Recover a variable-width Span start after an active immutable V3--V14
+    /// forward table selected its authoritative endpoint.
+    ///
+    /// This route has no mutable-row admission ticket. Its opaque capability
+    /// instead binds the active header to the exact pointer-stable sidecar and
+    /// program lineage. Reverse K0 receives only the separate live workspace;
+    /// it cannot mutate the header or any sidecar allocation.
+    /// # Safety
+    ///
+    /// `capability` must have been minted synchronously from the still-active
+    /// [`FrozenPreparedHeaderV6`] and exact [`FrozenDynamicRowsStorageV3`]
+    /// owner retained by this prepared program. Neither the header nor owner
+    /// may be deactivated, replaced, mutated, moved out, or dropped before
+    /// this call returns. The selected endpoint must be the one produced by
+    /// the immediately preceding native scan of that owner over `window`.
+    #[doc(hidden)]
+    pub unsafe fn recover_frozen_dynamic_rows_span_from_selected_end_with_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+        expected_artifact_identity: [u8; 32],
+        selected_end: usize,
+        capability: FrozenDynamicRowsSpanCapability,
+    ) -> Result<MatchResult, CompileError> {
+        self.recover_dynamic_native_rows_span_from_selected_end_impl(
+            haystack,
+            window,
+            workspace,
+            expected_artifact_identity,
+            selected_end,
+            Some(capability),
+        )
+    }
+
+    fn recover_dynamic_native_rows_span_from_selected_end_impl(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+        expected_artifact_identity: [u8; 32],
+        selected_end: usize,
+        compact_capability: Option<FrozenDynamicRowsSpanCapability>,
+    ) -> Result<MatchResult, CompileError> {
         if window.start > window.end || window.end > haystack.len() {
             return Err(CompileError::InvalidWindow {
                 start: window.start,
@@ -10853,17 +10988,28 @@ impl CompiledProgram {
             });
         }
 
-        // Take the capability before authenticating any caller-controlled
-        // payload. A malformed private call cannot retain and replay a live
-        // admission against a later endpoint.
-        let admitted_window = workspace
-            .dynamic_native_rows
-            .as_deref_mut()
-            .and_then(|dynamic| dynamic.state.take_native_entry_window());
-        if admitted_window != Some(window) {
-            return Err(CompileError::InternalInvariant(
-                "dynamic native-row Span recovery window was not admitted by preflight",
-            ));
+        let compact_recovery = compact_capability.is_some();
+        if let Some(capability) = compact_capability {
+            if capability.program_instance != self.identity.instance
+                || capability.artifact_identity != expected_artifact_identity
+            {
+                return Err(CompileError::InternalInvariant(
+                    "frozen dynamic-row Span capability does not match the prepared program",
+                ));
+            }
+        } else {
+            // Take the mutable-row capability before authenticating any
+            // caller-controlled payload. A malformed private call cannot retain
+            // and replay a live admission against a later endpoint.
+            let admitted_window = workspace
+                .dynamic_native_rows
+                .as_deref_mut()
+                .and_then(|dynamic| dynamic.state.take_native_entry_window());
+            if admitted_window != Some(window) {
+                return Err(CompileError::InternalInvariant(
+                    "dynamic native-row Span recovery window was not admitted by preflight",
+                ));
+            }
         }
         if expected_artifact_identity != self.identity.artifact {
             return Err(CompileError::InternalInvariant(
@@ -10910,7 +11056,9 @@ impl CompiledProgram {
                 "reverse K0 did not recover a dynamic-row span inside its admitted window at the native-selected endpoint",
             ));
         }
-        if let Some(dynamic) = workspace.dynamic_native_rows.as_deref_mut() {
+        if !compact_recovery
+            && let Some(dynamic) = workspace.dynamic_native_rows.as_deref_mut()
+        {
             dynamic.state.settle_consumed_local_completion();
         }
         Ok(MatchResult::Span(Some((recovered_start, selected_end))))
@@ -14990,7 +15138,7 @@ mod tests {
                 usize::MAX,
                 usize::MAX,
             )
-            .is_none());
+            .is_some());
         let mut warmed = vec![b'!'; DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES];
         warmed[0] = b'a';
         let window = SearchWindow::full(&warmed);
@@ -15180,6 +15328,103 @@ mod tests {
             None,
             "malformed postflight must consume the admission"
         );
+    }
+
+    #[test]
+    fn frozen_dynamic_rows_variable_span_recovery_is_repeatable_and_disjoint() {
+        let compiled = raw_program(
+            &scanner_free_variable_pair_raw(),
+            OutputContract::Span,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        let mut workspace = compiled.prepare_workspace().expect("dynamic workspace");
+        let (live_forward_rows, live_reverse_rows) = {
+            let nfa = workspace.nfa.as_mut().expect("bidirectional K0 workspace");
+            let receipt = nfa
+                .compiler_private_try_prefill_root_cache_with_receipt(&compiled.automaton)
+                .expect("complete variable-Span setup projection");
+            let full = nfa
+                .compiler_private_fully_prefilled_root_projection_without_resume(
+                    &compiled.automaton,
+                    receipt,
+                )
+                .expect("authenticated bidirectional projection");
+            (
+                full.forward_rows_address().expose_provenance(),
+                full.reverse_rows_address()
+                    .expect("variable Span reverse rows")
+                    .expose_provenance(),
+            )
+        };
+        assert_ne!(live_forward_rows, live_reverse_rows);
+
+        let storage = compiled
+            .compiler_private_frozen_dynamic_rows_storage_v3(
+                &workspace,
+                usize::MAX,
+                usize::MAX,
+            )
+            .expect("closed variable-Span forward owner");
+        let frozen_rows = storage.descriptor().rows_address;
+        assert_ne!(frozen_rows, live_forward_rows);
+        assert_ne!(frozen_rows, live_reverse_rows);
+        assert_ne!(storage.class_map.as_ptr().expose_provenance(), live_reverse_rows);
+
+        let identity = compiled.artifact_identity();
+        let mut header = compiled.compiler_private_frozen_prepared_header_v6(
+            &workspace,
+            None,
+            Some(&storage),
+        );
+        assert!(header.has_dynamic_rows());
+        assert_eq!(header.v1.reverse_rows_address, 0);
+        assert_eq!(header.v1.reverse_live_cells, 0);
+        assert_eq!(
+            header.v1.reverse_initial_row,
+            FROZEN_PREPARED_HEADER_V1_NO_REVERSE_ROW
+        );
+
+        let mut haystack = vec![b'!'; DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES + 8];
+        haystack[3..5].copy_from_slice(b"bq");
+        let window = SearchWindow::new(3, haystack.len());
+        for invocation in 0..2 {
+            let capability = header
+                .compiler_private_active_span_capability(&storage, identity)
+                .expect("active exact compact owner");
+            // SAFETY: this test retains the exact active header and immutable
+            // owner that synchronously minted `capability` across the call.
+            let recovered = unsafe {
+                compiled.recover_frozen_dynamic_rows_span_from_selected_end_with_workspace(
+                    &haystack,
+                    window,
+                    &mut workspace,
+                    identity,
+                    5,
+                    capability,
+                )
+            };
+            assert_eq!(
+                recovered
+                    .unwrap_or_else(|error| panic!("compact invocation {invocation}: {error}")),
+                MatchResult::Span(Some((3, 5)))
+            );
+            assert!(header.is_active(), "successful reverse K0 is disjoint");
+            assert!(workspace
+                .dynamic_native_rows
+                .as_deref()
+                .is_some_and(|dynamic| dynamic.state.native_entry_window.is_none()));
+        }
+
+        let mut wrong_identity = identity;
+        wrong_identity[0] ^= 1;
+        assert!(header
+            .compiler_private_active_span_capability(&storage, wrong_identity)
+            .is_none());
+        header.deactivate();
+        assert!(header
+            .compiler_private_active_span_capability(&storage, identity)
+            .is_none());
     }
 
     #[test]
@@ -24966,16 +25211,25 @@ mod tests {
         assert_eq!(variable_view.root_requirement, None);
         assert_eq!(variable_view.exact_match_width, None);
         let variable_workspace = variable_span.prepare_workspace().unwrap();
-        assert!(
-            variable_span
-                .compiler_private_frozen_dynamic_rows_storage_v3(
-                    &variable_workspace,
-                    usize::MAX,
-                    usize::MAX,
-                )
-                .is_none(),
-            "variable Span must retain synchronous reverse recovery"
+        let variable_storage = variable_span
+            .compiler_private_frozen_dynamic_rows_storage_v3(
+                &variable_workspace,
+                usize::MAX,
+                usize::MAX,
+            )
+            .expect("variable Span publishes a closed forward compact owner");
+        let variable_header = variable_span.compiler_private_frozen_prepared_header_v6(
+            &variable_workspace,
+            None,
+            Some(&variable_storage),
         );
+        assert!(variable_header.has_dynamic_rows());
+        assert!(variable_header
+            .compiler_private_active_span_capability(
+                &variable_storage,
+                variable_span.artifact_identity(),
+            )
+            .is_some());
 
         let compiled = raw_program(
             &scanner_free_nonloop_pair_raw(),

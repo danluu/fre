@@ -2111,12 +2111,12 @@ fn lower_native_dynamic_rows_prepared(
     };
     let variable_span_recovery =
         view.output == OutputContract::Span && view.exact_match_width.is_none();
-    // Variable-width Span requires reverse-K0 recovery, while immutable
-    // compact rows deliberately retain no reverse owner. This semantic fact
-    // is target-neutral and must govern code emission even when a target
-    // cannot install the graph root that independently excludes fused
-    // supertransitions.
-    let immutable_compact_possible = !variable_span_recovery;
+    // The compact owner is a closed forward projection. Variable Span can use
+    // it because the exact active V3--V14 capability authorizes a reverse-only
+    // postflight in the separately owned bidirectional K0 workspace. This
+    // target-neutral proof is unavailable to V1/V2 and mutable descriptors,
+    // which retain their single-use preflight ticket below.
+    let immutable_compact_possible = true;
     let supertransitions_possible =
         immutable_compact_possible && view.root_requirement.is_none();
     let identity_offset =
@@ -12980,7 +12980,9 @@ fn lower_x86_64_slow_partial_wrapper(
 ///
 /// Production exclusive handles use an active-capability mode: construction
 /// fully validates the private immutable owner before publishing both seals,
-/// and every route that can mutate prepared state clears the active seal first.
+/// and every route that can mutate capability-owned state clears the active
+/// seal first. Reverse-only variable-Span postflight mutates only the disjoint
+/// live K0 workspace and therefore retains the owner on success.
 /// Fixed-width SIMD modes preserve that proof while comparing the exact
 /// artifact identity with one branch. Portable AArch64 targets retain the
 /// scalar capability because ASIMD is an explicit target feature in this
@@ -13917,10 +13919,16 @@ fn x86_emit_frozen_compact_entry(
         }
     }
 
-    assembler.instruction(&[0x4c, 0x8b, 0x54, 0x24, 0x28])?;
-    assembler.instruction(&[0x4c, 0x89, 0x54, 0x24, 0x40])?;
-    assembler.instruction(&[0x4c, 0x8b, 0x54, 0x24, 0x30])?;
-    assembler.instruction(&[0x4c, 0x89, 0x54, 0x24, 0x48])?;
+    // Preserve the standalone full verifier byte contract. Production
+    // lowering saves these public bounds once before its selector lattice,
+    // avoiding the historical four-instruction copy in every format guard.
+    if guard_mode == FrozenCompactGuardMode::FullVerifier {
+        assembler.instruction(&[0x4c, 0x8b, 0x54, 0x24, 0x28])?;
+        assembler.instruction(&[0x4c, 0x89, 0x54, 0x24, 0x40])?;
+        assembler.instruction(&[0x4c, 0x8b, 0x54, 0x24, 0x30])?;
+        assembler.instruction(&[0x4c, 0x89, 0x54, 0x24, 0x48])?;
+    }
+
     if format == FrozenCompactNativeFormat::UnaryExistsV5 {
         assembler.instruction(&[
             0x45,
@@ -14500,8 +14508,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
     allow_direct_hole_continuation: bool,
     direct_byte_formats_possible: bool,
 ) -> Result<NativeDynamicRowsEmission, ObjectError> {
-    let immutable_compact_possible =
-        !(output == OutputContract::Span && exact_span_width.is_none());
+    let immutable_compact_possible = true;
     let supertransitions_possible = immutable_compact_possible && root_plan.is_none();
     lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         root_plan,
@@ -14570,8 +14577,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         SCANNER_FREE_FRAME_BYTES
     };
     let variable_span_recovery = output == OutputContract::Span && exact_span_width.is_none();
-    if immutable_compact_possible != !variable_span_recovery
-        || supertransitions_possible && (!immutable_compact_possible || root_plan.is_some())
+    if supertransitions_possible && (!immutable_compact_possible || root_plan.is_some())
     {
         return Err(ObjectError::InvalidModule(
             "x86 dynamic compact capabilities are semantically inconsistent",
@@ -14794,9 +14800,16 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     // target-feature vocabulary is empty. Keeping this fixed-width guard also
     // avoids introducing wide-vector transition state into scalar entries.
     let compact_guard_mode = FrozenCompactGuardMode::ActiveCapabilitySimdIdentity;
+    // Preserve the exact public window once, before any compact guard uses
+    // caller-saved registers. A successful V3--V14 variable-Span scan passes
+    // these original bounds to its capability-authenticated postflight;
+    // preflight is still free to overwrite the same private record.
+    assembler.instruction(&[0x48, 0x89, 0x4c, 0x24, 0x40])?;
+    assembler.instruction(&[0x4c, 0x89, 0x44, 0x24, 0x48])?;
 
-    // Keep the complete V3--V14 selector lattice out of machine code when
-    // target-neutral output semantics make every immutable format impossible.
+    // Keep this compile-time gate paired with the compact bodies. Every
+    // current dynamic-row output supports immutable rows; variable Span uses
+    // the active-owner reverse-only postflight described above.
     if immutable_compact_possible {
     if output == OutputContract::Exists {
         x86_emit_frozen_compact_v5_entry(
@@ -14933,12 +14946,18 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         assembler.instruction(&compare_maximum)?;
         assembler.branch(&[0x0f, 0x87], framed_short_fallback)?;
     }
-    x86_emit_frozen_dynamic_entry(
-        &mut assembler,
-        call_preflight,
-        preflight_enter,
-        root_plan.is_some(),
-    )?;
+    if variable_span_recovery {
+        // V2 has no immutable compact postflight capability. It and every
+        // mutable descriptor must obtain the exact single-use window ticket.
+        assembler.branch(&[0xe9], call_preflight)?;
+    } else {
+        x86_emit_frozen_dynamic_entry(
+            &mut assembler,
+            call_preflight,
+            preflight_enter,
+            root_plan.is_some(),
+        )?;
+    }
 
     assembler.bind(call_preflight)?;
     if root_plan.is_none() {
@@ -14974,8 +14993,8 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
 
     let mut v7_loop_scan_displacement_label = None;
     let mut v6_loop_scan_displacement_label = None;
-    // Bodies share the selector's compile-time gate so unreachable labels do
-    // not leave cold decoder or helper-call bytes in a variable-Span entry.
+    // Bodies share the selector's compile-time gate so a future semantic
+    // opt-out cannot leave unreachable decoder or helper-call bytes behind.
     if immutable_compact_possible {
     assembler.bind(v5_enter)?;
     if output == OutputContract::Exists {
@@ -24190,10 +24209,15 @@ fn aarch64_emit_frozen_compact_entry(
         }
     }
 
-    assembler.instruction(aarch64_load_x_imm(8, 31, 24)?)?;
-    assembler.instruction(aarch64_store_x(8, 31, 48)?)?;
-    assembler.instruction(aarch64_load_x_imm(8, 31, 32)?)?;
-    assembler.instruction(aarch64_store_x(8, 31, 56)?)?;
+    // Preserve the standalone full verifier instruction contract. Production
+    // lowering saves the bounds once before selecting a compact format.
+    if guard_mode == FrozenCompactGuardMode::FullVerifier {
+        assembler.instruction(aarch64_load_x_imm(8, 31, 24)?)?;
+        assembler.instruction(aarch64_store_x(8, 31, 48)?)?;
+        assembler.instruction(aarch64_load_x_imm(8, 31, 32)?)?;
+        assembler.instruction(aarch64_store_x(8, 31, 56)?)?;
+    }
+
     if format == FrozenCompactNativeFormat::UnaryExistsV5 {
         assembler.instruction(aarch64_load_w_imm(
             7,
@@ -24880,8 +24904,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
     allow_direct_hole_continuation: bool,
     direct_byte_formats_possible: bool,
 ) -> Result<NativeDynamicRowsEmission, ObjectError> {
-    let immutable_compact_possible =
-        !(output == OutputContract::Span && exact_span_width.is_none());
+    let immutable_compact_possible = true;
     let supertransitions_possible = immutable_compact_possible && root_plan.is_none();
     lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         root_plan,
@@ -24957,8 +24980,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         .checked_sub(8)
         .ok_or(ObjectError::ArithmeticOverflow("AArch64 dynamic link offset"))?;
     let variable_span_recovery = output == OutputContract::Span && exact_span_width.is_none();
-    if immutable_compact_possible != !variable_span_recovery
-        || supertransitions_possible && (!immutable_compact_possible || root_plan.is_some())
+    if supertransitions_possible && (!immutable_compact_possible || root_plan.is_some())
     {
         return Err(ObjectError::InvalidModule(
             "AArch64 dynamic compact capabilities are semantically inconsistent",
@@ -25140,9 +25162,15 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     } else {
         FrozenCompactGuardMode::ActiveCapability
     };
+    // Preserve the exact public window before any compact guard repurposes
+    // caller-saved registers. Preflight may overwrite these two record words;
+    // a V3--V14 variable-Span match carries them unchanged to postflight.
+    assembler.instruction(aarch64_store_x(3, 31, 48)?)?;
+    assembler.instruction(aarch64_store_x(4, 31, 56)?)?;
 
-    // Keep the complete V3--V14 selector lattice out of machine code when
-    // target-neutral output semantics make every immutable format impossible.
+    // Keep this compile-time gate paired with the compact bodies. Every
+    // current dynamic-row output supports immutable rows; variable Span uses
+    // the active-owner reverse-only postflight described above.
     if immutable_compact_possible {
     if output == OutputContract::Exists {
         aarch64_emit_frozen_compact_v5_entry(
@@ -25277,12 +25305,18 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         assembler.instruction(aarch64_cmp_x_imm(8, maximum)?)?;
         assembler.branch_cond(AARCH64_HI, framed_short_fallback)?;
     }
-    aarch64_emit_frozen_dynamic_entry(
-        &mut assembler,
-        call_preflight,
-        preflight_enter,
-        root_plan.is_some(),
-    )?;
+    if variable_span_recovery {
+        // Legacy V2 has no active compact Span capability. Preserve its exact
+        // admission/revocation transaction together with mutable rows.
+        assembler.branch(call_preflight)?;
+    } else {
+        aarch64_emit_frozen_dynamic_entry(
+            &mut assembler,
+            call_preflight,
+            preflight_enter,
+            root_plan.is_some(),
+        )?;
+    }
 
     assembler.bind(call_preflight)?;
     if root_plan.is_none() {
@@ -25318,8 +25352,8 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
 
     let mut v7_loop_scan_branch = None;
     let mut v6_loop_scan_branch = None;
-    // Bodies share the selector's compile-time gate so unreachable labels do
-    // not leave cold decoder or helper-call bytes in a variable-Span entry.
+    // Bodies share the selector's compile-time gate so a future semantic
+    // opt-out cannot leave unreachable decoder or helper-call bytes behind.
     if immutable_compact_possible {
     assembler.bind(v5_enter)?;
     if output == OutputContract::Exists {
@@ -35394,7 +35428,7 @@ mod tests {
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "one cross-ISA audit proves variable Span code DCE and fixed-width preservation"
+        reason = "one cross-ISA audit proves variable Span compact coverage, legacy admission, and fixed-width preservation"
     )]
     fn dynamic_variable_span_codegen_calls_recovery_on_both_architectures() {
         fn byte_occurrences(code: &[u8], needle: &[u8]) -> usize {
@@ -35410,16 +35444,13 @@ mod tests {
                 .count()
         }
 
-        const COMPACT_FLAGS: [u32; 12] = [
+        const VARIABLE_SPAN_COMPACT_FLAGS: [u32; 9] = [
             FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3,
             FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V4,
-            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V5,
             FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V6,
             FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V7,
             FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V8,
-            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V9,
             FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V10,
-            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V11,
             FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V12,
             FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V13,
             FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V14,
@@ -35488,17 +35519,28 @@ mod tests {
                 .iter()
                 .filter(|relocation| relocation.symbol == DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL)
                 .count(),
-            0,
-            "variable Span has no immutable V6/V7 loop bodies"
+            2,
+            "variable Span retains both immutable V6/V7 loop bodies"
         );
-        for flag in COMPACT_FLAGS {
+        for flag in VARIABLE_SPAN_COMPACT_FLAGS {
             assert_eq!(
                 byte_occurrences(&x86.code, &x86_flag(flag)),
-                0,
-                "x86 variable Span retained compact flag {flag:#x}"
+                1,
+                "x86 variable Span lost compact flag {flag:#x}"
             );
         }
-        assert_eq!(
+        for excluded in [
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V5,
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V9,
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V11,
+        ] {
+            assert_eq!(
+                byte_occurrences(&x86.code, &x86_flag(excluded)),
+                0,
+                "x86 variable Span retained unsupported compact flag {excluded:#x}"
+            );
+        }
+        assert_ne!(
             byte_occurrences(
                 &x86.code,
                 &[
@@ -35508,15 +35550,15 @@ mod tests {
                 ],
             ),
             0,
-            "x86 variable Span retained paired compact bodies"
+            "x86 variable Span lost its dense-pair compact body"
         );
         assert_eq!(
             byte_occurrences(
                 &x86.code,
                 &x86_flag(FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS),
             ),
-            1,
-            "x86 variable Span retains the ordinary V1/V2 entry"
+            0,
+            "x86 variable Span must send legacy V1/V2 through preflight"
         );
 
         let arm = lower_aarch64_dynamic_rows_prepared_for_output(
@@ -35563,22 +35605,33 @@ mod tests {
                 .iter()
                 .filter(|relocation| relocation.symbol == DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL)
                 .count(),
-            0,
-            "variable Span has no immutable V6/V7 loop bodies"
+            2,
+            "variable Span retains both immutable V6/V7 loop bodies"
         );
         let arm_words = arm
             .code
             .chunks_exact(4)
             .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
             .collect::<Vec<_>>();
-        for flag in COMPACT_FLAGS {
+        for flag in VARIABLE_SPAN_COMPACT_FLAGS {
             assert_eq!(
                 word_occurrences(&arm_words, &arm_flag(flag)),
-                0,
-                "AArch64 variable Span retained compact flag {flag:#x}"
+                1,
+                "AArch64 variable Span lost compact flag {flag:#x}"
             );
         }
-        assert_eq!(
+        for excluded in [
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V5,
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V9,
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V11,
+        ] {
+            assert_eq!(
+                word_occurrences(&arm_words, &arm_flag(excluded)),
+                0,
+                "AArch64 variable Span retained unsupported compact flag {excluded:#x}"
+            );
+        }
+        assert_ne!(
             word_occurrences(
                 &arm_words,
                 &[
@@ -35587,7 +35640,7 @@ mod tests {
                 ],
             ),
             0,
-            "AArch64 variable Span retained paired compact bodies"
+            "AArch64 variable Span lost its dense-pair compact body"
         );
         let arm_v2_flag = [
             aarch64_load_w_imm(
@@ -35606,13 +35659,13 @@ mod tests {
         ];
         assert_eq!(
             word_occurrences(&arm_words, &arm_v2_flag),
-            1,
-            "AArch64 variable Span retains the ordinary V1/V2 entry"
+            0,
+            "AArch64 variable Span must send legacy V1/V2 through preflight"
         );
 
-        // A graph root still scans candidates for the ordinary mutable V1
-        // rows, but it must not retain representation tags whose immutable
-        // compact bodies cannot preserve a variable-width Span start.
+        // A graph root retains the one-symbol compact formats. It excludes
+        // only pair/quad supertransitions because those cannot cross root
+        // scanner ownership; legacy V1/V2 still enters through preflight.
         let filter = dynamic_root_test_filter(b"a", 0);
         let rooted_x86 = lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
             Some(X86DynamicRootPlan::Range(filter)),
@@ -35631,9 +35684,23 @@ mod tests {
                     0x49, 0xff, 0xc4, // scanner-hit accounting
                 ],
             ),
-            1,
-            "x86 variable Span must have no compact tag dispatch between representation load and V1 accounting"
+            0,
+            "x86 rooted variable Span must dispatch compact tags before V1 accounting"
         );
+        assert_eq!(
+            byte_occurrences(
+                &rooted_x86.code,
+                &x86_flag(FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3),
+            ),
+            1,
+            "x86 rooted variable Span lost ordinary compact rows"
+        );
+        for excluded in [
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V13,
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V14,
+        ] {
+            assert_eq!(byte_occurrences(&rooted_x86.code, &x86_flag(excluded)), 0);
+        }
         let mut arm_data = vec![0_u8; 32];
         let arm_root = install_aarch64_dynamic_root_plan(
             &mut arm_data,
@@ -35663,9 +35730,23 @@ mod tests {
                     aarch64_add_x_imm(19, 19, 1).unwrap(),
                 ],
             ),
-            1,
-            "AArch64 variable Span must have no compact tag dispatch between representation load and V1 accounting"
+            0,
+            "AArch64 rooted variable Span must dispatch compact tags before V1 accounting"
         );
+        assert_eq!(
+            word_occurrences(
+                &rooted_arm_words,
+                &arm_flag(FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3),
+            ),
+            1,
+            "AArch64 rooted variable Span lost ordinary compact rows"
+        );
+        for excluded in [
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V13,
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V14,
+        ] {
+            assert_eq!(word_occurrences(&rooted_arm_words, &arm_flag(excluded)), 0);
+        }
 
         // Established fixed-width Span lowering remains self-contained and
         // has no dependency on the new postflight symbol. Its compact rows
@@ -35719,8 +35800,6 @@ mod tests {
             ),
             1
         );
-        assert!(x86.code.len() < exact_x86.code.len());
-        assert!(arm.code.len() < exact_arm.code.len());
     }
 
     #[test]
@@ -35817,8 +35896,8 @@ mod tests {
                         relocation.symbol == DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL
                     })
                     .count(),
-                0,
-                "top-level variable Span loop-body DCE: {target:?}"
+                2,
+                "top-level variable Span loop-body coverage: {target:?}"
             );
 
             match target.architecture {
@@ -35860,8 +35939,8 @@ mod tests {
                             variable_span_code,
                             &flag(FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3),
                         ),
-                        0,
-                        "top-level x86 variable Span retained compact rows"
+                        1,
+                        "top-level x86 variable Span lost compact rows"
                     );
                 }
                 Architecture::Aarch64 => {
@@ -35917,8 +35996,8 @@ mod tests {
                             &variable_span_words,
                             &flag(FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3),
                         ),
-                        0,
-                        "top-level AArch64 variable Span retained compact rows"
+                        1,
+                        "top-level AArch64 variable Span lost compact rows"
                     );
                 }
             }
@@ -36357,6 +36436,7 @@ mod tests {
         program: &CompiledProgram,
         target: Target,
         expects_root_scanner: bool,
+        use_frozen_owner: bool,
         label: &str,
         window: SearchWindow,
         cases: &[LinkedDynamicFirstHoleCase<'_>],
@@ -36375,6 +36455,27 @@ mod tests {
             .native_dynamic_rows_view()
             .expect("dynamic first-hole program view");
         assert_eq!(view.root_requirement.is_some(), expects_root_scanner);
+        if use_frozen_owner {
+            assert_eq!(view.output, OutputContract::Span);
+            assert_eq!(view.exact_match_width, None);
+            let workspace = program
+                .prepare_workspace()
+                .expect("compact link-proof workspace");
+            let storage = program
+                .compiler_private_frozen_dynamic_rows_storage_v3(
+                    &workspace,
+                    usize::MAX,
+                    usize::MAX,
+                )
+                .expect("compact link-proof owner");
+            assert!(program
+                .compiler_private_frozen_prepared_header_v6(
+                    &workspace,
+                    None,
+                    Some(&storage),
+                )
+                .has_dynamic_rows());
+        }
         let module = CompiledModule::lower(program, target).expect("lower dynamic host object");
         assert_eq!(
             module.required_prepared_dynamic_rows_continue_runtime_symbol(),
@@ -36426,10 +36527,54 @@ mod tests {
         let object_path = directory.join("dynamic.o");
         fs::write(&object_path, object).expect("write dynamic-hole object");
 
+        let warm_native = if use_frozen_owner {
+            String::new()
+        } else {
+            format!(
+                "uint32_t ws=fre_aot_regex_runtime_search_exclusive_v1(native,warm,length,{}U,{}U,&wr);if(ws!=1U)return base+1;",
+                window.start(),
+                window.end(),
+            )
+        };
+        let repeat_native = if use_frozen_owner {
+            format!(
+                "uint32_t rs=call_native(native,novel,length,{}U,{}U,&rr);if(rs!=bs||rr.start!=br.start||rr.end!=br.end)return base+4;",
+                window.start(),
+                window.end(),
+            )
+        } else {
+            String::new()
+        };
+        let compact_flag_predicate = [
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3,
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V4,
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V6,
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V7,
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V8,
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V9,
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V10,
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V11,
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V12,
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V13,
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V14,
+        ]
+        .into_iter()
+        .map(|flag| format!("flags=={flag}U"))
+        .collect::<Vec<_>>()
+        .join("||");
+        let require_frozen_owner = if use_frozen_owner {
+            "if(!active_dynamic_owner(native))return base+6;"
+        } else {
+            ""
+        };
         let mut source = format!(
-            "#include <stddef.h>\n#include <stdint.h>\n\
+            "#include <stddef.h>\n#include <stdint.h>\n#include <string.h>\n\
              typedef void *handle_t;\
              typedef struct{{size_t start;size_t end;}} result_t;\n\
+             static int active_dynamic_owner(handle_t h){{uint64_t seal=0;uint32_t flags=0;\
+               memcpy(&seal,(const unsigned char*)h+{active_seal_offset}U,sizeof(seal));\
+               memcpy(&flags,(const unsigned char*)h+{flags_offset}U,sizeof(flags));\
+               return seal==UINT64_C(0x{active_seal:x})&&({compact_flag_predicate});}}\n\
              extern const unsigned char {program_symbol}[];\n\
              extern uint32_t {symbol}(handle_t,const unsigned char*,size_t,size_t,size_t,result_t*);\n\
              static uint32_t call_native(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r){{\n\
@@ -36456,15 +36601,21 @@ mod tests {
              static int prepare(handle_t *h){{return fre_aot_regex_runtime_prepare_exclusive_v1({program_symbol},{program_len}U,h)==0U;}}\n\
              static int destroy(handle_t h){{return fre_aot_regex_runtime_destroy_exclusive_v1(h)==0U;}}\n\
              static int run_case(const unsigned char *warm,const unsigned char *novel,size_t length,uint32_t expected_status,size_t expected_start,size_t expected_end,int base){{\
-               handle_t native=0,baseline=0;result_t wr={{91U,92U}},nr={{93U,94U}},br={{95U,96U}};\
+               handle_t native=0,baseline=0;result_t wr={{91U,92U}},nr={{93U,94U}},rr={{97U,98U}},br={{95U,96U}};\
                if(!prepare(&native)||!prepare(&baseline))return base;\
-               uint32_t ws=fre_aot_regex_runtime_search_exclusive_v1(native,warm,length,{window_start}U,{window_end}U,&wr);\
-               if(ws!=1U)return base+1;\
+               {require_frozen_owner}\
+               {warm_native}\
                uint32_t ns=call_native(native,novel,length,{window_start}U,{window_end}U,&nr);\
                uint32_t bs=fre_aot_regex_runtime_search_exclusive_v1(baseline,novel,length,{window_start}U,{window_end}U,&br);\
                if(ns!=bs||nr.start!=br.start||nr.end!=br.end)return base+2;\
                if(ns!=expected_status||nr.start!=expected_start||nr.end!=expected_end)return base+3;\
-               if(!destroy(native)||!destroy(baseline))return base+4;return 0;}}\n",
+               {require_frozen_owner}\
+               {repeat_native}\
+               {require_frozen_owner}\
+               if(!destroy(native)||!destroy(baseline))return base+5;return 0;}}\n",
+            active_seal = FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL,
+            active_seal_offset = FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL_OFFSET,
+            flags_offset = FROZEN_PREPARED_HEADER_V1_FLAGS_OFFSET,
             window_start = window.start(),
             window_end = window.end(),
         );
@@ -36635,6 +36786,7 @@ mod tests {
                 &program,
                 target,
                 false,
+                false,
                 &format!("{output:?}"),
                 window,
                 &[
@@ -36673,6 +36825,7 @@ mod tests {
         link_real_dynamic_first_hole_cases(
             &pending_program,
             target,
+            false,
             false,
             "SelectedEndPending",
             window,
@@ -36759,6 +36912,7 @@ mod tests {
                 compiled.program(),
                 target,
                 true,
+                false,
                 &format!("Root{output:?}"),
                 window,
                 &[
@@ -36803,7 +36957,32 @@ mod tests {
             variable.program(),
             target,
             true,
+            false,
             "RootVariableSpan",
+            window,
+            &[
+                LinkedDynamicFirstHoleCase {
+                    warm: &variable_warm,
+                    novel: &variable_match,
+                    expected_status: 1,
+                    expected_start: candidate,
+                    expected_end: candidate + 3,
+                },
+                LinkedDynamicFirstHoleCase {
+                    warm: &variable_warm,
+                    novel: &variable_no_match,
+                    expected_status: 0,
+                    expected_start: 0,
+                    expected_end: 0,
+                },
+            ],
+        );
+        link_real_dynamic_first_hole_cases(
+            variable.program(),
+            target,
+            true,
+            true,
+            "RootVariableSpanCompact",
             window,
             &[
                 LinkedDynamicFirstHoleCase {
@@ -36856,6 +37035,7 @@ mod tests {
                 cut.program(),
                 target,
                 true,
+                false,
                 &format!("CutRoot{output:?}"),
                 cut_window,
                 &[
@@ -36875,6 +37055,36 @@ mod tests {
                     },
                 ],
             );
+            if output == OutputContract::Span {
+                // The integrated runtime retains both this optimizing
+                // fallback receipt and its independently closed compact
+                // owner. The active compact header wins generated entry while
+                // the receipt remains available to any later fallback.
+                link_real_dynamic_first_hole_cases(
+                    cut.program(),
+                    target,
+                    true,
+                    true,
+                    "CutRootVariableSpanCompact",
+                    cut_window,
+                    &[
+                        LinkedDynamicFirstHoleCase {
+                            warm: &cut_warm,
+                            novel: &cut_match,
+                            expected_status: 1,
+                            expected_start,
+                            expected_end,
+                        },
+                        LinkedDynamicFirstHoleCase {
+                            warm: &cut_warm,
+                            novel: &cut_no_match,
+                            expected_status: 0,
+                            expected_start: 0,
+                            expected_end: 0,
+                        },
+                    ],
+                );
+            }
         }
     }
 
@@ -36886,7 +37096,7 @@ mod tests {
     #[ignore = "requires `cargo build -p fre-aot-regex-runtime --lib`; links variable-Span generated code to the real postflight runtime"]
     #[allow(
         clippy::too_many_lines,
-        reason = "the opt-in host link test owns one exhaustive all-window C differential"
+        reason = "the opt-in host link test owns one exhaustive repeated all-window C differential"
     )]
     fn linked_host_dynamic_variable_span_all_windows_uses_real_runtime() {
         use std::{fmt::Write as _, fs, process::Command, time::SystemTime};
@@ -36992,13 +37202,13 @@ mod tests {
              static int prepare(handle_t *h){{return fre_aot_regex_runtime_prepare_exclusive_v1({program_symbol},{program_len}U,h)==0U;}}\n\
              static int run(const unsigned char *h,size_t n,int base){{\n\
                for(size_t start=0;start<=n;start++)for(size_t end=start;end<=n;end++){{\n\
-                 handle_t native=0,oracle=0;result_t warm={{91U,92U}},got={{93U,94U}},expected={{95U,96U}};\n\
+                 handle_t native=0,oracle=0;result_t got={{91U,92U}},again={{93U,94U}},expected={{95U,96U}};\n\
                  if(!prepare(&native)||!prepare(&oracle))return base;\n\
-                 uint32_t ws=fre_aot_regex_runtime_search_exclusive_v1(native,h,n,start,end,&warm);\n\
                  uint32_t os=fre_aot_regex_runtime_search_exclusive_v1(oracle,h,n,start,end,&expected);\n\
                  uint32_t ns={entry}(native,h,n,start,end,&got);\n\
-                 if(ws!=os||warm.start!=expected.start||warm.end!=expected.end)return base+1;\n\
-                 if(ns!=os||got.start!=expected.start||got.end!=expected.end)return base+2;\n\
+                 uint32_t rs={entry}(native,h,n,start,end,&again);\n\
+                 if(ns!=os||got.start!=expected.start||got.end!=expected.end)return base+1;\n\
+                 if(rs!=os||again.start!=expected.start||again.end!=expected.end)return base+2;\n\
                  if(fre_aot_regex_runtime_destroy_exclusive_v1(native)!=0U||fre_aot_regex_runtime_destroy_exclusive_v1(oracle)!=0U)return base+3;\n\
                }}return 0;}}\n"
         );

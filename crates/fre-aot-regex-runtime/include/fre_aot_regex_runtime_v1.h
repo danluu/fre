@@ -144,11 +144,14 @@ uint32_t fre_aot_regex_runtime_search_exclusive_recover_partial_span_v1(
 
 /*
  * Recover the selected start after a variable-width, non-nullable dynamic-row
- * scan completes locally with only its endpoint. The identity and exact
- * window must match the immediately preceding successful dynamic-row
- * preflight on this exclusive session. selected_end must lie strictly after
- * window_start and at or before window_end. Success initializes result_out
- * with the exact Span; every rejection leaves it untouched.
+ * scan completes locally with only its endpoint. For mutable rows and legacy
+ * V1/V2 headers, the identity and exact window must match the immediately
+ * preceding successful dynamic-row preflight on this exclusive session. An
+ * active immutable V3--V14 owner may instead authenticate the synchronous
+ * endpoint directly without a preflight ticket. selected_end must lie
+ * strictly after window_start and at or before window_end. Successful
+ * immutable recovery retains that owner; every rejection revokes it and
+ * leaves result_out untouched.
  *
  * This is a compiler-private object-linking ABI. It is declared here so
  * embedders that resolve generated-object dependencies can provide the exact
