@@ -1,6 +1,14 @@
 //! Compile-time-specialized classification for four arbitrary byte values.
 
-use crate::{BYTE_SET_BLOCK_BYTES, BYTE_SET_WIDE_BLOCK_BYTES, ByteSetMask16, ByteSetMask32};
+#[cfg(all(
+    target_arch = "aarch64",
+    target_feature = "neon",
+    not(feature = "static-dispatch-arm-41-d84")
+))]
+use crate::{ASCII_NARROW_BYTES, AsciiByteSet};
+use crate::{
+    BYTE_SET_BLOCK_BYTES, BYTE_SET_WIDE_BLOCK_BYTES, ByteSetMask16, ByteSetMask32,
+};
 
 /// Classify one exact sixteen-byte block against one byte value.
 #[must_use]
@@ -421,28 +429,153 @@ pub fn classify_byte_set4_32(
     split_32(bytes, |block| classify_byte_set4_16(members, block))
 }
 
+/// Find the first byte equal to one of four values with a whole-slice scan
+/// specialized for the compiler target.
+///
+/// Compiler target features select the fixed-width leaf once around the
+/// complete-slice loop. This avoids repeating feature selection or indirect
+/// dispatch for every classified block. Duplicate member values are harmless.
+#[must_use]
+#[inline]
+#[allow(
+    unsafe_code,
+    reason = "compiler target features select one whole-slice AArch64 leaf without runtime detection"
+)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "mutually exclusive compiler-target branches keep every leaf choice and exact scalar fallback locally auditable"
+)]
+pub fn find_byte_set4(members: [u8; 4], bytes: &[u8]) -> Option<usize> {
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_os = "linux",
+        target_endian = "little",
+        target_feature = "sve",
+        target_feature = "sve2",
+        any(
+            feature = "static-dispatch-arm-41-d84",
+            not(target_feature = "neon")
+        )
+    ))]
+    {
+        let match_values = [
+            members[0], members[1], members[2], members[3], members[0], members[1], members[2],
+            members[3], members[0], members[1], members[2], members[3], members[0], members[1],
+            members[2], members[3],
+        ];
+        if let Some((block_start, mask)) = find_byte_values16_32_block(&match_values, bytes) {
+            return block_start.checked_add(
+                usize::try_from(mask.member_mask().trailing_zeros())
+                    .expect("a 32-bit lane index fits in usize"),
+            );
+        }
+        let complete_len = bytes
+            .len()
+            .checked_sub(bytes.len() % BYTE_SET_WIDE_BLOCK_BYTES)
+            .expect("a remainder cannot exceed its source length");
+        bytes[complete_len..]
+            .iter()
+            .position(|byte| members.contains(byte))
+            .and_then(|relative| complete_len.checked_add(relative))
+    }
+
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_feature = "neon",
+        not(feature = "static-dispatch-arm-41-d84")
+    ))]
+    {
+        // SAFETY: NEON is guaranteed by compiler target features.
+        if members.iter().all(|&member| member < 0x80) {
+            let mut columns = [0_u8; ASCII_NARROW_BYTES];
+            let mut words = [0_u64; 2];
+            for member in members {
+                columns[usize::from(member & 0x0f)] |= 1_u8 << (member >> 4);
+                let word = usize::from(member >> 6);
+                words[word] |= 1_u64 << (member & 63);
+            }
+            return unsafe {
+                crate::aarch64::find_ascii_members_neon(
+                    &columns,
+                    AsciiByteSet::from_words(words),
+                    bytes,
+                )
+            };
+        }
+        unsafe { crate::aarch64::find_byte_set4_neon(members, bytes) }
+    }
+
+    #[cfg(not(any(
+        all(
+            target_arch = "aarch64",
+            target_os = "linux",
+            target_endian = "little",
+            target_feature = "sve",
+            target_feature = "sve2",
+            any(
+                feature = "static-dispatch-arm-41-d84",
+                not(target_feature = "neon")
+            )
+        ),
+        all(
+            target_arch = "aarch64",
+            target_feature = "neon",
+            not(feature = "static-dispatch-arm-41-d84")
+        )
+    )))]
+    {
+        let complete_len = bytes
+            .len()
+            .checked_sub(bytes.len() % BYTE_SET_BLOCK_BYTES)
+            .expect("a remainder cannot exceed its source length");
+        for (block_index, block) in bytes[..complete_len]
+            .chunks_exact(BYTE_SET_BLOCK_BYTES)
+            .enumerate()
+        {
+            let block: &[u8; BYTE_SET_BLOCK_BYTES] = block
+                .try_into()
+                .expect("an exact chunk has the fixed block extent");
+            let member_mask = classify_byte_set4_16(members, block).member_mask();
+            if member_mask != 0 {
+                let block_start = block_index
+                    .checked_mul(BYTE_SET_BLOCK_BYTES)
+                    .expect("a complete block index is bounded by the source slice");
+                return block_start.checked_add(
+                    usize::try_from(member_mask.trailing_zeros())
+                        .expect("a 16-bit lane index fits in usize"),
+                );
+            }
+        }
+        bytes[complete_len..]
+            .iter()
+            .position(|byte| members.contains(byte))
+            .and_then(|relative| complete_len.checked_add(relative))
+    }
+}
+
 /// Find the first complete 32-byte block containing one of sixteen byte values.
 ///
 /// Callers representing a smaller nonempty set fill unused table lanes with
 /// any retained member. Duplicate values do not change the result.
 /// An incomplete trailing block is deliberately ignored. The returned mask
 /// describes every member lane in the complete block at the returned byte
-/// offset. Compiler-static native profiles may fuse all preceding zero-mask
-/// blocks into one authenticated operation; other profiles retain the exact
-/// fixed-block classifier loop.
+/// offset. Compiler targets that guarantee SVE2 fuse all preceding zero-mask
+/// blocks into one operation; other profiles retain the exact portable loop.
 #[must_use]
 #[allow(
     unsafe_code,
-    reason = "the compiler-static SVE2 profile proves the private fused leaf and the slice proves every complete block extent"
+    reason = "compiler target features prove the private fused SVE2 leaf and the slice proves every complete block extent"
 )]
 #[inline]
 pub fn find_byte_values16_32_block(
     match_values: &[u8; 16],
     bytes: &[u8],
 ) -> Option<(usize, ByteSetMask32)> {
-    let complete_len = bytes.len() - bytes.len() % BYTE_SET_WIDE_BLOCK_BYTES;
+    let complete_len = bytes
+        .len()
+        .checked_sub(bytes.len() % BYTE_SET_WIDE_BLOCK_BYTES)
+        .expect("a remainder cannot exceed its source length");
     #[cfg(all(
-        feature = "static-dispatch-arm-41-d84",
         target_arch = "aarch64",
         target_os = "linux",
         target_endian = "little",
@@ -450,17 +583,16 @@ pub fn find_byte_values16_32_block(
         target_feature = "sve2"
     ))]
     {
-        // SAFETY: the authenticated compiler-static profile proves SVE2, and
+        // SAFETY: compiler target features prove SVE2, and
         // `complete_len` restricts the operation to complete 32-byte blocks.
-        return unsafe {
+        unsafe {
             crate::aarch64_sve2::find_byte_values16_32_block_sve2(
                 match_values,
                 &bytes[..complete_len],
             )
-        };
+        }
     }
     #[cfg(not(all(
-        feature = "static-dispatch-arm-41-d84",
         target_arch = "aarch64",
         target_os = "linux",
         target_endian = "little",
@@ -567,7 +699,7 @@ mod tests {
         BYTE_SET_BLOCK_BYTES, BYTE_SET_WIDE_BLOCK_BYTES, ByteSetMask32, classify_byte_set1_16,
         classify_byte_set1_32, classify_byte_set2_16, classify_byte_set2_32, classify_byte_set3_16,
         classify_byte_set3_32, classify_byte_set4_16, classify_byte_set4_16_scalar,
-        classify_byte_set4_32, find_byte_values16_32_block,
+        classify_byte_set4_32, find_byte_set4, find_byte_values16_32_block,
     };
 
     fn classify_byte_set4_32_scalar(
@@ -745,6 +877,38 @@ mod tests {
         let mut tail_only = vec![0x55; BYTE_SET_WIDE_BLOCK_BYTES + 7];
         tail_only[BYTE_SET_WIDE_BLOCK_BYTES + 6] = members[0];
         assert_eq!(find_byte_values16_32_block(&members, &tail_only), None);
+    }
+
+    #[test]
+    fn whole_slice_set4_finder_matches_scalar_across_boundaries_and_alignments() {
+        for members in [
+            [b'a', b'e', b'i', b'o'],
+            [0, 0x7f, 0x80, 0xff],
+            [0x55; 4],
+        ] {
+            let nonmember = (0_u8..=u8::MAX)
+                .find(|byte| !members.contains(byte))
+                .expect("four values leave at least one nonmember");
+            for alignment in 0..=31 {
+                for len in [0_usize, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 129] {
+                    let mut source = vec![nonmember; alignment + len];
+                    assert_eq!(find_byte_set4(members, &source[alignment..]), None);
+                    for position in [0_usize, 1, 15, 16, 17, 31, 32, 63, 64, 128] {
+                        if position >= len {
+                            continue;
+                        }
+                        source[alignment + position] = members[position % members.len()];
+                        let bytes = &source[alignment..];
+                        assert_eq!(
+                            find_byte_set4(members, bytes),
+                            bytes.iter().position(|byte| members.contains(byte)),
+                            "members={members:?} alignment={alignment} len={len} position={position}",
+                        );
+                        source[alignment + position] = nonmember;
+                    }
+                }
+            }
+        }
     }
 
     #[test]

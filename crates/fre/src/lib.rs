@@ -523,6 +523,8 @@ pub use fre_kernels::{
     FixedPredicateWord64AdaptiveHandoffIdentity, FixedPredicateWord64BuildAccounting,
     FixedPredicateWord64BuildError, FixedPredicateWord64BuildLimits,
     FixedPredicateWord64CountResult, FixedPredicateWord64ExactAnchorIdentity,
+    FixedPredicateWord64GeneralFallbackScanIdentity,
+    FixedPredicateWord64GeneralPrimaryScanIdentity,
     FixedPredicateWord64MatchSelection, FixedPredicateWord64MatchSemantics,
     FixedPredicateWord64Operation, FixedPredicateWord64OperationIdentity, FixedPredicateWord64Plan,
     FixedPredicateWord64ReduceAccounting, FixedPredicateWord64ReduceError,
@@ -790,14 +792,14 @@ pub use unicode_word_run::{
 /// Stable schema for facade-level explanation records.
 pub const EXPLAIN_SCHEMA_VERSION: u32 = 15;
 
-// Automatic ordinary search admits exact anchors and staged general plans with
-// a three-member primary plus an independently selective predicate finder.
-// Wider direct-pair plans, predicates above the kernel's source-derived
-// cardinality gate, and single-finder shapes preserve K0 as the facade
-// incumbent. Construction proves a word width of at most 64, so one primary
-// finder leaves at most 63 non-universal verification predicates. The retained
-// second finder and final Shift-And handoff keep dense rejection streams inside
-// the closed linear bound.
+// Automatic ordinary search admits exact anchors and staged general primaries
+// when the finite incumbent cannot fit. Three-member primaries use memchr3;
+// wider ASCII Four/Range/Set primaries use one compiler- or receipt-selected
+// whole-slice member finder. Raw Shift-And, high-byte primaries and
+// scalar/direct candidate streams preserve K0. Construction proves a word
+// width of at most 64, so one primary finder leaves at most 63 non-universal
+// verification predicates. The retained second finder and final Shift-And
+// handoff keep dense rejection streams inside the closed linear bound.
 const FIXED_PREDICATE_SEARCH_AUTO_MAX_VERIFICATION_PREDICATES: usize =
     FIXED_PREDICATE_WORD64_MAX_WIDTH - 1;
 
@@ -3264,6 +3266,7 @@ fn try_fixed_predicate_word64_before_finite(
         ));
     }
     let (plan, _) = attempt.into_parts();
+    let general_primary_scan = plan.general_primary_scan_identity();
     let strategy =
         plan.search_operation_identity(FixedPredicateWord64SearchOperation::Exists);
     let reducer = strategy.reducer;
@@ -3271,13 +3274,17 @@ fn try_fixed_predicate_word64_before_finite(
         reducer,
         FixedPredicateWord64Reducer::OneByteAnchor | FixedPredicateWord64Reducer::TwoByteAnchor
     );
-    let staged_general_pair = matches!(reducer, FixedPredicateWord64Reducer::ShiftAnd)
-        && strategy.primary_finder.is_some_and(|finder| {
-            finder.kind == FixedPredicateWord64AdaptiveFinderKind::Three
-        })
+    let staged_general = match general_primary_scan {
+        Some(FixedPredicateWord64GeneralPrimaryScanIdentity::Memchr3) => true,
+        Some(FixedPredicateWord64GeneralPrimaryScanIdentity::CompiledWholeSlice) => true,
+        Some(FixedPredicateWord64GeneralPrimaryScanIdentity::DirectCandidateStream) | None => false,
+    };
+    let fixed_shift_and = matches!(reducer, FixedPredicateWord64Reducer::ShiftAnd)
+        && strategy.primary_finder.is_some()
+        && staged_general
         && fixed.has_non_universal_predicate()
         && fixed.finite_incumbent_cannot_fit(finite_max_patterns, finite_max_pattern_bytes);
-    let auto_admitted = (exact_anchor || staged_general_pair)
+    let auto_admitted = (exact_anchor || fixed_shift_and)
         && plan.max_verification_predicates()
             <= FIXED_PREDICATE_SEARCH_AUTO_MAX_VERIFICATION_PREDICATES;
     if !auto_admitted {
@@ -17863,7 +17870,8 @@ mod tests {
     use fre_kernels::{
         BoundedLiteralClassRunPlan, DispatchedPrefixClassAlternationSearchCursor,
         FixedPredicateWord64AdaptiveFinderKind, FixedPredicateWord64AdaptiveHandoffIdentity,
-        FixedPredicateWord64Reducer, FixedPredicateWord64SearchCursor,
+        FixedPredicateWord64GeneralPrimaryScanIdentity, FixedPredicateWord64Reducer,
+        FixedPredicateWord64SearchCursor,
         PrefixClassAlternationSearchCursor, UnicodeScalarSearchCursor,
     };
     use fre_lower::UnsupportedFeature;
@@ -28489,7 +28497,7 @@ mod tests {
     }
 
     #[test]
-    fn staged_three_member_pair_routes_before_k0_but_direct_and_broad_shapes_preserve_k0() {
+    fn staged_ascii_general_primaries_route_before_k0_but_direct_and_raw_preserve_k0() {
         let limits = BuildLimits {
             literal_set: fre_kernels::LiteralSetBuildLimits {
                 max_patterns: 4,
@@ -28523,17 +28531,106 @@ mod tests {
             FixedPredicateWord64AdaptiveHandoffIdentity::Finder { .. }
         ));
 
-        for pattern in [
-            r"[a-d][e-h]",
-            r"[\x00-\x7E][\x00-\x7E]",
-            r"[a-c][\x00-\xFF]",
+        const RANGE_LEFT: &[(u8, u8)] = &[(b'a', b'd')];
+        const RANGE_RIGHT: &[(u8, u8)] = &[(b'e', b'h')];
+        const FOUR_LEFT: &[(u8, u8)] = &[
+            (b'B', b'B'),
+            (b'D', b'D'),
+            (b'F', b'F'),
+            (b'H', b'H'),
+        ];
+        const FOUR_RIGHT: &[(u8, u8)] = &[
+            (b'J', b'J'),
+            (b'L', b'L'),
+            (b'N', b'N'),
+            (b'P', b'P'),
+        ];
+        const SET_LEFT: &[(u8, u8)] = &[(b'A', b'C'), (b'F', b'F'), (b'H', b'H')];
+        const SET_RIGHT: &[(u8, u8)] =
+            &[(b'J', b'L'), (b'N', b'N'), (b'P', b'P'), (b'R', b'R')];
+        for (pattern, haystack, primary_kind, predicates) in [
+            (
+                r"[a-d][e-h]",
+                &b"\xff\xffaf"[..],
+                Some(FixedPredicateWord64AdaptiveFinderKind::Range),
+                &[RANGE_LEFT, RANGE_RIGHT][..],
+            ),
+            (
+                r"[BDFH][JLNP]",
+                &b"\xff\xffBJ"[..],
+                Some(FixedPredicateWord64AdaptiveFinderKind::Four),
+                &[FOUR_LEFT, FOUR_RIGHT][..],
+            ),
+            (
+                r"[A-CFH][J-LNPR]",
+                &b"\xff\xffAJ"[..],
+                Some(FixedPredicateWord64AdaptiveFinderKind::Set),
+                &[SET_LEFT, SET_RIGHT][..],
+            ),
         ] {
-            let broad = PortableBuilder::new(pattern)
+            let low_level = fre_kernels::FixedPredicateWord64Plan::build(
+                predicates,
+                fre_kernels::FixedPredicateWord64BuildLimits::unlimited(),
+            )
+            .unwrap();
+            let expected_fixed = matches!(
+                low_level.general_primary_scan_identity(),
+                Some(FixedPredicateWord64GeneralPrimaryScanIdentity::Memchr3)
+                    | Some(FixedPredicateWord64GeneralPrimaryScanIdentity::CompiledWholeSlice)
+            );
+            let fixed = PortableBuilder::new(pattern)
                 .unicode(false)
                 .limits(limits)
                 .build()
                 .unwrap();
-            assert_eq!(broad.build_report().plan, PlanKind::K0, "pattern={pattern}");
+            assert_eq!(
+                fixed.build_report().plan,
+                if expected_fixed {
+                    PlanKind::FixedPredicateWord64
+                } else {
+                    PlanKind::K0
+                },
+                "pattern={pattern}"
+            );
+            let (matched, accounting) = fixed
+                .find(haystack, SearchLimits::unlimited())
+                .unwrap();
+            assert_eq!(matched, Some(Match { start: 2, end: 4 }));
+            match accounting {
+                SearchAccounting::FixedPredicateWord64(accounting) => {
+                    assert_eq!(
+                        accounting.identity.reducer,
+                        FixedPredicateWord64Reducer::ShiftAnd
+                    );
+                    assert_eq!(
+                        accounting.identity.primary_finder.map(|finder| finder.kind),
+                        primary_kind,
+                        "pattern={pattern}"
+                    );
+                }
+                SearchAccounting::K0(_) if !expected_fixed => {}
+                other => panic!(
+                    "generalized Shift-And route has unexpected accounting for {pattern}: {other:?}"
+                ),
+            }
+        }
+
+        for (pattern, haystack) in [
+            (r"[\x00-\x7E][\x00-\x7E]", &b"\xff\xffAA"[..]),
+            (r"[a-c][\x00-\xFF]", &b"\xff\xffa\xff"[..]),
+            (r"[\x80-\x83][J-N]", &b"\xff\xff\x80J"[..]),
+        ] {
+            let k0 = PortableBuilder::new(pattern)
+                .unicode(false)
+                .limits(limits)
+                .build()
+                .unwrap();
+            assert_eq!(k0.build_report().plan, PlanKind::K0, "pattern={pattern}");
+            assert_eq!(
+                k0.find(haystack, SearchLimits::unlimited()).unwrap().0,
+                Some(Match { start: 2, end: 4 }),
+                "pattern={pattern}"
+            );
         }
     }
 

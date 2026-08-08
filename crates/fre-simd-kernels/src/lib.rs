@@ -74,7 +74,7 @@ pub use byte_bucket::{
 pub use byte_pair_barrier::{
     BYTE_PAIR_BARRIER_GROUP_BYTES, BytePairBarrierScan, BytePairBarrierScanner,
 };
-pub use byte_range::classify_byte_delta_16;
+pub use byte_range::{classify_byte_delta_16, find_byte_delta};
 pub use byte_set::{
     BYTE_SET_BLOCK_BYTES, BYTE_SET_CANDIDATE_BLOCK_BYTES, BYTE_SET_CLASSIFIER_BUILD_WORK,
     BYTE_SET_WIDE_BLOCK_BYTES, ByteSet256, ByteSetClassifier, ByteSetMask16, ByteSetMask32,
@@ -82,7 +82,7 @@ pub use byte_set::{
 pub use byte_set4::{
     classify_byte_set1_16, classify_byte_set1_32, classify_byte_set2_16, classify_byte_set2_32,
     classify_byte_set3_16, classify_byte_set3_32, classify_byte_set4_16, classify_byte_set4_32,
-    find_byte_values16_32_block,
+    find_byte_set4, find_byte_values16_32_block,
 };
 pub use nonmember_run::{
     ASCII_NONMEMBER_RUN_MAX_CLASSIFICATION_OVERHEAD, ASCII_NONMEMBER_RUN_SCANNER_BUILD_WORK,

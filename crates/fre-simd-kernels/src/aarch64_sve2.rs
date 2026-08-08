@@ -983,8 +983,23 @@ unsafe extern "C" {
     fn fre_byte_set1_mask16_sve2_asm(member: u8, bytes: *const u8) -> u16;
     fn fre_byte_set2_mask16_sve2_asm(members: u16, bytes: *const u8) -> u16;
     fn fre_byte_set4_mask16_sve2_asm(members: u32, bytes: *const u8) -> u16;
+    #[cfg(all(
+        feature = "static-dispatch-arm-41-d84",
+        target_feature = "sve",
+        target_feature = "sve2"
+    ))]
     fn fre_byte_set1_mask32_sve2_asm(member: u8, bytes: *const u8) -> u32;
+    #[cfg(all(
+        feature = "static-dispatch-arm-41-d84",
+        target_feature = "sve",
+        target_feature = "sve2"
+    ))]
     fn fre_byte_set2_mask32_sve2_asm(members: u16, bytes: *const u8) -> u32;
+    #[cfg(all(
+        feature = "static-dispatch-arm-41-d84",
+        target_feature = "sve",
+        target_feature = "sve2"
+    ))]
     fn fre_byte_set4_mask32_sve2_asm(members: u32, bytes: *const u8) -> u32;
     fn fre_byte_values16_first_mask32_sve2_asm(
         match_values: *const u8,
@@ -1118,6 +1133,11 @@ pub(super) unsafe fn classify_byte_set4_16_sve2(
     unsafe_code,
     reason = "this private leaf calls reviewed fixed-32 SVE2 assembly after the authenticated compiler-static profile proves SVE plus SVE2 usable"
 )]
+#[cfg(all(
+    feature = "static-dispatch-arm-41-d84",
+    target_feature = "sve",
+    target_feature = "sve2"
+))]
 #[inline]
 pub(super) unsafe fn classify_byte_set1_32_sve2(
     member: u8,
@@ -1130,6 +1150,11 @@ pub(super) unsafe fn classify_byte_set1_32_sve2(
     unsafe_code,
     reason = "this private leaf calls reviewed fixed-32 SVE2 assembly after the authenticated compiler-static profile proves SVE plus SVE2 usable"
 )]
+#[cfg(all(
+    feature = "static-dispatch-arm-41-d84",
+    target_feature = "sve",
+    target_feature = "sve2"
+))]
 #[inline]
 pub(super) unsafe fn classify_byte_set2_32_sve2(
     members: [u8; 2],
@@ -1144,6 +1169,11 @@ pub(super) unsafe fn classify_byte_set2_32_sve2(
     unsafe_code,
     reason = "SVE2 MATCH consumes an unordered segment-local set in one instruction, so repeating one of three members adds no comparison"
 )]
+#[cfg(all(
+    feature = "static-dispatch-arm-41-d84",
+    target_feature = "sve",
+    target_feature = "sve2"
+))]
 #[inline]
 pub(super) unsafe fn classify_byte_set3_32_sve2(
     members: [u8; 3],
@@ -1156,6 +1186,11 @@ pub(super) unsafe fn classify_byte_set3_32_sve2(
     unsafe_code,
     reason = "this private leaf calls reviewed fixed-32 SVE2 assembly after the authenticated compiler-static profile proves SVE plus SVE2 usable"
 )]
+#[cfg(all(
+    feature = "static-dispatch-arm-41-d84",
+    target_feature = "sve",
+    target_feature = "sve2"
+))]
 #[inline]
 pub(super) unsafe fn classify_byte_set4_32_sve2(
     members: [u8; 4],
@@ -1170,7 +1205,7 @@ pub(super) unsafe fn classify_byte_set4_32_sve2(
 
 #[allow(
     unsafe_code,
-    reason = "this private leaf is reachable only from the authenticated compiler-static SVE2 profile and scans complete fixed-width blocks from the supplied slice"
+    reason = "this private leaf is reachable only when compiler target features guarantee SVE2 and scans complete fixed-width blocks from the supplied slice"
 )]
 #[inline]
 pub(super) unsafe fn find_byte_values16_32_block_sve2(
@@ -1178,7 +1213,7 @@ pub(super) unsafe fn find_byte_values16_32_block_sve2(
     bytes: &[u8],
 ) -> Option<(usize, ByteSetMask32)> {
     debug_assert_eq!(bytes.len() % BYTE_SET_WIDE_BLOCK_BYTES, 0);
-    // SAFETY: the caller proves SVE2 and supplies a slice containing only
+    // SAFETY: compiler target features prove SVE2 and the caller supplies only
     // complete 32-byte blocks. The complete initialized table is repeated in
     // every 128-bit segment; the assembly predicates every source load within
     // the reported length and returns one complete mask from the first hit block.

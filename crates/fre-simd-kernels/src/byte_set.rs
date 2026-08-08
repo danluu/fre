@@ -542,6 +542,87 @@ impl ByteSetClassifier {
             ByteSetMask32::from_halves(self.classify_16(first), self.classify_16(second))
         }
     }
+
+    /// Find the first byte belonging to this compiled set.
+    ///
+    /// Runtime builds authenticate one whole-slice vector leaf before entering
+    /// its loop; compiler-static builds call their fixed leaf directly. Thus a
+    /// long scan does not repeat indirect dispatch for every classified block.
+    #[must_use]
+    #[allow(
+        unsafe_code,
+        reason = "the retained or compiler-fixed receipt proves the target features for the selected whole-slice leaf"
+    )]
+    pub fn find_first_member(&self, bytes: &[u8]) -> Option<usize> {
+        #[cfg(not(feature = "static-dispatch"))]
+        {
+            #[cfg(target_arch = "x86_64")]
+            if runtime_has_direct_wide(self.selection) {
+                // SAFETY: the retained wide selection reconstructs AVX2 only
+                // from the immutable authenticated policy-visible features.
+                return unsafe { find_first_member_avx2(&self.tables, self.set(), bytes) };
+            }
+            if matches!(self.selection.vector, VectorKind::Scalar) {
+                return find_first_member_scalar(self.set(), bytes);
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                // SAFETY: the only non-scalar narrow AArch64 variant requires
+                // NEON in the immutable retained receipt.
+                if is_ascii_set(self.set()) {
+                    return unsafe {
+                        find_first_ascii_member_neon(&self.tables, self.set(), bytes)
+                    };
+                }
+                unsafe { find_first_member_neon(&self.tables, self.set(), bytes) }
+            }
+            #[cfg(target_arch = "x86_64")]
+            {
+                // SAFETY: the only non-scalar narrow x86-64 variant requires
+                // SSSE3 in the immutable retained receipt.
+                unsafe { find_first_member_ssse3(&self.tables, self.set(), bytes) }
+            }
+            #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+            find_first_member_scalar(self.set(), bytes)
+        }
+        #[cfg(feature = "static-dispatch")]
+        {
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+            {
+                // SAFETY: AVX2 is fixed in the authenticated compiler profile.
+                unsafe { find_first_member_avx2(&self.tables, self.set(), bytes) }
+            }
+            #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+            {
+                // SAFETY: NEON is fixed in the authenticated compiler profile.
+                if is_ascii_set(self.set()) {
+                    return unsafe {
+                        find_first_ascii_member_neon(&self.tables, self.set(), bytes)
+                    };
+                }
+                unsafe { find_first_member_neon(&self.tables, self.set(), bytes) }
+            }
+            #[cfg(all(
+                target_arch = "x86_64",
+                not(target_feature = "avx2"),
+                target_feature = "ssse3"
+            ))]
+            {
+                // SAFETY: SSSE3 is fixed in the authenticated compiler profile.
+                unsafe { find_first_member_ssse3(&self.tables, self.set(), bytes) }
+            }
+            #[cfg(not(any(
+                all(target_arch = "x86_64", target_feature = "avx2"),
+                all(target_arch = "aarch64", target_feature = "neon"),
+                all(
+                    target_arch = "x86_64",
+                    not(target_feature = "avx2"),
+                    target_feature = "ssse3"
+                )
+            )))]
+            find_first_member_scalar(self.set(), bytes)
+        }
+    }
 }
 
 #[cfg(all(not(feature = "static-dispatch"), target_arch = "x86_64"))]
@@ -703,13 +784,58 @@ fn classify_scalar(tables: &ByteSetTables, bytes: &[u8; BYTE_SET_BLOCK_BYTES]) -
     ByteSetMask16(members)
 }
 
-#[cfg(target_arch = "aarch64")]
+fn find_first_member_scalar(set: ByteSet256, bytes: &[u8]) -> Option<usize> {
+    bytes.iter().position(|&byte| set.contains(byte))
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(not(feature = "static-dispatch"), target_feature = "neon")
+))]
+const fn is_ascii_set(set: ByteSet256) -> bool {
+    let [_, _, upper_low, upper_high] = set.words();
+    upper_low == 0 && upper_high == 0
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(not(feature = "static-dispatch"), target_feature = "neon")
+))]
+#[allow(
+    unsafe_code,
+    reason = "the caller authenticates NEON once before this ASCII-specialized whole-slice leaf performs exact loads"
+)]
+#[target_feature(enable = "neon")]
+#[inline(never)]
+unsafe fn find_first_ascii_member_neon(
+    tables: &ByteSetTables,
+    set: ByteSet256,
+    bytes: &[u8],
+) -> Option<usize> {
+    debug_assert!(is_ascii_set(set));
+    let [low, high, _, _] = set.words();
+    // SAFETY: this enclosing leaf already has NEON enabled; the classifier's
+    // exact ASCII columns and words describe the same immutable set.
+    unsafe {
+        crate::aarch64::find_ascii_members_neon(
+            &tables.lower,
+            crate::AsciiByteSet::from_words([low, high]),
+            bytes,
+        )
+    }
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(not(feature = "static-dispatch"), target_feature = "neon")
+))]
 #[allow(
     unsafe_code,
     unsafe_op_in_unsafe_fn,
     reason = "the private NEON leaf is reachable only through authenticated dispatch and exact fixed extents"
 )]
 #[target_feature(enable = "neon")]
+#[inline]
 unsafe fn classify_neon(
     tables: &ByteSetTables,
     bytes: &[u8; BYTE_SET_BLOCK_BYTES],
@@ -742,13 +868,112 @@ unsafe fn classify_neon(
     ByteSetMask16(members)
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(
+    target_arch = "aarch64",
+    any(not(feature = "static-dispatch"), target_feature = "neon")
+))]
+#[allow(
+    unsafe_code,
+    reason = "the caller authenticates NEON once before this whole-slice leaf performs exact fixed-width loads"
+)]
+#[target_feature(enable = "neon")]
+#[inline(never)]
+unsafe fn find_first_member_neon(
+    tables: &ByteSetTables,
+    set: ByteSet256,
+    bytes: &[u8],
+) -> Option<usize> {
+    const BITS: [u8; BYTE_SET_BLOCK_BYTES] = [
+        1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128,
+    ];
+    use core::arch::aarch64::{
+        vandq_u8, vbslq_u8, vceqq_u8, vcltq_u8, vdupq_n_u8, vld1q_u8, vmaxvq_u8, vmvnq_u8,
+        vorrq_u8, vqtbl1q_u8, vshrq_n_u8,
+    };
+
+    // SAFETY: both tables contain exactly sixteen initialized bytes and this
+    // enclosing leaf already has NEON enabled.
+    let (lower, upper) = unsafe {
+        (
+            vld1q_u8(tables.lower.as_ptr()),
+            vld1q_u8(tables.upper.as_ptr()),
+        )
+    };
+    // SAFETY: the constant has exactly sixteen initialized bytes.
+    let bits = unsafe { vld1q_u8(BITS.as_ptr()) };
+    let nibble_mask = vdupq_n_u8(0x0f);
+    let classify_members = |input| {
+        let low_nibbles = vandq_u8(input, nibble_mask);
+        let high_nibbles = vandq_u8(vshrq_n_u8::<4>(input), nibble_mask);
+        let lower_columns = vqtbl1q_u8(lower, low_nibbles);
+        let upper_columns = vqtbl1q_u8(upper, low_nibbles);
+        let lower_half = vcltq_u8(high_nibbles, vdupq_n_u8(8));
+        let columns = vbslq_u8(lower_half, lower_columns, upper_columns);
+        let selected_bits = vandq_u8(columns, vqtbl1q_u8(bits, high_nibbles));
+        vmvnq_u8(vceqq_u8(selected_bits, vdupq_n_u8(0)))
+    };
+
+    let mut block_start = 0_usize;
+    let mut groups = bytes.chunks_exact(BYTE_SET_WIDE_BLOCK_BYTES);
+    for group in &mut groups {
+        let first: &[u8; BYTE_SET_BLOCK_BYTES] = group[..BYTE_SET_BLOCK_BYTES]
+            .try_into()
+            .expect("a wide group has one exact first NEON block");
+        let second: &[u8; BYTE_SET_BLOCK_BYTES] = group[BYTE_SET_BLOCK_BYTES..]
+            .try_into()
+            .expect("a wide group has one exact second NEON block");
+        // SAFETY: both array references prove their exact load extents.
+        let (first_input, second_input) = unsafe {
+            (
+                vld1q_u8(first.as_ptr()),
+                vld1q_u8(second.as_ptr()),
+            )
+        };
+        if vmaxvq_u8(vorrq_u8(
+            classify_members(first_input),
+            classify_members(second_input),
+        )) != 0
+        {
+            return find_first_member_scalar(set, group)
+                .and_then(|relative| block_start.checked_add(relative));
+        }
+        block_start = block_start
+            .checked_add(BYTE_SET_WIDE_BLOCK_BYTES)
+            .expect("a complete group stays within its source slice");
+    }
+
+    let remainder = groups.remainder();
+    let mut tail = remainder;
+    if remainder.len() >= BYTE_SET_BLOCK_BYTES {
+        let block: &[u8; BYTE_SET_BLOCK_BYTES] = remainder[..BYTE_SET_BLOCK_BYTES]
+            .try_into()
+            .expect("a wide remainder has one exact NEON block");
+        // SAFETY: the array reference proves the exact load extent.
+        let input = unsafe { vld1q_u8(block.as_ptr()) };
+        if vmaxvq_u8(classify_members(input)) != 0 {
+            return find_first_member_scalar(set, block)
+                .and_then(|relative| block_start.checked_add(relative));
+        }
+        block_start = block_start
+            .checked_add(BYTE_SET_BLOCK_BYTES)
+            .expect("a trailing vector block stays within its source slice");
+        tail = &remainder[BYTE_SET_BLOCK_BYTES..];
+    }
+    find_first_member_scalar(set, tail)
+        .and_then(|relative| block_start.checked_add(relative))
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(not(feature = "static-dispatch"), target_feature = "ssse3")
+))]
 #[allow(
     unsafe_code,
     unsafe_op_in_unsafe_fn,
     reason = "the private SSSE3 leaf is reachable only through authenticated dispatch and exact fixed extents"
 )]
 #[target_feature(enable = "ssse3")]
+#[inline]
 unsafe fn classify_ssse3(
     tables: &ByteSetTables,
     bytes: &[u8; BYTE_SET_BLOCK_BYTES],
@@ -783,6 +1008,52 @@ unsafe fn classify_ssse3(
         u16::try_from((!_mm_movemask_epi8(zero_lanes)) & 0xffff)
             .expect("a sixteen-lane movemask fits in u16"),
     )
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(
+        not(feature = "static-dispatch"),
+        all(not(target_feature = "avx2"), target_feature = "ssse3")
+    )
+))]
+#[allow(
+    unsafe_code,
+    reason = "the caller authenticates SSSE3 once before this whole-slice leaf performs exact fixed-width loads"
+)]
+#[target_feature(enable = "ssse3")]
+#[inline(never)]
+unsafe fn find_first_member_ssse3(
+    tables: &ByteSetTables,
+    set: ByteSet256,
+    bytes: &[u8],
+) -> Option<usize> {
+    let complete_len = bytes
+        .len()
+        .checked_sub(bytes.len() % BYTE_SET_BLOCK_BYTES)
+        .expect("a remainder cannot exceed its source length");
+    for (block_index, block) in bytes[..complete_len]
+        .chunks_exact(BYTE_SET_BLOCK_BYTES)
+        .enumerate()
+    {
+        let block: &[u8; BYTE_SET_BLOCK_BYTES] = block
+            .try_into()
+            .expect("an exact chunk has the fixed block extent");
+        // SAFETY: this enclosing leaf already has SSSE3 enabled and the array
+        // proves the exact load extent.
+        let member_mask = unsafe { classify_ssse3(tables, block) }.member_mask();
+        if member_mask != 0 {
+            let block_start = block_index
+                .checked_mul(BYTE_SET_BLOCK_BYTES)
+                .expect("a complete block index is bounded by the source slice");
+            return block_start.checked_add(
+                usize::try_from(member_mask.trailing_zeros())
+                    .expect("a 16-bit lane index fits in usize"),
+            );
+        }
+    }
+    find_first_member_scalar(set, &bytes[complete_len..])
+        .and_then(|relative| complete_len.checked_add(relative))
 }
 
 const SCALAR: KernelVariant<ByteSetEntry> = KernelVariant::new(
@@ -1097,7 +1368,10 @@ const fn static_wide_variant_id() -> &'static str {
     SPLIT_MASK32_VARIANT_ID
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(not(feature = "static-dispatch"), target_feature = "avx2")
+))]
 #[allow(
     unsafe_code,
     unsafe_op_in_unsafe_fn,
@@ -1108,6 +1382,7 @@ const fn static_wide_variant_id() -> &'static str {
     reason = "AVX2 unaligned loads explicitly accept byte-backed addresses"
 )]
 #[target_feature(enable = "avx2")]
+#[inline]
 unsafe fn classify_32_avx2(
     tables: &ByteSetTables,
     bytes: &[u8; BYTE_SET_WIDE_BLOCK_BYTES],
@@ -1149,6 +1424,49 @@ unsafe fn classify_32_avx2(
     ByteSetMask32::new(u32::from_ne_bytes(
         (!_mm256_movemask_epi8(zero_lanes)).to_ne_bytes(),
     ))
+}
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(not(feature = "static-dispatch"), target_feature = "avx2")
+))]
+#[allow(
+    unsafe_code,
+    reason = "the caller authenticates AVX2 once before this whole-slice leaf performs exact fixed-width loads"
+)]
+#[target_feature(enable = "avx2")]
+#[inline(never)]
+unsafe fn find_first_member_avx2(
+    tables: &ByteSetTables,
+    set: ByteSet256,
+    bytes: &[u8],
+) -> Option<usize> {
+    let complete_len = bytes
+        .len()
+        .checked_sub(bytes.len() % BYTE_SET_WIDE_BLOCK_BYTES)
+        .expect("a remainder cannot exceed its source length");
+    for (block_index, block) in bytes[..complete_len]
+        .chunks_exact(BYTE_SET_WIDE_BLOCK_BYTES)
+        .enumerate()
+    {
+        let block: &[u8; BYTE_SET_WIDE_BLOCK_BYTES] = block
+            .try_into()
+            .expect("an exact wide chunk has the fixed block extent");
+        // SAFETY: this enclosing leaf already has AVX2 enabled and the array
+        // proves the exact load extent.
+        let member_mask = unsafe { classify_32_avx2(tables, block) }.member_mask();
+        if member_mask != 0 {
+            let block_start = block_index
+                .checked_mul(BYTE_SET_WIDE_BLOCK_BYTES)
+                .expect("a complete block index is bounded by the source slice");
+            return block_start.checked_add(
+                usize::try_from(member_mask.trailing_zeros())
+                    .expect("a 32-bit lane index fits in usize"),
+            );
+        }
+    }
+    find_first_member_scalar(set, &bytes[complete_len..])
+        .and_then(|relative| complete_len.checked_add(relative))
 }
 
 #[cfg(all(
@@ -1276,6 +1594,48 @@ mod tests {
                         classifier.classify_16(block).member_mask() & (1_u16 << lane) != 0,
                         set.contains(block[lane])
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn whole_slice_finder_matches_scalar_for_sets_boundaries_and_alignments() {
+        let sets = [
+            ByteSet256::from_words([1, 0, 0, 0]),
+            ByteSet256::from_words([0, 1_u64 << 63, 1, 1_u64 << 63]),
+            ByteSet256::from_words([
+                0x0101_0101_0101_0101,
+                0x8040_2010_0804_0201,
+                0x1111_1111_1111_1111,
+                0x8000_0000_0000_0001,
+            ]),
+        ];
+        for set in sets {
+            let classifier = ByteSetClassifier::new(set);
+            let nonmember = (0_u8..=u8::MAX)
+                .find(|&byte| !set.contains(byte))
+                .expect("the exercised sets leave a nonmember");
+            let member = (0_u8..=u8::MAX)
+                .find(|&byte| set.contains(byte))
+                .expect("the exercised sets are nonempty");
+            for alignment in 0..=31 {
+                for len in [0_usize, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 129] {
+                    let mut source = vec![nonmember; alignment + len];
+                    assert_eq!(classifier.find_first_member(&source[alignment..]), None);
+                    for position in [0_usize, 1, 15, 16, 17, 31, 32, 63, 64, 128] {
+                        if position >= len {
+                            continue;
+                        }
+                        source[alignment + position] = member;
+                        let bytes = &source[alignment..];
+                        assert_eq!(
+                            classifier.find_first_member(bytes),
+                            bytes.iter().position(|&byte| set.contains(byte)),
+                            "set={set:?} alignment={alignment} len={len} position={position}",
+                        );
+                        source[alignment + position] = nonmember;
+                    }
                 }
             }
         }

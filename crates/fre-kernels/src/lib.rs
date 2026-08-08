@@ -259,6 +259,8 @@ pub use fixed_predicate_word64::{
     COUNT_OPERATION_ID as FIXED_PREDICATE_WORD64_COUNT_OPERATION_ID,
     CountResult as FixedPredicateWord64CountResult,
     ExactAnchorIdentity as FixedPredicateWord64ExactAnchorIdentity, FixedPredicateWord64Plan,
+    GeneralFallbackScanIdentity as FixedPredicateWord64GeneralFallbackScanIdentity,
+    GeneralPrimaryScanIdentity as FixedPredicateWord64GeneralPrimaryScanIdentity,
     MASK_SLOTS as FIXED_PREDICATE_WORD64_MASK_SLOTS, MAX_WIDTH as FIXED_PREDICATE_WORD64_MAX_WIDTH,
     MIN_WIDTH as FIXED_PREDICATE_WORD64_MIN_WIDTH,
     MatchSelection as FixedPredicateWord64MatchSelection,

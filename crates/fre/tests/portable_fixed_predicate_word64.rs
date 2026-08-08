@@ -1,7 +1,13 @@
 use fre::{
-    BuildError, BuildLimits, EXPLAIN_SCHEMA_VERSION, FixedPredicateWord64Reducer, PlanKind,
+    BuildError, BuildLimits, EXPLAIN_SCHEMA_VERSION, FixedPredicateWord64AdaptiveFinderKind,
+    FixedPredicateWord64Reducer, PlanKind,
     PlanSelection, PortableBuilder, PortableCapturesReadError, PortableFindIterLimits, RustProfile,
     SearchAccounting, SearchError, SearchLimits, SearchSessionLimits, SearchWindow,
+};
+use fre_kernels::{
+    FixedPredicateWord64BuildLimits as KernelBuildLimits,
+    FixedPredicateWord64GeneralPrimaryScanIdentity as PrimaryScanIdentity,
+    FixedPredicateWord64Plan as KernelPlan,
 };
 
 const ONE_ANCHOR_PATTERN: &str = r"Q[ab][cd][ef][gh][ij][kl][mn][op][rs][tu][vw][xy][01]";
@@ -763,7 +769,7 @@ fn fixed_predicate_limits_close_at_exact_planner_persistent_and_search_bounds() 
 }
 
 #[test]
-fn declined_fixed_predicate_inspections_preserve_exact_cumulative_planner_work() {
+fn declined_raw_shift_and_inspections_preserve_exact_cumulative_planner_work() {
     let cases = [
         raw_shift_and_pattern(16),
         raw_shift_and_pattern(17),
@@ -796,6 +802,286 @@ fn declined_fixed_predicate_inspections_preserve_exact_cumulative_planner_work()
                 if needed == report.planner_work && limit == report.planner_work - 1
         ));
     }
+}
+
+#[test]
+fn generalized_shift_and_admission_matches_k0_and_regex_across_finder_shapes() {
+    #[derive(Clone, Copy, Debug)]
+    enum Shape {
+        Four,
+        Range,
+        Set,
+        RawPair,
+        RawSingle,
+    }
+
+    let shape = |width: usize, shape: Shape| {
+        let (primary, secondary, primary_byte, secondary_byte, expected) = match shape {
+            Shape::Four => (
+                "[BDFH]",
+                "[JLNPQ]",
+                b'B',
+                b'J',
+                Some(FixedPredicateWord64AdaptiveFinderKind::Four),
+            ),
+            Shape::Range => (
+                "[A-D]",
+                "[J-N]",
+                b'A',
+                b'J',
+                Some(FixedPredicateWord64AdaptiveFinderKind::Range),
+            ),
+            Shape::Set => (
+                "[A-CFH]",
+                "[J-LNPR]",
+                b'A',
+                b'J',
+                Some(FixedPredicateWord64AdaptiveFinderKind::Set),
+            ),
+            Shape::RawPair => (
+                r"[\x00-\x40]",
+                r"[\x80-\xC1]",
+                0,
+                0x80,
+                None,
+            ),
+            Shape::RawSingle => (
+                "[a-c]",
+                r"[\x00-\xFF]",
+                b'a',
+                0xff,
+                None,
+            ),
+        };
+        let mut pattern = r"[\x00-\xFF]".repeat(width);
+        pattern.replace_range(..r"[\x00-\xFF]".len(), primary);
+        let last = pattern.len() - r"[\x00-\xFF]".len();
+        pattern.replace_range(last.., secondary);
+        let mut word = vec![0xff; width];
+        word[0] = primary_byte;
+        word[width - 1] = secondary_byte;
+        (pattern, word, expected)
+    };
+
+    let staged_for = |width: usize, shape: Shape| {
+        const FULL: &[(u8, u8)] = &[(0, u8::MAX)];
+        const FOUR_LEFT: &[(u8, u8)] = &[
+            (b'B', b'B'),
+            (b'D', b'D'),
+            (b'F', b'F'),
+            (b'H', b'H'),
+        ];
+        const FOUR_RIGHT: &[(u8, u8)] = &[
+            (b'J', b'J'),
+            (b'L', b'L'),
+            (b'N', b'N'),
+            (b'P', b'Q'),
+        ];
+        const RANGE_LEFT: &[(u8, u8)] = &[(b'A', b'D')];
+        const RANGE_RIGHT: &[(u8, u8)] = &[(b'J', b'N')];
+        const SET_LEFT: &[(u8, u8)] = &[(b'A', b'C'), (b'F', b'F'), (b'H', b'H')];
+        const SET_RIGHT: &[(u8, u8)] =
+            &[(b'J', b'L'), (b'N', b'N'), (b'P', b'P'), (b'R', b'R')];
+        const RAW_LEFT: &[(u8, u8)] = &[(0, 0x40)];
+        const RAW_RIGHT: &[(u8, u8)] = &[(0x80, 0xC1)];
+        const THREE: &[(u8, u8)] = &[(b'a', b'c')];
+        let (left, right) = match shape {
+            Shape::Four => (FOUR_LEFT, FOUR_RIGHT),
+            Shape::Range => (RANGE_LEFT, RANGE_RIGHT),
+            Shape::Set => (SET_LEFT, SET_RIGHT),
+            Shape::RawPair => (RAW_LEFT, RAW_RIGHT),
+            Shape::RawSingle => (THREE, FULL),
+        };
+        let mut positions = vec![FULL; width];
+        positions[0] = left;
+        positions[width - 1] = right;
+        let plan = KernelPlan::build(&positions, KernelBuildLimits::unlimited()).unwrap();
+        matches!(
+            plan.general_primary_scan_identity(),
+            Some(PrimaryScanIdentity::Memchr3)
+                | Some(PrimaryScanIdentity::CompiledWholeSlice)
+        )
+    };
+
+    let limits = BuildLimits {
+        literal_set: fre_kernels::LiteralSetBuildLimits {
+            max_patterns: 2,
+            ..fre_kernels::LiteralSetBuildLimits::default()
+        },
+        ..BuildLimits::default()
+    };
+    for width in [2, 17, 64] {
+        for finder_shape in [
+            Shape::Four,
+            Shape::Range,
+            Shape::Set,
+            Shape::RawPair,
+            Shape::RawSingle,
+        ] {
+            let (pattern, word, expected_kind) = shape(width, finder_shape);
+            let auto = PortableBuilder::new(&pattern)
+                .unicode(false)
+                .limits(limits)
+                .build()
+                .unwrap();
+            let k0 = PortableBuilder::new(&pattern)
+                .unicode(false)
+                .plan_selection(PlanSelection::ForceK0)
+                .limits(limits)
+                .build()
+                .unwrap();
+            let expected_fixed = staged_for(width, finder_shape);
+            assert_eq!(
+                auto.build_report().plan,
+                if expected_fixed {
+                    PlanKind::FixedPredicateWord64
+                } else {
+                    PlanKind::K0
+                },
+                "width={width} shape={finder_shape:?}"
+            );
+            assert_eq!(k0.build_report().plan, PlanKind::K0);
+
+            let mut late = vec![0xff; width * 3 + 17];
+            late.extend_from_slice(&word);
+            let mut dense = Vec::new();
+            for _ in 0..4 {
+                dense.extend_from_slice(&word);
+                dense.push(0xff);
+            }
+            let mut rejected = Vec::new();
+            let mut decoy = word.clone();
+            if matches!(finder_shape, Shape::RawSingle) {
+                decoy[0] = 0xff;
+            } else {
+                decoy[width - 1] = 0xff;
+            }
+            for _ in 0..4 {
+                rejected.extend_from_slice(&decoy);
+                rejected.push(0xff);
+            }
+            let haystacks = [
+                Vec::new(),
+                vec![0xff; width.saturating_sub(1)],
+                vec![0xff; width * 4 + 31],
+                word.clone(),
+                late,
+                dense,
+                rejected,
+            ];
+            let upstream = regex::bytes::RegexBuilder::new(&pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            for haystack in haystacks {
+                let expected_first = upstream
+                    .find(&haystack)
+                    .map(|matched| (matched.start(), matched.end()));
+                let (auto_first, accounting) = auto
+                    .find(&haystack, SearchLimits::unlimited())
+                    .unwrap();
+                match (expected_fixed, expected_kind, accounting) {
+                    (
+                        true,
+                        Some(expected_kind),
+                        SearchAccounting::FixedPredicateWord64(accounting),
+                    ) => {
+                        assert_eq!(
+                            accounting.identity.primary_finder.map(|finder| finder.kind),
+                            Some(expected_kind),
+                            "width={width} shape={finder_shape:?}"
+                        );
+                    }
+                    (false, _, SearchAccounting::K0(_)) => {}
+                    _ => panic!("generalized route returned unexpected accounting"),
+                }
+                assert_eq!(span(auto_first), expected_first);
+                assert_eq!(
+                    span(k0.find(&haystack, SearchLimits::unlimited()).unwrap().0),
+                    expected_first
+                );
+                assert_eq!(
+                    auto.is_match_value(&haystack, SearchLimits::unlimited())
+                        .unwrap(),
+                    expected_first.is_some()
+                );
+                assert_eq!(
+                    auto.shortest_match(&haystack, SearchLimits::unlimited())
+                        .unwrap()
+                        .0,
+                    expected_first.map(|(_, end)| end)
+                );
+                assert_eq!(
+                    auto.selected_end(&haystack, SearchLimits::unlimited())
+                        .unwrap()
+                        .0,
+                    expected_first.map(|(_, end)| end)
+                );
+
+                let expected_all: Vec<_> = upstream
+                    .find_iter(&haystack)
+                    .map(|matched| (matched.start(), matched.end()))
+                    .collect();
+                let actual_all: Vec<_> = auto
+                    .find_iter(&haystack, PortableFindIterLimits::unlimited())
+                    .unwrap()
+                    .map(|matched| {
+                        matched.map(|matched| (matched.start(), matched.end()))
+                    })
+                    .collect::<Result<_, _>>()
+                    .unwrap();
+                assert_eq!(actual_all, expected_all);
+
+                let mut session = auto
+                    .search_session(SearchSessionLimits::unlimited())
+                    .unwrap();
+                assert_eq!(
+                    span(
+                        session
+                            .find_value(&haystack, SearchLimits::unlimited())
+                            .unwrap()
+                    ),
+                    expected_first
+                );
+
+                let windows = [
+                    (0, haystack.len()),
+                    (haystack.len().min(1), haystack.len()),
+                    (0, haystack.len().saturating_sub(1)),
+                    (haystack.len() / 2, haystack.len()),
+                ];
+                for (start, end) in windows {
+                    let window = SearchWindow::new(start, end);
+                    assert_eq!(
+                        span(
+                            auto.find_window(
+                                &haystack,
+                                window,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap()
+                            .0
+                        ),
+                        span(
+                            k0.find_window(
+                                &haystack,
+                                window,
+                                SearchLimits::unlimited(),
+                            )
+                            .unwrap()
+                            .0
+                        )
+                    );
+                }
+            }
+        }
+    }
+
+    assert_ne!(
+        build_auto("[A-CFH][J-LNPR]").build_report().plan,
+        PlanKind::FixedPredicateWord64,
+        "a fitting finite product must preserve incumbent precedence"
+    );
 }
 
 #[test]
