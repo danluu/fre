@@ -47,6 +47,7 @@ mod literal_anchor;
 mod literal_assertions;
 mod literal_class_run_literal;
 mod literal_set;
+mod line_domain_byte_atoms;
 mod ordered_literal_aggregate;
 mod packed_literal_set;
 mod packed_ordered_literal_aggregate;
@@ -74,6 +75,19 @@ pub use anchored_line_capture::{
     PLAN_ID as ANCHORED_LINE_CAPTURE_PLAN_ID, RunActual as AnchoredLineCaptureRunActual,
     RunError as AnchoredLineCaptureRunError, RunLimits as AnchoredLineCaptureRunLimits,
     RunUpperBounds as AnchoredLineCaptureRunUpperBounds,
+};
+
+pub use line_domain_byte_atoms::{
+    BuildAccounting as LineDomainByteAtomsBuildAccounting,
+    BuildError as LineDomainByteAtomsBuildError,
+    BuildLimits as LineDomainByteAtomsBuildLimits, Cursor as LineDomainByteAtomsCursor,
+    LineDomainPlan as LineDomainByteAtomsPlan, LineMode as LineDomainMode,
+    Operation as LineDomainByteAtomsOperation, PLAN_ID as LINE_DOMAIN_BYTE_ATOMS_PLAN_ID,
+    SearchAccounting as LineDomainByteAtomsSearchAccounting,
+    SearchActual as LineDomainByteAtomsSearchActual,
+    SearchError as LineDomainByteAtomsSearchError,
+    SearchLimits as LineDomainByteAtomsSearchLimits,
+    SearchUpperBounds as LineDomainByteAtomsSearchUpperBounds,
 };
 
 pub use bounded_class_sequence::{

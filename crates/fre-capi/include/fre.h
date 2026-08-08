@@ -80,6 +80,7 @@ typedef uint32_t fre_v1_status;
 #define FRE_V1_PLAN_REVERSE_INNER UINT32_C(13)
 #define FRE_V1_PLAN_PREFIX_CLASS_ALTERNATION UINT32_C(14)
 #define FRE_V1_PLAN_UNICODE_SCALAR_RUN UINT32_C(15)
+#define FRE_V1_PLAN_LINE_DOMAIN_BYTE_ATOMS UINT32_C(16)
 
 #define FRE_V1_ADMISSION_UPSTREAM_ORACLE_PENDING UINT32_C(1)
 
@@ -271,6 +272,8 @@ FRE_V1_STATIC_ASSERT(FRE_V1_PLAN_PREFIX_CLASS_ALTERNATION == 14u,
                      "prefix/class-alternation plan tag");
 FRE_V1_STATIC_ASSERT(FRE_V1_PLAN_UNICODE_SCALAR_RUN == 15u,
                      "Unicode scalar-run plan tag");
+FRE_V1_STATIC_ASSERT(FRE_V1_PLAN_LINE_DOMAIN_BYTE_ATOMS == 16u,
+                     "line-domain byte-atoms plan tag");
 
 #if SIZE_MAX == UINT64_MAX
 FRE_V1_STATIC_ASSERT(sizeof(fre_v1_selected_end_result) == 24u, "end size");

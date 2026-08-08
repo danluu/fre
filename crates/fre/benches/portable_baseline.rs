@@ -134,6 +134,7 @@ fn compare_search(case: &Case) {
         PlanKind::UnicodeWordRun => "fre-unicode-word-run",
         PlanKind::FixedPredicateWord64 => "fre-fixed-predicate-word64",
         PlanKind::UnicodeScalarRun => "fre-unicode-scalar-run",
+        PlanKind::LineDomainByteAtoms => "fre-line-domain-byte-atoms",
     };
 
     warm(|| {

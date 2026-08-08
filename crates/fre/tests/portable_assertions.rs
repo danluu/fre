@@ -816,8 +816,8 @@ fn generic_ascii_word_and_lf_line_shapes_route_without_approximation() {
                 b"prefix\nSherlock Holmes\nsuffix",
                 b"Sherlock Holmes\r\n",
             ],
-            PlanKind::K0,
-            "k0",
+            PlanKind::LineDomainByteAtoms,
+            "line-domain-byte-atoms-search-v3",
         ),
     ];
 

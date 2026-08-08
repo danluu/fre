@@ -1,6 +1,6 @@
 use fre::{
-    PortableRegexSetBuildLimits, PortableRegexSetExecutionError, PortableRegexSetRunLimits,
-    PortableTextBuildError, PortableTextProof, PortableTextRegexSet,
+    PlanKind, PortableRegexSetBuildLimits, PortableRegexSetExecutionError,
+    PortableRegexSetRunLimits, PortableTextBuildError, PortableTextProof, PortableTextRegexSet,
     PortableTextRegexSetBuildError, PortableTextRegexSetBuilder, RustProfile,
 };
 
@@ -53,6 +53,24 @@ fn text_set_offset_search_matches_pinned_rust_at_every_byte() {
     let patterns = ["", r"\bbar\b", r"(?m)^bar$", "é", "東京"];
     let fre = PortableTextRegexSet::new(patterns).expect("FRE text offset set");
     let upstream = regex::RegexSet::new(patterns).expect("pinned text offset set");
+    assert_eq!(
+        fre.pattern_build_report(2)
+            .expect("multiline constituent report")
+            .portable
+            .plan,
+        PlanKind::K0,
+        "text-set constituents must not enter byte-only line-domain routing",
+    );
+    let cloned = fre.clone();
+    assert_eq!(
+        cloned
+            .pattern_build_report(2)
+            .expect("cloned multiline constituent report")
+            .portable
+            .plan,
+        PlanKind::K0,
+        "text-set cloning must replay text-facade routing provenance",
+    );
 
     for haystack in ["", "é", "foobar", "foo\nbar\n東京"] {
         for start in 0..=haystack.len() {

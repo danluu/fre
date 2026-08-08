@@ -408,6 +408,7 @@ const fn plan_tag(plan: PlanKind) -> u8 {
         PlanKind::ReverseInner => 13,
         PlanKind::PrefixClassAlternation => 14,
         PlanKind::UnicodeScalarRun => 15,
+        PlanKind::LineDomainByteAtoms => 16,
     }
 }
 

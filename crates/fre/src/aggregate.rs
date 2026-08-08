@@ -213,8 +213,8 @@ pub use p16_grep_stream::{
     ACCOUNTING_VERSION as PORTABLE_GREP_ACCOUNTING_VERSION,
     ALGORITHM_VERSION as PORTABLE_GREP_ALGORITHM_VERSION, PortableGrepBuildError,
     PortableGrepError, PortableGrepExecutionError, PortableGrepLineTotalError,
-    PortableGrepLiteralError, PortableGrepMatch, PortableGrepProspective, PortableGrepResult,
-    PortableGrepSession, PortableGrepWordError,
+    PortableGrepLineDomainError, PortableGrepLiteralError, PortableGrepMatch,
+    PortableGrepProspective, PortableGrepResult, PortableGrepSession, PortableGrepWordError,
 };
 
 pub use fre_aggregate::Strategy as AggregateStrategy;

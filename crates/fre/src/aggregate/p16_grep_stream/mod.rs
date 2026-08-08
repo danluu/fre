@@ -7,10 +7,12 @@
 
 use core::fmt::Write as _;
 
+mod line_domain;
 mod literal;
 mod word;
 
 pub use crate::line_total_grep::Error as PortableGrepLineTotalError;
+pub use line_domain::Error as PortableGrepLineDomainError;
 pub use literal::Error as PortableGrepLiteralError;
 pub use word::Error as PortableGrepWordError;
 
@@ -101,6 +103,7 @@ impl PortableGrepProspective {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EngineProspective {
     LineTotal(line_total_grep::Prospective),
+    LineDomain(line_domain::Prospective),
     Literal(literal::Prospective),
     K0(K0Prospective),
     Word(word::Prospective),
@@ -171,6 +174,8 @@ pub enum PortableGrepError {
     K0(k0_grep::GrepStreamError),
     /// The construction-certified line-total reducer refused.
     LineTotal(PortableGrepLineTotalError),
+    /// The deterministic line-domain adapter refused.
+    LineDomain(PortableGrepLineDomainError),
     /// The native word line-state engine refused or found an invariant error.
     Word(PortableGrepWordError),
     /// The shared exact-literal line adapter refused before begin.
@@ -197,6 +202,8 @@ pub enum PortableGrepExecutionError {
     K0(k0_grep::GrepStreamError),
     /// The construction-certified line-total reducer failed.
     LineTotal(PortableGrepLineTotalError),
+    /// The deterministic line-domain adapter failed.
+    LineDomain(PortableGrepLineDomainError),
     /// The native ASCII/Unicode word-run engine failed.
     Word(PortableGrepWordError),
     /// The shared exact-literal adapter failed.
@@ -230,6 +237,12 @@ impl From<k0_grep::GrepStreamError> for PortableGrepError {
 impl From<line_total_grep::Error> for PortableGrepError {
     fn from(error: line_total_grep::Error) -> Self {
         Self::LineTotal(error)
+    }
+}
+
+impl From<line_domain::Error> for PortableGrepError {
+    fn from(error: line_domain::Error) -> Self {
+        Self::LineDomain(error)
     }
 }
 
@@ -289,6 +302,7 @@ impl<'r> PortableGrepSession<'r> {
         } else {
             match &regex.plan {
                 PortablePlan::ExactLiteral(_) => empty_slot,
+                PortablePlan::LineDomainByteAtoms(_) => empty_slot,
                 PortablePlan::K0(k0) => AutomatonSlotLayout::for_automaton(
                     k0.automaton.stats().states(),
                     k0.automaton.stats().edges(),
@@ -381,6 +395,9 @@ impl<'r> PortableGrepSession<'r> {
                 PortablePlan::ExactLiteral(plan) => {
                     EngineProspective::Literal(literal::prospective(plan, haystack_len)?)
                 }
+                PortablePlan::LineDomainByteAtoms(plan) => EngineProspective::LineDomain(
+                    line_domain::prospective(plan, haystack_len)?,
+                ),
                 PortablePlan::K0(k0) => {
                     EngineProspective::K0(k0_grep::prospective(&k0.automaton, haystack_len)?)
                 }
@@ -466,6 +483,18 @@ impl<'r> PortableGrepSession<'r> {
         match (&self.regex.plan, required.engine) {
             (PortablePlan::ExactLiteral(plan), EngineProspective::Literal(engine)) => {
                 Self::execute_literal(
+                    &mut self.operation,
+                    self.compiled_plan_id,
+                    plan,
+                    haystack,
+                    engine,
+                    required,
+                    reset_limits,
+                    run_limits,
+                )
+            }
+            (PortablePlan::LineDomainByteAtoms(plan), EngineProspective::LineDomain(engine)) => {
+                Self::execute_line_domain(
                     &mut self.operation,
                     self.compiled_plan_id,
                     plan,
@@ -667,6 +696,78 @@ impl<'r> PortableGrepSession<'r> {
         clippy::result_large_err,
         reason = "engine admission and common limits are separate authenticated inputs"
     )]
+    fn execute_line_domain(
+        operation: &mut OperationSession,
+        compiled_plan_id: [u8; 16],
+        plan: &crate::line_domain_byte_atoms::OwnedPlan,
+        haystack: &[u8],
+        engine: line_domain::Prospective,
+        common: PortableGrepProspective,
+        reset_limits: OperationSessionResetLimits,
+        run_limits: OperationSessionRunLimits,
+    ) -> Result<PortableGrepResult, PortableGrepError> {
+        let invocation = OperationSessionInvocation {
+            haystack_len: haystack.len(),
+            range: 0..haystack.len(),
+            required_generations: common.required_generations,
+        };
+        let mut forced = operation.forced_grep();
+        let attempt = forced
+            .begin_stream_count(
+                compiled_plan_id,
+                invocation,
+                common.execution,
+                reset_limits,
+                run_limits,
+            )
+            .map_err(map_begin_error)?;
+        let mut order = attempt.stream_order_verifier();
+        let result = line_domain::count_matching_lines_with_observer(
+            plan,
+            haystack,
+            engine,
+            |matched| order.observe(common_match(line_domain_match(matched))),
+        );
+        let report = match result {
+            Ok(report) => report,
+            Err(line_domain::ObservedError::Execution { error, partial }) => {
+                return Err(close_execution(
+                    attempt,
+                    line_domain_actual(partial),
+                    order.finish(),
+                    GrepStreamFailure::Engine,
+                    PortableGrepExecutionError::LineDomain(error),
+                ));
+            }
+            Err(line_domain::ObservedError::Observer { error, partial }) => {
+                return Err(close_execution(
+                    attempt,
+                    line_domain_actual(partial),
+                    order.finish(),
+                    GrepStreamFailure::Observer,
+                    observer_execution_error(error),
+                ));
+            }
+        };
+        if report.prospective() != engine {
+            return Err(close_execution(
+                attempt,
+                line_domain_actual(report.actual()),
+                order.finish(),
+                GrepStreamFailure::Protocol,
+                PortableGrepExecutionError::Protocol {
+                    detail: "line-domain engine report changed its admitted prospective",
+                },
+            ));
+        }
+        finish_line_domain(attempt, report, order.finish())
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::result_large_err,
+        reason = "engine admission and common limits are separate authenticated inputs"
+    )]
     fn execute_k0(
         operation: &mut OperationSession,
         compiled_plan_id: [u8; 16],
@@ -855,6 +956,14 @@ fn operation_prospective(engine: EngineProspective) -> (OperationSessionExecutio
                 value.line_domains(),
                 0,
             ),
+            EngineProspective::LineDomain(value) => (
+                value.work(),
+                value.source_accesses(),
+                value.transitions(),
+                value.candidates(),
+                value.line_domains(),
+                0,
+            ),
             EngineProspective::Literal(value) => (
                 value.work(),
                 value.source_accesses(),
@@ -949,6 +1058,39 @@ fn finish_literal(
     let common_report = GrepStreamExecutionReport {
         source_line_domains: actual.domains_examined(),
         actual: literal_actual(actual),
+        first_match: first_match.map(common_match),
+        last_match: last_match.map(common_match),
+    };
+    let receipt = attempt
+        .finish_stream_count(common_report, order)
+        .map_err(map_commit_error)?;
+    Ok(PortableGrepResult {
+        count: actual.matching_lines(),
+        source_line_domains: common_report.source_line_domains,
+        first_match,
+        last_match,
+        receipt,
+    })
+}
+
+#[allow(
+    clippy::result_large_err,
+    reason = "typed common-session refusals retain their closed allocation-free receipt by value"
+)]
+fn finish_line_domain(
+    attempt: crate::operation_session::OperationSessionAttempt<
+        '_,
+        crate::operation_session::grep::Slot,
+    >,
+    report: line_domain::Report,
+    order: GrepStreamOrderProof,
+) -> Result<PortableGrepResult, PortableGrepError> {
+    let actual = report.actual();
+    let first_match = report.first_match().map(line_domain_match);
+    let last_match = report.last_match().map(line_domain_match);
+    let common_report = GrepStreamExecutionReport {
+        source_line_domains: actual.domains_examined(),
+        actual: line_domain_actual(actual),
         first_match: first_match.map(common_match),
         last_match: last_match.map(common_match),
     };
@@ -1088,6 +1230,17 @@ fn literal_match(value: literal::MatchedLine) -> PortableGrepMatch {
     }
 }
 
+fn line_domain_match(value: line_domain::MatchedLine) -> PortableGrepMatch {
+    PortableGrepMatch {
+        line_ordinal: value.ordinal(),
+        line_start: value.line_start(),
+        line_content_end: value.content_end(),
+        line_source_end: value.source_end(),
+        match_start: value.match_start(),
+        match_end: value.match_end(),
+    }
+}
+
 fn k0_match(value: k0_grep::MatchedLine) -> PortableGrepMatch {
     let selected = value.selected_match();
     PortableGrepMatch {
@@ -1128,6 +1281,22 @@ fn line_total_actual(value: line_total_grep::Actual) -> OperationSessionExecutio
 }
 
 fn literal_actual(value: literal::Actual) -> OperationSessionExecutionActual {
+    OperationSessionExecutionActual {
+        work: value.work(),
+        source_accesses: value.source_accesses(),
+        transitions: value.transitions(),
+        candidates: value.candidates(),
+        cache_misses: 0,
+        history_nodes: 0,
+        line_domains: value.matching_lines(),
+        output_events: value.matching_lines(),
+        selected_span_bytes: 0,
+        participation_entries: 0,
+        allocations: 0,
+    }
+}
+
+fn line_domain_actual(value: line_domain::Actual) -> OperationSessionExecutionActual {
     OperationSessionExecutionActual {
         work: value.work(),
         source_accesses: value.source_accesses(),
@@ -1270,6 +1439,12 @@ fn compiled_plan_id(regex: &PortableRegex) -> [u8; 16] {
             digest.byte(0x11);
             write!(&mut digest, "{plan:?}").expect("compiled-plan identity writer is infallible");
         }
+        PortablePlan::LineDomainByteAtoms(plan) => {
+            digest.byte(0x13);
+            plan.visit_identity_words(|word| {
+                digest.tagged_bytes(0x14, &word.to_le_bytes());
+            });
+        }
         _ => {
             digest.byte(0xff);
         }
@@ -1362,6 +1537,30 @@ mod tests {
             lines.push((line_start, source.len(), source.len()));
         }
         lines
+    }
+
+    fn direct_line_domain_plan(
+        pattern: &str,
+    ) -> Box<crate::line_domain_byte_atoms::OwnedPlan> {
+        let hir = regex_syntax::ParserBuilder::new()
+            .unicode(false)
+            .utf8(false)
+            .build()
+            .parse(pattern)
+            .expect("direct line-domain test HIR");
+        let crate::line_domain_byte_atoms::InspectionOutcome::Eligible(inspection) =
+            crate::line_domain_byte_atoms::inspect(&hir, b'\n', 0, u64::MAX)
+                .expect("direct line-domain inspection")
+        else {
+            panic!("direct line-domain test shape declined");
+        };
+        let crate::line_domain_byte_atoms::PublicationOutcome::Published(plan) = inspection
+            .try_publish(u64::MAX, usize::MAX)
+            .expect("direct line-domain publication")
+        else {
+            panic!("direct line-domain test owner declined");
+        };
+        plan
     }
 
     fn repeated_search_trace(regex: &PortableRegex, source: &[u8]) -> Vec<PortableGrepMatch> {
@@ -1475,6 +1674,142 @@ mod tests {
     }
 
     #[test]
+    fn line_domain_facade_preserves_partition_semantics_offsets_and_reuse() {
+        let lf = PortableRegex::new(r"(?m)^(?-u:[A-Z][a-z]{2,8})$")
+            .expect("ordinary line-domain regex");
+        assert_eq!(lf.build_report().plan, crate::PlanKind::LineDomainByteAtoms);
+        assert_eq!(
+            lf.runtime_implementation_id(),
+            fre_kernels::LINE_DOMAIN_BYTE_ATOMS_PLAN_ID
+        );
+        for source in [
+            b"".as_slice(),
+            b"\n\n".as_slice(),
+            b"Alpha\r\nBeta\nbad\rDelta\nEcho".as_slice(),
+            b"Alpha\n\xff\r\nGamma\r".as_slice(),
+        ] {
+            assert_matches_repeated(&lf, source);
+        }
+
+        // Grep strips the CR in CRLF before applying the regex. Searching the
+        // original source window directly would incorrectly make ordinary `$`
+        // observe the CR instead of the already-partitioned content end.
+        let mut session = lf.grep_stream_session().expect("line-domain session");
+        let result = execute(&mut session, b"Alpha\r\nmiss\nBeta");
+        assert_eq!(result.count(), 2);
+        assert_eq!(result.first_match.map(|matched| matched.match_end), Some(5));
+        assert_eq!(result.last_match.map(|matched| matched.match_start), Some(12));
+
+        let crlf = PortableRegex::new(r"(?Rm)^(?-u:[A-Z][a-z]{2,8})$")
+            .expect("CRLF line-domain regex");
+        assert_eq!(
+            crlf.build_report().plan,
+            crate::PlanKind::LineDomainByteAtoms
+        );
+        assert_matches_repeated(&crlf, b"\r\nBravo\r\nBad\rDelta\nEcho\r\n");
+    }
+
+    #[test]
+    fn line_domain_grep_keeps_configured_terminators_inside_each_lf_domain() {
+        let regex = crate::PortableBuilder::new(r"(?m)^(?-u:[A-Z][a-z]{2,8})$")
+            .line_terminator(b'|')
+            .build()
+            .expect("configured-terminator line-domain regex");
+        assert_eq!(
+            regex.build_report().plan,
+            crate::PlanKind::LineDomainByteAtoms
+        );
+        // The first LF-domain selects `Alpha` between configured terminators;
+        // the second selects `Beta` at the content-slice boundaries.
+        assert_matches_repeated(&regex, b"x|Alpha|tail\nBeta\r\nnope");
+    }
+
+    #[test]
+    fn line_domain_prospective_binds_the_plan_and_empty_source() {
+        // These one-atom masks collide under the candidate's former XOR-folded
+        // fingerprint. Admission is instead tied to the exact live owner.
+        let first = PortableRegex::new(r"(?m)^(?-u:[\x00\xE1])$")
+            .expect("first line-domain regex");
+        let second = PortableRegex::new(r"(?m)^(?-u:[\x01\xE2])$")
+            .expect("second line-domain regex");
+        let mut first_session = first.grep_stream_session().expect("first session");
+        let mut second_session = second.grep_stream_session().expect("second session");
+
+        let empty = first_session.prospective(0).expect("empty prospective");
+        assert_eq!(
+            empty.execution(),
+            OperationSessionExecutionProspective::default()
+        );
+        let empty_result = first_session.count(b"").expect("empty grep");
+        assert_eq!(empty_result.count(), 0);
+        assert_eq!(empty_result.source_line_domains, 0);
+
+        let source = b"\0\n\xE2";
+        let first_prospective = first_session
+            .prospective(source.len())
+            .expect("first prospective");
+        let mut sibling_session = first.grep_stream_session().expect("sibling session");
+        let sibling_prospective = sibling_session
+            .prospective(source.len())
+            .expect("sibling prospective");
+        assert_eq!(first_prospective, sibling_prospective);
+        let (sibling_reset, sibling_run) = sibling_session
+            .exact_limits(sibling_prospective)
+            .expect("sibling exact limits");
+        sibling_session
+            .count_matching_lines(source, first_prospective, sibling_reset, sibling_run)
+            .expect("same-owner prospective is interoperable across sessions");
+
+        let cloned = first.clone();
+        assert_eq!(compiled_plan_id(&first), compiled_plan_id(&cloned));
+        let cloned_session = cloned.grep_stream_session().expect("cloned session");
+        assert_ne!(
+            first_prospective,
+            cloned_session
+                .prospective(source.len())
+                .expect("cloned prospective"),
+            "a rebuilt clone has the same compiled identity but a distinct live owner",
+        );
+        let second_prospective = second_session
+            .prospective(source.len())
+            .expect("second prospective");
+        assert_ne!(first_prospective, second_prospective);
+        let (reset, run) = second_session
+            .exact_limits(second_prospective)
+            .expect("second exact limits");
+        assert!(matches!(
+            second_session.count_matching_lines(source, first_prospective, reset, run),
+            Err(PortableGrepError::AdmissionMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn line_domain_prospective_rejects_same_address_owner_replacement() {
+        let source = b"A\nmiss";
+        let mut slot = *direct_line_domain_plan(r"(?m)^(?-u:A)$");
+        let first_address = core::ptr::from_ref(&slot).addr();
+        let first_instance = slot.instance_identity();
+        let admitted = line_domain::prospective(&slot, source.len())
+            .expect("first direct prospective");
+
+        // Assignment replaces the immutable owner value in one stable local
+        // place. This gives the ABA case without unsafe code or allocator
+        // reuse assumptions.
+        slot = *direct_line_domain_plan(r"(?m)^(?-u:A)$");
+        let replacement_instance = slot.instance_identity();
+        assert_ne!(first_instance, replacement_instance);
+        assert_eq!(core::ptr::from_ref(&slot).addr(), first_address);
+
+        let required = line_domain::prospective(&slot, source.len())
+            .expect("replacement direct prospective");
+        assert_ne!(admitted, required);
+        assert!(matches!(
+            line_domain::count_matching_lines(&slot, source, admitted),
+            Err(line_domain::Error::AdmissionMismatch)
+        ));
+    }
+
+    #[test]
     fn construction_certifies_only_greedy_total_byte_line_hir() {
         let unicode = PortableRegex::new(r"(?m)^.*$").expect("Unicode byte-regex profile");
         assert!(!unicode.has_line_total_grep_plan());
@@ -1579,9 +1914,11 @@ mod tests {
     }
 
     #[test]
-    fn literal_k0_and_word_positive_dimensions_refuse_one_below_before_execution() {
+    fn literal_line_domain_k0_and_word_positive_dimensions_refuse_one_below_before_execution() {
         for regex in [
             PortableRegex::new("ab").expect("literal regex"),
+            PortableRegex::new(r"(?m)^(?-u:[A-Z][a-z]{2,8})$")
+                .expect("line-domain regex"),
             PortableRegex::new(r"(?-u)^(?:ab|a[cd]+?)[^\n]*z$").expect("K0 regex"),
             PortableRegex::new(r"\b\w{2,}\b").expect("word regex"),
         ] {
@@ -1706,11 +2043,22 @@ mod tests {
         let word = PortableRegex::new(r"\b\w{2,}\b").expect("word regex");
         let literal = PortableRegex::new("ab").expect("literal regex");
         let other_literal = PortableRegex::new("ac").expect("other literal regex");
+        let line_domain = PortableRegex::new(r"(?m)^(?-u:[\x00\xE1])$")
+            .expect("line-domain regex");
+        let other_line_domain = PortableRegex::new(r"(?m)^(?-u:[\x01\xE2])$")
+            .expect("other line-domain regex");
         assert_ne!(compiled_plan_id(&first), [0; 16]);
         assert_eq!(compiled_plan_id(&first), compiled_plan_id(&replay));
         assert_ne!(compiled_plan_id(&first), compiled_plan_id(&second));
         assert_ne!(compiled_plan_id(&first), compiled_plan_id(&word));
         assert_ne!(compiled_plan_id(&literal), compiled_plan_id(&other_literal));
         assert_ne!(compiled_plan_id(&literal), compiled_plan_id(&first));
+        assert_ne!(compiled_plan_id(&line_domain), [0; 16]);
+        assert_ne!(
+            compiled_plan_id(&line_domain),
+            compiled_plan_id(&other_line_domain)
+        );
+        assert_ne!(compiled_plan_id(&line_domain), compiled_plan_id(&first));
+        assert_ne!(compiled_plan_id(&line_domain), compiled_plan_id(&literal));
     }
 }

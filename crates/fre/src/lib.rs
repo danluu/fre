@@ -93,6 +93,7 @@ pub mod guarded_ascii_word;
 mod guarded_literal_set;
 pub mod guarded_unicode_word;
 mod line_capture;
+mod line_domain_byte_atoms;
 mod line_total_grep;
 mod literal_assertions;
 mod literal_class_run_literal;
@@ -231,8 +232,9 @@ pub use aggregate::{
     PRIORITY_AGGREGATE_ACCOUNTING_ID, PRIORITY_AGGREGATE_MANY_ACCOUNTING_ID,
     PRIORITY_AGGREGATE_MANY_SCHEMA_VERSION, PRIORITY_AGGREGATE_SCHEMA_VERSION,
     PortableGrepBuildError, PortableGrepError, PortableGrepExecutionError,
-    PortableGrepLiteralError, PortableGrepMatch, PortableGrepProspective, PortableGrepResult,
-    PortableGrepSession, PortableGrepWordError, PriorityAggregateAssertionProof,
+    PortableGrepLineDomainError, PortableGrepLiteralError, PortableGrepMatch,
+    PortableGrepProspective, PortableGrepResult, PortableGrepSession, PortableGrepWordError,
+    PriorityAggregateAssertionProof,
     PriorityAggregateBridgeAccounting, PriorityAggregateBridgeLimits,
     PriorityAggregateBridgeProspective, PriorityAggregateBridgeResource,
     PriorityAggregateBuildError, PriorityAggregateBuildLimits, PriorityAggregateBuildReport,
@@ -1103,6 +1105,8 @@ pub enum PlanKind {
     /// Positive root Unicode scalar-class repetition with a bulk leading-byte
     /// filter and exact scalar verification.
     UnicodeScalarRun,
+    /// Deterministic finite byte atoms over configured-byte or CRLF line domains.
+    LineDomainByteAtoms,
 }
 
 /// Construction failure without semantic fallback.
@@ -3758,6 +3762,8 @@ pub enum SearchAccounting {
     GuardedLiteralSet(GuardedLiteralSetSearchAccounting),
     /// Complete Unicode scalar-run source-independent envelope and exact counters.
     UnicodeScalarRun(UnicodeScalarSearchAccounting),
+    /// Complete deterministic line-domain envelope and exact counters.
+    LineDomainByteAtoms(fre_kernels::LineDomainByteAtomsSearchAccounting),
 }
 
 impl SearchAccounting {
@@ -3781,6 +3787,7 @@ impl SearchAccounting {
             Self::UnicodeWordRun(_) => PlanKind::UnicodeWordRun,
             Self::FixedPredicateWord64(_) => PlanKind::FixedPredicateWord64,
             Self::UnicodeScalarRun(_) => PlanKind::UnicodeScalarRun,
+            Self::LineDomainByteAtoms(_) => PlanKind::LineDomainByteAtoms,
         }
     }
 
@@ -3821,6 +3828,7 @@ impl SearchAccounting {
             Self::UnicodeScalarRun(accounting) => {
                 u64::try_from(accounting.actual.work).unwrap_or(u64::MAX)
             }
+            Self::LineDomainByteAtoms(accounting) => accounting.actual.work,
         }
     }
 }
@@ -3867,6 +3875,7 @@ pub enum SearchError {
     FixedPredicateWord64(FixedPredicateWord64SearchError),
     GuardedLiteralSet(GuardedLiteralSetSearchError),
     UnicodeScalarRun(UnicodeScalarSearchError),
+    LineDomainByteAtoms(fre_kernels::LineDomainByteAtomsSearchError),
 }
 
 impl fmt::Display for SearchError {
@@ -3909,6 +3918,9 @@ impl fmt::Display for SearchError {
                 write!(f, "fixed-predicate search failed: {error}")
             }
             Self::UnicodeScalarRun(error) => write!(f, "Unicode scalar-run search failed: {error}"),
+            Self::LineDomainByteAtoms(error) => {
+                write!(f, "line-domain byte-atom search failed: {error}")
+            }
         }
     }
 }
@@ -3933,6 +3945,7 @@ impl std::error::Error for SearchError {
             Self::UnicodeWordRun(error) => Some(error),
             Self::FixedPredicateWord64(error) => Some(error),
             Self::UnicodeScalarRun(error) => Some(error),
+            Self::LineDomainByteAtoms(error) => Some(error),
         }
     }
 }
@@ -4040,6 +4053,12 @@ impl From<FixedPredicateWord64SearchError> for SearchError {
 impl From<UnicodeScalarSearchError> for SearchError {
     fn from(value: UnicodeScalarSearchError) -> Self {
         Self::UnicodeScalarRun(value)
+    }
+}
+
+impl From<fre_kernels::LineDomainByteAtomsSearchError> for SearchError {
+    fn from(value: fre_kernels::LineDomainByteAtomsSearchError) -> Self {
+        Self::LineDomainByteAtoms(value)
     }
 }
 
@@ -4268,7 +4287,7 @@ pub struct PortableBuilder {
     selection: PlanSelection,
     set_admitted: bool,
     utf8_start_guarded: bool,
-    pure_byte_class_repeat_allowed: bool,
+    byte_native_plans_allowed: bool,
 }
 
 fn try_box_bounded_literal_class_run_owner(
@@ -4450,7 +4469,7 @@ impl PortableBuilder {
             selection: PlanSelection::Auto,
             set_admitted: false,
             utf8_start_guarded: false,
-            pure_byte_class_repeat_allowed: true,
+            byte_native_plans_allowed: true,
         }
     }
 
@@ -4633,7 +4652,7 @@ impl PortableBuilder {
     /// Preserve text-facade routing while keeping byte-only native plans out
     /// of an otherwise equivalent unguarded text HIR.
     pub(crate) const fn for_text_facade(mut self) -> Self {
-        self.pure_byte_class_repeat_allowed = false;
+        self.byte_native_plans_allowed = false;
         self
     }
 
@@ -5544,7 +5563,7 @@ impl PortableBuilder {
             }
         }
         let mut pure_byte_class_repeat_work = prefix_class_alternation_work;
-        if self.selection == PlanSelection::Auto && self.pure_byte_class_repeat_allowed {
+        if self.selection == PlanSelection::Auto && self.byte_native_plans_allowed {
             let inspection = pure_byte_class_repeat::inspect(
                 &rust.hir,
                 prefix_class_alternation_work,
@@ -5621,7 +5640,7 @@ impl PortableBuilder {
             }
         }
         let mut bounded_byte_class_repeat_work = pure_byte_class_repeat_work;
-        if self.selection == PlanSelection::Auto && self.pure_byte_class_repeat_allowed {
+        if self.selection == PlanSelection::Auto && self.byte_native_plans_allowed {
             let inspection = bounded_byte_class_repeat::inspect(
                 &rust.hir,
                 pure_byte_class_repeat_work,
@@ -5748,7 +5767,7 @@ impl PortableBuilder {
             });
         }
         let mut nullable_optional_chain_work = fixed_predicate_work;
-        if self.selection == PlanSelection::Auto && self.pure_byte_class_repeat_allowed {
+        if self.selection == PlanSelection::Auto && self.byte_native_plans_allowed {
             let inspection = nullable_optional_chain::inspect(
                 &rust.hir,
                 fixed_predicate_work,
@@ -5820,7 +5839,7 @@ impl PortableBuilder {
             }
         }
         let mut nullable_finite_token_repeat_work = nullable_optional_chain_work;
-        if self.selection == PlanSelection::Auto && self.pure_byte_class_repeat_allowed {
+        if self.selection == PlanSelection::Auto && self.byte_native_plans_allowed {
             let inspection = nullable_finite_token_repeat::inspect(
                 &rust.hir,
                 nullable_optional_chain_work,
@@ -6146,7 +6165,7 @@ impl PortableBuilder {
             }
         }
         let mut bounded_byte_class_sequence_work = finite_work;
-        if self.selection == PlanSelection::Auto && self.pure_byte_class_repeat_allowed {
+        if self.selection == PlanSelection::Auto && self.byte_native_plans_allowed {
             let inspection = bounded_byte_class_sequence::inspect(
                 &rust.hir,
                 finite_work,
@@ -6379,7 +6398,7 @@ impl PortableBuilder {
         // Every established native family above therefore keeps precedence;
         // ForceK0 returned before this selection pipeline began.
         if self.selection == PlanSelection::Auto
-            && self.pure_byte_class_repeat_allowed
+            && self.byte_native_plans_allowed
             && explicit_captures == 0
             && fallback_planner_work < self.limits.max_planner_work
         {
@@ -6777,6 +6796,120 @@ impl PortableBuilder {
                     }
                 }
             }
+            }
+        }
+        // This proof is deliberately last among native searches. It replaces
+        // only the otherwise-generic K0 route, so every established direct
+        // specialization above retains its construction and runtime
+        // precedence. The sizable immutable atom owner is published behind
+        // one fallible box; an optional resource or allocation refusal keeps
+        // the authoritative K0 fallback available.
+        if self.selection == PlanSelection::Auto
+            && self.byte_native_plans_allowed
+            && fallback_planner_work < self.limits.max_planner_work
+        {
+            match line_domain_byte_atoms::inspect(
+                &rust.hir,
+                self.profile.options.line_terminator,
+                fallback_planner_work,
+                self.limits.max_planner_work,
+            ) {
+                Ok(line_domain_byte_atoms::InspectionOutcome::Eligible(inspection)) => {
+                    let retained_facade_bytes = source_storage_bytes
+                        .checked_add(capture_name_storage_bytes)
+                        .ok_or(BuildError::PersistentBytesOverflow)?;
+                    let available_persistent_bytes = self
+                        .limits
+                        .max_persistent_bytes
+                        .saturating_sub(retained_facade_bytes);
+                    match inspection
+                        .try_publish(
+                            self.limits.max_planner_work,
+                            available_persistent_bytes,
+                        )
+                        .map_err(|error| match error {
+                            line_domain_byte_atoms::PublicationError::ArithmeticOverflow => {
+                                BuildError::InternalInvariant(
+                                    "line-domain publication accounting overflowed",
+                                )
+                            }
+                            line_domain_byte_atoms::PublicationError::KernelInvariant => {
+                                BuildError::InternalInvariant(
+                                    "line-domain kernel disagreed with its HIR proof",
+                                )
+                            }
+                            line_domain_byte_atoms::PublicationError::OwnerLayoutOverflow => {
+                                BuildError::InternalInvariant(
+                                    "line-domain owner allocation layout overflowed",
+                                )
+                            }
+                        })?
+                    {
+                        line_domain_byte_atoms::PublicationOutcome::Published(plan) => {
+                            let build = plan.build_accounting();
+                            if build.owner_allocations != 1
+                                || build.kernel.allocations != 0
+                                || build.kernel.persistent_bytes
+                                    != core::mem::size_of::<
+                                        fre_kernels::LineDomainByteAtomsPlan,
+                                    >()
+                                || plan.storage_bytes() != build.persistent_bytes
+                            {
+                                return Err(BuildError::InternalInvariant(
+                                    "line-domain owner lost its allocation receipt",
+                                ));
+                            }
+                            return Ok(PortableRegex {
+                                source,
+                                capture_names,
+                                line_total_grep_plan,
+                                plan: PortablePlan::LineDomainByteAtoms(plan),
+                                profile: profile.clone(),
+                                limits: self.limits,
+                                selection: self.selection,
+                                report: BuildReport {
+                                    profile: profile.clone(),
+                                    admission,
+                                    syntax,
+                                    plan: PlanKind::LineDomainByteAtoms,
+                                    planner_work: build.cumulative_planner_work,
+                                    lowering: None,
+                                    states: 0,
+                                    edges: 0,
+                                    plan_storage_bytes: build.persistent_bytes,
+                                    source_storage_bytes,
+                                    capture_name_storage_bytes,
+                                    charged_persistent_bytes: 0,
+                                    persistent_byte_limit: 0,
+                                    captures_len,
+                                    static_captures_len,
+                                    minimum_match_bytes,
+                                    required_literal: None,
+                                    literal_class_run_literal: None,
+                                    forward_anchored: None,
+                                }
+                                .enforce_persistent_limit(
+                                    self.limits.max_persistent_bytes,
+                                )?,
+                            });
+                        }
+                        line_domain_byte_atoms::PublicationOutcome::Declined {
+                            planner_work,
+                        } => fallback_planner_work = planner_work,
+                    }
+                }
+                Ok(line_domain_byte_atoms::InspectionOutcome::Ineligible {
+                    planner_work,
+                }) => fallback_planner_work = planner_work,
+                Err(line_domain_byte_atoms::InspectionError::WorkLimit {
+                    actual,
+                    ..
+                }) => fallback_planner_work = actual,
+                Err(line_domain_byte_atoms::InspectionError::ArithmeticOverflow) => {
+                    return Err(BuildError::InternalInvariant(
+                        "line-domain HIR inspection accounting overflowed",
+                    ));
+                }
             }
         }
         let lowered = fre_lower::lower_raw(
@@ -7456,6 +7589,7 @@ enum PortablePlan {
         Box<universal_finite_greedy_corridor::BoundedDelimitedSegmentPlan>,
     ),
     UnicodeScalarRun(Box<UnicodeScalarSearchPlan>),
+    LineDomainByteAtoms(Box<line_domain_byte_atoms::OwnedPlan>),
 }
 
 impl PortablePlan {
@@ -7492,6 +7626,7 @@ impl PortablePlan {
             Self::UniversalFiniteGreedyCorridor(plan) => plan.plan_id(),
             Self::BoundedDelimitedSegmentRepeat(plan) => plan.plan_id(),
             Self::UnicodeScalarRun(_) => UNICODE_SCALAR_RUN_SEARCH_PLAN_ID,
+            Self::LineDomainByteAtoms(_) => fre_kernels::LINE_DOMAIN_BYTE_ATOMS_PLAN_ID,
         }
     }
 }
@@ -8245,6 +8380,13 @@ impl PortableRegex {
                 )?;
                 Ok((matched, SearchAccounting::UnicodeScalarRun(accounting)))
             }
+            PortablePlan::LineDomainByteAtoms(plan) => {
+                let (matched, accounting) = plan.is_match_window(haystack, window, limits)?;
+                Ok((
+                    matched,
+                    SearchAccounting::LineDomainByteAtoms(accounting),
+                ))
+            }
         }
     }
 
@@ -8459,6 +8601,9 @@ impl PortableRegex {
                     fre_kernels::Window::new(window.start(), window.end()),
                     unicode_scalar_search_limits(limits),
                 )
+                .map_err(SearchError::from),
+            PortablePlan::LineDomainByteAtoms(plan) => plan
+                .is_match_window_value(haystack, window, limits)
                 .map_err(SearchError::from),
         }
     }
@@ -8843,6 +8988,18 @@ impl PortableRegex {
                 )?;
                 Ok((end, SearchAccounting::UnicodeScalarRun(accounting)))
             }
+            PortablePlan::LineDomainByteAtoms(plan) => {
+                let (matched, accounting) = plan.find_window(
+                    haystack,
+                    window,
+                    limits,
+                    fre_kernels::LineDomainByteAtomsOperation::EarliestEnd,
+                )?;
+                Ok((
+                    matched.map(Match::end),
+                    SearchAccounting::LineDomainByteAtoms(accounting),
+                ))
+            }
         }
     }
 
@@ -9106,6 +9263,18 @@ impl PortableRegex {
                 Ok((
                     matched.map(|(_, end)| end),
                     SearchAccounting::UnicodeScalarRun(accounting),
+                ))
+            }
+            PortablePlan::LineDomainByteAtoms(plan) => {
+                let (matched, accounting) = plan.find_window(
+                    haystack,
+                    SearchWindow::full(haystack),
+                    limits,
+                    fre_kernels::LineDomainByteAtomsOperation::SelectedEnd,
+                )?;
+                Ok((
+                    matched.map(Match::end),
+                    SearchAccounting::LineDomainByteAtoms(accounting),
                 ))
             }
         }
@@ -9653,6 +9822,18 @@ impl PortableRegex {
                     SearchAccounting::UnicodeScalarRun(accounting),
                 ))
             }
+            PortablePlan::LineDomainByteAtoms(plan) => {
+                let (matched, accounting) = plan.find_window(
+                    haystack,
+                    window,
+                    limits,
+                    fre_kernels::LineDomainByteAtomsOperation::Span,
+                )?;
+                Ok((
+                    matched,
+                    SearchAccounting::LineDomainByteAtoms(accounting),
+                ))
+            }
         }
     }
 
@@ -9884,6 +10065,9 @@ impl PortableRegex {
                 )
                 .map(|matched| matched.map(|(start, end)| Match { start, end }))
                 .map_err(SearchError::from),
+            PortablePlan::LineDomainByteAtoms(plan) => plan
+                .find_window_value(haystack, window, limits)
+                .map_err(SearchError::from),
         }
     }
 
@@ -9903,6 +10087,9 @@ impl PortableRegex {
             ),
             PortablePlan::UnicodeScalarRun(plan) => Some(
                 PortableNativeSearchCursor::UnicodeScalarRun(plan.search_cursor(haystack)),
+            ),
+            PortablePlan::LineDomainByteAtoms(plan) => Some(
+                PortableNativeSearchCursor::LineDomainByteAtoms(plan.search_cursor(haystack)),
             ),
             _ => None,
         }
@@ -10165,6 +10352,15 @@ impl PortableRegex {
                     matched.map(|(start, end)| Match { start, end }),
                     u64::try_from(accounting.actual.work).unwrap_or(u64::MAX),
                 ))
+            }
+            PortablePlan::LineDomainByteAtoms(plan) => {
+                let (matched, accounting) = plan.find_window(
+                    haystack,
+                    SearchWindow::new(start, haystack.len()),
+                    limits,
+                    fre_kernels::LineDomainByteAtomsOperation::Iterate,
+                )?;
+                Ok((matched, accounting.actual.work))
             }
             PortablePlan::K0(_) => {
                 let (matched, accounting) =
@@ -16718,6 +16914,7 @@ enum PortableNativeSearchCursor<'r, 'h> {
     PrefixClass(PrefixClassAlternationSearchCursor<'r, 'h>),
     DispatchedPrefixClass(DispatchedPrefixClassAlternationSearchCursor<'r, 'h>),
     UnicodeScalarRun(UnicodeScalarSearchCursor<'r, 'h>),
+    LineDomainByteAtoms(line_domain_byte_atoms::SearchCursor<'r, 'h>),
 }
 
 impl PortableNativeSearchCursor<'_, '_> {
@@ -16763,6 +16960,10 @@ impl PortableNativeSearchCursor<'_, '_> {
                     u64::try_from(accounting.actual.work).unwrap_or(u64::MAX),
                 ))
             }
+            Self::LineDomainByteAtoms(cursor) => {
+                let (matched, accounting) = cursor.find_at(start, limits)?;
+                Ok((matched, accounting.actual.work))
+            }
         }
     }
 
@@ -16775,6 +16976,9 @@ impl PortableNativeSearchCursor<'_, '_> {
             Self::UnicodeScalarRun(cursor) => cursor
                 .find_at_value(start, unicode_scalar_search_limits(limits))
                 .map(|matched| matched.map(|(start, end)| Match { start, end }))
+                .map_err(SearchError::from),
+            Self::LineDomainByteAtoms(cursor) => cursor
+                .find_at_value(start, limits)
                 .map_err(SearchError::from),
             _ => self.find_at(start, limits).map(|(matched, _work)| matched),
         }

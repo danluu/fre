@@ -17,6 +17,7 @@ use crate::{
     FRE_V1_FEATURE_SPAN, FRE_V1_FEATURE_THREAD_SAFE_REGEX, FRE_V1_FEATURES, FRE_V1_JIT_DENY,
     FRE_V1_PLAN_BOUNDED_BYTE_CLASS_SEQUENCE, FRE_V1_PLAN_EXACT_LITERAL,
     FRE_V1_PLAN_FIXED_PREDICATE_WORD64, FRE_V1_PLAN_FORWARD_ANCHORED, FRE_V1_PLAN_K0,
+    FRE_V1_PLAN_LINE_DOMAIN_BYTE_ATOMS,
     FRE_V1_PLAN_LITERAL_CLASS_RUN_LITERAL, FRE_V1_PLAN_LITERAL_SET_DFA,
     FRE_V1_PLAN_PACKED_LITERAL_SET, FRE_V1_PLAN_PURE_BYTE_CLASS_REPEAT,
     FRE_V1_PLAN_PREFIX_CLASS_ALTERNATION, FRE_V1_PLAN_REQUIRED_LITERAL,
@@ -99,8 +100,9 @@ fn abi_layouts_offsets_tags_and_features_are_stable() {
             FRE_V1_PLAN_REVERSE_INNER,
             FRE_V1_PLAN_PREFIX_CLASS_ALTERNATION,
             FRE_V1_PLAN_UNICODE_SCALAR_RUN,
+            FRE_V1_PLAN_LINE_DOMAIN_BYTE_ATOMS,
         ],
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
     );
     assert_eq!(
         FRE_V1_FEATURES,
@@ -151,6 +153,10 @@ fn every_rust_plan_kind_has_the_pinned_public_tag() {
         (
             PlanKind::UnicodeScalarRun,
             FRE_V1_PLAN_UNICODE_SCALAR_RUN,
+        ),
+        (
+            PlanKind::LineDomainByteAtoms,
+            FRE_V1_PLAN_LINE_DOMAIN_BYTE_ATOMS,
         ),
     ];
     for (plan, expected) in cases {
@@ -385,6 +391,10 @@ fn appended_native_plans_have_stable_public_plan_tags() {
         (
             br"Q[ab][cd][ef][gh][ij][kl][mn][op][rs][tu][vw][xy][01][23][45][67]",
             FRE_V1_PLAN_FIXED_PREDICATE_WORD64,
+        ),
+        (
+            br"(?m)^(?-u:[A-Z][a-z]{2,8})$",
+            FRE_V1_PLAN_LINE_DOMAIN_BYTE_ATOMS,
         ),
     ];
     for &(pattern, expected) in cases {

@@ -1164,6 +1164,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn text_facade_keeps_line_domain_eligible_shapes_on_k0() {
+        let regex = PortableTextRegex::new(r"(?m)^Sherlock Holmes$")
+            .expect("text-equivalent multiline literal");
+        assert_eq!(regex.build_report().portable.plan, crate::PlanKind::K0);
+        assert!(regex.build_report().portable.lowering.is_some());
+        let (matched, accounting) = regex
+            .find("prefix\nSherlock Holmes\nsuffix", SearchLimits::unlimited())
+            .expect("text K0 search");
+        assert_eq!(matched.map(|value| (value.start(), value.end())), Some((7, 22)));
+        assert!(matches!(accounting, SearchAccounting::K0(_)));
+        let session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .expect("text K0 session");
+        assert_eq!(session.runtime_implementation_id(), "k0");
+        assert!(session.workspace_setup_accounting().is_some());
+    }
+
+    #[test]
     fn impossible_alternative_elision_is_ordered_and_dead_on_both_profiles() {
         let text_dead = Hir::concat(vec![Hir::fail(), Hir::literal("text".as_bytes())]);
         let bytes_dead = Hir::concat(vec![Hir::fail(), Hir::literal("bytes".as_bytes())]);
