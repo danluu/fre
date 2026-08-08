@@ -327,6 +327,10 @@ pub struct ScanReceipt {
 /// `DenseFallback` certifies that every candidate start before
 /// `resume_start` was checked and did not match.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(
+    dead_code,
+    reason = "the exact-block owner supersedes this retained one-candidate fallback"
+)]
 pub(crate) enum AdaptiveFindOutcome {
     Match(LiteralCandidate),
     NoMatch,
@@ -335,8 +339,32 @@ pub(crate) enum AdaptiveFindOutcome {
 
 /// Density-aware leftmost-search result with exact work already committed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(
+    dead_code,
+    reason = "the exact-block owner supersedes this retained one-candidate fallback"
+)]
 pub(crate) struct AdaptiveFindResult {
     pub outcome: AdaptiveFindOutcome,
+    pub receipt: ScanReceipt,
+}
+
+/// Terminal disposition of one ordered necessary-candidate search.
+///
+/// A candidate is only a source-derived necessary fixed-column hit. The
+/// caller must still settle it with an authoritative matcher. `NoCandidate`
+/// proves that the complete window contains no possible folded start, while a
+/// dense guard rejection leaves an exact continuation at `resume_start`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RootCandidateOutcome {
+    Candidate { start: usize },
+    NoCandidate,
+    DenseFallback { resume_start: usize },
+}
+
+/// One checked necessary-candidate result with exact committed work.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RootCandidateResult {
+    pub outcome: RootCandidateOutcome,
     pub receipt: ScanReceipt,
 }
 
@@ -855,6 +883,30 @@ impl FoldedLiteralTriePlan {
         self.build
     }
 
+    /// Authenticate that the retained root columns are necessary for every
+    /// exact byte pattern owned by an attaching authoritative matcher.
+    pub(crate) fn root_prefilter_is_necessary_for(
+        &self,
+        patterns: &[Vec<u8>],
+    ) -> bool {
+        let Some(prefilter) = self.root_prefilter.as_ref() else {
+            return false;
+        };
+        !patterns.is_empty()
+            && patterns.iter().all(|pattern| {
+                let bytes = pattern.as_slice();
+                bytes
+                    .get(usize::from(prefilter.offset))
+                    .is_some_and(|&byte| byte_set_contains(prefilter.byte_set, byte))
+                    && (!prefilter.has_guard()
+                        || bytes
+                            .get(usize::from(prefilter.guard_offset))
+                            .is_some_and(|&byte| {
+                                byte_set_contains(prefilter.guard_byte_set, byte)
+                            }))
+            })
+    }
+
     /// Derive a complete fixed-program linear envelope from input length only.
     ///
     /// Every successfully decoded scalar performs at most one transition
@@ -1012,6 +1064,10 @@ impl FoldedLiteralTriePlan {
     /// exact byte matcher. The decision has no corpus-selected threshold.
     #[cold]
     #[inline(never)]
+    #[allow(
+        dead_code,
+        reason = "the exact-block owner supersedes this retained one-candidate fallback"
+    )]
     pub(crate) fn find_window_adaptive_precharged(
         &self,
         haystack: &[u8],
@@ -1059,6 +1115,60 @@ impl FoldedLiteralTriePlan {
             });
         }
         Ok(AdaptiveFindResult {
+            outcome,
+            receipt: ScanReceipt { upper, actual },
+        })
+    }
+
+    /// Find the first guard-qualified necessary root candidate.
+    ///
+    /// This is a source-selection primitive, not a match operation. The
+    /// caller supplies an exact precharge for this window and must settle a
+    /// reported start with an authoritative matcher before returning it.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn find_root_candidate_precharged(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        upper: ScanUpperBounds,
+    ) -> Result<RootCandidateResult, ScanAttemptError> {
+        if window.start() > window.end() || window.end() > haystack.len() {
+            return Err(ScanAttemptError {
+                source: ScanError::InvalidWindow {
+                    start: window.start(),
+                    end: window.end(),
+                    haystack_len: haystack.len(),
+                },
+                actual: ScanActual::default(),
+            });
+        }
+        if upper.input_bytes < window.end().saturating_sub(window.start()) {
+            return Err(ScanAttemptError {
+                source: ScanError::Invariant {
+                    detail: "folded root-candidate precharge does not cover its window",
+                },
+                actual: ScanActual::default(),
+            });
+        }
+
+        scan_source_probe::record();
+        let source = &haystack[window.start()..window.end()];
+        let (outcome, mut actual) =
+            execute_root_candidate_find(self, source, window.start(), upper)?;
+        actual.work = actual
+            .candidate_starts
+            .checked_add(actual.source_byte_reads)
+            .ok_or_else(|| attempt_overflow(upper, actual, "folded root-candidate work"))?;
+        if !actual_within(actual, upper) {
+            return Err(ScanAttemptError {
+                source: ScanError::Invariant {
+                    detail: "folded root-candidate actual exceeded prospective",
+                },
+                actual,
+            });
+        }
+        Ok(RootCandidateResult {
             outcome,
             receipt: ScanReceipt { upper, actual },
         })
@@ -1387,6 +1497,10 @@ impl AdaptiveHitState<'_, '_> {
 )]
 #[cold]
 #[inline(never)]
+#[allow(
+    dead_code,
+    reason = "the exact-block owner supersedes this retained one-candidate fallback"
+)]
 fn execute_adaptive_find(
     plan: &FoldedLiteralTriePlan,
     source: &[u8],
@@ -1438,6 +1552,173 @@ fn execute_adaptive_find(
         upper,
         state.actual,
         "adaptive folded prefilter completion source reads",
+    )?;
+    Ok((state.outcome, state.actual))
+}
+
+struct RootCandidateHitState<'plan, 'source> {
+    source: &'source [u8],
+    absolute_base: usize,
+    upper: ScanUpperBounds,
+    offset: usize,
+    prefilter: &'plan RootPrefilter,
+    actual: ScanActual,
+    prefilter_source_reads: usize,
+    previous_candidate_scanned_through: usize,
+    outcome: RootCandidateOutcome,
+}
+
+impl RootCandidateHitState<'_, '_> {
+    #[inline(never)]
+    fn on_hit(&mut self, hit: usize, scanned_through: usize) -> Result<bool, ScanAttemptError> {
+        let additional_reads = scanned_through
+            .checked_sub(self.prefilter_source_reads)
+            .ok_or(ScanAttemptError {
+                source: ScanError::Invariant {
+                    detail: "folded root-candidate prefix moved backwards",
+                },
+                actual: self.actual,
+            })?;
+        self.actual.source_byte_reads = checked_actual_add(
+            self.actual.source_byte_reads,
+            additional_reads,
+            self.upper,
+            self.actual,
+            "folded root-candidate prefilter source reads",
+        )?;
+        self.prefilter_source_reads = scanned_through;
+        let Some(relative_start) = hit.checked_sub(self.offset) else {
+            return Ok(true);
+        };
+
+        let verification_source_reads_before = self.actual.source_byte_reads;
+        if self.prefilter.has_guard() {
+            let Some(guard_position) =
+                relative_start.checked_add(usize::from(self.prefilter.guard_offset))
+            else {
+                return Ok(true);
+            };
+            let Some(&guard_byte) = self.source.get(guard_position) else {
+                return Ok(true);
+            };
+            self.actual.source_byte_reads = checked_actual_add(
+                self.actual.source_byte_reads,
+                1,
+                self.upper,
+                self.actual,
+                "folded root-candidate guard reads",
+            )?;
+            if !self.prefilter.guard_matches(guard_byte) {
+                let guard_work = self
+                    .actual
+                    .source_byte_reads
+                    .checked_sub(verification_source_reads_before)
+                    .ok_or_else(|| {
+                        attempt_overflow(
+                            self.upper,
+                            self.actual,
+                            "folded root-candidate guard work",
+                        )
+                    })?;
+                let local_span = scanned_through
+                    .checked_sub(self.previous_candidate_scanned_through)
+                    .ok_or_else(|| {
+                        attempt_overflow(
+                            self.upper,
+                            self.actual,
+                            "folded root-candidate guard byte distance",
+                        )
+                    })?;
+                self.previous_candidate_scanned_through = scanned_through;
+                if guard_work > local_span {
+                    let resume_start = self
+                        .absolute_base
+                        .checked_add(relative_start)
+                        .and_then(|start| start.checked_add(1))
+                        .ok_or_else(|| {
+                            attempt_overflow(
+                                self.upper,
+                                self.actual,
+                                "folded root-candidate guard continuation",
+                            )
+                        })?;
+                    self.outcome = RootCandidateOutcome::DenseFallback { resume_start };
+                    return Ok(false);
+                }
+                return Ok(true);
+            }
+        }
+        self.actual.candidate_starts = checked_actual_add(
+            self.actual.candidate_starts,
+            1,
+            self.upper,
+            self.actual,
+            "folded root-candidate starts",
+        )?;
+        let start = self
+            .absolute_base
+            .checked_add(relative_start)
+            .ok_or_else(|| {
+                attempt_overflow(
+                    self.upper,
+                    self.actual,
+                    "folded root-candidate absolute start",
+                )
+            })?;
+        self.outcome = RootCandidateOutcome::Candidate { start };
+        Ok(false)
+    }
+}
+
+fn execute_root_candidate_find(
+    plan: &FoldedLiteralTriePlan,
+    source: &[u8],
+    absolute_base: usize,
+    upper: ScanUpperBounds,
+) -> Result<(RootCandidateOutcome, ScanActual), ScanAttemptError> {
+    let Some(prefilter) = plan.root_prefilter.as_ref() else {
+        return Err(ScanAttemptError {
+            source: ScanError::Invariant {
+                detail: "folded root-candidate search requires a retained root prefilter",
+            },
+            actual: ScanActual::default(),
+        });
+    };
+    let actual = ScanActual {
+        input_bytes: source.len(),
+        ..ScanActual::default()
+    };
+    let invalid_actual = actual;
+    let mut state = RootCandidateHitState {
+        source,
+        absolute_base,
+        upper,
+        offset: usize::from(prefilter.offset),
+        prefilter,
+        actual,
+        prefilter_source_reads: 0,
+        previous_candidate_scanned_through: 0,
+        outcome: RootCandidateOutcome::NoCandidate,
+    };
+    let completed_source_reads = {
+        let mut hit_state: RootPrefilterHitState<'_, '_, '_, '_, LeftmostFirstSink<'_>> =
+            RootPrefilterHitState::RootCandidate(&mut state, PhantomData);
+        prefilter.scan(source, invalid_actual, &mut hit_state)?
+    };
+    let remaining_prefilter_reads = completed_source_reads
+        .checked_sub(state.prefilter_source_reads)
+        .ok_or(ScanAttemptError {
+            source: ScanError::Invariant {
+                detail: "folded root-candidate completion moved backwards",
+            },
+            actual: state.actual,
+        })?;
+    state.actual.source_byte_reads = checked_actual_add(
+        state.actual.source_byte_reads,
+        remaining_prefilter_reads,
+        upper,
+        state.actual,
+        "folded root-candidate completion source reads",
     )?;
     Ok((state.outcome, state.actual))
 }
@@ -1546,6 +1827,10 @@ where
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "the enum retains the superseded adaptive verifier alongside exact blocks"
+)]
 enum RootPrefilterHitState<'state, 'plan, 'source, 'emit, S>
 where
     S: LiteralCandidateSink + ?Sized,
@@ -1553,6 +1838,10 @@ where
     Incumbent(&'state mut IncumbentHitState<'plan, 'source, 'emit, S>),
     Adaptive(
         &'state mut AdaptiveHitState<'plan, 'source>,
+        PhantomData<&'emit mut S>,
+    ),
+    RootCandidate(
+        &'state mut RootCandidateHitState<'plan, 'source>,
         PhantomData<&'emit mut S>,
     ),
 }
@@ -1566,6 +1855,7 @@ where
         match self {
             Self::Incumbent(state) => state.on_hit(hit, scanned_through),
             Self::Adaptive(state, _) => state.on_hit(hit, scanned_through),
+            Self::RootCandidate(state, _) => state.on_hit(hit, scanned_through),
         }
     }
 }

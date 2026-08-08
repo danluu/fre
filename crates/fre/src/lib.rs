@@ -729,7 +729,7 @@ use fre_kernels::{
     ForwardAnchoredSearchAccounting, ForwardAnchoredSearchError, ForwardAnchoredSearchLimits,
     LiteralAccounting, LiteralBuildLimits, LiteralClassRunLiteralPlan, LiteralClassRunSearchPlan,
     LiteralError, LiteralPlan, LiteralSearchLimits, LiteralSetAccounting, LiteralSetBuildLimits,
-    LiteralSetError, LiteralSetPlan, LiteralSetSearchLimits,
+    LiteralSetError, LiteralSetFoldAttachment, LiteralSetPlan, LiteralSetSearchLimits,
     PACKED_LITERAL_SET_CERTIFIED_MAX_PATTERNS, PackedLiteralSetAccounting,
     PackedLiteralSetBuildLimits, PackedLiteralSetError, PackedLiteralSetPlan,
     PackedLiteralSetSearchLimits, RequiredLiteralBuildAccounting, RequiredLiteralBuildError,
@@ -3317,19 +3317,18 @@ fn try_fixed_predicate_word64_before_finite(
 #[cold]
 #[inline(never)]
 fn try_attach_unicode_folded_long_tail(
-    literal_set: &mut LiteralSetPlan,
-    words: &[Vec<u8>],
+    attachment: LiteralSetFoldAttachment<'_>,
     parsed_hir: (&Hir, u64),
     profile: &RustProfile,
     limits: &BuildLimits,
     retained_facade_bytes: usize,
     incumbent_planner_work: u64,
-) -> Result<u64, BuildError> {
+) -> Result<(LiteralSetPlan, u64), BuildError> {
     let (hir, hir_nodes) = parsed_hir;
     let available_plan_bytes = limits
         .max_persistent_bytes
         .saturating_sub(retained_facade_bytes);
-    let dfa_bytes = literal_set.build_accounting().persistent_bytes;
+    let dfa_bytes = attachment.plan().build_accounting().persistent_bytes;
     let Some(available_trie_bytes) =
         available_plan_bytes
             .checked_sub(dfa_bytes)
@@ -3337,7 +3336,7 @@ fn try_attach_unicode_folded_long_tail(
                 bytes.checked_sub(LiteralSetPlan::folded_long_tail_additional_owner_bytes())
             })
     else {
-        return Ok(incumbent_planner_work);
+        return Ok((attachment.into_plan(), incumbent_planner_work));
     };
     let remaining_planner_work = limits
         .max_planner_work
@@ -3346,12 +3345,12 @@ fn try_attach_unicode_folded_long_tail(
             "incumbent planner work exceeded its enforced limit",
         ))?;
     let Some(folded_planner_work_upper_bound) =
-        folded_tail_planner_work_upper_bound(hir_nodes, literal_set)
+        folded_tail_planner_work_upper_bound(hir_nodes, attachment.plan())
     else {
-        return Ok(incumbent_planner_work);
+        return Ok((attachment.into_plan(), incumbent_planner_work));
     };
     if folded_planner_work_upper_bound > remaining_planner_work {
-        return Ok(incumbent_planner_work);
+        return Ok((attachment.into_plan(), incumbent_planner_work));
     }
     let planner_limit = usize::try_from(remaining_planner_work).unwrap_or(usize::MAX);
     let mut folded_limits = UnicodeFoldedLiteralBuildLimits::default();
@@ -3388,22 +3387,14 @@ fn try_attach_unicode_folded_long_tail(
         folded_planner,
         limits.max_planner_work,
     )?;
-    if let Some(plan) = plan {
-        let max_pattern_bytes =
-            words
-                .iter()
-                .map(Vec::len)
-                .max()
-                .ok_or(BuildError::InternalInvariant(
-                    "nonempty folded finite language lost every pattern",
-                ))?;
-        let _attached = literal_set.try_attach_folded_long_tail(
-            plan.into_trie(),
-            max_pattern_bytes,
-            available_plan_bytes,
-        )?;
-    }
-    Ok(planner_work)
+    let literal_set = if let Some(plan) = plan {
+        attachment
+            .try_attach(plan.into_trie(), available_plan_bytes)?
+            .0
+    } else {
+        attachment.into_plan()
+    };
+    Ok((literal_set, planner_work))
 }
 
 impl fmt::Display for BuildError {
@@ -6097,23 +6088,29 @@ impl PortableBuilder {
                         .enforce_persistent_limit(self.limits.max_persistent_bytes)?,
                     });
                 }
-                let mut literal_set = LiteralSetPlan::new(&words, self.limits.literal_set)?;
-                if self.selection == PlanSelection::Auto
+                let literal_set = if self.selection == PlanSelection::Auto
                     && words.len() > PACKED_LITERAL_SET_CERTIFIED_MAX_PATTERNS
                 {
                     let retained_facade_bytes = source_storage_bytes
                         .checked_add(capture_name_storage_bytes)
                         .ok_or(BuildError::PersistentBytesOverflow)?;
-                    finite_work = try_attach_unicode_folded_long_tail(
-                        &mut literal_set,
+                    let attachment = LiteralSetFoldAttachment::new(
                         &words,
+                        self.limits.literal_set,
+                    )?;
+                    let attached = try_attach_unicode_folded_long_tail(
+                        attachment,
                         (&rust.hir, syntax.hir_nodes),
                         &self.profile,
                         &self.limits,
                         retained_facade_bytes,
                         finite_work,
                     )?;
-                }
+                    finite_work = attached.1;
+                    attached.0
+                } else {
+                    LiteralSetPlan::new(&words, self.limits.literal_set)?
+                };
                 let storage = literal_set.build_accounting().persistent_bytes;
                 return Ok(PortableRegex {
                     source,
