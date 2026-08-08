@@ -14754,15 +14754,10 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     assembler.branch(&[0x0f, 0x88], short_fallback)?;
     assembler.instruction(&[0x4c, 0x39, 0xc1])?;
     assembler.branch(&[0x0f, 0x87], short_fallback)?;
+    // Compact table loops require at least one consumable byte. Preserve the
+    // canonical empty-window settlement while admitting every nonempty size.
+    assembler.branch(&[0x0f, 0x84], short_fallback)?;
     assembler.instruction(&[0x4c, 0x39, 0xc2])?;
-    assembler.branch(&[0x0f, 0x82], short_fallback)?;
-    assembler.instruction(&[0x4c, 0x89, 0xc0])?; // mov r8, rax
-    assembler.instruction(&[0x48, 0x29, 0xc8])?; // sub rcx, rax
-    let minimum = u32::try_from(DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES)
-        .map_err(|_| ObjectError::ArithmeticOverflow("dynamic row input floor"))?;
-    let mut compare_minimum = vec![0x48, 0x3d];
-    compare_minimum.extend_from_slice(&minimum.to_le_bytes());
-    assembler.instruction(&compare_minimum)?;
     assembler.branch(&[0x0f, 0x82], short_fallback)?;
     // Entry RSP is 8 modulo 16. The frame aligns calls, retains all six
     // public arguments, and reserves the four-word private preflight record.
@@ -14912,6 +14907,18 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     )?;
     }
     assembler.bind(try_v2)?;
+    // Compact capabilities are immutable, self-contained tables and remain
+    // profitable and safe for every nonempty window. Keep the historical
+    // crossover only for V1/V2 and cold mutable rows, after every compact
+    // generation has had an opportunity to authenticate and enter.
+    assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, 0x30])?;
+    assembler.instruction(&[0x48, 0x2b, 0x44, 0x24, 0x28])?;
+    let minimum = u32::try_from(DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES)
+        .map_err(|_| ObjectError::ArithmeticOverflow("dynamic row input floor"))?;
+    let mut compare_minimum = vec![0x48, 0x3d];
+    compare_minimum.extend_from_slice(&minimum.to_le_bytes());
+    assembler.instruction(&compare_minimum)?;
+    assembler.branch(&[0x0f, 0x82], framed_short_fallback)?;
     if root_plan.is_none() {
         // Only a seal/identity-authenticated active compact capability may
         // bypass the historical scanner-free ceiling. V1/V2 headers still
@@ -25098,13 +25105,11 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     assembler.branch_cond(AARCH64_MI, short_fallback)?;
     assembler.instruction(aarch64_cmp_x(3, 4)?)?;
     assembler.branch_cond(AARCH64_HI, short_fallback)?;
+    // Compact table loops require at least one consumable byte. Preserve the
+    // canonical empty-window settlement while admitting every nonempty size.
+    assembler.branch_cond(AARCH64_EQ, short_fallback)?;
     assembler.instruction(aarch64_cmp_x(4, 2)?)?;
     assembler.branch_cond(AARCH64_HI, short_fallback)?;
-    assembler.instruction(aarch64_sub_x_reg(6, 4, 3)?)?;
-    let minimum = u16::try_from(DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES)
-        .map_err(|_| ObjectError::ArithmeticOverflow("dynamic row input floor"))?;
-    assembler.instruction(aarch64_cmp_x_imm(6, minimum)?)?;
-    assembler.branch_cond(AARCH64_LO, short_fallback)?;
     assembler.instruction(aarch64_sub_x_imm(31, 31, frame_bytes)?)?;
     assembler.instruction(aarch64_store_x(30, 31, link_offset)?)?;
     assembler.instruction(aarch64_store_x(0, 31, 0)?)?;
@@ -25248,6 +25253,17 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     )?;
     }
     assembler.bind(try_v2)?;
+    // Compact capabilities are immutable, self-contained tables and remain
+    // profitable and safe for every nonempty window. Keep the historical
+    // crossover only for V1/V2 and cold mutable rows, after every compact
+    // generation has had an opportunity to authenticate and enter.
+    assembler.instruction(aarch64_load_x_imm(8, 31, 32)?)?;
+    assembler.instruction(aarch64_load_x_imm(9, 31, 24)?)?;
+    assembler.instruction(aarch64_sub_x_reg(8, 8, 9)?)?;
+    let minimum = u16::try_from(DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES)
+        .map_err(|_| ObjectError::ArithmeticOverflow("dynamic row input floor"))?;
+    assembler.instruction(aarch64_cmp_x_imm(8, minimum)?)?;
+    assembler.branch_cond(AARCH64_LO, framed_short_fallback)?;
     if root_plan.is_none() {
         // Only a seal/identity-authenticated active compact capability may
         // retain a scanner-free long window. V1/V2 descriptors preserve the
@@ -32509,7 +32525,9 @@ mod tests {
              extern uint32_t fre_aot_regex_runtime_prepare_exclusive_v1(const unsigned char*,size_t,handle_t*);\n\
              extern uint32_t fre_aot_regex_runtime_search_exclusive_v1(handle_t,const unsigned char*,size_t,size_t,size_t,result_t*);\n\
              extern uint32_t fre_aot_regex_runtime_destroy_exclusive_v1(handle_t);\n\
+             #define ACTIVE_SEAL UINT64_C({active_seal})\n\
              static unsigned char matching[1025],absent[1025];\n\
+             static uint64_t read_u64(handle_t h){{uint64_t v=0;memcpy(&v,h,sizeof(v));return v;}}\n\
              static int prepare(handle_t*h){{return fre_aot_regex_runtime_prepare_exclusive_v1({program_symbol},{program_len}U,h)==0U;}}\n\
              static int destroy(handle_t h){{return fre_aot_regex_runtime_destroy_exclusive_v1(h)==0U;}}\n\
              static int compare(const unsigned char*p,size_t s,size_t e,int base){{\
@@ -32518,20 +32536,27 @@ mod tests {
                uint32_t ns={entry}(native,p,sizeof(matching),s,e,&nr);\
                uint32_t bs=fre_aot_regex_runtime_search_exclusive_v1(baseline,p,sizeof(matching),s,e,&br);\
                if(ns!=bs||nr.start!=br.start||nr.end!=br.end)return base+1;\
+               if(read_u64(native)!=ACTIVE_SEAL)return base+4;\
                nr.start=95U;nr.end=96U;br.start=97U;br.end=98U;\
                ns=fre_aot_regex_runtime_search_exclusive_v1(native,p,sizeof(matching),s,e,&nr);\
                bs=fre_aot_regex_runtime_search_exclusive_v1(baseline,p,sizeof(matching),s,e,&br);\
                if(ns!=bs||nr.start!=br.start||nr.end!=br.end)return base+2;\
+               if(read_u64(native)!=ACTIVE_SEAL)return base+5;\
                nr.start=99U;nr.end=100U;br.start=101U;br.end=102U;\
                ns={entry}(native,p,sizeof(matching),s,e,&nr);\
                bs=fre_aot_regex_runtime_search_exclusive_v1(baseline,p,sizeof(matching),s,e,&br);\
                if(ns!=bs||nr.start!=br.start||nr.end!=br.end)return base+3;\
-               if(!destroy(native)||!destroy(baseline))return base+4;return 0;}}\n\
+               if(read_u64(native)!=ACTIVE_SEAL)return base+6;\
+               if(!destroy(native)||!destroy(baseline))return base+7;return 0;}}\n\
              int main(void){{memset(matching,'a',sizeof(matching));memset(absent,'a',sizeof(absent));\
                matching[sizeof(matching)-1U]='Q';absent[sizeof(absent)-1U]='R';\
-               int status=compare(matching,0U,sizeof(matching),10);if(status)return status;\
+               int status=compare(matching,sizeof(matching)-2U,sizeof(matching),1);if(status)return status;\
+               status=compare(absent,0U,1U,2);if(status)return status;\
+               status=compare(absent,0U,31U,3);if(status)return status;\
+               status=compare(matching,0U,sizeof(matching),10);if(status)return status;\
                status=compare(absent,0U,sizeof(absent),20);if(status)return status;\
-               return compare(matching,17U,sizeof(matching),30);}}\n"
+               return compare(matching,17U,sizeof(matching),30);}}\n",
+            active_seal = FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL,
         );
         let c_path = directory.join("frozen-loop-v2.c");
         let executable = directory.join("frozen-loop-v2");
@@ -38342,6 +38367,10 @@ static int run_case(const unsigned char *p,size_t n,size_t s,size_t e,uint32_t e
                if(read_u64(h,ACTIVE_OFFSET)==ACTIVE_SEAL){{fre_aot_regex_runtime_destroy_exclusive_v1(h);return base+7;}}\
                return fre_aot_regex_runtime_destroy_exclusive_v1(h)==0U?0:base+8;}}\n\
              int main(void){{memset(haystack,0xa5,sizeof(haystack));int s;\
+               s=run_case(1U,0U,5);if(s)return s;\
+               s=run_case(2U,0U,6);if(s)return s;\
+               s=run_case(15U,0U,7);if(s)return s;\
+               s=run_case(31U,0U,8);if(s)return s;\
                s=run_case(32U,0U,10);if(s)return s;\
                s=run_case(39U,0U,20);if(s)return s;\
                s=run_case(40U,1U,30);if(s)return s;\
@@ -38522,6 +38551,11 @@ static int run_case(const unsigned char *p,size_t n,size_t s,size_t e,uint32_t e
             let background = [0, 1];
             let witness = [3, 3];
             let cases = vec![
+                case(1, None, background, witness),
+                case(2, Some(0), background, witness),
+                case(15, Some(13), background, witness),
+                case(boundary - 1, Some(boundary - 3), background, witness),
+                case(boundary - 1, None, background, witness),
                 case(boundary, Some(boundary - 2), background, witness),
                 case(boundary, None, background, witness),
                 case(boundary + 1, Some(boundary - 1), background, witness),
@@ -39326,6 +39360,7 @@ uint32_t fre_aot_regex_runtime_search_exclusive_v1(handle_t h,const unsigned cha
 uint32_t fre_aot_regex_runtime_search_exclusive_dynamic_rows_preflight_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,preflight_t*o){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;(void)i;(void)o;helper_calls++;return 97U;}}
 uint32_t fre_aot_regex_runtime_search_exclusive_dynamic_rows_deopt_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;helper_calls++;return 97U;}}
 uint32_t fre_aot_regex_runtime_search_exclusive_dynamic_rows_continue_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,const continuation_t*c){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;(void)i;(void)c;helper_calls++;return 97U;}}
+size_t fre_aot_regex_runtime_scan_frozen_loop_v2(const unsigned char*p,const void*s,size_t n){{(void)p;(void)s;(void)n;helper_calls++;return 0U;}}
 static void init(int matching){{
   memset(&frozen,0,sizeof(frozen));rows[0]=matching?2U:0U;rows[1]=UINT16_C(0x8000);
   frozen.v1.active_seal=UINT64_C({active_seal});frozen.v1.magic=UINT64_C({magic});
@@ -39344,9 +39379,12 @@ static void init(int matching){{
 }}
 static int run(int matching,int base){{
   unsigned char haystack[64];memset(haystack,'a',sizeof(haystack));init(matching);helper_calls=0;
-  result_t result={{91U,92U}};uint32_t status={entry}((handle_t)&frozen,haystack,sizeof(haystack),5U,37U,&result);
-  uint32_t expected=matching?1U:0U;size_t begin=matching?5U:0U;size_t end=matching?7U:0U;
-  if(status!=expected||result.start!=begin||result.end!=end)return base;
+  const size_t widths[5]={{1U,2U,15U,31U,32U}};
+  for(size_t i=0;i<5U;i++){{
+    result_t result={{91U,92U}};uint32_t status={entry}((handle_t)&frozen,haystack,sizeof(haystack),5U,5U+widths[i],&result);
+    uint32_t expected=matching&&widths[i]>=2U?1U:0U;size_t begin=expected?5U:0U;size_t end=expected?7U:0U;
+    if(status!=expected||result.start!=begin||result.end!=end)return base+(int)i;
+  }}
   if(helper_calls!=0U)return base+1;
   if(frozen.v1.active_seal!=UINT64_C({active_seal})||frozen.v4.ready_seal!=UINT64_C({ready_seal}))return base+2;
   return 0;
@@ -45038,6 +45076,97 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                     .contains(&aarch64_and_low_w(8, 8, 15).unwrap()));
             }
         }
+    }
+
+    #[test]
+    fn compact_entries_precede_legacy_short_window_crossover_cross_isa() {
+        let x86 = lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
+            None,
+            FeatureSet::EMPTY,
+            OutputContract::SelectedEnd,
+            None,
+            true,
+            false,
+        )
+        .unwrap();
+        let x86_frame = [0x48, 0x83, 0xec, 104];
+        let mut x86_v12_flag = vec![
+            0x81,
+            0x7f,
+            u8::try_from(FROZEN_PREPARED_HEADER_V1_FLAGS_OFFSET).unwrap(),
+        ];
+        x86_v12_flag
+            .extend_from_slice(&FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V12.to_le_bytes());
+        let x86_minimum = [
+            0x48,
+            0x3d,
+            u8::try_from(DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES).unwrap(),
+            0,
+            0,
+            0,
+        ];
+        let x86_position = |needle: &[u8]| {
+            x86.code
+                .windows(needle.len())
+                .position(|window| window == needle)
+                .unwrap()
+        };
+        assert!(x86_position(&x86_frame) < x86_position(&x86_v12_flag));
+        assert!(x86_position(&x86_v12_flag) < x86_position(&x86_minimum));
+        assert_eq!(
+            x86.code
+                .windows(x86_minimum.len())
+                .filter(|window| *window == x86_minimum)
+                .count(),
+            1
+        );
+
+        let arm = lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
+            None,
+            OutputContract::SelectedEnd,
+            None,
+            true,
+            false,
+        )
+        .unwrap();
+        let words = arm
+            .code
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        let arm_frame = aarch64_sub_x_imm(31, 31, 96).unwrap();
+        let arm_v12_flag = [
+            aarch64_load_w_imm(
+                8,
+                0,
+                u16::try_from(FROZEN_PREPARED_HEADER_V1_FLAGS_OFFSET).unwrap(),
+            )
+            .unwrap(),
+            aarch64_movz_x(
+                9,
+                u16::try_from(FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V12).unwrap(),
+                0,
+            )
+            .unwrap(),
+            aarch64_cmp_w(8, 9).unwrap(),
+        ];
+        let arm_minimum = aarch64_cmp_x_imm(
+            8,
+            u16::try_from(DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES).unwrap(),
+        )
+        .unwrap();
+        let frame_position = words.iter().position(|&word| word == arm_frame).unwrap();
+        let flag_position = words
+            .windows(arm_v12_flag.len())
+            .position(|window| window == arm_v12_flag)
+            .unwrap();
+        let minimum_position = words
+            .iter()
+            .position(|&word| word == arm_minimum)
+            .unwrap();
+        assert!(frame_position < flag_position);
+        assert!(flag_position < minimum_position);
+        assert_eq!(words.iter().filter(|&&word| word == arm_minimum).count(), 1);
     }
 
     #[test]
