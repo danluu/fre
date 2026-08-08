@@ -736,6 +736,28 @@ impl LiteralSetPlan {
                     computation: "folded literal-set exact-block transitions",
                 },
             )?;
+            let proved_progress = block_end.checked_sub(search_start).ok_or(
+                LiteralSetError::ArithmeticOverflow {
+                    computation: "folded literal-set exact-block progress",
+                },
+            )?;
+            // The necessary-root scan has already settled every start before
+            // `candidate_start`. If the authoritative DFA probe would cost
+            // more transitions than the total starts settled since
+            // `search_start`, its right-overlap cost is not yet amortized.
+            // Preserve the root proof, but let the incumbent resume at the
+            // candidate itself so it can still select that start and retain
+            // leftmost-first source priority.
+            if probe_transitions > proved_progress {
+                return self.finish_folded_long_fallback(
+                    haystack,
+                    Window::new(candidate_start, window.end()),
+                    limits,
+                    incumbent_accounting,
+                    actual_work,
+                    prospective.work,
+                );
+            }
             let matched = self.find_in_settled_block(
                 haystack,
                 Window::new(candidate_start, probe_end),
@@ -755,21 +777,6 @@ impl LiteralSetPlan {
                 let accounting =
                     folded_long_accounting(incumbent_accounting, actual_work, prospective.work)?;
                 return Ok((None, accounting));
-            }
-            let proved_progress = block_end.checked_sub(search_start).ok_or(
-                LiteralSetError::ArithmeticOverflow {
-                    computation: "folded literal-set exact-block progress",
-                },
-            )?;
-            if probe_transitions > proved_progress {
-                return self.finish_folded_long_fallback(
-                    haystack,
-                    Window::new(block_end, window.end()),
-                    limits,
-                    incumbent_accounting,
-                    actual_work,
-                    prospective.work,
-                );
             }
             search_start = block_end;
         }
@@ -1817,6 +1824,81 @@ mod folded_long_tail_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn short_root_distance_decides_before_paying_exact_overlap() {
+        let (incumbent, accelerated) = three_column_plans();
+        let tail = accelerated.folded_long_tail.as_deref().unwrap();
+        assert_eq!(tail.max_pattern_bytes, 3);
+        let build = tail.trie.build_accounting();
+        let primary = build.root_prefilter_offset.unwrap();
+        let guard = build.root_prefilter_guard_offset.unwrap();
+        let changed = (0..3)
+            .find(|&offset| offset != primary && offset != guard)
+            .unwrap();
+        let mut rejected = *b"abc";
+        rejected[changed] = b'z';
+        let input_bytes = folded_short_minimum_bytes(tail).unwrap();
+        let window = Window::new(0, input_bytes);
+        let prospective = folded_short_prospective(tail, window, usize::MAX).unwrap();
+
+        let near_start = tail.max_pattern_bytes - 1;
+        let later_match = near_start + BYTE_BUCKET_BLOCK_BYTES;
+        let mut near = vec![b'!'; input_bytes];
+        near[near_start..near_start + rejected.len()].copy_from_slice(&rejected);
+        near[later_match..later_match + 3].copy_from_slice(b"abc");
+        let near_root = tail
+            .trie
+            .find_root_candidate_precharged(&near, window, prospective.trie)
+            .unwrap();
+        assert_eq!(
+            near_root.outcome,
+            RootCandidateOutcome::Candidate { start: near_start }
+        );
+        let expected = incumbent
+            .find_window(&near, window, LiteralSetSearchLimits::unlimited())
+            .unwrap()
+            .0;
+        let (actual, accounting) = accelerated
+            .find_window(&near, window, LiteralSetSearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(actual, Some((later_match, later_match + 3)));
+        assert_eq!(
+            accounting.transitions_upper_bound,
+            near_root.receipt.actual.work + (window.end() - near_start + 1),
+            "distance W-1 must resume the incumbent at the candidate before exact overlap"
+        );
+
+        let amortized_start = tail.max_pattern_bytes;
+        let mut amortized = vec![b'!'; input_bytes];
+        amortized[amortized_start..amortized_start + 3].copy_from_slice(b"abc");
+        let amortized_root = tail
+            .trie
+            .find_root_candidate_precharged(&amortized, window, prospective.trie)
+            .unwrap();
+        assert_eq!(
+            amortized_root.outcome,
+            RootCandidateOutcome::Candidate {
+                start: amortized_start,
+            }
+        );
+        let (actual, accounting) = accelerated
+            .find_window(
+                &amortized,
+                window,
+                LiteralSetSearchLimits::unlimited(),
+            )
+            .unwrap();
+        let probe_transitions = BYTE_BUCKET_BLOCK_BYTES + tail.max_pattern_bytes;
+        assert_eq!(actual, Some((amortized_start, amortized_start + 3)));
+        assert_eq!(
+            accounting.transitions_upper_bound,
+            amortized_root.receipt.actual.work + probe_transitions,
+            "distance W exactly amortizes the authoritative block"
+        );
+        assert!(accounting.transitions_upper_bound <= prospective.work);
     }
 
     #[test]
