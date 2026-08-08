@@ -26,7 +26,7 @@ use memchr::{memchr, memchr2, memchr3, memmem, memrchr, memrchr2};
 use crate::anchored_line_capture::{Atom, ByteMask, MAX_ATOMS};
 
 /// Immutable implementation identity for construction and search receipts.
-pub const PLAN_ID: &str = "line-domain-byte-atoms-search-v3";
+pub const PLAN_ID: &str = "line-domain-byte-atoms-search-v4";
 
 const BUILD_FIXED_WORK: u64 = 1;
 const BUILD_ATOM_WORK: u64 = 1;
@@ -45,6 +45,10 @@ const BUILD_PREFILTER_RETAINED_BYTE_WORK: u64 = 1;
 const VALUE_PREFILTER_LITERAL_BYTES: usize = 256;
 const VALUE_PREFILTER_SET_BYTES: usize = 4;
 const VALUE_PREFILTER_MASK_WORDS: usize = 4;
+// The endpoint probe is useful only when rejecting a wrong-width line avoids
+// checking at least two established wide-block work quanta. Narrow fixed plans
+// retain the branch-minimal delimiter executor.
+const FIXED_WIDTH_ENDPOINT_MIN_BYTES: usize = 2 * BYTE_SET_WIDE_BLOCK_BYTES;
 
 /// Line assertion family certified by the facade's HIR proof.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -589,6 +593,8 @@ pub struct LineDomainPlan {
     minimum_match_bytes: usize,
     maximum_match_bytes: usize,
     line_mode: LineMode,
+    // Construction-sealed admission for the exact-width endpoint executor.
+    fixed_width_endpoint: bool,
     value_prefilter: ValuePrefilter,
 }
 
@@ -699,12 +705,16 @@ impl LineDomainPlan {
         let mut retained = [Atom::default(); MAX_ATOMS];
         retained[..atoms.len()].copy_from_slice(atoms);
         let value_prefilter = ValuePrefilter::select(atoms, &mut work, limits.max_work)?;
+        let fixed_width_endpoint = matches!(value_prefilter, ValuePrefilter::None)
+            && minimum_match_bytes == maximum_match_bytes
+            && minimum_match_bytes >= FIXED_WIDTH_ENDPOINT_MIN_BYTES;
         let plan = Self {
             atoms: retained,
             atom_count: atoms.len(),
             minimum_match_bytes,
             maximum_match_bytes,
             line_mode,
+            fixed_width_endpoint,
             value_prefilter,
         };
         let accounting = BuildAccounting {
@@ -1013,7 +1023,81 @@ impl LineDomainPlan {
                 }
             };
         }
+        if self.uses_fixed_width_endpoint() {
+            return self.find_from_value_fixed_width(
+                haystack,
+                start,
+                end,
+                self.minimum_match_bytes,
+            );
+        }
         let mut candidate = self.first_line_start_value(haystack, start, end)?;
+        loop {
+            if candidate >= end || input_bytes(candidate, end) < self.minimum_match_bytes {
+                return None;
+            }
+            if let Some(matched_end) = self.match_candidate_value(haystack, candidate, end) {
+                return Some(MatchSpan::new(candidate, matched_end));
+            }
+            candidate = self.next_line_start_value(haystack, candidate, end)?;
+        }
+    }
+
+    fn uses_fixed_width_endpoint(&self) -> bool {
+        self.fixed_width_endpoint
+    }
+
+    fn find_from_value_fixed_width(
+        &self,
+        haystack: &[u8],
+        start: usize,
+        end: usize,
+        width: usize,
+    ) -> Option<MatchSpan> {
+        // Preserve the generic executor's immediate-hit path. After a miss,
+        // a false projected endpoint proves that this fixed-width candidate
+        // cannot match without reading its body. A true endpoint is only
+        // provisional because it may belong to a later line; validate it, and
+        // permanently resume the generic executor after the first false
+        // positive so exact-width workloads do not pay one probe per line.
+        let mut candidate = self.first_line_start_value(haystack, start, end)?;
+        if candidate >= end || input_bytes(candidate, end) < width {
+            return None;
+        }
+        if let Some(matched_end) = self.match_candidate_value(haystack, candidate, end) {
+            return Some(MatchSpan::new(candidate, matched_end));
+        }
+        let expected_end = candidate.checked_add(width)?;
+        let exact_width = self.is_line_end_value(haystack, expected_end);
+        candidate = self.next_line_start_value(haystack, candidate, end)?;
+        if exact_width {
+            return self.find_from_value_none_after_candidate(haystack, candidate, end);
+        }
+
+        loop {
+            if candidate >= end || input_bytes(candidate, end) < width {
+                return None;
+            }
+            let expected_end = candidate.checked_add(width)?;
+            if self.is_line_end_value(haystack, expected_end) {
+                if let Some(matched_end) =
+                    self.match_candidate_value(haystack, candidate, end)
+                {
+                    return Some(MatchSpan::new(candidate, matched_end));
+                }
+                candidate = self.next_line_start_value(haystack, candidate, end)?;
+                return self.find_from_value_none_after_candidate(haystack, candidate, end);
+            }
+            candidate = self.next_line_start_value(haystack, candidate, end)?;
+        }
+    }
+
+    fn find_from_value_none_after_candidate(
+        &self,
+        haystack: &[u8],
+        mut candidate: usize,
+        end: usize,
+    ) -> Option<MatchSpan> {
         loop {
             if candidate >= end || input_bytes(candidate, end) < self.minimum_match_bytes {
                 return None;
@@ -1993,6 +2077,195 @@ mod tests {
             Err(BuildError::WorkLimit { needed, limit })
                 if needed == literal_build.work && limit == literal_build.work.saturating_sub(1)
         ));
+    }
+
+    #[test]
+    fn fixed_width_endpoint_gate_admits_only_amortizable_unfiltered_plans() {
+        let broad = mask(&[(b'0', b'9'), (b'A', b'Z')]);
+        let narrow_width = u32::try_from(FIXED_WIDTH_ENDPOINT_MIN_BYTES - 1).unwrap();
+        let admitted_width = u32::try_from(FIXED_WIDTH_ENDPOINT_MIN_BYTES).unwrap();
+        let block_width = u32::try_from(BYTE_SET_WIDE_BLOCK_BYTES).unwrap();
+
+        let narrow = LineDomainPlan::new(
+            LF,
+            &[Atom::new(broad, narrow_width, Some(narrow_width))],
+            BuildLimits::default(),
+        )
+        .unwrap()
+        .0;
+        assert!(matches!(narrow.value_prefilter, ValuePrefilter::None));
+        assert!(!narrow.uses_fixed_width_endpoint());
+
+        let variable = LineDomainPlan::new(
+            LF,
+            &[Atom::new(
+                broad,
+                admitted_width,
+                Some(admitted_width + 1),
+            )],
+            BuildLimits::default(),
+        )
+        .unwrap()
+        .0;
+        assert!(matches!(variable.value_prefilter, ValuePrefilter::None));
+        assert!(!variable.uses_fixed_width_endpoint());
+
+        let literal = LineDomainPlan::new(
+            LF,
+            &[Atom::new(
+                ByteMask::singleton(b'A'),
+                admitted_width,
+                Some(admitted_width),
+            )],
+            BuildLimits::default(),
+        )
+        .unwrap()
+        .0;
+        assert!(matches!(
+            literal.value_prefilter,
+            ValuePrefilter::Literal { .. }
+        ));
+        assert!(!literal.uses_fixed_width_endpoint());
+
+        let small_set = LineDomainPlan::new(
+            LF,
+            &[Atom::new(
+                mask(&[(b'A', b'B')]),
+                admitted_width,
+                Some(admitted_width),
+            )],
+            BuildLimits::default(),
+        )
+        .unwrap()
+        .0;
+        assert!(matches!(
+            small_set.value_prefilter,
+            ValuePrefilter::SmallSet { .. }
+        ));
+        assert!(!small_set.uses_fixed_width_endpoint());
+
+        let admitted_atoms = [
+            Atom::new(broad, block_width, Some(block_width)),
+            Atom::new(broad, block_width, Some(block_width)),
+        ];
+        let (admitted, build) =
+            LineDomainPlan::new(LF, &admitted_atoms, BuildLimits::default()).unwrap();
+        assert!(matches!(admitted.value_prefilter, ValuePrefilter::None));
+        assert!(admitted.uses_fixed_width_endpoint());
+        assert_eq!(
+            admitted.minimum_match_bytes,
+            FIXED_WIDTH_ENDPOINT_MIN_BYTES
+        );
+        assert_eq!(build.plan_id, PLAN_ID);
+        assert_eq!(build.persistent_bytes, size_of::<LineDomainPlan>());
+        let projected =
+            LineDomainPlan::projected_value_prefilter_build_work(&admitted_atoms).unwrap();
+        assert_eq!(
+            build.work,
+            1 + 2 * u64::try_from(admitted_atoms.len()).unwrap() + projected
+        );
+
+        let exact_limits = BuildLimits {
+            max_work: build.work,
+            max_persistent_bytes: build.persistent_bytes,
+            ..BuildLimits::default()
+        };
+        let exact_build = LineDomainPlan::new(LF, &admitted_atoms, exact_limits)
+            .unwrap()
+            .1;
+        assert_eq!(exact_build, build);
+        assert!(matches!(
+            LineDomainPlan::new(
+                LF,
+                &admitted_atoms,
+                BuildLimits {
+                    max_work: build.work - 1,
+                    ..BuildLimits::default()
+                },
+            ),
+            Err(BuildError::WorkLimit { needed, limit })
+                if needed == build.work && limit == build.work - 1
+        ));
+        assert!(matches!(
+            LineDomainPlan::new(
+                LF,
+                &admitted_atoms,
+                BuildLimits {
+                    max_persistent_bytes: build.persistent_bytes - 1,
+                    ..BuildLimits::default()
+                },
+            ),
+            Err(BuildError::PersistentBytesLimit { needed, limit })
+                if needed == build.persistent_bytes && limit == build.persistent_bytes - 1
+        ));
+    }
+
+    #[test]
+    fn fixed_width_domain_gate_matches_accounted_reference_for_every_window_and_line_mode() {
+        let broad = mask(&[(b'0', b'9'), (b'A', b'Z')]);
+        let width = FIXED_WIDTH_ENDPOINT_MIN_BYTES;
+        let width_u32 = u32::try_from(width).unwrap();
+        let block_width = u32::try_from(BYTE_SET_WIDE_BLOCK_BYTES).unwrap();
+        let valid = vec![b'A'; width];
+
+        let mut lf = valid.clone();
+        lf[width - 1] = b'!';
+        lf.push(b'\n');
+        lf.extend_from_slice(&valid);
+
+        let mut pipe = b"!|!|".to_vec();
+        pipe.extend(std::iter::repeat_n(b'A', width - 2));
+        pipe.push(b'|');
+        pipe.extend_from_slice(&valid);
+
+        let mut crlf = b"!\n".to_vec();
+        crlf.extend(std::iter::repeat_n(b'A', width - 3));
+        crlf.extend_from_slice(b"\r\n");
+        let mut exact_invalid = valid.clone();
+        exact_invalid[width - 1] = b'!';
+        crlf.extend_from_slice(&exact_invalid);
+        crlf.extend_from_slice(b"\r\nA\r");
+        crlf.extend_from_slice(&valid);
+        crlf.push(b'\n');
+
+        let cases = [
+            (LF, lf),
+            (LineMode::Lf { terminator: b'|' }, pipe),
+            (LineMode::Crlf, crlf),
+        ];
+        let one_atom = [Atom::new(broad, width_u32, Some(width_u32))];
+        let two_atoms = [
+            Atom::new(broad, block_width, Some(block_width)),
+            Atom::new(broad, block_width, Some(block_width)),
+        ];
+        let atom_sets: [&[Atom]; 2] = [&one_atom, &two_atoms];
+        for (mode, haystack) in &cases {
+            for atoms in atom_sets {
+                let plan = LineDomainPlan::new(*mode, atoms, BuildLimits::default())
+                    .unwrap()
+                    .0;
+                assert!(matches!(plan.value_prefilter, ValuePrefilter::None));
+                assert!(plan.uses_fixed_width_endpoint());
+                assert_eq!(plan.minimum_match_bytes, plan.maximum_match_bytes);
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let expected = plan
+                            .find(haystack, start, end, SearchLimits::unlimited())
+                            .unwrap()
+                            .0;
+                        let actual = plan
+                            .find_value(haystack, start, end, SearchLimits::unlimited())
+                            .unwrap();
+                        assert_eq!(
+                            tuple(actual),
+                            tuple(expected),
+                            "mode={mode:?}, atoms={}, window={start}..{end}",
+                            atoms.len(),
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

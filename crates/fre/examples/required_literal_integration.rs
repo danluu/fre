@@ -182,7 +182,7 @@ fn emit(
         PlanKind::BoundedByteClassSequence => "bounded-byte-class-sequence-search-v2",
         PlanKind::FixedPredicateWord64 => "fixed-predicate-word64-first-match-v1",
         PlanKind::UnicodeScalarRun => "unicode-scalar-run-search-v1",
-        PlanKind::LineDomainByteAtoms => "line-domain-byte-atoms-search-v3",
+        PlanKind::LineDomainByteAtoms => "line-domain-byte-atoms-search-v4",
     };
     let per_iteration = elapsed_ns / u128::try_from(ITERATIONS).unwrap();
     let (start, end) = matched.map_or((String::new(), String::new()), |(start, end)| {
