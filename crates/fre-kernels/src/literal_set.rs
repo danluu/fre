@@ -658,6 +658,43 @@ impl LiteralSetPlan {
         let Some(head) = folded_short_block_head(tail, window) else {
             return self.find_window_incumbent(haystack, window, incumbent_accounting);
         };
+        // Admit both head outcomes before reading source. A hit needs only the
+        // exact prefix; after a miss, the incumbent can resume at the first
+        // unsettled start under the complete `miss_work` envelope.
+        if head.miss_work > limits.max_transitions {
+            return self.find_window_incumbent(haystack, window, incumbent_accounting);
+        }
+        if let Some(matched) =
+            self.find_in_settled_block(haystack, head.probe, head.settled_starts)?
+        {
+            let accounting = folded_long_accounting(
+                incumbent_accounting,
+                head.prefix_transitions,
+                head.miss_work,
+            )?;
+            return Ok((Some(matched), accounting));
+        }
+        self.find_window_folded_short_after_head_miss(
+            haystack,
+            window,
+            limits,
+            incumbent_accounting,
+            tail,
+            head,
+        )
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn find_window_folded_short_after_head_miss(
+        &self,
+        haystack: &[u8],
+        window: Window,
+        limits: LiteralSetSearchLimits,
+        incumbent_accounting: LiteralSetAccounting,
+        tail: &FoldedLongTail,
+        head: FoldedLongHead,
+    ) -> Result<(Option<(usize, usize)>, LiteralSetAccounting), LiteralSetError> {
         let Some(prospective) = folded_short_prospective_after_head(
             tail,
             window,
@@ -665,18 +702,18 @@ impl LiteralSetPlan {
             limits.max_transitions,
         )
         else {
-            return self.find_window_incumbent(haystack, window, incumbent_accounting);
-        };
-        if let Some(matched) =
-            self.find_in_settled_block(haystack, head.probe, head.settled_starts)?
-        {
+            let (matched, _) = self.find_window_incumbent(
+                haystack,
+                head.continuation,
+                head.continuation_accounting,
+            )?;
             let accounting = folded_long_accounting(
                 incumbent_accounting,
-                head.prefix_transitions,
-                prospective.work,
+                head.miss_work,
+                head.miss_work,
             )?;
-            return Ok((Some(matched), accounting));
-        }
+            return Ok((matched, accounting));
+        };
         let mut search_start = head.continuation.start();
         // The exact head contributes its settled starts to the first tail
         // block's overlap amortization. Later accepted blocks reset this
@@ -992,6 +1029,8 @@ impl LiteralSetPlan {
                 "folded literal-set settled block escaped its source",
             ));
         }
+        #[cfg(test)]
+        folded_short_stage_probe::record_settled_scan();
         let input = Input::new(&haystack[probe.start()..probe.end()]);
         let matched = self
             .automaton
@@ -1209,6 +1248,8 @@ fn folded_short_prospective_after_head(
     head: FoldedLongHead,
     max_work: usize,
 ) -> Option<FoldedLongProspective> {
+    #[cfg(test)]
+    folded_short_stage_probe::record_short_prospective();
     if head.miss_work > max_work
         || head.probe.start() != window.start()
         || head.continuation.end() != window.end()
@@ -1467,6 +1508,47 @@ fn checked_mul(
 }
 
 #[cfg(test)]
+mod folded_short_stage_probe {
+    use std::cell::Cell;
+
+    std::thread_local! {
+        static SETTLED_SCANS: Cell<usize> = const { Cell::new(0) };
+        static SHORT_PROSPECTIVES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn record_settled_scan() {
+        SETTLED_SCANS.set(
+            SETTLED_SCANS
+                .get()
+                .checked_add(1)
+                .expect("folded settled-scan probe overflow"),
+        );
+    }
+
+    pub(super) fn record_short_prospective() {
+        SHORT_PROSPECTIVES.set(
+            SHORT_PROSPECTIVES
+                .get()
+                .checked_add(1)
+                .expect("folded short-prospective probe overflow"),
+        );
+    }
+
+    pub(super) fn reset() {
+        SETTLED_SCANS.set(0);
+        SHORT_PROSPECTIVES.set(0);
+    }
+
+    pub(super) fn settled_scans() -> usize {
+        SETTLED_SCANS.get()
+    }
+
+    pub(super) fn short_prospectives() -> usize {
+        SHORT_PROSPECTIVES.get()
+    }
+}
+
+#[cfg(test)]
 mod folded_long_tail_tests {
     use crate::folded_literal_trie::{
         BuildAttempt, BuildLimits, FoldedLiteral, FoldedLiteralTriePlan, FoldedScalarClass,
@@ -1478,6 +1560,7 @@ mod folded_long_tail_tests {
         LiteralSetError, LiteralSetFoldAttachment, LiteralSetPlan, LiteralSetSearchLimits, Window,
         folded_long_head, folded_long_prospective, folded_short_block_head,
         folded_short_blocks_admitted, folded_short_minimum_bytes, folded_short_prospective,
+        folded_short_stage_probe,
     };
 
     fn patterns() -> [&'static [u8]; 3] {
@@ -2128,6 +2211,8 @@ mod folded_long_tail_tests {
                     + 1
             );
             assert!(prospective.work > incumbent_work);
+            assert!(incumbent_work < head.miss_work);
+            assert!(head.miss_work < prospective.work);
 
             let match_start = head.continuation.start();
             let mut haystack = vec![b'!'; window.end() + 1];
@@ -2143,35 +2228,127 @@ mod folded_long_tail_tests {
                     max_transitions: prospective.work,
                 },
             ] {
+                folded_short_stage_probe::reset();
                 let actual = accelerated.find_window(&haystack, window, limits).unwrap();
                 assert_eq!(actual.0, expected.0, "frame={frame}, limits={limits:?}");
                 assert!(actual.1.transitions_upper_bound > head.prefix_transitions);
                 assert!(actual.1.transitions_upper_bound <= prospective.work);
+                assert!(folded_short_stage_probe::settled_scans() >= 1);
+                assert_eq!(folded_short_stage_probe::short_prospectives(), 1);
+            }
+
+            for max_transitions in [prospective.work - 1, head.miss_work] {
+                let limits = LiteralSetSearchLimits { max_transitions };
+                assert!(folded_short_prospective(tail, window, max_transitions).is_none());
+                folded_short_stage_probe::reset();
+                let actual = accelerated.find_window(&haystack, window, limits).unwrap();
+                assert_eq!(actual.0, expected.0, "frame={frame}, limits={limits:?}");
+                assert_eq!(actual.1.transitions_upper_bound, head.miss_work);
+                assert_eq!(folded_short_stage_probe::settled_scans(), 1);
+                assert_eq!(folded_short_stage_probe::short_prospectives(), 1);
             }
 
             for limits in [
                 LiteralSetSearchLimits {
-                    max_transitions: prospective.work - 1,
+                    max_transitions: head.miss_work - 1,
                 },
                 LiteralSetSearchLimits {
                     max_transitions: incumbent_work,
                 },
             ] {
+                folded_short_stage_probe::reset();
                 assert_eq!(
                     accelerated.find_window(&haystack, window, limits).unwrap(),
                     incumbent.find_window(&haystack, window, limits).unwrap(),
                     "frame={frame}, limits={limits:?}"
                 );
+                assert_eq!(folded_short_stage_probe::settled_scans(), 0);
+                assert_eq!(folded_short_stage_probe::short_prospectives(), 0);
             }
 
             let one_below = LiteralSetSearchLimits {
                 max_transitions: incumbent_work - 1,
             };
+            folded_short_stage_probe::reset();
             assert_eq!(
                 accelerated.find_window(&haystack, window, one_below),
                 incumbent.find_window(&haystack, window, one_below),
                 "frame={frame}"
             );
+            assert_eq!(folded_short_stage_probe::settled_scans(), 0);
+            assert_eq!(folded_short_stage_probe::short_prospectives(), 0);
+        }
+    }
+
+    #[test]
+    fn short_mixed_width_preserves_the_candidate_on_pre_dfa_fallback() {
+        let (incumbent, accelerated) = mixed_width_plans(81);
+        let tail = accelerated.folded_long_tail.as_deref().unwrap();
+        assert_eq!(tail.max_pattern_bytes, 81);
+        let input_bytes = folded_short_minimum_bytes(tail).unwrap();
+        assert_eq!(input_bytes, 144);
+
+        for frame in 0..BYTE_BUCKET_BLOCK_BYTES {
+            let window = Window::new(frame, frame + input_bytes);
+            let head = folded_short_block_head(tail, window).unwrap();
+            assert_eq!(head.settled_starts, 64);
+            assert_eq!(head.probe, window);
+            assert_eq!(head.continuation_accounting.searched_bytes, 80);
+            assert!(head.continuation_accounting.searched_bytes < tail.max_pattern_bytes);
+            let prospective = folded_short_prospective(tail, window, usize::MAX).unwrap();
+
+            let candidate_start = head.continuation.start();
+            let mut haystack = vec![b'!'; window.end() + 1];
+            haystack[candidate_start] = b'x';
+            let root = tail
+                .trie
+                .find_root_candidate_precharged(
+                    &haystack,
+                    head.continuation,
+                    prospective.trie,
+                )
+                .unwrap();
+            assert_eq!(
+                root.outcome,
+                RootCandidateOutcome::Candidate {
+                    start: candidate_start,
+                }
+            );
+            let block_end = candidate_start + BYTE_BUCKET_BLOCK_BYTES;
+            let probe_end = (block_end + tail.max_pattern_bytes - 1).min(window.end());
+            let probe_transitions = probe_end - candidate_start + 1;
+            let proved_progress = block_end - window.start();
+            assert_eq!(probe_transitions, 81);
+            assert_eq!(proved_progress, 80);
+            assert!(probe_transitions > proved_progress);
+
+            let expected = incumbent
+                .find_window(&haystack, window, LiteralSetSearchLimits::unlimited())
+                .unwrap()
+                .0;
+            folded_short_stage_probe::reset();
+            let (actual, accounting) = accelerated
+                .find_window(
+                    &haystack,
+                    window,
+                    LiteralSetSearchLimits {
+                        max_transitions: prospective.work,
+                    },
+                )
+                .unwrap();
+            assert_eq!(actual, expected, "frame={frame}");
+            assert_eq!(actual, Some((candidate_start, candidate_start + 1)));
+            assert_eq!(
+                accounting.transitions_upper_bound,
+                head.prefix_transitions
+                    + root.receipt.actual.work
+                    + window.end()
+                    - candidate_start
+                    + 1
+            );
+            assert!(accounting.transitions_upper_bound <= prospective.work);
+            assert_eq!(folded_short_stage_probe::settled_scans(), 1);
+            assert_eq!(folded_short_stage_probe::short_prospectives(), 1);
         }
     }
 
@@ -2428,7 +2605,7 @@ mod folded_long_tail_tests {
     }
 
     #[test]
-    fn short_prospective_and_incumbent_limits_are_decided_before_the_path() {
+    fn short_head_and_tail_limits_are_decided_before_each_stage() {
         let (incumbent, accelerated) = plans();
         let tail = accelerated.folded_long_tail.as_deref().unwrap();
         let frame = 5;
@@ -2450,26 +2627,39 @@ mod folded_long_tail_tests {
             head.prefix_transitions + input_bytes - head.settled_starts + 1
         );
         let prospective = folded_short_prospective(tail, window, usize::MAX).unwrap();
+        assert!(head.prefix_transitions <= input_bytes + 1);
+        assert!(input_bytes + 1 < head.miss_work);
         assert!(prospective.work > head.miss_work);
 
-        let early_start = window.start() + head.settled_starts - 1;
+        let early_start = window.start() + 2;
+        assert!(early_start < head.continuation.start());
         let mut early = vec![b'z'; window.end() + 7];
         early[early_start..early_start + 2].copy_from_slice(b"ka");
-        let early_exact = accelerated
-            .find_window(
-                &early,
-                window,
-                LiteralSetSearchLimits {
-                    max_transitions: prospective.work,
-                },
-            )
-            .unwrap();
-        assert_eq!(early_exact.0, Some((early_start, early_start + 2)));
-        assert_eq!(
-            early_exact.1.transitions_upper_bound,
-            head.prefix_transitions
-        );
+        assert!(folded_short_prospective(tail, window, head.miss_work).is_none());
+        for max_transitions in [
+            prospective.work,
+            prospective.work - 1,
+            head.miss_work,
+        ] {
+            folded_short_stage_probe::reset();
+            let early_exact = accelerated
+                .find_window(
+                    &early,
+                    window,
+                    LiteralSetSearchLimits { max_transitions },
+                )
+                .unwrap();
+            assert_eq!(early_exact.0, Some((early_start, early_start + 2)));
+            assert_eq!(
+                early_exact.1.transitions_upper_bound,
+                head.prefix_transitions,
+                "a head hit must not depend on the full prospective at limit {max_transitions}"
+            );
+            assert_eq!(folded_short_stage_probe::settled_scans(), 1);
+            assert_eq!(folded_short_stage_probe::short_prospectives(), 0);
+        }
 
+        folded_short_stage_probe::reset();
         let exact = accelerated
             .find_window(
                 &haystack,
@@ -2481,29 +2671,59 @@ mod folded_long_tail_tests {
             .unwrap();
         assert_eq!(exact.0, Some((window.end() - 2, window.end())));
         assert!(exact.1.transitions_upper_bound <= prospective.work);
+        assert!(folded_short_stage_probe::settled_scans() >= 1);
+        assert_eq!(folded_short_stage_probe::short_prospectives(), 1);
 
-        let incumbent_limit = LiteralSetSearchLimits {
-            max_transitions: prospective.work - 1,
-        };
-        let expected = incumbent.find_window(&haystack, window, incumbent_limit).unwrap();
-        let declined = accelerated
-            .find_window(&haystack, window, incumbent_limit)
+        for max_transitions in [prospective.work - 1, head.miss_work] {
+            let limits = LiteralSetSearchLimits { max_transitions };
+            assert!(folded_short_prospective(tail, window, max_transitions).is_none());
+            folded_short_stage_probe::reset();
+            let expected = incumbent.find_window(&haystack, window, limits).unwrap();
+            let declined = accelerated.find_window(&haystack, window, limits).unwrap();
+            assert_eq!(declined.0, expected.0);
+            assert_eq!(declined.1.transitions_upper_bound, head.miss_work);
+            assert_eq!(folded_short_stage_probe::settled_scans(), 1);
+            assert_eq!(folded_short_stage_probe::short_prospectives(), 1);
+        }
+
+        let absent = vec![b'z'; window.end() + 7];
+        folded_short_stage_probe::reset();
+        let absent_miss = accelerated
+            .find_window(
+                &absent,
+                window,
+                LiteralSetSearchLimits {
+                    max_transitions: head.miss_work,
+                },
+            )
             .unwrap();
-        assert_eq!(declined, expected);
-        assert_eq!(declined.1.transitions_upper_bound, input_bytes + 1);
-        assert_eq!(
-            accelerated
-                .find_window(&early, window, incumbent_limit)
-                .unwrap(),
-            incumbent
-                .find_window(&early, window, incumbent_limit)
-                .unwrap(),
-            "a one-below prospective must choose the incumbent before reading even a true head"
-        );
+        assert_eq!(absent_miss.0, None);
+        assert_eq!(absent_miss.1.transitions_upper_bound, head.miss_work);
+        assert_eq!(folded_short_stage_probe::settled_scans(), 1);
+        assert_eq!(folded_short_stage_probe::short_prospectives(), 1);
+
+        let one_below_head = LiteralSetSearchLimits {
+            max_transitions: head.miss_work - 1,
+        };
+        for source in [&haystack, &early] {
+            folded_short_stage_probe::reset();
+            assert_eq!(
+                accelerated
+                    .find_window(source, window, one_below_head)
+                    .unwrap(),
+                incumbent
+                    .find_window(source, window, one_below_head)
+                    .unwrap(),
+                "one below the complete head-miss envelope must select the incumbent before the head"
+            );
+            assert_eq!(folded_short_stage_probe::settled_scans(), 0);
+            assert_eq!(folded_short_stage_probe::short_prospectives(), 0);
+        }
 
         let below_incumbent = LiteralSetSearchLimits {
             max_transitions: input_bytes,
         };
+        folded_short_stage_probe::reset();
         assert_eq!(
             accelerated.find_window(&haystack, window, below_incumbent),
             Err(LiteralSetError::TransitionLimit {
@@ -2511,6 +2731,8 @@ mod folded_long_tail_tests {
                 limit: input_bytes,
             })
         );
+        assert_eq!(folded_short_stage_probe::settled_scans(), 0);
+        assert_eq!(folded_short_stage_probe::short_prospectives(), 0);
     }
 
     #[test]
