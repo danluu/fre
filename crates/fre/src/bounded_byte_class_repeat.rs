@@ -7,7 +7,7 @@
 use fre_exact_alloc::{CopyError, ExactBoxOrUsize};
 use fre_kernels::{
     BYTE_SET_BLOCK_BYTES, BYTE_SET_CLASSIFIER_BUILD_WORK, ByteSet256, ByteSetClassifier,
-    DispatchPolicy, SimdDispatchContext,
+    DispatchPolicy, SimdDispatchContext, classify_byte_delta_16,
 };
 use regex_syntax::hir::{Class, Hir, HirKind};
 
@@ -68,7 +68,7 @@ pub(crate) struct Plan {
     owner: ExactBoxOrUsize<Owner>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Qualified {
     start: usize,
     minimum_end: usize,
@@ -79,6 +79,88 @@ struct SearchState {
     meter: WorkMeter,
     candidate_scans: usize,
     run_scans: usize,
+}
+
+#[derive(Clone, Copy)]
+enum MemberMaskMode<'a> {
+    Range {
+        origin: u8,
+        maximum_delta: u8,
+        inverted: bool,
+    },
+    Classified {
+        classifier: &'a ByteSetClassifier,
+        inverted: bool,
+    },
+}
+
+impl<'a> MemberMaskMode<'a> {
+    fn from_owner(owner: &'a Owner) -> Option<Self> {
+        match owner.member_seek {
+            SetSeek::Range {
+                origin,
+                maximum_delta,
+                inverted,
+            } => Some(Self::Range {
+                origin,
+                maximum_delta,
+                inverted,
+            }),
+            SetSeek::Classified { inverted } => Some(Self::Classified {
+                classifier: owner
+                    .classifier
+                    .as_ref()
+                    .expect("a classified member seek retains its classifier"),
+                inverted,
+            }),
+            SetSeek::Constant(_)
+            | SetSeek::One(_)
+            | SetSeek::Two(_, _)
+            | SetSeek::Three(_, _, _) => None,
+        }
+    }
+
+    #[inline]
+    fn classify_16(self, block: &[u8; BYTE_SET_BLOCK_BYTES]) -> u16 {
+        match self {
+            Self::Range {
+                origin,
+                maximum_delta,
+                inverted,
+            } => {
+                let raw = classify_byte_delta_16(origin, maximum_delta, block).member_mask();
+                if inverted { !raw } else { raw }
+            }
+            Self::Classified {
+                classifier,
+                inverted,
+            } => {
+                let raw = classifier.classify_16(block).member_mask();
+                if inverted { !raw } else { raw }
+            }
+        }
+    }
+
+    #[inline]
+    fn contains(self, byte: u8) -> bool {
+        match self {
+            Self::Range {
+                origin,
+                maximum_delta,
+                inverted,
+            } => (byte.wrapping_sub(origin) <= maximum_delta) != inverted,
+            Self::Classified {
+                classifier,
+                inverted,
+            } => classifier.set().contains(byte) != inverted,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RunCarry {
+    start: usize,
+    length: usize,
 }
 
 impl Plan {
@@ -392,37 +474,40 @@ impl Plan {
         let owner = self.owner();
         let minimum = usize::try_from(owner.minimum)
             .expect("one repetition minimum fits the target index width");
-        let mut position = window.start();
-        loop {
-            let start = owner.member_seek.seek_unmetered(
+        let start = owner.member_seek.seek_unmetered(
+            haystack,
+            window.start(),
+            window.end(),
+            owner.classifier.as_ref(),
+        )?;
+        if window.end().saturating_sub(start) < minimum {
+            return None;
+        }
+        let minimum_end = start
+            .checked_add(minimum)
+            .expect("the remaining-window proof bounds the minimum end");
+        if minimum > 1
+            && let Some(run_end) = owner.run_end_seek.seek_unmetered(
+                haystack,
+                start
+                    .checked_add(1)
+                    .expect("a member before the window end can advance once"),
+                minimum_end,
+                owner.classifier.as_ref(),
+            )
+        {
+            let position = run_end
+                .checked_add(1)
+                .expect("a nonmember before the window end can advance once");
+            return qualifying_search_value_after_rejection(
+                owner,
                 haystack,
                 position,
                 window.end(),
-                owner.classifier.as_ref(),
-            )?;
-            if window.end().saturating_sub(start) < minimum {
-                return None;
-            }
-            let minimum_end = start
-                .checked_add(minimum)
-                .expect("the remaining-window proof bounds the minimum end");
-            if minimum > 1
-                && let Some(run_end) = owner.run_end_seek.seek_unmetered(
-                    haystack,
-                    start
-                        .checked_add(1)
-                        .expect("a member before the window end can advance once"),
-                    minimum_end,
-                    owner.classifier.as_ref(),
-                )
-            {
-                position = run_end
-                    .checked_add(1)
-                    .expect("a nonmember before the window end can advance once");
-                continue;
-            }
-            return Some(Qualified { start, minimum_end });
+                minimum,
+            );
         }
+        Some(Qualified { start, minimum_end })
     }
 
     #[inline(never)]
@@ -458,6 +543,234 @@ impl Plan {
             match_events,
         }
     }
+}
+
+#[inline(never)]
+fn qualifying_search_value_after_rejection(
+    owner: &Owner,
+    haystack: &[u8],
+    mut position: usize,
+    end: usize,
+    minimum: usize,
+) -> Option<Qualified> {
+    debug_assert!(minimum > 1);
+    let Some(mode) = MemberMaskMode::from_owner(owner) else {
+        return qualifying_search_value_incumbent(
+            owner, haystack, position, end, minimum,
+        );
+    };
+    loop {
+        let start = owner.member_seek.seek_unmetered(
+            haystack,
+            position,
+            end,
+            owner.classifier.as_ref(),
+        )?;
+        if end.saturating_sub(start) < minimum {
+            return None;
+        }
+        let minimum_end = start
+            .checked_add(minimum)
+            .expect("the remaining-window proof bounds the minimum end");
+        if let Some(run_end) = owner.run_end_seek.seek_unmetered(
+            haystack,
+            start
+                .checked_add(1)
+                .expect("a member before the window end can advance once"),
+            minimum_end,
+            owner.classifier.as_ref(),
+        ) {
+            position = run_end
+                .checked_add(1)
+                .expect("a nonmember before the window end can advance once");
+            if end.saturating_sub(position) >= BYTE_SET_BLOCK_BYTES {
+                return qualifying_search_value_masks(
+                    mode, haystack, position, end, minimum,
+                );
+            }
+            continue;
+        }
+        return Some(Qualified { start, minimum_end });
+    }
+}
+
+#[inline(never)]
+fn qualifying_search_value_incumbent(
+    owner: &Owner,
+    haystack: &[u8],
+    mut position: usize,
+    end: usize,
+    minimum: usize,
+) -> Option<Qualified> {
+    debug_assert!(minimum > 1);
+    loop {
+        let start = owner.member_seek.seek_unmetered(
+            haystack,
+            position,
+            end,
+            owner.classifier.as_ref(),
+        )?;
+        if end.saturating_sub(start) < minimum {
+            return None;
+        }
+        let minimum_end = start
+            .checked_add(minimum)
+            .expect("the remaining-window proof bounds the minimum end");
+        if let Some(run_end) = owner.run_end_seek.seek_unmetered(
+            haystack,
+            start
+                .checked_add(1)
+                .expect("a member before the window end can advance once"),
+            minimum_end,
+            owner.classifier.as_ref(),
+        ) {
+            position = run_end
+                .checked_add(1)
+                .expect("a nonmember before the window end can advance once");
+            continue;
+        }
+        return Some(Qualified { start, minimum_end });
+    }
+}
+
+#[inline(never)]
+fn qualifying_search_value_masks(
+    mode: MemberMaskMode<'_>,
+    haystack: &[u8],
+    mut position: usize,
+    end: usize,
+    minimum: usize,
+) -> Option<Qualified> {
+    debug_assert!(end.saturating_sub(position) >= BYTE_SET_BLOCK_BYTES);
+    debug_assert!(minimum > 1);
+    let mut carry = None;
+    while end.saturating_sub(position) >= BYTE_SET_BLOCK_BYTES {
+        let block_end = position
+            .checked_add(BYTE_SET_BLOCK_BYTES)
+            .expect("one complete block within the window has a representable end");
+        let block: &[u8; BYTE_SET_BLOCK_BYTES] = haystack[position..block_end]
+            .try_into()
+            .expect("the member-mask scanner checked one complete block");
+        if let Some(qualified) =
+            consume_member_mask(mode.classify_16(block), position, minimum, &mut carry)
+        {
+            return Some(qualified);
+        }
+        position = block_end;
+    }
+
+    for (relative, &byte) in haystack[position..end].iter().enumerate() {
+        let index = position
+            .checked_add(relative)
+            .expect("one validated scalar tail offset fits the source index");
+        if mode.contains(byte) {
+            let run = carry.get_or_insert(RunCarry {
+                start: index,
+                length: 0,
+            });
+            run.length = run
+                .length
+                .checked_add(1)
+                .expect("one retained run length cannot exceed the source length");
+            if run.length >= minimum {
+                return Some(Qualified {
+                    start: run.start,
+                    minimum_end: run
+                        .start
+                        .checked_add(minimum)
+                        .expect("the qualifying run proves its minimum end"),
+                });
+            }
+        } else {
+            carry = None;
+        }
+    }
+    None
+}
+
+fn consume_member_mask(
+    mask: u16,
+    block_start: usize,
+    minimum: usize,
+    carry: &mut Option<RunCarry>,
+) -> Option<Qualified> {
+    let mut offset = 0_usize;
+    if let Some(mut retained) = carry.take() {
+        let leading = usize::try_from(mask.trailing_ones())
+            .expect("one fixed-width mask prefix fits usize");
+        retained.length = retained
+            .length
+            .checked_add(leading)
+            .expect("one retained run length cannot exceed the source length");
+        if retained.length >= minimum {
+            return Some(Qualified {
+                start: retained.start,
+                minimum_end: retained
+                    .start
+                    .checked_add(minimum)
+                    .expect("the qualifying carried run proves its minimum end"),
+            });
+        }
+        if leading == BYTE_SET_BLOCK_BYTES {
+            *carry = Some(retained);
+            return None;
+        }
+        offset = leading
+            .checked_add(1)
+            .expect("a nonmember after a fixed-width prefix advances once");
+    }
+
+    while offset < BYTE_SET_BLOCK_BYTES {
+        let remaining = BYTE_SET_BLOCK_BYTES
+            .checked_sub(offset)
+            .expect("the mask offset stays within one block");
+        let shift = u32::try_from(offset).expect("one mask offset fits u32");
+        let shifted = u32::from(mask)
+            .checked_shr(shift)
+            .expect("one mask offset stays within the widened mask");
+        let zeros = usize::try_from(shifted.trailing_zeros())
+            .expect("one fixed-width zero run fits usize")
+            .min(remaining);
+        offset = offset
+            .checked_add(zeros)
+            .expect("one mask-relative zero run stays within the block");
+        if offset == BYTE_SET_BLOCK_BYTES {
+            return None;
+        }
+
+        let remaining = BYTE_SET_BLOCK_BYTES
+            .checked_sub(offset)
+            .expect("the mask offset stays within one block");
+        let shift = u32::try_from(offset).expect("one mask offset fits u32");
+        let shifted = u32::from(mask)
+            .checked_shr(shift)
+            .expect("one mask offset stays within the widened mask");
+        let ones = usize::try_from(shifted.trailing_ones())
+            .expect("one fixed-width member run fits usize")
+            .min(remaining);
+        let start = block_start
+            .checked_add(offset)
+            .expect("one mask-relative member offset stays within the source");
+        if ones >= minimum {
+            return Some(Qualified {
+                start,
+                minimum_end: start
+                    .checked_add(minimum)
+                    .expect("the qualifying block run proves its minimum end"),
+            });
+        }
+        offset = offset
+            .checked_add(ones)
+            .expect("one mask-relative member run stays within the block");
+        if offset == BYTE_SET_BLOCK_BYTES {
+            *carry = Some(RunCarry {
+                start,
+                length: ones,
+            });
+            return None;
+        }
+    }
+    None
 }
 
 fn unmetered_work_fits(window: SearchWindow) -> bool {
@@ -601,7 +914,10 @@ fn charge_planner(work: &mut u64, additional: u64, limit: u64) -> Result<(), Ins
 
 #[cfg(test)]
 mod tests {
-    use super::{BYTE_SET_BLOCK_BYTES, PLAN_ID};
+    use super::{
+        BYTE_SET_BLOCK_BYTES, MemberMaskMode, PLAN_ID, Qualified, RunCarry,
+        consume_member_mask,
+    };
     use crate::pure_byte_class_repeat::SetSeek;
     use crate::{
         BuildError, BuildLimits, PlanKind, PlanSelection, PortableBuilder, PortableFindIterLimits,
@@ -698,6 +1014,10 @@ mod tests {
             }
         );
         assert!(plan.owner().classifier.is_none());
+        assert!(matches!(
+            MemberMaskMode::from_owner(plan.owner()),
+            Some(MemberMaskMode::Range { .. })
+        ));
 
         let (matched, receipt) = range
             .find(b"................................@@@@!", SearchLimits::unlimited())
@@ -726,6 +1046,7 @@ mod tests {
             }
         );
         assert!(plan.owner().classifier.is_none());
+        assert!(MemberMaskMode::from_owner(plan.owner()).is_none());
 
         let small_holey = build("(?-u:[ac]){2,5}");
         let PortablePlan::BoundedByteClassRepeat(plan) = &small_holey.plan else {
@@ -744,6 +1065,18 @@ mod tests {
         assert!(!classifier.set().contains(b'a'));
         assert!(classifier.set().contains(b'b'));
         assert!(!classifier.set().contains(b'c'));
+        assert!(MemberMaskMode::from_owner(plan.owner()).is_none());
+
+        let small_holey_three = build("(?-u:[ace]){2,5}");
+        let PortablePlan::BoundedByteClassRepeat(plan) = &small_holey_three.plan else {
+            panic!("one bounded holey triple should retain the bounded repeat plan");
+        };
+        assert_eq!(
+            plan.owner().member_seek,
+            SetSeek::Three(b'a', b'c', b'e')
+        );
+        assert!(plan.owner().classifier.is_some());
+        assert!(MemberMaskMode::from_owner(plan.owner()).is_none());
     }
 
     #[test]
@@ -764,6 +1097,8 @@ mod tests {
             "(?-u:[ace]){2,4}?",
             "(?-u:[abdz]){2,4}",
             "(?-u:[abdz]){2,4}?",
+            "(?-u:[^abdz]){2,4}",
+            "(?-u:[^abdz]){2,4}?",
             "(?s-u:.){2,4}",
         ];
         let alphabet = [b'a', b'b', b'c', b'd', 0x80_u8];
@@ -1021,6 +1356,280 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn every_member_mask_transition_matches_a_scalar_run_oracle() {
+        fn scalar_transition(
+            mask: u16,
+            block_start: usize,
+            minimum: usize,
+            incoming: Option<RunCarry>,
+        ) -> (Option<Qualified>, Option<RunCarry>) {
+            let prefix_length = incoming.map_or(0, |carry| carry.length);
+            let source_start = block_start
+                .checked_sub(prefix_length)
+                .expect("the fixture leaves room for its incoming run");
+            let mut run_start = None;
+            let mut run_length = 0_usize;
+            let transition_length = prefix_length
+                .checked_add(BYTE_SET_BLOCK_BYTES)
+                .expect("the test transition length fits usize");
+            for offset in 0..transition_length {
+                let member = if offset < prefix_length {
+                    true
+                } else {
+                    let lane = offset
+                        .checked_sub(prefix_length)
+                        .expect("the mask lane follows the incoming prefix");
+                    let shift = u32::try_from(lane).expect("one mask lane fits u32");
+                    let bit = 1_u16
+                        .checked_shl(shift)
+                        .expect("one lane stays within the fixed-width mask");
+                    mask & bit != 0
+                };
+                if member {
+                    run_start.get_or_insert(
+                        source_start
+                            .checked_add(offset)
+                            .expect("the fixture transition stays within usize"),
+                    );
+                    run_length = run_length
+                        .checked_add(1)
+                        .expect("one fixture run stays within its transition");
+                    if run_length >= minimum {
+                        let start = run_start.expect("one positive run has a start");
+                        return (
+                            Some(Qualified {
+                                start,
+                                minimum_end: start
+                                    .checked_add(minimum)
+                                    .expect("one fixture minimum end fits usize"),
+                            }),
+                            None,
+                        );
+                    }
+                } else {
+                    run_start = None;
+                    run_length = 0;
+                }
+            }
+            (
+                None,
+                run_start.map(|start| RunCarry {
+                    start,
+                    length: run_length,
+                }),
+            )
+        }
+
+        let block_start = 64_usize;
+        for minimum in [2_usize, 3, 7, 15, 16, 17, 31, 32, 33] {
+            for mask in u16::MIN..=u16::MAX {
+                let midpoint = minimum
+                    .checked_div(2)
+                    .expect("all fixture minimums are positive");
+                let last_short = minimum
+                    .checked_sub(1)
+                    .expect("all fixture minimums exceed one");
+                let incoming_lengths = [0_usize, 1, midpoint, last_short];
+                for (length_index, incoming_length) in
+                    incoming_lengths.into_iter().enumerate()
+                {
+                    if incoming_lengths[..length_index].contains(&incoming_length) {
+                        continue;
+                    }
+                    let incoming = (incoming_length != 0).then(|| RunCarry {
+                        start: block_start
+                            .checked_sub(incoming_length)
+                            .expect("the fixture leaves room for its incoming run"),
+                        length: incoming_length,
+                    });
+                    let expected = scalar_transition(mask, block_start, minimum, incoming);
+                    let mut actual_carry = incoming;
+                    let actual =
+                        consume_member_mask(mask, block_start, minimum, &mut actual_carry);
+                    assert_eq!(
+                        actual, expected.0,
+                        "qualified mask={mask:#06x} minimum={minimum} incoming={incoming:?}",
+                    );
+                    if actual.is_none() {
+                        assert_eq!(
+                            actual_carry, expected.1,
+                            "carry mask={mask:#06x} minimum={minimum} incoming={incoming:?}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn member_mask_run_finder_matches_accounted_across_block_boundaries() {
+        let patterns = [
+            "(?-u:[a-z]){17,33}",
+            "(?-u:[a-z]){17,33}?",
+            "(?-u:[a-z]){33,48}",
+            "(?-u:[aceg]){17,33}",
+            "(?-u:[aceg]){17,33}?",
+            "(?-u:[aceg]){33,48}",
+            "(?-u:[^x]){17,33}",
+            "(?-u:[^x]){33,48}?",
+            "(?-u:[^abdz]){17,33}",
+            "(?-u:[^abdz]){33,48}?",
+            "(?-u:[\\x80\\x82\\x84\\x86]){17,33}",
+            "(?-u:[\\x80\\x82\\x84\\x86]){33,48}?",
+        ];
+
+        let mut ascii = Vec::new();
+        for _ in 0..3 {
+            for index in 0..16 {
+                ascii.push(b"aceg"[index % 4]);
+            }
+            ascii.push(b'!');
+        }
+        ascii.extend_from_slice(&[b'!'; 13]);
+        for index in 0..40 {
+            ascii.push(b"aceg"[index % 4]);
+        }
+
+        let mut inverted = Vec::new();
+        for _ in 0..3 {
+            inverted.extend_from_slice(&[b'a'; 16]);
+            inverted.push(b'x');
+        }
+        inverted.extend_from_slice(&[b'x'; 13]);
+        inverted.extend_from_slice(&[b'a'; 40]);
+
+        let mut high = Vec::new();
+        for _ in 0..3 {
+            for index in 0..16 {
+                high.push([0x80, 0x82, 0x84, 0x86][index % 4]);
+            }
+            high.push(b'!');
+        }
+        high.extend_from_slice(&[b'!'; 13]);
+        for index in 0..40 {
+            high.push([0x80, 0x82, 0x84, 0x86][index % 4]);
+        }
+
+        for pattern in patterns {
+            let regex = build(pattern);
+            let oracle = regex::bytes::RegexBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            let PortablePlan::BoundedByteClassRepeat(plan) = &regex.plan else {
+                panic!("expected bounded plan for {pattern:?}");
+            };
+            let mut session = regex
+                .search_session(SearchSessionLimits::unlimited())
+                .expect("the native bounded session should build");
+            for haystack in [&ascii, &inverted, &high] {
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let window = SearchWindow::new(start, end);
+                        let expected_match = plan
+                            .find_window(haystack, window, SearchLimits::unlimited())
+                            .unwrap()
+                            .0;
+                        let expected_exists = expected_match.is_some();
+                        let expected_earliest = plan
+                            .earliest_end_window(haystack, window, SearchLimits::unlimited())
+                            .unwrap()
+                            .0;
+                        let oracle_window = &haystack[start..end];
+                        let oracle_match = oracle.find(oracle_window).map(|matched| {
+                            (
+                                start
+                                    .checked_add(matched.start())
+                                    .expect("one oracle start stays within the window"),
+                                start
+                                    .checked_add(matched.end())
+                                    .expect("one oracle end stays within the window"),
+                            )
+                        });
+                        let oracle_earliest = oracle.shortest_match(oracle_window).map(|relative| {
+                            start
+                                .checked_add(relative)
+                                .expect("one oracle earliest end stays within the window")
+                        });
+                        assert_eq!(
+                            span(expected_match),
+                            oracle_match,
+                            "accounted span oracle: {pattern:?} window={start}..{end}",
+                        );
+                        assert_eq!(
+                            expected_earliest, oracle_earliest,
+                            "accounted earliest oracle: {pattern:?} window={start}..{end}",
+                        );
+                        assert_eq!(
+                            span(
+                                plan.find_window_value(
+                                    haystack,
+                                    window,
+                                    SearchLimits::unlimited(),
+                                )
+                                .unwrap(),
+                            ),
+                            span(expected_match),
+                            "plan span: {pattern:?} window={start}..{end}",
+                        );
+                        assert_eq!(
+                            session
+                                .is_match_window_value(
+                                    haystack,
+                                    window,
+                                    SearchLimits::unlimited(),
+                                )
+                                .unwrap(),
+                            expected_exists,
+                            "session exists: {pattern:?} window={start}..{end}",
+                        );
+                        assert_eq!(
+                            session
+                                .shortest_match_window_value(
+                                    haystack,
+                                    window,
+                                    SearchLimits::unlimited(),
+                                )
+                                .unwrap(),
+                            expected_earliest,
+                            "session earliest: {pattern:?} window={start}..{end}",
+                        );
+                        assert_eq!(
+                            span(
+                                session
+                                    .find_window_value(
+                                        haystack,
+                                        window,
+                                        SearchLimits::unlimited(),
+                                    )
+                                    .unwrap(),
+                            ),
+                            span(expected_match),
+                            "session span: {pattern:?} window={start}..{end}",
+                        );
+                    }
+                }
+
+                let expected_iter = oracle
+                    .find_iter(haystack)
+                    .map(|matched| (matched.start(), matched.end()))
+                    .collect::<Vec<_>>();
+                let actual_iter = session
+                    .find_iter_value(haystack, PortableFindIterRunLimits::unlimited())
+                    .map(|matched| {
+                        let matched = matched.unwrap();
+                        (matched.start(), matched.end())
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    actual_iter, expected_iter,
+                    "session iterator: {pattern:?} {haystack:?}"
+                );
             }
         }
     }
