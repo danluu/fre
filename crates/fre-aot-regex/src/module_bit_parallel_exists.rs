@@ -901,11 +901,10 @@ fn lower_x86_64_multiword_bit_parallel(
         );
         assembler.instruction(&root_only_row)?;
         if use_avx2 || use_avx512_rows {
-            assembler.instruction(&[0x4c, 0x89, 0xd6])?;
             if use_avx2 {
-                assembler.instruction(&[0xc5, 0xfe, 0x6f, 0x06])?;
+                assembler.instruction(&[0xc4, 0xc1, 0x7e, 0x6f, 0x02])?;
             } else {
-                assembler.instruction(&[0x62, 0xf1, 0xfe, 0x28, 0x6f, 0x06])?;
+                assembler.instruction(&[0x62, 0xd1, 0xfe, 0x28, 0x6f, 0x02])?;
             }
         } else {
             for word in 0..layout.words {
@@ -935,11 +934,10 @@ fn lower_x86_64_multiword_bit_parallel(
         );
         assembler.instruction(&root_row)?; // root row pointer -> r10
         if use_avx2 || use_avx512_rows {
-            assembler.instruction(&[0x4c, 0x89, 0xd6])?; // root row -> rsi
             if use_avx2 {
-                assembler.instruction(&[0xc5, 0xfe, 0x6f, 0x06])?; // vmovdqu -> ymm0
+                assembler.instruction(&[0xc4, 0xc1, 0x7e, 0x6f, 0x02])?; // vmovdqu -> ymm0
             } else {
-                assembler.instruction(&[0x62, 0xf1, 0xfe, 0x28, 0x6f, 0x06])?; // vmovdqu64
+                assembler.instruction(&[0x62, 0xd1, 0xfe, 0x28, 0x6f, 0x02])?; // vmovdqu64
             }
         } else {
             for word in 0..layout.words {
@@ -964,11 +962,10 @@ fn lower_x86_64_multiword_bit_parallel(
                 x86_emit_movabs(&mut assembler, 0xba, !layout.roots[source_word])?;
                 assembler.instruction(&[0x4c, 0x21, 0xd0])?; // active & !root
             }
-            assembler.bind(bit_loop)?;
             assembler.instruction(&[0x48, 0x85, 0xc0])?;
             assembler.branch(&[0x0f, 0x84], bit_done)?;
+            assembler.bind(bit_loop)?;
             assembler.instruction(&[0x48, 0x0f, 0xbc, 0xc8])?; // bsf rax, rcx
-            assembler.instruction(&[0x48, 0x0f, 0xb3, 0xc8])?; // btr rcx, rax
             assembler.instruction(&[0x48, 0xc1, 0xe1, 0x05])?; // bit * native row bytes
             if source_word == 0 {
                 assembler.instruction(&[0x49, 0x8d, 0x34, 0x08])?;
@@ -1002,7 +999,9 @@ fn lower_x86_64_multiword_bit_parallel(
                     assembler.instruction(&[0x4c, 0x09, 0x54, 0x24, reached_offset])?;
                 }
             }
-            assembler.branch(&[0xe9], bit_loop)?;
+            assembler.instruction(&[0x4c, 0x8d, 0x50, 0xff])?; // active - 1 -> r10
+            assembler.instruction(&[0x4c, 0x21, 0xd0])?; // clear lowest active bit
+            assembler.branch(&[0x0f, 0x85], bit_loop)?;
             assembler.bind(bit_done)?;
         }
 
@@ -1120,9 +1119,9 @@ fn aarch64_orr_x(destination: u8, left: u8, right: u8) -> Result<u32, ObjectErro
     )
 }
 
-fn aarch64_and_x(destination: u8, left: u8, right: u8) -> Result<u32, ObjectError> {
+fn aarch64_ands_x(destination: u8, left: u8, right: u8) -> Result<u32, ObjectError> {
     Ok(
-        0x8a00_0000
+        0xea00_0000
             | aarch64_reg(right, 16)?
             | aarch64_reg(left, 5)?
             | aarch64_reg(destination, 0)?,
@@ -1667,12 +1666,12 @@ fn lower_aarch64_multiword_bit_parallel(
                         .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 root register"))?,
                 )?)?;
             }
-            assembler.bind(bit_loop)?;
             assembler.branch_zero_x(16, bit_done)?;
+            assembler.bind(bit_loop)?;
             assembler.instruction(aarch64_rbit_x(6, 16)?)?;
             assembler.instruction(aarch64_clz_x(6, 6)?)?;
             assembler.instruction(super::aarch64_sub_x_imm(7, 16, 1)?)?;
-            assembler.instruction(aarch64_and_x(16, 16, 7)?)?;
+            assembler.instruction(aarch64_ands_x(16, 16, 7)?)?;
             assembler.instruction(super::aarch64_add_x_lsl(6, 1, 6, 5)?)?;
             if use_asimd {
                 if layout.words > 2 {
@@ -1697,7 +1696,7 @@ fn lower_aarch64_multiword_bit_parallel(
                     assembler.instruction(aarch64_orr_x(reached, reached, 7)?)?;
                 }
             }
-            assembler.branch(bit_loop)?;
+            assembler.branch_cond(AARCH64_NE, bit_loop)?;
             assembler.bind(bit_done)?;
             if source_word + 1 != layout.words {
                 assembler.instruction(aarch64_add_x_imm(
@@ -2336,9 +2335,12 @@ mod tests {
             .expect("scalar dense x86 leaf");
         let vector = lower_x86_64_bit_parallel(&layout, avx2).expect("AVX2 dense x86 leaf");
         let wide = lower_x86_64_bit_parallel(&layout, avx512).expect("AVX-512 dense x86 leaf");
-        assert_eq!(count_bytes(&scalar.code, &[0xc5, 0xfe, 0x6f, 0x06]), 0);
-        assert!(count_bytes(&vector.code, &[0xc5, 0xfe, 0x6f, 0x06]) > 0);
-        assert!(count_bytes(&wide.code, &[0x62, 0xf1, 0xfe, 0x28, 0x6f, 0x06]) > 0);
+        assert_eq!(
+            count_bytes(&scalar.code, &[0xc4, 0xc1, 0x7e, 0x6f, 0x02]),
+            0
+        );
+        assert!(count_bytes(&vector.code, &[0xc4, 0xc1, 0x7e, 0x6f, 0x02]) > 0);
+        assert!(count_bytes(&wide.code, &[0x62, 0xd1, 0xfe, 0x28, 0x6f, 0x02]) > 0);
         let arm = lower_aarch64_bit_parallel(&layout, asimd).expect("ASIMD dense W4 leaf");
         let arm_words = arm
             .code
