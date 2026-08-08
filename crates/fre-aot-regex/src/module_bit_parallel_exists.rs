@@ -52,10 +52,9 @@ const ROOT_SKIP_FIRST_LANE_BYTES: usize = 16;
 // The sidecar itself proves a tighter retained-memory ceiling. These native
 // caps independently bound object growth and make a failed optional lowering
 // fall back to the serialized runtime route.
-const MAX_NATIVE_BIT_PARALLEL_DATA_BYTES: usize =
-    CLASSIFIER_BYTES
-        + 256 * (MAX_BIT_PARALLEL_EXISTS_STATES / NIBBLE_BITS) * NIBBLE_ROW_BYTES
-        + ROOT_SKIP_FIRST_LANE_BYTES * 2;
+const MAX_NATIVE_BIT_PARALLEL_DATA_BYTES: usize = CLASSIFIER_BYTES
+    + 256 * (MAX_BIT_PARALLEL_EXISTS_STATES / NIBBLE_BITS) * NIBBLE_ROW_BYTES
+    + ROOT_SKIP_FIRST_LANE_BYTES * 2;
 const MAX_NATIVE_BIT_PARALLEL_CODE_BYTES: usize = 2 * 1024;
 
 #[derive(Debug)]
@@ -87,8 +86,7 @@ pub(super) fn lower_native_bit_parallel_exists(
         let Some(filter) = layout.root_filter else {
             return Ok(None);
         };
-        if layout.source_nibbles != 1
-            || filter.candidate_bytes > MAX_ROOT_SKIP_CANDIDATE_BYTES
+        if filter.candidate_bytes > MAX_ROOT_SKIP_CANDIDATE_BYTES
             || filter.constant_count() > 8
             || filter.ranges().is_empty()
         {
@@ -231,13 +229,22 @@ fn build_native_bit_parallel_layout(
         return None;
     }
 
-    let root_filter = if constant_result.is_none() && source_nibbles == 1 {
-        let subset = usize::try_from(root & 0x0f).ok()?;
+    let root_filter = if constant_result.is_none() {
         let mut membership = [0_u64; 4];
         for byte in u8::MIN..=u8::MAX {
             let class = usize::from(view.byte_to_class[usize::from(byte)]);
-            let index = class.checked_mul(NIBBLE_SUBSETS)?.checked_add(subset)?;
-            let reached = *view.transition_masks.get(index)?;
+            let class_base = class
+                .checked_mul(source_nibbles)?
+                .checked_mul(NIBBLE_SUBSETS)?;
+            let mut reached = 0_u64;
+            for nibble in 0..source_nibbles {
+                let shift = nibble.checked_mul(NIBBLE_BITS)?;
+                let subset = usize::try_from((root >> shift) & 0x0f).ok()?;
+                let index = class_base
+                    .checked_add(nibble.checked_mul(NIBBLE_SUBSETS)?)?
+                    .checked_add(subset)?;
+                reached |= *view.transition_masks.get(index)?;
+            }
             let changes_root = reached & (ACCEPT_BIT | (CONSUMING_BITS & !root)) != 0;
             if changes_root {
                 let byte = usize::from(byte);
@@ -339,6 +346,7 @@ fn lower_x86_64_bit_parallel(
     let vector_hit = assembler.label()?;
     let scalar_scan = assembler.label()?;
     let scalar_miss = assembler.label()?;
+    let root_recurrence = assembler.label()?;
     let recurrence = assembler.label()?;
     let no_match = assembler.label()?;
     let matched = assembler.label()?;
@@ -387,16 +395,18 @@ fn lower_x86_64_bit_parallel(
         assembler.bind(vector_hit)?;
         x86_emit_first_candidate_lane(&mut assembler, X86CandidateMask::for_filter(filter, kind))?;
         assembler.instruction(&[0x48, 0x01, 0xc2])?; // position += first lane
-        assembler.branch(&[0xe9], recurrence)?;
+        assembler.branch(&[0xe9], root_recurrence)?;
 
         assembler.bind(scalar_scan)?;
         x86_emit_start_filter_scalar_bound(&mut assembler, 0, no_match)?;
         x86_emit_scalar_filter_membership(&mut assembler, filter, scalar_miss)?;
-        assembler.branch(&[0xe9], recurrence)?;
+        assembler.branch(&[0xe9], root_recurrence)?;
         assembler.bind(scalar_miss)?;
         assembler.instruction(&[0x48, 0xff, 0xc2])?;
         assembler.branch(&[0xe9], scalar_scan)?;
 
+        assembler.bind(root_recurrence)?;
+        assembler.instruction(&[0x4d, 0x89, 0xda])?; // scanner scratch -> exact root active
         assembler.bind(recurrence)?;
         assembler.instruction(&[0x48, 0x39, 0xca])?; // position >= end
         assembler.branch(&[0x0f, 0x83], no_match)?;
@@ -404,9 +414,27 @@ fn lower_x86_64_bit_parallel(
         assembler.instruction(&[0x48, 0xff, 0xc2])?; // position += 1
         assembler.instruction(&[0x41, 0x8b, 0x04, 0x81])?; // row offset = table[byte]
         assembler.instruction(&[0x49, 0x8d, 0x34, 0x01])?; // row = table + offset
-        assembler.instruction(&[0x4c, 0x89, 0xd0])?; // subset = active
-        assembler.instruction(&[0x83, 0xe0, 0x0f])?;
-        assembler.instruction(&[0x48, 0x8b, 0x04, 0xc6])?; // reached = row[subset]
+        assembler.instruction(&[0x31, 0xc0])?; // reached = 0
+        for nibble in 0..layout.source_nibbles {
+            assembler.instruction(&[0x4d, 0x89, 0xd0])?; // active -> temporary r8
+            let shift = u8::try_from(
+                nibble
+                    .checked_mul(NIBBLE_BITS)
+                    .ok_or(ObjectError::ArithmeticOverflow("x86 bit-parallel shift"))?,
+            )
+            .map_err(|_| ObjectError::ArithmeticOverflow("x86 bit-parallel shift"))?;
+            if shift != 0 {
+                assembler.instruction(&[0x49, 0xc1, 0xe8, shift])?;
+            }
+            assembler.instruction(&[0x41, 0x83, 0xe0, 0x0f])?;
+            let displacement = u32::try_from(nibble.checked_mul(NIBBLE_ROW_BYTES).ok_or(
+                ObjectError::ArithmeticOverflow("x86 bit-parallel row offset"),
+            )?)
+            .map_err(|_| ObjectError::ArithmeticOverflow("x86 bit-parallel row offset"))?;
+            let mut union = vec![0x4a, 0x0b, 0x84, 0xc6];
+            union.extend_from_slice(&displacement.to_le_bytes());
+            assembler.instruction(&union)?; // reached |= row[r8 * 8 + displacement]
+        }
         assembler.instruction(&[0x48, 0x85, 0xc0])?;
         assembler.branch(&[0x0f, 0x88], matched)?; // acceptance marker is the sign bit
         assembler.instruction(&[0x48, 0x0f, 0xba, 0xf0, 0x3f])?; // btr 63, rax
@@ -515,6 +543,7 @@ fn lower_aarch64_bit_parallel(
     let batch_hit = assembler.label()?;
     let scalar_scan = assembler.label()?;
     let scalar_miss = assembler.label()?;
+    let root_recurrence = assembler.label()?;
     let recurrence = assembler.label()?;
     let no_match = assembler.label()?;
     let matched = assembler.label()?;
@@ -562,7 +591,7 @@ fn lower_aarch64_bit_parallel(
                 false,
                 scan,
                 scalar_scan,
-                recurrence,
+                root_recurrence,
             )?;
         } else {
             aarch64_emit_start_filter_constants(
@@ -595,7 +624,7 @@ fn lower_aarch64_bit_parallel(
 
             assembler.bind(batch_hit)?;
             aarch64_emit_first_candidate_in_batch(&mut assembler, first_candidates)?;
-            assembler.branch(recurrence)?;
+            assembler.branch(root_recurrence)?;
 
             assembler.bind(single_vector)?;
             assembler.instruction(super::aarch64_sub_x_reg(12, 3, 2)?)?;
@@ -617,17 +646,19 @@ fn lower_aarch64_bit_parallel(
 
             assembler.bind(single_hit)?;
             aarch64_emit_first_candidate_lane(&mut assembler, 24)?;
-            assembler.branch(recurrence)?;
+            assembler.branch(root_recurrence)?;
         }
 
         assembler.bind(scalar_scan)?;
         aarch64_emit_start_filter_scalar_bound(&mut assembler, 0, no_match)?;
         aarch64_emit_scalar_filter_membership(&mut assembler, filter, scalar_miss)?;
-        assembler.branch(recurrence)?;
+        assembler.branch(root_recurrence)?;
         assembler.bind(scalar_miss)?;
         assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
         assembler.branch(scalar_scan)?;
 
+        assembler.bind(root_recurrence)?;
+        assembler.instruction(aarch64_mov_x(8, 9)?)?; // scanner scratch -> exact root active
         assembler.bind(recurrence)?;
         assembler.instruction(aarch64_cmp_x(2, 3)?)?;
         assembler.branch_cond(AARCH64_HS, no_match)?;
@@ -635,8 +666,41 @@ fn lower_aarch64_bit_parallel(
         assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
         assembler.instruction(aarch64_load_w_lsl2(11, 5, 12)?)?;
         assembler.instruction(aarch64_add_x_reg(11, 5, 11)?)?;
-        assembler.instruction(aarch64_and_low_x(12, 8, 4)?)?;
-        assembler.instruction(aarch64_load_x_lsl3(10, 11, 12)?)?;
+        assembler.instruction(aarch64_movz_w(10, 0)?)?;
+        for nibble in 0..layout.source_nibbles {
+            let shift = u8::try_from(nibble.checked_mul(NIBBLE_BITS).ok_or(
+                ObjectError::ArithmeticOverflow("AArch64 bit-parallel shift"),
+            )?)
+            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 bit-parallel shift"))?;
+            if shift == 0 {
+                assembler.instruction(aarch64_mov_x(12, 8)?)?;
+            } else {
+                assembler.instruction(aarch64_lsr_x_imm(12, 8, shift)?)?;
+            }
+            assembler.instruction(aarch64_and_low_x(
+                12,
+                12,
+                u8::try_from(NIBBLE_BITS)
+                    .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 nibble width"))?,
+            )?)?;
+            assembler.instruction(aarch64_load_x_lsl3(13, 11, 12)?)?;
+            assembler.instruction(aarch64_orr_x(10, 10, 13)?)?;
+            if nibble
+                .checked_add(1)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "AArch64 next bit-parallel nibble",
+                ))?
+                != layout.source_nibbles
+            {
+                assembler.instruction(aarch64_add_x_imm(
+                    11,
+                    11,
+                    u16::try_from(NIBBLE_ROW_BYTES).map_err(|_| {
+                        ObjectError::ArithmeticOverflow("AArch64 bit-parallel row stride")
+                    })?,
+                )?)?;
+            }
+        }
         assembler.instruction(aarch64_lsr_x_imm(12, 10, 63)?)?;
         assembler.branch_nonzero_w(12, matched)?;
         assembler.instruction(aarch64_and_low_x(8, 10, 63)?)?;
@@ -706,6 +770,7 @@ mod tests {
     };
 
     const GENERAL_PATTERN: &str = r"(?:ab|c)*z";
+    const MULTI_NIBBLE_PATTERN: &str = r"(?:abcdef|ghijkl)*z";
 
     fn fallback_limits() -> CompileLimitsV1 {
         CompileLimitsV1 {
@@ -717,9 +782,9 @@ mod tests {
         }
     }
 
-    fn compiled_sidecar(target: Target) -> crate::CompiledRegex {
+    fn compiled_sidecar_for(pattern: &str, target: Target) -> crate::CompiledRegex {
         let compiled = compile_with_slow_aot_limits(
-            CompileRequest::new(GENERAL_PATTERN, target)
+            CompileRequest::new(pattern, target)
                 .mode(CompileMode::Optimizing)
                 .output(OutputContract::Exists)
                 .limits(fallback_limits()),
@@ -736,6 +801,14 @@ mod tests {
         .expect("compile bit-parallel fallback");
         assert!(compiled.program().bit_parallel_exists_stats().is_some());
         compiled
+    }
+
+    fn compiled_sidecar(target: Target) -> crate::CompiledRegex {
+        compiled_sidecar_for(GENERAL_PATTERN, target)
+    }
+
+    fn compiled_multi_nibble_sidecar(target: Target) -> crate::CompiledRegex {
+        compiled_sidecar_for(MULTI_NIBBLE_PATTERN, target)
     }
 
     fn count_bytes(haystack: &[u8], needle: &[u8]) -> usize {
@@ -859,7 +932,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_w1_has_one_recurrence_load_and_wider_words_do_not_publish() {
+    fn exact_w1_has_one_recurrence_load_and_empty_root_departures_do_not_publish() {
         let compiled = compiled_sidecar(Target::x86_64_linux());
         let view = compiled
             .program()
@@ -899,7 +972,7 @@ mod tests {
             .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
             .unwrap();
         let aarch64 = lower_aarch64_bit_parallel(&layout, asimd).expect("ASIMD W1 leaf");
-        let union_load = aarch64_load_x_lsl3(10, 11, 12).unwrap();
+        let union_load = aarch64_load_x_lsl3(13, 11, 12).unwrap();
         let classifier_load = aarch64_load_w_lsl2(11, 5, 12).unwrap();
         for expected in [union_load, classifier_load] {
             assert_eq!(
@@ -926,7 +999,11 @@ mod tests {
             let view = synthetic_view(consuming_states, &byte_to_class, &masks);
             let layout = build_native_bit_parallel_layout(view).expect("synthetic native layout");
             assert_eq!(layout.source_nibbles, source_nibbles);
-            assert!(layout.root_filter.is_none());
+            assert!(
+                layout
+                    .root_filter
+                    .is_some_and(|filter| filter.ranges().is_empty())
+            );
             assert_eq!(
                 layout.data.len(),
                 CLASSIFIER_BYTES + source_nibbles * NIBBLE_ROW_BYTES
@@ -937,6 +1014,72 @@ mod tests {
                     .is_none()
             );
         }
+    }
+
+    #[test]
+    fn multi_nibble_recurrence_and_root_filter_publish_exactly() {
+        let avx2 = Target::x86_64_linux()
+            .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+            .unwrap();
+        let compiled = compiled_multi_nibble_sidecar(avx2);
+        let view = compiled
+            .program()
+            .native_bit_parallel_exists_view()
+            .expect("multi-nibble native view");
+        assert!(view.stats.consuming_states > NIBBLE_BITS);
+        assert!(view.stats.consuming_states <= 63);
+        assert!(view.stats.source_nibbles > 1);
+        let layout = build_native_bit_parallel_layout(view).expect("multi-nibble native layout");
+        let filter = layout.root_filter.expect("multi-nibble root filter");
+        assert!(!filter.ranges().is_empty());
+        assert!(filter.candidate_bytes <= MAX_ROOT_SKIP_CANDIDATE_BYTES);
+
+        for byte in u8::MIN..=u8::MAX {
+            let class = usize::from(view.byte_to_class[usize::from(byte)]);
+            let class_base = class * view.stats.source_nibbles * NIBBLE_SUBSETS;
+            let mut reached = 0_u64;
+            for nibble in 0..view.stats.source_nibbles {
+                let subset =
+                    usize::try_from((layout.root >> (nibble * NIBBLE_BITS)) & 0x0f).unwrap();
+                reached |= view.transition_masks[class_base + nibble * NIBBLE_SUBSETS + subset];
+            }
+            let expected = reached & (ACCEPT_BIT | (CONSUMING_BITS & !layout.root)) != 0;
+            let admitted = filter
+                .ranges()
+                .iter()
+                .any(|range| range.start <= byte && byte <= range.end);
+            assert_eq!(admitted, expected, "root departure byte {byte:#04x}");
+            if !admitted {
+                assert_eq!(reached & ACCEPT_BIT, 0);
+                assert_eq!((reached & CONSUMING_BITS) | layout.root, layout.root);
+            }
+        }
+
+        let x86 = lower_x86_64_bit_parallel(&layout, avx2).expect("x86 multi-nibble leaf");
+        assert_eq!(x86.emitted_nibbles, view.stats.source_nibbles);
+        assert_eq!(
+            count_bytes(&x86.code, &[0x4a, 0x0b, 0x84, 0xc6]),
+            view.stats.source_nibbles
+        );
+        assert_eq!(x86.relocations.len(), 1);
+
+        let asimd = Target::aarch64_macos()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .unwrap();
+        let aarch64 =
+            lower_aarch64_bit_parallel(&layout, asimd).expect("AArch64 multi-nibble leaf");
+        let union_load = aarch64_load_x_lsl3(13, 11, 12).unwrap();
+        assert_eq!(
+            aarch64
+                .code
+                .chunks_exact(4)
+                .filter(|bytes| u32::from_le_bytes((*bytes).try_into().unwrap()) == union_load)
+                .count(),
+            view.stats.source_nibbles
+        );
+        assert_eq!(aarch64.emitted_nibbles, view.stats.source_nibbles);
+        assert_eq!(aarch64.relocations.len(), 2);
+        assert!(compiled.module().required_runtime_symbol().is_none());
     }
 
     #[test]
@@ -1103,22 +1246,41 @@ mod tests {
         clippy::too_many_lines,
         reason = "the opt-in linker differential keeps object, ABI, and every-window expectations together"
     )]
-    fn run_linked_bit_parallel_differential(target: Target, x86_rosetta: bool) {
+    fn run_linked_bit_parallel_differential(target: Target, x86_rosetta: bool, multi_nibble: bool) {
         use std::{fmt::Write as _, fs, process::Command};
 
-        let compiled = compiled_sidecar(target);
+        let compiled = if multi_nibble {
+            compiled_multi_nibble_sidecar(target)
+        } else {
+            compiled_sidecar(target)
+        };
         assert!(compiled.module().required_runtime_symbol().is_none());
-        let haystacks = [
-            b"".as_slice(),
-            b"z".as_slice(),
-            b"xxabczxx".as_slice(),
-            b"ababababx".as_slice(),
-            b"ccabccz".as_slice(),
-        ];
+        let haystacks = if multi_nibble {
+            [
+                b"".as_slice(),
+                b"z".as_slice(),
+                b"xxabcdefzxx".as_slice(),
+                b"ghijklx".as_slice(),
+                b"abcdefabcdefz".as_slice(),
+            ]
+        } else {
+            [
+                b"".as_slice(),
+                b"z".as_slice(),
+                b"xxabczxx".as_slice(),
+                b"ababababx".as_slice(),
+                b"ccabccz".as_slice(),
+            ]
+        };
         let directory = std::env::temp_dir().join(format!(
             "fre-aot-bit-parallel-exists-{}-{}",
             std::process::id(),
-            if x86_rosetta { "x86" } else { "host" }
+            match (x86_rosetta, multi_nibble) {
+                (true, true) => "x86-multi",
+                (true, false) => "x86-one",
+                (false, true) => "host-multi",
+                (false, false) => "host-one",
+            }
         ));
         fs::create_dir_all(&directory).expect("create linked fixture directory");
         let object = directory.join("bit_parallel.o");
@@ -1241,13 +1403,15 @@ mod tests {
                 .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
                 .unwrap()
         };
-        run_linked_bit_parallel_differential(target, false);
+        run_linked_bit_parallel_differential(target, false, false);
+        run_linked_bit_parallel_differential(target, false, true);
     }
 
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     #[test]
     #[ignore = "cross-links x86-64 and executes it through macOS Rosetta"]
     fn linked_x86_64_bit_parallel_exists_matches_portable_under_rosetta() {
-        run_linked_bit_parallel_differential(Target::x86_64_macos(), true);
+        run_linked_bit_parallel_differential(Target::x86_64_macos(), true, false);
+        run_linked_bit_parallel_differential(Target::x86_64_macos(), true, true);
     }
 }
