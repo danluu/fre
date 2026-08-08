@@ -405,6 +405,9 @@ const fn plan_tag(plan: PlanKind) -> u8 {
         PlanKind::PureByteClassRepeat => 10,
         PlanKind::FixedPredicateWord64 => 11,
         PlanKind::BoundedByteClassSequence => 12,
+        PlanKind::ReverseInner => 13,
+        PlanKind::PrefixClassAlternation => 14,
+        PlanKind::UnicodeScalarRun => 15,
     }
 }
 

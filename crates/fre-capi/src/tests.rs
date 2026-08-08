@@ -19,7 +19,9 @@ use crate::{
     FRE_V1_PLAN_FIXED_PREDICATE_WORD64, FRE_V1_PLAN_FORWARD_ANCHORED, FRE_V1_PLAN_K0,
     FRE_V1_PLAN_LITERAL_CLASS_RUN_LITERAL, FRE_V1_PLAN_LITERAL_SET_DFA,
     FRE_V1_PLAN_PACKED_LITERAL_SET, FRE_V1_PLAN_PURE_BYTE_CLASS_REPEAT,
-    FRE_V1_PLAN_REQUIRED_LITERAL, FRE_V1_PLAN_UNICODE_FOLDED_LITERAL, FRE_V1_PLAN_UNICODE_WORD_RUN,
+    FRE_V1_PLAN_PREFIX_CLASS_ALTERNATION, FRE_V1_PLAN_REQUIRED_LITERAL,
+    FRE_V1_PLAN_REVERSE_INNER, FRE_V1_PLAN_UNICODE_FOLDED_LITERAL,
+    FRE_V1_PLAN_UNICODE_SCALAR_RUN, FRE_V1_PLAN_UNICODE_WORD_RUN,
     FRE_V1_PROFILE_RUST_BYTES, FRE_V1_STATUS_ABI_MISMATCH, FRE_V1_STATUS_COMPILE_ERROR,
     FRE_V1_STATUS_INVALID_ARGUMENT, FRE_V1_STATUS_INVALID_PATTERN_ENCODING,
     FRE_V1_STATUS_NULL_WITH_NONZERO_LENGTH, FRE_V1_STATUS_OK, FRE_V1_STATUS_PANIC,
@@ -94,8 +96,11 @@ fn abi_layouts_offsets_tags_and_features_are_stable() {
             FRE_V1_PLAN_PURE_BYTE_CLASS_REPEAT,
             FRE_V1_PLAN_FIXED_PREDICATE_WORD64,
             FRE_V1_PLAN_BOUNDED_BYTE_CLASS_SEQUENCE,
+            FRE_V1_PLAN_REVERSE_INNER,
+            FRE_V1_PLAN_PREFIX_CLASS_ALTERNATION,
+            FRE_V1_PLAN_UNICODE_SCALAR_RUN,
         ],
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
     );
     assert_eq!(
         FRE_V1_FEATURES,
@@ -119,6 +124,11 @@ fn every_rust_plan_kind_has_the_pinned_public_tag() {
             PlanKind::LiteralClassRunLiteral,
             FRE_V1_PLAN_LITERAL_CLASS_RUN_LITERAL,
         ),
+        (PlanKind::ReverseInner, FRE_V1_PLAN_REVERSE_INNER),
+        (
+            PlanKind::PrefixClassAlternation,
+            FRE_V1_PLAN_PREFIX_CLASS_ALTERNATION,
+        ),
         (
             PlanKind::PureByteClassRepeat,
             FRE_V1_PLAN_PURE_BYTE_CLASS_REPEAT,
@@ -137,6 +147,10 @@ fn every_rust_plan_kind_has_the_pinned_public_tag() {
         (
             PlanKind::FixedPredicateWord64,
             FRE_V1_PLAN_FIXED_PREDICATE_WORD64,
+        ),
+        (
+            PlanKind::UnicodeScalarRun,
+            FRE_V1_PLAN_UNICODE_SCALAR_RUN,
         ),
     ];
     for (plan, expected) in cases {
@@ -336,6 +350,20 @@ fn literal_class_run_has_a_stable_public_plan_tag() {
         FRE_V1_STATUS_OK
     );
     assert_eq!(plan.plan, FRE_V1_PLAN_LITERAL_CLASS_RUN_LITERAL);
+    // SAFETY: transfers the sole live reference from compile.
+    assert_eq!(unsafe { fre_v1_regex_release(regex) }, FRE_V1_STATUS_OK);
+}
+
+#[test]
+fn unicode_scalar_run_has_a_stable_public_plan_tag() {
+    let (regex, _) = compile(br"\p{Greek}{2,6}", FreV1Config::checked_default());
+    let mut plan = FreV1PlanInfo::caller_init();
+    // SAFETY: compile returned one live handle and plan is valid output storage.
+    assert_eq!(
+        unsafe { fre_v1_regex_plan(regex, &raw mut plan, ptr::null_mut()) },
+        FRE_V1_STATUS_OK
+    );
+    assert_eq!(plan.plan, FRE_V1_PLAN_UNICODE_SCALAR_RUN);
     // SAFETY: transfers the sole live reference from compile.
     assert_eq!(unsafe { fre_v1_regex_release(regex) }, FRE_V1_STATUS_OK);
 }
