@@ -13266,49 +13266,56 @@ fn x86_emit_frozen_compact_entry(
     assembler.instruction(&compare_flags)?;
     assembler.branch(&[0x0f, 0x85], try_older)?;
 
-    let mut compare_extent = vec![
-        0x48,
-        0x81,
-        0x7f,
-        header_disp(
-            FROZEN_PREPARED_HEADER_V1_HEADER_BYTES_OFFSET,
-            "x86 V3 header extent offset",
-        )?,
-    ];
-    compare_extent.extend_from_slice(
-        &u32::try_from(format.header_bytes())
-            .map_err(|_| ObjectError::ArithmeticOverflow("x86 compact header extent"))?
-            .to_le_bytes(),
-    );
-    assembler.instruction(&compare_extent)?;
-    branch_failed(assembler)?;
+    // Every live exclusive handle owns the maximum V6 envelope. The active
+    // seal authenticates its immutable setup proof; only the audit path needs
+    // to re-read the smaller format's logical extent and descriptor mirrors.
+    if guard_mode == FrozenCompactGuardMode::FullVerifier {
+        let mut compare_extent = vec![
+            0x48,
+            0x81,
+            0x7f,
+            header_disp(
+                FROZEN_PREPARED_HEADER_V1_HEADER_BYTES_OFFSET,
+                "x86 V3 header extent offset",
+            )?,
+        ];
+        compare_extent.extend_from_slice(
+            &u32::try_from(format.header_bytes())
+                .map_err(|_| ObjectError::ArithmeticOverflow("x86 compact header extent"))?
+                .to_le_bytes(),
+        );
+        assembler.instruction(&compare_extent)?;
+        branch_failed(assembler)?;
+    }
 
     let mut load_seal = vec![0x49, 0xba];
     load_seal.extend_from_slice(&FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL.to_le_bytes());
     assembler.instruction(&load_seal)?;
     assembler.instruction(&[0x4c, 0x3b, 0x17])?;
     branch_failed(assembler)?;
-    let mut load_magic = vec![0x49, 0xba];
-    load_magic.extend_from_slice(&FROZEN_PREPARED_HEADER_V1_MAGIC.to_le_bytes());
-    assembler.instruction(&load_magic)?;
-    assembler.instruction(&[
-        0x4c,
-        0x3b,
-        0x57,
-        header_disp(FROZEN_PREPARED_HEADER_V1_MAGIC_OFFSET, "x86 V3 magic")?,
-    ])?;
-    branch_failed(assembler)?;
-    let mut compare_abi = vec![
-        0x81,
-        0x7f,
-        header_disp(
-            FROZEN_PREPARED_HEADER_V1_ABI_VERSION_OFFSET,
-            "x86 V3 ABI version",
-        )?,
-    ];
-    compare_abi.extend_from_slice(&FROZEN_PREPARED_HEADER_V1_ABI_VERSION.to_le_bytes());
-    assembler.instruction(&compare_abi)?;
-    branch_failed(assembler)?;
+    if guard_mode == FrozenCompactGuardMode::FullVerifier {
+        let mut load_magic = vec![0x49, 0xba];
+        load_magic.extend_from_slice(&FROZEN_PREPARED_HEADER_V1_MAGIC.to_le_bytes());
+        assembler.instruction(&load_magic)?;
+        assembler.instruction(&[
+            0x4c,
+            0x3b,
+            0x57,
+            header_disp(FROZEN_PREPARED_HEADER_V1_MAGIC_OFFSET, "x86 V3 magic")?,
+        ])?;
+        branch_failed(assembler)?;
+        let mut compare_abi = vec![
+            0x81,
+            0x7f,
+            header_disp(
+                FROZEN_PREPARED_HEADER_V1_ABI_VERSION_OFFSET,
+                "x86 V3 ABI version",
+            )?,
+        ];
+        compare_abi.extend_from_slice(&FROZEN_PREPARED_HEADER_V1_ABI_VERSION.to_le_bytes());
+        assembler.instruction(&compare_abi)?;
+        branch_failed(assembler)?;
+    }
 
     // The artifact comparison remains exact over all 256 bits. This scalar
     // form is the correctness baseline for independently measured SIMD gates.
@@ -13372,31 +13379,33 @@ fn x86_emit_frozen_compact_entry(
     tail_address.extend_from_slice(&tail_offset.to_le_bytes());
     assembler.instruction(&tail_address)?;
 
-    let mut load_ready = vec![0x49, 0xba];
-    load_ready.extend_from_slice(&format.ready_seal().to_le_bytes());
-    assembler.instruction(&load_ready)?;
-    assembler.instruction(&[
-        0x4d,
-        0x3b,
-        0x53,
-        tail_disp(
-            format.ready_seal_offset(),
-            "x86 V3 ready seal",
-        )?,
-    ])?;
-    branch_failed(assembler)?;
-    let mut compare_format = vec![
-        0x41,
-        0x81,
-        0x7b,
-        tail_disp(
-            format.format_version_offset(),
-            "x86 V3 format version",
-        )?,
-    ];
-    compare_format.extend_from_slice(&format.format_version().to_le_bytes());
-    assembler.instruction(&compare_format)?;
-    branch_failed(assembler)?;
+    if guard_mode == FrozenCompactGuardMode::FullVerifier {
+        let mut load_ready = vec![0x49, 0xba];
+        load_ready.extend_from_slice(&format.ready_seal().to_le_bytes());
+        assembler.instruction(&load_ready)?;
+        assembler.instruction(&[
+            0x4d,
+            0x3b,
+            0x53,
+            tail_disp(
+                format.ready_seal_offset(),
+                "x86 V3 ready seal",
+            )?,
+        ])?;
+        branch_failed(assembler)?;
+        let mut compare_format = vec![
+            0x41,
+            0x81,
+            0x7b,
+            tail_disp(
+                format.format_version_offset(),
+                "x86 V3 format version",
+            )?,
+        ];
+        compare_format.extend_from_slice(&format.format_version().to_le_bytes());
+        assembler.instruction(&compare_format)?;
+        branch_failed(assembler)?;
+    }
 
     if guard_mode == FrozenCompactGuardMode::FullVerifier {
         // These mirrors, pointer constraints, and the complete geometry below
@@ -13456,19 +13465,19 @@ fn x86_emit_frozen_compact_entry(
         }
     }
 
-    // Cache identity is a semantic generation token rather than row geometry;
-    // retain its nonzero authentication in both modes.
-    assembler.instruction(&[
-        0x4d,
-        0x8b,
-        0x53,
-        tail_disp(
-            format.cache_identity_offset(),
-            "x86 V3 cache identity",
-        )?,
-    ])?;
-    assembler.instruction(&[0x4d, 0x85, 0xd2])?;
-    assembler.branch(&[0x0f, 0x84], call_preflight)?;
+    if guard_mode == FrozenCompactGuardMode::FullVerifier {
+        assembler.instruction(&[
+            0x4d,
+            0x8b,
+            0x53,
+            tail_disp(
+                format.cache_identity_offset(),
+                "x86 V3 cache identity",
+            )?,
+        ])?;
+        assembler.instruction(&[0x4d, 0x85, 0xd2])?;
+        assembler.branch(&[0x0f, 0x84], call_preflight)?;
+    }
 
     if guard_mode == FrozenCompactGuardMode::FullVerifier {
         assembler.instruction(&[
@@ -13762,117 +13771,114 @@ fn x86_emit_frozen_compact_entry(
         }
     }
 
-    // Compact non-loop formats, including V11/V13/V14 supertransitions,
-    // normalize complete immutable rows by suppressing mutable-K0 learned-loop
-    // ownership. Authenticate that normalization exactly: the
-    // scalar loop below still executes every closed DFA row, including rows
-    // that had learned-loop accelerator metadata in the mutable projection.
-    assembler.instruction(&[
-        0x41,
-        0x83,
-        0x7b,
-        tail_disp(format.loop_count_offset(), "x86 V3 loop count")?,
-        0,
-    ])?;
-    branch_failed(assembler)?;
-    for loop_index in 0..NATIVE_ROWS_LOOP_ROW_CAPACITY {
-        let offset = format.loop_states_offset()
-            .checked_add(
-                loop_index
-                    .checked_mul(core::mem::size_of::<u32>())
-                    .ok_or(ObjectError::ArithmeticOverflow("x86 V3 loop state"))?,
-            )
-            .ok_or(ObjectError::ArithmeticOverflow("x86 V3 loop state"))?;
+    if guard_mode == FrozenCompactGuardMode::FullVerifier {
+        // Compact non-loop formats, including V11/V13/V14 supertransitions,
+        // normalize complete immutable rows by suppressing mutable-K0
+        // learned-loop ownership. The full verifier authenticates that
+        // normalization independently of the active capability.
         assembler.instruction(&[
             0x41,
             0x83,
             0x7b,
-            tail_disp(offset, "x86 V3 inactive loop state")?,
-            0xff,
-        ])?;
-        branch_failed(assembler)?;
-    }
-
-    if format == FrozenCompactNativeFormat::UnaryExistsV5 {
-        // The setup proof is immutable behind the active capability. Retain
-        // a cheap independent value check in production too: zero (never)
-        // and every positive one-based step must have its exact complement
-        // and must not exceed the authenticated finite state count.
-        assembler.instruction(&[
-            0x45,
-            0x8b,
-            0x53,
-            tail_disp(
-                FROZEN_DYNAMIC_ROWS_V5_FIRST_ACCEPT_STEP_OFFSET,
-                "x86 V5 first accept step",
-            )?,
-        ])?;
-        assembler.instruction(&[0x44, 0x89, 0xd0])?;
-        assembler.instruction(&[
-            0x41,
-            0x33,
-            0x43,
-            tail_disp(
-                FROZEN_DYNAMIC_ROWS_V5_FIRST_ACCEPT_STEP_COMPLEMENT_OFFSET,
-                "x86 V5 first accept complement",
-            )?,
-        ])?;
-        assembler.instruction(&[0x83, 0xf8, 0xff])?;
-        branch_failed(assembler)?;
-        assembler.instruction(&[
-            0x45,
-            0x3b,
-            0x53,
-            tail_disp(format.state_count_offset(), "x86 V5 state bound")?,
-        ])?;
-        assembler.branch(&[0x0f, 0x87], call_preflight)?;
-    }
-
-    if format.has_loop_plans() {
-        let loop_plan_capacity = u8::try_from(NATIVE_ROWS_LOOP_ROW_CAPACITY)
-            .map_err(|_| ObjectError::ArithmeticOverflow("x86 V6 loop capacity"))?;
-        assembler.instruction(&[
-            0x41,
-            0x83,
-            0x7b,
-            tail_disp(
-                FROZEN_DYNAMIC_ROWS_V6_LOOP_PLAN_COUNT_OFFSET,
-                "x86 V6 loop plan count",
-            )?,
-            1,
-        ])?;
-        assembler.branch(&[0x0f, 0x82], call_preflight)?;
-        assembler.instruction(&[
-            0x41,
-            0x83,
-            0x7b,
-            tail_disp(
-                FROZEN_DYNAMIC_ROWS_V6_LOOP_PLAN_COUNT_OFFSET,
-                "x86 V6 loop plan count",
-            )?,
-            loop_plan_capacity,
-        ])?;
-        assembler.branch(&[0x0f, 0x87], call_preflight)?;
-        assembler.instruction(&[
-            0x41,
-            0x83,
-            0x7b,
-            tail_disp(FROZEN_DYNAMIC_ROWS_V6_RESERVED_OFFSET, "x86 V6 reserved")?,
+            tail_disp(format.loop_count_offset(), "x86 V3 loop count")?,
             0,
         ])?;
         branch_failed(assembler)?;
-        for (field, context) in [
-            (
-                FROZEN_DYNAMIC_ROWS_V6_LOOP_INDEX_ADDRESS_OFFSET,
-                "x86 V6 loop index address",
-            ),
-            (
-                FROZEN_DYNAMIC_ROWS_V6_LOOP_INDEX_LENGTH_OFFSET,
-                "x86 V6 loop index length",
-            ),
-        ] {
-            assembler.instruction(&[0x49, 0x83, 0x7b, tail_disp(field, context)?, 0])?;
-            assembler.branch(&[0x0f, 0x84], call_preflight)?;
+        for loop_index in 0..NATIVE_ROWS_LOOP_ROW_CAPACITY {
+            let offset = format.loop_states_offset()
+                .checked_add(
+                    loop_index
+                        .checked_mul(core::mem::size_of::<u32>())
+                        .ok_or(ObjectError::ArithmeticOverflow("x86 V3 loop state"))?,
+                )
+                .ok_or(ObjectError::ArithmeticOverflow("x86 V3 loop state"))?;
+            assembler.instruction(&[
+                0x41,
+                0x83,
+                0x7b,
+                tail_disp(offset, "x86 V3 inactive loop state")?,
+                0xff,
+            ])?;
+            branch_failed(assembler)?;
+        }
+
+        if format == FrozenCompactNativeFormat::UnaryExistsV5 {
+            assembler.instruction(&[
+                0x45,
+                0x8b,
+                0x53,
+                tail_disp(
+                    FROZEN_DYNAMIC_ROWS_V5_FIRST_ACCEPT_STEP_OFFSET,
+                    "x86 V5 first accept step",
+                )?,
+            ])?;
+            assembler.instruction(&[0x44, 0x89, 0xd0])?;
+            assembler.instruction(&[
+                0x41,
+                0x33,
+                0x43,
+                tail_disp(
+                    FROZEN_DYNAMIC_ROWS_V5_FIRST_ACCEPT_STEP_COMPLEMENT_OFFSET,
+                    "x86 V5 first accept complement",
+                )?,
+            ])?;
+            assembler.instruction(&[0x83, 0xf8, 0xff])?;
+            branch_failed(assembler)?;
+            assembler.instruction(&[
+                0x45,
+                0x3b,
+                0x53,
+                tail_disp(format.state_count_offset(), "x86 V5 state bound")?,
+            ])?;
+            assembler.branch(&[0x0f, 0x87], call_preflight)?;
+        }
+
+        if format.has_loop_plans() {
+            let loop_plan_capacity = u8::try_from(NATIVE_ROWS_LOOP_ROW_CAPACITY)
+                .map_err(|_| ObjectError::ArithmeticOverflow("x86 V6 loop capacity"))?;
+            assembler.instruction(&[
+                0x41,
+                0x83,
+                0x7b,
+                tail_disp(
+                    FROZEN_DYNAMIC_ROWS_V6_LOOP_PLAN_COUNT_OFFSET,
+                    "x86 V6 loop plan count",
+                )?,
+                1,
+            ])?;
+            assembler.branch(&[0x0f, 0x82], call_preflight)?;
+            assembler.instruction(&[
+                0x41,
+                0x83,
+                0x7b,
+                tail_disp(
+                    FROZEN_DYNAMIC_ROWS_V6_LOOP_PLAN_COUNT_OFFSET,
+                    "x86 V6 loop plan count",
+                )?,
+                loop_plan_capacity,
+            ])?;
+            assembler.branch(&[0x0f, 0x87], call_preflight)?;
+            assembler.instruction(&[
+                0x41,
+                0x83,
+                0x7b,
+                tail_disp(FROZEN_DYNAMIC_ROWS_V6_RESERVED_OFFSET, "x86 V6 reserved")?,
+                0,
+            ])?;
+            branch_failed(assembler)?;
+            for (field, context) in [
+                (
+                    FROZEN_DYNAMIC_ROWS_V6_LOOP_INDEX_ADDRESS_OFFSET,
+                    "x86 V6 loop index address",
+                ),
+                (
+                    FROZEN_DYNAMIC_ROWS_V6_LOOP_INDEX_LENGTH_OFFSET,
+                    "x86 V6 loop index length",
+                ),
+            ] {
+                assembler.instruction(&[0x49, 0x83, 0x7b, tail_disp(field, context)?, 0])?;
+                assembler.branch(&[0x0f, 0x84], call_preflight)?;
+            }
         }
     }
 
@@ -23545,52 +23551,62 @@ fn aarch64_emit_frozen_compact_entry(
     assembler.instruction(aarch64_cmp_w(8, 9)?)?;
     assembler.branch_cond(AARCH64_NE, try_older)?;
 
-    assembler.instruction(aarch64_load_x_imm(
-        8,
-        0,
-        offset(
-            FROZEN_PREPARED_HEADER_V1_HEADER_BYTES_OFFSET,
-            "AArch64 V3 header extent offset",
-        )?,
-    )?)?;
-    aarch64_load_u64_constant(
-        assembler,
-        9,
-        u64::try_from(format.header_bytes())
-            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 compact header extent"))?,
-    )?;
-    assembler.instruction(aarch64_cmp_x(8, 9)?)?;
-    assembler.branch_cond(AARCH64_NE, call_preflight)?;
-
-    for (field, expected, context) in [
-        (
-            FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL_OFFSET,
-            FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL,
-            "AArch64 V3 active seal",
-        ),
-        (
-            FROZEN_PREPARED_HEADER_V1_MAGIC_OFFSET,
-            FROZEN_PREPARED_HEADER_V1_MAGIC,
-            "AArch64 V3 magic",
-        ),
-    ] {
-        assembler.instruction(aarch64_load_x_imm(8, 0, offset(field, context)?)?)?;
-        aarch64_load_u64_constant(assembler, 9, expected)?;
+    // Every live exclusive handle owns the maximum V6 envelope. The active
+    // seal authenticates its immutable setup proof; only the audit path needs
+    // to re-read the smaller format's logical extent and descriptor mirrors.
+    if guard_mode == FrozenCompactGuardMode::FullVerifier {
+        assembler.instruction(aarch64_load_x_imm(
+            8,
+            0,
+            offset(
+                FROZEN_PREPARED_HEADER_V1_HEADER_BYTES_OFFSET,
+                "AArch64 V3 header extent offset",
+            )?,
+        )?)?;
+        aarch64_load_u64_constant(
+            assembler,
+            9,
+            u64::try_from(format.header_bytes())
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 compact header extent"))?,
+        )?;
         assembler.instruction(aarch64_cmp_x(8, 9)?)?;
         assembler.branch_cond(AARCH64_NE, call_preflight)?;
     }
 
-    assembler.instruction(aarch64_load_w_imm(
+    assembler.instruction(aarch64_load_x_imm(
         8,
         0,
         offset(
-            FROZEN_PREPARED_HEADER_V1_ABI_VERSION_OFFSET,
-            "AArch64 V3 ABI version",
+            FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL_OFFSET,
+            "AArch64 V3 active seal",
         )?,
     )?)?;
-    aarch64_load_u32_constant(assembler, 9, FROZEN_PREPARED_HEADER_V1_ABI_VERSION)?;
-    assembler.instruction(aarch64_cmp_w(8, 9)?)?;
+    aarch64_load_u64_constant(assembler, 9, FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL)?;
+    assembler.instruction(aarch64_cmp_x(8, 9)?)?;
     assembler.branch_cond(AARCH64_NE, call_preflight)?;
+
+    if guard_mode == FrozenCompactGuardMode::FullVerifier {
+        assembler.instruction(aarch64_load_x_imm(
+            8,
+            0,
+            offset(FROZEN_PREPARED_HEADER_V1_MAGIC_OFFSET, "AArch64 V3 magic")?,
+        )?)?;
+        aarch64_load_u64_constant(assembler, 9, FROZEN_PREPARED_HEADER_V1_MAGIC)?;
+        assembler.instruction(aarch64_cmp_x(8, 9)?)?;
+        assembler.branch_cond(AARCH64_NE, call_preflight)?;
+
+        assembler.instruction(aarch64_load_w_imm(
+            8,
+            0,
+            offset(
+                FROZEN_PREPARED_HEADER_V1_ABI_VERSION_OFFSET,
+                "AArch64 V3 ABI version",
+            )?,
+        )?)?;
+        aarch64_load_u32_constant(assembler, 9, FROZEN_PREPARED_HEADER_V1_ABI_VERSION)?;
+        assembler.instruction(aarch64_cmp_w(8, 9)?)?;
+        assembler.branch_cond(AARCH64_NE, call_preflight)?;
+    }
 
     // Compare all four u64 words; the linked identity address in X6 is not
     // repurposed until the exact 256-bit comparison is complete.
@@ -23653,28 +23669,30 @@ fn aarch64_emit_frozen_compact_entry(
             "AArch64 compact tail offset",
         )?,
     )?)?;
-    assembler.instruction(aarch64_load_x_imm(
-        8,
-        13,
-        offset(
-            format.ready_seal_offset(),
-            "AArch64 V3 ready seal",
-        )?,
-    )?)?;
-    aarch64_load_u64_constant(assembler, 9, format.ready_seal())?;
-    assembler.instruction(aarch64_cmp_x(8, 9)?)?;
-    assembler.branch_cond(AARCH64_NE, call_preflight)?;
-    assembler.instruction(aarch64_load_w_imm(
-        8,
-        13,
-        offset(
-            format.format_version_offset(),
-            "AArch64 V3 format version",
-        )?,
-    )?)?;
-    aarch64_load_u32_constant(assembler, 9, format.format_version())?;
-    assembler.instruction(aarch64_cmp_w(8, 9)?)?;
-    assembler.branch_cond(AARCH64_NE, call_preflight)?;
+    if guard_mode == FrozenCompactGuardMode::FullVerifier {
+        assembler.instruction(aarch64_load_x_imm(
+            8,
+            13,
+            offset(
+                format.ready_seal_offset(),
+                "AArch64 V3 ready seal",
+            )?,
+        )?)?;
+        aarch64_load_u64_constant(assembler, 9, format.ready_seal())?;
+        assembler.instruction(aarch64_cmp_x(8, 9)?)?;
+        assembler.branch_cond(AARCH64_NE, call_preflight)?;
+        assembler.instruction(aarch64_load_w_imm(
+            8,
+            13,
+            offset(
+                format.format_version_offset(),
+                "AArch64 V3 format version",
+            )?,
+        )?)?;
+        aarch64_load_u32_constant(assembler, 9, format.format_version())?;
+        assembler.instruction(aarch64_cmp_w(8, 9)?)?;
+        assembler.branch_cond(AARCH64_NE, call_preflight)?;
+    }
 
     if guard_mode == FrozenCompactGuardMode::FullVerifier {
         // The active capability covers these setup-validated immutable
@@ -23731,18 +23749,18 @@ fn aarch64_emit_frozen_compact_entry(
         }
     }
 
-    // The cache identity is a semantic generation token, not row geometry.
-    // Keep its nonzero authentication in both guard modes.
-    assembler.instruction(aarch64_load_x_imm(
-        8,
-        13,
-        offset(
-            format.cache_identity_offset(),
-            "AArch64 V3 cache identity",
-        )?,
-    )?)?;
-    assembler.instruction(aarch64_cmp_x_imm(8, 0)?)?;
-    assembler.branch_cond(AARCH64_EQ, call_preflight)?;
+    if guard_mode == FrozenCompactGuardMode::FullVerifier {
+        assembler.instruction(aarch64_load_x_imm(
+            8,
+            13,
+            offset(
+                format.cache_identity_offset(),
+                "AArch64 V3 cache identity",
+            )?,
+        )?)?;
+        assembler.instruction(aarch64_cmp_x_imm(8, 0)?)?;
+        assembler.branch_cond(AARCH64_EQ, call_preflight)?;
+    }
 
     if guard_mode == FrozenCompactGuardMode::FullVerifier {
         assembler.instruction(aarch64_load_w_imm(
@@ -23994,99 +24012,100 @@ fn aarch64_emit_frozen_compact_entry(
         }
     }
 
-    // The compact V3/V4/V8/V9/V10/V11/V12/V13/V14 owner normalizes complete
-    // immutable rows by suppressing mutable learned-loop ownership. Exact
-    // zero/MAX metadata proves that this direct loop may scalar-step all
-    // closed states without racing an overlay.
-    assembler.instruction(aarch64_load_w_imm(
-        7,
-        13,
-        offset(format.loop_count_offset(), "AArch64 V3 loop count")?,
-    )?)?;
-    assembler.branch_nonzero_w(7, call_preflight)?;
-    aarch64_load_u32_constant(assembler, 8, u32::MAX)?;
-    for loop_index in 0..NATIVE_ROWS_LOOP_ROW_CAPACITY {
-        let loop_offset = format.loop_states_offset()
-            .checked_add(
-                loop_index
-                    .checked_mul(core::mem::size_of::<u32>())
-                    .ok_or(ObjectError::ArithmeticOverflow("AArch64 V3 loop state"))?,
-            )
-            .ok_or(ObjectError::ArithmeticOverflow("AArch64 V3 loop state"))?;
+    if guard_mode == FrozenCompactGuardMode::FullVerifier {
+        // Compact non-loop formats normalize complete immutable rows by
+        // suppressing mutable learned-loop ownership. The full verifier
+        // authenticates that normalization independently of the capability.
         assembler.instruction(aarch64_load_w_imm(
             7,
             13,
-            offset(loop_offset, "AArch64 V3 inactive loop state")?,
+            offset(format.loop_count_offset(), "AArch64 V3 loop count")?,
         )?)?;
-        assembler.instruction(aarch64_cmp_w(7, 8)?)?;
-        assembler.branch_cond(AARCH64_NE, call_preflight)?;
-    }
+        assembler.branch_nonzero_w(7, call_preflight)?;
+        aarch64_load_u32_constant(assembler, 8, u32::MAX)?;
+        for loop_index in 0..NATIVE_ROWS_LOOP_ROW_CAPACITY {
+            let loop_offset = format.loop_states_offset()
+                .checked_add(
+                    loop_index
+                        .checked_mul(core::mem::size_of::<u32>())
+                        .ok_or(ObjectError::ArithmeticOverflow("AArch64 V3 loop state"))?,
+                )
+                .ok_or(ObjectError::ArithmeticOverflow("AArch64 V3 loop state"))?;
+            assembler.instruction(aarch64_load_w_imm(
+                7,
+                13,
+                offset(loop_offset, "AArch64 V3 inactive loop state")?,
+            )?)?;
+            assembler.instruction(aarch64_cmp_w(7, 8)?)?;
+            assembler.branch_cond(AARCH64_NE, call_preflight)?;
+        }
 
-    if format == FrozenCompactNativeFormat::UnaryExistsV5 {
-        assembler.instruction(aarch64_load_w_imm(
-            7,
-            13,
-            offset(
-                FROZEN_DYNAMIC_ROWS_V5_FIRST_ACCEPT_STEP_OFFSET,
-                "AArch64 V5 first accept step",
-            )?,
-        )?)?;
-        assembler.instruction(aarch64_load_w_imm(
-            8,
-            13,
-            offset(
-                FROZEN_DYNAMIC_ROWS_V5_FIRST_ACCEPT_STEP_COMPLEMENT_OFFSET,
-                "AArch64 V5 first accept complement",
-            )?,
-        )?)?;
-        assembler.instruction(aarch64_eor_w(8, 8, 7)?)?;
-        aarch64_load_u32_constant(assembler, 9, u32::MAX)?;
-        assembler.instruction(aarch64_cmp_w(8, 9)?)?;
-        assembler.branch_cond(AARCH64_NE, call_preflight)?;
-        assembler.instruction(aarch64_load_w_imm(
-            8,
-            13,
-            offset(format.state_count_offset(), "AArch64 V5 state bound")?,
-        )?)?;
-        assembler.instruction(aarch64_cmp_w(7, 8)?)?;
-        assembler.branch_cond(AARCH64_HI, call_preflight)?;
-    }
+        if format == FrozenCompactNativeFormat::UnaryExistsV5 {
+            assembler.instruction(aarch64_load_w_imm(
+                7,
+                13,
+                offset(
+                    FROZEN_DYNAMIC_ROWS_V5_FIRST_ACCEPT_STEP_OFFSET,
+                    "AArch64 V5 first accept step",
+                )?,
+            )?)?;
+            assembler.instruction(aarch64_load_w_imm(
+                8,
+                13,
+                offset(
+                    FROZEN_DYNAMIC_ROWS_V5_FIRST_ACCEPT_STEP_COMPLEMENT_OFFSET,
+                    "AArch64 V5 first accept complement",
+                )?,
+            )?)?;
+            assembler.instruction(aarch64_eor_w(8, 8, 7)?)?;
+            aarch64_load_u32_constant(assembler, 9, u32::MAX)?;
+            assembler.instruction(aarch64_cmp_w(8, 9)?)?;
+            assembler.branch_cond(AARCH64_NE, call_preflight)?;
+            assembler.instruction(aarch64_load_w_imm(
+                8,
+                13,
+                offset(format.state_count_offset(), "AArch64 V5 state bound")?,
+            )?)?;
+            assembler.instruction(aarch64_cmp_w(7, 8)?)?;
+            assembler.branch_cond(AARCH64_HI, call_preflight)?;
+        }
 
-    if format.has_loop_plans() {
-        assembler.instruction(aarch64_load_w_imm(
-            7,
-            13,
-            offset(
-                FROZEN_DYNAMIC_ROWS_V6_LOOP_PLAN_COUNT_OFFSET,
-                "AArch64 V6 loop plan count",
-            )?,
-        )?)?;
-        assembler.branch_zero_w(7, call_preflight)?;
-        assembler.instruction(aarch64_cmp_w_imm(
-            7,
-            u16::try_from(NATIVE_ROWS_LOOP_ROW_CAPACITY)
-                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 V6 loop capacity"))?,
-        )?)?;
-        assembler.branch_cond(AARCH64_HI, call_preflight)?;
-        assembler.instruction(aarch64_load_w_imm(
-            8,
-            13,
-            offset(FROZEN_DYNAMIC_ROWS_V6_RESERVED_OFFSET, "AArch64 V6 reserved")?,
-        )?)?;
-        assembler.branch_nonzero_w(8, call_preflight)?;
-        for (field, context) in [
-            (
-                FROZEN_DYNAMIC_ROWS_V6_LOOP_INDEX_ADDRESS_OFFSET,
-                "AArch64 V6 loop index address",
-            ),
-            (
-                FROZEN_DYNAMIC_ROWS_V6_LOOP_INDEX_LENGTH_OFFSET,
-                "AArch64 V6 loop index length",
-            ),
-        ] {
-            assembler.instruction(aarch64_load_x_imm(8, 13, offset(field, context)?)?)?;
-            assembler.instruction(aarch64_cmp_x_imm(8, 0)?)?;
-            assembler.branch_cond(AARCH64_EQ, call_preflight)?;
+        if format.has_loop_plans() {
+            assembler.instruction(aarch64_load_w_imm(
+                7,
+                13,
+                offset(
+                    FROZEN_DYNAMIC_ROWS_V6_LOOP_PLAN_COUNT_OFFSET,
+                    "AArch64 V6 loop plan count",
+                )?,
+            )?)?;
+            assembler.branch_zero_w(7, call_preflight)?;
+            assembler.instruction(aarch64_cmp_w_imm(
+                7,
+                u16::try_from(NATIVE_ROWS_LOOP_ROW_CAPACITY)
+                    .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 V6 loop capacity"))?,
+            )?)?;
+            assembler.branch_cond(AARCH64_HI, call_preflight)?;
+            assembler.instruction(aarch64_load_w_imm(
+                8,
+                13,
+                offset(FROZEN_DYNAMIC_ROWS_V6_RESERVED_OFFSET, "AArch64 V6 reserved")?,
+            )?)?;
+            assembler.branch_nonzero_w(8, call_preflight)?;
+            for (field, context) in [
+                (
+                    FROZEN_DYNAMIC_ROWS_V6_LOOP_INDEX_ADDRESS_OFFSET,
+                    "AArch64 V6 loop index address",
+                ),
+                (
+                    FROZEN_DYNAMIC_ROWS_V6_LOOP_INDEX_LENGTH_OFFSET,
+                    "AArch64 V6 loop index length",
+                ),
+            ] {
+                assembler.instruction(aarch64_load_x_imm(8, 13, offset(field, context)?)?)?;
+                assembler.instruction(aarch64_cmp_x_imm(8, 0)?)?;
+                assembler.branch_cond(AARCH64_EQ, call_preflight)?;
+            }
         }
     }
 
@@ -32170,6 +32189,9 @@ mod tests {
         )
         .expect("write trusted-loop object");
 
+        // Exercise the V6/V7 capability while live, revoke it through the
+        // ordinary runtime, then re-enter generated code through its
+        // inactive-capability side exit.
         let source = format!(
             "#include <stddef.h>\n#include <stdint.h>\n#include <string.h>\n\
              typedef void *handle_t;typedef struct{{size_t start;size_t end;}} result_t;\n\
@@ -32188,10 +32210,14 @@ mod tests {
                uint32_t bs=fre_aot_regex_runtime_search_exclusive_v1(baseline,p,sizeof(matching),s,e,&br);\
                if(ns!=bs||nr.start!=br.start||nr.end!=br.end)return base+1;\
                nr.start=95U;nr.end=96U;br.start=97U;br.end=98U;\
-               ns={entry}(native,p,sizeof(matching),s,e,&nr);\
+               ns=fre_aot_regex_runtime_search_exclusive_v1(native,p,sizeof(matching),s,e,&nr);\
                bs=fre_aot_regex_runtime_search_exclusive_v1(baseline,p,sizeof(matching),s,e,&br);\
                if(ns!=bs||nr.start!=br.start||nr.end!=br.end)return base+2;\
-               if(!destroy(native)||!destroy(baseline))return base+3;return 0;}}\n\
+               nr.start=99U;nr.end=100U;br.start=101U;br.end=102U;\
+               ns={entry}(native,p,sizeof(matching),s,e,&nr);\
+               bs=fre_aot_regex_runtime_search_exclusive_v1(baseline,p,sizeof(matching),s,e,&br);\
+               if(ns!=bs||nr.start!=br.start||nr.end!=br.end)return base+3;\
+               if(!destroy(native)||!destroy(baseline))return base+4;return 0;}}\n\
              int main(void){{memset(matching,'a',sizeof(matching));memset(absent,'a',sizeof(absent));\
                matching[sizeof(matching)-1U]='Q';absent[sizeof(absent)-1U]='R';\
                int status=compare(matching,0U,sizeof(matching),10);if(status)return status;\
@@ -37942,12 +37968,15 @@ static int run_case(const unsigned char *p,size_t n,size_t s,size_t e,uint32_t e
         )
         .expect("write unary V5 object");
 
+        // Execute V5 while live, revoke the owner through the ordinary
+        // runtime, then exercise the generated inactive-capability exit.
         let source = format!(
             "#include <stddef.h>\n#include <stdint.h>\n#include <string.h>\n\
              typedef void *handle_t;typedef struct{{size_t start;size_t end;}} result_t;\n\
              extern const unsigned char {program_symbol}[];\n\
              extern uint32_t {entry}(handle_t,const unsigned char*,size_t,size_t,size_t,result_t*);\n\
              extern uint32_t fre_aot_regex_runtime_prepare_exclusive_v1(const unsigned char*,size_t,handle_t*);\n\
+             extern uint32_t fre_aot_regex_runtime_search_exclusive_v1(handle_t,const unsigned char*,size_t,size_t,size_t,result_t*);\n\
              extern uint32_t fre_aot_regex_runtime_destroy_exclusive_v1(handle_t);\n\
              #define ACTIVE_OFFSET {active_offset}U\n\
              #define FLAGS_OFFSET {flags_offset}U\n\
@@ -37994,7 +38023,15 @@ static int run_case(const unsigned char *p,size_t n,size_t s,size_t e,uint32_t e
                uint32_t status={entry}(h,haystack,sizeof(haystack),7U,7U+width,&result);\
                if(status!=expected||result.start!=0U||result.end!=0U){{fre_aot_regex_runtime_destroy_exclusive_v1(h);return base+2;}}\
                if(!owns_v5(h)){{fre_aot_regex_runtime_destroy_exclusive_v1(h);return base+3;}}\
-               return fre_aot_regex_runtime_destroy_exclusive_v1(h)==0U?0:base+4;}}\n\
+               result.start=93U;result.end=94U;\
+               status=fre_aot_regex_runtime_search_exclusive_v1(h,haystack,sizeof(haystack),7U,7U+width,&result);\
+               if(status!=expected||result.start!=0U||result.end!=0U){{fre_aot_regex_runtime_destroy_exclusive_v1(h);return base+4;}}\
+               if(read_u64(h,ACTIVE_OFFSET)==ACTIVE_SEAL){{fre_aot_regex_runtime_destroy_exclusive_v1(h);return base+5;}}\
+               result.start=95U;result.end=96U;\
+               status={entry}(h,haystack,sizeof(haystack),7U,7U+width,&result);\
+               if(status!=expected||result.start!=0U||result.end!=0U){{fre_aot_regex_runtime_destroy_exclusive_v1(h);return base+6;}}\
+               if(read_u64(h,ACTIVE_OFFSET)==ACTIVE_SEAL){{fre_aot_regex_runtime_destroy_exclusive_v1(h);return base+7;}}\
+               return fre_aot_regex_runtime_destroy_exclusive_v1(h)==0U?0:base+8;}}\n\
              int main(void){{memset(haystack,0xa5,sizeof(haystack));int s;\
                s=run_case(32U,0U,10);if(s)return s;\
                s=run_case(39U,0U,20);if(s)return s;\
@@ -38263,6 +38300,9 @@ static int run_case(const unsigned char *p,size_t n,size_t s,size_t e,uint32_t e
                 .unwrap_or_else(|error| panic!("emit {label}/{output:?}: {error}"));
                 fs::write(&object, object_bytes).expect("write compact-u8 object");
 
+                // Each real V10/V12 owner must stay active after native use,
+                // remain revoked after an ordinary runtime call, and route a
+                // later generated call through the inactive-capability exit.
                 let mut source = String::from(
                     "#include <stddef.h>\n#include <stdint.h>\n#include <string.h>\n\
                      typedef void *handle_t;typedef struct{size_t start;size_t end;} result_t;\n",
@@ -38374,7 +38414,16 @@ static int run_case(const unsigned char*p,size_t n,size_t s,size_t e,uint32_t xs
   if(ns!=bs||nr.start!=br.start||nr.end!=br.end){destroy(native);destroy(baseline);return base+2;}
   if(ns!=xs||nr.start!=xb||nr.end!=xe){destroy(native);destroy(baseline);return base+3;}
   if(!owns_expected_u8(native)){destroy(native);destroy(baseline);return base+4;}
-  if(!destroy(native)||!destroy(baseline))return base+5;return 0;
+  nr.start=95U;nr.end=96U;br.start=97U;br.end=98U;
+  ns=fre_aot_regex_runtime_search_exclusive_v1(native,p,n,s,e,&nr);
+  bs=fre_aot_regex_runtime_search_exclusive_v1(baseline,p,n,s,e,&br);
+  if(ns!=bs||nr.start!=br.start||nr.end!=br.end){destroy(native);destroy(baseline);return base+5;}
+  nr.start=99U;nr.end=100U;br.start=101U;br.end=102U;
+  ns=NATIVE_ENTRY(native,p,n,s,e,&nr);
+  bs=fre_aot_regex_runtime_search_exclusive_v1(baseline,p,n,s,e,&br);
+  if(ns!=bs||nr.start!=br.start||nr.end!=br.end){destroy(native);destroy(baseline);return base+6;}
+  if(read_u64(native,ACTIVE_OFFSET)==ACTIVE_SEAL){destroy(native);destroy(baseline);return base+7;}
+  if(!destroy(native)||!destroy(baseline))return base+8;return 0;
 }
 "#,
                 );
@@ -45367,8 +45416,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             )
             .unwrap();
             assert_eq!(occurrences(&x86.code, &x86_flag), 1, "{context}");
-            assert_eq!(occurrences(&x86.code, &x86_version), 1, "{context}");
-            assert_eq!(occurrences(&x86.code, &x86_ready), 1, "{context}");
+            assert_eq!(occurrences(&x86.code, &x86_version), 0, "{context}");
+            assert_eq!(occurrences(&x86.code, &x86_ready), 0, "{context}");
             assert!(
                 occurrences(&x86.code, &[0x47, 0x8d, 0x14, 0x53]) >= 6,
                 "C=2 fused Horner LEAs: {context}"
@@ -45433,7 +45482,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 1,
                 "{context}"
             );
-            assert_eq!(occurrences(&arm.code, &arm_ready), 1, "{context}");
+            assert_eq!(occurrences(&arm.code, &arm_ready), 0, "{context}");
             assert!(
                 arm_words
                     .iter()
@@ -45736,8 +45785,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             )
             .unwrap();
             assert_eq!(occurrences(&x86.code, &x86_flag), 1, "{context}");
-            assert_eq!(occurrences(&x86.code, &x86_version), 1, "{context}");
-            assert_eq!(occurrences(&x86.code, &x86_ready), 1, "{context}");
+            assert_eq!(occurrences(&x86.code, &x86_version), 0, "{context}");
+            assert_eq!(occurrences(&x86.code, &x86_ready), 0, "{context}");
             assert!(
                 occurrences(&x86.code, &[0x47, 0x0f, 0xb7, 0x14, 0x50]) >= 1,
                 "V13 must use one indexed u16 pair load: {context}"
@@ -45773,7 +45822,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 1,
                 "{context}"
             );
-            assert_eq!(occurrences(&arm.code, &arm_ready), 1, "{context}");
+            assert_eq!(occurrences(&arm.code, &arm_ready), 0, "{context}");
             assert_eq!(
                 arm_words
                     .iter()
@@ -46274,6 +46323,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             x86_v4_capability.bind(label).unwrap();
             x86_v4_capability.instruction(&[0xc3]).unwrap();
         }
+        let x86_v4_capability_instruction_count =
+            x86_v4_capability.instruction_offsets.len();
         let x86_v4_capability = x86_v4_capability.finish().unwrap();
         let mut v4_flag = vec![
             0x81,
@@ -46286,7 +46337,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
         let mut v4_ready_seal = vec![0x49, 0xba];
         v4_ready_seal.extend_from_slice(&FROZEN_PREPARED_HEADER_V4_READY_SEAL.to_le_bytes());
         assert_eq!(occurrences(&x86_v4_auth, &v4_ready_seal), 1);
-        assert_eq!(occurrences(&x86_v4_capability, &v4_ready_seal), 1);
+        assert_eq!(occurrences(&x86_v4_capability, &v4_ready_seal), 0);
         assert_eq!(
             occurrences(
                 &x86_v4_auth,
@@ -46352,6 +46403,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             x86_capability.bind(label).unwrap();
             x86_capability.instruction(&[0xc3]).unwrap();
         }
+        let x86_capability_instruction_count = x86_capability.instruction_offsets.len();
         let x86_capability = x86_capability.finish().unwrap();
 
         let canonical_descriptor_initial = [
@@ -46400,15 +46452,64 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 .to_le_bytes(),
         );
         assert_eq!(occurrences(&x86_auth, &v3_extent), 1);
-        assert_eq!(occurrences(&x86_capability, &v3_extent), 1);
+        assert_eq!(occurrences(&x86_capability, &v3_extent), 0);
         let mut active_seal = vec![0x49, 0xba];
         active_seal.extend_from_slice(&FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL.to_le_bytes());
         assert_eq!(occurrences(&x86_auth, &active_seal), 1);
         assert_eq!(occurrences(&x86_capability, &active_seal), 1);
+        let mut header_magic = vec![0x49, 0xba];
+        header_magic.extend_from_slice(&FROZEN_PREPARED_HEADER_V1_MAGIC.to_le_bytes());
+        assert_eq!(occurrences(&x86_auth, &header_magic), 1);
+        assert_eq!(occurrences(&x86_capability, &header_magic), 0);
+        let mut header_abi = vec![
+            0x81,
+            0x7f,
+            u8::try_from(FROZEN_PREPARED_HEADER_V1_ABI_VERSION_OFFSET).unwrap(),
+        ];
+        header_abi.extend_from_slice(&FROZEN_PREPARED_HEADER_V1_ABI_VERSION.to_le_bytes());
+        assert_eq!(occurrences(&x86_auth, &header_abi), 1);
+        assert_eq!(occurrences(&x86_capability, &header_abi), 0);
         let mut ready_seal = vec![0x49, 0xba];
         ready_seal.extend_from_slice(&FROZEN_PREPARED_HEADER_V3_READY_SEAL.to_le_bytes());
         assert_eq!(occurrences(&x86_auth, &ready_seal), 1);
-        assert_eq!(occurrences(&x86_capability, &ready_seal), 1);
+        assert_eq!(occurrences(&x86_capability, &ready_seal), 0);
+        let mut format_version = vec![
+            0x41,
+            0x81,
+            0x7b,
+            u8::try_from(FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION_OFFSET).unwrap(),
+        ];
+        format_version.extend_from_slice(&FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION.to_le_bytes());
+        assert_eq!(occurrences(&x86_auth, &format_version), 1);
+        assert_eq!(occurrences(&x86_capability, &format_version), 0);
+        let cache_nonzero = [
+            0x4d,
+            0x8b,
+            0x53,
+            u8::try_from(FROZEN_DYNAMIC_ROWS_V3_CACHE_IDENTITY_OFFSET).unwrap(),
+            0x4d,
+            0x85,
+            0xd2,
+        ];
+        assert_eq!(occurrences(&x86_auth, &cache_nonzero), 1);
+        assert_eq!(occurrences(&x86_capability, &cache_nonzero), 0);
+        let tail_address = {
+            let mut bytes = vec![0x4c, 0x8d, 0x9f];
+            bytes.extend_from_slice(
+                &i32::try_from(FROZEN_PREPARED_HEADER_V3_DYNAMIC_ROWS_OFFSET)
+                    .unwrap()
+                    .to_le_bytes(),
+            );
+            bytes
+        };
+        assert_eq!(occurrences(&x86_auth, &tail_address), 1);
+        assert_eq!(occurrences(&x86_capability, &tail_address), 1);
+        let retained_window = [
+            0x4c, 0x8b, 0x54, 0x24, 0x28, 0x4c, 0x89, 0x54, 0x24, 0x40, 0x4c, 0x8b, 0x54,
+            0x24, 0x30, 0x4c, 0x89, 0x54, 0x24, 0x48,
+        ];
+        assert_eq!(occurrences(&x86_auth, &retained_window), 1);
+        assert_eq!(occurrences(&x86_capability, &retained_window), 1);
         for identity_word in 0_usize..4 {
             let byte_offset = u8::try_from(identity_word * core::mem::size_of::<u64>()).unwrap();
             let linked_load = if byte_offset == 0 {
@@ -46459,15 +46560,21 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
         assert_eq!(occurrences(&x86_auth, &x86_loop_normalization), 1);
         assert_eq!(
             occurrences(&x86_capability, &x86_loop_normalization),
-            1,
-            "the capability guard must retain semantic loop normalization"
+            0,
+            "the active seal covers setup-authenticated loop normalization"
         );
         assert_eq!(occurrences(&x86_v4_auth, &x86_loop_normalization), 1);
         assert_eq!(
             occurrences(&x86_v4_capability, &x86_loop_normalization),
-            1,
-            "the V4 capability guard must retain semantic loop normalization"
+            0,
+            "the V4 active seal covers setup-authenticated loop normalization"
         );
+        assert_eq!(
+            x86_capability_instruction_count,
+            26,
+            "23 guard instructions plus three bound return sentinels"
+        );
+        assert_eq!(x86_v4_capability_instruction_count, 26);
         assert!(
             x86_capability.len().saturating_add(96) < x86_auth.len(),
             "the x86 capability guard must remove a material amount of per-call geometry work"
@@ -46613,19 +46720,14 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
         );
         let scanner_free_ceiling = [0x48, 0x3d, 0xff, 0x0f, 0x00, 0x00];
         assert_eq!(occurrences(&x86.code, &scanner_free_ceiling), 2);
-        let ready_selection = x86
-            .code
-            .windows(ready_seal.len())
-            .position(|window| window == ready_seal.as_slice())
-            .unwrap();
         let first_ceiling = x86
             .code
             .windows(scanner_free_ceiling.len())
             .position(|window| window == scanner_free_ceiling)
             .unwrap();
         assert!(
-            ready_selection < first_ceiling && first_ceiling < v2_selection,
-            "x86 must authenticate closed compact rows before applying the legacy scanner-free ceiling"
+            v3_selection < first_ceiling && first_ceiling < v2_selection,
+            "x86 must select and authenticate the compact capability before the legacy scanner-free ceiling"
         );
 
         let mut arm_v4_auth = Aarch64Assembler::new();
@@ -46697,7 +46799,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             .unwrap();
         let arm_v4_ready = arm_v4_ready.finish().unwrap();
         assert_eq!(occurrences(&arm_v4_auth, &arm_v4_ready), 1);
-        assert_eq!(occurrences(&arm_v4_capability, &arm_v4_ready), 1);
+        assert_eq!(occurrences(&arm_v4_capability, &arm_v4_ready), 0);
 
         let mut arm_auth = Aarch64Assembler::new();
         let arm_try_v2 = arm_auth.label().unwrap();
@@ -46818,12 +46920,19 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             aarch64_cmp_x(8, 9).unwrap(),
         ];
         assert_eq!(
+            arm_auth_words
+                .windows(arm_v3_extent.len())
+                .filter(|words| *words == arm_v3_extent)
+                .count(),
+            1
+        );
+        assert_eq!(
             arm_capability_words
                 .windows(arm_v3_extent.len())
                 .filter(|words| *words == arm_v3_extent)
                 .count(),
-            1,
-            "the AArch64 capability guard must authenticate the exact V3 extent"
+            0,
+            "the active seal covers the immutable maximum physical envelope"
         );
         for identity_word in 0_usize..4 {
             let byte_offset = u16::try_from(identity_word * core::mem::size_of::<u64>()).unwrap();
@@ -46874,12 +46983,139 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
         let arm_active = arm_active.finish().unwrap();
         assert_eq!(occurrences(&arm_auth, &arm_active), 1);
         assert_eq!(occurrences(&arm_capability, &arm_active), 1);
+        let mut arm_magic = Aarch64Assembler::new();
+        aarch64_load_u64_constant(&mut arm_magic, 9, FROZEN_PREPARED_HEADER_V1_MAGIC)
+            .unwrap();
+        let arm_magic = arm_magic.finish().unwrap();
+        assert_eq!(occurrences(&arm_auth, &arm_magic), 1);
+        assert_eq!(occurrences(&arm_capability, &arm_magic), 0);
+        let arm_abi = [
+            aarch64_load_w_imm(
+                8,
+                0,
+                u16::try_from(FROZEN_PREPARED_HEADER_V1_ABI_VERSION_OFFSET).unwrap(),
+            )
+            .unwrap(),
+            aarch64_movz_x(
+                9,
+                u16::try_from(FROZEN_PREPARED_HEADER_V1_ABI_VERSION).unwrap(),
+                0,
+            )
+            .unwrap(),
+            aarch64_cmp_w(8, 9).unwrap(),
+        ];
+        assert_eq!(
+            arm_auth_words
+                .windows(arm_abi.len())
+                .filter(|words| *words == arm_abi)
+                .count(),
+            1
+        );
+        assert_eq!(
+            arm_capability_words
+                .windows(arm_abi.len())
+                .filter(|words| *words == arm_abi)
+                .count(),
+            0
+        );
         let mut arm_ready = Aarch64Assembler::new();
         aarch64_load_u64_constant(&mut arm_ready, 9, FROZEN_PREPARED_HEADER_V3_READY_SEAL)
             .unwrap();
         let arm_ready = arm_ready.finish().unwrap();
         assert_eq!(occurrences(&arm_auth, &arm_ready), 1);
-        assert_eq!(occurrences(&arm_capability, &arm_ready), 1);
+        assert_eq!(occurrences(&arm_capability, &arm_ready), 0);
+        let arm_format = [
+            aarch64_load_w_imm(
+                8,
+                13,
+                u16::try_from(FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION_OFFSET).unwrap(),
+            )
+            .unwrap(),
+            aarch64_movz_x(
+                9,
+                u16::try_from(FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION).unwrap(),
+                0,
+            )
+            .unwrap(),
+            aarch64_cmp_w(8, 9).unwrap(),
+        ];
+        assert_eq!(
+            arm_auth_words
+                .windows(arm_format.len())
+                .filter(|words| *words == arm_format)
+                .count(),
+            1
+        );
+        assert_eq!(
+            arm_capability_words
+                .windows(arm_format.len())
+                .filter(|words| *words == arm_format)
+                .count(),
+            0
+        );
+        let arm_cache_nonzero = [
+            aarch64_load_x_imm(
+                8,
+                13,
+                u16::try_from(FROZEN_DYNAMIC_ROWS_V3_CACHE_IDENTITY_OFFSET).unwrap(),
+            )
+            .unwrap(),
+            aarch64_cmp_x_imm(8, 0).unwrap(),
+        ];
+        assert_eq!(
+            arm_auth_words
+                .windows(arm_cache_nonzero.len())
+                .filter(|words| *words == arm_cache_nonzero)
+                .count(),
+            1
+        );
+        assert_eq!(
+            arm_capability_words
+                .windows(arm_cache_nonzero.len())
+                .filter(|words| *words == arm_cache_nonzero)
+                .count(),
+            0
+        );
+        let arm_tail_address = aarch64_add_x_imm(
+            13,
+            0,
+            u16::try_from(FROZEN_PREPARED_HEADER_V3_DYNAMIC_ROWS_OFFSET).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            arm_auth_words
+                .iter()
+                .filter(|&&word| word == arm_tail_address)
+                .count(),
+            1
+        );
+        assert_eq!(
+            arm_capability_words
+                .iter()
+                .filter(|&&word| word == arm_tail_address)
+                .count(),
+            1
+        );
+        let arm_retained_window = [
+            aarch64_load_x_imm(8, 31, 24).unwrap(),
+            aarch64_store_x(8, 31, 48).unwrap(),
+            aarch64_load_x_imm(8, 31, 32).unwrap(),
+            aarch64_store_x(8, 31, 56).unwrap(),
+        ];
+        assert_eq!(
+            arm_auth_words
+                .windows(arm_retained_window.len())
+                .filter(|words| *words == arm_retained_window)
+                .count(),
+            1
+        );
+        assert_eq!(
+            arm_capability_words
+                .windows(arm_retained_window.len())
+                .filter(|words| *words == arm_retained_window)
+                .count(),
+            1
+        );
         let arm_full_geometry = aarch64_load_w_imm(
             10,
             13,
@@ -46968,8 +47204,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 .iter()
                 .filter(|&&word| word == arm_loop_normalization)
                 .count(),
-            1,
-            "the capability guard must retain semantic loop normalization"
+            0,
+            "the active seal covers setup-authenticated loop normalization"
         );
         assert_eq!(
             arm_v4_auth_words
@@ -46983,9 +47219,15 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 .iter()
                 .filter(|&&word| word == arm_loop_normalization)
                 .count(),
-            1,
-            "the V4 capability guard must retain semantic loop normalization"
+            0,
+            "the V4 active seal covers setup-authenticated loop normalization"
         );
+        assert_eq!(
+            arm_capability_words.len(),
+            36,
+            "33 guard instructions plus three bound NOP sentinels"
+        );
+        assert_eq!(arm_v4_capability_words.len(), 36);
         assert!(
             arm_capability.len().saturating_add(96) < arm_auth.len(),
             "the AArch64 capability guard must remove a material amount of per-call geometry work"
@@ -47283,20 +47525,250 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 .count(),
             2
         );
-        let arm_ready_selection = arm
-            .code
-            .windows(arm_ready.len())
-            .position(|window| window == arm_ready.as_slice())
-            .unwrap();
         let arm_first_ceiling = arm_words
             .iter()
             .position(|&word| word == arm_scanner_free_ceiling)
             .unwrap();
         assert!(
-            arm_ready_selection < arm_first_ceiling * core::mem::size_of::<u32>()
-                && arm_first_ceiling < arm_v2_selection,
-            "AArch64 must authenticate closed compact rows before applying the legacy scanner-free ceiling"
+            arm_v3_selection < arm_first_ceiling && arm_first_ceiling < arm_v2_selection,
+            "AArch64 must select and authenticate the compact capability before the legacy scanner-free ceiling"
         );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one cross-ISA audit covers both specialized compact capability shapes"
+    )]
+    fn frozen_compact_specialized_entry_checks_are_full_verifier_only_cross_isa() {
+        fn occurrences(code: &[u8], needle: &[u8]) -> usize {
+            code.windows(needle.len())
+                .filter(|window| *window == needle)
+                .count()
+        }
+
+        fn x86_entry(
+            format: FrozenCompactNativeFormat,
+            guard_mode: FrozenCompactGuardMode,
+        ) -> (Vec<u8>, usize) {
+            let mut assembler = X86Assembler::new();
+            let try_older = assembler.label().unwrap();
+            let call_preflight = assembler.label().unwrap();
+            let compact_enter = assembler.label().unwrap();
+            x86_emit_frozen_compact_entry(
+                &mut assembler,
+                format,
+                try_older,
+                call_preflight,
+                compact_enter,
+                guard_mode,
+            )
+            .unwrap();
+            for label in [try_older, call_preflight, compact_enter] {
+                assembler.bind(label).unwrap();
+                assembler.instruction(&[0xc3]).unwrap();
+            }
+            let instruction_count = assembler.instruction_offsets.len();
+            (assembler.finish().unwrap(), instruction_count)
+        }
+
+        fn arm_entry(
+            format: FrozenCompactNativeFormat,
+            guard_mode: FrozenCompactGuardMode,
+        ) -> Vec<u8> {
+            let mut assembler = Aarch64Assembler::new();
+            let try_older = assembler.label().unwrap();
+            let call_preflight = assembler.label().unwrap();
+            let compact_enter = assembler.label().unwrap();
+            aarch64_emit_frozen_compact_entry(
+                &mut assembler,
+                format,
+                try_older,
+                call_preflight,
+                compact_enter,
+                guard_mode,
+            )
+            .unwrap();
+            for label in [try_older, call_preflight, compact_enter] {
+                assembler.bind(label).unwrap();
+                assembler.instruction(0xd503_201f).unwrap();
+            }
+            assembler.finish().unwrap()
+        }
+
+        let (x86_v5_full, _) = x86_entry(
+            FrozenCompactNativeFormat::UnaryExistsV5,
+            FrozenCompactGuardMode::FullVerifier,
+        );
+        let (x86_v5_active, x86_v5_active_instruction_count) = x86_entry(
+            FrozenCompactNativeFormat::UnaryExistsV5,
+            FrozenCompactGuardMode::ActiveCapability,
+        );
+        let x86_v5_step = [
+            0x45,
+            0x8b,
+            0x53,
+            u8::try_from(FROZEN_DYNAMIC_ROWS_V5_FIRST_ACCEPT_STEP_OFFSET).unwrap(),
+        ];
+        let x86_v5_complement = [
+            0x41,
+            0x33,
+            0x43,
+            u8::try_from(FROZEN_DYNAMIC_ROWS_V5_FIRST_ACCEPT_STEP_COMPLEMENT_OFFSET).unwrap(),
+        ];
+        assert_eq!(occurrences(&x86_v5_full, &x86_v5_step), 2);
+        assert_eq!(
+            occurrences(&x86_v5_active, &x86_v5_step),
+            1,
+            "V5 retains only the value consumed by its body"
+        );
+        assert_eq!(occurrences(&x86_v5_full, &x86_v5_complement), 1);
+        assert_eq!(occurrences(&x86_v5_active, &x86_v5_complement), 0);
+        assert_eq!(x86_v5_active_instruction_count, 27);
+
+        let arm_v5_full = arm_entry(
+            FrozenCompactNativeFormat::UnaryExistsV5,
+            FrozenCompactGuardMode::FullVerifier,
+        );
+        let arm_v5_active = arm_entry(
+            FrozenCompactNativeFormat::UnaryExistsV5,
+            FrozenCompactGuardMode::ActiveCapability,
+        );
+        let arm_v5_full_words = arm_v5_full
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        let arm_v5_active_words = arm_v5_active
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        let arm_v5_step = aarch64_load_w_imm(
+            7,
+            13,
+            u16::try_from(FROZEN_DYNAMIC_ROWS_V5_FIRST_ACCEPT_STEP_OFFSET).unwrap(),
+        )
+        .unwrap();
+        let arm_v5_complement = aarch64_load_w_imm(
+            8,
+            13,
+            u16::try_from(FROZEN_DYNAMIC_ROWS_V5_FIRST_ACCEPT_STEP_COMPLEMENT_OFFSET).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            arm_v5_full_words
+                .iter()
+                .filter(|&&word| word == arm_v5_step)
+                .count(),
+            2
+        );
+        assert_eq!(
+            arm_v5_active_words
+                .iter()
+                .filter(|&&word| word == arm_v5_step)
+                .count(),
+            1,
+            "V5 retains only the value consumed by its body"
+        );
+        assert_eq!(
+            arm_v5_full_words
+                .iter()
+                .filter(|&&word| word == arm_v5_complement)
+                .count(),
+            1
+        );
+        assert_eq!(
+            arm_v5_active_words
+                .iter()
+                .filter(|&&word| word == arm_v5_complement)
+                .count(),
+            0
+        );
+        assert_eq!(arm_v5_active_words.len(), 37);
+
+        for format in [
+            FrozenCompactNativeFormat::StateOrdinalV6,
+            FrozenCompactNativeFormat::CellOffsetV7,
+        ] {
+            let (x86_full, _) =
+                x86_entry(format, FrozenCompactGuardMode::FullVerifier);
+            let (x86_active, x86_active_instruction_count) =
+                x86_entry(format, FrozenCompactGuardMode::ActiveCapability);
+            let x86_plan_count = [
+                0x41,
+                0x83,
+                0x7b,
+                u8::try_from(FROZEN_DYNAMIC_ROWS_V6_LOOP_PLAN_COUNT_OFFSET).unwrap(),
+                1,
+            ];
+            let x86_plan_address = [
+                0x49,
+                0x83,
+                0x7b,
+                u8::try_from(FROZEN_DYNAMIC_ROWS_V6_LOOP_INDEX_ADDRESS_OFFSET).unwrap(),
+                0,
+            ];
+            assert_eq!(occurrences(&x86_full, &x86_plan_count), 1, "{format:?}");
+            assert_eq!(occurrences(&x86_active, &x86_plan_count), 0, "{format:?}");
+            assert_eq!(occurrences(&x86_full, &x86_plan_address), 1, "{format:?}");
+            assert_eq!(occurrences(&x86_active, &x86_plan_address), 0, "{format:?}");
+            assert_eq!(x86_active_instruction_count, 26, "{format:?}");
+
+            let arm_full = arm_entry(format, FrozenCompactGuardMode::FullVerifier);
+            let arm_active = arm_entry(format, FrozenCompactGuardMode::ActiveCapability);
+            let arm_full_words = arm_full
+                .chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            let arm_active_words = arm_active
+                .chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            let arm_plan_count = aarch64_load_w_imm(
+                7,
+                13,
+                u16::try_from(FROZEN_DYNAMIC_ROWS_V6_LOOP_PLAN_COUNT_OFFSET).unwrap(),
+            )
+            .unwrap();
+            let arm_plan_address = aarch64_load_x_imm(
+                8,
+                13,
+                u16::try_from(FROZEN_DYNAMIC_ROWS_V6_LOOP_INDEX_ADDRESS_OFFSET).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                arm_full_words
+                    .iter()
+                    .filter(|&&word| word == arm_plan_count)
+                    .count(),
+                1,
+                "{format:?}"
+            );
+            assert_eq!(
+                arm_active_words
+                    .iter()
+                    .filter(|&&word| word == arm_plan_count)
+                    .count(),
+                0,
+                "{format:?}"
+            );
+            assert_eq!(
+                arm_full_words
+                    .iter()
+                    .filter(|&&word| word == arm_plan_address)
+                    .count(),
+                1,
+                "{format:?}"
+            );
+            assert_eq!(
+                arm_active_words
+                    .iter()
+                    .filter(|&&word| word == arm_plan_address)
+                    .count(),
+                0,
+                "{format:?}"
+            );
+            assert_eq!(arm_active_words.len(), 36, "{format:?}");
+        }
     }
 
     #[test]
