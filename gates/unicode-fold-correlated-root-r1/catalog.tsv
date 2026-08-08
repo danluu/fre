@@ -1,0 +1,73 @@
+# fre.unicode-fold-correlated-root-gate.v2
+# Unicode simple-fold source: regex-syntax 0.8.11, Unicode 16.0.0.
+# Complete generated source table SHA-256:
+# 7622c7f7f03ac0dc2f2bcd51c81a217d64de0cc912f62f1add5f676603a02456
+#
+# Facts are canonical equivalence classes, expressed only as scalar values.
+# Recipes were selected mechanically in scalar-vector lexicographic order.
+# A candidate column must pass the production root-prefilter eligibility rules:
+# it is present in every expansion, is not entirely UTF-8 structural leads, and
+# a wide set spans at most eight high nibbles. Columns are ranked by production's
+# (structural leads, frozen byte-frequency score, reverse offset) tuple. For a
+# requested union cardinality, retain the first class that grows the union
+# without exceeding the target and retain a recipe only when production selects
+# the requested column. No character names or measured timings participate.
+
+meta	schema	fre.unicode-fold-correlated-root-gate.v2
+meta	unicode_version	16.0.0
+meta	unicode_table_sha256	7622c7f7f03ac0dc2f2bcd51c81a217d64de0cc912f62f1add5f676603a02456
+meta	selection	production-eligible-ranked-byte-union-v2
+meta	saturation_fold_atoms	13
+meta	semantic_spacing	1,2,3,7,15,16,17,31
+meta	timing_sizes	129,4097,65537
+
+sentinel	guard	0021
+sentinel	background	0022
+sentinel	separator	0023
+sentinel	deep_mismatch	0024
+
+fact	ascii_0	0041,0061
+fact	ascii_1	0042,0062
+fact	ascii_2	0043,0063
+fact	ascii_3	0044,0064
+fact	ascii_4	0045,0065
+
+fact	fixed2_same_lead_0	00C0,00E0
+fact	fixed2_same_lead_1	00C1,00E1
+fact	fixed2_same_lead_2	00C2,00E2
+fact	fixed2_same_lead_d5	00D5,00F5
+fact	fixed2_two_lead_0	00B5,039C,03BC
+fact	fixed2_two_lead_1	0386,03AC
+
+fact	fixed3_0	10A0,2D00
+fact	fixed3_1	10A1,2D01
+fact	fixed3_2	10A2,2D02
+fact	fixed3_3	10A3,2D03
+fact	fixed3_offset1_1	10C0,2D20
+fact	fixed3_selected2_card3_0	1E60,1E61,1E9B
+
+fact	fixed4_0	10400,10428
+fact	fixed4_1	10401,10429
+fact	fixed4_2	10402,1042A
+fact	fixed4_3	10403,1042B
+fact	fixed4_offset2_1	10418,10440
+fact	fixed4_offset2_2	104B0,104D8
+fact	fixed4_selected3_card1_0	10C85,10CC5
+
+fact	mixed_0	004B,006B,212A
+fact	mixed_1	0053,0073,017F
+fact	mixed_2	00C5,00E5,212B
+fact	mixed_3	00DF,1E9E
+
+# recipe fields:
+# id, utf8 profile, placement, explicit independent guard, requested primary
+# cardinality, primary local byte offset, tuple local start, tuple width,
+# bucket budget, and semicolon-free comma-separated structural fact IDs.
+recipe	p1_w4_fixed4_suffix_b1	fixed4	suffix	false	1	3	0	4	1	fixed4_selected3_card1_0
+recipe	p2_w2_fixed2_suffix_b2_guard	fixed2	suffix	true	2	1	0	2	2	fixed2_same_lead_0
+recipe	p3_w3_fixed3_suffix_b4	fixed3	suffix	false	3	2	0	3	4	fixed3_selected2_card3_0
+recipe	p4_w4_fixed2_middle_b4_guard	fixed2+successor	middle	true	4	1	0	4	4	fixed2_two_lead_0,fixed2_same_lead_d5
+recipe	p8_w2_fixed2_suffix_b8	fixed2	suffix	false	8	1	0	2	8	fixed2_two_lead_0,fixed2_same_lead_0,fixed2_same_lead_1,fixed2_same_lead_d5
+recipe	p9_w4_fixed2_middle_b8_guard	fixed2+successor	middle	true	9	1	0	4	8	fixed2_two_lead_0,fixed2_same_lead_0,fixed2_same_lead_1,fixed2_same_lead_2
+recipe	p3_w2_mixed_prefix_b2	mixed	prefix	false	3	0	0	2	2	mixed_0
+recipe	p8_w3_mixed_prefix_b8	mixed	prefix	false	8	0	0	3	8	mixed_0,mixed_1,mixed_2,mixed_3
