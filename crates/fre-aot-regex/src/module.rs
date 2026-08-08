@@ -41020,7 +41020,21 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 let wire = compiled.program().serialize().unwrap();
                 let restored = crate::CompiledProgram::deserialize(&wire).unwrap();
                 let bounded_module = CompiledModule::lower(&restored, target).unwrap();
-                assert!(bounded_module.required_runtime_symbol().is_some());
+                if output == OutputContract::Exists {
+                    let stats = restored
+                        .bit_parallel_exists_stats()
+                        .expect("root-only Exists retains the bounded graph executor");
+                    assert!(stats.source_nibbles > 1, "{target:?}/{output:?}");
+                    assert!(
+                        bounded_module.required_runtime_symbol().is_none(),
+                        "{target:?}/{output:?}"
+                    );
+                } else {
+                    assert!(
+                        bounded_module.required_runtime_symbol().is_some(),
+                        "{target:?}/{output:?}"
+                    );
+                }
                 let restored_module = CompiledModule::lower_k0_optimizing_with_data_limit(
                     &restored,
                     target,
