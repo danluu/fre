@@ -15563,6 +15563,31 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             Ok(())
         };
 
+    let reinstall_root_scanner_constants = |assembler: &mut X86Assembler| {
+        match root_plan {
+            Some(X86DynamicRootPlan::Range(filter)) => {
+                let kind = filter_kind.ok_or(ObjectError::InvalidModule(
+                    "x86 rooted range scanner lost its instruction selection",
+                ))?;
+                x86_emit_start_filter_constants(assembler, filter, kind, 1)?;
+            }
+            Some(X86DynamicRootPlan::Exact { storage, .. }) => {
+                if let Some(kind) = exact_vector_kind {
+                    // Root setup retained the post-identity table base in the
+                    // private frame. R9 ordinarily names the inline class
+                    // map, so borrow it for the vector reload and restore the
+                    // map relative to the common V6/V7 tail in R11.
+                    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x08])?;
+                    x86_emit_exact_vector_constants(assembler, storage, kind)?;
+                    assembler
+                        .instruction(&[0x4d, 0x8d, 0x8b, 0x00, 0xff, 0xff, 0xff])?;
+                }
+            }
+            None => {}
+        }
+        Ok::<(), ObjectError>(())
+    };
+
     assembler.bind(v7_enter)?;
     assembler.instruction(&[
         0x49,
@@ -15750,6 +15775,11 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     assembler.branch(&[0x0f, 0x87], v7_loop_failure)?;
     assembler.instruction(&[0x48, 0x01, 0xc2])?;
     assembler.instruction(&[0x48, 0x83, 0xc4, 0x10])?;
+    // The trusted loop helper follows the platform C ABI and may clobber
+    // every caller-saved vector register. Root scanning keeps its constants
+    // live in exactly those registers, so reinstall them before a later
+    // transition can return to the root scanner.
+    reinstall_root_scanner_constants(&mut assembler)?;
     assembler.instruction(&[0x48, 0x39, 0xca])?;
     assembler.branch(&[0x0f, 0x82], v7_table_scan)?;
     assembler.branch(&[0xe9], native_complete.unwrap_or(native_no_match))?;
@@ -15964,6 +15994,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     assembler.branch(&[0x0f, 0x87], v6_loop_failure)?;
     assembler.instruction(&[0x48, 0x01, 0xc2])?;
     assembler.instruction(&[0x48, 0x83, 0xc4, 0x10])?;
+    reinstall_root_scanner_constants(&mut assembler)?;
     assembler.branch(&[0xe9], v6_update_dispatch)?;
     assembler.bind(v6_loop_failure)?;
     assembler.instruction(&[0x48, 0x83, 0xc4, 0x10])?;
@@ -25199,6 +25230,17 @@ fn aarch64_emit_dynamic_root_setup(
         assembler.instruction(aarch64_load_x_imm(5, 31, 80)?)?;
         assembler.instruction(aarch64_add_x_imm(5, 5, 32)?)?;
     }
+    aarch64_emit_dynamic_root_constants(assembler, plan)
+}
+
+/// Reinstall only the caller-saved vector and dispatch state for a rooted
+/// scanner. Table-backed plans receive their already-restored post-identity
+/// base in X5, which lets a compact loop-helper return preserve the pending
+/// endpoint stored in the original identity frame word.
+fn aarch64_emit_dynamic_root_constants(
+    assembler: &mut Aarch64Assembler,
+    plan: Aarch64DynamicScannerPlan,
+) -> Result<(), ObjectError> {
     match plan {
         Aarch64DynamicScannerPlan::Range(plan) => {
             if plan.use_asimd {
@@ -26309,6 +26351,12 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     assembler.instruction(aarch64_sub_x_imm(31, 31, 32)?)?;
     assembler.instruction(aarch64_store_x(11, 31, 0)?)?;
     assembler.instruction(aarch64_store_x(2, 31, 8)?)?;
+    if root_plan.is_some() {
+        // X5 holds the post-identity root table base whenever the selected
+        // plan needs one. It is caller-saved, like every root SIMD constant,
+        // so retain it beside the existing row and position call spills.
+        assembler.instruction(aarch64_store_x(5, 31, 16)?)?;
+    }
     // Trusted V2 ABI: X0=source, X1=the authenticated scanner retained from
     // the immutable plan, X2=remaining length. The active-capability checks
     // and exact plan/key proof above are the safety boundary.
@@ -26318,6 +26366,9 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     assembler.instruction(aarch64_mov_x(10, 0)?)?;
     assembler.instruction(aarch64_load_x_imm(11, 31, 0)?)?;
     assembler.instruction(aarch64_load_x_imm(2, 31, 8)?)?;
+    if root_plan.is_some() {
+        assembler.instruction(aarch64_load_x_imm(5, 31, 16)?)?;
+    }
     assembler.instruction(aarch64_load_x_imm(3, 31, 88)?)?;
     assembler.instruction(aarch64_load_x_imm(0, 31, 40)?)?;
     assembler.instruction(aarch64_load_x_imm(8, 31, 32)?)?;
@@ -26346,6 +26397,13 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     assembler.branch_cond(AARCH64_HI, v7_loop_failure)?;
     assembler.instruction(aarch64_add_x_reg(2, 2, 10)?)?;
     assembler.instruction(aarch64_add_x_imm(31, 31, 32)?)?;
+    if let Some(plan) = root_plan {
+        // The helper uses the ordinary base PCS and may clobber every SIMD
+        // register, predicate, and mixed-VL scratch register. Rebuild the
+        // complete root scanner state before a table transition can re-enter
+        // that scanner.
+        aarch64_emit_dynamic_root_constants(&mut assembler, plan)?;
+    }
     assembler.instruction(aarch64_cmp_x(2, 3)?)?;
     assembler.branch_cond(AARCH64_LO, v7_table_scan)?;
     assembler.branch(native_complete.unwrap_or(native_no_match))?;
@@ -26513,6 +26571,9 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     assembler.instruction(aarch64_sub_x_imm(31, 31, 32)?)?;
     assembler.instruction(aarch64_store_x(11, 31, 0)?)?;
     assembler.instruction(aarch64_store_x(2, 31, 8)?)?;
+    if root_plan.is_some() {
+        assembler.instruction(aarch64_store_x(5, 31, 16)?)?;
+    }
     // Keep the same direct-pointer V2 register contract in the V6 body.
     assembler.instruction(aarch64_add_x_reg(0, 0, 2)?)?;
     assembler.instruction(aarch64_mov_x(2, 12)?)?;
@@ -26520,6 +26581,9 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     assembler.instruction(aarch64_mov_x(10, 0)?)?;
     assembler.instruction(aarch64_load_x_imm(11, 31, 0)?)?;
     assembler.instruction(aarch64_load_x_imm(2, 31, 8)?)?;
+    if root_plan.is_some() {
+        assembler.instruction(aarch64_load_x_imm(5, 31, 16)?)?;
+    }
     assembler.instruction(aarch64_load_x_imm(3, 31, 88)?)?;
     assembler.instruction(aarch64_load_x_imm(0, 31, 40)?)?;
     assembler.instruction(aarch64_load_x_imm(8, 31, 32)?)?;
@@ -26554,6 +26618,9 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     assembler.branch_cond(AARCH64_HI, v6_loop_failure)?;
     assembler.instruction(aarch64_add_x_reg(2, 2, 10)?)?;
     assembler.instruction(aarch64_add_x_imm(31, 31, 32)?)?;
+    if let Some(plan) = root_plan {
+        aarch64_emit_dynamic_root_constants(&mut assembler, plan)?;
+    }
     assembler.instruction(aarch64_cmp_x(2, 3)?)?;
     assembler.branch_cond(AARCH64_LO, v6_scan)?;
     assembler.branch(native_complete.unwrap_or(native_no_match))?;
@@ -30557,8 +30624,8 @@ mod tests {
                 .iter()
                 .filter(|&&word| word == aarch64_sve_cntb(16).unwrap())
                 .count(),
-            1,
-            "mixed dynamic root must sample CNTB once"
+            3,
+            "mixed dynamic root must restore its VL after both compact loop helpers"
         );
         assert_eq!(
             words
@@ -30567,8 +30634,8 @@ mod tests {
                     word == aarch64_sub_x_imm(17, 16, AARCH64_SVE_MIN_VECTOR_BYTES).unwrap()
                 })
                 .count(),
-            1,
-            "mixed dynamic root must retain its VL16 mode"
+            3,
+            "mixed dynamic root must restore its VL16 mode after both compact loop helpers"
         );
         assert!(words.contains(&aarch64_mov_x(6, 16).unwrap()));
         assert!(words.contains(&aarch64_sve2_match_b(1, 0, 16).unwrap()));
@@ -33010,6 +33077,204 @@ mod tests {
         any(target_os = "linux", target_os = "macos")
     ))]
     #[test]
+    #[ignore = "requires `cargo build -p fre-aot-regex-runtime --lib`; links a zero-row compact Span entry to the real runtime"]
+    fn linked_host_zero_row_alternation_span_ignores_false_root_candidates() {
+        use std::{fmt::Write as _, fs, process::Command, time::SystemTime};
+
+        let base = if cfg!(target_arch = "x86_64") {
+            if cfg!(target_os = "linux") {
+                Target::x86_64_linux()
+            } else {
+                Target::x86_64_macos()
+            }
+        } else if cfg!(target_os = "linux") {
+            Target::aarch64_linux()
+        } else {
+            Target::aarch64_macos()
+        };
+        let feature = if cfg!(target_arch = "x86_64") {
+            CpuFeature::X86Avx2
+        } else {
+            CpuFeature::Aarch64Asimd
+        };
+        let target = base
+            .with_features(FeatureSet::of(feature))
+            .expect("valid host vector target");
+        let mut slow_limits = SlowAotLimits::default();
+        slow_limits.determinize.max_states = 0;
+        slow_limits.determinize.max_transitions = 0;
+        slow_limits.determinize.max_work = 0;
+        slow_limits.max_allocation_bytes = 0;
+        slow_limits.max_native_data_bytes = 0;
+        let compiled = crate::compile_with_slow_aot_limits(
+            CompileRequest::new("(?:blphb|betb|gbmmb)Z", target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span)
+                .limits(CompileLimitsV1 {
+                    determinize: DeterminizeLimits {
+                        max_states: 0,
+                        ..DeterminizeLimits::default()
+                    },
+                    ..CompileLimitsV1::default()
+                }),
+            slow_limits,
+        )
+        .expect("compile zero-row alternation Span");
+        assert_eq!(
+            compiled.receipt().engine_selection_reason,
+            crate::EngineSelectionReason::DeterminizationResourceLimit,
+        );
+        let entry = compiled
+            .module()
+            .prepared_entry_symbol()
+            .expect("zero-row alternation prepared entry");
+        let (program_symbol, program_len) = compiled
+            .module()
+            .required_runtime_program()
+            .expect("zero-row alternation runtime program");
+
+        let seed = 0x243f_6a88_85a3_08d2_u64;
+        let generation_id = 6_usize;
+        let safe = b"~!@#%&*+=:;?";
+        let candidates = b"bbg";
+        let component = |shift: u32| usize::from(((seed >> shift) & 0xffff) as u16);
+        let background = |length: usize| {
+            (0_usize..length)
+                .map(|index| {
+                    let safe_index = (index * (13 + component(8) % 16)
+                        + generation_id * (11 + component(40) % 16)
+                        + component(0))
+                        % safe.len();
+                    safe[safe_index]
+                })
+                .collect::<Vec<_>>()
+        };
+        let phase = (generation_id * (23 + component(20) % 16) + component(16)) % 32;
+        let with_fixture = |mut haystack: Vec<u8>| {
+            let match_start = (haystack.len() - 5) / 2;
+            haystack[match_start..match_start + 5].copy_from_slice(b"betbZ");
+            haystack
+        };
+        let with_roots = |mut haystack: Vec<u8>, limit: usize| {
+            for index in (phase..haystack.len().min(limit)).step_by(32) {
+                let candidate = (index / 32 + generation_id + component(32)) % candidates.len();
+                haystack[index] = candidates[candidate];
+            }
+            haystack
+        };
+        let mut one_g_64 = background(64);
+        one_g_64[phase] = b'g';
+        let mut one_b_64 = background(64);
+        one_b_64[phase] = b'b';
+        let mut one_g_4096 = background(4096);
+        one_g_4096[phase] = b'g';
+        let cases = [
+            with_fixture(background(64)),
+            with_fixture(one_g_64),
+            with_fixture(one_b_64),
+            with_fixture(with_roots(background(128), 61)),
+            with_fixture(background(4096)),
+            with_fixture(one_g_4096),
+            with_fixture(with_roots(background(4096), 2045)),
+            with_fixture(with_roots(background(4096), usize::MAX)),
+        ];
+
+        let current_exe = std::env::current_exe().expect("current test executable");
+        let profile_dir = current_exe
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("Cargo profile directory");
+        let static_runtime = profile_dir.join("libfre_aot_regex_runtime.a");
+        assert!(
+            static_runtime.is_file(),
+            "build the linked runtime first: cargo build -p fre-aot-regex-runtime --lib ({})",
+            static_runtime.display()
+        );
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "fre-aot-zero-row-alternation-span-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("create zero-row linker directory");
+        let object = directory.join("zero-row-alternation.o");
+        fs::write(&object, compiled.object()).expect("write zero-row object");
+        let mut source = format!(
+            "#include <stddef.h>\n#include <stdint.h>\n#include <stdio.h>\n\
+             typedef void *handle_t;typedef struct{{size_t start;size_t end;}} result_t;\n\
+             extern const unsigned char {program_symbol}[];\n\
+             extern uint32_t {entry}(handle_t,const unsigned char*,size_t,size_t,size_t,result_t*);\n\
+             extern uint32_t fre_aot_regex_runtime_prepare_exclusive_v1(const unsigned char*,size_t,handle_t*);\n\
+             extern uint32_t fre_aot_regex_runtime_search_exclusive_v1(handle_t,const unsigned char*,size_t,size_t,size_t,result_t*);\n\
+             extern uint32_t fre_aot_regex_runtime_destroy_exclusive_v1(handle_t);\n\
+             static int run(const unsigned char*haystack,size_t length,size_t match_start,int base){{\n\
+               handle_t native=0,oracle=0;result_t got={{91U,92U}},expected={{93U,94U}};\n\
+               if(fre_aot_regex_runtime_prepare_exclusive_v1({program_symbol},{program_len}U,&native)!=0U)return 10;\n\
+               if(fre_aot_regex_runtime_prepare_exclusive_v1({program_symbol},{program_len}U,&oracle)!=0U)return 11;\n\
+               uint32_t os=fre_aot_regex_runtime_search_exclusive_v1(oracle,haystack,length,0U,length,&expected);\n\
+               uint32_t ns={entry}(native,haystack,length,0U,length,&got);\n\
+               if(os!=1U||expected.start!=match_start||expected.end!=match_start+5U)return 12;\n\
+               if(ns!=os||got.start!=expected.start||got.end!=expected.end){{fprintf(stderr,\"case=%d native=%u/%zu/%zu oracle=%u/%zu/%zu\\n\",base,ns,got.start,got.end,os,expected.start,expected.end);return base;}}\n\
+               if(fre_aot_regex_runtime_destroy_exclusive_v1(native)!=0U)return 14;\n\
+               if(fre_aot_regex_runtime_destroy_exclusive_v1(oracle)!=0U)return 15;return 0;}}\n",
+        );
+        for (index, haystack) in cases.iter().enumerate() {
+            let bytes = haystack
+                .iter()
+                .map(u8::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            writeln!(
+                source,
+                "static const unsigned char haystack{index}[]={{{bytes}}};"
+            )
+            .expect("write zero-row test haystack");
+        }
+        source.push_str("int main(void){int status;\n");
+        for (index, haystack) in cases.iter().enumerate() {
+            let match_start = (haystack.len() - 5) / 2;
+            writeln!(
+                source,
+                "status=run(haystack{index},sizeof(haystack{index}),{match_start}U,{});if(status)return status;",
+                40 + index,
+            )
+            .expect("write zero-row test call");
+        }
+        source.push_str("return 0;}\n");
+        let c_path = directory.join("zero-row-alternation.c");
+        let executable = directory.join("zero-row-alternation");
+        fs::write(&c_path, source).expect("write zero-row C harness");
+        let compiler = if cfg!(target_os = "macos") { "clang" } else { "cc" };
+        let status = Command::new(compiler)
+            .arg("-O0")
+            .arg(&c_path)
+            .arg(&object)
+            .arg(&static_runtime)
+            .arg("-o")
+            .arg(&executable)
+            .status()
+            .expect("link zero-row C harness");
+        assert!(status.success(), "zero-row C harness failed to link");
+        let output = Command::new(&executable)
+            .output()
+            .expect("execute zero-row C harness");
+        assert!(
+            output.status.success(),
+            "status={:?} stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::remove_dir_all(&directory).expect("remove zero-row linker directory");
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
     #[ignore = "links and executes a fragmented exact dynamic root on the host ISA"]
     fn linked_host_dynamic_exact_root_entry_preserves_all_outputs_and_windows() {
         #[cfg(target_arch = "x86_64")]
@@ -33770,6 +34035,11 @@ mod tests {
             assert_eq!(scanner.membership, membership);
             assert!(scanner.vectorized);
             let code = emission.code.as_slice();
+            assert_eq!(
+                occurrences(code, &[0xb8, b'a', b'a', b'a', b'a']),
+                3,
+                "the {accelerator:?} root constant must be installed initially and after both compact loop helpers"
+            );
             let scanner_free_ceiling = [0x48, 0x3d, 0xff, 0x0f, 0x00, 0x00];
             assert!(
                 !code
@@ -34413,6 +34683,24 @@ mod tests {
                         "missing exact vector classifier: {features:?}/{output:?}"
                     );
                 }
+                let constant_load = match accelerator {
+                    StartAccelerator::X86Avx2 => Some([0xc4, 0xc1, 0x7e, 0x6f].as_slice()),
+                    StartAccelerator::X86Avx512Bw => {
+                        Some([0x62, 0xd2, 0x7d, 0x48, 0x5a].as_slice())
+                    }
+                    _ => None,
+                };
+                if let Some(constant_load) = constant_load {
+                    assert_eq!(
+                        emission
+                            .code
+                            .windows(constant_load.len())
+                            .filter(|bytes| *bytes == constant_load)
+                            .count(),
+                        12,
+                        "four exact constants must be installed initially and after both compact loop helpers: {features:?}/{output:?}"
+                    );
+                }
                 assert_eq!(
                     emission
                         .code
@@ -34589,6 +34877,42 @@ mod tests {
                     .chunks_exact(4)
                     .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
                     .collect::<Vec<_>>();
+                assert_eq!(
+                    words
+                        .iter()
+                        .filter(|&&word| word == aarch64_store_x(5, 31, 16).unwrap())
+                        .count(),
+                    2,
+                    "{target:?}/{output:?} must preserve the root table base across both compact loop helpers"
+                );
+                assert_eq!(
+                    words
+                        .iter()
+                        .filter(|&&word| word == aarch64_load_x_imm(5, 31, 16).unwrap())
+                        .count(),
+                    2,
+                    "{target:?}/{output:?} must restore the root table base after both compact loop helpers"
+                );
+                match accelerator {
+                    StartAccelerator::Aarch64Asimd => assert_eq!(
+                        words
+                            .iter()
+                            .filter(|&&word| word == aarch64_ld1_three_16b(16, 6).unwrap())
+                            .count(),
+                        3,
+                        "{target:?}/{output:?} must install exact ASIMD constants initially and after both compact loop helpers"
+                    ),
+                    StartAccelerator::Aarch64Sve | StartAccelerator::Aarch64Sve2 => assert_eq!(
+                        words
+                            .iter()
+                            .filter(|&&word| word == aarch64_sve_ld1rqb(16, 12).unwrap())
+                            .count(),
+                        3,
+                        "{target:?}/{output:?} must install exact SVE constants initially and after both compact loop helpers"
+                    ),
+                    StartAccelerator::Scalar => {}
+                    unexpected => panic!("unexpected AArch64 accelerator {unexpected:?}"),
+                }
                 assert_eq!(
                     words
                         .iter()
