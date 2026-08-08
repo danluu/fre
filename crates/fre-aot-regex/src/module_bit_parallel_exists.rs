@@ -14,6 +14,8 @@ use crate::{
     },
 };
 
+use std::collections::BTreeMap;
+
 use super::{
     AARCH64_EQ, AARCH64_HI, AARCH64_HS, AARCH64_LO, AARCH64_MI, AARCH64_NE,
     AARCH64_STANDALONE_FILTER_FIRST_CONSTANT, Aarch64Assembler, Aarch64SveFilterKind, Architecture,
@@ -60,7 +62,26 @@ const MULTIWORD_ROOT_ROWS_OFFSET: usize =
 // caps independently bound object growth and make a failed optional lowering
 // fall back to the serialized runtime route.
 const MAX_NATIVE_BIT_PARALLEL_DATA_BYTES: usize = 4 * 1024 * 1024 + ROOT_SKIP_FIRST_LANE_BYTES * 2;
+// Hybrid admission reserves the maximum scanner suffix inside the original
+// 4 MiB table budget. Keep that stricter bound local to hybrid layouts so a
+// graph that selects no subset sources retains the exact parent resource cap.
+const MAX_NATIVE_BIT_PARALLEL_HYBRID_DATA_BYTES: usize = 4 * 1024 * 1024;
 const MAX_NATIVE_BIT_PARALLEL_CODE_BYTES: usize = 8 * 1024;
+
+// Hybrid multiword rows are selected from an input-independent Cesaro model
+// over the canonical byte classes. The finite distribution is exact until
+// either bound is reached; a graph that exceeds either bound simply retains
+// direct rows everywhere.
+const MULTIWORD_ACTIVITY_WARMUP_STEPS: usize = 4;
+const MULTIWORD_ACTIVITY_SAMPLE_STEPS: usize = 20;
+const MAX_MULTIWORD_ACTIVITY_FRONTIERS: usize = 4_096;
+const MAX_MULTIWORD_ACTIVITY_ROW_UNIONS: usize = 16_000_000;
+const MULTIWORD_ACTIVITY_PROBABILITY_SCALE: u64 = 1_u64 << 32;
+// One subset union has more scalar address-generation work than one direct
+// row. Requiring at least seven direct rows for every four subset rows is a
+// target-neutral, deliberately conservative admission threshold.
+const SUBSET_ROW_DIRECT_COST_NUMERATOR: i128 = 7;
+const SUBSET_ROW_DIRECT_COST_DENOMINATOR: i128 = 4;
 
 #[derive(Debug)]
 struct NativeBitParallelLayout {
@@ -70,6 +91,9 @@ struct NativeBitParallelLayout {
     words: usize,
     consuming_states: usize,
     direct_row_words: usize,
+    source_row_offsets: [u32; MAX_BIT_PARALLEL_EXISTS_WORDS],
+    source_row_nibbles: [u8; MAX_BIT_PARALLEL_EXISTS_WORDS],
+    subset_source_mask: u8,
     source_nibbles: usize,
     constant_result: Option<bool>,
     root_filter: Option<NativeStartFilter>,
@@ -363,6 +387,9 @@ fn build_native_bit_parallel_layout(
         words: 1,
         consuming_states: stats.consuming_states,
         direct_row_words: 1,
+        source_row_offsets: [0; MAX_BIT_PARALLEL_EXISTS_WORDS],
+        source_row_nibbles: [0; MAX_BIT_PARALLEL_EXISTS_WORDS],
+        subset_source_mask: 0,
         source_nibbles,
         constant_result,
         root_filter,
@@ -371,6 +398,263 @@ fn build_native_bit_parallel_layout(
         root_vector_offset: None,
         accept_vector_offset: None,
     })
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct MultiwordSourceActivity {
+    expected_bits_q32: u64,
+    expected_nibbles_q32: u64,
+}
+
+fn source_word_bits(consuming_states: usize, source_word: usize) -> Option<usize> {
+    consuming_states
+        .checked_sub(source_word.checked_mul(64)?)
+        .map(|remaining| remaining.min(64))
+}
+
+fn nonzero_nibbles(mut bits: u64) -> u32 {
+    let mut count = 0_u32;
+    while bits != 0 {
+        count += u32::from(bits & 0x0f != 0);
+        bits >>= NIBBLE_BITS;
+    }
+    count
+}
+
+/// Measure a deterministic Q32 iid-byte frontier distribution, then take a
+/// Cesaro average of live source density. This uses only the authenticated
+/// classifier, direct rows, and root frontier. It intentionally declines the
+/// hybrid representation if the canonical graph's frontier distribution is
+/// too large to model within a fixed compiler-work budget. Q32 truncation is
+/// deterministic across compiler hosts and drops only sub-2^-32 mass.
+fn multiword_source_activity(
+    view: NativeBitParallelExistsView<'_>,
+    roots: [u64; MAX_BIT_PARALLEL_EXISTS_WORDS],
+) -> Option<[MultiwordSourceActivity; MAX_BIT_PARALLEL_EXISTS_WORDS]> {
+    let words = view.stats.words;
+    let mut class_weights = [0_u16; BYTE_VALUES];
+    for &class in view.byte_to_class {
+        let class = usize::from(class);
+        class_weights[class] = class_weights[class].checked_add(1)?;
+    }
+
+    let mut distribution = BTreeMap::new();
+    distribution.insert(roots, MULTIWORD_ACTIVITY_PROBABILITY_SCALE);
+    let mut activity = [MultiwordSourceActivity::default(); MAX_BIT_PARALLEL_EXISTS_WORDS];
+    let mut sampled_steps = 0_usize;
+    let mut row_unions = 0_usize;
+    let total_steps =
+        MULTIWORD_ACTIVITY_WARMUP_STEPS.checked_add(MULTIWORD_ACTIVITY_SAMPLE_STEPS)?;
+
+    for step in 0..total_steps {
+        if step >= MULTIWORD_ACTIVITY_WARMUP_STEPS {
+            let total_weight: u128 = distribution
+                .values()
+                .map(|&weight| u128::from(weight))
+                .sum();
+            if total_weight == 0 {
+                break;
+            }
+            let mut bit_weight = [0_u128; MAX_BIT_PARALLEL_EXISTS_WORDS];
+            let mut nibble_weight = [0_u128; MAX_BIT_PARALLEL_EXISTS_WORDS];
+            for (frontier, &weight) in &distribution {
+                for word in 0..words {
+                    let nonroot = frontier[word] & !roots[word];
+                    bit_weight[word] = bit_weight[word]
+                        .checked_add(u128::from(weight) * u128::from(nonroot.count_ones()))?;
+                    nibble_weight[word] = nibble_weight[word]
+                        .checked_add(u128::from(weight) * u128::from(nonzero_nibbles(nonroot)))?;
+                }
+            }
+            for word in 0..words {
+                let bit_step = bit_weight[word]
+                    .checked_mul(u128::from(MULTIWORD_ACTIVITY_PROBABILITY_SCALE))?
+                    / total_weight;
+                let nibble_step = nibble_weight[word]
+                    .checked_mul(u128::from(MULTIWORD_ACTIVITY_PROBABILITY_SCALE))?
+                    / total_weight;
+                activity[word].expected_bits_q32 = activity[word]
+                    .expected_bits_q32
+                    .checked_add(u64::try_from(bit_step).ok()?)?;
+                activity[word].expected_nibbles_q32 = activity[word]
+                    .expected_nibbles_q32
+                    .checked_add(u64::try_from(nibble_step).ok()?)?;
+            }
+            sampled_steps = sampled_steps.checked_add(1)?;
+        }
+
+        let mut raw_next = BTreeMap::new();
+        for (frontier, &weight) in &distribution {
+            for (class, &class_weight) in class_weights
+                .iter()
+                .enumerate()
+                .take(view.stats.byte_classes)
+            {
+                if class_weight == 0 {
+                    continue;
+                }
+                let mut reached = [0_u64; MAX_BIT_PARALLEL_EXISTS_WORDS];
+                for source_word in 0..words {
+                    let mut sources = frontier[source_word];
+                    while sources != 0 {
+                        row_unions = row_unions.checked_add(1)?;
+                        if row_unions > MAX_MULTIWORD_ACTIVITY_ROW_UNIONS {
+                            return None;
+                        }
+                        let source_bit = usize::try_from(sources.trailing_zeros()).ok()?;
+                        sources &= sources.checked_sub(1)?;
+                        let ordinal = source_word.checked_mul(64)?.checked_add(source_bit)?;
+                        if ordinal >= view.stats.consuming_states {
+                            return None;
+                        }
+                        let direct_base = class
+                            .checked_mul(view.stats.consuming_states)?
+                            .checked_add(ordinal)?
+                            .checked_mul(words)?;
+                        for destination_word in 0..words {
+                            reached[destination_word] |= *view
+                                .transition_masks
+                                .get(direct_base.checked_add(destination_word)?)?;
+                        }
+                    }
+                }
+                if reached[words.checked_sub(1)?] & ACCEPT_BIT != 0 {
+                    continue;
+                }
+                let mut successor = roots;
+                for word in 0..words {
+                    successor[word] |= reached[word];
+                }
+                let successor_weight = u128::from(weight).checked_mul(u128::from(class_weight))?;
+                let entry = raw_next.entry(successor).or_insert(0_u128);
+                *entry = entry.checked_add(successor_weight)?;
+                if raw_next.len() > MAX_MULTIWORD_ACTIVITY_FRONTIERS {
+                    return None;
+                }
+            }
+        }
+        let surviving_weight: u128 = raw_next.values().copied().sum();
+        if surviving_weight == 0 {
+            break;
+        }
+        let mut next = BTreeMap::new();
+        for (frontier, raw_weight) in raw_next {
+            let normalized = raw_weight
+                .checked_mul(u128::from(MULTIWORD_ACTIVITY_PROBABILITY_SCALE))?
+                / surviving_weight;
+            let normalized = u64::try_from(normalized).ok()?;
+            if normalized != 0 {
+                next.insert(frontier, normalized);
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        distribution = next;
+    }
+
+    if sampled_steps == 0 {
+        return Some(activity);
+    }
+    let denominator = u64::try_from(sampled_steps).ok()?;
+    for word_activity in activity.iter_mut().take(words) {
+        word_activity.expected_bits_q32 /= denominator;
+        word_activity.expected_nibbles_q32 /= denominator;
+    }
+    Some(activity)
+}
+
+fn multiword_source_layout(
+    consuming_states: usize,
+    words: usize,
+    subset_source_mask: u8,
+    native_row_bytes: usize,
+) -> Option<(
+    [u32; MAX_BIT_PARALLEL_EXISTS_WORDS],
+    [u8; MAX_BIT_PARALLEL_EXISTS_WORDS],
+    usize,
+)> {
+    let mut offsets = [0_u32; MAX_BIT_PARALLEL_EXISTS_WORDS];
+    let mut nibbles = [0_u8; MAX_BIT_PARALLEL_EXISTS_WORDS];
+    let mut class_bytes = 0_usize;
+    for source_word in 0..words {
+        offsets[source_word] = u32::try_from(class_bytes).ok()?;
+        let source_bits = source_word_bits(consuming_states, source_word)?;
+        if source_bits == 0 {
+            return None;
+        }
+        let source_rows = if subset_source_mask & (1_u8 << source_word) != 0 {
+            let source_nibbles = source_bits.div_ceil(NIBBLE_BITS);
+            nibbles[source_word] = u8::try_from(source_nibbles).ok()?;
+            source_nibbles.checked_mul(NIBBLE_SUBSETS)?
+        } else {
+            source_bits
+        };
+        class_bytes = class_bytes.checked_add(source_rows.checked_mul(native_row_bytes)?)?;
+    }
+    Some((offsets, nibbles, class_bytes))
+}
+
+fn admitted_multiword_subset_sources(
+    view: NativeBitParallelExistsView<'_>,
+    roots: [u64; MAX_BIT_PARALLEL_EXISTS_WORDS],
+    native_row_bytes: usize,
+    fixed_table_bytes: usize,
+) -> Option<u8> {
+    let activity = multiword_source_activity(view, roots)?;
+    let mut gains = [0_i128; MAX_BIT_PARALLEL_EXISTS_WORDS];
+    for word in 0..view.stats.words {
+        gains[word] = i128::from(activity[word].expected_bits_q32)
+            * SUBSET_ROW_DIRECT_COST_DENOMINATOR
+            - i128::from(activity[word].expected_nibbles_q32) * SUBSET_ROW_DIRECT_COST_NUMERATOR;
+    }
+
+    // Reserve the maximum scanner suffix so selection never depends on target
+    // ISA or on a later auxiliary-table append. The canonical state vectors
+    // are already included in `fixed_table_bytes`.
+    let auxiliary_reserve = ROOT_SKIP_FIRST_LANE_BYTES.checked_mul(2)?;
+    let mut best_mask = 0_u8;
+    let mut best_gain = 0_i128;
+    let mut best_data_bytes = usize::MAX;
+    for mask in 1_u8..(1_u8 << view.stats.words) {
+        let mut gain = 0_i128;
+        let mut all_profitable = true;
+        for word in 0..view.stats.words {
+            if mask & (1_u8 << word) != 0 {
+                // Gain is in quarter-row Q32 units. Two Q32 units therefore
+                // encode the required half-row expected saving.
+                if gains[word]
+                    < i128::from(MULTIWORD_ACTIVITY_PROBABILITY_SCALE)
+                        * (SUBSET_ROW_DIRECT_COST_DENOMINATOR / 2)
+                {
+                    all_profitable = false;
+                    break;
+                }
+                gain += gains[word];
+            }
+        }
+        if !all_profitable {
+            continue;
+        }
+        let (_, _, class_bytes) = multiword_source_layout(
+            view.stats.consuming_states,
+            view.stats.words,
+            mask,
+            native_row_bytes,
+        )?;
+        let data_bytes = fixed_table_bytes
+            .checked_add(view.stats.byte_classes.checked_mul(class_bytes)?)?
+            .checked_add(auxiliary_reserve)?;
+        if data_bytes > MAX_NATIVE_BIT_PARALLEL_HYBRID_DATA_BYTES {
+            continue;
+        }
+        if gain > best_gain || gain == best_gain && data_bytes < best_data_bytes {
+            best_mask = mask;
+            best_gain = gain;
+            best_data_bytes = data_bytes;
+        }
+    }
+    Some(best_mask)
 }
 
 #[allow(
@@ -535,15 +819,21 @@ fn build_native_multiword_bit_parallel_layout(
     let direct_row_words = MAX_BIT_PARALLEL_EXISTS_WORDS;
     let native_row_bytes = direct_row_words.checked_mul(core::mem::size_of::<u64>())?;
     let native_root_entries = BYTE_VALUES.checked_mul(direct_row_words)?;
-    let native_direct_entries = stats
-        .byte_classes
-        .checked_mul(stats.consuming_states)?
-        .checked_mul(direct_row_words)?;
     let root_offset = MULTIWORD_ROOT_ROWS_OFFSET;
     let direct_offset =
         root_offset.checked_add(native_root_entries.checked_mul(core::mem::size_of::<u64>())?)?;
-    let table_bytes = direct_offset
-        .checked_add(native_direct_entries.checked_mul(core::mem::size_of::<u64>())?)?;
+    let subset_source_mask = if constant_result.is_none() {
+        admitted_multiword_subset_sources(view, roots, native_row_bytes, direct_offset).unwrap_or(0)
+    } else {
+        0
+    };
+    let (source_row_offsets, source_row_nibbles, class_stride) = multiword_source_layout(
+        stats.consuming_states,
+        words,
+        subset_source_mask,
+        native_row_bytes,
+    )?;
+    let table_bytes = direct_offset.checked_add(stats.byte_classes.checked_mul(class_stride)?)?;
 
     let mut data = Vec::new();
     if constant_result.is_none() {
@@ -551,7 +841,6 @@ fn build_native_multiword_bit_parallel_layout(
             table_bytes.checked_add(ROOT_SKIP_FIRST_LANE_BYTES.checked_mul(2)?)?,
         )
         .ok()?;
-        let class_stride = stats.consuming_states.checked_mul(native_row_bytes)?;
         for byte in 0..BYTE_VALUES {
             let class_row = direct_offset
                 .checked_add(usize::from(view.byte_to_class[byte]).checked_mul(class_stride)?)?;
@@ -584,19 +873,78 @@ fn build_native_multiword_bit_parallel_layout(
                 data.extend_from_slice(&value.to_le_bytes());
             }
         }
-        for class in 0..stats.byte_classes {
-            for ordinal in 0..stats.consuming_states {
-                let source = class
-                    .checked_mul(stats.consuming_states)?
-                    .checked_add(ordinal)?
-                    .checked_mul(words)?;
-                for word in 0..direct_row_words {
-                    let value = if word < words {
-                        *view.transition_masks.get(source.checked_add(word)?)?
+        if subset_source_mask == 0 {
+            // Preserve the parent's ordinal-major table construction exactly.
+            // Besides making the compatibility boundary explicit, this keeps
+            // zero-mask object bytes independent of hybrid implementation
+            // details.
+            for class in 0..stats.byte_classes {
+                for ordinal in 0..stats.consuming_states {
+                    let source = class
+                        .checked_mul(stats.consuming_states)?
+                        .checked_add(ordinal)?
+                        .checked_mul(words)?;
+                    for word in 0..direct_row_words {
+                        let value = if word < words {
+                            *view.transition_masks.get(source.checked_add(word)?)?
+                        } else {
+                            0
+                        };
+                        data.extend_from_slice(&value.to_le_bytes());
+                    }
+                }
+            }
+        } else {
+            for class in 0..stats.byte_classes {
+                for source_word in 0..words {
+                    let source_bits = source_word_bits(stats.consuming_states, source_word)?;
+                    if subset_source_mask & (1_u8 << source_word) != 0 {
+                        for nibble in 0..usize::from(source_row_nibbles[source_word]) {
+                            for subset in 0..NIBBLE_SUBSETS {
+                                let mut reached = [0_u64; MAX_BIT_PARALLEL_EXISTS_WORDS];
+                                for nibble_bit in 0..NIBBLE_BITS {
+                                    if subset & (1 << nibble_bit) == 0 {
+                                        continue;
+                                    }
+                                    let source_bit =
+                                        nibble.checked_mul(NIBBLE_BITS)?.checked_add(nibble_bit)?;
+                                    if source_bit >= source_bits {
+                                        continue;
+                                    }
+                                    let ordinal =
+                                        source_word.checked_mul(64)?.checked_add(source_bit)?;
+                                    let source = class
+                                        .checked_mul(stats.consuming_states)?
+                                        .checked_add(ordinal)?
+                                        .checked_mul(words)?;
+                                    for word in 0..words {
+                                        reached[word] |= *view
+                                            .transition_masks
+                                            .get(source.checked_add(word)?)?;
+                                    }
+                                }
+                                for value in reached.iter().take(direct_row_words) {
+                                    data.extend_from_slice(&value.to_le_bytes());
+                                }
+                            }
+                        }
                     } else {
-                        0
-                    };
-                    data.extend_from_slice(&value.to_le_bytes());
+                        for source_bit in 0..source_bits {
+                            let ordinal = source_word.checked_mul(64)?.checked_add(source_bit)?;
+                            let source = class
+                                .checked_mul(stats.consuming_states)?
+                                .checked_add(ordinal)?
+                                .checked_mul(words)?;
+                            for word in 0..direct_row_words {
+                                let value = if word < words {
+                                    *view.transition_masks.get(source.checked_add(word)?)?
+                                } else {
+                                    0
+                                };
+                                data.extend_from_slice(&value.to_le_bytes());
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -629,7 +977,12 @@ fn build_native_multiword_bit_parallel_layout(
     let accept_vector_offset = constant_result
         .is_none()
         .then_some(u32::try_from(MULTIWORD_ACCEPT_VECTOR_OFFSET).ok()?);
-    if data.len() > MAX_NATIVE_BIT_PARALLEL_DATA_BYTES {
+    let data_limit = if subset_source_mask == 0 {
+        MAX_NATIVE_BIT_PARALLEL_DATA_BYTES
+    } else {
+        MAX_NATIVE_BIT_PARALLEL_HYBRID_DATA_BYTES
+    };
+    if data.len() > data_limit {
         return None;
     }
     Some(NativeBitParallelLayout {
@@ -639,6 +992,9 @@ fn build_native_multiword_bit_parallel_layout(
         words,
         consuming_states: stats.consuming_states,
         direct_row_words,
+        source_row_offsets,
+        source_row_nibbles,
+        subset_source_mask,
         source_nibbles: 0,
         constant_result,
         root_filter,
@@ -1056,53 +1412,138 @@ fn lower_x86_64_multiword_bit_parallel(
             }
         }
 
-        for source_word in 0..layout.words {
-            let bit_loop = assembler.label()?;
-            let bit_done = assembler.label()?;
-            x86_emit_stack_load_rax(
-                &mut assembler,
-                u8::try_from(source_word * 8)
-                    .map_err(|_| ObjectError::ArithmeticOverflow("x86 source stack offset"))?,
-            )?;
-            if layout.roots[source_word] != 0 {
-                x86_emit_movabs(&mut assembler, 0xba, !layout.roots[source_word])?;
-                assembler.instruction(&[0x4c, 0x21, 0xd0])?; // active & !root
-            }
-            assembler.instruction(&[0x48, 0x85, 0xc0])?;
-            assembler.branch(&[0x0f, 0x84], bit_done)?;
-            assembler.bind(bit_loop)?;
-            assembler.instruction(&[0x48, 0x0f, 0xbc, 0xc8])?; // bsf rax, rcx
-            assembler.instruction(&[0x48, 0xc1, 0xe1, 0x05])?; // bit * native row bytes
-            if source_word == 0 {
-                assembler.instruction(&[0x49, 0x8d, 0x34, 0x08])?;
-            } else {
-                let source_word_offset = source_word
-                    .checked_mul(64)
-                    .and_then(|states| states.checked_mul(layout.direct_row_words))
-                    .and_then(|words| words.checked_mul(core::mem::size_of::<u64>()))
-                    .ok_or(ObjectError::ArithmeticOverflow("x86 source-word row base"))?;
-                let mut direct_row = vec![0x49, 0x8d, 0xb4, 0x08];
-                direct_row.extend_from_slice(
-                    &u32::try_from(source_word_offset)
-                        .map_err(|_| ObjectError::ArithmeticOverflow("x86 source-word row base"))?
-                        .to_le_bytes(),
-                );
-                assembler.instruction(&direct_row)?;
-            }
-            if use_avx2 {
-                assembler.instruction(&[0xc5, 0xfd, 0xeb, 0x06])?; // vpor
-            } else if use_avx512_rows {
-                assembler.instruction(&[0x62, 0xf1, 0x7d, 0x28, 0xeb, 0x06])?; // vpord
-            } else {
-                assembler.instruction(&[0x66, 0x0f, 0xeb, 0x06])?; // por low row -> xmm0
-                if layout.words > 2 {
-                    assembler.instruction(&[0x66, 0x44, 0x0f, 0xeb, 0x6e, 0x10])?; // high
+        if layout.subset_source_mask == 0 {
+            // Keep the exact parent emitter for direct-only layouts. In
+            // particular, retain its source-word address progression and
+            // label allocation so the complete native object is unchanged.
+            for source_word in 0..layout.words {
+                let bit_loop = assembler.label()?;
+                let bit_done = assembler.label()?;
+                x86_emit_stack_load_rax(
+                    &mut assembler,
+                    u8::try_from(source_word * 8)
+                        .map_err(|_| ObjectError::ArithmeticOverflow("x86 source stack offset"))?,
+                )?;
+                if layout.roots[source_word] != 0 {
+                    x86_emit_movabs(&mut assembler, 0xba, !layout.roots[source_word])?;
+                    assembler.instruction(&[0x4c, 0x21, 0xd0])?; // active & !root
                 }
+                assembler.instruction(&[0x48, 0x85, 0xc0])?;
+                assembler.branch(&[0x0f, 0x84], bit_done)?;
+                assembler.bind(bit_loop)?;
+                assembler.instruction(&[0x48, 0x0f, 0xbc, 0xc8])?; // bsf rax, rcx
+                assembler.instruction(&[0x48, 0xc1, 0xe1, 0x05])?; // bit * native row bytes
+                if source_word == 0 {
+                    assembler.instruction(&[0x49, 0x8d, 0x34, 0x08])?;
+                } else {
+                    let source_word_offset = source_word
+                        .checked_mul(64)
+                        .and_then(|states| states.checked_mul(layout.direct_row_words))
+                        .and_then(|words| words.checked_mul(core::mem::size_of::<u64>()))
+                        .ok_or(ObjectError::ArithmeticOverflow("x86 source-word row base"))?;
+                    let mut direct_row = vec![0x49, 0x8d, 0xb4, 0x08];
+                    direct_row.extend_from_slice(
+                        &u32::try_from(source_word_offset)
+                            .map_err(|_| {
+                                ObjectError::ArithmeticOverflow("x86 source-word row base")
+                            })?
+                            .to_le_bytes(),
+                    );
+                    assembler.instruction(&direct_row)?;
+                }
+                if use_avx2 {
+                    assembler.instruction(&[0xc5, 0xfd, 0xeb, 0x06])?; // vpor
+                } else if use_avx512_rows {
+                    assembler.instruction(&[0x62, 0xf1, 0x7d, 0x28, 0xeb, 0x06])?; // vpord
+                } else {
+                    assembler.instruction(&[0x66, 0x0f, 0xeb, 0x06])?; // por low row -> xmm0
+                    if layout.words > 2 {
+                        assembler.instruction(&[0x66, 0x44, 0x0f, 0xeb, 0x6e, 0x10])?; // high
+                    }
+                }
+                assembler.instruction(&[0x4c, 0x8d, 0x50, 0xff])?; // active - 1 -> r10
+                assembler.instruction(&[0x4c, 0x21, 0xd0])?; // clear lowest active bit
+                assembler.branch(&[0x0f, 0x85], bit_loop)?;
+                assembler.bind(bit_done)?;
             }
-            assembler.instruction(&[0x4c, 0x8d, 0x50, 0xff])?; // active - 1 -> r10
-            assembler.instruction(&[0x4c, 0x21, 0xd0])?; // clear lowest active bit
-            assembler.branch(&[0x0f, 0x85], bit_loop)?;
-            assembler.bind(bit_done)?;
+        } else {
+            for source_word in 0..layout.words {
+                let bit_loop = assembler.label()?;
+                let bit_done = assembler.label()?;
+                x86_emit_stack_load_rax(
+                    &mut assembler,
+                    u8::try_from(source_word * 8)
+                        .map_err(|_| ObjectError::ArithmeticOverflow("x86 source stack offset"))?,
+                )?;
+                if layout.roots[source_word] != 0 {
+                    x86_emit_movabs(&mut assembler, 0xba, !layout.roots[source_word])?;
+                    assembler.instruction(&[0x4c, 0x21, 0xd0])?; // active & !root
+                }
+                assembler.instruction(&[0x48, 0x85, 0xc0])?;
+                assembler.branch(&[0x0f, 0x84], bit_done)?;
+                let source_row_offset = layout.source_row_offsets[source_word];
+                if layout.subset_source_mask & (1_u8 << source_word) != 0 {
+                    if layout.source_row_nibbles[source_word] == 0 {
+                        return Err(ObjectError::InvalidModule(
+                            "x86 multiword subset source has no nibbles",
+                        ));
+                    }
+                    if source_row_offset == 0 {
+                        assembler.instruction(&[0x4c, 0x89, 0xc6])?; // class row -> rsi
+                    } else {
+                        let mut source_base = vec![0x49, 0x8d, 0xb0];
+                        source_base.extend_from_slice(&source_row_offset.to_le_bytes());
+                        assembler.instruction(&source_base)?; // subset source base -> rsi
+                    }
+                    assembler.bind(bit_loop)?;
+                    assembler.instruction(&[0x48, 0x0f, 0xbc, 0xc8])?; // first live bit -> rcx
+                    assembler.instruction(&[0x83, 0xe1, 0xfc])?; // align to its nibble
+                    assembler.instruction(&[0x48, 0xd3, 0xe8])?; // discard lower empty nibbles
+                    assembler.instruction(&[0x48, 0xc1, 0xe1, 0x07])?; // bit * 128
+                    assembler.instruction(&[0x48, 0x01, 0xce])?; // selected nibble base
+                    assembler.instruction(&[0x48, 0x89, 0xc1])?; // active subset -> rcx
+                    assembler.instruction(&[0x83, 0xe1, 0x0f])?;
+                    assembler.instruction(&[0x48, 0xc1, 0xe1, 0x05])?; // subset row offset
+                    if use_avx2 {
+                        assembler.instruction(&[0xc5, 0xfd, 0xeb, 0x04, 0x0e])?;
+                    } else if use_avx512_rows {
+                        assembler.instruction(&[0x62, 0xf1, 0x7d, 0x28, 0xeb, 0x04, 0x0e])?;
+                    } else {
+                        assembler.instruction(&[0x66, 0x0f, 0xeb, 0x04, 0x0e])?;
+                        if layout.words > 2 {
+                            assembler.instruction(&[0x66, 0x44, 0x0f, 0xeb, 0x6c, 0x0e, 0x10])?;
+                        }
+                    }
+                    assembler.instruction(&[0x48, 0x81, 0xc6, 0x00, 0x02, 0x00, 0x00])?;
+                    assembler.instruction(&[0x48, 0xc1, 0xe8, 0x04])?; // consume the nibble
+                    assembler.branch(&[0x0f, 0x85], bit_loop)?;
+                } else {
+                    assembler.bind(bit_loop)?;
+                    assembler.instruction(&[0x48, 0x0f, 0xbc, 0xc8])?; // bsf rax, rcx
+                    assembler.instruction(&[0x48, 0xc1, 0xe1, 0x05])?; // bit * native row bytes
+                    if source_row_offset == 0 {
+                        assembler.instruction(&[0x49, 0x8d, 0x34, 0x08])?;
+                    } else {
+                        let mut direct_row = vec![0x49, 0x8d, 0xb4, 0x08];
+                        direct_row.extend_from_slice(&source_row_offset.to_le_bytes());
+                        assembler.instruction(&direct_row)?;
+                    }
+                    if use_avx2 {
+                        assembler.instruction(&[0xc5, 0xfd, 0xeb, 0x06])?; // vpor
+                    } else if use_avx512_rows {
+                        assembler.instruction(&[0x62, 0xf1, 0x7d, 0x28, 0xeb, 0x06])?; // vpord
+                    } else {
+                        assembler.instruction(&[0x66, 0x0f, 0xeb, 0x06])?; // por low row -> xmm0
+                        if layout.words > 2 {
+                            assembler.instruction(&[0x66, 0x44, 0x0f, 0xeb, 0x6e, 0x10])?; // high
+                        }
+                    }
+                    assembler.instruction(&[0x4c, 0x8d, 0x50, 0xff])?; // active - 1 -> r10
+                    assembler.instruction(&[0x4c, 0x21, 0xd0])?; // clear lowest active bit
+                    assembler.branch(&[0x0f, 0x85], bit_loop)?;
+                }
+                assembler.bind(bit_done)?;
+            }
         }
 
         assembler.bind(finish_reached)?;
@@ -1887,62 +2328,168 @@ fn lower_aarch64_multiword_bit_parallel(
                 )?)?;
             }
         }
-        assembler.instruction(aarch64_mov_x(1, 17)?)?; // current source-word row base
-
-        for source_word in 0..layout.words {
-            let bit_loop = assembler.label()?;
-            let bit_done = assembler.label()?;
-            let active = u8::try_from(8 + source_word)
-                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 source register"))?;
-            if !use_asimd_state_vectors && layout.roots[source_word] != 0 {
-                assembler.instruction(aarch64_bic_x(
-                    active,
-                    active,
-                    u8::try_from(19 + source_word)
-                        .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 root register"))?,
-                )?)?;
-            }
-            assembler.branch_zero_x(active, bit_done)?;
-            assembler.bind(bit_loop)?;
-            assembler.instruction(aarch64_rbit_x(6, active)?)?;
-            assembler.instruction(aarch64_clz_x(6, 6)?)?;
-            assembler.instruction(super::aarch64_sub_x_imm(7, active, 1)?)?;
-            assembler.instruction(aarch64_ands_x(active, active, 7)?)?;
-            assembler.instruction(super::aarch64_add_x_lsl(6, 1, 6, 5)?)?;
-            if use_asimd {
-                if layout.words > 2 {
-                    assembler.instruction(super::aarch64_load_pair_q(2, 3, 6, 0)?)?;
-                    assembler.instruction(aarch64_orr_16b(0, 0, 2)?)?;
-                    assembler.instruction(aarch64_orr_16b(1, 1, 3)?)?;
-                } else {
-                    assembler.instruction(aarch64_load_q(2, 6)?)?;
-                    assembler.instruction(aarch64_orr_16b(0, 0, 2)?)?;
-                }
-            } else {
-                for destination_word in 0..layout.words {
-                    assembler.instruction(aarch64_load_x_imm(
-                        7,
-                        6,
-                        u16::try_from(destination_word * 8).map_err(|_| {
-                            ObjectError::ArithmeticOverflow("AArch64 direct row offset")
+        if layout.subset_source_mask == 0 {
+            // Keep the exact parent direct-row emitter, including its single
+            // rolling source pointer, when graph activity selects no hybrid
+            // source words.
+            assembler.instruction(aarch64_mov_x(1, 17)?)?; // current source-word row base
+            for source_word in 0..layout.words {
+                let bit_loop = assembler.label()?;
+                let bit_done = assembler.label()?;
+                let active = u8::try_from(8 + source_word)
+                    .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 source register"))?;
+                if !use_asimd_state_vectors && layout.roots[source_word] != 0 {
+                    assembler.instruction(aarch64_bic_x(
+                        active,
+                        active,
+                        u8::try_from(19 + source_word).map_err(|_| {
+                            ObjectError::ArithmeticOverflow("AArch64 root register")
                         })?,
                     )?)?;
-                    let reached = u8::try_from(12 + destination_word)
-                        .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 reached register"))?;
-                    assembler.instruction(aarch64_orr_x(reached, reached, 7)?)?;
                 }
-            }
-            assembler.branch_cond(AARCH64_NE, bit_loop)?;
-            assembler.bind(bit_done)?;
-            if source_word + 1 != layout.words {
-                assembler.instruction(aarch64_add_x_imm(
-                    1,
-                    1,
-                    u16::try_from(64 * layout.direct_row_words * core::mem::size_of::<u64>())
-                        .map_err(|_| {
+                assembler.branch_zero_x(active, bit_done)?;
+                assembler.bind(bit_loop)?;
+                assembler.instruction(aarch64_rbit_x(6, active)?)?;
+                assembler.instruction(aarch64_clz_x(6, 6)?)?;
+                assembler.instruction(super::aarch64_sub_x_imm(7, active, 1)?)?;
+                assembler.instruction(aarch64_ands_x(active, active, 7)?)?;
+                assembler.instruction(super::aarch64_add_x_lsl(6, 1, 6, 5)?)?;
+                if use_asimd {
+                    if layout.words > 2 {
+                        assembler.instruction(super::aarch64_load_pair_q(2, 3, 6, 0)?)?;
+                        assembler.instruction(aarch64_orr_16b(0, 0, 2)?)?;
+                        assembler.instruction(aarch64_orr_16b(1, 1, 3)?)?;
+                    } else {
+                        assembler.instruction(aarch64_load_q(2, 6)?)?;
+                        assembler.instruction(aarch64_orr_16b(0, 0, 2)?)?;
+                    }
+                } else {
+                    for destination_word in 0..layout.words {
+                        assembler.instruction(aarch64_load_x_imm(
+                            7,
+                            6,
+                            u16::try_from(destination_word * 8).map_err(|_| {
+                                ObjectError::ArithmeticOverflow("AArch64 direct row offset")
+                            })?,
+                        )?)?;
+                        let reached = u8::try_from(12 + destination_word).map_err(|_| {
+                            ObjectError::ArithmeticOverflow("AArch64 reached register")
+                        })?;
+                        assembler.instruction(aarch64_orr_x(reached, reached, 7)?)?;
+                    }
+                }
+                assembler.branch_cond(AARCH64_NE, bit_loop)?;
+                assembler.bind(bit_done)?;
+                if source_word + 1 != layout.words {
+                    assembler.instruction(aarch64_add_x_imm(
+                        1,
+                        1,
+                        u16::try_from(64 * layout.direct_row_words * core::mem::size_of::<u64>())
+                            .map_err(|_| {
                             ObjectError::ArithmeticOverflow("AArch64 source-word row stride")
                         })?,
-                )?)?;
+                    )?)?;
+                }
+            }
+        } else {
+            for source_word in 0..layout.words {
+                let bit_loop = assembler.label()?;
+                let bit_done = assembler.label()?;
+                let source_row_offset = layout.source_row_offsets[source_word];
+                if source_row_offset == 0 {
+                    assembler.instruction(aarch64_mov_x(1, 17)?)?;
+                } else {
+                    aarch64_load_u64_constant(&mut assembler, 6, u64::from(source_row_offset))?;
+                    assembler.instruction(aarch64_add_x_reg(1, 17, 6)?)?;
+                }
+                let active = u8::try_from(8 + source_word)
+                    .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 source register"))?;
+                if !use_asimd_state_vectors && layout.roots[source_word] != 0 {
+                    assembler.instruction(aarch64_bic_x(
+                        active,
+                        active,
+                        u8::try_from(19 + source_word).map_err(|_| {
+                            ObjectError::ArithmeticOverflow("AArch64 root register")
+                        })?,
+                    )?)?;
+                }
+                assembler.branch_zero_x(active, bit_done)?;
+                if layout.subset_source_mask & (1_u8 << source_word) != 0 {
+                    if layout.source_row_nibbles[source_word] == 0 {
+                        return Err(ObjectError::InvalidModule(
+                            "AArch64 multiword subset source has no nibbles",
+                        ));
+                    }
+                    assembler.bind(bit_loop)?;
+                    assembler.instruction(aarch64_rbit_x(6, active)?)?;
+                    assembler.instruction(aarch64_clz_x(6, 6)?)?;
+                    assembler.instruction(aarch64_lsr_x_imm(6, 6, 2)?)?; // first nibble
+                    assembler.instruction(super::aarch64_add_x_lsl(7, 31, 6, 2)?)?;
+                    assembler.instruction(super::aarch64_lsrv_x(active, active, 7)?)?;
+                    assembler.instruction(super::aarch64_add_x_lsl(1, 1, 6, 9)?)?;
+                    assembler.instruction(aarch64_and_low_x(7, active, 4)?)?;
+                    assembler.instruction(super::aarch64_add_x_lsl(6, 1, 7, 5)?)?;
+                    if use_asimd {
+                        if layout.words > 2 {
+                            assembler.instruction(super::aarch64_load_pair_q(2, 3, 6, 0)?)?;
+                            assembler.instruction(aarch64_orr_16b(0, 0, 2)?)?;
+                            assembler.instruction(aarch64_orr_16b(1, 1, 3)?)?;
+                        } else {
+                            assembler.instruction(aarch64_load_q(2, 6)?)?;
+                            assembler.instruction(aarch64_orr_16b(0, 0, 2)?)?;
+                        }
+                    } else {
+                        for destination_word in 0..layout.words {
+                            assembler.instruction(aarch64_load_x_imm(
+                                7,
+                                6,
+                                u16::try_from(destination_word * 8).map_err(|_| {
+                                    ObjectError::ArithmeticOverflow("AArch64 subset row offset")
+                                })?,
+                            )?)?;
+                            let reached = u8::try_from(12 + destination_word).map_err(|_| {
+                                ObjectError::ArithmeticOverflow("AArch64 reached register")
+                            })?;
+                            assembler.instruction(aarch64_orr_x(reached, reached, 7)?)?;
+                        }
+                    }
+                    assembler.instruction(aarch64_add_x_imm(1, 1, 512)?)?;
+                    assembler.instruction(aarch64_lsr_x_imm(active, active, 4)?)?;
+                    assembler.branch_nonzero_x(active, bit_loop)?;
+                } else {
+                    assembler.bind(bit_loop)?;
+                    assembler.instruction(aarch64_rbit_x(6, active)?)?;
+                    assembler.instruction(aarch64_clz_x(6, 6)?)?;
+                    assembler.instruction(super::aarch64_sub_x_imm(7, active, 1)?)?;
+                    assembler.instruction(aarch64_ands_x(active, active, 7)?)?;
+                    assembler.instruction(super::aarch64_add_x_lsl(6, 1, 6, 5)?)?;
+                    if use_asimd {
+                        if layout.words > 2 {
+                            assembler.instruction(super::aarch64_load_pair_q(2, 3, 6, 0)?)?;
+                            assembler.instruction(aarch64_orr_16b(0, 0, 2)?)?;
+                            assembler.instruction(aarch64_orr_16b(1, 1, 3)?)?;
+                        } else {
+                            assembler.instruction(aarch64_load_q(2, 6)?)?;
+                            assembler.instruction(aarch64_orr_16b(0, 0, 2)?)?;
+                        }
+                    } else {
+                        for destination_word in 0..layout.words {
+                            assembler.instruction(aarch64_load_x_imm(
+                                7,
+                                6,
+                                u16::try_from(destination_word * 8).map_err(|_| {
+                                    ObjectError::ArithmeticOverflow("AArch64 direct row offset")
+                                })?,
+                            )?)?;
+                            let reached = u8::try_from(12 + destination_word).map_err(|_| {
+                                ObjectError::ArithmeticOverflow("AArch64 reached register")
+                            })?;
+                            assembler.instruction(aarch64_orr_x(reached, reached, 7)?)?;
+                        }
+                    }
+                    assembler.branch_cond(AARCH64_NE, bit_loop)?;
+                }
+                assembler.bind(bit_done)?;
             }
         }
 
@@ -2081,6 +2628,8 @@ fn lower_aarch64_multiword_bit_parallel(
 
 #[cfg(test)]
 mod tests {
+    use core::fmt::Write as _;
+
     use super::*;
     use crate::{
         CompileLimitsV1, CompileMode, CompileRequest, CompiledProgram, CpuFeature,
@@ -2208,6 +2757,18 @@ mod tests {
         compiled
     }
 
+    fn compiled_hybrid_subset_sidecar(target: Target) -> crate::CompiledRegex {
+        let pattern = format!("(?s-u:{}z)", ".".repeat(128));
+        let compiled = compiled_sidecar_for(&pattern, target);
+        let view = compiled
+            .program()
+            .native_bit_parallel_exists_view()
+            .expect("hybrid subset sidecar");
+        let layout = build_native_bit_parallel_layout(view).expect("hybrid subset layout");
+        assert_ne!(layout.subset_source_mask, 0);
+        compiled
+    }
+
     fn compiled_recurrence_only_sidecar_for_words(
         target: Target,
         expected_words: usize,
@@ -2238,6 +2799,118 @@ mod tests {
             .windows(needle.len())
             .filter(|window| *window == needle)
             .count()
+    }
+
+    fn digest_hex(digest: [u8; 32]) -> String {
+        let mut result = String::with_capacity(64);
+        for byte in digest {
+            write!(&mut result, "{byte:02x}").unwrap();
+        }
+        result
+    }
+
+    #[test]
+    fn zero_subset_mask_preserves_parent_objects_across_isas_and_word_counts() {
+        // Full-object digests from clean parent 9234b0a2. These pin the table
+        // layout, recurrence emitter, relocations, and target feature routing
+        // together; a structural layout assertion alone would miss any code
+        // drift in the zero-mask compatibility path.
+        let avx512 = FeatureSet::of(CpuFeature::X86Avx512F).with(CpuFeature::X86Avx512Vl);
+        let sve = FeatureSet::of(CpuFeature::Aarch64Sve);
+        let sve2 = sve.with(CpuFeature::Aarch64Sve2);
+        let targets = [
+            (
+                "x86-sse2",
+                Target::x86_64_linux(),
+                [
+                    "5d9a51ee5c796c509c0afe20ea8106271ac6665ec72ed805467432a94ee712b2",
+                    "e45e1e03431c9c853b0db89892a8f8936995b6b53c79e3f43af12f89ca5de03b",
+                    "46cc94433ad7de815abeb770382158c3847c8132dd547c052cd7a8adf73af474",
+                ],
+            ),
+            (
+                "x86-avx2",
+                Target::x86_64_linux()
+                    .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+                    .unwrap(),
+                [
+                    "ce84a5ff1619395c68de365f3c1092a48e1a1d95bbd78f438215a01f011df3e3",
+                    "1b50be47d9dd2b8d43c69dc021783115542ddca817ed39b5d338a58915f695c2",
+                    "a8fde9c16d5c6c7e9c982113d47dd52db81894e191b4658b9788c2b3766ca098",
+                ],
+            ),
+            (
+                "x86-avx512",
+                Target::x86_64_linux().with_features(avx512).unwrap(),
+                [
+                    "cd962dc750fb42ca598833fa506a33e9d7b4b4ed1707da8b2524858f81a3f261",
+                    "f96539981795191dcc9a60958d38682a7912da8370dd1b26b4b57be413c711a2",
+                    "2e357a5b8e781c2164c3badd6019b58eab86ca542e1374e6793304323589286b",
+                ],
+            ),
+            (
+                "arm-scalar",
+                Target::aarch64_macos(),
+                [
+                    "51a1a7abeb990a428b705fd557c2337003c05f53cbc84c1b91aee063783575e6",
+                    "e4bc11062634dbdee27071691a68c7c8e9d20989355f646cc5d6493ff884c9c0",
+                    "60e328d49744f74e8e0df0400757ae447040f547af10309d42668345550ca688",
+                ],
+            ),
+            (
+                "arm-asimd",
+                Target::aarch64_macos()
+                    .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                    .unwrap(),
+                [
+                    "cb94903114323e5da58c8edcbee614aad77bf4bae81654816bd75a4b25ab6472",
+                    "00670fc9565fb5940c274babeb066013b865fc168caa7b504b68bc6f0928bacb",
+                    "524297bf47de2acf77797ed5dd20f7f9b6176437b1a461b26a601f1be3b3a90e",
+                ],
+            ),
+            (
+                "arm-sve",
+                Target::aarch64_linux().with_features(sve).unwrap(),
+                [
+                    "d1d37264e85d1e869aecc7b511b1c1fd5288e64f95787a152b2c3181ab736921",
+                    "5beed424b45036a16d0f0488e7b2723c45685d8d7e5a7ecd4a499359bceb5c14",
+                    "3077a69df6a2d0a5d52915a12db3a09468f2ac1c9dfa78ab3ba77b0677d9e915",
+                ],
+            ),
+            (
+                "arm-sve2",
+                Target::aarch64_linux().with_features(sve2).unwrap(),
+                [
+                    "337ec04efb26d5d743175ee33422f286135d415cff851af0ec92d172395d07e9",
+                    "3aec92def5ea3615e99a2ab8cfc4ed1b259ee225b7bd757a4e66e5f6d54a1c3d",
+                    "7f4832f05eb45c85348bba58c6adb6f4e8e4f7ba4a25fc5255b733b0c31cf6ed",
+                ],
+            ),
+        ];
+        for (target_name, target, expected_digests) in targets {
+            for (word_index, pattern_repetitions) in [78_usize, 142, 206].into_iter().enumerate()
+            {
+                let pattern = format!(
+                    r"(?:{}Q|(?-u:\xFF))",
+                    "[abcdefghijklm]".repeat(pattern_repetitions)
+                );
+                let compiled = compiled_sidecar_for(&pattern, target);
+                let view = compiled
+                    .program()
+                    .native_bit_parallel_exists_view()
+                    .expect("zero-mask compatibility sidecar");
+                let layout = build_native_bit_parallel_layout(view)
+                    .expect("zero-mask compatibility native layout");
+                assert_eq!(layout.words, word_index + 2, "{target_name}");
+                assert_eq!(layout.subset_source_mask, 0, "{target_name}");
+                assert_eq!(
+                    digest_hex(compiled.receipt().object_sha256),
+                    expected_digests[word_index],
+                    "{target_name} W{}",
+                    word_index + 2
+                );
+            }
+        }
     }
 
     #[allow(
@@ -2349,6 +3022,206 @@ mod tests {
                 derivation_work: 0,
             },
         }
+    }
+
+    fn synthetic_multiword_view<'a>(
+        consuming_states: usize,
+        byte_to_class: &'a [u8; BYTE_VALUES],
+        masks: &'a [u64],
+        root_masks: &'a [u64],
+        initial: [u64; MAX_BIT_PARALLEL_EXISTS_WORDS],
+    ) -> NativeBitParallelExistsView<'a> {
+        let words = consuming_states.checked_add(1).unwrap().div_ceil(64);
+        let byte_classes = usize::from(*byte_to_class.iter().max().unwrap()) + 1;
+        let retained_bytes = core::mem::size_of::<BitParallelExists>()
+            .checked_add(core::mem::size_of_val(masks))
+            .and_then(|bytes| bytes.checked_add(core::mem::size_of_val(root_masks)))
+            .unwrap();
+        NativeBitParallelExistsView {
+            byte_to_class,
+            transition_masks: masks,
+            root_transition_masks: root_masks,
+            initial,
+            stats: crate::BitParallelExistsStats {
+                thompson_states: consuming_states,
+                thompson_edges: 0,
+                consuming_states,
+                byte_classes,
+                words,
+                source_nibbles: 0,
+                transition_entries: masks.len(),
+                root_transition_entries: root_masks.len(),
+                retained_bytes,
+                peak_build_bytes: retained_bytes,
+                derivation_work: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn dense_graph_activity_selects_exact_bounded_hybrid_subset_rows() {
+        let consuming_states = 65;
+        let words = 2;
+        let byte_to_class = [0_u8; BYTE_VALUES];
+        let mut masks = vec![0_u64; consuming_states * words];
+        for ordinal in 0..consuming_states {
+            masks[ordinal * words] = u64::MAX;
+        }
+        let mut root_masks = vec![0_u64; BYTE_VALUES * words];
+        for byte in 0..BYTE_VALUES {
+            root_masks[byte * words] = u64::MAX;
+        }
+        let view = synthetic_multiword_view(
+            consuming_states,
+            &byte_to_class,
+            &masks,
+            &root_masks,
+            [1, 0, 0, 0],
+        );
+        let layout = build_native_bit_parallel_layout(view).expect("dense hybrid layout");
+        assert_eq!(layout.subset_source_mask, 1);
+        assert_eq!(layout.source_row_nibbles, [16, 0, 0, 0]);
+        assert_eq!(layout.source_row_offsets[0], 0);
+        assert_eq!(layout.source_row_offsets[1], 16 * 16 * 32);
+        assert!(layout.data.len() <= MAX_NATIVE_BIT_PARALLEL_DATA_BYTES);
+
+        let class_row = usize::try_from(u32::from_le_bytes(
+            layout.data[..CLASSIFIER_ENTRY_BYTES].try_into().unwrap(),
+        ))
+        .unwrap();
+        for nibble in 0..16 {
+            for subset in 0..NIBBLE_SUBSETS {
+                let packed_row = class_row + (nibble * NIBBLE_SUBSETS + subset) * 32;
+                let expected = if subset == 0 { 0 } else { u64::MAX };
+                assert_eq!(
+                    u64::from_le_bytes(layout.data[packed_row..packed_row + 8].try_into().unwrap()),
+                    expected
+                );
+                for word in 1..MAX_BIT_PARALLEL_EXISTS_WORDS {
+                    assert_eq!(
+                        u64::from_le_bytes(
+                            layout.data[packed_row + word * 8..packed_row + word * 8 + 8]
+                                .try_into()
+                                .unwrap()
+                        ),
+                        0
+                    );
+                }
+            }
+        }
+        let cold_row = class_row + usize::try_from(layout.source_row_offsets[1]).unwrap();
+        assert_eq!(
+            u64::from_le_bytes(layout.data[cold_row..cold_row + 8].try_into().unwrap()),
+            u64::MAX
+        );
+
+        let avx2 = Target::x86_64_linux()
+            .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+            .unwrap();
+        let x86 = lower_x86_64_bit_parallel(&layout, avx2).expect("x86 hybrid leaf");
+        assert_eq!(x86.emitted_words, words);
+        assert!(x86.code.len() <= MAX_NATIVE_BIT_PARALLEL_CODE_BYTES);
+        assert_eq!(count_bytes(&x86.code, &[0x83, 0xe1, 0xfc]), 1);
+        assert_eq!(count_bytes(&x86.code, &[0xc5, 0xfd, 0xeb, 0x04, 0x0e]), 1);
+
+        let asimd = Target::aarch64_macos()
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+            .unwrap();
+        let arm = lower_aarch64_bit_parallel(&layout, asimd).expect("ASIMD hybrid leaf");
+        assert_eq!(arm.emitted_words, words);
+        assert!(arm.code.len() <= MAX_NATIVE_BIT_PARALLEL_CODE_BYTES);
+        let arm_words = arm
+            .code
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(arm_words.contains(&super::super::aarch64_lsrv_x(8, 8, 7).unwrap()));
+        assert!(arm_words.contains(&aarch64_and_low_x(7, 8, 4).unwrap()));
+
+        // This is the address progression emitted by both loops: after one
+        // loaded nibble, BSF or RBIT+CLZ skips directly over every interior
+        // zero nibble before the next load.
+        fn emitted_subset_rows(mut active: u64) -> Vec<(usize, usize)> {
+            let mut nibble_base = 0_usize;
+            let mut rows = Vec::new();
+            while active != 0 {
+                let aligned_bit = usize::try_from(active.trailing_zeros()).unwrap() & !3;
+                active >>= aligned_bit;
+                nibble_base += aligned_bit / NIBBLE_BITS;
+                rows.push((nibble_base, usize::try_from(active & 0x0f).unwrap()));
+                active >>= NIBBLE_BITS;
+                nibble_base += 1;
+            }
+            rows
+        }
+        for (active, expected) in [
+            (1_u64 | 1_u64 << 60, vec![(0, 1), (15, 1)]),
+            (
+                0b1011_u64 | 0b1100_u64 << 28 | 1_u64 << 60,
+                vec![(0, 11), (7, 12), (15, 1)],
+            ),
+        ] {
+            let rows = emitted_subset_rows(active);
+            assert_eq!(rows, expected);
+            assert_eq!(
+                rows.len(),
+                usize::try_from(nonzero_nibbles(active)).unwrap()
+            );
+            for (nibble, subset) in rows {
+                let offset = class_row + (nibble * NIBBLE_SUBSETS + subset) * 32;
+                assert!(
+                    offset < class_row + usize::try_from(layout.source_row_offsets[1]).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hybrid_activity_uses_exact_byte_class_mass_not_class_count() {
+        let consuming_states = 65;
+        let words = 2;
+        let mut byte_to_class = [0_u8; BYTE_VALUES];
+        byte_to_class[BYTE_VALUES - 1] = 1;
+        let mut masks = vec![0_u64; 2 * consuming_states * words];
+        let rare_class = consuming_states * words;
+        for ordinal in 0..consuming_states {
+            masks[rare_class + ordinal * words] = u64::MAX;
+        }
+        let mut root_masks = vec![0_u64; BYTE_VALUES * words];
+        root_masks[(BYTE_VALUES - 1) * words] = u64::MAX;
+        let view = synthetic_multiword_view(
+            consuming_states,
+            &byte_to_class,
+            &masks,
+            &root_masks,
+            [1, 0, 0, 0],
+        );
+        let activity = multiword_source_activity(view, [1, 0, 0, 0]).unwrap();
+        assert_eq!(
+            activity[0].expected_bits_q32,
+            MULTIWORD_ACTIVITY_PROBABILITY_SCALE * 63 / 256
+        );
+        assert_eq!(
+            activity[0].expected_nibbles_q32,
+            MULTIWORD_ACTIVITY_PROBABILITY_SCALE * 16 / 256
+        );
+        let layout = build_native_bit_parallel_layout(view).expect("byte-mass layout");
+        assert_eq!(layout.subset_source_mask, 0);
+    }
+
+    #[test]
+    fn general_wildcard_pipeline_admits_hybrid_rows_without_pattern_identity() {
+        let compiled = compiled_hybrid_subset_sidecar(Target::aarch64_macos());
+        let view = compiled
+            .program()
+            .native_bit_parallel_exists_view()
+            .unwrap();
+        assert!(view.stats.words >= 2);
+        assert!(compiled.module().required_runtime_symbol().is_none());
+        assert!(
+            compiled.module().sections()[1].bytes().len() <= MAX_NATIVE_BIT_PARALLEL_DATA_BYTES
+        );
+        assert!(compiled.module().code_bytes() <= MAX_NATIVE_BIT_PARALLEL_CODE_BYTES);
     }
 
     #[test]
@@ -3278,6 +4151,7 @@ mod tests {
             12..=14 => {
                 compiled_recurrence_only_sidecar_for_words(target, usize::from(machine - 10))
             }
+            15 => compiled_hybrid_subset_sidecar(target),
             _ => panic!("unknown bit-parallel fixture"),
         };
         assert!(compiled.module().required_runtime_symbol().is_none());
@@ -3352,6 +4226,11 @@ mod tests {
                     vec![b'x'; 129],
                 ]
             }
+            15 => {
+                let mut matching = vec![b'x'; 128];
+                matching.push(b'z');
+                vec![Vec::new(), b"z".to_vec(), vec![b'x'; 64], matching]
+            }
             _ => unreachable!(),
         };
         let fixture_name = match machine {
@@ -3361,6 +4240,7 @@ mod tests {
             10 => "dense-one".to_owned(),
             11 => "wide-one".to_owned(),
             12..=14 => format!("dense-words-{}", machine - 10),
+            15 => "hybrid-subsets".to_owned(),
             _ => unreachable!(),
         };
         let directory = std::env::temp_dir().join(format!(
@@ -3379,6 +4259,9 @@ mod tests {
             "#include <stdint.h>\n#include <stddef.h>\nextern uint32_t {symbol}(const unsigned char*,size_t,size_t,size_t,size_t*);\n"
         );
         let mut calls = String::from("int main(void){size_t r[2],i,j,k;uint32_t s;\n");
+        let mut portable_workspace = compiled
+            .prepare_workspace()
+            .expect("prepare reusable portable differential workspace");
         for (haystack_index, haystack) in haystacks.iter().enumerate() {
             let bytes = if haystack.is_empty() {
                 "0".to_owned()
@@ -3398,7 +4281,11 @@ mod tests {
             for start in 0..=haystack.len() {
                 for end in start..=haystack.len() {
                     let result = compiled
-                        .search(haystack, SearchWindow::new(start, end))
+                        .search_with_workspace(
+                            haystack,
+                            SearchWindow::new(start, end),
+                            &mut portable_workspace,
+                        )
                         .expect("portable result");
                     let MatchResult::Exists(found) = result else {
                         panic!("Exists contract changed")
@@ -3486,6 +4373,39 @@ mod tests {
         any(target_os = "linux", target_os = "macos")
     ))]
     #[test]
+    #[ignore = "links and executes the admitted hybrid subset-row leaf on the host"]
+    fn linked_host_hybrid_subset_rows_match_portable_for_every_window() {
+        let target = if cfg!(target_arch = "x86_64") {
+            if cfg!(target_os = "linux") {
+                Target::x86_64_linux()
+            } else {
+                Target::x86_64_macos()
+            }
+        } else if cfg!(target_os = "linux") {
+            Target::aarch64_linux()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                .unwrap()
+        } else {
+            Target::aarch64_macos()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                .unwrap()
+        };
+        run_linked_bit_parallel_differential(target, false, 15);
+        if cfg!(target_arch = "aarch64") {
+            let scalar = if cfg!(target_os = "linux") {
+                Target::aarch64_linux()
+            } else {
+                Target::aarch64_macos()
+            };
+            run_linked_bit_parallel_differential(scalar, false, 15);
+        }
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
     #[ignore = "links and executes the bit-parallel fallback leaf on the host"]
     fn linked_host_bit_parallel_exists_matches_portable_for_every_window() {
         let target = if cfg!(target_arch = "x86_64") {
@@ -3507,6 +4427,7 @@ mod tests {
         run_linked_bit_parallel_differential(target, false, 1);
         run_linked_bit_parallel_differential(target, false, 10);
         run_linked_bit_parallel_differential(target, false, 11);
+        run_linked_bit_parallel_differential(target, false, 15);
         for words in 2..=4 {
             run_linked_bit_parallel_differential(target, false, words);
             run_linked_bit_parallel_differential(target, false, words + 10);
@@ -3523,6 +4444,7 @@ mod tests {
             }
             run_linked_bit_parallel_differential(scalar_target, false, 10);
             run_linked_bit_parallel_differential(scalar_target, false, 11);
+            run_linked_bit_parallel_differential(scalar_target, false, 15);
         }
     }
 
@@ -3543,7 +4465,19 @@ mod tests {
                     u8::try_from(words).expect("bit-parallel word count fits in fixture selector"),
                 );
             }
+            run_linked_bit_parallel_differential(target, false, 15);
         }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    #[ignore = "cross-links admitted SSE2/AVX2 hybrid rows and executes them through Rosetta"]
+    fn linked_x86_64_hybrid_subset_rows_match_portable_under_rosetta() {
+        run_linked_bit_parallel_differential(Target::x86_64_macos(), true, 15);
+        let avx2 = Target::x86_64_macos()
+            .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+            .unwrap();
+        run_linked_bit_parallel_differential(avx2, true, 15);
     }
 
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
@@ -3554,6 +4488,7 @@ mod tests {
         run_linked_bit_parallel_differential(Target::x86_64_macos(), true, 1);
         run_linked_bit_parallel_differential(Target::x86_64_macos(), true, 10);
         run_linked_bit_parallel_differential(Target::x86_64_macos(), true, 11);
+        run_linked_bit_parallel_differential(Target::x86_64_macos(), true, 15);
         for words in 2..=4 {
             run_linked_bit_parallel_differential(Target::x86_64_macos(), true, words);
             run_linked_bit_parallel_differential(Target::x86_64_macos(), true, words + 10);
@@ -3565,5 +4500,6 @@ mod tests {
             run_linked_bit_parallel_differential(avx2, true, words);
             run_linked_bit_parallel_differential(avx2, true, words + 10);
         }
+        run_linked_bit_parallel_differential(avx2, true, 15);
     }
 }
