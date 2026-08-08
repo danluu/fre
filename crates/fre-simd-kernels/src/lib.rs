@@ -82,6 +82,7 @@ pub use byte_set::{
 pub use byte_set4::{
     classify_byte_set1_16, classify_byte_set1_32, classify_byte_set2_16, classify_byte_set2_32,
     classify_byte_set3_16, classify_byte_set3_32, classify_byte_set4_16, classify_byte_set4_32,
+    find_byte_values16_32_block,
 };
 pub use nonmember_run::{
     ASCII_NONMEMBER_RUN_MAX_CLASSIFICATION_OVERHEAD, ASCII_NONMEMBER_RUN_SCANNER_BUILD_WORK,

@@ -17570,7 +17570,7 @@ mod tests {
         BoundedLiteralClassRunPlan, DispatchedPrefixClassAlternationSearchCursor,
         FixedPredicateWord64AdaptiveFinderKind, FixedPredicateWord64AdaptiveHandoffIdentity,
         FixedPredicateWord64Reducer, FixedPredicateWord64SearchCursor,
-        PrefixClassAlternationSearchCursor,
+        PrefixClassAlternationSearchCursor, UnicodeScalarSearchCursor,
     };
     use fre_lower::UnsupportedFeature;
     use std::fmt::Write as _;
@@ -31134,9 +31134,21 @@ mod tests {
         let SearchAccounting::UnicodeScalarRun(accounting) = accounting else {
             panic!("Unicode scalar-run route returned another accounting family");
         };
-        assert_eq!(accounting.actual.leading_block_classifications, 0);
-        assert_eq!(accounting.actual.leading_block_classification_bytes, 0);
-        assert!(accounting.actual.leading_scalar_probes >= 96);
+        assert_eq!(accounting.actual.leading_block_classifications, 3);
+        assert_eq!(accounting.actual.leading_block_classification_bytes, 96);
+        let expected_scalar_probes = if cfg!(all(
+            feature = "static-dispatch-arm-41-d84",
+            target_arch = "aarch64",
+            target_os = "linux",
+            target_endian = "little",
+            target_feature = "sve",
+            target_feature = "sve2"
+        )) {
+            0
+        } else {
+            3
+        };
+        assert_eq!(accounting.actual.leading_scalar_probes, expected_scalar_probes);
         let refused = SearchLimits {
             max_work: u64::try_from(accounting.upper_bounds.work - 1).unwrap(),
             max_scratch_bytes: usize::MAX,

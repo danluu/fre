@@ -36,15 +36,15 @@ pub const DISPATCHED_PLAN_ID: &str =
 pub const RUN_PLAN_ID: &str = "unicode-scalar-aggregate.ascii-runs-utf8-stream-ranges.run-plus.v2";
 /// Stable identity for direct selected-span search over one positive root
 /// Unicode scalar-class repetition.
-pub const SEARCH_PLAN_ID: &str = "unicode-scalar-run-search.leading-byte-cardinality-ranges.v2";
+pub const SEARCH_PLAN_ID: &str = "unicode-scalar-run-search.leading-byte-cardinality-ranges.v4";
 /// Stable identity for selected-span search.
 pub const SEARCH_OPERATION_ID: &str = "unicode-scalar-run-search.selected-span.v1";
 /// Stable identity for existence search.
 pub const SEARCH_EXISTS_OPERATION_ID: &str = "unicode-scalar-run-search.exists.v1";
 /// Stable identity for earliest-end search.
 pub const SEARCH_EARLIEST_END_OPERATION_ID: &str = "unicode-scalar-run-search.earliest-end.v1";
-/// Exact byte-value probes used to select a one-, two-, or three-byte native
-/// leading search during construction.
+/// Exact byte-value probes used to select a sparse or fixed-table leading
+/// search during construction.
 pub const SEARCH_LEADING_SELECTION_WORK: usize = 256;
 /// Stable identity for symbolic counted/lower-bounded repetition.
 pub(crate) const REPEATED_RUN_PLAN_ID: &str =
@@ -3128,7 +3128,8 @@ pub struct SearchBuildAccounting {
 
 /// Source-independent upper bounds for one suffix search.
 /// `leading_scalar_probes` counts logical bytes examined by a sparse memchr
-/// leaf, or scalar front probes made around fixed-width classifier blocks.
+/// leaf, scalar tail probes after specialized complete blocks, or scalar front
+/// probes made around general fixed-width classifier blocks.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SearchUpperBounds {
     pub input_bytes: usize,
@@ -3236,8 +3237,9 @@ impl std::error::Error for SearchError {}
 /// The leading-byte search is a conservative prefilter: every valid UTF-8
 /// encoding of a member scalar has its first byte in this set, but candidates
 /// are always decoded and checked against the exact retained scalar ranges.
-/// Sets of one to three bytes use the corresponding native memchr primitive;
-/// larger sets use the retained fixed-width classifier.
+/// Sets of one to three bytes use the corresponding native memchr primitive.
+/// Sets of four to sixteen bytes use one compiler-static SVE2 table leaf when
+/// available, while other profiles retain the general classifier.
 #[derive(Debug)]
 pub struct UnicodeScalarSearchPlan {
     scalar: UnicodeScalarAggregatePlan,
@@ -3252,11 +3254,32 @@ enum LeadingByteSearch {
     One(u8),
     Two(u8, u8),
     Three(u8, u8, u8),
+    #[cfg(all(
+        feature = "static-dispatch-arm-41-d84",
+        target_arch = "aarch64",
+        target_os = "linux",
+        target_endian = "little",
+        target_feature = "sve",
+        target_feature = "sve2"
+    ))]
+    Small([u8; 16]),
 }
 
 impl LeadingByteSearch {
-    const fn uses_classifier(self) -> bool {
-        matches!(self, Self::Classifier)
+    const fn uses_block_classification(self) -> bool {
+        match self {
+            Self::Classifier => true,
+            #[cfg(all(
+                feature = "static-dispatch-arm-41-d84",
+                target_arch = "aarch64",
+                target_os = "linux",
+                target_endian = "little",
+                target_feature = "sve",
+                target_feature = "sve2"
+            ))]
+            Self::Small(_) => true,
+            _ => false,
+        }
     }
 }
 
@@ -3388,7 +3411,7 @@ impl UnicodeScalarSearchPlan {
     ) -> Result<SearchUpperBounds, SearchError> {
         let leading_scalar_probes = input_bytes;
         let (leading_block_classifications, leading_block_classification_bytes) =
-            if self.leading_search.uses_classifier() {
+            if self.leading_search.uses_block_classification() {
                 let classifications = input_bytes
                     .checked_add(BYTE_SET_WIDE_BLOCK_BYTES.saturating_sub(1))
                     .ok_or(SearchError::ArithmeticOverflow {
@@ -3636,7 +3659,7 @@ impl UnicodeScalarAggregatePlan {
     reason = "the complete byte domain bounds the member count to 256"
 )]
 fn select_leading_byte_search(set: ByteSet256) -> LeadingByteSearch {
-    let mut selected = [0_u8; 3];
+    let mut selected = [0_u8; 16];
     let mut count = 0_usize;
     for value in 0_u16..=u16::from(u8::MAX) {
         let byte = u8::try_from(value).expect("the enumerated byte domain fits u8");
@@ -3651,6 +3674,28 @@ fn select_leading_byte_search(set: ByteSet256) -> LeadingByteSearch {
         1 => LeadingByteSearch::One(selected[0]),
         2 => LeadingByteSearch::Two(selected[0], selected[1]),
         3 => LeadingByteSearch::Three(selected[0], selected[1], selected[2]),
+        #[cfg(all(
+            feature = "static-dispatch-arm-41-d84",
+            target_arch = "aarch64",
+            target_os = "linux",
+            target_endian = "little",
+            target_feature = "sve",
+            target_feature = "sve2"
+        ))]
+        4..=16 => {
+            let duplicate = selected[0];
+            selected[count..].fill(duplicate);
+            LeadingByteSearch::Small(selected)
+        }
+        #[cfg(not(all(
+            feature = "static-dispatch-arm-41-d84",
+            target_arch = "aarch64",
+            target_os = "linux",
+            target_endian = "little",
+            target_feature = "sve",
+            target_feature = "sve2"
+        )))]
+        4..=16 => LeadingByteSearch::Classifier,
         _ => LeadingByteSearch::Classifier,
     }
 }
@@ -3888,11 +3933,28 @@ impl<'h> UnicodeScalarSearchCursor<'_, 'h> {
         actual: &mut SearchActualCounters,
     ) -> Option<usize> {
         let searched = &self.haystack[position..end];
-        let sparse_relative = match self.plan.leading_search {
-            LeadingByteSearch::One(first) => memchr(first, searched),
-            LeadingByteSearch::Two(first, second) => memchr2(first, second, searched),
+        let sparse_relative = match &self.plan.leading_search {
+            LeadingByteSearch::One(first) => memchr(*first, searched),
+            LeadingByteSearch::Two(first, second) => memchr2(*first, *second, searched),
             LeadingByteSearch::Three(first, second, third) => {
-                memchr3(first, second, third, searched)
+                memchr3(*first, *second, *third, searched)
+            }
+            #[cfg(all(
+                feature = "static-dispatch-arm-41-d84",
+                target_arch = "aarch64",
+                target_os = "linux",
+                target_endian = "little",
+                target_feature = "sve",
+                target_feature = "sve2"
+            ))]
+            LeadingByteSearch::Small(match_values) => {
+                return self.next_leading_small::<METERED>(
+                    position,
+                    end,
+                    match_values,
+                    state,
+                    actual,
+                );
             }
             LeadingByteSearch::Classifier => {
                 return self.next_leading_classifier::<METERED>(position, end, state, actual);
@@ -3903,6 +3965,83 @@ impl<'h> UnicodeScalarSearchCursor<'_, 'h> {
                 sparse_relative.map_or(searched.len(), |relative| relative + 1);
         }
         sparse_relative.and_then(|relative| position.checked_add(relative))
+    }
+
+    #[cfg(all(
+        feature = "static-dispatch-arm-41-d84",
+        target_arch = "aarch64",
+        target_os = "linux",
+        target_endian = "little",
+        target_feature = "sve",
+        target_feature = "sve2"
+    ))]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "fixed block extents and bit lanes are checked before every operation"
+    )]
+    fn next_leading_small<const METERED: bool>(
+        &self,
+        mut position: usize,
+        end: usize,
+        match_values: &[u8; 16],
+        state: &mut UnicodeScalarSearchCursorState,
+        actual: &mut SearchActualCounters,
+    ) -> Option<usize> {
+        while position < end {
+            if state.leading_block_valid {
+                let block_end = state.leading_block_base + BYTE_SET_WIDE_BLOCK_BYTES;
+                if position >= state.leading_block_base && position < block_end {
+                    let offset = position - state.leading_block_base;
+                    let allowed = u32::MAX.checked_shl(u32::try_from(offset).ok()?).unwrap_or(0);
+                    let candidates = state.leading_block_mask & allowed;
+                    if candidates != 0 {
+                        let lane = usize::try_from(candidates.trailing_zeros()).ok()?;
+                        state.leading_block_mask &= !(1_u32 << lane);
+                        return state.leading_block_base.checked_add(lane);
+                    }
+                    position = block_end;
+                    state.leading_block_valid = false;
+                    continue;
+                }
+                state.leading_block_valid = false;
+            }
+
+            let remaining = end - position;
+            let complete_bytes = remaining - remaining % BYTE_SET_WIDE_BLOCK_BYTES;
+            if complete_bytes != 0 {
+                let searched = &self.haystack[position..position + complete_bytes];
+                if let Some((relative, mask)) =
+                    fre_simd_kernels::find_byte_values16_32_block(match_values, searched)
+                {
+                    let blocks = relative / BYTE_SET_WIDE_BLOCK_BYTES + 1;
+                    let classified_bytes = blocks * BYTE_SET_WIDE_BLOCK_BYTES;
+                    if METERED {
+                        actual.leading_block_classifications += blocks;
+                        actual.leading_block_classification_bytes += classified_bytes;
+                    }
+                    state.leading_block_base = position + relative;
+                    state.leading_block_mask = mask.member_mask();
+                    state.leading_block_valid = true;
+                    position = state.leading_block_base;
+                    continue;
+                }
+                let blocks = complete_bytes / BYTE_SET_WIDE_BLOCK_BYTES;
+                if METERED {
+                    actual.leading_block_classifications += blocks;
+                    actual.leading_block_classification_bytes += complete_bytes;
+                }
+                position += complete_bytes;
+                continue;
+            }
+            if METERED {
+                actual.leading_scalar_probes += 1;
+            }
+            if self.plan.leading.set().contains(self.haystack[position]) {
+                return Some(position);
+            }
+            position += 1;
+        }
+        None
     }
 
     #[allow(
@@ -4042,6 +4181,24 @@ mod tests {
         UnicodeScalarAggregatePlan, UnicodeScalarSearchPlan, ValueReduction,
         binary_search_comparison_bound, decode_scalar, decode_scalar_inline, decode_scalar_with,
     };
+    #[cfg(all(
+        feature = "static-dispatch-arm-41-d84",
+        target_arch = "aarch64",
+        target_os = "linux",
+        target_endian = "little",
+        target_feature = "sve",
+        target_feature = "sve2"
+    ))]
+    use super::select_leading_byte_search;
+    #[cfg(all(
+        feature = "static-dispatch-arm-41-d84",
+        target_arch = "aarch64",
+        target_os = "linux",
+        target_endian = "little",
+        target_feature = "sve",
+        target_feature = "sve2"
+    ))]
+    use fre_simd_kernels::ByteSet256;
     use crate::{
         ASCII_WIDE_BYTES, AsciiByteSet, AsciiByteSetClassifier, DispatchPolicy, Feature,
         SimdDispatchContext, Window,
@@ -5738,6 +5895,116 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[cfg(all(
+        feature = "static-dispatch-arm-41-d84",
+        target_arch = "aarch64",
+        target_os = "linux",
+        target_endian = "little",
+        target_feature = "sve",
+        target_feature = "sve2"
+    ))]
+    #[test]
+    fn leading_search_small_table_boundary_is_sixteen_values() {
+        let sixteen = select_leading_byte_search(ByteSet256::from_words([
+            (1_u64 << 16) - 1,
+            0,
+            0,
+            0,
+        ]));
+        let LeadingByteSearch::Small(values) = sixteen else {
+            panic!("sixteen values did not select the fixed table");
+        };
+        assert_eq!(values, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+        assert_eq!(
+            select_leading_byte_search(ByteSet256::from_words([(1_u64 << 17) - 1, 0, 0, 0])),
+            LeadingByteSearch::Classifier,
+        );
+    }
+
+    #[cfg(all(
+        feature = "static-dispatch-arm-41-d84",
+        target_arch = "aarch64",
+        target_os = "linux",
+        target_endian = "little",
+        target_feature = "sve",
+        target_feature = "sve2"
+    ))]
+    #[test]
+    fn scalar_run_small_table_retains_full_mask_and_invalidates_backward_restart() {
+        let ranges = [
+            ('\u{80}', '\u{80}'),
+            ('\u{340}', '\u{340}'),
+            ('\u{380}', '\u{380}'),
+            ('\u{1000}', '\u{1000}'),
+            ('\u{2000}', '\u{2000}'),
+            ('\u{A000}', '\u{A000}'),
+            ('\u{10000}', '\u{10000}'),
+        ];
+        let plan = UnicodeScalarSearchPlan::build_repeated_with_dispatch(
+            SimdDispatchContext::capture(),
+            ranges,
+            2,
+            Some(4),
+            true,
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        assert!(matches!(plan.leading_search, LeadingByteSearch::Small(_)));
+
+        let mut haystack = vec![b'x'; 96];
+        haystack.extend_from_slice("\u{81}xx\u{80}\u{80}".as_bytes());
+        haystack.extend_from_slice(&[b'x'; 40]);
+        haystack.extend_from_slice("\u{1000}\u{1000}".as_bytes());
+
+        let mut cursor = plan.search_cursor(&haystack);
+        for start in [0, 0, 32, 96] {
+            assert_eq!(
+                cursor
+                    .find_at_value(start, SearchLimits::unlimited())
+                    .unwrap(),
+                Some((100, 104)),
+                "start={start}",
+            );
+        }
+        assert_eq!(
+            cursor
+                .find_at_value(104, SearchLimits::unlimited())
+                .unwrap(),
+            Some((144, 150)),
+        );
+        assert_eq!(
+            cursor
+                .find_at_value(0, SearchLimits::unlimited())
+                .unwrap(),
+            Some((100, 104)),
+        );
+
+        let (matched, accounting) = plan
+            .find_window(
+                &haystack,
+                Window::full(&haystack),
+                SearchLimits::unlimited(),
+            )
+            .unwrap();
+        assert_eq!(matched, Some((100, 104)));
+        assert_eq!(accounting.actual.leading_block_classifications, 4);
+        assert_eq!(accounting.actual.leading_block_classification_bytes, 128);
+        assert_eq!(accounting.actual.leading_scalar_probes, 0);
+
+        let absent = vec![b'x'; 70];
+        let (matched, accounting) = plan
+            .find_window(
+                &absent,
+                Window::full(&absent),
+                SearchLimits::unlimited(),
+            )
+            .unwrap();
+        assert_eq!(matched, None);
+        assert_eq!(accounting.actual.leading_block_classifications, 2);
+        assert_eq!(accounting.actual.leading_block_classification_bytes, 64);
+        assert_eq!(accounting.actual.leading_scalar_probes, 5);
     }
 
     #[test]
