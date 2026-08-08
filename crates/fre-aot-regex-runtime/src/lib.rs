@@ -4094,8 +4094,8 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
         .expect("compile generated-only dynamic-row fixture");
         let identity = compiled.receipt().program_sha256;
         let serialized = compiled.program().serialize().unwrap();
-        let public_handle = prepare_exclusive(&serialized);
-        let private_handle = prepare_exclusive(&serialized);
+        let public_handle = prepare_exclusive_with_cold_dynamic_rows(&serialized);
+        let private_handle = prepare_exclusive_with_cold_dynamic_rows(&serialized);
         let mut haystack = vec![b'!'; 80];
         for pair in haystack[8..70].chunks_exact_mut(2) {
             pair.copy_from_slice(b"ab");
