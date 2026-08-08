@@ -17962,6 +17962,22 @@ impl Aarch64Assembler {
         )
     }
 
+    fn branch_zero_x(&mut self, register: u8, label: Aarch64Label) -> Result<(), ObjectError> {
+        self.branch_placeholder(
+            0xb400_0000 | aarch64_reg(register, 0)?,
+            label,
+            Aarch64FixupKind::CompareBranch19,
+        )
+    }
+
+    fn branch_nonzero_x(&mut self, register: u8, label: Aarch64Label) -> Result<(), ObjectError> {
+        self.branch_placeholder(
+            0xb500_0000 | aarch64_reg(register, 0)?,
+            label,
+            Aarch64FixupKind::CompareBranch19,
+        )
+    }
+
     fn branch_bit_set_w(
         &mut self,
         register: u8,
@@ -17975,6 +17991,27 @@ impl Aarch64Assembler {
         }
         self.branch_placeholder(
             0x3700_0000 | (u32::from(bit) << 19) | aarch64_reg(register, 0)?,
+            label,
+            Aarch64FixupKind::TestBit14,
+        )
+    }
+
+    fn branch_bit_set_x(
+        &mut self,
+        register: u8,
+        bit: u8,
+        label: Aarch64Label,
+    ) -> Result<(), ObjectError> {
+        if bit > 63 {
+            return Err(ObjectError::InvalidModule(
+                "AArch64 X-register test bit is invalid",
+            ));
+        }
+        self.branch_placeholder(
+            0x3700_0000
+                | (u32::from(bit / 32) << 31)
+                | (u32::from(bit % 32) << 19)
+                | aarch64_reg(register, 0)?,
             label,
             Aarch64FixupKind::TestBit14,
         )
@@ -45582,9 +45619,25 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             .collect::<Vec<_>>();
         assert_eq!(words, [0x37f8_0068, 0x3400_0046, 0xd503_201f]);
 
+        let mut wide = Aarch64Assembler::new();
+        let target = wide.label().unwrap();
+        wide.branch_bit_set_x(10, 63, target).unwrap();
+        wide.branch_zero_x(16, target).unwrap();
+        wide.branch_nonzero_x(7, target).unwrap();
+        wide.instruction(0xd503_201f).unwrap(); // nop
+        wide.bind(target).unwrap();
+        let words = wide
+            .finish()
+            .unwrap()
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(words, [0xb7f8_008a, 0xb400_0070, 0xb500_0047, 0xd503_201f]);
+
         let mut invalid = Aarch64Assembler::new();
         let label = invalid.label().unwrap();
         assert!(invalid.branch_bit_set_w(8, 32, label).is_err());
+        assert!(invalid.branch_bit_set_x(8, 64, label).is_err());
         assert!(invalid.branch_bit_clear_w(8, 32, label).is_err());
     }
 
