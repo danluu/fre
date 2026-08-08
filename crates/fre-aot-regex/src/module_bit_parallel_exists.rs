@@ -892,6 +892,20 @@ fn lower_x86_64_multiword_bit_parallel(
     } else {
         None
     };
+    let avx512_state_vectors = if use_avx512_rows && layout.constant_result.is_none() {
+        Some((
+            layout.root_vector_offset.ok_or(ObjectError::InvalidModule(
+                "x86 AVX-512 root vector is absent",
+            ))?,
+            layout
+                .accept_vector_offset
+                .ok_or(ObjectError::InvalidModule(
+                    "x86 AVX-512 accept vector is absent",
+                ))?,
+        ))
+    } else {
+        None
+    };
     let sse2_root_vector_offset =
         if !use_avx2 && !use_avx512_rows && layout.constant_result.is_none() {
             Some(
@@ -940,6 +954,18 @@ fn lower_x86_64_multiword_bit_parallel(
             let mut accept_vector_load = vec![0xc4, 0x41, 0x7e, 0x6f, 0xb1];
             accept_vector_load.extend_from_slice(&accept_vector_offset.to_le_bytes());
             assembler.instruction(&accept_vector_load)?; // accept vector -> ymm14
+        }
+        if let Some((root_vector_offset, accept_vector_offset)) = avx512_state_vectors {
+            // YMM16/YMM17 exist only under AVX-512 and are caller-saved under
+            // both supported x86-64 ABIs. They are outside every start-filter
+            // constant and scratch bank, including the SSE2 scanner selected
+            // by an authenticated F+VL target that does not also have BW.
+            let mut avx512_root_constant = vec![0x62, 0xc1, 0xfe, 0x28, 0x6f, 0x81];
+            avx512_root_constant.extend_from_slice(&root_vector_offset.to_le_bytes());
+            assembler.instruction(&avx512_root_constant)?; // root vector -> ymm16
+            let mut avx512_accept_constant = vec![0x62, 0xc1, 0xfe, 0x28, 0x6f, 0x89];
+            avx512_accept_constant.extend_from_slice(&accept_vector_offset.to_le_bytes());
+            assembler.instruction(&avx512_accept_constant)?; // accept vector -> ymm17
         }
         if let Some((filter, kind)) = scanner_filter.zip(filter_kind) {
             x86_emit_start_filter_constants(&mut assembler, filter, kind, 1)?;
@@ -1088,6 +1114,29 @@ fn lower_x86_64_multiword_bit_parallel(
             if scanner_filter.is_some() {
                 assembler.instruction(&[0xc5, 0x95, 0xef, 0xc0])?; // active ^ root
                 assembler.instruction(&[0xc4, 0xe2, 0x7d, 0x17, 0xc0])?; // vptest
+                assembler.branch(&[0x0f, 0x85], recurrence)?;
+                assembler.branch(&[0xe9], scan)?;
+            } else {
+                assembler.branch(&[0xe9], recurrence)?;
+            }
+        } else if avx512_state_vectors.is_some() {
+            // AVX-512F+VL is sufficient for every instruction in this block;
+            // in particular, it does not borrow AVX2 or AVX-512BW from real
+            // hardware feature correlations. VPTESTMQ publishes the exact
+            // per-qword accept test in K1 and KORTESTW sets flags without a
+            // reached-vector stack round trip.
+            assembler.instruction(&[0x62, 0xb2, 0xfd, 0x28, 0x27, 0xc9])?; // vptestmq k1, ymm0, ymm17
+            assembler.instruction(&[0xc5, 0xf8, 0x98, 0xc9])?; // kortestw k1, k1
+            assembler.branch(&[0x0f, 0x85], matched)?;
+            assembler.instruction(&[0x62, 0xb1, 0x7d, 0x28, 0xeb, 0xc0])?; // reached | root -> ymm0
+            assembler.instruction(&[0x62, 0xf1, 0xfe, 0x28, 0x7f, 0x04, 0x24])?; // active vector
+            if scanner_filter.is_some() {
+                // Every native row and state constant has four authenticated
+                // qwords. W2/W3 padding is zero, so all four equality bits
+                // must be set before the exact-root scanner may regain control.
+                assembler.instruction(&[0x62, 0xb2, 0xfd, 0x28, 0x29, 0xc8])?; // active == root -> k1
+                assembler.instruction(&[0xc5, 0xf8, 0x93, 0xc1])?; // kmovw k1, eax
+                assembler.instruction(&[0x3c, 0x0f])?; // all four qwords equal
                 assembler.branch(&[0x0f, 0x85], recurrence)?;
                 assembler.branch(&[0xe9], scan)?;
             } else {
@@ -2139,6 +2188,26 @@ mod tests {
         compiled_multiword_sidecar_for_words(target, 2)
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the asserted W2-W4 fixture domain makes its pattern length exact"
+    )]
+    fn compiled_range_scanner_multiword_sidecar_for_words(
+        target: Target,
+        expected_words: usize,
+    ) -> crate::CompiledRegex {
+        assert!((2..=MAX_BIT_PARALLEL_EXISTS_WORDS).contains(&expected_words));
+        let consuming_prefix = (expected_words - 1) * 64;
+        let pattern = format!("[a-z]{}z", "a".repeat(consuming_prefix - 1));
+        let compiled = compiled_sidecar_for(&pattern, target);
+        let stats = compiled
+            .program()
+            .bit_parallel_exists_stats()
+            .expect("range-scanner multiword bit-parallel sidecar");
+        assert_eq!(stats.words, expected_words);
+        compiled
+    }
+
     fn compiled_recurrence_only_sidecar_for_words(
         target: Target,
         expected_words: usize,
@@ -2169,6 +2238,86 @@ mod tests {
             .windows(needle.len())
             .filter(|window| *window == needle)
             .count()
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the authenticated W2-W4 table dimensions bound every test-only offset"
+    )]
+    fn assert_multiword_native_padding_is_zero(
+        layout: &NativeBitParallelLayout,
+        view: NativeBitParallelExistsView<'_>,
+    ) {
+        assert!((2..=MAX_BIT_PARALLEL_EXISTS_WORDS).contains(&layout.words));
+        assert_eq!(layout.direct_row_words, MAX_BIT_PARALLEL_EXISTS_WORDS);
+        let root_vector_offset = usize::try_from(
+            layout
+                .root_vector_offset
+                .expect("multiword root vector offset"),
+        )
+        .unwrap();
+        let accept_vector_offset = usize::try_from(
+            layout
+                .accept_vector_offset
+                .expect("multiword accept vector offset"),
+        )
+        .unwrap();
+        for word in 0..MAX_BIT_PARALLEL_EXISTS_WORDS {
+            let root_offset = root_vector_offset + word * core::mem::size_of::<u64>();
+            let accept_offset = accept_vector_offset + word * core::mem::size_of::<u64>();
+            let root = u64::from_le_bytes(
+                layout.data[root_offset..root_offset + 8]
+                    .try_into()
+                    .unwrap(),
+            );
+            let accept = u64::from_le_bytes(
+                layout.data[accept_offset..accept_offset + 8]
+                    .try_into()
+                    .unwrap(),
+            );
+            assert_eq!(root, layout.roots[word]);
+            assert_eq!(
+                accept,
+                if word + 1 == layout.words {
+                    ACCEPT_BIT
+                } else {
+                    0
+                }
+            );
+            if word >= layout.words {
+                assert_eq!(root, 0, "W{} root padding word {word}", layout.words);
+                assert_eq!(accept, 0, "W{} accept padding word {word}", layout.words);
+            }
+        }
+
+        let row_bytes = MAX_BIT_PARALLEL_EXISTS_WORDS * core::mem::size_of::<u64>();
+        for byte in 0..BYTE_VALUES {
+            let row_offset = MULTIWORD_ROOT_ROWS_OFFSET + byte * row_bytes;
+            for word in layout.words..MAX_BIT_PARALLEL_EXISTS_WORDS {
+                let offset = row_offset + word * core::mem::size_of::<u64>();
+                assert_eq!(
+                    u64::from_le_bytes(layout.data[offset..offset + 8].try_into().unwrap()),
+                    0,
+                    "W{} byte {byte:#04x} root-row padding word {word}",
+                    layout.words
+                );
+            }
+        }
+
+        let direct_offset = MULTIWORD_ROOT_ROWS_OFFSET + BYTE_VALUES * row_bytes;
+        let direct_rows = view.stats.byte_classes * view.stats.consuming_states;
+        for row in 0..direct_rows {
+            let row_offset = direct_offset + row * row_bytes;
+            for word in layout.words..MAX_BIT_PARALLEL_EXISTS_WORDS {
+                let offset = row_offset + word * core::mem::size_of::<u64>();
+                assert_eq!(
+                    u64::from_le_bytes(layout.data[offset..offset + 8].try_into().unwrap()),
+                    0,
+                    "W{} direct row {row} padding word {word}",
+                    layout.words
+                );
+            }
+        }
     }
 
     fn synthetic_view<'a>(
@@ -2591,9 +2740,7 @@ mod tests {
                 );
                 let emission =
                     lower_x86_64_bit_parallel(&layout, target).expect("multiword SSE2 leaf");
-                let root_offset = layout
-                    .root_vector_offset
-                    .expect("SSE2 root vector offset");
+                let root_offset = layout.root_vector_offset.expect("SSE2 root vector offset");
                 for padding_word in words..MAX_BIT_PARALLEL_EXISTS_WORDS {
                     let offset = usize::try_from(root_offset).unwrap() + padding_word * 8;
                     assert_eq!(
@@ -2662,6 +2809,121 @@ mod tests {
                     0,
                     "SSE4.1 PTEST leaked into W{words}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the cross-OS feature lattice, encodings, and padding form one AVX-512 receipt"
+    )]
+    fn avx512f_vl_multiword_finish_stays_in_vectors_for_sparse_and_dense_rows() {
+        let f_vl = FeatureSet::of(CpuFeature::X86Avx512F).with(CpuFeature::X86Avx512Vl);
+        let f_bw_vl = f_vl.with(CpuFeature::X86Avx512Bw);
+        assert!(!f_vl.has(CpuFeature::X86Avx2));
+        assert!(!f_vl.has(CpuFeature::X86Avx512Bw));
+
+        for words in 2..=MAX_BIT_PARALLEL_EXISTS_WORDS {
+            // Some(true) is an exact sparse scanner, Some(false) is a sparse
+            // range scanner, and None is the dense recurrence-only route.
+            for scanner_shape in [Some(true), Some(false), None] {
+                let scanner = scanner_shape.is_some();
+                let source_target = Target::x86_64_linux().with_features(f_vl).unwrap();
+                let compiled = match scanner_shape {
+                    Some(true) => compiled_multiword_sidecar_for_words(source_target, words),
+                    Some(false) => {
+                        compiled_range_scanner_multiword_sidecar_for_words(source_target, words)
+                    }
+                    None => compiled_recurrence_only_sidecar_for_words(source_target, words),
+                };
+                let view = compiled
+                    .program()
+                    .native_bit_parallel_exists_view()
+                    .expect("multiword AVX-512 view");
+                let layout =
+                    build_native_bit_parallel_layout(view).expect("multiword AVX-512 layout");
+                assert_multiword_native_padding_is_zero(&layout, view);
+                if let Some(expected_exact) = scanner_shape {
+                    assert_eq!(
+                        layout
+                            .root_filter
+                            .expect("sparse AVX-512 root scanner")
+                            .is_exact(),
+                        expected_exact
+                    );
+                }
+
+                for base_target in [Target::x86_64_linux(), Target::x86_64_macos()] {
+                    for features in [f_vl, f_bw_vl] {
+                        let target = base_target.with_features(features).unwrap();
+                        assert_eq!(
+                            admitted_root_scanner_filter(&layout, target).is_some(),
+                            scanner
+                        );
+                        let emission = lower_x86_64_bit_parallel(&layout, target)
+                            .expect("multiword AVX-512 leaf");
+                        let root_offset = layout
+                            .root_vector_offset
+                            .expect("AVX-512 root vector offset");
+                        let accept_offset = layout
+                            .accept_vector_offset
+                            .expect("AVX-512 accept vector offset");
+
+                        let mut root_load = vec![0x62, 0xc1, 0xfe, 0x28, 0x6f, 0x81];
+                        root_load.extend_from_slice(&root_offset.to_le_bytes());
+                        let mut accept_load = vec![0x62, 0xc1, 0xfe, 0x28, 0x6f, 0x89];
+                        accept_load.extend_from_slice(&accept_offset.to_le_bytes());
+                        assert_eq!(count_bytes(&emission.code, &root_load), 1);
+                        assert_eq!(count_bytes(&emission.code, &accept_load), 1);
+                        assert_eq!(
+                            count_bytes(&emission.code, &[0x62, 0xb2, 0xfd, 0x28, 0x27, 0xc9]),
+                            1
+                        );
+                        assert_eq!(count_bytes(&emission.code, &[0xc5, 0xf8, 0x98, 0xc9]), 1);
+                        assert_eq!(
+                            count_bytes(&emission.code, &[0x62, 0xb1, 0x7d, 0x28, 0xeb, 0xc0]),
+                            1
+                        );
+                        assert_eq!(
+                            count_bytes(
+                                &emission.code,
+                                &[0x62, 0xf1, 0xfe, 0x28, 0x7f, 0x04, 0x24]
+                            ),
+                            1
+                        );
+                        assert_eq!(
+                            count_bytes(&emission.code, &[0x62, 0xb2, 0xfd, 0x28, 0x29, 0xc8]),
+                            usize::from(scanner)
+                        );
+                        assert_eq!(
+                            count_bytes(&emission.code, &[0xc5, 0xf8, 0x93, 0xc1, 0x3c, 0x0f]),
+                            usize::from(scanner)
+                        );
+
+                        // The old AVX-512 finish spilled reached at rsp+32 and
+                        // then rebuilt active one scalar word at a time.
+                        assert_eq!(
+                            count_bytes(
+                                &emission.code,
+                                &[0x62, 0xf1, 0xfe, 0x28, 0x7f, 0x44, 0x24, 0x01]
+                            ),
+                            0
+                        );
+                        for offset in [0_u8, 8, 16, 24] {
+                            assert_eq!(
+                                count_bytes(&emission.code, &[0x48, 0x89, 0x44, 0x24, offset]),
+                                0,
+                                "W{words} scalar active store at {offset}"
+                            );
+                        }
+                        assert_eq!(
+                            count_bytes(&emission.code, &[0xc4, 0xc2, 0x7d, 0x17, 0xc6]),
+                            0,
+                            "W{words} borrowed the AVX2 accept test"
+                        );
+                    }
+                }
             }
         }
     }
