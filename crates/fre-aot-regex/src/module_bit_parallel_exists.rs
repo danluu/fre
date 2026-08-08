@@ -892,6 +892,16 @@ fn lower_x86_64_multiword_bit_parallel(
     } else {
         None
     };
+    let sse2_root_vector_offset =
+        if !use_avx2 && !use_avx512_rows && layout.constant_result.is_none() {
+            Some(
+                layout
+                    .x86_root_vector_offset
+                    .ok_or(ObjectError::InvalidModule("x86 SSE2 root vector is absent"))?,
+            )
+        } else {
+            None
+        };
     let scan = assembler.label()?;
     let vector_scan = assembler.label()?;
     let vector_hit = assembler.label()?;
@@ -1078,6 +1088,75 @@ fn lower_x86_64_multiword_bit_parallel(
             if scanner_filter.is_some() {
                 assembler.instruction(&[0xc5, 0x95, 0xef, 0xc0])?; // active ^ root
                 assembler.instruction(&[0xc4, 0xe2, 0x7d, 0x17, 0xc0])?; // vptest
+                assembler.branch(&[0x0f, 0x85], recurrence)?;
+                assembler.branch(&[0xe9], scan)?;
+            } else {
+                assembler.branch(&[0xe9], recurrence)?;
+            }
+        } else if let Some(root_vector_offset) = sse2_root_vector_offset {
+            // ACCEPT_BIT is the sign bit of the final word. PMOVMSKB extracts
+            // exactly that bit from the reached vector without a stack round
+            // trip or an SSE4.1 dependency.
+            let (accept_vector_mask, accept_mask_extract) = match layout.words {
+                2 => (1_u32 << 15, &[0x66, 0x0f, 0xd7, 0xc0][..]), // xmm0 -> eax
+                3 => (1_u32 << 7, &[0x66, 0x41, 0x0f, 0xd7, 0xc5][..]), // xmm13 -> eax
+                4 => (1_u32 << 15, &[0x66, 0x41, 0x0f, 0xd7, 0xc5][..]),
+                _ => {
+                    return Err(ObjectError::InvalidModule(
+                        "x86 SSE2 multiword accept vector dimensions",
+                    ));
+                }
+            };
+            assembler.instruction(accept_mask_extract)?;
+            let mut accept_test = vec![0xa9]; // test imm32, eax
+            accept_test.extend_from_slice(&accept_vector_mask.to_le_bytes());
+            assembler.instruction(&accept_test)?;
+            assembler.branch(&[0x0f, 0x85], matched)?;
+
+            let mut root_low = vec![0x66, 0x41, 0x0f, 0xeb, 0x81]; // por disp32[r9], xmm0
+            root_low.extend_from_slice(&root_vector_offset.to_le_bytes());
+            assembler.instruction(&root_low)?;
+            if layout.words > 2 {
+                let mut root_high = vec![0x66, 0x45, 0x0f, 0xeb, 0xa9]; // -> xmm13
+                root_high.extend_from_slice(
+                    &root_vector_offset
+                        .checked_add(16)
+                        .ok_or(ObjectError::ArithmeticOverflow(
+                            "x86 SSE2 high root vector offset",
+                        ))?
+                        .to_le_bytes(),
+                );
+                assembler.instruction(&root_high)?;
+            }
+            assembler.instruction(&[0xf3, 0x0f, 0x7f, 0x04, 0x24])?; // active low
+            if layout.words > 2 {
+                assembler.instruction(&[0xf3, 0x44, 0x0f, 0x7f, 0x6c, 0x24, 0x10])?; // high
+            }
+
+            if scanner_filter.is_some() {
+                // The active vectors have already been authenticated on the
+                // stack. Reuse their registers to prove active == root using
+                // only SSE2 before handing exact roots back to the scanner.
+                // Its persistent constants occupy XMM1..XMM8; XMM13 is
+                // scanner scratch and is recomputed on every scan block.
+                let mut root_equal_low = vec![0x66, 0x41, 0x0f, 0x74, 0x81];
+                root_equal_low.extend_from_slice(&root_vector_offset.to_le_bytes());
+                assembler.instruction(&root_equal_low)?; // active == root bytes -> xmm0
+                if layout.words > 2 {
+                    let mut root_equal_high = vec![0x66, 0x45, 0x0f, 0x74, 0xa9];
+                    root_equal_high.extend_from_slice(
+                        &root_vector_offset
+                            .checked_add(16)
+                            .ok_or(ObjectError::ArithmeticOverflow(
+                                "x86 SSE2 high root vector offset",
+                            ))?
+                            .to_le_bytes(),
+                    );
+                    assembler.instruction(&root_equal_high)?;
+                    assembler.instruction(&[0x66, 0x41, 0x0f, 0xdb, 0xc5])?; // both halves
+                }
+                assembler.instruction(&[0x66, 0x0f, 0xd7, 0xc0])?; // byte mask -> eax
+                assembler.instruction(&[0x66, 0x83, 0xf8, 0xff])?; // all 16 bytes equal
                 assembler.branch(&[0x0f, 0x85], recurrence)?;
                 assembler.branch(&[0xe9], scan)?;
             } else {
@@ -2489,6 +2568,102 @@ mod tests {
         );
         assert!(scalar_arm_words.contains(&aarch64_bic_x(8, 8, 19).unwrap()));
         assert!(compiled.module().required_runtime_symbol().is_none());
+    }
+
+    #[test]
+    fn baseline_x86_multiword_finish_stays_in_sse2_vectors() {
+        let target = Target::x86_64_linux();
+        for words in 2..=MAX_BIT_PARALLEL_EXISTS_WORDS {
+            for scanner in [true, false] {
+                let compiled = if scanner {
+                    compiled_multiword_sidecar_for_words(target, words)
+                } else {
+                    compiled_recurrence_only_sidecar_for_words(target, words)
+                };
+                let view = compiled
+                    .program()
+                    .native_bit_parallel_exists_view()
+                    .expect("multiword SSE2 view");
+                let layout = build_native_bit_parallel_layout(view).expect("multiword SSE2 layout");
+                assert_eq!(
+                    admitted_root_scanner_filter(&layout, target).is_some(),
+                    scanner
+                );
+                let emission =
+                    lower_x86_64_bit_parallel(&layout, target).expect("multiword SSE2 leaf");
+                let root_offset = layout
+                    .x86_root_vector_offset
+                    .expect("SSE2 root vector offset");
+                for padding_word in words..MAX_BIT_PARALLEL_EXISTS_WORDS {
+                    let offset = usize::try_from(root_offset).unwrap() + padding_word * 8;
+                    assert_eq!(
+                        u64::from_le_bytes(layout.data[offset..offset + 8].try_into().unwrap()),
+                        0,
+                        "W{words} root-vector padding word {padding_word}"
+                    );
+                }
+
+                let mut accept_test = if words == 2 {
+                    vec![0x66, 0x0f, 0xd7, 0xc0, 0xa9]
+                } else {
+                    vec![0x66, 0x41, 0x0f, 0xd7, 0xc5, 0xa9]
+                };
+                let accept_mask = if words == 3 { 1_u32 << 7 } else { 1_u32 << 15 };
+                accept_test.extend_from_slice(&accept_mask.to_le_bytes());
+                assert_eq!(count_bytes(&emission.code, &accept_test), 1);
+
+                let mut root_low = vec![0x66, 0x41, 0x0f, 0xeb, 0x81];
+                root_low.extend_from_slice(&root_offset.to_le_bytes());
+                assert_eq!(count_bytes(&emission.code, &root_low), 1);
+                assert_eq!(
+                    count_bytes(&emission.code, &[0xf3, 0x0f, 0x7f, 0x04, 0x24]),
+                    1
+                );
+                if words > 2 {
+                    let mut root_high = vec![0x66, 0x45, 0x0f, 0xeb, 0xa9];
+                    root_high.extend_from_slice(&(root_offset + 16).to_le_bytes());
+                    assert_eq!(count_bytes(&emission.code, &root_high), 1);
+                    assert_eq!(
+                        count_bytes(&emission.code, &[0xf3, 0x44, 0x0f, 0x7f, 0x6c, 0x24, 0x10]),
+                        1
+                    );
+                }
+
+                let mut root_equal_low = vec![0x66, 0x41, 0x0f, 0x74, 0x81];
+                root_equal_low.extend_from_slice(&root_offset.to_le_bytes());
+                assert_eq!(
+                    count_bytes(&emission.code, &root_equal_low),
+                    usize::from(scanner)
+                );
+                assert_eq!(
+                    count_bytes(
+                        &emission.code,
+                        &[
+                            0x66, 0x0f, 0xd7, 0xc0, // pmovmskb xmm0, eax
+                            0x66, 0x83, 0xf8, 0xff, // cmp 0xffff, ax
+                        ]
+                    ),
+                    usize::from(scanner)
+                );
+                if words > 2 {
+                    let mut root_equal_high = vec![0x66, 0x45, 0x0f, 0x74, 0xa9];
+                    root_equal_high.extend_from_slice(&(root_offset + 16).to_le_bytes());
+                    assert_eq!(
+                        count_bytes(&emission.code, &root_equal_high),
+                        usize::from(scanner)
+                    );
+                    assert_eq!(
+                        count_bytes(&emission.code, &[0x66, 0x41, 0x0f, 0xdb, 0xc5]),
+                        usize::from(scanner)
+                    );
+                }
+                assert_eq!(
+                    count_bytes(&emission.code, &[0x66, 0x0f, 0x38, 0x17]),
+                    0,
+                    "SSE4.1 PTEST leaked into W{words}"
+                );
+            }
+        }
     }
 
     #[test]
