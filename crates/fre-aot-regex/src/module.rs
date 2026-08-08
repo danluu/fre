@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     CompileError, DeterminizationReport, DeterminizeLimits, DfaStats, ObjectError,
+    bit_parallel_exists::NativeBitParallelExistsView,
     bounded_suffix_retry::{
         BoundedSuffixRetryPlan, select_bounded_interior_retry, select_bounded_suffix_retry,
     },
@@ -210,6 +211,8 @@ pub struct SlowContextAotReport {
 
 #[path = "module_context.rs"]
 mod module_context;
+#[path = "module_bit_parallel_exists.rs"]
+mod module_bit_parallel_exists;
 #[path = "module_dfa_loop_skip.rs"]
 mod module_dfa_loop_skip;
 #[path = "module_seeded_reverse_aarch64.rs"]
@@ -1148,6 +1151,7 @@ impl CompiledModule {
                 semantic_native,
                 false,
                 program.native_context_program_view(),
+                program.native_bit_parallel_exists_view(),
                 program.native_partial_dfa_view(),
                 program.native_dynamic_rows_view(),
                 target,
@@ -1260,6 +1264,7 @@ impl CompiledModule {
             slow_retained_forward_minimized,
             ordinary_native,
             program.native_context_program_view(),
+            program.native_bit_parallel_exists_view(),
             program.native_partial_dfa_view(),
             program.native_dynamic_rows_view(),
             target,
@@ -1313,6 +1318,7 @@ impl CompiledModule {
             false,
             native,
             program.native_context_program_view(),
+            program.native_bit_parallel_exists_view(),
             program.native_partial_dfa_view(),
             program.native_dynamic_rows_view(),
             target,
@@ -1329,6 +1335,7 @@ impl CompiledModule {
         native: Option<NativeProgramView<'_>>,
         native_materialized_fallback: bool,
         native_context: Option<NativeContextProgramView<'_>>,
+        native_bit_parallel: Option<NativeBitParallelExistsView<'_>>,
         native_partial: Option<NativePartialProgramView<'_>>,
         native_dynamic_rows: Option<NativeDynamicRowsProgramView>,
         target: Target,
@@ -1349,6 +1356,7 @@ impl CompiledModule {
             false,
             native,
             native_context,
+            native_bit_parallel,
             native_partial,
             native_dynamic_rows,
             target,
@@ -1368,6 +1376,7 @@ impl CompiledModule {
         slow_retained_forward_minimized: bool,
         native: Option<NativeProgramView<'_>>,
         native_context: Option<NativeContextProgramView<'_>>,
+        native_bit_parallel: Option<NativeBitParallelExistsView<'_>>,
         native_partial: Option<NativePartialProgramView<'_>>,
         native_dynamic_rows: Option<NativeDynamicRowsProgramView>,
         target: Target,
@@ -1413,6 +1422,17 @@ impl CompiledModule {
             let lowering = module_context::lower_native_context(view, target)?;
             let native_digest = native_module_digest(&program_bytes, target, &lowering)?;
             (lowering, native_digest, None)
+        } else if let Some(view) = native_bit_parallel {
+            if let Some(lowering) =
+                module_bit_parallel_exists::lower_native_bit_parallel_exists(view, target)?
+            {
+                let native_digest = native_module_digest(&program_bytes, target, &lowering)?;
+                (lowering, native_digest, None)
+            } else {
+                let lowering = lower_runtime_adapter(program_bytes, target.architecture)?;
+                let native_digest = native_module_digest(&lowering.data, target, &lowering)?;
+                (lowering, native_digest, None)
+            }
         } else if let Some(view) = native_partial {
             if let Some((lowering, prepared_layout)) =
                 lower_native_partial_prepared(program_bytes.clone(), &view, target)?
@@ -17942,6 +17962,22 @@ impl Aarch64Assembler {
         )
     }
 
+    fn branch_zero_x(&mut self, register: u8, label: Aarch64Label) -> Result<(), ObjectError> {
+        self.branch_placeholder(
+            0xb400_0000 | aarch64_reg(register, 0)?,
+            label,
+            Aarch64FixupKind::CompareBranch19,
+        )
+    }
+
+    fn branch_nonzero_x(&mut self, register: u8, label: Aarch64Label) -> Result<(), ObjectError> {
+        self.branch_placeholder(
+            0xb500_0000 | aarch64_reg(register, 0)?,
+            label,
+            Aarch64FixupKind::CompareBranch19,
+        )
+    }
+
     fn branch_bit_set_w(
         &mut self,
         register: u8,
@@ -17955,6 +17991,27 @@ impl Aarch64Assembler {
         }
         self.branch_placeholder(
             0x3700_0000 | (u32::from(bit) << 19) | aarch64_reg(register, 0)?,
+            label,
+            Aarch64FixupKind::TestBit14,
+        )
+    }
+
+    fn branch_bit_set_x(
+        &mut self,
+        register: u8,
+        bit: u8,
+        label: Aarch64Label,
+    ) -> Result<(), ObjectError> {
+        if bit > 63 {
+            return Err(ObjectError::InvalidModule(
+                "AArch64 X-register test bit is invalid",
+            ));
+        }
+        self.branch_placeholder(
+            0x3700_0000
+                | (u32::from(bit / 32) << 31)
+                | (u32::from(bit % 32) << 19)
+                | aarch64_reg(register, 0)?,
             label,
             Aarch64FixupKind::TestBit14,
         )
@@ -28673,6 +28730,7 @@ mod tests {
                 .or_else(|| program.native_exact_product_view()),
             false,
             program.native_context_program_view(),
+            program.native_bit_parallel_exists_view(),
             program.native_partial_dfa_view(),
             program.native_dynamic_rows_view(),
             target,
@@ -40999,7 +41057,21 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 let wire = compiled.program().serialize().unwrap();
                 let restored = crate::CompiledProgram::deserialize(&wire).unwrap();
                 let bounded_module = CompiledModule::lower(&restored, target).unwrap();
-                assert!(bounded_module.required_runtime_symbol().is_some());
+                if output == OutputContract::Exists {
+                    let stats = restored
+                        .bit_parallel_exists_stats()
+                        .expect("root-only Exists retains the bounded graph executor");
+                    assert!(stats.source_nibbles > 1, "{target:?}/{output:?}");
+                    assert!(
+                        bounded_module.required_runtime_symbol().is_none(),
+                        "{target:?}/{output:?}"
+                    );
+                } else {
+                    assert!(
+                        bounded_module.required_runtime_symbol().is_some(),
+                        "{target:?}/{output:?}"
+                    );
+                }
                 let restored_module = CompiledModule::lower_k0_optimizing_with_data_limit(
                     &restored,
                     target,
@@ -41065,6 +41137,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 .or_else(|| scalar_program.native_exact_product_view()),
             false,
             scalar_program.native_context_program_view(),
+            scalar_program.native_bit_parallel_exists_view(),
             scalar_program.native_partial_dfa_view(),
             scalar_program.native_dynamic_rows_view(),
             scalar_target,
@@ -41569,6 +41642,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 None,
                 None,
                 false,
+                None,
                 None,
                 None,
                 None,
@@ -45545,9 +45619,25 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             .collect::<Vec<_>>();
         assert_eq!(words, [0x37f8_0068, 0x3400_0046, 0xd503_201f]);
 
+        let mut wide = Aarch64Assembler::new();
+        let target = wide.label().unwrap();
+        wide.branch_bit_set_x(10, 63, target).unwrap();
+        wide.branch_zero_x(16, target).unwrap();
+        wide.branch_nonzero_x(7, target).unwrap();
+        wide.instruction(0xd503_201f).unwrap(); // nop
+        wide.bind(target).unwrap();
+        let words = wide
+            .finish()
+            .unwrap()
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(words, [0xb7f8_008a, 0xb400_0070, 0xb500_0047, 0xd503_201f]);
+
         let mut invalid = Aarch64Assembler::new();
         let label = invalid.label().unwrap();
         assert!(invalid.branch_bit_set_w(8, 32, label).is_err());
+        assert!(invalid.branch_bit_set_x(8, 64, label).is_err());
         assert!(invalid.branch_bit_clear_w(8, 32, label).is_err());
     }
 

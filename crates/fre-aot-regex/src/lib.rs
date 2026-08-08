@@ -13,6 +13,7 @@
 
 #![forbid(unsafe_code)]
 
+mod bit_parallel_exists;
 mod bounded_suffix_retry;
 mod context_dfa;
 mod context_native;
@@ -34,6 +35,10 @@ use fre_lower::{LowerLimits, OperationSemantics};
 use fre_syntax::{CanonicalPattern, CompatibilityProfile, ParseRequest, RustProfile};
 use sha2::{Digest, Sha256};
 
+pub use bit_parallel_exists::{
+    BitParallelExistsStats, MAX_BIT_PARALLEL_EXISTS_MEMORY_BYTES, MAX_BIT_PARALLEL_EXISTS_STATES,
+    MAX_BIT_PARALLEL_EXISTS_WORDS, MAX_BIT_PARALLEL_EXISTS_WORK,
+};
 pub use context_dfa::{ContextDfaDecline, ContextDfaResource, ContextDfaStats};
 pub use dfa::{
     DeterminizationDecline, DeterminizationReport, DeterminizationResource, DeterminizationStage,

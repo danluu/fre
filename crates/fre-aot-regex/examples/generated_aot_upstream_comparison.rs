@@ -1919,6 +1919,8 @@ impl CompiledShape {
             "slow_aot_partial_generated_entry"
         } else if self.aot.module().prepared_entry_symbol().is_some() {
             "prepared_compiled_all_windows"
+        } else if self.publishes_native_bit_parallel_exists() {
+            "native_bit_parallel_complete"
         } else if self.runtime_program.is_some() && self.partial_dfa.is_some() {
             "runtime_dependent_partial_compiled_entry"
         } else if self.runtime_program.is_some() {
@@ -1937,6 +1939,53 @@ impl CompiledShape {
         } else {
             "self_contained_compiled_all_windows"
         }
+    }
+
+    fn publishes_native_bit_parallel_exists(&self) -> bool {
+        publishes_native_bit_parallel_exists(&self.aot, self.runtime_program.as_ref())
+    }
+}
+
+fn publishes_native_bit_parallel_exists(
+    aot: &CompiledRegex,
+    runtime_program: Option<&(String, usize)>,
+) -> bool {
+    aot.receipt().engine == EngineKind::OrderedNfa
+        && aot.program().bit_parallel_exists_stats().is_some()
+        && !aot.program().has_nfa_exact_product()
+        && aot.receipt().slow_aot.is_none()
+        && aot.receipt().slow_context_aot.is_none()
+        && runtime_program.is_none()
+        && aot.module().required_runtime_symbol().is_none()
+        && is_self_contained_native_shape(aot)
+}
+
+fn classify_fallback_artifact(
+    aot: &CompiledRegex,
+    runtime_program: Option<&(String, usize)>,
+    partial_dfa: Option<PartialDfaStats>,
+    has_context_assertions: bool,
+) -> &'static str {
+    if is_genuine_slow_partial(aot) {
+        "slow_aot_partial"
+    } else if publishes_native_bit_parallel_exists(aot, runtime_program) {
+        "bit_parallel_exists"
+    } else if partial_dfa.is_some() {
+        "retained_partial"
+    } else if aot.program().has_nfa_exact_product() {
+        "exact_product"
+    } else if has_context_assertions {
+        "contextual"
+    } else if aot
+        .module()
+        .required_prepared_dynamic_rows_deopt_runtime_symbol()
+        .is_some()
+    {
+        "dynamic_rows"
+    } else if aot.receipt().engine == EngineKind::OrderedNfa {
+        "plain_nfa"
+    } else {
+        "direct"
     }
 }
 
@@ -2389,7 +2438,6 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
                 .required_runtime_program()
                 .map(|(symbol, bytes)| (symbol.to_owned(), bytes));
             let partial_dfa = retained_partial_stats(&aot)?;
-            let exact_product = aot.program().has_nfa_exact_product();
             let structurally_runtime_backed =
                 reason == EngineSelectionReason::DeterminizationResourceLimit;
             if runtime_program.is_some()
@@ -2439,25 +2487,12 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
             }
             let prepared_capability_format = prepared_capability_format(&aot)
                 .map_err(|error| format!("{} {error}", spec.name))?;
-            let fallback_artifact_kind = if is_genuine_slow_partial(&aot) {
-                "slow_aot_partial"
-            } else if partial_dfa.is_some() {
-                "retained_partial"
-            } else if exact_product {
-                "exact_product"
-            } else if has_context_assertions {
-                "contextual"
-            } else if aot
-                .module()
-                .required_prepared_dynamic_rows_deopt_runtime_symbol()
-                .is_some()
-            {
-                "dynamic_rows"
-            } else if aot.receipt().engine == EngineKind::OrderedNfa {
-                "plain_nfa"
-            } else {
-                "direct"
-            };
+            let fallback_artifact_kind = classify_fallback_artifact(
+                &aot,
+                runtime_program.as_ref(),
+                partial_dfa,
+                has_context_assertions,
+            );
             if config.force_retained_resource_fallback
                 && !retained_limit_derivation.starts_with("excluded_")
                 && let Some(stats) = partial_dfa
@@ -3941,7 +3976,7 @@ fn command_version(program: &OsStr, argument: &str) -> String {
 
 fn print_partial_dfa_metadata(shapes: &[CompiledShape]) {
     println!(
-        "#partial_dfa\tpattern\tfamily\tseed\toutput\tartifact_kind\tscore_scope\tlimit_derivation\truntime_program\tprepared_entry_published\tprepared_entry_symbol\tprepared_capability_format\tcomplete_rows\tdiscovered_states\tresume_frontiers\tresume_items\toptimized_entry_supported\tmin_input_bytes\trequested_max_states\trequested_max_transitions\trequested_max_work\teffective_max_states\teffective_max_transitions\teffective_max_work\tdecline_stage\tdecline_resource\twork_completed\tstates_completed\ttransitions_completed\texact_product\tstatus"
+        "#partial_dfa\tpattern\tfamily\tseed\toutput\tartifact_kind\tscore_scope\tlimit_derivation\truntime_program\tprepared_entry_published\tprepared_entry_symbol\tprepared_capability_format\tcomplete_rows\tdiscovered_states\tresume_frontiers\tresume_items\toptimized_entry_supported\tmin_input_bytes\trequested_max_states\trequested_max_transitions\trequested_max_work\teffective_max_states\teffective_max_transitions\teffective_max_work\tdecline_stage\tdecline_resource\twork_completed\tstates_completed\ttransitions_completed\texact_product\tbit_parallel_exists\tnative_bit_parallel_exists\tstatus"
     );
     for shape in shapes {
         let report = &shape.aot.receipt().determinization;
@@ -4003,6 +4038,13 @@ fn print_partial_dfa_metadata(shapes: &[CompiledShape]) {
             report.states_completed.to_string(),
             report.transitions_completed.to_string(),
             shape.aot.program().has_nfa_exact_product().to_string(),
+            shape
+                .aot
+                .program()
+                .bit_parallel_exists_stats()
+                .is_some()
+                .to_string(),
+            shape.publishes_native_bit_parallel_exists().to_string(),
             "ok".to_owned(),
         ];
         println!("{}", fields.join("\t"));
@@ -4963,6 +5005,61 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn native_bit_parallel_exists_fallback_is_classified_from_the_emitted_object_abi() {
+        let target = Target::x86_64_linux();
+        let mut limits = CompileLimitsV1::default();
+        limits.determinize.max_states = 0;
+        let pattern = "(?:ab|c)*z";
+        let aot = compile_with_slow_aot_limits(
+            CompileRequest::new(pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists)
+                .limits(limits),
+            disabled_slow_aot_limits(),
+        )
+        .expect("compile bit-parallel resource fallback");
+        assert_eq!(aot.receipt().engine, EngineKind::OrderedNfa);
+        assert!(aot.program().bit_parallel_exists_stats().is_some());
+        assert!(!aot.program().has_nfa_exact_product());
+        assert!(aot.module().required_runtime_program().is_none());
+        assert!(aot.module().required_runtime_symbol().is_none());
+
+        let runtime_program = None;
+        let partial_dfa = retained_partial_stats(&aot).unwrap();
+        assert!(publishes_native_bit_parallel_exists(
+            &aot,
+            runtime_program.as_ref()
+        ));
+        assert_eq!(
+            classify_fallback_artifact(&aot, runtime_program.as_ref(), partial_dfa, false),
+            "bit_parallel_exists"
+        );
+
+        let mut spec = grammar_patterns(&flat_grammar_config(Some(UNSEEN_TEST_SEED)))
+            .into_iter()
+            .next()
+            .expect("grammar shape");
+        spec.name = "bit_parallel_exists_fallback".to_owned();
+        spec.base_name.clone_from(&spec.name);
+        spec.pattern = pattern.to_owned();
+        spec.fixture = b"abcz".to_vec();
+        spec.output = OutputKind::Exists;
+        spec.force_fallback = true;
+        let shape = CompiledShape {
+            spec,
+            upstream: Regex::new(pattern).unwrap(),
+            aot,
+            runtime_program,
+            partial_dfa,
+            prepared_capability_format: "not_prepared",
+            fallback_artifact_kind: "bit_parallel_exists",
+            retained_limit_derivation: "legacy_zero_state",
+        };
+        assert_eq!(shape.route(), "direct_resource_fallback");
+        assert!(shape.publishes_native_bit_parallel_exists());
     }
 
     #[test]
