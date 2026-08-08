@@ -11,8 +11,8 @@ use core::{fmt, marker::PhantomData, mem};
 
 use fre_exact_alloc::{CopyError, ExactVec};
 use fre_simd_kernels::{
-    BYTE_BUCKET_MAX_COLUMNS, ByteBucketClassifier, ByteBucketTables, DispatchPolicy,
-    SelectionReceipt, SimdDispatchContext,
+    BYTE_BUCKET_BLOCK_BYTES, BYTE_BUCKET_MAX_COLUMNS, ByteBucketClassifier, ByteBucketTables,
+    DispatchPolicy, SelectionReceipt, SimdDispatchContext,
 };
 use memchr::{memchr_iter, memchr2_iter, memchr3_iter};
 
@@ -905,6 +905,89 @@ impl FoldedLiteralTriePlan {
                                 byte_set_contains(prefilter.guard_byte_set, byte)
                             }))
             })
+    }
+
+    /// Derive the source-independent envelope needed by ordered necessary-root
+    /// searches interleaved with authoritative exact blocks.
+    ///
+    /// The attaching matcher has already authenticated that the selected
+    /// fixed columns lie inside every exact pattern of width at most
+    /// `max_pattern_bytes`. Each accepted continuation settles
+    /// `starts_per_block` starts, at least one complete classifier block, so
+    /// there are at most `ceil(N / B)` restarts. Charging one full pattern
+    /// width per possible block covers both a late fixed column and the wide
+    /// classifier's rounded read frontier. A retained guard adds at most one
+    /// read for each primary hit. This primitive never decodes a scalar or
+    /// traverses a trie edge.
+    pub(crate) fn root_candidate_exact_block_upper_bounds(
+        &self,
+        input_bytes: usize,
+        max_pattern_bytes: usize,
+        starts_per_block: usize,
+    ) -> Result<(ScanUpperBounds, usize), ScanError> {
+        let Some(prefilter) = self.root_prefilter.as_ref() else {
+            return Err(ScanError::Invariant {
+                detail: "folded root-candidate envelope requires a retained root prefilter",
+            });
+        };
+        if max_pattern_bytes == 0
+            || usize::from(prefilter.offset) >= max_pattern_bytes
+            || (prefilter.has_guard()
+                && usize::from(prefilter.guard_offset) >= max_pattern_bytes)
+        {
+            return Err(ScanError::Invariant {
+                detail: "folded root-candidate columns escaped the exact pattern width",
+            });
+        }
+        if starts_per_block < BYTE_BUCKET_BLOCK_BYTES {
+            return Err(ScanError::Invariant {
+                detail: "folded root-candidate exact block is narrower than its classifier",
+            });
+        }
+        let exact_blocks = input_bytes
+            .checked_div(starts_per_block)
+            .and_then(|blocks| {
+                blocks.checked_add(usize::from(input_bytes % starts_per_block != 0))
+            })
+            .ok_or(ScanError::ArithmeticOverflow {
+                computation: "folded root-candidate exact blocks",
+            })?;
+        let repeated_source_overlap_bytes = exact_blocks
+            .checked_mul(max_pattern_bytes)
+            .ok_or(ScanError::ArithmeticOverflow {
+                computation: "folded root-candidate repeated source overlap",
+            })?;
+        let source_passes = usize::from(prefilter.has_guard())
+            .checked_add(1)
+            .ok_or(ScanError::ArithmeticOverflow {
+                computation: "folded root-candidate source passes",
+            })?;
+        let primary_source_byte_reads = input_bytes
+            .checked_add(repeated_source_overlap_bytes)
+            .ok_or(ScanError::ArithmeticOverflow {
+                computation: "folded root-candidate repeated source byte reads",
+            })?;
+        let source_byte_reads = primary_source_byte_reads
+            .checked_mul(source_passes)
+            .ok_or(ScanError::ArithmeticOverflow {
+                computation: "folded root-candidate source byte reads",
+            })?;
+        let candidate_starts = input_bytes;
+        let work = candidate_starts.checked_add(source_byte_reads).ok_or(
+            ScanError::ArithmeticOverflow {
+                computation: "folded root-candidate work",
+            },
+        )?;
+        Ok((
+            ScanUpperBounds {
+                input_bytes,
+                candidate_starts,
+                source_byte_reads,
+                work,
+                ..ScanUpperBounds::default()
+            },
+            exact_blocks,
+        ))
     }
 
     /// Derive a complete fixed-program linear envelope from input length only.
