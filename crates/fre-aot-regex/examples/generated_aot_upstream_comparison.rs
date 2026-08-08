@@ -2034,11 +2034,13 @@ fn prepared_capability_format(compiled: &CompiledRegex) -> Result<&'static str, 
     let fully_prefilled_fallback = program
         .compiler_private_try_prefill_retained_fallback_with_workspace_receipt(&mut workspace)
         .map_err(|error| format!("prepared capability prefill failed: {error}"))?;
-    let mut frozen_dynamic_rows = program.compiler_private_frozen_dynamic_rows_storage_v3(
-        &workspace,
-        FROZEN_DYNAMIC_SIDECAR_MAX_K0_BYTES,
-        FROZEN_DYNAMIC_SIDECAR_MAX_PACKED_BYTES,
-    );
+    let mut frozen_dynamic_rows = program
+        .compiler_private_frozen_dynamic_rows_storage_v3_with_fallback_receipt(
+            &mut workspace,
+            fully_prefilled_fallback,
+            FROZEN_DYNAMIC_SIDECAR_MAX_K0_BYTES,
+            FROZEN_DYNAMIC_SIDECAR_MAX_PACKED_BYTES,
+        );
     let mut frozen_header = if frozen_dynamic_rows.is_some() {
         program.compiler_private_frozen_prepared_header_v6(
             &workspace,

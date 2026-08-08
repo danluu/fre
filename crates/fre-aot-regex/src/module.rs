@@ -32481,11 +32481,11 @@ mod tests {
                 ..CompileLimitsV1::default()
             }),
         );
-        let workspace = compiled.program().prepare_workspace().unwrap();
+        let mut workspace = compiled.program().prepare_workspace().unwrap();
         let storage = compiled
             .program()
             .compiler_private_frozen_dynamic_rows_storage_v3(
-                &workspace,
+                &mut workspace,
                 512 * 1024,
                 512 * 1024,
             )
@@ -36460,12 +36460,12 @@ mod tests {
         if use_frozen_owner {
             assert_eq!(view.output, OutputContract::Span);
             assert_eq!(view.exact_match_width, None);
-            let workspace = program
+            let mut workspace = program
                 .prepare_workspace()
                 .expect("compact link-proof workspace");
             let storage = program
                 .compiler_private_frozen_dynamic_rows_storage_v3(
-                    &workspace,
+                    &mut workspace,
                     usize::MAX,
                     usize::MAX,
                 )
@@ -37108,7 +37108,7 @@ mod tests {
                             return None;
                         }
                         let mut workspace = compiled.program().prepare_workspace().ok()?;
-                        compiled
+                        let fallback_receipt = compiled
                             .program()
                             .compiler_private_try_prefill_retained_fallback_with_workspace_receipt(
                                 &mut workspace,
@@ -37116,8 +37116,9 @@ mod tests {
                             .ok()??;
                         compiled
                             .program()
-                            .compiler_private_frozen_dynamic_rows_storage_v3(
-                                &workspace,
+                            .compiler_private_frozen_dynamic_rows_storage_v3_with_fallback_receipt(
+                                &mut workspace,
+                                Some(fallback_receipt),
                                 usize::MAX,
                                 usize::MAX,
                             )?;
@@ -38244,12 +38245,12 @@ int main(void) {{
                     }
                 }
 
-                let workspace = program
+                let mut workspace = program
                     .prepare_workspace()
                     .unwrap_or_else(|error| panic!("prepare {}: {error}", graph.label));
                 let storage = program
                     .compiler_private_frozen_dynamic_rows_storage_v3(
-                        &workspace,
+                        &mut workspace,
                         512 * 1024,
                         512 * 1024,
                     )
@@ -38532,11 +38533,11 @@ static int run_case(const unsigned char *p,size_t n,size_t s,size_t e,uint32_t e
                 .output(OutputContract::Exists)
                 .limits(limits),
         );
-        let workspace = compiled.program().prepare_workspace().unwrap();
+        let mut workspace = compiled.program().prepare_workspace().unwrap();
         let storage = compiled
             .program()
             .compiler_private_frozen_dynamic_rows_storage_v3(
-                &workspace,
+                &mut workspace,
                 512 * 1024,
                 512 * 1024,
             )
@@ -38886,10 +38887,10 @@ static int run_case(const unsigned char *p,size_t n,size_t s,size_t e,uint32_t e
                     .unwrap_or_else(|| panic!("missing {label}/{output:?} dynamic view"));
                 assert_eq!(view.root_requirement, None, "{label}/{output:?}");
                 assert_eq!(view.exact_match_width, Some(2), "{label}/{output:?}");
-                let workspace = program.prepare_workspace().unwrap();
+                let mut workspace = program.prepare_workspace().unwrap();
                 let storage = program
                     .compiler_private_frozen_dynamic_rows_storage_v3(
-                        &workspace,
+                        &mut workspace,
                         512 * 1024,
                         512 * 1024,
                     )
@@ -39184,11 +39185,11 @@ static int run_case(const unsigned char*p,size_t n,size_t s,size_t e,uint32_t xs
         let (program_symbol, program_len) = module
             .required_runtime_program()
             .expect("frozen dynamic runtime program");
-        let workspace = compiled.program().prepare_workspace().unwrap();
+        let mut workspace = compiled.program().prepare_workspace().unwrap();
         let storage = compiled
             .program()
             .compiler_private_frozen_dynamic_rows_storage_v3(
-                &workspace,
+                &mut workspace,
                 524_288,
                 524_288,
             )
@@ -39348,10 +39349,10 @@ static int run_case(const unsigned char*p,size_t n,size_t s,size_t e,uint32_t xs
                 .expect("singleton-class scanner-free dynamic view");
             assert_eq!(view.root_requirement, None);
             assert_eq!(view.exact_match_width, None);
-            let workspace = program.prepare_workspace().unwrap();
+            let mut workspace = program.prepare_workspace().unwrap();
             let storage = program
                 .compiler_private_frozen_dynamic_rows_storage_v3(
-                    &workspace,
+                    &mut workspace,
                     512 * 1024,
                     512 * 1024,
                 )

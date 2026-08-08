@@ -15215,6 +15215,121 @@ pub(crate) fn recover_span_from_selected_end_with_fully_prefilled_workspace(
     })
 }
 
+/// Root-only reverse counterpart of the fully-prefilled ordered-resume
+/// executor.
+///
+/// An immutable native root has already selected the exact endpoint, so no
+/// retained continuation set participates in this authentication. A live
+/// root receipt traverses the setup-completed reverse rows directly. Finite
+/// limits, empty endpoints, and stale receipts retain the ordinary exact
+/// recovery path.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the reverse-only bridge keeps its exact endpoint, cache owner, and setup receipt explicit"
+)]
+pub(crate) fn recover_span_from_selected_end_with_fully_prefilled_root_workspace(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &mut K0Workspace,
+    selected_end: usize,
+    limits: SearchLimits,
+    receipt: K0FullyPrefilledResumeCacheReceipt,
+) -> Result<UntypedReport, SearchError> {
+    validate_window(haystack, window)?;
+    if selected_end < window.start() || selected_end > window.end() {
+        return Err(SearchError::InvalidResumeState {
+            detail: "selected endpoint is outside the original search window",
+        });
+    }
+    if workspace.bound_automaton_identity != automaton.identity() {
+        return Err(SearchError::InvalidResumeState {
+            detail: "selected-end reverse recovery workspace belongs to another automaton",
+        });
+    }
+    if selected_end != window.start()
+        && (automaton.stats().assertion_edges() != 0
+            || !workspace.reverse.is_allocated()
+            || !workspace.reverse.is_bound_to(automaton))
+    {
+        return Err(SearchError::InvalidResumeState {
+            detail: "positive selected-end recovery requires an assertion-free bound bidirectional workspace",
+        });
+    }
+    if limits != SearchLimits::unlimited()
+        || selected_end == window.start()
+        || workspace
+            .fully_prefilled_root_cache_is_live(automaton, receipt, true)
+            .is_none()
+    {
+        return recover_span_from_selected_end_with_workspace(
+            automaton,
+            haystack,
+            window,
+            workspace,
+            selected_end,
+            limits,
+        );
+    }
+
+    let initial_work = initial_accounted_warm_resume_work(0)?;
+    let (outcome, work) = if receipt.has_reverse_byte_rows() {
+        let byte_row_base = u32::try_from(receipt.reverse_cells).map_err(|_| {
+            SearchError::InternalInvariant {
+                detail: "authenticated reverse byte-row base does not fit u32",
+            }
+        })?;
+        execute_accounted_warm_ordered_resume_reverse_loop::<true, true>(
+            automaton,
+            haystack,
+            window,
+            workspace,
+            byte_row_base,
+            selected_end,
+            initial_work,
+        )?
+    } else {
+        execute_accounted_warm_ordered_resume_reverse_loop::<true, false>(
+            automaton,
+            haystack,
+            window,
+            workspace,
+            0,
+            selected_end,
+            initial_work,
+        )?
+    };
+    let WarmResumeSpan::Complete(Some(found)) = outcome else {
+        return Err(SearchError::InternalInvariant {
+            detail: "fully-prefilled root selected-end recovery produced a mutable handoff",
+        });
+    };
+    let transition_work = work.checked_sub(initial_work).ok_or(
+        SearchError::InternalInvariant {
+            detail: "fully-prefilled root selected-end recovery work regressed",
+        },
+    )?;
+    let boundaries = usize::try_from(transition_work)
+        .ok()
+        .and_then(|bytes| bytes.checked_add(1))
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "fully-prefilled root selected-end examined boundaries",
+        })?;
+    let scratch_bytes = workspace.retained_bytes;
+    let mut setup = SetupAccounting::empty(scratch_bytes, true);
+    setup.work = initial_work;
+    Ok(UntypedReport {
+        found: Some(found),
+        accounting: SearchAccounting::new(
+            work,
+            setup,
+            transition_work,
+            scratch_bytes,
+            boundaries,
+        ),
+    })
+}
+
 fn lazy_capabilities(
     automaton: &Automaton,
     workspace: &K0Workspace,
@@ -50082,6 +50197,44 @@ mod tests {
         assert_eq!(
             reverse_only.accounting().boundaries(),
             window.end() - window.start() + 1
+        );
+
+        let root_reverse_only = plan
+            .prepare::<Span>()
+            .recover_span_from_selected_end_with_fully_prefilled_root_workspace(
+                &haystack,
+                window,
+                &mut workspace,
+                window.end(),
+                SearchLimits::unlimited(),
+                receipt,
+            )
+            .unwrap();
+        assert_eq!(root_reverse_only.output(), reverse_only.output());
+        assert_eq!(root_reverse_only.accounting(), reverse_only.accounting());
+        assert_eq!(workspace.lazy.state_len, forward_states);
+        assert_eq!(workspace.reverse.state_len, reverse_states);
+
+        // A receipt from another cache generation must decline the warm root
+        // path and preserve the exact ordinary reverse result.
+        let mut cold_root =
+            K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+        assert!(cold_root
+            .fully_prefilled_root_cache_is_live(&plan, receipt, true)
+            .is_none());
+        assert_eq!(
+            plan.prepare::<Span>()
+                .recover_span_from_selected_end_with_fully_prefilled_root_workspace(
+                    &haystack,
+                    window,
+                    &mut cold_root,
+                    window.end(),
+                    SearchLimits::unlimited(),
+                    receipt,
+                )
+                .unwrap()
+                .into_output(),
+            MatchSpan::new(window.start(), window.end())
         );
 
         // Pairing the resume set with another append-only cache repairs its

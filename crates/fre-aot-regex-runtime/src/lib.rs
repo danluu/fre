@@ -391,9 +391,10 @@ pub struct PreparedAotRegex {
 
 const _: () = assert!(std::mem::offset_of!(PreparedAotRegex, frozen_header) == 0);
 
-// A complete compact sidecar is optional setup-only storage. Bound the
-// temporary second K0 workspace and its final immutable copy independently;
-// larger programs keep the ordinary adaptive executor and one live workspace.
+// A complete compact sidecar is optional setup-only storage. Retain the
+// established K0-size admission and independently bound its final immutable
+// copy; larger programs keep the ordinary adaptive executor and one live
+// workspace.
 const FROZEN_DYNAMIC_SIDECAR_MAX_K0_BYTES: usize = 512 * 1024;
 const FROZEN_DYNAMIC_SIDECAR_MAX_PACKED_BYTES: usize = 512 * 1024;
 
@@ -421,16 +422,18 @@ impl PreparedAotRegex {
         // continuation fallback, but it need not force the generated entry
         // to execute the older wide K0 projection. The header publishers keep
         // their established rule that a receipt wins when both candidates are
-        // supplied; this runtime owner instead presents only the independently
-        // closed compact projection first while retaining the receipt beside
-        // it. A compact construction or publication decline then presents the
-        // receipt alone and transactionally recovers the established V1
-        // capability. Both setup proofs remain immutable until revocation.
-        let mut frozen_dynamic_rows = program.compiler_private_frozen_dynamic_rows_storage_v3(
-            &workspace,
-            FROZEN_DYNAMIC_SIDECAR_MAX_K0_BYTES,
-            FROZEN_DYNAMIC_SIDECAR_MAX_PACKED_BYTES,
-        );
+        // supplied; this runtime owner instead copies the compact projection
+        // from that same completed live cache and presents only the compact
+        // owner first. A compact construction or publication decline then
+        // presents the retained receipt alone and recovers the established V1
+        // capability. Every retained proof remains immutable until revocation.
+        let mut frozen_dynamic_rows = program
+            .compiler_private_frozen_dynamic_rows_storage_v3_with_fallback_receipt(
+                &mut workspace,
+                fully_prefilled_fallback,
+                FROZEN_DYNAMIC_SIDECAR_MAX_K0_BYTES,
+                FROZEN_DYNAMIC_SIDECAR_MAX_PACKED_BYTES,
+            );
         let mut frozen_header = if frozen_dynamic_rows.is_some() {
             program.compiler_private_frozen_prepared_header_v6(
                 &workspace,

@@ -2522,6 +2522,18 @@ pub struct FullyPrefilledFallbackReceipt {
     k0: K0FullyPrefilledResumeCacheReceipt,
 }
 
+/// Program-lineage binding for a complete root-only K0 cache transaction.
+///
+/// Unlike [`FullyPrefilledFallbackReceipt`], this proof carries no retained
+/// continuation-set authority. Immutable dynamic-row owners retain it only
+/// for reverse recovery after their separately copied forward table selected
+/// an exact endpoint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FullyPrefilledRootFallbackReceipt {
+    program_instance: u64,
+    k0: K0FullyPrefilledResumeCacheReceipt,
+}
+
 /// Versioned, target-native header for one setup-authenticated frozen K0 root.
 ///
 /// Prepared exclusive runtimes place this record at byte offset zero of their
@@ -2881,6 +2893,7 @@ pub struct FrozenDynamicRowsStorage {
 pub struct FrozenDynamicRowsStorageV3 {
     program_instance: u64,
     artifact_identity: [u8; 32],
+    root_prefill_receipt: FullyPrefilledRootFallbackReceipt,
     rows: Box<[u16]>,
     rows_u8: Option<Box<[u8]>>,
     pair_rows_v11: Option<Box<[u32]>>,
@@ -8522,7 +8535,26 @@ impl CompiledProgram {
             .then_some(storage)
     }
 
-    /// Build a pointer-stable immutable compact copy of one complete K0 root.
+    /// Build a pointer-stable immutable compact copy of one complete live K0
+    /// root that has no separately retained resume-prefill receipt.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn compiler_private_frozen_dynamic_rows_storage_v3(
+        &self,
+        workspace: &mut ProgramWorkspace,
+        max_k0_bytes: usize,
+        max_packed_bytes: usize,
+    ) -> Option<FrozenDynamicRowsStorageV3> {
+        self.compiler_private_frozen_dynamic_rows_storage_v3_with_fallback_receipt(
+            workspace,
+            None,
+            max_k0_bytes,
+            max_packed_bytes,
+        )
+    }
+
+    /// Build a pointer-stable immutable compact copy of one complete K0 root,
+    /// reusing an earlier live resume-prefill transaction when one exists.
     /// V13 may replace scanner-free fixed-width rows with exact dense
     /// two-transition `u16` cells when its independent resident budget fits;
     /// V11 remains an authenticated compatibility pair form, but V13's exact
@@ -8537,9 +8569,10 @@ impl CompiledProgram {
         clippy::too_many_lines,
         reason = "one fail-closed setup transaction authenticates, compacts, and closes the complete projection"
     )]
-    pub fn compiler_private_frozen_dynamic_rows_storage_v3(
+    pub fn compiler_private_frozen_dynamic_rows_storage_v3_with_fallback_receipt(
         &self,
-        workspace: &ProgramWorkspace,
+        workspace: &mut ProgramWorkspace,
+        fully_prefilled_fallback: Option<FullyPrefilledFallbackReceipt>,
         max_k0_bytes: usize,
         max_packed_bytes: usize,
     ) -> Option<FrozenDynamicRowsStorageV3> {
@@ -8561,20 +8594,34 @@ impl CompiledProgram {
         let variable_span_recovery = dynamic_view.output == OutputContract::Span
             && dynamic_view.exact_match_width.is_none();
 
-        let mut candidate = self.prepare_workspace().ok()?;
-        if candidate.identity.instance != self.identity.instance
-            || candidate.compiler_private_k0_retained_bytes() == 0
-            || candidate.compiler_private_k0_retained_bytes() > max_k0_bytes
-        {
-            return None;
-        }
-        let nfa = candidate.nfa.as_mut()?;
-        let receipt = nfa.compiler_private_try_prefill_root_cache_with_receipt(&self.automaton)?;
+        // Reuse a retained-partial transaction when setup already completed
+        // the live cache with continuation hints. Otherwise complete the same
+        // live root transaction without a resume set. No second K0 workspace
+        // is allocated, and a later packing decline leaves only a harmless
+        // fully warmed live cache with no immutable publication.
+        let nfa = workspace.nfa.as_mut()?;
+        let retained_receipt = fully_prefilled_fallback
+            .filter(|receipt| receipt.program_instance == self.identity.instance)
+            .map(|receipt| receipt.k0)
+            .filter(|&receipt| {
+                nfa.compiler_private_fully_prefilled_root_projection_without_resume(
+                    &self.automaton,
+                    receipt,
+                )
+                .is_some()
+            });
+        let receipt = retained_receipt.or_else(|| {
+            nfa.compiler_private_try_prefill_root_cache_with_receipt(&self.automaton)
+        })?;
         let full = nfa.compiler_private_fully_prefilled_root_projection_without_resume(
             &self.automaton,
             receipt,
         )?;
         let direct = nfa.dynamic_root_projection(&self.automaton)?;
+        let root_prefill_receipt = FullyPrefilledRootFallbackReceipt {
+            program_instance: self.identity.instance,
+            k0: receipt,
+        };
 
         let source_class_count = usize::try_from(full.row_stride()).ok()?;
         let source_cells = direct.state_count().checked_mul(source_class_count)?;
@@ -8772,6 +8819,7 @@ impl CompiledProgram {
             let storage = FrozenDynamicRowsStorageV3 {
                 program_instance: self.identity.instance,
                 artifact_identity: self.identity.artifact,
+                root_prefill_receipt,
                 rows: Box::default(),
                 rows_u8: None,
                 pair_rows_v11: None,
@@ -8830,6 +8878,7 @@ impl CompiledProgram {
             let storage = FrozenDynamicRowsStorageV3 {
                 program_instance: self.identity.instance,
                 artifact_identity: self.identity.artifact,
+                root_prefill_receipt,
                 rows: Box::default(),
                 rows_u8: None,
                 pair_rows_v11: None,
@@ -8890,6 +8939,7 @@ impl CompiledProgram {
             let storage = FrozenDynamicRowsStorageV3 {
                 program_instance: self.identity.instance,
                 artifact_identity: self.identity.artifact,
+                root_prefill_receipt,
                 rows: Box::default(),
                 rows_u8: None,
                 pair_rows_v11: Some(pair_rows_v11),
@@ -9153,6 +9203,7 @@ impl CompiledProgram {
         let storage = FrozenDynamicRowsStorageV3 {
             program_instance: self.identity.instance,
             artifact_identity: self.identity.artifact,
+            root_prefill_receipt,
             rows,
             rows_u8,
             pair_rows_v11: None,
@@ -10988,6 +11039,9 @@ impl CompiledProgram {
         }
 
         let compact_recovery = compact_capability.is_some();
+        let root_prefill_receipt = compact_capability
+            .as_ref()
+            .map(|capability| capability.owner.root_prefill_receipt);
         if let Some(capability) = compact_capability {
             if capability
                 .header
@@ -10998,6 +11052,8 @@ impl CompiledProgram {
                 .is_none()
                 || capability.program_instance != self.identity.instance
                 || capability.artifact_identity != expected_artifact_identity
+                || capability.owner.root_prefill_receipt.program_instance
+                    != self.identity.instance
             {
                 return Err(CompileError::InternalInvariant(
                     "frozen dynamic-row Span capability does not match the prepared program",
@@ -11049,14 +11105,24 @@ impl CompiledProgram {
         let nfa = workspace.nfa.as_mut().ok_or(CompileError::InternalInvariant(
             "dynamic native-row Span recovery has no prepared bidirectional K0 workspace",
         ))?;
-        let recovered_start = self.recover_partial_span_start(
-            haystack,
-            window,
-            nfa,
-            None,
-            selected_end,
-            None,
-        )?;
+        let recovered_start = if let Some(receipt) = root_prefill_receipt {
+            self.recover_root_prefilled_span_start(
+                haystack,
+                window,
+                nfa,
+                selected_end,
+                receipt,
+            )?
+        } else {
+            self.recover_partial_span_start(
+                haystack,
+                window,
+                nfa,
+                None,
+                selected_end,
+                None,
+            )?
+        };
         if recovered_start < window.start || recovered_start > selected_end {
             return Err(CompileError::InternalInvariant(
                 "reverse K0 did not recover a dynamic-row span inside its admitted window at the native-selected endpoint",
@@ -11570,6 +11636,39 @@ impl CompiledProgram {
         if recovered.end() != selected_end {
             return Err(CompileError::InternalInvariant(
                 "reverse K0 changed the forward-selected endpoint",
+            ));
+        }
+        Ok(recovered.start())
+    }
+
+    fn recover_root_prefilled_span_start(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut K0Workspace,
+        selected_end: usize,
+        receipt: FullyPrefilledRootFallbackReceipt,
+    ) -> Result<usize, CompileError> {
+        if receipt.program_instance != self.identity.instance {
+            return Err(CompileError::InternalInvariant(
+                "root-prefilled reverse receipt belongs to a different program lineage",
+            ));
+        }
+        let recovered = self
+            .automaton
+            .prepare::<Span>()
+            .recover_span_from_selected_end_with_fully_prefilled_root_workspace(
+                haystack,
+                K0SearchWindow::new(window.start, window.end),
+                workspace,
+                selected_end,
+                SearchLimits::unlimited(),
+                receipt.k0,
+            )?
+            .into_output();
+        if recovered.end() != selected_end {
+            return Err(CompileError::InternalInvariant(
+                "root-prefilled reverse K0 changed the forward-selected endpoint",
             ));
         }
         Ok(recovered.start())
@@ -14218,6 +14317,22 @@ mod tests {
         .expect("compile")
     }
 
+    fn complete_root_prefill_receipt(
+        compiled: &CompiledProgram,
+        workspace: &mut ProgramWorkspace,
+    ) -> FullyPrefilledRootFallbackReceipt {
+        let k0 = workspace
+            .nfa
+            .as_mut()
+            .expect("test program has a K0 workspace")
+            .compiler_private_try_prefill_root_cache_with_receipt(&compiled.automaton)
+            .expect("test program has a complete root prefill receipt");
+        FullyPrefilledRootFallbackReceipt {
+            program_instance: compiled.identity.instance,
+            k0,
+        }
+    }
+
     fn frozen_test_source_cell(
         destination: Option<usize>,
         source_class_count: usize,
@@ -15137,14 +15252,15 @@ mod tests {
         assert_eq!(view.exact_match_width, None);
         assert_eq!(view.root_requirement, None);
 
-        let mut workspace = compiled.prepare_workspace().expect("dynamic workspace");
+        let mut setup_workspace = compiled.prepare_workspace().expect("setup workspace");
         assert!(compiled
             .compiler_private_frozen_dynamic_rows_storage_v3(
-                &workspace,
+                &mut setup_workspace,
                 usize::MAX,
                 usize::MAX,
             )
             .is_some());
+        let mut workspace = compiled.prepare_workspace().expect("dynamic workspace");
         let mut warmed = vec![b'!'; DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES];
         warmed[0] = b'a';
         let window = SearchWindow::full(&warmed);
@@ -15345,15 +15461,19 @@ mod tests {
             DeterminizeLimits::default(),
         );
         let mut workspace = compiled.prepare_workspace().expect("dynamic workspace");
+        let storage = compiled
+            .compiler_private_frozen_dynamic_rows_storage_v3(
+                &mut workspace,
+                usize::MAX,
+                usize::MAX,
+            )
+            .expect("closed variable-Span forward owner");
         let (live_forward_rows, live_reverse_rows) = {
-            let nfa = workspace.nfa.as_mut().expect("bidirectional K0 workspace");
-            let receipt = nfa
-                .compiler_private_try_prefill_root_cache_with_receipt(&compiled.automaton)
-                .expect("complete variable-Span setup projection");
+            let nfa = workspace.nfa.as_ref().expect("bidirectional K0 workspace");
             let full = nfa
                 .compiler_private_fully_prefilled_root_projection_without_resume(
                     &compiled.automaton,
-                    receipt,
+                    storage.root_prefill_receipt.k0,
                 )
                 .expect("authenticated bidirectional projection");
             (
@@ -15364,14 +15484,6 @@ mod tests {
             )
         };
         assert_ne!(live_forward_rows, live_reverse_rows);
-
-        let storage = compiled
-            .compiler_private_frozen_dynamic_rows_storage_v3(
-                &workspace,
-                usize::MAX,
-                usize::MAX,
-            )
-            .expect("closed variable-Span forward owner");
         let frozen_rows = storage.descriptor().rows_address;
         assert_ne!(frozen_rows, live_forward_rows);
         assert_ne!(frozen_rows, live_reverse_rows);
@@ -15419,6 +15531,25 @@ mod tests {
                 .is_some_and(|dynamic| dynamic.state.native_entry_window.is_none()));
         }
 
+        let capability = header
+            .compiler_private_active_span_capability(&storage, identity)
+            .expect("active exact compact owner");
+        let mut cold_workspace = compiled.prepare_workspace().expect("cold recovery workspace");
+        assert_eq!(
+            compiled
+                .recover_frozen_dynamic_rows_span_from_selected_end_with_workspace(
+                    &haystack,
+                    window,
+                    &mut cold_workspace,
+                    identity,
+                    5,
+                    capability,
+                )
+                .expect("a foreign cache generation must use exact generic recovery"),
+            MatchResult::Span(Some((3, 5)))
+        );
+        assert!(header.is_active(), "stale-receipt fallback is disjoint");
+
         let mut wrong_identity = identity;
         wrong_identity[0] ^= 1;
         assert!(header
@@ -15428,6 +15559,78 @@ mod tests {
         assert!(header
             .compiler_private_active_span_capability(&storage, identity)
             .is_none());
+    }
+
+    #[test]
+    fn frozen_dynamic_rows_reuse_the_live_retained_prefill_receipt() {
+        let compiled = program(
+            r"a+Q|[b-c][a-b]{1,5}(?:x+|y+)",
+            OutputContract::Span,
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: 8,
+                ..DeterminizeLimits::default()
+            },
+        );
+        let dynamic = compiled
+            .native_dynamic_rows_view()
+            .expect("retained-partial program also has a dynamic root");
+        assert_eq!(dynamic.exact_match_width, None);
+        let mut workspace = compiled.prepare_workspace().unwrap();
+        let fallback = compiled
+            .compiler_private_try_prefill_retained_fallback_with_workspace_receipt(
+                &mut workspace,
+            )
+            .unwrap()
+            .expect("retained resume cache prefill");
+        let (cache_identity, forward_cells, reverse_cells, forward_rows) = {
+            let projection = workspace
+                .nfa
+                .as_ref()
+                .unwrap()
+                .compiler_private_fully_prefilled_root_projection_without_resume(
+                    &compiled.automaton,
+                    fallback.k0,
+                )
+                .unwrap();
+            (
+                projection.cache_identity(),
+                projection.forward_rows().len(),
+                projection.reverse_rows().unwrap().len(),
+                projection.forward_rows_address(),
+            )
+        };
+
+        let storage = compiled
+            .compiler_private_frozen_dynamic_rows_storage_v3_with_fallback_receipt(
+                &mut workspace,
+                Some(fallback),
+                usize::MAX,
+                usize::MAX,
+            )
+            .expect("compact owner copied from the retained live cache");
+        assert_eq!(
+            storage.root_prefill_receipt.program_instance,
+            compiled.identity.instance
+        );
+        assert_eq!(storage.root_prefill_receipt.k0, fallback.k0);
+        let projection = workspace
+            .nfa
+            .as_ref()
+            .unwrap()
+            .compiler_private_fully_prefilled_root_projection_without_resume(
+                &compiled.automaton,
+                storage.root_prefill_receipt.k0,
+            )
+            .expect("the copied owner must leave its source receipt live");
+        assert_eq!(projection.cache_identity(), cache_identity);
+        assert_eq!(projection.forward_rows().len(), forward_cells);
+        assert_eq!(projection.reverse_rows().unwrap().len(), reverse_cells);
+        assert_eq!(projection.forward_rows_address(), forward_rows);
+        assert_ne!(
+            storage.descriptor().rows_address,
+            forward_rows.expose_provenance()
+        );
     }
 
     #[test]
@@ -15841,7 +16044,7 @@ mod tests {
         }
         assert!(compiled
             .compiler_private_frozen_dynamic_rows_storage_v3(
-                &workspace,
+                &mut workspace,
                 usize::MAX,
                 usize::MAX,
             )
@@ -22619,7 +22822,8 @@ mod tests {
             CompileMode::Fast,
             DeterminizeLimits::default(),
         );
-        let workspace = compiled.prepare_workspace().unwrap();
+        let mut workspace = compiled.prepare_workspace().unwrap();
+        let root_prefill_receipt = complete_root_prefill_receipt(&compiled, &mut workspace);
         let state_count = 2_usize;
         let class_count = 3_usize;
         let (quad, tail3, tail2, _, block_cells, total_cells, _) =
@@ -22642,6 +22846,7 @@ mod tests {
         let mut storage = FrozenDynamicRowsStorageV3 {
             program_instance: compiled.identity.instance,
             artifact_identity: compiled.identity.artifact,
+            root_prefill_receipt,
             rows: Box::default(),
             rows_u8: None,
             pair_rows_v11: None,
@@ -22927,7 +23132,8 @@ mod tests {
             CompileMode::Fast,
             DeterminizeLimits::default(),
         );
-        let workspace = compiled.prepare_workspace().unwrap();
+        let mut workspace = compiled.prepare_workspace().unwrap();
+        let root_prefill_receipt = complete_root_prefill_receipt(&compiled, &mut workspace);
         let state_count = 2_usize;
         let class_count = 3_usize;
         let (pair_cells, block_cells, total_cells, _) =
@@ -22950,6 +23156,7 @@ mod tests {
         let mut storage = FrozenDynamicRowsStorageV3 {
             program_instance: compiled.identity.instance,
             artifact_identity: compiled.identity.artifact,
+            root_prefill_receipt,
             rows: Box::default(),
             rows_u8: None,
             pair_rows_v11: None,
@@ -24061,7 +24268,8 @@ mod tests {
             CompileMode::Fast,
             DeterminizeLimits::default(),
         );
-        let workspace = compiled.prepare_workspace().unwrap();
+        let mut workspace = compiled.prepare_workspace().unwrap();
+        let root_prefill_receipt = complete_root_prefill_receipt(&compiled, &mut workspace);
         let identity_map: [u8; 256] = core::array::from_fn(|byte| u8::try_from(byte).unwrap());
         let reverse_map: [u8; 256] = core::array::from_fn(|byte| {
             u8::try_from(255_usize.checked_sub(byte).unwrap()).unwrap()
@@ -24110,6 +24318,7 @@ mod tests {
             FrozenDynamicRowsStorageV3 {
                 program_instance: compiled.identity.instance,
                 artifact_identity: compiled.identity.artifact,
+                root_prefill_receipt,
                 rows,
                 rows_u8: None,
                 pair_rows_v11: None,
@@ -24236,7 +24445,8 @@ mod tests {
             CompileMode::Fast,
             DeterminizeLimits::default(),
         );
-        let workspace = compiled.prepare_workspace().unwrap();
+        let mut workspace = compiled.prepare_workspace().unwrap();
+        let root_prefill_receipt = complete_root_prefill_receipt(&compiled, &mut workspace);
         let state_count = 2_usize;
         let class_count = 256_usize;
         let mut byte_rows = Vec::with_capacity(state_count * class_count);
@@ -24269,6 +24479,7 @@ mod tests {
         let mut storage = FrozenDynamicRowsStorageV3 {
             program_instance: compiled.identity.instance,
             artifact_identity: compiled.identity.artifact,
+            root_prefill_receipt,
             rows: Vec::new().into_boxed_slice(),
             rows_u8: Some(byte_rows),
             pair_rows_v11: None,
@@ -24357,7 +24568,8 @@ mod tests {
                 ..DeterminizeLimits::default()
             },
         );
-        let workspace = compiled.prepare_workspace().unwrap();
+        let mut workspace = compiled.prepare_workspace().unwrap();
+        let root_prefill_receipt = complete_root_prefill_receipt(&compiled, &mut workspace);
         let state_count = 16_384_usize;
         let class_count = 2_usize;
         assert_eq!(
@@ -24383,6 +24595,7 @@ mod tests {
         let storage = FrozenDynamicRowsStorageV3 {
             program_instance: compiled.identity.instance,
             artifact_identity: compiled.identity.artifact,
+            root_prefill_receipt,
             rows,
             rows_u8: None,
             pair_rows_v11: None,
@@ -24420,22 +24633,30 @@ mod tests {
             let dynamic = compiled
                 .native_dynamic_rows_view()
                 .unwrap_or_else(|| panic!("missing dynamic rows for {label}"));
-            let workspace = compiled.prepare_workspace().unwrap();
+            let mut workspace = compiled.prepare_workspace().unwrap();
             assert!(
                 workspace
                     .nfa
                     .as_ref()
                     .and_then(|nfa| nfa.dynamic_root_projection(&compiled.automaton))
                     .is_none(),
-                "compact setup must leave the live workspace cold for {label}"
+                "a fresh compact workspace must begin cold for {label}"
             );
             let storage = compiled
                 .compiler_private_frozen_dynamic_rows_storage_v3(
-                    &workspace,
+                    &mut workspace,
                     usize::MAX,
                     usize::MAX,
                 )
                 .unwrap_or_else(|| panic!("closed dynamic rows did not promote for {label}"));
+            assert!(
+                workspace
+                    .nfa
+                    .as_ref()
+                    .and_then(|nfa| nfa.dynamic_root_projection(&compiled.automaton))
+                    .is_some(),
+                "compact setup must retain the completed live root for {label}"
+            );
             assert!(storage.descriptor_is_valid_for(compiled.identity), "{label}");
             let header = compiled.compiler_private_frozen_prepared_header_v3(
                 &workspace,
@@ -24539,11 +24760,11 @@ mod tests {
         );
         assert!(exact_product.has_nfa_exact_product());
         assert!(exact_product.native_dynamic_rows_view().is_none());
-        let exact_workspace = exact_product.prepare_workspace().unwrap();
+        let mut exact_workspace = exact_product.prepare_workspace().unwrap();
         assert!(
             exact_product
                 .compiler_private_frozen_dynamic_rows_storage_v3(
-                    &exact_workspace,
+                    &mut exact_workspace,
                     usize::MAX,
                     usize::MAX,
                 )
@@ -24568,11 +24789,11 @@ mod tests {
                 ..DeterminizeLimits::default()
             },
         );
-        let workspace = compiled.prepare_workspace().unwrap();
+        let mut workspace = compiled.prepare_workspace().unwrap();
         let retained_bytes = workspace.compiler_private_k0_retained_bytes();
         let maximum_owner = compiled
             .compiler_private_frozen_dynamic_rows_storage_v3(
-                &workspace,
+                &mut workspace,
                 retained_bytes,
                 usize::MAX,
             )
@@ -24608,18 +24829,20 @@ mod tests {
         // The inherited mapped-u16 budget admits the general compact owner,
         // but cannot also retain any V6/V7 loop payload. Arbitration therefore
         // reaches V12 without weakening either resource authority.
+        let mut below_budget_workspace = compiled.prepare_workspace().unwrap();
         assert!(
             compiled
                 .compiler_private_frozen_dynamic_rows_storage_v3(
-                    &workspace,
+                    &mut below_budget_workspace,
                     retained_bytes,
                     selection_budget.saturating_sub(1),
                 )
                 .is_none()
         );
+        let mut exact_budget_workspace = compiled.prepare_workspace().unwrap();
         let mut storage = compiled
             .compiler_private_frozen_dynamic_rows_storage_v3(
-                &workspace,
+                &mut exact_budget_workspace,
                 retained_bytes,
                 selection_budget,
             )
@@ -24862,11 +25085,11 @@ mod tests {
                     ..DeterminizeLimits::default()
                 },
             );
-            let nullable_workspace = nullable.prepare_workspace().unwrap();
+            let mut nullable_workspace = nullable.prepare_workspace().unwrap();
             assert!(
                 nullable
                     .compiler_private_frozen_dynamic_rows_storage_v3(
-                        &nullable_workspace,
+                        &mut nullable_workspace,
                         usize::MAX,
                         usize::MAX,
                     )
@@ -24905,10 +25128,10 @@ mod tests {
             );
         }
 
-        let workspace = compiled.prepare_workspace().unwrap();
+        let mut workspace = compiled.prepare_workspace().unwrap();
         let mut storage = compiled
             .compiler_private_frozen_dynamic_rows_storage_v3(
-                &workspace,
+                &mut workspace,
                 usize::MAX,
                 usize::MAX,
             )
@@ -24983,10 +25206,10 @@ mod tests {
                 ..DeterminizeLimits::default()
             },
         );
-        let selected_workspace = selected.prepare_workspace().unwrap();
+        let mut selected_workspace = selected.prepare_workspace().unwrap();
         let selected_storage = selected
             .compiler_private_frozen_dynamic_rows_storage_v3(
-                &selected_workspace,
+                &mut selected_workspace,
                 usize::MAX,
                 usize::MAX,
             )
@@ -25081,11 +25304,11 @@ mod tests {
             let dynamic = compiled.native_dynamic_rows_view().unwrap();
             assert_eq!(dynamic.root_requirement, None, "{output:?}");
             assert_eq!(dynamic.exact_match_width, Some(2), "{output:?}");
-            let workspace = compiled.prepare_workspace().unwrap();
+            let mut workspace = compiled.prepare_workspace().unwrap();
             let retained_bytes = workspace.compiler_private_k0_retained_bytes();
             let broad_storage = compiled
                 .compiler_private_frozen_dynamic_rows_storage_v3(
-                    &workspace,
+                    &mut workspace,
                     retained_bytes,
                     usize::MAX,
                 )
@@ -25099,9 +25322,10 @@ mod tests {
             let class_count = usize::try_from(broad_storage.descriptor.class_count).unwrap();
             let (_, _, _, pair_bytes) =
                 frozen_pair_rows_v13_geometry(state_count, class_count).unwrap();
+            let mut pair_workspace = compiled.prepare_workspace().unwrap();
             let storage = compiled
                 .compiler_private_frozen_dynamic_rows_storage_v3(
-                    &workspace,
+                    &mut pair_workspace,
                     retained_bytes,
                     pair_bytes,
                 )
@@ -25125,9 +25349,10 @@ mod tests {
             assert!(pair_bytes <= retained_bytes);
             assert!(pair_bytes <= FROZEN_PAIR_ROWS_V13_MAX_BYTES);
 
+            let mut below_pair_workspace = compiled.prepare_workspace().unwrap();
             let below_pair_budget = compiled
                 .compiler_private_frozen_dynamic_rows_storage_v3(
-                    &workspace,
+                    &mut below_pair_workspace,
                     retained_bytes,
                     pair_bytes - 1,
                 )
@@ -25136,9 +25361,10 @@ mod tests {
                 below_pair_budget.descriptor.format_version,
                 FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION
             );
+            let mut exact_pair_workspace = compiled.prepare_workspace().unwrap();
             let exact_pair_budget = compiled
                 .compiler_private_frozen_dynamic_rows_storage_v3(
-                    &workspace,
+                    &mut exact_pair_workspace,
                     retained_bytes,
                     pair_bytes,
                 )
@@ -25149,7 +25375,7 @@ mod tests {
             );
 
             let header = compiled.compiler_private_frozen_prepared_header_v3(
-                &workspace,
+                &pair_workspace,
                 None,
                 Some(&storage),
             );
@@ -25180,7 +25406,7 @@ mod tests {
             );
 
             let maximum = compiled.compiler_private_frozen_prepared_header_v6(
-                &workspace,
+                &pair_workspace,
                 None,
                 Some(&storage),
             );
@@ -25213,10 +25439,10 @@ mod tests {
         let variable_view = variable_span.native_dynamic_rows_view().unwrap();
         assert_eq!(variable_view.root_requirement, None);
         assert_eq!(variable_view.exact_match_width, None);
-        let variable_workspace = variable_span.prepare_workspace().unwrap();
+        let mut variable_workspace = variable_span.prepare_workspace().unwrap();
         let variable_storage = variable_span
             .compiler_private_frozen_dynamic_rows_storage_v3(
-                &variable_workspace,
+                &mut variable_workspace,
                 usize::MAX,
                 usize::MAX,
             )
@@ -25243,7 +25469,8 @@ mod tests {
                 ..DeterminizeLimits::default()
             },
         );
-        let workspace = compiled.prepare_workspace().unwrap();
+        let mut workspace = compiled.prepare_workspace().unwrap();
+        let root_prefill_receipt = complete_root_prefill_receipt(&compiled, &mut workspace);
         let state_count = 2_usize;
         let class_count = 3_usize;
         let (physical_classes, pair_cells, block_words, total_words, _) =
@@ -25276,6 +25503,7 @@ mod tests {
         let mut storage = FrozenDynamicRowsStorageV3 {
             program_instance: compiled.identity.instance,
             artifact_identity: compiled.identity.artifact,
+            root_prefill_receipt,
             rows: Box::default(),
             rows_u8: None,
             pair_rows_v11: Some(pair_rows_v11),
@@ -25401,7 +25629,7 @@ mod tests {
                 ..DeterminizeLimits::default()
             },
         );
-        let workspace = compiled.prepare_workspace().unwrap();
+        let mut workspace = compiled.prepare_workspace().unwrap();
         let retained_bytes = workspace.compiler_private_k0_retained_bytes();
         // A retained loop suppresses the generally smaller V12 promotion. V7
         // is an additive extension of the production-packed V4 owner, so its
@@ -25409,7 +25637,7 @@ mod tests {
         // and publication path without manufacturing a dominated selection.
         let mut storage = compiled
             .compiler_private_frozen_dynamic_rows_storage_v3(
-                &workspace,
+                &mut workspace,
                 retained_bytes,
                 usize::MAX,
             )
@@ -25640,11 +25868,11 @@ mod tests {
                     ..DeterminizeLimits::default()
                 },
             );
-            let nullable_workspace = nullable.prepare_workspace().unwrap();
+            let mut nullable_workspace = nullable.prepare_workspace().unwrap();
             assert!(
                 nullable
                     .compiler_private_frozen_dynamic_rows_storage_v3(
-                        &nullable_workspace,
+                        &mut nullable_workspace,
                         usize::MAX,
                         usize::MAX,
                     )
@@ -25800,10 +26028,10 @@ mod tests {
                 ..DeterminizeLimits::default()
             },
         );
-        let workspace = compiled.prepare_workspace().unwrap();
+        let mut workspace = compiled.prepare_workspace().unwrap();
         let mut storage = compiled
             .compiler_private_frozen_dynamic_rows_storage_v3(
-                &workspace,
+                &mut workspace,
                 usize::MAX,
                 usize::MAX,
             )
