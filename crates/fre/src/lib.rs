@@ -7744,7 +7744,8 @@ impl PortableRegex {
     /// the ordinary Pike workspace. Cache selection is source-free and occurs
     /// before allocation; every subsequent call reuses the selected storage
     /// without growing. Native plans retain their existing operation-specific
-    /// dispatch and need no session storage.
+    /// dispatch and need no allocated session storage. Exact literals bind
+    /// their selected immutable plan directly in the inline session owner.
     ///
     /// # Errors
     ///
@@ -7862,6 +7863,10 @@ impl PortableRegex {
                     negative_prefilter_span_state: K0NegativePrefilterState::default(),
                 }
             }
+            PortablePlan::ExactLiteral(plan) => PortableSearchSessionPlan::ExactLiteral {
+                regex: self,
+                plan,
+            },
             _ => PortableSearchSessionPlan::Native(self),
         };
         Ok(PortableSearchSession { plan })
@@ -10293,11 +10298,13 @@ impl PortableRegex {
 
 /// Operation-local reusable search state for one immutable portable matcher.
 ///
-/// This keeps construction-selected specialized plans unchanged. Only K0 owns
-/// mutable state, consisting of its primary fixed-capacity workspace, one
-/// optional immutable-plan-bound prefix workspace, and bounded
-/// performance-only histories whose sizes are determined entirely by the
-/// validated plan. Neither workspace retains source positions or results.
+/// This keeps construction-selected specialized plans unchanged. Exact
+/// literals bind their immutable selected plan once so steady calls do not
+/// redispatch through the complete portable-plan enum. Only K0 owns mutable
+/// state, consisting of its primary fixed-capacity workspace, one optional
+/// immutable-plan-bound prefix workspace, and bounded performance-only
+/// histories whose sizes are determined entirely by the validated plan.
+/// Neither workspace retains source positions or results.
 #[derive(Debug)]
 pub struct PortableSearchSession<'a> {
     plan: PortableSearchSessionPlan<'a>,
@@ -10323,6 +10330,14 @@ enum PortableSearchSessionPlan<'a> {
         mandatory_suffix_span_state: K0NegativePrefilterState,
         negative_prefilter_exists_state: K0NegativePrefilterState,
         negative_prefilter_span_state: K0NegativePrefilterState,
+    },
+    /// Keep this new specialized route after the two established variants so
+    /// their discriminants and common steady-state dispatch remain stable.
+    /// The immutable semantic owner remains available for diagnostics while
+    /// steady searches bind the selected literal plan exactly once here.
+    ExactLiteral {
+        regex: &'a PortableRegex,
+        plan: &'a LiteralPlan,
     },
 }
 
@@ -14701,6 +14716,9 @@ impl<'r> PortableSearchSession<'r> {
     #[must_use]
     pub const fn runtime_implementation_id(&self) -> &'static str {
         match &self.plan {
+            PortableSearchSessionPlan::ExactLiteral { regex, .. } => {
+                regex.runtime_implementation_id()
+            }
             PortableSearchSessionPlan::Native(regex) => regex.runtime_implementation_id(),
             PortableSearchSessionPlan::K0 { .. } => "k0",
         }
@@ -14714,7 +14732,8 @@ impl<'r> PortableSearchSession<'r> {
     #[must_use]
     pub const fn workspace_setup_accounting(&self) -> Option<SearchSessionSetupAccounting> {
         match &self.plan {
-            PortableSearchSessionPlan::Native(_) => None,
+            PortableSearchSessionPlan::ExactLiteral { .. }
+            | PortableSearchSessionPlan::Native(_) => None,
             PortableSearchSessionPlan::K0 {
                 aggregate_setup, ..
             } => Some(*aggregate_setup),
@@ -14796,6 +14815,17 @@ impl<'r> PortableSearchSession<'r> {
         limits: SearchLimits,
     ) -> Result<(bool, SearchAccounting), SearchError> {
         match &mut self.plan {
+            PortableSearchSessionPlan::ExactLiteral { plan, .. } => {
+                let (matched, accounting) = plan.find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    literal_limits(limits),
+                )?;
+                Ok((
+                    matched.is_some(),
+                    SearchAccounting::ExactLiteral(accounting),
+                ))
+            }
             PortableSearchSessionPlan::Native(regex) => {
                 regex.is_match_window(haystack, window, limits)
             }
@@ -14822,6 +14852,14 @@ impl<'r> PortableSearchSession<'r> {
         limits: SearchLimits,
     ) -> Result<bool, SearchError> {
         match &mut self.plan {
+            PortableSearchSessionPlan::ExactLiteral { plan, .. } => plan
+                .find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    literal_limits(limits),
+                )
+                .map(|(matched, _)| matched.is_some())
+                .map_err(SearchError::from),
             PortableSearchSessionPlan::Native(regex) => {
                 regex.is_match_window_value(haystack, window, limits)
             }
@@ -15108,6 +15146,14 @@ impl<'r> PortableSearchSession<'r> {
         limits: SearchLimits,
     ) -> Result<Option<usize>, SearchError> {
         match &mut self.plan {
+            PortableSearchSessionPlan::ExactLiteral { plan, .. } => plan
+                .find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    literal_limits(limits),
+                )
+                .map(|(matched, _)| matched.map(|(_, end)| end))
+                .map_err(SearchError::from),
             PortableSearchSessionPlan::Native(regex) => regex
                 .shortest_match_window(haystack, window, limits)
                 .map(|(output, _)| output),
@@ -15263,6 +15309,17 @@ impl<'r> PortableSearchSession<'r> {
         limits: SearchLimits,
     ) -> Result<(Option<usize>, SearchAccounting), SearchError> {
         match &mut self.plan {
+            PortableSearchSessionPlan::ExactLiteral { plan, .. } => {
+                let (matched, accounting) = plan.find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    literal_limits(limits),
+                )?;
+                Ok((
+                    matched.map(|(_, end)| end),
+                    SearchAccounting::ExactLiteral(accounting),
+                ))
+            }
             PortableSearchSessionPlan::Native(regex) => {
                 regex.shortest_match_window(haystack, window, limits)
             }
@@ -15286,6 +15343,13 @@ impl<'r> PortableSearchSession<'r> {
         limits: SearchLimits,
     ) -> Result<(Option<usize>, SearchAccounting), SearchError> {
         match &mut self.plan {
+            PortableSearchSessionPlan::ExactLiteral { plan, .. } => {
+                let (matched, accounting) = plan.find(haystack, literal_limits(limits))?;
+                Ok((
+                    matched.map(|(_, end)| end),
+                    SearchAccounting::ExactLiteral(accounting),
+                ))
+            }
             PortableSearchSessionPlan::Native(regex) => regex.selected_end(haystack, limits),
             PortableSearchSessionPlan::K0 { session, .. } => {
                 let report = session.search::<SelectedEnd>(haystack, limits)?;
@@ -15416,6 +15480,17 @@ impl<'r> PortableSearchSession<'r> {
         limits: SearchLimits,
     ) -> Result<(Option<Match>, SearchAccounting), SearchError> {
         match &mut self.plan {
+            PortableSearchSessionPlan::ExactLiteral { plan, .. } => {
+                let (matched, accounting) = plan.find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    literal_limits(limits),
+                )?;
+                Ok((
+                    matched.map(|(start, end)| Match { start, end }),
+                    SearchAccounting::ExactLiteral(accounting),
+                ))
+            }
             PortableSearchSessionPlan::Native(regex) => regex.find_window(haystack, window, limits),
             PortableSearchSessionPlan::K0 { session, .. } => {
                 let report = if window.end() == haystack.len() {
@@ -15447,6 +15522,14 @@ impl<'r> PortableSearchSession<'r> {
         limits: SearchLimits,
     ) -> Result<Option<Match>, SearchError> {
         match &mut self.plan {
+            PortableSearchSessionPlan::ExactLiteral { plan, .. } => plan
+                .find_window(
+                    haystack,
+                    LiteralWindow::new(window.start(), window.end()),
+                    literal_limits(limits),
+                )
+                .map(|(matched, _)| matched.map(|(start, end)| Match { start, end }))
+                .map_err(SearchError::from),
             PortableSearchSessionPlan::Native(regex) => {
                 regex.find_window_value(haystack, window, limits)
             }
@@ -16367,6 +16450,7 @@ impl<'r> PortableSearchSession<'r> {
         haystack: &'h [u8],
     ) -> Option<PortableNativeSearchCursor<'r, 'h>> {
         match &self.plan {
+            PortableSearchSessionPlan::ExactLiteral { .. } => None,
             PortableSearchSessionPlan::Native(regex) => regex.native_search_cursor(haystack),
             PortableSearchSessionPlan::K0 { .. } => None,
         }
@@ -16491,7 +16575,8 @@ impl<'r> PortableSearchSession<'r> {
                 && k0_plan.absolute_end_proof.is_none() => {
                 session.retained_root_run_cursor_available()
             }
-            PortableSearchSessionPlan::Native(_)
+            PortableSearchSessionPlan::ExactLiteral { .. }
+            | PortableSearchSessionPlan::Native(_)
             | PortableSearchSessionPlan::K0 { .. } => false,
         };
         if retained_root_run {
@@ -16527,6 +16612,17 @@ impl<'r> PortableSearchSession<'r> {
         limits: SearchLimits,
     ) -> Result<(Option<Match>, u64), SearchError> {
         match &mut self.plan {
+            PortableSearchSessionPlan::ExactLiteral { plan, .. } => {
+                let (matched, accounting) = plan.find_window(
+                    source.haystack(),
+                    LiteralWindow::new(start, source.haystack().len()),
+                    literal_limits(limits),
+                )?;
+                Ok((
+                    matched.map(|(start, end)| Match { start, end }),
+                    u64::try_from(accounting.linear_terms).unwrap_or(u64::MAX),
+                ))
+            }
             PortableSearchSessionPlan::Native(regex) => {
                 regex.find_iter_at(source.haystack(), start, limits)
             }
@@ -20588,7 +20684,8 @@ mod tests {
                 assert!(k0_plan.absolute_end_proof.is_none());
                 *exclusive_route_state
             }
-            PortableSearchSessionPlan::Native(_) => unreachable!(),
+            PortableSearchSessionPlan::ExactLiteral { .. }
+            | PortableSearchSessionPlan::Native(_) => unreachable!(),
         };
         let haystack = b"zzabzz";
         let window = SearchWindow::full(haystack);
@@ -20612,7 +20709,8 @@ mod tests {
                 exclusive_route_state,
                 ..
             } => *exclusive_route_state,
-            PortableSearchSessionPlan::Native(_) => unreachable!(),
+            PortableSearchSessionPlan::ExactLiteral { .. }
+            | PortableSearchSessionPlan::Native(_) => unreachable!(),
         };
         assert_eq!(state_after, state_before);
     }
@@ -20644,7 +20742,8 @@ mod tests {
                 ));
                 correlated_states.exists
             }
-            PortableSearchSessionPlan::Native(_) => unreachable!(),
+            PortableSearchSessionPlan::ExactLiteral { .. }
+            | PortableSearchSessionPlan::Native(_) => unreachable!(),
         };
 
         let regex = PortableBuilder::new(r"(?-u:(?:ab|c+)\z)")
@@ -21690,7 +21789,8 @@ mod tests {
                 );
                 *mandatory_suffix_exists_state
             }
-            PortableSearchSessionPlan::Native(_) => {
+            PortableSearchSessionPlan::ExactLiteral { .. }
+            | PortableSearchSessionPlan::Native(_) => {
                 panic!("cross-operation fixture did not retain K0")
             }
         };
@@ -21726,7 +21826,8 @@ mod tests {
                 );
                 *mandatory_suffix_span_state
             }
-            PortableSearchSessionPlan::Native(_) => {
+            PortableSearchSessionPlan::ExactLiteral { .. }
+            | PortableSearchSessionPlan::Native(_) => {
                 panic!("cross-operation fixture lost K0")
             }
         };
@@ -21869,7 +21970,8 @@ mod tests {
                 *mandatory_suffix_span_state,
                 *negative_prefilter_span_state,
             ),
-            PortableSearchSessionPlan::Native(_) => {
+            PortableSearchSessionPlan::ExactLiteral { .. }
+            | PortableSearchSessionPlan::Native(_) => {
                 panic!("universal retry-clock session lost K0")
             }
         };
@@ -21901,7 +22003,8 @@ mod tests {
                 *mandatory_suffix_span_state,
                 *negative_prefilter_span_state,
             ),
-            PortableSearchSessionPlan::Native(_) => {
+            PortableSearchSessionPlan::ExactLiteral { .. }
+            | PortableSearchSessionPlan::Native(_) => {
                 panic!("universal retry-clock session lost K0")
             }
         };
@@ -21932,7 +22035,8 @@ mod tests {
                 *mandatory_suffix_span_state,
                 *negative_prefilter_span_state,
             ),
-            PortableSearchSessionPlan::Native(_) => {
+            PortableSearchSessionPlan::ExactLiteral { .. }
+            | PortableSearchSessionPlan::Native(_) => {
                 panic!("universal retry-clock session lost K0")
             }
         };
@@ -22045,7 +22149,8 @@ mod tests {
                 *mandatory_suffix_span_state,
                 *negative_prefilter_span_state,
             ),
-            PortableSearchSessionPlan::Native(_) => {
+            PortableSearchSessionPlan::ExactLiteral { .. }
+            | PortableSearchSessionPlan::Native(_) => {
                 panic!("universal mutation session lost K0")
             }
         };
@@ -22070,7 +22175,8 @@ mod tests {
                 *mandatory_suffix_span_state,
                 *negative_prefilter_span_state,
             ),
-            PortableSearchSessionPlan::Native(_) => {
+            PortableSearchSessionPlan::ExactLiteral { .. }
+            | PortableSearchSessionPlan::Native(_) => {
                 panic!("universal mutation session lost K0")
             }
         };
@@ -22105,7 +22211,8 @@ mod tests {
                 mandatory_suffix_span_state,
                 ..
             } => *mandatory_suffix_span_state,
-            PortableSearchSessionPlan::Native(_) => {
+            PortableSearchSessionPlan::ExactLiteral { .. }
+            | PortableSearchSessionPlan::Native(_) => {
                 panic!("universal mutation session lost K0")
             }
         };
@@ -22126,7 +22233,8 @@ mod tests {
                 mandatory_suffix_span_state,
                 ..
             } => *mandatory_suffix_span_state,
-            PortableSearchSessionPlan::Native(_) => {
+            PortableSearchSessionPlan::ExactLiteral { .. }
+            | PortableSearchSessionPlan::Native(_) => {
                 panic!("universal mutation session lost K0")
             }
         };
@@ -22150,7 +22258,8 @@ mod tests {
                 mandatory_suffix_span_state,
                 ..
             } => *mandatory_suffix_span_state,
-            PortableSearchSessionPlan::Native(_) => {
+            PortableSearchSessionPlan::ExactLiteral { .. }
+            | PortableSearchSessionPlan::Native(_) => {
                 panic!("universal mutation session lost K0")
             }
         };
@@ -22170,7 +22279,8 @@ mod tests {
                 mandatory_suffix_span_state,
                 ..
             } => *mandatory_suffix_span_state,
-            PortableSearchSessionPlan::Native(_) => {
+            PortableSearchSessionPlan::ExactLiteral { .. }
+            | PortableSearchSessionPlan::Native(_) => {
                 panic!("universal mutation session lost K0")
             }
         };
@@ -25751,7 +25861,8 @@ mod tests {
                 *mandatory_suffix_span_state,
                 *negative_prefilter_span_state,
             ),
-            PortableSearchSessionPlan::Native(_) => {
+            PortableSearchSessionPlan::ExactLiteral { .. }
+            | PortableSearchSessionPlan::Native(_) => {
                 panic!("finite long-suffix prefilter session did not retain K0")
             }
         };
@@ -25784,7 +25895,8 @@ mod tests {
                 *mandatory_suffix_span_state,
                 *negative_prefilter_span_state,
             ),
-            PortableSearchSessionPlan::Native(_) => {
+            PortableSearchSessionPlan::ExactLiteral { .. }
+            | PortableSearchSessionPlan::Native(_) => {
                 panic!("finite long-suffix prefilter session did not retain K0")
             }
         };
@@ -25842,7 +25954,8 @@ mod tests {
                     *negative_prefilter_span_state,
                 )
             }
-            PortableSearchSessionPlan::Native(_) => {
+            PortableSearchSessionPlan::ExactLiteral { .. }
+            | PortableSearchSessionPlan::Native(_) => {
                 panic!("finite long-suffix prefilter session did not retain K0")
             }
         };
@@ -25862,7 +25975,8 @@ mod tests {
                 *mandatory_suffix_span_state,
                 *negative_prefilter_span_state,
             ),
-            PortableSearchSessionPlan::Native(_) => {
+            PortableSearchSessionPlan::ExactLiteral { .. }
+            | PortableSearchSessionPlan::Native(_) => {
                 panic!("finite long-suffix prefilter session did not retain K0")
             }
         };
@@ -25894,7 +26008,8 @@ mod tests {
                     *mandatory_suffix_span_state,
                     *negative_prefilter_span_state,
                 ),
-                PortableSearchSessionPlan::Native(_) => {
+                PortableSearchSessionPlan::ExactLiteral { .. }
+                | PortableSearchSessionPlan::Native(_) => {
                     panic!("finite long-suffix prefilter session did not retain K0")
                 }
             };
@@ -25939,7 +26054,8 @@ mod tests {
                         *negative_prefilter_span_state,
                     )
                 }
-                PortableSearchSessionPlan::Native(_) => {
+                PortableSearchSessionPlan::ExactLiteral { .. }
+                | PortableSearchSessionPlan::Native(_) => {
                     panic!("finite long-suffix prefilter session did not retain K0")
                 }
             };
@@ -25981,7 +26097,8 @@ mod tests {
                     *negative_prefilter_span_state,
                 )
             }
-            PortableSearchSessionPlan::Native(_) => {
+            PortableSearchSessionPlan::ExactLiteral { .. }
+            | PortableSearchSessionPlan::Native(_) => {
                 panic!("finite long-suffix prefilter session did not retain K0")
             }
         };
@@ -25999,7 +26116,8 @@ mod tests {
                     mandatory_suffix_span_state,
                     SearchWindow::full(&haystack),
                 ),
-                PortableSearchSessionPlan::Native(_) => {
+                PortableSearchSessionPlan::ExactLiteral { .. }
+                | PortableSearchSessionPlan::Native(_) => {
                     panic!("finite long-suffix prefilter session did not retain K0")
                 }
             };
@@ -26028,7 +26146,8 @@ mod tests {
                 ));
                 *mandatory_suffix_span_state
             }
-            PortableSearchSessionPlan::Native(_) => {
+            PortableSearchSessionPlan::ExactLiteral { .. }
+            | PortableSearchSessionPlan::Native(_) => {
                 panic!("finite long-suffix prefilter session did not retain K0")
             }
         };
@@ -26050,7 +26169,8 @@ mod tests {
                 mandatory_suffix_span_state,
                 ..
             } => *mandatory_suffix_span_state,
-            PortableSearchSessionPlan::Native(_) => {
+            PortableSearchSessionPlan::ExactLiteral { .. }
+            | PortableSearchSessionPlan::Native(_) => {
                 panic!("finite long-suffix prefilter session did not retain K0")
             }
         };
@@ -27148,6 +27268,372 @@ mod tests {
 
         let captured = PortableRegex::new("(Sherlock)").unwrap();
         assert_eq!(captured.build_report().plan, PlanKind::ExactLiteral);
+    }
+
+    #[test]
+    fn exact_literal_session_binds_the_selected_plan_without_layout_growth() {
+        #[allow(
+            dead_code,
+            reason = "the test-only baseline pins the two-variant session layout"
+        )]
+        enum BaselinePortableSearchSessionPlan<'a> {
+            Native(&'a PortableRegex),
+            K0 {
+                session: fre_automata::K0SearchSession<'a>,
+                aggregate_setup: super::SearchSessionSetupAccounting,
+                k0_plan: &'a super::PortableK0Plan,
+                reverse_inner:
+                    Option<Box<super::k0_general_reverse_inner::SearchSession<'a>>>,
+                mandatory_suffix: Option<&'a super::K0MandatorySuffixPlan>,
+                mandatory_cut: Option<&'a super::K0MandatoryCutPlan>,
+                negative_prefilter: Option<&'a super::K0NegativePrefilterPlan>,
+                exclusive_route_state: super::K0ExclusiveRouteState,
+                mandatory_suffix_exists_state: super::K0NegativePrefilterState,
+                mandatory_suffix_span_state: super::K0NegativePrefilterState,
+                negative_prefilter_exists_state: super::K0NegativePrefilterState,
+                negative_prefilter_span_state: super::K0NegativePrefilterState,
+            },
+        }
+
+        let regex = PortableBuilder::new("needle")
+            .unicode(false)
+            .build()
+            .unwrap();
+        let zero_setup = SearchSessionLimits {
+            max_setup_work: 0,
+            max_scratch_bytes: 0,
+        };
+        let mut session = regex.search_session(zero_setup).unwrap();
+        let PortableSearchSessionPlan::ExactLiteral {
+            regex: bound_regex,
+            plan: bound_plan,
+        } = &session.plan
+        else {
+            panic!("exact literal did not bind its direct session variant")
+        };
+        let PortablePlan::ExactLiteral(owner_plan) = &regex.plan else {
+            unreachable!()
+        };
+        assert!(core::ptr::eq(*bound_regex, &regex));
+        assert!(core::ptr::eq(*bound_plan, owner_plan));
+        assert_eq!(session.runtime_implementation_id(), "exact-literal");
+        assert_eq!(session.workspace_setup_accounting(), None);
+        let endpoint = regex.endpoint_search_session(zero_setup).unwrap();
+        assert!(matches!(
+            &endpoint.plan,
+            PortableSearchSessionPlan::ExactLiteral { .. }
+        ));
+        assert_eq!(endpoint.workspace_setup_accounting(), None);
+        let matches = session.find_iter(
+            b"needle",
+            PortableFindIterRunLimits::unlimited(),
+        );
+        assert!(matches!(
+            &matches.state,
+            super::PortableMatchIterState::General(_)
+        ));
+        drop(matches);
+        let value_matches = session.find_iter_value(
+            b"needle",
+            PortableFindIterRunLimits::unlimited(),
+        );
+        assert!(matches!(
+            &value_matches.state,
+            super::PortableValueMatchIterState::General(_)
+        ));
+        drop(value_matches);
+        assert_eq!(
+            core::mem::size_of::<PortableSearchSessionPlan<'static>>(),
+            core::mem::size_of::<BaselinePortableSearchSessionPlan<'static>>(),
+            "binding a second reference must fit inside the existing K0-led enum layout",
+        );
+        assert_eq!(
+            core::mem::align_of::<PortableSearchSessionPlan<'static>>(),
+            core::mem::align_of::<BaselinePortableSearchSessionPlan<'static>>(),
+        );
+        assert_eq!(
+            core::mem::size_of::<PortableSearchSession<'static>>(),
+            core::mem::size_of::<PortableSearchSessionPlan<'static>>(),
+        );
+    }
+
+    #[test]
+    fn exact_literal_session_exhaustively_matches_its_owner_routes() {
+        let patterns = words(2);
+        let haystacks = words(3);
+        for pattern in &patterns {
+            let pattern = core::str::from_utf8(pattern).unwrap();
+            let regex = PortableBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap_or_else(|error| panic!("pattern={pattern:?}: {error:?}"));
+            assert_eq!(regex.build_report().plan, PlanKind::ExactLiteral);
+            let upstream = regex::bytes::RegexBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            let mut session = regex
+                .search_session(SearchSessionLimits::unlimited())
+                .unwrap();
+            for haystack in &haystacks {
+                for start in 0..=haystack.len() {
+                    let mut source = K0SpanSourceCursor::new(haystack);
+                    assert_eq!(
+                        session.find_iter_at(
+                            &mut source,
+                            start,
+                            SearchLimits::unlimited(),
+                        ),
+                        regex.find_iter_at(haystack, start, SearchLimits::unlimited()),
+                        "iterator pattern={pattern:?}, haystack={haystack:?}, start={start}",
+                    );
+                    assert_eq!(
+                        session.find_at(haystack, start, SearchLimits::unlimited()),
+                        regex.find_at(haystack, start, SearchLimits::unlimited()),
+                    );
+                    assert_eq!(
+                        session.find_at_value(haystack, start, SearchLimits::unlimited()),
+                        regex.find_at_value(haystack, start, SearchLimits::unlimited()),
+                    );
+                    assert_eq!(
+                        session.is_match_at(haystack, start, SearchLimits::unlimited()),
+                        regex.is_match_at(haystack, start, SearchLimits::unlimited()),
+                    );
+                    assert_eq!(
+                        session.is_match_value_at(
+                            haystack,
+                            start,
+                            SearchLimits::unlimited(),
+                        ),
+                        regex.is_match_value_at(
+                            haystack,
+                            start,
+                            SearchLimits::unlimited(),
+                        ),
+                    );
+                }
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let window = SearchWindow::new(start, end);
+                        assert_eq!(
+                            session.is_match_window(
+                                haystack,
+                                window,
+                                SearchLimits::unlimited(),
+                            ),
+                            regex.is_match_window(
+                                haystack,
+                                window,
+                                SearchLimits::unlimited(),
+                            ),
+                        );
+                        assert_eq!(
+                            session.is_match_window_value(
+                                haystack,
+                                window,
+                                SearchLimits::unlimited(),
+                            ),
+                            regex.is_match_window_value(
+                                haystack,
+                                window,
+                                SearchLimits::unlimited(),
+                            ),
+                        );
+                        assert_eq!(
+                            session.find_window(
+                                haystack,
+                                window,
+                                SearchLimits::unlimited(),
+                            ),
+                            regex.find_window(
+                                haystack,
+                                window,
+                                SearchLimits::unlimited(),
+                            ),
+                        );
+                        assert_eq!(
+                            session.find_window_value(
+                                haystack,
+                                window,
+                                SearchLimits::unlimited(),
+                            ),
+                            regex.find_window_value(
+                                haystack,
+                                window,
+                                SearchLimits::unlimited(),
+                            ),
+                        );
+                        let expected_shortest = regex.shortest_match_window(
+                            haystack,
+                            window,
+                            SearchLimits::unlimited(),
+                        );
+                        assert_eq!(
+                            session.shortest_match_window(
+                                haystack,
+                                window,
+                                SearchLimits::unlimited(),
+                            ),
+                            expected_shortest,
+                        );
+                        assert_eq!(
+                            session.shortest_match_window_value(
+                                haystack,
+                                window,
+                                SearchLimits::unlimited(),
+                            ),
+                            expected_shortest.map(|(output, _)| output),
+                        );
+                    }
+                }
+                assert_eq!(
+                    session.selected_end(haystack, SearchLimits::unlimited()),
+                    regex.selected_end(haystack, SearchLimits::unlimited()),
+                );
+                assert_eq!(
+                    session.selected_end_value(haystack, SearchLimits::unlimited()),
+                    regex.selected_end(haystack, SearchLimits::unlimited())
+                        .map(|(output, _)| output),
+                );
+
+                let expected: Vec<_> = upstream
+                    .find_iter(haystack)
+                    .map(|matched| (matched.start(), matched.end()))
+                    .collect();
+                let actual: Vec<_> = session
+                    .find_iter(haystack, PortableFindIterRunLimits::unlimited())
+                    .map(|matched| {
+                        let matched = matched.unwrap();
+                        (matched.start(), matched.end())
+                    })
+                    .collect();
+                assert_eq!(actual, expected, "pattern={pattern:?}, haystack={haystack:?}");
+                let actual_value: Vec<_> = session
+                    .find_iter_value(haystack, PortableFindIterRunLimits::unlimited())
+                    .map(|matched| {
+                        let matched = matched.unwrap();
+                        (matched.start(), matched.end())
+                    })
+                    .collect();
+                assert_eq!(
+                    actual_value, expected,
+                    "value pattern={pattern:?}, haystack={haystack:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn exact_literal_session_refuses_at_the_owner_boundary_before_search() {
+        let regex = PortableBuilder::new("needle")
+            .unicode(false)
+            .build()
+            .unwrap();
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        let haystack = b"zzneedlexx";
+        let refused = SearchLimits {
+            max_work: 15,
+            max_scratch_bytes: 0,
+        };
+        let expected = SearchError::ExactLiteral(
+            fre_kernels::LiteralError::LinearTermLimit {
+                needed: 16,
+                limit: 15,
+            },
+        );
+        assert_eq!(session.find(haystack, refused), Err(expected.clone()));
+        assert_eq!(session.find_value(haystack, refused), Err(expected.clone()));
+        assert_eq!(session.is_match(haystack, refused), Err(expected.clone()));
+        assert_eq!(session.is_match_value(haystack, refused), Err(expected.clone()));
+        assert_eq!(
+            session.shortest_match(haystack, refused),
+            Err(expected.clone()),
+        );
+        assert_eq!(
+            session.shortest_match_value(haystack, refused),
+            Err(expected.clone()),
+        );
+        assert_eq!(
+            session.selected_end(haystack, refused),
+            Err(expected.clone()),
+        );
+        assert_eq!(
+            session.selected_end_value(haystack, refused),
+            Err(expected.clone()),
+        );
+        assert_eq!(regex.find(haystack, refused), Err(expected.clone()));
+
+        for window in [
+            SearchWindow::new(4, 3),
+            SearchWindow::new(0, haystack.len() + 1),
+        ] {
+            assert_eq!(
+                session.find_window(haystack, window, SearchLimits::unlimited()),
+                regex.find_window(haystack, window, SearchLimits::unlimited()),
+            );
+            assert_eq!(
+                session.find_window_value(
+                    haystack,
+                    window,
+                    SearchLimits::unlimited(),
+                ),
+                regex.find_window_value(
+                    haystack,
+                    window,
+                    SearchLimits::unlimited(),
+                ),
+            );
+            assert_eq!(
+                session.is_match_window(haystack, window, SearchLimits::unlimited()),
+                regex.is_match_window(haystack, window, SearchLimits::unlimited()),
+            );
+            assert_eq!(
+                session.shortest_match_window(
+                    haystack,
+                    window,
+                    SearchLimits::unlimited(),
+                ),
+                regex.shortest_match_window(
+                    haystack,
+                    window,
+                    SearchLimits::unlimited(),
+                ),
+            );
+        }
+
+        let mut refused_iter = session.find_iter(
+            haystack,
+            PortableFindIterRunLimits {
+                search: refused,
+                max_search_calls: usize::MAX,
+            },
+        );
+        assert_eq!(
+            refused_iter.next(),
+            Some(Err(PortableFindIterError::Search(expected))),
+        );
+        assert_eq!(refused_iter.next(), None);
+        drop(refused_iter);
+        assert_eq!(
+            session.find_value(haystack, SearchLimits::unlimited()),
+            Ok(Some(Match { start: 2, end: 8 })),
+            "a refusal must not retain any source-dependent session state",
+        );
+        let mut reused = haystack.to_vec();
+        let address = reused.as_ptr();
+        assert_eq!(
+            session.find_value(&reused, SearchLimits::unlimited()),
+            Ok(Some(Match { start: 2, end: 8 })),
+        );
+        reused.fill(b'x');
+        assert_eq!(reused.as_ptr(), address);
+        assert_eq!(
+            session.find_value(&reused, SearchLimits::unlimited()),
+            Ok(None),
+            "the plan-bound session must not retain same-address source results",
+        );
     }
 
     #[test]
