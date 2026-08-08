@@ -14951,6 +14951,12 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         // mutable descriptor must obtain the exact single-use window ticket.
         assembler.branch(&[0xe9], call_preflight)?;
     } else {
+        // The compact selectors receive the linked artifact identity in RAX,
+        // but the legacy V2 crossover computes its window length in the same
+        // register. Restore the frame-resident identity before the V2 verifier
+        // authenticates the frozen header.
+        assembler.instruction(&[0x48, 0x8b, 0x04, 0x24])?;
+
         x86_emit_frozen_dynamic_entry(
             &mut assembler,
             call_preflight,
