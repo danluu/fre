@@ -13,9 +13,11 @@
 //! Every rotation is compared with the upstream engine and the portable AOT
 //! semantic program before timing. The linked native harness validates the
 //! same fingerprints and results again. Runtime-backed assertion and resource
-//! fallback objects are prepared once and timed through the prepared-search
-//! API; object deserialization is never inside a timed loop. Compilation,
-//! object linking, and preparation are excluded from all measurements.
+//! fallback objects are prepared once for dependency/lifecycle validation.
+//! Timed calls always enter generated code: the exclusive prepared entry when
+//! one was published, otherwise the module's ordinary generated entry.
+//! Compilation, object linking, and preparation are excluded from all
+//! measurements.
 //!
 //! Run on a supported x86-64 or `AArch64` Linux/macOS host:
 //!
@@ -95,6 +97,11 @@ const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 const PATTERN_SEEDS: [u64; 2] = [0x243f_6a88_85a3_08d2, 0x1319_8a2e_0370_7345];
 const UPSTREAM_REGEX_VERSION: &str = "1.13.1";
+// Keep the diagnostic setup transaction identical to the exclusive runtime.
+// These limits affect only optional immutable setup state, never semantics or
+// timed execution.
+const FROZEN_DYNAMIC_SIDECAR_MAX_K0_BYTES: usize = 512 * 1024;
+const FROZEN_DYNAMIC_SIDECAR_MAX_PACKED_BYTES: usize = 512 * 1024;
 
 fn usage() -> &'static str {
     "generated_aot_upstream_comparison - generated general-AOT comparison
@@ -118,8 +125,11 @@ OPTIONS:
                          ordinary_runtime_resource_fallback, or
                          prepared_runtime_resource_fallback. Authenticated
                          complete retained tables may use the self-contained
-                         direct_resource_fallback route; other retained rows
-                         without a prepared entry use the ordinary route.
+                         direct_resource_fallback route. A published prepared
+                         optimizing entry owns the prepared route even when
+                         no stable partial-row statistics exist; runtime-dependent
+                         generated entries without that prepared entry use the
+                         ordinary route.
   --measurement-order O  Timed engine order: upstream-native (default) or
                          native-upstream. All build/link/runtime preparation
                          completes before either timed phase.
@@ -1780,6 +1790,7 @@ struct CompiledShape {
     aot: CompiledRegex,
     runtime_program: Option<(String, usize)>,
     partial_dfa: Option<PartialDfaStats>,
+    prepared_capability_format: &'static str,
     fallback_artifact_kind: &'static str,
     retained_limit_derivation: &'static str,
 }
@@ -1791,15 +1802,57 @@ impl CompiledShape {
             EngineSelectionReason::CompleteContextDfa => "direct_context_dfa",
             EngineSelectionReason::ContextAssertions => "prepared_runtime_assertion",
             EngineSelectionReason::DeterminizationResourceLimit => {
-                if self.runtime_program.is_none() {
-                    "direct_resource_fallback"
-                } else if self.aot.module().prepared_entry_symbol().is_some() {
+                if self.aot.module().prepared_entry_symbol().is_some() {
                     "prepared_runtime_resource_fallback"
-                } else {
+                } else if self.runtime_program.is_some() {
                     "ordinary_runtime_resource_fallback"
+                } else {
+                    "direct_resource_fallback"
                 }
             }
             EngineSelectionReason::FastMode => "unexpected_fast_mode",
+        }
+    }
+
+    fn is_compiled_primary(&self) -> bool {
+        let module = self.aot.module();
+        let entry = module.entry_symbol();
+        module
+            .symbols()
+            .iter()
+            .any(|symbol| symbol.name == entry && symbol.section.is_some())
+    }
+
+    fn timed_entry_scope(&self) -> &'static str {
+        if self.aot.module().prepared_entry_symbol().is_some() {
+            "prepared_compiled"
+        } else if self.runtime_program.is_some() {
+            "runtime_dependent_compiled"
+        } else {
+            "self_contained_compiled"
+        }
+    }
+
+    fn score_scope(&self) -> &'static str {
+        if self.aot.module().prepared_entry_symbol().is_some() {
+            "prepared_compiled_all_windows"
+        } else if self.runtime_program.is_some() && self.partial_dfa.is_some() {
+            "runtime_dependent_partial_compiled_entry"
+        } else if self.runtime_program.is_some() {
+            "runtime_dependent_compiled_entry"
+        } else if self.runtime_program.is_none()
+            && self.partial_dfa.is_some_and(|stats| {
+                stats.complete_rows != 0
+                    && stats.complete_rows == stats.discovered_states
+                    && stats.resume_frontiers == 0
+                    && stats.resume_items == 0
+            })
+        {
+            "retained_complete_direct_all_windows"
+        } else if self.runtime_program.is_none() && self.partial_dfa.is_some() {
+            "slow_aot_self_contained_all_windows"
+        } else {
+            "self_contained_compiled_all_windows"
         }
     }
 }
@@ -1825,33 +1878,103 @@ fn retained_partial_stats(compiled: &CompiledRegex) -> Result<Option<PartialDfaS
         .map_err(|error| format!("partial-DFA statistics failed: {error}"))
 }
 
+fn prepared_capability_format(compiled: &CompiledRegex) -> Result<&'static str, String> {
+    if compiled.module().prepared_entry_symbol().is_none() {
+        return Ok("not_prepared");
+    }
+    if compiled.module().required_runtime_program().is_none() {
+        return Err("prepared native entry has no serialized runtime program".to_owned());
+    }
+
+    // Mirror PreparedAotRegex::from_program exactly far enough to report
+    // which immutable offset-zero capability would be active before the
+    // first native call. This is structural and setup-derived: it does not
+    // recognize pattern names or inspect benchmark inputs.
+    let program = compiled.program();
+    let mut workspace = program
+        .prepare_workspace()
+        .map_err(|error| format!("prepared capability workspace failed: {error}"))?;
+    let fully_prefilled_fallback = program
+        .compiler_private_try_prefill_retained_fallback_with_workspace_receipt(&mut workspace)
+        .map_err(|error| format!("prepared capability prefill failed: {error}"))?;
+    let mut frozen_dynamic_rows = program.compiler_private_frozen_dynamic_rows_storage_v3(
+        &workspace,
+        FROZEN_DYNAMIC_SIDECAR_MAX_K0_BYTES,
+        FROZEN_DYNAMIC_SIDECAR_MAX_PACKED_BYTES,
+    );
+    let mut frozen_header = if frozen_dynamic_rows.is_some() {
+        program.compiler_private_frozen_prepared_header_v6(
+            &workspace,
+            None,
+            frozen_dynamic_rows.as_ref(),
+        )
+    } else {
+        program.compiler_private_frozen_prepared_header_v6(
+            &workspace,
+            fully_prefilled_fallback,
+            None,
+        )
+    };
+    if frozen_dynamic_rows.is_some() && !frozen_header.has_dynamic_rows() {
+        frozen_dynamic_rows = None;
+        frozen_header = program.compiler_private_frozen_prepared_header_v6(
+            &workspace,
+            fully_prefilled_fallback,
+            None,
+        );
+    }
+    if frozen_header.has_dynamic_rows() {
+        if frozen_dynamic_rows.is_none() {
+            return Err("active compact header lost its immutable owner".to_owned());
+        }
+        Ok("active_immutable_compact_v3_v14")
+    } else if frozen_header.is_active() {
+        Ok("active_immutable_retained_v1")
+    } else {
+        Ok("prepared_no_immutable_capability")
+    }
+}
+
 fn is_self_contained_native_shape(compiled: &CompiledRegex) -> Result<bool, String> {
-    if compiled.module().required_runtime_program().is_some()
-        || compiled.module().required_runtime_symbol().is_some()
-        || compiled.module().prepared_entry_symbol().is_some()
+    let module = compiled.module();
+    if module.required_runtime_program().is_some()
+        || module.prepared_entry_symbol().is_some()
+        || module.required_runtime_symbol().is_some()
+        || module.required_prepared_runtime_symbol().is_some()
+        || module.required_prepared_fallback_runtime_symbol().is_some()
+        || module.required_prepared_admission_runtime_symbol().is_some()
+        || module.required_prepared_preflight_runtime_symbol().is_some()
+        || module
+            .required_prepared_dynamic_rows_deopt_runtime_symbol()
+            .is_some()
+        || module
+            .required_prepared_dynamic_rows_continue_runtime_symbol()
+            .is_some()
+        || module
+            .required_prepared_dynamic_rows_span_recovery_runtime_symbol()
+            .is_some()
+        || module
+            .required_prepared_dynamic_rows_loop_scan_runtime_symbol()
+            .is_some()
+        || module.required_prepared_span_recovery_runtime_symbol().is_some()
         || compiled.receipt().runtime_helper_required
     {
         return Ok(false);
     }
-    if matches!(
-        compiled.receipt().engine,
-        EngineKind::OrderedDfa | EngineKind::OrderedContextDfa
-    ) || compiled.program().has_nfa_exact_product()
-        && compiled.receipt().engine == EngineKind::OrderedNfa
-    {
-        return Ok(true);
+    let unresolved = module
+        .symbols()
+        .iter()
+        .filter(|symbol| symbol.section.is_none())
+        .map(|symbol| symbol.name.as_str())
+        .collect::<Vec<_>>();
+    if unresolved.is_empty() {
+        Ok(true)
+    } else {
+        Err(format!(
+            "native module has unclassified unresolved symbols: {}",
+            unresolved.join(",")
+        ))
     }
-    let partial_dfa = retained_partial_stats(compiled)?;
-    Ok(compiled.receipt().engine == EngineKind::OrderedNfa
-        && compiled.receipt().engine_selection_reason
-            == EngineSelectionReason::DeterminizationResourceLimit
-        && partial_dfa.as_ref().is_some_and(|stats| {
-            stats.complete_rows > 0
-                && stats.complete_rows == stats.discovered_states
-                && stats.resume_frontiers == 0
-                && stats.resume_items == 0
-                && stats.optimized_entry_supported
-        }))
 }
 
 fn compile_retained_resource_probe(
@@ -2003,20 +2126,14 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
                 .map(|(symbol, bytes)| (symbol.to_owned(), bytes));
             let partial_dfa = retained_partial_stats(&aot)?;
             let exact_product = aot.program().has_nfa_exact_product();
-            if force_ordinary_fallback && runtime_program.is_none() && !exact_product {
-                return Err(format!(
-                    "{} forced resource fallback did not retain a runtime program",
-                    spec.name
-                ));
-            }
-            let natural_resource_fallback = config.nested_grammar
-                && reason == EngineSelectionReason::DeterminizationResourceLimit;
+            let structurally_runtime_backed =
+                reason == EngineSelectionReason::DeterminizationResourceLimit;
             if runtime_program.is_some()
                 && !spec.force_fallback
                 && !config.force_resource_fallback
                 && !config.force_retained_resource_fallback
                 && !has_context_assertions
-                && !natural_resource_fallback
+                && !structurally_runtime_backed
             {
                 return Err(format!(
                     "{} unexpectedly retained a runtime program",
@@ -2024,6 +2141,12 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
                 ));
             }
             let self_contained_engine = is_self_contained_native_shape(&aot)?;
+            if force_ordinary_fallback && runtime_program.is_none() && !self_contained_engine {
+                return Err(format!(
+                    "{} forced resource fallback has neither a runtime program nor a self-contained native entry",
+                    spec.name
+                ));
+            }
             if runtime_program.is_none()
                 && (aot.module().required_runtime_symbol().is_some() || !self_contained_engine)
             {
@@ -2033,18 +2156,38 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
                 ));
             }
             let prepared_entry_published = aot.module().prepared_entry_symbol().is_some();
-            if prepared_entry_published && (runtime_program.is_none() || partial_dfa.is_none()) {
+            if prepared_entry_published && runtime_program.is_none() {
                 return Err(format!(
-                    "{} published a prepared native entry without its retained runtime artifact",
+                    "{} published a prepared native entry without its serialized runtime program",
                     spec.name
                 ));
             }
+            let entry_symbol = aot.module().entry_symbol();
+            if !aot
+                .module()
+                .symbols()
+                .iter()
+                .any(|symbol| symbol.name == entry_symbol && symbol.section.is_some())
+            {
+                return Err(format!(
+                    "{} emitted no defined generated entry for timed execution",
+                    spec.name
+                ));
+            }
+            let prepared_capability_format = prepared_capability_format(&aot)
+                .map_err(|error| format!("{} {error}", spec.name))?;
             let fallback_artifact_kind = if partial_dfa.is_some() {
                 "retained_partial"
             } else if exact_product {
                 "exact_product"
             } else if has_context_assertions {
                 "contextual"
+            } else if aot
+                .module()
+                .required_prepared_dynamic_rows_deopt_runtime_symbol()
+                .is_some()
+            {
+                "dynamic_rows"
             } else if aot.receipt().engine == EngineKind::OrderedNfa {
                 "plain_nfa"
             } else {
@@ -2073,6 +2216,7 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
                 aot,
                 runtime_program,
                 partial_dfa,
+                prepared_capability_format,
                 fallback_artifact_kind,
                 retained_limit_derivation,
             })
@@ -2083,10 +2227,13 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
         if route == "prepared_runtime_resource_fallback"
             && shapes
                 .iter()
-                .any(|shape| shape.aot.module().prepared_entry_symbol().is_none())
+                .any(|shape| {
+                    shape.aot.module().prepared_entry_symbol().is_none()
+                        || shape.runtime_program.is_none()
+                })
         {
             return Err(
-                "prepared runtime route selected an artifact without a published native entry"
+                "prepared runtime route selected an artifact without its native entry and serialized program"
                     .to_owned(),
             );
         }
@@ -2645,7 +2792,6 @@ fn build_c_harness(config: &Config, shapes: &[CompiledShape], scenarios: &[Scena
          typedef uint32_t (*entry_fn)(const unsigned char *, size_t, size_t, size_t, size_t *);\n\
          typedef uint32_t (*exclusive_entry_fn)(exclusive_handle, const unsigned char *, size_t, size_t, size_t, size_t *);\n\
          extern uint32_t fre_aot_regex_runtime_prepare_exclusive_v1(const unsigned char *, size_t, exclusive_handle *);\n\
-         extern uint32_t fre_aot_regex_runtime_search_exclusive_v1(exclusive_handle, const unsigned char *, size_t, size_t, size_t, size_t *);\n\
          extern uint32_t fre_aot_regex_runtime_destroy_exclusive_v1(exclusive_handle);\n\n\
          typedef struct {\n\
            const char *name; entry_fn direct; exclusive_entry_fn prepared_direct;\n\
@@ -2692,18 +2838,13 @@ fn build_c_harness(config: &Config, shapes: &[CompiledShape], scenarios: &[Scena
     }
     source.push_str("\nstatic shape_spec shapes[] = {\n");
     for (index, shape) in shapes.iter().enumerate() {
-        let (direct, prepared_direct, program, program_len) =
-            shape.runtime_program.as_ref().map_or_else(
-                || (shape.aot.module().entry_symbol(), "NULL", "NULL", 0),
-                |(symbol, bytes)| {
-                    (
-                        "NULL",
-                        shape.aot.module().prepared_entry_symbol().unwrap_or("NULL"),
-                        symbol.as_str(),
-                        *bytes,
-                    )
-                },
-            );
+        let prepared_entry = shape.aot.module().prepared_entry_symbol();
+        let direct = shape.aot.module().entry_symbol();
+        let prepared_direct = prepared_entry.unwrap_or("NULL");
+        let (program, program_len) = shape
+            .runtime_program
+            .as_ref()
+            .map_or(("NULL", 0), |(symbol, bytes)| (symbol.as_str(), *bytes));
         writeln!(
             &mut source,
             "  {{\"{}\", {direct}, {prepared_direct}, {program}, {program_len}, 0, fixture_{index}, sizeof(fixture_{index}), candidates_{index}, sizeof(candidates_{index}), {}, {}, UINT64_C({}), {}, {}}},",
@@ -2854,8 +2995,6 @@ fn build_c_harness(config: &Config, shapes: &[CompiledShape], scenarios: &[Scena
          static uint32_t invoke(shape_spec *shape, const unsigned char *haystack, size_t length, size_t *result) {\n\
            if (shape->prepared_direct != NULL)\n\
              return shape->prepared_direct(shape->prepared, haystack, length, 0U, length, result);\n\
-           if (shape->program != NULL)\n\
-             return fre_aot_regex_runtime_search_exclusive_v1(shape->prepared, haystack, length, 0U, length, result);\n\
            return shape->direct(haystack, length, 0U, length, result);\n\
          }\n\n"
     );
@@ -3368,7 +3507,7 @@ fn print_joined_rows(
         } else {
             "middle_4kib"
         };
-        let compiled_primary = shape.runtime_program.is_none();
+        let compiled_primary = shape.is_compiled_primary();
         let groups = [
             ("all".to_owned(), "all".to_owned()),
             (
@@ -3381,6 +3520,10 @@ fn print_joined_rows(
                 .to_owned(),
             ),
             ("route".to_owned(), shape.route().to_owned()),
+            (
+                "native_entry_scope".to_owned(),
+                shape.timed_entry_scope().to_owned(),
+            ),
             ("family".to_owned(), shape.spec.family.to_owned()),
             ("seed".to_owned(), format!("0x{:016x}", shape.spec.seed)),
             ("source_kind".to_owned(), shape.spec.source_kind.to_owned()),
@@ -3517,7 +3660,7 @@ fn command_version(program: &OsStr, argument: &str) -> String {
 
 fn print_partial_dfa_metadata(shapes: &[CompiledShape]) {
     println!(
-        "#partial_dfa\tpattern\tfamily\tseed\toutput\tartifact_kind\tscore_scope\tlimit_derivation\truntime_program\tprepared_entry_published\tprepared_entry_symbol\tcomplete_rows\tdiscovered_states\tresume_frontiers\tresume_items\toptimized_entry_supported\tmin_input_bytes\trequested_max_states\trequested_max_transitions\trequested_max_work\teffective_max_states\teffective_max_transitions\teffective_max_work\tdecline_stage\tdecline_resource\twork_completed\tstates_completed\ttransitions_completed\texact_product\tstatus"
+        "#partial_dfa\tpattern\tfamily\tseed\toutput\tartifact_kind\tscore_scope\tlimit_derivation\truntime_program\tprepared_entry_published\tprepared_entry_symbol\tprepared_capability_format\tcomplete_rows\tdiscovered_states\tresume_frontiers\tresume_items\toptimized_entry_supported\tmin_input_bytes\trequested_max_states\trequested_max_transitions\trequested_max_work\teffective_max_states\teffective_max_transitions\teffective_max_work\tdecline_stage\tdecline_resource\twork_completed\tstates_completed\ttransitions_completed\texact_product\tstatus"
     );
     for shape in shapes {
         let report = &shape.aot.receipt().determinization;
@@ -3543,13 +3686,7 @@ fn print_partial_dfa_metadata(shapes: &[CompiledShape]) {
             format!("0x{:016x}", shape.spec.seed),
             shape.spec.output.name().to_owned(),
             shape.fallback_artifact_kind.to_owned(),
-            if partial.is_some() && shape.runtime_program.is_none() {
-                "retained_complete_direct_all_windows".to_owned()
-            } else if partial.is_some() {
-                "retained_partial_windows_ge_min".to_owned()
-            } else {
-                "excluded_from_retained_partial".to_owned()
-            },
+            shape.score_scope().to_owned(),
             shape.retained_limit_derivation.to_owned(),
             shape.runtime_program.is_some().to_string(),
             shape
@@ -3564,6 +3701,7 @@ fn print_partial_dfa_metadata(shapes: &[CompiledShape]) {
                 .prepared_entry_symbol()
                 .unwrap_or("none")
                 .to_owned(),
+            shape.prepared_capability_format.to_owned(),
             number(partial.map(|stats| stats.complete_rows as u64)),
             number(partial.map(|stats| stats.discovered_states as u64)),
             number(partial.map(|stats| stats.resume_frontiers as u64)),
@@ -3646,7 +3784,7 @@ fn print_environment(config: &Config, shapes: &[CompiledShape], scenario_count: 
             "environment\tsemantic_validation\tregex_{UPSTREAM_REGEX_VERSION}_oracle_vs_portable_fre_then_linked_native"
         );
         println!(
-            "environment\taggregation_scope\tself_contained_compiled_primary_only;natural_resource_fallbacks_reported_as_runtime_resilience"
+            "environment\taggregation_scope\tevery_timed_row_enters_generated_code;native_entry_scope_distinguishes_self_contained_prepared_and_runtime_dependent"
         );
     }
     println!("environment\ttarget\t{}", config.target_name);
@@ -3939,10 +4077,179 @@ mod tests {
             aot,
             runtime_program: None,
             partial_dfa: None,
+            prepared_capability_format: "not_prepared",
             fallback_artifact_kind: "exact_product",
             retained_limit_derivation: "legacy_zero_state",
         };
         assert_eq!(shape.route(), "direct_resource_fallback");
+        assert!(shape.is_compiled_primary());
+    }
+
+    #[test]
+    fn zero_row_variable_span_prepared_entry_is_embedded_and_scored_as_compiled() {
+        let target = Target::x86_64_linux();
+        let pattern = "(?:ab|ac)+z";
+        let mut limits = CompileLimitsV1::default();
+        limits.determinize.max_states = 0;
+        let slow_limits = fre_aot_regex::SlowAotLimits {
+            determinize: fre_aot_regex::DeterminizeLimits {
+                max_states: 0,
+                ..fre_aot_regex::DeterminizeLimits::default()
+            },
+            max_native_data_bytes: 0,
+            ..fre_aot_regex::SlowAotLimits::default()
+        };
+        let aot = fre_aot_regex::compile_with_slow_aot_limits(
+            CompileRequest::new(pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span)
+                .limits(limits),
+            slow_limits,
+        )
+        .expect("compile optimizing zero-row variable Span");
+        assert_eq!(
+            aot.receipt().engine_selection_reason,
+            EngineSelectionReason::DeterminizationResourceLimit
+        );
+        assert!(retained_partial_stats(&aot).unwrap().is_none());
+        let prepared_entry = aot
+            .module()
+            .prepared_entry_symbol()
+            .expect("general dynamic-row prepared entry")
+            .to_owned();
+        let entry = aot.module().entry_symbol().to_owned();
+        let (runtime_symbol, runtime_bytes) = aot
+            .module()
+            .required_runtime_program()
+            .map(|(symbol, bytes)| (symbol.to_owned(), bytes))
+            .expect("prepared entry serialized program");
+        let runtime_program = Some((runtime_symbol.clone(), runtime_bytes));
+        assert_eq!(
+            prepared_capability_format(&aot).unwrap(),
+            "active_immutable_compact_v3_v14"
+        );
+
+        let fixture = b"abz";
+        let upstream = Regex::new(pattern).unwrap();
+        let upstream_result = upstream_search(&upstream, OutputKind::Span, fixture);
+        let portable_result = AbiResult::from_aot(
+            aot.search(fixture, SearchWindow::full(fixture)).unwrap(),
+            OutputKind::Span,
+        )
+        .unwrap();
+        assert_eq!(portable_result, upstream_result);
+
+        let mut spec = grammar_patterns(&flat_grammar_config(Some(UNSEEN_TEST_SEED)))
+            .into_iter()
+            .next()
+            .expect("grammar shape");
+        spec.name = "zero_row_variable_span".to_owned();
+        spec.base_name = spec.name.clone();
+        spec.family = "resource_fallback";
+        spec.pattern = pattern.to_owned();
+        spec.fixture = fixture.to_vec();
+        spec.candidates = b"a".to_vec();
+        spec.output = OutputKind::Span;
+        spec.force_fallback = true;
+        let shape = CompiledShape {
+            spec,
+            upstream,
+            aot,
+            runtime_program,
+            partial_dfa: None,
+            prepared_capability_format: "active_immutable_compact_v3_v14",
+            fallback_artifact_kind: "dynamic_rows",
+            retained_limit_derivation: "legacy_zero_state",
+        };
+        assert_eq!(shape.route(), "prepared_runtime_resource_fallback");
+        assert!(shape.is_compiled_primary());
+        assert_eq!(shape.score_scope(), "prepared_compiled_all_windows");
+
+        let source = build_c_harness(&flat_grammar_config(None), &[shape], &[]);
+        assert!(source.contains(&format!(
+            "extern uint32_t {prepared_entry}(exclusive_handle"
+        )));
+        assert!(source.contains(&format!("extern const unsigned char {runtime_symbol}[];")));
+        assert!(source.contains(&format!(
+            "{{\"zero_row_variable_span\", {entry}, {prepared_entry}, {runtime_symbol}, {runtime_bytes}, 0"
+        )));
+    }
+
+    #[test]
+    fn runtime_backed_nonprepared_shape_times_the_generated_entry() {
+        let target = Target::x86_64_linux();
+        let pattern = r"a{0}";
+        let mut limits = CompileLimitsV1::default();
+        limits.determinize.max_states = 0;
+        let aot = fre_aot_regex::compile_with_slow_aot_limits(
+            CompileRequest::new(pattern, target)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span)
+                .limits(limits),
+            fre_aot_regex::SlowAotLimits {
+                max_allocation_bytes: 0,
+                max_native_data_bytes: 0,
+                ..fre_aot_regex::SlowAotLimits::default()
+            },
+        )
+        .expect("compile runtime-backed nonprepared fixture");
+        assert_eq!(
+            aot.receipt().engine_selection_reason,
+            EngineSelectionReason::DeterminizationResourceLimit
+        );
+        assert!(retained_partial_stats(&aot).unwrap().is_none());
+        assert!(aot.module().prepared_entry_symbol().is_none());
+        assert!(!is_self_contained_native_shape(&aot).unwrap());
+        let entry = aot.module().entry_symbol().to_owned();
+        let (runtime_symbol, runtime_bytes) = aot
+            .module()
+            .required_runtime_program()
+            .map(|(symbol, bytes)| (symbol.to_owned(), bytes))
+            .expect("runtime adapter serialized program");
+
+        let fixture = b"x";
+        let upstream = Regex::new(pattern).unwrap();
+        let upstream_result = upstream_search(&upstream, OutputKind::Span, fixture);
+        let portable_result = AbiResult::from_aot(
+            aot.search(fixture, SearchWindow::full(fixture)).unwrap(),
+            OutputKind::Span,
+        )
+        .unwrap();
+        assert_eq!(portable_result, upstream_result);
+
+        let mut spec = grammar_patterns(&flat_grammar_config(Some(UNSEEN_TEST_SEED)))
+            .into_iter()
+            .next()
+            .expect("grammar shape");
+        spec.name = "runtime_backed_nonprepared".to_owned();
+        spec.base_name = spec.name.clone();
+        spec.family = "resource_fallback";
+        spec.pattern = pattern.to_owned();
+        spec.fixture = fixture.to_vec();
+        spec.candidates = b"x".to_vec();
+        spec.output = OutputKind::Span;
+        spec.force_fallback = true;
+        let shape = CompiledShape {
+            spec,
+            upstream,
+            aot,
+            runtime_program: Some((runtime_symbol.clone(), runtime_bytes)),
+            partial_dfa: None,
+            prepared_capability_format: "not_prepared",
+            fallback_artifact_kind: "plain_nfa",
+            retained_limit_derivation: "legacy_zero_state",
+        };
+        assert_eq!(shape.route(), "ordinary_runtime_resource_fallback");
+        assert!(shape.is_compiled_primary());
+        assert_eq!(shape.timed_entry_scope(), "runtime_dependent_compiled");
+        assert_eq!(shape.score_scope(), "runtime_dependent_compiled_entry");
+
+        let source = build_c_harness(&flat_grammar_config(None), &[shape], &[]);
+        assert!(source.contains(&format!(
+            "{{\"runtime_backed_nonprepared\", {entry}, NULL, {runtime_symbol}, {runtime_bytes}, 0"
+        )));
+        assert!(source.contains("return shape->direct(haystack, length, 0U, length, result);"));
+        assert!(!source.contains("fre_aot_regex_runtime_search_exclusive_v1"));
     }
 
     #[test]
@@ -4005,72 +4312,55 @@ mod tests {
             .into_iter()
             .next()
             .expect("grammar shape");
-        let ordinary_pattern = "[ab]+";
-        let ordinary_probe = compile(
-            CompileRequest::new(ordinary_pattern, Target::x86_64_linux())
-                .mode(CompileMode::Optimizing)
-                .output(OutputContract::Span),
-        )
-        .expect("compile ordinary retained probe");
-        let ordinary_limits = CompileLimitsV1 {
-            determinize: fre_aot_regex::DeterminizeLimits {
-                max_work: ordinary_probe
-                    .receipt()
-                    .dfa
-                    .expect("ordinary complete DFA statistics")
-                    .build_work
-                    .checked_sub(1)
-                    .expect("ordinary DFA has nonzero work"),
-                ..fre_aot_regex::DeterminizeLimits::default()
-            },
-            ..CompileLimitsV1::default()
-        };
-
-        for (pattern, target, output, limits, expected_route, prepared) in [
+        let pattern = "a+Q|[b-c][a-b]{1,5}(?:x+|y+)|a*";
+        for (bound_slow_native, expected_route, prepared, runtime_backed) in [
             (
-                "a+Q|[b-c][a-b]{1,5}(?:x+|y+)|a*",
-                Target::x86_64_linux(),
-                OutputContract::SelectedEnd,
-                prepared_limits,
+                true,
                 "prepared_runtime_resource_fallback",
                 true,
+                true,
             ),
-            (
-                ordinary_pattern,
-                Target::x86_64_linux(),
-                OutputContract::Span,
-                ordinary_limits,
-                "ordinary_runtime_resource_fallback",
-                false,
-            ),
+            (false, "direct_resource_fallback", false, false),
         ] {
-            let aot = compile(
-                CompileRequest::new(pattern, target)
-                    .mode(CompileMode::Optimizing)
-                    .output(output)
-                    .limits(limits),
-            )
+            let request = CompileRequest::new(pattern, Target::x86_64_linux())
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::SelectedEnd)
+                .limits(prepared_limits);
+            let aot = if bound_slow_native {
+                fre_aot_regex::compile_with_slow_aot_limits(
+                    request,
+                    fre_aot_regex::SlowAotLimits {
+                        max_native_data_bytes: 0,
+                        ..fre_aot_regex::SlowAotLimits::default()
+                    },
+                )
+            } else {
+                compile(request)
+            }
             .expect("compile retained route fixture");
             let runtime_program = aot
                 .module()
                 .required_runtime_program()
                 .map(|(symbol, bytes)| (symbol.to_owned(), bytes));
             let partial_dfa = retained_partial_stats(&aot).unwrap();
-            assert!(runtime_program.is_some());
-            assert!(partial_dfa.is_some());
+            assert_eq!(runtime_program.is_some(), runtime_backed, "{pattern:?}");
+            let partial_stats = partial_dfa.expect("incomplete retained semantic rows");
+            assert!(partial_stats.complete_rows > 0);
+            assert!(partial_stats.complete_rows < partial_stats.discovered_states);
             assert_eq!(aot.module().prepared_entry_symbol().is_some(), prepared);
-            assert!(!is_self_contained_native_shape(&aot).unwrap());
+            assert_eq!(
+                is_self_contained_native_shape(&aot).unwrap(),
+                !runtime_backed,
+                "{pattern:?}"
+            );
 
             let mut spec = base_spec.clone();
             spec.pattern = pattern.to_owned();
-            spec.output = match output {
-                OutputContract::Span => OutputKind::Span,
-                OutputContract::Exists => OutputKind::Exists,
-                OutputContract::SelectedEnd => OutputKind::SelectedEnd,
-            };
+            spec.output = OutputKind::SelectedEnd;
             let shape = CompiledShape {
                 spec,
                 upstream: Regex::new(pattern).unwrap(),
+                prepared_capability_format: prepared_capability_format(&aot).unwrap(),
                 aot,
                 runtime_program,
                 partial_dfa,
@@ -4078,6 +4368,14 @@ mod tests {
                 retained_limit_derivation: "forward_state_limit",
             };
             assert_eq!(shape.route(), expected_route);
+            assert_eq!(
+                shape.score_scope(),
+                if prepared {
+                    "prepared_compiled_all_windows"
+                } else {
+                    "slow_aot_self_contained_all_windows"
+                }
+            );
         }
     }
 
