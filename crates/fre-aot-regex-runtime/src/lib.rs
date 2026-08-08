@@ -391,9 +391,10 @@ pub struct PreparedAotRegex {
 
 const _: () = assert!(std::mem::offset_of!(PreparedAotRegex, frozen_header) == 0);
 
-// A complete compact sidecar is optional setup-only storage. Bound the
-// temporary second K0 workspace and its final immutable copy independently;
-// larger programs keep the ordinary adaptive executor and one live workspace.
+// A complete compact sidecar is optional setup-only storage. Retain the
+// established K0-size admission and independently bound its final immutable
+// copy; larger programs keep the ordinary adaptive executor and one live
+// workspace.
 const FROZEN_DYNAMIC_SIDECAR_MAX_K0_BYTES: usize = 512 * 1024;
 const FROZEN_DYNAMIC_SIDECAR_MAX_PACKED_BYTES: usize = 512 * 1024;
 
@@ -421,16 +422,18 @@ impl PreparedAotRegex {
         // continuation fallback, but it need not force the generated entry
         // to execute the older wide K0 projection. The header publishers keep
         // their established rule that a receipt wins when both candidates are
-        // supplied; this runtime owner instead presents only the independently
-        // closed compact projection first while retaining the receipt beside
-        // it. A compact construction or publication decline then presents the
-        // receipt alone and transactionally recovers the established V1
-        // capability. Both setup proofs remain immutable until revocation.
-        let mut frozen_dynamic_rows = program.compiler_private_frozen_dynamic_rows_storage_v3(
-            &workspace,
-            FROZEN_DYNAMIC_SIDECAR_MAX_K0_BYTES,
-            FROZEN_DYNAMIC_SIDECAR_MAX_PACKED_BYTES,
-        );
+        // supplied; this runtime owner instead copies the compact projection
+        // from that same completed live cache and presents only the compact
+        // owner first. A compact construction or publication decline then
+        // presents the retained receipt alone and recovers the established V1
+        // capability. Every retained proof remains immutable until revocation.
+        let mut frozen_dynamic_rows = program
+            .compiler_private_frozen_dynamic_rows_storage_v3_with_fallback_receipt(
+                &mut workspace,
+                fully_prefilled_fallback,
+                FROZEN_DYNAMIC_SIDECAR_MAX_K0_BYTES,
+                FROZEN_DYNAMIC_SIDECAR_MAX_PACKED_BYTES,
+            );
         let mut frozen_header = if frozen_dynamic_rows.is_some() {
             program.compiler_private_frozen_prepared_header_v6(
                 &workspace,
@@ -2874,6 +2877,39 @@ mod tests {
         handle
     }
 
+    fn prepare_exclusive_with_cold_dynamic_rows(program: &[u8]) -> FreAotRegexExclusiveHandleV1 {
+        let program = CompiledProgram::deserialize(program).expect("deserialize test program");
+        let mut workspace = program.prepare_workspace().expect("prepare test workspace");
+        let fully_prefilled_fallback = program
+            .compiler_private_try_prefill_retained_fallback_with_workspace_receipt(&mut workspace)
+            .expect("prefill cold dynamic-row test owner");
+        let frozen_dynamic_rows = program
+            .compiler_private_frozen_dynamic_rows_storage_v3_with_fallback_receipt(
+                &mut workspace,
+                fully_prefilled_fallback,
+                0,
+                0,
+            );
+        assert!(frozen_dynamic_rows.is_none());
+        assert!(fully_prefilled_fallback.is_none());
+        let frozen_header = program.compiler_private_frozen_prepared_header_v6(
+            &workspace,
+            fully_prefilled_fallback,
+            frozen_dynamic_rows.as_ref(),
+        );
+        assert!(!frozen_header.is_active());
+        let prepared = PreparedAotRegex {
+            frozen_header,
+            program,
+            workspace,
+            frozen_dynamic_rows,
+            fully_prefilled_fallback,
+        };
+        FreAotRegexExclusiveHandleV1(
+            Box::into_raw(Box::new(prepared)).cast::<std::ffi::c_void>(),
+        )
+    }
+
     fn call_exclusive(
         handle: FreAotRegexExclusiveHandleV1,
         haystack: &[u8],
@@ -4176,7 +4212,7 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
         .expect("compile dynamic-row runtime fixture");
         let identity = compiled.receipt().program_sha256;
         let serialized = compiled.program().serialize().unwrap();
-        let handle = prepare_exclusive(&serialized);
+        let handle = prepare_exclusive_with_cold_dynamic_rows(&serialized);
         let mut haystack = vec![b'!'; 80];
         for pair in haystack[8..70].chunks_exact_mut(2) {
             pair.copy_from_slice(b"ab");
@@ -4330,7 +4366,7 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
             );
             let identity = compiled.receipt().program_sha256;
             let serialized = compiled.program().serialize().unwrap();
-            let handle = prepare_exclusive(&serialized);
+            let handle = prepare_exclusive_with_cold_dynamic_rows(&serialized);
             let mut warmed = vec![b'!'; 80];
             warmed[8..10].copy_from_slice(b"aa");
             let start = 8;
@@ -4482,7 +4518,7 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
 
         let identity = compiled.receipt().program_sha256;
         let serialized = compiled.program().serialize().unwrap();
-        let handle = prepare_exclusive(&serialized);
+        let handle = prepare_exclusive_with_cold_dynamic_rows(&serialized);
         let mut haystack = vec![b'!'; 80];
         let start = 8_usize;
         let end = 72_usize;
@@ -4818,7 +4854,7 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
         .expect("compile scanner-free pending-end fixture");
         let identity = compiled.receipt().program_sha256;
         let serialized = compiled.program().serialize().unwrap();
-        let handle = prepare_exclusive(&serialized);
+        let handle = prepare_exclusive_with_cold_dynamic_rows(&serialized);
         let mut warmed = vec![b'!'; 80];
         let start = 8;
         let end = 72;
@@ -4916,7 +4952,7 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
         .expect("compile alternating dynamic-row fixture");
         let identity = compiled.receipt().program_sha256;
         let serialized = compiled.program().serialize().unwrap();
-        let handle = prepare_exclusive(&serialized);
+        let handle = prepare_exclusive_with_cold_dynamic_rows(&serialized);
         let mut haystack = vec![b'!'; 80];
         for pair in haystack[8..70].chunks_exact_mut(2) {
             pair.copy_from_slice(b"ab");

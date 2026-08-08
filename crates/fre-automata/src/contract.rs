@@ -1221,6 +1221,40 @@ impl TypedPlan<'_, Span> {
         Ok(SearchReport::new(span, report.accounting))
     }
 
+    /// Recover an authenticated root-selected endpoint through
+    /// setup-completed reverse rows without continuation-set authority. A
+    /// stale receipt or finite resource limit fails closed to
+    /// [`Self::recover_span_from_selected_end_with_workspace`].
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the root-prefilled reverse bridge keeps its cache owner and selected endpoint explicit"
+    )]
+    pub fn recover_span_from_selected_end_with_fully_prefilled_root_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut K0Workspace,
+        selected_end: usize,
+        limits: SearchLimits,
+        receipt: K0FullyPrefilledResumeCacheReceipt,
+    ) -> Result<SearchReport<MatchSpan>, SearchError> {
+        let report =
+            crate::k0::recover_span_from_selected_end_with_fully_prefilled_root_workspace(
+                self.automaton,
+                haystack,
+                window,
+                workspace,
+                selected_end,
+                limits,
+                receipt,
+            )?;
+        let span = report.found.ok_or(SearchError::InternalInvariant {
+            detail: "fully-prefilled root selected-end reverse recovery returned no span",
+        })?;
+        Ok(SearchReport::new(span, report.accounting))
+    }
+
     /// Search a complete-haystack suffix in one non-overlapping traversal.
     ///
     /// The workspace retains source-independent span invocation facts after
