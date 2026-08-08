@@ -1072,11 +1072,12 @@ fn context_native_and_context_fallback_receipts_name_the_actual_routes() {
     assert_eq!(restored.engine_kind(), EngineKind::OrderedNfa);
     assert_eq!(restored.engine_selection_reason(), None);
     assert_eq!(restored.context_determinization_report(), None);
-    assert!(
-        crate::CompiledModule::lower(&restored, Target::x86_64_linux())
-            .unwrap()
-            .required_runtime_symbol()
-            .is_some()
+    let restored_module = crate::CompiledModule::lower(&restored, Target::x86_64_linux()).unwrap();
+    assert!(restored_module.required_runtime_symbol().is_some());
+    assert!(restored_module.prepared_entry_symbol().is_some());
+    assert_eq!(
+        restored_module.required_prepared_fallback_runtime_symbol(),
+        Some("fre_aot_regex_runtime_search_exclusive_v1")
     );
 
     let mut limits = CompileLimitsV1::default();
@@ -1106,6 +1107,13 @@ fn context_native_and_context_fallback_receipts_name_the_actual_routes() {
     );
     assert!(declined.receipt().slow_context_aot.is_none());
     assert!(declined.receipt().runtime_helper_required);
+    assert!(declined.module().prepared_entry_symbol().is_some());
+    assert_eq!(
+        declined
+            .module()
+            .required_prepared_fallback_runtime_symbol(),
+        Some("fre_aot_regex_runtime_search_exclusive_v1")
+    );
     let decline = declined
         .receipt()
         .context_determinization
@@ -1148,6 +1156,13 @@ fn context_native_and_context_fallback_receipts_name_the_actual_routes() {
         EngineSelectionReason::ContextAssertions
     );
     assert!(unsupported.receipt().runtime_helper_required);
+    assert!(unsupported.module().prepared_entry_symbol().is_some());
+    assert_eq!(
+        unsupported
+            .module()
+            .required_prepared_fallback_runtime_symbol(),
+        Some("fre_aot_regex_runtime_search_exclusive_v1")
+    );
     assert!(
         unsupported
             .receipt()

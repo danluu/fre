@@ -128,11 +128,10 @@ OPTIONS:
                          prepared_runtime_resource_fallback, or
                          slow_partial_resource_fallback. Authenticated
                          complete retained tables may use the self-contained
-                         direct_resource_fallback route. A published prepared
-                         optimizing entry owns the prepared route even when
-                         no stable partial-row statistics exist; runtime-dependent
-                         generated entries without that prepared entry use the
-                         ordinary route.
+                         direct_resource_fallback route. Every newly emitted
+                         non-slow runtime-backed object publishes a prepared
+                         entry; ordinary routes remain available when auditing
+                         legacy objects.
   --measurement-order O  Timed engine order: upstream-native (default) or
                          native-upstream. All build/link/runtime preparation
                          completes before either timed phase.
@@ -2473,6 +2472,19 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
                     spec.name
                 ));
             }
+            if runtime_program.is_some()
+                && !is_genuine_slow_partial(&aot)
+                && (aot.module().required_runtime_symbol()
+                    != Some("fre_aot_regex_runtime_search_v1")
+                    || !prepared_entry_published
+                    || aot.module().required_prepared_fallback_runtime_symbol()
+                        != Some("fre_aot_regex_runtime_search_exclusive_v1"))
+            {
+                return Err(format!(
+                    "{} runtime-backed object did not publish its exact prepared entry dependencies",
+                    spec.name
+                ));
+            }
             let entry_symbol = aot.module().entry_symbol();
             if !aot
                 .module()
@@ -4804,7 +4816,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_backed_nonprepared_shape_times_the_generated_entry() {
+    fn runtime_backed_plain_nfa_publishes_and_times_the_prepared_entry() {
         let target = Target::x86_64_linux();
         let pattern = r"a{0}";
         let mut limits = CompileLimitsV1::default();
@@ -4820,13 +4832,25 @@ mod tests {
                 ..fre_aot_regex::SlowAotLimits::default()
             },
         )
-        .expect("compile runtime-backed nonprepared fixture");
+        .expect("compile runtime-backed plain-NFA fixture");
         assert_eq!(
             aot.receipt().engine_selection_reason,
             EngineSelectionReason::DeterminizationResourceLimit
         );
         assert!(retained_partial_stats(&aot).unwrap().is_none());
-        assert!(aot.module().prepared_entry_symbol().is_none());
+        let prepared_entry = aot
+            .module()
+            .prepared_entry_symbol()
+            .expect("general prepared runtime-adapter entry")
+            .to_owned();
+        assert_eq!(
+            aot.module().required_prepared_fallback_runtime_symbol(),
+            Some("fre_aot_regex_runtime_search_exclusive_v1")
+        );
+        assert_eq!(
+            prepared_capability_format(&aot).unwrap(),
+            "prepared_no_immutable_capability"
+        );
         assert!(!is_self_contained_native_shape(&aot));
         let entry = aot.module().entry_symbol().to_owned();
         let (runtime_symbol, runtime_bytes) = aot
@@ -4849,7 +4873,7 @@ mod tests {
             .into_iter()
             .next()
             .expect("grammar shape");
-        spec.name = "runtime_backed_nonprepared".to_owned();
+        spec.name = "runtime_backed_plain_nfa".to_owned();
         spec.base_name = spec.name.clone();
         spec.family = "resource_fallback";
         spec.pattern = pattern.to_owned();
@@ -4863,21 +4887,22 @@ mod tests {
             aot,
             runtime_program: Some((runtime_symbol.clone(), runtime_bytes)),
             partial_dfa: None,
-            prepared_capability_format: "not_prepared",
+            prepared_capability_format: "prepared_no_immutable_capability",
             fallback_artifact_kind: "plain_nfa",
             retained_limit_derivation: "legacy_zero_state",
         };
-        assert_eq!(shape.route(), "ordinary_runtime_resource_fallback");
+        assert_eq!(shape.route(), "prepared_runtime_resource_fallback");
         assert!(shape.is_compiled_primary());
-        assert_eq!(shape.timed_entry_scope(), "runtime_dependent_compiled");
-        assert_eq!(shape.score_scope(), "runtime_dependent_compiled_entry");
+        assert_eq!(shape.timed_entry_scope(), "prepared_compiled");
+        assert_eq!(shape.score_scope(), "prepared_compiled_all_windows");
 
         let source = build_c_harness(&flat_grammar_config(None), &[shape], &[]);
         assert!(source.contains(&format!(
-            "{{\"runtime_backed_nonprepared\", {entry}, NULL, {runtime_symbol}, {runtime_bytes}, 0"
+            "extern uint32_t {prepared_entry}(exclusive_handle"
         )));
-        assert!(source.contains("return shape->direct(haystack, length, 0U, length, result);"));
-        assert!(!source.contains("fre_aot_regex_runtime_search_exclusive_v1"));
+        assert!(source.contains(&format!(
+            "{{\"runtime_backed_plain_nfa\", {entry}, {prepared_entry}, {runtime_symbol}, {runtime_bytes}, 0"
+        )));
     }
 
     #[test]

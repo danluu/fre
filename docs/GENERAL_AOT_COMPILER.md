@@ -50,6 +50,20 @@ choice is:
 | Optimizing, contextual determinization is unsupported or reaches a limit | ordered TNFA | `ContextAssertions` | runtime adapter |
 | Optimizing, state/transition/work/allocation limit reached | ordered TNFA | `DeterminizationResourceLimit` | runtime adapter |
 
+Every runtime-adapter object keeps the ordinary serialized-program entry for
+ABI compatibility and also exports an additive exclusive-handle entry. A
+consumer can prepare the object's exact exported runtime program once with
+`fre_aot_regex_runtime_prepare_exclusive_v1`, reuse that handle for matching,
+and destroy it with `fre_aot_regex_runtime_destroy_exclusive_v1`. On x86-64
+and AArch64 the generated prepared entry is an ABI-preserving tail branch to
+the versioned exclusive runtime helper, so program reconstruction and
+workspace allocation stay outside steady-state matching. This applies to the
+general runtime-adapter route, including contextual and resource declines; it
+does not depend on a pattern recipe. The generated entry and that exact
+exported program form an inseparable ABI pair; a handle prepared from another
+program is outside the entry contract. The public runtime helper itself accepts
+any live exclusive handle and does not infer which generated entry called it.
+
 Syntax errors, hard lowering limits, and program/object byte limits are typed
 compilation errors. Capture outputs are outside this capture-free API's
 contract; grouping itself is erased and does not prevent compilation. These

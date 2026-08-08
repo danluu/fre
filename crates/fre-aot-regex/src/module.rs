@@ -905,6 +905,9 @@ const RUNTIME_PROGRAM_SYMBOL: usize = 3;
 // deterministic slot without expanding either module's preceding ABI.
 const SLOW_PARTIAL_TABLE_SYMBOL: usize = 4;
 const PREPARED_ENTRY_SYMBOL: usize = 4;
+// Runtime-adapter and native prepared modules have disjoint layouts after
+// their common prepared entry. The simple adapter has one dependency here.
+const RUNTIME_ADAPTER_PREPARED_FALLBACK_RUNTIME_SYMBOL: usize = 5;
 const PARTIAL_TABLE_SYMBOL: usize = 5;
 const PARTIAL_IDENTITY_SYMBOL: usize = 6;
 const PARTIAL_NATIVE_CORE_SYMBOL: usize = 7;
@@ -1049,8 +1052,20 @@ struct NativeSlowPartialTableLayout {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PreparedEntryLayout {
+    ordinary_code_size: usize,
     code_offset: usize,
     code_size: usize,
+    kind: PreparedEntryKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreparedEntryKind {
+    RuntimeAdapter,
+    Native(PreparedNativeEntryLayout),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PreparedNativeEntryLayout {
     native_core_offset: usize,
     native_core_size: usize,
     table_offset: usize,
@@ -1401,63 +1416,107 @@ impl CompiledModule {
         let program_name = identity_symbol(PROGRAM_SYMBOL_PREFIX, program_digest.as_slice())?;
         let (lowering, native_digest, prepared_layout) = if let Some(lowering) = prelowered {
             validate_native_slow_partial_table_layout(&program_bytes, &lowering, target)?;
-            let native_digest = native_module_digest(&program_bytes, target, &lowering)?;
+            let native_digest = native_module_digest(&program_bytes, target, &lowering, None)?;
             (lowering, native_digest, None)
         } else if let Some(view) = native {
             let native_lowering = lower_native_dfa(view, target)?;
             if let Some(lowering) = native_lowering {
-                let native_digest = native_module_digest(&program_bytes, target, &lowering)?;
+                let native_digest = native_module_digest(&program_bytes, target, &lowering, None)?;
                 (lowering, native_digest, None)
             } else if let Some(dynamic) = native_dynamic_rows {
                 let (lowering, prepared_layout) =
                     lower_native_dynamic_rows_prepared(program_bytes.clone(), dynamic, target)?;
-                let native_digest = native_module_digest(&lowering.data, target, &lowering)?;
+                let native_digest = native_module_digest(
+                    &lowering.data,
+                    target,
+                    &lowering,
+                    Some(prepared_layout),
+                )?;
                 (lowering, native_digest, Some(prepared_layout))
             } else {
-                let lowering = lower_runtime_adapter(program_bytes, target.architecture)?;
-                let native_digest = native_module_digest(&lowering.data, target, &lowering)?;
-                (lowering, native_digest, None)
+                let (lowering, prepared_layout) =
+                    lower_runtime_adapter(program_bytes, target.architecture)?;
+                let native_digest = native_module_digest(
+                    &lowering.data,
+                    target,
+                    &lowering,
+                    Some(prepared_layout),
+                )?;
+                (lowering, native_digest, Some(prepared_layout))
             }
         } else if let Some(view) = native_context {
             let lowering = module_context::lower_native_context(view, target)?;
-            let native_digest = native_module_digest(&program_bytes, target, &lowering)?;
+            let native_digest = native_module_digest(&program_bytes, target, &lowering, None)?;
             (lowering, native_digest, None)
         } else if let Some(view) = native_bit_parallel {
             if let Some(lowering) =
                 module_bit_parallel_exists::lower_native_bit_parallel_exists(view, target)?
             {
-                let native_digest = native_module_digest(&program_bytes, target, &lowering)?;
+                let native_digest = native_module_digest(&program_bytes, target, &lowering, None)?;
                 (lowering, native_digest, None)
             } else {
-                let lowering = lower_runtime_adapter(program_bytes, target.architecture)?;
-                let native_digest = native_module_digest(&lowering.data, target, &lowering)?;
-                (lowering, native_digest, None)
+                let (lowering, prepared_layout) =
+                    lower_runtime_adapter(program_bytes, target.architecture)?;
+                let native_digest = native_module_digest(
+                    &lowering.data,
+                    target,
+                    &lowering,
+                    Some(prepared_layout),
+                )?;
+                (lowering, native_digest, Some(prepared_layout))
             }
         } else if let Some(view) = native_partial {
             if let Some((lowering, prepared_layout)) =
                 lower_native_partial_prepared(program_bytes.clone(), &view, target)?
             {
-                let native_digest = native_module_digest(&lowering.data, target, &lowering)?;
+                let native_digest = native_module_digest(
+                    &lowering.data,
+                    target,
+                    &lowering,
+                    Some(prepared_layout),
+                )?;
                 (lowering, native_digest, Some(prepared_layout))
             } else if let Some(dynamic) = native_dynamic_rows {
                 let (lowering, prepared_layout) =
                     lower_native_dynamic_rows_prepared(program_bytes.clone(), dynamic, target)?;
-                let native_digest = native_module_digest(&lowering.data, target, &lowering)?;
+                let native_digest = native_module_digest(
+                    &lowering.data,
+                    target,
+                    &lowering,
+                    Some(prepared_layout),
+                )?;
                 (lowering, native_digest, Some(prepared_layout))
             } else {
-                let lowering = lower_runtime_adapter(program_bytes, target.architecture)?;
-                let native_digest = native_module_digest(&lowering.data, target, &lowering)?;
-                (lowering, native_digest, None)
+                let (lowering, prepared_layout) =
+                    lower_runtime_adapter(program_bytes, target.architecture)?;
+                let native_digest = native_module_digest(
+                    &lowering.data,
+                    target,
+                    &lowering,
+                    Some(prepared_layout),
+                )?;
+                (lowering, native_digest, Some(prepared_layout))
             }
         } else if let Some(dynamic) = native_dynamic_rows {
             let (lowering, prepared_layout) =
                 lower_native_dynamic_rows_prepared(program_bytes.clone(), dynamic, target)?;
-            let native_digest = native_module_digest(&lowering.data, target, &lowering)?;
+            let native_digest = native_module_digest(
+                &lowering.data,
+                target,
+                &lowering,
+                Some(prepared_layout),
+            )?;
             (lowering, native_digest, Some(prepared_layout))
         } else {
-            let lowering = lower_runtime_adapter(program_bytes, target.architecture)?;
-            let native_digest = native_module_digest(&lowering.data, target, &lowering)?;
-            (lowering, native_digest, None)
+            let (lowering, prepared_layout) =
+                lower_runtime_adapter(program_bytes, target.architecture)?;
+            let native_digest = native_module_digest(
+                &lowering.data,
+                target,
+                &lowering,
+                Some(prepared_layout),
+            )?;
+            (lowering, native_digest, Some(prepared_layout))
         };
         if slow_context_aot_report.is_some()
             && (lowering.needs_runtime || lowering.slow_partial_table.is_some())
@@ -1492,7 +1551,7 @@ impl CompiledModule {
             data_size
         };
         let entry_size = if let Some(prepared) = prepared_layout {
-            u64::try_from(prepared.code_offset)
+            u64::try_from(prepared.ordinary_code_size)
                 .map_err(|_| ObjectError::ArithmeticOverflow("module entry code size"))?
         } else {
             code_size
@@ -1602,129 +1661,15 @@ impl CompiledModule {
                 )?)
                 .map_err(|_| ObjectError::ArithmeticOverflow("prepared entry code size"))?,
             });
-            symbols.push(ModuleSymbol {
-                name: ".Lfre_aot_regex_partial_table_v1".to_owned(),
-                binding: SymbolBinding::Local,
-                kind: SymbolKind::Object,
-                section: Some(PROGRAM_SECTION),
-                offset: u64::try_from(prepared.table_offset).map_err(|_| {
-                    ObjectError::ArithmeticOverflow("prepared table offset")
-                })?,
-                size: u64::try_from(prepared.table_size).map_err(|_| {
-                    ObjectError::ArithmeticOverflow("prepared table size")
-                })?,
-            });
-            symbols.push(ModuleSymbol {
-                name: ".Lfre_aot_regex_partial_identity_v1".to_owned(),
-                binding: SymbolBinding::Local,
-                kind: SymbolKind::Object,
-                section: Some(PROGRAM_SECTION),
-                offset: u64::try_from(prepared.identity_offset).map_err(|_| {
-                    ObjectError::ArithmeticOverflow("prepared identity offset")
-                })?,
-                size: 32,
-            });
-            if symbols.len() != PARTIAL_NATIVE_CORE_SYMBOL {
-                return Err(ObjectError::InvalidModule(
-                    "partial native core symbol order is inconsistent",
-                ));
-            }
-            symbols.push(ModuleSymbol {
-                name: ".Lfre_aot_regex_partial_native_core_v1".to_owned(),
-                binding: SymbolBinding::Local,
-                kind: SymbolKind::Function,
-                section: Some(TEXT_SECTION),
-                offset: u64::try_from(prepared.native_core_offset)
-                    .map_err(|_| ObjectError::ArithmeticOverflow("partial native core offset"))?,
-                size: u64::try_from(prepared.native_core_size)
-                    .map_err(|_| ObjectError::ArithmeticOverflow("partial native core size"))?,
-            });
-            symbols.push(ModuleSymbol {
-                name: PARTIAL_RUNTIME_SYMBOL_NAME.to_owned(),
-                binding: SymbolBinding::Global,
-                kind: SymbolKind::Function,
-                section: None,
-                offset: 0,
-                size: 0,
-            });
-            symbols.push(ModuleSymbol {
-                name: PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME.to_owned(),
-                binding: SymbolBinding::Global,
-                kind: SymbolKind::Function,
-                section: None,
-                offset: 0,
-                size: 0,
-            });
-            symbols.push(ModuleSymbol {
-                name: if prepared.dynamic_rows {
-                    DYNAMIC_ROWS_PREFLIGHT_RUNTIME_SYMBOL_NAME
-                } else {
-                    PREPARED_PREFLIGHT_RUNTIME_SYMBOL_NAME
-                }
-                .to_owned(),
-                binding: SymbolBinding::Global,
-                kind: SymbolKind::Function,
-                section: None,
-                offset: 0,
-                size: 0,
-            });
-            if prepared.dynamic_rows {
-                if symbols.len() != DYNAMIC_ROWS_DEOPT_RUNTIME_SYMBOL {
-                    return Err(ObjectError::InvalidModule(
-                        "dynamic-row deopt symbol order is inconsistent",
-                    ));
-                }
-                symbols.push(ModuleSymbol {
-                    name: DYNAMIC_ROWS_DEOPT_RUNTIME_SYMBOL_NAME.to_owned(),
-                    binding: SymbolBinding::Global,
-                    kind: SymbolKind::Function,
-                    section: None,
-                    offset: 0,
-                    size: 0,
-                });
-                // Slot 12 remains the established dynamic continuation slot.
-                // A deliberately continuation-free variable-Span lowering
-                // keeps a defined local placeholder there, so the recovery
-                // helper has one deterministic cross-target index without
-                // publishing a false undefined dependency.
-                if needs_dynamic_rows_continue_symbol || prepared.span_recovery {
-                    if symbols.len() != DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL {
+            match prepared.kind {
+                PreparedEntryKind::RuntimeAdapter => {
+                    if symbols.len() != RUNTIME_ADAPTER_PREPARED_FALLBACK_RUNTIME_SYMBOL {
                         return Err(ObjectError::InvalidModule(
-                            "dynamic-row continuation symbol order is inconsistent",
-                        ));
-                    }
-                    if needs_dynamic_rows_continue_symbol {
-                        symbols.push(ModuleSymbol {
-                            name: DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL_NAME.to_owned(),
-                            binding: SymbolBinding::Global,
-                            kind: SymbolKind::Function,
-                            section: None,
-                            offset: 0,
-                            size: 0,
-                        });
-                    } else {
-                        symbols.push(ModuleSymbol {
-                            name: ".Lfre_aot_regex_dynamic_rows_no_continue_v1".to_owned(),
-                            binding: SymbolBinding::Local,
-                            kind: SymbolKind::Object,
-                            section: Some(PROGRAM_SECTION),
-                            offset: u64::try_from(prepared.identity_offset).map_err(|_| {
-                                ObjectError::ArithmeticOverflow(
-                                    "dynamic-row continuation placeholder offset",
-                                )
-                            })?,
-                            size: 0,
-                        });
-                    }
-                }
-                if prepared.span_recovery {
-                    if symbols.len() != DYNAMIC_ROWS_SPAN_RECOVERY_RUNTIME_SYMBOL {
-                        return Err(ObjectError::InvalidModule(
-                            "dynamic-row Span recovery symbol order is inconsistent",
+                            "runtime-adapter prepared symbol order is inconsistent",
                         ));
                     }
                     symbols.push(ModuleSymbol {
-                        name: DYNAMIC_ROWS_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME.to_owned(),
+                        name: PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME.to_owned(),
                         binding: SymbolBinding::Global,
                         kind: SymbolKind::Function,
                         section: None,
@@ -1732,61 +1677,194 @@ impl CompiledModule {
                         size: 0,
                     });
                 }
-                if symbols.len() == DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL {
+                PreparedEntryKind::Native(prepared) => {
                     symbols.push(ModuleSymbol {
-                        name: ".Lfre_aot_regex_dynamic_rows_no_continue_for_loop_v1".to_owned(),
+                        name: ".Lfre_aot_regex_partial_table_v1".to_owned(),
+                        binding: SymbolBinding::Local,
+                        kind: SymbolKind::Object,
+                        section: Some(PROGRAM_SECTION),
+                        offset: u64::try_from(prepared.table_offset).map_err(|_| {
+                            ObjectError::ArithmeticOverflow("prepared table offset")
+                        })?,
+                        size: u64::try_from(prepared.table_size).map_err(|_| {
+                            ObjectError::ArithmeticOverflow("prepared table size")
+                        })?,
+                    });
+                    symbols.push(ModuleSymbol {
+                        name: ".Lfre_aot_regex_partial_identity_v1".to_owned(),
                         binding: SymbolBinding::Local,
                         kind: SymbolKind::Object,
                         section: Some(PROGRAM_SECTION),
                         offset: u64::try_from(prepared.identity_offset).map_err(|_| {
-                            ObjectError::ArithmeticOverflow(
-                                "dynamic-row loop continuation placeholder offset",
-                            )
+                            ObjectError::ArithmeticOverflow("prepared identity offset")
                         })?,
-                        size: 0,
+                        size: 32,
                     });
-                }
-                if symbols.len() == DYNAMIC_ROWS_SPAN_RECOVERY_RUNTIME_SYMBOL {
+                    if symbols.len() != PARTIAL_NATIVE_CORE_SYMBOL {
+                        return Err(ObjectError::InvalidModule(
+                            "partial native core symbol order is inconsistent",
+                        ));
+                    }
                     symbols.push(ModuleSymbol {
-                        name: ".Lfre_aot_regex_dynamic_rows_no_span_for_loop_v1".to_owned(),
+                        name: ".Lfre_aot_regex_partial_native_core_v1".to_owned(),
                         binding: SymbolBinding::Local,
-                        kind: SymbolKind::Object,
-                        section: Some(PROGRAM_SECTION),
-                        offset: u64::try_from(prepared.identity_offset).map_err(|_| {
-                            ObjectError::ArithmeticOverflow(
-                                "dynamic-row loop Span placeholder offset",
-                            )
-                        })?,
+                        kind: SymbolKind::Function,
+                        section: Some(TEXT_SECTION),
+                        offset: u64::try_from(prepared.native_core_offset)
+                            .map_err(|_| ObjectError::ArithmeticOverflow("partial native core offset"))?,
+                        size: u64::try_from(prepared.native_core_size)
+                            .map_err(|_| ObjectError::ArithmeticOverflow("partial native core size"))?,
+                    });
+                    symbols.push(ModuleSymbol {
+                        name: PARTIAL_RUNTIME_SYMBOL_NAME.to_owned(),
+                        binding: SymbolBinding::Global,
+                        kind: SymbolKind::Function,
+                        section: None,
+                        offset: 0,
                         size: 0,
                     });
+                    symbols.push(ModuleSymbol {
+                        name: PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME.to_owned(),
+                        binding: SymbolBinding::Global,
+                        kind: SymbolKind::Function,
+                        section: None,
+                        offset: 0,
+                        size: 0,
+                    });
+                    symbols.push(ModuleSymbol {
+                        name: if prepared.dynamic_rows {
+                            DYNAMIC_ROWS_PREFLIGHT_RUNTIME_SYMBOL_NAME
+                        } else {
+                            PREPARED_PREFLIGHT_RUNTIME_SYMBOL_NAME
+                        }
+                        .to_owned(),
+                        binding: SymbolBinding::Global,
+                        kind: SymbolKind::Function,
+                        section: None,
+                        offset: 0,
+                        size: 0,
+                    });
+                    if prepared.dynamic_rows {
+                        if symbols.len() != DYNAMIC_ROWS_DEOPT_RUNTIME_SYMBOL {
+                            return Err(ObjectError::InvalidModule(
+                                "dynamic-row deopt symbol order is inconsistent",
+                            ));
+                        }
+                        symbols.push(ModuleSymbol {
+                            name: DYNAMIC_ROWS_DEOPT_RUNTIME_SYMBOL_NAME.to_owned(),
+                            binding: SymbolBinding::Global,
+                            kind: SymbolKind::Function,
+                            section: None,
+                            offset: 0,
+                            size: 0,
+                        });
+                        // Slot 12 remains the established dynamic continuation slot.
+                        // A deliberately continuation-free variable-Span lowering
+                        // keeps a defined local placeholder there, so the recovery
+                        // helper has one deterministic cross-target index without
+                        // publishing a false undefined dependency.
+                        if needs_dynamic_rows_continue_symbol || prepared.span_recovery {
+                            if symbols.len() != DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL {
+                                return Err(ObjectError::InvalidModule(
+                                    "dynamic-row continuation symbol order is inconsistent",
+                                ));
+                            }
+                            if needs_dynamic_rows_continue_symbol {
+                                symbols.push(ModuleSymbol {
+                                    name: DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL_NAME.to_owned(),
+                                    binding: SymbolBinding::Global,
+                                    kind: SymbolKind::Function,
+                                    section: None,
+                                    offset: 0,
+                                    size: 0,
+                                });
+                            } else {
+                                symbols.push(ModuleSymbol {
+                                    name: ".Lfre_aot_regex_dynamic_rows_no_continue_v1".to_owned(),
+                                    binding: SymbolBinding::Local,
+                                    kind: SymbolKind::Object,
+                                    section: Some(PROGRAM_SECTION),
+                                    offset: u64::try_from(prepared.identity_offset).map_err(|_| {
+                                        ObjectError::ArithmeticOverflow(
+                                            "dynamic-row continuation placeholder offset",
+                                        )
+                                    })?,
+                                    size: 0,
+                                });
+                            }
+                        }
+                        if prepared.span_recovery {
+                            if symbols.len() != DYNAMIC_ROWS_SPAN_RECOVERY_RUNTIME_SYMBOL {
+                                return Err(ObjectError::InvalidModule(
+                                    "dynamic-row Span recovery symbol order is inconsistent",
+                                ));
+                            }
+                            symbols.push(ModuleSymbol {
+                                name: DYNAMIC_ROWS_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME.to_owned(),
+                                binding: SymbolBinding::Global,
+                                kind: SymbolKind::Function,
+                                section: None,
+                                offset: 0,
+                                size: 0,
+                            });
+                        }
+                        if symbols.len() == DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL {
+                            symbols.push(ModuleSymbol {
+                                name: ".Lfre_aot_regex_dynamic_rows_no_continue_for_loop_v1".to_owned(),
+                                binding: SymbolBinding::Local,
+                                kind: SymbolKind::Object,
+                                section: Some(PROGRAM_SECTION),
+                                offset: u64::try_from(prepared.identity_offset).map_err(|_| {
+                                    ObjectError::ArithmeticOverflow(
+                                        "dynamic-row loop continuation placeholder offset",
+                                    )
+                                })?,
+                                size: 0,
+                            });
+                        }
+                        if symbols.len() == DYNAMIC_ROWS_SPAN_RECOVERY_RUNTIME_SYMBOL {
+                            symbols.push(ModuleSymbol {
+                                name: ".Lfre_aot_regex_dynamic_rows_no_span_for_loop_v1".to_owned(),
+                                binding: SymbolBinding::Local,
+                                kind: SymbolKind::Object,
+                                section: Some(PROGRAM_SECTION),
+                                offset: u64::try_from(prepared.identity_offset).map_err(|_| {
+                                    ObjectError::ArithmeticOverflow(
+                                        "dynamic-row loop Span placeholder offset",
+                                    )
+                                })?,
+                                size: 0,
+                            });
+                        }
+                        if symbols.len() != DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL {
+                            return Err(ObjectError::InvalidModule(
+                                "dynamic-row frozen-loop helper symbol order is inconsistent",
+                            ));
+                        }
+                        symbols.push(ModuleSymbol {
+                            name: DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL_NAME.to_owned(),
+                            binding: SymbolBinding::Global,
+                            kind: SymbolKind::Function,
+                            section: None,
+                            offset: 0,
+                            size: 0,
+                        });
+                    } else if prepared.span_recovery {
+                        if symbols.len() != PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL {
+                            return Err(ObjectError::InvalidModule(
+                                "partial Span recovery symbol order is inconsistent",
+                            ));
+                        }
+                        symbols.push(ModuleSymbol {
+                            name: PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME.to_owned(),
+                            binding: SymbolBinding::Global,
+                            kind: SymbolKind::Function,
+                            section: None,
+                            offset: 0,
+                            size: 0,
+                        });
+                    }
                 }
-                if symbols.len() != DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL {
-                    return Err(ObjectError::InvalidModule(
-                        "dynamic-row frozen-loop helper symbol order is inconsistent",
-                    ));
-                }
-                symbols.push(ModuleSymbol {
-                    name: DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL_NAME.to_owned(),
-                    binding: SymbolBinding::Global,
-                    kind: SymbolKind::Function,
-                    section: None,
-                    offset: 0,
-                    size: 0,
-                });
-            } else if prepared.span_recovery {
-                if symbols.len() != PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL {
-                    return Err(ObjectError::InvalidModule(
-                        "partial Span recovery symbol order is inconsistent",
-                    ));
-                }
-                symbols.push(ModuleSymbol {
-                    name: PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME.to_owned(),
-                    binding: SymbolBinding::Global,
-                    kind: SymbolKind::Function,
-                    section: None,
-                    offset: 0,
-                    size: 0,
-                });
             }
             Some(PREPARED_ENTRY_SYMBOL)
         } else {
@@ -1862,8 +1940,15 @@ impl CompiledModule {
         &self.symbols[self.entry_symbol_index].name
     }
 
-    /// Return the additive exclusive-handle entry when authenticated static
-    /// or dynamically warmed rows were lowered into this module.
+    /// Return the additive exclusive-handle entry for a runtime-backed module.
+    ///
+    /// Prepare [`Self::required_runtime_program`] exactly once with
+    /// `fre_aot_regex_runtime_prepare_exclusive_v1`, call this entry with the
+    /// exclusively owned handle, and destroy it with
+    /// `fre_aot_regex_runtime_destroy_exclusive_v1`. The ordinary entry stays
+    /// present for ABI compatibility. The entry and exported program are one
+    /// inseparable ABI pair: passing a handle prepared from any other program
+    /// violates this entry's contract.
     #[must_use]
     pub fn prepared_entry_symbol(&self) -> Option<&str> {
         self.prepared_entry_symbol_index
@@ -1895,8 +1980,11 @@ impl CompiledModule {
     pub fn required_prepared_fallback_runtime_symbol(&self) -> Option<&str> {
         self.prepared_entry_symbol_index?;
         self.symbols
-            .get(PREPARED_FALLBACK_RUNTIME_SYMBOL)
-            .filter(|symbol| symbol.section.is_none())
+            .iter()
+            .find(|symbol| {
+                symbol.section.is_none()
+                    && symbol.name == PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME
+            })
             .map(|symbol| symbol.name.as_str())
     }
 
@@ -2041,9 +2129,11 @@ impl CompiledModule {
     /// Return the exported serialized-program object required for preparation.
     ///
     /// Runtime-backed modules define the returned symbol over the exact
-    /// serialized program byte extent. A C integrator can pass that symbol's
-    /// address and returned length to `fre_aot_regex_runtime_prepare_v1`.
-    /// Direct DFA modules are self-contained and return `None`.
+    /// serialized program byte extent. Pass that symbol and returned length
+    /// to `fre_aot_regex_runtime_prepare_exclusive_v1`, reuse the handle with
+    /// [`Self::prepared_entry_symbol`], and destroy it with
+    /// `fre_aot_regex_runtime_destroy_exclusive_v1`. Direct modules return
+    /// `None`.
     #[must_use]
     pub fn required_runtime_program(&self) -> Option<(&str, usize)> {
         let index = self.runtime_program_symbol_index?;
@@ -2080,20 +2170,64 @@ impl CompiledModule {
 fn lower_runtime_adapter(
     program_bytes: Vec<u8>,
     architecture: Architecture,
-) -> Result<NativeLowering, ObjectError> {
-    let (code, relocations) = match architecture {
+) -> Result<(NativeLowering, PreparedEntryLayout), ObjectError> {
+    let (mut code, mut relocations) = match architecture {
         Architecture::X86_64 => lower_x86_64_runtime_adapter()?,
         Architecture::Aarch64 => lower_aarch64_runtime_adapter()?,
     };
-    Ok(NativeLowering {
-        code,
-        data: program_bytes,
-        relocations,
-        slow_partial_table: None,
-        needs_runtime: true,
-        start_accelerator: StartAccelerator::None,
-        anchored_prefix_filter_bytes: 0,
-    })
+    let ordinary_code_size = code.len();
+    let alignment_mask = match architecture {
+        Architecture::X86_64 => 15,
+        Architecture::Aarch64 => 3,
+    };
+    let code_offset = code
+        .len()
+        .checked_add(alignment_mask)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "prepared runtime-adapter code alignment",
+        ))?
+        & !alignment_mask;
+    match architecture {
+        Architecture::X86_64 => code.resize(code_offset, 0x90),
+        Architecture::Aarch64 => {
+            while code.len() < code_offset {
+                push_bytes(&mut code, &0xd503_201f_u32.to_le_bytes())?;
+            }
+        }
+    }
+    let (prepared_code, prepared_relocations) = match architecture {
+        Architecture::X86_64 => lower_x86_64_prepared_runtime_adapter(),
+        Architecture::Aarch64 => lower_aarch64_prepared_runtime_adapter(),
+    };
+    let code_size = prepared_code.len();
+    push_bytes(&mut code, &prepared_code)?;
+    let relocation_base = offset_u64(code_offset, "prepared runtime-adapter relocation base")?;
+    for mut relocation in prepared_relocations {
+        relocation.offset = relocation
+            .offset
+            .checked_add(relocation_base)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "prepared runtime-adapter relocation offset",
+            ))?;
+        relocations.push(relocation);
+    }
+    Ok((
+        NativeLowering {
+            code,
+            data: program_bytes,
+            relocations,
+            slow_partial_table: None,
+            needs_runtime: true,
+            start_accelerator: StartAccelerator::None,
+            anchored_prefix_filter_bytes: 0,
+        },
+        PreparedEntryLayout {
+            ordinary_code_size,
+            code_offset,
+            code_size,
+            kind: PreparedEntryKind::RuntimeAdapter,
+        },
+    ))
 }
 
 /// Add an exclusive prepared entry that scans one optional graph-certified
@@ -2285,15 +2419,18 @@ fn lower_native_dynamic_rows_prepared(
             anchored_prefix_filter_bytes: 0,
         },
         PreparedEntryLayout {
+            ordinary_code_size: code_offset,
             code_offset,
             code_size,
-            native_core_offset,
-            native_core_size: 0,
-            table_offset: identity_offset,
-            table_size: 0,
-            identity_offset,
-            span_recovery: variable_span_recovery,
-            dynamic_rows: true,
+            kind: PreparedEntryKind::Native(PreparedNativeEntryLayout {
+                native_core_offset,
+                native_core_size: 0,
+                table_offset: identity_offset,
+                table_size: 0,
+                identity_offset,
+                span_recovery: variable_span_recovery,
+                dynamic_rows: true,
+            }),
         },
     ))
 }
@@ -2857,15 +2994,18 @@ fn lower_native_partial_prepared(
             anchored_prefix_filter_bytes: native.anchored_prefix_filter_bytes,
         },
         PreparedEntryLayout {
+            ordinary_code_size: code_offset,
             code_offset,
             code_size,
-            native_core_offset,
-            native_core_size,
-            table_offset,
-            table_size,
-            identity_offset,
-            span_recovery,
-            dynamic_rows: false,
+            kind: PreparedEntryKind::Native(PreparedNativeEntryLayout {
+                native_core_offset,
+                native_core_size,
+                table_offset,
+                table_size,
+                identity_offset,
+                span_recovery,
+                dynamic_rows: false,
+            }),
         },
     )))
 }
@@ -2878,6 +3018,7 @@ fn native_module_digest(
     program_bytes: &[u8],
     target: Target,
     lowering: &NativeLowering,
+    prepared_layout: Option<PreparedEntryLayout>,
 ) -> Result<[u8; 32], ObjectError> {
     fn update_bytes(
         digest: &mut Sha256,
@@ -2954,11 +3095,22 @@ fn native_module_digest(
                 "partial runtime symbol identity byte length",
             )?;
         }
-        if lowering
-            .relocations
-            .iter()
-            .any(|relocation| relocation.symbol == PREPARED_FALLBACK_RUNTIME_SYMBOL)
-        {
+        if let Some(prepared) = prepared_layout {
+            let fallback_symbol = match prepared.kind {
+                PreparedEntryKind::RuntimeAdapter => {
+                    RUNTIME_ADAPTER_PREPARED_FALLBACK_RUNTIME_SYMBOL
+                }
+                PreparedEntryKind::Native(_) => PREPARED_FALLBACK_RUNTIME_SYMBOL,
+            };
+            if !lowering
+                .relocations
+                .iter()
+                .any(|relocation| relocation.symbol == fallback_symbol)
+            {
+                return Err(ObjectError::InvalidModule(
+                    "prepared entry is missing its fallback runtime relocation",
+                ));
+            }
             update_bytes(
                 &mut digest,
                 PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME.as_bytes(),
@@ -12821,6 +12973,21 @@ fn lower_x86_64_runtime_adapter() -> Result<(Vec<u8>, Vec<ModuleRelocation>), Ob
             },
         ],
     ))
+}
+
+fn lower_x86_64_prepared_runtime_adapter() -> (Vec<u8>, Vec<ModuleRelocation>) {
+    // The exclusive helper has exactly the prepared entry's six-argument
+    // SysV ABI. A tail jump needs no shuffle, frame, or target feature.
+    (
+        vec![0xe9, 0, 0, 0, 0],
+        vec![ModuleRelocation {
+            section: TEXT_SECTION,
+            offset: 1,
+            kind: RelocationKind::X86PltRelative32,
+            symbol: RUNTIME_ADAPTER_PREPARED_FALLBACK_RUNTIME_SYMBOL,
+            addend: -4,
+        }],
+    )
 }
 
 fn patch_x86_64_local_call(
@@ -23836,6 +24003,21 @@ fn lower_aarch64_runtime_adapter() -> Result<(Vec<u8>, Vec<ModuleRelocation>), O
             },
         ],
     ))
+}
+
+fn lower_aarch64_prepared_runtime_adapter() -> (Vec<u8>, Vec<ModuleRelocation>) {
+    // The exclusive helper has exactly the prepared entry's six-argument
+    // AAPCS64 ABI. A tail branch preserves LR and all arguments.
+    (
+        0x1400_0000_u32.to_le_bytes().to_vec(),
+        vec![ModuleRelocation {
+            section: TEXT_SECTION,
+            offset: 0,
+            kind: RelocationKind::Aarch64Branch26,
+            symbol: RUNTIME_ADAPTER_PREPARED_FALLBACK_RUNTIME_SYMBOL,
+            addend: 0,
+        }],
+    )
 }
 
 fn patch_aarch64_local_call(
@@ -36701,7 +36883,10 @@ mod tests {
             .unwrap();
             let variable_span_code = &variable_span.code[variable_span_layout.code_offset
                 ..variable_span_layout.code_offset + variable_span_layout.code_size];
-            assert!(variable_span_layout.span_recovery);
+            assert!(matches!(
+                variable_span_layout.kind,
+                PreparedEntryKind::Native(layout) if layout.span_recovery
+            ));
             assert_eq!(
                 variable_span
                     .relocations
@@ -53092,6 +53277,94 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
     }
 
     #[test]
+    fn prepared_runtime_adapters_are_exact_abi_preserving_tail_branches() {
+        let (x86, x86_relocations) = lower_x86_64_prepared_runtime_adapter();
+        assert_eq!(x86, [0xe9, 0, 0, 0, 0]);
+        assert_eq!(x86_relocations.len(), 1);
+        assert_eq!(x86_relocations[0].offset, 1);
+        assert_eq!(x86_relocations[0].kind, RelocationKind::X86PltRelative32);
+        assert_eq!(
+            x86_relocations[0].symbol,
+            RUNTIME_ADAPTER_PREPARED_FALLBACK_RUNTIME_SYMBOL
+        );
+        assert_eq!(x86_relocations[0].addend, -4);
+
+        let (aarch64, aarch64_relocations) = lower_aarch64_prepared_runtime_adapter();
+        assert_eq!(aarch64, 0x1400_0000_u32.to_le_bytes());
+        assert_eq!(aarch64_relocations.len(), 1);
+        assert_eq!(aarch64_relocations[0].offset, 0);
+        assert_eq!(aarch64_relocations[0].kind, RelocationKind::Aarch64Branch26);
+        assert_eq!(
+            aarch64_relocations[0].symbol,
+            RUNTIME_ADAPTER_PREPARED_FALLBACK_RUNTIME_SYMBOL
+        );
+        assert_eq!(aarch64_relocations[0].addend, 0);
+    }
+
+    #[test]
+    fn prepared_runtime_entry_is_additive_to_the_unchanged_direct_adapter() {
+        for architecture in [Architecture::X86_64, Architecture::Aarch64] {
+            let (direct_code, direct_relocations) = match architecture {
+                Architecture::X86_64 => lower_x86_64_runtime_adapter().unwrap(),
+                Architecture::Aarch64 => lower_aarch64_runtime_adapter().unwrap(),
+            };
+            let (mut lowering, layout) =
+                lower_runtime_adapter(vec![1, 2, 3], architecture).unwrap();
+            assert_eq!(layout.ordinary_code_size, direct_code.len());
+            assert!(matches!(layout.kind, PreparedEntryKind::RuntimeAdapter));
+            assert_eq!(
+                lowering.code.get(..direct_code.len()),
+                Some(direct_code.as_slice())
+            );
+            assert_eq!(
+                lowering.relocations.get(..direct_relocations.len()),
+                Some(direct_relocations.as_slice())
+            );
+            assert_eq!(lowering.data, [1, 2, 3]);
+            assert!(lowering.needs_runtime);
+
+            let expected_prepared = match architecture {
+                Architecture::X86_64 => vec![0xe9, 0, 0, 0, 0],
+                Architecture::Aarch64 => 0x1400_0000_u32.to_le_bytes().to_vec(),
+            };
+            assert_eq!(
+                lowering
+                    .code
+                    .get(layout.code_offset..layout.code_offset + layout.code_size),
+                Some(expected_prepared.as_slice())
+            );
+            let prepared_relocation = lowering.relocations.last().unwrap();
+            assert_eq!(
+                prepared_relocation.symbol,
+                RUNTIME_ADAPTER_PREPARED_FALLBACK_RUNTIME_SYMBOL
+            );
+            let relative_offset = usize::try_from(prepared_relocation.offset).unwrap()
+                - layout.code_offset;
+            assert_eq!(
+                relative_offset,
+                match architecture {
+                    Architecture::X86_64 => 1,
+                    Architecture::Aarch64 => 0,
+                }
+            );
+            let target = match architecture {
+                Architecture::X86_64 => Target::x86_64_linux(),
+                Architecture::Aarch64 => Target::aarch64_linux(),
+            };
+            assert!(
+                native_module_digest(&lowering.data, target, &lowering, Some(layout)).is_ok()
+            );
+            lowering.relocations.pop();
+            assert!(matches!(
+                native_module_digest(&lowering.data, target, &lowering, Some(layout)),
+                Err(ObjectError::InvalidModule(
+                    "prepared entry is missing its fallback runtime relocation"
+                ))
+            ));
+        }
+    }
+
+    #[test]
     fn identity_symbol_is_full_and_deterministic() {
         let digest = [0xab; 32];
         let symbol = identity_symbol("p_", &digest).unwrap();
@@ -53156,6 +53429,93 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             compiled[0].module().entry_symbol(),
             repeated.module().entry_symbol()
         );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one cross-target matrix audits the complete runtime-program object contract"
+    )]
+    fn runtime_adapters_publish_a_general_prepared_entry_on_every_target() {
+        let mut limits = CompileLimitsV1::default();
+        limits.determinize.max_states = 0;
+        for target in [
+            Target::x86_64_linux(),
+            Target::x86_64_macos(),
+            Target::aarch64_linux(),
+            Target::aarch64_macos(),
+        ] {
+            let compiled = crate::compile_with_slow_aot_limits(
+                CompileRequest::new("a{0}", target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span)
+                    .limits(limits),
+                SlowAotLimits {
+                    max_allocation_bytes: 0,
+                    max_native_data_bytes: 0,
+                    ..SlowAotLimits::default()
+                },
+            )
+            .expect("plain runtime-adapter fixture");
+            assert_eq!(
+                compiled.receipt().engine_selection_reason,
+                crate::EngineSelectionReason::DeterminizationResourceLimit
+            );
+            let module = compiled.module();
+            assert!(module.required_runtime_program().is_some());
+            assert_eq!(module.required_runtime_symbol(), Some(RUNTIME_SYMBOL_NAME));
+            assert_eq!(
+                module.required_prepared_fallback_runtime_symbol(),
+                Some(PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME)
+            );
+            assert_eq!(module.required_prepared_runtime_symbol(), None);
+            assert_eq!(module.required_prepared_preflight_runtime_symbol(), None);
+            assert_eq!(module.required_prepared_span_recovery_runtime_symbol(), None);
+            assert_eq!(module.symbols().len(), 6);
+
+            let ordinary_code_size = match target.architecture {
+                Architecture::X86_64 => lower_x86_64_runtime_adapter().unwrap().0.len(),
+                Architecture::Aarch64 => lower_aarch64_runtime_adapter().unwrap().0.len(),
+            };
+            assert_eq!(
+                module.symbols()[ENTRY_SYMBOL].size,
+                u64::try_from(ordinary_code_size).unwrap()
+            );
+            let prepared = &module.symbols()[PREPARED_ENTRY_SYMBOL];
+            assert_eq!(prepared.name, module.prepared_entry_symbol().unwrap());
+            assert_eq!(prepared.binding, SymbolBinding::Global);
+            assert_eq!(prepared.kind, SymbolKind::Function);
+            assert_eq!(prepared.section, Some(TEXT_SECTION));
+            let expected_size = match target.architecture {
+                Architecture::X86_64 => 5,
+                Architecture::Aarch64 => 4,
+            };
+            assert_eq!(prepared.size, expected_size);
+
+            let helper = &module.symbols()[RUNTIME_ADAPTER_PREPARED_FALLBACK_RUNTIME_SYMBOL];
+            assert_eq!(helper.name, PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME);
+            assert_eq!(helper.binding, SymbolBinding::Global);
+            assert_eq!(helper.kind, SymbolKind::Function);
+            assert_eq!(helper.section, None);
+            let prepared_offset = usize::try_from(prepared.offset).unwrap();
+            let relocation_delta = match target.architecture {
+                Architecture::X86_64 => 1,
+                Architecture::Aarch64 => 0,
+            };
+            assert!(module.relocations().iter().any(|relocation| {
+                relocation.symbol == RUNTIME_ADAPTER_PREPARED_FALLBACK_RUNTIME_SYMBOL
+                    && relocation.offset
+                        == u64::try_from(prepared_offset + relocation_delta).unwrap()
+            }));
+            assert!(module
+                .relocations()
+                .iter()
+                .any(|relocation| relocation.symbol == RUNTIME_SYMBOL));
+            assert_eq!(
+                emit_object(module, ObjectFormat::for_target(target), usize::MAX).unwrap(),
+                compiled.object()
+            );
+        }
     }
 
     #[test]
@@ -53340,7 +53700,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             start_accelerator: StartAccelerator::None,
             anchored_prefix_filter_bytes: 0,
         };
-        let base = native_module_digest(program, target, &lowering).unwrap();
+        let base = native_module_digest(program, target, &lowering, None).unwrap();
         let mut legacy = Sha256::new();
         legacy.update(b"fre-aot-regex/native-module-identity\0");
         legacy.update(1_u32.to_le_bytes());
@@ -53360,7 +53720,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
         assert_eq!(base, legacy, "ordinary V1 digest stream changed");
         assert_ne!(
             base,
-            native_module_digest(b"semantic program!", target, &lowering).unwrap()
+            native_module_digest(b"semantic program!", target, &lowering, None).unwrap()
         );
         for distinct_target in [
             Target {
@@ -53382,34 +53742,34 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
         ] {
             assert_ne!(
                 base,
-                native_module_digest(program, distinct_target, &lowering).unwrap()
+                native_module_digest(program, distinct_target, &lowering, None).unwrap()
             );
         }
 
         lowering.code.push(7);
         assert_ne!(
             base,
-            native_module_digest(program, target, &lowering).unwrap()
+            native_module_digest(program, target, &lowering, None).unwrap()
         );
         lowering.code.pop();
         lowering.data.push(8);
         assert_ne!(
             base,
-            native_module_digest(program, target, &lowering).unwrap()
+            native_module_digest(program, target, &lowering, None).unwrap()
         );
         lowering.data.pop();
         lowering.slow_partial_table = Some(NativeSlowPartialTableLayout { offset: 1, size: 2 });
-        let table_layout = native_module_digest(program, target, &lowering).unwrap();
+        let table_layout = native_module_digest(program, target, &lowering, None).unwrap();
         assert_ne!(base, table_layout);
         lowering.slow_partial_table = Some(NativeSlowPartialTableLayout { offset: 2, size: 2 });
         assert_ne!(
             table_layout,
-            native_module_digest(program, target, &lowering).unwrap()
+            native_module_digest(program, target, &lowering, None).unwrap()
         );
         lowering.slow_partial_table = Some(NativeSlowPartialTableLayout { offset: 1, size: 1 });
         assert_ne!(
             table_layout,
-            native_module_digest(program, target, &lowering).unwrap()
+            native_module_digest(program, target, &lowering, None).unwrap()
         );
         lowering.slow_partial_table = None;
         lowering.relocations.push(ModuleRelocation {
@@ -53421,27 +53781,27 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
         });
         assert_ne!(
             base,
-            native_module_digest(program, target, &lowering).unwrap()
+            native_module_digest(program, target, &lowering, None).unwrap()
         );
         lowering.relocations.clear();
         lowering.needs_runtime = true;
-        let runtime = native_module_digest(program, target, &lowering).unwrap();
+        let runtime = native_module_digest(program, target, &lowering, None).unwrap();
         assert_ne!(base, runtime);
         assert_ne!(
             runtime,
-            native_module_digest(b"semantic program!", target, &lowering).unwrap()
+            native_module_digest(b"semantic program!", target, &lowering, None).unwrap()
         );
         lowering.needs_runtime = false;
         lowering.start_accelerator = StartAccelerator::X86Sse2;
         assert_ne!(
             base,
-            native_module_digest(program, target, &lowering).unwrap()
+            native_module_digest(program, target, &lowering, None).unwrap()
         );
         lowering.start_accelerator = StartAccelerator::None;
         lowering.anchored_prefix_filter_bytes = 4;
         assert_ne!(
             base,
-            native_module_digest(program, target, &lowering).unwrap()
+            native_module_digest(program, target, &lowering, None).unwrap()
         );
     }
 
