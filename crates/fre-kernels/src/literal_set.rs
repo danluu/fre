@@ -1475,7 +1475,7 @@ mod folded_short_stage_probe {
 mod folded_long_tail_tests {
     use crate::folded_literal_trie::{
         BuildAttempt, BuildLimits, FoldedLiteral, FoldedLiteralTriePlan, FoldedScalarClass,
-        RootCandidateOutcome,
+        RootCandidateOutcome, root_candidate_dispatch_probe,
     };
 
     use super::{
@@ -1596,6 +1596,106 @@ mod folded_long_tail_tests {
         (incumbent, accelerated)
     }
 
+    fn mixed_width_plans(long_width: usize) -> (LiteralSetPlan, LiteralSetPlan) {
+        assert!(long_width >= 2);
+        let common = ['e'];
+        let rare = ['\u{7f}'];
+        let short = ['x'];
+        let mut long_classes = vec![FoldedScalarClass::new(&common); long_width];
+        long_classes[long_width - 1] = FoldedScalarClass::new(&rare);
+        let short_classes = [FoldedScalarClass::new(&short)];
+        let literals = [
+            FoldedLiteral::new(&long_classes),
+            FoldedLiteral::new(&short_classes),
+        ];
+        let trie = match FoldedLiteralTriePlan::build(&literals, BuildLimits::default()).unwrap() {
+            BuildAttempt::Admitted(plan) => plan,
+            BuildAttempt::DenseFallback(fallback) => {
+                panic!("synthetic mixed-width trie declined: {fallback:?}")
+            }
+        };
+        let mut long_pattern = vec![b'e'; long_width];
+        long_pattern[long_width - 1] = 0x7f;
+        let patterns = vec![long_pattern, b"x".to_vec()];
+        let incumbent = LiteralSetPlan::new(&patterns, LiteralSetBuildLimits::default()).unwrap();
+        let attachment =
+            LiteralSetFoldAttachment::new(&patterns, LiteralSetBuildLimits::default()).unwrap();
+        let (accelerated, attached) = attachment.try_attach(trie, usize::MAX).unwrap();
+        assert!(attached);
+        (incumbent, accelerated)
+    }
+
+    fn wide_primary_guard_plans() -> (LiteralSetPlan, LiteralSetPlan) {
+        let primary = ['\u{1c}', '\u{1d}', '\u{1e}', '\u{1f}'];
+        let guard = [' '];
+        let classes = [
+            FoldedScalarClass::new(&primary),
+            FoldedScalarClass::new(&guard),
+        ];
+        let literals = [FoldedLiteral::new(&classes)];
+        let trie = match FoldedLiteralTriePlan::build(&literals, BuildLimits::default()).unwrap() {
+            BuildAttempt::Admitted(plan) => plan,
+            BuildAttempt::DenseFallback(fallback) => {
+                panic!("synthetic guarded wide-root trie declined: {fallback:?}")
+            }
+        };
+        assert_eq!(trie.build_accounting().root_prefilter_offset, Some(0));
+        assert_eq!(trie.build_accounting().root_prefilter_needles, 4);
+        assert_eq!(trie.build_accounting().root_prefilter_guard_offset, Some(1));
+        assert_eq!(trie.build_accounting().root_prefilter_guard_needles, 1);
+        assert!(
+            trie.build_accounting()
+                .root_prefilter_classifier_selection
+                .is_some()
+        );
+        let patterns = vec![
+            vec![0x1c, b' '],
+            vec![0x1d, b' '],
+            vec![0x1e, b' '],
+            vec![0x1f, b' '],
+        ];
+        let incumbent = LiteralSetPlan::new(&patterns, LiteralSetBuildLimits::default()).unwrap();
+        let attachment =
+            LiteralSetFoldAttachment::new(&patterns, LiteralSetBuildLimits::default()).unwrap();
+        let (accelerated, attached) = attachment.try_attach(trie, usize::MAX).unwrap();
+        assert!(attached);
+        (incumbent, accelerated)
+    }
+
+    fn wide_late_guard_plans() -> (LiteralSetPlan, LiteralSetPlan) {
+        let common = [' '];
+        let wide = ['\u{3}', '\u{4}', '\u{5}', '\u{6}'];
+        let mut classes = vec![FoldedScalarClass::new(&common); 32];
+        classes[31] = FoldedScalarClass::new(&wide);
+        let literals = [FoldedLiteral::new(&classes)];
+        let trie = match FoldedLiteralTriePlan::build(&literals, BuildLimits::default()).unwrap() {
+            BuildAttempt::Admitted(plan) => plan,
+            BuildAttempt::DenseFallback(fallback) => {
+                panic!("synthetic wide late-column trie declined: {fallback:?}")
+            }
+        };
+        let build = trie.build_accounting();
+        assert_eq!(build.root_prefilter_offset, Some(31));
+        assert_eq!(build.root_prefilter_needles, 4);
+        assert!(build.root_prefilter_classifier_selection.is_some());
+        assert_eq!(build.root_prefilter_guard_offset, Some(30));
+        assert_eq!(build.root_prefilter_guard_needles, 1);
+        let patterns = wide
+            .iter()
+            .map(|&last| {
+                let mut pattern = vec![b' '; 32];
+                pattern[31] = u8::try_from(last).unwrap();
+                pattern
+            })
+            .collect::<Vec<_>>();
+        let incumbent = LiteralSetPlan::new(&patterns, LiteralSetBuildLimits::default()).unwrap();
+        let attachment =
+            LiteralSetFoldAttachment::new(&patterns, LiteralSetBuildLimits::default()).unwrap();
+        let (accelerated, attached) = attachment.try_attach(trie, usize::MAX).unwrap();
+        assert!(attached);
+        (incumbent, accelerated)
+    }
+
     #[test]
     fn ordinary_and_sub_block_literal_sets_retain_incumbent_path_and_accounting() {
         let patterns = patterns();
@@ -1654,6 +1754,7 @@ mod folded_long_tail_tests {
             .unwrap();
         assert_eq!(root.outcome, RootCandidateOutcome::NoCandidate);
         folded_short_stage_probe::reset();
+        root_candidate_dispatch_probe::reset();
         let (actual, accounting) = accelerated
             .find(&haystack, LiteralSetSearchLimits::unlimited())
             .unwrap();
@@ -1664,6 +1765,7 @@ mod folded_long_tail_tests {
         assert!(accounting.transitions_upper_bound <= prospective.work);
         assert_eq!(folded_short_stage_probe::settled_scans(), 0);
         assert_eq!(folded_short_stage_probe::short_prospectives(), 1);
+        assert_eq!(root_candidate_dispatch_probe::dispatches(), 1);
         assert_eq!(expected.1.transitions_upper_bound, haystack.len() + 1);
     }
 
@@ -1685,6 +1787,38 @@ mod folded_long_tail_tests {
         assert!(matches!(
             tail.trie
                 .root_candidate_single_pass_upper_bounds(usize::MAX, tail.max_pattern_bytes),
+            Err(crate::folded_literal_trie::ScanError::ArithmeticOverflow { .. })
+        ));
+
+        let (_, guarded) = wide_primary_guard_plans();
+        let guarded_tail = guarded.folded_long_tail.as_deref().unwrap();
+        let guarded_build = guarded_tail.trie.build_accounting();
+        let required_width = guarded_build
+            .root_prefilter_offset
+            .unwrap()
+            .max(guarded_build.root_prefilter_guard_offset.unwrap())
+            + 1;
+        assert_eq!(required_width, guarded_tail.max_pattern_bytes);
+        let guarded_single = guarded_tail
+            .trie
+            .root_candidate_single_pass_upper_bounds(64, required_width)
+            .unwrap();
+        assert_eq!(guarded_single.source_byte_reads, 2 * guarded_single.input_bytes);
+        assert_eq!(
+            guarded_single.work,
+            guarded_single.candidate_starts + guarded_single.source_byte_reads
+        );
+        assert!(matches!(
+            guarded_tail
+                .trie
+                .root_candidate_single_pass_upper_bounds(64, required_width - 1),
+            Err(crate::folded_literal_trie::ScanError::Invariant { .. })
+        ));
+        assert!(matches!(
+            guarded_tail.trie.root_candidate_single_pass_upper_bounds(
+                usize::MAX,
+                required_width,
+            ),
             Err(crate::folded_literal_trie::ScanError::ArithmeticOverflow { .. })
         ));
     }
@@ -2016,6 +2150,126 @@ mod folded_long_tail_tests {
     }
 
     #[test]
+    fn short_mixed_width_preserves_shorter_boundary_matches() {
+        let (incumbent, accelerated) = mixed_width_plans(BYTE_BUCKET_BLOCK_BYTES);
+        let tail = accelerated.folded_long_tail.as_deref().unwrap();
+        assert_eq!(tail.max_pattern_bytes, BYTE_BUCKET_BLOCK_BYTES);
+        let input_bytes = folded_short_minimum_bytes(tail).unwrap();
+        let window = Window::new(0, input_bytes);
+        let prospective = folded_short_root_prospective(tail, window, usize::MAX).unwrap();
+
+        for (candidate_start, expected_settled_scans) in [
+            (tail.max_pattern_bytes - 1, 0),
+            (tail.max_pattern_bytes, 1),
+        ] {
+            let mut haystack = vec![b'!'; input_bytes];
+            haystack[candidate_start] = b'x';
+            folded_short_stage_probe::reset();
+            root_candidate_dispatch_probe::reset();
+            let actual = accelerated
+                .find_window(
+                    &haystack,
+                    window,
+                    LiteralSetSearchLimits {
+                        max_transitions: prospective.work,
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                actual.0,
+                incumbent
+                    .find_window(&haystack, window, LiteralSetSearchLimits::unlimited())
+                    .unwrap()
+                    .0
+            );
+            assert_eq!(actual.0, Some((candidate_start, candidate_start + 1)));
+            assert!(actual.1.transitions_upper_bound <= prospective.work);
+            assert_eq!(
+                folded_short_stage_probe::settled_scans(),
+                expected_settled_scans
+            );
+            assert_eq!(root_candidate_dispatch_probe::dispatches(), 1);
+        }
+
+        let candidate_start = tail.max_pattern_bytes;
+        let block_end = candidate_start + BYTE_BUCKET_BLOCK_BYTES;
+        let mut haystack = vec![b'!'; input_bytes];
+        haystack[candidate_start..candidate_start + tail.max_pattern_bytes].fill(b'e');
+        haystack[block_end] = b'x';
+        folded_short_stage_probe::reset();
+        root_candidate_dispatch_probe::reset();
+        let actual = accelerated
+            .find_window(
+                &haystack,
+                window,
+                LiteralSetSearchLimits {
+                    max_transitions: prospective.work,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            actual.0,
+            incumbent
+                .find_window(&haystack, window, LiteralSetSearchLimits::unlimited())
+                .unwrap()
+                .0
+        );
+        assert_eq!(actual.0, Some((block_end, block_end + 1)));
+        assert!(actual.1.transitions_upper_bound <= prospective.work);
+        assert_eq!(folded_short_stage_probe::settled_scans(), 1);
+        assert_eq!(root_candidate_dispatch_probe::dispatches(), 1);
+    }
+
+    #[test]
+    fn short_guard_rejection_dense_fallback_resumes_after_the_proved_start() {
+        let (incumbent, accelerated) = wide_primary_guard_plans();
+        let tail = accelerated.folded_long_tail.as_deref().unwrap();
+        let input_bytes = folded_short_minimum_bytes(tail).unwrap();
+        let window = Window::new(0, input_bytes);
+        let prospective = folded_short_root_prospective(tail, window, usize::MAX).unwrap();
+        let resume_start = 2;
+        let real_start = BYTE_BUCKET_BLOCK_BYTES * 2;
+        let mut haystack = vec![0x1c; input_bytes];
+        haystack[real_start..real_start + 2].copy_from_slice(&[0x1c, b' ']);
+        let root = tail
+            .trie
+            .find_root_candidate_precharged(&haystack, window, prospective.trie)
+            .unwrap();
+        assert_eq!(
+            root.outcome,
+            RootCandidateOutcome::DenseFallback { resume_start }
+        );
+
+        folded_short_stage_probe::reset();
+        root_candidate_dispatch_probe::reset();
+        let actual = accelerated
+            .find_window(
+                &haystack,
+                window,
+                LiteralSetSearchLimits {
+                    max_transitions: prospective.work,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            actual.0,
+            incumbent
+                .find_window(&haystack, window, LiteralSetSearchLimits::unlimited())
+                .unwrap()
+                .0
+        );
+        assert_eq!(actual.0, Some((real_start, real_start + 2)));
+        assert_eq!(
+            actual.1.transitions_upper_bound,
+            root.receipt.actual.work + window.end() - resume_start + 1
+        );
+        assert!(actual.1.transitions_upper_bound <= prospective.work);
+        assert_eq!(folded_short_stage_probe::settled_scans(), 0);
+        assert_eq!(folded_short_stage_probe::short_prospectives(), 1);
+        assert_eq!(root_candidate_dispatch_probe::dispatches(), 1);
+    }
+
+    #[test]
     fn short_root_gate_limit_is_decided_before_source_dispatch() {
         let (incumbent, accelerated) = three_column_plans();
         let tail = accelerated.folded_long_tail.as_deref().unwrap();
@@ -2114,6 +2368,84 @@ mod folded_long_tail_tests {
                 .0,
             Some((1, 4))
         );
+        haystack.fill(b'!');
+        let late_start = tail.max_pattern_bytes;
+        haystack[late_start..late_start + 3].copy_from_slice(b"abc");
+        folded_short_stage_probe::reset();
+        root_candidate_dispatch_probe::reset();
+        assert_eq!(
+            accelerated
+                .find(&haystack, LiteralSetSearchLimits::unlimited())
+                .unwrap()
+                .0,
+            Some((late_start, late_start + 3))
+        );
+        assert_eq!(folded_short_stage_probe::settled_scans(), 1);
+        assert_eq!(root_candidate_dispatch_probe::dispatches(), 1);
+    }
+
+    #[test]
+    fn long_wide_late_guard_restarts_cover_every_window_residue() {
+        let (incumbent, accelerated) = wide_late_guard_plans();
+        let tail = accelerated.folded_long_tail.as_deref().unwrap();
+        let mut exact = vec![b' '; 32];
+        exact[31] = 3;
+        let mut rejected = exact.clone();
+        rejected[1] = b'x';
+        let input_bytes = tail.dfa_prefix_bytes + 256;
+        assert!(input_bytes > tail.dfa_prefix_bytes);
+
+        for frame in 0..BYTE_BUCKET_BLOCK_BYTES {
+            let window = Window::new(frame, frame + input_bytes);
+            let head = folded_long_head(tail, window).unwrap();
+            let prospective = folded_long_prospective(tail, window, usize::MAX).unwrap();
+            let continuation = head.continuation.start();
+            let relative_candidates = [33, 82, 131, 180];
+            let mut haystack = vec![b'!'; window.end() + BYTE_BUCKET_BLOCK_BYTES];
+            for relative_start in &relative_candidates[..3] {
+                let start = continuation + relative_start;
+                haystack[start..start + rejected.len()].copy_from_slice(&rejected);
+            }
+            let real_start = continuation + relative_candidates[3];
+            haystack[real_start..real_start + exact.len()].copy_from_slice(&exact);
+
+            let mut root_start = continuation;
+            let mut root_source_reads = 0;
+            for relative_start in relative_candidates {
+                let expected_start = continuation + relative_start;
+                let root = tail
+                    .trie
+                    .find_root_candidate_precharged(
+                        &haystack,
+                        Window::new(root_start, window.end()),
+                        prospective.trie,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    root.outcome,
+                    RootCandidateOutcome::Candidate {
+                        start: expected_start,
+                    },
+                    "frame={frame}"
+                );
+                root_source_reads += root.receipt.actual.source_byte_reads;
+                root_start = expected_start + BYTE_BUCKET_BLOCK_BYTES;
+            }
+            assert!(root_source_reads <= prospective.trie.source_byte_reads);
+
+            root_candidate_dispatch_probe::reset();
+            let expected = incumbent
+                .find_window(&haystack, window, LiteralSetSearchLimits::unlimited())
+                .unwrap()
+                .0;
+            let (actual, accounting) = accelerated
+                .find_window(&haystack, window, LiteralSetSearchLimits::unlimited())
+                .unwrap();
+            assert_eq!(actual, expected, "frame={frame}");
+            assert_eq!(actual, Some((real_start, real_start + exact.len())));
+            assert!(accounting.transitions_upper_bound <= prospective.work);
+            assert_eq!(root_candidate_dispatch_probe::dispatches(), 4);
+        }
     }
 
     #[test]

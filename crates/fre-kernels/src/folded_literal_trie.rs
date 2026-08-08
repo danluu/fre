@@ -1202,6 +1202,8 @@ impl FoldedLiteralTriePlan {
             });
         }
 
+        #[cfg(test)]
+        root_candidate_dispatch_probe::record();
         scan_source_probe::record();
         let source = &haystack[window.start()..window.end()];
         let (outcome, mut actual) =
@@ -3104,6 +3106,32 @@ mod build_probe {
 #[cfg(not(test))]
 mod scan_source_probe {
     pub(super) const fn record() {}
+}
+
+#[cfg(test)]
+pub(crate) mod root_candidate_dispatch_probe {
+    use std::cell::Cell;
+
+    std::thread_local! {
+        static DISPATCHES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn record() {
+        DISPATCHES.set(
+            DISPATCHES
+                .get()
+                .checked_add(1)
+                .expect("folded root-candidate dispatch probe overflow"),
+        );
+    }
+
+    pub(crate) fn reset() {
+        DISPATCHES.set(0);
+    }
+
+    pub(crate) fn dispatches() -> usize {
+        DISPATCHES.get()
+    }
 }
 
 #[cfg(test)]
