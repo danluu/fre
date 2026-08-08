@@ -32538,15 +32538,18 @@ mod tests {
                if(ns!=bs||nr.start!=br.start||nr.end!=br.end)return base+1;\
                if(read_u64(native)!=ACTIVE_SEAL)return base+4;\
                nr.start=95U;nr.end=96U;br.start=97U;br.end=98U;\
-               ns=fre_aot_regex_runtime_search_exclusive_v1(native,p,sizeof(matching),s,e,&nr);\
+               ns={entry}(native,p,sizeof(matching),s,e,&nr);\
                bs=fre_aot_regex_runtime_search_exclusive_v1(baseline,p,sizeof(matching),s,e,&br);\
                if(ns!=bs||nr.start!=br.start||nr.end!=br.end)return base+2;\
                if(read_u64(native)!=ACTIVE_SEAL)return base+5;\
                nr.start=99U;nr.end=100U;br.start=101U;br.end=102U;\
-               ns={entry}(native,p,sizeof(matching),s,e,&nr);\
+               ns=fre_aot_regex_runtime_search_exclusive_v1(native,p,sizeof(matching),s,e,&nr);\
                bs=fre_aot_regex_runtime_search_exclusive_v1(baseline,p,sizeof(matching),s,e,&br);\
                if(ns!=bs||nr.start!=br.start||nr.end!=br.end)return base+3;\
-               if(read_u64(native)!=ACTIVE_SEAL)return base+6;\
+               nr.start=103U;nr.end=104U;br.start=105U;br.end=106U;\
+               ns={entry}(native,p,sizeof(matching),s,e,&nr);\
+               bs=fre_aot_regex_runtime_search_exclusive_v1(baseline,p,sizeof(matching),s,e,&br);\
+               if(ns!=bs||nr.start!=br.start||nr.end!=br.end)return base+6;\
                if(!destroy(native)||!destroy(baseline))return base+7;return 0;}}\n\
              int main(void){{memset(matching,'a',sizeof(matching));memset(absent,'a',sizeof(absent));\
                matching[sizeof(matching)-1U]='Q';absent[sizeof(absent)-1U]='R';\
