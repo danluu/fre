@@ -12981,8 +12981,9 @@ fn lower_x86_64_slow_partial_wrapper(
 /// Production exclusive handles use an active-capability mode: construction
 /// fully validates the private immutable owner before publishing both seals,
 /// and every route that can mutate capability-owned state clears the active
-/// seal first. Reverse-only variable-Span postflight mutates only the disjoint
-/// live K0 workspace and therefore retains the owner on success.
+/// seal first. Reverse-only variable-Span postflight reads only the separately
+/// authenticated live reverse projection (and fallback mutates disjoint K0
+/// scratch), so it retains the immutable owner on success.
 /// Fixed-width SIMD modes preserve that proof while comparing the exact
 /// artifact identity with one branch. Portable AArch64 targets retain the
 /// scalar capability because ASIMD is an explicit target feature in this
@@ -12999,8 +13000,27 @@ enum FrozenCompactGuardMode {
     ActiveCapability,
     ActiveCapabilitySimdIdentity,
     FullVerifier,
+    FullVerifierVariableSpan(u16),
 }
 
+impl FrozenCompactGuardMode {
+    const fn is_full_verifier(self) -> bool {
+        matches!(self, Self::FullVerifier | Self::FullVerifierVariableSpan(_))
+    }
+
+    const fn variable_span_source_class_count(self) -> Option<u16> {
+        match self {
+            Self::FullVerifierVariableSpan(source_class_count) => Some(source_class_count),
+            Self::ActiveCapability
+            | Self::ActiveCapabilitySimdIdentity
+            | Self::FullVerifier => None,
+        }
+    }
+
+    const fn uses_simd_identity(self) -> bool {
+        matches!(self, Self::ActiveCapabilitySimdIdentity)
+    }
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FrozenCompactNativeFormat {
     StateOrdinalV3,
@@ -13261,6 +13281,14 @@ fn x86_emit_frozen_compact_entry(
     let tail_disp = |offset: usize, context| {
         u8::try_from(offset).map_err(|_| ObjectError::ArithmeticOverflow(context))
     };
+    if guard_mode
+        .variable_span_source_class_count()
+        .is_some_and(|count| !(1..=256).contains(&count))
+    {
+        return Err(ObjectError::InvalidModule(
+            "x86 compact reverse verifier has an invalid source class count",
+        ));
+    }
 
     // Select the overlapping tail exclusively through its distinct V1 flag.
     // A different-generation header reaches the older validator without
@@ -13277,7 +13305,7 @@ fn x86_emit_frozen_compact_entry(
     // Every live exclusive handle owns the maximum V6 envelope. The active
     // seal authenticates its immutable setup proof; only the audit path needs
     // to re-read the smaller format's logical extent and descriptor mirrors.
-    if guard_mode == FrozenCompactGuardMode::FullVerifier {
+    if guard_mode.is_full_verifier() {
         let mut compare_extent = vec![
             0x48,
             0x81,
@@ -13301,7 +13329,7 @@ fn x86_emit_frozen_compact_entry(
     assembler.instruction(&load_seal)?;
     assembler.instruction(&[0x4c, 0x3b, 0x17])?;
     branch_failed(assembler)?;
-    if guard_mode == FrozenCompactGuardMode::FullVerifier {
+    if guard_mode.is_full_verifier() {
         let mut load_magic = vec![0x49, 0xba];
         load_magic.extend_from_slice(&FROZEN_PREPARED_HEADER_V1_MAGIC.to_le_bytes());
         assembler.instruction(&load_magic)?;
@@ -13331,7 +13359,7 @@ fn x86_emit_frozen_compact_entry(
     // exact 256-bit result. The linked identity address is already
     // frame-resident, so the mask may consume EAX without weakening later
     // preflight or table setup.
-    if guard_mode == FrozenCompactGuardMode::ActiveCapabilitySimdIdentity {
+    if guard_mode.uses_simd_identity() {
         let first_header = header_disp(
             FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET,
             "x86 compact SSE2 identity offset",
@@ -13382,7 +13410,93 @@ fn x86_emit_frozen_compact_entry(
         }
     }
 
-    if guard_mode == FrozenCompactGuardMode::FullVerifier {
+    if let Some(source_class_count) = guard_mode.variable_span_source_class_count() {
+        let source_class_count_u32 = u32::from(source_class_count);
+        let reverse_failed = assembler.label()?;
+        let reverse_valid = assembler.label()?;
+
+        // Preserve the SysV window arguments while DIV consumes RDX:RCX.
+        // This path exists only for the independent audit verifier; active
+        // prepared handles use their setup-authenticated capability instead.
+        assembler.instruction(&[0x52])?; // push rdx
+        assembler.instruction(&[0x51])?; // push rcx
+        assembler.instruction(&[
+            0x4c,
+            0x8b,
+            0x57,
+            header_disp(
+                FROZEN_PREPARED_HEADER_V1_REVERSE_ROWS_ADDRESS_OFFSET,
+                "x86 V3 reverse rows",
+            )?,
+        ])?;
+        assembler.instruction(&[0x4d, 0x85, 0xd2])?;
+        assembler.branch(&[0x0f, 0x84], reverse_failed)?;
+        assembler.instruction(&[0x41, 0xf6, 0xc2, 0x03])?;
+        assembler.branch(&[0x0f, 0x85], reverse_failed)?;
+
+        assembler.instruction(&[
+            0x4c,
+            0x8b,
+            0x57,
+            header_disp(
+                FROZEN_PREPARED_HEADER_V1_REVERSE_LIVE_CELLS_OFFSET,
+                "x86 V3 reverse live cells",
+            )?,
+        ])?;
+        let mut compare_minimum = vec![0x49, 0x81, 0xfa];
+        compare_minimum.extend_from_slice(&source_class_count_u32.to_le_bytes());
+        assembler.instruction(&compare_minimum)?;
+        assembler.branch(&[0x0f, 0x82], reverse_failed)?;
+        let mut compare_maximum = vec![0x49, 0x81, 0xfa];
+        compare_maximum
+            .extend_from_slice(&DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK.to_le_bytes());
+        assembler.instruction(&compare_maximum)?;
+        assembler.branch(&[0x0f, 0x87], reverse_failed)?;
+
+        // Exact divisibility by the original, pre-coalescing K0 stride.
+        assembler.instruction(&[0x4c, 0x89, 0xd0])?;
+        assembler.instruction(&[0x31, 0xd2])?;
+        let mut load_stride = vec![0xb9];
+        load_stride.extend_from_slice(&source_class_count_u32.to_le_bytes());
+        assembler.instruction(&load_stride)?;
+        assembler.instruction(&[0x48, 0xf7, 0xf1])?;
+        assembler.instruction(&[0x48, 0x85, 0xd2])?;
+        assembler.branch(&[0x0f, 0x85], reverse_failed)?;
+
+        assembler.instruction(&[
+            0x44,
+            0x8b,
+            0x5f,
+            header_disp(
+                FROZEN_PREPARED_HEADER_V1_REVERSE_INITIAL_ROW_OFFSET,
+                "x86 V3 reverse initial row",
+            )?,
+        ])?;
+        let mut compare_no_reverse = vec![0x41, 0x81, 0xfb];
+        compare_no_reverse
+            .extend_from_slice(&FROZEN_PREPARED_HEADER_V1_NO_REVERSE_ROW.to_le_bytes());
+        assembler.instruction(&compare_no_reverse)?;
+        assembler.branch(&[0x0f, 0x84], reverse_failed)?;
+        assembler.instruction(&[0x44, 0x89, 0xd8])?;
+        assembler.instruction(&[0x31, 0xd2])?;
+        assembler.instruction(&[0x48, 0xf7, 0xf1])?;
+        assembler.instruction(&[0x48, 0x85, 0xd2])?;
+        assembler.branch(&[0x0f, 0x85], reverse_failed)?;
+        let mut add_stride = vec![0x49, 0x81, 0xc3];
+        add_stride.extend_from_slice(&source_class_count_u32.to_le_bytes());
+        assembler.instruction(&add_stride)?;
+        assembler.instruction(&[0x4d, 0x39, 0xd3])?;
+        assembler.branch(&[0x0f, 0x87], reverse_failed)?;
+
+        assembler.instruction(&[0x59])?; // pop rcx
+        assembler.instruction(&[0x5a])?; // pop rdx
+        assembler.branch(&[0xe9], reverse_valid)?;
+        assembler.bind(reverse_failed)?;
+        assembler.instruction(&[0x59])?;
+        assembler.instruction(&[0x5a])?;
+        assembler.branch(&[0xe9], call_preflight)?;
+        assembler.bind(reverse_valid)?;
+    } else if guard_mode.is_full_verifier() {
         for (field, context) in [
             (
                 FROZEN_PREPARED_HEADER_V1_REVERSE_ROWS_ADDRESS_OFFSET,
@@ -13416,7 +13530,7 @@ fn x86_emit_frozen_compact_entry(
     tail_address.extend_from_slice(&tail_offset.to_le_bytes());
     assembler.instruction(&tail_address)?;
 
-    if guard_mode == FrozenCompactGuardMode::FullVerifier {
+    if guard_mode.is_full_verifier() {
         let mut load_ready = vec![0x49, 0xba];
         load_ready.extend_from_slice(&format.ready_seal().to_le_bytes());
         assembler.instruction(&load_ready)?;
@@ -13444,7 +13558,7 @@ fn x86_emit_frozen_compact_entry(
         branch_failed(assembler)?;
     }
 
-    if guard_mode == FrozenCompactGuardMode::FullVerifier {
+    if guard_mode.is_full_verifier() {
         // These mirrors, pointer constraints, and the complete geometry below
         // were proved when the private owner was built. Production entries may
         // rely on the still-active capability; the full verifier remains an
@@ -13502,7 +13616,7 @@ fn x86_emit_frozen_compact_entry(
         }
     }
 
-    if guard_mode == FrozenCompactGuardMode::FullVerifier {
+    if guard_mode.is_full_verifier() {
         assembler.instruction(&[
             0x4d,
             0x8b,
@@ -13516,7 +13630,7 @@ fn x86_emit_frozen_compact_entry(
         assembler.branch(&[0x0f, 0x84], call_preflight)?;
     }
 
-    if guard_mode == FrozenCompactGuardMode::FullVerifier {
+    if guard_mode.is_full_verifier() {
         assembler.instruction(&[
             0x41,
             0x8b,
@@ -13808,7 +13922,7 @@ fn x86_emit_frozen_compact_entry(
         }
     }
 
-    if guard_mode == FrozenCompactGuardMode::FullVerifier {
+    if guard_mode.is_full_verifier() {
         // Compact non-loop formats, including V11/V13/V14 supertransitions,
         // normalize complete immutable rows by suppressing mutable-K0
         // learned-loop ownership. The full verifier authenticates that
@@ -13922,7 +14036,7 @@ fn x86_emit_frozen_compact_entry(
     // Preserve the standalone full verifier byte contract. Production
     // lowering saves these public bounds once before its selector lattice,
     // avoiding the historical four-instruction copy in every format guard.
-    if guard_mode == FrozenCompactGuardMode::FullVerifier {
+    if guard_mode.is_full_verifier() {
         assembler.instruction(&[0x4c, 0x8b, 0x54, 0x24, 0x28])?;
         assembler.instruction(&[0x4c, 0x89, 0x54, 0x24, 0x40])?;
         assembler.instruction(&[0x4c, 0x8b, 0x54, 0x24, 0x30])?;
@@ -23615,6 +23729,14 @@ fn aarch64_emit_frozen_compact_entry(
     let offset = |value: usize, context| {
         u16::try_from(value).map_err(|_| ObjectError::ArithmeticOverflow(context))
     };
+    if guard_mode
+        .variable_span_source_class_count()
+        .is_some_and(|count| !(1..=256).contains(&count))
+    {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 compact reverse verifier has an invalid source class count",
+        ));
+    }
 
     // The tail layouts overlap, so select the format solely through its
     // distinct V1 flag. Other generations branch to the older validator
@@ -23635,7 +23757,7 @@ fn aarch64_emit_frozen_compact_entry(
     // Every live exclusive handle owns the maximum V6 envelope. The active
     // seal authenticates its immutable setup proof; only the audit path needs
     // to re-read the smaller format's logical extent and descriptor mirrors.
-    if guard_mode == FrozenCompactGuardMode::FullVerifier {
+    if guard_mode.is_full_verifier() {
         assembler.instruction(aarch64_load_x_imm(
             8,
             0,
@@ -23666,7 +23788,7 @@ fn aarch64_emit_frozen_compact_entry(
     assembler.instruction(aarch64_cmp_x(8, 9)?)?;
     assembler.branch_cond(AARCH64_NE, call_preflight)?;
 
-    if guard_mode == FrozenCompactGuardMode::FullVerifier {
+    if guard_mode.is_full_verifier() {
         assembler.instruction(aarch64_load_x_imm(
             8,
             0,
@@ -23693,7 +23815,7 @@ fn aarch64_emit_frozen_compact_entry(
     // targets. An explicitly ASIMD-capable target loads both unaligned halves,
     // OR-reduces their exact bytewise XOR, and branches once. V16..V19 are
     // caller-saved and no scanner constants are live at this entry.
-    if guard_mode == FrozenCompactGuardMode::ActiveCapabilitySimdIdentity {
+    if guard_mode.uses_simd_identity() {
         let header = offset(
             FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET,
             "AArch64 compact SIMD identity offset",
@@ -23733,7 +23855,63 @@ fn aarch64_emit_frozen_compact_entry(
         }
     }
 
-    if guard_mode == FrozenCompactGuardMode::FullVerifier {
+    if let Some(source_class_count) = guard_mode.variable_span_source_class_count() {
+        assembler.instruction(aarch64_load_x_imm(
+            8,
+            0,
+            offset(
+                FROZEN_PREPARED_HEADER_V1_REVERSE_ROWS_ADDRESS_OFFSET,
+                "AArch64 V3 reverse rows",
+            )?,
+        )?)?;
+        assembler.instruction(aarch64_cmp_x_imm(8, 0)?)?;
+        assembler.branch_cond(AARCH64_EQ, call_preflight)?;
+        assembler.instruction(aarch64_and_low_x(9, 8, 2)?)?;
+        assembler.instruction(aarch64_cmp_x_imm(9, 0)?)?;
+        assembler.branch_cond(AARCH64_NE, call_preflight)?;
+
+        assembler.instruction(aarch64_load_x_imm(
+            8,
+            0,
+            offset(
+                FROZEN_PREPARED_HEADER_V1_REVERSE_LIVE_CELLS_OFFSET,
+                "AArch64 V3 reverse live cells",
+            )?,
+        )?)?;
+        assembler.instruction(aarch64_cmp_x_imm(8, source_class_count)?)?;
+        assembler.branch_cond(AARCH64_LO, call_preflight)?;
+        aarch64_load_u64_constant(
+            assembler,
+            9,
+            u64::from(DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK),
+        )?;
+        assembler.instruction(aarch64_cmp_x(8, 9)?)?;
+        assembler.branch_cond(AARCH64_HI, call_preflight)?;
+        assembler.instruction(aarch64_movz_x(10, source_class_count, 0)?)?;
+        assembler.instruction(aarch64_udiv_x(9, 8, 10)?)?;
+        assembler.instruction(aarch64_msub_x(9, 9, 10, 8)?)?;
+        assembler.instruction(aarch64_cmp_x_imm(9, 0)?)?;
+        assembler.branch_cond(AARCH64_NE, call_preflight)?;
+
+        assembler.instruction(aarch64_load_w_imm(
+            11,
+            0,
+            offset(
+                FROZEN_PREPARED_HEADER_V1_REVERSE_INITIAL_ROW_OFFSET,
+                "AArch64 V3 reverse initial row",
+            )?,
+        )?)?;
+        aarch64_load_u32_constant(assembler, 9, FROZEN_PREPARED_HEADER_V1_NO_REVERSE_ROW)?;
+        assembler.instruction(aarch64_cmp_w(11, 9)?)?;
+        assembler.branch_cond(AARCH64_EQ, call_preflight)?;
+        assembler.instruction(aarch64_udiv_x(9, 11, 10)?)?;
+        assembler.instruction(aarch64_msub_x(9, 9, 10, 11)?)?;
+        assembler.instruction(aarch64_cmp_x_imm(9, 0)?)?;
+        assembler.branch_cond(AARCH64_NE, call_preflight)?;
+        assembler.instruction(aarch64_add_x_reg(11, 11, 10)?)?;
+        assembler.instruction(aarch64_cmp_x(11, 8)?)?;
+        assembler.branch_cond(AARCH64_HI, call_preflight)?;
+    } else if guard_mode.is_full_verifier() {
         for (field, context) in [
             (
                 FROZEN_PREPARED_HEADER_V1_REVERSE_ROWS_ADDRESS_OFFSET,
@@ -23769,7 +23947,7 @@ fn aarch64_emit_frozen_compact_entry(
             "AArch64 compact tail offset",
         )?,
     )?)?;
-    if guard_mode == FrozenCompactGuardMode::FullVerifier {
+    if guard_mode.is_full_verifier() {
         assembler.instruction(aarch64_load_x_imm(
             8,
             13,
@@ -23794,7 +23972,7 @@ fn aarch64_emit_frozen_compact_entry(
         assembler.branch_cond(AARCH64_NE, call_preflight)?;
     }
 
-    if guard_mode == FrozenCompactGuardMode::FullVerifier {
+    if guard_mode.is_full_verifier() {
         // The active capability covers these setup-validated immutable
         // mirrors, pointer constraints, and the complete geometry below.
         // Retain this mode as an independently emitted full verifier.
@@ -23849,7 +24027,7 @@ fn aarch64_emit_frozen_compact_entry(
         }
     }
 
-    if guard_mode == FrozenCompactGuardMode::FullVerifier {
+    if guard_mode.is_full_verifier() {
         assembler.instruction(aarch64_load_x_imm(
             8,
             13,
@@ -23862,7 +24040,7 @@ fn aarch64_emit_frozen_compact_entry(
         assembler.branch_cond(AARCH64_EQ, call_preflight)?;
     }
 
-    if guard_mode == FrozenCompactGuardMode::FullVerifier {
+    if guard_mode.is_full_verifier() {
         assembler.instruction(aarch64_load_w_imm(
             10,
             13,
@@ -24112,7 +24290,7 @@ fn aarch64_emit_frozen_compact_entry(
         }
     }
 
-    if guard_mode == FrozenCompactGuardMode::FullVerifier {
+    if guard_mode.is_full_verifier() {
         // Compact non-loop formats normalize complete immutable rows by
         // suppressing mutable learned-loop ownership. The full verifier
         // authenticates that normalization independently of the capability.
@@ -24211,7 +24389,7 @@ fn aarch64_emit_frozen_compact_entry(
 
     // Preserve the standalone full verifier instruction contract. Production
     // lowering saves the bounds once before selecting a compact format.
-    if guard_mode == FrozenCompactGuardMode::FullVerifier {
+    if guard_mode.is_full_verifier() {
         assembler.instruction(aarch64_load_x_imm(8, 31, 24)?)?;
         assembler.instruction(aarch64_store_x(8, 31, 48)?)?;
         assembler.instruction(aarch64_load_x_imm(8, 31, 32)?)?;
@@ -45932,6 +46110,115 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                     .filter(|words| *words == flag_selector)
                     .count(),
                 1
+            );
+        }
+    }
+
+    #[test]
+    fn compact_variable_span_full_verifier_checks_reverse_geometry_cross_isa() {
+        let source_class_count = 7_u16;
+        let mut x86 = X86Assembler::new();
+        let x86_try_older = x86.label().unwrap();
+        let x86_preflight = x86.label().unwrap();
+        let x86_enter = x86.label().unwrap();
+        x86_emit_frozen_compact_entry(
+            &mut x86,
+            FrozenCompactNativeFormat::CellOffsetV4,
+            x86_try_older,
+            x86_preflight,
+            x86_enter,
+            FrozenCompactGuardMode::FullVerifierVariableSpan(source_class_count),
+        )
+        .unwrap();
+        for label in [x86_try_older, x86_preflight, x86_enter] {
+            x86.bind(label).unwrap();
+            x86.instruction(&[0xc3]).unwrap();
+        }
+        let x86 = x86.finish().unwrap();
+        assert_eq!(
+            x86.windows(3)
+                .filter(|bytes| *bytes == [0x48, 0xf7, 0xf1])
+                .count(),
+            2,
+            "live extent and initial row require exact source-stride remainders"
+        );
+        assert!(x86.windows(4).any(|bytes| {
+            bytes
+                == [
+                    0x4c,
+                    0x8b,
+                    0x57,
+                    u8::try_from(FROZEN_PREPARED_HEADER_V1_REVERSE_ROWS_ADDRESS_OFFSET)
+                        .unwrap(),
+                ]
+        }));
+        assert!(x86.windows(4).any(|bytes| bytes == [0x41, 0xf6, 0xc2, 0x03]));
+
+        let mut arm = Aarch64Assembler::new();
+        let arm_try_older = arm.label().unwrap();
+        let arm_preflight = arm.label().unwrap();
+        let arm_enter = arm.label().unwrap();
+        aarch64_emit_frozen_compact_entry(
+            &mut arm,
+            FrozenCompactNativeFormat::CellOffsetV4,
+            arm_try_older,
+            arm_preflight,
+            arm_enter,
+            FrozenCompactGuardMode::FullVerifierVariableSpan(source_class_count),
+        )
+        .unwrap();
+        for label in [arm_try_older, arm_preflight, arm_enter] {
+            arm.bind(label).unwrap();
+            arm.instruction(0xd503_201f).unwrap();
+        }
+        let arm = arm
+            .finish()
+            .unwrap()
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(arm.contains(&aarch64_udiv_x(9, 8, 10).unwrap()));
+        assert!(arm.contains(&aarch64_msub_x(9, 9, 10, 8).unwrap()));
+        assert!(arm.contains(&aarch64_udiv_x(9, 11, 10).unwrap()));
+        assert!(arm.contains(&aarch64_msub_x(9, 9, 10, 11).unwrap()));
+        assert!(arm.contains(&aarch64_and_low_x(9, 8, 2).unwrap()));
+
+        for invalid in [0_u16, 257] {
+            let mut x86 = X86Assembler::new();
+            let labels = [
+                x86.label().unwrap(),
+                x86.label().unwrap(),
+                x86.label().unwrap(),
+            ];
+            assert!(x86_emit_frozen_compact_entry(
+                &mut x86,
+                FrozenCompactNativeFormat::CellOffsetV4,
+                labels[0],
+                labels[1],
+                labels[2],
+                FrozenCompactGuardMode::FullVerifierVariableSpan(invalid),
+            )
+            .is_err());
+            assert!(x86.code.is_empty(), "invalid x86 geometry is transactional");
+
+            let mut arm = Aarch64Assembler::new();
+            let labels = [
+                arm.label().unwrap(),
+                arm.label().unwrap(),
+                arm.label().unwrap(),
+            ];
+            assert!(aarch64_emit_frozen_compact_entry(
+                &mut arm,
+                FrozenCompactNativeFormat::CellOffsetV4,
+                labels[0],
+                labels[1],
+                labels[2],
+                FrozenCompactGuardMode::FullVerifierVariableSpan(invalid),
+            )
+            .is_err());
+            assert!(
+                arm.code.is_empty(),
+                "invalid AArch64 geometry is transactional"
             );
         }
     }
