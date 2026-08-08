@@ -4137,9 +4137,9 @@ pub struct PortableFindIterAccounting {
     /// another search.
     pub suppressed_empty: usize,
     /// Sum of charged work or conservative linear terms from successful
-    /// contextual searches and UTF-8 empty-match progress. Native monotone
-    /// continuations may prepay one complete linear source envelope and then
-    /// contribute zero for covered non-overlapping restarts.
+    /// contextual searches and UTF-8 empty-match progress. Specialized
+    /// monotone continuations may prepay one complete linear source envelope
+    /// and then contribute zero for covered non-overlapping restarts.
     pub work_or_linear_terms: u64,
     /// Exact byte classifications performed while advancing a text iterator
     /// to the next UTF-8 scalar boundary after a repeated empty match.
@@ -16165,7 +16165,32 @@ impl<'r> PortableSearchSession<'r> {
             PortableSearchSessionPlan::Native(regex) => {
                 regex.find_iter_at(source.haystack(), start, limits)
             }
-            PortableSearchSessionPlan::K0 { session, .. } => {
+            PortableSearchSessionPlan::K0 {
+                session,
+                k0_plan,
+                reverse_inner,
+                mandatory_suffix,
+                mandatory_cut,
+                negative_prefilter,
+                ..
+            } => {
+                if k0_plan.correlated_terminal().is_some() {
+                    let sidecars_absent = reverse_inner.is_none()
+                        && mandatory_suffix.is_none()
+                        && mandatory_cut.is_none()
+                        && negative_prefilter.is_none()
+                        && k0_plan.absolute_end_proof.is_none();
+                    if let Some(prepared) = prepare_k0_correlated_iter_at(
+                        session,
+                        k0_plan,
+                        sidecars_absent,
+                        source,
+                        start,
+                        limits,
+                    ) {
+                        return prepared.map(|prepared| prepared.commit(source));
+                    }
+                }
                 let report = session.search_span_at_source_cursor(source, start, limits)?;
                 let work = report.accounting().work();
                 let matched = report.into_output().map(|span| Match {
@@ -16277,6 +16302,125 @@ impl PortableNativeSearchCursor<'_, '_> {
     ) -> Result<Option<Match>, SearchError> {
         self.find_at(start, limits).map(|(matched, _work)| matched)
     }
+}
+
+// One term for the forward terminal stream, one for the disjoint reverse
+// class runs, at most two sixteen-byte literal comparisons per terminal, and
+// the remaining branch lookup/progress arithmetic all fit below this linear
+// envelope. Exact-delimited admission makes terminal-separated regions
+// disjoint across both one search and monotone iterator continuations.
+const K0_CORRELATED_ITER_LINEAR_TERMS_PER_BYTE: u64 = 64;
+const K0_CORRELATED_ITER_LINEAR_BASE_TERMS: u64 = 1;
+
+fn k0_correlated_iter_linear_work(window_bytes: usize) -> Option<u64> {
+    u64::try_from(window_bytes)
+        .ok()?
+        .checked_mul(K0_CORRELATED_ITER_LINEAR_TERMS_PER_BYTE)?
+        .checked_add(K0_CORRELATED_ITER_LINEAR_BASE_TERMS)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct K0CorrelatedIterPrepared {
+    matched: Option<Match>,
+    work: u64,
+    #[cfg(test)]
+    fallback_work: u64,
+    automaton_identity: u64,
+    window_end: usize,
+    next_start: usize,
+}
+
+impl K0CorrelatedIterPrepared {
+    fn commit(
+        self,
+        source: &mut K0SpanSourceCursor<'_>,
+    ) -> (Option<Match>, u64) {
+        source.publish_facade_continuation(
+            self.automaton_identity,
+            self.window_end,
+            self.next_start,
+        );
+        (self.matched, self.work)
+    }
+}
+
+#[inline(never)]
+fn prepare_k0_correlated_iter_at(
+    session: &mut K0SearchSession<'_>,
+    k0_plan: &PortableK0Plan,
+    sidecars_absent: bool,
+    source: &mut K0SpanSourceCursor<'_>,
+    start: usize,
+    limits: SearchLimits,
+) -> Option<Result<K0CorrelatedIterPrepared, SearchError>> {
+    let plan = k0_plan.correlated_terminal()?;
+    if !sidecars_absent || session.retained_root_run_cursor_available() {
+        return None;
+    }
+    let haystack = source.haystack();
+    let window = SearchWindow::new(start, haystack.len());
+    if !k0_correlated_exact_delimited_allows(plan, haystack.len(), window, limits) {
+        return None;
+    }
+    // Complete the source-independent prospective before touching bytes. An
+    // unrepresentable optional envelope declines to authoritative ordinary K0.
+    let prospective = k0_correlated_iter_linear_work(
+        window.end().checked_sub(window.start())?,
+    )?;
+    let automaton_identity = k0_plan.automaton.identity();
+    let retained = match source.retained_facade_continuation(automaton_identity) {
+        Ok(retained) => retained,
+        Err(error) => return Some(Err(SearchError::from(error))),
+    };
+    let prepaid_work = if retained == Some((window.end(), window.start())) {
+        0
+    } else {
+        prospective
+    };
+    let searched = match plan.probe_exact_delimited(
+        haystack,
+        window.start(),
+        window.end(),
+    ) {
+        correlated_bounded_alternation::ExactDelimitedProbe::Match { start, end } => {
+            Ok((Some(Match { start, end }), prepaid_work, 0))
+        }
+        correlated_bounded_alternation::ExactDelimitedProbe::Exhausted => {
+            Ok((None, prepaid_work, 0))
+        }
+        correlated_bounded_alternation::ExactDelimitedProbe::Fallback {
+            first_unproved_start,
+        } => {
+            let fallback_start = first_unproved_start.min(window.end());
+            session
+                .search_span_at_source_cursor(source, fallback_start, limits)
+                .map_err(SearchError::from)
+                .and_then(|report| {
+                    let fallback_work = report.accounting().work();
+                    let matched = report.into_output().map(|span| Match {
+                        start: span.start(),
+                        end: span.end(),
+                    });
+                    let work = prepaid_work.checked_add(fallback_work).ok_or(
+                        SearchError::K0(K0SearchError::ArithmeticOverflow {
+                            computation: "correlated iterator prepaid plus fallback work",
+                        }),
+                    )?;
+                    Ok((matched, work, fallback_work))
+                })
+        }
+    };
+    Some(searched.map(|(matched, work, _fallback_work)| {
+        K0CorrelatedIterPrepared {
+            matched,
+            work,
+            #[cfg(test)]
+            fallback_work: _fallback_work,
+            automaton_identity,
+            window_end: window.end(),
+            next_start: matched.map_or(window.end(), Match::end),
+        }
+    }))
 }
 
 #[derive(Debug)]
@@ -16997,11 +17141,12 @@ mod tests {
         CompatibilityProfile, GuardedLiteralSetSearchError, Hir, K0AbsoluteEndProof,
         K0FiniteSuffixRoute, K0MandatoryCutPlan, K0MandatorySuffixOutcome,
         K0MandatorySuffixPlan, K0MandatorySuffixSpanOutcome, K0NegativePrefilterOutcome, Match,
-        K0PackedFrontierExistsReceipt, K0PackedFrontierPlan, OperationSemantics, PlanKind,
-        PlanSelection,
+        K0PackedFrontierExistsReceipt, K0PackedFrontierPlan, K0SpanSourceCursor,
+        OperationSemantics, PlanKind, PlanSelection,
         PortableBuilder, PortableFindIterAccounting, PortableFindIterError, PortableFindIterLimits,
-        PortableFindIterRunLimits, PortablePlan, PortableRegex, SearchAccounting, SearchError,
-        PortableSearchSessionPlan, SearchLimits, SearchSessionLimits, SearchWindow,
+        PortableFindIterRunLimits, PortablePlan, PortableRegex, PortableSearchSession,
+        PortableSearchSessionPlan, SearchAccounting, SearchError, SearchLimits,
+        SearchSessionLimits, SearchWindow,
         SimdDispatchContext,
         K0NegativePrefilterClassState, K0NegativePrefilterState,
         K0_NEGATIVE_PREFILTER_MAX_DISABLED_CALLS,
@@ -27044,6 +27189,93 @@ mod tests {
 
     #[test]
     fn native_iterator_cursors_have_a_bounded_inline_layout() {
+        #[allow(
+            dead_code,
+            reason = "the test-only baseline pins the source cursor's original storage"
+        )]
+        struct BaselineRootRunBlockCursor {
+            automaton_identity: u64,
+            base: usize,
+            members: u64,
+            valid_bytes: u8,
+            qualified_starts: u32,
+            activation_at: usize,
+        }
+
+        #[allow(
+            dead_code,
+            reason = "the test-only baseline pins the source cursor's original layout"
+        )]
+        struct BaselineK0SpanSourceCursor<'h> {
+            haystack: &'h [u8],
+            root_run: BaselineRootRunBlockCursor,
+        }
+
+        #[allow(
+            dead_code,
+            reason = "the test-only baseline pins the accounted core's original layout"
+        )]
+        struct BaselineMatchIterCore<'h> {
+            k0_source: BaselineK0SpanSourceCursor<'h>,
+            limits: PortableFindIterRunLimits,
+            empty_match_progress: super::EmptyMatchProgress,
+            start: usize,
+            last_match_end: Option<usize>,
+            pending_empty_progress: bool,
+            accounting: PortableFindIterAccounting,
+            finished: bool,
+        }
+
+        #[allow(
+            dead_code,
+            reason = "the test-only baseline pins the value core's original layout"
+        )]
+        struct BaselineValueMatchIterCore<'h> {
+            k0_source: BaselineK0SpanSourceCursor<'h>,
+            limits: PortableFindIterRunLimits,
+            start: usize,
+            last_match_end: Option<usize>,
+            pending_empty_progress: bool,
+            search_calls: usize,
+            finished: bool,
+        }
+
+        #[allow(
+            dead_code,
+            reason = "the test-only baseline pins the native cursor's original variants"
+        )]
+        enum BaselineNativeSearchCursor<'r, 'h> {
+            FixedPredicate(FixedPredicateWord64SearchCursor<'r, 'h>),
+            PrefixClass(PrefixClassAlternationSearchCursor<'r, 'h>),
+            DispatchedPrefixClass(
+                DispatchedPrefixClassAlternationSearchCursor<'r, 'h>,
+            ),
+        }
+
+        #[allow(
+            dead_code,
+            reason = "the test-only baseline pins the accounted state's original layout"
+        )]
+        enum BaselineMatchIterState<'r, 'h> {
+            General(BaselineMatchIterCore<'h>),
+            Native {
+                core: BaselineMatchIterCore<'h>,
+                cursor: BaselineNativeSearchCursor<'r, 'h>,
+            },
+        }
+
+        #[allow(
+            dead_code,
+            reason = "the test-only baseline pins the value state's original layout"
+        )]
+        enum BaselineValueMatchIterState<'r, 'h> {
+            General(BaselineValueMatchIterCore<'h>),
+            Native {
+                core: BaselineValueMatchIterCore<'h>,
+                cursor: BaselineNativeSearchCursor<'r, 'h>,
+            },
+        }
+
         let word = core::mem::size_of::<usize>();
         let cursor = core::mem::size_of::<FixedPredicateWord64SearchCursor<'static, 'static>>();
         let prefix_cursor =
@@ -27051,8 +27283,28 @@ mod tests {
         let dispatched_prefix_cursor = core::mem::size_of::<
             DispatchedPrefixClassAlternationSearchCursor<'static, 'static>,
         >();
-        let state = core::mem::size_of::<super::PortableMatchIterState<'static, 'static>>();
-        let general = core::mem::size_of::<super::PortableMatchIterCore<'static>>();
+        let baseline_native_cursor =
+            core::mem::size_of::<BaselineNativeSearchCursor<'static, 'static>>();
+        let native_cursor =
+            core::mem::size_of::<super::PortableNativeSearchCursor<'static, 'static>>();
+        let baseline_accounted_state =
+            core::mem::size_of::<BaselineMatchIterState<'static, 'static>>();
+        let accounted_state =
+            core::mem::size_of::<super::PortableMatchIterState<'static, 'static>>();
+        let baseline_value_state =
+            core::mem::size_of::<BaselineValueMatchIterState<'static, 'static>>();
+        let value_state =
+            core::mem::size_of::<super::PortableValueMatchIterState<'static, 'static>>();
+        let baseline_accounted_core =
+            core::mem::size_of::<BaselineMatchIterCore<'static>>();
+        let accounted_core =
+            core::mem::size_of::<super::PortableMatchIterCore<'static>>();
+        let baseline_value_core =
+            core::mem::size_of::<BaselineValueMatchIterCore<'static>>();
+        let value_core =
+            core::mem::size_of::<super::PortableValueMatchIterCore<'static>>();
+        let baseline_source_cursor =
+            core::mem::size_of::<BaselineK0SpanSourceCursor<'static>>();
         let source_cursor = core::mem::size_of::<fre_automata::K0SpanSourceCursor<'static>>();
 
         assert_eq!(
@@ -27068,17 +27320,41 @@ mod tests {
             dispatched_prefix_cursor <= 10 * word,
             "dispatched prefix cursor grew to {dispatched_prefix_cursor} bytes"
         );
+        assert_eq!(
+            source_cursor, baseline_source_cursor,
+            "facade continuation changed the original K0 source-cursor layout"
+        );
+        assert_eq!(
+            accounted_core, baseline_accounted_core,
+            "facade continuation changed the original accounted core layout"
+        );
+        assert_eq!(
+            value_core, baseline_value_core,
+            "facade continuation changed the original value core layout"
+        );
+        assert_eq!(
+            native_cursor, baseline_native_cursor,
+            "facade continuation changed the original native-cursor layout"
+        );
+        assert_eq!(
+            accounted_state, baseline_accounted_state,
+            "facade continuation changed the original accounted-state layout"
+        );
+        assert_eq!(
+            value_state, baseline_value_state,
+            "facade continuation changed the original value-state layout"
+        );
         assert!(
-            state >= cursor + source_cursor,
+            accounted_state >= cursor + source_cursor,
             "fixed iterator variant lost one of its two independent source cursors"
         );
         assert!(
-            general < state,
+            accounted_core < accounted_state,
             "general iterator payload retained the fixed cursor"
         );
         assert!(
-            state <= 32 * word,
-            "iterator state grew beyond its inline 32-word envelope: {state} bytes"
+            accounted_state <= 32 * word,
+            "iterator state grew beyond its inline 32-word envelope: {accounted_state} bytes"
         );
     }
 
@@ -27831,6 +28107,421 @@ mod tests {
                 )
                 .is_err(),
         );
+    }
+
+    fn prepare_correlated_iter_for_test(
+        session: &mut PortableSearchSession<'_>,
+        source: &mut K0SpanSourceCursor<'_>,
+        start: usize,
+        limits: SearchLimits,
+    ) -> Option<Result<super::K0CorrelatedIterPrepared, SearchError>> {
+        let PortableSearchSessionPlan::K0 {
+            session: k0_session,
+            k0_plan,
+            reverse_inner,
+            mandatory_suffix,
+            mandatory_cut,
+            negative_prefilter,
+            ..
+        } = &mut session.plan
+        else {
+            return None;
+        };
+        k0_plan.correlated_terminal()?;
+        let sidecars_absent = reverse_inner.is_none()
+            && mandatory_suffix.is_none()
+            && mandatory_cut.is_none()
+            && negative_prefilter.is_none()
+            && k0_plan.absolute_end_proof.is_none();
+        super::prepare_k0_correlated_iter_at(
+            k0_session,
+            k0_plan,
+            sidecars_absent,
+            source,
+            start,
+            limits,
+        )
+    }
+
+    fn k0_automaton_identity(session: &PortableSearchSession<'_>) -> u64 {
+        let PortableSearchSessionPlan::K0 { k0_plan, .. } = &session.plan else {
+            panic!("correlated iterator fixture lost K0");
+        };
+        k0_plan.automaton.identity()
+    }
+
+    #[test]
+    fn correlated_delimited_accounted_iterator_prepays_one_linear_envelope() {
+        const PATTERN: &str = r"(?-u:(?:ab[bc]*Z|q[de]*Y))";
+        let regex = PortableBuilder::new(PATTERN)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let upstream = regex::bytes::RegexBuilder::new(PATTERN)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let haystack = b"abbbbZqdddYabZ";
+        let expected = upstream
+            .find_iter(haystack)
+            .map(|matched| (matched.start(), matched.end()))
+            .collect::<Vec<_>>();
+        assert_eq!(expected, vec![(0, 6), (6, 11), (11, 14)]);
+
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        let automaton_identity = k0_automaton_identity(&session);
+        let mut matches =
+            session.find_iter(haystack, PortableFindIterRunLimits::unlimited());
+        let mut actual = Vec::new();
+        for expected_match in &expected {
+            let matched = matches.next().unwrap().unwrap();
+            actual.push((matched.start(), matched.end()));
+            let accounting = matches.accounting();
+            if actual.len() == 1 {
+                assert_eq!(
+                    accounting.work_or_linear_terms,
+                    super::k0_correlated_iter_linear_work(haystack.len()).unwrap(),
+                );
+            } else {
+                assert_eq!(
+                    accounting.work_or_linear_terms,
+                    super::k0_correlated_iter_linear_work(haystack.len()).unwrap(),
+                    "contiguous continuations must consume the prepaid source envelope",
+                );
+            }
+            assert_eq!(
+                matches
+                    .state
+                    .core()
+                    .k0_source
+                    .retained_facade_continuation(automaton_identity)
+                    .unwrap(),
+                Some((haystack.len(), expected_match.1)),
+            );
+            assert_eq!(actual.last(), Some(expected_match));
+        }
+        assert!(matches.next().is_none());
+        assert_eq!(actual, expected);
+        assert_eq!(matches.accounting().matches, expected.len());
+        assert_eq!(matches.accounting().search_calls, expected.len() + 1);
+        assert_eq!(
+            matches
+                .state
+                .core()
+                .k0_source
+                .retained_facade_continuation(automaton_identity)
+                .unwrap(),
+            Some((haystack.len(), haystack.len())),
+        );
+
+        drop(matches);
+        let value = session
+            .find_iter_value(haystack, PortableFindIterRunLimits::unlimited())
+            .map(|matched| {
+                let matched = matched.unwrap();
+                (matched.start(), matched.end())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(value, expected);
+    }
+
+    #[test]
+    fn correlated_delimited_cursor_refusal_reset_and_late_failure_are_transactional() {
+        const PATTERN: &str = r"(?-u:(?:ab[bc]*Z|q[de]*Y))";
+        let regex = PortableBuilder::new(PATTERN)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let haystack = b"abbbbZqdddY";
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        let automaton_identity = k0_automaton_identity(&session);
+        let mut source = K0SpanSourceCursor::new(haystack);
+        let cold = source
+            .retained_facade_continuation(automaton_identity)
+            .unwrap();
+        assert_eq!(cold, None);
+        let refused = prepare_correlated_iter_for_test(
+            &mut session,
+            &mut source,
+            0,
+            SearchLimits {
+                max_work: u64::MAX - 1,
+                max_scratch_bytes: usize::MAX,
+            },
+        );
+        assert!(refused.is_none());
+        assert_eq!(
+            source
+                .retained_facade_continuation(automaton_identity)
+                .unwrap(),
+            cold,
+        );
+
+        let staged = prepare_correlated_iter_for_test(
+            &mut session,
+            &mut source,
+            0,
+            SearchLimits::unlimited(),
+        )
+            .expect("unlimited exact-delimited admission")
+            .unwrap();
+        assert_eq!(staged.matched, Some(Match { start: 0, end: 6 }));
+        assert_eq!(
+            source
+                .retained_facade_continuation(automaton_identity)
+                .unwrap(),
+            cold,
+            "a completed but uncommitted transaction must not publish progress",
+        );
+        let _uncommitted = staged;
+
+        let prepared = prepare_correlated_iter_for_test(
+            &mut session,
+            &mut source,
+            0,
+            SearchLimits::unlimited(),
+        )
+            .unwrap()
+            .unwrap();
+        let (first, first_work) = prepared.commit(&mut source);
+        assert_eq!(first, Some(Match { start: 0, end: 6 }));
+        assert_eq!(
+            first_work,
+            super::k0_correlated_iter_linear_work(haystack.len()).unwrap(),
+        );
+        let prepared = prepare_correlated_iter_for_test(
+            &mut session,
+            &mut source,
+            1,
+            SearchLimits::unlimited(),
+        )
+            .unwrap()
+            .unwrap();
+        let (noncontiguous, reset_work) = prepared.commit(&mut source);
+        assert_eq!(noncontiguous, Some(Match { start: 6, end: 11 }));
+        assert_eq!(
+            reset_work,
+            super::k0_correlated_iter_linear_work(haystack.len() - 1).unwrap(),
+        );
+    }
+
+    #[test]
+    fn correlated_delimited_accounted_cursor_falls_back_from_the_proved_floor() {
+        const PATTERN: &str = r"(?-u:(?:ab[bc]*Z|q[de]*Y))";
+        let regex = PortableBuilder::new(PATTERN)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let upstream = regex::bytes::RegexBuilder::new(PATTERN)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let false_terminal = 3;
+        let valid_start = false_terminal + BYTE_SET_BLOCK_BYTES * 2;
+        let mut haystack = vec![b'~'; BYTE_SET_BLOCK_BYTES * 5];
+        haystack[false_terminal] = b'Z';
+        haystack[valid_start..valid_start + 4].copy_from_slice(b"qddY");
+        let expected = upstream.find(&haystack).map(|matched| Match {
+            start: matched.start(),
+            end: matched.end(),
+        });
+        assert_eq!(expected, Some(Match { start: valid_start, end: valid_start + 4 }));
+
+        let mut session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        let PortableSearchSessionPlan::K0 { k0_plan, .. } = &session.plan else {
+            panic!("fallback fixture lost K0");
+        };
+        let plan = k0_plan.correlated_terminal().unwrap();
+        assert!(matches!(
+            plan.probe_exact_delimited(&haystack, 0, haystack.len()),
+            super::correlated_bounded_alternation::ExactDelimitedProbe::Fallback {
+                first_unproved_start
+            } if first_unproved_start == false_terminal + 1
+        ));
+        let mut charge_session = regex
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        let charge_identity = k0_automaton_identity(&charge_session);
+        let mut charge_source = K0SpanSourceCursor::new(&haystack);
+        let prepared = prepare_correlated_iter_for_test(
+            &mut charge_session,
+            &mut charge_source,
+            0,
+            SearchLimits::unlimited(),
+        )
+            .unwrap()
+            .unwrap();
+        assert_eq!(prepared.matched, expected);
+        assert_eq!(
+            prepared.work,
+            super::k0_correlated_iter_linear_work(haystack.len())
+                .unwrap()
+                .checked_add(prepared.fallback_work)
+                .unwrap(),
+            "a fresh cursor must charge exactly its prepaid pass plus fresh authoritative fallback work",
+        );
+        assert_eq!(
+            charge_source
+                .retained_facade_continuation(charge_identity)
+                .unwrap(),
+            None,
+            "preparation must not publish before the caller accepts its accounting",
+        );
+
+        let automaton_identity = k0_automaton_identity(&session);
+        let mut source = K0SpanSourceCursor::new(&haystack);
+        let cursor_before = source
+            .retained_facade_continuation(automaton_identity)
+            .unwrap();
+        let staged = prepare_correlated_iter_for_test(
+            &mut session,
+            &mut source,
+            0,
+            SearchLimits::unlimited(),
+        )
+            .expect("the exact-delimited probe reaches its authoritative fallback")
+            .unwrap();
+        assert_eq!(staged.matched, expected);
+        assert_eq!(
+            source
+                .retained_facade_continuation(automaton_identity)
+                .unwrap(),
+            cursor_before,
+            "a post-fallback failure must not publish retained cursor progress",
+        );
+        let _uncommitted = staged;
+        let prepared = prepare_correlated_iter_for_test(
+            &mut session,
+            &mut source,
+            0,
+            SearchLimits::unlimited(),
+        )
+            .unwrap()
+            .unwrap();
+        let (matched, _) = prepared.commit(&mut source);
+        assert_eq!(matched, expected);
+        let prepared = prepare_correlated_iter_for_test(
+            &mut session,
+            &mut source,
+            expected.unwrap().end(),
+            SearchLimits::unlimited(),
+        )
+            .unwrap()
+            .unwrap();
+        let (exhausted, continuation_work) = prepared.commit(&mut source);
+        assert_eq!(exhausted, None);
+        assert_eq!(continuation_work, 0);
+    }
+
+    #[test]
+    fn correlated_delimited_accounted_iterators_bind_each_plan_and_same_address_source() {
+        const LEFT: &str = r"(?-u:(?:ab[bc]*Z|q[de]*Y))";
+        const RIGHT: &str = r"(?-u:(?:mn[no]*X|r[st]+W))";
+        let left = PortableBuilder::new(LEFT).unicode(false).build().unwrap();
+        let right = PortableBuilder::new(RIGHT).unicode(false).build().unwrap();
+        let left_upstream = regex::bytes::RegexBuilder::new(LEFT)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let right_upstream = regex::bytes::RegexBuilder::new(RIGHT)
+            .unicode(false)
+            .build()
+            .unwrap();
+        let mut left_session = left
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        let mut right_session = right
+            .search_session(SearchSessionLimits::unlimited())
+            .unwrap();
+        let mut source = vec![b'~'; BYTE_SET_BLOCK_BYTES * 5];
+        let source_address = source.as_ptr();
+        for (left_token, right_token) in [
+            (b"abbbbZ".as_slice(), b"mnnnX".as_slice()),
+            (b"qdddY".as_slice(), b"rsttW".as_slice()),
+            (b"abZ".as_slice(), b"mnX".as_slice()),
+        ] {
+            source.fill(b'~');
+            source[7..7 + left_token.len()].copy_from_slice(left_token);
+            let right_start = BYTE_SET_BLOCK_BYTES * 3 + 1;
+            source[right_start..right_start + right_token.len()].copy_from_slice(right_token);
+            assert_eq!(source.as_ptr(), source_address);
+            let left_expected = left_upstream
+                .find_iter(&source)
+                .map(|matched| (matched.start(), matched.end()))
+                .collect::<Vec<_>>();
+            let right_expected = right_upstream
+                .find_iter(&source)
+                .map(|matched| (matched.start(), matched.end()))
+                .collect::<Vec<_>>();
+            let left_actual = left_session
+                .find_iter(&source, PortableFindIterRunLimits::unlimited())
+                .map(|matched| {
+                    let matched = matched.unwrap();
+                    (matched.start(), matched.end())
+                })
+                .collect::<Vec<_>>();
+            let right_actual = right_session
+                .find_iter(&source, PortableFindIterRunLimits::unlimited())
+                .map(|matched| {
+                    let matched = matched.unwrap();
+                    (matched.start(), matched.end())
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(left_actual, left_expected);
+            assert_eq!(right_actual, right_expected);
+            let left_identity = k0_automaton_identity(&left_session);
+            let mut bound_source = K0SpanSourceCursor::new(&source);
+            assert_eq!(
+                bound_source
+                    .retained_facade_continuation(left_identity)
+                    .unwrap(),
+                None,
+                "a new immutable borrow at the same address must start cold",
+            );
+            let prepared = prepare_correlated_iter_for_test(
+                &mut left_session,
+                &mut bound_source,
+                0,
+                SearchLimits::unlimited(),
+            )
+                .expect("left plan retains its exact continuation")
+                .unwrap();
+            let (left_first, _) = prepared.commit(&mut bound_source);
+            assert_eq!(
+                left_first.map(|matched| (matched.start(), matched.end())),
+                left_expected.first().copied(),
+            );
+            let cursor_before = bound_source
+                .retained_facade_continuation(left_identity)
+                .unwrap();
+            let cross_plan = prepare_correlated_iter_for_test(
+                &mut right_session,
+                &mut bound_source,
+                0,
+                SearchLimits::unlimited(),
+            )
+                .expect("a cross-plan use is an authenticated error")
+                .unwrap_err();
+            assert!(matches!(
+                cross_plan,
+                SearchError::K0(fre_automata::SearchError::InternalInvariant {
+                    detail: "source-bound facade continuation received a different immutable plan"
+                })
+            ));
+            assert_eq!(
+                bound_source
+                    .retained_facade_continuation(left_identity)
+                    .unwrap(),
+                cursor_before,
+                "cross-plan refusal must precede cursor publication",
+            );
+        }
     }
 
     #[test]

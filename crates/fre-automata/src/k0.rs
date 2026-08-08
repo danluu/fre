@@ -2145,6 +2145,12 @@ struct RootRunBlockCursor {
     activation_at: usize,
 }
 
+// Root-run blocks contain at most 64 bytes. The otherwise impossible tag
+// overlays facade-owned continuation words without enlarging the lifetime-
+// bound source cursor. Facades may use this overlay only after proving that
+// the immutable plan has no retained root-run cursor.
+const FACADE_CONTINUATION_TAG: u8 = u8::MAX;
+
 impl Default for RootRunBlockCursor {
     fn default() -> Self {
         Self {
@@ -2215,6 +2221,57 @@ impl<'h> K0SpanSourceCursor<'h> {
     #[must_use]
     pub const fn haystack(&self) -> &'h [u8] {
         self.haystack
+    }
+
+    /// Read facade-owned continuation words authenticated by one immutable
+    /// automaton identity.
+    ///
+    /// A caller may use this overlay only when its session proves retained
+    /// root-run continuation unavailable. The source cursor's lifetime binds
+    /// these words to this exact immutable haystack borrow.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::InternalInvariant`] when retained facade state
+    /// belongs to a different immutable plan.
+    #[doc(hidden)]
+    pub fn retained_facade_continuation(
+        &self,
+        automaton_identity: u64,
+    ) -> Result<Option<(usize, usize)>, SearchError> {
+        if self.root_run.valid_bytes != FACADE_CONTINUATION_TAG {
+            return Ok(None);
+        }
+        if self.root_run.automaton_identity != automaton_identity {
+            return Err(SearchError::InternalInvariant {
+                detail: "source-bound facade continuation received a different immutable plan",
+            });
+        }
+        Ok(Some((self.root_run.base, self.root_run.activation_at)))
+    }
+
+    /// Publish facade-owned continuation words into the mutually exclusive
+    /// root-run storage overlay.
+    ///
+    /// The caller must authenticate `automaton_identity`, prove retained
+    /// root-run continuation unavailable, and stage all fallible work before
+    /// publishing.
+    #[doc(hidden)]
+    pub fn publish_facade_continuation(
+        &mut self,
+        automaton_identity: u64,
+        window_end: usize,
+        next_start: usize,
+    ) {
+        debug_assert_ne!(automaton_identity, 0);
+        self.root_run = RootRunBlockCursor {
+            automaton_identity,
+            base: window_end,
+            members: 0,
+            valid_bytes: FACADE_CONTINUATION_TAG,
+            qualified_starts: 0,
+            activation_at: next_start,
+        };
     }
 }
 
