@@ -2297,8 +2297,89 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_search_exclusive_dynamic_rows_pre
         return STATUS_INVALID_ARGUMENT;
     }
 
-    // SAFETY: the caller guarantees the exclusive live session and disjoint
-    // readable/writable extents documented above.
+    // SAFETY: the checks above establish the raw extents, alignments, and
+    // exact-window contract consumed by the shared transaction.
+    unsafe {
+        exclusive_dynamic_rows_preflight_prevalidated(
+            handle,
+            haystack_ptr,
+            haystack_len,
+            window_start,
+            window_end,
+            result_ptr,
+            expected_artifact_identity_ptr,
+            preflight_out,
+        )
+    }
+}
+
+/// Compiler-private dynamic-row preflight for FRE's generated prepared entry.
+///
+/// This symbol is deliberately absent from the public C header. Its sole
+/// producer is the generated prepared wrapper, which has already validated
+/// every raw ABI fact below and passes its own static artifact identity plus
+/// an aligned stack-resident preflight record. Semantic identity, workspace,
+/// program-shape, descriptor, and admission checks remain in the shared
+/// transaction.
+///
+/// # Safety
+///
+/// `handle` must name one exclusively owned live prepared session.
+/// `haystack_ptr` must be non-null and readable for `haystack_len` bytes, with
+/// `haystack_len <= isize::MAX`. The exact window must satisfy
+/// `window_start <= window_end <= haystack_len`. `result_ptr` and
+/// `preflight_out` must be non-null, aligned, writable, mutually disjoint, and
+/// disjoint from all readable inputs. `expected_artifact_identity_ptr` must be
+/// non-null and readable for exactly [`ARTIFACT_IDENTITY_BYTES`] bytes. No
+/// overlapping search or destroy may use any copy of `handle`.
+#[doc(hidden)]
+#[unsafe(no_mangle)]
+#[allow(
+    unsafe_code,
+    clippy::too_many_arguments,
+    reason = "the generated-only ABI consumes raw facts proved by its emitted caller"
+)]
+pub unsafe extern "C" fn fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v1(
+    handle: FreAotRegexExclusiveHandleV1,
+    haystack_ptr: *const u8,
+    haystack_len: usize,
+    window_start: usize,
+    window_end: usize,
+    result_ptr: *mut FreAotRegexResultV1,
+    expected_artifact_identity_ptr: *const u8,
+    preflight_out: *mut FreAotRegexDynamicRowsPreflightV1,
+) -> u32 {
+    // SAFETY: every raw requirement is part of this compiler-private
+    // function's contract and is established by its sole emitted caller.
+    unsafe {
+        exclusive_dynamic_rows_preflight_prevalidated(
+            handle,
+            haystack_ptr,
+            haystack_len,
+            window_start,
+            window_end,
+            result_ptr,
+            expected_artifact_identity_ptr,
+            preflight_out,
+        )
+    }
+}
+
+#[allow(
+    unsafe_code,
+    clippy::too_many_arguments,
+    reason = "one panic-catching transaction serves checked public and generated-only entry policies"
+)]
+unsafe fn exclusive_dynamic_rows_preflight_prevalidated(
+    handle: FreAotRegexExclusiveHandleV1,
+    haystack_ptr: *const u8,
+    haystack_len: usize,
+    window_start: usize,
+    window_end: usize,
+    result_ptr: *mut FreAotRegexResultV1,
+    expected_artifact_identity_ptr: *const u8,
+    preflight_out: *mut FreAotRegexDynamicRowsPreflightV1,
+) -> u32 {
     catch_unwind(AssertUnwindSafe(|| unsafe {
         let prepared = &mut *handle.0.cast::<PreparedAotRegex>();
         let haystack = std::slice::from_raw_parts(haystack_ptr, haystack_len);
@@ -2989,6 +3070,35 @@ mod tests {
 
     #[allow(
         clippy::too_many_arguments,
+        reason = "the helper mirrors the generated-only dynamic-row preflight ABI"
+    )]
+    fn call_exclusive_compiler_private_dynamic_rows_preflight(
+        handle: FreAotRegexExclusiveHandleV1,
+        haystack: &[u8],
+        start: usize,
+        end: usize,
+        result: &mut FreAotRegexResultV1,
+        expected_artifact_identity: &[u8; ARTIFACT_IDENTITY_BYTES],
+        output: &mut FreAotRegexDynamicRowsPreflightV1,
+    ) -> u32 {
+        // SAFETY: this test helper supplies the exact live, validated,
+        // disjoint inputs established by FRE's generated wrapper.
+        unsafe {
+            fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v1(
+                handle,
+                haystack.as_ptr(),
+                haystack.len(),
+                start,
+                end,
+                result,
+                expected_artifact_identity.as_ptr(),
+                output,
+            )
+        }
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
         reason = "the helper mirrors the compiler-private authenticated first-hole continuation"
     )]
     fn call_exclusive_dynamic_rows_continue(
@@ -3230,6 +3340,7 @@ mod tests {
             "fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v1",
             "fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v2",
             "fre_aot_regex_runtime_search_exclusive_dynamic_rows_preflight_v1",
+            "fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v1",
             "fre_aot_regex_runtime_search_exclusive_dynamic_rows_deopt_v1",
             "fre_aot_regex_runtime_search_exclusive_dynamic_rows_continue_v1",
             "fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1",
@@ -3446,6 +3557,17 @@ mod tests {
             *const u8,
             *mut FreAotRegexDynamicRowsPreflightV1,
         ) -> u32 = fre_aot_regex_runtime_search_exclusive_dynamic_rows_preflight_v1;
+        let _: unsafe extern "C" fn(
+            FreAotRegexExclusiveHandleV1,
+            *const u8,
+            usize,
+            usize,
+            usize,
+            *mut FreAotRegexResultV1,
+            *const u8,
+            *mut FreAotRegexDynamicRowsPreflightV1,
+        ) -> u32 =
+            fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v1;
         let _: unsafe extern "C" fn(
             FreAotRegexExclusiveHandleV1,
             *const u8,
@@ -3776,6 +3898,272 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
             STATUS_NO_MATCH
         );
         assert_eq!(result, FreAotRegexResultV1::default());
+    }
+
+    #[test]
+    #[allow(
+        clippy::cast_ptr_alignment,
+        clippy::too_many_lines,
+        reason = "all ten public raw predicates and both untouched output transactions form one boundary audit"
+    )]
+    fn public_dynamic_rows_preflight_rejects_every_raw_boundary_violation_transactionally() {
+        let compiled = compile(
+            CompileRequest::new("(?:ab|ac)+z", Target::x86_64_linux())
+                .mode(CompileMode::Fast)
+                .output(OutputContract::Exists),
+        )
+        .expect("compile dynamic-row public-boundary fixture");
+        let identity = compiled.receipt().program_sha256;
+        let serialized = compiled.program().serialize().unwrap();
+        let handle = prepare_exclusive(&serialized);
+        let haystack = [b'x'; 80];
+        let sentinel_result = FreAotRegexResultV1 { start: 71, end: 73 };
+        let sentinel_output = FreAotRegexDynamicRowsPreflightV1 {
+            start: 79,
+            end: 83,
+            native_rows_address: 89,
+            cache_generation: 97,
+        };
+        let mut result: FreAotRegexResultV1;
+        let mut output: FreAotRegexDynamicRowsPreflightV1;
+        let mut result_words = [0xa5a5_a5a5_a5a5_a5a5_usize; 3];
+        let mut output_words = [0x5a5a_5a5a_5a5a_5a5a_usize; 5];
+        let result_words_before = result_words;
+        let output_words_before = output_words;
+        let misaligned_result = result_words
+            .as_mut_ptr()
+            .cast::<u8>()
+            .wrapping_add(1)
+            .cast::<FreAotRegexResultV1>();
+        let misaligned_output = output_words
+            .as_mut_ptr()
+            .cast::<u8>()
+            .wrapping_add(1)
+            .cast::<FreAotRegexDynamicRowsPreflightV1>();
+        assert!(!misaligned_result.is_aligned());
+        assert!(!misaligned_output.is_aligned());
+
+        macro_rules! reject {
+            (
+                $name:literal, $case_handle:expr, $haystack_ptr:expr, $haystack_len:expr,
+                $start:expr, $end:expr, $result_ptr:expr, $identity_ptr:expr,
+                $output_ptr:expr, $expected_status:expr
+            ) => {{
+                result = sentinel_result;
+                output = sentinel_output;
+                // SAFETY: every malformed extent is selected so the checked
+                // public boundary rejects it before any invalid dereference.
+                let status = unsafe {
+                    fre_aot_regex_runtime_search_exclusive_dynamic_rows_preflight_v1(
+                        $case_handle,
+                        $haystack_ptr,
+                        $haystack_len,
+                        $start,
+                        $end,
+                        $result_ptr,
+                        $identity_ptr,
+                        $output_ptr,
+                    )
+                };
+                assert_eq!(status, $expected_status, $name);
+                assert_eq!(result, sentinel_result, "result transaction: {}", $name);
+                assert_eq!(output, sentinel_output, "preflight transaction: {}", $name);
+                assert_eq!(result_words, result_words_before, "result backing: {}", $name);
+                assert_eq!(output_words, output_words_before, "output backing: {}", $name);
+            }};
+        }
+
+        reject!(
+            "invalid handle",
+            FreAotRegexExclusiveHandleV1::INVALID,
+            haystack.as_ptr(), haystack.len(), 8, 72,
+            &raw mut result, identity.as_ptr(), &raw mut output,
+            STATUS_INVALID_HANDLE
+        );
+        reject!(
+            "null haystack",
+            handle, std::ptr::null(), haystack.len(), 8, 72,
+            &raw mut result, identity.as_ptr(), &raw mut output,
+            STATUS_INVALID_ARGUMENT
+        );
+        reject!(
+            "null result",
+            handle, haystack.as_ptr(), haystack.len(), 8, 72,
+            std::ptr::null_mut(), identity.as_ptr(), &raw mut output,
+            STATUS_INVALID_ARGUMENT
+        );
+        reject!(
+            "misaligned result",
+            handle, haystack.as_ptr(), haystack.len(), 8, 72,
+            misaligned_result, identity.as_ptr(), &raw mut output,
+            STATUS_INVALID_ARGUMENT
+        );
+        reject!(
+            "null identity",
+            handle, haystack.as_ptr(), haystack.len(), 8, 72,
+            &raw mut result, std::ptr::null(), &raw mut output,
+            STATUS_INVALID_ARGUMENT
+        );
+        reject!(
+            "null preflight output",
+            handle, haystack.as_ptr(), haystack.len(), 8, 72,
+            &raw mut result, identity.as_ptr(), std::ptr::null_mut(),
+            STATUS_INVALID_ARGUMENT
+        );
+        reject!(
+            "misaligned preflight output",
+            handle, haystack.as_ptr(), haystack.len(), 8, 72,
+            &raw mut result, identity.as_ptr(), misaligned_output,
+            STATUS_INVALID_ARGUMENT
+        );
+        reject!(
+            "length exceeds isize",
+            handle, haystack.as_ptr(), isize::MAX.unsigned_abs().checked_add(1).unwrap(), 0, 0,
+            &raw mut result, identity.as_ptr(), &raw mut output,
+            STATUS_INVALID_ARGUMENT
+        );
+        reject!(
+            "start after end",
+            handle, haystack.as_ptr(), haystack.len(), 73, 72,
+            &raw mut result, identity.as_ptr(), &raw mut output,
+            STATUS_INVALID_ARGUMENT
+        );
+        reject!(
+            "end after length",
+            handle, haystack.as_ptr(), haystack.len(), 8,
+            haystack.len().checked_add(1).unwrap(),
+            &raw mut result, identity.as_ptr(), &raw mut output,
+            STATUS_INVALID_ARGUMENT
+        );
+
+        // SAFETY: the rejected calls never consumed or aliased this uniquely
+        // owned live session.
+        assert_eq!(
+            unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(handle) },
+            STATUS_SUCCESS
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "cold, warm, deopt, and identity-failure parity form one generated-boundary transaction"
+    )]
+    fn compiler_private_dynamic_rows_preflight_matches_checked_transaction() {
+        let compiled = compile(
+            CompileRequest::new("(?:ab|ac)+z", Target::x86_64_linux())
+                .mode(CompileMode::Fast)
+                .output(OutputContract::Exists),
+        )
+        .expect("compile generated-only dynamic-row fixture");
+        let identity = compiled.receipt().program_sha256;
+        let serialized = compiled.program().serialize().unwrap();
+        let public_handle = prepare_exclusive(&serialized);
+        let private_handle = prepare_exclusive(&serialized);
+        let mut haystack = vec![b'!'; 80];
+        for pair in haystack[8..70].chunks_exact_mut(2) {
+            pair.copy_from_slice(b"ab");
+        }
+        haystack[70] = b'z';
+        let sentinel_result = FreAotRegexResultV1 { start: 91, end: 92 };
+        let sentinel_output = FreAotRegexDynamicRowsPreflightV1 {
+            start: 93,
+            end: 94,
+            native_rows_address: 95,
+            cache_generation: 96,
+        };
+
+        for expected_status in [STATUS_MATCH, STATUS_PARTIAL_PREFLIGHT_ENTER] {
+            let mut public_result = sentinel_result;
+            let mut private_result = sentinel_result;
+            let mut public_output = sentinel_output;
+            let mut private_output = sentinel_output;
+            let public_status = call_exclusive_dynamic_rows_preflight(
+                public_handle, &haystack, 8, 72, &mut public_result, &identity,
+                &mut public_output,
+            );
+            let private_status = call_exclusive_compiler_private_dynamic_rows_preflight(
+                private_handle, &haystack, 8, 72, &mut private_result, &identity,
+                &mut private_output,
+            );
+            assert_eq!(public_status, expected_status);
+            assert_eq!(private_status, public_status);
+            assert_eq!(private_result, public_result);
+            if expected_status == STATUS_MATCH {
+                assert_eq!(public_output, sentinel_output);
+                assert_eq!(private_output, sentinel_output);
+            } else {
+                assert_eq!((private_output.start, private_output.end), (8, 72));
+                assert_eq!(
+                    (private_output.start, private_output.end),
+                    (public_output.start, public_output.end)
+                );
+                for output in [public_output, private_output] {
+                    assert_ne!(output.native_rows_address, 0);
+                    assert_ne!(output.cache_generation, 0);
+                    // SAFETY: each descriptor belongs to its still-live,
+                    // synchronously admitted exclusive transaction.
+                    let descriptor = unsafe {
+                        &*std::ptr::with_exposed_provenance::<
+                            fre_aot_regex::DynamicNativeRowsV1,
+                        >(output.native_rows_address)
+                    };
+                    assert_eq!(descriptor.cache_identity, output.cache_generation);
+                    assert_ne!(descriptor.rows_address, 0);
+                    assert_ne!(descriptor.class_map_address, 0);
+                }
+            }
+        }
+
+        let mut public_result = sentinel_result;
+        let mut private_result = sentinel_result;
+        assert_eq!(
+            call_exclusive_dynamic_rows_deopt(
+                public_handle, &haystack, 8, 72, &mut public_result,
+            ),
+            STATUS_MATCH
+        );
+        assert_eq!(
+            call_exclusive_dynamic_rows_deopt(
+                private_handle, &haystack, 8, 72, &mut private_result,
+            ),
+            STATUS_MATCH
+        );
+        assert_eq!(private_result, public_result);
+
+        let mut wrong_identity = identity;
+        wrong_identity[0] ^= 1;
+        let mut public_output = sentinel_output;
+        let mut private_output = sentinel_output;
+        public_result = sentinel_result;
+        private_result = sentinel_result;
+        assert_eq!(
+            call_exclusive_dynamic_rows_preflight(
+                public_handle, &haystack, 8, 72, &mut public_result, &wrong_identity,
+                &mut public_output,
+            ),
+            STATUS_RUNTIME_FAILURE
+        );
+        assert_eq!(
+            call_exclusive_compiler_private_dynamic_rows_preflight(
+                private_handle, &haystack, 8, 72, &mut private_result, &wrong_identity,
+                &mut private_output,
+            ),
+            STATUS_RUNTIME_FAILURE
+        );
+        assert_eq!(public_result, sentinel_result);
+        assert_eq!(private_result, sentinel_result);
+        assert_eq!(public_output, sentinel_output);
+        assert_eq!(private_output, sentinel_output);
+
+        for handle in [public_handle, private_handle] {
+            // SAFETY: each session is live, uniquely owned, and no call
+            // overlaps its destruction.
+            assert_eq!(
+                unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(handle) },
+                STATUS_SUCCESS
+            );
+        }
     }
 
     #[test]

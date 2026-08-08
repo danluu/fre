@@ -924,7 +924,7 @@ const PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME: &str =
 const PREPARED_PREFLIGHT_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_search_exclusive_partial_preflight_v1";
 const DYNAMIC_ROWS_PREFLIGHT_RUNTIME_SYMBOL_NAME: &str =
-    "fre_aot_regex_runtime_search_exclusive_dynamic_rows_preflight_v1";
+    "fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v1";
 const DYNAMIC_ROWS_DEOPT_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_search_exclusive_dynamic_rows_deopt_v1";
 const DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL_NAME: &str =
@@ -36065,6 +36065,173 @@ mod tests {
         }
     }
 
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the full target/feature matrix shares one generated-only guard and relocation proof"
+    )]
+    fn compiler_private_dynamic_preflight_is_guard_dominated_on_every_target() {
+        for target in identity_target_matrix() {
+            let compiled = compile(
+                CompileRequest::new("(?:ab|ac)+z", target)
+                    .mode(CompileMode::Fast)
+                    .output(OutputContract::Exists),
+            )
+            .unwrap_or_else(|error| panic!("dynamic guard audit {target:?}: {error}"));
+            let module = compiled.module();
+            assert_eq!(
+                module.required_prepared_preflight_runtime_symbol(),
+                Some(DYNAMIC_ROWS_PREFLIGHT_RUNTIME_SYMBOL_NAME),
+                "{target:?}"
+            );
+            assert!(module.symbols().iter().all(|symbol| {
+                symbol.name != "fre_aot_regex_runtime_search_exclusive_dynamic_rows_preflight_v1"
+            }));
+            assert_eq!(
+                module.symbols()[PREPARED_PREFLIGHT_RUNTIME_SYMBOL].name,
+                DYNAMIC_ROWS_PREFLIGHT_RUNTIME_SYMBOL_NAME,
+                "{target:?}"
+            );
+            let preflights = module
+                .relocations()
+                .iter()
+                .filter(|relocation| relocation.symbol == PREPARED_PREFLIGHT_RUNTIME_SYMBOL)
+                .collect::<Vec<_>>();
+            assert_eq!(preflights.len(), 1, "{target:?}");
+
+            let prepared = &module.symbols()[PREPARED_ENTRY_SYMBOL];
+            let prepared_start = usize::try_from(prepared.offset).unwrap();
+            let prepared_end = prepared_start + usize::try_from(prepared.size).unwrap();
+            let code = &module.sections()[TEXT_SECTION].bytes()[prepared_start..prepared_end];
+            let preflight = preflights[0];
+            let preflight_offset = usize::try_from(preflight.offset).unwrap();
+            assert!(
+                (prepared_start..prepared_end).contains(&preflight_offset),
+                "{target:?}"
+            );
+            let local_preflight = preflight_offset - prepared_start;
+            let identity_relocations = module
+                .relocations()
+                .iter()
+                .filter(|relocation| {
+                    relocation.symbol == PARTIAL_IDENTITY_SYMBOL
+                        && relocation.offset >= prepared.offset
+                        && relocation.offset < preflight.offset
+                })
+                .count();
+
+            match target.architecture {
+                Architecture::X86_64 => {
+                    let before_preflight = &code[..local_preflight];
+                    let guards: &[(&[u8], [u8; 2])] = &[
+                        (&[0x48, 0x85, 0xff], [0x0f, 0x84]), // handle != null
+                        (&[0x48, 0x85, 0xf6], [0x0f, 0x84]), // haystack != null
+                        (&[0x4d, 0x85, 0xc9], [0x0f, 0x84]), // result != null
+                        (&[0x41, 0xf6, 0xc1, 0x07], [0x0f, 0x85]), // result aligned
+                        (&[0x48, 0x85, 0xd2], [0x0f, 0x88]), // length <= isize::MAX
+                        (&[0x4c, 0x39, 0xc1], [0x0f, 0x87]), // start <= end
+                    ];
+                    let mut cursor = 0;
+                    for &(instruction, branch) in guards {
+                        assert_eq!(
+                            before_preflight.get(cursor..cursor + instruction.len()),
+                            Some(instruction),
+                            "x86 guard {instruction:02x?}: {target:?}"
+                        );
+                        assert_eq!(
+                            before_preflight.get(
+                                cursor + instruction.len()..cursor + instruction.len() + 2
+                            ),
+                            Some(branch.as_slice()),
+                            "x86 guard branch {instruction:02x?}: {target:?}"
+                        );
+                        cursor += instruction.len() + 6;
+                    }
+                    assert_eq!(
+                        before_preflight.get(cursor..cursor + 2),
+                        Some([0x0f, 0x84].as_slice()),
+                        "empty-window guard: {target:?}"
+                    );
+                    cursor += 6;
+                    assert_eq!(
+                        before_preflight.get(cursor..cursor + 3),
+                        Some([0x4c, 0x39, 0xc2].as_slice()),
+                        "end/length guard: {target:?}"
+                    );
+                    assert_eq!(
+                        before_preflight.get(cursor + 3..cursor + 5),
+                        Some([0x0f, 0x82].as_slice()),
+                        "end/length branch: {target:?}"
+                    );
+                    cursor += 9;
+                    assert_eq!(
+                        before_preflight.get(cursor..cursor + 3),
+                        Some([0x48, 0x83, 0xec].as_slice()),
+                        "x86 aligned frame: {target:?}"
+                    );
+                    assert!(matches!(before_preflight[cursor + 3], 104 | 120));
+                    assert_eq!(identity_relocations, 1, "{target:?}");
+                    assert_eq!(code.get(local_preflight.wrapping_sub(1)), Some(&0xe8));
+                    assert_eq!(
+                        code.get(local_preflight.wrapping_sub(11)..local_preflight),
+                        Some(
+                            [
+                                0x48, 0x8d, 0x44, 0x24, 0x40,
+                                0x48, 0x89, 0x44, 0x24, 0x08,
+                                0xe8,
+                            ]
+                            .as_slice()
+                        ),
+                        "generated x86 private arguments: {target:?}"
+                    );
+                }
+                Architecture::Aarch64 => {
+                    assert_eq!(local_preflight % 4, 0, "{target:?}");
+                    let words = code
+                        .chunks_exact(4)
+                        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                        .collect::<Vec<_>>();
+                    let branch = |index: usize, condition: u8| {
+                        assert_eq!(
+                            words[index] & 0xff00_001f,
+                            0x5400_0000 | u32::from(condition),
+                            "AArch64 guard {index}: {target:?}"
+                        );
+                    };
+                    assert_eq!(words[0], aarch64_cmp_x_imm(0, 0).unwrap());
+                    branch(1, AARCH64_EQ);
+                    assert_eq!(words[2], aarch64_cmp_x_imm(1, 0).unwrap());
+                    branch(3, AARCH64_EQ);
+                    assert_eq!(words[4], aarch64_cmp_x_imm(5, 0).unwrap());
+                    branch(5, AARCH64_EQ);
+                    assert_eq!(words[6], aarch64_and_low_x(6, 5, 3).unwrap());
+                    assert_eq!(words[7], aarch64_cmp_x_imm(6, 0).unwrap());
+                    branch(8, AARCH64_NE);
+                    assert_eq!(words[9], aarch64_cmp_x_imm(2, 0).unwrap());
+                    branch(10, AARCH64_MI);
+                    assert_eq!(words[11], aarch64_cmp_x(3, 4).unwrap());
+                    branch(12, AARCH64_HI);
+                    branch(13, AARCH64_EQ);
+                    assert_eq!(words[14], aarch64_cmp_x(4, 2).unwrap());
+                    branch(15, AARCH64_HI);
+                    assert!(matches!(
+                        words[16],
+                        word if word == aarch64_sub_x_imm(31, 31, 96).unwrap()
+                            || word == aarch64_sub_x_imm(31, 31, 112).unwrap()
+                    ));
+                    assert_eq!(identity_relocations, 2, "{target:?}");
+                    let preflight_word = local_preflight / 4;
+                    assert_eq!(words[preflight_word], 0x9400_0000, "{target:?}");
+                    assert_eq!(
+                        words[preflight_word - 1],
+                        aarch64_add_x_imm(7, 31, 48).unwrap(),
+                        "aligned generated private record: {target:?}"
+                    );
+                }
+            }
+        }
+    }
+
     #[cfg(all(
         any(target_arch = "x86_64", target_arch = "aarch64"),
         any(target_os = "linux", target_os = "macos")
@@ -37567,6 +37734,9 @@ static void init_frozen(uint32_t stride,size_t states,int matching) {{
 uint32_t fre_aot_regex_runtime_search_v1(const unsigned char*a,const unsigned char*b,size_t n,size_t s,size_t e,result_t*r) {{
   (void)a;(void)b;(void)n;(void)s;(void)e;(void)r;return 98;
 }}
+size_t fre_aot_regex_runtime_scan_frozen_loop_v2(const unsigned char*p,const void*s,size_t n) {{
+  (void)p;(void)s;(void)n;return 0;
+}}
 uint32_t fre_aot_regex_runtime_search_exclusive_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r) {{
   fallback_calls++;
   if(h==NULL)return 5;
@@ -37588,7 +37758,7 @@ uint32_t fre_aot_regex_runtime_search_exclusive_dynamic_rows_continue_v1(handle_
   if(d==NULL||c==NULL||memcmp(d,identity,32)!=0)return 86;
   return fre_aot_regex_runtime_search_exclusive_dynamic_rows_deopt_v1(h,p,n,s,e,r);
 }}
-uint32_t fre_aot_regex_runtime_search_exclusive_dynamic_rows_preflight_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*d,preflight_t*out) {{
+uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*d,preflight_t*out) {{
   preflight_calls++;
   if(h==NULL)return 5;
   if(h!=(handle_t)&frozen)return 90;
@@ -39639,7 +39809,7 @@ static frozen_v4_t frozen;
 static unsigned helper_calls;
 uint32_t fre_aot_regex_runtime_search_v1(const unsigned char*a,const unsigned char*b,size_t n,size_t s,size_t e,result_t*r){{(void)a;(void)b;(void)n;(void)s;(void)e;(void)r;helper_calls++;return 97U;}}
 uint32_t fre_aot_regex_runtime_search_exclusive_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;helper_calls++;return 97U;}}
-uint32_t fre_aot_regex_runtime_search_exclusive_dynamic_rows_preflight_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,preflight_t*o){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;(void)i;(void)o;helper_calls++;return 97U;}}
+uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,preflight_t*o){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;(void)i;(void)o;helper_calls++;return 97U;}}
 uint32_t fre_aot_regex_runtime_search_exclusive_dynamic_rows_deopt_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;helper_calls++;return 97U;}}
 uint32_t fre_aot_regex_runtime_search_exclusive_dynamic_rows_continue_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,const continuation_t*c){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;(void)i;(void)c;helper_calls++;return 97U;}}
 size_t fre_aot_regex_runtime_scan_frozen_loop_v2(const unsigned char*p,const void*s,size_t n){{(void)p;(void)s;(void)n;helper_calls++;return 0U;}}
