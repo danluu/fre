@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     CompileError, DeterminizationReport, DeterminizeLimits, DfaStats, ObjectError,
+    bit_parallel_exists::NativeBitParallelExistsView,
     bounded_suffix_retry::{
         BoundedSuffixRetryPlan, select_bounded_interior_retry, select_bounded_suffix_retry,
     },
@@ -210,6 +211,8 @@ pub struct SlowContextAotReport {
 
 #[path = "module_context.rs"]
 mod module_context;
+#[path = "module_bit_parallel_exists.rs"]
+mod module_bit_parallel_exists;
 #[path = "module_dfa_loop_skip.rs"]
 mod module_dfa_loop_skip;
 #[path = "module_seeded_reverse_aarch64.rs"]
@@ -1148,6 +1151,7 @@ impl CompiledModule {
                 semantic_native,
                 false,
                 program.native_context_program_view(),
+                program.native_bit_parallel_exists_view(),
                 program.native_partial_dfa_view(),
                 program.native_dynamic_rows_view(),
                 target,
@@ -1260,6 +1264,7 @@ impl CompiledModule {
             slow_retained_forward_minimized,
             ordinary_native,
             program.native_context_program_view(),
+            program.native_bit_parallel_exists_view(),
             program.native_partial_dfa_view(),
             program.native_dynamic_rows_view(),
             target,
@@ -1313,6 +1318,7 @@ impl CompiledModule {
             false,
             native,
             program.native_context_program_view(),
+            program.native_bit_parallel_exists_view(),
             program.native_partial_dfa_view(),
             program.native_dynamic_rows_view(),
             target,
@@ -1329,6 +1335,7 @@ impl CompiledModule {
         native: Option<NativeProgramView<'_>>,
         native_materialized_fallback: bool,
         native_context: Option<NativeContextProgramView<'_>>,
+        native_bit_parallel: Option<NativeBitParallelExistsView<'_>>,
         native_partial: Option<NativePartialProgramView<'_>>,
         native_dynamic_rows: Option<NativeDynamicRowsProgramView>,
         target: Target,
@@ -1349,6 +1356,7 @@ impl CompiledModule {
             false,
             native,
             native_context,
+            native_bit_parallel,
             native_partial,
             native_dynamic_rows,
             target,
@@ -1368,6 +1376,7 @@ impl CompiledModule {
         slow_retained_forward_minimized: bool,
         native: Option<NativeProgramView<'_>>,
         native_context: Option<NativeContextProgramView<'_>>,
+        native_bit_parallel: Option<NativeBitParallelExistsView<'_>>,
         native_partial: Option<NativePartialProgramView<'_>>,
         native_dynamic_rows: Option<NativeDynamicRowsProgramView>,
         target: Target,
@@ -1413,6 +1422,17 @@ impl CompiledModule {
             let lowering = module_context::lower_native_context(view, target)?;
             let native_digest = native_module_digest(&program_bytes, target, &lowering)?;
             (lowering, native_digest, None)
+        } else if let Some(view) = native_bit_parallel {
+            if let Some(lowering) =
+                module_bit_parallel_exists::lower_native_bit_parallel_exists(view, target)?
+            {
+                let native_digest = native_module_digest(&program_bytes, target, &lowering)?;
+                (lowering, native_digest, None)
+            } else {
+                let lowering = lower_runtime_adapter(program_bytes, target.architecture)?;
+                let native_digest = native_module_digest(&lowering.data, target, &lowering)?;
+                (lowering, native_digest, None)
+            }
         } else if let Some(view) = native_partial {
             if let Some((lowering, prepared_layout)) =
                 lower_native_partial_prepared(program_bytes.clone(), &view, target)?
@@ -28606,6 +28626,7 @@ mod tests {
                 .or_else(|| program.native_exact_product_view()),
             false,
             program.native_context_program_view(),
+            program.native_bit_parallel_exists_view(),
             program.native_partial_dfa_view(),
             program.native_dynamic_rows_view(),
             target,
@@ -40741,6 +40762,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 .or_else(|| scalar_program.native_exact_product_view()),
             false,
             scalar_program.native_context_program_view(),
+            scalar_program.native_bit_parallel_exists_view(),
             scalar_program.native_partial_dfa_view(),
             scalar_program.native_dynamic_rows_view(),
             scalar_target,
@@ -41245,6 +41267,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 None,
                 None,
                 false,
+                None,
                 None,
                 None,
                 None,

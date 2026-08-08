@@ -948,8 +948,9 @@ pub(crate) struct OrderedDfa {
 /// treats entry into that state as a side exit to the exact ordered-NFA
 /// engine. The compact incomplete-state suffix retains either the canonical
 /// ordered frontier and pending mode needed by endpoint contracts, or the
-/// canonical set-valued frontier needed by Exists. K0 continues at the first
-/// unconsumed byte without replaying the prefix.
+/// canonical set-valued frontier needed by Exists. The selected exact fallback
+/// executor continues at the first unconsumed byte without replaying the
+/// prefix.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PartialDfa {
     alphabet: Alphabet,
@@ -1707,6 +1708,13 @@ impl PartialDfa {
         self.forward
             .resume_keys
             .iter()
+            .map(|key| (key.items.as_slice(), key.pending))
+    }
+
+    pub(crate) fn resume_frontier(&self, state: usize) -> Option<(&[u32], bool)> {
+        self.forward
+            .resume_keys
+            .get(state)
             .map(|key| (key.items.as_slice(), key.pending))
     }
 

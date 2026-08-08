@@ -18,6 +18,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{
     CompileMode,
+    bit_parallel_exists::{
+        BitParallelExists, BitParallelExistsStats, NativeBitParallelExistsView,
+    },
     context_dfa::{
         self, ContextDfa, ContextDfaDecline, ContextDfaLimits, ContextDfaOutcome,
         ContextDfaResourceUsage, ContextDfaStats, NativeContextDfaView,
@@ -2414,10 +2417,12 @@ pub struct CompiledProgram {
     /// Optional in-memory assertion optimizer. Stable serialization keeps
     /// the universal ordered-NFA engine and deliberately omits this sidecar.
     context_dfa: Option<ContextDfa>,
-    /// Mutually exclusive, cold optimizing artifacts. Contextual provenance
-    /// and assertion-free retained rows cannot coexist. Combining them keeps
-    /// this field exactly the size and alignment of the former contextual
-    /// provenance option, so ordinary `CompiledProgram` layout is unchanged.
+    /// Cold optimizing artifacts. Contextual provenance and assertion-free
+    /// fallback artifacts cannot coexist; retained rows and their exact
+    /// bit-parallel continuation share one boxed variant when both apply.
+    /// Combining them keeps this field exactly the size and alignment of the
+    /// former contextual provenance option, so ordinary `CompiledProgram`
+    /// layout is unchanged.
     optimization_sidecar: ProgramOptimizationSidecar,
     anchored_prefix: AnchoredPrefix,
     anchored_suffix: AnchoredSuffix,
@@ -2428,9 +2433,9 @@ pub struct CompiledProgram {
     nfa_mandatory_cut: Option<NfaMandatoryCut>,
 }
 
-/// A fresh contextual attempt and an assertion-free partial DFA are mutually
-/// exclusive compiler outcomes. The large contextual report has enough enum
-/// niches to retain the partial owner without growing `CompiledProgram`.
+/// A fresh contextual attempt and assertion-free fallback artifacts are
+/// mutually exclusive compiler outcomes. The large contextual report has
+/// enough enum niches to retain their owner without growing `CompiledProgram`.
 #[allow(
     clippy::large_enum_variant,
     reason = "the mutually exclusive sidecar preserves the baseline contextual-report layout"
@@ -2445,6 +2450,16 @@ enum ProgramOptimizationSidecar {
     Partial(Box<PartialDfa>),
     /// Stable V1--V5 FIFO replay.
     LegacyPartial(Box<PartialDfa>),
+    /// Exact bounded assertion-free Exists fallback without retained rows.
+    BitParallelExists(Box<BitParallelExists>),
+    /// Fresh V6 retained rows and their exact bit-parallel Exists fallback.
+    PartialBitParallelExists(Box<PartialBitParallelExists>),
+}
+
+#[derive(Clone, Debug)]
+struct PartialBitParallelExists {
+    partial: PartialDfa,
+    bit_parallel: BitParallelExists,
 }
 
 const _: () = assert!(
@@ -2463,32 +2478,63 @@ impl ProgramOptimizationSidecar {
             Self::None
             | Self::OptimizingFallback
             | Self::Partial(_)
-            | Self::LegacyPartial(_) => None,
+            | Self::LegacyPartial(_)
+            | Self::BitParallelExists(_)
+            | Self::PartialBitParallelExists(_) => None,
         }
     }
 
     const fn partial_dfa(&self) -> Option<&PartialDfa> {
         match self {
             Self::Partial(partial) | Self::LegacyPartial(partial) => Some(partial),
-            Self::None | Self::OptimizingFallback | Self::Context(_) => None,
+            Self::PartialBitParallelExists(sidecars) => Some(&sidecars.partial),
+            Self::None
+            | Self::OptimizingFallback
+            | Self::Context(_)
+            | Self::BitParallelExists(_) => None,
         }
     }
 
     const fn has_partial_dfa(&self) -> bool {
-        matches!(self, Self::Partial(_) | Self::LegacyPartial(_))
+        matches!(
+            self,
+            Self::Partial(_) | Self::LegacyPartial(_) | Self::PartialBitParallelExists(_)
+        )
     }
 
     const fn is_optimizing_fallback_without_dfa(&self) -> bool {
-        matches!(self, Self::OptimizingFallback)
+        matches!(self, Self::OptimizingFallback | Self::BitParallelExists(_))
     }
 
     const fn partial_replay_order(&self) -> Option<DfaReplayOrder> {
         match self {
-            Self::Partial(_) => Some(DfaReplayOrder::DescendingClassMass),
+            Self::Partial(_) | Self::PartialBitParallelExists(_) => {
+                Some(DfaReplayOrder::DescendingClassMass)
+            }
             Self::LegacyPartial(_) => Some(DfaReplayOrder::Fifo),
-            Self::None | Self::OptimizingFallback | Self::Context(_) => None,
+            Self::None
+            | Self::OptimizingFallback
+            | Self::Context(_)
+            | Self::BitParallelExists(_) => None,
         }
     }
+
+    fn bit_parallel_exists(&self) -> Option<&BitParallelExists> {
+        match self {
+            Self::BitParallelExists(bit_parallel) => Some(bit_parallel),
+            Self::PartialBitParallelExists(sidecars) => Some(&sidecars.bit_parallel),
+            Self::None
+            | Self::OptimizingFallback
+            | Self::Context(_)
+            | Self::Partial(_)
+            | Self::LegacyPartial(_) => None,
+        }
+    }
+}
+
+fn partial_dfa_has_frontier(partial: &PartialDfa) -> bool {
+    let (complete_rows, discovered_states) = partial.retained_dimensions();
+    complete_rows < discovered_states
 }
 
 /// Reusable, allocation-free execution storage for one semantic program.
@@ -7128,6 +7174,19 @@ impl CompiledProgram {
             })
             .flatten();
         let has_nfa_exact_product = nfa_exact_product.is_some();
+        let bit_parallel_exists = (nfa_exact_product.is_none()
+            && output == OutputContract::Exists
+            && engine_selection_reason == EngineSelectionReason::DeterminizationResourceLimit
+            && matches!(engine, ProgramEngine::OrderedNfa)
+            // A resource decline can happen after the complete forward table
+            // was already built (for example, during a later optimization
+            // phase). Keep that stronger table eligible for ordinary native
+            // lowering instead of replacing it with another exact executor.
+            && partial_dfa
+                .as_ref()
+                .is_none_or(partial_dfa_has_frontier))
+        .then(|| BitParallelExists::derive(&raw))
+        .flatten();
         let nfa_mandatory_suffix = (nfa_exact_product.is_none())
             .then(|| {
                 derive_nfa_suffix(
@@ -7151,30 +7210,58 @@ impl CompiledProgram {
                     mode == CompileMode::Optimizing && context_dfa.is_none(),
                 )
             });
+        // An existing mandatory cut remains authoritative. Besides avoiding
+        // redundant retained state, this keeps its stable wire provenance and
+        // lets the narrower window proof run before a whole-graph executor.
+        let bit_parallel_exists = bit_parallel_exists.filter(|_| nfa_mandatory_cut.is_none());
         let optimization_sidecar = match (
             context_determinization_report,
             partial_dfa.filter(|_| !has_nfa_exact_product),
+            bit_parallel_exists,
         ) {
-            (Some(report), None) => ProgramOptimizationSidecar::Context(report),
-            (None, Some(partial)) if matches!(engine, ProgramEngine::OrderedNfa) => {
+            (Some(report), None, None) => ProgramOptimizationSidecar::Context(report),
+            (None, Some(partial), None) if matches!(engine, ProgramEngine::OrderedNfa) => {
                 ProgramOptimizationSidecar::Partial(Box::new(partial))
             }
-            (None, None)
+            (None, None, Some(bit_parallel)) if matches!(engine, ProgramEngine::OrderedNfa) => {
+                ProgramOptimizationSidecar::BitParallelExists(Box::new(bit_parallel))
+            }
+            (None, Some(partial), Some(bit_parallel))
+                if matches!(engine, ProgramEngine::OrderedNfa) =>
+            {
+                ProgramOptimizationSidecar::PartialBitParallelExists(Box::new(
+                    PartialBitParallelExists {
+                        partial,
+                        bit_parallel,
+                    },
+                ))
+            }
+            (None, None, None)
                 if mode == CompileMode::Optimizing
                     && matches!(engine, ProgramEngine::OrderedNfa)
                     && nfa_mandatory_cut.is_none() =>
             {
                 ProgramOptimizationSidecar::OptimizingFallback
             }
-            (None, None) => ProgramOptimizationSidecar::None,
-            (Some(_), Some(_)) => {
+            (None, None, None) => ProgramOptimizationSidecar::None,
+            (Some(_), Some(_), _) => {
                 return Err(CompileError::InternalInvariant(
                     "contextual provenance was paired with a partial DFA",
                 ));
             }
-            (None, Some(_)) => {
+            (Some(_), None, Some(_)) => {
+                return Err(CompileError::InternalInvariant(
+                    "contextual provenance was paired with bit-parallel execution",
+                ));
+            }
+            (None, Some(_), _) => {
                 return Err(CompileError::InternalInvariant(
                     "partial DFA was paired with a non-fallback engine",
+                ));
+            }
+            (None, None, Some(_)) => {
+                return Err(CompileError::InternalInvariant(
+                    "bit-parallel execution was paired with a non-fallback engine",
                 ));
             }
         };
@@ -7313,6 +7400,34 @@ impl CompiledProgram {
 
     fn partial_dfa(&self) -> Option<&PartialDfa> {
         self.optimization_sidecar.partial_dfa()
+    }
+
+    fn bit_parallel_exists(&self) -> Option<&BitParallelExists> {
+        self.optimization_sidecar.bit_parallel_exists()
+    }
+
+    /// Return the canonical one-word fallback dimensions and resource receipt.
+    ///
+    /// This is present only for an assertion-free optimizing `Exists` program
+    /// whose complete determinization declined and whose validated Thompson
+    /// graph fit the fixed bit-parallel construction envelope.
+    #[must_use]
+    pub fn bit_parallel_exists_stats(&self) -> Option<BitParallelExistsStats> {
+        self.bit_parallel_exists().map(BitParallelExists::stats)
+    }
+
+    /// Return the complete canonical one-word `Exists` machine for native
+    /// lowering. The explicit contract/engine checks keep the private sidecar
+    /// from becoming an accidental lowering seam for another result ABI.
+    pub(crate) fn native_bit_parallel_exists_view(
+        &self,
+    ) -> Option<NativeBitParallelExistsView<'_>> {
+        if self.output != OutputContract::Exists
+            || !matches!(self.engine, ProgramEngine::OrderedNfa)
+        {
+            return None;
+        }
+        self.bit_parallel_exists().map(BitParallelExists::native_view)
     }
 
     /// Whether this ordered-NFA artifact has a complete exact-product scanner.
@@ -7843,6 +7958,9 @@ impl CompiledProgram {
         let (dfa, retained_prefix_requirement, retained_suffix_requirement) = match &self.engine {
             ProgramEngine::OrderedDfa(machine) => (machine.native_view(), None, None),
             ProgramEngine::OrderedNfa => {
+                if self.bit_parallel_exists().is_some() {
+                    return None;
+                }
                 // A mandatory cut can narrow the semantic window more
                 // strongly than the ordinary native prefix filters. Keep the
                 // baseline runtime route until native lowering carries and
@@ -8126,6 +8244,9 @@ impl CompiledProgram {
         let partial = self
             .partial_dfa()
             .map(|partial| {
+                // Retained-row lifecycle and compile-time K0 materialization
+                // remain authoritative even when an exact bit executor is
+                // available as a lower-priority native fallback.
                 let resume = (partial.resume_frontier_count() != 0)
                     .then(|| {
                         K0ResumeSet::new(
@@ -8261,6 +8382,8 @@ impl CompiledProgram {
     /// This preserves the ordinary semantic entry's compact call graph while
     /// selecting a retained partial DFA only when the artifact and its exact
     /// workspace both carry one and the input can amortize its fixed dispatch.
+    /// An eligible Exists hole continues in the bit-parallel executor from its
+    /// authenticated frontier rather than replaying the retained prefix.
     /// Runtime adapters for optimizing AOT artifacts should use this entry.
     ///
     /// # Errors
@@ -11373,6 +11496,13 @@ impl CompiledProgram {
             NfaMandatoryCutOutcome::Complete(found) => return Ok(found),
             NfaMandatoryCutOutcome::Continue(narrowed) => window = narrowed,
         }
+        if let Some(bit_parallel) = self.bit_parallel_exists() {
+            return Ok(MatchResult::Exists(bit_parallel.search(
+                haystack,
+                window.start,
+                window.end,
+            )?));
+        }
         self.search_nfa_unaccelerated(haystack, window, workspace)
     }
 
@@ -11805,6 +11935,40 @@ impl CompiledProgram {
     ) -> Result<Option<MatchResult>, CompileError> {
         let input_bytes = window.end.saturating_sub(window.start);
         let consumed = resume.position.saturating_sub(window.start);
+        if resume_set.is_none()
+            && let Some(bit_parallel) = self.bit_parallel_exists()
+        {
+            if self.output != OutputContract::Exists {
+                return Err(CompileError::InternalInvariant(
+                    "bit-parallel continuation was paired with a non-Exists output",
+                ));
+            }
+            if resume.pending_end.is_some() {
+                state.observe_resume(consumed, input_bytes);
+                return Ok(Some(MatchResult::Exists(true)));
+            }
+            let partial = self.partial_dfa().ok_or(CompileError::InternalInvariant(
+                "bit-parallel continuation has no retained partial DFA",
+            ))?;
+            let (frontier, pending) = partial.resume_frontier(resume.state).ok_or(
+                CompileError::InternalInvariant(
+                    "bit-parallel continuation has no authenticated resume frontier",
+                ),
+            )?;
+            if pending {
+                return Err(CompileError::InternalInvariant(
+                    "bit-parallel Exists resume frontier retained an unreported acceptance",
+                ));
+            }
+            let found = bit_parallel.search_from_raw_frontier(
+                haystack,
+                resume.position,
+                window.end,
+                frontier,
+            )?;
+            state.observe_resume(consumed, input_bytes);
+            return Ok(Some(MatchResult::Exists(found)));
+        }
         if resume_set
             .as_ref()
             .is_none_or(|set| !set.is_bound_to(&self.automaton))
@@ -12711,6 +12875,22 @@ impl CompiledProgram {
                 "exact-product flag is incompatible with the embedded graph",
             ));
         }
+        // V7's optimizing-fallback marker and V6's fresh retained rows are
+        // stable proof that the serialized program came from the optimizing
+        // resource-fallback compiler. Reconstruct the bounded exact Exists
+        // executor from the canonical graph instead of consuming another
+        // header flag; the one-byte header already uses its remaining bits for
+        // graph dispatch and optimizer provenance.
+        let bit_parallel_exists = (output == OutputContract::Exists
+            && matches!(engine, ProgramEngine::OrderedNfa)
+            && !has_nfa_exact_product
+            && (optimizing_fallback_enabled
+                || (version == PROGRAM_FORMAT_VERSION_V6 && partial_dfa.is_some()))
+            && partial_dfa
+                .as_deref()
+                .is_none_or(partial_dfa_has_frontier))
+        .then(|| BitParallelExists::derive(&raw))
+        .flatten();
         let nfa_mandatory_suffix = nfa_exact_product
             .is_none()
             .then(|| {
@@ -12745,6 +12925,7 @@ impl CompiledProgram {
         let nfa_mandatory_cut = nfa_exact_product
             .map(NfaMandatoryCut::from_exact_product)
             .or(ordinary_mandatory_cut);
+        let bit_parallel_exists = bit_parallel_exists.filter(|_| nfa_mandatory_cut.is_none());
         if has_nfa_exact_product && partial_dfa.is_some() {
             return Err(ProgramFormatError::Malformed(
                 "exact-product and partial-DFA sidecars are mutually exclusive",
@@ -12755,21 +12936,34 @@ impl CompiledProgram {
                 "partial DFA was paired with a non-fallback engine",
             ));
         }
-        let optimization_sidecar = partial_dfa.map_or_else(
-            || {
-                if optimizing_fallback_enabled {
-                    ProgramOptimizationSidecar::OptimizingFallback
-                } else {
-                    ProgramOptimizationSidecar::None
-                }
-            },
-            |partial| match dfa_replay_order {
+        let optimization_sidecar = match (partial_dfa, bit_parallel_exists) {
+            (None, None) if optimizing_fallback_enabled => {
+                ProgramOptimizationSidecar::OptimizingFallback
+            }
+            (None, None) => ProgramOptimizationSidecar::None,
+            (Some(partial), None) => match dfa_replay_order {
                 DfaReplayOrder::Fifo => ProgramOptimizationSidecar::LegacyPartial(partial),
                 DfaReplayOrder::DescendingClassMass => {
                     ProgramOptimizationSidecar::Partial(partial)
                 }
             },
-        );
+            (None, Some(bit_parallel)) => {
+                ProgramOptimizationSidecar::BitParallelExists(Box::new(bit_parallel))
+            }
+            (Some(partial), Some(bit_parallel)) => {
+                if dfa_replay_order != DfaReplayOrder::DescendingClassMass {
+                    return Err(ProgramFormatError::Malformed(
+                        "bit-parallel retained rows require class-mass replay",
+                    ));
+                }
+                ProgramOptimizationSidecar::PartialBitParallelExists(Box::new(
+                    PartialBitParallelExists {
+                        partial: *partial,
+                        bit_parallel,
+                    },
+                ))
+            }
+        };
         let program = Self {
             raw,
             automaton,
@@ -14378,7 +14572,11 @@ fn put_u64(bytes: &mut Vec<u8>, value: u64) {
 
 #[cfg(test)]
 mod tests {
-    use crate::dfa::{DeterminizationResource, DeterminizationStage};
+    use crate::{
+        MAX_BIT_PARALLEL_EXISTS_MEMORY_BYTES, MAX_BIT_PARALLEL_EXISTS_STATES,
+        MAX_BIT_PARALLEL_EXISTS_WORK,
+        dfa::{DeterminizationResource, DeterminizationStage},
+    };
     use fre_automata::{Automaton, CompileLimits};
     use fre_lower::{LowerLimits, OperationSemantics};
     use fre_syntax::{CanonicalPattern, CompatibilityProfile, ParseRequest, RustProfile};
@@ -16385,6 +16583,197 @@ mod tests {
         }
     }
 
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one exhaustive differential owns selection, every window, wire, and structural declines"
+    )]
+    fn bit_parallel_exists_is_general_exact_bounded_and_round_trips() {
+        let cases: [(&str, &[u8]); 6] = [
+            (r"(?:ab|c)*z", b"xxabczxx"),
+            (r"(?:ab|c)*?z", b"xxabczxx"),
+            (r"(?:a|aa|b)+c", b"xxaaaacx"),
+            (r"(?:[a-c]{0,3}d)?", b"xxabcdxx"),
+            (r"(?:a(?:bc)?|b+d)e", b"xxbbbde"),
+            (r"(?:a{2,4}|ba+)c", b"xxbaaacx"),
+        ];
+        let mut haystacks = generated_byte_strings(b"abcx", 4);
+        haystacks.extend(cases.iter().map(|(_, witness)| witness.to_vec()));
+        haystacks.extend([b"zzzzzz".to_vec(), b"xxxxabczxxxx".to_vec()]);
+
+        for (pattern, _) in cases {
+            let compiled = program(
+                pattern,
+                OutputContract::Exists,
+                CompileMode::Optimizing,
+                DeterminizeLimits {
+                    max_states: 0,
+                    ..DeterminizeLimits::default()
+                },
+            );
+            assert_eq!(compiled.engine_kind(), EngineKind::OrderedNfa, "{pattern}");
+            assert_eq!(
+                compiled.engine_selection_reason(),
+                Some(EngineSelectionReason::DeterminizationResourceLimit),
+                "{pattern}"
+            );
+            assert!(
+                compiled
+                    .determinization_report()
+                    .is_some_and(|report| report.decline.is_some()),
+                "{pattern}"
+            );
+            let stats = compiled
+                .bit_parallel_exists_stats()
+                .unwrap_or_else(|| panic!("bounded graph did not select bit execution: {pattern}"));
+            assert!(compiled.native_dfa_view().is_none());
+            assert!(stats.thompson_states <= MAX_BIT_PARALLEL_EXISTS_STATES);
+            assert!(stats.derivation_work <= MAX_BIT_PARALLEL_EXISTS_WORK);
+            assert!(stats.peak_build_bytes <= MAX_BIT_PARALLEL_EXISTS_MEMORY_BYTES);
+            assert!(stats.transition_entries > 0);
+
+            let bytes = compiled.serialize().expect("serialize bit executor");
+            assert_eq!(
+                u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+                PROGRAM_FORMAT_VERSION_V7
+            );
+            assert_ne!(bytes[15] & PROGRAM_FLAG_NFA_OPTIMIZING_FALLBACK, 0);
+            let restored = CompiledProgram::deserialize(&bytes).expect("restore bit executor");
+            assert_eq!(restored.serialize().unwrap(), bytes);
+            assert_eq!(restored.bit_parallel_exists_stats(), Some(stats));
+            let reference = program(
+                pattern,
+                OutputContract::Exists,
+                CompileMode::Fast,
+                DeterminizeLimits::default(),
+            );
+            assert_eq!(reference.bit_parallel_exists_stats(), None);
+
+            let mut compiled_workspace = compiled.prepare_workspace().unwrap();
+            let mut restored_workspace = restored.prepare_workspace().unwrap();
+            let mut reference_workspace = reference.prepare_workspace().unwrap();
+            assert!(matches!(
+                compiled.search_with_workspace(
+                    b"abc",
+                    SearchWindow::new(2, 1),
+                    &mut compiled_workspace,
+                ),
+                Err(CompileError::InvalidWindow {
+                    start: 2,
+                    end: 1,
+                    haystack_len: 3,
+                })
+            ));
+            assert!(matches!(
+                restored.search_optimized_with_workspace(
+                    b"abc",
+                    SearchWindow::new(0, usize::MAX),
+                    &mut restored_workspace,
+                ),
+                Err(CompileError::InvalidWindow {
+                    start: 0,
+                    end: usize::MAX,
+                    haystack_len: 3,
+                })
+            ));
+
+            for haystack in &haystacks {
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let window = SearchWindow::new(start, end);
+                        let expected = reference
+                            .search_with_workspace(
+                                haystack,
+                                window,
+                                &mut reference_workspace,
+                            )
+                            .unwrap();
+                        assert_eq!(
+                            compiled
+                                .search_with_workspace(
+                                    haystack,
+                                    window,
+                                    &mut compiled_workspace,
+                                )
+                                .unwrap(),
+                            expected,
+                            "ordinary mismatch: {pattern}/{haystack:?}/{start}..{end}"
+                        );
+                        assert_eq!(
+                            compiled
+                                .search_optimized_with_workspace(
+                                    haystack,
+                                    window,
+                                    &mut compiled_workspace,
+                                )
+                                .unwrap(),
+                            expected,
+                            "optimized mismatch: {pattern}/{haystack:?}/{start}..{end}"
+                        );
+                        assert_eq!(
+                            restored
+                                .search_optimized_with_workspace(
+                                    haystack,
+                                    window,
+                                    &mut restored_workspace,
+                                )
+                                .unwrap(),
+                            expected,
+                            "restored mismatch: {pattern}/{haystack:?}/{start}..{end}"
+                        );
+                    }
+                }
+            }
+        }
+
+        let complete = program(
+            r"(?:ab|c)*z",
+            OutputContract::Exists,
+            CompileMode::Optimizing,
+            DeterminizeLimits::default(),
+        );
+        assert_eq!(complete.engine_kind(), EngineKind::OrderedDfa);
+        assert_eq!(complete.bit_parallel_exists_stats(), None);
+
+        for (pattern, output, mode) in [
+            (r"(?:ab|c)*z", OutputContract::Exists, CompileMode::Fast),
+            (
+                r"(?:ab|c)*z",
+                OutputContract::SelectedEnd,
+                CompileMode::Optimizing,
+            ),
+            (
+                r"(?m:^a$)",
+                OutputContract::Exists,
+                CompileMode::Optimizing,
+            ),
+        ] {
+            let declined = program(
+                pattern,
+                output,
+                mode,
+                DeterminizeLimits {
+                    max_states: 0,
+                    ..DeterminizeLimits::default()
+                },
+            );
+            assert_eq!(declined.bit_parallel_exists_stats(), None, "{pattern}");
+        }
+
+        let wide_pattern = format!("{}z", "a".repeat(MAX_BIT_PARALLEL_EXISTS_STATES));
+        let wide = program(
+            &wide_pattern,
+            OutputContract::Exists,
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+        );
+        assert!(wide.raw.roles.len() > MAX_BIT_PARALLEL_EXISTS_STATES);
+        assert_eq!(wide.bit_parallel_exists_stats(), None);
+    }
+
     fn assert_exact_product_matches_fast_for_every_window(
         pattern: &str,
         alphabet: &[u8],
@@ -17774,6 +18163,10 @@ mod tests {
             let restored = CompiledProgram::deserialize(&bytes).expect("restore fallback");
             assert_eq!(restored.engine_kind(), EngineKind::OrderedNfa);
             assert!(restored.nfa_mandatory_suffix.is_some());
+            assert_eq!(
+                restored.bit_parallel_exists_stats(),
+                compiled.bit_parallel_exists_stats()
+            );
             assert_eq!(restored.serialize().unwrap(), bytes);
 
             let fast = program(
@@ -18070,6 +18463,10 @@ mod tests {
             let restored = CompiledProgram::deserialize(&bytes).expect("restore cut fallback");
             assert!(restored.nfa_mandatory_suffix.is_none());
             assert!(restored.nfa_mandatory_cut.is_some());
+            assert_eq!(
+                restored.bit_parallel_exists_stats(),
+                compiled.bit_parallel_exists_stats()
+            );
             assert_eq!(restored.serialize().unwrap(), bytes);
 
             let fast = program(
@@ -18901,6 +19298,10 @@ mod tests {
             );
             let restored = CompiledProgram::deserialize(&bytes).expect("restore fallback");
             assert!(restored.nfa_mandatory_suffix.is_some());
+            assert_eq!(
+                restored.bit_parallel_exists_stats(),
+                compiled.bit_parallel_exists_stats()
+            );
             assert_eq!(
                 restored
                     .nfa_mandatory_suffix
@@ -20696,6 +21097,10 @@ mod tests {
                 })
                 .unwrap_or_else(|| panic!("no retained finite-cut resume for {output:?}"));
             let (limited, maximum_width, narrowed) = limited;
+            if output == OutputContract::Exists {
+                assert!(limited.bit_parallel_exists().is_none());
+                assert!(limited.partial_dfa().is_some());
+            }
             let member_position = witness_start + 11;
             assert_eq!(
                 narrowed,
@@ -20724,6 +21129,11 @@ mod tests {
             let restored =
                 CompiledProgram::deserialize(&bytes).expect("restore retained finite cut");
             assert!(restored.native_dynamic_rows_view().is_some(), "{output:?}");
+            assert_eq!(
+                restored.bit_parallel_exists_stats(),
+                limited.bit_parallel_exists_stats(),
+                "{output:?}"
+            );
             assert_eq!(
                 restored.search_nfa_with_mandatory_cut(&haystack, original),
                 NfaMandatoryCutOutcome::Continue(narrowed),
@@ -29274,6 +29684,30 @@ mod tests {
         assert!(CompiledProgram::deserialize(&incompatible).is_err());
         incompatible[15] = PROGRAM_FLAG_NFA_EXACT_PRODUCT;
         assert!(CompiledProgram::deserialize(&incompatible).is_err());
+
+        let bit_parallel = program(
+            r"(?:ab|c)*z",
+            OutputContract::Exists,
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+        );
+        let bit_bytes = bit_parallel.serialize().unwrap();
+        assert!(bit_parallel.bit_parallel_exists().is_some());
+        assert_eq!(
+            u32::from_le_bytes(bit_bytes[8..12].try_into().unwrap()),
+            PROGRAM_FORMAT_VERSION_V7
+        );
+        assert_ne!(
+            bit_bytes[15] & PROGRAM_FLAG_NFA_OPTIMIZING_FALLBACK,
+            0
+        );
+        assert!(CompiledProgram::deserialize(&bit_bytes).is_ok());
+        let mut legacy_v3_bit = bit_bytes.clone();
+        legacy_v3_bit[8..12].copy_from_slice(&PROGRAM_FORMAT_VERSION_V3.to_le_bytes());
+        assert!(CompiledProgram::deserialize(&legacy_v3_bit).is_err());
 
         let unbounded = program(
             "(?:ab|c)*q[xz]",
