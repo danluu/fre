@@ -3100,7 +3100,11 @@ mod tests {
         for features in [sve, sve2, mixed_sve, mixed_sve2] {
             let target = Target::aarch64_linux().with_features(features).unwrap();
             for words in 2..=MAX_BIT_PARALLEL_EXISTS_WORDS {
-                run_linked_bit_parallel_differential(target, false, words);
+                run_linked_bit_parallel_differential(
+                    target,
+                    false,
+                    u8::try_from(words).expect("bit-parallel word count fits in fixture selector"),
+                );
             }
         }
     }
