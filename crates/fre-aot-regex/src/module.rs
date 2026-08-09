@@ -15040,6 +15040,16 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     // latest accepting pointer so V3/V4/V8/V10/V12 accepting transitions stay
     // register-only; convert back to an offset once at their shared completion.
     let register_last_accept = root_plan.is_none() && output != OutputContract::Exists;
+    // Legacy V2 mutable rows share the same scanner-free value condition, but
+    // still run through their distinct 32-bit offset/pointer loops. R11 is
+    // caller-saved and its authenticated descriptor is dead after V2 setup,
+    // so retain V2's latest endpoint there without changing the public frame.
+    let v2_register_complete = register_last_accept
+        .then(|| assembler.label())
+        .transpose()?;
+    let v2_complete = v2_register_complete
+        .or(native_complete)
+        .unwrap_or(native_no_match);
     let register_complete = register_last_accept
         .then(|| assembler.label())
         .transpose()?;
@@ -15057,7 +15067,13 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     let native_continue = allow_direct_hole_continuation
         .then(|| assembler.label())
         .transpose()?;
-    let pointer_continue = native_continue
+    // Only the cold unpublished-cell edge materializes a scanner-free V2
+    // endpoint in the historical frame slot consumed by the continuation ABI.
+    let v2_register_continue = (register_last_accept && native_continue.is_some())
+        .then(|| assembler.label())
+        .transpose()?;
+    let v2_continue = v2_register_continue.or(native_continue);
+    let pointer_continue = v2_continue
         .map(|_| assembler.label())
         .transpose()?;
     let call_preflight = assembler.label()?;
@@ -17171,7 +17187,8 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         assembler.instruction(&[0x4e, 0x8d, 0x04, 0x86])?;
         if output != OutputContract::Exists {
             // A non-nullable admitted descriptor has no pending endpoint yet.
-            assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x60, 0, 0, 0, 0])?;
+            // R11's descriptor lifetime ended when the pointer row was formed.
+            assembler.instruction(&[0x45, 0x31, 0xdb])?; // xor r11d,r11d
         }
         assembler.branch(&[0xe9], pointer_scan)?;
     }
@@ -17216,10 +17233,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     let loop_rows_checked = root_plan.map(|_| assembler.label()).transpose()?;
     assembler.bind(scan)?;
     assembler.instruction(&[0x48, 0x39, 0xca])?;
-    assembler.branch(
-        &[0x0f, 0x83],
-        native_complete.unwrap_or(native_no_match),
-    )?;
+    assembler.branch(&[0x0f, 0x83], v2_complete)?;
     // The graph scanner independently owns the restartable initial-row skip,
     // including when K0 has also learned a loop overlay for that row. A hit
     // enters the canonical direct cell once; only non-root learned rows remain
@@ -17275,10 +17289,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
 
     assembler.bind(pointer_scan)?;
     assembler.instruction(&[0x48, 0x39, 0xca])?;
-    assembler.branch(
-        &[0x0f, 0x83],
-        native_complete.unwrap_or(native_no_match),
-    )?;
+    assembler.branch(&[0x0f, 0x83], v2_complete)?;
     if root_plan.is_some() {
         // The zero-overlay representation compares two authenticated row
         // pointers. No descriptor field or ownership count is read per byte.
@@ -17497,12 +17508,14 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     assembler.instruction(&[0x41, 0x83, 0xfa, 0xff])?; // cmp r10d, -1
     assembler.branch(
         &[0x0f, 0x84],
-        native_continue.unwrap_or(framed_fallback),
+        v2_continue.unwrap_or(framed_fallback),
     )?;
     assembler.instruction(&[0x48, 0xff, 0xc2])?;
     assembler.instruction(&[0x45, 0x85, 0xd2])?; // test r10d, r10d
     if output == OutputContract::Exists {
         assembler.branch(&[0x0f, 0x88], native_match)?; // js
+    } else if register_last_accept {
+        assembler.instruction(&[0x4c, 0x0f, 0x48, 0xda])?; // cmovs r11,rdx
     } else {
         let not_accepting = assembler.label()?;
         assembler.branch(&[0x0f, 0x89], not_accepting)?; // jns
@@ -17511,10 +17524,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     }
     assembler.instruction(&[0x41, 0x81, 0xe2, 0xff, 0xff, 0xff, 0x1f])?;
     assembler.instruction(&[0x45, 0x85, 0xd2])?;
-    assembler.branch(
-        &[0x0f, 0x84],
-        native_complete.unwrap_or(native_no_match),
-    )?;
+    assembler.branch(&[0x0f, 0x84], v2_complete)?;
     assembler.instruction(&[0x45, 0x89, 0xd0])?;
     assembler.instruction(&[0x41, 0xff, 0xc8])?;
     assembler.branch(&[0xe9], scan)?;
@@ -17533,6 +17543,8 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     assembler.instruction(&[0x45, 0x85, 0xd2])?;
     if output == OutputContract::Exists {
         assembler.branch(&[0x0f, 0x88], native_match)?;
+    } else if register_last_accept {
+        assembler.instruction(&[0x4c, 0x0f, 0x48, 0xda])?; // cmovs r11,rdx
     } else {
         let not_accepting = assembler.label()?;
         assembler.branch(&[0x0f, 0x89], not_accepting)?;
@@ -17541,23 +17553,27 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     }
     assembler.instruction(&[0x41, 0x81, 0xe2, 0xff, 0xff, 0xff, 0x1f])?;
     assembler.instruction(&[0x45, 0x85, 0xd2])?;
-    assembler.branch(
-        &[0x0f, 0x84],
-        native_complete.unwrap_or(native_no_match),
-    )?;
+    assembler.branch(&[0x0f, 0x84], v2_complete)?;
     // The one-based token folds token-to-offset and row-base formation into
     // one LEA. There is no row-plus-class ADD and no MOV/DEC state update.
     assembler.instruction(&[0x4e, 0x8d, 0x44, 0x96, 0xfc])?;
     assembler.branch(&[0xe9], pointer_scan)?;
 
-    if let (Some(pointer_continue), Some(native_continue)) =
-        (pointer_continue, native_continue)
+    if let (Some(pointer_continue), Some(v2_continue)) =
+        (pointer_continue, v2_continue)
     {
         assembler.bind(pointer_continue)?;
         // Continuation's private ABI names the zero-based cell-row offset, not
         // a process pointer. Convert only on the cold unpublished-cell edge.
         assembler.instruction(&[0x49, 0x29, 0xf0])?; // current -= rows
         assembler.instruction(&[0x49, 0xc1, 0xe8, 0x02])?; // bytes -> cells
+        assembler.branch(&[0xe9], v2_continue)?;
+    }
+    if let (Some(v2_register_continue), Some(native_continue)) =
+        (v2_register_continue, native_continue)
+    {
+        assembler.bind(v2_register_continue)?;
+        assembler.instruction(&[0x4c, 0x89, 0x5c, 0x24, 0x60])?; // spill pending end
         assembler.branch(&[0xe9], native_continue)?;
     }
     if let (Some(X86DynamicRootPlan::Range(filter)), Some(kind)) = (root_plan, filter_kind) {
@@ -17694,6 +17710,13 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         assembler.bind(complete)?;
         assembler.instruction(&[0x4d, 0x89, 0xe3])?; // mov r11,r12
         assembler.instruction(&[0x4c, 0x8b, 0x64, 0x24, 0x60])?; // restore r12
+        assembler.instruction(&[0x4d, 0x85, 0xdb])?; // test r11,r11
+        assembler.branch(&[0x0f, 0x84], native_no_match)?;
+        assembler.branch(&[0xe9], native_match)?;
+    }
+
+    if let Some(v2_register_complete) = v2_register_complete {
+        assembler.bind(v2_register_complete)?;
         assembler.instruction(&[0x4d, 0x85, 0xdb])?; // test r11,r11
         assembler.branch(&[0x0f, 0x84], native_no_match)?;
         assembler.branch(&[0xe9], native_match)?;
@@ -26031,6 +26054,15 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     // private frame. V6/V7 spill X4 only across their rare loop-helper call;
     // every eligible compact format tail-merges into one register completion.
     let register_last_accept = root_plan.is_none() && output != OutputContract::Exists;
+    // Legacy V2 mutable rows can retain their endpoint in caller-saved X7.
+    // The ordinary return ABI already consumes X7 as its selected endpoint,
+    // and V2 setup has no live value there once preflight has returned.
+    let v2_register_complete = register_last_accept
+        .then(|| assembler.label())
+        .transpose()?;
+    let v2_complete = v2_register_complete
+        .or(native_complete)
+        .unwrap_or(native_no_match);
     let register_complete = register_last_accept
         .then(|| assembler.label())
         .transpose()?;
@@ -26040,7 +26072,12 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     let native_continue = allow_direct_hole_continuation
         .then(|| assembler.label())
         .transpose()?;
-    let pointer_continue = native_continue
+    // Materialize X7 in the continuation record only on an unpublished cell.
+    let v2_register_continue = (register_last_accept && native_continue.is_some())
+        .then(|| assembler.label())
+        .transpose()?;
+    let v2_continue = v2_register_continue.or(native_continue);
+    let pointer_continue = v2_continue
         .map(|_| assembler.label())
         .transpose()?;
     let call_preflight = assembler.label()?;
@@ -28149,7 +28186,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         assembler.instruction(aarch64_add_x_lsl(11, 15, 11, 2)?)?;
         assembler.instruction(aarch64_mov_x(1, 11)?)?;
         if output != OutputContract::Exists {
-            assembler.instruction(aarch64_store_x(31, 31, 80)?)?;
+            assembler.instruction(aarch64_movz_x(7, 0, 0)?)?;
         }
         assembler.branch(pointer_scan)?;
     }
@@ -28179,10 +28216,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
 
     assembler.bind(scan)?;
     assembler.instruction(aarch64_cmp_x(2, 3)?)?;
-    assembler.branch_cond(
-        AARCH64_HS,
-        native_complete.unwrap_or(native_no_match),
-    )?;
+    assembler.branch_cond(AARCH64_HS, v2_complete)?;
     if root_plan.is_some() {
         // The graph scanner owns the initial row even when K0 publishes a
         // learned-loop overlay for that same row. Every non-root learned row
@@ -28235,10 +28269,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
 
     assembler.bind(pointer_scan)?;
     assembler.instruction(aarch64_cmp_x(2, 3)?)?;
-    assembler.branch_cond(
-        AARCH64_HS,
-        native_complete.unwrap_or(native_no_match),
-    )?;
+    assembler.branch_cond(AARCH64_HS, v2_complete)?;
     if root_plan.is_some() {
         assembler.instruction(aarch64_cmp_x(11, 1)?)?;
         let root_dispatch = root_dispatch.ok_or(ObjectError::InvalidModule(
@@ -28484,11 +28515,15 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     assembler.instruction(aarch64_cmn_w_imm(8, 1)?)?;
     assembler.branch_cond(
         AARCH64_EQ,
-        native_continue.unwrap_or(framed_fallback),
+        v2_continue.unwrap_or(framed_fallback),
     )?;
     assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
     if output == OutputContract::Exists {
         assembler.branch_bit_set_w(8, 31, native_match)?;
+    } else if register_last_accept {
+        // CMN(cell, 1) leaves N set for every accepting canonical cell; ADD
+        // does not alter flags, so select the post-increment endpoint in X7.
+        assembler.instruction(aarch64_csel_x(7, 2, 7, AARCH64_MI)?)?;
     } else {
         let not_accepting = assembler.label()?;
         assembler.branch_bit_clear_w(8, 31, not_accepting)?;
@@ -28496,7 +28531,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         assembler.bind(not_accepting)?;
     }
     assembler.instruction(aarch64_and_low_w(8, 8, 29)?)?;
-    assembler.branch_zero_w(8, native_complete.unwrap_or(native_no_match))?;
+    assembler.branch_zero_w(8, v2_complete)?;
     assembler.instruction(aarch64_sub_w_imm(11, 8, 1)?)?;
     assembler.branch(scan)?;
 
@@ -28512,6 +28547,8 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
     if output == OutputContract::Exists {
         assembler.branch_bit_set_w(8, 31, native_match)?;
+    } else if register_last_accept {
+        assembler.instruction(aarch64_csel_x(7, 2, 7, AARCH64_MI)?)?;
     } else {
         let not_accepting = assembler.label()?;
         assembler.branch_bit_clear_w(8, 31, not_accepting)?;
@@ -28519,14 +28556,14 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         assembler.bind(not_accepting)?;
     }
     assembler.instruction(aarch64_and_low_w(8, 8, 29)?)?;
-    assembler.branch_zero_w(8, native_complete.unwrap_or(native_no_match))?;
+    assembler.branch_zero_w(8, v2_complete)?;
     // X15 is rows-4 and W8 is the nonzero one-based token. One ADD therefore
     // forms the next row directly, with no row-plus-class or token decrement.
     assembler.instruction(aarch64_add_x_lsl(11, 15, 8, 2)?)?;
     assembler.branch(pointer_scan)?;
 
-    if let (Some(pointer_continue), Some(native_continue)) =
-        (pointer_continue, native_continue)
+    if let (Some(pointer_continue), Some(v2_continue)) =
+        (pointer_continue, v2_continue)
     {
         assembler.bind(pointer_continue)?;
         // Reconstruct the exact zero-based cell-row offset only for the cold
@@ -28534,6 +28571,13 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         assembler.instruction(aarch64_sub_x_reg(11, 11, 15)?)?;
         assembler.instruction(aarch64_lsr_x_imm(11, 11, 2)?)?;
         assembler.instruction(aarch64_sub_w_imm(11, 11, 1)?)?;
+        assembler.branch(v2_continue)?;
+    }
+    if let (Some(v2_register_continue), Some(native_continue)) =
+        (v2_register_continue, native_continue)
+    {
+        assembler.bind(v2_register_continue)?;
+        assembler.instruction(aarch64_store_x(7, 31, 80)?)?;
         assembler.branch(native_continue)?;
     }
 
@@ -28771,6 +28815,13 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             assembler.branch(scalar_loop)?;
         }
         }
+    }
+
+    if let Some(v2_register_complete) = v2_register_complete {
+        assembler.bind(v2_register_complete)?;
+        assembler.instruction(aarch64_cmp_x_imm(7, 0)?)?;
+        assembler.branch_cond(AARCH64_EQ, native_no_match)?;
+        assembler.branch(native_match)?;
     }
 
     if let Some(native_complete) = native_complete {
@@ -30769,8 +30820,13 @@ mod tests {
                 );
                 assert_eq!(
                     byte_occurrences(code, &[0x48, 0x89, 0x54, 0x24, 0x60]),
-                    if output == OutputContract::Exists { 0 } else { 4 },
-                    "{context}: only the four noncompact continuation bodies retain stack endpoints; scanner-free V6/V7 add none"
+                    if output == OutputContract::Exists { 0 } else { 2 },
+                    "{context}: only V13's two endpoint bodies retain hot stack updates"
+                );
+                assert_eq!(
+                    byte_occurrences(code, &[0x4c, 0x0f, 0x48, 0xda]),
+                    if output == OutputContract::Exists { 0 } else { 2 },
+                    "{context}: both legacy V2 loops select accepting endpoints into R11 without branches"
                 );
                 for guard in code
                     .windows(x86_pair_guard.len())
@@ -30838,6 +30894,11 @@ mod tests {
                     byte_occurrences(&rooted.code, &[0x48, 0x0f, 0x48, 0xfa]),
                     0,
                     "{context}: rooted endpoint storage keeps its conditional stack update"
+                );
+                assert_eq!(
+                    byte_occurrences(&rooted.code, &[0x4c, 0x0f, 0x48, 0xda]),
+                    0,
+                    "{context}: rooted V2 retains its stack-backed endpoint contract"
                 );
             }
         }
@@ -30949,6 +31010,24 @@ mod tests {
             assert_eq!(
                 words
                     .iter()
+                    .filter(|&&word| {
+                        word == aarch64_csel_x(7, 2, 7, AARCH64_MI).unwrap()
+                    })
+                    .count(),
+                if output == OutputContract::Exists { 0 } else { 2 },
+                "{context}: both legacy V2 loops select accepting endpoints into X7 without branches"
+            );
+            assert_eq!(
+                words
+                    .iter()
+                    .filter(|&&word| word == aarch64_store_x(7, 31, 80).unwrap())
+                    .count(),
+                usize::from(output != OutputContract::Exists),
+                "{context}: V2 spills X7 only on its shared cold continuation edge"
+            );
+            assert_eq!(
+                words
+                    .iter()
                     .filter(|&&word| word == arm_second_u16_cell)
                     .count(),
                 11,
@@ -30996,6 +31075,8 @@ mod tests {
                 (aarch64_store_x(4, 31, 16).unwrap(), 0),
                 (aarch64_load_x_imm(4, 31, 16).unwrap(), 0),
                 (aarch64_mov_x(7, 4).unwrap(), 0),
+                (aarch64_csel_x(7, 2, 7, AARCH64_MI).unwrap(), 0),
+                (aarch64_store_x(7, 31, 80).unwrap(), 0),
             ] {
                 assert_eq!(
                     rooted_words
@@ -35383,15 +35464,19 @@ mod tests {
                     .windows(3)
                     .position(|bytes| bytes == [0x45, 0x85, 0xd2])
                     .expect("x86 sign-bit test");
-            assert_eq!(
-                x86_test_normalized_branch_opcode(&x86, accept_test + 3),
-                Some(if output == OutputContract::Exists {
-                    0x88
-                } else {
-                    0x89
-                }),
-                "x86 {output:?} accepts from the cell sign bit"
-            );
+            if output == OutputContract::Exists {
+                assert_eq!(
+                    x86_test_normalized_branch_opcode(&x86, accept_test + 3),
+                    Some(0x88),
+                    "x86 Exists accepts from the cell sign bit"
+                );
+            } else {
+                assert_eq!(
+                    x86.get(accept_test + 3..accept_test + 7),
+                    Some([0x4c, 0x0f, 0x48, 0xda].as_slice()),
+                    "x86 {output:?} must select the V2 endpoint into R11 without a branch"
+                );
+            }
             let next_mask = [0x41, 0x81, 0xe2, 0xff, 0xff, 0xff, 0x1f];
             let mask = x86_table
                 + x86[x86_table..]
@@ -35508,16 +35593,19 @@ mod tests {
             }
             assert_eq!(words[arm_table + arm_table_prefix.len()] & 0xf, 0);
             let accept = arm_table + arm_table_prefix.len() + 2;
-            let expected_accept = if output == OutputContract::Exists {
-                0x37f8_0008
+            if output == OutputContract::Exists {
+                assert_eq!(
+                    words[accept] & 0xfff8_001f,
+                    0x37f8_0008,
+                    "AArch64 Exists accepts through bit 31"
+                );
             } else {
-                0x36f8_0008
-            };
-            assert_eq!(
-                words[accept] & 0xfff8_001f,
-                expected_accept,
-                "AArch64 {output:?} accepts through bit 31"
-            );
+                assert_eq!(
+                    words[accept],
+                    aarch64_csel_x(7, 2, 7, AARCH64_MI).unwrap(),
+                    "AArch64 {output:?} must select the V2 endpoint into X7 without a branch"
+                );
+            }
             let mask = words[accept..accept + 4]
                 .iter()
                 .position(|&word| word == aarch64_and_low_w(8, 8, 29).unwrap())
@@ -36792,9 +36880,24 @@ mod tests {
                 &[0x49, 0x29, 0xf0, 0x49, 0xc1, 0xe8, 0x02],
                 "x86 pointer hole must recover the zero-based cell-row offset"
             );
-            x86_test_branch_target(code, pointer_continue + 7)
-                .expect("x86 pointer-hole continuation branch")
-                .0
+            let after_conversion = pointer_continue + 7;
+            let continuation = if code.get(after_conversion..after_conversion + 5)
+                == Some([0x4c, 0x89, 0x5c, 0x24, 0x60].as_slice())
+            {
+                after_conversion
+            } else {
+                x86_test_branch_target(code, after_conversion)
+                    .expect("x86 pointer-hole continuation branch")
+                    .0
+            };
+            if code.get(continuation..continuation + 5)
+                == Some([0x4c, 0x89, 0x5c, 0x24, 0x60].as_slice())
+            {
+                return x86_test_branch_target(code, continuation + 5)
+                    .expect("x86 register-endpoint continuation spill branch")
+                    .0;
+            }
+            continuation
         }
 
         fn aarch64_conditional_target(words: &[u32], branch: usize) -> usize {
@@ -36858,6 +36961,14 @@ mod tests {
                 "x86 {output:?}"
             );
             let continuation = x86_unfilled_target(&x86.code, true);
+            assert_eq!(
+                x86.code
+                    .windows(5)
+                    .filter(|bytes| *bytes == [0x4c, 0x89, 0x5c, 0x24, 0x60])
+                    .count(),
+                1 + 2 * usize::from(output != OutputContract::Exists),
+                "x86 {output:?} adds one cold V2 endpoint spill beside V13 and the continuation cache record"
+            );
             assert_eq!(
                 &x86.code[continuation..continuation + 5],
                 &[0x4c, 0x8b, 0x54, 0x24, 0x10],
@@ -36942,8 +37053,25 @@ mod tests {
                 ],
                 "AArch64 pointer hole must recover the zero-based cell-row offset"
             );
-            let continuation =
-                aarch64_unconditional_target(&words, pointer_continue + 3);
+            let after_conversion = pointer_continue + 3;
+            let mut continuation = if words[after_conversion]
+                == aarch64_store_x(7, 31, 80).unwrap()
+            {
+                after_conversion
+            } else {
+                aarch64_unconditional_target(&words, after_conversion)
+            };
+            if words[continuation] == aarch64_store_x(7, 31, 80).unwrap() {
+                continuation = aarch64_unconditional_target(&words, continuation + 1);
+            }
+            assert_eq!(
+                words
+                    .iter()
+                    .filter(|&&word| word == aarch64_store_x(7, 31, 80).unwrap())
+                    .count(),
+                usize::from(output != OutputContract::Exists),
+                "AArch64 {output:?} emits one cold V2 endpoint spill"
+            );
             assert_eq!(
                 words[continuation],
                 aarch64_load_x_imm(12, 31, 0).unwrap(),
@@ -38822,10 +38950,10 @@ mod tests {
         any(target_os = "linux", target_os = "macos")
     ))]
     #[test]
-    #[ignore = "requires `cargo build -p fre-aot-regex-runtime --lib`; links scanner-free generated code to the real continuation runtime"]
+    #[ignore = "requires `cargo build -p fre-aot-regex-runtime --lib`; links scanner-free V2 register endpoints to the real continuation runtime"]
     #[allow(
         clippy::too_many_lines,
-        reason = "the opt-in test covers three value contracts, match/no-match, and pending priority in one real-runtime matrix"
+        reason = "the opt-in test covers direct V2 completion, cold holes, three value contracts, pending priority, and caller ABI preservation in one real-runtime matrix"
     )]
     fn linked_host_scanner_free_dynamic_first_hole_uses_real_runtime() {
         fn host_target() -> Target {
@@ -38929,6 +39057,15 @@ mod tests {
                 &format!("{output:?}"),
                 window,
                 &[
+                    // The warmed input remains entirely in published mutable
+                    // V2 rows and settles directly from R11/X7.
+                    LinkedDynamicFirstHoleCase {
+                        warm: &warm,
+                        novel: &warm,
+                        expected_status,
+                        expected_start,
+                        expected_end,
+                    },
                     LinkedDynamicFirstHoleCase {
                         warm: &warm,
                         novel: &matching,
@@ -38969,13 +39106,22 @@ mod tests {
             false,
             "SelectedEndPending",
             window,
-            &[LinkedDynamicFirstHoleCase {
-                warm: &warm,
-                novel: &matching,
-                expected_status: 1,
-                expected_start: pending_end,
-                expected_end: pending_end,
-            }],
+            &[
+                LinkedDynamicFirstHoleCase {
+                    warm: &warm,
+                    novel: &warm,
+                    expected_status: 1,
+                    expected_start: window_start + 2,
+                    expected_end: window_start + 2,
+                },
+                LinkedDynamicFirstHoleCase {
+                    warm: &warm,
+                    novel: &matching,
+                    expected_status: 1,
+                    expected_start: pending_end,
+                    expected_end: pending_end,
+                },
+            ],
         );
     }
 
