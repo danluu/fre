@@ -960,13 +960,13 @@ pub(crate) struct PartialDfa {
 
 /// Compiler-owned completed-row prefix retained by the bounded slow AOT pass.
 ///
-/// This is deliberately not a [`PartialDfa`]. It carries no resume keys,
-/// portable packing, start certificates, stable limits, or serialization ABI.
-/// A genuinely incomplete forward prefix treats every destination outside
-/// `complete_rows` as one synthetic whole-search-deoptimization hole. A
-/// later-stage numeric decline can instead retain a complete forward machine
-/// plus the already-built optional reverse machine for ordinary direct native
-/// lowering.
+/// This is deliberately not a [`PartialDfa`]. It carries no portable packing,
+/// start certificates, stable limits, or serialization ABI. A genuinely
+/// incomplete forward prefix keeps the compiler's already-owned discovery
+/// keys so a private object sidecar can bind exact K0 continuations without
+/// replaying completed rows. A later-stage numeric decline can instead retain
+/// a complete forward machine plus the already-built optional reverse machine
+/// for ordinary direct native lowering.
 #[derive(Debug)]
 pub(crate) struct NativeSlowPartial {
     alphabet: Alphabet,
@@ -986,6 +986,10 @@ struct NativeSlowPartialForward {
     complete_rows: usize,
     discovered_states: usize,
     states_before_minimization: usize,
+    /// Already-owned subset keys in discovery order. This is populated only
+    /// for a genuinely incomplete prefix; completed candidates need no
+    /// continuation sidecar.
+    states: Vec<ForwardKey>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2418,6 +2422,7 @@ impl NativeSlowPartial {
                 complete_rows: states,
                 discovered_states: states,
                 states_before_minimization,
+                states: Vec::new(),
             },
             reverse,
             reverse_states_before_minimization,
@@ -2446,6 +2451,25 @@ impl NativeSlowPartial {
 
     pub(crate) const fn retained_dimensions(&self) -> (usize, usize) {
         (self.forward.complete_rows, self.forward.discovered_states)
+    }
+
+    pub(crate) fn resume_frontiers(
+        &self,
+    ) -> Option<impl ExactSizeIterator<Item = (&[u32], bool)>> {
+        let keys = self
+            .forward
+            .states
+            .get(self.forward.complete_rows..self.forward.discovered_states)?;
+        (!keys.is_empty()).then(|| {
+            keys.iter()
+                .map(|key| (key.items.as_slice(), key.pending))
+        })
+    }
+
+    pub(crate) fn resume_item_count(&self) -> Option<usize> {
+        self.resume_frontiers()?.try_fold(0usize, |total, (items, _)| {
+            total.checked_add(items.len())
+        })
     }
 
     pub(crate) const fn retained_forward_minimized(&self) -> bool {
@@ -4712,10 +4736,11 @@ fn compact_partial_forward(
     })
 }
 
-/// Retain the slow compiler's already-owned completed rows without making a
-/// fallible allocation after the resource refusal. Worklist keys and start
-/// actions are intentionally dropped: a synthetic native hole restarts the
-/// original whole search and therefore consumes neither continuation ABI.
+/// Retain the slow compiler's already-owned completed rows and discovery keys
+/// without making a fallible allocation after the resource refusal. Native
+/// object lowering may copy the incomplete suffix into a private continuation
+/// descriptor; keeping the original vector here does not allocate or change
+/// the slow compiler's bounded accounting.
 fn retain_native_slow_partial_forward(
     mut transitions: Vec<ForwardCell>,
     states: Vec<ForwardKey>,
@@ -4733,7 +4758,6 @@ fn retain_native_slow_partial_forward(
     }
     transitions.truncate(completed_cells);
     let discovered_states = states.len();
-    drop(states);
     Some(NativeSlowPartialForward {
         initial_pending,
         initial_terminal,
@@ -4741,6 +4765,7 @@ fn retain_native_slow_partial_forward(
         complete_rows,
         discovered_states,
         states_before_minimization: discovered_states,
+        states,
     })
 }
 

@@ -5800,6 +5800,12 @@ impl K0ResumeSet {
         self.automaton_identity == automaton.identity()
     }
 
+    /// Return the authenticated pending-end mode for one ordered frontier.
+    #[doc(hidden)]
+    pub fn pending_mode(&self, state: usize) -> Result<bool, SearchError> {
+        self.frontier(state).map(|(_, pending)| pending)
+    }
+
     fn frontier(&self, state: usize) -> Result<(&[u32], bool), SearchError> {
         let offset = *self
             .offsets
@@ -5890,6 +5896,63 @@ pub struct K0FullyPrefilledResumeMapProjection<'a> {
     compact_row_stride: u32,
     raw_byte_row_base: Option<u32>,
     cache_identity: u64,
+}
+
+/// Constant-time projection of one selected resume state from a sealed,
+/// fully-prefilled cache generation.
+///
+/// The resume set's fields are private and its set-level cache identity is
+/// cleared by every ordinary hint repair. Once that seal and the K0 receipt
+/// authenticate, a prepared exclusive runtime can map the one state selected
+/// by generated code without rescanning every unrelated frontier or every
+/// complete transition row on each match.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct K0FullyPrefilledResumeStateProjection {
+    source_state: u32,
+    source_initial_state: u32,
+    state_count: usize,
+    row_stride: u32,
+    cache_identity: u64,
+    pending: bool,
+}
+
+impl K0FullyPrefilledResumeStateProjection {
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn source_state(self) -> u32 {
+        self.source_state
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn source_initial_state(self) -> u32 {
+        self.source_initial_state
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn state_count(self) -> usize {
+        self.state_count
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn row_stride(self) -> u32 {
+        self.row_stride
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn cache_identity(self) -> u64 {
+        self.cache_identity
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn pending(self) -> bool {
+        self.pending
+    }
 }
 
 impl K0FullyPrefilledResumeMapProjection<'_> {
@@ -6599,7 +6662,7 @@ impl K0Workspace {
         automaton: &Automaton,
         resume_set: &mut K0ResumeSet,
     ) -> Option<K0FullyPrefilledResumeCacheReceipt> {
-        prefill_complete_caches_transaction(automaton, self, Some(resume_set)).unwrap_or(None)
+        prefill_complete_caches_transaction(automaton, self, Some(resume_set), None).unwrap_or(None)
     }
 
     /// Complete every root-reachable forward and reverse row without a
@@ -6612,7 +6675,102 @@ impl K0Workspace {
         &mut self,
         automaton: &Automaton,
     ) -> Option<K0FullyPrefilledResumeCacheReceipt> {
-        prefill_complete_caches_transaction(automaton, self, None).unwrap_or(None)
+        prefill_complete_caches_transaction(automaton, self, None, None).unwrap_or(None)
+    }
+
+    /// Replace one authenticated complete root cache with a complete cache
+    /// that also interns a newly discovered compiler-owned resume set.
+    ///
+    /// The old receipt is narrow replacement authority: ordinary warmed or
+    /// partially populated workspaces still decline. Construction remains a
+    /// private all-or-nothing transaction in a same-layout workspace, and the
+    /// live rows plus resume hints change only after the staged root, every
+    /// resume frontier, all transitions, and optional reverse rows are closed.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn compiler_private_try_extend_fully_prefilled_root_with_resume_receipt(
+        &mut self,
+        automaton: &Automaton,
+        resume_set: &mut K0ResumeSet,
+        root_receipt: K0FullyPrefilledResumeCacheReceipt,
+    ) -> Option<K0FullyPrefilledResumeCacheReceipt> {
+        self.fully_prefilled_root_cache_is_live(automaton, root_receipt, false)?;
+        prefill_complete_caches_transaction(
+            automaton,
+            self,
+            Some(resume_set),
+            Some(root_receipt),
+        )
+        .unwrap_or(None)
+    }
+
+    /// Attach a new ordered-resume set to an already complete root cache.
+    ///
+    /// Immutable prepared-row owners complete the root cache during setup,
+    /// before a compiler-owned static-prefix descriptor is seen. This cheap
+    /// setup/cold path authenticates the retained root receipt and finds every
+    /// exact resume frontier already present among its interned states. It
+    /// performs a complete read-only validation pass before publishing any
+    /// hint, allocates nothing, and never changes rows or cache identity. A
+    /// caller whose committed-prefix frontier is absent may then use the
+    /// separately authenticated superset-replacement transaction above.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn compiler_private_try_bind_resume_to_fully_prefilled_root_cache_with_receipt(
+        &self,
+        automaton: &Automaton,
+        resume_set: &mut K0ResumeSet,
+        receipt: K0FullyPrefilledResumeCacheReceipt,
+    ) -> Option<K0FullyPrefilledResumeCacheReceipt> {
+        self.fully_prefilled_root_cache_is_live(automaton, receipt, false)?;
+        let count = resume_set.cached_states.len();
+        if count == 0
+            || !resume_set.is_bound_to(automaton)
+            || resume_set.cached_workspace_identities.len() != count
+            || resume_set.modes.len() != count
+            || resume_set.offsets.len() != count
+            || resume_set.lengths.len() != count
+            || resume_set
+                .cached_states
+                .iter()
+                .any(|&state| state != LAZY_NO_STATE)
+        {
+            return None;
+        }
+
+        let find_state = |frontier: &[u32], pending: bool| {
+            (0..receipt.forward_state_len).find_map(|state| {
+                let state = u32::try_from(state).ok()?;
+                let (offset, length, cached_pending) =
+                    resume_lazy_state_bounds(&self.lazy, state).ok()?;
+                let end = offset.checked_add(length)?;
+                (cached_pending == pending
+                    && self.lazy.items.get(offset..end) == Some(frontier))
+                .then_some(state)
+            })
+        };
+
+        // The first pass is deliberately mutation-free. A foreign frontier
+        // leaves every existing hint and the set-level publication seal
+        // untouched.
+        for resume_state in 0..count {
+            let (frontier, pending) = resume_set.frontier(resume_state).ok()?;
+            find_state(frontier, pending)?;
+        }
+
+        // Every lookup above succeeded against immutable rows. Recompute the
+        // bounded map to avoid temporary allocation, then publish the common
+        // cache identity last.
+        for resume_state in 0..count {
+            let (frontier, pending) = resume_set.frontier(resume_state).ok()?;
+            let state = find_state(frontier, pending)?;
+            *resume_set.cached_states.get_mut(resume_state)? = state;
+            *resume_set
+                .cached_workspace_identities
+                .get_mut(resume_state)? = receipt.cache_identity;
+        }
+        resume_set.fully_prefilled_cache_identity = receipt.cache_identity;
+        Some(receipt)
     }
 
     /// Authenticate a retained prefill receipt and return the exact cached row
@@ -6747,6 +6905,78 @@ impl K0Workspace {
             }
         }
         Some(())
+    }
+
+    /// Authenticate and project one generated-code-selected resume state in
+    /// constant time.
+    ///
+    /// The complete map projection below remains the setup/publication proof
+    /// when raw addresses or all entries are exposed. This narrower form is
+    /// for a permanently owned prepared session: private resume metadata was
+    /// already sealed by the complete transaction, and any ordinary repair
+    /// clears `fully_prefilled_cache_identity` before this method can succeed
+    /// again.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn compiler_private_fully_prefilled_resume_state_projection(
+        &self,
+        automaton: &Automaton,
+        resume_set: &K0ResumeSet,
+        resume_state: usize,
+        receipt: K0FullyPrefilledResumeCacheReceipt,
+    ) -> Option<K0FullyPrefilledResumeStateProjection> {
+        self.fully_prefilled_cache_is_live(automaton, resume_set, receipt, false)?;
+        let count = resume_set.cached_states.len();
+        if count == 0
+            || resume_set.cached_workspace_identities.len() != count
+            || resume_set.modes.len() != count
+            || resume_set.offsets.len() != count
+            || resume_set.lengths.len() != count
+        {
+            return None;
+        }
+        let mode = *resume_set.modes.get(resume_state)?;
+        let source_state = *resume_set.cached_states.get(resume_state)?;
+        let cached_identity = *resume_set
+            .cached_workspace_identities
+            .get(resume_state)?;
+        let source_state_index = usize::try_from(source_state).ok()?;
+        if mode > 1
+            || cached_identity != receipt.cache_identity
+            || source_state == LAZY_NO_STATE
+            || source_state_index >= receipt.forward_state_len
+        {
+            return None;
+        }
+        let (_, _, cached_pending) = resume_lazy_state_bounds(&self.lazy, source_state).ok()?;
+        if cached_pending != (mode != 0) {
+            return None;
+        }
+        let stride = usize::try_from(receipt.direct_row_stride).ok()?;
+        if stride == 0 {
+            return None;
+        }
+        let source_row = usize::try_from(self.lazy.row_offset(source_state).ok()?).ok()?;
+        if source_row.checked_add(stride)? > receipt.forward_cells {
+            return None;
+        }
+        let source_initial_state = self.lazy.initial;
+        let source_initial_index = usize::try_from(source_initial_state).ok()?;
+        let initial_row = usize::try_from(self.lazy.row_offset(source_initial_state).ok()?).ok()?;
+        if source_initial_state == LAZY_NO_STATE
+            || source_initial_index >= receipt.forward_state_len
+            || initial_row.checked_add(stride)? > receipt.forward_cells
+        {
+            return None;
+        }
+        Some(K0FullyPrefilledResumeStateProjection {
+            source_state,
+            source_initial_state,
+            state_count: receipt.forward_state_len,
+            row_stride: receipt.direct_row_stride,
+            cache_identity: receipt.cache_identity,
+            pending: mode != 0,
+        })
     }
 
     /// Authenticate every ordered-resume entry and borrow its frozen K0 map
@@ -19104,23 +19334,33 @@ fn prefill_complete_caches_transaction(
     automaton: &Automaton,
     live: &mut K0Workspace,
     resume_set: Option<&mut K0ResumeSet>,
+    replacement_root_receipt: Option<K0FullyPrefilledResumeCacheReceipt>,
 ) -> Result<Option<K0FullyPrefilledResumeCacheReceipt>, SearchError> {
+    let replacing_complete_root = replacement_root_receipt.is_some_and(|receipt| {
+        live.fully_prefilled_root_cache_is_live(automaton, receipt, false)
+            .is_some()
+    });
+    if replacement_root_receipt.is_some() && !replacing_complete_root {
+        return Ok(None);
+    }
+    let live_caches_are_cold = !live.lazy.initialized
+        && live.lazy.state_len == 0
+        && live.lazy.item_len == 0
+        && (!live.reverse.is_allocated()
+            || (!live.reverse.initialized
+                && live.reverse.state_len == 0
+                && live.reverse.item_len == 0));
     if live.bound_automaton_identity != automaton.identity()
         || automaton.stats().assertion_edges() != 0
         || !live.lazy.is_allocated()
         || live.lazy.context.is_allocated()
-        || live.lazy.initialized
-        || live.lazy.state_len != 0
-        || live.lazy.item_len != 0
         || live.lazy.declined
         || live.lazy.saturated
         || (live.reverse.is_allocated()
             && (live.reverse.context.is_allocated()
-                || live.reverse.initialized
-                || live.reverse.state_len != 0
-                || live.reverse.item_len != 0
                 || live.reverse.declined
                 || live.reverse.saturated))
+        || (!replacing_complete_root && !live_caches_are_cold)
         || resume_set.as_deref().is_some_and(|resume_set| {
             !resume_set.is_bound_to(automaton)
                 || resume_set
@@ -50671,6 +50911,102 @@ mod tests {
     }
 
     #[test]
+    fn compiler_private_root_prefill_transactionally_adds_foreign_resume_frontiers() {
+        let plan = byte_chain(&[(b'a', b'a'), (b'b', b'b'), (b'c', b'c')]);
+        let mut workspace =
+            K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let retained = workspace.retained_bytes();
+        let old_receipt = workspace
+            .compiler_private_try_prefill_root_cache_with_receipt(&plan)
+            .expect("root-only complete cache");
+        let old_identity = workspace.lazy.cache_identity;
+        let old_rows = workspace.lazy.rows.clone();
+
+        // A committed-prefix singleton is not part of the ordinary
+        // unanchored root quotient for this chain. The read-only fast attach
+        // therefore declines without publishing even one hint.
+        let frontier = [1_u32];
+        let mut resume =
+            K0ResumeSet::new(&plan, 1, 1, [(&frontier[..], false)]).unwrap();
+        assert!(
+            workspace
+                .compiler_private_try_bind_resume_to_fully_prefilled_root_cache_with_receipt(
+                    &plan,
+                    &mut resume,
+                    old_receipt,
+                )
+                .is_none(),
+            "the fixture must require a true superset transaction"
+        );
+        assert_eq!(resume.cached_states, [super::LAZY_NO_STATE]);
+        assert_eq!(
+            resume.cached_workspace_identities,
+            [super::PRISTINE_RESUME_CACHE_ID]
+        );
+        assert_eq!(resume.fully_prefilled_cache_identity, 0);
+
+        let mut wrong = old_receipt;
+        wrong.cache_identity ^= u64::MAX;
+        assert!(
+            workspace
+                .compiler_private_try_extend_fully_prefilled_root_with_resume_receipt(
+                    &plan,
+                    &mut resume,
+                    wrong,
+                )
+                .is_none()
+        );
+        assert_eq!(workspace.lazy.cache_identity, old_identity);
+        assert_eq!(workspace.lazy.rows, old_rows);
+        assert_eq!(resume.cached_states, [super::LAZY_NO_STATE]);
+        assert!(
+            workspace
+                .compiler_private_fully_prefilled_root_projection_without_resume(
+                    &plan,
+                    old_receipt,
+                )
+                .is_some()
+        );
+
+        let new_receipt = workspace
+            .compiler_private_try_extend_fully_prefilled_root_with_resume_receipt(
+                &plan,
+                &mut resume,
+                old_receipt,
+            )
+            .expect("the root-plus-resume superset must fit the same layout");
+        assert_eq!(workspace.retained_bytes(), retained);
+        assert_ne!(new_receipt.cache_identity, old_receipt.cache_identity);
+        assert!(
+            workspace
+                .compiler_private_fully_prefilled_root_projection_without_resume(
+                    &plan,
+                    old_receipt,
+                )
+                .is_none(),
+            "replacement must retire the old cache generation"
+        );
+        assert!(
+            workspace
+                .compiler_private_fully_prefilled_root_projection_without_resume(
+                    &plan,
+                    new_receipt,
+                )
+                .is_some()
+        );
+        let projection = workspace
+            .compiler_private_fully_prefilled_resume_map_projection(
+                &plan,
+                &resume,
+                new_receipt,
+            )
+            .expect("the replacement receipt must authenticate its resume map");
+        assert_eq!(projection.count(), 1);
+        assert_eq!(projection.pending(0), Some(false));
+        assert!(projection.compact_row(0).is_some());
+    }
+
+    #[test]
     #[allow(
         clippy::too_many_lines,
         reason = "the setup projection regression exhaustively corrupts every parallel map entry"
@@ -50729,6 +51065,26 @@ mod tests {
             assert_eq!(projection.compact_row(projection.count()), None);
             assert_eq!(projection.raw_byte_row(projection.count()), None);
         }
+        let root = workspace
+            .compiler_private_fully_prefilled_root_projection_without_resume(&plan, receipt)
+            .expect("sealed root projection");
+        let source_initial_state = root.forward_initial_row() / root.row_stride();
+        for resume_state in 0..resume.cached_states.len() {
+            let selected = workspace
+                .compiler_private_fully_prefilled_resume_state_projection(
+                    &plan,
+                    &resume,
+                    resume_state,
+                    receipt,
+                )
+                .expect("constant-time selected resume projection");
+            assert_eq!(selected.source_state(), resume.cached_states[resume_state]);
+            assert_eq!(selected.source_initial_state(), source_initial_state);
+            assert_eq!(selected.state_count(), receipt.forward_state_len);
+            assert_eq!(selected.row_stride(), receipt.direct_row_stride);
+            assert_eq!(selected.cache_identity(), receipt.cache_identity);
+            assert_eq!(selected.pending(), resume.modes[resume_state] != 0);
+        }
 
         let empty = b"";
         assert_eq!(
@@ -50761,6 +51117,16 @@ mod tests {
                     .is_none(),
                 "stale workspace identity at resume index {resume_state} must fail closed"
             );
+            assert!(
+                workspace
+                    .compiler_private_fully_prefilled_resume_state_projection(
+                        &plan,
+                        &resume,
+                        resume_state,
+                        receipt,
+                    )
+                    .is_none()
+            );
             resume.cached_workspace_identities[resume_state] = saved_identity;
 
             let saved_state = resume.cached_states[resume_state];
@@ -50773,6 +51139,16 @@ mod tests {
                     .is_none(),
                 "missing cached state at resume index {resume_state} must fail closed"
             );
+            assert!(
+                workspace
+                    .compiler_private_fully_prefilled_resume_state_projection(
+                        &plan,
+                        &resume,
+                        resume_state,
+                        receipt,
+                    )
+                    .is_none()
+            );
             resume.cached_states[resume_state] = saved_state;
 
             let saved_mode = resume.modes[resume_state];
@@ -50784,6 +51160,16 @@ mod tests {
                     )
                     .is_none(),
                 "noncanonical pending mode at resume index {resume_state} must fail closed"
+            );
+            assert!(
+                workspace
+                    .compiler_private_fully_prefilled_resume_state_projection(
+                        &plan,
+                        &resume,
+                        resume_state,
+                        receipt,
+                    )
+                    .is_none()
             );
             resume.modes[resume_state] = saved_mode;
         }

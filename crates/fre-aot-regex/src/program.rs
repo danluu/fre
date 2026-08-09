@@ -40,6 +40,15 @@ use crate::{
 };
 
 const PROGRAM_MAGIC: &[u8; 8] = b"FREGAOT\0";
+/// Compiler-private object sidecar for transient slow-prefix continuation.
+#[doc(hidden)]
+pub const STATIC_PREFIX_RESUME_DESCRIPTOR_V1_MAGIC: &[u8; 8] = b"FRESPXK1";
+#[doc(hidden)]
+pub const STATIC_PREFIX_RESUME_DESCRIPTOR_V1_HEADER_BYTES: usize = 32;
+#[doc(hidden)]
+pub const STATIC_PREFIX_RESUME_DESCRIPTOR_V1_STATE_BYTES: usize = 16;
+#[doc(hidden)]
+pub const STATIC_PREFIX_RESUME_DESCRIPTOR_V1_MAX_BYTES: usize = 256 * 1024 * 1024;
 const PROGRAM_FORMAT_VERSION_V1: u32 = 1;
 const PROGRAM_FORMAT_VERSION_V2: u32 = 2;
 const PROGRAM_FORMAT_VERSION_V3: u32 = 3;
@@ -2551,6 +2560,7 @@ pub struct ProgramWorkspace {
     identity: ProgramIdentity,
     nfa: Option<K0Workspace>,
     partial: Option<Box<PartialDfaWorkspace>>,
+    static_prefix_resume: Option<Box<StaticPrefixResumeWorkspace>>,
     dynamic_native_rows: Option<Box<DynamicNativeRowsWorkspace>>,
 }
 
@@ -3006,6 +3016,16 @@ pub struct FrozenDynamicRowsStorageV3 {
     loop_index: Box<[u8]>,
     loop_scanners: Box<[FrozenCompactLoopScanner]>,
     descriptor_v6: Option<FrozenDynamicRowsV6>,
+}
+
+/// Result of continuing an already-consumed static prefix in an immutable
+/// supertransition table.  The endpoint is sufficient for every value
+/// contract: `Exists` observes only presence, `SelectedEnd` returns it directly,
+/// fixed-width Span derives its start arithmetically, and variable-width Span
+/// runs the existing authenticated reverse-only postflight.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FrozenStaticPrefixForwardOutcome {
+    selected_end: Option<usize>,
 }
 
 /// Stable preamble magic for [`FrozenPreparedHeaderV1`].
@@ -6076,6 +6096,345 @@ impl FrozenDynamicRowsStorageV3 {
         }
     }
 
+    /// Continue from one canonical K0 state in an immutable compact-row owner.
+    ///
+    /// Static-prefix holes and the prepared root table are produced from the
+    /// same fully-prefilled K0 cache. Once the caller authenticates that
+    /// lineage and maps the hole frontier to a canonical state, the compact
+    /// cells have exactly the same semantics as a root scan; only the initial
+    /// row/block and pending endpoint differ. Every compact generation is
+    /// decoded from its published format contract rather than from a regex or
+    /// compiler-recipe identity.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one checked decoder keeps all immutable row-format contracts adjacent"
+    )]
+    fn static_prefix_forward_from_canonical_state(
+        &self,
+        haystack: &[u8],
+        resume_position: usize,
+        window_end: usize,
+        canonical_state: usize,
+        pending_end: Option<usize>,
+        output: OutputContract,
+    ) -> Option<FrozenStaticPrefixForwardOutcome> {
+        if resume_position > window_end || window_end > haystack.len() {
+            return None;
+        }
+        let class_count = usize::try_from(self.descriptor.class_count).ok()?;
+        let state_count = usize::try_from(self.descriptor.state_count).ok()?;
+        if class_count == 0 || canonical_state >= state_count {
+            return None;
+        }
+        let mut position = resume_position;
+        let mut selected_end = pending_end;
+        if output == OutputContract::Exists && selected_end.is_some() {
+            return Some(FrozenStaticPrefixForwardOutcome { selected_end });
+        }
+
+        if matches!(
+            self.descriptor.format_version,
+            FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION
+                | FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION
+                | FROZEN_DYNAMIC_ROWS_V8_FORMAT_VERSION
+                | FROZEN_DYNAMIC_ROWS_V9_FORMAT_VERSION
+        ) {
+            let state_ordinal = matches!(
+                self.descriptor.format_version,
+                FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION
+                    | FROZEN_DYNAMIC_ROWS_V8_FORMAT_VERSION
+            );
+            let direct_byte = matches!(
+                self.descriptor.format_version,
+                FROZEN_DYNAMIC_ROWS_V8_FORMAT_VERSION
+                    | FROZEN_DYNAMIC_ROWS_V9_FORMAT_VERSION
+            );
+            let physical_cells = if state_ordinal {
+                let shift = self.descriptor.row_shift.checked_sub(1)?;
+                1_usize.checked_shl(shift)?
+            } else {
+                class_count
+            };
+            let total_cells = state_count.checked_mul(physical_cells)?;
+            if physical_cells == 0 || self.rows.len() != total_cells {
+                return None;
+            }
+            let mut row = canonical_state.checked_mul(physical_cells)?;
+            while position < window_end {
+                let byte = usize::from(*haystack.get(position)?);
+                let class = if direct_byte {
+                    byte
+                } else {
+                    usize::from(*self.class_map.get(byte)?)
+                };
+                if class >= class_count || class >= physical_cells {
+                    return None;
+                }
+                let cell = *self.rows.get(row.checked_add(class)?)?;
+                position = position.checked_add(1)?;
+                if cell & DYNAMIC_NATIVE_ROWS_V3_ACCEPT_MASK != 0 {
+                    selected_end = Some(position);
+                    if output == OutputContract::Exists {
+                        return Some(FrozenStaticPrefixForwardOutcome { selected_end });
+                    }
+                }
+                let token = cell & DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK;
+                if token == 0 {
+                    return Some(FrozenStaticPrefixForwardOutcome { selected_end });
+                }
+                row = if state_ordinal {
+                    usize::from(token)
+                        .checked_sub(1)?
+                        .checked_mul(physical_cells)?
+                } else {
+                    usize::from(token).checked_sub(1)?
+                };
+                if row >= total_cells || !row.is_multiple_of(physical_cells) {
+                    return None;
+                }
+            }
+            return Some(FrozenStaticPrefixForwardOutcome { selected_end });
+        }
+
+        if matches!(
+            self.descriptor.format_version,
+            FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION | FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION
+        ) {
+            let rows = self.rows_u8.as_deref()?;
+            let direct_byte =
+                self.descriptor.format_version == FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION;
+            let physical_cells = 1_usize.checked_shl(self.descriptor.row_shift)?;
+            let total_cells = state_count.checked_mul(physical_cells)?;
+            if physical_cells == 0 || rows.len() != total_cells {
+                return None;
+            }
+            let mut row = canonical_state.checked_mul(physical_cells)?;
+            while position < window_end {
+                let byte = usize::from(*haystack.get(position)?);
+                let class = if direct_byte {
+                    byte
+                } else {
+                    usize::from(*self.class_map.get(byte)?)
+                };
+                if class >= class_count || class >= physical_cells {
+                    return None;
+                }
+                let cell = *rows.get(row.checked_add(class)?)?;
+                position = position.checked_add(1)?;
+                if cell & DYNAMIC_NATIVE_ROWS_V10_ACCEPT_MASK != 0 {
+                    selected_end = Some(position);
+                    if output == OutputContract::Exists {
+                        return Some(FrozenStaticPrefixForwardOutcome { selected_end });
+                    }
+                }
+                let token = cell & DYNAMIC_NATIVE_ROWS_V10_NEXT_STATE_TOKEN_MASK;
+                if token == 0 {
+                    return Some(FrozenStaticPrefixForwardOutcome { selected_end });
+                }
+                row = usize::from(token)
+                    .checked_sub(1)?
+                    .checked_mul(physical_cells)?;
+                if row >= total_cells {
+                    return None;
+                }
+            }
+            return Some(FrozenStaticPrefixForwardOutcome { selected_end });
+        }
+
+        if self.descriptor.format_version == FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION {
+            let rows = self.pair_rows_v11.as_deref()?;
+            let (physical_classes, pair_cells, block_words, total_words, _) =
+                frozen_pair_rows_v11_geometry(state_count, class_count)?;
+            if rows.len() != total_words {
+                return None;
+            }
+            let mut block = canonical_state.checked_mul(block_words)?;
+            while window_end.saturating_sub(position) >= 2 {
+                let first = usize::from(*haystack.get(position)?);
+                let second = usize::from(*haystack.get(position.checked_add(1)?)?);
+                let first_class = usize::from(*self.class_map.get(first)?);
+                let second_class = usize::from(*self.class_map.get(second)?);
+                if first_class >= class_count || second_class >= class_count {
+                    return None;
+                }
+                let key = first_class
+                    .checked_mul(physical_classes)?
+                    .checked_add(second_class)?;
+                let cell = *rows.get(block.checked_add(key)?)?;
+                let first_dead = cell & DYNAMIC_NATIVE_ROWS_V11_FIRST_DEAD_MASK != 0;
+                position = position.checked_add(if first_dead { 1 } else { 2 })?;
+                if cell & DYNAMIC_NATIVE_ROWS_V11_ANY_ACCEPT_MASK != 0 {
+                    selected_end = Some(
+                        if !first_dead
+                            && cell & DYNAMIC_NATIVE_ROWS_V11_ACCEPT_BACK_ONE_MASK != 0
+                        {
+                            position.checked_sub(1)?
+                        } else {
+                            position
+                        },
+                    );
+                    if output == OutputContract::Exists {
+                        return Some(FrozenStaticPrefixForwardOutcome { selected_end });
+                    }
+                }
+                let token = cell & DYNAMIC_NATIVE_ROWS_V11_NEXT_BLOCK_TOKEN_MASK;
+                if first_dead || token == 0 {
+                    return Some(FrozenStaticPrefixForwardOutcome { selected_end });
+                }
+                block = usize::try_from(token).ok()?.checked_sub(1)?;
+                if block >= total_words || !block.is_multiple_of(block_words) {
+                    return None;
+                }
+            }
+            if position < window_end {
+                let byte = usize::from(*haystack.get(position)?);
+                let class = usize::from(*self.class_map.get(byte)?);
+                if class >= class_count {
+                    return None;
+                }
+                let accepts = *rows.get(block.checked_add(pair_cells)?)?;
+                position = position.checked_add(1)?;
+                if accepts & (1_u32.checked_shl(u32::try_from(class).ok()?)?) != 0 {
+                    selected_end = Some(position);
+                }
+            }
+            return Some(FrozenStaticPrefixForwardOutcome { selected_end });
+        }
+
+        if self.descriptor.format_version == FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION {
+            let rows = self.quad_rows_v14.as_deref()?;
+            let (quad_cells, tail3_cells, tail2_cells, tail1_cells, block_cells, total_cells, _) =
+                frozen_quad_rows_v14_geometry(state_count, class_count)?;
+            if rows.len() != total_cells {
+                return None;
+            }
+            let tail3_offset = quad_cells;
+            let tail2_offset = tail3_offset.checked_add(tail3_cells)?;
+            let tail1_offset = tail2_offset.checked_add(tail2_cells)?;
+            if tail1_offset.checked_add(tail1_cells)? != block_cells {
+                return None;
+            }
+            let mut block = canonical_state.checked_mul(block_cells)?;
+            while window_end.saturating_sub(position) >= 4 {
+                let mut key = 0usize;
+                for &byte in haystack.get(position..position.checked_add(4)?)? {
+                    let class = usize::from(*self.class_map.get(usize::from(byte))?);
+                    if class >= class_count {
+                        return None;
+                    }
+                    key = key.checked_mul(class_count)?.checked_add(class)?;
+                }
+                let cell = *rows.get(block.checked_add(key)?)?;
+                position = position.checked_add(4)?;
+                if cell & DYNAMIC_NATIVE_ROWS_V14_ANY_ACCEPT_MASK != 0 {
+                    let distance = usize::from(
+                        (cell & DYNAMIC_NATIVE_ROWS_V14_ACCEPT_DISTANCE_MASK) >> 13,
+                    );
+                    selected_end = Some(position.checked_sub(distance)?);
+                    if output == OutputContract::Exists {
+                        return Some(FrozenStaticPrefixForwardOutcome { selected_end });
+                    }
+                }
+                let token = cell & DYNAMIC_NATIVE_ROWS_V14_NEXT_BLOCK_TOKEN_MASK;
+                if token == 0 {
+                    return Some(FrozenStaticPrefixForwardOutcome { selected_end });
+                }
+                block = usize::from(token).checked_sub(1)?;
+                if block >= total_cells || !block.is_multiple_of(block_cells) {
+                    return None;
+                }
+            }
+
+            let remaining = window_end.saturating_sub(position);
+            if remaining != 0 {
+                let (section_offset, section_cells) = match remaining {
+                    1 => (tail1_offset, tail1_cells),
+                    2 => (tail2_offset, tail2_cells),
+                    3 => (tail3_offset, tail3_cells),
+                    _ => return None,
+                };
+                let mut key = 0usize;
+                for &byte in haystack.get(position..window_end)? {
+                    let class = usize::from(*self.class_map.get(usize::from(byte))?);
+                    if class >= class_count {
+                        return None;
+                    }
+                    key = key.checked_mul(class_count)?.checked_add(class)?;
+                }
+                if key >= section_cells {
+                    return None;
+                }
+                let cell = *rows.get(block.checked_add(section_offset)?.checked_add(key)?)?;
+                position = window_end;
+                if cell & DYNAMIC_NATIVE_ROWS_V14_ANY_ACCEPT_MASK != 0 {
+                    let distance = usize::from(
+                        (cell & DYNAMIC_NATIVE_ROWS_V14_ACCEPT_DISTANCE_MASK) >> 13,
+                    );
+                    selected_end = Some(position.checked_sub(distance)?);
+                }
+            }
+            return Some(FrozenStaticPrefixForwardOutcome { selected_end });
+        }
+
+        if self.descriptor.format_version == FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION {
+            let rows = self.pair_rows_v13.as_deref()?;
+            let (pair_cells, block_cells, total_cells, _) =
+                frozen_pair_rows_v13_geometry(state_count, class_count)?;
+            if rows.len() != total_cells {
+                return None;
+            }
+            let mut block = canonical_state.checked_mul(block_cells)?;
+            while window_end.saturating_sub(position) >= 2 {
+                let first = usize::from(*haystack.get(position)?);
+                let second = usize::from(*haystack.get(position.checked_add(1)?)?);
+                let first_class = usize::from(*self.class_map.get(first)?);
+                let second_class = usize::from(*self.class_map.get(second)?);
+                if first_class >= class_count || second_class >= class_count {
+                    return None;
+                }
+                let key = first_class
+                    .checked_mul(class_count)?
+                    .checked_add(second_class)?;
+                let cell = *rows.get(block.checked_add(key)?)?;
+                position = position.checked_add(2)?;
+                if cell & DYNAMIC_NATIVE_ROWS_V13_ANY_ACCEPT_MASK != 0 {
+                    selected_end = Some(if cell & DYNAMIC_NATIVE_ROWS_V13_ACCEPT_BACK_ONE_MASK != 0
+                    {
+                        position.checked_sub(1)?
+                    } else {
+                        position
+                    });
+                    if output == OutputContract::Exists {
+                        return Some(FrozenStaticPrefixForwardOutcome { selected_end });
+                    }
+                }
+                let token = cell & DYNAMIC_NATIVE_ROWS_V13_NEXT_BLOCK_TOKEN_MASK;
+                if token == 0 {
+                    return Some(FrozenStaticPrefixForwardOutcome { selected_end });
+                }
+                block = usize::from(token).checked_sub(1)?;
+                if block >= total_cells || !block.is_multiple_of(block_cells) {
+                    return None;
+                }
+            }
+            if position < window_end {
+                let byte = usize::from(*haystack.get(position)?);
+                let class = usize::from(*self.class_map.get(byte)?);
+                if class >= class_count {
+                    return None;
+                }
+                let accepts = *rows.get(block.checked_add(pair_cells)?)?;
+                position = position.checked_add(1)?;
+                if accepts & (1_u16.checked_shl(u32::try_from(class).ok()?)?) != 0 {
+                    selected_end = Some(position);
+                }
+            }
+            return Some(FrozenStaticPrefixForwardOutcome { selected_end });
+        }
+
+        None
+    }
+
     fn descriptor_v6(&self) -> Option<FrozenDynamicRowsV6> {
         self.descriptor_v6
     }
@@ -6173,6 +6532,63 @@ struct PartialDfaWorkspace {
     state: PartialDfaRuntimeState,
 }
 
+/// Lazily graph-bound continuation set supplied by one compiler-owned static
+/// prefix object. The pointer binding makes repeated preflights constant-time;
+/// a different object for the same semantic program replaces the sidecar
+/// transactionally.
+#[derive(Debug)]
+struct StaticPrefixResumeWorkspace {
+    descriptor_binding: usize,
+    resume: K0ResumeSet,
+    fully_prefilled: Option<FullyPrefilledFallbackReceipt>,
+    ticket: Option<StaticPrefixResumeTicket>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StaticPrefixResumeTicket {
+    haystack_address: usize,
+    haystack_len: usize,
+    window: SearchWindow,
+}
+
+impl StaticPrefixResumeWorkspace {
+    fn admit(&mut self, haystack: &[u8], window: SearchWindow) {
+        self.ticket = Some(StaticPrefixResumeTicket {
+            haystack_address: haystack.as_ptr().expose_provenance(),
+            haystack_len: haystack.len(),
+            window,
+        });
+    }
+
+    fn consume(&mut self, haystack: &[u8]) -> Result<SearchWindow, CompileError> {
+        let ticket = self.ticket.take().ok_or(CompileError::InternalInvariant(
+            "static-prefix continuation has no synchronous preflight ticket",
+        ))?;
+        if ticket.haystack_address != haystack.as_ptr().expose_provenance()
+            || ticket.haystack_len != haystack.len()
+        {
+            return Err(CompileError::InternalInvariant(
+                "static-prefix continuation haystack differs from preflight",
+            ));
+        }
+        Ok(ticket.window)
+    }
+
+    fn peek(&self, haystack: &[u8]) -> Result<SearchWindow, CompileError> {
+        let ticket = self.ticket.ok_or(CompileError::InternalInvariant(
+            "static-prefix continuation has no synchronous preflight ticket",
+        ))?;
+        if ticket.haystack_address != haystack.as_ptr().expose_provenance()
+            || ticket.haystack_len != haystack.len()
+        {
+            return Err(CompileError::InternalInvariant(
+                "static-prefix continuation haystack differs from preflight",
+            ));
+        }
+        Ok(ticket.window)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PartialDfaResumeResult {
     found: MatchResult,
@@ -6190,6 +6606,10 @@ struct DynamicNativeRowsWorkspace {
     native_rows_dirty: bool,
     #[cfg(test)]
     native_rows_refreshes: usize,
+    #[cfg(test)]
+    preflight_admission_settlements: usize,
+    #[cfg(test)]
+    preflight_admission_replacements: usize,
 }
 
 const NATIVE_ROWS_INITIAL_PENDING: u32 = 1;
@@ -6210,6 +6630,39 @@ const fn native_rows_initial_flags(pending: bool, terminal: bool) -> u32 {
 }
 
 impl DynamicNativeRowsWorkspace {
+    #[inline]
+    fn settle_preflight_admission(&mut self) {
+        #[cfg(test)]
+        {
+            self.preflight_admission_settlements =
+                self.preflight_admission_settlements.saturating_add(1);
+        }
+        self.state.settle_unobserved_local_entry();
+    }
+
+    #[inline]
+    fn settle_and_claim_preflight_admission(
+        &mut self,
+        window: SearchWindow,
+        original_input_bytes: usize,
+        after_mandatory_cut: bool,
+    ) -> bool {
+        #[cfg(test)]
+        {
+            self.preflight_admission_settlements =
+                self.preflight_admission_settlements.saturating_add(1);
+            if self.state.native_entry_admission.is_some() {
+                self.preflight_admission_replacements =
+                    self.preflight_admission_replacements.saturating_add(1);
+            }
+        }
+        self.state.settle_and_claim_with_provenance(
+            window,
+            original_input_bytes,
+            after_mandatory_cut,
+        )
+    }
+
     fn refresh_native_rows(&mut self, automaton: &Automaton, workspace: &K0Workspace) -> bool {
         debug_assert!(self.native_rows_dirty);
         #[cfg(test)]
@@ -6270,6 +6723,92 @@ impl DynamicNativeRowsWorkspace {
             ),
         };
         self.native_rows_dirty = false;
+        // Seal the compiler-private V2 contract once per dirty projection.
+        // Clean repeated preflights reuse this descriptor without rewalking
+        // its class map or geometry. A future K0 construction regression thus
+        // declines to portable execution even in release builds instead of
+        // reaching generated unchecked loads.
+        if !self.compiler_private_descriptor_satisfies_v2_contract() {
+            self.native_rows = DynamicNativeRowsV1::default();
+            self.native_rows_dirty = true;
+            return false;
+        }
+        true
+    }
+
+    /// Publish the exact descriptor covered by the compiler-private V2
+    /// preflight contract. Release builds pay only for returning the two
+    /// already-live words; debug and test builds independently audit the
+    /// construction invariants at the trust boundary.
+    #[inline]
+    fn compiler_private_trusted_descriptor_v2(&self) -> (usize, u64) {
+        debug_assert!(self.compiler_private_descriptor_satisfies_v2_contract());
+        (
+            (&raw const self.native_rows).expose_provenance(),
+            self.native_rows.cache_identity,
+        )
+    }
+
+    fn compiler_private_descriptor_satisfies_v2_contract(&self) -> bool {
+        let rows = self.native_rows;
+        let Ok(stride) = usize::try_from(rows.row_stride) else {
+            return false;
+        };
+        let Ok(initial_row) = usize::try_from(rows.initial_row) else {
+            return false;
+        };
+        let Ok(loop_count) = usize::try_from(rows.learned_loop_row_count) else {
+            return false;
+        };
+        let descriptor_address = (&raw const self.native_rows).expose_provenance();
+        if self.native_rows_dirty
+            || descriptor_address == 0
+            || !descriptor_address.is_multiple_of(core::mem::align_of::<DynamicNativeRowsV1>())
+            || rows.rows_address == 0
+            || !rows
+                .rows_address
+                .is_multiple_of(core::mem::align_of::<u32>())
+            || rows.class_map_address != self.class_map.as_ptr().expose_provenance()
+            || rows.live_cells == 0
+            || rows.live_cells > usize::try_from(DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK)
+                .unwrap_or(usize::MAX)
+            || !(1..=256).contains(&stride)
+            || rows.live_cells.checked_rem(stride) != Some(0)
+            || initial_row.checked_rem(stride) != Some(0)
+            || initial_row
+                .checked_add(stride)
+                .is_none_or(|end| end > rows.live_cells)
+            || rows.unfilled_cell != DYNAMIC_NATIVE_ROWS_V1_UNFILLED_CELL
+            || rows.accept_mask != DYNAMIC_NATIVE_ROWS_V1_ACCEPT_MASK
+            || rows.next_row_token_mask != DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK
+            || rows.cache_identity == 0
+            || rows.initial_flags != 0
+            || loop_count > rows.learned_loop_rows.len()
+            || rows.learned_loop_rows[loop_count..]
+                .iter()
+                .any(|&row| row != u32::MAX)
+            || self
+                .class_map
+                .iter()
+                .any(|&class| usize::from(class) >= stride)
+        {
+            return false;
+        }
+        for (index, &row) in rows.learned_loop_rows[..loop_count].iter().enumerate() {
+            let Ok(row) = usize::try_from(row) else {
+                return false;
+            };
+            if row.checked_rem(stride) != Some(0)
+                || row
+                    .checked_add(stride)
+                    .is_none_or(|end| end > rows.live_cells)
+                || rows.learned_loop_rows[..index]
+                    .iter()
+                    .any(|&prior| usize::try_from(prior).ok() == Some(row))
+            {
+                return false;
+            }
+        }
         true
     }
 }
@@ -6281,9 +6820,10 @@ impl DynamicNativeRowsWorkspace {
 struct DynamicNativeRowsState {
     consecutive_deopts: u8,
     bypass_remaining: u16,
-    native_entry_window: Option<SearchWindow>,
-    native_entry_original_input_bytes: usize,
-    native_entry_after_mandatory_cut: bool,
+    // Liveness and its exact continuation provenance are one capability.
+    // Taking it invalidates the admission without separately clearing payload
+    // fields that no code may observe while the capability is absent.
+    native_entry_admission: Option<DynamicNativeRowsAdmission>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6294,6 +6834,12 @@ struct DynamicNativeRowsAdmission {
 }
 
 impl DynamicNativeRowsState {
+    #[cfg(test)]
+    fn native_entry_window(&self) -> Option<SearchWindow> {
+        self.native_entry_admission
+            .map(|admission| admission.window)
+    }
+
     fn settle_unobserved_local_entry(&mut self) {
         if self.take_native_entry_admission().is_some() {
             self.consecutive_deopts = 0;
@@ -6310,20 +6856,42 @@ impl DynamicNativeRowsState {
         )
     }
 
+    #[cfg(test)]
     fn claim_with_provenance(
         &mut self,
         window: SearchWindow,
         original_input_bytes: usize,
         after_mandatory_cut: bool,
     ) -> bool {
-        self.settle_unobserved_local_entry();
-        if self.bypass_remaining != 0 {
+        self.settle_and_claim_with_provenance(
+            window,
+            original_input_bytes,
+            after_mandatory_cut,
+        )
+    }
+
+    /// Settle a prior generated local return and claim the next entry as one
+    /// state transition. A live admission is overwritten directly, avoiding
+    /// stores that clear fields which the new admission immediately replaces.
+    #[inline]
+    fn settle_and_claim_with_provenance(
+        &mut self,
+        window: SearchWindow,
+        original_input_bytes: usize,
+        after_mandatory_cut: bool,
+    ) -> bool {
+        if self.native_entry_admission.is_some() {
+            self.consecutive_deopts = 0;
+            self.bypass_remaining = 0;
+        } else if self.bypass_remaining != 0 {
             self.bypass_remaining = self.bypass_remaining.saturating_sub(1);
             return false;
         }
-        self.native_entry_window = Some(window);
-        self.native_entry_original_input_bytes = original_input_bytes;
-        self.native_entry_after_mandatory_cut = after_mandatory_cut;
+        self.native_entry_admission = Some(DynamicNativeRowsAdmission {
+            window,
+            original_input_bytes,
+            after_mandatory_cut,
+        });
         true
     }
 
@@ -6346,23 +6914,13 @@ impl DynamicNativeRowsState {
     }
 
     fn settle_consumed_local_completion(&mut self) {
-        debug_assert!(self.native_entry_window.is_none());
-        debug_assert_eq!(self.native_entry_original_input_bytes, 0);
-        debug_assert!(!self.native_entry_after_mandatory_cut);
+        debug_assert!(self.native_entry_admission.is_none());
         self.consecutive_deopts = 0;
         self.bypass_remaining = 0;
     }
 
     fn take_native_entry_admission(&mut self) -> Option<DynamicNativeRowsAdmission> {
-        let window = self.native_entry_window.take()?;
-        let admission = DynamicNativeRowsAdmission {
-            window,
-            original_input_bytes: self.native_entry_original_input_bytes,
-            after_mandatory_cut: self.native_entry_after_mandatory_cut,
-        };
-        self.native_entry_original_input_bytes = 0;
-        self.native_entry_after_mandatory_cut = false;
-        Some(admission)
+        self.native_entry_admission.take()
     }
 
     /// Consume the exact window admitted for one generated dynamic-row scan.
@@ -6630,6 +7188,33 @@ pub(crate) struct NativeProgramView<'a> {
     pub(crate) retained_suffix_requirement: Option<NativeRetainedSuffixRequirement>,
 }
 
+/// Borrowed transient frontier suffix retained by the slow compiler.
+///
+/// This is object-lowering input only. It is never attached to the stable
+/// semantic program or exposed through its serialization format.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NativeSlowResumeView<'a> {
+    partial: &'a NativeSlowPartial,
+    state_count: usize,
+    item_count: usize,
+}
+
+impl<'a> NativeSlowResumeView<'a> {
+    pub(crate) const fn state_count(self) -> usize {
+        self.state_count
+    }
+
+    pub(crate) const fn item_count(self) -> usize {
+        self.item_count
+    }
+
+    pub(crate) fn frontiers(self) -> impl ExactSizeIterator<Item = (&'a [u32], bool)> {
+        self.partial
+            .resume_frontiers()
+            .expect("authenticated slow-resume view has an incomplete suffix")
+    }
+}
+
 /// Compiler-owned complete DFA materialized from one setup-authenticated K0
 /// cache. This is transient lowering IR: it is neither serialized into the
 /// semantic program nor retained after the native object has copied its
@@ -6728,6 +7313,20 @@ impl NativeSlowDfaProgram {
             NativeSlowMachine::Complete(_) => false,
             NativeSlowMachine::Partial(partial) => partial.retained_forward_minimized(),
         }
+    }
+
+    pub(crate) fn resume_view(&self) -> Option<NativeSlowResumeView<'_>> {
+        let NativeSlowMachine::Partial(partial) = &self.machine else {
+            return None;
+        };
+        let (complete_rows, discovered_states) = partial.retained_dimensions();
+        let state_count = discovered_states.checked_sub(complete_rows)?;
+        let item_count = partial.resume_item_count()?;
+        (state_count != 0 && item_count != 0).then_some(NativeSlowResumeView {
+            partial,
+            state_count,
+            item_count,
+        })
     }
 
     fn native_view(&self) -> NativeDfaView<'_> {
@@ -6960,6 +7559,10 @@ pub(crate) struct NativeDynamicRowsProgramView {
     /// Frozen normalization may merge columns but cannot split them, so a
     /// source below the raw-expansion threshold can never publish V8/V9 rows.
     pub(crate) source_class_count: usize,
+    /// Exact immutable K0 byte-to-class map. Only variable-width `Span`
+    /// lowering consumes this compile-time sidecar; other outputs keep it
+    /// absent so their emitted data remains byte-for-byte unchanged.
+    pub(crate) source_byte_classes: Option<[u8; 256]>,
     /// Exact match-relative byte class selected from the Thompson graph.
     /// Target lowering may use it only while the authenticated cache is in
     /// its initial row; unsupported shapes retain the scalar row entry.
@@ -7832,9 +8435,14 @@ impl CompiledProgram {
     ///
     /// Allocation exhaustion is an optimization decline. A state,
     /// transition, or work refusal after at least one complete row may retain
-    /// that already-owned prefix. A complete late-stage artifact can lower
-    /// directly; a genuinely incomplete prefix requires native whole-search
-    /// deoptimization. Structural compiler failures remain typed errors.
+    /// that already-owned prefix as an optimizer candidate. A complete
+    /// late-stage artifact can lower directly. Current module selection first
+    /// tries to close a genuinely incomplete prefix through K0, then retains
+    /// its exact frontier suffix in private object data when the complete table
+    /// cannot fit. Native holes continue at the first unconsumed byte; only an
+    /// object-data decline falls back to the ordinary prepared route. The raw
+    /// replaying wrapper remains only as a legacy object-ABI emitter.
+    /// Structural compiler failures remain typed errors.
     pub(crate) fn native_slow_determinized_program(
         &self,
         limits: DeterminizeLimits,
@@ -8124,6 +8732,9 @@ impl CompiledProgram {
                 .iter()
                 .filter(|&&start| start)
                 .count(),
+            source_byte_classes: (self.output == OutputContract::Span
+                && self.exact_match_width.is_none())
+                .then(|| dfa_boundary_class_map(&self.raw)),
             root_requirement,
         })
     }
@@ -8277,12 +8888,17 @@ impl CompiledProgram {
                     native_rows_dirty: true,
                     #[cfg(test)]
                     native_rows_refreshes: 0,
+                    #[cfg(test)]
+                    preflight_admission_settlements: 0,
+                    #[cfg(test)]
+                    preflight_admission_replacements: 0,
                 })
             });
         Ok(ProgramWorkspace {
             identity: self.identity,
             nfa,
             partial,
+            static_prefix_resume: None,
             dynamic_native_rows,
         })
     }
@@ -8821,6 +9437,7 @@ impl CompiledProgram {
         }
         if source_class_count == 0
             || source_class_count > 256
+            || source_class_count != dynamic_view.source_class_count
             || state_count == 0
             || source_cells == 0
             || source_cells != full.forward_rows().len()
@@ -9466,7 +10083,11 @@ impl CompiledProgram {
             else {
                 return header;
             };
-            if root_projection.cache_identity() != rows.cache_identity
+            let Ok(expected_reverse_stride) = u32::try_from(dynamic_view.source_class_count) else {
+                return header;
+            };
+            if reverse.row_stride != expected_reverse_stride
+                || root_projection.cache_identity() != rows.cache_identity
                 || storage.root_prefill_receipt.reverse != Some(reverse)
             {
                 return header;
@@ -10045,22 +10666,20 @@ impl CompiledProgram {
         // did not complete locally. Do not let a later search misclassify a
         // failed authentication or K0 continuation as a completed probe.
         partial_workspace.state.clear_native_entry();
-        if partial_workspace
+        let resume_set = partial_workspace
             .resume
-            .as_ref()
-            .is_none_or(|resume| !resume.is_bound_to(&self.automaton))
-        {
-            return Err(CompileError::InternalInvariant(
+            .as_mut()
+            .filter(|resume| resume.is_bound_to(&self.automaton))
+            .ok_or(CompileError::InternalInvariant(
                 "retained partial resume has no authenticated K0 resume set",
-            ));
-        }
+            ))?;
         let resumed = self.search_nfa_from_partial_resume(
             haystack,
             window,
             workspace.nfa.as_mut().ok_or(CompileError::InternalInvariant(
                 "retained partial resume has no prepared K0 workspace",
             ))?,
-            &mut partial_workspace.resume,
+            resume_set,
             PartialDfaResume {
                 state: resume_state,
                 position: resume_position,
@@ -10477,22 +11096,20 @@ impl CompiledProgram {
                 "preflight-authenticated partial resume has no retained workspace",
             ),
         )?;
-        if partial_workspace
+        let resume_set = partial_workspace
             .resume
-            .as_ref()
-            .is_none_or(|resume| !resume.is_bound_to(&self.automaton))
-        {
-            return Err(CompileError::InternalInvariant(
+            .as_mut()
+            .filter(|resume| resume.is_bound_to(&self.automaton))
+            .ok_or(CompileError::InternalInvariant(
                 "preflight-authenticated partial resume has no K0 resume set",
-            ));
-        }
+            ))?;
         let resumed = self.search_nfa_from_partial_resume(
             haystack,
             window,
             nfa.as_mut().ok_or(CompileError::InternalInvariant(
                 "preflight-authenticated partial resume has no K0 workspace",
             ))?,
-            &mut partial_workspace.resume,
+            resume_set,
             PartialDfaResume {
                 state: resume_state,
                 position: resume_position,
@@ -10669,6 +11286,761 @@ impl CompiledProgram {
             selected_end.saturating_sub(window.start),
             window.end.saturating_sub(window.start),
         );
+        Ok(MatchResult::Span(Some((recovered_start, selected_end))))
+    }
+
+    /// Recover a variable-width Span start selected by a compiler-owned
+    /// transient static DFA prefix.
+    ///
+    /// Unlike retained-row recovery, this route deliberately has no stable
+    /// partial-DFA payload or mutable admission ticket. The generated caller
+    /// authenticates the semantic artifact immediately before running its
+    /// immutable table and invokes this postflight synchronously only after
+    /// that table returns an authoritative endpoint. Reverse K0 recovers the
+    /// start without replaying the completed forward search.
+    #[doc(hidden)]
+    pub fn recover_static_prefix_span_from_selected_end_with_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+        expected_artifact_identity: [u8; 32],
+        selected_end: usize,
+    ) -> Result<MatchResult, CompileError> {
+        self.recover_static_prefix_span_from_selected_end_with_workspace_impl(
+            haystack,
+            window,
+            workspace,
+            expected_artifact_identity,
+            selected_end,
+            None,
+        )
+    }
+
+    /// Receipt-bearing counterpart for an exclusive prepared session whose
+    /// setup already populated every reachable K0 fallback row.
+    #[doc(hidden)]
+    pub fn recover_static_prefix_span_from_selected_end_with_fully_prefilled_fallback_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+        expected_artifact_identity: [u8; 32],
+        selected_end: usize,
+        receipt: FullyPrefilledFallbackReceipt,
+    ) -> Result<MatchResult, CompileError> {
+        self.recover_static_prefix_span_from_selected_end_with_workspace_impl(
+            haystack,
+            window,
+            workspace,
+            expected_artifact_identity,
+            selected_end,
+            Some(receipt),
+        )
+    }
+
+    fn recover_static_prefix_span_from_selected_end_with_workspace_impl(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+        expected_artifact_identity: [u8; 32],
+        selected_end: usize,
+        receipt: Option<FullyPrefilledFallbackReceipt>,
+    ) -> Result<MatchResult, CompileError> {
+        if window.start > window.end || window.end > haystack.len() {
+            return Err(CompileError::InvalidWindow {
+                start: window.start,
+                end: window.end,
+                haystack_len: haystack.len(),
+            });
+        }
+        if expected_artifact_identity != self.identity.artifact {
+            return Err(CompileError::InternalInvariant(
+                "static-prefix Span recovery artifact identity does not match the prepared program",
+            ));
+        }
+        if !workspace.identity.compatible(&self.identity) {
+            return Err(CompileError::InternalInvariant(
+                "static-prefix Span recovery workspace belongs to a different semantic program",
+            ));
+        }
+        if self.context_dfa.is_some()
+            || !matches!(self.engine, ProgramEngine::OrderedNfa)
+            || self.automaton.stats().has_assertions()
+            || self.output != OutputContract::Span
+            || self.exact_match_width.is_some()
+        {
+            return Err(CompileError::InternalInvariant(
+                "static-prefix Span recovery requires an assertion-free variable-width ordered-NFA Span program",
+            ));
+        }
+        if selected_end <= window.start || selected_end > window.end {
+            return Err(CompileError::InternalInvariant(
+                "static-prefix Span recovery endpoint is not inside its search window",
+            ));
+        }
+
+        workspace.mark_dynamic_native_rows_dirty();
+        let nfa = workspace.nfa.as_mut().ok_or(CompileError::InternalInvariant(
+            "static-prefix Span recovery has no prepared bidirectional K0 workspace",
+        ))?;
+        let recovered_start = self.recover_partial_span_start(
+            haystack,
+            window,
+            nfa,
+            None,
+            selected_end,
+            receipt,
+        )?;
+        if recovered_start < window.start || recovered_start > selected_end {
+            return Err(CompileError::InternalInvariant(
+                "reverse K0 did not recover a static-prefix span inside its search window",
+            ));
+        }
+        Ok(MatchResult::Span(Some((recovered_start, selected_end))))
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one pass validates the complete untrusted descriptor before constructing a resume set"
+    )]
+    fn static_prefix_resume_set_from_descriptor(
+        &self,
+        descriptor: &[u32],
+    ) -> Result<K0ResumeSet, CompileError> {
+        const HEADER_WORDS: usize = STATIC_PREFIX_RESUME_DESCRIPTOR_V1_HEADER_BYTES
+            / core::mem::size_of::<u32>();
+        const STATE_WORDS: usize = STATIC_PREFIX_RESUME_DESCRIPTOR_V1_STATE_BYTES
+            / core::mem::size_of::<u32>();
+        if descriptor.len() < HEADER_WORDS
+            || descriptor
+                .len()
+                .checked_mul(core::mem::size_of::<u32>())
+                .is_none_or(|bytes| bytes > STATIC_PREFIX_RESUME_DESCRIPTOR_V1_MAX_BYTES)
+        {
+            return Err(CompileError::InternalInvariant(
+                "static-prefix resume descriptor has an invalid bounded extent",
+            ));
+        }
+        let mut magic = [0_u8; 8];
+        magic[..4].copy_from_slice(&descriptor[0].to_le_bytes());
+        magic[4..].copy_from_slice(&descriptor[1].to_le_bytes());
+        if &magic != STATIC_PREFIX_RESUME_DESCRIPTOR_V1_MAGIC {
+            return Err(CompileError::InternalInvariant(
+                "static-prefix resume descriptor has an invalid magic",
+            ));
+        }
+        let declared_words = usize::try_from(descriptor[2]).map_err(|_| {
+            CompileError::InternalInvariant(
+                "static-prefix resume descriptor word count does not fit usize",
+            )
+        })?;
+        let state_count = usize::try_from(descriptor[3]).map_err(|_| {
+            CompileError::InternalInvariant(
+                "static-prefix resume descriptor state count does not fit usize",
+            )
+        })?;
+        let item_count = usize::try_from(descriptor[4]).map_err(|_| {
+            CompileError::InternalInvariant(
+                "static-prefix resume descriptor item count does not fit usize",
+            )
+        })?;
+        if declared_words != descriptor.len()
+            || state_count == 0
+            || item_count == 0
+            || descriptor[5..HEADER_WORDS].iter().any(|&word| word != 0)
+        {
+            return Err(CompileError::InternalInvariant(
+                "static-prefix resume descriptor header is inconsistent",
+            ));
+        }
+        let state_words = state_count.checked_mul(STATE_WORDS).ok_or(
+            CompileError::InternalInvariant(
+                "static-prefix resume descriptor state extent overflowed",
+            ),
+        )?;
+        let item_start = HEADER_WORDS.checked_add(state_words).ok_or(
+            CompileError::InternalInvariant(
+                "static-prefix resume descriptor item offset overflowed",
+            ),
+        )?;
+        if item_start.checked_add(item_count) != Some(descriptor.len()) {
+            return Err(CompileError::InternalInvariant(
+                "static-prefix resume descriptor payload extent is inconsistent",
+            ));
+        }
+        let records = descriptor.get(HEADER_WORDS..item_start).ok_or(
+            CompileError::InternalInvariant(
+                "static-prefix resume descriptor records are truncated",
+            ),
+        )?;
+        let items = descriptor.get(item_start..).ok_or(
+            CompileError::InternalInvariant(
+                "static-prefix resume descriptor items are truncated",
+            ),
+        )?;
+        let mut cursor = 0usize;
+        for record in records.chunks_exact(STATE_WORDS) {
+            let offset = usize::try_from(record[0]).map_err(|_| {
+                CompileError::InternalInvariant(
+                    "static-prefix resume frontier offset does not fit usize",
+                )
+            })?;
+            let length = usize::try_from(record[1]).map_err(|_| {
+                CompileError::InternalInvariant(
+                    "static-prefix resume frontier length does not fit usize",
+                )
+            })?;
+            let end = offset.checked_add(length).ok_or(
+                CompileError::InternalInvariant(
+                    "static-prefix resume frontier extent overflowed",
+                ),
+            )?;
+            if offset != cursor
+                || length == 0
+                || record[2] > 1
+                || record[3] != 0
+                || end > item_count
+            {
+                return Err(CompileError::InternalInvariant(
+                    "static-prefix resume frontier metadata is noncanonical",
+                ));
+            }
+            cursor = end;
+        }
+        if cursor != item_count {
+            return Err(CompileError::InternalInvariant(
+                "static-prefix resume frontiers do not cover their item arena",
+            ));
+        }
+        let frontiers = records.chunks_exact(STATE_WORDS).map(|record| {
+            let offset = usize::try_from(record[0]).expect("validated resume offset");
+            let length = usize::try_from(record[1]).expect("validated resume length");
+            let end = offset
+                .checked_add(length)
+                .expect("validated resume frontier extent");
+            (&items[offset..end], record[2] != 0)
+        });
+        K0ResumeSet::new(&self.automaton, state_count, item_count, frontiers)
+            .map_err(CompileError::from)
+    }
+
+    fn validate_static_prefix_object_context(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &ProgramWorkspace,
+        expected_artifact_identity: [u8; 32],
+    ) -> Result<(), CompileError> {
+        if window.start > window.end || window.end > haystack.len() {
+            return Err(CompileError::InvalidWindow {
+                start: window.start,
+                end: window.end,
+                haystack_len: haystack.len(),
+            });
+        }
+        if expected_artifact_identity != self.identity.artifact
+            || !workspace.identity.compatible(&self.identity)
+            || self.context_dfa.is_some()
+            || !matches!(self.engine, ProgramEngine::OrderedNfa)
+            || self.automaton.stats().has_assertions()
+        {
+            return Err(CompileError::InternalInvariant(
+                "static-prefix object rejected its artifact, workspace, or graph",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Return whether whole-window graph proofs have a structurally admitted
+    /// chance to beat a transient native prefix.
+    ///
+    /// The ordinary retained-row crossover already amortizes the fixed helper
+    /// and SIMD-scanner costs at this boundary. Reusing it avoids taxing short
+    /// native-local searches, while requiring an actual suffix or cut sidecar
+    /// avoids entering an empty portable prepass.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn compiler_private_static_prefix_complete_proofs_should_run(
+        &self,
+        input_bytes: usize,
+    ) -> bool {
+        input_bytes >= PARTIAL_DFA_MIN_INPUT_BYTES
+            && (self.nfa_mandatory_suffix.is_some() || self.nfa_mandatory_cut.is_some())
+    }
+
+    /// Run only complete whole-window proofs before a transient static prefix.
+    ///
+    /// This stage deliberately does not read or bind the compiler-owned resume
+    /// descriptor. An inconclusive cut cannot narrow the window because every
+    /// emitted frontier was constructed for the original exact window.
+    #[doc(hidden)]
+    pub fn preflight_static_prefix_complete_proofs_with_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+        expected_artifact_identity: [u8; 32],
+    ) -> Result<RetainedPartialPreflight, CompileError> {
+        self.validate_static_prefix_object_context(
+            haystack,
+            window,
+            workspace,
+            expected_artifact_identity,
+        )?;
+        if !self.compiler_private_static_prefix_complete_proofs_should_run(
+            window.end.saturating_sub(window.start),
+        ) {
+            return Ok(RetainedPartialPreflight::Enter(window));
+        }
+
+        if let Some(state) = workspace.static_prefix_resume.as_deref_mut() {
+            state.ticket = None;
+        }
+        workspace.mark_dynamic_native_rows_dirty();
+        let nfa = workspace.nfa.as_mut().ok_or(
+            CompileError::InternalInvariant(
+                "static-prefix complete preflight has no prepared K0 workspace",
+            ),
+        )?;
+        match self.search_nfa_with_retained_complete_accelerators(haystack, window, nfa)? {
+            NfaMandatoryCutOutcome::Complete(found) => {
+                Ok(RetainedPartialPreflight::Complete(found))
+            }
+            NfaMandatoryCutOutcome::Continue(_) => Ok(RetainedPartialPreflight::Enter(window)),
+        }
+    }
+
+    /// Lazily graph-bind one transient static-prefix continuation descriptor
+    /// only after generated code reaches a hole, then admit its exact window.
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the compiler-private hole binding authenticates object sidecar, workspace, and exact call"
+    )]
+    pub fn bind_static_prefix_resume_with_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+        frozen_owner: Option<&FrozenDynamicRowsStorageV3>,
+        expected_artifact_identity: [u8; 32],
+        descriptor_binding: usize,
+        descriptor: &[u32],
+    ) -> Result<Option<FullyPrefilledFallbackReceipt>, CompileError> {
+        self.validate_static_prefix_object_context(
+            haystack,
+            window,
+            workspace,
+            expected_artifact_identity,
+        )?;
+        if descriptor_binding == 0 {
+            return Err(CompileError::InternalInvariant(
+                "static-prefix hole binding rejected its descriptor address",
+            ));
+        }
+        let already_bound = workspace
+            .static_prefix_resume
+            .as_deref()
+            .is_some_and(|state| {
+                state.descriptor_binding == descriptor_binding
+                    && state.resume.is_bound_to(&self.automaton)
+            });
+        let mut newly_published = None;
+        if !already_bound {
+            let mut resume = self.static_prefix_resume_set_from_descriptor(descriptor)?;
+            workspace.mark_dynamic_native_rows_dirty();
+            let fully_prefilled = workspace.nfa.as_mut().and_then(|nfa| {
+                if let Some(k0) = nfa.compiler_private_try_prefill_resume_caches_with_receipt(
+                    &self.automaton,
+                    &mut resume,
+                ) {
+                    let receipt = FullyPrefilledFallbackReceipt {
+                        program_instance: self.identity.instance,
+                        k0,
+                    };
+                    newly_published = Some(receipt);
+                    return Some(receipt);
+                }
+
+                let owner = frozen_owner.filter(|owner| {
+                    owner.descriptor_is_valid_for(self.identity)
+                        && owner.root_prefill_receipt.program_instance
+                            == self.identity.instance
+                })?;
+                let k0 = nfa
+                    .compiler_private_try_bind_resume_to_fully_prefilled_root_cache_with_receipt(
+                        &self.automaton,
+                        &mut resume,
+                        owner.root_prefill_receipt.k0,
+                    )
+                    .or_else(|| {
+                        nfa.compiler_private_try_extend_fully_prefilled_root_with_resume_receipt(
+                            &self.automaton,
+                            &mut resume,
+                            owner.root_prefill_receipt.k0,
+                        )
+                        .inspect(|&k0| {
+                            newly_published = Some(FullyPrefilledFallbackReceipt {
+                                program_instance: self.identity.instance,
+                                k0,
+                            });
+                        })
+                    })?;
+                Some(FullyPrefilledFallbackReceipt {
+                    program_instance: self.identity.instance,
+                    k0,
+                })
+            });
+            workspace.static_prefix_resume = Some(Box::new(StaticPrefixResumeWorkspace {
+                descriptor_binding,
+                resume,
+                fully_prefilled,
+                ticket: None,
+            }));
+        }
+
+        workspace
+            .static_prefix_resume
+            .as_deref_mut()
+            .ok_or(CompileError::InternalInvariant(
+                "static-prefix resume preflight did not retain its sidecar",
+            ))?
+            .admit(haystack, window);
+        Ok(newly_published)
+    }
+
+    /// Try to continue a compiler-owned static prefix in the immutable
+    /// setup-time compact table instead of replaying the same fully-prefilled
+    /// K0 rows through the scalar portable loop.
+    ///
+    /// Admission is format- and lineage-driven, not pattern-driven. The
+    /// static descriptor's exact frontier is mapped through the authenticated
+    /// resume cache into the canonical state numbering used by the frozen
+    /// owner. Any missing proof or unsupported compact generation declines
+    /// without consuming the single-use ticket, allowing the established K0
+    /// continuation to run unchanged.
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the private continuation binds one exact artifact, owner, ticket, and native frontier"
+    )]
+    pub fn try_search_from_static_prefix_resume_ticket_with_frozen_rows(
+        &self,
+        haystack: &[u8],
+        workspace: &mut ProgramWorkspace,
+        owner: &FrozenDynamicRowsStorageV3,
+        resume_state: usize,
+        resume_position: usize,
+        pending_end_word: usize,
+    ) -> Result<Option<MatchResult>, CompileError> {
+        if !workspace.identity.compatible(&self.identity)
+            || self.context_dfa.is_some()
+            || !matches!(self.engine, ProgramEngine::OrderedNfa)
+            || self.automaton.stats().has_assertions()
+            // The storage has private fields and can only be constructed by
+            // this program's checked setup builder. Repeating its linear
+            // whole-table validation on every match would erase the compact
+            // continuation's benefit. Authenticate immutable ownership here;
+            // the safe decoder below independently checks every accessed
+            // extent, while the live K0 projection rechecks cache lineage.
+            || owner.program_instance != self.identity.instance
+            || owner.artifact_identity != self.identity.artifact
+            || owner.root_prefill_receipt.program_instance != self.identity.instance
+        {
+            return Ok(None);
+        }
+        if !matches!(
+            owner.descriptor.format_version,
+            FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION
+                | FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION
+                | FROZEN_DYNAMIC_ROWS_V8_FORMAT_VERSION
+                | FROZEN_DYNAMIC_ROWS_V9_FORMAT_VERSION
+                | FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION
+                | FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION
+                | FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION
+                | FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION
+                | FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION
+        ) {
+            return Ok(None);
+        }
+
+        let ProgramWorkspace {
+            nfa,
+            static_prefix_resume,
+            dynamic_native_rows,
+            ..
+        } = workspace;
+        let state = static_prefix_resume.as_deref_mut().ok_or(
+            CompileError::InternalInvariant(
+                "static-prefix frozen continuation has no graph-bound sidecar",
+            ),
+        )?;
+        let window = state.peek(haystack)?;
+        if resume_position <= window.start || resume_position >= window.end {
+            return Err(CompileError::InternalInvariant(
+                "static-prefix frozen continuation position is outside its admitted window",
+            ));
+        }
+        let pending = state.resume.pending_mode(resume_state)?;
+        let pending_end = pending.then_some(pending_end_word);
+        if pending_end.is_some_and(|end| end <= window.start || end > resume_position) {
+            return Err(CompileError::InternalInvariant(
+                "static-prefix frozen continuation pending endpoint is outside its consumed prefix",
+            ));
+        }
+        let Some(nfa_read) = nfa.as_ref() else {
+            return Ok(None);
+        };
+        if state.fully_prefilled.is_none()
+            && let Some(k0) = nfa_read
+                .compiler_private_try_bind_resume_to_fully_prefilled_root_cache_with_receipt(
+                    &self.automaton,
+                    &mut state.resume,
+                    owner.root_prefill_receipt.k0,
+                )
+        {
+            state.fully_prefilled = Some(FullyPrefilledFallbackReceipt {
+                program_instance: self.identity.instance,
+                k0,
+            });
+        }
+        let Some(fully_prefilled) = state
+            .fully_prefilled
+            .filter(|receipt| receipt.program_instance == self.identity.instance)
+        else {
+            return Ok(None);
+        };
+
+        // The setup transaction already validated every frontier and row.
+        // Private resume metadata is immutable while its set-level seal is
+        // live, so authenticate only the generated-code-selected state here;
+        // rescanning the whole map and root table per match would dominate
+        // the suffix itself. The compact builder's zero/root swap is
+        // self-inverse.
+        let Some(mapping) = nfa_read
+            .compiler_private_fully_prefilled_resume_state_projection(
+                &self.automaton,
+                &state.resume,
+                resume_state,
+                fully_prefilled.k0,
+            )
+        else {
+            return Ok(None);
+        };
+        if mapping.cache_identity() != owner.descriptor.cache_identity
+            || mapping.row_stride() == 0
+            || mapping.pending() != pending
+        {
+            return Ok(None);
+        }
+        let source_initial_state = usize::try_from(mapping.source_initial_state()).map_err(|_| {
+            CompileError::InternalInvariant(
+                "static-prefix frozen continuation initial state does not fit usize",
+            )
+        })?;
+        let source_state = usize::try_from(mapping.source_state()).map_err(|_| {
+            CompileError::InternalInvariant(
+                "static-prefix frozen continuation state does not fit usize",
+            )
+        })?;
+        let state_count = usize::try_from(owner.descriptor.state_count).map_err(|_| {
+            CompileError::InternalInvariant(
+                "static-prefix frozen continuation state count does not fit usize",
+            )
+        })?;
+        if mapping.state_count() != state_count
+            || source_initial_state >= state_count
+            || source_state >= state_count
+        {
+            return Ok(None);
+        }
+        let canonical_state =
+            canonicalize_frozen_state_ordinal(source_state, source_initial_state);
+        let Some(forward) = owner.static_prefix_forward_from_canonical_state(
+            haystack,
+            resume_position,
+            window.end,
+            canonical_state,
+            pending_end,
+            self.output,
+        ) else {
+            return Ok(None);
+        };
+
+        // Only a successfully authenticated and completed immutable scan owns
+        // the ticket. Every decline above leaves it available to K0.
+        let consumed_window = state.consume(haystack)?;
+        if consumed_window != window {
+            return Err(CompileError::InternalInvariant(
+                "static-prefix frozen continuation consumed a different window",
+            ));
+        }
+        if let Some(dynamic) = dynamic_native_rows.as_deref_mut() {
+            dynamic.native_rows_dirty = true;
+        }
+
+        let found = match self.output {
+            OutputContract::Exists => MatchResult::Exists(forward.selected_end.is_some()),
+            OutputContract::SelectedEnd => MatchResult::SelectedEnd(forward.selected_end),
+            OutputContract::Span => {
+                let Some(selected_end) = forward.selected_end else {
+                    return Ok(Some(MatchResult::Span(None)));
+                };
+                if let Some(width) = self.exact_match_width {
+                    let start = selected_end.checked_sub(width).ok_or(
+                        CompileError::InternalInvariant(
+                            "static-prefix frozen continuation endpoint precedes exact width",
+                        ),
+                    )?;
+                    if start < window.start {
+                        return Err(CompileError::InternalInvariant(
+                            "static-prefix frozen continuation exact start precedes its window",
+                        ));
+                    }
+                    MatchResult::Span(Some((start, selected_end)))
+                } else {
+                    let recovered_start = self.recover_partial_span_start(
+                        haystack,
+                        window,
+                        nfa.as_mut().ok_or(CompileError::InternalInvariant(
+                            "static-prefix frozen continuation has no reverse K0 workspace",
+                        ))?,
+                        Some(&state.resume),
+                        selected_end,
+                        state.fully_prefilled,
+                    )?;
+                    MatchResult::Span(Some((recovered_start, selected_end)))
+                }
+            }
+        };
+        Ok(Some(found))
+    }
+
+    /// Continue from the exact frontier and first unconsumed byte returned by
+    /// the static native prefix admitted in the immediately preceding call.
+    #[doc(hidden)]
+    pub fn search_from_static_prefix_resume_ticket_with_workspace(
+        &self,
+        haystack: &[u8],
+        workspace: &mut ProgramWorkspace,
+        resume_state: usize,
+        resume_position: usize,
+        pending_end_word: usize,
+    ) -> Result<MatchResult, CompileError> {
+        if !workspace.identity.compatible(&self.identity)
+            || self.context_dfa.is_some()
+            || !matches!(self.engine, ProgramEngine::OrderedNfa)
+            || self.automaton.stats().has_assertions()
+        {
+            return Err(CompileError::InternalInvariant(
+                "static-prefix continuation rejected its workspace or graph",
+            ));
+        }
+        let ProgramWorkspace {
+            nfa,
+            static_prefix_resume,
+            dynamic_native_rows,
+            ..
+        } = workspace;
+        let state = static_prefix_resume.as_deref_mut().ok_or(
+            CompileError::InternalInvariant(
+                "static-prefix continuation has no graph-bound sidecar",
+            ),
+        )?;
+        let window = state.consume(haystack)?;
+        if resume_position <= window.start || resume_position >= window.end {
+            return Err(CompileError::InternalInvariant(
+                "static-prefix continuation position is outside its admitted window",
+            ));
+        }
+        let pending = state.resume.pending_mode(resume_state)?;
+        let pending_end = pending.then_some(pending_end_word);
+        if pending_end.is_some_and(|end| end <= window.start || end > resume_position) {
+            return Err(CompileError::InternalInvariant(
+                "static-prefix continuation pending endpoint is outside its consumed prefix",
+            ));
+        }
+        if let Some(dynamic) = dynamic_native_rows.as_deref_mut() {
+            dynamic.native_rows_dirty = true;
+        }
+        let resumed = self.search_nfa_from_partial_resume(
+            haystack,
+            window,
+            nfa.as_mut().ok_or(CompileError::InternalInvariant(
+                "static-prefix continuation has no prepared K0 workspace",
+            ))?,
+            &mut state.resume,
+            PartialDfaResume {
+                state: resume_state,
+                position: resume_position,
+                pending_end,
+            },
+            state.fully_prefilled,
+        )?;
+        Ok(resumed.found)
+    }
+
+    /// Recover a variable-width Span start using the exact static frontier set
+    /// and receipt bound by the immediately preceding V2 preflight.
+    #[doc(hidden)]
+    pub fn recover_bound_static_prefix_span_from_selected_end_with_workspace(
+        &self,
+        haystack: &[u8],
+        expected_window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+        expected_artifact_identity: [u8; 32],
+        selected_end: usize,
+    ) -> Result<MatchResult, CompileError> {
+        if expected_artifact_identity != self.identity.artifact
+            || !workspace.identity.compatible(&self.identity)
+            || self.context_dfa.is_some()
+            || !matches!(self.engine, ProgramEngine::OrderedNfa)
+            || self.automaton.stats().has_assertions()
+            || self.output != OutputContract::Span
+            || self.exact_match_width.is_some()
+        {
+            return Err(CompileError::InternalInvariant(
+                "bound static-prefix Span recovery rejected its artifact or graph",
+            ));
+        }
+        let ProgramWorkspace {
+            nfa,
+            static_prefix_resume,
+            dynamic_native_rows,
+            ..
+        } = workspace;
+        let state = static_prefix_resume.as_deref_mut().ok_or(
+            CompileError::InternalInvariant(
+                "bound static-prefix Span recovery has no graph-bound sidecar",
+            ),
+        )?;
+        let window = state.consume(haystack)?;
+        if window != expected_window {
+            return Err(CompileError::InternalInvariant(
+                "bound static-prefix Span recovery window disagrees with its ticket",
+            ));
+        }
+        if selected_end <= window.start || selected_end > window.end {
+            return Err(CompileError::InternalInvariant(
+                "bound static-prefix Span endpoint is outside its admitted window",
+            ));
+        }
+        if let Some(dynamic) = dynamic_native_rows.as_deref_mut() {
+            dynamic.native_rows_dirty = true;
+        }
+        let recovered_start = self.recover_partial_span_start(
+            haystack,
+            window,
+            nfa.as_mut().ok_or(CompileError::InternalInvariant(
+                "bound static-prefix Span recovery has no bidirectional K0 workspace",
+            ))?,
+            Some(&state.resume),
+            selected_end,
+            state.fully_prefilled,
+        )?;
         Ok(MatchResult::Span(Some((recovered_start, selected_end))))
     }
 
@@ -10859,11 +12231,10 @@ impl CompiledProgram {
 
     /// Authenticate and project an ordinary prepared K0 cache for the
     /// additive dynamic warmed-row root. Projection and admission are O(1),
-    /// allocation-free, and publish the cache's immutable identity token for
-    /// generated code to compare against the descriptor before reading either
-    /// source address. The returned exposed-provenance addresses are valid only
-    /// for that synchronous admitted scan and must not survive a helper call or
-    /// re-entry.
+    /// allocation-free, and publish the cache's immutable identity token with
+    /// the descriptor. The returned exposed-provenance addresses are valid
+    /// only for that synchronous admitted scan and must not survive a helper
+    /// call or re-entry.
     #[doc(hidden)]
     pub fn preflight_dynamic_native_rows_with_workspace(
         &self,
@@ -10872,7 +12243,72 @@ impl CompiledProgram {
         workspace: &mut ProgramWorkspace,
         expected_artifact_identity: [u8; 32],
     ) -> Result<(RetainedPartialPreflight, usize, u64), CompileError> {
-        if window.start > window.end || window.end > haystack.len() {
+        self.preflight_dynamic_native_rows_with_workspace_inner::<false>(
+            haystack,
+            window,
+            workspace,
+            expected_artifact_identity,
+        )
+    }
+
+    /// Compiler-private V3 projection after the generated wrapper and the
+    /// prepared runtime have established the invariant parts of admission.
+    ///
+    /// Unlike [`Self::preflight_dynamic_native_rows_with_workspace`], this
+    /// path does not repeat the exact-window, workspace-lineage, or static
+    /// program-shape checks on every search. Artifact authentication remains a
+    /// release-mode check and binds the generated entry to this exact program.
+    ///
+    /// # Compiler-private contract
+    ///
+    /// `window` must be contained in `haystack`. `workspace` must be the live,
+    /// exclusively borrowed workspace constructed for `self`. The caller must
+    /// be a generated dynamic-row entry for `self`; consequently the output
+    /// contract, engine, assertion, exact-product, and dynamic-row-workspace
+    /// requirements below must already hold. A foreign
+    /// `expected_artifact_identity` is permitted and is rejected before any
+    /// trusted operation. No returned address may survive a helper call,
+    /// re-entry, workspace mutation, or the end of the search.
+    #[doc(hidden)]
+    pub fn compiler_private_preflight_dynamic_native_rows_v3_with_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+        expected_artifact_identity: [u8; 32],
+    ) -> Result<(RetainedPartialPreflight, usize, u64), CompileError> {
+        debug_assert!(window.start <= window.end && window.end <= haystack.len());
+        debug_assert!(workspace.identity.compatible(&self.identity));
+        debug_assert!(matches!(
+            self.output,
+            OutputContract::Exists | OutputContract::SelectedEnd | OutputContract::Span
+        ));
+        debug_assert!(self.output != OutputContract::Span || self.exact_match_width != Some(0));
+        debug_assert!(self.context_dfa.is_none());
+        debug_assert!(matches!(self.engine, ProgramEngine::OrderedNfa));
+        debug_assert!(!self.automaton.stats().has_assertions());
+        debug_assert!(!self.has_nfa_exact_product());
+        debug_assert!(workspace.dynamic_native_rows.is_some());
+        self.preflight_dynamic_native_rows_with_workspace_inner::<true>(
+            haystack,
+            window,
+            workspace,
+            expected_artifact_identity,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one const-specialized transaction keeps checked and trusted policies identical"
+    )]
+    fn preflight_dynamic_native_rows_with_workspace_inner<const TRUSTED_V3: bool>(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+        expected_artifact_identity: [u8; 32],
+    ) -> Result<(RetainedPartialPreflight, usize, u64), CompileError> {
+        if !TRUSTED_V3 && (window.start > window.end || window.end > haystack.len()) {
             return Err(CompileError::InvalidWindow {
                 start: window.start,
                 end: window.end,
@@ -10884,7 +12320,7 @@ impl CompiledProgram {
                 "dynamic native-row preflight artifact identity does not match the prepared program",
             ));
         }
-        if !workspace.identity.compatible(&self.identity) {
+        if !TRUSTED_V3 && !workspace.identity.compatible(&self.identity) {
             return Err(CompileError::InternalInvariant(
                 "dynamic native-row workspace belongs to a different semantic program",
             ));
@@ -10893,37 +12329,29 @@ impl CompiledProgram {
             OutputContract::Exists | OutputContract::SelectedEnd => true,
             OutputContract::Span => self.exact_match_width != Some(0),
         };
-        if !output_supported
-            || self.context_dfa.is_some()
-            || !matches!(self.engine, ProgramEngine::OrderedNfa)
-            || self.automaton.stats().has_assertions()
-            || self.has_nfa_exact_product()
+        if !TRUSTED_V3
+            && (!output_supported
+                || self.context_dfa.is_some()
+                || !matches!(self.engine, ProgramEngine::OrderedNfa)
+                || self.automaton.stats().has_assertions()
+                || self.has_nfa_exact_product())
         {
             return Err(CompileError::InternalInvariant(
                 "dynamic native rows require assertion-free ordered-NFA endpoint output or nonzero Span",
             ));
         }
 
-        let input_bytes = window.end.saturating_sub(window.start);
-        let has_mandatory_cut = self.nfa_mandatory_cut.is_some();
-        workspace
-            .dynamic_native_rows
-            .as_deref_mut()
-            .ok_or(CompileError::InternalInvariant(
-                "dynamic native-row preflight has no prepared descriptor workspace",
-            ))?
-            .state
-            .settle_unobserved_local_entry();
-        let window = if has_mandatory_cut {
-            match self.search_nfa_with_mandatory_cut(haystack, window) {
-                NfaMandatoryCutOutcome::Complete(found) => {
-                    return Ok((RetainedPartialPreflight::Complete(found), 0, 0));
-                }
-                NfaMandatoryCutOutcome::Continue(narrowed) => narrowed,
-            }
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "the trusted V3 contract proves exact-window subtraction cannot underflow"
+        )]
+        let input_bytes = if TRUSTED_V3 {
+            window.end - window.start
         } else {
-            window
+            window.end.saturating_sub(window.start)
         };
+        let has_mandatory_cut = self.nfa_mandatory_cut.is_some();
+        let mut window = window;
         let mut initial_pending = false;
         let mut enter = None;
         {
@@ -10937,28 +12365,49 @@ impl CompiledProgram {
                     "dynamic native-row preflight has no prepared descriptor workspace",
                 ),
             )?;
-            if window.start < window.end && input_bytes >= DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES {
-                let nfa = nfa.as_ref().ok_or(CompileError::InternalInvariant(
-                    "dynamic native-row preflight has no prepared K0 workspace",
-                ))?;
+            if has_mandatory_cut {
+                match self.search_nfa_with_mandatory_cut(haystack, window) {
+                    NfaMandatoryCutOutcome::Complete(found) => {
+                        dynamic.settle_preflight_admission();
+                        return Ok((RetainedPartialPreflight::Complete(found), 0, 0));
+                    }
+                    NfaMandatoryCutOutcome::Continue(narrowed) => window = narrowed,
+                }
+            }
+            let should_claim = if window.start < window.end
+                && input_bytes >= DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES
+            {
+                let Some(nfa) = nfa.as_ref() else {
+                    dynamic.settle_preflight_admission();
+                    return Err(CompileError::InternalInvariant(
+                        "dynamic native-row preflight has no prepared K0 workspace",
+                    ));
+                };
                 let descriptor_ready = !dynamic.native_rows_dirty
                     || dynamic.refresh_native_rows(&self.automaton, nfa);
                 if descriptor_ready {
                     initial_pending =
                         dynamic.native_rows.initial_flags & NATIVE_ROWS_INITIAL_PENDING != 0;
-                    if !initial_pending
-                        && dynamic.state.claim_with_provenance(
-                            window,
-                            input_bytes,
-                            has_mandatory_cut,
-                        )
-                    {
-                        enter = Some((
-                            (&raw const dynamic.native_rows).expose_provenance(),
-                            dynamic.native_rows.cache_identity,
-                        ));
-                    }
                 }
+                descriptor_ready && !initial_pending
+            } else {
+                false
+            };
+            // This is the only admission settlement on every accepted
+            // preflight. The cut analysis receives no workspace and descriptor
+            // refresh leaves admission state untouched, so a proven prior
+            // local return can become the next live admission without clearing
+            // and then rewriting its fields.
+            if should_claim {
+                if dynamic.settle_and_claim_preflight_admission(
+                    window,
+                    input_bytes,
+                    has_mandatory_cut,
+                ) {
+                    enter = Some(dynamic.compiler_private_trusted_descriptor_v2());
+                }
+            } else {
+                dynamic.settle_preflight_admission();
             }
         }
         if initial_pending && self.output == OutputContract::Exists {
@@ -11976,6 +13425,9 @@ impl CompiledProgram {
             state.observe_fallback(consumed, input_bytes);
             return Ok(None);
         }
+        let resume_set = resume_set.as_mut().ok_or(CompileError::InternalInvariant(
+            "partial DFA hole has no authenticated K0 resume set",
+        ))?;
         let resumed = self.search_nfa_from_partial_resume(
             haystack, window, workspace, resume_set, resume, receipt,
         )?;
@@ -11992,13 +13444,10 @@ impl CompiledProgram {
         haystack: &[u8],
         window: SearchWindow,
         workspace: &mut K0Workspace,
-        resume_set: &mut Option<K0ResumeSet>,
+        resume_set: &mut K0ResumeSet,
         resume: PartialDfaResume,
         receipt: Option<FullyPrefilledFallbackReceipt>,
     ) -> Result<PartialDfaResumeResult, CompileError> {
-        let resume_set = resume_set.as_mut().ok_or(CompileError::InternalInvariant(
-            "partial DFA hole has no authenticated K0 resume set",
-        ))?;
         let k0_window = K0SearchWindow::new(window.start, window.end);
         let limits = SearchLimits::unlimited();
         let k0_receipt = receipt
@@ -14270,6 +15719,19 @@ fn dfa_boundary_starts(raw: &RawPlan) -> [bool; 256] {
     boundary_starts
 }
 
+fn dfa_boundary_class_map(raw: &RawPlan) -> [u8; 256] {
+    let boundary_starts = dfa_boundary_starts(raw);
+    let mut current_class = 0_u8;
+    core::array::from_fn(|byte| {
+        if byte != 0 && boundary_starts[byte] {
+            current_class = current_class
+                .checked_add(1)
+                .expect("at most 256 increasing byte-boundary classes");
+        }
+        current_class
+    })
+}
+
 fn dfa_alphabet_shape(raw: &RawPlan) -> Result<DfaAlphabetShape, ProgramFormatError> {
     let boundary_starts = dfa_boundary_starts(raw);
     let boundary_classes = boundary_starts.iter().filter(|&&start| start).count();
@@ -14936,7 +16398,7 @@ mod tests {
         let dynamic = dynamic_rows(workspace);
         assert_eq!(dynamic.native_rows_dirty, dirty);
         assert_eq!(dynamic.native_rows_refreshes, refreshes);
-        assert_eq!(dynamic.state.native_entry_window, ticket);
+        assert_eq!(dynamic.state.native_entry_window(), ticket);
     }
 
     fn enter_dynamic_rows(
@@ -15006,6 +16468,113 @@ mod tests {
     }
 
     #[test]
+    fn compiler_private_v2_descriptor_validator_covers_every_unchecked_field_family() {
+        let compiled = program(
+            "(?:ab|ac)+z",
+            OutputContract::Exists,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        let mut workspace = compiled.prepare_workspace().expect("prepared K0 workspace");
+        let mut haystack = vec![b'a'; 64];
+        for pair in haystack[..62].chunks_exact_mut(2) {
+            pair.copy_from_slice(b"ab");
+        }
+        haystack[62] = b'z';
+        haystack[63] = b'!';
+        let window = SearchWindow::new(0, haystack.len());
+        let identity = compiled.artifact_identity();
+
+        let (cold, _, _) = compiled
+            .preflight_dynamic_native_rows_with_workspace(
+                &haystack,
+                window,
+                &mut workspace,
+                identity,
+            )
+            .expect("cold dynamic preflight");
+        assert_eq!(
+            cold,
+            RetainedPartialPreflight::Complete(MatchResult::Exists(true))
+        );
+        enter_dynamic_rows(
+            &compiled,
+            &haystack,
+            window,
+            &mut workspace,
+            identity,
+            "trusted V2 descriptor",
+        );
+
+        let dynamic = workspace
+            .dynamic_native_rows
+            .as_deref_mut()
+            .expect("prepared dynamic-row workspace");
+        let original = dynamic.native_rows;
+        let original_class_map = dynamic.class_map;
+        assert!(dynamic.compiler_private_descriptor_satisfies_v2_contract());
+
+        macro_rules! reject_field {
+            ($field:ident, $value:expr) => {{
+                dynamic.native_rows = original;
+                dynamic.native_rows.$field = $value;
+                assert!(
+                    !dynamic.compiler_private_descriptor_satisfies_v2_contract(),
+                    stringify!($field)
+                );
+            }};
+        }
+        reject_field!(rows_address, 0);
+        reject_field!(rows_address, original.rows_address.saturating_add(1));
+        reject_field!(class_map_address, 0);
+        reject_field!(live_cells, 0);
+        reject_field!(row_stride, 0);
+        reject_field!(
+            initial_row,
+            u32::try_from(original.live_cells).unwrap_or(u32::MAX)
+        );
+        reject_field!(unfilled_cell, 0);
+        reject_field!(accept_mask, 0);
+        reject_field!(next_row_token_mask, 0);
+        reject_field!(cache_identity, 0);
+        reject_field!(initial_flags, NATIVE_ROWS_INITIAL_PENDING);
+        reject_field!(
+            learned_loop_row_count,
+            u32::try_from(original.learned_loop_rows.len() + 1).unwrap()
+        );
+
+        dynamic.native_rows = original;
+        dynamic.native_rows.learned_loop_row_count = 0;
+        dynamic.native_rows.learned_loop_rows[0] = 0;
+        assert!(!dynamic.compiler_private_descriptor_satisfies_v2_contract());
+
+        dynamic.native_rows = original;
+        dynamic.native_rows.learned_loop_row_count = 1;
+        dynamic.native_rows.learned_loop_rows[0] =
+            u32::try_from(original.live_cells).unwrap_or(u32::MAX);
+        assert!(!dynamic.compiler_private_descriptor_satisfies_v2_contract());
+
+        dynamic.native_rows = original;
+        dynamic.native_rows.learned_loop_row_count = 2;
+        dynamic.native_rows.learned_loop_rows[0] = 0;
+        dynamic.native_rows.learned_loop_rows[1] = 0;
+        assert!(!dynamic.compiler_private_descriptor_satisfies_v2_contract());
+
+        dynamic.native_rows = original;
+        let stride = u8::try_from(original.row_stride).expect("fixture stride fits one byte");
+        assert_ne!(stride, u8::MAX);
+        dynamic.class_map[0] = stride;
+        assert!(!dynamic.compiler_private_descriptor_satisfies_v2_contract());
+
+        dynamic.class_map = original_class_map;
+        dynamic.native_rows = original;
+        dynamic.native_rows_dirty = true;
+        assert!(!dynamic.compiler_private_descriptor_satisfies_v2_contract());
+        dynamic.native_rows_dirty = false;
+        assert!(dynamic.compiler_private_descriptor_satisfies_v2_contract());
+    }
+
+    #[test]
     #[allow(
         clippy::too_many_lines,
         reason = "one lifecycle regression proves projection reuse and every dirty-to-refresh boundary"
@@ -15041,6 +16610,15 @@ mod tests {
         );
         assert_eq!((cold_address, cold_cache_identity), (0, 0));
         assert_dynamic_rows_lifecycle(&workspace, true, 1, None);
+        assert_eq!(
+            dynamic_rows(&workspace).preflight_admission_settlements,
+            1,
+            "a completing cold preflight settles exactly once"
+        );
+        assert_eq!(
+            dynamic_rows(&workspace).preflight_admission_replacements,
+            0
+        );
 
         let (first_address, first_cache_identity, first_projection) = enter_dynamic_rows(
             &compiled,
@@ -15051,6 +16629,15 @@ mod tests {
             "warm dynamic preflight",
         );
         assert_dynamic_rows_lifecycle(&workspace, false, 2, Some(window));
+        assert_eq!(
+            dynamic_rows(&workspace).preflight_admission_settlements,
+            2,
+            "a first admitted preflight settles exactly once"
+        );
+        assert_eq!(
+            dynamic_rows(&workspace).preflight_admission_replacements,
+            0
+        );
         assert_eq!(first_projection.cache_identity, first_cache_identity);
         assert_eq!(first_projection.initial_flags, 0);
 
@@ -15068,6 +16655,16 @@ mod tests {
         assert_eq!(second_cache_identity, first_cache_identity);
         assert_eq!(second_projection, first_projection);
         assert_dynamic_rows_lifecycle(&workspace, false, 2, Some(window));
+        assert_eq!(
+            dynamic_rows(&workspace).preflight_admission_settlements,
+            3,
+            "local completion and readmission use one settlement"
+        );
+        assert_eq!(
+            dynamic_rows(&workspace).preflight_admission_replacements,
+            1,
+            "local completion becomes the next admission without an intermediate clear"
+        );
 
         // A whole-search side exit invalidates before canonical K0 runs. The
         // two dirty stores coalesce, and the next admission refreshes exactly
@@ -15769,7 +17366,7 @@ mod tests {
                 .as_deref()
                 .expect("dynamic state")
                 .state
-                .native_entry_window,
+                .native_entry_window(),
             None,
             "malformed postflight must consume the admission"
         );
@@ -15874,7 +17471,7 @@ mod tests {
             assert!(workspace
                 .dynamic_native_rows
                 .as_deref()
-                .is_some_and(|dynamic| dynamic.state.native_entry_window.is_none()));
+                .is_some_and(|dynamic| dynamic.state.native_entry_window().is_none()));
         }
 
         let capability = header
@@ -16046,7 +17643,7 @@ mod tests {
             .as_deref()
             .expect("consumed dynamic descriptor")
             .state;
-        assert_eq!(state.native_entry_window, None);
+        assert_eq!(state.native_entry_window(), None);
         assert_eq!(state.consecutive_deopts, 1);
         assert_eq!(state.bypass_remaining, 0);
 
@@ -16093,7 +17690,7 @@ mod tests {
             .as_deref()
             .expect("consumed stale descriptor")
             .state;
-        assert_eq!(state.native_entry_window, None);
+        assert_eq!(state.native_entry_window(), None);
         assert_eq!(state.consecutive_deopts, 1);
     }
 
@@ -16264,7 +17861,7 @@ mod tests {
             &dynamic.native_rows.learned_loop_rows[..learned_loop_rows.len()],
             learned_loop_rows.as_slice()
         );
-        assert_eq!(dynamic.state.native_entry_window, Some(window));
+        assert_eq!(dynamic.state.native_entry_window(), Some(window));
     }
 
     #[test]
@@ -16336,7 +17933,7 @@ mod tests {
             0
         );
         assert_eq!(dynamic.native_rows.rows_address, 0);
-        assert_eq!(dynamic.state.native_entry_window, None);
+        assert_eq!(dynamic.state.native_entry_window(), None);
         assert!(!dynamic.native_rows_dirty);
         assert_eq!(
             dynamic.native_rows_refreshes, 2,
@@ -16383,7 +17980,7 @@ mod tests {
                     .as_deref()
                     .expect("nullable dynamic workspace")
                     .state
-                    .native_entry_window,
+                    .native_entry_window(),
                 None,
                 "{phase}"
             );
@@ -16438,7 +18035,7 @@ mod tests {
         assert_ne!((address, cache_identity), (0, 0));
         let dynamic = workspace.dynamic_native_rows.as_deref().unwrap();
         assert_eq!(dynamic.native_rows.initial_flags, 0);
-        assert_eq!(dynamic.state.native_entry_window, Some(window));
+        assert_eq!(dynamic.state.native_entry_window(), Some(window));
     }
 
     #[test]
@@ -16469,7 +18066,7 @@ mod tests {
             workspace
                 .dynamic_native_rows
                 .as_deref()
-                .is_some_and(|dynamic| dynamic.state.native_entry_window.is_none())
+                .is_some_and(|dynamic| dynamic.state.native_entry_window().is_none())
         );
 
         let variable_span = program(
@@ -16503,7 +18100,7 @@ mod tests {
             span_workspace
                 .dynamic_native_rows
                 .as_deref()
-                .is_some_and(|dynamic| dynamic.state.native_entry_window.is_none()),
+                .is_some_and(|dynamic| dynamic.state.native_entry_window().is_none()),
             "nullable Span must complete without publishing an admission ticket"
         );
     }
@@ -16529,6 +18126,316 @@ mod tests {
         assert!(state.claim(window));
         state.settle_unobserved_local_entry();
         assert_eq!(state, DynamicNativeRowsState::default());
+    }
+
+    #[test]
+    fn dynamic_native_rows_preflight_settles_once_for_complete_enter_and_short_paths() {
+        const MATCH_BYTES: usize = 15;
+        let pattern = r"(?:ba|cd)[a-b]{1,10}7[A-Za-z]{1,2}";
+        let compiled = program(
+            pattern,
+            OutputContract::Exists,
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+        );
+        assert!(compiled.has_nfa_mandatory_cut());
+        let identity = compiled.artifact_identity();
+        let mut workspace = compiled.prepare_workspace().expect("prepared K0 workspace");
+
+        let candidate = DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES + 16;
+        let mut matching = vec![b'!'; candidate + MATCH_BYTES];
+        matching[candidate..candidate + 2].copy_from_slice(b"ba");
+        matching[candidate + 2..candidate + 12].fill(b'b');
+        matching[candidate + 12..candidate + MATCH_BYTES].copy_from_slice(b"7AZ");
+        let matching_window = SearchWindow::new(3, matching.len());
+        let missing = vec![b'!'; matching.len()];
+        let (complete, address, cache_identity) = compiled
+            .preflight_dynamic_native_rows_with_workspace(
+                &missing,
+                matching_window,
+                &mut workspace,
+                identity,
+            )
+            .expect("mandatory-cut completion");
+        assert_eq!(
+            complete,
+            RetainedPartialPreflight::Complete(MatchResult::Exists(false))
+        );
+        assert_eq!((address, cache_identity), (0, 0));
+        assert_eq!(dynamic_rows(&workspace).preflight_admission_settlements, 1);
+
+        let (cold, address, cache_identity) = compiled
+            .preflight_dynamic_native_rows_with_workspace(
+                &matching,
+                matching_window,
+                &mut workspace,
+                identity,
+            )
+            .expect("cold canonical completion");
+        assert_eq!(
+            cold,
+            RetainedPartialPreflight::Complete(MatchResult::Exists(true))
+        );
+        assert_eq!((address, cache_identity), (0, 0));
+        assert_eq!(dynamic_rows(&workspace).preflight_admission_settlements, 2);
+
+        let (entered, address, cache_identity) = compiled
+            .preflight_dynamic_native_rows_with_workspace(
+                &matching,
+                matching_window,
+                &mut workspace,
+                identity,
+            )
+            .expect("warm admission");
+        let NfaMandatoryCutOutcome::Continue(narrowed) =
+            compiled.search_nfa_with_mandatory_cut(&matching, matching_window)
+        else {
+            panic!("fixture mandatory cut did not retain a narrowed window");
+        };
+        assert_eq!(entered, RetainedPartialPreflight::Enter(narrowed));
+        assert_ne!((address, cache_identity), (0, 0));
+        assert_eq!(dynamic_rows(&workspace).preflight_admission_settlements, 3);
+
+        let short = b"bab7A";
+        let (completed_short, address, cache_identity) = compiled
+            .preflight_dynamic_native_rows_with_workspace(
+                short,
+                SearchWindow::full(short),
+                &mut workspace,
+                identity,
+            )
+            .expect("short canonical completion");
+        assert_eq!(
+            completed_short,
+            RetainedPartialPreflight::Complete(MatchResult::Exists(true))
+        );
+        assert_eq!((address, cache_identity), (0, 0));
+        let dynamic = dynamic_rows(&workspace);
+        assert_eq!(dynamic.preflight_admission_settlements, 4);
+        assert_eq!(dynamic.preflight_admission_replacements, 0);
+        assert!(dynamic.state.native_entry_window().is_none());
+    }
+
+    #[test]
+    fn dynamic_native_rows_settle_and_claim_replaces_exact_admission() {
+        let mut state = DynamicNativeRowsState::default();
+        let prior = SearchWindow::new(7, 71);
+        assert!(state.claim_with_provenance(prior, 96, true));
+        state.consecutive_deopts = 3;
+        state.bypass_remaining = 23;
+
+        let current = SearchWindow::new(11, 83);
+        assert!(state.settle_and_claim_with_provenance(current, 128, false));
+        assert_eq!(state.consecutive_deopts, 0);
+        assert_eq!(state.bypass_remaining, 0);
+        assert_eq!(
+            state.take_native_entry_admission(),
+            Some(DynamicNativeRowsAdmission {
+                window: current,
+                original_input_bytes: 128,
+                after_mandatory_cut: false,
+            })
+        );
+        assert_eq!(state, DynamicNativeRowsState::default());
+    }
+
+    #[test]
+    fn dynamic_native_rows_missing_k0_settles_prior_admission_once() {
+        let compiled = program(
+            "(?:ab|ac)+z",
+            OutputContract::Exists,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        let mut haystack = vec![b'a'; 64];
+        for pair in haystack[..62].chunks_exact_mut(2) {
+            pair.copy_from_slice(b"ab");
+        }
+        haystack[62] = b'z';
+        haystack[63] = b'!';
+        let window = SearchWindow::full(&haystack);
+        let identity = compiled.artifact_identity();
+        let mut workspace = compiled.prepare_workspace().expect("dynamic workspace");
+
+        let (cold, _, _) = compiled
+            .preflight_dynamic_native_rows_with_workspace(
+                &haystack,
+                window,
+                &mut workspace,
+                identity,
+            )
+            .expect("cold preflight");
+        assert_eq!(
+            cold,
+            RetainedPartialPreflight::Complete(MatchResult::Exists(true))
+        );
+        enter_dynamic_rows(
+            &compiled,
+            &haystack,
+            window,
+            &mut workspace,
+            identity,
+            "live admission before malformed workspace",
+        );
+        assert_eq!(dynamic_rows(&workspace).preflight_admission_settlements, 2);
+        workspace.nfa = None;
+
+        assert!(matches!(
+            compiled.preflight_dynamic_native_rows_with_workspace(
+                &haystack,
+                window,
+                &mut workspace,
+                identity,
+            ),
+            Err(CompileError::InternalInvariant(
+                "dynamic native-row preflight has no prepared K0 workspace"
+            ))
+        ));
+        let dynamic = dynamic_rows(&workspace);
+        assert_eq!(dynamic.preflight_admission_settlements, 3);
+        assert_eq!(dynamic.preflight_admission_replacements, 0);
+        assert_eq!(dynamic.state, DynamicNativeRowsState::default());
+    }
+
+    #[test]
+    fn dynamic_native_rows_single_settlement_is_workspace_local_under_concurrency() {
+        let compiled = program(
+            "(?:ab|ac)+z",
+            OutputContract::Exists,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        let mut haystack = vec![b'a'; 64];
+        for pair in haystack[..62].chunks_exact_mut(2) {
+            pair.copy_from_slice(b"ab");
+        }
+        haystack[62] = b'z';
+        haystack[63] = b'!';
+        let window = SearchWindow::full(&haystack);
+        let identity = compiled.artifact_identity();
+
+        std::thread::scope(|scope| {
+            let mut workers = Vec::new();
+            for _ in 0..4 {
+                let compiled = &compiled;
+                let haystack = &haystack;
+                workers.push(scope.spawn(move || {
+                    let mut workspace = compiled
+                        .prepare_workspace()
+                        .expect("independent prepared K0 workspace");
+                    let (cold, _, _) = compiled
+                        .preflight_dynamic_native_rows_with_workspace(
+                            haystack,
+                            window,
+                            &mut workspace,
+                            identity,
+                        )
+                        .expect("concurrent cold preflight");
+                    assert_eq!(
+                        cold,
+                        RetainedPartialPreflight::Complete(MatchResult::Exists(true))
+                    );
+                    for context in ["concurrent admission", "concurrent local readmission"] {
+                        let (entered, address, cache_identity) = compiled
+                            .preflight_dynamic_native_rows_with_workspace(
+                                haystack,
+                                window,
+                                &mut workspace,
+                                identity,
+                            )
+                            .unwrap_or_else(|error| panic!("{context}: {error}"));
+                        assert_eq!(entered, RetainedPartialPreflight::Enter(window));
+                        assert_ne!((address, cache_identity), (0, 0));
+                    }
+                    let dynamic = dynamic_rows(&workspace);
+                    assert_eq!(dynamic.preflight_admission_settlements, 3);
+                    assert_eq!(dynamic.preflight_admission_replacements, 1);
+                    assert_eq!(dynamic.state.native_entry_window(), Some(window));
+                }));
+            }
+            for worker in workers {
+                worker.join().expect("independent dynamic-row worker");
+            }
+        });
+    }
+
+    #[test]
+    fn trusted_v3_window_subtraction_matches_checked_exact_windows() {
+        let compiled = program(
+            "(?:ab|ac)+z",
+            OutputContract::Exists,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        let mut haystack = vec![b'!'; 80];
+        for pair in haystack[8..70].chunks_exact_mut(2) {
+            pair.copy_from_slice(b"ab");
+        }
+        haystack[70] = b'z';
+        let identity = compiled.artifact_identity();
+
+        for window in [
+            SearchWindow::new(0, 0),
+            SearchWindow::new(8, 8),
+            SearchWindow::new(haystack.len(), haystack.len()),
+            SearchWindow::new(8, 72),
+            SearchWindow::full(&haystack),
+        ] {
+            let mut checked = compiled
+                .prepare_workspace()
+                .expect("checked exact-window workspace");
+            let mut trusted = compiled
+                .prepare_workspace()
+                .expect("trusted exact-window workspace");
+            for round in 0..3 {
+                let (checked_outcome, checked_address, checked_cache_identity) = compiled
+                    .preflight_dynamic_native_rows_with_workspace(
+                        &haystack,
+                        window,
+                        &mut checked,
+                        identity,
+                    )
+                    .expect("checked exact-window preflight");
+                let (trusted_outcome, trusted_address, trusted_cache_identity) = compiled
+                    .compiler_private_preflight_dynamic_native_rows_v3_with_workspace(
+                        &haystack,
+                        window,
+                        &mut trusted,
+                        identity,
+                    )
+                    .expect("trusted exact-window preflight");
+                assert_eq!(trusted_outcome, checked_outcome, "{window:?}/round {round}");
+                assert_eq!(
+                    trusted_address != 0,
+                    checked_address != 0,
+                    "{window:?}/round {round} descriptor"
+                );
+                assert_eq!(
+                    trusted_cache_identity != 0,
+                    checked_cache_identity != 0,
+                    "{window:?}/round {round} cache"
+                );
+
+                for workspace in [&checked, &trusted] {
+                    let state = &dynamic_rows(workspace).state;
+                    if matches!(checked_outcome, RetainedPartialPreflight::Enter(_)) {
+                        assert_eq!(checked_outcome, RetainedPartialPreflight::Enter(window));
+                        assert_eq!(
+                            state
+                                .native_entry_admission
+                                .map(|admission| admission.original_input_bytes),
+                            Some(window.end.saturating_sub(window.start)),
+                            "{window:?}/round {round} admitted length"
+                        );
+                    } else {
+                        assert!(state.native_entry_window().is_none());
+                    }
+                }
+            }
+        }
     }
 
     fn authentic_partial_resume(
@@ -21249,29 +23156,19 @@ mod tests {
                 "warm {output:?}"
             );
             assert_ne!((address, cache_identity), (0, 0), "warm {output:?}");
-            assert_eq!(
-                dynamic_workspace
-                    .dynamic_native_rows
-                    .as_deref()
-                    .expect("dynamic descriptor")
-                    .state
-                    .native_entry_window,
-                Some(narrowed),
-                "warm {output:?} ticket"
-            );
             let dynamic_state = &dynamic_workspace
                 .dynamic_native_rows
                 .as_deref()
                 .expect("dynamic descriptor")
                 .state;
             assert_eq!(
-                dynamic_state.native_entry_original_input_bytes,
-                original.end - original.start,
-                "warm {output:?} original byte basis"
-            );
-            assert!(
-                dynamic_state.native_entry_after_mandatory_cut,
-                "warm {output:?} must retain post-cut provenance"
+                dynamic_state.native_entry_admission,
+                Some(DynamicNativeRowsAdmission {
+                    window: narrowed,
+                    original_input_bytes: original.end - original.start,
+                    after_mandatory_cut: true,
+                }),
+                "warm {output:?} ticket and provenance"
             );
 
             let absent = vec![b'!'; haystack.len()];
@@ -21300,7 +23197,7 @@ mod tests {
                     .as_deref()
                     .expect("dynamic descriptor")
                     .state
-                    .native_entry_window,
+                    .native_entry_window(),
                 None,
                 "exhausted {output:?} must settle the prior ticket"
             );
@@ -21360,17 +23257,8 @@ mod tests {
                 .as_deref()
                 .expect("wire dynamic descriptor")
                 .state;
-            assert_eq!(deopt_state.native_entry_window, None, "wire deopt {output:?}");
+            assert_eq!(deopt_state.native_entry_admission, None, "wire deopt {output:?}");
             assert_eq!(deopt_state.consecutive_deopts, 1, "wire deopt {output:?}");
-            assert_eq!(
-                deopt_state.native_entry_original_input_bytes,
-                0,
-                "wire deopt {output:?} consumed original byte provenance"
-            );
-            assert!(
-                !deopt_state.native_entry_after_mandatory_cut,
-                "wire deopt {output:?} consumed post-cut provenance"
-            );
             let (wire_reentered, _, wire_cache_identity) = restored
                 .preflight_dynamic_native_rows_with_workspace(
                     &haystack,
@@ -21634,13 +23522,15 @@ mod tests {
             );
             let descriptor = dynamic.native_rows;
             assert_eq!(descriptor.cache_identity, cache_identity, "{output:?}");
-            assert_eq!(dynamic.state.native_entry_window, Some(narrowed), "{output:?}");
             assert_eq!(
-                dynamic.state.native_entry_original_input_bytes,
-                original.end - original.start,
-                "{output:?}"
+                dynamic.state.native_entry_admission,
+                Some(DynamicNativeRowsAdmission {
+                    window: narrowed,
+                    original_input_bytes: original.end - original.start,
+                    after_mandatory_cut: true,
+                }),
+                "{output:?} admission and post-cut provenance"
             );
-            assert!(dynamic.state.native_entry_after_mandatory_cut, "{output:?}");
             {
                 let projection = workspace
                     .nfa
@@ -23738,6 +25628,625 @@ mod tests {
     }
 
     #[test]
+    fn every_frozen_row_format_resumes_from_every_canonical_state() {
+        type ModelCell = (bool, Option<usize>);
+
+        fn scalar_selected_end(
+            cells: &[ModelCell],
+            mut state: usize,
+            input: &[u8],
+            base: usize,
+            mut selected_end: Option<usize>,
+        ) -> Option<usize> {
+            for (offset, &class) in input.iter().enumerate() {
+                let (accepts, destination) = cells[state * 2 + usize::from(class)];
+                if accepts {
+                    selected_end = Some(base + offset + 1);
+                }
+                let Some(destination) = destination else {
+                    break;
+                };
+                state = destination;
+            }
+            selected_end
+        }
+
+        let compiled = program(
+            "ab",
+            OutputContract::SelectedEnd,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        let mut workspace = compiled.prepare_workspace().unwrap();
+        let root_prefill_receipt = complete_root_prefill_receipt(&compiled, &mut workspace);
+        let class_map: [u8; 256] =
+            core::array::from_fn(|byte| u8::try_from(byte & 1).unwrap());
+        let mut source_classes = [0_u8; 256];
+        source_classes[1] = 1;
+        let columns = FrozenCompactColumnProjection {
+            class_count: 2,
+            source_classes,
+            class_map,
+        };
+        let cells: [ModelCell; 4] = [
+            (false, Some(0)),
+            (true, Some(1)),
+            (true, None),
+            (false, Some(0)),
+        ];
+        let source_rows = cells
+            .iter()
+            .map(|&(accepts, destination)| {
+                frozen_test_source_cell(destination, 2, accepts, 0)
+            })
+            .collect::<Vec<_>>();
+        let build_u16_rows = |physical_cells: usize, state_ordinal: bool| {
+            let mut rows = vec![DYNAMIC_NATIVE_ROWS_V3_DEAD_CELL; 2 * physical_cells];
+            for state in 0..2 {
+                for class in 0..2 {
+                    let (accepts, destination) = cells[state * 2 + class];
+                    let token = destination.map_or(0, |destination| {
+                        let token = if state_ordinal {
+                            destination + 1
+                        } else {
+                            destination * physical_cells + 1
+                        };
+                        u16::try_from(token).unwrap()
+                    });
+                    rows[state * physical_cells + class] = token
+                        | accepts
+                            .then_some(DYNAMIC_NATIVE_ROWS_V3_ACCEPT_MASK)
+                            .unwrap_or(0);
+                }
+            }
+            rows.into_boxed_slice()
+        };
+        let build_u8_rows = |physical_cells: usize| {
+            let mut rows = vec![DYNAMIC_NATIVE_ROWS_V10_DEAD_CELL; 2 * physical_cells];
+            for state in 0..2 {
+                for class in 0..2 {
+                    let (accepts, destination) = cells[state * 2 + class];
+                    let token = destination
+                        .map_or(0, |destination| u8::try_from(destination + 1).unwrap());
+                    rows[state * physical_cells + class] = token
+                        | accepts
+                            .then_some(DYNAMIC_NATIVE_ROWS_V10_ACCEPT_MASK)
+                            .unwrap_or(0);
+                }
+            }
+            rows.into_boxed_slice()
+        };
+        let identity_map: [u8; 256] =
+            core::array::from_fn(|byte| u8::try_from(byte).unwrap());
+        let pair_rows_v11 =
+            build_frozen_pair_rows_v11(&source_rows, &columns, 2, 2, 0).unwrap();
+        let pair_rows_v13 =
+            build_frozen_pair_rows_v13(&source_rows, &columns, 2, 2, 0).unwrap();
+        let quad_rows_v14 =
+            build_frozen_quad_rows_v14(&source_rows, &columns, 2, 2, 0).unwrap();
+
+        let make_storage =
+            |format_version: u32,
+             row_shift: u32,
+             descriptor_class_count: u32,
+             rows: Box<[u16]>,
+             rows_u8: Option<Box<[u8]>>,
+             pair_rows_v11: Option<Box<[u32]>>,
+             pair_rows_v13: Option<Box<[u16]>>,
+             quad_rows_v14: Option<Box<[u16]>>,
+             storage_class_map: [u8; 256]| {
+            let rows_address = if !rows.is_empty() {
+                rows.as_ptr().expose_provenance()
+            } else if let Some(rows) = rows_u8.as_ref() {
+                rows.as_ptr().expose_provenance()
+            } else if let Some(rows) = pair_rows_v11.as_ref() {
+                rows.as_ptr().expose_provenance()
+            } else if let Some(rows) = pair_rows_v13.as_ref() {
+                rows.as_ptr().expose_provenance()
+            } else {
+                quad_rows_v14
+                    .as_ref()
+                    .unwrap()
+                    .as_ptr()
+                    .expose_provenance()
+            };
+            FrozenDynamicRowsStorageV3 {
+                program_instance: compiled.identity.instance,
+                artifact_identity: compiled.identity.artifact,
+                root_prefill_receipt,
+                rows,
+                rows_u8,
+                pair_rows_v11,
+                pair_rows_v13,
+                quad_rows_v14,
+                class_map: storage_class_map,
+                descriptor: FrozenDynamicRowsV3 {
+                    ready_seal: 0,
+                    rows_address,
+                    cache_identity: 1,
+                    state_count: 2,
+                    class_count: descriptor_class_count,
+                    row_shift,
+                    initial_state: 0,
+                    learned_loop_state_count: 0,
+                    learned_loop_states: [u32::MAX; 4],
+                    format_version,
+                },
+                unary_exists_first_accept_step: None,
+                loop_index: Box::default(),
+                loop_scanners: Box::default(),
+                descriptor_v6: None,
+            }
+        };
+        let storages = vec![
+            (
+                "V3",
+                make_storage(
+                    FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION,
+                    2,
+                    2,
+                    build_u16_rows(2, true),
+                    None,
+                    None,
+                    None,
+                    None,
+                    class_map,
+                ),
+            ),
+            (
+                "V4",
+                make_storage(
+                    FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION,
+                    0,
+                    2,
+                    build_u16_rows(2, false),
+                    None,
+                    None,
+                    None,
+                    None,
+                    class_map,
+                ),
+            ),
+            (
+                "V8",
+                make_storage(
+                    FROZEN_DYNAMIC_ROWS_V8_FORMAT_VERSION,
+                    9,
+                    256,
+                    build_u16_rows(256, true),
+                    None,
+                    None,
+                    None,
+                    None,
+                    identity_map,
+                ),
+            ),
+            (
+                "V9",
+                make_storage(
+                    FROZEN_DYNAMIC_ROWS_V9_FORMAT_VERSION,
+                    0,
+                    256,
+                    build_u16_rows(256, false),
+                    None,
+                    None,
+                    None,
+                    None,
+                    identity_map,
+                ),
+            ),
+            (
+                "V10",
+                make_storage(
+                    FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION,
+                    8,
+                    256,
+                    Box::default(),
+                    Some(build_u8_rows(256)),
+                    None,
+                    None,
+                    None,
+                    identity_map,
+                ),
+            ),
+            (
+                "V11",
+                make_storage(
+                    FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION,
+                    1,
+                    2,
+                    Box::default(),
+                    None,
+                    Some(pair_rows_v11),
+                    None,
+                    None,
+                    class_map,
+                ),
+            ),
+            (
+                "V12",
+                make_storage(
+                    FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION,
+                    1,
+                    2,
+                    Box::default(),
+                    Some(build_u8_rows(2)),
+                    None,
+                    None,
+                    None,
+                    class_map,
+                ),
+            ),
+            (
+                "V13",
+                make_storage(
+                    FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION,
+                    0,
+                    2,
+                    Box::default(),
+                    None,
+                    None,
+                    Some(pair_rows_v13),
+                    None,
+                    class_map,
+                ),
+            ),
+            (
+                "V14",
+                make_storage(
+                    FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION,
+                    0,
+                    2,
+                    Box::default(),
+                    None,
+                    None,
+                    None,
+                    Some(quad_rows_v14),
+                    class_map,
+                ),
+            ),
+        ];
+
+        const BASE: usize = 3;
+        for state in 0..2 {
+            for length in 1_u32..=9 {
+                for input_bits in 0_usize..1_usize.checked_shl(length).unwrap() {
+                    let input = (0..length)
+                        .map(|index| u8::from(input_bits & (1 << index) != 0))
+                        .collect::<Vec<_>>();
+                    let mut haystack = vec![0xfe; BASE];
+                    haystack.extend_from_slice(&input);
+                    for pending in [None, Some(BASE - 1)] {
+                        let expected =
+                            scalar_selected_end(&cells, state, &input, BASE, pending);
+                        for (label, storage) in &storages {
+                            let actual = storage
+                                .static_prefix_forward_from_canonical_state(
+                                    &haystack,
+                                    BASE,
+                                    haystack.len(),
+                                    state,
+                                    pending,
+                                    OutputContract::SelectedEnd,
+                                )
+                                .unwrap_or_else(|| panic!("{label} declined a valid resume"));
+                            assert_eq!(
+                                actual.selected_end, expected,
+                                "{label} state={state} input={input:?} pending={pending:?}"
+                            );
+                            let exists = storage
+                                .static_prefix_forward_from_canonical_state(
+                                    &haystack,
+                                    BASE,
+                                    haystack.len(),
+                                    state,
+                                    pending,
+                                    OutputContract::Exists,
+                                )
+                                .unwrap();
+                            assert_eq!(
+                                exists.selected_end.is_some(),
+                                expected.is_some(),
+                                "{label} Exists state={state} input={input:?} pending={pending:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn static_prefix_resume_peek_is_nondestructive_but_consume_retires_mismatch() {
+        let compiled = program(
+            "ab",
+            OutputContract::SelectedEnd,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        let frontier = [0_u32];
+        let resume = K0ResumeSet::new(
+            &compiled.automaton,
+            1,
+            1,
+            [(&frontier[..], false)],
+        )
+        .unwrap();
+        let mut state = StaticPrefixResumeWorkspace {
+            descriptor_binding: 1,
+            resume,
+            fully_prefilled: None,
+            ticket: None,
+        };
+        let admitted = [b'a', b'b'];
+        let foreign = [b'a', b'b', b'c'];
+        state.admit(&admitted, SearchWindow::full(&admitted));
+        assert!(state.peek(&foreign).is_err());
+        assert_eq!(state.peek(&admitted).unwrap(), SearchWindow::full(&admitted));
+        assert!(state.consume(&foreign).is_err());
+        assert!(state.peek(&admitted).is_err());
+        assert!(state.consume(&admitted).is_err());
+    }
+
+    #[test]
+    fn authenticated_static_resume_maps_every_frontier_into_frozen_v14() {
+        for output in [OutputContract::Exists, OutputContract::SelectedEnd] {
+            let compiled = program(
+                r"(?-u:(?:a|[^a][\x00-\xff]){4})",
+                output,
+                CompileMode::Fast,
+                DeterminizeLimits {
+                    max_states: 0,
+                    ..DeterminizeLimits::default()
+                },
+            );
+            let candidate = (1..=32)
+                .find_map(|max_states| {
+                    let candidate = compiled
+                        .native_slow_determinized_program(
+                            DeterminizeLimits {
+                                max_states,
+                                ..DeterminizeLimits::default()
+                            },
+                            usize::MAX,
+                        )
+                        .expect("bounded static-prefix candidate")?;
+                    let (complete, discovered) = candidate.retained_dimensions()?;
+                    (complete != 0 && complete < discovered).then_some(candidate)
+                })
+                .unwrap_or_else(|| panic!("no partial static prefix for {output:?}"));
+            let resume_view = candidate
+                .resume_view()
+                .expect("partial static prefix resume view");
+            const HEADER_WORDS: usize = STATIC_PREFIX_RESUME_DESCRIPTOR_V1_HEADER_BYTES / 4;
+            const STATE_WORDS: usize = STATIC_PREFIX_RESUME_DESCRIPTOR_V1_STATE_BYTES / 4;
+            let descriptor_words = HEADER_WORDS
+                + resume_view.state_count() * STATE_WORDS
+                + resume_view.item_count();
+            let mut descriptor = Vec::with_capacity(descriptor_words);
+            descriptor.push(u32::from_le_bytes(
+                STATIC_PREFIX_RESUME_DESCRIPTOR_V1_MAGIC[..4]
+                    .try_into()
+                    .unwrap(),
+            ));
+            descriptor.push(u32::from_le_bytes(
+                STATIC_PREFIX_RESUME_DESCRIPTOR_V1_MAGIC[4..]
+                    .try_into()
+                    .unwrap(),
+            ));
+            descriptor.extend_from_slice(&[
+                u32::try_from(descriptor_words).unwrap(),
+                u32::try_from(resume_view.state_count()).unwrap(),
+                u32::try_from(resume_view.item_count()).unwrap(),
+                0,
+                0,
+                0,
+            ]);
+            let mut item_offset = 0usize;
+            for (frontier, pending) in resume_view.frontiers() {
+                descriptor.extend_from_slice(&[
+                    u32::try_from(item_offset).unwrap(),
+                    u32::try_from(frontier.len()).unwrap(),
+                    u32::from(pending),
+                    0,
+                ]);
+                item_offset += frontier.len();
+            }
+            for (frontier, _) in resume_view.frontiers() {
+                descriptor.extend_from_slice(frontier);
+            }
+            assert_eq!(descriptor.len(), descriptor_words);
+            let descriptor_binding = descriptor.as_ptr().expose_provenance();
+
+            let mut workspace = compiled.prepare_workspace().unwrap();
+            let mut owner = compiled
+                .compiler_private_frozen_dynamic_rows_storage_v3(
+                    &mut workspace,
+                    usize::MAX,
+                    usize::MAX,
+                )
+                .expect("complete frozen V14 owner");
+            assert_eq!(
+                owner.descriptor.format_version,
+                FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION,
+                "{output:?}"
+            );
+            let old_root_receipt = owner.root_prefill_receipt.k0;
+            let initial_haystack = [0_u8, 0];
+            let newly_published = compiled
+                .bind_static_prefix_resume_with_workspace(
+                    &initial_haystack,
+                    SearchWindow::full(&initial_haystack),
+                    &mut workspace,
+                    Some(&owner),
+                    compiled.identity.artifact,
+                    descriptor_binding,
+                    &descriptor,
+                )
+                .expect("bind the serialized static-resume descriptor");
+            if output == OutputContract::Exists {
+                assert!(
+                    newly_published.is_some(),
+                    "the Exists fixture must require the root-plus-resume superset"
+                );
+                assert!(
+                    workspace
+                        .nfa
+                        .as_ref()
+                        .unwrap()
+                        .compiler_private_fully_prefilled_root_projection_without_resume(
+                            &compiled.automaton,
+                            old_root_receipt,
+                        )
+                        .is_none(),
+                    "publishing the superset must retire the old root receipt"
+                );
+                let pending = workspace
+                    .static_prefix_resume
+                    .as_deref()
+                    .unwrap()
+                    .resume
+                    .pending_mode(0)
+                    .unwrap();
+                assert!(
+                    compiled
+                        .try_search_from_static_prefix_resume_ticket_with_frozen_rows(
+                            &initial_haystack,
+                            &mut workspace,
+                            &owner,
+                            0,
+                            1,
+                            usize::from(pending),
+                        )
+                        .unwrap()
+                        .is_none(),
+                    "the compact owner copied from the retired generation must decline"
+                );
+            }
+            if let Some(receipt) = newly_published {
+                owner = compiled
+                    .compiler_private_frozen_dynamic_rows_storage_v3_with_fallback_receipt(
+                        &mut workspace,
+                        Some(receipt),
+                        usize::MAX,
+                        usize::MAX,
+                    )
+                    .expect("rebuild frozen owner from root-plus-resume cache");
+            }
+            assert_eq!(
+                owner.descriptor.format_version,
+                FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION,
+                "{output:?}"
+            );
+            let fully_prefilled = workspace
+                .static_prefix_resume
+                .as_deref()
+                .and_then(|state| state.fully_prefilled)
+                .expect("serialized resume descriptor must retain a complete receipt");
+            {
+                let nfa = workspace.nfa.as_ref().unwrap();
+                let state = workspace.static_prefix_resume.as_deref().unwrap();
+                let map = nfa
+                    .compiler_private_fully_prefilled_resume_map_projection(
+                        &compiled.automaton,
+                        &state.resume,
+                        fully_prefilled.k0,
+                    )
+                    .expect("project attached static resume map");
+                let root = nfa
+                    .compiler_private_fully_prefilled_root_projection_without_resume(
+                        &compiled.automaton,
+                        owner.root_prefill_receipt.k0,
+                    )
+                    .expect("project frozen root lineage");
+                assert_eq!(map.cache_identity(), root.cache_identity());
+                assert_eq!(map.compact_row_stride(), root.row_stride());
+                assert!(map.cached_state_ids().iter().all(|&state| {
+                    usize::try_from(state).unwrap()
+                        < usize::try_from(owner.descriptor.state_count).unwrap()
+                }));
+            }
+
+            for resume_state in 0..resume_view.state_count() {
+                let pending = workspace
+                    .static_prefix_resume
+                    .as_deref()
+                    .unwrap()
+                    .resume
+                    .pending_mode(resume_state)
+                    .unwrap();
+                for length in 1_u32..=7 {
+                    for input_bits in 0_usize..1_usize.checked_shl(length).unwrap() {
+                        let mut haystack = vec![0_u8];
+                        haystack.extend((0..length).map(|index| {
+                            u8::from(input_bits & (1_usize << index) != 0)
+                        }));
+                        let window = SearchWindow::full(&haystack);
+                        let pending_end_word = usize::from(pending);
+                        assert!(
+                            compiled
+                                .bind_static_prefix_resume_with_workspace(
+                                    &haystack,
+                                    window,
+                                    &mut workspace,
+                                    Some(&owner),
+                                    compiled.identity.artifact,
+                                    descriptor_binding,
+                                    &descriptor,
+                                )
+                                .unwrap()
+                                .is_none(),
+                            "a repeated binding must reuse its prepared owner"
+                        );
+                        let actual = compiled
+                            .try_search_from_static_prefix_resume_ticket_with_frozen_rows(
+                                &haystack,
+                                &mut workspace,
+                                &owner,
+                                resume_state,
+                                1,
+                                pending_end_word,
+                            )
+                            .unwrap()
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "V14 declined {output:?} state={resume_state} input={haystack:?}"
+                                )
+                            });
+                        assert!(
+                            compiled
+                                .bind_static_prefix_resume_with_workspace(
+                                    &haystack,
+                                    window,
+                                    &mut workspace,
+                                    Some(&owner),
+                                    compiled.identity.artifact,
+                                    descriptor_binding,
+                                    &descriptor,
+                                )
+                                .unwrap()
+                                .is_none()
+                        );
+                        let expected = compiled
+                            .search_from_static_prefix_resume_ticket_with_workspace(
+                                &haystack,
+                                &mut workspace,
+                                resume_state,
+                                1,
+                                pending_end_word,
+                            )
+                            .unwrap();
+                        assert_eq!(
+                            actual, expected,
+                            "{output:?} state={resume_state} input={haystack:?} pending={pending}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn frozen_dense_pair_supertransition_v13_is_bounded_and_fail_closed() {
         let compiled = program(
             "ab",
@@ -24550,6 +27059,51 @@ mod tests {
                 < FROZEN_COMPACT_DIRECT_BYTE_MIN_CLASSES,
             "narrow source alphabets omit V8/V9/V10 raw-byte code entirely"
         );
+    }
+
+    #[test]
+    fn dynamic_reverse_class_map_is_exact_at_all_classifier_mode_boundaries() {
+        for class_count in [1_usize, 2, 255, 256] {
+            // Singleton ranges for bytes 0..class_count-2 introduce exactly
+            // the increasing boundaries 1..class_count-1. The final class
+            // covers the remainder of the byte alphabet.
+            let edge_count = class_count - 1;
+            let singleton_bytes = (0..edge_count)
+                .map(|byte| u8::try_from(byte).unwrap())
+                .collect::<Vec<_>>();
+            let raw = RawPlan {
+                start: 0,
+                roles: vec![StateRole::Consume, StateRole::Accept],
+                edge_offsets: vec![
+                    0,
+                    u32::try_from(edge_count).unwrap(),
+                    u32::try_from(edge_count).unwrap(),
+                ],
+                edge_targets: vec![1; edge_count],
+                edge_kinds: vec![EdgeKind::ByteRange; edge_count],
+                byte_starts: singleton_bytes.clone(),
+                byte_ends: singleton_bytes,
+            };
+            let boundaries = dfa_boundary_starts(&raw);
+            assert_eq!(
+                boundaries.iter().filter(|&&is_start| is_start).count(),
+                class_count
+            );
+            let map = dfa_boundary_class_map(&raw);
+            for (byte, &class) in map.iter().enumerate() {
+                let expected = byte.min(class_count - 1);
+                assert_eq!(
+                    usize::from(class),
+                    expected,
+                    "classes={class_count}, byte={byte}"
+                );
+                assert_eq!(
+                    boundaries[byte],
+                    byte == 0 || usize::from(class) != usize::from(map[byte - 1]),
+                    "classes={class_count}, byte={byte}"
+                );
+            }
+        }
     }
 
     #[test]
