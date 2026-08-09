@@ -12396,6 +12396,7 @@ fn try_warm_direct_span_with_reverse_and_retained_start_mask(
     let initial_row = lazy.row_offset(lazy.initial)?;
     let mut state = initial_row;
     let mut position = window.start();
+    let mut candidate_floor = window.start();
     let mut pending_end = initial_pending.then_some(window.start());
     let mut active_start = Some(window.start());
     let mut pending_start = initial_pending.then_some(window.start());
@@ -12434,6 +12435,7 @@ fn try_warm_direct_span_with_reverse_and_retained_start_mask(
                 if position == window.end() {
                     return complete_warm_direct_span(None, &meter, direct_steps);
                 }
+                candidate_floor = position;
                 active_start = matches!(
                     lazy.initial_kind,
                     LazyInitialKind::Positive | LazyInitialKind::PositiveSingle
@@ -12533,7 +12535,7 @@ fn try_warm_direct_span_with_reverse_and_retained_start_mask(
     let mut state = reverse.row_offset(reverse.initial)?;
     let mut cursor = selected_end;
     let mut candidate = None;
-    while cursor > window.start() {
+    while cursor > candidate_floor {
         let source = cursor
             .checked_sub(1)
             .ok_or(SearchError::InternalInvariant {
@@ -29659,6 +29661,36 @@ mod tests {
                 ],
                 byte_starts: vec![b'a', 0, 0, u8::MIN, b'z'],
                 byte_ends: vec![b'a', 0, 0, u8::MAX, b'z'],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn any_then_a_greedy_any_star_z() -> Automaton {
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Accept,
+                ],
+                edge_offsets: vec![0, 1, 2, 4, 5, 6, 6],
+                edge_targets: vec![1, 2, 3, 4, 2, 5],
+                edge_kinds: vec![
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                ],
+                byte_starts: vec![u8::MIN, b'a', 0, 0, u8::MIN, b'z'],
+                byte_ends: vec![u8::MAX, b'a', 0, 0, u8::MAX, b'z'],
             },
             CompileLimits::default(),
         )
@@ -53283,6 +53315,88 @@ mod tests {
         assert_eq!(session.workspace.reverse.state_len, reverse_state_len);
         assert_eq!(session.workspace.reverse.item_len, reverse_item_len);
         assert_eq!(session.workspace.reverse.rows, reverse_rows);
+    }
+
+    #[test]
+    fn warmed_value_span_reverse_stops_at_the_scanner_candidate_floor() {
+        fn exercise(plan: &Automaton, scanner_offset: usize) {
+            let candidate = 40;
+            let mut haystack = vec![b'z'; candidate];
+            haystack.extend(std::iter::repeat_n(b'r', scanner_offset));
+            haystack.extend_from_slice(b"abbbz");
+            assert!(haystack.len() < super::LAZY_LOOP_SKIP_MIN_BYTES);
+            let window = SearchWindow::full(&haystack);
+            let expected_span = MatchSpan::new(candidate, haystack.len());
+            let expected = Some(expected_span);
+            let mut session =
+                K0SearchSession::new_selected(plan, WorkspaceLimits::unlimited(), true, true)
+                    .unwrap();
+            assert_eq!(
+                session
+                    .search_window::<Span>(&haystack, window, SearchLimits::unlimited())
+                    .unwrap()
+                    .into_output(),
+                expected
+            );
+            assert!(session.workspace.lazy.loop_skip_plans.is_empty());
+            let proof = plan.start_filter_proof.get().unwrap();
+            let scanner = proof.scanner.as_ref().unwrap();
+            assert_eq!(usize::from(scanner.offset), scanner_offset);
+            assert!(matches!(scanner.scanner, StartScanner::One(b'a')));
+
+            let mut reverse_state = session
+                .workspace
+                .reverse
+                .row_offset(session.workspace.reverse.initial)
+                .unwrap();
+            let mut reverse_cursor = expected_span.end();
+            let mut reverse_path = Vec::new();
+            while reverse_cursor > candidate {
+                let source = reverse_cursor - 1;
+                let cell_index = usize::try_from(reverse_state)
+                    .unwrap()
+                    .checked_add(usize::from(byte_class(plan, haystack[source])))
+                    .unwrap();
+                reverse_path.push(cell_index);
+                let cell = session.workspace.reverse.rows[cell_index];
+                assert_ne!(cell, super::LAZY_CELL_UNFILLED);
+                reverse_cursor = source;
+                if source == candidate {
+                    assert_ne!(cell & super::LAZY_CELL_ACCEPT, 0);
+                }
+                let encoded = cell & super::LAZY_CELL_STATE_MASK;
+                assert_ne!(encoded, 0);
+                reverse_state = encoded - 1;
+            }
+            let pre_floor_cell = usize::try_from(reverse_state)
+                .unwrap()
+                .checked_add(usize::from(byte_class(plan, b'z')))
+                .unwrap();
+            assert!(!reverse_path.contains(&pre_floor_cell));
+            session.workspace.reverse.rows[pre_floor_cell] = super::LAZY_CELL_UNFILLED;
+            let lazy_rows = session.workspace.lazy.rows.clone();
+            let reverse_rows = session.workspace.reverse.rows.clone();
+            let generation = session.workspace.generation;
+            assert_eq!(
+                super::try_warm_direct_span_with_reverse(
+                    plan,
+                    &haystack,
+                    window,
+                    &session.workspace.lazy,
+                    &session.workspace.reverse,
+                    proof,
+                ),
+                Ok(super::WarmDirectSpan::Complete(Some(
+                    super::WarmDirectMatch::ReverseRecovered(expected_span)
+                )))
+            );
+            assert_eq!(session.workspace.lazy.rows, lazy_rows);
+            assert_eq!(session.workspace.reverse.rows, reverse_rows);
+            assert_eq!(session.workspace.generation, generation);
+        }
+
+        exercise(&a_greedy_any_star_z(), 0);
+        exercise(&any_then_a_greedy_any_star_z(), 1);
     }
 
     #[test]
