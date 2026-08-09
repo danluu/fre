@@ -6190,6 +6190,8 @@ struct DynamicNativeRowsWorkspace {
     native_rows_dirty: bool,
     #[cfg(test)]
     native_rows_refreshes: usize,
+    #[cfg(test)]
+    preflight_admission_settlements: usize,
 }
 
 const NATIVE_ROWS_INITIAL_PENDING: u32 = 1;
@@ -6210,6 +6212,15 @@ const fn native_rows_initial_flags(pending: bool, terminal: bool) -> u32 {
 }
 
 impl DynamicNativeRowsWorkspace {
+    fn settle_preflight_admission(&mut self) {
+        #[cfg(test)]
+        {
+            self.preflight_admission_settlements =
+                self.preflight_admission_settlements.saturating_add(1);
+        }
+        self.state.settle_unobserved_local_entry();
+    }
+
     fn refresh_native_rows(&mut self, automaton: &Automaton, workspace: &K0Workspace) -> bool {
         debug_assert!(self.native_rows_dirty);
         #[cfg(test)]
@@ -6396,6 +6407,7 @@ impl DynamicNativeRowsState {
         )
     }
 
+    #[cfg(test)]
     fn claim_with_provenance(
         &mut self,
         window: SearchWindow,
@@ -6403,6 +6415,26 @@ impl DynamicNativeRowsState {
         after_mandatory_cut: bool,
     ) -> bool {
         self.settle_unobserved_local_entry();
+        self.claim_pre_settled_with_provenance(
+            window,
+            original_input_bytes,
+            after_mandatory_cut,
+        )
+    }
+
+    /// Claim after this exact state has already settled any prior generated
+    /// local return. The caller must not mutate the admission fields between
+    /// settlement and this call.
+    fn claim_pre_settled_with_provenance(
+        &mut self,
+        window: SearchWindow,
+        original_input_bytes: usize,
+        after_mandatory_cut: bool,
+    ) -> bool {
+        debug_assert!(
+            self.native_entry_window.is_none(),
+            "a pre-settled claim cannot replace a live admission"
+        );
         if self.bypass_remaining != 0 {
             self.bypass_remaining = self.bypass_remaining.saturating_sub(1);
             return false;
@@ -8363,6 +8395,8 @@ impl CompiledProgram {
                     native_rows_dirty: true,
                     #[cfg(test)]
                     native_rows_refreshes: 0,
+                    #[cfg(test)]
+                    preflight_admission_settlements: 0,
                 })
             });
         Ok(ProgramWorkspace {
@@ -11057,24 +11091,7 @@ impl CompiledProgram {
 
         let input_bytes = window.end.saturating_sub(window.start);
         let has_mandatory_cut = self.nfa_mandatory_cut.is_some();
-        workspace
-            .dynamic_native_rows
-            .as_deref_mut()
-            .ok_or(CompileError::InternalInvariant(
-                "dynamic native-row preflight has no prepared descriptor workspace",
-            ))?
-            .state
-            .settle_unobserved_local_entry();
-        let window = if has_mandatory_cut {
-            match self.search_nfa_with_mandatory_cut(haystack, window) {
-                NfaMandatoryCutOutcome::Complete(found) => {
-                    return Ok((RetainedPartialPreflight::Complete(found), 0, 0));
-                }
-                NfaMandatoryCutOutcome::Continue(narrowed) => narrowed,
-            }
-        } else {
-            window
-        };
+        let mut window = window;
         let mut initial_pending = false;
         let mut enter = None;
         {
@@ -11088,6 +11105,18 @@ impl CompiledProgram {
                     "dynamic native-row preflight has no prepared descriptor workspace",
                 ),
             )?;
+            // This is the only admission settlement on every preflight. The
+            // mandatory-cut analysis below receives no workspace and cannot
+            // mutate this state; descriptor refresh also leaves it untouched.
+            dynamic.settle_preflight_admission();
+            if has_mandatory_cut {
+                match self.search_nfa_with_mandatory_cut(haystack, window) {
+                    NfaMandatoryCutOutcome::Complete(found) => {
+                        return Ok((RetainedPartialPreflight::Complete(found), 0, 0));
+                    }
+                    NfaMandatoryCutOutcome::Continue(narrowed) => window = narrowed,
+                }
+            }
             if window.start < window.end && input_bytes >= DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES {
                 let nfa = nfa.as_ref().ok_or(CompileError::InternalInvariant(
                     "dynamic native-row preflight has no prepared K0 workspace",
@@ -11098,7 +11127,7 @@ impl CompiledProgram {
                     initial_pending =
                         dynamic.native_rows.initial_flags & NATIVE_ROWS_INITIAL_PENDING != 0;
                     if !initial_pending
-                        && dynamic.state.claim_with_provenance(
+                        && dynamic.state.claim_pre_settled_with_provenance(
                             window,
                             input_bytes,
                             has_mandatory_cut,
@@ -15296,6 +15325,11 @@ mod tests {
         );
         assert_eq!((cold_address, cold_cache_identity), (0, 0));
         assert_dynamic_rows_lifecycle(&workspace, true, 1, None);
+        assert_eq!(
+            dynamic_rows(&workspace).preflight_admission_settlements,
+            1,
+            "a completing cold preflight settles exactly once"
+        );
 
         let (first_address, first_cache_identity, first_projection) = enter_dynamic_rows(
             &compiled,
@@ -15306,6 +15340,11 @@ mod tests {
             "warm dynamic preflight",
         );
         assert_dynamic_rows_lifecycle(&workspace, false, 2, Some(window));
+        assert_eq!(
+            dynamic_rows(&workspace).preflight_admission_settlements,
+            2,
+            "a first admitted preflight settles exactly once"
+        );
         assert_eq!(first_projection.cache_identity, first_cache_identity);
         assert_eq!(first_projection.initial_flags, 0);
 
@@ -15323,6 +15362,11 @@ mod tests {
         assert_eq!(second_cache_identity, first_cache_identity);
         assert_eq!(second_projection, first_projection);
         assert_dynamic_rows_lifecycle(&workspace, false, 2, Some(window));
+        assert_eq!(
+            dynamic_rows(&workspace).preflight_admission_settlements,
+            3,
+            "local completion and readmission use one settlement"
+        );
 
         // A whole-search side exit invalidates before canonical K0 runs. The
         // two dirty stores coalesce, and the next admission refreshes exactly
@@ -16784,6 +16828,189 @@ mod tests {
         assert!(state.claim(window));
         state.settle_unobserved_local_entry();
         assert_eq!(state, DynamicNativeRowsState::default());
+    }
+
+    #[test]
+    fn dynamic_native_rows_preflight_settles_once_for_complete_enter_and_short_paths() {
+        const MATCH_BYTES: usize = 15;
+        let pattern = r"(?:ba|cd)[a-b]{1,10}7[A-Za-z]{1,2}";
+        let compiled = program(
+            pattern,
+            OutputContract::Exists,
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+        );
+        assert!(compiled.has_nfa_mandatory_cut());
+        let identity = compiled.artifact_identity();
+        let mut workspace = compiled.prepare_workspace().expect("prepared K0 workspace");
+
+        let candidate = DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES + 16;
+        let mut matching = vec![b'!'; candidate + MATCH_BYTES];
+        matching[candidate..candidate + 2].copy_from_slice(b"ba");
+        matching[candidate + 2..candidate + 12].fill(b'b');
+        matching[candidate + 12..candidate + MATCH_BYTES].copy_from_slice(b"7AZ");
+        let matching_window = SearchWindow::new(3, matching.len());
+        let missing = vec![b'!'; matching.len()];
+        let (complete, address, cache_identity) = compiled
+            .preflight_dynamic_native_rows_with_workspace(
+                &missing,
+                matching_window,
+                &mut workspace,
+                identity,
+            )
+            .expect("mandatory-cut completion");
+        assert_eq!(
+            complete,
+            RetainedPartialPreflight::Complete(MatchResult::Exists(false))
+        );
+        assert_eq!((address, cache_identity), (0, 0));
+        assert_eq!(dynamic_rows(&workspace).preflight_admission_settlements, 1);
+
+        let (cold, address, cache_identity) = compiled
+            .preflight_dynamic_native_rows_with_workspace(
+                &matching,
+                matching_window,
+                &mut workspace,
+                identity,
+            )
+            .expect("cold canonical completion");
+        assert_eq!(
+            cold,
+            RetainedPartialPreflight::Complete(MatchResult::Exists(true))
+        );
+        assert_eq!((address, cache_identity), (0, 0));
+        assert_eq!(dynamic_rows(&workspace).preflight_admission_settlements, 2);
+
+        let (entered, address, cache_identity) = compiled
+            .preflight_dynamic_native_rows_with_workspace(
+                &matching,
+                matching_window,
+                &mut workspace,
+                identity,
+            )
+            .expect("warm admission");
+        let NfaMandatoryCutOutcome::Continue(narrowed) =
+            compiled.search_nfa_with_mandatory_cut(&matching, matching_window)
+        else {
+            panic!("fixture mandatory cut did not retain a narrowed window");
+        };
+        assert_eq!(entered, RetainedPartialPreflight::Enter(narrowed));
+        assert_ne!((address, cache_identity), (0, 0));
+        assert_eq!(dynamic_rows(&workspace).preflight_admission_settlements, 3);
+
+        let short = b"bab7A";
+        let (completed_short, address, cache_identity) = compiled
+            .preflight_dynamic_native_rows_with_workspace(
+                short,
+                SearchWindow::full(short),
+                &mut workspace,
+                identity,
+            )
+            .expect("short canonical completion");
+        assert_eq!(
+            completed_short,
+            RetainedPartialPreflight::Complete(MatchResult::Exists(true))
+        );
+        assert_eq!((address, cache_identity), (0, 0));
+        let dynamic = dynamic_rows(&workspace);
+        assert_eq!(dynamic.preflight_admission_settlements, 4);
+        assert!(dynamic.state.native_entry_window.is_none());
+    }
+
+    #[test]
+    fn dynamic_native_rows_pre_settled_claim_preserves_exact_admission() {
+        let mut state = DynamicNativeRowsState::default();
+        let prior = SearchWindow::new(7, 71);
+        assert!(state.claim_with_provenance(prior, 96, true));
+        state.consecutive_deopts = 3;
+        state.bypass_remaining = 23;
+
+        state.settle_unobserved_local_entry();
+        assert_eq!(state, DynamicNativeRowsState::default());
+
+        let current = SearchWindow::new(11, 83);
+        assert!(state.claim_pre_settled_with_provenance(current, 128, false));
+        assert_eq!(
+            state.take_native_entry_admission(),
+            Some(DynamicNativeRowsAdmission {
+                window: current,
+                original_input_bytes: 128,
+                after_mandatory_cut: false,
+            })
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "a pre-settled claim cannot replace a live admission")]
+    fn dynamic_native_rows_pre_settled_claim_rejects_overlapping_admission() {
+        let mut state = DynamicNativeRowsState::default();
+        let window = SearchWindow::new(7, 71);
+        assert!(state.claim(window));
+        let _ = state.claim_pre_settled_with_provenance(window, 64, false);
+    }
+
+    #[test]
+    fn dynamic_native_rows_single_settlement_is_workspace_local_under_concurrency() {
+        let compiled = program(
+            "(?:ab|ac)+z",
+            OutputContract::Exists,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        let mut haystack = vec![b'a'; 64];
+        for pair in haystack[..62].chunks_exact_mut(2) {
+            pair.copy_from_slice(b"ab");
+        }
+        haystack[62] = b'z';
+        haystack[63] = b'!';
+        let window = SearchWindow::full(&haystack);
+        let identity = compiled.artifact_identity();
+
+        std::thread::scope(|scope| {
+            let mut workers = Vec::new();
+            for _ in 0..4 {
+                let compiled = &compiled;
+                let haystack = &haystack;
+                workers.push(scope.spawn(move || {
+                    let mut workspace = compiled
+                        .prepare_workspace()
+                        .expect("independent prepared K0 workspace");
+                    let (cold, _, _) = compiled
+                        .preflight_dynamic_native_rows_with_workspace(
+                            haystack,
+                            window,
+                            &mut workspace,
+                            identity,
+                        )
+                        .expect("concurrent cold preflight");
+                    assert_eq!(
+                        cold,
+                        RetainedPartialPreflight::Complete(MatchResult::Exists(true))
+                    );
+                    for context in ["concurrent admission", "concurrent local readmission"] {
+                        let (entered, address, cache_identity) = compiled
+                            .preflight_dynamic_native_rows_with_workspace(
+                                haystack,
+                                window,
+                                &mut workspace,
+                                identity,
+                            )
+                            .unwrap_or_else(|error| panic!("{context}: {error}"));
+                        assert_eq!(entered, RetainedPartialPreflight::Enter(window));
+                        assert_ne!((address, cache_identity), (0, 0));
+                    }
+                    let dynamic = dynamic_rows(&workspace);
+                    assert_eq!(dynamic.preflight_admission_settlements, 3);
+                    assert_eq!(dynamic.state.native_entry_window, Some(window));
+                }));
+            }
+            for worker in workers {
+                worker.join().expect("independent dynamic-row worker");
+            }
+        });
     }
 
     fn authentic_partial_resume(
