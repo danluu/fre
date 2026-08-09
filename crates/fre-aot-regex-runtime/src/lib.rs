@@ -758,7 +758,7 @@ impl PreparedAotRegex {
         expected_artifact_identity: [u8; ARTIFACT_IDENTITY_BYTES],
         descriptor_binding: usize,
         descriptor: &[u32],
-    ) -> Result<(), CompileError> {
+    ) -> Result<RetainedPartialPreflight, CompileError> {
         self.deactivate_frozen_header();
         self.program.preflight_static_prefix_resume_with_workspace(
             haystack,
@@ -1809,7 +1809,7 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_compiler_private_search_exclusive
             .cast::<[u8; ARTIFACT_IDENTITY_BYTES]>()
             .read();
         let prepared = &mut *handle.0.cast::<PreparedAotRegex>();
-        let Ok(()) = prepared.preflight_static_prefix_resume(
+        let Ok(preflight) = prepared.preflight_static_prefix_resume(
             haystack,
             SearchWindow::new(window_start, window_end),
             expected_artifact_identity,
@@ -1818,7 +1818,17 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_compiler_private_search_exclusive
         ) else {
             return STATUS_RUNTIME_FAILURE;
         };
-        STATUS_PARTIAL_PREFLIGHT_ENTER
+        match preflight {
+            RetainedPartialPreflight::Complete(found) => {
+                let (status, result) = encode_match_result(found);
+                result_ptr.write(result);
+                status
+            }
+            RetainedPartialPreflight::Enter(admitted) => {
+                debug_assert_eq!(admitted, SearchWindow::new(window_start, window_end));
+                STATUS_PARTIAL_PREFLIGHT_ENTER
+            }
+        }
     }))
     .unwrap_or(STATUS_RUNTIME_FAILURE)
 }

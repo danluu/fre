@@ -11178,7 +11178,7 @@ impl CompiledProgram {
         expected_artifact_identity: [u8; 32],
         descriptor_binding: usize,
         descriptor: &[u32],
-    ) -> Result<(), CompileError> {
+    ) -> Result<RetainedPartialPreflight, CompileError> {
         if window.start > window.end || window.end > haystack.len() {
             return Err(CompileError::InvalidWindow {
                 start: window.start,
@@ -11225,6 +11225,34 @@ impl CompiledProgram {
                 ticket: None,
             }));
         }
+
+        workspace.mark_dynamic_native_rows_dirty();
+        let completed = {
+            let nfa = workspace.nfa.as_mut().ok_or(
+                CompileError::InternalInvariant(
+                    "static-prefix resume preflight has no prepared K0 workspace",
+                ),
+            )?;
+            if let Some(found) =
+                self.search_nfa_with_mandatory_suffix(haystack, window, nfa)?
+            {
+                Some(found)
+            } else {
+                match self.search_nfa_with_mandatory_cut(haystack, window) {
+                    NfaMandatoryCutOutcome::Complete(found) => Some(found),
+                    // The retained frontier was constructed for the original
+                    // window. A cut may prove a narrower root start, but only
+                    // a complete proof can bypass that exact continuation.
+                    NfaMandatoryCutOutcome::Continue(_) => None,
+                }
+            }
+        };
+        if let Some(found) = completed {
+            if let Some(state) = workspace.static_prefix_resume.as_deref_mut() {
+                state.ticket = None;
+            }
+            return Ok(RetainedPartialPreflight::Complete(found));
+        }
         workspace
             .static_prefix_resume
             .as_deref_mut()
@@ -11232,7 +11260,7 @@ impl CompiledProgram {
                 "static-prefix resume preflight did not retain its sidecar",
             ))?
             .admit(haystack, window);
-        Ok(())
+        Ok(RetainedPartialPreflight::Enter(window))
     }
 
     /// Continue from the exact frontier and first unconsumed byte returned by
