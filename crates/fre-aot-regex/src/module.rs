@@ -36239,8 +36239,8 @@ mod tests {
                 );
                 let trusted_descriptor = words
                     .iter()
-                    .position(|&word| word == aarch64_load_x_imm(13, 31, 64).unwrap())
-                    .expect("AArch64 root must load its trusted V2 descriptor");
+                    .position(|&word| word == aarch64_mov_x(13, 1).unwrap())
+                    .expect("AArch64 root must retain V6's trusted descriptor from X1");
                 assert_eq!(
                     words[trusted_descriptor + 1],
                     aarch64_load_pair_x(
@@ -37144,9 +37144,9 @@ mod tests {
             );
             let descriptor = x86
                 .code
-                .windows(5)
-                .position(|bytes| bytes == [0x4c, 0x8b, 0x5c, 0x24, 0x50])
-                .expect("x86 dynamic descriptor load");
+                .windows(3)
+                .position(|bytes| bytes == [0x49, 0x89, 0xd3])
+                .expect("x86 V6 dynamic descriptor transfer from RDX");
             assert!(descriptor < x86.code.len(), "x86 {output:?}");
             assert_eq!(
                 x86.relocations
@@ -37172,14 +37172,20 @@ mod tests {
                 &[0x4c, 0x8b, 0x54, 0x24, 0x10],
                 "x86 {output:?} authenticates the frozen seal before continuation"
             );
+            let cache_identity_offset = u8::try_from(NATIVE_ROWS_CACHE_IDENTITY).unwrap();
+            let direct_identity_load = if output == OutputContract::Exists {
+                [0x4d, 0x8b, 0x5b, cache_identity_offset]
+            } else {
+                [0x4c, 0x8b, 0x58, cache_identity_offset]
+            };
             let cache_capture = continuation
                 .checked_add(
                     x86.code[continuation..]
-                        .windows(5)
-                        .position(|bytes| bytes == [0x4c, 0x8b, 0x5c, 0x24, 0x50])
-                        .expect("x86 descriptor reload after frozen-seal guard"),
+                        .windows(direct_identity_load.len())
+                        .position(|bytes| bytes == direct_identity_load)
+                        .expect("x86 direct trusted-descriptor identity load"),
                 )
-                .expect("x86 descriptor reload offset");
+                .expect("x86 identity load offset");
             assert!(continuation < cache_capture);
             let window_capture = [
                 0x48, 0x8b, 0x4c, 0x24, 0x40, // exact start -> rcx
@@ -37192,14 +37198,9 @@ mod tests {
                 "x86 {output:?} must capture the admitted window only on continuation"
             );
             assert_eq!(
-                &x86.code[cache_capture + 5..cache_capture + 9],
-                &[
-                    0x4d,
-                    0x8b,
-                    0x5b,
-                    u8::try_from(NATIVE_ROWS_CACHE_IDENTITY).unwrap(),
-                ],
-                "x86 {output:?} loads identity from the trusted descriptor only on the cold continuation"
+                &x86.code[cache_capture..cache_capture + direct_identity_load.len()],
+                &direct_identity_load,
+                "x86 {output:?} loads identity directly from V6's trusted descriptor only on the cold continuation"
             );
             assert!(
                 !x86.code[continuation..cache_capture]
@@ -37261,8 +37262,8 @@ mod tests {
             );
             let descriptor = words
                 .iter()
-                .position(|&word| word == aarch64_load_x_imm(13, 31, 64).unwrap())
-                .expect("AArch64 trusted dynamic descriptor load");
+                .position(|&word| word == aarch64_mov_x(13, 1).unwrap())
+                .expect("AArch64 V6 trusted dynamic descriptor transfer from X1");
             assert!(descriptor < words.len(), "AArch64 {output:?}");
             let pointer_table = [
                 aarch64_load_byte_reg(8, 0, 2).unwrap(),
@@ -37313,10 +37314,18 @@ mod tests {
                 .checked_add(
                     words[continuation..]
                         .iter()
-                        .position(|&word| word == aarch64_load_x_imm(9, 31, 64).unwrap())
-                        .expect("AArch64 descriptor reload after frozen-seal guard"),
+                        .position(|&word| {
+                            word
+                                == aarch64_load_x_imm(
+                                    9,
+                                    13,
+                                    u16::try_from(NATIVE_ROWS_CACHE_IDENTITY).unwrap(),
+                                )
+                                .unwrap()
+                        })
+                        .expect("AArch64 direct trusted-descriptor identity load"),
                 )
-                .expect("AArch64 descriptor reload offset");
+                .expect("AArch64 identity load offset");
             assert!(continuation < cache_capture);
             assert!(
                 words[continuation..cache_capture]
@@ -37324,14 +37333,14 @@ mod tests {
                 "AArch64 {output:?} must capture the admitted window only on continuation"
             );
             assert_eq!(
-                words[cache_capture + 1],
+                words[cache_capture],
                 aarch64_load_x_imm(
                     9,
-                    9,
+                    13,
                     u16::try_from(NATIVE_ROWS_CACHE_IDENTITY).unwrap(),
                 )
                 .unwrap(),
-                "AArch64 {output:?} loads identity from the trusted descriptor only on the cold continuation"
+                "AArch64 {output:?} loads identity directly from V6's trusted descriptor only on the cold continuation"
             );
             assert!(
                 !words[continuation..cache_capture]
