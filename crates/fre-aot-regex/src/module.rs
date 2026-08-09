@@ -13228,6 +13228,38 @@ enum FrozenCompactNativeFormat {
     DenseQuadSupertransitionV14,
 }
 
+fn x86_emit_movq_xmm_from_gpr(
+    assembler: &mut X86Assembler,
+    xmm: u8,
+    gpr: u8,
+) -> Result<(), ObjectError> {
+    if xmm >= 16 || gpr >= 16 {
+        return Err(ObjectError::InvalidModule(
+            "x86 MOVQ register is outside the baseline register bank",
+        ));
+    }
+    let rex = 0x48 | ((xmm >> 3) << 2) | (gpr >> 3);
+    let modrm = 0xc0 | ((xmm & 7) << 3) | (gpr & 7);
+    assembler.instruction(&[0x66, rex, 0x0f, 0x6e, modrm])?;
+    Ok(())
+}
+
+fn x86_emit_movq_gpr_from_xmm(
+    assembler: &mut X86Assembler,
+    gpr: u8,
+    xmm: u8,
+) -> Result<(), ObjectError> {
+    if xmm >= 16 || gpr >= 16 {
+        return Err(ObjectError::InvalidModule(
+            "x86 MOVQ register is outside the baseline register bank",
+        ));
+    }
+    let rex = 0x48 | ((xmm >> 3) << 2) | (gpr >> 3);
+    let modrm = 0xc0 | ((xmm & 7) << 3) | (gpr & 7);
+    assembler.instruction(&[0x66, rex, 0x0f, 0x7e, modrm])?;
+    Ok(())
+}
+
 impl FrozenCompactNativeFormat {
     const fn flag(self) -> u32 {
         match self {
@@ -14850,6 +14882,20 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     const ROOT_SCANNER_COMPACT_V8_DIRECT_BYTE: u8 = 6;
     const ROOT_SCANNER_COMPACT_V10_DIRECT_U8: u8 = 8;
     const ROOT_SCANNER_COMPACT_V12_MAPPED_U8: u8 = 9;
+    const GPR_RAX: u8 = 0;
+    const GPR_RCX: u8 = 1;
+    const GPR_RDX: u8 = 2;
+    const GPR_RSI: u8 = 6;
+    const GPR_RDI: u8 = 7;
+    const GPR_R8: u8 = 8;
+    const GPR_R9: u8 = 9;
+    const XMM_STACKLESS_HANDLE: u8 = 4;
+    const XMM_STACKLESS_HAYSTACK: u8 = 5;
+    const XMM_STACKLESS_LENGTH: u8 = 6;
+    const XMM_STACKLESS_START: u8 = 7;
+    const XMM_STACKLESS_END: u8 = 8;
+    const XMM_STACKLESS_RESULT: u8 = 9;
+    const XMM_STACKLESS_IDENTITY: u8 = 10;
     const _: () = assert!(
         ((1_u16 << ROOT_SCANNER_OFFSET_ROWS)
             | (1_u16 << ROOT_SCANNER_COMPACT_V3)
@@ -14875,6 +14921,14 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     } else {
         SCANNER_FREE_FRAME_BYTES
     };
+    // Immutable scanner-free Exists leaves make no calls and need no
+    // callee-saved registers. Keep their public ABI values in the unused
+    // baseline XMM bank so the common compact path never touches RSP. V6/V7,
+    // mutable V2, preflight, and every defensive side exit materialize the
+    // established frame only when they are actually selected.
+    let stackless_immutable_exists = root_plan.is_none()
+        && output == OutputContract::Exists
+        && immutable_compact_possible;
     let variable_span_recovery = output == OutputContract::Span && exact_span_width.is_none();
     if supertransitions_possible && (!immutable_compact_possible || root_plan.is_some())
     {
@@ -15031,6 +15085,14 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     let root_scalar_reject = root_plan.map(|_| assembler.label()).transpose()?;
     let native_match = assembler.label()?;
     let native_no_match = assembler.label()?;
+    let stackless_native_match = stackless_immutable_exists
+        .then(|| assembler.label())
+        .transpose()?;
+    let stackless_native_no_match = stackless_immutable_exists
+        .then(|| assembler.label())
+        .transpose()?;
+    let leaf_native_match = stackless_native_match.unwrap_or(native_match);
+    let leaf_native_no_match = stackless_native_no_match.unwrap_or(native_no_match);
     let native_complete = (output != OutputContract::Exists)
         .then(|| assembler.label())
         .transpose()?;
@@ -15062,7 +15124,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         .transpose()?;
     let compact_complete = register_complete
         .or(native_complete)
-        .unwrap_or(native_no_match);
+        .unwrap_or(leaf_native_no_match);
     let native_continue = allow_direct_hole_continuation
         .then(|| assembler.label())
         .transpose()?;
@@ -15077,6 +15139,20 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         .transpose()?;
     let call_preflight = assembler.label()?;
     let framed_fallback = assembler.label()?;
+    let stackless_call_preflight = stackless_immutable_exists
+        .then(|| assembler.label())
+        .transpose()?;
+    let stackless_leaf_fallback = stackless_immutable_exists
+        .then(|| assembler.label())
+        .transpose()?;
+    let leaf_framed_fallback = stackless_leaf_fallback.unwrap_or(framed_fallback);
+    let v7_framed_enter = stackless_immutable_exists
+        .then(|| assembler.label())
+        .transpose()?;
+    let v6_framed_enter = stackless_immutable_exists
+        .then(|| assembler.label())
+        .transpose()?;
+    let compact_guard_fallback = stackless_call_preflight.unwrap_or(call_preflight);
     let framed_short_fallback = assembler.label()?;
     let adaptive_fallback = assembler.label()?;
     let short_fallback = assembler.label()?;
@@ -15087,6 +15163,57 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         .or(native_complete)
         .unwrap_or(native_no_match);
     let compact_loop_framed_fallback = loop_framed_fallback.unwrap_or(framed_fallback);
+    let save_stackless_public_args = |assembler: &mut X86Assembler| {
+        for (xmm, gpr) in [
+            (XMM_STACKLESS_HANDLE, GPR_RDI),
+            (XMM_STACKLESS_HAYSTACK, GPR_RSI),
+            (XMM_STACKLESS_LENGTH, GPR_RDX),
+            (XMM_STACKLESS_START, GPR_RCX),
+            (XMM_STACKLESS_END, GPR_R8),
+            (XMM_STACKLESS_RESULT, GPR_R9),
+        ] {
+            x86_emit_movq_xmm_from_gpr(assembler, xmm, gpr)?;
+        }
+        Ok::<(), ObjectError>(())
+    };
+    let restore_stackless_public_args = |assembler: &mut X86Assembler| {
+        for (gpr, xmm) in [
+            (GPR_RDI, XMM_STACKLESS_HANDLE),
+            (GPR_RSI, XMM_STACKLESS_HAYSTACK),
+            (GPR_RDX, XMM_STACKLESS_LENGTH),
+            (GPR_RCX, XMM_STACKLESS_START),
+            (GPR_R8, XMM_STACKLESS_END),
+            (GPR_R9, XMM_STACKLESS_RESULT),
+        ] {
+            x86_emit_movq_gpr_from_xmm(assembler, gpr, xmm)?;
+        }
+        Ok::<(), ObjectError>(())
+    };
+    let materialize_stackless_frame = |assembler: &mut X86Assembler| {
+        restore_stackless_public_args(assembler)?;
+        assembler.instruction(&[0x48, 0x83, 0xec, frame_bytes])?;
+        assembler.instruction(&[0x48, 0x89, 0x7c, 0x24, 0x10])?;
+        assembler.instruction(&[0x48, 0x89, 0x74, 0x24, 0x18])?;
+        assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x20])?;
+        assembler.instruction(&[0x4c, 0x89, 0x4c, 0x24, 0x38])?;
+        x86_emit_movq_gpr_from_xmm(assembler, GPR_RAX, XMM_STACKLESS_IDENTITY)?;
+        assembler.instruction(&[0x48, 0x89, 0x04, 0x24])?;
+        assembler.instruction(&[0x48, 0x89, 0x4c, 0x24, 0x40])?;
+        assembler.instruction(&[0x4c, 0x89, 0x44, 0x24, 0x48])?;
+        Ok::<(), ObjectError>(())
+    };
+    let load_leaf_scan_window = |assembler: &mut X86Assembler| {
+        if stackless_immutable_exists {
+            x86_emit_movq_gpr_from_xmm(assembler, GPR_RDI, XMM_STACKLESS_HAYSTACK)?;
+            x86_emit_movq_gpr_from_xmm(assembler, GPR_RDX, XMM_STACKLESS_START)?;
+            x86_emit_movq_gpr_from_xmm(assembler, GPR_RCX, XMM_STACKLESS_END)?;
+        } else {
+            assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x18])?;
+            assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x40])?;
+            assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x48])?;
+        }
+        Ok::<(), ObjectError>(())
+    };
 
     // Reject malformed public arguments before reading the offset-zero header.
     // The ordinary helper remains authoritative for status/result semantics.
@@ -15107,27 +15234,31 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     assembler.branch(&[0x0f, 0x84], short_fallback)?;
     assembler.instruction(&[0x4c, 0x39, 0xc2])?;
     assembler.branch(&[0x0f, 0x82], short_fallback)?;
-    // Entry RSP is 8 modulo 16. The frame aligns calls, retains the four
-    // public arguments needed after entry, and reserves the private preflight
-    // record whose first two words are the authoritative window. Root-scanner
-    // entries also retain one representation tag/pointer and, when
-    // continuation accounting is active, one callee-saved hit counter.
-    assembler.instruction(&[0x48, 0x83, 0xec, frame_bytes])?;
-    assembler.instruction(&[0x48, 0x89, 0x7c, 0x24, 0x10])?;
-    assembler.instruction(&[0x48, 0x89, 0x74, 0x24, 0x18])?;
-    assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x20])?;
-    assembler.instruction(&[0x4c, 0x89, 0x4c, 0x24, 0x38])?;
-    if tracks_root_scanner_hits {
-        // Save the caller's R12, then use it as a register-resident hit
-        // counter across the private preflight call and native scan.
-        assembler.instruction(&[
-            0x4c,
-            0x89,
-            0x64,
-            0x24,
-            ROOT_SCANNER_SAVED_R12_OFFSET,
-        ])?;
-        assembler.instruction(&[0x45, 0x31, 0xe4])?; // xor r12d, r12d
+    if stackless_immutable_exists {
+        save_stackless_public_args(&mut assembler)?;
+    } else {
+        // Entry RSP is 8 modulo 16. The frame aligns calls, retains the four
+        // public arguments needed after entry, and reserves the private
+        // preflight record whose first two words are the authoritative window.
+        // Root-scanner entries also retain one representation tag/pointer and,
+        // when continuation accounting is active, one callee-saved hit counter.
+        assembler.instruction(&[0x48, 0x83, 0xec, frame_bytes])?;
+        assembler.instruction(&[0x48, 0x89, 0x7c, 0x24, 0x10])?;
+        assembler.instruction(&[0x48, 0x89, 0x74, 0x24, 0x18])?;
+        assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x20])?;
+        assembler.instruction(&[0x4c, 0x89, 0x4c, 0x24, 0x38])?;
+        if tracks_root_scanner_hits {
+            // Save the caller's R12, then use it as a register-resident hit
+            // counter across the private preflight call and native scan.
+            assembler.instruction(&[
+                0x4c,
+                0x89,
+                0x64,
+                0x24,
+                ROOT_SCANNER_SAVED_R12_OFFSET,
+            ])?;
+            assembler.instruction(&[0x45, 0x31, 0xe4])?; // xor r12d, r12d
+        }
     }
 
     // SysV arguments seven and eight are the embedded artifact identity and
@@ -15136,7 +15267,15 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     let identity_displacement_label = assembler.label()?;
     assembler.bind(identity_displacement_label)?;
     push_bytes(&mut assembler.code, &[0; 4])?;
-    assembler.instruction(&[0x48, 0x89, 0x04, 0x24])?;
+    if stackless_immutable_exists {
+        x86_emit_movq_xmm_from_gpr(
+            &mut assembler,
+            XMM_STACKLESS_IDENTITY,
+            GPR_RAX,
+        )?;
+    } else {
+        assembler.instruction(&[0x48, 0x89, 0x04, 0x24])?;
+    }
     // SSE2 is part of the x86-64 architecture baseline, even when the explicit
     // target-feature vocabulary is empty. Keeping this fixed-width guard also
     // avoids introducing wide-vector transition state into scalar entries.
@@ -15145,8 +15284,10 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     // caller-saved registers. A successful V3--V14 variable-Span scan passes
     // these original bounds to its capability-authenticated postflight;
     // preflight is still free to overwrite the same private record.
-    assembler.instruction(&[0x48, 0x89, 0x4c, 0x24, 0x40])?;
-    assembler.instruction(&[0x4c, 0x89, 0x44, 0x24, 0x48])?;
+    if !stackless_immutable_exists {
+        assembler.instruction(&[0x48, 0x89, 0x4c, 0x24, 0x40])?;
+        assembler.instruction(&[0x4c, 0x89, 0x44, 0x24, 0x48])?;
+    }
 
     // Keep this compile-time gate paired with the compact bodies. Every
     // current dynamic-row output supports immutable rows; variable Span uses
@@ -15156,7 +15297,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         x86_emit_frozen_compact_v5_entry(
             &mut assembler,
             try_v7,
-            call_preflight,
+            compact_guard_fallback,
             v5_enter,
             compact_guard_mode,
         )?;
@@ -15165,8 +15306,8 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     x86_emit_frozen_compact_v7_entry(
         &mut assembler,
         try_v6,
-        call_preflight,
-        v7_enter,
+        compact_guard_fallback,
+        v7_framed_enter.unwrap_or(v7_enter),
         compact_guard_mode,
     )?;
     assembler.bind(try_v6)?;
@@ -15179,8 +15320,8 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
                 try_v12
             }),
         ),
-        call_preflight,
-        v6_enter,
+        compact_guard_fallback,
+        v6_framed_enter.unwrap_or(v6_enter),
         compact_guard_mode,
     )?;
     if let (Some(try_v14), Some(v14_enter)) = (try_v14, v14_enter) {
@@ -15192,7 +15333,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             } else {
                 try_v12
             }),
-            call_preflight,
+            compact_guard_fallback,
             v14_enter,
             compact_guard_mode,
         )?;
@@ -15206,7 +15347,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             } else {
                 try_v12
             },
-            call_preflight,
+            compact_guard_fallback,
             v13_enter,
             compact_guard_mode,
         )?;
@@ -15216,7 +15357,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         x86_emit_frozen_compact_v10_entry(
             &mut assembler,
             try_v12,
-            call_preflight,
+            compact_guard_fallback,
             v10_enter,
             compact_guard_mode,
         )?;
@@ -15229,7 +15370,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         } else {
             try_v4
         },
-        call_preflight,
+        compact_guard_fallback,
         v12_enter,
         compact_guard_mode,
     )?;
@@ -15238,7 +15379,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         x86_emit_frozen_compact_v8_entry(
             &mut assembler,
             try_v4,
-            call_preflight,
+            compact_guard_fallback,
             v8_enter,
             compact_guard_mode,
         )?;
@@ -15247,7 +15388,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     x86_emit_frozen_compact_v4_entry(
         &mut assembler,
         try_v3,
-        call_preflight,
+        compact_guard_fallback,
         v4_enter,
         compact_guard_mode,
     )?;
@@ -15255,12 +15396,15 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     x86_emit_frozen_compact_v3_entry(
         &mut assembler,
         try_v2,
-        call_preflight,
+        compact_guard_fallback,
         v3_enter,
         compact_guard_mode,
     )?;
     }
     assembler.bind(try_v2)?;
+    if stackless_immutable_exists {
+        materialize_stackless_frame(&mut assembler)?;
+    }
     // Compact capabilities are immutable, self-contained tables and remain
     // profitable and safe for every nonempty window. Keep the historical
     // crossover only for V1/V2 and cold mutable rows, after every compact
@@ -15338,6 +15482,22 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     assembler.instruction(&[0x48, 0x83, 0xc4, frame_bytes])?;
     assembler.instruction(&[0xc3])?;
 
+    if let Some(stackless_call_preflight) = stackless_call_preflight {
+        assembler.bind(stackless_call_preflight)?;
+        materialize_stackless_frame(&mut assembler)?;
+        assembler.branch(&[0xe9], call_preflight)?;
+    }
+    if let Some(v7_framed_enter) = v7_framed_enter {
+        assembler.bind(v7_framed_enter)?;
+        materialize_stackless_frame(&mut assembler)?;
+        assembler.branch(&[0xe9], v7_enter)?;
+    }
+    if let Some(v6_framed_enter) = v6_framed_enter {
+        assembler.bind(v6_framed_enter)?;
+        materialize_stackless_frame(&mut assembler)?;
+        assembler.branch(&[0xe9], v6_enter)?;
+    }
+
     let mut v7_loop_scan_displacement_label = None;
     let mut v6_loop_scan_displacement_label = None;
     // Bodies share the selector's compile-time gate so a future semantic
@@ -15349,12 +15509,26 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         // the exact no-accept sentinel. Compare only the admitted window
         // length; this reads neither haystack bytes nor compact rows.
         assembler.instruction(&[0x45, 0x85, 0xd2])?;
-        assembler.branch(&[0x0f, 0x84], native_no_match)?;
-        assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, 0x48])?;
-        assembler.instruction(&[0x48, 0x2b, 0x44, 0x24, 0x40])?;
+        assembler.branch(&[0x0f, 0x84], leaf_native_no_match)?;
+        if stackless_immutable_exists {
+            x86_emit_movq_gpr_from_xmm(
+                &mut assembler,
+                GPR_RAX,
+                XMM_STACKLESS_END,
+            )?;
+            x86_emit_movq_gpr_from_xmm(
+                &mut assembler,
+                GPR_RCX,
+                XMM_STACKLESS_START,
+            )?;
+            assembler.instruction(&[0x48, 0x29, 0xc8])?;
+        } else {
+            assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, 0x48])?;
+            assembler.instruction(&[0x48, 0x2b, 0x44, 0x24, 0x40])?;
+        }
         assembler.instruction(&[0x4c, 0x39, 0xd0])?;
-        assembler.branch(&[0x0f, 0x82], native_no_match)?;
-        assembler.branch(&[0xe9], native_match)?;
+        assembler.branch(&[0x0f, 0x82], leaf_native_no_match)?;
+        assembler.branch(&[0xe9], leaf_native_match)?;
     }
 
     if let (Some(v14_enter), Some(v14_class_entries)) = (v14_enter, v14_class_entries) {
@@ -15367,7 +15541,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
                 .map_err(|_| ObjectError::ArithmeticOverflow("x86 V14 rows address"))?,
         ])?;
         assembler.instruction(&[0x48, 0x85, 0xf6])?;
-        assembler.branch(&[0x0f, 0x84], framed_fallback)?;
+        assembler.branch(&[0x0f, 0x84], leaf_framed_fallback)?;
         assembler.instruction(&[0x49, 0x89, 0xf0])?; // canonical block zero
         let class_map_offset = i32::try_from(FROZEN_PREPARED_HEADER_V1_CLASS_MAP_OFFSET)
             .map_err(|_| ObjectError::ArithmeticOverflow("x86 V14 inline class map"))?;
@@ -15381,9 +15555,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             u8::try_from(FROZEN_DYNAMIC_ROWS_V3_CLASS_COUNT_OFFSET)
                 .map_err(|_| ObjectError::ArithmeticOverflow("x86 V14 class count"))?,
         ])?;
-        assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x18])?;
-        assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x40])?;
-        assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x48])?;
+        load_leaf_scan_window(&mut assembler)?;
         if output != OutputContract::Exists {
             assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x60, 0, 0, 0, 0])?;
         }
@@ -15392,7 +15564,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         assembler.instruction(&[0x83, 0xf8, 0x03])?;
         assembler.branch(&[0x0f, 0x84], v14_class_entries[1])?;
         assembler.instruction(&[0x83, 0xf8, 0x04])?;
-        assembler.branch(&[0x0f, 0x85], framed_fallback)?;
+        assembler.branch(&[0x0f, 0x85], leaf_framed_fallback)?;
         assembler.branch(&[0xe9], v14_class_entries[2])?;
 
         let emit_v14_key =
@@ -15459,7 +15631,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             let tail3 = assembler.label()?;
             let tail2 = assembler.label()?;
             let tail1 = assembler.label()?;
-            let complete = native_complete.unwrap_or(native_no_match);
+            let complete = native_complete.unwrap_or(leaf_native_no_match);
 
             assembler.bind(entry)?;
             assembler.instruction(&[0x48, 0x39, 0xca])?;
@@ -15474,7 +15646,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             assembler.instruction(&[0x48, 0x83, 0xc2, 0x04])?;
             if output == OutputContract::Exists {
                 assembler.instruction(&[0x66, 0x45, 0x85, 0xd2])?;
-                assembler.branch(&[0x0f, 0x88], native_match)?;
+                assembler.branch(&[0x0f, 0x88], leaf_native_match)?;
             } else {
                 let no_accept = assembler.label()?;
                 assembler.instruction(&[0x66, 0x45, 0x85, 0xd2])?;
@@ -15515,7 +15687,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             assembler.instruction(&[0x41, 0x83, 0xfb, 0x02])?;
             assembler.branch(&[0x0f, 0x84], tail2)?;
             assembler.instruction(&[0x41, 0x83, 0xfb, 0x03])?;
-            assembler.branch(&[0x0f, 0x85], framed_fallback)?;
+            assembler.branch(&[0x0f, 0x85], leaf_framed_fallback)?;
             assembler.branch(&[0xe9], tail3)?;
 
             for (length, section_offset, tail_label) in [
@@ -15541,8 +15713,8 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
                 ])?;
                 if output == OutputContract::Exists {
                     assembler.instruction(&[0x66, 0x45, 0x85, 0xd2])?;
-                    assembler.branch(&[0x0f, 0x88], native_match)?;
-                    assembler.branch(&[0xe9], native_no_match)?;
+                    assembler.branch(&[0x0f, 0x88], leaf_native_match)?;
+                    assembler.branch(&[0xe9], leaf_native_no_match)?;
                 } else {
                     let no_accept = assembler.label()?;
                     assembler.instruction(&[0x66, 0x45, 0x85, 0xd2])?;
@@ -15570,7 +15742,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
                 .map_err(|_| ObjectError::ArithmeticOverflow("x86 V13 rows address"))?,
         ])?;
         assembler.instruction(&[0x48, 0x85, 0xf6])?;
-        assembler.branch(&[0x0f, 0x84], framed_fallback)?;
+        assembler.branch(&[0x0f, 0x84], leaf_framed_fallback)?;
         assembler.instruction(&[0x49, 0x89, 0xf0])?; // canonical block zero
         let class_map_offset = i32::try_from(FROZEN_PREPARED_HEADER_V1_CLASS_MAP_OFFSET)
             .map_err(|_| ObjectError::ArithmeticOverflow("x86 V13 inline class map"))?;
@@ -15584,9 +15756,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             u8::try_from(FROZEN_DYNAMIC_ROWS_V3_CLASS_COUNT_OFFSET)
                 .map_err(|_| ObjectError::ArithmeticOverflow("x86 V13 class count"))?,
         ])?;
-        assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x18])?;
-        assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x40])?;
-        assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x48])?;
+        load_leaf_scan_window(&mut assembler)?;
         if output != OutputContract::Exists {
             assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x60, 0, 0, 0, 0])?;
         }
@@ -15610,9 +15780,9 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
 
         if output == OutputContract::Exists {
             assembler.instruction(&[0x66, 0x45, 0x85, 0xd2])?;
-            assembler.branch(&[0x0f, 0x88], native_match)?;
+            assembler.branch(&[0x0f, 0x88], leaf_native_match)?;
             assembler.instruction(&[0x41, 0x81, 0xe2, 0xff, 0x3f, 0x00, 0x00])?;
-            assembler.branch(&[0x0f, 0x84], native_no_match)?;
+            assembler.branch(&[0x0f, 0x84], leaf_native_no_match)?;
             assembler.instruction(&[0x48, 0x83, 0xc2, 0x02])?;
         } else {
             assembler.instruction(&[0x48, 0x83, 0xc2, 0x02])?;
@@ -15642,7 +15812,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         assembler.branch(&[0x0f, 0x82], pair_scan)?;
         assembler.instruction(&[0x48, 0x39, 0xca])?;
         assembler.branch(&[0x0f, 0x82], tail)?;
-        assembler.branch(&[0xe9], native_complete.unwrap_or(native_no_match))?;
+        assembler.branch(&[0xe9], native_complete.unwrap_or(leaf_native_no_match))?;
 
         assembler.bind(tail)?;
         assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
@@ -15653,8 +15823,8 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         assembler.instruction(&[0x45, 0x0f, 0xa3, 0xd3])?;
         assembler.instruction(&[0x48, 0xff, 0xc2])?;
         if output == OutputContract::Exists {
-            assembler.branch(&[0x0f, 0x82], native_match)?;
-            assembler.branch(&[0xe9], native_no_match)?;
+            assembler.branch(&[0x0f, 0x82], leaf_native_match)?;
+            assembler.branch(&[0xe9], leaf_native_no_match)?;
         } else {
             let tail_accept = assembler.label()?;
             assembler.branch(&[0x0f, 0x82], tail_accept)?;
@@ -15673,11 +15843,8 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
                 // makes the accept bit SF and the exact dead cell ZF. A
                 // non-accepting live V4 token feeds the biased LEA directly.
                 assembler.instruction(&[0x66, 0x45, 0x85, 0xd2])?;
-                assembler.branch(&[0x0f, 0x88], native_match)?;
-                assembler.branch(
-                    &[0x0f, 0x84],
-                    native_complete.unwrap_or(native_no_match),
-                )?;
+                assembler.branch(&[0x0f, 0x88], leaf_native_match)?;
+                assembler.branch(&[0x0f, 0x84], compact_complete)?;
             } else {
                 if register_last_accept {
                     // The authenticated u16 cell's accept bit is its sign bit.
@@ -15722,7 +15889,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             assembler.instruction(&[0x48, 0xff, 0xc2])?;
             if output == OutputContract::Exists {
                 assembler.instruction(&[0x45, 0x84, 0xd2])?;
-                assembler.branch(&[0x0f, 0x88], native_match)?;
+                assembler.branch(&[0x0f, 0x88], leaf_native_match)?;
                 assembler.branch(&[0x0f, 0x84], compact_complete)?;
             } else {
                 if register_last_accept {
@@ -16328,7 +16495,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             .map_err(|_| ObjectError::ArithmeticOverflow("x86 V4 rows address"))?,
     ])?;
     assembler.instruction(&[0x48, 0x85, 0xf6])?;
-    assembler.branch(&[0x0f, 0x84], framed_fallback)?;
+    assembler.branch(&[0x0f, 0x84], leaf_framed_fallback)?;
     if root_plan.is_none() {
         // The active V4 capability authenticates the immutable class count
         // and every class-map byte before publication. A one-class alphabet
@@ -16346,11 +16513,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         ])?;
         assembler.branch(&[0x0f, 0x85], class_mapped)?;
         assembler.instruction(&[0x49, 0x89, 0xf0])?; // canonical V4 row zero
-        if register_last_accept {
-            assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x18])?;
-        }
-        assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x40])?;
-        assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x48])?;
+        load_leaf_scan_window(&mut assembler)?;
         if register_last_accept {
             assembler.instruction(&[0x48, 0x01, 0xfa])?; // add rdx,rdi
             assembler.instruction(&[0x48, 0x01, 0xf9])?; // add rcx,rdi
@@ -16364,11 +16527,8 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         assembler.instruction(&[0x48, 0xff, 0xc2])?;
         if output == OutputContract::Exists {
             assembler.instruction(&[0x66, 0x45, 0x85, 0xd2])?;
-            assembler.branch(&[0x0f, 0x88], native_match)?;
-            assembler.branch(
-                &[0x0f, 0x84],
-                native_complete.unwrap_or(native_no_match),
-            )?;
+            assembler.branch(&[0x0f, 0x88], leaf_native_match)?;
+            assembler.branch(&[0x0f, 0x84], compact_complete)?;
         } else {
             if register_last_accept {
                 assembler.instruction(&[0x66, 0x45, 0x85, 0xd2])?; // test r10w,r10w
@@ -16415,9 +16575,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         // loop can recognize restartable root transitions with one compare.
         assembler.instruction(&[0x4c, 0x89, 0x44, 0x24, 0x50])?;
     }
-    assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x18])?;
-    assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x40])?;
-    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x48])?;
+    load_leaf_scan_window(&mut assembler)?;
     if let Some(root_setup) = root_setup {
         assembler.branch(&[0xe9], root_setup)?;
     } else if register_last_accept {
@@ -16500,7 +16658,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
                 .map_err(|_| ObjectError::ArithmeticOverflow("x86 V10 rows address"))?,
         ])?;
         assembler.instruction(&[0x48, 0x85, 0xf6])?;
-        assembler.branch(&[0x0f, 0x84], framed_fallback)?;
+        assembler.branch(&[0x0f, 0x84], leaf_framed_fallback)?;
         assembler.instruction(&[0x49, 0x89, 0xf0])?; // canonical row zero
         if root_setup.is_some() {
             assembler.instruction(&[
@@ -16516,9 +16674,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             ])?;
             assembler.instruction(&[0x4c, 0x89, 0x44, 0x24, 0x50])?;
         }
-        assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x18])?;
-        assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x40])?;
-        assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x48])?;
+        load_leaf_scan_window(&mut assembler)?;
         if let Some(root_setup) = root_setup {
             assembler.branch(&[0xe9], root_setup)?;
         } else if register_last_accept {
@@ -16594,7 +16750,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             .map_err(|_| ObjectError::ArithmeticOverflow("x86 V12 rows address"))?,
     ])?;
     assembler.instruction(&[0x48, 0x85, 0xf6])?;
-    assembler.branch(&[0x0f, 0x84], framed_fallback)?;
+    assembler.branch(&[0x0f, 0x84], leaf_framed_fallback)?;
     let class_map_offset = i32::try_from(FROZEN_PREPARED_HEADER_V1_CLASS_MAP_OFFSET)
         .map_err(|_| ObjectError::ArithmeticOverflow("x86 V12 inline class map"))?;
     let mut inline_class_map = vec![0x4c, 0x8d, 0x8f];
@@ -16622,9 +16778,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         assembler.instruction(&[0x49, 0x89, 0xf0])?;
         assembler.instruction(&[0x4c, 0x89, 0x44, 0x24, 0x50])?;
     }
-    assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x18])?;
-    assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x40])?;
-    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x48])?;
+    load_leaf_scan_window(&mut assembler)?;
     if let Some(root_setup) = root_setup {
         assembler.branch(&[0xe9], root_setup)?;
     } else if register_last_accept {
@@ -16751,9 +16905,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         u8::try_from(FROZEN_DYNAMIC_ROWS_V3_ROW_SHIFT_OFFSET)
             .map_err(|_| ObjectError::ArithmeticOverflow("x86 V3 row shift"))?,
     ])?;
-    assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x18])?;
-    assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x40])?;
-    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x48])?;
+    load_leaf_scan_window(&mut assembler)?;
     if let Some(root_setup) = root_setup {
         assembler.branch(&[0xe9], root_setup)?;
     } else if register_last_accept {
@@ -16796,11 +16948,8 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
                 // Its not-taken sign branch proves the live token needs no
                 // mask.
                 assembler.instruction(&[0x66, 0x45, 0x85, 0xd2])?;
-                assembler.branch(&[0x0f, 0x88], native_match)?;
-                assembler.branch(
-                    &[0x0f, 0x84],
-                    native_complete.unwrap_or(native_no_match),
-                )?;
+                assembler.branch(&[0x0f, 0x88], leaf_native_match)?;
+                assembler.branch(&[0x0f, 0x84], compact_complete)?;
             } else {
                 if register_last_accept {
                     assembler.instruction(&[0x66, 0x45, 0x85, 0xd2])?; // test r10w,r10w
@@ -16897,7 +17046,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         assembler.instruction(&[0x48, 0xff, 0xc2])?;
         if output == OutputContract::Exists {
             assembler.instruction(&[0x66, 0x45, 0x85, 0xd2])?;
-            assembler.branch(&[0x0f, 0x88], native_match)?;
+            assembler.branch(&[0x0f, 0x88], leaf_native_match)?;
         } else {
             if register_last_accept {
                 assembler.instruction(&[0x66, 0x45, 0x85, 0xd2])?; // test r10w,r10w
@@ -16923,7 +17072,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
                 .map_err(|_| ObjectError::ArithmeticOverflow("x86 V8 rows address"))?,
         ])?;
         assembler.instruction(&[0x48, 0x85, 0xf6])?;
-        assembler.branch(&[0x0f, 0x84], framed_fallback)?;
+        assembler.branch(&[0x0f, 0x84], leaf_framed_fallback)?;
         assembler.instruction(&[0x49, 0x89, 0xf0])?; // canonical row zero
         if root_setup.is_some() {
             assembler.instruction(&[
@@ -16939,9 +17088,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             ])?;
             assembler.instruction(&[0x4c, 0x89, 0x44, 0x24, 0x50])?;
         }
-        assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x18])?;
-        assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x40])?;
-        assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x48])?;
+        load_leaf_scan_window(&mut assembler)?;
         if let Some(root_setup) = root_setup {
             assembler.branch(&[0xe9], root_setup)?;
         } else if register_last_accept {
@@ -16956,11 +17103,8 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             assembler.instruction(&[0x48, 0xff, 0xc2])?;
             if output == OutputContract::Exists {
                 assembler.instruction(&[0x66, 0x45, 0x85, 0xd2])?;
-                assembler.branch(&[0x0f, 0x88], native_match)?;
-                assembler.branch(
-                    &[0x0f, 0x84],
-                    native_complete.unwrap_or(native_no_match),
-                )?;
+                assembler.branch(&[0x0f, 0x88], leaf_native_match)?;
+                assembler.branch(&[0x0f, 0x84], compact_complete)?;
             } else {
                 if register_last_accept {
                     assembler.instruction(&[0x66, 0x45, 0x85, 0xd2])?; // test r10w,r10w
@@ -17029,7 +17173,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             assembler.instruction(&[0x48, 0xff, 0xc2])?;
             if output == OutputContract::Exists {
                 assembler.instruction(&[0x66, 0x45, 0x85, 0xd2])?;
-                assembler.branch(&[0x0f, 0x88], native_match)?;
+                assembler.branch(&[0x0f, 0x88], leaf_native_match)?;
             } else {
                 if register_last_accept {
                     assembler.instruction(&[0x66, 0x45, 0x85, 0xd2])?; // test r10w,r10w
@@ -17696,6 +17840,33 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         assembler.branch(&[0xe9], framed_fallback)?;
     }
 
+    if let Some(stackless_native_no_match) = stackless_native_no_match {
+        assembler.bind(stackless_native_no_match)?;
+        assembler.instruction(&[0x31, 0xc0])?;
+        x86_emit_movq_gpr_from_xmm(
+            &mut assembler,
+            GPR_R9,
+            XMM_STACKLESS_RESULT,
+        )?;
+        assembler.instruction(&[0x49, 0x89, 0x01])?;
+        assembler.instruction(&[0x49, 0x89, 0x41, 0x08])?;
+        assembler.instruction(&[0xc3])?;
+    }
+
+    if let Some(stackless_native_match) = stackless_native_match {
+        assembler.bind(stackless_native_match)?;
+        assembler.instruction(&[0x31, 0xc0])?;
+        x86_emit_movq_gpr_from_xmm(
+            &mut assembler,
+            GPR_R9,
+            XMM_STACKLESS_RESULT,
+        )?;
+        assembler.instruction(&[0x49, 0x89, 0x01])?;
+        assembler.instruction(&[0x49, 0x89, 0x41, 0x08])?;
+        assembler.instruction(&[0xb8, 1, 0, 0, 0])?;
+        assembler.instruction(&[0xc3])?;
+    }
+
     assembler.bind(native_no_match)?;
     if filter_kind.is_some_and(X86StartFilterKind::needs_vzeroupper) {
         assembler.instruction(&[0xc5, 0xf8, 0x77])?;
@@ -17855,6 +18026,12 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         restore_root_scanner_counter(&mut assembler)?;
         assembler.instruction(&[0x48, 0x83, 0xc4, frame_bytes])?;
         assembler.instruction(&[0xc3])?;
+    }
+
+    if let Some(stackless_leaf_fallback) = stackless_leaf_fallback {
+        assembler.bind(stackless_leaf_fallback)?;
+        materialize_stackless_frame(&mut assembler)?;
+        assembler.branch(&[0xe9], framed_fallback)?;
     }
 
     assembler.bind(framed_fallback)?;
@@ -48202,6 +48379,87 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
         assert!(frame_position < flag_position);
         assert!(flag_position < minimum_position);
         assert_eq!(words.iter().filter(|&&word| word == arm_minimum).count(), 1);
+    }
+
+    #[test]
+    fn scanner_free_immutable_exists_keeps_x86_leaf_frame_off_hot_entry() {
+        let exists = lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
+            None,
+            FeatureSet::EMPTY,
+            OutputContract::Exists,
+            None,
+            true,
+            true,
+        )
+        .unwrap();
+        let selected = lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
+            None,
+            FeatureSet::EMPTY,
+            OutputContract::SelectedEnd,
+            None,
+            true,
+            true,
+        )
+        .unwrap();
+        let frame = [0x48, 0x83, 0xec, 104];
+        let mut v5_flag = vec![
+            0x81,
+            0x7f,
+            u8::try_from(FROZEN_PREPARED_HEADER_V1_FLAGS_OFFSET).unwrap(),
+        ];
+        v5_flag.extend_from_slice(&FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V5.to_le_bytes());
+        let mut v12_flag = vec![
+            0x81,
+            0x7f,
+            u8::try_from(FROZEN_PREPARED_HEADER_V1_FLAGS_OFFSET).unwrap(),
+        ];
+        v12_flag.extend_from_slice(&FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V12.to_le_bytes());
+        let position = |code: &[u8], needle: &[u8]| {
+            code.windows(needle.len())
+                .position(|window| window == needle)
+                .unwrap_or_else(|| panic!("missing x86 sequence {needle:02x?}"))
+        };
+
+        let exists_flag = position(&exists.code, &v5_flag);
+        let exists_frame = position(&exists.code, &frame);
+        let selected_flag = position(&selected.code, &v12_flag);
+        let selected_frame = position(&selected.code, &frame);
+        assert!(exists_flag < exists_frame);
+        assert!(selected_frame < selected_flag);
+
+        // XMM4..XMM10 retain handle, haystack, length, start, end, output,
+        // and linked identity. The active guard consumes only XMM0..XMM3.
+        for save in [
+            [0x66, 0x48, 0x0f, 0x6e, 0xe7],
+            [0x66, 0x48, 0x0f, 0x6e, 0xee],
+            [0x66, 0x48, 0x0f, 0x6e, 0xf2],
+            [0x66, 0x48, 0x0f, 0x6e, 0xf9],
+            [0x66, 0x4d, 0x0f, 0x6e, 0xc0],
+            [0x66, 0x4d, 0x0f, 0x6e, 0xc9],
+            [0x66, 0x4c, 0x0f, 0x6e, 0xd0],
+        ] {
+            assert!(position(&exists.code, &save) < exists_flag);
+        }
+        assert!(!exists.code[..exists_flag]
+            .windows(frame.len())
+            .any(|window| window == frame));
+
+        let no_match_leaf = [
+            0x31, 0xc0, 0x66, 0x4d, 0x0f, 0x7e, 0xc9, 0x49, 0x89, 0x01, 0x49, 0x89, 0x41,
+            0x08, 0xc3,
+        ];
+        let match_leaf = [
+            0x31, 0xc0, 0x66, 0x4d, 0x0f, 0x7e, 0xc9, 0x49, 0x89, 0x01, 0x49, 0x89, 0x41,
+            0x08, 0xb8, 1, 0, 0, 0, 0xc3,
+        ];
+        assert!(exists
+            .code
+            .windows(no_match_leaf.len())
+            .any(|window| window == no_match_leaf));
+        assert!(exists
+            .code
+            .windows(match_leaf.len())
+            .any(|window| window == match_leaf));
     }
 
     #[test]
