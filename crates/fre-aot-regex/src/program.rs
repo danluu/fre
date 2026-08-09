@@ -17185,12 +17185,14 @@ mod tests {
                     if matches!(checked_outcome, RetainedPartialPreflight::Enter(_)) {
                         assert_eq!(checked_outcome, RetainedPartialPreflight::Enter(window));
                         assert_eq!(
-                            state.native_entry_original_input_bytes,
-                            window.end.saturating_sub(window.start),
+                            state
+                                .native_entry_admission
+                                .map(|admission| admission.original_input_bytes),
+                            Some(window.end.saturating_sub(window.start)),
                             "{window:?}/round {round} admitted length"
                         );
                     } else {
-                        assert!(state.native_entry_window.is_none());
+                        assert!(state.native_entry_window().is_none());
                     }
                 }
             }

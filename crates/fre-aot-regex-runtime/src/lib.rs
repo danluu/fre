@@ -146,6 +146,19 @@ pub struct FreAotRegexDynamicRowsPreflightV1 {
     pub cache_generation: u64,
 }
 
+/// Compiler-private V6 dynamic-row preflight return registers.
+///
+/// The two native words map to the ordinary C aggregate return registers:
+/// RAX/RDX on x86-64 SysV and Darwin, and X0/X1 on AAPCS64. The descriptor is
+/// nonzero only when `status` is [`STATUS_PARTIAL_PREFLIGHT_ENTER`].
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(C)]
+pub struct FreAotRegexDynamicRowsPreflightResultV6 {
+    pub status: usize,
+    pub native_rows_address: usize,
+}
+
 /// Compiler-private payload for one exact first-unpublished-cell handoff.
 ///
 /// The exact admitted window remains in the search helper's ordinary arguments.
@@ -2596,6 +2609,61 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_compiler_private_search_exclusive
     }
 }
 
+/// Compiler-private dynamic-row preflight with a return-register descriptor.
+///
+/// V6 preserves V5's trusted-program, artifact-identity, mutable-admission,
+/// descriptor, transaction, and exact-window checks. On
+/// [`STATUS_PARTIAL_PREFLIGHT_ENTER`], it writes only the admitted `start` and
+/// `end` to `window_out` and returns the authenticated native-row descriptor
+/// beside the status in a two-word C aggregate. On every other status the
+/// returned descriptor is zero and `window_out` has V5's transactional
+/// untouched-output semantics.
+///
+/// The versioned symbol prevents generated objects that consume the second
+/// aggregate return register from linking against a V5-only runtime. It is
+/// deliberately absent from the public C header.
+///
+/// # Safety
+///
+/// The caller must satisfy V5's generated-wrapper and prepared-workspace
+/// premises. `window_out` must be non-null, aligned, writable for exactly one
+/// [`FreAotRegexSearchWindowV1`], and disjoint from every readable input and
+/// `result_ptr`.
+#[doc(hidden)]
+#[unsafe(no_mangle)]
+#[allow(
+    unsafe_code,
+    clippy::too_many_arguments,
+    reason = "the generated-only V6 ABI returns its trusted descriptor in native aggregate registers"
+)]
+pub unsafe extern "C" fn fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v6(
+    handle: FreAotRegexExclusiveHandleV1,
+    haystack_ptr: *const u8,
+    haystack_len: usize,
+    window_start: usize,
+    window_end: usize,
+    result_ptr: *mut FreAotRegexResultV1,
+    expected_artifact_identity_ptr: *const u8,
+    window_out: *mut FreAotRegexSearchWindowV1,
+) -> FreAotRegexDynamicRowsPreflightResultV6 {
+    // SAFETY: V6 changes only the successful output transport. The exact
+    // V5 premises still establish every raw and runtime-owned input to the
+    // shared transaction, and the two-word output is the prefix written by
+    // this policy specialization.
+    unsafe {
+        exclusive_dynamic_rows_preflight_prevalidated_result::<true, false, false>(
+            handle,
+            haystack_ptr,
+            haystack_len,
+            window_start,
+            window_end,
+            result_ptr,
+            expected_artifact_identity_ptr,
+            window_out.cast::<FreAotRegexDynamicRowsPreflightV1>(),
+        )
+    }
+}
+
 #[allow(
     unsafe_code,
     clippy::too_many_arguments,
@@ -2614,6 +2682,52 @@ unsafe fn exclusive_dynamic_rows_preflight_prevalidated<
     expected_artifact_identity_ptr: *const u8,
     preflight_out: *mut FreAotRegexDynamicRowsPreflightV1,
 ) -> u32 {
+    // SAFETY: the caller establishes the selected legacy policy's raw input
+    // and output contract. Legacy V1--V5 always write the descriptor word on
+    // admitted entry; V1--V3 additionally write the cache identity.
+    let returned = unsafe {
+        exclusive_dynamic_rows_preflight_prevalidated_result::<
+            TRUSTED_PROGRAM,
+            WRITE_CACHE_IDENTITY,
+            true,
+        >(
+            handle,
+            haystack_ptr,
+            haystack_len,
+            window_start,
+            window_end,
+            result_ptr,
+            expected_artifact_identity_ptr,
+            preflight_out,
+        )
+    };
+    u32::try_from(returned.status).unwrap_or(STATUS_RUNTIME_FAILURE)
+}
+
+#[allow(
+    unsafe_code,
+    clippy::too_many_arguments,
+    reason = "one panic-catching transaction serves legacy memory-return and V6 register-return policies"
+)]
+unsafe fn exclusive_dynamic_rows_preflight_prevalidated_result<
+    const TRUSTED_PROGRAM: bool,
+    const WRITE_CACHE_IDENTITY: bool,
+    const WRITE_NATIVE_ROWS_ADDRESS: bool,
+>(
+    handle: FreAotRegexExclusiveHandleV1,
+    haystack_ptr: *const u8,
+    haystack_len: usize,
+    window_start: usize,
+    window_end: usize,
+    result_ptr: *mut FreAotRegexResultV1,
+    expected_artifact_identity_ptr: *const u8,
+    preflight_out: *mut FreAotRegexDynamicRowsPreflightV1,
+) -> FreAotRegexDynamicRowsPreflightResultV6 {
+    let returned =
+        |status: u32, native_rows_address: usize| FreAotRegexDynamicRowsPreflightResultV6 {
+            status: usize::try_from(status).expect("dynamic-row runtime status fits in usize"),
+            native_rows_address,
+        };
     catch_unwind(AssertUnwindSafe(|| unsafe {
         let prepared = &mut *handle.0.cast::<PreparedAotRegex>();
         let haystack = std::slice::from_raw_parts(haystack_ptr, haystack_len);
@@ -2635,13 +2749,13 @@ unsafe fn exclusive_dynamic_rows_preflight_prevalidated<
             )
         };
         let Ok((outcome, native_rows_address, cache_identity)) = preflight else {
-            return STATUS_RUNTIME_FAILURE;
+            return returned(STATUS_RUNTIME_FAILURE, 0);
         };
         match outcome {
             RetainedPartialPreflight::Complete(found) => {
                 let (status, result) = encode_match_result(found);
                 result_ptr.write(result);
-                status
+                returned(status, 0)
             }
             RetainedPartialPreflight::Enter(window) => {
                 if WRITE_CACHE_IDENTITY {
@@ -2652,20 +2766,23 @@ unsafe fn exclusive_dynamic_rows_preflight_prevalidated<
                         cache_generation: cache_identity,
                     });
                 } else {
-                    // V4/V5 generated callers allocate the unchanged V1
-                    // extent but read only these three initialized words.
-                    // The cache identity remains available in the trusted
-                    // descriptor for a rare continuation side exit.
+                    // V4/V5 write the descriptor word after the exact window;
+                    // V6 transports it in the second aggregate return
+                    // register. Every version leaves cache identity available
+                    // in the trusted descriptor for a rare continuation side
+                    // exit instead of copying it on the common path.
                     std::ptr::addr_of_mut!((*preflight_out).start).write(window.start());
                     std::ptr::addr_of_mut!((*preflight_out).end).write(window.end());
-                    std::ptr::addr_of_mut!((*preflight_out).native_rows_address)
-                        .write(native_rows_address);
+                    if WRITE_NATIVE_ROWS_ADDRESS {
+                        std::ptr::addr_of_mut!((*preflight_out).native_rows_address)
+                            .write(native_rows_address);
+                    }
                 }
-                STATUS_PARTIAL_PREFLIGHT_ENTER
+                returned(STATUS_PARTIAL_PREFLIGHT_ENTER, native_rows_address)
             }
         }
     }))
-    .unwrap_or(STATUS_RUNTIME_FAILURE)
+    .unwrap_or_else(|_| returned(STATUS_RUNTIME_FAILURE, 0))
 }
 
 /// Authenticate one native-root-owned incomplete-retained search.
@@ -3472,6 +3589,37 @@ mod tests {
 
     #[allow(
         clippy::too_many_arguments,
+        reason = "the helper mirrors the generated-only V6 return-register dynamic-row preflight ABI"
+    )]
+    fn call_exclusive_compiler_private_dynamic_rows_preflight_v6(
+        handle: FreAotRegexExclusiveHandleV1,
+        haystack: &[u8],
+        start: usize,
+        end: usize,
+        result: &mut FreAotRegexResultV1,
+        expected_artifact_identity: &[u8; ARTIFACT_IDENTITY_BYTES],
+        output: &mut FreAotRegexDynamicRowsPreflightV1,
+    ) -> FreAotRegexDynamicRowsPreflightResultV6 {
+        // SAFETY: this test helper supplies the exact live, validated,
+        // disjoint inputs established by FRE's generated V6 wrapper. The
+        // larger sentinel record lets the test prove that V6 writes only its
+        // two-word window prefix.
+        unsafe {
+            fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v6(
+                handle,
+                haystack.as_ptr(),
+                haystack.len(),
+                start,
+                end,
+                result,
+                expected_artifact_identity.as_ptr(),
+                std::ptr::from_mut(output).cast::<FreAotRegexSearchWindowV1>(),
+            )
+        }
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
         reason = "the helper mirrors the compiler-private authenticated first-hole continuation"
     )]
     fn call_exclusive_dynamic_rows_continue(
@@ -3679,6 +3827,22 @@ mod tests {
             align_of::<usize>()
         );
         assert_eq!(
+            size_of::<FreAotRegexDynamicRowsPreflightResultV6>(),
+            size_of::<[usize; 2]>()
+        );
+        assert_eq!(
+            align_of::<FreAotRegexDynamicRowsPreflightResultV6>(),
+            align_of::<usize>()
+        );
+        assert_eq!(
+            core::mem::offset_of!(FreAotRegexDynamicRowsPreflightResultV6, status),
+            0
+        );
+        assert_eq!(
+            core::mem::offset_of!(FreAotRegexDynamicRowsPreflightResultV6, native_rows_address),
+            size_of::<usize>()
+        );
+        assert_eq!(
             size_of::<FreAotRegexDynamicRowsContinuationV1>(),
             size_of::<[usize; 5]>()
         );
@@ -3718,6 +3882,7 @@ mod tests {
             "fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v3",
             "fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v4",
             "fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v5",
+            "fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v6",
             "fre_aot_regex_runtime_search_exclusive_dynamic_rows_deopt_v1",
             "fre_aot_regex_runtime_search_exclusive_dynamic_rows_continue_v1",
             "fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1",
@@ -3989,6 +4154,17 @@ mod tests {
             *mut FreAotRegexDynamicRowsPreflightV1,
         ) -> u32 =
             fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v5;
+        let _: unsafe extern "C" fn(
+            FreAotRegexExclusiveHandleV1,
+            *const u8,
+            usize,
+            usize,
+            usize,
+            *mut FreAotRegexResultV1,
+            *const u8,
+            *mut FreAotRegexSearchWindowV1,
+        ) -> FreAotRegexDynamicRowsPreflightResultV6 =
+            fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v6;
         let _: unsafe extern "C" fn(
             FreAotRegexExclusiveHandleV1,
             *const u8,
@@ -4735,6 +4911,114 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
                 "{version} destroy"
             );
         }
+    }
+
+    #[test]
+    fn compiler_private_v6_returns_descriptor_and_writes_only_exact_window() {
+        let compiled = compile(
+            CompileRequest::new("(?:ab|ac)+z", Target::x86_64_linux())
+                .mode(CompileMode::Fast)
+                .output(OutputContract::Exists),
+        )
+        .expect("compile V6 dynamic-row fixture");
+        let identity = compiled.receipt().program_sha256;
+        let serialized = compiled.program().serialize().unwrap();
+        let handle = prepare_exclusive_with_cold_dynamic_rows(&serialized);
+        let mut haystack = vec![b'!'; 80];
+        for pair in haystack[8..70].chunks_exact_mut(2) {
+            pair.copy_from_slice(b"ab");
+        }
+        haystack[70] = b'z';
+        let sentinel_result = FreAotRegexResultV1 { start: 91, end: 92 };
+        let sentinel_output = FreAotRegexDynamicRowsPreflightV1 {
+            start: 93,
+            end: 94,
+            native_rows_address: 95,
+            cache_generation: 0xfeed_face_cafe_beef,
+        };
+
+        let mut result = sentinel_result;
+        let mut output = sentinel_output;
+        let returned = call_exclusive_compiler_private_dynamic_rows_preflight_v6(
+            handle,
+            &haystack,
+            8,
+            72,
+            &mut result,
+            &identity,
+            &mut output,
+        );
+        assert_eq!(returned.status, usize::try_from(STATUS_MATCH).unwrap());
+        assert_eq!(returned.native_rows_address, 0);
+        assert_eq!(output, sentinel_output, "cold completion output");
+
+        result = sentinel_result;
+        output = sentinel_output;
+        let returned = call_exclusive_compiler_private_dynamic_rows_preflight_v6(
+            handle,
+            &haystack,
+            8,
+            72,
+            &mut result,
+            &identity,
+            &mut output,
+        );
+        assert_eq!(
+            returned.status,
+            usize::try_from(STATUS_PARTIAL_PREFLIGHT_ENTER).unwrap()
+        );
+        assert_ne!(returned.native_rows_address, 0);
+        assert_eq!((output.start, output.end), (8, 72));
+        assert_eq!(
+            output.native_rows_address, sentinel_output.native_rows_address,
+            "V6 must not write the third output word"
+        );
+        assert_eq!(
+            output.cache_generation, sentinel_output.cache_generation,
+            "V6 must not write the fourth output word"
+        );
+        // SAFETY: the admitted exclusive transaction keeps the returned
+        // descriptor live until the deopt below ends synchronous native use.
+        let descriptor = unsafe {
+            &*std::ptr::with_exposed_provenance::<fre_aot_regex::DynamicNativeRowsV1>(
+                returned.native_rows_address,
+            )
+        };
+        assert_ne!(descriptor.cache_identity, 0);
+        assert_ne!(descriptor.rows_address, 0);
+        assert_ne!(descriptor.class_map_address, 0);
+
+        result = sentinel_result;
+        assert_eq!(
+            call_exclusive_dynamic_rows_deopt(handle, &haystack, 8, 72, &mut result),
+            STATUS_MATCH
+        );
+        let mut wrong_identity = identity;
+        wrong_identity[0] ^= 1;
+        result = sentinel_result;
+        output = sentinel_output;
+        let returned = call_exclusive_compiler_private_dynamic_rows_preflight_v6(
+            handle,
+            &haystack,
+            8,
+            72,
+            &mut result,
+            &wrong_identity,
+            &mut output,
+        );
+        assert_eq!(
+            returned.status,
+            usize::try_from(STATUS_RUNTIME_FAILURE).unwrap()
+        );
+        assert_eq!(returned.native_rows_address, 0);
+        assert_eq!(result, sentinel_result);
+        assert_eq!(output, sentinel_output);
+        // SAFETY: the failed identity admitted no transaction and this test
+        // uniquely owns the still-live handle.
+        assert_eq!(
+            unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(handle) },
+            STATUS_SUCCESS
+        );
     }
 
     #[test]

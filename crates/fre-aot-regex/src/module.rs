@@ -930,7 +930,7 @@ const PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME: &str =
 const PREPARED_PREFLIGHT_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_search_exclusive_partial_preflight_v1";
 const DYNAMIC_ROWS_PREFLIGHT_RUNTIME_SYMBOL_NAME: &str =
-    "fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v5";
+    "fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v6";
 const DYNAMIC_ROWS_DEOPT_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_search_exclusive_dynamic_rows_deopt_v1";
 const DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL_NAME: &str =
@@ -14955,6 +14955,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         }
     };
     let preflight_enter = assembler.label()?;
+    let trusted_descriptor_enter = assembler.label()?;
     let try_v7 = assembler.label()?;
     let try_v6 = assembler.label()?;
     let try_v14 = pair_supertransition_possible
@@ -15300,7 +15301,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         x86_emit_frozen_dynamic_entry(
             &mut assembler,
             call_preflight,
-            preflight_enter,
+            trusted_descriptor_enter,
             root_plan.is_some(),
         )?;
     }
@@ -17073,17 +17074,23 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     // the ordinary helper-argument slots. Cold deopt reloads the private
     // window directly, while first-hole continuation captures it in argument
     // registers before reusing the output record as its payload.
-    // V5's compiler-private preflight constructs and authenticates the
-    // descriptor and its cache lineage for this synchronous scan. Retain only
+    // V6's compiler-private preflight constructs and authenticates the
+    // descriptor and its cache lineage for this synchronous scan, returning
+    // it beside status in RDX. Retain only
     // the invocation-specific learned-loop policy here; rechecking the
     // canonical cell, address, geometry, stride, initial row, or duplicated
     // cache identity would repeat the runtime transaction on every search.
     // A first-hole continuation reloads the identity from this same trusted
-    // descriptor before calling the mutating runtime helper. V5 therefore
-    // leaves the fourth output word untouched on the common successful entry.
-    // R11 retains the descriptor while the shared scanner helpers use RAX for
-    // constants, remaining lengths, and candidate masks.
-    assembler.instruction(&[0x4c, 0x8b, 0x5c, 0x24, 0x50])?; // descriptor
+    // descriptor before calling the mutating runtime helper. V6 therefore
+    // writes only the two admitted-window words on the common successful
+    // entry. R11 takes the descriptor directly from the aggregate return
+    // register while the shared scanner helpers use RAX for constants,
+    // remaining lengths, and candidate masks.
+    assembler.instruction(&[0x49, 0x89, 0xd3])?; // descriptor: rdx -> r11
+    // A locally authenticated legacy V2 header already retained its trusted
+    // descriptor in R11 and enters immediately after the V6-only register
+    // transfer above.
+    assembler.bind(trusted_descriptor_enter)?;
     assembler.instruction(&[0x49, 0x8b, 0x33])?; // rows
     assembler.instruction(&[0x4d, 0x8b, 0x4b, NATIVE_ROWS_CLASS_MAP_ADDRESS as u8])?;
     if root_plan.is_some() {
@@ -17136,7 +17143,10 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         assembler.instruction(&[0x4e, 0x8d, 0x04, 0x86])?;
         if output != OutputContract::Exists {
             // A non-nullable admitted descriptor has no pending endpoint yet.
-            // R11's descriptor lifetime ended when the pointer row was formed.
+            // Preserve it in caller-saved RAX through the pointer loop before
+            // R11 becomes the latest accepting endpoint. RSI must retain the
+            // rows base used by every native transition.
+            assembler.instruction(&[0x4c, 0x89, 0xd8])?; // descriptor: r11 -> rax
             assembler.instruction(&[0x45, 0x31, 0xdb])?; // xor r11d,r11d
         }
         assembler.branch(&[0xe9], pointer_scan)?;
@@ -17514,6 +17524,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         assembler.bind(pointer_continue)?;
         // Continuation's private ABI names the zero-based cell-row offset, not
         // a process pointer. Convert only on the cold unpublished-cell edge.
+        // RSI remains the rows base in both endpoint and Exists loops.
         assembler.instruction(&[0x49, 0x29, 0xf0])?; // current -= rows
         assembler.instruction(&[0x49, 0xc1, 0xe8, 0x02])?; // bytes -> cells
         assembler.branch(&[0xe9], v2_continue)?;
@@ -17762,10 +17773,20 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     if let Some(native_continue) = native_continue {
         assembler.bind(native_continue)?;
         assembler.instruction(&[0x4c, 0x8b, 0x54, 0x24, 0x10])?;
-        let mut load_seal = vec![0x49, 0xbb];
-        load_seal.extend_from_slice(&FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL.to_le_bytes());
-        assembler.instruction(&load_seal)?;
-        assembler.instruction(&[0x4d, 0x3b, 0x1a])?;
+        if register_last_accept {
+            // RAX retains the descriptor, so use R11 for the seal check.
+            let mut load_seal = vec![0x49, 0xbb];
+            load_seal.extend_from_slice(&FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL.to_le_bytes());
+            assembler.instruction(&load_seal)?;
+            assembler.instruction(&[0x4d, 0x3b, 0x1a])?;
+        } else {
+            // R11 retains the descriptor for the cold identity load below;
+            // use otherwise-dead RAX for the seal check.
+            let mut load_seal = vec![0x48, 0xb8];
+            load_seal.extend_from_slice(&FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL.to_le_bytes());
+            assembler.instruction(&load_seal)?;
+            assembler.instruction(&[0x49, 0x3b, 0x02])?;
+        }
         assembler.branch(&[0x0f, 0x84], framed_fallback)?;
         if filter_kind.is_some_and(X86StartFilterKind::needs_vzeroupper) {
             assembler.instruction(&[0xc5, 0xf8, 0x77])?;
@@ -17776,16 +17797,16 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         // by payload construction below.
         assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x40])?; // exact start
         assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x48])?; // exact end
-        // Reload the cold identity from the trusted descriptor, then preserve
-        // the exact row and unread byte.
-        assembler.instruction(&[0x4c, 0x8b, 0x5c, 0x24, 0x50])?; // descriptor
-        assembler.instruction(&[
-            0x4d,
-            0x8b,
-            0x5b,
-            u8::try_from(NATIVE_ROWS_CACHE_IDENTITY)
-                .map_err(|_| ObjectError::ArithmeticOverflow("x86 dynamic cache identity"))?,
-        ])?;
+        // Reload the cold identity from the trusted descriptor retained
+        // directly from V6's second return register, then preserve the exact
+        // row and unread byte.
+        let cache_identity_offset = u8::try_from(NATIVE_ROWS_CACHE_IDENTITY)
+            .map_err(|_| ObjectError::ArithmeticOverflow("x86 dynamic cache identity"))?;
+        if register_last_accept {
+            assembler.instruction(&[0x4c, 0x8b, 0x58, cache_identity_offset])?;
+        } else {
+            assembler.instruction(&[0x4d, 0x8b, 0x5b, cache_identity_offset])?;
+        }
         assembler.instruction(&[0x4c, 0x89, 0x44, 0x24, 0x40])?; // current row
         assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x48])?; // unread position
         if tracks_root_scanner_hits {
@@ -25886,6 +25907,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         Ok::<(), ObjectError>(())
     };
     let preflight_enter = assembler.label()?;
+    let trusted_descriptor_enter = assembler.label()?;
     let try_v7 = assembler.label()?;
     let try_v6 = assembler.label()?;
     let try_v14 = pair_supertransition_possible
@@ -26220,7 +26242,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         aarch64_emit_frozen_dynamic_entry(
             &mut assembler,
             call_preflight,
-            preflight_enter,
+            trusted_descriptor_enter,
             root_plan.is_some(),
         )?;
     }
@@ -27977,19 +27999,25 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     // the ordinary helper-argument slots. Cold deopt reloads the private
     // window directly, while first-hole continuation captures it in X3/X4
     // before reusing the output record as its payload.
-    // V5's compiler-private preflight constructs and authenticates the
-    // descriptor and its cache lineage for this synchronous scan. Retain only
+    // V6's compiler-private preflight constructs and authenticates the
+    // descriptor and its cache lineage for this synchronous scan, returning
+    // it beside status in X1. Retain only
     // the invocation-specific learned-loop policy here; rechecking the
     // canonical cell, address, geometry, stride, initial row, or duplicated
     // cache identity would repeat the runtime transaction on every search.
     // A first-hole continuation reloads the identity from this same trusted
-    // descriptor before calling the mutating runtime helper. V5 therefore
-    // leaves the fourth output word untouched on the common successful entry.
+    // descriptor before calling the mutating runtime helper. V6 therefore
+    // writes only the two admitted-window words on the common successful
+    // entry.
     // Caller-saved registers remain disjoint across the root scanners:
     // X13 descriptor, X14/X15 map/rows, X11 current row, X1 initial row,
     // X2/X3 position/end, and X4/X7/X8/X9/X10/X12 scratch. X11/X1 are cell
     // offsets for the overlay representation and pointers for zero-overlay.
-    assembler.instruction(aarch64_load_x_imm(13, 31, 64)?)?; // descriptor
+    assembler.instruction(aarch64_mov_x(13, 1)?)?; // descriptor: x1 -> x13
+    // A locally authenticated legacy V2 header already retained its trusted
+    // descriptor in X13 and enters immediately after the V6-only register
+    // transfer above.
+    assembler.bind(trusted_descriptor_enter)?;
     assembler.instruction(aarch64_load_x_imm(
         15,
         13,
@@ -28768,12 +28796,12 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         // compiler-private continuation record. Payload construction below
         // leaves X3/X4 untouched.
         assembler.instruction(aarch64_load_pair_x(3, 4, 31, 48)?)?;
-        // Reload the cold identity from the trusted descriptor before
-        // preserving the exact scalar frontier.
-        assembler.instruction(aarch64_load_x_imm(9, 31, 64)?)?; // descriptor
+        // Reload the cold identity from the trusted descriptor retained
+        // directly from V6's second return register before preserving the
+        // exact scalar frontier.
         assembler.instruction(aarch64_load_x_imm(
             9,
-            9,
+            13,
             u16::try_from(NATIVE_ROWS_CACHE_IDENTITY)
                 .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic cache identity"))?,
         )?)?;
@@ -35249,7 +35277,13 @@ mod tests {
         clippy::too_many_lines,
         reason = "the cross-ISA V2 contract audit keeps trusted entry shape and exact hot-loop encodings together"
     )]
-    fn dynamic_v5_preflight_elides_redundant_guards_before_both_immediate_hot_loops() {
+    fn dynamic_v6_preflight_elides_redundant_guards_before_both_immediate_hot_loops() {
+        fn occurrences(code: &[u8], needle: &[u8]) -> usize {
+            code.windows(needle.len())
+                .filter(|window| *window == needle)
+                .count()
+        }
+
         assert_eq!(aarch64_cmn_w_imm(8, 1).unwrap(), 0x3100_051f);
         assert_eq!(aarch64_and_low_w(8, 8, 29).unwrap(), 0x1200_7108);
         assert!(aarch64_cmn_w_imm(8, 0x1000).is_err());
@@ -35280,9 +35314,21 @@ mod tests {
                     .any(|bytes| bytes == redundant_window_copy),
                 "x86 {output:?} recopied its already-private V2 window"
             );
+            let x86_entry_prefix = [
+                0x49,
+                0x89,
+                0xd3, // descriptor: rdx -> r11
+                0x49,
+                0x8b,
+                0x33, // rows
+                0x4d,
+                0x8b,
+                0x4b,
+                u8::try_from(NATIVE_ROWS_CLASS_MAP_ADDRESS).unwrap(),
+            ];
             let x86_entry = x86
-                .windows(5)
-                .position(|bytes| bytes == [0x4c, 0x8b, 0x5c, 0x24, 0x50])
+                .windows(x86_entry_prefix.len())
+                .position(|bytes| bytes == x86_entry_prefix)
                 .expect("x86 mutable descriptor entry");
             let x86_table_prefix = [
                 0x44, 0x0f, 0xb6, 0x14, 0x17, // byte
@@ -35297,23 +35343,43 @@ mod tests {
             assert!(x86_entry < x86_table, "{output:?}");
             let trusted_entry = &x86[x86_entry..x86_table];
             assert_eq!(
-                &trusted_entry[..12],
-                &[
-                    0x4c,
-                    0x8b,
-                    0x5c,
-                    0x24,
-                    0x50,
-                    0x49,
-                    0x8b,
-                    0x33,
-                    0x4d,
-                    0x8b,
-                    0x4b,
-                    u8::try_from(NATIVE_ROWS_CLASS_MAP_ADDRESS).unwrap(),
-                ],
-                "x86 {output:?} must consume the trusted V2 descriptor directly"
+                &trusted_entry[..x86_entry_prefix.len()],
+                &x86_entry_prefix,
+                "x86 {output:?} must consume V6's RDX descriptor directly"
             );
+            assert!(!trusted_entry
+                .windows(5)
+                .any(|bytes| bytes == [0x4c, 0x8b, 0x5c, 0x24, 0x50]));
+            let cache_identity_offset = u8::try_from(NATIVE_ROWS_CACHE_IDENTITY).unwrap();
+            let retained_descriptor_to_rax = [0x4c, 0x89, 0xd8];
+            let identity_from_rax = [0x4c, 0x8b, 0x58, cache_identity_offset];
+            let identity_from_r11 = [0x4d, 0x8b, 0x5b, cache_identity_offset];
+            let mut continuation_seal_in_rax = vec![0x48, 0xb8];
+            continuation_seal_in_rax
+                .extend_from_slice(&FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL.to_le_bytes());
+            continuation_seal_in_rax.extend_from_slice(&[0x49, 0x3b, 0x02]);
+            let mut continuation_seal_in_r11 = vec![0x49, 0xbb];
+            continuation_seal_in_r11
+                .extend_from_slice(&FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL.to_le_bytes());
+            continuation_seal_in_r11.extend_from_slice(&[0x4d, 0x3b, 0x1a]);
+            if output == OutputContract::Exists {
+                assert!(!trusted_entry
+                    .windows(retained_descriptor_to_rax.len())
+                    .any(|bytes| bytes == retained_descriptor_to_rax));
+                assert_eq!(occurrences(&x86[x86_table..], &identity_from_rax), 0);
+                assert_eq!(occurrences(&x86[x86_table..], &identity_from_r11), 1);
+                assert_eq!(
+                    occurrences(&x86[x86_table..], &continuation_seal_in_rax),
+                    1
+                );
+            } else {
+                assert!(trusted_entry
+                    .windows(retained_descriptor_to_rax.len())
+                    .any(|bytes| bytes == retained_descriptor_to_rax));
+                assert_eq!(occurrences(&x86[x86_table..], &identity_from_rax), 1);
+                assert_eq!(occurrences(&x86[x86_table..], &identity_from_r11), 0);
+                assert!(occurrences(&x86[x86_table..], &continuation_seal_in_r11) >= 1);
+            }
             for (field, expected) in [
                 (
                     NATIVE_ROWS_UNFILLED_CELL,
@@ -35462,7 +35528,7 @@ mod tests {
             );
             let arm_entry = words
                 .iter()
-                .position(|&word| word == aarch64_load_x_imm(13, 31, 64).unwrap())
+                .position(|&word| word == aarch64_mov_x(13, 1).unwrap())
                 .expect("AArch64 trusted mutable descriptor entry");
             let arm_table_prefix = [
                 aarch64_load_byte_reg(8, 0, 2).unwrap(),
@@ -35479,7 +35545,7 @@ mod tests {
             assert_eq!(
                 &trusted_entry[..2],
                 &[
-                    aarch64_load_x_imm(13, 31, 64).unwrap(),
+                    aarch64_mov_x(13, 1).unwrap(),
                     aarch64_load_pair_x(
                         15,
                         14,
@@ -35488,8 +35554,9 @@ mod tests {
                     )
                     .unwrap(),
                 ],
-                "AArch64 {output:?} must consume the trusted V2 descriptor directly"
+                "AArch64 {output:?} must consume V6's X1 descriptor directly"
             );
+            assert!(!trusted_entry.contains(&aarch64_load_x_imm(13, 31, 64).unwrap()));
             for removed in [
                 aarch64_cmp_x_imm(13, 0).unwrap(),
                 aarch64_load_x_imm(10, 31, 72).unwrap(),
@@ -38023,11 +38090,12 @@ mod tests {
                         | "fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v2"
                         | "fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v3"
                         | "fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v4"
+                        | "fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v5"
                 )
             }));
             assert_eq!(
                 module.symbols()[PREPARED_PREFLIGHT_RUNTIME_SYMBOL].name,
-                "fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v5",
+                "fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v6",
                 "{target:?}"
             );
             let preflights = module
@@ -38122,6 +38190,37 @@ mod tests {
                         ),
                         "generated x86 private arguments: {target:?}"
                     );
+                    let call_return = local_preflight + 4;
+                    assert_eq!(
+                        code.get(call_return..call_return + 5),
+                        Some(
+                            [
+                                0x83,
+                                0xf8,
+                                PARTIAL_PREFLIGHT_ENTER_STATUS,
+                                0x0f,
+                                0x84,
+                            ]
+                            .as_slice()
+                        ),
+                        "x86 V6 status must arrive in RAX: {target:?}"
+                    );
+                    let branch_displacement = i32::from_le_bytes(
+                        code[call_return + 5..call_return + 9]
+                            .try_into()
+                            .unwrap(),
+                    );
+                    let branch_end = call_return + 9;
+                    let enter = usize::try_from(
+                        isize::try_from(branch_end).unwrap()
+                            + isize::try_from(branch_displacement).unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        code.get(enter..enter + 3),
+                        Some([0x49, 0x89, 0xd3].as_slice()),
+                        "x86 V6 descriptor must move directly from RDX to R11: {target:?}"
+                    );
                 }
                 Architecture::Aarch64 => {
                     assert_eq!(local_preflight % 4, 0, "{target:?}");
@@ -38164,6 +38263,33 @@ mod tests {
                         words[preflight_word - 1],
                         aarch64_add_x_imm(7, 31, 48).unwrap(),
                         "aligned generated private record: {target:?}"
+                    );
+                    assert_eq!(
+                        words[preflight_word + 1],
+                        aarch64_cmp_w_imm(
+                            0,
+                            u16::from(PARTIAL_PREFLIGHT_ENTER_STATUS)
+                        )
+                        .unwrap(),
+                        "AArch64 V6 status must arrive in X0: {target:?}"
+                    );
+                    let enter_branch = words[preflight_word + 2];
+                    assert_eq!(
+                        enter_branch & 0xff00_001f,
+                        0x5400_0000 | u32::from(AARCH64_EQ),
+                        "AArch64 V6 enter branch: {target:?}"
+                    );
+                    let immediate = i32::try_from((enter_branch >> 5) & 0x7ffff).unwrap();
+                    let signed_immediate = (immediate << 13) >> 13;
+                    let enter_word = usize::try_from(
+                        isize::try_from(preflight_word + 2).unwrap()
+                            + isize::try_from(signed_immediate).unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        words[enter_word],
+                        aarch64_mov_x(13, 1).unwrap(),
+                        "AArch64 V6 descriptor must move directly from X1 to X13: {target:?}"
                     );
                 }
             }
@@ -39882,6 +40008,7 @@ typedef struct {{
 typedef struct {{
   size_t start; size_t end; size_t native_rows_address; uint64_t cache_generation;
 }} preflight_t;
+typedef struct {{ size_t status; size_t native_rows_address; }} preflight_result_v6_t;
 typedef struct {{
   size_t current_row; size_t resume_position; size_t pending_valid;
   size_t pending_end; uint64_t cache_identity;
@@ -39975,15 +40102,15 @@ uint32_t fre_aot_regex_runtime_search_exclusive_dynamic_rows_continue_v1(handle_
   if(d==NULL||c==NULL||memcmp(d,identity,32)!=0)return 86;
   return fre_aot_regex_runtime_search_exclusive_dynamic_rows_deopt_v1(h,p,n,s,e,r);
 }}
-uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v5(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*d,preflight_t*out) {{
+preflight_result_v6_t fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v6(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*d,preflight_t*out) {{
   preflight_calls++;
-  if(h==NULL)return 5;
-  if(h!=(handle_t)&frozen)return 90;
+  if(h==NULL)return (preflight_result_v6_t){{5,0}};
+  if(h!=(handle_t)&frozen)return (preflight_result_v6_t){{90,0}};
   frozen.v1.active_seal=0;
-  if(p!=haystack||n!=sizeof(haystack)||s!=5||e!=69||d==NULL||out==NULL||memcmp(d,identity,32)!=0)return 88;
-  if(mode==2){{r->start=321;r->end=654;return 76;}}
-  out->start=(mode==5)?s+1U:s;out->end=(mode==5)?e-1U:e;out->native_rows_address=(size_t)(uintptr_t)&rows;
-  return 6;
+  if(p!=haystack||n!=sizeof(haystack)||s!=5||e!=69||d==NULL||out==NULL||memcmp(d,identity,32)!=0)return (preflight_result_v6_t){{88,0}};
+  if(mode==2){{r->start=321;r->end=654;return (preflight_result_v6_t){{76,0}};}}
+  out->start=(mode==5)?s+1U:s;out->end=(mode==5)?e-1U:e;
+  return (preflight_result_v6_t){{6,(size_t)(uintptr_t)&rows}};
 }}
 static int run_direct(uint32_t stride,size_t states,int matching,const unsigned char*p,size_t n,size_t s,size_t e,int base) {{
   init_frozen(stride,states,matching);mode=20;
@@ -40098,7 +40225,7 @@ int main(void) {{
   if(status!=0||r.start!=0||r.end!=0||fallback_calls!=0||deopt_calls!=0||preflight_calls!=1)return 13;
   mode=5;cells[0]=UINT32_MAX;r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)&frozen,haystack,sizeof(haystack),5,69,&r);
   if(status!=77||r.start!=123||r.end!=456||fallback_calls!=0||deopt_calls!=1||preflight_calls!=1)return 14;
-  /* V5 producer invariants are trusted here; only invocation-specific
+  /* V6 producer invariants are trusted here; only invocation-specific
      policy remains a generated-code check. */
   init_rows();mode=8;cells[0]=2;cells[1]=2;r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)&frozen,haystack,sizeof(haystack),5,69,&r);
   if(status!=0||r.start!=0||r.end!=0||fallback_calls!=0||deopt_calls!=0||preflight_calls!=1)return 18;
@@ -40128,22 +40255,22 @@ int main(void) {{
 "##,
         );
         if output == OutputContract::Exists && !fragmented_exact_root {
+            const V6_PREFLIGHT: &str =
+                "fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v6";
             const V5_PREFLIGHT: &str =
                 "fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v5";
-            const V4_PREFLIGHT: &str =
-                "fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v4";
-            let legacy_source = source.replacen(V5_PREFLIGHT, V4_PREFLIGHT, 1);
+            let legacy_source = source.replacen(V6_PREFLIGHT, V5_PREFLIGHT, 1);
             assert_ne!(
                 legacy_source, source,
-                "the V5 linker fixture did not contain its capability symbol"
+                "the V6 linker fixture did not contain its capability symbol"
             );
             assert!(
-                !legacy_source.contains(V5_PREFLIGHT),
-                "the legacy linker fixture still exposes the V5 capability symbol"
+                !legacy_source.contains(V6_PREFLIGHT),
+                "the legacy linker fixture still exposes the V6 capability symbol"
             );
-            let legacy_c_path = directory.join("dynamic-v4-runtime.c");
-            let legacy_executable = directory.join("dynamic-v4-runtime");
-            fs::write(&legacy_c_path, legacy_source).expect("write V4-only dynamic runtime");
+            let legacy_c_path = directory.join("dynamic-v5-runtime.c");
+            let legacy_executable = directory.join("dynamic-v5-runtime");
+            fs::write(&legacy_c_path, legacy_source).expect("write V5-only dynamic runtime");
             let c_compiler = if cfg!(target_os = "macos") {
                 "clang"
             } else {
@@ -40156,10 +40283,10 @@ int main(void) {{
                 .arg("-o")
                 .arg(&legacy_executable)
                 .output()
-                .expect("invoke host C compiler for V4-only runtime");
+                .expect("invoke host C compiler for V5-only runtime");
             assert!(
                 !legacy.status.success(),
-                "a generated V5 object linked against a runtime exposing only the V4 preflight: {}",
+                "a generated V6 object linked against a runtime exposing only the V5 preflight: {}",
                 String::from_utf8_lossy(&legacy.stderr)
             );
         }
@@ -42047,6 +42174,7 @@ typedef struct {{
 }} frozen_v4_tail_t;
 typedef struct {{ frozen_v1_t v1; frozen_v4_tail_t v4; }} frozen_v4_t;
 typedef struct {{ size_t start; size_t end; size_t rows; uint64_t generation; }} preflight_t;
+typedef struct {{ size_t status; size_t native_rows_address; }} preflight_result_v6_t;
 typedef struct {{ size_t row; size_t position; size_t pending; size_t end; uint64_t generation; }} continuation_t;
 _Static_assert(sizeof(frozen_v1_t)=={v1_bytes}U,"V1 extent");
 _Static_assert(offsetof(frozen_v4_t,v4)=={tail_offset}U,"V4 tail offset");
@@ -42058,7 +42186,7 @@ static frozen_v4_t frozen;
 static unsigned helper_calls;
 uint32_t fre_aot_regex_runtime_search_v1(const unsigned char*a,const unsigned char*b,size_t n,size_t s,size_t e,result_t*r){{(void)a;(void)b;(void)n;(void)s;(void)e;(void)r;helper_calls++;return 97U;}}
 uint32_t fre_aot_regex_runtime_search_exclusive_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;helper_calls++;return 97U;}}
-uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v5(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,preflight_t*o){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;(void)i;(void)o;helper_calls++;return 97U;}}
+preflight_result_v6_t fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v6(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,preflight_t*o){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;(void)i;(void)o;helper_calls++;return (preflight_result_v6_t){{97U,0U}};}}
 uint32_t fre_aot_regex_runtime_search_exclusive_dynamic_rows_deopt_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;helper_calls++;return 97U;}}
 uint32_t fre_aot_regex_runtime_search_exclusive_dynamic_rows_continue_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,const continuation_t*c){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;(void)i;(void)c;helper_calls++;return 97U;}}
 size_t fre_aot_regex_runtime_scan_frozen_loop_v2(const unsigned char*p,const void*s,size_t n){{(void)p;(void)s;(void)n;helper_calls++;return 0U;}}
