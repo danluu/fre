@@ -5737,6 +5737,12 @@ impl K0ResumeSet {
         self.automaton_identity == automaton.identity()
     }
 
+    /// Return the authenticated pending-end mode for one ordered frontier.
+    #[doc(hidden)]
+    pub fn pending_mode(&self, state: usize) -> Result<bool, SearchError> {
+        self.frontier(state).map(|(_, pending)| pending)
+    }
+
     fn frontier(&self, state: usize) -> Result<(&[u32], bool), SearchError> {
         let offset = *self
             .offsets

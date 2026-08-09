@@ -49,6 +49,11 @@
 //! fully authenticating
 //! [`fre_aot_regex_runtime_search_exclusive_from_partial_v1`] remains available
 //! for older generated objects.
+//! A resource-bounded slow compiler can keep a larger transient native prefix
+//! outside the stable program format. Its V2 static-prefix preflight binds the
+//! emitted exact frontier descriptor once; a native hole then consumes the
+//! synchronous ticket through the compact static-prefix continuation without
+//! replaying completed rows. Older V1 static-prefix objects remain supported.
 //! A variable-width Span table that completes locally with only its selected
 //! endpoint uses
 //! [`fre_aot_regex_runtime_search_exclusive_recover_partial_span_v1`] to
@@ -74,7 +79,8 @@ use fre_aot_regex::{
     CompileError, CompiledProgram, FrozenCompactLoopScanner, FrozenDynamicRowsStorageV3,
     FrozenPreparedHeaderV6, FullyPrefilledFallbackReceipt, MatchResult, OutputContract,
     PROGRAM_HEADER_LEN, ProgramFormatError, ProgramWorkspace, RetainedPartialPreflight,
-    SearchWindow,
+    STATIC_PREFIX_RESUME_DESCRIPTOR_V1_HEADER_BYTES,
+    STATIC_PREFIX_RESUME_DESCRIPTOR_V1_MAX_BYTES, SearchWindow,
 };
 #[cfg(test)]
 use fre_aot_regex::{FrozenPreparedHeaderV2, FrozenPreparedHeaderV3};
@@ -743,6 +749,61 @@ impl PreparedAotRegex {
                     selected_end,
                 )
         }
+    }
+
+    fn preflight_static_prefix_resume(
+        &mut self,
+        haystack: &[u8],
+        window: SearchWindow,
+        expected_artifact_identity: [u8; ARTIFACT_IDENTITY_BYTES],
+        descriptor_binding: usize,
+        descriptor: &[u32],
+    ) -> Result<(), CompileError> {
+        self.deactivate_frozen_header();
+        self.program.preflight_static_prefix_resume_with_workspace(
+            haystack,
+            window,
+            &mut self.workspace,
+            expected_artifact_identity,
+            descriptor_binding,
+            descriptor,
+        )
+    }
+
+    fn search_from_static_prefix_resume_ticket(
+        &mut self,
+        haystack: &[u8],
+        resume_state: usize,
+        resume_position: usize,
+        pending_end: usize,
+    ) -> Result<MatchResult, CompileError> {
+        self.deactivate_frozen_header();
+        self.program
+            .search_from_static_prefix_resume_ticket_with_workspace(
+                haystack,
+                &mut self.workspace,
+                resume_state,
+                resume_position,
+                pending_end,
+            )
+    }
+
+    fn recover_bound_static_prefix_span_from_selected_end(
+        &mut self,
+        haystack: &[u8],
+        window: SearchWindow,
+        expected_artifact_identity: [u8; ARTIFACT_IDENTITY_BYTES],
+        selected_end: usize,
+    ) -> Result<MatchResult, CompileError> {
+        self.deactivate_frozen_header();
+        self.program
+            .recover_bound_static_prefix_span_from_selected_end_with_workspace(
+                haystack,
+                window,
+                &mut self.workspace,
+                expected_artifact_identity,
+                selected_end,
+            )
     }
 
     fn preflight_retained_partial_native_root(
@@ -1668,6 +1729,162 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_compiler_private_search_exclusive
     .unwrap_or(STATUS_RUNTIME_FAILURE)
 }
 
+/// Bind an exact compiler-owned static-prefix frontier descriptor and admit
+/// one synchronous native search window.
+///
+/// Unlike V1, this preflight retains the transient frontiers that correspond
+/// to every native hole. The first call graph-binds that immutable descriptor
+/// to the prepared K0 program; later calls reuse the bound resume set and only
+/// refresh a single-use haystack/window ticket. Generated code must consume
+/// that ticket through either the matching continuation or Span postflight.
+///
+/// This private object/runtime seam is intentionally absent from the public C
+/// header. The descriptor is object data, not stable serialized-program data.
+///
+/// # Safety
+///
+/// The handle, haystack, result, and identity requirements are identical to
+/// [`fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_preflight_v1`].
+/// `descriptor_ptr` must be aligned for `u32` and address a readable canonical
+/// V1 descriptor whose fixed header declares its complete readable extent.
+/// That extent must not overlap writable result storage and must remain live
+/// for the lifetime of the prepared handle because its address is the private
+/// binding capability.
+#[doc(hidden)]
+#[unsafe(no_mangle)]
+#[allow(
+    unsafe_code,
+    clippy::too_many_arguments,
+    reason = "the compiler-private static-prefix boundary binds generated object data and an exact call"
+)]
+pub unsafe extern "C" fn fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_preflight_v2(
+    handle: FreAotRegexExclusiveHandleV1,
+    haystack_ptr: *const u8,
+    haystack_len: usize,
+    window_start: usize,
+    window_end: usize,
+    result_ptr: *mut FreAotRegexResultV1,
+    expected_artifact_identity_ptr: *const u8,
+    descriptor_ptr: *const u32,
+) -> u32 {
+    const HEADER_WORDS: usize =
+        STATIC_PREFIX_RESUME_DESCRIPTOR_V1_HEADER_BYTES / std::mem::size_of::<u32>();
+
+    if handle.is_invalid() {
+        return STATUS_INVALID_HANDLE;
+    }
+    if haystack_ptr.is_null()
+        || result_ptr.is_null()
+        || !result_ptr.is_aligned()
+        || expected_artifact_identity_ptr.is_null()
+        || descriptor_ptr.is_null()
+        || !descriptor_ptr.is_aligned()
+        || haystack_len > isize::MAX.unsigned_abs()
+        || window_start > window_end
+        || window_end > haystack_len
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+
+    // SAFETY: the caller supplies the live exclusive owner and every extent
+    // documented above. The bounded fixed-header read precedes construction
+    // of the complete descriptor slice, whose declared size is capped before
+    // that slice is formed.
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        let header = std::slice::from_raw_parts(descriptor_ptr, HEADER_WORDS);
+        let Ok(total_words) = usize::try_from(header[2]) else {
+            return STATUS_RUNTIME_FAILURE;
+        };
+        let Some(total_bytes) = total_words.checked_mul(std::mem::size_of::<u32>()) else {
+            return STATUS_RUNTIME_FAILURE;
+        };
+        if total_words < HEADER_WORDS
+            || total_bytes > STATIC_PREFIX_RESUME_DESCRIPTOR_V1_MAX_BYTES
+        {
+            return STATUS_RUNTIME_FAILURE;
+        }
+        let descriptor = std::slice::from_raw_parts(descriptor_ptr, total_words);
+        let haystack = std::slice::from_raw_parts(haystack_ptr, haystack_len);
+        let expected_artifact_identity = expected_artifact_identity_ptr
+            .cast::<[u8; ARTIFACT_IDENTITY_BYTES]>()
+            .read();
+        let prepared = &mut *handle.0.cast::<PreparedAotRegex>();
+        let Ok(()) = prepared.preflight_static_prefix_resume(
+            haystack,
+            SearchWindow::new(window_start, window_end),
+            expected_artifact_identity,
+            descriptor_ptr.addr(),
+            descriptor,
+        ) else {
+            return STATUS_RUNTIME_FAILURE;
+        };
+        STATUS_PARTIAL_PREFLIGHT_ENTER
+    }))
+    .unwrap_or(STATUS_RUNTIME_FAILURE)
+}
+
+/// Continue an admitted static native prefix from its exact K0 frontier and
+/// first unconsumed byte.
+///
+/// This compact private ABI consumes the single-use ticket created by V2
+/// preflight. Pending mode is authenticated from the bound frontier set; the
+/// final word carries the pending endpoint only when that mode is active.
+///
+/// # Safety
+///
+/// The handle, haystack, and result requirements are identical to
+/// [`fre_aot_regex_runtime_search_exclusive_v1`]. The caller must be the
+/// generated native entry that received [`STATUS_PARTIAL_PREFLIGHT_ENTER`]
+/// from V2 preflight for this exact haystack and must pass a state, position,
+/// and pending endpoint emitted by that native prefix.
+#[doc(hidden)]
+#[unsafe(no_mangle)]
+#[allow(
+    unsafe_code,
+    clippy::too_many_arguments,
+    reason = "the compact continuation carries one exact native frontier payload"
+)]
+pub unsafe extern "C" fn fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_continue_v1(
+    handle: FreAotRegexExclusiveHandleV1,
+    haystack_ptr: *const u8,
+    haystack_len: usize,
+    result_ptr: *mut FreAotRegexResultV1,
+    resume_state: usize,
+    resume_position: usize,
+    pending_end: usize,
+) -> u32 {
+    if handle.is_invalid() {
+        return STATUS_INVALID_HANDLE;
+    }
+    if haystack_ptr.is_null()
+        || result_ptr.is_null()
+        || !result_ptr.is_aligned()
+        || haystack_len > isize::MAX.unsigned_abs()
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+
+    // SAFETY: the generated caller guarantees the exclusive owner and the
+    // readable/writable disjoint extents documented above. Program-side
+    // ticket consumption authenticates the exact haystack and resume payload.
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        let prepared = &mut *handle.0.cast::<PreparedAotRegex>();
+        let haystack = std::slice::from_raw_parts(haystack_ptr, haystack_len);
+        let Ok(found) = prepared.search_from_static_prefix_resume_ticket(
+            haystack,
+            resume_state,
+            resume_position,
+            pending_end,
+        ) else {
+            return STATUS_RUNTIME_FAILURE;
+        };
+        let (status, result) = encode_match_result(found);
+        result_ptr.write(result);
+        status
+    }))
+    .unwrap_or(STATUS_RUNTIME_FAILURE)
+}
+
 /// Recover a Span start after a compiler-owned static prefix selected its
 /// authoritative endpoint.
 ///
@@ -1726,6 +1943,75 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_compiler_private_search_exclusive
             .read();
         let Ok(MatchResult::Span(Some((start, end)))) = prepared
             .recover_static_prefix_span_from_selected_end(
+                haystack,
+                SearchWindow::new(window_start, window_end),
+                expected_artifact_identity,
+                selected_end,
+            )
+        else {
+            return STATUS_RUNTIME_FAILURE;
+        };
+        result_ptr.write(FreAotRegexResultV1 { start, end });
+        STATUS_MATCH
+    }))
+    .unwrap_or(STATUS_RUNTIME_FAILURE)
+}
+
+/// Recover a Span start from the exact frontier set bound by V2 static-prefix
+/// preflight.
+///
+/// This V2 postflight consumes the same single-use ticket as the continuation
+/// helper. It authenticates the original window and reuses the graph-bound
+/// resume set (and any setup-time full-prefill receipt) for reverse-only K0.
+///
+/// # Safety
+///
+/// The raw pointer requirements are identical to the V1 Span postflight. The
+/// generated caller must invoke this synchronously after V2 preflight and a
+/// native completion over the same exact window.
+#[doc(hidden)]
+#[unsafe(no_mangle)]
+#[allow(
+    unsafe_code,
+    clippy::too_many_arguments,
+    reason = "the V2 static-prefix postflight authenticates the admitted ticket and endpoint"
+)]
+pub unsafe extern "C" fn fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_recover_span_v2(
+    handle: FreAotRegexExclusiveHandleV1,
+    haystack_ptr: *const u8,
+    haystack_len: usize,
+    window_start: usize,
+    window_end: usize,
+    result_ptr: *mut FreAotRegexResultV1,
+    expected_artifact_identity_ptr: *const u8,
+    selected_end: usize,
+) -> u32 {
+    if handle.is_invalid() {
+        return STATUS_INVALID_HANDLE;
+    }
+    if haystack_ptr.is_null()
+        || result_ptr.is_null()
+        || !result_ptr.is_aligned()
+        || expected_artifact_identity_ptr.is_null()
+        || haystack_len > isize::MAX.unsigned_abs()
+        || window_start > window_end
+        || window_end > haystack_len
+        || selected_end <= window_start
+        || selected_end > window_end
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+
+    // SAFETY: the generated caller guarantees one live exclusive allocation
+    // and every readable/writable disjoint extent documented above.
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        let prepared = &mut *handle.0.cast::<PreparedAotRegex>();
+        let haystack = std::slice::from_raw_parts(haystack_ptr, haystack_len);
+        let expected_artifact_identity = expected_artifact_identity_ptr
+            .cast::<[u8; ARTIFACT_IDENTITY_BYTES]>()
+            .read();
+        let Ok(MatchResult::Span(Some((start, end)))) = prepared
+            .recover_bound_static_prefix_span_from_selected_end(
                 haystack,
                 SearchWindow::new(window_start, window_end),
                 expected_artifact_identity,
@@ -3513,6 +3799,31 @@ mod tests {
         }
     }
 
+    fn call_exclusive_static_prefix_preflight_v2(
+        handle: FreAotRegexExclusiveHandleV1,
+        haystack: &[u8],
+        start: usize,
+        end: usize,
+        result: &mut FreAotRegexResultV1,
+        expected_artifact_identity: &[u8; ARTIFACT_IDENTITY_BYTES],
+        descriptor: &[u32],
+    ) -> u32 {
+        // SAFETY: each test owns the live exclusive session and supplies
+        // readable haystack, identity, descriptor, and disjoint output.
+        unsafe {
+            fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_preflight_v2(
+                handle,
+                haystack.as_ptr(),
+                haystack.len(),
+                start,
+                end,
+                result,
+                expected_artifact_identity.as_ptr(),
+                descriptor.as_ptr(),
+            )
+        }
+    }
+
     fn call_exclusive_static_prefix_recover_span(
         handle: FreAotRegexExclusiveHandleV1,
         haystack: &[u8],
@@ -4101,7 +4412,10 @@ mod tests {
             "fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v5",
             "fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v6",
             "fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_preflight_v1",
+            "fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_preflight_v2",
+            "fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_continue_v1",
             "fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_recover_span_v1",
+            "fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_recover_span_v2",
             "fre_aot_regex_runtime_search_exclusive_dynamic_rows_deopt_v1",
             "fre_aot_regex_runtime_search_exclusive_dynamic_rows_continue_v1",
             "fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1",
@@ -4166,9 +4480,41 @@ mod tests {
             usize,
             *mut FreAotRegexResultV1,
             *const u8,
+            *const u32,
+        ) -> u32 =
+            fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_preflight_v2;
+        let _: unsafe extern "C" fn(
+            FreAotRegexExclusiveHandleV1,
+            *const u8,
+            usize,
+            *mut FreAotRegexResultV1,
+            usize,
+            usize,
+            usize,
+        ) -> u32 =
+            fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_continue_v1;
+        let _: unsafe extern "C" fn(
+            FreAotRegexExclusiveHandleV1,
+            *const u8,
+            usize,
+            usize,
+            usize,
+            *mut FreAotRegexResultV1,
+            *const u8,
             usize,
         ) -> u32 =
             fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_recover_span_v1;
+        let _: unsafe extern "C" fn(
+            FreAotRegexExclusiveHandleV1,
+            *const u8,
+            usize,
+            usize,
+            usize,
+            *mut FreAotRegexResultV1,
+            *const u8,
+            usize,
+        ) -> u32 =
+            fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_recover_span_v2;
         let _: unsafe extern "C" fn(
             FreAotRegexExclusiveHandleV1,
             *const u8,
@@ -6780,6 +7126,120 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
 
         // SAFETY: this test owns the unique live handle and no operation
         // overlaps destruction.
+        assert_eq!(
+            unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(handle) },
+            STATUS_SUCCESS
+        );
+    }
+
+    #[test]
+    fn static_prefix_v2_descriptor_and_ticket_boundary_fails_closed() {
+        let compiled = compile(
+            CompileRequest::new("(?:ab|ac)+z", Target::x86_64_linux())
+                .mode(CompileMode::Fast)
+                .output(OutputContract::Span),
+        )
+        .expect("compile static-prefix V2 boundary fixture");
+        let identity = compiled.receipt().program_sha256;
+        let serialized = compiled.program().serialize().expect("serialize fixture");
+        let handle = prepare_exclusive(&serialized);
+        let haystack = vec![b'x'; 128];
+        let sentinel = FreAotRegexResultV1 {
+            start: 0xfeed_face,
+            end: 0xdead_beef,
+        };
+        let mut result = sentinel;
+
+        let truncated = [0_u32; STATIC_PREFIX_RESUME_DESCRIPTOR_V1_HEADER_BYTES / 4];
+        assert_eq!(
+            call_exclusive_static_prefix_preflight_v2(
+                handle,
+                &haystack,
+                0,
+                haystack.len(),
+                &mut result,
+                &identity,
+                &truncated,
+            ),
+            STATUS_RUNTIME_FAILURE
+        );
+        assert_eq!(result, sentinel);
+        assert!(exclusive_frozen_header_is_active(handle));
+
+        let mut oversized = truncated;
+        oversized[2] = u32::try_from(
+            STATIC_PREFIX_RESUME_DESCRIPTOR_V1_MAX_BYTES / std::mem::size_of::<u32>() + 1,
+        )
+        .unwrap();
+        assert_eq!(
+            call_exclusive_static_prefix_preflight_v2(
+                handle,
+                &haystack,
+                0,
+                haystack.len(),
+                &mut result,
+                &identity,
+                &oversized,
+            ),
+            STATUS_RUNTIME_FAILURE
+        );
+        assert_eq!(result, sentinel);
+        assert!(exclusive_frozen_header_is_active(handle));
+
+        let mut bad_magic = truncated;
+        bad_magic[2] = u32::try_from(bad_magic.len()).unwrap();
+        assert_eq!(
+            call_exclusive_static_prefix_preflight_v2(
+                handle,
+                &haystack,
+                0,
+                haystack.len(),
+                &mut result,
+                &identity,
+                &bad_magic,
+            ),
+            STATUS_RUNTIME_FAILURE
+        );
+        assert_eq!(result, sentinel);
+        assert!(!exclusive_frozen_header_is_active(handle));
+
+        // SAFETY: this test uniquely owns the live handle and all supplied
+        // extents. No successful V2 preflight exists, so both ticket consumers
+        // must reject without initializing the result.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_continue_v1(
+                    handle,
+                    haystack.as_ptr(),
+                    haystack.len(),
+                    &raw mut result,
+                    0,
+                    64,
+                    0,
+                )
+            },
+            STATUS_RUNTIME_FAILURE
+        );
+        assert_eq!(result, sentinel);
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_recover_span_v2(
+                    handle,
+                    haystack.as_ptr(),
+                    haystack.len(),
+                    0,
+                    haystack.len(),
+                    &raw mut result,
+                    identity.as_ptr(),
+                    64,
+                )
+            },
+            STATUS_RUNTIME_FAILURE
+        );
+        assert_eq!(result, sentinel);
+
+        // SAFETY: this test owns the unique live handle and no call overlaps
+        // destruction.
         assert_eq!(
             unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(handle) },
             STATUS_SUCCESS

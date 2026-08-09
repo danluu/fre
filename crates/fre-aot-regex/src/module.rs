@@ -127,7 +127,11 @@ use crate::{
         MAX_ANCHORED_PREFIX_BYTES, NativeContextProgramView,
         NativeDynamicRootRequirement, NativeDynamicRowsProgramView, NativePartialProgramView,
         NativeProgramView, NativeRetainedPrefixRequirement, NativeRetainedSuffixRequirement,
-        OutputContract, PARTIAL_DFA_MIN_INPUT_BYTES,
+        NativeSlowResumeView, OutputContract, PARTIAL_DFA_MIN_INPUT_BYTES,
+        STATIC_PREFIX_RESUME_DESCRIPTOR_V1_HEADER_BYTES,
+        STATIC_PREFIX_RESUME_DESCRIPTOR_V1_MAGIC,
+        STATIC_PREFIX_RESUME_DESCRIPTOR_V1_MAX_BYTES,
+        STATIC_PREFIX_RESUME_DESCRIPTOR_V1_STATE_BYTES,
     },
     required_literals::{MaximumConsumedDistance, RequiredInteriorCandidate, RequiredLiteralSet},
     seeded_reverse::{
@@ -923,14 +927,20 @@ const DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL: usize = 14;
 const RUNTIME_SYMBOL_NAME: &str = "fre_aot_regex_runtime_search_v1";
 const PARTIAL_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v2";
+const SLOW_PREFIX_CONTINUE_RUNTIME_SYMBOL_NAME: &str =
+    "fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_continue_v1";
+const SLOW_PREFIX_PREFLIGHT_V1_RUNTIME_SYMBOL_NAME: &str =
+    "fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_preflight_v1";
 const PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_search_exclusive_v1";
 const PREPARED_PREFLIGHT_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_search_exclusive_partial_preflight_v1";
 const SLOW_PREFIX_PREFLIGHT_RUNTIME_SYMBOL_NAME: &str =
-    "fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_preflight_v1";
-const SLOW_PREFIX_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME: &str =
+    "fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_preflight_v2";
+const SLOW_PREFIX_SPAN_RECOVERY_V1_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_recover_span_v1";
+const SLOW_PREFIX_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME: &str =
+    "fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_recover_span_v2";
 const DYNAMIC_ROWS_PREFLIGHT_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v6";
 const DYNAMIC_ROWS_DEOPT_RUNTIME_SYMBOL_NAME: &str =
@@ -1099,6 +1109,7 @@ struct PreparedNativeEntryLayout {
     span_recovery: bool,
     dynamic_rows: bool,
     slow_prefix: bool,
+    slow_prefix_resume: bool,
 }
 
 impl CompiledModule {
@@ -1129,9 +1140,9 @@ impl CompiledModule {
     /// complete forward graph that lowers directly, including retained reverse
     /// start recovery. Otherwise the compiler attempts to close an incomplete
     /// graph through the bounded K0 projection. If that complete table cannot
-    /// fit, it preserves the ordinary persistent prepared fallback instead of
-    /// publishing a raw entry that rebuilds state and replays the whole search
-    /// at every hole.
+    /// fit, it retains the already-owned exact hole frontiers in private object
+    /// data and continues K0 from the first unconsumed byte. A zero-hole late
+    /// reverse decline retains the lighter authenticated prepared postflight.
     /// This can take substantially longer than ordinary lowering.
     /// Callers re-lowering a restored or otherwise untrusted program must opt
     /// in explicitly; a serialized optimizer marker never authorizes this
@@ -1275,11 +1286,12 @@ impl CompiledModule {
                     let lowered = if uses_partial_wrapper {
                         // Run the compiler-owned prefix under an authenticated
                         // prepared entry. Local completions retain native speed;
-                        // a collapsed hole reuses the same prepared workspace
-                        // for the general whole-search fallback.
+                        // an exact hole reuses the same prepared workspace and
+                        // continues at its first unconsumed byte.
                         lower_optional_native_slow_partial_prepared_with_data_limit(
                             &program_bytes,
                             view,
+                            candidate.resume_view(),
                             program.artifact_identity(),
                             target,
                             effective_native_data_limit_bytes,
@@ -1797,7 +1809,12 @@ impl CompiledModule {
                             .map_err(|_| ObjectError::ArithmeticOverflow("partial native core size"))?,
                     });
                     symbols.push(ModuleSymbol {
-                        name: PARTIAL_RUNTIME_SYMBOL_NAME.to_owned(),
+                        name: if prepared.slow_prefix_resume {
+                            SLOW_PREFIX_CONTINUE_RUNTIME_SYMBOL_NAME
+                        } else {
+                            PARTIAL_RUNTIME_SYMBOL_NAME
+                        }
+                        .to_owned(),
                         binding: SymbolBinding::Global,
                         kind: SymbolKind::Function,
                         section: None,
@@ -1815,8 +1832,10 @@ impl CompiledModule {
                     symbols.push(ModuleSymbol {
                         name: if prepared.dynamic_rows {
                             DYNAMIC_ROWS_PREFLIGHT_RUNTIME_SYMBOL_NAME
-                        } else if prepared.slow_prefix {
+                        } else if prepared.slow_prefix_resume {
                             SLOW_PREFIX_PREFLIGHT_RUNTIME_SYMBOL_NAME
+                        } else if prepared.slow_prefix {
+                            SLOW_PREFIX_PREFLIGHT_V1_RUNTIME_SYMBOL_NAME
                         } else {
                             PREPARED_PREFLIGHT_RUNTIME_SYMBOL_NAME
                         }
@@ -1939,8 +1958,10 @@ impl CompiledModule {
                             ));
                         }
                         symbols.push(ModuleSymbol {
-                            name: if prepared.slow_prefix {
+                            name: if prepared.slow_prefix_resume {
                                 SLOW_PREFIX_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME
+                            } else if prepared.slow_prefix {
+                                SLOW_PREFIX_SPAN_RECOVERY_V1_RUNTIME_SYMBOL_NAME
                             } else {
                                 PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME
                             }
@@ -2200,6 +2221,7 @@ impl CompiledModule {
             .filter(|symbol| {
                 symbol.section.is_none()
                     && (symbol.name == PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME
+                        || symbol.name == SLOW_PREFIX_SPAN_RECOVERY_V1_RUNTIME_SYMBOL_NAME
                         || symbol.name == SLOW_PREFIX_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME)
             })
             .map(|symbol| symbol.name.as_str())
@@ -2587,6 +2609,7 @@ fn lower_native_dynamic_rows_prepared(
                 span_recovery: variable_span_recovery,
                 dynamic_rows: true,
                 slow_prefix: false,
+                slow_prefix_resume: false,
             }),
         },
     ))
@@ -2812,11 +2835,114 @@ fn lower_optional_native_slow_partial_with_data_limit(
     optional_native_lowering_outcome(outcome)
 }
 
+fn static_prefix_resume_descriptor_size(
+    resume: NativeSlowResumeView<'_>,
+) -> Result<Option<usize>, ObjectError> {
+    if u32::try_from(resume.state_count()).is_err()
+        || u32::try_from(resume.item_count()).is_err()
+    {
+        return Ok(None);
+    }
+    let state_bytes = resume
+        .state_count()
+        .checked_mul(STATIC_PREFIX_RESUME_DESCRIPTOR_V1_STATE_BYTES)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "static-prefix resume descriptor states",
+        ))?;
+    let item_bytes = resume
+        .item_count()
+        .checked_mul(core::mem::size_of::<u32>())
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "static-prefix resume descriptor items",
+        ))?;
+    let bytes = STATIC_PREFIX_RESUME_DESCRIPTOR_V1_HEADER_BYTES
+        .checked_add(state_bytes)
+        .and_then(|bytes| bytes.checked_add(item_bytes))
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "static-prefix resume descriptor extent",
+        ))?;
+    Ok((bytes <= STATIC_PREFIX_RESUME_DESCRIPTOR_V1_MAX_BYTES).then_some(bytes))
+}
+
+fn append_static_prefix_resume_descriptor(
+    destination: &mut Vec<u8>,
+    resume: NativeSlowResumeView<'_>,
+    descriptor_bytes: usize,
+) -> Result<(), ObjectError> {
+    let start = destination.len();
+    push_bytes(destination, STATIC_PREFIX_RESUME_DESCRIPTOR_V1_MAGIC)?;
+    push_bytes(
+        destination,
+        &u32::try_from(descriptor_bytes / core::mem::size_of::<u32>())
+            .map_err(|_| ObjectError::ArithmeticOverflow("static-prefix descriptor word count"))?
+            .to_le_bytes(),
+    )?;
+    push_bytes(
+        destination,
+        &u32::try_from(resume.state_count())
+            .map_err(|_| ObjectError::ArithmeticOverflow("static-prefix resume state count"))?
+            .to_le_bytes(),
+    )?;
+    push_bytes(
+        destination,
+        &u32::try_from(resume.item_count())
+            .map_err(|_| ObjectError::ArithmeticOverflow("static-prefix resume item count"))?
+            .to_le_bytes(),
+    )?;
+    push_bytes(destination, &0_u32.to_le_bytes())?;
+    push_bytes(destination, &0_u32.to_le_bytes())?;
+    push_bytes(destination, &0_u32.to_le_bytes())?;
+
+    let mut item_offset = 0usize;
+    for (frontier, pending) in resume.frontiers() {
+        if frontier.is_empty() {
+            return Err(ObjectError::InvalidModule(
+                "static-prefix resume descriptor has an empty frontier",
+            ));
+        }
+        push_bytes(
+            destination,
+            &u32::try_from(item_offset)
+                .map_err(|_| ObjectError::ArithmeticOverflow("static-prefix resume item offset"))?
+                .to_le_bytes(),
+        )?;
+        push_bytes(
+            destination,
+            &u32::try_from(frontier.len())
+                .map_err(|_| ObjectError::ArithmeticOverflow("static-prefix resume frontier length"))?
+                .to_le_bytes(),
+        )?;
+        push_bytes(destination, &u32::from(pending).to_le_bytes())?;
+        push_bytes(destination, &0_u32.to_le_bytes())?;
+        item_offset = item_offset
+            .checked_add(frontier.len())
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "static-prefix resume item cursor",
+            ))?;
+    }
+    if item_offset != resume.item_count() {
+        return Err(ObjectError::InvalidModule(
+            "static-prefix resume descriptor item count changed",
+        ));
+    }
+    for (frontier, _) in resume.frontiers() {
+        for &item in frontier {
+            push_bytes(destination, &item.to_le_bytes())?;
+        }
+    }
+    if destination.len().checked_sub(start) != Some(descriptor_bytes) {
+        return Err(ObjectError::InvalidModule(
+            "static-prefix resume descriptor length changed",
+        ));
+    }
+    Ok(())
+}
+
 /// Compose a transient, resource-bounded DFA prefix with the persistent
-/// prepared runtime. The static table is compiler-owned and immutable; it is
-/// intentionally absent from the stable serialized program. Artifact
-/// authentication precedes every native entry, while a collapsed hole replays
-/// only through the already-prepared general engine.
+/// prepared runtime. The static table and exact continuation frontiers are
+/// compiler-owned and immutable; both remain absent from the stable semantic
+/// format. Artifact authentication and one-time graph binding precede native
+/// entry, while a hole continues from its first unconsumed byte.
 #[allow(
     clippy::too_many_lines,
     reason = "serialized program, static table, authenticated prepared entry, and local native core form one transaction"
@@ -2824,17 +2950,37 @@ fn lower_optional_native_slow_partial_with_data_limit(
 fn lower_native_slow_partial_prepared_with_data_limit(
     mut program_bytes: Vec<u8>,
     view: NativeProgramView<'_>,
+    resume: Option<NativeSlowResumeView<'_>>,
     artifact_identity: [u8; 32],
     target: Target,
     max_native_data_bytes: usize,
 ) -> Result<Option<(NativeLowering, PreparedEntryLayout)>, ObjectError> {
     if !view.collapse_partial_holes || view.partial_discovered_states.is_none() {
         return Err(ObjectError::InvalidModule(
-            "static-prefix hybrid has no collapsed-hole extent",
+            "static-prefix hybrid has no prepared-prefix extent",
         ));
     }
+    let (complete_rows, discovered_states) = (
+        view.dfa.forward_cells.len() / view.dfa.class_count,
+        view.partial_discovered_states.unwrap_or(0),
+    );
+    if discovered_states.checked_sub(complete_rows)
+        != Some(resume.map_or(0, NativeSlowResumeView::state_count))
+    {
+        return Err(ObjectError::InvalidModule(
+            "static-prefix resume extent disagrees with discovered rows",
+        ));
+    }
+    let native_view = if resume.is_some() {
+        NativeProgramView {
+            collapse_partial_holes: false,
+            ..view
+        }
+    } else {
+        view
+    };
     let Some(native) = lower_native_dfa_with_entry_contract_and_data_limit(
-        view,
+        native_view,
         target,
         NativeDfaEntryContract::PreparedPartialCore,
         max_native_data_bytes,
@@ -2849,6 +2995,14 @@ fn lower_native_slow_partial_prepared_with_data_limit(
     let span_recovery = view.output == OutputContract::Span
         && view.exact_match_width.is_none()
         && !view.dfa.initial_pending;
+    let resume_descriptor_size = if let Some(resume) = resume {
+        let Some(size) = static_prefix_resume_descriptor_size(resume)? else {
+            return Ok(None);
+        };
+        Some(size)
+    } else {
+        None
+    };
 
     let serialized_program_size = program_bytes.len();
     let table_offset = serialized_program_size
@@ -2859,7 +3013,22 @@ fn lower_native_slow_partial_prepared_with_data_limit(
     let table_end = table_offset
         .checked_add(table_size)
         .ok_or(ObjectError::ArithmeticOverflow("static-prefix table extent"))?;
-    let identity_offset = table_end
+    let resume_offset = if resume_descriptor_size.is_some() {
+        table_end
+            .checked_add(15)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "static-prefix resume descriptor alignment",
+            ))?
+            & !15
+    } else {
+        table_end
+    };
+    let resume_end = resume_offset
+        .checked_add(resume_descriptor_size.unwrap_or(0))
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "static-prefix resume descriptor extent",
+        ))?;
+    let identity_offset = resume_end
         .checked_add(15)
         .ok_or(ObjectError::ArithmeticOverflow("static-prefix identity alignment"))?
         & !15;
@@ -2877,6 +3046,14 @@ fn lower_native_slow_partial_prepared_with_data_limit(
         .map_err(|_| ObjectError::Allocation("static-prefix combined data"))?;
     program_bytes.resize(table_offset, 0);
     push_bytes(&mut program_bytes, &native.data)?;
+    if let (Some(resume), Some(resume_descriptor_size)) = (resume, resume_descriptor_size) {
+        program_bytes.resize(resume_offset, 0);
+        append_static_prefix_resume_descriptor(
+            &mut program_bytes,
+            resume,
+            resume_descriptor_size,
+        )?;
+    }
     program_bytes.resize(identity_offset, 0);
     push_bytes(&mut program_bytes, &artifact_identity)?;
     if program_bytes.len() != final_data_len {
@@ -2908,12 +3085,34 @@ fn lower_native_slow_partial_prepared_with_data_limit(
             }
         }
     }
+    let resume_table_addend = resume
+        .map(|_| {
+            i64::try_from(
+                resume_offset
+                    .checked_sub(table_offset)
+                    .ok_or(ObjectError::ArithmeticOverflow(
+                        "static-prefix resume descriptor table delta",
+                    ))?,
+            )
+            .map_err(|_| {
+                ObjectError::ArithmeticOverflow("static-prefix descriptor relocation addend")
+            })
+        })
+        .transpose()?;
     let wrapper = match target.architecture {
         Architecture::X86_64 => {
-            lower_x86_64_static_prefix_prepared_wrapper(view.output, span_recovery)?
+            lower_x86_64_static_prefix_prepared_wrapper(
+                view.output,
+                span_recovery,
+                resume_table_addend,
+            )?
         }
         Architecture::Aarch64 => {
-            lower_aarch64_static_prefix_prepared_wrapper(view.output, span_recovery)?
+            lower_aarch64_static_prefix_prepared_wrapper(
+                view.output,
+                span_recovery,
+                resume_table_addend,
+            )?
         }
     };
     let NativeSlowPartialWrapper {
@@ -3008,6 +3207,7 @@ fn lower_native_slow_partial_prepared_with_data_limit(
                 span_recovery,
                 dynamic_rows: false,
                 slow_prefix: true,
+                slow_prefix_resume: resume.is_some(),
             }),
         },
     )))
@@ -3016,6 +3216,7 @@ fn lower_native_slow_partial_prepared_with_data_limit(
 fn lower_optional_native_slow_partial_prepared_with_data_limit(
     program_bytes: &[u8],
     view: NativeProgramView<'_>,
+    resume: Option<NativeSlowResumeView<'_>>,
     artifact_identity: [u8; 32],
     target: Target,
     max_native_data_bytes: usize,
@@ -3029,6 +3230,7 @@ fn lower_optional_native_slow_partial_prepared_with_data_limit(
             lower_native_slow_partial_prepared_with_data_limit(
                 owned_program,
                 view,
+                resume,
                 artifact_identity,
                 target,
                 max_native_data_bytes,
@@ -3404,6 +3606,7 @@ fn lower_native_partial_prepared(
                 span_recovery,
                 dynamic_rows: false,
                 slow_prefix: false,
+                slow_prefix_resume: false,
             }),
         },
     )))
@@ -3427,6 +3630,11 @@ fn native_module_digest(
         if prepared.slow_prefix && prepared.dynamic_rows {
             return Err(ObjectError::InvalidModule(
                 "static-prefix prepared layout conflicts with another native prepared mode",
+            ));
+        }
+        if prepared.slow_prefix_resume && !prepared.slow_prefix {
+            return Err(ObjectError::InvalidModule(
+                "static-prefix resume layout has no static prefix",
             ));
         }
     }
@@ -3500,9 +3708,15 @@ fn native_module_digest(
             .iter()
             .any(|relocation| relocation.symbol == PARTIAL_RUNTIME_SYMBOL)
         {
+            let partial_symbol_name = match prepared_layout.map(|layout| layout.kind) {
+                Some(PreparedEntryKind::Native(prepared)) if prepared.slow_prefix_resume => {
+                    SLOW_PREFIX_CONTINUE_RUNTIME_SYMBOL_NAME
+                }
+                _ => PARTIAL_RUNTIME_SYMBOL_NAME,
+            };
             update_bytes(
                 &mut digest,
-                PARTIAL_RUNTIME_SYMBOL_NAME.as_bytes(),
+                partial_symbol_name.as_bytes(),
                 "partial runtime symbol identity byte length",
             )?;
         }
@@ -3540,8 +3754,11 @@ fn native_module_digest(
                 Some(PreparedEntryKind::Native(prepared)) if prepared.dynamic_rows => {
                     DYNAMIC_ROWS_PREFLIGHT_RUNTIME_SYMBOL_NAME
                 }
-                Some(PreparedEntryKind::Native(prepared)) if prepared.slow_prefix => {
+                Some(PreparedEntryKind::Native(prepared)) if prepared.slow_prefix_resume => {
                     SLOW_PREFIX_PREFLIGHT_RUNTIME_SYMBOL_NAME
+                }
+                Some(PreparedEntryKind::Native(prepared)) if prepared.slow_prefix => {
+                    SLOW_PREFIX_PREFLIGHT_V1_RUNTIME_SYMBOL_NAME
                 }
                 _ => PREPARED_PREFLIGHT_RUNTIME_SYMBOL_NAME,
             };
@@ -3557,8 +3774,11 @@ fn native_module_digest(
             .any(|relocation| relocation.symbol == PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL)
         {
             let auxiliary_symbol_name = match prepared_layout.map(|layout| layout.kind) {
-                Some(PreparedEntryKind::Native(prepared)) if prepared.slow_prefix => {
+                Some(PreparedEntryKind::Native(prepared)) if prepared.slow_prefix_resume => {
                     SLOW_PREFIX_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME
+                }
+                Some(PreparedEntryKind::Native(prepared)) if prepared.slow_prefix => {
+                    SLOW_PREFIX_SPAN_RECOVERY_V1_RUNTIME_SYMBOL_NAME
                 }
                 _ if lowering
                     .relocations
@@ -13583,17 +13803,20 @@ fn lower_x86_64_slow_partial_wrapper(
 }
 
 /// Lower the prepared half of a transient static-prefix hybrid. Successful
-/// native completion returns directly; every collapsed hole reuses the same
-/// prepared handle for a whole-search fallback over the original window.
+/// native completion returns directly; every retained hole continues through
+/// the same prepared handle from its exact frontier and first unconsumed byte.
+/// A complete-forward late reverse decline has no descriptor or continuation.
 fn lower_x86_64_static_prefix_prepared_wrapper(
     output: OutputContract,
     span_recovery: bool,
+    resume_table_addend: Option<i64>,
 ) -> Result<NativeSlowPartialWrapper, ObjectError> {
-    const FRAME_BYTES: u8 = 56;
+    const FRAME_BYTES: u8 = 72;
     let mut assembler = X86Assembler::new();
     let preflight_enter = assembler.label()?;
     let native_match = assembler.label()?;
     let native_no_match = assembler.label()?;
+    let native_resume = resume_table_addend.map(|_| assembler.label()).transpose()?;
     let native_span_recovery = span_recovery.then(|| assembler.label()).transpose()?;
     let native_deopt = assembler.label()?;
     let fallback_runtime = assembler.label()?;
@@ -13610,21 +13833,32 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
     assembler.instruction(&compare_minimum)?;
     assembler.branch(&[0x0f, 0x82], fallback_runtime)?;
 
-    // Entry RSP is 8 modulo 16. The 56-byte frame aligns helper calls, keeps
-    // all six prepared arguments for a whole-search side exit, and provides
-    // the seventh SysV argument slot for the static artifact identity.
+    // Entry RSP is 8 modulo 16. The 72-byte frame aligns helper calls, keeps
+    // all six prepared arguments for a side exit, and provides the seventh
+    // and eighth SysV argument slots for identity and the static frontier
+    // descriptor.
     assembler.instruction(&[0x48, 0x83, 0xec, FRAME_BYTES])?;
-    assembler.instruction(&[0x48, 0x89, 0x7c, 0x24, 0x08])?; // handle
-    assembler.instruction(&[0x48, 0x89, 0x74, 0x24, 0x10])?; // haystack
-    assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x18])?; // length
-    assembler.instruction(&[0x48, 0x89, 0x4c, 0x24, 0x20])?; // start
-    assembler.instruction(&[0x4c, 0x89, 0x44, 0x24, 0x28])?; // end
-    assembler.instruction(&[0x4c, 0x89, 0x4c, 0x24, 0x30])?; // result
+    assembler.instruction(&[0x48, 0x89, 0x7c, 0x24, 0x10])?; // handle
+    assembler.instruction(&[0x48, 0x89, 0x74, 0x24, 0x18])?; // haystack
+    assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x20])?; // length
+    assembler.instruction(&[0x48, 0x89, 0x4c, 0x24, 0x28])?; // start
+    assembler.instruction(&[0x4c, 0x89, 0x44, 0x24, 0x30])?; // end
+    assembler.instruction(&[0x4c, 0x89, 0x4c, 0x24, 0x38])?; // result
     assembler.instruction(&[0x48, 0x8d, 0x05])?;
     let identity_displacement_label = assembler.label()?;
     assembler.bind(identity_displacement_label)?;
     push_bytes(&mut assembler.code, &[0; 4])?;
     assembler.instruction(&[0x48, 0x89, 0x04, 0x24])?;
+    let resume_descriptor_displacement_label = if resume_table_addend.is_some() {
+        assembler.instruction(&[0x48, 0x8d, 0x05])?;
+        let displacement = assembler.label()?;
+        assembler.bind(displacement)?;
+        push_bytes(&mut assembler.code, &[0; 4])?;
+        assembler.instruction(&[0x48, 0x89, 0x44, 0x24, 0x08])?;
+        Some(displacement)
+    } else {
+        None
+    };
     assembler.instruction(&[0xe8])?;
     let preflight_displacement_label = assembler.label()?;
     assembler.bind(preflight_displacement_label)?;
@@ -13635,11 +13869,11 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
     assembler.instruction(&[0xc3])?;
 
     assembler.bind(preflight_enter)?;
-    assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x10])?;
-    assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x18])?;
-    assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x20])?;
-    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x28])?;
-    assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x30])?;
+    assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x18])?;
+    assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x20])?;
+    assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x28])?;
+    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x30])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x38])?;
     assembler.instruction(&[0xe8])?;
     let core_call_displacement_label = assembler.label()?;
     assembler.bind(core_call_displacement_label)?;
@@ -13648,6 +13882,15 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
     assembler.branch(&[0x0f, 0x84], native_match)?;
     assembler.instruction(&[0x85, 0xc0])?;
     assembler.branch(&[0x0f, 0x84], native_no_match)?;
+    if let Some(native_resume) = native_resume {
+        assembler.instruction(&[
+            0x83,
+            0xf8,
+            u8::try_from(NATIVE_PARTIAL_STATUS_RESUME)
+                .map_err(|_| ObjectError::ArithmeticOverflow("static-prefix resume status"))?,
+        ])?;
+        assembler.branch(&[0x0f, 0x84], native_resume)?;
+    }
     if let Some(native_span_recovery) = native_span_recovery {
         assembler.instruction(&[
             0x83,
@@ -13661,7 +13904,7 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
     assembler.branch(&[0xe9], native_deopt)?;
 
     assembler.bind(native_no_match)?;
-    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x30])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x38])?;
     assembler.instruction(&[0x31, 0xc0])?;
     assembler.instruction(&[0x49, 0x89, 0x01])?;
     assembler.instruction(&[0x49, 0x89, 0x41, 0x08])?;
@@ -13669,7 +13912,7 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
     assembler.instruction(&[0xc3])?;
 
     assembler.bind(native_match)?;
-    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x30])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x38])?;
     match output {
         OutputContract::Exists => {
             assembler.instruction(&[0x31, 0xc0])?;
@@ -13691,12 +13934,12 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
 
     let span_recovery_displacement_label = if let Some(native_span_recovery) = native_span_recovery {
         assembler.bind(native_span_recovery)?;
-        assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x08])?;
-        assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x10])?;
-        assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x18])?;
-        assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x20])?;
-        assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x28])?;
-        assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x30])?;
+        assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x10])?;
+        assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x18])?;
+        assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x20])?;
+        assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x28])?;
+        assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x30])?;
+        assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x38])?;
         assembler.instruction(&[0x4c, 0x89, 0x5c, 0x24, 0x08])?;
         assembler.instruction(&[0xe8])?;
         let displacement = assembler.label()?;
@@ -13709,13 +13952,36 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
         None
     };
 
+    let resume_runtime_displacement_label = if let Some(native_resume) = native_resume {
+        assembler.bind(native_resume)?;
+        // The native core returns resume state in r10, first unconsumed
+        // position in rdx, and the pending endpoint word in r11. The canonical
+        // descriptor determines whether that last word is meaningful.
+        assembler.instruction(&[0x4c, 0x89, 0x1c, 0x24])?;
+        assembler.instruction(&[0x49, 0x89, 0xd1])?;
+        assembler.instruction(&[0x4d, 0x89, 0xd0])?;
+        assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x10])?;
+        assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x18])?;
+        assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x20])?;
+        assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x38])?;
+        assembler.instruction(&[0xe8])?;
+        let displacement = assembler.label()?;
+        assembler.bind(displacement)?;
+        push_bytes(&mut assembler.code, &[0; 4])?;
+        assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+        assembler.instruction(&[0xc3])?;
+        Some(displacement)
+    } else {
+        None
+    };
+
     assembler.bind(native_deopt)?;
-    assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x08])?;
-    assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x10])?;
-    assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x18])?;
-    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x20])?;
-    assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x28])?;
-    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x30])?;
+    assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x10])?;
+    assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x18])?;
+    assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x20])?;
+    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x28])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x30])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x38])?;
     assembler.instruction(&[0xe8])?;
     let deopt_displacement_label = assembler.label()?;
     assembler.bind(deopt_displacement_label)?;
@@ -13731,10 +13997,16 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
 
     let finished = assembler.finish_with_label_offsets()?;
     let identity_displacement = finished.label_offset(identity_displacement_label)?;
+    let resume_descriptor_displacement = resume_descriptor_displacement_label
+        .map(|label| finished.label_offset(label))
+        .transpose()?;
     let preflight_displacement = finished.label_offset(preflight_displacement_label)?;
     let core_call_offset = finished.label_offset(core_call_displacement_label)?;
     let deopt_displacement = finished.label_offset(deopt_displacement_label)?;
     let fallback_displacement = finished.label_offset(fallback_displacement_label)?;
+    let resume_runtime_displacement = resume_runtime_displacement_label
+        .map(|label| finished.label_offset(label))
+        .transpose()?;
     let span_recovery_displacement = span_recovery_displacement_label
         .map(|label| finished.label_offset(label))
         .transpose()?;
@@ -13768,6 +14040,45 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
             addend: -4,
         },
     ];
+    if let (Some(descriptor_displacement), Some(runtime_displacement), Some(table_addend)) = (
+        resume_descriptor_displacement,
+        resume_runtime_displacement,
+        resume_table_addend,
+    ) {
+        relocations.extend([
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(
+                    descriptor_displacement,
+                    "x86 static-prefix resume descriptor relocation",
+                )?,
+                kind: RelocationKind::X86PcRelative32,
+                symbol: PARTIAL_TABLE_SYMBOL,
+                addend: table_addend.checked_sub(4).ok_or(
+                    ObjectError::ArithmeticOverflow(
+                        "x86 static-prefix resume descriptor relocation addend",
+                    ),
+                )?,
+            },
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(
+                    runtime_displacement,
+                    "x86 static-prefix continuation relocation",
+                )?,
+                kind: RelocationKind::X86PltRelative32,
+                symbol: PARTIAL_RUNTIME_SYMBOL,
+                addend: -4,
+            },
+        ]);
+    } else if resume_descriptor_displacement.is_some()
+        || resume_runtime_displacement.is_some()
+        || resume_table_addend.is_some()
+    {
+        return Err(ObjectError::InvalidModule(
+            "x86 static-prefix resume lowering is incomplete",
+        ));
+    }
     if let Some(span_recovery_displacement) = span_recovery_displacement {
         relocations.push(ModuleRelocation {
             section: TEXT_SECTION,
@@ -25418,12 +25729,14 @@ fn lower_aarch64_slow_partial_wrapper(
 fn lower_aarch64_static_prefix_prepared_wrapper(
     output: OutputContract,
     span_recovery: bool,
+    resume_table_addend: Option<i64>,
 ) -> Result<NativeSlowPartialWrapper, ObjectError> {
     const FRAME_BYTES: u16 = 64;
     let mut assembler = Aarch64Assembler::new();
     let preflight_enter = assembler.label()?;
     let native_match = assembler.label()?;
     let native_no_match = assembler.label()?;
+    let native_resume = resume_table_addend.map(|_| assembler.label()).transpose()?;
     let native_span_recovery = span_recovery.then(|| assembler.label()).transpose()?;
     let native_deopt = assembler.label()?;
     let fallback_runtime = assembler.label()?;
@@ -25443,6 +25756,14 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
     assembler.instruction(aarch64_store_x(30, 31, 56)?)?;
     let identity_page = assembler.instruction(0x9000_0006)?;
     let identity_page_offset = assembler.instruction(aarch64_add_x_imm(6, 6, 0)?)?;
+    let resume_descriptor_relocations = if resume_table_addend.is_some() {
+        Some((
+            assembler.instruction(0x9000_0007)?,
+            assembler.instruction(aarch64_add_x_imm(7, 7, 0)?)?,
+        ))
+    } else {
+        None
+    };
     let preflight_branch = assembler.instruction(0x9400_0000)?;
     assembler.instruction(aarch64_cmp_w_imm(
         0,
@@ -25461,6 +25782,15 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
     assembler.branch_cond(AARCH64_EQ, native_match)?;
     assembler.instruction(aarch64_cmp_w_imm(0, 0)?)?;
     assembler.branch_cond(AARCH64_EQ, native_no_match)?;
+    if let Some(native_resume) = native_resume {
+        assembler.instruction(aarch64_cmp_w_imm(
+            0,
+            u16::try_from(NATIVE_PARTIAL_STATUS_RESUME).map_err(|_| {
+                ObjectError::ArithmeticOverflow("AArch64 static-prefix resume status")
+            })?,
+        )?)?;
+        assembler.branch_cond(AARCH64_EQ, native_resume)?;
+    }
     if let Some(native_span_recovery) = native_span_recovery {
         assembler.instruction(aarch64_cmp_w_imm(
             0,
@@ -25514,6 +25844,23 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
         None
     };
 
+    let resume_runtime_branch = if let Some(native_resume) = native_resume {
+        assembler.bind(native_resume)?;
+        assembler.instruction(aarch64_mov_x(5, 2)?)?;
+        assembler.instruction(aarch64_mov_x(4, 6)?)?;
+        assembler.instruction(aarch64_mov_x(6, 7)?)?;
+        assembler.instruction(aarch64_load_pair_x(0, 1, 31, 0)?)?;
+        assembler.instruction(aarch64_load_x_imm(2, 31, 16)?)?;
+        assembler.instruction(aarch64_load_x_imm(3, 31, 40)?)?;
+        let branch = assembler.instruction(0x9400_0000)?;
+        assembler.instruction(aarch64_load_x_imm(30, 31, 56)?)?;
+        assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+        assembler.instruction(0xd65f_03c0)?;
+        Some(branch)
+    } else {
+        None
+    };
+
     assembler.bind(native_deopt)?;
     assembler.instruction(aarch64_load_pair_x(0, 1, 31, 0)?)?;
     assembler.instruction(aarch64_load_pair_x(2, 3, 31, 16)?)?;
@@ -25534,6 +25881,23 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
         deopt_branch,
         fallback_branch,
     ];
+    let resume_indices = match (
+        resume_descriptor_relocations,
+        resume_runtime_branch,
+        resume_table_addend,
+    ) {
+        (Some((descriptor_page, descriptor_page_offset)), Some(runtime_branch), Some(_)) => {
+            let first = relocation_offsets.len();
+            relocation_offsets.extend([descriptor_page, descriptor_page_offset, runtime_branch]);
+            Some((first, first + 1, first + 2))
+        }
+        (None, None, None) => None,
+        _ => {
+            return Err(ObjectError::InvalidModule(
+                "AArch64 static-prefix resume lowering is incomplete",
+            ));
+        }
+    };
     let span_recovery_indices = span_recovery_relocations.map(
         |(identity_page, identity_page_offset, runtime_branch)| {
             let first = relocation_offsets.len();
@@ -25579,6 +25943,42 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
             addend: 0,
         },
     ];
+    if let (Some((descriptor_page, descriptor_page_offset, runtime_branch)), Some(table_addend)) =
+        (resume_indices, resume_table_addend)
+    {
+        relocations.extend([
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(
+                    relocation_offsets[descriptor_page],
+                    "AArch64 static-prefix resume descriptor ADRP",
+                )?,
+                kind: RelocationKind::Aarch64Page21,
+                symbol: PARTIAL_TABLE_SYMBOL,
+                addend: table_addend,
+            },
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(
+                    relocation_offsets[descriptor_page_offset],
+                    "AArch64 static-prefix resume descriptor ADD",
+                )?,
+                kind: RelocationKind::Aarch64PageOff12,
+                symbol: PARTIAL_TABLE_SYMBOL,
+                addend: table_addend,
+            },
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(
+                    relocation_offsets[runtime_branch],
+                    "AArch64 static-prefix continuation branch",
+                )?,
+                kind: RelocationKind::Aarch64Branch26,
+                symbol: PARTIAL_RUNTIME_SYMBOL,
+                addend: 0,
+            },
+        ]);
+    }
     if let Some((identity_page, identity_page_offset, runtime_branch)) = span_recovery_indices {
         relocations.extend([
             ModuleRelocation {
@@ -44821,7 +45221,7 @@ int main(void){{
         clippy::too_many_lines,
         reason = "one matrix authenticates transient holes, public symbols, and both backends"
     )]
-    fn slow_partial_compatibility_wrapper_uses_one_whole_search_hole_on_every_target() {
+    fn slow_partial_legacy_wrapper_and_exact_prepared_continuation_are_cross_target() {
         for output in [
             OutputContract::Exists,
             OutputContract::SelectedEnd,
@@ -45068,7 +45468,10 @@ int main(void){{
                     assert!(declined.slow_aot_report().is_some());
                     assert_eq!(declined.required_runtime_symbol(), Some(RUNTIME_SYMBOL_NAME));
                     assert!(declined.prepared_entry_symbol().is_some());
-                    assert!(declined.required_prepared_runtime_symbol().is_none());
+                    assert_eq!(
+                        declined.required_prepared_runtime_symbol(),
+                        Some(SLOW_PREFIX_CONTINUE_RUNTIME_SYMBOL_NAME)
+                    );
                     assert_eq!(
                         declined.required_prepared_fallback_runtime_symbol(),
                         Some(PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME)
@@ -45104,15 +45507,44 @@ int main(void){{
                     .len()
                     .checked_sub(serialized.len())
                     .expect("combined partial table follows its serialized program");
+                let resume = retained
+                    .resume_view()
+                    .unwrap_or_else(|| panic!("missing resume view: {output:?}/{target:?}"));
                 let hybrid = lower_optional_native_slow_partial_prepared_with_data_limit(
                     &serialized,
                     retained_view,
+                    Some(resume),
                     compiled.program().artifact_identity(),
                     target,
                     usize::MAX,
                 )
                 .unwrap()
                 .unwrap_or_else(|| panic!("unlowerable prepared hybrid: {output:?}/{target:?}"));
+                let PreparedEntryKind::Native(hybrid_layout) = hybrid.1.kind else {
+                    panic!("static-prefix hybrid has no native layout: {output:?}/{target:?}");
+                };
+                assert!(hybrid_layout.slow_prefix_resume);
+                let descriptor_offset = hybrid_layout
+                    .table_offset
+                    .checked_add(hybrid_layout.table_size)
+                    .and_then(|end| end.checked_add(15))
+                    .unwrap()
+                    & !15;
+                let descriptor_size = static_prefix_resume_descriptor_size(resume)
+                    .unwrap()
+                    .expect("bounded static-prefix descriptor");
+                let mut expected_descriptor = Vec::new();
+                append_static_prefix_resume_descriptor(
+                    &mut expected_descriptor,
+                    resume,
+                    descriptor_size,
+                )
+                .expect("encode expected static-prefix descriptor");
+                assert_eq!(
+                    &hybrid.0.data[descriptor_offset..descriptor_offset + descriptor_size],
+                    expected_descriptor,
+                    "canonical static-prefix descriptor: {output:?}/{target:?}"
+                );
                 let hybrid_native_bytes = hybrid
                     .0
                     .data
@@ -45154,7 +45586,41 @@ int main(void){{
                 assert!(constrained.slow_aot_report().is_some());
                 assert_eq!(constrained.required_runtime_symbol(), Some(RUNTIME_SYMBOL_NAME));
                 assert!(constrained.prepared_entry_symbol().is_some());
-                assert!(constrained.required_prepared_runtime_symbol().is_none());
+                assert_eq!(
+                    constrained.required_prepared_runtime_symbol(),
+                    Some(SLOW_PREFIX_CONTINUE_RUNTIME_SYMBOL_NAME)
+                );
+                assert_eq!(
+                    constrained
+                        .relocations()
+                        .iter()
+                        .filter(|relocation| relocation.symbol == PARTIAL_RUNTIME_SYMBOL)
+                        .count(),
+                    1,
+                    "static-prefix continuation relocation: {output:?}/{target:?}"
+                );
+                let descriptor_delta = i64::try_from(
+                    descriptor_offset
+                        .checked_sub(hybrid_layout.table_offset)
+                        .unwrap(),
+                )
+                .unwrap();
+                let (descriptor_addend, descriptor_relocations) = match target.architecture {
+                    Architecture::X86_64 => (descriptor_delta - 4, 1),
+                    Architecture::Aarch64 => (descriptor_delta, 2),
+                };
+                assert_eq!(
+                    constrained
+                        .relocations()
+                        .iter()
+                        .filter(|relocation| {
+                            relocation.symbol == PARTIAL_TABLE_SYMBOL
+                                && relocation.addend == descriptor_addend
+                        })
+                        .count(),
+                    descriptor_relocations,
+                    "static-prefix descriptor relocations: {output:?}/{target:?}"
+                );
                 assert_eq!(
                     constrained.required_prepared_fallback_runtime_symbol(),
                     Some(PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME)
@@ -45628,7 +46094,11 @@ int main(void){{
             );
             assert_eq!(
                 module.required_prepared_preflight_runtime_symbol(),
-                Some(SLOW_PREFIX_PREFLIGHT_RUNTIME_SYMBOL_NAME)
+                Some(SLOW_PREFIX_PREFLIGHT_V1_RUNTIME_SYMBOL_NAME)
+            );
+            assert_eq!(
+                module.required_prepared_span_recovery_runtime_symbol(),
+                Some(SLOW_PREFIX_SPAN_RECOVERY_V1_RUNTIME_SYMBOL_NAME)
             );
             assert!(module.sections()[PROGRAM_SECTION]
                 .bytes()
@@ -48475,6 +48945,7 @@ int main(void){{
         let direct_hybrid = lower_optional_native_slow_partial_prepared_with_data_limit(
             &serialized,
             view,
+            candidate.resume_view(),
             fast.program().artifact_identity(),
             target,
             usize::MAX,
@@ -48503,15 +48974,22 @@ int main(void){{
             module.required_prepared_fallback_runtime_symbol(),
             Some(PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME)
         );
-        assert!(module.required_prepared_runtime_symbol().is_none());
+        assert_eq!(
+            module.required_prepared_runtime_symbol(),
+            Some(SLOW_PREFIX_CONTINUE_RUNTIME_SYMBOL_NAME)
+        );
         assert_eq!(
             module.required_prepared_span_recovery_runtime_symbol(),
             Some(SLOW_PREFIX_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME)
         );
-        assert!(!module
-            .relocations()
-            .iter()
-            .any(|relocation| relocation.symbol == PARTIAL_RUNTIME_SYMBOL));
+        assert_eq!(
+            module
+                .relocations()
+                .iter()
+                .filter(|relocation| relocation.symbol == PARTIAL_RUNTIME_SYMBOL)
+                .count(),
+            1
+        );
 
         let long_len = PARTIAL_DFA_MIN_INPUT_BYTES + 64;
         let mut native_match = vec![b'!'; long_len];

@@ -40,6 +40,15 @@ use crate::{
 };
 
 const PROGRAM_MAGIC: &[u8; 8] = b"FREGAOT\0";
+/// Compiler-private object sidecar for transient slow-prefix continuation.
+#[doc(hidden)]
+pub const STATIC_PREFIX_RESUME_DESCRIPTOR_V1_MAGIC: &[u8; 8] = b"FRESPXK1";
+#[doc(hidden)]
+pub const STATIC_PREFIX_RESUME_DESCRIPTOR_V1_HEADER_BYTES: usize = 32;
+#[doc(hidden)]
+pub const STATIC_PREFIX_RESUME_DESCRIPTOR_V1_STATE_BYTES: usize = 16;
+#[doc(hidden)]
+pub const STATIC_PREFIX_RESUME_DESCRIPTOR_V1_MAX_BYTES: usize = 256 * 1024 * 1024;
 const PROGRAM_FORMAT_VERSION_V1: u32 = 1;
 const PROGRAM_FORMAT_VERSION_V2: u32 = 2;
 const PROGRAM_FORMAT_VERSION_V3: u32 = 3;
@@ -2551,6 +2560,7 @@ pub struct ProgramWorkspace {
     identity: ProgramIdentity,
     nfa: Option<K0Workspace>,
     partial: Option<Box<PartialDfaWorkspace>>,
+    static_prefix_resume: Option<Box<StaticPrefixResumeWorkspace>>,
     dynamic_native_rows: Option<Box<DynamicNativeRowsWorkspace>>,
 }
 
@@ -6173,6 +6183,49 @@ struct PartialDfaWorkspace {
     state: PartialDfaRuntimeState,
 }
 
+/// Lazily graph-bound continuation set supplied by one compiler-owned static
+/// prefix object. The pointer binding makes repeated preflights constant-time;
+/// a different object for the same semantic program replaces the sidecar
+/// transactionally.
+#[derive(Debug)]
+struct StaticPrefixResumeWorkspace {
+    descriptor_binding: usize,
+    resume: K0ResumeSet,
+    fully_prefilled: Option<FullyPrefilledFallbackReceipt>,
+    ticket: Option<StaticPrefixResumeTicket>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StaticPrefixResumeTicket {
+    haystack_address: usize,
+    haystack_len: usize,
+    window: SearchWindow,
+}
+
+impl StaticPrefixResumeWorkspace {
+    fn admit(&mut self, haystack: &[u8], window: SearchWindow) {
+        self.ticket = Some(StaticPrefixResumeTicket {
+            haystack_address: haystack.as_ptr().expose_provenance(),
+            haystack_len: haystack.len(),
+            window,
+        });
+    }
+
+    fn consume(&mut self, haystack: &[u8]) -> Result<SearchWindow, CompileError> {
+        let ticket = self.ticket.take().ok_or(CompileError::InternalInvariant(
+            "static-prefix continuation has no synchronous preflight ticket",
+        ))?;
+        if ticket.haystack_address != haystack.as_ptr().expose_provenance()
+            || ticket.haystack_len != haystack.len()
+        {
+            return Err(CompileError::InternalInvariant(
+                "static-prefix continuation haystack differs from preflight",
+            ));
+        }
+        Ok(ticket.window)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PartialDfaResumeResult {
     found: MatchResult,
@@ -6772,6 +6825,33 @@ pub(crate) struct NativeProgramView<'a> {
     pub(crate) retained_suffix_requirement: Option<NativeRetainedSuffixRequirement>,
 }
 
+/// Borrowed transient frontier suffix retained by the slow compiler.
+///
+/// This is object-lowering input only. It is never attached to the stable
+/// semantic program or exposed through its serialization format.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NativeSlowResumeView<'a> {
+    partial: &'a NativeSlowPartial,
+    state_count: usize,
+    item_count: usize,
+}
+
+impl<'a> NativeSlowResumeView<'a> {
+    pub(crate) const fn state_count(self) -> usize {
+        self.state_count
+    }
+
+    pub(crate) const fn item_count(self) -> usize {
+        self.item_count
+    }
+
+    pub(crate) fn frontiers(self) -> impl ExactSizeIterator<Item = (&'a [u32], bool)> {
+        self.partial
+            .resume_frontiers()
+            .expect("authenticated slow-resume view has an incomplete suffix")
+    }
+}
+
 /// Compiler-owned complete DFA materialized from one setup-authenticated K0
 /// cache. This is transient lowering IR: it is neither serialized into the
 /// semantic program nor retained after the native object has copied its
@@ -6870,6 +6950,20 @@ impl NativeSlowDfaProgram {
             NativeSlowMachine::Complete(_) => false,
             NativeSlowMachine::Partial(partial) => partial.retained_forward_minimized(),
         }
+    }
+
+    pub(crate) fn resume_view(&self) -> Option<NativeSlowResumeView<'_>> {
+        let NativeSlowMachine::Partial(partial) = &self.machine else {
+            return None;
+        };
+        let (complete_rows, discovered_states) = partial.retained_dimensions();
+        let state_count = discovered_states.checked_sub(complete_rows)?;
+        let item_count = partial.resume_item_count()?;
+        (state_count != 0 && item_count != 0).then_some(NativeSlowResumeView {
+            partial,
+            state_count,
+            item_count,
+        })
     }
 
     fn native_view(&self) -> NativeDfaView<'_> {
@@ -7979,10 +8073,12 @@ impl CompiledProgram {
     /// Allocation exhaustion is an optimization decline. A state,
     /// transition, or work refusal after at least one complete row may retain
     /// that already-owned prefix as an optimizer candidate. A complete
-    /// late-stage artifact can lower directly. Current module selection tries
-    /// to close a genuinely incomplete prefix through K0, then declines to the
-    /// persistent prepared route if completion cannot fit; the raw replaying
-    /// wrapper remains only as a legacy object-ABI compatibility emitter.
+    /// late-stage artifact can lower directly. Current module selection first
+    /// tries to close a genuinely incomplete prefix through K0, then retains
+    /// its exact frontier suffix in private object data when the complete table
+    /// cannot fit. Native holes continue at the first unconsumed byte; only an
+    /// object-data decline falls back to the ordinary prepared route. The raw
+    /// replaying wrapper remains only as a legacy object-ABI emitter.
     /// Structural compiler failures remain typed errors.
     pub(crate) fn native_slow_determinized_program(
         &self,
@@ -8439,6 +8535,7 @@ impl CompiledProgram {
             identity: self.identity,
             nfa,
             partial,
+            static_prefix_resume: None,
             dynamic_native_rows,
         })
     }
@@ -10206,22 +10303,20 @@ impl CompiledProgram {
         // did not complete locally. Do not let a later search misclassify a
         // failed authentication or K0 continuation as a completed probe.
         partial_workspace.state.clear_native_entry();
-        if partial_workspace
+        let resume_set = partial_workspace
             .resume
-            .as_ref()
-            .is_none_or(|resume| !resume.is_bound_to(&self.automaton))
-        {
-            return Err(CompileError::InternalInvariant(
+            .as_mut()
+            .filter(|resume| resume.is_bound_to(&self.automaton))
+            .ok_or(CompileError::InternalInvariant(
                 "retained partial resume has no authenticated K0 resume set",
-            ));
-        }
+            ))?;
         let resumed = self.search_nfa_from_partial_resume(
             haystack,
             window,
             workspace.nfa.as_mut().ok_or(CompileError::InternalInvariant(
                 "retained partial resume has no prepared K0 workspace",
             ))?,
-            &mut partial_workspace.resume,
+            resume_set,
             PartialDfaResume {
                 state: resume_state,
                 position: resume_position,
@@ -10638,22 +10733,20 @@ impl CompiledProgram {
                 "preflight-authenticated partial resume has no retained workspace",
             ),
         )?;
-        if partial_workspace
+        let resume_set = partial_workspace
             .resume
-            .as_ref()
-            .is_none_or(|resume| !resume.is_bound_to(&self.automaton))
-        {
-            return Err(CompileError::InternalInvariant(
+            .as_mut()
+            .filter(|resume| resume.is_bound_to(&self.automaton))
+            .ok_or(CompileError::InternalInvariant(
                 "preflight-authenticated partial resume has no K0 resume set",
-            ));
-        }
+            ))?;
         let resumed = self.search_nfa_from_partial_resume(
             haystack,
             window,
             nfa.as_mut().ok_or(CompileError::InternalInvariant(
                 "preflight-authenticated partial resume has no K0 workspace",
             ))?,
-            &mut partial_workspace.resume,
+            resume_set,
             PartialDfaResume {
                 state: resume_state,
                 position: resume_position,
@@ -10942,6 +11035,328 @@ impl CompiledProgram {
                 "reverse K0 did not recover a static-prefix span inside its search window",
             ));
         }
+        Ok(MatchResult::Span(Some((recovered_start, selected_end))))
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one pass validates the complete untrusted descriptor before constructing a resume set"
+    )]
+    fn static_prefix_resume_set_from_descriptor(
+        &self,
+        descriptor: &[u32],
+    ) -> Result<K0ResumeSet, CompileError> {
+        const HEADER_WORDS: usize = STATIC_PREFIX_RESUME_DESCRIPTOR_V1_HEADER_BYTES
+            / core::mem::size_of::<u32>();
+        const STATE_WORDS: usize = STATIC_PREFIX_RESUME_DESCRIPTOR_V1_STATE_BYTES
+            / core::mem::size_of::<u32>();
+        if descriptor.len() < HEADER_WORDS
+            || descriptor
+                .len()
+                .checked_mul(core::mem::size_of::<u32>())
+                .is_none_or(|bytes| bytes > STATIC_PREFIX_RESUME_DESCRIPTOR_V1_MAX_BYTES)
+        {
+            return Err(CompileError::InternalInvariant(
+                "static-prefix resume descriptor has an invalid bounded extent",
+            ));
+        }
+        let mut magic = [0_u8; 8];
+        magic[..4].copy_from_slice(&descriptor[0].to_le_bytes());
+        magic[4..].copy_from_slice(&descriptor[1].to_le_bytes());
+        if &magic != STATIC_PREFIX_RESUME_DESCRIPTOR_V1_MAGIC {
+            return Err(CompileError::InternalInvariant(
+                "static-prefix resume descriptor has an invalid magic",
+            ));
+        }
+        let declared_words = usize::try_from(descriptor[2]).map_err(|_| {
+            CompileError::InternalInvariant(
+                "static-prefix resume descriptor word count does not fit usize",
+            )
+        })?;
+        let state_count = usize::try_from(descriptor[3]).map_err(|_| {
+            CompileError::InternalInvariant(
+                "static-prefix resume descriptor state count does not fit usize",
+            )
+        })?;
+        let item_count = usize::try_from(descriptor[4]).map_err(|_| {
+            CompileError::InternalInvariant(
+                "static-prefix resume descriptor item count does not fit usize",
+            )
+        })?;
+        if declared_words != descriptor.len()
+            || state_count == 0
+            || item_count == 0
+            || descriptor[5..HEADER_WORDS].iter().any(|&word| word != 0)
+        {
+            return Err(CompileError::InternalInvariant(
+                "static-prefix resume descriptor header is inconsistent",
+            ));
+        }
+        let state_words = state_count.checked_mul(STATE_WORDS).ok_or(
+            CompileError::InternalInvariant(
+                "static-prefix resume descriptor state extent overflowed",
+            ),
+        )?;
+        let item_start = HEADER_WORDS.checked_add(state_words).ok_or(
+            CompileError::InternalInvariant(
+                "static-prefix resume descriptor item offset overflowed",
+            ),
+        )?;
+        if item_start.checked_add(item_count) != Some(descriptor.len()) {
+            return Err(CompileError::InternalInvariant(
+                "static-prefix resume descriptor payload extent is inconsistent",
+            ));
+        }
+        let records = descriptor.get(HEADER_WORDS..item_start).ok_or(
+            CompileError::InternalInvariant(
+                "static-prefix resume descriptor records are truncated",
+            ),
+        )?;
+        let items = descriptor.get(item_start..).ok_or(
+            CompileError::InternalInvariant(
+                "static-prefix resume descriptor items are truncated",
+            ),
+        )?;
+        let mut cursor = 0usize;
+        for record in records.chunks_exact(STATE_WORDS) {
+            let offset = usize::try_from(record[0]).map_err(|_| {
+                CompileError::InternalInvariant(
+                    "static-prefix resume frontier offset does not fit usize",
+                )
+            })?;
+            let length = usize::try_from(record[1]).map_err(|_| {
+                CompileError::InternalInvariant(
+                    "static-prefix resume frontier length does not fit usize",
+                )
+            })?;
+            let end = offset.checked_add(length).ok_or(
+                CompileError::InternalInvariant(
+                    "static-prefix resume frontier extent overflowed",
+                ),
+            )?;
+            if offset != cursor
+                || length == 0
+                || record[2] > 1
+                || record[3] != 0
+                || end > item_count
+            {
+                return Err(CompileError::InternalInvariant(
+                    "static-prefix resume frontier metadata is noncanonical",
+                ));
+            }
+            cursor = end;
+        }
+        if cursor != item_count {
+            return Err(CompileError::InternalInvariant(
+                "static-prefix resume frontiers do not cover their item arena",
+            ));
+        }
+        let frontiers = records.chunks_exact(STATE_WORDS).map(|record| {
+            let offset = usize::try_from(record[0]).expect("validated resume offset");
+            let length = usize::try_from(record[1]).expect("validated resume length");
+            let end = offset
+                .checked_add(length)
+                .expect("validated resume frontier extent");
+            (&items[offset..end], record[2] != 0)
+        });
+        K0ResumeSet::new(&self.automaton, state_count, item_count, frontiers)
+            .map_err(CompileError::from)
+    }
+
+    /// Authenticate and lazily graph-bind one transient static-prefix
+    /// continuation descriptor, then admit its exact synchronous window.
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the compiler-private preflight binds artifact, object sidecar, workspace, and exact call"
+    )]
+    pub fn preflight_static_prefix_resume_with_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+        expected_artifact_identity: [u8; 32],
+        descriptor_binding: usize,
+        descriptor: &[u32],
+    ) -> Result<(), CompileError> {
+        if window.start > window.end || window.end > haystack.len() {
+            return Err(CompileError::InvalidWindow {
+                start: window.start,
+                end: window.end,
+                haystack_len: haystack.len(),
+            });
+        }
+        if expected_artifact_identity != self.identity.artifact
+            || !workspace.identity.compatible(&self.identity)
+            || descriptor_binding == 0
+            || self.context_dfa.is_some()
+            || !matches!(self.engine, ProgramEngine::OrderedNfa)
+            || self.automaton.stats().has_assertions()
+            || window.end.saturating_sub(window.start) < PARTIAL_DFA_MIN_INPUT_BYTES
+        {
+            return Err(CompileError::InternalInvariant(
+                "static-prefix resume preflight rejected its artifact, graph, sidecar, or window",
+            ));
+        }
+        let already_bound = workspace
+            .static_prefix_resume
+            .as_deref()
+            .is_some_and(|state| {
+                state.descriptor_binding == descriptor_binding
+                    && state.resume.is_bound_to(&self.automaton)
+            });
+        if !already_bound {
+            let mut resume = self.static_prefix_resume_set_from_descriptor(descriptor)?;
+            workspace.mark_dynamic_native_rows_dirty();
+            let fully_prefilled = workspace.nfa.as_mut().and_then(|nfa| {
+                nfa.compiler_private_try_prefill_resume_caches_with_receipt(
+                    &self.automaton,
+                    &mut resume,
+                )
+                .map(|k0| FullyPrefilledFallbackReceipt {
+                    program_instance: self.identity.instance,
+                    k0,
+                })
+            });
+            workspace.static_prefix_resume = Some(Box::new(StaticPrefixResumeWorkspace {
+                descriptor_binding,
+                resume,
+                fully_prefilled,
+                ticket: None,
+            }));
+        }
+        workspace
+            .static_prefix_resume
+            .as_deref_mut()
+            .ok_or(CompileError::InternalInvariant(
+                "static-prefix resume preflight did not retain its sidecar",
+            ))?
+            .admit(haystack, window);
+        Ok(())
+    }
+
+    /// Continue from the exact frontier and first unconsumed byte returned by
+    /// the static native prefix admitted in the immediately preceding call.
+    #[doc(hidden)]
+    pub fn search_from_static_prefix_resume_ticket_with_workspace(
+        &self,
+        haystack: &[u8],
+        workspace: &mut ProgramWorkspace,
+        resume_state: usize,
+        resume_position: usize,
+        pending_end_word: usize,
+    ) -> Result<MatchResult, CompileError> {
+        if !workspace.identity.compatible(&self.identity)
+            || self.context_dfa.is_some()
+            || !matches!(self.engine, ProgramEngine::OrderedNfa)
+            || self.automaton.stats().has_assertions()
+        {
+            return Err(CompileError::InternalInvariant(
+                "static-prefix continuation rejected its workspace or graph",
+            ));
+        }
+        let ProgramWorkspace {
+            nfa,
+            static_prefix_resume,
+            dynamic_native_rows,
+            ..
+        } = workspace;
+        let state = static_prefix_resume.as_deref_mut().ok_or(
+            CompileError::InternalInvariant(
+                "static-prefix continuation has no graph-bound sidecar",
+            ),
+        )?;
+        let window = state.consume(haystack)?;
+        if resume_position <= window.start || resume_position >= window.end {
+            return Err(CompileError::InternalInvariant(
+                "static-prefix continuation position is outside its admitted window",
+            ));
+        }
+        let pending = state.resume.pending_mode(resume_state)?;
+        let pending_end = pending.then_some(pending_end_word);
+        if pending_end.is_some_and(|end| end <= window.start || end > resume_position) {
+            return Err(CompileError::InternalInvariant(
+                "static-prefix continuation pending endpoint is outside its consumed prefix",
+            ));
+        }
+        if let Some(dynamic) = dynamic_native_rows.as_deref_mut() {
+            dynamic.native_rows_dirty = true;
+        }
+        let resumed = self.search_nfa_from_partial_resume(
+            haystack,
+            window,
+            nfa.as_mut().ok_or(CompileError::InternalInvariant(
+                "static-prefix continuation has no prepared K0 workspace",
+            ))?,
+            &mut state.resume,
+            PartialDfaResume {
+                state: resume_state,
+                position: resume_position,
+                pending_end,
+            },
+            state.fully_prefilled,
+        )?;
+        Ok(resumed.found)
+    }
+
+    /// Recover a variable-width Span start using the exact static frontier set
+    /// and receipt bound by the immediately preceding V2 preflight.
+    #[doc(hidden)]
+    pub fn recover_bound_static_prefix_span_from_selected_end_with_workspace(
+        &self,
+        haystack: &[u8],
+        expected_window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+        expected_artifact_identity: [u8; 32],
+        selected_end: usize,
+    ) -> Result<MatchResult, CompileError> {
+        if expected_artifact_identity != self.identity.artifact
+            || !workspace.identity.compatible(&self.identity)
+            || self.context_dfa.is_some()
+            || !matches!(self.engine, ProgramEngine::OrderedNfa)
+            || self.automaton.stats().has_assertions()
+            || self.output != OutputContract::Span
+            || self.exact_match_width.is_some()
+        {
+            return Err(CompileError::InternalInvariant(
+                "bound static-prefix Span recovery rejected its artifact or graph",
+            ));
+        }
+        let ProgramWorkspace {
+            nfa,
+            static_prefix_resume,
+            dynamic_native_rows,
+            ..
+        } = workspace;
+        let state = static_prefix_resume.as_deref_mut().ok_or(
+            CompileError::InternalInvariant(
+                "bound static-prefix Span recovery has no graph-bound sidecar",
+            ),
+        )?;
+        let window = state.consume(haystack)?;
+        if window != expected_window {
+            return Err(CompileError::InternalInvariant(
+                "bound static-prefix Span recovery window disagrees with its ticket",
+            ));
+        }
+        if selected_end <= window.start || selected_end > window.end {
+            return Err(CompileError::InternalInvariant(
+                "bound static-prefix Span endpoint is outside its admitted window",
+            ));
+        }
+        if let Some(dynamic) = dynamic_native_rows.as_deref_mut() {
+            dynamic.native_rows_dirty = true;
+        }
+        let recovered_start = self.recover_partial_span_start(
+            haystack,
+            window,
+            nfa.as_mut().ok_or(CompileError::InternalInvariant(
+                "bound static-prefix Span recovery has no bidirectional K0 workspace",
+            ))?,
+            Some(&state.resume),
+            selected_end,
+            state.fully_prefilled,
+        )?;
         Ok(MatchResult::Span(Some((recovered_start, selected_end))))
     }
 
@@ -12326,6 +12741,9 @@ impl CompiledProgram {
             state.observe_fallback(consumed, input_bytes);
             return Ok(None);
         }
+        let resume_set = resume_set.as_mut().ok_or(CompileError::InternalInvariant(
+            "partial DFA hole has no authenticated K0 resume set",
+        ))?;
         let resumed = self.search_nfa_from_partial_resume(
             haystack, window, workspace, resume_set, resume, receipt,
         )?;
@@ -12342,13 +12760,10 @@ impl CompiledProgram {
         haystack: &[u8],
         window: SearchWindow,
         workspace: &mut K0Workspace,
-        resume_set: &mut Option<K0ResumeSet>,
+        resume_set: &mut K0ResumeSet,
         resume: PartialDfaResume,
         receipt: Option<FullyPrefilledFallbackReceipt>,
     ) -> Result<PartialDfaResumeResult, CompileError> {
-        let resume_set = resume_set.as_mut().ok_or(CompileError::InternalInvariant(
-            "partial DFA hole has no authenticated K0 resume set",
-        ))?;
         let k0_window = K0SearchWindow::new(window.start, window.end);
         let limits = SearchLimits::unlimited();
         let k0_receipt = receipt
