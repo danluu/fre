@@ -1571,6 +1571,73 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_search_exclusive_v1(
     )
 }
 
+/// Authenticate one compiler-owned static native prefix search.
+///
+/// This compiler-private entry validates the ordinary exclusive-search
+/// boundary and binds generated code to the exact prepared artifact. It does
+/// not inspect or mutate executor workspace state: on success the caller may
+/// run its immutable native prefix over the unchanged search window. A native
+/// hole must leave generated code and complete the same whole search through
+/// [`fre_aot_regex_runtime_search_exclusive_v1`].
+///
+/// The helper is deliberately independent of serialized retained-DFA rows.
+/// Optimizing compilation can therefore publish a transient, resource-bounded
+/// native prefix without adding pattern-specific state to the stable program
+/// format or rebuilding a runtime on every hole.
+///
+/// # Safety
+///
+/// `handle` must satisfy the exclusive ownership contract of
+/// [`fre_aot_regex_runtime_search_exclusive_v1`]. Haystack and result extents
+/// have the same requirements. `expected_artifact_identity_ptr` must address
+/// exactly [`ARTIFACT_IDENTITY_BYTES`] readable bytes and be disjoint from the
+/// writable result for the duration of the call.
+#[doc(hidden)]
+#[unsafe(no_mangle)]
+#[allow(
+    unsafe_code,
+    clippy::too_many_arguments,
+    reason = "the compiler-private static-prefix boundary authenticates raw generated-code arguments"
+)]
+pub unsafe extern "C" fn fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_preflight_v1(
+    handle: FreAotRegexExclusiveHandleV1,
+    haystack_ptr: *const u8,
+    haystack_len: usize,
+    window_start: usize,
+    window_end: usize,
+    result_ptr: *mut FreAotRegexResultV1,
+    expected_artifact_identity_ptr: *const u8,
+) -> u32 {
+    if handle.is_invalid() {
+        return STATUS_INVALID_HANDLE;
+    }
+    if haystack_ptr.is_null()
+        || result_ptr.is_null()
+        || !result_ptr.is_aligned()
+        || expected_artifact_identity_ptr.is_null()
+        || haystack_len > isize::MAX.unsigned_abs()
+        || window_start > window_end
+        || window_end > haystack_len
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+
+    // SAFETY: the caller guarantees one live exclusively owned allocation and
+    // every readable/writable extent documented above. Reading the immutable
+    // header does not claim or alter any mutable prepared-workspace capability.
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        let prepared = &*handle.0.cast::<PreparedAotRegex>();
+        let expected_artifact_identity = expected_artifact_identity_ptr
+            .cast::<[u8; ARTIFACT_IDENTITY_BYTES]>()
+            .read();
+        if expected_artifact_identity != *prepared.frozen_header.artifact_identity() {
+            return STATUS_RUNTIME_FAILURE;
+        }
+        STATUS_PARTIAL_PREFLIGHT_ENTER
+    }))
+    .unwrap_or(STATUS_RUNTIME_FAILURE)
+}
+
 /// Compiler-private capability and side exit for a frozen prepared root.
 ///
 /// Future generated direct entries link this distinct symbol instead of a V1
@@ -3321,6 +3388,29 @@ mod tests {
         }
     }
 
+    fn call_exclusive_static_prefix_preflight(
+        handle: FreAotRegexExclusiveHandleV1,
+        haystack: &[u8],
+        start: usize,
+        end: usize,
+        result: &mut FreAotRegexResultV1,
+        expected_artifact_identity: &[u8; ARTIFACT_IDENTITY_BYTES],
+    ) -> u32 {
+        // SAFETY: each test owns the live exclusive session and supplies
+        // readable haystack/identity plus disjoint aligned writable output.
+        unsafe {
+            fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_preflight_v1(
+                handle,
+                haystack.as_ptr(),
+                haystack.len(),
+                start,
+                end,
+                result,
+                expected_artifact_identity.as_ptr(),
+            )
+        }
+    }
+
     fn exclusive_frozen_header_is_active(handle: FreAotRegexExclusiveHandleV1) -> bool {
         assert!(!handle.is_invalid());
         // SAFETY: lifecycle tests call this only while they uniquely own the
@@ -3883,6 +3973,7 @@ mod tests {
             "fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v4",
             "fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v5",
             "fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v6",
+            "fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_preflight_v1",
             "fre_aot_regex_runtime_search_exclusive_dynamic_rows_deopt_v1",
             "fre_aot_regex_runtime_search_exclusive_dynamic_rows_continue_v1",
             "fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1",
@@ -3929,6 +4020,16 @@ mod tests {
             *mut FreAotRegexResultV1,
             *const u8,
         ) -> u32 = fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1;
+        let _: unsafe extern "C" fn(
+            FreAotRegexExclusiveHandleV1,
+            *const u8,
+            usize,
+            usize,
+            usize,
+            *mut FreAotRegexResultV1,
+            *const u8,
+        ) -> u32 =
+            fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_preflight_v1;
         let _: unsafe extern "C" fn(
             FreAotRegexExclusiveHandleV1,
             *const u8,
@@ -6446,6 +6547,87 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
         // overlaps destruction.
         assert_eq!(
             unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(exclusive) },
+            STATUS_SUCCESS
+        );
+    }
+
+    #[test]
+    fn static_prefix_preflight_authenticates_without_consuming_prepared_state() {
+        let compiled = compile(
+            CompileRequest::new("(?:ab|ac)+z", Target::x86_64_linux())
+                .mode(CompileMode::Fast)
+                .output(OutputContract::Span),
+        )
+        .expect("compile static-prefix preflight fixture");
+        let identity = compiled.receipt().program_sha256;
+        let serialized = compiled.program().serialize().expect("serialize fixture");
+        let handle = prepare_exclusive(&serialized);
+        let haystack = b"!!abacz??";
+        let sentinel = FreAotRegexResultV1 {
+            start: 0xfeed_face,
+            end: 0xdead_beef,
+        };
+        let mut result = sentinel;
+
+        assert_eq!(
+            call_exclusive_static_prefix_preflight(
+                handle,
+                haystack,
+                0,
+                haystack.len(),
+                &mut result,
+                &identity,
+            ),
+            STATUS_PARTIAL_PREFLIGHT_ENTER
+        );
+        assert_eq!(result, sentinel);
+        assert!(exclusive_frozen_header_is_active(handle));
+
+        let mut wrong_identity = identity;
+        wrong_identity[17] ^= 0x80;
+        assert_eq!(
+            call_exclusive_static_prefix_preflight(
+                handle,
+                haystack,
+                0,
+                haystack.len(),
+                &mut result,
+                &wrong_identity,
+            ),
+            STATUS_RUNTIME_FAILURE
+        );
+        assert_eq!(result, sentinel);
+        assert!(exclusive_frozen_header_is_active(handle));
+
+        let mut fallback = FreAotRegexResultV1::default();
+        assert_eq!(
+            call_exclusive(handle, haystack, 0, haystack.len(), &mut fallback),
+            STATUS_MATCH
+        );
+        assert_eq!(fallback, FreAotRegexResultV1 { start: 2, end: 7 });
+        assert!(!exclusive_frozen_header_is_active(handle));
+
+        // The immutable identity remains authoritative after a general search
+        // retires unrelated frozen-row capabilities. A later static-prefix
+        // call can still complete natively or deopt through the same handle.
+        result = sentinel;
+        assert_eq!(
+            call_exclusive_static_prefix_preflight(
+                handle,
+                haystack,
+                2,
+                7,
+                &mut result,
+                &identity,
+            ),
+            STATUS_PARTIAL_PREFLIGHT_ENTER
+        );
+        assert_eq!(result, sentinel);
+
+        // SAFETY: this test owns the unique live handle and no operation
+        // overlaps destruction.
+        assert_eq!(
+            unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(handle) },
             STATUS_SUCCESS
         );
     }

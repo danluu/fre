@@ -927,6 +927,8 @@ const PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_search_exclusive_v1";
 const PREPARED_PREFLIGHT_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_search_exclusive_partial_preflight_v1";
+const SLOW_PREFIX_PREFLIGHT_RUNTIME_SYMBOL_NAME: &str =
+    "fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_preflight_v1";
 const DYNAMIC_ROWS_PREFLIGHT_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v6";
 const DYNAMIC_ROWS_DEOPT_RUNTIME_SYMBOL_NAME: &str =
@@ -1094,6 +1096,7 @@ struct PreparedNativeEntryLayout {
     identity_offset: usize,
     span_recovery: bool,
     dynamic_rows: bool,
+    slow_prefix: bool,
 }
 
 impl CompiledModule {
@@ -1226,6 +1229,7 @@ impl CompiledModule {
         } else {
             None
         };
+        let mut optional_prepared_layout = None;
         let mut complete_k0 = None;
 
         let slow_determinized = if optional_lowering.is_none() {
@@ -1267,22 +1271,30 @@ impl CompiledModule {
                     optional_lowering = Some(lowering);
                 } else {
                     let lowered = if uses_partial_wrapper {
-                        // The raw slow-partial entry must rebuild the semantic
-                        // runtime and replay from the original window whenever
-                        // it reaches a collapsed hole. Preserve the ordinary
-                        // lowering cascade instead: every runtime-backed route
-                        // below publishes an authenticated prepared entry whose
-                        // workspace survives repeated compiled searches.
-                        Ok(None)
+                        // Run the compiler-owned prefix under an authenticated
+                        // prepared entry. Local completions retain native speed;
+                        // a collapsed hole reuses the same prepared workspace
+                        // for the general whole-search fallback.
+                        lower_optional_native_slow_partial_prepared_with_data_limit(
+                            &program_bytes,
+                            view,
+                            program.artifact_identity(),
+                            target,
+                            effective_native_data_limit_bytes,
+                        )
+                        .map(|lowered| {
+                            lowered.map(|(lowering, prepared)| (lowering, Some(prepared)))
+                        })
                     } else {
                         lower_optional_native_dfa_with_data_limit(
                             view,
                             target,
                             effective_native_data_limit_bytes,
                         )
+                        .map(|lowered| lowered.map(|lowering| (lowering, None)))
                     };
                     match lowered {
-                        Ok(Some(lowering)) => {
+                        Ok(Some((lowering, prepared_layout))) => {
                             let native_data_bytes = if uses_partial_wrapper {
                                 lowering.data.len().checked_sub(program_bytes.len()).ok_or(
                                     CompileError::InternalInvariant(
@@ -1302,6 +1314,7 @@ impl CompiledModule {
                             });
                             slow_retained_forward_minimized =
                                 candidate.retained_forward_minimized();
+                            optional_prepared_layout = prepared_layout;
                             optional_lowering = Some(lowering);
                         }
                         Ok(None) => {}
@@ -1326,6 +1339,7 @@ impl CompiledModule {
         Self::lower_serialized_with_prelowered(
             program_bytes,
             optional_lowering,
+            optional_prepared_layout,
             slow_aot_report,
             slow_context_aot_report,
             slow_retained_forward_minimized,
@@ -1382,6 +1396,7 @@ impl CompiledModule {
             optional_lowering,
             None,
             None,
+            None,
             false,
             native,
             program.native_context_program_view(),
@@ -1420,6 +1435,7 @@ impl CompiledModule {
             prelowered,
             None,
             None,
+            None,
             false,
             native,
             native_context,
@@ -1438,6 +1454,7 @@ impl CompiledModule {
     fn lower_serialized_with_prelowered(
         program_bytes: Vec<u8>,
         prelowered: Option<NativeLowering>,
+        prelowered_prepared_layout: Option<PreparedEntryLayout>,
         slow_aot_report: Option<SlowAotReport>,
         slow_context_aot_report: Option<SlowContextAotReport>,
         slow_retained_forward_minimized: bool,
@@ -1466,10 +1483,20 @@ impl CompiledModule {
         let serialized_program_size = program_bytes.len();
         let program_digest = Sha256::digest(&program_bytes);
         let program_name = identity_symbol(PROGRAM_SYMBOL_PREFIX, program_digest.as_slice())?;
+        if prelowered_prepared_layout.is_some() && prelowered.is_none() {
+            return Err(ObjectError::InvalidModule(
+                "prelowered prepared layout has no selected native lowering",
+            ));
+        }
         let (lowering, native_digest, prepared_layout) = if let Some(lowering) = prelowered {
             validate_native_slow_partial_table_layout(&program_bytes, &lowering, target)?;
-            let native_digest = native_module_digest(&program_bytes, target, &lowering, None)?;
-            (lowering, native_digest, None)
+            let native_digest = native_module_digest(
+                &program_bytes,
+                target,
+                &lowering,
+                prelowered_prepared_layout,
+            )?;
+            (lowering, native_digest, prelowered_prepared_layout)
         } else if let Some(view) = native {
             let native_lowering = lower_native_dfa(view, target)?;
             if let Some(lowering) = native_lowering {
@@ -1786,6 +1813,8 @@ impl CompiledModule {
                     symbols.push(ModuleSymbol {
                         name: if prepared.dynamic_rows {
                             DYNAMIC_ROWS_PREFLIGHT_RUNTIME_SYMBOL_NAME
+                        } else if prepared.slow_prefix {
+                            SLOW_PREFIX_PREFLIGHT_RUNTIME_SYMBOL_NAME
                         } else {
                             PREPARED_PREFLIGHT_RUNTIME_SYMBOL_NAME
                         }
@@ -2548,6 +2577,7 @@ fn lower_native_dynamic_rows_prepared(
                 identity_offset,
                 span_recovery: variable_span_recovery,
                 dynamic_rows: true,
+                slow_prefix: false,
             }),
         },
     ))
@@ -2771,6 +2801,231 @@ fn lower_optional_native_slow_partial_with_data_limit(
         )
     })();
     optional_native_lowering_outcome(outcome)
+}
+
+/// Compose a transient, resource-bounded DFA prefix with the persistent
+/// prepared runtime. The static table is compiler-owned and immutable; it is
+/// intentionally absent from the stable serialized program. Artifact
+/// authentication precedes every native entry, while a collapsed hole replays
+/// only through the already-prepared general engine.
+#[allow(
+    clippy::too_many_lines,
+    reason = "serialized program, static table, authenticated prepared entry, and local native core form one transaction"
+)]
+fn lower_native_slow_partial_prepared_with_data_limit(
+    mut program_bytes: Vec<u8>,
+    view: NativeProgramView<'_>,
+    artifact_identity: [u8; 32],
+    target: Target,
+    max_native_data_bytes: usize,
+) -> Result<Option<(NativeLowering, PreparedEntryLayout)>, ObjectError> {
+    if !view.collapse_partial_holes || view.partial_discovered_states.is_none() {
+        return Err(ObjectError::InvalidModule(
+            "static-prefix hybrid has no collapsed-hole extent",
+        ));
+    }
+    let Some(native) = lower_native_dfa_with_entry_contract_and_data_limit(
+        view,
+        target,
+        NativeDfaEntryContract::PreparedPartialCore,
+        max_native_data_bytes,
+    )? else {
+        return Ok(None);
+    };
+    if native.needs_runtime || native.slow_partial_table.is_some() {
+        return Err(ObjectError::InvalidModule(
+            "static-prefix native core unexpectedly retained a runtime layout",
+        ));
+    }
+
+    let serialized_program_size = program_bytes.len();
+    let table_offset = serialized_program_size
+        .checked_add(15)
+        .ok_or(ObjectError::ArithmeticOverflow("static-prefix table alignment"))?
+        & !15;
+    let table_size = native.data.len();
+    let table_end = table_offset
+        .checked_add(table_size)
+        .ok_or(ObjectError::ArithmeticOverflow("static-prefix table extent"))?;
+    let identity_offset = table_end
+        .checked_add(15)
+        .ok_or(ObjectError::ArithmeticOverflow("static-prefix identity alignment"))?
+        & !15;
+    let final_data_len = identity_offset
+        .checked_add(artifact_identity.len())
+        .ok_or(ObjectError::ArithmeticOverflow("static-prefix data extent"))?;
+    let native_data_bytes = final_data_len
+        .checked_sub(serialized_program_size)
+        .ok_or(ObjectError::ArithmeticOverflow("static-prefix native data size"))?;
+    if native_data_bytes > max_native_data_bytes {
+        return Ok(None);
+    }
+    program_bytes
+        .try_reserve_exact(native_data_bytes)
+        .map_err(|_| ObjectError::Allocation("static-prefix combined data"))?;
+    program_bytes.resize(table_offset, 0);
+    push_bytes(&mut program_bytes, &native.data)?;
+    program_bytes.resize(identity_offset, 0);
+    push_bytes(&mut program_bytes, &artifact_identity)?;
+    if program_bytes.len() != final_data_len {
+        return Err(ObjectError::InvalidModule(
+            "static-prefix combined data length changed",
+        ));
+    }
+
+    let (mut code, mut relocations) = match target.architecture {
+        Architecture::X86_64 => lower_x86_64_runtime_adapter()?,
+        Architecture::Aarch64 => lower_aarch64_runtime_adapter()?,
+    };
+    let code_alignment_mask = match target.architecture {
+        Architecture::X86_64 => 15,
+        Architecture::Aarch64 => 3,
+    };
+    let code_offset = code
+        .len()
+        .checked_add(code_alignment_mask)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "static-prefix prepared code alignment",
+        ))?
+        & !code_alignment_mask;
+    match target.architecture {
+        Architecture::X86_64 => code.resize(code_offset, 0x90),
+        Architecture::Aarch64 => {
+            while code.len() < code_offset {
+                push_bytes(&mut code, &0xd503_201f_u32.to_le_bytes())?;
+            }
+        }
+    }
+    let wrapper = match target.architecture {
+        Architecture::X86_64 => lower_x86_64_static_prefix_prepared_wrapper(view.output)?,
+        Architecture::Aarch64 => lower_aarch64_static_prefix_prepared_wrapper(view.output)?,
+    };
+    let NativeSlowPartialWrapper {
+        code: prepared_code,
+        relocations: prepared_relocations,
+        core_call_offset,
+    } = wrapper;
+    let code_size = prepared_code.len();
+    push_bytes(&mut code, &prepared_code)?;
+    for mut relocation in prepared_relocations {
+        relocation.offset = relocation
+            .offset
+            .checked_add(offset_u64(
+                code_offset,
+                "static-prefix prepared relocation base",
+            )?)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "static-prefix prepared relocation offset",
+            ))?;
+        relocations.push(relocation);
+    }
+
+    let native_core_offset = code
+        .len()
+        .checked_add(code_alignment_mask)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "static-prefix native core alignment",
+        ))?
+        & !code_alignment_mask;
+    match target.architecture {
+        Architecture::X86_64 => code.resize(native_core_offset, 0x90),
+        Architecture::Aarch64 => {
+            while code.len() < native_core_offset {
+                push_bytes(&mut code, &0xd503_201f_u32.to_le_bytes())?;
+            }
+        }
+    }
+    let absolute_core_call_offset = code_offset
+        .checked_add(core_call_offset)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "static-prefix local core call offset",
+        ))?;
+    match target.architecture {
+        Architecture::X86_64 => {
+            patch_x86_64_local_call(&mut code, absolute_core_call_offset, native_core_offset)?;
+        }
+        Architecture::Aarch64 => {
+            patch_aarch64_local_call(&mut code, absolute_core_call_offset, native_core_offset)?;
+        }
+    }
+    let native_core_size = native.code.len();
+    push_bytes(&mut code, &native.code)?;
+    for mut relocation in native.relocations {
+        relocation.offset = relocation
+            .offset
+            .checked_add(offset_u64(
+                native_core_offset,
+                "static-prefix native core relocation base",
+            )?)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "static-prefix native core relocation offset",
+            ))?;
+        if relocation.symbol != PROGRAM_SYMBOL {
+            return Err(ObjectError::InvalidModule(
+                "static-prefix native core has an unexpected relocation target",
+            ));
+        }
+        relocation.symbol = PARTIAL_TABLE_SYMBOL;
+        relocations.push(relocation);
+    }
+
+    Ok(Some((
+        NativeLowering {
+            code,
+            data: program_bytes,
+            relocations,
+            slow_partial_table: None,
+            needs_runtime: true,
+            start_accelerator: native.start_accelerator,
+            anchored_prefix_filter_bytes: native.anchored_prefix_filter_bytes,
+        },
+        PreparedEntryLayout {
+            ordinary_code_size: code_offset,
+            code_offset,
+            code_size,
+            kind: PreparedEntryKind::Native(PreparedNativeEntryLayout {
+                native_core_offset,
+                native_core_size,
+                table_offset,
+                table_size,
+                identity_offset,
+                span_recovery: false,
+                dynamic_rows: false,
+                slow_prefix: true,
+            }),
+        },
+    )))
+}
+
+fn lower_optional_native_slow_partial_prepared_with_data_limit(
+    program_bytes: &[u8],
+    view: NativeProgramView<'_>,
+    artifact_identity: [u8; 32],
+    target: Target,
+    max_native_data_bytes: usize,
+) -> Result<Option<(NativeLowering, PreparedEntryLayout)>, ObjectError> {
+    let mut owned_program = Vec::new();
+    let outcome = owned_program
+        .try_reserve_exact(program_bytes.len())
+        .map_err(|_| ObjectError::Allocation("static-prefix semantic program copy"))
+        .and_then(|()| {
+            owned_program.extend_from_slice(program_bytes);
+            lower_native_slow_partial_prepared_with_data_limit(
+                owned_program,
+                view,
+                artifact_identity,
+                target,
+                max_native_data_bytes,
+            )
+        });
+    match outcome {
+        Ok(lowering) => Ok(lowering),
+        Err(ObjectError::Allocation(_) | ObjectError::Resource {
+            resource: crate::CompileResource::ProgramBytes,
+            ..
+        }) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn validate_native_slow_partial_table_layout(
@@ -3132,6 +3387,7 @@ fn lower_native_partial_prepared(
                 identity_offset,
                 span_recovery,
                 dynamic_rows: false,
+                slow_prefix: false,
             }),
         },
     )))
@@ -3147,6 +3403,18 @@ fn native_module_digest(
     lowering: &NativeLowering,
     prepared_layout: Option<PreparedEntryLayout>,
 ) -> Result<[u8; 32], ObjectError> {
+    if let Some(PreparedEntryLayout {
+        kind: PreparedEntryKind::Native(prepared),
+        ..
+    }) = prepared_layout
+    {
+        if prepared.slow_prefix && (prepared.dynamic_rows || prepared.span_recovery) {
+            return Err(ObjectError::InvalidModule(
+                "static-prefix prepared layout conflicts with another native prepared mode",
+            ));
+        }
+    }
+
     fn update_bytes(
         digest: &mut Sha256,
         bytes: &[u8],
@@ -3249,17 +3517,17 @@ fn native_module_digest(
             .iter()
             .any(|relocation| relocation.symbol == PREPARED_PREFLIGHT_RUNTIME_SYMBOL)
         {
-            // The dynamic warmed-root entry deliberately has no partial-hole
-            // continuation relocation. Commit the actual unresolved helper
-            // name, rather than the shared symbol slot, into module identity.
-            let preflight_symbol_name = if lowering
-                .relocations
-                .iter()
-                .any(|relocation| relocation.symbol == PARTIAL_RUNTIME_SYMBOL)
-            {
-                PREPARED_PREFLIGHT_RUNTIME_SYMBOL_NAME
-            } else {
-                DYNAMIC_ROWS_PREFLIGHT_RUNTIME_SYMBOL_NAME
+            // Distinct prepared-native layouts deliberately share one stable
+            // symbol slot. Commit the helper selected by the authenticated
+            // layout rather than inferring it from unrelated side exits.
+            let preflight_symbol_name = match prepared_layout.map(|layout| layout.kind) {
+                Some(PreparedEntryKind::Native(prepared)) if prepared.dynamic_rows => {
+                    DYNAMIC_ROWS_PREFLIGHT_RUNTIME_SYMBOL_NAME
+                }
+                Some(PreparedEntryKind::Native(prepared)) if prepared.slow_prefix => {
+                    SLOW_PREFIX_PREFLIGHT_RUNTIME_SYMBOL_NAME
+                }
+                _ => PREPARED_PREFLIGHT_RUNTIME_SYMBOL_NAME,
             };
             update_bytes(
                 &mut digest,
@@ -13287,6 +13555,163 @@ fn lower_x86_64_slow_partial_wrapper(
                 )?,
                 kind: RelocationKind::X86PltRelative32,
                 symbol: RUNTIME_SYMBOL,
+                addend: -4,
+            },
+        ],
+        core_call_offset,
+    })
+}
+
+/// Lower the prepared half of a transient static-prefix hybrid. Successful
+/// native completion returns directly; every collapsed hole reuses the same
+/// prepared handle for a whole-search fallback over the original window.
+fn lower_x86_64_static_prefix_prepared_wrapper(
+    output: OutputContract,
+) -> Result<NativeSlowPartialWrapper, ObjectError> {
+    const FRAME_BYTES: u8 = 56;
+    let mut assembler = X86Assembler::new();
+    let preflight_enter = assembler.label()?;
+    let native_match = assembler.label()?;
+    let native_no_match = assembler.label()?;
+    let native_deopt = assembler.label()?;
+    let fallback_runtime = assembler.label()?;
+
+    // Short windows retain the ordinary prepared path. The wrapping
+    // subtraction is harmless because the runtime helper remains the raw-ABI
+    // validator on this branch.
+    assembler.instruction(&[0x4c, 0x89, 0xc0])?; // mov r8, rax
+    assembler.instruction(&[0x48, 0x29, 0xc8])?; // sub rcx, rax
+    let minimum = u32::try_from(PARTIAL_DFA_MIN_INPUT_BYTES)
+        .map_err(|_| ObjectError::ArithmeticOverflow("static-prefix input admission floor"))?;
+    let mut compare_minimum = vec![0x48, 0x3d];
+    compare_minimum.extend_from_slice(&minimum.to_le_bytes());
+    assembler.instruction(&compare_minimum)?;
+    assembler.branch(&[0x0f, 0x82], fallback_runtime)?;
+
+    // Entry RSP is 8 modulo 16. The 56-byte frame aligns helper calls, keeps
+    // all six prepared arguments for a whole-search side exit, and provides
+    // the seventh SysV argument slot for the static artifact identity.
+    assembler.instruction(&[0x48, 0x83, 0xec, FRAME_BYTES])?;
+    assembler.instruction(&[0x48, 0x89, 0x7c, 0x24, 0x08])?; // handle
+    assembler.instruction(&[0x48, 0x89, 0x74, 0x24, 0x10])?; // haystack
+    assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x18])?; // length
+    assembler.instruction(&[0x48, 0x89, 0x4c, 0x24, 0x20])?; // start
+    assembler.instruction(&[0x4c, 0x89, 0x44, 0x24, 0x28])?; // end
+    assembler.instruction(&[0x4c, 0x89, 0x4c, 0x24, 0x30])?; // result
+    assembler.instruction(&[0x48, 0x8d, 0x05])?;
+    let identity_displacement_label = assembler.label()?;
+    assembler.bind(identity_displacement_label)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    assembler.instruction(&[0x48, 0x89, 0x04, 0x24])?;
+    assembler.instruction(&[0xe8])?;
+    let preflight_displacement_label = assembler.label()?;
+    assembler.bind(preflight_displacement_label)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    assembler.instruction(&[0x83, 0xf8, PARTIAL_PREFLIGHT_ENTER_STATUS])?;
+    assembler.branch(&[0x0f, 0x84], preflight_enter)?;
+    assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+    assembler.instruction(&[0xc3])?;
+
+    assembler.bind(preflight_enter)?;
+    assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x10])?;
+    assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x18])?;
+    assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x20])?;
+    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x28])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x30])?;
+    assembler.instruction(&[0xe8])?;
+    let core_call_displacement_label = assembler.label()?;
+    assembler.bind(core_call_displacement_label)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    assembler.instruction(&[0x83, 0xf8, 1])?;
+    assembler.branch(&[0x0f, 0x84], native_match)?;
+    assembler.instruction(&[0x85, 0xc0])?;
+    assembler.branch(&[0x0f, 0x84], native_no_match)?;
+    assembler.branch(&[0xe9], native_deopt)?;
+
+    assembler.bind(native_no_match)?;
+    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x30])?;
+    assembler.instruction(&[0x31, 0xc0])?;
+    assembler.instruction(&[0x49, 0x89, 0x01])?;
+    assembler.instruction(&[0x49, 0x89, 0x41, 0x08])?;
+    assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+    assembler.instruction(&[0xc3])?;
+
+    assembler.bind(native_match)?;
+    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x30])?;
+    match output {
+        OutputContract::Exists => {
+            assembler.instruction(&[0x31, 0xc0])?;
+            assembler.instruction(&[0x49, 0x89, 0x01])?;
+            assembler.instruction(&[0x49, 0x89, 0x41, 0x08])?;
+        }
+        OutputContract::SelectedEnd => {
+            assembler.instruction(&[0x4d, 0x89, 0x19])?;
+            assembler.instruction(&[0x4d, 0x89, 0x59, 0x08])?;
+        }
+        OutputContract::Span => {
+            assembler.instruction(&[0x4d, 0x89, 0x11])?;
+            assembler.instruction(&[0x4d, 0x89, 0x59, 0x08])?;
+        }
+    }
+    assembler.instruction(&[0xb8, 1, 0, 0, 0])?;
+    assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+    assembler.instruction(&[0xc3])?;
+
+    assembler.bind(native_deopt)?;
+    assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x08])?;
+    assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x10])?;
+    assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x18])?;
+    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x20])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x28])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x30])?;
+    assembler.instruction(&[0xe8])?;
+    let deopt_displacement_label = assembler.label()?;
+    assembler.bind(deopt_displacement_label)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+    assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+    assembler.instruction(&[0xc3])?;
+
+    assembler.bind(fallback_runtime)?;
+    assembler.instruction(&[0xe9])?;
+    let fallback_displacement_label = assembler.label()?;
+    assembler.bind(fallback_displacement_label)?;
+    push_bytes(&mut assembler.code, &[0; 4])?;
+
+    let finished = assembler.finish_with_label_offsets()?;
+    let identity_displacement = finished.label_offset(identity_displacement_label)?;
+    let preflight_displacement = finished.label_offset(preflight_displacement_label)?;
+    let core_call_offset = finished.label_offset(core_call_displacement_label)?;
+    let deopt_displacement = finished.label_offset(deopt_displacement_label)?;
+    let fallback_displacement = finished.label_offset(fallback_displacement_label)?;
+    Ok(NativeSlowPartialWrapper {
+        code: finished.code,
+        relocations: vec![
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(identity_displacement, "x86 static-prefix identity relocation")?,
+                kind: RelocationKind::X86PcRelative32,
+                symbol: PARTIAL_IDENTITY_SYMBOL,
+                addend: -4,
+            },
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(preflight_displacement, "x86 static-prefix preflight relocation")?,
+                kind: RelocationKind::X86PltRelative32,
+                symbol: PREPARED_PREFLIGHT_RUNTIME_SYMBOL,
+                addend: -4,
+            },
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(deopt_displacement, "x86 static-prefix deopt relocation")?,
+                kind: RelocationKind::X86PltRelative32,
+                symbol: PREPARED_FALLBACK_RUNTIME_SYMBOL,
+                addend: -4,
+            },
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(fallback_displacement, "x86 static-prefix fallback relocation")?,
+                kind: RelocationKind::X86PltRelative32,
+                symbol: PREPARED_FALLBACK_RUNTIME_SYMBOL,
                 addend: -4,
             },
         ],
@@ -24915,6 +25340,142 @@ fn lower_aarch64_slow_partial_wrapper(
                 )?,
                 kind: RelocationKind::Aarch64Branch26,
                 symbol: RUNTIME_SYMBOL,
+                addend: 0,
+            },
+        ],
+        core_call_offset: relocation_offsets[3],
+    })
+}
+
+fn lower_aarch64_static_prefix_prepared_wrapper(
+    output: OutputContract,
+) -> Result<NativeSlowPartialWrapper, ObjectError> {
+    const FRAME_BYTES: u16 = 64;
+    let mut assembler = Aarch64Assembler::new();
+    let preflight_enter = assembler.label()?;
+    let native_match = assembler.label()?;
+    let native_no_match = assembler.label()?;
+    let native_deopt = assembler.label()?;
+    let fallback_runtime = assembler.label()?;
+
+    // X6 is caller-saved and all six public arguments remain untouched for a
+    // short-window tail fallback.
+    assembler.instruction(aarch64_sub_x_reg(6, 4, 3)?)?;
+    let minimum = u16::try_from(PARTIAL_DFA_MIN_INPUT_BYTES)
+        .map_err(|_| ObjectError::ArithmeticOverflow("static-prefix input admission floor"))?;
+    assembler.instruction(aarch64_cmp_x_imm(6, minimum)?)?;
+    assembler.branch_cond(AARCH64_LO, fallback_runtime)?;
+
+    assembler.instruction(aarch64_sub_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(aarch64_store_pair_x(0, 1, 31, 0)?)?;
+    assembler.instruction(aarch64_store_pair_x(2, 3, 31, 16)?)?;
+    assembler.instruction(aarch64_store_pair_x(4, 5, 31, 32)?)?;
+    assembler.instruction(aarch64_store_x(30, 31, 56)?)?;
+    let identity_page = assembler.instruction(0x9000_0006)?;
+    let identity_page_offset = assembler.instruction(aarch64_add_x_imm(6, 6, 0)?)?;
+    let preflight_branch = assembler.instruction(0x9400_0000)?;
+    assembler.instruction(aarch64_cmp_w_imm(
+        0,
+        u16::from(PARTIAL_PREFLIGHT_ENTER_STATUS),
+    )?)?;
+    assembler.branch_cond(AARCH64_EQ, preflight_enter)?;
+    assembler.instruction(aarch64_load_x_imm(30, 31, 56)?)?;
+    assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    assembler.bind(preflight_enter)?;
+    assembler.instruction(aarch64_load_pair_x(0, 1, 31, 8)?)?;
+    assembler.instruction(aarch64_load_pair_x(2, 3, 31, 24)?)?;
+    let core_call_offset = assembler.instruction(0x9400_0000)?;
+    assembler.instruction(aarch64_cmp_w_imm(0, 1)?)?;
+    assembler.branch_cond(AARCH64_EQ, native_match)?;
+    assembler.instruction(aarch64_cmp_w_imm(0, 0)?)?;
+    assembler.branch_cond(AARCH64_EQ, native_no_match)?;
+    assembler.branch(native_deopt)?;
+
+    assembler.bind(native_no_match)?;
+    assembler.instruction(aarch64_load_x_imm(5, 31, 40)?)?;
+    assembler.instruction(aarch64_store_pair_x(31, 31, 5, 0)?)?;
+    assembler.instruction(aarch64_movz_w(0, 0)?)?;
+    assembler.instruction(aarch64_load_x_imm(30, 31, 56)?)?;
+    assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    assembler.bind(native_match)?;
+    assembler.instruction(aarch64_load_x_imm(5, 31, 40)?)?;
+    match output {
+        OutputContract::Exists => {
+            assembler.instruction(aarch64_store_pair_x(31, 31, 5, 0)?)?;
+        }
+        OutputContract::SelectedEnd => {
+            assembler.instruction(aarch64_store_pair_x(7, 7, 5, 0)?)?;
+        }
+        OutputContract::Span => {
+            assembler.instruction(aarch64_store_pair_x(6, 7, 5, 0)?)?;
+        }
+    }
+    assembler.instruction(aarch64_movz_w(0, 1)?)?;
+    assembler.instruction(aarch64_load_x_imm(30, 31, 56)?)?;
+    assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    assembler.bind(native_deopt)?;
+    assembler.instruction(aarch64_load_pair_x(0, 1, 31, 0)?)?;
+    assembler.instruction(aarch64_load_pair_x(2, 3, 31, 16)?)?;
+    assembler.instruction(aarch64_load_pair_x(4, 5, 31, 32)?)?;
+    let deopt_branch = assembler.instruction(0x9400_0000)?;
+    assembler.instruction(aarch64_load_x_imm(30, 31, 56)?)?;
+    assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(0xd65f_03c0)?;
+
+    assembler.bind(fallback_runtime)?;
+    let fallback_branch = assembler.instruction(0x1400_0000)?;
+
+    let mut relocation_offsets = [
+        identity_page,
+        identity_page_offset,
+        preflight_branch,
+        core_call_offset,
+        deopt_branch,
+        fallback_branch,
+    ];
+    let code = assembler.finish_with_offsets(&mut relocation_offsets)?;
+    Ok(NativeSlowPartialWrapper {
+        code,
+        relocations: vec![
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(relocation_offsets[0], "AArch64 static-prefix identity ADRP")?,
+                kind: RelocationKind::Aarch64Page21,
+                symbol: PARTIAL_IDENTITY_SYMBOL,
+                addend: 0,
+            },
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(relocation_offsets[1], "AArch64 static-prefix identity ADD")?,
+                kind: RelocationKind::Aarch64PageOff12,
+                symbol: PARTIAL_IDENTITY_SYMBOL,
+                addend: 0,
+            },
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(relocation_offsets[2], "AArch64 static-prefix preflight branch")?,
+                kind: RelocationKind::Aarch64Branch26,
+                symbol: PREPARED_PREFLIGHT_RUNTIME_SYMBOL,
+                addend: 0,
+            },
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(relocation_offsets[4], "AArch64 static-prefix deopt branch")?,
+                kind: RelocationKind::Aarch64Branch26,
+                symbol: PREPARED_FALLBACK_RUNTIME_SYMBOL,
+                addend: 0,
+            },
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(relocation_offsets[5], "AArch64 static-prefix fallback branch")?,
+                kind: RelocationKind::Aarch64Branch26,
+                symbol: PREPARED_FALLBACK_RUNTIME_SYMBOL,
                 addend: 0,
             },
         ],
@@ -44230,6 +44791,7 @@ int main(void){{
                     Some(raw),
                     None,
                     None,
+                    None,
                     false,
                     None,
                     None,
@@ -44342,9 +44904,9 @@ int main(void){{
             assert!(compiled.module().prepared_entry_symbol().is_none());
 
             // The complete compiler-owned K0 table wins when it and the
-            // retained prefix both fit. If the caller gives enough native
-            // data only for the smaller prefix, decline its replaying public
-            // wrapper and preserve the ordinary persistent fallback.
+            // retained prefix both fit. If only the smaller prefix fits, pair
+            // it with the persistent prepared fallback; one byte below that
+            // exact hybrid boundary preserves the ordinary prepared route.
             let serialized = compiled.program().serialize().unwrap();
             for target in identity_target_matrix() {
                 let materialized = compiled
@@ -44366,11 +44928,18 @@ int main(void){{
                         slow_limits,
                     )
                     .unwrap();
-                    let ordinary = CompiledModule::lower(compiled.program(), target).unwrap();
-                    assert!(declined.slow_aot_report().is_none());
-                    assert_eq!(declined.sections(), ordinary.sections());
-                    assert_eq!(declined.symbols(), ordinary.symbols());
-                    assert_eq!(declined.relocations(), ordinary.relocations());
+                    assert!(declined.slow_aot_report().is_some());
+                    assert_eq!(declined.required_runtime_symbol(), Some(RUNTIME_SYMBOL_NAME));
+                    assert!(declined.prepared_entry_symbol().is_some());
+                    assert!(declined.required_prepared_runtime_symbol().is_none());
+                    assert_eq!(
+                        declined.required_prepared_fallback_runtime_symbol(),
+                        Some(PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME)
+                    );
+                    assert_eq!(
+                        declined.required_prepared_preflight_runtime_symbol(),
+                        Some(SLOW_PREFIX_PREFLIGHT_RUNTIME_SYMBOL_NAME)
+                    );
                     continue;
                 };
                 let retained = compiled
@@ -44398,9 +44967,25 @@ int main(void){{
                     .len()
                     .checked_sub(serialized.len())
                     .expect("combined partial table follows its serialized program");
+                let hybrid = lower_optional_native_slow_partial_prepared_with_data_limit(
+                    &serialized,
+                    retained_view,
+                    compiled.program().artifact_identity(),
+                    target,
+                    usize::MAX,
+                )
+                .unwrap()
+                .unwrap_or_else(|| panic!("unlowerable prepared hybrid: {output:?}/{target:?}"));
+                let hybrid_native_bytes = hybrid
+                    .0
+                    .data
+                    .len()
+                    .checked_sub(serialized.len())
+                    .expect("prepared hybrid data follows its serialized program");
+                assert!(hybrid_native_bytes > partial_native_bytes);
                 assert!(
-                    partial_native_bytes < k0.data.len(),
-                    "fixture must separate the partial and complete budgets: {output:?}/{target:?}"
+                    hybrid_native_bytes < k0.data.len(),
+                    "fixture must separate the hybrid and complete budgets: {output:?}/{target:?}"
                 );
 
                 let preferred = CompiledModule::lower_optimizing_with_limits(
@@ -44426,22 +45011,34 @@ int main(void){{
                         compiled.program(),
                         target,
                         slow_limits,
-                        partial_native_bytes,
+                        hybrid_native_bytes,
                     )
                     .unwrap();
+                assert!(constrained.slow_aot_report().is_some());
+                assert_eq!(constrained.required_runtime_symbol(), Some(RUNTIME_SYMBOL_NAME));
+                assert!(constrained.prepared_entry_symbol().is_some());
+                assert!(constrained.required_prepared_runtime_symbol().is_none());
+                assert_eq!(
+                    constrained.required_prepared_fallback_runtime_symbol(),
+                    Some(PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME)
+                );
+                assert_eq!(
+                    constrained.required_prepared_preflight_runtime_symbol(),
+                    Some(SLOW_PREFIX_PREFLIGHT_RUNTIME_SYMBOL_NAME)
+                );
+
+                let below_hybrid = CompiledModule::lower_optimizing_with_limits_and_native_data_limit(
+                    compiled.program(),
+                    target,
+                    slow_limits,
+                    hybrid_native_bytes - 1,
+                )
+                .unwrap();
                 let ordinary = CompiledModule::lower(compiled.program(), target).unwrap();
-                assert!(constrained.slow_aot_report().is_none());
-                assert_eq!(
-                    constrained.required_runtime_symbol(),
-                    ordinary.required_runtime_symbol()
-                );
-                assert_eq!(
-                    constrained.prepared_entry_symbol(),
-                    ordinary.prepared_entry_symbol()
-                );
-                assert_eq!(constrained.sections(), ordinary.sections());
-                assert_eq!(constrained.symbols(), ordinary.symbols());
-                assert_eq!(constrained.relocations(), ordinary.relocations());
+                assert!(below_hybrid.slow_aot_report().is_none());
+                assert_eq!(below_hybrid.sections(), ordinary.sections());
+                assert_eq!(below_hybrid.symbols(), ordinary.symbols());
+                assert_eq!(below_hybrid.relocations(), ordinary.relocations());
             }
             for pass in [
                 crate::OptimizationPass::UniversalOrderedTnfa,
@@ -44556,6 +45153,7 @@ int main(void){{
             let module = CompiledModule::lower_serialized_with_prelowered(
                 program,
                 Some(lowering),
+                None,
                 None,
                 None,
                 false,
@@ -44847,6 +45445,7 @@ int main(void){{
             view.partial_discovered_states,
             partial.retained_dimensions().map(|(_, discovered)| discovered)
         );
+        let serialized = fast.program().serialize().expect("serialize slow fixture");
         for target in [
             Target::x86_64_linux(),
             Target::x86_64_macos(),
@@ -44860,12 +45459,29 @@ int main(void){{
             )
             .unwrap_or_else(|error| panic!("reverse-stage fallback {target:?}: {error}"));
             let ordinary = CompiledModule::lower(fast.program(), target).unwrap();
-            assert!(module.slow_aot_report().is_none());
+            let report = module
+                .slow_aot_report()
+                .unwrap_or_else(|| panic!("missing retained-prefix report: {target:?}"));
+            assert!(report.determinization.decline.as_ref().is_some_and(|decline| {
+                decline.stage == crate::DeterminizationStage::ReverseSubsetConstruction
+            }));
             assert_eq!(module.required_runtime_symbol(), ordinary.required_runtime_symbol());
-            assert_eq!(module.prepared_entry_symbol(), ordinary.prepared_entry_symbol());
-            assert_eq!(module.sections(), ordinary.sections());
-            assert_eq!(module.symbols(), ordinary.symbols());
-            assert_eq!(module.relocations(), ordinary.relocations());
+            assert!(module.prepared_entry_symbol().is_some());
+            assert!(module.required_prepared_runtime_symbol().is_none());
+            assert_eq!(
+                module.required_prepared_fallback_runtime_symbol(),
+                Some(PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME)
+            );
+            assert_eq!(
+                module.required_prepared_preflight_runtime_symbol(),
+                Some(SLOW_PREFIX_PREFLIGHT_RUNTIME_SYMBOL_NAME)
+            );
+            assert!(module.sections()[PROGRAM_SECTION]
+                .bytes()
+                .starts_with(&serialized));
+            assert!(ordinary.sections()[PROGRAM_SECTION]
+                .bytes()
+                .starts_with(&serialized));
         }
     }
 
@@ -47591,6 +48207,274 @@ int main(void){{
                 }
             }
         }
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    #[ignore = "requires `cargo build -p fre-aot-regex-runtime --lib`; links the static-prefix hybrid to the real exclusive runtime"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the opt-in differential constructs the resource-capped hybrid and reuses one real prepared handle across native and fallback paths"
+    )]
+    fn linked_host_slow_prefix_hybrid_reuses_one_handle_across_real_fallbacks() {
+        use std::{fs, process::Command, time::SystemTime};
+
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum StaticOutcome {
+            Match,
+            NoMatch,
+            InteriorHole,
+        }
+
+        fn trace_static_prefix(
+            view: NativeProgramView<'_>,
+            complete_rows: usize,
+            bytes: &[u8],
+        ) -> StaticOutcome {
+            let mut state = 0_usize;
+            for (position, &byte) in bytes.iter().enumerate() {
+                let class = usize::from(view.dfa.byte_classes[usize::from(byte)]);
+                let cell = view.dfa.forward_cells[state * view.dfa.class_count + class];
+                if cell.accepted() {
+                    return StaticOutcome::Match;
+                }
+                let next = cell.next();
+                if next == NO_DFA_STATE {
+                    return StaticOutcome::NoMatch;
+                }
+                let next = usize::try_from(next).expect("semantic state index");
+                if next >= complete_rows {
+                    return if position + 1 < bytes.len() {
+                        StaticOutcome::InteriorHole
+                    } else {
+                        StaticOutcome::NoMatch
+                    };
+                }
+                state = next;
+            }
+            StaticOutcome::NoMatch
+        }
+
+        fn c_bytes(bytes: &[u8]) -> String {
+            bytes
+                .iter()
+                .map(u8::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+
+        let mut target = if cfg!(target_arch = "x86_64") {
+            if cfg!(target_os = "linux") {
+                Target::x86_64_linux()
+            } else {
+                Target::x86_64_macos()
+            }
+        } else if cfg!(target_os = "linux") {
+            Target::aarch64_linux()
+        } else {
+            Target::aarch64_macos()
+        };
+        if cfg!(target_arch = "aarch64") {
+            target = target
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                .unwrap();
+        }
+
+        let fast = compile(
+            CompileRequest::new(PARTIAL_LOOP_PATTERN, target)
+                .mode(CompileMode::Fast)
+                .output(OutputContract::SelectedEnd),
+        )
+        .expect("fast static-prefix fixture");
+        let (slow_limits, candidate) = (1..=64)
+            .find_map(|max_states| {
+                let limits = slow_partial_limits(max_states);
+                let candidate = fast
+                    .program()
+                    .native_slow_determinized_program(
+                        limits.determinize,
+                        limits.max_allocation_bytes,
+                    )
+                    .expect("bounded static-prefix construction")?;
+                let (complete, discovered) = candidate.retained_dimensions()?;
+                if complete == 0 || complete >= discovered {
+                    return None;
+                }
+                let view = fast.program().native_slow_determinized_view(&candidate);
+                let layout = build_native_dfa_table_for_architecture(view, target.architecture)
+                    .expect("host static-prefix table")
+                    .1;
+                layout.loop_skip.is_some().then_some((limits, candidate))
+            })
+            .expect("resource-bounded prefix with a native loop");
+        let (complete_rows, discovered_states) = candidate
+            .retained_dimensions()
+            .expect("retained prefix dimensions");
+        assert!(complete_rows < discovered_states);
+        let view = fast.program().native_slow_determinized_view(&candidate);
+        assert!(view.collapse_partial_holes);
+
+        let serialized = fast.program().serialize().expect("serialize hybrid program");
+        let direct_hybrid = lower_optional_native_slow_partial_prepared_with_data_limit(
+            &serialized,
+            view,
+            fast.program().artifact_identity(),
+            target,
+            usize::MAX,
+        )
+        .expect("lower host static-prefix hybrid")
+        .expect("host static-prefix hybrid fits");
+        let native_data_bytes = direct_hybrid
+            .0
+            .data
+            .len()
+            .checked_sub(serialized.len())
+            .expect("hybrid data follows the semantic program");
+        let module = CompiledModule::lower_optimizing_with_limits_and_native_data_limit(
+            fast.program(),
+            target,
+            slow_limits,
+            native_data_bytes,
+        )
+        .expect("select resource-capped static-prefix hybrid");
+        assert!(module.slow_aot_report().is_some());
+        assert_eq!(
+            module.required_prepared_preflight_runtime_symbol(),
+            Some(SLOW_PREFIX_PREFLIGHT_RUNTIME_SYMBOL_NAME)
+        );
+        assert_eq!(
+            module.required_prepared_fallback_runtime_symbol(),
+            Some(PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME)
+        );
+        assert!(module.required_prepared_runtime_symbol().is_none());
+        assert!(!module
+            .relocations()
+            .iter()
+            .any(|relocation| relocation.symbol == PARTIAL_RUNTIME_SYMBOL));
+
+        let long_len = PARTIAL_DFA_MIN_INPUT_BYTES + 64;
+        let mut native_match = vec![b'!'; long_len];
+        native_match[0] = b'A';
+        *native_match.last_mut().expect("nonempty match fixture") = b'Z';
+        assert_eq!(
+            trace_static_prefix(view, complete_rows, &native_match),
+            StaticOutcome::Match
+        );
+        let native_no_match = vec![b'!'; long_len];
+        assert_eq!(
+            trace_static_prefix(view, complete_rows, &native_no_match),
+            StaticOutcome::NoMatch
+        );
+        let hole_haystack = generated_byte_strings(
+            &[0, b'A', b'Z', b'a', b'b', b'c', b'd', b'!'],
+            6,
+        )
+        .into_iter()
+        .find_map(|prefix| {
+            let mut haystack = vec![b'!'; long_len];
+            haystack[..prefix.len()].copy_from_slice(&prefix);
+            (trace_static_prefix(view, complete_rows, &haystack)
+                == StaticOutcome::InteriorHole)
+                .then_some(haystack)
+        })
+        .expect("reachable interior static-prefix hole");
+        let short_match = b"A!Z";
+
+        let current_exe = std::env::current_exe().expect("current test executable");
+        let profile_dir = current_exe
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("Cargo profile directory");
+        let static_runtime = profile_dir.join("libfre_aot_regex_runtime.a");
+        assert!(
+            static_runtime.is_file(),
+            "build the linked runtime first: cargo build -p fre-aot-regex-runtime --lib ({})",
+            static_runtime.display()
+        );
+
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "fre-aot-slow-prefix-hybrid-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("create hybrid linker directory");
+        let object = directory.join("hybrid.o");
+        let object_bytes = emit_object(&module, ObjectFormat::for_target(target), usize::MAX)
+            .expect("emit hybrid object");
+        fs::write(&object, object_bytes).expect("write hybrid object");
+        let symbol = module.prepared_entry_symbol().expect("hybrid prepared symbol");
+        let (program_symbol, program_len) = module
+            .required_runtime_program()
+            .expect("hybrid runtime program alias");
+
+        let source = format!(
+            "#include <stddef.h>\n#include <stdint.h>\n\
+             typedef void *handle_t;typedef struct{{size_t start;size_t end;}} result_t;\n\
+             extern const unsigned char {program_symbol}[];\n\
+             extern uint32_t {symbol}(handle_t,const unsigned char*,size_t,size_t,size_t,result_t*);\n\
+             extern uint32_t fre_aot_regex_runtime_prepare_exclusive_v1(const unsigned char*,size_t,handle_t*);\n\
+             extern uint32_t fre_aot_regex_runtime_search_exclusive_v1(handle_t,const unsigned char*,size_t,size_t,size_t,result_t*);\n\
+             extern uint32_t fre_aot_regex_runtime_destroy_exclusive_v1(handle_t);\n\
+             static const unsigned char native_match[]={{{}}};\n\
+             static const unsigned char native_no_match[]={{{}}};\n\
+             static const unsigned char hole_haystack[]={{{}}};\n\
+             static const unsigned char short_match[]={{{}}};\n\
+             static int run_one(handle_t native,handle_t baseline,const unsigned char*p,size_t n,int code){{\
+               result_t nr={{91U,92U}},br={{93U,94U}};\
+               uint32_t ns={symbol}(native,p,n,0U,n,&nr);\
+               uint32_t bs=fre_aot_regex_runtime_search_exclusive_v1(baseline,p,n,0U,n,&br);\
+               if(ns!=bs||nr.start!=br.start||nr.end!=br.end)return code;return 0;}}\n\
+             int main(void){{handle_t native=0,baseline=0;int status;\
+               if(fre_aot_regex_runtime_prepare_exclusive_v1({program_symbol},{program_len}U,&native)!=0U)return 10;\
+               if(fre_aot_regex_runtime_prepare_exclusive_v1({program_symbol},{program_len}U,&baseline)!=0U)return 11;\
+               status=run_one(native,baseline,native_match,sizeof(native_match),20);if(status)return status;\
+               status=run_one(native,baseline,hole_haystack,sizeof(hole_haystack),21);if(status)return status;\
+               status=run_one(native,baseline,native_no_match,sizeof(native_no_match),22);if(status)return status;\
+               status=run_one(native,baseline,short_match,sizeof(short_match),23);if(status)return status;\
+               status=run_one(native,baseline,hole_haystack,sizeof(hole_haystack),24);if(status)return status;\
+               status=run_one(native,baseline,native_match,sizeof(native_match),25);if(status)return status;\
+               if(fre_aot_regex_runtime_destroy_exclusive_v1(native)!=0U)return 30;\
+               if(fre_aot_regex_runtime_destroy_exclusive_v1(baseline)!=0U)return 31;return 0;}}\n",
+            c_bytes(&native_match),
+            c_bytes(&native_no_match),
+            c_bytes(&hole_haystack),
+            c_bytes(short_match),
+        );
+        let c_path = directory.join("hybrid.c");
+        let executable = directory.join("hybrid");
+        fs::write(&c_path, source).expect("write hybrid C harness");
+        let c_compiler = if cfg!(target_os = "macos") {
+            "clang"
+        } else {
+            "cc"
+        };
+        let status = Command::new(c_compiler)
+            .arg("-O0")
+            .arg(&c_path)
+            .arg(&object)
+            .arg(&static_runtime)
+            .arg("-o")
+            .arg(&executable)
+            .status()
+            .expect("link hybrid real-runtime harness");
+        assert!(status.success(), "hybrid real-runtime harness failed to link");
+        let output = Command::new(&executable)
+            .output()
+            .expect("execute hybrid real-runtime harness");
+        assert!(
+            output.status.success(),
+            "status={:?} stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::remove_dir_all(&directory).expect("remove hybrid linker directory");
     }
 
     #[cfg(all(
