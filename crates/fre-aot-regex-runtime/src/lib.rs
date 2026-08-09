@@ -844,14 +844,33 @@ impl PreparedAotRegex {
         descriptor: &[u32],
     ) -> Result<(), CompileError> {
         self.deactivate_frozen_header();
-        self.program.bind_static_prefix_resume_with_workspace(
+        let newly_published = self.program.bind_static_prefix_resume_with_workspace(
             haystack,
             window,
             &mut self.workspace,
+            self.frozen_dynamic_rows.as_ref(),
             expected_artifact_identity,
             descriptor_binding,
             descriptor,
-        )
+        )?;
+        if let Some(receipt) = newly_published {
+            // Replacing the complete K0 cache retires every receipt and
+            // immutable copy derived from its prior generation. Rebuild the
+            // compact owner from the newly authenticated root-plus-resume
+            // superset. A packing decline keeps the new fully-prefilled K0
+            // continuation but must never retain the stale owner.
+            self.fully_prefilled_fallback = None;
+            self.frozen_dynamic_rows = None;
+            self.frozen_dynamic_rows = self
+                .program
+                .compiler_private_frozen_dynamic_rows_storage_v3_with_fallback_receipt(
+                    &mut self.workspace,
+                    Some(receipt),
+                    FROZEN_DYNAMIC_SIDECAR_MAX_K0_BYTES,
+                    FROZEN_DYNAMIC_SIDECAR_MAX_PACKED_BYTES,
+                );
+        }
+        Ok(())
     }
 
     fn search_from_static_prefix_resume_ticket(
@@ -862,6 +881,20 @@ impl PreparedAotRegex {
         pending_end: usize,
     ) -> Result<MatchResult, CompileError> {
         self.deactivate_frozen_header();
+        if let Some(owner) = self.frozen_dynamic_rows.as_ref()
+            && let Some(found) = self
+                .program
+                .try_search_from_static_prefix_resume_ticket_with_frozen_rows(
+                    haystack,
+                    &mut self.workspace,
+                    owner,
+                    resume_state,
+                    resume_position,
+                    pending_end,
+                )?
+        {
+            return Ok(found);
+        }
         self.program
             .search_from_static_prefix_resume_ticket_with_workspace(
                 haystack,
@@ -1816,9 +1849,10 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_compiler_private_search_exclusive
 /// `descriptor_ptr` must be aligned for `u32` and address a readable canonical
 /// V1 descriptor whose fixed header declares its complete readable extent. V2
 /// preflight stores but does not dereference this pointer. The extent must not
-/// overlap writable result storage and must remain live through synchronous
-/// native execution and any continuation. Its address remains the private
-/// binding capability for the lifetime of the generated object.
+/// overlap writable result storage, its bytes must remain immutable, and it
+/// must remain live through synchronous native execution and any continuation.
+/// Its address remains the private binding capability for the lifetime of the
+/// generated object.
 #[doc(hidden)]
 #[unsafe(no_mangle)]
 #[allow(

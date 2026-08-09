@@ -3018,6 +3018,16 @@ pub struct FrozenDynamicRowsStorageV3 {
     descriptor_v6: Option<FrozenDynamicRowsV6>,
 }
 
+/// Result of continuing an already-consumed static prefix in an immutable
+/// supertransition table.  The endpoint is sufficient for every value
+/// contract: `Exists` observes only presence, `SelectedEnd` returns it directly,
+/// fixed-width Span derives its start arithmetically, and variable-width Span
+/// runs the existing authenticated reverse-only postflight.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FrozenStaticPrefixForwardOutcome {
+    selected_end: Option<usize>,
+}
+
 /// Stable preamble magic for [`FrozenPreparedHeaderV1`].
 #[doc(hidden)]
 pub const FROZEN_PREPARED_HEADER_V1_MAGIC: u64 = u64::from_le_bytes(*b"FREFRZ1\0");
@@ -6086,6 +6096,345 @@ impl FrozenDynamicRowsStorageV3 {
         }
     }
 
+    /// Continue from one canonical K0 state in an immutable compact-row owner.
+    ///
+    /// Static-prefix holes and the prepared root table are produced from the
+    /// same fully-prefilled K0 cache. Once the caller authenticates that
+    /// lineage and maps the hole frontier to a canonical state, the compact
+    /// cells have exactly the same semantics as a root scan; only the initial
+    /// row/block and pending endpoint differ. Every compact generation is
+    /// decoded from its published format contract rather than from a regex or
+    /// compiler-recipe identity.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one checked decoder keeps all immutable row-format contracts adjacent"
+    )]
+    fn static_prefix_forward_from_canonical_state(
+        &self,
+        haystack: &[u8],
+        resume_position: usize,
+        window_end: usize,
+        canonical_state: usize,
+        pending_end: Option<usize>,
+        output: OutputContract,
+    ) -> Option<FrozenStaticPrefixForwardOutcome> {
+        if resume_position > window_end || window_end > haystack.len() {
+            return None;
+        }
+        let class_count = usize::try_from(self.descriptor.class_count).ok()?;
+        let state_count = usize::try_from(self.descriptor.state_count).ok()?;
+        if class_count == 0 || canonical_state >= state_count {
+            return None;
+        }
+        let mut position = resume_position;
+        let mut selected_end = pending_end;
+        if output == OutputContract::Exists && selected_end.is_some() {
+            return Some(FrozenStaticPrefixForwardOutcome { selected_end });
+        }
+
+        if matches!(
+            self.descriptor.format_version,
+            FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION
+                | FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION
+                | FROZEN_DYNAMIC_ROWS_V8_FORMAT_VERSION
+                | FROZEN_DYNAMIC_ROWS_V9_FORMAT_VERSION
+        ) {
+            let state_ordinal = matches!(
+                self.descriptor.format_version,
+                FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION
+                    | FROZEN_DYNAMIC_ROWS_V8_FORMAT_VERSION
+            );
+            let direct_byte = matches!(
+                self.descriptor.format_version,
+                FROZEN_DYNAMIC_ROWS_V8_FORMAT_VERSION
+                    | FROZEN_DYNAMIC_ROWS_V9_FORMAT_VERSION
+            );
+            let physical_cells = if state_ordinal {
+                let shift = self.descriptor.row_shift.checked_sub(1)?;
+                1_usize.checked_shl(shift)?
+            } else {
+                class_count
+            };
+            let total_cells = state_count.checked_mul(physical_cells)?;
+            if physical_cells == 0 || self.rows.len() != total_cells {
+                return None;
+            }
+            let mut row = canonical_state.checked_mul(physical_cells)?;
+            while position < window_end {
+                let byte = usize::from(*haystack.get(position)?);
+                let class = if direct_byte {
+                    byte
+                } else {
+                    usize::from(*self.class_map.get(byte)?)
+                };
+                if class >= class_count || class >= physical_cells {
+                    return None;
+                }
+                let cell = *self.rows.get(row.checked_add(class)?)?;
+                position = position.checked_add(1)?;
+                if cell & DYNAMIC_NATIVE_ROWS_V3_ACCEPT_MASK != 0 {
+                    selected_end = Some(position);
+                    if output == OutputContract::Exists {
+                        return Some(FrozenStaticPrefixForwardOutcome { selected_end });
+                    }
+                }
+                let token = cell & DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK;
+                if token == 0 {
+                    return Some(FrozenStaticPrefixForwardOutcome { selected_end });
+                }
+                row = if state_ordinal {
+                    usize::from(token)
+                        .checked_sub(1)?
+                        .checked_mul(physical_cells)?
+                } else {
+                    usize::from(token).checked_sub(1)?
+                };
+                if row >= total_cells || !row.is_multiple_of(physical_cells) {
+                    return None;
+                }
+            }
+            return Some(FrozenStaticPrefixForwardOutcome { selected_end });
+        }
+
+        if matches!(
+            self.descriptor.format_version,
+            FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION | FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION
+        ) {
+            let rows = self.rows_u8.as_deref()?;
+            let direct_byte =
+                self.descriptor.format_version == FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION;
+            let physical_cells = 1_usize.checked_shl(self.descriptor.row_shift)?;
+            let total_cells = state_count.checked_mul(physical_cells)?;
+            if physical_cells == 0 || rows.len() != total_cells {
+                return None;
+            }
+            let mut row = canonical_state.checked_mul(physical_cells)?;
+            while position < window_end {
+                let byte = usize::from(*haystack.get(position)?);
+                let class = if direct_byte {
+                    byte
+                } else {
+                    usize::from(*self.class_map.get(byte)?)
+                };
+                if class >= class_count || class >= physical_cells {
+                    return None;
+                }
+                let cell = *rows.get(row.checked_add(class)?)?;
+                position = position.checked_add(1)?;
+                if cell & DYNAMIC_NATIVE_ROWS_V10_ACCEPT_MASK != 0 {
+                    selected_end = Some(position);
+                    if output == OutputContract::Exists {
+                        return Some(FrozenStaticPrefixForwardOutcome { selected_end });
+                    }
+                }
+                let token = cell & DYNAMIC_NATIVE_ROWS_V10_NEXT_STATE_TOKEN_MASK;
+                if token == 0 {
+                    return Some(FrozenStaticPrefixForwardOutcome { selected_end });
+                }
+                row = usize::from(token)
+                    .checked_sub(1)?
+                    .checked_mul(physical_cells)?;
+                if row >= total_cells {
+                    return None;
+                }
+            }
+            return Some(FrozenStaticPrefixForwardOutcome { selected_end });
+        }
+
+        if self.descriptor.format_version == FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION {
+            let rows = self.pair_rows_v11.as_deref()?;
+            let (physical_classes, pair_cells, block_words, total_words, _) =
+                frozen_pair_rows_v11_geometry(state_count, class_count)?;
+            if rows.len() != total_words {
+                return None;
+            }
+            let mut block = canonical_state.checked_mul(block_words)?;
+            while window_end.saturating_sub(position) >= 2 {
+                let first = usize::from(*haystack.get(position)?);
+                let second = usize::from(*haystack.get(position.checked_add(1)?)?);
+                let first_class = usize::from(*self.class_map.get(first)?);
+                let second_class = usize::from(*self.class_map.get(second)?);
+                if first_class >= class_count || second_class >= class_count {
+                    return None;
+                }
+                let key = first_class
+                    .checked_mul(physical_classes)?
+                    .checked_add(second_class)?;
+                let cell = *rows.get(block.checked_add(key)?)?;
+                let first_dead = cell & DYNAMIC_NATIVE_ROWS_V11_FIRST_DEAD_MASK != 0;
+                position = position.checked_add(if first_dead { 1 } else { 2 })?;
+                if cell & DYNAMIC_NATIVE_ROWS_V11_ANY_ACCEPT_MASK != 0 {
+                    selected_end = Some(
+                        if !first_dead
+                            && cell & DYNAMIC_NATIVE_ROWS_V11_ACCEPT_BACK_ONE_MASK != 0
+                        {
+                            position.checked_sub(1)?
+                        } else {
+                            position
+                        },
+                    );
+                    if output == OutputContract::Exists {
+                        return Some(FrozenStaticPrefixForwardOutcome { selected_end });
+                    }
+                }
+                let token = cell & DYNAMIC_NATIVE_ROWS_V11_NEXT_BLOCK_TOKEN_MASK;
+                if first_dead || token == 0 {
+                    return Some(FrozenStaticPrefixForwardOutcome { selected_end });
+                }
+                block = usize::try_from(token).ok()?.checked_sub(1)?;
+                if block >= total_words || !block.is_multiple_of(block_words) {
+                    return None;
+                }
+            }
+            if position < window_end {
+                let byte = usize::from(*haystack.get(position)?);
+                let class = usize::from(*self.class_map.get(byte)?);
+                if class >= class_count {
+                    return None;
+                }
+                let accepts = *rows.get(block.checked_add(pair_cells)?)?;
+                position = position.checked_add(1)?;
+                if accepts & (1_u32.checked_shl(u32::try_from(class).ok()?)?) != 0 {
+                    selected_end = Some(position);
+                }
+            }
+            return Some(FrozenStaticPrefixForwardOutcome { selected_end });
+        }
+
+        if self.descriptor.format_version == FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION {
+            let rows = self.quad_rows_v14.as_deref()?;
+            let (quad_cells, tail3_cells, tail2_cells, tail1_cells, block_cells, total_cells, _) =
+                frozen_quad_rows_v14_geometry(state_count, class_count)?;
+            if rows.len() != total_cells {
+                return None;
+            }
+            let tail3_offset = quad_cells;
+            let tail2_offset = tail3_offset.checked_add(tail3_cells)?;
+            let tail1_offset = tail2_offset.checked_add(tail2_cells)?;
+            if tail1_offset.checked_add(tail1_cells)? != block_cells {
+                return None;
+            }
+            let mut block = canonical_state.checked_mul(block_cells)?;
+            while window_end.saturating_sub(position) >= 4 {
+                let mut key = 0usize;
+                for &byte in haystack.get(position..position.checked_add(4)?)? {
+                    let class = usize::from(*self.class_map.get(usize::from(byte))?);
+                    if class >= class_count {
+                        return None;
+                    }
+                    key = key.checked_mul(class_count)?.checked_add(class)?;
+                }
+                let cell = *rows.get(block.checked_add(key)?)?;
+                position = position.checked_add(4)?;
+                if cell & DYNAMIC_NATIVE_ROWS_V14_ANY_ACCEPT_MASK != 0 {
+                    let distance = usize::from(
+                        (cell & DYNAMIC_NATIVE_ROWS_V14_ACCEPT_DISTANCE_MASK) >> 13,
+                    );
+                    selected_end = Some(position.checked_sub(distance)?);
+                    if output == OutputContract::Exists {
+                        return Some(FrozenStaticPrefixForwardOutcome { selected_end });
+                    }
+                }
+                let token = cell & DYNAMIC_NATIVE_ROWS_V14_NEXT_BLOCK_TOKEN_MASK;
+                if token == 0 {
+                    return Some(FrozenStaticPrefixForwardOutcome { selected_end });
+                }
+                block = usize::from(token).checked_sub(1)?;
+                if block >= total_cells || !block.is_multiple_of(block_cells) {
+                    return None;
+                }
+            }
+
+            let remaining = window_end.saturating_sub(position);
+            if remaining != 0 {
+                let (section_offset, section_cells) = match remaining {
+                    1 => (tail1_offset, tail1_cells),
+                    2 => (tail2_offset, tail2_cells),
+                    3 => (tail3_offset, tail3_cells),
+                    _ => return None,
+                };
+                let mut key = 0usize;
+                for &byte in haystack.get(position..window_end)? {
+                    let class = usize::from(*self.class_map.get(usize::from(byte))?);
+                    if class >= class_count {
+                        return None;
+                    }
+                    key = key.checked_mul(class_count)?.checked_add(class)?;
+                }
+                if key >= section_cells {
+                    return None;
+                }
+                let cell = *rows.get(block.checked_add(section_offset)?.checked_add(key)?)?;
+                position = window_end;
+                if cell & DYNAMIC_NATIVE_ROWS_V14_ANY_ACCEPT_MASK != 0 {
+                    let distance = usize::from(
+                        (cell & DYNAMIC_NATIVE_ROWS_V14_ACCEPT_DISTANCE_MASK) >> 13,
+                    );
+                    selected_end = Some(position.checked_sub(distance)?);
+                }
+            }
+            return Some(FrozenStaticPrefixForwardOutcome { selected_end });
+        }
+
+        if self.descriptor.format_version == FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION {
+            let rows = self.pair_rows_v13.as_deref()?;
+            let (pair_cells, block_cells, total_cells, _) =
+                frozen_pair_rows_v13_geometry(state_count, class_count)?;
+            if rows.len() != total_cells {
+                return None;
+            }
+            let mut block = canonical_state.checked_mul(block_cells)?;
+            while window_end.saturating_sub(position) >= 2 {
+                let first = usize::from(*haystack.get(position)?);
+                let second = usize::from(*haystack.get(position.checked_add(1)?)?);
+                let first_class = usize::from(*self.class_map.get(first)?);
+                let second_class = usize::from(*self.class_map.get(second)?);
+                if first_class >= class_count || second_class >= class_count {
+                    return None;
+                }
+                let key = first_class
+                    .checked_mul(class_count)?
+                    .checked_add(second_class)?;
+                let cell = *rows.get(block.checked_add(key)?)?;
+                position = position.checked_add(2)?;
+                if cell & DYNAMIC_NATIVE_ROWS_V13_ANY_ACCEPT_MASK != 0 {
+                    selected_end = Some(if cell & DYNAMIC_NATIVE_ROWS_V13_ACCEPT_BACK_ONE_MASK != 0
+                    {
+                        position.checked_sub(1)?
+                    } else {
+                        position
+                    });
+                    if output == OutputContract::Exists {
+                        return Some(FrozenStaticPrefixForwardOutcome { selected_end });
+                    }
+                }
+                let token = cell & DYNAMIC_NATIVE_ROWS_V13_NEXT_BLOCK_TOKEN_MASK;
+                if token == 0 {
+                    return Some(FrozenStaticPrefixForwardOutcome { selected_end });
+                }
+                block = usize::from(token).checked_sub(1)?;
+                if block >= total_cells || !block.is_multiple_of(block_cells) {
+                    return None;
+                }
+            }
+            if position < window_end {
+                let byte = usize::from(*haystack.get(position)?);
+                let class = usize::from(*self.class_map.get(byte)?);
+                if class >= class_count {
+                    return None;
+                }
+                let accepts = *rows.get(block.checked_add(pair_cells)?)?;
+                position = position.checked_add(1)?;
+                if accepts & (1_u16.checked_shl(u32::try_from(class).ok()?)?) != 0 {
+                    selected_end = Some(position);
+                }
+            }
+            return Some(FrozenStaticPrefixForwardOutcome { selected_end });
+        }
+
+        None
+    }
+
     fn descriptor_v6(&self) -> Option<FrozenDynamicRowsV6> {
         self.descriptor_v6
     }
@@ -6213,6 +6562,20 @@ impl StaticPrefixResumeWorkspace {
 
     fn consume(&mut self, haystack: &[u8]) -> Result<SearchWindow, CompileError> {
         let ticket = self.ticket.take().ok_or(CompileError::InternalInvariant(
+            "static-prefix continuation has no synchronous preflight ticket",
+        ))?;
+        if ticket.haystack_address != haystack.as_ptr().expose_provenance()
+            || ticket.haystack_len != haystack.len()
+        {
+            return Err(CompileError::InternalInvariant(
+                "static-prefix continuation haystack differs from preflight",
+            ));
+        }
+        Ok(ticket.window)
+    }
+
+    fn peek(&self, haystack: &[u8]) -> Result<SearchWindow, CompileError> {
+        let ticket = self.ticket.ok_or(CompileError::InternalInvariant(
             "static-prefix continuation has no synchronous preflight ticket",
         ))?;
         if ticket.haystack_address != haystack.as_ptr().expose_provenance()
@@ -11261,10 +11624,11 @@ impl CompiledProgram {
         haystack: &[u8],
         window: SearchWindow,
         workspace: &mut ProgramWorkspace,
+        frozen_owner: Option<&FrozenDynamicRowsStorageV3>,
         expected_artifact_identity: [u8; 32],
         descriptor_binding: usize,
         descriptor: &[u32],
-    ) -> Result<(), CompileError> {
+    ) -> Result<Option<FullyPrefilledFallbackReceipt>, CompileError> {
         self.validate_static_prefix_object_context(
             haystack,
             window,
@@ -11283,15 +11647,48 @@ impl CompiledProgram {
                 state.descriptor_binding == descriptor_binding
                     && state.resume.is_bound_to(&self.automaton)
             });
+        let mut newly_published = None;
         if !already_bound {
             let mut resume = self.static_prefix_resume_set_from_descriptor(descriptor)?;
             workspace.mark_dynamic_native_rows_dirty();
             let fully_prefilled = workspace.nfa.as_mut().and_then(|nfa| {
-                nfa.compiler_private_try_prefill_resume_caches_with_receipt(
+                if let Some(k0) = nfa.compiler_private_try_prefill_resume_caches_with_receipt(
                     &self.automaton,
                     &mut resume,
-                )
-                .map(|k0| FullyPrefilledFallbackReceipt {
+                ) {
+                    let receipt = FullyPrefilledFallbackReceipt {
+                        program_instance: self.identity.instance,
+                        k0,
+                    };
+                    newly_published = Some(receipt);
+                    return Some(receipt);
+                }
+
+                let owner = frozen_owner.filter(|owner| {
+                    owner.descriptor_is_valid_for(self.identity)
+                        && owner.root_prefill_receipt.program_instance
+                            == self.identity.instance
+                })?;
+                let k0 = nfa
+                    .compiler_private_try_bind_resume_to_fully_prefilled_root_cache_with_receipt(
+                        &self.automaton,
+                        &mut resume,
+                        owner.root_prefill_receipt.k0,
+                    )
+                    .or_else(|| {
+                        nfa.compiler_private_try_extend_fully_prefilled_root_with_resume_receipt(
+                            &self.automaton,
+                            &mut resume,
+                            owner.root_prefill_receipt.k0,
+                        )
+                        .inspect(|&k0| {
+                            newly_published = Some(FullyPrefilledFallbackReceipt {
+                                program_instance: self.identity.instance,
+                                k0,
+                            });
+                        })
+                    })?;
+                Some(FullyPrefilledFallbackReceipt {
                     program_instance: self.identity.instance,
                     k0,
                 })
@@ -11311,7 +11708,215 @@ impl CompiledProgram {
                 "static-prefix resume preflight did not retain its sidecar",
             ))?
             .admit(haystack, window);
-        Ok(())
+        Ok(newly_published)
+    }
+
+    /// Try to continue a compiler-owned static prefix in the immutable
+    /// setup-time compact table instead of replaying the same fully-prefilled
+    /// K0 rows through the scalar portable loop.
+    ///
+    /// Admission is format- and lineage-driven, not pattern-driven. The
+    /// static descriptor's exact frontier is mapped through the authenticated
+    /// resume cache into the canonical state numbering used by the frozen
+    /// owner. Any missing proof or unsupported compact generation declines
+    /// without consuming the single-use ticket, allowing the established K0
+    /// continuation to run unchanged.
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the private continuation binds one exact artifact, owner, ticket, and native frontier"
+    )]
+    pub fn try_search_from_static_prefix_resume_ticket_with_frozen_rows(
+        &self,
+        haystack: &[u8],
+        workspace: &mut ProgramWorkspace,
+        owner: &FrozenDynamicRowsStorageV3,
+        resume_state: usize,
+        resume_position: usize,
+        pending_end_word: usize,
+    ) -> Result<Option<MatchResult>, CompileError> {
+        if !workspace.identity.compatible(&self.identity)
+            || self.context_dfa.is_some()
+            || !matches!(self.engine, ProgramEngine::OrderedNfa)
+            || self.automaton.stats().has_assertions()
+            // The storage has private fields and can only be constructed by
+            // this program's checked setup builder. Repeating its linear
+            // whole-table validation on every match would erase the compact
+            // continuation's benefit. Authenticate immutable ownership here;
+            // the safe decoder below independently checks every accessed
+            // extent, while the live K0 projection rechecks cache lineage.
+            || owner.program_instance != self.identity.instance
+            || owner.artifact_identity != self.identity.artifact
+            || owner.root_prefill_receipt.program_instance != self.identity.instance
+        {
+            return Ok(None);
+        }
+        if !matches!(
+            owner.descriptor.format_version,
+            FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION
+                | FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION
+                | FROZEN_DYNAMIC_ROWS_V8_FORMAT_VERSION
+                | FROZEN_DYNAMIC_ROWS_V9_FORMAT_VERSION
+                | FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION
+                | FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION
+                | FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION
+                | FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION
+                | FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION
+        ) {
+            return Ok(None);
+        }
+
+        let ProgramWorkspace {
+            nfa,
+            static_prefix_resume,
+            dynamic_native_rows,
+            ..
+        } = workspace;
+        let state = static_prefix_resume.as_deref_mut().ok_or(
+            CompileError::InternalInvariant(
+                "static-prefix frozen continuation has no graph-bound sidecar",
+            ),
+        )?;
+        let window = state.peek(haystack)?;
+        if resume_position <= window.start || resume_position >= window.end {
+            return Err(CompileError::InternalInvariant(
+                "static-prefix frozen continuation position is outside its admitted window",
+            ));
+        }
+        let pending = state.resume.pending_mode(resume_state)?;
+        let pending_end = pending.then_some(pending_end_word);
+        if pending_end.is_some_and(|end| end <= window.start || end > resume_position) {
+            return Err(CompileError::InternalInvariant(
+                "static-prefix frozen continuation pending endpoint is outside its consumed prefix",
+            ));
+        }
+        let Some(nfa_read) = nfa.as_ref() else {
+            return Ok(None);
+        };
+        if state.fully_prefilled.is_none()
+            && let Some(k0) = nfa_read
+                .compiler_private_try_bind_resume_to_fully_prefilled_root_cache_with_receipt(
+                    &self.automaton,
+                    &mut state.resume,
+                    owner.root_prefill_receipt.k0,
+                )
+        {
+            state.fully_prefilled = Some(FullyPrefilledFallbackReceipt {
+                program_instance: self.identity.instance,
+                k0,
+            });
+        }
+        let Some(fully_prefilled) = state
+            .fully_prefilled
+            .filter(|receipt| receipt.program_instance == self.identity.instance)
+        else {
+            return Ok(None);
+        };
+
+        // The setup transaction already validated every frontier and row.
+        // Private resume metadata is immutable while its set-level seal is
+        // live, so authenticate only the generated-code-selected state here;
+        // rescanning the whole map and root table per match would dominate
+        // the suffix itself. The compact builder's zero/root swap is
+        // self-inverse.
+        let Some(mapping) = nfa_read
+            .compiler_private_fully_prefilled_resume_state_projection(
+                &self.automaton,
+                &state.resume,
+                resume_state,
+                fully_prefilled.k0,
+            )
+        else {
+            return Ok(None);
+        };
+        if mapping.cache_identity() != owner.descriptor.cache_identity
+            || mapping.row_stride() == 0
+            || mapping.pending() != pending
+        {
+            return Ok(None);
+        }
+        let source_initial_state = usize::try_from(mapping.source_initial_state()).map_err(|_| {
+            CompileError::InternalInvariant(
+                "static-prefix frozen continuation initial state does not fit usize",
+            )
+        })?;
+        let source_state = usize::try_from(mapping.source_state()).map_err(|_| {
+            CompileError::InternalInvariant(
+                "static-prefix frozen continuation state does not fit usize",
+            )
+        })?;
+        let state_count = usize::try_from(owner.descriptor.state_count).map_err(|_| {
+            CompileError::InternalInvariant(
+                "static-prefix frozen continuation state count does not fit usize",
+            )
+        })?;
+        if mapping.state_count() != state_count
+            || source_initial_state >= state_count
+            || source_state >= state_count
+        {
+            return Ok(None);
+        }
+        let canonical_state =
+            canonicalize_frozen_state_ordinal(source_state, source_initial_state);
+        let Some(forward) = owner.static_prefix_forward_from_canonical_state(
+            haystack,
+            resume_position,
+            window.end,
+            canonical_state,
+            pending_end,
+            self.output,
+        ) else {
+            return Ok(None);
+        };
+
+        // Only a successfully authenticated and completed immutable scan owns
+        // the ticket. Every decline above leaves it available to K0.
+        let consumed_window = state.consume(haystack)?;
+        if consumed_window != window {
+            return Err(CompileError::InternalInvariant(
+                "static-prefix frozen continuation consumed a different window",
+            ));
+        }
+        if let Some(dynamic) = dynamic_native_rows.as_deref_mut() {
+            dynamic.native_rows_dirty = true;
+        }
+
+        let found = match self.output {
+            OutputContract::Exists => MatchResult::Exists(forward.selected_end.is_some()),
+            OutputContract::SelectedEnd => MatchResult::SelectedEnd(forward.selected_end),
+            OutputContract::Span => {
+                let Some(selected_end) = forward.selected_end else {
+                    return Ok(Some(MatchResult::Span(None)));
+                };
+                if let Some(width) = self.exact_match_width {
+                    let start = selected_end.checked_sub(width).ok_or(
+                        CompileError::InternalInvariant(
+                            "static-prefix frozen continuation endpoint precedes exact width",
+                        ),
+                    )?;
+                    if start < window.start {
+                        return Err(CompileError::InternalInvariant(
+                            "static-prefix frozen continuation exact start precedes its window",
+                        ));
+                    }
+                    MatchResult::Span(Some((start, selected_end)))
+                } else {
+                    let recovered_start = self.recover_partial_span_start(
+                        haystack,
+                        window,
+                        nfa.as_mut().ok_or(CompileError::InternalInvariant(
+                            "static-prefix frozen continuation has no reverse K0 workspace",
+                        ))?,
+                        Some(&state.resume),
+                        selected_end,
+                        state.fully_prefilled,
+                    )?;
+                    MatchResult::Span(Some((recovered_start, selected_end)))
+                }
+            }
+        };
+        Ok(Some(found))
     }
 
     /// Continue from the exact frontier and first unconsumed byte returned by
@@ -25017,6 +25622,625 @@ mod tests {
                         scalar_selected_end(&cells, &input),
                         "graph={cells:?}, input={input:?}"
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_frozen_row_format_resumes_from_every_canonical_state() {
+        type ModelCell = (bool, Option<usize>);
+
+        fn scalar_selected_end(
+            cells: &[ModelCell],
+            mut state: usize,
+            input: &[u8],
+            base: usize,
+            mut selected_end: Option<usize>,
+        ) -> Option<usize> {
+            for (offset, &class) in input.iter().enumerate() {
+                let (accepts, destination) = cells[state * 2 + usize::from(class)];
+                if accepts {
+                    selected_end = Some(base + offset + 1);
+                }
+                let Some(destination) = destination else {
+                    break;
+                };
+                state = destination;
+            }
+            selected_end
+        }
+
+        let compiled = program(
+            "ab",
+            OutputContract::SelectedEnd,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        let mut workspace = compiled.prepare_workspace().unwrap();
+        let root_prefill_receipt = complete_root_prefill_receipt(&compiled, &mut workspace);
+        let class_map: [u8; 256] =
+            core::array::from_fn(|byte| u8::try_from(byte & 1).unwrap());
+        let mut source_classes = [0_u8; 256];
+        source_classes[1] = 1;
+        let columns = FrozenCompactColumnProjection {
+            class_count: 2,
+            source_classes,
+            class_map,
+        };
+        let cells: [ModelCell; 4] = [
+            (false, Some(0)),
+            (true, Some(1)),
+            (true, None),
+            (false, Some(0)),
+        ];
+        let source_rows = cells
+            .iter()
+            .map(|&(accepts, destination)| {
+                frozen_test_source_cell(destination, 2, accepts, 0)
+            })
+            .collect::<Vec<_>>();
+        let build_u16_rows = |physical_cells: usize, state_ordinal: bool| {
+            let mut rows = vec![DYNAMIC_NATIVE_ROWS_V3_DEAD_CELL; 2 * physical_cells];
+            for state in 0..2 {
+                for class in 0..2 {
+                    let (accepts, destination) = cells[state * 2 + class];
+                    let token = destination.map_or(0, |destination| {
+                        let token = if state_ordinal {
+                            destination + 1
+                        } else {
+                            destination * physical_cells + 1
+                        };
+                        u16::try_from(token).unwrap()
+                    });
+                    rows[state * physical_cells + class] = token
+                        | accepts
+                            .then_some(DYNAMIC_NATIVE_ROWS_V3_ACCEPT_MASK)
+                            .unwrap_or(0);
+                }
+            }
+            rows.into_boxed_slice()
+        };
+        let build_u8_rows = |physical_cells: usize| {
+            let mut rows = vec![DYNAMIC_NATIVE_ROWS_V10_DEAD_CELL; 2 * physical_cells];
+            for state in 0..2 {
+                for class in 0..2 {
+                    let (accepts, destination) = cells[state * 2 + class];
+                    let token = destination
+                        .map_or(0, |destination| u8::try_from(destination + 1).unwrap());
+                    rows[state * physical_cells + class] = token
+                        | accepts
+                            .then_some(DYNAMIC_NATIVE_ROWS_V10_ACCEPT_MASK)
+                            .unwrap_or(0);
+                }
+            }
+            rows.into_boxed_slice()
+        };
+        let identity_map: [u8; 256] =
+            core::array::from_fn(|byte| u8::try_from(byte).unwrap());
+        let pair_rows_v11 =
+            build_frozen_pair_rows_v11(&source_rows, &columns, 2, 2, 0).unwrap();
+        let pair_rows_v13 =
+            build_frozen_pair_rows_v13(&source_rows, &columns, 2, 2, 0).unwrap();
+        let quad_rows_v14 =
+            build_frozen_quad_rows_v14(&source_rows, &columns, 2, 2, 0).unwrap();
+
+        let make_storage =
+            |format_version: u32,
+             row_shift: u32,
+             descriptor_class_count: u32,
+             rows: Box<[u16]>,
+             rows_u8: Option<Box<[u8]>>,
+             pair_rows_v11: Option<Box<[u32]>>,
+             pair_rows_v13: Option<Box<[u16]>>,
+             quad_rows_v14: Option<Box<[u16]>>,
+             storage_class_map: [u8; 256]| {
+            let rows_address = if !rows.is_empty() {
+                rows.as_ptr().expose_provenance()
+            } else if let Some(rows) = rows_u8.as_ref() {
+                rows.as_ptr().expose_provenance()
+            } else if let Some(rows) = pair_rows_v11.as_ref() {
+                rows.as_ptr().expose_provenance()
+            } else if let Some(rows) = pair_rows_v13.as_ref() {
+                rows.as_ptr().expose_provenance()
+            } else {
+                quad_rows_v14
+                    .as_ref()
+                    .unwrap()
+                    .as_ptr()
+                    .expose_provenance()
+            };
+            FrozenDynamicRowsStorageV3 {
+                program_instance: compiled.identity.instance,
+                artifact_identity: compiled.identity.artifact,
+                root_prefill_receipt,
+                rows,
+                rows_u8,
+                pair_rows_v11,
+                pair_rows_v13,
+                quad_rows_v14,
+                class_map: storage_class_map,
+                descriptor: FrozenDynamicRowsV3 {
+                    ready_seal: 0,
+                    rows_address,
+                    cache_identity: 1,
+                    state_count: 2,
+                    class_count: descriptor_class_count,
+                    row_shift,
+                    initial_state: 0,
+                    learned_loop_state_count: 0,
+                    learned_loop_states: [u32::MAX; 4],
+                    format_version,
+                },
+                unary_exists_first_accept_step: None,
+                loop_index: Box::default(),
+                loop_scanners: Box::default(),
+                descriptor_v6: None,
+            }
+        };
+        let storages = vec![
+            (
+                "V3",
+                make_storage(
+                    FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION,
+                    2,
+                    2,
+                    build_u16_rows(2, true),
+                    None,
+                    None,
+                    None,
+                    None,
+                    class_map,
+                ),
+            ),
+            (
+                "V4",
+                make_storage(
+                    FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION,
+                    0,
+                    2,
+                    build_u16_rows(2, false),
+                    None,
+                    None,
+                    None,
+                    None,
+                    class_map,
+                ),
+            ),
+            (
+                "V8",
+                make_storage(
+                    FROZEN_DYNAMIC_ROWS_V8_FORMAT_VERSION,
+                    9,
+                    256,
+                    build_u16_rows(256, true),
+                    None,
+                    None,
+                    None,
+                    None,
+                    identity_map,
+                ),
+            ),
+            (
+                "V9",
+                make_storage(
+                    FROZEN_DYNAMIC_ROWS_V9_FORMAT_VERSION,
+                    0,
+                    256,
+                    build_u16_rows(256, false),
+                    None,
+                    None,
+                    None,
+                    None,
+                    identity_map,
+                ),
+            ),
+            (
+                "V10",
+                make_storage(
+                    FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION,
+                    8,
+                    256,
+                    Box::default(),
+                    Some(build_u8_rows(256)),
+                    None,
+                    None,
+                    None,
+                    identity_map,
+                ),
+            ),
+            (
+                "V11",
+                make_storage(
+                    FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION,
+                    1,
+                    2,
+                    Box::default(),
+                    None,
+                    Some(pair_rows_v11),
+                    None,
+                    None,
+                    class_map,
+                ),
+            ),
+            (
+                "V12",
+                make_storage(
+                    FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION,
+                    1,
+                    2,
+                    Box::default(),
+                    Some(build_u8_rows(2)),
+                    None,
+                    None,
+                    None,
+                    class_map,
+                ),
+            ),
+            (
+                "V13",
+                make_storage(
+                    FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION,
+                    0,
+                    2,
+                    Box::default(),
+                    None,
+                    None,
+                    Some(pair_rows_v13),
+                    None,
+                    class_map,
+                ),
+            ),
+            (
+                "V14",
+                make_storage(
+                    FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION,
+                    0,
+                    2,
+                    Box::default(),
+                    None,
+                    None,
+                    None,
+                    Some(quad_rows_v14),
+                    class_map,
+                ),
+            ),
+        ];
+
+        const BASE: usize = 3;
+        for state in 0..2 {
+            for length in 1_u32..=9 {
+                for input_bits in 0_usize..1_usize.checked_shl(length).unwrap() {
+                    let input = (0..length)
+                        .map(|index| u8::from(input_bits & (1 << index) != 0))
+                        .collect::<Vec<_>>();
+                    let mut haystack = vec![0xfe; BASE];
+                    haystack.extend_from_slice(&input);
+                    for pending in [None, Some(BASE - 1)] {
+                        let expected =
+                            scalar_selected_end(&cells, state, &input, BASE, pending);
+                        for (label, storage) in &storages {
+                            let actual = storage
+                                .static_prefix_forward_from_canonical_state(
+                                    &haystack,
+                                    BASE,
+                                    haystack.len(),
+                                    state,
+                                    pending,
+                                    OutputContract::SelectedEnd,
+                                )
+                                .unwrap_or_else(|| panic!("{label} declined a valid resume"));
+                            assert_eq!(
+                                actual.selected_end, expected,
+                                "{label} state={state} input={input:?} pending={pending:?}"
+                            );
+                            let exists = storage
+                                .static_prefix_forward_from_canonical_state(
+                                    &haystack,
+                                    BASE,
+                                    haystack.len(),
+                                    state,
+                                    pending,
+                                    OutputContract::Exists,
+                                )
+                                .unwrap();
+                            assert_eq!(
+                                exists.selected_end.is_some(),
+                                expected.is_some(),
+                                "{label} Exists state={state} input={input:?} pending={pending:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn static_prefix_resume_peek_is_nondestructive_but_consume_retires_mismatch() {
+        let compiled = program(
+            "ab",
+            OutputContract::SelectedEnd,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        let frontier = [0_u32];
+        let resume = K0ResumeSet::new(
+            &compiled.automaton,
+            1,
+            1,
+            [(&frontier[..], false)],
+        )
+        .unwrap();
+        let mut state = StaticPrefixResumeWorkspace {
+            descriptor_binding: 1,
+            resume,
+            fully_prefilled: None,
+            ticket: None,
+        };
+        let admitted = [b'a', b'b'];
+        let foreign = [b'a', b'b', b'c'];
+        state.admit(&admitted, SearchWindow::full(&admitted));
+        assert!(state.peek(&foreign).is_err());
+        assert_eq!(state.peek(&admitted).unwrap(), SearchWindow::full(&admitted));
+        assert!(state.consume(&foreign).is_err());
+        assert!(state.peek(&admitted).is_err());
+        assert!(state.consume(&admitted).is_err());
+    }
+
+    #[test]
+    fn authenticated_static_resume_maps_every_frontier_into_frozen_v14() {
+        for output in [OutputContract::Exists, OutputContract::SelectedEnd] {
+            let compiled = program(
+                r"(?-u:(?:a|[^a][\x00-\xff]){4})",
+                output,
+                CompileMode::Fast,
+                DeterminizeLimits {
+                    max_states: 0,
+                    ..DeterminizeLimits::default()
+                },
+            );
+            let candidate = (1..=32)
+                .find_map(|max_states| {
+                    let candidate = compiled
+                        .native_slow_determinized_program(
+                            DeterminizeLimits {
+                                max_states,
+                                ..DeterminizeLimits::default()
+                            },
+                            usize::MAX,
+                        )
+                        .expect("bounded static-prefix candidate")?;
+                    let (complete, discovered) = candidate.retained_dimensions()?;
+                    (complete != 0 && complete < discovered).then_some(candidate)
+                })
+                .unwrap_or_else(|| panic!("no partial static prefix for {output:?}"));
+            let resume_view = candidate
+                .resume_view()
+                .expect("partial static prefix resume view");
+            const HEADER_WORDS: usize = STATIC_PREFIX_RESUME_DESCRIPTOR_V1_HEADER_BYTES / 4;
+            const STATE_WORDS: usize = STATIC_PREFIX_RESUME_DESCRIPTOR_V1_STATE_BYTES / 4;
+            let descriptor_words = HEADER_WORDS
+                + resume_view.state_count() * STATE_WORDS
+                + resume_view.item_count();
+            let mut descriptor = Vec::with_capacity(descriptor_words);
+            descriptor.push(u32::from_le_bytes(
+                STATIC_PREFIX_RESUME_DESCRIPTOR_V1_MAGIC[..4]
+                    .try_into()
+                    .unwrap(),
+            ));
+            descriptor.push(u32::from_le_bytes(
+                STATIC_PREFIX_RESUME_DESCRIPTOR_V1_MAGIC[4..]
+                    .try_into()
+                    .unwrap(),
+            ));
+            descriptor.extend_from_slice(&[
+                u32::try_from(descriptor_words).unwrap(),
+                u32::try_from(resume_view.state_count()).unwrap(),
+                u32::try_from(resume_view.item_count()).unwrap(),
+                0,
+                0,
+                0,
+            ]);
+            let mut item_offset = 0usize;
+            for (frontier, pending) in resume_view.frontiers() {
+                descriptor.extend_from_slice(&[
+                    u32::try_from(item_offset).unwrap(),
+                    u32::try_from(frontier.len()).unwrap(),
+                    u32::from(pending),
+                    0,
+                ]);
+                item_offset += frontier.len();
+            }
+            for (frontier, _) in resume_view.frontiers() {
+                descriptor.extend_from_slice(frontier);
+            }
+            assert_eq!(descriptor.len(), descriptor_words);
+            let descriptor_binding = descriptor.as_ptr().expose_provenance();
+
+            let mut workspace = compiled.prepare_workspace().unwrap();
+            let mut owner = compiled
+                .compiler_private_frozen_dynamic_rows_storage_v3(
+                    &mut workspace,
+                    usize::MAX,
+                    usize::MAX,
+                )
+                .expect("complete frozen V14 owner");
+            assert_eq!(
+                owner.descriptor.format_version,
+                FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION,
+                "{output:?}"
+            );
+            let old_root_receipt = owner.root_prefill_receipt.k0;
+            let initial_haystack = [0_u8, 0];
+            let newly_published = compiled
+                .bind_static_prefix_resume_with_workspace(
+                    &initial_haystack,
+                    SearchWindow::full(&initial_haystack),
+                    &mut workspace,
+                    Some(&owner),
+                    compiled.identity.artifact,
+                    descriptor_binding,
+                    &descriptor,
+                )
+                .expect("bind the serialized static-resume descriptor");
+            if output == OutputContract::Exists {
+                assert!(
+                    newly_published.is_some(),
+                    "the Exists fixture must require the root-plus-resume superset"
+                );
+                assert!(
+                    workspace
+                        .nfa
+                        .as_ref()
+                        .unwrap()
+                        .compiler_private_fully_prefilled_root_projection_without_resume(
+                            &compiled.automaton,
+                            old_root_receipt,
+                        )
+                        .is_none(),
+                    "publishing the superset must retire the old root receipt"
+                );
+                let pending = workspace
+                    .static_prefix_resume
+                    .as_deref()
+                    .unwrap()
+                    .resume
+                    .pending_mode(0)
+                    .unwrap();
+                assert!(
+                    compiled
+                        .try_search_from_static_prefix_resume_ticket_with_frozen_rows(
+                            &initial_haystack,
+                            &mut workspace,
+                            &owner,
+                            0,
+                            1,
+                            usize::from(pending),
+                        )
+                        .unwrap()
+                        .is_none(),
+                    "the compact owner copied from the retired generation must decline"
+                );
+            }
+            if let Some(receipt) = newly_published {
+                owner = compiled
+                    .compiler_private_frozen_dynamic_rows_storage_v3_with_fallback_receipt(
+                        &mut workspace,
+                        Some(receipt),
+                        usize::MAX,
+                        usize::MAX,
+                    )
+                    .expect("rebuild frozen owner from root-plus-resume cache");
+            }
+            assert_eq!(
+                owner.descriptor.format_version,
+                FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION,
+                "{output:?}"
+            );
+            let fully_prefilled = workspace
+                .static_prefix_resume
+                .as_deref()
+                .and_then(|state| state.fully_prefilled)
+                .expect("serialized resume descriptor must retain a complete receipt");
+            {
+                let nfa = workspace.nfa.as_ref().unwrap();
+                let state = workspace.static_prefix_resume.as_deref().unwrap();
+                let map = nfa
+                    .compiler_private_fully_prefilled_resume_map_projection(
+                        &compiled.automaton,
+                        &state.resume,
+                        fully_prefilled.k0,
+                    )
+                    .expect("project attached static resume map");
+                let root = nfa
+                    .compiler_private_fully_prefilled_root_projection_without_resume(
+                        &compiled.automaton,
+                        owner.root_prefill_receipt.k0,
+                    )
+                    .expect("project frozen root lineage");
+                assert_eq!(map.cache_identity(), root.cache_identity());
+                assert_eq!(map.compact_row_stride(), root.row_stride());
+                assert!(map.cached_state_ids().iter().all(|&state| {
+                    usize::try_from(state).unwrap()
+                        < usize::try_from(owner.descriptor.state_count).unwrap()
+                }));
+            }
+
+            for resume_state in 0..resume_view.state_count() {
+                let pending = workspace
+                    .static_prefix_resume
+                    .as_deref()
+                    .unwrap()
+                    .resume
+                    .pending_mode(resume_state)
+                    .unwrap();
+                for length in 1_u32..=7 {
+                    for input_bits in 0_usize..1_usize.checked_shl(length).unwrap() {
+                        let mut haystack = vec![0_u8];
+                        haystack.extend((0..length).map(|index| {
+                            u8::from(input_bits & (1_usize << index) != 0)
+                        }));
+                        let window = SearchWindow::full(&haystack);
+                        let pending_end_word = usize::from(pending);
+                        assert!(
+                            compiled
+                                .bind_static_prefix_resume_with_workspace(
+                                    &haystack,
+                                    window,
+                                    &mut workspace,
+                                    Some(&owner),
+                                    compiled.identity.artifact,
+                                    descriptor_binding,
+                                    &descriptor,
+                                )
+                                .unwrap()
+                                .is_none(),
+                            "a repeated binding must reuse its prepared owner"
+                        );
+                        let actual = compiled
+                            .try_search_from_static_prefix_resume_ticket_with_frozen_rows(
+                                &haystack,
+                                &mut workspace,
+                                &owner,
+                                resume_state,
+                                1,
+                                pending_end_word,
+                            )
+                            .unwrap()
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "V14 declined {output:?} state={resume_state} input={haystack:?}"
+                                )
+                            });
+                        assert!(
+                            compiled
+                                .bind_static_prefix_resume_with_workspace(
+                                    &haystack,
+                                    window,
+                                    &mut workspace,
+                                    Some(&owner),
+                                    compiled.identity.artifact,
+                                    descriptor_binding,
+                                    &descriptor,
+                                )
+                                .unwrap()
+                                .is_none()
+                        );
+                        let expected = compiled
+                            .search_from_static_prefix_resume_ticket_with_workspace(
+                                &haystack,
+                                &mut workspace,
+                                resume_state,
+                                1,
+                                pending_end_word,
+                            )
+                            .unwrap();
+                        assert_eq!(
+                            actual, expected,
+                            "{output:?} state={resume_state} input={haystack:?} pending={pending}"
+                        );
+                    }
                 }
             }
         }
