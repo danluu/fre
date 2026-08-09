@@ -949,6 +949,29 @@ const NATIVE_LOWERING_VERSION: u32 = 1;
 const NATIVE_MODULE_IDENTITY_DOMAIN: &[u8] = b"fre-aot-regex/native-module-identity\0";
 const NATIVE_SLOW_PARTIAL_TABLE_IDENTITY_DOMAIN: &[u8] =
     b"fre-aot-regex/native-module-identity/slow-partial-table\0";
+const NATIVE_DYNAMIC_REVERSE_CLASS_MAP_BYTES: usize = 256;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeReverseClassMode {
+    Zero,
+    Mapped,
+    Identity,
+}
+
+impl NativeReverseClassMode {
+    const fn from_class_count(class_count: usize) -> Option<Self> {
+        match class_count {
+            1 => Some(Self::Zero),
+            2..=255 => Some(Self::Mapped),
+            256 => Some(Self::Identity),
+            _ => None,
+        }
+    }
+
+    const fn needs_map(self) -> bool {
+        matches!(self, Self::Mapped)
+    }
+}
 const PARTIAL_CELL_ACCEPTED: u32 = 1 << 31;
 const PARTIAL_CELL_HOLE_BASE: u32 = 1 << 30;
 const PARTIAL_CELL_DEAD: u32 = PARTIAL_CELL_ACCEPTED - 1;
@@ -2243,11 +2266,10 @@ fn lower_native_dynamic_rows_prepared(
     view: NativeDynamicRowsProgramView,
     target: Target,
 ) -> Result<(NativeLowering, PreparedEntryLayout), ObjectError> {
-    if !(1..=256).contains(&view.source_class_count) {
-        return Err(ObjectError::InvalidModule(
+    let reverse_class_mode = NativeReverseClassMode::from_class_count(view.source_class_count)
+        .ok_or(ObjectError::InvalidModule(
             "dynamic source class count is outside the byte alphabet",
-        ));
-    }
+        ))?;
     let exact_span_width = match (view.output, view.exact_match_width) {
         (OutputContract::Exists | OutputContract::SelectedEnd, _) => None,
         (OutputContract::Span, None) => None,
@@ -2265,6 +2287,45 @@ fn lower_native_dynamic_rows_prepared(
     };
     let variable_span_recovery =
         view.output == OutputContract::Span && view.exact_match_width.is_none();
+    let source_byte_classes = match (variable_span_recovery, view.source_byte_classes) {
+        (true, Some(classes)) => classes,
+        (true, None) => {
+            return Err(ObjectError::InvalidModule(
+                "dynamic variable Span has no exact source byte-class map",
+            ));
+        }
+        (false, None) => [0; 256],
+        (false, Some(_)) => {
+            return Err(ObjectError::InvalidModule(
+                "dynamic non-variable output unexpectedly carries a source byte-class map",
+            ));
+        }
+    };
+    if variable_span_recovery {
+        let mut source_classes_seen = [false; 256];
+        for (byte, &class) in source_byte_classes.iter().enumerate() {
+            let class = usize::from(class);
+            if class >= view.source_class_count {
+                return Err(ObjectError::InvalidModule(
+                    "dynamic source class map exceeds its exact class count",
+                ));
+            }
+            if reverse_class_mode == NativeReverseClassMode::Identity && class != byte {
+                return Err(ObjectError::InvalidModule(
+                    "dynamic 256-class source map is not canonical identity",
+                ));
+            }
+            source_classes_seen[class] = true;
+        }
+        if source_classes_seen[..view.source_class_count]
+            .iter()
+            .any(|&seen| !seen)
+        {
+            return Err(ObjectError::InvalidModule(
+                "dynamic source class map omits an exact source class",
+            ));
+        }
+    }
     // The compact owner is a closed forward projection. Variable Span can use
     // it because the exact active V3--V14 capability authorizes a reverse-only
     // postflight in the separately owned bidirectional K0 workspace. This
@@ -2273,15 +2334,41 @@ fn lower_native_dynamic_rows_prepared(
     let immutable_compact_possible = true;
     let supertransitions_possible =
         immutable_compact_possible && view.root_requirement.is_none();
-    let identity_offset =
-        program_bytes
+    // Mapped reverse alphabets place their classifier immediately before the
+    // aligned identity. Existing root-scanner tables therefore retain their
+    // identity+32 base and every non-Span artifact remains byte-identical.
+    let reverse_map_prefix_bytes = if variable_span_recovery && reverse_class_mode.needs_map() {
+        NATIVE_DYNAMIC_REVERSE_CLASS_MAP_BYTES
+    } else {
+        0
+    };
+    let identity_offset = program_bytes
             .len()
+            .checked_add(reverse_map_prefix_bytes)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "dynamic native-row reverse class-map extent",
+            ))?
             .checked_add(15)
             .ok_or(ObjectError::ArithmeticOverflow(
                 "dynamic native-row identity alignment",
             ))?
             & !15;
-    program_bytes.resize(identity_offset, 0);
+    if reverse_map_prefix_bytes != 0 {
+        let map_offset = identity_offset
+            .checked_sub(NATIVE_DYNAMIC_REVERSE_CLASS_MAP_BYTES)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "dynamic native-row reverse class-map offset",
+            ))?;
+        program_bytes.resize(map_offset, 0);
+        program_bytes.extend_from_slice(&source_byte_classes);
+    } else {
+        program_bytes.resize(identity_offset, 0);
+    }
+    if program_bytes.len() != identity_offset {
+        return Err(ObjectError::InvalidModule(
+            "dynamic reverse class map is not adjacent to the artifact identity",
+        ));
+    }
     program_bytes.extend_from_slice(&view.artifact_identity);
     let root_plan = view
         .root_requirement
@@ -2352,6 +2439,7 @@ fn lower_native_dynamic_rows_prepared(
                 view.source_class_count >= FROZEN_COMPACT_DIRECT_BYTE_MIN_CLASSES,
                 immutable_compact_possible,
                 supertransitions_possible,
+                view.source_class_count,
             )?
         },
         Architecture::Aarch64 => {
@@ -2364,6 +2452,7 @@ fn lower_native_dynamic_rows_prepared(
                 immutable_compact_possible,
                 supertransitions_possible,
                 target.features.has(CpuFeature::Aarch64Asimd),
+                view.source_class_count,
             )?
         },
     };
@@ -14850,6 +14939,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
         direct_byte_formats_possible,
         immutable_compact_possible,
         supertransitions_possible,
+        256,
     )
 }
 
@@ -14869,6 +14959,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     direct_byte_formats_possible: bool,
     immutable_compact_possible: bool,
     supertransitions_possible: bool,
+    source_class_count: usize,
 ) -> Result<NativeDynamicRowsEmission, ObjectError> {
     const SCANNER_FREE_FRAME_BYTES: u8 = 104;
     const ROOT_SCANNER_FRAME_BYTES: u8 = 120;
@@ -14909,6 +15000,10 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             == 8
     );
     let tracks_root_scanner_hits = allow_direct_hole_continuation && root_plan.is_some();
+    let reverse_class_mode = NativeReverseClassMode::from_class_count(source_class_count)
+        .ok_or(ObjectError::InvalidModule(
+            "x86 dynamic reverse source class count is invalid",
+        ))?;
     // Every compact entry starts with a nonempty window. Scanner-free entries
     // inherit that proof from the public boundary. Rooted entries inherit it
     // from the graph scanner: scalar hits prove position+offset < end, fixed
@@ -15096,6 +15191,12 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     let native_complete = (output != OutputContract::Exists)
         .then(|| assembler.label())
         .transpose()?;
+    let compact_native_match = (variable_span_recovery && immutable_compact_possible)
+        .then(|| assembler.label())
+        .transpose()?;
+    let compact_native_complete = (variable_span_recovery && immutable_compact_possible)
+        .then(|| assembler.label())
+        .transpose()?;
     // Scanner-free compact loops without helper calls do not need the public
     // source base once their cursor and end become pointers. Reuse RDI for the
     // latest accepting pointer so V3/V4/V8/V10/V12 accepting transitions stay
@@ -15123,6 +15224,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         .then(|| assembler.label())
         .transpose()?;
     let compact_complete = register_complete
+        .or(compact_native_complete)
         .or(native_complete)
         .unwrap_or(leaf_native_no_match);
     let native_continue = allow_direct_hole_continuation
@@ -15160,6 +15262,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         .then(|| assembler.label())
         .transpose()?;
     let loop_complete = loop_register_complete
+        .or(compact_native_complete)
         .or(native_complete)
         .unwrap_or(native_no_match);
     let compact_loop_framed_fallback = loop_framed_fallback.unwrap_or(framed_fallback);
@@ -15503,6 +15606,11 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     // Bodies share the selector's compile-time gate so a future semantic
     // opt-out cannot leave unreachable decoder or helper-call bytes behind.
     if immutable_compact_possible {
+    // Production compact guards authenticate the immutable owner and its
+    // complete reverse projection before entering these bodies. Keep V1/V2
+    // and preflight outcomes on the outer helper-backed completion labels.
+    let native_match = compact_native_match.unwrap_or(native_match);
+    let native_complete = compact_native_complete.or(native_complete);
     assembler.bind(v5_enter)?;
     if output == OutputContract::Exists {
         // R10D is the authenticated one-based first accepting step. Zero is
@@ -17801,13 +17909,175 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         assembler.branch(&[0xe9], scalar)?;
     }
 
+    let mut compact_reverse_identity_displacement_label = None;
+    if let (Some(compact_native_complete), Some(compact_native_match)) =
+        (compact_native_complete, compact_native_match)
+    {
+        assembler.bind(compact_native_complete)?;
+        assembler.instruction(&[0x4c, 0x8b, 0x5c, 0x24, 0x60])?;
+        assembler.instruction(&[0x4d, 0x85, 0xdb])?;
+        assembler.branch(&[0x0f, 0x84], native_no_match)?;
+        assembler.branch(&[0xe9], compact_native_match)?;
+
+        assembler.bind(compact_native_match)?;
+        // Only V3--V14 compact bodies can reach this label. Their production
+        // guards already authenticated the immutable reverse geometry and
+        // bound its stride to this program's original K0 alphabet.
+        assembler.instruction(&[0x4c, 0x89, 0x5c, 0x24, 0x60])?; // selected end
+        assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, 0x10])?; // handle
+        assembler.instruction(&[
+            0x48,
+            0x8b,
+            0x78,
+            u8::try_from(FROZEN_PREPARED_HEADER_V1_REVERSE_ROWS_ADDRESS_OFFSET)
+                .map_err(|_| ObjectError::ArithmeticOverflow("x86 compact reverse rows"))?,
+        ])?;
+        assembler.instruction(&[
+            0x8b,
+            0x48,
+            u8::try_from(FROZEN_PREPARED_HEADER_V1_REVERSE_INITIAL_ROW_OFFSET)
+                .map_err(|_| ObjectError::ArithmeticOverflow(
+                    "x86 compact reverse initial row",
+                ))?,
+        ])?;
+        assembler.instruction(&[0x48, 0x8d, 0x0c, 0x8f])?; // row pointer
+        assembler.instruction(&[0x4c, 0x89, 0xde])?; // cursor = selected end
+        if reverse_class_mode.needs_map() {
+            assembler.instruction(&[0x4c, 0x8d, 0x05])?;
+            let reverse_identity = assembler.label()?;
+            assembler.bind(reverse_identity)?;
+            push_bytes(&mut assembler.code, &[0; 4])?;
+            compact_reverse_identity_displacement_label = Some(reverse_identity);
+            let mut subtract_map = vec![0x49, 0x81, 0xe8];
+            subtract_map.extend_from_slice(
+                &u32::try_from(NATIVE_DYNAMIC_REVERSE_CLASS_MAP_BYTES)
+                    .map_err(|_| ObjectError::ArithmeticOverflow(
+                        "x86 compact reverse class-map displacement",
+                    ))?
+                    .to_le_bytes(),
+            );
+            assembler.instruction(&subtract_map)?;
+        }
+
+        let reverse_loop = assembler.label()?;
+        let reverse_tail = assembler.label()?;
+        let reverse_first_not_accepting = assembler.label()?;
+        let reverse_second_not_accepting = assembler.label()?;
+        let reverse_tail_not_accepting = assembler.label()?;
+        let reverse_finish = assembler.label()?;
+        let reverse_fallback = assembler.label()?;
+
+        assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x40])?; // window start
+        assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x18])?; // haystack
+        // Every candidate cursor is strictly before the selected endpoint,
+        // so the endpoint itself is a free impossible-start sentinel.
+        assembler.instruction(&[0x4d, 0x89, 0xda])?; // no start = selected end
+        assembler.instruction(&[0x48, 0x39, 0xd6])?;
+        assembler.branch(&[0x0f, 0x86], reverse_finish)?;
+        assembler.instruction(&[0x48, 0x89, 0xf0])?;
+        assembler.instruction(&[0x48, 0x29, 0xd0])?;
+        assembler.instruction(&[0xa8, 0x01])?;
+        assembler.branch(&[0x0f, 0x85], reverse_tail)?;
+
+        // Retire two reverse transitions per loop and preload independent
+        // source classes before the first row-dependent cell access.
+        assembler.bind(reverse_loop)?;
+        assembler.instruction(&[0x48, 0x83, 0xee, 0x02])?;
+        if reverse_class_mode != NativeReverseClassMode::Zero {
+            assembler.instruction(&[0x41, 0x0f, 0xb6, 0x44, 0x31, 0x01])?;
+            assembler.instruction(&[0x41, 0x0f, 0xb6, 0x14, 0x31])?;
+        }
+        if reverse_class_mode == NativeReverseClassMode::Mapped {
+            assembler.instruction(&[0x41, 0x0f, 0xb6, 0x04, 0x00])?;
+            assembler.instruction(&[0x41, 0x0f, 0xb6, 0x14, 0x10])?;
+        }
+        if reverse_class_mode == NativeReverseClassMode::Zero {
+            assembler.instruction(&[0x8b, 0x01])?;
+        } else {
+            assembler.instruction(&[0x8b, 0x04, 0x81])?;
+        }
+        let mut test_accept = vec![0xa9];
+        test_accept.extend_from_slice(&DYNAMIC_NATIVE_ROWS_V1_ACCEPT_MASK.to_le_bytes());
+        assembler.instruction(&test_accept)?;
+        assembler.branch(&[0x0f, 0x84], reverse_first_not_accepting)?;
+        assembler.instruction(&[0x4c, 0x8d, 0x56, 0x01])?;
+        assembler.bind(reverse_first_not_accepting)?;
+        let mut mask_token = vec![0x25];
+        mask_token.extend_from_slice(&DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK.to_le_bytes());
+        assembler.instruction(&mask_token)?;
+        assembler.branch(&[0x0f, 0x84], reverse_finish)?;
+        assembler.instruction(&[0xff, 0xc8])?;
+        assembler.instruction(&[0x48, 0x8d, 0x0c, 0x87])?;
+
+        if reverse_class_mode == NativeReverseClassMode::Zero {
+            assembler.instruction(&[0x8b, 0x01])?;
+        } else {
+            assembler.instruction(&[0x8b, 0x04, 0x91])?;
+        }
+        assembler.instruction(&test_accept)?;
+        assembler.branch(&[0x0f, 0x84], reverse_second_not_accepting)?;
+        assembler.instruction(&[0x49, 0x89, 0xf2])?;
+        assembler.bind(reverse_second_not_accepting)?;
+        assembler.instruction(&mask_token)?;
+        assembler.branch(&[0x0f, 0x84], reverse_finish)?;
+        assembler.instruction(&[0xff, 0xc8])?;
+        assembler.instruction(&[0x48, 0x8d, 0x0c, 0x87])?;
+        assembler.instruction(&[0x48, 0x3b, 0x74, 0x24, 0x40])?;
+        assembler.branch(&[0x0f, 0x87], reverse_loop)?;
+        assembler.branch(&[0xe9], reverse_finish)?;
+
+        assembler.bind(reverse_tail)?;
+        assembler.instruction(&[0x48, 0xff, 0xce])?;
+        if reverse_class_mode != NativeReverseClassMode::Zero {
+            assembler.instruction(&[0x41, 0x0f, 0xb6, 0x04, 0x31])?;
+        }
+        if reverse_class_mode == NativeReverseClassMode::Mapped {
+            assembler.instruction(&[0x41, 0x0f, 0xb6, 0x04, 0x00])?;
+        }
+        if reverse_class_mode == NativeReverseClassMode::Zero {
+            assembler.instruction(&[0x8b, 0x01])?;
+        } else {
+            assembler.instruction(&[0x8b, 0x04, 0x81])?;
+        }
+        assembler.instruction(&test_accept)?;
+        assembler.branch(&[0x0f, 0x84], reverse_tail_not_accepting)?;
+        assembler.instruction(&[0x49, 0x89, 0xf2])?;
+        assembler.bind(reverse_tail_not_accepting)?;
+        assembler.instruction(&mask_token)?;
+        assembler.branch(&[0x0f, 0x84], reverse_finish)?;
+        assembler.instruction(&[0xff, 0xc8])?;
+        assembler.instruction(&[0x48, 0x8d, 0x0c, 0x87])?;
+        assembler.instruction(&[0x48, 0x3b, 0x74, 0x24, 0x40])?;
+        assembler.branch(&[0x0f, 0x87], reverse_loop)?;
+        assembler.branch(&[0xe9], reverse_finish)?;
+
+        assembler.bind(reverse_finish)?;
+        assembler.instruction(&[0x4d, 0x39, 0xda])?; // candidate == selected end
+        assembler.branch(&[0x0f, 0x84], reverse_fallback)?;
+        if filter_kind.is_some_and(X86StartFilterKind::needs_vzeroupper) {
+            assembler.instruction(&[0xc5, 0xf8, 0x77])?;
+        }
+        assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x38])?;
+        assembler.instruction(&[0x4d, 0x89, 0x11])?;
+        assembler.instruction(&[0x4c, 0x8b, 0x5c, 0x24, 0x60])?;
+        assembler.instruction(&[0x4d, 0x89, 0x59, 0x08])?;
+        assembler.instruction(&[0xb8, 1, 0, 0, 0])?;
+        restore_root_scanner_counter(&mut assembler)?;
+        assembler.instruction(&[0x48, 0x83, 0xc4, frame_bytes])?;
+        assembler.instruction(&[0xc3])?;
+
+        assembler.bind(reverse_fallback)?;
+        assembler.instruction(&[0x4c, 0x8b, 0x5c, 0x24, 0x60])?;
+        assembler.branch(&[0xe9], native_match)?;
+    }
+
     if let Some(complete) = register_complete {
         assembler.bind(complete)?;
         assembler.instruction(&[0x48, 0x85, 0xff])?; // test rdi,rdi
         assembler.branch(&[0x0f, 0x84], native_no_match)?;
         assembler.instruction(&[0x49, 0x89, 0xfb])?; // mov r11,rdi
         assembler.instruction(&[0x4c, 0x2b, 0x5c, 0x24, 0x18])?;
-        assembler.branch(&[0xe9], native_match)?;
+        assembler.branch(&[0xe9], compact_native_match.unwrap_or(native_match))?;
     }
 
     if let Some(complete) = loop_register_complete {
@@ -17816,7 +18086,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         assembler.instruction(&[0x4c, 0x8b, 0x64, 0x24, 0x60])?; // restore r12
         assembler.instruction(&[0x4d, 0x85, 0xdb])?; // test r11,r11
         assembler.branch(&[0x0f, 0x84], native_no_match)?;
-        assembler.branch(&[0xe9], native_match)?;
+        assembler.branch(&[0xe9], compact_native_match.unwrap_or(native_match))?;
     }
 
     if let Some(v2_register_complete) = v2_register_complete {
@@ -18092,6 +18362,9 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     let continuation_displacement = continuation_displacement_label
         .map(|label| finished.label_offset(label))
         .transpose()?;
+    let compact_reverse_identity_displacement = compact_reverse_identity_displacement_label
+        .map(|label| finished.label_offset(label))
+        .transpose()?;
     let span_recovery_displacements = span_recovery_relocation_labels
         .map(|(identity, runtime)| {
             Ok::<_, ObjectError>((
@@ -18166,6 +18439,15 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         return Err(ObjectError::InvalidModule(
             "x86 dynamic continuation relocation pair is incomplete",
         ));
+    }
+    if let Some(identity) = compact_reverse_identity_displacement {
+        relocations.push(ModuleRelocation {
+            section: TEXT_SECTION,
+            offset: offset_u64(identity, "x86 compact reverse identity relocation")?,
+            kind: RelocationKind::X86PcRelative32,
+            symbol: PARTIAL_IDENTITY_SYMBOL,
+            addend: -4,
+        });
     }
     if let Some((identity, runtime)) = span_recovery_displacements {
         relocations.push(ModuleRelocation {
@@ -25985,6 +26267,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
         immutable_compact_possible,
         supertransitions_possible,
         false,
+        256,
     )
 }
 
@@ -26002,6 +26285,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     immutable_compact_possible: bool,
     supertransitions_possible: bool,
     use_asimd_identity: bool,
+    source_class_count: usize,
 ) -> Result<NativeDynamicRowsEmission, ObjectError> {
     const SCANNER_FREE_FRAME_BYTES: u16 = 96;
     const ROOT_SCANNER_FRAME_BYTES: u16 = 112;
@@ -26028,6 +26312,10 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             == 8
     );
     let tracks_root_scanner_hits = allow_direct_hole_continuation && root_plan.is_some();
+    let reverse_class_mode = NativeReverseClassMode::from_class_count(source_class_count)
+        .ok_or(ObjectError::InvalidModule(
+            "AArch64 dynamic reverse source class count is invalid",
+        ))?;
     // Every compact entry starts with a nonempty window. Scanner-free entries
     // inherit that proof from the public boundary. Rooted entries inherit it
     // from the graph scanner: scalar hits prove position+offset < end, fixed
@@ -26194,6 +26482,12 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     let native_complete = (output != OutputContract::Exists)
         .then(|| assembler.label())
         .transpose()?;
+    let compact_native_match = (variable_span_recovery && immutable_compact_possible)
+        .then(|| assembler.label())
+        .transpose()?;
+    let compact_native_complete = (variable_span_recovery && immutable_compact_possible)
+        .then(|| assembler.label())
+        .transpose()?;
     // Scanner-free compact loops no longer need the public end argument in
     // X4 after the frame has retained it. Keep the latest accepting endpoint
     // there instead of round-tripping every accepting transition through the
@@ -26213,6 +26507,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         .then(|| assembler.label())
         .transpose()?;
     let compact_complete = register_complete
+        .or(compact_native_complete)
         .or(native_complete)
         .unwrap_or(native_no_match);
     let non_loop_native_match = stackless_native_match.unwrap_or(native_match);
@@ -26593,6 +26888,11 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     // Bodies share the selector's compile-time gate so a future semantic
     // opt-out cannot leave unreachable decoder or helper-call bytes behind.
     if immutable_compact_possible {
+    // Production compact guards authenticate the immutable owner and its
+    // complete reverse projection before entering these bodies. Keep V1/V2
+    // and preflight outcomes on the outer helper-backed completion labels.
+    let native_match = compact_native_match.unwrap_or(native_match);
+    let native_complete = compact_native_complete.or(native_complete);
     assembler.bind(v5_enter)?;
     if output == OutputContract::Exists {
         // W7 is the authenticated one-based first accepting step. Zero means
@@ -29073,6 +29373,179 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     assembler.instruction(aarch64_add_x_imm(31, 31, frame_bytes)?)?;
     assembler.instruction(0xd65f_03c0)?;
 
+    let mut compact_reverse_identity_offsets = None;
+    if let (Some(compact_native_complete), Some(compact_native_match)) =
+        (compact_native_complete, compact_native_match)
+    {
+        assembler.bind(compact_native_complete)?;
+        assembler.instruction(aarch64_load_x_imm(7, 31, 80)?)?;
+        assembler.instruction(aarch64_cmp_x_imm(7, 0)?)?;
+        assembler.branch_cond(AARCH64_EQ, native_no_match)?;
+        assembler.branch(compact_native_match)?;
+
+        assembler.bind(compact_native_match)?;
+        // Only V3--V14 active-capability bodies can reach this label. Header
+        // publication has already authenticated the reverse projection and
+        // bound its stride to the compiler's original K0 alphabet.
+        assembler.instruction(aarch64_store_x(7, 31, 80)?)?;
+        assembler.instruction(aarch64_load_x_imm(0, 31, 0)?)?;
+        assembler.instruction(aarch64_load_x_imm(
+            8,
+            0,
+            u16::try_from(FROZEN_PREPARED_HEADER_V1_REVERSE_ROWS_ADDRESS_OFFSET)
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 compact reverse rows"))?,
+        )?)?;
+        assembler.instruction(aarch64_load_w_imm(
+            11,
+            0,
+            u16::try_from(FROZEN_PREPARED_HEADER_V1_REVERSE_INITIAL_ROW_OFFSET)
+                .map_err(|_| {
+                    ObjectError::ArithmeticOverflow("AArch64 compact reverse initial row")
+                })?,
+        )?)?;
+        assembler.instruction(aarch64_add_x_uxtw(11, 8, 11, 2)?)?;
+        if reverse_class_mode == NativeReverseClassMode::Mapped {
+            let reverse_identity_page = assembler.instruction(0x9000_000e)?;
+            let reverse_identity_page_offset =
+                assembler.instruction(aarch64_add_x_imm(14, 14, 0)?)?;
+            compact_reverse_identity_offsets =
+                Some((reverse_identity_page, reverse_identity_page_offset));
+            assembler.instruction(aarch64_sub_x_imm(14, 14, 256)?)?;
+        }
+        assembler.instruction(aarch64_mov_x(12, 7)?)?;
+
+        let reverse_loop = assembler.label()?;
+        let reverse_tail = assembler.label()?;
+        let reverse_first_not_accepting = assembler.label()?;
+        let reverse_second_not_accepting = assembler.label()?;
+        let reverse_tail_not_accepting = assembler.label()?;
+        let reverse_finish = assembler.label()?;
+        let reverse_fallback = assembler.label()?;
+
+        assembler.instruction(aarch64_load_x_imm(3, 31, 48)?)?;
+        assembler.instruction(aarch64_load_x_imm(15, 31, 8)?)?;
+        // Every candidate cursor is strictly before the selected endpoint,
+        // so the endpoint itself is a free impossible-start sentinel.
+        assembler.instruction(aarch64_mov_x(13, 12)?)?;
+        assembler.instruction(aarch64_cmp_x(12, 3)?)?;
+        assembler.branch_cond(AARCH64_LS, reverse_finish)?;
+        assembler.instruction(aarch64_sub_x_reg(16, 12, 3)?)?;
+        assembler.branch_bit_set_w(16, 0, reverse_tail)?;
+
+        // Preload both independent input classes ahead of the row-token
+        // dependency chain and retire two reverse transitions per loop. A
+        // unary alphabet needs neither the source bytes nor a classifier.
+        assembler.bind(reverse_loop)?;
+        assembler.instruction(aarch64_sub_x_imm(12, 12, 2)?)?;
+        if reverse_class_mode != NativeReverseClassMode::Zero {
+            assembler.instruction(aarch64_add_x_reg(10, 15, 12)?)?;
+            assembler.instruction(aarch64_load_byte_imm(16, 10, 1)?)?;
+            assembler.instruction(aarch64_load_byte_imm(17, 10, 0)?)?;
+        }
+        if reverse_class_mode == NativeReverseClassMode::Mapped {
+            assembler.instruction(aarch64_load_byte_reg(16, 14, 16)?)?;
+            assembler.instruction(aarch64_load_byte_reg(17, 14, 17)?)?;
+        }
+        if reverse_class_mode == NativeReverseClassMode::Zero {
+            assembler.instruction(aarch64_load_w_imm(10, 11, 0)?)?;
+        } else {
+            assembler.instruction(aarch64_load_w_uxtw(10, 11, 16)?)?;
+        }
+        assembler.branch_bit_clear_w(
+            10,
+            u8::try_from(DYNAMIC_NATIVE_ROWS_V1_ACCEPT_MASK.trailing_zeros())
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 reverse accept bit"))?,
+            reverse_first_not_accepting,
+        )?;
+        assembler.instruction(aarch64_add_x_imm(13, 12, 1)?)?;
+        assembler.bind(reverse_first_not_accepting)?;
+        assembler.instruction(aarch64_and_low_w(
+            10,
+            10,
+            u8::try_from(DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK.count_ones())
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 reverse token bits"))?,
+        )?)?;
+        assembler.branch_zero_w(10, reverse_finish)?;
+        assembler.instruction(aarch64_sub_w_imm(10, 10, 1)?)?;
+        assembler.instruction(aarch64_add_x_uxtw(11, 8, 10, 2)?)?;
+
+        if reverse_class_mode == NativeReverseClassMode::Zero {
+            assembler.instruction(aarch64_load_w_imm(10, 11, 0)?)?;
+        } else {
+            assembler.instruction(aarch64_load_w_uxtw(10, 11, 17)?)?;
+        }
+        assembler.branch_bit_clear_w(
+            10,
+            u8::try_from(DYNAMIC_NATIVE_ROWS_V1_ACCEPT_MASK.trailing_zeros())
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 reverse accept bit"))?,
+            reverse_second_not_accepting,
+        )?;
+        assembler.instruction(aarch64_mov_x(13, 12)?)?;
+        assembler.bind(reverse_second_not_accepting)?;
+        assembler.instruction(aarch64_and_low_w(
+            10,
+            10,
+            u8::try_from(DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK.count_ones())
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 reverse token bits"))?,
+        )?)?;
+        assembler.branch_zero_w(10, reverse_finish)?;
+        assembler.instruction(aarch64_sub_w_imm(10, 10, 1)?)?;
+        assembler.instruction(aarch64_add_x_uxtw(11, 8, 10, 2)?)?;
+        assembler.instruction(aarch64_cmp_x(12, 3)?)?;
+        assembler.branch_cond(AARCH64_HI, reverse_loop)?;
+        assembler.branch(reverse_finish)?;
+
+        assembler.bind(reverse_tail)?;
+        assembler.instruction(aarch64_sub_x_imm(12, 12, 1)?)?;
+        if reverse_class_mode != NativeReverseClassMode::Zero {
+            assembler.instruction(aarch64_load_byte_reg(16, 15, 12)?)?;
+        }
+        if reverse_class_mode == NativeReverseClassMode::Mapped {
+            assembler.instruction(aarch64_load_byte_reg(16, 14, 16)?)?;
+        }
+        if reverse_class_mode == NativeReverseClassMode::Zero {
+            assembler.instruction(aarch64_load_w_imm(10, 11, 0)?)?;
+        } else {
+            assembler.instruction(aarch64_load_w_uxtw(10, 11, 16)?)?;
+        }
+        assembler.branch_bit_clear_w(
+            10,
+            u8::try_from(DYNAMIC_NATIVE_ROWS_V1_ACCEPT_MASK.trailing_zeros())
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 reverse accept bit"))?,
+            reverse_tail_not_accepting,
+        )?;
+        assembler.instruction(aarch64_mov_x(13, 12)?)?;
+        assembler.bind(reverse_tail_not_accepting)?;
+        assembler.instruction(aarch64_and_low_w(
+            10,
+            10,
+            u8::try_from(DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK.count_ones())
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 reverse token bits"))?,
+        )?)?;
+        assembler.branch_zero_w(10, reverse_finish)?;
+        assembler.instruction(aarch64_sub_w_imm(10, 10, 1)?)?;
+        assembler.instruction(aarch64_add_x_uxtw(11, 8, 10, 2)?)?;
+        assembler.instruction(aarch64_cmp_x(12, 3)?)?;
+        assembler.branch_cond(AARCH64_HI, reverse_loop)?;
+        assembler.branch(reverse_finish)?;
+
+        assembler.bind(reverse_finish)?;
+        assembler.instruction(aarch64_cmp_x(13, 7)?)?;
+        assembler.branch_cond(AARCH64_EQ, reverse_fallback)?;
+        assembler.instruction(aarch64_load_x_imm(5, 31, 24)?)?;
+        assembler.instruction(aarch64_store_x(13, 5, 0)?)?;
+        assembler.instruction(aarch64_load_x_imm(7, 31, 80)?)?;
+        assembler.instruction(aarch64_store_x(7, 5, 8)?)?;
+        assembler.instruction(aarch64_movz_w(0, 1)?)?;
+        restore_frame_link(&mut assembler)?;
+        assembler.instruction(aarch64_add_x_imm(31, 31, frame_bytes)?)?;
+        assembler.instruction(0xd65f_03c0)?;
+
+        assembler.bind(reverse_fallback)?;
+        assembler.instruction(aarch64_load_x_imm(7, 31, 80)?)?;
+        assembler.branch(native_match)?;
+    }
+
     let mut span_recovery_relocation_offsets = None;
     assembler.bind(native_match)?;
     assembler.instruction(aarch64_load_x_imm(5, 31, 24)?)?;
@@ -29240,6 +29713,12 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     } else {
         None
     };
+    let compact_reverse_relocation_base =
+        compact_reverse_identity_offsets.map(|(identity_page, identity_offset)| {
+            let base = relocation_offsets.len();
+            relocation_offsets.extend_from_slice(&[identity_page, identity_offset]);
+            base
+        });
     let span_recovery_relocation_base = span_recovery_relocation_offsets.map(
         |(identity_page, identity_page_offset, runtime_branch)| {
             let base = relocation_offsets.len();
@@ -29363,6 +29842,45 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
                 )?,
                 kind: RelocationKind::Aarch64Branch26,
                 symbol: DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL,
+                addend: 0,
+            },
+        ]);
+    }
+    if let Some(base) = compact_reverse_relocation_base {
+        let end = base
+            .checked_add(2)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "AArch64 compact reverse relocation indices",
+            ))?;
+        let &[identity_page, identity_offset] = relocation_offsets
+            .get(base..end)
+            .ok_or(ObjectError::InvalidModule(
+                "AArch64 compact reverse relocation offsets are absent",
+            ))?
+        else {
+            return Err(ObjectError::InvalidModule(
+                "AArch64 compact reverse relocation offsets are malformed",
+            ));
+        };
+        relocations.extend_from_slice(&[
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(
+                    identity_page,
+                    "AArch64 compact reverse identity ADRP",
+                )?,
+                kind: RelocationKind::Aarch64Page21,
+                symbol: PARTIAL_IDENTITY_SYMBOL,
+                addend: 0,
+            },
+            ModuleRelocation {
+                section: TEXT_SECTION,
+                offset: offset_u64(
+                    identity_offset,
+                    "AArch64 compact reverse identity ADD",
+                )?,
+                kind: RelocationKind::Aarch64PageOff12,
+                symbol: PARTIAL_IDENTITY_SYMBOL,
                 addend: 0,
             },
         ]);
@@ -30572,6 +31090,176 @@ mod tests {
     }
 
     #[test]
+    fn compact_reverse_classifier_unswitches_zero_mapped_and_identity_alphabets() {
+        fn byte_occurrences(code: &[u8], needle: &[u8]) -> usize {
+            code.windows(needle.len())
+                .filter(|window| *window == needle)
+                .count()
+        }
+
+        fn word_occurrences(code: &[u8], needle: u32) -> usize {
+            code.chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .filter(|&word| word == needle)
+                .count()
+        }
+
+        assert_eq!(
+            NativeReverseClassMode::from_class_count(1),
+            Some(NativeReverseClassMode::Zero)
+        );
+        assert_eq!(
+            NativeReverseClassMode::from_class_count(2),
+            Some(NativeReverseClassMode::Mapped)
+        );
+        assert_eq!(
+            NativeReverseClassMode::from_class_count(255),
+            Some(NativeReverseClassMode::Mapped)
+        );
+        assert_eq!(
+            NativeReverseClassMode::from_class_count(256),
+            Some(NativeReverseClassMode::Identity)
+        );
+        assert_eq!(NativeReverseClassMode::from_class_count(0), None);
+        assert_eq!(NativeReverseClassMode::from_class_count(257), None);
+
+        let x86 = |source_class_count| {
+            lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
+                None,
+                FeatureSet::EMPTY,
+                OutputContract::Span,
+                None,
+                true,
+                false,
+                true,
+                true,
+                source_class_count,
+            )
+            .unwrap()
+        };
+        let x86_zero = x86(1);
+        let x86_mapped = x86(2);
+        let x86_identity = x86(256);
+        let x86_pair_source_load = [0x41, 0x0f, 0xb6, 0x44, 0x31, 0x01];
+        let x86_map_load = [0x41, 0x0f, 0xb6, 0x04, 0x00];
+        assert_eq!(byte_occurrences(&x86_zero.code, &x86_pair_source_load), 0);
+        assert_eq!(byte_occurrences(&x86_identity.code, &x86_pair_source_load), 1);
+        assert_eq!(byte_occurrences(&x86_mapped.code, &x86_pair_source_load), 1);
+        assert_eq!(byte_occurrences(&x86_zero.code, &x86_map_load), 0);
+        assert_eq!(byte_occurrences(&x86_identity.code, &x86_map_load), 0);
+        assert_eq!(byte_occurrences(&x86_mapped.code, &x86_map_load), 2);
+        let x86_identity_relocations = |emission: &NativeDynamicRowsEmission| {
+            emission
+                .relocations
+                .iter()
+                .filter(|relocation| relocation.symbol == PARTIAL_IDENTITY_SYMBOL)
+                .count()
+        };
+        assert_eq!(
+            x86_identity_relocations(&x86_mapped),
+            x86_identity_relocations(&x86_identity) + 1
+        );
+        assert_eq!(
+            x86_identity_relocations(&x86_zero),
+            x86_identity_relocations(&x86_identity)
+        );
+        assert!(x86_zero.code.len() < x86_identity.code.len());
+        assert!(x86_identity.code.len() < x86_mapped.code.len());
+
+        let arm = |source_class_count| {
+            lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
+                None,
+                OutputContract::Span,
+                None,
+                true,
+                false,
+                true,
+                true,
+                false,
+                source_class_count,
+            )
+            .unwrap()
+        };
+        let arm_zero = arm(1);
+        let arm_mapped = arm(2);
+        let arm_identity = arm(256);
+        let arm_pair_source_load = aarch64_load_byte_imm(16, 10, 1).unwrap();
+        let arm_map_load = aarch64_load_byte_reg(16, 14, 16).unwrap();
+        assert_eq!(word_occurrences(&arm_zero.code, arm_pair_source_load), 0);
+        assert_eq!(word_occurrences(&arm_identity.code, arm_pair_source_load), 1);
+        assert_eq!(word_occurrences(&arm_mapped.code, arm_pair_source_load), 1);
+        assert_eq!(word_occurrences(&arm_zero.code, arm_map_load), 0);
+        assert_eq!(word_occurrences(&arm_identity.code, arm_map_load), 0);
+        assert_eq!(word_occurrences(&arm_mapped.code, arm_map_load), 2);
+        let arm_identity_relocations = |emission: &NativeDynamicRowsEmission| {
+            emission
+                .relocations
+                .iter()
+                .filter(|relocation| relocation.symbol == PARTIAL_IDENTITY_SYMBOL)
+                .count()
+        };
+        assert_eq!(
+            arm_identity_relocations(&arm_mapped),
+            arm_identity_relocations(&arm_identity) + 2
+        );
+        assert_eq!(
+            arm_identity_relocations(&arm_zero),
+            arm_identity_relocations(&arm_identity)
+        );
+        assert!(arm_zero.code.len() < arm_identity.code.len());
+        assert!(arm_identity.code.len() < arm_mapped.code.len());
+
+        let zero_map = [0_u8; 256];
+        let mapped_map = core::array::from_fn(|byte| u8::from(byte != 0));
+        let identity_map = core::array::from_fn(|byte| u8::try_from(byte).unwrap());
+        let view = |source_class_count, source_byte_classes| NativeDynamicRowsProgramView {
+            output: OutputContract::Span,
+            exact_match_width: None,
+            artifact_identity: [0x5a; 32],
+            source_class_count,
+            source_byte_classes: Some(source_byte_classes),
+            root_requirement: None,
+        };
+        let zero = lower_native_dynamic_rows_prepared(
+            Vec::new(),
+            view(1, zero_map),
+            Target::x86_64_linux(),
+        )
+        .unwrap()
+        .0;
+        let mapped = lower_native_dynamic_rows_prepared(
+            Vec::new(),
+            view(2, mapped_map),
+            Target::x86_64_linux(),
+        )
+        .unwrap()
+        .0;
+        let identity = lower_native_dynamic_rows_prepared(
+            Vec::new(),
+            view(256, identity_map),
+            Target::x86_64_linux(),
+        )
+        .unwrap()
+        .0;
+        let identity_bytes = [0_u8; 32].len();
+        assert_eq!(zero.data.len(), identity_bytes);
+        assert_eq!(identity.data.len(), identity_bytes);
+        assert_eq!(
+            mapped.data.len(),
+            identity_bytes + NATIVE_DYNAMIC_REVERSE_CLASS_MAP_BYTES
+        );
+
+        let mut permuted_identity = identity_map;
+        permuted_identity.swap(0, 1);
+        assert!(lower_native_dynamic_rows_prepared(
+            Vec::new(),
+            view(256, permuted_identity),
+            Target::x86_64_linux(),
+        )
+        .is_err());
+    }
+
+    #[test]
     #[allow(
         clippy::too_many_lines,
         reason = "one structural audit proves exact SIMD reductions and target-aware production selection"
@@ -30766,6 +31454,7 @@ mod tests {
                 true,
                 true,
                 false,
+                256,
             )
             .unwrap();
         let asimd_arm =
@@ -30778,6 +31467,7 @@ mod tests {
                 true,
                 true,
                 true,
+                256,
             )
             .unwrap();
         for (emission, expected) in [
@@ -37580,8 +38270,8 @@ mod tests {
                         .windows(3)
                         .filter(|bytes| *bytes == [0xc5, 0xf8, 0x77])
                         .count(),
-                    4,
-                    "root x86 continuation must clean AVX state: {features:?}/{output:?}/{width:?}"
+                    4 + usize::from(output == OutputContract::Span && width.is_none()),
+                    "root x86 continuation and direct reverse success must clean AVX state: {features:?}/{output:?}/{width:?}"
                 );
                 let pointer_lookup = [
                     0x44, 0x0f, 0xb6, 0x14, 0x17, 0x47, 0x0f, 0xb6, 0x14, 0x11, 0x47, 0x8b,
@@ -38164,6 +38854,7 @@ mod tests {
             exact_match_width: None,
             artifact_identity: [0x5a; 32],
             source_class_count: 256,
+            source_byte_classes: None,
             // An empty exact graph column has semantic root ownership but no
             // moving backend scanner to install. Supertransition legality is
             // derived from this semantic requirement, not installation.
@@ -38179,6 +38870,7 @@ mod tests {
         let variable_span_view = NativeDynamicRowsProgramView {
             output: OutputContract::Span,
             exact_match_width: None,
+            source_byte_classes: Some(core::array::from_fn(|byte| byte as u8)),
             root_requirement: None,
             ..semantic_root_view
         };
@@ -42627,6 +43319,198 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             );
             fs::remove_dir_all(&directory).expect("remove singleton Span linker directory");
         }
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    #[ignore = "links a forged active V4 owner to prove compact variable-Span recovery never calls its helper"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the direct descriptor fixture keeps forward, reverse, and helper-call provenance in one executable oracle"
+    )]
+    fn linked_host_compact_variable_span_recovers_natively_without_helper() {
+        use std::{fs, process::Command, time::SystemTime};
+
+        let target = if cfg!(target_arch = "x86_64") {
+            if cfg!(target_os = "linux") {
+                Target::x86_64_linux()
+            } else {
+                Target::x86_64_macos()
+            }
+        } else if cfg!(target_os = "linux") {
+            Target::aarch64_linux()
+        } else {
+            Target::aarch64_macos()
+        };
+        let program = scanner_free_dynamic_program(
+            scanner_free_variable_pair_raw(),
+            OutputContract::Span,
+        );
+        let view = program
+            .native_dynamic_rows_view()
+            .expect("scanner-free variable Span dynamic view");
+        assert_eq!(view.source_class_count, 3);
+        assert!(view.source_byte_classes.is_some());
+        let module = lower_without_materialized_k0(&program, target);
+        assert_eq!(
+            module.required_prepared_dynamic_rows_span_recovery_runtime_symbol(),
+            Some(DYNAMIC_ROWS_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME)
+        );
+        let entry = module
+            .prepared_entry_symbol()
+            .expect("variable Span prepared entry");
+        let identity = program
+            .artifact_identity()
+            .iter()
+            .map(u8::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "fre-aot-compact-native-reverse-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("create compact reverse linker directory");
+        let object = directory.join("compact-reverse.o");
+        let object_bytes = crate::emit_object(
+            &module,
+            ObjectFormat::for_target(target),
+            usize::MAX,
+        )
+        .expect("emit compact reverse object");
+        fs::write(&object, object_bytes).expect("write compact reverse object");
+
+        let source = format!(
+            r##"#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+typedef void *handle_t;
+typedef struct {{ size_t start; size_t end; }} result_t;
+typedef struct {{
+  uint64_t active_seal; uint64_t magic; uint32_t abi_version; uint32_t flags;
+  size_t header_bytes; unsigned char artifact_identity[32];
+  size_t forward_rows_address; size_t reverse_rows_address;
+  size_t forward_live_cells; size_t reverse_live_cells; uint64_t cache_identity;
+  uint32_t row_stride; uint32_t forward_initial_row; uint32_t reverse_initial_row;
+  uint32_t unfilled_cell; uint32_t accept_mask; uint32_t next_row_token_mask;
+  unsigned char class_map[256];
+}} frozen_v1_t;
+typedef struct {{
+  uint64_t ready_seal; size_t rows_address; uint64_t cache_identity;
+  uint32_t state_count; uint32_t class_count; uint32_t row_shift;
+  uint32_t initial_state; uint32_t learned_loop_state_count;
+  uint32_t learned_loop_states[4]; uint32_t format_version;
+}} frozen_v4_tail_t;
+typedef struct {{ frozen_v1_t v1; frozen_v4_tail_t v4; }} frozen_v4_t;
+typedef struct {{ size_t start; size_t end; size_t rows; uint64_t generation; }} preflight_t;
+typedef struct {{ size_t status; size_t native_rows_address; }} preflight_result_v6_t;
+typedef struct {{ size_t row; size_t position; size_t pending; size_t end; uint64_t generation; }} continuation_t;
+_Static_assert(sizeof(frozen_v1_t)=={v1_bytes}U,"V1 extent");
+_Static_assert(offsetof(frozen_v4_t,v4)=={tail_offset}U,"V4 tail offset");
+_Static_assert(sizeof(frozen_v4_t)=={v4_bytes}U,"V4 extent");
+extern uint32_t {entry}(handle_t,const unsigned char*,size_t,size_t,size_t,result_t*);
+static const unsigned char identity[32]={{{identity}}};
+static uint16_t forward_rows[4];
+static uint32_t reverse_rows[6];
+static frozen_v4_t frozen;
+static unsigned helper_calls;
+uint32_t fre_aot_regex_runtime_search_v1(const unsigned char*a,const unsigned char*b,size_t n,size_t s,size_t e,result_t*r){{(void)a;(void)b;(void)n;(void)s;(void)e;(void)r;helper_calls++;return 97U;}}
+uint32_t fre_aot_regex_runtime_search_exclusive_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;helper_calls++;return 97U;}}
+preflight_result_v6_t fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v6(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,preflight_t*o){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;(void)i;(void)o;helper_calls++;return (preflight_result_v6_t){{97U,0U}};}}
+uint32_t fre_aot_regex_runtime_search_exclusive_dynamic_rows_deopt_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;helper_calls++;return 97U;}}
+uint32_t fre_aot_regex_runtime_search_exclusive_dynamic_rows_continue_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,const continuation_t*c){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;(void)i;(void)c;helper_calls++;return 97U;}}
+uint32_t fre_aot_regex_runtime_search_exclusive_dynamic_rows_recover_span_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,size_t x){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;(void)i;(void)x;helper_calls++;return 97U;}}
+size_t fre_aot_regex_runtime_scan_frozen_loop_v2(const unsigned char*p,const void*s,size_t n){{(void)p;(void)s;(void)n;helper_calls++;return 0U;}}
+static void init(void){{
+  memset(&frozen,0,sizeof(frozen));
+  forward_rows[0]=3U;forward_rows[1]=UINT16_C(0x8000);
+  forward_rows[2]=UINT16_C(0x8000);forward_rows[3]=UINT16_C(0x8000);
+  reverse_rows[0]=4U;reverse_rows[1]=UINT32_C(0x80000004);reverse_rows[2]=4U;
+  reverse_rows[3]=UINT32_C(0x80000000);reverse_rows[4]=0U;reverse_rows[5]=UINT32_C(0x80000000);
+  frozen.v1.active_seal=UINT64_C({active_seal});frozen.v1.magic=UINT64_C({magic});
+  frozen.v1.abi_version=UINT32_C({abi});frozen.v1.flags=UINT32_C({v4_flag});
+  frozen.v1.header_bytes={v4_bytes}U;memcpy(frozen.v1.artifact_identity,identity,sizeof(identity));
+  frozen.v1.forward_rows_address=(size_t)(uintptr_t)forward_rows;
+  frozen.v1.reverse_rows_address=(size_t)(uintptr_t)reverse_rows;
+  frozen.v1.forward_live_cells=4U;frozen.v1.reverse_live_cells=6U;
+  frozen.v1.cache_identity=UINT64_C(77);frozen.v1.row_stride=2U;
+  frozen.v1.forward_initial_row=0U;frozen.v1.reverse_initial_row=0U;
+  frozen.v1.unfilled_cell=0U;frozen.v1.accept_mask=UINT32_C(0x8000);
+  frozen.v1.next_row_token_mask=UINT32_C(0x7fff);
+  for(size_t i=0;i<256U;i++)frozen.v1.class_map[i]=(i==(size_t)'a')?1U:0U;
+  frozen.v4.ready_seal=UINT64_C({ready_seal});
+  frozen.v4.rows_address=(size_t)(uintptr_t)forward_rows;
+  frozen.v4.cache_identity=UINT64_C(77);frozen.v4.state_count=2U;frozen.v4.class_count=2U;
+  frozen.v4.row_shift=1U;frozen.v4.initial_state=0U;frozen.v4.learned_loop_state_count=0U;
+  for(size_t i=0;i<4U;i++)frozen.v4.learned_loop_states[i]=UINT32_MAX;
+  frozen.v4.format_version=UINT32_C({v4_format});
+}}
+static int run(const unsigned char *hay,size_t end,size_t xs,size_t xe,int base){{
+  result_t result={{91U,92U}};helper_calls=0U;
+  uint32_t status={entry}((handle_t)&frozen,hay,64U,5U,end,&result);
+  if(status!=1U||result.start!=xs||result.end!=xe)return base;
+  if(helper_calls!=0U)return base+1;
+  return 0;
+}}
+int main(void){{
+  unsigned char hay[64];memset(hay,'a',sizeof(hay));init();
+  int status=run(hay,10U,5U,6U,10);if(status)return status;
+  hay[5]='b';hay[6]='q';status=run(hay,10U,5U,7U,20);if(status)return status;
+  result_t miss={{91U,92U}};helper_calls=0U;
+  status={entry}((handle_t)&frozen,hay,sizeof(hay),5U,6U,&miss);
+  if(status!=0U||miss.start!=0U||miss.end!=0U||helper_calls!=0U)return 30;
+  frozen.v1.flags=UINT32_C({v2_flag});helper_calls=0U;miss.start=91U;miss.end=92U;
+  status={entry}((handle_t)&frozen,hay,sizeof(hay),5U,45U,&miss);
+  if(status!=97U||helper_calls!=1U||miss.start!=91U||miss.end!=92U)return 31;
+  return 0;
+}}
+"##,
+            v1_bytes = FROZEN_PREPARED_HEADER_V4_DYNAMIC_ROWS_OFFSET,
+            tail_offset = FROZEN_PREPARED_HEADER_V4_DYNAMIC_ROWS_OFFSET,
+            v4_bytes = FROZEN_PREPARED_HEADER_V4_BYTES,
+            active_seal = FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL,
+            magic = FROZEN_PREPARED_HEADER_V1_MAGIC,
+            abi = FROZEN_PREPARED_HEADER_V1_ABI_VERSION,
+            v2_flag = FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS,
+            v4_flag = FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V4,
+            ready_seal = FROZEN_PREPARED_HEADER_V4_READY_SEAL,
+            v4_format = FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION,
+        );
+        let c_path = directory.join("compact-reverse.c");
+        let executable = directory.join("compact-reverse");
+        fs::write(&c_path, source).expect("write compact reverse C harness");
+        let c_compiler = if cfg!(target_os = "macos") {
+            "clang"
+        } else {
+            "cc"
+        };
+        let status = Command::new(c_compiler)
+            .arg("-O0")
+            .arg(&c_path)
+            .arg(&object)
+            .arg("-o")
+            .arg(&executable)
+            .status()
+            .expect("link compact reverse harness");
+        assert!(status.success(), "compact reverse harness failed to link");
+        let result = Command::new(&executable)
+            .output()
+            .expect("execute compact reverse harness");
+        assert!(
+            result.status.success(),
+            "status={:?} stdout={} stderr={}",
+            result.status.code(),
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        fs::remove_dir_all(&directory).expect("remove compact reverse linker directory");
     }
 
     #[cfg(all(

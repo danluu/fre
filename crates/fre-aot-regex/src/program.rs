@@ -7102,6 +7102,10 @@ pub(crate) struct NativeDynamicRowsProgramView {
     /// Frozen normalization may merge columns but cannot split them, so a
     /// source below the raw-expansion threshold can never publish V8/V9 rows.
     pub(crate) source_class_count: usize,
+    /// Exact immutable K0 byte-to-class map. Only variable-width `Span`
+    /// lowering consumes this compile-time sidecar; other outputs keep it
+    /// absent so their emitted data remains byte-for-byte unchanged.
+    pub(crate) source_byte_classes: Option<[u8; 256]>,
     /// Exact match-relative byte class selected from the Thompson graph.
     /// Target lowering may use it only while the authenticated cache is in
     /// its initial row; unsupported shapes retain the scalar row entry.
@@ -8266,6 +8270,9 @@ impl CompiledProgram {
                 .iter()
                 .filter(|&&start| start)
                 .count(),
+            source_byte_classes: (self.output == OutputContract::Span
+                && self.exact_match_width.is_none())
+                .then(|| dfa_boundary_class_map(&self.raw)),
             root_requirement,
         })
     }
@@ -8967,6 +8974,7 @@ impl CompiledProgram {
         }
         if source_class_count == 0
             || source_class_count > 256
+            || source_class_count != dynamic_view.source_class_count
             || state_count == 0
             || source_cells == 0
             || source_cells != full.forward_rows().len()
@@ -9612,7 +9620,11 @@ impl CompiledProgram {
             else {
                 return header;
             };
-            if root_projection.cache_identity() != rows.cache_identity
+            let Ok(expected_reverse_stride) = u32::try_from(dynamic_view.source_class_count) else {
+                return header;
+            };
+            if reverse.row_stride != expected_reverse_stride
+                || root_projection.cache_identity() != rows.cache_identity
                 || storage.root_prefill_receipt.reverse != Some(reverse)
             {
                 return header;
@@ -14491,6 +14503,19 @@ fn dfa_boundary_starts(raw: &RawPlan) -> [bool; 256] {
         }
     }
     boundary_starts
+}
+
+fn dfa_boundary_class_map(raw: &RawPlan) -> [u8; 256] {
+    let boundary_starts = dfa_boundary_starts(raw);
+    let mut current_class = 0_u8;
+    core::array::from_fn(|byte| {
+        if byte != 0 && boundary_starts[byte] {
+            current_class = current_class
+                .checked_add(1)
+                .expect("at most 256 increasing byte-boundary classes");
+        }
+        current_class
+    })
 }
 
 fn dfa_alphabet_shape(raw: &RawPlan) -> Result<DfaAlphabetShape, ProgramFormatError> {
@@ -25201,6 +25226,51 @@ mod tests {
                 < FROZEN_COMPACT_DIRECT_BYTE_MIN_CLASSES,
             "narrow source alphabets omit V8/V9/V10 raw-byte code entirely"
         );
+    }
+
+    #[test]
+    fn dynamic_reverse_class_map_is_exact_at_all_classifier_mode_boundaries() {
+        for class_count in [1_usize, 2, 255, 256] {
+            // Singleton ranges for bytes 0..class_count-2 introduce exactly
+            // the increasing boundaries 1..class_count-1. The final class
+            // covers the remainder of the byte alphabet.
+            let edge_count = class_count - 1;
+            let singleton_bytes = (0..edge_count)
+                .map(|byte| u8::try_from(byte).unwrap())
+                .collect::<Vec<_>>();
+            let raw = RawPlan {
+                start: 0,
+                roles: vec![StateRole::Consume, StateRole::Accept],
+                edge_offsets: vec![
+                    0,
+                    u32::try_from(edge_count).unwrap(),
+                    u32::try_from(edge_count).unwrap(),
+                ],
+                edge_targets: vec![1; edge_count],
+                edge_kinds: vec![EdgeKind::ByteRange; edge_count],
+                byte_starts: singleton_bytes.clone(),
+                byte_ends: singleton_bytes,
+            };
+            let boundaries = dfa_boundary_starts(&raw);
+            assert_eq!(
+                boundaries.iter().filter(|&&is_start| is_start).count(),
+                class_count
+            );
+            let map = dfa_boundary_class_map(&raw);
+            for (byte, &class) in map.iter().enumerate() {
+                let expected = byte.min(class_count - 1);
+                assert_eq!(
+                    usize::from(class),
+                    expected,
+                    "classes={class_count}, byte={byte}"
+                );
+                assert_eq!(
+                    boundaries[byte],
+                    byte == 0 || usize::from(class) != usize::from(map[byte - 1]),
+                    "classes={class_count}, byte={byte}"
+                );
+            }
+        }
     }
 
     #[test]
