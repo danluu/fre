@@ -10945,11 +10945,10 @@ impl CompiledProgram {
 
     /// Authenticate and project an ordinary prepared K0 cache for the
     /// additive dynamic warmed-row root. Projection and admission are O(1),
-    /// allocation-free, and publish the cache's immutable identity token for
-    /// generated code to compare against the descriptor before reading either
-    /// source address. The returned exposed-provenance addresses are valid only
-    /// for that synchronous admitted scan and must not survive a helper call or
-    /// re-entry.
+    /// allocation-free, and publish the cache's immutable identity token with
+    /// the descriptor. The returned exposed-provenance addresses are valid
+    /// only for that synchronous admitted scan and must not survive a helper
+    /// call or re-entry.
     #[doc(hidden)]
     pub fn preflight_dynamic_native_rows_with_workspace(
         &self,
@@ -10958,7 +10957,72 @@ impl CompiledProgram {
         workspace: &mut ProgramWorkspace,
         expected_artifact_identity: [u8; 32],
     ) -> Result<(RetainedPartialPreflight, usize, u64), CompileError> {
-        if window.start > window.end || window.end > haystack.len() {
+        self.preflight_dynamic_native_rows_with_workspace_inner::<false>(
+            haystack,
+            window,
+            workspace,
+            expected_artifact_identity,
+        )
+    }
+
+    /// Compiler-private V3 projection after the generated wrapper and the
+    /// prepared runtime have established the invariant parts of admission.
+    ///
+    /// Unlike [`Self::preflight_dynamic_native_rows_with_workspace`], this
+    /// path does not repeat the exact-window, workspace-lineage, or static
+    /// program-shape checks on every search. Artifact authentication remains a
+    /// release-mode check and binds the generated entry to this exact program.
+    ///
+    /// # Compiler-private contract
+    ///
+    /// `window` must be contained in `haystack`. `workspace` must be the live,
+    /// exclusively borrowed workspace constructed for `self`. The caller must
+    /// be a generated dynamic-row entry for `self`; consequently the output
+    /// contract, engine, assertion, exact-product, and dynamic-row-workspace
+    /// requirements below must already hold. A foreign
+    /// `expected_artifact_identity` is permitted and is rejected before any
+    /// trusted operation. No returned address may survive a helper call,
+    /// re-entry, workspace mutation, or the end of the search.
+    #[doc(hidden)]
+    pub fn compiler_private_preflight_dynamic_native_rows_v3_with_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+        expected_artifact_identity: [u8; 32],
+    ) -> Result<(RetainedPartialPreflight, usize, u64), CompileError> {
+        debug_assert!(window.start <= window.end && window.end <= haystack.len());
+        debug_assert!(workspace.identity.compatible(&self.identity));
+        debug_assert!(matches!(
+            self.output,
+            OutputContract::Exists | OutputContract::SelectedEnd | OutputContract::Span
+        ));
+        debug_assert!(self.output != OutputContract::Span || self.exact_match_width != Some(0));
+        debug_assert!(self.context_dfa.is_none());
+        debug_assert!(matches!(self.engine, ProgramEngine::OrderedNfa));
+        debug_assert!(!self.automaton.stats().has_assertions());
+        debug_assert!(!self.has_nfa_exact_product());
+        debug_assert!(workspace.dynamic_native_rows.is_some());
+        self.preflight_dynamic_native_rows_with_workspace_inner::<true>(
+            haystack,
+            window,
+            workspace,
+            expected_artifact_identity,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one const-specialized transaction keeps checked and trusted policies identical"
+    )]
+    fn preflight_dynamic_native_rows_with_workspace_inner<const TRUSTED_V3: bool>(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+        expected_artifact_identity: [u8; 32],
+    ) -> Result<(RetainedPartialPreflight, usize, u64), CompileError> {
+        if !TRUSTED_V3 && (window.start > window.end || window.end > haystack.len()) {
             return Err(CompileError::InvalidWindow {
                 start: window.start,
                 end: window.end,
@@ -10970,7 +11034,7 @@ impl CompiledProgram {
                 "dynamic native-row preflight artifact identity does not match the prepared program",
             ));
         }
-        if !workspace.identity.compatible(&self.identity) {
+        if !TRUSTED_V3 && !workspace.identity.compatible(&self.identity) {
             return Err(CompileError::InternalInvariant(
                 "dynamic native-row workspace belongs to a different semantic program",
             ));
@@ -10979,11 +11043,12 @@ impl CompiledProgram {
             OutputContract::Exists | OutputContract::SelectedEnd => true,
             OutputContract::Span => self.exact_match_width != Some(0),
         };
-        if !output_supported
-            || self.context_dfa.is_some()
-            || !matches!(self.engine, ProgramEngine::OrderedNfa)
-            || self.automaton.stats().has_assertions()
-            || self.has_nfa_exact_product()
+        if !TRUSTED_V3
+            && (!output_supported
+                || self.context_dfa.is_some()
+                || !matches!(self.engine, ProgramEngine::OrderedNfa)
+                || self.automaton.stats().has_assertions()
+                || self.has_nfa_exact_product())
         {
             return Err(CompileError::InternalInvariant(
                 "dynamic native rows require assertion-free ordered-NFA endpoint output or nonzero Span",
