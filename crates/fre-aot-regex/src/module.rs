@@ -17999,7 +17999,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
 fn lower_x86_64_partial_prepared(
     view: &NativePartialProgramView<'_>,
 ) -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
-    const FRAME_BYTES: u8 = 88;
+    const FRAME_BYTES: u8 = 72;
     let mut assembler = X86Assembler::new();
     let span_recovery = view.output == OutputContract::Span
         && !view.dfa.initial_pending
@@ -18032,14 +18032,14 @@ fn lower_x86_64_partial_prepared(
     assembler.instruction(&compare_minimum)?;
     assembler.branch(&[0x0f, 0x82], fallback_runtime)?;
 
-    // Entry RSP is 8 modulo 16. An 88-byte frame aligns it for calls, retains
+    // Entry RSP is 8 modulo 16. A 72-byte frame aligns it for calls, retains
     // only the public arguments needed after preflight, reserves two SysV
     // private arguments, and leaves two exact-window outputs.
     assembler.instruction(&[0x48, 0x83, 0xec, FRAME_BYTES])?;
     assembler.instruction(&[0x48, 0x89, 0x7c, 0x24, 0x10])?;
     assembler.instruction(&[0x48, 0x89, 0x74, 0x24, 0x18])?;
     assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x20])?;
-    assembler.instruction(&[0x4c, 0x89, 0x4c, 0x24, 0x38])?;
+    assembler.instruction(&[0x4c, 0x89, 0x4c, 0x24, 0x28])?;
 
     // One authenticated runtime transaction settles the prior local native
     // result, runs suffix then cut, and consults adaptive admission. SysV
@@ -18049,7 +18049,7 @@ fn lower_x86_64_partial_prepared(
     assembler.bind(preflight_identity_displacement_label)?;
     push_bytes(&mut assembler.code, &[0; 4])?;
     assembler.instruction(&[0x48, 0x89, 0x04, 0x24])?;
-    assembler.instruction(&[0x48, 0x8d, 0x44, 0x24, 0x40])?;
+    assembler.instruction(&[0x48, 0x8d, 0x44, 0x24, 0x30])?;
     assembler.instruction(&[0x48, 0x89, 0x44, 0x24, 0x08])?;
     // Saving the public arguments did not clobber RDI through R9. Keep those
     // live entry values in their ABI registers for the first preflight call;
@@ -18072,8 +18072,8 @@ fn lower_x86_64_partial_prepared(
     // slots remain available to an Exists retry scratch path and continuation.
     assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x18])?; // haystack
     assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x20])?; // length
-    assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x40])?; // exact start
-    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x48])?; // exact end
+    assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x30])?; // exact start
+    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x38])?; // exact end
     assembler.instruction(&[0x4c, 0x8d, 0x04, 0x24])?; // result = rsp
     assembler.instruction(&[0xe8])?;
     let native_core_displacement_label = assembler.label()?;
@@ -18089,14 +18089,14 @@ fn lower_x86_64_partial_prepared(
     }
     assembler.instruction(&[0x85, 0xc0])?;
     assembler.branch(&[0x0f, 0x85], native_invalid)?;
-    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x38])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x28])?;
     assembler.instruction(&[0x49, 0xc7, 0x01, 0, 0, 0, 0])?;
     assembler.instruction(&[0x49, 0xc7, 0x41, 0x08, 0, 0, 0, 0])?;
     assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
     assembler.instruction(&[0xc3])?;
 
     assembler.bind(native_match)?;
-    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x38])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x28])?;
     if view.output == OutputContract::Exists {
         assembler.instruction(&[0x31, 0xc0])?;
         assembler.instruction(&[0x49, 0x89, 0x01])?;
@@ -18126,9 +18126,9 @@ fn lower_x86_64_partial_prepared(
         assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x10])?;
         assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x18])?;
         assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x20])?;
-        assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x40])?;
-        assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x48])?;
-        assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x38])?;
+        assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x30])?;
+        assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x38])?;
+        assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x28])?;
         assembler.instruction(&[0xe8])?;
         let recovery_runtime_displacement_label = assembler.label()?;
         assembler.bind(recovery_runtime_displacement_label)?;
@@ -18154,7 +18154,7 @@ fn lower_x86_64_partial_prepared(
     assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x10])?;
     assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x18])?;
     assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x20])?;
-    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x38])?;
+    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x28])?;
     assembler.instruction(&[0xe8])?;
     let runtime_displacement_label = assembler.label()?;
     assembler.bind(runtime_displacement_label)?;
@@ -29066,7 +29066,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
 fn lower_aarch64_partial_prepared(
     view: &NativePartialProgramView<'_>,
 ) -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
-    const FRAME_BYTES: u16 = 80;
+    const FRAME_BYTES: u16 = 64;
     let mut assembler = Aarch64Assembler::new();
     let span_recovery = view.output == OutputContract::Span
         && !view.dfa.initial_pending
@@ -29090,7 +29090,7 @@ fn lower_aarch64_partial_prepared(
     assembler.branch_cond(AARCH64_LO, fallback_runtime)?;
 
     assembler.instruction(aarch64_sub_x_imm(31, 31, FRAME_BYTES)?)?;
-    assembler.instruction(aarch64_store_x(30, 31, 72)?)?;
+    assembler.instruction(aarch64_store_x(30, 31, 56)?)?;
     assembler.instruction(aarch64_store_pair_x(0, 1, 31, 0)?)?;
     // Start/end remain live in X3/X4 through the first preflight call and are
     // then superseded by its exact-window output. Retain only length/result.
@@ -29102,7 +29102,7 @@ fn lower_aarch64_partial_prepared(
     let preflight_identity_page = assembler.instruction(0x9000_0006)?;
     let preflight_identity_page_offset =
         assembler.instruction(aarch64_add_x_imm(6, 6, 0)?)?;
-    assembler.instruction(aarch64_add_x_imm(7, 31, 48)?)?;
+    assembler.instruction(aarch64_add_x_imm(7, 31, 32)?)?;
     // The frame stores do not change any live argument register. Only X6/X7
     // are selected for the additional preflight arguments, so the first
     // helper consumes the original X0..X5 directly; later paths reload only
@@ -29113,7 +29113,7 @@ fn lower_aarch64_partial_prepared(
         u16::from(PARTIAL_PREFLIGHT_ENTER_STATUS),
     )?)?;
     assembler.branch_cond(AARCH64_EQ, preflight_enter)?;
-    assembler.instruction(aarch64_load_x_imm(30, 31, 72)?)?;
+    assembler.instruction(aarch64_load_x_imm(30, 31, 56)?)?;
     assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
     assembler.instruction(0xd65f_03c0)?;
 
@@ -29123,7 +29123,7 @@ fn lower_aarch64_partial_prepared(
     // output slots and returns match/resume payloads in caller-saved registers,
     // so those slots need no private-outcome initialization or copy.
     assembler.instruction(aarch64_load_pair_x(0, 1, 31, 8)?)?; // haystack, length
-    assembler.instruction(aarch64_load_pair_x(2, 3, 31, 48)?)?; // exact window
+    assembler.instruction(aarch64_load_pair_x(2, 3, 31, 32)?)?; // exact window
     let native_core_branch = assembler.instruction(0x9400_0000)?;
     assembler.instruction(aarch64_cmp_w_imm(0, 1)?)?;
     assembler.branch_cond(AARCH64_EQ, native_match)?;
@@ -29145,7 +29145,7 @@ fn lower_aarch64_partial_prepared(
     assembler.branch_cond(AARCH64_NE, native_invalid)?;
     assembler.instruction(aarch64_load_x_imm(5, 31, 24)?)?;
     assembler.instruction(aarch64_store_pair_x(31, 31, 5, 0)?)?;
-    assembler.instruction(aarch64_load_x_imm(30, 31, 72)?)?;
+    assembler.instruction(aarch64_load_x_imm(30, 31, 56)?)?;
     assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
     assembler.instruction(0xd65f_03c0)?;
 
@@ -29159,7 +29159,7 @@ fn lower_aarch64_partial_prepared(
         assembler.instruction(aarch64_store_pair_x(6, 7, 5, 0)?)?;
     }
     assembler.instruction(aarch64_movz_w(0, 1)?)?;
-    assembler.instruction(aarch64_load_x_imm(30, 31, 72)?)?;
+    assembler.instruction(aarch64_load_x_imm(30, 31, 56)?)?;
     assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
     assembler.instruction(0xd65f_03c0)?;
 
@@ -29173,9 +29173,9 @@ fn lower_aarch64_partial_prepared(
             assembler.instruction(aarch64_add_x_imm(6, 6, 0)?)?;
         assembler.instruction(aarch64_load_pair_x(0, 1, 31, 0)?)?;
         assembler.instruction(aarch64_load_pair_x(2, 5, 31, 16)?)?;
-        assembler.instruction(aarch64_load_pair_x(3, 4, 31, 48)?)?;
+        assembler.instruction(aarch64_load_pair_x(3, 4, 31, 32)?)?;
         let recovery_runtime_branch = assembler.instruction(0x9400_0000)?;
-        assembler.instruction(aarch64_load_x_imm(30, 31, 72)?)?;
+        assembler.instruction(aarch64_load_x_imm(30, 31, 56)?)?;
         assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
         assembler.instruction(0xd65f_03c0)?;
         Some((
@@ -29197,13 +29197,13 @@ fn lower_aarch64_partial_prepared(
     assembler.instruction(aarch64_load_pair_x(0, 1, 31, 0)?)?;
     assembler.instruction(aarch64_load_pair_x(2, 3, 31, 16)?)?;
     let runtime_branch = assembler.instruction(0x9400_0000)?; // bl runtime helper
-    assembler.instruction(aarch64_load_x_imm(30, 31, 72)?)?;
+    assembler.instruction(aarch64_load_x_imm(30, 31, 56)?)?;
     assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
     assembler.instruction(0xd65f_03c0)?;
 
     assembler.bind(native_invalid)?;
     assembler.instruction(aarch64_movz_w(0, 2)?)?;
-    assembler.instruction(aarch64_load_x_imm(30, 31, 72)?)?;
+    assembler.instruction(aarch64_load_x_imm(30, 31, 56)?)?;
     assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
     assembler.instruction(0xd65f_03c0)?;
 
@@ -44192,7 +44192,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 .to_le_bytes(),
         );
         assert!(x86.windows(x86_floor.len()).any(|bytes| bytes == x86_floor));
-        assert!(x86.windows(4).any(|bytes| bytes == [0x48, 0x83, 0xec, 88]));
+        assert!(x86.windows(4).any(|bytes| bytes == [0x48, 0x83, 0xec, 72]));
         let native_core_offset = usize::try_from(x86_relocations[1].offset).unwrap();
         assert_eq!(x86.get(native_core_offset.wrapping_sub(1)), Some(&0xe8));
         assert_eq!(
@@ -44201,8 +44201,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 [
                     0x48, 0x8b, 0x7c, 0x24, 0x18, // haystack
                     0x48, 0x8b, 0x74, 0x24, 0x20, // length
-                    0x48, 0x8b, 0x54, 0x24, 0x40, // exact start
-                    0x48, 0x8b, 0x4c, 0x24, 0x48, // exact end
+                    0x48, 0x8b, 0x54, 0x24, 0x30, // exact start
+                    0x48, 0x8b, 0x4c, 0x24, 0x38, // exact end
                     0x4c, 0x8d, 0x04, 0x24, // result
                 ]
                 .as_slice()
@@ -44279,8 +44279,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
             .collect::<Vec<_>>();
         assert_eq!(words.first(), Some(&aarch64_sub_x_reg(6, 4, 3).unwrap()));
-        assert!(words.contains(&aarch64_sub_x_imm(31, 31, 80).unwrap()));
-        assert!(words.contains(&aarch64_store_x(30, 31, 72).unwrap()));
+        assert!(words.contains(&aarch64_sub_x_imm(31, 31, 64).unwrap()));
+        assert!(words.contains(&aarch64_store_x(30, 31, 56).unwrap()));
         assert!(words.contains(&aarch64_mov_x(5, 2).unwrap()));
         assert!(words.contains(&aarch64_mov_x(4, 6).unwrap()));
         assert!(words.contains(
@@ -44301,7 +44301,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                     .try_into()
                     .unwrap()
             ),
-            aarch64_add_x_imm(7, 31, 48).unwrap(),
+            aarch64_add_x_imm(7, 31, 32).unwrap(),
             "the first preflight call must directly follow its final argument setup",
         );
         let native_core_offset = usize::try_from(aarch64_relocations[3].offset).unwrap();
@@ -44320,7 +44320,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 .collect::<Vec<_>>(),
             [
                 aarch64_load_pair_x(0, 1, 31, 8).unwrap(),
-                aarch64_load_pair_x(2, 3, 31, 48).unwrap(),
+                aarch64_load_pair_x(2, 3, 31, 32).unwrap(),
             ],
             "AArch64 native core must load the preflight exact window directly",
         );
@@ -44329,7 +44329,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             .position(|&word| word == aarch64_store_pair_x(31, 31, 5, 0).unwrap())
             .expect("AArch64 native no-match result initialization");
         assert!(native_core_offset / 4 < caller_zero);
-        assert!(words.contains(&aarch64_add_x_imm(7, 31, 48).unwrap()));
+        assert!(words.contains(&aarch64_add_x_imm(7, 31, 32).unwrap()));
         assert_eq!(
             words
                 .iter()
@@ -44903,7 +44903,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                             aarch64_add_x_imm(6, 6, 0).unwrap(),
                             aarch64_load_pair_x(0, 1, 31, 0).unwrap(),
                             aarch64_load_pair_x(2, 5, 31, 16).unwrap(),
-                            aarch64_load_pair_x(3, 4, 31, 48).unwrap(),
+                            aarch64_load_pair_x(3, 4, 31, 32).unwrap(),
                         ]
                     );
                 }
@@ -45631,8 +45631,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                             [
                                 0x48, 0x8b, 0x7c, 0x24, 0x18, // haystack
                                 0x48, 0x8b, 0x74, 0x24, 0x20, // length
-                                0x48, 0x8b, 0x54, 0x24, 0x40, // exact start
-                                0x48, 0x8b, 0x4c, 0x24, 0x48, // exact end
+                                0x48, 0x8b, 0x54, 0x24, 0x30, // exact start
+                                0x48, 0x8b, 0x4c, 0x24, 0x38, // exact end
                                 0x4c, 0x8d, 0x04, 0x24, // result
                             ]
                             .as_slice()
@@ -45659,7 +45659,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                     );
                     assert!(code
                         .windows(5)
-                        .any(|bytes| bytes == [0x48, 0x83, 0xc4, 88, 0xc3]));
+                        .any(|bytes| bytes == [0x48, 0x83, 0xc4, 72, 0xc3]));
                     let eager_private_initialization = [0_u8, 8, 16, 24, 32]
                         .into_iter()
                         .flat_map(|offset| {
@@ -45715,7 +45715,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                         .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
                         .collect::<Vec<_>>();
                     for instruction in [
-                        aarch64_add_x_imm(7, 31, 48).unwrap(),
+                        aarch64_add_x_imm(7, 31, 32).unwrap(),
                         aarch64_cmp_w_imm(
                             0,
                             u16::from(PARTIAL_PREFLIGHT_ENTER_STATUS),
@@ -45731,7 +45731,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                             .collect::<Vec<_>>(),
                         [
                             aarch64_load_pair_x(0, 1, 31, 8).unwrap(),
-                            aarch64_load_pair_x(2, 3, 31, 48).unwrap(),
+                            aarch64_load_pair_x(2, 3, 31, 32).unwrap(),
                         ],
                         "{target:?} native core must load the exact window directly",
                     );
@@ -45871,8 +45871,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                             [
                                 0x48, 0x8b, 0x7c, 0x24, 0x18, // haystack
                                 0x48, 0x8b, 0x74, 0x24, 0x20, // length
-                                0x48, 0x8b, 0x54, 0x24, 0x40, // exact start
-                                0x48, 0x8b, 0x4c, 0x24, 0x48, // exact end
+                                0x48, 0x8b, 0x54, 0x24, 0x30, // exact start
+                                0x48, 0x8b, 0x4c, 0x24, 0x38, // exact end
                                 0x4c, 0x8d, 0x04, 0x24, // result
                             ]
                             .as_slice()
@@ -45889,9 +45889,9 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                                 0x48, 0x8b, 0x7c, 0x24, 0x10, // handle
                                 0x48, 0x8b, 0x74, 0x24, 0x18, // haystack
                                 0x48, 0x8b, 0x54, 0x24, 0x20, // length
-                                0x48, 0x8b, 0x4c, 0x24, 0x40, // exact start
-                                0x4c, 0x8b, 0x44, 0x24, 0x48, // exact end
-                                0x4c, 0x8b, 0x4c, 0x24, 0x38, // result
+                                0x48, 0x8b, 0x4c, 0x24, 0x30, // exact start
+                                0x4c, 0x8b, 0x44, 0x24, 0x38, // exact end
+                                0x4c, 0x8b, 0x4c, 0x24, 0x28, // result
                             ]
                             .as_slice()
                         ),
@@ -45960,7 +45960,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                             .collect::<Vec<_>>(),
                         [
                             aarch64_load_pair_x(0, 1, 31, 8).unwrap(),
-                            aarch64_load_pair_x(2, 3, 31, 48).unwrap(),
+                            aarch64_load_pair_x(2, 3, 31, 32).unwrap(),
                         ],
                         "{target:?} Span core must load the exact window directly",
                     );
@@ -45984,7 +45984,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                             aarch64_add_x_imm(6, 6, 0).unwrap(),
                             aarch64_load_pair_x(0, 1, 31, 0).unwrap(),
                             aarch64_load_pair_x(2, 5, 31, 16).unwrap(),
-                            aarch64_load_pair_x(3, 4, 31, 48).unwrap(),
+                            aarch64_load_pair_x(3, 4, 31, 32).unwrap(),
                         ],
                         "{target:?}"
                     );
