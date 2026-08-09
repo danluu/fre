@@ -25913,10 +25913,16 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     let v6_register_complete = register_last_accept
         .then(|| assembler.label())
         .transpose()?;
+    let v8_register_complete = (register_last_accept && direct_byte_formats_possible)
+        .then(|| assembler.label())
+        .transpose()?;
     let v7_complete = v7_register_complete
         .or(native_complete)
         .unwrap_or(native_no_match);
     let v6_complete = v6_register_complete
+        .or(native_complete)
+        .unwrap_or(native_no_match);
+    let v8_complete = v8_register_complete
         .or(native_complete)
         .unwrap_or(native_no_match);
     let native_continue = allow_direct_hole_continuation
@@ -27682,7 +27688,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         if let Some(root_setup) = root_setup {
             assembler.branch(root_setup)?;
         } else if output != OutputContract::Exists {
-            assembler.instruction(aarch64_store_x(31, 31, 80)?)?;
+            assembler.instruction(aarch64_movz_x(4, 0, 0)?)?;
         }
 
         let emit_v8_transition =
@@ -27702,13 +27708,14 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
                 } else {
                     let not_accepting = assembler.label()?;
                     assembler.branch_bit_clear_w(8, 15, not_accepting)?;
-                    assembler.instruction(aarch64_store_x(2, 31, 80)?)?;
+                    if v8_register_complete.is_some() {
+                        assembler.instruction(aarch64_mov_x(4, 2)?)?;
+                    } else {
+                        assembler.instruction(aarch64_store_x(2, 31, 80)?)?;
+                    }
                     assembler.bind(not_accepting)?;
                     assembler.instruction(aarch64_and_low_w(6, 8, 15)?)?;
-                    assembler.branch_zero_w(
-                        6,
-                        native_complete.unwrap_or(native_no_match),
-                    )?;
+                    assembler.branch_zero_w(6, v8_complete)?;
                     assembler.instruction(aarch64_sub_w_imm(6, 6, 1)?)?;
                 }
                 if let Some(root_dispatch) = root_dispatch {
@@ -27753,10 +27760,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
 
             assembler.bind(scalar_tail)?;
             assembler.instruction(aarch64_cmp_x(2, 3)?)?;
-            assembler.branch_cond(
-                AARCH64_HS,
-                native_complete.unwrap_or(native_no_match),
-            )?;
+            assembler.branch_cond(AARCH64_HS, v8_complete)?;
             if scanner_free_exists_pointer_cursor {
                 assembler.instruction(aarch64_load_byte_imm(6, 2, 0)?)?;
             } else {
@@ -27769,10 +27773,10 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             } else {
                 let not_accepting = assembler.label()?;
                 assembler.branch_bit_clear_w(8, 15, not_accepting)?;
-                assembler.instruction(aarch64_store_x(2, 31, 80)?)?;
+                assembler.instruction(aarch64_mov_x(4, 2)?)?;
                 assembler.bind(not_accepting)?;
             }
-            assembler.branch(native_complete.unwrap_or(native_no_match))?;
+            assembler.branch(v8_complete)?;
         } else {
             assembler.bind(v8_scan)?;
             if let Some(root_dispatch) = root_dispatch {
@@ -27799,7 +27803,14 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             emit_v8_transition(&mut assembler, cursor_already_advanced)?;
             assembler.instruction(aarch64_cmp_x(2, 3)?)?;
             assembler.branch_cond(AARCH64_LO, v8_scan)?;
-            assembler.branch(native_complete.unwrap_or(native_no_match))?;
+            assembler.branch(v8_complete)?;
+        }
+        if let Some(complete) = v8_register_complete {
+            assembler.bind(complete)?;
+            assembler.instruction(aarch64_mov_x(7, 4)?)?;
+            assembler.instruction(aarch64_cmp_x_imm(7, 0)?)?;
+            assembler.branch_cond(AARCH64_EQ, native_no_match)?;
+            assembler.branch(native_match)?;
         }
     }
 
@@ -30625,7 +30636,7 @@ mod tests {
             let register_endpoint_words = [
                 (aarch64_store_x(4, 31, 16).unwrap(), 0, 2),
                 (aarch64_load_x_imm(4, 31, 16).unwrap(), 0, 2),
-                (aarch64_mov_x(7, 4).unwrap(), 0, 2),
+                (aarch64_mov_x(7, 4).unwrap(), 0, 3),
             ];
             for (word, exists_count, endpoint_count) in register_endpoint_words {
                 assert_eq!(
