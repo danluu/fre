@@ -19369,6 +19369,19 @@ fn aarch64_madd_w(
         | aarch64_reg(destination, 0)?)
 }
 
+fn aarch64_madd_x(
+    destination: u8,
+    left: u8,
+    right: u8,
+    addend: u8,
+) -> Result<u32, ObjectError> {
+    Ok(0x9b00_0000
+        | aarch64_reg(right, 16)?
+        | aarch64_reg(addend, 10)?
+        | aarch64_reg(left, 5)?
+        | aarch64_reg(destination, 0)?)
+}
+
 fn aarch64_and_w(destination: u8, left: u8, right: u8) -> Result<u32, ObjectError> {
     Ok(
         0x0a00_0000
@@ -26821,6 +26834,13 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         u16::try_from(FROZEN_DYNAMIC_ROWS_V3_ROW_SHIFT_OFFSET)
             .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 V6 row shift"))?,
     )?)?;
+    if root_plan.is_none() {
+        // The authenticated shift is invariant for the lifetime of this
+        // scanner-free V6 entry. Materialize its byte stride once so every
+        // serial transition can fold state*stride+rows into one MADD.
+        assembler.instruction(aarch64_movz_x(10, 1, 0)?)?;
+        assembler.instruction(aarch64_lslv_x(12, 10, 12)?)?;
+    }
     if root_plan.is_some() {
         assembler.instruction(aarch64_movz_x(8, ROOT_SCANNER_COMPACT_V6, 0)?)?;
         assembler.instruction(aarch64_store_x(
@@ -26876,8 +26896,12 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
                 )?;
                 assembler.instruction(aarch64_sub_w_imm(6, 6, 1)?)?;
             }
-            assembler.instruction(aarch64_lslv_x(10, 6, 12)?)?;
-            assembler.instruction(aarch64_add_x_reg(11, 15, 10)?)?;
+            if root_plan.is_none() {
+                assembler.instruction(aarch64_madd_x(11, 6, 12, 15)?)?;
+            } else {
+                assembler.instruction(aarch64_lslv_x(10, 6, 12)?)?;
+                assembler.instruction(aarch64_add_x_reg(11, 15, 10)?)?;
+            }
             Ok(())
         };
 
@@ -26969,9 +26993,12 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     assembler.branch(native_complete.unwrap_or(native_no_match))?;
     assembler.bind(v6_not_all_bytes)?;
 
-    assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
+    // Keep X12's authenticated shift or precomputed stride live across the
+    // ordinary and short-loop paths. X7 is dead after member verification and
+    // carries the helper length only when a call is actually selected.
+    assembler.instruction(aarch64_sub_x_reg(7, 3, 2)?)?;
     assembler.instruction(aarch64_cmp_x_imm(
-        12,
+        7,
         u16::try_from(FROZEN_COMPACT_LOOP_SCAN_MIN_BYTES)
             .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 V6 loop threshold"))?,
     )?)?;
@@ -26992,7 +27019,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     }
     // Keep the same direct-pointer V2 register contract in the V6 body.
     assembler.instruction(aarch64_add_x_reg(0, 0, 2)?)?;
-    assembler.instruction(aarch64_mov_x(2, 12)?)?;
+    assembler.instruction(aarch64_mov_x(2, 7)?)?;
     v6_loop_scan_branch = Some(assembler.instruction(0x9400_0000)?);
     assembler.instruction(aarch64_mov_x(10, 0)?)?;
     assembler.instruction(aarch64_load_x_imm(11, 31, 0)?)?;
@@ -27034,6 +27061,10 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     assembler.branch_cond(AARCH64_HI, v6_loop_failure)?;
     assembler.instruction(aarch64_add_x_reg(2, 2, 10)?)?;
     assembler.instruction(aarch64_add_x_imm(31, 31, 32)?)?;
+    if root_plan.is_none() {
+        assembler.instruction(aarch64_movz_x(10, 1, 0)?)?;
+        assembler.instruction(aarch64_lslv_x(12, 10, 12)?)?;
+    }
     if let Some(plan) = root_plan {
         aarch64_emit_dynamic_root_constants(&mut assembler, plan)?;
     }
@@ -30543,6 +30574,14 @@ mod tests {
             assert_eq!(
                 words
                     .iter()
+                    .filter(|&&word| word == aarch64_madd_x(11, 6, 12, 15).unwrap())
+                    .count(),
+                3,
+                "{context}: scanner-free V6 folds every paired and scalar row update into one MADD"
+            );
+            assert_eq!(
+                words
+                    .iter()
                     .filter(|&&word| word == arm_second_u16_cell)
                     .count(),
                 11,
@@ -30601,6 +30640,18 @@ mod tests {
                     .count(),
                 0,
                 "{context}: rooted V6/V7 paths retain per-byte root dispatch"
+            );
+            assert_eq!(
+                rooted_words
+                    .iter()
+                    .filter(|&&word| word == aarch64_madd_x(11, 6, 12, 15).unwrap())
+                    .count(),
+                0,
+                "{context}: rooted V6 keeps its shift register compatible with root dispatch"
+            );
+            assert!(
+                rooted_words.contains(&aarch64_lslv_x(10, 6, 12).unwrap()),
+                "{context}: rooted V6 retains the variable-shift row update"
             );
         }
     }
@@ -49004,6 +49055,10 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             0x1b00_0000 | (12_u32 << 16) | (10_u32 << 10) | (8_u32 << 5) | 8
         );
         assert_eq!(
+            aarch64_madd_x(11, 6, 12, 15).unwrap(),
+            0x9b00_0000 | (12_u32 << 16) | (15_u32 << 10) | (6_u32 << 5) | 11
+        );
+        assert_eq!(
             aarch64_add_x_uxtw(11, 15, 8, 1).unwrap(),
             0x8b20_4000 | (8_u32 << 16) | (1_u32 << 10) | (15_u32 << 5) | 11
         );
@@ -50594,9 +50649,26 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                         .unwrap()
                 })
                 .count(),
-            2
+            1,
+            "V7 retains its remaining-length scratch in X12"
         );
-        assert!(arm_words.contains(&aarch64_lslv_x(10, 6, 12).unwrap()));
+        assert_eq!(
+            arm_words
+                .iter()
+                .filter(|&&word| {
+                    word
+                        == aarch64_cmp_x_imm(
+                            7,
+                            u16::try_from(FROZEN_COMPACT_LOOP_SCAN_MIN_BYTES).unwrap(),
+                        )
+                        .unwrap()
+                })
+                .count(),
+            1,
+            "V6 keeps its invariant stride in X12 and uses X7 for remaining length"
+        );
+        assert!(arm_words.contains(&aarch64_madd_x(11, 6, 12, 15).unwrap()));
+        assert!(!arm_words.contains(&aarch64_lslv_x(10, 6, 12).unwrap()));
         assert_eq!(
             arm_words
                 .iter()
@@ -50611,12 +50683,23 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             .filter(|relocation| relocation.symbol == DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL)
             .collect::<Vec<_>>();
         let arm_source = aarch64_add_x_reg(0, 0, 2).unwrap().to_le_bytes();
-        let arm_length = aarch64_mov_x(2, 12).unwrap().to_le_bytes();
+        let arm_v7_length = aarch64_mov_x(2, 12).unwrap().to_le_bytes();
+        let arm_v6_length = aarch64_mov_x(2, 7).unwrap().to_le_bytes();
+        let mut v7_lengths = 0_usize;
+        let mut v6_lengths = 0_usize;
         for relocation in arm_loop_calls {
             let branch = usize::try_from(relocation.offset).unwrap();
             assert_eq!(&arm.code[branch - 8..branch - 4], &arm_source);
-            assert_eq!(&arm.code[branch - 4..branch], &arm_length);
+            let length = &arm.code[branch - 4..branch];
+            if length == arm_v7_length {
+                v7_lengths += 1;
+            } else if length == arm_v6_length {
+                v6_lengths += 1;
+            } else {
+                panic!("trusted loop call uses an unexpected length register");
+            }
         }
+        assert_eq!((v7_lengths, v6_lengths), (1, 1));
         assert_eq!(
             DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL_NAME,
             "fre_aot_regex_runtime_scan_frozen_loop_v2"
