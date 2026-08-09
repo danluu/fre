@@ -10833,6 +10833,118 @@ impl CompiledProgram {
         Ok(MatchResult::Span(Some((recovered_start, selected_end))))
     }
 
+    /// Recover a variable-width Span start selected by a compiler-owned
+    /// transient static DFA prefix.
+    ///
+    /// Unlike retained-row recovery, this route deliberately has no stable
+    /// partial-DFA payload or mutable admission ticket. The generated caller
+    /// authenticates the semantic artifact immediately before running its
+    /// immutable table and invokes this postflight synchronously only after
+    /// that table returns an authoritative endpoint. Reverse K0 recovers the
+    /// start without replaying the completed forward search.
+    #[doc(hidden)]
+    pub fn recover_static_prefix_span_from_selected_end_with_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+        expected_artifact_identity: [u8; 32],
+        selected_end: usize,
+    ) -> Result<MatchResult, CompileError> {
+        self.recover_static_prefix_span_from_selected_end_with_workspace_impl(
+            haystack,
+            window,
+            workspace,
+            expected_artifact_identity,
+            selected_end,
+            None,
+        )
+    }
+
+    /// Receipt-bearing counterpart for an exclusive prepared session whose
+    /// setup already populated every reachable K0 fallback row.
+    #[doc(hidden)]
+    pub fn recover_static_prefix_span_from_selected_end_with_fully_prefilled_fallback_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+        expected_artifact_identity: [u8; 32],
+        selected_end: usize,
+        receipt: FullyPrefilledFallbackReceipt,
+    ) -> Result<MatchResult, CompileError> {
+        self.recover_static_prefix_span_from_selected_end_with_workspace_impl(
+            haystack,
+            window,
+            workspace,
+            expected_artifact_identity,
+            selected_end,
+            Some(receipt),
+        )
+    }
+
+    fn recover_static_prefix_span_from_selected_end_with_workspace_impl(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+        expected_artifact_identity: [u8; 32],
+        selected_end: usize,
+        receipt: Option<FullyPrefilledFallbackReceipt>,
+    ) -> Result<MatchResult, CompileError> {
+        if window.start > window.end || window.end > haystack.len() {
+            return Err(CompileError::InvalidWindow {
+                start: window.start,
+                end: window.end,
+                haystack_len: haystack.len(),
+            });
+        }
+        if expected_artifact_identity != self.identity.artifact {
+            return Err(CompileError::InternalInvariant(
+                "static-prefix Span recovery artifact identity does not match the prepared program",
+            ));
+        }
+        if !workspace.identity.compatible(&self.identity) {
+            return Err(CompileError::InternalInvariant(
+                "static-prefix Span recovery workspace belongs to a different semantic program",
+            ));
+        }
+        if self.context_dfa.is_some()
+            || !matches!(self.engine, ProgramEngine::OrderedNfa)
+            || self.automaton.stats().has_assertions()
+            || self.output != OutputContract::Span
+            || self.exact_match_width.is_some()
+        {
+            return Err(CompileError::InternalInvariant(
+                "static-prefix Span recovery requires an assertion-free variable-width ordered-NFA Span program",
+            ));
+        }
+        if selected_end <= window.start || selected_end > window.end {
+            return Err(CompileError::InternalInvariant(
+                "static-prefix Span recovery endpoint is not inside its search window",
+            ));
+        }
+
+        workspace.mark_dynamic_native_rows_dirty();
+        let nfa = workspace.nfa.as_mut().ok_or(CompileError::InternalInvariant(
+            "static-prefix Span recovery has no prepared bidirectional K0 workspace",
+        ))?;
+        let recovered_start = self.recover_partial_span_start(
+            haystack,
+            window,
+            nfa,
+            None,
+            selected_end,
+            receipt,
+        )?;
+        if recovered_start < window.start || recovered_start > selected_end {
+            return Err(CompileError::InternalInvariant(
+                "reverse K0 did not recover a static-prefix span inside its search window",
+            ));
+        }
+        Ok(MatchResult::Span(Some((recovered_start, selected_end))))
+    }
+
     /// Authenticate and prepare one native incomplete-retained execution.
     ///
     /// The transaction mirrors the portable retained route: settle the prior

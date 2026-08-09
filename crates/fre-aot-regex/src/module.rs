@@ -929,6 +929,8 @@ const PREPARED_PREFLIGHT_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_search_exclusive_partial_preflight_v1";
 const SLOW_PREFIX_PREFLIGHT_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_preflight_v1";
+const SLOW_PREFIX_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME: &str =
+    "fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_recover_span_v1";
 const DYNAMIC_ROWS_PREFLIGHT_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v6";
 const DYNAMIC_ROWS_DEOPT_RUNTIME_SYMBOL_NAME: &str =
@@ -1933,11 +1935,16 @@ impl CompiledModule {
                     } else if prepared.span_recovery {
                         if symbols.len() != PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL {
                             return Err(ObjectError::InvalidModule(
-                                "partial Span recovery symbol order is inconsistent",
+                                "prepared Span recovery symbol order is inconsistent",
                             ));
                         }
                         symbols.push(ModuleSymbol {
-                            name: PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME.to_owned(),
+                            name: if prepared.slow_prefix {
+                                SLOW_PREFIX_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME
+                            } else {
+                                PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME
+                            }
+                            .to_owned(),
                             binding: SymbolBinding::Global,
                             kind: SymbolKind::Function,
                             section: None,
@@ -2176,7 +2183,8 @@ impl CompiledModule {
     }
 
     /// Return the authenticated selected-end-to-Span recovery helper required
-    /// by a variable-width partial Span entry, when that entry is present.
+    /// by a variable-width partial or transient-prefix Span entry, when that
+    /// entry is present.
     #[must_use]
     pub fn required_prepared_span_recovery_runtime_symbol(&self) -> Option<&str> {
         self.prepared_entry_symbol_index?;
@@ -2191,7 +2199,8 @@ impl CompiledModule {
             .get(PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL)
             .filter(|symbol| {
                 symbol.section.is_none()
-                    && symbol.name == PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME
+                    && (symbol.name == PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME
+                        || symbol.name == SLOW_PREFIX_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME)
             })
             .map(|symbol| symbol.name.as_str())
     }
@@ -2837,6 +2846,9 @@ fn lower_native_slow_partial_prepared_with_data_limit(
             "static-prefix native core unexpectedly retained a runtime layout",
         ));
     }
+    let span_recovery = view.output == OutputContract::Span
+        && view.exact_match_width.is_none()
+        && !view.dfa.initial_pending;
 
     let serialized_program_size = program_bytes.len();
     let table_offset = serialized_program_size
@@ -2897,8 +2909,12 @@ fn lower_native_slow_partial_prepared_with_data_limit(
         }
     }
     let wrapper = match target.architecture {
-        Architecture::X86_64 => lower_x86_64_static_prefix_prepared_wrapper(view.output)?,
-        Architecture::Aarch64 => lower_aarch64_static_prefix_prepared_wrapper(view.output)?,
+        Architecture::X86_64 => {
+            lower_x86_64_static_prefix_prepared_wrapper(view.output, span_recovery)?
+        }
+        Architecture::Aarch64 => {
+            lower_aarch64_static_prefix_prepared_wrapper(view.output, span_recovery)?
+        }
     };
     let NativeSlowPartialWrapper {
         code: prepared_code,
@@ -2989,7 +3005,7 @@ fn lower_native_slow_partial_prepared_with_data_limit(
                 table_offset,
                 table_size,
                 identity_offset,
-                span_recovery: false,
+                span_recovery,
                 dynamic_rows: false,
                 slow_prefix: true,
             }),
@@ -3408,7 +3424,7 @@ fn native_module_digest(
         ..
     }) = prepared_layout
     {
-        if prepared.slow_prefix && (prepared.dynamic_rows || prepared.span_recovery) {
+        if prepared.slow_prefix && prepared.dynamic_rows {
             return Err(ObjectError::InvalidModule(
                 "static-prefix prepared layout conflicts with another native prepared mode",
             ));
@@ -3540,14 +3556,18 @@ fn native_module_digest(
             .iter()
             .any(|relocation| relocation.symbol == PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL)
         {
-            let auxiliary_symbol_name = if lowering
-                .relocations
-                .iter()
-                .any(|relocation| relocation.symbol == PARTIAL_RUNTIME_SYMBOL)
-            {
-                PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME
-            } else {
-                DYNAMIC_ROWS_DEOPT_RUNTIME_SYMBOL_NAME
+            let auxiliary_symbol_name = match prepared_layout.map(|layout| layout.kind) {
+                Some(PreparedEntryKind::Native(prepared)) if prepared.slow_prefix => {
+                    SLOW_PREFIX_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME
+                }
+                _ if lowering
+                    .relocations
+                    .iter()
+                    .any(|relocation| relocation.symbol == PARTIAL_RUNTIME_SYMBOL) =>
+                {
+                    PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME
+                }
+                _ => DYNAMIC_ROWS_DEOPT_RUNTIME_SYMBOL_NAME,
             };
             update_bytes(
                 &mut digest,
@@ -13567,12 +13587,14 @@ fn lower_x86_64_slow_partial_wrapper(
 /// prepared handle for a whole-search fallback over the original window.
 fn lower_x86_64_static_prefix_prepared_wrapper(
     output: OutputContract,
+    span_recovery: bool,
 ) -> Result<NativeSlowPartialWrapper, ObjectError> {
     const FRAME_BYTES: u8 = 56;
     let mut assembler = X86Assembler::new();
     let preflight_enter = assembler.label()?;
     let native_match = assembler.label()?;
     let native_no_match = assembler.label()?;
+    let native_span_recovery = span_recovery.then(|| assembler.label()).transpose()?;
     let native_deopt = assembler.label()?;
     let fallback_runtime = assembler.label()?;
 
@@ -13626,6 +13648,16 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
     assembler.branch(&[0x0f, 0x84], native_match)?;
     assembler.instruction(&[0x85, 0xc0])?;
     assembler.branch(&[0x0f, 0x84], native_no_match)?;
+    if let Some(native_span_recovery) = native_span_recovery {
+        assembler.instruction(&[
+            0x83,
+            0xf8,
+            u8::try_from(NATIVE_PARTIAL_STATUS_SELECTED_END).map_err(|_| {
+                ObjectError::ArithmeticOverflow("static-prefix Span recovery status")
+            })?,
+        ])?;
+        assembler.branch(&[0x0f, 0x84], native_span_recovery)?;
+    }
     assembler.branch(&[0xe9], native_deopt)?;
 
     assembler.bind(native_no_match)?;
@@ -13657,6 +13689,26 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
     assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
     assembler.instruction(&[0xc3])?;
 
+    let span_recovery_displacement_label = if let Some(native_span_recovery) = native_span_recovery {
+        assembler.bind(native_span_recovery)?;
+        assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x08])?;
+        assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x10])?;
+        assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x18])?;
+        assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x20])?;
+        assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x28])?;
+        assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x30])?;
+        assembler.instruction(&[0x4c, 0x89, 0x5c, 0x24, 0x08])?;
+        assembler.instruction(&[0xe8])?;
+        let displacement = assembler.label()?;
+        assembler.bind(displacement)?;
+        push_bytes(&mut assembler.code, &[0; 4])?;
+        assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+        assembler.instruction(&[0xc3])?;
+        Some(displacement)
+    } else {
+        None
+    };
+
     assembler.bind(native_deopt)?;
     assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x08])?;
     assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x10])?;
@@ -13683,38 +13735,54 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
     let core_call_offset = finished.label_offset(core_call_displacement_label)?;
     let deopt_displacement = finished.label_offset(deopt_displacement_label)?;
     let fallback_displacement = finished.label_offset(fallback_displacement_label)?;
+    let span_recovery_displacement = span_recovery_displacement_label
+        .map(|label| finished.label_offset(label))
+        .transpose()?;
+    let mut relocations = vec![
+        ModuleRelocation {
+            section: TEXT_SECTION,
+            offset: offset_u64(identity_displacement, "x86 static-prefix identity relocation")?,
+            kind: RelocationKind::X86PcRelative32,
+            symbol: PARTIAL_IDENTITY_SYMBOL,
+            addend: -4,
+        },
+        ModuleRelocation {
+            section: TEXT_SECTION,
+            offset: offset_u64(preflight_displacement, "x86 static-prefix preflight relocation")?,
+            kind: RelocationKind::X86PltRelative32,
+            symbol: PREPARED_PREFLIGHT_RUNTIME_SYMBOL,
+            addend: -4,
+        },
+        ModuleRelocation {
+            section: TEXT_SECTION,
+            offset: offset_u64(deopt_displacement, "x86 static-prefix deopt relocation")?,
+            kind: RelocationKind::X86PltRelative32,
+            symbol: PREPARED_FALLBACK_RUNTIME_SYMBOL,
+            addend: -4,
+        },
+        ModuleRelocation {
+            section: TEXT_SECTION,
+            offset: offset_u64(fallback_displacement, "x86 static-prefix fallback relocation")?,
+            kind: RelocationKind::X86PltRelative32,
+            symbol: PREPARED_FALLBACK_RUNTIME_SYMBOL,
+            addend: -4,
+        },
+    ];
+    if let Some(span_recovery_displacement) = span_recovery_displacement {
+        relocations.push(ModuleRelocation {
+            section: TEXT_SECTION,
+            offset: offset_u64(
+                span_recovery_displacement,
+                "x86 static-prefix Span recovery relocation",
+            )?,
+            kind: RelocationKind::X86PltRelative32,
+            symbol: PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL,
+            addend: -4,
+        });
+    }
     Ok(NativeSlowPartialWrapper {
         code: finished.code,
-        relocations: vec![
-            ModuleRelocation {
-                section: TEXT_SECTION,
-                offset: offset_u64(identity_displacement, "x86 static-prefix identity relocation")?,
-                kind: RelocationKind::X86PcRelative32,
-                symbol: PARTIAL_IDENTITY_SYMBOL,
-                addend: -4,
-            },
-            ModuleRelocation {
-                section: TEXT_SECTION,
-                offset: offset_u64(preflight_displacement, "x86 static-prefix preflight relocation")?,
-                kind: RelocationKind::X86PltRelative32,
-                symbol: PREPARED_PREFLIGHT_RUNTIME_SYMBOL,
-                addend: -4,
-            },
-            ModuleRelocation {
-                section: TEXT_SECTION,
-                offset: offset_u64(deopt_displacement, "x86 static-prefix deopt relocation")?,
-                kind: RelocationKind::X86PltRelative32,
-                symbol: PREPARED_FALLBACK_RUNTIME_SYMBOL,
-                addend: -4,
-            },
-            ModuleRelocation {
-                section: TEXT_SECTION,
-                offset: offset_u64(fallback_displacement, "x86 static-prefix fallback relocation")?,
-                kind: RelocationKind::X86PltRelative32,
-                symbol: PREPARED_FALLBACK_RUNTIME_SYMBOL,
-                addend: -4,
-            },
-        ],
+        relocations,
         core_call_offset,
     })
 }
@@ -25349,12 +25417,14 @@ fn lower_aarch64_slow_partial_wrapper(
 
 fn lower_aarch64_static_prefix_prepared_wrapper(
     output: OutputContract,
+    span_recovery: bool,
 ) -> Result<NativeSlowPartialWrapper, ObjectError> {
     const FRAME_BYTES: u16 = 64;
     let mut assembler = Aarch64Assembler::new();
     let preflight_enter = assembler.label()?;
     let native_match = assembler.label()?;
     let native_no_match = assembler.label()?;
+    let native_span_recovery = span_recovery.then(|| assembler.label()).transpose()?;
     let native_deopt = assembler.label()?;
     let fallback_runtime = assembler.label()?;
 
@@ -25391,6 +25461,15 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
     assembler.branch_cond(AARCH64_EQ, native_match)?;
     assembler.instruction(aarch64_cmp_w_imm(0, 0)?)?;
     assembler.branch_cond(AARCH64_EQ, native_no_match)?;
+    if let Some(native_span_recovery) = native_span_recovery {
+        assembler.instruction(aarch64_cmp_w_imm(
+            0,
+            u16::try_from(NATIVE_PARTIAL_STATUS_SELECTED_END).map_err(|_| {
+                ObjectError::ArithmeticOverflow("AArch64 static-prefix Span recovery status")
+            })?,
+        )?)?;
+        assembler.branch_cond(AARCH64_EQ, native_span_recovery)?;
+    }
     assembler.branch(native_deopt)?;
 
     assembler.bind(native_no_match)?;
@@ -25419,6 +25498,22 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
     assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
     assembler.instruction(0xd65f_03c0)?;
 
+    let span_recovery_relocations = if let Some(native_span_recovery) = native_span_recovery {
+        assembler.bind(native_span_recovery)?;
+        assembler.instruction(aarch64_load_pair_x(0, 1, 31, 0)?)?;
+        assembler.instruction(aarch64_load_pair_x(2, 3, 31, 16)?)?;
+        assembler.instruction(aarch64_load_pair_x(4, 5, 31, 32)?)?;
+        let identity_page = assembler.instruction(0x9000_0006)?;
+        let identity_page_offset = assembler.instruction(aarch64_add_x_imm(6, 6, 0)?)?;
+        let runtime_branch = assembler.instruction(0x9400_0000)?;
+        assembler.instruction(aarch64_load_x_imm(30, 31, 56)?)?;
+        assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+        assembler.instruction(0xd65f_03c0)?;
+        Some((identity_page, identity_page_offset, runtime_branch))
+    } else {
+        None
+    };
+
     assembler.bind(native_deopt)?;
     assembler.instruction(aarch64_load_pair_x(0, 1, 31, 0)?)?;
     assembler.instruction(aarch64_load_pair_x(2, 3, 31, 16)?)?;
@@ -25431,7 +25526,7 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
     assembler.bind(fallback_runtime)?;
     let fallback_branch = assembler.instruction(0x1400_0000)?;
 
-    let mut relocation_offsets = [
+    let mut relocation_offsets = vec![
         identity_page,
         identity_page_offset,
         preflight_branch,
@@ -25439,46 +25534,88 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
         deopt_branch,
         fallback_branch,
     ];
+    let span_recovery_indices = span_recovery_relocations.map(
+        |(identity_page, identity_page_offset, runtime_branch)| {
+            let first = relocation_offsets.len();
+            relocation_offsets.extend([identity_page, identity_page_offset, runtime_branch]);
+            (first, first + 1, first + 2)
+        },
+    );
     let code = assembler.finish_with_offsets(&mut relocation_offsets)?;
-    Ok(NativeSlowPartialWrapper {
-        code,
-        relocations: vec![
+    let mut relocations = vec![
+        ModuleRelocation {
+            section: TEXT_SECTION,
+            offset: offset_u64(relocation_offsets[0], "AArch64 static-prefix identity ADRP")?,
+            kind: RelocationKind::Aarch64Page21,
+            symbol: PARTIAL_IDENTITY_SYMBOL,
+            addend: 0,
+        },
+        ModuleRelocation {
+            section: TEXT_SECTION,
+            offset: offset_u64(relocation_offsets[1], "AArch64 static-prefix identity ADD")?,
+            kind: RelocationKind::Aarch64PageOff12,
+            symbol: PARTIAL_IDENTITY_SYMBOL,
+            addend: 0,
+        },
+        ModuleRelocation {
+            section: TEXT_SECTION,
+            offset: offset_u64(relocation_offsets[2], "AArch64 static-prefix preflight branch")?,
+            kind: RelocationKind::Aarch64Branch26,
+            symbol: PREPARED_PREFLIGHT_RUNTIME_SYMBOL,
+            addend: 0,
+        },
+        ModuleRelocation {
+            section: TEXT_SECTION,
+            offset: offset_u64(relocation_offsets[4], "AArch64 static-prefix deopt branch")?,
+            kind: RelocationKind::Aarch64Branch26,
+            symbol: PREPARED_FALLBACK_RUNTIME_SYMBOL,
+            addend: 0,
+        },
+        ModuleRelocation {
+            section: TEXT_SECTION,
+            offset: offset_u64(relocation_offsets[5], "AArch64 static-prefix fallback branch")?,
+            kind: RelocationKind::Aarch64Branch26,
+            symbol: PREPARED_FALLBACK_RUNTIME_SYMBOL,
+            addend: 0,
+        },
+    ];
+    if let Some((identity_page, identity_page_offset, runtime_branch)) = span_recovery_indices {
+        relocations.extend([
             ModuleRelocation {
                 section: TEXT_SECTION,
-                offset: offset_u64(relocation_offsets[0], "AArch64 static-prefix identity ADRP")?,
+                offset: offset_u64(
+                    relocation_offsets[identity_page],
+                    "AArch64 static-prefix Span identity ADRP",
+                )?,
                 kind: RelocationKind::Aarch64Page21,
                 symbol: PARTIAL_IDENTITY_SYMBOL,
                 addend: 0,
             },
             ModuleRelocation {
                 section: TEXT_SECTION,
-                offset: offset_u64(relocation_offsets[1], "AArch64 static-prefix identity ADD")?,
+                offset: offset_u64(
+                    relocation_offsets[identity_page_offset],
+                    "AArch64 static-prefix Span identity ADD",
+                )?,
                 kind: RelocationKind::Aarch64PageOff12,
                 symbol: PARTIAL_IDENTITY_SYMBOL,
                 addend: 0,
             },
             ModuleRelocation {
                 section: TEXT_SECTION,
-                offset: offset_u64(relocation_offsets[2], "AArch64 static-prefix preflight branch")?,
+                offset: offset_u64(
+                    relocation_offsets[runtime_branch],
+                    "AArch64 static-prefix Span recovery branch",
+                )?,
                 kind: RelocationKind::Aarch64Branch26,
-                symbol: PREPARED_PREFLIGHT_RUNTIME_SYMBOL,
+                symbol: PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL,
                 addend: 0,
             },
-            ModuleRelocation {
-                section: TEXT_SECTION,
-                offset: offset_u64(relocation_offsets[4], "AArch64 static-prefix deopt branch")?,
-                kind: RelocationKind::Aarch64Branch26,
-                symbol: PREPARED_FALLBACK_RUNTIME_SYMBOL,
-                addend: 0,
-            },
-            ModuleRelocation {
-                section: TEXT_SECTION,
-                offset: offset_u64(relocation_offsets[5], "AArch64 static-prefix fallback branch")?,
-                kind: RelocationKind::Aarch64Branch26,
-                symbol: PREPARED_FALLBACK_RUNTIME_SYMBOL,
-                addend: 0,
-            },
-        ],
+        ]);
+    }
+    Ok(NativeSlowPartialWrapper {
+        code,
+        relocations,
         core_call_offset: relocation_offsets[3],
     })
 }
@@ -45026,6 +45163,23 @@ int main(void){{
                     constrained.required_prepared_preflight_runtime_symbol(),
                     Some(SLOW_PREFIX_PREFLIGHT_RUNTIME_SYMBOL_NAME)
                 );
+                assert_eq!(
+                    constrained.required_prepared_span_recovery_runtime_symbol(),
+                    (output == OutputContract::Span)
+                        .then_some(SLOW_PREFIX_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME),
+                    "static-prefix Span helper: {output:?}/{target:?}"
+                );
+                assert_eq!(
+                    constrained
+                        .relocations()
+                        .iter()
+                        .filter(|relocation| {
+                            relocation.symbol == PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL
+                        })
+                        .count(),
+                    usize::from(output == OutputContract::Span),
+                    "static-prefix Span relocation: {output:?}/{target:?}"
+                );
 
                 let below_hybrid = CompiledModule::lower_optimizing_with_limits_and_native_data_limit(
                     compiled.program(),
@@ -48286,7 +48440,7 @@ int main(void){{
         let fast = compile(
             CompileRequest::new(PARTIAL_LOOP_PATTERN, target)
                 .mode(CompileMode::Fast)
-                .output(OutputContract::SelectedEnd),
+                .output(OutputContract::Span),
         )
         .expect("fast static-prefix fixture");
         let (slow_limits, candidate) = (1..=64)
@@ -48350,6 +48504,10 @@ int main(void){{
             Some(PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME)
         );
         assert!(module.required_prepared_runtime_symbol().is_none());
+        assert_eq!(
+            module.required_prepared_span_recovery_runtime_symbol(),
+            Some(SLOW_PREFIX_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME)
+        );
         assert!(!module
             .relocations()
             .iter()
