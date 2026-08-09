@@ -17071,14 +17071,12 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
 
     }
     assembler.bind(preflight_enter)?;
-    // Canonicalize the ordinary helper arguments to the exact window admitted
-    // by preflight. Continuation payloads overwrite the preflight record, so
-    // every later deopt/hole path reloads this durable narrowed alias.
-    assembler.instruction(&[0x4c, 0x8b, 0x54, 0x24, 0x40])?;
-    assembler.instruction(&[0x4c, 0x89, 0x54, 0x24, 0x28])?;
-    assembler.instruction(&[0x4c, 0x8b, 0x54, 0x24, 0x48])?;
-    assembler.instruction(&[0x4c, 0x89, 0x54, 0x24, 0x30])?;
-    // V2's compiler-private preflight constructs and authenticates the
+    // Keep preflight's exact admitted window in its private output slots.
+    // Immediate native completion never needs to duplicate those bounds into
+    // the ordinary helper-argument slots. Cold deopt reloads the private
+    // window directly, while first-hole continuation captures it in argument
+    // registers before reusing the output record as its payload.
+    // V5's compiler-private preflight constructs and authenticates the
     // descriptor and its cache lineage for this synchronous scan. Retain only
     // the invocation-specific learned-loop policy here; rechecking the
     // canonical cell, address, geometry, stride, initial row, or duplicated
@@ -17775,8 +17773,14 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         if filter_kind.is_some_and(X86StartFilterKind::needs_vzeroupper) {
             assembler.instruction(&[0xc5, 0xf8, 0x77])?;
         }
-        // Preserve the exact row and unread byte, then reuse the five
-        // preflight/output words as the compiler-private continuation record.
+        // Preserve preflight's exact admitted start/end in their eventual
+        // SysV argument registers before reusing the five output words as the
+        // compiler-private continuation record. Neither register is consumed
+        // by payload construction below.
+        assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x40])?; // exact start
+        assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x48])?; // exact end
+        // Reload the cold identity from the trusted descriptor, then preserve
+        // the exact row and unread byte.
         assembler.instruction(&[0x4c, 0x8b, 0x5c, 0x24, 0x50])?; // descriptor
         assembler.instruction(&[
             0x4d,
@@ -17784,7 +17788,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             0x5b,
             u8::try_from(NATIVE_ROWS_CACHE_IDENTITY)
                 .map_err(|_| ObjectError::ArithmeticOverflow("x86 dynamic cache identity"))?,
-        ])?; // cold cache identity
+        ])?;
         assembler.instruction(&[0x4c, 0x89, 0x44, 0x24, 0x40])?; // current row
         assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x48])?; // unread position
         if tracks_root_scanner_hits {
@@ -17823,8 +17827,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x10])?;
         assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x18])?;
         assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x20])?;
-        assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x28])?;
-        assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x30])?;
+        assembler.instruction(&[0x4d, 0x89, 0xc8])?; // exact end: r9 -> r8
         assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x38])?;
         assembler.instruction(&[0xe8])?;
         let continuation = assembler.label()?;
@@ -17850,8 +17853,8 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x10])?;
     assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x18])?;
     assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x20])?;
-    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x28])?;
-    assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x30])?;
+    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x40])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x48])?;
     assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x38])?;
     restore_root_scanner_counter(&mut assembler)?;
     assembler.instruction(&[0x48, 0x83, 0xc4, frame_bytes])?;
@@ -17861,8 +17864,8 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x10])?;
     assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x18])?;
     assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x20])?;
-    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x28])?;
-    assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x30])?;
+    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x40])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x48])?;
     assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x38])?;
     restore_root_scanner_counter(&mut assembler)?;
     assembler.instruction(&[0x48, 0x83, 0xc4, frame_bytes])?;
@@ -27975,13 +27978,12 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
 
     }
     assembler.bind(preflight_enter)?;
-    // Preserve the exact preflight window in the ordinary helper arguments;
-    // the continuation record later reuses the preflight stack slots.
-    assembler.instruction(aarch64_load_x_imm(8, 31, 48)?)?;
-    assembler.instruction(aarch64_store_x(8, 31, 24)?)?;
-    assembler.instruction(aarch64_load_x_imm(8, 31, 56)?)?;
-    assembler.instruction(aarch64_store_x(8, 31, 32)?)?;
-    // V2's compiler-private preflight constructs and authenticates the
+    // Keep preflight's exact admitted window in its private output slots.
+    // Immediate native completion never needs to duplicate those bounds into
+    // the ordinary helper-argument slots. Cold deopt reloads the private
+    // window directly, while first-hole continuation captures it in X3/X4
+    // before reusing the output record as its payload.
+    // V5's compiler-private preflight constructs and authenticates the
     // descriptor and its cache lineage for this synchronous scan. Retain only
     // the invocation-specific learned-loop policy here; rechecking the
     // canonical cell, address, geometry, stride, initial row, or duplicated
@@ -28768,15 +28770,20 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         assembler.instruction(aarch64_load_x_imm(8, 12, 0)?)?;
         assembler.instruction(aarch64_cmp_x(8, 10)?)?;
         assembler.branch_cond(AARCH64_EQ, framed_fallback)?;
-        // Preserve the exact scalar frontier, then reuse the five preflight
-        // words as the compiler-private continuation record.
+        // Preserve preflight's exact admitted start/end in their eventual ABI
+        // argument registers before reusing the five output words as the
+        // compiler-private continuation record. Payload construction below
+        // leaves X3/X4 untouched.
+        assembler.instruction(aarch64_load_pair_x(3, 4, 31, 48)?)?;
+        // Reload the cold identity from the trusted descriptor before
+        // preserving the exact scalar frontier.
         assembler.instruction(aarch64_load_x_imm(9, 31, 64)?)?; // descriptor
         assembler.instruction(aarch64_load_x_imm(
             9,
             9,
             u16::try_from(NATIVE_ROWS_CACHE_IDENTITY)
                 .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic cache identity"))?,
-        )?)?; // cold cache identity
+        )?)?;
         assembler.instruction(aarch64_store_pair_x(11, 2, 31, 48)?)?; // row, unread
         if tracks_root_scanner_hits {
             assembler.instruction(aarch64_add_x_reg(8, 19, 19)?)?; // hits << 1
@@ -28805,8 +28812,8 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         continuation_identity_page_offset = Some(identity_page_offset);
         assembler.instruction(aarch64_add_x_imm(7, 31, 48)?)?;
         assembler.instruction(aarch64_load_pair_x(0, 1, 31, 0)?)?;
-        assembler.instruction(aarch64_load_pair_x(2, 3, 31, 16)?)?;
-        assembler.instruction(aarch64_load_pair_x(4, 5, 31, 32)?)?;
+        assembler.instruction(aarch64_load_x_imm(2, 31, 16)?)?;
+        assembler.instruction(aarch64_load_x_imm(5, 31, 40)?)?;
         continuation_branch = Some(assembler.instruction(0x9400_0000)?);
         restore_frame_link(&mut assembler)?;
         assembler.instruction(aarch64_add_x_imm(31, 31, frame_bytes)?)?;
@@ -28821,16 +28828,18 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     assembler.branch_cond(AARCH64_NE, adaptive_fallback)?;
     assembler.bind(framed_short_fallback)?;
     assembler.instruction(aarch64_load_pair_x(0, 1, 31, 0)?)?;
-    assembler.instruction(aarch64_load_pair_x(2, 3, 31, 16)?)?;
-    assembler.instruction(aarch64_load_pair_x(4, 5, 31, 32)?)?;
+    assembler.instruction(aarch64_load_x_imm(2, 31, 16)?)?;
+    assembler.instruction(aarch64_load_pair_x(3, 4, 31, 48)?)?;
+    assembler.instruction(aarch64_load_x_imm(5, 31, 40)?)?;
     restore_frame_link(&mut assembler)?;
     assembler.instruction(aarch64_add_x_imm(31, 31, frame_bytes)?)?;
     assembler.branch(short_fallback)?;
 
     assembler.bind(adaptive_fallback)?;
     assembler.instruction(aarch64_load_pair_x(0, 1, 31, 0)?)?;
-    assembler.instruction(aarch64_load_pair_x(2, 3, 31, 16)?)?;
-    assembler.instruction(aarch64_load_pair_x(4, 5, 31, 32)?)?;
+    assembler.instruction(aarch64_load_x_imm(2, 31, 16)?)?;
+    assembler.instruction(aarch64_load_pair_x(3, 4, 31, 48)?)?;
+    assembler.instruction(aarch64_load_x_imm(5, 31, 40)?)?;
     restore_frame_link(&mut assembler)?;
     assembler.instruction(aarch64_add_x_imm(31, 31, frame_bytes)?)?;
     let deopt_branch = assembler.instruction(0x1400_0000)?;
@@ -36868,17 +36877,19 @@ mod tests {
                 0x4c, 0x8b, 0x54, 0x24, 0x48, // preflight end
                 0x4c, 0x89, 0x54, 0x24, 0x30, // ordinary end
             ];
-            let alias = x86
-                .code
-                .windows(x86_window_alias.len())
-                .position(|bytes| bytes == x86_window_alias)
-                .unwrap_or_else(|| panic!("x86 {output:?} missing admitted-window alias"));
+            assert!(
+                !x86
+                    .code
+                    .windows(x86_window_alias.len())
+                    .any(|bytes| bytes == x86_window_alias),
+                "x86 {output:?} eagerly duplicates the admitted window"
+            );
             let descriptor = x86
                 .code
                 .windows(5)
                 .position(|bytes| bytes == [0x4c, 0x8b, 0x5c, 0x24, 0x50])
                 .expect("x86 dynamic descriptor load");
-            assert!(alias < descriptor, "x86 {output:?}");
+            assert!(descriptor < x86.code.len(), "x86 {output:?}");
             assert_eq!(
                 x86.relocations
                     .iter()
@@ -36912,6 +36923,16 @@ mod tests {
                 )
                 .expect("x86 descriptor reload offset");
             assert!(continuation < cache_capture);
+            let window_capture = [
+                0x48, 0x8b, 0x4c, 0x24, 0x40, // exact start -> rcx
+                0x4c, 0x8b, 0x4c, 0x24, 0x48, // exact end -> r9
+            ];
+            assert!(
+                x86.code[continuation..cache_capture]
+                    .windows(window_capture.len())
+                    .any(|bytes| bytes == window_capture),
+                "x86 {output:?} must capture the admitted window only on continuation"
+            );
             assert_eq!(
                 &x86.code[cache_capture + 5..cache_capture + 9],
                 &[
@@ -36926,7 +36947,7 @@ mod tests {
                 !x86.code[continuation..cache_capture]
                     .windows(5)
                     .any(|bytes| bytes == [0x4c, 0x8b, 0x5c, 0x24, 0x58]),
-                "x86 {output:?} must not read V4's untouched fourth output word"
+                "x86 {output:?} must not read V5's untouched fourth output word"
             );
             for instruction in [
                 [0x4c, 0x89, 0x44, 0x24, 0x40],
@@ -36939,6 +36960,12 @@ mod tests {
                     "x86 {output:?} missing continuation record instruction {instruction:02x?}"
                 );
             }
+            assert!(
+                x86.code
+                    .windows(3)
+                    .any(|bytes| bytes == [0x4d, 0x89, 0xc8]),
+                "x86 {output:?} must forward the captured end in R8"
+            );
 
             let arm = lower_aarch64_dynamic_rows_prepared_for_output(
                 None,
@@ -36968,15 +36995,17 @@ mod tests {
                 aarch64_load_x_imm(8, 31, 56).unwrap(),
                 aarch64_store_x(8, 31, 32).unwrap(),
             ];
-            let alias = words
-                .windows(arm_window_alias.len())
-                .position(|window| window == arm_window_alias)
-                .unwrap_or_else(|| panic!("AArch64 {output:?} missing admitted-window alias"));
+            assert!(
+                !words
+                    .windows(arm_window_alias.len())
+                    .any(|window| window == arm_window_alias),
+                "AArch64 {output:?} eagerly duplicates the admitted window"
+            );
             let descriptor = words
                 .iter()
                 .position(|&word| word == aarch64_load_x_imm(13, 31, 64).unwrap())
                 .expect("AArch64 trusted dynamic descriptor load");
-            assert!(alias < descriptor, "AArch64 {output:?}");
+            assert!(descriptor < words.len(), "AArch64 {output:?}");
             let pointer_table = [
                 aarch64_load_byte_reg(8, 0, 2).unwrap(),
                 aarch64_load_byte_reg(10, 14, 8).unwrap(),
@@ -37031,6 +37060,11 @@ mod tests {
                 )
                 .expect("AArch64 descriptor reload offset");
             assert!(continuation < cache_capture);
+            assert!(
+                words[continuation..cache_capture]
+                    .contains(&aarch64_load_pair_x(3, 4, 31, 48).unwrap()),
+                "AArch64 {output:?} must capture the admitted window only on continuation"
+            );
             assert_eq!(
                 words[cache_capture + 1],
                 aarch64_load_x_imm(
@@ -37044,7 +37078,7 @@ mod tests {
             assert!(
                 !words[continuation..cache_capture]
                     .contains(&aarch64_load_x_imm(9, 31, 72).unwrap()),
-                "AArch64 {output:?} must not read V4's untouched fourth output word"
+                "AArch64 {output:?} must not read V5's untouched fourth output word"
             );
             for instruction in [
                 aarch64_store_pair_x(11, 2, 31, 48).unwrap(),
@@ -39920,7 +39954,7 @@ uint32_t fre_aot_regex_runtime_search_exclusive_dynamic_rows_deopt_v1(handle_t h
   deopt_calls++;
   if(h==NULL)return 5;
   if(h!=(handle_t)&frozen)return 90;
-  if(p!=haystack||n!=sizeof(haystack)||s!=5||e!=69||mode<5||mode>11)return 87;
+  if(p!=haystack||n!=sizeof(haystack)||s!=(mode==5?6U:5U)||e!=(mode==5?68U:69U)||mode<5||mode>11)return 87;
   r->start=123;r->end=456;return 77;
 }}
 uint32_t fre_aot_regex_runtime_search_exclusive_dynamic_rows_continue_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*d,const continuation_t*c) {{
@@ -39934,7 +39968,7 @@ uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_pr
   frozen.v1.active_seal=0;
   if(p!=haystack||n!=sizeof(haystack)||s!=5||e!=69||d==NULL||out==NULL||memcmp(d,identity,32)!=0)return 88;
   if(mode==2){{r->start=321;r->end=654;return 76;}}
-  out->start=s;out->end=e;out->native_rows_address=(size_t)(uintptr_t)&rows;
+  out->start=(mode==5)?s+1U:s;out->end=(mode==5)?e-1U:e;out->native_rows_address=(size_t)(uintptr_t)&rows;
   return 6;
 }}
 static int run_direct(uint32_t stride,size_t states,int matching,const unsigned char*p,size_t n,size_t s,size_t e,int base) {{
