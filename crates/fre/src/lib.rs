@@ -10518,6 +10518,34 @@ pub struct PortableSearchSession<'a> {
     plan: PortableSearchSessionPlan<'a>,
 }
 
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum K0ValueIterRoute {
+    General,
+    SourceBound,
+    Unknown,
+}
+
+#[cold]
+#[inline(never)]
+fn classify_and_cache_k0_value_iter_route(
+    session: &K0SearchSession<'_>,
+    sidecars_absent: bool,
+    route_state: &mut K0ExclusiveRouteState,
+) -> K0ValueIterRoute {
+    let route = if !sidecars_absent {
+        K0ValueIterRoute::General
+    } else {
+        match session.retained_span_value_cursor_eligibility() {
+            Some(true) => K0ValueIterRoute::SourceBound,
+            Some(false) => K0ValueIterRoute::General,
+            None => K0ValueIterRoute::Unknown,
+        }
+    };
+    route_state.set_value_iter_route(route);
+    route
+}
+
 #[derive(Debug)]
 #[allow(
     clippy::large_enum_variant,
@@ -11233,13 +11261,16 @@ struct K0CorrelatedRouteStates {
 
 /// Operation routing state for construction-exclusive K0 accelerators. The
 /// compact correlated bundle and packed policy share one inline slot, so no
-/// packed-only payload is added to ordinary K0 sessions.
+/// packed-only payload is added to ordinary K0 sessions. Otherwise empty
+/// ordinary tags retain the value-iterator route in that same slot.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum K0ExclusiveRouteState {
-    None,
-    Correlated(K0CorrelatedRouteStates),
-    Packed(K0PackedFrontierExistsState),
+    NoneGeneral = 0,
+    Correlated(K0CorrelatedRouteStates) = 1,
+    Packed(K0PackedFrontierExistsState) = 2,
+    NoneSourceBound = 3,
+    NoneUnknown = 4,
 }
 
 impl K0ExclusiveRouteState {
@@ -11247,21 +11278,49 @@ impl K0ExclusiveRouteState {
         match plan {
             K0ExclusivePlan::Packed(_) => Self::Packed(K0PackedFrontierExistsState::default()),
             K0ExclusivePlan::Correlated(_) => Self::Correlated(K0CorrelatedRouteStates::default()),
-            K0ExclusivePlan::None => Self::None,
+            K0ExclusivePlan::None => Self::NoneUnknown,
+        }
+    }
+
+    const fn value_iter_route(&self) -> K0ValueIterRoute {
+        match self {
+            Self::NoneGeneral => K0ValueIterRoute::General,
+            Self::NoneSourceBound => K0ValueIterRoute::SourceBound,
+            Self::NoneUnknown => K0ValueIterRoute::Unknown,
+            Self::Correlated(_) | Self::Packed(_) => K0ValueIterRoute::General,
+        }
+    }
+
+    fn set_value_iter_route(&mut self, route: K0ValueIterRoute) {
+        if matches!(
+            self,
+            Self::NoneGeneral | Self::NoneSourceBound | Self::NoneUnknown
+        ) {
+            *self = match route {
+                K0ValueIterRoute::General => Self::NoneGeneral,
+                K0ValueIterRoute::SourceBound => Self::NoneSourceBound,
+                K0ValueIterRoute::Unknown => Self::NoneUnknown,
+            };
         }
     }
 
     fn packed_mut(&mut self) -> Option<&mut K0PackedFrontierExistsState> {
         match self {
             Self::Packed(state) => Some(state),
-            Self::None | Self::Correlated(_) => None,
+            Self::NoneGeneral
+            | Self::NoneSourceBound
+            | Self::NoneUnknown
+            | Self::Correlated(_) => None,
         }
     }
 
     fn correlated_mut(&mut self) -> Option<&mut K0CorrelatedRouteStates> {
         match self {
             Self::Correlated(state) => Some(state),
-            Self::None | Self::Packed(_) => None,
+            Self::NoneGeneral
+            | Self::NoneSourceBound
+            | Self::NoneUnknown
+            | Self::Packed(_) => None,
         }
     }
 }
@@ -16686,7 +16745,7 @@ impl<'r> PortableSearchSession<'r> {
         haystack: &'h [u8],
         limits: PortableFindIterRunLimits,
     ) -> PortableSessionValueMatches<'s, 'r, 'h> {
-        let native_cursor = self.native_search_cursor(haystack);
+        let native_cursor = self.value_native_search_cursor(haystack, limits);
         PortableSessionValueMatches {
             session: self,
             state: PortableValueMatchIterState::new(haystack, limits, native_cursor),
@@ -16730,6 +16789,54 @@ impl<'r> PortableSearchSession<'r> {
             ),
             PortableSearchSessionPlan::Native(regex) => regex.native_search_cursor(haystack),
             PortableSearchSessionPlan::K0 { .. } => None,
+        }
+    }
+
+    fn value_native_search_cursor<'h>(
+        &mut self,
+        haystack: &'h [u8],
+        limits: PortableFindIterRunLimits,
+    ) -> Option<PortableNativeSearchCursor<'r, 'h>> {
+        match &mut self.plan {
+            PortableSearchSessionPlan::ExactLiteral { .. } => None,
+            PortableSearchSessionPlan::FixedPredicateWord64 { plan, .. } => Some(
+                PortableNativeSearchCursor::FixedPredicate(plan.search_cursor(haystack)),
+            ),
+            PortableSearchSessionPlan::Native(regex) => regex.native_search_cursor(haystack),
+            PortableSearchSessionPlan::K0 {
+                session,
+                k0_plan,
+                reverse_inner,
+                mandatory_suffix,
+                mandatory_cut,
+                negative_prefilter,
+                exclusive_route_state,
+                ..
+            } => {
+                match exclusive_route_state.value_iter_route() {
+                    K0ValueIterRoute::General => None,
+                    K0ValueIterRoute::SourceBound => {
+                        (limits.search == SearchLimits::unlimited())
+                            .then_some(PortableNativeSearchCursor::K0SourceBound)
+                    }
+                    K0ValueIterRoute::Unknown => {
+                        let sidecars_absent = reverse_inner.is_none()
+                            && mandatory_suffix.is_none()
+                            && mandatory_cut.is_none()
+                            && negative_prefilter.is_none()
+                            && k0_plan.correlated_terminal().is_none()
+                            && k0_plan.absolute_end_proof.is_none();
+                        let classified = classify_and_cache_k0_value_iter_route(
+                            session,
+                            sidecars_absent,
+                            exclusive_route_state,
+                        );
+                        (classified == K0ValueIterRoute::SourceBound
+                            && limits.search == SearchLimits::unlimited())
+                        .then_some(PortableNativeSearchCursor::K0SourceBound)
+                    }
+                }
+            }
         }
     }
 
@@ -16832,6 +16939,22 @@ impl<'r> PortableSearchSession<'r> {
             *mandatory_suffix_span_state = suffix_state_after_success;
         }
         Some(result)
+    }
+
+    fn find_iter_value_source_bound_at(
+        &mut self,
+        source: &mut K0SpanSourceCursor<'_>,
+        start: usize,
+        limits: SearchLimits,
+    ) -> Result<Option<Match>, SearchError> {
+        let PortableSearchSessionPlan::K0 { session, .. } = &mut self.plan else {
+            unreachable!("source-bound K0 iterator route was checked before construction");
+        };
+        let found = session.search_span_value_at_source_cursor(source, start, limits)?;
+        Ok(found.map(|span| Match {
+            start: span.start(),
+            end: span.end(),
+        }))
     }
 
     fn find_iter_value_at(
@@ -17008,6 +17131,7 @@ enum PortableNativeSearchCursor<'r, 'h> {
     DispatchedPrefixClass(DispatchedPrefixClassAlternationSearchCursor<'r, 'h>),
     UnicodeScalarRun(UnicodeScalarSearchCursor<'r, 'h>),
     LineDomainByteAtoms(line_domain_byte_atoms::SearchCursor<'r, 'h>),
+    K0SourceBound,
 }
 
 impl PortableNativeSearchCursor<'_, '_> {
@@ -17057,6 +17181,9 @@ impl PortableNativeSearchCursor<'_, '_> {
                 let (matched, accounting) = cursor.find_at(start, limits)?;
                 Ok((matched, accounting.actual.work))
             }
+            Self::K0SourceBound => {
+                unreachable!("source-bound K0 iteration is dispatched with its mutable session")
+            }
         }
     }
 
@@ -17073,6 +17200,9 @@ impl PortableNativeSearchCursor<'_, '_> {
             Self::LineDomainByteAtoms(cursor) => cursor
                 .find_at_value(start, limits)
                 .map_err(SearchError::from),
+            Self::K0SourceBound => {
+                unreachable!("source-bound K0 iteration is dispatched with its mutable session")
+            }
             _ => self.find_at(start, limits).map(|(matched, _work)| matched),
         }
     }
@@ -17373,12 +17503,26 @@ impl<'r, 'h> PortableValueMatchIterState<'r, 'h> {
                 session.find_iter_value_at(source, start, limits)
             }),
             Self::Native { core, cursor } => {
-                core.next_match_with(|_source, start, limits| {
-                    cursor.find_at_value(start, limits)
-                })
+                if matches!(cursor, PortableNativeSearchCursor::K0SourceBound) {
+                    next_source_bound_k0_value_match(core, session)
+                } else {
+                    core.next_match_with(|_source, start, limits| {
+                        cursor.find_at_value(start, limits)
+                    })
+                }
             }
         }
     }
+}
+
+#[inline(never)]
+fn next_source_bound_k0_value_match<'r, 'h>(
+    core: &mut PortableValueMatchIterCore<'h>,
+    session: &mut PortableSearchSession<'r>,
+) -> Option<Result<Match, PortableFindIterError>> {
+    core.next_match_with(|source, start, limits| {
+        session.find_iter_value_source_bound_at(source, start, limits)
+    })
 }
 
 impl<'h> PortableMatchIterCore<'h> {
@@ -19189,6 +19333,46 @@ mod tests {
             assert_eq!(exclusive, 200);
             assert!(exclusive < 3 * 104, "the pre-compaction bundle was 312 bytes");
         }
+
+        let mut ordinary = super::K0ExclusiveRouteState::for_plan(
+            &super::K0ExclusivePlan::None,
+        );
+        assert_eq!(
+            ordinary.value_iter_route(),
+            super::K0ValueIterRoute::Unknown
+        );
+        ordinary.set_value_iter_route(super::K0ValueIterRoute::SourceBound);
+        assert_eq!(
+            ordinary.value_iter_route(),
+            super::K0ValueIterRoute::SourceBound
+        );
+        ordinary.set_value_iter_route(super::K0ValueIterRoute::General);
+        assert_eq!(
+            ordinary.value_iter_route(),
+            super::K0ValueIterRoute::General
+        );
+
+        let mut packed_state = super::K0ExclusiveRouteState::Packed(
+            super::K0PackedFrontierExistsState::default(),
+        );
+        let packed_before = packed_state;
+        packed_state.set_value_iter_route(super::K0ValueIterRoute::SourceBound);
+        assert_eq!(
+            packed_state.value_iter_route(),
+            super::K0ValueIterRoute::General
+        );
+        assert_eq!(packed_state, packed_before);
+
+        let mut correlated_state = super::K0ExclusiveRouteState::Correlated(
+            super::K0CorrelatedRouteStates::default(),
+        );
+        let correlated_before = correlated_state;
+        correlated_state.set_value_iter_route(super::K0ValueIterRoute::SourceBound);
+        assert_eq!(
+            correlated_state.value_iter_route(),
+            super::K0ValueIterRoute::General
+        );
+        assert_eq!(correlated_state, correlated_before);
     }
 
     #[test]
@@ -28627,12 +28811,14 @@ mod tests {
             assert_eq!(session_value, expected);
         }
 
-        let cases: [(&str, &[u8], bool); 8] = [
+        let cases: [(&str, &[u8], bool); 10] = [
             ("", b"", true),
             ("", &[0xe2, 0x98, 0x83, 0xff], true),
             ("a*", b"aba", true),
             ("(?:a|)", b"ab", true),
             ("(?:|a)", b"ab", true),
+            (r"(?:|[aceg][\x00-\x40])", b"a!p c?g\x20", true),
+            (r"(?:[aceg][\x00-\x40]|)", b"a!p c?g\x20", true),
             (r"\A|a$", b"ba", true),
             ("aba", b"aba--aba", false),
             ("alpha|beta|gamma", b"zzalpha-beta-gamma", false),
@@ -29433,6 +29619,279 @@ mod tests {
                 .map(|matched| (matched.start(), matched.end())),
             Some((2, 4))
         );
+    }
+
+    #[test]
+    fn reused_k0_value_iterators_cache_only_broad_unlimited_source_routes() {
+        fn plain_forced_k0(pattern: &str) -> PortableRegex {
+            let mut regex = PortableBuilder::new(pattern)
+                .unicode(false)
+                .plan_selection(PlanSelection::ForceK0)
+                .build()
+                .unwrap();
+            let PortablePlan::K0(plan) = &mut regex.plan else {
+                unreachable!("forced value-iterator route fixture must retain K0");
+            };
+            plan.absolute_end_proof = None;
+            plan.exclusive = super::K0ExclusivePlan::None;
+            plan.reverse_inner = None;
+            plan.mandatory_suffix = None;
+            plan.mandatory_cut = None;
+            plan.negative_prefilter = None;
+            regex
+        }
+
+        fn is_source_bound(state: &super::PortableValueMatchIterState<'_, '_>) -> bool {
+            matches!(
+                state,
+                super::PortableValueMatchIterState::Native {
+                    cursor: super::PortableNativeSearchCursor::K0SourceBound,
+                    ..
+                }
+            )
+        }
+
+        let broad = [
+            (r"[\x20-\x60][\x80-\xFF]", [0x40_u8, 0x80]),
+            (r"[aceg][\x00-\x40]", [b'a', 0x20]),
+            (r"[\x80\x82\xFE\xFF][\x00-\x40]", [0x80, 0x20]),
+        ];
+        for (pattern, matched_bytes) in broad {
+            let regex = plain_forced_k0(pattern);
+            let upstream = regex::bytes::RegexBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            let mut haystack = vec![b'p'; 128];
+            for position in [20_usize, 22, 24, 26] {
+                haystack[position..position + 2].copy_from_slice(&matched_bytes);
+            }
+            let expected = upstream
+                .find_iter(&haystack)
+                .map(|matched| (matched.start(), matched.end()))
+                .collect::<Vec<_>>();
+            let mut session = regex
+                .search_session(SearchSessionLimits::unlimited())
+                .unwrap();
+            let PortableSearchSessionPlan::K0 {
+                session: k0_session,
+                exclusive_route_state,
+                ..
+            } = &session.plan
+            else {
+                unreachable!();
+            };
+            assert!(!k0_session.retained_root_run_cursor_available());
+            assert_eq!(
+                exclusive_route_state.value_iter_route(),
+                super::K0ValueIterRoute::Unknown
+            );
+
+            let cold = session
+                .find_iter_value(&haystack, PortableFindIterRunLimits::unlimited());
+            assert!(!is_source_bound(&cold.state), "cold pattern={pattern}");
+            let actual = cold
+                .map(|matched| matched.map(|matched| (matched.start(), matched.end())))
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(actual, expected, "cold pattern={pattern}");
+
+            let warm = session
+                .find_iter_value(&haystack, PortableFindIterRunLimits::unlimited());
+            assert!(is_source_bound(&warm.state), "warm pattern={pattern}");
+            let actual = warm
+                .map(|matched| matched.map(|matched| (matched.start(), matched.end())))
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(actual, expected, "warm pattern={pattern}");
+
+            let finite = PortableFindIterRunLimits {
+                search: SearchLimits {
+                    max_work: u64::MAX - 1,
+                    max_scratch_bytes: usize::MAX,
+                },
+                max_search_calls: usize::MAX,
+            };
+            let finite_iter = session.find_iter_value(&haystack, finite);
+            assert!(
+                matches!(
+                    &finite_iter.state,
+                    super::PortableValueMatchIterState::General(_)
+                ),
+                "finite pattern={pattern}"
+            );
+            drop(finite_iter);
+            let PortableSearchSessionPlan::K0 {
+                exclusive_route_state,
+                ..
+            } = &session.plan
+            else {
+                unreachable!();
+            };
+            assert_eq!(
+                exclusive_route_state.value_iter_route(),
+                super::K0ValueIterRoute::SourceBound
+            );
+        }
+
+        for pattern in [
+            r"a[\x00-\x40]",
+            r"[ac][\x00-\x40]",
+            r"[ace][\x00-\x40]",
+        ] {
+            let regex = plain_forced_k0(pattern);
+            let mut session = regex
+                .search_session(SearchSessionLimits::unlimited())
+                .unwrap();
+            let haystack = b"ppppppppppppppppppppa ppa ppa ppa pppppppppppppppp";
+            let cold = session
+                .find_iter_value(haystack, PortableFindIterRunLimits::unlimited());
+            assert!(!is_source_bound(&cold.state), "cold pattern={pattern}");
+            let expected = cold.collect::<Result<Vec<_>, _>>().unwrap();
+            let warm = session
+                .find_iter_value(haystack, PortableFindIterRunLimits::unlimited());
+            assert!(
+                matches!(
+                    &warm.state,
+                    super::PortableValueMatchIterState::General(_)
+                ),
+                "warm pattern={pattern}"
+            );
+            assert_eq!(warm.collect::<Result<Vec<_>, _>>().unwrap(), expected);
+            let PortableSearchSessionPlan::K0 {
+                exclusive_route_state,
+                ..
+            } = &session.plan
+            else {
+                unreachable!();
+            };
+            assert_eq!(
+                exclusive_route_state.value_iter_route(),
+                super::K0ValueIterRoute::General
+            );
+        }
+    }
+
+    #[test]
+    fn forced_k0_ordinary_iterators_release_source_masks_on_drop_and_mutation() {
+        let cases = [
+            (r"[\x20-\x7F][\x00-\x40]", [0x60_u8, 0x20]),
+            (r"[aceg][\x00-\x40]", [b'a', 0x20]),
+            (r"[\x80\x82\xFE\xFF][\x00-\x40]", [0x80, 0x20]),
+        ];
+
+        for (pattern, matched_bytes) in cases {
+            let mut fre = PortableBuilder::new(pattern)
+                .unicode(false)
+                .plan_selection(PlanSelection::ForceK0)
+                .build()
+                .unwrap();
+            assert_eq!(fre.build_report().plan, PlanKind::K0);
+            let PortablePlan::K0(plan) = &mut fre.plan else {
+                unreachable!("forced ordinary iterator fixture must retain K0");
+            };
+            plan.absolute_end_proof = None;
+            plan.exclusive = super::K0ExclusivePlan::None;
+            plan.reverse_inner = None;
+            plan.mandatory_suffix = None;
+            plan.mandatory_cut = None;
+            plan.negative_prefilter = None;
+
+            let upstream = regex::bytes::RegexBuilder::new(pattern)
+                .unicode(false)
+                .build()
+                .unwrap();
+            let mut session = fre
+                .search_session(super::SearchSessionLimits::unlimited())
+                .unwrap();
+            let PortableSearchSessionPlan::K0 {
+                session: k0_session,
+                reverse_inner: None,
+                mandatory_suffix: None,
+                mandatory_cut: None,
+                negative_prefilter: None,
+                ..
+            } = &session.plan
+            else {
+                panic!("ordinary iterator fixture retained a facade sidecar");
+            };
+            assert!(!k0_session.retained_root_run_cursor_available());
+
+            let mut haystack = vec![b'p'; 128];
+            for position in [20_usize, 22, 24, 26] {
+                haystack[position..position + 2].copy_from_slice(&matched_bytes);
+            }
+            let allocation = haystack.as_ptr();
+            let expected = |source: &[u8]| {
+                upstream
+                    .find_iter(source)
+                    .map(|matched| (matched.start(), matched.end()))
+                    .collect::<Vec<_>>()
+            };
+
+            let fresh: Result<Vec<_>, _> = fre
+                .find_iter(&haystack, PortableFindIterLimits::unlimited())
+                .unwrap()
+                .map(|matched| matched.map(|matched| (matched.start(), matched.end())))
+                .collect();
+            assert_eq!(fresh.unwrap(), expected(&haystack), "pattern={pattern}");
+            let fresh_value: Result<Vec<_>, _> = fre
+                .find_iter_value(&haystack, PortableFindIterLimits::unlimited())
+                .unwrap()
+                .map(|matched| matched.map(|matched| (matched.start(), matched.end())))
+                .collect();
+            assert_eq!(
+                fresh_value.unwrap(),
+                expected(&haystack),
+                "value pattern={pattern}"
+            );
+
+            {
+                let mut matches =
+                    session.find_iter(&haystack, PortableFindIterRunLimits::unlimited());
+                for expected_match in expected(&haystack).into_iter().take(2) {
+                    let actual = matches.next().unwrap().unwrap();
+                    assert_eq!((actual.start(), actual.end()), expected_match);
+                }
+            }
+            haystack.fill(b'p');
+            for position in [40_usize, 42, 44, 46] {
+                haystack[position..position + 2].copy_from_slice(&matched_bytes);
+            }
+            assert_eq!(haystack.as_ptr(), allocation);
+            let restarted: Result<Vec<_>, _> = session
+                .find_iter(&haystack, PortableFindIterRunLimits::unlimited())
+                .map(|matched| matched.map(|matched| (matched.start(), matched.end())))
+                .collect();
+            assert_eq!(
+                restarted.unwrap(),
+                expected(&haystack),
+                "same-address accounted restart pattern={pattern}"
+            );
+
+            {
+                let mut matches =
+                    session.find_iter_value(&haystack, PortableFindIterRunLimits::unlimited());
+                for expected_match in expected(&haystack).into_iter().take(2) {
+                    let actual = matches.next().unwrap().unwrap();
+                    assert_eq!((actual.start(), actual.end()), expected_match);
+                }
+            }
+            haystack.fill(b'p');
+            for position in [68_usize, 70, 72, 74] {
+                haystack[position..position + 2].copy_from_slice(&matched_bytes);
+            }
+            assert_eq!(haystack.as_ptr(), allocation);
+            let restarted_value: Result<Vec<_>, _> = session
+                .find_iter_value(&haystack, PortableFindIterRunLimits::unlimited())
+                .map(|matched| matched.map(|matched| (matched.start(), matched.end())))
+                .collect();
+            assert_eq!(
+                restarted_value.unwrap(),
+                expected(&haystack),
+                "same-address value restart pattern={pattern}"
+            );
+        }
     }
 
     fn assert_correlated_delimited_session_matches_upstream(

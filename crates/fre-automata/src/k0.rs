@@ -1977,9 +1977,8 @@ struct DirectLazyReady;
 
 // One ordinary execution loop may revisit a complete classifier block after
 // a guard or DFA restart rejects its first member. Retain only the unconsumed
-// lanes from that already charged block. This cursor is deliberately created
-// by the loop itself: it never crosses a search call, fallback, source, or
-// workspace boundary.
+// lanes from that already charged block. A source cursor may preserve that
+// monotone suffix after a successful value-only iterator search.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct RetainedStartMaskCursor {
     base: usize,
@@ -2150,6 +2149,11 @@ struct RootRunBlockCursor {
 // bound source cursor. Facades may use this overlay only after proving that
 // the immutable plan has no retained root-run cursor.
 const FACADE_CONTINUATION_TAG: u8 = u8::MAX;
+// Ordinary K0 uses the adjacent impossible tag to retain one primary-scanner
+// suffix across value-only searches owned by this exact source cursor. Its
+// logical width lives in `qualified_starts`, while `activation_at` is the
+// earliest next search start for which the consumed suffix remains valid.
+const RETAINED_START_MASK_TAG: u8 = u8::MAX - 1;
 
 impl Default for RootRunBlockCursor {
     fn default() -> Self {
@@ -2191,6 +2195,80 @@ impl RootRunBlockCursor {
         self.clear_members();
         self.automaton_identity = automaton_identity;
         self.activation_at = position;
+    }
+
+    fn retained_start_mask(
+        &self,
+        automaton_identity: u64,
+        start: usize,
+    ) -> Result<RetainedStartMaskCursor, SearchError> {
+        if *self == Self::empty() {
+            return Ok(RetainedStartMaskCursor::default());
+        }
+        if self.automaton_identity != automaton_identity {
+            return Err(SearchError::InternalInvariant {
+                detail: "source-bound start-mask cursor received a different immutable plan",
+            });
+        }
+        if self.valid_bytes == FACADE_CONTINUATION_TAG {
+            return Ok(RetainedStartMaskCursor::default());
+        }
+        if self.valid_bytes != RETAINED_START_MASK_TAG {
+            // A differently configured session for this same immutable
+            // automaton may have left root-run state in the shared overlay.
+            // It is source-compatible but not a generic scanner mask.
+            return Ok(RetainedStartMaskCursor::default());
+        }
+        if start < self.activation_at {
+            // The saved mask has consumed at least one earlier candidate.
+            // Reclassify a repeated or backward query from a cold cursor.
+            return Ok(RetainedStartMaskCursor::default());
+        }
+        let width = u8::try_from(self.qualified_starts).map_err(|_| {
+            SearchError::InternalInvariant {
+                detail: "source-bound start-mask width did not fit its classifier cursor",
+            }
+        })?;
+        let width_bits = u32::from(width);
+        if width == 0 || width_bits > u64::BITS {
+            return Err(SearchError::InternalInvariant {
+                detail: "source-bound start-mask width exceeded its classifier cursor",
+            });
+        }
+        let unused = u64::BITS - width_bits;
+        let valid = u64::MAX.checked_shr(unused).unwrap_or(u64::MAX);
+        if self.members & !valid != 0 {
+            return Err(SearchError::InternalInvariant {
+                detail: "source-bound start mask contained an out-of-block lane",
+            });
+        }
+        Ok(RetainedStartMaskCursor {
+            base: self.base,
+            width,
+            members: self.members,
+        })
+    }
+
+    fn publish_retained_start_mask(
+        &mut self,
+        automaton_identity: u64,
+        retained: RetainedStartMaskCursor,
+        activation_at: usize,
+    ) {
+        debug_assert_ne!(automaton_identity, 0);
+        if retained.width == 0 {
+            self.clear();
+            return;
+        }
+        debug_assert!(u32::from(retained.width) <= u64::BITS);
+        *self = Self {
+            automaton_identity,
+            base: retained.base,
+            members: retained.members,
+            valid_bytes: RETAINED_START_MASK_TAG,
+            qualified_starts: u32::from(retained.width),
+            activation_at,
+        };
     }
 }
 
@@ -2239,13 +2317,15 @@ impl<'h> K0SpanSourceCursor<'h> {
         &self,
         automaton_identity: u64,
     ) -> Result<Option<(usize, usize)>, SearchError> {
-        if self.root_run.valid_bytes != FACADE_CONTINUATION_TAG {
-            return Ok(None);
-        }
-        if self.root_run.automaton_identity != automaton_identity {
+        if self.root_run != RootRunBlockCursor::empty()
+            && self.root_run.automaton_identity != automaton_identity
+        {
             return Err(SearchError::InternalInvariant {
                 detail: "source-bound facade continuation received a different immutable plan",
             });
+        }
+        if self.root_run.valid_bytes != FACADE_CONTINUATION_TAG {
+            return Ok(None);
         }
         Ok(Some((self.root_run.base, self.root_run.activation_at)))
     }
@@ -7178,6 +7258,40 @@ impl<'a> K0SearchSession<'a> {
         self.root_run.is_some()
     }
 
+    /// Whether value-only span iteration can reuse source-bound scanner state.
+    ///
+    /// A cold proof returns `None` so the ordinary value entry performs the
+    /// first search and publication. Narrow `memchr` scanners and contextual
+    /// plans return `Some(false)` because they cannot publish a reusable
+    /// classifier mask.
+    #[doc(hidden)]
+    #[must_use]
+    #[inline]
+    pub fn retained_span_value_cursor_eligibility(&self) -> Option<bool> {
+        if self.root_run.is_some() {
+            return Some(true);
+        }
+        if self.capabilities.contextual {
+            return Some(false);
+        }
+        if !self.capabilities.lazy
+            || self.workspace.lazy.declined
+            || self.workspace.lazy.saturated
+            || !self.workspace.lazy.loop_skip_plans.is_empty()
+        {
+            return Some(false);
+        }
+        let proof = self.automaton.start_filter_proof.get()?;
+        Some(proof.scanner.as_ref().is_some_and(|scanner| {
+            matches!(
+                scanner.scanner,
+                StartScanner::Range { .. }
+                    | StartScanner::AsciiSet { .. }
+                    | StartScanner::Set(_)
+            )
+        }))
+    }
+
     /// Whether ordinary reused K0 can represent its full work certificate.
     ///
     /// This source-only query is bound to the session's exact immutable plan.
@@ -7842,6 +7956,82 @@ impl<'a> K0SearchSession<'a> {
             self.capabilities,
         )
         .map(|report| report.found)
+    }
+
+    /// Project one iterator-owned Span while retaining a monotone primary-
+    /// scanner suffix in the lifetime-bound source cursor.
+    pub(crate) fn search_span_value_at_source_untyped(
+        &mut self,
+        source: &mut K0SpanSourceCursor<'_>,
+        start: usize,
+        limits: SearchLimits,
+    ) -> Result<Option<MatchSpan>, SearchError> {
+        let haystack = source.haystack;
+        let window = SearchWindow::new(start, haystack.len());
+        validate_window(haystack, window)?;
+
+        // Preserve the existing root-run specialization and its exact work
+        // ledger. It already owns this overlay and publishes transactionally.
+        if self.root_run.is_some() {
+            return self
+                .search_span_at_untyped(source, start, limits)
+                .map(|report| report.found);
+        }
+
+        // Authenticate every occupied overlay even when contextual execution
+        // keeps using its existing report-free path without generic retention.
+        let incoming_start_mask = source
+            .root_run
+            .retained_start_mask(self.automaton.identity(), start)?;
+        if self.capabilities.contextual {
+            return self
+                .search_span_at_untyped(source, start, limits)
+                .map(|report| report.found);
+        }
+
+        if limits == SearchLimits::unlimited() && self.capabilities.lazy {
+            if let Some(proof) = self.automaton.start_filter_proof.get() {
+                if self.workspace.lazy.is_bound_to(self.automaton)
+                    && self.workspace.lazy.initialized
+                    && !self.workspace.lazy.declined
+                    && !self.workspace.lazy.saturated
+                {
+                    let nullable_initial = matches!(
+                        self.workspace.lazy.initial_kind,
+                        LazyInitialKind::NullablePrefix | LazyInitialKind::NullableTerminal
+                    );
+                    if !proof.force_haystack_start && proof.relaxed_nullable == nullable_initial {
+                        let mut transactional_start_mask = incoming_start_mask;
+                        match try_warm_direct_span_with_reverse_and_retained_start_mask(
+                            self.automaton,
+                            haystack,
+                            window,
+                            &self.workspace.lazy,
+                            &self.workspace.reverse,
+                            proof,
+                            &mut transactional_start_mask,
+                        )? {
+                            WarmDirectSpan::Complete(found) => {
+                                let activation_at = found.map(WarmDirectMatch::span).map_or(
+                                    window.end(),
+                                    |matched| matched.start().saturating_add(1),
+                                );
+                                source.root_run.publish_retained_start_mask(
+                                    self.automaton.identity(),
+                                    transactional_start_mask,
+                                    activation_at,
+                                );
+                                return Ok(found.map(WarmDirectMatch::span));
+                            }
+                            WarmDirectSpan::Declined => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        self.search_span_at_untyped(source, start, limits)
+            .map(|report| report.found)
     }
 
     pub(crate) fn search_span_at_untyped(
@@ -12146,6 +12336,31 @@ fn try_warm_direct_span_with_reverse(
     reverse: &ReverseWorkspace,
     proof: &StartFilterProof,
 ) -> Result<WarmDirectSpan, SearchError> {
+    let mut retained_start_mask = RetainedStartMaskCursor::default();
+    try_warm_direct_span_with_reverse_and_retained_start_mask(
+        automaton,
+        haystack,
+        window,
+        lazy,
+        reverse,
+        proof,
+        &mut retained_start_mask,
+    )
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the forward and reverse halves share one source-bound read-only transaction"
+)]
+fn try_warm_direct_span_with_reverse_and_retained_start_mask(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    lazy: &LazyWorkspace,
+    reverse: &ReverseWorkspace,
+    proof: &StartFilterProof,
+    retained_start_mask: &mut RetainedStartMaskCursor,
+) -> Result<WarmDirectSpan, SearchError> {
     // The ordinary Span path applies the retained loop action to start
     // provenance and can skip the run safely. Do not shadow it with this
     // scalar-only optimistic reader.
@@ -12185,7 +12400,6 @@ fn try_warm_direct_span_with_reverse(
     let mut pending_end = initial_pending.then_some(window.start());
     let mut active_start = Some(window.start());
     let mut pending_start = initial_pending.then_some(window.start());
-    let mut retained_start_mask = RetainedStartMaskCursor::default();
     let mut adaptive_probe = AdaptiveStartProbe::default();
     let mut engine_candidate = None;
 
@@ -12215,7 +12429,7 @@ fn try_warm_direct_span_with_reverse(
                     proof.guard(),
                     proof.probe(),
                     &mut meter,
-                    &mut retained_start_mask,
+                    retained_start_mask,
                     &mut adaptive_probe,
                 )?;
                 if position == window.end() {
@@ -24994,7 +25208,9 @@ fn execute_root_run_corridor(
     debug_assert!(descriptor.minimum() > 0);
     debug_assert!(descriptor.minimum() <= ROOT_CORRIDOR_MASK_MAXIMUM_MINIMUM);
     let automaton_identity = automaton.identity();
-    if cursor.automaton_identity != automaton_identity {
+    if cursor.automaton_identity != automaton_identity
+        || usize::from(cursor.valid_bytes) > ROOT_RUN_WINDOW_BYTES
+    {
         cursor.clear();
     }
 
@@ -27980,8 +28196,9 @@ mod tests {
         classify_byte_delta_16, scratch_bytes, ContextHotTransition, ContextTransitionSlot,
         ContextTransitionStore, LazyWorkspace, WarmContextForwardContinuation, WorkMeter,
         WorkspaceLayout, ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, BYTE_SET_BLOCK_BYTES,
-        BYTE_SET_WIDE_BLOCK_BYTES, CONTEXT_INITIAL_SOURCE, INVOCATION_RESET_WORK,
-        ROOT_RUN_SCANNER_SHAPE_MAX_WORK, WARM_EXISTS_INLINE_BYTES,
+        BYTE_SET_WIDE_BLOCK_BYTES, CONTEXT_INITIAL_SOURCE, FACADE_CONTINUATION_TAG,
+        INVOCATION_RESET_WORK, RETAINED_START_MASK_TAG, ROOT_RUN_SCANNER_SHAPE_MAX_WORK,
+        ROOT_RUN_WINDOW_BYTES, WARM_EXISTS_INLINE_BYTES,
     };
     use crate::{
         epsilon_closure_dispatch::EpsilonClosureDispatch,
@@ -28408,6 +28625,54 @@ mod tests {
             RawPlan {
                 start,
                 roles,
+                edge_offsets,
+                edge_targets,
+                edge_kinds,
+                byte_starts,
+                byte_ends,
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn byte_ranges_at_offset_then_range(
+        offset: usize,
+        scanner_ranges: &[(u8, u8)],
+        suffix: (u8, u8),
+    ) -> Automaton {
+        assert!(!scanner_ranges.is_empty());
+        let width = offset.checked_add(2).unwrap();
+        let mut edge_offsets = Vec::with_capacity(width + 2);
+        let mut edge_targets = Vec::new();
+        let mut edge_kinds = Vec::new();
+        let mut byte_starts = Vec::new();
+        let mut byte_ends = Vec::new();
+        edge_offsets.push(0);
+        for position in 0..width {
+            let ranges: &[(u8, u8)] = if position < offset {
+                &[(0, u8::MAX)]
+            } else if position == offset {
+                scanner_ranges
+            } else {
+                &[suffix]
+            };
+            for &(start, end) in ranges {
+                edge_targets.push(u32::try_from(position + 1).unwrap());
+                edge_kinds.push(EdgeKind::ByteRange);
+                byte_starts.push(start);
+                byte_ends.push(end);
+            }
+            edge_offsets.push(u32::try_from(edge_targets.len()).unwrap());
+        }
+        edge_offsets.push(u32::try_from(edge_targets.len()).unwrap());
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: (0..width)
+                    .map(|_| StateRole::Consume)
+                    .chain(std::iter::once(StateRole::Accept))
+                    .collect(),
                 edge_offsets,
                 edge_targets,
                 edge_kinds,
@@ -57544,6 +57809,281 @@ mod tests {
                 .search_exists_value(&source, window, SearchLimits::unlimited())
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn ordinary_start_mask_source_cursor_matches_fresh_k0() {
+        let cases = [
+            (
+                "range",
+                byte_ranges_at_offset_then_range(3, &[(0x20, 0x60)], (0x80, 0xff)),
+                [0x40, 0x80],
+            ),
+            (
+                "ascii-set",
+                byte_ranges_at_offset_then_range(
+                    3,
+                    &[(b'a', b'a'), (b'c', b'c'), (b'e', b'e'), (b'g', b'g')],
+                    (0, 64),
+                ),
+                [b'a', 0x20],
+            ),
+            (
+                "full-set",
+                byte_ranges_at_offset_then_range(
+                    3,
+                    &[(0x80, 0x80), (0x82, 0x82), (0xfe, 0xfe), (0xff, 0xff)],
+                    (0, 64),
+                ),
+                [0x80, 0x20],
+            ),
+        ];
+        let mut retained_families = [false; 3];
+
+        for (case_index, (name, plan, matched_bytes)) in cases.iter().enumerate() {
+            for residue in [0_usize, 1, 15, 16, 31] {
+                let mut storage = vec![0x70; 96 + 64];
+                let base_residue = storage.as_ptr().addr() % BYTE_SET_WIDE_BLOCK_BYTES;
+                let padding = residue
+                    .checked_add(BYTE_SET_WIDE_BLOCK_BYTES)
+                    .and_then(|wanted| wanted.checked_sub(base_residue))
+                    .expect("one alignment adjustment fits")
+                    % BYTE_SET_WIDE_BLOCK_BYTES;
+                let source_end = padding.checked_add(96).unwrap();
+                for position in [20_usize, 22, 24, 26, 52, 54, 56, 58] {
+                    storage[padding + position + 3] = matched_bytes[0];
+                    storage[padding + position + 4] = matched_bytes[1];
+                }
+                let source = &storage[padding..source_end];
+                assert_eq!(source.as_ptr().addr() % BYTE_SET_WIDE_BLOCK_BYTES, residue);
+
+                let mut retained = K0SearchSession::new_selected(
+                    plan,
+                    WorkspaceLimits::unlimited(),
+                    true,
+                    true,
+                )
+                .unwrap();
+                let mut fresh = K0SearchSession::new_selected(
+                    plan,
+                    WorkspaceLimits::unlimited(),
+                    true,
+                    true,
+                )
+                .unwrap();
+                assert!(retained.root_run.is_none(), "{name} must use ordinary K0");
+                for session in [&mut retained, &mut fresh] {
+                    for _ in 0..2 {
+                        let _ = session
+                            .search::<Span>(source, SearchLimits::unlimited())
+                            .unwrap();
+                    }
+                }
+                let proof = plan
+                    .start_filter_proof
+                    .get()
+                    .expect("warm ordinary session publishes a start scanner");
+                match *name {
+                    "range" => assert!(matches!(
+                        proof.scanner,
+                        Some(StartPositionScanner {
+                            offset: 3,
+                            scanner: StartScanner::Range { .. },
+                        })
+                    )),
+                    "ascii-set" => assert!(matches!(
+                        proof.scanner,
+                        Some(StartPositionScanner {
+                            offset: 3,
+                            scanner: StartScanner::AsciiSet { .. },
+                        })
+                    )),
+                    "full-set" => assert!(matches!(
+                        proof.scanner,
+                        Some(StartPositionScanner {
+                            offset: 3,
+                            scanner: StartScanner::Set(_),
+                        })
+                    )),
+                    _ => unreachable!(),
+                }
+
+                let mut cursor = K0SpanSourceCursor::new(source);
+                for start in [0_usize, 22, 24, 20, 26, 52, 54, 56, 58, 60] {
+                    let expected = fresh
+                        .search_span_at_cursor(source, start, SearchLimits::unlimited())
+                        .unwrap();
+                    let actual = retained
+                        .search_span_value_at_source_untyped(
+                            &mut cursor,
+                            start,
+                            SearchLimits::unlimited(),
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        &actual,
+                        expected.output(),
+                        "{name} residue={residue} start={start}"
+                    );
+                    if cursor.root_run.valid_bytes == RETAINED_START_MASK_TAG {
+                        retained_families[case_index] = true;
+                    }
+                }
+            }
+        }
+        assert_eq!(retained_families, [true; 3]);
+    }
+
+    #[test]
+    fn ordinary_start_mask_cursor_is_plan_bound_and_transactional() {
+        let plan = byte_class_then_range(b"aceg", (0, 64), None);
+        let foreign_plan = byte_class_then_range(b"bdfh", (0, 64), None);
+        let mut source_bytes = vec![0x70; 96];
+        for position in [20_usize, 22, 24, 26, 52, 54] {
+            source_bytes[position] = b'a';
+            source_bytes[position + 1] = 0x20;
+        }
+
+        let mut retained = K0SearchSession::new_selected(
+            &plan,
+            WorkspaceLimits::unlimited(),
+            true,
+            true,
+        )
+        .unwrap();
+        let mut fresh = K0SearchSession::new_selected(
+            &plan,
+            WorkspaceLimits::unlimited(),
+            true,
+            true,
+        )
+        .unwrap();
+        for session in [&mut retained, &mut fresh] {
+            for _ in 0..2 {
+                let _ = session
+                    .search::<Span>(&source_bytes, SearchLimits::unlimited())
+                    .unwrap();
+            }
+        }
+        assert!(retained.root_run.is_none());
+        let mut source = K0SpanSourceCursor::new(&source_bytes);
+        let first = retained
+            .search_span_value_at_source_untyped(&mut source, 0, SearchLimits::unlimited())
+            .unwrap();
+        assert_eq!(first, Some(MatchSpan::new(20, 22)));
+        assert_eq!(source.root_run.valid_bytes, RETAINED_START_MASK_TAG);
+        assert_eq!(source.root_run.automaton_identity, plan.identity());
+        assert!(matches!(
+            usize::try_from(source.root_run.qualified_starts).unwrap(),
+            BYTE_SET_BLOCK_BYTES | BYTE_SET_WIDE_BLOCK_BYTES
+        ));
+        assert_eq!(source.root_run.activation_at, 21);
+
+        for start in [20_usize, 24, 22, 52, 26] {
+            let expected = fresh
+                .search_span_at_cursor(&source_bytes, start, SearchLimits::unlimited())
+                .unwrap()
+                .into_output();
+            let actual = retained
+                .search_span_value_at_source_untyped(
+                    &mut source,
+                    start,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap();
+            assert_eq!(actual, expected, "nonmonotone start={start}");
+        }
+
+        let before_limit = source.root_run;
+        assert!(matches!(
+            retained.search_span_value_at_source_untyped(
+                &mut source,
+                54,
+                SearchLimits {
+                    max_work: 0,
+                    max_scratch_bytes: usize::MAX,
+                },
+            ),
+            Err(SearchError::WorkLimitExceeded { limit: 0, .. })
+        ));
+        assert_eq!(source.root_run, before_limit);
+        let retained_bytes = retained.construction_accounting().retained_bytes();
+        assert!(retained_bytes > 0);
+        assert!(matches!(
+            retained.search_span_value_at_source_untyped(
+                &mut source,
+                54,
+                SearchLimits {
+                    max_work: u64::MAX,
+                    max_scratch_bytes: retained_bytes - 1,
+                },
+            ),
+            Err(SearchError::ResourceLimit {
+                resource: ResourceKind::ScratchBytes,
+                ..
+            })
+        ));
+        assert_eq!(source.root_run, before_limit);
+
+        let mut foreign = K0SearchSession::new_selected(
+            &foreign_plan,
+            WorkspaceLimits::unlimited(),
+            true,
+            true,
+        )
+        .unwrap();
+        let _ = foreign
+            .search::<Span>(&source_bytes, SearchLimits::unlimited())
+            .unwrap();
+        let before_foreign = source.root_run;
+        assert!(matches!(
+            foreign.search_span_value_at_source_untyped(
+                &mut source,
+                54,
+                SearchLimits::unlimited(),
+            ),
+            Err(SearchError::InternalInvariant {
+                detail: "source-bound start-mask cursor received a different immutable plan",
+            })
+        ));
+        assert_eq!(source.root_run, before_foreign);
+    }
+
+    #[test]
+    fn root_run_rejects_non_root_overlay_tags_before_cached_decode() {
+        let plan = root_run_exact_two();
+        let mut session = K0SearchSession::new_selected(
+            &plan,
+            WorkspaceLimits::unlimited(),
+            true,
+            true,
+        )
+        .unwrap();
+        let haystack = b"acegaceg";
+        let _ = session
+            .search::<Span>(haystack, SearchLimits::unlimited())
+            .unwrap();
+        assert!(session.root_run.is_some());
+
+        for tag in [RETAINED_START_MASK_TAG, FACADE_CONTINUATION_TAG] {
+            let mut source = K0SpanSourceCursor::new(haystack);
+            source.root_run = super::RootRunBlockCursor {
+                automaton_identity: plan.identity(),
+                base: 0,
+                members: u64::MAX,
+                valid_bytes: tag,
+                qualified_starts: u32::MAX,
+                activation_at: usize::MAX,
+            };
+            assert_eq!(
+                session
+                    .search_span_at_source_cursor(&mut source, 0, SearchLimits::unlimited())
+                    .unwrap()
+                    .into_output(),
+                Some(MatchSpan::new(0, 2))
+            );
+            assert!(usize::from(source.root_run.valid_bytes) <= ROOT_RUN_WINDOW_BYTES);
+        }
     }
 
     #[test]

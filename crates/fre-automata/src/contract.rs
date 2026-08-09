@@ -1394,6 +1394,24 @@ impl K0SearchSession<'_> {
         self.search_span_value_untyped(haystack, window, limits)
     }
 
+    /// Return only a Span for one iterator-owned suffix while retaining
+    /// primary-scanner masks tied to the cursor's exact immutable source.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] under the same range and resource contract as
+    /// [`Self::search_span_value`].
+    #[doc(hidden)]
+    #[inline]
+    pub fn search_span_value_at_source_cursor(
+        &mut self,
+        source: &mut K0SpanSourceCursor<'_>,
+        start: usize,
+        limits: SearchLimits,
+    ) -> Result<Option<MatchSpan>, SearchError> {
+        self.search_span_value_at_source_untyped(source, start, limits)
+    }
+
     /// Search a complete-haystack suffix with retained source-independent
     /// span cursor facts.
     ///
