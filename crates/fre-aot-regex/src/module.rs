@@ -1268,12 +1268,13 @@ impl CompiledModule {
                     optional_lowering = Some(lowering);
                 } else {
                     let lowered = if uses_partial_wrapper {
-                        lower_optional_native_slow_partial_with_data_limit(
-                            &program_bytes,
-                            view,
-                            target,
-                            effective_native_data_limit_bytes,
-                        )
+                        // The raw slow-partial entry must rebuild the semantic
+                        // runtime and replay from the original window whenever
+                        // it reaches a collapsed hole. Preserve the ordinary
+                        // lowering cascade instead: every runtime-backed route
+                        // below publishes an authenticated prepared entry whose
+                        // workspace survives repeated compiled searches.
+                        Ok(None)
                     } else {
                         lower_optional_native_dfa_with_data_limit(
                             view,
