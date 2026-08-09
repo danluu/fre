@@ -71,6 +71,32 @@ const ANCHOR_CANDIDATE_WORK: usize = 1;
 const PREDICATE_CHECK_WORK: usize = 1;
 const MATCH_WORK: usize = 3;
 const REDUCE_FINAL_WORK: usize = 1;
+// A value-only search with unlimited limits does not publish the prospective
+// accounting, but it must still prove that every checked upper-bound
+// intermediate and the final u64 work conversion would succeed. At most 63
+// non-primary predicates plus finder service, calls and candidate accounting
+// charge 66 units per window byte. One terminal finder call, one match and
+// finalization add at most five more units.
+const SEARCH_VALUE_PREFLIGHT_ANCHOR_WORK_FACTOR: usize = (MAX_WIDTH - 1) * PREDICATE_CHECK_WORK
+    + FINDER_SCAN_BYTE_WORK
+    + FINDER_CALL_WORK
+    + ANCHOR_CANDIDATE_WORK;
+const SEARCH_VALUE_PREFLIGHT_HYBRID_WORK_FACTOR: usize = TRANSITION_WORK
+    + (MAX_WIDTH - 1 - 3) * PREDICATE_CHECK_WORK;
+const SEARCH_VALUE_PREFLIGHT_WORK_FACTOR: usize = if SEARCH_VALUE_PREFLIGHT_ANCHOR_WORK_FACTOR
+    >= SEARCH_VALUE_PREFLIGHT_HYBRID_WORK_FACTOR
+{
+    SEARCH_VALUE_PREFLIGHT_ANCHOR_WORK_FACTOR
+} else {
+    SEARCH_VALUE_PREFLIGHT_HYBRID_WORK_FACTOR
+};
+const SEARCH_VALUE_PREFLIGHT_WORK_SLOP: usize =
+    FINDER_CALL_WORK + MATCH_WORK + REDUCE_FINAL_WORK;
+const SEARCH_VALUE_PREFLIGHT_ARITHMETIC_MAX: usize =
+    usize::MAX >> usize::BITS.saturating_sub(u64::BITS);
+const SEARCH_VALUE_PREFLIGHT_MAX_WINDOW_BYTES: usize =
+    (SEARCH_VALUE_PREFLIGHT_ARITHMETIC_MAX - SEARCH_VALUE_PREFLIGHT_WORK_SLOP)
+        / SEARCH_VALUE_PREFLIGHT_WORK_FACTOR;
 const ADAPTIVE_FALLBACK_REJECTIONS: usize = 8;
 // Exact anchors and retained candidate streams may have only one authenticated
 // 16-byte classification block. Do not infer wider economics for their handoff.
@@ -3227,13 +3253,14 @@ impl FixedPredicateWord64Plan {
         window: Window,
         limits: SearchLimits,
     ) -> Result<Option<(usize, usize)>, SearchError> {
-        let _ = self.search_preflight(haystack.len(), window, limits)?;
-        let slice =
-            haystack
-                .get(window.start()..window.end())
-                .ok_or(SearchError::InternalInvariant(
-                    "admitted fixed-predicate window disappeared",
-                ))?;
+        let slice = haystack.get(window.start()..window.end()).ok_or(
+            SearchError::InvalidWindow {
+                start: window.start(),
+                end: window.end(),
+                haystack_len: haystack.len(),
+            },
+        )?;
+        self.search_value_preflight_validated(slice.len(), limits)?;
         if self.primary_finder.is_some() {
             return if self.general_primary_staged().is_some() {
                 self.first_general_primary_value(slice, window.start())
@@ -3707,6 +3734,28 @@ impl FixedPredicateWord64Plan {
         window: Window,
         limits: SearchLimits,
     ) -> Result<SearchUpperBounds, SearchError> {
+        let window_bytes = Self::validated_search_window_bytes(haystack_len, window)?;
+        self.search_preflight_validated(window_bytes, limits)
+    }
+
+    fn search_value_preflight_validated(
+        &self,
+        window_bytes: usize,
+        limits: SearchLimits,
+    ) -> Result<(), SearchError> {
+        if limits == SearchLimits::unlimited()
+            && window_bytes <= SEARCH_VALUE_PREFLIGHT_MAX_WINDOW_BYTES
+        {
+            return Ok(());
+        }
+        self.search_preflight_validated(window_bytes, limits)
+            .map(drop)
+    }
+
+    fn validated_search_window_bytes(
+        haystack_len: usize,
+        window: Window,
+    ) -> Result<usize, SearchError> {
         if window.start() > window.end() || window.end() > haystack_len {
             return Err(SearchError::InvalidWindow {
                 start: window.start(),
@@ -3714,13 +3763,23 @@ impl FixedPredicateWord64Plan {
                 haystack_len,
             });
         }
-        let window_bytes =
-            window
-                .end()
-                .checked_sub(window.start())
-                .ok_or(SearchError::ArithmeticOverflow {
-                    computation: "search window width",
-                })?;
+        window
+            .end()
+            .checked_sub(window.start())
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "search window width",
+            })
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the source-free preflight keeps every checked search bound adjacent"
+    )]
+    fn search_preflight_validated(
+        &self,
+        window_bytes: usize,
+        limits: SearchLimits,
+    ) -> Result<SearchUpperBounds, SearchError> {
         let candidate_events = window_bytes
             .checked_sub(self.width)
             .and_then(|last| last.checked_add(1))
@@ -8355,6 +8414,128 @@ mod tests {
             assert_eq!(reporting_error, compact_error);
             assert!(matches!(compact_error, SearchError::InvalidWindow { .. }));
         }
+    }
+
+    #[test]
+    fn first_match_unlimited_value_preflight_threshold_proves_arithmetic() {
+        assert_eq!(SEARCH_VALUE_PREFLIGHT_WORK_FACTOR, 66);
+        assert_eq!(SEARCH_VALUE_PREFLIGHT_WORK_SLOP, 5);
+        assert_eq!(
+            (u128::from(u32::MAX) - 5) / 66,
+            65_075_261,
+        );
+        assert_eq!(
+            (u128::from(u64::MAX) - 5) / 66,
+            279_496_122_328_932_600,
+        );
+        match usize::BITS {
+            32 => assert_eq!(SEARCH_VALUE_PREFLIGHT_MAX_WINDOW_BYTES, 65_075_261),
+            64 => assert_eq!(
+                SEARCH_VALUE_PREFLIGHT_MAX_WINDOW_BYTES,
+                279_496_122_328_932_600,
+            ),
+            _ => {}
+        }
+
+        let admitted_work = SEARCH_VALUE_PREFLIGHT_MAX_WINDOW_BYTES
+            .checked_mul(SEARCH_VALUE_PREFLIGHT_WORK_FACTOR)
+            .and_then(|work| work.checked_add(SEARCH_VALUE_PREFLIGHT_WORK_SLOP))
+            .unwrap();
+        assert!(u64::try_from(admitted_work).is_ok());
+        let first_unproved = SEARCH_VALUE_PREFLIGHT_MAX_WINDOW_BYTES
+            .checked_add(1)
+            .unwrap()
+            .checked_mul(SEARCH_VALUE_PREFLIGHT_WORK_FACTOR)
+            .and_then(|work| work.checked_add(SEARCH_VALUE_PREFLIGHT_WORK_SLOP));
+        assert!(first_unproved.is_none_or(|work| u64::try_from(work).is_err()));
+    }
+
+    #[test]
+    fn first_match_unlimited_value_preflight_covers_plan_shapes_and_overflow() {
+        const FULL: &[(u8, u8)] = &[(0, u8::MAX)];
+        const SINGLE: &[(u8, u8)] = &[(b'Q', b'Q')];
+        const THREE: &[(u8, u8)] = &[(b'J', b'L')];
+        const BROAD: &[(u8, u8)] = &[(0, 0x7E)];
+        const FOUR: &[(u8, u8)] = &[
+            (b'B', b'B'),
+            (b'D', b'D'),
+            (b'F', b'F'),
+            (b'H', b'H'),
+        ];
+        const SIX: &[(u8, u8)] = &[
+            (b'J', b'J'),
+            (b'L', b'L'),
+            (b'N', b'N'),
+            (b'P', b'P'),
+            (b'R', b'R'),
+            (b'T', b'T'),
+        ];
+
+        let raw = FixedPredicateWord64Plan::build(&[FULL], BuildLimits::unlimited()).unwrap();
+        assert!(raw.is_raw_shift_and());
+        let exact =
+            FixedPredicateWord64Plan::build(&[FULL, SINGLE, FULL], BuildLimits::unlimited())
+                .unwrap();
+        assert!(matches!(exact.anchor, Anchor::One { .. }));
+        assert!(exact.adaptive_fallback.is_none());
+        let adaptive = FixedPredicateWord64Plan::build(
+            &[SINGLE, THREE, BROAD, BROAD, BROAD, BROAD],
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        assert!(adaptive.adaptive_fallback.is_some());
+        let general =
+            FixedPredicateWord64Plan::build(&[FOUR, SIX], BuildLimits::unlimited()).unwrap();
+        assert!(general.primary_finder.is_some());
+
+        let mut maximum_verification = vec![BROAD; MAX_WIDTH];
+        maximum_verification[MAX_WIDTH / 2] = SINGLE;
+        let maximum_verification = FixedPredicateWord64Plan::build(
+            maximum_verification.as_slice(),
+            BuildLimits::unlimited(),
+        )
+        .unwrap();
+        assert_eq!(
+            maximum_verification.max_verification_predicates(),
+            MAX_WIDTH - 1,
+        );
+        assert!(maximum_verification.adaptive_fallback.is_some());
+
+        let threshold_window = Window::new(0, SEARCH_VALUE_PREFLIGHT_MAX_WINDOW_BYTES);
+        for plan in [&raw, &exact, &adaptive, &general, &maximum_verification] {
+            plan.search_preflight(
+                SEARCH_VALUE_PREFLIGHT_MAX_WINDOW_BYTES,
+                threshold_window,
+                SearchLimits::unlimited(),
+            )
+            .unwrap();
+            assert_eq!(
+                plan.search_value_preflight_validated(
+                    SEARCH_VALUE_PREFLIGHT_MAX_WINDOW_BYTES,
+                    SearchLimits::unlimited(),
+                ),
+                Ok(()),
+            );
+        }
+
+        let raw_overflow_window = SEARCH_VALUE_PREFLIGHT_ARITHMETIC_MAX
+            .checked_sub(MATCH_WORK + REDUCE_FINAL_WORK)
+            .unwrap()
+            .checked_div(TRANSITION_WORK)
+            .and_then(|window| window.checked_add(1))
+            .unwrap();
+        let overflow_window = Window::new(0, raw_overflow_window);
+        let reporting = raw.search_preflight(
+            raw_overflow_window,
+            overflow_window,
+            SearchLimits::unlimited(),
+        );
+        let compact = raw.search_value_preflight_validated(
+            raw_overflow_window,
+            SearchLimits::unlimited(),
+        );
+        assert_eq!(compact, reporting.clone().map(drop));
+        assert!(matches!(reporting, Err(SearchError::ArithmeticOverflow { .. })));
     }
 
     #[test]
