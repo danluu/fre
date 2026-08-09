@@ -1227,6 +1227,7 @@ impl CompiledModule {
         } else {
             None
         };
+        let mut complete_k0 = None;
 
         let slow_determinized = if optional_lowering.is_none() {
             program.native_slow_determinized_program(
@@ -1242,51 +1243,79 @@ impl CompiledModule {
             if let Some(candidate) = slow_determinized.as_ref() {
                 let view = program.native_slow_determinized_view(candidate);
                 let uses_partial_wrapper = view.collapse_partial_holes;
-                let lowered = if uses_partial_wrapper {
-                    lower_optional_native_slow_partial_with_data_limit(
-                        &program_bytes,
-                        view,
-                        target,
-                        effective_native_data_limit_bytes,
-                    )
+                // A retained slow prefix is useful only when the established
+                // compiler-owned K0 projection cannot close the same graph.
+                // Prefer that complete runtime-free table whenever it fits
+                // the caller's identical native-data budget; compile time is
+                // explicitly outside the optimizing mode's match-time goal.
+                let complete_k0_lowering = if uses_partial_wrapper {
+                    complete_k0 = program.native_fully_prefilled_program();
+                    complete_k0
+                        .as_ref()
+                        .map(|materialized| {
+                            lower_optional_native_dfa_with_data_limit(
+                                program.native_fully_prefilled_view(materialized),
+                                target,
+                                effective_native_data_limit_bytes,
+                            )
+                        })
+                        .transpose()?
+                        .flatten()
                 } else {
-                    lower_optional_native_dfa_with_data_limit(
-                        view,
-                        target,
-                        effective_native_data_limit_bytes,
-                    )
+                    None
                 };
-                match lowered {
-                    Ok(Some(lowering)) => {
-                        let native_data_bytes = if uses_partial_wrapper {
-                            lowering.data.len().checked_sub(program_bytes.len()).ok_or(
-                                CompileError::InternalInvariant(
-                                    "slow partial native data precedes its serialized program",
-                                ),
-                            )?
-                        } else {
-                            lowering.data.len()
-                        };
-                        slow_aot_report = Some(SlowAotReport {
-                            requested_limits,
+                if let Some(lowering) = complete_k0_lowering {
+                    optional_lowering = Some(lowering);
+                } else {
+                    let lowered = if uses_partial_wrapper {
+                        lower_optional_native_slow_partial_with_data_limit(
+                            &program_bytes,
+                            view,
+                            target,
                             effective_native_data_limit_bytes,
-                            determinization: candidate.report().clone(),
-                            dfa: candidate.stats(),
-                            allocation_bytes: candidate.allocation_bytes(),
-                            native_data_bytes,
-                        });
-                        slow_retained_forward_minimized =
-                            candidate.retained_forward_minimized();
-                        optional_lowering = Some(lowering);
+                        )
+                    } else {
+                        lower_optional_native_dfa_with_data_limit(
+                            view,
+                            target,
+                            effective_native_data_limit_bytes,
+                        )
+                    };
+                    match lowered {
+                        Ok(Some(lowering)) => {
+                            let native_data_bytes = if uses_partial_wrapper {
+                                lowering.data.len().checked_sub(program_bytes.len()).ok_or(
+                                    CompileError::InternalInvariant(
+                                        "slow partial native data precedes its serialized program",
+                                    ),
+                                )?
+                            } else {
+                                lowering.data.len()
+                            };
+                            slow_aot_report = Some(SlowAotReport {
+                                requested_limits,
+                                effective_native_data_limit_bytes,
+                                determinization: candidate.report().clone(),
+                                dfa: candidate.stats(),
+                                allocation_bytes: candidate.allocation_bytes(),
+                                native_data_bytes,
+                            });
+                            slow_retained_forward_minimized =
+                                candidate.retained_forward_minimized();
+                            optional_lowering = Some(lowering);
+                        }
+                        Ok(None) => {}
+                        Err(error) => return Err(error.into()),
                     }
-                    Ok(None) => {}
-                    Err(error) => return Err(error.into()),
                 }
             }
         }
         if optional_lowering.is_none() {
-            if let Some(materialized) = program.native_fully_prefilled_program() {
-                let view = program.native_fully_prefilled_view(&materialized);
+            if complete_k0.is_none() {
+                complete_k0 = program.native_fully_prefilled_program();
+            }
+            if let Some(materialized) = complete_k0.as_ref() {
+                let view = program.native_fully_prefilled_view(materialized);
                 optional_lowering = lower_optional_native_dfa_with_data_limit(
                     view,
                     target,
@@ -44268,11 +44297,104 @@ int main(void){{
                 slow_limits,
             )
             .expect("receipt-bearing slow partial compile");
-            assert!(compiled
-                .receipt()
-                .slow_aot
-                .as_ref()
-                .is_some_and(|report| report.determinization.decline.is_some()));
+            assert!(compiled.program().native_fully_prefilled_program().is_some());
+            assert!(compiled.receipt().slow_aot.is_none());
+            assert!(!compiled.receipt().runtime_helper_required);
+            assert!(compiled.module().slow_aot_report().is_none());
+            assert!(compiled.module().required_runtime_symbol().is_none());
+            assert!(compiled.module().prepared_entry_symbol().is_none());
+
+            // The complete compiler-owned K0 table wins when it and the
+            // partial wrapper both fit. If the caller gives enough native
+            // data only for the smaller retained prefix, preserve that
+            // wrapper rather than declining both optional routes.
+            let serialized = compiled.program().serialize().unwrap();
+            for target in [
+                Target::x86_64_linux(),
+                Target::aarch64_linux()
+                    .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                    .unwrap(),
+            ] {
+                let materialized = compiled
+                    .program()
+                    .native_fully_prefilled_program()
+                    .unwrap_or_else(|| panic!("missing complete K0: {output:?}/{target:?}"));
+                let k0 = lower_optional_native_dfa_with_data_limit(
+                    compiled
+                        .program()
+                        .native_fully_prefilled_view(&materialized),
+                    target,
+                    usize::MAX,
+                )
+                .unwrap()
+                .unwrap_or_else(|| panic!("unlowerable complete K0: {output:?}/{target:?}"));
+                let retained = compiled
+                    .program()
+                    .native_slow_determinized_program(
+                        slow_limits.determinize,
+                        slow_limits.max_allocation_bytes,
+                    )
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("missing retained prefix: {output:?}/{target:?}"));
+                let retained_view = compiled
+                    .program()
+                    .native_slow_determinized_view(&retained);
+                assert!(retained_view.collapse_partial_holes);
+                let partial = lower_optional_native_slow_partial_with_data_limit(
+                    &serialized,
+                    retained_view,
+                    target,
+                    usize::MAX,
+                )
+                .unwrap()
+                .unwrap_or_else(|| panic!("unlowerable retained prefix: {output:?}/{target:?}"));
+                let partial_native_bytes = partial
+                    .data
+                    .len()
+                    .checked_sub(serialized.len())
+                    .expect("combined partial table follows its serialized program");
+                assert!(
+                    partial_native_bytes < k0.data.len(),
+                    "fixture must separate the partial and complete budgets: {output:?}/{target:?}"
+                );
+
+                let preferred = CompiledModule::lower_optimizing_with_limits(
+                    compiled.program(),
+                    target,
+                    slow_limits,
+                )
+                .unwrap();
+                let expected_k0 = CompiledModule::lower_k0_optimizing_with_data_limit(
+                    compiled.program(),
+                    target,
+                    usize::MAX,
+                )
+                .unwrap();
+                assert!(preferred.slow_aot_report().is_none());
+                assert!(preferred.required_runtime_symbol().is_none());
+                assert_eq!(preferred.sections(), expected_k0.sections());
+                assert_eq!(preferred.symbols(), expected_k0.symbols());
+                assert_eq!(preferred.relocations(), expected_k0.relocations());
+
+                let constrained =
+                    CompiledModule::lower_optimizing_with_limits_and_native_data_limit(
+                        compiled.program(),
+                        target,
+                        slow_limits,
+                        partial_native_bytes,
+                    )
+                    .unwrap();
+                assert!(constrained.slow_aot_report().is_some());
+                assert_eq!(
+                    constrained.required_runtime_symbol(),
+                    Some(RUNTIME_SYMBOL_NAME)
+                );
+                assert!(constrained.prepared_entry_symbol().is_none());
+                assert_eq!(
+                    constrained.sections()[PROGRAM_SECTION].bytes().len() - serialized.len(),
+                    partial_native_bytes
+                );
+            }
             for pass in [
                 crate::OptimizationPass::UniversalOrderedTnfa,
                 crate::OptimizationPass::RemoveUnusedReverseMachine,
@@ -44280,10 +44402,13 @@ int main(void){{
                 crate::OptimizationPass::TargetInstructionSelection,
                 crate::OptimizationPass::FixedRegisterAssignment,
                 crate::OptimizationPass::CheckedBranchFixup,
-                crate::OptimizationPass::RuntimeAdapterLowering,
             ] {
                 assert!(compiled.receipt().passes.contains(&pass), "{output:?}/{pass:?}");
             }
+            assert!(!compiled
+                .receipt()
+                .passes
+                .contains(&crate::OptimizationPass::RuntimeAdapterLowering));
         }
     }
 
