@@ -6235,7 +6235,7 @@ impl DynamicNativeRowsWorkspace {
         {
             self.preflight_admission_settlements =
                 self.preflight_admission_settlements.saturating_add(1);
-            if self.state.native_entry_window.is_some() {
+            if self.state.native_entry_admission.is_some() {
                 self.preflight_admission_replacements =
                     self.preflight_admission_replacements.saturating_add(1);
             }
@@ -6404,9 +6404,10 @@ impl DynamicNativeRowsWorkspace {
 struct DynamicNativeRowsState {
     consecutive_deopts: u8,
     bypass_remaining: u16,
-    native_entry_window: Option<SearchWindow>,
-    native_entry_original_input_bytes: usize,
-    native_entry_after_mandatory_cut: bool,
+    // Liveness and its exact continuation provenance are one capability.
+    // Taking it invalidates the admission without separately clearing payload
+    // fields that no code may observe while the capability is absent.
+    native_entry_admission: Option<DynamicNativeRowsAdmission>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6417,6 +6418,12 @@ struct DynamicNativeRowsAdmission {
 }
 
 impl DynamicNativeRowsState {
+    #[cfg(test)]
+    fn native_entry_window(&self) -> Option<SearchWindow> {
+        self.native_entry_admission
+            .map(|admission| admission.window)
+    }
+
     fn settle_unobserved_local_entry(&mut self) {
         if self.take_native_entry_admission().is_some() {
             self.consecutive_deopts = 0;
@@ -6457,21 +6464,18 @@ impl DynamicNativeRowsState {
         original_input_bytes: usize,
         after_mandatory_cut: bool,
     ) -> bool {
-        if self.native_entry_window.is_some() {
+        if self.native_entry_admission.is_some() {
             self.consecutive_deopts = 0;
             self.bypass_remaining = 0;
         } else if self.bypass_remaining != 0 {
-            debug_assert_eq!(self.native_entry_original_input_bytes, 0);
-            debug_assert!(!self.native_entry_after_mandatory_cut);
             self.bypass_remaining = self.bypass_remaining.saturating_sub(1);
             return false;
-        } else {
-            debug_assert_eq!(self.native_entry_original_input_bytes, 0);
-            debug_assert!(!self.native_entry_after_mandatory_cut);
         }
-        self.native_entry_window = Some(window);
-        self.native_entry_original_input_bytes = original_input_bytes;
-        self.native_entry_after_mandatory_cut = after_mandatory_cut;
+        self.native_entry_admission = Some(DynamicNativeRowsAdmission {
+            window,
+            original_input_bytes,
+            after_mandatory_cut,
+        });
         true
     }
 
@@ -6494,23 +6498,13 @@ impl DynamicNativeRowsState {
     }
 
     fn settle_consumed_local_completion(&mut self) {
-        debug_assert!(self.native_entry_window.is_none());
-        debug_assert_eq!(self.native_entry_original_input_bytes, 0);
-        debug_assert!(!self.native_entry_after_mandatory_cut);
+        debug_assert!(self.native_entry_admission.is_none());
         self.consecutive_deopts = 0;
         self.bypass_remaining = 0;
     }
 
     fn take_native_entry_admission(&mut self) -> Option<DynamicNativeRowsAdmission> {
-        let window = self.native_entry_window.take()?;
-        let admission = DynamicNativeRowsAdmission {
-            window,
-            original_input_bytes: self.native_entry_original_input_bytes,
-            after_mandatory_cut: self.native_entry_after_mandatory_cut,
-        };
-        self.native_entry_original_input_bytes = 0;
-        self.native_entry_after_mandatory_cut = false;
-        Some(admission)
+        self.native_entry_admission.take()
     }
 
     /// Consume the exact window admitted for one generated dynamic-row scan.
@@ -15165,7 +15159,7 @@ mod tests {
         let dynamic = dynamic_rows(workspace);
         assert_eq!(dynamic.native_rows_dirty, dirty);
         assert_eq!(dynamic.native_rows_refreshes, refreshes);
-        assert_eq!(dynamic.state.native_entry_window, ticket);
+        assert_eq!(dynamic.state.native_entry_window(), ticket);
     }
 
     fn enter_dynamic_rows(
@@ -16133,7 +16127,7 @@ mod tests {
                 .as_deref()
                 .expect("dynamic state")
                 .state
-                .native_entry_window,
+                .native_entry_window(),
             None,
             "malformed postflight must consume the admission"
         );
@@ -16238,7 +16232,7 @@ mod tests {
             assert!(workspace
                 .dynamic_native_rows
                 .as_deref()
-                .is_some_and(|dynamic| dynamic.state.native_entry_window.is_none()));
+                .is_some_and(|dynamic| dynamic.state.native_entry_window().is_none()));
         }
 
         let capability = header
@@ -16410,7 +16404,7 @@ mod tests {
             .as_deref()
             .expect("consumed dynamic descriptor")
             .state;
-        assert_eq!(state.native_entry_window, None);
+        assert_eq!(state.native_entry_window(), None);
         assert_eq!(state.consecutive_deopts, 1);
         assert_eq!(state.bypass_remaining, 0);
 
@@ -16457,7 +16451,7 @@ mod tests {
             .as_deref()
             .expect("consumed stale descriptor")
             .state;
-        assert_eq!(state.native_entry_window, None);
+        assert_eq!(state.native_entry_window(), None);
         assert_eq!(state.consecutive_deopts, 1);
     }
 
@@ -16628,7 +16622,7 @@ mod tests {
             &dynamic.native_rows.learned_loop_rows[..learned_loop_rows.len()],
             learned_loop_rows.as_slice()
         );
-        assert_eq!(dynamic.state.native_entry_window, Some(window));
+        assert_eq!(dynamic.state.native_entry_window(), Some(window));
     }
 
     #[test]
@@ -16700,7 +16694,7 @@ mod tests {
             0
         );
         assert_eq!(dynamic.native_rows.rows_address, 0);
-        assert_eq!(dynamic.state.native_entry_window, None);
+        assert_eq!(dynamic.state.native_entry_window(), None);
         assert!(!dynamic.native_rows_dirty);
         assert_eq!(
             dynamic.native_rows_refreshes, 2,
@@ -16747,7 +16741,7 @@ mod tests {
                     .as_deref()
                     .expect("nullable dynamic workspace")
                     .state
-                    .native_entry_window,
+                    .native_entry_window(),
                 None,
                 "{phase}"
             );
@@ -16802,7 +16796,7 @@ mod tests {
         assert_ne!((address, cache_identity), (0, 0));
         let dynamic = workspace.dynamic_native_rows.as_deref().unwrap();
         assert_eq!(dynamic.native_rows.initial_flags, 0);
-        assert_eq!(dynamic.state.native_entry_window, Some(window));
+        assert_eq!(dynamic.state.native_entry_window(), Some(window));
     }
 
     #[test]
@@ -16833,7 +16827,7 @@ mod tests {
             workspace
                 .dynamic_native_rows
                 .as_deref()
-                .is_some_and(|dynamic| dynamic.state.native_entry_window.is_none())
+                .is_some_and(|dynamic| dynamic.state.native_entry_window().is_none())
         );
 
         let variable_span = program(
@@ -16867,7 +16861,7 @@ mod tests {
             span_workspace
                 .dynamic_native_rows
                 .as_deref()
-                .is_some_and(|dynamic| dynamic.state.native_entry_window.is_none()),
+                .is_some_and(|dynamic| dynamic.state.native_entry_window().is_none()),
             "nullable Span must complete without publishing an admission ticket"
         );
     }
@@ -16983,7 +16977,7 @@ mod tests {
         let dynamic = dynamic_rows(&workspace);
         assert_eq!(dynamic.preflight_admission_settlements, 4);
         assert_eq!(dynamic.preflight_admission_replacements, 0);
-        assert!(dynamic.state.native_entry_window.is_none());
+        assert!(dynamic.state.native_entry_window().is_none());
     }
 
     #[test]
@@ -17120,7 +17114,7 @@ mod tests {
                     let dynamic = dynamic_rows(&workspace);
                     assert_eq!(dynamic.preflight_admission_settlements, 3);
                     assert_eq!(dynamic.preflight_admission_replacements, 1);
-                    assert_eq!(dynamic.state.native_entry_window, Some(window));
+                    assert_eq!(dynamic.state.native_entry_window(), Some(window));
                 }));
             }
             for worker in workers {
@@ -21921,29 +21915,19 @@ mod tests {
                 "warm {output:?}"
             );
             assert_ne!((address, cache_identity), (0, 0), "warm {output:?}");
-            assert_eq!(
-                dynamic_workspace
-                    .dynamic_native_rows
-                    .as_deref()
-                    .expect("dynamic descriptor")
-                    .state
-                    .native_entry_window,
-                Some(narrowed),
-                "warm {output:?} ticket"
-            );
             let dynamic_state = &dynamic_workspace
                 .dynamic_native_rows
                 .as_deref()
                 .expect("dynamic descriptor")
                 .state;
             assert_eq!(
-                dynamic_state.native_entry_original_input_bytes,
-                original.end - original.start,
-                "warm {output:?} original byte basis"
-            );
-            assert!(
-                dynamic_state.native_entry_after_mandatory_cut,
-                "warm {output:?} must retain post-cut provenance"
+                dynamic_state.native_entry_admission,
+                Some(DynamicNativeRowsAdmission {
+                    window: narrowed,
+                    original_input_bytes: original.end - original.start,
+                    after_mandatory_cut: true,
+                }),
+                "warm {output:?} ticket and provenance"
             );
 
             let absent = vec![b'!'; haystack.len()];
@@ -21972,7 +21956,7 @@ mod tests {
                     .as_deref()
                     .expect("dynamic descriptor")
                     .state
-                    .native_entry_window,
+                    .native_entry_window(),
                 None,
                 "exhausted {output:?} must settle the prior ticket"
             );
@@ -22032,17 +22016,8 @@ mod tests {
                 .as_deref()
                 .expect("wire dynamic descriptor")
                 .state;
-            assert_eq!(deopt_state.native_entry_window, None, "wire deopt {output:?}");
+            assert_eq!(deopt_state.native_entry_admission, None, "wire deopt {output:?}");
             assert_eq!(deopt_state.consecutive_deopts, 1, "wire deopt {output:?}");
-            assert_eq!(
-                deopt_state.native_entry_original_input_bytes,
-                0,
-                "wire deopt {output:?} consumed original byte provenance"
-            );
-            assert!(
-                !deopt_state.native_entry_after_mandatory_cut,
-                "wire deopt {output:?} consumed post-cut provenance"
-            );
             let (wire_reentered, _, wire_cache_identity) = restored
                 .preflight_dynamic_native_rows_with_workspace(
                     &haystack,
@@ -22306,13 +22281,15 @@ mod tests {
             );
             let descriptor = dynamic.native_rows;
             assert_eq!(descriptor.cache_identity, cache_identity, "{output:?}");
-            assert_eq!(dynamic.state.native_entry_window, Some(narrowed), "{output:?}");
             assert_eq!(
-                dynamic.state.native_entry_original_input_bytes,
-                original.end - original.start,
-                "{output:?}"
+                dynamic.state.native_entry_admission,
+                Some(DynamicNativeRowsAdmission {
+                    window: narrowed,
+                    original_input_bytes: original.end - original.start,
+                    after_mandatory_cut: true,
+                }),
+                "{output:?} admission and post-cut provenance"
             );
-            assert!(dynamic.state.native_entry_after_mandatory_cut, "{output:?}");
             {
                 let projection = workspace
                     .nfa
