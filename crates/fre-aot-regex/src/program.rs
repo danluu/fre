@@ -11163,22 +11163,13 @@ impl CompiledProgram {
             .map_err(CompileError::from)
     }
 
-    /// Authenticate and lazily graph-bind one transient static-prefix
-    /// continuation descriptor, then admit its exact synchronous window.
-    #[doc(hidden)]
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the compiler-private preflight binds artifact, object sidecar, workspace, and exact call"
-    )]
-    pub fn preflight_static_prefix_resume_with_workspace(
+    fn validate_static_prefix_object_context(
         &self,
         haystack: &[u8],
         window: SearchWindow,
-        workspace: &mut ProgramWorkspace,
+        workspace: &ProgramWorkspace,
         expected_artifact_identity: [u8; 32],
-        descriptor_binding: usize,
-        descriptor: &[u32],
-    ) -> Result<RetainedPartialPreflight, CompileError> {
+    ) -> Result<(), CompileError> {
         if window.start > window.end || window.end > haystack.len() {
             return Err(CompileError::InvalidWindow {
                 start: window.start,
@@ -11188,14 +11179,101 @@ impl CompiledProgram {
         }
         if expected_artifact_identity != self.identity.artifact
             || !workspace.identity.compatible(&self.identity)
-            || descriptor_binding == 0
             || self.context_dfa.is_some()
             || !matches!(self.engine, ProgramEngine::OrderedNfa)
             || self.automaton.stats().has_assertions()
-            || window.end.saturating_sub(window.start) < PARTIAL_DFA_MIN_INPUT_BYTES
         {
             return Err(CompileError::InternalInvariant(
-                "static-prefix resume preflight rejected its artifact, graph, sidecar, or window",
+                "static-prefix object rejected its artifact, workspace, or graph",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Return whether whole-window graph proofs have a structurally admitted
+    /// chance to beat a transient native prefix.
+    ///
+    /// The ordinary retained-row crossover already amortizes the fixed helper
+    /// and SIMD-scanner costs at this boundary. Reusing it avoids taxing short
+    /// native-local searches, while requiring an actual suffix or cut sidecar
+    /// avoids entering an empty portable prepass.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn compiler_private_static_prefix_complete_proofs_should_run(
+        &self,
+        input_bytes: usize,
+    ) -> bool {
+        input_bytes >= PARTIAL_DFA_MIN_INPUT_BYTES
+            && (self.nfa_mandatory_suffix.is_some() || self.nfa_mandatory_cut.is_some())
+    }
+
+    /// Run only complete whole-window proofs before a transient static prefix.
+    ///
+    /// This stage deliberately does not read or bind the compiler-owned resume
+    /// descriptor. An inconclusive cut cannot narrow the window because every
+    /// emitted frontier was constructed for the original exact window.
+    #[doc(hidden)]
+    pub fn preflight_static_prefix_complete_proofs_with_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+        expected_artifact_identity: [u8; 32],
+    ) -> Result<RetainedPartialPreflight, CompileError> {
+        self.validate_static_prefix_object_context(
+            haystack,
+            window,
+            workspace,
+            expected_artifact_identity,
+        )?;
+        if !self.compiler_private_static_prefix_complete_proofs_should_run(
+            window.end.saturating_sub(window.start),
+        ) {
+            return Ok(RetainedPartialPreflight::Enter(window));
+        }
+
+        if let Some(state) = workspace.static_prefix_resume.as_deref_mut() {
+            state.ticket = None;
+        }
+        workspace.mark_dynamic_native_rows_dirty();
+        let nfa = workspace.nfa.as_mut().ok_or(
+            CompileError::InternalInvariant(
+                "static-prefix complete preflight has no prepared K0 workspace",
+            ),
+        )?;
+        match self.search_nfa_with_retained_complete_accelerators(haystack, window, nfa)? {
+            NfaMandatoryCutOutcome::Complete(found) => {
+                Ok(RetainedPartialPreflight::Complete(found))
+            }
+            NfaMandatoryCutOutcome::Continue(_) => Ok(RetainedPartialPreflight::Enter(window)),
+        }
+    }
+
+    /// Lazily graph-bind one transient static-prefix continuation descriptor
+    /// only after generated code reaches a hole, then admit its exact window.
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the compiler-private hole binding authenticates object sidecar, workspace, and exact call"
+    )]
+    pub fn bind_static_prefix_resume_with_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+        expected_artifact_identity: [u8; 32],
+        descriptor_binding: usize,
+        descriptor: &[u32],
+    ) -> Result<(), CompileError> {
+        self.validate_static_prefix_object_context(
+            haystack,
+            window,
+            workspace,
+            expected_artifact_identity,
+        )?;
+        if descriptor_binding == 0 {
+            return Err(CompileError::InternalInvariant(
+                "static-prefix hole binding rejected its descriptor address",
             ));
         }
         let already_bound = workspace
@@ -11226,33 +11304,6 @@ impl CompiledProgram {
             }));
         }
 
-        workspace.mark_dynamic_native_rows_dirty();
-        let completed = {
-            let nfa = workspace.nfa.as_mut().ok_or(
-                CompileError::InternalInvariant(
-                    "static-prefix resume preflight has no prepared K0 workspace",
-                ),
-            )?;
-            if let Some(found) =
-                self.search_nfa_with_mandatory_suffix(haystack, window, nfa)?
-            {
-                Some(found)
-            } else {
-                match self.search_nfa_with_mandatory_cut(haystack, window) {
-                    NfaMandatoryCutOutcome::Complete(found) => Some(found),
-                    // The retained frontier was constructed for the original
-                    // window. A cut may prove a narrower root start, but only
-                    // a complete proof can bypass that exact continuation.
-                    NfaMandatoryCutOutcome::Continue(_) => None,
-                }
-            }
-        };
-        if let Some(found) = completed {
-            if let Some(state) = workspace.static_prefix_resume.as_deref_mut() {
-                state.ticket = None;
-            }
-            return Ok(RetainedPartialPreflight::Complete(found));
-        }
         workspace
             .static_prefix_resume
             .as_deref_mut()
@@ -11260,7 +11311,7 @@ impl CompiledProgram {
                 "static-prefix resume preflight did not retain its sidecar",
             ))?
             .admit(haystack, window);
-        Ok(RetainedPartialPreflight::Enter(window))
+        Ok(())
     }
 
     /// Continue from the exact frontier and first unconsumed byte returned by

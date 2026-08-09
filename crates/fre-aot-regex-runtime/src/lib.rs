@@ -50,11 +50,12 @@
 //! [`fre_aot_regex_runtime_search_exclusive_from_partial_v1`] remains available
 //! for older generated objects.
 //! A resource-bounded slow compiler can keep a larger transient native prefix
-//! outside the stable program format. Its V2 static-prefix preflight retains a
-//! cheap synchronous object ticket; only a native hole parses and binds the
-//! emitted exact frontier descriptor before compact continuation proceeds
-//! without replaying completed rows. Older V1 static-prefix objects remain
-//! supported.
+//! outside the stable program format. Its V2 static-prefix preflight first
+//! tries admitted complete graph proofs, then retains a cheap synchronous
+//! object ticket when native execution is still needed. Only a native hole
+//! parses and binds the emitted exact frontier descriptor before compact
+//! continuation proceeds without replaying completed rows. Older V1
+//! static-prefix objects remain supported.
 //! A variable-width Span table that completes locally with only its selected
 //! endpoint uses
 //! [`fre_aot_regex_runtime_search_exclusive_recover_partial_span_v1`] to
@@ -415,8 +416,8 @@ pub struct PreparedAotRegex {
 
 /// One generated static-prefix invocation awaiting either a native hole or a
 /// Span postflight. Keeping this raw object ticket outside `ProgramWorkspace`
-/// lets the common all-native path avoid descriptor parsing, graph binding,
-/// cache prefill, and portable whole-window proofs.
+/// lets an all-native path avoid descriptor parsing, graph binding, and cache
+/// prefill; short windows also avoid touching portable executor workspace.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct StaticPrefixObjectTicket {
     haystack_address: usize,
@@ -810,16 +811,40 @@ impl PreparedAotRegex {
         }
     }
 
-    fn preflight_static_prefix_resume(
+    fn preflight_static_prefix_complete_proofs(
+        &mut self,
+        haystack: &[u8],
+        window: SearchWindow,
+        expected_artifact_identity: [u8; ARTIFACT_IDENTITY_BYTES],
+    ) -> Result<RetainedPartialPreflight, CompileError> {
+        if !self
+            .program
+            .compiler_private_static_prefix_complete_proofs_should_run(
+                window.end().saturating_sub(window.start()),
+            )
+        {
+            return Ok(RetainedPartialPreflight::Enter(window));
+        }
+        self.deactivate_frozen_header();
+        self.program
+            .preflight_static_prefix_complete_proofs_with_workspace(
+                haystack,
+                window,
+                &mut self.workspace,
+                expected_artifact_identity,
+            )
+    }
+
+    fn bind_static_prefix_resume(
         &mut self,
         haystack: &[u8],
         window: SearchWindow,
         expected_artifact_identity: [u8; ARTIFACT_IDENTITY_BYTES],
         descriptor_binding: usize,
         descriptor: &[u32],
-    ) -> Result<RetainedPartialPreflight, CompileError> {
+    ) -> Result<(), CompileError> {
         self.deactivate_frozen_header();
-        self.program.preflight_static_prefix_resume_with_workspace(
+        self.program.bind_static_prefix_resume_with_workspace(
             haystack,
             window,
             &mut self.workspace,
@@ -1773,12 +1798,13 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_compiler_private_search_exclusive
 /// Authenticate one compiler-owned static-prefix object and admit one
 /// synchronous native search window.
 ///
-/// Unlike V1, this preflight retains the descriptor address along with the
-/// exact haystack and window. It deliberately does not read the descriptor,
-/// bind its frontiers, fill K0 caches, or run portable fallback proofs. Those
-/// costs are deferred until native code reaches a hole. Generated code must
-/// consume the ticket through either the matching continuation or Span
-/// postflight.
+/// Unlike V1, this preflight can first run graph-derived complete suffix/cut
+/// proofs when the ordinary retained-row crossover admits their fixed cost.
+/// An inconclusive proof retains the descriptor address with the exact
+/// haystack and window, but does not read the descriptor, bind its frontiers,
+/// or fill K0 caches. Those costs remain deferred until native code reaches a
+/// hole. Generated code must consume the ticket through either the matching
+/// continuation or Span postflight.
 ///
 /// This private object/runtime seam is intentionally absent from the public C
 /// header. The descriptor is object data, not stable serialized-program data.
@@ -1827,17 +1853,32 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_compiler_private_search_exclusive
     }
 
     // SAFETY: the caller supplies the live exclusive owner and every extent
-    // documented above. This common-path preflight reads only the identity and
-    // haystack extents; descriptor access is deferred to the hole continuation.
+    // documented above. Descriptor access is deferred to the hole continuation;
+    // the optional portable stage uses only the authenticated program/window.
     catch_unwind(AssertUnwindSafe(|| unsafe {
         let haystack = std::slice::from_raw_parts(haystack_ptr, haystack_len);
         let expected_artifact_identity = expected_artifact_identity_ptr
             .cast::<[u8; ARTIFACT_IDENTITY_BYTES]>()
             .read();
         let prepared = &mut *handle.0.cast::<PreparedAotRegex>();
+        prepared.static_prefix_object_ticket = None;
+        let window = SearchWindow::new(window_start, window_end);
+        let Ok(preflight) = prepared.preflight_static_prefix_complete_proofs(
+            haystack,
+            window,
+            expected_artifact_identity,
+        ) else {
+            return STATUS_RUNTIME_FAILURE;
+        };
+        if let RetainedPartialPreflight::Complete(found) = preflight {
+            let (status, result) = encode_match_result(found);
+            result_ptr.write(result);
+            return status;
+        }
+        debug_assert_eq!(preflight, RetainedPartialPreflight::Enter(window));
         let Ok(()) = prepared.admit_static_prefix_object(
             haystack,
-            SearchWindow::new(window_start, window_end),
+            window,
             expected_artifact_identity,
             descriptor_ptr.expose_provenance(),
         ) else {
@@ -1919,7 +1960,7 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_compiler_private_search_exclusive
             return STATUS_RUNTIME_FAILURE;
         }
         let descriptor = std::slice::from_raw_parts(descriptor_ptr, total_words);
-        let Ok(preflight) = prepared.preflight_static_prefix_resume(
+        let Ok(()) = prepared.bind_static_prefix_resume(
             haystack,
             ticket.window,
             *prepared.frozen_header.artifact_identity(),
@@ -1928,12 +1969,6 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_compiler_private_search_exclusive
         ) else {
             return STATUS_RUNTIME_FAILURE;
         };
-        if let RetainedPartialPreflight::Complete(found) = preflight {
-            let (status, result) = encode_match_result(found);
-            result_ptr.write(result);
-            return status;
-        }
-        debug_assert_eq!(preflight, RetainedPartialPreflight::Enter(ticket.window));
         let Ok(found) = prepared.search_from_static_prefix_resume_ticket(
             haystack,
             resume_state,
@@ -7430,6 +7465,93 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
                     &raw mut result,
                     identity.as_ptr(),
                     haystack.len(),
+                )
+            },
+            STATUS_RUNTIME_FAILURE
+        );
+        assert_eq!(result, sentinel);
+
+        // SAFETY: this test owns the unique live handle and no call overlaps
+        // destruction.
+        assert_eq!(
+            unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(handle) },
+            STATUS_SUCCESS
+        );
+    }
+
+    #[test]
+    fn static_prefix_v2_complete_proofs_use_the_retained_row_crossover() {
+        let mut limits = CompileLimitsV1::default();
+        limits.determinize.max_states = 0;
+        let compiled = compile(
+            CompileRequest::new("(?:x|yz)7[A-Za-z]{1,2}", Target::x86_64_linux())
+                .mode(CompileMode::Optimizing)
+                .limits(limits)
+                .output(OutputContract::Span),
+        )
+        .expect("compile static-prefix V2 proof fixture");
+        assert!(!compiled
+            .program()
+            .compiler_private_static_prefix_complete_proofs_should_run(255));
+        assert!(compiled
+            .program()
+            .compiler_private_static_prefix_complete_proofs_should_run(256));
+        let identity = compiled.receipt().program_sha256;
+        let serialized = compiled.program().serialize().expect("serialize fixture");
+        let handle = prepare_exclusive(&serialized);
+        let descriptor = [0_u32; STATIC_PREFIX_RESUME_DESCRIPTOR_V1_HEADER_BYTES / 4];
+        let short = vec![b'x'; 255];
+        let long = vec![b'x'; 256];
+        let sentinel = FreAotRegexResultV1 {
+            start: 0xfeed_face,
+            end: 0xdead_beef,
+        };
+        let mut result = sentinel;
+
+        assert_eq!(
+            call_exclusive_static_prefix_preflight_v2(
+                handle,
+                &short,
+                0,
+                short.len(),
+                &mut result,
+                &identity,
+                &descriptor,
+            ),
+            STATUS_PARTIAL_PREFLIGHT_ENTER
+        );
+        assert_eq!(result, sentinel);
+        assert!(exclusive_frozen_header_is_active(handle));
+
+        result = sentinel;
+        assert_eq!(
+            call_exclusive_static_prefix_preflight_v2(
+                handle,
+                &long,
+                0,
+                long.len(),
+                &mut result,
+                &identity,
+                &descriptor,
+            ),
+            STATUS_NO_MATCH
+        );
+        assert_eq!(result, FreAotRegexResultV1::default());
+        assert!(!exclusive_frozen_header_is_active(handle));
+
+        result = sentinel;
+        // A complete proof clears the earlier short-window ticket and does not
+        // admit a replacement, so no malformed descriptor can be consumed.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_continue_v1(
+                    handle,
+                    long.as_ptr(),
+                    long.len(),
+                    &raw mut result,
+                    0,
+                    128,
+                    0,
                 )
             },
             STATUS_RUNTIME_FAILURE
