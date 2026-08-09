@@ -167,8 +167,7 @@ impl Default for SlowAotLimits {
     }
 }
 
-/// Provenance for a slow complete DFA or transient completed-row prefix
-/// selected into a native module.
+/// Provenance for a slow complete DFA selected into a native module.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SlowAotReport {
     /// Limits requested at the optimizing compiler API boundary.
@@ -180,8 +179,7 @@ pub struct SlowAotReport {
     /// Peak conservative logical allocation charged by determinization.
     pub allocation_bytes: usize,
     /// Read-only native DFA payload, including alignment, installed auxiliary
-    /// scanners, and target-specific sidecar tables. The semantic program
-    /// bytes used by a partial wrapper's whole-search deopt are excluded.
+    /// scanners, and target-specific sidecar tables.
     pub native_data_bytes: usize,
 }
 
@@ -1122,12 +1120,13 @@ impl CompiledModule {
     ///
     /// In addition to every route considered by [`Self::lower`], this may
     /// re-run contextual or assertion-free ordered determinization under
-    /// explicit resource ceilings. A numeric refusal after completing
-    /// assertion-free rows may lower a complete graph directly, including
-    /// retained reverse start recovery, or place a genuinely incomplete
-    /// prefix behind whole-search runtime deoptimization. Otherwise the
-    /// compiler may complete an assertion-free resource fallback's bounded K0
-    /// state graph.
+    /// explicit resource ceilings. A late numeric refusal may still leave a
+    /// complete forward graph that lowers directly, including retained reverse
+    /// start recovery. Otherwise the compiler attempts to close an incomplete
+    /// graph through the bounded K0 projection. If that complete table cannot
+    /// fit, it preserves the ordinary persistent prepared fallback instead of
+    /// publishing a raw entry that rebuilds state and replays the whole search
+    /// at every hole.
     /// This can take substantially longer than ordinary lowering.
     /// Callers re-lowering a restored or otherwise untrusted program must opt
     /// in explicitly; a serialized optimizer marker never authorizes this

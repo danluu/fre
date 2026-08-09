@@ -7978,9 +7978,12 @@ impl CompiledProgram {
     ///
     /// Allocation exhaustion is an optimization decline. A state,
     /// transition, or work refusal after at least one complete row may retain
-    /// that already-owned prefix. A complete late-stage artifact can lower
-    /// directly; a genuinely incomplete prefix requires native whole-search
-    /// deoptimization. Structural compiler failures remain typed errors.
+    /// that already-owned prefix as an optimizer candidate. A complete
+    /// late-stage artifact can lower directly. Current module selection tries
+    /// to close a genuinely incomplete prefix through K0, then declines to the
+    /// persistent prepared route if completion cannot fit; the raw replaying
+    /// wrapper remains only as a legacy object-ABI compatibility emitter.
+    /// Structural compiler failures remain typed errors.
     pub(crate) fn native_slow_determinized_program(
         &self,
         limits: DeterminizeLimits,
