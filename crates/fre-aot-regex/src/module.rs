@@ -44346,12 +44346,7 @@ int main(void){{
             // data only for the smaller prefix, decline its replaying public
             // wrapper and preserve the ordinary persistent fallback.
             let serialized = compiled.program().serialize().unwrap();
-            for target in [
-                Target::x86_64_linux(),
-                Target::aarch64_linux()
-                    .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
-                    .unwrap(),
-            ] {
+            for target in identity_target_matrix() {
                 let materialized = compiled
                     .program()
                     .native_fully_prefilled_program()
@@ -44363,8 +44358,21 @@ int main(void){{
                     target,
                     usize::MAX,
                 )
-                .unwrap()
-                .unwrap_or_else(|| panic!("unlowerable complete K0: {output:?}/{target:?}"));
+                .unwrap();
+                let Some(k0) = k0 else {
+                    let declined = CompiledModule::lower_optimizing_with_limits(
+                        compiled.program(),
+                        target,
+                        slow_limits,
+                    )
+                    .unwrap();
+                    let ordinary = CompiledModule::lower(compiled.program(), target).unwrap();
+                    assert!(declined.slow_aot_report().is_none());
+                    assert_eq!(declined.sections(), ordinary.sections());
+                    assert_eq!(declined.symbols(), ordinary.symbols());
+                    assert_eq!(declined.relocations(), ordinary.relocations());
+                    continue;
+                };
                 let retained = compiled
                     .program()
                     .native_slow_determinized_program(
