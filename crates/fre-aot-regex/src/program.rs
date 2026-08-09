@@ -11089,7 +11089,15 @@ impl CompiledProgram {
             ));
         }
 
-        let input_bytes = window.end.saturating_sub(window.start);
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "the trusted V3 contract proves exact-window subtraction cannot underflow"
+        )]
+        let input_bytes = if TRUSTED_V3 {
+            window.end - window.start
+        } else {
+            window.end.saturating_sub(window.start)
+        };
         let has_mandatory_cut = self.nfa_mandatory_cut.is_some();
         let mut window = window;
         let mut initial_pending = false;
@@ -17011,6 +17019,80 @@ mod tests {
                 worker.join().expect("independent dynamic-row worker");
             }
         });
+    }
+
+    #[test]
+    fn trusted_v3_window_subtraction_matches_checked_exact_windows() {
+        let compiled = program(
+            "(?:ab|ac)+z",
+            OutputContract::Exists,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        let mut haystack = vec![b'!'; 80];
+        for pair in haystack[8..70].chunks_exact_mut(2) {
+            pair.copy_from_slice(b"ab");
+        }
+        haystack[70] = b'z';
+        let identity = compiled.artifact_identity();
+
+        for window in [
+            SearchWindow::new(0, 0),
+            SearchWindow::new(8, 8),
+            SearchWindow::new(haystack.len(), haystack.len()),
+            SearchWindow::new(8, 72),
+            SearchWindow::full(&haystack),
+        ] {
+            let mut checked = compiled
+                .prepare_workspace()
+                .expect("checked exact-window workspace");
+            let mut trusted = compiled
+                .prepare_workspace()
+                .expect("trusted exact-window workspace");
+            for round in 0..3 {
+                let (checked_outcome, checked_address, checked_cache_identity) = compiled
+                    .preflight_dynamic_native_rows_with_workspace(
+                        &haystack,
+                        window,
+                        &mut checked,
+                        identity,
+                    )
+                    .expect("checked exact-window preflight");
+                let (trusted_outcome, trusted_address, trusted_cache_identity) = compiled
+                    .compiler_private_preflight_dynamic_native_rows_v3_with_workspace(
+                        &haystack,
+                        window,
+                        &mut trusted,
+                        identity,
+                    )
+                    .expect("trusted exact-window preflight");
+                assert_eq!(trusted_outcome, checked_outcome, "{window:?}/round {round}");
+                assert_eq!(
+                    trusted_address != 0,
+                    checked_address != 0,
+                    "{window:?}/round {round} descriptor"
+                );
+                assert_eq!(
+                    trusted_cache_identity != 0,
+                    checked_cache_identity != 0,
+                    "{window:?}/round {round} cache"
+                );
+
+                for workspace in [&checked, &trusted] {
+                    let state = &dynamic_rows(workspace).state;
+                    if matches!(checked_outcome, RetainedPartialPreflight::Enter(_)) {
+                        assert_eq!(checked_outcome, RetainedPartialPreflight::Enter(window));
+                        assert_eq!(
+                            state.native_entry_original_input_bytes,
+                            window.end.saturating_sub(window.start),
+                            "{window:?}/round {round} admitted length"
+                        );
+                    } else {
+                        assert!(state.native_entry_window.is_none());
+                    }
+                }
+            }
+        }
     }
 
     fn authentic_partial_resume(
