@@ -29622,7 +29622,7 @@ mod tests {
     }
 
     #[test]
-    fn reused_k0_value_iterators_cache_only_broad_unlimited_source_routes() {
+    fn reused_k0_value_iterators_cache_scanner_routes_only_for_unlimited_runs() {
         fn plain_forced_k0(pattern: &str) -> PortableRegex {
             let mut regex = PortableBuilder::new(pattern)
                 .unicode(false)
@@ -29750,13 +29750,7 @@ mod tests {
             let expected = cold.collect::<Result<Vec<_>, _>>().unwrap();
             let warm = session
                 .find_iter_value(haystack, PortableFindIterRunLimits::unlimited());
-            assert!(
-                matches!(
-                    &warm.state,
-                    super::PortableValueMatchIterState::General(_)
-                ),
-                "warm pattern={pattern}"
-            );
+            assert!(is_source_bound(&warm.state), "warm pattern={pattern}");
             assert_eq!(warm.collect::<Result<Vec<_>, _>>().unwrap(), expected);
             let PortableSearchSessionPlan::K0 {
                 exclusive_route_state,
@@ -29767,7 +29761,7 @@ mod tests {
             };
             assert_eq!(
                 exclusive_route_state.value_iter_route(),
-                super::K0ValueIterRoute::General
+                super::K0ValueIterRoute::SourceBound
             );
         }
     }

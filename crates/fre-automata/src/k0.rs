@@ -7258,12 +7258,13 @@ impl<'a> K0SearchSession<'a> {
         self.root_run.is_some()
     }
 
-    /// Whether value-only span iteration can reuse source-bound scanner state.
+    /// Whether value-only span iteration can use source-bound scanner state.
     ///
     /// A cold proof returns `None` so the ordinary value entry performs the
-    /// first search and publication. Narrow `memchr` scanners and contextual
-    /// plans return `Some(false)` because they cannot publish a reusable
-    /// classifier mask.
+    /// first search and publication. Wide classifiers may additionally retain
+    /// one unconsumed mask, while narrow `memchr` scanners use the same direct
+    /// route without publishing cross-call lanes. Contextual plans and proofs
+    /// without a scanner return `Some(false)`.
     #[doc(hidden)]
     #[must_use]
     #[inline]
@@ -7282,14 +7283,12 @@ impl<'a> K0SearchSession<'a> {
             return Some(false);
         }
         let proof = self.automaton.start_filter_proof.get()?;
-        Some(proof.scanner.as_ref().is_some_and(|scanner| {
-            matches!(
-                scanner.scanner,
-                StartScanner::Range { .. }
-                    | StartScanner::AsciiSet { .. }
-                    | StartScanner::Set(_)
-            )
-        }))
+        Some(
+            proof
+                .scanner
+                .as_ref()
+                .is_some_and(|scanner| !matches!(scanner.scanner, StartScanner::Empty)),
+        )
     }
 
     /// Whether ordinary reused K0 can represent its full work certificate.
