@@ -3018,6 +3018,29 @@ pub struct FrozenDynamicRowsStorageV3 {
     descriptor_v6: Option<FrozenDynamicRowsV6>,
 }
 
+/// Independently owned dense table that may be entered only from an already
+/// authenticated arbitrary-state continuation.
+///
+/// The private newtype prevents callers outside this module from accidentally
+/// supplying a root-scanner-independent V13/V14 owner to the ordinary public
+/// prepared-header publisher. Compiler-private continuation projection and
+/// publication APIs unwrap it only after authenticating the exact resume
+/// ticket for which the owner was built.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct FrozenDenseContinuationRowsStorageV1 {
+    rows: FrozenDynamicRowsStorageV3,
+}
+
+impl FrozenDenseContinuationRowsStorageV1 {
+    /// Return the exact dense generation owned by this continuation sidecar.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn compiler_private_format_version(&self) -> u32 {
+        self.rows.descriptor.format_version
+    }
+}
+
 /// Result of continuing an already-consumed static prefix in an immutable
 /// supertransition table.  The endpoint is sufficient for every value
 /// contract: `Exists` observes only presence, `SelectedEnd` returns it directly,
@@ -9369,16 +9392,98 @@ impl CompiledProgram {
     /// map is retained inline for publication.
     #[doc(hidden)]
     #[must_use]
-    #[allow(
-        clippy::too_many_lines,
-        reason = "one fail-closed setup transaction authenticates, compacts, and closes the complete projection"
-    )]
     pub fn compiler_private_frozen_dynamic_rows_storage_v3_with_fallback_receipt(
         &self,
         workspace: &mut ProgramWorkspace,
         fully_prefilled_fallback: Option<FullyPrefilledFallbackReceipt>,
         max_k0_bytes: usize,
         max_packed_bytes: usize,
+    ) -> Option<FrozenDynamicRowsStorageV3> {
+        self.compiler_private_frozen_dynamic_rows_storage_v3_with_fallback_receipt_policy(
+            workspace,
+            fully_prefilled_fallback,
+            max_k0_bytes,
+            max_packed_bytes,
+            false,
+        )
+    }
+
+    /// Build an independently owned dense continuation table from the same
+    /// authenticated complete K0 transaction used by the public root owner.
+    ///
+    /// This owner is only authority for an already admitted arbitrary-state
+    /// continuation. It must never be published at the public root entry, so
+    /// an otherwise mandatory root scanner does not exclude exact V13/V14
+    /// composition. A geometry or resource decline returns no side owner and
+    /// leaves the ordinary root-compatible owner unchanged.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn compiler_private_frozen_dense_continuation_rows_storage_v3_with_fallback_receipt(
+        &self,
+        workspace: &mut ProgramWorkspace,
+        fully_prefilled_fallback: Option<FullyPrefilledFallbackReceipt>,
+        max_k0_bytes: usize,
+        max_packed_bytes: usize,
+    ) -> Option<FrozenDenseContinuationRowsStorageV1> {
+        let storage = self
+            .compiler_private_frozen_dynamic_rows_storage_v3_with_fallback_receipt_policy(
+                workspace,
+                fully_prefilled_fallback,
+                max_k0_bytes,
+                max_packed_bytes,
+                true,
+            )?;
+        matches!(
+            storage.descriptor.format_version,
+            FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION | FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION
+        )
+        .then_some(FrozenDenseContinuationRowsStorageV1 { rows: storage })
+    }
+
+    /// Publish a dense side owner only for the authenticated local
+    /// continuation entry. The distinct owner type makes this the sole
+    /// external publication route and keeps public-root header construction
+    /// unable to unwrap the scanner-independent table.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn compiler_private_frozen_dense_continuation_prepared_header_v6(
+        &self,
+        workspace: &ProgramWorkspace,
+        owner: &FrozenDenseContinuationRowsStorageV1,
+    ) -> Option<FrozenPreparedHeaderV6> {
+        if workspace.identity.instance != self.identity.instance
+            || !owner.rows.descriptor_is_valid_for(self.identity)
+            || !owner.rows.descriptor_v6_is_valid_for(self.identity)
+        {
+            return None;
+        }
+        let header = self.compiler_private_frozen_prepared_header_v6(
+            workspace,
+            None,
+            Some(&owner.rows),
+        );
+        let format_version = owner.compiler_private_format_version();
+        (header.has_dynamic_rows()
+            && header.dynamic_rows_v6.compact.format_version == format_version
+            && matches!(
+                format_version,
+                FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION
+                    | FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION
+            ))
+        .then_some(header)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one fail-closed setup transaction authenticates, compacts, and closes the complete projection"
+    )]
+    fn compiler_private_frozen_dynamic_rows_storage_v3_with_fallback_receipt_policy(
+        &self,
+        workspace: &mut ProgramWorkspace,
+        fully_prefilled_fallback: Option<FullyPrefilledFallbackReceipt>,
+        max_k0_bytes: usize,
+        max_packed_bytes: usize,
+        dense_continuation_only: bool,
     ) -> Option<FrozenDynamicRowsStorageV3> {
         if workspace.identity.instance != self.identity.instance {
             return None;
@@ -9585,7 +9690,8 @@ impl CompiledProgram {
         let unary_v5_eligible = dynamic_view.output == OutputContract::Exists
             && semantic_class_count == 1
             && format == FrozenCompactRowsFormat::CellOffsetV4;
-        let retain_loop_extension = !unary_v5_eligible
+        let retain_loop_extension = !dense_continuation_only
+            && !unary_v5_eligible
             && loop_candidate_count != 0
             && mapped_bytes
                 .checked_add(loop_payload_bytes)
@@ -9594,11 +9700,13 @@ impl CompiledProgram {
         // V14 amortizes four serial DFA transitions into one exact table
         // access. Exact base-C blocks retain more state coverage than padded
         // rows; one constant block-size multiply is paid only once per four
-        // bytes. Selection is entirely geometry/resource driven and remains
-        // scanner-free so no root or continuation boundary can be crossed.
+        // bytes. The ordinary owner requires a scanner-free public entry. The
+        // continuation-only owner starts after that scanner has already
+        // admitted an exact state/cursor pair, so the same complete table is
+        // independently safe there without acquiring public-root authority.
         if !unary_v5_eligible
             && !retain_loop_extension
-            && dynamic_view.root_requirement.is_none()
+            && (dense_continuation_only || dynamic_view.root_requirement.is_none())
             && let Some((_, _, _, _, _, total_cells, quad_bytes)) =
                 frozen_quad_rows_v14_geometry(state_count, semantic_class_count)
             && quad_bytes <= retained_bytes
@@ -9651,12 +9759,13 @@ impl CompiledProgram {
 
         // V13 is the dense two-symbol form. Its exact C^2 key space removes
         // V11's power-of-two padding and its u16 cell halves resident traffic.
-        // Unary V5 and admitted V6/V7 loop owners retain priority. Pair
-        // formats remain scanner-free because collapsing two transitions must
-        // not cross a root-scanner or loop-ownership point.
+        // Unary V5 and admitted V6/V7 loop owners retain priority for the
+        // public owner. The independent continuation owner deliberately
+        // prefers a complete dense table: it is entered only after the root
+        // scanner and static-prefix frontier have already been authenticated.
         if !unary_v5_eligible
             && !retain_loop_extension
-            && dynamic_view.root_requirement.is_none()
+            && (dense_continuation_only || dynamic_view.root_requirement.is_none())
             && let Some((_, _, total_cells, pair_bytes)) =
                 frozen_pair_rows_v13_geometry(state_count, semantic_class_count)
             && pair_bytes <= retained_bytes
@@ -27850,8 +27959,95 @@ mod tests {
                         header.v1.flags,
                         FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V11
                             | FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V13
+                            | FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V14
                     ),
-                    "root-scanner ownership must exclude pair formats for {label}"
+                    "root-scanner ownership must exclude dense supertransitions for {label}"
+                );
+                let mut continuation_workspace = compiled.prepare_workspace().unwrap();
+                let continuation = compiled
+                    .compiler_private_frozen_dense_continuation_rows_storage_v3_with_fallback_receipt(
+                        &mut continuation_workspace,
+                        None,
+                        usize::MAX,
+                        usize::MAX,
+                    )
+                    .unwrap_or_else(|| {
+                        panic!("rooted {label} did not retain a dense continuation owner")
+                    });
+                assert!(
+                    continuation.rows.descriptor_is_valid_for(compiled.identity),
+                    "dense continuation descriptor is invalid for {label}"
+                );
+                assert!(
+                    matches!(
+                        continuation.compiler_private_format_version(),
+                        FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION
+                            | FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION
+                    ),
+                    "rooted continuation did not select a dense generation for {label}"
+                );
+                assert!(
+                    continuation
+                        .rows
+                        .descriptor_v6_is_valid_for(compiled.identity),
+                    "dense continuation envelope is invalid for {label}"
+                );
+                let continuation_header = compiled
+                    .compiler_private_frozen_dense_continuation_prepared_header_v6(
+                        &continuation_workspace,
+                        &continuation,
+                    )
+                    .unwrap_or_else(|| {
+                        panic!("dense continuation header declined for {label}")
+                    });
+                assert!(continuation_header.is_active(), "{label}");
+                assert!(continuation_header.has_dynamic_rows(), "{label}");
+                assert_eq!(
+                    continuation_header.dynamic_rows_v6.compact.format_version,
+                    continuation.compiler_private_format_version(),
+                    "dense continuation generation changed during publication for {label}"
+                );
+                let foreign =
+                    CompiledProgram::deserialize(&compiled.serialize().unwrap()).unwrap();
+                let foreign_workspace = foreign.prepare_workspace().unwrap();
+                assert!(
+                    compiled
+                        .compiler_private_frozen_dense_continuation_prepared_header_v6(
+                            &foreign_workspace,
+                            &continuation,
+                        )
+                        .is_none(),
+                    "a foreign workspace must not publish the dense owner for {label}"
+                );
+                assert!(
+                    foreign
+                        .compiler_private_frozen_dense_continuation_prepared_header_v6(
+                            &continuation_workspace,
+                            &continuation,
+                        )
+                        .is_none(),
+                    "a foreign program must not publish the dense owner for {label}"
+                );
+                let continuation_states =
+                    usize::try_from(continuation.rows.descriptor.state_count).unwrap();
+                let continuation_classes =
+                    usize::try_from(continuation.rows.descriptor.class_count).unwrap();
+                let (_, _, _, pair_bytes) = frozen_pair_rows_v13_geometry(
+                    continuation_states,
+                    continuation_classes,
+                )
+                .expect("a retained V13/V14 owner must admit dense-pair geometry");
+                let mut declined_workspace = compiled.prepare_workspace().unwrap();
+                assert!(
+                    compiled
+                        .compiler_private_frozen_dense_continuation_rows_storage_v3_with_fallback_receipt(
+                            &mut declined_workspace,
+                            None,
+                            usize::MAX,
+                            pair_bytes - 1,
+                        )
+                        .is_none(),
+                    "a dense-budget decline must not leak an ordinary root owner for {label}"
                 );
             }
             header.v1.flags
@@ -27910,11 +28106,36 @@ mod tests {
                 .is_some_and(|cut| cut.exact_product().is_none()),
             "the composition witness must retain an ordinary mandatory cut"
         );
+        assert!(
+            mandatory_cut
+                .native_dynamic_rows_view()
+                .is_some_and(|view| view.root_requirement.is_some()),
+            "the dense-continuation witness must retain a public root scanner"
+        );
         let _ = assert_promoted(&mandatory_cut, "ordinary mandatory-cut fallback");
         let restored_cut =
             CompiledProgram::deserialize(&mandatory_cut.serialize().unwrap()).unwrap();
         assert!(restored_cut.nfa_mandatory_cut.is_some());
         let _ = assert_promoted(&restored_cut, "restored mandatory-cut fallback");
+
+        for output in [OutputContract::SelectedEnd, OutputContract::Span] {
+            let rooted_value = program(
+                "(?:x|yz)7[A-Za-z]+",
+                output,
+                CompileMode::Optimizing,
+                DeterminizeLimits {
+                    max_states: 0,
+                    ..DeterminizeLimits::default()
+                },
+            );
+            assert!(
+                rooted_value
+                    .native_dynamic_rows_view()
+                    .is_some_and(|view| view.root_requirement.is_some()),
+                "the {output:?} dense-continuation witness must retain a root scanner"
+            );
+            let _ = assert_promoted(&rooted_value, "rooted value-contract fallback");
+        }
 
         let exact_product = program(
             "a[0-2]Z",
