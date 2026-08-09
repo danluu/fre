@@ -811,6 +811,12 @@ fn generalized_shift_and_admission_matches_k0_and_regex_across_finder_shapes() {
         Four,
         Range,
         Set,
+        HighFour,
+        HighRange,
+        HighSet,
+        MixedFour,
+        MixedRange,
+        MixedSet,
         RawPair,
         RawSingle,
     }
@@ -836,6 +842,48 @@ fn generalized_shift_and_admission_matches_k0_and_regex_across_finder_shapes() {
                 "[J-LNPR]",
                 b'A',
                 b'J',
+                Some(FixedPredicateWord64AdaptiveFinderKind::Set),
+            ),
+            Shape::HighFour => (
+                r"[\x80\x82\x84\x86]",
+                r"[\x91\x93\x95\x97-\x98]",
+                0x80,
+                0x91,
+                Some(FixedPredicateWord64AdaptiveFinderKind::Four),
+            ),
+            Shape::HighRange => (
+                r"[\x80-\x83]",
+                r"[\x90-\x93]",
+                0x80,
+                0x90,
+                Some(FixedPredicateWord64AdaptiveFinderKind::Range),
+            ),
+            Shape::HighSet => (
+                r"[\x80-\x81\x84\x88-\x89]",
+                r"[\x90-\x92\x95\x98\x9A]",
+                0x80,
+                0x90,
+                Some(FixedPredicateWord64AdaptiveFinderKind::Set),
+            ),
+            Shape::MixedFour => (
+                r"[\x01\x41\x80\xFE]",
+                r"[\x02\x42\x81\xFC-\xFD]",
+                0x01,
+                0x02,
+                Some(FixedPredicateWord64AdaptiveFinderKind::Four),
+            ),
+            Shape::MixedRange => (
+                r"[\x70-\x83]",
+                r"[\x90-\xA4]",
+                0x70,
+                0x90,
+                Some(FixedPredicateWord64AdaptiveFinderKind::Range),
+            ),
+            Shape::MixedSet => (
+                r"[\x01\x03\x80-\x81\xFE]",
+                r"[\x02\x04\x82-\x84\xFD]",
+                0x01,
+                0x02,
                 Some(FixedPredicateWord64AdaptiveFinderKind::Set),
             ),
             Shape::RawPair => (
@@ -882,6 +930,30 @@ fn generalized_shift_and_admission_matches_k0_and_regex_across_finder_shapes() {
         const SET_LEFT: &[(u8, u8)] = &[(b'A', b'C'), (b'F', b'F'), (b'H', b'H')];
         const SET_RIGHT: &[(u8, u8)] =
             &[(b'J', b'L'), (b'N', b'N'), (b'P', b'P'), (b'R', b'R')];
+        const HIGH_FOUR_LEFT: &[(u8, u8)] =
+            &[(0x80, 0x80), (0x82, 0x82), (0x84, 0x84), (0x86, 0x86)];
+        const HIGH_FOUR_RIGHT: &[(u8, u8)] = &[
+            (0x91, 0x91),
+            (0x93, 0x93),
+            (0x95, 0x95),
+            (0x97, 0x98),
+        ];
+        const HIGH_RANGE_LEFT: &[(u8, u8)] = &[(0x80, 0x83)];
+        const HIGH_RANGE_RIGHT: &[(u8, u8)] = &[(0x90, 0x93)];
+        const HIGH_SET_LEFT: &[(u8, u8)] =
+            &[(0x80, 0x81), (0x84, 0x84), (0x88, 0x89)];
+        const HIGH_SET_RIGHT: &[(u8, u8)] =
+            &[(0x90, 0x92), (0x95, 0x95), (0x98, 0x98), (0x9A, 0x9A)];
+        const MIXED_FOUR_LEFT: &[(u8, u8)] =
+            &[(0x01, 0x01), (0x41, 0x41), (0x80, 0x80), (0xFE, 0xFE)];
+        const MIXED_FOUR_RIGHT: &[(u8, u8)] =
+            &[(0x02, 0x02), (0x42, 0x42), (0x81, 0x81), (0xFC, 0xFD)];
+        const MIXED_RANGE_LEFT: &[(u8, u8)] = &[(0x70, 0x83)];
+        const MIXED_RANGE_RIGHT: &[(u8, u8)] = &[(0x90, 0xA4)];
+        const MIXED_SET_LEFT: &[(u8, u8)] =
+            &[(0x01, 0x01), (0x03, 0x03), (0x80, 0x81), (0xFE, 0xFE)];
+        const MIXED_SET_RIGHT: &[(u8, u8)] =
+            &[(0x02, 0x02), (0x04, 0x04), (0x82, 0x84), (0xFD, 0xFD)];
         const RAW_LEFT: &[(u8, u8)] = &[(0, 0x40)];
         const RAW_RIGHT: &[(u8, u8)] = &[(0x80, 0xC1)];
         const THREE: &[(u8, u8)] = &[(b'a', b'c')];
@@ -889,6 +961,12 @@ fn generalized_shift_and_admission_matches_k0_and_regex_across_finder_shapes() {
             Shape::Four => (FOUR_LEFT, FOUR_RIGHT),
             Shape::Range => (RANGE_LEFT, RANGE_RIGHT),
             Shape::Set => (SET_LEFT, SET_RIGHT),
+            Shape::HighFour => (HIGH_FOUR_LEFT, HIGH_FOUR_RIGHT),
+            Shape::HighRange => (HIGH_RANGE_LEFT, HIGH_RANGE_RIGHT),
+            Shape::HighSet => (HIGH_SET_LEFT, HIGH_SET_RIGHT),
+            Shape::MixedFour => (MIXED_FOUR_LEFT, MIXED_FOUR_RIGHT),
+            Shape::MixedRange => (MIXED_RANGE_LEFT, MIXED_RANGE_RIGHT),
+            Shape::MixedSet => (MIXED_SET_LEFT, MIXED_SET_RIGHT),
             Shape::RawPair => (RAW_LEFT, RAW_RIGHT),
             Shape::RawSingle => (THREE, FULL),
         };
@@ -915,6 +993,12 @@ fn generalized_shift_and_admission_matches_k0_and_regex_across_finder_shapes() {
             Shape::Four,
             Shape::Range,
             Shape::Set,
+            Shape::HighFour,
+            Shape::HighRange,
+            Shape::HighSet,
+            Shape::MixedFour,
+            Shape::MixedRange,
+            Shape::MixedSet,
             Shape::RawPair,
             Shape::RawSingle,
         ] {

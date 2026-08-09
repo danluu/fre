@@ -794,10 +794,10 @@ pub const EXPLAIN_SCHEMA_VERSION: u32 = 15;
 
 // Automatic ordinary search admits exact anchors and staged general primaries
 // when the finite incumbent cannot fit. Three-member primaries use memchr3;
-// wider ASCII Four/Range/Set primaries use one compiler- or receipt-selected
-// whole-slice member finder. Raw Shift-And, high-byte primaries and
-// scalar/direct candidate streams preserve K0. Construction proves a word
-// width of at most 64, so one primary finder leaves at most 63 non-universal
+// wider Four/Range/Set primaries use one compiler- or receipt-selected
+// whole-slice member finder whenever that selection is vectorized. Raw
+// Shift-And and scalar/direct candidate streams preserve K0. Construction
+// proves a word width of at most 64, so one primary finder leaves at most 63 non-universal
 // verification predicates. The retained second finder and final Shift-And
 // handoff keep dense rejection streams inside the closed linear bound.
 const FIXED_PREDICATE_SEARCH_AUTO_MAX_VERIFICATION_PREDICATES: usize =
@@ -28497,7 +28497,7 @@ mod tests {
     }
 
     #[test]
-    fn staged_ascii_general_primaries_route_before_k0_but_direct_and_raw_preserve_k0() {
+    fn staged_vector_general_primaries_route_before_k0_but_direct_and_raw_preserve_k0() {
         let limits = BuildLimits {
             literal_set: fre_kernels::LiteralSetBuildLimits {
                 max_patterns: 4,
@@ -28548,6 +28548,20 @@ mod tests {
         const SET_LEFT: &[(u8, u8)] = &[(b'A', b'C'), (b'F', b'F'), (b'H', b'H')];
         const SET_RIGHT: &[(u8, u8)] =
             &[(b'J', b'L'), (b'N', b'N'), (b'P', b'P'), (b'R', b'R')];
+        const HIGH_RANGE_LEFT: &[(u8, u8)] = &[(0x80, 0x83)];
+        const HIGH_RANGE_RIGHT: &[(u8, u8)] = &[(0x90, 0x93)];
+        const HIGH_FOUR_LEFT: &[(u8, u8)] =
+            &[(0x80, 0x80), (0x82, 0x82), (0x84, 0x84), (0x86, 0x86)];
+        const HIGH_FOUR_RIGHT: &[(u8, u8)] = &[
+            (0x91, 0x91),
+            (0x93, 0x93),
+            (0x95, 0x95),
+            (0x97, 0x98),
+        ];
+        const HIGH_SET_LEFT: &[(u8, u8)] =
+            &[(0x80, 0x81), (0x84, 0x84), (0x88, 0x89)];
+        const HIGH_SET_RIGHT: &[(u8, u8)] =
+            &[(0x90, 0x92), (0x95, 0x95), (0x98, 0x98), (0x9A, 0x9A)];
         for (pattern, haystack, primary_kind, predicates) in [
             (
                 r"[a-d][e-h]",
@@ -28566,6 +28580,24 @@ mod tests {
                 &b"\xff\xffAJ"[..],
                 Some(FixedPredicateWord64AdaptiveFinderKind::Set),
                 &[SET_LEFT, SET_RIGHT][..],
+            ),
+            (
+                r"[\x80-\x83][\x90-\x93]",
+                &b"\xff\xff\x80\x90"[..],
+                Some(FixedPredicateWord64AdaptiveFinderKind::Range),
+                &[HIGH_RANGE_LEFT, HIGH_RANGE_RIGHT][..],
+            ),
+            (
+                r"[\x80\x82\x84\x86][\x91\x93\x95\x97-\x98]",
+                &b"\xff\xff\x80\x91"[..],
+                Some(FixedPredicateWord64AdaptiveFinderKind::Four),
+                &[HIGH_FOUR_LEFT, HIGH_FOUR_RIGHT][..],
+            ),
+            (
+                r"[\x80-\x81\x84\x88-\x89][\x90-\x92\x95\x98\x9A]",
+                &b"\xff\xff\x80\x90"[..],
+                Some(FixedPredicateWord64AdaptiveFinderKind::Set),
+                &[HIGH_SET_LEFT, HIGH_SET_RIGHT][..],
             ),
         ] {
             let low_level = fre_kernels::FixedPredicateWord64Plan::build(
@@ -28618,7 +28650,6 @@ mod tests {
         for (pattern, haystack) in [
             (r"[\x00-\x7E][\x00-\x7E]", &b"\xff\xffAA"[..]),
             (r"[a-c][\x00-\xFF]", &b"\xff\xffa\xff"[..]),
-            (r"[\x80-\x83][J-N]", &b"\xff\xff\x80J"[..]),
         ] {
             let k0 = PortableBuilder::new(pattern)
                 .unicode(false)

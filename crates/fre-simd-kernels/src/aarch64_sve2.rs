@@ -302,6 +302,52 @@ fre_byte_values16_first_mask32_sve2_asm:
     .size fre_byte_values16_first_mask32_sve2_asm, .-fre_byte_values16_first_mask32_sve2_asm
     .popsection
 
+    // Scan complete 128-byte groups for any of at most sixteen byte values.
+    // Predicate OR accumulation replaces four fixed-32 ptest/branch pairs with
+    // one group decision. A caller that observes a hit recovers its exact lane
+    // within that bounded group; no hit returns the supplied complete length.
+    // The loop is vector-length agnostic: WHILELO bounds every load even when
+    // the effective vector length exceeds the fixed group extent.
+    .pushsection .text.fre_byte_values16_first_group128_sve2_asm, "ax", %progbits
+    .arch armv8-a+sve2
+    .p2align 2
+    .hidden fre_byte_values16_first_group128_sve2_asm
+    .global fre_byte_values16_first_group128_sve2_asm
+    .type fre_byte_values16_first_group128_sve2_asm, %function
+fre_byte_values16_first_group128_sve2_asm:
+    .cfi_startproc
+    ptrue p2.b
+    ld1rqb z0.b, p2/z, [x0]
+    mov x8, #0
+    mov x14, #128
+1:
+    cmp x8, x2
+    b.hs 4f
+    mov x9, #0
+    pfalse p3.b
+2:
+    whilelo p0.b, x9, x14
+    add x10, x8, x9
+    ld1b z1.b, p0/z, [x1, x10]
+    match p1.b, p0/z, z1.b, z0.b
+    orr p3.b, p2/z, p3.b, p1.b
+    incb x9
+    cmp x9, #128
+    b.lo 2b
+    ptest p2, p3.b
+    b.any 3f
+    add x8, x8, #128
+    b 1b
+3:
+    mov x0, x8
+    ret
+4:
+    mov x0, x2
+    ret
+    .cfi_endproc
+    .size fre_byte_values16_first_group128_sve2_asm, .-fre_byte_values16_first_group128_sve2_asm
+    .popsection
+
     // Wide arbitrary full-byte-set classification. The two nibble tables
     // together represent all 256 byte values. SVE2 MATCH selects the lower or
     // upper high-nibble table without any input-dependent dispatch.
@@ -1006,6 +1052,11 @@ unsafe extern "C" {
         bytes: *const u8,
         len: usize,
     ) -> ByteValues16BlockScanResult;
+    fn fre_byte_values16_first_group128_sve2_asm(
+        match_values: *const u8,
+        bytes: *const u8,
+        len: usize,
+    ) -> usize;
     fn fre_byte_set_mask32_sve2_asm(
         lower_columns: *const u8,
         upper_columns: *const u8,
@@ -1233,6 +1284,31 @@ pub(super) unsafe fn find_byte_values16_32_block_sve2(
     let member_mask = u32::try_from(result.member_mask)
         .expect("the exact 32-byte block mask occupies only the low 32 bits");
     Some((result.block_start, ByteSetMask32::new(member_mask)))
+}
+
+#[allow(
+    unsafe_code,
+    reason = "this private leaf is reachable only when compiler target features guarantee SVE2 and scans complete fixed-width groups from the supplied slice"
+)]
+#[inline]
+pub(super) unsafe fn find_byte_values16_128_group_sve2(
+    match_values: &[u8; 16],
+    bytes: &[u8],
+) -> usize {
+    const GROUP_BYTES: usize = BYTE_SET_WIDE_BLOCK_BYTES * 4;
+    debug_assert_eq!(bytes.len() % GROUP_BYTES, 0);
+    // SAFETY: compiler target features prove SVE2, the caller supplies only
+    // complete 128-byte groups, and the initialized table has sixteen bytes.
+    let group_start = unsafe {
+        fre_byte_values16_first_group128_sve2_asm(
+            match_values.as_ptr(),
+            bytes.as_ptr(),
+            bytes.len(),
+        )
+    };
+    debug_assert!(group_start == bytes.len() || group_start % GROUP_BYTES == 0);
+    debug_assert!(group_start <= bytes.len());
+    group_start
 }
 
 #[allow(

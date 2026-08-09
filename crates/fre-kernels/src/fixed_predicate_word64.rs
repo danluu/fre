@@ -6,15 +6,15 @@
 //! byte-to-position mask table. An exact
 //! one-or-two-byte predicate drives a monotone candidate stream when available.
 //! Otherwise, a three-member predicate starts one `memchr3` stream and a
-//! wider ASCII Four/Range/Set predicate may scan through its already-retained
-//! block classifier.
+//! wider Four/Range/Set predicate may scan through its already-retained block
+//! classifier when its compiler or runtime SIMD selection is vectorized.
 //! Dense rejections by its paired predicate move to a retained intersected
 //! vector stream, where the second classifier runs only for blocks with a
 //! primary survivor. If such a block has no fallback member, the already-
 //! retained fallback classifier may skip the following fallback-empty run.
-//! Dense residual rejections move monotonically to Shift-And. High-byte,
-//! scalar-selected and otherwise unsupported wider primaries begin directly
-//! in the retained intersected stream.
+//! Dense residual rejections move monotonically to Shift-And. Scalar-selected
+//! and otherwise unsupported wider primaries begin directly in the retained
+//! intersected stream.
 //! Universal predicates are never rechecked. Every phase restarts after each
 //! accepted word, allocates no operation memory, and materializes no spans.
 
@@ -34,21 +34,21 @@ use crate::packed_ordered_literal_aggregate::byte_frequency_rank;
 
 /// Stable identity for the fixed-predicate selective-finder-or-Shift-And strategy.
 pub const PLAN_ID: &str =
-    "fixed-predicate-word64.selective-predicate-or-shift-and.nonoverlap.v13";
+    "fixed-predicate-word64.selective-predicate-or-shift-and.nonoverlap.v14";
 /// Stable identity for the count reducer.
-pub const COUNT_OPERATION_ID: &str = "fixed-predicate-word64.count.v12";
+pub const COUNT_OPERATION_ID: &str = "fixed-predicate-word64.count.v13";
 /// Stable identity for the matched-byte-sum reducer.
-pub const SPAN_SUM_OPERATION_ID: &str = "fixed-predicate-word64.span-sum.v12";
+pub const SPAN_SUM_OPERATION_ID: &str = "fixed-predicate-word64.span-sum.v13";
 /// Stable identity for the ordinary first-match search projection.
-pub const SEARCH_PLAN_ID: &str = "fixed-predicate-word64.first-match.v9";
+pub const SEARCH_PLAN_ID: &str = "fixed-predicate-word64.first-match.v10";
 /// Stable identity for existence search.
-const EXISTS_SEARCH_OPERATION_ID: &str = "fixed-predicate-word64.search.exists.v9";
+const EXISTS_SEARCH_OPERATION_ID: &str = "fixed-predicate-word64.search.exists.v10";
 /// Stable identity for the first accepting end projection.
-const EARLIEST_END_SEARCH_OPERATION_ID: &str = "fixed-predicate-word64.search.earliest-end.v9";
+const EARLIEST_END_SEARCH_OPERATION_ID: &str = "fixed-predicate-word64.search.earliest-end.v10";
 /// Stable identity for the selected match end projection.
-const SELECTED_END_SEARCH_OPERATION_ID: &str = "fixed-predicate-word64.search.selected-end.v9";
+const SELECTED_END_SEARCH_OPERATION_ID: &str = "fixed-predicate-word64.search.selected-end.v10";
 /// Stable identity for the selected span projection.
-const SPAN_SEARCH_OPERATION_ID: &str = "fixed-predicate-word64.search.span.v9";
+const SPAN_SEARCH_OPERATION_ID: &str = "fixed-predicate-word64.search.span.v10";
 /// Version of the receipt-bearing fixed-predicate construction protocol.
 pub const BUILD_ATTEMPT_ALGORITHM_VERSION: u32 = 12;
 /// Version of the partial-actual fixed-predicate construction ledger.
@@ -72,7 +72,13 @@ const PREDICATE_CHECK_WORK: usize = 1;
 const MATCH_WORK: usize = 3;
 const REDUCE_FINAL_WORK: usize = 1;
 const ADAPTIVE_FALLBACK_REJECTIONS: usize = 8;
+// Exact anchors and retained candidate streams may have only one authenticated
+// 16-byte classification block. Do not infer wider economics for their handoff.
 const ADAPTIVE_FALLBACK_MAX_MEAN_SKIP: usize = BYTE_SET_BLOCK_BYTES;
+// Whole-slice leaves that demonstrably service at least 32-byte groups may use
+// this wider initial-handoff grain. Each staged seeker authenticates that fact
+// independently; memchr3 and 16-byte compiler leaves retain the narrow limit.
+const GENERAL_PRIMARY_WIDE_MAX_MEAN_SKIP: usize = BYTE_SET_WIDE_BLOCK_BYTES;
 // This is the same source-derived maximum used by K0's retained guard. Above
 // it, a predicate admits more than one quarter of the byte domain and cannot
 // justify a retained intersection.
@@ -84,13 +90,43 @@ fn dense_rejection_burst(
     rejected_anchor: usize,
     rejected_candidates: usize,
 ) -> Option<bool> {
+    dense_rejection_burst_with_limit(
+        first_rejected_anchor,
+        rejected_anchor,
+        rejected_candidates,
+        ADAPTIVE_FALLBACK_MAX_MEAN_SKIP,
+    )
+}
+
+#[inline]
+fn dense_general_primary_rejection_burst(
+    first_rejected_anchor: usize,
+    rejected_anchor: usize,
+    rejected_candidates: usize,
+    max_mean_skip: usize,
+) -> Option<bool> {
+    dense_rejection_burst_with_limit(
+        first_rejected_anchor,
+        rejected_anchor,
+        rejected_candidates,
+        max_mean_skip,
+    )
+}
+
+#[inline]
+fn dense_rejection_burst_with_limit(
+    first_rejected_anchor: usize,
+    rejected_anchor: usize,
+    rejected_candidates: usize,
+    max_mean_skip: usize,
+) -> Option<bool> {
     if rejected_candidates < ADAPTIVE_FALLBACK_REJECTIONS {
         return Some(false);
     }
     let span = rejected_anchor.checked_sub(first_rejected_anchor)?;
     let admitted_span = ADAPTIVE_FALLBACK_REJECTIONS
         .checked_sub(1)?
-        .checked_mul(ADAPTIVE_FALLBACK_MAX_MEAN_SKIP)?;
+        .checked_mul(max_mean_skip)?;
     Some(span <= admitted_span)
 }
 
@@ -203,7 +239,7 @@ pub struct AdaptiveFinderIdentity {
 pub enum GeneralPrimaryScanIdentity {
     /// Three exact bytes are staged through `memchr3`.
     Memchr3,
-    /// One compiled whole-slice leaf stages a wider ASCII predicate.
+    /// One compiled whole-slice leaf stages a wider byte predicate.
     CompiledWholeSlice,
     /// The general pair begins directly in the intersected candidate stream.
     DirectCandidateStream,
@@ -226,10 +262,10 @@ pub enum AdaptiveHandoffIdentity {
     DirectShiftAnd,
     /// One secondary finder is retained. With an exact primary, dense
     /// rejection hands off to an intersected stream. A three-member general
-    /// primary begins with `memchr3`; a wider ASCII primary may begin with its
-    /// retained block classifier. Dense rejections hand off through this
-    /// finder, while unsupported wider primaries begin in the intersected
-    /// stream.
+    /// primary begins with `memchr3`; a wider vector-classified primary may
+    /// begin with its retained block classifier. Dense rejections hand off
+    /// through this finder, while unsupported wider primaries begin in the
+    /// intersected stream.
     Finder {
         /// Exact retained finder.
         finder: AdaptiveFinderIdentity,
@@ -1318,6 +1354,13 @@ impl GeneralPrimarySeeker<'_> {
             Self::CompiledWholeSlice(finder) => finder.find_member(bytes, true),
         }
     }
+
+    const fn max_mean_skip(self) -> usize {
+        match self {
+            Self::Memchr3(_) => BYTE_SET_BLOCK_BYTES,
+            Self::CompiledWholeSlice(finder) => finder.general_primary_max_mean_skip(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1422,6 +1465,33 @@ impl AdaptiveFallback {
         }
     }
 
+    const fn general_primary_max_mean_skip(&self) -> usize {
+        match &self.finder {
+            // Every reviewed AArch64 whole-slice leaf groups at least 32 bytes;
+            // the x86 and portable Four/Range loops remain 16-byte operations.
+            AdaptiveFinder::Four(_)
+            | AdaptiveFinder::Range { .. }
+            | AdaptiveFinder::Set(_)
+                if cfg!(target_arch = "aarch64") =>
+            {
+                GENERAL_PRIMARY_WIDE_MAX_MEAN_SKIP
+            }
+            // Other targets may use the wider Set limit only when their
+            // retained direct candidate receipt independently exposes it.
+            AdaptiveFinder::Set(classifier)
+                if classifier.candidate_block_bytes() == BYTE_SET_WIDE_BLOCK_BYTES =>
+            {
+                GENERAL_PRIMARY_WIDE_MAX_MEAN_SKIP
+            }
+            AdaptiveFinder::One(_)
+            | AdaptiveFinder::Two(_, _)
+            | AdaptiveFinder::Three(_, _, _)
+            | AdaptiveFinder::Four(_)
+            | AdaptiveFinder::Range { .. }
+            | AdaptiveFinder::Set(_) => ADAPTIVE_FALLBACK_MAX_MEAN_SKIP,
+        }
+    }
+
     #[inline]
     fn matches(&self, byte: u8) -> bool {
         match &self.finder {
@@ -1436,33 +1506,6 @@ impl AdaptiveFallback {
                 maximum_delta,
             } => byte.wrapping_sub(*origin) <= *maximum_delta,
             AdaptiveFinder::Set(classifier) => classifier.set().contains(byte),
-        }
-    }
-
-    const fn is_ascii(&self) -> bool {
-        match &self.finder {
-            AdaptiveFinder::One(first) => *first < 0x80,
-            AdaptiveFinder::Two(first, second) => *first < 0x80 && *second < 0x80,
-            AdaptiveFinder::Three(first, second, third) => {
-                *first < 0x80 && *second < 0x80 && *third < 0x80
-            }
-            AdaptiveFinder::Four(members) => {
-                members[0] < 0x80
-                    && members[1] < 0x80
-                    && members[2] < 0x80
-                    && members[3] < 0x80
-            }
-            AdaptiveFinder::Range {
-                origin,
-                maximum_delta,
-            } => match (*origin).checked_add(*maximum_delta) {
-                Some(end) => end < 0x80,
-                None => false,
-            },
-            AdaptiveFinder::Set(classifier) => {
-                let [_, _, upper_low, upper_high] = classifier.set().words();
-                upper_low == 0 && upper_high == 0
-            }
         }
     }
 
@@ -1493,7 +1536,7 @@ impl AdaptiveFallback {
     }
 
     const fn supports_classified_general_stage(&self) -> bool {
-        self.is_ascii() && self.supports_vector_classified_run()
+        self.supports_vector_classified_run()
     }
 
     #[inline]
@@ -2589,7 +2632,7 @@ fn select_anchor(
     let exact_primary_offset = selected.offset().map(usize::from);
     // A general primary is retained only with a second independently selective
     // predicate. Three-member primaries begin with memchr3; supported wider
-    // ASCII primaries scan through their already-retained classifier.
+    // primaries scan through their already-retained classifier.
     let general_pair = match (exact_primary_offset, fallback_first, fallback_second) {
         (None, Some(primary), Some(secondary))
             if primary.score.0 <= GENERAL_PRIMARY_MAX_CARDINALITY
@@ -3228,6 +3271,7 @@ impl FixedPredicateWord64Plan {
         let (primary_offset, seeker) = self.general_primary_staged().ok_or(
             SearchError::InternalInvariant("general primary lost its staged finder"),
         )?;
+        let general_primary_max_mean_skip = seeker.max_mean_skip();
         let fallback = self.adaptive_fallback.as_ref().ok_or(
             SearchError::InternalInvariant("general primary lost its paired predicate finder"),
         )?;
@@ -3323,10 +3367,11 @@ impl FixedPredicateWord64Plan {
                 SearchError::InternalInvariant("general primary handoff preceded its cursor"),
             )?;
             if fallback_rejections == ADAPTIVE_FALLBACK_REJECTIONS {
-                if dense_rejection_burst(
+                if dense_general_primary_rejection_burst(
                     fallback_burst_start,
                     anchor,
                     fallback_rejections,
+                    general_primary_max_mean_skip,
                 )
                 .ok_or(SearchError::ArithmeticOverflow {
                     computation: "general primary fallback rejection density",
@@ -3340,10 +3385,11 @@ impl FixedPredicateWord64Plan {
                 fallback_rejections = 0;
             }
             if residual_rejections == ADAPTIVE_FALLBACK_REJECTIONS {
-                if dense_rejection_burst(
+                if dense_general_primary_rejection_burst(
                     residual_burst_start,
                     anchor,
                     residual_rejections,
+                    general_primary_max_mean_skip,
                 )
                 .ok_or(SearchError::ArithmeticOverflow {
                     computation: "general primary residual rejection density",
@@ -3915,6 +3961,7 @@ impl FixedPredicateWord64Plan {
         let (primary_offset, seeker) = self.general_primary_staged().ok_or(
             SearchError::InternalInvariant("retained general primary lost its staged finder"),
         )?;
+        let general_primary_max_mean_skip = seeker.max_mean_skip();
         let fallback = self.adaptive_fallback.as_ref().ok_or(
             SearchError::InternalInvariant(
                 "retained general primary lost its paired predicate finder",
@@ -4041,10 +4088,11 @@ impl FixedPredicateWord64Plan {
                 SearchError::InternalInvariant("retained general primary handoff preceded cursor"),
             )?;
             if fallback_rejections == ADAPTIVE_FALLBACK_REJECTIONS {
-                if dense_rejection_burst(
+                if dense_general_primary_rejection_burst(
                     fallback_burst_start,
                     anchor,
                     fallback_rejections,
+                    general_primary_max_mean_skip,
                 )
                 .ok_or(SearchError::ArithmeticOverflow {
                     computation: "retained general primary fallback rejection density",
@@ -4062,10 +4110,11 @@ impl FixedPredicateWord64Plan {
                 fallback_rejections = 0;
             }
             if residual_rejections == ADAPTIVE_FALLBACK_REJECTIONS {
-                if dense_rejection_burst(
+                if dense_general_primary_rejection_burst(
                     residual_burst_start,
                     anchor,
                     residual_rejections,
+                    general_primary_max_mean_skip,
                 )
                 .ok_or(SearchError::ArithmeticOverflow {
                     computation: "retained general primary residual rejection density",
@@ -4577,6 +4626,7 @@ impl FixedPredicateWord64Plan {
         let Some((primary_offset, seeker)) = self.general_primary_staged() else {
             return self.execute_first_direct_general_finder(slice, window_start, upper);
         };
+        let general_primary_max_mean_skip = seeker.max_mean_skip();
         let fallback = self.adaptive_fallback.as_ref().ok_or(
             SearchError::InternalInvariant("general primary lost its paired predicate finder"),
         )?;
@@ -4702,10 +4752,11 @@ impl FixedPredicateWord64Plan {
                 SearchError::InternalInvariant("general primary handoff preceded its cursor"),
             )?;
             if fallback_rejections == ADAPTIVE_FALLBACK_REJECTIONS {
-                if dense_rejection_burst(
+                if dense_general_primary_rejection_burst(
                     fallback_burst_start,
                     anchor,
                     fallback_rejections,
+                    general_primary_max_mean_skip,
                 )
                 .ok_or(SearchError::ArithmeticOverflow {
                     computation: "general primary fallback rejection density",
@@ -4725,10 +4776,11 @@ impl FixedPredicateWord64Plan {
                 fallback_rejections = 0;
             }
             if residual_rejections == ADAPTIVE_FALLBACK_REJECTIONS {
-                if dense_rejection_burst(
+                if dense_general_primary_rejection_burst(
                     residual_burst_start,
                     anchor,
                     residual_rejections,
+                    general_primary_max_mean_skip,
                 )
                 .ok_or(SearchError::ArithmeticOverflow {
                     computation: "general primary residual rejection density",
@@ -5729,6 +5781,7 @@ impl FixedPredicateWord64Plan {
     #[inline]
     fn scan_general_primary_value(&self, haystack: &[u8]) -> Option<u64> {
         let (primary_offset, seeker) = self.general_primary_staged()?;
+        let general_primary_max_mean_skip = seeker.max_mean_skip();
         let fallback = self.adaptive_fallback.as_ref()?;
         let fallback_offset = usize::from(fallback.offset);
         if primary_offset == fallback_offset {
@@ -5785,10 +5838,11 @@ impl FixedPredicateWord64Plan {
             cursor = anchor.checked_add(1)?;
             let first_untested_start = cursor.checked_sub(primary_offset)?;
             if fallback_rejections == ADAPTIVE_FALLBACK_REJECTIONS {
-                if dense_rejection_burst(
+                if dense_general_primary_rejection_burst(
                     fallback_burst_start,
                     anchor,
                     fallback_rejections,
+                    general_primary_max_mean_skip,
                 )? {
                     return count.checked_add(
                         self.scan_adaptive_fallback_value(haystack, first_untested_start)?,
@@ -5797,10 +5851,11 @@ impl FixedPredicateWord64Plan {
                 fallback_rejections = 0;
             }
             if residual_rejections == ADAPTIVE_FALLBACK_REJECTIONS {
-                if dense_rejection_burst(
+                if dense_general_primary_rejection_burst(
                     residual_burst_start,
                     anchor,
                     residual_rejections,
+                    general_primary_max_mean_skip,
                 )? {
                     return count.checked_add(
                         self.scan_shift_and_value(haystack.get(first_untested_start..)?)?,
@@ -6163,6 +6218,7 @@ impl FixedPredicateWord64Plan {
         let (primary_offset, seeker) = self.general_primary_staged().ok_or(
             ReduceError::InternalInvariant("general reducer lost its staged primary"),
         )?;
+        let general_primary_max_mean_skip = seeker.max_mean_skip();
         let fallback = self.adaptive_fallback.as_ref().ok_or(
             ReduceError::InternalInvariant("general reducer lost its paired predicate finder"),
         )?;
@@ -6277,10 +6333,11 @@ impl FixedPredicateWord64Plan {
                 ReduceError::InternalInvariant("general reducer handoff preceded its cursor"),
             )?;
             if fallback_rejections == ADAPTIVE_FALLBACK_REJECTIONS {
-                if dense_rejection_burst(
+                if dense_general_primary_rejection_burst(
                     fallback_burst_start,
                     anchor,
                     fallback_rejections,
+                    general_primary_max_mean_skip,
                 )
                 .ok_or(ReduceError::ArithmeticOverflow {
                     computation: "general reducer fallback rejection density",
@@ -6290,10 +6347,11 @@ impl FixedPredicateWord64Plan {
                 fallback_rejections = 0;
             }
             if residual_rejections == ADAPTIVE_FALLBACK_REJECTIONS {
-                if dense_rejection_burst(
+                if dense_general_primary_rejection_burst(
                     residual_burst_start,
                     anchor,
                     residual_rejections,
+                    general_primary_max_mean_skip,
                 )
                 .ok_or(ReduceError::ArithmeticOverflow {
                     computation: "general reducer residual rejection density",
@@ -7179,6 +7237,79 @@ mod tests {
 
     fn ab_plan() -> FixedPredicateWord64Plan {
         FixedPredicateWord64Plan::build(&[A, B], BuildLimits::unlimited()).unwrap()
+    }
+
+    #[test]
+    fn adaptive_rejection_density_tracks_path_specific_scan_grains() {
+        assert_eq!(
+            ADAPTIVE_FALLBACK_MAX_MEAN_SKIP,
+            BYTE_SET_BLOCK_BYTES
+        );
+        assert_eq!(
+            GENERAL_PRIMARY_WIDE_MAX_MEAN_SKIP,
+            BYTE_SET_WIDE_BLOCK_BYTES
+        );
+        assert_eq!(
+            GeneralPrimarySeeker::Memchr3([1, 2, 3]).max_mean_skip(),
+            BYTE_SET_BLOCK_BYTES
+        );
+        let four = AdaptiveFallback {
+            offset: 0,
+            cardinality: 4,
+            finder: AdaptiveFinder::Four([1, 2, 3, 4]),
+        };
+        assert_eq!(
+            GeneralPrimarySeeker::CompiledWholeSlice(&four).max_mean_skip(),
+            if cfg!(target_arch = "aarch64") {
+                BYTE_SET_WIDE_BLOCK_BYTES
+            } else {
+                BYTE_SET_BLOCK_BYTES
+            }
+        );
+        let narrow_boundary = (ADAPTIVE_FALLBACK_REJECTIONS - 1)
+            .checked_mul(BYTE_SET_BLOCK_BYTES)
+            .unwrap();
+        assert_eq!(
+            dense_rejection_burst(100, 100 + narrow_boundary, ADAPTIVE_FALLBACK_REJECTIONS),
+            Some(true)
+        );
+        assert_eq!(
+            dense_rejection_burst(
+                100,
+                100 + narrow_boundary + 1,
+                ADAPTIVE_FALLBACK_REJECTIONS
+            ),
+            Some(false)
+        );
+        let general_boundary = (ADAPTIVE_FALLBACK_REJECTIONS - 1)
+            .checked_mul(BYTE_SET_WIDE_BLOCK_BYTES)
+            .unwrap();
+        assert_eq!(
+            dense_general_primary_rejection_burst(
+                100,
+                100 + general_boundary,
+                ADAPTIVE_FALLBACK_REJECTIONS,
+                GENERAL_PRIMARY_WIDE_MAX_MEAN_SKIP
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            dense_general_primary_rejection_burst(
+                100,
+                100 + general_boundary + 1,
+                ADAPTIVE_FALLBACK_REJECTIONS,
+                GENERAL_PRIMARY_WIDE_MAX_MEAN_SKIP
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            dense_rejection_burst(
+                100,
+                100 + narrow_boundary,
+                ADAPTIVE_FALLBACK_REJECTIONS - 1
+            ),
+            Some(false)
+        );
     }
 
     fn naive_count(haystack: &[u8], predicates: &[&[(u8, u8)]]) -> u64 {
@@ -8712,7 +8843,7 @@ mod tests {
     }
 
     #[test]
-    fn operation_identities_record_compiler_or_receipt_selected_scan_modes() {
+    fn operation_identities_stage_all_byte_domains_under_the_same_vector_selection() {
         const ASCII: &[(u8, u8)] = &[
             (b'A', b'A'),
             (b'C', b'C'),
@@ -8743,19 +8874,14 @@ mod tests {
             );
         }
 
-        if matches!(
-            ascii.general_primary_scan_identity(),
-            Some(GeneralPrimaryScanIdentity::CompiledWholeSlice)
-        ) {
-            assert_eq!(
-                high.general_primary_scan_identity(),
-                Some(GeneralPrimaryScanIdentity::DirectCandidateStream)
-            );
-            assert_ne!(
-                ascii.operation_identity(Operation::Count),
-                high.operation_identity(Operation::Count)
-            );
-        }
+        assert_eq!(
+            high.general_primary_scan_identity(),
+            ascii.general_primary_scan_identity()
+        );
+        assert_eq!(
+            high.general_fallback_scan_identity(),
+            ascii.general_fallback_scan_identity()
+        );
     }
 
     #[test]

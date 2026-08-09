@@ -162,6 +162,39 @@ impl ByteSet256 {
         }
         ByteSetTables { lower, upper }
     }
+
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_os = "linux",
+        target_endian = "little",
+        target_feature = "sve",
+        target_feature = "sve2"
+    ))]
+    fn match_values16(self) -> Option<[u8; 16]> {
+        let word_bits = usize::try_from(u64::BITS).ok()?;
+        let mut values = [0_u8; 16];
+        let mut members = 0_usize;
+        for (word_index, mut word) in self.0.into_iter().enumerate() {
+            while word != 0 {
+                if members == values.len() {
+                    return None;
+                }
+                let bit = word.trailing_zeros();
+                let byte = word_index
+                    .checked_mul(word_bits)?
+                    .checked_add(usize::try_from(bit).ok()?)?;
+                values[members] = u8::try_from(byte).ok()?;
+                members = members.checked_add(1)?;
+                word &= word.wrapping_sub(1);
+            }
+        }
+        if members == 0 {
+            return None;
+        }
+        let first = values[0];
+        values[members..].fill(first);
+        Some(values)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -351,6 +384,44 @@ impl ByteSetClassifier {
     #[must_use]
     pub const fn set(&self) -> ByteSet256 {
         self.set
+    }
+
+    #[cfg(all(
+        not(feature = "static-dispatch"),
+        target_arch = "aarch64",
+        target_os = "linux",
+        target_endian = "little",
+        target_feature = "sve",
+        target_feature = "sve2"
+    ))]
+    const fn supports_small_mixed_whole_slice_sve2(&self) -> bool {
+        self.selection.policy_usable.contains(Feature::ArmSve)
+            && self.selection.policy_usable.contains(Feature::ArmSve2)
+    }
+
+    #[cfg(all(
+        feature = "static-dispatch-arm-41-d84",
+        target_arch = "aarch64",
+        target_os = "linux",
+        target_endian = "little",
+        target_feature = "sve",
+        target_feature = "sve2"
+    ))]
+    const fn supports_small_mixed_whole_slice_sve2(&self) -> bool {
+        true
+    }
+
+    #[cfg(all(
+        feature = "static-dispatch",
+        not(feature = "static-dispatch-arm-41-d84"),
+        target_arch = "aarch64",
+        target_os = "linux",
+        target_endian = "little",
+        target_feature = "sve",
+        target_feature = "sve2"
+    ))]
+    const fn supports_small_mixed_whole_slice_sve2(&self) -> bool {
+        false
     }
 
     /// Stable selection receipt for this fixed-width operation.
@@ -545,15 +616,33 @@ impl ByteSetClassifier {
 
     /// Find the first byte belonging to this compiled set.
     ///
-    /// Runtime builds authenticate one whole-slice vector leaf before entering
-    /// its loop; compiler-static builds call their fixed leaf directly. Thus a
-    /// long scan does not repeat indirect dispatch for every classified block.
+    /// Runtime builds independently admit whole-slice vector leaves from their
+    /// retained policy-visible features before entering a loop; compiler-static
+    /// builds call their fixed leaves directly. Thus a long scan does not
+    /// repeat indirect dispatch for every classified block.
     #[must_use]
     #[allow(
         unsafe_code,
         reason = "the retained or compiler-fixed receipt proves the target features for the selected whole-slice leaf"
     )]
     pub fn find_first_member(&self, bytes: &[u8]) -> Option<usize> {
+        #[cfg(all(
+            target_arch = "aarch64",
+            target_os = "linux",
+            target_endian = "little",
+            target_feature = "sve",
+            target_feature = "sve2"
+        ))]
+        {
+            let [lower_low, lower_high, upper_low, upper_high] = self.set().words();
+            if self.supports_small_mixed_whole_slice_sve2()
+                && (lower_low != 0 || lower_high != 0)
+                && (upper_low != 0 || upper_high != 0)
+                && let Some(match_values) = self.set().match_values16()
+            {
+                return find_first_member_values16_sve2(match_values, self.set(), bytes);
+            }
+        }
         #[cfg(not(feature = "static-dispatch"))]
         {
             #[cfg(target_arch = "x86_64")]
@@ -572,6 +661,11 @@ impl ByteSetClassifier {
                 if is_ascii_set(self.set()) {
                     return unsafe {
                         find_first_ascii_member_neon(&self.tables, self.set(), bytes)
+                    };
+                }
+                if is_high_only_set(self.set()) {
+                    return unsafe {
+                        find_first_high_member_neon(&self.tables, self.set(), bytes)
                     };
                 }
                 unsafe { find_first_member_neon(&self.tables, self.set(), bytes) }
@@ -598,6 +692,11 @@ impl ByteSetClassifier {
                 if is_ascii_set(self.set()) {
                     return unsafe {
                         find_first_ascii_member_neon(&self.tables, self.set(), bytes)
+                    };
+                }
+                if is_high_only_set(self.set()) {
+                    return unsafe {
+                        find_first_high_member_neon(&self.tables, self.set(), bytes)
                     };
                 }
                 unsafe { find_first_member_neon(&self.tables, self.set(), bytes) }
@@ -790,11 +889,81 @@ fn find_first_member_scalar(set: ByteSet256, bytes: &[u8]) -> Option<usize> {
 
 #[cfg(all(
     target_arch = "aarch64",
+    target_os = "linux",
+    target_endian = "little",
+    target_feature = "sve",
+    target_feature = "sve2"
+))]
+#[allow(
+    unsafe_code,
+    reason = "compiler target features prove SVE2 before the private complete-group scan is called"
+)]
+fn find_first_member_values16_sve2(
+    match_values: [u8; 16],
+    set: ByteSet256,
+    bytes: &[u8],
+) -> Option<usize> {
+    const GROUP_BYTES: usize = BYTE_SET_WIDE_BLOCK_BYTES * 4;
+    let complete_group_len = bytes
+        .len()
+        .checked_sub(bytes.len() % GROUP_BYTES)
+        .expect("a remainder cannot exceed its source length");
+    let group_start = if complete_group_len == 0 {
+        0
+    } else {
+        // SAFETY: compiler target features prove SVE2, and the nonempty prefix
+        // contains only complete 128-byte groups.
+        unsafe {
+            crate::aarch64_sve2::find_byte_values16_128_group_sve2(
+                &match_values,
+                &bytes[..complete_group_len],
+            )
+        }
+    };
+    if group_start != complete_group_len {
+        let group_end = group_start
+            .checked_add(GROUP_BYTES)
+            .expect("a complete group end stays within its source slice");
+        return find_first_member_scalar(set, &bytes[group_start..group_end])
+            .and_then(|relative| group_start.checked_add(relative));
+    }
+
+    let tail = &bytes[complete_group_len..];
+    if tail.len() >= BYTE_SET_WIDE_BLOCK_BYTES
+        && let Some((block_start, mask)) = crate::find_byte_values16_32_block(&match_values, tail)
+    {
+        return complete_group_len.checked_add(block_start)?.checked_add(
+            usize::try_from(mask.member_mask().trailing_zeros())
+                .expect("a 32-bit lane index fits in usize"),
+        );
+    }
+    let complete_tail_len = tail
+        .len()
+        .checked_sub(tail.len() % BYTE_SET_WIDE_BLOCK_BYTES)
+        .expect("a remainder cannot exceed its source length");
+    let scalar_start = complete_group_len
+        .checked_add(complete_tail_len)
+        .expect("complete groups and blocks partition the source slice");
+    find_first_member_scalar(set, &bytes[scalar_start..])
+        .and_then(|relative| scalar_start.checked_add(relative))
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
     any(not(feature = "static-dispatch"), target_feature = "neon")
 ))]
 const fn is_ascii_set(set: ByteSet256) -> bool {
     let [_, _, upper_low, upper_high] = set.words();
     upper_low == 0 && upper_high == 0
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(not(feature = "static-dispatch"), target_feature = "neon")
+))]
+const fn is_high_only_set(set: ByteSet256) -> bool {
+    let [lower_low, lower_high, upper_low, upper_high] = set.words();
+    lower_low == 0 && lower_high == 0 && (upper_low != 0 || upper_high != 0)
 }
 
 #[cfg(all(
@@ -876,6 +1045,10 @@ unsafe fn classify_neon(
     unsafe_code,
     reason = "the caller authenticates NEON once before this whole-slice leaf performs exact fixed-width loads"
 )]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one auditable loop keeps four-vector groups, vector-pair and vector-block tails, and exact scalar recovery under the same preloaded classifier"
+)]
 #[target_feature(enable = "neon")]
 #[inline(never)]
 unsafe fn find_first_member_neon(
@@ -883,6 +1056,7 @@ unsafe fn find_first_member_neon(
     set: ByteSet256,
     bytes: &[u8],
 ) -> Option<usize> {
+    const GROUP_BYTES: usize = BYTE_SET_WIDE_BLOCK_BYTES * 2;
     const BITS: [u8; BYTE_SET_BLOCK_BYTES] = [
         1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128,
     ];
@@ -914,14 +1088,59 @@ unsafe fn find_first_member_neon(
     };
 
     let mut block_start = 0_usize;
-    let mut groups = bytes.chunks_exact(BYTE_SET_WIDE_BLOCK_BYTES);
+    let mut groups = bytes.chunks_exact(GROUP_BYTES);
     for group in &mut groups {
         let first: &[u8; BYTE_SET_BLOCK_BYTES] = group[..BYTE_SET_BLOCK_BYTES]
             .try_into()
-            .expect("a wide group has one exact first NEON block");
-        let second: &[u8; BYTE_SET_BLOCK_BYTES] = group[BYTE_SET_BLOCK_BYTES..]
+            .expect("a four-vector group has one exact first NEON block");
+        let second: &[u8; BYTE_SET_BLOCK_BYTES] =
+            group[BYTE_SET_BLOCK_BYTES..BYTE_SET_WIDE_BLOCK_BYTES]
             .try_into()
-            .expect("a wide group has one exact second NEON block");
+            .expect("a four-vector group has one exact second NEON block");
+        let third: &[u8; BYTE_SET_BLOCK_BYTES] = group
+            [BYTE_SET_WIDE_BLOCK_BYTES..BYTE_SET_WIDE_BLOCK_BYTES + BYTE_SET_BLOCK_BYTES]
+            .try_into()
+            .expect("a four-vector group has one exact third NEON block");
+        let fourth: &[u8; BYTE_SET_BLOCK_BYTES] = group
+            [BYTE_SET_WIDE_BLOCK_BYTES + BYTE_SET_BLOCK_BYTES..GROUP_BYTES]
+            .try_into()
+            .expect("a four-vector group has one exact fourth NEON block");
+        // SAFETY: all four array references prove their exact load extents.
+        let (first_input, second_input, third_input, fourth_input) = unsafe {
+            (
+                vld1q_u8(first.as_ptr()),
+                vld1q_u8(second.as_ptr()),
+                vld1q_u8(third.as_ptr()),
+                vld1q_u8(fourth.as_ptr()),
+            )
+        };
+        let first_pair = vorrq_u8(
+            classify_members(first_input),
+            classify_members(second_input),
+        );
+        let second_pair = vorrq_u8(
+            classify_members(third_input),
+            classify_members(fourth_input),
+        );
+        if vmaxvq_u8(vorrq_u8(first_pair, second_pair)) != 0 {
+            return find_first_member_scalar(set, group)
+                .and_then(|relative| block_start.checked_add(relative));
+        }
+        block_start = block_start
+            .checked_add(GROUP_BYTES)
+            .expect("a complete group stays within its source slice");
+    }
+
+    let remainder = groups.remainder();
+    let mut tail = remainder;
+    if remainder.len() >= BYTE_SET_WIDE_BLOCK_BYTES {
+        let first: &[u8; BYTE_SET_BLOCK_BYTES] = remainder[..BYTE_SET_BLOCK_BYTES]
+            .try_into()
+            .expect("a four-vector remainder has one exact first NEON block");
+        let second: &[u8; BYTE_SET_BLOCK_BYTES] =
+            remainder[BYTE_SET_BLOCK_BYTES..BYTE_SET_WIDE_BLOCK_BYTES]
+            .try_into()
+            .expect("a four-vector remainder has one exact second NEON block");
         // SAFETY: both array references prove their exact load extents.
         let (first_input, second_input) = unsafe {
             (
@@ -934,18 +1153,16 @@ unsafe fn find_first_member_neon(
             classify_members(second_input),
         )) != 0
         {
-            return find_first_member_scalar(set, group)
+            return find_first_member_scalar(set, &remainder[..BYTE_SET_WIDE_BLOCK_BYTES])
                 .and_then(|relative| block_start.checked_add(relative));
         }
         block_start = block_start
             .checked_add(BYTE_SET_WIDE_BLOCK_BYTES)
-            .expect("a complete group stays within its source slice");
+            .expect("a trailing vector pair stays within its source slice");
+        tail = &remainder[BYTE_SET_WIDE_BLOCK_BYTES..];
     }
-
-    let remainder = groups.remainder();
-    let mut tail = remainder;
-    if remainder.len() >= BYTE_SET_BLOCK_BYTES {
-        let block: &[u8; BYTE_SET_BLOCK_BYTES] = remainder[..BYTE_SET_BLOCK_BYTES]
+    if tail.len() >= BYTE_SET_BLOCK_BYTES {
+        let block: &[u8; BYTE_SET_BLOCK_BYTES] = tail[..BYTE_SET_BLOCK_BYTES]
             .try_into()
             .expect("a wide remainder has one exact NEON block");
         // SAFETY: the array reference proves the exact load extent.
@@ -957,9 +1174,72 @@ unsafe fn find_first_member_neon(
         block_start = block_start
             .checked_add(BYTE_SET_BLOCK_BYTES)
             .expect("a trailing vector block stays within its source slice");
-        tail = &remainder[BYTE_SET_BLOCK_BYTES..];
+        tail = &tail[BYTE_SET_BLOCK_BYTES..];
     }
     find_first_member_scalar(set, tail)
+        .and_then(|relative| block_start.checked_add(relative))
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(not(feature = "static-dispatch"), target_feature = "neon")
+))]
+#[allow(
+    unsafe_code,
+    reason = "the caller authenticates NEON once before this high-byte whole-slice gate performs bounded vector loads"
+)]
+#[target_feature(enable = "neon")]
+#[inline(never)]
+unsafe fn find_first_high_member_neon(
+    tables: &ByteSetTables,
+    set: ByteSet256,
+    bytes: &[u8],
+) -> Option<usize> {
+    use core::arch::aarch64::{vld1q_u8, vmaxvq_u8, vorrq_u8};
+
+    const GROUP_BYTES: usize = BYTE_SET_WIDE_BLOCK_BYTES * 4;
+    let mut block_start = 0_usize;
+    let mut consecutive_high_groups = 0_u8;
+    let mut groups = bytes.chunks_exact(GROUP_BYTES);
+    for group in &mut groups {
+        let pointer = group.as_ptr();
+        // SAFETY: the exact 128-byte group proves all eight vector loads.
+        let high_lanes = unsafe {
+            let first_pair = vorrq_u8(vld1q_u8(pointer), vld1q_u8(pointer.add(16)));
+            let second_pair = vorrq_u8(vld1q_u8(pointer.add(32)), vld1q_u8(pointer.add(48)));
+            let third_pair = vorrq_u8(vld1q_u8(pointer.add(64)), vld1q_u8(pointer.add(80)));
+            let fourth_pair = vorrq_u8(vld1q_u8(pointer.add(96)), vld1q_u8(pointer.add(112)));
+            vorrq_u8(
+                vorrq_u8(first_pair, second_pair),
+                vorrq_u8(third_pair, fourth_pair),
+            )
+        };
+        if vmaxvq_u8(high_lanes) < 0x80 {
+            consecutive_high_groups = 0;
+            block_start = block_start
+                .checked_add(GROUP_BYTES)
+                .expect("a complete group stays within its source slice");
+            continue;
+        }
+        // SAFETY: this enclosing leaf already has NEON enabled.
+        if let Some(relative) = unsafe { find_first_member_neon(tables, set, group) } {
+            return block_start.checked_add(relative);
+        }
+        consecutive_high_groups = consecutive_high_groups
+            .checked_add(1)
+            .expect("the fallback threshold is reached after two groups");
+        block_start = block_start
+            .checked_add(GROUP_BYTES)
+            .expect("a complete group stays within its source slice");
+        if consecutive_high_groups == 2 {
+            // SAFETY: this enclosing leaf already has NEON enabled, and the
+            // remaining suffix starts after the two completely serviced groups.
+            return unsafe { find_first_member_neon(tables, set, &bytes[block_start..]) }
+                .and_then(|relative| block_start.checked_add(relative));
+        }
+    }
+    // SAFETY: this enclosing leaf already has NEON enabled.
+    unsafe { find_first_member_neon(tables, set, groups.remainder()) }
         .and_then(|relative| block_start.checked_add(relative))
 }
 
@@ -1605,6 +1885,12 @@ mod tests {
             ByteSet256::from_words([1, 0, 0, 0]),
             ByteSet256::from_words([0, 1_u64 << 63, 1, 1_u64 << 63]),
             ByteSet256::from_words([
+                0,
+                0,
+                0x0000_0000_0001_ffff,
+                (1_u64 << 3) | (1_u64 << 63),
+            ]),
+            ByteSet256::from_words([
                 0x0101_0101_0101_0101,
                 0x8040_2010_0804_0201,
                 0x1111_1111_1111_1111,
@@ -1613,28 +1899,40 @@ mod tests {
         ];
         for set in sets {
             let classifier = ByteSetClassifier::new(set);
-            let nonmember = (0_u8..=u8::MAX)
-                .find(|&byte| !set.contains(byte))
-                .expect("the exercised sets leave a nonmember");
-            let member = (0_u8..=u8::MAX)
-                .find(|&byte| set.contains(byte))
-                .expect("the exercised sets are nonempty");
-            for alignment in 0..=31 {
-                for len in [0_usize, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 129] {
-                    let mut source = vec![nonmember; alignment + len];
-                    assert_eq!(classifier.find_first_member(&source[alignment..]), None);
-                    for position in [0_usize, 1, 15, 16, 17, 31, 32, 63, 64, 128] {
-                        if position >= len {
-                            continue;
+            let members = [
+                (0_u8..0x80).find(|&byte| set.contains(byte)),
+                (0x80_u8..=u8::MAX).find(|&byte| set.contains(byte)),
+            ];
+            for member in members.into_iter().flatten() {
+                let nonmembers = [
+                    (0_u8..0x80).find(|&byte| !set.contains(byte)),
+                    (0x80_u8..=u8::MAX).find(|&byte| !set.contains(byte)),
+                ];
+                for nonmember in nonmembers.into_iter().flatten() {
+                    for alignment in 0..=31 {
+                        for len in [
+                            0_usize, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129,
+                            255, 256, 257, 383, 384, 385,
+                        ] {
+                            let mut source = vec![nonmember; alignment + len];
+                            assert_eq!(classifier.find_first_member(&source[alignment..]), None);
+                            for position in [
+                                0_usize, 1, 15, 16, 17, 31, 32, 63, 64, 127, 128, 255, 256,
+                                383, 384,
+                            ] {
+                                if position >= len {
+                                    continue;
+                                }
+                                source[alignment + position] = member;
+                                let bytes = &source[alignment..];
+                                assert_eq!(
+                                    classifier.find_first_member(bytes),
+                                    bytes.iter().position(|&byte| set.contains(byte)),
+                                    "set={set:?} member={member} nonmember={nonmember} alignment={alignment} len={len} position={position}",
+                                );
+                                source[alignment + position] = nonmember;
+                            }
                         }
-                        source[alignment + position] = member;
-                        let bytes = &source[alignment..];
-                        assert_eq!(
-                            classifier.find_first_member(bytes),
-                            bytes.iter().position(|&byte| set.contains(byte)),
-                            "set={set:?} alignment={alignment} len={len} position={position}",
-                        );
-                        source[alignment + position] = nonmember;
                     }
                 }
             }
@@ -1725,6 +2023,58 @@ mod tests {
             classifier.wide_selection().delegate_variant_id,
             Some("byte-set.mask16.scalar.v1")
         );
+    }
+
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_os = "linux",
+        target_endian = "little",
+        target_feature = "sve",
+        target_feature = "sve2"
+    ))]
+    #[test]
+    fn small_mixed_whole_slice_sve2_respects_dispatch_authority() {
+        let set = ByteSet256::from_words([1, 0, 1, 0]);
+        #[cfg(not(feature = "static-dispatch"))]
+        {
+            use crate::{Feature, FeatureSet};
+
+            let portable = ByteSetClassifier::with_policy(set, DispatchPolicy::Portable).unwrap();
+            assert!(!portable.supports_small_mixed_whole_slice_sve2());
+
+            let neon_only = ByteSetClassifier::with_policy(
+                set,
+                DispatchPolicy::AllowOnly(FeatureSet::of(Feature::ArmNeon)),
+            )
+            .unwrap();
+            assert!(!neon_only.supports_small_mixed_whole_slice_sve2());
+
+            let sve2_only = ByteSetClassifier::with_policy(
+                set,
+                DispatchPolicy::AllowOnly(
+                    FeatureSet::of(Feature::ArmSve).with(Feature::ArmSve2),
+                ),
+            )
+            .unwrap();
+
+            let automatic = ByteSetClassifier::new(set);
+            let usable = automatic.selection().policy_usable;
+            if usable.contains(Feature::ArmSve) && usable.contains(Feature::ArmSve2) {
+                assert!(sve2_only.supports_small_mixed_whole_slice_sve2());
+                assert!(automatic.supports_small_mixed_whole_slice_sve2());
+            } else {
+                assert!(!sve2_only.supports_small_mixed_whole_slice_sve2());
+                assert!(!automatic.supports_small_mixed_whole_slice_sve2());
+            }
+        }
+        #[cfg(feature = "static-dispatch")]
+        {
+            let automatic = ByteSetClassifier::new(set);
+            assert_eq!(
+                automatic.supports_small_mixed_whole_slice_sve2(),
+                cfg!(feature = "static-dispatch-arm-41-d84")
+            );
+        }
     }
 
     #[cfg(all(not(feature = "static-dispatch"), target_arch = "x86_64"))]
