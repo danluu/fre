@@ -5564,6 +5564,21 @@ impl FrozenDynamicRowsStorage {
 }
 
 impl FrozenDynamicRowsStorageV3 {
+    /// Return the completed live-K0 receipt from which this immutable owner
+    /// was copied. A second compiler-owned sidecar may reuse the receipt only
+    /// through APIs that reauthenticate its program instance and live cache
+    /// lineage; exposing it avoids attempting a second one-shot prefill.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn compiler_private_fully_prefilled_fallback_receipt(
+        &self,
+    ) -> FullyPrefilledFallbackReceipt {
+        FullyPrefilledFallbackReceipt {
+            program_instance: self.root_prefill_receipt.program_instance,
+            k0: self.root_prefill_receipt.k0,
+        }
+    }
+
     fn descriptor_is_valid_for(&self, identity: ProgramIdentity) -> bool {
         let rows = self.descriptor;
         let Ok(state_count) = usize::try_from(rows.state_count) else {
@@ -12084,6 +12099,46 @@ impl CompiledProgram {
             cache_identity: mapping.cache_identity(),
             format_version: owner.descriptor.format_version,
             fully_prefilled,
+        }))
+    }
+
+    /// Project one compiler-owned static hole into the independently owned
+    /// scanner-free continuation table.
+    ///
+    /// The continuation owner is intentionally a private newtype: ordinary
+    /// public-root publication cannot unwrap it, while this entry delegates
+    /// to the same exact ticket, cache-lineage, and canonical-state checks as
+    /// the established root-compatible owner.
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the private projection binds one exact artifact, owner, ticket, and native frontier"
+    )]
+    pub fn try_project_static_prefix_resume_ticket_with_frozen_static_continuation_rows(
+        &self,
+        haystack: &[u8],
+        workspace: &mut ProgramWorkspace,
+        owner: &FrozenStaticContinuationRowsStorageV1,
+        resume_state: usize,
+        resume_position: usize,
+        pending_end_word: usize,
+    ) -> Result<Option<FrozenStaticPrefixResumeProjection>, CompileError> {
+        let projection = self.try_project_static_prefix_resume_ticket_with_frozen_rows(
+            haystack,
+            workspace,
+            &owner.rows,
+            resume_state,
+            resume_position,
+            pending_end_word,
+        )?;
+        Ok(projection.filter(|projection| {
+            projection.format_version == owner.compiler_private_format_version()
+                && matches!(
+                    projection.format_version,
+                    FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION
+                        | FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION
+                        | FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION
+                )
         }))
     }
 

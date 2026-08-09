@@ -79,12 +79,13 @@ use std::sync::{Arc, Mutex, OnceLock, TryLockError};
 
 use fre_aot_regex::{
     CompileError, CompiledProgram, FrozenCompactLoopScanner, FrozenDynamicRowsStorageV3,
-    FrozenPreparedHeaderV6, FullyPrefilledFallbackReceipt, MatchResult, OutputContract,
+    FrozenPreparedHeaderV6, FrozenStaticContinuationRowsStorageV1,
+    FullyPrefilledFallbackReceipt, MatchResult, OutputContract,
     FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION, FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION,
     FROZEN_DYNAMIC_ROWS_V8_FORMAT_VERSION, FROZEN_DYNAMIC_ROWS_V9_FORMAT_VERSION,
     FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION, FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION,
     FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION, FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION,
-    FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION,
+    FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION, FROZEN_PREPARED_HEADER_V6_BYTES,
     PROGRAM_HEADER_LEN, ProgramFormatError, ProgramWorkspace, RetainedPartialPreflight,
     STATIC_PREFIX_RESUME_DESCRIPTOR_V1_HEADER_BYTES,
     STATIC_PREFIX_RESUME_DESCRIPTOR_V1_MAX_BYTES, SearchWindow,
@@ -109,6 +110,9 @@ pub const STATUS_PARTIAL_PREFLIGHT_ENTER: u32 = 6;
 /// Compiler-private status selecting an authenticated local static-resume tail.
 #[doc(hidden)]
 pub const STATUS_STATIC_PREFIX_NATIVE_RESUME: u32 = 7;
+/// Compiler-private status selecting the dense continuation local tail.
+#[doc(hidden)]
+pub const STATUS_STATIC_PREFIX_NATIVE_DENSE_RESUME: u32 = 8;
 /// Successful status for prepare and destroy lifecycle operations.
 pub const STATUS_SUCCESS: u32 = 0;
 /// Bytes in the exact SHA-256 semantic-artifact identity accepted by resume.
@@ -415,9 +419,11 @@ impl Default for FreAotRegexExclusiveHandleV1 {
 #[repr(C)]
 pub struct PreparedAotRegex {
     frozen_header: FrozenPreparedHeaderV6,
+    static_continuation_header: FrozenPreparedHeaderV6,
     program: CompiledProgram,
     workspace: ProgramWorkspace,
     frozen_dynamic_rows: Option<FrozenDynamicRowsStorageV3>,
+    frozen_static_continuation_rows: Option<FrozenStaticContinuationRowsStorageV1>,
     fully_prefilled_fallback: Option<FullyPrefilledFallbackReceipt>,
     static_prefix_object_ticket: Option<StaticPrefixObjectTicket>,
 }
@@ -435,6 +441,10 @@ struct StaticPrefixObjectTicket {
 }
 
 const _: () = assert!(std::mem::offset_of!(PreparedAotRegex, frozen_header) == 0);
+const _: () = assert!(
+    std::mem::offset_of!(PreparedAotRegex, static_continuation_header)
+        == FROZEN_PREPARED_HEADER_V6_BYTES
+);
 
 // A complete compact sidecar is optional setup-only storage. Retain the
 // established K0-size admission and independently bound its final immutable
@@ -479,6 +489,10 @@ impl PreparedAotRegex {
                 FROZEN_DYNAMIC_SIDECAR_MAX_K0_BYTES,
                 FROZEN_DYNAMIC_SIDECAR_MAX_PACKED_BYTES,
             );
+        let static_continuation_receipt = frozen_dynamic_rows
+            .as_ref()
+            .map(FrozenDynamicRowsStorageV3::compiler_private_fully_prefilled_fallback_receipt)
+            .or(fully_prefilled_fallback);
         let mut frozen_header = if frozen_dynamic_rows.is_some() {
             program.compiler_private_frozen_prepared_header_v6(
                 &workspace,
@@ -503,11 +517,31 @@ impl PreparedAotRegex {
         if !frozen_header.has_dynamic_rows() {
             frozen_dynamic_rows = None;
         }
+        let frozen_static_continuation_rows = program
+            .compiler_private_frozen_static_continuation_rows_storage_v3_with_fallback_receipt(
+                &mut workspace,
+                static_continuation_receipt,
+                FROZEN_DYNAMIC_SIDECAR_MAX_K0_BYTES,
+                FROZEN_DYNAMIC_SIDECAR_MAX_PACKED_BYTES,
+            );
+        let static_continuation_header = frozen_static_continuation_rows
+            .as_ref()
+            .and_then(|owner| {
+                program.compiler_private_frozen_static_continuation_prepared_header_v6(
+                    &workspace,
+                    owner,
+                )
+            })
+            .unwrap_or_else(|| {
+                program.compiler_private_frozen_prepared_header_v6(&workspace, None, None)
+            });
         Ok(Self {
             frozen_header,
+            static_continuation_header,
             program,
             workspace,
             frozen_dynamic_rows,
+            frozen_static_continuation_rows,
             fully_prefilled_fallback,
             static_prefix_object_ticket: None,
         })
@@ -521,6 +555,14 @@ impl PreparedAotRegex {
         );
         if self.frozen_header.is_active() {
             self.frozen_header.deactivate();
+        }
+        debug_assert!(
+            !self.static_continuation_header.has_dynamic_rows()
+                || self.frozen_static_continuation_rows.is_some(),
+            "an active static-continuation header must retain its immutable payload owner"
+        );
+        if self.static_continuation_header.is_active() {
+            self.static_continuation_header.deactivate();
         }
     }
 
@@ -869,6 +911,7 @@ impl PreparedAotRegex {
             // continuation but must never retain the stale owner.
             self.fully_prefilled_fallback = None;
             self.frozen_dynamic_rows = None;
+            self.frozen_static_continuation_rows = None;
             self.frozen_dynamic_rows = self
                 .program
                 .compiler_private_frozen_dynamic_rows_storage_v3_with_fallback_receipt(
@@ -877,21 +920,90 @@ impl PreparedAotRegex {
                     FROZEN_DYNAMIC_SIDECAR_MAX_K0_BYTES,
                     FROZEN_DYNAMIC_SIDECAR_MAX_PACKED_BYTES,
                 );
+            let static_continuation_receipt = self
+                .frozen_dynamic_rows
+                .as_ref()
+                .map(
+                    FrozenDynamicRowsStorageV3::compiler_private_fully_prefilled_fallback_receipt,
+                )
+                .unwrap_or(receipt);
+            self.frozen_static_continuation_rows = self
+                .program
+                .compiler_private_frozen_static_continuation_rows_storage_v3_with_fallback_receipt(
+                    &mut self.workspace,
+                    Some(static_continuation_receipt),
+                    FROZEN_DYNAMIC_SIDECAR_MAX_K0_BYTES,
+                    FROZEN_DYNAMIC_SIDECAR_MAX_PACKED_BYTES,
+                );
         }
         Ok(())
     }
 
     /// Authenticate one immutable compact continuation and publish the exact
-    /// offset-zero header consumed by the generated local tail.  The returned
-    /// words are physical-layout independent: canonical state and an optional
-    /// pending endpoint encoded with zero as the absent sentinel.
+    /// stable header consumed by the selected generated local tail. The dense
+    /// continuation owner at the fixed second-header offset has precedence;
+    /// the established root-compatible offset-zero owner remains status 7.
+    /// Returned state words are physical-layout independent.
     fn project_static_prefix_resume_to_frozen_owner(
         &mut self,
         haystack: &[u8],
         resume_state: usize,
         resume_position: usize,
         pending_end: usize,
-    ) -> Result<Option<(usize, usize)>, CompileError> {
+    ) -> Result<Option<(u32, usize, usize)>, CompileError> {
+        if let Some(owner) = self.frozen_static_continuation_rows.as_ref()
+            && let Some(projection) = self
+                .program
+                .try_project_static_prefix_resume_ticket_with_frozen_static_continuation_rows(
+                    haystack,
+                    &mut self.workspace,
+                    owner,
+                    resume_state,
+                    resume_position,
+                    pending_end,
+                )?
+        {
+            let header = self
+                .program
+                .compiler_private_frozen_static_continuation_prepared_header_v6(
+                    &self.workspace,
+                    owner,
+                );
+            if let Some(header) = header
+                && let Some(header_format) =
+                    header.compiler_private_dynamic_rows_format_version()
+                && header_format == projection.format_version()
+                && matches!(
+                    header_format,
+                    FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION
+                        | FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION
+                        | FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION
+                )
+            {
+                let canonical_state = projection.canonical_state();
+                let pending_end = match projection.pending_end() {
+                    None => 0,
+                    Some(0) => {
+                        return Err(CompileError::InternalInvariant(
+                            "static-prefix native projection cannot encode a zero pending endpoint",
+                        ));
+                    }
+                    Some(pending_end) => pending_end,
+                };
+                self.program
+                    .consume_static_prefix_resume_projection_with_workspace(
+                        haystack,
+                        &mut self.workspace,
+                        projection,
+                    )?;
+                self.static_continuation_header = header;
+                return Ok(Some((
+                    STATUS_STATIC_PREFIX_NATIVE_DENSE_RESUME,
+                    canonical_state,
+                    pending_end,
+                )));
+            }
+        }
         let Some(owner) = self.frozen_dynamic_rows.as_ref() else {
             return Ok(None);
         };
@@ -967,7 +1079,11 @@ impl PreparedAotRegex {
         // generation at the same stable offset-zero address before native
         // execution resumes synchronously.
         self.frozen_header = header;
-        Ok(Some((canonical_state, pending_end)))
+        Ok(Some((
+            STATUS_STATIC_PREFIX_NATIVE_RESUME,
+            canonical_state,
+            pending_end,
+        )))
     }
 
     fn search_from_static_prefix_resume_ticket(
@@ -2106,12 +2222,12 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_compiler_private_search_exclusive
             resume_position,
             pending_end,
         ) {
-            Ok(Some((canonical_state, pending_end))) => {
+            Ok(Some((status, canonical_state, pending_end))) => {
                 result_ptr.write(FreAotRegexResultV1 {
                     start: canonical_state,
                     end: pending_end,
                 });
-                return STATUS_STATIC_PREFIX_NATIVE_RESUME;
+                return status;
             }
             Ok(None) => {}
             Err(_) => return STATUS_RUNTIME_FAILURE,
@@ -3883,6 +3999,14 @@ mod tests {
                 .compiler_private_dynamic_rows_format_version(),
             Some(fre_aot_regex::FROZEN_DYNAMIC_ROWS_V7_FORMAT_VERSION)
         );
+        assert!(overlay.frozen_static_continuation_rows.is_some());
+        assert!(overlay.static_continuation_header.has_dynamic_rows());
+        assert!(matches!(
+            overlay
+                .static_continuation_header
+                .compiler_private_dynamic_rows_format_version(),
+            Some(FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION | FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION)
+        ));
 
         let plain = prepared(
             r"(?-u:(?:a|[^a][\x00-\xff]){4})",
@@ -3894,6 +4018,32 @@ mod tests {
                 .frozen_header
                 .compiler_private_dynamic_rows_format_version(),
             Some(FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION)
+        );
+        assert!(plain.frozen_static_continuation_rows.is_some());
+        assert_eq!(
+            plain
+                .static_continuation_header
+                .compiler_private_dynamic_rows_format_version(),
+            Some(FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION)
+        );
+
+        let unary = prepared(
+            r"(?s-u:.{3,})",
+            OutputContract::Exists,
+            CompileMode::Fast,
+        );
+        assert_eq!(
+            unary
+                .frozen_header
+                .compiler_private_dynamic_rows_format_version(),
+            Some(fre_aot_regex::FROZEN_DYNAMIC_ROWS_V5_FORMAT_VERSION)
+        );
+        assert!(unary.frozen_static_continuation_rows.is_some());
+        assert_eq!(
+            unary
+                .static_continuation_header
+                .compiler_private_dynamic_rows_format_version(),
+            Some(FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION)
         );
     }
 
@@ -4000,11 +4150,16 @@ mod tests {
             frozen_dynamic_rows.as_ref(),
         );
         assert!(!frozen_header.is_active());
+        let static_continuation_header =
+            program.compiler_private_frozen_prepared_header_v6(&workspace, None, None);
+        assert!(!static_continuation_header.is_active());
         let prepared = PreparedAotRegex {
             frozen_header,
+            static_continuation_header,
             program,
             workspace,
             frozen_dynamic_rows,
+            frozen_static_continuation_rows: None,
             fully_prefilled_fallback,
             static_prefix_object_ticket: None,
         };
@@ -4588,6 +4743,10 @@ mod tests {
     )]
     fn c_abi_layout_declarations_and_function_types_are_stable() {
         assert_eq!(std::mem::offset_of!(PreparedAotRegex, frozen_header), 0);
+        assert_eq!(
+            std::mem::offset_of!(PreparedAotRegex, static_continuation_header),
+            FROZEN_PREPARED_HEADER_V6_BYTES
+        );
         assert_eq!(
             size_of::<fre_aot_regex::FrozenPreparedHeaderV1>(),
             fre_aot_regex::FROZEN_PREPARED_HEADER_V1_BYTES
@@ -7777,6 +7936,9 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
         );
         assert!(direct.frozen_header.has_dynamic_rows());
         assert!(direct.frozen_header.is_active());
+        assert!(direct.frozen_static_continuation_rows.is_some());
+        assert!(direct.static_continuation_header.has_dynamic_rows());
+        assert!(direct.static_continuation_header.is_active());
         assert_eq!(*direct.frozen_header.artifact_identity(), identity);
         assert_eq!(
             (&raw const direct).cast::<u8>().addr(),
@@ -7785,6 +7947,7 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
         );
         assert_eq!(direct.search(haystack, window).unwrap(), expected);
         assert!(!direct.frozen_header.is_active());
+        assert!(!direct.static_continuation_header.is_active());
         assert_eq!(direct.search(haystack, window).unwrap(), expected);
         assert!(!direct.frozen_header.is_active(), "a legacy search cannot reactivate");
 
