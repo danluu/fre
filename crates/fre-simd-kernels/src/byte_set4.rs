@@ -890,10 +890,16 @@ mod tests {
                 .find(|byte| !members.contains(byte))
                 .expect("four values leave at least one nonmember");
             for alignment in 0..=31 {
-                for len in [0_usize, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 129] {
+                for len in [
+                    0_usize, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 191, 192,
+                    193, 255, 256, 257, 319, 320, 321,
+                ] {
                     let mut source = vec![nonmember; alignment + len];
                     assert_eq!(find_byte_set4(members, &source[alignment..]), None);
-                    for position in [0_usize, 1, 15, 16, 17, 31, 32, 63, 64, 128] {
+                    for position in [
+                        0_usize, 1, 15, 16, 17, 31, 32, 63, 64, 65, 127, 128, 129, 191, 192,
+                        193, 255, 256, 257, 319, 320,
+                    ] {
                         if position >= len {
                             continue;
                         }
@@ -907,6 +913,19 @@ mod tests {
                         source[alignment + position] = nonmember;
                     }
                 }
+                let mut source = vec![nonmember; alignment + 321];
+                for (index, position) in [143_usize, 144, 159, 160, 191, 192, 255, 256]
+                    .into_iter()
+                    .enumerate()
+                {
+                    source[alignment + position] = members[index % members.len()];
+                }
+                let bytes = &source[alignment..];
+                assert_eq!(
+                    find_byte_set4(members, bytes),
+                    bytes.iter().position(|byte| members.contains(byte)),
+                    "multiple hits lost source order: members={members:?} alignment={alignment}",
+                );
             }
         }
     }

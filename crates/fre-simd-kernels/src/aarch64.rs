@@ -304,11 +304,20 @@ pub(super) unsafe fn classify_byte_set4_16_neon(
     target_feature = "neon",
     not(feature = "static-dispatch-arm-41-d84")
 ))]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one leaf keeps the exact-density prelude, coarse groups, retained exact recovery, and bounded tails under the same preloaded four-value classifier"
+)]
 #[target_feature(enable = "neon")]
 #[inline(never)]
 pub(super) unsafe fn find_byte_set4_neon(members: [u8; 4], bytes: &[u8]) -> Option<usize> {
     use core::arch::aarch64::{vmaxvq_u8, vorrq_u8};
 
+    const COARSE_GROUP_BYTES: usize = BYTE_SET_WIDE_BLOCK_BYTES * 2;
+    // Four distinct uniform values have an expected gap of 256 / 4 = 64
+    // bytes. Two gaps of ordered exact misses form a corpus-independent local
+    // density test; duplicate values only make the switch more conservative.
+    const EXACT_PRELUDE_BYTES: usize = BYTE_SET_WIDE_BLOCK_BYTES * 4;
     let first = vdupq_n_u8(members[0]);
     let second = vdupq_n_u8(members[1]);
     let third = vdupq_n_u8(members[2]);
@@ -319,15 +328,13 @@ pub(super) unsafe fn find_byte_set4_neon(members: [u8; 4], bytes: &[u8]) -> Opti
             vorrq_u8(vceqq_u8(input, third), vceqq_u8(input, fourth)),
         )
     };
-    let mut block_start = 0_usize;
-    let mut groups = bytes.chunks_exact(BYTE_SET_WIDE_BLOCK_BYTES);
-    for group in &mut groups {
-        let first_block: &[u8; BYTE_SET_BLOCK_BYTES] = group[..BYTE_SET_BLOCK_BYTES]
+    let classify_pair = |pair: &[u8; BYTE_SET_WIDE_BLOCK_BYTES]| {
+        let first_block: &[u8; BYTE_SET_BLOCK_BYTES] = pair[..BYTE_SET_BLOCK_BYTES]
             .try_into()
-            .expect("a wide group has one exact first NEON block");
-        let second_block: &[u8; BYTE_SET_BLOCK_BYTES] = group[BYTE_SET_BLOCK_BYTES..]
+            .expect("an exact pair has one first NEON block");
+        let second_block: &[u8; BYTE_SET_BLOCK_BYTES] = pair[BYTE_SET_BLOCK_BYTES..]
             .try_into()
-            .expect("a wide group has one exact second NEON block");
+            .expect("an exact pair has one second NEON block");
         // SAFETY: both array references prove their exact load extents.
         let (first_input, second_input) = unsafe {
             (
@@ -335,20 +342,106 @@ pub(super) unsafe fn find_byte_set4_neon(members: [u8; 4], bytes: &[u8]) -> Opti
                 vld1q_u8(second_block.as_ptr()),
             )
         };
-        if vmaxvq_u8(vorrq_u8(classify(first_input), classify(second_input))) != 0 {
-            return group
+        vmaxvq_u8(vorrq_u8(classify(first_input), classify(second_input))) != 0
+    };
+
+    let mut block_start = 0_usize;
+    let complete_prelude_len = bytes
+        .len()
+        .min(EXACT_PRELUDE_BYTES)
+        .checked_sub(bytes.len().min(EXACT_PRELUDE_BYTES) % BYTE_SET_WIDE_BLOCK_BYTES)
+        .expect("a remainder cannot exceed its source length");
+    for pair in bytes[..complete_prelude_len].chunks_exact(BYTE_SET_WIDE_BLOCK_BYTES) {
+        let pair: &[u8; BYTE_SET_WIDE_BLOCK_BYTES] = pair
+            .try_into()
+            .expect("an exact prelude chunk has the fixed pair extent");
+        if classify_pair(pair) {
+            return pair
                 .iter()
                 .position(|byte| members.contains(byte))
                 .and_then(|relative| block_start.checked_add(relative));
         }
         block_start = block_start
             .checked_add(BYTE_SET_WIDE_BLOCK_BYTES)
-            .expect("a complete group stays within its source slice");
+            .expect("the exact prelude stays within its source slice");
     }
-    let remainder = groups.remainder();
-    let mut tail = remainder;
-    if remainder.len() >= BYTE_SET_BLOCK_BYTES {
-        let block: &[u8; BYTE_SET_BLOCK_BYTES] = remainder[..BYTE_SET_BLOCK_BYTES]
+
+    let remaining = &bytes[block_start..];
+    let complete_coarse_len = remaining
+        .len()
+        .checked_sub(remaining.len() % COARSE_GROUP_BYTES)
+        .expect("a remainder cannot exceed its source length");
+    // Keep one final complete group on the exact path. A lone coarse decision
+    // cannot amortize itself, while the ordered tail protects late positives.
+    let coarse_len = complete_coarse_len.saturating_sub(COARSE_GROUP_BYTES);
+    for group in remaining[..coarse_len].chunks_exact(COARSE_GROUP_BYTES) {
+        let pointer = group.as_ptr();
+        // SAFETY: the exact 64-byte group proves all four vector loads.
+        let (input0, input1, input2, input3) = unsafe {
+            (
+                vld1q_u8(pointer),
+                vld1q_u8(pointer.add(16)),
+                vld1q_u8(pointer.add(32)),
+                vld1q_u8(pointer.add(48)),
+            )
+        };
+        let lanes0 = classify(input0);
+        let lanes1 = classify(input1);
+        let lanes2 = classify(input2);
+        let lanes3 = classify(input3);
+        let first_pair = vorrq_u8(lanes0, lanes1);
+        let second_pair = vorrq_u8(lanes2, lanes3);
+        if vmaxvq_u8(vorrq_u8(first_pair, second_pair)) != 0 {
+            let (vector_offset, lanes) = if vmaxvq_u8(first_pair) != 0 {
+                if vmaxvq_u8(lanes0) != 0 {
+                    (0_usize, lanes0)
+                } else {
+                    (BYTE_SET_BLOCK_BYTES, lanes1)
+                }
+            } else if vmaxvq_u8(lanes2) != 0 {
+                (BYTE_SET_WIDE_BLOCK_BYTES, lanes2)
+            } else {
+                (BYTE_SET_WIDE_BLOCK_BYTES + BYTE_SET_BLOCK_BYTES, lanes3)
+            };
+            // SAFETY: the retained comparison lanes were produced inside this
+            // NEON leaf, the fixed constant supplies one complete initialized
+            // vector, and the helper performs only register arithmetic.
+            let lane_weights = unsafe { vld1q_u8(LANE_WEIGHTS.as_ptr()) };
+            let mask = unsafe { boolean_lanes_to_mask(lanes, lane_weights) };
+            debug_assert_ne!(mask, 0);
+            let lane = usize::try_from(mask.trailing_zeros())
+                .expect("a sixteen-bit lane index fits in usize");
+            return block_start
+                .checked_add(vector_offset)
+                .and_then(|vector_start| vector_start.checked_add(lane));
+        }
+        block_start = block_start
+            .checked_add(COARSE_GROUP_BYTES)
+            .expect("a complete coarse group stays within its source slice");
+    }
+
+    let remainder = &remaining[coarse_len..];
+    let complete_pair_len = remainder
+        .len()
+        .checked_sub(remainder.len() % BYTE_SET_WIDE_BLOCK_BYTES)
+        .expect("a remainder cannot exceed its source length");
+    for pair in remainder[..complete_pair_len].chunks_exact(BYTE_SET_WIDE_BLOCK_BYTES) {
+        let pair: &[u8; BYTE_SET_WIDE_BLOCK_BYTES] = pair
+            .try_into()
+            .expect("an exact coarse tail has the fixed pair extent");
+        if classify_pair(pair) {
+            return pair
+                .iter()
+                .position(|byte| members.contains(byte))
+                .and_then(|relative| block_start.checked_add(relative));
+        }
+        block_start = block_start
+            .checked_add(BYTE_SET_WIDE_BLOCK_BYTES)
+            .expect("a trailing vector pair stays within its source slice");
+    }
+    let mut tail = &remainder[complete_pair_len..];
+    if tail.len() >= BYTE_SET_BLOCK_BYTES {
+        let block: &[u8; BYTE_SET_BLOCK_BYTES] = tail[..BYTE_SET_BLOCK_BYTES]
             .try_into()
             .expect("a wide remainder has one exact NEON block");
         // SAFETY: the array reference proves the exact load extent.
@@ -362,7 +455,7 @@ pub(super) unsafe fn find_byte_set4_neon(members: [u8; 4], bytes: &[u8]) -> Opti
         block_start = block_start
             .checked_add(BYTE_SET_BLOCK_BYTES)
             .expect("a trailing vector block stays within its source slice");
-        tail = &remainder[BYTE_SET_BLOCK_BYTES..];
+        tail = &tail[BYTE_SET_BLOCK_BYTES..];
     }
     tail.iter()
         .position(|byte| members.contains(byte))
