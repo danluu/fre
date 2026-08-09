@@ -6979,6 +6979,68 @@ impl K0Workspace {
         })
     }
 
+    /// Project one selected resume state from an already sealed complete map.
+    ///
+    /// This is the hot-path counterpart of the fully checked projection above.
+    /// The opaque receipt can only be created by a complete cache transaction,
+    /// and `fully_prefilled_cache_identity` is published only after every
+    /// resume entry has been authenticated. Ordinary hint repair clears that
+    /// set-level seal before changing an entry. Therefore the process-unique
+    /// cache generation and the selected entry are sufficient here; setup-time
+    /// row, arena, and semantic-frontier checks are not repeated per match.
+    ///
+    /// This projection is only authority to select a separately owned,
+    /// immutable frozen row. It is not authority to dereference live K0 rows;
+    /// those paths retain the complete receipt validation above.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn compiler_private_frozen_owner_resume_state_projection(
+        &self,
+        automaton: &Automaton,
+        resume_set: &K0ResumeSet,
+        resume_state: usize,
+        receipt: K0FullyPrefilledResumeCacheReceipt,
+    ) -> Option<K0FullyPrefilledResumeStateProjection> {
+        if receipt.cache_identity == 0
+            || receipt.automaton_identity != automaton.identity()
+            || self.bound_automaton_identity != receipt.automaton_identity
+            || self.lazy.automaton_identity != receipt.automaton_identity
+            || self.lazy.cache_identity != receipt.cache_identity
+            || resume_set.automaton_identity != receipt.automaton_identity
+            || resume_set.fully_prefilled_cache_identity != receipt.cache_identity
+            || receipt.direct_row_stride == 0
+            || receipt.forward_state_len == 0
+        {
+            return None;
+        }
+        let mode = *resume_set.modes.get(resume_state)?;
+        let source_state = *resume_set.cached_states.get(resume_state)?;
+        let cached_identity = *resume_set
+            .cached_workspace_identities
+            .get(resume_state)?;
+        if mode > 1
+            || cached_identity != receipt.cache_identity
+            || source_state == LAZY_NO_STATE
+            || usize::try_from(source_state).ok()? >= receipt.forward_state_len
+        {
+            return None;
+        }
+        let source_initial_state = self.lazy.initial;
+        if source_initial_state == LAZY_NO_STATE
+            || usize::try_from(source_initial_state).ok()? >= receipt.forward_state_len
+        {
+            return None;
+        }
+        Some(K0FullyPrefilledResumeStateProjection {
+            source_state,
+            source_initial_state,
+            state_count: receipt.forward_state_len,
+            row_stride: receipt.direct_row_stride,
+            cache_identity: receipt.cache_identity,
+            pending: mode != 0,
+        })
+    }
+
     /// Authenticate every ordered-resume entry and borrow its frozen K0 map
     /// for a versioned exclusive-runtime header.
     ///
@@ -51078,6 +51140,15 @@ mod tests {
                     receipt,
                 )
                 .expect("constant-time selected resume projection");
+            let sealed = workspace
+                .compiler_private_frozen_owner_resume_state_projection(
+                    &plan,
+                    &resume,
+                    resume_state,
+                    receipt,
+                )
+                .expect("the setup-sealed map must project the selected state");
+            assert_eq!(sealed, selected);
             assert_eq!(selected.source_state(), resume.cached_states[resume_state]);
             assert_eq!(selected.source_initial_state(), source_initial_state);
             assert_eq!(selected.state_count(), receipt.forward_state_len);
@@ -51222,6 +51293,14 @@ mod tests {
                 .compiler_private_fully_prefilled_resume_map_projection(&plan, &resume, receipt)
                 .is_none(),
             "ordinary hint repair must revoke the authenticated resume map"
+        );
+        assert!(
+            workspace
+                .compiler_private_frozen_owner_resume_state_projection(
+                    &plan, &resume, 0, receipt,
+                )
+                .is_none(),
+            "ordinary hint repair must revoke the sealed hot projection"
         );
     }
 

@@ -11821,7 +11821,7 @@ impl CompiledProgram {
         // the suffix itself. The compact builder's zero/root swap is
         // self-inverse.
         let Some(mapping) = nfa_read
-            .compiler_private_fully_prefilled_resume_state_projection(
+            .compiler_private_frozen_owner_resume_state_projection(
                 &self.automaton,
                 &state.resume,
                 resume_state,
