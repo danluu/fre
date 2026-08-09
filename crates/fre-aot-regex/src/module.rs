@@ -2554,6 +2554,10 @@ fn lower_native_dynamic_rows_prepared(
     ))
 }
 
+#[allow(
+    dead_code,
+    reason = "kept to authenticate and service the legacy raw slow-partial object ABI"
+)]
 struct NativeSlowPartialWrapper {
     code: Vec<u8>,
     relocations: Vec<ModuleRelocation>,
@@ -2566,8 +2570,9 @@ struct NativeSlowPartialWrapper {
 /// reloads the untouched original arguments and tailcalls the semantic
 /// runtime for the whole search.
 #[allow(
+    dead_code,
     clippy::too_many_lines,
-    reason = "program, transient table, wrapper, core, and relocation addends form one transaction"
+    reason = "legacy program, transient table, wrapper, core, and relocation addends form one compatibility transaction"
 )]
 fn lower_native_slow_partial_with_data_limit(
     mut program_bytes: Vec<u8>,
@@ -2743,6 +2748,10 @@ fn lower_native_slow_partial_with_data_limit(
 /// Apply the optional-native decline policy to the complete slow-prefix
 /// transaction, including table emission, wrapper composition, local fixups,
 /// and relocation retargeting.
+#[allow(
+    dead_code,
+    reason = "kept as a testable compatibility constructor for the legacy raw object ABI"
+)]
 fn lower_optional_native_slow_partial_with_data_limit(
     program_bytes: &[u8],
     view: NativeProgramView<'_>,
@@ -13109,6 +13118,10 @@ fn lower_x86_64_prepared_runtime_adapter() -> (Vec<u8>, Vec<ModuleRelocation>) {
     )
 }
 
+#[allow(
+    dead_code,
+    reason = "used by the retained legacy slow-partial compatibility emitter"
+)]
 fn patch_x86_64_local_call(
     code: &mut [u8],
     displacement_offset: usize,
@@ -13148,8 +13161,9 @@ fn patch_x86_64_local_call(
 }
 
 #[allow(
+    dead_code,
     clippy::too_many_lines,
-    reason = "the public ABI checks, local outcomes, and whole-search tail deopt stay contiguous"
+    reason = "legacy public ABI checks, local outcomes, and whole-search tail deopt stay contiguous"
 )]
 fn lower_x86_64_slow_partial_wrapper(
     output: OutputContract,
@@ -24741,6 +24755,10 @@ fn lower_aarch64_prepared_runtime_adapter() -> (Vec<u8>, Vec<ModuleRelocation>) 
     )
 }
 
+#[allow(
+    dead_code,
+    reason = "used by the retained legacy slow-partial compatibility emitter"
+)]
 fn patch_aarch64_local_call(
     code: &mut [u8],
     instruction_offset: usize,
@@ -24776,8 +24794,9 @@ fn patch_aarch64_local_call(
 }
 
 #[allow(
+    dead_code,
     clippy::too_many_lines,
-    reason = "the public ABI checks, local outcomes, and whole-search tail deopt stay contiguous"
+    reason = "legacy public ABI checks, local outcomes, and whole-search tail deopt stay contiguous"
 )]
 fn lower_aarch64_slow_partial_wrapper(
     output: OutputContract,
@@ -44105,7 +44124,7 @@ int main(void){{
         clippy::too_many_lines,
         reason = "one matrix authenticates transient holes, public symbols, and both backends"
     )]
-    fn slow_partial_uses_one_whole_search_hole_on_every_target() {
+    fn slow_partial_compatibility_wrapper_uses_one_whole_search_hole_on_every_target() {
         for output in [
             OutputContract::Exists,
             OutputContract::SelectedEnd,
@@ -44190,24 +44209,42 @@ int main(void){{
                 .expect("slow partial table alignment")
                 & !15;
             for target in identity_target_matrix() {
-                let module = CompiledModule::lower_optimizing_with_limits(
-                    fast.program(),
+                // Keep authenticating the legacy raw ABI for already emitted
+                // objects even though new optimizing compilations deliberately
+                // choose a persistent prepared entry instead.
+                let raw = lower_optional_native_slow_partial_with_data_limit(
+                    &serialized,
+                    fast.program().native_slow_determinized_view(&candidate),
                     target,
-                    slow_limits,
+                    slow_limits.max_native_data_bytes,
                 )
-                .unwrap_or_else(|error| panic!("slow partial {output:?}/{target:?}: {error}"));
-                let report = module
-                    .slow_aot_report()
-                    .unwrap_or_else(|| panic!("missing slow report: {output:?}/{target:?}"));
-                assert!(report.determinization.decline.is_some());
+                .unwrap_or_else(|error| panic!("slow partial {output:?}/{target:?}: {error}"))
+                .unwrap_or_else(|| panic!("declined slow partial {output:?}/{target:?}"));
+                let native_data_bytes = raw
+                    .data
+                    .len()
+                    .checked_sub(serialized.len())
+                    .expect("slow partial table follows its serialized program");
+                assert!(native_data_bytes <= slow_limits.max_native_data_bytes);
+                let module = CompiledModule::lower_serialized_with_prelowered(
+                    serialized.clone(),
+                    Some(raw),
+                    None,
+                    None,
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    target,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("assemble slow compatibility module {output:?}/{target:?}: {error}")
+                });
+                assert!(module.slow_aot_report().is_none());
                 assert_eq!(
-                    report.dfa.build_work,
-                    report.determinization.work_completed
-                );
-                assert!(report.allocation_bytes <= slow_limits.max_allocation_bytes);
-                assert!(report.native_data_bytes <= slow_limits.max_native_data_bytes);
-                assert_eq!(
-                    report.native_data_bytes,
+                    native_data_bytes,
                     module.sections()[PROGRAM_SECTION].bytes().len() - serialized.len(),
                     "alignment padding and table accounting: {output:?}/{target:?}"
                 );
@@ -44306,9 +44343,9 @@ int main(void){{
             assert!(compiled.module().prepared_entry_symbol().is_none());
 
             // The complete compiler-owned K0 table wins when it and the
-            // partial wrapper both fit. If the caller gives enough native
-            // data only for the smaller retained prefix, preserve that
-            // wrapper rather than declining both optional routes.
+            // retained prefix both fit. If the caller gives enough native
+            // data only for the smaller prefix, decline its replaying public
+            // wrapper and preserve the ordinary persistent fallback.
             let serialized = compiled.program().serialize().unwrap();
             for target in [
                 Target::x86_64_linux(),
@@ -44385,16 +44422,19 @@ int main(void){{
                         partial_native_bytes,
                     )
                     .unwrap();
-                assert!(constrained.slow_aot_report().is_some());
+                let ordinary = CompiledModule::lower(compiled.program(), target).unwrap();
+                assert!(constrained.slow_aot_report().is_none());
                 assert_eq!(
                     constrained.required_runtime_symbol(),
-                    Some(RUNTIME_SYMBOL_NAME)
+                    ordinary.required_runtime_symbol()
                 );
-                assert!(constrained.prepared_entry_symbol().is_none());
                 assert_eq!(
-                    constrained.sections()[PROGRAM_SECTION].bytes().len() - serialized.len(),
-                    partial_native_bytes
+                    constrained.prepared_entry_symbol(),
+                    ordinary.prepared_entry_symbol()
                 );
+                assert_eq!(constrained.sections(), ordinary.sections());
+                assert_eq!(constrained.symbols(), ordinary.symbols());
+                assert_eq!(constrained.relocations(), ordinary.relocations());
             }
             for pass in [
                 crate::OptimizationPass::UniversalOrderedTnfa,
@@ -44773,7 +44813,7 @@ int main(void){{
     }
 
     #[test]
-    fn slow_reverse_construction_decline_still_uses_whole_search_wrapper() {
+    fn slow_reverse_construction_decline_uses_persistent_fallback() {
         let pattern = "a+Q|[b-c][a-b]{1,5}(?:x+|y+)";
         let fast = compile(
             CompileRequest::new(pattern, Target::x86_64_linux())
@@ -44811,14 +44851,14 @@ int main(void){{
                 target,
                 limits,
             )
-            .unwrap_or_else(|error| panic!("reverse-stage wrapper {target:?}: {error}"));
-            assert_eq!(module.required_runtime_symbol(), Some(RUNTIME_SYMBOL_NAME));
-            assert!(module.prepared_entry_symbol().is_none());
-            assert_eq!(module.symbols().len(), 5);
-            assert_eq!(
-                module.symbols()[SLOW_PARTIAL_TABLE_SYMBOL].name,
-                ".Lfre_aot_regex_slow_partial_table_v1"
-            );
+            .unwrap_or_else(|error| panic!("reverse-stage fallback {target:?}: {error}"));
+            let ordinary = CompiledModule::lower(fast.program(), target).unwrap();
+            assert!(module.slow_aot_report().is_none());
+            assert_eq!(module.required_runtime_symbol(), ordinary.required_runtime_symbol());
+            assert_eq!(module.prepared_entry_symbol(), ordinary.prepared_entry_symbol());
+            assert_eq!(module.sections(), ordinary.sections());
+            assert_eq!(module.symbols(), ordinary.symbols());
+            assert_eq!(module.relocations(), ordinary.relocations());
         }
     }
 
