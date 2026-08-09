@@ -15035,15 +15035,15 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     let native_complete = (output != OutputContract::Exists)
         .then(|| assembler.label())
         .transpose()?;
-    // Scanner-free V4 does not need the public source base once its cursor
-    // and end become pointers. Reuse RDI for the latest accepting pointer so
-    // accepting transitions stay register-only; convert back to an offset
-    // once at completion for the common output path.
-    let v4_register_endpoint = root_plan.is_none() && output != OutputContract::Exists;
-    let v4_register_complete = v4_register_endpoint
+    // Scanner-free compact loops without helper calls do not need the public
+    // source base once their cursor and end become pointers. Reuse RDI for the
+    // latest accepting pointer so V3/V4/V8/V10/V12 accepting transitions stay
+    // register-only; convert back to an offset once at their shared completion.
+    let register_last_accept = root_plan.is_none() && output != OutputContract::Exists;
+    let register_complete = register_last_accept
         .then(|| assembler.label())
         .transpose()?;
-    let v4_complete = v4_register_complete
+    let compact_complete = register_complete
         .or(native_complete)
         .unwrap_or(native_no_match);
     let native_continue = allow_direct_hole_continuation
@@ -15653,7 +15653,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
                 assembler.instruction(&[0x41, 0xf7, 0xc2, 0x00, 0x80, 0x00, 0x00])?;
                 let not_accepting = assembler.label()?;
                 assembler.branch(&[0x0f, 0x84], not_accepting)?;
-                if v4_register_endpoint {
+                if register_last_accept {
                     assembler.instruction(&[0x48, 0x89, 0xd7])?; // mov rdi,rdx
                 } else {
                     assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x60])?;
@@ -15661,7 +15661,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
                 assembler.bind(not_accepting)?;
                 assembler.instruction(&[0x41, 0x81, 0xe2, 0xff, 0x7f, 0x00, 0x00])?;
                 assembler.instruction(&[0x45, 0x85, 0xd2])?;
-                assembler.branch(&[0x0f, 0x84], v4_complete)?;
+                assembler.branch(&[0x0f, 0x84], compact_complete)?;
             }
             if update_row {
                 // V4 tokens are one-based destination cell-row offsets. This
@@ -15675,7 +15675,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             emit_v4_transition(assembler, true)?;
             assembler.instruction(&[0x48, 0x39, 0xca])?;
             assembler.branch(&[0x0f, 0x82], backedge)?;
-            assembler.branch(&[0xe9], v4_complete)?;
+            assembler.branch(&[0xe9], compact_complete)?;
             Ok(())
         };
 
@@ -15691,21 +15691,19 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             if output == OutputContract::Exists {
                 assembler.instruction(&[0x45, 0x84, 0xd2])?;
                 assembler.branch(&[0x0f, 0x88], native_match)?;
-                assembler.branch(
-                    &[0x0f, 0x84],
-                    native_complete.unwrap_or(native_no_match),
-                )?;
+                assembler.branch(&[0x0f, 0x84], compact_complete)?;
             } else {
                 assembler.instruction(&[0x41, 0xf6, 0xc2, 0x80])?;
                 let not_accepting = assembler.label()?;
                 assembler.branch(&[0x0f, 0x84], not_accepting)?;
-                assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x60])?;
+                if register_last_accept {
+                    assembler.instruction(&[0x48, 0x89, 0xd7])?; // mov rdi,rdx
+                } else {
+                    assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x60])?;
+                }
                 assembler.bind(not_accepting)?;
                 assembler.instruction(&[0x41, 0x83, 0xe2, 0x7f])?;
-                assembler.branch(
-                    &[0x0f, 0x84],
-                    native_complete.unwrap_or(native_no_match),
-                )?;
+                assembler.branch(&[0x0f, 0x84], compact_complete)?;
             }
             assembler.instruction(&[0x41, 0xff, 0xca])?;
             if let Some(root_vector) = root_vector {
@@ -15735,7 +15733,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             emit_u8_state_ordinal_transition(assembler, row_shift, true)?;
             assembler.instruction(&[0x48, 0x39, 0xca])?;
             assembler.branch(&[0x0f, 0x82], backedge)?;
-            assembler.branch(&[0xe9], native_complete.unwrap_or(native_no_match))?;
+            assembler.branch(&[0xe9], compact_complete)?;
             Ok(())
         };
 
@@ -16305,12 +16303,12 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         ])?;
         assembler.branch(&[0x0f, 0x85], class_mapped)?;
         assembler.instruction(&[0x49, 0x89, 0xf0])?; // canonical V4 row zero
-        if v4_register_endpoint {
+        if register_last_accept {
             assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x18])?;
         }
         assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x40])?;
         assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x48])?;
-        if v4_register_endpoint {
+        if register_last_accept {
             assembler.instruction(&[0x48, 0x01, 0xfa])?; // add rdx,rdi
             assembler.instruction(&[0x48, 0x01, 0xf9])?; // add rcx,rdi
             assembler.instruction(&[0x31, 0xff])?; // xor edi,edi
@@ -16332,7 +16330,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             assembler.instruction(&[0x41, 0xf7, 0xc2, 0x00, 0x80, 0x00, 0x00])?;
             let not_accepting = assembler.label()?;
             assembler.branch(&[0x0f, 0x84], not_accepting)?;
-            if v4_register_endpoint {
+            if register_last_accept {
                 assembler.instruction(&[0x48, 0x89, 0xd7])?; // mov rdi,rdx
             } else {
                 assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x60])?;
@@ -16340,12 +16338,12 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             assembler.bind(not_accepting)?;
             assembler.instruction(&[0x41, 0x81, 0xe2, 0xff, 0x7f, 0x00, 0x00])?;
             assembler.instruction(&[0x45, 0x85, 0xd2])?;
-            assembler.branch(&[0x0f, 0x84], v4_complete)?;
+            assembler.branch(&[0x0f, 0x84], compact_complete)?;
         }
         assembler.instruction(&[0x4e, 0x8d, 0x44, 0x56, 0xfe])?;
         assembler.instruction(&[0x48, 0x39, 0xca])?;
         assembler.branch(&[0x0f, 0x82], singleton_scan)?;
-        assembler.branch(&[0xe9], v4_complete)?;
+        assembler.branch(&[0xe9], compact_complete)?;
         assembler.bind(class_mapped)?;
     }
     let class_map_offset = i32::try_from(FROZEN_PREPARED_HEADER_V1_CLASS_MAP_OFFSET)
@@ -16378,7 +16376,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x48])?;
     if let Some(root_setup) = root_setup {
         assembler.branch(&[0xe9], root_setup)?;
-    } else if v4_register_endpoint {
+    } else if register_last_accept {
         assembler.instruction(&[0x48, 0x01, 0xfa])?; // add rdx,rdi
         assembler.instruction(&[0x48, 0x01, 0xf9])?; // add rcx,rdi
         assembler.instruction(&[0x31, 0xff])?; // xor edi,edi
@@ -16396,7 +16394,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         assembler.branch(&[0x0f, 0x83], v4_table_scan)?;
 
         assembler.bind(v4_scan)?;
-        if v4_register_endpoint {
+        if register_last_accept {
             assembler.instruction(&[0x44, 0x0f, 0xb6, 0x12])?;
             assembler.instruction(&[0x44, 0x0f, 0xb6, 0x5a, 0x01])?;
         } else {
@@ -16414,8 +16412,8 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
 
         assembler.bind(v4_table_scan)?;
         assembler.instruction(&[0x48, 0x39, 0xca])?;
-        assembler.branch(&[0x0f, 0x83], v4_complete)?;
-        if v4_register_endpoint {
+        assembler.branch(&[0x0f, 0x83], compact_complete)?;
+        if register_last_accept {
             assembler.instruction(&[0x44, 0x0f, 0xb6, 0x12])?;
         } else {
             assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
@@ -16423,7 +16421,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         assembler.instruction(&[0x47, 0x0f, 0xb6, 0x14, 0x11])?;
         assembler.instruction(&[0x47, 0x0f, 0xb7, 0x14, 0x50])?;
         emit_v4_transition(&mut assembler, false)?;
-        assembler.branch(&[0xe9], v4_complete)?;
+        assembler.branch(&[0xe9], compact_complete)?;
     } else {
         assembler.bind(v4_scan)?;
         if let Some(root_vector) = root_vector {
@@ -16479,6 +16477,10 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x48])?;
         if let Some(root_setup) = root_setup {
             assembler.branch(&[0xe9], root_setup)?;
+        } else if register_last_accept {
+            assembler.instruction(&[0x48, 0x01, 0xfa])?; // add rdx,rdi
+            assembler.instruction(&[0x48, 0x01, 0xf9])?; // add rcx,rdi
+            assembler.instruction(&[0x31, 0xff])?; // xor edi,edi
         } else if output != OutputContract::Exists {
             assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x60, 0, 0, 0, 0])?;
         }
@@ -16493,8 +16495,13 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             assembler.branch(&[0x0f, 0x83], v10_table_scan)?;
 
             assembler.bind(v10_scan)?;
-            assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
-            assembler.instruction(&[0x44, 0x0f, 0xb6, 0x5c, 0x17, 0x01])?;
+            if register_last_accept {
+                assembler.instruction(&[0x44, 0x0f, 0xb6, 0x12])?;
+                assembler.instruction(&[0x44, 0x0f, 0xb6, 0x5a, 0x01])?;
+            } else {
+                assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
+                assembler.instruction(&[0x44, 0x0f, 0xb6, 0x5c, 0x17, 0x01])?;
+            }
             assembler.instruction(&[0x47, 0x0f, 0xb6, 0x14, 0x10])?;
             emit_u8_state_ordinal_transition(&mut assembler, 8, true)?;
             assembler.instruction(&[0x47, 0x0f, 0xb6, 0x14, 0x18])?;
@@ -16504,14 +16511,15 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
 
             assembler.bind(v10_table_scan)?;
             assembler.instruction(&[0x48, 0x39, 0xca])?;
-            assembler.branch(
-                &[0x0f, 0x83],
-                native_complete.unwrap_or(native_no_match),
-            )?;
-            assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
+            assembler.branch(&[0x0f, 0x83], compact_complete)?;
+            if register_last_accept {
+                assembler.instruction(&[0x44, 0x0f, 0xb6, 0x12])?;
+            } else {
+                assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
+            }
             assembler.instruction(&[0x47, 0x0f, 0xb6, 0x14, 0x10])?;
             emit_u8_state_ordinal_transition(&mut assembler, 8, false)?;
-            assembler.branch(&[0xe9], native_complete.unwrap_or(native_no_match))?;
+            assembler.branch(&[0xe9], compact_complete)?;
         } else {
             assembler.bind(v10_scan)?;
             if let Some(root_vector) = root_vector {
@@ -16575,6 +16583,10 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x48])?;
     if let Some(root_setup) = root_setup {
         assembler.branch(&[0xe9], root_setup)?;
+    } else if register_last_accept {
+        assembler.instruction(&[0x48, 0x01, 0xfa])?; // add rdx,rdi
+        assembler.instruction(&[0x48, 0x01, 0xf9])?; // add rcx,rdi
+        assembler.instruction(&[0x31, 0xff])?; // xor edi,edi
     } else if output != OutputContract::Exists {
         assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x60, 0, 0, 0, 0])?;
     }
@@ -16613,8 +16625,13 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             )?;
 
             assembler.bind(v12_scan)?;
-            assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
-            assembler.instruction(&[0x44, 0x0f, 0xb6, 0x5c, 0x17, 0x01])?;
+            if register_last_accept {
+                assembler.instruction(&[0x44, 0x0f, 0xb6, 0x12])?;
+                assembler.instruction(&[0x44, 0x0f, 0xb6, 0x5a, 0x01])?;
+            } else {
+                assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
+                assembler.instruction(&[0x44, 0x0f, 0xb6, 0x5c, 0x17, 0x01])?;
+            }
             assembler.instruction(&[0x47, 0x0f, 0xb6, 0x14, 0x11])?;
             assembler.instruction(&[0x47, 0x0f, 0xb6, 0x1c, 0x19])?;
             assembler.instruction(&[0x47, 0x0f, 0xb6, 0x14, 0x10])?;
@@ -16641,15 +16658,16 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     if let Some(v12_scalar_tail) = v12_scalar_tail {
         assembler.bind(v12_scalar_tail)?;
         assembler.instruction(&[0x48, 0x39, 0xca])?;
-        assembler.branch(
-            &[0x0f, 0x83],
-            native_complete.unwrap_or(native_no_match),
-        )?;
-        assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
+        assembler.branch(&[0x0f, 0x83], compact_complete)?;
+        if register_last_accept {
+            assembler.instruction(&[0x44, 0x0f, 0xb6, 0x12])?;
+        } else {
+            assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
+        }
         assembler.instruction(&[0x47, 0x0f, 0xb6, 0x14, 0x11])?;
         assembler.instruction(&[0x47, 0x0f, 0xb6, 0x14, 0x10])?;
         emit_u8_state_ordinal_transition(&mut assembler, 0, false)?;
-        assembler.branch(&[0xe9], native_complete.unwrap_or(native_no_match))?;
+        assembler.branch(&[0xe9], compact_complete)?;
     }
 
     assembler.bind(v3_enter)?;
@@ -16694,6 +16712,10 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x48])?;
     if let Some(root_setup) = root_setup {
         assembler.branch(&[0xe9], root_setup)?;
+    } else if register_last_accept {
+        assembler.instruction(&[0x48, 0x01, 0xfa])?; // add rdx,rdi
+        assembler.instruction(&[0x48, 0x01, 0xf9])?; // add rcx,rdi
+        assembler.instruction(&[0x31, 0xff])?; // xor edi,edi
     } else if output != OutputContract::Exists {
         assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x60, 0, 0, 0, 0])?;
     }
@@ -16739,13 +16761,14 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
                 assembler.instruction(&[0x41, 0xf7, 0xc2, 0x00, 0x80, 0x00, 0x00])?;
                 let not_accepting = assembler.label()?;
                 assembler.branch(&[0x0f, 0x84], not_accepting)?;
-                assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x60])?;
+                if register_last_accept {
+                    assembler.instruction(&[0x48, 0x89, 0xd7])?; // mov rdi,rdx
+                } else {
+                    assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x60])?;
+                }
                 assembler.bind(not_accepting)?;
                 assembler.instruction(&[0x41, 0x81, 0xe2, 0xff, 0x7f, 0x00, 0x00])?;
-                assembler.branch(
-                    &[0x0f, 0x84],
-                    native_complete.unwrap_or(native_no_match),
-                )?;
+                assembler.branch(&[0x0f, 0x84], compact_complete)?;
             }
             // V3 setup authenticated every nonzero low token against
             // state_count, so every live token may become its zero-based
@@ -16779,8 +16802,13 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             )?;
 
             assembler.bind(v3_scan)?;
-            assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
-            assembler.instruction(&[0x44, 0x0f, 0xb6, 0x5c, 0x17, 0x01])?;
+            if register_last_accept {
+                assembler.instruction(&[0x44, 0x0f, 0xb6, 0x12])?;
+                assembler.instruction(&[0x44, 0x0f, 0xb6, 0x5a, 0x01])?;
+            } else {
+                assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
+                assembler.instruction(&[0x44, 0x0f, 0xb6, 0x5c, 0x17, 0x01])?;
+            }
             assembler.instruction(&[0x47, 0x0f, 0xb6, 0x14, 0x11])?;
             assembler.instruction(&[0x47, 0x0f, 0xb6, 0x1c, 0x19])?;
             assembler.instruction(&[0x47, 0x0f, 0xb7, 0x14, 0x50])?;
@@ -16813,11 +16841,12 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     if let Some(v3_scalar_tail) = v3_scalar_tail {
         assembler.bind(v3_scalar_tail)?;
         assembler.instruction(&[0x48, 0x39, 0xca])?;
-        assembler.branch(
-            &[0x0f, 0x83],
-            native_complete.unwrap_or(native_no_match),
-        )?;
-        assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
+        assembler.branch(&[0x0f, 0x83], compact_complete)?;
+        if register_last_accept {
+            assembler.instruction(&[0x44, 0x0f, 0xb6, 0x12])?;
+        } else {
+            assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
+        }
         assembler.instruction(&[0x47, 0x0f, 0xb6, 0x14, 0x11])?;
         assembler.instruction(&[0x47, 0x0f, 0xb7, 0x14, 0x50])?;
         assembler.instruction(&[0x48, 0xff, 0xc2])?;
@@ -16828,13 +16857,14 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             assembler.instruction(&[0x41, 0xf7, 0xc2, 0x00, 0x80, 0x00, 0x00])?;
             let not_accepting = assembler.label()?;
             assembler.branch(&[0x0f, 0x84], not_accepting)?;
-            assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x60])?;
+            if register_last_accept {
+                assembler.instruction(&[0x48, 0x89, 0xd7])?; // mov rdi,rdx
+            } else {
+                assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x60])?;
+            }
             assembler.bind(not_accepting)?;
         }
-        assembler.branch(
-            &[0xe9],
-            native_complete.unwrap_or(native_no_match),
-        )?;
+        assembler.branch(&[0xe9], compact_complete)?;
     }
 
     if direct_byte_formats_possible {
@@ -16868,6 +16898,10 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x48])?;
         if let Some(root_setup) = root_setup {
             assembler.branch(&[0xe9], root_setup)?;
+        } else if register_last_accept {
+            assembler.instruction(&[0x48, 0x01, 0xfa])?; // add rdx,rdi
+            assembler.instruction(&[0x48, 0x01, 0xf9])?; // add rcx,rdi
+            assembler.instruction(&[0x31, 0xff])?; // xor edi,edi
         } else if output != OutputContract::Exists {
             assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x60, 0, 0, 0, 0])?;
         }
@@ -16885,13 +16919,14 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
                 assembler.instruction(&[0x41, 0xf7, 0xc2, 0x00, 0x80, 0x00, 0x00])?;
                 let not_accepting = assembler.label()?;
                 assembler.branch(&[0x0f, 0x84], not_accepting)?;
-                assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x60])?;
+                if register_last_accept {
+                    assembler.instruction(&[0x48, 0x89, 0xd7])?; // mov rdi,rdx
+                } else {
+                    assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x60])?;
+                }
                 assembler.bind(not_accepting)?;
                 assembler.instruction(&[0x41, 0x81, 0xe2, 0xff, 0x7f, 0x00, 0x00])?;
-                assembler.branch(
-                    &[0x0f, 0x84],
-                    native_complete.unwrap_or(native_no_match),
-                )?;
+                assembler.branch(&[0x0f, 0x84], compact_complete)?;
             }
             assembler.instruction(&[0x41, 0xff, 0xca])?;
             if let Some(root_vector) = root_vector {
@@ -16921,8 +16956,13 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             assembler.branch(&[0x0f, 0x83], scalar_tail)?;
 
             assembler.bind(v8_scan)?;
-            assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
-            assembler.instruction(&[0x44, 0x0f, 0xb6, 0x5c, 0x17, 0x01])?;
+            if register_last_accept {
+                assembler.instruction(&[0x44, 0x0f, 0xb6, 0x12])?;
+                assembler.instruction(&[0x44, 0x0f, 0xb6, 0x5a, 0x01])?;
+            } else {
+                assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
+                assembler.instruction(&[0x44, 0x0f, 0xb6, 0x5c, 0x17, 0x01])?;
+            }
             assembler.instruction(&[0x47, 0x0f, 0xb7, 0x14, 0x50])?;
             emit_v8_transition(&mut assembler)?;
             assembler.instruction(&[0x47, 0x0f, 0xb7, 0x14, 0x58])?;
@@ -16932,11 +16972,12 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
 
             assembler.bind(scalar_tail)?;
             assembler.instruction(&[0x48, 0x39, 0xca])?;
-            assembler.branch(
-                &[0x0f, 0x83],
-                native_complete.unwrap_or(native_no_match),
-            )?;
-            assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
+            assembler.branch(&[0x0f, 0x83], compact_complete)?;
+            if register_last_accept {
+                assembler.instruction(&[0x44, 0x0f, 0xb6, 0x12])?;
+            } else {
+                assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
+            }
             assembler.instruction(&[0x47, 0x0f, 0xb7, 0x14, 0x50])?;
             assembler.instruction(&[0x48, 0xff, 0xc2])?;
             if output == OutputContract::Exists {
@@ -16946,10 +16987,14 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
                 assembler.instruction(&[0x41, 0xf7, 0xc2, 0x00, 0x80, 0x00, 0x00])?;
                 let not_accepting = assembler.label()?;
                 assembler.branch(&[0x0f, 0x84], not_accepting)?;
-                assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x60])?;
+                if register_last_accept {
+                    assembler.instruction(&[0x48, 0x89, 0xd7])?; // mov rdi,rdx
+                } else {
+                    assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x60])?;
+                }
                 assembler.bind(not_accepting)?;
             }
-            assembler.branch(&[0xe9], native_complete.unwrap_or(native_no_match))?;
+            assembler.branch(&[0xe9], compact_complete)?;
         } else {
             assembler.bind(v8_scan)?;
             if let Some(root_vector) = root_vector {
@@ -17602,7 +17647,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         assembler.branch(&[0xe9], scalar)?;
     }
 
-    if let Some(complete) = v4_register_complete {
+    if let Some(complete) = register_complete {
         assembler.bind(complete)?;
         assembler.instruction(&[0x48, 0x85, 0xff])?; // test rdi,rdi
         assembler.branch(&[0x0f, 0x84], native_no_match)?;
@@ -30458,6 +30503,7 @@ mod tests {
         let x86_loop_second_class = [0x41, 0x0f, 0xb6, 0x04, 0x01];
         let x86_loop_second_u16_cell = [0x45, 0x0f, 0xb7, 0x14, 0x40];
         let x86_second_byte = [0x44, 0x0f, 0xb6, 0x5c, 0x17, 0x01];
+        let x86_pointer_second_byte = [0x44, 0x0f, 0xb6, 0x5a, 0x01];
         let x86_second_class = [0x47, 0x0f, 0xb6, 0x1c, 0x19];
         let x86_second_u16_cell = [0x47, 0x0f, 0xb7, 0x14, 0x58];
         let x86_second_u8_cell = [0x47, 0x0f, 0xb6, 0x14, 0x18];
@@ -30482,6 +30528,30 @@ mod tests {
         let x86_mapped_u8_prefix = [
             0x44, 0x0f, 0xb6, 0x14, 0x17, // byte[position]
             0x44, 0x0f, 0xb6, 0x5c, 0x17, 0x01, // byte[position + 1]
+            0x47, 0x0f, 0xb6, 0x14, 0x11, // first class
+            0x47, 0x0f, 0xb6, 0x1c, 0x19, // second class
+            0x47, 0x0f, 0xb6, 0x14, 0x10, // first u8 cell
+        ];
+        let x86_pointer_mapped_u16_prefix = [
+            0x44, 0x0f, 0xb6, 0x12, // byte[position]
+            0x44, 0x0f, 0xb6, 0x5a, 0x01, // byte[position + 1]
+            0x47, 0x0f, 0xb6, 0x14, 0x11, // first class
+            0x47, 0x0f, 0xb6, 0x1c, 0x19, // second class
+            0x47, 0x0f, 0xb7, 0x14, 0x50, // first u16 cell
+        ];
+        let x86_pointer_direct_u16_prefix = [
+            0x44, 0x0f, 0xb6, 0x12, // byte[position]
+            0x44, 0x0f, 0xb6, 0x5a, 0x01, // byte[position + 1]
+            0x47, 0x0f, 0xb7, 0x14, 0x50, // first u16 cell
+        ];
+        let x86_pointer_direct_u8_prefix = [
+            0x44, 0x0f, 0xb6, 0x12, // byte[position]
+            0x44, 0x0f, 0xb6, 0x5a, 0x01, // byte[position + 1]
+            0x47, 0x0f, 0xb6, 0x14, 0x10, // first u8 cell
+        ];
+        let x86_pointer_mapped_u8_prefix = [
+            0x44, 0x0f, 0xb6, 0x12, // byte[position]
+            0x44, 0x0f, 0xb6, 0x5a, 0x01, // byte[position + 1]
             0x47, 0x0f, 0xb6, 0x14, 0x11, // first class
             0x47, 0x0f, 0xb6, 0x1c, 0x19, // second class
             0x47, 0x0f, 0xb6, 0x14, 0x10, // first u8 cell
@@ -30536,11 +30606,20 @@ mod tests {
                 assert_eq!(
                     byte_occurrences(code, &x86_second_byte),
                     if supertransitions {
-                        if output == OutputContract::Exists { 31 } else { 30 }
+                        if output == OutputContract::Exists { 31 } else { 10 }
                     } else {
                         21
                     },
-                    "{context}: all production paired bodies"
+                    "{context}: offset-cursor production paired bodies"
+                );
+                assert_eq!(
+                    byte_occurrences(code, &x86_pointer_second_byte),
+                    if supertransitions && output != OutputContract::Exists {
+                        21
+                    } else {
+                        0
+                    },
+                    "{context}: every no-helper endpoint body uses a pointer cursor"
                 );
                 assert_eq!(
                     byte_occurrences(code, &x86_second_class),
@@ -30559,23 +30638,43 @@ mod tests {
                 );
                 assert_eq!(
                     byte_occurrences(code, &x86_mapped_u16_prefix),
-                    if output == OutputContract::Exists { 10 } else { 9 },
-                    "{context}: mapped u16 pair prefixes"
+                    if output == OutputContract::Exists { 10 } else { 0 },
+                    "{context}: offset-cursor mapped u16 pair prefixes"
+                );
+                assert_eq!(
+                    byte_occurrences(code, &x86_pointer_mapped_u16_prefix),
+                    if output == OutputContract::Exists { 0 } else { 10 },
+                    "{context}: pointer-cursor mapped u16 pair prefixes"
                 );
                 assert_eq!(
                     byte_occurrences(code, &x86_direct_u16_prefix),
-                    1,
-                    "{context}: direct V8 pair prefix"
+                    usize::from(output == OutputContract::Exists),
+                    "{context}: offset-cursor direct V8 pair prefix"
+                );
+                assert_eq!(
+                    byte_occurrences(code, &x86_pointer_direct_u16_prefix),
+                    usize::from(output != OutputContract::Exists),
+                    "{context}: pointer-cursor direct V8 pair prefix"
                 );
                 assert_eq!(
                     byte_occurrences(code, &x86_direct_u8_prefix),
-                    1,
-                    "{context}: direct V10 pair prefix"
+                    usize::from(output == OutputContract::Exists),
+                    "{context}: offset-cursor direct V10 pair prefix"
+                );
+                assert_eq!(
+                    byte_occurrences(code, &x86_pointer_direct_u8_prefix),
+                    usize::from(output != OutputContract::Exists),
+                    "{context}: pointer-cursor direct V10 pair prefix"
                 );
                 assert_eq!(
                     byte_occurrences(code, &x86_mapped_u8_prefix),
-                    9,
-                    "{context}: mapped V12 pair prefixes"
+                    if output == OutputContract::Exists { 9 } else { 0 },
+                    "{context}: offset-cursor mapped V12 pair prefixes"
+                );
+                assert_eq!(
+                    byte_occurrences(code, &x86_pointer_mapped_u8_prefix),
+                    if output == OutputContract::Exists { 0 } else { 9 },
+                    "{context}: pointer-cursor mapped V12 pair prefixes"
                 );
                 for guard in code
                     .windows(x86_pair_guard.len())
@@ -46902,36 +47001,71 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 0x44, 0x0f, 0xb6, 0x14, 0x17, 0x47, 0x0f, 0xb6, 0x14, 0x11, 0x47, 0x0f,
                 0xb7, 0x14, 0x50,
             ];
+            let x86_pointer_mapped_v4 = [
+                0x44, 0x0f, 0xb6, 0x12, 0x47, 0x0f, 0xb6, 0x14, 0x11, 0x47, 0x0f, 0xb7,
+                0x14, 0x50,
+            ];
             let x86_direct_v4 = [
                 0x44, 0x0f, 0xb6, 0x14, 0x17, 0x47, 0x0f, 0xb7, 0x14, 0x50,
+            ];
+            let x86_pointer_direct_v4 = [
+                0x44, 0x0f, 0xb6, 0x12, 0x47, 0x0f, 0xb7, 0x14, 0x50,
             ];
             let x86_mapped_u8 = [
                 0x44, 0x0f, 0xb6, 0x14, 0x17, 0x47, 0x0f, 0xb6, 0x14, 0x11, 0x47, 0x0f,
                 0xb6, 0x14, 0x10,
+            ];
+            let x86_pointer_mapped_u8 = [
+                0x44, 0x0f, 0xb6, 0x12, 0x47, 0x0f, 0xb6, 0x14, 0x11, 0x47, 0x0f, 0xb6,
+                0x14, 0x10,
             ];
             assert_eq!(
                 x86.code
                     .windows(x86_mapped_v4.len())
                     .filter(|window| *window == x86_mapped_v4)
                     .count(),
-                if output == OutputContract::Exists { 12 } else { 11 },
-                "x86 mapped V7/V6 plus the offset-form V3/V4 scalar tails for {output:?}"
+                if output == OutputContract::Exists { 12 } else { 10 },
+                "x86 mapped V7/V6 retain offsets while V3/V4 endpoint tails use pointers for {output:?}"
+            );
+            assert_eq!(
+                x86.code
+                    .windows(x86_pointer_mapped_v4.len())
+                    .filter(|window| *window == x86_pointer_mapped_v4)
+                    .count(),
+                if output == OutputContract::Exists { 0 } else { 2 },
+                "x86 pointer-form V3/V4 scalar tails for {output:?}"
             );
             assert_eq!(
                 x86.code
                     .windows(x86_direct_v4.len())
                     .filter(|window| *window == x86_direct_v4)
                     .count(),
-                1,
-                "x86 direct-byte u16 V8 body for {output:?}"
+                usize::from(output == OutputContract::Exists),
+                "x86 offset-form direct-byte u16 V8 body for {output:?}"
+            );
+            assert_eq!(
+                x86.code
+                    .windows(x86_pointer_direct_v4.len())
+                    .filter(|window| *window == x86_pointer_direct_v4)
+                    .count(),
+                usize::from(output != OutputContract::Exists),
+                "x86 pointer-form direct-byte u16 V8 body for {output:?}"
             );
             assert_eq!(
                 x86.code
                     .windows(x86_mapped_u8.len())
                     .filter(|window| *window == x86_mapped_u8)
                     .count(),
-                1,
-                "x86 mapped compact-u8 V12 shares one exact scalar tail for {output:?}"
+                usize::from(output == OutputContract::Exists),
+                "x86 offset-form compact-u8 V12 scalar tail for {output:?}"
+            );
+            assert_eq!(
+                x86.code
+                    .windows(x86_pointer_mapped_u8.len())
+                    .filter(|window| *window == x86_pointer_mapped_u8)
+                    .count(),
+                usize::from(output != OutputContract::Exists),
+                "x86 pointer-form compact-u8 V12 scalar tail for {output:?}"
             );
 
             let arm = lower_aarch64_dynamic_rows_prepared_for_output(
@@ -47297,13 +47431,13 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 let context = format!("x86/{tier}/{output:?}");
                 assert_eq!(
                     byte_occurrences(code, &x86_pointer_setup),
-                    if output == OutputContract::Exists { 0 } else { 2 },
-                    "{context}: singleton and mapped V4 entries pointerize once each"
+                    if output == OutputContract::Exists { 0 } else { 6 },
+                    "{context}: singleton V4 and all five no-helper compact entries pointerize once each"
                 );
                 assert_eq!(
                     byte_occurrences(code, &x86_pointer_complete),
                     if output == OutputContract::Exists { 0 } else { 1 },
-                    "{context}: scanner-free V4 has one pointer-to-offset completion"
+                    "{context}: scanner-free no-helper formats share one pointer-to-offset completion"
                 );
                 assert_eq!(byte_occurrences(code, &x86_class_guard), 1, "{context}");
                 assert_eq!(
