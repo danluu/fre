@@ -15035,6 +15035,17 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     let native_complete = (output != OutputContract::Exists)
         .then(|| assembler.label())
         .transpose()?;
+    // Scanner-free V4 does not need the public source base once its cursor
+    // and end become pointers. Reuse RDI for the latest accepting pointer so
+    // accepting transitions stay register-only; convert back to an offset
+    // once at completion for the common output path.
+    let v4_register_endpoint = root_plan.is_none() && output != OutputContract::Exists;
+    let v4_register_complete = v4_register_endpoint
+        .then(|| assembler.label())
+        .transpose()?;
+    let v4_complete = v4_register_complete
+        .or(native_complete)
+        .unwrap_or(native_no_match);
     let native_continue = allow_direct_hole_continuation
         .then(|| assembler.label())
         .transpose()?;
@@ -15642,14 +15653,15 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
                 assembler.instruction(&[0x41, 0xf7, 0xc2, 0x00, 0x80, 0x00, 0x00])?;
                 let not_accepting = assembler.label()?;
                 assembler.branch(&[0x0f, 0x84], not_accepting)?;
-                assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x60])?;
+                if v4_register_endpoint {
+                    assembler.instruction(&[0x48, 0x89, 0xd7])?; // mov rdi,rdx
+                } else {
+                    assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x60])?;
+                }
                 assembler.bind(not_accepting)?;
                 assembler.instruction(&[0x41, 0x81, 0xe2, 0xff, 0x7f, 0x00, 0x00])?;
                 assembler.instruction(&[0x45, 0x85, 0xd2])?;
-                assembler.branch(
-                    &[0x0f, 0x84],
-                    native_complete.unwrap_or(native_no_match),
-                )?;
+                assembler.branch(&[0x0f, 0x84], v4_complete)?;
             }
             if update_row {
                 // V4 tokens are one-based destination cell-row offsets. This
@@ -15663,10 +15675,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             emit_v4_transition(assembler, true)?;
             assembler.instruction(&[0x48, 0x39, 0xca])?;
             assembler.branch(&[0x0f, 0x82], backedge)?;
-            assembler.branch(
-                &[0xe9],
-                native_complete.unwrap_or(native_no_match),
-            )?;
+            assembler.branch(&[0xe9], v4_complete)?;
             Ok(())
         };
 
@@ -16296,9 +16305,16 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         ])?;
         assembler.branch(&[0x0f, 0x85], class_mapped)?;
         assembler.instruction(&[0x49, 0x89, 0xf0])?; // canonical V4 row zero
+        if v4_register_endpoint {
+            assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x18])?;
+        }
         assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x40])?;
         assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x48])?;
-        if output != OutputContract::Exists {
+        if v4_register_endpoint {
+            assembler.instruction(&[0x48, 0x01, 0xfa])?; // add rdx,rdi
+            assembler.instruction(&[0x48, 0x01, 0xf9])?; // add rcx,rdi
+            assembler.instruction(&[0x31, 0xff])?; // xor edi,edi
+        } else if output != OutputContract::Exists {
             assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x60, 0, 0, 0, 0])?;
         }
         let singleton_scan = assembler.label()?;
@@ -16316,22 +16332,20 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             assembler.instruction(&[0x41, 0xf7, 0xc2, 0x00, 0x80, 0x00, 0x00])?;
             let not_accepting = assembler.label()?;
             assembler.branch(&[0x0f, 0x84], not_accepting)?;
-            assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x60])?;
+            if v4_register_endpoint {
+                assembler.instruction(&[0x48, 0x89, 0xd7])?; // mov rdi,rdx
+            } else {
+                assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x60])?;
+            }
             assembler.bind(not_accepting)?;
             assembler.instruction(&[0x41, 0x81, 0xe2, 0xff, 0x7f, 0x00, 0x00])?;
             assembler.instruction(&[0x45, 0x85, 0xd2])?;
-            assembler.branch(
-                &[0x0f, 0x84],
-                native_complete.unwrap_or(native_no_match),
-            )?;
+            assembler.branch(&[0x0f, 0x84], v4_complete)?;
         }
         assembler.instruction(&[0x4e, 0x8d, 0x44, 0x56, 0xfe])?;
         assembler.instruction(&[0x48, 0x39, 0xca])?;
         assembler.branch(&[0x0f, 0x82], singleton_scan)?;
-        assembler.branch(
-            &[0xe9],
-            native_complete.unwrap_or(native_no_match),
-        )?;
+        assembler.branch(&[0xe9], v4_complete)?;
         assembler.bind(class_mapped)?;
     }
     let class_map_offset = i32::try_from(FROZEN_PREPARED_HEADER_V1_CLASS_MAP_OFFSET)
@@ -16364,6 +16378,10 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x48])?;
     if let Some(root_setup) = root_setup {
         assembler.branch(&[0xe9], root_setup)?;
+    } else if v4_register_endpoint {
+        assembler.instruction(&[0x48, 0x01, 0xfa])?; // add rdx,rdi
+        assembler.instruction(&[0x48, 0x01, 0xf9])?; // add rcx,rdi
+        assembler.instruction(&[0x31, 0xff])?; // xor edi,edi
     } else if output != OutputContract::Exists {
         assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x60, 0, 0, 0, 0])?;
     }
@@ -16378,8 +16396,13 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         assembler.branch(&[0x0f, 0x83], v4_table_scan)?;
 
         assembler.bind(v4_scan)?;
-        assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
-        assembler.instruction(&[0x44, 0x0f, 0xb6, 0x5c, 0x17, 0x01])?;
+        if v4_register_endpoint {
+            assembler.instruction(&[0x44, 0x0f, 0xb6, 0x12])?;
+            assembler.instruction(&[0x44, 0x0f, 0xb6, 0x5a, 0x01])?;
+        } else {
+            assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
+            assembler.instruction(&[0x44, 0x0f, 0xb6, 0x5c, 0x17, 0x01])?;
+        }
         assembler.instruction(&[0x47, 0x0f, 0xb6, 0x14, 0x11])?;
         assembler.instruction(&[0x47, 0x0f, 0xb6, 0x1c, 0x19])?;
         assembler.instruction(&[0x47, 0x0f, 0xb7, 0x14, 0x50])?;
@@ -16391,18 +16414,16 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
 
         assembler.bind(v4_table_scan)?;
         assembler.instruction(&[0x48, 0x39, 0xca])?;
-        assembler.branch(
-            &[0x0f, 0x83],
-            native_complete.unwrap_or(native_no_match),
-        )?;
-        assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
+        assembler.branch(&[0x0f, 0x83], v4_complete)?;
+        if v4_register_endpoint {
+            assembler.instruction(&[0x44, 0x0f, 0xb6, 0x12])?;
+        } else {
+            assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
+        }
         assembler.instruction(&[0x47, 0x0f, 0xb6, 0x14, 0x11])?;
         assembler.instruction(&[0x47, 0x0f, 0xb7, 0x14, 0x50])?;
         emit_v4_transition(&mut assembler, false)?;
-        assembler.branch(
-            &[0xe9],
-            native_complete.unwrap_or(native_no_match),
-        )?;
+        assembler.branch(&[0xe9], v4_complete)?;
     } else {
         assembler.bind(v4_scan)?;
         if let Some(root_vector) = root_vector {
@@ -17579,6 +17600,15 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         assembler.bind(scalar_reject)?;
         assembler.instruction(&[0x48, 0xff, 0xc2])?;
         assembler.branch(&[0xe9], scalar)?;
+    }
+
+    if let Some(complete) = v4_register_complete {
+        assembler.bind(complete)?;
+        assembler.instruction(&[0x48, 0x85, 0xff])?; // test rdi,rdi
+        assembler.branch(&[0x0f, 0x84], native_no_match)?;
+        assembler.instruction(&[0x49, 0x89, 0xfb])?; // mov r11,rdi
+        assembler.instruction(&[0x4c, 0x2b, 0x5c, 0x24, 0x18])?;
+        assembler.branch(&[0xe9], native_match)?;
     }
 
     if let Some(native_complete) = native_complete {
@@ -30505,7 +30535,11 @@ mod tests {
                 );
                 assert_eq!(
                     byte_occurrences(code, &x86_second_byte),
-                    if supertransitions { 31 } else { 21 },
+                    if supertransitions {
+                        if output == OutputContract::Exists { 31 } else { 30 }
+                    } else {
+                        21
+                    },
                     "{context}: all production paired bodies"
                 );
                 assert_eq!(
@@ -30525,7 +30559,7 @@ mod tests {
                 );
                 assert_eq!(
                     byte_occurrences(code, &x86_mapped_u16_prefix),
-                    10,
+                    if output == OutputContract::Exists { 10 } else { 9 },
                     "{context}: mapped u16 pair prefixes"
                 );
                 assert_eq!(
@@ -46880,8 +46914,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                     .windows(x86_mapped_v4.len())
                     .filter(|window| *window == x86_mapped_v4)
                     .count(),
-                12,
-                "x86 mapped V7/V6 plus the V3/V4 scalar tails for {output:?}"
+                if output == OutputContract::Exists { 12 } else { 11 },
+                "x86 mapped V7/V6 plus the offset-form V3/V4 scalar tails for {output:?}"
             );
             assert_eq!(
                 x86.code
@@ -47236,6 +47270,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
         let x86_hay_load = [0x44, 0x0f, 0xb6, 0x14, 0x17];
         let x86_class_load = [0x47, 0x0f, 0xb6, 0x14, 0x11];
         let x86_update = [0x4e, 0x8d, 0x44, 0x56, 0xfe];
+        let x86_pointer_setup = [0x48, 0x01, 0xfa, 0x48, 0x01, 0xf9, 0x31, 0xff];
+        let x86_pointer_complete = [0x49, 0x89, 0xfb, 0x4c, 0x2b, 0x5c, 0x24, 0x18];
         let avx512 = FeatureSet::of(CpuFeature::X86Avx512F)
             .with(CpuFeature::X86Avx512Bw)
             .with(CpuFeature::X86Avx512Vl);
@@ -47259,6 +47295,16 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 .unwrap();
                 let code = emission.code.as_slice();
                 let context = format!("x86/{tier}/{output:?}");
+                assert_eq!(
+                    byte_occurrences(code, &x86_pointer_setup),
+                    if output == OutputContract::Exists { 0 } else { 2 },
+                    "{context}: singleton and mapped V4 entries pointerize once each"
+                );
+                assert_eq!(
+                    byte_occurrences(code, &x86_pointer_complete),
+                    if output == OutputContract::Exists { 0 } else { 1 },
+                    "{context}: scanner-free V4 has one pointer-to-offset completion"
+                );
                 assert_eq!(byte_occurrences(code, &x86_class_guard), 1, "{context}");
                 assert_eq!(
                     byte_occurrences(code, &x86_singleton_load),
@@ -47336,8 +47382,13 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                             &code[singleton..update],
                             &[0x48, 0x89, 0x54, 0x24, 0x60],
                         ),
+                        0,
+                        "{context}: scanner-free V4 does not spill accepting endpoints"
+                    );
+                    assert_eq!(
+                        byte_occurrences(&code[singleton..update], &[0x48, 0x89, 0xd7]),
                         1,
-                        "{context}: accepting cells publish the consumed endpoint"
+                        "{context}: accepting cells retain the consumed endpoint in RDI"
                     );
                     assert_eq!(
                         byte_occurrences(
