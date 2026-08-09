@@ -80,7 +80,11 @@ pub(crate) const START_FILTER_SCANNER_SELECTION_WORK: usize = 1;
 pub(crate) const START_FILTER_GUARD_SELECTION_WORK: usize = 1;
 /// Optional work to retain one already-compared broad exact-position class as
 /// an adaptive Probe after the primary scanner has been fully constructed.
-pub(crate) const START_FILTER_PROBE_SELECTION_WORK: usize = 1;
+pub(crate) const START_FILTER_PROBE_RETENTION_WORK: usize = 1;
+/// Maximum optional Probe work, including exact contiguous-range detection
+/// when the primary scanner can retain a classified block intersection.
+pub(crate) const START_FILTER_PROBE_SELECTION_WORK: usize =
+    START_FILTER_PROBE_RETENTION_WORK + BYTE_START_RANGE_DETECTION_WORK;
 /// Largest non-scanner byte class selective enough to retain as a guard.
 /// Sixty-four members are one quarter of the complete 256-byte domain.
 pub(crate) const START_FILTER_GUARD_MAX_CARDINALITY: u32 = 64;
@@ -699,6 +703,41 @@ pub(crate) struct StartPositionClass {
     pub(crate) set: ByteSet,
 }
 
+/// Broad exact-position class sampled after primary-candidate rejection.
+///
+/// A contiguous range can be intersected with the primary scanner a complete
+/// candidate block at a time without constructing another runtime classifier.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StartPositionProbe {
+    pub(crate) set: ByteSet,
+    pub(crate) offset: u8,
+    range_start: u8,
+    range_end: u8,
+}
+
+impl StartPositionProbe {
+    pub(crate) const fn new(class: StartPositionClass, range: Option<(u8, u8)>) -> Self {
+        let (range_start, range_end) = match range {
+            Some((start, end)) => (start, end),
+            None => (1, 0),
+        };
+        Self {
+            set: class.set,
+            offset: class.offset,
+            range_start,
+            range_end,
+        }
+    }
+
+    pub(crate) const fn range(&self) -> Option<(u8, u8)> {
+        if self.range_start <= self.range_end {
+            Some((self.range_start, self.range_end))
+        } else {
+            None
+        }
+    }
+}
+
 /// Execution policy for the one retained non-scanner exact-position class.
 ///
 /// A guard is checked for every primary candidate. A probe starts inactive
@@ -708,7 +747,7 @@ pub(crate) struct StartPositionClass {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StartPositionFilter {
     Guard(StartPositionClass),
-    Probe(StartPositionClass),
+    Probe(StartPositionProbe),
 }
 
 impl StartPositionFilter {
@@ -719,10 +758,10 @@ impl StartPositionFilter {
         }
     }
 
-    pub(crate) const fn probe(&self) -> Option<&StartPositionClass> {
+    pub(crate) const fn probe(&self) -> Option<&StartPositionProbe> {
         match self {
             Self::Guard(_) => None,
-            Self::Probe(class) => Some(class),
+            Self::Probe(probe) => Some(probe),
         }
     }
 }
@@ -751,7 +790,7 @@ impl StartFilterProof {
         }
     }
 
-    pub(crate) const fn probe(&self) -> Option<&StartPositionClass> {
+    pub(crate) const fn probe(&self) -> Option<&StartPositionProbe> {
         match &self.filter {
             Some(filter) => filter.probe(),
             None => None,
