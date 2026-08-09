@@ -930,7 +930,7 @@ const PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME: &str =
 const PREPARED_PREFLIGHT_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_search_exclusive_partial_preflight_v1";
 const DYNAMIC_ROWS_PREFLIGHT_RUNTIME_SYMBOL_NAME: &str =
-    "fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v3";
+    "fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v5";
 const DYNAMIC_ROWS_DEOPT_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_search_exclusive_dynamic_rows_deopt_v1";
 const DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL_NAME: &str =
@@ -17083,8 +17083,9 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     // the invocation-specific learned-loop policy here; rechecking the
     // canonical cell, address, geometry, stride, initial row, or duplicated
     // cache identity would repeat the runtime transaction on every search.
-    // The output identity remains in the stack record for an eventual first-
-    // hole continuation, where the mutating runtime helper authenticates it.
+    // A first-hole continuation reloads the identity from this same trusted
+    // descriptor before calling the mutating runtime helper. V5 therefore
+    // leaves the fourth output word untouched on the common successful entry.
     // R11 retains the descriptor while the shared scanner helpers use RAX for
     // constants, remaining lengths, and candidate masks.
     assembler.instruction(&[0x4c, 0x8b, 0x5c, 0x24, 0x50])?; // descriptor
@@ -17776,7 +17777,14 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         }
         // Preserve the exact row and unread byte, then reuse the five
         // preflight/output words as the compiler-private continuation record.
-        assembler.instruction(&[0x4c, 0x8b, 0x5c, 0x24, 0x58])?; // cache identity
+        assembler.instruction(&[0x4c, 0x8b, 0x5c, 0x24, 0x50])?; // descriptor
+        assembler.instruction(&[
+            0x4d,
+            0x8b,
+            0x5b,
+            u8::try_from(NATIVE_ROWS_CACHE_IDENTITY)
+                .map_err(|_| ObjectError::ArithmeticOverflow("x86 dynamic cache identity"))?,
+        ])?; // cold cache identity
         assembler.instruction(&[0x4c, 0x89, 0x44, 0x24, 0x40])?; // current row
         assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x48])?; // unread position
         if tracks_root_scanner_hits {
@@ -27978,8 +27986,9 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     // the invocation-specific learned-loop policy here; rechecking the
     // canonical cell, address, geometry, stride, initial row, or duplicated
     // cache identity would repeat the runtime transaction on every search.
-    // The output identity remains in the stack record for an eventual first-
-    // hole continuation, where the mutating runtime helper authenticates it.
+    // A first-hole continuation reloads the identity from this same trusted
+    // descriptor before calling the mutating runtime helper. V5 therefore
+    // leaves the fourth output word untouched on the common successful entry.
     // Caller-saved registers remain disjoint across the root scanners:
     // X13 descriptor, X14/X15 map/rows, X11 current row, X1 initial row,
     // X2/X3 position/end, and X4/X7/X8/X9/X10/X12 scratch. X11/X1 are cell
@@ -28761,7 +28770,13 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         assembler.branch_cond(AARCH64_EQ, framed_fallback)?;
         // Preserve the exact scalar frontier, then reuse the five preflight
         // words as the compiler-private continuation record.
-        assembler.instruction(aarch64_load_x_imm(9, 31, 72)?)?; // cache identity
+        assembler.instruction(aarch64_load_x_imm(9, 31, 64)?)?; // descriptor
+        assembler.instruction(aarch64_load_x_imm(
+            9,
+            9,
+            u16::try_from(NATIVE_ROWS_CACHE_IDENTITY)
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic cache identity"))?,
+        )?)?; // cold cache identity
         assembler.instruction(aarch64_store_pair_x(11, 2, 31, 48)?)?; // row, unread
         if tracks_root_scanner_hits {
             assembler.instruction(aarch64_add_x_reg(8, 19, 19)?)?; // hits << 1
@@ -35235,7 +35250,7 @@ mod tests {
         clippy::too_many_lines,
         reason = "the cross-ISA V2 contract audit keeps trusted entry shape and exact hot-loop encodings together"
     )]
-    fn dynamic_v2_preflight_elides_redundant_guards_before_both_immediate_hot_loops() {
+    fn dynamic_v5_preflight_elides_redundant_guards_before_both_immediate_hot_loops() {
         assert_eq!(aarch64_cmn_w_imm(8, 1).unwrap(), 0x3100_051f);
         assert_eq!(aarch64_and_low_w(8, 8, 29).unwrap(), 0x1200_7108);
         assert!(aarch64_cmn_w_imm(8, 0x1000).is_err());
@@ -36892,11 +36907,27 @@ mod tests {
                 .checked_add(
                     x86.code[continuation..]
                         .windows(5)
-                        .position(|bytes| bytes == [0x4c, 0x8b, 0x5c, 0x24, 0x58])
-                        .expect("x86 cache-identity capture after frozen-seal guard"),
+                        .position(|bytes| bytes == [0x4c, 0x8b, 0x5c, 0x24, 0x50])
+                        .expect("x86 descriptor reload after frozen-seal guard"),
                 )
-                .expect("x86 cache-identity offset");
+                .expect("x86 descriptor reload offset");
             assert!(continuation < cache_capture);
+            assert_eq!(
+                &x86.code[cache_capture + 5..cache_capture + 9],
+                &[
+                    0x4d,
+                    0x8b,
+                    0x5b,
+                    u8::try_from(NATIVE_ROWS_CACHE_IDENTITY).unwrap(),
+                ],
+                "x86 {output:?} loads identity from the trusted descriptor only on the cold continuation"
+            );
+            assert!(
+                !x86.code[continuation..cache_capture]
+                    .windows(5)
+                    .any(|bytes| bytes == [0x4c, 0x8b, 0x5c, 0x24, 0x58]),
+                "x86 {output:?} must not read V4's untouched fourth output word"
+            );
             for instruction in [
                 [0x4c, 0x89, 0x44, 0x24, 0x40],
                 [0x48, 0x89, 0x54, 0x24, 0x48],
@@ -36995,11 +37026,26 @@ mod tests {
                 .checked_add(
                     words[continuation..]
                         .iter()
-                        .position(|&word| word == aarch64_load_x_imm(9, 31, 72).unwrap())
-                        .expect("AArch64 cache-identity capture after frozen-seal guard"),
+                        .position(|&word| word == aarch64_load_x_imm(9, 31, 64).unwrap())
+                        .expect("AArch64 descriptor reload after frozen-seal guard"),
                 )
-                .expect("AArch64 cache-identity offset");
+                .expect("AArch64 descriptor reload offset");
             assert!(continuation < cache_capture);
+            assert_eq!(
+                words[cache_capture + 1],
+                aarch64_load_x_imm(
+                    9,
+                    9,
+                    u16::try_from(NATIVE_ROWS_CACHE_IDENTITY).unwrap(),
+                )
+                .unwrap(),
+                "AArch64 {output:?} loads identity from the trusted descriptor only on the cold continuation"
+            );
+            assert!(
+                !words[continuation..cache_capture]
+                    .contains(&aarch64_load_x_imm(9, 31, 72).unwrap()),
+                "AArch64 {output:?} must not read V4's untouched fourth output word"
+            );
             for instruction in [
                 aarch64_store_pair_x(11, 2, 31, 48).unwrap(),
                 aarch64_store_x(9, 31, 80).unwrap(),
@@ -37927,11 +37973,13 @@ mod tests {
                     symbol.name.as_str(),
                     "fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v1"
                         | "fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v2"
+                        | "fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v3"
+                        | "fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v4"
                 )
             }));
             assert_eq!(
                 module.symbols()[PREPARED_PREFLIGHT_RUNTIME_SYMBOL].name,
-                "fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v3",
+                "fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v5",
                 "{target:?}"
             );
             let preflights = module
@@ -39879,7 +39927,7 @@ uint32_t fre_aot_regex_runtime_search_exclusive_dynamic_rows_continue_v1(handle_
   if(d==NULL||c==NULL||memcmp(d,identity,32)!=0)return 86;
   return fre_aot_regex_runtime_search_exclusive_dynamic_rows_deopt_v1(h,p,n,s,e,r);
 }}
-uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v3(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*d,preflight_t*out) {{
+uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v5(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*d,preflight_t*out) {{
   preflight_calls++;
   if(h==NULL)return 5;
   if(h!=(handle_t)&frozen)return 90;
@@ -39887,7 +39935,7 @@ uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_pr
   if(p!=haystack||n!=sizeof(haystack)||s!=5||e!=69||d==NULL||out==NULL||memcmp(d,identity,32)!=0)return 88;
   if(mode==2){{r->start=321;r->end=654;return 76;}}
   out->start=s;out->end=e;out->native_rows_address=(size_t)(uintptr_t)&rows;
-  out->cache_generation=77;return 6;
+  return 6;
 }}
 static int run_direct(uint32_t stride,size_t states,int matching,const unsigned char*p,size_t n,size_t s,size_t e,int base) {{
   init_frozen(stride,states,matching);mode=20;
@@ -40002,7 +40050,7 @@ int main(void) {{
   if(status!=0||r.start!=0||r.end!=0||fallback_calls!=0||deopt_calls!=0||preflight_calls!=1)return 13;
   mode=5;cells[0]=UINT32_MAX;r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)&frozen,haystack,sizeof(haystack),5,69,&r);
   if(status!=77||r.start!=123||r.end!=456||fallback_calls!=0||deopt_calls!=1||preflight_calls!=1)return 14;
-  /* V3 producer invariants are trusted here; only invocation-specific
+  /* V5 producer invariants are trusted here; only invocation-specific
      policy remains a generated-code check. */
   init_rows();mode=8;cells[0]=2;cells[1]=2;r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)&frozen,haystack,sizeof(haystack),5,69,&r);
   if(status!=0||r.start!=0||r.end!=0||fallback_calls!=0||deopt_calls!=0||preflight_calls!=1)return 18;
@@ -40032,22 +40080,22 @@ int main(void) {{
 "##,
         );
         if output == OutputContract::Exists && !fragmented_exact_root {
-            const V3_PREFLIGHT: &str =
-                "fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v3";
-            const V2_PREFLIGHT: &str =
-                "fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v2";
-            let legacy_source = source.replacen(V3_PREFLIGHT, V2_PREFLIGHT, 1);
+            const V5_PREFLIGHT: &str =
+                "fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v5";
+            const V4_PREFLIGHT: &str =
+                "fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v4";
+            let legacy_source = source.replacen(V5_PREFLIGHT, V4_PREFLIGHT, 1);
             assert_ne!(
                 legacy_source, source,
-                "the V3 linker fixture did not contain its capability symbol"
+                "the V5 linker fixture did not contain its capability symbol"
             );
             assert!(
-                !legacy_source.contains(V3_PREFLIGHT),
-                "the legacy linker fixture still exposes the V3 capability symbol"
+                !legacy_source.contains(V5_PREFLIGHT),
+                "the legacy linker fixture still exposes the V5 capability symbol"
             );
-            let legacy_c_path = directory.join("dynamic-v2-runtime.c");
-            let legacy_executable = directory.join("dynamic-v2-runtime");
-            fs::write(&legacy_c_path, legacy_source).expect("write V2-only dynamic runtime");
+            let legacy_c_path = directory.join("dynamic-v4-runtime.c");
+            let legacy_executable = directory.join("dynamic-v4-runtime");
+            fs::write(&legacy_c_path, legacy_source).expect("write V4-only dynamic runtime");
             let c_compiler = if cfg!(target_os = "macos") {
                 "clang"
             } else {
@@ -40060,10 +40108,10 @@ int main(void) {{
                 .arg("-o")
                 .arg(&legacy_executable)
                 .output()
-                .expect("invoke host C compiler for V2-only runtime");
+                .expect("invoke host C compiler for V4-only runtime");
             assert!(
                 !legacy.status.success(),
-                "a generated V3 object linked against a runtime exposing only the V2 preflight: {}",
+                "a generated V5 object linked against a runtime exposing only the V4 preflight: {}",
                 String::from_utf8_lossy(&legacy.stderr)
             );
         }
@@ -41962,7 +42010,7 @@ static frozen_v4_t frozen;
 static unsigned helper_calls;
 uint32_t fre_aot_regex_runtime_search_v1(const unsigned char*a,const unsigned char*b,size_t n,size_t s,size_t e,result_t*r){{(void)a;(void)b;(void)n;(void)s;(void)e;(void)r;helper_calls++;return 97U;}}
 uint32_t fre_aot_regex_runtime_search_exclusive_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;helper_calls++;return 97U;}}
-uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v3(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,preflight_t*o){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;(void)i;(void)o;helper_calls++;return 97U;}}
+uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v5(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,preflight_t*o){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;(void)i;(void)o;helper_calls++;return 97U;}}
 uint32_t fre_aot_regex_runtime_search_exclusive_dynamic_rows_deopt_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;helper_calls++;return 97U;}}
 uint32_t fre_aot_regex_runtime_search_exclusive_dynamic_rows_continue_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,const continuation_t*c){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;(void)i;(void)c;helper_calls++;return 97U;}}
 size_t fre_aot_regex_runtime_scan_frozen_loop_v2(const unsigned char*p,const void*s,size_t n){{(void)p;(void)s;(void)n;helper_calls++;return 0U;}}
