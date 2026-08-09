@@ -3018,22 +3018,24 @@ pub struct FrozenDynamicRowsStorageV3 {
     descriptor_v6: Option<FrozenDynamicRowsV6>,
 }
 
-/// Independently owned dense table that may be entered only from an already
+/// Independently owned compact table that may be entered only from an already
 /// authenticated arbitrary-state continuation.
 ///
 /// The private newtype prevents callers outside this module from accidentally
-/// supplying a root-scanner-independent V13/V14 owner to the ordinary public
-/// prepared-header publisher. Compiler-private continuation projection and
-/// publication APIs unwrap it only after authenticating the exact resume
-/// ticket for which the owner was built.
+/// supplying a root-scanner-independent V4/V13/V14 owner to the ordinary
+/// public prepared-header publisher. Compiler-private continuation projection
+/// and publication APIs unwrap it only after authenticating the exact resume
+/// ticket for which the owner was built. V4 rescues unary V5 rows whose
+/// root-only first-accept summary cannot authorize an arbitrary-state entry;
+/// V13/V14 rescue rooted loop-overlay rows with multi-symbol transitions.
 #[doc(hidden)]
 #[derive(Debug)]
-pub struct FrozenDenseContinuationRowsStorageV1 {
+pub struct FrozenStaticContinuationRowsStorageV1 {
     rows: FrozenDynamicRowsStorageV3,
 }
 
-impl FrozenDenseContinuationRowsStorageV1 {
-    /// Return the exact dense generation owned by this continuation sidecar.
+impl FrozenStaticContinuationRowsStorageV1 {
+    /// Return the exact compact generation owned by this continuation sidecar.
     #[doc(hidden)]
     #[must_use]
     pub const fn compiler_private_format_version(&self) -> u32 {
@@ -9408,23 +9410,25 @@ impl CompiledProgram {
         )
     }
 
-    /// Build an independently owned dense continuation table from the same
+    /// Build an independently owned continuation table from the same
     /// authenticated complete K0 transaction used by the public root owner.
     ///
     /// This owner is only authority for an already admitted arbitrary-state
-    /// continuation. It must never be published at the public root entry, so
-    /// an otherwise mandatory root scanner does not exclude exact V13/V14
-    /// composition. A geometry or resource decline returns no side owner and
-    /// leaves the ordinary root-compatible owner unchanged.
+    /// continuation. It must never be published at the public root entry. An
+    /// otherwise mandatory root scanner therefore does not exclude exact
+    /// V13/V14 composition, and a unary V5 root summary is republished as the
+    /// underlying exact V4 rows rather than being misapplied to an arbitrary
+    /// state. A geometry or resource decline returns no side owner and leaves
+    /// the ordinary root-compatible owner unchanged.
     #[doc(hidden)]
     #[must_use]
-    pub fn compiler_private_frozen_dense_continuation_rows_storage_v3_with_fallback_receipt(
+    pub fn compiler_private_frozen_static_continuation_rows_storage_v3_with_fallback_receipt(
         &self,
         workspace: &mut ProgramWorkspace,
         fully_prefilled_fallback: Option<FullyPrefilledFallbackReceipt>,
         max_k0_bytes: usize,
         max_packed_bytes: usize,
-    ) -> Option<FrozenDenseContinuationRowsStorageV1> {
+    ) -> Option<FrozenStaticContinuationRowsStorageV1> {
         let storage = self
             .compiler_private_frozen_dynamic_rows_storage_v3_with_fallback_receipt_policy(
                 workspace,
@@ -9433,23 +9437,30 @@ impl CompiledProgram {
                 max_packed_bytes,
                 true,
             )?;
-        matches!(
-            storage.descriptor.format_version,
-            FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION | FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION
-        )
-        .then_some(FrozenDenseContinuationRowsStorageV1 { rows: storage })
+        let format_version = storage.descriptor.format_version;
+        let unary_v4 = format_version == FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION
+            && self.output == OutputContract::Exists
+            && storage.descriptor.class_count == 1
+            && storage.unary_exists_first_accept_step.is_none();
+        (unary_v4
+            || matches!(
+                format_version,
+                FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION
+                    | FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION
+            ))
+        .then_some(FrozenStaticContinuationRowsStorageV1 { rows: storage })
     }
 
-    /// Publish a dense side owner only for the authenticated local
+    /// Publish a scanner-free side owner only for the authenticated local
     /// continuation entry. The distinct owner type makes this the sole
     /// external publication route and keeps public-root header construction
     /// unable to unwrap the scanner-independent table.
     #[doc(hidden)]
     #[must_use]
-    pub fn compiler_private_frozen_dense_continuation_prepared_header_v6(
+    pub fn compiler_private_frozen_static_continuation_prepared_header_v6(
         &self,
         workspace: &ProgramWorkspace,
-        owner: &FrozenDenseContinuationRowsStorageV1,
+        owner: &FrozenStaticContinuationRowsStorageV1,
     ) -> Option<FrozenPreparedHeaderV6> {
         if workspace.identity.instance != self.identity.instance
             || !owner.rows.descriptor_is_valid_for(self.identity)
@@ -9463,13 +9474,18 @@ impl CompiledProgram {
             Some(&owner.rows),
         );
         let format_version = owner.compiler_private_format_version();
+        let unary_v4 = format_version == FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION
+            && self.output == OutputContract::Exists
+            && owner.rows.descriptor.class_count == 1
+            && owner.rows.unary_exists_first_accept_step.is_none();
         (header.has_dynamic_rows()
             && header.dynamic_rows_v6.compact.format_version == format_version
-            && matches!(
-                format_version,
-                FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION
-                    | FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION
-            ))
+            && (unary_v4
+                || matches!(
+                    format_version,
+                    FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION
+                        | FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION
+                )))
         .then_some(header)
     }
 
@@ -9483,7 +9499,7 @@ impl CompiledProgram {
         fully_prefilled_fallback: Option<FullyPrefilledFallbackReceipt>,
         max_k0_bytes: usize,
         max_packed_bytes: usize,
-        dense_continuation_only: bool,
+        static_continuation_only: bool,
     ) -> Option<FrozenDynamicRowsStorageV3> {
         if workspace.identity.instance != self.identity.instance {
             return None;
@@ -9687,10 +9703,15 @@ impl CompiledProgram {
         let loop_payload_bytes = loop_candidate_count
             .checked_mul(core::mem::size_of::<FrozenCompactLoopScanner>())?
             .checked_add(mapped_loop_index_length)?;
-        let unary_v5_eligible = dynamic_view.output == OutputContract::Exists
+        let unary_v5_eligible = !static_continuation_only
+            && dynamic_view.output == OutputContract::Exists
             && semantic_class_count == 1
             && format == FrozenCompactRowsFormat::CellOffsetV4;
-        let retain_loop_extension = !dense_continuation_only
+        let static_unary_v4 = static_continuation_only
+            && dynamic_view.output == OutputContract::Exists
+            && semantic_class_count == 1
+            && format == FrozenCompactRowsFormat::CellOffsetV4;
+        let retain_loop_extension = !static_continuation_only
             && !unary_v5_eligible
             && loop_candidate_count != 0
             && mapped_bytes
@@ -9706,7 +9727,7 @@ impl CompiledProgram {
         // independently safe there without acquiring public-root authority.
         if !unary_v5_eligible
             && !retain_loop_extension
-            && (dense_continuation_only || dynamic_view.root_requirement.is_none())
+            && (static_continuation_only || dynamic_view.root_requirement.is_none())
             && let Some((_, _, _, _, _, total_cells, quad_bytes)) =
                 frozen_quad_rows_v14_geometry(state_count, semantic_class_count)
             && quad_bytes <= retained_bytes
@@ -9765,7 +9786,7 @@ impl CompiledProgram {
         // scanner and static-prefix frontier have already been authenticated.
         if !unary_v5_eligible
             && !retain_loop_extension
-            && (dense_continuation_only || dynamic_view.root_requirement.is_none())
+            && (static_continuation_only || dynamic_view.root_requirement.is_none())
             && let Some((_, _, total_cells, pair_bytes)) =
                 frozen_pair_rows_v13_geometry(state_count, semantic_class_count)
             && pair_bytes <= retained_bytes
@@ -9878,7 +9899,7 @@ impl CompiledProgram {
             }
         }
 
-        if !unary_v5_eligible && !retain_loop_extension {
+        if !unary_v5_eligible && !static_unary_v4 && !retain_loop_extension {
             (columns, format) = promote_frozen_compact_raw_byte_projection(
                 columns,
                 format,
@@ -9979,7 +10000,10 @@ impl CompiledProgram {
         let rows_u8 = owned_rows_u8.map(Vec::into_boxed_slice);
 
         let unary_exists_first_accept_step =
-            if dynamic_view.output == OutputContract::Exists && class_count == 1 {
+            if !static_continuation_only
+                && dynamic_view.output == OutputContract::Exists
+                && class_count == 1
+            {
                 if format != FrozenCompactRowsFormat::CellOffsetV4 {
                     return None;
                 }
@@ -27965,7 +27989,7 @@ mod tests {
                 );
                 let mut continuation_workspace = compiled.prepare_workspace().unwrap();
                 let continuation = compiled
-                    .compiler_private_frozen_dense_continuation_rows_storage_v3_with_fallback_receipt(
+                    .compiler_private_frozen_static_continuation_rows_storage_v3_with_fallback_receipt(
                         &mut continuation_workspace,
                         None,
                         usize::MAX,
@@ -27993,7 +28017,7 @@ mod tests {
                     "dense continuation envelope is invalid for {label}"
                 );
                 let continuation_header = compiled
-                    .compiler_private_frozen_dense_continuation_prepared_header_v6(
+                    .compiler_private_frozen_static_continuation_prepared_header_v6(
                         &continuation_workspace,
                         &continuation,
                     )
@@ -28012,7 +28036,7 @@ mod tests {
                 let foreign_workspace = foreign.prepare_workspace().unwrap();
                 assert!(
                     compiled
-                        .compiler_private_frozen_dense_continuation_prepared_header_v6(
+                        .compiler_private_frozen_static_continuation_prepared_header_v6(
                             &foreign_workspace,
                             &continuation,
                         )
@@ -28021,7 +28045,7 @@ mod tests {
                 );
                 assert!(
                     foreign
-                        .compiler_private_frozen_dense_continuation_prepared_header_v6(
+                        .compiler_private_frozen_static_continuation_prepared_header_v6(
                             &continuation_workspace,
                             &continuation,
                         )
@@ -28040,7 +28064,7 @@ mod tests {
                 let mut declined_workspace = compiled.prepare_workspace().unwrap();
                 assert!(
                     compiled
-                        .compiler_private_frozen_dense_continuation_rows_storage_v3_with_fallback_receipt(
+                        .compiler_private_frozen_static_continuation_rows_storage_v3_with_fallback_receipt(
                             &mut declined_workspace,
                             None,
                             usize::MAX,
@@ -28555,6 +28579,57 @@ mod tests {
             !header.dynamic_rows_v5.first_accept_step
         );
         assert_eq!(header.v1.forward_live_cells, usize::try_from(header.dynamic_rows_v5.state_count).unwrap());
+
+        // V5's one-based accepting step is exact only from canonical root
+        // state zero. A static-prefix hole resumes at an arbitrary canonical
+        // state, so its independently owned continuation view must publish
+        // the same complete unary rows as ordinary V4 instead of reusing the
+        // root-only summary.
+        let mut continuation_workspace = compiled.prepare_workspace().unwrap();
+        let continuation = compiled
+            .compiler_private_frozen_static_continuation_rows_storage_v3_with_fallback_receipt(
+                &mut continuation_workspace,
+                None,
+                usize::MAX,
+                usize::MAX,
+            )
+            .expect("unary static continuation owner");
+        assert_eq!(
+            continuation.compiler_private_format_version(),
+            FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION
+        );
+        assert!(continuation.rows.unary_exists_first_accept_step.is_none());
+        let continuation_header = compiled
+            .compiler_private_frozen_static_continuation_prepared_header_v6(
+                &continuation_workspace,
+                &continuation,
+            )
+            .expect("unary static continuation header");
+        assert_eq!(
+            continuation_header.v1.flags,
+            FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V4
+        );
+        assert_eq!(
+            continuation_header.dynamic_rows_v6.compact.format_version,
+            FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION
+        );
+        let unary_v4_bytes = usize::try_from(continuation.rows.descriptor.state_count)
+            .unwrap()
+            .checked_mul(core::mem::size_of::<u16>())
+            .and_then(|bytes| bytes.checked_add(256))
+            .unwrap();
+        let mut declined_continuation_workspace = compiled.prepare_workspace().unwrap();
+        assert!(
+            compiled
+                .compiler_private_frozen_static_continuation_rows_storage_v3_with_fallback_receipt(
+                    &mut declined_continuation_workspace,
+                    None,
+                    usize::MAX,
+                    unary_v4_bytes - 1,
+                )
+                .is_none(),
+            "a unary continuation budget decline must not leak the V5 root summary"
+        );
 
         header.dynamic_rows_v5.first_accept_step_complement ^= 1;
         assert!(!header.has_dynamic_rows(), "summary corruption must fail closed");

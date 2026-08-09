@@ -139,7 +139,7 @@ pub use program::{
     FROZEN_PREPARED_HEADER_V13_DYNAMIC_ROWS_OFFSET, FROZEN_PREPARED_HEADER_V13_READY_SEAL,
     FROZEN_PREPARED_HEADER_V14_BYTES, FROZEN_PREPARED_HEADER_V14_DYNAMIC_ROWS_OFFSET,
     FROZEN_PREPARED_HEADER_V14_READY_SEAL, FrozenCompactLoopPlanV1, FrozenCompactLoopScanner,
-    FrozenDenseContinuationRowsStorageV1, FrozenDynamicRowsStorage,
+    FrozenStaticContinuationRowsStorageV1, FrozenDynamicRowsStorage,
     FrozenDynamicRowsStorageV3, FrozenDynamicRowsV3, FrozenDynamicRowsV5,
     FrozenDynamicRowsV6,
     FrozenPreparedHeaderV1, FrozenPreparedHeaderV2, FrozenPreparedHeaderV3,
