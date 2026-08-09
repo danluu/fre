@@ -6270,6 +6270,92 @@ impl DynamicNativeRowsWorkspace {
             ),
         };
         self.native_rows_dirty = false;
+        // Seal the compiler-private V2 contract once per dirty projection.
+        // Clean repeated preflights reuse this descriptor without rewalking
+        // its class map or geometry. A future K0 construction regression thus
+        // declines to portable execution even in release builds instead of
+        // reaching generated unchecked loads.
+        if !self.compiler_private_descriptor_satisfies_v2_contract() {
+            self.native_rows = DynamicNativeRowsV1::default();
+            self.native_rows_dirty = true;
+            return false;
+        }
+        true
+    }
+
+    /// Publish the exact descriptor covered by the compiler-private V2
+    /// preflight contract. Release builds pay only for returning the two
+    /// already-live words; debug and test builds independently audit the
+    /// construction invariants at the trust boundary.
+    #[inline]
+    fn compiler_private_trusted_descriptor_v2(&self) -> (usize, u64) {
+        debug_assert!(self.compiler_private_descriptor_satisfies_v2_contract());
+        (
+            (&raw const self.native_rows).expose_provenance(),
+            self.native_rows.cache_identity,
+        )
+    }
+
+    fn compiler_private_descriptor_satisfies_v2_contract(&self) -> bool {
+        let rows = self.native_rows;
+        let Ok(stride) = usize::try_from(rows.row_stride) else {
+            return false;
+        };
+        let Ok(initial_row) = usize::try_from(rows.initial_row) else {
+            return false;
+        };
+        let Ok(loop_count) = usize::try_from(rows.learned_loop_row_count) else {
+            return false;
+        };
+        let descriptor_address = (&raw const self.native_rows).expose_provenance();
+        if self.native_rows_dirty
+            || descriptor_address == 0
+            || !descriptor_address.is_multiple_of(core::mem::align_of::<DynamicNativeRowsV1>())
+            || rows.rows_address == 0
+            || !rows
+                .rows_address
+                .is_multiple_of(core::mem::align_of::<u32>())
+            || rows.class_map_address != self.class_map.as_ptr().expose_provenance()
+            || rows.live_cells == 0
+            || rows.live_cells > usize::try_from(DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK)
+                .unwrap_or(usize::MAX)
+            || !(1..=256).contains(&stride)
+            || rows.live_cells.checked_rem(stride) != Some(0)
+            || initial_row.checked_rem(stride) != Some(0)
+            || initial_row
+                .checked_add(stride)
+                .is_none_or(|end| end > rows.live_cells)
+            || rows.unfilled_cell != DYNAMIC_NATIVE_ROWS_V1_UNFILLED_CELL
+            || rows.accept_mask != DYNAMIC_NATIVE_ROWS_V1_ACCEPT_MASK
+            || rows.next_row_token_mask != DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK
+            || rows.cache_identity == 0
+            || rows.initial_flags != 0
+            || loop_count > rows.learned_loop_rows.len()
+            || rows.learned_loop_rows[loop_count..]
+                .iter()
+                .any(|&row| row != u32::MAX)
+            || self
+                .class_map
+                .iter()
+                .any(|&class| usize::from(class) >= stride)
+        {
+            return false;
+        }
+        for (index, &row) in rows.learned_loop_rows[..loop_count].iter().enumerate() {
+            let Ok(row) = usize::try_from(row) else {
+                return false;
+            };
+            if row.checked_rem(stride) != Some(0)
+                || row
+                    .checked_add(stride)
+                    .is_none_or(|end| end > rows.live_cells)
+                || rows.learned_loop_rows[..index]
+                    .iter()
+                    .any(|&prior| usize::try_from(prior).ok() == Some(row))
+            {
+                return false;
+            }
+        }
         true
     }
 }
@@ -10953,10 +11039,7 @@ impl CompiledProgram {
                             has_mandatory_cut,
                         )
                     {
-                        enter = Some((
-                            (&raw const dynamic.native_rows).expose_provenance(),
-                            dynamic.native_rows.cache_identity,
-                        ));
+                        enter = Some(dynamic.compiler_private_trusted_descriptor_v2());
                     }
                 }
             }
@@ -15003,6 +15086,113 @@ mod tests {
         let mut strings = Vec::new();
         extend(&mut strings, &mut Vec::new(), alphabet, max_len);
         strings
+    }
+
+    #[test]
+    fn compiler_private_v2_descriptor_validator_covers_every_unchecked_field_family() {
+        let compiled = program(
+            "(?:ab|ac)+z",
+            OutputContract::Exists,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        let mut workspace = compiled.prepare_workspace().expect("prepared K0 workspace");
+        let mut haystack = vec![b'a'; 64];
+        for pair in haystack[..62].chunks_exact_mut(2) {
+            pair.copy_from_slice(b"ab");
+        }
+        haystack[62] = b'z';
+        haystack[63] = b'!';
+        let window = SearchWindow::new(0, haystack.len());
+        let identity = compiled.artifact_identity();
+
+        let (cold, _, _) = compiled
+            .preflight_dynamic_native_rows_with_workspace(
+                &haystack,
+                window,
+                &mut workspace,
+                identity,
+            )
+            .expect("cold dynamic preflight");
+        assert_eq!(
+            cold,
+            RetainedPartialPreflight::Complete(MatchResult::Exists(true))
+        );
+        enter_dynamic_rows(
+            &compiled,
+            &haystack,
+            window,
+            &mut workspace,
+            identity,
+            "trusted V2 descriptor",
+        );
+
+        let dynamic = workspace
+            .dynamic_native_rows
+            .as_deref_mut()
+            .expect("prepared dynamic-row workspace");
+        let original = dynamic.native_rows;
+        let original_class_map = dynamic.class_map;
+        assert!(dynamic.compiler_private_descriptor_satisfies_v2_contract());
+
+        macro_rules! reject_field {
+            ($field:ident, $value:expr) => {{
+                dynamic.native_rows = original;
+                dynamic.native_rows.$field = $value;
+                assert!(
+                    !dynamic.compiler_private_descriptor_satisfies_v2_contract(),
+                    stringify!($field)
+                );
+            }};
+        }
+        reject_field!(rows_address, 0);
+        reject_field!(rows_address, original.rows_address.saturating_add(1));
+        reject_field!(class_map_address, 0);
+        reject_field!(live_cells, 0);
+        reject_field!(row_stride, 0);
+        reject_field!(
+            initial_row,
+            u32::try_from(original.live_cells).unwrap_or(u32::MAX)
+        );
+        reject_field!(unfilled_cell, 0);
+        reject_field!(accept_mask, 0);
+        reject_field!(next_row_token_mask, 0);
+        reject_field!(cache_identity, 0);
+        reject_field!(initial_flags, NATIVE_ROWS_INITIAL_PENDING);
+        reject_field!(
+            learned_loop_row_count,
+            u32::try_from(original.learned_loop_rows.len() + 1).unwrap()
+        );
+
+        dynamic.native_rows = original;
+        dynamic.native_rows.learned_loop_row_count = 0;
+        dynamic.native_rows.learned_loop_rows[0] = 0;
+        assert!(!dynamic.compiler_private_descriptor_satisfies_v2_contract());
+
+        dynamic.native_rows = original;
+        dynamic.native_rows.learned_loop_row_count = 1;
+        dynamic.native_rows.learned_loop_rows[0] =
+            u32::try_from(original.live_cells).unwrap_or(u32::MAX);
+        assert!(!dynamic.compiler_private_descriptor_satisfies_v2_contract());
+
+        dynamic.native_rows = original;
+        dynamic.native_rows.learned_loop_row_count = 2;
+        dynamic.native_rows.learned_loop_rows[0] = 0;
+        dynamic.native_rows.learned_loop_rows[1] = 0;
+        assert!(!dynamic.compiler_private_descriptor_satisfies_v2_contract());
+
+        dynamic.native_rows = original;
+        let stride = u8::try_from(original.row_stride).expect("fixture stride fits one byte");
+        assert_ne!(stride, u8::MAX);
+        dynamic.class_map[0] = stride;
+        assert!(!dynamic.compiler_private_descriptor_satisfies_v2_contract());
+
+        dynamic.class_map = original_class_map;
+        dynamic.native_rows = original;
+        dynamic.native_rows_dirty = true;
+        assert!(!dynamic.compiler_private_descriptor_satisfies_v2_contract());
+        dynamic.native_rows_dirty = false;
+        assert!(dynamic.compiler_private_descriptor_satisfies_v2_contract());
     }
 
     #[test]

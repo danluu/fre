@@ -930,7 +930,7 @@ const PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME: &str =
 const PREPARED_PREFLIGHT_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_search_exclusive_partial_preflight_v1";
 const DYNAMIC_ROWS_PREFLIGHT_RUNTIME_SYMBOL_NAME: &str =
-    "fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v1";
+    "fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v2";
 const DYNAMIC_ROWS_DEOPT_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_search_exclusive_dynamic_rows_deopt_v1";
 const DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL_NAME: &str =
@@ -17078,66 +17078,23 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     assembler.instruction(&[0x4c, 0x89, 0x54, 0x24, 0x28])?;
     assembler.instruction(&[0x4c, 0x8b, 0x54, 0x24, 0x48])?;
     assembler.instruction(&[0x4c, 0x89, 0x54, 0x24, 0x30])?;
-    // R11 retains the authenticated descriptor while the shared scanner
-    // helpers use RAX for constants, remaining lengths, and candidate masks.
+    // V2's compiler-private preflight constructs and authenticates the
+    // descriptor and its cache lineage for this synchronous scan. Retain only
+    // the invocation-specific learned-loop policy here; rechecking the
+    // canonical cell, address, geometry, stride, initial row, or duplicated
+    // cache identity would repeat the runtime transaction on every search.
+    // The output identity remains in the stack record for an eventual first-
+    // hole continuation, where the mutating runtime helper authenticates it.
+    // R11 retains the descriptor while the shared scanner helpers use RAX for
+    // constants, remaining lengths, and candidate masks.
     assembler.instruction(&[0x4c, 0x8b, 0x5c, 0x24, 0x50])?; // descriptor
-    assembler.instruction(&[0x4d, 0x85, 0xdb])?;
-    assembler.branch(&[0x0f, 0x84], framed_fallback)?;
     assembler.instruction(&[0x49, 0x8b, 0x33])?; // rows
-    assembler.instruction(&[0x48, 0x85, 0xf6])?;
-    assembler.branch(&[0x0f, 0x84], framed_fallback)?;
     assembler.instruction(&[0x4d, 0x8b, 0x4b, NATIVE_ROWS_CLASS_MAP_ADDRESS as u8])?;
-    assembler.instruction(&[0x4d, 0x85, 0xc9])?;
-    assembler.branch(&[0x0f, 0x84], framed_fallback)?;
-    assembler.instruction(&[0x4c, 0x8b, 0x54, 0x24, 0x58])?; // generation
-    assembler.instruction(&[0x4d, 0x85, 0xd2])?;
-    assembler.branch(&[0x0f, 0x84], framed_fallback)?;
-    assembler.instruction(&[0x4d, 0x3b, 0x53, NATIVE_ROWS_CACHE_IDENTITY as u8])?;
-    assembler.branch(&[0x0f, 0x85], framed_fallback)?;
-    assembler.instruction(&[0x41, 0x83, 0x7b, NATIVE_ROWS_INITIAL_FLAGS as u8, 0])?;
-    assembler.branch(&[0x0f, 0x85], framed_fallback)?;
-    // The mutable V1 producer has one canonical cell encoding. Authenticate
-    // it once at the descriptor boundary so the byte loop can use immediate
-    // cell operations without rereading three cold descriptor fields.
-    for (field, expected, context) in [
-        (
-            NATIVE_ROWS_UNFILLED_CELL,
-            DYNAMIC_NATIVE_ROWS_V1_UNFILLED_CELL,
-            "x86 dynamic unfilled value",
-        ),
-        (
-            NATIVE_ROWS_ACCEPT_MASK,
-            DYNAMIC_NATIVE_ROWS_V1_ACCEPT_MASK,
-            "x86 dynamic accept value",
-        ),
-        (
-            NATIVE_ROWS_NEXT_ROW_TOKEN_MASK,
-            DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK,
-            "x86 dynamic next-row value",
-        ),
-    ] {
-        let mut compare = vec![
-            0x41,
-            0x81,
-            0x7b,
-            u8::try_from(field).map_err(|_| ObjectError::ArithmeticOverflow(context))?,
-        ];
-        compare.extend_from_slice(&expected.to_le_bytes());
-        assembler.instruction(&compare)?;
-        assembler.branch(&[0x0f, 0x85], framed_fallback)?;
-    }
     if root_plan.is_some() {
         // Cache the overlay count only long enough to select one invocation
         // representation. The nonzero path retains its ordered ownership
         // checks; zero-overlay rows enter a pointer-row loop below.
         assembler.instruction(&[0x41, 0x8b, 0x43, NATIVE_ROWS_LOOP_COUNT as u8])?;
-        assembler.instruction(&[
-            0x83,
-            0xf8,
-            u8::try_from(NATIVE_ROWS_LOOP_ROW_CAPACITY)
-                .map_err(|_| ObjectError::ArithmeticOverflow("x86 dynamic loop capacity"))?,
-        ])?;
-        assembler.branch(&[0x0f, 0x87], framed_fallback)?; // loop count > capacity
     } else {
         // Without an independent root scanner, preserve the established
         // whole-cache decline instead of adding loop ownership checks to the
@@ -17145,11 +17102,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         assembler.instruction(&[0x41, 0x83, 0x7b, NATIVE_ROWS_LOOP_COUNT as u8, 0])?;
         assembler.branch(&[0x0f, 0x85], framed_fallback)?;
     }
-    assembler.instruction(&[0x41, 0x83, 0x7b, NATIVE_ROWS_ROW_STRIDE as u8, 0])?;
-    assembler.branch(&[0x0f, 0x84], framed_fallback)?;
     assembler.instruction(&[0x45, 0x8b, 0x43, NATIVE_ROWS_INITIAL_ROW as u8])?;
-    assembler.instruction(&[0x4d, 0x3b, 0x43, NATIVE_ROWS_LIVE_CELLS as u8])?;
-    assembler.branch(&[0x0f, 0x83], framed_fallback)?;
     assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x18])?; // haystack
     assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x40])?; // position
     assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x48])?; // exact end
@@ -20082,32 +20035,6 @@ fn aarch64_and_low_w(destination: u8, source: u8, bits: u8) -> Result<u32, Objec
         .filter(|&value| value < 31)
         .ok_or(ObjectError::InvalidModule("AArch64 low-bit mask"))?;
     Ok(0x1200_0000
-        | (u32::from(mask_end) << 10)
-        | aarch64_reg(source, 5)?
-        | aarch64_reg(destination, 0)?)
-}
-
-fn aarch64_eor_contiguous_x(
-    destination: u8,
-    source: u8,
-    first_bit: u8,
-    bit_count: u8,
-) -> Result<u32, ObjectError> {
-    let end = first_bit
-        .checked_add(bit_count)
-        .filter(|&value| value <= 64)
-        .ok_or(ObjectError::InvalidModule(
-            "AArch64 contiguous logical immediate",
-        ))?;
-    if bit_count == 0 || bit_count == 64 || end == 0 {
-        return Err(ObjectError::InvalidModule(
-            "AArch64 contiguous logical immediate",
-        ));
-    }
-    let rotate = (64_u8 - first_bit) & 63;
-    let mask_end = bit_count - 1;
-    Ok(0xd240_0000
-        | (u32::from(rotate) << 16)
         | (u32::from(mask_end) << 10)
         | aarch64_reg(source, 5)?
         | aarch64_reg(destination, 0)?)
@@ -28046,118 +27973,55 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     assembler.instruction(aarch64_store_x(8, 31, 24)?)?;
     assembler.instruction(aarch64_load_x_imm(8, 31, 56)?)?;
     assembler.instruction(aarch64_store_x(8, 31, 32)?)?;
+    // V2's compiler-private preflight constructs and authenticates the
+    // descriptor and its cache lineage for this synchronous scan. Retain only
+    // the invocation-specific learned-loop policy here; rechecking the
+    // canonical cell, address, geometry, stride, initial row, or duplicated
+    // cache identity would repeat the runtime transaction on every search.
+    // The output identity remains in the stack record for an eventual first-
+    // hole continuation, where the mutating runtime helper authenticates it.
     // Caller-saved registers remain disjoint across the root scanners:
     // X13 descriptor, X14/X15 map/rows, X11 current row, X1 initial row,
     // X2/X3 position/end, and X4/X7/X8/X9/X10/X12 scratch. X11/X1 are cell
     // offsets for the overlay representation and pointers for zero-overlay.
     assembler.instruction(aarch64_load_x_imm(13, 31, 64)?)?; // descriptor
-    assembler.instruction(aarch64_cmp_x_imm(13, 0)?)?;
-    assembler.branch_cond(AARCH64_EQ, framed_fallback)?;
     assembler.instruction(aarch64_load_x_imm(
         15,
         13,
         u16::try_from(NATIVE_ROWS_ROWS_ADDRESS)
             .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic rows address"))?,
     )?)?;
-    assembler.instruction(aarch64_cmp_x_imm(15, 0)?)?;
-    assembler.branch_cond(AARCH64_EQ, framed_fallback)?;
     assembler.instruction(aarch64_load_x_imm(
         14,
         13,
         u16::try_from(NATIVE_ROWS_CLASS_MAP_ADDRESS)
             .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic class map"))?,
     )?)?;
-    assembler.instruction(aarch64_cmp_x_imm(14, 0)?)?;
-    assembler.branch_cond(AARCH64_EQ, framed_fallback)?;
-    assembler.instruction(aarch64_load_x_imm(10, 31, 72)?)?; // output cache identity
-    assembler.instruction(aarch64_cmp_x_imm(10, 0)?)?;
-    assembler.branch_cond(AARCH64_EQ, framed_fallback)?;
-    assembler.instruction(aarch64_load_x_imm(
-        8,
-        13,
-        u16::try_from(NATIVE_ROWS_CACHE_IDENTITY)
-            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic cache identity"))?,
-    )?)?;
-    assembler.instruction(aarch64_cmp_x(10, 8)?)?;
-    assembler.branch_cond(AARCH64_NE, framed_fallback)?;
-    assembler.instruction(aarch64_load_w_imm(
-        8,
-        13,
-        u16::try_from(NATIVE_ROWS_INITIAL_FLAGS)
-            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic initial flags"))?,
-    )?)?;
-    assembler.branch_nonzero_w(8, framed_fallback)?;
-    // Validate the mutable V1 cell encoding once. On every supported
-    // little-endian target, the adjacent accepting and token fields form one
-    // 64-bit run of bits 31..=60, so one logical immediate authenticates both
-    // without materializing either constant. The transition loop can then
-    // release three invariant registers and use CMN, TBNZ/TBZ, and an
-    // immediate low-29 mask.
-    assembler.instruction(aarch64_load_w_imm(
-        8,
-        13,
-        u16::try_from(NATIVE_ROWS_UNFILLED_CELL)
-            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic unfilled value"))?,
-    )?)?;
-    assembler.instruction(aarch64_cmn_w_imm(8, 1)?)?;
-    assembler.branch_cond(AARCH64_NE, framed_fallback)?;
-    assembler.instruction(aarch64_load_x_imm(
-        8,
-        13,
-        u16::try_from(NATIVE_ROWS_ACCEPT_MASK)
-            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic cell masks"))?,
-    )?)?;
-    assembler.instruction(aarch64_eor_contiguous_x(8, 8, 31, 30)?)?;
-    assembler.instruction(aarch64_cmp_x_imm(8, 0)?)?;
-    assembler.branch_cond(AARCH64_NE, framed_fallback)?;
     assembler.instruction(aarch64_load_w_imm(
         12,
         13,
         u16::try_from(NATIVE_ROWS_LOOP_COUNT)
             .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic loop count"))?,
     )?)?;
-    if root_plan.is_some() {
-        assembler.instruction(aarch64_cmp_w_imm(
-            12,
-            u16::try_from(NATIVE_ROWS_LOOP_ROW_CAPACITY)
-                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic loop capacity"))?,
-        )?)?;
-        assembler.branch_cond(AARCH64_HI, framed_fallback)?;
-    } else {
+    if root_plan.is_none() {
         // Without an independent root scanner, preserve the established
         // conservative decline for every learned-loop overlay.
         assembler.branch_nonzero_w(12, framed_fallback)?;
     }
-    assembler.instruction(aarch64_load_w_imm(
-        8,
-        13,
-        u16::try_from(NATIVE_ROWS_ROW_STRIDE)
-            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic row stride"))?,
-    )?)?;
-    assembler.branch_zero_w(8, framed_fallback)?;
     assembler.instruction(aarch64_load_w_imm(
         1,
         13,
         u16::try_from(NATIVE_ROWS_INITIAL_ROW)
             .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic initial row"))?,
     )?)?;
-    assembler.instruction(aarch64_load_x_imm(
-        10,
-        13,
-        u16::try_from(NATIVE_ROWS_LIVE_CELLS)
-            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 dynamic live cells"))?,
-    )?)?;
-    assembler.instruction(aarch64_cmp_x(1, 10)?)?;
-    assembler.branch_cond(AARCH64_HS, framed_fallback)?;
     assembler.instruction(aarch64_load_x_imm(0, 31, 8)?)?; // haystack
     assembler.instruction(aarch64_load_x_imm(2, 31, 48)?)?;
     assembler.instruction(aarch64_load_x_imm(3, 31, 56)?)?;
 
     if let Some(root_setup) = root_setup {
         let pointer_enter = assembler.label()?;
-        // X10 was reused for the authenticated live-cell bound above. Keep
-        // the already-authenticated loop count in W12 so zero-overlay roots
-        // select the pointer representation before root setup consumes it.
+        // Keep the trusted loop count in W12 so zero-overlay roots select the
+        // pointer representation before root setup consumes it.
         assembler.branch_zero_w(12, pointer_enter)?;
         assembler.instruction(aarch64_movz_x(8, ROOT_SCANNER_OFFSET_ROWS, 0)?)?;
         assembler.instruction(aarch64_store_x(
@@ -35369,29 +35233,12 @@ mod tests {
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "the cross-ISA cell specialization audit keeps entry authentication and the exact hot-loop encodings together"
+        reason = "the cross-ISA V2 contract audit keeps trusted entry shape and exact hot-loop encodings together"
     )]
-    fn dynamic_v1_cells_are_authenticated_before_both_immediate_hot_loops() {
-        fn aarch64_conditional_target(words: &[u32], branch: usize) -> usize {
-            let instruction = words[branch];
-            assert_eq!(instruction & 0xff00_0010, 0x5400_0000);
-            let immediate = (instruction >> 5) & 0x7_ffff;
-            let signed = i32::try_from(immediate << 13).unwrap() >> 13;
-            branch
-                .checked_add_signed(isize::try_from(signed).unwrap())
-                .expect("AArch64 conditional target")
-        }
-
+    fn dynamic_v2_preflight_elides_redundant_guards_before_both_immediate_hot_loops() {
         assert_eq!(aarch64_cmn_w_imm(8, 1).unwrap(), 0x3100_051f);
         assert_eq!(aarch64_and_low_w(8, 8, 29).unwrap(), 0x1200_7108);
-        assert_eq!(
-            aarch64_eor_contiguous_x(8, 8, 31, 30).unwrap(),
-            0xd261_7508
-        );
         assert!(aarch64_cmn_w_imm(8, 0x1000).is_err());
-        assert!(aarch64_eor_contiguous_x(8, 8, 0, 0).is_err());
-        assert!(aarch64_eor_contiguous_x(8, 8, 0, 64).is_err());
-        assert!(aarch64_eor_contiguous_x(8, 8, 63, 2).is_err());
 
         for (output, width) in [
             (OutputContract::Exists, None),
@@ -35422,10 +35269,25 @@ mod tests {
                 .position(|bytes| bytes == x86_table_prefix)
                 .expect("x86 immediate pointer-row V1/V2 transition");
             assert!(x86_entry < x86_table, "{output:?}");
-            let descriptor_null_branch = x86_entry + 8;
-            let descriptor_fallback = x86_test_branch_target(&x86, descriptor_null_branch)
-                .expect("x86 descriptor-null fallback")
-                .0;
+            let trusted_entry = &x86[x86_entry..x86_table];
+            assert_eq!(
+                &trusted_entry[..12],
+                &[
+                    0x4c,
+                    0x8b,
+                    0x5c,
+                    0x24,
+                    0x50,
+                    0x49,
+                    0x8b,
+                    0x33,
+                    0x4d,
+                    0x8b,
+                    0x4b,
+                    u8::try_from(NATIVE_ROWS_CLASS_MAP_ADDRESS).unwrap(),
+                ],
+                "x86 {output:?} must consume the trusted V2 descriptor directly"
+            );
             for (field, expected) in [
                 (
                     NATIVE_ROWS_UNFILLED_CELL,
@@ -35439,21 +35301,63 @@ mod tests {
             ] {
                 let mut guard = vec![0x41, 0x81, 0x7b, u8::try_from(field).unwrap()];
                 guard.extend_from_slice(&expected.to_le_bytes());
-                let guard = x86_entry
-                    + x86[x86_entry..x86_table]
+                assert!(
+                    !trusted_entry
                         .windows(guard.len())
-                        .position(|bytes| bytes == guard)
-                        .unwrap_or_else(|| panic!("x86 {output:?} missing canonical guard"));
-                let branch = guard + 8;
-                assert_eq!(x86_test_normalized_branch_opcode(&x86, branch), Some(0x85));
-                assert_eq!(
-                    x86_test_branch_target(&x86, branch)
-                        .expect("x86 malformed-cell fallback")
-                        .0,
-                    descriptor_fallback,
-                    "x86 {output:?} malformed descriptor must share the framed fallback"
+                        .any(|bytes| bytes == guard),
+                    "x86 {output:?} redundantly revalidates a V2 canonical field"
                 );
             }
+            for removed in [
+                vec![0x4d, 0x85, 0xdb],
+                vec![0x48, 0x85, 0xf6],
+                vec![0x4d, 0x85, 0xc9],
+                vec![0x4d, 0x85, 0xd2],
+                vec![0x4c, 0x8b, 0x54, 0x24, 0x58],
+                vec![
+                    0x4d,
+                    0x3b,
+                    0x53,
+                    u8::try_from(NATIVE_ROWS_CACHE_IDENTITY).unwrap(),
+                ],
+                vec![
+                    0x41,
+                    0x83,
+                    0x7b,
+                    u8::try_from(NATIVE_ROWS_INITIAL_FLAGS).unwrap(),
+                    0,
+                ],
+                vec![
+                    0x41,
+                    0x83,
+                    0x7b,
+                    u8::try_from(NATIVE_ROWS_ROW_STRIDE).unwrap(),
+                    0,
+                ],
+                vec![
+                    0x4d,
+                    0x3b,
+                    0x43,
+                    u8::try_from(NATIVE_ROWS_LIVE_CELLS).unwrap(),
+                ],
+            ] {
+                assert!(
+                    !trusted_entry
+                        .windows(removed.len())
+                        .any(|bytes| bytes == removed),
+                    "x86 {output:?} retained a redundant V2 descriptor guard"
+                );
+            }
+            assert!(trusted_entry.windows(5).any(|bytes| {
+                bytes
+                    == [
+                        0x41,
+                        0x83,
+                        0x7b,
+                        u8::try_from(NATIVE_ROWS_LOOP_COUNT).unwrap(),
+                        0,
+                    ]
+            }));
             let unfilled_branch = x86_table + x86_table_prefix.len();
             assert_eq!(
                 x86_test_normalized_branch_opcode(&x86, unfilled_branch),
@@ -35521,7 +35425,7 @@ mod tests {
             let arm_entry = words
                 .iter()
                 .position(|&word| word == aarch64_load_x_imm(13, 31, 64).unwrap())
-                .expect("AArch64 mutable descriptor entry");
+                .expect("AArch64 trusted mutable descriptor entry");
             let arm_table_prefix = [
                 aarch64_load_byte_reg(8, 0, 2).unwrap(),
                 aarch64_load_byte_reg(10, 14, 8).unwrap(),
@@ -35533,64 +35437,75 @@ mod tests {
                 .position(|window| window == arm_table_prefix)
                 .expect("AArch64 immediate pointer-row V1/V2 transition");
             assert!(arm_entry < arm_table, "{output:?}");
-            let descriptor_fallback = aarch64_conditional_target(&words, arm_entry + 2);
-            let unfilled_load = aarch64_load_w_imm(
-                8,
-                13,
-                u16::try_from(NATIVE_ROWS_UNFILLED_CELL).unwrap(),
-            )
-            .unwrap();
-            let unfilled_guard = arm_entry
-                + words[arm_entry..arm_table]
-                    .iter()
-                    .position(|&word| word == unfilled_load)
-                    .unwrap_or_else(|| {
-                        panic!("AArch64 {output:?} missing canonical sentinel guard")
-                    });
+            let trusted_entry = &words[arm_entry..arm_table];
             assert_eq!(
-                words[unfilled_guard + 1],
-                aarch64_cmn_w_imm(8, 1).unwrap()
+                &trusted_entry[..2],
+                &[
+                    aarch64_load_x_imm(13, 31, 64).unwrap(),
+                    aarch64_load_pair_x(
+                        15,
+                        14,
+                        13,
+                        i16::try_from(NATIVE_ROWS_ROWS_ADDRESS).unwrap(),
+                    )
+                    .unwrap(),
+                ],
+                "AArch64 {output:?} must consume the trusted V2 descriptor directly"
             );
-            assert_eq!(words[unfilled_guard + 2] & 0xf, u32::from(AARCH64_NE));
-            assert_eq!(
-                aarch64_conditional_target(&words, unfilled_guard + 2),
-                descriptor_fallback,
-                "AArch64 {output:?} malformed sentinel must use the framed fallback"
-            );
-
-            let pair_load = aarch64_load_x_imm(
-                8,
-                13,
-                u16::try_from(NATIVE_ROWS_ACCEPT_MASK).unwrap(),
-            )
-            .unwrap();
-            let pair_guard = unfilled_guard
-                + words[unfilled_guard..arm_table]
-                    .iter()
-                    .position(|&word| word == pair_load)
-                    .unwrap_or_else(|| {
-                        panic!("AArch64 {output:?} missing canonical mask-pair guard")
-                    });
-            assert_eq!(
-                words[pair_guard + 1],
-                aarch64_eor_contiguous_x(8, 8, 31, 30).unwrap()
-            );
-            assert_eq!(words[pair_guard + 2], aarch64_cmp_x_imm(8, 0).unwrap());
-            assert_eq!(words[pair_guard + 3] & 0xf, u32::from(AARCH64_NE));
-            assert_eq!(
-                aarch64_conditional_target(&words, pair_guard + 3),
-                descriptor_fallback,
-                "AArch64 {output:?} malformed cell masks must use the framed fallback"
-            );
-            for field in [NATIVE_ROWS_ACCEPT_MASK, NATIVE_ROWS_NEXT_ROW_TOKEN_MASK] {
+            for removed in [
+                aarch64_cmp_x_imm(13, 0).unwrap(),
+                aarch64_load_x_imm(10, 31, 72).unwrap(),
+                aarch64_load_x_imm(
+                    8,
+                    13,
+                    u16::try_from(NATIVE_ROWS_CACHE_IDENTITY).unwrap(),
+                )
+                .unwrap(),
+                aarch64_cmp_x(10, 8).unwrap(),
+                aarch64_load_w_imm(
+                    8,
+                    13,
+                    u16::try_from(NATIVE_ROWS_INITIAL_FLAGS).unwrap(),
+                )
+                .unwrap(),
+                aarch64_load_w_imm(
+                    8,
+                    13,
+                    u16::try_from(NATIVE_ROWS_UNFILLED_CELL).unwrap(),
+                )
+                .unwrap(),
+                aarch64_load_x_imm(
+                    8,
+                    13,
+                    u16::try_from(NATIVE_ROWS_ACCEPT_MASK).unwrap(),
+                )
+                .unwrap(),
+                aarch64_load_w_imm(
+                    8,
+                    13,
+                    u16::try_from(NATIVE_ROWS_ROW_STRIDE).unwrap(),
+                )
+                .unwrap(),
+                aarch64_load_x_imm(
+                    10,
+                    13,
+                    u16::try_from(NATIVE_ROWS_LIVE_CELLS).unwrap(),
+                )
+                .unwrap(),
+            ] {
                 assert!(
-                    !words[arm_entry..arm_table].contains(
-                        &aarch64_load_w_imm(8, 13, u16::try_from(field).unwrap())
-                            .unwrap()
-                    ),
-                    "AArch64 {output:?} must authenticate adjacent masks together"
+                    !trusted_entry.contains(&removed),
+                    "AArch64 {output:?} retained a redundant V2 descriptor guard"
                 );
             }
+            assert!(trusted_entry.contains(
+                &aarch64_load_w_imm(
+                    12,
+                    13,
+                    u16::try_from(NATIVE_ROWS_LOOP_COUNT).unwrap(),
+                )
+                .unwrap()
+            ));
             assert_eq!(words[arm_table + arm_table_prefix.len()] & 0xf, 0);
             let accept = arm_table + arm_table_prefix.len() + 2;
             if output == OutputContract::Exists {
@@ -36040,41 +35955,40 @@ mod tests {
                     9,
                     "{target:?}/{output:?} V3 rows must use the exact canonical-root branch"
                 );
-                let authenticated_loop_count = words
+                let trusted_descriptor = words
                     .iter()
-                    .position(|&word| {
-                        word
-                            == aarch64_load_w_imm(
-                                12,
-                                13,
-                                u16::try_from(NATIVE_ROWS_LOOP_COUNT).unwrap(),
-                            )
-                            .unwrap()
-                    })
-                    .expect("AArch64 root must authenticate its loop count into W12");
-                let authenticated_live_cells = authenticated_loop_count
-                    + words[authenticated_loop_count..]
-                    .iter()
-                    .position(|&word| {
-                        word
-                            == aarch64_load_x_imm(
-                                10,
-                                13,
-                                u16::try_from(NATIVE_ROWS_LIVE_CELLS).unwrap(),
-                            )
-                            .unwrap()
-                    })
-                    .expect("AArch64 root must authenticate its live-cell bound");
-                assert!(authenticated_loop_count < authenticated_live_cells);
+                    .position(|&word| word == aarch64_load_x_imm(13, 31, 64).unwrap())
+                    .expect("AArch64 root must load its trusted V2 descriptor");
                 assert_eq!(
-                    words[authenticated_live_cells + 4],
-                    aarch64_load_pair_x(2, 3, 31, 48).unwrap(),
-                    "adjacent admitted bounds must be paired after live-cell authentication"
+                    words[trusted_descriptor + 1],
+                    aarch64_load_pair_x(
+                        15,
+                        14,
+                        13,
+                        i16::try_from(NATIVE_ROWS_ROWS_ADDRESS).unwrap(),
+                    )
+                    .unwrap(),
+                    "trusted rows and class map must be paired immediately after the descriptor"
                 );
                 assert_eq!(
-                    words[authenticated_live_cells + 5] & 0xff00_001f,
+                    words[trusted_descriptor + 2],
+                    aarch64_load_w_imm(
+                        12,
+                        13,
+                        u16::try_from(NATIVE_ROWS_LOOP_COUNT).unwrap(),
+                    )
+                    .unwrap(),
+                    "the invocation-specific learned-loop policy must remain live in W12"
+                );
+                assert_eq!(
+                    words[trusted_descriptor + 5],
+                    aarch64_load_pair_x(2, 3, 31, 48).unwrap(),
+                    "adjacent admitted bounds must be paired after trusted descriptor setup"
+                );
+                assert_eq!(
+                    words[trusted_descriptor + 6] & 0xff00_001f,
                     0x3400_000c,
-                    "zero-overlay selection must use the preserved W12 loop count after X10 is reused"
+                    "zero-overlay selection must use the trusted W12 loop count"
                 );
                 let candidate_prefix = [
                     aarch64_load_x_imm(8, 31, 88).unwrap(),
@@ -37030,7 +36944,7 @@ mod tests {
             let descriptor = words
                 .iter()
                 .position(|&word| word == aarch64_load_x_imm(13, 31, 64).unwrap())
-                .expect("AArch64 dynamic descriptor load");
+                .expect("AArch64 trusted dynamic descriptor load");
             assert!(alias < descriptor, "AArch64 {output:?}");
             let pointer_table = [
                 aarch64_load_byte_reg(8, 0, 2).unwrap(),
@@ -39958,7 +39872,7 @@ uint32_t fre_aot_regex_runtime_search_exclusive_dynamic_rows_continue_v1(handle_
   if(d==NULL||c==NULL||memcmp(d,identity,32)!=0)return 86;
   return fre_aot_regex_runtime_search_exclusive_dynamic_rows_deopt_v1(h,p,n,s,e,r);
 }}
-uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*d,preflight_t*out) {{
+uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v2(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*d,preflight_t*out) {{
   preflight_calls++;
   if(h==NULL)return 5;
   if(h!=(handle_t)&frozen)return 90;
@@ -39966,7 +39880,7 @@ uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_pr
   if(p!=haystack||n!=sizeof(haystack)||s!=5||e!=69||d==NULL||out==NULL||memcmp(d,identity,32)!=0)return 88;
   if(mode==2){{r->start=321;r->end=654;return 76;}}
   out->start=s;out->end=e;out->native_rows_address=(size_t)(uintptr_t)&rows;
-  out->cache_generation=(mode==6)?78:77;return 6;
+  out->cache_generation=77;return 6;
 }}
 static int run_direct(uint32_t stride,size_t states,int matching,const unsigned char*p,size_t n,size_t s,size_t e,int base) {{
   init_frozen(stride,states,matching);mode=20;
@@ -40081,18 +39995,14 @@ int main(void) {{
   if(status!=0||r.start!=0||r.end!=0||fallback_calls!=0||deopt_calls!=0||preflight_calls!=1)return 13;
   mode=5;cells[0]=UINT32_MAX;r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)&frozen,haystack,sizeof(haystack),5,69,&r);
   if(status!=77||r.start!=123||r.end!=456||fallback_calls!=0||deopt_calls!=1||preflight_calls!=1)return 14;
-  mode=6;cells[0]=UINT32_C(0x80000000);r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)&frozen,haystack,sizeof(haystack),5,69,&r);
-  if(status!=77||r.start!=123||r.end!=456||fallback_calls!=0||deopt_calls!=1||preflight_calls!=1)return 15;
-  mode=7;rows.initial_flags=1;r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)&frozen,haystack,sizeof(haystack),5,69,&r);
-  if(status!=77||r.start!=123||r.end!=456||fallback_calls!=0||deopt_calls!=1||preflight_calls!=1)return 16;
+  /* V2 producer invariants are trusted here; only invocation-specific
+     policy remains a generated-code check. */
   init_rows();mode=8;cells[0]=2;cells[1]=2;r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)&frozen,haystack,sizeof(haystack),5,69,&r);
   if(status!=0||r.start!=0||r.end!=0||fallback_calls!=0||deopt_calls!=0||preflight_calls!=1)return 18;
   init_rows();mode=9;rows.learned_loop_row_count=1;rows.learned_loop_rows[0]=0;cells[0]=2;cells[1]=UINT32_C(0x80000000);r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)&frozen,haystack,sizeof(haystack),5,69,&r);
   {initial_loop_assertion}
   init_rows();mode=10;rows.learned_loop_row_count=1;rows.learned_loop_rows[0]=1;cells[0]={pending_deopt_cell};cells[1]=UINT32_C(0x80000000);r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)&frozen,haystack,sizeof(haystack),5,69,&r);
   if(status!=77||r.start!=123||r.end!=456||fallback_calls!=0||deopt_calls!=1||preflight_calls!=1)return 20;
-  init_rows();mode=11;rows.learned_loop_row_count=5;r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}((handle_t)&frozen,haystack,sizeof(haystack),5,69,&r);
-  if(status!=77||r.start!=123||r.end!=456||fallback_calls!=0||deopt_calls!=1||preflight_calls!=1)return 21;
   mode=0;rows.initial_flags=0;r=(result_t){{91,92}};fallback_calls=preflight_calls=deopt_calls=0;status={symbol}(NULL,haystack,sizeof(haystack),5,69,&r);
   if(status!=5||r.start!=91||r.end!=92||fallback_calls!=1||deopt_calls!=0||preflight_calls!=0)return 17;
   {exhaustive_selected}
@@ -42009,7 +41919,7 @@ static frozen_v4_t frozen;
 static unsigned helper_calls;
 uint32_t fre_aot_regex_runtime_search_v1(const unsigned char*a,const unsigned char*b,size_t n,size_t s,size_t e,result_t*r){{(void)a;(void)b;(void)n;(void)s;(void)e;(void)r;helper_calls++;return 97U;}}
 uint32_t fre_aot_regex_runtime_search_exclusive_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;helper_calls++;return 97U;}}
-uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,preflight_t*o){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;(void)i;(void)o;helper_calls++;return 97U;}}
+uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v2(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,preflight_t*o){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;(void)i;(void)o;helper_calls++;return 97U;}}
 uint32_t fre_aot_regex_runtime_search_exclusive_dynamic_rows_deopt_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;helper_calls++;return 97U;}}
 uint32_t fre_aot_regex_runtime_search_exclusive_dynamic_rows_continue_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,const continuation_t*c){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;(void)i;(void)c;helper_calls++;return 97U;}}
 size_t fre_aot_regex_runtime_scan_frozen_loop_v2(const unsigned char*p,const void*s,size_t n){{(void)p;(void)s;(void)n;helper_calls++;return 0U;}}

@@ -2368,6 +2368,63 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_compiler_private_search_exclusive
     }
 }
 
+/// Compiler-private trusted dynamic-row preflight for FRE's generated entry.
+///
+/// This V2 symbol has the same four-word output layout as V1, but strengthens
+/// the successful-entry contract. On [`STATUS_PARTIAL_PREFLIGHT_ENTER`], the
+/// returned descriptor was constructed by the live prepared workspace and is
+/// valid for the complete synchronous native scan: its descriptor, rows, and
+/// class-map addresses are non-null and suitably aligned; its cell encoding,
+/// live extent, stride, initial row, initial flags, loop-row geometry, and
+/// cache identity satisfy the canonical dynamic-row invariants. The output
+/// cache identity is the identity stored in that descriptor. Neither the
+/// descriptor nor either projected source address may be retained across a
+/// helper call, re-entry, or the end of this exclusive search.
+/// Calling any deopt, continuation, or recovery helper ends use of the
+/// descriptor before that helper may mutate or rebuild the workspace.
+///
+/// The versioned symbol prevents an object that relies on this stronger
+/// contract from linking against an older runtime that only implements V1.
+/// It remains deliberately absent from the public C header.
+///
+/// # Safety
+///
+/// The raw input, exclusive ownership, and disjoint writable-output
+/// requirements are identical to
+/// [`fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v1`].
+#[doc(hidden)]
+#[unsafe(no_mangle)]
+#[allow(
+    unsafe_code,
+    clippy::too_many_arguments,
+    reason = "the generated-only ABI consumes raw facts proved by its emitted caller"
+)]
+pub unsafe extern "C" fn fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v2(
+    handle: FreAotRegexExclusiveHandleV1,
+    haystack_ptr: *const u8,
+    haystack_len: usize,
+    window_start: usize,
+    window_end: usize,
+    result_ptr: *mut FreAotRegexResultV1,
+    expected_artifact_identity_ptr: *const u8,
+    preflight_out: *mut FreAotRegexDynamicRowsPreflightV1,
+) -> u32 {
+    // SAFETY: every raw requirement is part of this compiler-private
+    // function's contract and is established by its sole emitted caller.
+    unsafe {
+        exclusive_dynamic_rows_preflight_prevalidated(
+            handle,
+            haystack_ptr,
+            haystack_len,
+            window_start,
+            window_end,
+            result_ptr,
+            expected_artifact_identity_ptr,
+            preflight_out,
+        )
+    }
+}
+
 #[allow(
     unsafe_code,
     clippy::too_many_arguments,
@@ -3120,7 +3177,7 @@ mod tests {
         // SAFETY: this test helper supplies the exact live, validated,
         // disjoint inputs established by FRE's generated wrapper.
         unsafe {
-            fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v1(
+            fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v2(
                 handle,
                 haystack.as_ptr(),
                 haystack.len(),
@@ -3377,6 +3434,7 @@ mod tests {
             "fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v2",
             "fre_aot_regex_runtime_search_exclusive_dynamic_rows_preflight_v1",
             "fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v1",
+            "fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v2",
             "fre_aot_regex_runtime_search_exclusive_dynamic_rows_deopt_v1",
             "fre_aot_regex_runtime_search_exclusive_dynamic_rows_continue_v1",
             "fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1",
@@ -3604,6 +3662,17 @@ mod tests {
             *mut FreAotRegexDynamicRowsPreflightV1,
         ) -> u32 =
             fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v1;
+        let _: unsafe extern "C" fn(
+            FreAotRegexExclusiveHandleV1,
+            *const u8,
+            usize,
+            usize,
+            usize,
+            *mut FreAotRegexResultV1,
+            *const u8,
+            *mut FreAotRegexDynamicRowsPreflightV1,
+        ) -> u32 =
+            fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v2;
         let _: unsafe extern "C" fn(
             FreAotRegexExclusiveHandleV1,
             *const u8,
