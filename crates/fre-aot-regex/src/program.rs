@@ -3022,12 +3022,12 @@ pub struct FrozenDynamicRowsStorageV3 {
 /// authenticated arbitrary-state continuation.
 ///
 /// The private newtype prevents callers outside this module from accidentally
-/// supplying a root-scanner-independent V4/V13/V14 owner to the ordinary
-/// public prepared-header publisher. Compiler-private continuation projection
-/// and publication APIs unwrap it only after authenticating the exact resume
-/// ticket for which the owner was built. V4 rescues unary V5 rows whose
-/// root-only first-accept summary cannot authorize an arbitrary-state entry;
-/// V13/V14 rescue rooted loop-overlay rows with multi-symbol transitions.
+/// supplying a root-scanner-independent compact owner to the ordinary public
+/// prepared-header publisher. Compiler-private continuation projection and
+/// publication APIs unwrap it only after authenticating the exact resume
+/// ticket for which the owner was built. Root-only V5 summaries and V6/V7
+/// loop extensions are deliberately excluded; every closed scanner-free
+/// V3/V4/V8--V14 table is valid from an authenticated canonical state.
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct FrozenStaticContinuationRowsStorageV1 {
@@ -3041,6 +3041,22 @@ impl FrozenStaticContinuationRowsStorageV1 {
     pub const fn compiler_private_format_version(&self) -> u32 {
         self.rows.descriptor.format_version
     }
+}
+
+#[inline]
+const fn frozen_static_continuation_format_is_supported(format_version: u32) -> bool {
+    matches!(
+        format_version,
+        FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION
+            | FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION
+            | FROZEN_DYNAMIC_ROWS_V8_FORMAT_VERSION
+            | FROZEN_DYNAMIC_ROWS_V9_FORMAT_VERSION
+            | FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION
+            | FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION
+            | FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION
+            | FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION
+            | FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION
+    )
 }
 
 /// Authenticated input to one immutable compact-row continuation.
@@ -9517,8 +9533,8 @@ impl CompiledProgram {
     ///
     /// This owner is only authority for an already admitted arbitrary-state
     /// continuation. It must never be published at the public root entry. An
-    /// otherwise mandatory root scanner therefore does not exclude exact
-    /// V13/V14 composition, and a unary V5 root summary is republished as the
+    /// otherwise mandatory root scanner therefore does not exclude a closed
+    /// scanner-free table, and a unary V5 root summary is republished as the
     /// underlying exact V4 rows rather than being misapplied to an arbitrary
     /// state. A geometry or resource decline returns no side owner and leaves
     /// the ordinary root-compatible owner unchanged.
@@ -9539,18 +9555,8 @@ impl CompiledProgram {
                 max_packed_bytes,
                 true,
             )?;
-        let format_version = storage.descriptor.format_version;
-        let unary_v4 = format_version == FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION
-            && self.output == OutputContract::Exists
-            && storage.descriptor.class_count == 1
-            && storage.unary_exists_first_accept_step.is_none();
-        (unary_v4
-            || matches!(
-                format_version,
-                FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION
-                    | FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION
-            ))
-        .then_some(FrozenStaticContinuationRowsStorageV1 { rows: storage })
+        frozen_static_continuation_format_is_supported(storage.descriptor.format_version)
+            .then_some(FrozenStaticContinuationRowsStorageV1 { rows: storage })
     }
 
     /// Publish a scanner-free side owner only for the authenticated local
@@ -9576,18 +9582,9 @@ impl CompiledProgram {
             Some(&owner.rows),
         );
         let format_version = owner.compiler_private_format_version();
-        let unary_v4 = format_version == FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION
-            && self.output == OutputContract::Exists
-            && owner.rows.descriptor.class_count == 1
-            && owner.rows.unary_exists_first_accept_step.is_none();
         (header.has_dynamic_rows()
             && header.dynamic_rows_v6.compact.format_version == format_version
-            && (unary_v4
-                || matches!(
-                    format_version,
-                    FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION
-                        | FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION
-                )))
+            && frozen_static_continuation_format_is_supported(format_version))
         .then_some(header)
     }
 
@@ -12133,12 +12130,7 @@ impl CompiledProgram {
         )?;
         Ok(projection.filter(|projection| {
             projection.format_version == owner.compiler_private_format_version()
-                && matches!(
-                    projection.format_version,
-                    FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION
-                        | FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION
-                        | FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION
-                )
+                && frozen_static_continuation_format_is_supported(projection.format_version)
         }))
     }
 
@@ -25985,6 +25977,17 @@ mod tests {
     }
 
     #[test]
+    fn static_continuation_policy_accepts_every_closed_scanner_free_format() {
+        for format_version in 0..=15 {
+            assert_eq!(
+                frozen_static_continuation_format_is_supported(format_version),
+                matches!(format_version, 3 | 4 | 8..=14),
+                "static-continuation policy drifted for format {format_version}"
+            );
+        }
+    }
+
+    #[test]
     fn every_frozen_row_format_resumes_from_every_canonical_state() {
         type ModelCell = (bool, Option<usize>);
 
@@ -28285,18 +28288,42 @@ mod tests {
                     continuation_classes,
                 )
                 .expect("a retained V13/V14 owner must admit dense-pair geometry");
-                let mut declined_workspace = compiled.prepare_workspace().unwrap();
-                assert!(
-                    compiled
-                        .compiler_private_frozen_static_continuation_rows_storage_v3_with_fallback_receipt(
-                            &mut declined_workspace,
-                            None,
-                            usize::MAX,
-                            pair_bytes - 1,
+                let mut below_dense_workspace = compiled.prepare_workspace().unwrap();
+                if let Some(smaller_continuation) = compiled
+                    .compiler_private_frozen_static_continuation_rows_storage_v3_with_fallback_receipt(
+                        &mut below_dense_workspace,
+                        None,
+                        usize::MAX,
+                        pair_bytes - 1,
+                    )
+                {
+                    let smaller_format = smaller_continuation.compiler_private_format_version();
+                    assert!(
+                        frozen_static_continuation_format_is_supported(smaller_format),
+                        "a dense-budget decline selected an unsupported continuation for {label}"
+                    );
+                    assert!(
+                        !matches!(
+                            smaller_format,
+                            FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION
+                                | FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION
+                        ),
+                        "a below-dense budget retained a dense continuation for {label}"
+                    );
+                    let smaller_header = compiled
+                        .compiler_private_frozen_static_continuation_prepared_header_v6(
+                            &below_dense_workspace,
+                            &smaller_continuation,
                         )
-                        .is_none(),
-                    "a dense-budget decline must not leak an ordinary root owner for {label}"
-                );
+                        .unwrap_or_else(|| {
+                            panic!("smaller continuation header declined for {label}")
+                        });
+                    assert_eq!(
+                        smaller_header.compiler_private_dynamic_rows_format_version(),
+                        Some(smaller_format),
+                        "smaller continuation changed format during publication for {label}"
+                    );
+                }
             }
             header.v1.flags
         }
@@ -28936,6 +28963,33 @@ mod tests {
         assert_eq!(
             selected_header.dynamic_rows_v6.compact.ready_seal,
             FROZEN_PREPARED_HEADER_V12_READY_SEAL
+        );
+
+        let mut selected_continuation_workspace = selected.prepare_workspace().unwrap();
+        let selected_continuation = selected
+            .compiler_private_frozen_static_continuation_rows_storage_v3_with_fallback_receipt(
+                &mut selected_continuation_workspace,
+                None,
+                usize::MAX,
+                usize::MAX,
+            )
+            .expect("SelectedEnd V12 static continuation owner");
+        assert_eq!(
+            selected_continuation.compiler_private_format_version(),
+            FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION,
+            "a closed mapped-u8 table is valid from an authenticated canonical state"
+        );
+        let selected_continuation_header = selected
+            .compiler_private_frozen_static_continuation_prepared_header_v6(
+                &selected_continuation_workspace,
+                &selected_continuation,
+            )
+            .expect("SelectedEnd V12 static continuation header");
+        assert!(selected_continuation_header.is_active());
+        assert_eq!(
+            selected_continuation_header
+                .compiler_private_dynamic_rows_format_version(),
+            Some(FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION)
         );
     }
 

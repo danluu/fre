@@ -576,7 +576,7 @@ struct NativeDynamicRowsEmission {
     /// is never exported through the prepared ABI; a static-prefix wrapper
     /// may call it synchronously after the runtime publishes its owner.
     static_resume_entry_offset: Option<usize>,
-    /// Dense-continuation side entry. It reads the fixed second prepared
+    /// Immutable-continuation side entry. It reads the fixed second prepared
     /// header while retaining the original allocation base for helpers.
     static_continuation_resume_entry_offset: Option<usize>,
 }
@@ -996,7 +996,7 @@ const PARTIAL_CELL_HOLE_BASE: u32 = 1 << 30;
 const PARTIAL_CELL_DEAD: u32 = PARTIAL_CELL_ACCEPTED - 1;
 const PARTIAL_PREFLIGHT_ENTER_STATUS: u8 = 6;
 const STATIC_PREFIX_NATIVE_RESUME_STATUS: u8 = 7;
-const STATIC_PREFIX_NATIVE_DENSE_RESUME_STATUS: u8 = 8;
+const STATIC_PREFIX_NATIVE_CONTINUATION_RESUME_STATUS: u8 = 8;
 const NATIVE_PARTIAL_STATUS_RESUME: u32 = 3;
 const NATIVE_PARTIAL_STATUS_SELECTED_END: u32 = 4;
 
@@ -2633,7 +2633,7 @@ struct NativeSlowPartialWrapper {
     relocations: Vec<ModuleRelocation>,
     core_call_offset: usize,
     resume_tail_call_offset: Option<usize>,
-    dense_resume_tail_call_offset: Option<usize>,
+    continuation_resume_tail_call_offset: Option<usize>,
 }
 
 /// Lower a transient slow-compiler prefix behind the ordinary public search
@@ -2712,7 +2712,7 @@ fn lower_native_slow_partial_with_data_limit(
         mut relocations,
         core_call_offset,
         resume_tail_call_offset: _,
-        dense_resume_tail_call_offset: _,
+        continuation_resume_tail_call_offset: _,
     } = wrapper;
     let code_alignment_mask = match target.architecture {
         Architecture::X86_64 => 15,
@@ -3198,7 +3198,7 @@ fn lower_native_slow_partial_prepared_with_data_limit(
         relocations: prepared_relocations,
         core_call_offset,
         resume_tail_call_offset,
-        dense_resume_tail_call_offset,
+        continuation_resume_tail_call_offset,
     } = wrapper;
     let code_size = prepared_code.len();
     push_bytes(&mut code, &prepared_code)?;
@@ -3267,13 +3267,13 @@ fn lower_native_slow_partial_prepared_with_data_limit(
     match (
         resume,
         resume_tail_call_offset,
-        dense_resume_tail_call_offset,
+        continuation_resume_tail_call_offset,
         static_resume_tail,
     ) {
         (
             Some(_),
             Some(resume_tail_call_offset),
-            Some(dense_resume_tail_call_offset),
+            Some(continuation_resume_tail_call_offset),
             Some(static_resume_tail),
         ) => {
             if static_resume_tail.scanner.is_some() {
@@ -3284,10 +3284,10 @@ fn lower_native_slow_partial_prepared_with_data_limit(
             let local_entry = static_resume_tail.static_resume_entry_offset.ok_or(
                 ObjectError::InvalidModule("static-prefix resume tail has no local entry"),
             )?;
-            let dense_local_entry = static_resume_tail
+            let continuation_local_entry = static_resume_tail
                 .static_continuation_resume_entry_offset
                 .ok_or(ObjectError::InvalidModule(
-                    "static-prefix resume tail has no dense local entry",
+                    "static-prefix resume tail has no continuation local entry",
                 ))?;
             let tail_offset = code
                 .len()
@@ -3312,31 +3312,31 @@ fn lower_native_slow_partial_prepared_with_data_limit(
             let absolute_tail_entry = tail_offset.checked_add(local_entry).ok_or(
                 ObjectError::ArithmeticOverflow("static-prefix resume local entry offset"),
             )?;
-            let absolute_dense_tail_call = code_offset
-                .checked_add(dense_resume_tail_call_offset)
+            let absolute_continuation_tail_call = code_offset
+                .checked_add(continuation_resume_tail_call_offset)
                 .ok_or(ObjectError::ArithmeticOverflow(
-                    "static-prefix dense-resume local call offset",
+                    "static-prefix continuation-resume local call offset",
                 ))?;
-            let absolute_dense_tail_entry = tail_offset
-                .checked_add(dense_local_entry)
+            let absolute_continuation_tail_entry = tail_offset
+                .checked_add(continuation_local_entry)
                 .ok_or(ObjectError::ArithmeticOverflow(
-                    "static-prefix dense-resume local entry offset",
+                    "static-prefix continuation-resume local entry offset",
                 ))?;
             match target.architecture {
                 Architecture::X86_64 => {
                     patch_x86_64_local_call(&mut code, absolute_tail_call, absolute_tail_entry)?;
                     patch_x86_64_local_call(
                         &mut code,
-                        absolute_dense_tail_call,
-                        absolute_dense_tail_entry,
+                        absolute_continuation_tail_call,
+                        absolute_continuation_tail_entry,
                     )?;
                 }
                 Architecture::Aarch64 => {
                     patch_aarch64_local_call(&mut code, absolute_tail_call, absolute_tail_entry)?;
                     patch_aarch64_local_call(
                         &mut code,
-                        absolute_dense_tail_call,
-                        absolute_dense_tail_entry,
+                        absolute_continuation_tail_call,
+                        absolute_continuation_tail_entry,
                     )?;
                 }
             }
@@ -13999,7 +13999,7 @@ fn lower_x86_64_slow_partial_wrapper(
         ],
         core_call_offset,
         resume_tail_call_offset: None,
-        dense_resume_tail_call_offset: None,
+        continuation_resume_tail_call_offset: None,
     })
 }
 
@@ -14154,7 +14154,7 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
     };
 
     let mut resume_tail_call_displacement_label = None;
-    let mut dense_resume_tail_call_displacement_label = None;
+    let mut continuation_resume_tail_call_displacement_label = None;
     let resume_runtime_displacement_label = if let Some(native_resume) = native_resume {
         assembler.bind(native_resume)?;
         // The native core returns resume state in r10, first unconsumed
@@ -14173,9 +14173,13 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
         assembler.bind(displacement)?;
         push_bytes(&mut assembler.code, &[0; 4])?;
         let resume_return = assembler.label()?;
-        let dense_resume = assembler.label()?;
-        assembler.instruction(&[0x83, 0xf8, STATIC_PREFIX_NATIVE_DENSE_RESUME_STATUS])?;
-        assembler.branch(&[0x0f, 0x84], dense_resume)?;
+        let continuation_resume = assembler.label()?;
+        assembler.instruction(&[
+            0x83,
+            0xf8,
+            STATIC_PREFIX_NATIVE_CONTINUATION_RESUME_STATUS,
+        ])?;
+        assembler.branch(&[0x0f, 0x84], continuation_resume)?;
         assembler.instruction(&[0x83, 0xf8, STATIC_PREFIX_NATIVE_RESUME_STATUS])?;
         assembler.branch(&[0x0f, 0x85], resume_return)?;
         // Reconstitute the ordinary prepared arguments and pass the three
@@ -14197,7 +14201,7 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
         resume_tail_call_displacement_label = Some(tail_call);
         assembler.branch(&[0xe9], resume_return)?;
 
-        assembler.bind(dense_resume)?;
+        assembler.bind(continuation_resume)?;
         // Status 8 keeps the public owner base in RDI. The distinct local
         // side entry selects its fixed +664 header after saving that base for
         // fallback and variable-Span recovery helpers.
@@ -14211,10 +14215,10 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
         assembler.instruction(&[0x4d, 0x8b, 0x19])?;
         assembler.instruction(&[0x49, 0x8b, 0x41, 0x08])?;
         assembler.instruction(&[0xe8])?;
-        let dense_tail_call = assembler.label()?;
-        assembler.bind(dense_tail_call)?;
+        let continuation_tail_call = assembler.label()?;
+        assembler.bind(continuation_tail_call)?;
         push_bytes(&mut assembler.code, &[0; 4])?;
-        dense_resume_tail_call_displacement_label = Some(dense_tail_call);
+        continuation_resume_tail_call_displacement_label = Some(continuation_tail_call);
         assembler.bind(resume_return)?;
         assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
         assembler.instruction(&[0xc3])?;
@@ -14261,7 +14265,7 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
     let resume_tail_call_offset = resume_tail_call_displacement_label
         .map(|label| finished.label_offset(label))
         .transpose()?;
-    let dense_resume_tail_call_offset = dense_resume_tail_call_displacement_label
+    let continuation_resume_tail_call_offset = continuation_resume_tail_call_displacement_label
         .map(|label| finished.label_offset(label))
         .transpose()?;
     let mut relocations = vec![
@@ -14350,7 +14354,7 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
         relocations,
         core_call_offset,
         resume_tail_call_offset,
-        dense_resume_tail_call_offset,
+        continuation_resume_tail_call_offset,
     })
 }
 
@@ -26368,7 +26372,7 @@ fn lower_aarch64_slow_partial_wrapper(
         ],
         core_call_offset: relocation_offsets[3],
         resume_tail_call_offset: None,
-        dense_resume_tail_call_offset: None,
+        continuation_resume_tail_call_offset: None,
     })
 }
 
@@ -26491,7 +26495,7 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
     };
 
     let mut resume_tail_call = None;
-    let mut dense_resume_tail_call = None;
+    let mut continuation_resume_tail_call = None;
     let resume_runtime_branch = if let Some(native_resume) = native_resume {
         assembler.bind(native_resume)?;
         assembler.instruction(aarch64_mov_x(5, 2)?)?;
@@ -26503,12 +26507,12 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
         assembler.instruction(aarch64_load_x_imm(3, 31, 40)?)?;
         let branch = assembler.instruction(0x9400_0000)?;
         let resume_return = assembler.label()?;
-        let dense_resume = assembler.label()?;
+        let continuation_resume = assembler.label()?;
         assembler.instruction(aarch64_cmp_w_imm(
             0,
-            u16::from(STATIC_PREFIX_NATIVE_DENSE_RESUME_STATUS),
+            u16::from(STATIC_PREFIX_NATIVE_CONTINUATION_RESUME_STATUS),
         )?)?;
-        assembler.branch_cond(AARCH64_EQ, dense_resume)?;
+        assembler.branch_cond(AARCH64_EQ, continuation_resume)?;
         assembler.instruction(aarch64_cmp_w_imm(
             0,
             u16::from(STATIC_PREFIX_NATIVE_RESUME_STATUS),
@@ -26524,15 +26528,15 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
         resume_tail_call = Some(assembler.instruction(0x9400_0000)?);
         assembler.branch(resume_return)?;
 
-        assembler.bind(dense_resume)?;
-        // Status 8 enters with the original allocation base in X0. The dense
+        assembler.bind(continuation_resume)?;
+        // Status 8 enters with the original allocation base in X0. The continuation
         // side entry saves it before selecting the fixed +664 header.
         assembler.instruction(aarch64_load_pair_x(0, 1, 31, 0)?)?;
         assembler.instruction(aarch64_load_pair_x(2, 3, 31, 16)?)?;
         assembler.instruction(aarch64_load_pair_x(4, 5, 31, 32)?)?;
         assembler.instruction(aarch64_load_x_imm(8, 31, 48)?)?;
         assembler.instruction(aarch64_load_pair_x(6, 7, 5, 0)?)?;
-        dense_resume_tail_call = Some(assembler.instruction(0x9400_0000)?);
+        continuation_resume_tail_call = Some(assembler.instruction(0x9400_0000)?);
         assembler.bind(resume_return)?;
         assembler.instruction(aarch64_load_x_imm(30, 31, 56)?)?;
         assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
@@ -26591,7 +26595,7 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
         relocation_offsets.push(tail_call);
         index
     });
-    let dense_resume_tail_index = dense_resume_tail_call.map(|tail_call| {
+    let continuation_resume_tail_index = continuation_resume_tail_call.map(|tail_call| {
         let index = relocation_offsets.len();
         relocation_offsets.push(tail_call);
         index
@@ -26709,7 +26713,7 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
         relocations,
         core_call_offset: relocation_offsets[3],
         resume_tail_call_offset: resume_tail_index.map(|index| relocation_offsets[index]),
-        dense_resume_tail_call_offset: dense_resume_tail_index
+        continuation_resume_tail_call_offset: continuation_resume_tail_index
             .map(|index| relocation_offsets[index]),
     })
 }
@@ -37149,7 +37153,7 @@ mod tests {
     }
 
     #[test]
-    fn static_dense_resume_side_entries_preserve_owner_on_x86_and_aarch64() {
+    fn static_continuation_resume_side_entries_preserve_owner_on_x86_and_aarch64() {
         let x86_feature_sets = [
             FeatureSet::of(CpuFeature::X86Sse2).with(CpuFeature::X86Avx2),
             FeatureSet::of(CpuFeature::X86Sse2)
@@ -37167,16 +37171,16 @@ mod tests {
                     lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_impl(
                         None, features, output, None, false, false, true, true, 2, true,
                     )
-                    .expect("x86 static dense-resume tail");
+                    .expect("x86 static continuation-resume tail");
                 let ordinary = emission
                     .static_resume_entry_offset
                     .expect("x86 ordinary resume side entry");
-                let dense = emission
+                let continuation = emission
                     .static_continuation_resume_entry_offset
-                    .expect("x86 dense resume side entry");
-                assert_ne!(ordinary, dense);
+                    .expect("x86 continuation resume side entry");
+                assert_ne!(ordinary, continuation);
                 assert_eq!(
-                    emission.code.get(dense..dense + 16),
+                    emission.code.get(continuation..continuation + 16),
                     Some(
                         [
                             0x48, 0x83, 0xec, 0x68, 0x48, 0x89, 0x7c, 0x24, 0x28, 0x48,
@@ -37206,24 +37210,27 @@ mod tests {
                 lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_impl(
                     None, output, None, false, false, true, true, true, 2, true,
                 )
-                .expect("AArch64 ASIMD static dense-resume tail");
+                .expect("AArch64 ASIMD static continuation-resume tail");
             let ordinary = emission
                 .static_resume_entry_offset
                 .expect("AArch64 ordinary resume side entry");
-            let dense = emission
+            let continuation = emission
                 .static_continuation_resume_entry_offset
-                .expect("AArch64 dense resume side entry");
-            assert_ne!(ordinary, dense);
+                .expect("AArch64 continuation resume side entry");
+            assert_ne!(ordinary, continuation);
             let instruction = |offset: usize| {
                 u32::from_le_bytes(emission.code[offset..offset + 4].try_into().unwrap())
             };
-            assert_eq!(instruction(dense), aarch64_sub_x_imm(31, 31, 96).unwrap());
             assert_eq!(
-                instruction(dense + 4),
+                instruction(continuation),
+                aarch64_sub_x_imm(31, 31, 96).unwrap()
+            );
+            assert_eq!(
+                instruction(continuation + 4),
                 aarch64_store_x(0, 31, 72).unwrap()
             );
             assert_eq!(
-                instruction(dense + 8),
+                instruction(continuation + 8),
                 aarch64_add_x_imm(0, 0, 664).unwrap()
             );
             let reload_owner = aarch64_load_x_imm(0, 31, 72).unwrap().to_le_bytes();
@@ -50412,12 +50419,12 @@ int main(void){{
         any(target_os = "linux", target_os = "macos")
     ))]
     #[test]
-    #[ignore = "requires `cargo build -p fre-aot-regex-runtime --lib`; directly exercises the compiler-private status-8 dense projection ABI"]
+    #[ignore = "requires `cargo build -p fre-aot-regex-runtime --lib`; directly exercises the compiler-private status-8 continuation projection ABI"]
     #[allow(
         clippy::too_many_lines,
-        reason = "one linked ABI proof covers supported-generation entry, pending transport, overlay decline, and replay rejection"
+        reason = "one linked ABI proof covers dense and one-symbol entries, pending transport, overlay decline, and replay rejection"
     )]
-    fn linked_host_static_resume_projection_enters_dense_v14_for_root_and_overlay() {
+    fn linked_host_static_resume_projection_enters_general_side_owner() {
         use std::{fs, process::Command, time::SystemTime};
 
         struct Fixture {
@@ -50504,6 +50511,7 @@ int main(void){{
 
         let v14 = fixture(r"(?-u:(?:a|[^a][\x00-\xff]){4})");
         let v7 = fixture(r"A(?-u:[^Z])*Z|[b-c][a-b]{1,5}(?:x+|y+)");
+        let v12 = fixture(r"(?s-u:.{3,})");
         let current_exe = std::env::current_exe().expect("current test executable");
         let profile_dir = current_exe
             .parent()
@@ -50538,6 +50546,9 @@ int main(void){{
              static const unsigned char v7_program[]={{{}}};\n\
              static const unsigned char v7_identity[]={{{}}};\n\
              static const uint32_t v7_descriptor[]={{{}}};\n\
+             static const unsigned char v12_program[]={{{}}};\n\
+             static const unsigned char v12_identity[]={{{}}};\n\
+             static const uint32_t v12_descriptor[]={{{}}};\n\
              static const unsigned char haystack[16]={{0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1}};\n\
              static int preflight(handle_t h,const unsigned char*identity,const uint32_t*descriptor,result_t*r){{\
                return (int)fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_preflight_v2(h,haystack,sizeof(haystack),0U,sizeof(haystack),r,identity,descriptor);}}\n\
@@ -50555,13 +50566,23 @@ int main(void){{
                if(status!=8U||r.end!={}U)return 22;\
                r.start=91U;r.end=92U;\
                if(fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_continue_v1(h,haystack,sizeof(haystack),&r,{}U,1U,{}U)!=3U||r.start!=91U||r.end!=92U)return 23;\
-               if(fre_aot_regex_runtime_destroy_exclusive_v1(h)!=0U)return 24;return 0;}}\n",
+               if(fre_aot_regex_runtime_destroy_exclusive_v1(h)!=0U)return 24;h=0;r.start=91U;r.end=92U;\
+               if(fre_aot_regex_runtime_prepare_exclusive_v1(v12_program,sizeof(v12_program),&h)!=0U)return 30;\
+               if(preflight(h,v12_identity,v12_descriptor,&r)!=6U||r.start!=91U||r.end!=92U)return 31;\
+               status=fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_continue_v1(h,haystack,sizeof(haystack),&r,{}U,1U,{}U);\
+               if(status!=8U||r.end!={}U)return 32;\
+               r.start=91U;r.end=92U;\
+               if(fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_continue_v1(h,haystack,sizeof(haystack),&r,{}U,1U,{}U)!=3U||r.start!=91U||r.end!=92U)return 33;\
+               if(fre_aot_regex_runtime_destroy_exclusive_v1(h)!=0U)return 34;return 0;}}\n",
             c_bytes(&v14.program),
             c_bytes(&v14.identity),
             c_words(&v14.descriptor),
             c_bytes(&v7.program),
             c_bytes(&v7.identity),
             c_words(&v7.descriptor),
+            c_bytes(&v12.program),
+            c_bytes(&v12.identity),
+            c_words(&v12.descriptor),
             v14.resume_state,
             v14.pending_end,
             v14.pending_end,
@@ -50572,6 +50593,11 @@ int main(void){{
             v7.pending_end,
             v7.resume_state,
             v7.pending_end,
+            v12.resume_state,
+            v12.pending_end,
+            v12.pending_end,
+            v12.resume_state,
+            v12.pending_end,
         );
         let c_path = directory.join("projection.c");
         let executable = directory.join("projection");
@@ -50611,9 +50637,9 @@ int main(void){{
     #[ignore = "links the status-8 static-prefix wrapper to a forged +664 V4 owner and executes arbitrary canonical state one"]
     #[allow(
         clippy::too_many_lines,
-        reason = "the linked proof keeps the real static hole, status-8 ABI, fixed dense-header offset, owner-base recovery, and all value contracts together"
+        reason = "the linked proof keeps the real static hole, status-8 ABI, fixed continuation-header offset, owner-base recovery, and all value contracts together"
     )]
-    fn linked_host_static_dense_resume_v4_tail_executes_all_outputs() {
+    fn linked_host_static_continuation_resume_v4_tail_executes_all_outputs() {
         use std::{fs, process::Command, time::SystemTime};
 
         const FORGED_V4_PATTERN: &str = r"(?-u:(?:a|[^a][\x00-\xff]){4})";
@@ -50804,16 +50830,16 @@ typedef struct {{
 }} frozen_v4_tail_t;
 typedef struct {{frozen_v1_t v1;frozen_v4_tail_t v4;}} frozen_v4_t;
 typedef union {{frozen_v4_t v4;unsigned char bytes[{slot_bytes}U];}} frozen_v6_slot_t;
-typedef struct {{unsigned char public_header[{second_offset}U];frozen_v6_slot_t dense;}} prepared_t;
+typedef struct {{unsigned char public_header[{second_offset}U];frozen_v6_slot_t continuation;}} prepared_t;
 _Static_assert(sizeof(frozen_v1_t)=={v1_bytes}U,"V1 extent");
 _Static_assert(offsetof(frozen_v4_t,v4)=={tail_offset}U,"V4 offset");
 _Static_assert(sizeof(frozen_v4_t)=={v4_bytes}U,"V4 extent");
-_Static_assert(offsetof(prepared_t,dense)=={second_offset}U,"dense header offset");
+_Static_assert(offsetof(prepared_t,continuation)=={second_offset}U,"continuation header offset");
 extern uint32_t {entry}(handle_t,const unsigned char*,size_t,size_t,size_t,result_t*);
 static const unsigned char identity[32]={{{identity}}};
 static const unsigned char haystack[]={{{haystack}}};
 static uint16_t rows[2];static uint32_t reverse_rows[256];static prepared_t prepared;
-#define frozen prepared.dense.v4
+#define frozen prepared.continuation.v4
 static size_t observed_cursor;static unsigned preflight_calls,continue_calls,recovery_calls,fallback_calls;
 uint32_t fre_aot_regex_runtime_search_v1(const unsigned char*a,const unsigned char*b,size_t n,size_t s,size_t e,result_t*r){{(void)a;(void)b;(void)n;(void)s;(void)e;(void)r;fallback_calls++;return 97U;}}
 uint32_t fre_aot_regex_runtime_search_exclusive_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;fallback_calls++;return 97U;}}
@@ -50951,15 +50977,17 @@ int main(void){{result_t result={{91U,92U}};init();uint32_t status={entry}((hand
         let entry_offset = emission
             .static_resume_entry_offset
             .expect("private supertransition entry");
-        let dense_entry_offset = emission
+        let continuation_entry_offset = emission
             .static_continuation_resume_entry_offset
-            .expect("private dense-continuation entry");
+            .expect("private continuation entry");
         assert!(entry_offset < emission.code.len());
-        assert!(dense_entry_offset < emission.code.len());
-        assert_ne!(entry_offset, dense_entry_offset);
+        assert!(continuation_entry_offset < emission.code.len());
+        assert_ne!(entry_offset, continuation_entry_offset);
         if target.architecture == Architecture::X86_64 {
             assert_eq!(
-                emission.code.get(dense_entry_offset..dense_entry_offset + 16),
+                emission
+                    .code
+                    .get(continuation_entry_offset..continuation_entry_offset + 16),
                 Some(
                     [
                         0x48, 0x83, 0xec, 0x68, // private frame
@@ -50968,7 +50996,7 @@ int main(void){{result_t result={{91U,92U}};init();uint32_t status={entry}((hand
                     ]
                     .as_slice()
                 ),
-                "x86 dense side entry must preserve the owner and select header +664"
+                "x86 continuation side entry must preserve the owner and select header +664"
             );
             let cursor_to_endpoint_before_first_dead_test = [
                 0x49, 0x89, 0xd3, 0x41, 0xf7, 0xc2, 0, 0, 0, 0x20,
@@ -50991,17 +51019,17 @@ int main(void){{result_t result={{91U,92U}};init();uint32_t status={entry}((hand
                 )
             };
             assert_eq!(
-                instruction(dense_entry_offset),
+                instruction(continuation_entry_offset),
                 aarch64_sub_x_imm(31, 31, 96).unwrap()
             );
             assert_eq!(
-                instruction(dense_entry_offset + 4),
+                instruction(continuation_entry_offset + 4),
                 aarch64_store_x(0, 31, 72).unwrap()
             );
             assert_eq!(
-                instruction(dense_entry_offset + 8),
+                instruction(continuation_entry_offset + 8),
                 aarch64_add_x_imm(0, 0, 664).unwrap(),
-                "AArch64 dense side entry must select header +664"
+                "AArch64 continuation side entry must select header +664"
             );
         }
 

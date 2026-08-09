@@ -110,9 +110,9 @@ pub const STATUS_PARTIAL_PREFLIGHT_ENTER: u32 = 6;
 /// Compiler-private status selecting an authenticated local static-resume tail.
 #[doc(hidden)]
 pub const STATUS_STATIC_PREFIX_NATIVE_RESUME: u32 = 7;
-/// Compiler-private status selecting the dense continuation local tail.
+/// Compiler-private status selecting the immutable continuation local tail.
 #[doc(hidden)]
-pub const STATUS_STATIC_PREFIX_NATIVE_DENSE_RESUME: u32 = 8;
+pub const STATUS_STATIC_PREFIX_NATIVE_CONTINUATION_RESUME: u32 = 8;
 /// Successful status for prepare and destroy lifecycle operations.
 pub const STATUS_SUCCESS: u32 = 0;
 /// Bytes in the exact SHA-256 semantic-artifact identity accepted by resume.
@@ -940,7 +940,7 @@ impl PreparedAotRegex {
     }
 
     /// Authenticate one immutable compact continuation and publish the exact
-    /// stable header consumed by the selected generated local tail. The dense
+    /// stable header consumed by the selected generated local tail. The
     /// continuation owner at the fixed second-header offset has precedence;
     /// the established root-compatible offset-zero owner remains status 7.
     /// Returned state words are physical-layout independent.
@@ -973,12 +973,6 @@ impl PreparedAotRegex {
                 && let Some(header_format) =
                     header.compiler_private_dynamic_rows_format_version()
                 && header_format == projection.format_version()
-                && matches!(
-                    header_format,
-                    FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION
-                        | FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION
-                        | FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION
-                )
             {
                 let canonical_state = projection.canonical_state();
                 let pending_end = match projection.pending_end() {
@@ -998,7 +992,7 @@ impl PreparedAotRegex {
                     )?;
                 self.static_continuation_header = header;
                 return Ok(Some((
-                    STATUS_STATIC_PREFIX_NATIVE_DENSE_RESUME,
+                    STATUS_STATIC_PREFIX_NATIVE_CONTINUATION_RESUME,
                     canonical_state,
                     pending_end,
                 )));
@@ -4044,6 +4038,20 @@ mod tests {
                 .static_continuation_header
                 .compiler_private_dynamic_rows_format_version(),
             Some(FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION)
+        );
+
+        let mapped = prepared(
+            r"(?s-u:.{3,})",
+            OutputContract::SelectedEnd,
+            CompileMode::Fast,
+        );
+        assert!(mapped.frozen_static_continuation_rows.is_some());
+        assert_eq!(
+            mapped
+                .static_continuation_header
+                .compiler_private_dynamic_rows_format_version(),
+            Some(FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION),
+            "closed mapped-u8 rows must remain available to an arbitrary-state continuation"
         );
     }
 
