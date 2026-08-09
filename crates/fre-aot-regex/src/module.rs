@@ -15808,26 +15808,61 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     }
 
     assembler.bind(v7_table_scan)?;
+    let v7_probe = assembler.label()?;
+    let emit_v7_transition = |assembler: &mut X86Assembler| -> Result<(), ObjectError> {
+        assembler.instruction(&[0x48, 0xff, 0xc2])?;
+        if output == OutputContract::Exists {
+            assembler.instruction(&[0x66, 0x45, 0x85, 0xd2])?;
+            assembler.branch(&[0x0f, 0x88], native_match)?;
+            assembler.branch(
+                &[0x0f, 0x84],
+                native_complete.unwrap_or(native_no_match),
+            )?;
+        } else {
+            assembler.instruction(&[0x41, 0xf7, 0xc2, 0x00, 0x80, 0x00, 0x00])?;
+            let not_accepting = assembler.label()?;
+            assembler.branch(&[0x0f, 0x84], not_accepting)?;
+            assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x60])?;
+            assembler.bind(not_accepting)?;
+            assembler.instruction(&[0x41, 0x81, 0xe2, 0xff, 0x7f, 0x00, 0x00])?;
+            assembler.instruction(&[0x45, 0x85, 0xd2])?;
+            assembler.branch(
+                &[0x0f, 0x84],
+                native_complete.unwrap_or(native_no_match),
+            )?;
+        }
+        assembler.instruction(&[0x4e, 0x8d, 0x44, 0x56, 0xfe])?;
+        Ok(())
+    };
+
+    if root_plan.is_none() {
+        // V7's self-loop probe is an optional accelerator, not part of the
+        // transition semantics. Schedule two independent byte/class loads,
+        // consume both exact cells, and probe the resulting state once. If
+        // the first transition enters a loop, consuming one byte normally is
+        // still exact and leaves the second transition eligible for the same
+        // authenticated scanner. Retain one real byte for a scalar tail.
+        let scalar_tail = assembler.label()?;
+        assembler.instruction(&[0x48, 0x8d, 0x42, 0x01])?; // lea rax,[rdx+1]
+        assembler.instruction(&[0x48, 0x39, 0xc8])?; // cmp rax,rcx
+        assembler.branch(&[0x0f, 0x83], scalar_tail)?;
+        assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
+        assembler.instruction(&[0x0f, 0xb6, 0x44, 0x17, 0x01])?;
+        assembler.instruction(&[0x47, 0x0f, 0xb6, 0x14, 0x11])?;
+        assembler.instruction(&[0x41, 0x0f, 0xb6, 0x04, 0x01])?;
+        assembler.instruction(&[0x47, 0x0f, 0xb7, 0x14, 0x50])?;
+        emit_v7_transition(&mut assembler)?;
+        assembler.instruction(&[0x45, 0x0f, 0xb7, 0x14, 0x40])?;
+        emit_v7_transition(&mut assembler)?;
+        assembler.branch(&[0xe9], v7_probe)?;
+        assembler.bind(scalar_tail)?;
+    }
     assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
     assembler.instruction(&[0x47, 0x0f, 0xb6, 0x14, 0x11])?;
     assembler.instruction(&[0x47, 0x0f, 0xb7, 0x14, 0x50])?;
-    assembler.instruction(&[0x48, 0xff, 0xc2])?;
-    if output == OutputContract::Exists {
-        assembler.instruction(&[0x66, 0x45, 0x85, 0xd2])?;
-        assembler.branch(&[0x0f, 0x88], native_match)?;
-        assembler.branch(&[0x0f, 0x84], native_complete.unwrap_or(native_no_match))?;
-    } else {
-        assembler.instruction(&[0x41, 0xf7, 0xc2, 0x00, 0x80, 0x00, 0x00])?;
-        let not_accepting = assembler.label()?;
-        assembler.branch(&[0x0f, 0x84], not_accepting)?;
-        assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x60])?;
-        assembler.bind(not_accepting)?;
-        assembler.instruction(&[0x41, 0x81, 0xe2, 0xff, 0x7f, 0x00, 0x00])?;
-        assembler.instruction(&[0x45, 0x85, 0xd2])?;
-        assembler.branch(&[0x0f, 0x84], native_complete.unwrap_or(native_no_match))?;
-    }
-    assembler.instruction(&[0x4e, 0x8d, 0x44, 0x56, 0xfe])?;
+    emit_v7_transition(&mut assembler)?;
 
+    assembler.bind(v7_probe)?;
     let v7_ordinary = assembler.label()?;
     assembler.instruction(&[
         0x49,
@@ -16026,24 +16061,59 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         assembler.bind(entry)?;
         assembler.instruction(&[0x49, 0x89, 0xf0])?;
         assembler.bind(v6_scan)?;
+        let emit_v6_transition = |assembler: &mut X86Assembler| -> Result<(), ObjectError> {
+            assembler.instruction(&[0x48, 0xff, 0xc2])?;
+            if output == OutputContract::Exists {
+                assembler.instruction(&[0x66, 0x45, 0x85, 0xd2])?;
+                assembler.branch(&[0x0f, 0x88], native_match)?;
+                assembler.branch(
+                    &[0x0f, 0x84],
+                    native_complete.unwrap_or(native_no_match),
+                )?;
+            } else {
+                assembler.instruction(&[0x41, 0xf7, 0xc2, 0x00, 0x80, 0x00, 0x00])?;
+                let not_accepting = assembler.label()?;
+                assembler.branch(&[0x0f, 0x84], not_accepting)?;
+                assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x60])?;
+                assembler.bind(not_accepting)?;
+                assembler.instruction(&[0x41, 0x81, 0xe2, 0xff, 0x7f, 0x00, 0x00])?;
+                assembler.branch(
+                    &[0x0f, 0x84],
+                    native_complete.unwrap_or(native_no_match),
+                )?;
+            }
+            assembler.instruction(&[0x41, 0xff, 0xca])?;
+            Ok(())
+        };
+
+        if root_plan.is_none() {
+            // The first exact transition may bypass the optional self-loop
+            // probe: one normally consumed byte preserves DFA semantics and
+            // the second resulting state is probed immediately. This halves
+            // loop-index traffic and row-shift redispatch on ordinary states,
+            // while issuing both independent input/class loads together.
+            let scalar_tail = assembler.label()?;
+            assembler.instruction(&[0x48, 0x8d, 0x42, 0x01])?; // lea rax,[rdx+1]
+            assembler.instruction(&[0x48, 0x39, 0xc8])?; // cmp rax,rcx
+            assembler.branch(&[0x0f, 0x83], scalar_tail)?;
+            assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
+            assembler.instruction(&[0x0f, 0xb6, 0x44, 0x17, 0x01])?;
+            assembler.instruction(&[0x47, 0x0f, 0xb6, 0x14, 0x11])?;
+            assembler.instruction(&[0x41, 0x0f, 0xb6, 0x04, 0x01])?;
+            assembler.instruction(&[0x47, 0x0f, 0xb7, 0x14, 0x50])?;
+            emit_v6_transition(&mut assembler)?;
+            assembler.instruction(&[0x49, 0xc1, 0xe2, shift])?;
+            assembler.instruction(&[0x4e, 0x8d, 0x04, 0x16])?;
+            assembler.instruction(&[0x45, 0x0f, 0xb7, 0x14, 0x40])?;
+            emit_v6_transition(&mut assembler)?;
+            assembler.branch(&[0xe9], v6_probe)?;
+            assembler.bind(scalar_tail)?;
+        }
+
         assembler.instruction(&[0x44, 0x0f, 0xb6, 0x14, 0x17])?;
         assembler.instruction(&[0x47, 0x0f, 0xb6, 0x14, 0x11])?;
         assembler.instruction(&[0x47, 0x0f, 0xb7, 0x14, 0x50])?;
-        assembler.instruction(&[0x48, 0xff, 0xc2])?;
-        if output == OutputContract::Exists {
-            assembler.instruction(&[0x66, 0x45, 0x85, 0xd2])?;
-            assembler.branch(&[0x0f, 0x88], native_match)?;
-            assembler.branch(&[0x0f, 0x84], native_complete.unwrap_or(native_no_match))?;
-        } else {
-            assembler.instruction(&[0x41, 0xf7, 0xc2, 0x00, 0x80, 0x00, 0x00])?;
-            let not_accepting = assembler.label()?;
-            assembler.branch(&[0x0f, 0x84], not_accepting)?;
-            assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x60])?;
-            assembler.bind(not_accepting)?;
-            assembler.instruction(&[0x41, 0x81, 0xe2, 0xff, 0x7f, 0x00, 0x00])?;
-            assembler.branch(&[0x0f, 0x84], native_complete.unwrap_or(native_no_match))?;
-        }
-        assembler.instruction(&[0x41, 0xff, 0xca])?;
+        emit_v6_transition(&mut assembler)?;
         if let Some(root_vector) = root_vector {
             let non_root = assembler.label()?;
             assembler.instruction(&[0x45, 0x85, 0xd2])?;
@@ -16055,7 +16125,6 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             assembler.branch(&[0xe9], root_vector)?;
             assembler.bind(non_root)?;
         }
-        let _ = shift;
         assembler.branch(&[0xe9], v6_probe)?;
     }
 
@@ -26516,25 +26585,63 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     }
 
     assembler.bind(v7_table_scan)?;
+    let v7_probe = assembler.label()?;
+    let emit_v7_transition =
+        |assembler: &mut Aarch64Assembler| -> Result<(), ObjectError> {
+            assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
+            if output == OutputContract::Exists {
+                assembler.branch_bit_set_w(8, 15, native_match)?;
+                assembler.branch_zero_w(
+                    8,
+                    native_complete.unwrap_or(native_no_match),
+                )?;
+                assembler.instruction(aarch64_and_low_w(8, 8, 15)?)?;
+            } else {
+                let not_accepting = assembler.label()?;
+                assembler.branch_bit_clear_w(8, 15, not_accepting)?;
+                assembler.instruction(aarch64_store_x(2, 31, 80)?)?;
+                assembler.bind(not_accepting)?;
+                assembler.instruction(aarch64_and_low_w(8, 8, 15)?)?;
+                assembler.branch_zero_w(
+                    8,
+                    native_complete.unwrap_or(native_no_match),
+                )?;
+            }
+            // X6 is the zero-based cell offset and therefore the exact V7
+            // loop-index key. The biased base in X15 forms the next row.
+            assembler.instruction(aarch64_sub_w_imm(6, 8, 1)?)?;
+            assembler.instruction(aarch64_add_x_uxtw(11, 15, 8, 1)?)?;
+            Ok(())
+        };
+
+    if root_plan.is_none() {
+        // The loop helper only accelerates authenticated self-loop bytes. It
+        // is therefore safe to consume two exact transitions and probe once:
+        // a loop reached by the first transition remains eligible after the
+        // second. Load both independent byte classes before the serial cells
+        // and reserve one real byte for the scalar endpoint tail.
+        let scalar_tail = assembler.label()?;
+        assembler.instruction(aarch64_sub_x_imm(9, 3, 1)?)?;
+        assembler.instruction(aarch64_cmp_x(2, 9)?)?;
+        assembler.branch_cond(AARCH64_HS, scalar_tail)?;
+        assembler.instruction(aarch64_load_byte_reg(6, 0, 2)?)?;
+        assembler.instruction(aarch64_add_x_imm(12, 2, 1)?)?;
+        assembler.instruction(aarch64_load_byte_reg(7, 0, 12)?)?;
+        assembler.instruction(aarch64_load_byte_reg(6, 14, 6)?)?;
+        assembler.instruction(aarch64_load_byte_reg(7, 14, 7)?)?;
+        assembler.instruction(aarch64_load_h_uxtw(8, 11, 6)?)?;
+        emit_v7_transition(&mut assembler)?;
+        assembler.instruction(aarch64_load_h_uxtw(8, 11, 7)?)?;
+        emit_v7_transition(&mut assembler)?;
+        assembler.branch(v7_probe)?;
+        assembler.bind(scalar_tail)?;
+    }
     assembler.instruction(aarch64_load_byte_reg(8, 0, 2)?)?;
     assembler.instruction(aarch64_load_byte_reg(8, 14, 8)?)?;
     assembler.instruction(aarch64_load_h_uxtw(8, 11, 8)?)?;
-    assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
-    if output == OutputContract::Exists {
-        assembler.branch_bit_set_w(8, 15, native_match)?;
-        assembler.branch_zero_w(8, native_complete.unwrap_or(native_no_match))?;
-        assembler.instruction(aarch64_and_low_w(8, 8, 15)?)?;
-    } else {
-        let not_accepting = assembler.label()?;
-        assembler.branch_bit_clear_w(8, 15, not_accepting)?;
-        assembler.instruction(aarch64_store_x(2, 31, 80)?)?;
-        assembler.bind(not_accepting)?;
-        assembler.instruction(aarch64_and_low_w(8, 8, 15)?)?;
-        assembler.branch_zero_w(8, native_complete.unwrap_or(native_no_match))?;
-    }
-    // X6 is the zero-based cell offset and therefore the exact V7 map key.
-    assembler.instruction(aarch64_sub_w_imm(6, 8, 1)?)?;
-    assembler.instruction(aarch64_add_x_uxtw(11, 15, 8, 1)?)?;
+    emit_v7_transition(&mut assembler)?;
+
+    assembler.bind(v7_probe)?;
     assembler.instruction(aarch64_load_x_imm(
         10,
         13,
@@ -26746,25 +26853,62 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     }
 
     assembler.bind(v6_table_scan)?;
+    let v6_probe = assembler.label()?;
+    let emit_v6_transition =
+        |assembler: &mut Aarch64Assembler| -> Result<(), ObjectError> {
+            assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
+            if output == OutputContract::Exists {
+                assembler.branch_bit_set_w(8, 15, native_match)?;
+                assembler.branch_zero_w(
+                    8,
+                    native_complete.unwrap_or(native_no_match),
+                )?;
+                assembler.instruction(aarch64_sub_w_imm(6, 8, 1)?)?;
+            } else {
+                let not_accepting = assembler.label()?;
+                assembler.branch_bit_clear_w(8, 15, not_accepting)?;
+                assembler.instruction(aarch64_store_x(2, 31, 80)?)?;
+                assembler.bind(not_accepting)?;
+                assembler.instruction(aarch64_and_low_w(6, 8, 15)?)?;
+                assembler.branch_zero_w(
+                    6,
+                    native_complete.unwrap_or(native_no_match),
+                )?;
+                assembler.instruction(aarch64_sub_w_imm(6, 6, 1)?)?;
+            }
+            assembler.instruction(aarch64_lslv_x(10, 6, 12)?)?;
+            assembler.instruction(aarch64_add_x_reg(11, 15, 10)?)?;
+            Ok(())
+        };
+
+    if root_plan.is_none() {
+        // V6 loop discovery is optional. Consume two exact transitions before
+        // probing the resulting state, retaining the second mapped class in
+        // W7 while the first serial row update uses X10. A loop reached after
+        // byte one loses at most that one scalar byte and remains eligible at
+        // byte two; a final unpaired byte follows the original scalar path.
+        let scalar_tail = assembler.label()?;
+        assembler.instruction(aarch64_sub_x_imm(9, 3, 1)?)?;
+        assembler.instruction(aarch64_cmp_x(2, 9)?)?;
+        assembler.branch_cond(AARCH64_HS, scalar_tail)?;
+        assembler.instruction(aarch64_load_byte_reg(6, 0, 2)?)?;
+        assembler.instruction(aarch64_add_x_imm(10, 2, 1)?)?;
+        assembler.instruction(aarch64_load_byte_reg(7, 0, 10)?)?;
+        assembler.instruction(aarch64_load_byte_reg(6, 14, 6)?)?;
+        assembler.instruction(aarch64_load_byte_reg(7, 14, 7)?)?;
+        assembler.instruction(aarch64_load_h_uxtw(8, 11, 6)?)?;
+        emit_v6_transition(&mut assembler)?;
+        assembler.instruction(aarch64_load_h_uxtw(8, 11, 7)?)?;
+        emit_v6_transition(&mut assembler)?;
+        assembler.branch(v6_probe)?;
+        assembler.bind(scalar_tail)?;
+    }
     assembler.instruction(aarch64_load_byte_reg(6, 0, 2)?)?;
     assembler.instruction(aarch64_load_byte_reg(6, 14, 6)?)?;
     assembler.instruction(aarch64_load_h_uxtw(8, 11, 6)?)?;
-    assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
-    if output == OutputContract::Exists {
-        assembler.branch_bit_set_w(8, 15, native_match)?;
-        assembler.branch_zero_w(8, native_complete.unwrap_or(native_no_match))?;
-        assembler.instruction(aarch64_sub_w_imm(6, 8, 1)?)?;
-    } else {
-        let not_accepting = assembler.label()?;
-        assembler.branch_bit_clear_w(8, 15, not_accepting)?;
-        assembler.instruction(aarch64_store_x(2, 31, 80)?)?;
-        assembler.bind(not_accepting)?;
-        assembler.instruction(aarch64_and_low_w(6, 8, 15)?)?;
-        assembler.branch_zero_w(6, native_complete.unwrap_or(native_no_match))?;
-        assembler.instruction(aarch64_sub_w_imm(6, 6, 1)?)?;
-    }
-    assembler.instruction(aarch64_lslv_x(10, 6, 12)?)?;
-    assembler.instruction(aarch64_add_x_reg(11, 15, 10)?)?;
+    emit_v6_transition(&mut assembler)?;
+
+    assembler.bind(v6_probe)?;
     assembler.instruction(aarch64_load_x_imm(
         10,
         13,
@@ -30128,6 +30272,13 @@ mod tests {
             0x48, 0xff, 0xc8, // dec rax
             0x48, 0x39, 0xc2, // cmp rdx, rax
         ];
+        let x86_loop_pair_guard = [
+            0x48, 0x8d, 0x42, 0x01, // lea rax, [rdx + 1]
+            0x48, 0x39, 0xc8, // cmp rax, rcx
+        ];
+        let x86_loop_second_byte = [0x0f, 0xb6, 0x44, 0x17, 0x01];
+        let x86_loop_second_class = [0x41, 0x0f, 0xb6, 0x04, 0x01];
+        let x86_loop_second_u16_cell = [0x45, 0x0f, 0xb7, 0x14, 0x40];
         let x86_second_byte = [0x44, 0x0f, 0xb6, 0x5c, 0x17, 0x01];
         let x86_second_class = [0x47, 0x0f, 0xb6, 0x1c, 0x19];
         let x86_second_u16_cell = [0x47, 0x0f, 0xb7, 0x14, 0x58];
@@ -30184,6 +30335,26 @@ mod tests {
                 let supertransitions =
                     !(output == OutputContract::Span && exact_span_width.is_none());
                 assert_eq!(byte_occurrences(code, &x86_pair_guard), 21, "{context}");
+                assert_eq!(
+                    byte_occurrences(code, &x86_loop_pair_guard),
+                    10,
+                    "{context}: V7 and all nine V6 shifts retain exact two-byte bounds"
+                );
+                assert_eq!(
+                    byte_occurrences(code, &x86_loop_second_byte),
+                    10,
+                    "{context}: V7 and all V6 shifts load their second input byte early"
+                );
+                assert_eq!(
+                    byte_occurrences(code, &x86_loop_second_class),
+                    10,
+                    "{context}: V7 and all V6 shifts map their second byte early"
+                );
+                assert_eq!(
+                    byte_occurrences(code, &x86_loop_second_u16_cell),
+                    10,
+                    "{context}: V7 and all V6 shifts consume a serial second cell"
+                );
                 assert_eq!(
                     byte_occurrences(code, &x86_second_byte),
                     if supertransitions { 31 } else { 21 },
@@ -30281,6 +30452,11 @@ mod tests {
                     0,
                     "{context}: rooted compact paths remain scalar"
                 );
+                assert_eq!(
+                    byte_occurrences(&rooted.code, &x86_loop_second_byte),
+                    0,
+                    "{context}: rooted V6/V7 paths retain per-byte root dispatch"
+                );
             }
         }
 
@@ -30289,6 +30465,8 @@ mod tests {
             aarch64_cmp_x(2, 9).unwrap(),
         ];
         let arm_second_class = aarch64_load_byte_reg(10, 14, 10).unwrap();
+        let arm_loop_second_class = aarch64_load_byte_reg(7, 14, 7).unwrap();
+        let arm_loop_second_u16_cell = aarch64_load_h_uxtw(8, 11, 7).unwrap();
         let arm_second_u16_cell = aarch64_load_h_uxtw(8, 11, 10).unwrap();
         let arm_second_u8_cell = aarch64_load_byte_reg(8, 11, 10).unwrap();
         let mut arm_data = vec![0_u8; 32];
@@ -30320,7 +30498,11 @@ mod tests {
                 .enumerate()
                 .filter_map(|(offset, window)| (window == arm_pair_guard).then_some(offset))
                 .collect::<Vec<_>>();
-            assert_eq!(guards.len(), 21, "{context}: exact pair guards");
+            assert_eq!(
+                guards.len(),
+                23,
+                "{context}: exact pair guards include V6/V7 probe-once loops"
+            );
             for guard in guards {
                 let branch = guard + arm_pair_guard.len();
                 assert_eq!(
@@ -30341,6 +30523,22 @@ mod tests {
                     .count(),
                 if supertransitions { 38 } else { 19 },
                 "{context}: production V3/V4/V12 mapped second-class loads"
+            );
+            assert_eq!(
+                words
+                    .iter()
+                    .filter(|&&word| word == arm_loop_second_class)
+                    .count(),
+                2,
+                "{context}: scanner-free V6/V7 retain their second mapped class in W7"
+            );
+            assert_eq!(
+                words
+                    .iter()
+                    .filter(|&&word| word == arm_loop_second_u16_cell)
+                    .count(),
+                2,
+                "{context}: scanner-free V6/V7 consume their second serial cell from W7"
             );
             assert_eq!(
                 words
@@ -30395,6 +30593,14 @@ mod tests {
                     .count(),
                 0,
                 "{context}: rooted compact paths remain scalar"
+            );
+            assert_eq!(
+                rooted_words
+                    .iter()
+                    .filter(|&&word| word == arm_loop_second_class)
+                    .count(),
+                0,
+                "{context}: rooted V6/V7 paths retain per-byte root dispatch"
             );
         }
     }
@@ -49113,13 +49319,13 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
         let x86 = lower_x86_64_dynamic_rows_prepared(None, FeatureSet::EMPTY).unwrap();
         assert_eq!(
             occurrences(&x86.code, &[0x47, 0x0f, 0xb7, 0x14, 0x50]),
-            37,
-            "V14, V13, V8, V7/V6, paired V3/V4 first cells, and their scalar tails need scaled u16 loads"
+            47,
+            "V14, V13, V8, paired V7/V6, paired V3/V4 first cells, and their scalar tails need scaled u16 loads"
         );
         assert_eq!(
             occurrences(&x86.code, &[0x4e, 0x8d, 0x04, 0x16]),
-            49,
-            "V8/V6 and both ordered V3/V10/V12 transitions need state-ordinal backedges"
+            58,
+            "paired V8/V6 and both ordered V3/V10/V12 transitions need state-ordinal backedges"
         );
         assert_eq!(
             occurrences(&x86.code, &[0x49, 0x89, 0xf0]),
@@ -49133,8 +49339,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
         );
         assert_eq!(
             occurrences(&x86.code, &[0x4e, 0x8d, 0x44, 0x56, 0xfe]),
-            8,
-            "three V14 alphabets plus V13, singleton, and mapped V4 need direct rows+token*2-2 backedges"
+            10,
+            "three V14 alphabets plus V13, singleton, paired V7, and mapped V4 need direct rows+token*2-2 backedges"
         );
         let mut v2_flag = vec![
             0x81,
@@ -49775,8 +49981,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 .iter()
                 .filter(|&&word| word == aarch64_load_h_uxtw(8, 11, 6).unwrap())
                 .count(),
-            13,
-            "V6/V8, the first V3 cell for every shift, and the shared V3 scalar tail"
+            15,
+            "paired V6/V7, V8, the first V3 cell for every shift, and the shared V3 scalar tail"
         );
         assert_eq!(
             arm_words
@@ -49799,8 +50005,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 .iter()
                 .filter(|&&word| word == aarch64_add_x_uxtw(11, 15, 8, 1).unwrap())
                 .count(),
-            8,
-            "three V14 alphabets plus V13, singleton, and mapped V4 need biased-base cell-offset backedges"
+            10,
+            "three V14 alphabets plus V13, singleton, paired V7, and mapped V4 need biased-base cell-offset backedges"
         );
         assert_eq!(
             arm_words
