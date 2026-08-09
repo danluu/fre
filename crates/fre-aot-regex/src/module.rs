@@ -25904,25 +25904,13 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     // Scanner-free compact loops no longer need the public end argument in
     // X4 after the frame has retained it. Keep the latest accepting endpoint
     // there instead of round-tripping every accepting transition through the
-    // private frame. V6/V7 spill X4 only across their rare loop-helper call
-    // and settle it through format-local completion edges.
+    // private frame. V6/V7 spill X4 only across their rare loop-helper call;
+    // every eligible compact format tail-merges into one register completion.
     let register_last_accept = root_plan.is_none() && output != OutputContract::Exists;
-    let v7_register_complete = register_last_accept
+    let register_complete = register_last_accept
         .then(|| assembler.label())
         .transpose()?;
-    let v6_register_complete = register_last_accept
-        .then(|| assembler.label())
-        .transpose()?;
-    let v8_register_complete = (register_last_accept && direct_byte_formats_possible)
-        .then(|| assembler.label())
-        .transpose()?;
-    let v7_complete = v7_register_complete
-        .or(native_complete)
-        .unwrap_or(native_no_match);
-    let v6_complete = v6_register_complete
-        .or(native_complete)
-        .unwrap_or(native_no_match);
-    let v8_complete = v8_register_complete
+    let compact_complete = register_complete
         .or(native_complete)
         .unwrap_or(native_no_match);
     let native_continue = allow_direct_hole_continuation
@@ -26479,7 +26467,9 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     let emit_v4_transition =
         |assembler: &mut Aarch64Assembler,
          advance_position: bool,
-         update_row: bool|
+         update_row: bool,
+         register_endpoint: bool,
+         complete: Aarch64Label|
          -> Result<(), ObjectError> {
             if advance_position {
                 assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
@@ -26488,14 +26478,18 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
                 assembler.branch_bit_set_w(8, 15, native_match)?;
                 // The not-taken accept branch proves bit 15 clear. Test the
                 // original cell for dead and feed a live V4 cell to ADD.
-                assembler.branch_zero_w(8, native_complete.unwrap_or(native_no_match))?;
+                assembler.branch_zero_w(8, complete)?;
             } else {
                 let not_accepting = assembler.label()?;
                 assembler.branch_bit_clear_w(8, 15, not_accepting)?;
-                assembler.instruction(aarch64_store_x(2, 31, 80)?)?;
+                if register_endpoint {
+                    assembler.instruction(aarch64_mov_x(4, 2)?)?;
+                } else {
+                    assembler.instruction(aarch64_store_x(2, 31, 80)?)?;
+                }
                 assembler.bind(not_accepting)?;
                 assembler.instruction(aarch64_and_low_w(8, 8, 15)?)?;
-                assembler.branch_zero_w(8, native_complete.unwrap_or(native_no_match))?;
+                assembler.branch_zero_w(8, complete)?;
             }
             if update_row {
                 assembler.instruction(aarch64_add_x_uxtw(11, 15, 8, 1)?)?;
@@ -26503,15 +26497,21 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             Ok(())
         };
     let emit_v4_transition_tail =
-        |assembler: &mut Aarch64Assembler, backedge: Aarch64Label| -> Result<(), ObjectError> {
+        |assembler: &mut Aarch64Assembler,
+         backedge: Aarch64Label,
+         register_endpoint: bool,
+         complete: Aarch64Label|
+         -> Result<(), ObjectError> {
             emit_v4_transition(
                 assembler,
                 !scanner_free_exists_pointer_cursor,
                 true,
+                register_endpoint,
+                complete,
             )?;
             assembler.instruction(aarch64_cmp_x(2, 3)?)?;
             assembler.branch_cond(AARCH64_LO, backedge)?;
-            assembler.branch(native_complete.unwrap_or(native_no_match))?;
+            assembler.branch(complete)?;
             Ok(())
         };
 
@@ -26521,22 +26521,28 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         |assembler: &mut Aarch64Assembler,
          row_shift: u8,
          advance_position: bool,
-         update_row: bool|
+         update_row: bool,
+         register_endpoint: bool,
+         complete: Aarch64Label|
          -> Result<(), ObjectError> {
             if advance_position {
                 assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
             }
             if output == OutputContract::Exists {
                 assembler.branch_bit_set_w(8, 7, native_match)?;
-                assembler.branch_zero_w(8, native_complete.unwrap_or(native_no_match))?;
+                assembler.branch_zero_w(8, complete)?;
                 assembler.instruction(aarch64_sub_w_imm(6, 8, 1)?)?;
             } else {
                 let not_accepting = assembler.label()?;
                 assembler.branch_bit_clear_w(8, 7, not_accepting)?;
-                assembler.instruction(aarch64_store_x(2, 31, 80)?)?;
+                if register_endpoint {
+                    assembler.instruction(aarch64_mov_x(4, 2)?)?;
+                } else {
+                    assembler.instruction(aarch64_store_x(2, 31, 80)?)?;
+                }
                 assembler.bind(not_accepting)?;
                 assembler.instruction(aarch64_and_low_w(6, 8, 7)?)?;
-                assembler.branch_zero_w(6, native_complete.unwrap_or(native_no_match))?;
+                assembler.branch_zero_w(6, complete)?;
                 assembler.instruction(aarch64_sub_w_imm(6, 6, 1)?)?;
             }
             if let Some(root_dispatch) = root_dispatch {
@@ -26558,17 +26564,21 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     let emit_u8_state_ordinal_transition_tail =
         |assembler: &mut Aarch64Assembler,
          row_shift: u8,
-         backedge: Aarch64Label|
+         backedge: Aarch64Label,
+         register_endpoint: bool,
+         complete: Aarch64Label|
          -> Result<(), ObjectError> {
             emit_u8_state_ordinal_transition(
                 assembler,
                 row_shift,
                 !scanner_free_exists_pointer_cursor,
                 true,
+                register_endpoint,
+                complete,
             )?;
             assembler.instruction(aarch64_cmp_x(2, 3)?)?;
             assembler.branch_cond(AARCH64_LO, backedge)?;
-            assembler.branch(native_complete.unwrap_or(native_no_match))?;
+            assembler.branch(complete)?;
             Ok(())
         };
 
@@ -26630,20 +26640,20 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
                 assembler.branch_bit_set_w(8, 15, native_match)?;
                 assembler.branch_zero_w(
                     8,
-                    v7_complete,
+                    compact_complete,
                 )?;
                 assembler.instruction(aarch64_and_low_w(8, 8, 15)?)?;
             } else {
                 let not_accepting = assembler.label()?;
                 assembler.branch_bit_clear_w(8, 15, not_accepting)?;
-                if v7_register_complete.is_some() {
+                if register_complete.is_some() {
                     assembler.instruction(aarch64_mov_x(4, 2)?)?;
                 } else {
                     assembler.instruction(aarch64_store_x(2, 31, 80)?)?;
                 }
                 assembler.bind(not_accepting)?;
                 assembler.instruction(aarch64_and_low_w(8, 8, 15)?)?;
-                assembler.branch_zero_w(8, v7_complete)?;
+                assembler.branch_zero_w(8, compact_complete)?;
             }
             // X6 is the zero-based cell offset and therefore the exact V7
             // loop-index key. The biased base in X15 forms the next row.
@@ -26747,7 +26757,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         assembler.branch_cond(AARCH64_NE, v7_not_all_bytes)?;
     }
     assembler.instruction(aarch64_mov_x(2, 3)?)?;
-    assembler.branch(v7_complete)?;
+    assembler.branch(compact_complete)?;
     assembler.bind(v7_not_all_bytes)?;
 
     assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
@@ -26773,7 +26783,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         // plan needs one. It is caller-saved, like every root SIMD constant,
         // so retain it beside the existing row and position call spills.
         assembler.instruction(aarch64_store_x(5, 31, 16)?)?;
-    } else if v7_register_complete.is_some() {
+    } else if register_complete.is_some() {
         assembler.instruction(aarch64_store_x(4, 31, 16)?)?;
     }
     // Trusted V2 ABI: X0=source, X1=the authenticated scanner retained from
@@ -26787,7 +26797,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     assembler.instruction(aarch64_load_x_imm(2, 31, 8)?)?;
     if root_plan.is_some() {
         assembler.instruction(aarch64_load_x_imm(5, 31, 16)?)?;
-    } else if v7_register_complete.is_some() {
+    } else if register_complete.is_some() {
         assembler.instruction(aarch64_load_x_imm(4, 31, 16)?)?;
     }
     assembler.instruction(aarch64_load_x_imm(3, 31, 88)?)?;
@@ -26827,7 +26837,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     }
     assembler.instruction(aarch64_cmp_x(2, 3)?)?;
     assembler.branch_cond(AARCH64_LO, v7_table_scan)?;
-    assembler.branch(v7_complete)?;
+    assembler.branch(compact_complete)?;
     assembler.bind(v7_loop_failure)?;
     assembler.instruction(aarch64_add_x_imm(31, 31, 32)?)?;
     assembler.branch(framed_fallback)?;
@@ -26835,14 +26845,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     assembler.bind(v7_ordinary)?;
     assembler.instruction(aarch64_cmp_x(2, 3)?)?;
     assembler.branch_cond(AARCH64_LO, v7_scan)?;
-    assembler.branch(v7_complete)?;
-    if let Some(complete) = v7_register_complete {
-        assembler.bind(complete)?;
-        assembler.instruction(aarch64_mov_x(7, 4)?)?;
-        assembler.instruction(aarch64_cmp_x_imm(7, 0)?)?;
-        assembler.branch_cond(AARCH64_EQ, native_no_match)?;
-        assembler.branch(native_match)?;
-    }
+    assembler.branch(compact_complete)?;
 
     // V6 uses canonical state ordinals as map keys. Its row shift is an
     // authenticated 1..=9 value; LSLV keeps one compact transition loop while
@@ -26917,20 +26920,20 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
                 assembler.branch_bit_set_w(8, 15, native_match)?;
                 assembler.branch_zero_w(
                     8,
-                    v6_complete,
+                    compact_complete,
                 )?;
                 assembler.instruction(aarch64_sub_w_imm(6, 8, 1)?)?;
             } else {
                 let not_accepting = assembler.label()?;
                 assembler.branch_bit_clear_w(8, 15, not_accepting)?;
-                if v6_register_complete.is_some() {
+                if register_complete.is_some() {
                     assembler.instruction(aarch64_mov_x(4, 2)?)?;
                 } else {
                     assembler.instruction(aarch64_store_x(2, 31, 80)?)?;
                 }
                 assembler.bind(not_accepting)?;
                 assembler.instruction(aarch64_and_low_w(6, 8, 15)?)?;
-                assembler.branch_zero_w(6, v6_complete)?;
+                assembler.branch_zero_w(6, compact_complete)?;
                 assembler.instruction(aarch64_sub_w_imm(6, 6, 1)?)?;
             }
             if root_plan.is_none() {
@@ -27028,7 +27031,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         assembler.branch_cond(AARCH64_NE, v6_not_all_bytes)?;
     }
     assembler.instruction(aarch64_mov_x(2, 3)?)?;
-    assembler.branch(v6_complete)?;
+    assembler.branch(compact_complete)?;
     assembler.bind(v6_not_all_bytes)?;
 
     // Keep X12's authenticated shift or precomputed stride live across the
@@ -27054,7 +27057,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     assembler.instruction(aarch64_store_x(2, 31, 8)?)?;
     if root_plan.is_some() {
         assembler.instruction(aarch64_store_x(5, 31, 16)?)?;
-    } else if v6_register_complete.is_some() {
+    } else if register_complete.is_some() {
         assembler.instruction(aarch64_store_x(4, 31, 16)?)?;
     }
     // Keep the same direct-pointer V2 register contract in the V6 body.
@@ -27066,7 +27069,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     assembler.instruction(aarch64_load_x_imm(2, 31, 8)?)?;
     if root_plan.is_some() {
         assembler.instruction(aarch64_load_x_imm(5, 31, 16)?)?;
-    } else if v6_register_complete.is_some() {
+    } else if register_complete.is_some() {
         assembler.instruction(aarch64_load_x_imm(4, 31, 16)?)?;
     }
     assembler.instruction(aarch64_load_x_imm(3, 31, 88)?)?;
@@ -27112,7 +27115,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     }
     assembler.instruction(aarch64_cmp_x(2, 3)?)?;
     assembler.branch_cond(AARCH64_LO, v6_scan)?;
-    assembler.branch(v6_complete)?;
+    assembler.branch(compact_complete)?;
     assembler.bind(v6_loop_failure)?;
     assembler.instruction(aarch64_add_x_imm(31, 31, 32)?)?;
     assembler.branch(framed_fallback)?;
@@ -27120,14 +27123,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     assembler.bind(v6_ordinary)?;
     assembler.instruction(aarch64_cmp_x(2, 3)?)?;
     assembler.branch_cond(AARCH64_LO, v6_scan)?;
-    assembler.branch(v6_complete)?;
-    if let Some(complete) = v6_register_complete {
-        assembler.bind(complete)?;
-        assembler.instruction(aarch64_mov_x(7, 4)?)?;
-        assembler.instruction(aarch64_cmp_x_imm(7, 0)?)?;
-        assembler.branch_cond(AARCH64_EQ, native_no_match)?;
-        assembler.branch(native_match)?;
-    }
+    assembler.branch(compact_complete)?;
 
     assembler.bind(v4_enter)?;
     assembler.instruction(aarch64_load_x_imm(
@@ -27162,7 +27158,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             assembler.instruction(aarch64_add_x_reg(2, 0, 2)?)?;
             assembler.instruction(aarch64_add_x_reg(3, 0, 3)?)?;
         } else {
-            assembler.instruction(aarch64_store_x(31, 31, 80)?)?;
+            assembler.instruction(aarch64_movz_x(4, 0, 0)?)?;
         }
         let singleton_scan = assembler.label()?;
         assembler.bind(singleton_scan)?;
@@ -27174,15 +27170,15 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         } else {
             let not_accepting = assembler.label()?;
             assembler.branch_bit_clear_w(8, 15, not_accepting)?;
-            assembler.instruction(aarch64_store_x(2, 31, 80)?)?;
+            assembler.instruction(aarch64_mov_x(4, 2)?)?;
             assembler.bind(not_accepting)?;
             assembler.instruction(aarch64_and_low_w(8, 8, 15)?)?;
-            assembler.branch_zero_w(8, native_complete.unwrap_or(native_no_match))?;
+            assembler.branch_zero_w(8, compact_complete)?;
         }
         assembler.instruction(aarch64_add_x_uxtw(11, 15, 8, 1)?)?;
         assembler.instruction(aarch64_cmp_x(2, 3)?)?;
         assembler.branch_cond(AARCH64_LO, singleton_scan)?;
-        assembler.branch(native_complete.unwrap_or(native_no_match))?;
+        assembler.branch(compact_complete)?;
         assembler.bind(class_mapped)?;
     }
     // Setup canonicalized the initial row before choosing V4. Preserve its
@@ -27216,7 +27212,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     if let Some(root_setup) = root_setup {
         assembler.branch(root_setup)?;
     } else if output != OutputContract::Exists {
-        assembler.instruction(aarch64_store_x(31, 31, 80)?)?;
+        assembler.instruction(aarch64_movz_x(4, 0, 0)?)?;
     }
 
     if root_plan.is_none() {
@@ -27239,18 +27235,27 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         assembler.instruction(aarch64_load_byte_reg(8, 14, 8)?)?;
         assembler.instruction(aarch64_load_byte_reg(10, 14, 10)?)?;
         assembler.instruction(aarch64_load_h_uxtw(8, 11, 8)?)?;
-        emit_v4_transition(&mut assembler, true, true)?;
+        emit_v4_transition(
+            &mut assembler,
+            true,
+            true,
+            register_complete.is_some(),
+            compact_complete,
+        )?;
         assembler.instruction(aarch64_load_h_uxtw(8, 11, 10)?)?;
-        emit_v4_transition(&mut assembler, true, true)?;
+        emit_v4_transition(
+            &mut assembler,
+            true,
+            true,
+            register_complete.is_some(),
+            compact_complete,
+        )?;
         assembler.instruction(aarch64_cmp_x(2, 9)?)?;
         assembler.branch_cond(AARCH64_LO, v4_scan)?;
 
         assembler.bind(v4_table_scan)?;
         assembler.instruction(aarch64_cmp_x(2, 3)?)?;
-        assembler.branch_cond(
-            AARCH64_HS,
-            native_complete.unwrap_or(native_no_match),
-        )?;
+        assembler.branch_cond(AARCH64_HS, compact_complete)?;
         if scanner_free_exists_pointer_cursor {
             assembler.instruction(aarch64_load_byte_imm(8, 2, 0)?)?;
         } else {
@@ -27258,8 +27263,14 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         }
         assembler.instruction(aarch64_load_byte_reg(8, 14, 8)?)?;
         assembler.instruction(aarch64_load_h_uxtw(8, 11, 8)?)?;
-        emit_v4_transition(&mut assembler, true, false)?;
-        assembler.branch(native_complete.unwrap_or(native_no_match))?;
+        emit_v4_transition(
+            &mut assembler,
+            true,
+            false,
+            register_complete.is_some(),
+            compact_complete,
+        )?;
+        assembler.branch(compact_complete)?;
     } else {
         assembler.bind(v4_scan)?;
         if let Some(root_dispatch) = root_dispatch {
@@ -27279,7 +27290,12 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         assembler.instruction(aarch64_load_byte_reg(8, 0, 2)?)?;
         assembler.instruction(aarch64_load_byte_reg(8, 14, 8)?)?;
         assembler.instruction(aarch64_load_h_uxtw(8, 11, 8)?)?;
-        emit_v4_transition_tail(&mut assembler, v4_scan)?;
+        emit_v4_transition_tail(
+            &mut assembler,
+            v4_scan,
+            register_complete.is_some(),
+            compact_complete,
+        )?;
     }
 
     if direct_byte_formats_possible {
@@ -27307,7 +27323,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         if let Some(root_setup) = root_setup {
             assembler.branch(root_setup)?;
         } else if output != OutputContract::Exists {
-            assembler.instruction(aarch64_store_x(31, 31, 80)?)?;
+            assembler.instruction(aarch64_movz_x(4, 0, 0)?)?;
         }
 
         if root_plan.is_none() {
@@ -27328,26 +27344,44 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
                 assembler.instruction(aarch64_load_byte_reg(10, 0, 12)?)?;
             }
             assembler.instruction(aarch64_load_byte_reg(8, 11, 6)?)?;
-            emit_u8_state_ordinal_transition(&mut assembler, 8, true, true)?;
+            emit_u8_state_ordinal_transition(
+                &mut assembler,
+                8,
+                true,
+                true,
+                register_complete.is_some(),
+                compact_complete,
+            )?;
             assembler.instruction(aarch64_load_byte_reg(8, 11, 10)?)?;
-            emit_u8_state_ordinal_transition(&mut assembler, 8, true, true)?;
+            emit_u8_state_ordinal_transition(
+                &mut assembler,
+                8,
+                true,
+                true,
+                register_complete.is_some(),
+                compact_complete,
+            )?;
             assembler.instruction(aarch64_cmp_x(2, 9)?)?;
             assembler.branch_cond(AARCH64_LO, v10_scan)?;
 
             assembler.bind(v10_table_scan)?;
             assembler.instruction(aarch64_cmp_x(2, 3)?)?;
-            assembler.branch_cond(
-                AARCH64_HS,
-                native_complete.unwrap_or(native_no_match),
-            )?;
+            assembler.branch_cond(AARCH64_HS, compact_complete)?;
             if scanner_free_exists_pointer_cursor {
                 assembler.instruction(aarch64_load_byte_imm(6, 2, 0)?)?;
             } else {
                 assembler.instruction(aarch64_load_byte_reg(6, 0, 2)?)?;
             }
             assembler.instruction(aarch64_load_byte_reg(8, 11, 6)?)?;
-            emit_u8_state_ordinal_transition(&mut assembler, 8, true, false)?;
-            assembler.branch(native_complete.unwrap_or(native_no_match))?;
+            emit_u8_state_ordinal_transition(
+                &mut assembler,
+                8,
+                true,
+                false,
+                register_complete.is_some(),
+                compact_complete,
+            )?;
+            assembler.branch(compact_complete)?;
         } else {
             assembler.bind(v10_scan)?;
             if let Some(root_dispatch) = root_dispatch {
@@ -27366,7 +27400,13 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             assembler.bind(v10_table_scan)?;
             assembler.instruction(aarch64_load_byte_reg(6, 0, 2)?)?;
             assembler.instruction(aarch64_load_byte_reg(8, 11, 6)?)?;
-            emit_u8_state_ordinal_transition_tail(&mut assembler, 8, v10_scan)?;
+            emit_u8_state_ordinal_transition_tail(
+                &mut assembler,
+                8,
+                v10_scan,
+                register_complete.is_some(),
+                compact_complete,
+            )?;
         }
     }
 
@@ -27405,7 +27445,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     if let Some(root_setup) = root_setup {
         assembler.branch(root_setup)?;
     } else if output != OutputContract::Exists {
-        assembler.instruction(aarch64_store_x(31, 31, 80)?)?;
+        assembler.instruction(aarch64_movz_x(4, 0, 0)?)?;
     }
 
     assembler.bind(v12_dispatch)?;
@@ -27452,9 +27492,23 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             assembler.instruction(aarch64_load_byte_reg(6, 14, 6)?)?;
             assembler.instruction(aarch64_load_byte_reg(10, 14, 10)?)?;
             assembler.instruction(aarch64_load_byte_reg(8, 11, 6)?)?;
-            emit_u8_state_ordinal_transition(&mut assembler, shift, true, true)?;
+            emit_u8_state_ordinal_transition(
+                &mut assembler,
+                shift,
+                true,
+                true,
+                register_complete.is_some(),
+                compact_complete,
+            )?;
             assembler.instruction(aarch64_load_byte_reg(8, 11, 10)?)?;
-            emit_u8_state_ordinal_transition(&mut assembler, shift, true, true)?;
+            emit_u8_state_ordinal_transition(
+                &mut assembler,
+                shift,
+                true,
+                true,
+                register_complete.is_some(),
+                compact_complete,
+            )?;
             assembler.instruction(aarch64_cmp_x(2, 9)?)?;
             assembler.branch_cond(AARCH64_LO, v12_scan)?;
             assembler.branch(
@@ -27467,17 +27521,20 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             assembler.instruction(aarch64_load_byte_reg(6, 0, 2)?)?;
             assembler.instruction(aarch64_load_byte_reg(6, 14, 6)?)?;
             assembler.instruction(aarch64_load_byte_reg(8, 11, 6)?)?;
-            emit_u8_state_ordinal_transition_tail(&mut assembler, shift, v12_scan)?;
+            emit_u8_state_ordinal_transition_tail(
+                &mut assembler,
+                shift,
+                v12_scan,
+                register_complete.is_some(),
+                compact_complete,
+            )?;
         }
     }
 
     if let Some(v12_scalar_tail) = v12_scalar_tail {
         assembler.bind(v12_scalar_tail)?;
         assembler.instruction(aarch64_cmp_x(2, 3)?)?;
-        assembler.branch_cond(
-            AARCH64_HS,
-            native_complete.unwrap_or(native_no_match),
-        )?;
+        assembler.branch_cond(AARCH64_HS, compact_complete)?;
         if scanner_free_exists_pointer_cursor {
             assembler.instruction(aarch64_load_byte_imm(6, 2, 0)?)?;
         } else {
@@ -27485,8 +27542,15 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         }
         assembler.instruction(aarch64_load_byte_reg(6, 14, 6)?)?;
         assembler.instruction(aarch64_load_byte_reg(8, 11, 6)?)?;
-        emit_u8_state_ordinal_transition(&mut assembler, 0, true, false)?;
-        assembler.branch(native_complete.unwrap_or(native_no_match))?;
+        emit_u8_state_ordinal_transition(
+            &mut assembler,
+            0,
+            true,
+            false,
+            register_complete.is_some(),
+            compact_complete,
+        )?;
+        assembler.branch(compact_complete)?;
     }
 
     assembler.bind(v3_enter)?;
@@ -27526,7 +27590,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     if let Some(root_setup) = root_setup {
         assembler.branch(root_setup)?;
     } else if output != OutputContract::Exists {
-        assembler.instruction(aarch64_store_x(31, 31, 80)?)?;
+        assembler.instruction(aarch64_movz_x(4, 0, 0)?)?;
     }
 
     assembler.bind(v3_dispatch)?;
@@ -27569,13 +27633,14 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             } else {
                 let not_accepting = assembler.label()?;
                 assembler.branch_bit_clear_w(8, 15, not_accepting)?;
-                assembler.instruction(aarch64_store_x(2, 31, 80)?)?;
+                if register_complete.is_some() {
+                    assembler.instruction(aarch64_mov_x(4, 2)?)?;
+                } else {
+                    assembler.instruction(aarch64_store_x(2, 31, 80)?)?;
+                }
                 assembler.bind(not_accepting)?;
                 assembler.instruction(aarch64_and_low_w(6, 8, 15)?)?;
-                assembler.branch_zero_w(
-                    6,
-                    native_complete.unwrap_or(native_no_match),
-                )?;
+                assembler.branch_zero_w(6, compact_complete)?;
                 assembler.instruction(aarch64_sub_w_imm(6, 6, 1)?)?;
             }
             if let Some(root_dispatch) = root_dispatch {
@@ -27633,17 +27698,14 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             emit_v3_transition(&mut assembler)?;
             assembler.instruction(aarch64_cmp_x(2, 3)?)?;
             assembler.branch_cond(AARCH64_LO, v3_scan)?;
-            assembler.branch(native_complete.unwrap_or(native_no_match))?;
+            assembler.branch(compact_complete)?;
         }
     }
 
     if let Some(v3_scalar_tail) = v3_scalar_tail {
         assembler.bind(v3_scalar_tail)?;
         assembler.instruction(aarch64_cmp_x(2, 3)?)?;
-        assembler.branch_cond(
-            AARCH64_HS,
-            native_complete.unwrap_or(native_no_match),
-        )?;
+        assembler.branch_cond(AARCH64_HS, compact_complete)?;
         if scanner_free_exists_pointer_cursor {
             assembler.instruction(aarch64_load_byte_imm(6, 2, 0)?)?;
         } else {
@@ -27657,10 +27719,10 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         } else {
             let not_accepting = assembler.label()?;
             assembler.branch_bit_clear_w(8, 15, not_accepting)?;
-            assembler.instruction(aarch64_store_x(2, 31, 80)?)?;
+            assembler.instruction(aarch64_mov_x(4, 2)?)?;
             assembler.bind(not_accepting)?;
         }
-        assembler.branch(native_complete.unwrap_or(native_no_match))?;
+        assembler.branch(compact_complete)?;
     }
 
     if direct_byte_formats_possible {
@@ -27708,14 +27770,14 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
                 } else {
                     let not_accepting = assembler.label()?;
                     assembler.branch_bit_clear_w(8, 15, not_accepting)?;
-                    if v8_register_complete.is_some() {
+                    if register_complete.is_some() {
                         assembler.instruction(aarch64_mov_x(4, 2)?)?;
                     } else {
                         assembler.instruction(aarch64_store_x(2, 31, 80)?)?;
                     }
                     assembler.bind(not_accepting)?;
                     assembler.instruction(aarch64_and_low_w(6, 8, 15)?)?;
-                    assembler.branch_zero_w(6, v8_complete)?;
+                    assembler.branch_zero_w(6, compact_complete)?;
                     assembler.instruction(aarch64_sub_w_imm(6, 6, 1)?)?;
                 }
                 if let Some(root_dispatch) = root_dispatch {
@@ -27760,7 +27822,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
 
             assembler.bind(scalar_tail)?;
             assembler.instruction(aarch64_cmp_x(2, 3)?)?;
-            assembler.branch_cond(AARCH64_HS, v8_complete)?;
+            assembler.branch_cond(AARCH64_HS, compact_complete)?;
             if scanner_free_exists_pointer_cursor {
                 assembler.instruction(aarch64_load_byte_imm(6, 2, 0)?)?;
             } else {
@@ -27776,7 +27838,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
                 assembler.instruction(aarch64_mov_x(4, 2)?)?;
                 assembler.bind(not_accepting)?;
             }
-            assembler.branch(v8_complete)?;
+            assembler.branch(compact_complete)?;
         } else {
             assembler.bind(v8_scan)?;
             if let Some(root_dispatch) = root_dispatch {
@@ -27803,15 +27865,16 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             emit_v8_transition(&mut assembler, cursor_already_advanced)?;
             assembler.instruction(aarch64_cmp_x(2, 3)?)?;
             assembler.branch_cond(AARCH64_LO, v8_scan)?;
-            assembler.branch(v8_complete)?;
+            assembler.branch(compact_complete)?;
         }
-        if let Some(complete) = v8_register_complete {
-            assembler.bind(complete)?;
-            assembler.instruction(aarch64_mov_x(7, 4)?)?;
-            assembler.instruction(aarch64_cmp_x_imm(7, 0)?)?;
-            assembler.branch_cond(AARCH64_EQ, native_no_match)?;
-            assembler.branch(native_match)?;
-        }
+    }
+
+    if let Some(complete) = register_complete {
+        assembler.bind(complete)?;
+        assembler.instruction(aarch64_mov_x(7, 4)?)?;
+        assembler.instruction(aarch64_cmp_x_imm(7, 0)?)?;
+        assembler.branch_cond(AARCH64_EQ, native_no_match)?;
+        assembler.branch(native_match)?;
     }
 
     }
@@ -30636,7 +30699,7 @@ mod tests {
             let register_endpoint_words = [
                 (aarch64_store_x(4, 31, 16).unwrap(), 0, 2),
                 (aarch64_load_x_imm(4, 31, 16).unwrap(), 0, 2),
-                (aarch64_mov_x(7, 4).unwrap(), 0, 3),
+                (aarch64_mov_x(7, 4).unwrap(), 0, 1),
             ];
             for (word, exists_count, endpoint_count) in register_endpoint_words {
                 assert_eq!(
@@ -30646,7 +30709,7 @@ mod tests {
                     } else {
                         endpoint_count
                     },
-                    "{context}: scanner-free V6/V7 keep the selected endpoint in X4 and spill it only across their loop helper"
+                    "{context}: scanner-free compact formats tail-merge the X4 endpoint while only V6/V7 spill it across their loop helper"
                 );
             }
             assert_eq!(
@@ -30706,7 +30769,7 @@ mod tests {
                         .filter(|&&candidate| candidate == word)
                         .count(),
                     expected,
-                    "{context}: rooted V6/V7 retain the frame-backed endpoint contract"
+                    "{context}: rooted compact formats retain the frame-backed endpoint contract"
                 );
             }
             assert_eq!(
@@ -47383,10 +47446,10 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 assert_eq!(
                     words[singleton..update]
                         .iter()
-                        .filter(|&&word| word == aarch64_store_x(2, 31, 80).unwrap())
+                        .filter(|&&word| word == aarch64_mov_x(4, 2).unwrap())
                         .count(),
                     1,
-                    "{context}: accepting cells publish the consumed endpoint"
+                    "{context}: accepting cells retain the consumed endpoint in X4"
                 );
                 assert!(words[singleton..update]
                     .contains(&aarch64_and_low_w(8, 8, 15).unwrap()));
