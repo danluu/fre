@@ -29411,9 +29411,6 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
 
         let reverse_loop = assembler.label()?;
         let reverse_tail = assembler.label()?;
-        let reverse_first_not_accepting = assembler.label()?;
-        let reverse_second_not_accepting = assembler.label()?;
-        let reverse_tail_not_accepting = assembler.label()?;
         let reverse_finish = assembler.label()?;
         let reverse_fallback = assembler.label()?;
 
@@ -29446,14 +29443,13 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         } else {
             assembler.instruction(aarch64_load_w_uxtw(10, 11, 16)?)?;
         }
-        assembler.branch_bit_clear_w(
-            10,
-            u8::try_from(DYNAMIC_NATIVE_ROWS_V1_ACCEPT_MASK.trailing_zeros())
-                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 reverse accept bit"))?,
-            reverse_first_not_accepting,
-        )?;
-        assembler.instruction(aarch64_add_x_imm(13, 12, 1)?)?;
-        assembler.bind(reverse_first_not_accepting)?;
+        // Complete reverse rows have no hole sentinel. As in the forward V2
+        // loop, CMN(cell, 1) therefore leaves N set exactly for an accepting
+        // cell. Select the candidate without a data-dependent branch; X16's
+        // first input class is dead once the cell has loaded.
+        assembler.instruction(aarch64_add_x_imm(16, 12, 1)?)?;
+        assembler.instruction(aarch64_cmn_w_imm(10, 1)?)?;
+        assembler.instruction(aarch64_csel_x(13, 16, 13, AARCH64_MI)?)?;
         assembler.instruction(aarch64_and_low_w(
             10,
             10,
@@ -29469,14 +29465,8 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         } else {
             assembler.instruction(aarch64_load_w_uxtw(10, 11, 17)?)?;
         }
-        assembler.branch_bit_clear_w(
-            10,
-            u8::try_from(DYNAMIC_NATIVE_ROWS_V1_ACCEPT_MASK.trailing_zeros())
-                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 reverse accept bit"))?,
-            reverse_second_not_accepting,
-        )?;
-        assembler.instruction(aarch64_mov_x(13, 12)?)?;
-        assembler.bind(reverse_second_not_accepting)?;
+        assembler.instruction(aarch64_cmn_w_imm(10, 1)?)?;
+        assembler.instruction(aarch64_csel_x(13, 12, 13, AARCH64_MI)?)?;
         assembler.instruction(aarch64_and_low_w(
             10,
             10,
@@ -29503,14 +29493,8 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         } else {
             assembler.instruction(aarch64_load_w_uxtw(10, 11, 16)?)?;
         }
-        assembler.branch_bit_clear_w(
-            10,
-            u8::try_from(DYNAMIC_NATIVE_ROWS_V1_ACCEPT_MASK.trailing_zeros())
-                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 reverse accept bit"))?,
-            reverse_tail_not_accepting,
-        )?;
-        assembler.instruction(aarch64_mov_x(13, 12)?)?;
-        assembler.bind(reverse_tail_not_accepting)?;
+        assembler.instruction(aarch64_cmn_w_imm(10, 1)?)?;
+        assembler.instruction(aarch64_csel_x(13, 12, 13, AARCH64_MI)?)?;
         assembler.instruction(aarch64_and_low_w(
             10,
             10,
@@ -31192,6 +31176,23 @@ mod tests {
         assert_eq!(word_occurrences(&arm_zero.code, arm_map_load), 0);
         assert_eq!(word_occurrences(&arm_identity.code, arm_map_load), 0);
         assert_eq!(word_occurrences(&arm_mapped.code, arm_map_load), 2);
+        let arm_reverse_first_select = aarch64_csel_x(13, 16, 13, AARCH64_MI).unwrap();
+        let arm_reverse_later_select = aarch64_csel_x(13, 12, 13, AARCH64_MI).unwrap();
+        let arm_reverse_accept_test = aarch64_cmn_w_imm(10, 1).unwrap();
+        for emission in [&arm_zero, &arm_mapped, &arm_identity] {
+            assert_eq!(
+                word_occurrences(&emission.code, arm_reverse_first_select),
+                1
+            );
+            assert_eq!(
+                word_occurrences(&emission.code, arm_reverse_later_select),
+                2
+            );
+            assert_eq!(
+                word_occurrences(&emission.code, arm_reverse_accept_test),
+                3
+            );
+        }
         let arm_identity_relocations = |emission: &NativeDynamicRowsEmission| {
             emission
                 .relocations
