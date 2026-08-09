@@ -3043,6 +3043,77 @@ impl FrozenStaticContinuationRowsStorageV1 {
     }
 }
 
+/// Authenticated input to one immutable compact-row continuation.
+///
+/// The projection is deliberately independent of any compact generation's
+/// physical row geometry. It is the narrow seam between graph/cache lineage
+/// validation and row execution. Constructing a projection does not retire
+/// the admitted single-use ticket; only a completed continuation may do so.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FrozenStaticPrefixResumeProjection {
+    program_instance: u64,
+    descriptor_binding: usize,
+    window: SearchWindow,
+    resume_position: usize,
+    canonical_state: usize,
+    pending_end: Option<usize>,
+    cache_identity: u64,
+    format_version: u32,
+    fully_prefilled: FullyPrefilledFallbackReceipt,
+}
+
+impl FrozenStaticPrefixResumeProjection {
+    /// First byte in the exact admitted search window.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn window_start(self) -> usize {
+        self.window.start
+    }
+
+    /// Exclusive end of the exact admitted search window.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn window_end(self) -> usize {
+        self.window.end
+    }
+
+    /// First byte not consumed by the compiler-owned static prefix.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn resume_position(self) -> usize {
+        self.resume_position
+    }
+
+    /// Zero-based canonical compact state selected by the static frontier.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn canonical_state(self) -> usize {
+        self.canonical_state
+    }
+
+    /// Pending selected endpoint carried by the static frontier, when any.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn pending_end(self) -> Option<usize> {
+        self.pending_end
+    }
+
+    /// Process-private cache identity shared with the immutable owner.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn cache_identity(self) -> u64 {
+        self.cache_identity
+    }
+
+    /// Exact compact row generation authenticated for this projection.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn format_version(self) -> u32 {
+        self.format_version
+    }
+}
+
 /// Result of continuing an already-consumed static prefix in an immutable
 /// supertransition table.  The endpoint is sufficient for every value
 /// contract: `Exists` observes only presence, `SelectedEnd` returns it directly,
@@ -4836,6 +4907,22 @@ impl FrozenPreparedHeaderV6 {
                     && rows.compact.ready_seal == FROZEN_PREPARED_HEADER_V14_READY_SEAL
             }
             _ => false,
+        }
+    }
+
+    /// Return the exact compact generation selected by this active header.
+    ///
+    /// This is a compiler-private routing receipt: generated continuation
+    /// code must dispatch the generation actually published at offset zero,
+    /// which can differ from the owner's underlying V3/V4 rows when a V5,
+    /// V6, or V7 summary/loop overlay is selected.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn compiler_private_dynamic_rows_format_version(&self) -> Option<u32> {
+        if self.has_dynamic_rows() {
+            Some(self.dynamic_rows_v6.compact.format_version)
+        } else {
+            None
         }
     }
 
@@ -11844,23 +11931,18 @@ impl CompiledProgram {
         Ok(newly_published)
     }
 
-    /// Try to continue a compiler-owned static prefix in the immutable
-    /// setup-time compact table instead of replaying the same fully-prefilled
-    /// K0 rows through the scalar portable loop.
+    /// Project one compiler-owned static hole into an immutable compact state.
     ///
-    /// Admission is format- and lineage-driven, not pattern-driven. The
-    /// static descriptor's exact frontier is mapped through the authenticated
-    /// resume cache into the canonical state numbering used by the frozen
-    /// owner. Any missing proof or unsupported compact generation declines
-    /// without consuming the single-use ticket, allowing the established K0
-    /// continuation to run unchanged.
+    /// This performs every graph, cache-lineage, selected-frontier, and owner
+    /// check needed before a row executor may follow the immutable sidecar.
+    /// It does not decode a row or consume the single-use continuation ticket.
     #[doc(hidden)]
     #[allow(
         clippy::too_many_arguments,
         clippy::too_many_lines,
-        reason = "the private continuation binds one exact artifact, owner, ticket, and native frontier"
+        reason = "the private projection binds one exact artifact, owner, ticket, and native frontier"
     )]
-    pub fn try_search_from_static_prefix_resume_ticket_with_frozen_rows(
+    pub fn try_project_static_prefix_resume_ticket_with_frozen_rows(
         &self,
         haystack: &[u8],
         workspace: &mut ProgramWorkspace,
@@ -11868,7 +11950,7 @@ impl CompiledProgram {
         resume_state: usize,
         resume_position: usize,
         pending_end_word: usize,
-    ) -> Result<Option<MatchResult>, CompileError> {
+    ) -> Result<Option<FrozenStaticPrefixResumeProjection>, CompileError> {
         if !workspace.identity.compatible(&self.identity)
             || self.context_dfa.is_some()
             || !matches!(self.engine, ProgramEngine::OrderedNfa)
@@ -11903,7 +11985,6 @@ impl CompiledProgram {
         let ProgramWorkspace {
             nfa,
             static_prefix_resume,
-            dynamic_native_rows,
             ..
         } = workspace;
         let state = static_prefix_resume.as_deref_mut().ok_or(
@@ -11990,14 +12071,96 @@ impl CompiledProgram {
         {
             return Ok(None);
         }
-        let canonical_state =
-            canonicalize_frozen_state_ordinal(source_state, source_initial_state);
+        Ok(Some(FrozenStaticPrefixResumeProjection {
+            program_instance: self.identity.instance,
+            descriptor_binding: state.descriptor_binding,
+            window,
+            resume_position,
+            canonical_state: canonicalize_frozen_state_ordinal(
+                source_state,
+                source_initial_state,
+            ),
+            pending_end,
+            cache_identity: mapping.cache_identity(),
+            format_version: owner.descriptor.format_version,
+            fully_prefilled,
+        }))
+    }
+
+    /// Retire the one-shot admission represented by an authenticated compact
+    /// projection before transferring execution to its row engine.
+    #[doc(hidden)]
+    #[inline]
+    pub fn consume_static_prefix_resume_projection_with_workspace(
+        &self,
+        haystack: &[u8],
+        workspace: &mut ProgramWorkspace,
+        projection: FrozenStaticPrefixResumeProjection,
+    ) -> Result<(), CompileError> {
+        let ProgramWorkspace {
+            static_prefix_resume,
+            dynamic_native_rows,
+            ..
+        } = workspace;
+        let state = static_prefix_resume.as_deref_mut().ok_or(
+            CompileError::InternalInvariant(
+                "static-prefix frozen projection has no graph-bound sidecar",
+            ),
+        )?;
+        let admitted_window = state.peek(haystack)?;
+        if projection.program_instance != self.identity.instance
+            || state.descriptor_binding != projection.descriptor_binding
+            || state.fully_prefilled != Some(projection.fully_prefilled)
+            || admitted_window != projection.window
+        {
+            return Err(CompileError::InternalInvariant(
+                "static-prefix frozen projection no longer matches its admission",
+            ));
+        }
+        let consumed_window = state.consume(haystack)?;
+        debug_assert_eq!(consumed_window, projection.window);
+        if let Some(dynamic) = dynamic_native_rows.as_deref_mut() {
+            dynamic.native_rows_dirty = true;
+        }
+        Ok(())
+    }
+
+    /// Try to continue a compiler-owned static prefix in the immutable
+    /// setup-time compact table instead of replaying the same fully-prefilled
+    /// K0 rows through the scalar portable loop.
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the private continuation binds one exact artifact, owner, ticket, and native frontier"
+    )]
+    pub fn try_search_from_static_prefix_resume_ticket_with_frozen_rows(
+        &self,
+        haystack: &[u8],
+        workspace: &mut ProgramWorkspace,
+        owner: &FrozenDynamicRowsStorageV3,
+        resume_state: usize,
+        resume_position: usize,
+        pending_end_word: usize,
+    ) -> Result<Option<MatchResult>, CompileError> {
+        let Some(projection) = self
+            .try_project_static_prefix_resume_ticket_with_frozen_rows(
+                haystack,
+                workspace,
+                owner,
+                resume_state,
+                resume_position,
+                pending_end_word,
+            )?
+        else {
+            return Ok(None);
+        };
         let Some(forward) = owner.static_prefix_forward_from_canonical_state(
             haystack,
-            resume_position,
-            window.end,
-            canonical_state,
-            pending_end,
+            projection.resume_position,
+            projection.window.end,
+            projection.canonical_state,
+            projection.pending_end,
             self.output,
         ) else {
             return Ok(None);
@@ -12005,15 +12168,21 @@ impl CompiledProgram {
 
         // Only a successfully authenticated and completed immutable scan owns
         // the ticket. Every decline above leaves it available to K0.
-        let consumed_window = state.consume(haystack)?;
-        if consumed_window != window {
-            return Err(CompileError::InternalInvariant(
-                "static-prefix frozen continuation consumed a different window",
-            ));
-        }
-        if let Some(dynamic) = dynamic_native_rows.as_deref_mut() {
-            dynamic.native_rows_dirty = true;
-        }
+        self.consume_static_prefix_resume_projection_with_workspace(
+            haystack,
+            workspace,
+            projection,
+        )?;
+        let ProgramWorkspace {
+            nfa,
+            static_prefix_resume,
+            ..
+        } = workspace;
+        let state = static_prefix_resume.as_deref_mut().ok_or(
+            CompileError::InternalInvariant(
+                "static-prefix frozen continuation has no graph-bound sidecar",
+            ),
+        )?;
 
         let found = match self.output {
             OutputContract::Exists => MatchResult::Exists(forward.selected_end.is_some()),
@@ -12028,7 +12197,7 @@ impl CompiledProgram {
                             "static-prefix frozen continuation endpoint precedes exact width",
                         ),
                     )?;
-                    if start < window.start {
+                    if start < projection.window.start {
                         return Err(CompileError::InternalInvariant(
                             "static-prefix frozen continuation exact start precedes its window",
                         ));
@@ -12037,13 +12206,13 @@ impl CompiledProgram {
                 } else {
                     let recovered_start = self.recover_partial_span_start(
                         haystack,
-                        window,
+                        projection.window,
                         nfa.as_mut().ok_or(CompileError::InternalInvariant(
                             "static-prefix frozen continuation has no reverse K0 workspace",
                         ))?,
                         Some(&state.resume),
                         selected_end,
-                        state.fully_prefilled,
+                        Some(projection.fully_prefilled),
                     )?;
                     MatchResult::Span(Some((recovered_start, selected_end)))
                 }

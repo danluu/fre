@@ -80,6 +80,11 @@ use std::sync::{Arc, Mutex, OnceLock, TryLockError};
 use fre_aot_regex::{
     CompileError, CompiledProgram, FrozenCompactLoopScanner, FrozenDynamicRowsStorageV3,
     FrozenPreparedHeaderV6, FullyPrefilledFallbackReceipt, MatchResult, OutputContract,
+    FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION, FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION,
+    FROZEN_DYNAMIC_ROWS_V8_FORMAT_VERSION, FROZEN_DYNAMIC_ROWS_V9_FORMAT_VERSION,
+    FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION, FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION,
+    FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION, FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION,
+    FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION,
     PROGRAM_HEADER_LEN, ProgramFormatError, ProgramWorkspace, RetainedPartialPreflight,
     STATIC_PREFIX_RESUME_DESCRIPTOR_V1_HEADER_BYTES,
     STATIC_PREFIX_RESUME_DESCRIPTOR_V1_MAX_BYTES, SearchWindow,
@@ -101,6 +106,9 @@ pub const STATUS_HANDLE_BUSY: u32 = 4;
 pub const STATUS_INVALID_HANDLE: u32 = 5;
 /// Native retained rows were admitted on the returned exact search window.
 pub const STATUS_PARTIAL_PREFLIGHT_ENTER: u32 = 6;
+/// Compiler-private status selecting an authenticated local static-resume tail.
+#[doc(hidden)]
+pub const STATUS_STATIC_PREFIX_NATIVE_RESUME: u32 = 7;
 /// Successful status for prepare and destroy lifecycle operations.
 pub const STATUS_SUCCESS: u32 = 0;
 /// Bytes in the exact SHA-256 semantic-artifact identity accepted by resume.
@@ -871,6 +879,95 @@ impl PreparedAotRegex {
                 );
         }
         Ok(())
+    }
+
+    /// Authenticate one immutable compact continuation and publish the exact
+    /// offset-zero header consumed by the generated local tail.  The returned
+    /// words are physical-layout independent: canonical state and an optional
+    /// pending endpoint encoded with zero as the absent sentinel.
+    fn project_static_prefix_resume_to_frozen_owner(
+        &mut self,
+        haystack: &[u8],
+        resume_state: usize,
+        resume_position: usize,
+        pending_end: usize,
+    ) -> Result<Option<(usize, usize)>, CompileError> {
+        let Some(owner) = self.frozen_dynamic_rows.as_ref() else {
+            return Ok(None);
+        };
+        let Some(projection) = self
+            .program
+            .try_project_static_prefix_resume_ticket_with_frozen_rows(
+                haystack,
+                &mut self.workspace,
+                owner,
+                resume_state,
+                resume_position,
+                pending_end,
+            )?
+        else {
+            return Ok(None);
+        };
+        if !matches!(
+            projection.format_version(),
+            FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION
+                | FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION
+                | FROZEN_DYNAMIC_ROWS_V8_FORMAT_VERSION
+                | FROZEN_DYNAMIC_ROWS_V9_FORMAT_VERSION
+                | FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION
+                | FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION
+                | FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION
+                | FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION
+                | FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION
+        ) {
+            return Ok(None);
+        }
+        let header = self.program.compiler_private_frozen_prepared_header_v6(
+            &self.workspace,
+            None,
+            Some(owner),
+        );
+        let Some(header_format) = header.compiler_private_dynamic_rows_format_version() else {
+            return Ok(None);
+        };
+        if header_format != projection.format_version()
+            || !matches!(
+                header_format,
+                FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION
+                    | FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION
+                    | FROZEN_DYNAMIC_ROWS_V8_FORMAT_VERSION
+                    | FROZEN_DYNAMIC_ROWS_V9_FORMAT_VERSION
+                    | FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION
+                    | FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION
+                    | FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION
+                    | FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION
+                    | FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION
+            )
+        {
+            return Ok(None);
+        }
+        let canonical_state = projection.canonical_state();
+        let pending_end = match projection.pending_end() {
+            None => 0,
+            Some(0) => {
+                return Err(CompileError::InternalInvariant(
+                    "static-prefix native projection cannot encode a zero pending endpoint",
+                ));
+            }
+            Some(pending_end) => pending_end,
+        };
+        self.program
+            .consume_static_prefix_resume_projection_with_workspace(
+                haystack,
+                &mut self.workspace,
+                projection,
+            )?;
+        // The exclusive ABI permits no concurrent access. Replacing the
+        // previously revoked value publishes this newly authenticated owner
+        // generation at the same stable offset-zero address before native
+        // execution resumes synchronously.
+        self.frozen_header = header;
+        Ok(Some((canonical_state, pending_end)))
     }
 
     fn search_from_static_prefix_resume_ticket(
@@ -2003,6 +2100,22 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_compiler_private_search_exclusive
         ) else {
             return STATUS_RUNTIME_FAILURE;
         };
+        match prepared.project_static_prefix_resume_to_frozen_owner(
+            haystack,
+            resume_state,
+            resume_position,
+            pending_end,
+        ) {
+            Ok(Some((canonical_state, pending_end))) => {
+                result_ptr.write(FreAotRegexResultV1 {
+                    start: canonical_state,
+                    end: pending_end,
+                });
+                return STATUS_STATIC_PREFIX_NATIVE_RESUME;
+            }
+            Ok(None) => {}
+            Err(_) => return STATUS_RUNTIME_FAILURE,
+        }
         let Ok(found) = prepared.search_from_static_prefix_resume_ticket(
             haystack,
             resume_state,
@@ -3755,6 +3868,33 @@ mod tests {
         .unwrap_or_else(|error| panic!("compile {mode:?} {pattern:?}: {error}"));
         let bytes = compiled.program().serialize().expect("serialize program");
         PreparedAotRegex::deserialize(&bytes).expect("prepare program")
+    }
+
+    #[test]
+    fn prepared_header_reports_actual_overlay_generation() {
+        let overlay = prepared(
+            r"A(?-u:[^Z])*Z|[b-c][a-b]{1,5}(?:x+|y+)",
+            OutputContract::SelectedEnd,
+            CompileMode::Fast,
+        );
+        assert_eq!(
+            overlay
+                .frozen_header
+                .compiler_private_dynamic_rows_format_version(),
+            Some(fre_aot_regex::FROZEN_DYNAMIC_ROWS_V7_FORMAT_VERSION)
+        );
+
+        let plain = prepared(
+            r"(?-u:(?:a|[^a][\x00-\xff]){4})",
+            OutputContract::SelectedEnd,
+            CompileMode::Fast,
+        );
+        assert_eq!(
+            plain
+                .frozen_header
+                .compiler_private_dynamic_rows_format_version(),
+            Some(FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION)
+        );
     }
 
     fn collected_spans(prepared: &mut PreparedAotRegex, haystack: &[u8]) -> Vec<(usize, usize)> {
