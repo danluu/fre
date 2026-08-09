@@ -14745,10 +14745,8 @@ fn x86_emit_frozen_dynamic_entry(
         assembler.bind(checked)?;
     }
 
-    assembler.instruction(&[0x4c, 0x8b, 0x54, 0x24, 0x28])?;
-    assembler.instruction(&[0x4c, 0x89, 0x54, 0x24, 0x40])?;
-    assembler.instruction(&[0x4c, 0x8b, 0x54, 0x24, 0x30])?;
-    assembler.instruction(&[0x4c, 0x89, 0x54, 0x24, 0x48])?;
+    // The caller installed the original window in the private record before
+    // selecting any frozen format. Keep it in place for this direct V2 entry.
     assembler.instruction(&[0x4c, 0x89, 0x5c, 0x24, 0x50])?;
     assembler.instruction(&[0x4d, 0x8b, 0x53, NATIVE_ROWS_CACHE_IDENTITY as u8])?;
     assembler.instruction(&[0x4c, 0x89, 0x54, 0x24, 0x58])?;
@@ -15108,16 +15106,15 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     assembler.branch(&[0x0f, 0x84], short_fallback)?;
     assembler.instruction(&[0x4c, 0x39, 0xc2])?;
     assembler.branch(&[0x0f, 0x82], short_fallback)?;
-    // Entry RSP is 8 modulo 16. The frame aligns calls, retains all six
-    // public arguments, and reserves the four-word private preflight record.
-    // Root-scanner entries also retain one representation tag/pointer and,
-    // when continuation accounting is active, one callee-saved hit counter.
+    // Entry RSP is 8 modulo 16. The frame aligns calls, retains the four
+    // public arguments needed after entry, and reserves the private preflight
+    // record whose first two words are the authoritative window. Root-scanner
+    // entries also retain one representation tag/pointer and, when
+    // continuation accounting is active, one callee-saved hit counter.
     assembler.instruction(&[0x48, 0x83, 0xec, frame_bytes])?;
     assembler.instruction(&[0x48, 0x89, 0x7c, 0x24, 0x10])?;
     assembler.instruction(&[0x48, 0x89, 0x74, 0x24, 0x18])?;
     assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x20])?;
-    assembler.instruction(&[0x48, 0x89, 0x4c, 0x24, 0x28])?;
-    assembler.instruction(&[0x4c, 0x89, 0x44, 0x24, 0x30])?;
     assembler.instruction(&[0x4c, 0x89, 0x4c, 0x24, 0x38])?;
     if tracks_root_scanner_hits {
         // Save the caller's R12, then use it as a register-resident hit
@@ -15267,8 +15264,8 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     // profitable and safe for every nonempty window. Keep the historical
     // crossover only for V1/V2 and cold mutable rows, after every compact
     // generation has had an opportunity to authenticate and enter.
-    assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, 0x30])?;
-    assembler.instruction(&[0x48, 0x2b, 0x44, 0x24, 0x28])?;
+    assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, 0x48])?;
+    assembler.instruction(&[0x48, 0x2b, 0x44, 0x24, 0x40])?;
     let minimum = u32::try_from(DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES)
         .map_err(|_| ObjectError::ArithmeticOverflow("dynamic row input floor"))?;
     let mut compare_minimum = vec![0x48, 0x3d];
@@ -15280,8 +15277,8 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         // bypass the historical scanner-free ceiling. V1/V2 headers still
         // hand long windows to the canonical executor before following their
         // mutable descriptors.
-        assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, 0x30])?;
-        assembler.instruction(&[0x48, 0x2b, 0x44, 0x24, 0x28])?;
+        assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, 0x48])?;
+        assembler.instruction(&[0x48, 0x2b, 0x44, 0x24, 0x40])?;
         let maximum = u32::try_from(FROZEN_SCANNER_FREE_DYNAMIC_ROWS_MAX_INPUT_BYTES)
             .map_err(|_| ObjectError::ArithmeticOverflow("frozen dynamic row input ceiling"))?;
         let mut compare_maximum = vec![0x48, 0x3d];
@@ -15313,8 +15310,8 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         // Capability authentication failures and cold mutable rows preserve
         // the same ceiling. Reaching this label proves that no closed compact
         // table was selected above.
-        assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, 0x30])?;
-        assembler.instruction(&[0x48, 0x2b, 0x44, 0x24, 0x28])?;
+        assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, 0x48])?;
+        assembler.instruction(&[0x48, 0x2b, 0x44, 0x24, 0x40])?;
         let maximum = u32::try_from(FROZEN_SCANNER_FREE_DYNAMIC_ROWS_MAX_INPUT_BYTES)
             .map_err(|_| ObjectError::ArithmeticOverflow("dynamic preflight input ceiling"))?;
         let mut compare_maximum = vec![0x48, 0x3d];
@@ -15325,8 +15322,8 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x10])?;
     assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x18])?;
     assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x20])?;
-    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x28])?;
-    assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x30])?;
+    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x40])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x48])?;
     assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x38])?;
     assembler.instruction(&[0x48, 0x8d, 0x44, 0x24, 0x40])?;
     assembler.instruction(&[0x48, 0x89, 0x44, 0x24, 0x08])?;
@@ -15352,8 +15349,8 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         // length; this reads neither haystack bytes nor compact rows.
         assembler.instruction(&[0x45, 0x85, 0xd2])?;
         assembler.branch(&[0x0f, 0x84], native_no_match)?;
-        assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, 0x30])?;
-        assembler.instruction(&[0x48, 0x2b, 0x44, 0x24, 0x28])?;
+        assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, 0x48])?;
+        assembler.instruction(&[0x48, 0x2b, 0x44, 0x24, 0x40])?;
         assembler.instruction(&[0x4c, 0x39, 0xd0])?;
         assembler.branch(&[0x0f, 0x82], native_no_match)?;
         assembler.branch(&[0xe9], native_match)?;
@@ -18035,14 +18032,13 @@ fn lower_x86_64_partial_prepared(
     assembler.instruction(&compare_minimum)?;
     assembler.branch(&[0x0f, 0x82], fallback_runtime)?;
 
-    // Entry RSP is 8 modulo 16. An 88-byte frame aligns it for calls, reserves
-    // two SysV private arguments, and leaves two exact-window outputs.
+    // Entry RSP is 8 modulo 16. An 88-byte frame aligns it for calls, retains
+    // only the public arguments needed after preflight, reserves two SysV
+    // private arguments, and leaves two exact-window outputs.
     assembler.instruction(&[0x48, 0x83, 0xec, FRAME_BYTES])?;
     assembler.instruction(&[0x48, 0x89, 0x7c, 0x24, 0x10])?;
     assembler.instruction(&[0x48, 0x89, 0x74, 0x24, 0x18])?;
     assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x20])?;
-    assembler.instruction(&[0x48, 0x89, 0x4c, 0x24, 0x28])?;
-    assembler.instruction(&[0x4c, 0x89, 0x44, 0x24, 0x30])?;
     assembler.instruction(&[0x4c, 0x89, 0x4c, 0x24, 0x38])?;
 
     // One authenticated runtime transaction settles the prior local native
@@ -25643,10 +25639,8 @@ fn aarch64_emit_frozen_dynamic_entry(
         assembler.bind(checked)?;
     }
 
-    assembler.instruction(aarch64_load_x_imm(8, 31, 24)?)?;
-    assembler.instruction(aarch64_store_x(8, 31, 48)?)?;
-    assembler.instruction(aarch64_load_x_imm(8, 31, 32)?)?;
-    assembler.instruction(aarch64_store_x(8, 31, 56)?)?;
+    // The caller installed the original window in the private record before
+    // selecting any frozen format. Keep it in place for this direct V2 entry.
     assembler.instruction(aarch64_store_x(13, 31, 64)?)?;
     assembler.instruction(aarch64_load_x_imm(
         8,
@@ -26056,8 +26050,9 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         assembler.instruction(aarch64_store_x(30, 31, link_offset)?)?;
     }
     assembler.instruction(aarch64_store_pair_x(0, 1, 31, 0)?)?;
-    assembler.instruction(aarch64_store_pair_x(2, 3, 31, 16)?)?;
-    assembler.instruction(aarch64_store_pair_x(4, 5, 31, 32)?)?;
+    // Retain length and result together; start/end live in the private
+    // preflight record from entry through either compact or admitted rows.
+    assembler.instruction(aarch64_store_pair_x(2, 5, 31, 16)?)?;
     if tracks_root_scanner_hits {
         assembler.instruction(aarch64_movz_w(19, 0)?)?;
     }
@@ -26078,8 +26073,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     // Preserve the exact public window before any compact guard repurposes
     // caller-saved registers. Preflight may overwrite these two record words;
     // a V3--V14 variable-Span match carries them unchanged to postflight.
-    assembler.instruction(aarch64_store_x(3, 31, 48)?)?;
-    assembler.instruction(aarch64_store_x(4, 31, 56)?)?;
+    assembler.instruction(aarch64_store_pair_x(3, 4, 31, 48)?)?;
 
     // Keep this compile-time gate paired with the compact bodies. Every
     // current dynamic-row output supports immutable rows; variable Span uses
@@ -26198,8 +26192,8 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     // profitable and safe for every nonempty window. Keep the historical
     // crossover only for V1/V2 and cold mutable rows, after every compact
     // generation has had an opportunity to authenticate and enter.
-    assembler.instruction(aarch64_load_x_imm(8, 31, 32)?)?;
-    assembler.instruction(aarch64_load_x_imm(9, 31, 24)?)?;
+    assembler.instruction(aarch64_load_x_imm(8, 31, 56)?)?;
+    assembler.instruction(aarch64_load_x_imm(9, 31, 48)?)?;
     assembler.instruction(aarch64_sub_x_reg(8, 8, 9)?)?;
     let minimum = u16::try_from(DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES)
         .map_err(|_| ObjectError::ArithmeticOverflow("dynamic row input floor"))?;
@@ -26210,8 +26204,8 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         // retain a scanner-free long window. V1/V2 descriptors preserve the
         // canonical
         // K0 crossover before any mutable row address is followed.
-        assembler.instruction(aarch64_load_x_imm(8, 31, 32)?)?;
-        assembler.instruction(aarch64_load_x_imm(9, 31, 24)?)?;
+        assembler.instruction(aarch64_load_x_imm(8, 31, 56)?)?;
+        assembler.instruction(aarch64_load_x_imm(9, 31, 48)?)?;
         assembler.instruction(aarch64_sub_x_reg(8, 8, 9)?)?;
         let maximum = u16::try_from(FROZEN_SCANNER_FREE_DYNAMIC_ROWS_MAX_INPUT_BYTES)
             .map_err(|_| ObjectError::ArithmeticOverflow("frozen dynamic row input ceiling"))?;
@@ -26236,8 +26230,8 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         // Failed compact capability authentication and every cold/mutable
         // preflight keep the historical ceiling. Valid compact entries cannot
         // reach here.
-        assembler.instruction(aarch64_load_x_imm(8, 31, 32)?)?;
-        assembler.instruction(aarch64_load_x_imm(9, 31, 24)?)?;
+        assembler.instruction(aarch64_load_x_imm(8, 31, 56)?)?;
+        assembler.instruction(aarch64_load_x_imm(9, 31, 48)?)?;
         assembler.instruction(aarch64_sub_x_reg(8, 8, 9)?)?;
         let maximum = u16::try_from(FROZEN_SCANNER_FREE_DYNAMIC_ROWS_MAX_INPUT_BYTES)
             .map_err(|_| ObjectError::ArithmeticOverflow("dynamic preflight input ceiling"))?;
@@ -26245,8 +26239,8 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         assembler.branch_cond(AARCH64_HI, framed_short_fallback)?;
     }
     assembler.instruction(aarch64_load_pair_x(0, 1, 31, 0)?)?;
-    assembler.instruction(aarch64_load_pair_x(2, 3, 31, 16)?)?;
-    assembler.instruction(aarch64_load_pair_x(4, 5, 31, 32)?)?;
+    assembler.instruction(aarch64_load_pair_x(2, 5, 31, 16)?)?;
+    assembler.instruction(aarch64_load_pair_x(3, 4, 31, 48)?)?;
     assembler.instruction(aarch64_load_x_imm(6, 31, 80)?)?;
     assembler.instruction(aarch64_add_x_imm(7, 31, 48)?)?;
     let preflight_branch = assembler.instruction(0x9400_0000)?;
@@ -26269,8 +26263,8 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         // W7 is the authenticated one-based first accepting step. Zero means
         // the unique orbit never accepts. Only window bounds are read here.
         assembler.branch_zero_w(7, native_no_match)?;
-        assembler.instruction(aarch64_load_x_imm(8, 31, 32)?)?;
-        assembler.instruction(aarch64_load_x_imm(9, 31, 24)?)?;
+        assembler.instruction(aarch64_load_x_imm(8, 31, 56)?)?;
+        assembler.instruction(aarch64_load_x_imm(9, 31, 48)?)?;
         assembler.instruction(aarch64_sub_x_reg(8, 8, 9)?)?;
         assembler.instruction(aarch64_cmp_x(8, 7)?)?;
         assembler.branch_cond(AARCH64_LO, native_no_match)?;
@@ -28709,7 +28703,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
 
     assembler.bind(native_no_match)?;
     assembler.instruction(aarch64_movz_w(0, 0)?)?;
-    assembler.instruction(aarch64_load_x_imm(5, 31, 40)?)?;
+    assembler.instruction(aarch64_load_x_imm(5, 31, 24)?)?;
     assembler.instruction(aarch64_store_pair_x(31, 31, 5, 0)?)?;
     restore_frame_link(&mut assembler)?;
     assembler.instruction(aarch64_add_x_imm(31, 31, frame_bytes)?)?;
@@ -28717,7 +28711,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
 
     let mut span_recovery_relocation_offsets = None;
     assembler.bind(native_match)?;
-    assembler.instruction(aarch64_load_x_imm(5, 31, 40)?)?;
+    assembler.instruction(aarch64_load_x_imm(5, 31, 24)?)?;
     match output {
         OutputContract::Exists => {
             assembler.instruction(aarch64_store_pair_x(31, 31, 5, 0)?)?;
@@ -28733,9 +28727,8 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             let identity_page_offset =
                 assembler.instruction(aarch64_add_x_imm(6, 6, 0)?)?;
             assembler.instruction(aarch64_load_pair_x(0, 1, 31, 0)?)?;
-            assembler.instruction(aarch64_load_x_imm(2, 31, 16)?)?;
+            assembler.instruction(aarch64_load_pair_x(2, 5, 31, 16)?)?;
             assembler.instruction(aarch64_load_pair_x(3, 4, 31, 48)?)?;
-            assembler.instruction(aarch64_load_x_imm(5, 31, 40)?)?;
             let runtime_branch = assembler.instruction(0x9400_0000)?;
             restore_frame_link(&mut assembler)?;
             assembler.instruction(aarch64_add_x_imm(31, 31, frame_bytes)?)?;
@@ -28812,8 +28805,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         continuation_identity_page_offset = Some(identity_page_offset);
         assembler.instruction(aarch64_add_x_imm(7, 31, 48)?)?;
         assembler.instruction(aarch64_load_pair_x(0, 1, 31, 0)?)?;
-        assembler.instruction(aarch64_load_x_imm(2, 31, 16)?)?;
-        assembler.instruction(aarch64_load_x_imm(5, 31, 40)?)?;
+        assembler.instruction(aarch64_load_pair_x(2, 5, 31, 16)?)?;
         continuation_branch = Some(assembler.instruction(0x9400_0000)?);
         restore_frame_link(&mut assembler)?;
         assembler.instruction(aarch64_add_x_imm(31, 31, frame_bytes)?)?;
@@ -28828,18 +28820,16 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
     assembler.branch_cond(AARCH64_NE, adaptive_fallback)?;
     assembler.bind(framed_short_fallback)?;
     assembler.instruction(aarch64_load_pair_x(0, 1, 31, 0)?)?;
-    assembler.instruction(aarch64_load_x_imm(2, 31, 16)?)?;
+    assembler.instruction(aarch64_load_pair_x(2, 5, 31, 16)?)?;
     assembler.instruction(aarch64_load_pair_x(3, 4, 31, 48)?)?;
-    assembler.instruction(aarch64_load_x_imm(5, 31, 40)?)?;
     restore_frame_link(&mut assembler)?;
     assembler.instruction(aarch64_add_x_imm(31, 31, frame_bytes)?)?;
     assembler.branch(short_fallback)?;
 
     assembler.bind(adaptive_fallback)?;
     assembler.instruction(aarch64_load_pair_x(0, 1, 31, 0)?)?;
-    assembler.instruction(aarch64_load_x_imm(2, 31, 16)?)?;
+    assembler.instruction(aarch64_load_pair_x(2, 5, 31, 16)?)?;
     assembler.instruction(aarch64_load_pair_x(3, 4, 31, 48)?)?;
-    assembler.instruction(aarch64_load_x_imm(5, 31, 40)?)?;
     restore_frame_link(&mut assembler)?;
     assembler.instruction(aarch64_add_x_imm(31, 31, frame_bytes)?)?;
     let deopt_branch = assembler.instruction(0x1400_0000)?;
@@ -29102,8 +29092,9 @@ fn lower_aarch64_partial_prepared(
     assembler.instruction(aarch64_sub_x_imm(31, 31, FRAME_BYTES)?)?;
     assembler.instruction(aarch64_store_x(30, 31, 72)?)?;
     assembler.instruction(aarch64_store_pair_x(0, 1, 31, 0)?)?;
-    assembler.instruction(aarch64_store_pair_x(2, 3, 31, 16)?)?;
-    assembler.instruction(aarch64_store_pair_x(4, 5, 31, 32)?)?;
+    // Start/end remain live in X3/X4 through the first preflight call and are
+    // then superseded by its exact-window output. Retain only length/result.
+    assembler.instruction(aarch64_store_pair_x(2, 5, 31, 16)?)?;
 
     // AAPCS64 carries the authenticated identity and exact-window output in
     // x6/x7, so the combined suffix/cut/admission transaction needs no stack
@@ -29112,9 +29103,10 @@ fn lower_aarch64_partial_prepared(
     let preflight_identity_page_offset =
         assembler.instruction(aarch64_add_x_imm(6, 6, 0)?)?;
     assembler.instruction(aarch64_add_x_imm(7, 31, 48)?)?;
-    // The frame stores preserve x0 through x5 without changing their live
-    // values. Only x6 and x7 are selected for the additional preflight
-    // arguments, so the first helper consumes the original six directly.
+    // The frame stores do not change any live argument register. Only X6/X7
+    // are selected for the additional preflight arguments, so the first
+    // helper consumes the original X0..X5 directly; later paths reload only
+    // the retained handle, haystack, length, and result.
     let preflight_runtime_branch = assembler.instruction(0x9400_0000)?;
     assembler.instruction(aarch64_cmp_w_imm(
         0,
@@ -29151,14 +29143,14 @@ fn lower_aarch64_partial_prepared(
     }
     assembler.instruction(aarch64_cmp_w_imm(0, 0)?)?;
     assembler.branch_cond(AARCH64_NE, native_invalid)?;
-    assembler.instruction(aarch64_load_x_imm(5, 31, 40)?)?;
+    assembler.instruction(aarch64_load_x_imm(5, 31, 24)?)?;
     assembler.instruction(aarch64_store_pair_x(31, 31, 5, 0)?)?;
     assembler.instruction(aarch64_load_x_imm(30, 31, 72)?)?;
     assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
     assembler.instruction(0xd65f_03c0)?;
 
     assembler.bind(native_match)?;
-    assembler.instruction(aarch64_load_x_imm(5, 31, 40)?)?;
+    assembler.instruction(aarch64_load_x_imm(5, 31, 24)?)?;
     if view.output == OutputContract::Exists {
         assembler.instruction(aarch64_store_pair_x(31, 31, 5, 0)?)?;
     } else if view.output == OutputContract::SelectedEnd {
@@ -29180,9 +29172,8 @@ fn lower_aarch64_partial_prepared(
         let recovery_identity_page_offset =
             assembler.instruction(aarch64_add_x_imm(6, 6, 0)?)?;
         assembler.instruction(aarch64_load_pair_x(0, 1, 31, 0)?)?;
-        assembler.instruction(aarch64_load_x_imm(2, 31, 16)?)?;
+        assembler.instruction(aarch64_load_pair_x(2, 5, 31, 16)?)?;
         assembler.instruction(aarch64_load_pair_x(3, 4, 31, 48)?)?;
-        assembler.instruction(aarch64_load_x_imm(5, 31, 40)?)?;
         let recovery_runtime_branch = assembler.instruction(0x9400_0000)?;
         assembler.instruction(aarch64_load_x_imm(30, 31, 72)?)?;
         assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
@@ -29204,8 +29195,7 @@ fn lower_aarch64_partial_prepared(
     assembler.instruction(aarch64_mov_x(4, 6)?)?;
     assembler.instruction(aarch64_mov_x(6, 7)?)?;
     assembler.instruction(aarch64_load_pair_x(0, 1, 31, 0)?)?;
-    assembler.instruction(aarch64_load_x_imm(2, 31, 16)?)?;
-    assembler.instruction(aarch64_load_x_imm(3, 31, 40)?)?;
+    assembler.instruction(aarch64_load_pair_x(2, 3, 31, 16)?)?;
     let runtime_branch = assembler.instruction(0x9400_0000)?; // bl runtime helper
     assembler.instruction(aarch64_load_x_imm(30, 31, 72)?)?;
     assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
@@ -35278,6 +35268,18 @@ mod tests {
             )
             .unwrap()
             .code;
+            let redundant_window_copy = [
+                0x4c, 0x8b, 0x54, 0x24, 0x28, // public start
+                0x4c, 0x89, 0x54, 0x24, 0x40, // private start
+                0x4c, 0x8b, 0x54, 0x24, 0x30, // public end
+                0x4c, 0x89, 0x54, 0x24, 0x48, // private end
+            ];
+            assert!(
+                !x86
+                    .windows(redundant_window_copy.len())
+                    .any(|bytes| bytes == redundant_window_copy),
+                "x86 {output:?} recopied its already-private V2 window"
+            );
             let x86_entry = x86
                 .windows(5)
                 .position(|bytes| bytes == [0x4c, 0x8b, 0x5c, 0x24, 0x50])
@@ -35446,6 +35448,18 @@ mod tests {
                 .chunks_exact(4)
                 .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
                 .collect::<Vec<_>>();
+            let redundant_window_copy = [
+                aarch64_load_x_imm(8, 31, 24).unwrap(),
+                aarch64_store_x(8, 31, 48).unwrap(),
+                aarch64_load_x_imm(8, 31, 32).unwrap(),
+                aarch64_store_x(8, 31, 56).unwrap(),
+            ];
+            assert!(
+                !words
+                    .windows(redundant_window_copy.len())
+                    .any(|window| window == redundant_window_copy),
+                "AArch64 {output:?} recopied its already-private V2 window"
+            );
             let arm_entry = words
                 .iter()
                 .position(|&word| word == aarch64_load_x_imm(13, 31, 64).unwrap())
@@ -44148,7 +44162,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             .expect("partial prepared view");
 
         let (x86, x86_relocations) = lower_x86_64_partial_prepared(&view).unwrap();
-        assert_eq!(x86.len(), 233, "x86 combined prepared wrapper size");
+        assert_eq!(x86.len(), 223, "x86 combined prepared wrapper size");
         assert_eq!(
             x86_relocations
                 .iter()
@@ -44220,15 +44234,15 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             x86.windows(5)
                 .filter(|bytes| *bytes == [0x48, 0x89, 0x4c, 0x24, 0x28].as_slice())
                 .count(),
-            1,
-            "x86 canonical start must only be saved on entry",
+            0,
+            "x86 retained a dead public start save",
         );
         assert_eq!(
             x86.windows(5)
                 .filter(|bytes| *bytes == [0x4c, 0x89, 0x44, 0x24, 0x30].as_slice())
                 .count(),
-            1,
-            "x86 canonical end must only be saved on entry",
+            0,
+            "x86 retained a dead public end save",
         );
         let runtime_offset = usize::try_from(x86_relocations[3].offset).unwrap();
         assert_eq!(x86.get(runtime_offset.wrapping_sub(1)), Some(&0xe8));
@@ -44238,7 +44252,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
         let (aarch64, aarch64_relocations) = lower_aarch64_partial_prepared(&view).unwrap();
         assert_eq!(
             aarch64.len(),
-            208,
+            200,
             "AArch64 combined prepared wrapper size"
         );
         assert_eq!(
@@ -44321,16 +44335,24 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                 .iter()
                 .filter(|&&word| word == aarch64_store_pair_x(2, 3, 31, 16).unwrap())
                 .count(),
-            1,
-            "AArch64 canonical start must only be saved on entry",
+            0,
+            "AArch64 retained a dead public start save",
         );
         assert_eq!(
             words
                 .iter()
                 .filter(|&&word| word == aarch64_store_pair_x(4, 5, 31, 32).unwrap())
                 .count(),
+            0,
+            "AArch64 retained a dead public end save",
+        );
+        assert_eq!(
+            words
+                .iter()
+                .filter(|&&word| word == aarch64_store_pair_x(2, 5, 31, 16).unwrap())
+                .count(),
             1,
-            "AArch64 canonical end must only be saved on entry",
+            "AArch64 must retain length and result in one pair",
         );
         let runtime_offset = usize::try_from(aarch64_relocations[4].offset).unwrap();
         assert_eq!(
@@ -44870,7 +44892,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                         u32::from_le_bytes(code[offset..offset + 4].try_into().unwrap()),
                         0x9400_0000
                     );
-                    let recovery_arguments = code[offset - 24..offset]
+                    let recovery_arguments = code[offset - 20..offset]
                         .chunks_exact(4)
                         .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
                         .collect::<Vec<_>>();
@@ -44880,9 +44902,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                             0x9000_0006,
                             aarch64_add_x_imm(6, 6, 0).unwrap(),
                             aarch64_load_pair_x(0, 1, 31, 0).unwrap(),
-                            aarch64_load_x_imm(2, 31, 16).unwrap(),
+                            aarch64_load_pair_x(2, 5, 31, 16).unwrap(),
                             aarch64_load_pair_x(3, 4, 31, 48).unwrap(),
-                            aarch64_load_x_imm(5, 31, 40).unwrap(),
                         ]
                     );
                 }
@@ -45624,8 +45645,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                                 *bytes == [0x48, 0x89, 0x4c, 0x24, 0x28].as_slice()
                             })
                             .count(),
-                        1,
-                        "{target:?} copied exact start into the canonical slot",
+                        0,
+                        "{target:?} retained a dead public start save",
                     );
                     assert_eq!(
                         code.windows(5)
@@ -45633,8 +45654,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                                 *bytes == [0x4c, 0x89, 0x44, 0x24, 0x30].as_slice()
                             })
                             .count(),
-                        1,
-                        "{target:?} copied exact end into the canonical slot",
+                        0,
+                        "{target:?} retained a dead public end save",
                     );
                     assert!(code
                         .windows(5)
@@ -45721,8 +45742,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                                 word == aarch64_store_pair_x(2, 3, 31, 16).unwrap()
                             })
                             .count(),
-                        1,
-                        "{target:?} copied exact start into the canonical slot",
+                        0,
+                        "{target:?} retained a dead public start save",
                     );
                     assert_eq!(
                         words
@@ -45731,8 +45752,18 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                                 word == aarch64_store_pair_x(4, 5, 31, 32).unwrap()
                             })
                             .count(),
+                        0,
+                        "{target:?} retained a dead public end save",
+                    );
+                    assert_eq!(
+                        words
+                            .iter()
+                            .filter(|&&word| {
+                                word == aarch64_store_pair_x(2, 5, 31, 16).unwrap()
+                            })
+                            .count(),
                         1,
-                        "{target:?} copied exact end into the canonical slot",
+                        "{target:?} must retain length and result in one pair",
                     );
                     let eager_private_initialization = [80_u16, 88, 96, 104, 112]
                         .map(|offset| aarch64_store_x(31, 31, offset).unwrap());
@@ -45829,7 +45860,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
 
             match target.architecture {
                 Architecture::X86_64 => {
-                    assert_eq!(code.len(), 298, "{target:?} Span wrapper size");
+                    assert_eq!(code.len(), 288, "{target:?} Span wrapper size");
                     assert_eq!(code.get(local_native_core.wrapping_sub(1)), Some(&0xe8));
                     assert_eq!(
                         code.get(
@@ -45872,8 +45903,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                                 *bytes == [0x48, 0x89, 0x4c, 0x24, 0x28].as_slice()
                             })
                             .count(),
-                        1,
-                        "{target:?} copied exact start into the canonical slot",
+                        0,
+                        "{target:?} retained a dead public start save",
                     );
                     assert_eq!(
                         code.windows(5)
@@ -45881,8 +45912,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                                 *bytes == [0x4c, 0x89, 0x44, 0x24, 0x30].as_slice()
                             })
                             .count(),
-                        1,
-                        "{target:?} copied exact end into the canonical slot",
+                        0,
+                        "{target:?} retained a dead public end save",
                     );
                     assert!(code.windows(3).any(|bytes| {
                         bytes
@@ -45912,7 +45943,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                     );
                 }
                 Architecture::Aarch64 => {
-                    assert_eq!(code.len(), 256, "{target:?} Span wrapper size");
+                    assert_eq!(code.len(), 244, "{target:?} Span wrapper size");
                     assert_eq!(
                         u32::from_le_bytes(
                             code[local_native_core..local_native_core + 4]
@@ -45942,7 +45973,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                         0x9400_0000,
                         "{target:?}"
                     );
-                    let recovery_arguments = code[local_recovery - 24..local_recovery]
+                    let recovery_arguments = code[local_recovery - 20..local_recovery]
                         .chunks_exact(4)
                         .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
                         .collect::<Vec<_>>();
@@ -45952,9 +45983,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                             0x9000_0006,
                             aarch64_add_x_imm(6, 6, 0).unwrap(),
                             aarch64_load_pair_x(0, 1, 31, 0).unwrap(),
-                            aarch64_load_x_imm(2, 31, 16).unwrap(),
+                            aarch64_load_pair_x(2, 5, 31, 16).unwrap(),
                             aarch64_load_pair_x(3, 4, 31, 48).unwrap(),
-                            aarch64_load_x_imm(5, 31, 40).unwrap(),
                         ],
                         "{target:?}"
                     );
@@ -45969,8 +45999,8 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                                 word == aarch64_store_pair_x(2, 3, 31, 16).unwrap()
                             })
                             .count(),
-                        1,
-                        "{target:?} copied exact start into the canonical slot",
+                        0,
+                        "{target:?} retained a dead public start save",
                     );
                     assert_eq!(
                         words
@@ -45979,8 +46009,18 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                                 word == aarch64_store_pair_x(4, 5, 31, 32).unwrap()
                             })
                             .count(),
+                        0,
+                        "{target:?} retained a dead public end save",
+                    );
+                    assert_eq!(
+                        words
+                            .iter()
+                            .filter(|&&word| {
+                                word == aarch64_store_pair_x(2, 5, 31, 16).unwrap()
+                            })
+                            .count(),
                         1,
-                        "{target:?} copied exact end into the canonical slot",
+                        "{target:?} must retain length and result in one pair",
                     );
                     assert!(
                         words.contains(
