@@ -15665,15 +15665,18 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
                     native_complete.unwrap_or(native_no_match),
                 )?;
             } else {
-                assembler.instruction(&[0x41, 0xf7, 0xc2, 0x00, 0x80, 0x00, 0x00])?;
-                let not_accepting = assembler.label()?;
-                assembler.branch(&[0x0f, 0x84], not_accepting)?;
                 if register_last_accept {
-                    assembler.instruction(&[0x48, 0x89, 0xd7])?; // mov rdi,rdx
+                    // The authenticated u16 cell's accept bit is its sign bit.
+                    // Select the post-increment endpoint without a hot branch.
+                    assembler.instruction(&[0x66, 0x45, 0x85, 0xd2])?; // test r10w,r10w
+                    assembler.instruction(&[0x48, 0x0f, 0x48, 0xfa])?; // cmovs rdi,rdx
                 } else {
+                    assembler.instruction(&[0x41, 0xf7, 0xc2, 0x00, 0x80, 0x00, 0x00])?;
+                    let not_accepting = assembler.label()?;
+                    assembler.branch(&[0x0f, 0x84], not_accepting)?;
                     assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x60])?;
+                    assembler.bind(not_accepting)?;
                 }
-                assembler.bind(not_accepting)?;
                 assembler.instruction(&[0x41, 0x81, 0xe2, 0xff, 0x7f, 0x00, 0x00])?;
                 assembler.instruction(&[0x45, 0x85, 0xd2])?;
                 assembler.branch(&[0x0f, 0x84], compact_complete)?;
@@ -15708,15 +15711,16 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
                 assembler.branch(&[0x0f, 0x88], native_match)?;
                 assembler.branch(&[0x0f, 0x84], compact_complete)?;
             } else {
-                assembler.instruction(&[0x41, 0xf6, 0xc2, 0x80])?;
-                let not_accepting = assembler.label()?;
-                assembler.branch(&[0x0f, 0x84], not_accepting)?;
                 if register_last_accept {
-                    assembler.instruction(&[0x48, 0x89, 0xd7])?; // mov rdi,rdx
+                    assembler.instruction(&[0x45, 0x84, 0xd2])?; // test r10b,r10b
+                    assembler.instruction(&[0x48, 0x0f, 0x48, 0xfa])?; // cmovs rdi,rdx
                 } else {
+                    assembler.instruction(&[0x41, 0xf6, 0xc2, 0x80])?;
+                    let not_accepting = assembler.label()?;
+                    assembler.branch(&[0x0f, 0x84], not_accepting)?;
                     assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x60])?;
+                    assembler.bind(not_accepting)?;
                 }
-                assembler.bind(not_accepting)?;
                 assembler.instruction(&[0x41, 0x83, 0xe2, 0x7f])?;
                 assembler.branch(&[0x0f, 0x84], compact_complete)?;
             }
@@ -15844,15 +15848,16 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
                 native_complete.unwrap_or(native_no_match),
             )?;
         } else {
-            assembler.instruction(&[0x41, 0xf7, 0xc2, 0x00, 0x80, 0x00, 0x00])?;
-            let not_accepting = assembler.label()?;
-            assembler.branch(&[0x0f, 0x84], not_accepting)?;
             if register_last_accept {
-                assembler.instruction(&[0x49, 0x89, 0xd4])?; // mov r12,rdx
+                assembler.instruction(&[0x66, 0x45, 0x85, 0xd2])?; // test r10w,r10w
+                assembler.instruction(&[0x4c, 0x0f, 0x48, 0xe2])?; // cmovs r12,rdx
             } else {
+                assembler.instruction(&[0x41, 0xf7, 0xc2, 0x00, 0x80, 0x00, 0x00])?;
+                let not_accepting = assembler.label()?;
+                assembler.branch(&[0x0f, 0x84], not_accepting)?;
                 assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x60])?;
+                assembler.bind(not_accepting)?;
             }
-            assembler.bind(not_accepting)?;
             assembler.instruction(&[0x41, 0x81, 0xe2, 0xff, 0x7f, 0x00, 0x00])?;
             assembler.instruction(&[0x45, 0x85, 0xd2])?;
             assembler.branch(&[0x0f, 0x84], loop_complete)?;
@@ -16100,15 +16105,16 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
                     native_complete.unwrap_or(native_no_match),
                 )?;
             } else {
-                assembler.instruction(&[0x41, 0xf7, 0xc2, 0x00, 0x80, 0x00, 0x00])?;
-                let not_accepting = assembler.label()?;
-                assembler.branch(&[0x0f, 0x84], not_accepting)?;
                 if register_last_accept {
-                    assembler.instruction(&[0x49, 0x89, 0xd4])?; // mov r12,rdx
+                    assembler.instruction(&[0x66, 0x45, 0x85, 0xd2])?; // test r10w,r10w
+                    assembler.instruction(&[0x4c, 0x0f, 0x48, 0xe2])?; // cmovs r12,rdx
                 } else {
+                    assembler.instruction(&[0x41, 0xf7, 0xc2, 0x00, 0x80, 0x00, 0x00])?;
+                    let not_accepting = assembler.label()?;
+                    assembler.branch(&[0x0f, 0x84], not_accepting)?;
                     assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x60])?;
+                    assembler.bind(not_accepting)?;
                 }
-                assembler.bind(not_accepting)?;
                 assembler.instruction(&[0x41, 0x81, 0xe2, 0xff, 0x7f, 0x00, 0x00])?;
                 assembler.branch(&[0x0f, 0x84], loop_complete)?;
             }
@@ -16350,15 +16356,16 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
                 native_complete.unwrap_or(native_no_match),
             )?;
         } else {
-            assembler.instruction(&[0x41, 0xf7, 0xc2, 0x00, 0x80, 0x00, 0x00])?;
-            let not_accepting = assembler.label()?;
-            assembler.branch(&[0x0f, 0x84], not_accepting)?;
             if register_last_accept {
-                assembler.instruction(&[0x48, 0x89, 0xd7])?; // mov rdi,rdx
+                assembler.instruction(&[0x66, 0x45, 0x85, 0xd2])?; // test r10w,r10w
+                assembler.instruction(&[0x48, 0x0f, 0x48, 0xfa])?; // cmovs rdi,rdx
             } else {
+                assembler.instruction(&[0x41, 0xf7, 0xc2, 0x00, 0x80, 0x00, 0x00])?;
+                let not_accepting = assembler.label()?;
+                assembler.branch(&[0x0f, 0x84], not_accepting)?;
                 assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x60])?;
+                assembler.bind(not_accepting)?;
             }
-            assembler.bind(not_accepting)?;
             assembler.instruction(&[0x41, 0x81, 0xe2, 0xff, 0x7f, 0x00, 0x00])?;
             assembler.instruction(&[0x45, 0x85, 0xd2])?;
             assembler.branch(&[0x0f, 0x84], compact_complete)?;
@@ -16781,15 +16788,16 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
                     native_complete.unwrap_or(native_no_match),
                 )?;
             } else {
-                assembler.instruction(&[0x41, 0xf7, 0xc2, 0x00, 0x80, 0x00, 0x00])?;
-                let not_accepting = assembler.label()?;
-                assembler.branch(&[0x0f, 0x84], not_accepting)?;
                 if register_last_accept {
-                    assembler.instruction(&[0x48, 0x89, 0xd7])?; // mov rdi,rdx
+                    assembler.instruction(&[0x66, 0x45, 0x85, 0xd2])?; // test r10w,r10w
+                    assembler.instruction(&[0x48, 0x0f, 0x48, 0xfa])?; // cmovs rdi,rdx
                 } else {
+                    assembler.instruction(&[0x41, 0xf7, 0xc2, 0x00, 0x80, 0x00, 0x00])?;
+                    let not_accepting = assembler.label()?;
+                    assembler.branch(&[0x0f, 0x84], not_accepting)?;
                     assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x60])?;
+                    assembler.bind(not_accepting)?;
                 }
-                assembler.bind(not_accepting)?;
                 assembler.instruction(&[0x41, 0x81, 0xe2, 0xff, 0x7f, 0x00, 0x00])?;
                 assembler.branch(&[0x0f, 0x84], compact_complete)?;
             }
@@ -16877,15 +16885,16 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
             assembler.instruction(&[0x66, 0x45, 0x85, 0xd2])?;
             assembler.branch(&[0x0f, 0x88], native_match)?;
         } else {
-            assembler.instruction(&[0x41, 0xf7, 0xc2, 0x00, 0x80, 0x00, 0x00])?;
-            let not_accepting = assembler.label()?;
-            assembler.branch(&[0x0f, 0x84], not_accepting)?;
             if register_last_accept {
-                assembler.instruction(&[0x48, 0x89, 0xd7])?; // mov rdi,rdx
+                assembler.instruction(&[0x66, 0x45, 0x85, 0xd2])?; // test r10w,r10w
+                assembler.instruction(&[0x48, 0x0f, 0x48, 0xfa])?; // cmovs rdi,rdx
             } else {
+                assembler.instruction(&[0x41, 0xf7, 0xc2, 0x00, 0x80, 0x00, 0x00])?;
+                let not_accepting = assembler.label()?;
+                assembler.branch(&[0x0f, 0x84], not_accepting)?;
                 assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x60])?;
+                assembler.bind(not_accepting)?;
             }
-            assembler.bind(not_accepting)?;
         }
         assembler.branch(&[0xe9], compact_complete)?;
     }
@@ -16939,15 +16948,16 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
                     native_complete.unwrap_or(native_no_match),
                 )?;
             } else {
-                assembler.instruction(&[0x41, 0xf7, 0xc2, 0x00, 0x80, 0x00, 0x00])?;
-                let not_accepting = assembler.label()?;
-                assembler.branch(&[0x0f, 0x84], not_accepting)?;
                 if register_last_accept {
-                    assembler.instruction(&[0x48, 0x89, 0xd7])?; // mov rdi,rdx
+                    assembler.instruction(&[0x66, 0x45, 0x85, 0xd2])?; // test r10w,r10w
+                    assembler.instruction(&[0x48, 0x0f, 0x48, 0xfa])?; // cmovs rdi,rdx
                 } else {
+                    assembler.instruction(&[0x41, 0xf7, 0xc2, 0x00, 0x80, 0x00, 0x00])?;
+                    let not_accepting = assembler.label()?;
+                    assembler.branch(&[0x0f, 0x84], not_accepting)?;
                     assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x60])?;
+                    assembler.bind(not_accepting)?;
                 }
-                assembler.bind(not_accepting)?;
                 assembler.instruction(&[0x41, 0x81, 0xe2, 0xff, 0x7f, 0x00, 0x00])?;
                 assembler.branch(&[0x0f, 0x84], compact_complete)?;
             }
@@ -17007,15 +17017,16 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
                 assembler.instruction(&[0x66, 0x45, 0x85, 0xd2])?;
                 assembler.branch(&[0x0f, 0x88], native_match)?;
             } else {
-                assembler.instruction(&[0x41, 0xf7, 0xc2, 0x00, 0x80, 0x00, 0x00])?;
-                let not_accepting = assembler.label()?;
-                assembler.branch(&[0x0f, 0x84], not_accepting)?;
                 if register_last_accept {
-                    assembler.instruction(&[0x48, 0x89, 0xd7])?; // mov rdi,rdx
+                    assembler.instruction(&[0x66, 0x45, 0x85, 0xd2])?; // test r10w,r10w
+                    assembler.instruction(&[0x48, 0x0f, 0x48, 0xfa])?; // cmovs rdi,rdx
                 } else {
+                    assembler.instruction(&[0x41, 0xf7, 0xc2, 0x00, 0x80, 0x00, 0x00])?;
+                    let not_accepting = assembler.label()?;
+                    assembler.branch(&[0x0f, 0x84], not_accepting)?;
                     assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x60])?;
+                    assembler.bind(not_accepting)?;
                 }
-                assembler.bind(not_accepting)?;
             }
             assembler.branch(&[0xe9], compact_complete)?;
         } else {
@@ -30721,9 +30732,9 @@ mod tests {
                         "V6/V7 save the caller's R12 only after selection",
                     ),
                     (
-                        [0x49, 0x89, 0xd4].as_slice(),
+                        [0x4c, 0x0f, 0x48, 0xe2].as_slice(),
                         30,
-                        "all paired and scalar V6/V7 accepting transitions retain the endpoint in R12",
+                        "all paired and scalar V6/V7 transitions select accepting endpoints into R12 without branches",
                     ),
                     (
                         [0x4c, 0x8b, 0x64, 0x24, 0x60].as_slice(),
@@ -30746,6 +30757,16 @@ mod tests {
                         "{context}: {purpose}"
                     );
                 }
+                assert_eq!(
+                    byte_occurrences(code, &[0x48, 0x0f, 0x48, 0xfa]),
+                    if output == OutputContract::Exists { 0 } else { 48 },
+                    "{context}: every V3/V4/V8/V10/V12 paired or scalar transition uses branchless RDI endpoint selection"
+                );
+                assert_eq!(
+                    byte_occurrences(code, &[0x48, 0x89, 0xd7]),
+                    0,
+                    "{context}: scanner-free endpoint transitions retain no unconditional RDI update"
+                );
                 assert_eq!(
                     byte_occurrences(code, &[0x48, 0x89, 0x54, 0x24, 0x60]),
                     if output == OutputContract::Exists { 0 } else { 4 },
@@ -30812,6 +30833,11 @@ mod tests {
                     byte_occurrences(&rooted.code, &x86_loop_second_byte),
                     0,
                     "{context}: rooted V6/V7 paths retain per-byte root dispatch"
+                );
+                assert_eq!(
+                    byte_occurrences(&rooted.code, &[0x48, 0x0f, 0x48, 0xfa]),
+                    0,
+                    "{context}: rooted endpoint storage keeps its conditional stack update"
                 );
             }
         }
@@ -47613,9 +47639,12 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
                         "{context}: scanner-free V4 does not spill accepting endpoints"
                     );
                     assert_eq!(
-                        byte_occurrences(&code[singleton..update], &[0x48, 0x89, 0xd7]),
+                        byte_occurrences(
+                            &code[singleton..update],
+                            &[0x48, 0x0f, 0x48, 0xfa],
+                        ),
                         1,
-                        "{context}: accepting cells retain the consumed endpoint in RDI"
+                        "{context}: accepting cells select the consumed endpoint into RDI without a branch"
                     );
                     assert_eq!(
                         byte_occurrences(
