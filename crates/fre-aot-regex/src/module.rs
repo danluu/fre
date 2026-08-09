@@ -17961,9 +17961,6 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
 
         let reverse_loop = assembler.label()?;
         let reverse_tail = assembler.label()?;
-        let reverse_first_not_accepting = assembler.label()?;
-        let reverse_second_not_accepting = assembler.label()?;
-        let reverse_tail_not_accepting = assembler.label()?;
         let reverse_finish = assembler.label()?;
         let reverse_fallback = assembler.label()?;
 
@@ -17996,12 +17993,14 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         } else {
             assembler.instruction(&[0x8b, 0x04, 0x81])?;
         }
-        let mut test_accept = vec![0xa9];
-        test_accept.extend_from_slice(&DYNAMIC_NATIVE_ROWS_V1_ACCEPT_MASK.to_le_bytes());
-        assembler.instruction(&test_accept)?;
-        assembler.branch(&[0x0f, 0x84], reverse_first_not_accepting)?;
-        assembler.instruction(&[0x4c, 0x8d, 0x56, 0x01])?;
-        assembler.bind(reverse_first_not_accepting)?;
+        // The acceptance bit is the sign bit. Reverse recovery normally sees
+        // a long run of non-accepting cells followed by one accepting cell;
+        // selecting the candidate with CMOVS avoids paying that terminal
+        // branch misprediction. R11 is free after its endpoint was copied to
+        // the frame and becomes the first candidate temporary.
+        assembler.instruction(&[0x85, 0xc0])?; // test eax,eax
+        assembler.instruction(&[0x4c, 0x8d, 0x5e, 0x01])?; // lea r11,[rsi+1]
+        assembler.instruction(&[0x4d, 0x0f, 0x48, 0xd3])?; // cmovs r10,r11
         let mut mask_token = vec![0x25];
         mask_token.extend_from_slice(&DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK.to_le_bytes());
         assembler.instruction(&mask_token)?;
@@ -18014,10 +18013,8 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         } else {
             assembler.instruction(&[0x8b, 0x04, 0x91])?;
         }
-        assembler.instruction(&test_accept)?;
-        assembler.branch(&[0x0f, 0x84], reverse_second_not_accepting)?;
-        assembler.instruction(&[0x49, 0x89, 0xf2])?;
-        assembler.bind(reverse_second_not_accepting)?;
+        assembler.instruction(&[0x85, 0xc0])?; // test eax,eax
+        assembler.instruction(&[0x4c, 0x0f, 0x48, 0xd6])?; // cmovs r10,rsi
         assembler.instruction(&mask_token)?;
         assembler.branch(&[0x0f, 0x84], reverse_finish)?;
         assembler.instruction(&[0xff, 0xc8])?;
@@ -18039,10 +18036,8 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         } else {
             assembler.instruction(&[0x8b, 0x04, 0x81])?;
         }
-        assembler.instruction(&test_accept)?;
-        assembler.branch(&[0x0f, 0x84], reverse_tail_not_accepting)?;
-        assembler.instruction(&[0x49, 0x89, 0xf2])?;
-        assembler.bind(reverse_tail_not_accepting)?;
+        assembler.instruction(&[0x85, 0xc0])?; // test eax,eax
+        assembler.instruction(&[0x4c, 0x0f, 0x48, 0xd6])?; // cmovs r10,rsi
         assembler.instruction(&mask_token)?;
         assembler.branch(&[0x0f, 0x84], reverse_finish)?;
         assembler.instruction(&[0xff, 0xc8])?;
@@ -18052,7 +18047,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities(
         assembler.branch(&[0xe9], reverse_finish)?;
 
         assembler.bind(reverse_finish)?;
-        assembler.instruction(&[0x4d, 0x39, 0xda])?; // candidate == selected end
+        assembler.instruction(&[0x4c, 0x3b, 0x54, 0x24, 0x60])?; // candidate == selected end
         assembler.branch(&[0x0f, 0x84], reverse_fallback)?;
         if filter_kind.is_some_and(X86StartFilterKind::needs_vzeroupper) {
             assembler.instruction(&[0xc5, 0xf8, 0x77])?;
@@ -31148,6 +31143,12 @@ mod tests {
         assert_eq!(byte_occurrences(&x86_zero.code, &x86_map_load), 0);
         assert_eq!(byte_occurrences(&x86_identity.code, &x86_map_load), 0);
         assert_eq!(byte_occurrences(&x86_mapped.code, &x86_map_load), 2);
+        let x86_first_accept_cmov = [0x4d, 0x0f, 0x48, 0xd3];
+        let x86_later_accept_cmov = [0x4c, 0x0f, 0x48, 0xd6];
+        for emission in [&x86_zero, &x86_mapped, &x86_identity] {
+            assert_eq!(byte_occurrences(&emission.code, &x86_first_accept_cmov), 1);
+            assert_eq!(byte_occurrences(&emission.code, &x86_later_accept_cmov), 2);
+        }
         let x86_identity_relocations = |emission: &NativeDynamicRowsEmission| {
             emission
                 .relocations
