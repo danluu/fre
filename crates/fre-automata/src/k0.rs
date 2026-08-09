@@ -5,10 +5,11 @@ use core::{
 };
 
 use fre_simd_kernels::{
-    classify_byte_delta_16, AsciiByteSet, AsciiByteSetClassifier, AsciiByteSetRunScanner,
-    ByteSet256, ByteSetClassifier, DispatchPolicy, SimdDispatchContext, ASCII_NARROW_BYTES,
-    ASCII_RUN_SCANNER_BUILD_WORK, ASCII_WIDE_BYTES, BYTE_SET_BLOCK_BYTES,
-    BYTE_SET_CLASSIFIER_BUILD_WORK, BYTE_SET_WIDE_BLOCK_BYTES,
+    classify_byte_delta_16, AsciiByteSet, AsciiByteSetClassifier,
+    AsciiByteSetNonMemberScanner, AsciiByteSetRunScanner, ByteSet256, ByteSetClassifier,
+    DispatchPolicy, SimdDispatchContext, ASCII_NARROW_BYTES,
+    ASCII_NONMEMBER_RUN_SCANNER_BUILD_WORK, ASCII_RUN_SCANNER_BUILD_WORK, ASCII_WIDE_BYTES,
+    BYTE_SET_BLOCK_BYTES, BYTE_SET_CLASSIFIER_BUILD_WORK, BYTE_SET_WIDE_BLOCK_BYTES,
 };
 use memchr::{memchr, memchr2, memchr3};
 
@@ -2822,15 +2823,21 @@ enum LazyStartAction {
 /// leaves and selects the target/tuning-specific choice once, rather than
 /// returning through this executor for every block. Dense ASCII sets may use
 /// the scanner's equivalent small-complement table because the exact member
-/// bitmap proves every high byte terminates the run. Sets containing high
-/// bytes retain the general 256-byte classifier. The universal class needs no
-/// source classification at all: the graph proof already says every byte has
-/// the same transition.
+/// bitmap proves every high byte terminates the run. Classes containing every
+/// high byte and at most sixteen ASCII exits instead retain that complementary
+/// exit set: the operation-specific nonmember scanner then consumes both ASCII
+/// loop members and arbitrary high bytes until the first possible exit.
+/// Arbitrary full-byte classes retain the general 256-byte member classifier;
+/// unlike the ASCII-exit case, that classifier has no operation-specific
+/// nonmember kernel whose setup can be amortized across the whole run. The
+/// universal class needs no source classification at all: the graph proof
+/// already says every byte has the same transition.
 #[derive(Clone, Copy, Debug)]
 enum LazyLoopScanner {
     All,
     Ascii(AsciiByteSetRunScanner),
     Set(ByteSetClassifier),
+    AsciiExits(AsciiByteSetNonMemberScanner),
 }
 
 impl LazyLoopScanner {
@@ -2838,6 +2845,18 @@ impl LazyLoopScanner {
     fn new(words: [u64; 4]) -> Self {
         if words == [u64::MAX; 4] {
             return Self::All;
+        }
+        if words[2] == u64::MAX && words[3] == u64::MAX {
+            let exits = AsciiByteSet::from_words([!words[0], !words[1]]);
+            let exit_words = exits.words();
+            if exit_words[0].count_ones() + exit_words[1].count_ones() <= 16 {
+                let scanner = SimdDispatchContext::capture()
+                    .ascii_byte_set_nonmember_scanner(exits, DispatchPolicy::Auto)
+                    .expect(
+                        "automatic ASCII nonmember dispatch always retains a scalar fallback",
+                    );
+                return Self::AsciiExits(scanner);
+            }
         }
         if words[2] == 0 && words[3] == 0 {
             let set = AsciiByteSet::from_words([words[0], words[1]]);
@@ -2859,6 +2878,11 @@ impl LazyLoopScanner {
             && words[3] == u64::MAX
         {
             0
+        } else if words[2] == u64::MAX
+            && words[3] == u64::MAX
+            && (!words[0]).count_ones() + (!words[1]).count_ones() <= 16
+        {
+            ASCII_NONMEMBER_RUN_SCANNER_BUILD_WORK as u64
         } else if words[2] == 0 && words[3] == 0 {
             ASCII_RUN_SCANNER_BUILD_WORK as u64
         } else {
@@ -2871,6 +2895,9 @@ impl LazyLoopScanner {
             Self::All => source.len(),
             Self::Ascii(scanner) => scanner.scan_forward(source).member_run_len(),
             Self::Set(classifier) => scan_full_byte_member_prefix(classifier, source),
+            Self::AsciiExits(scanner) => {
+                scanner.scan_forward(source).nonmember_run_len()
+            }
         }
     }
 
@@ -2882,6 +2909,10 @@ impl LazyLoopScanner {
                 [words[0], words[1], 0, 0]
             }
             Self::Set(classifier) => classifier.set().words(),
+            Self::AsciiExits(scanner) => {
+                let exits = scanner.set().words();
+                [!exits[0], !exits[1], u64::MAX, u64::MAX]
+            }
         }
     }
 
@@ -2893,6 +2924,7 @@ impl LazyLoopScanner {
                 byte.is_ascii() && scanner.set().contains(byte)
             }
             Self::Set(classifier) => classifier.set().contains(byte),
+            Self::AsciiExits(scanner) => !scanner.set().contains(byte),
         }
     }
 
@@ -2910,6 +2942,10 @@ impl LazyLoopScanner {
                 .into_iter()
                 .map(u64::count_ones)
                 .sum(),
+            Self::AsciiExits(scanner) => {
+                let exits = scanner.set().words();
+                256 - exits[0].count_ones() - exits[1].count_ones()
+            }
         }
     }
 }
@@ -3148,6 +3184,9 @@ struct ContextLazyLoopSkipPlan {
 
 const CONTEXT_LAZY_LOOP_SKIP_PLAN_CAPACITY: usize = 4;
 const _: () = assert!(CONTEXT_LAZY_LOOP_SKIP_PLAN_CAPACITY <= LAZY_MAX_STATES);
+const _: () = assert!(
+    CONTEXT_LAZY_LOOP_SKIP_PLAN_CAPACITY == LAZY_LOOP_SKIP_PLAN_CAPACITY
+);
 const CONTEXT_LAZY_LOOP_SKIP_OWNER_PUBLICATION_WORK: u64 = 1;
 const CONTEXT_LAZY_LOOP_SKIP_BITMAP_PUBLICATION_WORK: u64 = 1;
 
@@ -3257,12 +3296,14 @@ struct ContextLazyLoopSkipCandidate {
     leave_final_member: bool,
 }
 
-/// Invocation-local suppression for an unproductive retained loop scanner.
+/// Invocation-local suppression for one unproductive retained loop scanner.
 ///
 /// Narrow graph classes can still have long profitable runs, so plan
 /// admission is class-size independent. If one runtime probe finds less than
 /// one wide block, wait two wide blocks of scalar progress before trying that
 /// same state again. Leaving the plan state clears the negative evidence.
+/// Probes never cross the private immutable-to-mutable handoff, so every live
+/// deadline remains inside one plan-table snapshot and one haystack borrow.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct LazyLoopProbe {
     retry_at: Option<usize>,
@@ -3385,8 +3426,6 @@ struct WarmContextForwardContinuation {
     engine_candidate: Option<usize>,
     retained_start_mask: RetainedStartMaskCursor,
     adaptive_probe: AdaptiveStartProbe,
-    loop_probe: LazyLoopProbe,
-    active_loop_slot: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -8610,8 +8649,6 @@ fn try_warm_context_exists_loop<const LOOP_SKIP: bool>(
                 engine_candidate,
                 retained_start_mask,
                 adaptive_probe,
-                loop_probe,
-                active_loop_slot,
             },
         ));
     };
@@ -8686,8 +8723,6 @@ fn try_warm_context_exists_loop<const LOOP_SKIP: bool>(
                             engine_candidate,
                             retained_start_mask,
                             adaptive_probe,
-                            loop_probe,
-                            active_loop_slot,
                         },
                     ));
                 };
@@ -8823,8 +8858,6 @@ fn try_warm_context_exists_loop<const LOOP_SKIP: bool>(
                             engine_candidate,
                             retained_start_mask,
                             adaptive_probe,
-                            loop_probe,
-                            active_loop_slot,
                         },
                     ));
                 };
@@ -9002,8 +9035,6 @@ fn try_warm_context_selected_end_loop<const LOOP_SKIP: bool>(
                 engine_candidate,
                 retained_start_mask,
                 adaptive_probe,
-                loop_probe,
-                active_loop_slot,
             },
         ));
     };
@@ -9079,8 +9110,6 @@ fn try_warm_context_selected_end_loop<const LOOP_SKIP: bool>(
                             engine_candidate,
                             retained_start_mask,
                             adaptive_probe,
-                            loop_probe,
-                            active_loop_slot,
                         },
                     ));
                 };
@@ -9216,8 +9245,6 @@ fn try_warm_context_selected_end_loop<const LOOP_SKIP: bool>(
                             engine_candidate,
                             retained_start_mask,
                             adaptive_probe,
-                            loop_probe,
-                            active_loop_slot,
                         },
                     ));
                 };
@@ -9734,8 +9761,6 @@ fn try_warm_context_span_loop<const LOOP_SKIP: bool>(
                 engine_candidate,
                 retained_start_mask,
                 adaptive_probe,
-                loop_probe,
-                active_loop_slot,
             },
         ));
     };
@@ -9811,8 +9836,6 @@ fn try_warm_context_span_loop<const LOOP_SKIP: bool>(
                             engine_candidate,
                             retained_start_mask,
                             adaptive_probe,
-                            loop_probe,
-                            active_loop_slot,
                         },
                     ));
                 };
@@ -9958,8 +9981,6 @@ fn try_warm_context_span_loop<const LOOP_SKIP: bool>(
                             engine_candidate,
                             retained_start_mask,
                             adaptive_probe,
-                            loop_probe,
-                            active_loop_slot,
                         },
                     ));
                 };
@@ -10203,8 +10224,11 @@ fn continue_mutable_warm_context_forward(
     let mut engine_candidate = continuation.engine_candidate;
     let mut retained_start_mask = continuation.retained_start_mask;
     let mut adaptive_probe = continuation.adaptive_probe;
-    let mut loop_probe = continuation.loop_probe;
-    let mut active_loop_slot = continuation.active_loop_slot;
+    // Optional negative loop evidence is deliberately phase-local. Dropping
+    // it at this private handoff prevents any source- or plan-bound deadline
+    // from crossing invocation preparation.
+    let mut loop_probe = LazyLoopProbe::default();
+    let mut active_loop_slot = None;
     let mut first_unfilled = true;
 
     loop {
@@ -10804,8 +10828,6 @@ struct WarmDirectExistsContinuation {
     engine_candidate: Option<usize>,
     retained_start_mask: RetainedStartMaskCursor,
     adaptive_probe: AdaptiveStartProbe,
-    loop_probe: LazyLoopProbe,
-    active_loop_slot: Option<usize>,
     first_loop_decided: bool,
 }
 
@@ -10908,8 +10930,6 @@ fn try_warm_direct_exists(
                     engine_candidate,
                     retained_start_mask: RetainedStartMaskCursor::default(),
                     adaptive_probe: AdaptiveStartProbe::default(),
-                    loop_probe: LazyLoopProbe::default(),
-                    active_loop_slot: None,
                     first_loop_decided: false,
                 },
             )
@@ -11194,8 +11214,6 @@ fn continue_warm_direct_exists_loop<const LOOP_SKIP: bool>(
                     engine_candidate,
                     retained_start_mask,
                     adaptive_probe,
-                    loop_probe,
-                    active_loop_slot,
                     first_loop_decided: true,
                 },
             )
@@ -11287,7 +11305,7 @@ fn complete_mutable_warm_direct_exists(
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
-    reason = "the mutable handoff retains every invocation-local scanner and loop cursor"
+    reason = "the mutable handoff retains every invocation-local scanner and DFA frontier"
 )]
 #[inline(never)]
 fn continue_mutable_warm_direct_exists(
@@ -11333,8 +11351,11 @@ fn continue_mutable_warm_direct_exists(
     let mut engine_candidate = continuation.engine_candidate;
     let mut retained_start_mask = continuation.retained_start_mask;
     let mut adaptive_probe = continuation.adaptive_probe;
-    let mut loop_probe = continuation.loop_probe;
-    let mut active_loop_slot = continuation.active_loop_slot;
+    // The immutable probe already decided the first unread boundary. Its
+    // optional cooldown is not durable state and never crosses invocation
+    // preparation or a haystack borrow boundary.
+    let mut loop_probe = LazyLoopProbe::default();
+    let mut active_loop_slot = None;
     // The scanner decision for the first unconsumed byte was already made by
     // the immutable probe. Its outlined loop also evaluated loop skipping;
     // the inline prefix did not, so let that origin select a retained loop
@@ -11913,8 +11934,6 @@ pub(crate) fn search_prevalidated_exists_value_from_dynamic_direct_hole_with_aut
             engine_candidate: None,
             retained_start_mask: RetainedStartMaskCursor::default(),
             adaptive_probe: AdaptiveStartProbe::default(),
-            loop_probe: LazyLoopProbe::default(),
-            active_loop_slot: None,
             first_loop_decided: true,
         },
     )
@@ -33844,11 +33863,13 @@ mod tests {
         assert_eq!(receipt.accounted, 16);
 
         let selected = plans.find_with_hint(retained_state, Some(0));
+        let mut suppressed = super::LazyLoopProbe::default();
+        suppressed.observe(0, 2).unwrap();
         receipt.defer_completed(&meter, 5).unwrap();
         assert_eq!(
             super::warm_context_loop_scan_threshold(
                 selected.map(|(_, plan)| plan.leave_final_member),
-                super::LazyLoopProbe { retry_at: Some(31) },
+                suppressed,
                 30,
                 super::LAZY_LOOP_SKIP_MIN_BYTES * 2,
             )
@@ -44583,7 +44604,10 @@ mod tests {
             .first()
             .expect("a long pending full-byte loop must retain a scanner");
         assert_eq!(loop_plan.start_action, super::LazyStartAction::Propagate);
-        assert!(matches!(loop_plan.scanner, super::LazyLoopScanner::Set(_)));
+        assert!(matches!(
+            loop_plan.scanner,
+            super::LazyLoopScanner::AsciiExits(_)
+        ));
         assert_eq!(loop_plan.scanner.cardinality(), 255);
         assert!(loop_plan.scanner.contains(u8::MIN));
         assert!(loop_plan.scanner.contains(u8::MAX));
@@ -44801,6 +44825,200 @@ mod tests {
                     scalar_prefix(&source),
                     "len={len} all-members"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn dense_full_byte_loop_scanners_use_small_exact_ascii_exits() {
+        fn loop_words(exits: &[u8]) -> [u64; 4] {
+            let mut words = [u64::MAX; 4];
+            for &exit in exits {
+                let word = usize::from(exit >> 6);
+                let bit = u32::from(exit & 63);
+                words[word] &= !(1_u64 << bit);
+            }
+            words
+        }
+
+        fn scalar_prefix(words: [u64; 4], source: &[u8]) -> usize {
+            source
+                .iter()
+                .take_while(|&&byte| super::byte_bitmap_contains(words, byte))
+                .count()
+        }
+
+        let singleton = [b'z'];
+        let small: [u8; 16] = core::array::from_fn(|index| {
+            u8::try_from(index).expect("a sixteen-value ASCII set fits u8")
+        });
+        let generic: [u8; 17] = core::array::from_fn(|index| {
+            u8::try_from(index).expect("a seventeen-value ASCII set fits u8")
+        });
+        let all_ascii: [u8; 128] = core::array::from_fn(|index| {
+            u8::try_from(index).expect("the ASCII domain fits u8")
+        });
+        let cases: [(&str, &[u8], bool); 4] = [
+            ("singleton", &singleton, true),
+            ("small", &small, true),
+            ("generic", &generic, false),
+            ("all-ascii", &all_ascii, false),
+        ];
+        let boundaries = [
+            0_usize, 1, 2, 15, 16, 17, 31, 32, 33, 47, 48, 49, 63, 64, 65, 95,
+            96, 97, 127, 128, 129, 255, 256, 257,
+        ];
+
+        for (name, exits, uses_exit_scanner) in cases {
+            let words = loop_words(exits);
+            let scanner = super::LazyLoopScanner::new(words);
+            assert_eq!(
+                matches!(scanner, super::LazyLoopScanner::AsciiExits(_)),
+                uses_exit_scanner,
+                "{name}/strategy"
+            );
+            let expected_build_work = if uses_exit_scanner {
+                super::ASCII_NONMEMBER_RUN_SCANNER_BUILD_WORK
+            } else {
+                super::BYTE_SET_CLASSIFIER_BUILD_WORK
+            };
+            assert_eq!(
+                super::LazyLoopScanner::build_work(words),
+                u64::try_from(expected_build_work).unwrap()
+            );
+            assert_eq!(scanner.words(), words, "{name}/member-set");
+            assert_eq!(
+                scanner.cardinality(),
+                256_u32 - u32::try_from(exits.len()).unwrap(),
+                "{name}/cardinality"
+            );
+            for byte in u8::MIN..=u8::MAX {
+                assert_eq!(
+                    scanner.contains(byte),
+                    super::byte_bitmap_contains(words, byte),
+                    "{name}/byte-{byte:#04x}"
+                );
+            }
+            let ascii_member = (u8::MIN..=0x7f)
+                .find(|&byte| super::byte_bitmap_contains(words, byte))
+                .unwrap_or(0x80);
+            let loop_members = [ascii_member, 0x80, 0xff];
+
+            for offset in [0_usize, 1, 3, 7, 15, 16, 31] {
+                for length in boundaries {
+                    let mut members = vec![0xcc; offset];
+                    members.extend(
+                        (0..length)
+                            .map(|index| loop_members[index % loop_members.len()]),
+                    );
+                    let source = &members[offset..];
+                    assert_eq!(
+                        scanner.scan_forward(source),
+                        scalar_prefix(words, source),
+                        "{name}/members/offset-{offset}/length-{length}"
+                    );
+
+                    for exit in [exits[0], exits[exits.len() - 1]] {
+                        let mut terminated = members.clone();
+                        terminated.push(exit);
+                        terminated.extend(std::iter::repeat_n(0x80, 37));
+                        let source = &terminated[offset..];
+                        assert_eq!(
+                            scanner.scan_forward(source),
+                            scalar_prefix(words, source),
+                            "{name}/exit-{exit:#04x}/offset-{offset}/prefix-{length}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dense_mixed_loop_scanners_keep_the_full_member_classifier() {
+        fn loop_words(exits: &[u8]) -> [u64; 4] {
+            let mut words = [u64::MAX; 4];
+            for &exit in exits {
+                let word = usize::from(exit >> 6);
+                let bit = u32::from(exit & 63);
+                words[word] &= !(1_u64 << bit);
+            }
+            words
+        }
+
+        fn scalar_prefix(words: [u64; 4], source: &[u8]) -> usize {
+            source
+                .iter()
+                .take_while(|&&byte| super::byte_bitmap_contains(words, byte))
+                .count()
+        }
+
+        let singleton = [0x80];
+        let sixteen = [
+            0x00, 0x02, 0x04, 0x06, 0x80, 0x82, 0x84, 0x86, 0x88, 0x8a, 0x8c, 0x8e,
+            0xf8, 0xfa, 0xfc, 0xff,
+        ];
+        let seventeen = [
+            0x00, 0x02, 0x04, 0x06, 0x08, 0x80, 0x82, 0x84, 0x86, 0x88, 0x8a, 0x8c,
+            0x8e, 0xf8, 0xfa, 0xfc, 0xff,
+        ];
+        let cases: [(&str, &[u8]); 3] = [
+            ("singleton", &singleton),
+            ("sixteen", &sixteen),
+            ("seventeen", &seventeen),
+        ];
+        let boundaries = [
+            0_usize, 1, 2, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129,
+        ];
+        let members = [b'a', b'p', 0x7f, 0x81, 0x83, 0xfe];
+
+        for (name, exits) in cases {
+            let words = loop_words(exits);
+            let scanner = super::LazyLoopScanner::new(words);
+            assert!(
+                matches!(scanner, super::LazyLoopScanner::Set(_)),
+                "{name}/strategy"
+            );
+            assert_eq!(
+                super::LazyLoopScanner::build_work(words),
+                u64::try_from(super::BYTE_SET_CLASSIFIER_BUILD_WORK).unwrap()
+            );
+            assert_eq!(scanner.words(), words, "{name}/member-set");
+            assert_eq!(
+                scanner.cardinality(),
+                256_u32 - u32::try_from(exits.len()).unwrap(),
+                "{name}/cardinality"
+            );
+            for byte in u8::MIN..=u8::MAX {
+                assert_eq!(
+                    scanner.contains(byte),
+                    super::byte_bitmap_contains(words, byte),
+                    "{name}/byte-{byte:#04x}"
+                );
+            }
+
+            for offset in [0_usize, 1, 3, 15, 16, 31] {
+                for length in boundaries {
+                    let mut source = vec![0xcc; offset];
+                    source.extend(
+                        (0..length).map(|index| members[index % members.len()]),
+                    );
+                    assert_eq!(
+                        scanner.scan_forward(&source[offset..]),
+                        scalar_prefix(words, &source[offset..]),
+                        "{name}/members/offset-{offset}/length-{length}"
+                    );
+                    for exit in [exits[0], exits[exits.len() - 1]] {
+                        let mut terminated = source.clone();
+                        terminated.push(exit);
+                        terminated.extend(std::iter::repeat_n(b'p', 37));
+                        assert_eq!(
+                            scanner.scan_forward(&terminated[offset..]),
+                            scalar_prefix(words, &terminated[offset..]),
+                            "{name}/exit-{exit:#04x}/offset-{offset}/prefix-{length}"
+                        );
+                    }
+                }
             }
         }
     }
@@ -45371,7 +45589,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_loop_cache_resets_probe_when_selected_slot_changes() {
+    fn direct_loop_cache_scopes_probe_cooldown_by_selected_slot() {
         let plan = direct_two_state_inferred_loop();
         let mut haystack = vec![b'b'; super::LAZY_LOOP_SKIP_MIN_BYTES * 2 + 1];
         haystack[0] = b'x';
@@ -46544,24 +46762,29 @@ mod tests {
     }
 
     #[test]
-    fn loop_probe_backoff_bounds_short_runs_and_resets_after_state_change() {
+    fn loop_probe_cooldown_progress_and_overflow_are_exact() {
         let mut probe = super::LazyLoopProbe::default();
-        let end = super::LAZY_LOOP_SKIP_MIN_BYTES * 4;
-        let mut attempts = 0usize;
-        for position in 0..end {
-            if probe.is_ready(position) {
-                attempts += 1;
-                probe.observe(position, 0).unwrap();
-            }
-        }
-        assert_eq!(attempts, 4);
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(core::mem::size_of::<super::LazyLoopProbe>(), 16);
 
-        probe.left_plan_state();
-        assert!(probe.is_ready(1));
-        probe.observe(1, super::ASCII_WIDE_BYTES - 1).unwrap();
-        assert!(!probe.is_ready(1));
-        probe.observe(1, super::ASCII_WIDE_BYTES).unwrap();
-        assert!(probe.is_ready(1));
+        probe.observe(20, 2).unwrap();
+        assert_eq!(
+            probe.retry_at,
+            Some(20 + super::LAZY_LOOP_SKIP_MIN_BYTES)
+        );
+        assert!(!probe.is_ready(20 + super::LAZY_LOOP_SKIP_MIN_BYTES - 1));
+        assert!(probe.is_ready(20 + super::LAZY_LOOP_SKIP_MIN_BYTES));
+
+        probe.observe(54, super::ASCII_WIDE_BYTES).unwrap();
+        assert_eq!(probe, super::LazyLoopProbe::default());
+        assert!(probe.is_ready(54));
+
+        assert!(matches!(
+            probe.observe(usize::MAX - 1, 0),
+            Err(SearchError::ArithmeticOverflow {
+                computation: "lazy loop probe retry position"
+            })
+        ));
     }
 
     #[test]
