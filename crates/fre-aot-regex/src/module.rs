@@ -5986,6 +5986,7 @@ fn build_native_dense_candidate(
     max_native_data_bytes: usize,
     exact_rows: Option<&NativeExactRowInternPlan>,
     column_quotient: Option<&NativeColumnQuotientPlan>,
+    permit_asimd_candidate_mask: bool,
 ) -> Result<Option<(Vec<u8>, NativeDfaLayout)>, ObjectError> {
     let force_class_mapped_applicable = || {
         let class_count = view.dfa.class_count;
@@ -6045,7 +6046,7 @@ fn build_native_dense_candidate(
     };
 
     let lowering =
-        build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
+        build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_and_asimd_policy(
             view,
             architecture,
             vector_cost_model,
@@ -6055,6 +6056,7 @@ fn build_native_dense_candidate(
             exact_rows,
             force_class_mapped,
             column_quotient,
+            permit_asimd_candidate_mask,
         )?;
     require_native_start_scanner(view, max_native_data_bytes, lowering).map(Some)
 }
@@ -7505,9 +7507,9 @@ fn lower_native_dfa_with_entry_contract_and_data_limit(
         .min(max_native_data_bytes);
     let vector_cost_model = native_vector_filter_cost_model_for_target(target, true);
     let relation_vector_owns_route = direct_relation_vector_owns_route(target);
-    let (mut data, mut layout) = build_native_dfa_table_with_cost_model_and_data_limit(
+    let (mut data, mut layout) = build_native_dfa_table_for_target_with_cost_model_and_data_limit(
         view,
-        target.architecture,
+        target,
         vector_cost_model,
         relation_vector_owns_route,
         maximum_native_data_bytes,
@@ -8626,12 +8628,54 @@ fn build_native_dfa_table_with_cost_model(
     clippy::too_many_lines,
     reason = "checked table layout and fixed power-of-two alignment stay contiguous for auditability"
 )]
+#[cfg(test)]
 fn build_native_dfa_table_with_cost_model_and_data_limit(
     view: NativeProgramView<'_>,
     architecture: Architecture,
     vector_cost_model: NativeVectorFilterCostModel,
     relation_vector_owns_route: bool,
     max_native_data_bytes: usize,
+) -> Result<(Vec<u8>, NativeDfaLayout), ObjectError> {
+    build_native_dfa_table_with_cost_model_data_limit_and_asimd_policy(
+        view,
+        architecture,
+        vector_cost_model,
+        relation_vector_owns_route,
+        max_native_data_bytes,
+        architecture == Architecture::Aarch64,
+    )
+}
+
+/// Build a native table for the concrete emitted target.
+///
+/// Architecture-only test builders conservatively retain AArch64 first-lane
+/// data because their eventual feature set is unknown. Once the target is
+/// concrete, a target without ASIMD cannot enter an ASIMD scanner, loop, or
+/// sparse-lookup route, so its ASIMD-only constants are dead data.
+fn build_native_dfa_table_for_target_with_cost_model_and_data_limit(
+    view: NativeProgramView<'_>,
+    target: Target,
+    vector_cost_model: NativeVectorFilterCostModel,
+    relation_vector_owns_route: bool,
+    max_native_data_bytes: usize,
+) -> Result<(Vec<u8>, NativeDfaLayout), ObjectError> {
+    build_native_dfa_table_with_cost_model_data_limit_and_asimd_policy(
+        view,
+        target.architecture,
+        vector_cost_model,
+        relation_vector_owns_route,
+        max_native_data_bytes,
+        target.features.has(CpuFeature::Aarch64Asimd),
+    )
+}
+
+fn build_native_dfa_table_with_cost_model_data_limit_and_asimd_policy(
+    view: NativeProgramView<'_>,
+    architecture: Architecture,
+    vector_cost_model: NativeVectorFilterCostModel,
+    relation_vector_owns_route: bool,
+    max_native_data_bytes: usize,
+    permit_asimd_candidate_mask: bool,
 ) -> Result<(Vec<u8>, NativeDfaLayout), ObjectError> {
     let exact_rows = native_exact_row_intern_candidate_plan(view, architecture);
     // Derivation retains only maps and representative class ordinals. The
@@ -8657,6 +8701,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit(
             max_native_data_bytes,
             exact_rows.as_ref(),
             column_quotient.as_ref(),
+            permit_asimd_candidate_mask,
         ) {
             Ok(Some(lowering)) => {
                 let cost = native_dense_candidate_cost(
@@ -8694,6 +8739,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit(
             max_native_data_bytes,
             exact_rows.as_ref(),
             column_quotient.as_ref(),
+            permit_asimd_candidate_mask,
         ) {
             Ok(Some(lowering)) => return Ok(lowering),
             Ok(None) => {}
@@ -8721,7 +8767,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit(
             && let Some(exact_rows) = exact_rows.as_ref()
         {
             let retry =
-                build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
+                build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_and_asimd_policy(
                     view,
                     architecture,
                     vector_cost_model,
@@ -8731,6 +8777,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit(
                     Some(exact_rows),
                     false,
                     None,
+                    permit_asimd_candidate_mask,
                 )
                 .and_then(|lowering| {
                     require_native_start_scanner(view, max_native_data_bytes, lowering)
@@ -8741,13 +8788,14 @@ fn build_native_dfa_table_with_cost_model_and_data_limit(
                 Err(error) => return Err(error),
             }
         }
-        let retry = build_native_dfa_table_with_cost_model_and_data_limit_once(
+        let retry = build_native_dfa_table_with_cost_model_and_data_limit_once_with_asimd_policy(
             view,
             architecture,
             vector_cost_model,
             relation_vector_owns_route,
             max_native_data_bytes,
             Some(plan),
+            permit_asimd_candidate_mask,
         )
         .and_then(|lowering| {
             require_native_start_scanner(view, max_native_data_bytes, lowering)
@@ -8779,6 +8827,7 @@ fn preserve_dense_decline_after_optional_retry(
     clippy::too_many_lines,
     reason = "checked table layout and fixed power-of-two alignment stay contiguous for auditability"
 )]
+#[cfg(test)]
 fn build_native_dfa_table_with_cost_model_and_data_limit_once(
     view: NativeProgramView<'_>,
     architecture: Architecture,
@@ -8787,7 +8836,27 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once(
     max_native_data_bytes: usize,
     default_exceptions: Option<NativeDefaultExceptionPlan>,
 ) -> Result<(Vec<u8>, NativeDfaLayout), ObjectError> {
-    build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
+    build_native_dfa_table_with_cost_model_and_data_limit_once_with_asimd_policy(
+        view,
+        architecture,
+        vector_cost_model,
+        relation_vector_owns_route,
+        max_native_data_bytes,
+        default_exceptions,
+        architecture == Architecture::Aarch64,
+    )
+}
+
+fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_asimd_policy(
+    view: NativeProgramView<'_>,
+    architecture: Architecture,
+    vector_cost_model: NativeVectorFilterCostModel,
+    relation_vector_owns_route: bool,
+    max_native_data_bytes: usize,
+    default_exceptions: Option<NativeDefaultExceptionPlan>,
+    permit_asimd_candidate_mask: bool,
+) -> Result<(Vec<u8>, NativeDfaLayout), ObjectError> {
+    build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_and_asimd_policy(
         view,
         architecture,
         vector_cost_model,
@@ -8797,6 +8866,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once(
         None,
         false,
         None,
+        permit_asimd_candidate_mask,
     )
 }
 
@@ -8805,6 +8875,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once(
     clippy::too_many_lines,
     reason = "checked table layout and fixed power-of-two alignment stay contiguous for auditability"
 )]
+#[cfg(test)]
 fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
     view: NativeProgramView<'_>,
     architecture: Architecture,
@@ -8815,6 +8886,37 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
     exact_rows: Option<&NativeExactRowInternPlan>,
     force_class_mapped: bool,
     column_quotient: Option<&NativeColumnQuotientPlan>,
+) -> Result<(Vec<u8>, NativeDfaLayout), ObjectError> {
+    build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_and_asimd_policy(
+        view,
+        architecture,
+        vector_cost_model,
+        relation_vector_owns_route,
+        max_native_data_bytes,
+        default_exceptions,
+        exact_rows,
+        force_class_mapped,
+        column_quotient,
+        architecture == Architecture::Aarch64,
+    )
+}
+
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::too_many_lines,
+    reason = "checked table layout and fixed power-of-two alignment stay contiguous for auditability"
+)]
+fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_and_asimd_policy(
+    view: NativeProgramView<'_>,
+    architecture: Architecture,
+    vector_cost_model: NativeVectorFilterCostModel,
+    relation_vector_owns_route: bool,
+    max_native_data_bytes: usize,
+    default_exceptions: Option<NativeDefaultExceptionPlan>,
+    exact_rows: Option<&NativeExactRowInternPlan>,
+    force_class_mapped: bool,
+    column_quotient: Option<&NativeColumnQuotientPlan>,
+    permit_asimd_candidate_mask: bool,
 ) -> Result<(Vec<u8>, NativeDfaLayout), ObjectError> {
     let dfa = view.dfa;
     if force_class_mapped && default_exceptions.is_some() {
@@ -9204,7 +9306,8 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
         row_bytes,
         exact_rows.map(|plan| plan.logical_to_physical.as_slice()),
     )?;
-    let retains_asimd_candidate_mask = architecture == Architecture::Aarch64
+    let retains_asimd_candidate_mask = permit_asimd_candidate_mask
+        && architecture == Architecture::Aarch64
         && (start_filter.is_some_and(|filter| !filter.ranges().is_empty())
             || requested_exact_start_byte_set.is_some()
             || suffix_filter.is_some_and(|suffix| !suffix.filter.ranges().is_empty())
@@ -69601,6 +69704,108 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             &AARCH64_FIRST_LANE_INDEX
         );
         assert_eq!(data.len(), offset + AARCH64_FIRST_LANE_INDEX.len());
+    }
+
+    #[test]
+    fn concrete_aarch64_targets_retain_first_lane_data_only_for_asimd_routes() {
+        let portable = Target::aarch64_linux();
+        let compiled = compile(
+            CompileRequest::new("[abcd]", portable)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists),
+        )
+        .unwrap();
+        let view = compiled.program().native_dfa_view().unwrap();
+        let build_for = |target| {
+            build_native_dfa_table_for_target_with_cost_model_and_data_limit(
+                view,
+                target,
+                native_vector_filter_cost_model_for_target(target, true),
+                direct_relation_vector_owns_route(target),
+                usize::MAX,
+            )
+            .unwrap()
+        };
+
+        let pure_sve = portable
+            .with_features(FeatureSet::of(CpuFeature::Aarch64Sve))
+            .unwrap();
+        let pure_sve2 = portable
+            .with_features(
+                FeatureSet::of(CpuFeature::Aarch64Sve).with(CpuFeature::Aarch64Sve2),
+            )
+            .unwrap();
+        for target in [portable, pure_sve, pure_sve2, Target::aarch64_macos()] {
+            let (_, layout) = build_for(target);
+            assert_eq!(
+                layout.asimd_lane_index_offset, None,
+                "target without ASIMD retained ASIMD-only data: {target:?}"
+            );
+        }
+
+        let asimd = FeatureSet::of(CpuFeature::Aarch64Asimd);
+        let mixed_sve = portable
+            .with_features(asimd.with(CpuFeature::Aarch64Sve))
+            .unwrap();
+        let mixed_sve2 = portable
+            .with_features(
+                asimd
+                    .with(CpuFeature::Aarch64Sve)
+                    .with(CpuFeature::Aarch64Sve2),
+            )
+            .unwrap();
+        for target in [
+            portable.with_features(asimd).unwrap(),
+            mixed_sve,
+            mixed_sve2,
+            Target::aarch64_macos().with_features(asimd).unwrap(),
+        ] {
+            let (_, layout) = build_for(target);
+            assert!(
+                layout.asimd_lane_index_offset.is_some(),
+                "ASIMD-capable target lost runtime fallback data: {target:?}"
+            );
+        }
+
+        let (conservative_data, conservative_layout) =
+            build_native_dfa_table_for_architecture(view, Architecture::Aarch64).unwrap();
+        let (portable_data, portable_layout) = build_for(portable);
+        assert!(conservative_layout.asimd_lane_index_offset.is_some());
+        assert_eq!(portable_layout.asimd_lane_index_offset, None);
+        assert!(portable_data.len() < conservative_data.len());
+    }
+
+    #[test]
+    fn concrete_target_lane_policy_is_a_noop_on_every_x86_tier() {
+        let compiled = compile(
+            CompileRequest::new("[abcd]", Target::x86_64_linux())
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Exists),
+        )
+        .unwrap();
+        let view = compiled.program().native_dfa_view().unwrap();
+        let expected =
+            build_native_dfa_table_for_architecture(view, Architecture::X86_64).unwrap();
+        let avx512 = FeatureSet::of(CpuFeature::X86Avx512F)
+            .with(CpuFeature::X86Avx512Bw)
+            .with(CpuFeature::X86Avx512Vl);
+        for features in [
+            FeatureSet::EMPTY,
+            FeatureSet::of(CpuFeature::X86Sse2),
+            FeatureSet::of(CpuFeature::X86Avx2),
+            avx512,
+        ] {
+            let target = Target::x86_64_linux().with_features(features).unwrap();
+            let actual = build_native_dfa_table_for_target_with_cost_model_and_data_limit(
+                view,
+                target,
+                native_vector_filter_cost_model_for_target(target, true),
+                direct_relation_vector_owns_route(target),
+                usize::MAX,
+            )
+            .unwrap();
+            assert_eq!(actual, expected, "x86 table changed for {features:?}");
+        }
     }
 
     #[test]
