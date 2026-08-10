@@ -13211,11 +13211,9 @@ fn x86_emit_sparse_exception_lookup(
     )?;
     let default = assembler.label()?;
     let done = assembler.label()?;
-    let vector_lanes = match kind {
-        X86StartFilterKind::Sse2 => NATIVE_SPARSE_VECTOR_LANES,
-        X86StartFilterKind::Avx2 | X86StartFilterKind::Avx512Bw => 32,
-    };
+    let vector_lanes = usize::from(kind.width());
     if capacity <= vector_lanes {
+        let wide_opmask = kind == X86StartFilterKind::Avx512Bw;
         match kind {
             X86StartFilterKind::Sse2 => {
                 // Repeat the zero-extended byte in every dword, then every
@@ -13226,13 +13224,13 @@ fn x86_emit_sparse_exception_lookup(
                 assembler.instruction(&[0x66, 0x41, 0x0f, 0x74, 0x42, 0x04])?; // pcmpeqb xmm0,[r10+4]
                 assembler.instruction(&[0x66, 0x0f, 0xd7, 0xc0])?; // pmovmskb eax,xmm0
             }
-            X86StartFilterKind::Avx2 | X86StartFilterKind::Avx512Bw => {
+            X86StartFilterKind::Avx2 => {
                 assembler.instruction(&[0xc5, 0xf9, 0x6e, 0xc0])?; // vmovd xmm0,eax
                 if capacity <= NATIVE_SPARSE_VECTOR_LANES {
                     assembler.instruction(&[0xc4, 0xe2, 0x79, 0x78, 0xc0])?; // vpbroadcastb xmm0,xmm0
                     assembler.instruction(&[0xc4, 0xc1, 0x79, 0x74, 0x42, 0x04])?; // vpcmpeqb xmm0,xmm0,[r10+4]
                     assembler.instruction(&[0xc5, 0xf9, 0xd7, 0xc0])?; // vpmovmskb eax,xmm0
-                } else {
+                } else if capacity <= 32 {
                     // The key bytes are followed by aligned packed values, so
                     // a 32-byte load remains inside the row even when fewer
                     // than 32 keys are live. Mask those value bytes out before
@@ -13254,10 +13252,40 @@ fn x86_emit_sparse_exception_lookup(
                     }
                 }
             }
+            X86StartFilterKind::Avx512Bw => {
+                // Sparse rows pad 5..16 keys and values to 16 physical slots;
+                // larger rows retain every logical slot. Thus every row here
+                // has at least 68 readable bytes from its key base, and one
+                // full ZMM load is in-bounds. Clear padding/value lanes before
+                // selecting the first exact key.
+                assembler.instruction(&[0x62, 0xf2, 0x7d, 0x48, 0x7a, 0xc0])?; // vpbroadcastb zmm0,eax
+                assembler.instruction(&[
+                    0x62, 0xd1, 0x7d, 0x48, 0x74, 0x8a, 0x04, 0x00, 0x00, 0x00,
+                ])?; // vpcmpeqb k1,zmm0,[r10+4]
+                assembler.instruction(&[0xc4, 0xe1, 0xfb, 0x93, 0xc1])?; // kmovq rax,k1
+                if capacity < 64 {
+                    let shift = 64_usize.checked_sub(capacity).ok_or(
+                        ObjectError::ArithmeticOverflow("x86 AVX-512 sparse live lanes"),
+                    )?;
+                    let shift = u8::try_from(shift).map_err(|_| {
+                        ObjectError::ArithmeticOverflow("x86 AVX-512 sparse live shift")
+                    })?;
+                    assembler.instruction(&[0x48, 0xc1, 0xe0, shift])?; // shl rax,64-capacity
+                    assembler.instruction(&[0x48, 0xc1, 0xe8, shift])?; // shr rax,64-capacity
+                }
+            }
         }
-        assembler.instruction(&[0x85, 0xc0])?; // test eax,eax
+        if wide_opmask {
+            assembler.instruction(&[0x48, 0x85, 0xc0])?; // test rax,rax
+        } else {
+            assembler.instruction(&[0x85, 0xc0])?; // test eax,eax
+        }
         assembler.branch(&[0x0f, 0x84], default)?;
-        assembler.instruction(&[0x0f, 0xbc, 0xc0])?; // bsf eax,eax
+        if wide_opmask {
+            assembler.instruction(&[0x48, 0x0f, 0xbc, 0xc0])?; // bsf rax,rax
+        } else {
+            assembler.instruction(&[0x0f, 0xbc, 0xc0])?; // bsf eax,eax
+        }
         let value_offset = u32::try_from(value_offset)
             .map_err(|_| ObjectError::ArithmeticOverflow("x86 scalable vector value offset"))?;
         let mut load = vec![0x41, 0x8b, 0x84, 0x82]; // mov eax,[r10+rax*4+disp32]
@@ -15994,8 +16022,22 @@ fn lower_x86_64_dfa_with_entry_contract(
                 .filter(|filter| !filter.ranges().is_empty())
         })
         .or_else(|| layout.loop_skip.map(|skip| skip.filter));
+    let table_lookup_kind = x86_start_filter_kind(features);
     let filter_kind = (layout.exact_start_byte_set.is_some() || instruction_filter.is_some())
-        .then(|| x86_start_filter_kind(features));
+        .then_some(table_lookup_kind);
+    let table_lookup_needs_vzeroupper = layout
+        .transitions
+        .scalable_exception_capacity()
+        .is_some_and(|capacity| match table_lookup_kind {
+            X86StartFilterKind::Sse2 => false,
+            X86StartFilterKind::Avx2 => {
+                usize::from(capacity) > NATIVE_SPARSE_VECTOR_LANES
+                    && usize::from(capacity) <= usize::from(table_lookup_kind.width())
+            }
+            X86StartFilterKind::Avx512Bw => {
+                usize::from(capacity) <= usize::from(table_lookup_kind.width())
+            }
+        });
     let exact_vector_kind = if layout.exact_start_byte_set.is_some() {
         filter_kind.filter(|kind| !matches!(kind, X86StartFilterKind::Sse2))
     } else {
@@ -16830,7 +16872,9 @@ fn lower_x86_64_dfa_with_entry_contract(
         assembler.instruction(&[0x41, 0x5d])?; // pop r13
         assembler.instruction(&[0x41, 0x5c])?; // pop r12
     }
-    if filter_kind.is_some_and(X86StartFilterKind::needs_vzeroupper) {
+    if filter_kind.is_some_and(X86StartFilterKind::needs_vzeroupper)
+        || table_lookup_needs_vzeroupper
+    {
         assembler.instruction(&[0xc5, 0xf8, 0x77])?;
     }
     assembler.instruction(&[0xc3])?;
@@ -59407,43 +59451,50 @@ int main(void){{
             ),
         ];
         for (target, expected_tier) in targets {
-            let dense = build_native_dfa_table_with_cost_model_and_data_limit_once(
+            let sparse = build_forced_default_exception_table(
                 view,
                 target.architecture,
-                NativeVectorFilterCostModel::Established,
-                true,
                 usize::MAX,
-                None,
             )
             .unwrap();
-            let lowering = lower_native_dfa_with_entry_contract_and_data_limit(
-                view,
-                target,
-                NativeDfaEntryContract::PreparedPartialCore,
-                dense.0.len() - 1,
-            )
-            .unwrap()
-            .unwrap_or_else(|| panic!("scalable vector target declined: {target:?}"));
+            assert_eq!(
+                sparse.1.transitions,
+                TransitionLayout::DefaultByteSparseExceptions(16),
+                "{target:?}",
+            );
+            let code = match target.architecture {
+                Architecture::X86_64 => {
+                    lower_x86_64_dfa(sparse.1, target.features).unwrap().0
+                }
+                Architecture::Aarch64 => lower_aarch64_dfa_for_operating_system(
+                    sparse.1,
+                    target.features,
+                    target.operating_system,
+                    None,
+                )
+                .unwrap()
+                .0,
+            };
             match target.architecture {
                 Architecture::X86_64 => {
                     let has = |instruction: &[u8]| {
-                        lowering
-                            .code
+                        code
                             .windows(instruction.len())
                             .any(|bytes| bytes == instruction)
                     };
                     assert!(!has(&[0x41, 0x0f, 0xb6, 0x04, 0x01]), "{target:?}");
-                    assert!(has(&[0x0f, 0xbc, 0xc0]), "{target:?}");
                     assert!(has(&[0x41, 0x8b, 0x84, 0x82, 20, 0, 0, 0]), "{target:?}",);
                     match expected_tier {
                         StartAccelerator::X86Sse2 => {
+                            assert!(has(&[0x0f, 0xbc, 0xc0]), "{target:?}");
                             assert!(has(&[0x69, 0xc0, 1, 1, 1, 1]), "{target:?}");
                             assert!(has(&[0x66, 0x0f, 0x6e, 0xc0]), "{target:?}");
                             assert!(has(&[0x66, 0x0f, 0x70, 0xc0, 0]), "{target:?}",);
                             assert!(has(&[0x66, 0x41, 0x0f, 0x74, 0x42, 4]), "{target:?}",);
                             assert!(has(&[0x66, 0x0f, 0xd7, 0xc0]), "{target:?}");
                         }
-                        StartAccelerator::X86Avx2 | StartAccelerator::X86Avx512Bw => {
+                        StartAccelerator::X86Avx2 => {
+                            assert!(has(&[0x0f, 0xbc, 0xc0]), "{target:?}");
                             assert!(has(&[0xc5, 0xf9, 0x6e, 0xc0]), "{target:?}");
                             assert!(has(&[0xc4, 0xe2, 0x79, 0x78, 0xc0]), "{target:?}",);
                             assert!(has(&[0xc4, 0xc1, 0x79, 0x74, 0x42, 4]), "{target:?}",);
@@ -59453,12 +59504,27 @@ int main(void){{
                                 "{target:?} used a legacy compare in an AVX loop",
                             );
                         }
+                        StartAccelerator::X86Avx512Bw => {
+                            for instruction in [
+                                &[0x62, 0xf2, 0x7d, 0x48, 0x7a, 0xc0][..],
+                                &[0x62, 0xd1, 0x7d, 0x48, 0x74, 0x8a, 4, 0, 0, 0][..],
+                                &[0xc4, 0xe1, 0xfb, 0x93, 0xc1][..],
+                                &[0x48, 0xc1, 0xe0, 48][..],
+                                &[0x48, 0xc1, 0xe8, 48][..],
+                                &[0x48, 0x0f, 0xbc, 0xc0][..],
+                            ] {
+                                assert!(has(instruction), "{target:?}/{instruction:x?}");
+                            }
+                            assert!(
+                                !has(&[0xc4, 0xe2, 0x79, 0x78, 0xc0]),
+                                "{target:?} used undeclared AVX2 in the AVX-512 lookup",
+                            );
+                        }
                         other => panic!("unexpected x86 accelerator {other:?}"),
                     }
                 }
                 Architecture::Aarch64 => {
-                    let words = lowering
-                        .code
+                    let words = code
                         .chunks_exact(4)
                         .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
                         .collect::<Vec<_>>();
@@ -59556,6 +59622,65 @@ int main(void){{
             );
         }
 
+        // AVX-512BW probes up to one full ZMM without assuming AVX2 or
+        // AVX-512VL. Loads that overlap aligned value storage are made exact
+        // by clearing every non-key mask bit before BSF.
+        for capacity in [5_u8, 16, 17, 31, 32, 33, 63, 64] {
+            let mut assembler = X86Assembler::new();
+            x86_emit_sparse_exception_lookup(
+                &mut assembler,
+                capacity,
+                NativeCellEncoding::Wide32,
+                X86StartFilterKind::Avx512Bw,
+            )
+            .unwrap();
+            let code = assembler.finish().unwrap();
+            for instruction in [
+                &[0x62, 0xf2, 0x7d, 0x48, 0x7a, 0xc0][..],
+                &[0x62, 0xd1, 0x7d, 0x48, 0x74, 0x8a, 4, 0, 0, 0][..],
+                &[0xc4, 0xe1, 0xfb, 0x93, 0xc1][..],
+                &[0x48, 0x85, 0xc0][..],
+                &[0x48, 0x0f, 0xbc, 0xc0][..],
+            ] {
+                assert!(code
+                    .windows(instruction.len())
+                    .any(|bytes| bytes == instruction));
+            }
+            for forbidden in [
+                &[0xc4, 0xe2, 0x79, 0x78, 0xc0][..],
+                &[0xc4, 0xe2, 0x7d, 0x78, 0xc0][..],
+                &[0xc4, 0xc1, 0x79, 0x74, 0x42, 4][..],
+                &[0xc4, 0xc1, 0x7d, 0x74, 0x42, 4][..],
+                &[0xc5, 0xf9, 0xd7, 0xc0][..],
+                &[0xc5, 0xfd, 0xd7, 0xc0][..],
+            ] {
+                assert!(!code
+                    .windows(forbidden.len())
+                    .any(|bytes| bytes == forbidden));
+            }
+            let value_offset = native_default_exception_value_offset(capacity).unwrap();
+            let vector_end = core::mem::size_of::<u32>()
+                .checked_add(usize::from(X86StartFilterKind::Avx512Bw.width()))
+                .unwrap();
+            assert!(
+                vector_end <= native_default_exception_row_bytes(capacity).unwrap()
+            );
+            let mut indexed_load = vec![0x41, 0x8b, 0x84, 0x82];
+            indexed_load.extend_from_slice(&u32::try_from(value_offset).unwrap().to_le_bytes());
+            assert!(code
+                .windows(indexed_load.len())
+                .any(|bytes| bytes == indexed_load));
+            let shift = 64_u8.checked_sub(capacity).unwrap();
+            for opcode in [0xe0, 0xe8] {
+                let instruction = [0x48, 0xc1, opcode, shift];
+                assert_eq!(
+                    code.windows(instruction.len())
+                        .any(|bytes| bytes == instruction),
+                    capacity < 64,
+                );
+            }
+        }
+
         // The mathematical 255-slot layout is accepted by both emitters,
         // including their largest key and value displacements.
         let mut x86_maximum = X86Assembler::new();
@@ -59585,11 +59710,14 @@ int main(void){{
             .expect("scalable binary base")
             .native;
         let view = fixture.view(base, false);
+        let avx512 =
+            FeatureSet::of(CpuFeature::X86Avx512F).with(CpuFeature::X86Avx512Bw);
         let targets = [
             Target::x86_64_linux(),
             Target::x86_64_linux()
                 .with_features(FeatureSet::of(CpuFeature::X86Avx2))
                 .unwrap(),
+            Target::x86_64_linux().with_features(avx512).unwrap(),
             Target::aarch64_linux(),
             Target::aarch64_linux()
                 .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
@@ -59631,7 +59759,8 @@ int main(void){{
                             .windows(5)
                             .any(|bytes| bytes == [0x41, 0x0f, 0xb6, 0x04, 0x01])
                     );
-                    match x86_start_filter_kind(target.features) {
+                    let kind = x86_start_filter_kind(target.features);
+                    match kind {
                         X86StartFilterKind::Sse2 => {
                             let root_offset = code
                                 .windows(root.len())
@@ -59658,7 +59787,7 @@ int main(void){{
                                 bytes == [0x66, 0x41, 0x0f, 0x74, 0x42, 4]
                             }));
                         }
-                        X86StartFilterKind::Avx2 | X86StartFilterKind::Avx512Bw => {
+                        X86StartFilterKind::Avx2 => {
                             assert!(!code
                                 .windows(root.len())
                                 .any(|bytes| bytes == root));
@@ -59674,6 +59803,47 @@ int main(void){{
                                     .any(|bytes| bytes == instruction));
                             }
                         }
+                        X86StartFilterKind::Avx512Bw => {
+                            assert!(!code
+                                .windows(root.len())
+                                .any(|bytes| bytes == root));
+                            for instruction in [
+                                &[0x62, 0xf2, 0x7d, 0x48, 0x7a, 0xc0][..],
+                                &[0x62, 0xd1, 0x7d, 0x48, 0x74, 0x8a, 4, 0, 0, 0][..],
+                                &[0xc4, 0xe1, 0xfb, 0x93, 0xc1][..],
+                                &[0x48, 0xc1, 0xe0, 33][..],
+                                &[0x48, 0xc1, 0xe8, 33][..],
+                                &[0x48, 0x85, 0xc0][..],
+                                &[0x48, 0x0f, 0xbc, 0xc0][..],
+                                &[0x41, 0x8b, 0x84, 0x82, 36, 0, 0, 0][..],
+                            ] {
+                                assert!(code
+                                    .windows(instruction.len())
+                                    .any(|bytes| bytes == instruction));
+                            }
+                        }
+                    }
+                    if kind.needs_vzeroupper() {
+                        let bare_sparse = NativeDfaLayout {
+                            exact_prefix_match_width: None,
+                            start_filter: None,
+                            exact_start_byte_set: None,
+                            exact_start_storage: None,
+                            suffix_filter: None,
+                            seeded_reverse: None,
+                            loop_skip: None,
+                            vector_filter: None,
+                            prefix_filter: None,
+                            prefix_relation: None,
+                            prefix_block: None,
+                            prefix_fast_forward: None,
+                            ..sparse.1
+                        };
+                        let bare_code =
+                            lower_x86_64_dfa(bare_sparse, target.features).unwrap().0;
+                        assert!(bare_code
+                            .windows(4)
+                            .any(|bytes| bytes == [0xc5, 0xf8, 0x77, 0xc3]));
                     }
                 }
                 Architecture::Aarch64 => {
