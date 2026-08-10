@@ -37656,6 +37656,87 @@ mod tests {
         )
     }
 
+    fn lower_forced_default_exception_table_for_target(
+        view: NativeProgramView<'_>,
+        target: Target,
+    ) -> Result<NativeLowering, ObjectError> {
+        let maximum = usize::try_from(CELL_NEXT_MASK)
+            .map_err(|_| ObjectError::ArithmeticOverflow("native table address limit"))?;
+        let vector_cost_model = native_vector_filter_cost_model_for_target(target, true);
+        let relation_vector_owns_route = direct_relation_vector_owns_route(target);
+        let plan = derive_native_default_exception_plan(
+            view.dfa,
+            view.partial_discovered_states,
+            view.collapse_partial_holes,
+            target.architecture,
+        )
+        .expect("synthetic default-exception plan");
+        let (mut data, mut layout) =
+            build_native_dfa_table_with_cost_model_and_data_limit_once_with_asimd_policy(
+                view,
+                target.architecture,
+                vector_cost_model,
+                relation_vector_owns_route,
+                maximum,
+                Some(plan),
+                target.features.has(CpuFeature::Aarch64Asimd),
+            )?;
+        let sve_filter_plan = install_aarch64_sve_filter_plan_with_limit(
+            &mut data,
+            layout,
+            target,
+            maximum,
+        )?;
+        let sve_suffix_kind = install_aarch64_sve_suffix_kind_with_limit(
+            &mut data,
+            layout,
+            target,
+            maximum,
+        )?;
+        install_aarch64_sve_loop_storage_with_limit(
+            &mut data,
+            &mut layout,
+            target,
+            maximum,
+        )?;
+        let entry_contract = NativeDfaEntryContract::PreparedPartialCore;
+        let emission = match target.architecture {
+            Architecture::X86_64 => {
+                lower_x86_64_dfa_with_entry_contract(
+                    layout,
+                    target.features,
+                    entry_contract,
+                )?
+            }
+            Architecture::Aarch64 => lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
+                layout,
+                target.features,
+                target.operating_system,
+                sve_filter_plan,
+                sve_suffix_kind,
+                entry_contract,
+            )?,
+        };
+        let start_accelerator = selected_start_accelerator(
+            layout,
+            target,
+            sve_filter_plan,
+            sve_suffix_kind,
+            emission.scanner,
+        );
+        Ok(NativeLowering {
+            code: emission.code,
+            data,
+            relocations: emission.relocations,
+            slow_partial_table: None,
+            needs_runtime: false,
+            start_accelerator,
+            anchored_prefix_filter_bytes: layout
+                .prefix_filter
+                .map_or(0, |filter| filter.guaranteed_bytes),
+        })
+    }
+
     fn scalable_default_exception_packed_at(
         data: &[u8],
         layout: NativeDfaLayout,
@@ -56627,6 +56708,21 @@ int main(void){{
                         bytes == [0x66, 0x41, 0x0f, 0x74, 0x42, 4]
                     }), "{target:?}");
                 }
+                Architecture::X86_64 if expected_isa == NativeScannerIsa::X86Avx512Bw => {
+                    for instruction in [
+                        &[0x62, 0xf2, 0x7d, 0x48, 0x7a, 0xc0][..],
+                        &[0x62, 0xd1, 0x7d, 0x48, 0x74, 0x8a, 4, 0, 0, 0][..],
+                        &[0xc4, 0xe1, 0xfb, 0x93, 0xc1][..],
+                    ] {
+                        assert!(emission
+                            .code
+                            .windows(instruction.len())
+                            .any(|bytes| bytes == instruction), "{target:?}");
+                    }
+                    assert!(!emission.code.windows(6).any(|bytes| {
+                        bytes == [0xc4, 0xc1, 0x79, 0x74, 0x42, 4]
+                    }), "{target:?}");
+                }
                 Architecture::X86_64 => {
                     assert!(emission.code.windows(6).any(|bytes| {
                         bytes == [0xc4, 0xc1, 0x79, 0x74, 0x42, 4]
@@ -58303,23 +58399,6 @@ int main(void){{
             );
             assert_eq!(sparse.1.cells, NativeCellEncoding::Wide32);
 
-            let admitted = build_native_dfa_table_with_cost_model_and_data_limit(
-                view,
-                architecture,
-                NativeVectorFilterCostModel::Established,
-                true,
-                sparse.0.len(),
-            )
-            .unwrap();
-            assert_eq!(admitted, sparse, "{architecture:?}");
-            let below = build_native_dfa_table_with_cost_model_and_data_limit(
-                view,
-                architecture,
-                NativeVectorFilterCostModel::Established,
-                true,
-                sparse.0.len() - 1,
-            )
-            .unwrap();
             let quotient = build_forced_column_quotient_table(
                 view,
                 architecture,
@@ -58329,6 +58408,34 @@ int main(void){{
             )
             .unwrap();
             assert!(quotient.0.len() < sparse.0.len(), "{architecture:?}");
+
+            let admitted = build_native_dfa_table_with_cost_model_and_data_limit(
+                view,
+                architecture,
+                NativeVectorFilterCostModel::Established,
+                true,
+                sparse.0.len(),
+            )
+            .unwrap();
+            assert_eq!(admitted, quotient, "{architecture:?}");
+            assert_eq!(
+                build_forced_default_exception_table(
+                    view,
+                    architecture,
+                    sparse.0.len(),
+                )
+                .unwrap(),
+                sparse,
+                "{architecture:?}",
+            );
+            let below = build_native_dfa_table_with_cost_model_and_data_limit(
+                view,
+                architecture,
+                NativeVectorFilterCostModel::Established,
+                true,
+                sparse.0.len() - 1,
+            )
+            .unwrap();
             assert_eq!(below, quotient, "{architecture:?}");
 
             let data = &sparse.0;
@@ -58676,7 +58783,15 @@ int main(void){{
         .unwrap();
         assert_eq!(ordinal_prefix, 336);
         for architecture in [Architecture::X86_64, Architecture::Aarch64] {
-            let dense = build_native_dfa_table_for_architecture(view, architecture).unwrap();
+            let dense = build_native_dfa_table_with_cost_model_and_data_limit_once(
+                view,
+                architecture,
+                NativeVectorFilterCostModel::Established,
+                true,
+                usize::MAX,
+                None,
+            )
+            .unwrap();
             assert_eq!(dense.1.cells, cells, "{architecture:?}");
             assert_eq!(usize::try_from(dense.1.reverse_offset).unwrap(), 33_936);
 
@@ -59940,23 +60055,8 @@ int main(void){{
             ),
         ];
         for (target, expected_accelerator) in targets {
-            let dense = build_native_dfa_table_with_cost_model_and_data_limit_once(
-                view,
-                target.architecture,
-                NativeVectorFilterCostModel::Established,
-                true,
-                usize::MAX,
-                None,
-            )
-            .unwrap();
-            let lowering = lower_native_dfa_with_entry_contract_and_data_limit(
-                view,
-                target,
-                NativeDfaEntryContract::PreparedPartialCore,
-                dense.0.len() - 1,
-            )
-            .unwrap()
-            .unwrap_or_else(|| panic!("packed collapsed target declined: {target:?}"));
+            let lowering =
+                lower_forced_default_exception_table_for_target(view, target).unwrap();
             assert_eq!(
                 lowering.start_accelerator,
                 expected_accelerator,
@@ -60069,14 +60169,8 @@ int main(void){{
             );
             assert_eq!(sparse.1.forward_offset, 0, "{target:?}");
             assert!(sparse.0.len() < dense.0.len(), "{target:?}");
-            let lowering = lower_native_dfa_with_entry_contract_and_data_limit(
-                view,
-                target,
-                NativeDfaEntryContract::PreparedPartialCore,
-                dense.0.len() - 1,
-            )
-            .unwrap()
-            .unwrap_or_else(|| panic!("byte-boundary target declined: {target:?}"));
+            let lowering =
+                lower_forced_default_exception_table_for_target(view, target).unwrap();
             let forward_end = usize::try_from(sparse.1.reverse_offset).unwrap();
             assert_eq!(
                 &lowering.data[..forward_end],
@@ -78356,26 +78450,31 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             TransitionLayout::ClassMapped
         );
 
+        let resource_target = Target::aarch64_macos();
         let resource_fixture = compile(
             CompileRequest::new(
                 "abcdefghijklmnopqrstuvwxyz012345",
-                Target::aarch64_macos(),
+                resource_target,
             )
             .mode(CompileMode::Optimizing)
             .output(OutputContract::SelectedEnd),
         )
         .unwrap();
         let resource_view = resource_fixture.program().native_dfa_view().unwrap();
-        let (resource_data, resource_layout) = build_native_dfa_table_for_architecture(
+        let (resource_data, resource_layout) =
+            build_native_dfa_table_for_target_with_cost_model_and_data_limit(
             resource_view,
-            Architecture::Aarch64,
+            resource_target,
+            native_vector_filter_cost_model_for_target(resource_target, true),
+            direct_relation_vector_owns_route(resource_target),
+            usize::MAX,
         )
         .unwrap();
         assert_eq!(resource_layout.transitions, TransitionLayout::ClassMapped);
         assert_eq!(resource_layout.cells, NativeCellEncoding::Compact16);
         let exactly_bounded = lower_native_dfa_with_data_limit(
             resource_view,
-            Target::aarch64_macos(),
+            resource_target,
             resource_data.len(),
         )
         .unwrap()
