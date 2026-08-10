@@ -39580,7 +39580,7 @@ mod tests {
             collapse_holes,
         };
 
-        let class_map = core::array::from_fn(|byte| {
+        let class_map: [u8; CLASS_MAP_BYTES] = core::array::from_fn(|byte| {
             u8::try_from((byte * 73 + 19) & usize::from(u8::MAX)).unwrap()
         });
         let default = ForwardCell::new(0, false);
