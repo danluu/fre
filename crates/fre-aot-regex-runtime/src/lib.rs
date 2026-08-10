@@ -563,8 +563,24 @@ impl PreparedAotRegex {
         })
     }
 
+    /// Retire every outstanding compiler-private static-prefix invocation and
+    /// return the prior capabilities to the one path that may consume them.
+    #[inline]
+    fn retire_static_prefix_capabilities(
+        &mut self,
+    ) -> (
+        Option<StaticPrefixObjectTicket>,
+        Option<StaticPrefixSpanPostflightTicket>,
+    ) {
+        (
+            self.static_prefix_object_ticket.take(),
+            self.static_prefix_span_postflight_ticket.take(),
+        )
+    }
+
     #[inline]
     fn deactivate_frozen_header(&mut self) {
+        let _ = self.retire_static_prefix_capabilities();
         debug_assert!(
             !self.frozen_header.has_dynamic_rows() || self.frozen_dynamic_rows.is_some(),
             "an active compact header must retain its immutable payload owner"
@@ -590,6 +606,7 @@ impl PreparedAotRegex {
         expected_artifact_identity: [u8; ARTIFACT_IDENTITY_BYTES],
         descriptor_address: usize,
     ) -> Result<(), CompileError> {
+        let _ = self.retire_static_prefix_capabilities();
         if expected_artifact_identity != *self.frozen_header.artifact_identity()
             || descriptor_address == 0
         {
@@ -615,8 +632,8 @@ impl PreparedAotRegex {
         // A second continuation is a replay, not the synchronous Span
         // postflight selected by the first continuation. Retire any such
         // postflight capability before rejecting the missing object ticket.
-        self.static_prefix_span_postflight_ticket = None;
-        let ticket = self.static_prefix_object_ticket.take().ok_or(
+        let (object, _) = self.retire_static_prefix_capabilities();
+        let ticket = object.ok_or(
             CompileError::InternalInvariant(
                 "static-prefix continuation has no synchronous object ticket",
             ),
@@ -636,7 +653,7 @@ impl PreparedAotRegex {
         &mut self,
         ticket: StaticPrefixObjectTicket,
     ) -> Result<(), CompileError> {
-        self.static_prefix_span_postflight_ticket = None;
+        let _ = self.retire_static_prefix_capabilities();
         if self.program.output_contract() != OutputContract::Span
             || self.program.exact_match_width().is_some()
         {
@@ -663,8 +680,7 @@ impl PreparedAotRegex {
         window: SearchWindow,
         expected_artifact_identity: [u8; ARTIFACT_IDENTITY_BYTES],
     ) -> Result<(), CompileError> {
-        let object = self.static_prefix_object_ticket.take();
-        let postflight = self.static_prefix_span_postflight_ticket.take();
+        let (object, postflight) = self.retire_static_prefix_capabilities();
         let (haystack_address, haystack_len, admitted_window, artifact_identity) =
             match (object, postflight) {
                 (Some(ticket), None) => (
@@ -2196,6 +2212,13 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_compiler_private_search_exclusive
         || window_start > window_end
         || window_end > haystack_len
     {
+        // SAFETY: every non-invalid handle supplied to this unsafe ABI remains
+        // one live exclusively owned prepared allocation even when another
+        // boundary argument is malformed.
+        let _ = unsafe {
+            &mut *handle.0.cast::<PreparedAotRegex>()
+        }
+        .retire_static_prefix_capabilities();
         return STATUS_INVALID_ARGUMENT;
     }
 
@@ -2208,8 +2231,7 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_compiler_private_search_exclusive
             .cast::<[u8; ARTIFACT_IDENTITY_BYTES]>()
             .read();
         let prepared = &mut *handle.0.cast::<PreparedAotRegex>();
-        prepared.static_prefix_object_ticket = None;
-        prepared.static_prefix_span_postflight_ticket = None;
+        let _ = prepared.retire_static_prefix_capabilities();
         let window = SearchWindow::new(window_start, window_end);
         let Ok(preflight) = prepared.preflight_static_prefix_complete_proofs(
             haystack,
@@ -2277,6 +2299,12 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_compiler_private_search_exclusive
         || !result_ptr.is_aligned()
         || haystack_len > isize::MAX.unsigned_abs()
     {
+        // SAFETY: the non-invalid exclusive handle remains live even though a
+        // continuation payload or output pointer is malformed.
+        let _ = unsafe {
+            &mut *handle.0.cast::<PreparedAotRegex>()
+        }
+        .retire_static_prefix_capabilities();
         return STATUS_INVALID_ARGUMENT;
     }
 
@@ -2483,6 +2511,12 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_compiler_private_search_exclusive
         || selected_end <= window_start
         || selected_end > window_end
     {
+        // SAFETY: the non-invalid exclusive handle remains live even though a
+        // postflight payload or output pointer is malformed.
+        let _ = unsafe {
+            &mut *handle.0.cast::<PreparedAotRegex>()
+        }
+        .retire_static_prefix_capabilities();
         return STATUS_INVALID_ARGUMENT;
     }
 
@@ -4466,6 +4500,42 @@ mod tests {
             .expect("publish authenticated continuation postflight");
         assert!(prepared.static_prefix_object_ticket.is_none());
         assert!(prepared.static_prefix_span_postflight_ticket.is_some());
+    }
+
+    fn static_prefix_capability_presence(
+        handle: FreAotRegexExclusiveHandleV1,
+    ) -> (bool, bool) {
+        // SAFETY: lifecycle tests call this only while they uniquely own the
+        // live allocation and no search or destruction overlaps the read.
+        let prepared = unsafe { &*handle.0.cast::<PreparedAotRegex>() };
+        (
+            prepared.static_prefix_object_ticket.is_some(),
+            prepared.static_prefix_span_postflight_ticket.is_some(),
+        )
+    }
+
+    fn admit_static_prefix_span_postflight_for_test(
+        handle: FreAotRegexExclusiveHandleV1,
+        haystack: &[u8],
+        result: &mut FreAotRegexResultV1,
+        expected_artifact_identity: &[u8; ARTIFACT_IDENTITY_BYTES],
+        descriptor: &[u32],
+    ) {
+        assert_eq!(
+            call_exclusive_static_prefix_preflight_v2(
+                handle,
+                haystack,
+                0,
+                haystack.len(),
+                result,
+                expected_artifact_identity,
+                descriptor,
+            ),
+            STATUS_PARTIAL_PREFLIGHT_ENTER
+        );
+        assert_eq!(static_prefix_capability_presence(handle), (true, false));
+        publish_static_prefix_span_postflight_for_test(handle, haystack);
+        assert_eq!(static_prefix_capability_presence(handle), (false, true));
     }
 
     fn exclusive_frozen_header_is_active(handle: FreAotRegexExclusiveHandleV1) -> bool {
@@ -8105,6 +8175,381 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
             ),
             STATUS_RUNTIME_FAILURE,
             "a successful continuation postflight is single-use"
+        );
+        assert_eq!(result, sentinel);
+
+        // SAFETY: this test owns the unique live handle and no call overlaps
+        // destruction.
+        assert_eq!(
+            unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(handle) },
+            STATUS_SUCCESS
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one boundary test proves every malformed V2 entry retires both capability kinds"
+    )]
+    fn static_prefix_v2_malformed_boundaries_retire_capabilities() {
+        let compiled = compile(
+            CompileRequest::new("(?:ab|ac)+z", Target::x86_64_linux())
+                .mode(CompileMode::Fast)
+                .output(OutputContract::Span),
+        )
+        .expect("compile malformed-boundary Span fixture");
+        let identity = compiled.receipt().program_sha256;
+        let serialized = compiled.program().serialize().expect("serialize fixture");
+        let handle = prepare_exclusive(&serialized);
+        let haystack = b"xxabacz";
+        let descriptor = [0_u32; STATIC_PREFIX_RESUME_DESCRIPTOR_V1_HEADER_BYTES / 4];
+        let sentinel = FreAotRegexResultV1 {
+            start: 0xfeed_face,
+            end: 0xdead_beef,
+        };
+        let mut result = sentinel;
+        let mut misaligned_storage = std::mem::MaybeUninit::<FreAotRegexResultV1>::uninit();
+        // SAFETY: adding one byte to an aligned live result allocation creates
+        // a live but deliberately misaligned pointer. Every tested boundary
+        // rejects it before dereference.
+        let misaligned_result = unsafe {
+            misaligned_storage
+                .as_mut_ptr()
+                .cast::<u8>()
+                .add(1)
+                .cast::<FreAotRegexResultV1>()
+        };
+        assert!(!misaligned_result.is_aligned());
+
+        admit_static_prefix_span_postflight_for_test(
+            handle,
+            haystack,
+            &mut result,
+            &identity,
+            &descriptor,
+        );
+        // SAFETY: the test owns the live handle and every readable extent; a
+        // null result is deliberately supplied to exercise early retirement.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_preflight_v2(
+                    handle,
+                    haystack.as_ptr(),
+                    haystack.len(),
+                    0,
+                    haystack.len(),
+                    std::ptr::null_mut(),
+                    identity.as_ptr(),
+                    descriptor.as_ptr(),
+                )
+            },
+            STATUS_INVALID_ARGUMENT
+        );
+        assert_eq!(static_prefix_capability_presence(handle), (false, false));
+
+        admit_static_prefix_span_postflight_for_test(
+            handle,
+            haystack,
+            &mut result,
+            &identity,
+            &descriptor,
+        );
+        // SAFETY: identical live extents to the preceding call; only the
+        // deliberately misaligned output differs.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_preflight_v2(
+                    handle,
+                    haystack.as_ptr(),
+                    haystack.len(),
+                    0,
+                    haystack.len(),
+                    misaligned_result,
+                    identity.as_ptr(),
+                    descriptor.as_ptr(),
+                )
+            },
+            STATUS_INVALID_ARGUMENT
+        );
+        assert_eq!(static_prefix_capability_presence(handle), (false, false));
+
+        assert_eq!(
+            call_exclusive_static_prefix_preflight_v2(
+                handle,
+                haystack,
+                0,
+                haystack.len(),
+                &mut result,
+                &identity,
+                &descriptor,
+            ),
+            STATUS_PARTIAL_PREFLIGHT_ENTER
+        );
+        assert_eq!(static_prefix_capability_presence(handle), (true, false));
+        // SAFETY: a null output is the sole malformed continuation argument.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_continue_v1(
+                    handle,
+                    haystack.as_ptr(),
+                    haystack.len(),
+                    std::ptr::null_mut(),
+                    0,
+                    1,
+                    0,
+                )
+            },
+            STATUS_INVALID_ARGUMENT
+        );
+        assert_eq!(static_prefix_capability_presence(handle), (false, false));
+
+        assert_eq!(
+            call_exclusive_static_prefix_preflight_v2(
+                handle,
+                haystack,
+                0,
+                haystack.len(),
+                &mut result,
+                &identity,
+                &descriptor,
+            ),
+            STATUS_PARTIAL_PREFLIGHT_ENTER
+        );
+        // SAFETY: the live continuation inputs are valid except for the
+        // deliberately misaligned output pointer.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_continue_v1(
+                    handle,
+                    haystack.as_ptr(),
+                    haystack.len(),
+                    misaligned_result,
+                    0,
+                    1,
+                    0,
+                )
+            },
+            STATUS_INVALID_ARGUMENT
+        );
+        assert_eq!(static_prefix_capability_presence(handle), (false, false));
+
+        admit_static_prefix_span_postflight_for_test(
+            handle,
+            haystack,
+            &mut result,
+            &identity,
+            &descriptor,
+        );
+        // SAFETY: the postflight carries valid readable inputs and a null
+        // output solely to exercise its early invalid-argument path.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_recover_span_v2(
+                    handle,
+                    haystack.as_ptr(),
+                    haystack.len(),
+                    0,
+                    haystack.len(),
+                    std::ptr::null_mut(),
+                    identity.as_ptr(),
+                    haystack.len(),
+                )
+            },
+            STATUS_INVALID_ARGUMENT
+        );
+        assert_eq!(static_prefix_capability_presence(handle), (false, false));
+
+        admit_static_prefix_span_postflight_for_test(
+            handle,
+            haystack,
+            &mut result,
+            &identity,
+            &descriptor,
+        );
+        // SAFETY: every postflight input except the output alignment is valid.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_recover_span_v2(
+                    handle,
+                    haystack.as_ptr(),
+                    haystack.len(),
+                    0,
+                    haystack.len(),
+                    misaligned_result,
+                    identity.as_ptr(),
+                    haystack.len(),
+                )
+            },
+            STATUS_INVALID_ARGUMENT
+        );
+        assert_eq!(static_prefix_capability_presence(handle), (false, false));
+
+        admit_static_prefix_span_postflight_for_test(
+            handle,
+            haystack,
+            &mut result,
+            &identity,
+            &descriptor,
+        );
+        result = sentinel;
+        assert_eq!(
+            call_exclusive_static_prefix_recover_span_v2(
+                handle,
+                haystack,
+                2,
+                1,
+                &mut result,
+                &identity,
+                haystack.len(),
+            ),
+            STATUS_INVALID_ARGUMENT
+        );
+        assert_eq!(result, sentinel);
+        assert_eq!(static_prefix_capability_presence(handle), (false, false));
+
+        admit_static_prefix_span_postflight_for_test(
+            handle,
+            haystack,
+            &mut result,
+            &identity,
+            &descriptor,
+        );
+        assert_eq!(
+            call_exclusive_static_prefix_recover_span_v2(
+                handle,
+                haystack,
+                0,
+                haystack.len(),
+                &mut result,
+                &identity,
+                0,
+            ),
+            STATUS_INVALID_ARGUMENT
+        );
+        assert_eq!(static_prefix_capability_presence(handle), (false, false));
+
+        admit_static_prefix_span_postflight_for_test(
+            handle,
+            haystack,
+            &mut result,
+            &identity,
+            &descriptor,
+        );
+        result = sentinel;
+        assert_eq!(
+            call_exclusive_static_prefix_recover_span_v2(
+                handle,
+                haystack,
+                1,
+                haystack.len(),
+                &mut result,
+                &identity,
+                haystack.len(),
+            ),
+            STATUS_RUNTIME_FAILURE,
+            "a well-formed but wrong window must consume the ticket"
+        );
+        assert_eq!(result, sentinel);
+        assert_eq!(static_prefix_capability_presence(handle), (false, false));
+        assert_eq!(
+            call_exclusive_static_prefix_recover_span_v2(
+                handle,
+                haystack,
+                0,
+                haystack.len(),
+                &mut result,
+                &identity,
+                haystack.len(),
+            ),
+            STATUS_RUNTIME_FAILURE,
+            "corrected arguments cannot replay a malformed or mismatched call"
+        );
+        assert_eq!(result, sentinel);
+
+        // SAFETY: this test owns the unique live handle and no call overlaps
+        // destruction.
+        assert_eq!(
+            unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(handle) },
+            STATUS_SUCCESS
+        );
+    }
+
+    #[test]
+    fn static_prefix_v2_intervening_mutation_retires_capabilities() {
+        let compiled = compile(
+            CompileRequest::new("(?:ab|ac)+z", Target::x86_64_linux())
+                .mode(CompileMode::Fast)
+                .output(OutputContract::Span),
+        )
+        .expect("compile intervening-mutation Span fixture");
+        let identity = compiled.receipt().program_sha256;
+        let serialized = compiled.program().serialize().expect("serialize fixture");
+        let handle = prepare_exclusive(&serialized);
+        let haystack = b"xxabacz";
+        let descriptor = [0_u32; STATIC_PREFIX_RESUME_DESCRIPTOR_V1_HEADER_BYTES / 4];
+        let sentinel = FreAotRegexResultV1 {
+            start: 0xfeed_face,
+            end: 0xdead_beef,
+        };
+        let mut result = sentinel;
+
+        assert_eq!(
+            call_exclusive_static_prefix_preflight_v2(
+                handle,
+                haystack,
+                0,
+                haystack.len(),
+                &mut result,
+                &identity,
+                &descriptor,
+            ),
+            STATUS_PARTIAL_PREFLIGHT_ENTER
+        );
+        assert_eq!(static_prefix_capability_presence(handle), (true, false));
+        assert_eq!(
+            call_exclusive(handle, haystack, 0, haystack.len(), &mut result),
+            STATUS_MATCH
+        );
+        assert_eq!(static_prefix_capability_presence(handle), (false, false));
+        result = sentinel;
+        assert_eq!(
+            call_exclusive_static_prefix_recover_span_v2(
+                handle,
+                haystack,
+                0,
+                haystack.len(),
+                &mut result,
+                &identity,
+                haystack.len(),
+            ),
+            STATUS_RUNTIME_FAILURE
+        );
+        assert_eq!(result, sentinel);
+
+        admit_static_prefix_span_postflight_for_test(
+            handle,
+            haystack,
+            &mut result,
+            &identity,
+            &descriptor,
+        );
+        assert_eq!(
+            call_exclusive(handle, haystack, 0, haystack.len(), &mut result),
+            STATUS_MATCH
+        );
+        assert_eq!(static_prefix_capability_presence(handle), (false, false));
+        result = sentinel;
+        assert_eq!(
+            call_exclusive_static_prefix_recover_span_v2(
+                handle,
+                haystack,
+                0,
+                haystack.len(),
+                &mut result,
+                &identity,
+                haystack.len(),
+            ),
+            STATUS_RUNTIME_FAILURE
         );
         assert_eq!(result, sentinel);
 
