@@ -35,6 +35,10 @@ pub(crate) const MAX_REQUIRED_INTERIOR_SEEDS: usize = 128;
 pub(crate) const MAX_REQUIRED_INTERIOR_CANDIDATE_WORK: u64 = 250_000;
 /// Fair-share logical allocation ceiling for one interior root's expansion.
 pub(crate) const MAX_REQUIRED_INTERIOR_CANDIDATE_ALLOCATION_ITEMS: usize = 32_768;
+/// Independent work ceiling for the optional mandatory-line cut proof.
+pub(crate) const MAX_REQUIRED_LINE_CUT_WORK: u64 = 2_000_000;
+/// Independent logical allocation ceiling for the optional line cut proof.
+pub(crate) const MAX_REQUIRED_LINE_CUT_ALLOCATION_ITEMS: usize = 262_144;
 
 /// One concrete byte sequence, stored inline for compact native handoff.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -126,6 +130,62 @@ pub(crate) enum MaximumConsumedDistance {
     Unbounded,
 }
 
+/// One contextual line assertion crossed by every structurally accepting
+/// path. The proof is graph-only: removing every edge of `kind` makes every
+/// accept unreachable from the Thompson start state.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum RequiredLineCutKind {
+    ConfiguredStart,
+    ConfiguredEnd,
+    CrlfStart,
+    CrlfEnd,
+}
+
+impl RequiredLineCutKind {
+    const ALL: [Self; 4] = [
+        Self::ConfiguredStart,
+        Self::ConfiguredEnd,
+        Self::CrlfStart,
+        Self::CrlfEnd,
+    ];
+
+    const fn edge(self) -> EdgeKind {
+        match self {
+            Self::ConfiguredStart => EdgeKind::AssertLineStartLf,
+            Self::ConfiguredEnd => EdgeKind::AssertLineEndLf,
+            Self::CrlfStart => EdgeKind::AssertLineStartCrlf,
+            Self::CrlfEnd => EdgeKind::AssertLineEndCrlf,
+        }
+    }
+
+    pub(crate) const fn scanner_cardinality(self) -> u8 {
+        match self {
+            Self::ConfiguredStart | Self::ConfiguredEnd => 1,
+            Self::CrlfStart | Self::CrlfEnd => 2,
+        }
+    }
+}
+
+/// A complete line-cut proof and a conservative maximum consumed distance
+/// from match start to the assertion boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RequiredLineCut {
+    kind: RequiredLineCutKind,
+    maximum_before: MaximumConsumedDistance,
+}
+
+impl RequiredLineCut {
+    #[must_use]
+    pub(crate) const fn kind(self) -> RequiredLineCutKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub(crate) const fn maximum_before(self) -> MaximumConsumedDistance {
+        self.maximum_before
+    }
+}
+
 /// One independently mandatory interior group.
 ///
 /// The literals inside a group are alternatives: every match contains at
@@ -183,6 +243,7 @@ impl RequiredInteriorCandidate {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RequiredInteriorLiterals {
     candidates: Box<[RequiredInteriorCandidate]>,
+    line_cuts: Box<[RequiredLineCut]>,
     derivation_work: u64,
     allocation_items: usize,
     resource_limited: bool,
@@ -194,6 +255,7 @@ impl RequiredInteriorLiterals {
     fn unavailable(budget: &Budget) -> Self {
         Self {
             candidates: Box::new([]),
+            line_cuts: Box::new([]),
             derivation_work: budget.work,
             allocation_items: budget.allocation_items,
             resource_limited: budget.resource_limited,
@@ -204,6 +266,14 @@ impl RequiredInteriorLiterals {
     #[must_use]
     pub(crate) fn candidates(&self) -> &[RequiredInteriorCandidate] {
         &self.candidates
+    }
+
+    /// Every independently proved mandatory exact line-assertion kind.
+    /// Target lowering chooses among them using the actual entry strategy;
+    /// notably, a full-window start cut may be a no-op while an end cut pays.
+    #[must_use]
+    pub(crate) fn line_cuts(&self) -> &[RequiredLineCut] {
+        &self.line_cuts
     }
 
     #[must_use]
@@ -284,6 +354,8 @@ pub(crate) struct RequiredLiteralLimits {
     pub(crate) max_interior_seeds: usize,
     pub(crate) max_candidate_work: u64,
     pub(crate) max_candidate_allocation_items: usize,
+    pub(crate) max_line_cut_work: u64,
+    pub(crate) max_line_cut_allocation_items: usize,
 }
 
 impl Default for RequiredLiteralLimits {
@@ -299,6 +371,8 @@ impl Default for RequiredLiteralLimits {
             max_interior_seeds: MAX_REQUIRED_INTERIOR_SEEDS,
             max_candidate_work: MAX_REQUIRED_INTERIOR_CANDIDATE_WORK,
             max_candidate_allocation_items: MAX_REQUIRED_INTERIOR_CANDIDATE_ALLOCATION_ITEMS,
+            max_line_cut_work: MAX_REQUIRED_LINE_CUT_WORK,
+            max_line_cut_allocation_items: MAX_REQUIRED_LINE_CUT_ALLOCATION_ITEMS,
         }
     }
 }
@@ -602,6 +676,16 @@ struct InteriorSeed {
     reason = "transactional interior derivation keeps one visible resource envelope"
 )]
 fn derive_interior(raw: &RawPlan, limits: RequiredLiteralLimits) -> RequiredInteriorLiterals {
+    let line_cuts = derive_line_cuts_independent(raw, limits);
+    let mut interior = derive_interior_literals(raw, limits);
+    interior.line_cuts = line_cuts;
+    interior
+}
+
+fn derive_interior_literals(
+    raw: &RawPlan,
+    limits: RequiredLiteralLimits,
+) -> RequiredInteriorLiterals {
     let mut budget = Budget::new(limits.max_work, limits.max_allocation_items);
     if limits.max_depth == 0 || limits.max_interior_candidates == 0 {
         return RequiredInteriorLiterals::unavailable(&budget);
@@ -698,12 +782,160 @@ fn derive_interior(raw: &RawPlan, limits: RequiredLiteralLimits) -> RequiredInte
             budget.resource_limited = true;
         }
     }
+    finish_interior(candidates, &budget)
+}
+
+fn finish_interior(
+    candidates: Vec<RequiredInteriorCandidate>,
+    budget: &Budget,
+) -> RequiredInteriorLiterals {
     RequiredInteriorLiterals {
         candidates: candidates.into_boxed_slice(),
+        line_cuts: Box::new([]),
         derivation_work: budget.work,
         allocation_items: budget.allocation_items,
         resource_limited: budget.resource_limited,
         context_assertions: budget.context_assertions,
+    }
+}
+
+/// Run the optional line proof under a fully independent envelope. In
+/// particular, graphs too expensive for retained literal derivation may still
+/// yield a useful line cut, while line-proof failure cannot alter established
+/// literal candidates, counters, or resource flags.
+fn derive_line_cuts_independent(
+    raw: &RawPlan,
+    limits: RequiredLiteralLimits,
+) -> Box<[RequiredLineCut]> {
+    let mut budget = Budget::new(
+        limits.max_line_cut_work,
+        limits.max_line_cut_allocation_items,
+    );
+    let Some(graph) = ProductiveGraph::build(raw, &mut budget) else {
+        return Box::new([]);
+    };
+    if graph.accepts.is_empty() {
+        return Box::new([]);
+    }
+    let Some(distances) = DistanceFacts::build(raw, &graph, &mut budget) else {
+        return Box::new([]);
+    };
+    derive_line_cuts(raw, &graph, &distances, &mut budget)
+        .unwrap_or_default()
+        .into_boxed_slice()
+}
+
+/// Proves that every productive start-to-accept path crosses one exact line
+/// assertion kind. Reachability is recomputed with that kind removed, so this
+/// remains valid across duplicated assertion states, alternations, and graph
+/// rewrites. The distance is deliberately taken from the full graph: paths
+/// that crossed an earlier assertion may only enlarge it, which is safe for
+/// subsequent start-window narrowing.
+fn derive_line_cuts(
+    raw: &RawPlan,
+    graph: &ProductiveGraph,
+    distances: &DistanceFacts,
+    budget: &mut Budget,
+) -> Option<Vec<RequiredLineCut>> {
+    let states = raw.roles.len();
+    let start = usize::try_from(raw.start).ok()?;
+    let mut reachable = bounded_vec(states, false, budget)?;
+    let mut stack = Vec::new();
+    if !budget.reserve_vec(&mut stack, states) {
+        return None;
+    }
+    let mut cuts = Vec::new();
+    if !budget.reserve_vec(&mut cuts, RequiredLineCutKind::ALL.len()) {
+        return None;
+    }
+
+    for kind in RequiredLineCutKind::ALL {
+        budget.charge(u64::try_from(states).ok()?).then_some(())?;
+        reachable.fill(false);
+        stack.clear();
+        reachable[start] = true;
+        stack.push(start);
+
+        let mut bypasses_cut = false;
+        while let Some(state) = stack.pop() {
+            if !budget.charge(1) {
+                return None;
+            }
+            if raw.roles.get(state) == Some(&StateRole::Accept) {
+                bypasses_cut = true;
+                break;
+            }
+            for edge in state_edges(raw, state)? {
+                if !budget.charge(1) {
+                    return None;
+                }
+                if raw.edge_kinds.get(edge) == Some(&kind.edge()) {
+                    continue;
+                }
+                let target = usize::try_from(*raw.edge_targets.get(edge)?).ok()?;
+                if graph.productive.get(target) == Some(&true) && !reachable[target] {
+                    reachable[target] = true;
+                    stack.push(target);
+                }
+            }
+        }
+        if bypasses_cut {
+            continue;
+        }
+
+        let mut maximum_before = MaximumConsumedDistance::Finite(0);
+        let mut crossed = false;
+        for (source, &source_reachable) in reachable.iter().enumerate() {
+            if !source_reachable || graph.productive.get(source) != Some(&true) {
+                continue;
+            }
+            if !budget.charge(1) {
+                return None;
+            }
+            for edge in state_edges(raw, source)? {
+                if !budget.charge(1) {
+                    return None;
+                }
+                if raw.edge_kinds.get(edge) != Some(&kind.edge()) {
+                    continue;
+                }
+                let target = usize::try_from(*raw.edge_targets.get(edge)?).ok()?;
+                if graph.productive.get(target) != Some(&true) {
+                    continue;
+                }
+                crossed = true;
+                maximum_before = maximum_distance(
+                    maximum_before,
+                    distances.before(source)?,
+                );
+            }
+        }
+        if !crossed {
+            // Productive start-to-accept paths exist, and none bypassed this
+            // cut. Failing to find a first cut therefore means the bounded
+            // proof did not complete consistently; decline conservatively.
+            budget.resource_limited = true;
+            return None;
+        }
+
+        cuts.push(RequiredLineCut {
+            kind,
+            maximum_before,
+        });
+    }
+    Some(cuts)
+}
+
+fn maximum_distance(
+    left: MaximumConsumedDistance,
+    right: MaximumConsumedDistance,
+) -> MaximumConsumedDistance {
+    match (left, right) {
+        (MaximumConsumedDistance::Unbounded, _)
+        | (_, MaximumConsumedDistance::Unbounded) => MaximumConsumedDistance::Unbounded,
+        (MaximumConsumedDistance::Finite(left), MaximumConsumedDistance::Finite(right)) => {
+            MaximumConsumedDistance::Finite(left.max(right))
+        }
     }
 }
 
@@ -1800,6 +2032,17 @@ mod tests {
             .collect()
     }
 
+    fn line_cut(
+        interior: &RequiredInteriorLiterals,
+        kind: RequiredLineCutKind,
+    ) -> Option<RequiredLineCut> {
+        interior
+            .line_cuts()
+            .iter()
+            .copied()
+            .find(|cut| cut.kind() == kind)
+    }
+
     type TestEdge = (u32, EdgeKind, u8, u8);
 
     fn epsilon(target: u32) -> TestEdge {
@@ -1808,6 +2051,17 @@ mod tests {
 
     fn assertion(target: u32) -> TestEdge {
         (target, EdgeKind::AssertWordAscii, 0, 0)
+    }
+
+    fn line_assertion(target: u32, kind: EdgeKind) -> TestEdge {
+        assert!(matches!(
+            kind,
+            EdgeKind::AssertLineStartLf
+                | EdgeKind::AssertLineEndLf
+                | EdgeKind::AssertLineStartCrlf
+                | EdgeKind::AssertLineEndCrlf
+        ));
+        (target, kind, 0, 0)
     }
 
     fn byte(target: u32, value: u8) -> TestEdge {
@@ -2387,6 +2641,356 @@ mod tests {
         );
         assert_interior_candidates_sound(&consuming_cycle, &required);
         assert_interior_candidates_sound(&zero_width_cycle, &zero_required);
+    }
+
+    #[test]
+    fn mandatory_line_cuts_are_graph_general_and_distance_bounded() {
+        let leading = hand_raw(
+            0,
+            vec![StateRole::Split, StateRole::Consume, StateRole::Accept],
+            vec![
+                vec![line_assertion(1, EdgeKind::AssertLineStartLf)],
+                vec![byte(2, b'a')],
+                vec![],
+            ],
+        );
+        assert_eq!(
+            line_cut(
+                derive(&leading).interior(),
+                RequiredLineCutKind::ConfiguredStart,
+            ),
+            Some(RequiredLineCut {
+                kind: RequiredLineCutKind::ConfiguredStart,
+                maximum_before: MaximumConsumedDistance::Finite(0),
+            })
+        );
+
+        let trailing = hand_raw(
+            0,
+            vec![
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Split,
+                StateRole::Accept,
+            ],
+            vec![
+                vec![byte(1, b'a')],
+                vec![byte(2, b'b')],
+                vec![line_assertion(3, EdgeKind::AssertLineEndCrlf)],
+                vec![],
+            ],
+        );
+        assert_eq!(
+            line_cut(
+                derive(&trailing).interior(),
+                RequiredLineCutKind::CrlfEnd,
+            ),
+            Some(RequiredLineCut {
+                kind: RequiredLineCutKind::CrlfEnd,
+                maximum_before: MaximumConsumedDistance::Finite(2),
+            })
+        );
+
+        // Neither assertion state dominates the shared accept, but removing
+        // every edge of the semantic kind disconnects both alternation arms.
+        let duplicated = hand_raw(
+            0,
+            vec![
+                StateRole::Split,
+                StateRole::Split,
+                StateRole::Split,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Accept,
+            ],
+            vec![
+                vec![epsilon(1), epsilon(2)],
+                vec![line_assertion(3, EdgeKind::AssertLineStartCrlf)],
+                vec![line_assertion(4, EdgeKind::AssertLineStartCrlf)],
+                vec![byte(5, b'a')],
+                vec![byte(5, b'b')],
+                vec![],
+            ],
+        );
+        assert_eq!(
+            line_cut(
+                derive(&duplicated).interior(),
+                RequiredLineCutKind::CrlfStart,
+            ),
+            Some(RequiredLineCut {
+                kind: RequiredLineCutKind::CrlfStart,
+                maximum_before: MaximumConsumedDistance::Finite(0),
+            })
+        );
+    }
+
+    #[test]
+    fn line_cut_declines_bypasses_and_reports_unbounded_prefixes() {
+        let bypass = hand_raw(
+            0,
+            vec![
+                StateRole::Split,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Accept,
+            ],
+            vec![
+                vec![
+                    line_assertion(1, EdgeKind::AssertLineEndLf),
+                    epsilon(2),
+                ],
+                vec![byte(3, b'a')],
+                vec![byte(3, b'b')],
+                vec![],
+            ],
+        );
+        assert!(derive(&bypass).interior().line_cuts().is_empty());
+
+        let unbounded = hand_raw(
+            0,
+            vec![
+                StateRole::Split,
+                StateRole::Consume,
+                StateRole::Split,
+                StateRole::Accept,
+            ],
+            vec![vec![epsilon(1), epsilon(2)], vec![byte(0, b'x')], vec![
+                line_assertion(3, EdgeKind::AssertLineEndLf),
+            ], vec![]],
+        );
+        assert_eq!(
+            line_cut(
+                derive(&unbounded).interior(),
+                RequiredLineCutKind::ConfiguredEnd,
+            ),
+            Some(RequiredLineCut {
+                kind: RequiredLineCutKind::ConfiguredEnd,
+                maximum_before: MaximumConsumedDistance::Unbounded,
+            })
+        );
+    }
+
+    #[test]
+    fn line_cut_survives_disabled_interior_literal_expansion() {
+        let raw = hand_raw(
+            0,
+            vec![StateRole::Split, StateRole::Consume, StateRole::Accept],
+            vec![
+                vec![line_assertion(1, EdgeKind::AssertLineStartLf)],
+                vec![byte(2, b'a')],
+                vec![],
+            ],
+        );
+        let derived = derive_interior(
+            &raw,
+            RequiredLiteralLimits {
+                max_depth: 0,
+                max_interior_candidates: 0,
+                ..RequiredLiteralLimits::default()
+            },
+        );
+        assert!(derived.candidates().is_empty());
+        assert_eq!(
+            line_cut(&derived, RequiredLineCutKind::ConfiguredStart),
+            Some(RequiredLineCut {
+                kind: RequiredLineCutKind::ConfiguredStart,
+                maximum_before: MaximumConsumedDistance::Finite(0),
+            })
+        );
+    }
+
+    #[test]
+    fn line_cut_handles_multiple_accepts_mixed_kinds_and_later_same_kind_cycles() {
+        let multiple_accepts = hand_raw(
+            0,
+            vec![
+                StateRole::Split,
+                StateRole::Split,
+                StateRole::Split,
+                StateRole::Accept,
+                StateRole::Accept,
+            ],
+            vec![
+                vec![epsilon(1), epsilon(2)],
+                vec![line_assertion(3, EdgeKind::AssertLineEndLf)],
+                vec![line_assertion(4, EdgeKind::AssertLineEndLf)],
+                vec![],
+                vec![],
+            ],
+        );
+        assert_eq!(
+            line_cut(
+                derive(&multiple_accepts).interior(),
+                RequiredLineCutKind::ConfiguredEnd,
+            ),
+            Some(RequiredLineCut {
+                kind: RequiredLineCutKind::ConfiguredEnd,
+                maximum_before: MaximumConsumedDistance::Finite(0),
+            })
+        );
+
+        let mixed_kinds = hand_raw(
+            0,
+            vec![
+                StateRole::Split,
+                StateRole::Split,
+                StateRole::Split,
+                StateRole::Accept,
+                StateRole::Accept,
+            ],
+            vec![
+                vec![epsilon(1), epsilon(2)],
+                vec![line_assertion(3, EdgeKind::AssertLineStartLf)],
+                vec![line_assertion(4, EdgeKind::AssertLineEndLf)],
+                vec![],
+                vec![],
+            ],
+        );
+        assert!(derive(&mixed_kinds).interior().line_cuts().is_empty());
+
+        // The consuming cycle is reachable only after the first mandatory
+        // assertion. The proof deliberately bounds possible *first* cuts,
+        // so the later same-kind cut and its cycle cannot inflate the zero
+        // distance of the first cut.
+        let later_cycle = hand_raw(
+            0,
+            vec![
+                StateRole::Split,
+                StateRole::Split,
+                StateRole::Consume,
+                StateRole::Split,
+                StateRole::Accept,
+            ],
+            vec![
+                vec![line_assertion(1, EdgeKind::AssertLineStartCrlf)],
+                vec![epsilon(2), epsilon(3)],
+                vec![byte(1, b'x')],
+                vec![line_assertion(4, EdgeKind::AssertLineStartCrlf)],
+                vec![],
+            ],
+        );
+        assert_eq!(
+            line_cut(
+                derive(&later_cycle).interior(),
+                RequiredLineCutKind::CrlfStart,
+            ),
+            Some(RequiredLineCut {
+                kind: RequiredLineCutKind::CrlfStart,
+                maximum_before: MaximumConsumedDistance::Finite(0),
+            })
+        );
+
+        let both_directions = hand_raw(
+            0,
+            vec![
+                StateRole::Split,
+                StateRole::Consume,
+                StateRole::Split,
+                StateRole::Accept,
+            ],
+            vec![
+                vec![line_assertion(1, EdgeKind::AssertLineStartLf)],
+                vec![byte(2, b'a')],
+                vec![line_assertion(3, EdgeKind::AssertLineEndLf)],
+                vec![],
+            ],
+        );
+        let both = derive(&both_directions);
+        assert_eq!(
+            both.interior().line_cuts(),
+            &[
+                RequiredLineCut {
+                    kind: RequiredLineCutKind::ConfiguredStart,
+                    maximum_before: MaximumConsumedDistance::Finite(0),
+                },
+                RequiredLineCut {
+                    kind: RequiredLineCutKind::ConfiguredEnd,
+                    maximum_before: MaximumConsumedDistance::Finite(1),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn declined_line_proof_does_not_spend_literal_budget_or_change_candidates() {
+        let raw = hand_raw(
+            0,
+            vec![
+                StateRole::Split,
+                StateRole::Consume,
+                StateRole::Consume,
+                StateRole::Accept,
+            ],
+            vec![
+                vec![line_assertion(1, EdgeKind::AssertLineStartLf)],
+                vec![byte(2, b'x')],
+                vec![byte(3, b'y')],
+                vec![],
+            ],
+        );
+        let tight = RequiredLiteralLimits {
+            max_work: 2_048,
+            max_allocation_items: 512,
+            max_candidate_work: 512,
+            max_candidate_allocation_items: 128,
+            ..RequiredLiteralLimits::default()
+        };
+        let proved = derive_interior(&raw, tight);
+        assert!(!proved.line_cuts().is_empty());
+        assert!(!proved.candidates().is_empty());
+
+        let declined = derive_interior(
+            &raw,
+            RequiredLiteralLimits {
+                max_line_cut_work: 0,
+                max_line_cut_allocation_items: 0,
+                ..tight
+            },
+        );
+        assert!(declined.line_cuts().is_empty());
+        assert_eq!(declined.candidates, proved.candidates);
+        assert_eq!(declined.derivation_work, proved.derivation_work);
+        assert_eq!(declined.allocation_items, proved.allocation_items);
+        assert_eq!(declined.resource_limited, proved.resource_limited);
+        assert_eq!(declined.context_assertions, proved.context_assertions);
+    }
+
+    #[test]
+    fn line_proof_is_independent_when_literal_analysis_is_disabled_or_exhausted() {
+        let raw = hand_raw(
+            0,
+            vec![StateRole::Split, StateRole::Consume, StateRole::Accept],
+            vec![
+                vec![line_assertion(1, EdgeKind::AssertLineStartLf)],
+                vec![byte(2, b'a')],
+                vec![],
+            ],
+        );
+        let disabled = derive_interior(
+            &raw,
+            RequiredLiteralLimits {
+                max_depth: 0,
+                max_interior_candidates: 0,
+                ..RequiredLiteralLimits::default()
+            },
+        );
+        assert_eq!(disabled.derivation_work(), 0);
+        assert_eq!(disabled.allocation_items(), 0);
+        assert!(!disabled.resource_limited());
+        assert!(!disabled.context_assertions());
+        assert!(line_cut(&disabled, RequiredLineCutKind::ConfiguredStart).is_some());
+
+        let exhausted = derive_interior(
+            &raw,
+            RequiredLiteralLimits {
+                max_work: 0,
+                max_allocation_items: 0,
+                ..RequiredLiteralLimits::default()
+            },
+        );
+        assert!(exhausted.candidates().is_empty());
+        assert!(exhausted.resource_limited());
+        assert!(line_cut(&exhausted, RequiredLineCutKind::ConfiguredStart).is_some());
     }
 
     #[test]

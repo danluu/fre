@@ -7783,6 +7783,8 @@ pub(crate) struct NativeRetainedSuffixRequirement {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct NativeContextProgramView<'a> {
     pub(crate) output: OutputContract,
+    /// Semantic configured line terminator used by LF-profile assertions.
+    pub(crate) line_terminator: u8,
     pub(crate) dfa: NativeContextDfaView<'a>,
     pub(crate) anchored_prefix: &'a AnchoredPrefix,
     pub(crate) anchored_suffix: &'a AnchoredSuffix,
@@ -8353,6 +8355,7 @@ impl CompiledProgram {
             .as_ref()
             .map(|machine| NativeContextProgramView {
                 output: self.output,
+                line_terminator: self.line_terminator,
                 dfa: machine.native_view(),
                 anchored_prefix: &self.anchored_prefix,
                 anchored_suffix: &self.anchored_suffix,
@@ -8660,6 +8663,7 @@ impl CompiledProgram {
     ) -> NativeContextProgramView<'a> {
         NativeContextProgramView {
             output: self.output,
+            line_terminator: self.line_terminator,
             dfa: candidate.machine.native_view(),
             anchored_prefix: &self.anchored_prefix,
             anchored_suffix: &self.anchored_suffix,

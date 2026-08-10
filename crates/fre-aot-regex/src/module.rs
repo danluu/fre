@@ -75234,10 +75234,10 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 && words[2] & 0xff00_001f == 0x5400_0009
         }));
 
-        // This boundary-pair route is not supported by the SVE primary
-        // scanner. Mixed capabilities therefore fall through structurally to
-        // ASIMD, including an exact receipt and byte-identical lowered
-        // sections. Whole objects retain target-feature identity in symbols.
+        // The boundary-pair route remains ASIMD, but the independent
+        // graph-proved line-cut route has an exact SVE2 primary scanner. The
+        // receipt therefore names the strongest scanner actually emitted and
+        // the mixed object retains both vector tiers.
         let asimd_boundary = compile_for(
             "(?m)^foo",
             OutputContract::Exists,
@@ -75252,16 +75252,16 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
         );
         assert_eq!(
             mixed_boundary.module().start_accelerator(),
-            StartAccelerator::Aarch64Asimd
+            StartAccelerator::Aarch64Sve2
         );
-        assert_eq!(
-            mixed_boundary.module().sections(),
-            asimd_boundary.module().sections()
-        );
-        assert_eq!(
-            mixed_boundary.module().relocations(),
-            asimd_boundary.module().relocations()
-        );
+        let mixed_boundary_words = mixed_boundary.module().sections()[TEXT_SECTION]
+            .bytes()
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(mixed_boundary_words.contains(&aarch64_sve2_match_b(1, 0, 16).unwrap()));
+        assert!(mixed_boundary_words.contains(&aarch64_load_q(0, 12).unwrap()));
+        assert_ne!(mixed_boundary.module().sections(), asimd_boundary.module().sections());
 
         // SVE remains unsupported by the macOS object policy, so mixed facts
         // preserve the existing ASIMD lowering there.

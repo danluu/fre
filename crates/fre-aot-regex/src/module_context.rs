@@ -71,13 +71,17 @@ use crate::{
     program::{
         AnchoredByteSet, MAX_ANCHORED_PREFIX_BYTES, NativeContextProgramView, OutputContract,
     },
-    required_literals::{MAX_REQUIRED_LITERAL_DEPTH, MaximumConsumedDistance},
+    required_literals::{
+        MAX_REQUIRED_LITERAL_DEPTH, MaximumConsumedDistance, RequiredLineCut,
+        RequiredLineCutKind,
+    },
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ContextPrepassRestart {
     CandidateBase,
     Bounded(u32),
+    LineStartBounded(u32),
     OriginalStart,
 }
 
@@ -90,6 +94,7 @@ struct ContextInteriorGuard {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct ContextSveFilterPlans {
+    line: Option<Aarch64SveFilterPlan>,
     interior: Option<Aarch64SveFilterPlan>,
     anchored: Option<Aarch64SveFilterPlan>,
     ordinary: Option<Aarch64SveFilterPlan>,
@@ -104,6 +109,153 @@ struct ContextSveFilterPlans {
 struct ContextAbsoluteBounds {
     requires_start: bool,
     requires_end: bool,
+}
+
+/// One target-lowerable mandatory line-boundary cut.
+///
+/// The graph proof owns semantic eligibility and the contextual DFA remains
+/// the verifier. This plan only finds an early boundary (or a conservative
+/// predecessor of one) and drops match starts proved too early to reach it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ContextLineCutPlan {
+    kind: RequiredLineCutKind,
+    maximum_before: u32,
+    primary: NativeStartFilter,
+}
+
+impl ContextLineCutPlan {
+    const fn is_start(self) -> bool {
+        matches!(
+            self.kind,
+            RequiredLineCutKind::ConfiguredStart | RequiredLineCutKind::CrlfStart
+        )
+    }
+
+}
+
+fn context_line_cut_maximum(
+    cut: RequiredLineCut,
+    max_match_width: Option<usize>,
+) -> Option<u32> {
+    match cut.maximum_before() {
+        MaximumConsumedDistance::Finite(maximum) => Some(max_match_width.map_or(maximum, |width| {
+            u32::try_from(width).map_or(maximum, |width| maximum.min(width))
+        })),
+        MaximumConsumedDistance::Unbounded => max_match_width.and_then(|width| width.try_into().ok()),
+    }
+}
+
+fn context_line_cut_filter(
+    kind: RequiredLineCutKind,
+    line_terminator: u8,
+) -> Result<Option<NativeStartFilter>, ObjectError> {
+    let mut words = [0_u64; 4];
+    let mut insert = |byte: u8| {
+        let index = usize::from(byte);
+        words[index / 64] |= 1_u64 << (index % 64);
+    };
+    match kind {
+        RequiredLineCutKind::ConfiguredStart | RequiredLineCutKind::ConfiguredEnd => {
+            insert(line_terminator);
+        }
+        RequiredLineCutKind::CrlfStart | RequiredLineCutKind::CrlfEnd => {
+            insert(b'\r');
+            insert(b'\n');
+        }
+    }
+    filter_from_membership_words(words, 0, false)
+}
+
+/// Select an entry cut using actual scanner direction. End cuts precede start
+/// cuts because absolute start at a full-window root cannot narrow anything,
+/// while the first line end can raise the lower bound by almost a whole line.
+/// Repeated empty-state start skipping is planned separately.
+fn derive_context_line_cut(
+    view: NativeContextProgramView<'_>,
+) -> Result<Option<ContextLineCutPlan>, ObjectError> {
+    let mut selected = None;
+    for &cut in view.required_literals.interior().line_cuts() {
+        let Some(maximum_before) = context_line_cut_maximum(cut, view.max_match_width) else {
+            continue;
+        };
+        let Some(primary) = context_line_cut_filter(cut.kind(), view.line_terminator)? else {
+            continue;
+        };
+        let candidate = ContextLineCutPlan {
+            kind: cut.kind(),
+            maximum_before,
+            primary,
+        };
+        let rank = (
+            candidate.is_start(),
+            candidate.kind.scanner_cardinality(),
+            candidate.maximum_before,
+            candidate.kind,
+        );
+        if selected.is_none_or(|current: ContextLineCutPlan| {
+            rank
+                < (
+                    current.is_start(),
+                    current.kind.scanner_cardinality(),
+                    current.maximum_before,
+                    current.kind,
+                )
+        }) {
+            selected = Some(candidate);
+        }
+    }
+    Ok(selected)
+}
+
+#[cfg(test)]
+fn context_line_boundary_at(
+    plan: ContextLineCutPlan,
+    line_terminator: u8,
+    haystack: &[u8],
+    position: usize,
+) -> bool {
+    if position > haystack.len() {
+        return false;
+    }
+    match plan.kind {
+        RequiredLineCutKind::ConfiguredStart => {
+            position == 0 || haystack.get(position - 1) == Some(&line_terminator)
+        }
+        RequiredLineCutKind::ConfiguredEnd => {
+            position == haystack.len() || haystack.get(position) == Some(&line_terminator)
+        }
+        RequiredLineCutKind::CrlfStart => {
+            position == 0
+                || haystack.get(position - 1) == Some(&b'\n')
+                || (haystack.get(position - 1) == Some(&b'\r')
+                    && haystack.get(position) != Some(&b'\n'))
+        }
+        RequiredLineCutKind::CrlfEnd => {
+            position == haystack.len()
+                || haystack.get(position) == Some(&b'\r')
+                || (haystack.get(position) == Some(&b'\n')
+                    && (position == 0 || haystack.get(position - 1) != Some(&b'\r')))
+        }
+    }
+}
+
+/// Exact executable specification for the emitted inclusive boundary search.
+/// `None` proves that the semantic window contains no usable assertion point.
+#[cfg(test)]
+fn context_line_cut_narrow_start(
+    plan: ContextLineCutPlan,
+    line_terminator: u8,
+    haystack: &[u8],
+    start: usize,
+    end: usize,
+) -> Option<usize> {
+    (start..=end)
+        .find(|&position| context_line_boundary_at(plan, line_terminator, haystack, position))
+        .map(|boundary| {
+            start.max(boundary.saturating_sub(
+                usize::try_from(plan.maximum_before).unwrap_or(usize::MAX),
+            ))
+        })
 }
 
 fn context_reverse_cell_format(
@@ -2068,7 +2220,11 @@ fn use_context_terminal_suffix_search(
         }
         // A bounded restart already gives the forward machine a cheap exact
         // neighborhood. Do not retain reverse tables for the same proof.
-        Some(ContextPrepassRestart::Bounded(_) | ContextPrepassRestart::CandidateBase) => false,
+        Some(
+            ContextPrepassRestart::Bounded(_)
+            | ContextPrepassRestart::LineStartBounded(_)
+            | ContextPrepassRestart::CandidateBase,
+        ) => false,
         // Without a competing mandatory guard, require a deeper sparse
         // conjunction that is strictly more selective than the ordinary
         // anchored-prefix scan. Reverse verification has a higher fixed cost,
@@ -2829,6 +2985,7 @@ fn strongest_aarch64_context_accelerator(
 )]
 fn selected_context_start_accelerator(
     target: Target,
+    line_cut: Option<ContextLineCutPlan>,
     terminal_suffix_search: Option<ContextTerminalSuffixSearch>,
     anchored_forward_search: Option<ContextAnchoredForwardSearch>,
     anchored_boundary_pair: Option<ContextBoundaryPairExpression>,
@@ -2837,7 +2994,8 @@ fn selected_context_start_accelerator(
     interior_guard: Option<ContextInteriorGuard>,
     sve_filter_plans: ContextSveFilterPlans,
 ) -> StartAccelerator {
-    let has_prefix_scanner = interior_guard.is_some_and(|guard| !guard.primary.ranges().is_empty())
+    let has_prefix_scanner = line_cut.is_some_and(|cut| !cut.primary.ranges().is_empty())
+        || interior_guard.is_some_and(|guard| !guard.primary.ranges().is_empty())
         || anchored_forward_search.is_some_and(|search| !search.primary.ranges().is_empty())
         || start_filter.is_some_and(|filter| !filter.ranges().is_empty());
     match target.architecture {
@@ -2853,6 +3011,17 @@ fn selected_context_start_accelerator(
         }
         Architecture::Aarch64 => {
             let mut selected = StartAccelerator::None;
+            if let Some(cut) = line_cut {
+                strongest_aarch64_context_accelerator(
+                    &mut selected,
+                    aarch64_context_prefix_accelerator(
+                        target,
+                        cut.primary,
+                        None,
+                        sve_filter_plans.line,
+                    ),
+                );
+            }
             if let Some(guard) = interior_guard {
                 strongest_aarch64_context_accelerator(
                     &mut selected,
@@ -2956,6 +3125,7 @@ fn lower_native_context_impl(
         requires_start: view.requires_haystack_start,
         requires_end: view.requires_haystack_end,
     };
+    let line_cut = derive_context_line_cut(view)?;
     let boundary_pair_relation = derive_context_boundary_pair_relation(view)?;
     // Only scanners whose complete runtime route is pure SVE2 may price an
     // exact set as one table/one MATCH. The explicit seam is shared with a
@@ -3197,13 +3367,22 @@ fn lower_native_context_impl(
         _ => None,
     };
     let state_skip = install_context_state_skip(&mut layout, state_skip_plan, max_data_bytes)?;
-    let has_vector_prepass = start_filter.is_some_and(|filter| !filter.ranges().is_empty())
+    let has_vector_prepass = line_cut.is_some_and(|cut| !cut.primary.ranges().is_empty())
+        || start_filter.is_some_and(|filter| !filter.ranges().is_empty())
         || interior_guard.is_some_and(|guard| !guard.primary.ranges().is_empty())
         || anchored_forward_search.is_some_and(|search| !search.primary.ranges().is_empty())
         || terminal_suffix_search.is_some();
     let asimd_lane_index_offset =
         install_context_asimd_lane_index(&mut layout, target, has_vector_prepass, max_data_bytes)?;
     let sve_filter_plans = ContextSveFilterPlans {
+        line: install_context_sve_filter_plan(
+            &mut layout,
+            target,
+            line_cut.map(|cut| cut.primary),
+            None,
+            true,
+            max_data_bytes,
+        )?,
         interior: install_context_sve_filter_plan(
             &mut layout,
             target,
@@ -3239,6 +3418,7 @@ fn lower_native_context_impl(
     let (code, relocations) = match target.architecture {
         Architecture::X86_64 => lower_x86_64_context(
             &layout,
+            line_cut,
             terminal_suffix_search,
             anchored_forward_search,
             anchored_adaptive_guard,
@@ -3258,6 +3438,7 @@ fn lower_native_context_impl(
         )?,
         Architecture::Aarch64 => lower_aarch64_context(
             &layout,
+            line_cut,
             terminal_suffix_search,
             anchored_forward_search,
             anchored_adaptive_guard,
@@ -3280,6 +3461,7 @@ fn lower_native_context_impl(
     };
     let start_accelerator = selected_context_start_accelerator(
         target,
+        line_cut,
         terminal_suffix_search,
         anchored_forward_search,
         anchored_boundary_pair,
@@ -3930,7 +4112,11 @@ fn x86_emit_prepass_restart(
         ContextPrepassRestart::OriginalStart => {
             assembler.instruction(&[0x49, 0x8b, 0x10])?;
         }
-        ContextPrepassRestart::Bounded(maximum) => {
+        ContextPrepassRestart::Bounded(maximum)
+        | ContextPrepassRestart::LineStartBounded(maximum) => {
+            if matches!(restart, ContextPrepassRestart::LineStartBounded(_)) {
+                assembler.instruction(&[0x48, 0xff, 0xc2])?; // terminator q -> boundary q+1
+            }
             let keep_original = assembler.label()?;
             let selected = assembler.label()?;
             assembler.instruction(&[0x49, 0x8b, 0x00])?; // original start
@@ -3948,6 +4134,101 @@ fn x86_emit_prepass_restart(
             assembler.instruction(&[0x49, 0x89, 0x10])?;
         }
     }
+    Ok(())
+}
+
+/// Scan the inclusive semantic line-boundary interval and raise only the
+/// lower search bound. Start cuts conservatively use the terminator byte at
+/// `q` as a predecessor of the true boundary `q + 1`; subtracting the proved
+/// allowance from `q` can only retain one extra start. If the byte immediately
+/// before an interior window is a possible terminator, entry narrowing is
+/// skipped because the boundary may be exactly at the original start.
+///
+/// CRLF uses the exact `{CR, LF}` byte superset. A false Start hit at CR is
+/// before the true boundary after its following LF. A false End hit at LF has
+/// a true CR boundary immediately before it; if that CR lies before this
+/// window, the LF is at the original start and cannot raise it. Thus the first
+/// superset hit never over-narrows.
+fn x86_emit_line_cut_prepass(
+    assembler: &mut X86Assembler,
+    filter_kind: X86StartFilterKind,
+    cut: ContextLineCutPlan,
+    no_match: usize,
+    invalid: usize,
+) -> Result<(), ObjectError> {
+    if cut.is_start() {
+        let unchanged = assembler.label()?;
+        assembler.instruction(&[0x48, 0x85, 0xd2])?; // absolute start is in the window
+        assembler.branch(&[0x0f, 0x84], unchanged)?;
+        assembler.instruction(&[0x0f, 0xb6, 0x44, 0x17, 0xff])?; // previous byte
+        for range in cut.primary.ranges() {
+            if range.start != range.end {
+                return Err(ObjectError::InvalidModule(
+                    "context line cut has a non-exact terminator filter",
+                ));
+            }
+            assembler.instruction(&[0x3c, range.start])?; // cmp al, terminator
+            assembler.branch(&[0x0f, 0x84], unchanged)?;
+        }
+        x86_emit_prefix_prepass(
+            assembler,
+            filter_kind,
+            cut.primary,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ContextPrepassRestart::LineStartBounded(cut.maximum_before),
+            None,
+            None,
+            no_match,
+            invalid,
+            None,
+        )?;
+        assembler.bind(unchanged)?;
+        return Ok(());
+    }
+
+    let semantic_end = assembler.label()?;
+    let exhausted = assembler.label()?;
+    let complete = assembler.label()?;
+    assembler.instruction(&[0x49, 0x89, 0x48, 0x08])?; // save semantic end
+    assembler.instruction(&[0x48, 0x39, 0xf1])?; // end vs full length
+    assembler.branch(&[0x0f, 0x84], semantic_end)?;
+    assembler.instruction(&[0x48, 0xff, 0xc1])?; // include current byte at window end
+    assembler.bind(semantic_end)?;
+    x86_emit_prefix_prepass(
+        assembler,
+        filter_kind,
+        cut.primary,
+        None,
+        None,
+        None,
+        None,
+        None,
+        ContextPrepassRestart::Bounded(cut.maximum_before),
+        None,
+        None,
+        exhausted,
+        invalid,
+        None,
+    )?;
+    assembler.instruction(&[0x49, 0x8b, 0x48, 0x08])?; // restore semantic end
+    assembler.instruction(&[0x49, 0xc7, 0x40, 0x08, 0xff, 0xff, 0xff, 0xff])?;
+    assembler.branch(&[0xe9], complete)?;
+
+    assembler.bind(exhausted)?;
+    assembler.instruction(&[0x49, 0x8b, 0x48, 0x08])?; // restore semantic end
+    assembler.instruction(&[0x48, 0x39, 0xf1])?;
+    assembler.branch(&[0x0f, 0x85], no_match)?; // no interior or absolute boundary
+    assembler.instruction(&[0x48, 0x89, 0xca])?; // absolute-end boundary candidate
+    x86_emit_prepass_restart(
+        assembler,
+        ContextPrepassRestart::Bounded(cut.maximum_before),
+    )?;
+    assembler.instruction(&[0x49, 0xc7, 0x40, 0x08, 0xff, 0xff, 0xff, 0xff])?;
+    assembler.bind(complete)?;
     Ok(())
 }
 
@@ -5483,6 +5764,7 @@ fn x86_emit_context_absolute_bounds(
 )]
 fn lower_x86_64_context(
     layout: &ContextNativeLayout,
+    line_cut: Option<ContextLineCutPlan>,
     terminal_suffix_search: Option<ContextTerminalSuffixSearch>,
     anchored_forward_search: Option<ContextAnchoredForwardSearch>,
     anchored_adaptive_guard: Option<ContextAnchoredAdaptiveGuard>,
@@ -5502,7 +5784,8 @@ fn lower_x86_64_context(
 ) -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
     let mut assembler = X86Assembler::new();
     let filter_kind = context_x86_start_filter_kind(features);
-    let has_vector_scanner = terminal_suffix_search.is_some()
+    let has_vector_scanner = line_cut.is_some_and(|cut| !cut.primary.ranges().is_empty())
+        || terminal_suffix_search.is_some()
         || anchored_forward_search.is_some_and(|search| !search.primary.ranges().is_empty())
         || start_filter.is_some_and(|filter| !filter.ranges().is_empty())
         || interior_guard.is_some_and(|guard| !guard.primary.ranges().is_empty())
@@ -5541,6 +5824,13 @@ fn lower_x86_64_context(
     let forward_entry = assembler.label()?;
     let forward_initialized = assembler.label()?;
     let anchored_prefix_scan = if start_filter.is_some() && empty_prefix_restart {
+        Some(assembler.label()?)
+    } else {
+        None
+    };
+    let line_start_restart = if line_cut.is_some_and(ContextLineCutPlan::is_start)
+        && anchored_prefix_scan.is_none()
+    {
         Some(assembler.label()?)
     } else {
         None
@@ -5588,6 +5878,16 @@ fn lower_x86_64_context(
     let table_displacement_label = assembler.label()?;
     assembler.bind(table_displacement_label)?;
     push_bytes(&mut assembler.code, &[0; 4])?;
+
+    if let Some(cut) = line_cut {
+        x86_emit_line_cut_prepass(
+            &mut assembler,
+            filter_kind,
+            cut,
+            no_match,
+            invalid_initialized,
+        )?;
+    }
 
     if let Some(suffix) = terminal_suffix_search {
         x86_emit_terminal_suffix_search(
@@ -5668,6 +5968,31 @@ fn lower_x86_64_context(
             invalid_initialized,
             None,
         )?;
+    }
+
+    if let (Some(restart), Some(cut)) = (line_start_restart, line_cut) {
+        // Ordinary entry flow skips the out-of-line empty-state restart.
+        // A restart scans at the current boundary: byte q can create the
+        // immediately following line start q+1, so there is no preincrement.
+        assembler.branch(&[0xe9], forward_entry)?;
+        assembler.bind(restart)?;
+        x86_emit_prefix_prepass(
+            &mut assembler,
+            filter_kind,
+            cut.primary,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ContextPrepassRestart::LineStartBounded(cut.maximum_before),
+            None,
+            None,
+            forward_finish,
+            invalid_initialized,
+            None,
+        )?;
+        assembler.branch(&[0xe9], forward_entry)?;
     }
 
     assembler.bind(forward_entry)?;
@@ -5754,6 +6079,16 @@ fn lower_x86_64_context(
         // their empty-state restart behavior.
         assembler.instruction(&[0xa8, CONTEXT_STATE_EMPTY])?;
         assembler.branch(&[0x0f, 0x85], forward_finish)?;
+    }
+    if let Some(restart) = line_start_restart {
+        let active = assembler.label()?;
+        assembler.instruction(&[0xa8, CONTEXT_STATE_PENDING])?;
+        assembler.branch(&[0x0f, 0x85], active)?;
+        assembler.instruction(&[0xa8, CONTEXT_STATE_EMPTY])?;
+        assembler.branch(&[0x0f, 0x84], active)?;
+        assembler.instruction(&[0x49, 0x89, 0x10])?; // new semantic lower bound
+        assembler.branch(&[0xe9], restart)?;
+        assembler.bind(active)?;
     }
     if let Some(prefix_scan) = anchored_prefix_scan {
         let active = assembler.label()?;
@@ -6350,7 +6685,11 @@ fn aarch64_context_emit_prepass_restart(
         ContextPrepassRestart::OriginalStart => {
             assembler.instruction(aarch64_mov_x(2, 9)?)?;
         }
-        ContextPrepassRestart::Bounded(maximum) => {
+        ContextPrepassRestart::Bounded(maximum)
+        | ContextPrepassRestart::LineStartBounded(maximum) => {
+            if matches!(restart, ContextPrepassRestart::LineStartBounded(_)) {
+                assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
+            }
             let keep_original = assembler.label()?;
             let selected = assembler.label()?;
             aarch64_load_u32_constant(assembler, 11, maximum)?;
@@ -6368,6 +6707,101 @@ fn aarch64_context_emit_prepass_restart(
             assembler.instruction(aarch64_store_x(2, 4, 0)?)?;
         }
     }
+    Ok(())
+}
+
+/// AArch64 counterpart of [`x86_emit_line_cut_prepass`]. The scanner's CRLF
+/// superset and predecessor-boundary argument are target-neutral; only the
+/// register protocol differs here.
+fn aarch64_context_emit_line_cut_prepass(
+    assembler: &mut Aarch64Assembler,
+    cut: ContextLineCutPlan,
+    sve_filter_plan: Option<Aarch64SveFilterPlan>,
+    use_asimd: bool,
+    use_exact_asimd_lane: bool,
+    no_match: usize,
+    invalid: usize,
+) -> Result<(), ObjectError> {
+    if cut.is_start() {
+        let unchanged = assembler.label()?;
+        assembler.instruction(aarch64_cmp_x_imm(2, 0)?)?;
+        assembler.branch_cond(AARCH64_EQ, unchanged)?;
+        assembler.instruction(aarch64_sub_x_imm(11, 2, 1)?)?;
+        assembler.instruction(aarch64_load_byte_reg(8, 0, 11)?)?;
+        for range in cut.primary.ranges() {
+            if range.start != range.end {
+                return Err(ObjectError::InvalidModule(
+                    "context line cut has a non-exact terminator filter",
+                ));
+            }
+            assembler.instruction(aarch64_cmp_w_imm(8, u16::from(range.start))?)?;
+            assembler.branch_cond(AARCH64_EQ, unchanged)?;
+        }
+        aarch64_context_emit_prefix_prepass(
+            assembler,
+            cut.primary,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ContextPrepassRestart::LineStartBounded(cut.maximum_before),
+            None,
+            None,
+            sve_filter_plan,
+            use_asimd,
+            use_exact_asimd_lane,
+            no_match,
+            invalid,
+            None,
+        )?;
+        assembler.bind(unchanged)?;
+        return Ok(());
+    }
+
+    let semantic_end = assembler.label()?;
+    let exhausted = assembler.label()?;
+    let complete = assembler.label()?;
+    assembler.instruction(aarch64_store_x(3, 4, 8)?)?;
+    assembler.instruction(aarch64_cmp_x(3, 1)?)?;
+    assembler.branch_cond(AARCH64_EQ, semantic_end)?;
+    assembler.instruction(aarch64_add_x_imm(3, 3, 1)?)?;
+    assembler.bind(semantic_end)?;
+    aarch64_context_emit_prefix_prepass(
+        assembler,
+        cut.primary,
+        None,
+        None,
+        None,
+        None,
+        None,
+        ContextPrepassRestart::Bounded(cut.maximum_before),
+        None,
+        None,
+        sve_filter_plan,
+        use_asimd,
+        use_exact_asimd_lane,
+        exhausted,
+        invalid,
+        None,
+    )?;
+    assembler.instruction(aarch64_context_load_x(3, 4, 8)?)?;
+    assembler.instruction(0x9280_0007)?; // pending = none
+    assembler.instruction(aarch64_store_x(7, 4, 8)?)?;
+    assembler.branch(complete)?;
+
+    assembler.bind(exhausted)?;
+    assembler.instruction(aarch64_context_load_x(3, 4, 8)?)?;
+    assembler.instruction(aarch64_cmp_x(3, 1)?)?;
+    assembler.branch_cond(AARCH64_NE, no_match)?;
+    assembler.instruction(aarch64_mov_x(2, 3)?)?;
+    aarch64_context_emit_prepass_restart(
+        assembler,
+        ContextPrepassRestart::Bounded(cut.maximum_before),
+    )?;
+    assembler.instruction(0x9280_0007)?; // pending = none
+    assembler.instruction(aarch64_store_x(7, 4, 8)?)?;
+    assembler.bind(complete)?;
     Ok(())
 }
 
@@ -8044,6 +8478,7 @@ fn aarch64_emit_context_absolute_bounds(
 )]
 fn lower_aarch64_context(
     layout: &ContextNativeLayout,
+    line_cut: Option<ContextLineCutPlan>,
     terminal_suffix_search: Option<ContextTerminalSuffixSearch>,
     anchored_forward_search: Option<ContextAnchoredForwardSearch>,
     anchored_adaptive_guard: Option<ContextAnchoredAdaptiveGuard>,
@@ -8098,6 +8533,13 @@ fn lower_aarch64_context(
     } else {
         None
     };
+    let line_start_restart = if line_cut.is_some_and(ContextLineCutPlan::is_start)
+        && anchored_prefix_scan.is_none()
+    {
+        Some(assembler.label()?)
+    } else {
+        None
+    };
     let anchored_accelerated_fallback =
         if anchored_forward_search.is_some() && start_filter.is_some() {
             Some(assembler.label()?)
@@ -8142,6 +8584,17 @@ fn lower_aarch64_context(
     let use_exact_asimd_lane = asimd_lane_index_offset.is_some();
     if let Some(offset) = asimd_lane_index_offset {
         aarch64_emit_first_lane_constants(&mut assembler, offset)?;
+    }
+    if let Some(cut) = line_cut {
+        aarch64_context_emit_line_cut_prepass(
+            &mut assembler,
+            cut,
+            sve_filter_plans.line,
+            use_asimd,
+            use_exact_asimd_lane,
+            no_match,
+            invalid_initialized,
+        )?;
     }
     if let Some(suffix) = terminal_suffix_search {
         aarch64_context_emit_terminal_suffix_search(
@@ -8229,6 +8682,30 @@ fn lower_aarch64_context(
         )?;
     }
 
+    if let (Some(restart), Some(cut)) = (line_start_restart, line_cut) {
+        assembler.branch(forward_entry)?;
+        assembler.bind(restart)?;
+        aarch64_context_emit_prefix_prepass(
+            &mut assembler,
+            cut.primary,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ContextPrepassRestart::LineStartBounded(cut.maximum_before),
+            None,
+            None,
+            sve_filter_plans.line,
+            use_asimd,
+            use_exact_asimd_lane,
+            forward_finish,
+            invalid_initialized,
+            None,
+        )?;
+        assembler.branch(forward_entry)?;
+    }
+
     assembler.bind(forward_entry)?;
     if let Some(raw) = layout.raw_pair_initial {
         aarch64_context_emit_raw_forward_initial(&mut assembler, layout, raw, invalid_initialized)?;
@@ -8300,6 +8777,15 @@ fn lower_aarch64_context(
     assembler.branch_bit_set_w(8, 1, forward_finish)?;
     if absolute_bounds.requires_start {
         assembler.branch_bit_set_w(8, 2, forward_finish)?;
+    }
+    if let Some(restart) = line_start_restart {
+        let active = assembler.label()?;
+        assembler.branch_bit_set_w(8, 0, active)?;
+        assembler.branch_bit_clear_w(8, 2, active)?;
+        assembler.instruction(aarch64_store_x(2, 4, 0)?)?;
+        assembler.instruction(aarch64_mov_x(9, 2)?)?;
+        assembler.branch(restart)?;
+        assembler.bind(active)?;
     }
     if let Some(prefix_scan) = anchored_prefix_scan {
         let active = assembler.label()?;
@@ -8903,6 +9389,217 @@ mod tests {
         assert_eq!(flags(r"(?:\Aab|cd)\z"), (false, true));
         assert_eq!(flags(r"\A(?:ab|cd\z)"), (true, false));
         assert_eq!(flags(r"(?m:^ab$)"), (false, false));
+    }
+
+    #[test]
+    fn line_cut_planning_is_direction_aware_and_uses_semantic_terminators() {
+        let plan = |pattern: &str| {
+            let compiled = compile(
+                CompileRequest::new(pattern, host_target())
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span),
+            )
+            .unwrap();
+            derive_context_line_cut(
+                compiled
+                    .program()
+                    .native_context_program_view()
+                    .expect("line assertion must use contextual lowering"),
+            )
+            .unwrap()
+            .expect("line assertion must yield a usable cut")
+        };
+
+        let both = plan(r"(?m:^abc$)");
+        assert_eq!(both.kind, RequiredLineCutKind::ConfiguredEnd);
+        assert_eq!(both.maximum_before, 3);
+        let start = plan(r"(?m:^abc)");
+        assert_eq!(start.kind, RequiredLineCutKind::ConfiguredStart);
+        assert_eq!(start.maximum_before, 0);
+        let crlf = plan(r"(?Rm:^abc$)");
+        assert_eq!(crlf.kind, RequiredLineCutKind::CrlfEnd);
+        assert_eq!(crlf.primary.candidate_bytes, 2);
+
+        let mut profile = fre_syntax::RustProfile::default();
+        profile.options.line_terminator = b';';
+        let configured = compile(
+            CompileRequest::new(r"(?m:^abc$)", host_target())
+                .profile(profile)
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span),
+        )
+        .unwrap();
+        let view = configured.program().native_context_program_view().unwrap();
+        let configured = derive_context_line_cut(view).unwrap().unwrap();
+        assert_eq!(view.line_terminator, b';');
+        assert_eq!(configured.primary.ranges().len(), 1);
+        assert_eq!(configured.primary.ranges()[0].start, b';');
+        assert_eq!(configured.primary.ranges()[0].end, b';');
+
+        let repeated = compile(
+            CompileRequest::new(r"(?Rm:^[^Z\r\n]*Z)", host_target())
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span),
+        )
+        .unwrap();
+        let repeated_view = repeated.program().native_context_program_view().unwrap();
+        assert!(
+            derive_anchored_prefix_start_filter(repeated_view.anchored_prefix.sets())
+                .unwrap()
+                .is_none(),
+            "broad first bytes must leave the line scanner owning empty-state restart",
+        );
+        assert!(derive_context_line_cut(repeated_view).unwrap().unwrap().is_start());
+    }
+
+    #[test]
+    fn line_cut_oracle_covers_every_window_and_crlf_adjacency() {
+        let configured_haystack = b"a;b;;c";
+        let crlf_haystack = b"\r\nA\rB\nC\r\n";
+        for (kind, terminator, haystack, expected_boundaries) in [
+            (
+                RequiredLineCutKind::ConfiguredStart,
+                b';',
+                configured_haystack.as_slice(),
+                &[0_usize, 2, 4, 5][..],
+            ),
+            (
+                RequiredLineCutKind::ConfiguredEnd,
+                b';',
+                configured_haystack.as_slice(),
+                &[1_usize, 3, 4, 6][..],
+            ),
+            (
+                RequiredLineCutKind::CrlfStart,
+                b';',
+                crlf_haystack.as_slice(),
+                &[0_usize, 2, 4, 6, 9][..],
+            ),
+            (
+                RequiredLineCutKind::CrlfEnd,
+                b';',
+                crlf_haystack.as_slice(),
+                &[0_usize, 3, 5, 7, 9][..],
+            ),
+        ] {
+            let primary = context_line_cut_filter(kind, terminator)
+                .unwrap()
+                .unwrap();
+            let plan = ContextLineCutPlan {
+                kind,
+                maximum_before: 2,
+                primary,
+            };
+            let actual = (0..=haystack.len())
+                .filter(|&position| context_line_boundary_at(plan, terminator, haystack, position))
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected_boundaries, "{kind:?}");
+            for start in 0..=haystack.len() {
+                for end in start..=haystack.len() {
+                    let expected = expected_boundaries
+                        .iter()
+                        .copied()
+                        .find(|&position| start <= position && position <= end)
+                        .map(|boundary| start.max(boundary.saturating_sub(2)));
+                    assert_eq!(
+                        context_line_cut_narrow_start(plan, terminator, haystack, start, end),
+                        expected,
+                        "{kind:?} {start}..{end}",
+                    );
+                }
+            }
+        }
+
+        let crlf_plan = ContextLineCutPlan {
+            kind: RequiredLineCutKind::CrlfStart,
+            maximum_before: 0,
+            primary: context_line_cut_filter(RequiredLineCutKind::CrlfStart, b'\n')
+                .unwrap()
+                .unwrap(),
+        };
+        assert_eq!(
+            context_line_cut_narrow_start(crlf_plan, b'\n', b"\r\n", 1, 1),
+            None,
+            "a window between CR and LF is not a CRLF line start",
+        );
+    }
+
+    #[test]
+    fn line_cut_receipts_cover_every_isa_and_optional_tables_do_not_force_decline() {
+        let avx512 = FeatureSet::of(CpuFeature::X86Avx512F).with(CpuFeature::X86Avx512Bw);
+        let sve2 = FeatureSet::of(CpuFeature::Aarch64Sve).with(CpuFeature::Aarch64Sve2);
+        let targets = [
+            (Target::x86_64_linux(), StartAccelerator::X86Sse2),
+            (
+                Target::x86_64_linux()
+                    .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+                    .unwrap(),
+                StartAccelerator::X86Avx2,
+            ),
+            (
+                Target::x86_64_linux().with_features(avx512).unwrap(),
+                StartAccelerator::X86Avx512Bw,
+            ),
+            (Target::aarch64_linux(), StartAccelerator::Scalar),
+            (
+                Target::aarch64_linux()
+                    .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                    .unwrap(),
+                StartAccelerator::Aarch64Asimd,
+            ),
+            (
+                Target::aarch64_linux()
+                    .with_features(FeatureSet::of(CpuFeature::Aarch64Sve))
+                    .unwrap(),
+                StartAccelerator::Aarch64Sve,
+            ),
+            (
+                Target::aarch64_linux().with_features(sve2).unwrap(),
+                StartAccelerator::Aarch64Sve2,
+            ),
+        ];
+        let base = compile(
+            CompileRequest::new(r"(?m:^abc$)", host_target())
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::Span),
+        )
+        .unwrap();
+        let view = base.program().native_context_program_view().unwrap();
+        let mandatory_bytes = build_context_native_layout_with_accelerators(
+            view,
+            ContextNativeLimits::default(),
+            false,
+            false,
+        )
+        .unwrap()
+        .data
+        .len();
+        assert!(mandatory_bytes > 0);
+
+        for (target, expected) in targets {
+            let compiled = compile(
+                CompileRequest::new(r"(?m:^abc$)", target)
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span),
+            )
+            .unwrap();
+            assert_eq!(compiled.module().start_accelerator(), expected, "{target:?}");
+            let lowering = lower_native_context_with_data_limit(view, target, mandatory_bytes)
+                .unwrap()
+                .expect("optional line tables must not reject the mandatory image");
+            assert!(lowering.data.len() <= mandatory_bytes, "{target:?}");
+            if target.architecture == Architecture::X86_64
+                && target.features.has(CpuFeature::X86Avx2)
+            {
+                assert!(
+                    lowering
+                        .code
+                        .windows(3)
+                        .any(|window| window == [0xc5, 0xf8, 0x77]),
+                    "AVX line scanner must retain vzeroupper",
+                );
+            }
+        }
     }
 
     #[test]
@@ -12601,6 +13298,154 @@ mod tests {
                 true,
                 false,
                 cases.clone(),
+                None,
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "links and executes graph-proved line cuts over every search window"]
+    fn linked_host_line_cut_differential() {
+        let mut cases = Vec::new();
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            cases.extend([
+                (
+                    r"(?m:^a$)",
+                    output,
+                    b"x\na\ny\na\n".as_slice(),
+                ),
+                (
+                    r"(?m:^$)",
+                    output,
+                    b"x\n\ny\n".as_slice(),
+                ),
+                (
+                    r"(?m:^a)",
+                    output,
+                    b"x\na\ny\na".as_slice(),
+                ),
+                (
+                    r"(?m:a$)",
+                    output,
+                    b"xa\nya\nza".as_slice(),
+                ),
+                (
+                    r"(?m:^(?:ab|a))",
+                    output,
+                    b"x\nab\na\ny".as_slice(),
+                ),
+                (
+                    r"(?m:^(?:a|ab))",
+                    output,
+                    b"x\nab\na\ny".as_slice(),
+                ),
+                (
+                    r"(?m:(?:ab|a)$)",
+                    output,
+                    b"xab\nya\na".as_slice(),
+                ),
+                (
+                    r"(?m:(?:a|ab)$)",
+                    output,
+                    b"xab\nya\na".as_slice(),
+                ),
+                (
+                    r"(?m:\A.{0,3}$)",
+                    output,
+                    b"ab\nxyz".as_slice(),
+                ),
+                (
+                    r"(?m:^.{0,3}\z)",
+                    output,
+                    b"ab\nxyz".as_slice(),
+                ),
+                (
+                    r"(?m:^[^Z\n]*Z)",
+                    output,
+                    b"aaa\nbbb\nccZ".as_slice(),
+                ),
+                (
+                    r"(?Rm:^[^Z\r\n]*Z)",
+                    output,
+                    b"aaa\r\nbbb\rccc\nddZ".as_slice(),
+                ),
+                (
+                    r"(?Rm:^(?:[^Z\r\n]*Z|$))",
+                    output,
+                    b"aaa\r\nbbb\r\n".as_slice(),
+                ),
+                (
+                    r"(?Rm:^a$)",
+                    output,
+                    b"\r\na\r\nA\ra\nB\r\na\rC".as_slice(),
+                ),
+                (
+                    r"(?Rm:^$)",
+                    output,
+                    b"\r\n\rX\n\r\n".as_slice(),
+                ),
+                (
+                    r"(?Rm:^a)",
+                    output,
+                    b"x\r\na\rX\na".as_slice(),
+                ),
+                (
+                    r"(?Rm:a$)",
+                    output,
+                    b"xa\r\nya\nza\r\n".as_slice(),
+                ),
+            ]);
+        }
+        for target in host_differential_targets() {
+            let directory = std::env::temp_dir().join(format!(
+                "fre-aot-context-line-cut-native-{}-{}",
+                std::process::id(),
+                match target.architecture {
+                    Architecture::Aarch64 => "aarch64",
+                    Architecture::X86_64 => "x86_64",
+                }
+            ));
+            build_context_differential_bundle_from_cases(
+                target,
+                directory,
+                true,
+                false,
+                cases.clone(),
+                None,
+            );
+
+            let custom_directory = std::env::temp_dir().join(format!(
+                "fre-aot-context-line-cut-custom-native-{}-{}",
+                std::process::id(),
+                match target.architecture {
+                    Architecture::Aarch64 => "aarch64",
+                    Architecture::X86_64 => "x86_64",
+                }
+            ));
+            let mut custom_cases = Vec::new();
+            for output in [
+                OutputContract::Exists,
+                OutputContract::SelectedEnd,
+                OutputContract::Span,
+            ] {
+                custom_cases.extend([
+                    (r"(?m:^a$)", output, b"x;a;y;a;".as_slice()),
+                    (r"(?m:^$)", output, b"x;;y;".as_slice()),
+                    (r"(?m:^a)", output, b"x;a;ya".as_slice()),
+                    (r"(?m:a$)", output, b"xa;ya;za".as_slice()),
+                ]);
+            }
+            build_context_differential_bundle_from_cases(
+                target,
+                custom_directory,
+                true,
+                false,
+                custom_cases,
+                Some(b';'),
             );
         }
     }
@@ -12739,6 +13584,7 @@ mod tests {
             execute,
             force_slow_context,
             cases(),
+            None,
         );
     }
 
@@ -12753,6 +13599,7 @@ mod tests {
         execute: bool,
         force_slow_context: bool,
         cases: Vec<(&'static str, OutputContract, &'static [u8])>,
+        line_terminator: Option<u8>,
     ) {
         fs::create_dir_all(&directory).unwrap();
         let mut source = String::from(
@@ -12774,6 +13621,13 @@ mod tests {
             let request = CompileRequest::new(pattern, target)
                 .mode(CompileMode::Optimizing)
                 .output(output);
+            let request = if let Some(line_terminator) = line_terminator {
+                let mut profile = fre_syntax::RustProfile::default();
+                profile.options.line_terminator = line_terminator;
+                request.profile(profile)
+            } else {
+                request
+            };
             let request = if force_slow_context {
                 let mut limits = crate::CompileLimitsV1::default();
                 limits.determinize.max_states = 0;
