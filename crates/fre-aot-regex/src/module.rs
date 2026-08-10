@@ -4688,6 +4688,7 @@ type NativeDefaultExceptionRow<const CAPACITY: usize> =
 struct NativeDefaultExceptionPlan {
     exception_capacity: u8,
     keys: NativeDefaultExceptionKeys,
+    cells: NativeCellEncoding,
     row_bytes: usize,
 }
 
@@ -5307,20 +5308,75 @@ fn native_default_exception_physical_slots(exception_capacity: u8) -> usize {
     }
 }
 
-fn native_default_exception_value_offset(exception_capacity: u8) -> Option<usize> {
-    let alignment_mask = core::mem::align_of::<u32>().checked_sub(1)?;
-    let keys_end = core::mem::size_of::<u32>()
+fn native_default_exception_value_offset(
+    exception_capacity: u8,
+    cells: NativeCellEncoding,
+) -> Option<usize> {
+    if !matches!(cells, NativeCellEncoding::Compact16 | NativeCellEncoding::Wide32) {
+        return None;
+    }
+    let cell_bytes = cells.bytes();
+    let keys_end = cell_bytes
         .checked_add(native_default_exception_physical_slots(exception_capacity))?;
+    let alignment_mask = cell_bytes.checked_sub(1)?;
     keys_end
         .checked_add(alignment_mask)
         .map(|offset| offset & !alignment_mask)
 }
 
-fn native_default_exception_row_bytes(exception_capacity: u8) -> Option<usize> {
-    native_default_exception_value_offset(exception_capacity)?.checked_add(
+fn native_default_exception_row_bytes(
+    exception_capacity: u8,
+    cells: NativeCellEncoding,
+) -> Option<usize> {
+    native_default_exception_value_offset(exception_capacity, cells)?.checked_add(
         native_default_exception_physical_slots(exception_capacity)
-            .checked_mul(core::mem::size_of::<u32>())?,
+            .checked_mul(cells.bytes())?,
     )
+}
+
+/// Select the narrowest established packed-cell ABI that can address every
+/// bounded sparse row and the complete authenticated continuation interval.
+///
+/// Compact row tokens are zero based and reserve `dead_token()` after the
+/// accelerator bit is stripped. Consequently the final live-or-hole token
+/// must remain strictly below that payload. Scalable sparse rows retain their
+/// existing Wide32 vector/binary lookup geometry.
+fn select_native_default_exception_encoding(
+    transitions: TransitionLayout,
+    exception_capacity: u8,
+    forward_states: usize,
+    encoded_hole_states: usize,
+) -> Option<(NativeCellEncoding, usize)> {
+    if forward_states == 0
+        || encoded_hole_states == 0
+        || usize::from(exception_capacity) > MAX_NATIVE_DEFAULT_EXCEPTIONS
+    {
+        return None;
+    }
+    for cells in [NativeCellEncoding::Compact16, NativeCellEncoding::Wide32] {
+        let Some(row_bytes) = native_default_exception_row_bytes(exception_capacity, cells) else {
+            continue;
+        };
+        let Some(forward_offset) = native_table_prefix_bytes(transitions, cells, 0) else {
+            continue;
+        };
+        let final_hole = forward_states
+            .checked_sub(1)
+            .and_then(|state| state.checked_mul(row_bytes))
+            .and_then(|offset| forward_offset.checked_add(offset))
+            .and_then(|offset| encode_native_row_offset(offset, cells))
+            .and_then(|last_live| last_live.checked_add(encoded_hole_states))
+            .and_then(|token| u32::try_from(token).ok())?;
+        let fits = if cells.is_compact() {
+            final_hole < cells.dead_token()
+        } else {
+            final_hole <= cells.next_mask()
+        };
+        if fits {
+            return Some((cells, row_bytes));
+        }
+    }
+    None
 }
 
 fn native_default_exception_row(
@@ -5554,6 +5610,7 @@ fn append_native_default_exception_record<F>(
     exceptions: &[NativeDefaultException],
     exception_count: usize,
     exception_capacity: u8,
+    cells: NativeCellEncoding,
     row_bytes: usize,
     pack: F,
 ) -> Result<(), ObjectError>
@@ -5571,7 +5628,7 @@ where
         ));
     }
     let row_start = bytes.len();
-    let value_offset = native_default_exception_value_offset(exception_capacity).ok_or(
+    let value_offset = native_default_exception_value_offset(exception_capacity, cells).ok_or(
         ObjectError::InvalidModule("default-exception row value offset"),
     )?;
     // Scalable rows duplicate their final real key into every physical
@@ -5588,7 +5645,7 @@ where
         .copied()
         .flatten();
     let exception_at = |slot: usize| exceptions.get(slot).copied().flatten().or(scalable_padding);
-    bytes.extend_from_slice(&pack(default)?.to_le_bytes());
+    append_native_packed_cell(bytes, pack(default)?, cells)?;
     for slot in 0..physical_slots {
         bytes.push(exception_at(slot).map_or(0, |(key, _)| key));
     }
@@ -5606,7 +5663,7 @@ where
         } else {
             default
         };
-        bytes.extend_from_slice(&pack(cell)?.to_le_bytes());
+        append_native_packed_cell(bytes, pack(cell)?, cells)?;
     }
     let row_end = row_start
         .checked_add(row_bytes)
@@ -5696,11 +5753,27 @@ fn derive_native_default_exception_plan(
         (None, None) => (NativeDefaultExceptionKeys::Classes, exception_capacity),
     };
     let exception_capacity = u8::try_from(exception_capacity).ok()?;
-    let row_bytes = native_default_exception_row_bytes(exception_capacity)?;
     let transitions = keys.transitions(exception_capacity);
+    let (cells, row_bytes) =
+        if usize::from(exception_capacity) <= MAX_NATIVE_DEFAULT_EXCEPTIONS {
+            select_native_default_exception_encoding(
+                transitions,
+                exception_capacity,
+                forward_states,
+                encoded_hole_states,
+            )?
+        } else {
+            (
+                NativeCellEncoding::Wide32,
+                native_default_exception_row_bytes(
+                    exception_capacity,
+                    NativeCellEncoding::Wide32,
+                )?,
+            )
+        };
     let sparse_bytes = native_machine_bytes(
         transitions,
-        NativeCellEncoding::Wide32,
+        cells,
         dfa.class_count,
         forward_states,
         0,
@@ -5726,6 +5799,7 @@ fn derive_native_default_exception_plan(
     (sparse_bytes < dense_bytes).then_some(NativeDefaultExceptionPlan {
         exception_capacity,
         keys,
+        cells,
         row_bytes,
     })
 }
@@ -6473,8 +6547,14 @@ fn native_row_bytes(
             | TransitionLayout::DefaultSparseExceptions(capacity)
             | TransitionLayout::DefaultByteSparseExceptions(capacity),
             NativeCellEncoding::Wide32,
-        ) => {
-            native_default_exception_row_bytes(capacity)
+        ) => native_default_exception_row_bytes(capacity, cells),
+        (
+            TransitionLayout::DefaultExceptions(capacity)
+            | TransitionLayout::DefaultByteExceptions(capacity)
+            | TransitionLayout::DefaultByteBoundaries(capacity),
+            NativeCellEncoding::Compact16,
+        ) if usize::from(capacity) <= MAX_NATIVE_DEFAULT_EXCEPTIONS => {
+            native_default_exception_row_bytes(capacity, cells)
         }
         (
             TransitionLayout::DefaultExceptions(_)
@@ -6522,6 +6602,12 @@ fn native_table_prefix_bytes(
             | TransitionLayout::DefaultByteSparseExceptions(_),
             NativeCellEncoding::Wide32,
         ) => Some(prefix),
+        (
+            TransitionLayout::DefaultExceptions(capacity)
+            | TransitionLayout::DefaultByteExceptions(capacity)
+            | TransitionLayout::DefaultByteBoundaries(capacity),
+            NativeCellEncoding::Compact16,
+        ) if usize::from(capacity) <= MAX_NATIVE_DEFAULT_EXCEPTIONS => Some(prefix),
         (
             TransitionLayout::DefaultExceptions(_)
             | TransitionLayout::DefaultByteExceptions(_)
@@ -9338,6 +9424,21 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
     // over physical rows so a tiny interned table does not inherit a multiply
     // or wide cell chosen for logical aliases that are never materialized.
     let (transitions, cells) = if let Some(plan) = default_exceptions {
+        let transitions = plan.keys.transitions(plan.exception_capacity);
+        let encoding_is_valid = if usize::from(plan.exception_capacity)
+            <= MAX_NATIVE_DEFAULT_EXCEPTIONS
+        {
+            select_native_default_exception_encoding(
+                transitions,
+                plan.exception_capacity,
+                forward_states,
+                encoded_hole_states,
+            ) == Some((plan.cells, plan.row_bytes))
+        } else {
+            plan.cells == NativeCellEncoding::Wide32
+                && native_default_exception_row_bytes(plan.exception_capacity, plan.cells)
+                    == Some(plan.row_bytes)
+        };
         if encoded_hole_states == 0
             || retained_reverse_states != 0
             || usize::from(plan.exception_capacity) > MAX_NATIVE_SPARSE_EXCEPTIONS
@@ -9345,17 +9446,13 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
                 plan.keys,
                 NativeDefaultExceptionKeys::Bytes | NativeDefaultExceptionKeys::Boundaries
             ) && plan.exception_capacity == 0)
-            || native_default_exception_row_bytes(plan.exception_capacity)
-                != Some(plan.row_bytes)
+            || !encoding_is_valid
         {
             return Err(ObjectError::InvalidModule(
                 "default-exception rows have an invalid partial shape",
             ));
         }
-        (
-            plan.keys.transitions(plan.exception_capacity),
-            NativeCellEncoding::Wide32,
-        )
+        (transitions, plan.cells)
     } else if force_class_mapped {
         if encoded_hole_states == 0 || retained_reverse_states != 0 {
             return Err(ObjectError::InvalidModule(
@@ -10107,6 +10204,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
                             &exceptions,
                             exception_count,
                             exception_capacity,
+                            cells,
                             row_bytes,
                             pack,
                         )?;
@@ -10135,12 +10233,12 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
                         };
                         let row_start = bytes.len();
                         let value_offset =
-                            native_default_exception_value_offset(exception_capacity).ok_or(
+                            native_default_exception_value_offset(exception_capacity, cells).ok_or(
                                 ObjectError::InvalidModule(
                                     "default-exception boundary value offset",
                                 ),
                             )?;
-                        bytes.extend_from_slice(&pack(default)?.to_le_bytes());
+                        append_native_packed_cell(&mut bytes, pack(default)?, cells)?;
                         for slot in 0..logical_capacity {
                             bytes.push(exception_at(slot).map_or(0, |(key, _)| key));
                         }
@@ -10154,7 +10252,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
                         );
                         for slot in 0..logical_capacity {
                             let cell = exception_at(slot).map_or(default, |(_, cell)| cell);
-                            bytes.extend_from_slice(&pack(cell)?.to_le_bytes());
+                            append_native_packed_cell(&mut bytes, pack(cell)?, cells)?;
                         }
                         let row_end = row_start.checked_add(row_bytes).ok_or(
                             ObjectError::ArithmeticOverflow(
@@ -10180,6 +10278,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
                             &exceptions,
                             exception_count,
                             exception_capacity,
+                            cells,
                             row_bytes,
                             pack,
                         )?;
@@ -10197,6 +10296,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
                             &exceptions,
                             exception_count,
                             exception_capacity,
+                            cells,
                             row_bytes,
                             pack,
                         )?;
@@ -10217,6 +10317,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
                             &exceptions,
                             exception_count,
                             exception_capacity,
+                            cells,
                             row_bytes,
                             pack,
                         )?;
@@ -13274,7 +13375,7 @@ fn x86_emit_default_exception_lookup(
     cells: NativeCellEncoding,
     keys: NativeDefaultExceptionKeys,
 ) -> Result<(), ObjectError> {
-    if cells != NativeCellEncoding::Wide32
+    if !matches!(cells, NativeCellEncoding::Compact16 | NativeCellEncoding::Wide32)
         || exception_capacity == 0
         || usize::from(exception_capacity) > MAX_NATIVE_DEFAULT_EXCEPTIONS
     {
@@ -13282,7 +13383,7 @@ fn x86_emit_default_exception_lookup(
             "x86 default-exception row shape",
         ));
     }
-    let value_offset = native_default_exception_value_offset(exception_capacity).ok_or(
+    let value_offset = native_default_exception_value_offset(exception_capacity, cells).ok_or(
         ObjectError::InvalidModule("x86 default-exception value offset"),
     )?;
     let mut exception_labels = Vec::new();
@@ -13302,7 +13403,8 @@ fn x86_emit_default_exception_lookup(
         };
         let label = assembler.label()?;
         exception_labels.push((slot, label));
-        let key_offset = core::mem::size_of::<u32>()
+        let key_offset = cells
+            .bytes()
             .checked_add(slot)
             .and_then(|offset| u8::try_from(offset).ok())
             .ok_or(ObjectError::ArithmeticOverflow(
@@ -13317,19 +13419,35 @@ fn x86_emit_default_exception_lookup(
         assembler.branch(branch, label)?;
     }
     let done = assembler.label()?;
-    assembler.instruction(&[0x41, 0x8b, 0x02])?; // eax = default cell
+    match cells {
+        NativeCellEncoding::Compact16 => {
+            assembler.instruction(&[0x41, 0x0f, 0xb7, 0x02])?;
+        }
+        NativeCellEncoding::Wide32 => {
+            assembler.instruction(&[0x41, 0x8b, 0x02])?;
+        }
+        _ => unreachable!("validated bounded sparse cell width"),
+    }
     assembler.branch(&[0xe9], done)?;
     for (slot, label) in exception_labels {
         assembler.bind(label)?;
         let cell_offset = value_offset
-            .checked_add(slot.checked_mul(core::mem::size_of::<u32>()).ok_or(
+            .checked_add(slot.checked_mul(cells.bytes()).ok_or(
                 ObjectError::ArithmeticOverflow("x86 default-exception cell offset"),
             )?)
             .and_then(|offset| u8::try_from(offset).ok())
             .ok_or(ObjectError::ArithmeticOverflow(
                 "x86 default-exception cell offset",
             ))?;
-        assembler.instruction(&[0x41, 0x8b, 0x42, cell_offset])?;
+        match cells {
+            NativeCellEncoding::Compact16 => {
+                assembler.instruction(&[0x41, 0x0f, 0xb7, 0x42, cell_offset])?;
+            }
+            NativeCellEncoding::Wide32 => {
+                assembler.instruction(&[0x41, 0x8b, 0x42, cell_offset])?;
+            }
+            _ => unreachable!("validated bounded sparse cell width"),
+        }
         assembler.branch(&[0xe9], done)?;
     }
     assembler.bind(done)?;
@@ -13442,7 +13560,11 @@ fn x86_emit_sparse_exception_lookup(
             "x86 scalable-exception row shape",
         ));
     }
-    let value_offset = native_default_exception_value_offset(exception_capacity).ok_or(
+    let value_offset = native_default_exception_value_offset(
+        exception_capacity,
+        NativeCellEncoding::Wide32,
+    )
+    .ok_or(
         ObjectError::InvalidModule("x86 scalable-exception value offset"),
     )?;
     let inline_default_slot =
@@ -13558,15 +13680,22 @@ fn x86_emit_table_lookup(
     kind: X86StartFilterKind,
 ) -> Result<(), ObjectError> {
     if transitions == TransitionLayout::DefaultExceptions(0) {
-        if cells != NativeCellEncoding::Wide32 {
-            return Err(ObjectError::InvalidModule(
-                "x86 uniform default row shape",
-            ));
-        }
         // Every raw byte names the same packed cell. Load it directly without
         // touching either the haystack or the omitted class map, and without
         // branching around an empty exception list.
-        assembler.instruction(&[0x41, 0x8b, 0x02])?; // eax = default cell
+        match cells {
+            NativeCellEncoding::Compact16 => {
+                assembler.instruction(&[0x41, 0x0f, 0xb7, 0x02])?;
+            }
+            NativeCellEncoding::Wide32 => {
+                assembler.instruction(&[0x41, 0x8b, 0x02])?;
+            }
+            _ => {
+                return Err(ObjectError::InvalidModule(
+                    "x86 uniform default row shape",
+                ));
+            }
+        }
         return Ok(());
     }
     // eax = haystack[position]
@@ -26082,7 +26211,7 @@ fn aarch64_emit_default_exception_lookup(
     cells: NativeCellEncoding,
     keys: NativeDefaultExceptionKeys,
 ) -> Result<(), ObjectError> {
-    if cells != NativeCellEncoding::Wide32
+    if !matches!(cells, NativeCellEncoding::Compact16 | NativeCellEncoding::Wide32)
         || exception_capacity == 0
         || usize::from(exception_capacity) > MAX_NATIVE_DEFAULT_EXCEPTIONS
     {
@@ -26090,7 +26219,7 @@ fn aarch64_emit_default_exception_lookup(
             "AArch64 default-exception row shape",
         ));
     }
-    let value_offset = native_default_exception_value_offset(exception_capacity).ok_or(
+    let value_offset = native_default_exception_value_offset(exception_capacity, cells).ok_or(
         ObjectError::InvalidModule("AArch64 default-exception value offset"),
     )?;
     let mut exception_labels = Vec::new();
@@ -26110,7 +26239,8 @@ fn aarch64_emit_default_exception_lookup(
         };
         let label = assembler.label()?;
         exception_labels.push((slot, label));
-        let key_offset = core::mem::size_of::<u32>()
+        let key_offset = cells
+            .bytes()
             .checked_add(slot)
             .and_then(|offset| u16::try_from(offset).ok())
             .ok_or(ObjectError::ArithmeticOverflow(
@@ -26126,19 +26256,35 @@ fn aarch64_emit_default_exception_lookup(
         assembler.branch_cond(condition, label)?;
     }
     let done = assembler.label()?;
-    assembler.instruction(aarch64_load_w_imm(8, 11, 0)?)?;
+    match cells {
+        NativeCellEncoding::Compact16 => {
+            assembler.instruction(aarch64_load_halfword_imm(8, 11, 0)?)?;
+        }
+        NativeCellEncoding::Wide32 => {
+            assembler.instruction(aarch64_load_w_imm(8, 11, 0)?)?;
+        }
+        _ => unreachable!("validated bounded sparse cell width"),
+    }
     assembler.branch(done)?;
     for (slot, label) in exception_labels {
         assembler.bind(label)?;
         let cell_offset = value_offset
-            .checked_add(slot.checked_mul(core::mem::size_of::<u32>()).ok_or(
+            .checked_add(slot.checked_mul(cells.bytes()).ok_or(
                 ObjectError::ArithmeticOverflow("AArch64 default-exception cell offset"),
             )?)
             .and_then(|offset| u16::try_from(offset).ok())
             .ok_or(ObjectError::ArithmeticOverflow(
                 "AArch64 default-exception cell offset",
             ))?;
-        assembler.instruction(aarch64_load_w_imm(8, 11, cell_offset)?)?;
+        match cells {
+            NativeCellEncoding::Compact16 => {
+                assembler.instruction(aarch64_load_halfword_imm(8, 11, cell_offset)?)?;
+            }
+            NativeCellEncoding::Wide32 => {
+                assembler.instruction(aarch64_load_w_imm(8, 11, cell_offset)?)?;
+            }
+            _ => unreachable!("validated bounded sparse cell width"),
+        }
         assembler.branch(done)?;
     }
     assembler.bind(done)?;
@@ -26234,7 +26380,11 @@ fn aarch64_emit_sparse_exception_lookup(
             "AArch64 scalable-exception row shape",
         ));
     }
-    let value_offset = native_default_exception_value_offset(exception_capacity).ok_or(
+    let value_offset = native_default_exception_value_offset(
+        exception_capacity,
+        NativeCellEncoding::Wide32,
+    )
+    .ok_or(
         ObjectError::InvalidModule("AArch64 scalable-exception value offset"),
     )?;
     let inline_default_slot =
@@ -26324,15 +26474,22 @@ fn aarch64_emit_table_lookup(
     features: FeatureSet,
 ) -> Result<(), ObjectError> {
     if transitions == TransitionLayout::DefaultExceptions(0) {
-        if cells != NativeCellEncoding::Wide32 {
-            return Err(ObjectError::InvalidModule(
-                "AArch64 uniform default row shape",
-            ));
-        }
         // A uniform row is independent of the current input byte. Its packed
         // default is the row itself, so neither the haystack nor a class map
         // participates in this transition.
-        assembler.instruction(aarch64_load_w_imm(8, 11, 0)?)?;
+        match cells {
+            NativeCellEncoding::Compact16 => {
+                assembler.instruction(aarch64_load_halfword_imm(8, 11, 0)?)?;
+            }
+            NativeCellEncoding::Wide32 => {
+                assembler.instruction(aarch64_load_w_imm(8, 11, 0)?)?;
+            }
+            _ => {
+                return Err(ObjectError::InvalidModule(
+                    "AArch64 uniform default row shape",
+                ));
+            }
+        }
         return Ok(());
     }
     assembler.instruction(aarch64_load_byte_reg(8, 0, 2)?)?;
@@ -37165,6 +37322,22 @@ mod tests {
         compiled
     }
 
+    fn read_native_packed_cell(data: &[u8], offset: usize, cells: NativeCellEncoding) -> u32 {
+        match cells {
+            NativeCellEncoding::Compact8Direct => u32::from(data[offset]),
+            NativeCellEncoding::Compact16
+            | NativeCellEncoding::Compact16Indexed(_)
+            | NativeCellEncoding::Compact16Ordinal(_) => {
+                u32::from(u16::from_le_bytes(
+                    data[offset..offset + 2].try_into().unwrap(),
+                ))
+            }
+            NativeCellEncoding::Wide32 => {
+                u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap())
+            }
+        }
+    }
+
     struct DefaultExceptionPartialFixture {
         byte_classes: [u8; 256],
         class_representatives: Vec<u8>,
@@ -38129,8 +38302,8 @@ mod tests {
             TransitionLayout::DefaultByteSparseExceptions(capacity) => (capacity, byte),
             other => panic!("expected scalable default-exception rows, got {other:?}"),
         };
-        let row_bytes = native_default_exception_row_bytes(capacity).unwrap();
-        let value_offset = native_default_exception_value_offset(capacity).unwrap();
+        let row_bytes = native_default_exception_row_bytes(capacity, layout.cells).unwrap();
+        let value_offset = native_default_exception_value_offset(capacity, layout.cells).unwrap();
         let row_start = usize::try_from(layout.forward_offset).unwrap() + state * row_bytes;
         let mut packed = u32::from_le_bytes(data[row_start..row_start + 4].try_into().unwrap());
         for slot in 0..native_default_exception_physical_slots(capacity) {
@@ -55843,12 +56016,12 @@ int main(void){{
                 "capacity={capacity}",
             );
             assert_eq!(
-                native_default_exception_value_offset(capacity),
+                native_default_exception_value_offset(capacity, NativeCellEncoding::Wide32),
                 Some(value_offset),
                 "capacity={capacity}",
             );
             assert_eq!(
-                native_default_exception_row_bytes(capacity),
+                native_default_exception_row_bytes(capacity, NativeCellEncoding::Wide32),
                 Some(row_bytes),
                 "capacity={capacity}",
             );
@@ -56079,8 +56252,9 @@ int main(void){{
                     assert_eq!(layout.transitions, expected_keys.transitions(capacity));
                     let logical_capacity = usize::from(capacity);
                     let physical_slots = native_default_exception_physical_slots(capacity);
-                    let row_bytes = native_default_exception_row_bytes(capacity).unwrap();
-                    let value_offset = native_default_exception_value_offset(capacity).unwrap();
+                    let row_bytes = native_default_exception_row_bytes(capacity, layout.cells).unwrap();
+                    let value_offset =
+                        native_default_exception_value_offset(capacity, layout.cells).unwrap();
                     let forward_offset = usize::try_from(layout.forward_offset).unwrap();
                     match layout.transitions {
                         TransitionLayout::DefaultSparseExceptions(_) => {
@@ -56215,8 +56389,16 @@ int main(void){{
         for capacity in [5_u8, 15] {
             let logical_capacity = usize::from(capacity);
             let physical_slots = native_default_exception_physical_slots(capacity);
-            let row_bytes = native_default_exception_row_bytes(capacity).unwrap();
-            let value_offset = native_default_exception_value_offset(capacity).unwrap();
+            let row_bytes = native_default_exception_row_bytes(
+                capacity,
+                NativeCellEncoding::Wide32,
+            )
+            .unwrap();
+            let value_offset = native_default_exception_value_offset(
+                capacity,
+                NativeCellEncoding::Wide32,
+            )
+            .unwrap();
             assert_eq!(physical_slots, NATIVE_SPARSE_VECTOR_LANES);
             assert_eq!(row_bytes, 84);
             assert_eq!(value_offset, 20);
@@ -56248,6 +56430,7 @@ int main(void){{
                     &exceptions,
                     exception_count,
                     capacity,
+                    NativeCellEncoding::Wide32,
                     row_bytes,
                     pack,
                 )
@@ -56512,30 +56695,33 @@ int main(void){{
 
         for architecture in [Architecture::X86_64, Architecture::Aarch64] {
             let exact = derive(&[1, 1, 1, 1], architecture);
+            assert_eq!(exact.cells, NativeCellEncoding::Compact16, "{architecture:?}");
             assert_eq!(exact.exception_capacity, 4, "{architecture:?}");
             assert_eq!(exact.keys, NativeDefaultExceptionKeys::Bytes, "{architecture:?}");
-            assert_eq!(exact.row_bytes, 24, "{architecture:?}");
+            assert_eq!(exact.row_bytes, 14, "{architecture:?}");
             assert_eq!(
                 native_machine_bytes(
                     exact.keys.transitions(exact.exception_capacity),
-                    NativeCellEncoding::Wide32,
+                    exact.cells,
                     CLASS_COUNT,
                     COMPLETE_ROWS,
                     0,
                 ),
-                Some(2_400),
+                Some(1_400),
             );
 
             let expanded = derive(&[2, 1, 1], architecture);
+            assert_eq!(expanded.cells, NativeCellEncoding::Compact16, "{architecture:?}");
             assert_eq!(expanded.exception_capacity, 3, "{architecture:?}");
             assert_eq!(
                 expanded.keys,
                 NativeDefaultExceptionKeys::Classes,
                 "{architecture:?}",
             );
-            assert_eq!(expanded.row_bytes, 20, "{architecture:?}");
+            assert_eq!(expanded.row_bytes, 12, "{architecture:?}");
 
             let overflow = derive(&[5], architecture);
+            assert_eq!(overflow.cells, NativeCellEncoding::Compact16, "{architecture:?}");
             assert_eq!(overflow.exception_capacity, 1, "{architecture:?}");
             assert_eq!(
                 overflow.keys,
@@ -56660,17 +56846,18 @@ int main(void){{
                 )
                 .expect("boundary sparse reduction");
                 assert_eq!(plan.keys, NativeDefaultExceptionKeys::Boundaries);
+                assert_eq!(plan.cells, NativeCellEncoding::Compact16);
                 assert_eq!(plan.exception_capacity, 3);
-                assert_eq!(plan.row_bytes, 20);
+                assert_eq!(plan.row_bytes, 12);
                 assert_eq!(
                     native_machine_bytes(
                         plan.keys.transitions(plan.exception_capacity),
-                        NativeCellEncoding::Wide32,
+                        plan.cells,
                         view.dfa.class_count,
                         BoundaryDefaultExceptionFixture::COMPLETE_ROWS,
                         0,
                     ),
-                    Some(2_000),
+                    Some(1_200),
                 );
                 assert_eq!(
                     native_machine_bytes(
@@ -56783,13 +56970,15 @@ int main(void){{
         for architecture in [Architecture::X86_64, Architecture::Aarch64] {
             let equal = derive(false, architecture);
             assert_eq!(equal.keys, NativeDefaultExceptionKeys::Boundaries);
+            assert_eq!(equal.cells, NativeCellEncoding::Compact16);
             assert_eq!(equal.exception_capacity, 2);
-            assert_eq!(equal.row_bytes, 16);
+            assert_eq!(equal.row_bytes, 8);
 
             let deeper = derive(true, architecture);
             assert_eq!(deeper.keys, NativeDefaultExceptionKeys::Classes);
+            assert_eq!(deeper.cells, NativeCellEncoding::Compact16);
             assert_eq!(deeper.exception_capacity, 2);
-            assert_eq!(deeper.row_bytes, 16);
+            assert_eq!(deeper.row_bytes, 8);
         }
     }
 
@@ -56815,10 +57004,13 @@ int main(void){{
                     other => panic!("expected byte-boundary rows, got {other:?}"),
                 };
                 assert_eq!(capacity, 3);
-                assert_eq!(layout.cells, NativeCellEncoding::Wide32);
+                assert_eq!(layout.cells, NativeCellEncoding::Compact16);
                 assert_eq!(layout.forward_offset, 0);
-                let row_bytes = native_default_exception_row_bytes(capacity).unwrap();
-                let value_offset = native_default_exception_value_offset(capacity).unwrap();
+                let row_bytes =
+                    native_default_exception_row_bytes(capacity, layout.cells).unwrap();
+                let value_offset =
+                    native_default_exception_value_offset(capacity, layout.cells).unwrap();
+                let cell_bytes = layout.cells.bytes();
                 let forward_end = BoundaryDefaultExceptionFixture::COMPLETE_ROWS * row_bytes;
                 assert_eq!(usize::try_from(layout.reverse_offset).unwrap(), forward_end);
                 assert!(data.len() >= forward_end);
@@ -56831,15 +57023,11 @@ int main(void){{
                 for state in 0..BoundaryDefaultExceptionFixture::COMPLETE_ROWS {
                     let row_start = state * row_bytes;
                     for byte in u8::MIN..=u8::MAX {
-                        let mut actual = u32::from_le_bytes(
-                            data[row_start..row_start + 4].try_into().unwrap(),
-                        );
+                        let mut actual = read_native_packed_cell(&data, row_start, layout.cells);
                         for slot in 0..usize::from(capacity) {
-                            if byte >= data[row_start + 4 + slot] {
-                                let offset = row_start + value_offset + slot * 4;
-                                actual = u32::from_le_bytes(
-                                    data[offset..offset + 4].try_into().unwrap(),
-                                );
+                            if byte >= data[row_start + cell_bytes + slot] {
+                                let offset = row_start + value_offset + slot * cell_bytes;
+                                actual = read_native_packed_cell(&data, offset, layout.cells);
                             }
                         }
                         let class = usize::from(fixture.byte_classes[usize::from(byte)]);
@@ -56862,13 +57050,171 @@ int main(void){{
                             expected,
                             "{architecture:?}/collapse={collapse}/state={state}/byte={byte}",
                         );
-                        saw_dead |= actual & layout.cells.next_mask() == 0;
-                        saw_hole |= actual & layout.cells.next_mask() >= partial.hole_token_base;
+                        let token = actual & layout.cells.next_mask();
+                        let is_dead = token == layout.cells.dead_token();
+                        saw_dead |= is_dead;
+                        saw_hole |= !is_dead && token >= partial.hole_token_base;
                         saw_accept |= actual & layout.cells.accepts() != 0;
                         saw_accelerated |= actual & layout.cells.accelerated() != 0;
                     }
                 }
                 assert!(saw_dead && saw_hole && saw_accept && saw_accelerated);
+            }
+        }
+    }
+
+    #[test]
+    fn compact_default_exception_geometry_has_exact_token_boundaries() {
+        let compact_rows = [2_usize, 6, 8, 12, 14];
+        let wide_rows = [4_usize, 12, 16, 20, 24];
+        for capacity in 0..=u8::try_from(MAX_NATIVE_DEFAULT_EXCEPTIONS).unwrap() {
+            let index = usize::from(capacity);
+            let transitions = TransitionLayout::DefaultExceptions(capacity);
+            let compact_row =
+                native_default_exception_row_bytes(capacity, NativeCellEncoding::Compact16)
+                    .unwrap();
+            let wide_row =
+                native_default_exception_row_bytes(capacity, NativeCellEncoding::Wide32)
+                    .unwrap();
+            assert_eq!(compact_row, compact_rows[index]);
+            assert_eq!(wide_row, wide_rows[index]);
+            let prefix = usize::from(capacity != 0) * CLASS_MAP_BYTES;
+            assert_eq!(
+                native_table_prefix_bytes(transitions, NativeCellEncoding::Compact16, 256),
+                Some(prefix),
+            );
+            assert!(prefix.is_multiple_of(NativeCellEncoding::Compact16.bytes()));
+            assert!(compact_row.is_multiple_of(NativeCellEncoding::Compact16.bytes()));
+
+            for encoded_holes in [1_usize, 257] {
+                let last_live_limit = usize::try_from(COMPACT_CELL_NEXT_MASK).unwrap()
+                    - encoded_holes;
+                let last_offset_limit = (last_live_limit - 1) * 2;
+                let maximum_states = (last_offset_limit - prefix) / compact_row + 1;
+                assert_eq!(
+                    select_native_default_exception_encoding(
+                        transitions,
+                        capacity,
+                        maximum_states,
+                        encoded_holes,
+                    ),
+                    Some((NativeCellEncoding::Compact16, compact_row)),
+                    "capacity={capacity}/holes={encoded_holes}",
+                );
+                assert_eq!(
+                    select_native_default_exception_encoding(
+                        transitions,
+                        capacity,
+                        maximum_states + 1,
+                        encoded_holes,
+                    ),
+                    Some((NativeCellEncoding::Wide32, wide_row)),
+                    "capacity={capacity}/holes={encoded_holes}",
+                );
+            }
+        }
+        assert!(select_native_default_exception_encoding(
+            TransitionLayout::DefaultExceptions(0),
+            0,
+            0,
+            1,
+        )
+        .is_none());
+        assert!(select_native_default_exception_encoding(
+            TransitionLayout::DefaultExceptions(0),
+            0,
+            1,
+            0,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn default_exception_lookup_lowers_every_capacity_and_cell_width_on_both_isas() {
+        for capacity in 0..=u8::try_from(MAX_NATIVE_DEFAULT_EXCEPTIONS).unwrap() {
+            for cells in [NativeCellEncoding::Compact16, NativeCellEncoding::Wide32] {
+                let mut x86 = X86Assembler::new();
+                x86_emit_table_lookup(
+                    &mut x86,
+                    TransitionLayout::DefaultExceptions(capacity),
+                    cells,
+                    X86StartFilterKind::Sse2,
+                )
+                .unwrap();
+                let x86 = x86.finish().unwrap();
+                let x86_default = match cells {
+                    NativeCellEncoding::Compact16 => vec![0x41, 0x0f, 0xb7, 0x02],
+                    NativeCellEncoding::Wide32 => vec![0x41, 0x8b, 0x02],
+                    _ => unreachable!("bounded sparse cell widths"),
+                };
+                assert!(x86
+                    .windows(x86_default.len())
+                    .any(|code| code == x86_default.as_slice()));
+
+                let mut aarch64 = Aarch64Assembler::new();
+                aarch64_emit_table_lookup(
+                    &mut aarch64,
+                    TransitionLayout::DefaultExceptions(capacity),
+                    cells,
+                    FeatureSet::EMPTY,
+                )
+                .unwrap();
+                let words = aarch64
+                    .finish()
+                    .unwrap()
+                    .chunks_exact(4)
+                    .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                    .collect::<Vec<_>>();
+                let aarch64_default = match cells {
+                    NativeCellEncoding::Compact16 => {
+                        aarch64_load_halfword_imm(8, 11, 0).unwrap()
+                    }
+                    NativeCellEncoding::Wide32 => aarch64_load_w_imm(8, 11, 0).unwrap(),
+                    _ => unreachable!("bounded sparse cell widths"),
+                };
+                assert!(words.contains(&aarch64_default));
+
+                if capacity == 0 {
+                    assert_eq!(x86, x86_default);
+                    assert_eq!(words.len(), 1);
+                    continue;
+                }
+                let value_offset =
+                    native_default_exception_value_offset(capacity, cells).unwrap();
+                for slot in 0..usize::from(capacity) {
+                    let key_offset = u8::try_from(cells.bytes() + slot).unwrap();
+                    assert!(x86.windows(4).any(|code| {
+                        code == [0x41, 0x3a, 0x42, key_offset]
+                    }));
+                    let cell_offset =
+                        u8::try_from(value_offset + slot * cells.bytes()).unwrap();
+                    let x86_value = match cells {
+                        NativeCellEncoding::Compact16 => {
+                            vec![0x41, 0x0f, 0xb7, 0x42, cell_offset]
+                        }
+                        NativeCellEncoding::Wide32 => vec![0x41, 0x8b, 0x42, cell_offset],
+                        _ => unreachable!("bounded sparse cell widths"),
+                    };
+                    assert!(x86
+                        .windows(x86_value.len())
+                        .any(|code| code == x86_value.as_slice()));
+                    assert!(words.contains(
+                        &aarch64_load_byte_imm(12, 11, u16::from(key_offset)).unwrap(),
+                    ));
+                    let aarch64_value = match cells {
+                        NativeCellEncoding::Compact16 => aarch64_load_halfword_imm(
+                            8,
+                            11,
+                            u16::from(cell_offset),
+                        )
+                        .unwrap(),
+                        NativeCellEncoding::Wide32 => {
+                            aarch64_load_w_imm(8, 11, u16::from(cell_offset)).unwrap()
+                        }
+                        _ => unreachable!("bounded sparse cell widths"),
+                    };
+                    assert!(words.contains(&aarch64_value));
+                }
             }
         }
     }
@@ -57310,6 +57656,7 @@ int main(void){{
             assert_eq!(partial.resume_states, 2);
             let row_bytes = native_default_exception_row_bytes(
                 ExactSparseComposeFixture::EXCEPTION_CAPACITY,
+                layout.cells,
             )
             .unwrap();
             let forward_offset = usize::try_from(layout.forward_offset).unwrap();
@@ -58808,7 +59155,11 @@ int main(void){{
             Some(UniformDefaultExceptionFixture::COMPLETE_ROWS * 4),
         );
         for capacity in 1..=u8::try_from(MAX_NATIVE_DEFAULT_EXCEPTIONS).unwrap() {
-            let row_bytes = native_default_exception_row_bytes(capacity).unwrap();
+            let row_bytes = native_default_exception_row_bytes(
+                capacity,
+                NativeCellEncoding::Wide32,
+            )
+            .unwrap();
             assert_eq!(
                 native_machine_bytes(
                     TransitionLayout::DefaultExceptions(capacity),
@@ -58846,7 +59197,8 @@ int main(void){{
                 .expect("uniform default-exception plan");
                 assert_eq!(plan.exception_capacity, 0, "{output:?}/{architecture:?}");
                 assert_eq!(plan.keys, NativeDefaultExceptionKeys::Classes);
-                assert_eq!(plan.row_bytes, 4, "{output:?}/{architecture:?}");
+                assert_eq!(plan.cells, NativeCellEncoding::Compact16);
+                assert_eq!(plan.row_bytes, 2, "{output:?}/{architecture:?}");
 
                 let (data, layout) =
                     build_forced_default_exception_table(view, architecture, usize::MAX)
@@ -58856,7 +59208,7 @@ int main(void){{
                     TransitionLayout::DefaultExceptions(0),
                     "{output:?}/{architecture:?}",
                 );
-                assert_eq!(layout.cells, NativeCellEncoding::Wide32);
+                assert_eq!(layout.cells, NativeCellEncoding::Compact16);
                 assert_eq!(layout.forward_offset, 0, "{output:?}/{architecture:?}");
                 assert_eq!(
                     usize::try_from(layout.reverse_offset).unwrap(),
@@ -58877,7 +59229,7 @@ int main(void){{
                     layout.cells,
                 )
                 .unwrap();
-                assert_eq!(partial.hole_token_base, 30);
+                assert_eq!(partial.hole_token_base, 8);
                 assert_eq!(
                     partial.hole_token_base,
                     u32::try_from(last_live_token + 1).unwrap(),
@@ -58896,9 +59248,7 @@ int main(void){{
                         ..(state + 1) * UniformDefaultExceptionFixture::CLASS_COUNT];
                     assert!(row.iter().all(|&cell| cell == row[0]));
                     let offset = state * plan.row_bytes;
-                    let packed = u32::from_le_bytes(
-                        data[offset..offset + plan.row_bytes].try_into().unwrap(),
-                    );
+                    let packed = read_native_packed_cell(&data, offset, layout.cells);
                     let semantic = row[0];
                     let expected = pack_native_partial_forward_cell(
                         semantic.next(),
@@ -58914,11 +59264,12 @@ int main(void){{
                     .unwrap();
                     assert_eq!(packed, expected, "{output:?}/{architecture:?}/state={state}");
                     let token = packed & layout.cells.next_mask();
-                    saw_dead |= token == 0;
-                    saw_live |= token != 0 && token < partial.hole_token_base;
+                    let is_dead = token == layout.cells.dead_token();
+                    saw_dead |= is_dead;
+                    saw_live |= !is_dead && token < partial.hole_token_base;
                     saw_accept |= packed & layout.cells.accepts() != 0;
-                    saw_first_hole |= token == partial.hole_token_base;
-                    saw_second_hole |= token == partial.hole_token_base + 1;
+                    saw_first_hole |= !is_dead && token == partial.hole_token_base;
+                    saw_second_hole |= !is_dead && token == partial.hole_token_base + 1;
                 }
                 assert!(saw_dead && saw_live && saw_accept);
                 assert!(saw_first_hole && saw_second_hole);
@@ -58937,8 +59288,8 @@ int main(void){{
                 .expect("uniform-row base native view"),
         );
         let required = UniformDefaultExceptionFixture::COMPLETE_ROWS
-            * native_default_exception_row_bytes(0).unwrap();
-        assert_eq!(required, 32);
+            * native_default_exception_row_bytes(0, NativeCellEncoding::Compact16).unwrap();
+        assert_eq!(required, 16);
         for architecture in [Architecture::X86_64, Architecture::Aarch64] {
             let sparse =
                 build_forced_default_exception_table(view, architecture, usize::MAX).unwrap();
@@ -59018,23 +59369,25 @@ int main(void){{
         x86_emit_table_lookup(
             &mut x86_lookup,
             TransitionLayout::DefaultExceptions(0),
-            NativeCellEncoding::Wide32,
+            NativeCellEncoding::Compact16,
             X86StartFilterKind::Sse2,
         )
         .unwrap();
-        assert_eq!(x86_lookup.finish().unwrap(), [0x41, 0x8b, 0x02]);
+        assert_eq!(x86_lookup.finish().unwrap(), [0x41, 0x0f, 0xb7, 0x02]);
 
         let mut aarch64_lookup = Aarch64Assembler::new();
         aarch64_emit_table_lookup(
             &mut aarch64_lookup,
             TransitionLayout::DefaultExceptions(0),
-            NativeCellEncoding::Wide32,
+            NativeCellEncoding::Compact16,
             FeatureSet::EMPTY,
         )
         .unwrap();
         assert_eq!(
             aarch64_lookup.finish().unwrap(),
-            aarch64_load_w_imm(8, 11, 0).unwrap().to_le_bytes(),
+            aarch64_load_halfword_imm(8, 11, 0)
+                .unwrap()
+                .to_le_bytes(),
         );
 
         let avx512 = FeatureSet::of(CpuFeature::X86Avx512F)
@@ -59093,7 +59446,7 @@ int main(void){{
                     Architecture::X86_64 => {
                         let hay_load = [0x0f, 0xb6, 0x04, 0x17];
                         let class_load = [0x41, 0x0f, 0xb6, 0x04, 0x01];
-                        let default_load = [0x41, 0x8b, 0x02];
+                        let default_load = [0x41, 0x0f, 0xb7, 0x02];
                         assert!(
                             !lowering.code.windows(hay_load.len()).any(|code| code == hay_load),
                             "{output:?}/{target:?} retained the transition hay load",
@@ -59121,7 +59474,7 @@ int main(void){{
                             .collect::<Vec<_>>();
                         let hay_load = aarch64_load_byte_reg(8, 0, 2).unwrap();
                         let class_load = aarch64_load_byte_reg(8, 5, 8).unwrap();
-                        let default_load = aarch64_load_w_imm(8, 11, 0).unwrap();
+                        let default_load = aarch64_load_halfword_imm(8, 11, 0).unwrap();
                         assert!(
                             !words.contains(&hay_load),
                             "{output:?}/{target:?} retained the transition hay load",
@@ -59148,7 +59501,18 @@ int main(void){{
         );
         let fixture = DefaultExceptionPartialFixture::new();
         let view = default_exception_partial_view(&fixture, &compiled);
-        for architecture in [Architecture::X86_64, Architecture::Aarch64] {
+        let wide_view = NativeProgramView {
+            partial_discovered_states: Some(
+                DefaultExceptionPartialFixture::COMPLETE_ROWS + 20_000,
+            ),
+            ..view
+        };
+        for (expected_cells, view, architecture) in [
+            (NativeCellEncoding::Compact16, view, Architecture::X86_64),
+            (NativeCellEncoding::Compact16, view, Architecture::Aarch64),
+            (NativeCellEncoding::Wide32, wide_view, Architecture::X86_64),
+            (NativeCellEncoding::Wide32, wide_view, Architecture::Aarch64),
+        ] {
             let (data, layout) =
                 build_forced_default_exception_table(view, architecture, usize::MAX).unwrap();
             let exception_capacity = match layout.transitions {
@@ -59159,11 +59523,16 @@ int main(void){{
                 usize::from(exception_capacity),
                 MAX_NATIVE_DEFAULT_EXCEPTIONS
             );
-            assert_eq!(layout.cells, NativeCellEncoding::Wide32);
+            assert_eq!(layout.cells, expected_cells);
             let partial = layout.partial.expect("partial sparse table");
-            let row_bytes = native_default_exception_row_bytes(exception_capacity).unwrap();
-            let value_offset =
-                native_default_exception_value_offset(exception_capacity).unwrap();
+            let row_bytes =
+                native_default_exception_row_bytes(exception_capacity, layout.cells).unwrap();
+            let value_offset = native_default_exception_value_offset(
+                exception_capacity,
+                layout.cells,
+            )
+            .unwrap();
+            let cell_bytes = layout.cells.bytes();
             let forward_offset = usize::try_from(layout.forward_offset).unwrap();
             assert_eq!(forward_offset, 0, "{architecture:?}");
             let forward_end =
@@ -59180,17 +59549,13 @@ int main(void){{
             let mut saw_accelerated = false;
             for state in 0..DefaultExceptionPartialFixture::COMPLETE_ROWS {
                 let row_start = forward_offset + state * row_bytes;
-                let default = u32::from_le_bytes(
-                    data[row_start..row_start + 4].try_into().unwrap(),
-                );
+                let default = read_native_packed_cell(&data, row_start, layout.cells);
                 for class in 0..DefaultExceptionPartialFixture::CLASS_COUNT {
                     let mut actual = default;
                     for slot in 0..usize::from(exception_capacity) {
-                        if usize::from(data[row_start + 4 + slot]) == class {
-                            let offset = row_start + value_offset + slot * 4;
-                            actual = u32::from_le_bytes(
-                                data[offset..offset + 4].try_into().unwrap(),
-                            );
+                        if usize::from(data[row_start + cell_bytes + slot]) == class {
+                            let offset = row_start + value_offset + slot * cell_bytes;
+                            actual = read_native_packed_cell(&data, offset, layout.cells);
                             break;
                         }
                     }
@@ -59208,17 +59573,23 @@ int main(void){{
                         layout.cells,
                     )
                     .unwrap();
-                    assert_eq!(actual, expected, "{architecture:?}/state={state}/class={class}");
-                    saw_dead |= actual & layout.cells.next_mask() == 0;
-                    saw_hole |= actual & layout.cells.next_mask() >= partial.hole_token_base;
+                    assert_eq!(
+                        actual,
+                        expected,
+                        "{expected_cells:?}/{architecture:?}/state={state}/class={class}",
+                    );
+                    let token = actual & layout.cells.next_mask();
+                    let is_dead = token == layout.cells.dead_token();
+                    saw_dead |= is_dead;
+                    saw_hole |= !is_dead && token >= partial.hole_token_base;
                     saw_accept |= actual & layout.cells.accepts() != 0;
                     saw_accelerated |= actual & layout.cells.accelerated() != 0;
                 }
             }
-            assert!(saw_dead, "{architecture:?}");
-            assert!(saw_hole, "{architecture:?}");
-            assert!(saw_accept, "{architecture:?}");
-            assert!(saw_accelerated, "{architecture:?}");
+            assert!(saw_dead, "{expected_cells:?}/{architecture:?}");
+            assert!(saw_hole, "{expected_cells:?}/{architecture:?}");
+            assert!(saw_accept, "{expected_cells:?}/{architecture:?}");
+            assert!(saw_accelerated, "{expected_cells:?}/{architecture:?}");
         }
     }
 
@@ -59264,7 +59635,8 @@ int main(void){{
             .expect("collapsed packed plurality plan");
             assert_eq!(plan.exception_capacity, 3, "{architecture:?}");
             assert_eq!(plan.keys, NativeDefaultExceptionKeys::Bytes, "{architecture:?}");
-            assert_eq!(plan.row_bytes, 20, "{architecture:?}");
+            assert_eq!(plan.cells, NativeCellEncoding::Compact16);
+            assert_eq!(plan.row_bytes, 12, "{architecture:?}");
             assert!(usize::from(plan.exception_capacity) <= MAX_NATIVE_DEFAULT_EXCEPTIONS);
             assert_eq!(
                 native_default_exception_retry_plan(
@@ -59315,7 +59687,7 @@ int main(void){{
                 TransitionLayout::DefaultByteExceptions(3),
                 "{architecture:?}",
             );
-            assert_eq!(sparse.1.cells, NativeCellEncoding::Wide32);
+            assert_eq!(sparse.1.cells, NativeCellEncoding::Compact16);
 
             let quotient = build_forced_column_quotient_table(
                 view,
@@ -59372,22 +59744,23 @@ int main(void){{
                 TransitionLayout::DefaultByteExceptions(capacity) => capacity,
                 other => panic!("expected default-exception rows, got {other:?}"),
             };
-            let row_bytes = native_default_exception_row_bytes(exception_capacity).unwrap();
-            let value_offset =
-                native_default_exception_value_offset(exception_capacity).unwrap();
+            let row_bytes =
+                native_default_exception_row_bytes(exception_capacity, layout.cells).unwrap();
+            let value_offset = native_default_exception_value_offset(
+                exception_capacity,
+                layout.cells,
+            )
+            .unwrap();
+            let cell_bytes = layout.cells.bytes();
             let forward_offset = usize::try_from(layout.forward_offset).unwrap();
             let packed_at = |state: usize, class: usize| {
                 let row_start = forward_offset + state * row_bytes;
                 let key = view.dfa.class_representatives[class];
-                let mut packed = u32::from_le_bytes(
-                    data[row_start..row_start + 4].try_into().unwrap(),
-                );
+                let mut packed = read_native_packed_cell(data, row_start, layout.cells);
                 for slot in 0..usize::from(exception_capacity) {
-                    if data[row_start + 4 + slot] == key {
-                        let offset = row_start + value_offset + slot * 4;
-                        packed = u32::from_le_bytes(
-                            data[offset..offset + 4].try_into().unwrap(),
-                        );
+                    if data[row_start + cell_bytes + slot] == key {
+                        let offset = row_start + value_offset + slot * cell_bytes;
+                        packed = read_native_packed_cell(data, offset, layout.cells);
                         break;
                     }
                 }
@@ -59583,9 +59956,10 @@ int main(void){{
                             "{architecture:?}/{collapse_holes}/state={state}/class={class}",
                         );
                         let token = actual & cells.next_mask();
-                        saw_dead |= token == cells.dead_token();
-                        saw_live |= token < partial.hole_token_base;
-                        saw_hole |= token >= partial.hole_token_base;
+                        let is_dead = token == cells.dead_token();
+                        saw_dead |= is_dead;
+                        saw_live |= !is_dead && token < partial.hole_token_base;
+                        saw_hole |= !is_dead && token >= partial.hole_token_base;
                         saw_accept |= actual & cells.accepts() != 0;
                         saw_accelerated |= actual & cells.accelerated() != 0;
                     }
@@ -59782,10 +60156,10 @@ int main(void){{
                     .unwrap();
                     assert_eq!(actual, expected, "{architecture:?}/{physical}/{byte}");
                     let token = actual & interned_cells.next_mask();
-                    saw_dead |= token == interned_cells.dead_token();
-                    saw_live |= token < partial.hole_token_base;
-                    saw_hole |= token >= partial.hole_token_base
-                        && token < interned_cells.dead_token();
+                    let is_dead = token == interned_cells.dead_token();
+                    saw_dead |= is_dead;
+                    saw_live |= !is_dead && token < partial.hole_token_base;
+                    saw_hole |= !is_dead && token >= partial.hole_token_base;
                 }
             }
             assert!(saw_dead && saw_live && saw_hole, "{architecture:?}");
@@ -60039,7 +60413,7 @@ int main(void){{
             .unwrap();
             let required_machine_bytes = native_machine_bytes(
                 plan.keys.transitions(plan.exception_capacity),
-                NativeCellEncoding::Wide32,
+                plan.cells,
                 view.dfa.class_count,
                 DefaultExceptionPartialFixture::COMPLETE_ROWS,
                 0,
@@ -60119,17 +60493,37 @@ int main(void){{
             .unwrap();
             assert_eq!(incorrectly_wide, 2_256, "{architecture:?}");
 
-            let sparse = CLASS_MAP_BYTES
-                + forward_states * native_default_exception_row_bytes(2).unwrap();
-            assert_eq!(sparse, 1_856);
-            assert!(actual_dense < sparse && sparse < incorrectly_wide);
-            assert!(derive_native_default_exception_plan(
+            let compact_sparse = CLASS_MAP_BYTES
+                + forward_states
+                    * native_default_exception_row_bytes(
+                        2,
+                        NativeCellEncoding::Compact16,
+                    )
+                    .unwrap();
+            let wide_sparse = CLASS_MAP_BYTES
+                + forward_states
+                    * native_default_exception_row_bytes(2, NativeCellEncoding::Wide32)
+                        .unwrap();
+            assert_eq!(compact_sparse, 1_056);
+            assert_eq!(wide_sparse, 1_856);
+            assert!(compact_sparse < actual_dense);
+            assert!(actual_dense < wide_sparse && wide_sparse < incorrectly_wide);
+            let collapsed_plan = derive_native_default_exception_plan(
                 view.dfa,
                 view.partial_discovered_states,
                 true,
                 architecture,
             )
-            .is_none());
+            .expect("collapsed compact sparse plan");
+            assert_eq!(
+                collapsed_plan,
+                NativeDefaultExceptionPlan {
+                    exception_capacity: 2,
+                    keys: NativeDefaultExceptionKeys::Classes,
+                    cells: NativeCellEncoding::Compact16,
+                    row_bytes: 8,
+                }
+            );
             assert_eq!(
                 derive_native_default_exception_plan(
                     view.dfa,
@@ -60140,23 +60534,21 @@ int main(void){{
                 Some(NativeDefaultExceptionPlan {
                     exception_capacity: 2,
                     keys: NativeDefaultExceptionKeys::Classes,
+                    cells: NativeCellEncoding::Wide32,
                     row_bytes: 16,
                 })
             );
 
-            // An allocator refusal is retryable only when the exact alternate
-            // table is smaller. This was the residual path on which the old
-            // uncollapsed proof could replace a 1,256-byte dense machine with
-            // a larger 1,856-byte sparse one.
+            // Compact token scaling turns the collapsed sparse record into a
+            // genuine reduction. The uncollapsed proof still falls back to
+            // Wide32 because its 20,000 distinct hole ordinals exceed 14 bits.
             let allocation = ObjectError::Allocation(
                 "synthetic collapsed dense allocation pressure",
             );
-            assert!(native_default_exception_retry_plan(
-                view,
-                architecture,
-                &allocation,
-            )
-            .is_none());
+            assert_eq!(
+                native_default_exception_retry_plan(view, architecture, &allocation),
+                Some(collapsed_plan),
+            );
         }
     }
 
@@ -60179,13 +60571,20 @@ int main(void){{
             ..collapsed
         };
         for architecture in [Architecture::X86_64, Architecture::Aarch64] {
-            assert!(derive_native_default_exception_plan(
-                collapsed.dfa,
-                collapsed.partial_discovered_states,
-                true,
-                architecture,
-            )
-            .is_none());
+            assert_eq!(
+                derive_native_default_exception_plan(
+                    collapsed.dfa,
+                    collapsed.partial_discovered_states,
+                    true,
+                    architecture,
+                ),
+                Some(NativeDefaultExceptionPlan {
+                    exception_capacity: 4,
+                    keys: NativeDefaultExceptionKeys::Classes,
+                    cells: NativeCellEncoding::Compact16,
+                    row_bytes: 14,
+                }),
+            );
             let plan = derive_native_default_exception_plan(
                 uncollapsed.dfa,
                 uncollapsed.partial_discovered_states,
@@ -60195,6 +60594,7 @@ int main(void){{
             .expect("nonmajority sparse reduction");
             assert_eq!(plan.exception_capacity, 4);
             assert_eq!(plan.keys, NativeDefaultExceptionKeys::Classes);
+            assert_eq!(plan.cells, NativeCellEncoding::Wide32);
             assert_eq!(plan.row_bytes, 24);
 
             let dense = build_native_dfa_table_with_cost_model_and_data_limit_once(
@@ -60269,7 +60669,8 @@ int main(void){{
             .expect("collapsed sparse reduction");
             assert_eq!(plan.exception_capacity, 1);
             assert_eq!(plan.keys, NativeDefaultExceptionKeys::Classes);
-            assert_eq!(plan.row_bytes, 12);
+            assert_eq!(plan.cells, NativeCellEncoding::Compact16);
+            assert_eq!(plan.row_bytes, 6);
             let dense =
                 build_native_dfa_table_with_cost_model_and_data_limit_once(
                     view,
@@ -60308,7 +60709,7 @@ int main(void){{
             );
             let required_machine_bytes = native_machine_bytes(
                 plan.keys.transitions(plan.exception_capacity),
-                NativeCellEncoding::Wide32,
+                plan.cells,
                 view.dfa.class_count,
                 CollapsedDefaultExceptionFixture::COMPLETE_ROWS,
                 0,
@@ -60435,10 +60836,10 @@ int main(void){{
                         "{target:?} retained the omitted sparse class-map load",
                     );
                     assert!(emission.code.windows(4).any(|bytes| {
-                        bytes == [0x41, 0x3a, 0x42, 0x04]
+                        bytes == [0x41, 0x3a, 0x42, 0x02]
                     }));
-                    assert!(emission.code.windows(3).any(|bytes| {
-                        bytes == [0x41, 0x8b, 0x02]
+                    assert!(emission.code.windows(4).any(|bytes| {
+                        bytes == [0x41, 0x0f, 0xb7, 0x02]
                     }));
                 }
                 Architecture::Aarch64 => {
@@ -60451,8 +60852,8 @@ int main(void){{
                         !words.contains(&aarch64_load_byte_reg(8, 5, 8).unwrap()),
                         "{target:?} retained the omitted sparse class-map load",
                     );
-                    assert!(words.contains(&aarch64_load_byte_imm(12, 11, 4).unwrap()));
-                    assert!(words.contains(&aarch64_load_w_imm(8, 11, 0).unwrap()));
+                    assert!(words.contains(&aarch64_load_byte_imm(12, 11, 2).unwrap()));
+                    assert!(words.contains(&aarch64_load_halfword_imm(8, 11, 0).unwrap()));
                 }
             }
         }
@@ -60730,12 +61131,21 @@ int main(void){{
                     .windows(forbidden.len())
                     .any(|bytes| bytes == forbidden));
             }
-            let value_offset = native_default_exception_value_offset(capacity).unwrap();
+            let value_offset = native_default_exception_value_offset(
+                capacity,
+                NativeCellEncoding::Wide32,
+            )
+            .unwrap();
             let vector_end = core::mem::size_of::<u32>()
                 .checked_add(usize::from(X86StartFilterKind::Avx512Bw.width()))
                 .unwrap();
             assert!(
-                vector_end <= native_default_exception_row_bytes(capacity).unwrap()
+                vector_end
+                    <= native_default_exception_row_bytes(
+                        capacity,
+                        NativeCellEncoding::Wide32,
+                    )
+                    .unwrap()
             );
             let mut indexed_load = vec![0x41, 0x8b, 0x84, 0x82];
             indexed_load.extend_from_slice(&u32::try_from(value_offset).unwrap().to_le_bytes());
@@ -61010,11 +61420,11 @@ int main(void){{
                     assert!(lowering
                         .code
                         .windows(4)
-                        .any(|bytes| bytes == [0x41, 0x3a, 0x42, 0x04]));
+                        .any(|bytes| bytes == [0x41, 0x3a, 0x42, 0x02]));
                     assert!(lowering
                         .code
-                        .windows(3)
-                        .any(|bytes| bytes == [0x41, 0x8b, 0x02]));
+                        .windows(4)
+                        .any(|bytes| bytes == [0x41, 0x0f, 0xb7, 0x02]));
                 }
                 Architecture::Aarch64 => {
                     let words = lowering
@@ -61026,8 +61436,8 @@ int main(void){{
                         !words.contains(&aarch64_load_byte_reg(8, 5, 8).unwrap()),
                         "{target:?} retained the omitted sparse class-map load",
                     );
-                    assert!(words.contains(&aarch64_load_byte_imm(12, 11, 4).unwrap()));
-                    assert!(words.contains(&aarch64_load_w_imm(8, 11, 0).unwrap()));
+                    assert!(words.contains(&aarch64_load_byte_imm(12, 11, 2).unwrap()));
+                    assert!(words.contains(&aarch64_load_halfword_imm(8, 11, 0).unwrap()));
                 }
             }
         }
@@ -61129,7 +61539,7 @@ int main(void){{
                     let compare = lowering
                         .code
                         .windows(4)
-                        .position(|bytes| bytes == [0x41, 0x3a, 0x42, 0x06])
+                        .position(|bytes| bytes == [0x41, 0x3a, 0x42, 0x04])
                         .expect("descending highest-boundary compare");
                     let branch = compare + 4;
                     assert!(
@@ -61154,7 +61564,7 @@ int main(void){{
                         .position(|pair| {
                             pair
                                 == [
-                                    aarch64_load_byte_imm(12, 11, 6).unwrap(),
+                                    aarch64_load_byte_imm(12, 11, 4).unwrap(),
                                     aarch64_cmp_w(8, 12).unwrap(),
                                 ]
                         })
