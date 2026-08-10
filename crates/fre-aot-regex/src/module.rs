@@ -4607,8 +4607,9 @@ enum TransitionLayout {
     DefaultByteBoundaries(u8),
     /// A wider compiler-private modal row. Five through sixteen logical
     /// exceptions occupy one complete 16-byte key vector; larger rows retain
-    /// their exact logical capacity and use a balanced scalar lookup. The
-    /// class map remains part of the class-keyed form.
+    /// their exact logical capacity. Backends use a native-width vector probe
+    /// when the target can cover the row and a balanced scalar lookup
+    /// otherwise. The class map remains part of the class-keyed form.
     DefaultSparseExceptions(u8),
     /// The same scalable modal row keyed by exact raw bytes. It is selected
     /// only when complete byte-preimage expansion does not increase global
@@ -55320,6 +55321,15 @@ int main(void){{
                         "{architecture:?}",
                     );
                     assert_eq!(sparse.1.cells, NativeCellEncoding::Wide32);
+                    let ranked = build_native_dfa_table_with_cost_model_and_data_limit(
+                        view,
+                        architecture,
+                        NativeVectorFilterCostModel::Established,
+                        true,
+                        usize::MAX,
+                    )
+                    .unwrap();
+                    assert!(ranked.0.len() <= dense.0.len(), "{architecture:?}");
                     assert_eq!(
                         build_native_dfa_table_with_cost_model_and_data_limit(
                             view,
@@ -55329,15 +55339,17 @@ int main(void){{
                             usize::MAX,
                         )
                         .unwrap(),
-                        dense,
-                        "a fitting dense layout changed on {architecture:?}",
+                        ranked,
+                        "{architecture:?}",
                     );
+
+                    // Candidate ranking may find a denser image that also
+                    // fits this ceiling. Exercise the sparse candidate's
+                    // byte-exact boundary independently of that choice.
                     assert_eq!(
-                        build_native_dfa_table_with_cost_model_and_data_limit(
+                        build_forced_default_exception_table(
                             view,
                             architecture,
-                            NativeVectorFilterCostModel::Established,
-                            true,
                             sparse.0.len(),
                         )
                         .unwrap(),
@@ -55354,7 +55366,6 @@ int main(void){{
                     match below {
                         Ok(smaller) => {
                             assert!(smaller.0.len() < sparse.0.len(), "{architecture:?}");
-                            assert_eq!(smaller.1.transitions, TransitionLayout::ClassMapped);
                         }
                         Err(ObjectError::Resource {
                             resource: crate::CompileResource::ProgramBytes,
@@ -55363,6 +55374,18 @@ int main(void){{
                         }) => assert_eq!(limit, sparse.0.len() - 1, "{architecture:?}"),
                         Err(error) => panic!("unexpected retry error on {architecture:?}: {error:?}"),
                     }
+                    assert!(matches!(
+                        build_forced_default_exception_table(
+                            view,
+                            architecture,
+                            sparse.0.len() - 1,
+                        ),
+                        Err(ObjectError::Resource {
+                            resource: crate::CompileResource::ProgramBytes,
+                            limit,
+                            ..
+                        }) if limit == sparse.0.len() - 1
+                    ));
                     let allocation =
                         ObjectError::Allocation("synthetic scalable sparse allocation pressure");
                     assert_eq!(
