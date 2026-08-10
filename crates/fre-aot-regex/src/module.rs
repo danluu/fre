@@ -4542,6 +4542,7 @@ fn native_default_exception_row(
 fn derive_native_default_exception_plan(
     dfa: NativeDfaView<'_>,
     partial_discovered_states: Option<usize>,
+    collapse_partial_holes: bool,
     architecture: Architecture,
 ) -> Option<NativeDefaultExceptionPlan> {
     let discovered = partial_discovered_states?;
@@ -4559,6 +4560,11 @@ fn derive_native_default_exception_plan(
     if resume_states == 0 {
         return None;
     }
+    let encoded_hole_states = if collapse_partial_holes {
+        1
+    } else {
+        resume_states
+    };
     let mut exception_capacity = 0_usize;
     for row in dfa.forward_cells.chunks_exact(dfa.class_count) {
         let (_, _, exceptions) = native_default_exception_row(row)?;
@@ -4572,7 +4578,7 @@ fn derive_native_default_exception_plan(
             dfa.class_count,
             forward_states,
             0,
-            resume_states,
+            encoded_hole_states,
             architecture,
         );
     let dense_bytes = native_machine_bytes(
@@ -4589,6 +4595,29 @@ fn derive_native_default_exception_plan(
         exception_capacity,
         row_bytes,
     })
+}
+
+fn native_default_exception_retry_plan(
+    view: NativeProgramView<'_>,
+    architecture: Architecture,
+    dense_error: &ObjectError,
+) -> Option<NativeDefaultExceptionPlan> {
+    if !matches!(
+        dense_error,
+        ObjectError::Allocation(_)
+            | ObjectError::Resource {
+                resource: crate::CompileResource::ProgramBytes,
+                ..
+            }
+    ) {
+        return None;
+    }
+    derive_native_default_exception_plan(
+        view.dfa,
+        view.partial_discovered_states,
+        view.collapse_partial_holes,
+        architecture,
+    )
 }
 
 /// Width of one packed transition cell in the ordinary native DFA tables.
@@ -6997,11 +7026,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit(
         })) => error,
         Err(error) => return Err(error),
     };
-    let Some(plan) = derive_native_default_exception_plan(
-        view.dfa,
-        view.partial_discovered_states,
-        architecture,
-    ) else {
+    let Some(plan) = native_default_exception_retry_plan(view, architecture, &dense_error) else {
         return Err(dense_error);
     };
     match build_native_dfa_table_with_cost_model_and_data_limit_once(
@@ -33809,6 +33834,82 @@ mod tests {
         }
     }
 
+    struct CollapsedDefaultExceptionFixture {
+        byte_classes: [u8; 256],
+        class_representatives: Vec<u8>,
+        forward_cells: Vec<ForwardCell>,
+        class_count: usize,
+    }
+
+    impl CollapsedDefaultExceptionFixture {
+        const COMPLETE_ROWS: usize = 100;
+        const DISCOVERED_STATES: usize = 20_100;
+
+        fn new(class_count: usize, exception_count: usize) -> Self {
+            assert!(class_count <= 256);
+            assert!(exception_count > 0);
+            assert!(exception_count <= MAX_NATIVE_DEFAULT_EXCEPTIONS);
+            assert!(class_count > exception_count * 2);
+            let mut byte_classes = [0_u8; 256];
+            for (byte, class) in byte_classes.iter_mut().enumerate() {
+                *class = u8::try_from(byte % class_count).unwrap();
+            }
+            let class_representatives = (0..class_count)
+                .map(|class| u8::try_from(class).unwrap())
+                .collect::<Vec<_>>();
+            let first_exception = class_count - exception_count;
+            let mut forward_cells = Vec::with_capacity(
+                Self::COMPLETE_ROWS * class_count,
+            );
+            for state in 0..Self::COMPLETE_ROWS {
+                let state = u32::try_from(state).unwrap();
+                for class in 0..class_count {
+                    let cell = if class < first_exception {
+                        ForwardCell::new(state, false)
+                    } else if class + 1 == class_count {
+                        ForwardCell::new(
+                            u32::try_from(Self::COMPLETE_ROWS).unwrap(),
+                            false,
+                        )
+                    } else {
+                        ForwardCell::new(NO_DFA_STATE, false)
+                    };
+                    forward_cells.push(cell);
+                }
+            }
+            Self {
+                byte_classes,
+                class_representatives,
+                forward_cells,
+                class_count,
+            }
+        }
+
+        fn view<'a>(&'a self, base: NativeProgramView<'a>) -> NativeProgramView<'a> {
+            NativeProgramView {
+                dfa: NativeDfaView {
+                    initial_state: 0,
+                    initial_pending: false,
+                    initial_terminal: false,
+                    byte_classes: &self.byte_classes,
+                    class_count: self.class_count,
+                    class_representatives: &self.class_representatives,
+                    forward_cells: &self.forward_cells,
+                    reverse_initial: None,
+                    reverse_cells: &[],
+                },
+                partial_discovered_states: Some(Self::DISCOVERED_STATES),
+                collapse_partial_holes: true,
+                exact_match_width: None,
+                max_match_width: None,
+                exact_product_width: None,
+                retained_prefix_requirement: None,
+                retained_suffix_requirement: None,
+                ..base
+            }
+        }
+    }
+
     fn default_exception_partial_view<'a>(
         fixture: &'a DefaultExceptionPartialFixture,
         compiled: &'a CompiledRegex,
@@ -33830,6 +33931,7 @@ mod tests {
         let plan = derive_native_default_exception_plan(
             view.dfa,
             view.partial_discovered_states,
+            view.collapse_partial_holes,
             architecture,
         )
         .expect("synthetic default-exception plan");
@@ -50807,6 +50909,7 @@ int main(void){{
             let plan = derive_native_default_exception_plan(
                 view.dfa,
                 view.partial_discovered_states,
+                view.collapse_partial_holes,
                 architecture,
             )
             .unwrap();
@@ -50827,6 +50930,172 @@ int main(void){{
                     ..
                 }) if limit == required_machine_bytes - 1
             ), "{architecture:?}: {below:?}");
+        }
+    }
+
+    #[test]
+    fn collapsed_default_exception_plan_uses_the_encoded_single_hole_geometry() {
+        let compiled = compile_partial_loop(
+            Target::x86_64_linux(),
+            OutputContract::SelectedEnd,
+        );
+        let fixture = CollapsedDefaultExceptionFixture::new(5, 2);
+        let view = fixture.view(
+            compiled
+                .program()
+                .native_partial_dfa_view()
+                .unwrap()
+                .native,
+        );
+        let forward_states = CollapsedDefaultExceptionFixture::COMPLETE_ROWS;
+        let resume_states = CollapsedDefaultExceptionFixture::DISCOVERED_STATES
+            - forward_states;
+        for architecture in [Architecture::X86_64, Architecture::Aarch64] {
+            let actual = select_native_table_encoding_with_holes_for_architecture(
+                view.dfa.class_count,
+                forward_states,
+                0,
+                1,
+                architecture,
+            );
+            assert_eq!(
+                actual,
+                (TransitionLayout::ClassMapped, NativeCellEncoding::Compact16),
+                "{architecture:?}"
+            );
+            let actual_dense = native_machine_bytes(
+                actual.0,
+                actual.1,
+                view.dfa.class_count,
+                forward_states,
+                0,
+            )
+            .unwrap();
+            assert_eq!(actual_dense, 1_256, "{architecture:?}");
+
+            let uncollapsed = select_native_table_encoding_with_holes_for_architecture(
+                view.dfa.class_count,
+                forward_states,
+                0,
+                resume_states,
+                architecture,
+            );
+            assert_eq!(uncollapsed.1, NativeCellEncoding::Wide32, "{architecture:?}");
+            let incorrectly_wide = native_machine_bytes(
+                uncollapsed.0,
+                uncollapsed.1,
+                view.dfa.class_count,
+                forward_states,
+                0,
+            )
+            .unwrap();
+            assert_eq!(incorrectly_wide, 2_256, "{architecture:?}");
+
+            let sparse = CLASS_MAP_BYTES
+                + forward_states * native_default_exception_row_bytes(2).unwrap();
+            assert_eq!(sparse, 1_856);
+            assert!(actual_dense < sparse && sparse < incorrectly_wide);
+            assert!(derive_native_default_exception_plan(
+                view.dfa,
+                view.partial_discovered_states,
+                true,
+                architecture,
+            )
+            .is_none());
+            assert_eq!(
+                derive_native_default_exception_plan(
+                    view.dfa,
+                    view.partial_discovered_states,
+                    false,
+                    architecture,
+                ),
+                Some(NativeDefaultExceptionPlan {
+                    exception_capacity: 2,
+                    row_bytes: 16,
+                })
+            );
+
+            // An allocator refusal is retryable only when the exact alternate
+            // table is smaller. This was the residual path on which the old
+            // uncollapsed proof could replace a 1,256-byte dense machine with
+            // a larger 1,856-byte sparse one.
+            let allocation = ObjectError::Allocation(
+                "synthetic collapsed dense allocation pressure",
+            );
+            assert!(native_default_exception_retry_plan(
+                view,
+                architecture,
+                &allocation,
+            )
+            .is_none());
+        }
+    }
+
+    #[test]
+    fn collapsed_default_exception_retry_has_exact_smaller_boundaries() {
+        let compiled = compile_partial_loop(
+            Target::x86_64_linux(),
+            OutputContract::SelectedEnd,
+        );
+        let fixture = CollapsedDefaultExceptionFixture::new(8, 1);
+        let view = fixture.view(
+            compiled
+                .program()
+                .native_partial_dfa_view()
+                .unwrap()
+                .native,
+        );
+        for architecture in [Architecture::X86_64, Architecture::Aarch64] {
+            let plan = derive_native_default_exception_plan(
+                view.dfa,
+                view.partial_discovered_states,
+                view.collapse_partial_holes,
+                architecture,
+            )
+            .expect("collapsed sparse reduction");
+            assert_eq!(plan.exception_capacity, 1);
+            assert_eq!(plan.row_bytes, 12);
+            let dense =
+                build_native_dfa_table_with_cost_model_and_data_limit_and_loop_capacity_once(
+                    view,
+                    architecture,
+                    NativeVectorFilterCostModel::Established,
+                    true,
+                    usize::MAX,
+                    module_dfa_loop_skip::MAX_STATIC_DFA_LOOP_SKIPS,
+                    None,
+                )
+                .unwrap();
+            let sparse =
+                build_forced_default_exception_table(view, architecture, usize::MAX).unwrap();
+            assert!(sparse.0.len() < dense.0.len(), "{architecture:?}");
+            let admitted = build_native_dfa_table_with_cost_model_and_data_limit_and_loop_capacity(
+                view,
+                architecture,
+                NativeVectorFilterCostModel::Established,
+                true,
+                sparse.0.len(),
+                module_dfa_loop_skip::MAX_STATIC_DFA_LOOP_SKIPS,
+            )
+            .unwrap();
+            assert_eq!(admitted, sparse, "{architecture:?}");
+            let required_machine_bytes = CLASS_MAP_BYTES
+                + CollapsedDefaultExceptionFixture::COMPLETE_ROWS * plan.row_bytes;
+            assert!(matches!(
+                build_native_dfa_table_with_cost_model_and_data_limit_and_loop_capacity(
+                    view,
+                    architecture,
+                    NativeVectorFilterCostModel::Established,
+                    true,
+                    required_machine_bytes - 1,
+                    module_dfa_loop_skip::MAX_STATIC_DFA_LOOP_SKIPS,
+                ),
+                Err(ObjectError::Resource {
+                    resource: crate::CompileResource::ProgramBytes,
+                    limit,
+                    ..
+                }) if limit == required_machine_bytes - 1
+            ), "{architecture:?}");
         }
     }
 
