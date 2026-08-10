@@ -4503,9 +4503,11 @@ fn native_default_exception_row(
     row: &[ForwardCell],
 ) -> Option<(ForwardCell, [Option<(u8, ForwardCell)>; MAX_NATIVE_DEFAULT_EXCEPTIONS], usize)> {
     let &first = row.first()?;
-    // Every admitted row has at most four exceptions and a class alphabet
-    // wider than its sparse record, hence its dominant cell is a strict
-    // majority. Boyer-Moore finds that unique cell in one bounded pass.
+    // A representable row wider than twice the exception capacity necessarily
+    // has a unique strict-majority default, so retain the linear Boyer-Moore
+    // path for ordinary alphabets. Only the bounded <=8-class remainder needs
+    // an exact modal scan to admit ties while keeping publication canonical:
+    // equal counts retain the cell at the lowest class ordinal.
     let mut candidate = first;
     let mut balance = 0_usize;
     for &cell in row {
@@ -4518,9 +4520,24 @@ fn native_default_exception_row(
             balance = balance.checked_sub(1)?;
         }
     }
-    let dominant = row.iter().filter(|&&cell| cell == candidate).count();
+    let mut dominant = row.iter().filter(|&&cell| cell == candidate).count();
     if dominant.checked_mul(2)? <= row.len() {
-        return None;
+        let modal_scan_bound = MAX_NATIVE_DEFAULT_EXCEPTIONS.checked_mul(2)?;
+        if row.len() > modal_scan_bound {
+            return None;
+        }
+        candidate = first;
+        dominant = 0;
+        for (class, &cell) in row.iter().enumerate() {
+            if row[..class].contains(&cell) {
+                continue;
+            }
+            let count = row.iter().filter(|&&other| other == cell).count();
+            if count > dominant {
+                candidate = cell;
+                dominant = count;
+            }
+        }
     }
     let exception_count = row.len().checked_sub(dominant)?;
     if exception_count > MAX_NATIVE_DEFAULT_EXCEPTIONS {
@@ -7800,7 +7817,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once(
                 let row_start = bytes.len();
                 let (default, exceptions, exception_count) =
                     native_default_exception_row(row).ok_or(ObjectError::InvalidModule(
-                        "default-exception row lost its dominant cell",
+                        "default-exception row lost its modal cell",
                     ))?;
                 if exception_count > usize::from(exception_capacity) {
                     return Err(ObjectError::InvalidModule(
@@ -33858,7 +33875,7 @@ mod tests {
             assert!(class_count <= 256);
             assert!(exception_count > 0);
             assert!(exception_count <= MAX_NATIVE_DEFAULT_EXCEPTIONS);
-            assert!(class_count > exception_count * 2);
+            assert!(class_count >= exception_count * 2);
             let mut byte_classes = [0_u8; 256];
             for (byte, class) in byte_classes.iter_mut().enumerate() {
                 *class = u8::try_from(byte % class_count).unwrap();
@@ -50795,6 +50812,49 @@ int main(void){{
     }
 
     #[test]
+    fn default_exception_rows_admit_every_canonical_four_exception_mode() {
+        let a = ForwardCell::new(0, false);
+        let b = ForwardCell::new(1, false);
+        let c = ForwardCell::new(2, true);
+        let d = ForwardCell::new(3, false);
+        let e = ForwardCell::new(NO_DFA_STATE, false);
+
+        let tied = [a, b, a, b, a, b, a, b];
+        let (default, exceptions, count) =
+            native_default_exception_row(&tied).expect("tied four-exception row");
+        assert_eq!(default, a);
+        assert_eq!(count, 4);
+        assert_eq!(
+            exceptions,
+            [Some((1, b)), Some((3, b)), Some((5, b)), Some((7, b))]
+        );
+
+        let plurality_without_majority = [a, b, b, b, c, c];
+        let (default, exceptions, count) = native_default_exception_row(
+            &plurality_without_majority,
+        )
+        .expect("non-majority modal row");
+        assert_eq!(default, b);
+        assert_eq!(count, 3);
+        assert_eq!(
+            exceptions,
+            [Some((0, a)), Some((4, c)), Some((5, c)), None]
+        );
+
+        let all_distinct = [a, b, c, d, e];
+        let (default, exceptions, count) =
+            native_default_exception_row(&all_distinct).expect("four exact exceptions");
+        assert_eq!(default, a);
+        assert_eq!(count, 4);
+        assert_eq!(
+            exceptions,
+            [Some((1, b)), Some((2, c)), Some((3, d)), Some((4, e))]
+        );
+        assert!(native_default_exception_row(&[a, b, c, d, e, ForwardCell::new(4, true)])
+            .is_none());
+    }
+
+    #[test]
     fn default_exception_retry_preserves_the_established_dense_decline() {
         let retry: Result<(Vec<u8>, NativeDfaLayout), ObjectError> =
             Err(ObjectError::InvalidModule(
@@ -51061,6 +51121,76 @@ int main(void){{
                 &allocation,
             )
             .is_none());
+        }
+    }
+
+    #[test]
+    fn nonmajority_modal_rows_rescue_the_exact_wide_partial_layout() {
+        let compiled = compile_partial_loop(
+            Target::x86_64_linux(),
+            OutputContract::SelectedEnd,
+        );
+        let fixture = CollapsedDefaultExceptionFixture::new(8, 4);
+        let collapsed = fixture.view(
+            compiled
+                .program()
+                .native_partial_dfa_view()
+                .unwrap()
+                .native,
+        );
+        let uncollapsed = NativeProgramView {
+            collapse_partial_holes: false,
+            ..collapsed
+        };
+        for architecture in [Architecture::X86_64, Architecture::Aarch64] {
+            assert!(derive_native_default_exception_plan(
+                collapsed.dfa,
+                collapsed.partial_discovered_states,
+                true,
+                architecture,
+            )
+            .is_none());
+            let plan = derive_native_default_exception_plan(
+                uncollapsed.dfa,
+                uncollapsed.partial_discovered_states,
+                false,
+                architecture,
+            )
+            .expect("nonmajority sparse reduction");
+            assert_eq!(plan.exception_capacity, 4);
+            assert_eq!(plan.row_bytes, 24);
+
+            let dense = build_native_dfa_table_with_cost_model_and_data_limit_once(
+                uncollapsed,
+                architecture,
+                NativeVectorFilterCostModel::Established,
+                true,
+                usize::MAX,
+                None,
+            )
+            .unwrap();
+            let sparse = build_forced_default_exception_table(
+                uncollapsed,
+                architecture,
+                usize::MAX,
+            )
+            .unwrap();
+            assert_eq!(dense.1.cells, NativeCellEncoding::Wide32, "{architecture:?}");
+            assert_eq!(
+                sparse.1.transitions,
+                TransitionLayout::DefaultExceptions(4),
+                "{architecture:?}"
+            );
+            assert!(sparse.0.len() < dense.0.len(), "{architecture:?}");
+            let admitted = build_native_dfa_table_with_cost_model_and_data_limit(
+                uncollapsed,
+                architecture,
+                NativeVectorFilterCostModel::Established,
+                true,
+                sparse.0.len(),
+            )
+            .unwrap();
+            assert_eq!(admitted, sparse, "{architecture:?}");
         }
     }
 
