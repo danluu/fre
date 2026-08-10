@@ -95,6 +95,17 @@ struct ContextSveFilterPlans {
     ordinary: Option<Aarch64SveFilterPlan>,
 }
 
+/// Graph-proved absolute-boundary cuts for one contextual program.
+///
+/// These facts are independent of target, source spelling, and input. They
+/// permit only search-window narrowing: the contextual table remains the
+/// semantic authority inside the reduced window.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ContextAbsoluteBounds {
+    requires_start: bool,
+    requires_end: bool,
+}
+
 fn context_reverse_cell_format(
     layout: &ContextNativeLayout,
 ) -> Result<ContextTransitionCellFormat, ObjectError> {
@@ -2941,6 +2952,10 @@ fn lower_native_context_impl(
     max_data_bytes: usize,
 ) -> Result<NativeLowering, ObjectError> {
     let max_data_bytes = max_data_bytes.min(MAX_CONTEXT_NATIVE_DATA_BYTES);
+    let absolute_bounds = ContextAbsoluteBounds {
+        requires_start: view.requires_haystack_start,
+        requires_end: view.requires_haystack_end,
+    };
     let boundary_pair_relation = derive_context_boundary_pair_relation(view)?;
     // Only scanners whose complete runtime route is pure SVE2 may price an
     // exact set as one table/one MATCH. The explicit seam is shared with a
@@ -3239,6 +3254,7 @@ fn lower_native_context_impl(
             state_skip,
             empty_prefix_restart,
             target.features,
+            absolute_bounds,
         )?,
         Architecture::Aarch64 => lower_aarch64_context(
             &layout,
@@ -3259,6 +3275,7 @@ fn lower_native_context_impl(
             target.features,
             asimd_lane_index_offset,
             sve_filter_plans,
+            absolute_bounds,
         )?,
     };
     let start_accelerator = selected_context_start_accelerator(
@@ -5380,6 +5397,85 @@ fn x86_emit_anchored_forward_search(
     Ok(())
 }
 
+/// Narrow a validated contextual search to the only absolute-boundary region
+/// that can contain a match. Exact widths collapse a one-sided anchored
+/// search to one start or endpoint; finite maximum widths retain the complete
+/// possible interval. The original haystack length in `rsi` is never changed,
+/// so assertion classification keeps using absolute rather than window edges.
+fn x86_emit_context_absolute_bounds(
+    assembler: &mut X86Assembler,
+    layout: &ContextNativeLayout,
+    bounds: ContextAbsoluteBounds,
+    no_match: usize,
+) -> Result<(), ObjectError> {
+    if bounds.requires_start {
+        assembler.instruction(&[0x48, 0x85, 0xd2])?; // test window start
+        assembler.branch(&[0x0f, 0x85], no_match)?;
+    }
+    if bounds.requires_end {
+        assembler.instruction(&[0x48, 0x39, 0xf1])?; // window end vs haystack length
+        assembler.branch(&[0x0f, 0x85], no_match)?;
+    }
+    if !bounds.requires_start && !bounds.requires_end {
+        return Ok(());
+    }
+
+    if let Some(width) = layout.exact_match_width {
+        assembler.instruction(&[0x48, 0xb8])?; // movabs rax, width
+        push_bytes(&mut assembler.code, &width.to_le_bytes())?;
+        match (bounds.requires_start, bounds.requires_end) {
+            (true, true) => {
+                assembler.instruction(&[0x48, 0x39, 0xc6])?; // len vs width
+                assembler.branch(&[0x0f, 0x85], no_match)?;
+            }
+            (true, false) => {
+                assembler.instruction(&[0x48, 0x39, 0xc1])?; // end vs width
+                assembler.branch(&[0x0f, 0x82], no_match)?;
+                assembler.instruction(&[0x48, 0x89, 0xc1])?; // end = width
+            }
+            (false, true) => {
+                assembler.instruction(&[0x48, 0x39, 0xc6])?; // len vs width
+                assembler.branch(&[0x0f, 0x82], no_match)?;
+                assembler.instruction(&[0x49, 0x89, 0xf3])?; // lower = len
+                assembler.instruction(&[0x49, 0x29, 0xc3])?; // lower -= width
+                assembler.instruction(&[0x4c, 0x39, 0xda])?; // start vs lower
+                assembler.branch(&[0x0f, 0x87], no_match)?;
+                assembler.instruction(&[0x4c, 0x89, 0xda])?; // start = lower
+            }
+            (false, false) => unreachable!("absolute-bound helper has no bound"),
+        }
+        return Ok(());
+    }
+
+    let Some(maximum) = layout.max_match_width else {
+        return Ok(());
+    };
+    assembler.instruction(&[0x48, 0xb8])?; // movabs rax, maximum
+    push_bytes(&mut assembler.code, &maximum.to_le_bytes())?;
+    match (bounds.requires_start, bounds.requires_end) {
+        (true, true) => {
+            assembler.instruction(&[0x48, 0x39, 0xc6])?; // len vs maximum
+            assembler.branch(&[0x0f, 0x87], no_match)?;
+        }
+        (true, false) => {
+            assembler.instruction(&[0x48, 0x39, 0xc1])?; // end vs maximum
+            assembler.instruction(&[0x48, 0x0f, 0x47, 0xc8])?; // end = min(end, max)
+        }
+        (false, true) => {
+            let bounded = assembler.label()?;
+            assembler.instruction(&[0x48, 0x39, 0xc6])?; // len vs maximum
+            assembler.branch(&[0x0f, 0x86], bounded)?;
+            assembler.instruction(&[0x49, 0x89, 0xf3])?; // lower = len
+            assembler.instruction(&[0x49, 0x29, 0xc3])?; // lower -= maximum
+            assembler.instruction(&[0x4c, 0x39, 0xda])?; // start vs lower
+            assembler.instruction(&[0x49, 0x0f, 0x42, 0xd3])?; // start = max(start, lower)
+            assembler.bind(bounded)?;
+        }
+        (false, false) => unreachable!("absolute-bound helper has no bound"),
+    }
+    Ok(())
+}
+
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -5402,6 +5498,7 @@ fn lower_x86_64_context(
     state_skip: Option<ContextStateSkip>,
     empty_prefix_restart: bool,
     features: FeatureSet,
+    absolute_bounds: ContextAbsoluteBounds,
 ) -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
     let mut assembler = X86Assembler::new();
     let filter_kind = context_x86_start_filter_kind(features);
@@ -5476,6 +5573,8 @@ fn lower_x86_64_context(
     assembler.branch(&[0x0f, 0x85], invalid_input)?;
     assembler.instruction(&[0x48, 0x85, 0xff])?;
     assembler.branch(&[0x0f, 0x84], invalid_input)?;
+
+    x86_emit_context_absolute_bounds(&mut assembler, layout, absolute_bounds, no_match)?;
 
     if anchored_forward_search.is_some() {
         assembler.instruction(&[0x49, 0x89, 0xd4])?; // debt origin = window start
@@ -5649,6 +5748,13 @@ fn lower_x86_64_context(
     assembler.branch(&[0x0f, 0x83], forward_finish)?;
     assembler.instruction(&[0xa8, CONTEXT_STATE_TERMINAL])?;
     assembler.branch(&[0x0f, 0x85], forward_finish)?;
+    if absolute_bounds.requires_start {
+        // Once the only absolute-start root is dead, no later boundary can
+        // reintroduce a viable start. Ordinary unanchored DFAs must retain
+        // their empty-state restart behavior.
+        assembler.instruction(&[0xa8, CONTEXT_STATE_EMPTY])?;
+        assembler.branch(&[0x0f, 0x85], forward_finish)?;
+    }
     if let Some(prefix_scan) = anchored_prefix_scan {
         let active = assembler.label()?;
         assembler.instruction(&[0xa8, CONTEXT_STATE_EMPTY])?;
@@ -7858,6 +7964,79 @@ fn aarch64_context_emit_anchored_forward_search(
     Ok(())
 }
 
+/// AArch64 counterpart of [`x86_emit_context_absolute_bounds`]. `x1` remains
+/// the original haystack length while only the validated search bounds in
+/// `x2`/`x3` are narrowed.
+fn aarch64_emit_context_absolute_bounds(
+    assembler: &mut Aarch64Assembler,
+    layout: &ContextNativeLayout,
+    bounds: ContextAbsoluteBounds,
+    no_match: usize,
+) -> Result<(), ObjectError> {
+    if bounds.requires_start {
+        assembler.instruction(aarch64_cmp_x_imm(2, 0)?)?;
+        assembler.branch_cond(AARCH64_NE, no_match)?;
+    }
+    if bounds.requires_end {
+        assembler.instruction(aarch64_cmp_x(3, 1)?)?;
+        assembler.branch_cond(AARCH64_NE, no_match)?;
+    }
+    if !bounds.requires_start && !bounds.requires_end {
+        return Ok(());
+    }
+
+    if let Some(width) = layout.exact_match_width {
+        aarch64_load_u64_constant(assembler, 11, width)?;
+        match (bounds.requires_start, bounds.requires_end) {
+            (true, true) => {
+                assembler.instruction(aarch64_cmp_x(1, 11)?)?;
+                assembler.branch_cond(AARCH64_NE, no_match)?;
+            }
+            (true, false) => {
+                assembler.instruction(aarch64_cmp_x(3, 11)?)?;
+                assembler.branch_cond(AARCH64_LO, no_match)?;
+                assembler.instruction(aarch64_mov_x(3, 11)?)?;
+            }
+            (false, true) => {
+                assembler.instruction(aarch64_cmp_x(1, 11)?)?;
+                assembler.branch_cond(AARCH64_LO, no_match)?;
+                assembler.instruction(aarch64_sub_x_reg(11, 1, 11)?)?;
+                assembler.instruction(aarch64_cmp_x(2, 11)?)?;
+                assembler.branch_cond(AARCH64_HI, no_match)?;
+                assembler.instruction(aarch64_mov_x(2, 11)?)?;
+            }
+            (false, false) => unreachable!("absolute-bound helper has no bound"),
+        }
+        return Ok(());
+    }
+
+    let Some(maximum) = layout.max_match_width else {
+        return Ok(());
+    };
+    aarch64_load_u64_constant(assembler, 11, maximum)?;
+    match (bounds.requires_start, bounds.requires_end) {
+        (true, true) => {
+            assembler.instruction(aarch64_cmp_x(1, 11)?)?;
+            assembler.branch_cond(AARCH64_HI, no_match)?;
+        }
+        (true, false) => {
+            assembler.instruction(aarch64_cmp_x(3, 11)?)?;
+            assembler.instruction(aarch64_csel_x(3, 3, 11, AARCH64_LS)?)?;
+        }
+        (false, true) => {
+            let bounded = assembler.label()?;
+            assembler.instruction(aarch64_cmp_x(1, 11)?)?;
+            assembler.branch_cond(AARCH64_LS, bounded)?;
+            assembler.instruction(aarch64_sub_x_reg(11, 1, 11)?)?;
+            assembler.instruction(aarch64_cmp_x(2, 11)?)?;
+            assembler.instruction(aarch64_csel_x(2, 2, 11, AARCH64_HS)?)?;
+            assembler.bind(bounded)?;
+        }
+        (false, false) => unreachable!("absolute-bound helper has no bound"),
+    }
+    Ok(())
+}
+
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -7882,6 +8061,7 @@ fn lower_aarch64_context(
     features: FeatureSet,
     asimd_lane_index_offset: Option<u32>,
     sve_filter_plans: ContextSveFilterPlans,
+    absolute_bounds: ContextAbsoluteBounds,
 ) -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
     let mut assembler = Aarch64Assembler::new();
     let current_sentinel = assembler.label()?;
@@ -7938,6 +8118,8 @@ fn lower_aarch64_context(
     assembler.branch_nonzero_w(8, invalid_input)?;
     assembler.instruction(aarch64_cmp_x_imm(0, 0)?)?;
     assembler.branch_cond(AARCH64_EQ, invalid_input)?;
+
+    aarch64_emit_context_absolute_bounds(&mut assembler, layout, absolute_bounds, no_match)?;
 
     if anchored_forward_search.is_some() {
         assembler.instruction(aarch64_mov_x(17, 2)?)?; // debt origin = window start
@@ -8116,6 +8298,9 @@ fn lower_aarch64_context(
     assembler.instruction(aarch64_cmp_x(2, 3)?)?;
     assembler.branch_cond(AARCH64_HS, forward_finish)?;
     assembler.branch_bit_set_w(8, 1, forward_finish)?;
+    if absolute_bounds.requires_start {
+        assembler.branch_bit_set_w(8, 2, forward_finish)?;
+    }
     if let Some(prefix_scan) = anchored_prefix_scan {
         let active = assembler.label()?;
         assembler.branch_bit_clear_w(8, 2, active)?;
@@ -8642,6 +8827,8 @@ mod tests {
             ("(?m:^$)", OutputContract::SelectedEnd, b"\n"),
             ("\\A(?:ab|a)\\z", OutputContract::Span, b"ab"),
             ("\\A(?:ab|a)\\z", OutputContract::Exists, b"a"),
+            ("\\A(?:ab|a)", OutputContract::Span, b"abz"),
+            ("(?:ab|a)\\z", OutputContract::Span, b"zab"),
             ("(?-u:\\B[0-9]+\\B)", OutputContract::Span, b"a123b !45!"),
             (
                 "(?-u:\\b(?:woua|qiaia)\\b)",
@@ -8690,7 +8877,32 @@ mod tests {
             ),
             ("(?m)^.$", OutputContract::Span, b"\xff\nq"),
             ("\\A\\z", OutputContract::Span, b""),
+            ("\\A\\z", OutputContract::Exists, b"x"),
         ]
+    }
+
+    #[test]
+    fn absolute_boundary_cuts_are_graph_general_and_conservative() {
+        let flags = |pattern: &str| {
+            let compiled = compile(
+                CompileRequest::new(pattern, host_target())
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Span),
+            )
+            .unwrap();
+            let view = compiled
+                .program()
+                .native_context_program_view()
+                .expect("absolute assertion must use contextual lowering");
+            (view.requires_haystack_start, view.requires_haystack_end)
+        };
+
+        assert_eq!(flags(r"\A(?:ab|cd)"), (true, false));
+        assert_eq!(flags(r"(?:ab|cd)\z"), (false, true));
+        assert_eq!(flags(r"\A(?:ab|cd)\z"), (true, true));
+        assert_eq!(flags(r"(?:\Aab|cd)\z"), (false, true));
+        assert_eq!(flags(r"\A(?:ab|cd\z)"), (true, false));
+        assert_eq!(flags(r"(?m:^ab$)"), (false, false));
     }
 
     #[test]
@@ -12352,6 +12564,48 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "links and executes absolute-boundary entries over every search window"]
+    fn linked_host_absolute_boundary_differential() {
+        let cases = vec![
+            (r"\A(?:ab|a)\z", OutputContract::Span, b"ab".as_slice()),
+            (r"\A(?:ab|cd)", OutputContract::Span, b"abz".as_slice()),
+            (
+                r"(?:ab|cd)\z",
+                OutputContract::SelectedEnd,
+                b"zab".as_slice(),
+            ),
+            (r"\A(?:a|abc)", OutputContract::Exists, b"abcx".as_slice()),
+            (r"(?:a|abc)\z", OutputContract::Span, b"xabc".as_slice()),
+            (
+                r"\A(?:a|abc)\z",
+                OutputContract::SelectedEnd,
+                b"abc".as_slice(),
+            ),
+            (r"\A\z", OutputContract::Span, b"".as_slice()),
+            (r"\A\z", OutputContract::Exists, b"x".as_slice()),
+            (r"\Aa*b", OutputContract::Span, b"aaaaac".as_slice()),
+            (r"a*\z", OutputContract::Exists, b"baaaaa".as_slice()),
+        ];
+        for target in host_differential_targets() {
+            let directory = std::env::temp_dir().join(format!(
+                "fre-aot-context-absolute-native-{}-{}",
+                std::process::id(),
+                match target.architecture {
+                    Architecture::Aarch64 => "aarch64",
+                    Architecture::X86_64 => "x86_64",
+                }
+            ));
+            build_context_differential_bundle_from_cases(
+                target,
+                directory,
+                true,
+                false,
+                cases.clone(),
+            );
+        }
+    }
+
+    #[test]
     #[ignore = "links and executes slow contextual AOT objects over every search window"]
     #[allow(
         clippy::too_many_lines,
@@ -12479,6 +12733,27 @@ mod tests {
         execute: bool,
         force_slow_context: bool,
     ) {
+        build_context_differential_bundle_from_cases(
+            target,
+            directory,
+            execute,
+            force_slow_context,
+            cases(),
+        );
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::too_many_lines,
+        reason = "native bundle construction and exact all-window expectations remain one audit unit"
+    )]
+    fn build_context_differential_bundle_from_cases(
+        target: Target,
+        directory: std::path::PathBuf,
+        execute: bool,
+        force_slow_context: bool,
+        cases: Vec<(&'static str, OutputContract, &'static [u8])>,
+    ) {
         fs::create_dir_all(&directory).unwrap();
         let mut source = String::from(
             "#include <stdint.h>\n#include <stddef.h>\n#include <stdio.h>\n\
@@ -12489,7 +12764,6 @@ mod tests {
         let mut first_symbol = None;
         let mut first_length = 0;
         let mut saw_sve = false;
-        let cases = cases();
         // The slow-route smoke test exhausts every window of one
         // representative variable-width Span graph. Established architecture
         // bundle generators retain the complete shared corpus.

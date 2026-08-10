@@ -7789,6 +7789,74 @@ pub(crate) struct NativeContextProgramView<'a> {
     pub(crate) required_literals: &'a RequiredLiterals,
     pub(crate) exact_match_width: Option<usize>,
     pub(crate) max_match_width: Option<usize>,
+    /// Every accepting graph path crosses an absolute-haystack-start
+    /// assertion. This is a graph-dominance fact, not a source-pattern hint.
+    pub(crate) requires_haystack_start: bool,
+    /// Every accepting graph path crosses an absolute-haystack-end assertion.
+    pub(crate) requires_haystack_end: bool,
+}
+
+/// Prove that every graph path from the Thompson start to an accept state
+/// crosses `assertion` by asking whether accept remains reachable after all
+/// such edges are removed. Assertion truth and transition priority are
+/// intentionally irrelevant: removing edges can only make this proof more
+/// conservative. Allocation or malformed-shape failure declines the optional
+/// fact rather than changing execution eligibility.
+fn accept_requires_assertion(raw: &RawPlan, assertion: EdgeKind) -> bool {
+    let states = raw.roles.len();
+    let Ok(start) = usize::try_from(raw.start) else {
+        return false;
+    };
+    if start >= states || raw.edge_offsets.len() != states.saturating_add(1) {
+        return false;
+    }
+    let mut seen = Vec::new();
+    if seen.try_reserve_exact(states).is_err() {
+        return false;
+    }
+    seen.resize(states, false);
+    let mut stack = Vec::new();
+    if stack.try_reserve_exact(states).is_err() {
+        return false;
+    }
+    seen[start] = true;
+    stack.push(start);
+    while let Some(state) = stack.pop() {
+        if raw.roles.get(state) == Some(&StateRole::Accept) {
+            return false;
+        }
+        let Some(next_state) = state.checked_add(1) else {
+            return false;
+        };
+        let (Some(&begin), Some(&end)) = (
+            raw.edge_offsets.get(state),
+            raw.edge_offsets.get(next_state),
+        ) else {
+            return false;
+        };
+        let (Ok(begin), Ok(end)) = (usize::try_from(begin), usize::try_from(end)) else {
+            return false;
+        };
+        if begin > end || end > raw.edge_kinds.len() || end > raw.edge_targets.len() {
+            return false;
+        }
+        for edge in begin..end {
+            if raw.edge_kinds[edge] == assertion {
+                continue;
+            }
+            let Ok(target) = usize::try_from(raw.edge_targets[edge]) else {
+                return false;
+            };
+            let Some(mark) = seen.get_mut(target) else {
+                return false;
+            };
+            if !*mark {
+                *mark = true;
+                stack.push(target);
+            }
+        }
+    }
+    true
 }
 
 const fn contextual_limits(requested: DeterminizeLimits) -> ContextDfaLimits {
@@ -8291,6 +8359,14 @@ impl CompiledProgram {
                 required_literals: &self.required_literals,
                 exact_match_width: self.exact_match_width,
                 max_match_width: self.max_match_width(),
+                requires_haystack_start: accept_requires_assertion(
+                    &self.raw,
+                    EdgeKind::AssertHaystackStart,
+                ),
+                requires_haystack_end: accept_requires_assertion(
+                    &self.raw,
+                    EdgeKind::AssertHaystackEnd,
+                ),
             })
     }
 
@@ -8590,6 +8666,14 @@ impl CompiledProgram {
             required_literals: &candidate.required_literals,
             exact_match_width: self.exact_match_width,
             max_match_width: self.max_match_width(),
+            requires_haystack_start: accept_requires_assertion(
+                &self.raw,
+                EdgeKind::AssertHaystackStart,
+            ),
+            requires_haystack_end: accept_requires_assertion(
+                &self.raw,
+                EdgeKind::AssertHaystackEnd,
+            ),
         }
     }
 
