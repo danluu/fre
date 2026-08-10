@@ -42,6 +42,7 @@ pub(super) fn x86_emit_bounded_suffix_retry(
     assembler: &mut X86Assembler,
     layout: NativeDfaLayout,
     plan: BoundedSuffixRetryPlan,
+    kind: X86StartFilterKind,
     retry_scan: X86Label,
     no_match: X86Label,
     matched: X86Label,
@@ -80,7 +81,7 @@ pub(super) fn x86_emit_bounded_suffix_retry(
     assembler.bind(verifier)?;
     assembler.instruction(&[0x4c, 0x39, 0xda])?; // position >= verifier end?
     assembler.branch(&[0x0f, 0x83], rejected)?;
-    x86_emit_table_lookup(assembler, layout.transitions, layout.cells)?;
+    x86_emit_table_lookup(assembler, layout.transitions, layout.cells, kind)?;
     assembler.instruction(&[0x48, 0xff, 0xc2])?;
     x86_emit_test_eax_mask(assembler, layout.cells.accepts())?;
     assembler.branch(&[0x0f, layout.cells.x86_accept_branch()], accepted)?;
@@ -130,6 +131,7 @@ pub(super) fn aarch64_emit_bounded_suffix_retry(
     assembler: &mut Aarch64Assembler,
     layout: NativeDfaLayout,
     plan: BoundedSuffixRetryPlan,
+    features: FeatureSet,
     retry_scan: Aarch64Label,
     no_match: Aarch64Label,
     matched: Aarch64Label,
@@ -165,7 +167,7 @@ pub(super) fn aarch64_emit_bounded_suffix_retry(
     assembler.bind(verifier)?;
     assembler.instruction(aarch64_cmp_x(2, 10)?)?;
     assembler.branch_cond(AARCH64_HS, rejected)?;
-    aarch64_emit_table_lookup(assembler, layout.transitions, layout.cells)?;
+    aarch64_emit_table_lookup(assembler, layout.transitions, layout.cells, features)?;
     assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
     assembler.branch_bit_set_w(8, layout.cells.accepts_bit(), accepted)?;
     // Mirror the ordinary forward dispatcher: both the accept and
@@ -220,7 +222,15 @@ mod tests {
         let retry = assembler.label()?;
         let no_match = assembler.label()?;
         let matched = assembler.label()?;
-        x86_emit_bounded_suffix_retry(&mut assembler, *layout, plan, retry, no_match, matched)?;
+        x86_emit_bounded_suffix_retry(
+            &mut assembler,
+            *layout,
+            plan,
+            X86StartFilterKind::Sse2,
+            retry,
+            no_match,
+            matched,
+        )?;
         assembler.bind(retry)?;
         assembler.bind(no_match)?;
         assembler.bind(matched)?;
@@ -260,8 +270,16 @@ mod tests {
         let retry = aarch64.label().unwrap();
         let no_match = aarch64.label().unwrap();
         let matched = aarch64.label().unwrap();
-        aarch64_emit_bounded_suffix_retry(&mut aarch64, layout, plan, retry, no_match, matched)
-            .unwrap();
+        aarch64_emit_bounded_suffix_retry(
+            &mut aarch64,
+            layout,
+            plan,
+            FeatureSet::EMPTY,
+            retry,
+            no_match,
+            matched,
+        )
+        .unwrap();
         aarch64.bind(retry).unwrap();
         aarch64.bind(no_match).unwrap();
         aarch64.bind(matched).unwrap();
