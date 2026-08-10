@@ -1,4 +1,4 @@
-use core::{marker::PhantomData, mem::size_of};
+use core::{marker::PhantomData, mem::size_of, ops::Deref};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     OnceLock,
@@ -34,13 +34,19 @@ fn next_automaton_identity() -> u64 {
 }
 
 /// Number of exact consumed-byte positions retained by the bounded start
-/// filter. Any of offsets zero through fifteen may supply the primary
+/// filter. Any of offsets zero through thirty-one may supply the primary
 /// scanner; at most one other position may supply a secondary Guard or Probe.
-pub(crate) const START_FILTER_POSITION_COUNT: usize = 16;
+pub(crate) const START_FILTER_POSITION_COUNT: usize = 32;
 /// Largest consumed-byte offset inspected by the bounded start filter.
 pub(crate) const START_FILTER_MAX_OFFSET: usize = START_FILTER_POSITION_COUNT - 1;
 /// Maximum secondary exact-position filters retained by one immutable proof.
 pub(crate) const START_FILTER_MAX_GUARDS: usize = 1;
+/// Maximum charged secondary classifications of one source position. A
+/// block-local Guard intersection may classify a lane once in its complete
+/// SIMD block and conservatively recheck a retained survivor as a scalar
+/// candidate on a later engine restart.
+const START_FILTER_MAX_SECONDARY_CHECKS_PER_POSITION: usize =
+    START_FILTER_MAX_GUARDS.saturating_add(1);
 /// Exact abstract work to count the members in all four byte-bitmap words.
 pub(crate) const BYTE_START_BITMAP_POPULATION_WORK: usize = 4;
 /// Exact abstract work to extract one small-scanner member from the bitmap.
@@ -698,9 +704,44 @@ pub(crate) enum StartScanner {
 
 /// One sound byte class at an exact consumed-byte offset after match start.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartPositionClassPolicy {
+    Ordinary,
+    AdaptiveProbe,
+    GuardPair,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct StartPositionClass {
     pub(crate) offset: u8,
+    range_start: u8,
+    range_end: u8,
+    policy: StartPositionClassPolicy,
     pub(crate) set: ByteSet,
+}
+
+impl StartPositionClass {
+    pub(crate) const fn new(offset: u8, set: ByteSet) -> Self {
+        Self {
+            offset,
+            range_start: 1,
+            range_end: 0,
+            policy: StartPositionClassPolicy::Ordinary,
+            set,
+        }
+    }
+
+    const fn with_probe_policy(
+        mut self,
+        range: Option<(u8, u8)>,
+        policy: StartPositionClassPolicy,
+    ) -> Self {
+        (self.range_start, self.range_end) = match range {
+            Some((start, end)) => (start, end),
+            None => (1, 0),
+        };
+        self.policy = policy;
+        self
+    }
 }
 
 /// Broad exact-position class sampled after primary-candidate rejection.
@@ -708,60 +749,98 @@ pub(crate) struct StartPositionClass {
 /// A contiguous range can be intersected with the primary scanner a complete
 /// candidate block at a time without constructing another runtime classifier.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(transparent)]
 pub(crate) struct StartPositionProbe {
-    pub(crate) set: ByteSet,
-    pub(crate) offset: u8,
-    range_start: u8,
-    range_end: u8,
+    class: StartPositionClass,
 }
 
 impl StartPositionProbe {
     pub(crate) const fn new(class: StartPositionClass, range: Option<(u8, u8)>) -> Self {
-        let (range_start, range_end) = match range {
-            Some((start, end)) => (start, end),
-            None => (1, 0),
-        };
         Self {
-            set: class.set,
-            offset: class.offset,
-            range_start,
-            range_end,
+            class: class.with_probe_policy(range, StartPositionClassPolicy::AdaptiveProbe),
+        }
+    }
+
+    pub(crate) const fn new_guard_pair(
+        class: StartPositionClass,
+        range: (u8, u8),
+    ) -> Self {
+        Self {
+            class: class.with_probe_policy(Some(range), StartPositionClassPolicy::GuardPair),
         }
     }
 
     pub(crate) const fn range(&self) -> Option<(u8, u8)> {
-        if self.range_start <= self.range_end {
-            Some((self.range_start, self.range_end))
+        if self.class.range_start <= self.class.range_end {
+            Some((self.class.range_start, self.class.range_end))
         } else {
             None
         }
+    }
+
+    pub(crate) const fn is_guard_pair(&self) -> bool {
+        matches!(self.class.policy, StartPositionClassPolicy::GuardPair)
+    }
+
+    pub(crate) const fn class(&self) -> &StartPositionClass {
+        &self.class
+    }
+}
+
+impl Deref for StartPositionProbe {
+    type Target = StartPositionClass;
+
+    fn deref(&self) -> &Self::Target {
+        &self.class
     }
 }
 
 /// Execution policy for the one retained non-scanner exact-position class.
 ///
-/// A guard is checked for every primary candidate. A probe starts inactive
-/// and is enabled only by invocation-local evidence from rejected primary
-/// candidates. Keeping the policy in the immutable proof makes the two routes
-/// auditable without retaining any source-dependent state.
+/// A guard is checked for every primary candidate. A Guard pair retains a paid
+/// exact range for invocation-local block intersection after source-derived
+/// admission succeeds. A broad probe starts inactive and is enabled only by
+/// invocation-local engine rejections.
+/// Keeping the policy in the immutable proof makes every route auditable
+/// without retaining any source-dependent state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum StartPositionFilter {
-    Guard(StartPositionClass),
-    Probe(StartPositionProbe),
+#[repr(transparent)]
+pub(crate) struct StartPositionFilter {
+    position: StartPositionProbe,
 }
 
 impl StartPositionFilter {
+    pub(crate) const fn new_guard(class: StartPositionClass) -> Self {
+        Self {
+            position: StartPositionProbe { class },
+        }
+    }
+
+    pub(crate) const fn new_probe(probe: StartPositionProbe) -> Self {
+        Self { position: probe }
+    }
+
     pub(crate) const fn guard(&self) -> Option<&StartPositionClass> {
-        match self {
-            Self::Guard(class) => Some(class),
-            Self::Probe(_) => None,
+        match self.position.class.policy {
+            StartPositionClassPolicy::Ordinary => Some(self.position.class()),
+            StartPositionClassPolicy::AdaptiveProbe | StartPositionClassPolicy::GuardPair => None,
+        }
+    }
+
+    pub(crate) const fn guard_pair(&self) -> Option<&StartPositionProbe> {
+        if self.position.is_guard_pair() {
+            Some(&self.position)
+        } else {
+            None
         }
     }
 
     pub(crate) const fn probe(&self) -> Option<&StartPositionProbe> {
-        match self {
-            Self::Guard(_) => None,
-            Self::Probe(probe) => Some(probe),
+        match self.position.class.policy {
+            StartPositionClassPolicy::Ordinary => None,
+            StartPositionClassPolicy::AdaptiveProbe | StartPositionClassPolicy::GuardPair => {
+                Some(&self.position)
+            }
         }
     }
 }
@@ -793,6 +872,28 @@ impl StartFilterProof {
     pub(crate) const fn probe(&self) -> Option<&StartPositionProbe> {
         match &self.filter {
             Some(filter) => filter.probe(),
+            None => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn guard_pair(&self) -> Option<&StartPositionProbe> {
+        match &self.filter {
+            Some(filter) => filter.guard_pair(),
+            None => None,
+        }
+    }
+
+    pub(crate) const fn scalar_guard_parts(&self) -> Option<(u8, &ByteSet)> {
+        match &self.filter {
+            Some(filter) => match (filter.guard(), filter.guard_pair()) {
+                (Some(guard), _) => Some((guard.offset, &guard.set)),
+                (None, Some(pair)) => {
+                    let class = pair.class();
+                    Some((class.offset, &class.set))
+                }
+                (None, None) => None,
+            },
             None => None,
         }
     }
@@ -1186,21 +1287,22 @@ impl Automaton {
                 computation: "conservative transition work bound",
             })?;
         // The first successful invocation on an immutable automaton derives
-        // up to sixteen exact-position byte classes and selects a scanner plus
+        // up to thirty-two exact-position byte classes and selects a scanner plus
         // one secondary Guard or Probe. Each depth may inspect a state twice
         // and a consuming edge twice while building the next frontier, in
         // addition to the ordinary edge inspection. Later invocations read
         // the automaton-owned result.
         let start_proof = self.conservative_start_filter_proof_work_bound()?;
-        // The mutually exclusive retained Guard or adaptive Probe can add at
-        // most one membership check per candidate/source position on top of
-        // the full all-boundaries automaton bound.
+        // The mutually exclusive retained Guard or adaptive Probe normally
+        // adds one membership check per candidate/source position. A retained
+        // block-local Guard survivor is conservatively rechecked after its
+        // SIMD classification, so reserve two secondary checks per position.
         let secondary_filter = input
-            .checked_mul(u64::try_from(START_FILTER_MAX_GUARDS).map_err(|_| {
-                SearchError::ArithmeticOverflow {
-                    computation: "start-filter guard count conversion",
-                }
-            })?)
+            .checked_mul(u64::try_from(START_FILTER_MAX_SECONDARY_CHECKS_PER_POSITION).map_err(
+                |_| SearchError::ArithmeticOverflow {
+                    computation: "start-filter secondary-check count conversion",
+                },
+            )?)
             .ok_or(SearchError::ArithmeticOverflow {
                 computation: "start-filter guard work bound",
             })?;
