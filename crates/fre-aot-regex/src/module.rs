@@ -3307,8 +3307,15 @@ fn lower_native_slow_partial_prepared_with_data_limit(
         view.exact_match_width,
         has_complete_preflight_proofs,
     );
-    let input_admission =
-        StaticPrefixInputAdmission::for_deferred_resume(resume, defer_preflight)?;
+    // The extra authenticated short-window dispatch amortizes on the x86
+    // wrapper. Keep the AArch64 wrapper on its established fallback route;
+    // its shorter call sequence does not recover the added dispatch cost.
+    let input_admission = match target.architecture {
+        Architecture::X86_64 => {
+            StaticPrefixInputAdmission::for_deferred_resume(resume, defer_preflight)?
+        }
+        Architecture::Aarch64 => StaticPrefixInputAdmission::FALLBACK_ONLY,
+    };
     let exact_span_width = match (view.output, view.exact_match_width) {
         (OutputContract::Exists | OutputContract::SelectedEnd, _) => None,
         (OutputContract::Span, None) => None,
@@ -52518,12 +52525,14 @@ int main(void){{
                     true,
                     Some(0),
                     true,
+                    StaticPrefixInputAdmission::FALLBACK_ONLY,
                 ),
                 Architecture::Aarch64 => lower_aarch64_static_prefix_prepared_wrapper(
                     OutputContract::Span,
                     true,
                     Some(0),
                     true,
+                    StaticPrefixInputAdmission::FALLBACK_ONLY,
                 ),
             }
             .unwrap();
@@ -53229,7 +53238,7 @@ int main(void){{
                                 .chunks_exact(4)
                                 .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
                                 .collect::<Vec<_>>();
-                            assert!(words.windows(2).any(|window| {
+                            assert!(!words.windows(2).any(|window| {
                                 window[0] == compare
                                     && window[1] & 0xff00_001f == 0x5400_0009
                             }));
