@@ -13,6 +13,7 @@
 
 #![forbid(unsafe_code)]
 
+mod absolute_anchored_cut;
 mod bit_parallel_exists;
 mod bounded_suffix_retry;
 mod context_dfa;
