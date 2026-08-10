@@ -4728,11 +4728,11 @@ enum TransitionLayout {
     /// only after dense retained-partial lowering exhausts its native-data
     /// transaction.
     DefaultExceptions(u8),
-    /// The same fixed sparse record, but its exception keys are exact raw
-    /// bytes. This form is admitted only when expanding graph-class exceptions
-    /// to their complete byte preimages does not increase the global record
-    /// capacity. It therefore removes the dependent class-map load and the
-    /// entire 256-byte prefix without adding comparisons or row bytes.
+    /// The same fixed sparse record, but its default is selected over all 256
+    /// raw-byte transitions and its exception keys are exact bytes. This form
+    /// is admitted only when neither an individual row nor the global record
+    /// capacity grows. It therefore removes the dependent class-map load and
+    /// the entire 256-byte prefix without adding comparisons or row bytes.
     DefaultByteExceptions(u8),
     /// A raw-byte piecewise-constant row. The first cell is the value at byte
     /// zero; each key is the first byte of a later constant run and owns the
@@ -4747,9 +4747,9 @@ enum TransitionLayout {
     /// when the target can cover the row and a balanced scalar lookup
     /// otherwise. The class map remains part of the class-keyed form.
     DefaultSparseExceptions(u8),
-    /// The same scalable modal row keyed by exact raw bytes. It is selected
-    /// only when complete byte-preimage expansion does not increase global
-    /// capacity, and therefore omits the class map exactly.
+    /// The same scalable row with its mode selected over all raw bytes and
+    /// exact byte exception keys. It is selected only when neither per-row nor
+    /// global capacity grows, and therefore omits the class map exactly.
     DefaultByteSparseExceptions(u8),
 }
 
@@ -5528,33 +5528,31 @@ fn native_default_exception_row(
     (next == exception_count).then_some((candidate, exceptions, exception_count))
 }
 
-/// Expand one canonical class-keyed sparse row to exact raw-byte keys.
+/// Narrow the canonical byte-domain modal row to the fixed scalar envelope.
 ///
-/// The default remains the class-modal cell selected above. Iterating the
-/// complete byte map in ordinal order proves exact preimage coverage and gives
-/// deterministic publication. Failure to fit the same fixed four-slot bound
-/// simply retains the established class-keyed representation.
+/// Both raw-key representations must select the same default. Deriving the
+/// arbitrary-capacity row once and copying its ascending prefix prevents the
+/// planner and bounded table builder from disagreeing when class and byte
+/// preimage modes differ.
 fn native_default_byte_exception_row(
     row: &[ForwardCell],
     byte_classes: &[u8],
     normalization: NativeDefaultExceptionNormalization,
 ) -> Option<NativeDefaultExceptionRow<MAX_NATIVE_DEFAULT_EXCEPTIONS>> {
-    if byte_classes.len() != CLASS_MAP_BYTES {
+    let (default, scalable, exception_count) =
+        native_sparse_default_byte_exception_row(row, byte_classes, normalization)?;
+    if exception_count > MAX_NATIVE_DEFAULT_EXCEPTIONS {
         return None;
     }
-    let (default, _, _) = native_default_exception_row(row, normalization)?;
     let mut exceptions = [None; MAX_NATIVE_DEFAULT_EXCEPTIONS];
-    let mut next = 0_usize;
-    for (byte, &class) in byte_classes.iter().enumerate() {
-        let cell = normalization.normalize(*row.get(usize::from(class))?)?;
-        if cell == default {
-            continue;
-        }
-        let slot = exceptions.get_mut(next)?;
-        *slot = Some((u8::try_from(byte).ok()?, cell));
-        next = next.checked_add(1)?;
+    for (destination, &exception) in exceptions
+        .iter_mut()
+        .zip(scalable.iter())
+        .take(exception_count)
+    {
+        *destination = exception;
     }
-    Some((default, exceptions, next))
+    Some((default, exceptions, exception_count))
 }
 
 /// Encode the complete raw-byte transition function as constant-run
@@ -5648,34 +5646,57 @@ fn native_sparse_default_exception_row(
     (next == exception_count).then_some((candidate, exceptions, exception_count))
 }
 
-/// Expand one arbitrary-capacity class-modal row to exact raw-byte keys.
-/// Complete byte-map traversal proves both semantic coverage and deterministic
-/// key order. A 256-byte non-default preimage cannot fit and declines exactly.
+/// Select the exact modal packed semantic cell over all 256 raw bytes.
+///
+/// This mode is deliberately independent of graph-class cardinality. Equal
+/// byte-domain frequencies retain the normalized value whose first raw byte
+/// ordinal is lowest, and exceptions are published in ascending byte order.
+/// Consequently a skewed class preimage can omit the class map without
+/// inheriting an arbitrarily poor class-modal default. At least one byte owns
+/// the selected mode, so the fixed 255-slot result always suffices.
 fn native_sparse_default_byte_exception_row(
     row: &[ForwardCell],
     byte_classes: &[u8],
     normalization: NativeDefaultExceptionNormalization,
 ) -> Option<NativeDefaultExceptionRow<MAX_NATIVE_SPARSE_EXCEPTIONS>> {
-    let (default, _, _) = native_sparse_default_exception_row(row, normalization)?;
-    native_sparse_default_byte_exception_row_with_default(row, byte_classes, normalization, default)
-}
-
-/// Expand one arbitrary-capacity class-modal row using its already-derived
-/// default. The planner uses this form so modal selection is paid exactly once
-/// per row even when it also considers omitting the class map.
-fn native_sparse_default_byte_exception_row_with_default(
-    row: &[ForwardCell],
-    byte_classes: &[u8],
-    normalization: NativeDefaultExceptionNormalization,
-    default: ForwardCell,
-) -> Option<NativeDefaultExceptionRow<MAX_NATIVE_SPARSE_EXCEPTIONS>> {
-    if byte_classes.len() != CLASS_MAP_BYTES {
+    let &first_class = byte_classes.first()?;
+    let first = normalization.normalize(*row.get(usize::from(first_class))?)?;
+    if byte_classes.len() != CLASS_MAP_BYTES || row.len() > CLASS_MAP_BYTES {
         return None;
     }
-    let mut exceptions = [None; MAX_NATIVE_SPARSE_EXCEPTIONS];
-    let mut next = 0_usize;
+    let mut normalized = [first; CLASS_MAP_BYTES];
+    let mut ordered = [((0_u32, false), 0_u8); CLASS_MAP_BYTES];
     for (byte, &class) in byte_classes.iter().enumerate() {
         let cell = normalization.normalize(*row.get(usize::from(class))?)?;
+        *normalized.get_mut(byte)? = cell;
+        *ordered.get_mut(byte)? = (
+            (cell.next(), cell.accepted()),
+            u8::try_from(byte).ok()?,
+        );
+    }
+    ordered.sort_unstable();
+    let mut candidate_ordinal = 0_usize;
+    let mut dominant = 0_usize;
+    let mut group_start = 0_usize;
+    while group_start < ordered.len() {
+        let key = ordered.get(group_start)?.0;
+        let mut group_end = group_start.checked_add(1)?;
+        while ordered.get(group_end).is_some_and(|entry| entry.0 == key) {
+            group_end = group_end.checked_add(1)?;
+        }
+        let count = group_end.checked_sub(group_start)?;
+        let first_ordinal = usize::from(ordered.get(group_start)?.1);
+        if count > dominant || count == dominant && first_ordinal < candidate_ordinal {
+            candidate_ordinal = first_ordinal;
+            dominant = count;
+        }
+        group_start = group_end;
+    }
+    let default = *normalized.get(candidate_ordinal)?;
+    let exception_count = CLASS_MAP_BYTES.checked_sub(dominant)?;
+    let mut exceptions = [None; MAX_NATIVE_SPARSE_EXCEPTIONS];
+    let mut next = 0_usize;
+    for (byte, &cell) in normalized.iter().enumerate() {
         if cell == default {
             continue;
         }
@@ -5683,7 +5704,7 @@ fn native_sparse_default_byte_exception_row_with_default(
         *slot = Some((u8::try_from(byte).ok()?, cell));
         next = next.checked_add(1)?;
     }
-    Some((default, exceptions, next))
+    (next == exception_count).then_some((default, exceptions, exception_count))
 }
 
 fn append_native_default_exception_record<F>(
@@ -5792,18 +5813,21 @@ fn derive_native_default_exception_plan(
     )?;
     let mut exception_capacity = 0_usize;
     let mut byte_exception_capacity = Some(0_usize);
+    let mut byte_exceptions_never_grow = true;
     let mut byte_boundary_capacity = Some(0_usize);
     for row in dfa.forward_cells.chunks_exact(dfa.class_count) {
-        let (default, _, exceptions) = native_sparse_default_exception_row(row, normalization)?;
-        exception_capacity = exception_capacity.max(exceptions);
+        let (_, _, class_exceptions) = native_sparse_default_exception_row(row, normalization)?;
+        exception_capacity = exception_capacity.max(class_exceptions);
         if let Some(capacity) = byte_exception_capacity {
-            byte_exception_capacity = native_sparse_default_byte_exception_row_with_default(
+            byte_exception_capacity = native_sparse_default_byte_exception_row(
                 row,
                 dfa.byte_classes,
                 normalization,
-                default,
             )
-            .map(|(_, _, exceptions)| capacity.max(exceptions));
+            .map(|(_, _, byte_exceptions)| {
+                byte_exceptions_never_grow &= byte_exceptions <= class_exceptions;
+                capacity.max(byte_exceptions)
+            });
         }
         if let Some(capacity) = byte_boundary_capacity {
             byte_boundary_capacity = native_default_byte_boundary_row(
@@ -5815,12 +5839,18 @@ fn derive_native_default_exception_plan(
         }
     }
     // Capacity is simultaneously the fixed record geometry and the maximum
-    // hot comparison depth. Prefer exact raw-byte equality on a tie; select
+    // hot comparison depth. Raw-byte equality may omit the dependent map only
+    // when it grows no individual row: this preserves every current and future
+    // short-row tier, even when another row hides that growth behind the same
+    // global maximum. Prefer raw equality on an otherwise exact tie; select
     // run boundaries when they use fewer slots, or when byte expansion does
     // not fit but boundaries remain no wider than the established class row.
-    let byte_candidate = (exception_capacity != 0
-        && byte_exception_capacity == Some(exception_capacity))
-        .then_some(exception_capacity);
+    let byte_candidate = byte_exception_capacity.filter(|&capacity| {
+        exception_capacity != 0
+            && capacity != 0
+            && byte_exceptions_never_grow
+            && capacity <= exception_capacity
+    });
     let boundary_candidate = byte_boundary_capacity.filter(|&capacity| {
         capacity != 0
             && capacity <= MAX_NATIVE_DEFAULT_EXCEPTIONS
@@ -9218,13 +9248,14 @@ fn build_native_dfa_table_with_cost_model_data_limit_and_asimd_policy(
     ))?;
     // Sparse rows remain a resource-only alternate after every feasible dense
     // representation. This prevents a branchier modal row from shadowing a
-    // smaller exact or column-quotient dense table. Exact duplicate rows
-    // strictly reduce class-keyed sparse records without changing their
-    // lookup, so try that proved composition before the uninterned record.
+    // smaller exact or column-quotient dense table. Exact duplicate normalized
+    // rows produce identical class and byte-modal records, so try those proved
+    // compositions before the uninterned record. Boundary records retain their
+    // established uninterned route until they have an independent oracle.
     if let Some(plan) =
         native_default_exception_retry_plan(view, architecture, &dense_error)
     {
-        if plan.keys == NativeDefaultExceptionKeys::Classes
+        if plan.keys != NativeDefaultExceptionKeys::Boundaries
             && let Some(exact_rows) = exact_rows.as_ref()
         {
             let retry =
@@ -9540,7 +9571,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
             ));
         };
         if default_exceptions.is_some_and(|sparse| {
-            sparse.keys != NativeDefaultExceptionKeys::Classes
+            sparse.keys == NativeDefaultExceptionKeys::Boundaries
         })
             || resume_states == 0
             || encoded_hole_states == 0
@@ -57793,22 +57824,25 @@ int main(void){{
                 .is_none()
         );
 
-        // The raw-key representation admits the mathematical 255-key bound
-        // and fails closed when every byte is exceptional.
+        // Raw-byte modal selection is independent of the tied class mode.
+        // The value first seen at byte zero owns 255 bytes, so the sole byte
+        // mapped to the other class is the exact ascending exception.
         let row = [ForwardCell::new(0, false), ForwardCell::new(1, false)];
         let binary = NativeDefaultExceptionNormalization::new(2, 3, false).unwrap();
         let mut byte_classes = [1_u8; CLASS_MAP_BYTES];
         byte_classes[usize::from(u8::MAX)] = 0;
         let expanded =
             native_sparse_default_byte_exception_row(&row, &byte_classes, binary).unwrap();
-        assert_eq!(expanded.2, MAX_NATIVE_SPARSE_EXCEPTIONS);
-        assert_eq!(expanded.1[0].unwrap().0, u8::MIN);
-        assert_eq!(
-            expanded.1[MAX_NATIVE_SPARSE_EXCEPTIONS - 1].unwrap().0,
-            u8::MAX - 1
-        );
+        assert_eq!(expanded.0, row[1]);
+        assert_eq!(expanded.2, 1);
+        assert_eq!(expanded.1[0], Some((u8::MAX, row[0])));
+        assert!(expanded.1[1..].iter().all(Option::is_none));
         byte_classes[usize::from(u8::MAX)] = 1;
-        assert!(native_sparse_default_byte_exception_row(&row, &byte_classes, binary).is_none());
+        let uniform =
+            native_sparse_default_byte_exception_row(&row, &byte_classes, binary).unwrap();
+        assert_eq!(uniform.0, row[1]);
+        assert_eq!(uniform.2, 0);
+        assert!(uniform.1.iter().all(Option::is_none));
     }
 
     #[test]
@@ -58592,6 +58626,15 @@ int main(void){{
             assert_eq!(count, 1, "byte={byte}");
             assert_eq!(exceptions[0], Some((byte, exceptional)), "byte={byte}");
             assert!(exceptions[1..].iter().all(Option::is_none));
+            let scalable = native_sparse_default_byte_exception_row(
+                &row,
+                &byte_classes,
+                normalization,
+            )
+            .unwrap();
+            assert_eq!(scalable.0, actual_default, "byte={byte}");
+            assert_eq!(scalable.2, count, "byte={byte}");
+            assert_eq!(scalable.1[..count], exceptions[..count], "byte={byte}");
         }
 
         let boundary_bytes = [u8::MIN, 1, u8::MAX - 1, u8::MAX];
@@ -58629,6 +58672,43 @@ int main(void){{
             normalization,
         )
         .is_none());
+    }
+
+    #[test]
+    fn raw_byte_modal_ties_use_first_byte_and_keep_acceptance_distinct() {
+        let early = ForwardCell::new(101, true);
+        let late = ForwardCell::new(2, false);
+        let row = [late, early];
+        let normalization = NativeDefaultExceptionNormalization::new(128, 132, false).unwrap();
+        let byte_classes: [u8; CLASS_MAP_BYTES] =
+            core::array::from_fn(|byte| u8::from(byte < CLASS_MAP_BYTES / 2));
+        let (default, exceptions, count) =
+            native_sparse_default_byte_exception_row(&row, &byte_classes, normalization).unwrap();
+        assert_eq!(default, early);
+        assert_eq!(count, CLASS_MAP_BYTES / 2);
+        assert_eq!(exceptions[0], Some((128, late)));
+        assert_eq!(exceptions[count - 1], Some((u8::MAX, late)));
+        assert!(exceptions[count..].iter().all(Option::is_none));
+        assert!(exceptions[..count]
+            .windows(2)
+            .all(|pair| pair[0].unwrap().0 < pair[1].unwrap().0));
+
+        let rejected = ForwardCell::new(7, false);
+        let accepted = ForwardCell::new(7, true);
+        let acceptance_row = [rejected, accepted];
+        let acceptance_classes: [u8; CLASS_MAP_BYTES] =
+            core::array::from_fn(|byte| u8::from(byte >= 200));
+        let (default, exceptions, count) = native_sparse_default_byte_exception_row(
+            &acceptance_row,
+            &acceptance_classes,
+            normalization,
+        )
+        .unwrap();
+        assert_eq!(default, rejected);
+        assert_eq!(count, 56);
+        assert!(exceptions[..count]
+            .iter()
+            .all(|exception| exception.unwrap().1 == accepted));
     }
 
     #[test]
@@ -58726,6 +58806,164 @@ int main(void){{
                 NativeDefaultExceptionKeys::Classes,
                 "{architecture:?}",
             );
+        }
+
+        // Class cardinality is tied, but class zero owns only byte 255 while
+        // class one owns every earlier byte. The class-modal expansion would
+        // publish 255 raw exceptions. Independent byte-domain selection
+        // instead retains the same one-slot global capacity and can remove
+        // both the map prefix and its dependent lookup.
+        const SKEW_ROWS: usize = 100;
+        let mut byte_classes = [1_u8; CLASS_MAP_BYTES];
+        byte_classes[usize::from(u8::MAX)] = 0;
+        let class_representatives = [u8::MAX, u8::MIN];
+        let mut forward_cells = Vec::with_capacity(SKEW_ROWS * 2);
+        for state in 0..SKEW_ROWS {
+            forward_cells.push(ForwardCell::new(u32::try_from(state).unwrap(), false));
+            forward_cells.push(ForwardCell::new(NO_DFA_STATE, true));
+        }
+        let skew = NativeDfaView {
+            initial_state: 0,
+            initial_pending: false,
+            initial_terminal: false,
+            byte_classes: &byte_classes,
+            class_count: 2,
+            class_representatives: &class_representatives,
+            forward_cells: &forward_cells,
+            reverse_initial: None,
+            reverse_cells: &[],
+        };
+        let normalization =
+            NativeDefaultExceptionNormalization::new(SKEW_ROWS, SKEW_ROWS + 1, false).unwrap();
+        for row in forward_cells.chunks_exact(2) {
+            let class = native_sparse_default_exception_row(row, normalization).unwrap();
+            let bytes = native_sparse_default_byte_exception_row(
+                row,
+                &byte_classes,
+                normalization,
+            )
+            .unwrap();
+            assert_eq!(class.0, row[0]);
+            assert_eq!(class.2, 1);
+            assert_eq!(bytes.0, row[1]);
+            assert_eq!(bytes.2, 1);
+            assert_eq!(bytes.1[0], Some((u8::MAX, row[0])));
+        }
+        for architecture in [Architecture::X86_64, Architecture::Aarch64] {
+            let plan = derive_native_default_exception_plan(
+                skew,
+                Some(SKEW_ROWS + 1),
+                false,
+                architecture,
+            )
+            .unwrap();
+            assert_eq!(plan.keys, NativeDefaultExceptionKeys::Bytes, "{architecture:?}");
+            assert_eq!(plan.exception_capacity, 1, "{architecture:?}");
+            assert_eq!(plan.cells, NativeCellEncoding::Compact16, "{architecture:?}");
+            assert_eq!(plan.row_bytes, 6, "{architecture:?}");
+            assert_eq!(
+                native_machine_bytes(
+                    plan.keys.transitions(plan.exception_capacity),
+                    plan.cells,
+                    skew.class_count,
+                    SKEW_ROWS,
+                    0,
+                ),
+                Some(600),
+                "{architecture:?}",
+            );
+        }
+
+        // A global-only comparison is insufficient: row zero establishes the
+        // same maximum (68) for both key domains, while every later row grows
+        // from 60 class exceptions to 68 raw-byte exceptions. Retaining class
+        // keys preserves all future row-local short-tier opportunities.
+        const PROFILE_CLASSES: usize = 128;
+        let mut profile_byte_classes = [0_u8; CLASS_MAP_BYTES];
+        for (byte, class) in profile_byte_classes[..188].iter_mut().enumerate() {
+            *class = u8::try_from(60 + byte % 60).unwrap();
+        }
+        for (class, byte) in (0..60).zip(188..248) {
+            profile_byte_classes[byte] = u8::try_from(class).unwrap();
+        }
+        for (class, byte) in (120..128).zip(248..256) {
+            profile_byte_classes[byte] = u8::try_from(class).unwrap();
+        }
+        let profile_representatives: [u8; PROFILE_CLASSES] = core::array::from_fn(|class| {
+            u8::try_from(
+                profile_byte_classes
+                    .iter()
+                    .position(|&actual| usize::from(actual) == class)
+                    .unwrap(),
+            )
+            .unwrap()
+        });
+        let a = ForwardCell::new(0, false);
+        let b = ForwardCell::new(1, true);
+        let mut profile_forward_cells = Vec::with_capacity(SKEW_ROWS * PROFILE_CLASSES);
+        for state in 0..SKEW_ROWS {
+            for class in 0..PROFILE_CLASSES {
+                let cell = if state == 0 {
+                    match class {
+                        0..60 => a,
+                        60..120 => b,
+                        _ => ForwardCell::new(u32::try_from(class - 118).unwrap(), class % 2 == 0),
+                    }
+                } else if matches!(class, 0..60 | 120..128) {
+                    a
+                } else {
+                    b
+                };
+                profile_forward_cells.push(cell);
+            }
+        }
+        let profile = NativeDfaView {
+            initial_state: 0,
+            initial_pending: false,
+            initial_terminal: false,
+            byte_classes: &profile_byte_classes,
+            class_count: PROFILE_CLASSES,
+            class_representatives: &profile_representatives,
+            forward_cells: &profile_forward_cells,
+            reverse_initial: None,
+            reverse_cells: &[],
+        };
+        let profile_normalization =
+            NativeDefaultExceptionNormalization::new(SKEW_ROWS, SKEW_ROWS + 1, false).unwrap();
+        let first_class = native_sparse_default_exception_row(
+            &profile_forward_cells[..PROFILE_CLASSES],
+            profile_normalization,
+        )
+        .unwrap();
+        let first_bytes = native_sparse_default_byte_exception_row(
+            &profile_forward_cells[..PROFILE_CLASSES],
+            &profile_byte_classes,
+            profile_normalization,
+        )
+        .unwrap();
+        let second_class = native_sparse_default_exception_row(
+            &profile_forward_cells[PROFILE_CLASSES..2 * PROFILE_CLASSES],
+            profile_normalization,
+        )
+        .unwrap();
+        let second_bytes = native_sparse_default_byte_exception_row(
+            &profile_forward_cells[PROFILE_CLASSES..2 * PROFILE_CLASSES],
+            &profile_byte_classes,
+            profile_normalization,
+        )
+        .unwrap();
+        assert_eq!((first_class.2, first_bytes.2), (68, 68));
+        assert_eq!((second_class.2, second_bytes.2), (60, 68));
+        for architecture in [Architecture::X86_64, Architecture::Aarch64] {
+            let plan = derive_native_default_exception_plan(
+                profile,
+                Some(SKEW_ROWS + 1),
+                false,
+                architecture,
+            )
+            .unwrap();
+            assert_eq!(plan.keys, NativeDefaultExceptionKeys::Classes, "{architecture:?}");
+            assert_eq!(plan.exception_capacity, 68, "{architecture:?}");
         }
     }
 
@@ -59529,9 +59767,9 @@ int main(void){{
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "both target families, every logical state, and every byte share one exact composed-table oracle"
+        reason = "both sparse key domains, both target families, every logical state, and every byte share one exact composed-table oracle"
     )]
-    fn exact_rows_compose_with_class_sparse_records_exhaustively() {
+    fn exact_rows_compose_with_deterministic_sparse_records_exhaustively() {
         let compiled = compile_uniform_default_base(OutputContract::SelectedEnd);
         let base = compiled
             .program()
@@ -59698,11 +59936,57 @@ int main(void){{
                 }
             }
 
+            // The five exceptional graph classes each own two raw bytes. A
+            // valid byte-modal record therefore has ten slots. Exact row
+            // equality proves that its default, ascending keys, and values
+            // are identical for every semantic alias just as for class keys.
+            let representative = &view.dfa.forward_cells[..view.dfa.class_count];
+            let normalization = NativeDefaultExceptionNormalization::new(
+                ExactSparseComposeFixture::COMPLETE_ROWS,
+                ExactSparseComposeFixture::DISCOVERED_STATES,
+                false,
+            )
+            .unwrap();
+            let raw_row = native_sparse_default_byte_exception_row(
+                representative,
+                view.dfa.byte_classes,
+                normalization,
+            )
+            .unwrap();
+            assert_eq!(raw_row.2, 10);
+            assert!(raw_row.1[..raw_row.2]
+                .windows(2)
+                .all(|pair| pair[0].unwrap().0 < pair[1].unwrap().0));
+            let raw_capacity = u8::try_from(raw_row.2).unwrap();
+            let raw_transitions = NativeDefaultExceptionKeys::Bytes.transitions(raw_capacity);
+            let (raw_cells, raw_row_bytes) = select_native_default_exception_encoding(
+                raw_transitions,
+                raw_capacity,
+                ExactSparseComposeFixture::COMPLETE_ROWS,
+                ExactSparseComposeFixture::DISCOVERED_STATES
+                    - ExactSparseComposeFixture::COMPLETE_ROWS,
+            )
+            .unwrap();
             let raw_sparse = NativeDefaultExceptionPlan {
+                exception_capacity: raw_capacity,
                 keys: NativeDefaultExceptionKeys::Bytes,
-                ..sparse_plan
+                cells: raw_cells,
+                row_bytes: raw_row_bytes,
             };
-            assert!(matches!(
+            let raw_uninterned =
+                build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
+                    view,
+                    architecture,
+                    NativeVectorFilterCostModel::Established,
+                    true,
+                    usize::MAX,
+                    Some(raw_sparse),
+                    None,
+                    false,
+                    None,
+                )
+                .unwrap();
+            let raw_composed =
                 build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
                     view,
                     architecture,
@@ -59713,11 +59997,91 @@ int main(void){{
                     Some(&exact_rows),
                     false,
                     None,
+                )
+                .unwrap();
+            assert!(raw_composed.0.len() < raw_uninterned.0.len(), "{architecture:?}");
+            assert_eq!(
+                raw_composed,
+                build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
+                    view,
+                    architecture,
+                    NativeVectorFilterCostModel::Established,
+                    true,
+                    raw_composed.0.len(),
+                    Some(raw_sparse),
+                    Some(&exact_rows),
+                    false,
+                    None,
+                )
+                .unwrap(),
+                "{architecture:?}",
+            );
+            assert!(matches!(
+                build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
+                    view,
+                    architecture,
+                    NativeVectorFilterCostModel::Established,
+                    true,
+                    raw_composed.0.len() - 1,
+                    Some(raw_sparse),
+                    Some(&exact_rows),
+                    false,
+                    None,
                 ),
-                Err(ObjectError::InvalidModule(
-                    "exact native row interning has an invalid partial shape"
-                )),
+                Err(ObjectError::Resource {
+                    resource: crate::CompileResource::ProgramBytes,
+                    limit,
+                    ..
+                }) if limit == raw_composed.0.len() - 1
             ));
+
+            let data = &raw_composed.0;
+            let layout = raw_composed.1;
+            assert_eq!(
+                layout.transitions,
+                TransitionLayout::DefaultByteSparseExceptions(raw_capacity),
+                "{architecture:?}",
+            );
+            assert_eq!(layout.cells, raw_cells, "{architecture:?}");
+            assert_eq!(layout.forward_offset, 0, "{architecture:?}");
+            assert_eq!(
+                usize::try_from(layout.reverse_offset).unwrap(),
+                raw_row_bytes,
+                "{architecture:?}",
+            );
+            let partial = layout.partial.expect("raw exact sparse partial layout");
+            for logical_state in 0..ExactSparseComposeFixture::COMPLETE_ROWS {
+                let physical_state = exact_rows.physical_state(logical_state).unwrap();
+                for byte in u8::MIN..=u8::MAX {
+                    let actual = scalable_default_exception_packed_at(
+                        data,
+                        layout,
+                        view,
+                        physical_state,
+                        byte,
+                    );
+                    let class = usize::from(view.dfa.byte_classes[usize::from(byte)]);
+                    let semantic = view.dfa.forward_cells
+                        [logical_state * ExactSparseComposeFixture::CLASS_COUNT + class];
+                    let expected = pack_native_partial_forward_cell_with_exact_rows(
+                        semantic.next(),
+                        semantic.accepted(),
+                        0,
+                        raw_row_bytes,
+                        ExactSparseComposeFixture::COMPLETE_ROWS,
+                        layout.has_start_scanner(),
+                        layout.loop_skip.map(|plan| plan.state),
+                        partial,
+                        layout.cells,
+                        Some(&exact_rows),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        actual, expected,
+                        "raw/{architecture:?}/logical={logical_state}/byte={byte}",
+                    );
+                }
+            }
         }
     }
 
