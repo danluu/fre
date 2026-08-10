@@ -941,6 +941,8 @@ const PARTIAL_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v2";
 const SLOW_PREFIX_CONTINUE_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_continue_v1";
+const SLOW_PREFIX_FUSED_CONTINUE_RUNTIME_SYMBOL_NAME: &str =
+    "fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_continue_v2";
 const SLOW_PREFIX_PREFLIGHT_V1_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_preflight_v1";
 const PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME: &str =
@@ -1130,6 +1132,7 @@ struct PreparedNativeEntryLayout {
     dynamic_rows: bool,
     slow_prefix: bool,
     slow_prefix_resume: bool,
+    deferred_static_prefix_hole: bool,
 }
 
 impl CompiledModule {
@@ -1846,7 +1849,9 @@ impl CompiledModule {
                             .map_err(|_| ObjectError::ArithmeticOverflow("partial native core size"))?,
                     });
                     symbols.push(ModuleSymbol {
-                        name: if prepared.slow_prefix_resume {
+                        name: if prepared.deferred_static_prefix_hole {
+                            SLOW_PREFIX_FUSED_CONTINUE_RUNTIME_SYMBOL_NAME
+                        } else if prepared.slow_prefix_resume {
                             SLOW_PREFIX_CONTINUE_RUNTIME_SYMBOL_NAME
                         } else {
                             PARTIAL_RUNTIME_SYMBOL_NAME
@@ -1866,23 +1871,39 @@ impl CompiledModule {
                         offset: 0,
                         size: 0,
                     });
-                    symbols.push(ModuleSymbol {
-                        name: if prepared.dynamic_rows {
-                            DYNAMIC_ROWS_PREFLIGHT_RUNTIME_SYMBOL_NAME
-                        } else if prepared.slow_prefix_resume {
-                            SLOW_PREFIX_PREFLIGHT_RUNTIME_SYMBOL_NAME
-                        } else if prepared.slow_prefix {
-                            SLOW_PREFIX_PREFLIGHT_V1_RUNTIME_SYMBOL_NAME
-                        } else {
-                            PREPARED_PREFLIGHT_RUNTIME_SYMBOL_NAME
-                        }
-                        .to_owned(),
-                        binding: SymbolBinding::Global,
-                        kind: SymbolKind::Function,
-                        section: None,
-                        offset: 0,
-                        size: 0,
-                    });
+                    if prepared.deferred_static_prefix_hole {
+                        symbols.push(ModuleSymbol {
+                            name: ".Lfre_aot_regex_static_prefix_no_eager_preflight_v1"
+                                .to_owned(),
+                            binding: SymbolBinding::Local,
+                            kind: SymbolKind::Object,
+                            section: Some(PROGRAM_SECTION),
+                            offset: u64::try_from(prepared.identity_offset).map_err(|_| {
+                                ObjectError::ArithmeticOverflow(
+                                    "deferred static-prefix preflight placeholder offset",
+                                )
+                            })?,
+                            size: 0,
+                        });
+                    } else {
+                        symbols.push(ModuleSymbol {
+                            name: if prepared.dynamic_rows {
+                                DYNAMIC_ROWS_PREFLIGHT_RUNTIME_SYMBOL_NAME
+                            } else if prepared.slow_prefix_resume {
+                                SLOW_PREFIX_PREFLIGHT_RUNTIME_SYMBOL_NAME
+                            } else if prepared.slow_prefix {
+                                SLOW_PREFIX_PREFLIGHT_V1_RUNTIME_SYMBOL_NAME
+                            } else {
+                                PREPARED_PREFLIGHT_RUNTIME_SYMBOL_NAME
+                            }
+                            .to_owned(),
+                            binding: SymbolBinding::Global,
+                            kind: SymbolKind::Function,
+                            section: None,
+                            offset: 0,
+                            size: 0,
+                        });
+                    }
                     if prepared.dynamic_rows {
                         if symbols.len() != DYNAMIC_ROWS_DEOPT_RUNTIME_SYMBOL {
                             return Err(ObjectError::InvalidModule(
@@ -2742,6 +2763,7 @@ fn lower_native_dynamic_rows_prepared(
                 dynamic_rows: true,
                 slow_prefix: false,
                 slow_prefix_resume: false,
+                deferred_static_prefix_hole: false,
             }),
         },
     ))
@@ -3559,6 +3581,7 @@ fn lower_native_slow_partial_prepared_with_data_limit(
                 dynamic_rows: false,
                 slow_prefix: true,
                 slow_prefix_resume: resume.is_some(),
+                deferred_static_prefix_hole: defer_preflight && resume.is_some(),
             }),
         },
     )))
@@ -3960,6 +3983,7 @@ fn lower_native_partial_prepared(
                 dynamic_rows: false,
                 slow_prefix: false,
                 slow_prefix_resume: false,
+                deferred_static_prefix_hole: false,
             }),
         },
     )))
@@ -3988,6 +4012,13 @@ fn native_module_digest(
         if prepared.slow_prefix_resume && !prepared.slow_prefix {
             return Err(ObjectError::InvalidModule(
                 "static-prefix resume layout has no static prefix",
+            ));
+        }
+        if prepared.deferred_static_prefix_hole
+            && (!prepared.slow_prefix_resume || !prepared.slow_prefix || prepared.dynamic_rows)
+        {
+            return Err(ObjectError::InvalidModule(
+                "deferred static-prefix hole layout has an incompatible prepared mode",
             ));
         }
     }
@@ -4062,6 +4093,11 @@ fn native_module_digest(
             .any(|relocation| relocation.symbol == PARTIAL_RUNTIME_SYMBOL)
         {
             let partial_symbol_name = match prepared_layout.map(|layout| layout.kind) {
+                Some(PreparedEntryKind::Native(prepared))
+                    if prepared.deferred_static_prefix_hole =>
+                {
+                    SLOW_PREFIX_FUSED_CONTINUE_RUNTIME_SYMBOL_NAME
+                }
                 Some(PreparedEntryKind::Native(prepared)) if prepared.slow_prefix_resume => {
                     SLOW_PREFIX_CONTINUE_RUNTIME_SYMBOL_NAME
                 }
@@ -14219,6 +14255,19 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
     defer_preflight: bool,
 ) -> Result<NativeSlowPartialWrapper, ObjectError> {
     let frame_bytes = if defer_preflight { 104 } else { 72 };
+    // Deferred holes use their first five frame words as the SysV outgoing
+    // identity, descriptor, state, position, and pending arguments for the
+    // fused eleven-argument boundary. Eager objects keep their established
+    // smaller layout and register-heavy V1 continuation call.
+    let saved_handle_offset = if defer_preflight { 0x28 } else { 0x10 };
+    let saved_haystack_offset = if defer_preflight { 0x30 } else { 0x18 };
+    let saved_length_offset = if defer_preflight { 0x38 } else { 0x20 };
+    let saved_start_offset = if defer_preflight { 0x40 } else { 0x28 };
+    let saved_end_offset = if defer_preflight { 0x48 } else { 0x30 };
+    let saved_result_offset = if defer_preflight { 0x50 } else { 0x38 };
+    let deferred_state_offset = 0x10;
+    let resume_position_offset = if defer_preflight { 0x18 } else { 0x40 };
+    let deferred_pending_offset = 0x20;
     let mut assembler = X86Assembler::new();
     let preflight_enter = assembler.label()?;
     let native_match = assembler.label()?;
@@ -14342,12 +14391,12 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
     // slots. The deferred frame adds three private words so a hole can retain
     // its frontier across lazy admission.
     assembler.instruction(&[0x48, 0x83, 0xec, frame_bytes])?;
-    assembler.instruction(&[0x48, 0x89, 0x7c, 0x24, 0x10])?; // handle
-    assembler.instruction(&[0x48, 0x89, 0x74, 0x24, 0x18])?; // haystack
-    assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x20])?; // length
-    assembler.instruction(&[0x48, 0x89, 0x4c, 0x24, 0x28])?; // start
-    assembler.instruction(&[0x4c, 0x89, 0x44, 0x24, 0x30])?; // end
-    assembler.instruction(&[0x4c, 0x89, 0x4c, 0x24, 0x38])?; // result
+    assembler.instruction(&[0x48, 0x89, 0x7c, 0x24, saved_handle_offset])?;
+    assembler.instruction(&[0x48, 0x89, 0x74, 0x24, saved_haystack_offset])?;
+    assembler.instruction(&[0x48, 0x89, 0x54, 0x24, saved_length_offset])?;
+    assembler.instruction(&[0x48, 0x89, 0x4c, 0x24, saved_start_offset])?;
+    assembler.instruction(&[0x4c, 0x89, 0x44, 0x24, saved_end_offset])?;
+    assembler.instruction(&[0x4c, 0x89, 0x4c, 0x24, saved_result_offset])?;
     let identity_displacement_label = if let Some(displacement) =
         deferred_identity_displacement_label
     {
@@ -14385,11 +14434,11 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
     };
 
     assembler.bind(preflight_enter)?;
-    assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x18])?;
-    assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x20])?;
-    assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x28])?;
-    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x30])?;
-    assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x38])?;
+    assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, saved_haystack_offset])?;
+    assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, saved_length_offset])?;
+    assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, saved_start_offset])?;
+    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, saved_end_offset])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, saved_result_offset])?;
     assembler.instruction(&[0xe8])?;
     let core_call_displacement_label = assembler.label()?;
     assembler.bind(core_call_displacement_label)?;
@@ -14423,10 +14472,10 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
     if let Some(direct_epoch_overflow) = direct_epoch_overflow {
         // Eager V2 admission minted a capability at the current generation.
         // Retire it by generation before publishing a direct result.
-        assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x10])?;
+        assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, saved_handle_offset])?;
         x86_emit_static_prefix_epoch_increment_rax(&mut assembler, direct_epoch_overflow)?;
     }
-    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x38])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, saved_result_offset])?;
     assembler.instruction(&[0x31, 0xc0])?;
     assembler.instruction(&[0x49, 0x89, 0x01])?;
     assembler.instruction(&[0x49, 0x89, 0x41, 0x08])?;
@@ -14436,10 +14485,10 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
     assembler.bind(native_match)?;
     if let Some(direct_epoch_overflow) = direct_epoch_overflow {
         // RAX is scratch here; R10/R11 retain the selected native endpoints.
-        assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x10])?;
+        assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, saved_handle_offset])?;
         x86_emit_static_prefix_epoch_increment_rax(&mut assembler, direct_epoch_overflow)?;
     }
-    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x38])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, saved_result_offset])?;
     match output {
         OutputContract::Exists => {
             assembler.instruction(&[0x31, 0xc0])?;
@@ -14479,12 +14528,12 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
 
     let span_recovery_displacement_label = if let Some(native_span_recovery) = native_span_recovery {
         assembler.bind(native_span_recovery)?;
-        assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x10])?;
-        assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x18])?;
-        assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x20])?;
-        assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x28])?;
-        assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x30])?;
-        assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x38])?;
+        assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, saved_handle_offset])?;
+        assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, saved_haystack_offset])?;
+        assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, saved_length_offset])?;
+        assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, saved_start_offset])?;
+        assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, saved_end_offset])?;
+        assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, saved_result_offset])?;
         assembler.instruction(&[0x4c, 0x89, 0x5c, 0x24, 0x08])?;
         assembler.instruction(&[0xe8])?;
         let displacement = assembler.label()?;
@@ -14499,46 +14548,52 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
 
     let mut resume_tail_call_displacement_label = None;
     let mut continuation_resume_tail_call_displacement_label = None;
-    let mut lazy_preflight_displacement_label = None;
     let resume_runtime_displacement_label = if let Some(native_resume) = native_resume {
         assembler.bind(native_resume)?;
         // The native core returns resume state in r10, first unconsumed
         // position in rdx, and the pending endpoint word in r11. The canonical
         // descriptor determines whether that last word is meaningful.
-        assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x40])?;
+        assembler.instruction(&[
+            0x48,
+            0x89,
+            0x54,
+            0x24,
+            resume_position_offset,
+        ])?;
         let resume_return = assembler.label()?;
         if defer_preflight {
-            // Preserve all three native frontier words across lazy V2
-            // admission. The identity and descriptor already occupy the two
-            // outgoing stack slots established before the local core call.
-            assembler.instruction(&[0x4c, 0x89, 0x54, 0x24, 0x48])?;
-            assembler.instruction(&[0x4c, 0x89, 0x5c, 0x24, 0x50])?;
-            assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x10])?;
-            assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x18])?;
-            assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x20])?;
-            assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x28])?;
-            assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x30])?;
-            assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x38])?;
-            assembler.instruction(&[0xe8])?;
-            let displacement = assembler.label()?;
-            assembler.bind(displacement)?;
-            push_bytes(&mut assembler.code, &[0; 4])?;
-            lazy_preflight_displacement_label = Some(displacement);
-            assembler.instruction(&[0x83, 0xf8, PARTIAL_PREFLIGHT_ENTER_STATUS])?;
-            assembler.branch(&[0x0f, 0x85], resume_return)?;
-            assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x40])?;
-            assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x48])?;
-            assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, 0x50])?;
-            assembler.instruction(&[0x48, 0x89, 0x04, 0x24])?;
+            // The first five frame words are the outgoing stack arguments for
+            // identity, descriptor, state, position, and pending endpoint.
+            // One helper call now authenticates and consumes the hole.
+            assembler.instruction(&[
+                0x4c,
+                0x89,
+                0x54,
+                0x24,
+                deferred_state_offset,
+            ])?;
+            assembler.instruction(&[
+                0x4c,
+                0x89,
+                0x5c,
+                0x24,
+                deferred_pending_offset,
+            ])?;
+            assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, saved_handle_offset])?;
+            assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, saved_haystack_offset])?;
+            assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, saved_length_offset])?;
+            assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, saved_start_offset])?;
+            assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, saved_end_offset])?;
+            assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, saved_result_offset])?;
         } else {
             assembler.instruction(&[0x4c, 0x89, 0x1c, 0x24])?;
             assembler.instruction(&[0x49, 0x89, 0xd1])?;
             assembler.instruction(&[0x4d, 0x89, 0xd0])?;
+            assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, saved_handle_offset])?;
+            assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, saved_haystack_offset])?;
+            assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, saved_length_offset])?;
+            assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, saved_result_offset])?;
         }
-        assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x10])?;
-        assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x18])?;
-        assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x20])?;
-        assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x38])?;
         assembler.instruction(&[0xe8])?;
         let displacement = assembler.label()?;
         assembler.bind(displacement)?;
@@ -14555,13 +14610,13 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
         // Reconstitute the ordinary prepared arguments and pass the three
         // private continuation words in R10 (cursor), R11 (canonical state),
         // and RAX (zero-or-pending endpoint) to the appended local tail.
-        assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x10])?;
-        assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x18])?;
-        assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x20])?;
-        assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x28])?;
-        assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x30])?;
-        assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x38])?;
-        assembler.instruction(&[0x4c, 0x8b, 0x54, 0x24, 0x40])?;
+        assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, saved_handle_offset])?;
+        assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, saved_haystack_offset])?;
+        assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, saved_length_offset])?;
+        assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, saved_start_offset])?;
+        assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, saved_end_offset])?;
+        assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, saved_result_offset])?;
+        assembler.instruction(&[0x4c, 0x8b, 0x54, 0x24, resume_position_offset])?;
         assembler.instruction(&[0x4d, 0x8b, 0x19])?;
         assembler.instruction(&[0x49, 0x8b, 0x41, 0x08])?;
         assembler.instruction(&[0xe8])?;
@@ -14575,13 +14630,13 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
         // Status 8 keeps the public owner base in RDI. The distinct local
         // side entry selects its fixed +664 header after saving that base for
         // fallback and variable-Span recovery helpers.
-        assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x10])?;
-        assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x18])?;
-        assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x20])?;
-        assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x28])?;
-        assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x30])?;
-        assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x38])?;
-        assembler.instruction(&[0x4c, 0x8b, 0x54, 0x24, 0x40])?;
+        assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, saved_handle_offset])?;
+        assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, saved_haystack_offset])?;
+        assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, saved_length_offset])?;
+        assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, saved_start_offset])?;
+        assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, saved_end_offset])?;
+        assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, saved_result_offset])?;
+        assembler.instruction(&[0x4c, 0x8b, 0x54, 0x24, resume_position_offset])?;
         assembler.instruction(&[0x4d, 0x8b, 0x19])?;
         assembler.instruction(&[0x49, 0x8b, 0x41, 0x08])?;
         assembler.instruction(&[0xe8])?;
@@ -14590,7 +14645,7 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
         push_bytes(&mut assembler.code, &[0; 4])?;
         continuation_resume_tail_call_displacement_label = Some(continuation_tail_call);
         assembler.bind(resume_return)?;
-        assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x10])?;
+        assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, saved_handle_offset])?;
         x86_emit_static_prefix_epoch_increment_r10(
             &mut assembler,
             resume_epoch_overflow.ok_or(ObjectError::InvalidModule(
@@ -14616,12 +14671,12 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
     };
 
     assembler.bind(native_deopt)?;
-    assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x10])?;
-    assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x18])?;
-    assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x20])?;
-    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x28])?;
-    assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x30])?;
-    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x38])?;
+    assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, saved_handle_offset])?;
+    assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, saved_haystack_offset])?;
+    assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, saved_length_offset])?;
+    assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, saved_start_offset])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, saved_end_offset])?;
+    assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, saved_result_offset])?;
     assembler.instruction(&[0xe8])?;
     let deopt_displacement_label = assembler.label()?;
     assembler.bind(deopt_displacement_label)?;
@@ -14702,18 +14757,9 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
     let resume_descriptor_displacement = resume_descriptor_displacement_label
         .map(|label| finished.label_offset(label))
         .transpose()?;
-    let preflight_displacement = match (
-        eager_preflight_displacement_label,
-        lazy_preflight_displacement_label,
-    ) {
-        (Some(label), None) | (None, Some(label)) => Some(finished.label_offset(label)?),
-        (None, None) => None,
-        (Some(_), Some(_)) => {
-            return Err(ObjectError::InvalidModule(
-                "x86 static-prefix emitted both eager and lazy preflights",
-            ));
-        }
-    };
+    let preflight_displacement = eager_preflight_displacement_label
+        .map(|label| finished.label_offset(label))
+        .transpose()?;
     let core_call_offset = finished.label_offset(core_call_displacement_label)?;
     let deopt_displacement = finished.label_offset(deopt_displacement_label)?;
     let fallback_displacement = finished.label_offset(fallback_displacement_label)?;
@@ -26885,6 +26931,22 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
 ) -> Result<NativeSlowPartialWrapper, ObjectError> {
     let frame_bytes = if defer_preflight { 96 } else { 64 };
     let return_address_offset = if defer_preflight { 88 } else { 56 };
+    // AAPCS64 supplies the first eight fused-boundary arguments in X0--X7;
+    // deferred frames reserve their first three words for state, position,
+    // and pending endpoint. Eager entries retain their established layout.
+    let saved_handle_offset = if defer_preflight { 24 } else { 0 };
+    let saved_haystack_offset = if defer_preflight { 32 } else { 8 };
+    let saved_length_offset = if defer_preflight { 40 } else { 16 };
+    let saved_start_offset = if defer_preflight { 48 } else { 24 };
+    let saved_end_offset = if defer_preflight { 56 } else { 32 };
+    let saved_result_offset = if defer_preflight { 64 } else { 40 };
+    let deferred_state_offset = 0;
+    let resume_position_offset = if defer_preflight { 8 } else { 48 };
+    let deferred_pending_offset = 16;
+    let load_offset = |offset: i16| {
+        u16::try_from(offset)
+            .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 static-prefix frame offset"))
+    };
     let mut assembler = Aarch64Assembler::new();
     let preflight_enter = assembler.label()?;
     let native_match = assembler.label()?;
@@ -26985,9 +27047,24 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
     assembler.branch_cond(AARCH64_LO, fallback_runtime)?;
 
     assembler.instruction(aarch64_sub_x_imm(31, 31, frame_bytes)?)?;
-    assembler.instruction(aarch64_store_pair_x(0, 1, 31, 0)?)?;
-    assembler.instruction(aarch64_store_pair_x(2, 3, 31, 16)?)?;
-    assembler.instruction(aarch64_store_pair_x(4, 5, 31, 32)?)?;
+    assembler.instruction(aarch64_store_pair_x(
+        0,
+        1,
+        31,
+        saved_handle_offset,
+    )?)?;
+    assembler.instruction(aarch64_store_pair_x(
+        2,
+        3,
+        31,
+        saved_length_offset,
+    )?)?;
+    assembler.instruction(aarch64_store_pair_x(
+        4,
+        5,
+        31,
+        saved_end_offset,
+    )?)?;
     assembler.instruction(aarch64_store_x(30, 31, return_address_offset)?)?;
     let (identity_page, identity_page_offset) = if let Some(relocations) =
         deferred_identity_relocations
@@ -27028,8 +27105,18 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
     };
 
     assembler.bind(preflight_enter)?;
-    assembler.instruction(aarch64_load_pair_x(0, 1, 31, 8)?)?;
-    assembler.instruction(aarch64_load_pair_x(2, 3, 31, 24)?)?;
+    assembler.instruction(aarch64_load_pair_x(
+        0,
+        1,
+        31,
+        saved_haystack_offset,
+    )?)?;
+    assembler.instruction(aarch64_load_pair_x(
+        2,
+        3,
+        31,
+        saved_start_offset,
+    )?)?;
     let core_call_offset = assembler.instruction(0x9400_0000)?;
     assembler.instruction(aarch64_cmp_w_imm(0, 1)?)?;
     assembler.branch_cond(AARCH64_EQ, native_match)?;
@@ -27059,7 +27146,11 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
     if let Some(direct_epoch_overflow) = direct_epoch_overflow {
         // Eager V2 admission minted a capability. Invalidate it before any
         // caller result store; X6/X7 remain available for match endpoints.
-        assembler.instruction(aarch64_load_x_imm(0, 31, 0)?)?;
+        assembler.instruction(aarch64_load_x_imm(
+            0,
+            31,
+            load_offset(saved_handle_offset)?,
+        )?)?;
         aarch64_emit_static_prefix_epoch_increment(
             &mut assembler,
             0,
@@ -27067,7 +27158,7 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
             direct_epoch_overflow,
         )?;
     }
-    assembler.instruction(aarch64_load_x_imm(5, 31, 40)?)?;
+    assembler.instruction(aarch64_load_x_imm(5, 31, saved_result_offset)?)?;
     assembler.instruction(aarch64_store_pair_x(31, 31, 5, 0)?)?;
     assembler.instruction(aarch64_movz_w(0, 0)?)?;
     assembler.instruction(aarch64_load_x_imm(30, 31, return_address_offset)?)?;
@@ -27076,7 +27167,11 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
 
     assembler.bind(native_match)?;
     if let Some(direct_epoch_overflow) = direct_epoch_overflow {
-        assembler.instruction(aarch64_load_x_imm(0, 31, 0)?)?;
+        assembler.instruction(aarch64_load_x_imm(
+            0,
+            31,
+            load_offset(saved_handle_offset)?,
+        )?)?;
         aarch64_emit_static_prefix_epoch_increment(
             &mut assembler,
             0,
@@ -27084,7 +27179,7 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
             direct_epoch_overflow,
         )?;
     }
-    assembler.instruction(aarch64_load_x_imm(5, 31, 40)?)?;
+    assembler.instruction(aarch64_load_x_imm(5, 31, saved_result_offset)?)?;
     match output {
         OutputContract::Exists => {
             assembler.instruction(aarch64_store_pair_x(31, 31, 5, 0)?)?;
@@ -27115,9 +27210,9 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
 
     let span_recovery_relocations = if let Some(native_span_recovery) = native_span_recovery {
         assembler.bind(native_span_recovery)?;
-        assembler.instruction(aarch64_load_pair_x(0, 1, 31, 0)?)?;
-        assembler.instruction(aarch64_load_pair_x(2, 3, 31, 16)?)?;
-        assembler.instruction(aarch64_load_pair_x(4, 5, 31, 32)?)?;
+        assembler.instruction(aarch64_load_pair_x(0, 1, 31, saved_handle_offset)?)?;
+        assembler.instruction(aarch64_load_pair_x(2, 3, 31, saved_length_offset)?)?;
+        assembler.instruction(aarch64_load_pair_x(4, 5, 31, saved_end_offset)?)?;
         let identity_page = assembler.instruction(0x9000_0006)?;
         let identity_page_offset = assembler.instruction(aarch64_add_x_imm(6, 6, 0)?)?;
         let runtime_branch = assembler.instruction(0x9400_0000)?;
@@ -27131,39 +27226,65 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
 
     let mut resume_tail_call = None;
     let mut continuation_resume_tail_call = None;
-    let mut lazy_preflight_branch = None;
     let resume_runtime_branch = if let Some(native_resume) = native_resume {
         assembler.bind(native_resume)?;
         let resume_return = assembler.label()?;
         if defer_preflight {
-            // Preserve the exact frontier across V2 admission. Identity and
-            // descriptor were materialized before entering the local core and
-            // remain immutable in their private frame slots.
-            assembler.instruction(aarch64_store_x(2, 31, 48)?)?;
-            assembler.instruction(aarch64_store_x(6, 31, 56)?)?;
-            assembler.instruction(aarch64_store_x(7, 31, 64)?)?;
-            assembler.instruction(aarch64_load_pair_x(0, 1, 31, 0)?)?;
-            assembler.instruction(aarch64_load_pair_x(2, 3, 31, 16)?)?;
-            assembler.instruction(aarch64_load_pair_x(4, 5, 31, 32)?)?;
-            assembler.instruction(aarch64_load_pair_x(6, 7, 31, 72)?)?;
-            lazy_preflight_branch = Some(assembler.instruction(0x9400_0000)?);
-            assembler.instruction(aarch64_cmp_w_imm(
-                0,
-                u16::from(PARTIAL_PREFLIGHT_ENTER_STATUS),
+            // X0--X7 carry handle, haystack, length, window, result,
+            // identity, and descriptor. The three native frontier words are
+            // the aligned stack arguments consumed by fused V2 continuation.
+            assembler.instruction(aarch64_store_x(
+                6,
+                31,
+                deferred_state_offset,
             )?)?;
-            assembler.branch_cond(AARCH64_NE, resume_return)?;
-            assembler.instruction(aarch64_load_x_imm(5, 31, 48)?)?;
-            assembler.instruction(aarch64_load_x_imm(4, 31, 56)?)?;
-            assembler.instruction(aarch64_load_x_imm(6, 31, 64)?)?;
+            assembler.instruction(aarch64_store_x(
+                2,
+                31,
+                resume_position_offset,
+            )?)?;
+            assembler.instruction(aarch64_store_x(
+                7,
+                31,
+                deferred_pending_offset,
+            )?)?;
+            assembler.instruction(aarch64_load_pair_x(
+                0,
+                1,
+                31,
+                saved_handle_offset,
+            )?)?;
+            assembler.instruction(aarch64_load_pair_x(
+                2,
+                3,
+                31,
+                saved_length_offset,
+            )?)?;
+            assembler.instruction(aarch64_load_pair_x(
+                4,
+                5,
+                31,
+                saved_end_offset,
+            )?)?;
+            assembler.instruction(aarch64_load_pair_x(6, 7, 31, 72)?)?;
         } else {
             assembler.instruction(aarch64_mov_x(5, 2)?)?;
-            assembler.instruction(aarch64_store_x(5, 31, 48)?)?;
+            assembler.instruction(aarch64_store_x(5, 31, resume_position_offset)?)?;
             assembler.instruction(aarch64_mov_x(4, 6)?)?;
             assembler.instruction(aarch64_mov_x(6, 7)?)?;
+            assembler.instruction(aarch64_load_pair_x(
+                0,
+                1,
+                31,
+                saved_handle_offset,
+            )?)?;
+            assembler.instruction(aarch64_load_x_imm(
+                2,
+                31,
+                load_offset(saved_length_offset)?,
+            )?)?;
+            assembler.instruction(aarch64_load_x_imm(3, 31, saved_result_offset)?)?;
         }
-        assembler.instruction(aarch64_load_pair_x(0, 1, 31, 0)?)?;
-        assembler.instruction(aarch64_load_x_imm(2, 31, 16)?)?;
-        assembler.instruction(aarch64_load_x_imm(3, 31, 40)?)?;
         let branch = assembler.instruction(0x9400_0000)?;
         let continuation_resume = assembler.label()?;
         assembler.instruction(aarch64_cmp_w_imm(
@@ -27178,10 +27299,10 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
         assembler.branch_cond(AARCH64_NE, resume_return)?;
         // Rebuild the prepared ABI and carry the authenticated continuation
         // in X8 (cursor), X6 (canonical state), and X7 (pending endpoint).
-        assembler.instruction(aarch64_load_pair_x(0, 1, 31, 0)?)?;
-        assembler.instruction(aarch64_load_pair_x(2, 3, 31, 16)?)?;
-        assembler.instruction(aarch64_load_pair_x(4, 5, 31, 32)?)?;
-        assembler.instruction(aarch64_load_x_imm(8, 31, 48)?)?;
+        assembler.instruction(aarch64_load_pair_x(0, 1, 31, saved_handle_offset)?)?;
+        assembler.instruction(aarch64_load_pair_x(2, 3, 31, saved_length_offset)?)?;
+        assembler.instruction(aarch64_load_pair_x(4, 5, 31, saved_end_offset)?)?;
+        assembler.instruction(aarch64_load_x_imm(8, 31, resume_position_offset)?)?;
         assembler.instruction(aarch64_load_pair_x(6, 7, 5, 0)?)?;
         resume_tail_call = Some(assembler.instruction(0x9400_0000)?);
         assembler.branch(resume_return)?;
@@ -27189,14 +27310,18 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
         assembler.bind(continuation_resume)?;
         // Status 8 enters with the original allocation base in X0. The continuation
         // side entry saves it before selecting the fixed +664 header.
-        assembler.instruction(aarch64_load_pair_x(0, 1, 31, 0)?)?;
-        assembler.instruction(aarch64_load_pair_x(2, 3, 31, 16)?)?;
-        assembler.instruction(aarch64_load_pair_x(4, 5, 31, 32)?)?;
-        assembler.instruction(aarch64_load_x_imm(8, 31, 48)?)?;
+        assembler.instruction(aarch64_load_pair_x(0, 1, 31, saved_handle_offset)?)?;
+        assembler.instruction(aarch64_load_pair_x(2, 3, 31, saved_length_offset)?)?;
+        assembler.instruction(aarch64_load_pair_x(4, 5, 31, saved_end_offset)?)?;
+        assembler.instruction(aarch64_load_x_imm(8, 31, resume_position_offset)?)?;
         assembler.instruction(aarch64_load_pair_x(6, 7, 5, 0)?)?;
         continuation_resume_tail_call = Some(assembler.instruction(0x9400_0000)?);
         assembler.bind(resume_return)?;
-        assembler.instruction(aarch64_load_x_imm(9, 31, 0)?)?;
+        assembler.instruction(aarch64_load_x_imm(
+            9,
+            31,
+            load_offset(saved_handle_offset)?,
+        )?)?;
         aarch64_emit_static_prefix_epoch_increment(
             &mut assembler,
             9,
@@ -27223,9 +27348,9 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
     };
 
     assembler.bind(native_deopt)?;
-    assembler.instruction(aarch64_load_pair_x(0, 1, 31, 0)?)?;
-    assembler.instruction(aarch64_load_pair_x(2, 3, 31, 16)?)?;
-    assembler.instruction(aarch64_load_pair_x(4, 5, 31, 32)?)?;
+    assembler.instruction(aarch64_load_pair_x(0, 1, 31, saved_handle_offset)?)?;
+    assembler.instruction(aarch64_load_pair_x(2, 3, 31, saved_length_offset)?)?;
+    assembler.instruction(aarch64_load_pair_x(4, 5, 31, saved_end_offset)?)?;
     let deopt_branch = assembler.instruction(0x9400_0000)?;
     assembler.instruction(aarch64_load_x_imm(30, 31, return_address_offset)?)?;
     assembler.instruction(aarch64_add_x_imm(31, 31, frame_bytes)?)?;
@@ -27284,19 +27409,11 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
         deopt_branch,
         fallback_branch,
     ];
-    let preflight_index = match (eager_preflight_branch, lazy_preflight_branch) {
-        (Some(branch), None) | (None, Some(branch)) => {
+    let preflight_index = eager_preflight_branch.map(|branch| {
             let index = relocation_offsets.len();
             relocation_offsets.push(branch);
-            Some(index)
-        }
-        (None, None) => None,
-        (Some(_), Some(_)) => {
-            return Err(ObjectError::InvalidModule(
-                "AArch64 static-prefix emitted both eager and lazy preflights",
-            ));
-        }
-    };
+            index
+        });
     let resume_indices = match (
         resume_descriptor_relocations,
         resume_runtime_branch,
@@ -47196,7 +47313,7 @@ int main(void){{
     }
 
     #[test]
-    fn deferred_static_prefix_preflight_is_structural_and_cross_target() {
+    fn fused_deferred_static_prefix_hole_is_structural_and_cross_target() {
         assert!(static_prefix_can_defer_preflight(
             OutputContract::Exists,
             None,
@@ -47248,14 +47365,18 @@ int main(void){{
                 .unwrap_or_else(|error| {
                     panic!("deferred wrapper {architecture:?}/{output:?}: {error}")
                 });
-                let preflight = deferred
+                let preflight_count = deferred
                     .relocations
                     .iter()
-                    .filter(|relocation| {
-                        relocation.symbol == PREPARED_PREFLIGHT_RUNTIME_SYMBOL
-                    })
+                    .filter(|relocation| relocation.symbol == PREPARED_PREFLIGHT_RUNTIME_SYMBOL)
+                    .count();
+                assert_eq!(preflight_count, 0, "{architecture:?}/{output:?}");
+                let fused = deferred
+                    .relocations
+                    .iter()
+                    .filter(|relocation| relocation.symbol == PARTIAL_RUNTIME_SYMBOL)
                     .collect::<Vec<_>>();
-                assert_eq!(preflight.len(), 1, "{architecture:?}/{output:?}");
+                assert_eq!(fused.len(), 1, "{architecture:?}/{output:?}");
                 assert_eq!(
                     deferred
                         .relocations
@@ -47267,10 +47388,10 @@ int main(void){{
                     2,
                     "guard and resume-wrap retirement branches: {architecture:?}/{output:?}"
                 );
-                let preflight_offset = usize::try_from(preflight[0].offset).unwrap();
+                let fused_offset = usize::try_from(fused[0].offset).unwrap();
                 assert!(
-                    preflight_offset > deferred.core_call_offset,
-                    "lazy preflight must follow the native call: {architecture:?}/{output:?}"
+                    fused_offset > deferred.core_call_offset,
+                    "fused hole continuation must follow the native call: {architecture:?}/{output:?}"
                 );
                 assert!(deferred.relocations.iter().all(|relocation| {
                     relocation.symbol != PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL
@@ -47318,6 +47439,16 @@ int main(void){{
                         assert!(prefix
                             .windows(store.len())
                             .any(|bytes| bytes == store.as_slice()));
+                        for frontier_store in [
+                            [0x4c, 0x89, 0x54, 0x24, 0x10],
+                            [0x48, 0x89, 0x54, 0x24, 0x18],
+                            [0x4c, 0x89, 0x5c, 0x24, 0x20],
+                        ] {
+                            assert!(deferred
+                                .code
+                                .windows(frontier_store.len())
+                                .any(|bytes| bytes == frontier_store));
+                        }
                     }
                     Architecture::Aarch64 => {
                         let words = deferred
@@ -47360,6 +47491,25 @@ int main(void){{
                         assert!(prefix.contains(&aarch64_load_x_imm(8, 0, epoch).unwrap()));
                         assert!(prefix.contains(&aarch64_add_x_imm(8, 8, 1).unwrap()));
                         assert!(prefix.contains(&aarch64_store_x(8, 0, epoch).unwrap()));
+                        for frontier_store in [
+                            // The assembler fuses the adjacent state/position
+                            // stores into one pair before final emission.
+                            aarch64_store_pair_x(6, 2, 31, 0).unwrap(),
+                            aarch64_store_x(7, 31, 16).unwrap(),
+                        ] {
+                            assert!(
+                                words.contains(&frontier_store),
+                                "missing AArch64 frontier store {frontier_store:#x}: {output:?}"
+                            );
+                        }
+                        for argument_load in [
+                            aarch64_load_pair_x(0, 1, 31, 24).unwrap(),
+                            aarch64_load_pair_x(2, 3, 31, 40).unwrap(),
+                            aarch64_load_pair_x(4, 5, 31, 56).unwrap(),
+                            aarch64_load_pair_x(6, 7, 31, 72).unwrap(),
+                        ] {
+                            assert!(words.contains(&argument_load));
+                        }
                     }
                 }
             }
@@ -47793,6 +47943,16 @@ int main(void){{
             // it with the persistent prepared fallback; one byte below that
             // exact hybrid boundary preserves the ordinary prepared route.
             let serialized = compiled.program().serialize().unwrap();
+            let has_complete_preflight_proofs = compiled
+                .program()
+                .compiler_private_static_prefix_complete_proofs_should_run(
+                    PARTIAL_DFA_MIN_INPUT_BYTES,
+                );
+            let expects_fused_hole = static_prefix_can_defer_preflight(
+                output,
+                compiled.program().exact_match_width(),
+                has_complete_preflight_proofs,
+            );
             for target in identity_target_matrix() {
                 let materialized = compiled
                     .program()
@@ -47818,7 +47978,11 @@ int main(void){{
                     assert!(declined.prepared_entry_symbol().is_some());
                     assert_eq!(
                         declined.required_prepared_runtime_symbol(),
-                        Some(SLOW_PREFIX_CONTINUE_RUNTIME_SYMBOL_NAME)
+                        Some(if expects_fused_hole {
+                            SLOW_PREFIX_FUSED_CONTINUE_RUNTIME_SYMBOL_NAME
+                        } else {
+                            SLOW_PREFIX_CONTINUE_RUNTIME_SYMBOL_NAME
+                        })
                     );
                     assert_eq!(
                         declined.required_prepared_fallback_runtime_symbol(),
@@ -47826,7 +47990,8 @@ int main(void){{
                     );
                     assert_eq!(
                         declined.required_prepared_preflight_runtime_symbol(),
-                        Some(SLOW_PREFIX_PREFLIGHT_RUNTIME_SYMBOL_NAME)
+                        (!expects_fused_hole)
+                            .then_some(SLOW_PREFIX_PREFLIGHT_RUNTIME_SYMBOL_NAME)
                     );
                     continue;
                 };
@@ -47877,6 +48042,11 @@ int main(void){{
                     panic!("static-prefix hybrid has no native layout: {output:?}/{target:?}");
                 };
                 assert!(hybrid_layout.slow_prefix_resume);
+                assert_eq!(
+                    hybrid_layout.deferred_static_prefix_hole,
+                    expects_fused_hole,
+                    "deferred hole layout: {output:?}/{target:?}"
+                );
                 let tail_alignment_mask = match target.architecture {
                     Architecture::X86_64 => 15,
                     Architecture::Aarch64 => 3,
@@ -47975,7 +48145,11 @@ int main(void){{
                 assert!(constrained.prepared_entry_symbol().is_some());
                 assert_eq!(
                     constrained.required_prepared_runtime_symbol(),
-                    Some(SLOW_PREFIX_CONTINUE_RUNTIME_SYMBOL_NAME)
+                    Some(if expects_fused_hole {
+                        SLOW_PREFIX_FUSED_CONTINUE_RUNTIME_SYMBOL_NAME
+                    } else {
+                        SLOW_PREFIX_CONTINUE_RUNTIME_SYMBOL_NAME
+                    })
                 );
                 assert_eq!(
                     constrained
@@ -48014,7 +48188,34 @@ int main(void){{
                 );
                 assert_eq!(
                     constrained.required_prepared_preflight_runtime_symbol(),
-                    Some(SLOW_PREFIX_PREFLIGHT_RUNTIME_SYMBOL_NAME)
+                    (!expects_fused_hole)
+                        .then_some(SLOW_PREFIX_PREFLIGHT_RUNTIME_SYMBOL_NAME)
+                );
+                assert_eq!(
+                    constrained
+                        .relocations()
+                        .iter()
+                        .filter(|relocation| {
+                            relocation.symbol == PREPARED_PREFLIGHT_RUNTIME_SYMBOL
+                        })
+                        .count(),
+                    usize::from(!expects_fused_hole),
+                    "static-prefix eager preflight relocation: {output:?}/{target:?}"
+                );
+                let hole_symbol = &constrained.symbols()[PARTIAL_RUNTIME_SYMBOL];
+                assert_eq!(
+                    hole_symbol.name,
+                    if expects_fused_hole {
+                        SLOW_PREFIX_FUSED_CONTINUE_RUNTIME_SYMBOL_NAME
+                    } else {
+                        SLOW_PREFIX_CONTINUE_RUNTIME_SYMBOL_NAME
+                    }
+                );
+                let preflight_symbol = &constrained.symbols()[PREPARED_PREFLIGHT_RUNTIME_SYMBOL];
+                assert_eq!(
+                    preflight_symbol.section.is_some(),
+                    expects_fused_hole,
+                    "deferred slot 10 must be local and noncallable: {output:?}/{target:?}"
                 );
                 assert_eq!(
                     constrained.required_prepared_span_recovery_runtime_symbol(),
@@ -51921,10 +52122,13 @@ int main(void){{
                 assert!(view.exact_match_width.is_none());
             }
             let serialized = fast.program().serialize().expect("serialize forged-V4 program");
+            let resume_view = candidate
+                .resume_view()
+                .expect("forged-V4 static-prefix resume descriptor");
             let direct = lower_optional_native_slow_partial_prepared_with_data_limit(
                 &serialized,
                 view,
-                candidate.resume_view(),
+                Some(resume_view),
                 fast.program().artifact_identity(),
                 fast.program()
                     .compiler_private_static_prefix_complete_proofs_should_run(
@@ -51935,6 +52139,18 @@ int main(void){{
             )
             .expect("lower forged-V4 static-prefix hybrid")
             .expect("forged-V4 hybrid fits");
+            let PreparedEntryKind::Native(direct_layout) = direct.1.kind else {
+                panic!("forged-V4 hybrid has no native prepared layout");
+            };
+            let descriptor_offset = direct_layout
+                .table_offset
+                .checked_add(direct_layout.table_size)
+                .and_then(|end| end.checked_add(15))
+                .expect("forged-V4 descriptor alignment")
+                & !15;
+            let descriptor_delta = descriptor_offset
+                .checked_sub(direct_layout.table_offset)
+                .expect("forged-V4 descriptor follows table");
             let native_data_bytes = direct
                 .0
                 .data
@@ -51952,6 +52168,9 @@ int main(void){{
             module.symbols[PARTIAL_IDENTITY_SYMBOL].name =
                 "fre_test_static_prefix_identity".to_owned();
             module.symbols[PARTIAL_IDENTITY_SYMBOL].binding = SymbolBinding::Global;
+            module.symbols[PARTIAL_TABLE_SYMBOL].name =
+                "fre_test_static_prefix_table".to_owned();
+            module.symbols[PARTIAL_TABLE_SYMBOL].binding = SymbolBinding::Global;
 
             let long_len = PARTIAL_DFA_MIN_INPUT_BYTES + 64;
             let hole_haystack = generated_byte_strings(
@@ -52037,21 +52256,23 @@ _Static_assert(offsetof(prepared_t,continuation)=={second_offset}U,"continuation
 _Static_assert(offsetof(prepared_t,invocation_epoch)=={epoch_offset}U,"static-prefix epoch offset");
 extern uint32_t {entry}(handle_t,const unsigned char*,size_t,size_t,size_t,result_t*);
 extern const unsigned char fre_test_static_prefix_identity[];
+extern const unsigned char fre_test_static_prefix_table[];
 static const unsigned char identity[32]={{{identity}}};
 static const unsigned char haystack[]={{{haystack}}};
 static uint16_t rows[2];static uint32_t reverse_rows[256];static uint8_t loop_index[2],scanner_cookie;static prepared_t prepared;
 #define frozen_v4 prepared.continuation.v4
 #define frozen_v6 prepared.continuation.v6
-static size_t observed_cursor;static unsigned preflight_calls,continue_calls,recovery_calls,fallback_calls,helper_calls,helper_bad,retire_calls;static int loop_case;static uint32_t preflight_status;
+static size_t observed_cursor,observed_state,observed_pending;static unsigned preflight_calls,continue_calls,fused_calls,recovery_calls,fallback_calls,helper_calls,helper_bad,retire_calls;static int loop_case;static uint32_t preflight_status;
 static unsigned object_ticket,span_postflight_ticket,stale_seen_at_preflight;static uint64_t ticket_epoch,postflight_epoch;
 uint32_t fre_aot_regex_runtime_search_v1(const unsigned char*a,const unsigned char*b,size_t n,size_t s,size_t e,result_t*r){{(void)a;(void)b;(void)n;(void)s;(void)e;(void)r;fallback_calls++;return 97U;}}
 uint32_t fre_aot_regex_runtime_search_exclusive_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;fallback_calls++;return 97U;}}
 uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_preflight_v2(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,const uint32_t*d){{(void)d;preflight_calls++;if(h!=(handle_t)&prepared||p!=haystack||n!=sizeof(haystack)||s!=0U||e!=n||i!=fre_test_static_prefix_identity||memcmp(i,identity,32U)!=0)return 96U;stale_seen_at_preflight=(object_ticket&&ticket_epoch!=prepared.invocation_epoch)||(span_postflight_ticket&&postflight_epoch!=prepared.invocation_epoch);object_ticket=0U;span_postflight_ticket=0U;if(preflight_status==1U){{r->start=111U;r->end=112U;return 1U;}}if(preflight_status!=6U)return preflight_status;object_ticket=1U;ticket_epoch=prepared.invocation_epoch;return 6U;}}
 uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_continue_v1(handle_t h,const unsigned char*p,size_t n,result_t*r,size_t state,size_t position,size_t pending){{(void)state;(void)pending;continue_calls++;if(h!=(handle_t)&prepared||p!=haystack||n!=sizeof(haystack)||position==0U||position>=n||object_ticket!=1U||ticket_epoch!=prepared.invocation_epoch)return 95U;object_ticket=0U;span_postflight_ticket=({mode}U==2U);postflight_epoch=prepared.invocation_epoch;observed_cursor=position;r->start=1U;r->end=loop_case&&{mode}U!=0U?position:0U;return 8U;}}
+uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_continue_v2(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,const uint32_t*d,size_t state,size_t position,size_t pending){{fused_calls++;if(h!=(handle_t)&prepared||p!=haystack||n!=sizeof(haystack)||s!=0U||e!=n||r==NULL||i!=fre_test_static_prefix_identity||memcmp(i,identity,32U)!=0||d!=(const uint32_t*)(const void*)(fre_test_static_prefix_table+{descriptor_delta}U))return 93U;stale_seen_at_preflight=(object_ticket&&ticket_epoch!=prepared.invocation_epoch)||(span_postflight_ticket&&postflight_epoch!=prepared.invocation_epoch);object_ticket=0U;span_postflight_ticket=0U;if(preflight_status==1U){{r->start=111U;r->end=112U;return 1U;}}if(preflight_status!=6U)return preflight_status;if(state>=(size_t)d[3]||position==0U||position>=n)return 92U;const uint32_t*record=d+{resume_header_words}U+state*{resume_state_words}U;if(record[1]==0U||record[2]>1U)return 91U;if(record[2]!=0U&&(pending==0U||pending>position))return 90U;observed_state=state;observed_cursor=position;observed_pending=pending;r->start=1U;r->end=loop_case&&{mode}U!=0U?position:0U;return 8U;}}
 uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_recover_span_v2(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,size_t selected){{recovery_calls++;if(h!=(handle_t)&prepared||p!=haystack||n!=sizeof(haystack)||s!=0U||e!=n||i!=fre_test_static_prefix_identity||memcmp(i,identity,32U)!=0||selected!=observed_cursor+(loop_case?0U:1U)||span_postflight_ticket!=1U||postflight_epoch!=prepared.invocation_epoch)return 94U;span_postflight_ticket=0U;r->start=observed_cursor;r->end=selected;return 1U;}}
 uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_retire_v1(handle_t h,uint32_t status){{retire_calls++;if(h!=(handle_t)&prepared)return 5U;object_ticket=0U;span_postflight_ticket=0U;prepared.invocation_epoch=prepared.invocation_epoch==UINT64_MAX?UINT64_C(1):prepared.invocation_epoch+UINT64_C(1);switch(status){{case 0U:case 1U:case 2U:case 3U:case 5U:return status;default:return 3U;}}}}
 size_t fre_aot_regex_runtime_scan_frozen_loop_v2(const unsigned char*p,const void*s,size_t n){{helper_calls++;if(p<haystack||p>haystack+sizeof(haystack)||s!=(const void*)&scanner_cookie)helper_bad++;return n;}}
-static void reset_observations(void){{observed_cursor=0U;preflight_calls=0U;continue_calls=0U;recovery_calls=0U;fallback_calls=0U;helper_calls=0U;helper_bad=0U;retire_calls=0U;object_ticket=0U;span_postflight_ticket=0U;stale_seen_at_preflight=0U;ticket_epoch=0U;postflight_epoch=0U;preflight_status=6U;prepared.invocation_epoch=UINT64_C(1);memset(prepared.public_header,0,sizeof(prepared.public_header));memcpy(prepared.public_header+{identity_offset}U,identity,32U);}}
+static void reset_observations(void){{observed_cursor=0U;observed_state=SIZE_MAX;observed_pending=SIZE_MAX;preflight_calls=0U;continue_calls=0U;fused_calls=0U;recovery_calls=0U;fallback_calls=0U;helper_calls=0U;helper_bad=0U;retire_calls=0U;object_ticket=0U;span_postflight_ticket=0U;stale_seen_at_preflight=0U;ticket_epoch=0U;postflight_epoch=0U;preflight_status=6U;prepared.invocation_epoch=UINT64_C(1);memset(prepared.public_header,0,sizeof(prepared.public_header));memcpy(prepared.public_header+{identity_offset}U,identity,32U);}}
 static void init_v4(void){{memset(&prepared.continuation,0,sizeof(prepared.continuation));rows[0]=0U;rows[1]=UINT16_C(0x8000);loop_case=0;
   frozen_v4.v1.active_seal=UINT64_C({active_seal});frozen_v4.v1.magic=UINT64_C({magic});
   frozen_v4.v1.abi_version=UINT32_C({abi});frozen_v4.v1.flags=UINT32_C({v4_flag});
@@ -52087,7 +52308,7 @@ static void init_loop(uint32_t format){{memset(&prepared.continuation,0,sizeof(p
   frozen_v6.v6.loop_plans[0].members[0]=UINT64_MAX;frozen_v6.v6.loop_plans[0].members[1]=UINT64_MAX;
   frozen_v6.v6.loop_plans[0].members[2]=0U;frozen_v6.v6.loop_plans[0].members[3]=0U;
   frozen_v6.v6.loop_plans[0].scanner_address=(size_t)(uintptr_t)&scanner_cookie;}}
-#define CHECK_GUARD(expr,want,want_retire,code) do{{reset_observations();result.start=91U;result.end=92U;uint32_t guard_status=(expr);if(guard_status!=(want)||result.start!=91U||result.end!=92U||preflight_calls!=0U||continue_calls!=0U||fallback_calls!=0U||retire_calls!=(want_retire)||prepared.invocation_epoch!=UINT64_C(1)+(want_retire))return(code);}}while(0)
+#define CHECK_GUARD(expr,want,want_retire,code) do{{reset_observations();result.start=91U;result.end=92U;uint32_t guard_status=(expr);if(guard_status!=(want)||result.start!=91U||result.end!=92U||preflight_calls!=0U||continue_calls!=0U||fused_calls!=0U||fallback_calls!=0U||retire_calls!=(want_retire)||prepared.invocation_epoch!=UINT64_C(1)+(want_retire))return(code);}}while(0)
 static int run_deferred_guards(void){{result_t result={{91U,92U}};if({mode}U==2U)return 0;
   CHECK_GUARD({entry}((handle_t)0,haystack,sizeof(haystack),0U,sizeof(haystack),&result),5U,0U,200);
   CHECK_GUARD({entry}((handle_t)&prepared,NULL,sizeof(haystack),0U,sizeof(haystack),&result),2U,1U,201);
@@ -52104,15 +52325,15 @@ static int run_deferred_guards(void){{result_t result={{91U,92U}};if({mode}U==2U
   reset_observations();prepared.invocation_epoch=UINT64_MAX;status={entry}((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),&result);
   if(status!=3U||result.start!=91U||result.end!=92U||preflight_calls!=0U||continue_calls!=0U||retire_calls!=1U||prepared.invocation_epoch!=UINT64_C(1))return 210;
   return 0;}}
-static int run_lazy_preflight_returns(void){{result_t result={{91U,92U}};if({mode}U==2U)return 0;reset_observations();preflight_status=1U;uint32_t status={entry}((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),&result);
-  if(status!=1U||result.start!=111U||result.end!=112U||preflight_calls!=1U||continue_calls!=0U||fallback_calls!=0U||object_ticket!=0U||retire_calls!=0U||prepared.invocation_epoch!=UINT64_C(3))return 220;
+static int run_fused_returns(void){{result_t result={{91U,92U}};if({mode}U==2U)return 0;reset_observations();preflight_status=1U;uint32_t status={entry}((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),&result);
+  if(status!=1U||result.start!=111U||result.end!=112U||preflight_calls!=0U||continue_calls!=0U||fused_calls!=1U||fallback_calls!=0U||object_ticket!=0U||retire_calls!=0U||prepared.invocation_epoch!=UINT64_C(3))return 220;
   reset_observations();preflight_status=3U;result.start=91U;result.end=92U;status={entry}((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),&result);
-  if(status!=3U||result.start!=91U||result.end!=92U||preflight_calls!=1U||continue_calls!=0U||fallback_calls!=0U||object_ticket!=0U||retire_calls!=0U||prepared.invocation_epoch!=UINT64_C(3))return 221;
+  if(status!=3U||result.start!=91U||result.end!=92U||preflight_calls!=0U||continue_calls!=0U||fused_calls!=1U||fallback_calls!=0U||object_ticket!=0U||retire_calls!=0U||prepared.invocation_epoch!=UINT64_C(3))return 221;
   return 0;}}
 static int run_v4(void){{result_t result={{91U,92U}};reset_observations();init_v4();if({mode}U!=2U){{object_ticket=1U;ticket_epoch=prepared.invocation_epoch;}}uint32_t status={entry}((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),&result);
-  if(preflight_calls!=1U)return 10;if(continue_calls!=1U)return 40+(int)status;if(fallback_calls!=0U)return 12;
+  if(preflight_calls!=({mode}U==2U))return 10;if(continue_calls!=({mode}U==2U))return 40+(int)status;if(fused_calls!=({mode}U!=2U))return 60+(int)status;if(fallback_calls!=0U)return 12;
   if({mode}U!=2U&&stale_seen_at_preflight!=1U)return 15;if(retire_calls!=0U||prepared.invocation_epoch!=UINT64_C({final_epoch}))return 16;
-  if(observed_cursor==0U||observed_cursor>=sizeof(haystack))return 13;if(helper_calls!=0U||helper_bad!=0U)return 14;
+  if(observed_cursor==0U||observed_cursor>=sizeof(haystack)){{fprintf(stderr,"v4 mode={mode} status=%u preflight=%u continue=%u fused=%u cursor=%zu\n",status,preflight_calls,continue_calls,fused_calls,observed_cursor);return 13;}}if(helper_calls!=0U||helper_bad!=0U)return 14;
   if({mode}U==0U){{if(status!=1U||result.start!=0U||result.end!=0U||recovery_calls!=0U)return 20;}}
   else if({mode}U==1U){{if(status!=1U||result.start!=observed_cursor+1U||result.end!=observed_cursor+1U||recovery_calls!=0U)return 21;}}
   else {{if(status!=1U||result.start!=observed_cursor||result.end!=observed_cursor+1U||recovery_calls!=1U)return 22;
@@ -52120,8 +52341,8 @@ static int run_v4(void){{result_t result={{91U,92U}};reset_observations();init_v
   if(object_ticket!=0U||span_postflight_ticket!=0U)return 24;
   return 0;}}
 static int run_loop(uint32_t format){{result_t result={{91U,92U}};reset_observations();init_loop(format);uint32_t status={entry}((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),&result);
-  if(preflight_calls!=1U||continue_calls!=1U||fallback_calls!=0U||helper_calls!=1U||helper_bad!=0U)fprintf(stderr,"loop format=%u status=%u preflight=%u continue=%u fallback=%u helper=%u bad=%u cursor=%zu result=%zu,%zu\n",format,status,preflight_calls,continue_calls,fallback_calls,helper_calls,helper_bad,observed_cursor,result.start,result.end);
-  if(preflight_calls!=1U)return 100+(int)format;if(continue_calls!=1U)return 120+(int)status;if(fallback_calls!=0U)return 130+(int)format;
+  if(preflight_calls!=({mode}U==2U)||continue_calls!=({mode}U==2U)||fused_calls!=({mode}U!=2U)||fallback_calls!=0U||helper_calls!=1U||helper_bad!=0U)fprintf(stderr,"loop format=%u status=%u preflight=%u continue=%u fused=%u fallback=%u helper=%u bad=%u cursor=%zu result=%zu,%zu\n",format,status,preflight_calls,continue_calls,fused_calls,fallback_calls,helper_calls,helper_bad,observed_cursor,result.start,result.end);
+  if(preflight_calls!=({mode}U==2U))return 100+(int)format;if(continue_calls!=({mode}U==2U))return 120+(int)status;if(fused_calls!=({mode}U!=2U))return 125+(int)status;if(fallback_calls!=0U)return 130+(int)format;
   if(retire_calls!=0U||prepared.invocation_epoch!=UINT64_C({final_epoch}))return 135+(int)format;
   if(observed_cursor==0U||observed_cursor>=sizeof(haystack))return 140+(int)format;if(helper_calls!=1U||helper_bad!=0U)return 145+(int)format;
   if({mode}U==0U){{if(status!=0U||result.start!=0U||result.end!=0U||recovery_calls!=0U)return 150+(int)format;}}
@@ -52131,9 +52352,9 @@ static int run_loop(uint32_t format){{result_t result={{91U,92U}};reset_observat
   if(object_ticket!=0U||span_postflight_ticket!=0U)return 180+(int)format;
   return 0;}}
 static int run_resume_overflow(void){{result_t result={{91U,92U}};if({mode}U==2U)return 0;reset_observations();init_v4();prepared.invocation_epoch=UINT64_MAX-UINT64_C(1);uint32_t status={entry}((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),&result);
-  if(status!=1U||preflight_calls!=1U||continue_calls!=1U||fallback_calls!=0U||retire_calls!=1U||prepared.invocation_epoch!=UINT64_C(1)||object_ticket!=0U||span_postflight_ticket!=0U)return 230;
+  if(status!=1U||preflight_calls!=0U||continue_calls!=0U||fused_calls!=1U||fallback_calls!=0U||retire_calls!=1U||prepared.invocation_epoch!=UINT64_C(1)||object_ticket!=0U||span_postflight_ticket!=0U)return 230;
   return 0;}}
-int main(void){{int status=run_deferred_guards();if(status!=0)return status;status=run_lazy_preflight_returns();if(status!=0)return status;status=run_v4();if(status!=0)return status;status=run_resume_overflow();if(status!=0)return status;status=run_loop(6U);if(status!=0)return status;return run_loop(7U);}}
+int main(void){{int status=run_deferred_guards();if(status!=0)return status;status=run_fused_returns();if(status!=0)return status;status=run_v4();if(status!=0)return status;status=run_resume_overflow();if(status!=0)return status;status=run_loop(6U);if(status!=0)return status;return run_loop(7U);}}
 "##,
                 v1_bytes = FROZEN_PREPARED_HEADER_V4_DYNAMIC_ROWS_OFFSET,
                 tail_offset = FROZEN_PREPARED_HEADER_V4_DYNAMIC_ROWS_OFFSET,
@@ -52147,6 +52368,9 @@ int main(void){{int status=run_deferred_guards();if(status!=0)return status;stat
                 entry = entry,
                 identity = c_bytes(&identity),
                 haystack = c_bytes(&hole_haystack),
+                descriptor_delta = descriptor_delta,
+                resume_header_words = STATIC_PREFIX_RESUME_DESCRIPTOR_V1_HEADER_BYTES / 4,
+                resume_state_words = STATIC_PREFIX_RESUME_DESCRIPTOR_V1_STATE_BYTES / 4,
                 identity_offset = FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET,
                 active_seal = FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL,
                 magic = FROZEN_PREPARED_HEADER_V1_MAGIC,
