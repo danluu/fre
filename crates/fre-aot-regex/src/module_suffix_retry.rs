@@ -88,8 +88,16 @@ pub(super) fn x86_emit_bounded_suffix_retry(
     // dispatch. A retry verifier follows the semantic transition directly,
     // so neither flag may participate in the next-row token.
     x86_emit_and_eax_mask(assembler, layout.cells.next_mask())?;
-    assembler.branch(&[0x0f, 0x84], rejected)?;
-    x86_emit_set_row_from_cell(assembler, layout.cells)?;
+    if layout.cells.is_compact() {
+        let mut compare_dead = vec![0x3d];
+        compare_dead.extend_from_slice(&layout.cells.dead_token().to_le_bytes());
+        assembler.instruction(&compare_dead)?;
+        assembler.branch(&[0x0f, 0x84], rejected)?;
+        x86_emit_set_row_from_compact_zero_based_cell(assembler, layout.cells)?;
+    } else {
+        assembler.branch(&[0x0f, 0x84], rejected)?;
+        x86_emit_set_row_from_cell(assembler, layout.cells)?;
+    }
     assembler.branch(&[0xe9], verifier)?;
 
     assembler.bind(rejected)?;
@@ -164,9 +172,15 @@ pub(super) fn aarch64_emit_bounded_suffix_retry(
     // accelerator tag are metadata, while the remaining low bits are the row
     // token.
     assembler.instruction(aarch64_and_low_w(6, 8, layout.cells.next_bits())?)?;
-    assembler.branch_zero_w(6, rejected)?;
-    assembler.instruction(aarch64_sub_w_imm(6, 6, 1)?)?;
-    aarch64_set_row_from_cell(assembler, layout.cells)?;
+    if layout.cells.is_compact() {
+        aarch64_load_u32_constant(assembler, 12, layout.cells.dead_token())?;
+        assembler.instruction(aarch64_cmp_w(6, 12)?)?;
+        assembler.branch_cond(AARCH64_EQ, rejected)?;
+    } else {
+        assembler.branch_zero_w(6, rejected)?;
+        assembler.instruction(aarch64_sub_w_imm(6, 6, 1)?)?;
+    }
+    aarch64_set_row_from_zero_based_cell(assembler, layout.cells, 6)?;
     assembler.branch(verifier)?;
 
     assembler.bind(rejected)?;

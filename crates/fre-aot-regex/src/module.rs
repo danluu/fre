@@ -5047,9 +5047,13 @@ fn native_exact_row_intern_retry_plan(
 /// Width of one packed transition cell in the ordinary native DFA tables.
 ///
 /// All encodings retain the same two flag bits. Wide tokens store an absolute
-/// table-relative byte offset plus one. Compact16 tokens store
-/// `(absolute_byte_offset / 2) + 1` after proving every row is halfword-aligned
-/// and every forward and retained reverse token fits in 14 bits. A class
+/// table-relative byte offset plus one. Compact tokens store an exact
+/// zero-based scaled row offset; their maximum low-bit value is reserved as
+/// an explicit dead sentinel carrying the accelerator bit. Moving the
+/// validity bias onto that cold sentinel removes one dependent decrement from
+/// every ordinary compact transition. Compact16 uses
+/// `absolute_byte_offset / 2` after proving every row is halfword-aligned and
+/// every forward and retained reverse token fits below the 14-bit sentinel. A class
 /// table may instead pad its physical row to a power of two and scale its
 /// token by that whole row; this keeps the same compact classifier while
 /// extending it to larger complete machines and retained incomplete prefixes
@@ -5132,6 +5136,19 @@ impl NativeCellEncoding {
             self,
             Self::Compact8Direct | Self::Compact16 | Self::Compact16Indexed(_)
         )
+    }
+
+    /// Low-bit payload reserved for a dead compact transition.
+    ///
+    /// The accelerator bit makes this payload exceptional in the ordinary
+    /// classifier. Once that bit is stripped on the cold edge, no live row or
+    /// partial-hole token may equal this value.
+    const fn dead_token(self) -> u32 {
+        if self.is_compact() {
+            self.next_mask()
+        } else {
+            0
+        }
     }
 
     const fn x86_accept_branch(self) -> u8 {
@@ -5227,7 +5244,12 @@ fn encode_native_row_offset(row_offset: usize, cells: NativeCellEncoding) -> Opt
     if !row_offset.is_multiple_of(scale) {
         return None;
     }
-    row_offset.checked_div(scale)?.checked_add(1)
+    let scaled = row_offset.checked_div(scale)?;
+    if cells.is_compact() {
+        Some(scaled)
+    } else {
+        scaled.checked_add(1)
+    }
 }
 
 /// Select the narrowest cell that can encode every row address in the final
@@ -5352,7 +5374,7 @@ fn select_native_cell_encoding_with_holes_for_architecture(
         .map(|token| token.max(forward_token))
         .and_then(|token| token.checked_add(resume_states))
         .and_then(|token| u32::try_from(token).ok())
-        .is_some_and(|token| token <= COMPACT_CELL_NEXT_MASK)
+        .is_some_and(|token| token < COMPACT_CELL_NEXT_MASK)
     {
         NativeCellEncoding::Compact16
     } else if transitions == TransitionLayout::ClassMapped
@@ -5395,7 +5417,7 @@ fn select_native_cell_encoding_with_holes_for_architecture(
                         reverse.max(forward).checked_add(resume_states)
                     })
                     .and_then(|token| u32::try_from(token).ok())
-                    .is_some_and(|token| token <= COMPACT_CELL_NEXT_MASK);
+                    .is_some_and(|token| token < COMPACT_CELL_NEXT_MASK);
                 let footprints = native_machine_bytes(
                     transitions,
                     cells,
@@ -7785,7 +7807,8 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
             .ok_or(ObjectError::ArithmeticOverflow(
                 "native partial final hole token",
             ))?;
-        if final_hole > cells.next_mask() {
+        if final_hole > cells.next_mask() || cells.is_compact() && final_hole == cells.dead_token()
+        {
             return Err(ObjectError::InvalidModule(
                 "native partial holes exceed packed-cell token space",
             ));
@@ -8294,7 +8317,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
                 if bytes.len() > row_end {
                     return Err(ObjectError::InvalidModule("native forward row overflow"));
                 }
-                bytes.resize(row_end, 0);
+                pad_native_packed_row(&mut bytes, row_end, cells)?;
             }
         }
         TransitionLayout::DirectByte => {
@@ -8456,7 +8479,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
                     if bytes.len() > row_end {
                         return Err(ObjectError::InvalidModule("native reverse row overflow"));
                     }
-                    bytes.resize(row_end, 0);
+                    pad_native_packed_row(&mut bytes, row_end, cells)?;
                 }
             }
             TransitionLayout::DirectByte => {
@@ -10452,7 +10475,8 @@ fn encode_native_next(
     cells: NativeCellEncoding,
 ) -> Result<usize, ObjectError> {
     if next == NO_DFA_STATE {
-        Ok(0)
+        usize::try_from(cells.dead_token())
+            .map_err(|_| ObjectError::ArithmeticOverflow("native DFA dead token"))
     } else {
         let next = usize::try_from(next)
             .map_err(|_| ObjectError::ArithmeticOverflow("native DFA next state"))?;
@@ -10524,10 +10548,11 @@ fn pack_native_forward_cell_with_exact_rows(
     cells: NativeCellEncoding,
     exact_rows: Option<&NativeExactRowInternPlan>,
 ) -> Result<u32, ObjectError> {
-    let accelerated =
-        next != NO_DFA_STATE && ((initial_scannable && next == 0) || loop_state == Some(next));
-    let encoded_next = if next == NO_DFA_STATE {
-        0
+    let dead = next == NO_DFA_STATE;
+    let accelerated = !dead && ((initial_scannable && next == 0) || loop_state == Some(next));
+    let encoded_next = if dead {
+        usize::try_from(cells.dead_token())
+            .map_err(|_| ObjectError::ArithmeticOverflow("native DFA dead token"))?
     } else {
         let logical = usize::try_from(next)
             .map_err(|_| ObjectError::ArithmeticOverflow("native DFA next state"))?;
@@ -10554,7 +10579,7 @@ fn pack_native_forward_cell_with_exact_rows(
             "native DFA row is not encodable at its cell width",
         ))?
     };
-    pack_native_encoded_cell(encoded_next, flag, accelerated, cells)
+    pack_native_encoded_cell(encoded_next, flag, accelerated, dead, cells)
 }
 
 #[allow(
@@ -10641,7 +10666,8 @@ fn pack_native_partial_forward_cell_with_exact_rows(
             .checked_add(resume)
             .ok_or(ObjectError::ArithmeticOverflow("native partial hole token"))?
     };
-    if token == 0 || token > cells.next_mask() {
+    if token == 0 || token > cells.next_mask() || cells.is_compact() && token == cells.dead_token()
+    {
         return Err(ObjectError::InvalidModule(
             "native partial hole token exceeds its cell encoding",
         ));
@@ -10658,6 +10684,7 @@ fn pack_native_cell_with_acceleration(
     accelerated: bool,
     cells: NativeCellEncoding,
 ) -> Result<u32, ObjectError> {
+    let dead = next == NO_DFA_STATE;
     let encoded_next = encode_native_next(
         next,
         machine_offset,
@@ -10665,29 +10692,42 @@ fn pack_native_cell_with_acceleration(
         states,
         cells,
     )?;
-    pack_native_encoded_cell(encoded_next, flag, accelerated, cells)
+    pack_native_encoded_cell(encoded_next, flag, accelerated, dead, cells)
 }
 
 fn pack_native_encoded_cell(
     encoded_next: usize,
     flag: bool,
     accelerated: bool,
+    dead: bool,
     cells: NativeCellEncoding,
 ) -> Result<u32, ObjectError> {
     let encoded_next = u32::try_from(encoded_next)
         .map_err(|_| ObjectError::ArithmeticOverflow("native DFA encoded next row"))?;
-    if encoded_next > cells.next_mask() {
+    if dead && accelerated {
+        return Err(ObjectError::InvalidModule(
+            "dead native DFA cell cannot enter semantic accelerator dispatch",
+        ));
+    }
+    if encoded_next > cells.next_mask()
+        || !dead && cells.is_compact() && encoded_next == cells.dead_token()
+    {
         return Err(ObjectError::InvalidModule(
             "native DFA state exceeds packed cell",
         ));
     }
-    if accelerated && encoded_next == 0 {
-        return Err(ObjectError::InvalidModule(
-            "dead native DFA cell cannot enter accelerator dispatch",
-        ));
-    }
+    // Compact zero-based tokens make row zero a valid ordinary destination.
+    // Give dead cells the otherwise-unreachable maximum payload and tag them
+    // exceptional. The cold accelerator edge recognizes that exact payload;
+    // `accelerated` itself remains a semantic graph tag and is still rejected
+    // for dead inputs above.
+    let encoded_accelerated = accelerated || dead && cells.is_compact();
     Ok(encoded_next
-        | if accelerated { cells.accelerated() } else { 0 }
+        | if encoded_accelerated {
+            cells.accelerated()
+        } else {
+            0
+        }
         | if flag { cells.accepts() } else { 0 })
 }
 
@@ -10708,6 +10748,36 @@ fn append_native_packed_cell(
             bytes.extend_from_slice(&packed.to_le_bytes());
         }
         NativeCellEncoding::Wide32 => bytes.extend_from_slice(&packed.to_le_bytes()),
+    }
+    Ok(())
+}
+
+/// Fill non-semantic physical row cells with the encoding's exact dead value.
+///
+/// Indexed class rows can contain power-of-two padding that the authenticated
+/// class map never addresses. Keeping those cells dead anyway preserves the
+/// packed decoder invariant under structural inspection: zero is a valid
+/// compact token for row zero and must not be used as generic cell padding.
+fn pad_native_packed_row(
+    bytes: &mut Vec<u8>,
+    row_end: usize,
+    cells: NativeCellEncoding,
+) -> Result<(), ObjectError> {
+    if bytes.len() > row_end
+        || !row_end
+            .checked_sub(bytes.len())
+            .is_some_and(|padding| padding.is_multiple_of(cells.bytes()))
+    {
+        return Err(ObjectError::InvalidModule("native packed row padding"));
+    }
+    let dead = cells.dead_token()
+        | if cells.is_compact() {
+            cells.accelerated()
+        } else {
+            0
+        };
+    while bytes.len() < row_end {
+        append_native_packed_cell(bytes, dead, cells)?;
     }
     Ok(())
 }
@@ -11556,27 +11626,16 @@ fn x86_emit_set_row_from_cell(
     cells: NativeCellEncoding,
 ) -> Result<(), ObjectError> {
     match cells {
-        // r10 = table + (encoded - 1) * 256
-        NativeCellEncoding::Compact8Direct => {
-            assembler.instruction(&[0xff, 0xc8])?; // dec eax
-            // The six-bit token fits a 32-bit shift, which also zero-extends
-            // RAX and avoids a REX prefix in the hot path.
-            assembler.instruction(&[0xc1, 0xe0, 0x08])?; // shl eax, 8
-            assembler.instruction(&[0x4d, 0x8d, 0x14, 0x01])?;
-        }
-        // r10 = table + (encoded - 1) * 2
-        NativeCellEncoding::Compact16 => {
-            assembler.instruction(&[0x4d, 0x8d, 0x54, 0x41, 0xfe])?;
-        }
-        // r10 = table + (encoded - 1) * row_bytes
-        NativeCellEncoding::Compact16Indexed(shift) => {
-            assembler.instruction(&[0xff, 0xc8])?; // dec eax
-            assembler.instruction(&[0xc1, 0xe0, shift])?; // shl eax, row shift
-            assembler.instruction(&[0x4d, 0x8d, 0x14, 0x01])?;
-        }
         // r10 = table + encoded - 1
         NativeCellEncoding::Wide32 => {
             assembler.instruction(&[0x4d, 0x8d, 0x54, 0x01, 0xff])?;
+        }
+        NativeCellEncoding::Compact8Direct
+        | NativeCellEncoding::Compact16
+        | NativeCellEncoding::Compact16Indexed(_) => {
+            return Err(ObjectError::InvalidModule(
+                "zero-based compact cell entered biased x86 row addressing",
+            ));
         }
     }
     Ok(())
@@ -14642,11 +14701,10 @@ fn lower_x86_64_dfa_with_entry_contract(
         NativeCellEncoding::Compact8Direct
         | NativeCellEncoding::Compact16
         | NativeCellEncoding::Compact16Indexed(_) => {
-            // After decrement, every ordinary live token is below the
-            // encoding's metadata bits. Dead underflows and either metadata
-            // bit moves the value above that range, so one unsigned branch
-            // classifies every exception.
-            assembler.instruction(&[0xff, 0xc8])?; // dec eax
+            // Every ordinary live token is a zero-based scaled row offset
+            // below the reserved dead payload. Either metadata bit, including
+            // the bit carried by that cold sentinel, moves the value above
+            // this range, so one unsigned branch classifies every exception.
             x86_emit_compact_zero_based_classifier(&mut assembler, layout.cells)?;
             assembler.branch(&[0x0f, 0x87], compact_exception)?; // ja
             x86_emit_set_row_from_compact_zero_based_cell(&mut assembler, layout.cells)?;
@@ -14679,14 +14737,24 @@ fn lower_x86_64_dfa_with_entry_contract(
 
     assembler.bind(accelerated_transition)?;
     x86_emit_and_eax_mask(&mut assembler, layout.cells.next_mask())?;
+    if layout.cells.is_compact() {
+        let mut compare_dead = vec![0x3d]; // cmp eax, compact dead payload
+        compare_dead.extend_from_slice(&layout.cells.dead_token().to_le_bytes());
+        assembler.instruction(&compare_dead)?;
+        assembler.branch(&[0x0f, 0x84], finish)?;
+    }
     if let Some(partial) = layout.partial {
         let mut compare_hole = vec![0x3d]; // cmp eax, hole_token_base
         compare_hole.extend_from_slice(&partial.hole_token_base.to_le_bytes());
         assembler.instruction(&compare_hole)?;
         assembler.branch(&[0x0f, 0x83], partial_resume)?; // jae
     }
-    assembler.branch(&[0x0f, 0x84], finish)?;
-    x86_emit_set_row_from_cell(&mut assembler, layout.cells)?;
+    if layout.cells.is_compact() {
+        x86_emit_set_row_from_compact_zero_based_cell(&mut assembler, layout.cells)?;
+    } else {
+        assembler.branch(&[0x0f, 0x84], finish)?;
+        x86_emit_set_row_from_cell(&mut assembler, layout.cells)?;
+    }
     // `scan` selects the initial scanner when its semantic preconditions hold,
     // then falls through the selected interior-loop row guard otherwise.
     assembler.branch(&[0xe9], scan)?;
@@ -14721,12 +14789,10 @@ fn lower_x86_64_dfa_with_entry_contract(
 
     assembler.bind(compact_exception)?;
     if layout.cells.is_compact() {
-        assembler.instruction(&[0xff, 0xc0])?; // restore packed cell
         x86_emit_test_eax_mask(&mut assembler, layout.cells.accepts())?;
         assembler.branch(&[0x0f, 0x85], accept)?;
-        assembler.instruction(&[0x85, 0xc0])?;
-        assembler.branch(&[0x0f, 0x84], finish)?;
-        // A live compact exception with no accept bit is accelerator-tagged.
+        // Every non-accepting compact exception is accelerator-tagged: a
+        // graph accelerator, partial hole, or the explicit dead sentinel.
         assembler.branch(&[0xe9], accelerated_transition)?;
     }
 
@@ -14736,21 +14802,23 @@ fn lower_x86_64_dfa_with_entry_contract(
     } else {
         assembler.instruction(&[0x49, 0x89, 0xd3])?;
         // Normalize only the cold accepting edge. This makes an accepted-live
-        // cell identical to a raw token and exposes accepted-dead as zero.
+        // cell identical to a raw token while accepted-dead retains its
+        // explicit compact accelerator sentinel.
         x86_emit_clear_eax_bit(&mut assembler, layout.cells.accepts_bit())?;
-        assembler.instruction(&[0x85, 0xc0])?;
-        assembler.branch(&[0x0f, 0x84], finish)?;
         match layout.cells {
             NativeCellEncoding::Compact8Direct
             | NativeCellEncoding::Compact16
             | NativeCellEncoding::Compact16Indexed(_) => {
                 x86_emit_test_eax_mask(&mut assembler, layout.cells.accelerated())?;
                 assembler.branch(&[0x0f, 0x85], accelerated_transition)?;
-                // With both metadata bits disproved, EAX is an encoded token.
-                x86_emit_set_row_from_cell(&mut assembler, layout.cells)?;
+                // With both metadata bits disproved, EAX is already the
+                // zero-based scaled row token, including valid row zero.
+                x86_emit_set_row_from_compact_zero_based_cell(&mut assembler, layout.cells)?;
                 assembler.branch(&[0xe9], scalar_backedge)?;
             }
             NativeCellEncoding::Wide32 => {
+                assembler.instruction(&[0x85, 0xc0])?;
+                assembler.branch(&[0x0f, 0x84], finish)?;
                 assembler.branch(&[0xe9], after_accept)?;
             }
         }
@@ -14818,7 +14886,6 @@ fn lower_x86_64_dfa_with_entry_contract(
                 NativeCellEncoding::Compact8Direct
                 | NativeCellEncoding::Compact16
                 | NativeCellEncoding::Compact16Indexed(_) => {
-                    assembler.instruction(&[0xff, 0xc8])?; // zero-based token
                     x86_emit_compact_zero_based_classifier(&mut assembler, layout.cells)?;
                     assembler.branch(&[0x0f, 0x87], reverse_exception)?;
                     x86_emit_set_row_from_compact_zero_based_cell(
@@ -14834,12 +14901,13 @@ fn lower_x86_64_dfa_with_entry_contract(
                 }
             }
             assembler.bind(reverse_continue)?;
-            x86_emit_set_row_from_cell(&mut assembler, layout.cells)?;
-            assembler.branch(&[0xe9], reverse_loop)?;
+            if layout.cells == NativeCellEncoding::Wide32 {
+                x86_emit_set_row_from_cell(&mut assembler, layout.cells)?;
+                assembler.branch(&[0xe9], reverse_loop)?;
+            }
 
             assembler.bind(reverse_exception)?;
             if layout.cells.is_compact() {
-                assembler.instruction(&[0xff, 0xc0])?; // restore packed cell
                 x86_emit_test_eax_mask(&mut assembler, layout.cells.accepts())?;
                 assembler.branch(&[0x0f, 0x85], record_reverse_start)?;
                 // The only non-accepting compact exception is dead.
@@ -14849,9 +14917,16 @@ fn lower_x86_64_dfa_with_entry_contract(
             assembler.bind(record_reverse_start)?;
             assembler.instruction(&[0x48, 0x89, 0xd1])?;
             x86_emit_clear_eax_bit(&mut assembler, layout.cells.accepts_bit())?;
-            assembler.instruction(&[0x85, 0xc0])?;
-            assembler.branch(&[0x0f, 0x84], reverse_finish)?;
-            assembler.branch(&[0xe9], reverse_continue)?;
+            if layout.cells.is_compact() {
+                x86_emit_test_eax_mask(&mut assembler, layout.cells.accelerated())?;
+                assembler.branch(&[0x0f, 0x85], reverse_finish)?;
+                x86_emit_set_row_from_compact_zero_based_cell(&mut assembler, layout.cells)?;
+                assembler.branch(&[0xe9], reverse_loop)?;
+            } else {
+                assembler.instruction(&[0x85, 0xc0])?;
+                assembler.branch(&[0x0f, 0x84], reverse_finish)?;
+                assembler.branch(&[0xe9], reverse_continue)?;
+            }
 
             assembler.bind(reverse_finish)?;
             assembler.instruction(&[0x48, 0x83, 0xf9, 0xff])?;
@@ -23727,9 +23802,10 @@ fn aarch64_set_row_base(
     aarch64_set_table_address(assembler, 11, table_offset)
 }
 
-fn aarch64_set_row_from_cell(
+fn aarch64_set_row_from_zero_based_cell(
     assembler: &mut Aarch64Assembler,
     cells: NativeCellEncoding,
+    token: u8,
 ) -> Result<(), ObjectError> {
     let shift = match cells {
         NativeCellEncoding::Compact8Direct => 8_u32,
@@ -23740,7 +23816,7 @@ fn aarch64_set_row_from_cell(
     assembler.instruction(
         0x8b00_0000
             | (shift << 10)
-            | aarch64_reg(6, 16)?
+            | aarch64_reg(token, 16)?
             | aarch64_reg(5, 5)?
             | aarch64_reg(11, 0)?,
     )?;
@@ -27453,17 +27529,16 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
         NativeCellEncoding::Compact8Direct
         | NativeCellEncoding::Compact16
         | NativeCellEncoding::Compact16Indexed(_) => {
-            // W6 becomes the zero-based row token. Bits at and above the
+            // W8 is already the zero-based row token. Bits at and above the
             // accelerator flag are all zero exactly for ordinary live compact
-            // cells; dead underflows.
-            assembler.instruction(aarch64_sub_w_imm(6, 8, 1)?)?;
+            // cells; dead uses the reserved maximum payload plus that flag.
             assembler.instruction(aarch64_lsr_w_imm(
                 12,
-                6,
+                8,
                 layout.cells.accelerated_bit(),
             )?)?;
             assembler.branch_nonzero_w(12, compact_exception)?;
-            aarch64_set_row_from_cell(&mut assembler, layout.cells)?;
+            aarch64_set_row_from_zero_based_cell(&mut assembler, layout.cells, 8)?;
             assembler.branch(scalar_backedge)?;
         }
         NativeCellEncoding::Wide32 => {
@@ -27476,7 +27551,7 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
         // The accept and accelerator branches prove W8 is a raw token.
         assembler.branch_zero_w(8, finish)?;
         assembler.instruction(aarch64_sub_w_imm(6, 8, 1)?)?;
-        aarch64_set_row_from_cell(&mut assembler, layout.cells)?;
+        aarch64_set_row_from_zero_based_cell(&mut assembler, layout.cells, 6)?;
     }
     assembler.bind(scalar_backedge)?;
     assembler.instruction(aarch64_cmp_x(2, 3)?)?;
@@ -27485,14 +27560,21 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
 
     assembler.bind(accelerated_transition)?;
     assembler.instruction(aarch64_and_low_w(6, 8, layout.cells.next_bits())?)?;
+    if layout.cells.is_compact() {
+        aarch64_load_u32_constant(&mut assembler, 12, layout.cells.dead_token())?;
+        assembler.instruction(aarch64_cmp_w(6, 12)?)?;
+        assembler.branch_cond(AARCH64_EQ, finish)?;
+    }
     if let Some(partial) = layout.partial {
         aarch64_load_u32_constant(&mut assembler, 12, partial.hole_token_base)?;
         assembler.instruction(aarch64_cmp_x(6, 12)?)?;
         assembler.branch_cond(AARCH64_HS, partial_resume)?;
     }
-    assembler.branch_zero_w(6, finish)?;
-    assembler.instruction(aarch64_sub_w_imm(6, 6, 1)?)?;
-    aarch64_set_row_from_cell(&mut assembler, layout.cells)?;
+    if !layout.cells.is_compact() {
+        assembler.branch_zero_w(6, finish)?;
+        assembler.instruction(aarch64_sub_w_imm(6, 6, 1)?)?;
+    }
+    aarch64_set_row_from_zero_based_cell(&mut assembler, layout.cells, 6)?;
     assembler.branch(scan)?;
 
     assembler.bind(partial_resume)?;
@@ -27524,8 +27606,8 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
     assembler.bind(compact_exception)?;
     if layout.cells.is_compact() {
         assembler.branch_bit_set_w(8, layout.cells.accepts_bit(), accept)?;
-        assembler.branch_zero_w(8, finish)?;
-        // A live compact exception without the accept bit is accelerated.
+        // Every non-accepting compact exception is accelerator-tagged: a
+        // graph accelerator, partial hole, or the explicit dead sentinel.
         assembler.branch(accelerated_transition)?;
     }
 
@@ -27535,9 +27617,9 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
     } else {
         assembler.instruction(aarch64_mov_x(7, 2)?)?;
         // Clear only the layout-specific accept bit on this cold edge. Any
-        // accelerator bit remains available to the shared classifier.
+        // accelerator bit, including compact accepted-dead, remains available
+        // to the shared classifier.
         assembler.instruction(aarch64_and_low_w(8, 8, layout.cells.accepts_bit())?)?;
-        assembler.branch_zero_w(8, finish)?;
         match layout.cells {
             NativeCellEncoding::Compact8Direct
             | NativeCellEncoding::Compact16
@@ -27547,11 +27629,13 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
                     layout.cells.accelerated_bit(),
                     accelerated_transition,
                 )?;
-                assembler.instruction(aarch64_sub_w_imm(6, 8, 1)?)?;
-                aarch64_set_row_from_cell(&mut assembler, layout.cells)?;
+                aarch64_set_row_from_zero_based_cell(&mut assembler, layout.cells, 8)?;
                 assembler.branch(scalar_backedge)?;
             }
-            NativeCellEncoding::Wide32 => assembler.branch(after_accept)?,
+            NativeCellEncoding::Wide32 => {
+                assembler.branch_zero_w(8, finish)?;
+                assembler.branch(after_accept)?;
+            }
         }
     }
 
@@ -27613,14 +27697,13 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
                 NativeCellEncoding::Compact8Direct
                 | NativeCellEncoding::Compact16
                 | NativeCellEncoding::Compact16Indexed(_) => {
-                    assembler.instruction(aarch64_sub_w_imm(6, 8, 1)?)?;
                     assembler.instruction(aarch64_lsr_w_imm(
                         12,
-                        6,
+                        8,
                         layout.cells.accelerated_bit(),
                     )?)?;
                     assembler.branch_nonzero_w(12, reverse_exception)?;
-                    aarch64_set_row_from_cell(&mut assembler, layout.cells)?;
+                    aarch64_set_row_from_zero_based_cell(&mut assembler, layout.cells, 8)?;
                     assembler.branch(reverse_scan)?;
                 }
                 NativeCellEncoding::Wide32 => {
@@ -27635,9 +27718,11 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
                 }
             }
             assembler.bind(reverse_continue)?;
-            assembler.instruction(aarch64_sub_w_imm(6, 8, 1)?)?;
-            aarch64_set_row_from_cell(&mut assembler, layout.cells)?;
-            assembler.branch(reverse_scan)?;
+            if layout.cells == NativeCellEncoding::Wide32 {
+                assembler.instruction(aarch64_sub_w_imm(6, 8, 1)?)?;
+                aarch64_set_row_from_zero_based_cell(&mut assembler, layout.cells, 6)?;
+                assembler.branch(reverse_scan)?;
+            }
 
             assembler.bind(reverse_exception)?;
             if layout.cells.is_compact() {
@@ -27649,8 +27734,14 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
             assembler.bind(record_reverse_start)?;
             assembler.instruction(aarch64_mov_x(10, 2)?)?;
             assembler.instruction(aarch64_and_low_w(8, 8, layout.cells.accepts_bit())?)?;
-            assembler.branch_zero_w(8, reverse_finish)?;
-            assembler.branch(reverse_continue)?;
+            if layout.cells.is_compact() {
+                assembler.branch_bit_set_w(8, layout.cells.accelerated_bit(), reverse_finish)?;
+                aarch64_set_row_from_zero_based_cell(&mut assembler, layout.cells, 8)?;
+                assembler.branch(reverse_scan)?;
+            } else {
+                assembler.branch_zero_w(8, reverse_finish)?;
+                assembler.branch(reverse_continue)?;
+            }
 
             assembler.bind(reverse_finish)?;
             assembler.instruction(aarch64_cmp_x(10, 13)?)?;
@@ -51399,7 +51490,7 @@ int main(void){{
                                     || loop_state == Some(next));
                             assert_eq!(
                                 packed & cells.accelerated() != 0,
-                                expected_accelerated,
+                                expected_accelerated || next == NO_DFA_STATE && cells.is_compact(),
                                 "{cells:?}/{accepted}/{initial_scannable}/{loop_state:?}/{next}"
                             );
                             assert_eq!(packed & cells.accepts() != 0, accepted);
@@ -51549,6 +51640,7 @@ int main(void){{
                     assert_eq!(
                         packed & layout.cells.accelerated() != 0,
                         expected_accelerated
+                            || cell.next() == NO_DFA_STATE && layout.cells.is_compact()
                     );
                     assert_eq!(packed & layout.cells.accepts() != 0, cell.accepted());
                     saw_hole |= semantic_hole;
@@ -51626,15 +51718,17 @@ int main(void){{
 
             let mut hole_dispatch = vec![0x3d];
             hole_dispatch.extend_from_slice(&x86_partial.hole_token_base.to_le_bytes());
-            let hole_compare = lowering
-                .code
-                .windows(hole_dispatch.len())
-                .position(|code| code == hole_dispatch)
-                .expect("x86 partial hole-base compare");
-            let branch = hole_compare + hole_dispatch.len();
             assert!(
-                lowering.code.get(branch) == Some(&0x73)
-                    || lowering.code.get(branch..branch + 2) == Some([0x0f, 0x83].as_slice())
+                lowering.code.windows(hole_dispatch.len()).enumerate().any(
+                    |(hole_compare, code)| {
+                        code == hole_dispatch
+                            && x86_test_normalized_branch_opcode(
+                                &lowering.code,
+                                hole_compare + hole_dispatch.len(),
+                            ) == Some(0x83)
+                    }
+                ),
+                "the partial-hole edge must retain its unsigned inclusive dispatch",
             );
         }
 
@@ -70931,8 +71025,17 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
     #[test]
     fn packed_native_cell_model_exhaustively_preserves_flags_and_absolute_tokens() {
         let machine_offsets = [0_usize, CLASS_MAP_BYTES, 4096];
-        for cells in [NativeCellEncoding::Compact16, NativeCellEncoding::Wide32] {
-            let row_widths = [cells.bytes(), 5 * cells.bytes(), 256 * cells.bytes()];
+        for cells in [
+            NativeCellEncoding::Compact8Direct,
+            NativeCellEncoding::Compact16,
+            NativeCellEncoding::Compact16Indexed(4),
+            NativeCellEncoding::Wide32,
+        ] {
+            let row_widths = [
+                cells.row_token_scale(),
+                5 * cells.row_token_scale(),
+                256 * cells.row_token_scale(),
+            ];
             for states in 1_usize..=17 {
                 for machine_offset in machine_offsets {
                     for row_bytes in row_widths {
@@ -70958,6 +71061,10 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                                     );
                                     if (next == NO_DFA_STATE && accelerated)
                                         || encoded > usize::try_from(cells.next_mask()).unwrap()
+                                        || next != NO_DFA_STATE
+                                            && cells.is_compact()
+                                            && encoded
+                                                == usize::try_from(cells.dead_token()).unwrap()
                                     {
                                         assert!(packed.is_err());
                                         continue;
@@ -70968,7 +71075,10 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                                         u32::try_from(encoded).unwrap()
                                     );
                                     assert_eq!(packed & cells.accepts() != 0, flag);
-                                    assert_eq!(packed & cells.accelerated() != 0, accelerated);
+                                    assert_eq!(
+                                        packed & cells.accelerated() != 0,
+                                        accelerated || next == NO_DFA_STATE && cells.is_compact()
+                                    );
                                     assert_eq!(
                                         packed
                                             & !(cells.accepts()
@@ -70999,15 +71109,20 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 .checked_mul(cells.row_token_scale())
                 .unwrap();
             assert_eq!(
-                pack_native_cell(0, false, maximum_offset, cells.bytes(), 1, cells).unwrap(),
-                cells.next_mask()
+                pack_native_cell(0, false, maximum_offset, cells.row_token_scale(), 1, cells,)
+                    .unwrap(),
+                if cells.is_compact() {
+                    cells.next_mask() - 1
+                } else {
+                    cells.next_mask()
+                }
             );
             assert!(
                 pack_native_cell(
                     0,
                     false,
                     maximum_offset + cells.row_token_scale(),
-                    cells.bytes(),
+                    cells.row_token_scale(),
                     1,
                     cells,
                 )
@@ -71021,7 +71136,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                             next,
                             false,
                             0,
-                            cells.bytes(),
+                            cells.row_token_scale(),
                             9,
                             initial_scannable,
                             loop_state,
@@ -71030,7 +71145,10 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                         .unwrap();
                         let expected = next != NO_DFA_STATE
                             && ((initial_scannable && next == 0) || loop_state == Some(next));
-                        assert_eq!(packed & cells.accelerated() != 0, expected);
+                        assert_eq!(
+                            packed & cells.accelerated() != 0,
+                            expected || next == NO_DFA_STATE && cells.is_compact()
+                        );
                     }
                 }
             }
@@ -71088,7 +71206,10 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 let expected_tag = cell.next() != NO_DFA_STATE
                     && ((cell.next() == 0 && layout.start_filter.is_some())
                         || loop_state == Some(cell.next()));
-                assert_eq!(packed & layout.cells.accelerated() != 0, expected_tag);
+                assert_eq!(
+                    packed & layout.cells.accelerated() != 0,
+                    expected_tag || cell.next() == NO_DFA_STATE && layout.cells.is_compact()
+                );
                 assert_eq!(packed & layout.cells.accepts() != 0, cell.accepted());
                 assert_eq!(
                     packed & layout.cells.next_mask(),
@@ -71133,7 +71254,10 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                         u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap())
                     }
                 };
-                assert_eq!(packed & layout.cells.accelerated(), 0);
+                assert_eq!(
+                    packed & layout.cells.accelerated() != 0,
+                    cell.next() == NO_DFA_STATE && layout.cells.is_compact()
+                );
                 assert_eq!(packed & layout.cells.accepts() != 0, cell.reaches_start());
                 assert_eq!(
                     packed & layout.cells.next_mask(),
@@ -71796,12 +71920,12 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
         ) -> (Destination, bool, bool) {
             let cells = NativeCellEncoding::Compact16;
             let token = packed & cells.next_mask();
-            let destination = if token == 0 {
+            let destination = if token == cells.dead_token() && packed & cells.accelerated() != 0 {
                 Destination::Dead
             } else if token >= partial.hole_token_base {
                 Destination::Resume(token - partial.hole_token_base)
             } else {
-                let byte_offset = usize::try_from(token - 1)
+                let byte_offset = usize::try_from(token)
                     .ok()
                     .and_then(|token| token.checked_mul(cells.row_token_scale()))
                     .expect("partial test row byte offset");
@@ -71981,7 +72105,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             NativeCellEncoding::Compact8Direct,
         )
         .expect("pack final byte-compact state");
-        assert_eq!(final_cell, u32::from(u8::MAX));
+        assert_eq!(final_cell, u32::from(u8::MAX - 1));
         let mut final_bytes = Vec::new();
         append_native_packed_cell(
             &mut final_bytes,
@@ -71989,7 +72113,31 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             NativeCellEncoding::Compact8Direct,
         )
         .expect("append final byte-compact state");
-        assert_eq!(final_bytes, [u8::MAX]);
+        assert_eq!(final_bytes, [u8::MAX - 1]);
+        assert_eq!(
+            pack_native_cell(
+                NO_DFA_STATE,
+                false,
+                0,
+                DIRECT_BYTE_ROW_CELLS,
+                63,
+                NativeCellEncoding::Compact8Direct,
+            )
+            .unwrap(),
+            DIRECT_COMPACT_CELL_ACCELERATED | DIRECT_COMPACT_CELL_NEXT_MASK,
+        );
+        assert_eq!(
+            pack_native_cell(
+                NO_DFA_STATE,
+                true,
+                0,
+                DIRECT_BYTE_ROW_CELLS,
+                63,
+                NativeCellEncoding::Compact8Direct,
+            )
+            .unwrap(),
+            u32::from(u8::MAX),
+        );
 
         // A short complete DFA exercises AArch64's established direct route;
         // byte cells halve that table without changing layout selection.
@@ -72050,12 +72198,11 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 .expect("lower x86 byte-compact core")
                 .0;
             assert!(
-                x86.windows(12).any(|bytes| {
+                x86.windows(10).any(|bytes| {
                     bytes
                         == [
                             0x41, 0x0f, 0xb6, 0x04, 0x02,
                             0x48, 0xff, 0xc2,
-                            0xff, 0xc8,
                             0x3c, 0x3e,
                         ]
                 }),
@@ -72085,7 +72232,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             );
             let scaled_row = 0x8b00_0000
                 | (8_u32 << 10)
-                | aarch64_reg(6, 16).unwrap()
+                | aarch64_reg(8, 16).unwrap()
                 | aarch64_reg(5, 5).unwrap()
                 | aarch64_reg(11, 0).unwrap();
             assert!(words.contains(&scaled_row), "{output:?}");
@@ -72195,7 +72342,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
         assert_eq!(live & cells.next_mask(), last_live_token);
         assert_ne!(live & cells.accepts(), 0);
         assert_eq!(live & cells.accelerated(), 0);
-        let decoded_last_row = usize::try_from((live & cells.next_mask()) - 1)
+        let decoded_last_row = usize::try_from(live & cells.next_mask())
             .ok()
             .and_then(|token| token.checked_mul(cells.row_token_scale()))
             .expect("decode indexed partial live row");
@@ -72279,7 +72426,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             cells,
         )
         .expect("pack indexed compact final row");
-        assert_eq!(packed & cells.next_mask(), 4_112);
+        assert_eq!(packed & cells.next_mask(), 4_111);
         assert_ne!(packed & cells.accepts(), 0);
         assert_ne!(packed & cells.accelerated(), 0);
         let mut bytes = Vec::new();
@@ -72323,7 +72470,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
         assert!(words.contains(&aarch64_load_h_uxtw(8, 11, 8).unwrap()));
         let scaled_row = 0x8b00_0000
             | (4_u32 << 10)
-            | aarch64_reg(6, 16).unwrap()
+            | aarch64_reg(8, 16).unwrap()
             | aarch64_reg(5, 5).unwrap()
             | aarch64_reg(11, 0).unwrap();
         assert!(words.contains(&scaled_row));
@@ -72372,13 +72519,18 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             row_bytes > logical_row_bytes,
             "fixture must exercise physical row padding"
         );
+        let padding_dead = u16::try_from(layout.cells.dead_token() | layout.cells.accelerated())
+            .unwrap()
+            .to_le_bytes();
         assert!(
             (0..states).all(|state| {
                 let padding_start = prefix_bytes + state * row_bytes + logical_row_bytes;
                 let padding_end = prefix_bytes + (state + 1) * row_bytes;
-                data[padding_start..padding_end].iter().all(|&byte| byte == 0)
+                data[padding_start..padding_end]
+                    .chunks_exact(layout.cells.bytes())
+                    .all(|cell| cell == padding_dead)
             }),
-            "physical power-of-two padding must not contain transition data"
+            "physical power-of-two padding must contain the explicit dead sentinel"
         );
         assert!(
             machine_bytes * X86_INDEXED_MAX_WIDE_FOOTPRINT_DENOMINATOR
@@ -72411,7 +72563,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
         assert!(words.contains(&aarch64_load_h_uxtw(8, 11, 8).unwrap()));
         let scaled_row = 0x8b00_0000
             | (u32::from(shift) << 10)
-            | aarch64_reg(6, 16).unwrap()
+            | aarch64_reg(8, 16).unwrap()
             | aarch64_reg(5, 5).unwrap()
             | aarch64_reg(11, 0).unwrap();
         assert!(words.contains(&scaled_row));
@@ -72462,11 +72614,11 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             .unwrap();
         let compact_classifier = direct_lookup_offset + direct_lookup.len() + 3;
         assert_eq!(
-            &direct_x86[compact_classifier..compact_classifier + 7],
-            &[0xff, 0xc8, 0x3d, 0xfe, 0x3f, 0x00, 0x00],
-            "compact hot dispatch must decrement into a zero-based token and range-check it"
+            &direct_x86[compact_classifier..compact_classifier + 5],
+            &[0x3d, 0xfe, 0x3f, 0x00, 0x00],
+            "compact hot dispatch must range-check the already-zero-based token"
         );
-        let exceptional_branch = compact_classifier + 7;
+        let exceptional_branch = compact_classifier + 5;
         assert_eq!(
             x86_test_normalized_branch_opcode(&direct_x86, exceptional_branch),
             Some(0x87),
@@ -72511,7 +72663,12 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             &direct_x86[accelerated_mask..accelerated_mask + 5],
             &[0x25, 0xff, 0x3f, 0x00, 0x00]
         );
-        let accelerated_dead_branch = accelerated_mask + 5;
+        let accelerated_dead_compare = accelerated_mask + 5;
+        assert_eq!(
+            &direct_x86[accelerated_dead_compare..accelerated_dead_compare + 5],
+            &[0x3d, 0xff, 0x3f, 0x00, 0x00],
+        );
+        let accelerated_dead_branch = accelerated_dead_compare + 5;
         assert_eq!(
             x86_test_normalized_branch_opcode(&direct_x86, accelerated_dead_branch),
             Some(0x84)
@@ -72521,10 +72678,10 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 .unwrap()
                 .1;
         assert_eq!(
-            &direct_x86[accelerated_row..accelerated_row + 5],
-            &[0x4d, 0x8d, 0x54, 0x41, 0xfe]
+            &direct_x86[accelerated_row..accelerated_row + 4],
+            &[0x4d, 0x8d, 0x14, 0x41]
         );
-        let tagged_branch = accelerated_row + 5;
+        let tagged_branch = accelerated_row + 4;
         let (tagged_target, _) = x86_test_branch_target(&direct_x86, tagged_branch).unwrap();
         assert!(
             tagged_target < tagged_branch,
@@ -72549,8 +72706,8 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
         );
         assert!(
             class_x86
-                .windows(7)
-                .any(|bytes| { bytes == [0xff, 0xc8, 0x3d, 0xfe, 0x3f, 0x00, 0x00] })
+                .windows(5)
+                .any(|bytes| { bytes == [0x3d, 0xfe, 0x3f, 0x00, 0x00] })
         );
 
         let direct_aarch64 = lower_aarch64_dfa(direct, FeatureSet::EMPTY).unwrap().0;
@@ -72574,31 +72731,27 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
         let aarch64_dispatch = aarch64_lookup + direct_lookup.len() + 1;
         assert_eq!(
             direct_words[aarch64_dispatch],
-            aarch64_sub_w_imm(6, 8, 1).unwrap()
+            aarch64_lsr_w_imm(12, 8, 14).unwrap()
         );
         assert_eq!(
-            direct_words[aarch64_dispatch + 1],
-            aarch64_lsr_w_imm(12, 6, 14).unwrap()
-        );
-        assert_eq!(
-            direct_words[aarch64_dispatch + 2] & 0xff00_001f,
+            direct_words[aarch64_dispatch + 1] & 0xff00_001f,
             0x3500_000c
         );
-        assert_eq!(direct_words[aarch64_dispatch + 3], 0x8b06_04ab);
+        assert_eq!(direct_words[aarch64_dispatch + 2], 0x8b08_04ab);
         assert_eq!(
-            direct_words[aarch64_dispatch + 4],
+            direct_words[aarch64_dispatch + 3],
             aarch64_cmp_x(2, 3).unwrap()
         );
         assert_eq!(
-            direct_words[aarch64_dispatch + 5] & 0xff00_001f,
+            direct_words[aarch64_dispatch + 4] & 0xff00_001f,
             0x5400_0003,
             "the rotated AArch64 hot edge must be B.LO"
         );
         let ordinary_displacement = {
-            let immediate = (direct_words[aarch64_dispatch + 5] >> 5) & 0x7_ffff;
+            let immediate = (direct_words[aarch64_dispatch + 4] >> 5) & 0x7_ffff;
             i32::try_from(immediate).unwrap().wrapping_shl(13) >> 13
         };
-        let ordinary_target = i32::try_from(aarch64_dispatch + 5)
+        let ordinary_target = i32::try_from(aarch64_dispatch + 4)
             .unwrap()
             .checked_add(ordinary_displacement)
             .and_then(|target| usize::try_from(target).ok())
@@ -72609,16 +72762,24 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             .unwrap();
         assert_eq!(ordinary_target, direct_body);
         assert_eq!(
-            direct_words[aarch64_dispatch + 6] & 0xfc00_0000,
+            direct_words[aarch64_dispatch + 5] & 0xfc00_0000,
             0x1400_0000
         );
         assert_eq!(
-            direct_words[aarch64_dispatch + 7],
+            direct_words[aarch64_dispatch + 6],
             aarch64_and_low_w(6, 8, 14).unwrap()
         );
         assert_eq!(
-            direct_words[aarch64_dispatch + 8] & 0xff00_001f,
-            0x3400_0006
+            direct_words[aarch64_dispatch + 7],
+            aarch64_movz_x(12, u16::try_from(COMPACT_CELL_NEXT_MASK).unwrap(), 0).unwrap(),
+        );
+        assert_eq!(
+            direct_words[aarch64_dispatch + 8],
+            aarch64_cmp_w(6, 12).unwrap(),
+        );
+        assert_eq!(
+            direct_words[aarch64_dispatch + 9] & 0xff00_001f,
+            0x5400_0000,
         );
         assert_eq!(direct_words[aarch64_dispatch + 10], 0x8b06_04ab);
         assert_eq!(
@@ -72645,7 +72806,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 .windows(class_lookup.len())
                 .any(|window| window == class_lookup)
         );
-        assert!(class_words.contains(&aarch64_lsr_w_imm(12, 6, 14).unwrap()));
+        assert!(class_words.contains(&aarch64_lsr_w_imm(12, 8, 14).unwrap()));
 
         let direct_reverse_x86 = lower_x86_64_dfa(direct_reverse, FeatureSet::EMPTY)
             .unwrap()
