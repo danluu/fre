@@ -51065,13 +51065,14 @@ static uint16_t rows[2];static uint32_t reverse_rows[256];static uint8_t loop_in
 #define frozen_v4 prepared.continuation.v4
 #define frozen_v6 prepared.continuation.v6
 static size_t observed_cursor;static unsigned preflight_calls,continue_calls,recovery_calls,fallback_calls,helper_calls,helper_bad;static int loop_case;
+static unsigned object_ticket,span_postflight_ticket;
 uint32_t fre_aot_regex_runtime_search_v1(const unsigned char*a,const unsigned char*b,size_t n,size_t s,size_t e,result_t*r){{(void)a;(void)b;(void)n;(void)s;(void)e;(void)r;fallback_calls++;return 97U;}}
 uint32_t fre_aot_regex_runtime_search_exclusive_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;fallback_calls++;return 97U;}}
-uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_preflight_v2(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,const uint32_t*d){{(void)r;(void)d;preflight_calls++;return h==(handle_t)&prepared&&p==haystack&&n==sizeof(haystack)&&s==0U&&e==n&&memcmp(i,identity,32U)==0?6U:96U;}}
-uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_continue_v1(handle_t h,const unsigned char*p,size_t n,result_t*r,size_t state,size_t position,size_t pending){{(void)state;(void)pending;continue_calls++;if(h!=(handle_t)&prepared||p!=haystack||n!=sizeof(haystack)||position==0U||position>=n)return 95U;observed_cursor=position;r->start=1U;r->end=loop_case&&{mode}U!=0U?position:0U;return 8U;}}
-uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_recover_span_v2(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,size_t selected){{recovery_calls++;if(h!=(handle_t)&prepared||p!=haystack||n!=sizeof(haystack)||s!=0U||e!=n||memcmp(i,identity,32U)!=0||selected!=observed_cursor+(loop_case?0U:1U))return 94U;r->start=observed_cursor;r->end=selected;return 1U;}}
+uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_preflight_v2(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,const uint32_t*d){{(void)r;(void)d;preflight_calls++;if(h!=(handle_t)&prepared||p!=haystack||n!=sizeof(haystack)||s!=0U||e!=n||memcmp(i,identity,32U)!=0)return 96U;object_ticket=1U;span_postflight_ticket=0U;return 6U;}}
+uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_continue_v1(handle_t h,const unsigned char*p,size_t n,result_t*r,size_t state,size_t position,size_t pending){{(void)state;(void)pending;continue_calls++;if(h!=(handle_t)&prepared||p!=haystack||n!=sizeof(haystack)||position==0U||position>=n||object_ticket!=1U)return 95U;object_ticket=0U;span_postflight_ticket=({mode}U==2U);observed_cursor=position;r->start=1U;r->end=loop_case&&{mode}U!=0U?position:0U;return 8U;}}
+uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_recover_span_v2(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,size_t selected){{recovery_calls++;if(h!=(handle_t)&prepared||p!=haystack||n!=sizeof(haystack)||s!=0U||e!=n||memcmp(i,identity,32U)!=0||selected!=observed_cursor+(loop_case?0U:1U)||span_postflight_ticket!=1U)return 94U;span_postflight_ticket=0U;r->start=observed_cursor;r->end=selected;return 1U;}}
 size_t fre_aot_regex_runtime_scan_frozen_loop_v2(const unsigned char*p,const void*s,size_t n){{helper_calls++;if(p<haystack||p>haystack+sizeof(haystack)||s!=(const void*)&scanner_cookie)helper_bad++;return n;}}
-static void reset_observations(void){{observed_cursor=0U;preflight_calls=0U;continue_calls=0U;recovery_calls=0U;fallback_calls=0U;helper_calls=0U;helper_bad=0U;}}
+static void reset_observations(void){{observed_cursor=0U;preflight_calls=0U;continue_calls=0U;recovery_calls=0U;fallback_calls=0U;helper_calls=0U;helper_bad=0U;object_ticket=0U;span_postflight_ticket=0U;}}
 static void init_v4(void){{memset(&prepared.continuation,0,sizeof(prepared.continuation));rows[0]=0U;rows[1]=UINT16_C(0x8000);loop_case=0;
   frozen_v4.v1.active_seal=UINT64_C({active_seal});frozen_v4.v1.magic=UINT64_C({magic});
   frozen_v4.v1.abi_version=UINT32_C({abi});frozen_v4.v1.flags=UINT32_C({v4_flag});
@@ -51112,7 +51113,9 @@ static int run_v4(void){{result_t result={{91U,92U}};reset_observations();init_v
   if(observed_cursor==0U||observed_cursor>=sizeof(haystack))return 13;if(helper_calls!=0U||helper_bad!=0U)return 14;
   if({mode}U==0U){{if(status!=1U||result.start!=0U||result.end!=0U||recovery_calls!=0U)return 20;}}
   else if({mode}U==1U){{if(status!=1U||result.start!=observed_cursor+1U||result.end!=observed_cursor+1U||recovery_calls!=0U)return 21;}}
-  else {{if(status!=1U||result.start!=observed_cursor||result.end!=observed_cursor+1U||recovery_calls!=1U)return 22;}}
+  else {{if(status!=1U||result.start!=observed_cursor||result.end!=observed_cursor+1U||recovery_calls!=1U)return 22;
+    result.start=91U;result.end=92U;if(fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_recover_span_v2((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),&result,identity,observed_cursor+1U)!=94U||result.start!=91U||result.end!=92U)return 23;}}
+  if(object_ticket!=0U||span_postflight_ticket!=0U)return 24;
   return 0;}}
 static int run_loop(uint32_t format){{result_t result={{91U,92U}};reset_observations();init_loop(format);uint32_t status={entry}((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),&result);
   if(preflight_calls!=1U||continue_calls!=1U||fallback_calls!=0U||helper_calls!=1U||helper_bad!=0U)fprintf(stderr,"loop format=%u status=%u preflight=%u continue=%u fallback=%u helper=%u bad=%u cursor=%zu result=%zu,%zu\n",format,status,preflight_calls,continue_calls,fallback_calls,helper_calls,helper_bad,observed_cursor,result.start,result.end);
@@ -51120,7 +51123,9 @@ static int run_loop(uint32_t format){{result_t result={{91U,92U}};reset_observat
   if(observed_cursor==0U||observed_cursor>=sizeof(haystack))return 140+(int)format;if(helper_calls!=1U||helper_bad!=0U)return 145+(int)format;
   if({mode}U==0U){{if(status!=0U||result.start!=0U||result.end!=0U||recovery_calls!=0U)return 150+(int)format;}}
   else if({mode}U==1U){{if(status!=1U||result.start!=observed_cursor||result.end!=observed_cursor||recovery_calls!=0U)return 160+(int)format;}}
-  else {{if(status!=1U||result.start!=observed_cursor||result.end!=observed_cursor||recovery_calls!=1U)return 170+(int)format;}}
+  else {{if(status!=1U||result.start!=observed_cursor||result.end!=observed_cursor||recovery_calls!=1U)return 170+(int)format;
+    result.start=91U;result.end=92U;if(fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_recover_span_v2((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),&result,identity,observed_cursor)!=94U||result.start!=91U||result.end!=92U)return 175+(int)format;}}
+  if(object_ticket!=0U||span_postflight_ticket!=0U)return 180+(int)format;
   return 0;}}
 int main(void){{int status=run_v4();if(status!=0)return status;status=run_loop(6U);if(status!=0)return status;return run_loop(7U);}}
 "##,

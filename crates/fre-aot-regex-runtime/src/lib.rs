@@ -426,6 +426,7 @@ pub struct PreparedAotRegex {
     frozen_static_continuation_rows: Option<FrozenStaticContinuationRowsStorageV1>,
     fully_prefilled_fallback: Option<FullyPrefilledFallbackReceipt>,
     static_prefix_object_ticket: Option<StaticPrefixObjectTicket>,
+    static_prefix_span_postflight_ticket: Option<StaticPrefixSpanPostflightTicket>,
 }
 
 /// One generated static-prefix invocation awaiting either a native hole or a
@@ -437,7 +438,21 @@ struct StaticPrefixObjectTicket {
     haystack_address: usize,
     haystack_len: usize,
     window: SearchWindow,
+    artifact_identity: [u8; ARTIFACT_IDENTITY_BYTES],
     descriptor_address: usize,
+}
+
+/// One successful authenticated status-7/8 continuation awaiting its
+/// synchronous variable-Span postflight. This is deliberately distinct from
+/// [`StaticPrefixObjectTicket`]: the continuation consumes the raw generated
+/// object capability while binding its descriptor, so Span recovery must not
+/// recreate or consume that descriptor capability a second time.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StaticPrefixSpanPostflightTicket {
+    haystack_address: usize,
+    haystack_len: usize,
+    window: SearchWindow,
+    artifact_identity: [u8; ARTIFACT_IDENTITY_BYTES],
 }
 
 const _: () = assert!(std::mem::offset_of!(PreparedAotRegex, frozen_header) == 0);
@@ -544,6 +559,7 @@ impl PreparedAotRegex {
             frozen_static_continuation_rows,
             fully_prefilled_fallback,
             static_prefix_object_ticket: None,
+            static_prefix_span_postflight_ticket: None,
         })
     }
 
@@ -585,6 +601,7 @@ impl PreparedAotRegex {
             haystack_address: haystack.as_ptr().expose_provenance(),
             haystack_len: haystack.len(),
             window,
+            artifact_identity: expected_artifact_identity,
             descriptor_address,
         });
         Ok(())
@@ -595,6 +612,10 @@ impl PreparedAotRegex {
         &mut self,
         haystack: &[u8],
     ) -> Result<StaticPrefixObjectTicket, CompileError> {
+        // A second continuation is a replay, not the synchronous Span
+        // postflight selected by the first continuation. Retire any such
+        // postflight capability before rejecting the missing object ticket.
+        self.static_prefix_span_postflight_ticket = None;
         let ticket = self.static_prefix_object_ticket.take().ok_or(
             CompileError::InternalInvariant(
                 "static-prefix continuation has no synchronous object ticket",
@@ -608,6 +629,72 @@ impl PreparedAotRegex {
             ));
         }
         Ok(ticket)
+    }
+
+    #[inline]
+    fn admit_static_prefix_span_postflight(
+        &mut self,
+        ticket: StaticPrefixObjectTicket,
+    ) -> Result<(), CompileError> {
+        self.static_prefix_span_postflight_ticket = None;
+        if self.program.output_contract() != OutputContract::Span
+            || self.program.exact_match_width().is_some()
+        {
+            return Ok(());
+        }
+        if ticket.artifact_identity != *self.frozen_header.artifact_identity() {
+            return Err(CompileError::InternalInvariant(
+                "static-prefix continuation cannot publish a foreign Span postflight",
+            ));
+        }
+        self.static_prefix_span_postflight_ticket = Some(StaticPrefixSpanPostflightTicket {
+            haystack_address: ticket.haystack_address,
+            haystack_len: ticket.haystack_len,
+            window: ticket.window,
+            artifact_identity: ticket.artifact_identity,
+        });
+        Ok(())
+    }
+
+    #[inline]
+    fn consume_static_prefix_span_recovery_ticket(
+        &mut self,
+        haystack: &[u8],
+        window: SearchWindow,
+        expected_artifact_identity: [u8; ARTIFACT_IDENTITY_BYTES],
+    ) -> Result<(), CompileError> {
+        let object = self.static_prefix_object_ticket.take();
+        let postflight = self.static_prefix_span_postflight_ticket.take();
+        let (haystack_address, haystack_len, admitted_window, artifact_identity) =
+            match (object, postflight) {
+                (Some(ticket), None) => (
+                    ticket.haystack_address,
+                    ticket.haystack_len,
+                    ticket.window,
+                    ticket.artifact_identity,
+                ),
+                (None, Some(ticket)) => (
+                    ticket.haystack_address,
+                    ticket.haystack_len,
+                    ticket.window,
+                    ticket.artifact_identity,
+                ),
+                (None, None) | (Some(_), Some(_)) => {
+                    return Err(CompileError::InternalInvariant(
+                        "static-prefix Span recovery has no unique synchronous capability",
+                    ));
+                }
+            };
+        if haystack_address != haystack.as_ptr().expose_provenance()
+            || haystack_len != haystack.len()
+            || admitted_window != window
+            || artifact_identity != expected_artifact_identity
+        {
+            return Err(CompileError::InternalInvariant(
+                "static-prefix Span recovery differs from its admitted invocation",
+            ));
+        }
+        Ok(())
     }
 
     /// Execute without re-deserializing or allocating executor workspace.
@@ -2122,6 +2209,7 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_compiler_private_search_exclusive
             .read();
         let prepared = &mut *handle.0.cast::<PreparedAotRegex>();
         prepared.static_prefix_object_ticket = None;
+        prepared.static_prefix_span_postflight_ticket = None;
         let window = SearchWindow::new(window_start, window_end);
         let Ok(preflight) = prepared.preflight_static_prefix_complete_proofs(
             haystack,
@@ -2250,6 +2338,9 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_compiler_private_search_exclusive
             pending_end,
         ) {
             Ok(Some((status, canonical_state, pending_end))) => {
+                let Ok(()) = prepared.admit_static_prefix_span_postflight(ticket) else {
+                    return STATUS_RUNTIME_FAILURE;
+                };
                 result_ptr.write(FreAotRegexResultV1 {
                     start: canonical_state,
                     end: pending_end,
@@ -2346,18 +2437,22 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_compiler_private_search_exclusive
     .unwrap_or(STATUS_RUNTIME_FAILURE)
 }
 
-/// Recover a Span start after a V2 static-prefix native completion.
+/// Recover a Span start after a V2 static-prefix native completion or an
+/// authenticated status-7/8 continuation.
 ///
-/// This V2 postflight consumes the same single-use ticket as the continuation
-/// helper. Local completion does not need the forward descriptor, so it
-/// authenticates the original window and uses the prepared root receipt for
-/// reverse-only K0 without ever parsing or graph-binding that descriptor.
+/// Direct local completion consumes the original single-use object ticket.
+/// The continuation helper consumes that object ticket while binding the
+/// forward descriptor, then mints a distinct single-use Span postflight ticket
+/// only after it successfully projects an immutable local continuation. Both
+/// capability kinds authenticate the original haystack, window, and artifact;
+/// the descriptor-bearing ticket is never reinserted or consumed twice.
 ///
 /// # Safety
 ///
 /// The raw pointer requirements are identical to the V1 Span postflight. The
-/// generated caller must invoke this synchronously after V2 preflight and a
-/// native completion over the same exact window.
+/// generated caller must invoke this synchronously after V2 preflight and
+/// either a direct native completion or a successful status-7/8 local
+/// continuation over the same exact window.
 #[doc(hidden)]
 #[unsafe(no_mangle)]
 #[allow(
@@ -2399,13 +2494,14 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_compiler_private_search_exclusive
         let expected_artifact_identity = expected_artifact_identity_ptr
             .cast::<[u8; ARTIFACT_IDENTITY_BYTES]>()
             .read();
-        let Ok(ticket) = prepared.consume_static_prefix_object(haystack) else {
+        let window = SearchWindow::new(window_start, window_end);
+        let Ok(()) = prepared.consume_static_prefix_span_recovery_ticket(
+            haystack,
+            window,
+            expected_artifact_identity,
+        ) else {
             return STATUS_RUNTIME_FAILURE;
         };
-        let window = SearchWindow::new(window_start, window_end);
-        if ticket.window != window {
-            return STATUS_RUNTIME_FAILURE;
-        }
         let Ok(MatchResult::Span(Some((start, end)))) = prepared
             .recover_static_prefix_span_from_selected_end(
                 haystack,
@@ -4203,6 +4299,7 @@ mod tests {
             frozen_static_continuation_rows: None,
             fully_prefilled_fallback,
             static_prefix_object_ticket: None,
+            static_prefix_span_postflight_ticket: None,
         };
         FreAotRegexExclusiveHandleV1(
             Box::into_raw(Box::new(prepared)).cast::<std::ffi::c_void>(),
@@ -4324,6 +4421,51 @@ mod tests {
                 selected_end,
             )
         }
+    }
+
+    fn call_exclusive_static_prefix_recover_span_v2(
+        handle: FreAotRegexExclusiveHandleV1,
+        haystack: &[u8],
+        start: usize,
+        end: usize,
+        result: &mut FreAotRegexResultV1,
+        expected_artifact_identity: &[u8; ARTIFACT_IDENTITY_BYTES],
+        selected_end: usize,
+    ) -> u32 {
+        // SAFETY: each test owns the live exclusive session and supplies the
+        // synchronous endpoint plus readable/disjoint pointer extents.
+        unsafe {
+            fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_recover_span_v2(
+                handle,
+                haystack.as_ptr(),
+                haystack.len(),
+                start,
+                end,
+                result,
+                expected_artifact_identity.as_ptr(),
+                selected_end,
+            )
+        }
+    }
+
+    fn publish_static_prefix_span_postflight_for_test(
+        handle: FreAotRegexExclusiveHandleV1,
+        haystack: &[u8],
+    ) {
+        // Model the exact capability transition performed only after a
+        // successful status-7/8 projection: consume the descriptor-bearing
+        // object ticket and publish a distinct variable-Span postflight.
+        // SAFETY: tests call this only with unique access to a live allocation
+        // and the exact admitted haystack while no FFI call overlaps.
+        let prepared = unsafe { &mut *handle.0.cast::<PreparedAotRegex>() };
+        let ticket = prepared
+            .consume_static_prefix_object(haystack)
+            .expect("consume admitted object ticket as continuation");
+        prepared
+            .admit_static_prefix_span_postflight(ticket)
+            .expect("publish authenticated continuation postflight");
+        assert!(prepared.static_prefix_object_ticket.is_none());
+        assert!(prepared.static_prefix_span_postflight_ticket.is_some());
     }
 
     fn exclusive_frozen_header_is_active(handle: FreAotRegexExclusiveHandleV1) -> bool {
@@ -7842,6 +7984,127 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
                 )
             },
             STATUS_RUNTIME_FAILURE
+        );
+        assert_eq!(result, sentinel);
+
+        // SAFETY: this test owns the unique live handle and no call overlaps
+        // destruction.
+        assert_eq!(
+            unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(handle) },
+            STATUS_SUCCESS
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one capability-ledger test covers mismatched invocation, success, and replay"
+    )]
+    fn static_prefix_v2_span_postflight_consumes_distinct_continuation_ticket_once() {
+        let compiled = compile(
+            CompileRequest::new("(?:ab|ac)+z", Target::x86_64_linux())
+                .mode(CompileMode::Fast)
+                .output(OutputContract::Span),
+        )
+        .expect("compile static-prefix continuation Span fixture");
+        assert_eq!(compiled.program().output_contract(), OutputContract::Span);
+        assert_eq!(compiled.program().exact_match_width(), None);
+        let identity = compiled.receipt().program_sha256;
+        let serialized = compiled.program().serialize().expect("serialize fixture");
+        let handle = prepare_exclusive(&serialized);
+        let haystack = b"xxabacz";
+        let descriptor = [0_u32; STATIC_PREFIX_RESUME_DESCRIPTOR_V1_HEADER_BYTES / 4];
+        let sentinel = FreAotRegexResultV1 {
+            start: 0xfeed_face,
+            end: 0xdead_beef,
+        };
+        let mut result = sentinel;
+
+        assert_eq!(
+            call_exclusive_static_prefix_preflight_v2(
+                handle,
+                haystack,
+                0,
+                haystack.len(),
+                &mut result,
+                &identity,
+                &descriptor,
+            ),
+            STATUS_PARTIAL_PREFLIGHT_ENTER
+        );
+        publish_static_prefix_span_postflight_for_test(handle, haystack);
+        let mut wrong_identity = identity;
+        wrong_identity[9] ^= 0x80;
+        // A mismatched invocation consumes the postflight capability and
+        // leaves the caller's result untouched.
+        assert_eq!(
+            call_exclusive_static_prefix_recover_span_v2(
+                handle,
+                haystack,
+                0,
+                haystack.len(),
+                &mut result,
+                &wrong_identity,
+                haystack.len(),
+            ),
+            STATUS_RUNTIME_FAILURE
+        );
+        assert_eq!(result, sentinel);
+        assert_eq!(
+            call_exclusive_static_prefix_recover_span_v2(
+                handle,
+                haystack,
+                0,
+                haystack.len(),
+                &mut result,
+                &identity,
+                haystack.len(),
+            ),
+            STATUS_RUNTIME_FAILURE,
+            "a mismatched postflight cannot be replayed with corrected arguments"
+        );
+        assert_eq!(result, sentinel);
+
+        assert_eq!(
+            call_exclusive_static_prefix_preflight_v2(
+                handle,
+                haystack,
+                0,
+                haystack.len(),
+                &mut result,
+                &identity,
+                &descriptor,
+            ),
+            STATUS_PARTIAL_PREFLIGHT_ENTER
+        );
+        publish_static_prefix_span_postflight_for_test(handle, haystack);
+        assert_eq!(
+            call_exclusive_static_prefix_recover_span_v2(
+                handle,
+                haystack,
+                0,
+                haystack.len(),
+                &mut result,
+                &identity,
+                haystack.len(),
+            ),
+            STATUS_MATCH
+        );
+        assert_eq!(result, FreAotRegexResultV1 { start: 2, end: 7 });
+
+        result = sentinel;
+        assert_eq!(
+            call_exclusive_static_prefix_recover_span_v2(
+                handle,
+                haystack,
+                0,
+                haystack.len(),
+                &mut result,
+                &identity,
+                haystack.len(),
+            ),
+            STATUS_RUNTIME_FAILURE,
+            "a successful continuation postflight is single-use"
         );
         assert_eq!(result, sentinel);
 
