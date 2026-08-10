@@ -4488,6 +4488,41 @@ struct NativeDefaultExceptionPlan {
     row_bytes: usize,
 }
 
+/// A deterministic physical-row quotient for exact completed-row aliases.
+///
+/// The semantic DFA keeps its discovery ordinals. Only the compiler-private
+/// native table is compacted: every live transition is repacked to the
+/// physical row selected here, while incomplete destinations retain their
+/// original resume ordinal. Representatives are the lowest semantic state in
+/// each equality class and physical rows follow representative order, so the
+/// initial state remains physical row zero and repeated lowering is byte
+/// deterministic.
+#[derive(Debug, Eq, PartialEq)]
+struct NativeExactRowInternPlan {
+    logical_to_physical: Vec<u32>,
+    physical_representatives: Vec<u32>,
+}
+
+impl NativeExactRowInternPlan {
+    fn physical_rows(&self) -> usize {
+        self.physical_representatives.len()
+    }
+
+    fn physical_state(&self, logical: usize) -> Option<usize> {
+        self.logical_to_physical
+            .get(logical)
+            .copied()
+            .and_then(|state| usize::try_from(state).ok())
+    }
+
+    fn representative(&self, physical: usize) -> Option<usize> {
+        self.physical_representatives
+            .get(physical)
+            .copied()
+            .and_then(|state| usize::try_from(state).ok())
+    }
+}
+
 /// Canonical semantic equality for resource-rescue rows.
 ///
 /// In a collapsed partial machine, every validated destination outside the
@@ -4540,6 +4575,241 @@ impl NativeDefaultExceptionNormalization {
         };
         ForwardCell::try_new(collapsed_hole_next, cell.accepted())
     }
+}
+
+fn native_normalized_forward_cell_key(
+    normalization: NativeDefaultExceptionNormalization,
+    cell: ForwardCell,
+) -> Option<(u32, bool)> {
+    normalization
+        .normalize(cell)
+        .map(|cell| (cell.next(), cell.accepted()))
+}
+
+fn native_normalized_row_cmp(
+    left: &[ForwardCell],
+    right: &[ForwardCell],
+    normalization: NativeDefaultExceptionNormalization,
+) -> core::cmp::Ordering {
+    left.iter()
+        .copied()
+        .zip(right.iter().copied())
+        .map(|(left, right)| {
+            native_normalized_forward_cell_key(normalization, left)
+                .cmp(&native_normalized_forward_cell_key(normalization, right))
+        })
+        .find(|&ordering| ordering != core::cmp::Ordering::Equal)
+        .unwrap_or_else(|| left.len().cmp(&right.len()))
+}
+
+/// Intern only rows that are already exactly equal under the native partial
+/// packer's authenticated hole semantics.
+///
+/// This deliberately does not attempt one-pass bisimulation. Rows whose
+/// destinations differ only after another prospective merge need a genuine
+/// partition-refinement fixed point, and root/loop accelerator identities
+/// would have to participate in that partition. Exact rows need neither
+/// assumption: their acceptance and destination vectors are identical before
+/// any physical address changes.
+fn derive_native_exact_row_intern_plan(
+    dfa: NativeDfaView<'_>,
+    partial_discovered_states: Option<usize>,
+    collapse_partial_holes: bool,
+) -> Option<NativeExactRowInternPlan> {
+    let discovered_states = partial_discovered_states?;
+    if dfa.class_count == 0
+        || dfa.class_count > CLASS_MAP_BYTES
+        || dfa.forward_cells.is_empty()
+        || !dfa.forward_cells.len().is_multiple_of(dfa.class_count)
+        || dfa.reverse_initial.is_some()
+        || !dfa.reverse_cells.is_empty()
+    {
+        return None;
+    }
+    let logical_states = dfa.forward_cells.len().checked_div(dfa.class_count)?;
+    if discovered_states.checked_sub(logical_states)? == 0
+        || u32::try_from(logical_states).is_err()
+    {
+        return None;
+    }
+    let normalization = NativeDefaultExceptionNormalization::new(
+        logical_states,
+        discovered_states,
+        collapse_partial_holes,
+    )?;
+    if dfa
+        .forward_cells
+        .iter()
+        .copied()
+        .any(|cell| normalization.normalize(cell).is_none())
+    {
+        return None;
+    }
+
+    let mut ordered_states = Vec::new();
+    ordered_states.try_reserve_exact(logical_states).ok()?;
+    for state in 0..logical_states {
+        ordered_states.push(u32::try_from(state).ok()?);
+    }
+    ordered_states.sort_unstable_by(|&left, &right| {
+        let left = usize::try_from(left).unwrap_or(usize::MAX);
+        let right = usize::try_from(right).unwrap_or(usize::MAX);
+        let left_start = left.saturating_mul(dfa.class_count);
+        let right_start = right.saturating_mul(dfa.class_count);
+        let left_row = dfa
+            .forward_cells
+            .get(left_start..left_start.saturating_add(dfa.class_count))
+            .unwrap_or(&[]);
+        let right_row = dfa
+            .forward_cells
+            .get(right_start..right_start.saturating_add(dfa.class_count))
+            .unwrap_or(&[]);
+        native_normalized_row_cmp(left_row, right_row, normalization)
+            .then_with(|| left.cmp(&right))
+    });
+
+    let mut logical_to_representative = Vec::new();
+    logical_to_representative
+        .try_reserve_exact(logical_states)
+        .ok()?;
+    logical_to_representative.resize(logical_states, u32::MAX);
+    let mut group_start = 0_usize;
+    while group_start < ordered_states.len() {
+        let representative = *ordered_states.get(group_start)?;
+        let representative_state = usize::try_from(representative).ok()?;
+        let representative_start = representative_state.checked_mul(dfa.class_count)?;
+        let representative_row = dfa.forward_cells.get(
+            representative_start..representative_start.checked_add(dfa.class_count)?,
+        )?;
+        let mut group_end = group_start.checked_add(1)?;
+        while let Some(&candidate) = ordered_states.get(group_end) {
+            let candidate = usize::try_from(candidate).ok()?;
+            let candidate_start = candidate.checked_mul(dfa.class_count)?;
+            let candidate_row = dfa
+                .forward_cells
+                .get(candidate_start..candidate_start.checked_add(dfa.class_count)?)?;
+            if native_normalized_row_cmp(representative_row, candidate_row, normalization)
+                != core::cmp::Ordering::Equal
+            {
+                break;
+            }
+            group_end = group_end.checked_add(1)?;
+        }
+        for &state in ordered_states.get(group_start..group_end)? {
+            *logical_to_representative.get_mut(usize::try_from(state).ok()?)? = representative;
+        }
+        group_start = group_end;
+    }
+    if logical_to_representative.iter().any(|&state| state == u32::MAX) {
+        return None;
+    }
+
+    let mut physical_representatives = Vec::new();
+    physical_representatives
+        .try_reserve_exact(logical_states)
+        .ok()?;
+    for state in 0..logical_states {
+        if logical_to_representative.get(state).copied()
+            == u32::try_from(state).ok()
+        {
+            physical_representatives.push(u32::try_from(state).ok()?);
+        }
+    }
+    if physical_representatives.len() == logical_states
+        || physical_representatives.first().copied() != Some(0)
+    {
+        return None;
+    }
+
+    ordered_states.clear();
+    ordered_states.resize(logical_states, u32::MAX);
+    for (physical, &representative) in physical_representatives.iter().enumerate() {
+        *ordered_states.get_mut(usize::try_from(representative).ok()?)? =
+            u32::try_from(physical).ok()?;
+    }
+    for representative in &mut logical_to_representative {
+        *representative = *ordered_states.get(usize::try_from(*representative).ok()?)?;
+        if *representative == u32::MAX {
+            return None;
+        }
+    }
+    Some(NativeExactRowInternPlan {
+        logical_to_physical: logical_to_representative,
+        physical_representatives,
+    })
+}
+
+fn native_exact_row_intern_plan_is_valid(
+    dfa: NativeDfaView<'_>,
+    discovered_states: usize,
+    collapse_partial_holes: bool,
+    plan: &NativeExactRowInternPlan,
+) -> bool {
+    let Some(logical_states) = dfa.forward_cells.len().checked_div(dfa.class_count) else {
+        return false;
+    };
+    let Some(normalization) = NativeDefaultExceptionNormalization::new(
+        logical_states,
+        discovered_states,
+        collapse_partial_holes,
+    ) else {
+        return false;
+    };
+    if plan.logical_to_physical.len() != logical_states
+        || plan.physical_rows() == 0
+        || plan.physical_rows() >= logical_states
+        || plan.physical_representatives.first().copied() != Some(0)
+        || plan.logical_to_physical.first().copied() != Some(0)
+    {
+        return false;
+    }
+    let mut prior = None;
+    for (physical, &representative) in plan.physical_representatives.iter().enumerate() {
+        let Ok(representative) = usize::try_from(representative) else {
+            return false;
+        };
+        if representative >= logical_states
+            || prior.is_some_and(|prior| representative <= prior)
+            || plan.physical_state(representative) != Some(physical)
+        {
+            return false;
+        }
+        prior = Some(representative);
+    }
+    for logical in 0..logical_states {
+        let Some(physical) = plan.physical_state(logical) else {
+            return false;
+        };
+        let Some(representative) = plan.representative(physical) else {
+            return false;
+        };
+        if representative > logical {
+            return false;
+        }
+        let Some(logical_start) = logical.checked_mul(dfa.class_count) else {
+            return false;
+        };
+        let Some(representative_start) = representative.checked_mul(dfa.class_count) else {
+            return false;
+        };
+        let Some(logical_row) = dfa
+            .forward_cells
+            .get(logical_start..logical_start.saturating_add(dfa.class_count))
+        else {
+            return false;
+        };
+        let Some(representative_row) = dfa.forward_cells.get(
+            representative_start..representative_start.saturating_add(dfa.class_count),
+        ) else {
+            return false;
+        };
+        if native_normalized_row_cmp(logical_row, representative_row, normalization)
+            != core::cmp::Ordering::Equal
+        {
+            return false;
+        }
+    }
+    true
 }
 
 fn native_default_exception_value_offset(exception_capacity: u8) -> Option<usize> {
@@ -4712,6 +4982,66 @@ fn native_default_exception_retry_plan(
         view.collapse_partial_holes,
         architecture,
     )
+}
+
+fn native_exact_row_intern_retry_plan(
+    view: NativeProgramView<'_>,
+    architecture: Architecture,
+    dense_error: &ObjectError,
+) -> Option<NativeExactRowInternPlan> {
+    if !matches!(
+        dense_error,
+        ObjectError::Allocation(_)
+            | ObjectError::Resource {
+                resource: crate::CompileResource::ProgramBytes,
+                ..
+            }
+    ) {
+        return None;
+    }
+    let plan = derive_native_exact_row_intern_plan(
+        view.dfa,
+        view.partial_discovered_states,
+        view.collapse_partial_holes,
+    )?;
+    let logical_states = view
+        .dfa
+        .forward_cells
+        .len()
+        .checked_div(view.dfa.class_count)?;
+    let resume_states = view
+        .partial_discovered_states?
+        .checked_sub(logical_states)?;
+    let encoded_hole_states = if view.collapse_partial_holes {
+        1
+    } else {
+        resume_states
+    };
+    let (transitions, cells) = select_native_table_encoding_with_holes_for_architecture(
+        view.dfa.class_count,
+        logical_states,
+        0,
+        encoded_hole_states,
+        architecture,
+    );
+    let dense_bytes = native_machine_bytes(
+        transitions,
+        cells,
+        view.dfa.class_count,
+        logical_states,
+        0,
+    )?;
+    let interned_bytes = native_machine_bytes(
+        transitions,
+        cells,
+        view.dfa.class_count,
+        plan.physical_rows(),
+        0,
+    )?;
+    // Preserve the established transition and cell geometry. This retry only
+    // removes exact duplicate rows; it neither reruns width selection with a
+    // smaller count nor overlaps the independent sparse-row representation.
+    (interned_bytes < dense_bytes).then_some(plan)
 }
 
 /// Width of one packed transition cell in the ordinary native DFA tables.
@@ -7119,6 +7449,21 @@ fn build_native_dfa_table_with_cost_model_and_data_limit(
         })) => error,
         Err(error) => return Err(error),
     };
+    if let Some(plan) = native_exact_row_intern_retry_plan(view, architecture, &dense_error) {
+        if let Ok(lowering) =
+            build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
+                view,
+                architecture,
+                vector_cost_model,
+                relation_vector_owns_route,
+                max_native_data_bytes,
+                None,
+                Some(&plan),
+            )
+        {
+            return Ok(lowering);
+        }
+    }
     let Some(plan) = native_default_exception_retry_plan(view, architecture, &dense_error) else {
         return Err(dense_error);
     };
@@ -7162,6 +7507,31 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once(
     relation_vector_owns_route: bool,
     max_native_data_bytes: usize,
     default_exceptions: Option<NativeDefaultExceptionPlan>,
+) -> Result<(Vec<u8>, NativeDfaLayout), ObjectError> {
+    build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
+        view,
+        architecture,
+        vector_cost_model,
+        relation_vector_owns_route,
+        max_native_data_bytes,
+        default_exceptions,
+        None,
+    )
+}
+
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::too_many_lines,
+    reason = "checked table layout and fixed power-of-two alignment stay contiguous for auditability"
+)]
+fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
+    view: NativeProgramView<'_>,
+    architecture: Architecture,
+    vector_cost_model: NativeVectorFilterCostModel,
+    relation_vector_owns_route: bool,
+    max_native_data_bytes: usize,
+    default_exceptions: Option<NativeDefaultExceptionPlan>,
+    exact_rows: Option<&NativeExactRowInternPlan>,
 ) -> Result<(Vec<u8>, NativeDfaLayout), ObjectError> {
     let dfa = view.dfa;
     if dfa.initial_state != 0 || dfa.class_count == 0 || dfa.class_count > 256 {
@@ -7285,6 +7655,33 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once(
     } else {
         resume_states
     };
+    let physical_forward_states = if let Some(plan) = exact_rows {
+        let Some(discovered_states) = view.partial_discovered_states else {
+            return Err(ObjectError::InvalidModule(
+                "exact native row interning has no discovered-state extent",
+            ));
+        };
+        if default_exceptions.is_some()
+            || resume_states == 0
+            || encoded_hole_states == 0
+            || retained_reverse_states != 0
+            || dfa.reverse_initial.is_some()
+            || !dfa.reverse_cells.is_empty()
+            || !native_exact_row_intern_plan_is_valid(
+                dfa,
+                discovered_states,
+                view.collapse_partial_holes,
+                plan,
+            )
+        {
+            return Err(ObjectError::InvalidModule(
+                "exact native row interning has an invalid partial shape",
+            ));
+        }
+        plan.physical_rows()
+    } else {
+        forward_states
+    };
     let (transitions, cells) = if let Some(plan) = default_exceptions {
         if encoded_hole_states == 0
             || retained_reverse_states != 0
@@ -7316,6 +7713,27 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once(
             architecture,
         )
     };
+    if exact_rows.is_some()
+        && !native_machine_bytes(
+            transitions,
+            cells,
+            dfa.class_count,
+            physical_forward_states,
+            0,
+        )
+        .zip(native_machine_bytes(
+            transitions,
+            cells,
+            dfa.class_count,
+            forward_states,
+            0,
+        ))
+        .is_some_and(|(interned, dense)| interned < dense)
+    {
+        return Err(ObjectError::InvalidModule(
+            "exact native row interning does not reduce table bytes",
+        ));
+    }
     if cells == NativeCellEncoding::Compact8Direct
         && (transitions != TransitionLayout::DirectByte || encoded_hole_states != 0)
     {
@@ -7328,7 +7746,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once(
     let forward_offset = native_table_prefix_bytes(transitions, cells, dfa.class_count)
         .ok_or(ObjectError::InvalidModule("native DFA table prefix"))?;
     let forward_bytes =
-        forward_states
+        physical_forward_states
             .checked_mul(row_bytes)
             .ok_or(ObjectError::ArithmeticOverflow(
                 "native forward table bytes",
@@ -7336,7 +7754,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once(
     let partial_layout = if encoded_hole_states == 0 {
         None
     } else {
-        let last_row_offset = forward_states
+        let last_row_offset = physical_forward_states
             .checked_sub(1)
             .and_then(|state| state.checked_mul(row_bytes))
             .and_then(|offset| forward_offset.checked_add(offset))
@@ -7455,6 +7873,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once(
         view.output,
         forward_offset,
         row_bytes,
+        exact_rows.map(|plan| plan.logical_to_physical.as_slice()),
     )?;
     let retains_asimd_candidate_mask = architecture == Architecture::Aarch64
         && (start_filter.is_some_and(|filter| !filter.ranges().is_empty())
@@ -7565,7 +7984,17 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once(
                         "native prefix fast-forward targets an incomplete row",
                     ));
                 }
-                let target_row_offset = target_state
+                let physical_target_state = exact_rows
+                    .map(|plan| {
+                        plan.physical_state(target_state).ok_or(
+                            ObjectError::InvalidModule(
+                                "native prefix target has no physical row",
+                            ),
+                        )
+                    })
+                    .transpose()?
+                    .unwrap_or(target_state);
+                let target_row_offset = physical_target_state
                     .checked_mul(row_bytes)
                     .and_then(|offset| forward_offset.checked_add(offset))
                     .ok_or(ObjectError::ArithmeticOverflow(
@@ -7802,11 +8231,37 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once(
     }
     match transitions {
         TransitionLayout::ClassMapped => {
-            for row in dfa.forward_cells.chunks_exact(dfa.class_count) {
+            for physical_state in 0..physical_forward_states {
+                let semantic_state = exact_rows
+                    .map(|plan| {
+                        plan.representative(physical_state).ok_or(
+                            ObjectError::InvalidModule(
+                                "exact native row has no semantic representative",
+                            ),
+                        )
+                    })
+                    .transpose()?
+                    .unwrap_or(physical_state);
+                let semantic_row = semantic_state.checked_mul(dfa.class_count).ok_or(
+                    ObjectError::ArithmeticOverflow("native forward semantic row"),
+                )?;
+                let row = dfa
+                    .forward_cells
+                    .get(
+                        semantic_row
+                            ..semantic_row.checked_add(dfa.class_count).ok_or(
+                                ObjectError::ArithmeticOverflow(
+                                    "native forward semantic row extent",
+                                ),
+                            )?,
+                    )
+                    .ok_or(ObjectError::InvalidModule(
+                        "exact native semantic row is outside its table",
+                    ))?;
                 let row_start = bytes.len();
                 for &cell in row {
                     let packed = if let Some(partial) = partial_layout {
-                        pack_native_partial_forward_cell(
+                        pack_native_partial_forward_cell_with_exact_rows(
                             cell.next(),
                             cell.accepted(),
                             forward_offset,
@@ -7816,9 +8271,10 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once(
                             loop_skip.map(|plan| plan.state),
                             partial,
                             cells,
+                            exact_rows,
                         )?
                     } else {
-                        pack_native_forward_cell(
+                        pack_native_forward_cell_with_exact_rows(
                             cell.next(),
                             cell.accepted(),
                             forward_offset,
@@ -7827,6 +8283,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once(
                             has_start_scanner,
                             loop_skip.map(|plan| plan.state),
                             cells,
+                            exact_rows,
                         )?
                     };
                     append_native_packed_cell(&mut bytes, packed, cells)?;
@@ -7841,8 +8298,18 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once(
             }
         }
         TransitionLayout::DirectByte => {
-            for state in 0..forward_states {
-                let row = state
+            for physical_state in 0..physical_forward_states {
+                let semantic_state = exact_rows
+                    .map(|plan| {
+                        plan.representative(physical_state).ok_or(
+                            ObjectError::InvalidModule(
+                                "exact native row has no semantic representative",
+                            ),
+                        )
+                    })
+                    .transpose()?
+                    .unwrap_or(physical_state);
+                let row = semantic_state
                     .checked_mul(dfa.class_count)
                     .ok_or(ObjectError::ArithmeticOverflow("native forward row"))?;
                 for &class in dfa.byte_classes {
@@ -7854,7 +8321,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once(
                         )
                         .ok_or(ObjectError::InvalidModule("native forward cell"))?;
                     let packed = if let Some(partial) = partial_layout {
-                        pack_native_partial_forward_cell(
+                        pack_native_partial_forward_cell_with_exact_rows(
                             cell.next(),
                             cell.accepted(),
                             forward_offset,
@@ -7864,9 +8331,10 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once(
                             loop_skip.map(|plan| plan.state),
                             partial,
                             cells,
+                            exact_rows,
                         )?
                     } else {
-                        pack_native_forward_cell(
+                        pack_native_forward_cell_with_exact_rows(
                             cell.next(),
                             cell.accepted(),
                             forward_offset,
@@ -7875,6 +8343,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once(
                             has_start_scanner,
                             loop_skip.map(|plan| plan.state),
                             cells,
+                            exact_rows,
                         )?
                     };
                     append_native_packed_cell(&mut bytes, packed, cells)?;
@@ -10016,6 +10485,7 @@ fn pack_native_cell(
     pack_native_cell_with_acceleration(next, flag, machine_offset, row_bytes, states, false, cells)
 }
 
+#[cfg(test)]
 fn pack_native_forward_cell(
     next: u32,
     flag: bool,
@@ -10026,17 +10496,65 @@ fn pack_native_forward_cell(
     loop_state: Option<u32>,
     cells: NativeCellEncoding,
 ) -> Result<u32, ObjectError> {
-    let accelerated =
-        next != NO_DFA_STATE && ((initial_scannable && next == 0) || loop_state == Some(next));
-    pack_native_cell_with_acceleration(
+    pack_native_forward_cell_with_exact_rows(
         next,
         flag,
         machine_offset,
         row_bytes,
         states,
-        accelerated,
+        initial_scannable,
+        loop_state,
         cells,
+        None,
     )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "forward packing keeps semantic accelerator identity separate from physical rows"
+)]
+fn pack_native_forward_cell_with_exact_rows(
+    next: u32,
+    flag: bool,
+    machine_offset: usize,
+    row_bytes: usize,
+    states: usize,
+    initial_scannable: bool,
+    loop_state: Option<u32>,
+    cells: NativeCellEncoding,
+    exact_rows: Option<&NativeExactRowInternPlan>,
+) -> Result<u32, ObjectError> {
+    let accelerated =
+        next != NO_DFA_STATE && ((initial_scannable && next == 0) || loop_state == Some(next));
+    let encoded_next = if next == NO_DFA_STATE {
+        0
+    } else {
+        let logical = usize::try_from(next)
+            .map_err(|_| ObjectError::ArithmeticOverflow("native DFA next state"))?;
+        if logical >= states {
+            return Err(ObjectError::InvalidModule(
+                "native DFA next state is outside its table",
+            ));
+        }
+        let physical = exact_rows
+            .map(|plan| {
+                plan.physical_state(logical).ok_or(ObjectError::InvalidModule(
+                    "native DFA next state has no physical row",
+                ))
+            })
+            .transpose()?
+            .unwrap_or(logical);
+        let row_offset = physical
+            .checked_mul(row_bytes)
+            .and_then(|offset| machine_offset.checked_add(offset))
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "native DFA next row offset",
+            ))?;
+        encode_native_row_offset(row_offset, cells).ok_or(ObjectError::InvalidModule(
+            "native DFA row is not encodable at its cell width",
+        ))?
+    };
+    pack_native_encoded_cell(encoded_next, flag, accelerated, cells)
 }
 
 #[allow(
@@ -10054,12 +10572,42 @@ fn pack_native_partial_forward_cell(
     partial: NativePartialDfaLayout,
     cells: NativeCellEncoding,
 ) -> Result<u32, ObjectError> {
+    pack_native_partial_forward_cell_with_exact_rows(
+        next,
+        accepted,
+        machine_offset,
+        row_bytes,
+        complete_states,
+        initial_scannable,
+        loop_state,
+        partial,
+        cells,
+        None,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "partial packing keeps semantic holes and accelerators separate from physical rows"
+)]
+fn pack_native_partial_forward_cell_with_exact_rows(
+    next: u32,
+    accepted: bool,
+    machine_offset: usize,
+    row_bytes: usize,
+    complete_states: usize,
+    initial_scannable: bool,
+    loop_state: Option<u32>,
+    partial: NativePartialDfaLayout,
+    cells: NativeCellEncoding,
+    exact_rows: Option<&NativeExactRowInternPlan>,
+) -> Result<u32, ObjectError> {
     if next == NO_DFA_STATE
         || usize::try_from(next)
             .ok()
             .is_some_and(|next| next < complete_states)
     {
-        return pack_native_forward_cell(
+        return pack_native_forward_cell_with_exact_rows(
             next,
             accepted,
             machine_offset,
@@ -10068,6 +10616,7 @@ fn pack_native_partial_forward_cell(
             initial_scannable,
             loop_state,
             cells,
+            exact_rows,
         );
     }
     let next = usize::try_from(next)
@@ -10109,14 +10658,24 @@ fn pack_native_cell_with_acceleration(
     accelerated: bool,
     cells: NativeCellEncoding,
 ) -> Result<u32, ObjectError> {
-    let encoded_next = u32::try_from(encode_native_next(
+    let encoded_next = encode_native_next(
         next,
         machine_offset,
         row_bytes,
         states,
         cells,
-    )?)
-    .map_err(|_| ObjectError::ArithmeticOverflow("native DFA encoded next row"))?;
+    )?;
+    pack_native_encoded_cell(encoded_next, flag, accelerated, cells)
+}
+
+fn pack_native_encoded_cell(
+    encoded_next: usize,
+    flag: bool,
+    accelerated: bool,
+    cells: NativeCellEncoding,
+) -> Result<u32, ObjectError> {
+    let encoded_next = u32::try_from(encoded_next)
+        .map_err(|_| ObjectError::ArithmeticOverflow("native DFA encoded next row"))?;
     if encoded_next > cells.next_mask() {
         return Err(ObjectError::InvalidModule(
             "native DFA state exceeds packed cell",
@@ -34124,11 +34683,14 @@ mod tests {
     }
 
     /// Every retained row after row zero names eight distinct incomplete
-    /// destinations. Packed collapsed semantics retain only two observable
-    /// hole variants (accepted and unaccepted), plus the dead cell. The nine
-    /// logical classes deliberately make the ordinary compact-indexed table
-    /// unattractive on x86-64 and still larger than the sparse rows on
-    /// AArch64, so both target families exercise the resource retry.
+    /// destinations and one row-specific live destination. Packed collapsed
+    /// semantics retain only two observable hole variants (accepted and
+    /// unaccepted), plus the live destination. The root retains a dead cell.
+    /// The live destination prevents exact-row interning from superseding the
+    /// sparse retry exercised by this fixture. The nine logical classes
+    /// deliberately make the ordinary compact-indexed table unattractive on
+    /// x86-64 and still larger than the sparse rows on AArch64, so both target
+    /// families exercise the resource retry.
     struct PackedCollapsedDefaultExceptionFixture {
         byte_classes: [u8; 256],
         class_representatives: [u8; 9],
@@ -34160,6 +34722,8 @@ mod tests {
                         ForwardCell::new(first_hole + u32::try_from(class).unwrap(), false)
                     } else if class <= 7 {
                         ForwardCell::new(first_hole + u32::try_from(class).unwrap(), true)
+                    } else if state != 0 {
+                        ForwardCell::new(u32::try_from(state).unwrap(), false)
                     } else {
                         ForwardCell::new(NO_DFA_STATE, false)
                     };
@@ -34188,6 +34752,93 @@ mod tests {
                 },
                 partial_discovered_states: Some(Self::DISCOVERED_STATES),
                 collapse_partial_holes: true,
+                exact_match_width: None,
+                max_match_width: None,
+                exact_product_width: None,
+                retained_prefix_requirement: None,
+                retained_suffix_requirement: None,
+                ..base
+            }
+        }
+    }
+
+    /// A resource-pressure fixture whose ordinary rows are intentionally not
+    /// sparse: rows 1 through 63 are exact semantic aliases, but their modal
+    /// cell has eight exceptions. State 10 is the only semantic self-loop and
+    /// shares physical row 1 after interning. The initial row's four singleton
+    /// departures retain every supported vector scanner tier, including SVE2
+    /// `MATCH`, without depending on source or benchmark identity.
+    struct ExactRowInternFixture {
+        byte_classes: [u8; 256],
+        class_representatives: [u8; 12],
+        forward_cells: Vec<ForwardCell>,
+    }
+
+    impl ExactRowInternFixture {
+        const CLASS_COUNT: usize = 12;
+        const COMPLETE_ROWS: usize = 64;
+        const DISCOVERED_STATES: usize = Self::COMPLETE_ROWS + 2;
+        const LOOP_STATE: u32 = 10;
+
+        fn new() -> Self {
+            let mut byte_classes = [0_u8; 256];
+            for byte in 1..Self::CLASS_COUNT {
+                byte_classes[byte] = u8::try_from(byte).unwrap();
+            }
+            let class_representatives = core::array::from_fn(|class| {
+                u8::try_from(class).unwrap()
+            });
+            let mut forward_cells = Vec::with_capacity(
+                Self::COMPLETE_ROWS * Self::CLASS_COUNT,
+            );
+            for class in 0..Self::CLASS_COUNT {
+                let next = if matches!(class, 1 | 3 | 5 | 7) {
+                    Self::LOOP_STATE
+                } else {
+                    0
+                };
+                forward_cells.push(ForwardCell::new(next, false));
+            }
+            let first_hole = u32::try_from(Self::COMPLETE_ROWS).unwrap();
+            let duplicate_row = [
+                ForwardCell::new(Self::LOOP_STATE, false),
+                ForwardCell::new(Self::LOOP_STATE, false),
+                ForwardCell::new(Self::LOOP_STATE, false),
+                ForwardCell::new(Self::LOOP_STATE, false),
+                ForwardCell::new(2, false),
+                ForwardCell::new(3, false),
+                ForwardCell::new(4, true),
+                ForwardCell::new(5, true),
+                ForwardCell::new(first_hole, false),
+                ForwardCell::new(first_hole + 1, false),
+                ForwardCell::new(NO_DFA_STATE, false),
+                ForwardCell::new(0, true),
+            ];
+            for _ in 1..Self::COMPLETE_ROWS {
+                forward_cells.extend_from_slice(&duplicate_row);
+            }
+            Self {
+                byte_classes,
+                class_representatives,
+                forward_cells,
+            }
+        }
+
+        fn view<'a>(&'a self, base: NativeProgramView<'a>) -> NativeProgramView<'a> {
+            NativeProgramView {
+                dfa: NativeDfaView {
+                    initial_state: 0,
+                    initial_pending: false,
+                    initial_terminal: false,
+                    byte_classes: &self.byte_classes,
+                    class_count: Self::CLASS_COUNT,
+                    class_representatives: &self.class_representatives,
+                    forward_cells: &self.forward_cells,
+                    reverse_initial: None,
+                    reverse_cells: &[],
+                },
+                partial_discovered_states: Some(Self::DISCOVERED_STATES),
+                collapse_partial_holes: false,
                 exact_match_width: None,
                 max_match_width: None,
                 exact_product_width: None,
@@ -34230,6 +34881,30 @@ mod tests {
             true,
             maximum,
             Some(plan),
+        )
+    }
+
+    fn build_forced_exact_row_intern_table(
+        view: NativeProgramView<'_>,
+        architecture: Architecture,
+        vector_cost_model: NativeVectorFilterCostModel,
+        relation_vector_owns_route: bool,
+        maximum: usize,
+    ) -> Result<(Vec<u8>, NativeDfaLayout), ObjectError> {
+        let plan = derive_native_exact_row_intern_plan(
+            view.dfa,
+            view.partial_discovered_states,
+            view.collapse_partial_holes,
+        )
+        .expect("synthetic exact-row intern plan");
+        build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
+            view,
+            architecture,
+            vector_cost_model,
+            relation_vector_owns_route,
+            maximum,
+            None,
+            Some(&plan),
         )
     }
 
@@ -51207,6 +51882,679 @@ int main(void){{
         assert_eq!(false_packed & cells.next_mask(), partial.hole_token_base);
         assert_ne!(false_packed & cells.accelerated(), 0);
         assert_eq!(false_packed ^ accepted_packed, cells.accepts());
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the exhaustive two-row oracle and packed identity checks share one semantic proof"
+    )]
+    fn exact_row_interning_has_an_exhaustive_cell_and_identity_oracle() {
+        let byte_classes = core::array::from_fn(|byte| u8::from(byte != 0));
+        let class_representatives = [0, 1];
+        let universe = [
+            ForwardCell::new(NO_DFA_STATE, false),
+            ForwardCell::new(NO_DFA_STATE, true),
+            ForwardCell::new(0, false),
+            ForwardCell::new(0, true),
+            ForwardCell::new(1, false),
+            ForwardCell::new(1, true),
+            ForwardCell::new(2, false),
+            ForwardCell::new(2, true),
+            ForwardCell::new(3, false),
+            ForwardCell::new(3, true),
+        ];
+        let oracle = |cell: ForwardCell, collapse_holes: bool| {
+            let next = if collapse_holes
+                && cell.next() != NO_DFA_STATE
+                && cell.next() >= 2
+            {
+                2
+            } else {
+                cell.next()
+            };
+            (next, cell.accepted())
+        };
+        for &first_left in &universe {
+            for &first_right in &universe {
+                for &second_left in &universe {
+                    for &second_right in &universe {
+                        let forward_cells = [
+                            first_left,
+                            first_right,
+                            second_left,
+                            second_right,
+                        ];
+                        let dfa = NativeDfaView {
+                            initial_state: 0,
+                            initial_pending: false,
+                            initial_terminal: false,
+                            byte_classes: &byte_classes,
+                            class_count: 2,
+                            class_representatives: &class_representatives,
+                            forward_cells: &forward_cells,
+                            reverse_initial: None,
+                            reverse_cells: &[],
+                        };
+                        for collapse_holes in [false, true] {
+                            let equal = oracle(first_left, collapse_holes)
+                                == oracle(second_left, collapse_holes)
+                                && oracle(first_right, collapse_holes)
+                                    == oracle(second_right, collapse_holes);
+                            let plan = derive_native_exact_row_intern_plan(
+                                dfa,
+                                Some(4),
+                                collapse_holes,
+                            );
+                            assert_eq!(
+                                plan.is_some(),
+                                equal,
+                                "collapse={collapse_holes}/{forward_cells:?}",
+                            );
+                            if let Some(plan) = plan {
+                                assert_eq!(plan.logical_to_physical, [0, 0]);
+                                assert_eq!(plan.physical_representatives, [0]);
+                                assert!(native_exact_row_intern_plan_is_valid(
+                                    dfa,
+                                    4,
+                                    collapse_holes,
+                                    &plan,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let equal_rows = [
+            ForwardCell::new(0, false),
+            ForwardCell::new(1, true),
+            ForwardCell::new(0, false),
+            ForwardCell::new(1, true),
+        ];
+        let dfa = NativeDfaView {
+            initial_state: 0,
+            initial_pending: false,
+            initial_terminal: false,
+            byte_classes: &byte_classes,
+            class_count: 2,
+            class_representatives: &class_representatives,
+            forward_cells: &equal_rows,
+            reverse_initial: None,
+            reverse_cells: &[],
+        };
+        let plan = derive_native_exact_row_intern_plan(dfa, Some(4), false).unwrap();
+        let cells = NativeCellEncoding::Wide32;
+        let machine_offset = CLASS_MAP_BYTES;
+        let row_bytes = 8;
+        let last_live = encode_native_row_offset(machine_offset, cells).unwrap();
+        let partial = NativePartialDfaLayout {
+            hole_token_base: u32::try_from(last_live + 1).unwrap(),
+            resume_states: 2,
+            collapse_holes: false,
+        };
+        let root = pack_native_partial_forward_cell_with_exact_rows(
+            0,
+            false,
+            machine_offset,
+            row_bytes,
+            2,
+            true,
+            None,
+            partial,
+            cells,
+            Some(&plan),
+        )
+        .unwrap();
+        let alias_without_loop = pack_native_partial_forward_cell_with_exact_rows(
+            1,
+            true,
+            machine_offset,
+            row_bytes,
+            2,
+            true,
+            None,
+            partial,
+            cells,
+            Some(&plan),
+        )
+        .unwrap();
+        let alias_with_loop = pack_native_partial_forward_cell_with_exact_rows(
+            1,
+            true,
+            machine_offset,
+            row_bytes,
+            2,
+            true,
+            Some(1),
+            partial,
+            cells,
+            Some(&plan),
+        )
+        .unwrap();
+        assert_eq!(root & cells.next_mask(), alias_without_loop & cells.next_mask());
+        assert_ne!(root & cells.accelerated(), 0);
+        assert_eq!(alias_without_loop & cells.accelerated(), 0);
+        assert_ne!(alias_with_loop & cells.accelerated(), 0);
+        assert_eq!(root & cells.accepts(), 0);
+        assert_ne!(alias_with_loop & cells.accepts(), 0);
+
+        let first_hole = pack_native_partial_forward_cell_with_exact_rows(
+            2,
+            false,
+            machine_offset,
+            row_bytes,
+            2,
+            true,
+            Some(1),
+            partial,
+            cells,
+            Some(&plan),
+        )
+        .unwrap();
+        let second_hole = pack_native_partial_forward_cell_with_exact_rows(
+            3,
+            false,
+            machine_offset,
+            row_bytes,
+            2,
+            true,
+            Some(1),
+            partial,
+            cells,
+            Some(&plan),
+        )
+        .unwrap();
+        assert_eq!(first_hole & cells.next_mask(), partial.hole_token_base);
+        assert_eq!(second_hole & cells.next_mask(), partial.hole_token_base + 1);
+        let collapsed = NativePartialDfaLayout {
+            collapse_holes: true,
+            ..partial
+        };
+        let collapsed_hole = |next| {
+            pack_native_partial_forward_cell_with_exact_rows(
+                next,
+                false,
+                machine_offset,
+                row_bytes,
+                2,
+                true,
+                Some(1),
+                collapsed,
+                cells,
+                Some(&plan),
+            )
+            .unwrap()
+        };
+        assert_eq!(collapsed_hole(2), collapsed_hole(3));
+
+        let reverse = [
+            crate::dfa::ReverseCell::new(0, false),
+            crate::dfa::ReverseCell::new(0, false),
+        ];
+        let reverse_dfa = NativeDfaView {
+            reverse_initial: Some(0),
+            reverse_cells: &reverse,
+            ..dfa
+        };
+        assert!(derive_native_exact_row_intern_plan(reverse_dfa, Some(4), false).is_none());
+        assert!(derive_native_exact_row_intern_plan(dfa, None, false).is_none());
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "resource boundaries, physical geometry, and every representative cell share one exact table oracle"
+    )]
+    fn exact_row_intern_retry_is_smaller_deterministic_and_fail_closed() {
+        let compiled = compile_uniform_default_base(OutputContract::SelectedEnd);
+        let base = compiled
+            .program()
+            .native_dfa_view()
+            .expect("exact-row base native view");
+        let fixture = ExactRowInternFixture::new();
+        let view = fixture.view(base);
+        for architecture in [Architecture::X86_64, Architecture::Aarch64] {
+            let plan = derive_native_exact_row_intern_plan(
+                view.dfa,
+                view.partial_discovered_states,
+                view.collapse_partial_holes,
+            )
+            .expect("exact duplicate rows");
+            assert_eq!(plan.physical_representatives, [0, 1]);
+            assert_eq!(plan.logical_to_physical[0], 0);
+            assert!(plan.logical_to_physical[1..].iter().all(|&row| row == 1));
+            assert_eq!(
+                derive_native_exact_row_intern_plan(
+                    view.dfa,
+                    view.partial_discovered_states,
+                    view.collapse_partial_holes,
+                ),
+                Some(NativeExactRowInternPlan {
+                    logical_to_physical: plan.logical_to_physical.clone(),
+                    physical_representatives: plan.physical_representatives.clone(),
+                }),
+                "{architecture:?}",
+            );
+            assert!(derive_native_default_exception_plan(
+                view.dfa,
+                view.partial_discovered_states,
+                view.collapse_partial_holes,
+                architecture,
+            )
+            .is_none());
+            let allocation = ObjectError::Allocation("synthetic dense allocation pressure");
+            assert_eq!(
+                native_exact_row_intern_retry_plan(view, architecture, &allocation),
+                Some(NativeExactRowInternPlan {
+                    logical_to_physical: plan.logical_to_physical.clone(),
+                    physical_representatives: plan.physical_representatives.clone(),
+                }),
+            );
+            assert!(native_exact_row_intern_retry_plan(
+                view,
+                architecture,
+                &ObjectError::InvalidModule("synthetic non-resource decline"),
+            )
+            .is_none());
+
+            let dense = build_native_dfa_table_with_cost_model_and_data_limit_once(
+                view,
+                architecture,
+                NativeVectorFilterCostModel::Established,
+                true,
+                usize::MAX,
+                None,
+            )
+            .unwrap();
+            let interned = build_forced_exact_row_intern_table(
+                view,
+                architecture,
+                NativeVectorFilterCostModel::Established,
+                true,
+                usize::MAX,
+            )
+            .unwrap();
+            assert!(interned.0.len() < dense.0.len(), "{architecture:?}");
+            assert_eq!(interned.1.transitions, dense.1.transitions);
+            assert_eq!(interned.1.cells, dense.1.cells);
+            assert_eq!(interned.1.transitions, TransitionLayout::ClassMapped);
+
+            // A fitting dense table is unchanged. The quotient is attempted
+            // only after the exact established table crosses the byte bound.
+            assert_eq!(
+                build_native_dfa_table_with_cost_model_and_data_limit(
+                    view,
+                    architecture,
+                    NativeVectorFilterCostModel::Established,
+                    true,
+                    usize::MAX,
+                )
+                .unwrap(),
+                dense,
+                "{architecture:?}",
+            );
+            assert_eq!(
+                build_native_dfa_table_with_cost_model_and_data_limit(
+                    view,
+                    architecture,
+                    NativeVectorFilterCostModel::Established,
+                    true,
+                    interned.0.len(),
+                )
+                .unwrap(),
+                interned,
+                "{architecture:?}",
+            );
+            let below = interned.0.len() - 1;
+            let declined = build_native_dfa_table_with_cost_model_and_data_limit(
+                view,
+                architecture,
+                NativeVectorFilterCostModel::Established,
+                true,
+                below,
+            );
+            assert!(matches!(
+                declined,
+                Err(ObjectError::Resource {
+                    resource: crate::CompileResource::ProgramBytes,
+                    limit,
+                    ..
+                }) if limit == below
+            ), "{architecture:?}: {declined:?}");
+
+            let data = &interned.0;
+            let layout = interned.1;
+            let partial = layout.partial.expect("interned partial layout");
+            assert!(!partial.collapse_holes);
+            assert_eq!(partial.resume_states, 2);
+            let row_bytes = native_row_bytes(
+                layout.transitions,
+                layout.cells,
+                ExactRowInternFixture::CLASS_COUNT,
+            )
+            .unwrap();
+            let forward_offset = usize::try_from(layout.forward_offset).unwrap();
+            let final_row_offset = forward_offset + row_bytes;
+            let last_live = u32::try_from(
+                encode_native_row_offset(final_row_offset, layout.cells).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(partial.hole_token_base, last_live + 1);
+            let loop_skip = layout.loop_skip.expect("semantic loop survives interning");
+            assert_eq!(loop_skip.state, ExactRowInternFixture::LOOP_STATE);
+            assert_eq!(
+                loop_skip.row_offset,
+                u32::try_from(forward_offset + row_bytes).unwrap(),
+            );
+
+            for (physical_state, semantic_state) in [(0_usize, 0_usize), (1, 1)] {
+                for class in 0..ExactRowInternFixture::CLASS_COUNT {
+                    let semantic = view.dfa.forward_cells
+                        [semantic_state * ExactRowInternFixture::CLASS_COUNT + class];
+                    let offset = forward_offset
+                        + physical_state * row_bytes
+                        + class * layout.cells.bytes();
+                    let packed = match layout.cells {
+                        NativeCellEncoding::Compact16
+                        | NativeCellEncoding::Compact16Indexed(_) => u32::from(
+                            u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()),
+                        ),
+                        NativeCellEncoding::Wide32 => {
+                            u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap())
+                        }
+                        NativeCellEncoding::Compact8Direct => {
+                            panic!("partial exact rows used a complete-only cell")
+                        }
+                    };
+                    let expected = pack_native_partial_forward_cell_with_exact_rows(
+                        semantic.next(),
+                        semantic.accepted(),
+                        forward_offset,
+                        row_bytes,
+                        ExactRowInternFixture::COMPLETE_ROWS,
+                        layout.has_start_scanner(),
+                        Some(loop_skip.state),
+                        partial,
+                        layout.cells,
+                        Some(&plan),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        packed, expected,
+                        "{architecture:?}/physical={physical_state}/class={class}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one exact resource retry is structurally lowered through every supported vector tier"
+    )]
+    fn exact_row_intern_retry_lowers_every_target_vector_tier() {
+        let compiled = compile_uniform_default_base(OutputContract::SelectedEnd);
+        let base = compiled
+            .program()
+            .native_dfa_view()
+            .expect("exact-row target base native view");
+        let fixture = ExactRowInternFixture::new();
+        let view = fixture.view(base);
+        let avx512 = FeatureSet::of(CpuFeature::X86Avx512F)
+            .with(CpuFeature::X86Avx512Bw)
+            .with(CpuFeature::X86Avx512Vl);
+        let sve = FeatureSet::of(CpuFeature::Aarch64Sve);
+        let sve2 = sve.with(CpuFeature::Aarch64Sve2);
+        let cases = [
+            (Target::x86_64_linux(), NativeScannerIsa::X86Sse2),
+            (
+                Target::x86_64_macos()
+                    .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+                    .unwrap(),
+                NativeScannerIsa::X86Avx2,
+            ),
+            (
+                Target::x86_64_linux().with_features(avx512).unwrap(),
+                NativeScannerIsa::X86Avx512Bw,
+            ),
+            (
+                Target::aarch64_macos()
+                    .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                    .unwrap(),
+                NativeScannerIsa::Aarch64Asimd,
+            ),
+            (
+                Target::aarch64_linux().with_features(sve).unwrap(),
+                NativeScannerIsa::Aarch64Sve,
+            ),
+            (
+                Target::aarch64_linux().with_features(sve2).unwrap(),
+                NativeScannerIsa::Aarch64Sve2,
+            ),
+        ];
+
+        for (target, expected_isa) in cases {
+            let cost_model = native_vector_filter_cost_model_for_target(target, true);
+            let relation_vector_owns_route = direct_relation_vector_owns_route(target);
+            let dense_table = build_native_dfa_table_with_cost_model_and_data_limit_once(
+                view,
+                target.architecture,
+                cost_model,
+                relation_vector_owns_route,
+                usize::MAX,
+                None,
+            )
+            .unwrap();
+            let (mut interned_data, mut interned_layout) =
+                build_forced_exact_row_intern_table(
+                    view,
+                    target.architecture,
+                    cost_model,
+                    relation_vector_owns_route,
+                    usize::MAX,
+                )
+                .unwrap();
+            assert!(interned_data.len() < dense_table.0.len(), "{target:?}");
+
+            let emission = match target.architecture {
+                Architecture::X86_64 => {
+                    lower_x86_64_dfa_with_emission(interned_layout, target.features).unwrap()
+                }
+                Architecture::Aarch64 => {
+                    let sve_plan = install_aarch64_sve_filter_plan(
+                        &mut interned_data,
+                        interned_layout,
+                        target,
+                    )
+                    .unwrap();
+                    install_aarch64_sve_loop_storage_with_limit(
+                        &mut interned_data,
+                        &mut interned_layout,
+                        target,
+                        usize::MAX,
+                    )
+                    .unwrap();
+                    lower_aarch64_dfa_for_operating_system_with_emission(
+                        interned_layout,
+                        target.features,
+                        target.operating_system,
+                        sve_plan,
+                    )
+                    .unwrap()
+                }
+            };
+            let scanner = emission.scanner.expect("interned primary scanner receipt");
+            assert_eq!(scanner.isa, expected_isa, "{target:?}");
+            assert!(scanner.vectorized, "{target:?}");
+
+            let dense_lowering = lower_native_dfa(view, target)
+                .unwrap()
+                .expect("fitting dense target lowering");
+            let limit = dense_table.0.len() - 1;
+            assert!(interned_data.len() <= limit, "{target:?}");
+            let interned_lowering = lower_native_dfa_with_data_limit(view, target, limit)
+                .unwrap()
+                .expect("exact-row resource rescue");
+            assert!(interned_lowering.data.len() <= limit, "{target:?}");
+            assert!(
+                interned_lowering.data.len() < dense_lowering.data.len(),
+                "{target:?}",
+            );
+            assert_eq!(
+                interned_lowering.start_accelerator,
+                scanner.start_accelerator(),
+                "{target:?}",
+            );
+            assert!(!interned_lowering.code.is_empty(), "{target:?}");
+            if expected_isa == NativeScannerIsa::Aarch64Sve2 {
+                assert!(interned_lowering.code.chunks_exact(4).any(|bytes| {
+                    bytes == aarch64_sve2_match_b(1, 0, 16).unwrap().to_le_bytes()
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn exact_row_interning_maps_guarded_prefix_targets_to_physical_rows() {
+        const PATTERN: &str =
+            r"(?-u:\x01)abcdefgh(?:a+Q|[b-c][a-b]{1,5}(?:x+|y+))";
+        const PREFIX: &[u8] = b"\x01abcdefgh";
+        let limits = CompileLimitsV1 {
+            determinize: DeterminizeLimits {
+                max_states: 16,
+                ..DeterminizeLimits::default()
+            },
+            ..CompileLimitsV1::default()
+        };
+        let compiled = compile(
+            CompileRequest::new(PATTERN, Target::x86_64_linux())
+                .mode(CompileMode::Optimizing)
+                .output(OutputContract::SelectedEnd)
+                .limits(limits),
+        )
+        .unwrap();
+        let partial = compiled
+            .program()
+            .native_partial_dfa_view()
+            .expect("prefix exact-row partial view");
+        let mut state = partial.dfa.dfa.initial_state;
+        let mut prior_states = Vec::new();
+        for &byte in PREFIX {
+            prior_states.push(state);
+            let row = usize::try_from(state).unwrap() * partial.dfa.class_count;
+            let class = usize::from(partial.dfa.byte_classes[usize::from(byte)]);
+            state = partial.dfa.dfa.forward_cells[row + class].next();
+        }
+        let target_state = usize::try_from(state).unwrap();
+        assert!(target_state < partial.complete_rows);
+        assert!(!prior_states.contains(&state));
+        assert_ne!(target_state, 0);
+        assert!(partial.complete_rows > 10);
+        assert!(!prior_states.contains(&10));
+
+        // Relabel the authenticated completed prefix without changing its
+        // graph. This places the final target at the highest ordinal and an
+        // off-path row at ordinal one. Giving that off-path row the target's
+        // exact contents creates a lower representative without changing any
+        // row consumed by the guarded prefix proof.
+        let complete_rows = partial.complete_rows;
+        let mut old_to_new = (0..complete_rows).collect::<Vec<_>>();
+        old_to_new.swap(1, 10);
+        old_to_new.swap(target_state, complete_rows - 1);
+        let class_count = partial.dfa.class_count;
+        let mut forward_cells = vec![
+            ForwardCell::new(NO_DFA_STATE, false);
+            partial.dfa.dfa.forward_cells.len()
+        ];
+        for old_state in 0..complete_rows {
+            let new_state = old_to_new[old_state];
+            for class in 0..class_count {
+                let cell = partial.dfa.dfa.forward_cells[old_state * class_count + class];
+                let next = usize::try_from(cell.next())
+                    .ok()
+                    .filter(|&next| next < complete_rows)
+                    .map_or(cell.next(), |next| u32::try_from(old_to_new[next]).unwrap());
+                forward_cells[new_state * class_count + class] =
+                    ForwardCell::new(next, cell.accepted());
+            }
+        }
+        let representative_state = old_to_new[10];
+        let target_state = old_to_new[target_state];
+        assert_eq!(representative_state, 1);
+        assert_eq!(target_state, complete_rows - 1);
+        let target_row = forward_cells
+            [target_state * class_count..(target_state + 1) * class_count]
+            .to_vec();
+        forward_cells[representative_state * class_count..(representative_state + 1) * class_count]
+            .copy_from_slice(&target_row);
+        let dfa = NativeDfaView {
+            forward_cells: &forward_cells,
+            ..partial.native.dfa
+        };
+        let view = NativeProgramView {
+            dfa,
+            ..partial.native
+        };
+        let plan = derive_native_exact_row_intern_plan(
+            view.dfa,
+            view.partial_discovered_states,
+            view.collapse_partial_holes,
+        )
+        .expect("prefix target exact alias");
+        assert_eq!(plan.physical_state(0), Some(0));
+        assert_eq!(plan.physical_state(representative_state), Some(1));
+        assert_eq!(plan.physical_state(target_state), Some(1));
+
+        for architecture in [Architecture::X86_64, Architecture::Aarch64] {
+            let dense = build_native_dfa_table_with_cost_model_and_data_limit_once(
+                view,
+                architecture,
+                NativeVectorFilterCostModel::Established,
+                true,
+                usize::MAX,
+                None,
+            )
+            .unwrap();
+            let interned = build_forced_exact_row_intern_table(
+                view,
+                architecture,
+                NativeVectorFilterCostModel::Established,
+                true,
+                usize::MAX,
+            )
+            .unwrap();
+            assert!(interned.0.len() < dense.0.len(), "{architecture:?}");
+            let fast_forward = interned
+                .1
+                .prefix_fast_forward
+                .expect("interned guarded prefix target");
+            assert_eq!(usize::from(fast_forward.consumed_bytes), PREFIX.len());
+            let row_bytes = native_row_bytes(
+                interned.1.transitions,
+                interned.1.cells,
+                class_count,
+            )
+            .unwrap();
+            assert_eq!(
+                fast_forward.target_row_offset,
+                interned.1.forward_offset + u32::try_from(row_bytes).unwrap(),
+            );
+            assert_eq!(
+                build_native_dfa_table_with_cost_model_and_data_limit(
+                    view,
+                    architecture,
+                    NativeVectorFilterCostModel::Established,
+                    true,
+                    interned.0.len(),
+                )
+                .unwrap(),
+                interned,
+                "{architecture:?}",
+            );
+        }
     }
 
     #[test]

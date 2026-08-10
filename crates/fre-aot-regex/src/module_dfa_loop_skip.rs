@@ -39,7 +39,7 @@ pub(super) struct NativeDfaLoopSkip {
     pub(super) accepting: bool,
     /// Semantic DFA state selected by the target-neutral graph analysis.
     pub(super) state: u32,
-    /// Table-relative byte address of the semantic state's forward row.
+    /// Table-relative byte address of the selected state's physical row.
     pub(super) row_offset: u32,
     /// Optional target-installed 16-byte table for SVE2 `MATCH`.
     ///
@@ -56,13 +56,30 @@ pub(super) fn derive_native_dfa_loop_skip(
     output: OutputContract,
     forward_offset: usize,
     row_bytes: usize,
+    logical_to_physical: Option<&[u32]>,
 ) -> Result<Option<NativeDfaLoopSkip>, ObjectError> {
     let Some(plan) = select_dfa_loop_skip(dfa, output) else {
         return Ok(None);
     };
     let state = usize::try_from(plan.state)
         .map_err(|_| ObjectError::ArithmeticOverflow("native loop-skip state"))?;
-    let row_offset = state
+    let physical_state = logical_to_physical
+        .map(|mapping| {
+            mapping
+                .get(state)
+                .copied()
+                .ok_or(ObjectError::InvalidModule(
+                    "native loop-skip state has no physical row",
+                ))
+                .and_then(|state| {
+                    usize::try_from(state).map_err(|_| {
+                        ObjectError::ArithmeticOverflow("native loop-skip physical state")
+                    })
+                })
+        })
+        .transpose()?
+        .unwrap_or(state);
+    let row_offset = physical_state
         .checked_mul(row_bytes)
         .and_then(|offset| offset.checked_add(forward_offset))
         .and_then(|offset| u32::try_from(offset).ok())
