@@ -17577,6 +17577,12 @@ fn lower_x86_64_dfa_with_entry_contract(
 
     assembler.bind(accelerated_transition)?;
     x86_emit_and_eax_mask(&mut assembler, layout.cells.next_mask())?;
+    if layout.cells == NativeCellEncoding::Wide32 {
+        // Wide dead cells have a zero payload after stripping metadata. Consume
+        // AND's zero flag before the optional partial-hole comparison overwrites
+        // it; row addressing must never consume zero as a one-based wide token.
+        assembler.branch(&[0x0f, 0x84], finish)?;
+    }
     if layout.cells.is_compact() {
         let mut compare_dead = vec![0x3d]; // cmp eax, compact dead payload
         compare_dead.extend_from_slice(&layout.cells.dead_token().to_le_bytes());
@@ -17592,7 +17598,6 @@ fn lower_x86_64_dfa_with_entry_contract(
     if layout.cells.is_compact() {
         x86_emit_set_row_from_compact_zero_based_cell(&mut assembler, layout.cells)?;
     } else {
-        assembler.branch(&[0x0f, 0x84], finish)?;
         x86_emit_set_row_from_cell(&mut assembler, layout.cells)?;
     }
     // An exact absolute entry admits only one candidate and deliberately
@@ -63385,6 +63390,105 @@ int main(void){{
         }
         assert!(native_sparse_chunk_plan(4, 16, 16).is_none());
         assert!(native_sparse_chunk_plan(usize::MAX, 64, usize::MAX).is_none());
+    }
+
+    #[test]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the focused x86 control-flow oracle decodes one authenticated branch"
+    )]
+    fn scalable_sparse_x86_wide_dead_guard_precedes_partial_hole_compare() {
+        let capacity = 5_u8;
+        let cells = NativeCellEncoding::Wide32;
+        let row_bytes = native_default_exception_row_bytes(capacity, cells).unwrap();
+        let tiers = [
+            ("sse2", FeatureSet::EMPTY),
+            ("avx2", FeatureSet::of(CpuFeature::X86Avx2)),
+            (
+                "avx512bw",
+                FeatureSet::of(CpuFeature::X86Avx512F)
+                    .with(CpuFeature::X86Avx512Bw),
+            ),
+        ];
+
+        for (tier, features) in tiers {
+            let target = Target::x86_64_linux().with_features(features).unwrap();
+            let (lowering, fixture) = linked_sparse_native_fixture(
+                target,
+                capacity,
+                cells,
+                NativeDefaultExceptionKeys::Bytes,
+                false,
+                OutputContract::SelectedEnd,
+            )
+            .unwrap();
+
+            // Independently reproduce the accepted-dead payload that enters
+            // `accelerated_transition`. The metadata strip makes it zero,
+            // while comparing it with a partial-hole base necessarily clears
+            // ZF. Therefore the dead branch must consume AND's result before
+            // the hole comparison, not flags left by that comparison.
+            let accepted_dead = pack_native_partial_forward_cell(
+                NO_DFA_STATE,
+                true,
+                0,
+                row_bytes,
+                1,
+                false,
+                None,
+                fixture.partial,
+                cells,
+            )
+            .unwrap();
+            assert_ne!(accepted_dead & cells.accepts(), 0, "{tier}");
+            assert_ne!(accepted_dead & cells.accelerated(), 0, "{tier}");
+            let stripped = accepted_dead & cells.next_mask();
+            assert_eq!(stripped, 0, "{tier}");
+            assert_ne!(stripped, fixture.partial.hole_token_base, "{tier}");
+
+            let mut strip_instruction = vec![0x25]; // and eax,next_mask
+            strip_instruction.extend_from_slice(&cells.next_mask().to_le_bytes());
+            let guard_start = lowering
+                .code
+                .windows(strip_instruction.len())
+                .position(|window| window == strip_instruction)
+                .unwrap_or_else(|| panic!("{tier}: missing wide metadata strip"));
+            let branch_start = guard_start + strip_instruction.len();
+            let (branch_end, displacement) = match lowering.code[branch_start] {
+                0x74 => (
+                    branch_start + 2,
+                    i64::from(i8::from_le_bytes([lowering.code[branch_start + 1]])),
+                ),
+                0x0f if lowering.code[branch_start + 1] == 0x84 => (
+                    branch_start + 6,
+                    i64::from(i32::from_le_bytes(
+                        lowering.code[branch_start + 2..branch_start + 6]
+                            .try_into()
+                            .unwrap(),
+                    )),
+                ),
+                opcode => panic!(
+                    "{tier}: metadata-strip ZF is not consumed immediately: opcode {opcode:#x}"
+                ),
+            };
+            let mut hole_compare = vec![0x3d]; // cmp eax,hole_token_base
+            hole_compare.extend_from_slice(&fixture.partial.hole_token_base.to_le_bytes());
+            assert_eq!(
+                &lowering.code[branch_end..branch_end + hole_compare.len()],
+                hole_compare.as_slice(),
+                "{tier}: partial-hole comparison moved ahead of the dead guard",
+            );
+
+            let target = usize::try_from(
+                i64::try_from(branch_end).unwrap() + displacement,
+            )
+            .unwrap();
+            assert_eq!(
+                &lowering.code[target..target + 4],
+                &[0x49, 0x83, 0xfb, 0xff],
+                "{tier}: zero wide payload does not branch to finish",
+            );
+        }
     }
 
     #[test]
