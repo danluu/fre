@@ -2547,16 +2547,19 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_compiler_private_search_exclusive
 }
 
 /// Authenticate and continue one deferred static-prefix hole in one runtime
-/// transaction.
+/// transaction. Variable-width Span continuations publish the same distinct
+/// single-use postflight ticket as the established admitted path when the
+/// immutable local tail must recover a selected start.
 ///
 /// This boundary is the fused counterpart of V2 preflight followed by V1
 /// continuation. It is valid only for compiler-selected objects with no
-/// complete suffix/cut preflight and no variable-width Span postflight. The
-/// generated caller has already authenticated the immutable owner and run its
-/// native prefix; this helper independently authenticates the raw object
-/// arguments, binds the descriptor, validates the exact frontier, and either
-/// finishes the search or returns an authenticated status-7/8 local handoff.
-/// No object ticket is ever published in prepared state.
+/// complete suffix/cut preflight. The generated caller has already
+/// authenticated the immutable owner and run its native prefix; this helper
+/// independently authenticates the raw object arguments, binds the
+/// descriptor, validates the exact frontier, and either finishes the search
+/// or returns an authenticated status-7/8 local handoff. No object ticket is
+/// ever published in prepared state; variable-width Span publishes only its
+/// distinct postflight ticket after a successful immutable projection.
 ///
 /// # Safety
 ///
@@ -2622,8 +2625,6 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_compiler_private_search_exclusive
             || prepared
                 .program
                 .compiler_private_static_prefix_complete_proofs_should_run(usize::MAX)
-            || (prepared.program.output_contract() == OutputContract::Span
-                && prepared.program.exact_match_width().is_none())
         {
             return STATUS_RUNTIME_FAILURE;
         }
@@ -2820,6 +2821,126 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_compiler_private_search_exclusive
             .recover_static_prefix_span_from_selected_end(
                 haystack,
                 window,
+                expected_artifact_identity,
+                selected_end,
+            )
+        else {
+            return STATUS_RUNTIME_FAILURE;
+        };
+        result_ptr.write(FreAotRegexResultV1 { start, end });
+        STATUS_MATCH
+    }))
+    .unwrap_or(STATUS_RUNTIME_FAILURE)
+}
+
+/// Authenticate and recover a variable-width Span only after a proof-free
+/// static native prefix selects its authoritative endpoint.
+///
+/// This V3 boundary is the direct-completion counterpart of fused V2 hole
+/// continuation. The generated entry has already checked every public scalar,
+/// compared the immutable artifact identity, and advanced the exclusive
+/// owner's invocation epoch before entering native code. It passes that exact
+/// epoch as a single-use capability here. This helper independently validates
+/// the raw arguments and artifact, consumes the epoch before any reverse work,
+/// and admits no program whose complete suffix/cut proofs belong before native
+/// execution. Native no-match and fully encoded terminal paths never call this
+/// boundary.
+///
+/// This private ABI is intentionally absent from the public C header. It is
+/// versioned separately from V2 because V2 consumes an eagerly published
+/// object/postflight ticket, while V3 consumes a generated epoch word. Stale
+/// older tickets are retired as non-authoritative state; a V1/V2 ticket minted
+/// in the current epoch is a conflicting route and fails closed.
+///
+/// # Safety
+///
+/// The raw pointer and exclusive ownership requirements are identical to V2.
+/// `invocation_epoch` must be the value read from the live prepared owner by
+/// the synchronous generated entry after its inline increment and before any
+/// other call through that exclusive handle.
+#[doc(hidden)]
+#[unsafe(no_mangle)]
+#[allow(
+    unsafe_code,
+    clippy::too_many_arguments,
+    reason = "the lazy static-prefix postflight authenticates one generated invocation epoch"
+)]
+pub unsafe extern "C" fn fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_recover_span_v3(
+    handle: FreAotRegexExclusiveHandleV1,
+    haystack_ptr: *const u8,
+    haystack_len: usize,
+    window_start: usize,
+    window_end: usize,
+    result_ptr: *mut FreAotRegexResultV1,
+    expected_artifact_identity_ptr: *const u8,
+    selected_end: usize,
+    invocation_epoch: u64,
+) -> u32 {
+    if handle.is_invalid() {
+        return STATUS_INVALID_HANDLE;
+    }
+
+    // Consume the generated capability before inspecting any other caller
+    // pointer. A corrected replay, panic, foreign identity, or malformed
+    // output can therefore never reuse the same native completion. The
+    // exclusive-handle ABI forbids overlapping calls, so this mutation is the
+    // complete synchronization boundary for the owner.
+    // SAFETY: every non-invalid handle supplied to this unsafe private ABI is
+    // one live exclusively owned PreparedAotRegex allocation.
+    let prepared = unsafe { &mut *handle.0.cast::<PreparedAotRegex>() };
+    let had_current_capability = {
+        let (object, postflight) = prepared.retire_static_prefix_capabilities();
+        object.is_some_and(|ticket| {
+            ticket.invocation_epoch == prepared.static_prefix_invocation_epoch
+        }) || postflight.is_some_and(|ticket| {
+            ticket.invocation_epoch == prepared.static_prefix_invocation_epoch
+        })
+    };
+    let epoch_matches = prepared.static_prefix_invocation_epoch == invocation_epoch;
+    let Some(next_epoch) = prepared.static_prefix_invocation_epoch.checked_add(1) else {
+        prepared.static_prefix_invocation_epoch = 1;
+        return STATUS_RUNTIME_FAILURE;
+    };
+    prepared.static_prefix_invocation_epoch = next_epoch;
+    if had_current_capability || !epoch_matches {
+        return STATUS_RUNTIME_FAILURE;
+    }
+
+    if haystack_ptr.is_null()
+        || result_ptr.is_null()
+        || !result_ptr.is_aligned()
+        || expected_artifact_identity_ptr.is_null()
+        || haystack_len > isize::MAX.unsigned_abs()
+        || window_start > window_end
+        || window_end > haystack_len
+        || selected_end <= window_start
+        || selected_end > window_end
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+
+    // SAFETY: the caller supplies the unique prepared owner and every live,
+    // readable/writable, disjoint extent documented above. The epoch was
+    // consumed before these pointers were inspected.
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        let prepared = &mut *handle.0.cast::<PreparedAotRegex>();
+        let haystack = std::slice::from_raw_parts(haystack_ptr, haystack_len);
+        let expected_artifact_identity = expected_artifact_identity_ptr
+            .cast::<[u8; ARTIFACT_IDENTITY_BYTES]>()
+            .read();
+        if expected_artifact_identity != *prepared.frozen_header.artifact_identity()
+            || prepared.program.output_contract() != OutputContract::Span
+            || prepared.program.exact_match_width().is_some()
+            || prepared
+                .program
+                .compiler_private_static_prefix_complete_proofs_should_run(usize::MAX)
+        {
+            return STATUS_RUNTIME_FAILURE;
+        }
+        let Ok(MatchResult::Span(Some((start, end)))) = prepared
+            .recover_static_prefix_span_from_selected_end(
+                haystack,
+                SearchWindow::new(window_start, window_end),
                 expected_artifact_identity,
                 selected_end,
             )
@@ -4827,6 +4948,33 @@ mod tests {
                 result,
                 expected_artifact_identity.as_ptr(),
                 selected_end,
+            )
+        }
+    }
+
+    fn call_exclusive_static_prefix_recover_span_v3(
+        handle: FreAotRegexExclusiveHandleV1,
+        haystack: &[u8],
+        start: usize,
+        end: usize,
+        result: &mut FreAotRegexResultV1,
+        expected_artifact_identity: &[u8; ARTIFACT_IDENTITY_BYTES],
+        selected_end: usize,
+        invocation_epoch: u64,
+    ) -> u32 {
+        // SAFETY: each test owns the live exclusive session and supplies the
+        // exact generated epoch plus readable/disjoint pointer extents.
+        unsafe {
+            fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_recover_span_v3(
+                handle,
+                haystack.as_ptr(),
+                haystack.len(),
+                start,
+                end,
+                result,
+                expected_artifact_identity.as_ptr(),
+                selected_end,
+                invocation_epoch,
             )
         }
     }
@@ -8537,6 +8685,296 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
             unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(handle) },
             STATUS_SUCCESS
         );
+    }
+
+    #[test]
+    fn static_prefix_continue_v2_variable_span_publishes_only_a_postflight_ticket() {
+        let compiled = compile(
+            CompileRequest::new("(?:ab|ac)+z", Target::x86_64_linux())
+                .mode(CompileMode::Fast)
+                .output(OutputContract::Span),
+        )
+        .expect("compile fused variable-Span fixture");
+        assert_eq!(compiled.program().exact_match_width(), None);
+        assert!(!compiled
+            .program()
+            .compiler_private_static_prefix_complete_proofs_should_run(usize::MAX));
+        let identity = compiled.receipt().program_sha256;
+        let serialized = compiled.program().serialize().expect("serialize fixture");
+        let handle = prepare_exclusive(&serialized);
+        let haystack = vec![b'x'; 128];
+        let descriptor = one_state_static_prefix_descriptor(0, false);
+        let mut result = FreAotRegexResultV1 {
+            start: 0x5555_aaaa,
+            end: 0xaaaa_5555,
+        };
+
+        assert_eq!(
+            call_exclusive_static_prefix_continue_v2(
+                handle,
+                &haystack,
+                0,
+                haystack.len(),
+                &mut result,
+                &identity,
+                &descriptor,
+                0,
+                64,
+                0,
+            ),
+            STATUS_STATIC_PREFIX_NATIVE_CONTINUATION_RESUME
+        );
+        assert_eq!(result, FreAotRegexResultV1 { start: 1, end: 0 });
+        assert_eq!(static_prefix_capability_presence(handle), (false, true));
+
+        // SAFETY: this test owns the unique live handle and no call overlaps
+        // destruction.
+        assert_eq!(
+            unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(handle) },
+            STATUS_SUCCESS
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one V3 ledger test covers success, replay, raw rejection, contamination, and proof gating"
+    )]
+    fn lazy_static_prefix_span_v3_consumes_exact_epoch_and_fails_closed() {
+        let compiled = compile(
+            CompileRequest::new("(?:ab|ac)+z", Target::x86_64_linux())
+                .mode(CompileMode::Fast)
+                .output(OutputContract::Span),
+        )
+        .expect("compile lazy variable-Span fixture");
+        assert!(!compiled
+            .program()
+            .compiler_private_static_prefix_complete_proofs_should_run(usize::MAX));
+        let identity = compiled.receipt().program_sha256;
+        let serialized = compiled.program().serialize().expect("serialize lazy fixture");
+        let handle = prepare_exclusive(&serialized);
+        let haystack = b"xxabacz";
+        let descriptor = [0_u32; STATIC_PREFIX_RESUME_DESCRIPTOR_V1_HEADER_BYTES / 4];
+        let sentinel = FreAotRegexResultV1 {
+            start: 0xfeed_face,
+            end: 0xdead_beef,
+        };
+        let arm_generated_entry = |owned: FreAotRegexExclusiveHandleV1| {
+            // SAFETY: this test uniquely owns the prepared allocation and
+            // models the generated wrapper's checked inline epoch increment.
+            let prepared = unsafe { &mut *owned.0.cast::<PreparedAotRegex>() };
+            prepared.static_prefix_invocation_epoch += 1;
+            prepared.static_prefix_invocation_epoch
+        };
+
+        let epoch = arm_generated_entry(handle);
+        let mut result = sentinel;
+        assert_eq!(
+            call_exclusive_static_prefix_recover_span_v3(
+                handle,
+                haystack,
+                0,
+                haystack.len(),
+                &mut result,
+                &identity,
+                haystack.len(),
+                epoch,
+            ),
+            STATUS_MATCH
+        );
+        assert_eq!(result, FreAotRegexResultV1 { start: 2, end: 7 });
+        assert_eq!(static_prefix_capability_presence(handle), (false, false));
+        assert_eq!(
+            unsafe { (&*handle.0.cast::<PreparedAotRegex>()).static_prefix_invocation_epoch },
+            epoch + 1
+        );
+
+        result = sentinel;
+        assert_eq!(
+            call_exclusive_static_prefix_recover_span_v3(
+                handle,
+                haystack,
+                0,
+                haystack.len(),
+                &mut result,
+                &identity,
+                haystack.len(),
+                epoch,
+            ),
+            STATUS_RUNTIME_FAILURE,
+            "a consumed generated epoch cannot be replayed"
+        );
+        assert_eq!(result, sentinel);
+
+        let epoch = arm_generated_entry(handle);
+        let mut wrong_identity = identity;
+        wrong_identity[7] ^= 0x80;
+        assert_eq!(
+            call_exclusive_static_prefix_recover_span_v3(
+                handle,
+                haystack,
+                0,
+                haystack.len(),
+                &mut result,
+                &wrong_identity,
+                haystack.len(),
+                epoch,
+            ),
+            STATUS_RUNTIME_FAILURE
+        );
+        assert_eq!(result, sentinel);
+        assert_eq!(
+            call_exclusive_static_prefix_recover_span_v3(
+                handle,
+                haystack,
+                0,
+                haystack.len(),
+                &mut result,
+                &identity,
+                haystack.len(),
+                epoch,
+            ),
+            STATUS_RUNTIME_FAILURE,
+            "corrected identity cannot replay a rejected epoch"
+        );
+
+        let epoch = arm_generated_entry(handle);
+        // SAFETY: every readable argument is valid; the null result is the
+        // deliberate raw-boundary refusal and must still consume the epoch.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_recover_span_v3(
+                    handle,
+                    haystack.as_ptr(),
+                    haystack.len(),
+                    0,
+                    haystack.len(),
+                    std::ptr::null_mut(),
+                    identity.as_ptr(),
+                    haystack.len(),
+                    epoch,
+                )
+            },
+            STATUS_INVALID_ARGUMENT
+        );
+        assert_eq!(
+            call_exclusive_static_prefix_recover_span_v3(
+                handle,
+                haystack,
+                0,
+                haystack.len(),
+                &mut result,
+                &identity,
+                haystack.len(),
+                epoch,
+            ),
+            STATUS_RUNTIME_FAILURE,
+            "corrected raw arguments cannot replay a rejected epoch"
+        );
+
+        assert_eq!(
+            call_exclusive_static_prefix_preflight_v2(
+                handle,
+                haystack,
+                0,
+                haystack.len(),
+                &mut result,
+                &identity,
+                &descriptor,
+            ),
+            STATUS_PARTIAL_PREFLIGHT_ENTER
+        );
+        assert_eq!(static_prefix_capability_presence(handle), (true, false));
+        let epoch = arm_generated_entry(handle);
+        assert_eq!(
+            call_exclusive_static_prefix_recover_span_v3(
+                handle,
+                haystack,
+                0,
+                haystack.len(),
+                &mut result,
+                &identity,
+                haystack.len(),
+                epoch,
+            ),
+            STATUS_MATCH,
+            "a generated epoch retires but is not blocked by a stale V1/V2 capability"
+        );
+        assert_eq!(static_prefix_capability_presence(handle), (false, false));
+        assert_eq!(result, FreAotRegexResultV1 { start: 2, end: 7 });
+
+        result = sentinel;
+        let epoch = arm_generated_entry(handle);
+        assert_eq!(
+            call_exclusive_static_prefix_preflight_v2(
+                handle,
+                haystack,
+                0,
+                haystack.len(),
+                &mut result,
+                &identity,
+                &descriptor,
+            ),
+            STATUS_PARTIAL_PREFLIGHT_ENTER
+        );
+        assert_eq!(static_prefix_capability_presence(handle), (true, false));
+        assert_eq!(
+            call_exclusive_static_prefix_recover_span_v3(
+                handle,
+                haystack,
+                0,
+                haystack.len(),
+                &mut result,
+                &identity,
+                haystack.len(),
+                epoch,
+            ),
+            STATUS_RUNTIME_FAILURE,
+            "V3 rejects a V1/V2 capability minted in its current epoch"
+        );
+        assert_eq!(static_prefix_capability_presence(handle), (false, false));
+        assert_eq!(result, sentinel);
+
+        let mut proof_limits = CompileLimitsV1::default();
+        proof_limits.determinize.max_states = 0;
+        let proof = compile(
+            CompileRequest::new("(?:x|yz)7[A-Za-z]{1,2}", Target::x86_64_linux())
+                .mode(CompileMode::Optimizing)
+                .limits(proof_limits)
+                .output(OutputContract::Span),
+        )
+        .expect("compile complete-proof Span fixture");
+        assert!(proof
+            .program()
+            .compiler_private_static_prefix_complete_proofs_should_run(usize::MAX));
+        let proof_identity = proof.receipt().program_sha256;
+        let proof_serialized = proof.program().serialize().expect("serialize proof fixture");
+        let proof_handle = prepare_exclusive(&proof_serialized);
+        let proof_epoch = arm_generated_entry(proof_handle);
+        assert_eq!(
+            call_exclusive_static_prefix_recover_span_v3(
+                proof_handle,
+                haystack,
+                0,
+                haystack.len(),
+                &mut result,
+                &proof_identity,
+                haystack.len(),
+                proof_epoch,
+            ),
+            STATUS_RUNTIME_FAILURE,
+            "complete proof owners must remain on eager V2 admission"
+        );
+        assert_eq!(result, sentinel);
+
+        for owned in [handle, proof_handle] {
+            // SAFETY: the loop owns each distinct live handle and no call
+            // overlaps destruction.
+            assert_eq!(
+                unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(owned) },
+                STATUS_SUCCESS
+            );
+        }
     }
 
     #[test]

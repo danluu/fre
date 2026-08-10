@@ -934,6 +934,10 @@ const DYNAMIC_ROWS_DEOPT_RUNTIME_SYMBOL: usize = 11;
 // continuation selected by that exact prepared layout.
 const STATIC_PREFIX_RETIRE_RUNTIME_SYMBOL: usize = 12;
 const DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL: usize = 12;
+// Static-prefix and dynamic-row entries are disjoint. Slot 13 is therefore
+// either the dynamic-row Span postflight or the lazy direct static-prefix Span
+// postflight selected after an inline-authenticated native endpoint.
+const STATIC_PREFIX_LAZY_SPAN_RECOVERY_RUNTIME_SYMBOL: usize = 13;
 const DYNAMIC_ROWS_SPAN_RECOVERY_RUNTIME_SYMBOL: usize = 13;
 const DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL: usize = 14;
 
@@ -956,6 +960,8 @@ const SLOW_PREFIX_SPAN_RECOVERY_V1_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_recover_span_v1";
 const SLOW_PREFIX_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_recover_span_v2";
+const SLOW_PREFIX_LAZY_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME: &str =
+    "fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_recover_span_v3";
 const STATIC_PREFIX_RETIRE_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_retire_v1";
 const DYNAMIC_ROWS_PREFLIGHT_RUNTIME_SYMBOL_NAME: &str =
@@ -1133,6 +1139,7 @@ struct PreparedNativeEntryLayout {
     dynamic_rows: bool,
     slow_prefix: bool,
     slow_prefix_resume: bool,
+    deferred_static_prefix_preflight: bool,
     deferred_static_prefix_hole: bool,
 }
 
@@ -1682,6 +1689,16 @@ impl CompiledModule {
             .relocations
             .iter()
             .any(|relocation| relocation.symbol == DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL);
+        let needs_partial_span_recovery_symbol = lowering
+            .relocations
+            .iter()
+            .any(|relocation| relocation.symbol == PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL);
+        let needs_lazy_static_prefix_span_recovery_symbol = lowering
+            .relocations
+            .iter()
+            .any(|relocation| {
+                relocation.symbol == STATIC_PREFIX_LAZY_SPAN_RECOVERY_RUNTIME_SYMBOL
+            });
         let needs_static_prefix_retire_symbol = prepared_layout.is_some_and(|layout| {
             matches!(
                 layout.kind,
@@ -1872,7 +1889,7 @@ impl CompiledModule {
                         offset: 0,
                         size: 0,
                     });
-                    if prepared.deferred_static_prefix_hole {
+                    if prepared.deferred_static_prefix_preflight {
                         symbols.push(ModuleSymbol {
                             name: ".Lfre_aot_regex_static_prefix_no_eager_preflight_v1"
                                 .to_owned(),
@@ -2011,7 +2028,7 @@ impl CompiledModule {
                             size: 0,
                         });
                     } else {
-                        if prepared.span_recovery {
+                        if needs_partial_span_recovery_symbol {
                             if symbols.len() != PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL {
                                 return Err(ObjectError::InvalidModule(
                                     "prepared Span recovery symbol order is inconsistent",
@@ -2060,6 +2077,53 @@ impl CompiledModule {
                             }
                             symbols.push(ModuleSymbol {
                                 name: STATIC_PREFIX_RETIRE_RUNTIME_SYMBOL_NAME.to_owned(),
+                                binding: SymbolBinding::Global,
+                                kind: SymbolKind::Function,
+                                section: None,
+                                offset: 0,
+                                size: 0,
+                            });
+                        }
+                        if needs_lazy_static_prefix_span_recovery_symbol {
+                            if !prepared.deferred_static_prefix_preflight
+                                || !prepared.slow_prefix
+                                || !prepared.span_recovery
+                            {
+                                return Err(ObjectError::InvalidModule(
+                                    "lazy static-prefix Span recovery has an incompatible prepared mode",
+                                ));
+                            }
+                            while symbols.len()
+                                < STATIC_PREFIX_LAZY_SPAN_RECOVERY_RUNTIME_SYMBOL
+                            {
+                                let slot = symbols.len();
+                                symbols.push(ModuleSymbol {
+                                    name: format!(
+                                        ".Lfre_aot_regex_lazy_span_placeholder_{slot}"
+                                    ),
+                                    binding: SymbolBinding::Local,
+                                    kind: SymbolKind::Object,
+                                    section: Some(PROGRAM_SECTION),
+                                    offset: u64::try_from(prepared.identity_offset).map_err(
+                                        |_| {
+                                            ObjectError::ArithmeticOverflow(
+                                                "lazy static-prefix Span placeholder offset",
+                                            )
+                                        },
+                                    )?,
+                                    size: 0,
+                                });
+                            }
+                            if symbols.len()
+                                != STATIC_PREFIX_LAZY_SPAN_RECOVERY_RUNTIME_SYMBOL
+                            {
+                                return Err(ObjectError::InvalidModule(
+                                    "lazy static-prefix Span symbol order is inconsistent",
+                                ));
+                            }
+                            symbols.push(ModuleSymbol {
+                                name: SLOW_PREFIX_LAZY_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME
+                                    .to_owned(),
                                 binding: SymbolBinding::Global,
                                 kind: SymbolKind::Function,
                                 section: None,
@@ -2377,6 +2441,28 @@ impl CompiledModule {
                     && (symbol.name == PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME
                         || symbol.name == SLOW_PREFIX_SPAN_RECOVERY_V1_RUNTIME_SYMBOL_NAME
                         || symbol.name == SLOW_PREFIX_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME)
+            })
+            .map(|symbol| symbol.name.as_str())
+    }
+
+    /// Return the versioned on-demand postflight used only when an
+    /// inline-authenticated static prefix selects a variable-width Span end
+    /// without first entering runtime admission.
+    #[must_use]
+    pub fn required_prepared_lazy_static_prefix_span_recovery_runtime_symbol(
+        &self,
+    ) -> Option<&str> {
+        self.prepared_entry_symbol_index?;
+        if !self.relocations.iter().any(|relocation| {
+            relocation.symbol == STATIC_PREFIX_LAZY_SPAN_RECOVERY_RUNTIME_SYMBOL
+        }) {
+            return None;
+        }
+        self.symbols
+            .get(STATIC_PREFIX_LAZY_SPAN_RECOVERY_RUNTIME_SYMBOL)
+            .filter(|symbol| {
+                symbol.section.is_none()
+                    && symbol.name == SLOW_PREFIX_LAZY_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME
             })
             .map(|symbol| symbol.name.as_str())
     }
@@ -2764,6 +2850,7 @@ fn lower_native_dynamic_rows_prepared(
                 dynamic_rows: true,
                 slow_prefix: false,
                 slow_prefix_resume: false,
+                deferred_static_prefix_preflight: false,
                 deferred_static_prefix_hole: false,
             }),
         },
@@ -3098,12 +3185,11 @@ fn append_static_prefix_resume_descriptor(
 }
 
 const fn static_prefix_can_defer_preflight(
-    output: OutputContract,
-    exact_match_width: Option<usize>,
+    _output: OutputContract,
+    _exact_match_width: Option<usize>,
     has_complete_preflight_proofs: bool,
 ) -> bool {
     !has_complete_preflight_proofs
-        && !(matches!(output, OutputContract::Span) && exact_match_width.is_none())
 }
 
 /// Compose a transient, resource-bounded DFA prefix with the persistent
@@ -3168,12 +3254,10 @@ fn lower_native_slow_partial_prepared_with_data_limit(
         && !view.dfa.initial_pending;
     let variable_span_recovery =
         view.output == OutputContract::Span && view.exact_match_width.is_none();
-    // Whole-window suffix/cut proofs must retain the established eager
-    // ordering. Variable-width Span likewise keeps V2 admission in front of
-    // native execution: its recovery helper intentionally requires the
-    // single-use invocation ticket minted by that admission. Every other
-    // result contract can authenticate the immutable object inline and defer
-    // V2 until an actual retained-prefix hole.
+    // Whole-window suffix/cut proofs must retain their established eager
+    // ordering. Every proof-free result contract authenticates the immutable
+    // object inline and defers runtime admission until an actual retained
+    // prefix hole or variable-width Span endpoint.
     let defer_preflight = static_prefix_can_defer_preflight(
         view.output,
         view.exact_match_width,
@@ -3582,6 +3666,7 @@ fn lower_native_slow_partial_prepared_with_data_limit(
                 dynamic_rows: false,
                 slow_prefix: true,
                 slow_prefix_resume: resume.is_some(),
+                deferred_static_prefix_preflight: defer_preflight,
                 deferred_static_prefix_hole: defer_preflight && resume.is_some(),
             }),
         },
@@ -3984,6 +4069,7 @@ fn lower_native_partial_prepared(
                 dynamic_rows: false,
                 slow_prefix: false,
                 slow_prefix_resume: false,
+                deferred_static_prefix_preflight: false,
                 deferred_static_prefix_hole: false,
             }),
         },
@@ -4015,8 +4101,18 @@ fn native_module_digest(
                 "static-prefix resume layout has no static prefix",
             ));
         }
+        if prepared.deferred_static_prefix_preflight
+            && (!prepared.slow_prefix || prepared.dynamic_rows)
+        {
+            return Err(ObjectError::InvalidModule(
+                "deferred static-prefix preflight has an incompatible prepared mode",
+            ));
+        }
         if prepared.deferred_static_prefix_hole
-            && (!prepared.slow_prefix_resume || !prepared.slow_prefix || prepared.dynamic_rows)
+            && (!prepared.deferred_static_prefix_preflight
+                || !prepared.slow_prefix_resume
+                || !prepared.slow_prefix
+                || prepared.dynamic_rows)
         {
             return Err(ObjectError::InvalidModule(
                 "deferred static-prefix hole layout has an incompatible prepared mode",
@@ -4183,6 +4279,15 @@ fn native_module_digest(
                 &mut digest,
                 auxiliary_symbol_name.as_bytes(),
                 "prepared auxiliary runtime symbol identity byte length",
+            )?;
+        }
+        if lowering.relocations.iter().any(|relocation| {
+            relocation.symbol == STATIC_PREFIX_LAZY_SPAN_RECOVERY_RUNTIME_SYMBOL
+        }) {
+            update_bytes(
+                &mut digest,
+                SLOW_PREFIX_LAZY_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME.as_bytes(),
+                "lazy static-prefix Span runtime symbol identity byte length",
             )?;
         }
         if lowering
@@ -17104,6 +17209,20 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
         assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, saved_end_offset])?;
         assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, saved_result_offset])?;
         assembler.instruction(&[0x4c, 0x89, 0x5c, 0x24, 0x08])?;
+        if defer_preflight {
+            assembler.instruction(&[0x48, 0x8b, 0x87])?;
+            push_bytes(
+                &mut assembler.code,
+                &u32::try_from(STATIC_PREFIX_INVOCATION_EPOCH_OFFSET)
+                    .map_err(|_| {
+                        ObjectError::ArithmeticOverflow(
+                            "x86 lazy static-prefix Span epoch offset",
+                        )
+                    })?
+                    .to_le_bytes(),
+            )?;
+            assembler.instruction(&[0x48, 0x89, 0x44, 0x24, 0x10])?;
+        }
         assembler.instruction(&[0xe8])?;
         let displacement = assembler.label()?;
         assembler.bind(displacement)?;
@@ -17427,7 +17546,11 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
                 "x86 static-prefix Span recovery relocation",
             )?,
             kind: RelocationKind::X86PltRelative32,
-            symbol: PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL,
+            symbol: if defer_preflight {
+                STATIC_PREFIX_LAZY_SPAN_RECOVERY_RUNTIME_SYMBOL
+            } else {
+                PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL
+            },
             addend: -4,
         });
     }
@@ -30152,6 +30275,18 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
         assembler.instruction(aarch64_load_pair_x(4, 5, 31, saved_end_offset)?)?;
         let identity_page = assembler.instruction(0x9000_0006)?;
         let identity_page_offset = assembler.instruction(aarch64_add_x_imm(6, 6, 0)?)?;
+        if defer_preflight {
+            assembler.instruction(aarch64_load_x_imm(
+                8,
+                0,
+                u16::try_from(STATIC_PREFIX_INVOCATION_EPOCH_OFFSET).map_err(|_| {
+                    ObjectError::ArithmeticOverflow(
+                        "AArch64 lazy static-prefix Span epoch offset",
+                    )
+                })?,
+            )?)?;
+            assembler.instruction(aarch64_store_x(8, 31, 0)?)?;
+        }
         let runtime_branch = assembler.instruction(0x9400_0000)?;
         assembler.instruction(aarch64_load_x_imm(30, 31, return_address_offset)?)?;
         assembler.instruction(aarch64_add_x_imm(31, 31, frame_bytes)?)?;
@@ -30503,7 +30638,11 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
                     "AArch64 static-prefix Span recovery branch",
                 )?,
                 kind: RelocationKind::Aarch64Branch26,
-                symbol: PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL,
+                symbol: if defer_preflight {
+                    STATIC_PREFIX_LAZY_SPAN_RECOVERY_RUNTIME_SYMBOL
+                } else {
+                    PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL
+                },
                 addend: 0,
             },
         ]);
@@ -51357,7 +51496,7 @@ int main(void){{
             Some(4),
             false,
         ));
-        assert!(!static_prefix_can_defer_preflight(
+        assert!(static_prefix_can_defer_preflight(
             OutputContract::Span,
             None,
             false,
@@ -51572,6 +51711,72 @@ int main(void){{
                 "no-resume deferred wrapper has only the cold guard/wrap helper: {architecture:?}"
             );
 
+            let lazy_span = match architecture {
+                Architecture::X86_64 => lower_x86_64_static_prefix_prepared_wrapper(
+                    OutputContract::Span,
+                    true,
+                    Some(0),
+                    true,
+                ),
+                Architecture::Aarch64 => lower_aarch64_static_prefix_prepared_wrapper(
+                    OutputContract::Span,
+                    true,
+                    Some(0),
+                    true,
+                ),
+            }
+            .unwrap();
+            assert!(lazy_span.relocations.iter().all(|relocation| {
+                relocation.symbol != PREPARED_PREFLIGHT_RUNTIME_SYMBOL
+            }));
+            assert_eq!(
+                lazy_span
+                    .relocations
+                    .iter()
+                    .filter(|relocation| {
+                        relocation.symbol
+                            == STATIC_PREFIX_LAZY_SPAN_RECOVERY_RUNTIME_SYMBOL
+                    })
+                    .count(),
+                1,
+                "one on-demand direct Span postflight: {architecture:?}"
+            );
+            assert!(lazy_span.relocations.iter().all(|relocation| {
+                relocation.symbol != PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL
+            }));
+            match architecture {
+                Architecture::X86_64 => {
+                    let epoch = u32::try_from(STATIC_PREFIX_INVOCATION_EPOCH_OFFSET)
+                        .unwrap()
+                        .to_le_bytes();
+                    let mut load = vec![0x48, 0x8b, 0x87];
+                    load.extend_from_slice(&epoch);
+                    assert!(lazy_span
+                        .code
+                        .windows(load.len())
+                        .any(|bytes| bytes == load.as_slice()));
+                    assert!(lazy_span.code.windows(5).any(|bytes| {
+                        bytes == [0x48, 0x89, 0x44, 0x24, 0x10]
+                    }));
+                }
+                Architecture::Aarch64 => {
+                    let words = lazy_span
+                        .code
+                        .chunks_exact(4)
+                        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                        .collect::<Vec<_>>();
+                    assert!(words.contains(
+                        &aarch64_load_x_imm(
+                            8,
+                            0,
+                            u16::try_from(STATIC_PREFIX_INVOCATION_EPOCH_OFFSET).unwrap(),
+                        )
+                        .unwrap()
+                    ));
+                    assert!(words.contains(&aarch64_store_x(8, 31, 0).unwrap()));
+                }
+            }
+
             let eager_span = match architecture {
                 Architecture::X86_64 => lower_x86_64_static_prefix_prepared_wrapper(
                     OutputContract::Span,
@@ -51595,7 +51800,7 @@ int main(void){{
             assert!(
                 usize::try_from(eager_preflight.offset).unwrap()
                     < eager_span.core_call_offset,
-                "variable Span must retain eager V2 admission: {architecture:?}"
+                "the explicit legacy wrapper must retain eager V2 admission: {architecture:?}"
             );
             assert_eq!(
                 eager_span
@@ -52071,6 +52276,11 @@ int main(void){{
                 };
                 assert!(hybrid_layout.slow_prefix_resume);
                 assert_eq!(
+                    hybrid_layout.deferred_static_prefix_preflight,
+                    expects_fused_hole,
+                    "deferred preflight layout: {output:?}/{target:?}"
+                );
+                assert_eq!(
                     hybrid_layout.deferred_static_prefix_hole,
                     expects_fused_hole,
                     "deferred hole layout: {output:?}/{target:?}"
@@ -52253,14 +52463,34 @@ int main(void){{
                 );
                 assert_eq!(
                     constrained
+                        .required_prepared_lazy_static_prefix_span_recovery_runtime_symbol(),
+                    (output == OutputContract::Span && expects_fused_hole)
+                        .then_some(SLOW_PREFIX_LAZY_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME),
+                    "lazy static-prefix Span helper: {output:?}/{target:?}"
+                );
+                assert_eq!(
+                    constrained
                         .relocations()
                         .iter()
                         .filter(|relocation| {
                             relocation.symbol == PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL
                         })
                         .count(),
-                    2 * usize::from(output == OutputContract::Span),
+                    usize::from(output == OutputContract::Span)
+                        * if expects_fused_hole { 1 } else { 2 },
                     "static-prefix Span relocation: {output:?}/{target:?}"
+                );
+                assert_eq!(
+                    constrained
+                        .relocations()
+                        .iter()
+                        .filter(|relocation| {
+                            relocation.symbol
+                                == STATIC_PREFIX_LAZY_SPAN_RECOVERY_RUNTIME_SYMBOL
+                        })
+                        .count(),
+                    usize::from(output == OutputContract::Span && expects_fused_hole),
+                    "lazy static-prefix Span relocation: {output:?}/{target:?}"
                 );
                 assert_eq!(
                     constrained.required_prepared_dynamic_rows_loop_scan_runtime_symbol(),
@@ -52775,11 +53005,15 @@ int main(void){{
             );
             assert_eq!(
                 module.required_prepared_preflight_runtime_symbol(),
-                Some(SLOW_PREFIX_PREFLIGHT_V1_RUNTIME_SYMBOL_NAME)
+                None
             );
             assert_eq!(
                 module.required_prepared_span_recovery_runtime_symbol(),
-                Some(SLOW_PREFIX_SPAN_RECOVERY_V1_RUNTIME_SYMBOL_NAME)
+                None
+            );
+            assert_eq!(
+                module.required_prepared_lazy_static_prefix_span_recovery_runtime_symbol(),
+                Some(SLOW_PREFIX_LAZY_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME)
             );
             assert!(module.sections()[PROGRAM_SECTION]
                 .bytes()
@@ -60039,7 +60273,7 @@ int main(void){{
         assert!(module.slow_aot_report().is_some());
         assert_eq!(
             module.required_prepared_preflight_runtime_symbol(),
-            Some(SLOW_PREFIX_PREFLIGHT_RUNTIME_SYMBOL_NAME)
+            None
         );
         assert_eq!(
             module.required_prepared_fallback_runtime_symbol(),
@@ -60047,11 +60281,15 @@ int main(void){{
         );
         assert_eq!(
             module.required_prepared_runtime_symbol(),
-            Some(SLOW_PREFIX_CONTINUE_RUNTIME_SYMBOL_NAME)
+            Some(SLOW_PREFIX_FUSED_CONTINUE_RUNTIME_SYMBOL_NAME)
         );
         assert_eq!(
             module.required_prepared_span_recovery_runtime_symbol(),
             Some(SLOW_PREFIX_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME)
+        );
+        assert_eq!(
+            module.required_prepared_lazy_static_prefix_span_recovery_runtime_symbol(),
+            Some(SLOW_PREFIX_LAZY_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME)
         );
         assert_eq!(
             module
