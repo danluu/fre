@@ -13757,39 +13757,107 @@ fn x86_emit_sparse_binary_range(
     Ok(())
 }
 
-fn x86_sparse_lookup_vector_width(
+const MAX_NATIVE_SPARSE_SCALAR_TAIL: usize = MAX_NATIVE_DEFAULT_EXCEPTIONS;
+
+/// Target-neutral code-size route for a fixed-width sparse-key probe.
+///
+/// A one-to-four-key remainder is cheaper as the already-established scalar
+/// tree than as another vector load, mask extraction and exact tail mask. The
+/// scalar tail is emitted before vector code while AL still holds the lookup
+/// key. Full scalable rows have unique keys; short rows repeat their final
+/// real key and the same value through logical padding, while uniform rows
+/// repeat the default. Thus a padded tail hit is semantically identical to
+/// the earlier logical hit. Physical padding exists only through capacity 16,
+/// where the single-vector inline sentinel remains in charge. Larger
+/// remainders use one final exact masked vector chunk.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeSparseChunkPlan {
+    vector_width: usize,
+    vector_keys: usize,
+    vector_chunks: usize,
+    scalar_tail: usize,
+}
+
+impl NativeSparseChunkPlan {
+    fn chunk_start(self, chunk: usize) -> Option<usize> {
+        (chunk < self.vector_chunks)
+            .then(|| chunk.checked_mul(self.vector_width))
+            .flatten()
+    }
+
+    fn chunk_live_lanes(self, chunk: usize) -> Option<usize> {
+        let start = self.chunk_start(chunk)?;
+        self.vector_keys
+            .checked_sub(start)
+            .map(|remaining| remaining.min(self.vector_width))
+    }
+
+    fn scalar_tail_start(self) -> Option<usize> {
+        (self.scalar_tail != 0).then_some(self.vector_keys)
+    }
+}
+
+fn native_sparse_chunk_plan(
+    capacity: usize,
+    vector_width: usize,
+    readable_key_bytes: usize,
+) -> Option<NativeSparseChunkPlan> {
+    if capacity == 0 || vector_width == 0 || !vector_width.is_power_of_two() {
+        return None;
+    }
+    let remainder = capacity.checked_rem(vector_width)?;
+    let scalar_tail = if remainder <= MAX_NATIVE_SPARSE_SCALAR_TAIL {
+        remainder
+    } else {
+        0
+    };
+    let vector_keys = capacity.checked_sub(scalar_tail)?;
+    if vector_keys == 0 {
+        return None;
+    }
+    let vector_chunks = vector_keys
+        .checked_add(vector_width.checked_sub(1)?)?
+        .checked_div(vector_width)?;
+    // This is the end of the final physical load, not merely the final live
+    // key. It proves every full chunk and an overlapping masked tail stay in
+    // the row. In particular, post-64 AVX-512 tails may safely read into the
+    // value area, while a no-full-chunk compact 17..20 row cannot use ZMM.
+    let final_load_end = vector_chunks.checked_mul(vector_width)?;
+    (final_load_end <= readable_key_bytes).then_some(NativeSparseChunkPlan {
+        vector_width,
+        vector_keys,
+        vector_chunks,
+        scalar_tail,
+    })
+}
+
+fn x86_sparse_lookup_lane_width(
     exception_capacity: u8,
     cells: NativeCellEncoding,
     kind: X86StartFilterKind,
-) -> Option<usize> {
+) -> usize {
     let capacity = usize::from(exception_capacity);
-    let target_width = usize::from(kind.width());
-    if capacity > target_width {
-        return None;
-    }
-    // A compact row has half-width values after its key area. AVX-512F+BW
-    // does not imply AVX2 or AVX-512VL, so its compact path uses architectural
-    // baseline SSE through sixteen keys, the scalar tree for the four rows
-    // whose key tail cannot cover a ZMM, and ZMM only once 64 readable bytes
-    // are proved. AVX2 retains its established XMM/YMM split.
-    let width = match (kind, cells, capacity) {
+    match (kind, cells, capacity) {
         (X86StartFilterKind::Sse2, _, _)
         | (X86StartFilterKind::Avx2, _, 0..=16)
-        | (X86StartFilterKind::Avx512Bw, NativeCellEncoding::Compact16, 0..=16) => 16,
+        | (X86StartFilterKind::Avx512Bw, NativeCellEncoding::Compact16, 0..=20) => 16,
         (X86StartFilterKind::Avx2, _, _) => 32,
-        (X86StartFilterKind::Avx512Bw, NativeCellEncoding::Compact16, 17..=20) => {
-            return None;
-        }
         (X86StartFilterKind::Avx512Bw, _, _) => 64,
-    };
-    native_default_exception_row_bytes(exception_capacity, cells)
-        .filter(|&row_bytes| {
-            cells
-                .bytes()
-                .checked_add(width)
-                .is_some_and(|end| end <= row_bytes)
-        })
-        .map(|_| width)
+    }
+}
+
+fn x86_sparse_lookup_chunk_plan(
+    exception_capacity: u8,
+    cells: NativeCellEncoding,
+    kind: X86StartFilterKind,
+) -> Option<NativeSparseChunkPlan> {
+    let row_bytes = native_default_exception_row_bytes(exception_capacity, cells)?;
+    let readable_key_bytes = row_bytes.checked_sub(cells.bytes())?;
+    native_sparse_chunk_plan(
+        usize::from(exception_capacity),
+        x86_sparse_lookup_lane_width(exception_capacity, cells, kind),
+        readable_key_bytes,
+    )
 }
 
 fn x86_sparse_lookup_needs_vzeroupper(
@@ -13797,15 +13865,155 @@ fn x86_sparse_lookup_needs_vzeroupper(
     cells: NativeCellEncoding,
     kind: X86StartFilterKind,
 ) -> bool {
-    x86_sparse_lookup_vector_width(exception_capacity, cells, kind).is_some_and(|width| {
+    x86_sparse_lookup_chunk_plan(exception_capacity, cells, kind).is_some_and(|plan| {
         matches!(kind, X86StartFilterKind::Avx2)
-            || matches!(kind, X86StartFilterKind::Avx512Bw) && width == 64
+            || matches!(kind, X86StartFilterKind::Avx512Bw) && plan.vector_width == 64
     })
+}
+
+fn x86_emit_sparse_vector_broadcast(
+    assembler: &mut X86Assembler,
+    kind: X86StartFilterKind,
+    vector_width: usize,
+) -> Result<(), ObjectError> {
+    match (kind, vector_width) {
+        (X86StartFilterKind::Sse2, 16) => {
+            assembler.instruction(&[0x69, 0xc0, 0x01, 0x01, 0x01, 0x01])?; // imul eax,0x01010101
+            assembler.instruction(&[0x66, 0x0f, 0x6e, 0xc0])?; // movd xmm0,eax
+            assembler.instruction(&[0x66, 0x0f, 0x70, 0xc0, 0x00])?; // pshufd xmm0,xmm0,0
+        }
+        (X86StartFilterKind::Avx512Bw, 16) => {
+            // AVX-512F+BW does not imply AVX2 or AVX-512VL, but it does
+            // provide the VEX.128 forms of these baseline operations. Keep
+            // the narrow compact-row route VEX encoded so a ZMM scanner can
+            // enter table lookup without an AVX-to-legacy-SSE transition.
+            assembler.instruction(&[0x69, 0xc0, 0x01, 0x01, 0x01, 0x01])?; // imul eax,0x01010101
+            assembler.instruction(&[0xc5, 0xf9, 0x6e, 0xc0])?; // vmovd xmm0,eax
+            assembler.instruction(&[0xc5, 0xf9, 0x70, 0xc0, 0x00])?; // vpshufd xmm0,xmm0,0
+        }
+        (X86StartFilterKind::Avx2, 16) => {
+            assembler.instruction(&[0xc5, 0xf9, 0x6e, 0xc0])?; // vmovd xmm0,eax
+            assembler.instruction(&[0xc4, 0xe2, 0x79, 0x78, 0xc0])?; // vpbroadcastb xmm0,xmm0
+        }
+        (X86StartFilterKind::Avx2, 32) => {
+            assembler.instruction(&[0xc5, 0xf9, 0x6e, 0xc0])?; // vmovd xmm0,eax
+            assembler.instruction(&[0xc4, 0xe2, 0x7d, 0x78, 0xc0])?; // vpbroadcastb ymm0,xmm0
+        }
+        (X86StartFilterKind::Avx512Bw, 64) => {
+            assembler.instruction(&[0x62, 0xf2, 0x7d, 0x48, 0x7a, 0xc0])?; // vpbroadcastb zmm0,eax
+        }
+        _ => {
+            return Err(ObjectError::InvalidModule(
+                "x86 scalable vector broadcast width",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Produce one exact local-lane mask without destroying the broadcast.
+///
+/// XMM/YMM14 is caller-saved and disjoint from persistent scanner state:
+/// graph-derived constants occupy registers 1..8, retained candidates live in
+/// R12/R13, and sparse-batch accumulation uses register 15. Prefix-relation
+/// code uses register 14 only as a defined-and-consumed negation temporary
+/// before it can branch to table lookup; every scanner reentry defines it
+/// again. Keeping the broadcast in register zero is therefore safe across any
+/// number of table chunks. AVX-512 writes K1 and likewise retains ZMM0.
+fn x86_emit_sparse_vector_mask(
+    assembler: &mut X86Assembler,
+    kind: X86StartFilterKind,
+    vector_width: usize,
+    key_offset: u32,
+    live_lanes: usize,
+) -> Result<(), ObjectError> {
+    if live_lanes == 0 || live_lanes > vector_width {
+        return Err(ObjectError::InvalidModule(
+            "x86 scalable vector live lanes",
+        ));
+    }
+    match (kind, vector_width) {
+        (X86StartFilterKind::Sse2, 16) => {
+            let mut load = vec![0xf3, 0x45, 0x0f, 0x6f, 0xb2]; // movdqu xmm14,[r10+disp32]
+            load.extend_from_slice(&key_offset.to_le_bytes());
+            assembler.instruction(&load)?;
+            assembler.instruction(&[0x66, 0x44, 0x0f, 0x74, 0xf0])?; // pcmpeqb xmm14,xmm0
+            assembler.instruction(&[0x66, 0x41, 0x0f, 0xd7, 0xc6])?; // pmovmskb eax,xmm14
+        }
+        (X86StartFilterKind::Avx2, 16 | 32) | (X86StartFilterKind::Avx512Bw, 16) => {
+            let vex_l = if vector_width == 16 { 0x79 } else { 0x7d };
+            let mut compare = vec![0xc4, 0x41, vex_l, 0x74, 0xb2]; // vpcmpeqb xmm/ymm14,xmm/ymm0,[r10+disp32]
+            compare.extend_from_slice(&key_offset.to_le_bytes());
+            assembler.instruction(&compare)?;
+            assembler.instruction(&[0xc4, 0xc1, vex_l, 0xd7, 0xc6])?; // vpmovmskb eax,xmm/ymm14
+        }
+        (X86StartFilterKind::Avx512Bw, 64) => {
+            let mut compare = vec![0x62, 0xd1, 0x7d, 0x48, 0x74, 0x8a]; // vpcmpeqb k1,zmm0,[r10+disp32]
+            compare.extend_from_slice(&key_offset.to_le_bytes());
+            assembler.instruction(&compare)?;
+            assembler.instruction(&[0xc4, 0xe1, 0xfb, 0x93, 0xc1])?; // kmovq rax,k1
+        }
+        _ => {
+            return Err(ObjectError::InvalidModule(
+                "x86 scalable vector mask width",
+            ));
+        }
+    }
+    if live_lanes == vector_width {
+        return Ok(());
+    }
+    if vector_width == 64 {
+        let shift = vector_width.checked_sub(live_lanes).ok_or(
+            ObjectError::ArithmeticOverflow("x86 AVX-512 sparse live lanes"),
+        )?;
+        let shift = u8::try_from(shift).map_err(|_| {
+            ObjectError::ArithmeticOverflow("x86 AVX-512 sparse live shift")
+        })?;
+        assembler.instruction(&[0x48, 0xc1, 0xe0, shift])?; // shl rax,64-live
+        assembler.instruction(&[0x48, 0xc1, 0xe8, shift])?; // shr rax,64-live
+    } else {
+        let live_bits = u32::try_from(live_lanes)
+            .map_err(|_| ObjectError::ArithmeticOverflow("x86 sparse live lanes"))?;
+        let live_mask = 1_u32
+            .checked_shl(live_bits)
+            .and_then(|mask| mask.checked_sub(1))
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "x86 sparse live mask",
+            ))?;
+        x86_emit_and_eax_mask(assembler, live_mask)?;
+    }
+    Ok(())
+}
+
+fn x86_emit_sparse_vector_value_load(
+    assembler: &mut X86Assembler,
+    value_offset: usize,
+    chunk_start: usize,
+    cells: NativeCellEncoding,
+) -> Result<(), ObjectError> {
+    let displacement = chunk_start
+        .checked_mul(cells.bytes())
+        .and_then(|offset| value_offset.checked_add(offset))
+        .and_then(|offset| u32::try_from(offset).ok())
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "x86 scalable vector value offset",
+        ))?;
+    let mut load = match cells {
+        NativeCellEncoding::Compact16 => vec![0x41, 0x0f, 0xb7, 0x84, 0x42],
+        NativeCellEncoding::Wide32 => vec![0x41, 0x8b, 0x84, 0x82],
+        _ => {
+            return Err(ObjectError::InvalidModule(
+                "x86 scalable vector value width",
+            ));
+        }
+    };
+    load.extend_from_slice(&displacement.to_le_bytes());
+    assembler.instruction(&load).map(|_| ())
 }
 
 #[allow(
     clippy::too_many_lines,
-    reason = "three target-width vector probes and the balanced scalar fallback share one lookup contract"
+    reason = "scalar-tail cost routing, three vector widths, exact masks and one common default share one lookup contract"
 )]
 fn x86_emit_sparse_exception_lookup(
     assembler: &mut X86Assembler,
@@ -13829,112 +14037,7 @@ fn x86_emit_sparse_exception_lookup(
         capacity < native_default_exception_physical_slots(exception_capacity);
     let default = assembler.label()?;
     let done = assembler.label()?;
-    if let Some(vector_lanes) =
-        x86_sparse_lookup_vector_width(exception_capacity, cells, kind)
-    {
-        let wide_opmask = vector_lanes == 64;
-        let key_offset = u8::try_from(cells.bytes()).map_err(|_| {
-            ObjectError::ArithmeticOverflow("x86 scalable vector key offset")
-        })?;
-        match (kind, vector_lanes) {
-            (X86StartFilterKind::Sse2 | X86StartFilterKind::Avx512Bw, 16) => {
-                // Repeat the zero-extended byte in every dword, then every
-                // vector lane. The fixed key area is a complete 16 bytes.
-                assembler.instruction(&[0x69, 0xc0, 0x01, 0x01, 0x01, 0x01])?; // imul eax,0x01010101
-                assembler.instruction(&[0x66, 0x0f, 0x6e, 0xc0])?; // movd xmm0,eax
-                assembler.instruction(&[0x66, 0x0f, 0x70, 0xc0, 0x00])?; // pshufd xmm0,xmm0,0
-                assembler.instruction(&[0x66, 0x41, 0x0f, 0x74, 0x42, key_offset])?; // pcmpeqb xmm0,[r10+keys]
-                assembler.instruction(&[0x66, 0x0f, 0xd7, 0xc0])?; // pmovmskb eax,xmm0
-            }
-            (X86StartFilterKind::Avx2, 16) => {
-                assembler.instruction(&[0xc5, 0xf9, 0x6e, 0xc0])?; // vmovd xmm0,eax
-                assembler.instruction(&[0xc4, 0xe2, 0x79, 0x78, 0xc0])?; // vpbroadcastb xmm0,xmm0
-                assembler.instruction(&[0xc4, 0xc1, 0x79, 0x74, 0x42, key_offset])?; // vpcmpeqb xmm0,xmm0,[r10+keys]
-                assembler.instruction(&[0xc5, 0xf9, 0xd7, 0xc0])?; // vpmovmskb eax,xmm0
-            }
-            (X86StartFilterKind::Avx2 | X86StartFilterKind::Avx512Bw, 32) => {
-                // The key bytes are followed by aligned packed values, so a
-                // complete YMM read remains within every admitted row. Mask
-                // those value bytes before selecting the first match.
-                assembler.instruction(&[0xc5, 0xf9, 0x6e, 0xc0])?; // vmovd xmm0,eax
-                assembler.instruction(&[0xc4, 0xe2, 0x7d, 0x78, 0xc0])?; // vpbroadcastb ymm0,xmm0
-                assembler.instruction(&[0xc4, 0xc1, 0x7d, 0x74, 0x42, key_offset])?; // vpcmpeqb ymm0,ymm0,[r10+keys]
-                assembler.instruction(&[0xc5, 0xfd, 0xd7, 0xc0])?; // vpmovmskb eax,ymm0
-                if capacity < 32 {
-                    let live_bits = u32::try_from(capacity).map_err(|_| {
-                        ObjectError::ArithmeticOverflow("x86 AVX2 sparse live lanes")
-                    })?;
-                    let live_mask = 1_u32
-                        .checked_shl(live_bits)
-                        .and_then(|mask| mask.checked_sub(1))
-                        .ok_or(ObjectError::ArithmeticOverflow(
-                            "x86 AVX2 sparse live mask",
-                        ))?;
-                    x86_emit_and_eax_mask(assembler, live_mask)?;
-                }
-            }
-            (X86StartFilterKind::Avx512Bw, 64) => {
-                // Sparse rows pad 5..16 keys and values to 16 physical slots;
-                // larger rows retain every logical slot. Thus every row here
-                // has at least 64 readable bytes from its key base, and one
-                // full ZMM load is in-bounds. Clear padding/value lanes before
-                // selecting the first exact key.
-                assembler.instruction(&[0x62, 0xf2, 0x7d, 0x48, 0x7a, 0xc0])?; // vpbroadcastb zmm0,eax
-                assembler.instruction(&[
-                    0x62, 0xd1, 0x7d, 0x48, 0x74, 0x8a, key_offset, 0x00, 0x00, 0x00,
-                ])?; // vpcmpeqb k1,zmm0,[r10+keys]
-                assembler.instruction(&[0xc4, 0xe1, 0xfb, 0x93, 0xc1])?; // kmovq rax,k1
-                if capacity < 64 {
-                    let shift = 64_usize.checked_sub(capacity).ok_or(
-                        ObjectError::ArithmeticOverflow("x86 AVX-512 sparse live lanes"),
-                    )?;
-                    let shift = u8::try_from(shift).map_err(|_| {
-                        ObjectError::ArithmeticOverflow("x86 AVX-512 sparse live shift")
-                    })?;
-                    assembler.instruction(&[0x48, 0xc1, 0xe0, shift])?; // shl rax,64-capacity
-                    assembler.instruction(&[0x48, 0xc1, 0xe8, shift])?; // shr rax,64-capacity
-                }
-            }
-            _ => {
-                return Err(ObjectError::InvalidModule(
-                    "x86 scalable vector lookup width",
-                ));
-            }
-        }
-        if inline_default_slot {
-            let default_bit = 1_u32
-                .checked_shl(u32::from(exception_capacity))
-                .ok_or(ObjectError::ArithmeticOverflow(
-                    "x86 scalable inline-default lane",
-                ))?;
-            x86_emit_or_eax_mask(assembler, default_bit)?;
-        } else if wide_opmask {
-            assembler.instruction(&[0x48, 0x85, 0xc0])?; // test rax,rax
-        } else {
-            assembler.instruction(&[0x85, 0xc0])?; // test eax,eax
-        }
-        if !inline_default_slot {
-            assembler.branch(&[0x0f, 0x84], default)?;
-        }
-        if wide_opmask {
-            assembler.instruction(&[0x48, 0x0f, 0xbc, 0xc0])?; // bsf rax,rax
-        } else {
-            assembler.instruction(&[0x0f, 0xbc, 0xc0])?; // bsf eax,eax
-        }
-        let value_offset = u32::try_from(value_offset)
-            .map_err(|_| ObjectError::ArithmeticOverflow("x86 scalable vector value offset"))?;
-        let mut load = match cells {
-            NativeCellEncoding::Compact16 => vec![0x41, 0x0f, 0xb7, 0x84, 0x42],
-            NativeCellEncoding::Wide32 => vec![0x41, 0x8b, 0x84, 0x82],
-            _ => unreachable!("validated scalable sparse cell width"),
-        };
-        load.extend_from_slice(&value_offset.to_le_bytes());
-        assembler.instruction(&load)?;
-        if inline_default_slot {
-            return Ok(());
-        }
-        assembler.branch(&[0xe9], done)?;
-    } else {
+    let Some(plan) = x86_sparse_lookup_chunk_plan(exception_capacity, cells, kind) else {
         x86_emit_sparse_binary_range(
             assembler,
             0,
@@ -13944,7 +14047,96 @@ fn x86_emit_sparse_exception_lookup(
             default,
             done,
         )?;
+        assembler.bind(default)?;
+        match cells {
+            NativeCellEncoding::Compact16 => {
+                assembler.instruction(&[0x41, 0x0f, 0xb7, 0x02])?;
+            }
+            NativeCellEncoding::Wide32 => {
+                assembler.instruction(&[0x41, 0x8b, 0x02])?;
+            }
+            _ => unreachable!("validated scalable sparse cell width"),
+        }
+        assembler.bind(done)?;
+        return Ok(());
+    };
+
+    // PMOVMSKB/KMOV overwrite EAX and therefore AL. Compare a cheap scalar
+    // tail first, then broadcast the still-live key exactly once. Any repeated
+    // logical padding key carries the same packed value as its first copy.
+    if let Some(tail_start) = plan.scalar_tail_start() {
+        let vector_start = assembler.label()?;
+        x86_emit_sparse_binary_range(
+            assembler,
+            tail_start,
+            capacity,
+            value_offset,
+            cells,
+            vector_start,
+            done,
+        )?;
+        assembler.bind(vector_start)?;
     }
+    x86_emit_sparse_vector_broadcast(assembler, kind, plan.vector_width)?;
+    let mut vector_hits = Vec::new();
+    vector_hits
+        .try_reserve_exact(plan.vector_chunks)
+        .map_err(|_| ObjectError::Allocation("x86 scalable vector hit labels"))?;
+    for chunk in 0..plan.vector_chunks {
+        let chunk_start = plan.chunk_start(chunk).ok_or(ObjectError::InvalidModule(
+            "x86 scalable vector chunk start",
+        ))?;
+        let live_lanes = plan
+            .chunk_live_lanes(chunk)
+            .ok_or(ObjectError::InvalidModule(
+                "x86 scalable vector chunk lanes",
+            ))?;
+        let key_offset = cells
+            .bytes()
+            .checked_add(chunk_start)
+            .and_then(|offset| u32::try_from(offset).ok())
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "x86 scalable vector key offset",
+            ))?;
+        x86_emit_sparse_vector_mask(
+            assembler,
+            kind,
+            plan.vector_width,
+            key_offset,
+            live_lanes,
+        )?;
+        if inline_default_slot {
+            if plan.vector_chunks != 1 || plan.scalar_tail != 0 {
+                return Err(ObjectError::InvalidModule(
+                    "x86 scalable inline-default route",
+                ));
+            }
+            let default_bit = 1_u32
+                .checked_shl(u32::from(exception_capacity))
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "x86 scalable inline-default lane",
+                ))?;
+            x86_emit_or_eax_mask(assembler, default_bit)?;
+            if plan.vector_width == 64 {
+                assembler.instruction(&[0x48, 0x0f, 0xbc, 0xc0])?; // bsf rax,rax
+            } else {
+                assembler.instruction(&[0x0f, 0xbc, 0xc0])?; // bsf eax,eax
+            }
+            x86_emit_sparse_vector_value_load(assembler, value_offset, chunk_start, cells)?;
+            return Ok(());
+        }
+        if plan.vector_width == 64 {
+            assembler.instruction(&[0x48, 0x85, 0xc0])?; // test rax,rax
+        } else {
+            assembler.instruction(&[0x85, 0xc0])?; // test eax,eax
+        }
+        let hit = assembler.label()?;
+        assembler.branch(&[0x0f, 0x85], hit)?; // rare nonzero mask
+        vector_hits.push((chunk_start, hit));
+    }
+    // No-match is the common path: all zero masks fall through every chunk to
+    // one default load. Rare hit stubs retain each local mask and fold the
+    // chunk base into their indexed value displacement.
     assembler.bind(default)?;
     match cells {
         NativeCellEncoding::Compact16 => {
@@ -13954,6 +14146,17 @@ fn x86_emit_sparse_exception_lookup(
             assembler.instruction(&[0x41, 0x8b, 0x02])?;
         }
         _ => unreachable!("validated scalable sparse cell width"),
+    }
+    assembler.branch(&[0xe9], done)?;
+    for (chunk_start, hit) in vector_hits {
+        assembler.bind(hit)?;
+        if plan.vector_width == 64 {
+            assembler.instruction(&[0x48, 0x0f, 0xbc, 0xc0])?; // bsf rax,rax
+        } else {
+            assembler.instruction(&[0x0f, 0xbc, 0xc0])?; // bsf eax,eax
+        }
+        x86_emit_sparse_vector_value_load(assembler, value_offset, chunk_start, cells)?;
+        assembler.branch(&[0xe9], done)?;
     }
     assembler.bind(done)?;
     Ok(())
@@ -57366,10 +57569,10 @@ int main(void){{
                     assert!(!has(&[0x85, 0xc0]));
                     match kind {
                         X86StartFilterKind::Sse2 => {
-                            assert!(has(&[0x66, 0x0f, 0xd7, 0xc0]));
+                            assert!(has(&[0x66, 0x41, 0x0f, 0xd7, 0xc6]));
                         }
                         X86StartFilterKind::Avx2 => {
-                            assert!(has(&[0xc5, 0xf9, 0xd7, 0xc0]));
+                            assert!(has(&[0xc4, 0xc1, 0x79, 0xd7, 0xc6]));
                         }
                         X86StartFilterKind::Avx512Bw => {
                             assert!(has(&[0xc4, 0xe1, 0xfb, 0x93, 0xc1]));
@@ -58674,21 +58877,25 @@ int main(void){{
             };
             match target.architecture {
                 Architecture::X86_64 if expected_isa == NativeScannerIsa::X86Sse2 => {
-                    assert!(emission.code.windows(6).any(|bytes| {
-                        bytes == [0x66, 0x41, 0x0f, 0x74, 0x42, 2]
+                    assert!(emission.code.windows(9).any(|bytes| {
+                        bytes == [0xf3, 0x45, 0x0f, 0x6f, 0xb2, 2, 0, 0, 0]
                     }), "{target:?}");
                 }
                 Architecture::X86_64 if expected_isa == NativeScannerIsa::X86Avx512Bw => {
                     // F+BW does not imply AVX2 or VL. Five compact keys stay
-                    // on the architectural SSE2 lookup even when a separate
-                    // AVX-512 scanner owns the entry tier.
-                    assert!(emission.code.windows(6).any(|bytes| {
-                        bytes == [0x66, 0x41, 0x0f, 0x74, 0x42, 2]
+                    // on a VEX.128 lookup even when a separate AVX-512
+                    // scanner owns the entry tier. No legacy SSE transition
+                    // may occur on that hot scanner-to-table edge.
+                    assert!(emission.code.windows(9).any(|bytes| {
+                        bytes == [0xc4, 0x41, 0x79, 0x74, 0xb2, 2, 0, 0, 0]
+                    }), "{target:?}");
+                    assert!(!emission.code.windows(9).any(|bytes| {
+                        bytes == [0xf3, 0x45, 0x0f, 0x6f, 0xb2, 2, 0, 0, 0]
                     }), "{target:?}");
                 }
                 Architecture::X86_64 => {
-                    assert!(emission.code.windows(6).any(|bytes| {
-                        bytes == [0xc4, 0xc1, 0x79, 0x74, 0x42, 2]
+                    assert!(emission.code.windows(9).any(|bytes| {
+                        bytes == [0xc4, 0x41, 0x79, 0x74, 0xb2, 2, 0, 0, 0]
                     }), "{target:?}");
                 }
                 Architecture::Aarch64 if expected_isa == NativeScannerIsa::Aarch64Asimd => {
@@ -61839,15 +62046,19 @@ int main(void){{
                             assert!(has(&[0x69, 0xc0, 1, 1, 1, 1]), "{target:?}");
                             assert!(has(&[0x66, 0x0f, 0x6e, 0xc0]), "{target:?}");
                             assert!(has(&[0x66, 0x0f, 0x70, 0xc0, 0]), "{target:?}",);
-                            assert!(has(&[0x66, 0x41, 0x0f, 0x74, 0x42, 2]), "{target:?}",);
-                            assert!(has(&[0x66, 0x0f, 0xd7, 0xc0]), "{target:?}");
+                            assert!(has(&[
+                                0xf3, 0x45, 0x0f, 0x6f, 0xb2, 2, 0, 0, 0,
+                            ]), "{target:?}",);
+                            assert!(has(&[0x66, 0x41, 0x0f, 0xd7, 0xc6]), "{target:?}");
                         }
                         StartAccelerator::X86Avx2 => {
                             assert!(has(&[0x0f, 0xbc, 0xc0]), "{target:?}");
                             assert!(has(&[0xc5, 0xf9, 0x6e, 0xc0]), "{target:?}");
                             assert!(has(&[0xc4, 0xe2, 0x79, 0x78, 0xc0]), "{target:?}",);
-                            assert!(has(&[0xc4, 0xc1, 0x79, 0x74, 0x42, 2]), "{target:?}",);
-                            assert!(has(&[0xc5, 0xf9, 0xd7, 0xc0]), "{target:?}");
+                            assert!(has(&[
+                                0xc4, 0x41, 0x79, 0x74, 0xb2, 2, 0, 0, 0,
+                            ]), "{target:?}",);
+                            assert!(has(&[0xc4, 0xc1, 0x79, 0xd7, 0xc6]), "{target:?}");
                             assert!(
                                 !has(&[0x66, 0x41, 0x0f, 0x74, 0x42, 2]),
                                 "{target:?} used a legacy compare in an AVX loop",
@@ -61855,10 +62066,15 @@ int main(void){{
                         }
                         StartAccelerator::X86Avx512Bw => {
                             assert!(has(&[0x69, 0xc0, 1, 1, 1, 1]), "{target:?}");
-                            assert!(has(&[0x66, 0x0f, 0x6e, 0xc0]), "{target:?}");
-                            assert!(has(&[0x66, 0x0f, 0x70, 0xc0, 0]), "{target:?}",);
-                            assert!(has(&[0x66, 0x41, 0x0f, 0x74, 0x42, 2]), "{target:?}",);
-                            assert!(has(&[0x66, 0x0f, 0xd7, 0xc0]), "{target:?}");
+                            assert!(has(&[0xc5, 0xf9, 0x6e, 0xc0]), "{target:?}");
+                            assert!(has(&[0xc5, 0xf9, 0x70, 0xc0, 0]), "{target:?}",);
+                            assert!(has(&[
+                                0xc4, 0x41, 0x79, 0x74, 0xb2, 2, 0, 0, 0,
+                            ]), "{target:?}",);
+                            assert!(has(&[0xc4, 0xc1, 0x79, 0xd7, 0xc6]), "{target:?}");
+                            assert!(!has(&[
+                                0xf3, 0x45, 0x0f, 0x6f, 0xb2, 2, 0, 0, 0,
+                            ]), "{target:?} used legacy SSE after an AVX-512 scanner");
                         }
                         other => panic!("unexpected x86 accelerator {other:?}"),
                     }
@@ -61935,38 +62151,479 @@ int main(void){{
     #[allow(
         clippy::arithmetic_side_effects,
         clippy::too_many_lines,
+        reason = "all capacity, cell-width and x86-tier chunk boundaries share one structural route proof"
+    )]
+    fn scalable_sparse_x86_chunk_routes_are_exhaustive_and_structural() {
+        const CAPACITIES: [u8; 16] = [
+            16, 17, 20, 21, 31, 32, 33, 63, 64, 65, 68, 69, 127, 128, 129, 255,
+        ];
+        const SSE2: [(usize, usize, usize, usize); 16] = [
+            (16, 16, 1, 0),
+            (16, 16, 1, 1),
+            (16, 16, 1, 4),
+            (16, 21, 2, 0),
+            (16, 31, 2, 0),
+            (16, 32, 2, 0),
+            (16, 32, 2, 1),
+            (16, 63, 4, 0),
+            (16, 64, 4, 0),
+            (16, 64, 4, 1),
+            (16, 64, 4, 4),
+            (16, 69, 5, 0),
+            (16, 127, 8, 0),
+            (16, 128, 8, 0),
+            (16, 128, 8, 1),
+            (16, 255, 16, 0),
+        ];
+        const AVX2: [(usize, usize, usize, usize); 16] = [
+            (16, 16, 1, 0),
+            (32, 17, 1, 0),
+            (32, 20, 1, 0),
+            (32, 21, 1, 0),
+            (32, 31, 1, 0),
+            (32, 32, 1, 0),
+            (32, 32, 1, 1),
+            (32, 63, 2, 0),
+            (32, 64, 2, 0),
+            (32, 64, 2, 1),
+            (32, 64, 2, 4),
+            (32, 69, 3, 0),
+            (32, 127, 4, 0),
+            (32, 128, 4, 0),
+            (32, 128, 4, 1),
+            (32, 255, 8, 0),
+        ];
+        const AVX512_COMPACT: [(usize, usize, usize, usize); 16] = [
+            (16, 16, 1, 0),
+            (16, 16, 1, 1),
+            (16, 16, 1, 4),
+            (64, 21, 1, 0),
+            (64, 31, 1, 0),
+            (64, 32, 1, 0),
+            (64, 33, 1, 0),
+            (64, 63, 1, 0),
+            (64, 64, 1, 0),
+            (64, 64, 1, 1),
+            (64, 64, 1, 4),
+            (64, 69, 2, 0),
+            (64, 127, 2, 0),
+            (64, 128, 2, 0),
+            (64, 128, 2, 1),
+            (64, 255, 4, 0),
+        ];
+        const AVX512_WIDE: [(usize, usize, usize, usize); 16] = [
+            (64, 16, 1, 0),
+            (64, 17, 1, 0),
+            (64, 20, 1, 0),
+            (64, 21, 1, 0),
+            (64, 31, 1, 0),
+            (64, 32, 1, 0),
+            (64, 33, 1, 0),
+            (64, 63, 1, 0),
+            (64, 64, 1, 0),
+            (64, 64, 1, 1),
+            (64, 64, 1, 4),
+            (64, 69, 2, 0),
+            (64, 127, 2, 0),
+            (64, 128, 2, 0),
+            (64, 128, 2, 1),
+            (64, 255, 4, 0),
+        ];
+
+        fn occurrences(code: &[u8], needle: &[u8]) -> usize {
+            code.windows(needle.len())
+                .filter(|bytes| *bytes == needle)
+                .count()
+        }
+
+        for cells in [NativeCellEncoding::Compact16, NativeCellEncoding::Wide32] {
+            for kind in [
+                X86StartFilterKind::Sse2,
+                X86StartFilterKind::Avx2,
+                X86StartFilterKind::Avx512Bw,
+            ] {
+                let expected = match (kind, cells) {
+                    (X86StartFilterKind::Sse2, _) => &SSE2,
+                    (X86StartFilterKind::Avx2, _) => &AVX2,
+                    (X86StartFilterKind::Avx512Bw, NativeCellEncoding::Compact16) => {
+                        &AVX512_COMPACT
+                    }
+                    (X86StartFilterKind::Avx512Bw, NativeCellEncoding::Wide32) => &AVX512_WIDE,
+                    _ => unreachable!(),
+                };
+                for (index, capacity) in CAPACITIES.iter().copied().enumerate() {
+                    let (vector_width, vector_keys, vector_chunks, scalar_tail) = expected[index];
+                    let expected_plan = NativeSparseChunkPlan {
+                        vector_width,
+                        vector_keys,
+                        vector_chunks,
+                        scalar_tail,
+                    };
+                    let plan = x86_sparse_lookup_chunk_plan(capacity, cells, kind).unwrap();
+                    assert_eq!(plan, expected_plan, "{kind:?}/{cells:?}/{capacity}");
+                    let row_bytes = native_default_exception_row_bytes(capacity, cells).unwrap();
+                    let readable = row_bytes - cells.bytes();
+                    for chunk in 0..plan.vector_chunks {
+                        let start = plan.chunk_start(chunk).unwrap();
+                        assert!(
+                            start + plan.vector_width <= readable,
+                            "{kind:?}/{cells:?}/{capacity}/chunk={chunk}",
+                        );
+                    }
+                    let final_load_end = plan.vector_chunks * plan.vector_width;
+                    assert!(native_sparse_chunk_plan(
+                        usize::from(capacity),
+                        plan.vector_width,
+                        final_load_end - 1,
+                    )
+                    .is_none());
+                    let final_live = plan.chunk_live_lanes(plan.vector_chunks - 1).unwrap();
+                    if plan.scalar_tail != 0 {
+                        assert!(plan.scalar_tail <= MAX_NATIVE_SPARSE_SCALAR_TAIL);
+                        assert_eq!(plan.vector_keys % plan.vector_width, 0);
+                        assert_eq!(final_live, plan.vector_width);
+                    } else if final_live != plan.vector_width {
+                        assert!(final_live > MAX_NATIVE_SPARSE_SCALAR_TAIL);
+                    }
+                    let expected_vzeroupper = kind == X86StartFilterKind::Avx2
+                        || kind == X86StartFilterKind::Avx512Bw && plan.vector_width == 64;
+                    assert_eq!(
+                        x86_sparse_lookup_needs_vzeroupper(capacity, cells, kind),
+                        expected_vzeroupper,
+                    );
+
+                    let mut assembler = X86Assembler::new();
+                    x86_emit_sparse_exception_lookup(&mut assembler, capacity, cells, kind)
+                        .unwrap();
+                    let code = assembler.finish().unwrap();
+                    let (broadcast, compare) = match (kind, plan.vector_width) {
+                        (X86StartFilterKind::Sse2, 16) => (
+                            &[0x69, 0xc0, 1, 1, 1, 1][..],
+                            &[0xf3, 0x45, 0x0f, 0x6f, 0xb2][..],
+                        ),
+                        (X86StartFilterKind::Avx512Bw, 16) => (
+                            &[0xc5, 0xf9, 0x70, 0xc0, 0][..],
+                            &[0xc4, 0x41, 0x79, 0x74, 0xb2][..],
+                        ),
+                        (X86StartFilterKind::Avx2, 16) => (
+                            &[0xc4, 0xe2, 0x79, 0x78, 0xc0][..],
+                            &[0xc4, 0x41, 0x79, 0x74, 0xb2][..],
+                        ),
+                        (X86StartFilterKind::Avx2, 32) => (
+                            &[0xc4, 0xe2, 0x7d, 0x78, 0xc0][..],
+                            &[0xc4, 0x41, 0x7d, 0x74, 0xb2][..],
+                        ),
+                        (X86StartFilterKind::Avx512Bw, 64) => (
+                            &[0x62, 0xf2, 0x7d, 0x48, 0x7a, 0xc0][..],
+                            &[0x62, 0xd1, 0x7d, 0x48, 0x74, 0x8a][..],
+                        ),
+                        _ => unreachable!(),
+                    };
+                    assert_eq!(occurrences(&code, broadcast), 1, "{kind:?}/{cells:?}/{capacity}");
+                    assert_eq!(
+                        occurrences(&code, compare),
+                        plan.vector_chunks,
+                        "{kind:?}/{cells:?}/{capacity}",
+                    );
+                    let taken_hits = if plan.vector_width == 64 {
+                        occurrences(&code, &[0x48, 0x85, 0xc0, 0x75])
+                            + occurrences(&code, &[0x48, 0x85, 0xc0, 0x0f, 0x85])
+                    } else {
+                        occurrences(&code, &[0x85, 0xc0, 0x75])
+                            + occurrences(&code, &[0x85, 0xc0, 0x0f, 0x85])
+                    };
+                    let taken_misses = if plan.vector_width == 64 {
+                        occurrences(&code, &[0x48, 0x85, 0xc0, 0x74])
+                            + occurrences(&code, &[0x48, 0x85, 0xc0, 0x0f, 0x84])
+                    } else {
+                        occurrences(&code, &[0x85, 0xc0, 0x74])
+                            + occurrences(&code, &[0x85, 0xc0, 0x0f, 0x84])
+                    };
+                    assert_eq!(taken_hits, plan.vector_chunks, "{kind:?}/{cells:?}/{capacity}");
+                    assert_eq!(taken_misses, 0, "{kind:?}/{cells:?}/{capacity}");
+                    let default_load = match cells {
+                        NativeCellEncoding::Compact16 => &[0x41, 0x0f, 0xb7, 0x02][..],
+                        NativeCellEncoding::Wide32 => &[0x41, 0x8b, 0x02][..],
+                        _ => unreachable!(),
+                    };
+                    assert_eq!(occurrences(&code, default_load), 1);
+                    let value_offset = native_default_exception_value_offset(capacity, cells)
+                        .unwrap();
+                    for chunk in 0..plan.vector_chunks {
+                        let start = plan.chunk_start(chunk).unwrap();
+                        let displacement = value_offset + start * cells.bytes();
+                        let mut indexed = match cells {
+                            NativeCellEncoding::Compact16 => {
+                                vec![0x41, 0x0f, 0xb7, 0x84, 0x42]
+                            }
+                            NativeCellEncoding::Wide32 => vec![0x41, 0x8b, 0x84, 0x82],
+                            _ => unreachable!(),
+                        };
+                        indexed.extend_from_slice(
+                            &u32::try_from(displacement).unwrap().to_le_bytes(),
+                        );
+                        assert_eq!(occurrences(&code, &indexed), 1);
+                    }
+                    if let Some(tail_start) = plan.scalar_tail_start() {
+                        let root = tail_start + plan.scalar_tail / 2;
+                        let key_offset = cells.bytes() + root;
+                        let compare = if let Ok(offset) = i8::try_from(key_offset) {
+                            vec![0x41, 0x3a, 0x42, offset.to_le_bytes()[0]]
+                        } else {
+                            let mut compare = vec![0x41, 0x3a, 0x82];
+                            compare.extend_from_slice(&u32::try_from(key_offset).unwrap().to_le_bytes());
+                            compare
+                        };
+                        assert!(occurrences(&code, &compare) >= 1);
+                    }
+                    if final_live != plan.vector_width {
+                        if plan.vector_width == 64 {
+                            let shift = u8::try_from(plan.vector_width - final_live).unwrap();
+                            for opcode in [0xe0, 0xe8] {
+                                assert_eq!(
+                                    occurrences(&code, &[0x48, 0xc1, opcode, shift]),
+                                    1,
+                                );
+                            }
+                        } else {
+                            let live = u32::try_from(final_live).unwrap();
+                            let mask = 1_u32.checked_shl(live).unwrap() - 1;
+                            let mut instruction = vec![0x25];
+                            instruction.extend_from_slice(&mask.to_le_bytes());
+                            assert_eq!(occurrences(&code, &instruction), 1);
+                        }
+                    }
+                }
+            }
+        }
+
+        let compiled = compile_partial_loop(Target::x86_64_linux(), OutputContract::SelectedEnd);
+        let base = compiled
+            .program()
+            .native_partial_dfa_view()
+            .expect("chunked VZEROUPPER base")
+            .native;
+        let fixture = ScalableDefaultExceptionFixture::new(64, 20, false);
+        let seed = build_forced_default_exception_table(
+            fixture.view(base, false),
+            Architecture::X86_64,
+            usize::MAX,
+        )
+        .unwrap()
+        .1;
+        let bare_seed = NativeDfaLayout {
+            exact_prefix_match_width: None,
+            start_filter: None,
+            exact_start_byte_set: None,
+            exact_start_storage: None,
+            suffix_filter: None,
+            seeded_reverse: None,
+            loop_skip: None,
+            vector_filter: None,
+            prefix_filter: None,
+            prefix_relation: None,
+            prefix_block: None,
+            prefix_fast_forward: None,
+            ..seed
+        };
+        for cells in [NativeCellEncoding::Compact16, NativeCellEncoding::Wide32] {
+            for kind in [
+                X86StartFilterKind::Sse2,
+                X86StartFilterKind::Avx2,
+                X86StartFilterKind::Avx512Bw,
+            ] {
+                let features = match kind {
+                    X86StartFilterKind::Sse2 => FeatureSet::EMPTY,
+                    X86StartFilterKind::Avx2 => FeatureSet::of(CpuFeature::X86Avx2),
+                    X86StartFilterKind::Avx512Bw => FeatureSet::of(CpuFeature::X86Avx512F)
+                        .with(CpuFeature::X86Avx512Bw),
+                };
+                for capacity in CAPACITIES {
+                    let layout = NativeDfaLayout {
+                        transitions: TransitionLayout::DefaultSparseExceptions(capacity),
+                        cells,
+                        ..bare_seed
+                    };
+                    let code = lower_x86_64_dfa(layout, features).unwrap().0;
+                    let expected = x86_sparse_lookup_needs_vzeroupper(capacity, cells, kind);
+                    assert_eq!(
+                        occurrences(&code, &[0xc5, 0xf8, 0x77, 0xc3]),
+                        usize::from(expected),
+                        "{kind:?}/{cells:?}/{capacity}",
+                    );
+                }
+            }
+        }
+        assert!(native_sparse_chunk_plan(4, 16, 16).is_none());
+        assert!(native_sparse_chunk_plan(usize::MAX, 64, usize::MAX).is_none());
+    }
+
+    #[test]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::too_many_lines,
+        reason = "uniform, short padded and full rows prove scalar-tail reordering for every x86 tier"
+    )]
+    fn scalable_sparse_x86_scalar_tails_preserve_padded_row_semantics() {
+        let default = ForwardCell::new(0, false);
+        for capacity in [17_u8, 20, 33, 65] {
+            for cells in [NativeCellEncoding::Compact16, NativeCellEncoding::Wide32] {
+                let row_bytes = native_default_exception_row_bytes(capacity, cells).unwrap();
+                let value_offset = native_default_exception_value_offset(capacity, cells).unwrap();
+                for exception_count in [0_usize, 5, usize::from(capacity)] {
+                    let mut exceptions = [None; MAX_NATIVE_SPARSE_EXCEPTIONS];
+                    for (slot, exception) in exceptions[..exception_count].iter_mut().enumerate() {
+                        *exception = Some((
+                            u8::try_from(slot + 1).unwrap(),
+                            ForwardCell::new(u32::try_from(slot + 1).unwrap(), false),
+                        ));
+                    }
+                    let mut row = Vec::new();
+                    append_native_default_exception_record(
+                        &mut row,
+                        default,
+                        &exceptions,
+                        exception_count,
+                        capacity,
+                        cells,
+                        row_bytes,
+                        |cell| Ok(cell.next()),
+                    )
+                    .unwrap();
+                    for kind in [
+                        X86StartFilterKind::Sse2,
+                        X86StartFilterKind::Avx2,
+                        X86StartFilterKind::Avx512Bw,
+                    ] {
+                        let plan = x86_sparse_lookup_chunk_plan(capacity, cells, kind).unwrap();
+                        for key in u8::MIN..=u8::MAX {
+                            let canonical_slot = (0..usize::from(capacity))
+                                .find(|&slot| row[cells.bytes() + slot] == key);
+                            let canonical = canonical_slot.map_or_else(
+                                || read_native_packed_cell(&row, 0, cells),
+                                |slot| {
+                                    read_native_packed_cell(
+                                        &row,
+                                        value_offset + slot * cells.bytes(),
+                                        cells,
+                                    )
+                                },
+                            );
+                            let mut selected = plan.scalar_tail_start().and_then(|start| {
+                                (start..usize::from(capacity))
+                                    .find(|&slot| row[cells.bytes() + slot] == key)
+                            });
+                            if selected.is_none() {
+                                for chunk in 0..plan.vector_chunks {
+                                    let start = plan.chunk_start(chunk).unwrap();
+                                    let live = plan.chunk_live_lanes(chunk).unwrap();
+                                    let mut mask = 0_u64;
+                                    for lane in 0..live {
+                                        if row[cells.bytes() + start + lane] == key {
+                                            mask |= 1_u64 << lane;
+                                        }
+                                    }
+                                    if mask != 0 {
+                                        selected = Some(
+                                            start
+                                                + usize::try_from(mask.trailing_zeros()).unwrap(),
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
+                            let chunked = selected.map_or_else(
+                                || read_native_packed_cell(&row, 0, cells),
+                                |slot| {
+                                    read_native_packed_cell(
+                                        &row,
+                                        value_offset + slot * cells.bytes(),
+                                        cells,
+                                    )
+                                },
+                            );
+                            assert_eq!(
+                                chunked, canonical,
+                                "capacity={capacity}/cells={cells:?}/kind={kind:?}/exceptions={exception_count}/key={key}",
+                            );
+                        }
+                        if plan.scalar_tail != 0 && exception_count <= 5 {
+                            let tail_start = plan.scalar_tail_start().unwrap();
+                            let tail_key = row[cells.bytes() + tail_start];
+                            let first = (0..tail_start)
+                                .find(|&slot| row[cells.bytes() + slot] == tail_key)
+                                .unwrap();
+                            let first_value = read_native_packed_cell(
+                                &row,
+                                value_offset + first * cells.bytes(),
+                                cells,
+                            );
+                            let tail_value = read_native_packed_cell(
+                                &row,
+                                value_offset + tail_start * cells.bytes(),
+                                cells,
+                            );
+                            assert_eq!(tail_value, first_value);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::too_many_lines,
         reason = "the final readable key byte is the exact SIMD safety boundary"
     )]
     fn scalable_compact_x86_final_row_guards_and_layout_shapes_are_exact() {
         let cells = NativeCellEncoding::Compact16;
         let avx512 = X86StartFilterKind::Avx512Bw;
-        for (capacity, readable, vector_width) in [
-            (5_u8, 48, Some(16)),
-            (16, 48, Some(16)),
-            (17, 52, None),
-            (20, 60, None),
-            (21, 64, Some(64)),
-            (32, 96, Some(64)),
-            (64, 192, Some(64)),
+        for (capacity, readable, vector_width, vector_keys, vector_chunks, scalar_tail) in [
+            (5_u8, 48, 16, 5, 1, 0),
+            (16, 48, 16, 16, 1, 0),
+            (17, 52, 16, 16, 1, 1),
+            (20, 60, 16, 16, 1, 4),
+            (21, 64, 64, 21, 1, 0),
+            (32, 96, 64, 32, 1, 0),
+            (64, 192, 64, 64, 1, 0),
         ] {
             let row_bytes = native_default_exception_row_bytes(capacity, cells).unwrap();
             assert_eq!(row_bytes - cells.bytes(), readable, "capacity={capacity}");
+            let plan = x86_sparse_lookup_chunk_plan(capacity, cells, avx512).unwrap();
             assert_eq!(
-                x86_sparse_lookup_vector_width(capacity, cells, avx512),
-                vector_width,
+                plan,
+                NativeSparseChunkPlan {
+                    vector_width,
+                    vector_keys,
+                    vector_chunks,
+                    scalar_tail,
+                },
                 "capacity={capacity}",
             );
-            if let Some(width) = vector_width {
-                assert!(cells.bytes() + width <= row_bytes, "capacity={capacity}");
+            for chunk in 0..plan.vector_chunks {
+                let load_end = plan.chunk_start(chunk).unwrap() + plan.vector_width;
+                assert!(load_end <= readable, "capacity={capacity}/chunk={chunk}");
             }
         }
         assert_eq!(
-            x86_sparse_lookup_vector_width(17, cells, X86StartFilterKind::Avx2),
-            Some(32),
+            x86_sparse_lookup_chunk_plan(17, cells, X86StartFilterKind::Avx2),
+            Some(NativeSparseChunkPlan {
+                vector_width: 32,
+                vector_keys: 17,
+                vector_chunks: 1,
+                scalar_tail: 0,
+            }),
         );
         assert_eq!(
-            x86_sparse_lookup_vector_width(32, cells, X86StartFilterKind::Avx2),
-            Some(32),
+            x86_sparse_lookup_chunk_plan(32, cells, X86StartFilterKind::Avx2),
+            Some(NativeSparseChunkPlan {
+                vector_width: 32,
+                vector_keys: 32,
+                vector_chunks: 1,
+                scalar_tail: 0,
+            }),
         );
 
         let compiled = compile_partial_loop(Target::x86_64_linux(), OutputContract::SelectedEnd);
@@ -62014,7 +62671,13 @@ int main(void){{
             let has_vzeroupper = has(&[0xc5, 0xf8, 0x77, 0xc3]);
             assert_eq!(has_vzeroupper, capacity == 21, "capacity={capacity}");
             if capacity == 20 {
-                assert!(has(&[0x41, 0x3a, 0x42, 12]));
+                assert!(has(&[0x41, 0x3a, 0x42, 20]));
+                assert!(has(&[
+                    0xc4, 0x41, 0x79, 0x74, 0xb2, 2, 0, 0, 0,
+                ]));
+                assert!(!has(&[
+                    0xf3, 0x45, 0x0f, 0x6f, 0xb2, 2, 0, 0, 0,
+                ]));
                 assert!(!has(&[
                     0x62, 0xd1, 0x7d, 0x48, 0x74, 0x8a, 2, 0, 0, 0,
                 ]));
@@ -62078,9 +62741,9 @@ int main(void){{
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "balanced lookup depth, maximum offsets, and both backend shapes share one proof"
+        reason = "chunked x86 masks, balanced AArch64 depth, and maximum offsets share one proof"
     )]
-    fn scalable_sparse_binary_lookup_is_balanced_and_cross_isa() {
+    fn scalable_sparse_chunked_x86_and_balanced_aarch64_are_exact() {
         fn comparison_depth(start: usize, end: usize, sought: usize) -> usize {
             if end - start == 1 {
                 return 1;
@@ -62274,30 +62937,21 @@ int main(void){{
                     let kind = x86_start_filter_kind(target.features);
                     match kind {
                         X86StartFilterKind::Sse2 => {
-                            let root_offset = code
-                                .windows(root.len())
-                                .position(|bytes| bytes == root)
-                                .unwrap_or_else(|| {
-                                    panic!("x86 balanced root comparison: {target:?}")
-                                });
-                            let lower_branch = &code[root_offset + 4..];
-                            let lower_bytes = if lower_branch.starts_with(&[0x72]) {
-                                2
-                            } else {
-                                assert!(lower_branch.starts_with(&[0x0f, 0x82]));
-                                6
-                            };
-                            let higher_branch = &lower_branch[lower_bytes..];
-                            assert!(
-                                higher_branch.starts_with(&[0x77])
-                                    || higher_branch.starts_with(&[0x0f, 0x87])
-                            );
-                            assert!(code
-                                .windows(5)
-                                .any(|bytes| bytes == [0x41, 0x0f, 0xb7, 0x42, 64]));
-                            assert!(!code.windows(6).any(|bytes| {
-                                bytes == [0x66, 0x41, 0x0f, 0x74, 0x42, 2]
-                            }));
+                            assert!(!code.windows(root.len()).any(|bytes| bytes == root));
+                            for instruction in [
+                                &[0x69, 0xc0, 1, 1, 1, 1][..],
+                                &[0xf3, 0x45, 0x0f, 0x6f, 0xb2, 2, 0, 0, 0][..],
+                                &[0xf3, 0x45, 0x0f, 0x6f, 0xb2, 18, 0, 0, 0][..],
+                                &[0x66, 0x44, 0x0f, 0x74, 0xf0][..],
+                                &[0x66, 0x41, 0x0f, 0xd7, 0xc6][..],
+                                &[0x25, 0xff, 0x7f, 0, 0][..],
+                                &[0x41, 0x0f, 0xb7, 0x84, 0x42, 34, 0, 0, 0][..],
+                                &[0x41, 0x0f, 0xb7, 0x84, 0x42, 66, 0, 0, 0][..],
+                            ] {
+                                assert!(code
+                                    .windows(instruction.len())
+                                    .any(|bytes| bytes == instruction));
+                            }
                         }
                         X86StartFilterKind::Avx2 => {
                             assert!(!code
@@ -62305,8 +62959,8 @@ int main(void){{
                                 .any(|bytes| bytes == root));
                             for instruction in [
                                 &[0xc4, 0xe2, 0x7d, 0x78, 0xc0][..],
-                                &[0xc4, 0xc1, 0x7d, 0x74, 0x42, 2][..],
-                                &[0xc5, 0xfd, 0xd7, 0xc0][..],
+                                &[0xc4, 0x41, 0x7d, 0x74, 0xb2, 2, 0, 0, 0][..],
+                                &[0xc4, 0xc1, 0x7d, 0xd7, 0xc6][..],
                                 &[0x25, 0xff, 0xff, 0xff, 0x7f][..],
                                 &[0x41, 0x0f, 0xb7, 0x84, 0x42, 34, 0, 0, 0][..],
                             ] {
