@@ -994,6 +994,9 @@ impl NativeReverseClassMode {
 const PARTIAL_CELL_ACCEPTED: u32 = 1 << 31;
 const PARTIAL_CELL_HOLE_BASE: u32 = 1 << 30;
 const PARTIAL_CELL_DEAD: u32 = PARTIAL_CELL_ACCEPTED - 1;
+const PREPARED_INVALID_ARGUMENT_STATUS: u8 = 2;
+const PREPARED_RUNTIME_FAILURE_STATUS: u8 = 3;
+const PREPARED_INVALID_HANDLE_STATUS: u8 = 5;
 const PARTIAL_PREFLIGHT_ENTER_STATUS: u8 = 6;
 const STATIC_PREFIX_NATIVE_RESUME_STATUS: u8 = 7;
 const STATIC_PREFIX_NATIVE_CONTINUATION_RESUME_STATUS: u8 = 8;
@@ -1043,6 +1046,7 @@ const _: () = assert!(
         == NATIVE_ROWS_NEXT_ROW_TOKEN_MASK
 );
 const _: () = assert!(FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL_OFFSET == 0);
+const _: () = assert!(FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET == 32);
 const _: () = assert!(DYNAMIC_NATIVE_ROWS_V3_DEAD_CELL == 0);
 const _: () = assert!(DYNAMIC_NATIVE_ROWS_V3_ACCEPT_MASK == 1 << 15);
 const _: () = assert!(DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK == (1 << 15) - 1);
@@ -1302,6 +1306,10 @@ impl CompiledModule {
                             view,
                             candidate.resume_view(),
                             program.artifact_identity(),
+                            program
+                                .compiler_private_static_prefix_complete_proofs_should_run(
+                                    PARTIAL_DFA_MIN_INPUT_BYTES,
+                                ),
                             target,
                             effective_native_data_limit_bytes,
                         )
@@ -2995,6 +3003,15 @@ fn append_static_prefix_resume_descriptor(
     Ok(())
 }
 
+const fn static_prefix_can_defer_preflight(
+    output: OutputContract,
+    exact_match_width: Option<usize>,
+    has_complete_preflight_proofs: bool,
+) -> bool {
+    !has_complete_preflight_proofs
+        && !(matches!(output, OutputContract::Span) && exact_match_width.is_none())
+}
+
 /// Compose a transient, resource-bounded DFA prefix with the persistent
 /// prepared runtime. The static table and exact continuation frontiers are
 /// compiler-owned and immutable; both remain absent from the stable semantic
@@ -3009,6 +3026,7 @@ fn lower_native_slow_partial_prepared_with_data_limit(
     view: NativeProgramView<'_>,
     resume: Option<NativeSlowResumeView<'_>>,
     artifact_identity: [u8; 32],
+    has_complete_preflight_proofs: bool,
     target: Target,
     max_native_data_bytes: usize,
 ) -> Result<Option<(NativeLowering, PreparedEntryLayout)>, ObjectError> {
@@ -3054,6 +3072,17 @@ fn lower_native_slow_partial_prepared_with_data_limit(
         && !view.dfa.initial_pending;
     let variable_span_recovery =
         view.output == OutputContract::Span && view.exact_match_width.is_none();
+    // Whole-window suffix/cut proofs must retain the established eager
+    // ordering. Variable-width Span likewise keeps V2 admission in front of
+    // native execution: its recovery helper intentionally requires the
+    // single-use invocation ticket minted by that admission. Every other
+    // result contract can authenticate the immutable object inline and defer
+    // V2 until an actual retained-prefix hole.
+    let defer_preflight = static_prefix_can_defer_preflight(
+        view.output,
+        view.exact_match_width,
+        has_complete_preflight_proofs,
+    );
     let exact_span_width = match (view.output, view.exact_match_width) {
         (OutputContract::Exists | OutputContract::SelectedEnd, _) => None,
         (OutputContract::Span, None) => None,
@@ -3193,6 +3222,7 @@ fn lower_native_slow_partial_prepared_with_data_limit(
                 view.output,
                 span_recovery,
                 resume_table_addend,
+                defer_preflight,
             )?
         }
         Architecture::Aarch64 => {
@@ -3200,6 +3230,7 @@ fn lower_native_slow_partial_prepared_with_data_limit(
                 view.output,
                 span_recovery,
                 resume_table_addend,
+                defer_preflight,
             )?
         }
     };
@@ -3465,6 +3496,7 @@ fn lower_optional_native_slow_partial_prepared_with_data_limit(
     view: NativeProgramView<'_>,
     resume: Option<NativeSlowResumeView<'_>>,
     artifact_identity: [u8; 32],
+    has_complete_preflight_proofs: bool,
     target: Target,
     max_native_data_bytes: usize,
 ) -> Result<Option<(NativeLowering, PreparedEntryLayout)>, ObjectError> {
@@ -3479,6 +3511,7 @@ fn lower_optional_native_slow_partial_prepared_with_data_limit(
                 view,
                 resume,
                 artifact_identity,
+                has_complete_preflight_proofs,
                 target,
                 max_native_data_bytes,
             )
@@ -14059,8 +14092,9 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
     output: OutputContract,
     span_recovery: bool,
     resume_table_addend: Option<i64>,
+    defer_preflight: bool,
 ) -> Result<NativeSlowPartialWrapper, ObjectError> {
-    const FRAME_BYTES: u8 = 72;
+    let frame_bytes = if defer_preflight { 104 } else { 72 };
     let mut assembler = X86Assembler::new();
     let preflight_enter = assembler.label()?;
     let native_match = assembler.label()?;
@@ -14069,6 +14103,30 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
     let native_span_recovery = span_recovery.then(|| assembler.label()).transpose()?;
     let native_deopt = assembler.label()?;
     let fallback_runtime = assembler.label()?;
+    let invalid_handle = defer_preflight.then(|| assembler.label()).transpose()?;
+    let invalid_argument = defer_preflight.then(|| assembler.label()).transpose()?;
+    let wrong_identity = defer_preflight.then(|| assembler.label()).transpose()?;
+
+    if let (Some(invalid_handle), Some(invalid_argument)) = (invalid_handle, invalid_argument) {
+        // The deferred route assumes exactly the same unsafe live-allocation
+        // contract as the runtime ABI, but validates every raw scalar before
+        // its first header or haystack load. Keep handle failure distinct from
+        // the remaining argument failures, matching V1/V2 runtime statuses.
+        assembler.instruction(&[0x48, 0x85, 0xff])?; // handle != null
+        assembler.branch(&[0x0f, 0x84], invalid_handle)?;
+        assembler.instruction(&[0x48, 0x85, 0xf6])?; // haystack != null
+        assembler.branch(&[0x0f, 0x84], invalid_argument)?;
+        assembler.instruction(&[0x48, 0x85, 0xd2])?; // length <= isize::MAX
+        assembler.branch(&[0x0f, 0x88], invalid_argument)?;
+        assembler.instruction(&[0x49, 0x39, 0xd0])?; // end <= length
+        assembler.branch(&[0x0f, 0x87], invalid_argument)?;
+        assembler.instruction(&[0x4c, 0x39, 0xc1])?; // start <= end
+        assembler.branch(&[0x0f, 0x87], invalid_argument)?;
+        assembler.instruction(&[0x4d, 0x85, 0xc9])?; // result != null
+        assembler.branch(&[0x0f, 0x84], invalid_argument)?;
+        assembler.instruction(&[0x41, 0xf6, 0xc1, 0x07])?; // result alignment
+        assembler.branch(&[0x0f, 0x85], invalid_argument)?;
+    }
 
     // Short windows retain the ordinary prepared path. The wrapping
     // subtraction is harmless because the runtime helper remains the raw-ABI
@@ -14082,21 +14140,79 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
     assembler.instruction(&compare_minimum)?;
     assembler.branch(&[0x0f, 0x82], fallback_runtime)?;
 
-    // Entry RSP is 8 modulo 16. The 72-byte frame aligns helper calls, keeps
-    // all six prepared arguments for a side exit, and provides the seventh
-    // and eighth SysV argument slots for identity and the static frontier
-    // descriptor.
-    assembler.instruction(&[0x48, 0x83, 0xec, FRAME_BYTES])?;
+    let deferred_identity_displacement_label = if let Some(wrong_identity) = wrong_identity {
+        // PreparedAotRegex is repr(C) and its immutable V6 header is asserted
+        // at offset zero. Artifact identity remains stable after the active
+        // compact seal is revoked, so this deliberately does not test that
+        // seal: retained prefixes remain reusable after earlier side exits.
+        assembler.instruction(&[0x48, 0x8d, 0x05])?;
+        let displacement = assembler.label()?;
+        assembler.bind(displacement)?;
+        push_bytes(&mut assembler.code, &[0; 4])?;
+        for identity_word in 0_usize..4 {
+            let word_offset = identity_word
+                .checked_mul(core::mem::size_of::<u64>())
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "x86 deferred static-prefix identity word",
+                ))?;
+            if word_offset == 0 {
+                assembler.instruction(&[0x4c, 0x8b, 0x10])?;
+            } else {
+                assembler.instruction(&[
+                    0x4c,
+                    0x8b,
+                    0x50,
+                    u8::try_from(word_offset).map_err(|_| {
+                        ObjectError::ArithmeticOverflow(
+                            "x86 deferred static-prefix linked identity offset",
+                        )
+                    })?,
+                ])?;
+            }
+            let header_offset = FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET
+                .checked_add(word_offset)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "x86 deferred static-prefix header identity offset",
+                ))?;
+            assembler.instruction(&[
+                0x4c,
+                0x3b,
+                0x57,
+                u8::try_from(header_offset).map_err(|_| {
+                    ObjectError::ArithmeticOverflow(
+                        "x86 deferred static-prefix header identity displacement",
+                    )
+                })?,
+            ])?;
+            assembler.branch(&[0x0f, 0x85], wrong_identity)?;
+        }
+        Some(displacement)
+    } else {
+        None
+    };
+
+    // Entry RSP is 8 modulo 16. Both frame sizes align helper calls and keep
+    // all six prepared arguments plus the two outgoing identity/descriptor
+    // slots. The deferred frame adds three private words so a hole can retain
+    // its frontier across lazy admission.
+    assembler.instruction(&[0x48, 0x83, 0xec, frame_bytes])?;
     assembler.instruction(&[0x48, 0x89, 0x7c, 0x24, 0x10])?; // handle
     assembler.instruction(&[0x48, 0x89, 0x74, 0x24, 0x18])?; // haystack
     assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x20])?; // length
     assembler.instruction(&[0x48, 0x89, 0x4c, 0x24, 0x28])?; // start
     assembler.instruction(&[0x4c, 0x89, 0x44, 0x24, 0x30])?; // end
     assembler.instruction(&[0x4c, 0x89, 0x4c, 0x24, 0x38])?; // result
-    assembler.instruction(&[0x48, 0x8d, 0x05])?;
-    let identity_displacement_label = assembler.label()?;
-    assembler.bind(identity_displacement_label)?;
-    push_bytes(&mut assembler.code, &[0; 4])?;
+    let identity_displacement_label = if let Some(displacement) =
+        deferred_identity_displacement_label
+    {
+        displacement
+    } else {
+        assembler.instruction(&[0x48, 0x8d, 0x05])?;
+        let displacement = assembler.label()?;
+        assembler.bind(displacement)?;
+        push_bytes(&mut assembler.code, &[0; 4])?;
+        displacement
+    };
     assembler.instruction(&[0x48, 0x89, 0x04, 0x24])?;
     let resume_descriptor_displacement_label = if resume_table_addend.is_some() {
         assembler.instruction(&[0x48, 0x8d, 0x05])?;
@@ -14108,14 +14224,19 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
     } else {
         None
     };
-    assembler.instruction(&[0xe8])?;
-    let preflight_displacement_label = assembler.label()?;
-    assembler.bind(preflight_displacement_label)?;
-    push_bytes(&mut assembler.code, &[0; 4])?;
-    assembler.instruction(&[0x83, 0xf8, PARTIAL_PREFLIGHT_ENTER_STATUS])?;
-    assembler.branch(&[0x0f, 0x84], preflight_enter)?;
-    assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
-    assembler.instruction(&[0xc3])?;
+    let eager_preflight_displacement_label = if defer_preflight {
+        None
+    } else {
+        assembler.instruction(&[0xe8])?;
+        let displacement = assembler.label()?;
+        assembler.bind(displacement)?;
+        push_bytes(&mut assembler.code, &[0; 4])?;
+        assembler.instruction(&[0x83, 0xf8, PARTIAL_PREFLIGHT_ENTER_STATUS])?;
+        assembler.branch(&[0x0f, 0x84], preflight_enter)?;
+        assembler.instruction(&[0x48, 0x83, 0xc4, frame_bytes])?;
+        assembler.instruction(&[0xc3])?;
+        Some(displacement)
+    };
 
     assembler.bind(preflight_enter)?;
     assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x18])?;
@@ -14157,7 +14278,7 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
     assembler.instruction(&[0x31, 0xc0])?;
     assembler.instruction(&[0x49, 0x89, 0x01])?;
     assembler.instruction(&[0x49, 0x89, 0x41, 0x08])?;
-    assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+    assembler.instruction(&[0x48, 0x83, 0xc4, frame_bytes])?;
     assembler.instruction(&[0xc3])?;
 
     assembler.bind(native_match)?;
@@ -14178,7 +14299,7 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
         }
     }
     assembler.instruction(&[0xb8, 1, 0, 0, 0])?;
-    assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+    assembler.instruction(&[0x48, 0x83, 0xc4, frame_bytes])?;
     assembler.instruction(&[0xc3])?;
 
     let span_recovery_displacement_label = if let Some(native_span_recovery) = native_span_recovery {
@@ -14194,7 +14315,7 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
         let displacement = assembler.label()?;
         assembler.bind(displacement)?;
         push_bytes(&mut assembler.code, &[0; 4])?;
-        assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+        assembler.instruction(&[0x48, 0x83, 0xc4, frame_bytes])?;
         assembler.instruction(&[0xc3])?;
         Some(displacement)
     } else {
@@ -14203,15 +14324,42 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
 
     let mut resume_tail_call_displacement_label = None;
     let mut continuation_resume_tail_call_displacement_label = None;
+    let mut lazy_preflight_displacement_label = None;
     let resume_runtime_displacement_label = if let Some(native_resume) = native_resume {
         assembler.bind(native_resume)?;
         // The native core returns resume state in r10, first unconsumed
         // position in rdx, and the pending endpoint word in r11. The canonical
         // descriptor determines whether that last word is meaningful.
         assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x40])?;
-        assembler.instruction(&[0x4c, 0x89, 0x1c, 0x24])?;
-        assembler.instruction(&[0x49, 0x89, 0xd1])?;
-        assembler.instruction(&[0x4d, 0x89, 0xd0])?;
+        let resume_return = assembler.label()?;
+        if defer_preflight {
+            // Preserve all three native frontier words across lazy V2
+            // admission. The identity and descriptor already occupy the two
+            // outgoing stack slots established before the local core call.
+            assembler.instruction(&[0x4c, 0x89, 0x54, 0x24, 0x48])?;
+            assembler.instruction(&[0x4c, 0x89, 0x5c, 0x24, 0x50])?;
+            assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x10])?;
+            assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x18])?;
+            assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x20])?;
+            assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x28])?;
+            assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x30])?;
+            assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x38])?;
+            assembler.instruction(&[0xe8])?;
+            let displacement = assembler.label()?;
+            assembler.bind(displacement)?;
+            push_bytes(&mut assembler.code, &[0; 4])?;
+            lazy_preflight_displacement_label = Some(displacement);
+            assembler.instruction(&[0x83, 0xf8, PARTIAL_PREFLIGHT_ENTER_STATUS])?;
+            assembler.branch(&[0x0f, 0x85], resume_return)?;
+            assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x40])?;
+            assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x48])?;
+            assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, 0x50])?;
+            assembler.instruction(&[0x48, 0x89, 0x04, 0x24])?;
+        } else {
+            assembler.instruction(&[0x4c, 0x89, 0x1c, 0x24])?;
+            assembler.instruction(&[0x49, 0x89, 0xd1])?;
+            assembler.instruction(&[0x4d, 0x89, 0xd0])?;
+        }
         assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x10])?;
         assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x18])?;
         assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x20])?;
@@ -14220,7 +14368,6 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
         let displacement = assembler.label()?;
         assembler.bind(displacement)?;
         push_bytes(&mut assembler.code, &[0; 4])?;
-        let resume_return = assembler.label()?;
         let continuation_resume = assembler.label()?;
         assembler.instruction(&[
             0x83,
@@ -14268,7 +14415,7 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
         push_bytes(&mut assembler.code, &[0; 4])?;
         continuation_resume_tail_call_displacement_label = Some(continuation_tail_call);
         assembler.bind(resume_return)?;
-        assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+        assembler.instruction(&[0x48, 0x83, 0xc4, frame_bytes])?;
         assembler.instruction(&[0xc3])?;
         Some(displacement)
     } else {
@@ -14286,8 +14433,24 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
     let deopt_displacement_label = assembler.label()?;
     assembler.bind(deopt_displacement_label)?;
     push_bytes(&mut assembler.code, &[0; 4])?;
-    assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+    assembler.instruction(&[0x48, 0x83, 0xc4, frame_bytes])?;
     assembler.instruction(&[0xc3])?;
+
+    if let Some(invalid_handle) = invalid_handle {
+        assembler.bind(invalid_handle)?;
+        assembler.instruction(&[0xb8, PREPARED_INVALID_HANDLE_STATUS, 0, 0, 0])?;
+        assembler.instruction(&[0xc3])?;
+    }
+    if let Some(invalid_argument) = invalid_argument {
+        assembler.bind(invalid_argument)?;
+        assembler.instruction(&[0xb8, PREPARED_INVALID_ARGUMENT_STATUS, 0, 0, 0])?;
+        assembler.instruction(&[0xc3])?;
+    }
+    if let Some(wrong_identity) = wrong_identity {
+        assembler.bind(wrong_identity)?;
+        assembler.instruction(&[0xb8, PREPARED_RUNTIME_FAILURE_STATUS, 0, 0, 0])?;
+        assembler.instruction(&[0xc3])?;
+    }
 
     assembler.bind(fallback_runtime)?;
     assembler.instruction(&[0xe9])?;
@@ -14300,7 +14463,18 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
     let resume_descriptor_displacement = resume_descriptor_displacement_label
         .map(|label| finished.label_offset(label))
         .transpose()?;
-    let preflight_displacement = finished.label_offset(preflight_displacement_label)?;
+    let preflight_displacement = match (
+        eager_preflight_displacement_label,
+        lazy_preflight_displacement_label,
+    ) {
+        (Some(label), None) | (None, Some(label)) => Some(finished.label_offset(label)?),
+        (None, None) => None,
+        (Some(_), Some(_)) => {
+            return Err(ObjectError::InvalidModule(
+                "x86 static-prefix emitted both eager and lazy preflights",
+            ));
+        }
+    };
     let core_call_offset = finished.label_offset(core_call_displacement_label)?;
     let deopt_displacement = finished.label_offset(deopt_displacement_label)?;
     let fallback_displacement = finished.label_offset(fallback_displacement_label)?;
@@ -14316,21 +14490,23 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
     let continuation_resume_tail_call_offset = continuation_resume_tail_call_displacement_label
         .map(|label| finished.label_offset(label))
         .transpose()?;
-    let mut relocations = vec![
-        ModuleRelocation {
-            section: TEXT_SECTION,
-            offset: offset_u64(identity_displacement, "x86 static-prefix identity relocation")?,
-            kind: RelocationKind::X86PcRelative32,
-            symbol: PARTIAL_IDENTITY_SYMBOL,
-            addend: -4,
-        },
-        ModuleRelocation {
+    let mut relocations = vec![ModuleRelocation {
+        section: TEXT_SECTION,
+        offset: offset_u64(identity_displacement, "x86 static-prefix identity relocation")?,
+        kind: RelocationKind::X86PcRelative32,
+        symbol: PARTIAL_IDENTITY_SYMBOL,
+        addend: -4,
+    }];
+    if let Some(preflight_displacement) = preflight_displacement {
+        relocations.push(ModuleRelocation {
             section: TEXT_SECTION,
             offset: offset_u64(preflight_displacement, "x86 static-prefix preflight relocation")?,
             kind: RelocationKind::X86PltRelative32,
             symbol: PREPARED_PREFLIGHT_RUNTIME_SYMBOL,
             addend: -4,
-        },
+        });
+    }
+    relocations.extend([
         ModuleRelocation {
             section: TEXT_SECTION,
             offset: offset_u64(deopt_displacement, "x86 static-prefix deopt relocation")?,
@@ -14345,7 +14521,7 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
             symbol: PREPARED_FALLBACK_RUNTIME_SYMBOL,
             addend: -4,
         },
-    ];
+    ]);
     if let (Some(descriptor_displacement), Some(runtime_displacement), Some(table_addend)) = (
         resume_descriptor_displacement,
         resume_runtime_displacement,
@@ -26435,8 +26611,10 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
     output: OutputContract,
     span_recovery: bool,
     resume_table_addend: Option<i64>,
+    defer_preflight: bool,
 ) -> Result<NativeSlowPartialWrapper, ObjectError> {
-    const FRAME_BYTES: u16 = 64;
+    let frame_bytes = if defer_preflight { 96 } else { 64 };
+    let return_address_offset = if defer_preflight { 88 } else { 56 };
     let mut assembler = Aarch64Assembler::new();
     let preflight_enter = assembler.label()?;
     let native_match = assembler.label()?;
@@ -26445,6 +26623,25 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
     let native_span_recovery = span_recovery.then(|| assembler.label()).transpose()?;
     let native_deopt = assembler.label()?;
     let fallback_runtime = assembler.label()?;
+    let invalid_handle = defer_preflight.then(|| assembler.label()).transpose()?;
+    let invalid_argument = defer_preflight.then(|| assembler.label()).transpose()?;
+    let wrong_identity = defer_preflight.then(|| assembler.label()).transpose()?;
+
+    if let (Some(invalid_handle), Some(invalid_argument)) = (invalid_handle, invalid_argument) {
+        // Check every raw scalar before the first header or haystack load.
+        // The non-null handle retains the private ABI's documented live-owner
+        // premise; null has its distinct stable status.
+        assembler.branch_zero_x(0, invalid_handle)?;
+        assembler.branch_zero_x(1, invalid_argument)?;
+        assembler.branch_bit_set_x(2, 63, invalid_argument)?;
+        assembler.instruction(aarch64_cmp_x(4, 2)?)?;
+        assembler.branch_cond(AARCH64_HI, invalid_argument)?;
+        assembler.instruction(aarch64_cmp_x(3, 4)?)?;
+        assembler.branch_cond(AARCH64_HI, invalid_argument)?;
+        assembler.branch_zero_x(5, invalid_argument)?;
+        assembler.instruction(aarch64_and_low_x(6, 5, 7)?)?;
+        assembler.branch_nonzero_x(6, invalid_argument)?;
+    }
 
     // X6 is caller-saved and all six public arguments remain untouched for a
     // short-window tail fallback.
@@ -26454,30 +26651,91 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
     assembler.instruction(aarch64_cmp_x_imm(6, minimum)?)?;
     assembler.branch_cond(AARCH64_LO, fallback_runtime)?;
 
-    assembler.instruction(aarch64_sub_x_imm(31, 31, FRAME_BYTES)?)?;
-    assembler.instruction(aarch64_store_pair_x(0, 1, 31, 0)?)?;
-    assembler.instruction(aarch64_store_pair_x(2, 3, 31, 16)?)?;
-    assembler.instruction(aarch64_store_pair_x(4, 5, 31, 32)?)?;
-    assembler.instruction(aarch64_store_x(30, 31, 56)?)?;
-    let identity_page = assembler.instruction(0x9000_0006)?;
-    let identity_page_offset = assembler.instruction(aarch64_add_x_imm(6, 6, 0)?)?;
-    let resume_descriptor_relocations = if resume_table_addend.is_some() {
-        Some((
-            assembler.instruction(0x9000_0007)?,
-            assembler.instruction(aarch64_add_x_imm(7, 7, 0)?)?,
-        ))
+    let deferred_identity_relocations = if let Some(wrong_identity) = wrong_identity {
+        // The offset-zero V6 identity remains immutable when mutable runtime
+        // work revokes the compact active seal. Do not couple retained-prefix
+        // reuse to that unrelated seal lifecycle.
+        let page = assembler.instruction(0x9000_0006)?;
+        let page_offset = assembler.instruction(aarch64_add_x_imm(6, 6, 0)?)?;
+        for identity_word in 0_usize..4 {
+            let word_offset = identity_word
+                .checked_mul(core::mem::size_of::<u64>())
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "AArch64 deferred static-prefix identity word",
+                ))?;
+            assembler.instruction(aarch64_load_x_imm(
+                8,
+                6,
+                u16::try_from(word_offset).map_err(|_| {
+                    ObjectError::ArithmeticOverflow(
+                        "AArch64 deferred static-prefix linked identity offset",
+                    )
+                })?,
+            )?)?;
+            let header_offset = FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET
+                .checked_add(word_offset)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "AArch64 deferred static-prefix header identity offset",
+                ))?;
+            assembler.instruction(aarch64_load_x_imm(
+                9,
+                0,
+                u16::try_from(header_offset).map_err(|_| {
+                    ObjectError::ArithmeticOverflow(
+                        "AArch64 deferred static-prefix header identity displacement",
+                    )
+                })?,
+            )?)?;
+            assembler.instruction(aarch64_cmp_x(9, 8)?)?;
+            assembler.branch_cond(AARCH64_NE, wrong_identity)?;
+        }
+        Some((page, page_offset))
     } else {
         None
     };
-    let preflight_branch = assembler.instruction(0x9400_0000)?;
-    assembler.instruction(aarch64_cmp_w_imm(
-        0,
-        u16::from(PARTIAL_PREFLIGHT_ENTER_STATUS),
-    )?)?;
-    assembler.branch_cond(AARCH64_EQ, preflight_enter)?;
-    assembler.instruction(aarch64_load_x_imm(30, 31, 56)?)?;
-    assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
-    assembler.instruction(0xd65f_03c0)?;
+
+    assembler.instruction(aarch64_sub_x_imm(31, 31, frame_bytes)?)?;
+    assembler.instruction(aarch64_store_pair_x(0, 1, 31, 0)?)?;
+    assembler.instruction(aarch64_store_pair_x(2, 3, 31, 16)?)?;
+    assembler.instruction(aarch64_store_pair_x(4, 5, 31, 32)?)?;
+    assembler.instruction(aarch64_store_x(30, 31, return_address_offset)?)?;
+    let (identity_page, identity_page_offset) = if let Some(relocations) =
+        deferred_identity_relocations
+    {
+        assembler.instruction(aarch64_store_x(6, 31, 72)?)?;
+        relocations
+    } else {
+        (
+            assembler.instruction(0x9000_0006)?,
+            assembler.instruction(aarch64_add_x_imm(6, 6, 0)?)?,
+        )
+    };
+    let resume_descriptor_relocations = if resume_table_addend.is_some() {
+        let relocations = (
+            assembler.instruction(0x9000_0007)?,
+            assembler.instruction(aarch64_add_x_imm(7, 7, 0)?)?,
+        );
+        if defer_preflight {
+            assembler.instruction(aarch64_store_x(7, 31, 80)?)?;
+        }
+        Some(relocations)
+    } else {
+        None
+    };
+    let eager_preflight_branch = if defer_preflight {
+        None
+    } else {
+        let branch = assembler.instruction(0x9400_0000)?;
+        assembler.instruction(aarch64_cmp_w_imm(
+            0,
+            u16::from(PARTIAL_PREFLIGHT_ENTER_STATUS),
+        )?)?;
+        assembler.branch_cond(AARCH64_EQ, preflight_enter)?;
+        assembler.instruction(aarch64_load_x_imm(30, 31, return_address_offset)?)?;
+        assembler.instruction(aarch64_add_x_imm(31, 31, frame_bytes)?)?;
+        assembler.instruction(0xd65f_03c0)?;
+        Some(branch)
+    };
 
     assembler.bind(preflight_enter)?;
     assembler.instruction(aarch64_load_pair_x(0, 1, 31, 8)?)?;
@@ -26511,8 +26769,8 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
     assembler.instruction(aarch64_load_x_imm(5, 31, 40)?)?;
     assembler.instruction(aarch64_store_pair_x(31, 31, 5, 0)?)?;
     assembler.instruction(aarch64_movz_w(0, 0)?)?;
-    assembler.instruction(aarch64_load_x_imm(30, 31, 56)?)?;
-    assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(aarch64_load_x_imm(30, 31, return_address_offset)?)?;
+    assembler.instruction(aarch64_add_x_imm(31, 31, frame_bytes)?)?;
     assembler.instruction(0xd65f_03c0)?;
 
     assembler.bind(native_match)?;
@@ -26529,8 +26787,8 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
         }
     }
     assembler.instruction(aarch64_movz_w(0, 1)?)?;
-    assembler.instruction(aarch64_load_x_imm(30, 31, 56)?)?;
-    assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(aarch64_load_x_imm(30, 31, return_address_offset)?)?;
+    assembler.instruction(aarch64_add_x_imm(31, 31, frame_bytes)?)?;
     assembler.instruction(0xd65f_03c0)?;
 
     let span_recovery_relocations = if let Some(native_span_recovery) = native_span_recovery {
@@ -26541,8 +26799,8 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
         let identity_page = assembler.instruction(0x9000_0006)?;
         let identity_page_offset = assembler.instruction(aarch64_add_x_imm(6, 6, 0)?)?;
         let runtime_branch = assembler.instruction(0x9400_0000)?;
-        assembler.instruction(aarch64_load_x_imm(30, 31, 56)?)?;
-        assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+        assembler.instruction(aarch64_load_x_imm(30, 31, return_address_offset)?)?;
+        assembler.instruction(aarch64_add_x_imm(31, 31, frame_bytes)?)?;
         assembler.instruction(0xd65f_03c0)?;
         Some((identity_page, identity_page_offset, runtime_branch))
     } else {
@@ -26551,17 +26809,40 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
 
     let mut resume_tail_call = None;
     let mut continuation_resume_tail_call = None;
+    let mut lazy_preflight_branch = None;
     let resume_runtime_branch = if let Some(native_resume) = native_resume {
         assembler.bind(native_resume)?;
-        assembler.instruction(aarch64_mov_x(5, 2)?)?;
-        assembler.instruction(aarch64_store_x(5, 31, 48)?)?;
-        assembler.instruction(aarch64_mov_x(4, 6)?)?;
-        assembler.instruction(aarch64_mov_x(6, 7)?)?;
+        let resume_return = assembler.label()?;
+        if defer_preflight {
+            // Preserve the exact frontier across V2 admission. Identity and
+            // descriptor were materialized before entering the local core and
+            // remain immutable in their private frame slots.
+            assembler.instruction(aarch64_store_x(2, 31, 48)?)?;
+            assembler.instruction(aarch64_store_x(6, 31, 56)?)?;
+            assembler.instruction(aarch64_store_x(7, 31, 64)?)?;
+            assembler.instruction(aarch64_load_pair_x(0, 1, 31, 0)?)?;
+            assembler.instruction(aarch64_load_pair_x(2, 3, 31, 16)?)?;
+            assembler.instruction(aarch64_load_pair_x(4, 5, 31, 32)?)?;
+            assembler.instruction(aarch64_load_pair_x(6, 7, 31, 72)?)?;
+            lazy_preflight_branch = Some(assembler.instruction(0x9400_0000)?);
+            assembler.instruction(aarch64_cmp_w_imm(
+                0,
+                u16::from(PARTIAL_PREFLIGHT_ENTER_STATUS),
+            )?)?;
+            assembler.branch_cond(AARCH64_NE, resume_return)?;
+            assembler.instruction(aarch64_load_x_imm(5, 31, 48)?)?;
+            assembler.instruction(aarch64_load_x_imm(4, 31, 56)?)?;
+            assembler.instruction(aarch64_load_x_imm(6, 31, 64)?)?;
+        } else {
+            assembler.instruction(aarch64_mov_x(5, 2)?)?;
+            assembler.instruction(aarch64_store_x(5, 31, 48)?)?;
+            assembler.instruction(aarch64_mov_x(4, 6)?)?;
+            assembler.instruction(aarch64_mov_x(6, 7)?)?;
+        }
         assembler.instruction(aarch64_load_pair_x(0, 1, 31, 0)?)?;
         assembler.instruction(aarch64_load_x_imm(2, 31, 16)?)?;
         assembler.instruction(aarch64_load_x_imm(3, 31, 40)?)?;
         let branch = assembler.instruction(0x9400_0000)?;
-        let resume_return = assembler.label()?;
         let continuation_resume = assembler.label()?;
         assembler.instruction(aarch64_cmp_w_imm(
             0,
@@ -26593,8 +26874,8 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
         assembler.instruction(aarch64_load_pair_x(6, 7, 5, 0)?)?;
         continuation_resume_tail_call = Some(assembler.instruction(0x9400_0000)?);
         assembler.bind(resume_return)?;
-        assembler.instruction(aarch64_load_x_imm(30, 31, 56)?)?;
-        assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+        assembler.instruction(aarch64_load_x_imm(30, 31, return_address_offset)?)?;
+        assembler.instruction(aarch64_add_x_imm(31, 31, frame_bytes)?)?;
         assembler.instruction(0xd65f_03c0)?;
         Some(branch)
     } else {
@@ -26606,9 +26887,34 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
     assembler.instruction(aarch64_load_pair_x(2, 3, 31, 16)?)?;
     assembler.instruction(aarch64_load_pair_x(4, 5, 31, 32)?)?;
     let deopt_branch = assembler.instruction(0x9400_0000)?;
-    assembler.instruction(aarch64_load_x_imm(30, 31, 56)?)?;
-    assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+    assembler.instruction(aarch64_load_x_imm(30, 31, return_address_offset)?)?;
+    assembler.instruction(aarch64_add_x_imm(31, 31, frame_bytes)?)?;
     assembler.instruction(0xd65f_03c0)?;
+
+    if let Some(invalid_handle) = invalid_handle {
+        assembler.bind(invalid_handle)?;
+        assembler.instruction(aarch64_movz_w(
+            0,
+            u16::from(PREPARED_INVALID_HANDLE_STATUS),
+        )?)?;
+        assembler.instruction(0xd65f_03c0)?;
+    }
+    if let Some(invalid_argument) = invalid_argument {
+        assembler.bind(invalid_argument)?;
+        assembler.instruction(aarch64_movz_w(
+            0,
+            u16::from(PREPARED_INVALID_ARGUMENT_STATUS),
+        )?)?;
+        assembler.instruction(0xd65f_03c0)?;
+    }
+    if let Some(wrong_identity) = wrong_identity {
+        assembler.bind(wrong_identity)?;
+        assembler.instruction(aarch64_movz_w(
+            0,
+            u16::from(PREPARED_RUNTIME_FAILURE_STATUS),
+        )?)?;
+        assembler.instruction(0xd65f_03c0)?;
+    }
 
     assembler.bind(fallback_runtime)?;
     let fallback_branch = assembler.instruction(0x1400_0000)?;
@@ -26616,11 +26922,23 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
     let mut relocation_offsets = vec![
         identity_page,
         identity_page_offset,
-        preflight_branch,
         core_call_offset,
         deopt_branch,
         fallback_branch,
     ];
+    let preflight_index = match (eager_preflight_branch, lazy_preflight_branch) {
+        (Some(branch), None) | (None, Some(branch)) => {
+            let index = relocation_offsets.len();
+            relocation_offsets.push(branch);
+            Some(index)
+        }
+        (None, None) => None,
+        (Some(_), Some(_)) => {
+            return Err(ObjectError::InvalidModule(
+                "AArch64 static-prefix emitted both eager and lazy preflights",
+            ));
+        }
+    };
     let resume_indices = match (
         resume_descriptor_relocations,
         resume_runtime_branch,
@@ -26671,28 +26989,35 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
             symbol: PARTIAL_IDENTITY_SYMBOL,
             addend: 0,
         },
-        ModuleRelocation {
+    ];
+    if let Some(preflight_index) = preflight_index {
+        relocations.push(ModuleRelocation {
             section: TEXT_SECTION,
-            offset: offset_u64(relocation_offsets[2], "AArch64 static-prefix preflight branch")?,
+            offset: offset_u64(
+                relocation_offsets[preflight_index],
+                "AArch64 static-prefix preflight branch",
+            )?,
             kind: RelocationKind::Aarch64Branch26,
             symbol: PREPARED_PREFLIGHT_RUNTIME_SYMBOL,
             addend: 0,
-        },
+        });
+    }
+    relocations.extend([
         ModuleRelocation {
             section: TEXT_SECTION,
-            offset: offset_u64(relocation_offsets[4], "AArch64 static-prefix deopt branch")?,
+            offset: offset_u64(relocation_offsets[3], "AArch64 static-prefix deopt branch")?,
             kind: RelocationKind::Aarch64Branch26,
             symbol: PREPARED_FALLBACK_RUNTIME_SYMBOL,
             addend: 0,
         },
         ModuleRelocation {
             section: TEXT_SECTION,
-            offset: offset_u64(relocation_offsets[5], "AArch64 static-prefix fallback branch")?,
+            offset: offset_u64(relocation_offsets[4], "AArch64 static-prefix fallback branch")?,
             kind: RelocationKind::Aarch64Branch26,
             symbol: PREPARED_FALLBACK_RUNTIME_SYMBOL,
             addend: 0,
         },
-    ];
+    ]);
     if let (Some((descriptor_page, descriptor_page_offset, runtime_branch)), Some(table_addend)) =
         (resume_indices, resume_table_addend)
     {
@@ -26766,7 +27091,7 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
     Ok(NativeSlowPartialWrapper {
         code,
         relocations,
-        core_call_offset: relocation_offsets[3],
+        core_call_offset: relocation_offsets[2],
         resume_tail_call_offset: resume_tail_index.map(|index| relocation_offsets[index]),
         continuation_resume_tail_call_offset: continuation_resume_tail_index
             .map(|index| relocation_offsets[index]),
@@ -46492,6 +46817,204 @@ int main(void){{
         }
     }
 
+    #[test]
+    fn deferred_static_prefix_preflight_is_structural_and_cross_target() {
+        assert!(static_prefix_can_defer_preflight(
+            OutputContract::Exists,
+            None,
+            false,
+        ));
+        assert!(static_prefix_can_defer_preflight(
+            OutputContract::SelectedEnd,
+            None,
+            false,
+        ));
+        assert!(static_prefix_can_defer_preflight(
+            OutputContract::Span,
+            Some(4),
+            false,
+        ));
+        assert!(!static_prefix_can_defer_preflight(
+            OutputContract::Span,
+            None,
+            false,
+        ));
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            assert!(!static_prefix_can_defer_preflight(output, Some(4), true));
+        }
+
+        for architecture in [Architecture::X86_64, Architecture::Aarch64] {
+            for output in [
+                OutputContract::Exists,
+                OutputContract::SelectedEnd,
+                OutputContract::Span,
+            ] {
+                let deferred = match architecture {
+                    Architecture::X86_64 => lower_x86_64_static_prefix_prepared_wrapper(
+                        output,
+                        false,
+                        Some(0),
+                        true,
+                    ),
+                    Architecture::Aarch64 => lower_aarch64_static_prefix_prepared_wrapper(
+                        output,
+                        false,
+                        Some(0),
+                        true,
+                    ),
+                }
+                .unwrap_or_else(|error| {
+                    panic!("deferred wrapper {architecture:?}/{output:?}: {error}")
+                });
+                let preflight = deferred
+                    .relocations
+                    .iter()
+                    .filter(|relocation| {
+                        relocation.symbol == PREPARED_PREFLIGHT_RUNTIME_SYMBOL
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(preflight.len(), 1, "{architecture:?}/{output:?}");
+                let preflight_offset = usize::try_from(preflight[0].offset).unwrap();
+                assert!(
+                    preflight_offset > deferred.core_call_offset,
+                    "lazy preflight must follow the native call: {architecture:?}/{output:?}"
+                );
+                assert!(deferred.relocations.iter().all(|relocation| {
+                    relocation.symbol != PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL
+                }));
+
+                match architecture {
+                    Architecture::X86_64 => {
+                        let prefix = &deferred.code[..deferred.core_call_offset];
+                        for instruction in [
+                            [0x48, 0x85, 0xff].as_slice(),
+                            [0x48, 0x85, 0xf6].as_slice(),
+                            [0x48, 0x85, 0xd2].as_slice(),
+                            [0x49, 0x39, 0xd0].as_slice(),
+                            [0x4c, 0x39, 0xc1].as_slice(),
+                            [0x4d, 0x85, 0xc9].as_slice(),
+                            [0x41, 0xf6, 0xc1, 0x07].as_slice(),
+                        ] {
+                            assert!(
+                                prefix
+                                    .windows(instruction.len())
+                                    .any(|bytes| bytes == instruction),
+                                "missing raw check {instruction:02x?}: {output:?}"
+                            );
+                        }
+                        for identity_word in 0_u8..4 {
+                            let displacement = u8::try_from(
+                                FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET
+                                    + usize::from(identity_word) * 8,
+                            )
+                            .unwrap();
+                            assert!(prefix.windows(4).any(|bytes| {
+                                bytes == [0x4c, 0x3b, 0x57, displacement]
+                            }));
+                        }
+                    }
+                    Architecture::Aarch64 => {
+                        let words = deferred
+                            .code
+                            .chunks_exact(4)
+                            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                            .collect::<Vec<_>>();
+                        let core_word = deferred.core_call_offset / 4;
+                        let prefix = &words[..core_word];
+                        for instruction in [
+                            aarch64_cmp_x(4, 2).unwrap(),
+                            aarch64_cmp_x(3, 4).unwrap(),
+                            aarch64_and_low_x(6, 5, 7).unwrap(),
+                        ] {
+                            assert!(prefix.contains(&instruction), "{output:?}/{instruction:#x}");
+                        }
+                        for identity_word in 0_usize..4 {
+                            let displacement = u16::try_from(
+                                FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET
+                                    + identity_word * 8,
+                            )
+                            .unwrap();
+                            assert!(prefix.contains(
+                                &aarch64_load_x_imm(9, 0, displacement).unwrap()
+                            ));
+                        }
+                        assert!(!prefix.contains(
+                            &aarch64_load_x_imm(
+                                9,
+                                0,
+                                u16::try_from(
+                                    FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL_OFFSET
+                                )
+                                .unwrap(),
+                            )
+                            .unwrap()
+                        ));
+                    }
+                }
+            }
+
+            let no_resume = match architecture {
+                Architecture::X86_64 => lower_x86_64_static_prefix_prepared_wrapper(
+                    OutputContract::Exists,
+                    false,
+                    None,
+                    true,
+                ),
+                Architecture::Aarch64 => lower_aarch64_static_prefix_prepared_wrapper(
+                    OutputContract::Exists,
+                    false,
+                    None,
+                    true,
+                ),
+            }
+            .unwrap();
+            assert!(no_resume.relocations.iter().all(|relocation| {
+                relocation.symbol != PREPARED_PREFLIGHT_RUNTIME_SYMBOL
+            }));
+
+            let eager_span = match architecture {
+                Architecture::X86_64 => lower_x86_64_static_prefix_prepared_wrapper(
+                    OutputContract::Span,
+                    true,
+                    Some(0),
+                    false,
+                ),
+                Architecture::Aarch64 => lower_aarch64_static_prefix_prepared_wrapper(
+                    OutputContract::Span,
+                    true,
+                    Some(0),
+                    false,
+                ),
+            }
+            .unwrap();
+            let eager_preflight = eager_span
+                .relocations
+                .iter()
+                .find(|relocation| relocation.symbol == PREPARED_PREFLIGHT_RUNTIME_SYMBOL)
+                .expect("eager Span preflight");
+            assert!(
+                usize::try_from(eager_preflight.offset).unwrap()
+                    < eager_span.core_call_offset,
+                "variable Span must retain eager V2 admission: {architecture:?}"
+            );
+            assert_eq!(
+                eager_span
+                    .relocations
+                    .iter()
+                    .filter(|relocation| {
+                        relocation.symbol == PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL
+                    })
+                    .count(),
+                1,
+                "{architecture:?}"
+            );
+        }
+    }
+
     fn slow_forward_minimized_reverse_decline_limits(
         program: &crate::CompiledProgram,
     ) -> SlowAotLimits {
@@ -46911,6 +47434,11 @@ int main(void){{
                     retained_view,
                     Some(resume),
                     compiled.program().artifact_identity(),
+                    compiled
+                        .program()
+                        .compiler_private_static_prefix_complete_proofs_should_run(
+                            PARTIAL_DFA_MIN_INPUT_BYTES,
+                        ),
                     target,
                     usize::MAX,
                 )
@@ -50442,6 +50970,10 @@ int main(void){{
             view,
             candidate.resume_view(),
             fast.program().artifact_identity(),
+            fast.program()
+                .compiler_private_static_prefix_complete_proofs_should_run(
+                    PARTIAL_DFA_MIN_INPUT_BYTES,
+                ),
             target,
             usize::MAX,
         )
@@ -50926,6 +51458,14 @@ int main(void){{
                     .output(output),
             )
             .expect("compile forged-V4 static-prefix fixture");
+            assert!(
+                !fast
+                    .program()
+                    .compiler_private_static_prefix_complete_proofs_should_run(
+                        PARTIAL_DFA_MIN_INPUT_BYTES,
+                    ),
+                "Fast fixture must not own optimizing complete-proof sidecars"
+            );
             let (slow_limits, candidate) = (1..=64)
                 .find_map(|max_states| {
                     let limits = slow_partial_limits(max_states);
@@ -50957,6 +51497,10 @@ int main(void){{
                 view,
                 candidate.resume_view(),
                 fast.program().artifact_identity(),
+                fast.program()
+                    .compiler_private_static_prefix_complete_proofs_should_run(
+                        PARTIAL_DFA_MIN_INPUT_BYTES,
+                    ),
                 target,
                 usize::MAX,
             )
@@ -51064,15 +51608,15 @@ static const unsigned char haystack[]={{{haystack}}};
 static uint16_t rows[2];static uint32_t reverse_rows[256];static uint8_t loop_index[2],scanner_cookie;static prepared_t prepared;
 #define frozen_v4 prepared.continuation.v4
 #define frozen_v6 prepared.continuation.v6
-static size_t observed_cursor;static unsigned preflight_calls,continue_calls,recovery_calls,fallback_calls,helper_calls,helper_bad;static int loop_case;
+static size_t observed_cursor;static unsigned preflight_calls,continue_calls,recovery_calls,fallback_calls,helper_calls,helper_bad;static int loop_case;static uint32_t preflight_status;
 static unsigned object_ticket,span_postflight_ticket;
 uint32_t fre_aot_regex_runtime_search_v1(const unsigned char*a,const unsigned char*b,size_t n,size_t s,size_t e,result_t*r){{(void)a;(void)b;(void)n;(void)s;(void)e;(void)r;fallback_calls++;return 97U;}}
 uint32_t fre_aot_regex_runtime_search_exclusive_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;fallback_calls++;return 97U;}}
-uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_preflight_v2(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,const uint32_t*d){{(void)r;(void)d;preflight_calls++;if(h!=(handle_t)&prepared||p!=haystack||n!=sizeof(haystack)||s!=0U||e!=n||memcmp(i,identity,32U)!=0)return 96U;object_ticket=1U;span_postflight_ticket=0U;return 6U;}}
+uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_preflight_v2(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,const uint32_t*d){{(void)d;preflight_calls++;if(h!=(handle_t)&prepared||p!=haystack||n!=sizeof(haystack)||s!=0U||e!=n||memcmp(i,identity,32U)!=0)return 96U;if(preflight_status==1U){{r->start=111U;r->end=112U;return 1U;}}if(preflight_status!=6U)return preflight_status;object_ticket=1U;span_postflight_ticket=0U;return 6U;}}
 uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_continue_v1(handle_t h,const unsigned char*p,size_t n,result_t*r,size_t state,size_t position,size_t pending){{(void)state;(void)pending;continue_calls++;if(h!=(handle_t)&prepared||p!=haystack||n!=sizeof(haystack)||position==0U||position>=n||object_ticket!=1U)return 95U;object_ticket=0U;span_postflight_ticket=({mode}U==2U);observed_cursor=position;r->start=1U;r->end=loop_case&&{mode}U!=0U?position:0U;return 8U;}}
 uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_recover_span_v2(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,size_t selected){{recovery_calls++;if(h!=(handle_t)&prepared||p!=haystack||n!=sizeof(haystack)||s!=0U||e!=n||memcmp(i,identity,32U)!=0||selected!=observed_cursor+(loop_case?0U:1U)||span_postflight_ticket!=1U)return 94U;span_postflight_ticket=0U;r->start=observed_cursor;r->end=selected;return 1U;}}
 size_t fre_aot_regex_runtime_scan_frozen_loop_v2(const unsigned char*p,const void*s,size_t n){{helper_calls++;if(p<haystack||p>haystack+sizeof(haystack)||s!=(const void*)&scanner_cookie)helper_bad++;return n;}}
-static void reset_observations(void){{observed_cursor=0U;preflight_calls=0U;continue_calls=0U;recovery_calls=0U;fallback_calls=0U;helper_calls=0U;helper_bad=0U;object_ticket=0U;span_postflight_ticket=0U;}}
+static void reset_observations(void){{observed_cursor=0U;preflight_calls=0U;continue_calls=0U;recovery_calls=0U;fallback_calls=0U;helper_calls=0U;helper_bad=0U;object_ticket=0U;span_postflight_ticket=0U;preflight_status=6U;memset(prepared.public_header,0,sizeof(prepared.public_header));memcpy(prepared.public_header+{identity_offset}U,identity,32U);}}
 static void init_v4(void){{memset(&prepared.continuation,0,sizeof(prepared.continuation));rows[0]=0U;rows[1]=UINT16_C(0x8000);loop_case=0;
   frozen_v4.v1.active_seal=UINT64_C({active_seal});frozen_v4.v1.magic=UINT64_C({magic});
   frozen_v4.v1.abi_version=UINT32_C({abi});frozen_v4.v1.flags=UINT32_C({v4_flag});
@@ -51108,6 +51652,23 @@ static void init_loop(uint32_t format){{memset(&prepared.continuation,0,sizeof(p
   frozen_v6.v6.loop_plans[0].members[0]=UINT64_MAX;frozen_v6.v6.loop_plans[0].members[1]=UINT64_MAX;
   frozen_v6.v6.loop_plans[0].members[2]=0U;frozen_v6.v6.loop_plans[0].members[3]=0U;
   frozen_v6.v6.loop_plans[0].scanner_address=(size_t)(uintptr_t)&scanner_cookie;}}
+#define CHECK_GUARD(expr,want,code) do{{reset_observations();result.start=91U;result.end=92U;uint32_t guard_status=(expr);if(guard_status!=(want)||result.start!=91U||result.end!=92U||preflight_calls!=0U||continue_calls!=0U||fallback_calls!=0U)return(code);}}while(0)
+static int run_deferred_guards(void){{result_t result={{91U,92U}};if({mode}U==2U)return 0;
+  CHECK_GUARD({entry}((handle_t)0,haystack,sizeof(haystack),0U,sizeof(haystack),&result),5U,200);
+  CHECK_GUARD({entry}((handle_t)&prepared,NULL,sizeof(haystack),0U,sizeof(haystack),&result),2U,201);
+  CHECK_GUARD({entry}((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),NULL),2U,202);
+  CHECK_GUARD({entry}((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),(result_t*)((unsigned char*)&result+1U)),2U,203);
+  CHECK_GUARD({entry}((handle_t)&prepared,haystack,sizeof(haystack),sizeof(haystack),0U,&result),2U,204);
+  CHECK_GUARD({entry}((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack)+1U,&result),2U,205);
+  CHECK_GUARD({entry}((handle_t)&prepared,haystack,SIZE_MAX,0U,0U,&result),2U,206);
+  reset_observations();prepared.public_header[{identity_offset}U]^=1U;uint32_t status={entry}((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),&result);prepared.public_header[{identity_offset}U]^=1U;
+  if(status!=3U||result.start!=91U||result.end!=92U||preflight_calls!=0U||continue_calls!=0U||fallback_calls!=0U)return 207;
+  return 0;}}
+static int run_lazy_preflight_returns(void){{result_t result={{91U,92U}};if({mode}U==2U)return 0;reset_observations();preflight_status=1U;uint32_t status={entry}((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),&result);
+  if(status!=1U||result.start!=111U||result.end!=112U||preflight_calls!=1U||continue_calls!=0U||fallback_calls!=0U||object_ticket!=0U)return 220;
+  reset_observations();preflight_status=3U;result.start=91U;result.end=92U;status={entry}((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),&result);
+  if(status!=3U||result.start!=91U||result.end!=92U||preflight_calls!=1U||continue_calls!=0U||fallback_calls!=0U||object_ticket!=0U)return 221;
+  return 0;}}
 static int run_v4(void){{result_t result={{91U,92U}};reset_observations();init_v4();uint32_t status={entry}((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),&result);
   if(preflight_calls!=1U)return 10;if(continue_calls!=1U)return 40+(int)status;if(fallback_calls!=0U)return 12;
   if(observed_cursor==0U||observed_cursor>=sizeof(haystack))return 13;if(helper_calls!=0U||helper_bad!=0U)return 14;
@@ -51127,7 +51688,7 @@ static int run_loop(uint32_t format){{result_t result={{91U,92U}};reset_observat
     result.start=91U;result.end=92U;if(fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_recover_span_v2((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),&result,identity,observed_cursor)!=94U||result.start!=91U||result.end!=92U)return 175+(int)format;}}
   if(object_ticket!=0U||span_postflight_ticket!=0U)return 180+(int)format;
   return 0;}}
-int main(void){{int status=run_v4();if(status!=0)return status;status=run_loop(6U);if(status!=0)return status;return run_loop(7U);}}
+int main(void){{int status=run_deferred_guards();if(status!=0)return status;status=run_lazy_preflight_returns();if(status!=0)return status;status=run_v4();if(status!=0)return status;status=run_loop(6U);if(status!=0)return status;return run_loop(7U);}}
 "##,
                 v1_bytes = FROZEN_PREPARED_HEADER_V4_DYNAMIC_ROWS_OFFSET,
                 tail_offset = FROZEN_PREPARED_HEADER_V4_DYNAMIC_ROWS_OFFSET,
@@ -51140,6 +51701,7 @@ int main(void){{int status=run_v4();if(status!=0)return status;status=run_loop(6
                 entry = entry,
                 identity = c_bytes(&identity),
                 haystack = c_bytes(&hole_haystack),
+                identity_offset = FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET,
                 active_seal = FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL,
                 magic = FROZEN_PREPARED_HEADER_V1_MAGIC,
                 abi = FROZEN_PREPARED_HEADER_V1_ABI_VERSION,
