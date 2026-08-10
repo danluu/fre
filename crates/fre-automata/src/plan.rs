@@ -732,6 +732,7 @@ pub(crate) enum StartScanner {
 enum StartPositionClassPolicy {
     Ordinary,
     AdaptiveProbe,
+    AdaptiveEarlyProbe,
     GuardPair,
 }
 
@@ -783,10 +784,13 @@ impl StartPositionClass {
     }
 }
 
-/// Broad exact-position class sampled after primary-candidate rejection.
+/// Broad exact-position class used as an adaptive secondary scanner.
 ///
 /// A contiguous range can be intersected with the primary scanner a complete
 /// candidate block at a time without constructing another runtime classifier.
+/// Compact deep classes normally activate after primary-candidate rejection;
+/// an immutable proof may separately mark one for a bounded source-witnessed
+/// trial before the first engine restart.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(transparent)]
 pub(crate) struct StartPositionProbe {
@@ -813,6 +817,9 @@ impl StartPositionProbe {
         for &member in &members[..member_count] {
             let word = usize::from(member / 64);
             let bit = u32::from(member % 64);
+            if words[word] & (1_u64 << bit) != 0 {
+                return None;
+            }
             words[word] |= 1_u64 << bit;
         }
         if ByteSet::from_words(words) != class.set {
@@ -823,6 +830,12 @@ impl StartPositionProbe {
                 .with_probe_policy(None, StartPositionClassPolicy::AdaptiveProbe)
                 .with_compact_probe_members(members, length),
         })
+    }
+
+    pub(crate) const fn with_early_trial(mut self) -> Self {
+        debug_assert!(self.class.compact_probe_len != 0);
+        self.class.policy = StartPositionClassPolicy::AdaptiveEarlyProbe;
+        self
     }
 
     pub(crate) const fn new_guard_pair(
@@ -844,6 +857,13 @@ impl StartPositionProbe {
 
     pub(crate) const fn is_guard_pair(&self) -> bool {
         matches!(self.class.policy, StartPositionClassPolicy::GuardPair)
+    }
+
+    pub(crate) const fn trials_early(&self) -> bool {
+        matches!(
+            self.class.policy,
+            StartPositionClassPolicy::AdaptiveEarlyProbe
+        )
     }
 
     pub(crate) const fn class(&self) -> &StartPositionClass {
@@ -872,8 +892,9 @@ impl Deref for StartPositionProbe {
 ///
 /// A guard is checked for every primary candidate. A Guard pair retains a paid
 /// exact range for invocation-local block intersection after source-derived
-/// admission succeeds. A broad probe starts inactive and is enabled only by
-/// invocation-local engine rejections.
+/// admission succeeds. A broad probe normally starts inactive and is enabled
+/// by invocation-local engine rejections; a compact deep probe may instead
+/// carry immutable eligibility for one bounded source-witnessed early trial.
 /// Keeping the policy in the immutable proof makes every route auditable
 /// without retaining any source-dependent state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -905,7 +926,9 @@ impl StartPositionFilter {
     pub(crate) const fn guard(&self) -> Option<&StartPositionClass> {
         match self.position.class.policy {
             StartPositionClassPolicy::Ordinary => Some(self.position.class()),
-            StartPositionClassPolicy::AdaptiveProbe | StartPositionClassPolicy::GuardPair => None,
+            StartPositionClassPolicy::AdaptiveProbe
+            | StartPositionClassPolicy::AdaptiveEarlyProbe
+            | StartPositionClassPolicy::GuardPair => None,
         }
     }
 
@@ -923,7 +946,9 @@ impl StartPositionFilter {
         }
         match self.position.class.policy {
             StartPositionClassPolicy::Ordinary => None,
-            StartPositionClassPolicy::AdaptiveProbe | StartPositionClassPolicy::GuardPair => {
+            StartPositionClassPolicy::AdaptiveProbe
+            | StartPositionClassPolicy::AdaptiveEarlyProbe
+            | StartPositionClassPolicy::GuardPair => {
                 Some(&self.position)
             }
         }

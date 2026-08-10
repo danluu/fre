@@ -82,6 +82,13 @@ const ASCII_START_BULK_MIN_BYTES: usize = ASCII_WIDE_BYTES * 2;
 // candidate blocks available. This keeps one speculative primary
 // classification out of short, sparse tails where it cannot be amortized.
 const ADAPTIVE_PROBE_FUSED_MIN_BYTES: usize = BYTE_SET_BLOCK_BYTES * 4;
+// A compact exact class may trial as the driving scanner before the engine
+// has supplied restart evidence, but only after one incumbent primary hit
+// and with enough deep suffix to amortize the outlined scan. One
+// anti-correlated deep hit bounds the reverse-check overhead before the
+// incumbent scanner resumes.
+const COMPACT_DEEP_TRIAL_MIN_SCAN_BYTES: usize = BYTE_SET_BLOCK_BYTES * 8;
+const COMPACT_DEEP_TRIAL_CLEAN_PREFIX_BYTES: usize = BYTE_SET_BLOCK_BYTES;
 // A second 16-byte range classification replaces scalar Guard checks only
 // when a primary block contains enough candidates to amortize it locally.
 // Sparse blocks retain the primary mask and use the established scalar Guard.
@@ -23732,8 +23739,13 @@ fn prepare_start_filter_cold<'a>(
     let result = (|| {
     let mut position_proof =
         derive_start_position_classes_inner(automaton, workspace, meter, position)?;
-    let (mut scanner, mut filter, mut publish) = if position_proof.length == 0 {
-        (None, None, true)
+    let (
+        mut scanner,
+        scanner_cardinality,
+        mut filter,
+        mut publish,
+    ) = if position_proof.length == 0 {
+        (None, 0, None, true)
     } else {
         let selection = select_start_classes(
             &position_proof.sets[..position_proof.length],
@@ -23744,7 +23756,7 @@ fn prepare_start_filter_cold<'a>(
             && selection.guard.is_none()
             && selection.probe.is_none()
         {
-            (None, None, true)
+            (None, 0, None, true)
         } else {
             let scanner = build_byte_start_scanner(
                 selection.scanner.set,
@@ -23832,6 +23844,7 @@ fn prepare_start_filter_cold<'a>(
                     offset: selection.scanner.offset,
                     scanner,
                 }),
+                selection.scanner_cardinality,
                 filter,
                 publish,
             )
@@ -23895,12 +23908,30 @@ fn prepare_start_filter_cold<'a>(
                 )?;
                 filter = filter.map(|filter| {
                     let probe = if let Some((members, length)) = compact {
-                        StartPositionProbe::new_compact(
+                        let compact_probe = StartPositionProbe::new_compact(
                             deep_probe,
                             members,
                             length,
                         )
-                        .expect("charged compact Probe extraction exactly represents its class")
+                        .expect("charged compact Probe extraction exactly represents its class");
+                        let trials_early = scanner.as_ref().is_some_and(|scanner| {
+                            deep_cardinality <= scanner_cardinality
+                                && matches!(
+                                    scanner.scanner,
+                                    StartScanner::One(_)
+                                        | StartScanner::Two(_, _)
+                                        | StartScanner::Three(_, _, _)
+                                )
+                                && deep_probe.offset > scanner.offset
+                                && filter.guard().is_some_and(|guard| {
+                                    deep_probe.offset > guard.offset
+                                })
+                        });
+                        if trials_early {
+                            compact_probe.with_early_trial()
+                        } else {
+                            compact_probe
+                        }
                     } else {
                         StartPositionProbe::new(deep_probe, None)
                     };
@@ -24635,7 +24666,7 @@ fn next_start_candidate_adaptive(
 
     if let Some(guard) = guard {
         debug_assert!(!probe.is_guard_pair());
-        if state.phase != AdaptiveProbePhase::Active {
+        if state.phase == AdaptiveProbePhase::Disabled {
             return next_start_candidate_retained(
                 scanner,
                 haystack,
@@ -24646,11 +24677,42 @@ fn next_start_candidate_adaptive(
                 cursor,
             );
         }
-        if meter.limit == u64::MAX && probe.compact_members().0 != 0 {
-            // A primary retained mask describes primary-scanner hits, while
-            // the promoted search below is driven by the deep class. Clear
-            // that incompatible meaning only after a successful decision so
-            // checked failures leave the invocation-local cursor unchanged.
+        if state.phase == AdaptiveProbePhase::Inactive {
+            let may_trial_compact = probe.trials_early()
+                && state.consecutive_rejections == 0
+                && meter.limit == u64::MAX
+                && cursor.width == 0
+                && compact_probe_scan_has_runway(probe, position, end);
+            if may_trial_compact {
+                return next_start_candidate_early_compact_deep_trial(
+                    scanner,
+                    guard,
+                    probe,
+                    haystack,
+                    position,
+                    end,
+                    meter,
+                    cursor,
+                    state,
+                );
+            }
+            return next_start_candidate_retained(
+                scanner,
+                haystack,
+                position,
+                end,
+                Some(guard),
+                meter,
+                cursor,
+            );
+        }
+        debug_assert_eq!(state.phase, AdaptiveProbePhase::Active);
+        let compact_length = probe.compact_members().0;
+        if meter.limit == u64::MAX && compact_length != 0 {
+            // Restart evidence already established that the deep class is a
+            // useful incumbent for this invocation. A reverse miss does not
+            // contradict that evidence, so preserve the established complete
+            // deep scan rather than applying the early trial's bounded risk.
             let promoted = next_start_candidate_promoted_deep_probe(
                 scanner,
                 guard,
@@ -24740,6 +24802,26 @@ fn next_start_candidate_adaptive(
     }
 }
 
+fn compact_probe_follows_incumbent(
+    scanner: &StartPositionScanner,
+    guard: &StartPositionClass,
+    probe: &StartPositionProbe,
+) -> bool {
+    probe.offset > scanner.offset && probe.offset > guard.offset
+}
+
+fn compact_probe_scan_has_runway(
+    probe: &StartPositionProbe,
+    position: usize,
+    end: usize,
+) -> bool {
+    position
+        .checked_add(usize::from(probe.offset))
+        .is_some_and(|scan_start| {
+            end.saturating_sub(scan_start) >= COMPACT_DEEP_TRIAL_MIN_SCAN_BYTES
+        })
+}
+
 fn start_scanner_contains_byte(scanner: &StartScanner, byte: u8) -> bool {
     match scanner {
         StartScanner::Empty => false,
@@ -24752,6 +24834,200 @@ fn start_scanner_contains_byte(scanner: &StartScanner, byte: u8) -> bool {
         StartScanner::AsciiSet { set, .. } => set.contains(byte),
         StartScanner::Set(classifier) => classifier.set().contains(byte),
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompactDeepProbeDecision {
+    Complete(usize),
+    DemoteAt(usize),
+}
+
+#[inline(always)]
+fn next_compact_seed_primary_candidate(
+    scanner: &StartPositionScanner,
+    haystack: &[u8],
+    position: usize,
+    end: usize,
+    meter: &mut WorkMeter,
+) -> Result<usize, SearchError> {
+    let scanner_offset = usize::from(scanner.offset);
+    let scan_start = position.checked_add(scanner_offset).ok_or(
+        SearchError::ArithmeticOverflow {
+            computation: "seeded compact Probe primary scan position",
+        },
+    )?;
+    if scan_start >= end {
+        return Ok(end);
+    }
+    let scan_position = match &scanner.scanner {
+        StartScanner::One(first) => {
+            next_small_start_candidate(haystack, scan_start, end, meter, |source| {
+                memchr(*first, source)
+            })
+        }
+        StartScanner::Two(first, second) => {
+            next_small_start_candidate(haystack, scan_start, end, meter, |source| {
+                memchr2(*first, *second, source)
+            })
+        }
+        StartScanner::Three(first, second, third) => {
+            next_small_start_candidate(haystack, scan_start, end, meter, |source| {
+                memchr3(*first, *second, *third, source)
+            })
+        }
+        StartScanner::Empty
+        | StartScanner::Range { .. }
+        | StartScanner::AsciiSet { .. }
+        | StartScanner::Set(_) => {
+            return Err(SearchError::InternalInvariant {
+                detail: "early compact Probe received a noncompact primary scanner",
+            });
+        }
+    }?;
+    if scan_position == end {
+        return Ok(end);
+    }
+    scan_position.checked_sub(scanner_offset).ok_or(
+        SearchError::InternalInvariant {
+            detail: "seeded compact Probe primary matched before its exact offset",
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn next_start_candidate_early_compact_deep_trial(
+    scanner: &StartPositionScanner,
+    guard: &StartPositionClass,
+    probe: &StartPositionProbe,
+    haystack: &[u8],
+    position: usize,
+    end: usize,
+    meter: &mut WorkMeter,
+    cursor: &mut RetainedStartMaskCursor,
+    state: &mut AdaptiveStartProbe,
+) -> Result<usize, SearchError> {
+    debug_assert_eq!(meter.limit, u64::MAX);
+    debug_assert_eq!(state.phase, AdaptiveProbePhase::Inactive);
+    debug_assert_eq!(state.consecutive_rejections, 0);
+    debug_assert!(probe.trials_early());
+    debug_assert_eq!(cursor.width, 0);
+    debug_assert!(compact_probe_follows_incumbent(scanner, guard, probe));
+
+    // Preserve the incumbent no-hit fast path outside this outlined trial:
+    // only a real primary witness pays the remaining speculative work.
+    let candidate =
+        next_compact_seed_primary_candidate(scanner, haystack, position, end, meter)?;
+    if candidate == end {
+        state.phase = AdaptiveProbePhase::Disabled;
+        return Ok(end);
+    }
+    let trial_cursor = *cursor;
+    let guard_position = candidate.checked_add(usize::from(guard.offset)).ok_or(
+        SearchError::ArithmeticOverflow {
+            computation: "seeded compact Probe Guard position",
+        },
+    )?;
+    meter.charge(1, candidate)?;
+    let guard_passed = guard_position < end && guard.set.contains(haystack[guard_position]);
+    if guard_passed {
+        let probe_position = candidate.checked_add(usize::from(probe.offset)).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "seeded compact Probe exact position",
+            },
+        )?;
+        meter.charge(1, candidate)?;
+        if probe_position < end && probe.set.contains(haystack[probe_position]) {
+            *cursor = trial_cursor;
+            state.phase = AdaptiveProbePhase::Disabled;
+            return Ok(candidate);
+        }
+    }
+
+    let resume = candidate
+        .checked_add(1)
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "seeded compact Probe next candidate",
+        })?;
+    if !compact_probe_scan_has_runway(probe, resume, end) {
+        return finish_early_compact_deep_probe(
+            scanner,
+            guard,
+            haystack,
+            end,
+            meter,
+            cursor,
+            state,
+            trial_cursor,
+            CompactDeepProbeDecision::DemoteAt(resume),
+        );
+    }
+
+    // Require a short source-observed deep-free prefix before changing the
+    // engine's incumbent start. A nearby deep hit signals correlation that
+    // graph cardinalities cannot predict; returning the Guard-passing seed
+    // then preserves the established engine path exactly.
+    let clean_start = resume
+        .checked_add(usize::from(probe.offset))
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "seeded compact Probe clean-prefix position",
+        })?;
+    let clean_end = clean_start
+        .checked_add(COMPACT_DEEP_TRIAL_CLEAN_PREFIX_BYTES)
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "seeded compact Probe clean-prefix end",
+        })?;
+    debug_assert!(clean_end <= end);
+    let first_deep = next_compact_probe_scan_position(
+        probe,
+        haystack,
+        clean_start,
+        clean_end,
+        meter,
+    )?;
+    if first_deep != clean_end {
+        if guard_passed {
+            *cursor = trial_cursor;
+            return Ok(candidate);
+        }
+        let mut declined_cursor = trial_cursor;
+        let declined = next_start_candidate_retained(
+            scanner,
+            haystack,
+            resume,
+            end,
+            Some(guard),
+            meter,
+            &mut declined_cursor,
+        )?;
+        *cursor = declined_cursor;
+        return Ok(declined);
+    }
+    let deep_resume = resume
+        .checked_add(COMPACT_DEEP_TRIAL_CLEAN_PREFIX_BYTES)
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "seeded compact Probe clean-prefix progress",
+        })?;
+    let decision = scan_early_compact_deep_probe(
+        scanner,
+        guard,
+        probe,
+        haystack,
+        deep_resume,
+        end,
+        meter,
+    )?;
+    finish_early_compact_deep_probe(
+        scanner,
+        guard,
+        haystack,
+        end,
+        meter,
+        cursor,
+        state,
+        trial_cursor,
+        decision,
+    )
 }
 
 fn next_compact_probe_scan_position(
@@ -24779,9 +25055,72 @@ fn next_compact_probe_scan_position(
             })
         }
         _ => Err(SearchError::InternalInvariant {
-            detail: "promoted deep Probe omitted its compact scan leaf",
+            detail: "compact deep Probe omitted its scan leaf",
         }),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn scan_early_compact_deep_probe(
+    scanner: &StartPositionScanner,
+    guard: &StartPositionClass,
+    probe: &StartPositionProbe,
+    haystack: &[u8],
+    position: usize,
+    end: usize,
+    meter: &mut WorkMeter,
+) -> Result<CompactDeepProbeDecision, SearchError> {
+    debug_assert_eq!(meter.limit, u64::MAX);
+    let probe_offset = usize::from(probe.offset);
+    let scanner_offset = usize::from(scanner.offset);
+    let guard_offset = usize::from(guard.offset);
+    debug_assert!(probe_offset > scanner_offset);
+    debug_assert!(probe_offset > guard_offset);
+    let probe_start = position.checked_add(probe_offset).ok_or(
+        SearchError::ArithmeticOverflow {
+            computation: "early compact Probe scan position",
+        },
+    )?;
+    if probe_start >= end {
+        return Ok(CompactDeepProbeDecision::Complete(end));
+    }
+    let probe_position =
+        next_compact_probe_scan_position(probe, haystack, probe_start, end, meter)?;
+    if probe_position == end {
+        return Ok(CompactDeepProbeDecision::Complete(end));
+    }
+    let candidate = probe_position.checked_sub(probe_offset).ok_or(
+        SearchError::InternalInvariant {
+            detail: "early compact Probe matched before its exact offset",
+        },
+    )?;
+
+    let scanner_position = candidate.checked_add(scanner_offset).ok_or(
+        SearchError::ArithmeticOverflow {
+            computation: "early compact Probe primary position",
+        },
+    )?;
+    meter.charge(1, candidate)?;
+    let primary_passed = scanner_position < end
+        && start_scanner_contains_byte(&scanner.scanner, haystack[scanner_position]);
+    if primary_passed {
+        let guard_position = candidate.checked_add(guard_offset).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "early compact Probe Guard position",
+            },
+        )?;
+        meter.charge(1, candidate)?;
+        if guard_position < end && guard.set.contains(haystack[guard_position]) {
+            return Ok(CompactDeepProbeDecision::Complete(candidate));
+        }
+    }
+    candidate
+        .checked_add(1)
+        .map(CompactDeepProbeDecision::DemoteAt)
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "early compact Probe next candidate",
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -24851,6 +25190,41 @@ fn next_start_candidate_promoted_deep_probe(
             .ok_or(SearchError::ArithmeticOverflow {
                 computation: "promoted deep Probe next candidate",
             })?;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_early_compact_deep_probe(
+    scanner: &StartPositionScanner,
+    guard: &StartPositionClass,
+    haystack: &[u8],
+    end: usize,
+    meter: &mut WorkMeter,
+    cursor: &mut RetainedStartMaskCursor,
+    state: &mut AdaptiveStartProbe,
+    mut demoted_cursor: RetainedStartMaskCursor,
+    decision: CompactDeepProbeDecision,
+) -> Result<usize, SearchError> {
+    match decision {
+        CompactDeepProbeDecision::Complete(candidate) => {
+            cursor.clear();
+            state.phase = AdaptiveProbePhase::Disabled;
+            Ok(candidate)
+        }
+        CompactDeepProbeDecision::DemoteAt(resume) => {
+            let candidate = next_start_candidate_retained(
+                scanner,
+                haystack,
+                resume,
+                end,
+                Some(guard),
+                meter,
+                &mut demoted_cursor,
+            )?;
+            *cursor = demoted_cursor;
+            state.phase = AdaptiveProbePhase::Disabled;
+            Ok(candidate)
+        }
     }
 }
 
@@ -40753,8 +41127,8 @@ mod tests {
         )
         .unwrap();
         let mut source = vec![b'x'; 5 * 40 + 33];
-        // The first deep hit fails the primary. The second passes the primary
-        // but fails the Guard. The third complete survivor is returned.
+        // Mature restart evidence keeps the deep scanner active across
+        // reverse misses: primary failure, then Guard failure, then survivor.
         source[32] = b'Z';
         source[40] = b'Q';
         source[40 + 32] = b'Z';
@@ -40766,11 +41140,7 @@ mod tests {
             phase: super::AdaptiveProbePhase::Active,
             consecutive_rejections: 2,
         };
-        let mut cursor = super::RetainedStartMaskCursor {
-            base: 0,
-            width: 16,
-            members: u64::MAX,
-        };
+        let mut cursor = super::RetainedStartMaskCursor::default();
         let mut meter = WorkMeter::new(u64::MAX, 0);
         assert_eq!(
             super::next_start_candidate_adaptive(
@@ -40803,6 +41173,111 @@ mod tests {
             2,
         )
         .is_none());
+        assert!(StartPositionProbe::new_compact(
+            StartPositionClass::new(32, byte_set(b"Z")),
+            [b'Z', b'Z', 0],
+            2,
+        )
+        .is_none());
+        assert!(StartPositionProbe::new_compact(
+            StartPositionClass::new(32, byte_set(b"YZ")),
+            [b'Y', b'Z', b'Y'],
+            3,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn compact_deep_probe_is_failure_atomic_before_and_after_restart_evidence() {
+        let guard = StartPositionClass::new(1, byte_set(b"A"));
+        let probe = StartPositionProbe::new_compact(
+            StartPositionClass::new(32, byte_set(b"Z")),
+            [b'Z', 0, 0],
+            1,
+        )
+        .unwrap();
+        let active_scanner = root_scanner(StartScanner::Range {
+            start: b'Q',
+            end: b'R',
+        });
+        let mut active_source = vec![b'x'; 128];
+        active_source[44] = b'Q';
+        active_source[44 + 32] = b'Z';
+
+        // The evidence-backed deep path can exhaust the global work counter
+        // after its primary reverse check. It must not clear the caller's
+        // cursor or publish a state change before that fallible Guard charge.
+        let mut active_state = super::AdaptiveStartProbe {
+            phase: super::AdaptiveProbePhase::Active,
+            consecutive_rejections: 2,
+        };
+        let mut active_cursor = super::RetainedStartMaskCursor {
+            base: 32,
+            width: 16,
+            members: 1_u64 << 12,
+        };
+        let original_active_state = active_state;
+        let original_active_cursor = active_cursor;
+        let mut active_meter = WorkMeter::new(u64::MAX, u64::MAX - 5);
+        assert!(matches!(
+            super::next_start_candidate_adaptive(
+                &active_scanner,
+                &active_source,
+                41,
+                active_source.len(),
+                Some(&guard),
+                Some(&probe),
+                &mut active_meter,
+                &mut active_cursor,
+                &mut active_state,
+            ),
+            Err(SearchError::ArithmeticOverflow {
+                computation: "search work counter"
+            })
+        ));
+        assert_eq!(active_meter.consumed, u64::MAX);
+        assert_eq!(active_cursor, original_active_cursor);
+        assert_eq!(active_state, original_active_state);
+
+        // The production early route has the same publication boundary: its
+        // primary seed and Guard may complete, but failure on the exact deep
+        // check leaves both invocation-local objects unchanged.
+        let early = StartPositionProbe::new_compact(
+            StartPositionClass::new(32, byte_set(b"Z")),
+            [b'Z', 0, 0],
+            1,
+        )
+        .unwrap()
+        .with_early_trial();
+        let early_scanner = root_scanner(StartScanner::One(b'Q'));
+        let mut early_source = vec![b'x'; 256];
+        early_source[0] = b'Q';
+        early_source[1] = b'A';
+        early_source[32] = b'Z';
+        let mut early_state = super::AdaptiveStartProbe::default();
+        let mut early_cursor = super::RetainedStartMaskCursor::default();
+        let original_early_state = early_state;
+        let original_early_cursor = early_cursor;
+        let mut early_meter = WorkMeter::new(u64::MAX, u64::MAX - 2);
+        assert!(matches!(
+            super::next_start_candidate_adaptive(
+                &early_scanner,
+                &early_source,
+                0,
+                early_source.len(),
+                Some(&guard),
+                Some(&early),
+                &mut early_meter,
+                &mut early_cursor,
+                &mut early_state,
+            ),
+            Err(SearchError::ArithmeticOverflow {
+                computation: "search work counter"
+            })
+        ));
+        assert_eq!(early_cursor, original_early_cursor);
+        assert_eq!(early_state, original_early_state);
+        assert_eq!(early_meter.consumed, u64::MAX);
     }
 
     #[test]
@@ -40843,6 +41318,7 @@ mod tests {
             1,
         )
         .unwrap();
+        let early_compact = compact.with_early_trial();
         let scalar = StartPositionProbe::new(
             StartPositionClass::new(32, byte_set(b"Z")),
             None,
@@ -40886,7 +41362,413 @@ mod tests {
             assert_eq!(compact_meter.consumed, scalar_meter.consumed, "limit={limit}");
             assert_eq!(compact_cursor, scalar_cursor, "limit={limit}");
             assert_eq!(compact_state, scalar_state, "limit={limit}");
+
+            let mut early_state = super::AdaptiveStartProbe::default();
+            let mut incumbent_state = super::AdaptiveStartProbe::default();
+            let mut early_cursor = super::RetainedStartMaskCursor::default();
+            let mut incumbent_cursor = super::RetainedStartMaskCursor::default();
+            let mut early_meter = WorkMeter::new(limit, 0);
+            let mut incumbent_meter = WorkMeter::new(limit, 0);
+            let early_result = super::next_start_candidate_adaptive(
+                &scanner,
+                &source,
+                0,
+                source.len(),
+                Some(&guard),
+                Some(&early_compact),
+                &mut early_meter,
+                &mut early_cursor,
+                &mut early_state,
+            );
+            let incumbent_result = super::next_start_candidate_adaptive(
+                &scanner,
+                &source,
+                0,
+                source.len(),
+                Some(&guard),
+                Some(&compact),
+                &mut incumbent_meter,
+                &mut incumbent_cursor,
+                &mut incumbent_state,
+            );
+            assert_eq!(early_result, incumbent_result, "early limit={limit}");
+            assert_eq!(early_meter.consumed, incumbent_meter.consumed);
+            assert_eq!(early_cursor, incumbent_cursor);
+            assert_eq!(early_state, incumbent_state);
         }
+    }
+
+    #[test]
+    fn compact_deep_trial_is_bounded_and_resumes_without_skipping() {
+        let scanner = root_scanner(StartScanner::One(b'Q'));
+        let guard = StartPositionClass::new(1, byte_set(b"A"));
+        let one = StartPositionProbe::new_compact(
+            StartPositionClass::new(32, byte_set(b"Z")),
+            [b'Z', 0, 0],
+            1,
+        )
+        .unwrap()
+        .with_early_trial();
+
+        let no_primary = vec![b'x'; 256];
+        let mut no_primary_state = super::AdaptiveStartProbe::default();
+        let mut no_primary_cursor = super::RetainedStartMaskCursor::default();
+        let mut no_primary_meter = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            super::next_start_candidate_adaptive(
+                &scanner,
+                &no_primary,
+                0,
+                no_primary.len(),
+                Some(&guard),
+                Some(&one),
+                &mut no_primary_meter,
+                &mut no_primary_cursor,
+                &mut no_primary_state,
+            )
+            .unwrap(),
+            no_primary.len()
+        );
+        assert_eq!(no_primary_meter.consumed, 256);
+        assert_eq!(
+            no_primary_state.phase,
+            super::AdaptiveProbePhase::Disabled
+        );
+        assert_eq!(
+            no_primary_cursor,
+            super::RetainedStartMaskCursor::default()
+        );
+
+        let mut survivor = vec![b'x'; 256];
+        survivor[0] = b'Q';
+        survivor[1] = b'A';
+        survivor[32] = b'Z';
+        let mut survivor_state = super::AdaptiveStartProbe::default();
+        let mut survivor_cursor = super::RetainedStartMaskCursor::default();
+        let mut survivor_meter = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            super::next_start_candidate_adaptive(
+                &scanner,
+                &survivor,
+                0,
+                survivor.len(),
+                Some(&guard),
+                Some(&one),
+                &mut survivor_meter,
+                &mut survivor_cursor,
+                &mut survivor_state,
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(survivor_meter.consumed, 3);
+        assert_eq!(survivor_state.phase, super::AdaptiveProbePhase::Disabled);
+
+        for primary in [
+            StartScanner::Two(b'Q', b'R'),
+            StartScanner::Three(b'Q', b'R', b'S'),
+        ] {
+            let primary_scanner = root_scanner(primary);
+            let mut primary_source = vec![b'x'; 256];
+            primary_source[0] = b'R';
+            primary_source[1] = b'A';
+            primary_source[32] = b'Z';
+            let mut primary_state = super::AdaptiveStartProbe::default();
+            let mut primary_cursor = super::RetainedStartMaskCursor::default();
+            let mut primary_meter = WorkMeter::new(u64::MAX, 0);
+            assert_eq!(
+                super::next_start_candidate_adaptive(
+                    &primary_scanner,
+                    &primary_source,
+                    0,
+                    primary_source.len(),
+                    Some(&guard),
+                    Some(&one),
+                    &mut primary_meter,
+                    &mut primary_cursor,
+                    &mut primary_state,
+                )
+                .unwrap(),
+                0
+            );
+            assert_eq!(primary_meter.consumed, 3);
+            assert_eq!(primary_state.phase, super::AdaptiveProbePhase::Disabled);
+        }
+
+        let mut absent = vec![b'x'; 256];
+        for candidate in (0..=absent.len() - 33).step_by(8) {
+            absent[candidate] = b'Q';
+            absent[candidate + 1] = b'A';
+        }
+        let mut absent_state = super::AdaptiveStartProbe::default();
+        let mut absent_cursor = super::RetainedStartMaskCursor::default();
+        let mut absent_meter = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            super::next_start_candidate_adaptive(
+                &scanner,
+                &absent,
+                0,
+                absent.len(),
+                Some(&guard),
+                Some(&one),
+                &mut absent_meter,
+                &mut absent_cursor,
+                &mut absent_state,
+            )
+            .unwrap(),
+            absent.len()
+        );
+        assert_eq!(absent_meter.consumed, 226);
+        assert_eq!(absent_state.phase, super::AdaptiveProbePhase::Disabled);
+        assert_eq!(absent_cursor, super::RetainedStartMaskCursor::default());
+
+        let mut noisy = vec![b'x'; 256];
+        noisy[0] = b'Q';
+        noisy[1] = b'A';
+        noisy[40] = b'Z';
+        let mut noisy_state = super::AdaptiveStartProbe::default();
+        let mut noisy_cursor = super::RetainedStartMaskCursor::default();
+        let mut noisy_meter = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            super::next_start_candidate_adaptive(
+                &scanner,
+                &noisy,
+                0,
+                noisy.len(),
+                Some(&guard),
+                Some(&one),
+                &mut noisy_meter,
+                &mut noisy_cursor,
+                &mut noisy_state,
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(noisy_meter.consumed, 11);
+        assert_eq!(noisy_state.phase, super::AdaptiveProbePhase::Inactive);
+
+        let mut declined = vec![b'x'; 256];
+        declined[0] = b'Q';
+        declined[40] = b'Z';
+        declined[60] = b'Q';
+        declined[61] = b'A';
+        let mut declined_state = super::AdaptiveStartProbe::default();
+        let mut declined_cursor = super::RetainedStartMaskCursor::default();
+        let mut declined_meter = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            super::next_start_candidate_adaptive(
+                &scanner,
+                &declined,
+                0,
+                declined.len(),
+                Some(&guard),
+                Some(&one),
+                &mut declined_meter,
+                &mut declined_cursor,
+                &mut declined_state,
+            )
+            .unwrap(),
+            60
+        );
+        assert_eq!(declined_meter.consumed, 71);
+        assert_eq!(declined_state.phase, super::AdaptiveProbePhase::Inactive);
+
+        let mut demoting = vec![b'x'; 256];
+        demoting[0] = b'Q';
+        demoting[1] = b'A';
+        demoting[60] = b'Q';
+        demoting[61] = b'A';
+        demoting[72] = b'Z';
+        let mut demoting_state = super::AdaptiveStartProbe::default();
+        let mut demoting_cursor = super::RetainedStartMaskCursor::default();
+        let mut demoting_meter = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            super::next_start_candidate_adaptive(
+                &scanner,
+                &demoting,
+                0,
+                demoting.len(),
+                Some(&guard),
+                Some(&one),
+                &mut demoting_meter,
+                &mut demoting_cursor,
+                &mut demoting_state,
+            )
+            .unwrap(),
+            60
+        );
+        assert_eq!(demoting_meter.consumed, 65);
+        assert_eq!(demoting_state.phase, super::AdaptiveProbePhase::Disabled);
+
+        let three = StartPositionProbe::new_compact(
+            StartPositionClass::new(32, byte_set(b"XYZ")),
+            [b'X', b'Y', b'Z'],
+            3,
+        )
+        .unwrap();
+        let mut ineligible = vec![b'x'; 256];
+        ineligible[0] = b'Q';
+        ineligible[1] = b'A';
+        let mut ineligible_state = super::AdaptiveStartProbe::default();
+        let mut ineligible_cursor = super::RetainedStartMaskCursor::default();
+        let mut ineligible_meter = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            super::next_start_candidate_adaptive(
+                &scanner,
+                &ineligible,
+                0,
+                ineligible.len(),
+                Some(&guard),
+                Some(&three),
+                &mut ineligible_meter,
+                &mut ineligible_cursor,
+                &mut ineligible_state,
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(ineligible_state.phase, super::AdaptiveProbePhase::Inactive);
+
+        let mut short = vec![
+            b'x';
+            32 + super::COMPACT_DEEP_TRIAL_MIN_SCAN_BYTES - 1
+        ];
+        short[0] = b'Q';
+        short[1] = b'A';
+        let mut short_state = super::AdaptiveStartProbe::default();
+        let mut short_cursor = super::RetainedStartMaskCursor::default();
+        let mut short_meter = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            super::next_start_candidate_adaptive(
+                &scanner,
+                &short,
+                0,
+                short.len(),
+                Some(&guard),
+                Some(&one),
+                &mut short_meter,
+                &mut short_cursor,
+                &mut short_state,
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(short_state.phase, super::AdaptiveProbePhase::Inactive);
+
+        let mut pre_seed_exact =
+            vec![b'x'; 32 + super::COMPACT_DEEP_TRIAL_MIN_SCAN_BYTES];
+        pre_seed_exact[0] = b'Q';
+        pre_seed_exact[1] = b'A';
+        let mut pre_seed_exact_state = super::AdaptiveStartProbe::default();
+        let mut pre_seed_exact_cursor = super::RetainedStartMaskCursor::default();
+        let mut pre_seed_exact_meter = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            super::next_start_candidate_adaptive(
+                &scanner,
+                &pre_seed_exact,
+                0,
+                pre_seed_exact.len(),
+                Some(&guard),
+                Some(&one),
+                &mut pre_seed_exact_meter,
+                &mut pre_seed_exact_cursor,
+                &mut pre_seed_exact_state,
+            )
+            .unwrap(),
+            pre_seed_exact.len()
+        );
+        assert_eq!(pre_seed_exact_meter.consumed, 162);
+        assert_eq!(
+            pre_seed_exact_state.phase,
+            super::AdaptiveProbePhase::Disabled
+        );
+
+        // The first length admits the trial before its seed but has one byte
+        // too little runway after consuming that seed. One additional byte
+        // admits exactly the bounded compact scan instead of scalar demotion.
+        let mut post_seed_exact =
+            vec![b'x'; 32 + 1 + super::COMPACT_DEEP_TRIAL_MIN_SCAN_BYTES];
+        post_seed_exact[0] = b'Q';
+        post_seed_exact[1] = b'A';
+        let mut post_seed_exact_state = super::AdaptiveStartProbe::default();
+        let mut post_seed_exact_cursor = super::RetainedStartMaskCursor::default();
+        let mut post_seed_exact_meter = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            super::next_start_candidate_adaptive(
+                &scanner,
+                &post_seed_exact,
+                0,
+                post_seed_exact.len(),
+                Some(&guard),
+                Some(&one),
+                &mut post_seed_exact_meter,
+                &mut post_seed_exact_cursor,
+                &mut post_seed_exact_state,
+            )
+            .unwrap(),
+            post_seed_exact.len()
+        );
+        assert_eq!(post_seed_exact_meter.consumed, 131);
+        assert_eq!(
+            post_seed_exact_state.phase,
+            super::AdaptiveProbePhase::Disabled
+        );
+
+        let offset_63 = StartPositionProbe::new_compact(
+            StartPositionClass::new(63, byte_set(b"Z")),
+            [b'Z', 0, 0],
+            1,
+        )
+        .unwrap()
+        .with_early_trial();
+        let mut offset_63_exact =
+            vec![b'x'; 63 + 1 + super::COMPACT_DEEP_TRIAL_MIN_SCAN_BYTES];
+        offset_63_exact[0] = b'Q';
+        offset_63_exact[1] = b'A';
+        let mut offset_63_state = super::AdaptiveStartProbe::default();
+        let mut offset_63_cursor = super::RetainedStartMaskCursor::default();
+        let mut offset_63_meter = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            super::next_start_candidate_adaptive(
+                &scanner,
+                &offset_63_exact,
+                0,
+                offset_63_exact.len(),
+                Some(&guard),
+                Some(&offset_63),
+                &mut offset_63_meter,
+                &mut offset_63_cursor,
+                &mut offset_63_state,
+            )
+            .unwrap(),
+            offset_63_exact.len()
+        );
+        assert_eq!(offset_63_meter.consumed, 131);
+        assert_eq!(offset_63_state.phase, super::AdaptiveProbePhase::Disabled);
+
+        let mut streak = super::AdaptiveStartProbe {
+            phase: super::AdaptiveProbePhase::Inactive,
+            consecutive_rejections: 1,
+        };
+        let mut streak_cursor = super::RetainedStartMaskCursor::default();
+        let mut streak_meter = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            super::next_start_candidate_adaptive(
+                &scanner,
+                &absent,
+                0,
+                absent.len(),
+                Some(&guard),
+                Some(&one),
+                &mut streak_meter,
+                &mut streak_cursor,
+                &mut streak,
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(streak.phase, super::AdaptiveProbePhase::Inactive);
+        assert_eq!(streak.consecutive_rejections, 1);
     }
 
     #[test]
@@ -40920,6 +41802,37 @@ mod tests {
         let proof = specialized.start_filter_proof.get().unwrap();
         assert!(matches!(proof.guard(), Some(guard) if guard.offset == 1));
         assert!(matches!(proof.probe(), Some(probe) if probe.offset == 32));
+        assert!(proof.probe().is_some_and(StartPositionProbe::trials_early));
+
+        let mut wider_ranges = vec![(0, u8::MAX); 33];
+        wider_ranges[0] = (b'Q', b'Q');
+        wider_ranges[1] = (b'A', b'A');
+        wider_ranges[32] = (b'Y', b'Z');
+        let wider_specialized = byte_chain(&wider_ranges);
+        let wider_reference = byte_chain(&wider_ranges);
+        let mut wider_valid = vec![b'x'; wider_ranges.len()];
+        wider_valid[0] = b'Q';
+        wider_valid[1] = b'A';
+        wider_valid[32] = b'Y';
+        assert_all_windows_match_unspecialized(
+            "cardinality-ineligible-deep-probe",
+            &wider_specialized,
+            &wider_reference,
+            &[wider_valid],
+        );
+        let wider_proof = wider_specialized.start_filter_proof.get().unwrap();
+        assert!(matches!(
+            wider_proof.scanner,
+            Some(StartPositionScanner {
+                offset: 0,
+                scanner: StartScanner::One(b'Q'),
+            })
+        ));
+        assert!(matches!(wider_proof.guard(), Some(guard) if guard.offset == 1));
+        let wider_probe = wider_proof.probe().unwrap();
+        assert_eq!(wider_probe.offset, 32);
+        assert_eq!(wider_probe.compact_members().0, 2);
+        assert!(!wider_probe.trials_early());
     }
 
     #[test]
