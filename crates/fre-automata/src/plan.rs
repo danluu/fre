@@ -5,9 +5,16 @@ use std::sync::{
 };
 
 use fre_simd_kernels::{
-    AsciiByteSet, AsciiByteSetClassifier, AsciiByteSetRunScanner, AsciiSelection,
-    ByteSetClassifier, ASCII_CLASSIFIER_BUILD_WORK, ASCII_RUN_SCANNER_BUILD_WORK,
+    AsciiByteSet, AsciiByteSetClassifier, AsciiByteSetNonMemberScanner,
+    AsciiSelection, ByteSetClassifier, ASCII_CLASSIFIER_BUILD_WORK,
+    ASCII_NONMEMBER_RUN_SCANNER_BUILD_WORK,
 };
+#[cfg(any(
+    test,
+    target_arch = "x86_64",
+    all(target_arch = "aarch64", target_os = "linux", target_endian = "little")
+))]
+use fre_simd_kernels::{AsciiByteSetRunScanner, ASCII_RUN_SCANNER_BUILD_WORK};
 
 use crate::{CompileError, MalformedPlan, Operation, ResourceKind, TypedPlan, WorkspaceLayout};
 use crate::{
@@ -91,7 +98,7 @@ pub(crate) const BYTE_START_SET_CLASSIFIER_BUILD_WORK: usize =
     fre_simd_kernels::BYTE_SET_CLASSIFIER_BUILD_WORK;
 /// Exact abstract work to compile a broad all-ASCII bitmap scanner.
 pub(crate) const BYTE_START_ASCII_CLASSIFIER_SELECTION_WORK: usize =
-    ASCII_CLASSIFIER_BUILD_WORK + ASCII_RUN_SCANNER_BUILD_WORK;
+    ASCII_CLASSIFIER_BUILD_WORK + ASCII_NONMEMBER_RUN_SCANNER_BUILD_WORK;
 /// Exact abstract work to compare one position with the incumbent scanner.
 pub(crate) const START_FILTER_SCANNER_SELECTION_WORK: usize = 1;
 /// Exact abstract work to compare one non-scanner position with the incumbent
@@ -574,20 +581,17 @@ impl ByteSet {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct StartAsciiClassifier {
     inner: AsciiByteSetClassifier,
-    nonmembers: AsciiByteSetRunScanner,
+    nonmembers: AsciiByteSetNonMemberScanner,
 }
 
 impl StartAsciiClassifier {
     pub(crate) fn new(set: AsciiByteSet) -> Self {
-        let words = set.words();
         Self {
             inner: AsciiByteSetClassifier::new(set),
-            // This scanner advances only across ASCII bytes outside the exact
-            // start set. A high byte deliberately ends the run so the caller
-            // can fall back to the full fixed-block membership path.
-            nonmembers: AsciiByteSetRunScanner::new(AsciiByteSet::from_words([
-                !words[0], !words[1],
-            ])),
+            // High bytes are exact nonmembers of an all-ASCII start set, so
+            // retain a whole-slice scanner that advances across them instead
+            // of ending the run at every non-ASCII byte.
+            nonmembers: AsciiByteSetNonMemberScanner::new(set),
         }
     }
 
@@ -595,7 +599,7 @@ impl StartAsciiClassifier {
         &self.inner
     }
 
-    pub(crate) const fn nonmember_scanner(&self) -> &AsciiByteSetRunScanner {
+    pub(crate) const fn nonmember_scanner(&self) -> &AsciiByteSetNonMemberScanner {
         &self.nonmembers
     }
 

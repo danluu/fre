@@ -26609,7 +26609,7 @@ fn next_ascii_start_candidate(
                 )?;
                 let skipped = nonmembers
                     .scan_forward(&haystack[position..bulk_end])
-                    .member_run_len();
+                    .nonmember_run_len();
                 let completed = skipped - (skipped % ASCII_WIDE_BYTES);
                 meter.charge_admitted(
                     u64::try_from(completed)
@@ -26626,10 +26626,10 @@ fn next_ascii_start_candidate(
                     }
                     continue;
                 }
-                // The run stopped either at a real ASCII member or at a high
-                // byte. Reclassify its containing block once through the
-                // exact all-byte path below, retaining every member lane and
-                // charging precisely the same block as the old loop.
+                // A real ASCII member stopped the run. Reclassify its
+                // containing block once through the exact all-byte path below,
+                // retaining every member lane and charging precisely the same
+                // block as the old loop.
             }
         }
         meter.charge_admitted(u64::try_from(ASCII_WIDE_BYTES).expect("classifier width fits u64"));
@@ -45302,7 +45302,21 @@ mod tests {
     #[test]
     fn ascii_nonmember_bulk_scan_preserves_boundaries_masks_and_exact_limits() {
         let scanner = root_scanner(scanner_for_set(byte_set(b"aceg")));
-        assert!(matches!(&scanner.scanner, StartScanner::AsciiSet { .. }));
+        let StartScanner::AsciiSet { classifier, .. } = &scanner.scanner else {
+            panic!("broad ASCII set did not retain its ASCII classifier");
+        };
+        assert_eq!(
+            classifier.nonmember_scanner().set(),
+            classifier.classifier().set()
+        );
+        let all_high = [0xff; 257];
+        assert_eq!(
+            classifier
+                .nonmember_scanner()
+                .scan_forward(&all_high)
+                .nonmember_run_len(),
+            all_high.len()
+        );
         let start = 5_usize;
         let length = 257_usize;
         let end = start.checked_add(length).unwrap();
