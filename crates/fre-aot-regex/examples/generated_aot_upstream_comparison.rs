@@ -159,6 +159,13 @@ OPTIONS:
                         forward prefix. Shapes without an interior prefix stay
                         truthfully classified as exclusions. Select only the
                         admitted rows with --route slow_partial_resource_fallback.
+  --slow-native-data-bytes N
+                        With --force-slow-partial-resource-fallback, apply the
+                        same non-zero native-data ceiling to every structurally
+                        eligible generated source. This permits fixed-budget
+                        resource screens without pattern-specific native-data
+                        limit derivation; structural state limits remain
+                        source-derived.
   --seed N               Measure one generated seed (decimal or 0x-prefixed).
                          Both grammar modes accept any new root seed.
   --grammar              Use the separate seeded grammar-generated diagnostic
@@ -196,6 +203,7 @@ struct Config {
     force_resource_fallback: bool,
     force_retained_resource_fallback: bool,
     force_slow_partial_resource_fallback: bool,
+    slow_native_data_bytes: Option<usize>,
     seed_filter: Option<u64>,
     grammar: bool,
     nested_grammar: bool,
@@ -218,6 +226,7 @@ struct PartialConfig {
     force_resource_fallback: bool,
     force_retained_resource_fallback: bool,
     force_slow_partial_resource_fallback: bool,
+    slow_native_data_bytes: Option<usize>,
     seed_filter: Option<u64>,
     grammar: bool,
     nested_grammar: bool,
@@ -238,6 +247,10 @@ impl Config {
                 }
                 Some("--force-slow-partial-resource-fallback") => {
                     partial.force_slow_partial_resource_fallback = true;
+                }
+                Some("--slow-native-data-bytes") => {
+                    partial.slow_native_data_bytes =
+                        Some(parse_next(&mut arguments, "--slow-native-data-bytes")?);
                 }
                 Some("--grammar") => partial.grammar = true,
                 Some("--nested-grammar") => partial.nested_grammar = true,
@@ -307,6 +320,17 @@ impl Config {
             partial.force_retained_resource_fallback,
             partial.force_slow_partial_resource_fallback,
         )?;
+        if partial.slow_native_data_bytes == Some(0) {
+            return Err("--slow-native-data-bytes must be non-zero".to_owned());
+        }
+        if partial.slow_native_data_bytes.is_some()
+            && !partial.force_slow_partial_resource_fallback
+        {
+            return Err(
+                "--slow-native-data-bytes requires --force-slow-partial-resource-fallback"
+                    .to_owned(),
+            );
+        }
         if warmup_rounds == 0 || bytes_per_trial == 0 || min_searches == 0 || min_trial_ns == 0 {
             return Err(
                 "warmup rounds, bytes per trial, searches, and trial duration must be non-zero"
@@ -341,6 +365,7 @@ impl Config {
             force_retained_resource_fallback: partial.force_retained_resource_fallback,
             force_slow_partial_resource_fallback: partial
                 .force_slow_partial_resource_fallback,
+            slow_native_data_bytes: partial.slow_native_data_bytes,
             seed_filter: partial.seed_filter,
             grammar: partial.grammar,
             nested_grammar: partial.nested_grammar,
@@ -2302,6 +2327,45 @@ fn compile_slow_partial_resource_probe(
     Ok((full_probe, "excluded_no_genuine_slow_partial"))
 }
 
+fn compile_slow_partial_fixed_native_data_probe(
+    pattern: &str,
+    output: OutputKind,
+    target: Target,
+    max_native_data_bytes: usize,
+) -> Result<(CompiledRegex, &'static str), String> {
+    let (planned, derivation) = compile_slow_partial_resource_probe(pattern, output, target)?;
+    if derivation.starts_with("excluded_") {
+        return Ok((planned, derivation));
+    }
+    let mut slow_limits = planned
+        .receipt()
+        .slow_aot
+        .as_ref()
+        .ok_or_else(|| "admitted slow-partial plan lost its resource receipt".to_owned())?
+        .requested_limits;
+    slow_limits.max_native_data_bytes = max_native_data_bytes;
+    let mut semantic_limits = CompileLimitsV1::default();
+    semantic_limits.determinize.max_states = 0;
+    let bounded = compile_source_aot_with_slow_limits(
+        pattern,
+        output,
+        target,
+        semantic_limits,
+        slow_limits,
+    )?;
+    let admitted = is_genuine_slow_partial(&bounded);
+    let bounded_derivation = match (derivation, admitted) {
+        ("slow_natural_resource_limit", true) => "fixed_native_natural_admitted",
+        ("slow_natural_resource_limit", false) => "fixed_native_natural_declined",
+        ("slow_forward_state_limit", true) => "fixed_native_state_limit_admitted",
+        ("slow_forward_state_limit", false) => "fixed_native_state_limit_declined",
+        ("slow_forward_state_search", true) => "fixed_native_state_search_admitted",
+        ("slow_forward_state_search", false) => "fixed_native_state_search_declined",
+        _ => return Err(format!("unknown slow-partial derivation {derivation:?}")),
+    };
+    Ok((bounded, bounded_derivation))
+}
+
 fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
     let seeded = if config.nested_grammar {
         nested_grammar_patterns(config)?
@@ -2362,11 +2426,20 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
                         compile_retained_resource_probe(&spec, config.target)?
                     }
                     ForcedFallbackMode::SlowPartial => {
-                        compile_slow_partial_resource_probe(
-                            &spec.pattern,
-                            spec.output,
-                            config.target,
-                        )
+                        if let Some(max_native_data_bytes) = config.slow_native_data_bytes {
+                            compile_slow_partial_fixed_native_data_probe(
+                                &spec.pattern,
+                                spec.output,
+                                config.target,
+                                max_native_data_bytes,
+                            )
+                        } else {
+                            compile_slow_partial_resource_probe(
+                                &spec.pattern,
+                                spec.output,
+                                config.target,
+                            )
+                        }
                         .map_err(|error| format!("{} {error}", spec.name))?
                     }
                     ForcedFallbackMode::None | ForcedFallbackMode::ZeroRows => {
@@ -2523,12 +2596,36 @@ fn compile_shapes(config: &Config) -> Result<Vec<CompiledShape>, String> {
             }
             if forced_mode == ForcedFallbackMode::SlowPartial
                 && !retained_limit_derivation.starts_with("excluded_")
-                && !is_genuine_slow_partial(&aot)
             {
-                return Err(format!(
-                    "{} derived slow-partial row failed its public receipt admission criteria",
-                    spec.name
-                ));
+                let genuine = is_genuine_slow_partial(&aot);
+                let consistent = if retained_limit_derivation.starts_with("fixed_native_") {
+                    genuine == retained_limit_derivation.ends_with("_admitted")
+                } else {
+                    genuine
+                };
+                if !consistent {
+                    return Err(format!(
+                        "{} derived slow-partial row failed its public receipt admission criteria",
+                        spec.name
+                    ));
+                }
+                if genuine && let Some(expected) = config.slow_native_data_bytes {
+                    let actual = aot
+                        .receipt()
+                        .slow_aot
+                        .as_ref()
+                        .ok_or_else(|| {
+                            format!("{} admitted fixed-native row lost its receipt", spec.name)
+                        })?
+                        .requested_limits
+                        .max_native_data_bytes;
+                    if actual != expected {
+                        return Err(format!(
+                            "{} fixed-native receipt recorded {actual} bytes, expected {expected}",
+                            spec.name
+                        ));
+                    }
+                }
             }
             Ok(CompiledShape {
                 spec,
@@ -4065,7 +4162,7 @@ fn print_partial_dfa_metadata(shapes: &[CompiledShape]) {
     // Keep the established partial-DFA row schema stable for existing matrix
     // consumers. Slow-AOT provenance is an additive comment-prefixed table.
     println!(
-        "#slow_aot_header\tpattern\tfamily\tseed\toutput\tlimit_derivation\tpresent\tpartial_admitted\trequested_max_states\teffective_max_states\tcomplete_rows\tforward_states_before_minimization\tdecline_stage\tdecline_resource\twork_completed\truntime_helper_symbols\tstatus"
+        "#slow_aot_header\tpattern\tfamily\tseed\toutput\tlimit_derivation\tpresent\tpartial_admitted\trequested_max_states\trequested_max_native_data_bytes\teffective_max_states\tcomplete_rows\tforward_states_before_minimization\tdecline_stage\tdecline_resource\twork_completed\truntime_helper_symbols\tstatus"
     );
     for shape in shapes {
         let slow = shape.aot.receipt().slow_aot.as_ref();
@@ -4092,6 +4189,7 @@ fn print_partial_dfa_metadata(shapes: &[CompiledShape]) {
             slow.is_some().to_string(),
             is_genuine_slow_partial(&shape.aot).to_string(),
             number(slow.map(|report| report.requested_limits.determinize.max_states as u64)),
+            number(slow.map(|report| report.requested_limits.max_native_data_bytes as u64)),
             number(slow.map(|report| report.determinization.effective_limits.max_states as u64)),
             number(slow.map(|report| report.dfa.forward_states as u64)),
             number(
@@ -4230,6 +4328,12 @@ fn print_environment(config: &Config, shapes: &[CompiledShape], scenario_count: 
         config.force_slow_partial_resource_fallback
     );
     println!(
+        "environment\tslow_native_data_bytes\t{}",
+        config
+            .slow_native_data_bytes
+            .map_or_else(|| "default".to_owned(), |bytes| bytes.to_string())
+    );
+    println!(
         "environment\tslow_aot_policy\t{}",
         config.forced_fallback_mode().slow_aot_policy()
     );
@@ -4279,7 +4383,7 @@ fn run(config: &Config) -> Result<(), String> {
     };
     let shapes = compile_shapes(config)?;
     eprintln!(
-        "generated comparison: {architecture}-{operating_system}, patterns={}, cells={}, feature_bits={:#x}, trials={}, bytes_per_trial={}, min_searches={}, min_trial_ns={}, smoke={}, grammar={}, nested_grammar={}, output_matrix={}, force_resource_fallback={}, force_retained_resource_fallback={}, force_slow_partial_resource_fallback={}, slow_aot_policy={}, family_filter={}, pattern_filter={}, route_filter={}, measurement_order={}, seed_filter={}",
+        "generated comparison: {architecture}-{operating_system}, patterns={}, cells={}, feature_bits={:#x}, trials={}, bytes_per_trial={}, min_searches={}, min_trial_ns={}, smoke={}, grammar={}, nested_grammar={}, output_matrix={}, force_resource_fallback={}, force_retained_resource_fallback={}, force_slow_partial_resource_fallback={}, slow_native_data_bytes={}, slow_aot_policy={}, family_filter={}, pattern_filter={}, route_filter={}, measurement_order={}, seed_filter={}",
         shapes.len(),
         shapes.len() * sizes(config).len() * positions(config).len() * densities(config).len(),
         config.target.features.bits(),
@@ -4294,6 +4398,9 @@ fn run(config: &Config) -> Result<(), String> {
         config.force_resource_fallback,
         config.force_retained_resource_fallback,
         config.force_slow_partial_resource_fallback,
+        config
+            .slow_native_data_bytes
+            .map_or_else(|| "default".to_owned(), |bytes| bytes.to_string()),
         config.forced_fallback_mode().slow_aot_policy(),
         config.family_filter.as_deref().unwrap_or("all"),
         config.pattern_filter.as_deref().unwrap_or("all"),
@@ -4365,6 +4472,7 @@ mod tests {
             force_resource_fallback: false,
             force_retained_resource_fallback: false,
             force_slow_partial_resource_fallback: false,
+            slow_native_data_bytes: None,
             seed_filter,
             grammar: true,
             nested_grammar: false,
@@ -4599,15 +4707,33 @@ mod tests {
 
     #[test]
     fn slow_partial_derivation_is_structural_and_times_the_generated_entry() {
-        const PATTERN: &str = "A(?-u:[^Z])*Z|(?:ab|cd){2,8}";
         let target = Target::x86_64_linux();
         let derive_without_name: fn(
             &str,
             OutputKind,
             Target,
         ) -> Result<(CompiledRegex, &'static str), String> = compile_slow_partial_resource_probe;
-        let (aot, derivation) = derive_without_name(PATTERN, OutputKind::SelectedEnd, target)
-            .expect("derive genuine slow partial from source structure");
+        let nested_config = generated_grammar_config(true, Some(UNSEEN_TEST_SEED), false);
+        let mut sources = nested_grammar_patterns(&nested_config)
+            .expect("generate deterministic nested structural fixtures");
+        sources.extend(grammar_patterns(&flat_grammar_config(Some(UNSEEN_TEST_SEED))));
+        let mut selected = None;
+        for spec in sources {
+            let (aot, derivation) =
+                derive_without_name(&spec.pattern, spec.output, target)
+                    .expect("probe generated source structure");
+            if matches!(
+                derivation,
+                "slow_forward_state_limit"
+                    | "slow_forward_state_search"
+                    | "slow_natural_resource_limit"
+            ) {
+                selected = Some((spec, aot, derivation));
+                break;
+            }
+        }
+        let (mut spec, aot, derivation) = selected
+            .expect("generated structural fixtures include a genuine slow partial");
         assert!(matches!(
             derivation,
             "slow_forward_state_limit"
@@ -4628,30 +4754,90 @@ mod tests {
         assert!(slow.dfa.forward_states < slow.dfa.forward_states_before_minimization);
         assert_eq!(aot.receipt().determinization.requested_limits.max_states, 0);
 
+        let fixed_native_limit = 4_096;
+        let (bounded, bounded_derivation) =
+            compile_slow_partial_fixed_native_data_probe(
+                &spec.pattern,
+                spec.output,
+                target,
+                fixed_native_limit,
+            )
+            .expect("derive the same partial graph under a fixed native-data ceiling");
+        assert!(matches!(
+            bounded_derivation,
+            "fixed_native_natural_admitted"
+                | "fixed_native_natural_declined"
+                | "fixed_native_state_limit_admitted"
+                | "fixed_native_state_limit_declined"
+                | "fixed_native_state_search_admitted"
+                | "fixed_native_state_search_declined"
+        ));
+        let bounded_admitted = is_genuine_slow_partial(&bounded);
+        assert_eq!(
+            bounded_admitted,
+            bounded_derivation.ends_with("_admitted")
+        );
+        if bounded_admitted {
+            assert_eq!(
+                bounded
+                    .receipt()
+                    .slow_aot
+                    .as_ref()
+                    .expect("bounded slow report")
+                    .requested_limits
+                    .max_native_data_bytes,
+                fixed_native_limit
+            );
+        } else {
+            assert!(bounded.receipt().slow_aot.is_none());
+        }
+
         let entry = aot.module().entry_symbol().to_owned();
+        let prepared_entry = aot
+            .module()
+            .prepared_entry_symbol()
+            .map(str::to_owned);
         let (runtime_symbol, runtime_bytes) = aot
             .module()
             .required_runtime_program()
             .map(|(symbol, bytes)| (symbol.to_owned(), bytes))
-            .expect("current whole-search slow-partial wrapper program");
-        assert!(aot.module().prepared_entry_symbol().is_none());
+            .expect("slow-partial runtime program");
+        spec.name = "arbitrary_renamed_source".to_owned();
+        spec.base_name = spec.name.clone();
         let shape = compiled_test_shape(
-            renamed_test_spec(PATTERN, OutputKind::SelectedEnd, "arbitrary_renamed_source"),
+            spec,
             aot,
             "slow_aot_partial",
             derivation,
         );
         assert_eq!(shape.route(), "slow_partial_resource_fallback");
         assert_eq!(shape.score_scope(), "slow_aot_partial_generated_entry");
+        assert_eq!(
+            shape.timed_entry_scope(),
+            if prepared_entry.is_some() {
+                "prepared_compiled"
+            } else {
+                "runtime_dependent_compiled"
+            }
+        );
         assert!(shape.is_compiled_primary());
 
         let source = build_c_harness(&flat_grammar_config(None), &[shape], &[]);
         assert!(source.contains(&format!(
             "extern uint32_t {entry}(const unsigned char *"
         )));
+        let prepared_initializer = prepared_entry.as_deref().unwrap_or("NULL");
         assert!(source.contains(&format!(
-            "{{\"arbitrary_renamed_source\", {entry}, NULL, {runtime_symbol}, {runtime_bytes}, 0"
+            "{{\"arbitrary_renamed_source\", {entry}, {prepared_initializer}, {runtime_symbol}, {runtime_bytes}, 0"
         )));
+        if let Some(prepared_entry) = prepared_entry {
+            assert!(source.contains(&format!(
+                "extern uint32_t {prepared_entry}(exclusive_handle"
+            )));
+        }
+        assert!(source.contains(
+            "return shape->prepared_direct(shape->prepared, haystack, length, 0U, length, result);"
+        ));
         assert!(source.contains("return shape->direct(haystack, length, 0U, length, result);"));
     }
 
