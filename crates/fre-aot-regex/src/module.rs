@@ -3196,9 +3196,10 @@ const fn static_prefix_can_defer_preflight(
 /// prepared runtime. The static table and exact continuation frontiers are
 /// compiler-owned and immutable; both remain absent from the stable semantic
 /// format. Every route authenticates the exact artifact before native entry.
-/// Complete-proof and variable-width Span programs bind eagerly; otherwise
-/// graph admission is deferred until an actual hole and continues from its
-/// first unconsumed byte.
+/// Complete-proof programs bind eagerly. Proof-free variable-width Span
+/// programs defer graph admission until either an actual hole or an
+/// authoritative native endpoint requires recovery; hole continuation starts
+/// from its first unconsumed byte.
 #[allow(
     clippy::too_many_lines,
     reason = "serialized program, static table, authenticated prepared entry, and local native core form one transaction"

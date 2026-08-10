@@ -5612,6 +5612,7 @@ mod tests {
             "fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_continue_v2",
             "fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_recover_span_v1",
             "fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_recover_span_v2",
+            "fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_recover_span_v3",
             "fre_aot_regex_runtime_search_exclusive_dynamic_rows_deopt_v1",
             "fre_aot_regex_runtime_search_exclusive_dynamic_rows_continue_v1",
             "fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1",
@@ -5727,6 +5728,18 @@ mod tests {
             usize,
         ) -> u32 =
             fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_recover_span_v2;
+        let _: unsafe extern "C" fn(
+            FreAotRegexExclusiveHandleV1,
+            *const u8,
+            usize,
+            usize,
+            usize,
+            *mut FreAotRegexResultV1,
+            *const u8,
+            usize,
+            u64,
+        ) -> u32 =
+            fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_recover_span_v3;
         let _: unsafe extern "C" fn(
             FreAotRegexExclusiveHandleV1,
             *const u8,
