@@ -5718,16 +5718,21 @@ fn native_column_quotient_retry_plan(
         encoded_hole_states,
         architecture,
     );
-    let quotient = select_native_table_encoding_with_holes_for_architecture(
-        plan.class_count(),
-        forward_states,
-        0,
-        encoded_hole_states,
-        architecture,
+    // Admission is based on the smallest exact class-mapped quotient, not on
+    // the ordinary hot-loop selector. The latter may deliberately choose a
+    // larger DirectByte image; if that image crosses the user's data cap, the
+    // builder retries this same quotient without the expansion.
+    let quotient = (
+        TransitionLayout::ClassMapped,
+        select_native_cell_encoding_with_holes_for_architecture(
+            TransitionLayout::ClassMapped,
+            plan.class_count(),
+            forward_states,
+            0,
+            encoded_hole_states,
+            architecture,
+        ),
     );
-    if quotient.0 != TransitionLayout::ClassMapped {
-        return None;
-    }
     let dense_bytes = native_machine_bytes(
         dense.0,
         dense.1,
@@ -8395,8 +8400,8 @@ fn build_native_dfa_table_with_cost_model_and_data_limit(
     let column_quotient =
         native_column_quotient_retry_plan(view, architecture, &dense_error);
     if let Some(column_quotient) = column_quotient.as_ref() {
-        if let Some(exact_rows) = exact_rows.as_ref()
-            && let Ok(lowering) =
+        if let Some(exact_rows) = exact_rows.as_ref() {
+            if let Ok(lowering) =
                 build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
                     view,
                     architecture,
@@ -8408,6 +8413,37 @@ fn build_native_dfa_table_with_cost_model_and_data_limit(
                     false,
                     Some(column_quotient),
                 )
+            {
+                return Ok(lowering);
+            }
+            if let Ok(lowering) =
+                build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
+                    view,
+                    architecture,
+                    vector_cost_model,
+                    relation_vector_owns_route,
+                    max_native_data_bytes,
+                    None,
+                    Some(exact_rows),
+                    true,
+                    Some(column_quotient),
+                )
+            {
+                return Ok(lowering);
+            }
+        }
+        if let Ok(lowering) =
+            build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
+                view,
+                architecture,
+                vector_cost_model,
+                relation_vector_owns_route,
+                max_native_data_bytes,
+                None,
+                None,
+                false,
+                Some(column_quotient),
+            )
         {
             return Ok(lowering);
         }
@@ -8420,7 +8456,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit(
                 max_native_data_bytes,
                 None,
                 None,
-                false,
+                true,
                 Some(column_quotient),
             )
         {
@@ -8490,10 +8526,11 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
 ) -> Result<(Vec<u8>, NativeDfaLayout), ObjectError> {
     let dfa = view.dfa;
     if force_class_mapped
-        && (default_exceptions.is_some() || exact_rows.is_none() || column_quotient.is_some())
+        && (default_exceptions.is_some()
+            || exact_rows.is_none() && column_quotient.is_none())
     {
         return Err(ObjectError::InvalidModule(
-            "forced mapped retry is not an exact-row quotient",
+            "forced mapped retry has no exact row or column quotient",
         ));
     }
     if dfa.initial_state != 0 || dfa.class_count == 0 || dfa.class_count > 256 {
@@ -8704,7 +8741,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
             TransitionLayout::ClassMapped,
             select_native_cell_encoding_with_holes_for_architecture(
                 TransitionLayout::ClassMapped,
-                dfa.class_count,
+                table_class_count,
                 physical_forward_states,
                 0,
                 encoded_hole_states,
@@ -37194,7 +37231,7 @@ mod tests {
             maximum,
             None,
             Some(&exact_rows),
-            false,
+            true,
             Some(&column_quotient),
         )
     }
@@ -38234,6 +38271,159 @@ mod tests {
             Target::x86_64_linux(),
         )
         .is_err());
+    }
+
+    #[test]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::too_many_lines,
+        reason = "the fixed quotient geometry and exact cap transaction share one regression oracle"
+    )]
+    fn column_quotient_retries_mapped_when_direct_byte_crosses_the_cap() {
+        const CLASS_COUNT: usize = 96;
+        const QUOTIENT_CLASSES: usize = 48;
+        const COMPLETE_ROWS: usize = 8;
+        const DISCOVERED_STATES: usize = COMPLETE_ROWS + 2;
+
+        let compiled = compile_uniform_default_base(OutputContract::SelectedEnd);
+        let base = compiled
+            .program()
+            .native_dfa_view()
+            .expect("mapped-quotient base native view");
+        let byte_classes = core::array::from_fn(|byte| {
+            u8::try_from(byte % CLASS_COUNT).unwrap()
+        });
+        let class_representatives = (0..CLASS_COUNT)
+            .map(|class| u8::try_from(class).unwrap())
+            .collect::<Vec<_>>();
+        let mut forward_cells = Vec::with_capacity(COMPLETE_ROWS * CLASS_COUNT);
+        for state in 0..COMPLETE_ROWS {
+            for class in 0..CLASS_COUNT {
+                let quotient = class / 2;
+                let accepted = state < 6 && quotient & (1 << state) != 0;
+                forward_cells.push(ForwardCell::new(
+                    u32::try_from(state).unwrap(),
+                    accepted,
+                ));
+            }
+        }
+        let view = NativeProgramView {
+            dfa: NativeDfaView {
+                initial_state: 0,
+                initial_pending: false,
+                initial_terminal: false,
+                byte_classes: &byte_classes,
+                class_count: CLASS_COUNT,
+                class_representatives: &class_representatives,
+                forward_cells: &forward_cells,
+                reverse_initial: None,
+                reverse_cells: &[],
+            },
+            partial_discovered_states: Some(DISCOVERED_STATES),
+            collapse_partial_holes: false,
+            exact_match_width: None,
+            max_match_width: None,
+            exact_product_width: None,
+            retained_prefix_requirement: None,
+            retained_suffix_requirement: None,
+            ..base
+        };
+        let plan = derive_native_column_quotient_plan(
+            view.dfa,
+            view.partial_discovered_states,
+            false,
+        )
+        .expect("exact paired-column quotient");
+        assert_eq!(plan.class_count(), QUOTIENT_CLASSES);
+        assert!(derive_native_exact_row_intern_plan(
+            view.dfa,
+            view.partial_discovered_states,
+            false,
+        )
+        .is_none());
+
+        for architecture in [Architecture::X86_64, Architecture::Aarch64] {
+            let allocation = ObjectError::Allocation("synthetic direct-byte pressure");
+            assert!(native_column_quotient_retry_plan(view, architecture, &allocation).is_some());
+            let dense = build_native_dfa_table_with_cost_model_and_data_limit_once(
+                view,
+                architecture,
+                NativeVectorFilterCostModel::Established,
+                true,
+                usize::MAX,
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                select_native_table_encoding_with_holes_for_architecture(
+                    plan.class_count(),
+                    COMPLETE_ROWS,
+                    0,
+                    DISCOVERED_STATES - COMPLETE_ROWS,
+                    architecture,
+                )
+                .0,
+                TransitionLayout::DirectByte,
+                "{architecture:?}",
+            );
+            let natural =
+                build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
+                    view,
+                    architecture,
+                    NativeVectorFilterCostModel::Established,
+                    true,
+                    usize::MAX,
+                    None,
+                    None,
+                    false,
+                    Some(&plan),
+                );
+            let mapped =
+                build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
+                    view,
+                    architecture,
+                    NativeVectorFilterCostModel::Established,
+                    true,
+                    usize::MAX,
+                    None,
+                    None,
+                    true,
+                    Some(&plan),
+                )
+                .unwrap();
+            assert_eq!(dense.1.transitions, TransitionLayout::DirectByte);
+            assert!(matches!(natural, Err(ObjectError::InvalidModule(_))));
+            assert_eq!(mapped.1.transitions, TransitionLayout::ClassMapped);
+            assert!(mapped.0.len() < dense.0.len(), "{architecture:?}");
+            assert_eq!(
+                build_native_dfa_table_with_cost_model_and_data_limit(
+                    view,
+                    architecture,
+                    NativeVectorFilterCostModel::Established,
+                    true,
+                    mapped.0.len(),
+                )
+                .unwrap(),
+                mapped,
+                "{architecture:?}",
+            );
+            let below = mapped.0.len() - 1;
+            let declined = build_native_dfa_table_with_cost_model_and_data_limit(
+                view,
+                architecture,
+                NativeVectorFilterCostModel::Established,
+                true,
+                below,
+            );
+            assert!(matches!(
+                declined,
+                Err(ObjectError::Resource {
+                    resource: crate::CompileResource::ProgramBytes,
+                    limit,
+                    ..
+                }) if limit == below
+            ), "{architecture:?}: {declined:?}");
+        }
     }
 
     #[test]
@@ -54274,6 +54464,9 @@ int main(void){{
                             NativeDefaultExceptionKeys::Bytes => {
                                 TransitionLayout::DefaultByteSparseExceptions(expected_capacity)
                             }
+                            NativeDefaultExceptionKeys::Boundaries => {
+                                TransitionLayout::DefaultByteBoundaries(expected_capacity)
+                            }
                         },
                         "{architecture:?}",
                     );
@@ -54338,17 +54531,18 @@ int main(void){{
                         true,
                         sparse.0.len() - 1,
                     );
-                    assert!(
-                        matches!(
-                            below,
-                            Err(ObjectError::Resource {
-                                resource: crate::CompileResource::ProgramBytes,
-                                limit,
-                                ..
-                            }) if limit == sparse.0.len() - 1
-                        ),
-                        "{architecture:?}: {below:?}"
-                    );
+                    match below {
+                        Ok(smaller) => {
+                            assert!(smaller.0.len() < sparse.0.len(), "{architecture:?}");
+                            assert_eq!(smaller.1.transitions, TransitionLayout::ClassMapped);
+                        }
+                        Err(ObjectError::Resource {
+                            resource: crate::CompileResource::ProgramBytes,
+                            limit,
+                            ..
+                        }) => assert_eq!(limit, sparse.0.len() - 1, "{architecture:?}"),
+                        Err(error) => panic!("unexpected retry error on {architecture:?}: {error:?}"),
+                    }
                     let allocation =
                         ObjectError::Allocation("synthetic scalable sparse allocation pressure");
                     assert_eq!(
@@ -55955,7 +56149,8 @@ int main(void){{
                         + quotient_class * layout.cells.bytes();
                     let packed = match layout.cells {
                         NativeCellEncoding::Compact16
-                        | NativeCellEncoding::Compact16Indexed(_) => u32::from(
+                        | NativeCellEncoding::Compact16Indexed(_)
+                        | NativeCellEncoding::Compact16Ordinal(_) => u32::from(
                             u16::from_le_bytes(
                                 quotient.0[offset..offset + 2].try_into().unwrap(),
                             ),
