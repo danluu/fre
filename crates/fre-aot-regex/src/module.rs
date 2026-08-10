@@ -4339,6 +4339,17 @@ const DIRECT_COMPACT_MAX_STATES: usize = 63;
 /// target-structural margins are independent of benchmark inputs.
 const X86_INDEXED_MAX_WIDE_FOOTPRINT_NUMERATOR: usize = 3;
 const X86_INDEXED_MAX_WIDE_FOOTPRINT_DENOMINATOR: usize = 4;
+/// Physical-row ordinals retain the exact compact cell load but replace a
+/// cheap power-of-two address shift with an arbitrary-stride multiply. Keep
+/// them on tables already larger than the ordinary L1 share and demand the
+/// same one-quarter minimum saving used by x86 indexed rows. `AArch64` may also
+/// replace an already-admitted padded indexed table when removing padding
+/// saves at least one third of that table: the hot instruction count remains
+/// one address-forming instruction (`MADD` instead of shifted `ADD`), while a
+/// single entry setup retains the row stride in a caller-saved register.
+const ORDINAL_MIN_WIDE_FOOTPRINT: usize = DIRECT_BYTE_TABLE_BUDGET;
+const AARCH64_ORDINAL_MAX_INDEXED_FOOTPRINT_NUMERATOR: usize = 2;
+const AARCH64_ORDINAL_MAX_INDEXED_FOOTPRINT_DENOMINATOR: usize = 3;
 const NO_DFA_STATE: u32 = u32::MAX;
 /// Optional reverse sidecars remain a bounded optimization artifact. The
 /// portable constructor accounts for eight-byte logical cells, while native
@@ -5191,12 +5202,18 @@ fn native_exact_row_intern_retry_plan(
 /// without growing the former wide table. Complete direct-byte tables may
 /// instead store one byte per cell and scale their six-bit row token by the
 /// fixed 256-byte row width in generated code.
+/// A non-power-of-two class row may retain its exact unpadded halfword stride
+/// and encode the physical row ordinal. Its class-map prefix is rounded up to
+/// that stride, so multiplying the zero-based token by the stride produces an
+/// absolute table address without a second bias. This form is admitted only
+/// by a target-specific code/data cost comparison.
 /// Seeded-reverse sidecars have an independent representation and remain wide.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NativeCellEncoding {
     Compact8Direct,
     Compact16,
     Compact16Indexed(u8),
+    Compact16Ordinal(u16),
     Wide32,
 }
 
@@ -5204,7 +5221,9 @@ impl NativeCellEncoding {
     const fn bytes(self) -> usize {
         match self {
             Self::Compact8Direct => core::mem::size_of::<u8>(),
-            Self::Compact16 | Self::Compact16Indexed(_) => core::mem::size_of::<u16>(),
+            Self::Compact16 | Self::Compact16Indexed(_) | Self::Compact16Ordinal(_) => {
+                core::mem::size_of::<u16>()
+            }
             Self::Wide32 => core::mem::size_of::<u32>(),
         }
     }
@@ -5212,7 +5231,9 @@ impl NativeCellEncoding {
     const fn accepts(self) -> u32 {
         match self {
             Self::Compact8Direct => DIRECT_COMPACT_CELL_ACCEPTS,
-            Self::Compact16 | Self::Compact16Indexed(_) => COMPACT_CELL_ACCEPTS,
+            Self::Compact16 | Self::Compact16Indexed(_) | Self::Compact16Ordinal(_) => {
+                COMPACT_CELL_ACCEPTS
+            }
             Self::Wide32 => CELL_ACCEPTS,
         }
     }
@@ -5220,7 +5241,9 @@ impl NativeCellEncoding {
     const fn accelerated(self) -> u32 {
         match self {
             Self::Compact8Direct => DIRECT_COMPACT_CELL_ACCELERATED,
-            Self::Compact16 | Self::Compact16Indexed(_) => COMPACT_CELL_ACCELERATED,
+            Self::Compact16 | Self::Compact16Indexed(_) | Self::Compact16Ordinal(_) => {
+                COMPACT_CELL_ACCELERATED
+            }
             Self::Wide32 => CELL_ACCELERATED,
         }
     }
@@ -5228,7 +5251,9 @@ impl NativeCellEncoding {
     const fn next_mask(self) -> u32 {
         match self {
             Self::Compact8Direct => DIRECT_COMPACT_CELL_NEXT_MASK,
-            Self::Compact16 | Self::Compact16Indexed(_) => COMPACT_CELL_NEXT_MASK,
+            Self::Compact16 | Self::Compact16Indexed(_) | Self::Compact16Ordinal(_) => {
+                COMPACT_CELL_NEXT_MASK
+            }
             Self::Wide32 => CELL_NEXT_MASK,
         }
     }
@@ -5236,7 +5261,7 @@ impl NativeCellEncoding {
     const fn accepts_bit(self) -> u8 {
         match self {
             Self::Compact8Direct => 7,
-            Self::Compact16 | Self::Compact16Indexed(_) => 15,
+            Self::Compact16 | Self::Compact16Indexed(_) | Self::Compact16Ordinal(_) => 15,
             Self::Wide32 => 31,
         }
     }
@@ -5244,7 +5269,7 @@ impl NativeCellEncoding {
     const fn accelerated_bit(self) -> u8 {
         match self {
             Self::Compact8Direct => 6,
-            Self::Compact16 | Self::Compact16Indexed(_) => 14,
+            Self::Compact16 | Self::Compact16Indexed(_) | Self::Compact16Ordinal(_) => 14,
             Self::Wide32 => 30,
         }
     }
@@ -5253,11 +5278,12 @@ impl NativeCellEncoding {
         self.accelerated_bit()
     }
 
-    const fn row_token_scale(self) -> usize {
+    fn row_token_scale(self) -> usize {
         match self {
             Self::Compact8Direct => DIRECT_BYTE_ROW_CELLS,
             Self::Compact16 => core::mem::size_of::<u16>(),
             Self::Compact16Indexed(shift) => 1_usize << shift,
+            Self::Compact16Ordinal(row_bytes) => usize::from(row_bytes),
             Self::Wide32 => 1,
         }
     }
@@ -5265,7 +5291,10 @@ impl NativeCellEncoding {
     const fn is_compact(self) -> bool {
         matches!(
             self,
-            Self::Compact8Direct | Self::Compact16 | Self::Compact16Indexed(_)
+            Self::Compact8Direct
+                | Self::Compact16
+                | Self::Compact16Indexed(_)
+                | Self::Compact16Ordinal(_)
         )
     }
 
@@ -5285,7 +5314,10 @@ impl NativeCellEncoding {
     const fn x86_accept_branch(self) -> u8 {
         match self {
             // The compact accept flag is not the sign bit of EAX.
-            Self::Compact8Direct | Self::Compact16 | Self::Compact16Indexed(_) => 0x85, // JNZ
+            Self::Compact8Direct
+            | Self::Compact16
+            | Self::Compact16Indexed(_)
+            | Self::Compact16Ordinal(_) => 0x85, // JNZ
             Self::Wide32 => 0x88,    // JS
         }
     }
@@ -5342,7 +5374,16 @@ fn native_row_bytes(
             (1_usize.checked_shl(u32::from(shift))? == physical_row_bytes)
                 .then_some(physical_row_bytes)
         }
-        (TransitionLayout::DirectByte, NativeCellEncoding::Compact16Indexed(_)) => None,
+        (TransitionLayout::ClassMapped, NativeCellEncoding::Compact16Ordinal(row_bytes)) => {
+            let logical_row_bytes = class_count
+                .checked_mul(core::mem::size_of::<u16>())
+                .filter(|&bytes| bytes != 0 && !bytes.is_power_of_two())?;
+            (logical_row_bytes == usize::from(row_bytes)).then_some(logical_row_bytes)
+        }
+        (
+            TransitionLayout::DirectByte,
+            NativeCellEncoding::Compact16Indexed(_) | NativeCellEncoding::Compact16Ordinal(_),
+        ) => None,
         _ => transitions.row_cells(class_count).checked_mul(cells.bytes()),
     }
 }
@@ -5374,7 +5415,17 @@ fn native_table_prefix_bytes(
                 .is_multiple_of(row_bytes)
                 .then_some(prefix_bytes)
         }
-        (TransitionLayout::DirectByte, NativeCellEncoding::Compact16Indexed(_)) => None,
+        (TransitionLayout::ClassMapped, NativeCellEncoding::Compact16Ordinal(_)) => {
+            let row_bytes = native_row_bytes(transitions, cells, class_count)?;
+            prefix
+                .checked_add(row_bytes.checked_sub(1)?)?
+                .checked_div(row_bytes)?
+                .checked_mul(row_bytes)
+        }
+        (
+            TransitionLayout::DirectByte,
+            NativeCellEncoding::Compact16Indexed(_) | NativeCellEncoding::Compact16Ordinal(_),
+        ) => None,
         _ => Some(prefix),
     }
 }
@@ -5408,9 +5459,9 @@ fn encode_native_row_offset(row_offset: usize, cells: NativeCellEncoding) -> Opt
 }
 
 /// Select the narrowest cell that can encode every row address in the final
-/// ordinary machine. The proof uses exact byte offsets for both the forward
-/// and retained reverse tables; arithmetic failure conservatively retains the
-/// wide representation.
+/// ordinary machine. The proof uses exact byte-offset or physical-row tokens
+/// for the forward table and exact byte offsets for any retained reverse
+/// table; arithmetic failure conservatively retains the wide representation.
 #[cfg(test)]
 fn select_native_cell_encoding(
     transitions: TransitionLayout,
@@ -5462,6 +5513,10 @@ fn select_native_cell_encoding_with_holes(
     )
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "all encoding candidates share one checked token and footprint comparison"
+)]
 fn select_native_cell_encoding_with_holes_for_architecture(
     transitions: TransitionLayout,
     class_count: usize,
@@ -5531,94 +5586,161 @@ fn select_native_cell_encoding_with_holes_for_architecture(
         .and_then(|token| u32::try_from(token).ok())
         .is_some_and(|token| token < COMPACT_CELL_NEXT_MASK)
     {
-        NativeCellEncoding::Compact16
-    } else if transitions == TransitionLayout::ClassMapped
-        && (resume_states == 0 || retained_reverse_states == 0)
+        return NativeCellEncoding::Compact16;
+    }
+    if transitions != TransitionLayout::ClassMapped
+        || (resume_states != 0 && retained_reverse_states != 0)
     {
-        // In an incomplete table, materialized row tokens and retained hole
-        // tokens share one ordinal space. The first hole immediately follows
-        // the final padded row, so subtracting `hole_token_base` still yields
-        // the existing zero-based continuation key. Bit 14 keeps every hole
-        // on the exceptional edge before generated code can decode it as an
-        // address. Partial native views never retain reverse rows.
-        compact_row_bytes
-            .checked_next_power_of_two()
-            .and_then(|indexed_row_bytes| {
-                let shift = u8::try_from(indexed_row_bytes.trailing_zeros()).ok()?;
-                let cells = NativeCellEncoding::Compact16Indexed(shift);
-                let forward_offset = CLASS_MAP_BYTES.max(indexed_row_bytes);
-                let reverse_offset = forward_states
-                    .checked_mul(indexed_row_bytes)
-                    .and_then(|bytes| forward_offset.checked_add(bytes))?;
-                let forward = last_token(
-                    forward_offset,
-                    forward_states,
+        return NativeCellEncoding::Wide32;
+    }
+
+    // In an incomplete table, materialized row tokens and retained hole
+    // tokens share one ordinal space. The first hole immediately follows the
+    // final physical row, so subtracting `hole_token_base` still yields the
+    // existing zero-based continuation key. Bit 14 keeps every hole on the
+    // exceptional edge before generated code can decode it as an address.
+    // Partial native views never retain reverse rows.
+    let indexed = compact_row_bytes
+        .checked_next_power_of_two()
+        .and_then(|indexed_row_bytes| {
+            let shift = u8::try_from(indexed_row_bytes.trailing_zeros()).ok()?;
+            let cells = NativeCellEncoding::Compact16Indexed(shift);
+            let forward_offset = CLASS_MAP_BYTES.max(indexed_row_bytes);
+            let reverse_offset = forward_states
+                .checked_mul(indexed_row_bytes)
+                .and_then(|bytes| forward_offset.checked_add(bytes))?;
+            let forward = last_token(
+                forward_offset,
+                forward_states,
+                indexed_row_bytes,
+                cells,
+            );
+            let reverse = if retained_reverse_states == 0 {
+                Some(0)
+            } else {
+                last_token(
+                    reverse_offset,
+                    retained_reverse_states,
                     indexed_row_bytes,
                     cells,
-                );
-                let reverse = if retained_reverse_states == 0 {
-                    Some(0)
-                } else {
-                    last_token(
-                        reverse_offset,
-                        retained_reverse_states,
-                        indexed_row_bytes,
-                        cells,
-                    )
-                };
-                let fits_token = reverse
-                    .zip(forward)
-                    .and_then(|(reverse, forward)| {
-                        reverse.max(forward).checked_add(resume_states)
-                    })
-                    .and_then(|token| u32::try_from(token).ok())
-                    .is_some_and(|token| token < COMPACT_CELL_NEXT_MASK);
-                let footprints = native_machine_bytes(
-                    transitions,
-                    cells,
-                    class_count,
-                    forward_states,
-                    retained_reverse_states,
                 )
-                .zip(native_machine_bytes(
-                    transitions,
-                    NativeCellEncoding::Wide32,
-                    class_count,
-                    forward_states,
-                    retained_reverse_states,
-                ));
-                let target_worthwhile = footprints.is_some_and(|(indexed, wide)| {
-                    if indexed > wide {
-                        return false;
-                    }
-                    if architecture == Architecture::Aarch64 {
-                        return true;
-                    }
-                    let meaningfully_smaller = indexed < wide
-                        && indexed
-                            .checked_mul(X86_INDEXED_MAX_WIDE_FOOTPRINT_DENOMINATOR)
-                            .zip(
-                                wide.checked_mul(
-                                    X86_INDEXED_MAX_WIDE_FOOTPRINT_NUMERATOR,
-                                ),
-                            )
-                            .is_some_and(|(indexed, wide)| indexed <= wide);
-                    if resume_states == 0 {
-                        return meaningfully_smaller;
-                    }
-                    // x86-64 pays one dependent shift to turn an ordinal into
-                    // a padded row address. Admit an incomplete table only
-                    // when it retains at least half of Compact16's ideal
-                    // one-half footprint saving over Wide32 and the former
-                    // table is already outside the conservative L1 share.
-                    meaningfully_smaller && wide > DIRECT_BYTE_TABLE_BUDGET
-                });
-                (fits_token && target_worthwhile).then_some(cells)
-            })
-            .unwrap_or(NativeCellEncoding::Wide32)
-    } else {
-        NativeCellEncoding::Wide32
+            };
+            let fits_token = reverse
+                .zip(forward)
+                .and_then(|(reverse, forward)| {
+                    reverse.max(forward).checked_add(resume_states)
+                })
+                .and_then(|token| u32::try_from(token).ok())
+                .is_some_and(|token| token < COMPACT_CELL_NEXT_MASK);
+            let footprints = native_machine_bytes(
+                transitions,
+                cells,
+                class_count,
+                forward_states,
+                retained_reverse_states,
+            )
+            .zip(native_machine_bytes(
+                transitions,
+                NativeCellEncoding::Wide32,
+                class_count,
+                forward_states,
+                retained_reverse_states,
+            ));
+            let target_worthwhile = footprints.is_some_and(|(indexed, wide)| {
+                if indexed > wide {
+                    return false;
+                }
+                if architecture == Architecture::Aarch64 {
+                    return true;
+                }
+                let meaningfully_smaller = indexed < wide
+                    && indexed
+                        .checked_mul(X86_INDEXED_MAX_WIDE_FOOTPRINT_DENOMINATOR)
+                        .zip(
+                            wide.checked_mul(X86_INDEXED_MAX_WIDE_FOOTPRINT_NUMERATOR),
+                        )
+                        .is_some_and(|(indexed, wide)| indexed <= wide);
+                if resume_states == 0 {
+                    return meaningfully_smaller;
+                }
+                // x86-64 pays one dependent shift to turn an ordinal into a
+                // padded row address. Admit an incomplete table only when it
+                // retains at least half of Compact16's ideal one-half
+                // footprint saving over Wide32 and the former table is
+                // already outside the conservative L1 share.
+                meaningfully_smaller && wide > DIRECT_BYTE_TABLE_BUDGET
+            });
+            (fits_token && target_worthwhile).then_some(cells)
+        })
+        .unwrap_or(NativeCellEncoding::Wide32);
+
+    let ordinal = (retained_reverse_states == 0 && !compact_row_bytes.is_power_of_two())
+        .then(|| {
+            let row_bytes = u16::try_from(compact_row_bytes).ok()?;
+            let cells = NativeCellEncoding::Compact16Ordinal(row_bytes);
+            let forward_offset = native_table_prefix_bytes(transitions, cells, class_count)?;
+            let forward = last_token(
+                forward_offset,
+                forward_states,
+                compact_row_bytes,
+                cells,
+            )?;
+            let fits_token = forward
+                .checked_add(resume_states)
+                .and_then(|token| u32::try_from(token).ok())
+                .is_some_and(|token| token < COMPACT_CELL_NEXT_MASK);
+            let ordinal_bytes = native_machine_bytes(
+                transitions,
+                cells,
+                class_count,
+                forward_states,
+                0,
+            )?;
+            let wide_bytes = native_machine_bytes(
+                transitions,
+                NativeCellEncoding::Wide32,
+                class_count,
+                forward_states,
+                0,
+            )?;
+            let worthwhile = wide_bytes > ORDINAL_MIN_WIDE_FOOTPRINT
+                && ordinal_bytes
+                    .checked_mul(X86_INDEXED_MAX_WIDE_FOOTPRINT_DENOMINATOR)
+                    .zip(
+                        wide_bytes
+                            .checked_mul(X86_INDEXED_MAX_WIDE_FOOTPRINT_NUMERATOR),
+                    )
+                    .is_some_and(|(ordinal, wide)| ordinal <= wide);
+            (fits_token && worthwhile).then_some((cells, ordinal_bytes))
+        })
+        .flatten();
+
+    if architecture == Architecture::Aarch64
+        && indexed != NativeCellEncoding::Wide32
+        && let Some((ordinal, ordinal_bytes)) = ordinal
+        && native_machine_bytes(
+            transitions,
+            indexed,
+            class_count,
+            forward_states,
+            0,
+        )
+        .and_then(|indexed_bytes| {
+            ordinal_bytes
+                .checked_mul(AARCH64_ORDINAL_MAX_INDEXED_FOOTPRINT_DENOMINATOR)
+                .zip(
+                    indexed_bytes
+                        .checked_mul(AARCH64_ORDINAL_MAX_INDEXED_FOOTPRINT_NUMERATOR),
+                )
+        })
+        .is_some_and(|(ordinal, indexed)| ordinal <= indexed)
+    {
+        return ordinal;
     }
+    if indexed != NativeCellEncoding::Wide32 {
+        return indexed;
+    }
+    ordinal.map_or(NativeCellEncoding::Wide32, |(cells, _)| cells)
 }
 
 #[cfg(test)]
@@ -10935,7 +11057,9 @@ fn append_native_packed_cell(
                 .map_err(|_| ObjectError::InvalidModule("byte-compact native cell overflowed"))?;
             bytes.push(packed);
         }
-        NativeCellEncoding::Compact16 | NativeCellEncoding::Compact16Indexed(_) => {
+        NativeCellEncoding::Compact16
+        | NativeCellEncoding::Compact16Indexed(_)
+        | NativeCellEncoding::Compact16Ordinal(_) => {
             let packed = u16::try_from(packed)
                 .map_err(|_| ObjectError::InvalidModule("compact native cell overflowed"))?;
             bytes.extend_from_slice(&packed.to_le_bytes());
@@ -11805,7 +11929,9 @@ fn x86_emit_table_lookup(
             // eax = zero_extend(packed_row[byte])
             assembler.instruction(&[0x41, 0x0f, 0xb6, 0x04, 0x02])?;
         }
-        NativeCellEncoding::Compact16 | NativeCellEncoding::Compact16Indexed(_) => {
+        NativeCellEncoding::Compact16
+        | NativeCellEncoding::Compact16Indexed(_)
+        | NativeCellEncoding::Compact16Ordinal(_) => {
             // eax = zero_extend(packed_row[class_or_byte])
             assembler.instruction(&[0x41, 0x0f, 0xb7, 0x04, 0x42])?;
         }
@@ -11846,7 +11972,9 @@ fn x86_emit_compact_zero_based_classifier(
                 .map_err(|_| ObjectError::InvalidModule("byte-compact classifier overflowed"))?;
             assembler.instruction(&[0x3c, maximum])?; // cmp al, next_mask - 1
         }
-        NativeCellEncoding::Compact16 | NativeCellEncoding::Compact16Indexed(_) => {
+        NativeCellEncoding::Compact16
+        | NativeCellEncoding::Compact16Indexed(_)
+        | NativeCellEncoding::Compact16Ordinal(_) => {
             let mut compare = vec![0x3d]; // cmp eax, next_mask - 1
             compare.extend_from_slice(&cells.next_mask().saturating_sub(1).to_le_bytes());
             assembler.instruction(&compare)?;
@@ -11857,6 +11985,80 @@ fn x86_emit_compact_zero_based_classifier(
             ));
         }
     }
+    Ok(())
+}
+
+/// Scale a zero-based compact row ordinal and add the table base.
+///
+/// The table prefix is an exact multiple of `row_bytes`, so the token already
+/// includes every physical prefix row. Factor class counts of 3, 5, or 9 use
+/// one LEA followed by the address LEA. All other counts use one immediate
+/// IMUL followed by the same scaled address LEA. The 14-bit token and at-most
+/// 256 graph classes prove the 32-bit product cannot wrap.
+fn x86_emit_set_row_from_compact_ordinal(
+    assembler: &mut X86Assembler,
+    row_bytes: u16,
+) -> Result<(), ObjectError> {
+    let row_bytes = usize::from(row_bytes);
+    if row_bytes == 0
+        || row_bytes.is_power_of_two()
+        || !row_bytes.is_multiple_of(core::mem::size_of::<u16>())
+    {
+        return Err(ObjectError::InvalidModule(
+            "x86 compact ordinal row stride",
+        ));
+    }
+    let class_count = row_bytes
+        .checked_div(core::mem::size_of::<u16>())
+        .filter(|&classes| (1..=CLASS_MAP_BYTES).contains(&classes))
+        .ok_or(ObjectError::InvalidModule(
+            "x86 compact ordinal class count",
+        ))?;
+    let power = class_count.trailing_zeros();
+    let odd = class_count >> power;
+    let address_shift = power
+        .checked_add(1)
+        .filter(|&shift| shift <= 3);
+    let address_scale = if let Some(address_shift) = address_shift
+        && matches!(odd, 3 | 5 | 9)
+    {
+        let first_scale = match odd {
+            3 => 0x40,
+            5 => 0x80,
+            9 => 0xc0,
+            _ => unreachable!("guarded compact ordinal LEA factor"),
+        };
+        assembler.instruction(&[0x8d, 0x04, first_scale])?; // eax *= 3, 5, or 9
+        1_u8 << u8::try_from(address_shift).map_err(|_| {
+            ObjectError::ArithmeticOverflow("x86 compact ordinal address shift")
+        })?
+    } else {
+        if let Ok(immediate) = u8::try_from(class_count)
+            && immediate <= i8::MAX.cast_unsigned()
+        {
+            assembler.instruction(&[0x6b, 0xc0, immediate])?; // imul eax,eax,imm8
+        } else {
+            let immediate = u32::try_from(class_count).map_err(|_| {
+                ObjectError::ArithmeticOverflow("x86 compact ordinal class count")
+            })?;
+            let mut instruction = vec![0x69, 0xc0]; // imul eax,eax,imm32
+            instruction.extend_from_slice(&immediate.to_le_bytes());
+            assembler.instruction(&instruction)?;
+        }
+        2
+    };
+    let sib = match address_scale {
+        1 => 0x01,
+        2 => 0x41,
+        4 => 0x81,
+        8 => 0xc1,
+        _ => {
+            return Err(ObjectError::InvalidModule(
+                "x86 compact ordinal address scale",
+            ));
+        }
+    };
+    assembler.instruction(&[0x4d, 0x8d, 0x14, sib])?; // r10 = table + scaled ordinal
     Ok(())
 }
 
@@ -11871,7 +12073,8 @@ fn x86_emit_set_row_from_cell(
         }
         NativeCellEncoding::Compact8Direct
         | NativeCellEncoding::Compact16
-        | NativeCellEncoding::Compact16Indexed(_) => {
+        | NativeCellEncoding::Compact16Indexed(_)
+        | NativeCellEncoding::Compact16Ordinal(_) => {
             return Err(ObjectError::InvalidModule(
                 "zero-based compact cell entered biased x86 row addressing",
             ));
@@ -11898,6 +12101,9 @@ fn x86_emit_set_row_from_compact_zero_based_cell(
             // r10 = table + zero_based_token * row_bytes
             assembler.instruction(&[0xc1, 0xe0, shift])?; // shl eax, row shift
             assembler.instruction(&[0x4d, 0x8d, 0x14, 0x01])?;
+        }
+        NativeCellEncoding::Compact16Ordinal(row_bytes) => {
+            x86_emit_set_row_from_compact_ordinal(assembler, row_bytes)?;
         }
         NativeCellEncoding::Wide32 => {
             return Err(ObjectError::InvalidModule(
@@ -14939,7 +15145,8 @@ fn lower_x86_64_dfa_with_entry_contract(
     match layout.cells {
         NativeCellEncoding::Compact8Direct
         | NativeCellEncoding::Compact16
-        | NativeCellEncoding::Compact16Indexed(_) => {
+        | NativeCellEncoding::Compact16Indexed(_)
+        | NativeCellEncoding::Compact16Ordinal(_) => {
             // Every ordinary live token is a zero-based scaled row offset
             // below the reserved dead payload. Either metadata bit, including
             // the bit carried by that cold sentinel, moves the value above
@@ -15047,7 +15254,8 @@ fn lower_x86_64_dfa_with_entry_contract(
         match layout.cells {
             NativeCellEncoding::Compact8Direct
             | NativeCellEncoding::Compact16
-            | NativeCellEncoding::Compact16Indexed(_) => {
+            | NativeCellEncoding::Compact16Indexed(_)
+            | NativeCellEncoding::Compact16Ordinal(_) => {
                 x86_emit_test_eax_mask(&mut assembler, layout.cells.accelerated())?;
                 assembler.branch(&[0x0f, 0x85], accelerated_transition)?;
                 // With both metadata bits disproved, EAX is already the
@@ -15124,7 +15332,8 @@ fn lower_x86_64_dfa_with_entry_contract(
             match layout.cells {
                 NativeCellEncoding::Compact8Direct
                 | NativeCellEncoding::Compact16
-                | NativeCellEncoding::Compact16Indexed(_) => {
+                | NativeCellEncoding::Compact16Indexed(_)
+                | NativeCellEncoding::Compact16Ordinal(_) => {
                     x86_emit_compact_zero_based_classifier(&mut assembler, layout.cells)?;
                     assembler.branch(&[0x0f, 0x87], reverse_exception)?;
                     x86_emit_set_row_from_compact_zero_based_cell(
@@ -24046,10 +24255,17 @@ fn aarch64_set_row_from_zero_based_cell(
     cells: NativeCellEncoding,
     token: u8,
 ) -> Result<(), ObjectError> {
+    if let NativeCellEncoding::Compact16Ordinal(_) = cells {
+        // X15 retains the exact row stride from entry setup. The aligned
+        // class-map prefix is already represented by the physical-row token.
+        assembler.instruction(aarch64_madd_x(11, token, 15, 5)?)?;
+        return Ok(());
+    }
     let shift = match cells {
         NativeCellEncoding::Compact8Direct => 8_u32,
         NativeCellEncoding::Compact16 => 1_u32,
         NativeCellEncoding::Compact16Indexed(shift) => u32::from(shift),
+        NativeCellEncoding::Compact16Ordinal(_) => unreachable!("handled above"),
         NativeCellEncoding::Wide32 => 0_u32,
     };
     assembler.instruction(
@@ -24187,7 +24403,9 @@ fn aarch64_emit_table_lookup(
         NativeCellEncoding::Compact8Direct => {
             assembler.instruction(aarch64_load_byte_reg(8, 11, 8)?)?;
         }
-        NativeCellEncoding::Compact16 | NativeCellEncoding::Compact16Indexed(_) => {
+        NativeCellEncoding::Compact16
+        | NativeCellEncoding::Compact16Indexed(_)
+        | NativeCellEncoding::Compact16Ordinal(_) => {
             assembler.instruction(aarch64_load_h_uxtw(8, 11, 8)?)?;
         }
         NativeCellEncoding::Wide32 => {
@@ -27316,6 +27534,12 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
             AARCH64_SVE_MIN_VECTOR_BYTES,
         )?)?;
     }
+    if let NativeCellEncoding::Compact16Ordinal(row_bytes) = layout.cells {
+        // X15 is caller-saved and otherwise unused by the ordinary DFA
+        // lowering. Retain the authenticated stride across scanner retries so
+        // every scalar transition forms its next row with one MADD.
+        assembler.instruction(aarch64_movz_x(15, row_bytes, 0)?)?;
+    }
 
     assembler.bind(scan)?;
     if let Some(filter) = layout.start_filter {
@@ -27813,7 +28037,8 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
     match layout.cells {
         NativeCellEncoding::Compact8Direct
         | NativeCellEncoding::Compact16
-        | NativeCellEncoding::Compact16Indexed(_) => {
+        | NativeCellEncoding::Compact16Indexed(_)
+        | NativeCellEncoding::Compact16Ordinal(_) => {
             // W8 is already the zero-based row token. Bits at and above the
             // accelerator flag are all zero exactly for ordinary live compact
             // cells; dead uses the reserved maximum payload plus that flag.
@@ -27908,7 +28133,8 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
         match layout.cells {
             NativeCellEncoding::Compact8Direct
             | NativeCellEncoding::Compact16
-            | NativeCellEncoding::Compact16Indexed(_) => {
+            | NativeCellEncoding::Compact16Indexed(_)
+            | NativeCellEncoding::Compact16Ordinal(_) => {
                 assembler.branch_bit_set_w(
                     8,
                     layout.cells.accelerated_bit(),
@@ -27981,7 +28207,8 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
             match layout.cells {
                 NativeCellEncoding::Compact8Direct
                 | NativeCellEncoding::Compact16
-                | NativeCellEncoding::Compact16Indexed(_) => {
+                | NativeCellEncoding::Compact16Indexed(_)
+                | NativeCellEncoding::Compact16Ordinal(_) => {
                     assembler.instruction(aarch64_lsr_w_imm(
                         12,
                         8,
@@ -35138,45 +35365,42 @@ mod tests {
         }
     }
 
-    /// Every retained row after row zero names eight distinct incomplete
+    /// Every retained row after row zero names ten distinct incomplete
     /// destinations and one row-specific live destination. Packed collapsed
     /// semantics retain only two observable hole variants (accepted and
     /// unaccepted), plus the live destination. The root retains a dead cell.
     /// The live destination prevents exact-row interning from superseding the
-    /// sparse retry exercised by this fixture. The nine logical classes
-    /// deliberately make the ordinary compact-indexed table unattractive on
-    /// x86-64 and still larger than the sparse rows on AArch64, so both target
-    /// families exercise the resource retry.
+    /// sparse retry exercised by this fixture. The eleven logical classes
+    /// make every dense representation, including physical-row ordinals,
+    /// larger than the sparse rows on both target families.
     struct PackedCollapsedDefaultExceptionFixture {
         byte_classes: [u8; 256],
-        class_representatives: [u8; 9],
+        class_representatives: [u8; 11],
         forward_cells: Vec<ForwardCell>,
     }
 
     impl PackedCollapsedDefaultExceptionFixture {
-        const CLASS_COUNT: usize = 9;
+        const CLASS_COUNT: usize = 11;
         const COMPLETE_ROWS: usize = 1_900;
-        const DISCOVERED_STATES: usize = Self::COMPLETE_ROWS + 8;
+        const DISCOVERED_STATES: usize = Self::COMPLETE_ROWS + 10;
 
         fn new() -> Self {
             let mut byte_classes = [0_u8; 256];
-            for class in 1..=5 {
-                byte_classes[class] = u8::try_from(class).unwrap();
-            }
-            for (byte, class) in [(250, 6), (252, 7), (254, 8)] {
+            byte_classes[1..=7].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7]);
+            for (byte, class) in [(250, 8), (252, 9), (254, 10)] {
                 byte_classes[byte] = class;
             }
-            let class_representatives = [0, 1, 2, 3, 4, 5, 250, 252, 254];
+            let class_representatives = [0, 1, 2, 3, 4, 5, 6, 7, 250, 252, 254];
             let mut forward_cells =
                 Vec::with_capacity(Self::COMPLETE_ROWS * Self::CLASS_COUNT);
             let first_hole = u32::try_from(Self::COMPLETE_ROWS).unwrap();
             for state in 0..Self::COMPLETE_ROWS {
                 for class in 0..Self::CLASS_COUNT {
-                    let cell = if state == 0 && class <= 5 {
+                    let cell = if state == 0 && class <= 7 {
                         ForwardCell::new(0, false)
-                    } else if class <= 5 {
-                        ForwardCell::new(first_hole + u32::try_from(class).unwrap(), false)
                     } else if class <= 7 {
+                        ForwardCell::new(first_hole + u32::try_from(class).unwrap(), false)
+                    } else if class <= 9 {
                         ForwardCell::new(first_hole + u32::try_from(class).unwrap(), true)
                     } else if state != 0 {
                         ForwardCell::new(u32::try_from(state).unwrap(), false)
@@ -35295,6 +35519,97 @@ mod tests {
                 },
                 partial_discovered_states: Some(Self::DISCOVERED_STATES),
                 collapse_partial_holes: false,
+                exact_match_width: None,
+                max_match_width: None,
+                exact_product_width: None,
+                retained_prefix_requirement: None,
+                retained_suffix_requirement: None,
+                ..base
+            }
+        }
+    }
+
+    /// A non-power-of-two compact row whose padded indexed image narrowly
+    /// misses the x86 cost gate. The exact physical-row ordinal image is one
+    /// half of Wide32 and remains beyond the conservative L1 share, so both
+    /// target families can exercise the general arbitrary-stride lowering.
+    struct OrdinalPartialFixture {
+        byte_classes: [u8; 256],
+        class_representatives: Vec<u8>,
+        forward_cells: Vec<ForwardCell>,
+    }
+
+    impl OrdinalPartialFixture {
+        const CLASS_COUNT: usize = 42;
+        const COMPLETE_ROWS: usize = 400;
+        const RESUME_STATES: usize = 4;
+        const DISCOVERED_STATES: usize = Self::COMPLETE_ROWS + Self::RESUME_STATES;
+        const ROW_BYTES: usize = Self::CLASS_COUNT * core::mem::size_of::<u16>();
+
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "fixed fixture bounds prove its state and class arithmetic"
+        )]
+        fn new() -> Self {
+            let byte_classes = core::array::from_fn(|byte| {
+                u8::try_from(byte % Self::CLASS_COUNT).unwrap()
+            });
+            let class_representatives = (0..Self::CLASS_COUNT)
+                .map(|class| u8::try_from(class).unwrap())
+                .collect::<Vec<_>>();
+            let mut forward_cells =
+                Vec::with_capacity(Self::COMPLETE_ROWS * Self::CLASS_COUNT);
+            let complete_rows = u32::try_from(Self::COMPLETE_ROWS).unwrap();
+            for state in 0..Self::COMPLETE_ROWS {
+                let state = u32::try_from(state).unwrap();
+                let next = (state + 1) % complete_rows;
+                for class in 0..Self::CLASS_COUNT {
+                    let cell = match class {
+                        0 => ForwardCell::new(next, false),
+                        1 => ForwardCell::new(NO_DFA_STATE, false),
+                        2 => ForwardCell::new(complete_rows, false),
+                        3 => ForwardCell::new(
+                            complete_rows
+                                + u32::try_from(Self::RESUME_STATES - 1).unwrap(),
+                            true,
+                        ),
+                        4 => ForwardCell::new(0, false),
+                        5 => ForwardCell::new(state, true),
+                        _ => ForwardCell::new(state, false),
+                    };
+                    forward_cells.push(cell);
+                }
+            }
+            Self {
+                byte_classes,
+                class_representatives,
+                forward_cells,
+            }
+        }
+
+        #[allow(
+            clippy::large_types_passed_by_value,
+            reason = "the copied compiler-private view is intentionally overlaid by this fixture"
+        )]
+        fn view<'a>(
+            &'a self,
+            base: NativeProgramView<'a>,
+            collapse_partial_holes: bool,
+        ) -> NativeProgramView<'a> {
+            NativeProgramView {
+                dfa: NativeDfaView {
+                    initial_state: 0,
+                    initial_pending: false,
+                    initial_terminal: false,
+                    byte_classes: &self.byte_classes,
+                    class_count: Self::CLASS_COUNT,
+                    class_representatives: &self.class_representatives,
+                    forward_cells: &self.forward_cells,
+                    reverse_initial: None,
+                    reverse_cells: &[],
+                },
+                partial_discovered_states: Some(Self::DISCOVERED_STATES),
+                collapse_partial_holes,
                 exact_match_width: None,
                 max_match_width: None,
                 exact_product_width: None,
@@ -51973,7 +52288,8 @@ int main(void){{
                     let packed = match layout.cells {
                         NativeCellEncoding::Compact8Direct => u32::from(data[offset]),
                         NativeCellEncoding::Compact16
-                        | NativeCellEncoding::Compact16Indexed(_) => u32::from(u16::from_le_bytes(
+                        | NativeCellEncoding::Compact16Indexed(_)
+                        | NativeCellEncoding::Compact16Ordinal(_) => u32::from(u16::from_le_bytes(
                             data[offset..offset + 2].try_into().unwrap(),
                         )),
                         NativeCellEncoding::Wide32 => {
@@ -53202,7 +53518,8 @@ int main(void){{
                         + class * layout.cells.bytes();
                     let packed = match layout.cells {
                         NativeCellEncoding::Compact16
-                        | NativeCellEncoding::Compact16Indexed(_) => u32::from(
+                        | NativeCellEncoding::Compact16Indexed(_)
+                        | NativeCellEncoding::Compact16Ordinal(_) => u32::from(
                             u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()),
                         ),
                         NativeCellEncoding::Wide32 => {
@@ -54033,14 +54350,11 @@ int main(void){{
                 None,
             )
             .unwrap();
-            match architecture {
-                Architecture::X86_64 => {
-                    assert_eq!(dense.1.cells, NativeCellEncoding::Wide32);
-                }
-                Architecture::Aarch64 => {
-                    assert_eq!(dense.1.cells, NativeCellEncoding::Compact16Indexed(5));
-                }
-            }
+            assert_eq!(
+                dense.1.cells,
+                NativeCellEncoding::Compact16Indexed(5),
+                "{architecture:?}",
+            );
             let sparse =
                 build_forced_default_exception_table(view, architecture, usize::MAX).unwrap();
             assert!(sparse.0.len() < dense.0.len(), "{architecture:?}");
@@ -54080,7 +54394,14 @@ int main(void){{
             let layout = sparse.1;
             let partial = layout.partial.expect("collapsed sparse partial layout");
             assert!(partial.collapse_holes);
-            assert_eq!(partial.resume_states, 8);
+            assert_eq!(
+                partial.resume_states,
+                u32::try_from(
+                    PackedCollapsedDefaultExceptionFixture::DISCOVERED_STATES
+                        - PackedCollapsedDefaultExceptionFixture::COMPLETE_ROWS,
+                )
+                .unwrap(),
+            );
             let exception_capacity = match layout.transitions {
                 TransitionLayout::DefaultByteExceptions(capacity) => capacity,
                 other => panic!("expected default-exception rows, got {other:?}"),
@@ -54134,11 +54455,11 @@ int main(void){{
             // without losing either observable packed flag.
             let row = PackedCollapsedDefaultExceptionFixture::CLASS_COUNT;
             assert_ne!(view.dfa.forward_cells[row], view.dfa.forward_cells[row + 1]);
-            assert_ne!(view.dfa.forward_cells[row + 6], view.dfa.forward_cells[row + 7]);
+            assert_ne!(view.dfa.forward_cells[row + 8], view.dfa.forward_cells[row + 9]);
             let false_hole = packed_at(1, 0);
-            let accepted_hole = packed_at(1, 6);
+            let accepted_hole = packed_at(1, 8);
             assert_eq!(false_hole, packed_at(1, 1));
-            assert_eq!(accepted_hole, packed_at(1, 7));
+            assert_eq!(accepted_hole, packed_at(1, 9));
             assert_eq!(
                 false_hole & layout.cells.next_mask(),
                 partial.hole_token_base,
@@ -54160,6 +54481,470 @@ int main(void){{
                 u32::try_from(encode_native_row_offset(final_row_offset, layout.cells).unwrap())
                     .unwrap();
             assert_eq!(partial.hole_token_base, last_live_token + 1);
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one oracle keeps exact cost, packed-cell, flag, and hole checks together"
+    )]
+    fn ordinal_partial_rows_preserve_every_cell_and_exact_cost_boundary() {
+        let compiled = compile_partial_loop(
+            Target::x86_64_linux(),
+            OutputContract::SelectedEnd,
+        );
+        let fixture = OrdinalPartialFixture::new();
+        let base = compiled
+            .program()
+            .native_partial_dfa_view()
+            .expect("partial ordinal base")
+            .native;
+        let cells = NativeCellEncoding::Compact16Ordinal(
+            u16::try_from(OrdinalPartialFixture::ROW_BYTES).unwrap(),
+        );
+        let prefix = native_table_prefix_bytes(
+            TransitionLayout::ClassMapped,
+            cells,
+            OrdinalPartialFixture::CLASS_COUNT,
+        )
+        .unwrap();
+        assert_eq!(prefix, 336);
+        let ordinal_bytes = native_machine_bytes(
+            TransitionLayout::ClassMapped,
+            cells,
+            OrdinalPartialFixture::CLASS_COUNT,
+            OrdinalPartialFixture::COMPLETE_ROWS,
+            0,
+        )
+        .unwrap();
+        let indexed = NativeCellEncoding::Compact16Indexed(7);
+        let indexed_bytes = native_machine_bytes(
+            TransitionLayout::ClassMapped,
+            indexed,
+            OrdinalPartialFixture::CLASS_COUNT,
+            OrdinalPartialFixture::COMPLETE_ROWS,
+            0,
+        )
+        .unwrap();
+        let wide_bytes = native_machine_bytes(
+            TransitionLayout::ClassMapped,
+            NativeCellEncoding::Wide32,
+            OrdinalPartialFixture::CLASS_COUNT,
+            OrdinalPartialFixture::COMPLETE_ROWS,
+            0,
+        )
+        .unwrap();
+        assert_eq!((ordinal_bytes, indexed_bytes, wide_bytes), (33_936, 51_456, 67_456));
+        assert!(wide_bytes > ORDINAL_MIN_WIDE_FOOTPRINT);
+        assert!(
+            indexed_bytes * X86_INDEXED_MAX_WIDE_FOOTPRINT_DENOMINATOR
+                > wide_bytes * X86_INDEXED_MAX_WIDE_FOOTPRINT_NUMERATOR,
+            "the established x86 indexed gate must decline this padding",
+        );
+        assert!(
+            ordinal_bytes * X86_INDEXED_MAX_WIDE_FOOTPRINT_DENOMINATOR
+                <= wide_bytes * X86_INDEXED_MAX_WIDE_FOOTPRINT_NUMERATOR,
+        );
+        assert!(
+            ordinal_bytes * AARCH64_ORDINAL_MAX_INDEXED_FOOTPRINT_DENOMINATOR
+                <= indexed_bytes * AARCH64_ORDINAL_MAX_INDEXED_FOOTPRINT_NUMERATOR,
+        );
+        for architecture in [Architecture::X86_64, Architecture::Aarch64] {
+            for collapse_holes in [false, true] {
+                let view = fixture.view(base, collapse_holes);
+                let (data, layout) =
+                    build_native_dfa_table_for_architecture(view, architecture).unwrap();
+                assert_eq!(layout.transitions, TransitionLayout::ClassMapped);
+                assert_eq!(layout.cells, cells, "{architecture:?}/{collapse_holes}");
+                assert_eq!(usize::try_from(layout.forward_offset).unwrap(), prefix);
+                assert_eq!(
+                    usize::try_from(layout.reverse_offset).unwrap(),
+                    ordinal_bytes,
+                );
+                let partial = layout.partial.expect("ordinal partial layout");
+                assert_eq!(
+                    usize::try_from(partial.resume_states).unwrap(),
+                    OrdinalPartialFixture::RESUME_STATES,
+                );
+                assert_eq!(partial.collapse_holes, collapse_holes);
+                let final_row = prefix
+                    + (OrdinalPartialFixture::COMPLETE_ROWS - 1)
+                        * OrdinalPartialFixture::ROW_BYTES;
+                assert_eq!(
+                    partial.hole_token_base,
+                    u32::try_from(encode_native_row_offset(final_row, cells).unwrap() + 1)
+                        .unwrap(),
+                );
+                let mut saw_dead = false;
+                let mut saw_live = false;
+                let mut saw_hole = false;
+                let mut saw_accept = false;
+                let mut saw_accelerated = false;
+                for state in 0..OrdinalPartialFixture::COMPLETE_ROWS {
+                    for class in 0..OrdinalPartialFixture::CLASS_COUNT {
+                        let offset = prefix
+                            + state * OrdinalPartialFixture::ROW_BYTES
+                            + class * core::mem::size_of::<u16>();
+                        let actual = u32::from(u16::from_le_bytes(
+                            data[offset..offset + 2].try_into().unwrap(),
+                        ));
+                        let semantic = view.dfa.forward_cells
+                            [state * OrdinalPartialFixture::CLASS_COUNT + class];
+                        let expected = pack_native_partial_forward_cell(
+                            semantic.next(),
+                            semantic.accepted(),
+                            prefix,
+                            OrdinalPartialFixture::ROW_BYTES,
+                            OrdinalPartialFixture::COMPLETE_ROWS,
+                            layout.has_start_scanner(),
+                            layout.loop_skip.map(|plan| plan.state),
+                            partial,
+                            cells,
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            actual,
+                            expected,
+                            "{architecture:?}/{collapse_holes}/state={state}/class={class}",
+                        );
+                        let token = actual & cells.next_mask();
+                        saw_dead |= token == cells.dead_token();
+                        saw_live |= token < partial.hole_token_base;
+                        saw_hole |= token >= partial.hole_token_base;
+                        saw_accept |= actual & cells.accepts() != 0;
+                        saw_accelerated |= actual & cells.accelerated() != 0;
+                    }
+                }
+                assert!(saw_dead && saw_live && saw_hole && saw_accept && saw_accelerated);
+                let row = OrdinalPartialFixture::ROW_BYTES;
+                let first_hole = u32::from(u16::from_le_bytes(
+                    data[prefix + row + 2 * 2..prefix + row + 2 * 2 + 2]
+                        .try_into()
+                        .unwrap(),
+                ));
+                let last_hole = u32::from(u16::from_le_bytes(
+                    data[prefix + row + 3 * 2..prefix + row + 3 * 2 + 2]
+                        .try_into()
+                        .unwrap(),
+                ));
+                if collapse_holes {
+                    assert_eq!(first_hole & cells.next_mask(), last_hole & cells.next_mask());
+                } else {
+                    assert_eq!(first_hole & cells.next_mask(), partial.hole_token_base);
+                    assert_eq!(
+                        last_hole & cells.next_mask(),
+                        partial.hole_token_base
+                            + u32::try_from(OrdinalPartialFixture::RESUME_STATES - 1).unwrap(),
+                    );
+                }
+                assert_ne!(first_hole & cells.accelerated(), 0);
+                assert_ne!(last_hole & cells.accelerated(), 0);
+                assert_eq!(first_hole & cells.accepts(), 0);
+                assert_ne!(last_hole & cells.accepts(), 0);
+            }
+        }
+
+        for architecture in [Architecture::X86_64, Architecture::Aarch64] {
+            assert_eq!(
+                select_native_cell_encoding_with_holes_for_architecture(
+                    TransitionLayout::ClassMapped,
+                    43,
+                    OrdinalPartialFixture::COMPLETE_ROWS,
+                    0,
+                    1,
+                    architecture,
+                ),
+                NativeCellEncoding::Compact16Indexed(7),
+                "the first geometry outside the exact ordinal cost bound stays indexed: {architecture:?}",
+            );
+            assert_eq!(
+                select_native_cell_encoding_with_holes_for_architecture(
+                    TransitionLayout::ClassMapped,
+                    OrdinalPartialFixture::CLASS_COUNT,
+                    usize::try_from(COMPACT_CELL_NEXT_MASK).unwrap(),
+                    0,
+                    1,
+                    architecture,
+                ),
+                NativeCellEncoding::Wide32,
+                "row-ordinal overflow must fail closed: {architecture:?}",
+            );
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::too_many_lines,
+        reason = "the composition oracle keeps intern selection, physical targets, holes, and packed cells together"
+    )]
+    fn ordinal_rows_compose_with_exact_interning_and_zero_based_holes() {
+        let compiled = compile_partial_loop(
+            Target::x86_64_linux(),
+            OutputContract::SelectedEnd,
+        );
+        let mut fixture = OrdinalPartialFixture::new();
+        let class_count = OrdinalPartialFixture::CLASS_COUNT;
+        fixture.byte_classes.fill(0);
+        fixture.byte_classes[1] = 1;
+        fixture.byte_classes[2] = 2;
+        fixture.byte_classes[3] = 3;
+        let mut alias = fixture.forward_cells[class_count..2 * class_count].to_vec();
+        alias[0] = ForwardCell::new(1, false);
+        alias[4] = ForwardCell::new(1, false);
+        alias[5] = ForwardCell::new(1, false);
+        for state in 1..OrdinalPartialFixture::COMPLETE_ROWS {
+            let start = state * class_count;
+            fixture.forward_cells[start..start + class_count].copy_from_slice(&alias);
+        }
+        let view = fixture.view(
+            compiled
+                .program()
+                .native_partial_dfa_view()
+                .expect("partial ordinal intern base")
+                .native,
+            false,
+        );
+        let plan = derive_native_exact_row_intern_plan(
+            view.dfa,
+            view.partial_discovered_states,
+            view.collapse_partial_holes,
+        )
+        .expect("ordinal exact-row aliases");
+        assert_eq!(plan.physical_representatives, [0, 1]);
+        assert_eq!(plan.logical_to_physical[0], 0);
+        assert!(plan.logical_to_physical[1..].iter().all(|&physical| physical == 1));
+
+        let cells = NativeCellEncoding::Compact16Ordinal(
+            u16::try_from(OrdinalPartialFixture::ROW_BYTES).unwrap(),
+        );
+        let prefix = native_table_prefix_bytes(
+            TransitionLayout::ClassMapped,
+            cells,
+            class_count,
+        )
+        .unwrap();
+        assert_eq!(prefix, 336);
+        for architecture in [Architecture::X86_64, Architecture::Aarch64] {
+            let dense = build_native_dfa_table_for_architecture(view, architecture).unwrap();
+            assert_eq!(dense.1.cells, cells, "{architecture:?}");
+            assert_eq!(usize::try_from(dense.1.reverse_offset).unwrap(), 33_936);
+
+            let interned = build_forced_exact_row_intern_table(
+                view,
+                architecture,
+                NativeVectorFilterCostModel::Established,
+                true,
+                usize::MAX,
+            )
+            .unwrap();
+            let layout = interned.1;
+            assert_eq!(layout.transitions, TransitionLayout::ClassMapped);
+            assert_eq!(layout.cells, cells, "{architecture:?}");
+            assert_eq!(usize::try_from(layout.forward_offset).unwrap(), prefix);
+            assert_eq!(usize::try_from(layout.reverse_offset).unwrap(), 504);
+            let partial = layout.partial.expect("interned ordinal partial layout");
+            assert_eq!(partial.hole_token_base, 6);
+            assert_eq!(partial.resume_states, 4);
+
+            let loop_skip = layout.loop_skip.expect("interned ordinal loop target");
+            let loop_state = usize::try_from(loop_skip.state).unwrap();
+            let loop_physical = plan.physical_state(loop_state).unwrap();
+            assert_eq!(
+                usize::try_from(loop_skip.row_offset).unwrap(),
+                prefix + loop_physical * OrdinalPartialFixture::ROW_BYTES,
+                "{architecture:?}",
+            );
+            if let Some(fast_forward) = layout.prefix_fast_forward {
+                let target = usize::try_from(fast_forward.target_row_offset).unwrap();
+                assert!(target >= prefix && target < 504, "{architecture:?}");
+                assert_eq!((target - prefix) % OrdinalPartialFixture::ROW_BYTES, 0);
+            }
+
+            let mut saw_dead = false;
+            let mut saw_live = false;
+            let mut saw_hole = false;
+            for physical in 0..plan.physical_rows() {
+                let semantic = plan.representative(physical).unwrap();
+                for class in 0..class_count {
+                    let offset = prefix
+                        + physical * OrdinalPartialFixture::ROW_BYTES
+                        + class * core::mem::size_of::<u16>();
+                    let actual = u32::from(u16::from_le_bytes(
+                        interned.0[offset..offset + 2].try_into().unwrap(),
+                    ));
+                    let cell = view.dfa.forward_cells[semantic * class_count + class];
+                    let expected = pack_native_partial_forward_cell_with_exact_rows(
+                        cell.next(),
+                        cell.accepted(),
+                        prefix,
+                        OrdinalPartialFixture::ROW_BYTES,
+                        OrdinalPartialFixture::COMPLETE_ROWS,
+                        layout.has_start_scanner(),
+                        layout.loop_skip.map(|skip| skip.state),
+                        partial,
+                        cells,
+                        Some(&plan),
+                    )
+                    .unwrap();
+                    assert_eq!(actual, expected, "{architecture:?}/{physical}/{class}");
+                    let token = actual & cells.next_mask();
+                    saw_dead |= token == cells.dead_token();
+                    saw_live |= token < partial.hole_token_base;
+                    saw_hole |= token >= partial.hole_token_base && token < cells.dead_token();
+                }
+            }
+            assert!(saw_dead && saw_live && saw_hole, "{architecture:?}");
+            assert_eq!(
+                build_native_dfa_table_with_cost_model_and_data_limit(
+                    view,
+                    architecture,
+                    NativeVectorFilterCostModel::Established,
+                    true,
+                    interned.0.len(),
+                )
+                .unwrap(),
+                interned,
+                "{architecture:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn compact_ordinal_address_sequences_are_exact_on_both_isas() {
+        let x86_cases: &[(u16, &[u8])] = &[
+            (6, &[0x8d, 0x04, 0x40, 0x4d, 0x8d, 0x14, 0x41]),
+            (12, &[0x8d, 0x04, 0x40, 0x4d, 0x8d, 0x14, 0x81]),
+            (40, &[0x8d, 0x04, 0x80, 0x4d, 0x8d, 0x14, 0xc1]),
+            (72, &[0x8d, 0x04, 0xc0, 0x4d, 0x8d, 0x14, 0xc1]),
+            (84, &[0x6b, 0xc0, 42, 0x4d, 0x8d, 0x14, 0x41]),
+            (
+                258,
+                &[0x69, 0xc0, 129, 0, 0, 0, 0x4d, 0x8d, 0x14, 0x41],
+            ),
+        ];
+        for &(row_bytes, expected) in x86_cases {
+            let mut assembler = X86Assembler::new();
+            x86_emit_set_row_from_compact_zero_based_cell(
+                &mut assembler,
+                NativeCellEncoding::Compact16Ordinal(row_bytes),
+            )
+            .unwrap();
+            assert_eq!(assembler.finish().unwrap(), expected, "row_bytes={row_bytes}");
+        }
+        let mut invalid = X86Assembler::new();
+        assert!(x86_emit_set_row_from_compact_zero_based_cell(
+            &mut invalid,
+            NativeCellEncoding::Compact16Ordinal(64),
+        )
+        .is_err());
+
+        let mut assembler = Aarch64Assembler::new();
+        aarch64_set_row_from_zero_based_cell(
+            &mut assembler,
+            NativeCellEncoding::Compact16Ordinal(84),
+            6,
+        )
+        .unwrap();
+        assert_eq!(
+            assembler.finish().unwrap(),
+            aarch64_madd_x(11, 6, 15, 5).unwrap().to_le_bytes(),
+        );
+    }
+
+    #[test]
+    fn ordinal_partial_lowering_covers_every_target_vector_tier() {
+        let compiled = compile_partial_loop(
+            Target::x86_64_linux(),
+            OutputContract::SelectedEnd,
+        );
+        let fixture = OrdinalPartialFixture::new();
+        let view = fixture.view(
+            compiled
+                .program()
+                .native_partial_dfa_view()
+                .expect("partial ordinal base")
+                .native,
+            false,
+        );
+        let avx512 = FeatureSet::of(CpuFeature::X86Avx512F)
+            .with(CpuFeature::X86Avx512Bw);
+        let sve = FeatureSet::of(CpuFeature::Aarch64Sve);
+        let targets = [
+            (Target::x86_64_linux(), StartAccelerator::X86Sse2),
+            (
+                Target::x86_64_linux()
+                    .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+                    .unwrap(),
+                StartAccelerator::X86Avx2,
+            ),
+            (
+                Target::x86_64_linux().with_features(avx512).unwrap(),
+                StartAccelerator::X86Avx512Bw,
+            ),
+            (
+                Target::aarch64_macos()
+                    .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                    .unwrap(),
+                StartAccelerator::Aarch64Asimd,
+            ),
+            (
+                Target::aarch64_linux().with_features(sve).unwrap(),
+                StartAccelerator::Aarch64Sve,
+            ),
+            (
+                Target::aarch64_linux()
+                    .with_features(sve.with(CpuFeature::Aarch64Sve2))
+                    .unwrap(),
+                StartAccelerator::Aarch64Sve2,
+            ),
+        ];
+        for (target, expected_accelerator) in targets {
+            let layout = build_native_dfa_table_for_architecture(view, target.architecture)
+                .unwrap()
+                .1;
+            assert_eq!(layout.transitions, TransitionLayout::ClassMapped);
+            assert_eq!(
+                layout.cells,
+                NativeCellEncoding::Compact16Ordinal(84),
+            );
+            let lowering = lower_native_dfa_with_entry_contract(
+                view,
+                target,
+                NativeDfaEntryContract::PreparedPartialCore,
+            )
+            .unwrap()
+            .unwrap_or_else(|| panic!("ordinal target declined: {target:?}"));
+            assert_eq!(lowering.start_accelerator, expected_accelerator, "{target:?}");
+            match target.architecture {
+                Architecture::X86_64 => {
+                    let compact_load = [0x41, 0x0f, 0xb7, 0x04, 0x42];
+                    let wide_load = [0x41, 0x8b, 0x04, 0x82];
+                    let ordinal_address = [0x6b, 0xc0, 42, 0x4d, 0x8d, 0x14, 0x41];
+                    assert!(lowering.code.windows(compact_load.len()).any(|code| code == compact_load));
+                    assert!(!lowering.code.windows(wide_load.len()).any(|code| code == wide_load));
+                    assert!(lowering.code.windows(ordinal_address.len()).any(|code| code == ordinal_address));
+                }
+                Architecture::Aarch64 => {
+                    let words = lowering
+                        .code
+                        .chunks_exact(4)
+                        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        words
+                            .iter()
+                            .filter(|&&word| word == aarch64_movz_x(15, 84, 0).unwrap())
+                            .count(),
+                        1,
+                        "{target:?}",
+                    );
+                    assert!(words.contains(&aarch64_madd_x(11, 6, 15, 5).unwrap()));
+                    assert!(words.contains(&aarch64_load_h_uxtw(8, 11, 8).unwrap()));
+                    assert!(!words.contains(&aarch64_load_w_uxtw(8, 11, 8).unwrap()));
+                }
+            }
         }
     }
 
@@ -72241,7 +73026,8 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 let packed = match layout.cells {
                     NativeCellEncoding::Compact8Direct => u32::from(data[offset]),
                     NativeCellEncoding::Compact16
-                    | NativeCellEncoding::Compact16Indexed(_) => u32::from(u16::from_le_bytes(
+                    | NativeCellEncoding::Compact16Indexed(_)
+                    | NativeCellEncoding::Compact16Ordinal(_) => u32::from(u16::from_le_bytes(
                         data[offset..offset + 2].try_into().unwrap(),
                     )),
                     NativeCellEncoding::Wide32 => {
@@ -72294,7 +73080,8 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 let packed = match layout.cells {
                     NativeCellEncoding::Compact8Direct => u32::from(data[offset]),
                     NativeCellEncoding::Compact16
-                    | NativeCellEncoding::Compact16Indexed(_) => u32::from(u16::from_le_bytes(
+                    | NativeCellEncoding::Compact16Indexed(_)
+                    | NativeCellEncoding::Compact16Ordinal(_) => u32::from(u16::from_le_bytes(
                         data[offset..offset + 2].try_into().unwrap(),
                     )),
                     NativeCellEncoding::Wide32 => {
@@ -72439,6 +73226,149 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one exhaustive loop checks every admissible physical stride and token boundary"
+    )]
+    fn physical_row_ordinals_exhaust_strides_flags_holes_and_capacity() {
+        let mask = usize::try_from(COMPACT_CELL_NEXT_MASK).unwrap();
+        for class_count in 1..=CLASS_MAP_BYTES {
+            let row_bytes = class_count * core::mem::size_of::<u16>();
+            let cells = NativeCellEncoding::Compact16Ordinal(
+                u16::try_from(row_bytes).unwrap(),
+            );
+            if row_bytes.is_power_of_two() {
+                assert_eq!(
+                    native_row_bytes(TransitionLayout::ClassMapped, cells, class_count),
+                    None,
+                    "class_count={class_count}",
+                );
+                continue;
+            }
+            assert_eq!(
+                native_row_bytes(TransitionLayout::ClassMapped, cells, class_count),
+                Some(row_bytes),
+                "class_count={class_count}",
+            );
+            assert_eq!(
+                native_row_bytes(TransitionLayout::DirectByte, cells, class_count),
+                None,
+                "class_count={class_count}",
+            );
+            let prefix = native_table_prefix_bytes(
+                TransitionLayout::ClassMapped,
+                cells,
+                class_count,
+            )
+            .unwrap();
+            assert!(prefix >= CLASS_MAP_BYTES, "class_count={class_count}");
+            assert!(prefix < CLASS_MAP_BYTES + row_bytes, "class_count={class_count}");
+            assert!(prefix.is_multiple_of(row_bytes), "class_count={class_count}");
+            let prefix_rows = prefix / row_bytes;
+            let maximum_states = mask - prefix_rows;
+            assert!(maximum_states > 4, "class_count={class_count}");
+            for state in [0, 1, maximum_states - 1] {
+                let offset = prefix + state * row_bytes;
+                assert_eq!(
+                    encode_native_row_offset(offset, cells),
+                    Some(prefix_rows + state),
+                    "class_count={class_count}/state={state}",
+                );
+            }
+            assert_eq!(
+                encode_native_row_offset(prefix + maximum_states * row_bytes, cells),
+                Some(mask),
+                "class_count={class_count}",
+            );
+
+            let complete_states = maximum_states - 4;
+            let final_row = prefix + (complete_states - 1) * row_bytes;
+            let final_token = encode_native_row_offset(final_row, cells).unwrap();
+            assert_eq!(final_token, mask - 5, "class_count={class_count}");
+            let partial = NativePartialDfaLayout {
+                hole_token_base: u32::try_from(final_token + 1).unwrap(),
+                resume_states: 4,
+                collapse_holes: false,
+            };
+            let live = pack_native_cell_with_acceleration(
+                u32::try_from(complete_states - 1).unwrap(),
+                true,
+                prefix,
+                row_bytes,
+                complete_states,
+                true,
+                cells,
+            )
+            .unwrap();
+            assert_eq!(
+                live,
+                u32::try_from(final_token).unwrap() | cells.accepts() | cells.accelerated(),
+                "class_count={class_count}",
+            );
+            let final_hole = pack_native_partial_forward_cell(
+                u32::try_from(complete_states + 3).unwrap(),
+                true,
+                prefix,
+                row_bytes,
+                complete_states,
+                false,
+                None,
+                partial,
+                cells,
+            )
+            .unwrap();
+            assert_eq!(
+                final_hole,
+                COMPACT_CELL_NEXT_MASK - 1 | cells.accepts() | cells.accelerated(),
+                "class_count={class_count}",
+            );
+            let overflow = NativePartialDfaLayout {
+                resume_states: 5,
+                ..partial
+            };
+            assert!(pack_native_partial_forward_cell(
+                u32::try_from(complete_states + 4).unwrap(),
+                false,
+                prefix,
+                row_bytes,
+                complete_states,
+                false,
+                None,
+                overflow,
+                cells,
+            )
+            .is_err(), "class_count={class_count}");
+
+            let collapsed_states = maximum_states - 1;
+            let collapsed_final = prefix + (collapsed_states - 1) * row_bytes;
+            let collapsed_base = encode_native_row_offset(collapsed_final, cells).unwrap() + 1;
+            assert_eq!(collapsed_base, mask - 1, "class_count={class_count}");
+            let collapsed = NativePartialDfaLayout {
+                hole_token_base: u32::try_from(collapsed_base).unwrap(),
+                resume_states: 256,
+                collapse_holes: true,
+            };
+            for (resume, accepted) in [(0, false), (127, true), (255, false)] {
+                let packed = pack_native_partial_forward_cell(
+                    u32::try_from(collapsed_states + resume).unwrap(),
+                    accepted,
+                    prefix,
+                    row_bytes,
+                    collapsed_states,
+                    false,
+                    None,
+                    collapsed,
+                    cells,
+                )
+                .unwrap();
+                assert_eq!(packed & cells.next_mask(), COMPACT_CELL_NEXT_MASK - 1);
+                assert_ne!(packed & cells.accelerated(), 0);
+                assert_eq!(packed & cells.accepts() != 0, accepted);
+            }
+        }
+    }
+
+    #[test]
     fn transition_layout_and_cell_selection_are_cache_bounded_and_graph_only() {
         assert_eq!(
             u32::try_from(DIRECT_COMPACT_MAX_STATES).unwrap(),
@@ -72572,8 +73502,8 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 1,
                 Architecture::X86_64,
             ),
-            NativeCellEncoding::Wide32,
-            "x86 keeps a partial table wide below the structural saving threshold"
+            NativeCellEncoding::Compact16Ordinal(84),
+            "exact ordinal rows rescue padding that misses the indexed saving threshold"
         );
         assert_eq!(
             select_native_cell_encoding_with_holes_for_architecture(
@@ -72649,8 +73579,8 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 0,
                 Architecture::X86_64,
             ),
-            NativeCellEncoding::Wide32,
-            "x86 declines a complete indexed row just below the saving boundary"
+            NativeCellEncoding::Compact16Ordinal(84),
+            "x86 rescues a complete unpadded row below the indexed saving boundary"
         );
         assert_eq!(
             select_native_cell_encoding_for_architecture(
@@ -72660,8 +73590,8 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 0,
                 Architecture::X86_64,
             ),
-            NativeCellEncoding::Wide32,
-            "x86 declines near-equal complete padding that cannot repay its row shift"
+            NativeCellEncoding::Compact16Ordinal(258),
+            "x86 removes near-equal indexed padding with an exact half-width row"
         );
         assert_eq!(
             select_native_cell_encoding_for_architecture(
@@ -72671,8 +73601,8 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 0,
                 Architecture::Aarch64,
             ),
-            NativeCellEncoding::Compact16Indexed(9),
-            "AArch64 folds the same no-growth row scale into its address ADD"
+            NativeCellEncoding::Compact16Ordinal(258),
+            "AArch64 replaces one shifted ADD with MADD when exact rows halve padding"
         );
         assert_eq!(
             select_native_table_encoding(8, 4_096, 0),
@@ -72853,7 +73783,8 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 let actual = match direct_layout.cells {
                     NativeCellEncoding::Compact8Direct => u32::from(direct_data[offset]),
                     NativeCellEncoding::Compact16
-                    | NativeCellEncoding::Compact16Indexed(_) => u32::from(u16::from_le_bytes(
+                    | NativeCellEncoding::Compact16Indexed(_)
+                    | NativeCellEncoding::Compact16Ordinal(_) => u32::from(u16::from_le_bytes(
                         direct_data[offset..offset + 2].try_into().unwrap(),
                     )),
                     NativeCellEncoding::Wide32 => {
@@ -72898,7 +73829,8 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 let actual = match variable_layout.cells {
                     NativeCellEncoding::Compact8Direct => u32::from(variable_data[offset]),
                     NativeCellEncoding::Compact16
-                    | NativeCellEncoding::Compact16Indexed(_) => u32::from(u16::from_le_bytes(
+                    | NativeCellEncoding::Compact16Indexed(_)
+                    | NativeCellEncoding::Compact16Ordinal(_) => u32::from(u16::from_le_bytes(
                         variable_data[offset..offset + 2].try_into().unwrap(),
                     )),
                     NativeCellEncoding::Wide32 => {
