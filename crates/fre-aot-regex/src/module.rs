@@ -18028,13 +18028,11 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_impl
     assembler.instruction(&[0x49, 0x81, 0xc3, 0x80, 0x01, 0x00, 0x00])?;
     assembler.instruction(&[0x49, 0x8b, 0x73, 0x08])?;
     assembler.instruction(&[0x4d, 0x8d, 0x8b, 0x00, 0xff, 0xff, 0xff])?;
-    assembler.instruction(&[
-        0x41,
-        0x8b,
-        0x43,
-        u8::try_from(FROZEN_DYNAMIC_ROWS_V3_ROW_SHIFT_OFFSET)
-            .map_err(|_| ObjectError::ArithmeticOverflow("x86 V6 restored row shift"))?,
-    ])?;
+    // RAX is the trusted helper's consumed-byte count. Keep it live through
+    // the exact remaining-window check; the update dispatcher reloads the
+    // row shift after the cursor has advanced. Loading EAX here used to
+    // truncate every helper result to the small shift (usually one), turning
+    // long V6 loops into one helper call per byte.
     assembler.instruction(&[0x49, 0x89, 0xc8])?;
     assembler.instruction(&[0x49, 0x29, 0xd0])?;
     assembler.instruction(&[0x4c, 0x39, 0xc0])?;
@@ -37322,6 +37320,28 @@ mod tests {
                         .count(),
                     usize::from(output != OutputContract::Exists) * 2,
                     "x86 V6/V7 must preserve the inherited endpoint while borrowing R12: {output:?}/{features:?}"
+                );
+                let v6_helper_return = [
+                    0x4c, 0x8b, 0x14, 0x24, // canonical state
+                    0x48, 0x8b, 0x54, 0x24, 0x08, // cursor
+                    0x48, 0x8b, 0x4c, 0x24, 0x58, // end
+                    0x48, 0x8b, 0x7c, 0x24, 0x28, // source
+                    0x4c, 0x8b, 0x5c, 0x24, 0x20, // selected header
+                    0x49, 0x81, 0xc3, 0x80, 0x01, 0x00, 0x00, // compact tail
+                    0x49, 0x8b, 0x73, 0x08, // rows
+                    0x4d, 0x8d, 0x8b, 0x00, 0xff, 0xff, 0xff, // class map
+                    0x49, 0x89, 0xc8, // remaining = end
+                    0x49, 0x29, 0xd0, // remaining -= cursor
+                    0x4c, 0x39, 0xc0, // helper result <= remaining
+                ];
+                assert_eq!(
+                    emission
+                        .code
+                        .windows(v6_helper_return.len())
+                        .filter(|window| *window == v6_helper_return)
+                        .count(),
+                    1,
+                    "x86 V6 must validate the live helper result before reloading its row shift: {output:?}/{features:?}"
                 );
                 assert_eq!(
                     emission.relocations.iter().any(|relocation| {
