@@ -11862,6 +11862,29 @@ impl CompiledProgram {
         }
     }
 
+    /// Return whether the exact immutable descriptor is already graph-bound
+    /// to this prepared workspace. A runtime owner uses this read-only query
+    /// to preserve its published compact headers across repeated admissions;
+    /// a false result still requires revoking every header before binding can
+    /// extend or replace K0 cache lineage.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn compiler_private_static_prefix_resume_binding_is_active(
+        &self,
+        workspace: &ProgramWorkspace,
+        descriptor_binding: usize,
+    ) -> bool {
+        descriptor_binding != 0
+            && workspace.identity.instance == self.identity.instance
+            && workspace
+                .static_prefix_resume
+                .as_deref()
+                .is_some_and(|state| {
+                    state.descriptor_binding == descriptor_binding
+                        && state.resume.is_bound_to(&self.automaton)
+                })
+    }
+
     /// Lazily graph-bind one transient static-prefix continuation descriptor
     /// only after generated code reaches a hole, then admit its exact window.
     #[doc(hidden)]
@@ -26529,6 +26552,11 @@ mod tests {
             );
             let old_root_receipt = owner.root_prefill_receipt.k0;
             let initial_haystack = [0_u8, 0];
+            assert!(!compiled
+                .compiler_private_static_prefix_resume_binding_is_active(
+                    &workspace,
+                    descriptor_binding,
+                ));
             let newly_published = compiled
                 .bind_static_prefix_resume_with_workspace(
                     &initial_haystack,
@@ -26540,6 +26568,16 @@ mod tests {
                     &descriptor,
                 )
                 .expect("bind the serialized static-resume descriptor");
+            assert!(compiled
+                .compiler_private_static_prefix_resume_binding_is_active(
+                    &workspace,
+                    descriptor_binding,
+                ));
+            assert!(!compiled
+                .compiler_private_static_prefix_resume_binding_is_active(
+                    &workspace,
+                    descriptor_binding.wrapping_add(4),
+                ));
             if output == OutputContract::Exists {
                 assert!(
                     newly_published.is_some(),
@@ -26639,6 +26677,11 @@ mod tests {
                         }));
                         let window = SearchWindow::full(&haystack);
                         let pending_end_word = usize::from(pending);
+                        assert!(compiled
+                            .compiler_private_static_prefix_resume_binding_is_active(
+                                &workspace,
+                                descriptor_binding,
+                            ));
                         assert!(
                             compiled
                                 .bind_static_prefix_resume_with_workspace(

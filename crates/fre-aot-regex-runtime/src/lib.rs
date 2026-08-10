@@ -893,7 +893,15 @@ impl PreparedAotRegex {
         descriptor_binding: usize,
         descriptor: &[u32],
     ) -> Result<(), CompileError> {
-        self.deactivate_frozen_header();
+        let binding_is_active = self
+            .program
+            .compiler_private_static_prefix_resume_binding_is_active(
+                &self.workspace,
+                descriptor_binding,
+            );
+        if !binding_is_active {
+            self.deactivate_frozen_header();
+        }
         let newly_published = self.program.bind_static_prefix_resume_with_workspace(
             haystack,
             window,
@@ -903,6 +911,7 @@ impl PreparedAotRegex {
             descriptor_binding,
             descriptor,
         )?;
+        debug_assert!(!binding_is_active || newly_published.is_none());
         if let Some(receipt) = newly_published {
             // Replacing the complete K0 cache retires every receipt and
             // immutable copy derived from its prior generation. Rebuild the
@@ -963,16 +972,24 @@ impl PreparedAotRegex {
                     pending_end,
                 )?
         {
-            let header = self
-                .program
-                .compiler_private_frozen_static_continuation_prepared_header_v6(
-                    &self.workspace,
-                    owner,
-                );
-            if let Some(header) = header
-                && let Some(header_format) =
-                    header.compiler_private_dynamic_rows_format_version()
-                && header_format == projection.format_version()
+            let projection_format = projection.format_version();
+            let active_header_format = self
+                .static_continuation_header
+                .compiler_private_dynamic_rows_format_version();
+            let replacement_header = if active_header_format == Some(projection_format) {
+                None
+            } else {
+                self.program
+                    .compiler_private_frozen_static_continuation_prepared_header_v6(
+                        &self.workspace,
+                        owner,
+                    )
+            };
+            let selected_header_format = replacement_header
+                .as_ref()
+                .and_then(|header| header.compiler_private_dynamic_rows_format_version())
+                .or(active_header_format);
+            if selected_header_format == Some(projection_format)
             {
                 let canonical_state = projection.canonical_state();
                 let pending_end = match projection.pending_end() {
@@ -990,7 +1007,9 @@ impl PreparedAotRegex {
                         &mut self.workspace,
                         projection,
                     )?;
-                self.static_continuation_header = header;
+                if let Some(header) = replacement_header {
+                    self.static_continuation_header = header;
+                }
                 return Ok(Some((
                     STATUS_STATIC_PREFIX_NATIVE_CONTINUATION_RESUME,
                     canonical_state,
@@ -2186,21 +2205,35 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_compiler_private_search_exclusive
         let Ok(ticket) = prepared.consume_static_prefix_object(haystack) else {
             return STATUS_RUNTIME_FAILURE;
         };
-        let descriptor_ptr =
-            std::ptr::with_exposed_provenance::<u32>(ticket.descriptor_address);
-        let header = std::slice::from_raw_parts(descriptor_ptr, HEADER_WORDS);
-        let Ok(total_words) = usize::try_from(header[2]) else {
-            return STATUS_RUNTIME_FAILURE;
+        let descriptor_is_bound = prepared
+            .program
+            .compiler_private_static_prefix_resume_binding_is_active(
+                &prepared.workspace,
+                ticket.descriptor_address,
+            );
+        let descriptor = if descriptor_is_bound {
+            // The generated object's address is its immutable binding
+            // capability. Once the graph-bound resume set authenticates that
+            // exact address, repeated holes need not re-read its bounded
+            // header or reconstruct a slice that the binding path ignores.
+            &[]
+        } else {
+            let descriptor_ptr =
+                std::ptr::with_exposed_provenance::<u32>(ticket.descriptor_address);
+            let header = std::slice::from_raw_parts(descriptor_ptr, HEADER_WORDS);
+            let Ok(total_words) = usize::try_from(header[2]) else {
+                return STATUS_RUNTIME_FAILURE;
+            };
+            let Some(total_bytes) = total_words.checked_mul(std::mem::size_of::<u32>()) else {
+                return STATUS_RUNTIME_FAILURE;
+            };
+            if total_words < HEADER_WORDS
+                || total_bytes > STATIC_PREFIX_RESUME_DESCRIPTOR_V1_MAX_BYTES
+            {
+                return STATUS_RUNTIME_FAILURE;
+            }
+            std::slice::from_raw_parts(descriptor_ptr, total_words)
         };
-        let Some(total_bytes) = total_words.checked_mul(std::mem::size_of::<u32>()) else {
-            return STATUS_RUNTIME_FAILURE;
-        };
-        if total_words < HEADER_WORDS
-            || total_bytes > STATIC_PREFIX_RESUME_DESCRIPTOR_V1_MAX_BYTES
-        {
-            return STATUS_RUNTIME_FAILURE;
-        }
-        let descriptor = std::slice::from_raw_parts(descriptor_ptr, total_words);
         let Ok(()) = prepared.bind_static_prefix_resume(
             haystack,
             ticket.window,
