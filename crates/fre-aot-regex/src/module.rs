@@ -6598,10 +6598,7 @@ impl TransitionLayout {
     }
 
     fn uses_vector_sparse_lookup(self) -> bool {
-        matches!(
-            self.scalable_exception_capacity(),
-            Some(capacity) if usize::from(capacity) <= NATIVE_SPARSE_VECTOR_LANES
-        )
+        self.scalable_exception_capacity().is_some()
     }
 
     const fn row_cells(self, class_count: usize) -> usize {
@@ -13763,13 +13760,13 @@ const MAX_NATIVE_SPARSE_SCALAR_TAIL: usize = MAX_NATIVE_DEFAULT_EXCEPTIONS;
 ///
 /// A one-to-four-key remainder is cheaper as the already-established scalar
 /// tree than as another vector load, mask extraction and exact tail mask. The
-/// scalar tail is emitted before vector code while AL still holds the lookup
-/// key. Full scalable rows have unique keys; short rows repeat their final
-/// real key and the same value through logical padding, while uniform rows
-/// repeat the default. Thus a padded tail hit is semantically identical to
-/// the earlier logical hit. Physical padding exists only through capacity 16,
-/// where the single-vector inline sentinel remains in charge. Larger
-/// remainders use one final exact masked vector chunk.
+/// scalar tail is emitted before vector code while the lookup key is still
+/// live. Scalable rows may repeat their final real key and its value through
+/// logical padding, while uniform rows repeat the default. Thus a padded tail
+/// hit is semantically identical to the earlier logical hit; key uniqueness
+/// is neither required nor assumed. Physical padding exists only through
+/// capacity 16, where the single-vector inline sentinel remains in charge.
+/// Larger remainders use one final exact masked vector chunk.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct NativeSparseChunkPlan {
     vector_width: usize,
@@ -27019,11 +27016,416 @@ fn aarch64_emit_sparse_binary_range(
     Ok(())
 }
 
+fn aarch64_sparse_lookup_chunk_plan(
+    exception_capacity: u8,
+    cells: NativeCellEncoding,
+) -> Option<NativeSparseChunkPlan> {
+    let row_bytes = native_default_exception_row_bytes(exception_capacity, cells)?;
+    let readable_key_bytes = row_bytes.checked_sub(cells.bytes())?;
+    native_sparse_chunk_plan(
+        usize::from(exception_capacity),
+        NATIVE_SPARSE_VECTOR_LANES,
+        readable_key_bytes,
+    )
+}
+
+fn aarch64_emit_sparse_default_load(
+    assembler: &mut Aarch64Assembler,
+    cells: NativeCellEncoding,
+) -> Result<(), ObjectError> {
+    match cells {
+        NativeCellEncoding::Compact16 => {
+            assembler.instruction(aarch64_load_halfword_imm(8, 11, 0)?)?;
+        }
+        NativeCellEncoding::Wide32 => {
+            assembler.instruction(aarch64_load_w_imm(8, 11, 0)?)?;
+        }
+        _ => {
+            return Err(ObjectError::InvalidModule(
+                "AArch64 scalable-exception value width",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn aarch64_emit_sparse_indexed_value_load(
+    assembler: &mut Aarch64Assembler,
+    value_offset: usize,
+    chunk_start: usize,
+    cells: NativeCellEncoding,
+) -> Result<(), ObjectError> {
+    let base_offset = chunk_start
+        .checked_mul(cells.bytes())
+        .and_then(|offset| value_offset.checked_add(offset))
+        .and_then(|offset| u16::try_from(offset).ok())
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "AArch64 scalable vector value offset",
+        ))?;
+    assembler.instruction(aarch64_add_x_imm(6, 11, base_offset)?)?;
+    match cells {
+        NativeCellEncoding::Compact16 => {
+            assembler.instruction(aarch64_load_h_uxtw(8, 6, 12)?)?;
+        }
+        NativeCellEncoding::Wide32 => {
+            assembler.instruction(aarch64_load_w_uxtw(8, 6, 12)?)?;
+        }
+        _ => {
+            return Err(ObjectError::InvalidModule(
+                "AArch64 scalable-exception value width",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn aarch64_emit_sparse_asimd_inline(
+    assembler: &mut Aarch64Assembler,
+    exception_capacity: u8,
+    cells: NativeCellEncoding,
+    value_offset: usize,
+    inline_default_slot: bool,
+    default: Aarch64Label,
+    done: Aarch64Label,
+) -> Result<(), ObjectError> {
+    assembler.instruction(aarch64_dup_16b_from_w(0, 8)?)?;
+    assembler.instruction(aarch64_add_x_imm(
+        6,
+        11,
+        u16::try_from(cells.bytes()).map_err(|_| {
+            ObjectError::ArithmeticOverflow("AArch64 scalable vector key offset")
+        })?,
+    )?)?;
+    assembler.instruction(aarch64_load_q(24, 6)?)?;
+    assembler.instruction(aarch64_cmeq_16b(24, 24, 0)?)?;
+    assembler.instruction(aarch64_bsl_16b(24, 29, 31)?)?;
+    assembler.instruction(aarch64_uminv_16b(24, 24)?)?;
+    assembler.instruction(aarch64_umov_b0(12, 24)?)?;
+    if inline_default_slot {
+        assembler.instruction(aarch64_movz_w(8, u16::from(exception_capacity))?)?;
+        assembler.instruction(aarch64_cmp_w(12, 8)?)?;
+        assembler.instruction(aarch64_csel_w(12, 12, 8, AARCH64_LO)?)?;
+    } else {
+        assembler.instruction(aarch64_cmp_w_imm(
+            12,
+            u16::try_from(NATIVE_SPARSE_VECTOR_LANES).map_err(|_| {
+                ObjectError::ArithmeticOverflow("AArch64 scalable vector lanes")
+            })?,
+        )?)?;
+        assembler.branch_cond(AARCH64_HS, default)?;
+    }
+    aarch64_emit_sparse_indexed_value_load(assembler, value_offset, 0, cells)?;
+    assembler.branch(done)?;
+    Ok(())
+}
+
+fn aarch64_emit_sparse_sve_inline(
+    assembler: &mut Aarch64Assembler,
+    exception_capacity: u8,
+    cells: NativeCellEncoding,
+    value_offset: usize,
+    inline_default_slot: bool,
+    default: Aarch64Label,
+    done: Aarch64Label,
+) -> Result<(), ObjectError> {
+    assembler.instruction(aarch64_sve_ptrue_b_vl16(1)?)?;
+    assembler.instruction(aarch64_add_x_imm(
+        6,
+        11,
+        u16::try_from(cells.bytes()).map_err(|_| {
+            ObjectError::ArithmeticOverflow("AArch64 SVE scalable key offset")
+        })?,
+    )?)?;
+    assembler.instruction(aarch64_sve_ld1b_predicated(24, 1, 6)?)?;
+    assembler.instruction(aarch64_sve_dup_b_from_w(25, 8)?)?;
+    assembler.instruction(aarch64_sve_cmpeq_b_predicated(2, 1, 24, 25)?)?;
+    if !inline_default_slot {
+        assembler.instruction(aarch64_sve_ptest_b(1, 2)?)?;
+        assembler.branch_cond(AARCH64_EQ, default)?;
+    }
+    assembler.instruction(aarch64_sve_brkb_b(3, 1, 2)?)?;
+    assembler.instruction(aarch64_sve_cntp_b(12, 1, 3)?)?;
+    if inline_default_slot {
+        // With no match BRKB retains all sixteen governing lanes, so CNTP
+        // produces 16. Clamp that result to the physical default sentinel;
+        // exact matches always select an earlier logical lane.
+        assembler.instruction(aarch64_movz_w(8, u16::from(exception_capacity))?)?;
+        assembler.instruction(aarch64_cmp_w(12, 8)?)?;
+        assembler.instruction(aarch64_csel_w(12, 12, 8, AARCH64_LO)?)?;
+    }
+    aarch64_emit_sparse_indexed_value_load(assembler, value_offset, 0, cells)?;
+    assembler.branch(done)?;
+    Ok(())
+}
+
+fn aarch64_emit_sparse_asimd_group_any(
+    assembler: &mut Aarch64Assembler,
+    vectors: usize,
+) -> Result<(), ObjectError> {
+    match vectors {
+        1 => aarch64_emit_candidate_any(assembler, 24),
+        2 => {
+            assembler.instruction(aarch64_orr_16b(28, 24, 25)?)?;
+            aarch64_emit_candidate_any(assembler, 28)
+        }
+        3 => {
+            assembler.instruction(aarch64_orr_16b(28, 24, 25)?)?;
+            assembler.instruction(aarch64_orr_16b(28, 28, 26)?)?;
+            aarch64_emit_candidate_any(assembler, 28)
+        }
+        4 => aarch64_emit_candidate_batch_any(assembler, 24),
+        _ => Err(ObjectError::InvalidModule(
+            "AArch64 scalable vector group width",
+        )),
+    }
+}
+
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "the one-to-four-vector proof bounds every consecutive scratch register"
+)]
+fn aarch64_emit_first_sparse_candidate_in_group(
+    assembler: &mut Aarch64Assembler,
+    vectors: usize,
+) -> Result<(), ObjectError> {
+    if !(1..=4).contains(&vectors) {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 scalable vector group width",
+        ));
+    }
+    assembler.instruction(aarch64_orr_16b(28, 29, 29)?)?;
+    for vector in 0..vectors {
+        let candidates = 24_u8
+            .checked_add(u8::try_from(vector).map_err(|_| {
+                ObjectError::ArithmeticOverflow("AArch64 scalable vector group")
+            })?)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "AArch64 scalable vector group",
+            ))?;
+        assembler.instruction(aarch64_bsl_16b(candidates, 28, 31)?)?;
+        if vector + 1 < vectors {
+            assembler.instruction(aarch64_add_16b(28, 28, 30)?)?;
+        }
+    }
+    match vectors {
+        1 => {}
+        2 => {
+            assembler.instruction(aarch64_umin_16b(24, 24, 25)?)?;
+        }
+        3 => {
+            assembler.instruction(aarch64_umin_16b(24, 24, 25)?)?;
+            assembler.instruction(aarch64_umin_16b(24, 24, 26)?)?;
+        }
+        4 => {
+            assembler.instruction(aarch64_umin_16b(24, 24, 25)?)?;
+            assembler.instruction(aarch64_umin_16b(26, 26, 27)?)?;
+            assembler.instruction(aarch64_umin_16b(24, 24, 26)?)?;
+        }
+        _ => unreachable!("validated one-to-four-vector group"),
+    }
+    assembler.instruction(aarch64_uminv_16b(24, 24)?)?;
+    assembler.instruction(aarch64_umov_b0(12, 24)?)?;
+    Ok(())
+}
+
+fn aarch64_emit_sparse_asimd_probes(
+    assembler: &mut Aarch64Assembler,
+    plan: NativeSparseChunkPlan,
+    cells: NativeCellEncoding,
+) -> Result<Vec<(usize, usize, Aarch64Label)>, ObjectError> {
+    assembler.instruction(aarch64_dup_16b_from_w(0, 8)?)?;
+    assembler.instruction(aarch64_add_x_imm(
+        6,
+        11,
+        u16::try_from(cells.bytes()).map_err(|_| {
+            ObjectError::ArithmeticOverflow("AArch64 scalable vector key offset")
+        })?,
+    )?)?;
+    let groups = plan
+        .vector_chunks
+        .checked_add(3)
+        .and_then(|chunks| chunks.checked_div(4))
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "AArch64 scalable vector groups",
+        ))?;
+    let mut hits = Vec::new();
+    hits.try_reserve_exact(groups)
+        .map_err(|_| ObjectError::Allocation("AArch64 scalable vector hit labels"))?;
+    for group in 0..groups {
+        let first_chunk = group
+            .checked_mul(4)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "AArch64 scalable vector group",
+            ))?;
+        let vectors = plan.vector_chunks.saturating_sub(first_chunk).min(4);
+        let group_start = plan
+            .chunk_start(first_chunk)
+            .ok_or(ObjectError::InvalidModule(
+                "AArch64 scalable vector chunk start",
+            ))?;
+        for vector in (0..vectors).step_by(2) {
+            let chunk = first_chunk
+                .checked_add(vector)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "AArch64 scalable vector chunk",
+                ))?;
+            let chunk_start = plan.chunk_start(chunk).ok_or(ObjectError::InvalidModule(
+                "AArch64 scalable vector chunk start",
+            ))?;
+            let first_destination = 24_u8
+                .checked_add(u8::try_from(vector).map_err(|_| {
+                    ObjectError::ArithmeticOverflow("AArch64 scalable vector register")
+                })?)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "AArch64 scalable vector register",
+                ))?;
+            let key_offset = u16::try_from(chunk_start).map_err(|_| {
+                ObjectError::ArithmeticOverflow("AArch64 scalable vector key offset")
+            })?;
+            if vector + 1 < vectors {
+                assembler.instruction(aarch64_load_pair_q(
+                    first_destination,
+                    first_destination.checked_add(1).ok_or(
+                        ObjectError::ArithmeticOverflow("AArch64 scalable vector register"),
+                    )?,
+                    6,
+                    key_offset,
+                )?)?;
+            } else {
+                assembler.instruction(aarch64_load_q_imm(
+                    first_destination,
+                    6,
+                    key_offset,
+                )?)?;
+            }
+        }
+        for vector in 0..vectors {
+            let chunk = first_chunk
+                .checked_add(vector)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "AArch64 scalable vector chunk",
+                ))?;
+            let live_lanes = plan
+                .chunk_live_lanes(chunk)
+                .ok_or(ObjectError::InvalidModule(
+                    "AArch64 scalable vector chunk lanes",
+                ))?;
+            let candidates = 24_u8
+                .checked_add(u8::try_from(vector).map_err(|_| {
+                    ObjectError::ArithmeticOverflow("AArch64 scalable vector register")
+                })?)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "AArch64 scalable vector register",
+                ))?;
+            assembler.instruction(aarch64_cmeq_16b(candidates, candidates, 0)?)?;
+            if live_lanes < NATIVE_SPARSE_VECTOR_LANES {
+                let last_live_lane = live_lanes.checked_sub(1).ok_or(
+                    ObjectError::InvalidModule("AArch64 scalable vector live lanes"),
+                )?;
+                assembler.instruction(aarch64_movi_16b(
+                    28,
+                    u8::try_from(last_live_lane).map_err(|_| {
+                        ObjectError::ArithmeticOverflow("AArch64 scalable vector live lanes")
+                    })?,
+                )?)?;
+                assembler.instruction(aarch64_cmhs_16b(28, 28, 29)?)?;
+                assembler.instruction(aarch64_and_16b(candidates, candidates, 28)?)?;
+            }
+        }
+        aarch64_emit_sparse_asimd_group_any(assembler, vectors)?;
+        let hit = assembler.label()?;
+        assembler.branch_cond(AARCH64_NE, hit)?;
+        hits.push((group_start, vectors, hit));
+    }
+    Ok(hits)
+}
+
+fn aarch64_emit_sparse_asimd_hit_stubs(
+    assembler: &mut Aarch64Assembler,
+    hits: Vec<(usize, usize, Aarch64Label)>,
+    value_offset: usize,
+    cells: NativeCellEncoding,
+    done: Aarch64Label,
+) -> Result<(), ObjectError> {
+    for (group_start, vectors, hit) in hits {
+        assembler.bind(hit)?;
+        aarch64_emit_first_sparse_candidate_in_group(assembler, vectors)?;
+        aarch64_emit_sparse_indexed_value_load(assembler, value_offset, group_start, cells)?;
+        assembler.branch(done)?;
+    }
+    Ok(())
+}
+
+fn aarch64_emit_sparse_sve_probe(
+    assembler: &mut Aarch64Assembler,
+    vector_keys: usize,
+    cells: NativeCellEncoding,
+    miss: Option<Aarch64Label>,
+) -> Result<Aarch64Label, ObjectError> {
+    if vector_keys == 0 || vector_keys > MAX_NATIVE_SPARSE_EXCEPTIONS {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 SVE scalable vector key extent",
+        ));
+    }
+    let vector_loop = assembler.label()?;
+    let hit = assembler.label()?;
+    assembler.instruction(aarch64_sve_dup_b_from_w(25, 8)?)?;
+    assembler.instruction(aarch64_add_x_imm(
+        6,
+        11,
+        u16::try_from(cells.bytes()).map_err(|_| {
+            ObjectError::ArithmeticOverflow("AArch64 SVE scalable key offset")
+        })?,
+    )?)?;
+    assembler.instruction(aarch64_movz_w(10, 0)?)?;
+    assembler.instruction(aarch64_movz_w(
+        12,
+        u16::try_from(vector_keys).map_err(|_| {
+            ObjectError::ArithmeticOverflow("AArch64 SVE scalable key extent")
+        })?,
+    )?)?;
+    assembler.bind(vector_loop)?;
+    assembler.instruction(aarch64_sve_whilelo_b(1, 10, 12)?)?;
+    assembler.instruction(aarch64_sve_ld1b_predicated(24, 1, 6)?)?;
+    assembler.instruction(aarch64_sve_cmpeq_b_predicated(2, 1, 24, 25)?)?;
+    assembler.instruction(aarch64_sve_ptest_b(1, 2)?)?;
+    assembler.branch_cond(AARCH64_NE, hit)?;
+    assembler.instruction(aarch64_sve_incp_b(10, 1)?)?;
+    assembler.instruction(aarch64_sve_addvl(6, 6, 1)?)?;
+    assembler.instruction(aarch64_cmp_x(10, 12)?)?;
+    assembler.branch_cond(AARCH64_LO, vector_loop)?;
+    if let Some(miss) = miss {
+        assembler.branch(miss)?;
+    }
+    Ok(hit)
+}
+
+fn aarch64_emit_sparse_sve_hit_stub(
+    assembler: &mut Aarch64Assembler,
+    hit: Aarch64Label,
+    value_offset: usize,
+    cells: NativeCellEncoding,
+    done: Aarch64Label,
+) -> Result<(), ObjectError> {
+    assembler.bind(hit)?;
+    assembler.instruction(aarch64_sve_brkb_b(3, 1, 2)?)?;
+    assembler.instruction(aarch64_sve_cntp_b(12, 1, 3)?)?;
+    assembler.instruction(aarch64_add_x_reg(12, 10, 12)?)?;
+    aarch64_emit_sparse_indexed_value_load(assembler, value_offset, 0, cells)?;
+    assembler.branch(done)?;
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the scalar tail, fixed/scalable vector routes, common default and cold hit stubs share one lookup contract"
+)]
 fn aarch64_emit_sparse_exception_lookup(
     assembler: &mut Aarch64Assembler,
     exception_capacity: u8,
     cells: NativeCellEncoding,
     features: FeatureSet,
+    operating_system: OperatingSystem,
 ) -> Result<(), ObjectError> {
     let capacity = usize::from(exception_capacity);
     if !matches!(cells, NativeCellEncoding::Compact16 | NativeCellEncoding::Wide32)
@@ -27041,102 +27443,9 @@ fn aarch64_emit_sparse_exception_lookup(
         capacity < native_default_exception_physical_slots(exception_capacity);
     let default = assembler.label()?;
     let done = assembler.label()?;
-    if capacity <= NATIVE_SPARSE_VECTOR_LANES && features.has(CpuFeature::Aarch64Asimd) {
-        assembler.instruction(aarch64_dup_16b_from_w(0, 8)?)?;
-        assembler.instruction(aarch64_add_x_imm(
-            12,
-            11,
-            u16::try_from(cells.bytes()).map_err(|_| {
-                ObjectError::ArithmeticOverflow("AArch64 scalable vector key offset")
-            })?,
-        )?)?;
-        assembler.instruction(aarch64_load_q(24, 12)?)?;
-        assembler.instruction(aarch64_cmeq_16b(24, 24, 0)?)?;
-        assembler.instruction(aarch64_bsl_16b(24, 29, 31)?)?;
-        assembler.instruction(aarch64_uminv_16b(24, 24)?)?;
-        assembler.instruction(aarch64_umov_b0(12, 24)?)?;
-        if inline_default_slot {
-            assembler.instruction(aarch64_movz_w(8, u16::from(exception_capacity))?)?;
-            assembler.instruction(aarch64_cmp_w(12, 8)?)?;
-            assembler.instruction(aarch64_csel_w(12, 12, 8, AARCH64_LO)?)?;
-        } else {
-            assembler.instruction(aarch64_cmp_w_imm(
-                12,
-                u16::try_from(NATIVE_SPARSE_VECTOR_LANES).map_err(|_| {
-                    ObjectError::ArithmeticOverflow("AArch64 scalable vector lanes")
-                })?,
-            )?)?;
-            assembler.branch_cond(AARCH64_HS, default)?;
-        }
-        assembler.instruction(aarch64_add_x_imm(
-            6,
-            11,
-            u16::try_from(value_offset).map_err(|_| {
-                ObjectError::ArithmeticOverflow("AArch64 scalable vector value offset")
-            })?,
-        )?)?;
-        match cells {
-            NativeCellEncoding::Compact16 => {
-                assembler.instruction(aarch64_load_h_uxtw(8, 6, 12)?)?;
-            }
-            NativeCellEncoding::Wide32 => {
-                assembler.instruction(aarch64_load_w_uxtw(8, 6, 12)?)?;
-            }
-            _ => unreachable!("validated scalable sparse cell width"),
-        }
-        if inline_default_slot {
-            return Ok(());
-        }
-        assembler.branch(done)?;
-    } else if capacity <= NATIVE_SPARSE_VECTOR_LANES
-        && (features.has(CpuFeature::Aarch64Sve) || features.has(CpuFeature::Aarch64Sve2))
-    {
-        assembler.instruction(aarch64_sve_ptrue_b_vl16(1)?)?;
-        assembler.instruction(aarch64_add_x_imm(
-            12,
-            11,
-            u16::try_from(cells.bytes()).map_err(|_| {
-                ObjectError::ArithmeticOverflow("AArch64 SVE scalable key offset")
-            })?,
-        )?)?;
-        assembler.instruction(aarch64_sve_ld1b_predicated(0, 1, 12)?)?;
-        assembler.instruction(aarch64_sve_dup_b_from_w(1, 8)?)?;
-        assembler.instruction(aarch64_sve_cmpeq_b_predicated(2, 1, 0, 1)?)?;
-        if !inline_default_slot {
-            assembler.instruction(aarch64_sve_ptest_b(1, 2)?)?;
-            assembler.branch_cond(AARCH64_EQ, default)?;
-        }
-        assembler.instruction(aarch64_sve_brkb_b(3, 1, 2)?)?;
-        assembler.instruction(aarch64_sve_cntp_b(12, 1, 3)?)?;
-        if inline_default_slot {
-            // With no match BRKB retains all sixteen governing lanes, so
-            // CNTP produces 16. Clamp that result to the in-row default slot;
-            // exact matches always have a lower logical lane.
-            assembler.instruction(aarch64_movz_w(8, u16::from(exception_capacity))?)?;
-            assembler.instruction(aarch64_cmp_w(12, 8)?)?;
-            assembler.instruction(aarch64_csel_w(12, 12, 8, AARCH64_LO)?)?;
-        }
-        assembler.instruction(aarch64_add_x_imm(
-            6,
-            11,
-            u16::try_from(value_offset).map_err(|_| {
-                ObjectError::ArithmeticOverflow("AArch64 SVE scalable value offset")
-            })?,
-        )?)?;
-        match cells {
-            NativeCellEncoding::Compact16 => {
-                assembler.instruction(aarch64_load_h_uxtw(8, 6, 12)?)?;
-            }
-            NativeCellEncoding::Wide32 => {
-                assembler.instruction(aarch64_load_w_uxtw(8, 6, 12)?)?;
-            }
-            _ => unreachable!("validated scalable sparse cell width"),
-        }
-        if inline_default_slot {
-            return Ok(());
-        }
-        assembler.branch(done)?;
-    } else {
+    let isa = aarch64_primary_scanner_isa(operating_system, features, true);
+
+    if isa == Aarch64PrimaryScannerIsa::Scalar {
         aarch64_emit_sparse_binary_range(
             assembler,
             0,
@@ -27146,16 +27455,131 @@ fn aarch64_emit_sparse_exception_lookup(
             default,
             done,
         )?;
+        assembler.bind(default)?;
+        aarch64_emit_sparse_default_load(assembler, cells)?;
+        assembler.bind(done)?;
+        return Ok(());
     }
-    assembler.bind(default)?;
-    match cells {
-        NativeCellEncoding::Compact16 => {
-            assembler.instruction(aarch64_load_halfword_imm(8, 11, 0)?)?;
+
+    if capacity <= NATIVE_SPARSE_VECTOR_LANES {
+        match isa {
+            Aarch64PrimaryScannerIsa::Asimd => aarch64_emit_sparse_asimd_inline(
+                assembler,
+                exception_capacity,
+                cells,
+                value_offset,
+                inline_default_slot,
+                default,
+                done,
+            )?,
+            Aarch64PrimaryScannerIsa::Sve => aarch64_emit_sparse_sve_inline(
+                assembler,
+                exception_capacity,
+                cells,
+                value_offset,
+                inline_default_slot,
+                default,
+                done,
+            )?,
+            Aarch64PrimaryScannerIsa::SveWithAsimdVl16 => {
+                let sve = assembler.label()?;
+                assembler.branch_nonzero_w(AARCH64_MIXED_ROOT_WIDE_MODE_REGISTER, sve)?;
+                aarch64_emit_sparse_asimd_inline(
+                    assembler,
+                    exception_capacity,
+                    cells,
+                    value_offset,
+                    inline_default_slot,
+                    default,
+                    done,
+                )?;
+                assembler.bind(sve)?;
+                aarch64_emit_sparse_sve_inline(
+                    assembler,
+                    exception_capacity,
+                    cells,
+                    value_offset,
+                    inline_default_slot,
+                    default,
+                    done,
+                )?;
+            }
+            Aarch64PrimaryScannerIsa::Scalar => unreachable!("handled scalar sparse route"),
         }
-        NativeCellEncoding::Wide32 => {
-            assembler.instruction(aarch64_load_w_imm(8, 11, 0)?)?;
+        if !inline_default_slot {
+            assembler.bind(default)?;
+            aarch64_emit_sparse_default_load(assembler, cells)?;
         }
-        _ => unreachable!("validated scalable sparse cell width"),
+        assembler.bind(done)?;
+        return Ok(());
+    }
+
+    let plan = aarch64_sparse_lookup_chunk_plan(exception_capacity, cells).ok_or(
+        ObjectError::InvalidModule("AArch64 scalable vector load extent"),
+    )?;
+    if let Some(tail_start) = plan.scalar_tail_start() {
+        let vector_dispatch = assembler.label()?;
+        aarch64_emit_sparse_binary_range(
+            assembler,
+            tail_start,
+            capacity,
+            value_offset,
+            cells,
+            vector_dispatch,
+            done,
+        )?;
+        assembler.bind(vector_dispatch)?;
+    }
+
+    match isa {
+        Aarch64PrimaryScannerIsa::Asimd => {
+            let hits = aarch64_emit_sparse_asimd_probes(assembler, plan, cells)?;
+            // Zero masks are overwhelmingly common and fall straight into
+            // one default load. A taken edge preserves the complete winning
+            // group in V24..V27 for its cold exact-first-lane stub.
+            assembler.bind(default)?;
+            aarch64_emit_sparse_default_load(assembler, cells)?;
+            assembler.branch(done)?;
+            aarch64_emit_sparse_asimd_hit_stubs(
+                assembler,
+                hits,
+                value_offset,
+                cells,
+                done,
+            )?;
+        }
+        Aarch64PrimaryScannerIsa::Sve => {
+            let hit = aarch64_emit_sparse_sve_probe(assembler, plan.vector_keys, cells, None)?;
+            // The predicated no-match loop exits directly into the common
+            // default. Only the rare first-hit edge reaches the cold stub.
+            assembler.bind(default)?;
+            aarch64_emit_sparse_default_load(assembler, cells)?;
+            assembler.branch(done)?;
+            aarch64_emit_sparse_sve_hit_stub(assembler, hit, value_offset, cells, done)?;
+        }
+        Aarch64PrimaryScannerIsa::SveWithAsimdVl16 => {
+            let sve = assembler.label()?;
+            assembler.branch_nonzero_w(AARCH64_MIXED_ROOT_WIDE_MODE_REGISTER, sve)?;
+            let hits = aarch64_emit_sparse_asimd_probes(assembler, plan, cells)?;
+            // VL16 keeps the fixed-width no-match fallthrough. Wider Linux
+            // vectors branch once to the scalable loop and reuse this same
+            // default block on exhaustion.
+            assembler.bind(default)?;
+            aarch64_emit_sparse_default_load(assembler, cells)?;
+            assembler.branch(done)?;
+            aarch64_emit_sparse_asimd_hit_stubs(
+                assembler,
+                hits,
+                value_offset,
+                cells,
+                done,
+            )?;
+            assembler.bind(sve)?;
+            let hit =
+                aarch64_emit_sparse_sve_probe(assembler, plan.vector_keys, cells, Some(default))?;
+            aarch64_emit_sparse_sve_hit_stub(assembler, hit, value_offset, cells, done)?;
+        }
+        Aarch64PrimaryScannerIsa::Scalar => unreachable!("handled scalar sparse route"),
     }
     assembler.bind(done)?;
     Ok(())
@@ -27166,6 +27590,7 @@ fn aarch64_emit_table_lookup(
     transitions: TransitionLayout,
     cells: NativeCellEncoding,
     features: FeatureSet,
+    operating_system: OperatingSystem,
 ) -> Result<(), ObjectError> {
     if transitions == TransitionLayout::DefaultExceptions(0) {
         // A uniform row is independent of the current input byte. Its packed
@@ -27222,11 +27647,23 @@ fn aarch64_emit_table_lookup(
         }
         TransitionLayout::DefaultSparseExceptions(exception_capacity) => {
             assembler.instruction(aarch64_load_byte_reg(8, 5, 8)?)?;
-            aarch64_emit_sparse_exception_lookup(assembler, exception_capacity, cells, features)?;
+            aarch64_emit_sparse_exception_lookup(
+                assembler,
+                exception_capacity,
+                cells,
+                features,
+                operating_system,
+            )?;
             return Ok(());
         }
         TransitionLayout::DefaultByteSparseExceptions(exception_capacity) => {
-            aarch64_emit_sparse_exception_lookup(assembler, exception_capacity, cells, features)?;
+            aarch64_emit_sparse_exception_lookup(
+                assembler,
+                exception_capacity,
+                cells,
+                features,
+                operating_system,
+            )?;
             return Ok(());
         }
     }
@@ -27609,6 +28046,20 @@ fn aarch64_umov_b0(destination: u8, source: u8) -> Result<u32, ObjectError> {
 
 fn aarch64_load_q(destination: u8, base: u8) -> Result<u32, ObjectError> {
     Ok(0x3dc0_0000 | aarch64_reg(base, 5)? | aarch64_reg(destination, 0)?)
+}
+
+fn aarch64_load_q_imm(
+    destination: u8,
+    base: u8,
+    byte_offset: u16,
+) -> Result<u32, ObjectError> {
+    if !byte_offset.is_multiple_of(16) || byte_offset / 16 > 0x0fff {
+        return Err(ObjectError::InvalidModule("AArch64 LDR Q offset"));
+    }
+    Ok(0x3dc0_0000
+        | (u32::from(byte_offset / 16) << 10)
+        | aarch64_reg(base, 5)?
+        | aarch64_reg(destination, 0)?)
 }
 
 fn aarch64_load_pair_q(
@@ -29666,6 +30117,7 @@ fn aarch64_emit_suffix_prepass(
     use_asimd_batch: bool,
     use_exact_asimd_lane: bool,
     features: FeatureSet,
+    operating_system: OperatingSystem,
     layout: NativeDfaLayout,
     no_match: Aarch64Label,
     matched: Aarch64Label,
@@ -30017,7 +30469,14 @@ fn aarch64_emit_suffix_prepass(
     assembler.bind(apply)?;
     if let Some(retry) = suffix.retry {
         module_suffix_retry::aarch64_emit_bounded_suffix_retry(
-            assembler, layout, retry, features, retry_scan, no_match, matched,
+            assembler,
+            layout,
+            retry,
+            features,
+            operating_system,
+            retry_scan,
+            no_match,
+            matched,
         )?;
     } else {
         aarch64_emit_suffix_restart(assembler, suffix.restart)?;
@@ -30228,8 +30687,18 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
     let use_asimd_loop = sve_loop_kind.is_none()
         && features.has(CpuFeature::Aarch64Asimd)
         && layout.loop_skip.is_some();
-    let use_asimd_sparse_lookup =
-        layout.transitions.uses_vector_sparse_lookup() && features.has(CpuFeature::Aarch64Asimd);
+    let sparse_lookup_isa = layout
+        .transitions
+        .scalable_exception_capacity()
+        .map_or(Aarch64PrimaryScannerIsa::Scalar, |_| {
+            aarch64_primary_scanner_isa(operating_system, features, true)
+        });
+    let use_asimd_sparse_lookup = matches!(
+        sparse_lookup_isa,
+        Aarch64PrimaryScannerIsa::Asimd | Aarch64PrimaryScannerIsa::SveWithAsimdVl16
+    );
+    let sparse_use_runtime_vl_dispatch =
+        aarch64_primary_scanner_uses_runtime_vl_dispatch(sparse_lookup_isa);
     let pure_sve_filter = use_sve_filter && !features.has(CpuFeature::Aarch64Asimd);
     let prefix_relation_vector = layout
         .prefix_relation
@@ -30369,6 +30838,7 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
             use_asimd_suffix_batch,
             use_exact_asimd_lane,
             features,
+            operating_system,
             layout,
             no_match,
             matched,
@@ -30439,13 +30909,16 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
         aarch64_emit_sve_filter_setups(&mut assembler, filter, vector_filter, sve_filter_plan)?;
     }
 
-    if !fixed_candidate && (use_runtime_vl_dispatch || exact_use_runtime_vl_dispatch) {
+    if sparse_use_runtime_vl_dispatch
+        || !fixed_candidate && (use_runtime_vl_dispatch || exact_use_runtime_vl_dispatch)
+    {
         // The suffix prepass cannot provide this value: its short-window
         // bypass reaches the root without executing its optional CNTB, and
         // the seeded-reverse prepass also owns X16. Sample only after every
-        // prepass and initial-pending early exit. Since `scan` is bound after
-        // these instructions, all root retries preserve and reuse both
-        // caller-saved registers instead of querying the process VL again.
+        // prepass and initial-pending early exit. Sparse rows, including a
+        // fixed-candidate entry, use the same retained mode. Since `scan` is
+        // bound after these instructions, every DFA transition and root retry
+        // preserves both caller-saved registers instead of querying VL again.
         assembler.instruction(aarch64_sve_cntb(AARCH64_MIXED_ROOT_VL_REGISTER)?)?;
         assembler.instruction(aarch64_sub_x_imm(
             AARCH64_MIXED_ROOT_WIDE_MODE_REGISTER,
@@ -30958,7 +31431,13 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
     assembler.instruction(aarch64_cmp_x(2, 3)?)?;
     assembler.branch_cond(AARCH64_HS, finish)?;
     assembler.bind(scalar_body)?;
-    aarch64_emit_table_lookup(&mut assembler, layout.transitions, layout.cells, features)?;
+    aarch64_emit_table_lookup(
+        &mut assembler,
+        layout.transitions,
+        layout.cells,
+        features,
+        operating_system,
+    )?;
     assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
     // Bits at and above the accelerator flag are zero exactly for ordinary
     // live forward cells. Every dead sentinel is tagged under the forward
@@ -31123,7 +31602,13 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
             assembler.instruction(aarch64_cmp_x(2, 9)?)?;
             assembler.branch_cond(AARCH64_LS, reverse_finish)?;
             assembler.instruction(aarch64_sub_x_imm(2, 2, 1)?)?;
-            aarch64_emit_table_lookup(&mut assembler, layout.transitions, layout.cells, features)?;
+            aarch64_emit_table_lookup(
+                &mut assembler,
+                layout.transitions,
+                layout.cells,
+                features,
+                operating_system,
+            )?;
             match layout.cells {
                 NativeCellEncoding::Compact8Direct
                 | NativeCellEncoding::Compact16
@@ -57592,7 +58077,11 @@ int main(void){{
                 for (features, asimd) in [
                     (FeatureSet::of(CpuFeature::Aarch64Asimd), true),
                     (FeatureSet::of(CpuFeature::Aarch64Sve), false),
-                    (FeatureSet::of(CpuFeature::Aarch64Sve2), false),
+                    (
+                        FeatureSet::of(CpuFeature::Aarch64Sve)
+                            .with(CpuFeature::Aarch64Sve2),
+                        false,
+                    ),
                 ] {
                     let mut assembler = Aarch64Assembler::new();
                     aarch64_emit_table_lookup(
@@ -57600,6 +58089,7 @@ int main(void){{
                         transitions,
                         NativeCellEncoding::Wide32,
                         features,
+                        OperatingSystem::Linux,
                     )
                     .unwrap();
                     let words = assembler
@@ -58223,6 +58713,7 @@ int main(void){{
                     TransitionLayout::DefaultExceptions(capacity),
                     cells,
                     FeatureSet::EMPTY,
+                    OperatingSystem::Linux,
                 )
                 .unwrap();
                 let words = aarch64
@@ -58916,7 +59407,7 @@ int main(void){{
                         .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
                         .collect::<Vec<_>>();
                     assert!(
-                        words.contains(&aarch64_sve_cmpeq_b_predicated(2, 1, 0, 1).unwrap()),
+                        words.contains(&aarch64_sve_cmpeq_b_predicated(2, 1, 24, 25).unwrap()),
                         "{target:?}",
                     );
                 }
@@ -60444,6 +60935,7 @@ int main(void){{
             TransitionLayout::DefaultExceptions(0),
             NativeCellEncoding::Compact16,
             FeatureSet::EMPTY,
+            OperatingSystem::Linux,
         )
         .unwrap();
         assert_eq!(
@@ -62104,7 +62596,7 @@ int main(void){{
                                 "{target:?}",
                             );
                             assert!(
-                                words.contains(&aarch64_load_q(24, 12).unwrap()),
+                                words.contains(&aarch64_load_q(24, 6).unwrap()),
                                 "{target:?}",
                             );
                             assert!(
@@ -62127,9 +62619,9 @@ int main(void){{
                         StartAccelerator::Aarch64Sve | StartAccelerator::Aarch64Sve2 => {
                             for instruction in [
                                 aarch64_sve_ptrue_b_vl16(1).unwrap(),
-                                aarch64_sve_ld1b_predicated(0, 1, 12).unwrap(),
-                                aarch64_sve_dup_b_from_w(1, 8).unwrap(),
-                                aarch64_sve_cmpeq_b_predicated(2, 1, 0, 1).unwrap(),
+                                aarch64_sve_ld1b_predicated(24, 1, 6).unwrap(),
+                                aarch64_sve_dup_b_from_w(25, 8).unwrap(),
+                                aarch64_sve_cmpeq_b_predicated(2, 1, 24, 25).unwrap(),
                                 aarch64_sve_ptest_b(1, 2).unwrap(),
                                 aarch64_sve_brkb_b(3, 1, 2).unwrap(),
                                 aarch64_sve_cntp_b(12, 1, 3).unwrap(),
@@ -62741,9 +63233,9 @@ int main(void){{
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "chunked x86 masks, balanced AArch64 depth, and maximum offsets share one proof"
+        reason = "chunked x86/AArch64 masks, scalar depth, scalable predicates, and maximum offsets share one proof"
     )]
-    fn scalable_sparse_chunked_x86_and_balanced_aarch64_are_exact() {
+    fn scalable_sparse_chunked_x86_and_aarch64_are_exact() {
         fn comparison_depth(start: usize, end: usize, sought: usize) -> usize {
             if end - start == 1 {
                 return 1;
@@ -62872,6 +63364,7 @@ int main(void){{
                 u8::MAX,
                 cells,
                 FeatureSet::EMPTY,
+                OperatingSystem::Linux,
             )
             .unwrap();
             assert!(!aarch64_maximum.finish().unwrap().is_empty());
@@ -63017,21 +63510,332 @@ int main(void){{
                         .chunks_exact(4)
                         .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
                         .collect::<Vec<_>>();
-                    let root_load = aarch64_load_byte_imm(12, 11, 17).unwrap();
-                    let root = words
-                        .windows(5)
-                        .find(|window| {
-                            window[0] == root_load
-                                && window[1] == aarch64_cmp_w(8, 12).unwrap()
-                                && window[2] & 0xff00_001f == 0x5400_0000 | u32::from(AARCH64_LO)
-                                && window[3] & 0xff00_001f == 0x5400_0000 | u32::from(AARCH64_HI)
-                        })
-                        .expect("AArch64 balanced root comparison");
-                    assert_eq!(root[4], aarch64_load_halfword_imm(8, 11, 64).unwrap());
                     assert!(words.contains(&aarch64_load_byte_reg(8, 5, 8).unwrap()));
-                    assert!(!words.contains(&aarch64_cmeq_16b(24, 24, 0).unwrap()));
-                    assert!(!words.contains(&aarch64_sve_ptrue_b_vl16(1).unwrap()));
+                    if target.features == FeatureSet::EMPTY {
+                        let root_load = aarch64_load_byte_imm(12, 11, 17).unwrap();
+                        let root = words
+                            .windows(5)
+                            .find(|window| {
+                                window[0] == root_load
+                                    && window[1] == aarch64_cmp_w(8, 12).unwrap()
+                                    && window[2] & 0xff00_001f
+                                        == 0x5400_0000 | u32::from(AARCH64_LO)
+                                    && window[3] & 0xff00_001f
+                                        == 0x5400_0000 | u32::from(AARCH64_HI)
+                            })
+                            .expect("AArch64 balanced scalar root comparison");
+                        assert_eq!(root[4], aarch64_load_halfword_imm(8, 11, 64).unwrap());
+                        assert!(!words.contains(&aarch64_cmeq_16b(24, 24, 0).unwrap()));
+                        assert!(!words.contains(&aarch64_sve_whilelo_b(1, 10, 12).unwrap()));
+                    } else if target.features.has(CpuFeature::Aarch64Asimd) {
+                        for instruction in [
+                            aarch64_load_pair_q(24, 25, 6, 0).unwrap(),
+                            aarch64_cmeq_16b(24, 24, 0).unwrap(),
+                            aarch64_cmeq_16b(25, 25, 0).unwrap(),
+                            aarch64_movi_16b(28, 14).unwrap(),
+                            aarch64_cmhs_16b(28, 28, 29).unwrap(),
+                            aarch64_bsl_16b(24, 29, 31).unwrap(),
+                            aarch64_bsl_16b(25, 28, 31).unwrap(),
+                        ] {
+                            assert!(words.contains(&instruction), "{instruction:#x}");
+                        }
+                        assert!(!words.contains(&aarch64_sve_whilelo_b(1, 10, 12).unwrap()));
+                    } else {
+                        for instruction in [
+                            aarch64_sve_dup_b_from_w(25, 8).unwrap(),
+                            aarch64_sve_whilelo_b(1, 10, 12).unwrap(),
+                            aarch64_sve_ld1b_predicated(24, 1, 6).unwrap(),
+                            aarch64_sve_cmpeq_b_predicated(2, 1, 24, 25).unwrap(),
+                            aarch64_sve_incp_b(10, 1).unwrap(),
+                            aarch64_sve_addvl(6, 6, 1).unwrap(),
+                            aarch64_sve_brkb_b(3, 1, 2).unwrap(),
+                            aarch64_sve_cntp_b(12, 1, 3).unwrap(),
+                        ] {
+                            assert!(words.contains(&instruction), "{instruction:#x}");
+                        }
+                        assert!(!words.contains(&aarch64_cmeq_16b(24, 24, 0).unwrap()));
+                    }
                 }
+            }
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the exhaustive capacity proof recomputes checked row geometry with small fixed bounds"
+    )]
+    fn aarch64_sparse_chunk_plan_exhausts_every_capacity_and_cell_width() {
+        for cells in [NativeCellEncoding::Compact16, NativeCellEncoding::Wide32] {
+            for capacity in MAX_NATIVE_DEFAULT_EXCEPTIONS + 1..=MAX_NATIVE_SPARSE_EXCEPTIONS {
+                let capacity_u8 = u8::try_from(capacity).unwrap();
+                let plan = aarch64_sparse_lookup_chunk_plan(capacity_u8, cells).unwrap();
+                let remainder = capacity % NATIVE_SPARSE_VECTOR_LANES;
+                let expected_scalar_tail = if remainder <= MAX_NATIVE_SPARSE_SCALAR_TAIL {
+                    remainder
+                } else {
+                    0
+                };
+                let expected_vector_keys = capacity - expected_scalar_tail;
+                let expected_chunks =
+                    (expected_vector_keys + NATIVE_SPARSE_VECTOR_LANES - 1)
+                        / NATIVE_SPARSE_VECTOR_LANES;
+                assert_eq!(plan.vector_width, NATIVE_SPARSE_VECTOR_LANES);
+                assert_eq!(plan.vector_keys, expected_vector_keys, "capacity={capacity}");
+                assert_eq!(plan.scalar_tail, expected_scalar_tail, "capacity={capacity}");
+                assert_eq!(plan.vector_chunks, expected_chunks, "capacity={capacity}");
+                assert_eq!(plan.scalar_tail_start(), (expected_scalar_tail != 0).then_some(expected_vector_keys));
+
+                let row_bytes = native_default_exception_row_bytes(capacity_u8, cells).unwrap();
+                let key_base = cells.bytes();
+                let readable_key_bytes = row_bytes - key_base;
+                let final_load_end = plan.vector_chunks * NATIVE_SPARSE_VECTOR_LANES;
+                assert!(final_load_end <= readable_key_bytes, "{cells:?}/{capacity}");
+                for chunk in 0..plan.vector_chunks {
+                    let start = plan.chunk_start(chunk).unwrap();
+                    let live = plan.chunk_live_lanes(chunk).unwrap();
+                    assert_eq!(start, chunk * NATIVE_SPARSE_VECTOR_LANES);
+                    assert!((1..=NATIVE_SPARSE_VECTOR_LANES).contains(&live));
+                    assert!(key_base + start + NATIVE_SPARSE_VECTOR_LANES <= row_bytes);
+                    assert_eq!(live, (plan.vector_keys - start).min(NATIVE_SPARSE_VECTOR_LANES));
+                }
+                assert_eq!(plan.chunk_start(plan.vector_chunks), None);
+                assert_eq!(plan.chunk_live_lanes(plan.vector_chunks), None);
+                assert!(TransitionLayout::DefaultSparseExceptions(capacity_u8)
+                    .uses_vector_sparse_lookup());
+                assert!(TransitionLayout::DefaultByteSparseExceptions(capacity_u8)
+                    .uses_vector_sparse_lookup());
+            }
+        }
+        assert!(!TransitionLayout::DefaultSparseExceptions(
+            u8::try_from(MAX_NATIVE_DEFAULT_EXCEPTIONS).unwrap(),
+        )
+        .uses_vector_sparse_lookup());
+    }
+
+    #[test]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "bounded lane models directly mirror fixed 16-byte groups and architectural SVE VLs"
+    )]
+    fn aarch64_sparse_asimd_and_sve_lane_models_cover_every_capacity() {
+        fn scalar_tail_first(
+            plan: NativeSparseChunkPlan,
+            candidates: &[bool],
+        ) -> Option<usize> {
+            plan.scalar_tail_start()
+                .and_then(|start| (start..candidates.len()).find(|&slot| candidates[slot]))
+        }
+
+        fn asimd_first(
+            plan: NativeSparseChunkPlan,
+            candidates: &[bool],
+        ) -> Option<usize> {
+            if let Some(tail) = scalar_tail_first(plan, candidates) {
+                return Some(tail);
+            }
+            for first_chunk in (0..plan.vector_chunks).step_by(4) {
+                let group_start = plan.chunk_start(first_chunk).unwrap();
+                let group_chunks = (plan.vector_chunks - first_chunk).min(4);
+                let group_end = (group_start + group_chunks * plan.vector_width)
+                    .min(plan.vector_keys);
+                if let Some(local) = (group_start..group_end).find(|&slot| candidates[slot]) {
+                    return Some(local);
+                }
+            }
+            None
+        }
+
+        fn sve_first(
+            plan: NativeSparseChunkPlan,
+            candidates: &[bool],
+            vector_length: usize,
+        ) -> Option<usize> {
+            if let Some(tail) = scalar_tail_first(plan, candidates) {
+                return Some(tail);
+            }
+            let mut base = 0_usize;
+            while base < plan.vector_keys {
+                let active = (plan.vector_keys - base).min(vector_length);
+                if let Some(local) =
+                    (base..base + active).find(|&slot| candidates[slot])
+                {
+                    return Some(local);
+                }
+                // INCP advances the logical ordinal by active P1 lanes while
+                // ADDVL advances the independent address by one complete VL.
+                base += active;
+            }
+            None
+        }
+
+        for capacity in NATIVE_SPARSE_VECTOR_LANES + 1..=MAX_NATIVE_SPARSE_EXCEPTIONS {
+            let plan = aarch64_sparse_lookup_chunk_plan(
+                u8::try_from(capacity).unwrap(),
+                NativeCellEncoding::Compact16,
+            )
+            .unwrap();
+            let mut candidates = vec![false; capacity];
+            assert_eq!(asimd_first(plan, &candidates), None);
+            for vector_length in (16_usize..=256).step_by(16) {
+                assert_eq!(sve_first(plan, &candidates, vector_length), None);
+            }
+            for sought in 0..capacity {
+                candidates[sought] = true;
+                assert_eq!(asimd_first(plan, &candidates), Some(sought), "capacity={capacity}");
+                for vector_length in (16_usize..=256).step_by(16) {
+                    assert_eq!(
+                        sve_first(plan, &candidates, vector_length),
+                        Some(sought),
+                        "capacity={capacity}/vl={vector_length}/sought={sought}",
+                    );
+                }
+                candidates[sought] = false;
+            }
+
+            candidates[0] = true;
+            candidates[capacity - 1] = true;
+            let expected = plan.scalar_tail_start().map_or(0, |_| capacity - 1);
+            assert_eq!(asimd_first(plan, &candidates), Some(expected));
+            for vector_length in (16_usize..=256).step_by(16) {
+                assert_eq!(sve_first(plan, &candidates, vector_length), Some(expected));
+            }
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "all feature/OS routes and capacity boundaries share one structural instruction audit"
+    )]
+    fn aarch64_sparse_vector_routes_cover_features_os_cells_and_boundaries() {
+        let asimd = FeatureSet::of(CpuFeature::Aarch64Asimd);
+        let sve = FeatureSet::of(CpuFeature::Aarch64Sve);
+        let sve2 = sve.with(CpuFeature::Aarch64Sve2);
+        let mixed = asimd.with(CpuFeature::Aarch64Sve);
+        let mixed_sve2 = mixed.with(CpuFeature::Aarch64Sve2);
+        let cases = [
+            (
+                OperatingSystem::Linux,
+                FeatureSet::EMPTY,
+                Aarch64PrimaryScannerIsa::Scalar,
+            ),
+            (
+                OperatingSystem::Linux,
+                asimd,
+                Aarch64PrimaryScannerIsa::Asimd,
+            ),
+            (
+                OperatingSystem::Linux,
+                sve,
+                Aarch64PrimaryScannerIsa::Sve,
+            ),
+            (
+                OperatingSystem::Linux,
+                sve2,
+                Aarch64PrimaryScannerIsa::Sve,
+            ),
+            (
+                OperatingSystem::Linux,
+                mixed,
+                Aarch64PrimaryScannerIsa::SveWithAsimdVl16,
+            ),
+            (
+                OperatingSystem::Linux,
+                mixed_sve2,
+                Aarch64PrimaryScannerIsa::SveWithAsimdVl16,
+            ),
+            (
+                OperatingSystem::Macos,
+                asimd,
+                Aarch64PrimaryScannerIsa::Asimd,
+            ),
+            (
+                OperatingSystem::Macos,
+                mixed_sve2,
+                Aarch64PrimaryScannerIsa::Asimd,
+            ),
+            (
+                OperatingSystem::Macos,
+                sve2,
+                Aarch64PrimaryScannerIsa::Scalar,
+            ),
+        ];
+        let capacities = [5_u8, 15, 16, 17, 20, 21, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255];
+
+        for cells in [NativeCellEncoding::Compact16, NativeCellEncoding::Wide32] {
+            for capacity in capacities {
+                for (operating_system, features, expected_isa) in cases {
+                    assert_eq!(
+                        aarch64_primary_scanner_isa(operating_system, features, true),
+                        expected_isa,
+                    );
+                    let mut assembler = Aarch64Assembler::new();
+                    aarch64_emit_sparse_exception_lookup(
+                        &mut assembler,
+                        capacity,
+                        cells,
+                        features,
+                        operating_system,
+                    )
+                    .unwrap();
+                    let words = assembler
+                        .finish()
+                        .unwrap()
+                        .chunks_exact(4)
+                        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                        .collect::<Vec<_>>();
+                    let has_asimd = words.contains(&aarch64_cmeq_16b(24, 24, 0).unwrap());
+                    let has_sve = if usize::from(capacity) <= NATIVE_SPARSE_VECTOR_LANES {
+                        words.contains(&aarch64_sve_ptrue_b_vl16(1).unwrap())
+                    } else {
+                        words.contains(&aarch64_sve_whilelo_b(1, 10, 12).unwrap())
+                    };
+                    assert_eq!(
+                        has_asimd,
+                        matches!(
+                            expected_isa,
+                            Aarch64PrimaryScannerIsa::Asimd
+                                | Aarch64PrimaryScannerIsa::SveWithAsimdVl16
+                        ),
+                        "{operating_system:?}/{features:?}/{cells:?}/{capacity}",
+                    );
+                    assert_eq!(
+                        has_sve,
+                        matches!(
+                            expected_isa,
+                            Aarch64PrimaryScannerIsa::Sve
+                                | Aarch64PrimaryScannerIsa::SveWithAsimdVl16
+                        ),
+                        "{operating_system:?}/{features:?}/{cells:?}/{capacity}",
+                    );
+                    let has_mixed_dispatch = words.iter().any(|word| {
+                        word & 0x7f00_001f
+                            == 0x3500_0000
+                                | u32::from(AARCH64_MIXED_ROOT_WIDE_MODE_REGISTER)
+                    });
+                    assert_eq!(
+                        has_mixed_dispatch,
+                        expected_isa == Aarch64PrimaryScannerIsa::SveWithAsimdVl16,
+                    );
+                    if operating_system == OperatingSystem::Macos {
+                        assert!(!has_sve, "macOS emitted SVE for {features:?}/{capacity}");
+                    }
+                }
+
+                let emit = |features| {
+                    let mut assembler = Aarch64Assembler::new();
+                    aarch64_emit_sparse_exception_lookup(
+                        &mut assembler,
+                        capacity,
+                        cells,
+                        features,
+                        OperatingSystem::Linux,
+                    )
+                    .unwrap();
+                    assembler.finish().unwrap()
+                };
+                assert_eq!(emit(sve), emit(sve2), "SVE2 changed CMPEQ route/{cells:?}/{capacity}");
             }
         }
     }
@@ -73261,17 +74065,24 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
     #[test]
     fn aarch64_sve_scanner_instructions_have_exact_encodings() {
         assert_eq!(aarch64_cmp_x_lsl(12, 6, 2).unwrap(), 0xeb06_099f);
+        assert_eq!(aarch64_load_q_imm(26, 6, 32).unwrap(), 0x3dc0_08da);
         assert_eq!(aarch64_sve_ptrue_b(), 0x2518_e3e0);
         assert_eq!(aarch64_sve_cntb(13).unwrap(), 0x0420_e3ed);
         assert_eq!(aarch64_sve_ld1b_vl(0, 12, 0).unwrap(), 0xa400_a180);
         assert_eq!(aarch64_sve_ld1b_vl(1, 12, 1).unwrap(), 0xa401_a181);
         assert_eq!(aarch64_sve_ld1b_vl(7, 12, 3).unwrap(), 0xa403_a187);
+        assert_eq!(aarch64_sve_ld1b_predicated(24, 1, 6).unwrap(), 0xa400_a4d8);
         assert_eq!(aarch64_sve_ld1rqb(16, 12).unwrap(), 0xa400_2190);
         assert_eq!(aarch64_sve_dup_b_imm(16, 0x00).unwrap(), 0x2538_c010);
         assert_eq!(aarch64_sve_dup_b_imm(17, 0x7f).unwrap(), 0x2538_cff1);
         assert_eq!(aarch64_sve_dup_b_imm(18, 0x80).unwrap(), 0x2538_d012);
         assert_eq!(aarch64_sve_dup_b_imm(19, 0xff).unwrap(), 0x2538_dff3);
+        assert_eq!(aarch64_sve_dup_b_from_w(25, 8).unwrap(), 0x0520_3919);
         assert_eq!(aarch64_sve_cmpeq_b(1, 0, 16).unwrap(), 0x2410_a001);
+        assert_eq!(
+            aarch64_sve_cmpeq_b_predicated(2, 1, 24, 25).unwrap(),
+            0x2419_a702,
+        );
         assert_eq!(aarch64_sve_cmphs_b(1, 0, 16).unwrap(), 0x2410_0001);
         assert_eq!(aarch64_sve_cmphs_b(3, 17, 0).unwrap(), 0x2400_0223);
         assert_eq!(aarch64_sve_and_b(1, 1, 3).unwrap(), 0x2503_4021);
@@ -73280,12 +74091,18 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
         assert_eq!(aarch64_sve_orrs_p0_b(8, 8, 9).unwrap(), 0x25c9_4108);
         assert_eq!(aarch64_sve_ptest_p0(1).unwrap(), 0x2550_c020);
         assert_eq!(aarch64_sve_ptest_p0(4).unwrap(), 0x2550_c080);
+        assert_eq!(aarch64_sve_ptest_b(1, 2).unwrap(), 0x2550_c440);
         assert_eq!(aarch64_sve_brkb_p0(2, 1).unwrap(), 0x2590_4022);
         assert_eq!(aarch64_sve_brkb_p0(3, 4).unwrap(), 0x2590_4083);
+        assert_eq!(aarch64_sve_brkb_b(3, 1, 2).unwrap(), 0x2590_4443);
+        assert_eq!(aarch64_sve_cntp_b(12, 1, 3).unwrap(), 0x2520_846c);
+        assert_eq!(aarch64_sve_incp_b(10, 1).unwrap(), 0x252c_882a);
         assert_eq!(aarch64_sve_incp_b(2, 2).unwrap(), 0x252c_8842);
+        assert_eq!(aarch64_sve_whilelo_b(1, 10, 12).unwrap(), 0x252c_1d41);
         assert_eq!(aarch64_sve_whilelo_b(0, 2, 3).unwrap(), 0x2523_1c40);
         assert_eq!(aarch64_sve_addvl(2, 2, 1).unwrap(), 0x0422_5022);
         assert_eq!(aarch64_sve_addvl(3, 4, 4).unwrap(), 0x0424_5083);
+        assert_eq!(aarch64_sve_addvl(6, 6, 1).unwrap(), 0x0426_5026);
         assert_eq!(aarch64_sve2_match_b(1, 0, 16).unwrap(), 0x4530_8001);
 
         assert!(aarch64_cmp_x_lsl(0, 0, 64).is_err());
@@ -78812,6 +79629,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             true,
             false,
             FeatureSet::of(CpuFeature::Aarch64Asimd),
+            OperatingSystem::Linux,
             aarch64_layout,
             aarch64_no_match,
             aarch64_matched,
@@ -82116,6 +82934,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             TransitionLayout::ClassMapped,
             NativeCellEncoding::Compact16,
             FeatureSet::EMPTY,
+            OperatingSystem::Linux,
         )
         .unwrap();
         let aarch64_class = aarch64_class.finish().unwrap();
@@ -82129,6 +82948,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             TransitionLayout::DirectByte,
             NativeCellEncoding::Compact16,
             FeatureSet::EMPTY,
+            OperatingSystem::Linux,
         )
         .unwrap();
         let aarch64_direct = aarch64_direct.finish().unwrap();

@@ -132,6 +132,7 @@ pub(super) fn aarch64_emit_bounded_suffix_retry(
     layout: NativeDfaLayout,
     plan: BoundedSuffixRetryPlan,
     features: FeatureSet,
+    operating_system: OperatingSystem,
     retry_scan: Aarch64Label,
     no_match: Aarch64Label,
     matched: Aarch64Label,
@@ -167,7 +168,13 @@ pub(super) fn aarch64_emit_bounded_suffix_retry(
     assembler.bind(verifier)?;
     assembler.instruction(aarch64_cmp_x(2, 10)?)?;
     assembler.branch_cond(AARCH64_HS, rejected)?;
-    aarch64_emit_table_lookup(assembler, layout.transitions, layout.cells, features)?;
+    aarch64_emit_table_lookup(
+        assembler,
+        layout.transitions,
+        layout.cells,
+        features,
+        operating_system,
+    )?;
     assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
     assembler.branch_bit_set_w(8, layout.cells.accepts_bit(), accepted)?;
     // Mirror the ordinary forward dispatcher: both the accept and
@@ -275,6 +282,7 @@ mod tests {
             layout,
             plan,
             FeatureSet::EMPTY,
+            OperatingSystem::Linux,
             retry,
             no_match,
             matched,
