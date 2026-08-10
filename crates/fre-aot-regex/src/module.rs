@@ -6468,6 +6468,25 @@ enum NativeCellEncoding {
     Wide32,
 }
 
+/// Selects the representation of a semantically dead packed DFA cell.
+///
+/// Ordinary forward rows tag every dead cell as exceptional, including wide
+/// rows whose low-bit dead payload remains zero. This lets both native ISAs
+/// classify every forward exception with the same unsigned high-bit test.
+/// Retained reverse rows and the independent seeded-reverse sidecar preserve
+/// their legacy wide representation, where zero alone means dead.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeDeadCellPolicy {
+    ForwardTagged,
+    LegacyZero,
+}
+
+impl NativeDeadCellPolicy {
+    const fn tags_dead(self, cells: NativeCellEncoding) -> bool {
+        cells.is_compact() || matches!(self, Self::ForwardTagged)
+    }
+}
+
 impl NativeCellEncoding {
     const fn bytes(self) -> usize {
         match self {
@@ -10175,7 +10194,12 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
                 if bytes.len() > row_end {
                     return Err(ObjectError::InvalidModule("native forward row overflow"));
                 }
-                pad_native_packed_row(&mut bytes, row_end, cells)?;
+                pad_native_packed_row(
+                    &mut bytes,
+                    row_end,
+                    cells,
+                    NativeDeadCellPolicy::ForwardTagged,
+                )?;
             }
         }
         TransitionLayout::DirectByte => {
@@ -10472,7 +10496,12 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
                     if bytes.len() > row_end {
                         return Err(ObjectError::InvalidModule("native reverse row overflow"));
                     }
-                    pad_native_packed_row(&mut bytes, row_end, cells)?;
+                    pad_native_packed_row(
+                        &mut bytes,
+                        row_end,
+                        cells,
+                        NativeDeadCellPolicy::LegacyZero,
+                    )?;
                 }
             }
             TransitionLayout::DirectByte => {
@@ -12576,7 +12605,14 @@ fn pack_native_forward_cell_with_exact_rows(
             "native DFA row is not encodable at its cell width",
         ))?
     };
-    pack_native_encoded_cell(encoded_next, flag, accelerated, dead, cells)
+    pack_native_encoded_cell(
+        encoded_next,
+        flag,
+        accelerated,
+        dead,
+        cells,
+        NativeDeadCellPolicy::ForwardTagged,
+    )
 }
 
 #[allow(
@@ -12689,7 +12725,14 @@ fn pack_native_cell_with_acceleration(
         states,
         cells,
     )?;
-    pack_native_encoded_cell(encoded_next, flag, accelerated, dead, cells)
+    pack_native_encoded_cell(
+        encoded_next,
+        flag,
+        accelerated,
+        dead,
+        cells,
+        NativeDeadCellPolicy::LegacyZero,
+    )
 }
 
 fn pack_native_encoded_cell(
@@ -12698,6 +12741,7 @@ fn pack_native_encoded_cell(
     accelerated: bool,
     dead: bool,
     cells: NativeCellEncoding,
+    dead_policy: NativeDeadCellPolicy,
 ) -> Result<u32, ObjectError> {
     let encoded_next = u32::try_from(encoded_next)
         .map_err(|_| ObjectError::ArithmeticOverflow("native DFA encoded next row"))?;
@@ -12713,12 +12757,13 @@ fn pack_native_encoded_cell(
             "native DFA state exceeds packed cell",
         ));
     }
-    // Compact zero-based tokens make row zero a valid ordinary destination.
-    // Give dead cells the otherwise-unreachable maximum payload and tag them
-    // exceptional. The cold accelerator edge recognizes that exact payload;
-    // `accelerated` itself remains a semantic graph tag and is still rejected
-    // for dead inputs above.
-    let encoded_accelerated = accelerated || dead && cells.is_compact();
+    // Compact zero-based tokens make row zero a valid ordinary destination,
+    // so their dead sentinel is always tagged. Forward wide cells tag their
+    // zero dead payload as well. Ordinary and seeded wide reverse cells
+    // deliberately keep their historical literal-zero representation;
+    // compact cells stay tagged under either policy. `accelerated` itself is
+    // still a semantic graph tag and remains invalid for dead inputs above.
+    let encoded_accelerated = accelerated || dead && dead_policy.tags_dead(cells);
     Ok(encoded_next
         | if encoded_accelerated {
             cells.accelerated()
@@ -12761,6 +12806,7 @@ fn pad_native_packed_row(
     bytes: &mut Vec<u8>,
     row_end: usize,
     cells: NativeCellEncoding,
+    dead_policy: NativeDeadCellPolicy,
 ) -> Result<(), ObjectError> {
     if bytes.len() > row_end
         || !row_end
@@ -12770,7 +12816,7 @@ fn pad_native_packed_row(
         return Err(ObjectError::InvalidModule("native packed row padding"));
     }
     let dead = cells.dead_token()
-        | if cells.is_compact() {
+        | if dead_policy.tags_dead(cells) {
             cells.accelerated()
         } else {
             0
@@ -13903,7 +13949,7 @@ fn x86_emit_clear_eax_bit(assembler: &mut X86Assembler, bit: u8) -> Result<(), O
     Ok(())
 }
 
-fn x86_emit_compact_zero_based_classifier(
+fn x86_emit_unsigned_cell_classifier(
     assembler: &mut X86Assembler,
     cells: NativeCellEncoding,
 ) -> Result<(), ObjectError> {
@@ -13921,9 +13967,9 @@ fn x86_emit_compact_zero_based_classifier(
             assembler.instruction(&compare)?;
         }
         NativeCellEncoding::Wide32 => {
-            return Err(ObjectError::InvalidModule(
-                "wide cell entered compact classifier",
-            ));
+            let mut compare = vec![0x3d]; // cmp eax, next_mask
+            compare.extend_from_slice(&cells.next_mask().to_le_bytes());
+            assembler.instruction(&compare)?;
         }
     }
     Ok(())
@@ -16535,7 +16581,7 @@ fn lower_x86_64_dfa_with_entry_contract(
     let scalar_backedge = assembler.label()?;
     let accelerated_transition = assembler.label()?;
     let partial_resume = assembler.label()?;
-    let compact_exception = assembler.label()?;
+    let forward_exception = assembler.label()?;
     let prefix_check = assembler.label()?;
     let prefix_vector_check = assembler.label()?;
     let prefix_verified = assembler.label()?;
@@ -16553,7 +16599,6 @@ fn lower_x86_64_dfa_with_entry_contract(
     let filter_sparse_batch_hit = assembler.label()?;
     let filter_retained_exhausted = assembler.label()?;
     let accept = assembler.label()?;
-    let after_accept = assembler.label()?;
     let finish = assembler.label()?;
     let no_match = assembler.label()?;
     let matched = assembler.label()?;
@@ -17180,36 +17225,25 @@ fn lower_x86_64_dfa_with_entry_contract(
         x86_start_filter_kind(features),
     )?;
     assembler.instruction(&[0x48, 0xff, 0xc2])?; // position += 1
+    // Every ordinary live token is at most this encoding's authenticated
+    // maximum. Either metadata bit, including the bit carried by every
+    // forward dead sentinel, moves the unsigned value above that range.
+    x86_emit_unsigned_cell_classifier(&mut assembler, layout.cells)?;
+    assembler.branch(&[0x0f, 0x87], forward_exception)?; // ja
     match layout.cells {
         NativeCellEncoding::Compact8Direct
         | NativeCellEncoding::Compact16
         | NativeCellEncoding::Compact16Indexed(_)
         | NativeCellEncoding::Compact16Ordinal(_) => {
-            // Every ordinary live token is a zero-based scaled row offset
-            // below the reserved dead payload. Either metadata bit, including
-            // the bit carried by that cold sentinel, moves the value above
-            // this range, so one unsigned branch classifies every exception.
-            x86_emit_compact_zero_based_classifier(&mut assembler, layout.cells)?;
-            assembler.branch(&[0x0f, 0x87], compact_exception)?; // ja
             x86_emit_set_row_from_compact_zero_based_cell(&mut assembler, layout.cells)?;
-            assembler.branch(&[0xe9], scalar_backedge)?;
         }
         NativeCellEncoding::Wide32 => {
-            // A wide cell's sign bit is accept, while literal zero is the
-            // non-accepting dead edge. One TEST establishes both facts.
-            assembler.instruction(&[0x85, 0xc0])?; // test eax, eax
-            assembler.branch(&[0x0f, 0x88], accept)?; // js
-            assembler.branch(&[0x0f, 0x84], finish)?; // jz
+            // The authenticated forward packer tags dead zero, so every
+            // ordinary wide value here is a nonzero one-based token.
+            x86_emit_set_row_from_cell(&mut assembler, layout.cells)?;
         }
     }
-    assembler.bind(after_accept)?;
-    if layout.cells == NativeCellEncoding::Wide32 {
-        x86_emit_test_eax_mask(&mut assembler, layout.cells.accelerated())?;
-        assembler.branch(&[0x0f, 0x85], accelerated_transition)?;
-        // TEST/JS/JZ plus the accelerator branch prove EAX is a raw nonzero
-        // byte token on this common edge.
-        x86_emit_set_row_from_cell(&mut assembler, layout.cells)?;
-    }
+    assembler.branch(&[0xe9], scalar_backedge)?;
     assembler.bind(scalar_backedge)?;
     // Rotate the steady-state loop around its bounds check. Scanner and
     // accelerator entries still use `scalar_transition`, while ordinary live
@@ -17271,14 +17305,12 @@ fn lower_x86_64_dfa_with_entry_contract(
         assembler.branch(&[0xe9], done)?;
     }
 
-    assembler.bind(compact_exception)?;
-    if layout.cells.is_compact() {
-        x86_emit_test_eax_mask(&mut assembler, layout.cells.accepts())?;
-        assembler.branch(&[0x0f, 0x85], accept)?;
-        // Every non-accepting compact exception is accelerator-tagged: a
-        // graph accelerator, partial hole, or the explicit dead sentinel.
-        assembler.branch(&[0xe9], accelerated_transition)?;
-    }
+    assembler.bind(forward_exception)?;
+    x86_emit_test_eax_mask(&mut assembler, layout.cells.accepts())?;
+    assembler.branch(&[0x0f, 0x85], accept)?;
+    // Every non-accepting forward exception is accelerator-tagged: a graph
+    // accelerator, partial hole, or the explicit dead sentinel.
+    assembler.branch(&[0xe9], accelerated_transition)?;
 
     assembler.bind(accept)?;
     if layout.output == OutputContract::Exists {
@@ -17286,27 +17318,27 @@ fn lower_x86_64_dfa_with_entry_contract(
     } else {
         assembler.instruction(&[0x49, 0x89, 0xd3])?;
         // Normalize only the cold accepting edge. This makes an accepted-live
-        // cell identical to a raw token while accepted-dead retains its
-        // explicit compact accelerator sentinel.
+        // cell identical to an ordinary token while accepted-dead retains its
+        // explicit accelerator sentinel at every cell width.
         x86_emit_clear_eax_bit(&mut assembler, layout.cells.accepts_bit())?;
+        x86_emit_test_eax_mask(&mut assembler, layout.cells.accelerated())?;
+        assembler.branch(&[0x0f, 0x85], accelerated_transition)?;
         match layout.cells {
             NativeCellEncoding::Compact8Direct
             | NativeCellEncoding::Compact16
             | NativeCellEncoding::Compact16Indexed(_)
             | NativeCellEncoding::Compact16Ordinal(_) => {
-                x86_emit_test_eax_mask(&mut assembler, layout.cells.accelerated())?;
-                assembler.branch(&[0x0f, 0x85], accelerated_transition)?;
                 // With both metadata bits disproved, EAX is already the
                 // zero-based scaled row token, including valid row zero.
                 x86_emit_set_row_from_compact_zero_based_cell(&mut assembler, layout.cells)?;
-                assembler.branch(&[0xe9], scalar_backedge)?;
             }
             NativeCellEncoding::Wide32 => {
-                assembler.instruction(&[0x85, 0xc0])?;
-                assembler.branch(&[0x0f, 0x84], finish)?;
-                assembler.branch(&[0xe9], after_accept)?;
+                // Accepted dead is tagged, so an ordinary accepted wide cell
+                // is necessarily a nonzero one-based row token.
+                x86_emit_set_row_from_cell(&mut assembler, layout.cells)?;
             }
         }
+        assembler.branch(&[0xe9], scalar_backedge)?;
     }
 
     assembler.bind(finish)?;
@@ -17377,7 +17409,7 @@ fn lower_x86_64_dfa_with_entry_contract(
                 | NativeCellEncoding::Compact16
                 | NativeCellEncoding::Compact16Indexed(_)
                 | NativeCellEncoding::Compact16Ordinal(_) => {
-                    x86_emit_compact_zero_based_classifier(&mut assembler, layout.cells)?;
+                    x86_emit_unsigned_cell_classifier(&mut assembler, layout.cells)?;
                     assembler.branch(&[0x0f, 0x87], reverse_exception)?;
                     x86_emit_set_row_from_compact_zero_based_cell(
                         &mut assembler,
@@ -29668,7 +29700,7 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
     let scalar_backedge = assembler.label()?;
     let accelerated_transition = assembler.label()?;
     let partial_resume = assembler.label()?;
-    let compact_exception = assembler.label()?;
+    let forward_exception = assembler.label()?;
     let prefix_check = assembler.label()?;
     let prefix_vector_check = assembler.label()?;
     let prefix_verified = assembler.label()?;
@@ -29690,7 +29722,6 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
     let filter_scalar_columns = assembler.label()?;
     let filter_scalar_reject = assembler.label()?;
     let accept = assembler.label()?;
-    let after_accept = assembler.label()?;
     let finish = assembler.label()?;
     let no_match = assembler.label()?;
     let matched = assembler.label()?;
@@ -30506,35 +30537,30 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
     assembler.bind(scalar_body)?;
     aarch64_emit_table_lookup(&mut assembler, layout.transitions, layout.cells, features)?;
     assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
+    // Bits at and above the accelerator flag are zero exactly for ordinary
+    // live forward cells. Every dead sentinel is tagged under the forward
+    // packing policy, so one shift and one branch classify every exception.
+    assembler.instruction(aarch64_lsr_w_imm(
+        12,
+        8,
+        layout.cells.accelerated_bit(),
+    )?)?;
+    assembler.branch_nonzero_w(12, forward_exception)?;
     match layout.cells {
         NativeCellEncoding::Compact8Direct
         | NativeCellEncoding::Compact16
         | NativeCellEncoding::Compact16Indexed(_)
         | NativeCellEncoding::Compact16Ordinal(_) => {
-            // W8 is already the zero-based row token. Bits at and above the
-            // accelerator flag are all zero exactly for ordinary live compact
-            // cells; dead uses the reserved maximum payload plus that flag.
-            assembler.instruction(aarch64_lsr_w_imm(
-                12,
-                8,
-                layout.cells.accelerated_bit(),
-            )?)?;
-            assembler.branch_nonzero_w(12, compact_exception)?;
             aarch64_set_row_from_zero_based_cell(&mut assembler, layout.cells, 8)?;
-            assembler.branch(scalar_backedge)?;
         }
         NativeCellEncoding::Wide32 => {
-            assembler.branch_bit_set_w(8, layout.cells.accepts_bit(), accept)?;
+            // The forward packing invariant makes every ordinary wide token
+            // nonzero and one-based.
+            assembler.instruction(aarch64_sub_w_imm(6, 8, 1)?)?;
+            aarch64_set_row_from_zero_based_cell(&mut assembler, layout.cells, 6)?;
         }
     }
-    assembler.bind(after_accept)?;
-    if layout.cells == NativeCellEncoding::Wide32 {
-        assembler.branch_bit_set_w(8, layout.cells.accelerated_bit(), accelerated_transition)?;
-        // The accept and accelerator branches prove W8 is a raw token.
-        assembler.branch_zero_w(8, finish)?;
-        assembler.instruction(aarch64_sub_w_imm(6, 8, 1)?)?;
-        aarch64_set_row_from_zero_based_cell(&mut assembler, layout.cells, 6)?;
-    }
+    assembler.branch(scalar_backedge)?;
     assembler.bind(scalar_backedge)?;
     assembler.instruction(aarch64_cmp_x(2, 3)?)?;
     assembler.branch_cond(AARCH64_LO, scalar_body)?;
@@ -30585,13 +30611,11 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
         assembler.branch(done)?;
     }
 
-    assembler.bind(compact_exception)?;
-    if layout.cells.is_compact() {
-        assembler.branch_bit_set_w(8, layout.cells.accepts_bit(), accept)?;
-        // Every non-accepting compact exception is accelerator-tagged: a
-        // graph accelerator, partial hole, or the explicit dead sentinel.
-        assembler.branch(accelerated_transition)?;
-    }
+    assembler.bind(forward_exception)?;
+    assembler.branch_bit_set_w(8, layout.cells.accepts_bit(), accept)?;
+    // Every non-accepting forward exception is accelerator-tagged: a graph
+    // accelerator, partial hole, or the explicit dead sentinel.
+    assembler.branch(accelerated_transition)?;
 
     assembler.bind(accept)?;
     if layout.output == OutputContract::Exists {
@@ -30599,27 +30623,25 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
     } else {
         assembler.instruction(aarch64_mov_x(7, 2)?)?;
         // Clear only the layout-specific accept bit on this cold edge. Any
-        // accelerator bit, including compact accepted-dead, remains available
-        // to the shared classifier.
+        // accelerator bit, including accepted-dead at every width, remains
+        // available to the shared classifier.
         assembler.instruction(aarch64_and_low_w(8, 8, layout.cells.accepts_bit())?)?;
+        assembler.branch_bit_set_w(8, layout.cells.accelerated_bit(), accelerated_transition)?;
         match layout.cells {
             NativeCellEncoding::Compact8Direct
             | NativeCellEncoding::Compact16
             | NativeCellEncoding::Compact16Indexed(_)
             | NativeCellEncoding::Compact16Ordinal(_) => {
-                assembler.branch_bit_set_w(
-                    8,
-                    layout.cells.accelerated_bit(),
-                    accelerated_transition,
-                )?;
                 aarch64_set_row_from_zero_based_cell(&mut assembler, layout.cells, 8)?;
-                assembler.branch(scalar_backedge)?;
             }
             NativeCellEncoding::Wide32 => {
-                assembler.branch_zero_w(8, finish)?;
-                assembler.branch(after_accept)?;
+                // Accepted dead is tagged, so an ordinary accepted wide cell
+                // is necessarily a nonzero one-based row token.
+                assembler.instruction(aarch64_sub_w_imm(6, 8, 1)?)?;
+                aarch64_set_row_from_zero_based_cell(&mut assembler, layout.cells, 6)?;
             }
         }
+        assembler.branch(scalar_backedge)?;
     }
 
     assembler.bind(finish)?;
@@ -55850,7 +55872,7 @@ int main(void){{
                                     || loop_state == Some(next));
                             assert_eq!(
                                 packed & cells.accelerated() != 0,
-                                expected_accelerated || next == NO_DFA_STATE && cells.is_compact(),
+                                expected_accelerated || next == NO_DFA_STATE,
                                 "{cells:?}/{accepted}/{initial_scannable}/{loop_state:?}/{next}"
                             );
                             assert_eq!(packed & cells.accepts() != 0, accepted);
@@ -56004,8 +56026,7 @@ int main(void){{
                     assert_eq!(packed & layout.cells.next_mask(), expected_token);
                     assert_eq!(
                         packed & layout.cells.accelerated() != 0,
-                        expected_accelerated
-                            || cell.next() == NO_DFA_STATE && layout.cells.is_compact()
+                        expected_accelerated || cell.next() == NO_DFA_STATE
                     );
                     assert_eq!(packed & layout.cells.accepts() != 0, cell.accepted());
                     saw_hole |= semantic_hole;
@@ -59860,7 +59881,17 @@ int main(void){{
             Target::x86_64_linux(),
             OutputContract::SelectedEnd,
         );
-        let fixture = DefaultExceptionPartialFixture::new();
+        let mut fixture = DefaultExceptionPartialFixture::new();
+        for state in 0..DefaultExceptionPartialFixture::COMPLETE_ROWS {
+            fixture.forward_cells
+                [state * DefaultExceptionPartialFixture::CLASS_COUNT + 64] =
+                ForwardCell::new(NO_DFA_STATE, state.is_multiple_of(2));
+            fixture.forward_cells
+                [state * DefaultExceptionPartialFixture::CLASS_COUNT + 128] = ForwardCell::new(
+                u32::try_from(DefaultExceptionPartialFixture::COMPLETE_ROWS).unwrap(),
+                state.is_multiple_of(2),
+            );
+        }
         let view = default_exception_partial_view(&fixture, &compiled);
         let wide_view = NativeProgramView {
             partial_discovered_states: Some(
@@ -59905,7 +59936,11 @@ int main(void){{
             );
             assert!(data.len() >= forward_end, "{architecture:?}");
             let mut saw_dead = false;
+            let mut saw_nonaccepting_dead = false;
+            let mut saw_accepting_dead = false;
+            let mut saw_live = false;
             let mut saw_hole = false;
+            let mut saw_accepting_hole = false;
             let mut saw_accept = false;
             let mut saw_accelerated = false;
             for state in 0..DefaultExceptionPartialFixture::COMPLETE_ROWS {
@@ -59945,10 +59980,30 @@ int main(void){{
                     saw_hole |= !is_dead && token >= partial.hole_token_base;
                     saw_accept |= actual & layout.cells.accepts() != 0;
                     saw_accelerated |= actual & layout.cells.accelerated() != 0;
+                    if semantic.next() == NO_DFA_STATE {
+                        assert_ne!(
+                            actual & layout.cells.accelerated(),
+                            0,
+                            "forward dead must be exceptional/{expected_cells:?}/{architecture:?}",
+                        );
+                        saw_nonaccepting_dead |= !semantic.accepted();
+                        saw_accepting_dead |= semantic.accepted();
+                    } else if usize::try_from(semantic.next()).ok().is_some_and(|next| {
+                        next < DefaultExceptionPartialFixture::COMPLETE_ROWS
+                    })
+                    {
+                        saw_live = true;
+                    } else {
+                        saw_accepting_hole |= semantic.accepted();
+                    }
                 }
             }
             assert!(saw_dead, "{expected_cells:?}/{architecture:?}");
+            assert!(saw_nonaccepting_dead, "{expected_cells:?}/{architecture:?}");
+            assert!(saw_accepting_dead, "{expected_cells:?}/{architecture:?}");
+            assert!(saw_live, "{expected_cells:?}/{architecture:?}");
             assert!(saw_hole, "{expected_cells:?}/{architecture:?}");
+            assert!(saw_accepting_hole, "{expected_cells:?}/{architecture:?}");
             assert!(saw_accept, "{expected_cells:?}/{architecture:?}");
             assert!(saw_accelerated, "{expected_cells:?}/{architecture:?}");
         }
@@ -79513,27 +79568,219 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             for next in core::iter::once(NO_DFA_STATE).chain(0_u32..=8) {
                 for initial_scannable in [false, true] {
                     for loop_state in core::iter::once(None).chain((0_u32..=8).map(Some)) {
-                        let packed = pack_native_forward_cell(
-                            next,
-                            false,
-                            0,
-                            cells.row_token_scale(),
-                            9,
-                            initial_scannable,
-                            loop_state,
-                            cells,
-                        )
-                        .unwrap();
-                        let expected = next != NO_DFA_STATE
-                            && ((initial_scannable && next == 0) || loop_state == Some(next));
-                        assert_eq!(
-                            packed & cells.accelerated() != 0,
-                            expected || next == NO_DFA_STATE && cells.is_compact()
-                        );
+                        for flag in [false, true] {
+                            let packed = pack_native_forward_cell(
+                                next,
+                                flag,
+                                0,
+                                cells.row_token_scale(),
+                                9,
+                                initial_scannable,
+                                loop_state,
+                                cells,
+                            )
+                            .unwrap();
+                            let expected = next != NO_DFA_STATE
+                                && ((initial_scannable && next == 0)
+                                    || loop_state == Some(next));
+                            assert_eq!(packed & cells.accepts() != 0, flag);
+                            assert_eq!(
+                                packed & cells.accelerated() != 0,
+                                expected || next == NO_DFA_STATE
+                            );
+                        }
                     }
                 }
             }
         }
+    }
+
+    #[test]
+    fn dead_cell_policy_is_directional_and_padding_is_exact_at_every_width() {
+        for cells in [
+            NativeCellEncoding::Compact8Direct,
+            NativeCellEncoding::Compact16,
+            NativeCellEncoding::Compact16Indexed(4),
+            NativeCellEncoding::Compact16Ordinal(6),
+            NativeCellEncoding::Wide32,
+        ] {
+            for accepted in [false, true] {
+                let forward = pack_native_forward_cell(
+                    NO_DFA_STATE,
+                    accepted,
+                    0,
+                    cells.row_token_scale(),
+                    1,
+                    false,
+                    None,
+                    cells,
+                )
+                .unwrap();
+                let legacy = pack_native_cell(
+                    NO_DFA_STATE,
+                    accepted,
+                    0,
+                    cells.row_token_scale(),
+                    1,
+                    cells,
+                )
+                .unwrap();
+                let flag = if accepted { cells.accepts() } else { 0 };
+                assert_eq!(
+                    forward,
+                    cells.dead_token() | cells.accelerated() | flag,
+                    "forward/{cells:?}/{accepted}",
+                );
+                assert_eq!(
+                    legacy,
+                    cells.dead_token()
+                        | if cells.is_compact() {
+                            cells.accelerated()
+                        } else {
+                            0
+                        }
+                        | flag,
+                    "legacy/{cells:?}/{accepted}",
+                );
+            }
+
+            let row_end = 3 * cells.bytes();
+            let mut forward_padding = Vec::new();
+            pad_native_packed_row(
+                &mut forward_padding,
+                row_end,
+                cells,
+                NativeDeadCellPolicy::ForwardTagged,
+            )
+            .unwrap();
+            let mut legacy_padding = Vec::new();
+            pad_native_packed_row(
+                &mut legacy_padding,
+                row_end,
+                cells,
+                NativeDeadCellPolicy::LegacyZero,
+            )
+            .unwrap();
+            for slot in 0..3 {
+                assert_eq!(
+                    read_native_packed_cell(&forward_padding, slot * cells.bytes(), cells),
+                    cells.dead_token() | cells.accelerated(),
+                    "forward padding/{cells:?}/{slot}",
+                );
+                assert_eq!(
+                    read_native_packed_cell(&legacy_padding, slot * cells.bytes(), cells),
+                    cells.dead_token()
+                        | if cells.is_compact() {
+                            cells.accelerated()
+                        } else {
+                            0
+                        },
+                    "legacy padding/{cells:?}/{slot}",
+                );
+            }
+            assert_eq!(
+                forward_padding == legacy_padding,
+                cells.is_compact(),
+                "only Wide32 changes with direction",
+            );
+        }
+
+        let cells = NativeCellEncoding::Wide32;
+        for accepted in [false, true] {
+            let ordinary = pack_native_forward_cell(0, accepted, 0, 1, 2, false, None, cells)
+                .unwrap();
+            assert_eq!(
+                ordinary,
+                1 | if accepted { CELL_ACCEPTS } else { 0 },
+                "ordinary live/{accepted}",
+            );
+            let graph_accelerated =
+                pack_native_forward_cell(0, accepted, 0, 1, 2, true, None, cells).unwrap();
+            assert_eq!(
+                graph_accelerated,
+                1 | CELL_ACCELERATED | if accepted { CELL_ACCEPTS } else { 0 },
+                "graph accelerator/{accepted}",
+            );
+            let hole = pack_native_partial_forward_cell(
+                2,
+                accepted,
+                0,
+                1,
+                2,
+                false,
+                None,
+                NativePartialDfaLayout {
+                    hole_token_base: 3,
+                    resume_states: 1,
+                    collapse_holes: false,
+                },
+                cells,
+            )
+            .unwrap();
+            assert_eq!(
+                hole,
+                3 | CELL_ACCELERATED | if accepted { CELL_ACCEPTS } else { 0 },
+                "partial hole/{accepted}",
+            );
+        }
+    }
+
+    #[test]
+    fn seeded_reverse_sidecars_preserve_the_legacy_wide_cell_identity() {
+        let mut saw_dead = false;
+        let mut saw_live = false;
+        let mut saw_reaches_start = false;
+        for pattern in ["(?s:.+)z", "(?s:.+)MAGIC(?s:.*)"] {
+            let compiled = compile(
+                CompileRequest::new(pattern, Target::x86_64_linux())
+                    .mode(CompileMode::Optimizing)
+                    .output(OutputContract::Exists),
+            )
+            .unwrap();
+            let view = compiled.program().native_dfa_view().unwrap();
+            let suffix = derive_suffix_filter(view)
+                .unwrap()
+                .expect("seeded-reverse suffix");
+            let machine = build_native_seeded_reverse(view, suffix, SeededReverseLimits::default())
+                .expect("seeded-reverse machine");
+            let (data, layout) = build_native_dfa_table_for_architecture(view, Architecture::X86_64)
+                .unwrap();
+            let sidecar = layout.seeded_reverse.expect("installed seeded sidecar");
+            assert_eq!(sidecar.boundary_offset, machine.boundary_offset);
+            assert_eq!(sidecar.proves_match, machine.proves_match);
+            assert_eq!(
+                sidecar.initial_reaches_start,
+                machine.dfa.initial_reaches_start(),
+            );
+
+            let initial_row_offset = usize::try_from(sidecar.initial_row_offset).unwrap();
+            let row_bytes = machine.dfa.class_count() * core::mem::size_of::<u32>();
+            for (index, cell) in machine.dfa.cells().iter().enumerate() {
+                let offset = initial_row_offset + index * core::mem::size_of::<u32>();
+                let actual = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+                let expected = pack_native_cell(
+                    cell.next,
+                    cell.reaches_start,
+                    initial_row_offset,
+                    row_bytes,
+                    machine.dfa.state_count(),
+                    NativeCellEncoding::Wide32,
+                )
+                .unwrap();
+                assert_eq!(actual, expected, "{pattern:?}/cell={index}");
+                assert_eq!(actual & CELL_ACCELERATED, 0, "{pattern:?}/cell={index}");
+                assert_eq!(actual & CELL_ACCEPTS != 0, cell.reaches_start);
+                if cell.next == NO_DFA_STATE {
+                    saw_dead = true;
+                    assert_eq!(actual & CELL_NEXT_MASK, 0);
+                } else {
+                    saw_live = true;
+                    assert_ne!(actual & CELL_NEXT_MASK, 0);
+                }
+                saw_reaches_start |= cell.reaches_start;
+            }
+        }
+        assert!(saw_dead && saw_live && saw_reaches_start);
     }
 
     #[test]
@@ -79594,7 +79841,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                         || loop_state == Some(cell.next()));
                 assert_eq!(
                     packed & layout.cells.accelerated() != 0,
-                    expected_tag || cell.next() == NO_DFA_STATE && layout.cells.is_compact()
+                    expected_tag || cell.next() == NO_DFA_STATE
                 );
                 assert_eq!(packed & layout.cells.accepts() != 0, cell.accepted());
                 assert_eq!(
@@ -81500,21 +81747,35 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             .filter_map(|(offset, window)| (window == wide_load).then_some(offset))
             .collect::<Vec<_>>();
         assert_eq!(loads.len(), 2); // ordinary forward and retained reverse
-        for (index, load) in loads.into_iter().enumerate() {
-            let test = load + wide_load.len() + if index == 0 { 3 } else { 0 };
-            assert_eq!(&x86_span[test..test + 2], &[0x85, 0xc0]);
-            let accept_branch = test + 2;
-            assert_eq!(
-                x86_test_normalized_branch_opcode(&x86_span, accept_branch),
-                Some(0x88),
-            );
-            let dead_branch =
-                accept_branch + x86_test_branch_target(&x86_span, accept_branch).unwrap().1;
-            assert_eq!(
-                x86_test_normalized_branch_opcode(&x86_span, dead_branch),
-                Some(0x84),
-            );
-        }
+        let mut forward_classifier = vec![0x3d]; // cmp eax, CELL_NEXT_MASK
+        forward_classifier.extend_from_slice(&CELL_NEXT_MASK.to_le_bytes());
+        let forward_compare = loads[0] + wide_load.len() + 3; // position += 1
+        assert_eq!(
+            &x86_span[forward_compare..forward_compare + forward_classifier.len()],
+            forward_classifier,
+        );
+        let forward_exception = forward_compare + forward_classifier.len();
+        assert_eq!(
+            x86_test_normalized_branch_opcode(&x86_span, forward_exception),
+            Some(0x87),
+        );
+        let forward_ordinary =
+            forward_exception + x86_test_branch_target(&x86_span, forward_exception).unwrap().1;
+        assert!(x86_span[forward_ordinary..].starts_with(&[0x4d, 0x8d, 0x54, 0x01, 0xff]));
+
+        let reverse_test = loads[1] + wide_load.len();
+        assert_eq!(&x86_span[reverse_test..reverse_test + 2], &[0x85, 0xc0]);
+        let reverse_accept = reverse_test + 2;
+        assert_eq!(
+            x86_test_normalized_branch_opcode(&x86_span, reverse_accept),
+            Some(0x88),
+        );
+        let reverse_dead =
+            reverse_accept + x86_test_branch_target(&x86_span, reverse_accept).unwrap().1;
+        assert_eq!(
+            x86_test_normalized_branch_opcode(&x86_span, reverse_dead),
+            Some(0x84),
+        );
         assert_eq!(
             x86_span
                 .windows(4)
@@ -81574,11 +81835,46 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             .chunks_exact(4)
             .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
             .collect::<Vec<_>>();
-        let accept_branches = words
+        let wide_load = aarch64_load_w_uxtw(8, 11, 8).unwrap();
+        let loads = words
             .iter()
-            .filter(|&&word| word & 0xfff8_001f == 0x37f8_0008)
-            .count();
-        assert_eq!(accept_branches, 2); // forward and reverse
+            .enumerate()
+            .filter_map(|(offset, &word)| (word == wide_load).then_some(offset))
+            .collect::<Vec<_>>();
+        assert_eq!(loads.len(), 2); // ordinary forward and retained reverse
+        let forward_load = loads
+            .iter()
+            .copied()
+            .find(|&offset| words.get(offset + 1) == Some(&aarch64_add_x_imm(2, 2, 1).unwrap()))
+            .expect("forward wide load");
+        let reverse_load = loads
+            .iter()
+            .copied()
+            .find(|&offset| offset != forward_load)
+            .expect("reverse wide load");
+        assert_eq!(
+            words[reverse_load + 1] & 0xfff8_001f,
+            0x37f8_0008,
+            "reverse Wide32 must preserve TBNZ bit 31",
+        );
+        assert_eq!(
+            words[reverse_load + 2] & 0x7f00_001f,
+            0x3400_0008,
+            "reverse Wide32 must preserve CBZ W8",
+        );
+        let forward_classifier = aarch64_lsr_w_imm(12, 8, 30).unwrap();
+        let forward_classifiers = words
+            .iter()
+            .enumerate()
+            .filter_map(|(offset, &word)| (word == forward_classifier).then_some(offset))
+            .collect::<Vec<_>>();
+        assert_eq!(forward_classifiers.len(), 1);
+        assert_eq!(forward_classifiers[0], forward_load + 2);
+        assert_eq!(
+            words[forward_classifiers[0] + 1] & 0xff00_001f,
+            0x3500_000c,
+            "forward Wide32 must classify with CBNZ W12",
+        );
         assert_eq!(
             words
                 .iter()
