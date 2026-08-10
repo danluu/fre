@@ -4698,7 +4698,7 @@ impl NativeExactRowInternPlan {
 /// A deterministic compiler-private quotient of graph byte classes.
 ///
 /// The public DFA and its resource receipt retain the graph pass's canonical
-/// alphabet. Only the native resource-retry table changes: classes whose
+/// alphabet. Only the compiler-private native table changes: classes whose
 /// transition cells are equal in every retained completed row are represented
 /// once. Equality uses the partial packer's authenticated collapsed-hole
 /// semantics, so distinct unfinished destinations may share a column only
@@ -4710,7 +4710,6 @@ struct NativeColumnQuotientPlan {
     byte_to_quotient: [u8; CLASS_MAP_BYTES],
     class_to_quotient: Vec<u8>,
     representative_classes: Vec<u8>,
-    quotient_rows: Vec<ForwardCell>,
 }
 
 impl NativeColumnQuotientPlan {
@@ -4948,22 +4947,10 @@ fn derive_native_column_quotient_plan(
         byte_to_quotient[byte] = *class_to_quotient.get(usize::from(class))?;
     }
 
-    let quotient_cells = forward_states.checked_mul(representative_classes.len())?;
-    let mut quotient_rows = Vec::new();
-    quotient_rows.try_reserve_exact(quotient_cells).ok()?;
-    for state in 0..forward_states {
-        let row = state.checked_mul(dfa.class_count)?;
-        for &representative in &representative_classes {
-            quotient_rows.push(*dfa.forward_cells.get(
-                row.checked_add(usize::from(representative))?,
-            )?);
-        }
-    }
     Some(NativeColumnQuotientPlan {
         byte_to_quotient,
         class_to_quotient,
         representative_classes,
-        quotient_rows,
     })
 }
 
@@ -4992,11 +4979,6 @@ fn native_column_quotient_plan_is_valid(
     ) else {
         return false;
     };
-    if plan.quotient_rows.len()
-        != forward_states.saturating_mul(plan.class_count())
-    {
-        return false;
-    }
     let mut prior = None;
     for (quotient, &representative) in plan.representative_classes.iter().enumerate() {
         let representative = usize::from(representative);
@@ -5038,17 +5020,6 @@ fn native_column_quotient_plan_is_valid(
                 return false;
             };
             if normalization.normalize(cell) != normalization.normalize(representative_cell) {
-                return false;
-            }
-            let Some(quotient_row) = state.checked_mul(plan.class_count()) else {
-                return false;
-            };
-            if plan
-                .quotient_rows
-                .get(quotient_row.saturating_add(quotient))
-                .copied()
-                != Some(representative_cell)
-            {
                 return false;
             }
         }
@@ -5721,6 +5692,7 @@ fn native_default_exception_retry_plan(
     )
 }
 
+#[cfg(test)]
 fn native_exact_row_intern_retry_plan(
     view: NativeProgramView<'_>,
     architecture: Architecture,
@@ -5736,6 +5708,13 @@ fn native_exact_row_intern_retry_plan(
     ) {
         return None;
     }
+    native_exact_row_intern_candidate_plan(view, architecture)
+}
+
+fn native_exact_row_intern_candidate_plan(
+    view: NativeProgramView<'_>,
+    architecture: Architecture,
+) -> Option<NativeExactRowInternPlan> {
     let plan = derive_native_exact_row_intern_plan(
         view.dfa,
         view.partial_discovered_states,
@@ -5782,6 +5761,7 @@ fn native_exact_row_intern_retry_plan(
     (interned_bytes < dense_bytes).then_some(plan)
 }
 
+#[cfg(test)]
 fn native_column_quotient_retry_plan(
     view: NativeProgramView<'_>,
     architecture: Architecture,
@@ -5797,6 +5777,14 @@ fn native_column_quotient_retry_plan(
     ) {
         return None;
     }
+    native_column_quotient_candidate_plan(view, architecture)
+}
+
+#[cfg(test)]
+fn native_column_quotient_candidate_plan(
+    view: NativeProgramView<'_>,
+    architecture: Architecture,
+) -> Option<NativeColumnQuotientPlan> {
     let plan = derive_native_column_quotient_plan(
         view.dfa,
         view.partial_discovered_states,
@@ -5855,6 +5843,115 @@ fn native_column_quotient_retry_plan(
         0,
     )?;
     (quotient_bytes < dense_bytes).then_some(plan)
+}
+
+/// Stable identities for the complete dense partial-table candidate set.
+///
+/// The order is only the final deterministic tie breaker. Candidate
+/// enumeration order does not participate in selection.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[repr(u8)]
+enum NativeDenseCandidateId {
+    CanonicalNatural,
+    CanonicalMapped,
+    ExactRowsNatural,
+    ExactRowsMapped,
+    ColumnQuotientMapped,
+    ExactRowsColumnQuotientMapped,
+}
+
+impl NativeDenseCandidateId {
+    const fn transforms(self) -> u8 {
+        match self {
+            Self::CanonicalNatural | Self::CanonicalMapped => 0,
+            Self::ExactRowsNatural
+            | Self::ExactRowsMapped
+            | Self::ColumnQuotientMapped => 1,
+            Self::ExactRowsColumnQuotientMapped => 2,
+        }
+    }
+}
+
+/// Target-explicit ranking for semantically identical dense partial tables.
+///
+/// Direct-byte tables are admitted only by the established 24-KiB and
+/// expansion policy. Once admitted, their removed dependent load dominates
+/// footprint differences within that hot envelope. Candidates with the same
+/// lookup shape then compare exact emitted data, so row and column quotients
+/// win only when they reduce the real table plus auxiliary image.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct NativeDenseCandidateCost {
+    dependent_load_depth: u8,
+    bytes_beyond_hot_budget: usize,
+    hot_instruction_units: u8,
+    address_latency: u8,
+    cache_lines: usize,
+    bytes: usize,
+    transforms: u8,
+    stable_id: NativeDenseCandidateId,
+}
+
+fn native_dense_candidate_cost(
+    architecture: Architecture,
+    data_bytes: usize,
+    layout: NativeDfaLayout,
+    stable_id: NativeDenseCandidateId,
+) -> Option<NativeDenseCandidateCost> {
+    let dependent_load_depth = match layout.transitions {
+        TransitionLayout::DirectByte => 2,
+        TransitionLayout::ClassMapped => 3,
+        TransitionLayout::DefaultExceptions(_)
+        | TransitionLayout::DefaultByteExceptions(_)
+        | TransitionLayout::DefaultByteBoundaries(_)
+        | TransitionLayout::DefaultSparseExceptions(_)
+        | TransitionLayout::DefaultByteSparseExceptions(_) => return None,
+    };
+    let (hot_instruction_units, address_latency) = match (architecture, layout.cells) {
+        (_, NativeCellEncoding::Compact8Direct) => (2, 0),
+        (Architecture::X86_64, NativeCellEncoding::Compact16) => (3, 0),
+        (Architecture::X86_64, NativeCellEncoding::Compact16Indexed(_)) => (4, 1),
+        (Architecture::X86_64, NativeCellEncoding::Compact16Ordinal(_)) => (4, 2),
+        (Architecture::X86_64, NativeCellEncoding::Wide32) => (6, 0),
+        (Architecture::Aarch64, NativeCellEncoding::Compact16)
+        | (Architecture::Aarch64, NativeCellEncoding::Compact16Indexed(_)) => (3, 0),
+        (Architecture::Aarch64, NativeCellEncoding::Compact16Ordinal(_)) => (3, 1),
+        (Architecture::Aarch64, NativeCellEncoding::Wide32) => (5, 0),
+    };
+    Some(NativeDenseCandidateCost {
+        dependent_load_depth,
+        bytes_beyond_hot_budget: data_bytes.saturating_sub(DIRECT_BYTE_TABLE_BUDGET),
+        hot_instruction_units,
+        address_latency,
+        cache_lines: data_bytes.div_ceil(64),
+        bytes: data_bytes,
+        transforms: stable_id.transforms(),
+        stable_id,
+    })
+}
+
+fn retain_native_dense_candidate(
+    best: &mut Option<(
+        NativeDenseCandidateCost,
+        (Vec<u8>, NativeDfaLayout),
+    )>,
+    architecture: Architecture,
+    stable_id: NativeDenseCandidateId,
+    lowering: (Vec<u8>, NativeDfaLayout),
+) {
+    let Some(cost) = native_dense_candidate_cost(
+        architecture,
+        lowering.0.len(),
+        lowering.1,
+        stable_id,
+    ) else {
+        return;
+    };
+    if best
+        .as_ref()
+        .is_none_or(|(best_cost, _)| cost < *best_cost)
+    {
+        *best = Some((cost, lowering));
+    }
 }
 
 /// Width of one packed transition cell in the ordinary native DFA tables.
@@ -8431,6 +8528,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit(
     relation_vector_owns_route: bool,
     max_native_data_bytes: usize,
 ) -> Result<(Vec<u8>, NativeDfaLayout), ObjectError> {
+    let mut best = None;
     let dense = build_native_dfa_table_with_cost_model_and_data_limit_once(
         view,
         architecture,
@@ -8440,61 +8538,141 @@ fn build_native_dfa_table_with_cost_model_and_data_limit(
         None,
     );
     let dense_error = match dense {
-        Ok(lowering) => return Ok(lowering),
+        Ok(lowering) => {
+            retain_native_dense_candidate(
+                &mut best,
+                architecture,
+                NativeDenseCandidateId::CanonicalNatural,
+                lowering,
+            );
+            None
+        }
         Err(error @ (ObjectError::Allocation(_) | ObjectError::Resource {
             resource: crate::CompileResource::ProgramBytes,
             ..
-        })) => error,
+        })) => Some(error),
         Err(error) => return Err(error),
     };
-    let exact_rows = native_exact_row_intern_retry_plan(view, architecture, &dense_error);
+
+    let exact_rows = native_exact_row_intern_candidate_plan(view, architecture);
     if let Some(plan) = exact_rows.as_ref() {
-        let interned = build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
+        for (force_class_mapped, stable_id) in [
+            (false, NativeDenseCandidateId::ExactRowsNatural),
+            (true, NativeDenseCandidateId::ExactRowsMapped),
+        ] {
+            if let Ok(lowering) =
+                build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
+                    view,
+                    architecture,
+                    vector_cost_model,
+                    relation_vector_owns_route,
+                    max_native_data_bytes,
+                    None,
+                    Some(plan),
+                    force_class_mapped,
+                    None,
+                )
+            {
+                retain_native_dense_candidate(
+                    &mut best,
+                    architecture,
+                    stable_id,
+                    lowering,
+                );
+            }
+        }
+    }
+
+    // Natural DirectByte is the established hot-loop choice, but it may be
+    // larger than the caller's exact data ceiling. Enumerate the canonical
+    // mapped image as a zero-transform bounded candidate.
+    if let Ok(lowering) =
+        build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
             view,
             architecture,
             vector_cost_model,
             relation_vector_owns_route,
             max_native_data_bytes,
             None,
-            Some(plan),
-            false,
             None,
+            true,
+            None,
+        )
+    {
+        retain_native_dense_candidate(
+            &mut best,
+            architecture,
+            NativeDenseCandidateId::CanonicalMapped,
+            lowering,
         );
-        match interned {
-            Ok(lowering) => return Ok(lowering),
-            Err(ObjectError::Allocation(_) | ObjectError::Resource {
-                resource: crate::CompileResource::ProgramBytes,
-                ..
-            }) => {
-                // The hot cost model may expand a tiny interned table to raw
-                // byte columns. Under an unusually tight user data ceiling,
-                // retry the same exact physical rows in their smaller mapped
-                // representation before giving up the resource rescue.
-                if let Ok(lowering) =
-                    build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
-                        view,
-                        architecture,
-                        vector_cost_model,
-                        relation_vector_owns_route,
-                        max_native_data_bytes,
-                        None,
-                        Some(plan),
-                        true,
-                        None,
-                    )
-                {
-                    return Ok(lowering);
-                }
-            }
-            Err(_) => {}
+    }
+
+    // Derivation retains only maps and representative class ordinals. The
+    // selected candidate reads representative cells directly from the graph;
+    // no rows-by-quotient matrix is speculatively materialized.
+    let column_quotient = derive_native_column_quotient_plan(
+        view.dfa,
+        view.partial_discovered_states,
+        view.collapse_partial_holes,
+    );
+    if let Some(column_quotient) = column_quotient.as_ref() {
+        if let Ok(lowering) =
+            build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
+                view,
+                architecture,
+                vector_cost_model,
+                relation_vector_owns_route,
+                max_native_data_bytes,
+                None,
+                None,
+                true,
+                Some(column_quotient),
+            )
+        {
+            retain_native_dense_candidate(
+                &mut best,
+                architecture,
+                NativeDenseCandidateId::ColumnQuotientMapped,
+                lowering,
+            );
+        }
+        if let Some(exact_rows) = exact_rows.as_ref()
+            && let Ok(lowering) =
+                build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
+                    view,
+                    architecture,
+                    vector_cost_model,
+                    relation_vector_owns_route,
+                    max_native_data_bytes,
+                    None,
+                    Some(exact_rows),
+                    true,
+                    Some(column_quotient),
+                )
+        {
+            retain_native_dense_candidate(
+                &mut best,
+                architecture,
+                NativeDenseCandidateId::ExactRowsColumnQuotientMapped,
+                lowering,
+            );
         }
     }
-    if let Some(plan) = native_default_exception_retry_plan(view, architecture, &dense_error) {
-        // Class-keyed sparse rows retain exactly the same lookup when their
-        // exact duplicate semantic rows are materialized once. Prefer that
-        // strict physical-record reduction before publishing the ordinary
-        // sparse rescue. Raw-byte and boundary representations deliberately
-        // remain independent until their own composition is proved.
+
+    if let Some((_, lowering)) = best {
+        return Ok(lowering);
+    }
+    let dense_error = dense_error.ok_or(ObjectError::InvalidModule(
+        "native dense candidate ranking lost a valid lowering",
+    ))?;
+    // Sparse rows remain a resource-only alternate after every feasible dense
+    // representation. This prevents a branchier modal row from shadowing a
+    // smaller exact or column-quotient dense table. Exact duplicate rows
+    // strictly reduce class-keyed sparse records without changing their
+    // lookup, so try that proved composition before the uninterned record.
+    if let Some(plan) =
+        native_default_exception_retry_plan(view, architecture, &dense_error)
+    {
         if plan.keys == NativeDefaultExceptionKeys::Classes
             && let Some(exact_rows) = exact_rows.as_ref()
             && let Ok(lowering) =
@@ -8523,80 +8701,8 @@ fn build_native_dfa_table_with_cost_model_and_data_limit(
             return Ok(lowering);
         }
     }
-    // Exact-row and bounded-sparse plans have their own established hot-loop
-    // cost models. The general column quotient is the residual dense-shape
-    // rescue when neither established alternate fits this exact transaction.
-    let column_quotient =
-        native_column_quotient_retry_plan(view, architecture, &dense_error);
-    if let Some(column_quotient) = column_quotient.as_ref() {
-        if let Some(exact_rows) = exact_rows.as_ref() {
-            if let Ok(lowering) =
-                build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
-                    view,
-                    architecture,
-                    vector_cost_model,
-                    relation_vector_owns_route,
-                    max_native_data_bytes,
-                    None,
-                    Some(exact_rows),
-                    false,
-                    Some(column_quotient),
-                )
-            {
-                return Ok(lowering);
-            }
-            if let Ok(lowering) =
-                build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
-                    view,
-                    architecture,
-                    vector_cost_model,
-                    relation_vector_owns_route,
-                    max_native_data_bytes,
-                    None,
-                    Some(exact_rows),
-                    true,
-                    Some(column_quotient),
-                )
-            {
-                return Ok(lowering);
-            }
-        }
-        if let Ok(lowering) =
-            build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
-                view,
-                architecture,
-                vector_cost_model,
-                relation_vector_owns_route,
-                max_native_data_bytes,
-                None,
-                None,
-                false,
-                Some(column_quotient),
-            )
-        {
-            return Ok(lowering);
-        }
-        if let Ok(lowering) =
-            build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
-                view,
-                architecture,
-                vector_cost_model,
-                relation_vector_owns_route,
-                max_native_data_bytes,
-                None,
-                None,
-                true,
-                Some(column_quotient),
-            )
-        {
-            return Ok(lowering);
-        }
-    }
-    // Alternate tables are optional rescues after the established dense
-    // lowering has already produced a recoverable resource decline. Any
-    // retry failure preserves that exact decline so target-specific
-    // legalization, allocation, or validation cannot turn an optimizer
-    // opportunity into a fatal compilation error.
+    // Optional candidate allocation or validation failure preserves the
+    // canonical resource decline.
     Err(dense_error)
 }
 
@@ -8654,12 +8760,9 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
     column_quotient: Option<&NativeColumnQuotientPlan>,
 ) -> Result<(Vec<u8>, NativeDfaLayout), ObjectError> {
     let dfa = view.dfa;
-    if force_class_mapped
-        && (default_exceptions.is_some()
-            || exact_rows.is_none() && column_quotient.is_none())
-    {
+    if force_class_mapped && default_exceptions.is_some() {
         return Err(ObjectError::InvalidModule(
-            "forced mapped retry has no exact row or column quotient",
+            "forced mapped rows overlap default-exception rows",
         ));
     }
     if dfa.initial_state != 0 || dfa.class_count == 0 || dfa.class_count > 256 {
@@ -8865,7 +8968,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
     } else if force_class_mapped {
         if encoded_hole_states == 0 || retained_reverse_states != 0 {
             return Err(ObjectError::InvalidModule(
-                "forced mapped rows have no exact partial quotient",
+                "forced mapped rows have no partial forward table",
             ));
         }
         (
@@ -9450,9 +9553,6 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
     let table_byte_classes = column_quotient
         .map(|plan| plan.byte_to_quotient.as_slice())
         .unwrap_or(dfa.byte_classes);
-    let table_forward_cells = column_quotient
-        .map(|plan| plan.quotient_rows.as_slice())
-        .unwrap_or(dfa.forward_cells);
     if transitions.table_prefix_bytes() != 0 {
         bytes.extend_from_slice(table_byte_classes);
         bytes.resize(forward_offset, 0);
@@ -9470,23 +9570,24 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
                     })
                     .transpose()?
                     .unwrap_or(physical_state);
-                let semantic_row = semantic_state.checked_mul(table_class_count).ok_or(
+                let semantic_row = semantic_state.checked_mul(dfa.class_count).ok_or(
                     ObjectError::ArithmeticOverflow("native forward semantic row"),
                 )?;
-                let row = table_forward_cells
-                    .get(
-                        semantic_row
-                            ..semantic_row.checked_add(table_class_count).ok_or(
-                                ObjectError::ArithmeticOverflow(
-                                    "native forward semantic row extent",
-                                ),
-                            )?,
-                    )
-                    .ok_or(ObjectError::InvalidModule(
-                        "exact native semantic row is outside its table",
-                    ))?;
                 let row_start = bytes.len();
-                for &cell in row {
+                for table_class in 0..table_class_count {
+                    let graph_class = column_quotient
+                        .and_then(|plan| plan.representative_classes.get(table_class))
+                        .copied()
+                        .map(usize::from)
+                        .unwrap_or(table_class);
+                    let cell = *dfa
+                        .forward_cells
+                        .get(semantic_row.checked_add(graph_class).ok_or(
+                            ObjectError::ArithmeticOverflow("native forward semantic cell"),
+                        )?)
+                        .ok_or(ObjectError::InvalidModule(
+                            "exact native semantic row is outside its table",
+                        ))?;
                     let packed = if let Some(partial) = partial_layout {
                         pack_native_partial_forward_cell_with_exact_rows(
                             cell.next(),
@@ -38740,6 +38841,140 @@ mod tests {
 
     #[test]
     #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::too_many_lines,
+        reason = "the exact cap boundary and cross-target canonical candidate oracle stay together"
+    )]
+    fn canonical_mapped_partial_table_is_the_general_direct_byte_cap_fallback() {
+        const CLASS_COUNT: usize = 64;
+        const COMPLETE_ROWS: usize = 8;
+        const DISCOVERED_STATES: usize = COMPLETE_ROWS + 2;
+
+        let compiled = compile_uniform_default_base(OutputContract::SelectedEnd);
+        let base = compiled
+            .program()
+            .native_dfa_view()
+            .expect("canonical mapped base native view");
+        let byte_classes = core::array::from_fn(|byte| {
+            u8::try_from(byte % CLASS_COUNT).unwrap()
+        });
+        let class_representatives = (0..CLASS_COUNT)
+            .map(|class| u8::try_from(class).unwrap())
+            .collect::<Vec<_>>();
+        let mut forward_cells = Vec::with_capacity(COMPLETE_ROWS * CLASS_COUNT);
+        for state in 0..COMPLETE_ROWS {
+            for class in 0..CLASS_COUNT {
+                forward_cells.push(ForwardCell::new(
+                    u32::try_from(state).unwrap(),
+                    state < 6 && class & (1 << state) != 0,
+                ));
+            }
+        }
+        let view = NativeProgramView {
+            dfa: NativeDfaView {
+                initial_state: 0,
+                initial_pending: false,
+                initial_terminal: false,
+                byte_classes: &byte_classes,
+                class_count: CLASS_COUNT,
+                class_representatives: &class_representatives,
+                forward_cells: &forward_cells,
+                reverse_initial: None,
+                reverse_cells: &[],
+            },
+            partial_discovered_states: Some(DISCOVERED_STATES),
+            collapse_partial_holes: false,
+            exact_match_width: None,
+            max_match_width: None,
+            exact_product_width: None,
+            retained_prefix_requirement: None,
+            retained_suffix_requirement: None,
+            ..base
+        };
+        assert!(derive_native_exact_row_intern_plan(
+            view.dfa,
+            view.partial_discovered_states,
+            false,
+        )
+        .is_none());
+        assert!(derive_native_column_quotient_plan(
+            view.dfa,
+            view.partial_discovered_states,
+            false,
+        )
+        .is_none());
+
+        for architecture in [Architecture::X86_64, Architecture::Aarch64] {
+            let natural = build_native_dfa_table_with_cost_model_and_data_limit_once(
+                view,
+                architecture,
+                NativeVectorFilterCostModel::Established,
+                true,
+                usize::MAX,
+                None,
+            )
+            .unwrap();
+            let mapped =
+                build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
+                    view,
+                    architecture,
+                    NativeVectorFilterCostModel::Established,
+                    true,
+                    usize::MAX,
+                    None,
+                    None,
+                    true,
+                    None,
+                )
+                .unwrap();
+            assert_eq!(natural.1.transitions, TransitionLayout::DirectByte);
+            assert_eq!(mapped.1.transitions, TransitionLayout::ClassMapped);
+            assert!(mapped.0.len() < natural.0.len(), "{architecture:?}");
+            assert_eq!(
+                build_native_dfa_table_with_cost_model_and_data_limit(
+                    view,
+                    architecture,
+                    NativeVectorFilterCostModel::Established,
+                    true,
+                    usize::MAX,
+                )
+                .unwrap(),
+                natural,
+                "admitted DirectByte keeps hot-path priority: {architecture:?}",
+            );
+            assert_eq!(
+                build_native_dfa_table_with_cost_model_and_data_limit(
+                    view,
+                    architecture,
+                    NativeVectorFilterCostModel::Established,
+                    true,
+                    mapped.0.len(),
+                )
+                .unwrap(),
+                mapped,
+                "canonical mapped table fits the exact cap: {architecture:?}",
+            );
+            let below = mapped.0.len() - 1;
+            let declined = build_native_dfa_table_with_cost_model_and_data_limit(
+                view,
+                architecture,
+                NativeVectorFilterCostModel::Established,
+                true,
+                below,
+            );
+            assert!(matches!(
+                declined,
+                Err(ObjectError::Resource {
+                    resource: crate::CompileResource::ProgramBytes,
+                    limit,
+                    ..
+                }) if limit == below
+            ), "{architecture:?}: {declined:?}");
+        }
+    }
+
+    #[test]
+    #[allow(
         clippy::too_many_lines,
         reason = "one structural audit proves exact SIMD reductions and target-aware production selection"
     )]
@@ -55980,10 +56215,22 @@ int main(void){{
                 usize::MAX,
             )
             .unwrap();
+            let exact_quotient = build_forced_exact_row_and_column_quotient_table(
+                view,
+                architecture,
+                NativeVectorFilterCostModel::Established,
+                true,
+                usize::MAX,
+            )
+            .unwrap();
             assert!(composed.0.len() < sparse.0.len(), "{architecture:?}");
             assert!(composed.0.len() < exact.0.len(), "{architecture:?}");
             assert!(composed.0.len() < mapped_exact.0.len(), "{architecture:?}");
             assert!(composed.0.len() < dense.0.len(), "{architecture:?}");
+            assert!(
+                exact_quotient.0.len() < composed.0.len(),
+                "{architecture:?}",
+            );
             assert_eq!(
                 composed,
                 build_forced_exact_sparse_table(
@@ -56004,7 +56251,7 @@ int main(void){{
                 composed.0.len(),
             )
             .unwrap();
-            assert_eq!(admitted, composed, "{architecture:?}");
+            assert_eq!(admitted, exact_quotient, "{architecture:?}");
 
             let data = &composed.0;
             let layout = composed.1;
@@ -56300,9 +56547,51 @@ int main(void){{
             assert_eq!(interned.1.cells, dense.1.cells);
             assert_eq!(mapped_interned.1.cells, dense.1.cells);
             assert_eq!(interned.1.cells, NativeCellEncoding::Compact16);
+            let combined = build_forced_exact_row_and_column_quotient_table(
+                view,
+                architecture,
+                NativeVectorFilterCostModel::Established,
+                true,
+                usize::MAX,
+            )
+            .unwrap();
+            let candidates = [
+                (NativeDenseCandidateId::CanonicalNatural, dense.clone()),
+                (NativeDenseCandidateId::ExactRowsNatural, interned.clone()),
+                (NativeDenseCandidateId::ExactRowsMapped, mapped_interned.clone()),
+                (
+                    NativeDenseCandidateId::ExactRowsColumnQuotientMapped,
+                    combined.clone(),
+                ),
+            ];
+            let mut forward_selection = None;
+            for &(stable_id, ref lowering) in &candidates {
+                retain_native_dense_candidate(
+                    &mut forward_selection,
+                    architecture,
+                    stable_id,
+                    lowering.clone(),
+                );
+            }
+            let mut reverse_selection = None;
+            for &(stable_id, ref lowering) in candidates.iter().rev() {
+                retain_native_dense_candidate(
+                    &mut reverse_selection,
+                    architecture,
+                    stable_id,
+                    lowering.clone(),
+                );
+            }
+            assert_eq!(forward_selection, reverse_selection, "{architecture:?}");
+            assert_eq!(
+                forward_selection.unwrap().0.stable_id,
+                NativeDenseCandidateId::ExactRowsNatural,
+                "{architecture:?}",
+            );
 
-            // A fitting dense table is unchanged. The quotient is attempted
-            // only after the exact established table crosses the byte bound.
+            // Equal-row interning is a zero-overhead address-space quotient.
+            // Its fitting DirectByte image keeps hot-loop priority over the
+            // still-smaller mapped form.
             assert_eq!(
                 build_native_dfa_table_with_cost_model_and_data_limit(
                     view,
@@ -56312,7 +56601,7 @@ int main(void){{
                     usize::MAX,
                 )
                 .unwrap(),
-                dense,
+                interned,
                 "{architecture:?}",
             );
             assert_eq!(
@@ -56337,16 +56626,8 @@ int main(void){{
                 )
                 .unwrap(),
                 mapped_interned,
-                "tight caps retain the smaller mapped quotient: {architecture:?}",
+                "tight caps preserve the exact-row mapped rescue: {architecture:?}",
             );
-            let combined = build_forced_exact_row_and_column_quotient_table(
-                view,
-                architecture,
-                NativeVectorFilterCostModel::Established,
-                true,
-                usize::MAX,
-            )
-            .unwrap();
             if combined.0.len() < mapped_interned.0.len() {
                 let admitted_combination =
                     build_native_dfa_table_with_cost_model_and_data_limit(
@@ -56545,19 +56826,17 @@ int main(void){{
             assert_eq!(scanner.isa, expected_isa, "{target:?}");
             assert!(scanner.vectorized, "{target:?}");
 
-            let dense_lowering = lower_native_dfa(view, target)
+            let fitting_lowering = lower_native_dfa(view, target)
                 .unwrap()
-                .expect("fitting dense target lowering");
+                .expect("fitting ranked target lowering");
             let limit = dense_table.0.len() - 1;
             assert!(interned_data.len() <= limit, "{target:?}");
             let interned_lowering = lower_native_dfa_with_data_limit(view, target, limit)
                 .unwrap()
                 .expect("exact-row resource rescue");
             assert!(interned_lowering.data.len() <= limit, "{target:?}");
-            assert!(
-                interned_lowering.data.len() < dense_lowering.data.len(),
-                "{target:?}",
-            );
+            assert_eq!(interned_lowering.data, fitting_lowering.data, "{target:?}");
+            assert_eq!(interned_lowering.code, fitting_lowering.code, "{target:?}");
             assert_eq!(
                 interned_lowering.start_accelerator,
                 scanner.start_accelerator(),
@@ -56643,7 +56922,6 @@ int main(void){{
                                 assert_eq!(plan.representative_classes, [0]);
                                 assert_eq!(plan.class_to_quotient, [0, 0]);
                                 assert!(plan.byte_to_quotient.iter().all(|&class| class == 0));
-                                assert_eq!(plan.quotient_rows, [first_left, second_left]);
                                 assert!(native_column_quotient_plan_is_valid(
                                     dfa,
                                     4,
@@ -56731,7 +57009,6 @@ int main(void){{
                 byte_to_quotient: plan.byte_to_quotient,
                 class_to_quotient: plan.class_to_quotient.clone(),
                 representative_classes: plan.representative_classes.clone(),
-                quotient_rows: plan.quotient_rows.clone(),
             }),
         );
         let uncollapsed = derive_native_column_quotient_plan(
@@ -56762,7 +57039,6 @@ int main(void){{
                     byte_to_quotient: plan.byte_to_quotient,
                     class_to_quotient: plan.class_to_quotient.clone(),
                     representative_classes: plan.representative_classes.clone(),
-                    quotient_rows: plan.quotient_rows.clone(),
                 }),
                 "{architecture:?}",
             );
@@ -56798,9 +57074,8 @@ int main(void){{
                 "{architecture:?}",
             );
 
-            // A fitting dense table retains the canonical graph alphabet.
-            // The private quotient is visible only after the dense resource
-            // transaction declines.
+            // Equal columns reduce a fitting mapped table without changing
+            // its hot-loop dependency or instruction shape.
             assert_eq!(
                 build_native_dfa_table_with_cost_model_and_data_limit(
                     view,
@@ -56810,7 +57085,7 @@ int main(void){{
                     usize::MAX,
                 )
                 .unwrap(),
-                dense,
+                quotient,
                 "{architecture:?}",
             );
             assert_eq!(
@@ -57923,7 +58198,15 @@ int main(void){{
             for collapse_holes in [false, true] {
                 let view = fixture.view(base, collapse_holes);
                 let (data, layout) =
-                    build_native_dfa_table_for_architecture(view, architecture).unwrap();
+                    build_native_dfa_table_with_cost_model_and_data_limit_once(
+                        view,
+                        architecture,
+                        NativeVectorFilterCostModel::Established,
+                        true,
+                        usize::MAX,
+                        None,
+                    )
+                    .unwrap();
                 assert_eq!(layout.transitions, TransitionLayout::ClassMapped);
                 assert_eq!(layout.cells, cells, "{architecture:?}/{collapse_holes}");
                 assert_eq!(usize::try_from(layout.forward_offset).unwrap(), prefix);
@@ -58281,33 +58564,59 @@ int main(void){{
             ),
         ];
         for (target, expected_accelerator) in targets {
-            let layout = build_native_dfa_table_for_architecture(view, target.architecture)
-                .unwrap()
-                .1;
+            let cost_model = native_vector_filter_cost_model_for_target(target, true);
+            let relation_vector_owns_route = direct_relation_vector_owns_route(target);
+            let (mut data, mut layout) =
+                build_native_dfa_table_with_cost_model_and_data_limit_once(
+                    view,
+                    target.architecture,
+                    cost_model,
+                    relation_vector_owns_route,
+                    usize::MAX,
+                    None,
+                )
+                .unwrap();
             assert_eq!(layout.transitions, TransitionLayout::ClassMapped);
             assert_eq!(
                 layout.cells,
                 NativeCellEncoding::Compact16Ordinal(84),
             );
-            let lowering = lower_native_dfa_with_entry_contract(
-                view,
-                target,
-                NativeDfaEntryContract::PreparedPartialCore,
-            )
-            .unwrap()
-            .unwrap_or_else(|| panic!("ordinal target declined: {target:?}"));
-            assert_eq!(lowering.start_accelerator, expected_accelerator, "{target:?}");
+            let emission = match target.architecture {
+                Architecture::X86_64 => {
+                    lower_x86_64_dfa_with_emission(layout, target.features).unwrap()
+                }
+                Architecture::Aarch64 => {
+                    let sve_plan =
+                        install_aarch64_sve_filter_plan(&mut data, layout, target).unwrap();
+                    install_aarch64_sve_loop_storage_with_limit(
+                        &mut data,
+                        &mut layout,
+                        target,
+                        usize::MAX,
+                    )
+                    .unwrap();
+                    lower_aarch64_dfa_for_operating_system_with_emission(
+                        layout,
+                        target.features,
+                        target.operating_system,
+                        sve_plan,
+                    )
+                    .unwrap()
+                }
+            };
+            let scanner = emission.scanner.expect("ordinal primary scanner receipt");
+            assert_eq!(scanner.start_accelerator(), expected_accelerator, "{target:?}");
             match target.architecture {
                 Architecture::X86_64 => {
                     let compact_load = [0x41, 0x0f, 0xb7, 0x04, 0x42];
                     let wide_load = [0x41, 0x8b, 0x04, 0x82];
                     let ordinal_address = [0x6b, 0xc0, 42, 0x4d, 0x8d, 0x14, 0x41];
-                    assert!(lowering.code.windows(compact_load.len()).any(|code| code == compact_load));
-                    assert!(!lowering.code.windows(wide_load.len()).any(|code| code == wide_load));
-                    assert!(lowering.code.windows(ordinal_address.len()).any(|code| code == ordinal_address));
+                    assert!(emission.code.windows(compact_load.len()).any(|code| code == compact_load));
+                    assert!(!emission.code.windows(wide_load.len()).any(|code| code == wide_load));
+                    assert!(emission.code.windows(ordinal_address.len()).any(|code| code == ordinal_address));
                 }
                 Architecture::Aarch64 => {
-                    let words = lowering
+                    let words = emission
                         .code
                         .chunks_exact(4)
                         .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
@@ -58351,7 +58660,8 @@ int main(void){{
                 build_forced_default_exception_table(view, architecture, usize::MAX).unwrap();
             assert!(sparse.0.len() < dense.0.len(), "{architecture:?}");
 
-            // Unlimited lowering remains the exact established dense result.
+            // Unlimited lowering may select an exact dense quotient, but
+            // never crosses into the branchier resource-only sparse form.
             let primary = build_native_dfa_table_with_cost_model_and_data_limit(
                 view,
                 architecture,
@@ -58360,7 +58670,11 @@ int main(void){{
                 usize::MAX,
             )
             .unwrap();
-            assert_eq!(primary, dense, "{architecture:?}");
+            assert!(primary.0.len() <= dense.0.len(), "{architecture:?}");
+            assert!(matches!(
+                primary.1.transitions,
+                TransitionLayout::ClassMapped | TransitionLayout::DirectByte
+            ), "{architecture:?}");
 
             let admitted = build_native_dfa_table_with_cost_model_and_data_limit(
                 view,
