@@ -4475,6 +4475,12 @@ enum TransitionLayout {
     /// only after dense retained-partial lowering exhausts its native-data
     /// transaction.
     DefaultExceptions(u8),
+    /// The same fixed sparse record, but its exception keys are exact raw
+    /// bytes. This form is admitted only when expanding graph-class exceptions
+    /// to their complete byte preimages does not increase the global record
+    /// capacity. It therefore removes the dependent class-map load and the
+    /// entire 256-byte prefix without adding comparisons or row bytes.
+    DefaultByteExceptions(u8),
 }
 
 /// Keep the cold resource-rescue lookup small enough to unroll without a
@@ -4485,7 +4491,23 @@ const MAX_NATIVE_DEFAULT_EXCEPTIONS: usize = 4;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct NativeDefaultExceptionPlan {
     exception_capacity: u8,
+    keys: NativeDefaultExceptionKeys,
     row_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeDefaultExceptionKeys {
+    Classes,
+    Bytes,
+}
+
+impl NativeDefaultExceptionKeys {
+    const fn transitions(self, exception_capacity: u8) -> TransitionLayout {
+        match self {
+            Self::Classes => TransitionLayout::DefaultExceptions(exception_capacity),
+            Self::Bytes => TransitionLayout::DefaultByteExceptions(exception_capacity),
+        }
+    }
 }
 
 /// A deterministic physical-row quotient for exact completed-row aliases.
@@ -4892,6 +4914,35 @@ fn native_default_exception_row(
     (next == exception_count).then_some((candidate, exceptions, exception_count))
 }
 
+/// Expand one canonical class-keyed sparse row to exact raw-byte keys.
+///
+/// The default remains the class-modal cell selected above. Iterating the
+/// complete byte map in ordinal order proves exact preimage coverage and gives
+/// deterministic publication. Failure to fit the same fixed four-slot bound
+/// simply retains the established class-keyed representation.
+fn native_default_byte_exception_row(
+    row: &[ForwardCell],
+    byte_classes: &[u8],
+    normalization: NativeDefaultExceptionNormalization,
+) -> Option<(ForwardCell, [Option<(u8, ForwardCell)>; MAX_NATIVE_DEFAULT_EXCEPTIONS], usize)> {
+    if byte_classes.len() != CLASS_MAP_BYTES {
+        return None;
+    }
+    let (default, _, _) = native_default_exception_row(row, normalization)?;
+    let mut exceptions = [None; MAX_NATIVE_DEFAULT_EXCEPTIONS];
+    let mut next = 0_usize;
+    for (byte, &class) in byte_classes.iter().enumerate() {
+        let cell = normalization.normalize(*row.get(usize::from(class))?)?;
+        if cell == default {
+            continue;
+        }
+        let slot = exceptions.get_mut(next)?;
+        *slot = Some((u8::try_from(byte).ok()?, cell));
+        next = next.checked_add(1)?;
+    }
+    Some((default, exceptions, next))
+}
+
 fn derive_native_default_exception_plan(
     dfa: NativeDfaView<'_>,
     partial_discovered_states: Option<usize>,
@@ -4924,14 +4975,31 @@ fn derive_native_default_exception_plan(
         collapse_partial_holes,
     )?;
     let mut exception_capacity = 0_usize;
+    let mut byte_exception_capacity = Some(0_usize);
     for row in dfa.forward_cells.chunks_exact(dfa.class_count) {
         let (_, _, exceptions) = native_default_exception_row(row, normalization)?;
         exception_capacity = exception_capacity.max(exceptions);
+        if let Some(capacity) = byte_exception_capacity {
+            byte_exception_capacity = native_default_byte_exception_row(
+                row,
+                dfa.byte_classes,
+                normalization,
+            )
+            .map(|(_, _, exceptions)| capacity.max(exceptions));
+        }
     }
+    let (keys, exception_capacity) = if exception_capacity != 0
+        && byte_exception_capacity == Some(exception_capacity)
+    {
+        (NativeDefaultExceptionKeys::Bytes, exception_capacity)
+    } else {
+        (NativeDefaultExceptionKeys::Classes, exception_capacity)
+    };
     let exception_capacity = u8::try_from(exception_capacity).ok()?;
     let row_bytes = native_default_exception_row_bytes(exception_capacity)?;
+    let transitions = keys.transitions(exception_capacity);
     let sparse_bytes = native_machine_bytes(
-        TransitionLayout::DefaultExceptions(exception_capacity),
+        transitions,
         NativeCellEncoding::Wide32,
         dfa.class_count,
         forward_states,
@@ -4957,6 +5025,7 @@ fn derive_native_default_exception_plan(
     // reduction before the caller is allowed to retry it.
     (sparse_bytes < dense_bytes).then_some(NativeDefaultExceptionPlan {
         exception_capacity,
+        keys,
         row_bytes,
     })
 }
@@ -5165,15 +5234,16 @@ impl TransitionLayout {
         match self {
             Self::ClassMapped => class_count,
             Self::DirectByte => DIRECT_BYTE_ROW_CELLS,
-            Self::DefaultExceptions(_) => 0,
+            Self::DefaultExceptions(_) | Self::DefaultByteExceptions(_) => 0,
         }
     }
 
     const fn table_prefix_bytes(self) -> usize {
         match self {
             Self::ClassMapped | Self::DefaultExceptions(1..) => CLASS_MAP_BYTES,
-            Self::DefaultExceptions(0) => 0,
-            Self::DirectByte => 0,
+            Self::DefaultExceptions(0)
+            | Self::DefaultByteExceptions(_)
+            | Self::DirectByte => 0,
         }
     }
 }
@@ -5184,10 +5254,18 @@ fn native_row_bytes(
     class_count: usize,
 ) -> Option<usize> {
     match (transitions, cells) {
-        (TransitionLayout::DefaultExceptions(capacity), NativeCellEncoding::Wide32) => {
+        (
+            TransitionLayout::DefaultExceptions(capacity)
+            | TransitionLayout::DefaultByteExceptions(capacity),
+            NativeCellEncoding::Wide32,
+        ) => {
             native_default_exception_row_bytes(capacity)
         }
-        (TransitionLayout::DefaultExceptions(_), _) => None,
+        (
+            TransitionLayout::DefaultExceptions(_)
+            | TransitionLayout::DefaultByteExceptions(_),
+            _,
+        ) => None,
         (TransitionLayout::ClassMapped, NativeCellEncoding::Compact8Direct) => None,
         (TransitionLayout::ClassMapped, NativeCellEncoding::Compact16Indexed(shift)) => {
             let logical_row_bytes = class_count
@@ -5209,8 +5287,15 @@ fn native_table_prefix_bytes(
 ) -> Option<usize> {
     let prefix = transitions.table_prefix_bytes();
     match (transitions, cells) {
-        (TransitionLayout::DefaultExceptions(_), NativeCellEncoding::Wide32) => Some(prefix),
-        (TransitionLayout::DefaultExceptions(_), _) => None,
+        (
+            TransitionLayout::DefaultExceptions(_) | TransitionLayout::DefaultByteExceptions(_),
+            NativeCellEncoding::Wide32,
+        ) => Some(prefix),
+        (
+            TransitionLayout::DefaultExceptions(_)
+            | TransitionLayout::DefaultByteExceptions(_),
+            _,
+        ) => None,
         (TransitionLayout::ClassMapped, NativeCellEncoding::Compact8Direct) => None,
         (TransitionLayout::ClassMapped, NativeCellEncoding::Compact16Indexed(_)) => {
             let row_bytes = native_row_bytes(transitions, cells, class_count)?;
@@ -7708,6 +7793,8 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
         if encoded_hole_states == 0
             || retained_reverse_states != 0
             || usize::from(plan.exception_capacity) > MAX_NATIVE_DEFAULT_EXCEPTIONS
+            || (plan.keys == NativeDefaultExceptionKeys::Bytes
+                && plan.exception_capacity == 0)
             || native_default_exception_row_bytes(plan.exception_capacity)
                 != Some(plan.row_bytes)
         {
@@ -7716,7 +7803,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
             ));
         }
         (
-            TransitionLayout::DefaultExceptions(plan.exception_capacity),
+            plan.keys.transitions(plan.exception_capacity),
             NativeCellEncoding::Wide32,
         )
     } else if encoded_hole_states == 0 {
@@ -8373,7 +8460,8 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
                 }
             }
         }
-        TransitionLayout::DefaultExceptions(exception_capacity) => {
+        TransitionLayout::DefaultExceptions(exception_capacity)
+        | TransitionLayout::DefaultByteExceptions(exception_capacity) => {
             let normalization = NativeDefaultExceptionNormalization::new(
                 forward_states,
                 view.partial_discovered_states.ok_or(ObjectError::InvalidModule(
@@ -8390,12 +8478,24 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
                 ))?;
             for row in dfa.forward_cells.chunks_exact(dfa.class_count) {
                 let row_start = bytes.len();
-                let (default, exceptions, exception_count) =
-                    native_default_exception_row(row, normalization).ok_or(
-                        ObjectError::InvalidModule(
-                            "default-exception row lost its modal cell",
-                        ),
-                    )?;
+                let sparse_row = match transitions {
+                    TransitionLayout::DefaultExceptions(_) => {
+                        native_default_exception_row(row, normalization)
+                    }
+                    TransitionLayout::DefaultByteExceptions(_) => {
+                        native_default_byte_exception_row(
+                            row,
+                            dfa.byte_classes,
+                            normalization,
+                        )
+                    }
+                    _ => None,
+                };
+                let (default, exceptions, exception_count) = sparse_row.ok_or(
+                    ObjectError::InvalidModule(
+                        "default-exception row lost its exact sparse representation",
+                    ),
+                )?;
                 if exception_count > usize::from(exception_capacity) {
                     return Err(ObjectError::InvalidModule(
                         "default-exception row exceeds its table capacity",
@@ -8423,7 +8523,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
                             .get(slot)
                             .copied()
                             .flatten()
-                            .map_or(0, |(class, _)| class),
+                            .map_or(0, |(key, _)| key),
                     );
                 }
                 bytes.resize(
@@ -8509,7 +8609,8 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
                     }
                 }
             }
-            TransitionLayout::DefaultExceptions(_) => {
+            TransitionLayout::DefaultExceptions(_)
+            | TransitionLayout::DefaultByteExceptions(_) => {
                 return Err(ObjectError::InvalidModule(
                     "default-exception rows retained a reverse machine",
                 ));
@@ -11486,6 +11587,58 @@ fn x86_emit_unreachable_nops(
     Ok(())
 }
 
+fn x86_emit_default_exception_lookup(
+    assembler: &mut X86Assembler,
+    exception_capacity: u8,
+    cells: NativeCellEncoding,
+) -> Result<(), ObjectError> {
+    if cells != NativeCellEncoding::Wide32
+        || exception_capacity == 0
+        || usize::from(exception_capacity) > MAX_NATIVE_DEFAULT_EXCEPTIONS
+    {
+        return Err(ObjectError::InvalidModule(
+            "x86 default-exception row shape",
+        ));
+    }
+    let value_offset = native_default_exception_value_offset(exception_capacity).ok_or(
+        ObjectError::InvalidModule("x86 default-exception value offset"),
+    )?;
+    let mut exception_labels = Vec::new();
+    exception_labels
+        .try_reserve_exact(usize::from(exception_capacity))
+        .map_err(|_| ObjectError::Allocation("x86 default-exception labels"))?;
+    for slot in 0..usize::from(exception_capacity) {
+        let label = assembler.label()?;
+        exception_labels.push(label);
+        let key_offset = core::mem::size_of::<u32>()
+            .checked_add(slot)
+            .and_then(|offset| u8::try_from(offset).ok())
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "x86 default-exception key offset",
+            ))?;
+        assembler.instruction(&[0x41, 0x3a, 0x42, key_offset])?; // cmp al,[r10+key]
+        assembler.branch(&[0x0f, 0x84], label)?;
+    }
+    let done = assembler.label()?;
+    assembler.instruction(&[0x41, 0x8b, 0x02])?; // eax = default cell
+    assembler.branch(&[0xe9], done)?;
+    for (slot, label) in exception_labels.into_iter().enumerate() {
+        assembler.bind(label)?;
+        let cell_offset = value_offset
+            .checked_add(slot.checked_mul(core::mem::size_of::<u32>()).ok_or(
+                ObjectError::ArithmeticOverflow("x86 default-exception cell offset"),
+            )?)
+            .and_then(|offset| u8::try_from(offset).ok())
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "x86 default-exception cell offset",
+            ))?;
+        assembler.instruction(&[0x41, 0x8b, 0x42, cell_offset])?;
+        assembler.branch(&[0xe9], done)?;
+    }
+    assembler.bind(done)?;
+    Ok(())
+}
+
 fn x86_emit_table_lookup(
     assembler: &mut X86Assembler,
     transitions: TransitionLayout,
@@ -11512,52 +11665,11 @@ fn x86_emit_table_lookup(
         TransitionLayout::DirectByte => {}
         TransitionLayout::DefaultExceptions(exception_capacity) => {
             assembler.instruction(&[0x41, 0x0f, 0xb6, 0x04, 0x01])?; // eax = class_map[eax]
-            if cells != NativeCellEncoding::Wide32
-                || usize::from(exception_capacity) > MAX_NATIVE_DEFAULT_EXCEPTIONS
-            {
-                return Err(ObjectError::InvalidModule(
-                    "x86 default-exception row shape",
-                ));
-            }
-            let value_offset = native_default_exception_value_offset(exception_capacity)
-                .ok_or(ObjectError::InvalidModule(
-                    "x86 default-exception value offset",
-                ))?;
-            let mut exception_labels = Vec::new();
-            exception_labels
-                .try_reserve_exact(usize::from(exception_capacity))
-                .map_err(|_| ObjectError::Allocation("x86 default-exception labels"))?;
-            for slot in 0..usize::from(exception_capacity) {
-                let label = assembler.label()?;
-                exception_labels.push(label);
-                let key_offset = core::mem::size_of::<u32>()
-                    .checked_add(slot)
-                    .and_then(|offset| u8::try_from(offset).ok())
-                    .ok_or(ObjectError::ArithmeticOverflow(
-                        "x86 default-exception key offset",
-                    ))?;
-                assembler.instruction(&[0x41, 0x3a, 0x42, key_offset])?; // cmp al,[r10+key]
-                assembler.branch(&[0x0f, 0x84], label)?;
-            }
-            let done = assembler.label()?;
-            assembler.instruction(&[0x41, 0x8b, 0x02])?; // eax = default cell
-            assembler.branch(&[0xe9], done)?;
-            for (slot, label) in exception_labels.into_iter().enumerate() {
-                assembler.bind(label)?;
-                let cell_offset = value_offset
-                    .checked_add(slot.checked_mul(core::mem::size_of::<u32>()).ok_or(
-                        ObjectError::ArithmeticOverflow(
-                            "x86 default-exception cell offset",
-                        ),
-                    )?)
-                    .and_then(|offset| u8::try_from(offset).ok())
-                    .ok_or(ObjectError::ArithmeticOverflow(
-                        "x86 default-exception cell offset",
-                    ))?;
-                assembler.instruction(&[0x41, 0x8b, 0x42, cell_offset])?;
-                assembler.branch(&[0xe9], done)?;
-            }
-            assembler.bind(done)?;
+            x86_emit_default_exception_lookup(assembler, exception_capacity, cells)?;
+            return Ok(());
+        }
+        TransitionLayout::DefaultByteExceptions(exception_capacity) => {
+            x86_emit_default_exception_lookup(assembler, exception_capacity, cells)?;
             return Ok(());
         }
     }
@@ -23823,6 +23935,59 @@ fn aarch64_set_row_from_zero_based_cell(
     Ok(())
 }
 
+fn aarch64_emit_default_exception_lookup(
+    assembler: &mut Aarch64Assembler,
+    exception_capacity: u8,
+    cells: NativeCellEncoding,
+) -> Result<(), ObjectError> {
+    if cells != NativeCellEncoding::Wide32
+        || exception_capacity == 0
+        || usize::from(exception_capacity) > MAX_NATIVE_DEFAULT_EXCEPTIONS
+    {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 default-exception row shape",
+        ));
+    }
+    let value_offset = native_default_exception_value_offset(exception_capacity).ok_or(
+        ObjectError::InvalidModule("AArch64 default-exception value offset"),
+    )?;
+    let mut exception_labels = Vec::new();
+    exception_labels
+        .try_reserve_exact(usize::from(exception_capacity))
+        .map_err(|_| ObjectError::Allocation("AArch64 default-exception labels"))?;
+    for slot in 0..usize::from(exception_capacity) {
+        let label = assembler.label()?;
+        exception_labels.push(label);
+        let key_offset = core::mem::size_of::<u32>()
+            .checked_add(slot)
+            .and_then(|offset| u16::try_from(offset).ok())
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "AArch64 default-exception key offset",
+            ))?;
+        assembler.instruction(aarch64_load_byte_imm(12, 11, key_offset)?)?;
+        assembler.instruction(aarch64_cmp_w(8, 12)?)?;
+        assembler.branch_cond(AARCH64_EQ, label)?;
+    }
+    let done = assembler.label()?;
+    assembler.instruction(aarch64_load_w_imm(8, 11, 0)?)?;
+    assembler.branch(done)?;
+    for (slot, label) in exception_labels.into_iter().enumerate() {
+        assembler.bind(label)?;
+        let cell_offset = value_offset
+            .checked_add(slot.checked_mul(core::mem::size_of::<u32>()).ok_or(
+                ObjectError::ArithmeticOverflow("AArch64 default-exception cell offset"),
+            )?)
+            .and_then(|offset| u16::try_from(offset).ok())
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "AArch64 default-exception cell offset",
+            ))?;
+        assembler.instruction(aarch64_load_w_imm(8, 11, cell_offset)?)?;
+        assembler.branch(done)?;
+    }
+    assembler.bind(done)?;
+    Ok(())
+}
+
 fn aarch64_emit_table_lookup(
     assembler: &mut Aarch64Assembler,
     transitions: TransitionLayout,
@@ -23848,53 +24013,11 @@ fn aarch64_emit_table_lookup(
         TransitionLayout::DirectByte => {}
         TransitionLayout::DefaultExceptions(exception_capacity) => {
             assembler.instruction(aarch64_load_byte_reg(8, 5, 8)?)?;
-            if cells != NativeCellEncoding::Wide32
-                || usize::from(exception_capacity) > MAX_NATIVE_DEFAULT_EXCEPTIONS
-            {
-                return Err(ObjectError::InvalidModule(
-                    "AArch64 default-exception row shape",
-                ));
-            }
-            let value_offset = native_default_exception_value_offset(exception_capacity)
-                .ok_or(ObjectError::InvalidModule(
-                    "AArch64 default-exception value offset",
-                ))?;
-            let mut exception_labels = Vec::new();
-            exception_labels
-                .try_reserve_exact(usize::from(exception_capacity))
-                .map_err(|_| ObjectError::Allocation("AArch64 default-exception labels"))?;
-            for slot in 0..usize::from(exception_capacity) {
-                let label = assembler.label()?;
-                exception_labels.push(label);
-                let key_offset = core::mem::size_of::<u32>()
-                    .checked_add(slot)
-                    .and_then(|offset| u16::try_from(offset).ok())
-                    .ok_or(ObjectError::ArithmeticOverflow(
-                        "AArch64 default-exception key offset",
-                    ))?;
-                assembler.instruction(aarch64_load_byte_imm(12, 11, key_offset)?)?;
-                assembler.instruction(aarch64_cmp_w(8, 12)?)?;
-                assembler.branch_cond(AARCH64_EQ, label)?;
-            }
-            let done = assembler.label()?;
-            assembler.instruction(aarch64_load_w_imm(8, 11, 0)?)?;
-            assembler.branch(done)?;
-            for (slot, label) in exception_labels.into_iter().enumerate() {
-                assembler.bind(label)?;
-                let cell_offset = value_offset
-                    .checked_add(slot.checked_mul(core::mem::size_of::<u32>()).ok_or(
-                        ObjectError::ArithmeticOverflow(
-                            "AArch64 default-exception cell offset",
-                        ),
-                    )?)
-                    .and_then(|offset| u16::try_from(offset).ok())
-                    .ok_or(ObjectError::ArithmeticOverflow(
-                        "AArch64 default-exception cell offset",
-                    ))?;
-                assembler.instruction(aarch64_load_w_imm(8, 11, cell_offset)?)?;
-                assembler.branch(done)?;
-            }
-            assembler.bind(done)?;
+            aarch64_emit_default_exception_lookup(assembler, exception_capacity, cells)?;
+            return Ok(());
+        }
+        TransitionLayout::DefaultByteExceptions(exception_capacity) => {
+            aarch64_emit_default_exception_lookup(assembler, exception_capacity, cells)?;
             return Ok(());
         }
     }
@@ -51594,7 +51717,8 @@ int main(void){{
                         TransitionLayout::DirectByte => {
                             usize::from(view.dfa.byte_classes[physical_column])
                         }
-                        TransitionLayout::DefaultExceptions(_) => {
+                        TransitionLayout::DefaultExceptions(_)
+                        | TransitionLayout::DefaultByteExceptions(_) => {
                             panic!("unlimited partial table unexpectedly used resource rescue")
                         }
                     };
@@ -51886,6 +52010,161 @@ int main(void){{
             exact,
         )
         .is_none());
+    }
+
+    #[test]
+    fn raw_byte_exception_rows_exhaust_every_key_and_capacity_boundary() {
+        let default = ForwardCell::new(0, false);
+        let exceptional = ForwardCell::new(NO_DFA_STATE, true);
+        let mut row = [default; 16];
+        row[15] = exceptional;
+        let normalization = NativeDefaultExceptionNormalization::new(16, 16, false).unwrap();
+
+        for byte in u8::MIN..=u8::MAX {
+            let mut byte_classes = [0_u8; 256];
+            byte_classes[usize::from(byte)] = 15;
+            let (actual_default, exceptions, count) = native_default_byte_exception_row(
+                &row,
+                &byte_classes,
+                normalization,
+            )
+            .unwrap();
+            assert_eq!(actual_default, default, "byte={byte}");
+            assert_eq!(count, 1, "byte={byte}");
+            assert_eq!(exceptions[0], Some((byte, exceptional)), "byte={byte}");
+            assert!(exceptions[1..].iter().all(Option::is_none));
+        }
+
+        let boundary_bytes = [u8::MIN, 1, u8::MAX - 1, u8::MAX];
+        for count in 1..=MAX_NATIVE_DEFAULT_EXCEPTIONS {
+            let mut row = [default; 16];
+            let mut byte_classes = [0_u8; 256];
+            for (index, &byte) in boundary_bytes[..count].iter().enumerate() {
+                let class = 12 + index;
+                row[class] = ForwardCell::new(u32::try_from(index + 1).unwrap(), index % 2 == 0);
+                byte_classes[usize::from(byte)] = u8::try_from(class).unwrap();
+            }
+            let (_, exceptions, actual_count) = native_default_byte_exception_row(
+                &row,
+                &byte_classes,
+                normalization,
+            )
+            .unwrap();
+            assert_eq!(actual_count, count);
+            assert_eq!(
+                exceptions[..count]
+                    .iter()
+                    .map(|exception| exception.unwrap().0)
+                    .collect::<Vec<_>>(),
+                boundary_bytes[..count],
+            );
+        }
+
+        let mut five_byte_classes = [0_u8; 256];
+        for byte in 0..=4 {
+            five_byte_classes[byte] = 15;
+        }
+        assert!(native_default_byte_exception_row(
+            &row,
+            &five_byte_classes,
+            normalization,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn raw_byte_exception_plan_requires_no_global_capacity_growth() {
+        const CLASS_COUNT: usize = 16;
+        const COMPLETE_ROWS: usize = 100;
+        let derive = |raw_counts: &[usize], architecture: Architecture| {
+            let exception_classes = raw_counts.len();
+            let default_classes = CLASS_COUNT - exception_classes;
+            let mut byte_classes = [0_u8; 256];
+            for class in 1..default_classes {
+                byte_classes[class] = u8::try_from(class).unwrap();
+            }
+            let mut next_byte = 240_usize;
+            for (exception, &raw_count) in raw_counts.iter().enumerate() {
+                let class = default_classes + exception;
+                for _ in 0..raw_count {
+                    byte_classes[next_byte] = u8::try_from(class).unwrap();
+                    next_byte += 1;
+                }
+            }
+            let class_representatives = (0..CLASS_COUNT)
+                .map(|class| {
+                    u8::try_from(
+                        byte_classes
+                            .iter()
+                            .position(|&actual| usize::from(actual) == class)
+                            .unwrap(),
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let mut forward_cells = Vec::with_capacity(COMPLETE_ROWS * CLASS_COUNT);
+            for state in 0..COMPLETE_ROWS {
+                let default = ForwardCell::new(u32::try_from(state).unwrap(), false);
+                for class in 0..CLASS_COUNT {
+                    forward_cells.push(if class < default_classes {
+                        default
+                    } else {
+                        ForwardCell::new(NO_DFA_STATE, false)
+                    });
+                }
+            }
+            derive_native_default_exception_plan(
+                NativeDfaView {
+                    initial_state: 0,
+                    initial_pending: false,
+                    initial_terminal: false,
+                    byte_classes: &byte_classes,
+                    class_count: CLASS_COUNT,
+                    class_representatives: &class_representatives,
+                    forward_cells: &forward_cells,
+                    reverse_initial: None,
+                    reverse_cells: &[],
+                },
+                Some(COMPLETE_ROWS + 1),
+                false,
+                architecture,
+            )
+            .unwrap()
+        };
+
+        for architecture in [Architecture::X86_64, Architecture::Aarch64] {
+            let exact = derive(&[1, 1, 1, 1], architecture);
+            assert_eq!(exact.exception_capacity, 4, "{architecture:?}");
+            assert_eq!(exact.keys, NativeDefaultExceptionKeys::Bytes, "{architecture:?}");
+            assert_eq!(exact.row_bytes, 24, "{architecture:?}");
+            assert_eq!(
+                native_machine_bytes(
+                    exact.keys.transitions(exact.exception_capacity),
+                    NativeCellEncoding::Wide32,
+                    CLASS_COUNT,
+                    COMPLETE_ROWS,
+                    0,
+                ),
+                Some(2_400),
+            );
+
+            let expanded = derive(&[2, 1, 1], architecture);
+            assert_eq!(expanded.exception_capacity, 3, "{architecture:?}");
+            assert_eq!(
+                expanded.keys,
+                NativeDefaultExceptionKeys::Classes,
+                "{architecture:?}",
+            );
+            assert_eq!(expanded.row_bytes, 20, "{architecture:?}");
+
+            let overflow = derive(&[5], architecture);
+            assert_eq!(overflow.exception_capacity, 1, "{architecture:?}");
+            assert_eq!(
+                overflow.keys,
+                NativeDefaultExceptionKeys::Classes,
+                "{architecture:?}",
+            );
+        }
     }
 
     #[test]
@@ -52730,6 +53009,7 @@ int main(void){{
                 )
                 .expect("uniform default-exception plan");
                 assert_eq!(plan.exception_capacity, 0, "{output:?}/{architecture:?}");
+                assert_eq!(plan.keys, NativeDefaultExceptionKeys::Classes);
                 assert_eq!(plan.row_bytes, 4, "{output:?}/{architecture:?}");
 
                 let (data, layout) =
@@ -53034,7 +53314,7 @@ int main(void){{
             let (data, layout) =
                 build_forced_default_exception_table(view, architecture, usize::MAX).unwrap();
             let exception_capacity = match layout.transitions {
-                TransitionLayout::DefaultExceptions(capacity) => capacity,
+                TransitionLayout::DefaultByteExceptions(capacity) => capacity,
                 other => panic!("expected default-exception rows, got {other:?}"),
             };
             assert_eq!(
@@ -53047,6 +53327,15 @@ int main(void){{
             let value_offset =
                 native_default_exception_value_offset(exception_capacity).unwrap();
             let forward_offset = usize::try_from(layout.forward_offset).unwrap();
+            assert_eq!(forward_offset, 0, "{architecture:?}");
+            let forward_end =
+                DefaultExceptionPartialFixture::COMPLETE_ROWS * row_bytes;
+            assert_eq!(
+                usize::try_from(layout.reverse_offset).unwrap(),
+                forward_end,
+                "{architecture:?}",
+            );
+            assert!(data.len() >= forward_end, "{architecture:?}");
             let mut saw_dead = false;
             let mut saw_hole = false;
             let mut saw_accept = false;
@@ -53134,6 +53423,7 @@ int main(void){{
             )
             .expect("collapsed packed plurality plan");
             assert_eq!(plan.exception_capacity, 3, "{architecture:?}");
+            assert_eq!(plan.keys, NativeDefaultExceptionKeys::Bytes, "{architecture:?}");
             assert_eq!(plan.row_bytes, 20, "{architecture:?}");
             assert!(usize::from(plan.exception_capacity) <= MAX_NATIVE_DEFAULT_EXCEPTIONS);
             assert_eq!(
@@ -53185,7 +53475,7 @@ int main(void){{
             assert!(sparse.0.len() < dense.0.len(), "{architecture:?}");
             assert_eq!(
                 sparse.1.transitions,
-                TransitionLayout::DefaultExceptions(3),
+                TransitionLayout::DefaultByteExceptions(3),
                 "{architecture:?}",
             );
             assert_eq!(sparse.1.cells, NativeCellEncoding::Wide32);
@@ -53221,7 +53511,7 @@ int main(void){{
             assert!(partial.collapse_holes);
             assert_eq!(partial.resume_states, 8);
             let exception_capacity = match layout.transitions {
-                TransitionLayout::DefaultExceptions(capacity) => capacity,
+                TransitionLayout::DefaultByteExceptions(capacity) => capacity,
                 other => panic!("expected default-exception rows, got {other:?}"),
             };
             let row_bytes = native_default_exception_row_bytes(exception_capacity).unwrap();
@@ -53230,11 +53520,12 @@ int main(void){{
             let forward_offset = usize::try_from(layout.forward_offset).unwrap();
             let packed_at = |state: usize, class: usize| {
                 let row_start = forward_offset + state * row_bytes;
+                let key = view.dfa.class_representatives[class];
                 let mut packed = u32::from_le_bytes(
                     data[row_start..row_start + 4].try_into().unwrap(),
                 );
                 for slot in 0..usize::from(exception_capacity) {
-                    if usize::from(data[row_start + 4 + slot]) == class {
+                    if data[row_start + 4 + slot] == key {
                         let offset = row_start + value_offset + slot * 4;
                         packed = u32::from_le_bytes(
                             data[offset..offset + 4].try_into().unwrap(),
@@ -53345,7 +53636,7 @@ int main(void){{
             .unwrap();
             assert!(matches!(
                 admitted.1.transitions,
-                TransitionLayout::DefaultExceptions(_)
+                TransitionLayout::DefaultByteExceptions(_)
             ));
             assert_eq!(admitted.0, sparse.0, "{architecture:?}");
 
@@ -53356,8 +53647,14 @@ int main(void){{
                 architecture,
             )
             .unwrap();
-            let required_machine_bytes = CLASS_MAP_BYTES
-                + DefaultExceptionPartialFixture::COMPLETE_ROWS * plan.row_bytes;
+            let required_machine_bytes = native_machine_bytes(
+                plan.keys.transitions(plan.exception_capacity),
+                NativeCellEncoding::Wide32,
+                view.dfa.class_count,
+                DefaultExceptionPartialFixture::COMPLETE_ROWS,
+                0,
+            )
+            .unwrap();
             let below = build_native_dfa_table_with_cost_model_and_data_limit(
                 view,
                 architecture,
@@ -53454,6 +53751,7 @@ int main(void){{
                 ),
                 Some(NativeDefaultExceptionPlan {
                     exception_capacity: 2,
+                    keys: NativeDefaultExceptionKeys::Classes,
                     row_bytes: 16,
                 })
             );
@@ -53508,6 +53806,7 @@ int main(void){{
             )
             .expect("nonmajority sparse reduction");
             assert_eq!(plan.exception_capacity, 4);
+            assert_eq!(plan.keys, NativeDefaultExceptionKeys::Classes);
             assert_eq!(plan.row_bytes, 24);
 
             let dense = build_native_dfa_table_with_cost_model_and_data_limit_once(
@@ -53567,6 +53866,7 @@ int main(void){{
             )
             .expect("collapsed sparse reduction");
             assert_eq!(plan.exception_capacity, 1);
+            assert_eq!(plan.keys, NativeDefaultExceptionKeys::Classes);
             assert_eq!(plan.row_bytes, 12);
             let dense =
                 build_native_dfa_table_with_cost_model_and_data_limit_once(
@@ -53590,8 +53890,14 @@ int main(void){{
             )
             .unwrap();
             assert_eq!(admitted, sparse, "{architecture:?}");
-            let required_machine_bytes = CLASS_MAP_BYTES
-                + CollapsedDefaultExceptionFixture::COMPLETE_ROWS * plan.row_bytes;
+            let required_machine_bytes = native_machine_bytes(
+                plan.keys.transitions(plan.exception_capacity),
+                NativeCellEncoding::Wide32,
+                view.dfa.class_count,
+                CollapsedDefaultExceptionFixture::COMPLETE_ROWS,
+                0,
+            )
+            .unwrap();
             assert!(matches!(
                 build_native_dfa_table_with_cost_model_and_data_limit(
                     view,
@@ -53675,6 +53981,14 @@ int main(void){{
             );
             match target.architecture {
                 Architecture::X86_64 => {
+                    let class_load = [0x41, 0x0f, 0xb6, 0x04, 0x01];
+                    assert!(
+                        !lowering
+                            .code
+                            .windows(class_load.len())
+                            .any(|bytes| bytes == class_load),
+                        "{target:?} retained the omitted sparse class-map load",
+                    );
                     assert!(lowering.code.windows(4).any(|bytes| {
                         bytes == [0x41, 0x3a, 0x42, 0x04]
                     }));
@@ -53688,6 +54002,10 @@ int main(void){{
                         .chunks_exact(4)
                         .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
                         .collect::<Vec<_>>();
+                    assert!(
+                        !words.contains(&aarch64_load_byte_reg(8, 5, 8).unwrap()),
+                        "{target:?} retained the omitted sparse class-map load",
+                    );
                     assert!(words.contains(&aarch64_load_byte_imm(12, 11, 4).unwrap()));
                     assert!(words.contains(&aarch64_load_w_imm(8, 11, 0).unwrap()));
                 }
@@ -53766,7 +54084,15 @@ int main(void){{
             );
             match target.architecture {
                 Architecture::X86_64 => {
-                    // cmp byte ptr [r10 + rax + 4], class; mov default.
+                    let class_load = [0x41, 0x0f, 0xb6, 0x04, 0x01];
+                    assert!(
+                        !lowering
+                            .code
+                            .windows(class_load.len())
+                            .any(|bytes| bytes == class_load),
+                        "{target:?} retained the omitted sparse class-map load",
+                    );
+                    // cmp byte ptr [r10 + rax + 4], raw byte; mov default.
                     assert!(lowering
                         .code
                         .windows(4)
@@ -53782,6 +54108,10 @@ int main(void){{
                         .chunks_exact(4)
                         .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
                         .collect::<Vec<_>>();
+                    assert!(
+                        !words.contains(&aarch64_load_byte_reg(8, 5, 8).unwrap()),
+                        "{target:?} retained the omitted sparse class-map load",
+                    );
                     assert!(words.contains(&aarch64_load_byte_imm(12, 11, 4).unwrap()));
                     assert!(words.contains(&aarch64_load_w_imm(8, 11, 0).unwrap()));
                 }
@@ -71186,7 +71516,8 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                     TransitionLayout::DirectByte => {
                         usize::from(view.dfa.byte_classes[physical_column])
                     }
-                    TransitionLayout::DefaultExceptions(_) => {
+                    TransitionLayout::DefaultExceptions(_)
+                    | TransitionLayout::DefaultByteExceptions(_) => {
                         panic!("complete table unexpectedly used partial resource rescue")
                     }
                 };
@@ -71237,7 +71568,8 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                     TransitionLayout::DirectByte => {
                         usize::from(view.dfa.byte_classes[physical_column])
                     }
-                    TransitionLayout::DefaultExceptions(_) => {
+                    TransitionLayout::DefaultExceptions(_)
+                    | TransitionLayout::DefaultByteExceptions(_) => {
                         panic!("reverse table unexpectedly used partial resource rescue")
                     }
                 };
@@ -75206,7 +75538,8 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             match native_layout.transitions {
                 TransitionLayout::ClassMapped => saw_class_mapped_rows = true,
                 TransitionLayout::DirectByte => saw_direct_rows = true,
-                TransitionLayout::DefaultExceptions(_) => {
+                TransitionLayout::DefaultExceptions(_)
+                | TransitionLayout::DefaultByteExceptions(_) => {
                     panic!("unlimited complete table unexpectedly used resource rescue")
                 }
             }
