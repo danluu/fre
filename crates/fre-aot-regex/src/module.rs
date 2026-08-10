@@ -742,6 +742,24 @@ impl NativeDfaEntryContract {
     }
 }
 
+/// Select the semantic rejection edge for an exact-product entry probe.
+///
+/// A moving search may reject the original start and continue with its
+/// ordinary scanner. An absolute-boundary proof has already reduced the
+/// search to one candidate, so rejection of any exact product column proves
+/// that the whole search has no match.
+const fn exact_start_probe_failure_target(
+    fixed_candidate: bool,
+    retry: usize,
+    no_match: usize,
+) -> usize {
+    if fixed_candidate {
+        no_match
+    } else {
+        retry
+    }
+}
+
 impl NativeScannerEmission {
     const fn start_accelerator(self) -> StartAccelerator {
         match self.isa {
@@ -16678,16 +16696,23 @@ fn lower_x86_64_dfa_with_entry_contract(
         let kind = filter_kind.ok_or(ObjectError::InvalidModule(
             "x86 exact-start prefix block has no instruction selection",
         ))?;
+        let probe_failed = exact_start_probe_failure_target(
+            fixed_candidate,
+            exact_start_probe_failed,
+            no_match,
+        );
         x86_emit_exact_start_probe(
             &mut assembler,
             layout,
             kind,
             !fixed_candidate,
             register_outcome,
-            exact_start_probe_failed,
+            probe_failed,
             matched,
         )?;
-        assembler.bind(exact_start_probe_failed)?;
+        if !fixed_candidate {
+            assembler.bind(exact_start_probe_failed)?;
+        }
     }
     let adaptive_suffix_cold = if !fixed_candidate
         && let Some(suffix) = layout.suffix_filter
@@ -29860,18 +29885,26 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
         // A sparse four-vector scanner wins on long misses but should not pay
         // four loads and a horizontal reduction for a match at the original
         // window start. The same complete-product guard used ahead of a
-        // suffix prepass proves that start once on large windows; failure
-        // leaves X2 untouched for the moving scanner.
+        // suffix prepass proves that start once on large windows. A moving
+        // entry retries from its untouched X2; a fixed entry has no second
+        // candidate and rejects immediately.
+        let probe_failed = exact_start_probe_failure_target(
+            fixed_candidate,
+            exact_start_probe_failed,
+            no_match,
+        );
         aarch64_emit_exact_start_probe(
             &mut assembler,
             layout,
             use_prefix_block,
             !fixed_candidate,
             register_outcome,
-            exact_start_probe_failed,
+            probe_failed,
             matched,
         )?;
-        assembler.bind(exact_start_probe_failed)?;
+        if !fixed_candidate {
+            assembler.bind(exact_start_probe_failed)?;
+        }
     }
     if !fixed_candidate && let Some(suffix) = layout.suffix_filter {
         aarch64_emit_suffix_prepass(
@@ -79048,8 +79081,23 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             "the entry probe must not rely on a scanner validation that has not happened"
         );
         let mut fixed_x86 = X86Assembler::new();
-        let fixed_x86_failed = fixed_x86.label().unwrap();
+        let fixed_x86_retry = fixed_x86.label().unwrap();
+        let fixed_x86_no_match = fixed_x86.label().unwrap();
         let fixed_x86_matched = fixed_x86.label().unwrap();
+        let fixed_x86_failed = exact_start_probe_failure_target(
+            true,
+            fixed_x86_retry,
+            fixed_x86_no_match,
+        );
+        assert_eq!(fixed_x86_failed, fixed_x86_no_match);
+        assert_eq!(
+            exact_start_probe_failure_target(
+                false,
+                fixed_x86_retry,
+                fixed_x86_no_match,
+            ),
+            fixed_x86_retry,
+        );
         x86_emit_exact_start_probe(
             &mut fixed_x86,
             x86_layout,
@@ -79060,7 +79108,22 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             fixed_x86_matched,
         )
         .unwrap();
-        fixed_x86.bind(fixed_x86_failed).unwrap();
+        assert!(
+            fixed_x86
+                .fixups
+                .iter()
+                .any(|fixup| fixup.label == fixed_x86_no_match),
+            "a fixed exact-product rejection must target the terminal no-match block",
+        );
+        assert!(
+            fixed_x86
+                .fixups
+                .iter()
+                .all(|fixup| fixup.label != fixed_x86_retry),
+            "a fixed exact-product rejection must not retain the DFA retry edge",
+        );
+        fixed_x86.bind(fixed_x86_retry).unwrap();
+        fixed_x86.bind(fixed_x86_no_match).unwrap();
         fixed_x86.bind(fixed_x86_matched).unwrap();
         let fixed_x86 = fixed_x86.finish().unwrap();
         assert!(fixed_x86.windows(4).any(|bytes| bytes == [0x48, 0x83, 0xf8, 5]));
@@ -79125,8 +79188,15 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
         assert!(words.iter().filter(|word| **word == primary_load).count() >= 2);
 
         let mut fixed_aarch64 = Aarch64Assembler::new();
-        let fixed_aarch64_failed = fixed_aarch64.label().unwrap();
+        let fixed_aarch64_retry = fixed_aarch64.label().unwrap();
+        let fixed_aarch64_no_match = fixed_aarch64.label().unwrap();
         let fixed_aarch64_matched = fixed_aarch64.label().unwrap();
+        let fixed_aarch64_failed = exact_start_probe_failure_target(
+            true,
+            fixed_aarch64_retry,
+            fixed_aarch64_no_match,
+        );
+        assert_eq!(fixed_aarch64_failed, fixed_aarch64_no_match);
         aarch64_emit_exact_start_probe(
             &mut fixed_aarch64,
             aarch64_layout,
@@ -79137,7 +79207,22 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             fixed_aarch64_matched,
         )
         .unwrap();
-        fixed_aarch64.bind(fixed_aarch64_failed).unwrap();
+        assert!(
+            fixed_aarch64
+                .fixups
+                .iter()
+                .any(|fixup| fixup.label == fixed_aarch64_no_match),
+            "a fixed exact-product rejection must target the terminal no-match block",
+        );
+        assert!(
+            fixed_aarch64
+                .fixups
+                .iter()
+                .all(|fixup| fixup.label != fixed_aarch64_retry),
+            "a fixed exact-product rejection must not retain the DFA retry edge",
+        );
+        fixed_aarch64.bind(fixed_aarch64_retry).unwrap();
+        fixed_aarch64.bind(fixed_aarch64_no_match).unwrap();
         fixed_aarch64.bind(fixed_aarch64_matched).unwrap();
         let fixed_words = fixed_aarch64
             .finish()
@@ -81664,10 +81749,16 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             base.with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
                 .unwrap()
         };
-        let fixtures: [(&str, &[u8]); 8] = [
+        let fixtures: [(&str, &[u8]); 11] = [
             (r"\A(?:ab|ac)", b"acxx"),
             (r"(?:ab|ac)\z", b"xxac"),
             (r"\A(?:ab|ac)\z", b"ac"),
+            // These windows satisfy their absolute bound and exact width but
+            // fail a proved product column. There is no second candidate for
+            // the native DFA retry path to find.
+            (r"\A(?:de|df)", b"dgxx"),
+            (r"(?:gh|gi)\z", b"xxgj"),
+            (r"\A(?:kl|km)\z", b"kn"),
             (r"\A(?:ab|cd)", b"cdxx"),
             (r"\Aabcdefghijklmnop", b"abcdefghijklmnop"),
             (r"\A", b"x"),
@@ -81712,6 +81803,13 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 assert!(module.slow_aot_report().is_some());
                 assert!(module.slow_context_aot_report().is_none());
                 assert!(module.required_runtime_program().is_none());
+                if (3..=5).contains(&fixture) {
+                    assert_eq!(
+                        module.anchored_prefix_filter_bytes(),
+                        2,
+                        "failed-product fixture did not exercise the exact native probe",
+                    );
+                }
                 let symbol = module.entry_symbol().to_owned();
                 writeln!(
                     source,
