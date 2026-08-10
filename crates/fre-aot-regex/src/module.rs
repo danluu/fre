@@ -7815,7 +7815,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once(
                         row_bytes,
                         forward_states,
                         has_start_scanner,
-                        loop_skips.state_slots(),
+                        loop_skip.map(|plan| plan.state),
                         partial_layout.ok_or(ObjectError::InvalidModule(
                             "default-exception rows have no partial layout",
                         ))?,
@@ -50872,7 +50872,7 @@ int main(void){{
                         row_bytes,
                         DefaultExceptionPartialFixture::COMPLETE_ROWS,
                         layout.has_start_scanner(),
-                        layout.loop_skips.state_slots(),
+                        layout.loop_skip.map(|plan| plan.state),
                         partial,
                         layout.cells,
                     )
@@ -51089,39 +51089,36 @@ int main(void){{
             assert_eq!(plan.exception_capacity, 1);
             assert_eq!(plan.row_bytes, 12);
             let dense =
-                build_native_dfa_table_with_cost_model_and_data_limit_and_loop_capacity_once(
+                build_native_dfa_table_with_cost_model_and_data_limit_once(
                     view,
                     architecture,
                     NativeVectorFilterCostModel::Established,
                     true,
                     usize::MAX,
-                    module_dfa_loop_skip::MAX_STATIC_DFA_LOOP_SKIPS,
                     None,
                 )
                 .unwrap();
             let sparse =
                 build_forced_default_exception_table(view, architecture, usize::MAX).unwrap();
             assert!(sparse.0.len() < dense.0.len(), "{architecture:?}");
-            let admitted = build_native_dfa_table_with_cost_model_and_data_limit_and_loop_capacity(
+            let admitted = build_native_dfa_table_with_cost_model_and_data_limit(
                 view,
                 architecture,
                 NativeVectorFilterCostModel::Established,
                 true,
                 sparse.0.len(),
-                module_dfa_loop_skip::MAX_STATIC_DFA_LOOP_SKIPS,
             )
             .unwrap();
             assert_eq!(admitted, sparse, "{architecture:?}");
             let required_machine_bytes = CLASS_MAP_BYTES
                 + CollapsedDefaultExceptionFixture::COMPLETE_ROWS * plan.row_bytes;
             assert!(matches!(
-                build_native_dfa_table_with_cost_model_and_data_limit_and_loop_capacity(
+                build_native_dfa_table_with_cost_model_and_data_limit(
                     view,
                     architecture,
                     NativeVectorFilterCostModel::Established,
                     true,
                     required_machine_bytes - 1,
-                    module_dfa_loop_skip::MAX_STATIC_DFA_LOOP_SKIPS,
                 ),
                 Err(ObjectError::Resource {
                     resource: crate::CompileResource::ProgramBytes,
@@ -51183,7 +51180,7 @@ int main(void){{
                     None,
                 )
                 .unwrap();
-            let lowering = lower_native_dfa_with_entry_contract_and_data_limit_once(
+            let lowering = lower_native_dfa_with_entry_contract_and_data_limit(
                 view,
                 target,
                 NativeDfaEntryContract::PreparedPartialCore,
