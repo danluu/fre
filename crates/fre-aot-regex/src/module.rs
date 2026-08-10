@@ -39521,6 +39521,443 @@ mod tests {
         packed
     }
 
+    #[derive(Clone, Copy)]
+    struct LinkedSparseNativeFixture {
+        byte_cells: [ForwardCell; CLASS_MAP_BYTES],
+        partial: NativePartialDfaLayout,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct LinkedSparseExpected {
+        status: u32,
+        first: Option<usize>,
+        second: Option<usize>,
+        position: Option<usize>,
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::too_many_lines,
+        reason = "the test fixture constructs one exact native sparse record and its independent byte oracle"
+    )]
+    fn linked_sparse_native_fixture(
+        target: Target,
+        exception_capacity: u8,
+        cells: NativeCellEncoding,
+        keys: NativeDefaultExceptionKeys,
+        collapse_holes: bool,
+        output: OutputContract,
+    ) -> Result<(NativeLowering, LinkedSparseNativeFixture), ObjectError> {
+        assert!(usize::from(exception_capacity) > MAX_NATIVE_DEFAULT_EXCEPTIONS);
+        assert!(matches!(
+            cells,
+            NativeCellEncoding::Compact16 | NativeCellEncoding::Wide32
+        ));
+        assert!(matches!(
+            keys,
+            NativeDefaultExceptionKeys::Classes | NativeDefaultExceptionKeys::Bytes
+        ));
+        let transitions = keys.transitions(exception_capacity);
+        let row_bytes = native_default_exception_row_bytes(exception_capacity, cells)
+            .expect("linked sparse row geometry");
+        let forward_offset =
+            native_table_prefix_bytes(transitions, cells, CLASS_MAP_BYTES)
+                .expect("linked sparse table prefix");
+        let reverse_offset = forward_offset
+            .checked_add(row_bytes)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "linked sparse machine extent",
+            ))?;
+        let last_live_token = encode_native_row_offset(forward_offset, cells).ok_or(
+            ObjectError::InvalidModule("linked sparse initial row token"),
+        )?;
+        let partial = NativePartialDfaLayout {
+            hole_token_base: u32::try_from(last_live_token.checked_add(1).ok_or(
+                ObjectError::ArithmeticOverflow("linked sparse hole base"),
+            )?)
+            .map_err(|_| ObjectError::ArithmeticOverflow("linked sparse hole base"))?,
+            resume_states: 4,
+            collapse_holes,
+        };
+
+        let class_map = core::array::from_fn(|byte| {
+            u8::try_from((byte * 73 + 19) & usize::from(u8::MAX)).unwrap()
+        });
+        let default = ForwardCell::new(0, false);
+        let mut key_cells = [default; CLASS_MAP_BYTES];
+        let mut exceptions = [None; MAX_NATIVE_SPARSE_EXCEPTIONS];
+        let capacity = usize::from(exception_capacity);
+        for slot in 0..capacity {
+            // Exact integer spacing exercises low, interior, and high keys at
+            // every capacity. At 255 this is precisely 0..=254, leaving byte
+            // 255 as the sole default query.
+            let key = u8::try_from(slot * CLASS_MAP_BYTES / capacity).unwrap();
+            let cell = match slot % 8 {
+                0 => ForwardCell::new(0, true),
+                1 => ForwardCell::new(1, false),
+                2 => ForwardCell::new(2, true),
+                3 => ForwardCell::new(NO_DFA_STATE, false),
+                4 => ForwardCell::new(NO_DFA_STATE, true),
+                5 => ForwardCell::new(3, false),
+                6 => ForwardCell::new(0, true),
+                _ => ForwardCell::new(4, true),
+            };
+            key_cells[usize::from(key)] = cell;
+            exceptions[slot] = Some((key, cell));
+        }
+        let byte_cells = core::array::from_fn(|byte| {
+            let key = match keys {
+                NativeDefaultExceptionKeys::Classes => class_map[byte],
+                NativeDefaultExceptionKeys::Bytes => u8::try_from(byte).unwrap(),
+                NativeDefaultExceptionKeys::Boundaries => {
+                    unreachable!("linked sparse fixture excludes boundaries")
+                }
+            };
+            key_cells[usize::from(key)]
+        });
+        let mut data = Vec::new();
+        if keys == NativeDefaultExceptionKeys::Classes {
+            data.extend_from_slice(&class_map);
+        }
+        append_native_default_exception_record(
+            &mut data,
+            default,
+            &exceptions,
+            capacity,
+            exception_capacity,
+            cells,
+            row_bytes,
+            |cell| {
+                pack_native_partial_forward_cell(
+                    cell.next(),
+                    cell.accepted(),
+                    forward_offset,
+                    row_bytes,
+                    1,
+                    false,
+                    None,
+                    partial,
+                    cells,
+                )
+            },
+        )?;
+        if data.len() != reverse_offset {
+            return Err(ObjectError::InvalidModule(
+                "linked sparse fixture emitted an unexpected machine extent",
+            ));
+        }
+
+        let needs_asimd_lane_index = target.architecture == Architecture::Aarch64
+            && transitions.uses_vector_sparse_lookup()
+            && target.features.has(CpuFeature::Aarch64Asimd);
+        let asimd_lane_index_offset = if needs_asimd_lane_index {
+            let aligned = data
+                .len()
+                .checked_add(AARCH64_FIRST_LANE_INDEX.len() - 1)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "linked sparse ASIMD lane alignment",
+                ))?
+                & !(AARCH64_FIRST_LANE_INDEX.len() - 1);
+            data.resize(aligned, 0);
+            data.extend_from_slice(&AARCH64_FIRST_LANE_INDEX);
+            Some(u32::try_from(aligned).map_err(|_| {
+                ObjectError::ArithmeticOverflow("linked sparse ASIMD lane offset")
+            })?)
+        } else {
+            None
+        };
+        let layout = NativeDfaLayout {
+            transitions,
+            cells,
+            forward_offset: u32::try_from(forward_offset).map_err(|_| {
+                ObjectError::ArithmeticOverflow("linked sparse forward offset")
+            })?,
+            reverse_offset: u32::try_from(reverse_offset).map_err(|_| {
+                ObjectError::ArithmeticOverflow("linked sparse reverse offset")
+            })?,
+            asimd_lane_index_offset,
+            initial_pending: false,
+            initial_terminal: false,
+            has_reverse: false,
+            partial: Some(partial),
+            exact_span_width: (output == OutputContract::Span).then_some(1),
+            exact_prefix_match_width: None,
+            output,
+            start_filter: None,
+            exact_start_byte_set: None,
+            exact_start_storage: None,
+            suffix_filter: None,
+            declined_redundant_root_reverse: false,
+            seeded_reverse: None,
+            loop_skip: None,
+            vector_filter: None,
+            prefix_filter: None,
+            prefix_relation: None,
+            prefix_block: None,
+            prefix_fast_forward: None,
+        };
+        let emission = match target.architecture {
+            Architecture::X86_64 => lower_x86_64_dfa_with_entry_contract(
+                layout,
+                target.features,
+                NativeDfaEntryContract::PreparedPartialCore,
+            )?,
+            Architecture::Aarch64 => lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
+                layout,
+                target.features,
+                target.operating_system,
+                None,
+                None,
+                NativeDfaEntryContract::PreparedPartialCore,
+            )?,
+        };
+        Ok((
+            NativeLowering {
+                code: emission.code,
+                data,
+                relocations: emission.relocations,
+                slow_partial_table: None,
+                needs_runtime: false,
+                start_accelerator: StartAccelerator::Scalar,
+                anchored_prefix_filter_bytes: 0,
+            },
+            LinkedSparseNativeFixture {
+                byte_cells,
+                partial,
+            },
+        ))
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the two-byte exhaustive oracle advances a cursor within a validated window"
+    )]
+    fn linked_sparse_expected(
+        fixture: LinkedSparseNativeFixture,
+        output: OutputContract,
+        haystack: [u8; 2],
+        start: usize,
+        end: usize,
+    ) -> LinkedSparseExpected {
+        let mut pending = None;
+        for position in start..end {
+            let cell = fixture.byte_cells[usize::from(haystack[position])];
+            let next_position = position + 1;
+            if cell.accepted() {
+                if output == OutputContract::Exists {
+                    return LinkedSparseExpected {
+                        status: 1,
+                        first: None,
+                        second: None,
+                        position: None,
+                    };
+                }
+                pending = Some(next_position);
+            }
+            match cell.next() {
+                NO_DFA_STATE => break,
+                0 => {}
+                next => {
+                    if next_position == end {
+                        break;
+                    }
+                    let resume = usize::try_from(next - 1).unwrap();
+                    return LinkedSparseExpected {
+                        status: NATIVE_PARTIAL_STATUS_RESUME,
+                        first: Some(if fixture.partial.collapse_holes {
+                            0
+                        } else {
+                            resume
+                        }),
+                        second: pending,
+                        position: Some(next_position),
+                    };
+                }
+            }
+        }
+        let Some(selected_end) = pending else {
+            return LinkedSparseExpected {
+                status: 0,
+                first: None,
+                second: None,
+                position: None,
+            };
+        };
+        match output {
+            OutputContract::Exists => unreachable!("Exists returns at its accepting edge"),
+            OutputContract::SelectedEnd => LinkedSparseExpected {
+                status: 1,
+                first: None,
+                second: Some(selected_end),
+                position: None,
+            },
+            OutputContract::Span => LinkedSparseExpected {
+                status: 1,
+                first: Some(selected_end - 1),
+                second: Some(selected_end),
+                position: None,
+            },
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn linked_sparse_host_target() -> Target {
+        let base = if cfg!(target_os = "linux") {
+            Target::x86_64_linux()
+        } else {
+            Target::x86_64_macos()
+        };
+        let features = match std::env::var("FRE_AOT_SPARSE_LINK_TIER").as_deref() {
+            Ok("avx2") => {
+                assert!(std::arch::is_x86_feature_detected!("avx2"));
+                FeatureSet::of(CpuFeature::X86Avx2)
+            }
+            Ok("avx512") => {
+                assert!(std::arch::is_x86_feature_detected!("avx512f"));
+                assert!(std::arch::is_x86_feature_detected!("avx512bw"));
+                FeatureSet::of(CpuFeature::X86Avx512F)
+                    .with(CpuFeature::X86Avx512Bw)
+            }
+            Ok("sse2") | Err(_) => FeatureSet::EMPTY,
+            Ok(tier) => panic!("unsupported x86 sparse linked tier {tier:?}"),
+        };
+        base.with_features(features).unwrap()
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn linked_sparse_host_target() -> Target {
+        let base = if cfg!(target_os = "linux") {
+            Target::aarch64_linux()
+        } else {
+            Target::aarch64_macos()
+        };
+        let asimd = FeatureSet::of(CpuFeature::Aarch64Asimd);
+        let features = match std::env::var("FRE_AOT_SPARSE_LINK_TIER").as_deref() {
+            Ok("scalar") => FeatureSet::EMPTY,
+            Ok("sve") => {
+                assert!(cfg!(target_os = "linux"));
+                assert!(std::arch::is_aarch64_feature_detected!("sve"));
+                FeatureSet::of(CpuFeature::Aarch64Sve)
+            }
+            Ok("sve2") => {
+                assert!(cfg!(target_os = "linux"));
+                assert!(std::arch::is_aarch64_feature_detected!("sve"));
+                assert!(std::arch::is_aarch64_feature_detected!("sve2"));
+                FeatureSet::of(CpuFeature::Aarch64Sve)
+                    .with(CpuFeature::Aarch64Sve2)
+            }
+            Ok("asimd-sve2") => {
+                assert!(cfg!(target_os = "linux"));
+                assert!(std::arch::is_aarch64_feature_detected!("sve"));
+                assert!(std::arch::is_aarch64_feature_detected!("sve2"));
+                asimd
+                    .with(CpuFeature::Aarch64Sve)
+                    .with(CpuFeature::Aarch64Sve2)
+            }
+            Ok("asimd") | Err(_) => asimd,
+            Ok(tier) => panic!("unsupported AArch64 sparse linked tier {tier:?}"),
+        };
+        base.with_features(features).unwrap()
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn append_linked_sparse_wrapper_assembly(
+        source: &mut String,
+        index: usize,
+        symbol: &str,
+    ) {
+        use std::fmt::Write as _;
+
+        let prefix = if cfg!(target_os = "macos") { "_" } else { "" };
+        let wrapper = format!("{prefix}fre_sparse_wrap_{index}");
+        let core = format!("{prefix}{symbol}");
+        writeln!(source, ".p2align 4\n.globl {wrapper}").unwrap();
+        if cfg!(target_os = "linux") {
+            writeln!(source, ".type {wrapper},@function").unwrap();
+        }
+        writeln!(source, "{wrapper}:").unwrap();
+        source.push_str(
+            "pushq %rbx\npushq %rbp\npushq %r12\npushq %r13\npushq %r14\npushq %r15\npushq %r9\n\
+             movq $0x919,%rbx\nmovq $0x920,%rbp\nmovq $0x912,%r12\nmovq $0x913,%r13\n\
+             movq $0x914,%r14\nmovq $0x915,%r15\n",
+        );
+        writeln!(source, "call {core}").unwrap();
+        writeln!(
+            source,
+            "popq %r9\nmovq %r10,0(%r9)\nmovq %r11,8(%r9)\nmovq %rdx,16(%r9)\n\
+             movq $0,24(%r9)\ncmpq $0x919,%rbx\njne .Lfre_sparse_bad_{index}\n\
+             cmpq $0x920,%rbp\njne .Lfre_sparse_bad_{index}\ncmpq $0x912,%r12\n\
+             jne .Lfre_sparse_bad_{index}\ncmpq $0x913,%r13\njne .Lfre_sparse_bad_{index}\n\
+             cmpq $0x914,%r14\njne .Lfre_sparse_bad_{index}\ncmpq $0x915,%r15\n\
+             jne .Lfre_sparse_bad_{index}\njmp .Lfre_sparse_restore_{index}\n\
+             .Lfre_sparse_bad_{index}:\nmovq $1,24(%r9)\n.Lfre_sparse_restore_{index}:\n\
+             popq %r15\npopq %r14\npopq %r13\npopq %r12\npopq %rbp\npopq %rbx\nret"
+        )
+        .unwrap();
+        if cfg!(target_os = "linux") {
+            writeln!(source, ".size {wrapper},.-{wrapper}").unwrap();
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn append_linked_sparse_wrapper_assembly(
+        source: &mut String,
+        index: usize,
+        symbol: &str,
+    ) {
+        use std::fmt::Write as _;
+
+        let prefix = if cfg!(target_os = "macos") { "_" } else { "" };
+        let wrapper = format!("{prefix}fre_sparse_wrap_{index}");
+        let core = format!("{prefix}{symbol}");
+        writeln!(source, ".p2align 4\n.globl {wrapper}").unwrap();
+        if cfg!(target_os = "linux") {
+            writeln!(source, ".type {wrapper},%function").unwrap();
+        }
+        writeln!(source, "{wrapper}:").unwrap();
+        source.push_str(
+            "sub sp,sp,#240\nstp x19,x20,[sp,#0]\nstp x21,x22,[sp,#16]\n\
+             stp x23,x24,[sp,#32]\nstp x25,x26,[sp,#48]\nstp x27,x28,[sp,#64]\n\
+             stp x29,x30,[sp,#80]\nstp q8,q9,[sp,#96]\nstp q10,q11,[sp,#128]\n\
+             stp q12,q13,[sp,#160]\nstp q14,q15,[sp,#192]\nstr x5,[sp,#224]\n\
+             mov x19,#0x919\nmov x20,#0x920\nmov x21,#0x921\nmov x22,#0x922\n\
+             mov x23,#0x923\nmov x24,#0x924\nmov x25,#0x925\nmov x26,#0x926\n\
+             mov x27,#0x927\nmov x28,#0x928\nmov x29,#0x929\n\
+             mov x10,#0x808\nfmov d8,x10\nmov x10,#0x809\nfmov d9,x10\n\
+             mov x10,#0x80a\nfmov d10,x10\nmov x10,#0x80b\nfmov d11,x10\n\
+             mov x10,#0x80c\nfmov d12,x10\nmov x10,#0x80d\nfmov d13,x10\n\
+             mov x10,#0x80e\nfmov d14,x10\nmov x10,#0x80f\nfmov d15,x10\n",
+        );
+        writeln!(source, "bl {core}").unwrap();
+        writeln!(
+            source,
+            "ldr x9,[sp,#224]\nstp x6,x7,[x9,#0]\nstr x2,[x9,#16]\nstr xzr,[x9,#24]\n\
+             cmp x19,#0x919\nb.ne .Lfre_sparse_bad_{index}\ncmp x20,#0x920\nb.ne .Lfre_sparse_bad_{index}\n\
+             cmp x21,#0x921\nb.ne .Lfre_sparse_bad_{index}\ncmp x22,#0x922\nb.ne .Lfre_sparse_bad_{index}\n\
+             cmp x23,#0x923\nb.ne .Lfre_sparse_bad_{index}\ncmp x24,#0x924\nb.ne .Lfre_sparse_bad_{index}\n\
+             cmp x25,#0x925\nb.ne .Lfre_sparse_bad_{index}\ncmp x26,#0x926\nb.ne .Lfre_sparse_bad_{index}\n\
+             cmp x27,#0x927\nb.ne .Lfre_sparse_bad_{index}\ncmp x28,#0x928\nb.ne .Lfre_sparse_bad_{index}\n\
+             cmp x29,#0x929\nb.ne .Lfre_sparse_bad_{index}\n\
+             fmov x11,d8\ncmp x11,#0x808\nb.ne .Lfre_sparse_bad_{index}\n\
+             fmov x11,d9\ncmp x11,#0x809\nb.ne .Lfre_sparse_bad_{index}\n\
+             fmov x11,d10\ncmp x11,#0x80a\nb.ne .Lfre_sparse_bad_{index}\n\
+             fmov x11,d11\ncmp x11,#0x80b\nb.ne .Lfre_sparse_bad_{index}\n\
+             fmov x11,d12\ncmp x11,#0x80c\nb.ne .Lfre_sparse_bad_{index}\n\
+             fmov x11,d13\ncmp x11,#0x80d\nb.ne .Lfre_sparse_bad_{index}\n\
+             fmov x11,d14\ncmp x11,#0x80e\nb.ne .Lfre_sparse_bad_{index}\n\
+             fmov x11,d15\ncmp x11,#0x80f\nb.ne .Lfre_sparse_bad_{index}\n\
+             b .Lfre_sparse_restore_{index}\n.Lfre_sparse_bad_{index}:\nmov x10,#1\nstr x10,[x9,#24]\n\
+             .Lfre_sparse_restore_{index}:\nldp q14,q15,[sp,#192]\nldp q12,q13,[sp,#160]\n\
+             ldp q10,q11,[sp,#128]\nldp q8,q9,[sp,#96]\nldp x29,x30,[sp,#80]\n\
+             ldp x27,x28,[sp,#64]\nldp x25,x26,[sp,#48]\nldp x23,x24,[sp,#32]\n\
+             ldp x21,x22,[sp,#16]\nldp x19,x20,[sp,#0]\nadd sp,sp,#240\nret"
+        )
+        .unwrap();
+        if cfg!(target_os = "linux") {
+            writeln!(source, ".size {wrapper},.-{wrapper}").unwrap();
+        }
+    }
+
     fn build_forced_exact_row_intern_table(
         view: NativeProgramView<'_>,
         architecture: Architecture,
@@ -63558,6 +63995,292 @@ int main(void){{
                 }
             }
         }
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    #[ignore = "links and executes the exhaustive scalable sparse private-core matrix natively"]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::too_many_lines,
+        reason = "one opt-in linked differential owns every capacity, cell width, key mode, hole mode, output contract, byte, and two-byte window"
+    )]
+    fn linked_host_scalable_sparse_private_core_is_exact() {
+        use std::{fmt::Write as _, fs, process::Command};
+
+        const SCRATCH_ZERO: usize = 0x1122_3344_5566_7788;
+        const SCRATCH_ONE: usize = 0x8877_6655_4433_2211;
+        const PAYLOAD_SENTINEL: usize = 0xa5a5_5a5a_55aa_aa55;
+
+        struct LinkedCase {
+            fixture: LinkedSparseNativeFixture,
+            output: OutputContract,
+            label: String,
+        }
+
+        let target = linked_sparse_host_target();
+        let directory = std::env::temp_dir().join(format!(
+            "fre-aot-linked-scalable-sparse-{}-{}",
+            std::process::id(),
+            if cfg!(target_arch = "x86_64") {
+                "x86"
+            } else {
+                "arm"
+            }
+        ));
+        if directory.exists() {
+            fs::remove_dir_all(&directory).unwrap();
+        }
+        fs::create_dir_all(&directory).unwrap();
+        let mut assembly = String::from(".text\n");
+        let mut source = String::from(
+            "#include <stdint.h>\n#include <stddef.h>\n#include <stdio.h>\n\
+             typedef struct { size_t first; size_t second; size_t position; size_t abi_bad; } payload_t;\n",
+        );
+        writeln!(
+            source,
+            "#define SCRATCH_ZERO ((size_t)UINT64_C({SCRATCH_ZERO}))\n\
+             #define SCRATCH_ONE ((size_t)UINT64_C({SCRATCH_ONE}))\n\
+             #define PAYLOAD_SENTINEL ((size_t)UINT64_C({PAYLOAD_SENTINEL}))"
+        )
+        .unwrap();
+        let mut objects = Vec::new();
+        let mut cases = Vec::new();
+
+        for capacity in [5_u8, 16, 17, 20, 21, 31, 32, 64, u8::MAX] {
+            for (cell_id, cells) in [
+                NativeCellEncoding::Compact16,
+                NativeCellEncoding::Wide32,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                for (key_id, keys) in [
+                    NativeDefaultExceptionKeys::Bytes,
+                    NativeDefaultExceptionKeys::Classes,
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    for collapse_holes in [false, true] {
+                        for (output_id, output) in [
+                            OutputContract::Exists,
+                            OutputContract::SelectedEnd,
+                            OutputContract::Span,
+                        ]
+                        .into_iter()
+                        .enumerate()
+                        {
+                            let (lowering, fixture) = linked_sparse_native_fixture(
+                                target,
+                                capacity,
+                                cells,
+                                keys,
+                                collapse_holes,
+                                output,
+                            )
+                            .unwrap_or_else(|error| {
+                                panic!(
+                                    "linked sparse fixture {capacity}/{cells:?}/{keys:?}/{collapse_holes}/{output:?}: {error}"
+                                )
+                            });
+                            let seed = format!(
+                                "fre-linked-sparse-v1/{capacity}/{cell_id}/{key_id}/{}/{output_id}",
+                                usize::from(collapse_holes),
+                            )
+                            .into_bytes();
+                            let module = CompiledModule::lower_serialized_with_prelowered(
+                                seed,
+                                Some(lowering),
+                                None,
+                                None,
+                                None,
+                                false,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                target,
+                            )
+                            .unwrap_or_else(|error| {
+                                panic!(
+                                    "linked sparse module {capacity}/{cells:?}/{keys:?}/{collapse_holes}/{output:?}: {error}"
+                                )
+                            });
+                            assert!(module.required_runtime_symbol().is_none());
+                            assert!(module.prepared_entry_symbol().is_none());
+                            let index = cases.len();
+                            append_linked_sparse_wrapper_assembly(
+                                &mut assembly,
+                                index,
+                                module.entry_symbol(),
+                            );
+                            let object = directory.join(format!("case-{index}.o"));
+                            fs::write(
+                                &object,
+                                emit_object(
+                                    &module,
+                                    ObjectFormat::for_target(target),
+                                    usize::MAX,
+                                )
+                                .unwrap(),
+                            )
+                            .unwrap();
+                            objects.push(object);
+
+                            writeln!(
+                                source,
+                                "extern uint32_t fre_sparse_wrap_{index}(const unsigned char*,size_t,size_t,size_t,size_t*,payload_t*);"
+                            )
+                            .unwrap();
+                            writeln!(
+                                source,
+                                "static void run_{index}(void){{for(unsigned b=0;b<256;b++){{unsigned char h[2]={{(unsigned char)b,(unsigned char)b}};for(size_t s=0;s<=2;s++){{for(size_t e=s;e<=2;e++){{size_t scratch[2]={{SCRATCH_ZERO,SCRATCH_ONE}};payload_t p={{PAYLOAD_SENTINEL,PAYLOAD_SENTINEL,PAYLOAD_SENTINEL,PAYLOAD_SENTINEL}};uint32_t status=fre_sparse_wrap_{index}(h,2,s,e,scratch,&p);printf(\"{index} %u %zu %zu %u %zu %zu %zu %zu %zu %zu\\n\",b,s,e,status,p.first,p.second,p.position,scratch[0],scratch[1],p.abi_bad);}}}}}}}}"
+                            )
+                            .unwrap();
+                            cases.push(LinkedCase {
+                                fixture,
+                                output,
+                                label: format!(
+                                    "capacity={capacity}/cells={cells:?}/keys={keys:?}/collapse={collapse_holes}/output={output:?}"
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        source.push_str("int main(void){\n");
+        for index in 0..cases.len() {
+            writeln!(source, "run_{index}();").unwrap();
+        }
+        source.push_str("return 0;}\n");
+        if cfg!(target_os = "linux") {
+            assembly.push_str(if cfg!(target_arch = "x86_64") {
+                ".section .note.GNU-stack,\"\",@progbits\n"
+            } else {
+                ".section .note.GNU-stack,\"\",%progbits\n"
+            });
+        }
+
+        let assembly_path = directory.join("wrappers.S");
+        let wrapper_object = directory.join("wrappers.o");
+        let source_path = directory.join("oracle.c");
+        let executable = directory.join("oracle");
+        fs::write(&assembly_path, assembly).unwrap();
+        fs::write(&source_path, source).unwrap();
+        let compiler = if cfg!(target_os = "macos") {
+            "clang"
+        } else {
+            "cc"
+        };
+        let status = Command::new(compiler)
+            .arg("-c")
+            .arg(&assembly_path)
+            .arg("-o")
+            .arg(&wrapper_object)
+            .status()
+            .expect("assemble scalable sparse ABI wrappers");
+        assert!(status.success(), "scalable sparse wrappers failed to assemble");
+        let status = Command::new(compiler)
+            .arg("-O0")
+            .arg(&source_path)
+            .arg(&wrapper_object)
+            .args(&objects)
+            .arg("-o")
+            .arg(&executable)
+            .status()
+            .expect("link scalable sparse native oracle");
+        assert!(status.success(), "scalable sparse oracle failed to link");
+        let output = Command::new(&executable)
+            .output()
+            .expect("execute scalable sparse native oracle");
+        assert!(
+            output.status.success(),
+            "status={:?} stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let mut lines = stdout.lines();
+        for (case_index, case) in cases.iter().enumerate() {
+            for byte in 0..=u8::MAX {
+                let haystack = [byte, byte];
+                for start in 0..=haystack.len() {
+                    for end in start..=haystack.len() {
+                        let line = lines.next().unwrap_or_else(|| {
+                            panic!(
+                                "missing linked result for {}/{byte}/{start}..{end}",
+                                case.label,
+                            )
+                        });
+                        let actual = line
+                            .split_ascii_whitespace()
+                            .map(|part| part.parse::<usize>().unwrap())
+                            .collect::<Vec<_>>();
+                        assert_eq!(actual.len(), 11, "{}/{byte}/{start}..{end}", case.label);
+                        assert_eq!(
+                            &actual[..4],
+                            &[case_index, usize::from(byte), start, end],
+                            "{}",
+                            case.label,
+                        );
+                        let expected = linked_sparse_expected(
+                            case.fixture,
+                            case.output,
+                            haystack,
+                            start,
+                            end,
+                        );
+                        assert_eq!(
+                            actual[4],
+                            usize::try_from(expected.status).unwrap(),
+                            "{}/{byte}/{start}..{end}",
+                            case.label,
+                        );
+                        if let Some(first) = expected.first {
+                            assert_eq!(
+                                actual[5], first,
+                                "{}/{byte}/{start}..{end}/first",
+                                case.label,
+                            );
+                        }
+                        if let Some(second) = expected.second {
+                            assert_eq!(
+                                actual[6], second,
+                                "{}/{byte}/{start}..{end}/second",
+                                case.label,
+                            );
+                        }
+                        if let Some(position) = expected.position {
+                            assert_eq!(
+                                actual[7], position,
+                                "{}/{byte}/{start}..{end}/position",
+                                case.label,
+                            );
+                        }
+                        assert_eq!(
+                            &actual[8..10],
+                            &[SCRATCH_ZERO, SCRATCH_ONE],
+                            "{}/{byte}/{start}..{end}/private scratch",
+                            case.label,
+                        );
+                        assert_eq!(
+                            actual[10], 0,
+                            "{}/{byte}/{start}..{end}/callee-saved ABI",
+                            case.label,
+                        );
+                    }
+                }
+            }
+        }
+        assert!(lines.next().is_none(), "unexpected scalable sparse oracle output");
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
