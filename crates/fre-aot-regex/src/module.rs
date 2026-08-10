@@ -4481,6 +4481,13 @@ enum TransitionLayout {
     /// capacity. It therefore removes the dependent class-map load and the
     /// entire 256-byte prefix without adding comparisons or row bytes.
     DefaultByteExceptions(u8),
+    /// A raw-byte piecewise-constant row. The first cell is the value at byte
+    /// zero; each key is the first byte of a later constant run and owns the
+    /// corresponding value slot. Descending unsigned threshold probes select
+    /// the exact run. This form is admitted only when its global boundary
+    /// count does not exceed the established class-exception capacity, so it
+    /// removes the map without increasing row bytes or comparison depth.
+    DefaultByteBoundaries(u8),
 }
 
 /// Keep the cold resource-rescue lookup small enough to unroll without a
@@ -4499,6 +4506,7 @@ struct NativeDefaultExceptionPlan {
 enum NativeDefaultExceptionKeys {
     Classes,
     Bytes,
+    Boundaries,
 }
 
 impl NativeDefaultExceptionKeys {
@@ -4506,6 +4514,7 @@ impl NativeDefaultExceptionKeys {
         match self {
             Self::Classes => TransitionLayout::DefaultExceptions(exception_capacity),
             Self::Bytes => TransitionLayout::DefaultByteExceptions(exception_capacity),
+            Self::Boundaries => TransitionLayout::DefaultByteBoundaries(exception_capacity),
         }
     }
 }
@@ -4943,6 +4952,37 @@ fn native_default_byte_exception_row(
     Some((default, exceptions, next))
 }
 
+/// Encode the complete raw-byte transition function as constant-run
+/// boundaries. A key is always in `1..=255` and names the value beginning at
+/// that byte; the separately returned first cell covers byte zero. Iterating
+/// all 256 bytes proves exact interval preimages without relying on class
+/// numbering or pattern identity.
+fn native_default_byte_boundary_row(
+    row: &[ForwardCell],
+    byte_classes: &[u8],
+    normalization: NativeDefaultExceptionNormalization,
+) -> Option<(ForwardCell, [Option<(u8, ForwardCell)>; MAX_NATIVE_DEFAULT_EXCEPTIONS], usize)> {
+    if byte_classes.len() != CLASS_MAP_BYTES {
+        return None;
+    }
+    let first_class = usize::from(*byte_classes.first()?);
+    let first = normalization.normalize(*row.get(first_class)?)?;
+    let mut previous = first;
+    let mut boundaries = [None; MAX_NATIVE_DEFAULT_EXCEPTIONS];
+    let mut next = 0_usize;
+    for (byte, &class) in byte_classes.iter().enumerate().skip(1) {
+        let cell = normalization.normalize(*row.get(usize::from(class))?)?;
+        if cell == previous {
+            continue;
+        }
+        let slot = boundaries.get_mut(next)?;
+        *slot = Some((u8::try_from(byte).ok()?, cell));
+        next = next.checked_add(1)?;
+        previous = cell;
+    }
+    Some((first, boundaries, next))
+}
+
 fn derive_native_default_exception_plan(
     dfa: NativeDfaView<'_>,
     partial_discovered_states: Option<usize>,
@@ -4976,6 +5016,7 @@ fn derive_native_default_exception_plan(
     )?;
     let mut exception_capacity = 0_usize;
     let mut byte_exception_capacity = Some(0_usize);
+    let mut byte_boundary_capacity = Some(0_usize);
     for row in dfa.forward_cells.chunks_exact(dfa.class_count) {
         let (_, _, exceptions) = native_default_exception_row(row, normalization)?;
         exception_capacity = exception_capacity.max(exceptions);
@@ -4987,13 +5028,34 @@ fn derive_native_default_exception_plan(
             )
             .map(|(_, _, exceptions)| capacity.max(exceptions));
         }
+        if let Some(capacity) = byte_boundary_capacity {
+            byte_boundary_capacity = native_default_byte_boundary_row(
+                row,
+                dfa.byte_classes,
+                normalization,
+            )
+            .map(|(_, _, boundaries)| capacity.max(boundaries));
+        }
     }
-    let (keys, exception_capacity) = if exception_capacity != 0
-        && byte_exception_capacity == Some(exception_capacity)
-    {
-        (NativeDefaultExceptionKeys::Bytes, exception_capacity)
-    } else {
-        (NativeDefaultExceptionKeys::Classes, exception_capacity)
+    // Capacity is simultaneously the fixed record geometry and the maximum
+    // hot comparison depth. Prefer exact raw-byte equality on a tie; select
+    // run boundaries when they use fewer slots, or when byte expansion does
+    // not fit but boundaries remain no wider than the established class row.
+    let byte_candidate = (exception_capacity != 0
+        && byte_exception_capacity == Some(exception_capacity))
+        .then_some(exception_capacity);
+    let boundary_candidate = byte_boundary_capacity.filter(|&capacity| {
+        capacity != 0 && capacity <= exception_capacity
+    });
+    let (keys, exception_capacity) = match (byte_candidate, boundary_candidate) {
+        (Some(bytes), Some(boundaries)) if boundaries < bytes => {
+            (NativeDefaultExceptionKeys::Boundaries, boundaries)
+        }
+        (Some(bytes), _) => (NativeDefaultExceptionKeys::Bytes, bytes),
+        (None, Some(boundaries)) => {
+            (NativeDefaultExceptionKeys::Boundaries, boundaries)
+        }
+        (None, None) => (NativeDefaultExceptionKeys::Classes, exception_capacity),
     };
     let exception_capacity = u8::try_from(exception_capacity).ok()?;
     let row_bytes = native_default_exception_row_bytes(exception_capacity)?;
@@ -5234,7 +5296,9 @@ impl TransitionLayout {
         match self {
             Self::ClassMapped => class_count,
             Self::DirectByte => DIRECT_BYTE_ROW_CELLS,
-            Self::DefaultExceptions(_) | Self::DefaultByteExceptions(_) => 0,
+            Self::DefaultExceptions(_)
+            | Self::DefaultByteExceptions(_)
+            | Self::DefaultByteBoundaries(_) => 0,
         }
     }
 
@@ -5243,6 +5307,7 @@ impl TransitionLayout {
             Self::ClassMapped | Self::DefaultExceptions(1..) => CLASS_MAP_BYTES,
             Self::DefaultExceptions(0)
             | Self::DefaultByteExceptions(_)
+            | Self::DefaultByteBoundaries(_)
             | Self::DirectByte => 0,
         }
     }
@@ -5256,14 +5321,16 @@ fn native_row_bytes(
     match (transitions, cells) {
         (
             TransitionLayout::DefaultExceptions(capacity)
-            | TransitionLayout::DefaultByteExceptions(capacity),
+            | TransitionLayout::DefaultByteExceptions(capacity)
+            | TransitionLayout::DefaultByteBoundaries(capacity),
             NativeCellEncoding::Wide32,
         ) => {
             native_default_exception_row_bytes(capacity)
         }
         (
             TransitionLayout::DefaultExceptions(_)
-            | TransitionLayout::DefaultByteExceptions(_),
+            | TransitionLayout::DefaultByteExceptions(_)
+            | TransitionLayout::DefaultByteBoundaries(_),
             _,
         ) => None,
         (TransitionLayout::ClassMapped, NativeCellEncoding::Compact8Direct) => None,
@@ -5288,12 +5355,15 @@ fn native_table_prefix_bytes(
     let prefix = transitions.table_prefix_bytes();
     match (transitions, cells) {
         (
-            TransitionLayout::DefaultExceptions(_) | TransitionLayout::DefaultByteExceptions(_),
+            TransitionLayout::DefaultExceptions(_)
+            | TransitionLayout::DefaultByteExceptions(_)
+            | TransitionLayout::DefaultByteBoundaries(_),
             NativeCellEncoding::Wide32,
         ) => Some(prefix),
         (
             TransitionLayout::DefaultExceptions(_)
-            | TransitionLayout::DefaultByteExceptions(_),
+            | TransitionLayout::DefaultByteExceptions(_)
+            | TransitionLayout::DefaultByteBoundaries(_),
             _,
         ) => None,
         (TransitionLayout::ClassMapped, NativeCellEncoding::Compact8Direct) => None,
@@ -7793,8 +7863,10 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
         if encoded_hole_states == 0
             || retained_reverse_states != 0
             || usize::from(plan.exception_capacity) > MAX_NATIVE_DEFAULT_EXCEPTIONS
-            || (plan.keys == NativeDefaultExceptionKeys::Bytes
-                && plan.exception_capacity == 0)
+            || (matches!(
+                plan.keys,
+                NativeDefaultExceptionKeys::Bytes | NativeDefaultExceptionKeys::Boundaries
+            ) && plan.exception_capacity == 0)
             || native_default_exception_row_bytes(plan.exception_capacity)
                 != Some(plan.row_bytes)
         {
@@ -8461,7 +8533,8 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
             }
         }
         TransitionLayout::DefaultExceptions(exception_capacity)
-        | TransitionLayout::DefaultByteExceptions(exception_capacity) => {
+        | TransitionLayout::DefaultByteExceptions(exception_capacity)
+        | TransitionLayout::DefaultByteBoundaries(exception_capacity) => {
             let normalization = NativeDefaultExceptionNormalization::new(
                 forward_states,
                 view.partial_discovered_states.ok_or(ObjectError::InvalidModule(
@@ -8489,6 +8562,13 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
                             normalization,
                         )
                     }
+                    TransitionLayout::DefaultByteBoundaries(_) => {
+                        native_default_byte_boundary_row(
+                            row,
+                            dfa.byte_classes,
+                            normalization,
+                        )
+                    }
                     _ => None,
                 };
                 let (default, exceptions, exception_count) = sparse_row.ok_or(
@@ -8501,6 +8581,27 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
                         "default-exception row exceeds its table capacity",
                     ));
                 }
+                // Boundary zero is not a real change point. Leading zero/base
+                // pairs therefore pad a short boundary row exactly: descending
+                // probes reach them only after every real threshold misses.
+                let leading_padding = if matches!(
+                    transitions,
+                    TransitionLayout::DefaultByteBoundaries(_)
+                ) {
+                    usize::from(exception_capacity)
+                        .checked_sub(exception_count)
+                        .ok_or(ObjectError::InvalidModule(
+                            "default-exception boundary padding",
+                        ))?
+                } else {
+                    0
+                };
+                let exception_at = |slot: usize| {
+                    slot.checked_sub(leading_padding)
+                        .and_then(|index| exceptions.get(index))
+                        .copied()
+                        .flatten()
+                };
                 let pack = |cell: ForwardCell| {
                     pack_native_partial_forward_cell(
                         cell.next(),
@@ -8518,13 +8619,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
                 };
                 bytes.extend_from_slice(&pack(default)?.to_le_bytes());
                 for slot in 0..usize::from(exception_capacity) {
-                    bytes.push(
-                        exceptions
-                            .get(slot)
-                            .copied()
-                            .flatten()
-                            .map_or(0, |(key, _)| key),
-                    );
+                    bytes.push(exception_at(slot).map_or(0, |(key, _)| key));
                 }
                 bytes.resize(
                     row_start
@@ -8535,11 +8630,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
                     0,
                 );
                 for slot in 0..usize::from(exception_capacity) {
-                    let cell = exceptions
-                        .get(slot)
-                        .copied()
-                        .flatten()
-                        .map_or(default, |(_, cell)| cell);
+                    let cell = exception_at(slot).map_or(default, |(_, cell)| cell);
                     bytes.extend_from_slice(&pack(cell)?.to_le_bytes());
                 }
                 let row_end = row_start.checked_add(row_bytes).ok_or(
@@ -8610,7 +8701,8 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
                 }
             }
             TransitionLayout::DefaultExceptions(_)
-            | TransitionLayout::DefaultByteExceptions(_) => {
+            | TransitionLayout::DefaultByteExceptions(_)
+            | TransitionLayout::DefaultByteBoundaries(_) => {
                 return Err(ObjectError::InvalidModule(
                     "default-exception rows retained a reverse machine",
                 ));
@@ -11591,6 +11683,7 @@ fn x86_emit_default_exception_lookup(
     assembler: &mut X86Assembler,
     exception_capacity: u8,
     cells: NativeCellEncoding,
+    keys: NativeDefaultExceptionKeys,
 ) -> Result<(), ObjectError> {
     if cells != NativeCellEncoding::Wide32
         || exception_capacity == 0
@@ -11607,9 +11700,19 @@ fn x86_emit_default_exception_lookup(
     exception_labels
         .try_reserve_exact(usize::from(exception_capacity))
         .map_err(|_| ObjectError::Allocation("x86 default-exception labels"))?;
-    for slot in 0..usize::from(exception_capacity) {
+    for ordinal in 0..usize::from(exception_capacity) {
+        let slot = if keys == NativeDefaultExceptionKeys::Boundaries {
+            usize::from(exception_capacity)
+                .checked_sub(ordinal)
+                .and_then(|slot| slot.checked_sub(1))
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "x86 default-exception boundary slot",
+                ))?
+        } else {
+            ordinal
+        };
         let label = assembler.label()?;
-        exception_labels.push(label);
+        exception_labels.push((slot, label));
         let key_offset = core::mem::size_of::<u32>()
             .checked_add(slot)
             .and_then(|offset| u8::try_from(offset).ok())
@@ -11617,12 +11720,17 @@ fn x86_emit_default_exception_lookup(
                 "x86 default-exception key offset",
             ))?;
         assembler.instruction(&[0x41, 0x3a, 0x42, key_offset])?; // cmp al,[r10+key]
-        assembler.branch(&[0x0f, 0x84], label)?;
+        let branch = if keys == NativeDefaultExceptionKeys::Boundaries {
+            &[0x0f, 0x83][..] // jae: byte is in this constant run or a later one
+        } else {
+            &[0x0f, 0x84][..] // je: exact class/raw-byte exception
+        };
+        assembler.branch(branch, label)?;
     }
     let done = assembler.label()?;
     assembler.instruction(&[0x41, 0x8b, 0x02])?; // eax = default cell
     assembler.branch(&[0xe9], done)?;
-    for (slot, label) in exception_labels.into_iter().enumerate() {
+    for (slot, label) in exception_labels {
         assembler.bind(label)?;
         let cell_offset = value_offset
             .checked_add(slot.checked_mul(core::mem::size_of::<u32>()).ok_or(
@@ -11665,11 +11773,30 @@ fn x86_emit_table_lookup(
         TransitionLayout::DirectByte => {}
         TransitionLayout::DefaultExceptions(exception_capacity) => {
             assembler.instruction(&[0x41, 0x0f, 0xb6, 0x04, 0x01])?; // eax = class_map[eax]
-            x86_emit_default_exception_lookup(assembler, exception_capacity, cells)?;
+            x86_emit_default_exception_lookup(
+                assembler,
+                exception_capacity,
+                cells,
+                NativeDefaultExceptionKeys::Classes,
+            )?;
             return Ok(());
         }
         TransitionLayout::DefaultByteExceptions(exception_capacity) => {
-            x86_emit_default_exception_lookup(assembler, exception_capacity, cells)?;
+            x86_emit_default_exception_lookup(
+                assembler,
+                exception_capacity,
+                cells,
+                NativeDefaultExceptionKeys::Bytes,
+            )?;
+            return Ok(());
+        }
+        TransitionLayout::DefaultByteBoundaries(exception_capacity) => {
+            x86_emit_default_exception_lookup(
+                assembler,
+                exception_capacity,
+                cells,
+                NativeDefaultExceptionKeys::Boundaries,
+            )?;
             return Ok(());
         }
     }
@@ -23939,6 +24066,7 @@ fn aarch64_emit_default_exception_lookup(
     assembler: &mut Aarch64Assembler,
     exception_capacity: u8,
     cells: NativeCellEncoding,
+    keys: NativeDefaultExceptionKeys,
 ) -> Result<(), ObjectError> {
     if cells != NativeCellEncoding::Wide32
         || exception_capacity == 0
@@ -23955,9 +24083,19 @@ fn aarch64_emit_default_exception_lookup(
     exception_labels
         .try_reserve_exact(usize::from(exception_capacity))
         .map_err(|_| ObjectError::Allocation("AArch64 default-exception labels"))?;
-    for slot in 0..usize::from(exception_capacity) {
+    for ordinal in 0..usize::from(exception_capacity) {
+        let slot = if keys == NativeDefaultExceptionKeys::Boundaries {
+            usize::from(exception_capacity)
+                .checked_sub(ordinal)
+                .and_then(|slot| slot.checked_sub(1))
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "AArch64 default-exception boundary slot",
+                ))?
+        } else {
+            ordinal
+        };
         let label = assembler.label()?;
-        exception_labels.push(label);
+        exception_labels.push((slot, label));
         let key_offset = core::mem::size_of::<u32>()
             .checked_add(slot)
             .and_then(|offset| u16::try_from(offset).ok())
@@ -23966,12 +24104,17 @@ fn aarch64_emit_default_exception_lookup(
             ))?;
         assembler.instruction(aarch64_load_byte_imm(12, 11, key_offset)?)?;
         assembler.instruction(aarch64_cmp_w(8, 12)?)?;
-        assembler.branch_cond(AARCH64_EQ, label)?;
+        let condition = if keys == NativeDefaultExceptionKeys::Boundaries {
+            AARCH64_HS
+        } else {
+            AARCH64_EQ
+        };
+        assembler.branch_cond(condition, label)?;
     }
     let done = assembler.label()?;
     assembler.instruction(aarch64_load_w_imm(8, 11, 0)?)?;
     assembler.branch(done)?;
-    for (slot, label) in exception_labels.into_iter().enumerate() {
+    for (slot, label) in exception_labels {
         assembler.bind(label)?;
         let cell_offset = value_offset
             .checked_add(slot.checked_mul(core::mem::size_of::<u32>()).ok_or(
@@ -24013,11 +24156,30 @@ fn aarch64_emit_table_lookup(
         TransitionLayout::DirectByte => {}
         TransitionLayout::DefaultExceptions(exception_capacity) => {
             assembler.instruction(aarch64_load_byte_reg(8, 5, 8)?)?;
-            aarch64_emit_default_exception_lookup(assembler, exception_capacity, cells)?;
+            aarch64_emit_default_exception_lookup(
+                assembler,
+                exception_capacity,
+                cells,
+                NativeDefaultExceptionKeys::Classes,
+            )?;
             return Ok(());
         }
         TransitionLayout::DefaultByteExceptions(exception_capacity) => {
-            aarch64_emit_default_exception_lookup(assembler, exception_capacity, cells)?;
+            aarch64_emit_default_exception_lookup(
+                assembler,
+                exception_capacity,
+                cells,
+                NativeDefaultExceptionKeys::Bytes,
+            )?;
+            return Ok(());
+        }
+        TransitionLayout::DefaultByteBoundaries(exception_capacity) => {
+            aarch64_emit_default_exception_lookup(
+                assembler,
+                exception_capacity,
+                cells,
+                NativeDefaultExceptionKeys::Boundaries,
+            )?;
             return Ok(());
         }
     }
@@ -34732,6 +34894,86 @@ mod tests {
                 },
                 partial_discovered_states: Some(Self::DISCOVERED_STATES),
                 collapse_partial_holes: false,
+                exact_match_width: None,
+                max_match_width: None,
+                exact_product_width: None,
+                retained_prefix_requirement: None,
+                retained_suffix_requirement: None,
+                ..base
+            }
+        }
+    }
+
+    /// Four exceptional graph classes occupy three exact constant raw-byte
+    /// runs. The initial row is uniform, so a fixed three-boundary record also
+    /// exercises leading zero/base padding. Later rows distinguish dead,
+    /// unaccepted-hole, and accepted-hole values under both collapsed and
+    /// uncollapsed packing.
+    struct BoundaryDefaultExceptionFixture {
+        byte_classes: [u8; 256],
+        class_representatives: Vec<u8>,
+        forward_cells: Vec<ForwardCell>,
+    }
+
+    impl BoundaryDefaultExceptionFixture {
+        const CLASS_COUNT: usize = 16;
+        const COMPLETE_ROWS: usize = 100;
+        const DISCOVERED_STATES: usize = Self::COMPLETE_ROWS + 2;
+
+        fn new() -> Self {
+            let byte_classes = core::array::from_fn(|byte| {
+                u8::try_from(byte / 16).unwrap()
+            });
+            let class_representatives = (0..Self::CLASS_COUNT)
+                .map(|class| u8::try_from(class * 16).unwrap())
+                .collect::<Vec<_>>();
+            let complete_rows = u32::try_from(Self::COMPLETE_ROWS).unwrap();
+            let mut forward_cells = Vec::with_capacity(
+                Self::COMPLETE_ROWS * Self::CLASS_COUNT,
+            );
+            for state in 0..Self::COMPLETE_ROWS {
+                let state = u32::try_from(state).unwrap();
+                for class in 0..Self::CLASS_COUNT {
+                    let cell = if state == 0 {
+                        ForwardCell::new(1, false)
+                    } else {
+                        match class {
+                            0..=11 => ForwardCell::new(state, false),
+                            12 | 13 => ForwardCell::new(NO_DFA_STATE, false),
+                            14 => ForwardCell::new(complete_rows, false),
+                            15 => ForwardCell::new(complete_rows + 1, true),
+                            _ => unreachable!("bounded boundary fixture class"),
+                        }
+                    };
+                    forward_cells.push(cell);
+                }
+            }
+            Self {
+                byte_classes,
+                class_representatives,
+                forward_cells,
+            }
+        }
+
+        fn view<'a>(
+            &'a self,
+            base: NativeProgramView<'a>,
+            collapse_partial_holes: bool,
+        ) -> NativeProgramView<'a> {
+            NativeProgramView {
+                dfa: NativeDfaView {
+                    initial_state: 0,
+                    initial_pending: false,
+                    initial_terminal: false,
+                    byte_classes: &self.byte_classes,
+                    class_count: Self::CLASS_COUNT,
+                    class_representatives: &self.class_representatives,
+                    forward_cells: &self.forward_cells,
+                    reverse_initial: None,
+                    reverse_cells: &[],
+                },
+                partial_discovered_states: Some(Self::DISCOVERED_STATES),
+                collapse_partial_holes,
                 exact_match_width: None,
                 max_match_width: None,
                 exact_product_width: None,
@@ -51718,7 +51960,8 @@ int main(void){{
                             usize::from(view.dfa.byte_classes[physical_column])
                         }
                         TransitionLayout::DefaultExceptions(_)
-                        | TransitionLayout::DefaultByteExceptions(_) => {
+                        | TransitionLayout::DefaultByteExceptions(_)
+                        | TransitionLayout::DefaultByteBoundaries(_) => {
                             panic!("unlimited partial table unexpectedly used resource rescue")
                         }
                     };
@@ -52088,7 +52331,7 @@ int main(void){{
                 let class = default_classes + exception;
                 for _ in 0..raw_count {
                     byte_classes[next_byte] = u8::try_from(class).unwrap();
-                    next_byte += 1;
+                    next_byte += 2;
                 }
             }
             let class_representatives = (0..CLASS_COUNT)
@@ -52164,6 +52407,334 @@ int main(void){{
                 NativeDefaultExceptionKeys::Classes,
                 "{architecture:?}",
             );
+        }
+    }
+
+    #[test]
+    fn byte_boundary_rows_exhaust_every_interval_byte_and_capacity_boundary() {
+        let default = ForwardCell::new(0, false);
+        let exceptional = ForwardCell::new(NO_DFA_STATE, true);
+        let row = [default, exceptional];
+        let normalization = NativeDefaultExceptionNormalization::new(1, 1, false).unwrap();
+
+        for lower in u8::MIN..=u8::MAX {
+            for upper in lower..=u8::MAX {
+                let byte_classes: [u8; 256] = core::array::from_fn(|byte| {
+                    u8::from(byte >= usize::from(lower) && byte <= usize::from(upper))
+                });
+                let (first, boundaries, count) = native_default_byte_boundary_row(
+                    &row,
+                    &byte_classes,
+                    normalization,
+                )
+                .unwrap();
+                let expected_count = usize::from(lower != u8::MIN)
+                    + usize::from(upper != u8::MAX);
+                assert_eq!(count, expected_count, "interval={lower}..={upper}");
+                for byte in u8::MIN..=u8::MAX {
+                    let mut actual = first;
+                    for &(boundary, cell) in boundaries[..count]
+                        .iter()
+                        .map(Option::as_ref)
+                        .map(Option::unwrap)
+                    {
+                        if byte >= boundary {
+                            actual = cell;
+                        }
+                    }
+                    let expected = if byte >= lower && byte <= upper {
+                        exceptional
+                    } else {
+                        default
+                    };
+                    assert_eq!(actual, expected, "interval={lower}..={upper}/byte={byte}");
+                }
+            }
+        }
+
+        let boundary_bytes = [1_u8, 2, 254, 255];
+        let distinct = core::array::from_fn::<_, 6, _>(|index| {
+            ForwardCell::new(u32::try_from(index).unwrap(), index % 2 == 0)
+        });
+        let normalization = NativeDefaultExceptionNormalization::new(6, 6, false).unwrap();
+        for count in 1..=MAX_NATIVE_DEFAULT_EXCEPTIONS {
+            let byte_classes: [u8; 256] = core::array::from_fn(|byte| {
+                u8::try_from(
+                    boundary_bytes[..count]
+                        .iter()
+                        .filter(|&&boundary| byte >= usize::from(boundary))
+                        .count(),
+                )
+                .unwrap()
+            });
+            let (first, boundaries, actual_count) = native_default_byte_boundary_row(
+                &distinct,
+                &byte_classes,
+                normalization,
+            )
+            .unwrap();
+            assert_eq!(first, distinct[0]);
+            assert_eq!(actual_count, count);
+            assert_eq!(
+                boundaries[..count]
+                    .iter()
+                    .map(|boundary| boundary.unwrap().0)
+                    .collect::<Vec<_>>(),
+                boundary_bytes[..count],
+            );
+        }
+
+        let five_boundaries = [1_u8, 2, 3, 254, 255];
+        let byte_classes: [u8; 256] = core::array::from_fn(|byte| {
+            u8::try_from(
+                five_boundaries
+                    .iter()
+                    .filter(|&&boundary| byte >= usize::from(boundary))
+                    .count(),
+            )
+            .unwrap()
+        });
+        assert!(native_default_byte_boundary_row(
+            &distinct,
+            &byte_classes,
+            normalization,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn byte_boundary_plan_never_exceeds_class_depth_or_row_geometry() {
+        let compiled = compile_partial_loop(
+            Target::x86_64_linux(),
+            OutputContract::SelectedEnd,
+        );
+        let fixture = BoundaryDefaultExceptionFixture::new();
+        let base = compiled
+            .program()
+            .native_partial_dfa_view()
+            .expect("partial base view")
+            .native;
+        for collapse in [false, true] {
+            let view = fixture.view(base, collapse);
+            for architecture in [Architecture::X86_64, Architecture::Aarch64] {
+                let plan = derive_native_default_exception_plan(
+                    view.dfa,
+                    view.partial_discovered_states,
+                    collapse,
+                    architecture,
+                )
+                .expect("boundary sparse reduction");
+                assert_eq!(plan.keys, NativeDefaultExceptionKeys::Boundaries);
+                assert_eq!(plan.exception_capacity, 3);
+                assert_eq!(plan.row_bytes, 20);
+                assert_eq!(
+                    native_machine_bytes(
+                        plan.keys.transitions(plan.exception_capacity),
+                        NativeCellEncoding::Wide32,
+                        view.dfa.class_count,
+                        BoundaryDefaultExceptionFixture::COMPLETE_ROWS,
+                        0,
+                    ),
+                    Some(2_000),
+                );
+                assert_eq!(
+                    native_machine_bytes(
+                        TransitionLayout::DefaultExceptions(4),
+                        NativeCellEncoding::Wide32,
+                        view.dfa.class_count,
+                        BoundaryDefaultExceptionFixture::COMPLETE_ROWS,
+                        0,
+                    ),
+                    Some(2_656),
+                );
+            }
+
+            let normalization = NativeDefaultExceptionNormalization::new(
+                BoundaryDefaultExceptionFixture::COMPLETE_ROWS,
+                BoundaryDefaultExceptionFixture::DISCOVERED_STATES,
+                collapse,
+            )
+            .unwrap();
+            let rows = fixture
+                .forward_cells
+                .chunks_exact(BoundaryDefaultExceptionFixture::CLASS_COUNT)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                native_default_byte_boundary_row(
+                    rows[0],
+                    &fixture.byte_classes,
+                    normalization,
+                )
+                .unwrap()
+                .2,
+                0,
+            );
+            let (_, boundaries, count) = native_default_byte_boundary_row(
+                rows[1],
+                &fixture.byte_classes,
+                normalization,
+            )
+            .unwrap();
+            assert_eq!(count, 3);
+            assert_eq!(
+                boundaries[..count]
+                    .iter()
+                    .map(|boundary| boundary.unwrap().0)
+                    .collect::<Vec<_>>(),
+                [192, 224, 240],
+            );
+            assert!(native_default_byte_exception_row(
+                rows[1],
+                &fixture.byte_classes,
+                normalization,
+            )
+            .is_none());
+        }
+
+        const CLASS_COUNT: usize = 16;
+        const COMPLETE_ROWS: usize = 100;
+        let derive = |returns_to_default: bool, architecture: Architecture| {
+            let mut byte_classes = [0_u8; 256];
+            for class in 1..14 {
+                byte_classes[class] = u8::try_from(class).unwrap();
+            }
+            for class in &mut byte_classes[100..=110] {
+                *class = 14;
+            }
+            let end = if returns_to_default { 120 } else { 255 };
+            for class in &mut byte_classes[111..=end] {
+                *class = 15;
+            }
+            let class_representatives = (0..CLASS_COUNT)
+                .map(|class| {
+                    u8::try_from(
+                        byte_classes
+                            .iter()
+                            .position(|&actual| usize::from(actual) == class)
+                            .unwrap(),
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let mut forward_cells = Vec::with_capacity(COMPLETE_ROWS * CLASS_COUNT);
+            for state in 0..COMPLETE_ROWS {
+                for class in 0..CLASS_COUNT {
+                    forward_cells.push(match class {
+                        0..=13 => ForwardCell::new(u32::try_from(state).unwrap(), false),
+                        14 => ForwardCell::new(NO_DFA_STATE, false),
+                        15 => ForwardCell::new(u32::try_from(COMPLETE_ROWS).unwrap(), true),
+                        _ => unreachable!("bounded class"),
+                    });
+                }
+            }
+            derive_native_default_exception_plan(
+                NativeDfaView {
+                    initial_state: 0,
+                    initial_pending: false,
+                    initial_terminal: false,
+                    byte_classes: &byte_classes,
+                    class_count: CLASS_COUNT,
+                    class_representatives: &class_representatives,
+                    forward_cells: &forward_cells,
+                    reverse_initial: None,
+                    reverse_cells: &[],
+                },
+                Some(COMPLETE_ROWS + 1),
+                false,
+                architecture,
+            )
+            .unwrap()
+        };
+        for architecture in [Architecture::X86_64, Architecture::Aarch64] {
+            let equal = derive(false, architecture);
+            assert_eq!(equal.keys, NativeDefaultExceptionKeys::Boundaries);
+            assert_eq!(equal.exception_capacity, 2);
+            assert_eq!(equal.row_bytes, 16);
+
+            let deeper = derive(true, architecture);
+            assert_eq!(deeper.keys, NativeDefaultExceptionKeys::Classes);
+            assert_eq!(deeper.exception_capacity, 2);
+            assert_eq!(deeper.row_bytes, 16);
+        }
+    }
+
+    #[test]
+    fn byte_boundary_partial_rows_have_an_exact_packed_oracle() {
+        let compiled = compile_partial_loop(
+            Target::x86_64_linux(),
+            OutputContract::SelectedEnd,
+        );
+        let fixture = BoundaryDefaultExceptionFixture::new();
+        let base = compiled
+            .program()
+            .native_partial_dfa_view()
+            .expect("partial base view")
+            .native;
+        for collapse in [false, true] {
+            let view = fixture.view(base, collapse);
+            for architecture in [Architecture::X86_64, Architecture::Aarch64] {
+                let (data, layout) =
+                    build_forced_default_exception_table(view, architecture, usize::MAX).unwrap();
+                let capacity = match layout.transitions {
+                    TransitionLayout::DefaultByteBoundaries(capacity) => capacity,
+                    other => panic!("expected byte-boundary rows, got {other:?}"),
+                };
+                assert_eq!(capacity, 3);
+                assert_eq!(layout.cells, NativeCellEncoding::Wide32);
+                assert_eq!(layout.forward_offset, 0);
+                let row_bytes = native_default_exception_row_bytes(capacity).unwrap();
+                let value_offset = native_default_exception_value_offset(capacity).unwrap();
+                let forward_end = BoundaryDefaultExceptionFixture::COMPLETE_ROWS * row_bytes;
+                assert_eq!(usize::try_from(layout.reverse_offset).unwrap(), forward_end);
+                assert!(data.len() >= forward_end);
+                let partial = layout.partial.expect("boundary partial layout");
+                assert_eq!(partial.collapse_holes, collapse);
+                let mut saw_dead = false;
+                let mut saw_hole = false;
+                let mut saw_accept = false;
+                let mut saw_accelerated = false;
+                for state in 0..BoundaryDefaultExceptionFixture::COMPLETE_ROWS {
+                    let row_start = state * row_bytes;
+                    for byte in u8::MIN..=u8::MAX {
+                        let mut actual = u32::from_le_bytes(
+                            data[row_start..row_start + 4].try_into().unwrap(),
+                        );
+                        for slot in 0..usize::from(capacity) {
+                            if byte >= data[row_start + 4 + slot] {
+                                let offset = row_start + value_offset + slot * 4;
+                                actual = u32::from_le_bytes(
+                                    data[offset..offset + 4].try_into().unwrap(),
+                                );
+                            }
+                        }
+                        let class = usize::from(fixture.byte_classes[usize::from(byte)]);
+                        let semantic = view.dfa.forward_cells
+                            [state * view.dfa.class_count + class];
+                        let expected = pack_native_partial_forward_cell(
+                            semantic.next(),
+                            semantic.accepted(),
+                            0,
+                            row_bytes,
+                            BoundaryDefaultExceptionFixture::COMPLETE_ROWS,
+                            layout.has_start_scanner(),
+                            layout.loop_skip.map(|plan| plan.state),
+                            partial,
+                            layout.cells,
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            actual,
+                            expected,
+                            "{architecture:?}/collapse={collapse}/state={state}/byte={byte}",
+                        );
+                        saw_dead |= actual & layout.cells.next_mask() == 0;
+                        saw_hole |= actual & layout.cells.next_mask() >= partial.hole_token_base;
+                        saw_accept |= actual & layout.cells.accepts() != 0;
+                        saw_accelerated |= actual & layout.cells.accelerated() != 0;
+                    }
+                }
+                assert!(saw_dead && saw_hole && saw_accept && saw_accelerated);
+            }
         }
     }
 
@@ -54114,6 +54685,148 @@ int main(void){{
                     );
                     assert!(words.contains(&aarch64_load_byte_imm(12, 11, 4).unwrap()));
                     assert!(words.contains(&aarch64_load_w_imm(8, 11, 0).unwrap()));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn byte_boundary_retry_lowers_every_target_vector_tier() {
+        let compiled = compile_partial_loop(
+            Target::x86_64_linux(),
+            OutputContract::SelectedEnd,
+        );
+        let fixture = BoundaryDefaultExceptionFixture::new();
+        let view = fixture.view(
+            compiled
+                .program()
+                .native_partial_dfa_view()
+                .expect("partial base view")
+                .native,
+            true,
+        );
+        let avx512 = FeatureSet::of(CpuFeature::X86Avx512F)
+            .with(CpuFeature::X86Avx512Bw);
+        let sve = FeatureSet::of(CpuFeature::Aarch64Sve);
+        let targets = [
+            (Target::x86_64_linux(), StartAccelerator::X86Sse2),
+            (
+                Target::x86_64_linux()
+                    .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+                    .unwrap(),
+                StartAccelerator::X86Avx2,
+            ),
+            (
+                Target::x86_64_linux().with_features(avx512).unwrap(),
+                StartAccelerator::X86Avx512Bw,
+            ),
+            (
+                Target::aarch64_macos()
+                    .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                    .unwrap(),
+                StartAccelerator::Aarch64Asimd,
+            ),
+            (
+                Target::aarch64_linux().with_features(sve).unwrap(),
+                StartAccelerator::Aarch64Sve,
+            ),
+            (
+                Target::aarch64_linux()
+                    .with_features(sve.with(CpuFeature::Aarch64Sve2))
+                    .unwrap(),
+                StartAccelerator::Aarch64Sve2,
+            ),
+        ];
+        for (target, expected_accelerator) in targets {
+            let dense = build_native_dfa_table_with_cost_model_and_data_limit_once(
+                view,
+                target.architecture,
+                NativeVectorFilterCostModel::Established,
+                true,
+                usize::MAX,
+                None,
+            )
+            .unwrap();
+            let sparse = build_forced_default_exception_table(
+                view,
+                target.architecture,
+                usize::MAX,
+            )
+            .unwrap();
+            assert_eq!(
+                sparse.1.transitions,
+                TransitionLayout::DefaultByteBoundaries(3),
+                "{target:?}",
+            );
+            assert_eq!(sparse.1.forward_offset, 0, "{target:?}");
+            assert!(sparse.0.len() < dense.0.len(), "{target:?}");
+            let lowering = lower_native_dfa_with_entry_contract_and_data_limit(
+                view,
+                target,
+                NativeDfaEntryContract::PreparedPartialCore,
+                dense.0.len() - 1,
+            )
+            .unwrap()
+            .unwrap_or_else(|| panic!("byte-boundary target declined: {target:?}"));
+            let forward_end = usize::try_from(sparse.1.reverse_offset).unwrap();
+            assert_eq!(
+                &lowering.data[..forward_end],
+                &sparse.0[..forward_end],
+                "{target:?}",
+            );
+            assert_eq!(
+                lowering.start_accelerator,
+                expected_accelerator,
+                "{target:?}",
+            );
+            match target.architecture {
+                Architecture::X86_64 => {
+                    let class_load = [0x41, 0x0f, 0xb6, 0x04, 0x01];
+                    assert!(
+                        !lowering
+                            .code
+                            .windows(class_load.len())
+                            .any(|bytes| bytes == class_load),
+                        "{target:?} retained the boundary class-map load",
+                    );
+                    let compare = lowering
+                        .code
+                        .windows(4)
+                        .position(|bytes| bytes == [0x41, 0x3a, 0x42, 0x06])
+                        .expect("descending highest-boundary compare");
+                    let branch = compare + 4;
+                    assert!(
+                        lowering.code.get(branch) == Some(&0x73)
+                            || lowering.code.get(branch..branch + 2)
+                                == Some([0x0f, 0x83].as_slice()),
+                        "{target:?} omitted unsigned boundary selection",
+                    );
+                }
+                Architecture::Aarch64 => {
+                    let words = lowering
+                        .code
+                        .chunks_exact(4)
+                        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                        .collect::<Vec<_>>();
+                    assert!(
+                        !words.contains(&aarch64_load_byte_reg(8, 5, 8).unwrap()),
+                        "{target:?} retained the boundary class-map load",
+                    );
+                    let compare = words
+                        .windows(2)
+                        .position(|pair| {
+                            pair
+                                == [
+                                    aarch64_load_byte_imm(12, 11, 6).unwrap(),
+                                    aarch64_cmp_w(8, 12).unwrap(),
+                                ]
+                        })
+                        .expect("descending highest-boundary compare");
+                    assert_eq!(
+                        words[compare + 2] & 0xff00_001f,
+                        0x5400_0000 | u32::from(AARCH64_HS),
+                        "{target:?} omitted unsigned boundary selection",
+                    );
                 }
             }
         }
@@ -71517,7 +72230,8 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                         usize::from(view.dfa.byte_classes[physical_column])
                     }
                     TransitionLayout::DefaultExceptions(_)
-                    | TransitionLayout::DefaultByteExceptions(_) => {
+                    | TransitionLayout::DefaultByteExceptions(_)
+                    | TransitionLayout::DefaultByteBoundaries(_) => {
                         panic!("complete table unexpectedly used partial resource rescue")
                     }
                 };
@@ -71569,7 +72283,8 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                         usize::from(view.dfa.byte_classes[physical_column])
                     }
                     TransitionLayout::DefaultExceptions(_)
-                    | TransitionLayout::DefaultByteExceptions(_) => {
+                    | TransitionLayout::DefaultByteExceptions(_)
+                    | TransitionLayout::DefaultByteBoundaries(_) => {
                         panic!("reverse table unexpectedly used partial resource rescue")
                     }
                 };
@@ -75539,7 +76254,8 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 TransitionLayout::ClassMapped => saw_class_mapped_rows = true,
                 TransitionLayout::DirectByte => saw_direct_rows = true,
                 TransitionLayout::DefaultExceptions(_)
-                | TransitionLayout::DefaultByteExceptions(_) => {
+                | TransitionLayout::DefaultByteExceptions(_)
+                | TransitionLayout::DefaultByteBoundaries(_) => {
                     panic!("unlimited complete table unexpectedly used resource rescue")
                 }
             }
