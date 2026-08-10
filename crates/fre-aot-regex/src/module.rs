@@ -132,6 +132,7 @@ use crate::{
         STATIC_PREFIX_RESUME_DESCRIPTOR_V1_MAGIC,
         STATIC_PREFIX_RESUME_DESCRIPTOR_V1_MAX_BYTES,
         STATIC_PREFIX_RESUME_DESCRIPTOR_V1_STATE_BYTES,
+        STATIC_PREFIX_INVOCATION_EPOCH_OFFSET,
     },
     required_literals::{MaximumConsumedDistance, RequiredInteriorCandidate, RequiredLiteralSet},
     seeded_reverse::{
@@ -927,6 +928,10 @@ const PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL: usize = 11;
 // Dynamic-row and partial-Span entries are mutually exclusive layouts, so
 // their one layout-specific helper occupies the same deterministic slot.
 const DYNAMIC_ROWS_DEOPT_RUNTIME_SYMBOL: usize = 11;
+// Static-prefix and dynamic-row entries are likewise disjoint. Slot 12 names
+// either the generated local-exit retirement boundary or the dynamic-row
+// continuation selected by that exact prepared layout.
+const STATIC_PREFIX_RETIRE_RUNTIME_SYMBOL: usize = 12;
 const DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL: usize = 12;
 const DYNAMIC_ROWS_SPAN_RECOVERY_RUNTIME_SYMBOL: usize = 13;
 const DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL: usize = 14;
@@ -948,6 +953,8 @@ const SLOW_PREFIX_SPAN_RECOVERY_V1_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_recover_span_v1";
 const SLOW_PREFIX_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_recover_span_v2";
+const STATIC_PREFIX_RETIRE_RUNTIME_SYMBOL_NAME: &str =
+    "fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_retire_v1";
 const DYNAMIC_ROWS_PREFLIGHT_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v6";
 const DYNAMIC_ROWS_DEOPT_RUNTIME_SYMBOL_NAME: &str =
@@ -1671,6 +1678,15 @@ impl CompiledModule {
             .relocations
             .iter()
             .any(|relocation| relocation.symbol == DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL);
+        let needs_static_prefix_retire_symbol = prepared_layout.is_some_and(|layout| {
+            matches!(
+                layout.kind,
+                PreparedEntryKind::Native(prepared) if prepared.slow_prefix
+            ) && lowering
+                .relocations
+                .iter()
+                .any(|relocation| relocation.symbol == STATIC_PREFIX_RETIRE_RUNTIME_SYMBOL)
+        });
         let needs_dynamic_rows_loop_scan_symbol = lowering
             .relocations
             .iter()
@@ -1995,6 +2011,40 @@ impl CompiledModule {
                                 size: 0,
                             });
                         }
+                        if needs_static_prefix_retire_symbol {
+                            while symbols.len() < STATIC_PREFIX_RETIRE_RUNTIME_SYMBOL {
+                                let slot = symbols.len();
+                                symbols.push(ModuleSymbol {
+                                    name: format!(
+                                        ".Lfre_aot_regex_static_prefix_retire_placeholder_{slot}"
+                                    ),
+                                    binding: SymbolBinding::Local,
+                                    kind: SymbolKind::Object,
+                                    section: Some(PROGRAM_SECTION),
+                                    offset: u64::try_from(prepared.identity_offset).map_err(
+                                        |_| {
+                                            ObjectError::ArithmeticOverflow(
+                                                "static-prefix retire placeholder offset",
+                                            )
+                                        },
+                                    )?,
+                                    size: 0,
+                                });
+                            }
+                            if symbols.len() != STATIC_PREFIX_RETIRE_RUNTIME_SYMBOL {
+                                return Err(ObjectError::InvalidModule(
+                                    "static-prefix retire symbol order is inconsistent",
+                                ));
+                            }
+                            symbols.push(ModuleSymbol {
+                                name: STATIC_PREFIX_RETIRE_RUNTIME_SYMBOL_NAME.to_owned(),
+                                binding: SymbolBinding::Global,
+                                kind: SymbolKind::Function,
+                                section: None,
+                                offset: 0,
+                                size: 0,
+                            });
+                        }
                         if needs_dynamic_rows_loop_scan_symbol {
                             if !prepared.slow_prefix_resume {
                                 return Err(ObjectError::InvalidModule(
@@ -2153,6 +2203,27 @@ impl CompiledModule {
             .find(|symbol| {
                 symbol.section.is_none()
                     && symbol.name == PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME
+            })
+            .map(|symbol| symbol.name.as_str())
+    }
+
+    /// Return the generated-only static-prefix retirement helper used by
+    /// inline guard failures and fail-closed epoch wrap handling.
+    #[must_use]
+    pub fn required_prepared_static_prefix_retire_runtime_symbol(&self) -> Option<&str> {
+        self.prepared_entry_symbol_index?;
+        if !self
+            .relocations
+            .iter()
+            .any(|relocation| relocation.symbol == STATIC_PREFIX_RETIRE_RUNTIME_SYMBOL)
+        {
+            return None;
+        }
+        self.symbols
+            .get(STATIC_PREFIX_RETIRE_RUNTIME_SYMBOL)
+            .filter(|symbol| {
+                symbol.section.is_none()
+                    && symbol.name == STATIC_PREFIX_RETIRE_RUNTIME_SYMBOL_NAME
             })
             .map(|symbol| symbol.name.as_str())
     }
@@ -3015,8 +3086,10 @@ const fn static_prefix_can_defer_preflight(
 /// Compose a transient, resource-bounded DFA prefix with the persistent
 /// prepared runtime. The static table and exact continuation frontiers are
 /// compiler-owned and immutable; both remain absent from the stable semantic
-/// format. Artifact authentication and one-time graph binding precede native
-/// entry, while a hole continues from its first unconsumed byte.
+/// format. Every route authenticates the exact artifact before native entry.
+/// Complete-proof and variable-width Span programs bind eagerly; otherwise
+/// graph admission is deferred until an actual hole and continues from its
+/// first unconsumed byte.
 #[allow(
     clippy::too_many_lines,
     reason = "serialized program, static table, authenticated prepared entry, and local native core form one transaction"
@@ -4084,6 +4157,21 @@ fn native_module_digest(
                 &mut digest,
                 DYNAMIC_ROWS_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME.as_bytes(),
                 "dynamic Span recovery runtime symbol identity byte length",
+            )?;
+        }
+        if prepared_layout.is_some_and(|layout| {
+            matches!(
+                layout.kind,
+                PreparedEntryKind::Native(prepared) if prepared.slow_prefix
+            ) && lowering
+                .relocations
+                .iter()
+                .any(|relocation| relocation.symbol == STATIC_PREFIX_RETIRE_RUNTIME_SYMBOL)
+        }) {
+            update_bytes(
+                &mut digest,
+                STATIC_PREFIX_RETIRE_RUNTIME_SYMBOL_NAME.as_bytes(),
+                "static-prefix retire runtime symbol identity byte length",
             )?;
         }
         if lowering
@@ -13947,6 +14035,42 @@ fn patch_x86_64_local_call(
     Ok(())
 }
 
+fn x86_emit_static_prefix_epoch_increment_rax(
+    assembler: &mut X86Assembler,
+    overflow: X86Label,
+) -> Result<(), ObjectError> {
+    let displacement = u32::try_from(STATIC_PREFIX_INVOCATION_EPOCH_OFFSET)
+        .map_err(|_| ObjectError::ArithmeticOverflow("x86 static-prefix epoch offset"))?
+        .to_le_bytes();
+    let mut load = vec![0x48, 0x8b, 0x87]; // mov rax, [rdi + disp32]
+    load.extend_from_slice(&displacement);
+    assembler.instruction(&load)?;
+    assembler.instruction(&[0x48, 0x83, 0xc0, 0x01])?; // add rax, 1
+    assembler.branch(&[0x0f, 0x84], overflow)?;
+    let mut store = vec![0x48, 0x89, 0x87]; // mov [rdi + disp32], rax
+    store.extend_from_slice(&displacement);
+    assembler.instruction(&store)?;
+    Ok(())
+}
+
+fn x86_emit_static_prefix_epoch_increment_r10(
+    assembler: &mut X86Assembler,
+    overflow: X86Label,
+) -> Result<(), ObjectError> {
+    let displacement = u32::try_from(STATIC_PREFIX_INVOCATION_EPOCH_OFFSET)
+        .map_err(|_| ObjectError::ArithmeticOverflow("x86 static-prefix epoch offset"))?
+        .to_le_bytes();
+    let mut load = vec![0x4c, 0x8b, 0x97]; // mov r10, [rdi + disp32]
+    load.extend_from_slice(&displacement);
+    assembler.instruction(&load)?;
+    assembler.instruction(&[0x49, 0x83, 0xc2, 0x01])?; // add r10, 1
+    assembler.branch(&[0x0f, 0x84], overflow)?;
+    let mut store = vec![0x4c, 0x89, 0x97]; // mov [rdi + disp32], r10
+    store.extend_from_slice(&displacement);
+    assembler.instruction(&store)?;
+    Ok(())
+}
+
 #[allow(
     dead_code,
     clippy::too_many_lines,
@@ -14106,6 +14230,13 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
     let invalid_handle = defer_preflight.then(|| assembler.label()).transpose()?;
     let invalid_argument = defer_preflight.then(|| assembler.label()).transpose()?;
     let wrong_identity = defer_preflight.then(|| assembler.label()).transpose()?;
+    let entry_epoch_overflow = defer_preflight.then(|| assembler.label()).transpose()?;
+    let guard_retire = defer_preflight.then(|| assembler.label()).transpose()?;
+    let direct_epoch_overflow = (!defer_preflight).then(|| assembler.label()).transpose()?;
+    let resume_epoch_overflow = resume_table_addend
+        .map(|_| assembler.label())
+        .transpose()?;
+    let mut retire_displacement_labels = Vec::new();
 
     if let (Some(invalid_handle), Some(invalid_argument)) = (invalid_handle, invalid_argument) {
         // The deferred route assumes exactly the same unsafe live-allocation
@@ -14127,18 +14258,6 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
         assembler.instruction(&[0x41, 0xf6, 0xc1, 0x07])?; // result alignment
         assembler.branch(&[0x0f, 0x85], invalid_argument)?;
     }
-
-    // Short windows retain the ordinary prepared path. The wrapping
-    // subtraction is harmless because the runtime helper remains the raw-ABI
-    // validator on this branch.
-    assembler.instruction(&[0x4c, 0x89, 0xc0])?; // mov r8, rax
-    assembler.instruction(&[0x48, 0x29, 0xc8])?; // sub rcx, rax
-    let minimum = u32::try_from(PARTIAL_DFA_MIN_INPUT_BYTES)
-        .map_err(|_| ObjectError::ArithmeticOverflow("static-prefix input admission floor"))?;
-    let mut compare_minimum = vec![0x48, 0x3d];
-    compare_minimum.extend_from_slice(&minimum.to_le_bytes());
-    assembler.instruction(&compare_minimum)?;
-    assembler.branch(&[0x0f, 0x82], fallback_runtime)?;
 
     let deferred_identity_displacement_label = if let Some(wrong_identity) = wrong_identity {
         // PreparedAotRegex is repr(C) and its immutable V6 header is asserted
@@ -14190,6 +14309,33 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
     } else {
         None
     };
+
+    if let Some(entry_epoch_overflow) = entry_epoch_overflow {
+        // The immutable identity authenticates this allocation before the
+        // first mutable access. Advancing the per-owner generation makes any
+        // capability left by an earlier invocation stale without adding a
+        // helper call to the ordinary native path.
+        x86_emit_static_prefix_epoch_increment_r10(&mut assembler, entry_epoch_overflow)?;
+    }
+
+    // Short windows retain the ordinary prepared path, but only after the
+    // deferred entry has authenticated the exact artifact and invalidated
+    // capabilities from prior invocations. All public argument registers are
+    // still intact for the six-argument tail fallback.
+    let minimum = u32::try_from(PARTIAL_DFA_MIN_INPUT_BYTES)
+        .map_err(|_| ObjectError::ArithmeticOverflow("static-prefix input admission floor"))?;
+    let mut compare_minimum = if defer_preflight {
+        assembler.instruction(&[0x4d, 0x89, 0xc2])?; // mov r10, r8
+        assembler.instruction(&[0x49, 0x29, 0xca])?; // sub r10, rcx
+        vec![0x49, 0x81, 0xfa] // cmp r10, imm32
+    } else {
+        assembler.instruction(&[0x4c, 0x89, 0xc0])?; // mov rax, r8
+        assembler.instruction(&[0x48, 0x29, 0xc8])?; // sub rax, rcx
+        vec![0x48, 0x3d] // cmp rax, imm32
+    };
+    compare_minimum.extend_from_slice(&minimum.to_le_bytes());
+    assembler.instruction(&compare_minimum)?;
+    assembler.branch(&[0x0f, 0x82], fallback_runtime)?;
 
     // Entry RSP is 8 modulo 16. Both frame sizes align helper calls and keep
     // all six prepared arguments plus the two outgoing identity/descriptor
@@ -14274,6 +14420,12 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
     assembler.branch(&[0xe9], native_deopt)?;
 
     assembler.bind(native_no_match)?;
+    if let Some(direct_epoch_overflow) = direct_epoch_overflow {
+        // Eager V2 admission minted a capability at the current generation.
+        // Retire it by generation before publishing a direct result.
+        assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x10])?;
+        x86_emit_static_prefix_epoch_increment_rax(&mut assembler, direct_epoch_overflow)?;
+    }
     assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x38])?;
     assembler.instruction(&[0x31, 0xc0])?;
     assembler.instruction(&[0x49, 0x89, 0x01])?;
@@ -14282,6 +14434,11 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
     assembler.instruction(&[0xc3])?;
 
     assembler.bind(native_match)?;
+    if let Some(direct_epoch_overflow) = direct_epoch_overflow {
+        // RAX is scratch here; R10/R11 retain the selected native endpoints.
+        assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x10])?;
+        x86_emit_static_prefix_epoch_increment_rax(&mut assembler, direct_epoch_overflow)?;
+    }
     assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x38])?;
     match output {
         OutputContract::Exists => {
@@ -14301,6 +14458,24 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
     assembler.instruction(&[0xb8, 1, 0, 0, 0])?;
     assembler.instruction(&[0x48, 0x83, 0xc4, frame_bytes])?;
     assembler.instruction(&[0xc3])?;
+
+    if let Some(direct_epoch_overflow) = direct_epoch_overflow {
+        assembler.bind(direct_epoch_overflow)?;
+        assembler.instruction(&[
+            0xbe,
+            PREPARED_RUNTIME_FAILURE_STATUS,
+            0,
+            0,
+            0,
+        ])?; // mov esi, runtime failure
+        assembler.instruction(&[0xe8])?;
+        let displacement = assembler.label()?;
+        assembler.bind(displacement)?;
+        push_bytes(&mut assembler.code, &[0; 4])?;
+        retire_displacement_labels.push(displacement);
+        assembler.instruction(&[0x48, 0x83, 0xc4, frame_bytes])?;
+        assembler.instruction(&[0xc3])?;
+    }
 
     let span_recovery_displacement_label = if let Some(native_span_recovery) = native_span_recovery {
         assembler.bind(native_span_recovery)?;
@@ -14415,6 +14590,24 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
         push_bytes(&mut assembler.code, &[0; 4])?;
         continuation_resume_tail_call_displacement_label = Some(continuation_tail_call);
         assembler.bind(resume_return)?;
+        assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x10])?;
+        x86_emit_static_prefix_epoch_increment_r10(
+            &mut assembler,
+            resume_epoch_overflow.ok_or(ObjectError::InvalidModule(
+                "x86 static-prefix resume epoch overflow label is absent",
+            ))?,
+        )?;
+        assembler.instruction(&[0x48, 0x83, 0xc4, frame_bytes])?;
+        assembler.instruction(&[0xc3])?;
+        assembler.bind(resume_epoch_overflow.ok_or(ObjectError::InvalidModule(
+            "x86 static-prefix resume epoch overflow label is absent",
+        ))?)?;
+        assembler.instruction(&[0x89, 0xc6])?; // mov esi, eax
+        assembler.instruction(&[0xe8])?;
+        let retire_displacement = assembler.label()?;
+        assembler.bind(retire_displacement)?;
+        push_bytes(&mut assembler.code, &[0; 4])?;
+        retire_displacement_labels.push(retire_displacement);
         assembler.instruction(&[0x48, 0x83, 0xc4, frame_bytes])?;
         assembler.instruction(&[0xc3])?;
         Some(displacement)
@@ -14443,13 +14636,59 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
     }
     if let Some(invalid_argument) = invalid_argument {
         assembler.bind(invalid_argument)?;
-        assembler.instruction(&[0xb8, PREPARED_INVALID_ARGUMENT_STATUS, 0, 0, 0])?;
-        assembler.instruction(&[0xc3])?;
+        assembler.instruction(&[
+            0xbe,
+            PREPARED_INVALID_ARGUMENT_STATUS,
+            0,
+            0,
+            0,
+        ])?; // mov esi, invalid argument
+        assembler.branch(
+            &[0xe9],
+            guard_retire.ok_or(ObjectError::InvalidModule(
+                "x86 static-prefix guard retirement label is absent",
+            ))?,
+        )?;
     }
     if let Some(wrong_identity) = wrong_identity {
         assembler.bind(wrong_identity)?;
-        assembler.instruction(&[0xb8, PREPARED_RUNTIME_FAILURE_STATUS, 0, 0, 0])?;
-        assembler.instruction(&[0xc3])?;
+        assembler.instruction(&[
+            0xbe,
+            PREPARED_RUNTIME_FAILURE_STATUS,
+            0,
+            0,
+            0,
+        ])?; // mov esi, runtime failure
+        assembler.branch(
+            &[0xe9],
+            guard_retire.ok_or(ObjectError::InvalidModule(
+                "x86 static-prefix guard retirement label is absent",
+            ))?,
+        )?;
+    }
+    if let Some(entry_epoch_overflow) = entry_epoch_overflow {
+        assembler.bind(entry_epoch_overflow)?;
+        assembler.instruction(&[
+            0xbe,
+            PREPARED_RUNTIME_FAILURE_STATUS,
+            0,
+            0,
+            0,
+        ])?; // mov esi, runtime failure
+        assembler.branch(
+            &[0xe9],
+            guard_retire.ok_or(ObjectError::InvalidModule(
+                "x86 static-prefix guard retirement label is absent",
+            ))?,
+        )?;
+    }
+    if let Some(guard_retire) = guard_retire {
+        assembler.bind(guard_retire)?;
+        assembler.instruction(&[0xe9])?;
+        let displacement = assembler.label()?;
+        assembler.bind(displacement)?;
+        push_bytes(&mut assembler.code, &[0; 4])?;
+        retire_displacement_labels.push(displacement);
     }
 
     assembler.bind(fallback_runtime)?;
@@ -14490,6 +14729,10 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
     let continuation_resume_tail_call_offset = continuation_resume_tail_call_displacement_label
         .map(|label| finished.label_offset(label))
         .transpose()?;
+    let retire_displacements = retire_displacement_labels
+        .into_iter()
+        .map(|label| finished.label_offset(label))
+        .collect::<Result<Vec<_>, _>>()?;
     let mut relocations = vec![ModuleRelocation {
         section: TEXT_SECTION,
         offset: offset_u64(identity_displacement, "x86 static-prefix identity relocation")?,
@@ -14570,6 +14813,18 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
             )?,
             kind: RelocationKind::X86PltRelative32,
             symbol: PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL,
+            addend: -4,
+        });
+    }
+    for retire_displacement in retire_displacements {
+        relocations.push(ModuleRelocation {
+            section: TEXT_SECTION,
+            offset: offset_u64(
+                retire_displacement,
+                "x86 static-prefix retirement relocation",
+            )?,
+            kind: RelocationKind::X86PltRelative32,
+            symbol: STATIC_PREFIX_RETIRE_RUNTIME_SYMBOL,
             addend: -4,
         });
     }
@@ -26607,6 +26862,21 @@ fn lower_aarch64_slow_partial_wrapper(
     })
 }
 
+fn aarch64_emit_static_prefix_epoch_increment(
+    assembler: &mut Aarch64Assembler,
+    handle: u8,
+    scratch: u8,
+    overflow: Aarch64Label,
+) -> Result<(), ObjectError> {
+    let epoch_offset = u16::try_from(STATIC_PREFIX_INVOCATION_EPOCH_OFFSET)
+        .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 static-prefix epoch offset"))?;
+    assembler.instruction(aarch64_load_x_imm(scratch, handle, epoch_offset)?)?;
+    assembler.instruction(aarch64_add_x_imm(scratch, scratch, 1)?)?;
+    assembler.branch_zero_x(scratch, overflow)?;
+    assembler.instruction(aarch64_store_x(scratch, handle, epoch_offset)?)?;
+    Ok(())
+}
+
 fn lower_aarch64_static_prefix_prepared_wrapper(
     output: OutputContract,
     span_recovery: bool,
@@ -26626,6 +26896,13 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
     let invalid_handle = defer_preflight.then(|| assembler.label()).transpose()?;
     let invalid_argument = defer_preflight.then(|| assembler.label()).transpose()?;
     let wrong_identity = defer_preflight.then(|| assembler.label()).transpose()?;
+    let entry_epoch_overflow = defer_preflight.then(|| assembler.label()).transpose()?;
+    let guard_retire = defer_preflight.then(|| assembler.label()).transpose()?;
+    let direct_epoch_overflow = (!defer_preflight).then(|| assembler.label()).transpose()?;
+    let resume_epoch_overflow = resume_table_addend
+        .map(|_| assembler.label())
+        .transpose()?;
+    let mut retire_branches = Vec::new();
 
     if let (Some(invalid_handle), Some(invalid_argument)) = (invalid_handle, invalid_argument) {
         // Check every raw scalar before the first header or haystack load.
@@ -26639,17 +26916,9 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
         assembler.instruction(aarch64_cmp_x(3, 4)?)?;
         assembler.branch_cond(AARCH64_HI, invalid_argument)?;
         assembler.branch_zero_x(5, invalid_argument)?;
-        assembler.instruction(aarch64_and_low_x(6, 5, 7)?)?;
+        assembler.instruction(aarch64_and_low_x(6, 5, 3)?)?;
         assembler.branch_nonzero_x(6, invalid_argument)?;
     }
-
-    // X6 is caller-saved and all six public arguments remain untouched for a
-    // short-window tail fallback.
-    assembler.instruction(aarch64_sub_x_reg(6, 4, 3)?)?;
-    let minimum = u16::try_from(PARTIAL_DFA_MIN_INPUT_BYTES)
-        .map_err(|_| ObjectError::ArithmeticOverflow("static-prefix input admission floor"))?;
-    assembler.instruction(aarch64_cmp_x_imm(6, minimum)?)?;
-    assembler.branch_cond(AARCH64_LO, fallback_runtime)?;
 
     let deferred_identity_relocations = if let Some(wrong_identity) = wrong_identity {
         // The offset-zero V6 identity remains immutable when mutable runtime
@@ -26693,6 +26962,27 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
     } else {
         None
     };
+
+    if let Some(entry_epoch_overflow) = entry_epoch_overflow {
+        // Authenticate the immutable owner before the first mutable access,
+        // then invalidate every capability minted by an older invocation.
+        aarch64_emit_static_prefix_epoch_increment(
+            &mut assembler,
+            0,
+            8,
+            entry_epoch_overflow,
+        )?;
+    }
+
+    // X6 is caller-saved and all six public arguments remain untouched for a
+    // short-window tail fallback. Authentication and generation retirement
+    // deliberately precede this generic path.
+    let window_register = if defer_preflight { 10 } else { 6 };
+    assembler.instruction(aarch64_sub_x_reg(window_register, 4, 3)?)?;
+    let minimum = u16::try_from(PARTIAL_DFA_MIN_INPUT_BYTES)
+        .map_err(|_| ObjectError::ArithmeticOverflow("static-prefix input admission floor"))?;
+    assembler.instruction(aarch64_cmp_x_imm(window_register, minimum)?)?;
+    assembler.branch_cond(AARCH64_LO, fallback_runtime)?;
 
     assembler.instruction(aarch64_sub_x_imm(31, 31, frame_bytes)?)?;
     assembler.instruction(aarch64_store_pair_x(0, 1, 31, 0)?)?;
@@ -26766,6 +27056,17 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
     assembler.branch(native_deopt)?;
 
     assembler.bind(native_no_match)?;
+    if let Some(direct_epoch_overflow) = direct_epoch_overflow {
+        // Eager V2 admission minted a capability. Invalidate it before any
+        // caller result store; X6/X7 remain available for match endpoints.
+        assembler.instruction(aarch64_load_x_imm(0, 31, 0)?)?;
+        aarch64_emit_static_prefix_epoch_increment(
+            &mut assembler,
+            0,
+            8,
+            direct_epoch_overflow,
+        )?;
+    }
     assembler.instruction(aarch64_load_x_imm(5, 31, 40)?)?;
     assembler.instruction(aarch64_store_pair_x(31, 31, 5, 0)?)?;
     assembler.instruction(aarch64_movz_w(0, 0)?)?;
@@ -26774,6 +27075,15 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
     assembler.instruction(0xd65f_03c0)?;
 
     assembler.bind(native_match)?;
+    if let Some(direct_epoch_overflow) = direct_epoch_overflow {
+        assembler.instruction(aarch64_load_x_imm(0, 31, 0)?)?;
+        aarch64_emit_static_prefix_epoch_increment(
+            &mut assembler,
+            0,
+            8,
+            direct_epoch_overflow,
+        )?;
+    }
     assembler.instruction(aarch64_load_x_imm(5, 31, 40)?)?;
     match output {
         OutputContract::Exists => {
@@ -26790,6 +27100,18 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
     assembler.instruction(aarch64_load_x_imm(30, 31, return_address_offset)?)?;
     assembler.instruction(aarch64_add_x_imm(31, 31, frame_bytes)?)?;
     assembler.instruction(0xd65f_03c0)?;
+
+    if let Some(direct_epoch_overflow) = direct_epoch_overflow {
+        assembler.bind(direct_epoch_overflow)?;
+        assembler.instruction(aarch64_movz_w(
+            1,
+            u16::from(PREPARED_RUNTIME_FAILURE_STATUS),
+        )?)?;
+        retire_branches.push(assembler.instruction(0x9400_0000)?);
+        assembler.instruction(aarch64_load_x_imm(30, 31, return_address_offset)?)?;
+        assembler.instruction(aarch64_add_x_imm(31, 31, frame_bytes)?)?;
+        assembler.instruction(0xd65f_03c0)?;
+    }
 
     let span_recovery_relocations = if let Some(native_span_recovery) = native_span_recovery {
         assembler.bind(native_span_recovery)?;
@@ -26874,6 +27196,24 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
         assembler.instruction(aarch64_load_pair_x(6, 7, 5, 0)?)?;
         continuation_resume_tail_call = Some(assembler.instruction(0x9400_0000)?);
         assembler.bind(resume_return)?;
+        assembler.instruction(aarch64_load_x_imm(9, 31, 0)?)?;
+        aarch64_emit_static_prefix_epoch_increment(
+            &mut assembler,
+            9,
+            8,
+            resume_epoch_overflow.ok_or(ObjectError::InvalidModule(
+                "AArch64 static-prefix resume epoch overflow label is absent",
+            ))?,
+        )?;
+        assembler.instruction(aarch64_load_x_imm(30, 31, return_address_offset)?)?;
+        assembler.instruction(aarch64_add_x_imm(31, 31, frame_bytes)?)?;
+        assembler.instruction(0xd65f_03c0)?;
+        assembler.bind(resume_epoch_overflow.ok_or(ObjectError::InvalidModule(
+            "AArch64 static-prefix resume epoch overflow label is absent",
+        ))?)?;
+        assembler.instruction(aarch64_mov_x(1, 0)?)?;
+        assembler.instruction(aarch64_mov_x(0, 9)?)?;
+        retire_branches.push(assembler.instruction(0x9400_0000)?);
         assembler.instruction(aarch64_load_x_imm(30, 31, return_address_offset)?)?;
         assembler.instruction(aarch64_add_x_imm(31, 31, frame_bytes)?)?;
         assembler.instruction(0xd65f_03c0)?;
@@ -26902,18 +27242,36 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
     if let Some(invalid_argument) = invalid_argument {
         assembler.bind(invalid_argument)?;
         assembler.instruction(aarch64_movz_w(
-            0,
+            1,
             u16::from(PREPARED_INVALID_ARGUMENT_STATUS),
         )?)?;
-        assembler.instruction(0xd65f_03c0)?;
+        assembler.branch(guard_retire.ok_or(ObjectError::InvalidModule(
+            "AArch64 static-prefix guard retirement label is absent",
+        ))?)?;
     }
     if let Some(wrong_identity) = wrong_identity {
         assembler.bind(wrong_identity)?;
         assembler.instruction(aarch64_movz_w(
-            0,
+            1,
             u16::from(PREPARED_RUNTIME_FAILURE_STATUS),
         )?)?;
-        assembler.instruction(0xd65f_03c0)?;
+        assembler.branch(guard_retire.ok_or(ObjectError::InvalidModule(
+            "AArch64 static-prefix guard retirement label is absent",
+        ))?)?;
+    }
+    if let Some(entry_epoch_overflow) = entry_epoch_overflow {
+        assembler.bind(entry_epoch_overflow)?;
+        assembler.instruction(aarch64_movz_w(
+            1,
+            u16::from(PREPARED_RUNTIME_FAILURE_STATUS),
+        )?)?;
+        assembler.branch(guard_retire.ok_or(ObjectError::InvalidModule(
+            "AArch64 static-prefix guard retirement label is absent",
+        ))?)?;
+    }
+    if let Some(guard_retire) = guard_retire {
+        assembler.bind(guard_retire)?;
+        retire_branches.push(assembler.instruction(0x1400_0000)?);
     }
 
     assembler.bind(fallback_runtime)?;
@@ -26973,6 +27331,14 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
         relocation_offsets.push(tail_call);
         index
     });
+    let retire_indices = retire_branches
+        .into_iter()
+        .map(|branch| {
+            let index = relocation_offsets.len();
+            relocation_offsets.push(branch);
+            index
+        })
+        .collect::<Vec<_>>();
     let code = assembler.finish_with_offsets(&mut relocation_offsets)?;
     let mut relocations = vec![
         ModuleRelocation {
@@ -27087,6 +27453,18 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
                 addend: 0,
             },
         ]);
+    }
+    for retire_index in retire_indices {
+        relocations.push(ModuleRelocation {
+            section: TEXT_SECTION,
+            offset: offset_u64(
+                relocation_offsets[retire_index],
+                "AArch64 static-prefix retirement branch",
+            )?,
+            kind: RelocationKind::Aarch64Branch26,
+            symbol: STATIC_PREFIX_RETIRE_RUNTIME_SYMBOL,
+            addend: 0,
+        });
     }
     Ok(NativeSlowPartialWrapper {
         code,
@@ -46878,6 +47256,17 @@ int main(void){{
                     })
                     .collect::<Vec<_>>();
                 assert_eq!(preflight.len(), 1, "{architecture:?}/{output:?}");
+                assert_eq!(
+                    deferred
+                        .relocations
+                        .iter()
+                        .filter(|relocation| {
+                            relocation.symbol == STATIC_PREFIX_RETIRE_RUNTIME_SYMBOL
+                        })
+                        .count(),
+                    2,
+                    "guard and resume-wrap retirement branches: {architecture:?}/{output:?}"
+                );
                 let preflight_offset = usize::try_from(preflight[0].offset).unwrap();
                 assert!(
                     preflight_offset > deferred.core_call_offset,
@@ -46916,6 +47305,19 @@ int main(void){{
                                 bytes == [0x4c, 0x3b, 0x57, displacement]
                             }));
                         }
+                        let epoch = u32::try_from(STATIC_PREFIX_INVOCATION_EPOCH_OFFSET)
+                            .unwrap()
+                            .to_le_bytes();
+                        let mut load = vec![0x4c, 0x8b, 0x97];
+                        load.extend_from_slice(&epoch);
+                        let mut store = vec![0x4c, 0x89, 0x97];
+                        store.extend_from_slice(&epoch);
+                        assert!(prefix
+                            .windows(load.len())
+                            .any(|bytes| bytes == load.as_slice()));
+                        assert!(prefix
+                            .windows(store.len())
+                            .any(|bytes| bytes == store.as_slice()));
                     }
                     Architecture::Aarch64 => {
                         let words = deferred
@@ -46928,7 +47330,7 @@ int main(void){{
                         for instruction in [
                             aarch64_cmp_x(4, 2).unwrap(),
                             aarch64_cmp_x(3, 4).unwrap(),
-                            aarch64_and_low_x(6, 5, 7).unwrap(),
+                            aarch64_and_low_x(6, 5, 3).unwrap(),
                         ] {
                             assert!(prefix.contains(&instruction), "{output:?}/{instruction:#x}");
                         }
@@ -46953,6 +47355,11 @@ int main(void){{
                             )
                             .unwrap()
                         ));
+                        let epoch = u16::try_from(STATIC_PREFIX_INVOCATION_EPOCH_OFFSET)
+                            .unwrap();
+                        assert!(prefix.contains(&aarch64_load_x_imm(8, 0, epoch).unwrap()));
+                        assert!(prefix.contains(&aarch64_add_x_imm(8, 8, 1).unwrap()));
+                        assert!(prefix.contains(&aarch64_store_x(8, 0, epoch).unwrap()));
                     }
                 }
             }
@@ -46975,6 +47382,17 @@ int main(void){{
             assert!(no_resume.relocations.iter().all(|relocation| {
                 relocation.symbol != PREPARED_PREFLIGHT_RUNTIME_SYMBOL
             }));
+            assert_eq!(
+                no_resume
+                    .relocations
+                    .iter()
+                    .filter(|relocation| {
+                        relocation.symbol == STATIC_PREFIX_RETIRE_RUNTIME_SYMBOL
+                    })
+                    .count(),
+                1,
+                "no-resume deferred wrapper has only the cold guard/wrap helper: {architecture:?}"
+            );
 
             let eager_span = match architecture {
                 Architecture::X86_64 => lower_x86_64_static_prefix_prepared_wrapper(
@@ -47011,6 +47429,17 @@ int main(void){{
                     .count(),
                 1,
                 "{architecture:?}"
+            );
+            assert_eq!(
+                eager_span
+                    .relocations
+                    .iter()
+                    .filter(|relocation| {
+                        relocation.symbol == STATIC_PREFIX_RETIRE_RUNTIME_SYMBOL
+                    })
+                    .count(),
+                2,
+                "eager direct and resume-wrap cold helpers: {architecture:?}"
             );
         }
     }
@@ -51512,7 +51941,7 @@ int main(void){{
                 .len()
                 .checked_sub(serialized.len())
                 .expect("hybrid data follows serialized program");
-            let module = CompiledModule::lower_optimizing_with_limits_and_native_data_limit(
+            let mut module = CompiledModule::lower_optimizing_with_limits_and_native_data_limit(
                 fast.program(),
                 target,
                 slow_limits,
@@ -51520,6 +51949,9 @@ int main(void){{
             )
             .expect("select forged-V4 static-prefix module");
             assert!(module.slow_aot_report().is_some());
+            module.symbols[PARTIAL_IDENTITY_SYMBOL].name =
+                "fre_test_static_prefix_identity".to_owned();
+            module.symbols[PARTIAL_IDENTITY_SYMBOL].binding = SymbolBinding::Global;
 
             let long_len = PARTIAL_DFA_MIN_INPUT_BYTES + 64;
             let hole_haystack = generated_byte_strings(
@@ -51593,7 +52025,7 @@ typedef struct {{
 }} frozen_v6_tail_t;
 typedef struct {{frozen_v1_t v1;frozen_v6_tail_t v6;}} frozen_v6_t;
 typedef union {{frozen_v4_t v4;frozen_v6_t v6;unsigned char bytes[{slot_bytes}U];}} frozen_v6_slot_t;
-typedef struct {{unsigned char public_header[{second_offset}U];frozen_v6_slot_t continuation;}} prepared_t;
+typedef struct {{unsigned char public_header[{second_offset}U];frozen_v6_slot_t continuation;uint64_t invocation_epoch;}} prepared_t;
 _Static_assert(sizeof(frozen_v1_t)=={v1_bytes}U,"V1 extent");
 _Static_assert(offsetof(frozen_v4_t,v4)=={tail_offset}U,"V4 offset");
 _Static_assert(sizeof(frozen_v4_t)=={v4_bytes}U,"V4 extent");
@@ -51602,21 +52034,24 @@ _Static_assert(offsetof(frozen_v6_t,v6)=={tail_offset}U,"V6 offset");
 _Static_assert(offsetof(frozen_v6_tail_t,loop_plans)=={loop_plans_offset}U,"loop-plan offset");
 _Static_assert(sizeof(frozen_v6_t)=={v6_bytes}U,"V6 extent");
 _Static_assert(offsetof(prepared_t,continuation)=={second_offset}U,"continuation header offset");
+_Static_assert(offsetof(prepared_t,invocation_epoch)=={epoch_offset}U,"static-prefix epoch offset");
 extern uint32_t {entry}(handle_t,const unsigned char*,size_t,size_t,size_t,result_t*);
+extern const unsigned char fre_test_static_prefix_identity[];
 static const unsigned char identity[32]={{{identity}}};
 static const unsigned char haystack[]={{{haystack}}};
 static uint16_t rows[2];static uint32_t reverse_rows[256];static uint8_t loop_index[2],scanner_cookie;static prepared_t prepared;
 #define frozen_v4 prepared.continuation.v4
 #define frozen_v6 prepared.continuation.v6
-static size_t observed_cursor;static unsigned preflight_calls,continue_calls,recovery_calls,fallback_calls,helper_calls,helper_bad;static int loop_case;static uint32_t preflight_status;
-static unsigned object_ticket,span_postflight_ticket;
+static size_t observed_cursor;static unsigned preflight_calls,continue_calls,recovery_calls,fallback_calls,helper_calls,helper_bad,retire_calls;static int loop_case;static uint32_t preflight_status;
+static unsigned object_ticket,span_postflight_ticket,stale_seen_at_preflight;static uint64_t ticket_epoch,postflight_epoch;
 uint32_t fre_aot_regex_runtime_search_v1(const unsigned char*a,const unsigned char*b,size_t n,size_t s,size_t e,result_t*r){{(void)a;(void)b;(void)n;(void)s;(void)e;(void)r;fallback_calls++;return 97U;}}
 uint32_t fre_aot_regex_runtime_search_exclusive_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;fallback_calls++;return 97U;}}
-uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_preflight_v2(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,const uint32_t*d){{(void)d;preflight_calls++;if(h!=(handle_t)&prepared||p!=haystack||n!=sizeof(haystack)||s!=0U||e!=n||memcmp(i,identity,32U)!=0)return 96U;if(preflight_status==1U){{r->start=111U;r->end=112U;return 1U;}}if(preflight_status!=6U)return preflight_status;object_ticket=1U;span_postflight_ticket=0U;return 6U;}}
-uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_continue_v1(handle_t h,const unsigned char*p,size_t n,result_t*r,size_t state,size_t position,size_t pending){{(void)state;(void)pending;continue_calls++;if(h!=(handle_t)&prepared||p!=haystack||n!=sizeof(haystack)||position==0U||position>=n||object_ticket!=1U)return 95U;object_ticket=0U;span_postflight_ticket=({mode}U==2U);observed_cursor=position;r->start=1U;r->end=loop_case&&{mode}U!=0U?position:0U;return 8U;}}
-uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_recover_span_v2(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,size_t selected){{recovery_calls++;if(h!=(handle_t)&prepared||p!=haystack||n!=sizeof(haystack)||s!=0U||e!=n||memcmp(i,identity,32U)!=0||selected!=observed_cursor+(loop_case?0U:1U)||span_postflight_ticket!=1U)return 94U;span_postflight_ticket=0U;r->start=observed_cursor;r->end=selected;return 1U;}}
+uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_preflight_v2(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,const uint32_t*d){{(void)d;preflight_calls++;if(h!=(handle_t)&prepared||p!=haystack||n!=sizeof(haystack)||s!=0U||e!=n||i!=fre_test_static_prefix_identity||memcmp(i,identity,32U)!=0)return 96U;stale_seen_at_preflight=(object_ticket&&ticket_epoch!=prepared.invocation_epoch)||(span_postflight_ticket&&postflight_epoch!=prepared.invocation_epoch);object_ticket=0U;span_postflight_ticket=0U;if(preflight_status==1U){{r->start=111U;r->end=112U;return 1U;}}if(preflight_status!=6U)return preflight_status;object_ticket=1U;ticket_epoch=prepared.invocation_epoch;return 6U;}}
+uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_continue_v1(handle_t h,const unsigned char*p,size_t n,result_t*r,size_t state,size_t position,size_t pending){{(void)state;(void)pending;continue_calls++;if(h!=(handle_t)&prepared||p!=haystack||n!=sizeof(haystack)||position==0U||position>=n||object_ticket!=1U||ticket_epoch!=prepared.invocation_epoch)return 95U;object_ticket=0U;span_postflight_ticket=({mode}U==2U);postflight_epoch=prepared.invocation_epoch;observed_cursor=position;r->start=1U;r->end=loop_case&&{mode}U!=0U?position:0U;return 8U;}}
+uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_recover_span_v2(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,size_t selected){{recovery_calls++;if(h!=(handle_t)&prepared||p!=haystack||n!=sizeof(haystack)||s!=0U||e!=n||i!=fre_test_static_prefix_identity||memcmp(i,identity,32U)!=0||selected!=observed_cursor+(loop_case?0U:1U)||span_postflight_ticket!=1U||postflight_epoch!=prepared.invocation_epoch)return 94U;span_postflight_ticket=0U;r->start=observed_cursor;r->end=selected;return 1U;}}
+uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_retire_v1(handle_t h,uint32_t status){{retire_calls++;if(h!=(handle_t)&prepared)return 5U;object_ticket=0U;span_postflight_ticket=0U;prepared.invocation_epoch=prepared.invocation_epoch==UINT64_MAX?UINT64_C(1):prepared.invocation_epoch+UINT64_C(1);switch(status){{case 0U:case 1U:case 2U:case 3U:case 5U:return status;default:return 3U;}}}}
 size_t fre_aot_regex_runtime_scan_frozen_loop_v2(const unsigned char*p,const void*s,size_t n){{helper_calls++;if(p<haystack||p>haystack+sizeof(haystack)||s!=(const void*)&scanner_cookie)helper_bad++;return n;}}
-static void reset_observations(void){{observed_cursor=0U;preflight_calls=0U;continue_calls=0U;recovery_calls=0U;fallback_calls=0U;helper_calls=0U;helper_bad=0U;object_ticket=0U;span_postflight_ticket=0U;preflight_status=6U;memset(prepared.public_header,0,sizeof(prepared.public_header));memcpy(prepared.public_header+{identity_offset}U,identity,32U);}}
+static void reset_observations(void){{observed_cursor=0U;preflight_calls=0U;continue_calls=0U;recovery_calls=0U;fallback_calls=0U;helper_calls=0U;helper_bad=0U;retire_calls=0U;object_ticket=0U;span_postflight_ticket=0U;stale_seen_at_preflight=0U;ticket_epoch=0U;postflight_epoch=0U;preflight_status=6U;prepared.invocation_epoch=UINT64_C(1);memset(prepared.public_header,0,sizeof(prepared.public_header));memcpy(prepared.public_header+{identity_offset}U,identity,32U);}}
 static void init_v4(void){{memset(&prepared.continuation,0,sizeof(prepared.continuation));rows[0]=0U;rows[1]=UINT16_C(0x8000);loop_case=0;
   frozen_v4.v1.active_seal=UINT64_C({active_seal});frozen_v4.v1.magic=UINT64_C({magic});
   frozen_v4.v1.abi_version=UINT32_C({abi});frozen_v4.v1.flags=UINT32_C({v4_flag});
@@ -51652,25 +52087,31 @@ static void init_loop(uint32_t format){{memset(&prepared.continuation,0,sizeof(p
   frozen_v6.v6.loop_plans[0].members[0]=UINT64_MAX;frozen_v6.v6.loop_plans[0].members[1]=UINT64_MAX;
   frozen_v6.v6.loop_plans[0].members[2]=0U;frozen_v6.v6.loop_plans[0].members[3]=0U;
   frozen_v6.v6.loop_plans[0].scanner_address=(size_t)(uintptr_t)&scanner_cookie;}}
-#define CHECK_GUARD(expr,want,code) do{{reset_observations();result.start=91U;result.end=92U;uint32_t guard_status=(expr);if(guard_status!=(want)||result.start!=91U||result.end!=92U||preflight_calls!=0U||continue_calls!=0U||fallback_calls!=0U)return(code);}}while(0)
+#define CHECK_GUARD(expr,want,want_retire,code) do{{reset_observations();result.start=91U;result.end=92U;uint32_t guard_status=(expr);if(guard_status!=(want)||result.start!=91U||result.end!=92U||preflight_calls!=0U||continue_calls!=0U||fallback_calls!=0U||retire_calls!=(want_retire)||prepared.invocation_epoch!=UINT64_C(1)+(want_retire))return(code);}}while(0)
 static int run_deferred_guards(void){{result_t result={{91U,92U}};if({mode}U==2U)return 0;
-  CHECK_GUARD({entry}((handle_t)0,haystack,sizeof(haystack),0U,sizeof(haystack),&result),5U,200);
-  CHECK_GUARD({entry}((handle_t)&prepared,NULL,sizeof(haystack),0U,sizeof(haystack),&result),2U,201);
-  CHECK_GUARD({entry}((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),NULL),2U,202);
-  CHECK_GUARD({entry}((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),(result_t*)((unsigned char*)&result+1U)),2U,203);
-  CHECK_GUARD({entry}((handle_t)&prepared,haystack,sizeof(haystack),sizeof(haystack),0U,&result),2U,204);
-  CHECK_GUARD({entry}((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack)+1U,&result),2U,205);
-  CHECK_GUARD({entry}((handle_t)&prepared,haystack,SIZE_MAX,0U,0U,&result),2U,206);
+  CHECK_GUARD({entry}((handle_t)0,haystack,sizeof(haystack),0U,sizeof(haystack),&result),5U,0U,200);
+  CHECK_GUARD({entry}((handle_t)&prepared,NULL,sizeof(haystack),0U,sizeof(haystack),&result),2U,1U,201);
+  CHECK_GUARD({entry}((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),NULL),2U,1U,202);
+  CHECK_GUARD({entry}((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),(result_t*)((unsigned char*)&result+1U)),2U,1U,203);
+  CHECK_GUARD({entry}((handle_t)&prepared,haystack,sizeof(haystack),sizeof(haystack),0U,&result),2U,1U,204);
+  CHECK_GUARD({entry}((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack)+1U,&result),2U,1U,205);
+  CHECK_GUARD({entry}((handle_t)&prepared,haystack,SIZE_MAX,0U,0U,&result),2U,1U,206);
   reset_observations();prepared.public_header[{identity_offset}U]^=1U;uint32_t status={entry}((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),&result);prepared.public_header[{identity_offset}U]^=1U;
-  if(status!=3U||result.start!=91U||result.end!=92U||preflight_calls!=0U||continue_calls!=0U||fallback_calls!=0U)return 207;
+  if(status!=3U||result.start!=91U||result.end!=92U||preflight_calls!=0U||continue_calls!=0U||fallback_calls!=0U||retire_calls!=1U||prepared.invocation_epoch!=UINT64_C(2)){{fprintf(stderr,"wrong-id status=%u result=%zu,%zu preflight=%u continue=%u fallback=%u retire=%u epoch=%llu\n",status,result.start,result.end,preflight_calls,continue_calls,fallback_calls,retire_calls,(unsigned long long)prepared.invocation_epoch);return 207;}}
+  reset_observations();object_ticket=1U;ticket_epoch=prepared.invocation_epoch;status={entry}((handle_t)&prepared,NULL,sizeof(haystack),0U,sizeof(haystack),&result);
+  if(status!=2U||object_ticket!=0U||span_postflight_ticket!=0U||retire_calls!=1U||prepared.invocation_epoch!=UINT64_C(2))return 208;
+  if(fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_continue_v1((handle_t)&prepared,haystack,sizeof(haystack),&result,0U,1U,0U)!=95U||object_ticket!=0U)return 209;
+  reset_observations();prepared.invocation_epoch=UINT64_MAX;status={entry}((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),&result);
+  if(status!=3U||result.start!=91U||result.end!=92U||preflight_calls!=0U||continue_calls!=0U||retire_calls!=1U||prepared.invocation_epoch!=UINT64_C(1))return 210;
   return 0;}}
 static int run_lazy_preflight_returns(void){{result_t result={{91U,92U}};if({mode}U==2U)return 0;reset_observations();preflight_status=1U;uint32_t status={entry}((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),&result);
-  if(status!=1U||result.start!=111U||result.end!=112U||preflight_calls!=1U||continue_calls!=0U||fallback_calls!=0U||object_ticket!=0U)return 220;
+  if(status!=1U||result.start!=111U||result.end!=112U||preflight_calls!=1U||continue_calls!=0U||fallback_calls!=0U||object_ticket!=0U||retire_calls!=0U||prepared.invocation_epoch!=UINT64_C(3))return 220;
   reset_observations();preflight_status=3U;result.start=91U;result.end=92U;status={entry}((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),&result);
-  if(status!=3U||result.start!=91U||result.end!=92U||preflight_calls!=1U||continue_calls!=0U||fallback_calls!=0U||object_ticket!=0U)return 221;
+  if(status!=3U||result.start!=91U||result.end!=92U||preflight_calls!=1U||continue_calls!=0U||fallback_calls!=0U||object_ticket!=0U||retire_calls!=0U||prepared.invocation_epoch!=UINT64_C(3))return 221;
   return 0;}}
-static int run_v4(void){{result_t result={{91U,92U}};reset_observations();init_v4();uint32_t status={entry}((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),&result);
+static int run_v4(void){{result_t result={{91U,92U}};reset_observations();init_v4();if({mode}U!=2U){{object_ticket=1U;ticket_epoch=prepared.invocation_epoch;}}uint32_t status={entry}((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),&result);
   if(preflight_calls!=1U)return 10;if(continue_calls!=1U)return 40+(int)status;if(fallback_calls!=0U)return 12;
+  if({mode}U!=2U&&stale_seen_at_preflight!=1U)return 15;if(retire_calls!=0U||prepared.invocation_epoch!=UINT64_C({final_epoch}))return 16;
   if(observed_cursor==0U||observed_cursor>=sizeof(haystack))return 13;if(helper_calls!=0U||helper_bad!=0U)return 14;
   if({mode}U==0U){{if(status!=1U||result.start!=0U||result.end!=0U||recovery_calls!=0U)return 20;}}
   else if({mode}U==1U){{if(status!=1U||result.start!=observed_cursor+1U||result.end!=observed_cursor+1U||recovery_calls!=0U)return 21;}}
@@ -51681,6 +52122,7 @@ static int run_v4(void){{result_t result={{91U,92U}};reset_observations();init_v
 static int run_loop(uint32_t format){{result_t result={{91U,92U}};reset_observations();init_loop(format);uint32_t status={entry}((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),&result);
   if(preflight_calls!=1U||continue_calls!=1U||fallback_calls!=0U||helper_calls!=1U||helper_bad!=0U)fprintf(stderr,"loop format=%u status=%u preflight=%u continue=%u fallback=%u helper=%u bad=%u cursor=%zu result=%zu,%zu\n",format,status,preflight_calls,continue_calls,fallback_calls,helper_calls,helper_bad,observed_cursor,result.start,result.end);
   if(preflight_calls!=1U)return 100+(int)format;if(continue_calls!=1U)return 120+(int)status;if(fallback_calls!=0U)return 130+(int)format;
+  if(retire_calls!=0U||prepared.invocation_epoch!=UINT64_C({final_epoch}))return 135+(int)format;
   if(observed_cursor==0U||observed_cursor>=sizeof(haystack))return 140+(int)format;if(helper_calls!=1U||helper_bad!=0U)return 145+(int)format;
   if({mode}U==0U){{if(status!=0U||result.start!=0U||result.end!=0U||recovery_calls!=0U)return 150+(int)format;}}
   else if({mode}U==1U){{if(status!=1U||result.start!=observed_cursor||result.end!=observed_cursor||recovery_calls!=0U)return 160+(int)format;}}
@@ -51688,13 +52130,17 @@ static int run_loop(uint32_t format){{result_t result={{91U,92U}};reset_observat
     result.start=91U;result.end=92U;if(fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_recover_span_v2((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),&result,identity,observed_cursor)!=94U||result.start!=91U||result.end!=92U)return 175+(int)format;}}
   if(object_ticket!=0U||span_postflight_ticket!=0U)return 180+(int)format;
   return 0;}}
-int main(void){{int status=run_deferred_guards();if(status!=0)return status;status=run_lazy_preflight_returns();if(status!=0)return status;status=run_v4();if(status!=0)return status;status=run_loop(6U);if(status!=0)return status;return run_loop(7U);}}
+static int run_resume_overflow(void){{result_t result={{91U,92U}};if({mode}U==2U)return 0;reset_observations();init_v4();prepared.invocation_epoch=UINT64_MAX-UINT64_C(1);uint32_t status={entry}((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),&result);
+  if(status!=1U||preflight_calls!=1U||continue_calls!=1U||fallback_calls!=0U||retire_calls!=1U||prepared.invocation_epoch!=UINT64_C(1)||object_ticket!=0U||span_postflight_ticket!=0U)return 230;
+  return 0;}}
+int main(void){{int status=run_deferred_guards();if(status!=0)return status;status=run_lazy_preflight_returns();if(status!=0)return status;status=run_v4();if(status!=0)return status;status=run_resume_overflow();if(status!=0)return status;status=run_loop(6U);if(status!=0)return status;return run_loop(7U);}}
 "##,
                 v1_bytes = FROZEN_PREPARED_HEADER_V4_DYNAMIC_ROWS_OFFSET,
                 tail_offset = FROZEN_PREPARED_HEADER_V4_DYNAMIC_ROWS_OFFSET,
                 v4_bytes = FROZEN_PREPARED_HEADER_V4_BYTES,
                 v6_bytes = FROZEN_PREPARED_HEADER_V6_BYTES,
                 second_offset = FROZEN_PREPARED_HEADER_V6_BYTES,
+                epoch_offset = STATIC_PREFIX_INVOCATION_EPOCH_OFFSET,
                 slot_bytes = FROZEN_PREPARED_HEADER_V6_BYTES,
                 loop_plan_bytes = FROZEN_COMPACT_LOOP_PLAN_V1_BYTES,
                 loop_plans_offset = FROZEN_DYNAMIC_ROWS_V6_LOOP_PLANS_OFFSET,
@@ -51715,6 +52161,7 @@ int main(void){{int status=run_deferred_guards();if(status!=0)return status;stat
                 v6_format = FROZEN_DYNAMIC_ROWS_V6_FORMAT_VERSION,
                 v7_format = FROZEN_DYNAMIC_ROWS_V7_FORMAT_VERSION,
                 mode = expected_mode,
+                final_epoch = if expected_mode == 2 { 2 } else { 3 },
             );
             let c_path = directory.join("resume-v4.c");
             let executable = directory.join("resume-v4");
@@ -51744,6 +52191,301 @@ int main(void){{int status=run_deferred_guards();if(status!=0)return status;stat
                 String::from_utf8_lossy(&result.stderr)
             );
             fs::remove_dir_all(&directory).expect("remove forged-V4 linker directory");
+        }
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    #[ignore = "links controlled eager/deferred static-prefix wrappers to fixed terminal native cores"]
+    fn linked_host_static_prefix_direct_terminals_invalidate_ticket_epochs() {
+        use std::{fs, process::Command, time::SystemTime};
+
+        let mut target = if cfg!(target_arch = "x86_64") {
+            if cfg!(target_os = "linux") {
+                Target::x86_64_linux()
+            } else {
+                Target::x86_64_macos()
+            }
+        } else if cfg!(target_os = "linux") {
+            Target::aarch64_linux()
+        } else {
+            Target::aarch64_macos()
+        };
+        if cfg!(target_arch = "aarch64") {
+            target = target
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                .unwrap();
+        }
+
+        let identity = core::array::from_fn::<_, 32, _>(|index| {
+            u8::try_from(index + 17).unwrap()
+        });
+        for (name, output, defer_preflight, core_status) in [
+            ("deferred-no-match", OutputContract::Exists, true, 0_u32),
+            ("deferred-match", OutputContract::Exists, true, 1),
+            ("deferred-exact-span", OutputContract::Span, true, 1),
+            ("eager-no-match", OutputContract::Exists, false, 0),
+            ("eager-match", OutputContract::Exists, false, 1),
+        ] {
+            let wrapper = match target.architecture {
+                Architecture::X86_64 => lower_x86_64_static_prefix_prepared_wrapper(
+                    output,
+                    false,
+                    Some(0),
+                    defer_preflight,
+                ),
+                Architecture::Aarch64 => lower_aarch64_static_prefix_prepared_wrapper(
+                    output,
+                    false,
+                    Some(0),
+                    defer_preflight,
+                ),
+            }
+            .unwrap_or_else(|error| panic!("lower {name} wrapper: {error}"));
+            assert!(wrapper.relocations.iter().any(|relocation| {
+                relocation.symbol == STATIC_PREFIX_RETIRE_RUNTIME_SYMBOL
+            }));
+
+            let mut code = wrapper.code;
+            let alignment_mask = if target.architecture == Architecture::X86_64 {
+                15
+            } else {
+                3
+            };
+            let core_offset = code
+                .len()
+                .checked_add(alignment_mask)
+                .unwrap()
+                & !alignment_mask;
+            match target.architecture {
+                Architecture::X86_64 => {
+                    code.resize(core_offset, 0x90);
+                    patch_x86_64_local_call(
+                        &mut code,
+                        wrapper.core_call_offset,
+                        core_offset,
+                    )
+                    .unwrap();
+                    // The exact-width Span case consumes these endpoints;
+                    // Exists ignores them. Both status paths remain fixed and
+                    // independent of the C harness.
+                    code.extend_from_slice(&[
+                        0x49, 0xc7, 0xc2, 3, 0, 0, 0, // r10 = start
+                        0x49, 0xc7, 0xc3, 7, 0, 0, 0, // r11 = end
+                        0xb8,
+                        u8::try_from(core_status).unwrap(),
+                        0,
+                        0,
+                        0,
+                        0xc3,
+                    ]);
+                }
+                Architecture::Aarch64 => {
+                    while code.len() < core_offset {
+                        code.extend_from_slice(&0xd503_201f_u32.to_le_bytes());
+                    }
+                    patch_aarch64_local_call(
+                        &mut code,
+                        wrapper.core_call_offset,
+                        core_offset,
+                    )
+                    .unwrap();
+                    for instruction in [
+                        aarch64_movz_x(6, 3, 0).unwrap(),
+                        aarch64_movz_x(7, 7, 0).unwrap(),
+                        aarch64_movz_w(0, u16::try_from(core_status).unwrap()).unwrap(),
+                        0xd65f_03c0,
+                    ] {
+                        code.extend_from_slice(&instruction.to_le_bytes());
+                    }
+                }
+            }
+
+            const DESCRIPTOR_OFFSET: usize = 32;
+            let mut data = identity.to_vec();
+            data.resize(DESCRIPTOR_OFFSET + 16, 0);
+            let mut symbols = (0..=STATIC_PREFIX_RETIRE_RUNTIME_SYMBOL)
+                .map(|index| ModuleSymbol {
+                    name: format!("fre_test_terminal_unused_{index}"),
+                    binding: SymbolBinding::Global,
+                    kind: SymbolKind::Function,
+                    section: None,
+                    offset: 0,
+                    size: 0,
+                })
+                .collect::<Vec<_>>();
+            symbols[PREPARED_ENTRY_SYMBOL] = ModuleSymbol {
+                name: "fre_test_static_prefix_terminal_entry".to_owned(),
+                binding: SymbolBinding::Global,
+                kind: SymbolKind::Function,
+                section: Some(TEXT_SECTION),
+                offset: 0,
+                size: u64::try_from(code.len()).unwrap(),
+            };
+            symbols[PARTIAL_TABLE_SYMBOL] = ModuleSymbol {
+                name: "fre_test_static_prefix_descriptor".to_owned(),
+                binding: SymbolBinding::Global,
+                kind: SymbolKind::Object,
+                section: Some(PROGRAM_SECTION),
+                offset: u64::try_from(DESCRIPTOR_OFFSET).unwrap(),
+                size: 16,
+            };
+            symbols[PARTIAL_IDENTITY_SYMBOL] = ModuleSymbol {
+                name: "fre_test_static_prefix_terminal_identity".to_owned(),
+                binding: SymbolBinding::Global,
+                kind: SymbolKind::Object,
+                section: Some(PROGRAM_SECTION),
+                offset: 0,
+                size: 32,
+            };
+            symbols[PARTIAL_NATIVE_CORE_SYMBOL] = ModuleSymbol {
+                name: ".Lfre_test_static_prefix_terminal_core".to_owned(),
+                binding: SymbolBinding::Local,
+                kind: SymbolKind::Function,
+                section: Some(TEXT_SECTION),
+                offset: u64::try_from(core_offset).unwrap(),
+                size: u64::try_from(code.len() - core_offset).unwrap(),
+            };
+            symbols[PARTIAL_RUNTIME_SYMBOL].name =
+                SLOW_PREFIX_CONTINUE_RUNTIME_SYMBOL_NAME.to_owned();
+            symbols[PREPARED_FALLBACK_RUNTIME_SYMBOL].name =
+                PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME.to_owned();
+            symbols[PREPARED_PREFLIGHT_RUNTIME_SYMBOL].name =
+                SLOW_PREFIX_PREFLIGHT_RUNTIME_SYMBOL_NAME.to_owned();
+            symbols[STATIC_PREFIX_RETIRE_RUNTIME_SYMBOL].name =
+                STATIC_PREFIX_RETIRE_RUNTIME_SYMBOL_NAME.to_owned();
+            let module = CompiledModule {
+                target,
+                sections: vec![
+                    ModuleSection {
+                        name: ".text",
+                        kind: SectionKind::Text,
+                        alignment: if target.architecture == Architecture::X86_64 {
+                            16
+                        } else {
+                            4
+                        },
+                        data: code.into_boxed_slice(),
+                    },
+                    ModuleSection {
+                        name: ".rodata.fre.regex",
+                        kind: SectionKind::ReadOnlyData,
+                        alignment: 16,
+                        data: data.into_boxed_slice(),
+                    },
+                ]
+                .into_boxed_slice(),
+                symbols: symbols.into_boxed_slice(),
+                relocations: wrapper.relocations.into_boxed_slice(),
+                entry_symbol_index: PREPARED_ENTRY_SYMBOL,
+                prepared_entry_symbol_index: Some(PREPARED_ENTRY_SYMBOL),
+                runtime_symbol_index: None,
+                runtime_program_symbol_index: None,
+                start_accelerator: StartAccelerator::None,
+                anchored_prefix_filter_bytes: 0,
+                slow_aot_report: None,
+                slow_context_aot_report: None,
+                slow_retained_forward_minimized: false,
+            };
+
+            let nonce = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos();
+            let directory = std::env::temp_dir().join(format!(
+                "fre-aot-static-terminal-{}-{name}-{nonce}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&directory).expect("create terminal linker directory");
+            let object = directory.join("terminal.o");
+            fs::write(
+                &object,
+                emit_object(&module, ObjectFormat::for_target(target), usize::MAX)
+                    .expect("emit terminal wrapper object"),
+            )
+            .expect("write terminal wrapper object");
+
+            let expected_start = if output == OutputContract::Span && core_status == 1 {
+                3
+            } else {
+                0
+            };
+            let expected_end = if output == OutputContract::Span && core_status == 1 {
+                7
+            } else {
+                0
+            };
+            let source = format!(
+                r##"#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+typedef void *handle_t;
+typedef struct {{size_t start;size_t end;}} result_t;
+typedef struct {{unsigned char headers[{epoch_offset}U];uint64_t invocation_epoch;}} prepared_t;
+_Static_assert(offsetof(prepared_t,invocation_epoch)=={epoch_offset}U,"epoch offset");
+extern uint32_t fre_test_static_prefix_terminal_entry(handle_t,const unsigned char*,size_t,size_t,size_t,result_t*);
+extern const unsigned char fre_test_static_prefix_terminal_identity[];
+extern const uint32_t fre_test_static_prefix_descriptor[];
+static prepared_t prepared;static const unsigned char haystack[{haystack_len}U]={{0}};
+static unsigned preflight_calls,continue_calls,recovery_calls,fallback_calls,retire_calls;
+static unsigned object_ticket,postflight_ticket;static uint64_t object_epoch,postflight_epoch;
+static void reset(uint64_t epoch){{memset(&prepared,0,sizeof(prepared));memcpy(prepared.headers+{identity_offset}U,fre_test_static_prefix_terminal_identity,32U);prepared.invocation_epoch=epoch;preflight_calls=continue_calls=recovery_calls=fallback_calls=retire_calls=0U;object_ticket=postflight_ticket=0U;object_epoch=postflight_epoch=0U;}}
+uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_preflight_v2(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,const uint32_t*d){{(void)r;preflight_calls++;if(h!=(handle_t)&prepared||p!=haystack||n!=sizeof(haystack)||s!=0U||e!=n||i!=fre_test_static_prefix_terminal_identity||d!=fre_test_static_prefix_descriptor)return 96U;object_ticket=1U;postflight_ticket=0U;object_epoch=prepared.invocation_epoch;return 6U;}}
+uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_continue_v1(handle_t h,const unsigned char*p,size_t n,result_t*r,size_t state,size_t position,size_t pending){{(void)r;(void)state;(void)position;(void)pending;continue_calls++;unsigned valid=h==(handle_t)&prepared&&p==haystack&&n==sizeof(haystack)&&object_ticket==1U&&object_epoch==prepared.invocation_epoch;object_ticket=0U;return valid?97U:3U;}}
+uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_recover_span_v2(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,size_t selected){{(void)r;(void)selected;recovery_calls++;unsigned valid=h==(handle_t)&prepared&&p==haystack&&n==sizeof(haystack)&&s==0U&&e==n&&i==fre_test_static_prefix_terminal_identity&&postflight_ticket==1U&&postflight_epoch==prepared.invocation_epoch;postflight_ticket=0U;return valid?97U:3U;}}
+uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_retire_v1(handle_t h,uint32_t status){{retire_calls++;if(h!=(handle_t)&prepared)return 5U;object_ticket=postflight_ticket=0U;prepared.invocation_epoch=prepared.invocation_epoch==UINT64_MAX?UINT64_C(1):prepared.invocation_epoch+UINT64_C(1);switch(status){{case 0U:case 1U:case 2U:case 3U:case 5U:return status;default:return 3U;}}}}
+uint32_t fre_aot_regex_runtime_search_exclusive_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;fallback_calls++;return 93U;}}
+static int check_result(result_t r){{return r.start=={expected_start}U&&r.end=={expected_end}U;}}
+int main(void){{result_t result={{91U,92U}};reset(UINT64_C(1));if({deferred}U){{object_ticket=1U;object_epoch=prepared.invocation_epoch;}}uint32_t status=fre_test_static_prefix_terminal_entry((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),&result);
+  if(status!={core_status}U||!check_result(result)||preflight_calls!={eager}U||fallback_calls!=0U||retire_calls!=0U||prepared.invocation_epoch!=UINT64_C(2)||object_ticket!=1U)return 10;
+  if(fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_continue_v1((handle_t)&prepared,haystack,sizeof(haystack),&result,0U,1U,0U)!=3U||object_ticket!=0U)return 11;
+  if({deferred}U){{reset(UINT64_C(1));postflight_ticket=1U;postflight_epoch=prepared.invocation_epoch;result.start=91U;result.end=92U;status=fre_test_static_prefix_terminal_entry((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),&result);
+    if(status!={core_status}U||!check_result(result)||postflight_ticket!=1U||prepared.invocation_epoch!=UINT64_C(2)||retire_calls!=0U)return 12;
+    if(fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_recover_span_v2((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),&result,fre_test_static_prefix_terminal_identity,7U)!=3U||postflight_ticket!=0U)return 13;}}
+  reset(UINT64_MAX);result.start=91U;result.end=92U;status=fre_test_static_prefix_terminal_entry((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),&result);
+  if(status!=3U||result.start!=91U||result.end!=92U||preflight_calls!={eager}U||fallback_calls!=0U||retire_calls!=1U||prepared.invocation_epoch!=UINT64_C(1)||object_ticket!=0U||postflight_ticket!=0U)return 14;
+  return 0;}}
+"##,
+                epoch_offset = STATIC_PREFIX_INVOCATION_EPOCH_OFFSET,
+                haystack_len = PARTIAL_DFA_MIN_INPUT_BYTES + 64,
+                identity_offset = FROZEN_PREPARED_HEADER_V1_ARTIFACT_IDENTITY_OFFSET,
+                expected_start = expected_start,
+                expected_end = expected_end,
+                deferred = usize::from(defer_preflight),
+                eager = usize::from(!defer_preflight),
+                core_status = core_status,
+            );
+            let c_path = directory.join("terminal.c");
+            let executable = directory.join("terminal");
+            fs::write(&c_path, source).expect("write terminal C harness");
+            let c_compiler = if cfg!(target_os = "macos") {
+                "clang"
+            } else {
+                "cc"
+            };
+            let status = Command::new(c_compiler)
+                .arg("-O0")
+                .arg(&c_path)
+                .arg(&object)
+                .arg("-o")
+                .arg(&executable)
+                .status()
+                .expect("link terminal epoch harness");
+            assert!(status.success(), "terminal harness failed to link: {name}");
+            let result = Command::new(&executable)
+                .output()
+                .expect("execute terminal epoch harness");
+            assert!(
+                result.status.success(),
+                "{name} status={:?} stdout={} stderr={}",
+                result.status.code(),
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            fs::remove_dir_all(&directory).expect("remove terminal linker directory");
         }
     }
 

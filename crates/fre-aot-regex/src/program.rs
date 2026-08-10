@@ -3387,6 +3387,13 @@ pub const FROZEN_PREPARED_HEADER_V6_DYNAMIC_ROWS_OFFSET: usize =
 /// Exact target-native extent of the V6/V7 maximum envelope.
 #[doc(hidden)]
 pub const FROZEN_PREPARED_HEADER_V6_BYTES: usize = std::mem::size_of::<FrozenPreparedHeaderV6>();
+/// Byte offset, from an exclusive prepared owner, of the mutable generation
+/// that invalidates compiler-private static-prefix tickets. Two immutable V6
+/// header envelopes remain the exact offset-zero public and continuation
+/// prefixes; the generation word follows both without changing either ABI.
+#[doc(hidden)]
+pub const STATIC_PREFIX_INVOCATION_EPOCH_OFFSET: usize =
+    FROZEN_PREPARED_HEADER_V6_BYTES * 2;
 /// V7 shares the V6 maximum envelope.
 #[doc(hidden)]
 pub const FROZEN_PREPARED_HEADER_V7_DYNAMIC_ROWS_OFFSET: usize =
