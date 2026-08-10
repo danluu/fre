@@ -18,6 +18,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{
     CompileMode,
+    absolute_anchored_cut::{
+        AbsoluteAnchoredBounds, AbsoluteAnchoredCutLimits, RelaxedAbsoluteAnchoredPlan,
+        relax_absolute_anchored_cuts,
+    },
     bit_parallel_exists::{
         BitParallelExists, BitParallelExistsStats, NativeBitParallelExistsView,
     },
@@ -7416,6 +7420,50 @@ pub(crate) struct NativeSlowDfaProgram {
     first_observable_hole_bytes: Option<usize>,
 }
 
+/// Complete assertion-free DFA produced from edge-specific absolute cuts.
+///
+/// This is transient slow-AOT IR. The stable program retains its original
+/// assertion graph, while native entry lowering enforces `bounds` against the
+/// original public `SearchWindow` before it may execute this relaxed machine.
+#[derive(Debug)]
+pub(crate) struct NativeExactAbsoluteAnchoredProgram {
+    relaxed: RelaxedAbsoluteAnchoredPlan,
+    machine: OrderedDfa,
+    width: usize,
+    anchored_prefix: AnchoredPrefix,
+    anchored_suffix: AnchoredSuffix,
+    required_literals: RequiredLiterals,
+    report: DeterminizationReport,
+    allocation_bytes: usize,
+}
+
+impl NativeExactAbsoluteAnchoredProgram {
+    pub(crate) const fn bounds(&self) -> AbsoluteAnchoredBounds {
+        self.relaxed.bounds
+    }
+
+    pub(crate) const fn report(&self) -> &DeterminizationReport {
+        &self.report
+    }
+
+    pub(crate) const fn width(&self) -> usize {
+        self.width
+    }
+
+    pub(crate) fn stats(&self) -> DfaStats {
+        self.machine.stats()
+    }
+
+    pub(crate) const fn allocation_bytes(&self) -> usize {
+        self.allocation_bytes
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn proof_work(&self) -> u64 {
+        self.relaxed.proof_work
+    }
+}
+
 /// Owned target-neutral result of explicitly bounded slow contextual
 /// determinization.
 ///
@@ -8614,6 +8662,106 @@ impl CompiledProgram {
             retained_prefix_requirement,
             retained_suffix_requirement,
         })
+    }
+
+    /// Build a complete assertion-free DFA after discharging graph-proved
+    /// absolute assertion cuts for one exact-width match candidate.
+    ///
+    /// The original semantic graph is immutable. The owned candidate contains
+    /// a fallible clone in which only proved first-start/last-end edge indices
+    /// (plus topologically unproductive assertions) became epsilon edges.
+    /// Native lowering must enforce the returned absolute bounds against the
+    /// unmodified public window before entering its ordinary direct DFA.
+    pub(crate) fn native_exact_absolute_anchored_program(
+        &self,
+        limits: DeterminizeLimits,
+        max_allocation_bytes: usize,
+    ) -> Result<Option<NativeExactAbsoluteAnchoredProgram>, CompileError> {
+        let Some(width) = self.exact_match_width else {
+            return Ok(None);
+        };
+        if !self.automaton.stats().has_assertions() {
+            return Ok(None);
+        }
+        let Some(relaxed) = relax_absolute_anchored_cuts(
+            &self.raw,
+            AbsoluteAnchoredCutLimits {
+                max_work: limits.max_work,
+                max_allocation_bytes,
+            },
+        ) else {
+            return Ok(None);
+        };
+        let Some(determinize_allocation_bytes) =
+            max_allocation_bytes.checked_sub(relaxed.allocation_bytes)
+        else {
+            return Ok(None);
+        };
+        // Exact width recovers Span starts arithmetically, so no reverse
+        // machine is needed for any output contract, including W=0.
+        let (outcome, allocation_bytes) = dfa::determinize_for_output_with_allocation_limit(
+            &relaxed.raw,
+            self.output,
+            false,
+            limits,
+            determinize_allocation_bytes,
+        )?;
+        let DeterminizeOutcome::Complete { machine, report } = outcome else {
+            return Ok(None);
+        };
+        let allocation_bytes = relaxed
+            .allocation_bytes
+            .checked_add(allocation_bytes)
+            .ok_or(CompileError::InternalInvariant(
+                "absolute-anchor candidate allocation accounting overflowed",
+            ))?;
+        if allocation_bytes > max_allocation_bytes {
+            return Err(CompileError::InternalInvariant(
+                "absolute-anchor candidate exceeded its allocation limit",
+            ));
+        }
+        let anchored_prefix = derive_anchored_prefix(&relaxed.raw);
+        let anchored_suffix = derive_anchored_suffix(&relaxed.raw);
+        let required_literals = required_literals::derive(&relaxed.raw);
+        if derive_exact_match_width(&relaxed.raw) != Some(width) {
+            return Err(CompileError::InternalInvariant(
+                "absolute assertion relaxation changed exact match width",
+            ));
+        }
+        Ok(Some(NativeExactAbsoluteAnchoredProgram {
+            relaxed,
+            machine,
+            width,
+            anchored_prefix,
+            anchored_suffix,
+            required_literals,
+            report,
+            allocation_bytes,
+        }))
+    }
+
+    pub(crate) fn native_exact_absolute_anchored_view<'a>(
+        &'a self,
+        candidate: &'a NativeExactAbsoluteAnchoredProgram,
+    ) -> NativeProgramView<'a> {
+        let width = self
+            .exact_match_width
+            .expect("an exact absolute anchored candidate retains its width");
+        NativeProgramView {
+            output: self.output,
+            raw: &candidate.relaxed.raw,
+            dfa: candidate.machine.native_view(),
+            partial_discovered_states: None,
+            collapse_partial_holes: false,
+            anchored_prefix: &candidate.anchored_prefix,
+            anchored_suffix: &candidate.anchored_suffix,
+            required_literals: &candidate.required_literals,
+            exact_match_width: Some(width),
+            max_match_width: Some(width),
+            exact_product_width: None,
+            retained_prefix_requirement: None,
+            retained_suffix_requirement: None,
+        }
     }
 
     /// Re-run complete contextual determinization for an explicitly selected
@@ -24893,6 +25041,115 @@ mod tests {
         assert_eq!(
             restored_module.start_accelerator(),
             crate::StartAccelerator::X86Avx2
+        );
+    }
+
+    #[test]
+    fn exact_absolute_anchor_candidate_is_structural_bounded_and_restorable() {
+        let cases = [
+            (r"\A(?:ab|ac)", true, false, 2_usize),
+            (r"(?:ab|ac)\z", false, true, 2),
+            (r"\A(?:ab|ac)\z", true, true, 2),
+            (r"\A", true, false, 0),
+            (r"\z", false, true, 0),
+            (r"\A\z", true, true, 0),
+        ];
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            for (pattern, requires_start, requires_end, width) in cases {
+                let fast = program(
+                    pattern,
+                    output,
+                    CompileMode::Fast,
+                    DeterminizeLimits::default(),
+                );
+                let candidate = fast
+                    .native_exact_absolute_anchored_program(
+                        DeterminizeLimits::default(),
+                        16 * 1024 * 1024,
+                    )
+                    .unwrap_or_else(|error| panic!("{pattern:?} {output:?}: {error}"))
+                    .unwrap_or_else(|| panic!("missing {pattern:?} {output:?}"));
+                assert_eq!(candidate.width(), width, "{pattern:?} {output:?}");
+                assert_eq!(
+                    candidate.bounds(),
+                    AbsoluteAnchoredBounds {
+                        requires_start,
+                        requires_end,
+                    },
+                    "{pattern:?} {output:?}"
+                );
+                assert!(candidate.proof_work() != 0, "{pattern:?} {output:?}");
+                assert!(candidate.allocation_bytes() != 0, "{pattern:?} {output:?}");
+                let view = fast.native_exact_absolute_anchored_view(&candidate);
+                assert_eq!(view.exact_match_width, Some(width));
+                assert!(view.dfa.reverse_cells.is_empty());
+                assert!(view.raw.edge_kinds.iter().all(|&kind| {
+                    !matches!(
+                        kind,
+                        EdgeKind::AssertHaystackStart | EdgeKind::AssertHaystackEnd
+                    )
+                }));
+
+                let restored =
+                    CompiledProgram::deserialize(&fast.serialize().unwrap()).unwrap();
+                let restored_candidate = restored
+                    .native_exact_absolute_anchored_program(
+                        DeterminizeLimits::default(),
+                        16 * 1024 * 1024,
+                    )
+                    .unwrap()
+                    .expect("restored exact absolute candidate");
+                assert_eq!(restored_candidate.bounds(), candidate.bounds());
+                assert_eq!(restored_candidate.width(), candidate.width());
+                assert_eq!(restored_candidate.stats(), candidate.stats());
+            }
+        }
+
+        for pattern in [r"\Aa(?-u:\b)", r"(?:\Aab|ac)", r"(?:a|bb)\z", r"\A(?:a|bb)\z"] {
+            let fast = program(
+                pattern,
+                OutputContract::Span,
+                CompileMode::Fast,
+                DeterminizeLimits::default(),
+            );
+            assert!(
+                fast.native_exact_absolute_anchored_program(
+                    DeterminizeLimits::default(),
+                    16 * 1024 * 1024,
+                )
+                .unwrap()
+                .is_none(),
+                "unsupported proof escaped for {pattern:?}"
+            );
+        }
+
+        let bounded = program(
+            r"\A(?:ab|ac)",
+            OutputContract::Exists,
+            CompileMode::Fast,
+            DeterminizeLimits::default(),
+        );
+        assert!(
+            bounded
+                .native_exact_absolute_anchored_program(DeterminizeLimits::default(), 0)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            bounded
+                .native_exact_absolute_anchored_program(
+                    DeterminizeLimits {
+                        max_work: 0,
+                        ..DeterminizeLimits::default()
+                    },
+                    usize::MAX,
+                )
+                .unwrap()
+                .is_none()
         );
     }
 

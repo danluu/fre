@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     CompileError, DeterminizationReport, DeterminizeLimits, DfaStats, ObjectError,
+    absolute_anchored_cut::AbsoluteAnchoredBounds,
     bit_parallel_exists::NativeBitParallelExistsView,
     bounded_suffix_retry::{
         BoundedSuffixRetryPlan, select_bounded_interior_retry, select_bounded_suffix_retry,
@@ -127,8 +128,9 @@ use crate::{
         FROZEN_PREPARED_HEADER_V14_READY_SEAL,
         MAX_ANCHORED_PREFIX_BYTES, NativeContextProgramView,
         NativeDynamicRootRequirement, NativeDynamicRowsProgramView, NativePartialProgramView,
-        NativeProgramView, NativeRetainedPrefixRequirement, NativeRetainedSuffixRequirement,
-        NativeSlowResumeView, OutputContract, PARTIAL_DFA_MIN_INPUT_BYTES,
+        NativeExactAbsoluteAnchoredProgram, NativeProgramView, NativeRetainedPrefixRequirement,
+        NativeRetainedSuffixRequirement, NativeSlowResumeView, OutputContract,
+        PARTIAL_DFA_MIN_INPUT_BYTES,
         STATIC_PREFIX_RESUME_DESCRIPTOR_V1_HEADER_BYTES,
         STATIC_PREFIX_RESUME_DESCRIPTOR_V1_MAGIC,
         STATIC_PREFIX_RESUME_DESCRIPTOR_V1_MAX_BYTES,
@@ -708,7 +710,36 @@ impl Aarch64DynamicScannerPlan {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NativeDfaEntryContract {
     Public,
+    /// Public ABI entry whose graph proof reduces the search to one exact
+    /// absolute-boundary candidate. The prologue validates the untouched
+    /// window, applies these bounds, and enters the initial DFA row directly
+    /// instead of running any moving root scanner.
+    ExactAbsoluteAnchored {
+        bounds: AbsoluteAnchoredBounds,
+        width: u64,
+    },
     PreparedPartialCore,
+}
+
+impl NativeDfaEntryContract {
+    const fn validates_public_args(self) -> bool {
+        !matches!(self, Self::PreparedPartialCore)
+    }
+
+    const fn register_outcome(self) -> bool {
+        matches!(self, Self::PreparedPartialCore)
+    }
+
+    const fn fixed_candidate(self) -> bool {
+        matches!(self, Self::ExactAbsoluteAnchored { .. })
+    }
+
+    const fn exact_absolute_anchored(self) -> Option<(AbsoluteAnchoredBounds, u64)> {
+        match self {
+            Self::ExactAbsoluteAnchored { bounds, width } => Some((bounds, width)),
+            Self::Public | Self::PreparedPartialCore => None,
+        }
+    }
 }
 
 impl NativeScannerEmission {
@@ -1243,12 +1274,48 @@ impl CompiledModule {
             .map_err(CompileError::from);
         }
 
-        let slow_context = program.native_slow_context_program(
+        let absolute_anchored = program.native_exact_absolute_anchored_program(
             requested_limits.determinize,
             requested_limits.max_allocation_bytes,
         )?;
+        let mut slow_aot_report = None;
         let mut slow_context_aot_report = None;
-        let mut optional_lowering = if let Some(candidate) = slow_context.as_ref() {
+        let mut optional_lowering = if let Some(candidate) = absolute_anchored.as_ref() {
+            let view = program.native_exact_absolute_anchored_view(candidate);
+            match lower_optional_native_exact_absolute_anchored_dfa_with_data_limit(
+                view,
+                candidate,
+                target,
+                effective_native_data_limit_bytes,
+            ) {
+                Ok(Some(lowering)) => {
+                    slow_aot_report = Some(SlowAotReport {
+                        requested_limits,
+                        effective_native_data_limit_bytes,
+                        determinization: candidate.report().clone(),
+                        dfa: candidate.stats(),
+                        allocation_bytes: candidate.allocation_bytes(),
+                        native_data_bytes: lowering.data.len(),
+                    });
+                    Some(lowering)
+                }
+                Ok(None) => None,
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            None
+        };
+        let slow_context = if optional_lowering.is_none() {
+            program.native_slow_context_program(
+                requested_limits.determinize,
+                requested_limits.max_allocation_bytes,
+            )?
+        } else {
+            None
+        };
+        if optional_lowering.is_none()
+            && let Some(candidate) = slow_context.as_ref()
+        {
             let view = program.native_slow_context_view(candidate);
             match module_context::lower_native_context_with_data_limit(
                 view,
@@ -1265,14 +1332,12 @@ impl CompiledModule {
                         work_completed: candidate.work_completed(),
                         native_data_bytes: lowering.data.len(),
                     });
-                    Some(lowering)
+                    optional_lowering = Some(lowering);
                 }
-                Ok(None) => None,
+                Ok(None) => {}
                 Err(error) => return Err(error.into()),
             }
-        } else {
-            None
-        };
+        }
         let mut optional_prepared_layout = None;
         let mut complete_k0 = None;
 
@@ -1284,7 +1349,6 @@ impl CompiledModule {
         } else {
             None
         };
-        let mut slow_aot_report = None;
         let mut slow_retained_forward_minimized = false;
         if optional_lowering.is_none() {
             if let Some(candidate) = slow_determinized.as_ref() {
@@ -7776,6 +7840,39 @@ fn lower_optional_native_dfa_with_data_limit(
     ))
 }
 
+/// Lower one exact graph-proved absolute-boundary candidate. Resource
+/// pressure declines transactionally; malformed proof/lowering state remains
+/// a hard compiler error.
+fn lower_optional_native_exact_absolute_anchored_dfa_with_data_limit(
+    view: NativeProgramView<'_>,
+    candidate: &NativeExactAbsoluteAnchoredProgram,
+    target: Target,
+    max_native_data_bytes: usize,
+) -> Result<Option<NativeLowering>, ObjectError> {
+    let width = u64::try_from(candidate.width())
+        .map_err(|_| ObjectError::ArithmeticOverflow("absolute-anchor exact width"))?;
+    let bounds = candidate.bounds();
+    if !bounds.requires_start && !bounds.requires_end {
+        return Err(ObjectError::InvalidModule(
+            "absolute-anchor entry has no absolute bound",
+        ));
+    }
+    if view.exact_match_width != Some(candidate.width())
+        || view.partial_discovered_states.is_some()
+        || view.collapse_partial_holes
+    {
+        return Err(ObjectError::InvalidModule(
+            "absolute-anchor entry has inconsistent exact DFA input",
+        ));
+    }
+    optional_native_lowering_outcome(lower_native_dfa_with_entry_contract_and_data_limit(
+        view,
+        target,
+        NativeDfaEntryContract::ExactAbsoluteAnchored { bounds, width },
+        max_native_data_bytes,
+    ))
+}
+
 fn optional_native_lowering_outcome(
     outcome: Result<Option<NativeLowering>, ObjectError>,
 ) -> Result<Option<NativeLowering>, ObjectError> {
@@ -7851,7 +7948,7 @@ fn lower_native_dfa_with_entry_contract_and_data_limit(
             required: data.len(),
         });
     }
-    if entry_contract == NativeDfaEntryContract::PreparedPartialCore && layout.partial.is_none() {
+    if entry_contract.register_outcome() && layout.partial.is_none() {
         return Err(ObjectError::InvalidModule(
             "trusted prepared core has no partial continuation layout",
         ));
@@ -7861,7 +7958,8 @@ fn lower_native_dfa_with_entry_contract_and_data_limit(
             NativeDfaEntryContract::Public => {
                 lower_x86_64_dfa_with_emission(layout, target.features)?
             }
-            NativeDfaEntryContract::PreparedPartialCore => {
+            NativeDfaEntryContract::ExactAbsoluteAnchored { .. }
+            | NativeDfaEntryContract::PreparedPartialCore => {
                 lower_x86_64_dfa_with_entry_contract(layout, target.features, entry_contract)?
             }
         },
@@ -16232,6 +16330,7 @@ fn x86_emit_exact_start_probe(
     assembler: &mut X86Assembler,
     layout: NativeDfaLayout,
     kind: X86StartFilterKind,
+    require_large_window: bool,
     register_outcome: bool,
     failed: X86Label,
     matched: X86Label,
@@ -16260,10 +16359,13 @@ fn x86_emit_exact_start_probe(
 
     assembler.instruction(&[0x48, 0x89, 0xc8])?; // remaining = end
     assembler.instruction(&[0x48, 0x29, 0xd0])?; // remaining -= original start
-    let mut large_window = vec![0x48, 0x3d];
-    large_window.extend_from_slice(&u32::from(SUFFIX_PREFILTER_MIN_WINDOW_BYTES).to_le_bytes());
-    assembler.instruction(&large_window)?;
-    assembler.branch(&[0x0f, 0x82], failed)?;
+    if require_large_window {
+        let mut large_window = vec![0x48, 0x3d];
+        large_window
+            .extend_from_slice(&u32::from(SUFFIX_PREFILTER_MIN_WINDOW_BYTES).to_le_bytes());
+        assembler.instruction(&large_window)?;
+        assembler.branch(&[0x0f, 0x82], failed)?;
+    }
     assembler.instruction(&[0x48, 0x83, 0xf8, width])?;
     assembler.branch(&[0x0f, 0x82], failed)?;
     if let Some(block) = layout.prefix_block {
@@ -16307,6 +16409,55 @@ fn x86_emit_exact_start_probe(
         register_outcome,
         matched,
     )
+}
+
+/// Validate and narrow the untouched public x86 search window to the only
+/// candidate admitted by an exact-width absolute-boundary proof. `rsi`
+/// remains the original haystack length until this helper returns.
+fn x86_emit_exact_absolute_anchored_bounds(
+    assembler: &mut X86Assembler,
+    bounds: AbsoluteAnchoredBounds,
+    width: u64,
+    no_match: X86Label,
+) -> Result<(), ObjectError> {
+    if bounds.requires_start {
+        assembler.instruction(&[0x48, 0x85, 0xd2])?; // test window start
+        assembler.branch(&[0x0f, 0x85], no_match)?;
+    }
+    if bounds.requires_end {
+        assembler.instruction(&[0x48, 0x39, 0xf1])?; // end vs length
+        assembler.branch(&[0x0f, 0x85], no_match)?;
+    }
+    if !bounds.requires_start && !bounds.requires_end {
+        return Err(ObjectError::InvalidModule(
+            "x86 absolute-anchor entry has no bound",
+        ));
+    }
+
+    assembler.instruction(&[0x48, 0xb8])?; // movabs rax, width
+    push_bytes(&mut assembler.code, &width.to_le_bytes())?;
+    match (bounds.requires_start, bounds.requires_end) {
+        (true, true) => {
+            assembler.instruction(&[0x48, 0x39, 0xc6])?; // len vs width
+            assembler.branch(&[0x0f, 0x85], no_match)?;
+        }
+        (true, false) => {
+            assembler.instruction(&[0x48, 0x39, 0xc1])?; // end vs width
+            assembler.branch(&[0x0f, 0x82], no_match)?;
+            assembler.instruction(&[0x48, 0x89, 0xc1])?; // end = width
+        }
+        (false, true) => {
+            assembler.instruction(&[0x48, 0x39, 0xc6])?; // len vs width
+            assembler.branch(&[0x0f, 0x82], no_match)?;
+            assembler.instruction(&[0x49, 0x89, 0xf3])?; // start = len
+            assembler.instruction(&[0x49, 0x29, 0xc3])?; // start -= width
+            assembler.instruction(&[0x4c, 0x39, 0xda])?; // old start vs candidate
+            assembler.branch(&[0x0f, 0x87], no_match)?;
+            assembler.instruction(&[0x4c, 0x89, 0xda])?; // start = candidate
+        }
+        (false, false) => unreachable!("absolute-anchor entry has no bound"),
+    }
+    Ok(())
 }
 
 fn x86_emit_start_filter_range_vector_test(
@@ -16357,7 +16508,8 @@ fn lower_x86_64_dfa_with_entry_contract(
         ));
     }
     let mut assembler = X86Assembler::new();
-    let register_outcome = entry_contract == NativeDfaEntryContract::PreparedPartialCore;
+    let register_outcome = entry_contract.register_outcome();
+    let fixed_candidate = entry_contract.fixed_candidate();
     let scan = assembler.label()?;
     let scalar_scan = assembler.label()?;
     let scalar_transition = assembler.label()?;
@@ -16486,7 +16638,7 @@ fn lower_x86_64_dfa_with_entry_contract(
         assembler.instruction(&[0x41, 0x57])?; // push r15
     }
 
-    if entry_contract == NativeDfaEntryContract::Public {
+    if entry_contract.validates_public_args() {
         // Validate start <= end <= length before touching public result
         // memory. The prepared partial core receives the same facts from its
         // sole validated caller and authenticated exact-window preflight.
@@ -16503,21 +16655,26 @@ fn lower_x86_64_dfa_with_entry_contract(
         assembler.instruction(&[0x48, 0x85, 0xff])?; // test rdi, rdi
         assembler.branch(&[0x0f, 0x84], invalid)?;
     }
-    assembler.instruction(&[0x48, 0x89, 0xd6])?; // mov rsi, rdx (window start)
-    if entry_contract == NativeDfaEntryContract::Public {
+    if entry_contract.validates_public_args() {
         assembler.instruction(&[0x31, 0xc0])?;
         assembler.instruction(&[0x49, 0x89, 0x00])?;
         assembler.instruction(&[0x49, 0x89, 0x40, 0x08])?;
     }
+    if let Some((bounds, width)) = entry_contract.exact_absolute_anchored() {
+        x86_emit_exact_absolute_anchored_bounds(&mut assembler, bounds, width, no_match)?;
+    }
+    assembler.instruction(&[0x48, 0x89, 0xd6])?; // mov rsi, rdx (window start)
 
     // lea table(%rip), r9
     assembler.instruction(&[0x4c, 0x8d, 0x0d])?;
     let table_displacement_label = assembler.label()?;
     assembler.bind(table_displacement_label)?;
     push_bytes(&mut assembler.code, &[0; 4])?;
-    if layout.exact_prefix_match_width.is_some()
-        && (layout.suffix_filter.is_some() || use_exact_product_multicolumn_batch)
-    {
+    let probe_exact_product = layout.exact_prefix_match_width.is_some()
+        && (fixed_candidate
+            || layout.suffix_filter.is_some()
+            || use_exact_product_multicolumn_batch);
+    if probe_exact_product {
         let kind = filter_kind.ok_or(ObjectError::InvalidModule(
             "x86 exact-start prefix block has no instruction selection",
         ))?;
@@ -16525,13 +16682,16 @@ fn lower_x86_64_dfa_with_entry_contract(
             &mut assembler,
             layout,
             kind,
+            !fixed_candidate,
             register_outcome,
             exact_start_probe_failed,
             matched,
         )?;
         assembler.bind(exact_start_probe_failed)?;
     }
-    let adaptive_suffix_cold = if let Some(suffix) = layout.suffix_filter {
+    let adaptive_suffix_cold = if !fixed_candidate
+        && let Some(suffix) = layout.suffix_filter
+    {
         let kind = filter_kind.ok_or(ObjectError::InvalidModule(
             "x86 suffix filter has no instruction selection",
         ))?;
@@ -16543,7 +16703,9 @@ fn lower_x86_64_dfa_with_entry_contract(
         assembler.instruction(&[0x49, 0xc7, 0xc3, 0xff, 0xff, 0xff, 0xff])?; // r11 = none
     }
     x86_set_row(&mut assembler, layout.forward_offset)?;
-    if let (Some(filter), Some(kind)) = (layout.start_filter, filter_kind) {
+    if !fixed_candidate
+        && let (Some(filter), Some(kind)) = (layout.start_filter, filter_kind)
+    {
         if let Some(plan) = prefix_relation_vector {
             x86_emit_prefix_relation_constants(&mut assembler, plan, kind)?;
         } else if let Some(vector_filter) = vector_filter {
@@ -16561,7 +16723,7 @@ fn lower_x86_64_dfa_with_entry_contract(
         } else {
             x86_emit_start_filter_constants(&mut assembler, filter, kind, 1)?;
         }
-    } else if let Some(exact_vector_kind) = exact_vector_kind {
+    } else if !fixed_candidate && let Some(exact_vector_kind) = exact_vector_kind {
         let storage = layout.exact_start_storage.ok_or(ObjectError::InvalidModule(
             "x86 vector exact scanner has no canonical storage",
         ))?;
@@ -16577,6 +16739,13 @@ fn lower_x86_64_dfa_with_entry_contract(
                 assembler.branch(&[0xe9], finish)?;
             }
         }
+    }
+
+    if fixed_candidate {
+        // The public proof and exact-width narrowing admitted exactly this
+        // start. Enter the initial row directly; moving root/suffix scanners
+        // can only rediscover the same candidate and add setup overhead.
+        assembler.branch(&[0xe9], scalar_transition)?;
     }
 
     assembler.bind(scan)?;
@@ -17258,6 +17427,7 @@ fn lower_x86_64_dfa_with_entry_contract(
         assembler.instruction(&[0x41, 0x5c])?; // pop r12
     }
     if filter_kind.is_some_and(X86StartFilterKind::needs_vzeroupper)
+        && (!fixed_candidate || probe_exact_product && layout.prefix_block.is_some())
         || table_lookup_needs_vzeroupper
     {
         assembler.instruction(&[0xc5, 0xf8, 0x77])?;
@@ -25946,6 +26116,7 @@ fn aarch64_emit_exact_start_probe(
     assembler: &mut Aarch64Assembler,
     layout: NativeDfaLayout,
     use_prefix_block: bool,
+    require_large_window: bool,
     register_outcome: bool,
     failed: Aarch64Label,
     matched: Aarch64Label,
@@ -25973,8 +26144,10 @@ fn aarch64_emit_exact_start_probe(
     }
 
     assembler.instruction(aarch64_sub_x_reg(12, 3, 2)?)?;
-    assembler.instruction(aarch64_cmp_x_imm(12, SUFFIX_PREFILTER_MIN_WINDOW_BYTES)?)?;
-    assembler.branch_cond(AARCH64_LO, failed)?;
+    if require_large_window {
+        assembler.instruction(aarch64_cmp_x_imm(12, SUFFIX_PREFILTER_MIN_WINDOW_BYTES)?)?;
+        assembler.branch_cond(AARCH64_LO, failed)?;
+    }
     assembler.instruction(aarch64_cmp_x_imm(12, u16::from(width))?)?;
     assembler.branch_cond(AARCH64_LO, failed)?;
     if use_prefix_block && let Some(block) = layout.prefix_block {
@@ -26020,6 +26193,52 @@ fn aarch64_emit_exact_start_probe(
         register_outcome,
         matched,
     )
+}
+
+/// AArch64 counterpart of the exact absolute-boundary public prologue. The
+/// original haystack length remains in X1 while only X2/X3 are narrowed.
+fn aarch64_emit_exact_absolute_anchored_bounds(
+    assembler: &mut Aarch64Assembler,
+    bounds: AbsoluteAnchoredBounds,
+    width: u64,
+    no_match: Aarch64Label,
+) -> Result<(), ObjectError> {
+    if bounds.requires_start {
+        assembler.instruction(aarch64_cmp_x_imm(2, 0)?)?;
+        assembler.branch_cond(AARCH64_NE, no_match)?;
+    }
+    if bounds.requires_end {
+        assembler.instruction(aarch64_cmp_x(3, 1)?)?;
+        assembler.branch_cond(AARCH64_NE, no_match)?;
+    }
+    if !bounds.requires_start && !bounds.requires_end {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 absolute-anchor entry has no bound",
+        ));
+    }
+
+    aarch64_load_u64_constant(assembler, 11, width)?;
+    match (bounds.requires_start, bounds.requires_end) {
+        (true, true) => {
+            assembler.instruction(aarch64_cmp_x(1, 11)?)?;
+            assembler.branch_cond(AARCH64_NE, no_match)?;
+        }
+        (true, false) => {
+            assembler.instruction(aarch64_cmp_x(3, 11)?)?;
+            assembler.branch_cond(AARCH64_LO, no_match)?;
+            assembler.instruction(aarch64_mov_x(3, 11)?)?;
+        }
+        (false, true) => {
+            assembler.instruction(aarch64_cmp_x(1, 11)?)?;
+            assembler.branch_cond(AARCH64_LO, no_match)?;
+            assembler.instruction(aarch64_sub_x_reg(11, 1, 11)?)?;
+            assembler.instruction(aarch64_cmp_x(2, 11)?)?;
+            assembler.branch_cond(AARCH64_HI, no_match)?;
+            assembler.instruction(aarch64_mov_x(2, 11)?)?;
+        }
+        (false, false) => unreachable!("absolute-anchor entry has no bound"),
+    }
+    Ok(())
 }
 
 fn aarch64_and_low_w(destination: u8, source: u8, bits: u8) -> Result<u32, ObjectError> {
@@ -29415,7 +29634,8 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
         ));
     }
     let mut assembler = Aarch64Assembler::new();
-    let register_outcome = entry_contract == NativeDfaEntryContract::PreparedPartialCore;
+    let register_outcome = entry_contract.register_outcome();
+    let fixed_candidate = entry_contract.fixed_candidate();
     let scan = assembler.label()?;
     let scalar_scan = assembler.label()?;
     let scalar_transition = assembler.label()?;
@@ -29459,7 +29679,7 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
     let reverse_finish = assembler.label()?;
     let exact_start_probe_failed = assembler.label()?;
 
-    if entry_contract == NativeDfaEntryContract::Public {
+    if entry_contract.validates_public_args() {
         assembler.instruction(0xf100_003f)?; // cmp length, #0
         assembler.branch_cond(AARCH64_MI, invalid)?;
         assembler.instruction(aarch64_cmp_x(3, 1)?)?;
@@ -29474,11 +29694,14 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
         assembler.instruction(0xf100_001f)?; // cmp x0, #0
         assembler.branch_cond(AARCH64_EQ, invalid)?;
     }
-    assembler.instruction(aarch64_mov_x(9, 2)?)?;
-    if entry_contract == NativeDfaEntryContract::Public {
+    if entry_contract.validates_public_args() {
         assembler.instruction(aarch64_store_x(31, 4, 0)?)?;
         assembler.instruction(aarch64_store_x(31, 4, 8)?)?;
     }
+    if let Some((bounds, width)) = entry_contract.exact_absolute_anchored() {
+        aarch64_emit_exact_absolute_anchored_bounds(&mut assembler, bounds, width, no_match)?;
+    }
+    assembler.instruction(aarch64_mov_x(9, 2)?)?;
 
     let table_page = assembler.instruction(0x9000_0005)?;
     let table_page_offset = assembler.instruction(aarch64_add_x_imm(5, 5, 0)?)?;
@@ -29609,7 +29832,8 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
         .then(|| assembler.label())
         .transpose()?;
     if use_asimd_sparse_lookup
-        || use_exact_asimd_lane
+        || !fixed_candidate
+            && use_exact_asimd_lane
             && (use_asimd_filter || use_exact_asimd || use_asimd_suffix || use_asimd_loop)
     {
         let lane_index_offset =
@@ -29628,9 +29852,11 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
         scalar_scan
     };
     let use_prefix_block = features.has(CpuFeature::Aarch64Asimd) && layout.prefix_block.is_some();
-    if layout.exact_prefix_match_width.is_some()
-        && (layout.suffix_filter.is_some() || use_asimd_exact_product_residual_batch)
-    {
+    let probe_exact_product = layout.exact_prefix_match_width.is_some()
+        && (fixed_candidate
+            || layout.suffix_filter.is_some()
+            || use_asimd_exact_product_residual_batch);
+    if probe_exact_product {
         // A sparse four-vector scanner wins on long misses but should not pay
         // four loads and a horizontal reduction for a match at the original
         // window start. The same complete-product guard used ahead of a
@@ -29640,13 +29866,14 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
             &mut assembler,
             layout,
             use_prefix_block,
+            !fixed_candidate,
             register_outcome,
             exact_start_probe_failed,
             matched,
         )?;
         assembler.bind(exact_start_probe_failed)?;
     }
-    if let Some(suffix) = layout.suffix_filter {
+    if !fixed_candidate && let Some(suffix) = layout.suffix_filter {
         aarch64_emit_suffix_prepass(
             &mut assembler,
             suffix,
@@ -29665,7 +29892,7 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
         assembler.instruction(0x9280_000d)?; // movn x13, #0
         assembler.instruction(aarch64_mov_x(7, 13)?)?;
     }
-    if use_asimd_filter {
+    if !fixed_candidate && use_asimd_filter {
         let filter = layout.start_filter.ok_or(ObjectError::InvalidModule(
             "ASIMD start filter has no graph filter",
         ))?;
@@ -29687,12 +29914,12 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
             let first_register = AARCH64_STANDALONE_FILTER_FIRST_CONSTANT;
             aarch64_emit_start_filter_constants(&mut assembler, filter, first_register)?;
         }
-    } else if let Some(kind) = exact_sve_kind {
+    } else if !fixed_candidate && let Some(kind) = exact_sve_kind {
         let storage = layout.exact_start_storage.ok_or(ObjectError::InvalidModule(
             "AArch64 SVE exact scanner has no canonical storage",
         ))?;
         aarch64_emit_exact_sve_constants(&mut assembler, storage, kind)?;
-    } else if use_exact_asimd {
+    } else if !fixed_candidate && use_exact_asimd {
         let storage = layout.exact_start_storage.ok_or(ObjectError::InvalidModule(
             "AArch64 ASIMD exact scanner has no canonical storage",
         ))?;
@@ -29712,7 +29939,7 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
     }
 
     let retain_sve_filter_setup = pure_sve_filter;
-    if retain_sve_filter_setup {
+    if !fixed_candidate && retain_sve_filter_setup {
         let filter = layout.start_filter.ok_or(ObjectError::InvalidModule(
             "pure-SVE start filter has no graph filter",
         ))?;
@@ -29725,7 +29952,7 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
         aarch64_emit_sve_filter_setups(&mut assembler, filter, vector_filter, sve_filter_plan)?;
     }
 
-    if use_runtime_vl_dispatch || exact_use_runtime_vl_dispatch {
+    if !fixed_candidate && (use_runtime_vl_dispatch || exact_use_runtime_vl_dispatch) {
         // The suffix prepass cannot provide this value: its short-window
         // bypass reaches the root without executing its optional CNTB, and
         // the seeded-reverse prepass also owns X16. Sample only after every
@@ -29744,6 +29971,13 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
         // lowering. Retain the authenticated stride across scanner retries so
         // every scalar transition forms its next row with one MADD.
         assembler.instruction(aarch64_movz_x(15, row_bytes, 0)?)?;
+    }
+
+    if fixed_candidate {
+        // The public proof admitted one start and X2/X3 now delimit exactly
+        // its width. Avoid every moving SIMD/scalar root scanner and consume
+        // that candidate through the ordinary ordered DFA directly.
+        assembler.branch(scalar_transition)?;
     }
 
     assembler.bind(scan)?;
@@ -54145,6 +54379,100 @@ int main(void){{
         assert_eq!(declined.sections(), fallback.sections());
         assert_eq!(declined.symbols(), fallback.symbols());
         assert_eq!(declined.relocations(), fallback.relocations());
+    }
+
+    #[test]
+    fn exact_absolute_anchor_route_is_general_cross_target_and_bounded() {
+        let avx512 = FeatureSet::of(CpuFeature::X86Avx2)
+            .with(CpuFeature::X86Avx512F)
+            .with(CpuFeature::X86Avx512Bw)
+            .with(CpuFeature::X86Avx512Vl);
+        let sve2 = FeatureSet::of(CpuFeature::Aarch64Sve)
+            .with(CpuFeature::Aarch64Sve2);
+        let targets = [
+            Target::x86_64_linux()
+                .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+                .unwrap(),
+            Target::x86_64_macos().with_features(avx512).unwrap(),
+            Target::aarch64_linux()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                .unwrap(),
+            Target::aarch64_linux()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Sve))
+                .unwrap(),
+            Target::aarch64_linux().with_features(sve2).unwrap(),
+            Target::aarch64_macos()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                .unwrap(),
+        ];
+        let patterns = [
+            r"\A(?:ab|ac)",
+            r"(?:ab|ac)\z",
+            r"\A(?:ab|ac)\z",
+            r"\A\z",
+        ];
+        for target in targets {
+            for output in [
+                OutputContract::Exists,
+                OutputContract::SelectedEnd,
+                OutputContract::Span,
+            ] {
+                for pattern in patterns {
+                    let compiled = compile(
+                        CompileRequest::new(pattern, target)
+                            .mode(CompileMode::Fast)
+                            .output(output),
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("compile {pattern:?}/{output:?}/{target:?}: {error}")
+                    });
+                    let module = CompiledModule::lower_optimizing(compiled.program(), target)
+                        .unwrap_or_else(|error| {
+                            panic!("lower {pattern:?}/{output:?}/{target:?}: {error}")
+                        });
+                    let report = module.slow_aot_report().unwrap_or_else(|| {
+                        panic!("missing exact slow report: {pattern:?}/{output:?}/{target:?}")
+                    });
+                    assert!(report.determinization.decline.is_none());
+                    assert!(report.dfa.forward_states != 0);
+                    assert!(module.slow_context_aot_report().is_none());
+                    assert!(module.required_runtime_program().is_none());
+                    emit_object(&module, ObjectFormat::for_target(target), usize::MAX)
+                        .unwrap_or_else(|error| {
+                            panic!("object {pattern:?}/{output:?}/{target:?}: {error}")
+                        });
+                }
+            }
+        }
+
+        let target = Target::x86_64_linux();
+        let compiled = compile(
+            CompileRequest::new(r"\A(?:ab|ac)", target)
+                .mode(CompileMode::Fast)
+                .output(OutputContract::Exists),
+        )
+        .unwrap();
+        let no_allocation = CompiledModule::lower_optimizing_with_limits(
+            compiled.program(),
+            target,
+            SlowAotLimits {
+                max_allocation_bytes: 0,
+                ..SlowAotLimits::default()
+            },
+        )
+        .unwrap();
+        assert!(no_allocation.slow_aot_report().is_none());
+        assert!(no_allocation.slow_context_aot_report().is_none());
+        let no_native_data =
+            CompiledModule::lower_optimizing_with_limits_and_native_data_limit(
+                compiled.program(),
+                target,
+                SlowAotLimits::default(),
+                0,
+            )
+            .unwrap();
+        assert!(no_native_data.slow_aot_report().is_none());
+        assert!(no_native_data.slow_context_aot_report().is_none());
     }
 
     #[test]
@@ -78719,6 +79047,29 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 >= 2,
             "the entry probe must not rely on a scanner validation that has not happened"
         );
+        let mut fixed_x86 = X86Assembler::new();
+        let fixed_x86_failed = fixed_x86.label().unwrap();
+        let fixed_x86_matched = fixed_x86.label().unwrap();
+        x86_emit_exact_start_probe(
+            &mut fixed_x86,
+            x86_layout,
+            X86StartFilterKind::Sse2,
+            false,
+            false,
+            fixed_x86_failed,
+            fixed_x86_matched,
+        )
+        .unwrap();
+        fixed_x86.bind(fixed_x86_failed).unwrap();
+        fixed_x86.bind(fixed_x86_matched).unwrap();
+        let fixed_x86 = fixed_x86.finish().unwrap();
+        assert!(fixed_x86.windows(4).any(|bytes| bytes == [0x48, 0x83, 0xf8, 5]));
+        assert!(
+            !fixed_x86
+                .windows(6)
+                .any(|bytes| bytes == [0x48, 0x3d, 128, 0, 0, 0]),
+            "the proved fixed candidate must not retain the large-window gate"
+        );
         let relation_vector = x86_layout
             .prefix_relation
             .and_then(|relation| relation.vector_plan);
@@ -78772,6 +79123,35 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             aarch64_load_byte_imm(8, 12, u16::from(primary.scan_offset)).unwrap()
         };
         assert!(words.iter().filter(|word| **word == primary_load).count() >= 2);
+
+        let mut fixed_aarch64 = Aarch64Assembler::new();
+        let fixed_aarch64_failed = fixed_aarch64.label().unwrap();
+        let fixed_aarch64_matched = fixed_aarch64.label().unwrap();
+        aarch64_emit_exact_start_probe(
+            &mut fixed_aarch64,
+            aarch64_layout,
+            false,
+            false,
+            false,
+            fixed_aarch64_failed,
+            fixed_aarch64_matched,
+        )
+        .unwrap();
+        fixed_aarch64.bind(fixed_aarch64_failed).unwrap();
+        fixed_aarch64.bind(fixed_aarch64_matched).unwrap();
+        let fixed_words = fixed_aarch64
+            .finish()
+            .unwrap()
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(fixed_words.contains(&aarch64_cmp_x_imm(12, 5).unwrap()));
+        assert!(
+            !fixed_words.contains(
+                &aarch64_cmp_x_imm(12, SUFFIX_PREFILTER_MIN_WINDOW_BYTES).unwrap()
+            ),
+            "the proved fixed candidate must not retain the large-window gate"
+        );
     }
 
     #[test]
@@ -81251,6 +81631,181 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                     aarch64_store_x(6, 4, 0).unwrap(),
                 ]
         }));
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    #[ignore = "links and executes exact absolute-boundary optimizing objects natively"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the opt-in host test owns one exhaustive all-window native differential"
+    )]
+    fn linked_host_exact_absolute_anchor_all_windows_agrees_with_portable() {
+        use std::{fmt::Write as _, fs, process::Command};
+
+        let base = if cfg!(target_arch = "x86_64") {
+            if cfg!(target_os = "linux") {
+                Target::x86_64_linux()
+            } else {
+                Target::x86_64_macos()
+            }
+        } else if cfg!(target_os = "linux") {
+            Target::aarch64_linux()
+        } else {
+            Target::aarch64_macos()
+        };
+        let target = if cfg!(target_arch = "x86_64") {
+            base.with_features(FeatureSet::of(CpuFeature::X86Avx2))
+                .unwrap()
+        } else {
+            base.with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                .unwrap()
+        };
+        let fixtures: [(&str, &[u8]); 8] = [
+            (r"\A(?:ab|ac)", b"acxx"),
+            (r"(?:ab|ac)\z", b"xxac"),
+            (r"\A(?:ab|ac)\z", b"ac"),
+            (r"\A(?:ab|cd)", b"cdxx"),
+            (r"\Aabcdefghijklmnop", b"abcdefghijklmnop"),
+            (r"\A", b"x"),
+            (r"\z", b"x"),
+            (r"\A\z", b""),
+        ];
+        let directory = std::env::temp_dir().join(format!(
+            "fre-aot-exact-absolute-{}-{}",
+            std::process::id(),
+            if cfg!(target_arch = "x86_64") { "x86" } else { "arm" }
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let mut source = String::from("#include <stdint.h>\n#include <stddef.h>\n#include <stdio.h>\n");
+        let mut objects = Vec::new();
+        let mut programs = Vec::new();
+        let mut symbols = Vec::new();
+        let mut fixture_indices = Vec::new();
+
+        for (fixture, (pattern, haystack)) in fixtures.iter().enumerate() {
+            let bytes = if haystack.is_empty() {
+                String::from("0")
+            } else {
+                haystack
+                    .iter()
+                    .map(u8::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            writeln!(source, "static const unsigned char h{fixture}[]={{{bytes}}};").unwrap();
+            for output in [
+                OutputContract::Exists,
+                OutputContract::SelectedEnd,
+                OutputContract::Span,
+            ] {
+                let compiled = compile(
+                    CompileRequest::new(*pattern, target)
+                        .mode(CompileMode::Fast)
+                        .output(output),
+                )
+                .unwrap();
+                let module = CompiledModule::lower_optimizing(compiled.program(), target).unwrap();
+                assert!(module.slow_aot_report().is_some());
+                assert!(module.slow_context_aot_report().is_none());
+                assert!(module.required_runtime_program().is_none());
+                let symbol = module.entry_symbol().to_owned();
+                writeln!(
+                    source,
+                    "extern uint32_t {symbol}(const unsigned char*,size_t,size_t,size_t,size_t*);"
+                )
+                .unwrap();
+                let object = directory.join(format!("case{}.o", objects.len()));
+                fs::write(
+                    &object,
+                    emit_object(&module, ObjectFormat::for_target(target), usize::MAX).unwrap(),
+                )
+                .unwrap();
+                objects.push(object);
+                programs.push(compiled);
+                symbols.push(symbol);
+                fixture_indices.push(fixture);
+            }
+        }
+
+        source.push_str("int main(void){size_t r[2];uint32_t s;\n");
+        let mut expected = Vec::new();
+        for (case, compiled) in programs.iter().enumerate() {
+            let fixture = fixture_indices[case];
+            let haystack = fixtures[fixture].1;
+            for start in 0..=haystack.len() {
+                for end in start..=haystack.len() {
+                    writeln!(
+                        source,
+                        "r[0]=99;r[1]=99;s={}(h{fixture},{},{start},{end},r);printf(\"%u %zu %zu\\n\",s,r[0],r[1]);",
+                        symbols[case],
+                        haystack.len(),
+                    )
+                    .unwrap();
+                    expected.push(
+                        compiled
+                            .search(haystack, SearchWindow::new(start, end))
+                            .unwrap(),
+                    );
+                }
+            }
+        }
+        writeln!(
+            source,
+            "r[0]=99;r[1]=99;s={}(h0,4,3,2,r);if(s!=2||r[0]!=99||r[1]!=99)return 90;",
+            symbols[0]
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "s={}(h0,4,0,4,(size_t*)0);if(s!=2)return 91;",
+            symbols[0]
+        )
+        .unwrap();
+        source.push_str("return 0;}\n");
+        let c_path = directory.join("exact.c");
+        let executable = directory.join("exact");
+        fs::write(&c_path, source).unwrap();
+        let compiler = if cfg!(target_os = "macos") { "clang" } else { "cc" };
+        let status = Command::new(compiler)
+            .arg("-O0")
+            .arg(&c_path)
+            .args(&objects)
+            .arg("-o")
+            .arg(&executable)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let output = Command::new(&executable).output().unwrap();
+        assert!(
+            output.status.success(),
+            "status={:?} stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let lines = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(lines.lines().count(), expected.len());
+        for (line, expected) in lines.lines().zip(expected) {
+            let actual = line
+                .split_ascii_whitespace()
+                .map(|part| part.parse::<usize>().unwrap())
+                .collect::<Vec<_>>();
+            match expected {
+                MatchResult::Exists(found) => {
+                    assert_eq!(actual, [usize::from(found), 0, 0]);
+                }
+                MatchResult::SelectedEnd(Some(end)) => assert_eq!(actual, [1, end, end]),
+                MatchResult::Span(Some((start, end))) => assert_eq!(actual, [1, start, end]),
+                MatchResult::SelectedEnd(None) | MatchResult::Span(None) => {
+                    assert_eq!(actual, [0, 0, 0]);
+                }
+            }
+        }
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[cfg(all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos")))]
