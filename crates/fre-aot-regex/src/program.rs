@@ -3025,9 +3025,10 @@ pub struct FrozenDynamicRowsStorageV3 {
 /// supplying a root-scanner-independent compact owner to the ordinary public
 /// prepared-header publisher. Compiler-private continuation projection and
 /// publication APIs unwrap it only after authenticating the exact resume
-/// ticket for which the owner was built. Root-only V5 summaries and V6/V7
-/// loop extensions are deliberately excluded; every closed scanner-free
-/// V3/V4/V8--V14 table is valid from an authenticated canonical state.
+/// ticket for which the owner was built. Root-only V5 summaries remain
+/// excluded. V6/V7 may be retained because their nonroot loop index is an
+/// optional exact accelerator over the same closed V3/V4 rows; the generated
+/// local tail authenticates the current canonical state before consulting it.
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct FrozenStaticContinuationRowsStorageV1 {
@@ -3039,7 +3040,7 @@ impl FrozenStaticContinuationRowsStorageV1 {
     #[doc(hidden)]
     #[must_use]
     pub const fn compiler_private_format_version(&self) -> u32 {
-        self.rows.descriptor.format_version
+        self.rows.effective_format_version()
     }
 }
 
@@ -3049,6 +3050,8 @@ const fn frozen_static_continuation_format_is_supported(format_version: u32) -> 
         format_version,
         FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION
             | FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION
+            | FROZEN_DYNAMIC_ROWS_V6_FORMAT_VERSION
+            | FROZEN_DYNAMIC_ROWS_V7_FORMAT_VERSION
             | FROZEN_DYNAMIC_ROWS_V8_FORMAT_VERSION
             | FROZEN_DYNAMIC_ROWS_V9_FORMAT_VERSION
             | FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION
@@ -5580,6 +5583,13 @@ impl FrozenDynamicRowsStorage {
 }
 
 impl FrozenDynamicRowsStorageV3 {
+    const fn effective_format_version(&self) -> u32 {
+        match self.descriptor_v6 {
+            Some(rows) => rows.compact.format_version,
+            None => self.descriptor.format_version,
+        }
+    }
+
     /// Return the completed live-K0 receipt from which this immutable owner
     /// was copied. A second compiler-owned sidecar may reuse the receipt only
     /// through APIs that reauthenticate its program instance and live cache
@@ -9534,10 +9544,11 @@ impl CompiledProgram {
     /// This owner is only authority for an already admitted arbitrary-state
     /// continuation. It must never be published at the public root entry. An
     /// otherwise mandatory root scanner therefore does not exclude a closed
-    /// scanner-free table, and a unary V5 root summary is republished as the
-    /// underlying exact V4 rows rather than being misapplied to an arbitrary
-    /// state. A geometry or resource decline returns no side owner and leaves
-    /// the ordinary root-compatible owner unchanged.
+    /// table, and a unary V5 root summary is republished as the underlying
+    /// exact V4 rows rather than being misapplied to an arbitrary state. An
+    /// optional V6/V7 loop index accelerates only independently proved
+    /// nonroot self-loops. A geometry or resource decline returns no side
+    /// owner and leaves the ordinary root-compatible owner unchanged.
     #[doc(hidden)]
     #[must_use]
     pub fn compiler_private_frozen_static_continuation_rows_storage_v3_with_fallback_receipt(
@@ -9555,14 +9566,15 @@ impl CompiledProgram {
                 max_packed_bytes,
                 true,
             )?;
-        frozen_static_continuation_format_is_supported(storage.descriptor.format_version)
+        let format_version = storage.effective_format_version();
+        frozen_static_continuation_format_is_supported(format_version)
             .then_some(FrozenStaticContinuationRowsStorageV1 { rows: storage })
     }
 
-    /// Publish a scanner-free side owner only for the authenticated local
+    /// Publish a closed side owner only for the authenticated local
     /// continuation entry. The distinct owner type makes this the sole
     /// external publication route and keeps public-root header construction
-    /// unable to unwrap the scanner-independent table.
+    /// unable to unwrap the arbitrary-state table or its optional loop index.
     #[doc(hidden)]
     #[must_use]
     pub fn compiler_private_frozen_static_continuation_prepared_header_v6(
@@ -9810,12 +9822,16 @@ impl CompiledProgram {
             && dynamic_view.output == OutputContract::Exists
             && semantic_class_count == 1
             && format == FrozenCompactRowsFormat::CellOffsetV4;
-        let retain_loop_extension = !static_continuation_only
-            && !unary_v5_eligible
+        let loop_extension_eligible = !unary_v5_eligible
             && loop_candidate_count != 0
             && mapped_bytes
                 .checked_add(loop_payload_bytes)
                 .is_some_and(|bytes| bytes <= max_packed_bytes);
+        // Preserve public-root arbitration: V6/V7 still outrank expanded
+        // supertransitions there. A continuation-only owner first tries its
+        // scanner-free V14/V13/V11 forms and retains a loop extension only as
+        // the exact one-transition fallback.
+        let retain_loop_extension = !static_continuation_only && loop_extension_eligible;
 
         // V14 amortizes four serial DFA transitions into one exact table
         // access. Exact base-C blocks retain more state coverage than padded
@@ -9997,6 +10013,8 @@ impl CompiledProgram {
                 return Some(storage);
             }
         }
+
+        let retain_loop_extension = loop_extension_eligible;
 
         if !unary_v5_eligible && !static_unary_v4 && !retain_loop_extension {
             (columns, format) = promote_frozen_compact_raw_byte_projection(
@@ -12094,13 +12112,13 @@ impl CompiledProgram {
             ),
             pending_end,
             cache_identity: mapping.cache_identity(),
-            format_version: owner.descriptor.format_version,
+            format_version: owner.effective_format_version(),
             fully_prefilled,
         }))
     }
 
     /// Project one compiler-owned static hole into the independently owned
-    /// scanner-free continuation table.
+    /// closed continuation table and optional nonroot loop index.
     ///
     /// The continuation owner is intentionally a private newtype: ordinary
     /// public-root publication cannot unwrap it, while this entry delegates
@@ -25977,14 +25995,92 @@ mod tests {
     }
 
     #[test]
-    fn static_continuation_policy_accepts_every_closed_scanner_free_format() {
+    fn static_continuation_policy_accepts_every_closed_arbitrary_state_format() {
         for format_version in 0..=15 {
             assert_eq!(
                 frozen_static_continuation_format_is_supported(format_version),
-                matches!(format_version, 3 | 4 | 8..=14),
+                matches!(format_version, 3 | 4 | 6..=14),
                 "static-continuation policy drifted for format {format_version}"
             );
         }
+    }
+
+    #[test]
+    fn static_continuation_retains_an_authenticated_nonroot_loop_fallback() {
+        let compiled = program(
+            r"a+Q|b+R|c+S|d+T|e+U|f+V|g+W|h+X|i+Y|j+Z",
+            OutputContract::SelectedEnd,
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+        );
+        let mut ordinary_workspace = compiled.prepare_workspace().unwrap();
+        let ordinary = compiled
+            .compiler_private_frozen_dynamic_rows_storage_v3(
+                &mut ordinary_workspace,
+                usize::MAX,
+                usize::MAX,
+            )
+            .expect("ordinary loop owner");
+        assert!(ordinary.descriptor_v6.is_some());
+        let loop_budget = ordinary
+            .rows
+            .len()
+            .checked_mul(core::mem::size_of::<u16>())
+            .and_then(|bytes| {
+                ordinary
+                    .rows_u8
+                    .as_ref()
+                    .map_or(Some(bytes), |rows| bytes.checked_add(rows.len()))
+            })
+            .and_then(|bytes| bytes.checked_add(256))
+            .and_then(|bytes| bytes.checked_add(ordinary.loop_index.len()))
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    ordinary
+                        .loop_scanners
+                        .len()
+                        .checked_mul(core::mem::size_of::<FrozenCompactLoopScanner>())?,
+                )
+            })
+            .expect("bounded loop owner extent");
+
+        let mut workspace = compiled.prepare_workspace().unwrap();
+        let continuation = compiled
+            .compiler_private_frozen_static_continuation_rows_storage_v3_with_fallback_receipt(
+                &mut workspace,
+                None,
+                usize::MAX,
+                loop_budget,
+            )
+            .expect("closed arbitrary-state continuation owner");
+        let format_version = continuation.compiler_private_format_version();
+        assert!(
+            matches!(
+                format_version,
+                FROZEN_DYNAMIC_ROWS_V6_FORMAT_VERSION | FROZEN_DYNAMIC_ROWS_V7_FORMAT_VERSION
+            ),
+            "expected a loop fallback, selected V{format_version}"
+        );
+        assert_ne!(
+            continuation
+                .rows
+                .compiler_private_frozen_loop_plan_count(),
+            0,
+            "the continuation loop extension must own a proved nonroot plan"
+        );
+        let header = compiled
+            .compiler_private_frozen_static_continuation_prepared_header_v6(
+                &workspace,
+                &continuation,
+            )
+            .expect("active continuation loop header");
+        assert_eq!(
+            header.compiler_private_dynamic_rows_format_version(),
+            Some(continuation.compiler_private_format_version())
+        );
     }
 
     #[test]

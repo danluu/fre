@@ -1663,6 +1663,10 @@ impl CompiledModule {
             .relocations
             .iter()
             .any(|relocation| relocation.symbol == DYNAMIC_ROWS_CONTINUE_RUNTIME_SYMBOL);
+        let needs_dynamic_rows_loop_scan_symbol = lowering
+            .relocations
+            .iter()
+            .any(|relocation| relocation.symbol == DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL);
 
         let sections = vec![
             ModuleSection {
@@ -1960,27 +1964,66 @@ impl CompiledModule {
                             offset: 0,
                             size: 0,
                         });
-                    } else if prepared.span_recovery {
-                        if symbols.len() != PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL {
-                            return Err(ObjectError::InvalidModule(
-                                "prepared Span recovery symbol order is inconsistent",
-                            ));
-                        }
-                        symbols.push(ModuleSymbol {
-                            name: if prepared.slow_prefix_resume {
-                                SLOW_PREFIX_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME
-                            } else if prepared.slow_prefix {
-                                SLOW_PREFIX_SPAN_RECOVERY_V1_RUNTIME_SYMBOL_NAME
-                            } else {
-                                PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME
+                    } else {
+                        if prepared.span_recovery {
+                            if symbols.len() != PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL {
+                                return Err(ObjectError::InvalidModule(
+                                    "prepared Span recovery symbol order is inconsistent",
+                                ));
                             }
-                            .to_owned(),
-                            binding: SymbolBinding::Global,
-                            kind: SymbolKind::Function,
-                            section: None,
-                            offset: 0,
-                            size: 0,
-                        });
+                            symbols.push(ModuleSymbol {
+                                name: if prepared.slow_prefix_resume {
+                                    SLOW_PREFIX_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME
+                                } else if prepared.slow_prefix {
+                                    SLOW_PREFIX_SPAN_RECOVERY_V1_RUNTIME_SYMBOL_NAME
+                                } else {
+                                    PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL_NAME
+                                }
+                                .to_owned(),
+                                binding: SymbolBinding::Global,
+                                kind: SymbolKind::Function,
+                                section: None,
+                                offset: 0,
+                                size: 0,
+                            });
+                        }
+                        if needs_dynamic_rows_loop_scan_symbol {
+                            if !prepared.slow_prefix_resume {
+                                return Err(ObjectError::InvalidModule(
+                                    "non-dynamic prepared loop helper has no static continuation",
+                                ));
+                            }
+                            while symbols.len() < DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL {
+                                let slot = symbols.len();
+                                symbols.push(ModuleSymbol {
+                                    name: format!(
+                                        ".Lfre_aot_regex_static_resume_loop_placeholder_{slot}"
+                                    ),
+                                    binding: SymbolBinding::Local,
+                                    kind: SymbolKind::Object,
+                                    section: Some(PROGRAM_SECTION),
+                                    offset: u64::try_from(prepared.identity_offset).map_err(|_| {
+                                        ObjectError::ArithmeticOverflow(
+                                            "static-resume loop placeholder offset",
+                                        )
+                                    })?,
+                                    size: 0,
+                                });
+                            }
+                            if symbols.len() != DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL {
+                                return Err(ObjectError::InvalidModule(
+                                    "static-resume frozen-loop helper symbol order is inconsistent",
+                                ));
+                            }
+                            symbols.push(ModuleSymbol {
+                                name: DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL_NAME.to_owned(),
+                                binding: SymbolBinding::Global,
+                                kind: SymbolKind::Function,
+                                section: None,
+                                offset: 0,
+                                size: 0,
+                            });
+                        }
                     }
                 }
             }
@@ -2192,7 +2235,8 @@ impl CompiledModule {
     }
 
     /// Return the authenticated immutable compact-loop scan helper required
-    /// by a dynamic-row prepared entry, when that entry is present.
+    /// by a dynamic-row prepared entry or its embedded static-continuation
+    /// tail, when either route is present.
     #[must_use]
     pub fn required_prepared_dynamic_rows_loop_scan_runtime_symbol(&self) -> Option<&str> {
         self.prepared_entry_symbol_index?;
@@ -3343,7 +3387,9 @@ fn lower_native_slow_partial_prepared_with_data_limit(
             push_bytes(&mut code, &static_resume_tail.code)?;
             for mut relocation in static_resume_tail.relocations {
                 match relocation.symbol {
-                    PARTIAL_IDENTITY_SYMBOL | PREPARED_FALLBACK_RUNTIME_SYMBOL => {}
+                    PARTIAL_IDENTITY_SYMBOL
+                    | PREPARED_FALLBACK_RUNTIME_SYMBOL
+                    | DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL => {}
                     DYNAMIC_ROWS_SPAN_RECOVERY_RUNTIME_SYMBOL
                         if view.output == OutputContract::Span =>
                     {
@@ -3355,11 +3401,13 @@ fn lower_native_slow_partial_prepared_with_data_limit(
                         relocation.symbol = PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL;
                     }
                     _ => {
-                        // Public-entry preflight, mutation, deopt, loop, and
+                        // Public-entry preflight, mutation, deopt, and
                         // non-Span postflight paths are unreachable from the
-                        // local compact selector. Symbol 11 in particular is
-                        // the dynamic deopt helper here, despite sharing the
-                        // partial-Span slot in a different object layout.
+                        // local compact selector. Compact V6/V7 loops can call
+                        // their immutable scanner after a status-8 handoff, so
+                        // that helper is retained above. Symbol 11 in
+                        // particular is the dynamic deopt helper here, despite
+                        // sharing the partial-Span slot in another layout.
                         continue;
                     }
                 }
@@ -16523,6 +16571,23 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_impl
         }
         Ok::<(), ObjectError>(())
     };
+    let initialize_loop_register_last_accept = |assembler: &mut X86Assembler| {
+        // V6/V7 keep their endpoint as an offset in callee-saved R12 across
+        // the trusted loop helper. Status-8 supplies an authenticated earlier
+        // endpoint in the frame; ordinary entry initialized the same word to
+        // zero. Preserve it in caller-saved R10 before that word becomes the
+        // save slot for the caller's R12.
+        if emit_static_resume_entry {
+            assembler.instruction(&[0x4c, 0x8b, 0x54, 0x24, 0x60])?;
+        }
+        assembler.instruction(&[0x4c, 0x89, 0x64, 0x24, 0x60])?; // save r12
+        if emit_static_resume_entry {
+            assembler.instruction(&[0x4d, 0x89, 0xd4])?; // mov r12,r10
+        } else {
+            assembler.instruction(&[0x45, 0x31, 0xe4])?; // xor r12d,r12d
+        }
+        Ok::<(), ObjectError>(())
+    };
     let initialize_state_ordinal_row =
         |assembler: &mut X86Assembler, row_shift: u8| {
             if emit_static_resume_entry {
@@ -17509,7 +17574,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_impl
     let mut inline_class_map = vec![0x4c, 0x8d, 0x8f];
     inline_class_map.extend_from_slice(&class_map_offset.to_le_bytes());
     assembler.instruction(&inline_class_map)?;
-    assembler.instruction(&[0x49, 0x89, 0xf0])?;
+    initialize_v4_row(&mut assembler, false)?;
     if root_setup.is_some() {
         assembler.instruction(&[
             0x48,
@@ -17530,8 +17595,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_impl
     if let Some(root_setup) = root_setup {
         assembler.branch(&[0xe9], root_setup)?;
     } else if register_last_accept {
-        assembler.instruction(&[0x4c, 0x89, 0x64, 0x24, 0x60])?; // save r12
-        assembler.instruction(&[0x45, 0x31, 0xe4])?; // xor r12d,r12d
+        initialize_loop_register_last_accept(&mut assembler)?;
     } else if output != OutputContract::Exists && !emit_static_resume_entry {
         assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x60, 0, 0, 0, 0])?;
     }
@@ -17777,8 +17841,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_impl
     if let Some(root_setup) = root_setup {
         assembler.branch(&[0xe9], root_setup)?;
     } else if register_last_accept {
-        assembler.instruction(&[0x4c, 0x89, 0x64, 0x24, 0x60])?; // save r12
-        assembler.instruction(&[0x45, 0x31, 0xe4])?; // xor r12d,r12d
+        initialize_loop_register_last_accept(&mut assembler)?;
     } else if output != OutputContract::Exists && !emit_static_resume_entry {
         assembler.instruction(&[0x48, 0xc7, 0x44, 0x24, 0x60, 0, 0, 0, 0])?;
     }
@@ -17806,7 +17869,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_impl
         let v6_scan = assembler.label()?;
         v6_scan_entries[index] = v6_scan;
         assembler.bind(entry)?;
-        assembler.instruction(&[0x49, 0x89, 0xf0])?;
+        initialize_state_ordinal_row(&mut assembler, shift)?;
         assembler.bind(v6_scan)?;
         let emit_v6_transition = |assembler: &mut X86Assembler| -> Result<(), ObjectError> {
             assembler.instruction(&[0x48, 0xff, 0xc2])?;
@@ -19802,17 +19865,11 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_impl
             assembler.instruction(&[0x48, 0x83, 0x7c, 0x24, 0x60, 0])?;
             assembler.branch(&[0x0f, 0x85], native_match)?;
         }
-        assembler.branch(
-            &[0xe9],
-            try_v14
-                .or(try_v13)
-                .or(try_v11)
-                .unwrap_or(if direct_byte_formats_possible {
-                    try_v10
-                } else {
-                    try_v12
-                }),
-        )?;
+        // Continuation owners may use the authenticated V7/V6 loop fallback
+        // when no denser supertransition projection fits. Enter before both
+        // loop formats; their flag guards fall through to the established
+        // V14/V13/V11 and direct/mapped chain.
+        assembler.branch(&[0xe9], try_v7)?;
     }
 
     let finished = assembler.finish_with_label_offsets()?;
@@ -29457,7 +29514,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_imp
     )?)?;
     assembler.instruction(aarch64_cmp_x_imm(15, 0)?)?;
     assembler.branch_cond(AARCH64_EQ, framed_fallback)?;
-    assembler.instruction(aarch64_mov_x(11, 15)?)?;
+    initialize_v4_row(&mut assembler, false)?;
     assembler.instruction(aarch64_mov_x(1, 15)?)?;
     assembler.instruction(aarch64_sub_x_imm(15, 15, 2)?)?;
     assembler.instruction(aarch64_add_x_imm(
@@ -29725,7 +29782,6 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_imp
     )?)?;
     assembler.instruction(aarch64_cmp_x_imm(15, 0)?)?;
     assembler.branch_cond(AARCH64_EQ, framed_fallback)?;
-    assembler.instruction(aarch64_mov_x(11, 15)?)?;
     assembler.instruction(aarch64_mov_x(1, 15)?)?;
     assembler.instruction(aarch64_add_x_imm(
         14,
@@ -29745,6 +29801,14 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_imp
         // serial transition can fold state*stride+rows into one MADD.
         assembler.instruction(aarch64_movz_x(10, 1, 0)?)?;
         assembler.instruction(aarch64_lslv_x(12, 10, 12)?)?;
+        if emit_static_resume_entry {
+            assembler.instruction(aarch64_load_x_imm(11, 31, 40)?)?;
+            assembler.instruction(aarch64_madd_x(11, 11, 12, 15)?)?;
+        } else {
+            assembler.instruction(aarch64_mov_x(11, 15)?)?;
+        }
+    } else {
+        assembler.instruction(aarch64_mov_x(11, 15)?)?;
     }
     if root_plan.is_some() {
         assembler.instruction(aarch64_movz_x(8, ROOT_SCANNER_COMPACT_V6, 0)?)?;
@@ -31856,16 +31920,10 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_imp
         if output == OutputContract::Exists {
             assembler.branch_nonzero_x(7, native_match)?;
         }
-        assembler.branch(
-            try_v14
-                .or(try_v13)
-                .or(try_v11)
-                .unwrap_or(if direct_byte_formats_possible {
-                    try_v10
-                } else {
-                    try_v12
-                }),
-        )?;
+        // The +664 continuation owner can be V7/V6 when no denser projection
+        // fits. Start before both loop formats and let their exact flag guards
+        // fall through to the established supertransition/direct chain.
+        assembler.branch(try_v7)?;
     }
 
     let mut relocation_offsets = vec![
@@ -37198,6 +37256,73 @@ mod tests {
                         >= 3,
                     "x86 helper paths must reload the original owner: {output:?}/{features:?}"
                 );
+                let class_count_offset = u8::try_from(
+                    FROZEN_DYNAMIC_ROWS_V3_CLASS_COUNT_OFFSET,
+                )
+                .unwrap();
+                let v7_state_entry = [
+                    0x4c,
+                    0x8b,
+                    0x54,
+                    0x24,
+                    0x58, // canonical state
+                    0x41,
+                    0x8b,
+                    0x43,
+                    class_count_offset,
+                    0x4c,
+                    0x0f,
+                    0xaf,
+                    0xd0,
+                    0x49,
+                    0xd1,
+                    0xe2,
+                    0x4e,
+                    0x8d,
+                    0x04,
+                    0x16,
+                ];
+                assert!(
+                    emission
+                        .code
+                        .windows(v7_state_entry.len())
+                        .filter(|window| *window == v7_state_entry)
+                        .count()
+                        >= 2,
+                    "x86 V7 and V4 must both select the status-8 canonical row: {output:?}/{features:?}"
+                );
+                for shift in 1_u8..=9 {
+                    let v6_state_entry = [
+                        0x4c, 0x8b, 0x54, 0x24, 0x58, // canonical state
+                        0x49, 0xc1, 0xe2, shift, // state * byte stride
+                        0x4e, 0x8d, 0x04, 0x16, // rows + byte offset
+                        0x48, 0x8d, 0x42, 0x01, // V6 paired-loop bound
+                        0x48, 0x39, 0xc8,
+                    ];
+                    assert_eq!(
+                        emission
+                            .code
+                            .windows(v6_state_entry.len())
+                            .filter(|window| *window == v6_state_entry)
+                            .count(),
+                        1,
+                        "x86 V6 shift {shift} must select the status-8 canonical row before its paired loop: {output:?}/{features:?}"
+                    );
+                }
+                let inherited_loop_endpoint = [
+                    0x4c, 0x8b, 0x54, 0x24, 0x60, // inherited endpoint
+                    0x4c, 0x89, 0x64, 0x24, 0x60, // save caller r12
+                    0x4d, 0x89, 0xd4, // endpoint -> r12
+                ];
+                assert_eq!(
+                    emission
+                        .code
+                        .windows(inherited_loop_endpoint.len())
+                        .filter(|window| *window == inherited_loop_endpoint)
+                        .count(),
+                    usize::from(output != OutputContract::Exists) * 2,
+                    "x86 V6/V7 must preserve the inherited endpoint while borrowing R12: {output:?}/{features:?}"
+                );
                 assert_eq!(
                     emission.relocations.iter().any(|relocation| {
                         relocation.symbol == DYNAMIC_ROWS_SPAN_RECOVERY_RUNTIME_SYMBOL
@@ -37242,6 +37367,42 @@ mod tests {
                     .count()
                     >= 3,
                 "AArch64 helper paths must reload the original owner: {output:?}"
+            );
+            let words = emission
+                .code
+                .chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            let v7_state_entry = [
+                aarch64_load_x_imm(11, 31, 40).unwrap(),
+                aarch64_load_w_imm(
+                    8,
+                    13,
+                    u16::try_from(FROZEN_DYNAMIC_ROWS_V3_CLASS_COUNT_OFFSET).unwrap(),
+                )
+                .unwrap(),
+                aarch64_mul_x(11, 11, 8).unwrap(),
+                aarch64_add_x_lsl(11, 15, 11, 1).unwrap(),
+            ];
+            assert!(
+                words
+                    .windows(v7_state_entry.len())
+                    .filter(|window| *window == v7_state_entry)
+                    .count()
+                    >= 2,
+                "AArch64 V7 and V4 must both select the status-8 canonical row: {output:?}"
+            );
+            let v6_state_entry = [
+                aarch64_load_x_imm(11, 31, 40).unwrap(),
+                aarch64_madd_x(11, 11, 12, 15).unwrap(),
+            ];
+            assert_eq!(
+                words
+                    .windows(v6_state_entry.len())
+                    .filter(|window| *window == v6_state_entry)
+                    .count(),
+                1,
+                "AArch64 V6 must select the status-8 canonical row: {output:?}"
             );
             assert_eq!(
                 emission.relocations.iter().any(|relocation| {
@@ -46895,6 +47056,22 @@ int main(void){{
                     2 * usize::from(output == OutputContract::Span),
                     "static-prefix Span relocation: {output:?}/{target:?}"
                 );
+                assert_eq!(
+                    constrained.required_prepared_dynamic_rows_loop_scan_runtime_symbol(),
+                    Some(DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL_NAME),
+                    "static continuation loop helper: {output:?}/{target:?}"
+                );
+                assert_eq!(
+                    constrained
+                        .relocations()
+                        .iter()
+                        .filter(|relocation| {
+                            relocation.symbol == DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL
+                        })
+                        .count(),
+                    2,
+                    "V6/V7 static continuation loop relocations: {output:?}/{target:?}"
+                );
                 let prepared_symbol = &constrained.symbols()[PREPARED_ENTRY_SYMBOL];
                 let prepared_end = usize::try_from(prepared_symbol.offset + prepared_symbol.size)
                     .unwrap();
@@ -46923,6 +47100,19 @@ int main(void){{
                         "one remapped Span postflight lives in the anonymous tail: {target:?}"
                     );
                 }
+                assert_eq!(
+                    constrained
+                        .relocations()
+                        .iter()
+                        .filter(|relocation| {
+                            relocation.symbol == DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL
+                                && usize::try_from(relocation.offset)
+                                    .is_ok_and(|offset| offset >= tail_offset)
+                        })
+                        .count(),
+                    2,
+                    "both loop helper calls live in the anonymous continuation tail: {output:?}/{target:?}"
+                );
                 emit_object(
                     &constrained,
                     ObjectFormat::for_target(target),
@@ -50634,12 +50824,12 @@ int main(void){{
         any(target_os = "linux", target_os = "macos")
     ))]
     #[test]
-    #[ignore = "links the status-8 static-prefix wrapper to a forged +664 V4 owner and executes arbitrary canonical state one"]
+    #[ignore = "links the status-8 static-prefix wrapper to forged +664 V4/V6/V7 owners and executes arbitrary canonical state one"]
     #[allow(
         clippy::too_many_lines,
         reason = "the linked proof keeps the real static hole, status-8 ABI, fixed continuation-header offset, owner-base recovery, and all value contracts together"
     )]
-    fn linked_host_static_continuation_resume_v4_tail_executes_all_outputs() {
+    fn linked_host_static_continuation_resume_v4_v6_v7_tails_execute_all_outputs() {
         use std::{fs, process::Command, time::SystemTime};
 
         const FORGED_V4_PATTERN: &str = r"(?-u:(?:a|[^a][\x00-\xff]){4})";
@@ -50810,6 +51000,7 @@ int main(void){{
             let source = format!(
                 r##"#include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 typedef void *handle_t;
 typedef struct {{size_t start;size_t end;}} result_t;
@@ -50829,50 +51020,98 @@ typedef struct {{
   uint32_t learned_loop_states[4];uint32_t format_version;
 }} frozen_v4_tail_t;
 typedef struct {{frozen_v1_t v1;frozen_v4_tail_t v4;}} frozen_v4_t;
-typedef union {{frozen_v4_t v4;unsigned char bytes[{slot_bytes}U];}} frozen_v6_slot_t;
+typedef struct {{
+  uint32_t canonical_state;uint32_t start_action;uint64_t members[4];size_t scanner_address;
+}} loop_plan_t;
+typedef struct {{
+  frozen_v4_tail_t compact;uint32_t loop_plan_count;uint32_t reserved;
+  size_t loop_index_address;size_t loop_index_length;loop_plan_t loop_plans[4];
+}} frozen_v6_tail_t;
+typedef struct {{frozen_v1_t v1;frozen_v6_tail_t v6;}} frozen_v6_t;
+typedef union {{frozen_v4_t v4;frozen_v6_t v6;unsigned char bytes[{slot_bytes}U];}} frozen_v6_slot_t;
 typedef struct {{unsigned char public_header[{second_offset}U];frozen_v6_slot_t continuation;}} prepared_t;
 _Static_assert(sizeof(frozen_v1_t)=={v1_bytes}U,"V1 extent");
 _Static_assert(offsetof(frozen_v4_t,v4)=={tail_offset}U,"V4 offset");
 _Static_assert(sizeof(frozen_v4_t)=={v4_bytes}U,"V4 extent");
+_Static_assert(sizeof(loop_plan_t)=={loop_plan_bytes}U,"loop-plan extent");
+_Static_assert(offsetof(frozen_v6_t,v6)=={tail_offset}U,"V6 offset");
+_Static_assert(offsetof(frozen_v6_tail_t,loop_plans)=={loop_plans_offset}U,"loop-plan offset");
+_Static_assert(sizeof(frozen_v6_t)=={v6_bytes}U,"V6 extent");
 _Static_assert(offsetof(prepared_t,continuation)=={second_offset}U,"continuation header offset");
 extern uint32_t {entry}(handle_t,const unsigned char*,size_t,size_t,size_t,result_t*);
 static const unsigned char identity[32]={{{identity}}};
 static const unsigned char haystack[]={{{haystack}}};
-static uint16_t rows[2];static uint32_t reverse_rows[256];static prepared_t prepared;
-#define frozen prepared.continuation.v4
-static size_t observed_cursor;static unsigned preflight_calls,continue_calls,recovery_calls,fallback_calls;
+static uint16_t rows[2];static uint32_t reverse_rows[256];static uint8_t loop_index[2],scanner_cookie;static prepared_t prepared;
+#define frozen_v4 prepared.continuation.v4
+#define frozen_v6 prepared.continuation.v6
+static size_t observed_cursor;static unsigned preflight_calls,continue_calls,recovery_calls,fallback_calls,helper_calls,helper_bad;static int loop_case;
 uint32_t fre_aot_regex_runtime_search_v1(const unsigned char*a,const unsigned char*b,size_t n,size_t s,size_t e,result_t*r){{(void)a;(void)b;(void)n;(void)s;(void)e;(void)r;fallback_calls++;return 97U;}}
 uint32_t fre_aot_regex_runtime_search_exclusive_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;fallback_calls++;return 97U;}}
 uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_preflight_v2(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,const uint32_t*d){{(void)r;(void)d;preflight_calls++;return h==(handle_t)&prepared&&p==haystack&&n==sizeof(haystack)&&s==0U&&e==n&&memcmp(i,identity,32U)==0?6U:96U;}}
-uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_continue_v1(handle_t h,const unsigned char*p,size_t n,result_t*r,size_t state,size_t position,size_t pending){{(void)state;(void)pending;continue_calls++;if(h!=(handle_t)&prepared||p!=haystack||n!=sizeof(haystack)||position==0U||position>=n)return 95U;observed_cursor=position;r->start=1U;r->end=0U;return 8U;}}
-uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_recover_span_v2(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,size_t selected){{recovery_calls++;if(h!=(handle_t)&prepared||p!=haystack||n!=sizeof(haystack)||s!=0U||e!=n||memcmp(i,identity,32U)!=0||selected!=observed_cursor+1U)return 94U;r->start=observed_cursor;r->end=selected;return 1U;}}
-static void init(void){{memset(&frozen,0,sizeof(frozen));rows[0]=0U;rows[1]=UINT16_C(0x8000);
-  frozen.v1.active_seal=UINT64_C({active_seal});frozen.v1.magic=UINT64_C({magic});
-  frozen.v1.abi_version=UINT32_C({abi});frozen.v1.flags=UINT32_C({v4_flag});
-  frozen.v1.header_bytes={v4_bytes}U;memcpy(frozen.v1.artifact_identity,identity,32U);
-  frozen.v1.forward_rows_address=(size_t)(uintptr_t)rows;frozen.v1.reverse_rows_address=(size_t)(uintptr_t)reverse_rows;
-  frozen.v1.forward_live_cells=2U;frozen.v1.reverse_live_cells=256U;
-  frozen.v1.cache_identity=UINT64_C(77);frozen.v1.row_stride=1U;frozen.v1.unfilled_cell=0U;
-  frozen.v1.accept_mask=UINT32_C(0x8000);frozen.v1.next_row_token_mask=UINT32_C(0x7fff);
-  memset(frozen.v1.class_map,0,sizeof(frozen.v1.class_map));
-  frozen.v4.ready_seal=UINT64_C({ready_seal});frozen.v4.rows_address=(size_t)(uintptr_t)rows;
-  frozen.v4.cache_identity=UINT64_C(77);frozen.v4.state_count=2U;frozen.v4.class_count=1U;
-  frozen.v4.row_shift=0U;frozen.v4.initial_state=0U;frozen.v4.learned_loop_state_count=0U;
-  for(size_t i=0;i<4U;i++)frozen.v4.learned_loop_states[i]=UINT32_MAX;
-  frozen.v4.format_version=UINT32_C({v4_format});}}
-int main(void){{result_t result={{91U,92U}};init();uint32_t status={entry}((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),&result);
+uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_continue_v1(handle_t h,const unsigned char*p,size_t n,result_t*r,size_t state,size_t position,size_t pending){{(void)state;(void)pending;continue_calls++;if(h!=(handle_t)&prepared||p!=haystack||n!=sizeof(haystack)||position==0U||position>=n)return 95U;observed_cursor=position;r->start=1U;r->end=loop_case&&{mode}U!=0U?position:0U;return 8U;}}
+uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_recover_span_v2(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,size_t selected){{recovery_calls++;if(h!=(handle_t)&prepared||p!=haystack||n!=sizeof(haystack)||s!=0U||e!=n||memcmp(i,identity,32U)!=0||selected!=observed_cursor+(loop_case?0U:1U))return 94U;r->start=observed_cursor;r->end=selected;return 1U;}}
+size_t fre_aot_regex_runtime_scan_frozen_loop_v2(const unsigned char*p,const void*s,size_t n){{helper_calls++;if(p<haystack||p>haystack+sizeof(haystack)||s!=(const void*)&scanner_cookie)helper_bad++;return n;}}
+static void reset_observations(void){{observed_cursor=0U;preflight_calls=0U;continue_calls=0U;recovery_calls=0U;fallback_calls=0U;helper_calls=0U;helper_bad=0U;}}
+static void init_v4(void){{memset(&prepared.continuation,0,sizeof(prepared.continuation));rows[0]=0U;rows[1]=UINT16_C(0x8000);loop_case=0;
+  frozen_v4.v1.active_seal=UINT64_C({active_seal});frozen_v4.v1.magic=UINT64_C({magic});
+  frozen_v4.v1.abi_version=UINT32_C({abi});frozen_v4.v1.flags=UINT32_C({v4_flag});
+  frozen_v4.v1.header_bytes={v4_bytes}U;memcpy(frozen_v4.v1.artifact_identity,identity,32U);
+  frozen_v4.v1.forward_rows_address=(size_t)(uintptr_t)rows;frozen_v4.v1.reverse_rows_address=(size_t)(uintptr_t)reverse_rows;
+  frozen_v4.v1.forward_live_cells=2U;frozen_v4.v1.reverse_live_cells=256U;
+  frozen_v4.v1.cache_identity=UINT64_C(77);frozen_v4.v1.row_stride=1U;frozen_v4.v1.unfilled_cell=0U;
+  frozen_v4.v1.accept_mask=UINT32_C(0x8000);frozen_v4.v1.next_row_token_mask=UINT32_C(0x7fff);
+  memset(frozen_v4.v1.class_map,0,sizeof(frozen_v4.v1.class_map));
+  frozen_v4.v4.ready_seal=UINT64_C({v4_ready_seal});frozen_v4.v4.rows_address=(size_t)(uintptr_t)rows;
+  frozen_v4.v4.cache_identity=UINT64_C(77);frozen_v4.v4.state_count=2U;frozen_v4.v4.class_count=1U;
+  frozen_v4.v4.row_shift=0U;frozen_v4.v4.initial_state=0U;frozen_v4.v4.learned_loop_state_count=0U;
+  for(size_t i=0;i<4U;i++)frozen_v4.v4.learned_loop_states[i]=UINT32_MAX;
+  frozen_v4.v4.format_version=UINT32_C({v4_format});}}
+static void init_loop(uint32_t format){{memset(&prepared.continuation,0,sizeof(prepared.continuation));rows[0]=UINT16_C(0x8000);rows[1]=UINT16_C(2);loop_index[0]=0U;loop_index[1]=1U;loop_case=1;
+  frozen_v6.v1.active_seal=UINT64_C({active_seal});frozen_v6.v1.magic=UINT64_C({magic});
+  frozen_v6.v1.abi_version=UINT32_C({abi});frozen_v6.v1.flags=format==6U?UINT32_C({v6_flag}):UINT32_C({v7_flag});
+  frozen_v6.v1.header_bytes={v6_bytes}U;memcpy(frozen_v6.v1.artifact_identity,identity,32U);
+  frozen_v6.v1.forward_rows_address=(size_t)(uintptr_t)rows;frozen_v6.v1.reverse_rows_address=(size_t)(uintptr_t)reverse_rows;
+  frozen_v6.v1.forward_live_cells=2U;frozen_v6.v1.reverse_live_cells=256U;
+  frozen_v6.v1.cache_identity=UINT64_C(77);frozen_v6.v1.row_stride=1U;frozen_v6.v1.unfilled_cell=0U;
+  frozen_v6.v1.accept_mask=UINT32_C(0x8000);frozen_v6.v1.next_row_token_mask=UINT32_C(0x7fff);
+  memset(frozen_v6.v1.class_map,0,sizeof(frozen_v6.v1.class_map));
+  frozen_v6.v6.compact.ready_seal=format==6U?UINT64_C({v6_ready_seal}):UINT64_C({v7_ready_seal});
+  frozen_v6.v6.compact.rows_address=(size_t)(uintptr_t)rows;frozen_v6.v6.compact.cache_identity=UINT64_C(77);
+  frozen_v6.v6.compact.state_count=2U;frozen_v6.v6.compact.class_count=1U;frozen_v6.v6.compact.row_shift=format==6U?1U:0U;
+  frozen_v6.v6.compact.initial_state=0U;frozen_v6.v6.compact.learned_loop_state_count=0U;
+  for(size_t i=0;i<4U;i++)frozen_v6.v6.compact.learned_loop_states[i]=UINT32_MAX;
+  frozen_v6.v6.compact.format_version=format==6U?UINT32_C({v6_format}):UINT32_C({v7_format});
+  frozen_v6.v6.loop_plan_count=1U;frozen_v6.v6.reserved=0U;
+  frozen_v6.v6.loop_index_address=(size_t)(uintptr_t)loop_index;frozen_v6.v6.loop_index_length=2U;
+  frozen_v6.v6.loop_plans[0].canonical_state=1U;frozen_v6.v6.loop_plans[0].start_action=0U;
+  frozen_v6.v6.loop_plans[0].members[0]=UINT64_MAX;frozen_v6.v6.loop_plans[0].members[1]=UINT64_MAX;
+  frozen_v6.v6.loop_plans[0].members[2]=0U;frozen_v6.v6.loop_plans[0].members[3]=0U;
+  frozen_v6.v6.loop_plans[0].scanner_address=(size_t)(uintptr_t)&scanner_cookie;}}
+static int run_v4(void){{result_t result={{91U,92U}};reset_observations();init_v4();uint32_t status={entry}((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),&result);
   if(preflight_calls!=1U)return 10;if(continue_calls!=1U)return 40+(int)status;if(fallback_calls!=0U)return 12;
-  if(observed_cursor==0U||observed_cursor>=sizeof(haystack))return 13;
+  if(observed_cursor==0U||observed_cursor>=sizeof(haystack))return 13;if(helper_calls!=0U||helper_bad!=0U)return 14;
   if({mode}U==0U){{if(status!=1U||result.start!=0U||result.end!=0U||recovery_calls!=0U)return 20;}}
   else if({mode}U==1U){{if(status!=1U||result.start!=observed_cursor+1U||result.end!=observed_cursor+1U||recovery_calls!=0U)return 21;}}
   else {{if(status!=1U||result.start!=observed_cursor||result.end!=observed_cursor+1U||recovery_calls!=1U)return 22;}}
   return 0;}}
+static int run_loop(uint32_t format){{result_t result={{91U,92U}};reset_observations();init_loop(format);uint32_t status={entry}((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),&result);
+  if(preflight_calls!=1U||continue_calls!=1U||fallback_calls!=0U||helper_calls!=1U||helper_bad!=0U)fprintf(stderr,"loop format=%u status=%u preflight=%u continue=%u fallback=%u helper=%u bad=%u cursor=%zu result=%zu,%zu\n",format,status,preflight_calls,continue_calls,fallback_calls,helper_calls,helper_bad,observed_cursor,result.start,result.end);
+  if(preflight_calls!=1U)return 100+(int)format;if(continue_calls!=1U)return 120+(int)status;if(fallback_calls!=0U)return 130+(int)format;
+  if(observed_cursor==0U||observed_cursor>=sizeof(haystack))return 140+(int)format;if(helper_calls!=1U||helper_bad!=0U)return 145+(int)format;
+  if({mode}U==0U){{if(status!=0U||result.start!=0U||result.end!=0U||recovery_calls!=0U)return 150+(int)format;}}
+  else if({mode}U==1U){{if(status!=1U||result.start!=observed_cursor||result.end!=observed_cursor||recovery_calls!=0U)return 160+(int)format;}}
+  else {{if(status!=1U||result.start!=observed_cursor||result.end!=observed_cursor||recovery_calls!=1U)return 170+(int)format;}}
+  return 0;}}
+int main(void){{int status=run_v4();if(status!=0)return status;status=run_loop(6U);if(status!=0)return status;return run_loop(7U);}}
 "##,
                 v1_bytes = FROZEN_PREPARED_HEADER_V4_DYNAMIC_ROWS_OFFSET,
                 tail_offset = FROZEN_PREPARED_HEADER_V4_DYNAMIC_ROWS_OFFSET,
                 v4_bytes = FROZEN_PREPARED_HEADER_V4_BYTES,
+                v6_bytes = FROZEN_PREPARED_HEADER_V6_BYTES,
                 second_offset = FROZEN_PREPARED_HEADER_V6_BYTES,
                 slot_bytes = FROZEN_PREPARED_HEADER_V6_BYTES,
+                loop_plan_bytes = FROZEN_COMPACT_LOOP_PLAN_V1_BYTES,
+                loop_plans_offset = FROZEN_DYNAMIC_ROWS_V6_LOOP_PLANS_OFFSET,
                 entry = entry,
                 identity = c_bytes(&identity),
                 haystack = c_bytes(&hole_haystack),
@@ -50880,8 +51119,14 @@ int main(void){{result_t result={{91U,92U}};init();uint32_t status={entry}((hand
                 magic = FROZEN_PREPARED_HEADER_V1_MAGIC,
                 abi = FROZEN_PREPARED_HEADER_V1_ABI_VERSION,
                 v4_flag = FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V4,
-                ready_seal = FROZEN_PREPARED_HEADER_V4_READY_SEAL,
+                v6_flag = FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V6,
+                v7_flag = FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V7,
+                v4_ready_seal = FROZEN_PREPARED_HEADER_V4_READY_SEAL,
+                v6_ready_seal = FROZEN_PREPARED_HEADER_V6_READY_SEAL,
+                v7_ready_seal = FROZEN_PREPARED_HEADER_V7_READY_SEAL,
                 v4_format = FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION,
+                v6_format = FROZEN_DYNAMIC_ROWS_V6_FORMAT_VERSION,
+                v7_format = FROZEN_DYNAMIC_ROWS_V7_FORMAT_VERSION,
                 mode = expected_mode,
             );
             let c_path = directory.join("resume-v4.c");
