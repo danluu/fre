@@ -4468,10 +4468,12 @@ enum TransitionLayout {
     /// Every state has one packed cell per possible input byte. This removes
     /// the dependent class-map load while preserving the same DFA graph.
     DirectByte,
-    /// A 256-byte map selects a graph class, then a compiler-private fixed
-    /// record supplies one dominant packed cell plus a bounded list of exact
-    /// class exceptions. This representation is considered only after dense
-    /// retained-partial lowering exhausts its native-data transaction.
+    /// For non-uniform rows, a 256-byte map selects a graph class, then a
+    /// compiler-private fixed record supplies one dominant packed cell plus a
+    /// bounded list of exact class exceptions. Capacity-zero rows are uniform
+    /// and omit the unused map entirely. This representation is considered
+    /// only after dense retained-partial lowering exhausts its native-data
+    /// transaction.
     DefaultExceptions(u8),
 }
 
@@ -4658,7 +4660,13 @@ fn derive_native_default_exception_plan(
     }
     let exception_capacity = u8::try_from(exception_capacity).ok()?;
     let row_bytes = native_default_exception_row_bytes(exception_capacity)?;
-    let sparse_bytes = CLASS_MAP_BYTES.checked_add(forward_states.checked_mul(row_bytes)?)?;
+    let sparse_bytes = native_machine_bytes(
+        TransitionLayout::DefaultExceptions(exception_capacity),
+        NativeCellEncoding::Wide32,
+        dfa.class_count,
+        forward_states,
+        0,
+    )?;
     let (dense_transitions, dense_cells) =
         select_native_table_encoding_with_holes_for_architecture(
             dfa.class_count,
@@ -4816,7 +4824,8 @@ impl TransitionLayout {
 
     const fn table_prefix_bytes(self) -> usize {
         match self {
-            Self::ClassMapped | Self::DefaultExceptions(_) => CLASS_MAP_BYTES,
+            Self::ClassMapped | Self::DefaultExceptions(1..) => CLASS_MAP_BYTES,
+            Self::DefaultExceptions(0) => 0,
             Self::DirectByte => 0,
         }
     }
@@ -4853,9 +4862,7 @@ fn native_table_prefix_bytes(
 ) -> Option<usize> {
     let prefix = transitions.table_prefix_bytes();
     match (transitions, cells) {
-        (TransitionLayout::DefaultExceptions(_), NativeCellEncoding::Wide32) => {
-            Some(CLASS_MAP_BYTES)
-        }
+        (TransitionLayout::DefaultExceptions(_), NativeCellEncoding::Wide32) => Some(prefix),
         (TransitionLayout::DefaultExceptions(_), _) => None,
         (TransitionLayout::ClassMapped, NativeCellEncoding::Compact8Direct) => None,
         (TransitionLayout::ClassMapped, NativeCellEncoding::Compact16Indexed(_)) => {
@@ -7789,10 +7796,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once(
             return Err(ObjectError::Allocation("native DFA table"));
         }
     }
-    if matches!(
-        transitions,
-        TransitionLayout::ClassMapped | TransitionLayout::DefaultExceptions(_)
-    ) {
+    if transitions.table_prefix_bytes() != 0 {
         bytes.extend_from_slice(dfa.byte_classes);
         bytes.resize(forward_offset, 0);
     }
@@ -10858,6 +10862,18 @@ fn x86_emit_table_lookup(
     transitions: TransitionLayout,
     cells: NativeCellEncoding,
 ) -> Result<(), ObjectError> {
+    if transitions == TransitionLayout::DefaultExceptions(0) {
+        if cells != NativeCellEncoding::Wide32 {
+            return Err(ObjectError::InvalidModule(
+                "x86 uniform default row shape",
+            ));
+        }
+        // Every raw byte names the same packed cell. Load it directly without
+        // touching either the haystack or the omitted class map, and without
+        // branching around an empty exception list.
+        assembler.instruction(&[0x41, 0x8b, 0x02])?; // eax = default cell
+        return Ok(());
+    }
     // eax = haystack[position]
     assembler.instruction(&[0x0f, 0xb6, 0x04, 0x17])?;
     match transitions {
@@ -23177,6 +23193,18 @@ fn aarch64_emit_table_lookup(
     transitions: TransitionLayout,
     cells: NativeCellEncoding,
 ) -> Result<(), ObjectError> {
+    if transitions == TransitionLayout::DefaultExceptions(0) {
+        if cells != NativeCellEncoding::Wide32 {
+            return Err(ObjectError::InvalidModule(
+                "AArch64 uniform default row shape",
+            ));
+        }
+        // A uniform row is independent of the current input byte. Its packed
+        // default is the row itself, so neither the haystack nor a class map
+        // participates in this transition.
+        assembler.instruction(aarch64_load_w_imm(8, 11, 0)?)?;
+        return Ok(());
+    }
     assembler.instruction(aarch64_load_byte_reg(8, 0, 2)?)?;
     match transitions {
         TransitionLayout::ClassMapped => {
@@ -33939,6 +33967,84 @@ mod tests {
                 ..base
             }
         }
+    }
+
+    struct UniformDefaultExceptionFixture {
+        byte_classes: [u8; 256],
+        class_representatives: Vec<u8>,
+        forward_cells: Vec<ForwardCell>,
+    }
+
+    impl UniformDefaultExceptionFixture {
+        const CLASS_COUNT: usize = 7;
+        const COMPLETE_ROWS: usize = 8;
+        const DISCOVERED_STATES: usize = Self::COMPLETE_ROWS + 2;
+
+        fn new() -> Self {
+            let byte_classes = core::array::from_fn(|byte| {
+                u8::try_from(byte % Self::CLASS_COUNT).unwrap()
+            });
+            let class_representatives = (0..Self::CLASS_COUNT)
+                .map(|class| u8::try_from(class).unwrap())
+                .collect::<Vec<_>>();
+            let complete_rows = u32::try_from(Self::COMPLETE_ROWS).unwrap();
+            let mut forward_cells = Vec::with_capacity(
+                Self::COMPLETE_ROWS * Self::CLASS_COUNT,
+            );
+            for state in 0..Self::COMPLETE_ROWS {
+                let state = u32::try_from(state).unwrap();
+                let cell = match state {
+                    0 => ForwardCell::new(1, false),
+                    1 => ForwardCell::new(1, true),
+                    2 => ForwardCell::new(NO_DFA_STATE, false),
+                    3 => ForwardCell::new(complete_rows, false),
+                    4 => ForwardCell::new(complete_rows + 1, true),
+                    5 => ForwardCell::new(0, false),
+                    6 => ForwardCell::new(6, false),
+                    7 => ForwardCell::new(2, true),
+                    _ => unreachable!("bounded uniform fixture state"),
+                };
+                forward_cells.extend(core::iter::repeat_n(cell, Self::CLASS_COUNT));
+            }
+            Self {
+                byte_classes,
+                class_representatives,
+                forward_cells,
+            }
+        }
+
+        fn view<'a>(&'a self, base: NativeProgramView<'a>) -> NativeProgramView<'a> {
+            NativeProgramView {
+                dfa: NativeDfaView {
+                    initial_state: 0,
+                    initial_pending: false,
+                    initial_terminal: false,
+                    byte_classes: &self.byte_classes,
+                    class_count: Self::CLASS_COUNT,
+                    class_representatives: &self.class_representatives,
+                    forward_cells: &self.forward_cells,
+                    reverse_initial: None,
+                    reverse_cells: &[],
+                },
+                partial_discovered_states: Some(Self::DISCOVERED_STATES),
+                collapse_partial_holes: false,
+                exact_match_width: None,
+                max_match_width: None,
+                exact_product_width: None,
+                retained_prefix_requirement: None,
+                retained_suffix_requirement: None,
+                ..base
+            }
+        }
+    }
+
+    fn compile_uniform_default_base(output: OutputContract) -> CompiledRegex {
+        compile(
+            CompileRequest::new("(?-u:.)+", Target::x86_64_linux())
+                .mode(CompileMode::Optimizing)
+                .output(output),
+        )
+        .expect("uniform-row base compilation")
     }
 
     struct CollapsedDefaultExceptionFixture {
@@ -51125,6 +51231,353 @@ int main(void){{
                 required: 8,
             })
         ));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "every uniform row, packed flag, live token, and partial-hole token shares one exact oracle"
+    )]
+    fn uniform_default_exception_rows_omit_the_map_and_preserve_partial_tokens() {
+        let fixture = UniformDefaultExceptionFixture::new();
+        assert_eq!(
+            native_machine_bytes(
+                TransitionLayout::DefaultExceptions(0),
+                NativeCellEncoding::Wide32,
+                UniformDefaultExceptionFixture::CLASS_COUNT,
+                UniformDefaultExceptionFixture::COMPLETE_ROWS,
+                0,
+            ),
+            Some(UniformDefaultExceptionFixture::COMPLETE_ROWS * 4),
+        );
+        for capacity in 1..=u8::try_from(MAX_NATIVE_DEFAULT_EXCEPTIONS).unwrap() {
+            let row_bytes = native_default_exception_row_bytes(capacity).unwrap();
+            assert_eq!(
+                native_machine_bytes(
+                    TransitionLayout::DefaultExceptions(capacity),
+                    NativeCellEncoding::Wide32,
+                    UniformDefaultExceptionFixture::CLASS_COUNT,
+                    UniformDefaultExceptionFixture::COMPLETE_ROWS,
+                    0,
+                ),
+                Some(
+                    CLASS_MAP_BYTES
+                        + UniformDefaultExceptionFixture::COMPLETE_ROWS * row_bytes,
+                ),
+                "capacity={capacity}",
+            );
+        }
+
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let compiled = compile_uniform_default_base(output);
+            let base = compiled
+                .program()
+                .native_dfa_view()
+                .expect("uniform-row base native view");
+            let view = fixture.view(base);
+            for architecture in [Architecture::X86_64, Architecture::Aarch64] {
+                let plan = derive_native_default_exception_plan(
+                    view.dfa,
+                    view.partial_discovered_states,
+                    view.collapse_partial_holes,
+                    architecture,
+                )
+                .expect("uniform default-exception plan");
+                assert_eq!(plan.exception_capacity, 0, "{output:?}/{architecture:?}");
+                assert_eq!(plan.row_bytes, 4, "{output:?}/{architecture:?}");
+
+                let (data, layout) =
+                    build_forced_default_exception_table(view, architecture, usize::MAX)
+                        .unwrap();
+                assert_eq!(
+                    layout.transitions,
+                    TransitionLayout::DefaultExceptions(0),
+                    "{output:?}/{architecture:?}",
+                );
+                assert_eq!(layout.cells, NativeCellEncoding::Wide32);
+                assert_eq!(layout.forward_offset, 0, "{output:?}/{architecture:?}");
+                assert_eq!(
+                    usize::try_from(layout.reverse_offset).unwrap(),
+                    UniformDefaultExceptionFixture::COMPLETE_ROWS * plan.row_bytes,
+                    "{output:?}/{architecture:?}",
+                );
+                assert_eq!(
+                    data.len(),
+                    UniformDefaultExceptionFixture::COMPLETE_ROWS * plan.row_bytes,
+                    "{output:?}/{architecture:?}",
+                );
+                assert!(!layout.has_start_scanner(), "{output:?}/{architecture:?}");
+                assert!(layout.loop_skip.is_none(), "{output:?}/{architecture:?}");
+
+                let partial = layout.partial.expect("uniform partial layout");
+                let last_live_token = encode_native_row_offset(
+                    (UniformDefaultExceptionFixture::COMPLETE_ROWS - 1) * plan.row_bytes,
+                    layout.cells,
+                )
+                .unwrap();
+                assert_eq!(partial.hole_token_base, 30);
+                assert_eq!(
+                    partial.hole_token_base,
+                    u32::try_from(last_live_token + 1).unwrap(),
+                );
+                assert_eq!(partial.resume_states, 2);
+                assert!(!partial.collapse_holes);
+
+                let mut saw_dead = false;
+                let mut saw_live = false;
+                let mut saw_accept = false;
+                let mut saw_first_hole = false;
+                let mut saw_second_hole = false;
+                for state in 0..UniformDefaultExceptionFixture::COMPLETE_ROWS {
+                    let row = &view.dfa.forward_cells[state
+                        * UniformDefaultExceptionFixture::CLASS_COUNT
+                        ..(state + 1) * UniformDefaultExceptionFixture::CLASS_COUNT];
+                    assert!(row.iter().all(|&cell| cell == row[0]));
+                    let offset = state * plan.row_bytes;
+                    let packed = u32::from_le_bytes(
+                        data[offset..offset + plan.row_bytes].try_into().unwrap(),
+                    );
+                    let semantic = row[0];
+                    let expected = pack_native_partial_forward_cell(
+                        semantic.next(),
+                        semantic.accepted(),
+                        0,
+                        plan.row_bytes,
+                        UniformDefaultExceptionFixture::COMPLETE_ROWS,
+                        false,
+                        None,
+                        partial,
+                        layout.cells,
+                    )
+                    .unwrap();
+                    assert_eq!(packed, expected, "{output:?}/{architecture:?}/state={state}");
+                    let token = packed & layout.cells.next_mask();
+                    saw_dead |= token == 0;
+                    saw_live |= token != 0 && token < partial.hole_token_base;
+                    saw_accept |= packed & layout.cells.accepts() != 0;
+                    saw_first_hole |= token == partial.hole_token_base;
+                    saw_second_hole |= token == partial.hole_token_base + 1;
+                }
+                assert!(saw_dead && saw_live && saw_accept);
+                assert!(saw_first_hole && saw_second_hole);
+            }
+        }
+    }
+
+    #[test]
+    fn uniform_default_exception_retry_has_exact_resource_and_fail_closed_boundaries() {
+        let fixture = UniformDefaultExceptionFixture::new();
+        let compiled = compile_uniform_default_base(OutputContract::SelectedEnd);
+        let view = fixture.view(
+            compiled
+                .program()
+                .native_dfa_view()
+                .expect("uniform-row base native view"),
+        );
+        let required = UniformDefaultExceptionFixture::COMPLETE_ROWS
+            * native_default_exception_row_bytes(0).unwrap();
+        assert_eq!(required, 32);
+        for architecture in [Architecture::X86_64, Architecture::Aarch64] {
+            let sparse =
+                build_forced_default_exception_table(view, architecture, usize::MAX).unwrap();
+            assert_eq!(sparse.0.len(), required, "{architecture:?}");
+            let dense = build_native_dfa_table_with_cost_model_and_data_limit_once(
+                view,
+                architecture,
+                NativeVectorFilterCostModel::Established,
+                true,
+                usize::MAX,
+                None,
+            )
+            .unwrap();
+            assert!(dense.0.len() > required, "{architecture:?}");
+
+            let exact = build_native_dfa_table_with_cost_model_and_data_limit(
+                view,
+                architecture,
+                NativeVectorFilterCostModel::Established,
+                true,
+                required,
+            )
+            .unwrap();
+            assert_eq!(exact, sparse, "{architecture:?}");
+
+            let sparse_decline =
+                build_forced_default_exception_table(view, architecture, required - 1)
+                    .unwrap_err();
+            assert_eq!(
+                sparse_decline,
+                ObjectError::Resource {
+                    resource: crate::CompileResource::ProgramBytes,
+                    limit: required - 1,
+                    required,
+                },
+                "{architecture:?}",
+            );
+            let dense_decline = build_native_dfa_table_with_cost_model_and_data_limit_once(
+                view,
+                architecture,
+                NativeVectorFilterCostModel::Established,
+                true,
+                required - 1,
+                None,
+            )
+            .unwrap_err();
+            assert!(matches!(
+                dense_decline,
+                ObjectError::Resource {
+                    resource: crate::CompileResource::ProgramBytes,
+                    limit,
+                    required: dense_required,
+                } if limit == required - 1 && dense_required == dense.0.len()
+            ));
+            assert_eq!(
+                build_native_dfa_table_with_cost_model_and_data_limit(
+                    view,
+                    architecture,
+                    NativeVectorFilterCostModel::Established,
+                    true,
+                    required - 1,
+                )
+                .unwrap_err(),
+                dense_decline,
+                "{architecture:?}",
+            );
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "every supported target tier and output contract shares one uniform-row lookup-shape audit"
+    )]
+    fn uniform_default_lookup_omits_hay_and_class_loads_at_every_target_tier() {
+        let mut x86_lookup = X86Assembler::new();
+        x86_emit_table_lookup(
+            &mut x86_lookup,
+            TransitionLayout::DefaultExceptions(0),
+            NativeCellEncoding::Wide32,
+        )
+        .unwrap();
+        assert_eq!(x86_lookup.finish().unwrap(), [0x41, 0x8b, 0x02]);
+
+        let mut aarch64_lookup = Aarch64Assembler::new();
+        aarch64_emit_table_lookup(
+            &mut aarch64_lookup,
+            TransitionLayout::DefaultExceptions(0),
+            NativeCellEncoding::Wide32,
+        )
+        .unwrap();
+        assert_eq!(
+            aarch64_lookup.finish().unwrap(),
+            aarch64_load_w_imm(8, 11, 0).unwrap().to_le_bytes(),
+        );
+
+        let avx512 = FeatureSet::of(CpuFeature::X86Avx512F)
+            .with(CpuFeature::X86Avx512Bw);
+        let sve = FeatureSet::of(CpuFeature::Aarch64Sve);
+        let targets = [
+            Target::x86_64_linux(),
+            Target::x86_64_macos(),
+            Target::x86_64_macos()
+                .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+                .unwrap(),
+            Target::x86_64_linux().with_features(avx512).unwrap(),
+            Target::aarch64_macos(),
+            Target::aarch64_linux(),
+            Target::aarch64_macos()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                .unwrap(),
+            Target::aarch64_linux()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                .unwrap(),
+            Target::aarch64_linux().with_features(sve).unwrap(),
+            Target::aarch64_linux()
+                .with_features(sve.with(CpuFeature::Aarch64Sve2))
+                .unwrap(),
+        ];
+        let fixture = UniformDefaultExceptionFixture::new();
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let compiled = compile_uniform_default_base(output);
+            let view = fixture.view(
+                compiled
+                    .program()
+                    .native_dfa_view()
+                    .expect("uniform-row base native view"),
+            );
+            for target in targets {
+                let forced = build_forced_default_exception_table(
+                    view,
+                    target.architecture,
+                    usize::MAX,
+                )
+                .unwrap();
+                let lowering = lower_native_dfa_with_entry_contract_and_data_limit(
+                    view,
+                    target,
+                    NativeDfaEntryContract::PreparedPartialCore,
+                    forced.0.len(),
+                )
+                .unwrap()
+                .unwrap_or_else(|| panic!("uniform-row target declined: {output:?}/{target:?}"));
+                assert_eq!(lowering.data, forced.0, "{output:?}/{target:?}");
+                match target.architecture {
+                    Architecture::X86_64 => {
+                        let hay_load = [0x0f, 0xb6, 0x04, 0x17];
+                        let class_load = [0x41, 0x0f, 0xb6, 0x04, 0x01];
+                        let default_load = [0x41, 0x8b, 0x02];
+                        assert!(
+                            !lowering.code.windows(hay_load.len()).any(|code| code == hay_load),
+                            "{output:?}/{target:?} retained the transition hay load",
+                        );
+                        assert!(
+                            !lowering
+                                .code
+                                .windows(class_load.len())
+                                .any(|code| code == class_load),
+                            "{output:?}/{target:?} retained the omitted-map load",
+                        );
+                        assert!(
+                            lowering
+                                .code
+                                .windows(default_load.len())
+                                .any(|code| code == default_load),
+                            "{output:?}/{target:?} omitted the direct default load",
+                        );
+                    }
+                    Architecture::Aarch64 => {
+                        let words = lowering
+                            .code
+                            .chunks_exact(4)
+                            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                            .collect::<Vec<_>>();
+                        let hay_load = aarch64_load_byte_reg(8, 0, 2).unwrap();
+                        let class_load = aarch64_load_byte_reg(8, 5, 8).unwrap();
+                        let default_load = aarch64_load_w_imm(8, 11, 0).unwrap();
+                        assert!(
+                            !words.contains(&hay_load),
+                            "{output:?}/{target:?} retained the transition hay load",
+                        );
+                        assert!(
+                            !words.contains(&class_load),
+                            "{output:?}/{target:?} retained the omitted-map load",
+                        );
+                        assert!(
+                            words.contains(&default_load),
+                            "{output:?}/{target:?} omitted the direct default load",
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
