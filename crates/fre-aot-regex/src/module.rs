@@ -7029,22 +7029,31 @@ fn build_native_dfa_table_with_cost_model_and_data_limit(
     let Some(plan) = native_default_exception_retry_plan(view, architecture, &dense_error) else {
         return Err(dense_error);
     };
-    match build_native_dfa_table_with_cost_model_and_data_limit_once(
-        view,
-        architecture,
-        vector_cost_model,
-        relation_vector_owns_route,
-        max_native_data_bytes,
-        Some(plan),
-    ) {
-        // Allocation and the caller's exact byte ceiling remain
-        // transactional optimizer declines. Structural/backend failures are
-        // compiler defects and must not be hidden behind the dense refusal.
-        Err(ObjectError::Allocation(_) | ObjectError::Resource {
-            resource: crate::CompileResource::ProgramBytes,
-            ..
-        }) => Err(dense_error),
-        result => result,
+    preserve_dense_decline_after_optional_retry(
+        dense_error,
+        build_native_dfa_table_with_cost_model_and_data_limit_once(
+            view,
+            architecture,
+            vector_cost_model,
+            relation_vector_owns_route,
+            max_native_data_bytes,
+            Some(plan),
+        ),
+    )
+}
+
+fn preserve_dense_decline_after_optional_retry(
+    dense_error: ObjectError,
+    retry: Result<(Vec<u8>, NativeDfaLayout), ObjectError>,
+) -> Result<(Vec<u8>, NativeDfaLayout), ObjectError> {
+    match retry {
+        Ok(lowering) => Ok(lowering),
+        // Sparse rows are an optional rescue after the established dense
+        // lowering has already produced a recoverable resource decline. Any
+        // retry failure must preserve that exact decline so target-specific
+        // legalization, allocation, or validation cannot turn an optimizer
+        // opportunity into a fatal compilation error.
+        Err(_) => Err(dense_error),
     }
 }
 
@@ -50783,6 +50792,30 @@ int main(void){{
             .collect::<Vec<_>>();
         assert!(macos_words.contains(&aarch64_cmp_x_imm(12, 32).unwrap()));
         assert!(!macos_words.contains(&aarch64_cmp_x_lsl(12, 6, 1).unwrap()));
+    }
+
+    #[test]
+    fn default_exception_retry_preserves_the_established_dense_decline() {
+        let retry: Result<(Vec<u8>, NativeDfaLayout), ObjectError> =
+            Err(ObjectError::InvalidModule(
+                "synthetic optional sparse legalization failure",
+            ));
+        let result = preserve_dense_decline_after_optional_retry(
+            ObjectError::Resource {
+                resource: crate::CompileResource::ProgramBytes,
+                limit: 7,
+                required: 8,
+            },
+            retry,
+        );
+        assert!(matches!(
+            result,
+            Err(ObjectError::Resource {
+                resource: crate::CompileResource::ProgramBytes,
+                limit: 7,
+                required: 8,
+            })
+        ));
     }
 
     #[test]
