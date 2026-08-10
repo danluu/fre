@@ -26,9 +26,11 @@ use crate::{
         BYTE_START_ASCII_CLASSIFIER_SELECTION_WORK, BYTE_START_BITMAP_POPULATION_WORK,
         BYTE_START_MEMBER_EXTRACTION_WORK, BYTE_START_RANGE_DETECTION_WORK,
         BYTE_START_SET_CLASSIFIER_BUILD_WORK, BYTE_START_SMALL_MAX_MEMBERS,
+        START_FILTER_DEEP_POSITION_COUNT, START_FILTER_DEEP_PROBE_SELECTION_WORK,
         START_FILTER_GUARD_MAX_CARDINALITY, START_FILTER_GUARD_SELECTION_WORK,
         START_FILTER_MAX_OFFSET, START_FILTER_POSITION_COUNT, START_FILTER_PROBE_RETENTION_WORK,
-        START_FILTER_PROBE_SELECTION_WORK, START_FILTER_SCANNER_SELECTION_WORK,
+        START_FILTER_PROBE_SELECTION_WORK, START_FILTER_PROOF_MAX_OFFSET,
+        START_FILTER_PROOF_POSITION_COUNT, START_FILTER_SCANNER_SELECTION_WORK,
     },
     Automaton, EdgeKind, K0OrderedResumeCompletion, K0OrderedResumeValue, MatchSpan,
     OutputContract, ResourceKind, SearchAccounting, SearchError, SearchLimits, SearchWindow,
@@ -62,8 +64,9 @@ fn claim_lazy_workspace_cache_id(counter: &AtomicU64) -> u64 {
 const GENERATION_FAST_WINDOW_MAX: usize = 4_294_967_295;
 const _: () = assert!(START_FILTER_POSITION_COUNT == 32);
 const _: () = assert!(START_FILTER_MAX_OFFSET <= u8::MAX as usize);
+const _: () = assert!(START_FILTER_PROOF_MAX_OFFSET <= u8::MAX as usize);
 const GENERATION_FAST_RESERVE: u64 = 3 * GENERATION_FAST_WINDOW_MAX as u64
-    + START_FILTER_POSITION_COUNT as u64
+    + START_FILTER_PROOF_POSITION_COUNT as u64
     + 3;
 const START_FILTER_OWNER_ALLOCATION_WORK: u64 = 1;
 #[cfg(all(target_arch = "aarch64", target_os = "linux", target_endian = "little"))]
@@ -23352,7 +23355,7 @@ fn execute_filtered_loop(
 
 #[derive(Clone, Copy, Debug)]
 struct StartPositionProof {
-    sets: [ByteSet; START_FILTER_POSITION_COUNT],
+    sets: [ByteSet; START_FILTER_PROOF_POSITION_COUNT],
     length: usize,
     force_haystack_start: bool,
 }
@@ -23360,13 +23363,14 @@ struct StartPositionProof {
 impl StartPositionProof {
     const fn disabled() -> Self {
         Self {
-            sets: [ByteSet::EMPTY; START_FILTER_POSITION_COUNT],
+            sets: [ByteSet::EMPTY; START_FILTER_PROOF_POSITION_COUNT],
             length: 0,
             force_haystack_start: false,
         }
     }
 }
 
+#[cfg(test)]
 fn derive_start_position_classes(
     automaton: &Automaton,
     workspace: &mut K0Workspace,
@@ -23388,13 +23392,58 @@ fn derive_start_position_classes_inner(
     meter: &mut WorkMeter,
     position: usize,
 ) -> Result<StartPositionProof, SearchError> {
-    let mut sets = [ByteSet::EMPTY; START_FILTER_POSITION_COUNT];
-    let mut force_haystack_start = false;
+    let sets = [ByteSet::EMPTY; START_FILTER_PROOF_POSITION_COUNT];
     workspace.current_len = 0;
     workspace.roots_len = 0;
     workspace.stack_len = 0;
 
-    for depth in 0..START_FILTER_POSITION_COUNT {
+    derive_start_position_classes_range(
+        automaton,
+        workspace,
+        meter,
+        position,
+        StartPositionProof {
+            sets,
+            length: 0,
+            force_haystack_start: false,
+        },
+        0,
+        START_FILTER_POSITION_COUNT,
+    )
+}
+
+fn extend_start_position_classes(
+    automaton: &Automaton,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+    position: usize,
+    proof: StartPositionProof,
+) -> Result<StartPositionProof, SearchError> {
+    debug_assert_eq!(proof.length, START_FILTER_POSITION_COUNT);
+    retain_next_start_frontier(automaton, workspace, meter, position)?;
+    derive_start_position_classes_range(
+        automaton,
+        workspace,
+        meter,
+        position,
+        proof,
+        START_FILTER_POSITION_COUNT,
+        START_FILTER_PROOF_POSITION_COUNT,
+    )
+}
+
+fn derive_start_position_classes_range(
+    automaton: &Automaton,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+    position: usize,
+    mut proof: StartPositionProof,
+    start_depth: usize,
+    end_depth: usize,
+) -> Result<StartPositionProof, SearchError> {
+    debug_assert!(start_depth <= end_depth);
+    debug_assert!(end_depth <= START_FILTER_PROOF_POSITION_COUNT);
+    for depth in start_depth..end_depth {
         begin_start_proof_depth(workspace)?;
         let frontier_len = if depth == 0 { 1 } else { workspace.roots_len };
         let mut reached_accept = false;
@@ -23441,7 +23490,7 @@ fn derive_start_position_classes_inner(
                                 // Boundary zero is evaluated without filtering;
                                 // every scanner-selected boundary is nonzero.
                                 if depth == 0 {
-                                    force_haystack_start = true;
+                                    proof.force_haystack_start = true;
                                 }
                                 continue;
                             }
@@ -23464,22 +23513,22 @@ fn derive_start_position_classes_inner(
         // at this or any later offset is required by every match.
         if reached_accept {
             return Ok(StartPositionProof {
-                sets,
+                sets: proof.sets,
                 length: depth,
-                force_haystack_start,
+                force_haystack_start: proof.force_haystack_start,
             });
         }
 
         let set = ByteSet::from_words(words);
-        sets[depth] = set;
+        proof.sets[depth] = set;
         if set == ByteSet::EMPTY {
             // No nonzero-start path can consume the next required byte, so no
             // such path can ever accept.
-            sets[0] = ByteSet::EMPTY;
+            proof.sets[0] = ByteSet::EMPTY;
             return Ok(StartPositionProof {
-                sets,
+                sets: proof.sets,
                 length: 1,
-                force_haystack_start,
+                force_haystack_start: proof.force_haystack_start,
             });
         }
         let next_depth = depth
@@ -23487,11 +23536,11 @@ fn derive_start_position_classes_inner(
             .ok_or(SearchError::ArithmeticOverflow {
                 computation: "start-filter next proof depth",
             })?;
-        if next_depth == START_FILTER_POSITION_COUNT {
+        if next_depth == end_depth {
             return Ok(StartPositionProof {
-                sets,
-                length: START_FILTER_POSITION_COUNT,
-                force_haystack_start,
+                sets: proof.sets,
+                length: end_depth,
+                force_haystack_start: proof.force_haystack_start,
             });
         }
 
@@ -23680,8 +23729,10 @@ fn prepare_start_filter_cold<'a>(
     position: usize,
     end: usize,
 ) -> Result<InvocationStartProof<'a>, SearchError> {
-    let position_proof = derive_start_position_classes(automaton, workspace, meter, position)?;
-    let (scanner, filter, publish) = if position_proof.length == 0 {
+    let result = (|| {
+    let mut position_proof =
+        derive_start_position_classes_inner(automaton, workspace, meter, position)?;
+    let (mut scanner, mut filter, mut publish) = if position_proof.length == 0 {
         (None, None, true)
     } else {
         let selection = select_start_classes(
@@ -23787,6 +23838,83 @@ fn prepare_start_filter_cold<'a>(
         }
     };
 
+    if position_proof.length == START_FILTER_POSITION_COUNT
+        && filter.as_ref().and_then(StartPositionFilter::guard).is_some()
+    {
+        let completion_reserve = if meter.limit == u64::MAX {
+            0
+        } else {
+            end.checked_sub(position).map_or(u64::MAX, |bytes| {
+                start_probe_completion_reserve(automaton, bytes)
+            })
+        };
+        let tail_admitted = automaton
+            .conservative_start_filter_tail_work_bound()
+            .ok()
+            .and_then(|tail| tail.checked_add(completion_reserve))
+            .is_some_and(|required| required <= meter.remaining());
+        if tail_admitted {
+            position_proof = extend_start_position_classes(
+                automaton,
+                workspace,
+                meter,
+                position,
+                position_proof,
+            )?;
+            if position_proof.sets[0] == ByteSet::EMPTY {
+                // The optional tier proved that the primary frontier cannot
+                // ever reach an accept state. Replace the already-correct but
+                // weaker primary proof with a permanent empty scanner.
+                scanner = Some(StartPositionScanner {
+                    offset: 0,
+                    scanner: StartScanner::Empty,
+                });
+                filter = None;
+            } else if let Some((deep_cardinality, deep_probe)) = select_deep_start_probe(
+                &position_proof.sets[START_FILTER_POSITION_COUNT..position_proof.length],
+                meter,
+                position,
+            )? {
+                let compact = if usize::try_from(deep_cardinality)
+                    .expect("deep Probe cardinality fits usize")
+                    <= BYTE_START_SMALL_MAX_MEMBERS
+                {
+                    Some(extract_small_start_members(
+                        deep_probe.set,
+                        deep_cardinality,
+                        meter,
+                        position,
+                    )?)
+                } else {
+                    None
+                };
+                meter.charge(
+                    u64::try_from(START_FILTER_PROBE_RETENTION_WORK)
+                        .expect("deep Probe retention work fits u64"),
+                    position,
+                )?;
+                filter = filter.map(|filter| {
+                    let probe = if let Some((members, length)) = compact {
+                        StartPositionProbe::new_compact(
+                            deep_probe,
+                            members,
+                            length,
+                        )
+                        .expect("charged compact Probe extraction exactly represents its class")
+                    } else {
+                        StartPositionProbe::new(deep_probe, None)
+                    };
+                    filter.with_late_probe(probe)
+                });
+            }
+        } else {
+            // A finite caller keeps the exact primary scanner and Guard for
+            // this invocation, but cannot permanently prevent a later caller
+            // from enriching the same immutable graph with its second tier.
+            publish = false;
+        }
+    }
+
     let proof = StartFilterProof {
         // The forced boundary matters only when skipping is enabled.
         force_haystack_start: scanner.is_some() && position_proof.force_haystack_start,
@@ -23797,6 +23925,14 @@ fn prepare_start_filter_cold<'a>(
     // Publish only after the entire search succeeds. A racing successful
     // caller may win first; both values come from the same immutable graph.
     Ok(InvocationStartProof::Pending { proof, publish })
+    })();
+    // Selection may keep the depth-thirty-one frontier live while deciding
+    // whether the optional second tier is affordable. No proof-local entry
+    // may escape into ordinary K0 execution, including on refusal.
+    workspace.current_len = 0;
+    workspace.roots_len = 0;
+    workspace.stack_len = 0;
+    result
 }
 
 fn start_probe_completion_reserve(automaton: &Automaton, input_bytes: usize) -> u64 {
@@ -23918,6 +24054,47 @@ fn select_start_classes(
     })
 }
 
+fn select_deep_start_probe(
+    sets: &[ByteSet],
+    meter: &mut WorkMeter,
+    position: usize,
+) -> Result<Option<(u32, StartPositionClass)>, SearchError> {
+    debug_assert!(sets.len() <= START_FILTER_DEEP_POSITION_COUNT);
+    let mut selected: Option<(u32, StartPositionClass)> = None;
+    for (relative_offset, &set) in sets.iter().enumerate() {
+        meter.charge(
+            u64::try_from(BYTE_START_BITMAP_POPULATION_WORK)
+                .expect("deep byte bitmap population work fits u64"),
+            position,
+        )?;
+        let cardinality = set.cardinality();
+        meter.charge(
+            u64::try_from(START_FILTER_DEEP_PROBE_SELECTION_WORK)
+                .expect("deep Probe selection work fits u64"),
+            position,
+        )?;
+        if cardinality == u32::from(u8::MAX) + 1 {
+            continue;
+        }
+        let offset = START_FILTER_POSITION_COUNT
+            .checked_add(relative_offset)
+            .and_then(|offset| u8::try_from(offset).ok())
+            .expect("bounded deep start-filter offset fits u8");
+        let class = StartPositionClass::new(offset, set);
+        let replace = match selected {
+            None => true,
+            Some((best_cardinality, _)) => cardinality < best_cardinality,
+        };
+        if replace {
+            selected = Some((cardinality, class));
+            if cardinality == 1 {
+                break;
+            }
+        }
+    }
+    Ok(selected)
+}
+
 #[cfg(test)]
 fn byte_start_scanner(
     set: ByteSet,
@@ -23946,37 +24123,9 @@ fn build_byte_start_scanner(
     if usize::try_from(cardinality).expect("byte cardinality fits usize")
         <= BYTE_START_SMALL_MAX_MEMBERS
     {
-        let extraction_work = usize::try_from(cardinality)
-            .ok()
-            .and_then(|members| members.checked_mul(BYTE_START_MEMBER_EXTRACTION_WORK))
-            .and_then(|work| u64::try_from(work).ok())
-            .ok_or(SearchError::ArithmeticOverflow {
-                computation: "small byte start-scanner extraction work",
-            })?;
-        meter.charge(extraction_work, position)?;
-        let mut bytes = [0_u8; BYTE_START_SMALL_MAX_MEMBERS];
-        let mut length = 0usize;
-        for (word_index, mut word) in set.words().into_iter().enumerate() {
-            while word != 0 {
-                let bit = word.trailing_zeros();
-                let byte = word_index
-                    .checked_mul(64)
-                    .and_then(|offset| u8::try_from(offset).ok())
-                    .expect("byte word offset fits u8")
-                    .checked_add(u8::try_from(bit).expect("byte word bit fits u8"))
-                    .expect("byte bitmap member fits u8");
-                *bytes
-                    .get_mut(length)
-                    .expect("small byte scanner retains at most three bytes") = byte;
-                length = length
-                    .checked_add(1)
-                    .expect("small byte scanner cardinality fits usize");
-                word &= word
-                    .checked_sub(1)
-                    .expect("the small byte scanner word is nonzero");
-            }
-        }
-        return Ok(match bytes[..length] {
+        let (bytes, length) =
+            extract_small_start_members(set, cardinality, meter, position)?;
+        return Ok(match bytes[..usize::from(length)] {
             [byte] => StartScanner::One(byte),
             [first, second] => StartScanner::Two(first, second),
             [first, second, third] => StartScanner::Three(first, second, third),
@@ -24010,6 +24159,53 @@ fn build_byte_start_scanner(
         position,
     )?;
     Ok(StartScanner::Set(build_full_byte_start_classifier(set)))
+}
+
+fn extract_small_start_members(
+    set: ByteSet,
+    cardinality: u32,
+    meter: &mut WorkMeter,
+    position: usize,
+) -> Result<([u8; BYTE_START_SMALL_MAX_MEMBERS], u8), SearchError> {
+    debug_assert!(cardinality > 0);
+    debug_assert!(
+        usize::try_from(cardinality).expect("byte cardinality fits usize")
+            <= BYTE_START_SMALL_MAX_MEMBERS
+    );
+    let extraction_work = usize::try_from(cardinality)
+        .ok()
+        .and_then(|members| members.checked_mul(BYTE_START_MEMBER_EXTRACTION_WORK))
+        .and_then(|work| u64::try_from(work).ok())
+        .ok_or(SearchError::ArithmeticOverflow {
+            computation: "small byte start-scanner extraction work",
+        })?;
+    meter.charge(extraction_work, position)?;
+    let mut bytes = [0_u8; BYTE_START_SMALL_MAX_MEMBERS];
+    let mut length = 0usize;
+    for (word_index, mut word) in set.words().into_iter().enumerate() {
+        while word != 0 {
+            let bit = word.trailing_zeros();
+            let byte = word_index
+                .checked_mul(64)
+                .and_then(|offset| u8::try_from(offset).ok())
+                .expect("byte word offset fits u8")
+                .checked_add(u8::try_from(bit).expect("byte word bit fits u8"))
+                .expect("byte bitmap member fits u8");
+            *bytes
+                .get_mut(length)
+                .expect("small byte scanner retains at most three bytes") = byte;
+            length = length
+                .checked_add(1)
+                .expect("small byte scanner cardinality fits usize");
+            word &= word
+                .checked_sub(1)
+                .expect("the small byte scanner word is nonzero");
+        }
+    }
+    Ok((
+        bytes,
+        u8::try_from(length).expect("small byte scanner length fits u8"),
+    ))
 }
 
 fn inclusive_byte_range(set: ByteSet, cardinality: u32) -> Option<(u8, u8)> {
@@ -24341,7 +24537,6 @@ fn next_start_candidate_adaptive(
     cursor: &mut RetainedStartMaskCursor,
     state: &mut AdaptiveStartProbe,
 ) -> Result<usize, SearchError> {
-    debug_assert!(guard.is_none() || probe.is_none());
     let Some(probe) = probe else {
         return next_start_candidate_retained(
             scanner, haystack, position, end, guard, meter, cursor,
@@ -24438,6 +24633,52 @@ fn next_start_candidate_adaptive(
         return Ok(candidate);
     }
 
+    if let Some(guard) = guard {
+        debug_assert!(!probe.is_guard_pair());
+        if state.phase != AdaptiveProbePhase::Active {
+            return next_start_candidate_retained(
+                scanner,
+                haystack,
+                position,
+                end,
+                Some(guard),
+                meter,
+                cursor,
+            );
+        }
+        if meter.limit == u64::MAX && probe.compact_members().0 != 0 {
+            // A primary retained mask describes primary-scanner hits, while
+            // the promoted search below is driven by the deep class. Clear
+            // that incompatible meaning only after a successful decision so
+            // checked failures leave the invocation-local cursor unchanged.
+            let promoted = next_start_candidate_promoted_deep_probe(
+                scanner,
+                guard,
+                probe,
+                haystack,
+                position,
+                end,
+                meter,
+                state,
+            );
+            if promoted.is_ok() {
+                cursor.clear();
+            }
+            return promoted;
+        }
+        return next_start_candidate_guard_late_probe(
+            scanner,
+            guard,
+            probe,
+            haystack,
+            position,
+            end,
+            meter,
+            cursor,
+            state,
+        );
+    }
+
     let scanner_offset = usize::from(scanner.offset);
     let probe_offset = usize::from(probe.offset);
     if state.phase == AdaptiveProbePhase::Active
@@ -24495,6 +24736,169 @@ fn next_start_candidate_adaptive(
             .checked_add(1)
             .ok_or(SearchError::ArithmeticOverflow {
                 computation: "adaptive start-probe next candidate",
+            })?;
+    }
+}
+
+fn start_scanner_contains_byte(scanner: &StartScanner, byte: u8) -> bool {
+    match scanner {
+        StartScanner::Empty => false,
+        StartScanner::One(member) => byte == *member,
+        StartScanner::Two(first, second) => byte == *first || byte == *second,
+        StartScanner::Three(first, second, third) => {
+            byte == *first || byte == *second || byte == *third
+        }
+        StartScanner::Range { start, end } => *start <= byte && byte <= *end,
+        StartScanner::AsciiSet { set, .. } => set.contains(byte),
+        StartScanner::Set(classifier) => classifier.set().contains(byte),
+    }
+}
+
+fn next_compact_probe_scan_position(
+    probe: &StartPositionProbe,
+    haystack: &[u8],
+    position: usize,
+    end: usize,
+    meter: &mut WorkMeter,
+) -> Result<usize, SearchError> {
+    let (length, members) = probe.compact_members();
+    match (length, members) {
+        (1, [first, _, _]) => {
+            next_small_start_candidate(haystack, position, end, meter, |source| {
+                memchr(*first, source)
+            })
+        }
+        (2, [first, second, _]) => {
+            next_small_start_candidate(haystack, position, end, meter, |source| {
+                memchr2(*first, *second, source)
+            })
+        }
+        (3, [first, second, third]) => {
+            next_small_start_candidate(haystack, position, end, meter, |source| {
+                memchr3(*first, *second, *third, source)
+            })
+        }
+        _ => Err(SearchError::InternalInvariant {
+            detail: "promoted deep Probe omitted its compact scan leaf",
+        }),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn next_start_candidate_promoted_deep_probe(
+    scanner: &StartPositionScanner,
+    guard: &StartPositionClass,
+    probe: &StartPositionProbe,
+    haystack: &[u8],
+    mut position: usize,
+    end: usize,
+    meter: &mut WorkMeter,
+    state: &mut AdaptiveStartProbe,
+) -> Result<usize, SearchError> {
+    debug_assert_eq!(meter.limit, u64::MAX);
+    debug_assert_eq!(state.phase, AdaptiveProbePhase::Active);
+    let probe_offset = usize::from(probe.offset);
+    let scanner_offset = usize::from(scanner.offset);
+    let guard_offset = usize::from(guard.offset);
+    loop {
+        let probe_start = position.checked_add(probe_offset).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "promoted deep Probe scan position",
+            },
+        )?;
+        if probe_start >= end {
+            return Ok(end);
+        }
+        let probe_position = next_compact_probe_scan_position(
+            probe,
+            haystack,
+            probe_start,
+            end,
+            meter,
+        )?;
+        if probe_position == end {
+            return Ok(end);
+        }
+        let candidate = probe_position.checked_sub(probe_offset).ok_or(
+            SearchError::InternalInvariant {
+                detail: "promoted deep Probe matched before its exact offset",
+            },
+        )?;
+
+        let scanner_position = candidate.checked_add(scanner_offset).ok_or(
+            SearchError::ArithmeticOverflow {
+                computation: "promoted deep Probe primary position",
+            },
+        )?;
+        meter.charge(1, candidate)?;
+        let primary_passed = scanner_position < end
+            && start_scanner_contains_byte(&scanner.scanner, haystack[scanner_position]);
+        if primary_passed {
+            let guard_position = candidate.checked_add(guard_offset).ok_or(
+                SearchError::ArithmeticOverflow {
+                    computation: "promoted deep Probe Guard position",
+                },
+            )?;
+            meter.charge(1, candidate)?;
+            if guard_position < end && guard.set.contains(haystack[guard_position]) {
+                state.phase = AdaptiveProbePhase::Disabled;
+                return Ok(candidate);
+            }
+        }
+        position = candidate
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "promoted deep Probe next candidate",
+            })?;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn next_start_candidate_guard_late_probe(
+    scanner: &StartPositionScanner,
+    guard: &StartPositionClass,
+    probe: &StartPositionProbe,
+    haystack: &[u8],
+    mut position: usize,
+    end: usize,
+    meter: &mut WorkMeter,
+    cursor: &mut RetainedStartMaskCursor,
+    state: &mut AdaptiveStartProbe,
+) -> Result<usize, SearchError> {
+    debug_assert_eq!(state.phase, AdaptiveProbePhase::Active);
+    loop {
+        let candidate = next_start_candidate_retained(
+            scanner,
+            haystack,
+            position,
+            end,
+            Some(guard),
+            meter,
+            cursor,
+        )?;
+        if candidate == end {
+            return Ok(end);
+        }
+
+        // The outlined path runs only after two engine-rejected Guard
+        // survivors. Charge before reading the extra exact position; a
+        // truncated position remains a charged rejection.
+        meter.charge(1, candidate)?;
+        let probe_position = candidate
+            .checked_add(usize::from(probe.offset))
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "late adaptive start-probe position",
+            })?;
+        if probe_position < end && probe.set.contains(haystack[probe_position]) {
+            state.phase = AdaptiveProbePhase::Disabled;
+            return Ok(candidate);
+        }
+        position = candidate
+            .checked_add(1)
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "late adaptive start-probe next candidate",
             })?;
     }
 }
@@ -26689,7 +27093,7 @@ fn required_generation_count(
     // with one generation for each exact proof position.
     let mut required = bytes
         .checked_add(1)
-        .and_then(|count| count.checked_add(START_FILTER_POSITION_COUNT))
+        .and_then(|count| count.checked_add(START_FILTER_PROOF_POSITION_COUNT))
         .ok_or(SearchError::ArithmeticOverflow {
             computation: "required boundary generations",
         })?;
@@ -29390,9 +29794,12 @@ mod tests {
             BYTE_START_ASCII_CLASSIFIER_SELECTION_WORK, BYTE_START_BITMAP_POPULATION_WORK,
             BYTE_START_MEMBER_EXTRACTION_WORK, BYTE_START_RANGE_DETECTION_WORK,
             BYTE_START_SET_CLASSIFIER_BUILD_WORK, BYTE_START_SMALL_MAX_MEMBERS,
+            START_FILTER_DEEP_POSITION_COUNT, START_FILTER_DEEP_PROBE_MAX_BUILD_WORK,
+            START_FILTER_DEEP_PROBE_SELECTION_WORK,
             START_FILTER_GUARD_SELECTION_WORK, START_FILTER_MAX_OFFSET,
             START_FILTER_MAX_SELECTION_WORK, START_FILTER_POSITION_COUNT,
             START_FILTER_PROBE_RETENTION_WORK, START_FILTER_PROBE_SELECTION_WORK,
+            START_FILTER_PROOF_MAX_OFFSET, START_FILTER_PROOF_POSITION_COUNT,
             START_FILTER_SCANNER_SELECTION_WORK,
         },
         Automaton, CompileLimits, EarliestEnd, EdgeKind, Exists, K0OrderedResumeCompletion,
@@ -29666,6 +30073,41 @@ mod tests {
                 edge_kinds: vec![EdgeKind::ByteRange; ranges.len()],
                 byte_starts: ranges.iter().map(|&(start, _)| start).collect(),
                 byte_ends: ranges.iter().map(|&(_, end)| end).collect(),
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn dead_byte_chain(dead_offset: usize) -> Automaton {
+        assert!(dead_offset > 1);
+        let state_count = dead_offset.checked_add(2).unwrap();
+        let mut edge_offsets = Vec::with_capacity(state_count + 1);
+        for state in 0..=dead_offset {
+            edge_offsets.push(u32::try_from(state.min(dead_offset)).unwrap());
+        }
+        edge_offsets.push(u32::try_from(dead_offset).unwrap());
+        edge_offsets.push(u32::try_from(dead_offset).unwrap());
+        let mut byte_starts = vec![0; dead_offset];
+        let mut byte_ends = vec![u8::MAX; dead_offset];
+        byte_starts[0] = b'Q';
+        byte_ends[0] = b'Q';
+        byte_starts[1] = b'A';
+        byte_ends[1] = b'A';
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: (0..=dead_offset)
+                    .map(|_| StateRole::Consume)
+                    .chain(core::iter::once(StateRole::Accept))
+                    .collect(),
+                edge_offsets,
+                edge_targets: (1..=dead_offset)
+                    .map(|target| u32::try_from(target).unwrap())
+                    .collect(),
+                edge_kinds: vec![EdgeKind::ByteRange; dead_offset],
+                byte_starts,
+                byte_ends,
             },
             CompileLimits::default(),
         )
@@ -38906,6 +39348,9 @@ mod tests {
         assert_eq!(START_FILTER_POSITION_COUNT, ASCII_NARROW_BYTES * 2);
         assert_eq!(START_FILTER_POSITION_COUNT, 32);
         assert_eq!(START_FILTER_MAX_OFFSET, 31);
+        assert_eq!(START_FILTER_DEEP_POSITION_COUNT, 32);
+        assert_eq!(START_FILTER_PROOF_POSITION_COUNT, 64);
+        assert_eq!(START_FILTER_PROOF_MAX_OFFSET, 63);
 
         let expected_selection_work = START_FILTER_POSITION_COUNT
             .checked_mul(
@@ -38918,9 +39363,19 @@ mod tests {
                     .checked_mul(START_FILTER_GUARD_SELECTION_WORK)
                     .and_then(|guards| work.checked_add(guards))
             })
+            .and_then(|work| {
+                START_FILTER_DEEP_POSITION_COUNT
+                    .checked_mul(
+                        BYTE_START_BITMAP_POPULATION_WORK
+                            .checked_add(START_FILTER_DEEP_PROBE_SELECTION_WORK)
+                            .unwrap(),
+                    )
+                    .and_then(|deep| work.checked_add(deep))
+            })
             .and_then(|work| work.checked_add(BYTE_START_RANGE_DETECTION_WORK))
             .and_then(|work| work.checked_add(BYTE_START_SET_CLASSIFIER_BUILD_WORK))
             .and_then(|work| work.checked_add(START_FILTER_PROBE_SELECTION_WORK))
+            .and_then(|work| work.checked_add(START_FILTER_DEEP_PROBE_MAX_BUILD_WORK))
             .unwrap();
         assert_eq!(START_FILTER_MAX_SELECTION_WORK, expected_selection_work);
         #[cfg(any(
@@ -38928,17 +39383,17 @@ mod tests {
             target_arch = "x86_64",
             all(target_arch = "aarch64", target_os = "linux", target_endian = "little")
         ))]
-        assert_eq!(START_FILTER_MAX_SELECTION_WORK, 588);
+        assert_eq!(START_FILTER_MAX_SELECTION_WORK, 752);
         #[cfg(not(any(
             feature = "static-dispatch",
             target_arch = "x86_64",
             all(target_arch = "aarch64", target_os = "linux", target_endian = "little")
         )))]
-        assert_eq!(START_FILTER_MAX_SELECTION_WORK, 587);
+        assert_eq!(START_FILTER_MAX_SELECTION_WORK, 751);
 
         // All exact-position sets remain a transient cold stack value. The
         // immutable owner still retains only its selected scanner and guard.
-        let expected_transient_bytes = START_FILTER_POSITION_COUNT
+        let expected_transient_bytes = START_FILTER_PROOF_POSITION_COUNT
             .checked_mul(size_of::<ByteSet>())
             .and_then(|bytes| bytes.checked_add(size_of::<usize>() * 2))
             .unwrap();
@@ -39804,6 +40259,211 @@ mod tests {
     }
 
     #[test]
+    fn deep_probe_selection_is_tier_bounded_stable_and_exact_charged() {
+        for absolute_offset in [32_usize, 33, 47, 63] {
+            let inspected = absolute_offset
+                .checked_sub(START_FILTER_POSITION_COUNT)
+                .and_then(|offset| offset.checked_add(1))
+                .unwrap();
+            let mut sets = vec![ByteSet::ALL; inspected];
+            *sets.last_mut().unwrap() = byte_set(b"Z");
+            let expected = u64::try_from(
+                inspected
+                    .checked_mul(
+                        BYTE_START_BITMAP_POPULATION_WORK
+                            .checked_add(START_FILTER_DEEP_PROBE_SELECTION_WORK)
+                            .unwrap(),
+                    )
+                    .unwrap(),
+            )
+            .unwrap();
+            let mut exact = WorkMeter::new(expected, 0);
+            assert_eq!(
+                super::select_deep_start_probe(&sets, &mut exact, 19).unwrap(),
+                Some((
+                    1,
+                    StartPositionClass::new(
+                        u8::try_from(absolute_offset).unwrap(),
+                        byte_set(b"Z"),
+                    ),
+                ))
+            );
+            assert_eq!(exact.consumed, expected);
+
+            let mut one_short = WorkMeter::new(expected - 1, 0);
+            let error =
+                super::select_deep_start_probe(&sets, &mut one_short, 19).unwrap_err();
+            assert!(matches!(
+                error,
+                SearchError::WorkLimitExceeded {
+                    limit,
+                    consumed,
+                    requested: 1,
+                    position: 19,
+                } if limit == expected - 1 && consumed == expected - 1
+            ));
+        }
+
+        let tied = vec![byte_set(b"YZ"); START_FILTER_DEEP_POSITION_COUNT];
+        let mut tied_meter = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            super::select_deep_start_probe(&tied, &mut tied_meter, 0).unwrap(),
+            Some((
+                2,
+                StartPositionClass::new(
+                    u8::try_from(START_FILTER_POSITION_COUNT).unwrap(),
+                    byte_set(b"YZ"),
+                ),
+            )),
+            "equal-cardinality tail classes keep the first geometric-tier offset"
+        );
+        assert_eq!(
+            tied_meter.consumed,
+            u64::try_from(
+                START_FILTER_DEEP_POSITION_COUNT
+                    * (BYTE_START_BITMAP_POPULATION_WORK
+                        + START_FILTER_DEEP_PROBE_SELECTION_WORK)
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn deep_probe_is_discovered_generically_across_the_second_tier() {
+        for probe_offset in [32_usize, 33, 47, 63] {
+            let mut ranges = vec![(0, u8::MAX); probe_offset + 1];
+            ranges[0] = (b'Q', b'Q');
+            ranges[1] = (b'A', b'A');
+            ranges[probe_offset] = (b'Z', b'Z');
+            let mut source = vec![b'x'; ranges.len()];
+            source[0] = b'Q';
+            source[1] = b'A';
+            source[probe_offset] = b'Z';
+            let automaton = byte_chain(&ranges);
+            assert_eq!(
+                automaton
+                    .prepare::<Span>()
+                    .search(&source, SearchLimits::unlimited())
+                    .unwrap()
+                    .into_output(),
+                Some(MatchSpan::new(0, source.len()))
+            );
+            let proof = automaton
+                .start_filter_proof
+                .get()
+                .expect("unlimited search publishes the two-tier proof");
+            assert!(matches!(proof.scanner, Some(StartPositionScanner { offset: 0, .. })));
+            assert!(matches!(proof.guard(), Some(guard) if guard.offset == 1));
+            assert!(matches!(
+                proof.probe(),
+                Some(probe) if usize::from(probe.offset) == probe_offset
+                    && probe.set == byte_set(b"Z")
+            ));
+        }
+
+        let refused_offset = START_FILTER_PROOF_POSITION_COUNT;
+        let mut ranges = vec![(0, u8::MAX); refused_offset + 1];
+        ranges[0] = (b'Q', b'Q');
+        ranges[1] = (b'A', b'A');
+        ranges[refused_offset] = (b'Z', b'Z');
+        let mut source = vec![b'x'; ranges.len()];
+        source[0] = b'Q';
+        source[1] = b'A';
+        source[refused_offset] = b'Z';
+        let automaton = byte_chain(&ranges);
+        let _ = automaton
+            .prepare::<Span>()
+            .search(&source, SearchLimits::unlimited())
+            .unwrap();
+        let proof = automaton.start_filter_proof.get().unwrap();
+        assert!(proof.guard().is_some());
+        assert_eq!(proof.probe(), None, "offset 64 lies outside the bounded tier");
+    }
+
+    #[test]
+    fn empty_second_tier_frontiers_publish_an_empty_scanner() {
+        for dead_offset in [32_usize, 47] {
+            let automaton = dead_byte_chain(dead_offset);
+            let source = vec![b'x'; dead_offset + 8];
+            let report = automaton
+                .prepare::<Span>()
+                .search(&source, SearchLimits::unlimited())
+                .unwrap();
+            assert_eq!(report.output(), &None, "dead offset {dead_offset}");
+            assert!(matches!(
+                automaton.start_filter_proof.get().and_then(|proof| proof.scanner),
+                Some(StartPositionScanner {
+                    offset: 0,
+                    scanner: StartScanner::Empty,
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn finite_tail_refusal_preserves_search_and_unlimited_retry_enriches() {
+        let mut ranges = vec![(0, u8::MAX); 33];
+        ranges[0] = (b'Q', b'Q');
+        ranges[1] = (b'A', b'A');
+        ranges[32] = (b'Z', b'Z');
+        let mut source = vec![b'x'; ranges.len()];
+        source[0] = b'Q';
+        source[1] = b'A';
+        source[32] = b'Z';
+
+        let measured = byte_chain(&ranges);
+        let mut measured_workspace =
+            K0Workspace::new(&measured, WorkspaceLimits::unlimited()).unwrap();
+        let cold = measured
+            .prepare::<Span>()
+            .search_with_workspace(
+                &source,
+                &mut measured_workspace,
+                SearchLimits::unlimited(),
+            )
+            .unwrap();
+        assert_eq!(cold.output(), &Some(MatchSpan::new(0, source.len())));
+        assert!(measured
+            .start_filter_proof
+            .get()
+            .is_some_and(|proof| proof.probe().is_some()));
+
+        let retry = byte_chain(&ranges);
+        let mut retry_workspace =
+            K0Workspace::new(&retry, WorkspaceLimits::unlimited()).unwrap();
+        let finite = retry
+            .prepare::<Span>()
+            .search_with_workspace(
+                &source,
+                &mut retry_workspace,
+                SearchLimits {
+                    max_work: cold.accounting().work().saturating_sub(1),
+                    max_scratch_bytes: usize::MAX,
+                },
+            )
+            .unwrap();
+        assert_eq!(finite.output(), cold.output());
+        assert!(
+            retry.start_filter_proof.get().is_none(),
+            "resource-dependent primary-only proof must remain retryable"
+        );
+
+        let enriched = retry
+            .prepare::<Span>()
+            .search_with_workspace(
+                &source,
+                &mut retry_workspace,
+                SearchLimits::unlimited(),
+            )
+            .unwrap();
+        assert_eq!(enriched.output(), cold.output());
+        assert!(matches!(
+            retry.start_filter_proof.get().and_then(StartFilterProof::probe),
+            Some(probe) if probe.offset == 32
+        ));
+    }
+
+    #[test]
     #[allow(
         clippy::too_many_lines,
         reason = "the exact state-machine trace keeps every transition and N/N-1 charge adjacent"
@@ -39974,6 +40634,292 @@ mod tests {
             })
         ));
         assert_eq!(postmortem, postmortem_before);
+    }
+
+    #[test]
+    fn late_probe_observes_only_guard_survivors_then_filters_in_order() {
+        const STRIDE: usize = 40;
+        let scanner = root_scanner(StartScanner::One(b'Q'));
+        let guard = StartPositionClass::new(1, byte_set(b"A"));
+        let probe = StartPositionProbe::new(
+            StartPositionClass::new(32, byte_set(b"Z")),
+            None,
+        );
+        let mut source = vec![b'x'; 4 * STRIDE + 33];
+        for candidate in [0, STRIDE, 2 * STRIDE, 3 * STRIDE, 4 * STRIDE] {
+            source[candidate] = b'Q';
+        }
+        source[1] = b'A';
+        source[STRIDE + 1] = b'A';
+        source[3 * STRIDE + 1] = b'A';
+        source[4 * STRIDE + 1] = b'A';
+        source[4 * STRIDE + 32] = b'Z';
+
+        let mut state = super::AdaptiveStartProbe::default();
+        let mut cursor = super::RetainedStartMaskCursor::default();
+        let mut meter = WorkMeter::new(u64::MAX, 0);
+        let first = super::next_start_candidate_adaptive(
+            &scanner,
+            &source,
+            0,
+            source.len(),
+            Some(&guard),
+            Some(&probe),
+            &mut meter,
+            &mut cursor,
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(first, 0);
+        state
+            .observe_restartable_rejection(&probe, &source, first, source.len(), &mut meter)
+            .unwrap();
+        assert_eq!(state.phase, super::AdaptiveProbePhase::Inactive);
+
+        let second = super::next_start_candidate_adaptive(
+            &scanner,
+            &source,
+            1,
+            source.len(),
+            Some(&guard),
+            Some(&probe),
+            &mut meter,
+            &mut cursor,
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(second, STRIDE);
+        state
+            .observe_restartable_rejection(&probe, &source, second, source.len(), &mut meter)
+            .unwrap();
+        assert_eq!(state.phase, super::AdaptiveProbePhase::Active);
+
+        let passing = super::next_start_candidate_adaptive(
+            &scanner,
+            &source,
+            second + 1,
+            source.len(),
+            Some(&guard),
+            Some(&probe),
+            &mut meter,
+            &mut cursor,
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(passing, 4 * STRIDE);
+        assert_eq!(state.phase, super::AdaptiveProbePhase::Disabled);
+
+        let q0_source = [b'Q', b'x', b'Q', b'x', b'Q', b'x'];
+        let mut adaptive_meter = WorkMeter::new(u64::MAX, 0);
+        let mut adaptive_cursor = super::RetainedStartMaskCursor::default();
+        let mut inactive = super::AdaptiveStartProbe::default();
+        let adaptive = super::next_start_candidate_adaptive(
+            &scanner,
+            &q0_source,
+            0,
+            q0_source.len(),
+            Some(&guard),
+            Some(&probe),
+            &mut adaptive_meter,
+            &mut adaptive_cursor,
+            &mut inactive,
+        )
+        .unwrap();
+        let mut direct_meter = WorkMeter::new(u64::MAX, 0);
+        let mut direct_cursor = super::RetainedStartMaskCursor::default();
+        let direct = super::next_start_candidate_retained(
+            &scanner,
+            &q0_source,
+            0,
+            q0_source.len(),
+            Some(&guard),
+            &mut direct_meter,
+            &mut direct_cursor,
+        )
+        .unwrap();
+        assert_eq!(adaptive, direct);
+        assert_eq!(adaptive_meter.consumed, direct_meter.consumed);
+        assert_eq!(adaptive_cursor, direct_cursor);
+    }
+
+    #[test]
+    fn compact_deep_probe_promotes_in_order_and_checks_primary_before_guard() {
+        let scanner = root_scanner(StartScanner::One(b'Q'));
+        let guard = StartPositionClass::new(1, byte_set(b"A"));
+        let probe = StartPositionProbe::new_compact(
+            StartPositionClass::new(32, byte_set(b"Z")),
+            [b'Z', 0, 0],
+            1,
+        )
+        .unwrap();
+        let mut source = vec![b'x'; 5 * 40 + 33];
+        // The first deep hit fails the primary. The second passes the primary
+        // but fails the Guard. The third complete survivor is returned.
+        source[32] = b'Z';
+        source[40] = b'Q';
+        source[40 + 32] = b'Z';
+        source[120] = b'Q';
+        source[121] = b'A';
+        source[120 + 32] = b'Z';
+
+        let mut state = super::AdaptiveStartProbe {
+            phase: super::AdaptiveProbePhase::Active,
+            consecutive_rejections: 2,
+        };
+        let mut cursor = super::RetainedStartMaskCursor {
+            base: 0,
+            width: 16,
+            members: u64::MAX,
+        };
+        let mut meter = WorkMeter::new(u64::MAX, 0);
+        assert_eq!(
+            super::next_start_candidate_adaptive(
+                &scanner,
+                &source,
+                0,
+                source.len(),
+                Some(&guard),
+                Some(&probe),
+                &mut meter,
+                &mut cursor,
+                &mut state,
+            )
+            .unwrap(),
+            120
+        );
+        assert_eq!(meter.consumed, 126);
+        assert_eq!(state.phase, super::AdaptiveProbePhase::Disabled);
+        assert_eq!(cursor, super::RetainedStartMaskCursor::default());
+
+        assert!(StartPositionProbe::new_compact(
+            StartPositionClass::new(32, byte_set(b"Z")),
+            [b'Z', 0, 0],
+            4,
+        )
+        .is_none());
+        assert!(StartPositionProbe::new_compact(
+            StartPositionClass::new(32, byte_set(b"YZ")),
+            [b'Y', b'Y', 0],
+            2,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn compact_deep_probe_dispatches_one_two_three_and_finite_stays_scalar() {
+        for (set, members, length, first_match) in [
+            (byte_set(b"Z"), [b'Z', 0, 0], 1, b'Z'),
+            (byte_set(b"YZ"), [b'Y', b'Z', 0], 2, b'Y'),
+            (byte_set(b"XYZ"), [b'X', b'Y', b'Z'], 3, b'X'),
+        ] {
+            let probe = StartPositionProbe::new_compact(
+                StartPositionClass::new(32, set),
+                members,
+                length,
+            )
+            .unwrap();
+            let mut source = [b'x'; 96];
+            source[47] = first_match;
+            let mut meter = WorkMeter::new(u64::MAX, 0);
+            assert_eq!(
+                super::next_compact_probe_scan_position(
+                    &probe,
+                    &source,
+                    32,
+                    source.len(),
+                    &mut meter,
+                )
+                .unwrap(),
+                47
+            );
+            assert_eq!(meter.consumed, 16);
+        }
+
+        let scanner = root_scanner(StartScanner::One(b'Q'));
+        let guard = StartPositionClass::new(1, byte_set(b"A"));
+        let compact = StartPositionProbe::new_compact(
+            StartPositionClass::new(32, byte_set(b"Z")),
+            [b'Z', 0, 0],
+            1,
+        )
+        .unwrap();
+        let scalar = StartPositionProbe::new(
+            StartPositionClass::new(32, byte_set(b"Z")),
+            None,
+        );
+        let mut source = vec![b'x'; 80];
+        source[0] = b'Q';
+        source[1] = b'A';
+        for limit in [1_u64, 2, 3, 32, 33, 64] {
+            let mut compact_state = super::AdaptiveStartProbe {
+                phase: super::AdaptiveProbePhase::Active,
+                consecutive_rejections: 2,
+            };
+            let mut scalar_state = compact_state;
+            let mut compact_cursor = super::RetainedStartMaskCursor::default();
+            let mut scalar_cursor = super::RetainedStartMaskCursor::default();
+            let mut compact_meter = WorkMeter::new(limit, 0);
+            let mut scalar_meter = WorkMeter::new(limit, 0);
+            let compact_result = super::next_start_candidate_adaptive(
+                &scanner,
+                &source,
+                0,
+                source.len(),
+                Some(&guard),
+                Some(&compact),
+                &mut compact_meter,
+                &mut compact_cursor,
+                &mut compact_state,
+            );
+            let scalar_result = super::next_start_candidate_adaptive(
+                &scanner,
+                &source,
+                0,
+                source.len(),
+                Some(&guard),
+                Some(&scalar),
+                &mut scalar_meter,
+                &mut scalar_cursor,
+                &mut scalar_state,
+            );
+            assert_eq!(compact_result, scalar_result, "limit={limit}");
+            assert_eq!(compact_meter.consumed, scalar_meter.consumed, "limit={limit}");
+            assert_eq!(compact_cursor, scalar_cursor, "limit={limit}");
+            assert_eq!(compact_state, scalar_state, "limit={limit}");
+        }
+    }
+
+    #[test]
+    fn guard_and_deep_probe_match_unspecialized_across_windows_and_truncation() {
+        let mut ranges = vec![(0, u8::MAX); 33];
+        ranges[0] = (b'Q', b'Q');
+        ranges[1] = (b'A', b'A');
+        ranges[32] = (b'Z', b'Z');
+        let specialized = byte_chain(&ranges);
+        let reference = byte_chain(&ranges);
+        let mut valid = vec![b'x'; ranges.len()];
+        valid[0] = b'Q';
+        valid[1] = b'A';
+        valid[32] = b'Z';
+        let mut shifted = vec![b'?'; 7];
+        shifted.extend_from_slice(&valid);
+        let mut truncated = valid.clone();
+        truncated.pop();
+        let mut rejecting = vec![b'x'; 3 * 40 + ranges.len()];
+        for candidate in [0, 40, 80, 120] {
+            rejecting[candidate] = b'Q';
+            rejecting[candidate + 1] = b'A';
+        }
+        rejecting[120 + 32] = b'Z';
+        assert_all_windows_match_unspecialized(
+            "guard-and-deep-probe",
+            &specialized,
+            &reference,
+            &[vec![], truncated, valid, shifted, rejecting],
+        );
+        let proof = specialized.start_filter_proof.get().unwrap();
+        assert!(matches!(proof.guard(), Some(guard) if guard.offset == 1));
+        assert!(matches!(proof.probe(), Some(probe) if probe.offset == 32));
     }
 
     #[test]
@@ -41253,8 +42199,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             post_proof.checked_sub(automaton_work).unwrap(),
-            input.checked_mul(2).unwrap(),
-            "the public certificate must reserve both pair classifications",
+            input.checked_mul(3).unwrap(),
+            "the public certificate must reserve pair replay plus a late Probe",
         );
     }
 
@@ -44740,6 +45686,12 @@ mod tests {
 
     #[test]
     fn start_filter_owner_layout_is_pointer_isolated() {
+        assert_eq!(size_of::<StartPositionClass>(), size_of::<ByteSet>() + 8);
+        assert_eq!(size_of::<StartPositionClass>(), 40);
+        assert_eq!(
+            size_of::<StartPositionProbe>(),
+            size_of::<StartPositionClass>()
+        );
         assert_eq!(
             size_of::<Option<EpsilonClosureDispatch>>(),
             size_of::<usize>(),
@@ -44751,9 +45703,9 @@ mod tests {
             "the ordered-edge dispatch owner must remain one optional pointer"
         );
         assert_eq!(
-            size_of::<Option<StartPositionFilter>>(),
-            size_of::<Option<StartPositionClass>>(),
-            "the Guard/Probe tag must reuse the incumbent optional-class discriminant"
+            size_of::<StartPositionFilter>(),
+            size_of::<StartPositionProbe>() + size_of::<Option<StartPositionProbe>>(),
+            "the immutable filter retains exactly one optional late Probe"
         );
         assert_eq!(
             StartFilterProofCell::PAYLOAD_BYTES,
@@ -44778,9 +45730,9 @@ mod tests {
             assert_eq!(size_of::<StartFilterProofCell>(), 16);
             assert_eq!(size_of::<Automaton>(), 448 + size_of::<usize>() * 2);
             #[cfg(feature = "static-dispatch")]
-            assert_eq!(size_of::<StartFilterProof>(), 192);
+            assert_eq!(size_of::<StartFilterProof>(), 224);
             #[cfg(not(feature = "static-dispatch"))]
-            assert_eq!(size_of::<StartFilterProof>(), 704);
+            assert_eq!(size_of::<StartFilterProof>(), 736);
         }
     }
 
@@ -45533,7 +46485,7 @@ mod tests {
     fn generation_rollover_is_preflighted_and_accounted_as_setup() {
         let required_generations = u64::try_from(
             1_usize
-                .checked_add(START_FILTER_POSITION_COUNT)
+                .checked_add(START_FILTER_PROOF_POSITION_COUNT)
                 .and_then(|count| count.checked_add(1))
                 .unwrap(),
         )
@@ -45625,7 +46577,7 @@ mod tests {
             super::required_generation_count(&plan, cold_window, mode.lazy, mode.reverse).unwrap();
         assert_eq!(
             endpoint_required,
-            u64::try_from(cold_haystack.len() + 1 + START_FILTER_POSITION_COUNT + 1,).unwrap()
+            u64::try_from(cold_haystack.len() + 1 + START_FILTER_PROOF_POSITION_COUNT + 1,).unwrap()
         );
         ordinary_preflight.generation = u64::MAX - endpoint_required;
         prepared_preflight.generation = u64::MAX - endpoint_required;

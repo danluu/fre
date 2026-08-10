@@ -33,18 +33,31 @@ fn next_automaton_identity() -> u64 {
         .unwrap_or_else(|_| panic!("automaton identity space exhausted"))
 }
 
-/// Number of exact consumed-byte positions retained by the bounded start
-/// filter. Any of offsets zero through thirty-one may supply the primary
-/// scanner; at most one other position may supply a secondary Guard or Probe.
+/// Number of exact consumed-byte positions in the primary bounded start-filter
+/// tier. Any of offsets zero through thirty-one may supply the primary scanner
+/// and at most one other primary-tier position may supply a Guard or Probe.
 pub(crate) const START_FILTER_POSITION_COUNT: usize = 32;
 /// Largest consumed-byte offset inspected by the bounded start filter.
 pub(crate) const START_FILTER_MAX_OFFSET: usize = START_FILTER_POSITION_COUNT - 1;
+/// Number of exact consumed-byte positions in the optional second proof tier.
+///
+/// Giving each tier the same width is a source-independent geometric policy:
+/// the first tier keeps all existing choices stable, while the second tier may
+/// retain one additional post-Guard Probe without privileging any one offset.
+pub(crate) const START_FILTER_DEEP_POSITION_COUNT: usize = START_FILTER_POSITION_COUNT;
+/// Total exact-position capacity of both bounded proof tiers.
+pub(crate) const START_FILTER_PROOF_POSITION_COUNT: usize =
+    START_FILTER_POSITION_COUNT + START_FILTER_DEEP_POSITION_COUNT;
+/// Largest consumed-byte offset represented by either bounded proof tier.
+pub(crate) const START_FILTER_PROOF_MAX_OFFSET: usize =
+    START_FILTER_PROOF_POSITION_COUNT - 1;
 /// Maximum secondary exact-position filters retained by one immutable proof.
-pub(crate) const START_FILTER_MAX_GUARDS: usize = 1;
+pub(crate) const START_FILTER_MAX_GUARDS: usize = 2;
 /// Maximum charged secondary classifications of one source position. A
 /// block-local Guard intersection may classify a lane once in its complete
 /// SIMD block and conservatively recheck a retained survivor as a scalar
-/// candidate on a later engine restart.
+/// candidate on a later engine restart; an independently retained deep Probe
+/// may then classify that Guard survivor once more.
 const START_FILTER_MAX_SECONDARY_CHECKS_PER_POSITION: usize =
     START_FILTER_MAX_GUARDS.saturating_add(1);
 /// Exact abstract work to count the members in all four byte-bitmap words.
@@ -84,9 +97,18 @@ pub(crate) const START_FILTER_SCANNER_SELECTION_WORK: usize = 1;
 /// Exact abstract work to compare one non-scanner position with the incumbent
 /// secondary filter.
 pub(crate) const START_FILTER_GUARD_SELECTION_WORK: usize = 1;
+/// Exact abstract work to compare one optional second-tier position with the
+/// incumbent deep Probe. Cardinality is charged independently as one complete
+/// four-word bitmap population.
+pub(crate) const START_FILTER_DEEP_PROBE_SELECTION_WORK: usize = 1;
 /// Optional work to retain one already-compared broad exact-position class as
 /// an adaptive Probe after the primary scanner has been fully constructed.
 pub(crate) const START_FILTER_PROBE_RETENTION_WORK: usize = 1;
+/// Maximum work to retain one deep Probe and materialize its compact
+/// one-to-three-member scan leaf in padding already owned by the exact class.
+pub(crate) const START_FILTER_DEEP_PROBE_MAX_BUILD_WORK: usize =
+    START_FILTER_PROBE_RETENTION_WORK
+        + BYTE_START_SMALL_MAX_MEMBERS * BYTE_START_MEMBER_EXTRACTION_WORK;
 /// Maximum optional Probe work, including exact contiguous-range detection
 /// when the primary scanner can retain a classified block intersection.
 pub(crate) const START_FILTER_PROBE_SELECTION_WORK: usize =
@@ -100,9 +122,12 @@ pub(crate) const START_FILTER_GUARD_MAX_CARDINALITY: u32 = 64;
 pub(crate) const START_FILTER_MAX_SELECTION_WORK: usize = START_FILTER_POSITION_COUNT
     * (BYTE_START_BITMAP_POPULATION_WORK + START_FILTER_SCANNER_SELECTION_WORK)
     + START_FILTER_MAX_OFFSET * START_FILTER_GUARD_SELECTION_WORK
+    + START_FILTER_DEEP_POSITION_COUNT
+        * (BYTE_START_BITMAP_POPULATION_WORK + START_FILTER_DEEP_PROBE_SELECTION_WORK)
     + BYTE_START_RANGE_DETECTION_WORK
     + BYTE_START_SET_CLASSIFIER_BUILD_WORK
-    + START_FILTER_PROBE_SELECTION_WORK;
+    + START_FILTER_PROBE_SELECTION_WORK
+    + START_FILTER_DEEP_PROBE_MAX_BUILD_WORK;
 
 /// The structural role of a Thompson state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -716,6 +741,8 @@ pub(crate) struct StartPositionClass {
     range_start: u8,
     range_end: u8,
     policy: StartPositionClassPolicy,
+    compact_probe_len: u8,
+    compact_probe_members: [u8; BYTE_START_SMALL_MAX_MEMBERS],
     pub(crate) set: ByteSet,
 }
 
@@ -726,6 +753,8 @@ impl StartPositionClass {
             range_start: 1,
             range_end: 0,
             policy: StartPositionClassPolicy::Ordinary,
+            compact_probe_len: 0,
+            compact_probe_members: [0; BYTE_START_SMALL_MAX_MEMBERS],
             set,
         }
     }
@@ -740,6 +769,16 @@ impl StartPositionClass {
             None => (1, 0),
         };
         self.policy = policy;
+        self
+    }
+
+    const fn with_compact_probe_members(
+        mut self,
+        members: [u8; BYTE_START_SMALL_MAX_MEMBERS],
+        length: u8,
+    ) -> Self {
+        self.compact_probe_len = length;
+        self.compact_probe_members = members;
         self
     }
 }
@@ -759,6 +798,31 @@ impl StartPositionProbe {
         Self {
             class: class.with_probe_policy(range, StartPositionClassPolicy::AdaptiveProbe),
         }
+    }
+
+    pub(crate) fn new_compact(
+        class: StartPositionClass,
+        members: [u8; BYTE_START_SMALL_MAX_MEMBERS],
+        length: u8,
+    ) -> Option<Self> {
+        let member_count = usize::from(length);
+        if !(1..=BYTE_START_SMALL_MAX_MEMBERS).contains(&member_count) {
+            return None;
+        }
+        let mut words = [0_u64; 4];
+        for &member in &members[..member_count] {
+            let word = usize::from(member / 64);
+            let bit = u32::from(member % 64);
+            words[word] |= 1_u64 << bit;
+        }
+        if ByteSet::from_words(words) != class.set {
+            return None;
+        }
+        Some(Self {
+            class: class
+                .with_probe_policy(None, StartPositionClassPolicy::AdaptiveProbe)
+                .with_compact_probe_members(members, length),
+        })
     }
 
     pub(crate) const fn new_guard_pair(
@@ -785,6 +849,15 @@ impl StartPositionProbe {
     pub(crate) const fn class(&self) -> &StartPositionClass {
         &self.class
     }
+
+    pub(crate) const fn compact_members(
+        &self,
+    ) -> (u8, &[u8; BYTE_START_SMALL_MAX_MEMBERS]) {
+        (
+            self.class.compact_probe_len,
+            &self.class.compact_probe_members,
+        )
+    }
 }
 
 impl Deref for StartPositionProbe {
@@ -804,20 +877,29 @@ impl Deref for StartPositionProbe {
 /// Keeping the policy in the immutable proof makes every route auditable
 /// without retaining any source-dependent state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(transparent)]
 pub(crate) struct StartPositionFilter {
     position: StartPositionProbe,
+    late_probe: Option<StartPositionProbe>,
 }
 
 impl StartPositionFilter {
     pub(crate) const fn new_guard(class: StartPositionClass) -> Self {
         Self {
             position: StartPositionProbe { class },
+            late_probe: None,
         }
     }
 
     pub(crate) const fn new_probe(probe: StartPositionProbe) -> Self {
-        Self { position: probe }
+        Self {
+            position: probe,
+            late_probe: None,
+        }
+    }
+
+    pub(crate) const fn with_late_probe(mut self, probe: StartPositionProbe) -> Self {
+        self.late_probe = Some(probe);
+        self
     }
 
     pub(crate) const fn guard(&self) -> Option<&StartPositionClass> {
@@ -836,6 +918,9 @@ impl StartPositionFilter {
     }
 
     pub(crate) const fn probe(&self) -> Option<&StartPositionProbe> {
+        if let Some(probe) = &self.late_probe {
+            return Some(probe);
+        }
         match self.position.class.policy {
             StartPositionClassPolicy::Ordinary => None,
             StartPositionClassPolicy::AdaptiveProbe | StartPositionClassPolicy::GuardPair => {
@@ -1287,16 +1372,17 @@ impl Automaton {
                 computation: "conservative transition work bound",
             })?;
         // The first successful invocation on an immutable automaton derives
-        // up to thirty-two exact-position byte classes and selects a scanner plus
-        // one secondary Guard or Probe. Each depth may inspect a state twice
+        // up to sixty-four exact-position byte classes in two equal tiers and
+        // selects a scanner plus bounded secondary filters. Each depth may
+        // inspect a state twice
         // and a consuming edge twice while building the next frontier, in
         // addition to the ordinary edge inspection. Later invocations read
         // the automaton-owned result.
         let start_proof = self.conservative_start_filter_proof_work_bound()?;
-        // The mutually exclusive retained Guard or adaptive Probe normally
-        // adds one membership check per candidate/source position. A retained
-        // block-local Guard survivor is conservatively rechecked after its
-        // SIMD classification, so reserve two secondary checks per position.
+        // A retained Guard or adaptive Probe normally adds one membership
+        // check per candidate/source position. A block-local Guard survivor
+        // may be conservatively rechecked after SIMD classification and then
+        // checked by one additional deep Probe, so reserve three checks.
         let secondary_filter = input
             .checked_mul(u64::try_from(START_FILTER_MAX_SECONDARY_CHECKS_PER_POSITION).map_err(
                 |_| SearchError::ArithmeticOverflow {
@@ -1315,20 +1401,9 @@ impl Automaton {
     }
 
     fn conservative_start_filter_proof_work_bound(&self) -> Result<u64, SearchError> {
-        let per_position = u64::try_from(self.stats.states)
-            .ok()
-            .and_then(|states| states.checked_mul(2))
-            .and_then(|states| {
-                u64::try_from(self.stats.edges)
-                    .ok()
-                    .and_then(|edges| edges.checked_mul(3))
-                    .and_then(|edges| states.checked_add(edges))
-            })
-            .ok_or(SearchError::ArithmeticOverflow {
-                computation: "start-filter per-position proof work bound",
-            })?;
+        let per_position = self.conservative_start_filter_position_work_bound()?;
         per_position
-            .checked_mul(u64::try_from(START_FILTER_POSITION_COUNT).map_err(|_| {
+            .checked_mul(u64::try_from(START_FILTER_PROOF_POSITION_COUNT).map_err(|_| {
                 SearchError::ArithmeticOverflow {
                     computation: "start-filter position count conversion",
                 }
@@ -1340,6 +1415,47 @@ impl Automaton {
             })
             .ok_or(SearchError::ArithmeticOverflow {
                 computation: "start-filter proof work bound",
+            })
+    }
+
+    pub(crate) fn conservative_start_filter_tail_work_bound(&self) -> Result<u64, SearchError> {
+        let per_position = self.conservative_start_filter_position_work_bound()?;
+        let selection = START_FILTER_DEEP_POSITION_COUNT
+            .checked_mul(
+                BYTE_START_BITMAP_POPULATION_WORK + START_FILTER_DEEP_PROBE_SELECTION_WORK,
+            )
+            .and_then(|work| work.checked_add(START_FILTER_DEEP_PROBE_MAX_BUILD_WORK))
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "deep start-filter selection work bound",
+            })?;
+        per_position
+            .checked_mul(u64::try_from(START_FILTER_DEEP_POSITION_COUNT).map_err(|_| {
+                SearchError::ArithmeticOverflow {
+                    computation: "deep start-filter position count conversion",
+                }
+            })?)
+            .and_then(|work| {
+                u64::try_from(selection)
+                    .ok()
+                    .and_then(|selection| work.checked_add(selection))
+            })
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "deep start-filter proof work bound",
+            })
+    }
+
+    fn conservative_start_filter_position_work_bound(&self) -> Result<u64, SearchError> {
+        u64::try_from(self.stats.states)
+            .ok()
+            .and_then(|states| states.checked_mul(2))
+            .and_then(|states| {
+                u64::try_from(self.stats.edges)
+                    .ok()
+                    .and_then(|edges| edges.checked_mul(3))
+                    .and_then(|edges| states.checked_add(edges))
+            })
+            .ok_or(SearchError::ArithmeticOverflow {
+                computation: "start-filter per-position proof work bound",
             })
     }
 
