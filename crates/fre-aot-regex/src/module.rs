@@ -17273,9 +17273,14 @@ fn lower_x86_64_dfa_with_entry_contract(
         assembler.branch(&[0x0f, 0x84], finish)?;
         x86_emit_set_row_from_cell(&mut assembler, layout.cells)?;
     }
-    // `scan` selects the initial scanner when its semantic preconditions hold,
-    // then falls through the selected interior-loop row guard otherwise.
-    assembler.branch(&[0xe9], scan)?;
+    // An exact absolute entry admits only one candidate and deliberately
+    // omits the moving root scanner's setup. Keep accelerator re-entry on the
+    // independently initialized loop-skip/scalar path in that contract.
+    // Ordinary entries retain the root scanner for later candidate starts.
+    assembler.branch(
+        &[0xe9],
+        if fixed_candidate { scalar_scan } else { scan },
+    )?;
 
     assembler.bind(partial_resume)?;
     if let Some(partial) = layout.partial {
@@ -30583,7 +30588,10 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
         assembler.instruction(aarch64_sub_w_imm(6, 6, 1)?)?;
     }
     aarch64_set_row_from_zero_based_cell(&mut assembler, layout.cells, 6)?;
-    assembler.branch(scan)?;
+    // Fixed exact-absolute entries omit all moving-scanner constants and the
+    // mixed SVE runtime-VL sample. Their accelerator edge may still reach a
+    // live row, so resume through the self-contained loop-skip/scalar path.
+    assembler.branch(if fixed_candidate { scalar_scan } else { scan })?;
 
     assembler.bind(partial_resume)?;
     if layout.partial.is_some() {
@@ -54528,6 +54536,60 @@ int main(void){{
             .unwrap();
         assert!(no_native_data.slow_aot_report().is_none());
         assert!(no_native_data.slow_context_aot_report().is_none());
+    }
+
+    #[test]
+    fn fixed_absolute_correlated_miss_reaches_a_live_accelerator_before_end() {
+        let pattern = r"\A(?:ab(?-u:.){4}X(?-u:.){9}|ac(?-u:.){4}Y(?-u:.){9})";
+        let haystack = b"ab0000Y000000000";
+        let target = Target::x86_64_linux();
+        let compiled = compile(
+            CompileRequest::new(pattern, target)
+                .mode(CompileMode::Fast)
+                .output(OutputContract::SelectedEnd),
+        )
+        .unwrap();
+        assert_eq!(
+            compiled
+                .search(haystack, SearchWindow::full(haystack))
+                .unwrap(),
+            MatchResult::SelectedEnd(None),
+        );
+        let candidate = compiled
+            .program()
+            .native_exact_absolute_anchored_program(
+                SlowAotLimits::default().determinize,
+                SlowAotLimits::default().max_allocation_bytes,
+            )
+            .unwrap()
+            .expect("exact absolute candidate");
+        let view = compiled
+            .program()
+            .native_exact_absolute_anchored_view(&candidate);
+        let (_, layout) = build_native_dfa_table(view).unwrap();
+        assert!(layout.start_filter.is_some());
+
+        let mut state = usize::try_from(view.dfa.initial_state).unwrap();
+        let mut accelerated_at = None;
+        for (index, &byte) in haystack.iter().enumerate() {
+            let class = usize::from(view.dfa.byte_classes[usize::from(byte)]);
+            let cell = view.dfa.forward_cells[state * view.dfa.class_count + class];
+            if cell.next() != NO_DFA_STATE
+                && cell.next() == 0
+                && index + 1 < haystack.len()
+            {
+                accelerated_at = Some(index);
+                break;
+            }
+            if cell.next() == NO_DFA_STATE {
+                break;
+            }
+            state = usize::try_from(cell.next()).unwrap();
+        }
+        assert!(
+            accelerated_at.is_some(),
+            "fixture did not reach a live root accelerator before the fixed end",
+        );
     }
 
     #[test]
@@ -82199,6 +82261,173 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 }
             }
         }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    #[test]
+    #[ignore = "links a fixed absolute candidate against an SVE poisoned-state guard page"]
+    fn linked_aarch64_fixed_absolute_accelerated_reentry_guard_page() {
+        use std::{fmt::Write as _, fs, process::Command};
+
+        assert!(std::arch::is_aarch64_feature_detected!("sve"));
+        let asimd = FeatureSet::of(CpuFeature::Aarch64Asimd);
+        let features = match std::env::var("FRE_AOT_AARCH64_SVE_GUARD_TIER").as_deref() {
+            Ok("sve2") => {
+                assert!(std::arch::is_aarch64_feature_detected!("sve2"));
+                asimd
+                    .with(CpuFeature::Aarch64Sve)
+                    .with(CpuFeature::Aarch64Sve2)
+            }
+            Ok("sve") | Err(_) => asimd.with(CpuFeature::Aarch64Sve),
+            Ok(tier) => panic!("unsupported AArch64 guard tier {tier:?}"),
+        };
+        let target = Target::aarch64_linux().with_features(features).unwrap();
+        let pattern = r"\A(?:ab(?-u:.){4}X(?-u:.){9}|ac(?-u:.){4}Y(?-u:.){9})";
+        let haystack = b"ab0000Y000000000";
+        assert_eq!(haystack.len(), 16);
+        let directory = std::env::temp_dir().join(format!(
+            "fre-aot-fixed-absolute-sve-guard-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let mut objects = Vec::new();
+        let mut symbols = Vec::new();
+
+        for output in [
+            OutputContract::Exists,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let compiled = compile(
+                CompileRequest::new(pattern, target)
+                    .mode(CompileMode::Fast)
+                    .output(output),
+            )
+            .unwrap();
+            assert!(matches!(
+                compiled
+                    .search(haystack, SearchWindow::full(haystack))
+                    .unwrap(),
+                MatchResult::Exists(false)
+                    | MatchResult::SelectedEnd(None)
+                    | MatchResult::Span(None)
+            ));
+            let candidate = compiled
+                .program()
+                .native_exact_absolute_anchored_program(
+                    SlowAotLimits::default().determinize,
+                    SlowAotLimits::default().max_allocation_bytes,
+                )
+                .unwrap()
+                .expect("correlated fixed absolute candidate");
+            let view = compiled
+                .program()
+                .native_exact_absolute_anchored_view(&candidate);
+            let layout = build_native_dfa_table(view).unwrap().1;
+            assert_eq!(view.exact_match_width, Some(haystack.len()));
+            assert!(layout
+                .start_filter
+                .is_some_and(|filter| !filter.ranges().is_empty()));
+            assert!(layout.exact_prefix_match_width.is_none());
+
+            let mut state = view.dfa.initial_state;
+            let mut took_live_root_before_end = false;
+            for (position, &byte) in haystack.iter().enumerate() {
+                let row = usize::try_from(state).unwrap();
+                let class = usize::from(view.dfa.byte_classes[usize::from(byte)]);
+                let cell = view.dfa.forward_cells[row * view.dfa.class_count + class];
+                let next = cell.next();
+                if next == 0 && position + 1 < haystack.len() {
+                    took_live_root_before_end = true;
+                }
+                if next == NO_DFA_STATE {
+                    break;
+                }
+                state = next;
+            }
+            assert!(
+                took_live_root_before_end,
+                "fixture must take an accelerated live-root edge before its fixed end"
+            );
+
+            let module = CompiledModule::lower_optimizing(compiled.program(), target).unwrap();
+            assert!(module.slow_aot_report().is_some());
+            let object = directory.join(format!("case-{}.o", objects.len()));
+            fs::write(
+                &object,
+                emit_object(&module, ObjectFormat::for_target(target), usize::MAX).unwrap(),
+            )
+            .unwrap();
+            objects.push(object);
+            symbols.push(module.entry_symbol().to_owned());
+        }
+
+        let mut source = String::from(
+            "#define _GNU_SOURCE\n#include <stdint.h>\n#include <stddef.h>\n#include <stdio.h>\n#include <string.h>\n#include <sys/mman.h>\n#include <sys/resource.h>\n#include <unistd.h>\n\
+             typedef uint32_t (*entry_t)(const unsigned char*,size_t,size_t,size_t,size_t*);\n\
+             extern uint32_t fre_call_with_poisoned_sve(const unsigned char*,size_t,size_t,size_t,size_t*,entry_t);\n",
+        );
+        for symbol in &symbols {
+            writeln!(
+                source,
+                "extern uint32_t {symbol}(const unsigned char*,size_t,size_t,size_t,size_t*);"
+            )
+            .unwrap();
+        }
+        source.push_str(
+            "static const unsigned char input[16]={'a','b','0','0','0','0','Y','0','0','0','0','0','0','0','0','0'};\n\
+             int main(void){struct rlimit z={0,0};if(setrlimit(RLIMIT_CORE,&z)!=0)return 79;long p=sysconf(_SC_PAGESIZE);if(p<=16)return 80;\n\
+             unsigned char*base=mmap(0,(size_t)p*2,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);if(base==MAP_FAILED)return 81;\n\
+             if(mprotect(base+p,(size_t)p,PROT_NONE)!=0)return 82;unsigned char*h=base+p-16;memcpy(h,input,16);size_t r[2];uint32_t s;\n",
+        );
+        for (index, symbol) in symbols.iter().enumerate() {
+            writeln!(
+                source,
+                "r[0]=99;r[1]=99;s=fre_call_with_poisoned_sve(h,16,0,16,r,{symbol});if(s!=0||r[0]!=0||r[1]!=0)return {};",
+                10 + index
+            )
+            .unwrap();
+        }
+        source.push_str(
+            "if(munmap(base,(size_t)p*2)!=0)return 83;puts(\"fixed-absolute-sve-guard-ok\");return 0;}\n",
+        );
+        let c_path = directory.join("guard.c");
+        let assembly_path = directory.join("poison.S");
+        fs::write(&c_path, source).unwrap();
+        fs::write(
+            &assembly_path,
+            ".text\n.global fre_call_with_poisoned_sve\n.type fre_call_with_poisoned_sve,%function\nfre_call_with_poisoned_sve:\nmov x16,#1\nmov x17,#1\nbr x5\n.size fre_call_with_poisoned_sve,.-fre_call_with_poisoned_sve\n.section .note.GNU-stack,\"\",%progbits\n",
+        )
+        .unwrap();
+        let executable = directory.join("guard");
+        let output = Command::new("cc")
+            .arg("-O0")
+            .arg(&c_path)
+            .arg(&assembly_path)
+            .args(&objects)
+            .arg("-o")
+            .arg(&executable)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = Command::new(&executable).output().unwrap();
+        assert!(
+            output.status.success(),
+            "status={:?} stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "fixed-absolute-sve-guard-ok"
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
