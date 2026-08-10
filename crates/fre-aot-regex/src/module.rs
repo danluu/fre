@@ -5942,13 +5942,17 @@ impl NativeDenseCandidateId {
 
 /// Target-explicit ranking for semantically identical dense partial tables.
 ///
-/// Direct-byte tables are admitted only by the established 24-KiB and
-/// expansion policy. Once admitted, their removed dependent load dominates
-/// footprint differences within that hot envelope. Candidates with the same
-/// lookup shape then compare exact emitted data, so row and column quotients
-/// win only when they reduce the real table plus auxiliary image.
+/// A concrete target first compares the final installed accelerator shape and
+/// its hot membership cost. Direct-byte tables are admitted only by the
+/// established 24-KiB and expansion policy; when the accelerator shape ties,
+/// their removed dependent load dominates footprint differences within that
+/// hot envelope. Candidates with the same lookup shape then compare exact
+/// emitted data, so row and column quotients win only when they reduce the
+/// real table plus auxiliary image.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct NativeDenseCandidateCost {
+    unavailable_target_accelerators: u8,
+    target_accelerator_instruction_units: u16,
     dependent_load_depth: u8,
     bytes_beyond_hot_budget: usize,
     hot_instruction_units: u8,
@@ -5986,6 +5990,8 @@ fn native_dense_candidate_cost(
         (Architecture::Aarch64, NativeCellEncoding::Wide32) => (5, 0),
     };
     Some(NativeDenseCandidateCost {
+        unavailable_target_accelerators: 0,
+        target_accelerator_instruction_units: 0,
         dependent_load_depth,
         bytes_beyond_hot_budget: data_bytes.saturating_sub(DIRECT_BYTE_TABLE_BUDGET),
         hot_instruction_units,
@@ -5995,6 +6001,159 @@ fn native_dense_candidate_cost(
         transforms: stable_id.transforms(),
         stable_id,
     })
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct NativeDenseTargetCost {
+    unavailable_accelerators: u8,
+    accelerator_instruction_units: u16,
+}
+
+fn native_aarch64_sve_filter_instruction_units(
+    filter: NativeStartFilter,
+    kind: Aarch64SveFilterKind,
+) -> u16 {
+    match kind {
+        Aarch64SveFilterKind::Sve => vector_filter_instruction_units(filter),
+        Aarch64SveFilterKind::Sve2 { .. } => 1,
+    }
+}
+
+fn add_native_dense_target_filter_cost(
+    cost: &mut NativeDenseTargetCost,
+    filter: NativeStartFilter,
+    kind: Aarch64SveFilterKind,
+) -> Result<(), ObjectError> {
+    cost.accelerator_instruction_units = cost
+        .accelerator_instruction_units
+        .checked_add(native_aarch64_sve_filter_instruction_units(filter, kind))
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "dense target accelerator instruction cost",
+        ))?;
+    Ok(())
+}
+
+/// Materialize every target-specific data sidecar before pricing a dense
+/// candidate. The returned instruction cost covers the scalable hot filters
+/// whose representation can change at the caller's `ProgramBytes` boundary.
+/// A missing direct SVE plan ranks after any semantically identical candidate
+/// that retained it; otherwise exact MATCH membership competes by its actual
+/// one-instruction hot cost before the ordinary DFA lookup tie breakers.
+fn native_dense_target_cost_and_final_data(
+    data: &mut Vec<u8>,
+    layout: &mut NativeDfaLayout,
+    target: Target,
+    maximum_table_bytes: usize,
+) -> Result<NativeDenseTargetCost, ObjectError> {
+    let sve_filter_plan = install_aarch64_sve_filter_plan_with_limit(
+        data,
+        *layout,
+        target,
+        maximum_table_bytes,
+    )?;
+    let sve_suffix_kind = install_aarch64_sve_suffix_kind_with_limit(
+        data,
+        *layout,
+        target,
+        maximum_table_bytes,
+    )?;
+    install_aarch64_sve_loop_storage_with_limit(
+        data,
+        layout,
+        target,
+        maximum_table_bytes,
+    )?;
+
+    if target.architecture != Architecture::Aarch64
+        || target.operating_system != OperatingSystem::Linux
+        || !target.features.has(CpuFeature::Aarch64Sve)
+    {
+        return Ok(NativeDenseTargetCost::default());
+    }
+
+    let mut cost = NativeDenseTargetCost::default();
+
+    if let Some(primary) = layout
+        .start_filter
+        .filter(|filter| !filter.ranges().is_empty())
+    {
+        if let Some(plan) = sve_filter_plan {
+            let relation_vector_owns_route = direct_relation_vector_owns_route(target)
+                && layout
+                    .prefix_relation
+                    .and_then(|relation| relation.vector_plan)
+                    .is_some();
+            let vector_filter = (!relation_vector_owns_route)
+                .then_some(layout.vector_filter)
+                .flatten();
+            plan.validate_for(primary, vector_filter)?;
+            if let Some(vector_filter) = vector_filter {
+                for (column, &filter) in vector_filter.columns().iter().enumerate() {
+                    add_native_dense_target_filter_cost(
+                        &mut cost,
+                        filter,
+                        plan.kind(column)?,
+                    )?;
+                }
+            } else {
+                add_native_dense_target_filter_cost(&mut cost, primary, plan.primary())?;
+            }
+        } else {
+            cost.unavailable_accelerators = cost.unavailable_accelerators.saturating_add(1);
+        }
+    }
+    if let Some(kind) = sve_suffix_kind {
+        let filter = layout
+            .suffix_filter
+            .ok_or(ObjectError::InvalidModule("SVE suffix plan has no filter"))?
+            .filter;
+        add_native_dense_target_filter_cost(&mut cost, filter, kind)?;
+    }
+    if let Some(kind) = selected_aarch64_sve_loop_kind(
+        layout,
+        target.features,
+        target.operating_system,
+    ) {
+        let filter = layout
+            .loop_skip
+            .ok_or(ObjectError::InvalidModule("SVE loop plan has no filter"))?
+            .filter;
+        add_native_dense_target_filter_cost(&mut cost, filter, kind)?;
+    }
+    Ok(cost)
+}
+
+fn native_dense_candidate_cost_for_target(
+    target: Target,
+    mut lowering: (Vec<u8>, NativeDfaLayout),
+    maximum_table_bytes: usize,
+    stable_id: NativeDenseCandidateId,
+) -> Result<Option<NativeDenseCandidateCost>, ObjectError> {
+    let target_cost = native_dense_target_cost_and_final_data(
+        &mut lowering.0,
+        &mut lowering.1,
+        target,
+        maximum_table_bytes,
+    )?;
+    if lowering.0.len() > maximum_table_bytes {
+        return Err(ObjectError::Resource {
+            resource: crate::CompileResource::ProgramBytes,
+            limit: maximum_table_bytes,
+            required: lowering.0.len(),
+        });
+    }
+    Ok(native_dense_candidate_cost(
+        target.architecture,
+        lowering.0.len(),
+        lowering.1,
+        stable_id,
+    )
+    .map(|mut cost| {
+        cost.unavailable_target_accelerators = target_cost.unavailable_accelerators;
+        cost.target_accelerator_instruction_units =
+            target_cost.accelerator_instruction_units;
+        cost
+    }))
 }
 
 fn require_native_start_scanner(
@@ -8698,6 +8857,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit(
         relation_vector_owns_route,
         max_native_data_bytes,
         architecture == Architecture::Aarch64,
+        None,
     )
 }
 
@@ -8721,6 +8881,7 @@ fn build_native_dfa_table_for_target_with_cost_model_and_data_limit(
         relation_vector_owns_route,
         max_native_data_bytes,
         target.features.has(CpuFeature::Aarch64Asimd),
+        Some(target),
     )
 }
 
@@ -8731,6 +8892,7 @@ fn build_native_dfa_table_with_cost_model_data_limit_and_asimd_policy(
     relation_vector_owns_route: bool,
     max_native_data_bytes: usize,
     permit_asimd_candidate_mask: bool,
+    ranking_target: Option<Target>,
 ) -> Result<(Vec<u8>, NativeDfaLayout), ObjectError> {
     let exact_rows = native_exact_row_intern_candidate_plan(view, architecture);
     // Derivation retains only maps and representative class ordinals. The
@@ -8759,12 +8921,21 @@ fn build_native_dfa_table_with_cost_model_data_limit_and_asimd_policy(
             permit_asimd_candidate_mask,
         ) {
             Ok(Some(lowering)) => {
-                let cost = native_dense_candidate_cost(
-                    architecture,
-                    lowering.0.len(),
-                    lowering.1,
-                    stable_id,
-                )
+                let cost = if let Some(target) = ranking_target {
+                    native_dense_candidate_cost_for_target(
+                        target,
+                        lowering,
+                        max_native_data_bytes,
+                        stable_id,
+                    )?
+                } else {
+                    native_dense_candidate_cost(
+                        architecture,
+                        lowering.0.len(),
+                        lowering.1,
+                        stable_id,
+                    )
+                }
                 .ok_or(ObjectError::InvalidModule(
                     "dense native candidate has a sparse layout",
                 ))?;
@@ -57323,6 +57494,164 @@ int main(void){{
                 }
             }
         }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the base and final target extents form one exact ProgramBytes boundary oracle"
+    )]
+    fn dense_ranking_accounts_for_final_sve2_match_data_under_the_program_cap() {
+        let compiled = compile_uniform_default_base(OutputContract::SelectedEnd);
+        let base = compiled
+            .program()
+            .native_dfa_view()
+            .expect("SVE2 dense-rank base native view");
+        let fixture = ExactRowInternFixture::new();
+        let view = fixture.view(base);
+        let features = FeatureSet::of(CpuFeature::Aarch64Sve)
+            .with(CpuFeature::Aarch64Sve2);
+        let target = Target::aarch64_linux().with_features(features).unwrap();
+        let cost_model = native_vector_filter_cost_model_for_target(target, true);
+        let relation_vector_owns_route = direct_relation_vector_owns_route(target);
+        let exact_rows = native_exact_row_intern_candidate_plan(view, Architecture::Aarch64)
+            .expect("exact-row dense candidate plan");
+
+        let direct = build_native_dense_candidate(
+            NativeDenseCandidateId::ExactRowsNatural,
+            view,
+            Architecture::Aarch64,
+            cost_model,
+            relation_vector_owns_route,
+            usize::MAX,
+            Some(&exact_rows),
+            None,
+            false,
+        )
+        .unwrap()
+        .expect("direct exact-row candidate");
+        let mapped = build_native_dense_candidate(
+            NativeDenseCandidateId::ExactRowsMapped,
+            view,
+            Architecture::Aarch64,
+            cost_model,
+            relation_vector_owns_route,
+            usize::MAX,
+            Some(&exact_rows),
+            None,
+            false,
+        )
+        .unwrap()
+        .expect("mapped exact-row candidate");
+        assert_eq!(direct.1.transitions, TransitionLayout::DirectByte);
+        assert_eq!(mapped.1.transitions, TransitionLayout::ClassMapped);
+        assert!(mapped.0.len() < direct.0.len());
+
+        // The direct image itself exactly consumes the caller's cap. The
+        // mapped equivalent leaves enough room for its target-specific MATCH
+        // table and must therefore win the final target-data comparison.
+        let maximum = direct.0.len();
+        let mut direct_data = direct.0.clone();
+        let direct_plan = install_aarch64_sve_filter_plan_with_limit(
+            &mut direct_data,
+            direct.1,
+            target,
+            maximum,
+        )
+        .unwrap()
+        .expect("direct base-SVE filter plan");
+        assert!(!direct_plan.uses_sve2());
+        assert_eq!(direct_data.len(), maximum);
+        let mut mapped_data = mapped.0.clone();
+        let mapped_plan = install_aarch64_sve_filter_plan_with_limit(
+            &mut mapped_data,
+            mapped.1,
+            target,
+            maximum,
+        )
+        .unwrap()
+        .expect("mapped SVE filter plan");
+        assert!(mapped_plan.uses_sve2());
+        assert!(mapped_data.len() <= maximum);
+
+        let direct_bounded_cost = native_dense_candidate_cost_for_target(
+            target,
+            direct.clone(),
+            maximum,
+            NativeDenseCandidateId::ExactRowsNatural,
+        )
+        .unwrap()
+        .unwrap();
+        let mapped_bounded_cost = native_dense_candidate_cost_for_target(
+            target,
+            mapped.clone(),
+            maximum,
+            NativeDenseCandidateId::ExactRowsMapped,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(direct_bounded_cost.bytes, maximum);
+        assert!(mapped_bounded_cost.bytes <= maximum);
+        assert!(
+            mapped_bounded_cost.target_accelerator_instruction_units
+                < direct_bounded_cost.target_accelerator_instruction_units
+        );
+        assert!(mapped_bounded_cost < direct_bounded_cost);
+
+        let unbounded_costs = [
+            native_dense_candidate_cost_for_target(
+                target,
+                direct.clone(),
+                usize::MAX,
+                NativeDenseCandidateId::ExactRowsNatural,
+            )
+            .unwrap()
+            .unwrap(),
+            native_dense_candidate_cost_for_target(
+                target,
+                mapped,
+                usize::MAX,
+                NativeDenseCandidateId::ExactRowsMapped,
+            )
+            .unwrap()
+            .unwrap(),
+        ];
+        assert_eq!(
+            unbounded_costs.iter().copied().min(),
+            unbounded_costs.iter().rev().copied().min(),
+        );
+        assert_eq!(
+            unbounded_costs.iter().copied().min().unwrap().stable_id,
+            NativeDenseCandidateId::ExactRowsNatural,
+        );
+
+        let unbounded = build_native_dfa_table_for_target_with_cost_model_and_data_limit(
+            view,
+            target,
+            cost_model,
+            relation_vector_owns_route,
+            usize::MAX,
+        )
+        .unwrap();
+        assert_eq!(unbounded.1.transitions, TransitionLayout::DirectByte);
+
+        let selected = build_native_dfa_table_for_target_with_cost_model_and_data_limit(
+            view,
+            target,
+            cost_model,
+            relation_vector_owns_route,
+            maximum,
+        )
+        .unwrap();
+        assert_eq!(selected.1.transitions, TransitionLayout::ClassMapped);
+
+        let lowering = lower_native_dfa_with_data_limit(view, target, maximum)
+            .unwrap()
+            .expect("mapped SVE2 lowering under the direct-table cap");
+        assert!(lowering.data.len() <= maximum);
+        assert!(lowering.code.chunks_exact(4).any(|bytes| {
+            bytes == aarch64_sve2_match_b(1, 0, 16).unwrap().to_le_bytes()
+        }));
     }
 
     #[test]
