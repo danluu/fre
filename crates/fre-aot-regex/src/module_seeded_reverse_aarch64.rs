@@ -448,6 +448,7 @@ mod tests {
             cells: NativeCellEncoding::Wide32,
             forward_offset: 0,
             reverse_offset: 0,
+            sparse_boundary_profile: None,
             asimd_lane_index_offset: None,
             initial_pending: false,
             initial_terminal: false,

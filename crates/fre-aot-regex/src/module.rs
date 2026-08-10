@@ -4762,9 +4762,73 @@ const MAX_NATIVE_DEFAULT_EXCEPTIONS: usize = 4;
 /// that semantic maximum rather than a regex- or target-specific recipe.
 const MAX_NATIVE_SPARSE_EXCEPTIONS: usize = CLASS_MAP_BYTES - 1;
 const NATIVE_SPARSE_VECTOR_LANES: usize = 16;
+/// Candidate duplicate-boundary probes are target-neutral properties of the
+/// serialized row. Keeping only the native SIMD boundaries used by a backend
+/// makes the graph profile fixed-size even when a retained DFA has many rows.
+const NATIVE_SPARSE_BOUNDARY_TIERS: [u8; 3] = [16, 32, 64];
 type NativeDefaultException = Option<(u8, ForwardCell)>;
 type NativeDefaultExceptionRow<const CAPACITY: usize> =
     (ForwardCell, [NativeDefaultException; CAPACITY], usize);
+
+/// Cumulative graph weight available to a duplicate-padding boundary guard.
+///
+/// `stoppable_default_byte_units[i]` is the sum, over semantic DFA rows whose
+/// exact exception count is at most `NATIVE_SPARSE_BOUNDARY_TIERS[i]`, of the
+/// number of raw input bytes selecting that row's modal default.
+/// `stoppable_row_byte_units[i]` counts every byte in those same rows, so a
+/// backend can charge short-route overhead on exception hits as well. Exact-row
+/// interning deliberately does not reduce `semantic_rows`: aliases remain
+/// distinct graph states and therefore still pay the proposed hot guard.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeSparseBoundaryProfile {
+    semantic_rows: u64,
+    stoppable_default_byte_units: [u64; NATIVE_SPARSE_BOUNDARY_TIERS.len()],
+    stoppable_row_byte_units: [u64; NATIVE_SPARSE_BOUNDARY_TIERS.len()],
+}
+
+impl NativeSparseBoundaryProfile {
+    fn stoppable_default_byte_units(self, threshold: u8) -> Option<u64> {
+        NATIVE_SPARSE_BOUNDARY_TIERS
+            .iter()
+            .position(|&tier| tier == threshold)
+            .and_then(|index| self.stoppable_default_byte_units.get(index).copied())
+    }
+
+    fn stoppable_row_byte_units(self, threshold: u8) -> Option<u64> {
+        NATIVE_SPARSE_BOUNDARY_TIERS
+            .iter()
+            .position(|&tier| tier == threshold)
+            .and_then(|index| self.stoppable_row_byte_units.get(index).copied())
+    }
+
+    fn is_valid(self) -> bool {
+        if self.semantic_rows == 0 {
+            return false;
+        }
+        let Ok(byte_units) = u64::try_from(CLASS_MAP_BYTES) else {
+            return false;
+        };
+        let Some(maximum) = self.semantic_rows.checked_mul(byte_units) else {
+            return false;
+        };
+        self.stoppable_default_byte_units
+            .into_iter()
+            .zip(self.stoppable_row_byte_units)
+            .try_fold(
+                (0_u64, 0_u64),
+                |(prior_defaults, prior_rows), (defaults, rows)| {
+                    let default_delta = defaults.checked_sub(prior_defaults)?;
+                    let row_delta = rows.checked_sub(prior_rows)?;
+                    (rows <= maximum
+                        && rows.is_multiple_of(byte_units)
+                        && defaults <= rows
+                        && default_delta <= row_delta)
+                        .then_some((defaults, rows))
+                },
+            )
+            .is_some()
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct NativeDefaultExceptionPlan {
@@ -4772,6 +4836,7 @@ struct NativeDefaultExceptionPlan {
     keys: NativeDefaultExceptionKeys,
     cells: NativeCellEncoding,
     row_bytes: usize,
+    sparse_boundary_profile: Option<NativeSparseBoundaryProfile>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5707,6 +5772,74 @@ fn native_sparse_default_byte_exception_row(
     (next == exception_count).then_some((default, exceptions, exception_count))
 }
 
+/// Retain only the cumulative graph facts consumed by target-specific
+/// duplicate-boundary admission. Guaranteed savings are deliberately
+/// restricted to bytes selecting the modal default: those are structurally
+/// known misses in the exception list. Full stoppable-row weight is retained
+/// separately so backend overhead also covers exception hits.
+fn derive_native_sparse_boundary_profile(
+    dfa: NativeDfaView<'_>,
+    normalization: NativeDefaultExceptionNormalization,
+    keys: NativeDefaultExceptionKeys,
+) -> Option<NativeSparseBoundaryProfile> {
+    if !matches!(keys, NativeDefaultExceptionKeys::Classes | NativeDefaultExceptionKeys::Bytes)
+    {
+        return None;
+    }
+    if dfa.byte_classes.len() != CLASS_MAP_BYTES
+        || dfa.class_count == 0
+        || !dfa.forward_cells.len().is_multiple_of(dfa.class_count)
+    {
+        return None;
+    }
+    let semantic_rows = dfa.forward_cells.len().checked_div(dfa.class_count)?;
+    let mut stoppable_default_byte_units = [0_u64; NATIVE_SPARSE_BOUNDARY_TIERS.len()];
+    let mut stoppable_row_byte_units = [0_u64; NATIVE_SPARSE_BOUNDARY_TIERS.len()];
+    let row_byte_units = u64::try_from(CLASS_MAP_BYTES).ok()?;
+    for row in dfa.forward_cells.chunks_exact(dfa.class_count) {
+        let (exception_count, default_byte_units) = match keys {
+            NativeDefaultExceptionKeys::Classes => {
+                let (default, _, exception_count) =
+                    native_sparse_default_exception_row(row, normalization)?;
+                let mut default_byte_units = 0_u64;
+                for &class in dfa.byte_classes {
+                    let cell = normalization.normalize(*row.get(usize::from(class))?)?;
+                    if cell == default {
+                        default_byte_units = default_byte_units.checked_add(1)?;
+                    }
+                }
+                (exception_count, default_byte_units)
+            }
+            NativeDefaultExceptionKeys::Bytes => {
+                let (_, _, exception_count) = native_sparse_default_byte_exception_row(
+                    row,
+                    dfa.byte_classes,
+                    normalization,
+                )?;
+                let exception_count_u64 = u64::try_from(exception_count).ok()?;
+                let default_byte_units =
+                    u64::try_from(CLASS_MAP_BYTES).ok()?.checked_sub(exception_count_u64)?;
+                (exception_count, default_byte_units)
+            }
+            NativeDefaultExceptionKeys::Boundaries => unreachable!("filtered sparse key kind"),
+        };
+        for (index, &threshold) in NATIVE_SPARSE_BOUNDARY_TIERS.iter().enumerate() {
+            if exception_count <= usize::from(threshold) {
+                let weight = stoppable_default_byte_units.get_mut(index)?;
+                *weight = weight.checked_add(default_byte_units)?;
+                let row_weight = stoppable_row_byte_units.get_mut(index)?;
+                *row_weight = row_weight.checked_add(row_byte_units)?;
+            }
+        }
+    }
+    let profile = NativeSparseBoundaryProfile {
+        semantic_rows: u64::try_from(semantic_rows).ok()?,
+        stoppable_default_byte_units,
+        stoppable_row_byte_units,
+    };
+    profile.is_valid().then_some(profile)
+}
+
 fn append_native_default_exception_record<F>(
     bytes: &mut Vec<u8>,
     default: ForwardCell,
@@ -5780,6 +5913,10 @@ where
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "three exact sparse representations, packed geometry and the cumulative profile share one selection transaction"
+)]
 fn derive_native_default_exception_plan(
     dfa: NativeDfaView<'_>,
     partial_discovered_states: Option<usize>,
@@ -5866,6 +6003,11 @@ fn derive_native_default_exception_plan(
         }
         (None, None) => (NativeDefaultExceptionKeys::Classes, exception_capacity),
     };
+    let sparse_boundary_profile = if exception_capacity > MAX_NATIVE_DEFAULT_EXCEPTIONS {
+        Some(derive_native_sparse_boundary_profile(dfa, normalization, keys)?)
+    } else {
+        None
+    };
     let exception_capacity = u8::try_from(exception_capacity).ok()?;
     let transitions = keys.transitions(exception_capacity);
     let (cells, row_bytes) = select_native_default_exception_encoding(
@@ -5904,6 +6046,7 @@ fn derive_native_default_exception_plan(
         keys,
         cells,
         row_bytes,
+        sparse_boundary_profile,
     })
 }
 
@@ -6672,9 +6815,21 @@ fn native_default_exception_layout_is_valid(layout: &NativeDfaLayout) -> bool {
         | TransitionLayout::DefaultByteSparseExceptions(capacity) => {
             usize::from(capacity) > MAX_NATIVE_DEFAULT_EXCEPTIONS
         }
-        TransitionLayout::ClassMapped | TransitionLayout::DirectByte => return true,
+        TransitionLayout::ClassMapped | TransitionLayout::DirectByte => {
+            return layout.sparse_boundary_profile.is_none();
+        }
     };
-    width_is_valid && capacity_is_valid && layout.partial.is_some() && !layout.has_reverse
+    let sparse_profile_is_valid = match layout.transitions.scalable_exception_capacity() {
+        Some(_) => layout
+            .sparse_boundary_profile
+            .is_some_and(NativeSparseBoundaryProfile::is_valid),
+        None => layout.sparse_boundary_profile.is_none(),
+    };
+    width_is_valid
+        && capacity_is_valid
+        && sparse_profile_is_valid
+        && layout.partial.is_some()
+        && !layout.has_reverse
 }
 
 fn native_row_bytes(
@@ -7671,6 +7826,9 @@ struct NativeDfaLayout {
     cells: NativeCellEncoding,
     forward_offset: u32,
     reverse_offset: u32,
+    /// Target-neutral graph weights for one optional duplicate-padding guard.
+    /// Present exactly for scalable sparse resource-fallback rows.
+    sparse_boundary_profile: Option<NativeSparseBoundaryProfile>,
     /// Table-relative address of `[0, 1, ..., 15]` used only by the `AArch64`
     /// ASIMD exact first-lane lowering.
     asimd_lane_index_offset: Option<u32>,
@@ -9605,6 +9763,14 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
             forward_states,
             encoded_hole_states,
         ) == Some((plan.cells, plan.row_bytes));
+        let sparse_profile_is_valid = if usize::from(plan.exception_capacity)
+            > MAX_NATIVE_DEFAULT_EXCEPTIONS
+        {
+            plan.sparse_boundary_profile
+                .is_some_and(NativeSparseBoundaryProfile::is_valid)
+        } else {
+            plan.sparse_boundary_profile.is_none()
+        };
         if encoded_hole_states == 0
             || retained_reverse_states != 0
             || usize::from(plan.exception_capacity) > MAX_NATIVE_SPARSE_EXCEPTIONS
@@ -9613,6 +9779,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
                 NativeDefaultExceptionKeys::Bytes | NativeDefaultExceptionKeys::Boundaries
             ) && plan.exception_capacity == 0)
             || !encoding_is_valid
+            || !sparse_profile_is_valid
         {
             return Err(ObjectError::InvalidModule(
                 "default-exception rows have an invalid partial shape",
@@ -10661,6 +10828,8 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
             cells,
             forward_offset: forward_offset_u32,
             reverse_offset: reverse_offset_u32,
+            sparse_boundary_profile: default_exceptions
+                .and_then(|plan| plan.sparse_boundary_profile),
             asimd_lane_index_offset,
             initial_pending: dfa.initial_pending,
             initial_terminal: dfa.initial_terminal,
@@ -13859,6 +14028,151 @@ fn native_sparse_chunk_plan(
     })
 }
 
+/// Minimum number of comparisons made by the emitted balanced scalar tree
+/// for a key that is absent from a non-empty range. The hot profile counts
+/// only modal-default bytes, which are proved absent from every exception
+/// range, so this lower bound applies to every weighted query.
+fn native_sparse_binary_miss_comparisons(width: usize) -> Option<usize> {
+    if width == 0 {
+        return Some(0);
+    }
+    if width == 1 {
+        return Some(1);
+    }
+    let midpoint = width.checked_div(2)?;
+    let lower = native_sparse_binary_miss_comparisons(midpoint)?.checked_add(1)?;
+    let higher_width = width.checked_sub(midpoint)?.checked_sub(1)?;
+    let higher = if higher_width == 0 {
+        1
+    } else {
+        native_sparse_binary_miss_comparisons(higher_width)?.checked_add(1)?
+    };
+    Some(lower.min(higher))
+}
+
+/// Instruction-equivalent work on the common no-exception path for the exact
+/// emitted plan. This deliberately uses the plan's vector chunk count and its
+/// separate scalar tail instead of approximating work as `ceil(C / tier)`.
+fn native_sparse_plan_miss_units(
+    plan: NativeSparseChunkPlan,
+    vector_chunk_units: u8,
+    scalar_compare_units: u8,
+) -> Option<u128> {
+    native_sparse_plan_miss_units_with_scalar(
+        plan,
+        vector_chunk_units,
+        scalar_compare_units,
+        true,
+    )
+}
+
+fn native_sparse_plan_miss_units_with_scalar(
+    plan: NativeSparseChunkPlan,
+    vector_chunk_units: u8,
+    scalar_compare_units: u8,
+    include_scalar_tail: bool,
+) -> Option<u128> {
+    if vector_chunk_units == 0 || scalar_compare_units == 0 {
+        return None;
+    }
+    let vector = u128::try_from(plan.vector_chunks)
+        .ok()?
+        .checked_mul(u128::from(vector_chunk_units))?;
+    let scalar = if include_scalar_tail {
+        u128::try_from(native_sparse_binary_miss_comparisons(plan.scalar_tail)?)
+            .ok()?
+            .checked_mul(u128::from(scalar_compare_units))?
+    } else {
+        0
+    };
+    vector.checked_add(scalar)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeSparseBoundaryCost {
+    guard_units: u8,
+    vector_chunk_units: u8,
+    scalar_compare_units: u8,
+    full_scalar_tail_is_shared: bool,
+    short_path_units: u8,
+}
+
+/// Admit one target-native duplicate-boundary tier only when a deliberately
+/// conservative static model clears a two-to-one margin. The guard is paid on
+/// every byte in every semantic row, while short-path work is paid on every
+/// byte in rows that can stop at the tier, including exception hits. Gross
+/// savings count only graph-proven modal-default misses and the exact
+/// difference between the backend's full and prefix plans. A backend can mark
+/// its full scalar tail as shared before the guard. Checked `u128` arithmetic
+/// makes an oversized graph decline the optional optimization instead of
+/// wrapping its cost.
+fn select_native_sparse_boundary_tier(
+    profile: NativeSparseBoundaryProfile,
+    exception_capacity: u8,
+    threshold: u8,
+    prefix_plan: NativeSparseChunkPlan,
+    full_plan: NativeSparseChunkPlan,
+    cost: NativeSparseBoundaryCost,
+) -> Option<u8> {
+    if !profile.is_valid()
+        || !NATIVE_SPARSE_BOUNDARY_TIERS.contains(&threshold)
+        || threshold == 0
+        || exception_capacity <= threshold
+        || cost.guard_units == 0
+        || prefix_plan.vector_width != full_plan.vector_width
+        || prefix_plan
+            .vector_keys
+            .checked_add(prefix_plan.scalar_tail)?
+            != usize::from(threshold)
+        || full_plan
+            .vector_keys
+            .checked_add(full_plan.scalar_tail)?
+            != usize::from(exception_capacity)
+    {
+        return None;
+    }
+    let prefix_work = native_sparse_plan_miss_units(
+        prefix_plan,
+        cost.vector_chunk_units,
+        cost.scalar_compare_units,
+    )?;
+    let full_work = native_sparse_plan_miss_units_with_scalar(
+        full_plan,
+        cost.vector_chunk_units,
+        cost.scalar_compare_units,
+        !cost.full_scalar_tail_is_shared,
+    )?;
+    let saved_per_stoppable_query = full_work.checked_sub(prefix_work)?;
+    if saved_per_stoppable_query == 0 {
+        return None;
+    }
+    let guard_paid = u128::from(profile.semantic_rows)
+        .checked_mul(u128::try_from(CLASS_MAP_BYTES).ok()?)?
+        .checked_mul(u128::from(cost.guard_units))?;
+    let short_path_paid = u128::from(profile.stoppable_row_byte_units(threshold)?)
+        .checked_mul(u128::from(cost.short_path_units))?;
+    let paid = guard_paid.checked_add(short_path_paid)?;
+    let saved = u128::from(profile.stoppable_default_byte_units(threshold)?)
+        .checked_mul(saved_per_stoppable_query)?;
+    let required = paid.checked_mul(2)?;
+    (saved > required).then_some(threshold)
+}
+
+const X86_SPARSE_BOUNDARY_COST: NativeSparseBoundaryCost = NativeSparseBoundaryCost {
+    guard_units: 3,
+    vector_chunk_units: 4,
+    scalar_compare_units: 2,
+    full_scalar_tail_is_shared: true,
+    short_path_units: 0,
+};
+const AARCH64_SPARSE_BOUNDARY_COST: NativeSparseBoundaryCost = NativeSparseBoundaryCost {
+    guard_units: 4,
+    vector_chunk_units: 2,
+    scalar_compare_units: 2,
+    full_scalar_tail_is_shared: false,
+    short_path_units: 1,
+};
+
 fn x86_sparse_lookup_lane_width(
     exception_capacity: u8,
     cells: NativeCellEncoding,
@@ -13879,11 +14193,28 @@ fn x86_sparse_lookup_chunk_plan(
     cells: NativeCellEncoding,
     kind: X86StartFilterKind,
 ) -> Option<NativeSparseChunkPlan> {
-    let row_bytes = native_default_exception_row_bytes(exception_capacity, cells)?;
+    x86_sparse_lookup_chunk_plan_for_row(
+        exception_capacity,
+        exception_capacity,
+        cells,
+        kind,
+    )
+}
+
+fn x86_sparse_lookup_chunk_plan_for_row(
+    row_exception_capacity: u8,
+    probe_exception_capacity: u8,
+    cells: NativeCellEncoding,
+    kind: X86StartFilterKind,
+) -> Option<NativeSparseChunkPlan> {
+    if probe_exception_capacity > row_exception_capacity {
+        return None;
+    }
+    let row_bytes = native_default_exception_row_bytes(row_exception_capacity, cells)?;
     let readable_key_bytes = row_bytes.checked_sub(cells.bytes())?;
     native_sparse_chunk_plan(
-        usize::from(exception_capacity),
-        x86_sparse_lookup_lane_width(exception_capacity, cells, kind),
+        usize::from(probe_exception_capacity),
+        x86_sparse_lookup_lane_width(probe_exception_capacity, cells, kind),
         readable_key_bytes,
     )
 }
@@ -13897,6 +14228,66 @@ fn x86_sparse_lookup_needs_vzeroupper(
         matches!(kind, X86StartFilterKind::Avx2)
             || matches!(kind, X86StartFilterKind::Avx512Bw) && plan.vector_width == 64
     })
+}
+
+fn x86_sparse_boundary_tier(
+    layout: &NativeDfaLayout,
+    kind: X86StartFilterKind,
+) -> Option<u8> {
+    let exception_capacity = layout.transitions.scalable_exception_capacity()?;
+    let threshold = match kind {
+        X86StartFilterKind::Sse2 => 16,
+        X86StartFilterKind::Avx2 => 32,
+        X86StartFilterKind::Avx512Bw => 64,
+    };
+    let prefix_plan = x86_sparse_lookup_chunk_plan_for_row(
+        exception_capacity,
+        threshold,
+        layout.cells,
+        kind,
+    )?;
+    let full_plan = x86_sparse_lookup_chunk_plan(exception_capacity, layout.cells, kind)?;
+    select_native_sparse_boundary_tier(
+        layout.sparse_boundary_profile?,
+        exception_capacity,
+        threshold,
+        prefix_plan,
+        full_plan,
+        X86_SPARSE_BOUNDARY_COST,
+    )
+}
+
+fn x86_emit_sparse_duplicate_boundary_guard(
+    assembler: &mut X86Assembler,
+    row_exception_capacity: u8,
+    threshold: u8,
+    cells: NativeCellEncoding,
+    full: X86Label,
+) -> Result<(), ObjectError> {
+    if threshold == 0
+        || threshold >= row_exception_capacity
+        || !NATIVE_SPARSE_BOUNDARY_TIERS.contains(&threshold)
+        || !matches!(cells, NativeCellEncoding::Compact16 | NativeCellEncoding::Wide32)
+    {
+        return Err(ObjectError::InvalidModule(
+            "x86 scalable duplicate-boundary guard shape",
+        ));
+    }
+    let displacement = cells
+        .bytes()
+        .checked_add(usize::from(threshold).checked_sub(1).ok_or(
+            ObjectError::ArithmeticOverflow("x86 sparse boundary tier"),
+        )?)
+        .and_then(|offset| u32::try_from(offset).ok())
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "x86 sparse boundary key offset",
+        ))?;
+    let mut load = vec![0x41, 0x0f, 0xb7, 0x82]; // movzx eax,word [r10+disp32]
+    load.extend_from_slice(&displacement.to_le_bytes());
+    assembler.instruction(&load)?;
+    assembler.instruction(&[0x38, 0xe0])?; // cmp al,ah
+    assembler.branch(&[0x0f, 0x85], full)?; // distinct keys prove count > tier
+    Ok(())
 }
 
 fn x86_emit_sparse_vector_broadcast(
@@ -14039,6 +14430,81 @@ fn x86_emit_sparse_vector_value_load(
     assembler.instruction(&load).map(|_| ())
 }
 
+/// Emit only the vector part of a sparse lookup after the byte key has
+/// already been broadcast. The caller owns `done`, which lets a guarded
+/// prefix and its full-row alternative share one broadcast and one join.
+fn x86_emit_sparse_vector_lookup_from_broadcast(
+    assembler: &mut X86Assembler,
+    plan: NativeSparseChunkPlan,
+    value_offset: usize,
+    cells: NativeCellEncoding,
+    kind: X86StartFilterKind,
+    default: X86Label,
+    done: X86Label,
+) -> Result<(), ObjectError> {
+    let mut vector_hits = Vec::new();
+    vector_hits
+        .try_reserve_exact(plan.vector_chunks)
+        .map_err(|_| ObjectError::Allocation("x86 scalable vector hit labels"))?;
+    for chunk in 0..plan.vector_chunks {
+        let chunk_start = plan.chunk_start(chunk).ok_or(ObjectError::InvalidModule(
+            "x86 scalable vector chunk start",
+        ))?;
+        let live_lanes = plan
+            .chunk_live_lanes(chunk)
+            .ok_or(ObjectError::InvalidModule(
+                "x86 scalable vector chunk lanes",
+            ))?;
+        let key_offset = cells
+            .bytes()
+            .checked_add(chunk_start)
+            .and_then(|offset| u32::try_from(offset).ok())
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "x86 scalable vector key offset",
+            ))?;
+        x86_emit_sparse_vector_mask(
+            assembler,
+            kind,
+            plan.vector_width,
+            key_offset,
+            live_lanes,
+        )?;
+        if plan.vector_width == 64 {
+            assembler.instruction(&[0x48, 0x85, 0xc0])?; // test rax,rax
+        } else {
+            assembler.instruction(&[0x85, 0xc0])?; // test eax,eax
+        }
+        let hit = assembler.label()?;
+        assembler.branch(&[0x0f, 0x85], hit)?; // rare nonzero mask
+        vector_hits.push((chunk_start, hit));
+    }
+    // No-match is the common path: all zero masks fall through every chunk to
+    // one default load. Rare hit stubs retain each local mask and fold the
+    // chunk base into their indexed value displacement.
+    assembler.bind(default)?;
+    match cells {
+        NativeCellEncoding::Compact16 => {
+            assembler.instruction(&[0x41, 0x0f, 0xb7, 0x02])?;
+        }
+        NativeCellEncoding::Wide32 => {
+            assembler.instruction(&[0x41, 0x8b, 0x02])?;
+        }
+        _ => unreachable!("validated scalable sparse cell width"),
+    }
+    assembler.branch(&[0xe9], done)?;
+    for (chunk_start, hit) in vector_hits {
+        assembler.bind(hit)?;
+        if plan.vector_width == 64 {
+            assembler.instruction(&[0x48, 0x0f, 0xbc, 0xc0])?; // bsf rax,rax
+        } else {
+            assembler.instruction(&[0x0f, 0xbc, 0xc0])?; // bsf eax,eax
+        }
+        x86_emit_sparse_vector_value_load(assembler, value_offset, chunk_start, cells)?;
+        assembler.branch(&[0xe9], done)?;
+    }
+    Ok(())
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "scalar-tail cost routing, three vector widths, exact masks and one common default share one lookup contract"
@@ -14049,23 +14515,50 @@ fn x86_emit_sparse_exception_lookup(
     cells: NativeCellEncoding,
     kind: X86StartFilterKind,
 ) -> Result<(), ObjectError> {
-    let capacity = usize::from(exception_capacity);
+    x86_emit_sparse_exception_lookup_prefix(
+        assembler,
+        exception_capacity,
+        exception_capacity,
+        cells,
+        kind,
+    )
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "scalar-tail cost routing, three vector widths, exact masks and one common default share one lookup contract"
+)]
+fn x86_emit_sparse_exception_lookup_prefix(
+    assembler: &mut X86Assembler,
+    row_exception_capacity: u8,
+    probe_exception_capacity: u8,
+    cells: NativeCellEncoding,
+    kind: X86StartFilterKind,
+) -> Result<(), ObjectError> {
+    let capacity = usize::from(probe_exception_capacity);
+    let row_capacity = usize::from(row_exception_capacity);
     if !matches!(cells, NativeCellEncoding::Compact16 | NativeCellEncoding::Wide32)
         || capacity <= MAX_NATIVE_DEFAULT_EXCEPTIONS
-        || capacity > MAX_NATIVE_SPARSE_EXCEPTIONS
+        || capacity > row_capacity
+        || row_capacity > MAX_NATIVE_SPARSE_EXCEPTIONS
     {
         return Err(ObjectError::InvalidModule(
             "x86 scalable-exception row shape",
         ));
     }
-    let value_offset = native_default_exception_value_offset(exception_capacity, cells).ok_or(
+    let value_offset = native_default_exception_value_offset(row_exception_capacity, cells).ok_or(
         ObjectError::InvalidModule("x86 scalable-exception value offset"),
     )?;
-    let inline_default_slot =
-        capacity < native_default_exception_physical_slots(exception_capacity);
+    let inline_default_slot = probe_exception_capacity == row_exception_capacity
+        && row_capacity < native_default_exception_physical_slots(row_exception_capacity);
     let default = assembler.label()?;
     let done = assembler.label()?;
-    let Some(plan) = x86_sparse_lookup_chunk_plan(exception_capacity, cells, kind) else {
+    let Some(plan) = x86_sparse_lookup_chunk_plan_for_row(
+        row_exception_capacity,
+        probe_exception_capacity,
+        cells,
+        kind,
+    ) else {
         x86_emit_sparse_binary_range(
             assembler,
             0,
@@ -14106,19 +14599,18 @@ fn x86_emit_sparse_exception_lookup(
         assembler.bind(vector_start)?;
     }
     x86_emit_sparse_vector_broadcast(assembler, kind, plan.vector_width)?;
-    let mut vector_hits = Vec::new();
-    vector_hits
-        .try_reserve_exact(plan.vector_chunks)
-        .map_err(|_| ObjectError::Allocation("x86 scalable vector hit labels"))?;
-    for chunk in 0..plan.vector_chunks {
-        let chunk_start = plan.chunk_start(chunk).ok_or(ObjectError::InvalidModule(
-            "x86 scalable vector chunk start",
+    if inline_default_slot {
+        if plan.vector_chunks != 1 || plan.scalar_tail != 0 {
+            return Err(ObjectError::InvalidModule(
+                "x86 scalable inline-default route",
+            ));
+        }
+        let chunk_start = plan.chunk_start(0).ok_or(ObjectError::InvalidModule(
+            "x86 scalable inline-default chunk",
         ))?;
-        let live_lanes = plan
-            .chunk_live_lanes(chunk)
-            .ok_or(ObjectError::InvalidModule(
-                "x86 scalable vector chunk lanes",
-            ))?;
+        let live_lanes = plan.chunk_live_lanes(0).ok_or(ObjectError::InvalidModule(
+            "x86 scalable inline-default lanes",
+        ))?;
         let key_offset = cells
             .bytes()
             .checked_add(chunk_start)
@@ -14133,59 +14625,29 @@ fn x86_emit_sparse_exception_lookup(
             key_offset,
             live_lanes,
         )?;
-        if inline_default_slot {
-            if plan.vector_chunks != 1 || plan.scalar_tail != 0 {
-                return Err(ObjectError::InvalidModule(
-                    "x86 scalable inline-default route",
-                ));
-            }
-            let default_bit = 1_u32
-                .checked_shl(u32::from(exception_capacity))
-                .ok_or(ObjectError::ArithmeticOverflow(
-                    "x86 scalable inline-default lane",
-                ))?;
-            x86_emit_or_eax_mask(assembler, default_bit)?;
-            if plan.vector_width == 64 {
-                assembler.instruction(&[0x48, 0x0f, 0xbc, 0xc0])?; // bsf rax,rax
-            } else {
-                assembler.instruction(&[0x0f, 0xbc, 0xc0])?; // bsf eax,eax
-            }
-            x86_emit_sparse_vector_value_load(assembler, value_offset, chunk_start, cells)?;
-            return Ok(());
-        }
-        if plan.vector_width == 64 {
-            assembler.instruction(&[0x48, 0x85, 0xc0])?; // test rax,rax
-        } else {
-            assembler.instruction(&[0x85, 0xc0])?; // test eax,eax
-        }
-        let hit = assembler.label()?;
-        assembler.branch(&[0x0f, 0x85], hit)?; // rare nonzero mask
-        vector_hits.push((chunk_start, hit));
-    }
-    // No-match is the common path: all zero masks fall through every chunk to
-    // one default load. Rare hit stubs retain each local mask and fold the
-    // chunk base into their indexed value displacement.
-    assembler.bind(default)?;
-    match cells {
-        NativeCellEncoding::Compact16 => {
-            assembler.instruction(&[0x41, 0x0f, 0xb7, 0x02])?;
-        }
-        NativeCellEncoding::Wide32 => {
-            assembler.instruction(&[0x41, 0x8b, 0x02])?;
-        }
-        _ => unreachable!("validated scalable sparse cell width"),
-    }
-    assembler.branch(&[0xe9], done)?;
-    for (chunk_start, hit) in vector_hits {
-        assembler.bind(hit)?;
+        let default_bit = 1_u32
+            .checked_shl(u32::from(probe_exception_capacity))
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "x86 scalable inline-default lane",
+            ))?;
+        x86_emit_or_eax_mask(assembler, default_bit)?;
         if plan.vector_width == 64 {
             assembler.instruction(&[0x48, 0x0f, 0xbc, 0xc0])?; // bsf rax,rax
         } else {
             assembler.instruction(&[0x0f, 0xbc, 0xc0])?; // bsf eax,eax
         }
         x86_emit_sparse_vector_value_load(assembler, value_offset, chunk_start, cells)?;
-        assembler.branch(&[0xe9], done)?;
+        return Ok(());
     }
+    x86_emit_sparse_vector_lookup_from_broadcast(
+        assembler,
+        plan,
+        value_offset,
+        cells,
+        kind,
+        default,
+        done,
+    )?;
     assembler.bind(done)?;
     Ok(())
 }
@@ -14195,6 +14657,26 @@ fn x86_emit_table_lookup(
     transitions: TransitionLayout,
     cells: NativeCellEncoding,
     kind: X86StartFilterKind,
+) -> Result<(), ObjectError> {
+    x86_emit_table_lookup_with_sparse_boundary_tier(
+        assembler,
+        transitions,
+        cells,
+        kind,
+        None,
+    )
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "dense, bounded, scalable and guarded scalable rows share one table-lookup contract"
+)]
+fn x86_emit_table_lookup_with_sparse_boundary_tier(
+    assembler: &mut X86Assembler,
+    transitions: TransitionLayout,
+    cells: NativeCellEncoding,
+    kind: X86StartFilterKind,
+    sparse_boundary_tier: Option<u8>,
 ) -> Result<(), ObjectError> {
     if transitions == TransitionLayout::DefaultExceptions(0) {
         // Every raw byte names the same packed cell. Load it directly without
@@ -14213,6 +14695,93 @@ fn x86_emit_table_lookup(
                 ));
             }
         }
+        return Ok(());
+    }
+    if let Some(threshold) = sparse_boundary_tier {
+        let (exception_capacity, class_keyed) = match transitions {
+            TransitionLayout::DefaultSparseExceptions(capacity) => (capacity, true),
+            TransitionLayout::DefaultByteSparseExceptions(capacity) => (capacity, false),
+            _ => {
+                return Err(ObjectError::InvalidModule(
+                    "x86 sparse boundary tier reached a dense table",
+                ));
+            }
+        };
+        let value_offset = native_default_exception_value_offset(exception_capacity, cells)
+            .ok_or(ObjectError::InvalidModule(
+                "x86 scalable-exception value offset",
+            ))?;
+        let prefix_plan = x86_sparse_lookup_chunk_plan_for_row(
+            exception_capacity,
+            threshold,
+            cells,
+            kind,
+        )
+        .ok_or(ObjectError::InvalidModule(
+            "x86 sparse boundary prefix plan",
+        ))?;
+        let full_plan = x86_sparse_lookup_chunk_plan(exception_capacity, cells, kind).ok_or(
+            ObjectError::InvalidModule("x86 sparse boundary full plan"),
+        )?;
+        if prefix_plan.scalar_tail != 0
+            || prefix_plan.vector_width != full_plan.vector_width
+        {
+            return Err(ObjectError::InvalidModule(
+                "x86 sparse boundary plan mismatch",
+            ));
+        }
+        // Keep AL live through the complete full-row scalar tail. Only then
+        // broadcast once; the duplicate-boundary probe may overwrite EAX,
+        // but both vector alternatives retain the byte in register zero.
+        assembler.instruction(&[0x0f, 0xb6, 0x04, 0x17])?; // eax = haystack[position]
+        if class_keyed {
+            assembler.instruction(&[0x41, 0x0f, 0xb6, 0x04, 0x01])?; // eax = class_map[eax]
+        }
+        let full = assembler.label()?;
+        let done = assembler.label()?;
+        if let Some(tail_start) = full_plan.scalar_tail_start() {
+            let vector_start = assembler.label()?;
+            x86_emit_sparse_binary_range(
+                assembler,
+                tail_start,
+                usize::from(exception_capacity),
+                value_offset,
+                cells,
+                vector_start,
+                done,
+            )?;
+            assembler.bind(vector_start)?;
+        }
+        x86_emit_sparse_vector_broadcast(assembler, kind, full_plan.vector_width)?;
+        x86_emit_sparse_duplicate_boundary_guard(
+            assembler,
+            exception_capacity,
+            threshold,
+            cells,
+            full,
+        )?;
+        let prefix_default = assembler.label()?;
+        x86_emit_sparse_vector_lookup_from_broadcast(
+            assembler,
+            prefix_plan,
+            value_offset,
+            cells,
+            kind,
+            prefix_default,
+            done,
+        )?;
+        assembler.bind(full)?;
+        let full_default = assembler.label()?;
+        x86_emit_sparse_vector_lookup_from_broadcast(
+            assembler,
+            full_plan,
+            value_offset,
+            cells,
+            kind,
+            full_default,
+            done,
+        )?;
+        assembler.bind(done)?;
         return Ok(());
     }
     // eax = haystack[position]
@@ -16983,6 +17552,7 @@ fn lower_x86_64_dfa_with_entry_contract(
         })
         .or_else(|| layout.loop_skip.map(|skip| skip.filter));
     let table_lookup_kind = x86_start_filter_kind(features);
+    let sparse_boundary_tier = x86_sparse_boundary_tier(&layout, table_lookup_kind);
     let filter_kind = (layout.exact_start_byte_set.is_some() || instruction_filter.is_some())
         .then_some(table_lookup_kind);
     let table_lookup_needs_vzeroupper = layout
@@ -17571,11 +18141,12 @@ fn lower_x86_64_dfa_with_entry_contract(
     assembler.instruction(&[0x48, 0x39, 0xca])?;
     assembler.branch(&[0x0f, 0x83], finish)?; // position >= end
     assembler.bind(scalar_body)?;
-    x86_emit_table_lookup(
+    x86_emit_table_lookup_with_sparse_boundary_tier(
         &mut assembler,
         layout.transitions,
         layout.cells,
         x86_start_filter_kind(features),
+        sparse_boundary_tier,
     )?;
     assembler.instruction(&[0x48, 0xff, 0xc2])?; // position += 1
     // Every ordinary live token is at most this encoding's authenticated
@@ -17761,11 +18332,12 @@ fn lower_x86_64_dfa_with_entry_contract(
             assembler.instruction(&[0x48, 0x39, 0xf2])?;
             assembler.branch(&[0x0f, 0x86], reverse_finish)?; // cursor <= window_start
             assembler.instruction(&[0x48, 0xff, 0xca])?;
-            x86_emit_table_lookup(
+            x86_emit_table_lookup_with_sparse_boundary_tier(
                 &mut assembler,
                 layout.transitions,
                 layout.cells,
                 x86_start_filter_kind(features),
+                sparse_boundary_tier,
             )?;
             match layout.cells {
                 NativeCellEncoding::Compact8Direct
@@ -27052,17 +27624,109 @@ fn aarch64_emit_sparse_binary_range(
     Ok(())
 }
 
+fn aarch64_sparse_lookup_chunk_plan_for_row(
+    row_exception_capacity: u8,
+    probe_exception_capacity: u8,
+    cells: NativeCellEncoding,
+) -> Option<NativeSparseChunkPlan> {
+    if probe_exception_capacity > row_exception_capacity {
+        return None;
+    }
+    let row_bytes = native_default_exception_row_bytes(row_exception_capacity, cells)?;
+    let readable_key_bytes = row_bytes.checked_sub(cells.bytes())?;
+    native_sparse_chunk_plan(
+        usize::from(probe_exception_capacity),
+        NATIVE_SPARSE_VECTOR_LANES,
+        readable_key_bytes,
+    )
+}
+
+#[cfg(test)]
 fn aarch64_sparse_lookup_chunk_plan(
     exception_capacity: u8,
     cells: NativeCellEncoding,
 ) -> Option<NativeSparseChunkPlan> {
-    let row_bytes = native_default_exception_row_bytes(exception_capacity, cells)?;
-    let readable_key_bytes = row_bytes.checked_sub(cells.bytes())?;
-    native_sparse_chunk_plan(
-        usize::from(exception_capacity),
-        NATIVE_SPARSE_VECTOR_LANES,
-        readable_key_bytes,
+    aarch64_sparse_lookup_chunk_plan_for_row(
+        exception_capacity,
+        exception_capacity,
+        cells,
     )
+}
+
+fn aarch64_sparse_boundary_tier(
+    layout: &NativeDfaLayout,
+    features: FeatureSet,
+    operating_system: OperatingSystem,
+) -> Option<u8> {
+    let exception_capacity = layout.transitions.scalable_exception_capacity()?;
+    // A predicated SVE probe advances by the runtime vector length, while the
+    // target-neutral profile has no runtime-VL histogram. Admit only the
+    // fixed 16-byte ASIMD route until a sound SVE work model is available.
+    if aarch64_primary_scanner_isa(operating_system, features, true)
+        != Aarch64PrimaryScannerIsa::Asimd
+    {
+        return None;
+    }
+    let threshold = u8::try_from(NATIVE_SPARSE_VECTOR_LANES).ok()?;
+    let prefix_plan = aarch64_sparse_lookup_chunk_plan_for_row(
+        exception_capacity,
+        threshold,
+        layout.cells,
+    )?;
+    let full_plan = aarch64_sparse_lookup_chunk_plan_for_row(
+        exception_capacity,
+        exception_capacity,
+        layout.cells,
+    )?;
+    // The guarded AArch64 lowering chooses the short/full route before either
+    // lookup emits its scalar tail. Unlike x86, that tail is not shared work,
+    // so decline until both alternatives can be compared as vector-only plans.
+    if full_plan.scalar_tail != 0 {
+        return None;
+    }
+    select_native_sparse_boundary_tier(
+        layout.sparse_boundary_profile?,
+        exception_capacity,
+        threshold,
+        prefix_plan,
+        full_plan,
+        AARCH64_SPARSE_BOUNDARY_COST,
+    )
+}
+
+fn aarch64_emit_sparse_duplicate_boundary_guard(
+    assembler: &mut Aarch64Assembler,
+    row_exception_capacity: u8,
+    threshold: u8,
+    cells: NativeCellEncoding,
+    full: Aarch64Label,
+) -> Result<(), ObjectError> {
+    if threshold == 0
+        || threshold >= row_exception_capacity
+        || !NATIVE_SPARSE_BOUNDARY_TIERS.contains(&threshold)
+        || !matches!(cells, NativeCellEncoding::Compact16 | NativeCellEncoding::Wide32)
+    {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 scalable duplicate-boundary guard shape",
+        ));
+    }
+    let left = cells
+        .bytes()
+        .checked_add(usize::from(threshold).checked_sub(1).ok_or(
+            ObjectError::ArithmeticOverflow("AArch64 sparse boundary tier"),
+        )?)
+        .and_then(|offset| u16::try_from(offset).ok())
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "AArch64 sparse boundary key offset",
+        ))?;
+    let right = left.checked_add(1).ok_or(ObjectError::ArithmeticOverflow(
+        "AArch64 sparse boundary key offset",
+    ))?;
+    assembler.instruction(aarch64_load_byte_imm(8, 11, left)?)?;
+    assembler.instruction(aarch64_load_byte_imm(12, 11, right)?)?;
+    assembler.instruction(aarch64_cmp_w(8, 12)?)?;
+    assembler.branch_cond(AARCH64_NE, full)?;
+    Ok(())
 }
 
 fn aarch64_emit_sparse_default_load(
@@ -27463,20 +28127,44 @@ fn aarch64_emit_sparse_exception_lookup(
     features: FeatureSet,
     operating_system: OperatingSystem,
 ) -> Result<(), ObjectError> {
-    let capacity = usize::from(exception_capacity);
+    aarch64_emit_sparse_exception_lookup_prefix(
+        assembler,
+        exception_capacity,
+        exception_capacity,
+        cells,
+        features,
+        operating_system,
+    )
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the scalar tail, fixed/scalable vector routes, common default and cold hit stubs share one lookup contract"
+)]
+fn aarch64_emit_sparse_exception_lookup_prefix(
+    assembler: &mut Aarch64Assembler,
+    row_exception_capacity: u8,
+    probe_exception_capacity: u8,
+    cells: NativeCellEncoding,
+    features: FeatureSet,
+    operating_system: OperatingSystem,
+) -> Result<(), ObjectError> {
+    let capacity = usize::from(probe_exception_capacity);
+    let row_capacity = usize::from(row_exception_capacity);
     if !matches!(cells, NativeCellEncoding::Compact16 | NativeCellEncoding::Wide32)
         || capacity <= MAX_NATIVE_DEFAULT_EXCEPTIONS
-        || capacity > MAX_NATIVE_SPARSE_EXCEPTIONS
+        || capacity > row_capacity
+        || row_capacity > MAX_NATIVE_SPARSE_EXCEPTIONS
     {
         return Err(ObjectError::InvalidModule(
             "AArch64 scalable-exception row shape",
         ));
     }
-    let value_offset = native_default_exception_value_offset(exception_capacity, cells).ok_or(
+    let value_offset = native_default_exception_value_offset(row_exception_capacity, cells).ok_or(
         ObjectError::InvalidModule("AArch64 scalable-exception value offset"),
     )?;
-    let inline_default_slot =
-        capacity < native_default_exception_physical_slots(exception_capacity);
+    let inline_default_slot = probe_exception_capacity == row_exception_capacity
+        && row_capacity < native_default_exception_physical_slots(row_exception_capacity);
     let default = assembler.label()?;
     let done = assembler.label()?;
     let isa = aarch64_primary_scanner_isa(operating_system, features, true);
@@ -27501,7 +28189,7 @@ fn aarch64_emit_sparse_exception_lookup(
         match isa {
             Aarch64PrimaryScannerIsa::Asimd => aarch64_emit_sparse_asimd_inline(
                 assembler,
-                exception_capacity,
+                probe_exception_capacity,
                 cells,
                 value_offset,
                 inline_default_slot,
@@ -27510,7 +28198,7 @@ fn aarch64_emit_sparse_exception_lookup(
             )?,
             Aarch64PrimaryScannerIsa::Sve => aarch64_emit_sparse_sve_inline(
                 assembler,
-                exception_capacity,
+                probe_exception_capacity,
                 cells,
                 value_offset,
                 inline_default_slot,
@@ -27522,7 +28210,7 @@ fn aarch64_emit_sparse_exception_lookup(
                 assembler.branch_nonzero_w(AARCH64_MIXED_ROOT_WIDE_MODE_REGISTER, sve)?;
                 aarch64_emit_sparse_asimd_inline(
                     assembler,
-                    exception_capacity,
+                    probe_exception_capacity,
                     cells,
                     value_offset,
                     inline_default_slot,
@@ -27532,7 +28220,7 @@ fn aarch64_emit_sparse_exception_lookup(
                 assembler.bind(sve)?;
                 aarch64_emit_sparse_sve_inline(
                     assembler,
-                    exception_capacity,
+                    probe_exception_capacity,
                     cells,
                     value_offset,
                     inline_default_slot,
@@ -27550,7 +28238,11 @@ fn aarch64_emit_sparse_exception_lookup(
         return Ok(());
     }
 
-    let plan = aarch64_sparse_lookup_chunk_plan(exception_capacity, cells).ok_or(
+    let plan = aarch64_sparse_lookup_chunk_plan_for_row(
+        row_exception_capacity,
+        probe_exception_capacity,
+        cells,
+    ).ok_or(
         ObjectError::InvalidModule("AArch64 scalable vector load extent"),
     )?;
     if let Some(tail_start) = plan.scalar_tail_start() {
@@ -27628,6 +28320,28 @@ fn aarch64_emit_table_lookup(
     features: FeatureSet,
     operating_system: OperatingSystem,
 ) -> Result<(), ObjectError> {
+    aarch64_emit_table_lookup_with_sparse_boundary_tier(
+        assembler,
+        transitions,
+        cells,
+        features,
+        operating_system,
+        None,
+    )
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "dense, bounded, scalable and guarded scalable rows share one table-lookup contract"
+)]
+fn aarch64_emit_table_lookup_with_sparse_boundary_tier(
+    assembler: &mut Aarch64Assembler,
+    transitions: TransitionLayout,
+    cells: NativeCellEncoding,
+    features: FeatureSet,
+    operating_system: OperatingSystem,
+    sparse_boundary_tier: Option<u8>,
+) -> Result<(), ObjectError> {
     if transitions == TransitionLayout::DefaultExceptions(0) {
         // A uniform row is independent of the current input byte. Its packed
         // default is the row itself, so neither the haystack nor a class map
@@ -27645,6 +28359,53 @@ fn aarch64_emit_table_lookup(
                 ));
             }
         }
+        return Ok(());
+    }
+    if let Some(threshold) = sparse_boundary_tier {
+        let (exception_capacity, class_keyed) = match transitions {
+            TransitionLayout::DefaultSparseExceptions(capacity) => (capacity, true),
+            TransitionLayout::DefaultByteSparseExceptions(capacity) => (capacity, false),
+            _ => {
+                return Err(ObjectError::InvalidModule(
+                    "AArch64 sparse boundary tier reached a dense table",
+                ));
+            }
+        };
+        let full = assembler.label()?;
+        let done = assembler.label()?;
+        aarch64_emit_sparse_duplicate_boundary_guard(
+            assembler,
+            exception_capacity,
+            threshold,
+            cells,
+            full,
+        )?;
+        assembler.instruction(aarch64_load_byte_reg(8, 0, 2)?)?;
+        if class_keyed {
+            assembler.instruction(aarch64_load_byte_reg(8, 5, 8)?)?;
+        }
+        aarch64_emit_sparse_exception_lookup_prefix(
+            assembler,
+            exception_capacity,
+            threshold,
+            cells,
+            features,
+            operating_system,
+        )?;
+        assembler.branch(done)?;
+        assembler.bind(full)?;
+        assembler.instruction(aarch64_load_byte_reg(8, 0, 2)?)?;
+        if class_keyed {
+            assembler.instruction(aarch64_load_byte_reg(8, 5, 8)?)?;
+        }
+        aarch64_emit_sparse_exception_lookup(
+            assembler,
+            exception_capacity,
+            cells,
+            features,
+            operating_system,
+        )?;
+        assembler.bind(done)?;
         return Ok(());
     }
     assembler.instruction(aarch64_load_byte_reg(8, 0, 2)?)?;
@@ -30729,6 +31490,8 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
         .map_or(Aarch64PrimaryScannerIsa::Scalar, |_| {
             aarch64_primary_scanner_isa(operating_system, features, true)
         });
+    let sparse_boundary_tier =
+        aarch64_sparse_boundary_tier(&layout, features, operating_system);
     let use_asimd_sparse_lookup = matches!(
         sparse_lookup_isa,
         Aarch64PrimaryScannerIsa::Asimd | Aarch64PrimaryScannerIsa::SveWithAsimdVl16
@@ -31467,12 +32230,13 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
     assembler.instruction(aarch64_cmp_x(2, 3)?)?;
     assembler.branch_cond(AARCH64_HS, finish)?;
     assembler.bind(scalar_body)?;
-    aarch64_emit_table_lookup(
+    aarch64_emit_table_lookup_with_sparse_boundary_tier(
         &mut assembler,
         layout.transitions,
         layout.cells,
         features,
         operating_system,
+        sparse_boundary_tier,
     )?;
     assembler.instruction(aarch64_add_x_imm(2, 2, 1)?)?;
     // Bits at and above the accelerator flag are zero exactly for ordinary
@@ -31638,12 +32402,13 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
             assembler.instruction(aarch64_cmp_x(2, 9)?)?;
             assembler.branch_cond(AARCH64_LS, reverse_finish)?;
             assembler.instruction(aarch64_sub_x_imm(2, 2, 1)?)?;
-            aarch64_emit_table_lookup(
+            aarch64_emit_table_lookup_with_sparse_boundary_tier(
                 &mut assembler,
                 layout.transitions,
                 layout.cells,
                 features,
                 operating_system,
+                sparse_boundary_tier,
             )?;
             match layout.cells {
                 NativeCellEncoding::Compact8Direct
@@ -39573,18 +40338,23 @@ mod tests {
 
     #[allow(
         clippy::arithmetic_side_effects,
+        clippy::too_many_arguments,
         clippy::too_many_lines,
         reason = "the test fixture constructs one exact native sparse record and its independent byte oracle"
     )]
     fn linked_sparse_native_fixture(
         target: Target,
         exception_capacity: u8,
+        exception_count: usize,
         cells: NativeCellEncoding,
         keys: NativeDefaultExceptionKeys,
         collapse_holes: bool,
         output: OutputContract,
+        sparse_boundary_profile: NativeSparseBoundaryProfile,
     ) -> Result<(NativeLowering, LinkedSparseNativeFixture), ObjectError> {
         assert!(usize::from(exception_capacity) > MAX_NATIVE_DEFAULT_EXCEPTIONS);
+        assert!(exception_count <= usize::from(exception_capacity));
+        assert!(sparse_boundary_profile.is_valid());
         assert!(matches!(
             cells,
             NativeCellEncoding::Compact16 | NativeCellEncoding::Wide32
@@ -39623,7 +40393,7 @@ mod tests {
         let mut key_cells = [default; CLASS_MAP_BYTES];
         let mut exceptions = [None; MAX_NATIVE_SPARSE_EXCEPTIONS];
         let capacity = usize::from(exception_capacity);
-        for slot in 0..capacity {
+        for slot in 0..exception_count {
             // Exact integer spacing exercises low, interior, and high keys at
             // every capacity. At 255 this is precisely 0..=254, leaving byte
             // 255 as the sole default query.
@@ -39659,7 +40429,7 @@ mod tests {
             &mut data,
             default,
             &exceptions,
-            capacity,
+            exception_count,
             exception_capacity,
             cells,
             row_bytes,
@@ -39711,6 +40481,7 @@ mod tests {
             reverse_offset: u32::try_from(reverse_offset).map_err(|_| {
                 ObjectError::ArithmeticOverflow("linked sparse reverse offset")
             })?,
+            sparse_boundary_profile: Some(sparse_boundary_profile),
             asimd_lane_index_offset,
             initial_pending: false,
             initial_terminal: false,
@@ -58061,6 +58832,86 @@ int main(void){{
     }
 
     #[test]
+    fn scalable_sparse_boundary_profiles_are_semantic_cumulative_and_equality_only() {
+        let compiled = compile_partial_loop(Target::x86_64_linux(), OutputContract::SelectedEnd);
+        let base = compiled
+            .program()
+            .native_partial_dfa_view()
+            .expect("sparse boundary profile base")
+            .native;
+        let raw = ScalableDefaultExceptionFixture::new(192, 69, true);
+        let raw_view = raw.view(base, false);
+        let raw_plan = derive_native_default_exception_plan(
+            raw_view.dfa,
+            raw_view.partial_discovered_states,
+            false,
+            Architecture::X86_64,
+        )
+        .expect("raw sparse boundary profile");
+        assert_eq!(raw_plan.keys, NativeDefaultExceptionKeys::Bytes);
+        assert_eq!(raw_plan.exception_capacity, 69);
+        assert_eq!(
+            raw_plan.sparse_boundary_profile,
+            Some(NativeSparseBoundaryProfile {
+                semantic_rows: 40,
+                stoppable_default_byte_units: [507, 507, 507],
+                stoppable_row_byte_units: [512, 512, 512],
+            }),
+        );
+
+        let classed = ScalableDefaultExceptionFixture::new(128, 31, false);
+        let classed_view = classed.view(base, false);
+        let classed_plan = derive_native_default_exception_plan(
+            classed_view.dfa,
+            classed_view.partial_discovered_states,
+            false,
+            Architecture::Aarch64,
+        )
+        .expect("class sparse boundary profile");
+        assert_eq!(classed_plan.keys, NativeDefaultExceptionKeys::Classes);
+        assert_eq!(classed_plan.exception_capacity, 31);
+        assert_eq!(
+            classed_plan.sparse_boundary_profile,
+            Some(NativeSparseBoundaryProfile {
+                semantic_rows: 40,
+                stoppable_default_byte_units: [502, 7_874, 7_874],
+                stoppable_row_byte_units: [512, 10_240, 10_240],
+            }),
+        );
+
+        let normalization = NativeDefaultExceptionNormalization::new(
+            ScalableDefaultExceptionFixture::COMPLETE_ROWS,
+            ScalableDefaultExceptionFixture::DISCOVERED_STATES,
+            false,
+        )
+        .unwrap();
+        assert!(derive_native_sparse_boundary_profile(
+            raw_view.dfa,
+            normalization,
+            NativeDefaultExceptionKeys::Boundaries,
+        )
+        .is_none());
+        assert!(!NativeSparseBoundaryProfile {
+            semantic_rows: 1,
+            stoppable_default_byte_units: [1, 2, 3],
+            stoppable_row_byte_units: [0, 2, 3],
+        }
+        .is_valid());
+        assert!(!NativeSparseBoundaryProfile {
+            semantic_rows: 1,
+            stoppable_default_byte_units: [0, 0, 0],
+            stoppable_row_byte_units: [1, 0, 1],
+        }
+        .is_valid());
+        assert!(!NativeSparseBoundaryProfile {
+            semantic_rows: 1,
+            stoppable_default_byte_units: [0, 1, 1],
+            stoppable_row_byte_units: [256, 256, 256],
+        }
+        .is_valid());
+    }
+
+    #[test]
     #[allow(
         clippy::arithmetic_side_effects,
         clippy::too_many_lines,
@@ -59972,6 +60823,14 @@ int main(void){{
                 keys: NativeDefaultExceptionKeys::Bytes,
                 cells: raw_cells,
                 row_bytes: raw_row_bytes,
+                sparse_boundary_profile: Some(
+                    derive_native_sparse_boundary_profile(
+                        view.dfa,
+                        normalization,
+                        NativeDefaultExceptionKeys::Bytes,
+                    )
+                    .unwrap(),
+                ),
             };
             let raw_uninterned =
                 build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
@@ -62917,6 +63776,7 @@ int main(void){{
                     keys: NativeDefaultExceptionKeys::Classes,
                     cells: NativeCellEncoding::Compact16,
                     row_bytes: 8,
+                    sparse_boundary_profile: None,
                 }
             );
             assert_eq!(
@@ -62931,6 +63791,7 @@ int main(void){{
                     keys: NativeDefaultExceptionKeys::Classes,
                     cells: NativeCellEncoding::Wide32,
                     row_bytes: 16,
+                    sparse_boundary_profile: None,
                 })
             );
 
@@ -62978,6 +63839,7 @@ int main(void){{
                     keys: NativeDefaultExceptionKeys::Classes,
                     cells: NativeCellEncoding::Compact16,
                     row_bytes: 14,
+                    sparse_boundary_profile: None,
                 }),
             );
             let plan = derive_native_default_exception_plan(
@@ -63448,6 +64310,311 @@ int main(void){{
     #[test]
     #[allow(
         clippy::arithmetic_side_effects,
+        reason = "serialized padding and every native tier boundary share one exact equality proof"
+    )]
+    fn scalable_sparse_duplicate_boundaries_encode_exact_exception_count_predicates() {
+        let default = ForwardCell::new(0, false);
+        for capacity in [17_u8, 33, 65, u8::MAX] {
+            for cells in [NativeCellEncoding::Compact16, NativeCellEncoding::Wide32] {
+                let row_bytes = native_default_exception_row_bytes(capacity, cells).unwrap();
+                for exception_count in [
+                    0_usize,
+                    1,
+                    16.min(usize::from(capacity)),
+                    17.min(usize::from(capacity)),
+                    32.min(usize::from(capacity)),
+                    33.min(usize::from(capacity)),
+                    64.min(usize::from(capacity)),
+                    65.min(usize::from(capacity)),
+                    usize::from(capacity),
+                ] {
+                    let mut exceptions = [None; MAX_NATIVE_SPARSE_EXCEPTIONS];
+                    for (slot, exception) in exceptions[..exception_count].iter_mut().enumerate() {
+                        *exception = Some((
+                            u8::try_from(slot).unwrap(),
+                            ForwardCell::new(u32::try_from(slot + 1).unwrap(), false),
+                        ));
+                    }
+                    let mut row = Vec::new();
+                    append_native_default_exception_record(
+                        &mut row,
+                        default,
+                        &exceptions,
+                        exception_count,
+                        capacity,
+                        cells,
+                        row_bytes,
+                        |cell| Ok(cell.next()),
+                    )
+                    .unwrap();
+                    for threshold in NATIVE_SPARSE_BOUNDARY_TIERS {
+                        if threshold >= capacity {
+                            continue;
+                        }
+                        let left = cells.bytes() + usize::from(threshold) - 1;
+                        let right = left + 1;
+                        assert_eq!(
+                            row[left] == row[right],
+                            exception_count <= usize::from(threshold),
+                            "capacity={capacity}/cells={cells:?}/exceptions={exception_count}/threshold={threshold}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scalable_sparse_boundary_admission_uses_exact_plans_and_fixed_aarch64_isa() {
+        let profile = NativeSparseBoundaryProfile {
+            semantic_rows: 1,
+            stoppable_default_byte_units: [256; NATIVE_SPARSE_BOUNDARY_TIERS.len()],
+            stoppable_row_byte_units: [256; NATIVE_SPARSE_BOUNDARY_TIERS.len()],
+        };
+        let cells = NativeCellEncoding::Compact16;
+        let sse_prefix = x86_sparse_lookup_chunk_plan_for_row(
+            33,
+            16,
+            cells,
+            X86StartFilterKind::Sse2,
+        )
+        .unwrap();
+        let sse_full = x86_sparse_lookup_chunk_plan(33, cells, X86StartFilterKind::Sse2).unwrap();
+        assert_eq!(sse_full.scalar_tail, 1);
+        assert_eq!(native_sparse_plan_miss_units(sse_prefix, 4, 2), Some(4));
+        assert_eq!(native_sparse_plan_miss_units(sse_full, 4, 2), Some(10));
+        assert_eq!(
+            select_native_sparse_boundary_tier(
+                profile,
+                33,
+                16,
+                sse_prefix,
+                sse_full,
+                X86_SPARSE_BOUNDARY_COST,
+            ),
+            None,
+            "the pre-guard scalar tail is not a short-path saving",
+        );
+
+        let avx2_prefix = x86_sparse_lookup_chunk_plan_for_row(
+            68,
+            32,
+            cells,
+            X86StartFilterKind::Avx2,
+        )
+        .unwrap();
+        let avx2_full =
+            x86_sparse_lookup_chunk_plan(68, cells, X86StartFilterKind::Avx2).unwrap();
+        assert_eq!(avx2_full.scalar_tail, 4);
+        assert_eq!(
+            select_native_sparse_boundary_tier(
+                profile,
+                68,
+                32,
+                avx2_prefix,
+                avx2_full,
+                NativeSparseBoundaryCost {
+                    full_scalar_tail_is_shared: false,
+                    ..X86_SPARSE_BOUNDARY_COST
+                },
+            ),
+            Some(32),
+        );
+        assert_eq!(
+            select_native_sparse_boundary_tier(
+                profile,
+                68,
+                32,
+                avx2_prefix,
+                avx2_full,
+                X86_SPARSE_BOUNDARY_COST,
+            ),
+            None,
+            "AVX2 capacity 68 pays its scalar tail before either guarded route",
+        );
+
+        let asimd_prefix = aarch64_sparse_lookup_chunk_plan_for_row(112, 16, cells).unwrap();
+        let asimd_full = aarch64_sparse_lookup_chunk_plan_for_row(112, 112, cells).unwrap();
+        assert_eq!(asimd_full.scalar_tail, 0);
+        assert_eq!(asimd_full.vector_chunks, 7);
+        let branch_edge_profile = NativeSparseBoundaryProfile {
+            semantic_rows: 1,
+            stoppable_default_byte_units: [210; NATIVE_SPARSE_BOUNDARY_TIERS.len()],
+            stoppable_row_byte_units: [256; NATIVE_SPARSE_BOUNDARY_TIERS.len()],
+        };
+        assert_eq!(
+            select_native_sparse_boundary_tier(
+                branch_edge_profile,
+                112,
+                16,
+                asimd_prefix,
+                asimd_full,
+                NativeSparseBoundaryCost {
+                    short_path_units: 0,
+                    ..AARCH64_SPARSE_BOUNDARY_COST
+                },
+            ),
+            Some(16),
+        );
+        assert_eq!(
+            select_native_sparse_boundary_tier(
+                branch_edge_profile,
+                112,
+                16,
+                asimd_prefix,
+                asimd_full,
+                AARCH64_SPARSE_BOUNDARY_COST,
+            ),
+            None,
+            "the ASIMD short route pays its otherwise-unshared join branch",
+        );
+
+        let compiled = compile_partial_loop(Target::x86_64_linux(), OutputContract::SelectedEnd);
+        let base = compiled
+            .program()
+            .native_partial_dfa_view()
+            .expect("boundary admission base")
+            .native;
+        let fixture = ScalableDefaultExceptionFixture::new(192, 68, false);
+        let mut layout = build_forced_default_exception_table(
+            fixture.view(base, false),
+            Architecture::Aarch64,
+            usize::MAX,
+        )
+        .unwrap()
+        .1;
+        assert_eq!(
+            layout.transitions,
+            TransitionLayout::DefaultByteSparseExceptions(68),
+        );
+        layout.sparse_boundary_profile = Some(profile);
+        assert_eq!(
+            x86_sparse_boundary_tier(&layout, X86StartFilterKind::Sse2),
+            Some(16),
+        );
+        assert_eq!(
+            x86_sparse_boundary_tier(&layout, X86StartFilterKind::Avx2),
+            None,
+        );
+        let tail_free_96 = NativeDfaLayout {
+            transitions: TransitionLayout::DefaultByteSparseExceptions(96),
+            ..layout
+        };
+        let avx2_tail_free_plan =
+            x86_sparse_lookup_chunk_plan(96, cells, X86StartFilterKind::Avx2).unwrap();
+        assert_eq!(avx2_tail_free_plan.scalar_tail, 0);
+        assert_eq!(avx2_tail_free_plan.vector_chunks, 3);
+        assert_eq!(
+            x86_sparse_boundary_tier(&tail_free_96, X86StartFilterKind::Avx2),
+            Some(32),
+        );
+        assert_eq!(
+            x86_sparse_boundary_tier(&layout, X86StartFilterKind::Avx512Bw),
+            None,
+        );
+
+        let asimd = FeatureSet::of(CpuFeature::Aarch64Asimd);
+        let sve = FeatureSet::of(CpuFeature::Aarch64Sve);
+        assert_eq!(
+            aarch64_sparse_boundary_tier(&layout, asimd, OperatingSystem::Macos),
+            None,
+            "AArch64 declines a full plan with a scalar tail",
+        );
+        assert_eq!(
+            aarch64_sparse_boundary_tier(&tail_free_96, asimd, OperatingSystem::Macos),
+            None,
+            "capacity 96 only equals the strict two-to-one admission threshold",
+        );
+        let aarch64_positive_112 = NativeDfaLayout {
+            transitions: TransitionLayout::DefaultByteSparseExceptions(112),
+            ..layout
+        };
+        let asimd_positive_plan =
+            aarch64_sparse_lookup_chunk_plan_for_row(112, 112, cells).unwrap();
+        assert_eq!(asimd_positive_plan.scalar_tail, 0);
+        assert_eq!(asimd_positive_plan.vector_chunks, 7);
+        assert_eq!(
+            aarch64_sparse_boundary_tier(
+                &aarch64_positive_112,
+                asimd,
+                OperatingSystem::Macos,
+            ),
+            Some(16),
+        );
+        assert_eq!(
+            aarch64_sparse_boundary_tier(
+                &aarch64_positive_112,
+                sve,
+                OperatingSystem::Linux,
+            ),
+            None,
+        );
+        assert_eq!(
+            aarch64_sparse_boundary_tier(
+                &aarch64_positive_112,
+                asimd.with(CpuFeature::Aarch64Sve),
+                OperatingSystem::Linux,
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn scalable_sparse_x86_boundary_guard_reuses_one_post_tail_broadcast() {
+        fn occurrences(code: &[u8], needle: &[u8]) -> usize {
+            code.windows(needle.len())
+                .filter(|bytes| *bytes == needle)
+                .count()
+        }
+
+        for cells in [NativeCellEncoding::Compact16, NativeCellEncoding::Wide32] {
+            let mut assembler = X86Assembler::new();
+            x86_emit_table_lookup_with_sparse_boundary_tier(
+                &mut assembler,
+                TransitionLayout::DefaultByteSparseExceptions(68),
+                cells,
+                X86StartFilterKind::Sse2,
+                Some(16),
+            )
+            .unwrap();
+            let code = assembler.finish().unwrap();
+            let query = [0x0f, 0xb6, 0x04, 0x17];
+            let broadcast = [0x69, 0xc0, 1, 1, 1, 1];
+            let tail_root = [
+                0x41,
+                0x3a,
+                0x42,
+                u8::try_from(cells.bytes() + 66).unwrap(),
+            ];
+            let mut guard = vec![0x41, 0x0f, 0xb7, 0x82];
+            guard.extend_from_slice(
+                &u32::try_from(cells.bytes() + 15).unwrap().to_le_bytes(),
+            );
+            assert_eq!(occurrences(&code, &query), 1, "{cells:?}");
+            assert_eq!(occurrences(&code, &broadcast), 1, "{cells:?}");
+            assert_eq!(occurrences(&code, &guard), 1, "{cells:?}");
+            assert_eq!(
+                occurrences(&code, &[0xf3, 0x45, 0x0f, 0x6f, 0xb2]),
+                5,
+                "one prefix plus four full probes/{cells:?}",
+            );
+            let query_at = code.windows(query.len()).position(|bytes| bytes == query).unwrap();
+            let tail_at = code
+                .windows(tail_root.len())
+                .position(|bytes| bytes == tail_root)
+                .unwrap();
+            let broadcast_at = code
+                .windows(broadcast.len())
+                .position(|bytes| bytes == broadcast)
+                .unwrap();
+            let guard_at = code.windows(guard.len()).position(|bytes| bytes == guard).unwrap();
+            assert!(query_at < tail_at && tail_at < broadcast_at && broadcast_at < guard_at);
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::arithmetic_side_effects,
         clippy::too_many_lines,
         reason = "all capacity, cell-width and x86-tier chunk boundaries share one structural route proof"
     )]
@@ -63780,10 +64947,22 @@ int main(void){{
             let (lowering, fixture) = linked_sparse_native_fixture(
                 target,
                 capacity,
+                usize::from(capacity),
                 cells,
                 NativeDefaultExceptionKeys::Bytes,
                 false,
                 OutputContract::SelectedEnd,
+                NativeSparseBoundaryProfile {
+                    semantic_rows: 1,
+                    stoppable_default_byte_units: [
+                        0;
+                        NATIVE_SPARSE_BOUNDARY_TIERS.len()
+                    ],
+                    stoppable_row_byte_units: [
+                        0;
+                        NATIVE_SPARSE_BOUNDARY_TIERS.len()
+                    ],
+                },
             )
             .unwrap();
 
@@ -64545,10 +65724,22 @@ int main(void){{
                             let (lowering, fixture) = linked_sparse_native_fixture(
                                 target,
                                 capacity,
+                                usize::from(capacity),
                                 cells,
                                 keys,
                                 collapse_holes,
                                 output,
+                                NativeSparseBoundaryProfile {
+                                    semantic_rows: 1,
+                                    stoppable_default_byte_units: [
+                                        0;
+                                        NATIVE_SPARSE_BOUNDARY_TIERS.len()
+                                    ],
+                                    stoppable_row_byte_units: [
+                                        0;
+                                        NATIVE_SPARSE_BOUNDARY_TIERS.len()
+                                    ],
+                                },
                             )
                             .unwrap_or_else(|error| {
                                 panic!(
@@ -64748,6 +65939,351 @@ int main(void){{
             }
         }
         assert!(lines.next().is_none(), "unexpected scalable sparse oracle output");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    #[ignore = "links and executes both forced sparse-boundary CFG branches on the host ISA"]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::too_many_lines,
+        reason = "the focused linked differential owns eight objects plus exact one- and two-byte transition witnesses across both guarded row shapes"
+    )]
+    fn linked_host_sparse_boundary_guard_both_count_sides_are_exact() {
+        use std::{fmt::Write as _, fs, process::Command};
+
+        const SCRATCH_ZERO: usize = 0x1122_3344_5566_7788;
+        const SCRATCH_ONE: usize = 0x8877_6655_4433_2211;
+        const PAYLOAD_SENTINEL: usize = 0xa5a5_5a5a_55aa_aa55;
+
+        struct LinkedCase {
+            fixture: LinkedSparseNativeFixture,
+            label: String,
+            witnesses: Vec<u8>,
+        }
+
+        let target = linked_sparse_host_target();
+        let (capacity, threshold) = match target.architecture {
+            Architecture::X86_64 => match x86_start_filter_kind(target.features) {
+                X86StartFilterKind::Sse2 => (68_u8, 16_u8),
+                X86StartFilterKind::Avx2 => (96, 32),
+                X86StartFilterKind::Avx512Bw => (196, 64),
+            },
+            Architecture::Aarch64 => {
+                assert_eq!(
+                    aarch64_primary_scanner_isa(
+                        target.operating_system,
+                        target.features,
+                        true,
+                    ),
+                    Aarch64PrimaryScannerIsa::Asimd,
+                    "focused sparse-boundary native test requires the fixed ASIMD route",
+                );
+                (112, 16)
+            }
+        };
+        let forced_profile = NativeSparseBoundaryProfile {
+            semantic_rows: 1,
+            stoppable_default_byte_units: [256; NATIVE_SPARSE_BOUNDARY_TIERS.len()],
+            stoppable_row_byte_units: [256; NATIVE_SPARSE_BOUNDARY_TIERS.len()],
+        };
+        let directory = std::env::temp_dir().join(format!(
+            "fre-aot-linked-sparse-boundary-{}-{}",
+            std::process::id(),
+            if cfg!(target_arch = "x86_64") {
+                "x86"
+            } else {
+                "arm"
+            }
+        ));
+        if directory.exists() {
+            fs::remove_dir_all(&directory).unwrap();
+        }
+        fs::create_dir_all(&directory).unwrap();
+        let mut assembly = String::from(".text\n");
+        let mut source = String::from(
+            "#include <stdint.h>\n#include <stddef.h>\n#include <stdio.h>\n\
+             typedef struct { size_t first; size_t second; size_t position; size_t abi_bad; } payload_t;\n",
+        );
+        writeln!(
+            source,
+            "#define SCRATCH_ZERO ((size_t)UINT64_C({SCRATCH_ZERO}))\n\
+             #define SCRATCH_ONE ((size_t)UINT64_C({SCRATCH_ONE}))\n\
+             #define PAYLOAD_SENTINEL ((size_t)UINT64_C({PAYLOAD_SENTINEL}))"
+        )
+        .unwrap();
+        let mut objects = Vec::new();
+        let mut cases = Vec::new();
+
+        for exception_count in [usize::from(threshold), usize::from(threshold) + 1] {
+            for cells in [NativeCellEncoding::Compact16, NativeCellEncoding::Wide32] {
+                for keys in [
+                    NativeDefaultExceptionKeys::Bytes,
+                    NativeDefaultExceptionKeys::Classes,
+                ] {
+                    let (lowering, fixture) = linked_sparse_native_fixture(
+                        target,
+                        capacity,
+                        exception_count,
+                        cells,
+                        keys,
+                        false,
+                        OutputContract::SelectedEnd,
+                        forced_profile,
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "focused sparse boundary fixture {capacity}/{exception_count}/{cells:?}/{keys:?}: {error}"
+                        )
+                    });
+                    match target.architecture {
+                        Architecture::X86_64 => {
+                            let mut guard = vec![0x41, 0x0f, 0xb7, 0x82];
+                            guard.extend_from_slice(
+                                &u32::try_from(cells.bytes() + usize::from(threshold) - 1)
+                                    .unwrap()
+                                    .to_le_bytes(),
+                            );
+                            assert!(lowering
+                                .code
+                                .windows(guard.len())
+                                .any(|bytes| bytes == guard));
+                        }
+                        Architecture::Aarch64 => {
+                            let words = lowering
+                                .code
+                                .chunks_exact(4)
+                                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                                .collect::<Vec<_>>();
+                            let left = u16::try_from(
+                                cells.bytes() + usize::from(threshold) - 1,
+                            )
+                            .unwrap();
+                            assert!(words.contains(&aarch64_load_byte_imm(8, 11, left).unwrap()));
+                            assert!(words.contains(
+                                &aarch64_load_byte_imm(12, 11, left + 1).unwrap(),
+                            ));
+                        }
+                    }
+                    let seed = format!(
+                        "fre-linked-sparse-boundary-v1/{capacity}/{exception_count}/{cells:?}/{keys:?}"
+                    )
+                    .into_bytes();
+                    let module = CompiledModule::lower_serialized_with_prelowered(
+                        seed,
+                        Some(lowering),
+                        None,
+                        None,
+                        None,
+                        false,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        target,
+                    )
+                    .unwrap();
+                    let index = cases.len();
+                    append_linked_sparse_wrapper_assembly(
+                        &mut assembly,
+                        index,
+                        module.entry_symbol(),
+                    );
+                    let object = directory.join(format!("case-{index}.o"));
+                    fs::write(
+                        &object,
+                        emit_object(
+                            &module,
+                            ObjectFormat::for_target(target),
+                            usize::MAX,
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    objects.push(object);
+                    writeln!(
+                        source,
+                        "extern uint32_t fre_sparse_wrap_{index}(const unsigned char*,size_t,size_t,size_t,size_t*,payload_t*);"
+                    )
+                    .unwrap();
+                    let mut witnesses = Vec::new();
+                    for byte in u8::MIN..=u8::MAX {
+                        let cell = fixture.byte_cells[usize::from(byte)];
+                        if !witnesses.iter().any(|&witness| {
+                            fixture.byte_cells[usize::from(witness)] == cell
+                        }) {
+                            witnesses.push(byte);
+                        }
+                    }
+                    let witness_values = witnesses
+                        .iter()
+                        .map(u8::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    writeln!(
+                        source,
+                        "static const unsigned char fre_sparse_witness_{index}[]={{{witness_values}}};\n\
+                         static void invoke_{index}(unsigned b0,unsigned b1,size_t end){{unsigned char h[2]={{(unsigned char)b0,(unsigned char)b1}};size_t scratch[2]={{SCRATCH_ZERO,SCRATCH_ONE}};payload_t p={{PAYLOAD_SENTINEL,PAYLOAD_SENTINEL,PAYLOAD_SENTINEL,PAYLOAD_SENTINEL}};uint32_t status=fre_sparse_wrap_{index}(h,2,0,end,scratch,&p);printf(\"{index} %zu %u %u %u %zu %zu %zu %zu %zu %zu\\n\",end,b0,b1,status,p.first,p.second,p.position,scratch[0],scratch[1],p.abi_bad);}}\n\
+                         static void run_{index}(void){{for(unsigned b=0;b<256;b++)invoke_{index}(b,0,1);for(size_t i=0;i<sizeof(fre_sparse_witness_{index});i++)for(size_t j=0;j<sizeof(fre_sparse_witness_{index});j++)invoke_{index}(fre_sparse_witness_{index}[i],fre_sparse_witness_{index}[j],2);}}"
+                    )
+                    .unwrap();
+                    cases.push(LinkedCase {
+                        fixture,
+                        label: format!(
+                            "capacity={capacity}/exceptions={exception_count}/cells={cells:?}/keys={keys:?}"
+                        ),
+                        witnesses,
+                    });
+                }
+            }
+        }
+        source.push_str("int main(void){\n");
+        for index in 0..cases.len() {
+            writeln!(source, "run_{index}();").unwrap();
+        }
+        source.push_str("return 0;}\n");
+        if cfg!(target_os = "linux") {
+            assembly.push_str(if cfg!(target_arch = "x86_64") {
+                ".section .note.GNU-stack,\"\",@progbits\n"
+            } else {
+                ".section .note.GNU-stack,\"\",%progbits\n"
+            });
+        }
+
+        let assembly_path = directory.join("wrappers.S");
+        let wrapper_object = directory.join("wrappers.o");
+        let source_path = directory.join("oracle.c");
+        let executable = directory.join("oracle");
+        fs::write(&assembly_path, assembly).unwrap();
+        fs::write(&source_path, source).unwrap();
+        let compiler = if cfg!(target_os = "macos") {
+            "clang"
+        } else {
+            "cc"
+        };
+        assert!(Command::new(compiler)
+            .arg("-c")
+            .arg(&assembly_path)
+            .arg("-o")
+            .arg(&wrapper_object)
+            .status()
+            .expect("assemble focused sparse-boundary wrappers")
+            .success());
+        assert!(Command::new(compiler)
+            .arg("-O0")
+            .arg(&source_path)
+            .arg(&wrapper_object)
+            .args(&objects)
+            .arg("-o")
+            .arg(&executable)
+            .status()
+            .expect("link focused sparse-boundary oracle")
+            .success());
+        let output = Command::new(&executable)
+            .output()
+            .expect("execute focused sparse-boundary oracle");
+        assert!(
+            output.status.success(),
+            "status={:?} stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let mut lines = stdout.lines();
+        for (case_index, case) in cases.iter().enumerate() {
+            let one_byte_queries = (u8::MIN..=u8::MAX).map(|byte| (1_usize, byte, 0_u8));
+            let two_byte_queries = case.witnesses.iter().copied().flat_map(|first| {
+                case.witnesses
+                    .iter()
+                    .copied()
+                    .map(move |second| (2_usize, first, second))
+            });
+            for (end, first_byte, second_byte) in one_byte_queries.chain(two_byte_queries) {
+                let line = lines.next().unwrap_or_else(|| {
+                    panic!(
+                        "missing focused linked result for {}/{first_byte},{second_byte}/end={end}",
+                        case.label,
+                    )
+                });
+                let actual = line
+                    .split_ascii_whitespace()
+                    .map(|part| part.parse::<usize>().unwrap())
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    actual.len(),
+                    11,
+                    "{}/{first_byte},{second_byte}/end={end}",
+                    case.label,
+                );
+                assert_eq!(
+                    &actual[..4],
+                    &[
+                        case_index,
+                        end,
+                        usize::from(first_byte),
+                        usize::from(second_byte),
+                    ],
+                    "{}",
+                    case.label,
+                );
+                let expected = linked_sparse_expected(
+                    case.fixture,
+                    OutputContract::SelectedEnd,
+                    [first_byte, second_byte],
+                    0,
+                    end,
+                );
+                assert_eq!(
+                    actual[4],
+                    usize::try_from(expected.status).unwrap(),
+                    "{}/{first_byte},{second_byte}/end={end}/status",
+                    case.label,
+                );
+                if let Some(first) = expected.first {
+                    assert_eq!(
+                        actual[5],
+                        first,
+                        "{}/{first_byte},{second_byte}/end={end}/first",
+                        case.label,
+                    );
+                }
+                if let Some(second) = expected.second {
+                    assert_eq!(
+                        actual[6],
+                        second,
+                        "{}/{first_byte},{second_byte}/end={end}/second",
+                        case.label,
+                    );
+                }
+                if let Some(position) = expected.position {
+                    assert_eq!(
+                        actual[7],
+                        position,
+                        "{}/{first_byte},{second_byte}/end={end}/position",
+                        case.label,
+                    );
+                }
+                assert_eq!(
+                    &actual[8..10],
+                    &[SCRATCH_ZERO, SCRATCH_ONE],
+                    "{}/{first_byte},{second_byte}/end={end}/private scratch",
+                    case.label,
+                );
+                assert_eq!(
+                    actual[10],
+                    0,
+                    "{}/{first_byte},{second_byte}/end={end}/callee-saved ABI",
+                    case.label,
+                );
+            }
+        }
+        assert!(lines.next().is_none(), "unexpected focused sparse-boundary output");
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -82676,6 +84212,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             cells: NativeCellEncoding::Wide32,
             forward_offset: 256,
             reverse_offset: 512,
+            sparse_boundary_profile: None,
             asimd_lane_index_offset: None,
             initial_pending: false,
             initial_terminal: false,
@@ -84997,6 +86534,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             cells: NativeCellEncoding::Wide32,
             forward_offset: 256,
             reverse_offset: 512,
+            sparse_boundary_profile: None,
             asimd_lane_index_offset: None,
             initial_pending: false,
             initial_terminal: false,
@@ -85190,6 +86728,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             cells: NativeCellEncoding::Wide32,
             forward_offset: 256,
             reverse_offset: 0,
+            sparse_boundary_profile: None,
             asimd_lane_index_offset: None,
             initial_pending: false,
             initial_terminal: false,
