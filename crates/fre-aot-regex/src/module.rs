@@ -3192,6 +3192,49 @@ const fn static_prefix_can_defer_preflight(
     !has_complete_preflight_proofs
 }
 
+/// Compiler-private short-window admission for a deferred static prefix.
+///
+/// The public ABI and persistent program format retain the established
+/// 256-byte floor. Only a genuine object-local resume descriptor can carry a
+/// proof that an input ending at or before its first hole needs no fallback.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StaticPrefixInputAdmission {
+    short_native_max: Option<u16>,
+}
+
+impl StaticPrefixInputAdmission {
+    const FALLBACK_ONLY: Self = Self {
+        short_native_max: None,
+    };
+
+    fn for_deferred_resume(
+        resume: Option<NativeSlowResumeView<'_>>,
+        defer_preflight: bool,
+    ) -> Result<Self, ObjectError> {
+        if !defer_preflight || resume.is_none() {
+            return Ok(Self::FALLBACK_ONLY);
+        }
+        let short_ceiling = PARTIAL_DFA_MIN_INPUT_BYTES.checked_sub(1).ok_or(
+            ObjectError::ArithmeticOverflow("static-prefix short admission ceiling"),
+        )?;
+        let first_hole = resume
+            .and_then(NativeSlowResumeView::first_observable_hole_bytes)
+            .unwrap_or(short_ceiling);
+        if first_hole == 0 {
+            return Err(ObjectError::InvalidModule(
+                "static-prefix first observable hole has zero depth",
+            ));
+        }
+        Ok(Self {
+            short_native_max: Some(
+                u16::try_from(first_hole.min(short_ceiling)).map_err(|_| {
+                    ObjectError::ArithmeticOverflow("static-prefix short admission maximum")
+                })?,
+            ),
+        })
+    }
+}
+
 /// Compose a transient, resource-bounded DFA prefix with the persistent
 /// prepared runtime. The static table and exact continuation frontiers are
 /// compiler-owned and immutable; both remain absent from the stable semantic
@@ -3264,6 +3307,8 @@ fn lower_native_slow_partial_prepared_with_data_limit(
         view.exact_match_width,
         has_complete_preflight_proofs,
     );
+    let input_admission =
+        StaticPrefixInputAdmission::for_deferred_resume(resume, defer_preflight)?;
     let exact_span_width = match (view.output, view.exact_match_width) {
         (OutputContract::Exists | OutputContract::SelectedEnd, _) => None,
         (OutputContract::Span, None) => None,
@@ -3404,6 +3449,7 @@ fn lower_native_slow_partial_prepared_with_data_limit(
                 span_recovery,
                 resume_table_addend,
                 defer_preflight,
+                input_admission,
             )?
         }
         Architecture::Aarch64 => {
@@ -3412,6 +3458,7 @@ fn lower_native_slow_partial_prepared_with_data_limit(
                 span_recovery,
                 resume_table_addend,
                 defer_preflight,
+                input_admission,
             )?
         }
     };
@@ -17277,7 +17324,22 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
     span_recovery: bool,
     resume_table_addend: Option<i64>,
     defer_preflight: bool,
+    input_admission: StaticPrefixInputAdmission,
 ) -> Result<NativeSlowPartialWrapper, ObjectError> {
+    if input_admission.short_native_max.is_some()
+        && (!defer_preflight || resume_table_addend.is_none())
+    {
+        return Err(ObjectError::InvalidModule(
+            "x86 short static-prefix admission has no deferred resume",
+        ));
+    }
+    if input_admission.short_native_max.is_some_and(|maximum| {
+        maximum == 0 || usize::from(maximum) >= PARTIAL_DFA_MIN_INPUT_BYTES
+    }) {
+        return Err(ObjectError::InvalidModule(
+            "x86 short static-prefix admission is outside the fallback window",
+        ));
+    }
     let frame_bytes = if defer_preflight { 104 } else { 72 };
     // Deferred holes use their first five frame words as the SysV outgoing
     // identity, descriptor, state, position, and pending arguments for the
@@ -17300,6 +17362,14 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
     let native_span_recovery = span_recovery.then(|| assembler.label()).transpose()?;
     let native_deopt = assembler.label()?;
     let fallback_runtime = assembler.label()?;
+    let short_window_check = input_admission
+        .short_native_max
+        .map(|_| assembler.label())
+        .transpose()?;
+    let short_native_entry = input_admission
+        .short_native_max
+        .map(|_| assembler.label())
+        .transpose()?;
     let invalid_handle = defer_preflight.then(|| assembler.label()).transpose()?;
     let invalid_argument = defer_preflight.then(|| assembler.label()).transpose()?;
     let wrong_identity = defer_preflight.then(|| assembler.label()).transpose()?;
@@ -17391,10 +17461,11 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
         x86_emit_static_prefix_epoch_increment_r10(&mut assembler, entry_epoch_overflow)?;
     }
 
-    // Short windows retain the ordinary prepared path, but only after the
-    // deferred entry has authenticated the exact artifact and invalidated
-    // capabilities from prior invocations. All public argument registers are
-    // still intact for the six-argument tail fallback.
+    // Unproved short windows retain the ordinary prepared path, but only
+    // after the deferred entry has authenticated the exact artifact and
+    // invalidated capabilities from prior invocations. A proved window jumps
+    // back to the unchanged native entry from a cold check below the fallback
+    // tail. All public argument registers remain intact on either route.
     let minimum = u32::try_from(PARTIAL_DFA_MIN_INPUT_BYTES)
         .map_err(|_| ObjectError::ArithmeticOverflow("static-prefix input admission floor"))?;
     let mut compare_minimum = if defer_preflight {
@@ -17408,7 +17479,13 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
     };
     compare_minimum.extend_from_slice(&minimum.to_le_bytes());
     assembler.instruction(&compare_minimum)?;
-    assembler.branch(&[0x0f, 0x82], fallback_runtime)?;
+    assembler.branch(
+        &[0x0f, 0x82],
+        short_window_check.unwrap_or(fallback_runtime),
+    )?;
+    if let Some(short_native_entry) = short_native_entry {
+        assembler.bind(short_native_entry)?;
+    }
 
     // Entry RSP is 8 modulo 16. Both frame sizes align helper calls and keep
     // all six prepared arguments plus the two outgoing identity/descriptor
@@ -17789,6 +17866,18 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
     let fallback_displacement_label = assembler.label()?;
     assembler.bind(fallback_displacement_label)?;
     push_bytes(&mut assembler.code, &[0; 4])?;
+    if let (Some(short_window_check), Some(short_native_entry), Some(short_native_max)) = (
+        short_window_check,
+        short_native_entry,
+        input_admission.short_native_max,
+    ) {
+        assembler.bind(short_window_check)?;
+        let mut compare_short = vec![0x49, 0x81, 0xfa]; // cmp r10, imm32
+        compare_short.extend_from_slice(&u32::from(short_native_max).to_le_bytes());
+        assembler.instruction(&compare_short)?;
+        assembler.branch(&[0x0f, 0x86], short_native_entry)?; // len <= h
+        assembler.branch(&[0xe9], fallback_runtime)?;
+    }
 
     let finished = assembler.finish_with_label_offsets()?;
     let identity_displacement = finished.label_offset(identity_displacement_label)?;
@@ -30338,7 +30427,22 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
     span_recovery: bool,
     resume_table_addend: Option<i64>,
     defer_preflight: bool,
+    input_admission: StaticPrefixInputAdmission,
 ) -> Result<NativeSlowPartialWrapper, ObjectError> {
+    if input_admission.short_native_max.is_some()
+        && (!defer_preflight || resume_table_addend.is_none())
+    {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 short static-prefix admission has no deferred resume",
+        ));
+    }
+    if input_admission.short_native_max.is_some_and(|maximum| {
+        maximum == 0 || usize::from(maximum) >= PARTIAL_DFA_MIN_INPUT_BYTES
+    }) {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 short static-prefix admission is outside the fallback window",
+        ));
+    }
     let frame_bytes = if defer_preflight { 96 } else { 64 };
     let return_address_offset = if defer_preflight { 88 } else { 56 };
     // AAPCS64 supplies the first eight fused-boundary arguments in X0--X7;
@@ -30365,6 +30469,14 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
     let native_span_recovery = span_recovery.then(|| assembler.label()).transpose()?;
     let native_deopt = assembler.label()?;
     let fallback_runtime = assembler.label()?;
+    let short_window_check = input_admission
+        .short_native_max
+        .map(|_| assembler.label())
+        .transpose()?;
+    let short_native_entry = input_admission
+        .short_native_max
+        .map(|_| assembler.label())
+        .transpose()?;
     let invalid_handle = defer_preflight.then(|| assembler.label()).transpose()?;
     let invalid_argument = defer_preflight.then(|| assembler.label()).transpose()?;
     let wrong_identity = defer_preflight.then(|| assembler.label()).transpose()?;
@@ -30446,15 +30558,22 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
         )?;
     }
 
-    // X6 is caller-saved and all six public arguments remain untouched for a
-    // short-window tail fallback. Authentication and generation retirement
-    // deliberately precede this generic path.
+    // X6 is caller-saved and all six public arguments remain untouched for an
+    // unproved short-window tail fallback. A proved short window returns from
+    // the cold check to the unchanged native entry. Authentication and
+    // generation retirement deliberately precede both paths.
     let window_register = if defer_preflight { 10 } else { 6 };
     assembler.instruction(aarch64_sub_x_reg(window_register, 4, 3)?)?;
     let minimum = u16::try_from(PARTIAL_DFA_MIN_INPUT_BYTES)
         .map_err(|_| ObjectError::ArithmeticOverflow("static-prefix input admission floor"))?;
     assembler.instruction(aarch64_cmp_x_imm(window_register, minimum)?)?;
-    assembler.branch_cond(AARCH64_LO, fallback_runtime)?;
+    assembler.branch_cond(
+        AARCH64_LO,
+        short_window_check.unwrap_or(fallback_runtime),
+    )?;
+    if let Some(short_native_entry) = short_native_entry {
+        assembler.bind(short_native_entry)?;
+    }
 
     assembler.instruction(aarch64_sub_x_imm(31, 31, frame_bytes)?)?;
     assembler.instruction(aarch64_store_pair_x(
@@ -30823,6 +30942,16 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
 
     assembler.bind(fallback_runtime)?;
     let fallback_branch = assembler.instruction(0x1400_0000)?;
+    if let (Some(short_window_check), Some(short_native_entry), Some(short_native_max)) = (
+        short_window_check,
+        short_native_entry,
+        input_admission.short_native_max,
+    ) {
+        assembler.bind(short_window_check)?;
+        assembler.instruction(aarch64_cmp_x_imm(window_register, short_native_max)?)?;
+        assembler.branch_cond(AARCH64_LS, short_native_entry)?; // len <= h
+        assembler.branch(fallback_runtime)?;
+    }
 
     let mut relocation_offsets = vec![
         identity_page,
@@ -52189,12 +52318,14 @@ int main(void){{
                         false,
                         Some(0),
                         true,
+                        StaticPrefixInputAdmission::FALLBACK_ONLY,
                     ),
                     Architecture::Aarch64 => lower_aarch64_static_prefix_prepared_wrapper(
                         output,
                         false,
                         Some(0),
                         true,
+                        StaticPrefixInputAdmission::FALLBACK_ONLY,
                     ),
                 }
                 .unwrap_or_else(|error| {
@@ -52355,12 +52486,14 @@ int main(void){{
                     false,
                     None,
                     true,
+                    StaticPrefixInputAdmission::FALLBACK_ONLY,
                 ),
                 Architecture::Aarch64 => lower_aarch64_static_prefix_prepared_wrapper(
                     OutputContract::Exists,
                     false,
                     None,
                     true,
+                    StaticPrefixInputAdmission::FALLBACK_ONLY,
                 ),
             }
             .unwrap();
@@ -52451,12 +52584,14 @@ int main(void){{
                     true,
                     Some(0),
                     false,
+                    StaticPrefixInputAdmission::FALLBACK_ONLY,
                 ),
                 Architecture::Aarch64 => lower_aarch64_static_prefix_prepared_wrapper(
                     OutputContract::Span,
                     true,
                     Some(0),
                     false,
+                    StaticPrefixInputAdmission::FALLBACK_ONLY,
                 ),
             }
             .unwrap();
@@ -52492,6 +52627,121 @@ int main(void){{
                 2,
                 "eager direct and resume-wrap cold helpers: {architecture:?}"
             );
+        }
+    }
+
+    #[test]
+    fn deferred_static_prefix_short_admission_is_inclusive_and_cross_target() {
+        const HOLE_BYTES: u16 = 7;
+        let safe = StaticPrefixInputAdmission {
+            short_native_max: Some(HOLE_BYTES),
+        };
+        let admitted = |length: usize| {
+            length >= PARTIAL_DFA_MIN_INPUT_BYTES || length <= usize::from(HOLE_BYTES)
+        };
+        assert!(admitted(usize::from(HOLE_BYTES)));
+        assert!(!admitted(usize::from(HOLE_BYTES) + 1));
+        assert!(!admitted(PARTIAL_DFA_MIN_INPUT_BYTES - 1));
+        assert!(admitted(PARTIAL_DFA_MIN_INPUT_BYTES));
+
+        let x86 = lower_x86_64_static_prefix_prepared_wrapper(
+            OutputContract::Exists,
+            false,
+            Some(0),
+            true,
+            safe,
+        )
+        .unwrap();
+        let x86_fallback_only = lower_x86_64_static_prefix_prepared_wrapper(
+            OutputContract::Exists,
+            false,
+            Some(0),
+            true,
+            StaticPrefixInputAdmission::FALLBACK_ONLY,
+        )
+        .unwrap();
+        let mut x86_floor = vec![0x49, 0x81, 0xfa]; // cmp r10, 256
+        x86_floor.extend_from_slice(
+            &u32::try_from(PARTIAL_DFA_MIN_INPUT_BYTES)
+                .unwrap()
+                .to_le_bytes(),
+        );
+        x86_floor.extend_from_slice(&[0x0f, 0x82]); // jb cold short check
+        let mut x86_short = vec![0x49, 0x81, 0xfa]; // cmp r10, h
+        x86_short.extend_from_slice(&u32::from(HOLE_BYTES).to_le_bytes());
+        x86_short.extend_from_slice(&[0x0f, 0x86]); // jbe native entry
+        assert!(x86
+            .code
+            .windows(x86_floor.len())
+            .any(|window| window == x86_floor));
+        assert!(x86
+            .code
+            .windows(x86_short.len())
+            .any(|window| window == x86_short));
+        assert!(!x86_fallback_only
+            .code
+            .windows(x86_short.len())
+            .any(|window| window == x86_short));
+
+        let aarch64 = lower_aarch64_static_prefix_prepared_wrapper(
+            OutputContract::Exists,
+            false,
+            Some(0),
+            true,
+            safe,
+        )
+        .unwrap();
+        let aarch64_fallback_only = lower_aarch64_static_prefix_prepared_wrapper(
+            OutputContract::Exists,
+            false,
+            Some(0),
+            true,
+            StaticPrefixInputAdmission::FALLBACK_ONLY,
+        )
+        .unwrap();
+        let words = aarch64
+            .code
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        let fallback_words = aarch64_fallback_only
+            .code
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        let floor_cmp = aarch64_cmp_x_imm(
+            10,
+            u16::try_from(PARTIAL_DFA_MIN_INPUT_BYTES).unwrap(),
+        )
+        .unwrap();
+        let short_cmp = aarch64_cmp_x_imm(10, HOLE_BYTES).unwrap();
+        assert!(words.windows(2).any(|window| {
+            window[0] == floor_cmp && window[1] & 0xff00_001f == 0x5400_0003
+        }));
+        assert!(words.windows(2).any(|window| {
+            window[0] == short_cmp && window[1] & 0xff00_001f == 0x5400_0009
+        }));
+        assert!(!fallback_words.windows(2).any(|window| {
+            window[0] == short_cmp && window[1] & 0xff00_001f == 0x5400_0009
+        }));
+
+        for invalid in [
+            lower_x86_64_static_prefix_prepared_wrapper(
+                OutputContract::Exists,
+                false,
+                None,
+                true,
+                safe,
+            ),
+            lower_x86_64_static_prefix_prepared_wrapper(
+                OutputContract::Exists,
+                false,
+                Some(0),
+                false,
+                safe,
+            ),
+        ] {
+            assert!(matches!(invalid, Err(ObjectError::InvalidModule(_))));
         }
     }
 
@@ -52953,6 +53203,39 @@ int main(void){{
                     expects_fused_hole,
                     "deferred hole layout: {output:?}/{target:?}"
                 );
+                if expects_fused_hole {
+                    let short_native_max = u16::try_from(
+                        resume
+                            .first_observable_hole_bytes()
+                            .unwrap_or(PARTIAL_DFA_MIN_INPUT_BYTES - 1)
+                            .min(PARTIAL_DFA_MIN_INPUT_BYTES - 1),
+                    )
+                    .expect("short admission maximum fits immediate");
+                    assert!(short_native_max > 0);
+                    let wrapper = &hybrid.0.code
+                        [hybrid.1.code_offset..hybrid.1.code_offset + hybrid.1.code_size];
+                    match target.architecture {
+                        Architecture::X86_64 => {
+                            let mut compare = vec![0x49, 0x81, 0xfa];
+                            compare.extend_from_slice(&u32::from(short_native_max).to_le_bytes());
+                            compare.extend_from_slice(&[0x0f, 0x86]);
+                            assert!(wrapper
+                                .windows(compare.len())
+                                .any(|window| window == compare));
+                        }
+                        Architecture::Aarch64 => {
+                            let compare = aarch64_cmp_x_imm(10, short_native_max).unwrap();
+                            let words = wrapper
+                                .chunks_exact(4)
+                                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                                .collect::<Vec<_>>();
+                            assert!(words.windows(2).any(|window| {
+                                window[0] == compare
+                                    && window[1] & 0xff00_001f == 0x5400_0009
+                            }));
+                        }
+                    }
+                }
                 let tail_alignment_mask = match target.architecture {
                     Architecture::X86_64 => 15,
                     Architecture::Aarch64 => 3,
@@ -62495,18 +62778,27 @@ int main(void){{int status=run_deferred_guards();if(status!=0)return status;stat
             ("eager-no-match", OutputContract::Exists, false, 0),
             ("eager-match", OutputContract::Exists, false, 1),
         ] {
+            let input_admission = if defer_preflight {
+                StaticPrefixInputAdmission {
+                    short_native_max: Some(7),
+                }
+            } else {
+                StaticPrefixInputAdmission::FALLBACK_ONLY
+            };
             let wrapper = match target.architecture {
                 Architecture::X86_64 => lower_x86_64_static_prefix_prepared_wrapper(
                     output,
                     false,
                     Some(0),
                     defer_preflight,
+                    input_admission,
                 ),
                 Architecture::Aarch64 => lower_aarch64_static_prefix_prepared_wrapper(
                     output,
                     false,
                     Some(0),
                     defer_preflight,
+                    input_admission,
                 ),
             }
             .unwrap_or_else(|error| panic!("lower {name} wrapper: {error}"));
@@ -62704,6 +62996,16 @@ uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_r
 uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_retire_v1(handle_t h,uint32_t status){{retire_calls++;if(h!=(handle_t)&prepared)return 5U;object_ticket=postflight_ticket=0U;prepared.invocation_epoch=prepared.invocation_epoch==UINT64_MAX?UINT64_C(1):prepared.invocation_epoch+UINT64_C(1);switch(status){{case 0U:case 1U:case 2U:case 3U:case 5U:return status;default:return 3U;}}}}
 uint32_t fre_aot_regex_runtime_search_exclusive_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;fallback_calls++;return 93U;}}
 static int check_result(result_t r){{return r.start=={expected_start}U&&r.end=={expected_end}U;}}
+static int run_short_admission(void){{if(!{deferred}U)return 0;result_t result={{91U,92U}};uint32_t status;
+  reset(UINT64_C(1));status=fre_test_static_prefix_terminal_entry((handle_t)&prepared,haystack,sizeof(haystack),0U,7U,&result);
+  if(status!={core_status}U||!check_result(result)||fallback_calls!=0U||preflight_calls!=0U||prepared.invocation_epoch!=UINT64_C(2))return 20;
+  reset(UINT64_C(1));result.start=91U;result.end=92U;status=fre_test_static_prefix_terminal_entry((handle_t)&prepared,haystack,sizeof(haystack),0U,8U,&result);
+  if(status!=93U||result.start!=91U||result.end!=92U||fallback_calls!=1U||preflight_calls!=0U||prepared.invocation_epoch!=UINT64_C(2))return 21;
+  reset(UINT64_C(1));status=fre_test_static_prefix_terminal_entry((handle_t)&prepared,haystack,sizeof(haystack),0U,255U,&result);
+  if(status!=93U||fallback_calls!=1U||preflight_calls!=0U||prepared.invocation_epoch!=UINT64_C(2))return 22;
+  reset(UINT64_C(1));result.start=91U;result.end=92U;status=fre_test_static_prefix_terminal_entry((handle_t)&prepared,haystack,sizeof(haystack),0U,256U,&result);
+  if(status!={core_status}U||!check_result(result)||fallback_calls!=0U||preflight_calls!=0U||prepared.invocation_epoch!=UINT64_C(2))return 23;
+  return 0;}}
 int main(void){{result_t result={{91U,92U}};reset(UINT64_C(1));if({deferred}U){{object_ticket=1U;object_epoch=prepared.invocation_epoch;}}uint32_t status=fre_test_static_prefix_terminal_entry((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),&result);
   if(status!={core_status}U||!check_result(result)||preflight_calls!={eager}U||fallback_calls!=0U||retire_calls!=0U||prepared.invocation_epoch!=UINT64_C(2)||object_ticket!=1U)return 10;
   if(fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_continue_v1((handle_t)&prepared,haystack,sizeof(haystack),&result,0U,1U,0U)!=3U||object_ticket!=0U)return 11;
@@ -62712,7 +63014,7 @@ int main(void){{result_t result={{91U,92U}};reset(UINT64_C(1));if({deferred}U){{
     if(fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_recover_span_v2((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),&result,fre_test_static_prefix_terminal_identity,7U)!=3U||postflight_ticket!=0U)return 13;}}
   reset(UINT64_MAX);result.start=91U;result.end=92U;status=fre_test_static_prefix_terminal_entry((handle_t)&prepared,haystack,sizeof(haystack),0U,sizeof(haystack),&result);
   if(status!=3U||result.start!=91U||result.end!=92U||preflight_calls!={eager}U||fallback_calls!=0U||retire_calls!=1U||prepared.invocation_epoch!=UINT64_C(1)||object_ticket!=0U||postflight_ticket!=0U)return 14;
-  return 0;}}
+  return run_short_admission();}}
 "##,
                 epoch_offset = STATIC_PREFIX_INVOCATION_EPOCH_OFFSET,
                 haystack_len = PARTIAL_DFA_MIN_INPUT_BYTES + 64,

@@ -2432,6 +2432,133 @@ impl NativeSlowPartial {
         }
     }
 
+    /// Return the shortest input length that can enter an incomplete row.
+    ///
+    /// The retained slow prefix owns subset states in FIFO discovery order,
+    /// so a level scan over its numeric state intervals is an allocation-free
+    /// breadth-first search. A hole reached after consuming byte `h` is not
+    /// observable on an input of length `h`: the native executor finishes at
+    /// the window boundary before asking for the missing row. It first needs
+    /// a continuation on length `h + 1`.
+    ///
+    /// Exists accepts immediately and therefore does not observe the
+    /// successor of an accepting transition. Endpoint contracts retain the
+    /// selected endpoint and continue through that successor, so the same
+    /// edge remains observable for `SelectedEnd` and `Span`.
+    pub(crate) fn first_observable_hole_bytes(
+        &self,
+        output: OutputContract,
+    ) -> Result<Option<usize>, CompileError> {
+        let classes = self.alphabet.classes();
+        let complete = self.forward.complete_rows;
+        let discovered = self.forward.discovered_states;
+        if classes == 0 || classes > 256 {
+            return Err(CompileError::InternalInvariant(
+                "slow partial DFA alphabet is outside 1..=256",
+            ));
+        }
+        if complete == 0 || complete > discovered {
+            return Err(CompileError::InternalInvariant(
+                "slow partial DFA retained dimensions are invalid",
+            ));
+        }
+        let expected_cells = complete.checked_mul(classes).ok_or(
+            CompileError::InternalInvariant("slow partial DFA table extent overflowed"),
+        )?;
+        if self.forward.transitions.len() != expected_cells {
+            return Err(CompileError::InternalInvariant(
+                "slow partial DFA table extent is inconsistent",
+            ));
+        }
+        if self.forward.initial_terminal && !self.forward.initial_pending {
+            return Err(CompileError::InternalInvariant(
+                "slow partial DFA initial terminal has no pending endpoint",
+            ));
+        }
+        for cell in self.forward.transitions.iter().copied() {
+            let next = cell.next();
+            if next != NO_STATE
+                && usize::try_from(next)
+                    .ok()
+                    .is_none_or(|state| state >= discovered)
+            {
+                return Err(CompileError::InternalInvariant(
+                    "slow partial DFA transition exceeds discovered states",
+                ));
+            }
+        }
+
+        // A later-stage resource decline can retain a complete forward
+        // machine in this owner. It has no continuation hole and deliberately
+        // carries no discovery keys.
+        if complete == discovered {
+            return Ok(None);
+        }
+        if self.forward.states.len() != discovered {
+            return Err(CompileError::InternalInvariant(
+                "slow partial DFA discovery keys are incomplete",
+            ));
+        }
+        if (output == OutputContract::Exists && self.forward.initial_pending)
+            || (output != OutputContract::Exists && self.forward.initial_terminal)
+        {
+            return Ok(None);
+        }
+
+        let mut level_start = 0usize;
+        let mut level_end = 1usize;
+        let mut depth = 0usize;
+        loop {
+            let mut next_level_end = level_end;
+            for state in level_start..level_end {
+                let row = state.checked_mul(classes).ok_or(
+                    CompileError::InternalInvariant("slow partial DFA row offset overflowed"),
+                )?;
+                for class in 0..classes {
+                    let index = row.checked_add(class).ok_or(
+                        CompileError::InternalInvariant("slow partial DFA cell offset overflowed"),
+                    )?;
+                    let cell = *self.forward.transitions.get(index).ok_or(
+                        CompileError::InternalInvariant("slow partial DFA row is absent"),
+                    )?;
+                    if output == OutputContract::Exists && cell.accepted() {
+                        continue;
+                    }
+                    let next = cell.next();
+                    if next == NO_STATE {
+                        continue;
+                    }
+                    let next = usize::try_from(next).map_err(|_| {
+                        CompileError::InternalInvariant(
+                            "slow partial DFA destination exceeded usize",
+                        )
+                    })?;
+                    if next >= complete {
+                        return depth.checked_add(1).map(Some).ok_or(
+                            CompileError::InternalInvariant(
+                                "slow partial DFA hole depth overflowed",
+                            ),
+                        );
+                    }
+                    let after_next = next.checked_add(1).ok_or(
+                        CompileError::InternalInvariant(
+                            "slow partial DFA level boundary overflowed",
+                        ),
+                    )?;
+                    next_level_end = next_level_end.max(after_next);
+                }
+            }
+            if next_level_end == level_end {
+                return Ok(None);
+            }
+            level_start = level_end;
+            level_end = next_level_end;
+            depth = depth.checked_add(1).ok_or(CompileError::InternalInvariant(
+                "slow partial DFA BFS depth overflowed",
+            ))?;
+        }
+    }
+
     pub(crate) fn native_view(&self) -> NativeDfaView<'_> {
         NativeDfaView {
             initial_state: 0,
@@ -6272,6 +6399,229 @@ fn put_u64(bytes: &mut Vec<u8>, value: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn synthetic_native_slow_partial(
+        classes: usize,
+        complete_rows: usize,
+        discovered_states: usize,
+        initial_pending: bool,
+        initial_terminal: bool,
+        transitions: Vec<ForwardCell>,
+    ) -> NativeSlowPartial {
+        let mut byte_to_class = [0_u8; 256];
+        for (byte, class) in byte_to_class.iter_mut().take(classes).enumerate() {
+            *class = u8::try_from(byte).expect("synthetic class fits u8");
+        }
+        NativeSlowPartial {
+            alphabet: Alphabet {
+                byte_to_class,
+                representatives: (0..classes)
+                    .map(|class| u8::try_from(class).expect("synthetic class fits u8"))
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            },
+            forward: NativeSlowPartialForward {
+                initial_pending,
+                initial_terminal,
+                transitions,
+                complete_rows,
+                discovered_states,
+                states_before_minimization: discovered_states,
+                states: (0..discovered_states)
+                    .map(|state| ForwardKey {
+                        items: vec![u32::try_from(state).expect("synthetic state fits u32")],
+                        pending: false,
+                    })
+                    .collect(),
+            },
+            reverse: None,
+            reverse_states_before_minimization: 0,
+            retained_forward_minimized: false,
+            boundary_classes: classes,
+            graph_classes: classes,
+        }
+    }
+
+    fn allocated_first_observable_hole_oracle(
+        partial: &NativeSlowPartial,
+        output: OutputContract,
+    ) -> Option<usize> {
+        if (output == OutputContract::Exists && partial.forward.initial_pending)
+            || (output != OutputContract::Exists && partial.forward.initial_terminal)
+        {
+            return None;
+        }
+        let classes = partial.alphabet.classes();
+        let complete = partial.forward.complete_rows;
+        let mut seen = vec![false; complete];
+        let mut queue = std::collections::VecDeque::new();
+        seen[0] = true;
+        queue.push_back((0usize, 0usize));
+        while let Some((state, depth)) = queue.pop_front() {
+            let row = state * classes;
+            for cell in partial.forward.transitions[row..row + classes]
+                .iter()
+                .copied()
+            {
+                if output == OutputContract::Exists && cell.accepted() {
+                    continue;
+                }
+                let next = cell.next();
+                if next == NO_STATE {
+                    continue;
+                }
+                let next = usize::try_from(next).expect("synthetic destination fits usize");
+                if next >= complete {
+                    return Some(depth + 1);
+                }
+                if !seen[next] {
+                    seen[next] = true;
+                    queue.push_back((next, depth + 1));
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn slow_partial_first_hole_bfs_matches_allocated_oracle() {
+        let cases = [
+            synthetic_native_slow_partial(
+                2,
+                2,
+                3,
+                false,
+                false,
+                vec![
+                    forward_cell! { next: 1, accepted: false },
+                    forward_cell! { next: NO_STATE, accepted: false },
+                    forward_cell! { next: 2, accepted: false },
+                    forward_cell! { next: 1, accepted: false },
+                ],
+            ),
+            synthetic_native_slow_partial(
+                2,
+                3,
+                4,
+                false,
+                false,
+                vec![
+                    forward_cell! { next: 1, accepted: false },
+                    forward_cell! { next: 2, accepted: false },
+                    forward_cell! { next: 3, accepted: false },
+                    forward_cell! { next: 1, accepted: false },
+                    forward_cell! { next: 2, accepted: false },
+                    forward_cell! { next: 3, accepted: false },
+                ],
+            ),
+            synthetic_native_slow_partial(
+                1,
+                1,
+                2,
+                false,
+                false,
+                vec![forward_cell! { next: 1, accepted: true }],
+            ),
+        ];
+        for (case, partial) in cases.iter().enumerate() {
+            for output in [
+                OutputContract::Exists,
+                OutputContract::SelectedEnd,
+                OutputContract::Span,
+            ] {
+                assert_eq!(
+                    partial.first_observable_hole_bytes(output).unwrap(),
+                    allocated_first_observable_hole_oracle(partial, output),
+                    "case {case}/{output:?}",
+                );
+            }
+        }
+        assert_eq!(
+            cases[0]
+                .first_observable_hole_bytes(OutputContract::SelectedEnd)
+                .unwrap(),
+            Some(2),
+        );
+        assert_eq!(
+            cases[1]
+                .first_observable_hole_bytes(OutputContract::SelectedEnd)
+                .unwrap(),
+            Some(2),
+        );
+        assert_eq!(
+            cases[2]
+                .first_observable_hole_bytes(OutputContract::Exists)
+                .unwrap(),
+            None,
+        );
+        assert_eq!(
+            cases[2]
+                .first_observable_hole_bytes(OutputContract::SelectedEnd)
+                .unwrap(),
+            Some(1),
+        );
+    }
+
+    #[test]
+    fn slow_partial_first_hole_respects_initial_terminals_and_rejects_bad_extent() {
+        let exists_terminal = synthetic_native_slow_partial(
+            1,
+            1,
+            2,
+            true,
+            false,
+            vec![forward_cell! { next: 1, accepted: false }],
+        );
+        assert_eq!(
+            exists_terminal
+                .first_observable_hole_bytes(OutputContract::Exists)
+                .unwrap(),
+            None,
+        );
+        assert_eq!(
+            exists_terminal
+                .first_observable_hole_bytes(OutputContract::SelectedEnd)
+                .unwrap(),
+            Some(1),
+        );
+
+        let endpoint_terminal = synthetic_native_slow_partial(
+            1,
+            1,
+            2,
+            true,
+            true,
+            vec![forward_cell! { next: 1, accepted: false }],
+        );
+        for output in [OutputContract::SelectedEnd, OutputContract::Span] {
+            assert_eq!(
+                endpoint_terminal
+                    .first_observable_hole_bytes(output)
+                    .unwrap(),
+                None,
+            );
+        }
+
+        let mut malformed = synthetic_native_slow_partial(
+            1,
+            1,
+            2,
+            false,
+            false,
+            vec![forward_cell! { next: 1, accepted: false }],
+        );
+        malformed.forward.transitions[0] =
+            forward_cell! { next: 2, accepted: false };
+        assert!(matches!(
+            malformed.first_observable_hole_bytes(OutputContract::Exists),
+            Err(CompileError::InternalInvariant(_)),
+        ));
+        malformed.forward.transitions.clear();
+        assert!(matches!(
+            malformed.first_observable_hole_bytes(OutputContract::Exists),
+            Err(CompileError::InternalInvariant(_)),
+        ));
+    }
 
     fn class_mass_test_alphabet() -> Alphabet {
         let mut byte_to_class = [2_u8; 256];

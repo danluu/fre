@@ -7357,6 +7357,7 @@ pub(crate) struct NativeSlowResumeView<'a> {
     partial: &'a NativeSlowPartial,
     state_count: usize,
     item_count: usize,
+    first_observable_hole_bytes: Option<usize>,
 }
 
 impl<'a> NativeSlowResumeView<'a> {
@@ -7366,6 +7367,12 @@ impl<'a> NativeSlowResumeView<'a> {
 
     pub(crate) const fn item_count(self) -> usize {
         self.item_count
+    }
+
+    /// Maximum short window that the retained native prefix can finish
+    /// without observing its deferred continuation.
+    pub(crate) const fn first_observable_hole_bytes(self) -> Option<usize> {
+        self.first_observable_hole_bytes
     }
 
     pub(crate) fn frontiers(self) -> impl ExactSizeIterator<Item = (&'a [u32], bool)> {
@@ -7404,6 +7411,9 @@ pub(crate) struct NativeSlowDfaProgram {
     required_literals: RequiredLiterals,
     report: DeterminizationReport,
     allocation_bytes: usize,
+    /// Compiler-private shortest distance to a genuine incomplete row.
+    /// `None` means that no continuation hole is observable.
+    first_observable_hole_bytes: Option<usize>,
 }
 
 /// Owned target-neutral result of explicitly bounded slow contextual
@@ -7486,6 +7496,7 @@ impl NativeSlowDfaProgram {
             partial,
             state_count,
             item_count,
+            first_observable_hole_bytes: self.first_observable_hole_bytes,
         })
     }
 
@@ -8628,17 +8639,23 @@ impl CompiledProgram {
                 required_literals: required_literals::derive(&self.raw),
                 report,
                 allocation_bytes,
+                first_observable_hole_bytes: None,
             })),
             DeterminizeOutcome::Declined {
                 report,
                 partial: None,
                 native_slow_partial: Some(machine),
-            } => Ok(Some(NativeSlowDfaProgram {
-                machine: NativeSlowMachine::Partial(machine),
-                required_literals: required_literals::derive(&self.raw),
-                report,
-                allocation_bytes,
-            })),
+            } => {
+                let first_observable_hole_bytes =
+                    machine.first_observable_hole_bytes(self.output)?;
+                Ok(Some(NativeSlowDfaProgram {
+                    machine: NativeSlowMachine::Partial(machine),
+                    required_literals: required_literals::derive(&self.raw),
+                    report,
+                    allocation_bytes,
+                    first_observable_hole_bytes,
+                }))
+            }
             DeterminizeOutcome::Declined {
                 partial: None,
                 native_slow_partial: None,
