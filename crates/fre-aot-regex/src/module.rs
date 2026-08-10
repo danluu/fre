@@ -4486,6 +4486,60 @@ struct NativeDefaultExceptionPlan {
     row_bytes: usize,
 }
 
+/// Canonical semantic equality for resource-rescue rows.
+///
+/// In a collapsed partial machine, every validated destination outside the
+/// completed prefix is packed as the same synthetic hole token. The partial
+/// packer takes that branch before considering the start scanner or selected
+/// loop state, sets the accelerator bit unconditionally, and retains only the
+/// cell's acceptance flag. Replacing each such destination with the first
+/// incomplete ordinal therefore preserves its exact packed value while making
+/// equality independent of which resume destination named the hole. An
+/// uncollapsed machine returns every validated cell unchanged.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeDefaultExceptionNormalization {
+    complete_states: usize,
+    discovered_states: usize,
+    collapsed_hole_next: Option<u32>,
+}
+
+impl NativeDefaultExceptionNormalization {
+    fn new(
+        complete_states: usize,
+        discovered_states: usize,
+        collapse_partial_holes: bool,
+    ) -> Option<Self> {
+        discovered_states.checked_sub(complete_states)?;
+        let collapsed_hole_next = if collapse_partial_holes {
+            Some(u32::try_from(complete_states).ok()?)
+        } else {
+            None
+        };
+        Some(Self {
+            complete_states,
+            discovered_states,
+            collapsed_hole_next,
+        })
+    }
+
+    fn normalize(self, cell: ForwardCell) -> Option<ForwardCell> {
+        if cell.next() == NO_DFA_STATE {
+            return Some(cell);
+        }
+        let next = usize::try_from(cell.next()).ok()?;
+        if next >= self.discovered_states {
+            return None;
+        }
+        if next < self.complete_states {
+            return Some(cell);
+        }
+        let Some(collapsed_hole_next) = self.collapsed_hole_next else {
+            return Some(cell);
+        };
+        ForwardCell::try_new(collapsed_hole_next, cell.accepted())
+    }
+}
+
 fn native_default_exception_value_offset(exception_capacity: u8) -> Option<usize> {
     let keys_end = core::mem::size_of::<u32>()
         .checked_add(usize::from(exception_capacity))?;
@@ -4501,8 +4555,18 @@ fn native_default_exception_row_bytes(exception_capacity: u8) -> Option<usize> {
 
 fn native_default_exception_row(
     row: &[ForwardCell],
+    normalization: NativeDefaultExceptionNormalization,
 ) -> Option<(ForwardCell, [Option<(u8, ForwardCell)>; MAX_NATIVE_DEFAULT_EXCEPTIONS], usize)> {
     let &first = row.first()?;
+    if row.len() > CLASS_MAP_BYTES {
+        return None;
+    }
+    let mut normalized = [first; CLASS_MAP_BYTES];
+    for (class, &cell) in row.iter().enumerate() {
+        *normalized.get_mut(class)? = normalization.normalize(cell)?;
+    }
+    let row = normalized.get(..row.len())?;
+    let first = row[0];
     // A representable row wider than twice the exception capacity necessarily
     // has a unique strict-majority default, so retain the linear Boyer-Moore
     // path for ordinary alphabets. Only the bounded <=8-class remainder needs
@@ -4582,9 +4646,14 @@ fn derive_native_default_exception_plan(
     } else {
         resume_states
     };
+    let normalization = NativeDefaultExceptionNormalization::new(
+        forward_states,
+        discovered,
+        collapse_partial_holes,
+    )?;
     let mut exception_capacity = 0_usize;
     for row in dfa.forward_cells.chunks_exact(dfa.class_count) {
-        let (_, _, exceptions) = native_default_exception_row(row)?;
+        let (_, _, exceptions) = native_default_exception_row(row, normalization)?;
         exception_capacity = exception_capacity.max(exceptions);
     }
     let exception_capacity = u8::try_from(exception_capacity).ok()?;
@@ -7809,6 +7878,16 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once(
             }
         }
         TransitionLayout::DefaultExceptions(exception_capacity) => {
+            let normalization = NativeDefaultExceptionNormalization::new(
+                forward_states,
+                view.partial_discovered_states.ok_or(ObjectError::InvalidModule(
+                    "default-exception rows have no discovered-state extent",
+                ))?,
+                view.collapse_partial_holes,
+            )
+            .ok_or(ObjectError::InvalidModule(
+                "default-exception row normalization is invalid",
+            ))?;
             let value_offset = native_default_exception_value_offset(exception_capacity)
                 .ok_or(ObjectError::InvalidModule(
                     "default-exception row value offset",
@@ -7816,9 +7895,11 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once(
             for row in dfa.forward_cells.chunks_exact(dfa.class_count) {
                 let row_start = bytes.len();
                 let (default, exceptions, exception_count) =
-                    native_default_exception_row(row).ok_or(ObjectError::InvalidModule(
-                        "default-exception row lost its modal cell",
-                    ))?;
+                    native_default_exception_row(row, normalization).ok_or(
+                        ObjectError::InvalidModule(
+                            "default-exception row lost its modal cell",
+                        ),
+                    )?;
                 if exception_count > usize::from(exception_capacity) {
                     return Err(ObjectError::InvalidModule(
                         "default-exception row exceeds its table capacity",
@@ -33936,6 +34017,81 @@ mod tests {
         }
     }
 
+    /// Every retained row after row zero names eight distinct incomplete
+    /// destinations. Packed collapsed semantics retain only two observable
+    /// hole variants (accepted and unaccepted), plus the dead cell. The nine
+    /// logical classes deliberately make the ordinary compact-indexed table
+    /// unattractive on x86-64 and still larger than the sparse rows on
+    /// AArch64, so both target families exercise the resource retry.
+    struct PackedCollapsedDefaultExceptionFixture {
+        byte_classes: [u8; 256],
+        class_representatives: [u8; 9],
+        forward_cells: Vec<ForwardCell>,
+    }
+
+    impl PackedCollapsedDefaultExceptionFixture {
+        const CLASS_COUNT: usize = 9;
+        const COMPLETE_ROWS: usize = 1_900;
+        const DISCOVERED_STATES: usize = Self::COMPLETE_ROWS + 8;
+
+        fn new() -> Self {
+            let mut byte_classes = [0_u8; 256];
+            for class in 1..=5 {
+                byte_classes[class] = u8::try_from(class).unwrap();
+            }
+            for (byte, class) in [(250, 6), (252, 7), (254, 8)] {
+                byte_classes[byte] = class;
+            }
+            let class_representatives = [0, 1, 2, 3, 4, 5, 250, 252, 254];
+            let mut forward_cells =
+                Vec::with_capacity(Self::COMPLETE_ROWS * Self::CLASS_COUNT);
+            let first_hole = u32::try_from(Self::COMPLETE_ROWS).unwrap();
+            for state in 0..Self::COMPLETE_ROWS {
+                for class in 0..Self::CLASS_COUNT {
+                    let cell = if state == 0 && class <= 5 {
+                        ForwardCell::new(0, false)
+                    } else if class <= 5 {
+                        ForwardCell::new(first_hole + u32::try_from(class).unwrap(), false)
+                    } else if class <= 7 {
+                        ForwardCell::new(first_hole + u32::try_from(class).unwrap(), true)
+                    } else {
+                        ForwardCell::new(NO_DFA_STATE, false)
+                    };
+                    forward_cells.push(cell);
+                }
+            }
+            Self {
+                byte_classes,
+                class_representatives,
+                forward_cells,
+            }
+        }
+
+        fn view<'a>(&'a self, base: NativeProgramView<'a>) -> NativeProgramView<'a> {
+            NativeProgramView {
+                dfa: NativeDfaView {
+                    initial_state: 0,
+                    initial_pending: false,
+                    initial_terminal: false,
+                    byte_classes: &self.byte_classes,
+                    class_count: Self::CLASS_COUNT,
+                    class_representatives: &self.class_representatives,
+                    forward_cells: &self.forward_cells,
+                    reverse_initial: None,
+                    reverse_cells: &[],
+                },
+                partial_discovered_states: Some(Self::DISCOVERED_STATES),
+                collapse_partial_holes: true,
+                exact_match_width: None,
+                max_match_width: None,
+                exact_product_width: None,
+                retained_prefix_requirement: None,
+                retained_suffix_requirement: None,
+                ..base
+            }
+        }
+    }
+
     fn default_exception_partial_view<'a>(
         fixture: &'a DefaultExceptionPartialFixture,
         compiled: &'a CompiledRegex,
@@ -50818,10 +50974,11 @@ int main(void){{
         let c = ForwardCell::new(2, true);
         let d = ForwardCell::new(3, false);
         let e = ForwardCell::new(NO_DFA_STATE, false);
+        let exact = NativeDefaultExceptionNormalization::new(5, 5, false).unwrap();
 
         let tied = [a, b, a, b, a, b, a, b];
         let (default, exceptions, count) =
-            native_default_exception_row(&tied).expect("tied four-exception row");
+            native_default_exception_row(&tied, exact).expect("tied four-exception row");
         assert_eq!(default, a);
         assert_eq!(count, 4);
         assert_eq!(
@@ -50830,10 +50987,9 @@ int main(void){{
         );
 
         let plurality_without_majority = [a, b, b, b, c, c];
-        let (default, exceptions, count) = native_default_exception_row(
-            &plurality_without_majority,
-        )
-        .expect("non-majority modal row");
+        let (default, exceptions, count) =
+            native_default_exception_row(&plurality_without_majority, exact)
+                .expect("non-majority modal row");
         assert_eq!(default, b);
         assert_eq!(count, 3);
         assert_eq!(
@@ -50843,15 +50999,108 @@ int main(void){{
 
         let all_distinct = [a, b, c, d, e];
         let (default, exceptions, count) =
-            native_default_exception_row(&all_distinct).expect("four exact exceptions");
+            native_default_exception_row(&all_distinct, exact).expect("four exact exceptions");
         assert_eq!(default, a);
         assert_eq!(count, 4);
         assert_eq!(
             exceptions,
             [Some((1, b)), Some((2, c)), Some((3, d)), Some((4, e))]
         );
-        assert!(native_default_exception_row(&[a, b, c, d, e, ForwardCell::new(4, true)])
-            .is_none());
+        assert!(native_default_exception_row(
+            &[a, b, c, d, e, ForwardCell::new(4, true)],
+            exact,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn collapsed_default_exception_normalization_is_exact_packed_semantics() {
+        let collapsed = NativeDefaultExceptionNormalization::new(4, 8, true).unwrap();
+        let uncollapsed = NativeDefaultExceptionNormalization::new(4, 8, false).unwrap();
+        let live = ForwardCell::new(3, true);
+        let dead = ForwardCell::new(NO_DFA_STATE, false);
+        let false_first = ForwardCell::new(4, false);
+        let false_last = ForwardCell::new(7, false);
+        let accepted_first = ForwardCell::new(5, true);
+        let accepted_last = ForwardCell::new(6, true);
+
+        assert_eq!(collapsed.normalize(live), Some(live));
+        assert_eq!(collapsed.normalize(dead), Some(dead));
+        assert_eq!(collapsed.normalize(false_first), collapsed.normalize(false_last));
+        assert_eq!(
+            collapsed.normalize(accepted_first),
+            collapsed.normalize(accepted_last)
+        );
+        assert_ne!(
+            collapsed.normalize(false_first),
+            collapsed.normalize(accepted_first)
+        );
+        // Validation precedes normalization: an otherwise collapsible ordinal
+        // outside the authenticated discovered extent must fail closed.
+        assert_eq!(collapsed.normalize(ForwardCell::new(8, false)), None);
+        for cell in [live, dead, false_first, false_last, accepted_first, accepted_last] {
+            assert_eq!(uncollapsed.normalize(cell), Some(cell));
+        }
+
+        let partial = NativePartialDfaLayout {
+            hole_token_base: 123,
+            resume_states: 4,
+            collapse_holes: true,
+        };
+        let cells = NativeCellEncoding::Wide32;
+        for initial_scannable in [false, true] {
+            for loop_state in [None, Some(0), Some(4), Some(7)] {
+                for raw in [false_first, false_last, accepted_first, accepted_last] {
+                    let normalized = collapsed.normalize(raw).unwrap();
+                    let raw_packed = pack_native_partial_forward_cell(
+                        raw.next(),
+                        raw.accepted(),
+                        256,
+                        20,
+                        4,
+                        initial_scannable,
+                        loop_state,
+                        partial,
+                        cells,
+                    )
+                    .unwrap();
+                    let normalized_packed = pack_native_partial_forward_cell(
+                        normalized.next(),
+                        normalized.accepted(),
+                        256,
+                        20,
+                        4,
+                        initial_scannable,
+                        loop_state,
+                        partial,
+                        cells,
+                    )
+                    .unwrap();
+                    assert_eq!(raw_packed, normalized_packed);
+                }
+            }
+        }
+        let pack = |cell: ForwardCell| {
+            pack_native_partial_forward_cell(
+                cell.next(),
+                cell.accepted(),
+                256,
+                20,
+                4,
+                true,
+                Some(cell.next()),
+                partial,
+                cells,
+            )
+            .unwrap()
+        };
+        let false_packed = pack(false_last);
+        let accepted_packed = pack(accepted_last);
+        assert_eq!(pack(false_first), false_packed);
+        assert_eq!(pack(accepted_first), accepted_packed);
+        assert_eq!(false_packed & cells.next_mask(), partial.hole_token_base);
+        assert_ne!(false_packed & cells.accelerated(), 0);
+        assert_eq!(false_packed ^ accepted_packed, cells.accepts());
     }
 
     #[test]
@@ -50948,6 +51197,212 @@ int main(void){{
             assert!(saw_hole, "{architecture:?}");
             assert!(saw_accept, "{architecture:?}");
             assert!(saw_accelerated, "{architecture:?}");
+        }
+    }
+
+    #[test]
+    fn distinct_collapsed_holes_share_defaults_with_an_exact_packed_oracle() {
+        let compiled = compile_partial_loop(
+            Target::x86_64_linux(),
+            OutputContract::SelectedEnd,
+        );
+        let fixture = PackedCollapsedDefaultExceptionFixture::new();
+        let view = fixture.view(
+            compiled
+                .program()
+                .native_partial_dfa_view()
+                .expect("partial base view")
+                .native,
+        );
+        let uncollapsed = NativeProgramView {
+            collapse_partial_holes: false,
+            ..view
+        };
+        for architecture in [Architecture::X86_64, Architecture::Aarch64] {
+            // Without collapsed packed equality, each non-root row has nine
+            // distinct values and is intentionally outside the four-slot
+            // format. The optimization must therefore remain fail-closed for
+            // byte-distinct uncollapsed rows.
+            assert!(derive_native_default_exception_plan(
+                uncollapsed.dfa,
+                uncollapsed.partial_discovered_states,
+                false,
+                architecture,
+            )
+            .is_none());
+
+            let plan = derive_native_default_exception_plan(
+                view.dfa,
+                view.partial_discovered_states,
+                true,
+                architecture,
+            )
+            .expect("collapsed packed plurality plan");
+            assert_eq!(plan.exception_capacity, 3, "{architecture:?}");
+            assert_eq!(plan.row_bytes, 20, "{architecture:?}");
+            assert!(usize::from(plan.exception_capacity) <= MAX_NATIVE_DEFAULT_EXCEPTIONS);
+            assert_eq!(
+                native_default_exception_retry_plan(
+                    view,
+                    architecture,
+                    &ObjectError::Allocation("synthetic dense allocation pressure"),
+                ),
+                Some(plan),
+            );
+            assert_eq!(
+                native_default_exception_retry_plan(
+                    view,
+                    architecture,
+                    &ObjectError::Resource {
+                        resource: crate::CompileResource::ProgramBytes,
+                        limit: 1,
+                        required: 2,
+                    },
+                ),
+                Some(plan),
+            );
+            assert!(native_default_exception_retry_plan(
+                view,
+                architecture,
+                &ObjectError::InvalidModule("synthetic non-resource decline"),
+            )
+            .is_none());
+
+            let dense = build_native_dfa_table_with_cost_model_and_data_limit_once(
+                view,
+                architecture,
+                NativeVectorFilterCostModel::Established,
+                true,
+                usize::MAX,
+                None,
+            )
+            .unwrap();
+            match architecture {
+                Architecture::X86_64 => {
+                    assert_eq!(dense.1.cells, NativeCellEncoding::Wide32);
+                }
+                Architecture::Aarch64 => {
+                    assert_eq!(dense.1.cells, NativeCellEncoding::Compact16Indexed(5));
+                }
+            }
+            let sparse =
+                build_forced_default_exception_table(view, architecture, usize::MAX).unwrap();
+            assert!(sparse.0.len() < dense.0.len(), "{architecture:?}");
+            assert_eq!(
+                sparse.1.transitions,
+                TransitionLayout::DefaultExceptions(3),
+                "{architecture:?}",
+            );
+            assert_eq!(sparse.1.cells, NativeCellEncoding::Wide32);
+
+            let admitted = build_native_dfa_table_with_cost_model_and_data_limit(
+                view,
+                architecture,
+                NativeVectorFilterCostModel::Established,
+                true,
+                sparse.0.len(),
+            )
+            .unwrap();
+            assert_eq!(admitted, sparse, "{architecture:?}");
+            let below = build_native_dfa_table_with_cost_model_and_data_limit(
+                view,
+                architecture,
+                NativeVectorFilterCostModel::Established,
+                true,
+                sparse.0.len() - 1,
+            );
+            assert!(matches!(
+                below,
+                Err(ObjectError::Resource {
+                    resource: crate::CompileResource::ProgramBytes,
+                    limit,
+                    ..
+                }) if limit == sparse.0.len() - 1
+            ), "{architecture:?}: {below:?}");
+
+            let data = &sparse.0;
+            let layout = sparse.1;
+            let partial = layout.partial.expect("collapsed sparse partial layout");
+            assert!(partial.collapse_holes);
+            assert_eq!(partial.resume_states, 8);
+            let exception_capacity = match layout.transitions {
+                TransitionLayout::DefaultExceptions(capacity) => capacity,
+                other => panic!("expected default-exception rows, got {other:?}"),
+            };
+            let row_bytes = native_default_exception_row_bytes(exception_capacity).unwrap();
+            let value_offset =
+                native_default_exception_value_offset(exception_capacity).unwrap();
+            let forward_offset = usize::try_from(layout.forward_offset).unwrap();
+            let packed_at = |state: usize, class: usize| {
+                let row_start = forward_offset + state * row_bytes;
+                let mut packed = u32::from_le_bytes(
+                    data[row_start..row_start + 4].try_into().unwrap(),
+                );
+                for slot in 0..usize::from(exception_capacity) {
+                    if usize::from(data[row_start + 4 + slot]) == class {
+                        let offset = row_start + value_offset + slot * 4;
+                        packed = u32::from_le_bytes(
+                            data[offset..offset + 4].try_into().unwrap(),
+                        );
+                        break;
+                    }
+                }
+                packed
+            };
+            for state in 0..PackedCollapsedDefaultExceptionFixture::COMPLETE_ROWS {
+                for class in 0..PackedCollapsedDefaultExceptionFixture::CLASS_COUNT {
+                    let semantic = view.dfa.forward_cells
+                        [state * PackedCollapsedDefaultExceptionFixture::CLASS_COUNT + class];
+                    let expected = pack_native_partial_forward_cell(
+                        semantic.next(),
+                        semantic.accepted(),
+                        forward_offset,
+                        row_bytes,
+                        PackedCollapsedDefaultExceptionFixture::COMPLETE_ROWS,
+                        layout.has_start_scanner(),
+                        layout.loop_skip.map(|loop_skip| loop_skip.state),
+                        partial,
+                        layout.cells,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        packed_at(state, class),
+                        expected,
+                        "{architecture:?}/state={state}/class={class}",
+                    );
+                }
+            }
+
+            // The first non-root row proves destination identity disappeared
+            // without losing either observable packed flag.
+            let row = PackedCollapsedDefaultExceptionFixture::CLASS_COUNT;
+            assert_ne!(view.dfa.forward_cells[row], view.dfa.forward_cells[row + 1]);
+            assert_ne!(view.dfa.forward_cells[row + 6], view.dfa.forward_cells[row + 7]);
+            let false_hole = packed_at(1, 0);
+            let accepted_hole = packed_at(1, 6);
+            assert_eq!(false_hole, packed_at(1, 1));
+            assert_eq!(accepted_hole, packed_at(1, 7));
+            assert_eq!(
+                false_hole & layout.cells.next_mask(),
+                partial.hole_token_base,
+            );
+            assert_eq!(
+                accepted_hole & layout.cells.next_mask(),
+                partial.hole_token_base,
+            );
+            assert_ne!(false_hole & layout.cells.accelerated(), 0);
+            assert_eq!(false_hole & layout.cells.accepts(), 0);
+            assert_ne!(accepted_hole & layout.cells.accepts(), 0);
+            assert_eq!(false_hole ^ accepted_hole, layout.cells.accepts());
+
+            // Only completed rows occupy addressable table space; the one
+            // collapsed hole token follows the final live row immediately.
+            let final_row_offset = forward_offset
+                + (PackedCollapsedDefaultExceptionFixture::COMPLETE_ROWS - 1) * row_bytes;
+            let last_live_token =
+                u32::try_from(encode_native_row_offset(final_row_offset, layout.cells).unwrap())
+                    .unwrap();
+            assert_eq!(partial.hole_token_base, last_live_token + 1);
         }
     }
 
@@ -51331,6 +51786,100 @@ int main(void){{
                     assert!(lowering.code.windows(3).any(|bytes| {
                         bytes == [0x41, 0x8b, 0x02]
                     }));
+                }
+                Architecture::Aarch64 => {
+                    let words = lowering
+                        .code
+                        .chunks_exact(4)
+                        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                        .collect::<Vec<_>>();
+                    assert!(words.contains(&aarch64_load_byte_imm(12, 11, 4).unwrap()));
+                    assert!(words.contains(&aarch64_load_w_imm(8, 11, 0).unwrap()));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn packed_collapsed_default_retry_lowers_every_target_vector_tier() {
+        let compiled = compile_partial_loop(
+            Target::x86_64_linux(),
+            OutputContract::SelectedEnd,
+        );
+        let fixture = PackedCollapsedDefaultExceptionFixture::new();
+        let view = fixture.view(
+            compiled
+                .program()
+                .native_partial_dfa_view()
+                .expect("partial base view")
+                .native,
+        );
+        let avx512 = FeatureSet::of(CpuFeature::X86Avx512F)
+            .with(CpuFeature::X86Avx512Bw);
+        let sve = FeatureSet::of(CpuFeature::Aarch64Sve);
+        let targets = [
+            (Target::x86_64_linux(), StartAccelerator::X86Sse2),
+            (
+                Target::x86_64_linux()
+                    .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+                    .unwrap(),
+                StartAccelerator::X86Avx2,
+            ),
+            (
+                Target::x86_64_linux().with_features(avx512).unwrap(),
+                StartAccelerator::X86Avx512Bw,
+            ),
+            (
+                Target::aarch64_macos()
+                    .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                    .unwrap(),
+                StartAccelerator::Aarch64Asimd,
+            ),
+            (
+                Target::aarch64_linux().with_features(sve).unwrap(),
+                StartAccelerator::Aarch64Sve,
+            ),
+            (
+                Target::aarch64_linux()
+                    .with_features(sve.with(CpuFeature::Aarch64Sve2))
+                    .unwrap(),
+                StartAccelerator::Aarch64Sve2,
+            ),
+        ];
+        for (target, expected_accelerator) in targets {
+            let dense = build_native_dfa_table_with_cost_model_and_data_limit_once(
+                view,
+                target.architecture,
+                NativeVectorFilterCostModel::Established,
+                true,
+                usize::MAX,
+                None,
+            )
+            .unwrap();
+            let lowering = lower_native_dfa_with_entry_contract_and_data_limit(
+                view,
+                target,
+                NativeDfaEntryContract::PreparedPartialCore,
+                dense.0.len() - 1,
+            )
+            .unwrap()
+            .unwrap_or_else(|| panic!("packed collapsed target declined: {target:?}"));
+            assert_eq!(
+                lowering.start_accelerator,
+                expected_accelerator,
+                "{target:?}",
+            );
+            match target.architecture {
+                Architecture::X86_64 => {
+                    // cmp byte ptr [r10 + rax + 4], class; mov default.
+                    assert!(lowering
+                        .code
+                        .windows(4)
+                        .any(|bytes| bytes == [0x41, 0x3a, 0x42, 0x04]));
+                    assert!(lowering
+                        .code
+                        .windows(3)
+                        .any(|bytes| bytes == [0x41, 0x8b, 0x02]));
                 }
                 Architecture::Aarch64 => {
                     let words = lowering
