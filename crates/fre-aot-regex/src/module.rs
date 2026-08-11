@@ -80,6 +80,11 @@ use crate::{
         FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION, FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION,
         FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION, FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION,
         FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION,
+        FROZEN_REVERSE_SUPERTRANSITION_V1_CLASS_COUNT_OFFSET,
+        FROZEN_REVERSE_SUPERTRANSITION_V1_CLASS_MAP_OFFSET,
+        FROZEN_REVERSE_SUPERTRANSITION_V1_FORMAT_VERSION_OFFSET,
+        FROZEN_REVERSE_SUPERTRANSITION_V1_INITIAL_BLOCK_OFFSET,
+        FROZEN_REVERSE_SUPERTRANSITION_V1_ROWS_ADDRESS_OFFSET,
         FROZEN_PREPARED_HEADER_V1_ABI_VERSION, FROZEN_PREPARED_HEADER_V1_ABI_VERSION_OFFSET,
         FROZEN_PREPARED_HEADER_V1_ACCEPT_MASK_OFFSET, FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL,
         FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL_OFFSET,
@@ -99,6 +104,7 @@ use crate::{
         FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V12,
         FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V13,
         FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V14,
+        FROZEN_PREPARED_HEADER_V1_FLAG_REVERSE_SUPERTRANSITION,
         FROZEN_PREPARED_HEADER_V1_FORWARD_INITIAL_ROW_OFFSET,
         FROZEN_PREPARED_HEADER_V1_FORWARD_LIVE_CELLS_OFFSET,
         FROZEN_PREPARED_HEADER_V1_FORWARD_ROWS_ADDRESS_OFFSET,
@@ -23965,6 +23971,8 @@ fn lower_x86_64_static_prefix_prepared_wrapper(
 enum FrozenCompactGuardMode {
     ActiveCapability,
     ActiveCapabilitySimdIdentity,
+    ActiveCapabilityReverseSupertransition,
+    ActiveCapabilitySimdIdentityReverseSupertransition,
     FullVerifier,
     FullVerifierVariableSpan(u16),
 }
@@ -23979,12 +23987,26 @@ impl FrozenCompactGuardMode {
             Self::FullVerifierVariableSpan(source_class_count) => Some(source_class_count),
             Self::ActiveCapability
             | Self::ActiveCapabilitySimdIdentity
+            | Self::ActiveCapabilityReverseSupertransition
+            | Self::ActiveCapabilitySimdIdentityReverseSupertransition
             | Self::FullVerifier => None,
         }
     }
 
     const fn uses_simd_identity(self) -> bool {
-        matches!(self, Self::ActiveCapabilitySimdIdentity)
+        matches!(
+            self,
+            Self::ActiveCapabilitySimdIdentity
+                | Self::ActiveCapabilitySimdIdentityReverseSupertransition
+        )
+    }
+
+    const fn expects_reverse_supertransition(self) -> bool {
+        matches!(
+            self,
+            Self::ActiveCapabilityReverseSupertransition
+                | Self::ActiveCapabilitySimdIdentityReverseSupertransition
+        )
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -24296,9 +24318,28 @@ fn x86_emit_frozen_compact_entry(
         0x7f,
         header_disp(FROZEN_PREPARED_HEADER_V1_FLAGS_OFFSET, "x86 V3 flags")?,
     ];
-    compare_flags.extend_from_slice(&format.flag().to_le_bytes());
+    let primary_flags = if guard_mode.expects_reverse_supertransition() {
+        format.flag() | FROZEN_PREPARED_HEADER_V1_FLAG_REVERSE_SUPERTRANSITION
+    } else {
+        format.flag()
+    };
+    compare_flags.extend_from_slice(&primary_flags.to_le_bytes());
     assembler.instruction(&compare_flags)?;
-    assembler.branch(&[0x0f, 0x85], try_older)?;
+    if guard_mode.expects_reverse_supertransition() {
+        let accepted_flags = assembler.label()?;
+        assembler.branch(&[0x0f, 0x84], accepted_flags)?;
+        let mut compare_base_flags = vec![
+            0x81,
+            0x7f,
+            header_disp(FROZEN_PREPARED_HEADER_V1_FLAGS_OFFSET, "x86 V3 base flags")?,
+        ];
+        compare_base_flags.extend_from_slice(&format.flag().to_le_bytes());
+        assembler.instruction(&compare_base_flags)?;
+        assembler.branch(&[0x0f, 0x85], try_older)?;
+        assembler.bind(accepted_flags)?;
+    } else {
+        assembler.branch(&[0x0f, 0x85], try_older)?;
+    }
 
     // Every live exclusive handle owns the maximum V6 envelope. The active
     // seal authenticates its immutable setup proof; only the audit path needs
@@ -24819,7 +24860,14 @@ fn x86_emit_frozen_compact_entry(
             assembler.instruction(&[0x49, 0x81, 0xfa, 0xff, 0x1f, 0x00, 0x00])?;
             assembler.branch(&[0x0f, 0x87], call_preflight)?;
         } else if format.is_dense_pair_supertransition() {
-            assembler.instruction(&[0x48, 0x3d, 0xff, 0x3f, 0x00, 0x00])?;
+            // As for V14, only block starts are encoded as destinations. The
+            // final block may extend past the token mask, so authenticate
+            // `(states - 1) * block_cells + 1` while retaining RAX as the
+            // complete live-cell extent for the mirror below.
+            assembler.instruction(&[0x49, 0x89, 0xc2])?;
+            assembler.instruction(&[0x49, 0x29, 0xd2])?;
+            assembler.instruction(&[0x49, 0xff, 0xc2])?;
+            assembler.instruction(&[0x49, 0x81, 0xfa, 0xff, 0x3f, 0x00, 0x00])?;
             assembler.branch(&[0x0f, 0x87], call_preflight)?;
         } else if format.is_pair_supertransition() {
             assembler.instruction(&[0x48, 0x3d, 0xff, 0xff, 0xff, 0x1f])?;
@@ -26222,7 +26270,11 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_impl
     // SSE2 is part of the x86-64 architecture baseline, even when the explicit
     // target-feature vocabulary is empty. Keeping this fixed-width guard also
     // avoids introducing wide-vector transition state into scalar entries.
-    let compact_guard_mode = FrozenCompactGuardMode::ActiveCapabilitySimdIdentity;
+    let compact_guard_mode = if variable_span_recovery {
+        FrozenCompactGuardMode::ActiveCapabilitySimdIdentityReverseSupertransition
+    } else {
+        FrozenCompactGuardMode::ActiveCapabilitySimdIdentity
+    };
     // Preserve the exact public window once, before any compact guard uses
     // caller-saved registers. A successful V3--V14 variable-Span scan passes
     // these original bounds to its capability-authenticated postflight;
@@ -28946,10 +28998,309 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_impl
 
         assembler.bind(compact_native_match)?;
         // Only V3--V14 compact bodies can reach this label. Their production
-        // guards already authenticated the immutable reverse geometry and
-        // bound its stride to this program's original K0 alphabet.
+        // guards admitted either the exact legacy base flag or that exact
+        // flag plus the reverse-supertransition modifier, then authenticated
+        // the immutable owner capability. Re-read the modifier before giving
+        // @88 its descriptor-pointer interpretation; the base case continues
+        // through the byte-for-byte K0 decoder below.
         assembler.instruction(&[0x4c, 0x89, 0x5c, 0x24, 0x60])?; // selected end
         assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, 0x10])?; // handle
+
+        let scalar_reverse_setup = assembler.label()?;
+        let scalar_reverse_retry = assembler.label()?;
+        let compact_v13_setup = assembler.label()?;
+        let compact_v13_loop = assembler.label()?;
+        let compact_v13_tail = assembler.label()?;
+        let compact_v14_setup = assembler.label()?;
+        let compact_v14_loop = assembler.label()?;
+        let compact_v14_tail_dispatch = assembler.label()?;
+        let compact_v14_tail3 = assembler.label()?;
+        let compact_v14_tail2 = assembler.label()?;
+        let compact_v14_tail1 = assembler.label()?;
+        let compact_reverse_finish = assembler.label()?;
+        let reverse_loop = assembler.label()?;
+        let reverse_tail = assembler.label()?;
+        let reverse_finish = assembler.label()?;
+        let reverse_success = assembler.label()?;
+        let reverse_fallback = assembler.label()?;
+
+        let mut test_reverse_modifier = vec![
+            0xf7,
+            0x40,
+            u8::try_from(FROZEN_PREPARED_HEADER_V1_FLAGS_OFFSET)
+                .map_err(|_| ObjectError::ArithmeticOverflow("x86 compact reverse flags"))?,
+        ];
+        test_reverse_modifier.extend_from_slice(
+            &FROZEN_PREPARED_HEADER_V1_FLAG_REVERSE_SUPERTRANSITION.to_le_bytes(),
+        );
+        assembler.instruction(&test_reverse_modifier)?;
+        assembler.branch(&[0x0f, 0x84], scalar_reverse_setup)?;
+
+        assembler.instruction(&[
+            0x48,
+            0x8b,
+            0x78,
+            u8::try_from(FROZEN_PREPARED_HEADER_V1_REVERSE_LIVE_CELLS_OFFSET).map_err(
+                |_| ObjectError::ArithmeticOverflow("x86 reverse descriptor address"),
+            )?,
+        ])?; // descriptor
+        let mut load_reverse_format = vec![0x44, 0x8b, 0x97];
+        load_reverse_format.extend_from_slice(
+            &i32::try_from(FROZEN_REVERSE_SUPERTRANSITION_V1_FORMAT_VERSION_OFFSET)
+                .map_err(|_| ObjectError::ArithmeticOverflow("x86 reverse format offset"))?
+                .to_le_bytes(),
+        );
+        assembler.instruction(&load_reverse_format)?; // r10d = format
+        assembler.instruction(&[
+            0x48,
+            0x8b,
+            0x4f,
+            u8::try_from(FROZEN_REVERSE_SUPERTRANSITION_V1_ROWS_ADDRESS_OFFSET)
+                .map_err(|_| ObjectError::ArithmeticOverflow("x86 reverse compact rows"))?,
+        ])?;
+        assembler.instruction(&[
+            0x8b,
+            0x47,
+            u8::try_from(FROZEN_REVERSE_SUPERTRANSITION_V1_INITIAL_BLOCK_OFFSET)
+                .map_err(|_| ObjectError::ArithmeticOverflow("x86 reverse initial block"))?,
+        ])?;
+        assembler.instruction(&[0x48, 0x8d, 0x0c, 0x41])?; // block = rows + initial*2
+        if reverse_class_mode != NativeReverseClassMode::Zero {
+            let mut load_reverse_map = vec![0x4c, 0x8d, 0x87];
+            load_reverse_map.extend_from_slice(
+                &i32::try_from(FROZEN_REVERSE_SUPERTRANSITION_V1_CLASS_MAP_OFFSET)
+                    .map_err(|_| ObjectError::ArithmeticOverflow("x86 reverse class map"))?
+                    .to_le_bytes(),
+            );
+            assembler.instruction(&load_reverse_map)?; // r8 = inline map
+            assembler.instruction(&[
+                0x44,
+                0x8b,
+                0x5f,
+                u8::try_from(FROZEN_REVERSE_SUPERTRANSITION_V1_CLASS_COUNT_OFFSET)
+                    .map_err(|_| ObjectError::ArithmeticOverflow("x86 reverse class count"))?,
+            ])?;
+        }
+        assembler.instruction(&[
+            0x48,
+            0x8b,
+            0x7f,
+            u8::try_from(FROZEN_REVERSE_SUPERTRANSITION_V1_ROWS_ADDRESS_OFFSET)
+                .map_err(|_| ObjectError::ArithmeticOverflow("x86 reverse row base"))?,
+        ])?;
+        assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x60])?; // cursor
+        assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x40])?; // window start
+        if reverse_class_mode != NativeReverseClassMode::Zero {
+            assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x18])?; // haystack
+        }
+        assembler.instruction(&[0x41, 0x83, 0xfa, 0x0e])?;
+        assembler.branch(&[0x0f, 0x84], compact_v14_setup)?;
+        assembler.instruction(&[0x41, 0x83, 0xfa, 0x0d])?;
+        assembler.branch(&[0x0f, 0x84], compact_v13_setup)?;
+        assembler.branch(&[0xe9], reverse_fallback)?;
+
+        // V13 consumes high-address then low-address classes in each pair.
+        // Its odd tail bitmap is used only after every complete pair, so the
+        // compact state remains exact when one low byte remains.
+        assembler.bind(compact_v13_setup)?;
+        assembler.instruction(&[0x49, 0x89, 0xf2])?; // impossible candidate sentinel
+        assembler.instruction(&[0x48, 0x89, 0xf0])?;
+        assembler.instruction(&[0x48, 0x29, 0xd0])?;
+        assembler.instruction(&[0x48, 0x85, 0xc0])?;
+        assembler.branch(&[0x0f, 0x84], compact_reverse_finish)?;
+        assembler.instruction(&[0x48, 0x83, 0xf8, 0x02])?;
+        assembler.branch(&[0x0f, 0x82], compact_v13_tail)?;
+        assembler.bind(compact_v13_loop)?;
+        assembler.instruction(&[0x48, 0x83, 0xee, 0x02])?;
+        if reverse_class_mode == NativeReverseClassMode::Zero {
+            assembler.instruction(&[0x0f, 0xb7, 0x01])?; // fixed pair key zero
+        } else {
+            assembler.instruction(&[0x41, 0x0f, 0xb6, 0x44, 0x31, 0x01])?;
+            assembler.instruction(&[0x41, 0x0f, 0xb6, 0x04, 0x00])?;
+            assembler.instruction(&[0x41, 0x0f, 0xaf, 0xc3])?;
+            assembler.instruction(&[0x41, 0x0f, 0xb6, 0x14, 0x31])?;
+            assembler.instruction(&[0x41, 0x0f, 0xb6, 0x14, 0x10])?;
+            assembler.instruction(&[0x01, 0xd0])?;
+            assembler.instruction(&[0x0f, 0xb7, 0x04, 0x41])?;
+        }
+        assembler.instruction(&[0x89, 0xc2])?;
+        assembler.instruction(&[0xc1, 0xea, 0x0e])?;
+        assembler.instruction(&[0x83, 0xe2, 0x01])?;
+        assembler.instruction(&[0x48, 0x8d, 0x14, 0x16])?;
+        assembler.instruction(&[0x66, 0x85, 0xc0])?;
+        assembler.instruction(&[0x4c, 0x0f, 0x48, 0xd2])?;
+        assembler.instruction(&[0x25, 0xff, 0x3f, 0x00, 0x00])?;
+        assembler.branch(&[0x0f, 0x84], compact_reverse_finish)?;
+        assembler.instruction(&[0xff, 0xc8])?;
+        assembler.instruction(&[0x48, 0x8d, 0x0c, 0x47])?;
+        assembler.instruction(&[0x48, 0x89, 0xf0])?;
+        assembler.instruction(&[0x48, 0x2b, 0x44, 0x24, 0x40])?;
+        assembler.instruction(&[0x48, 0x83, 0xf8, 0x02])?;
+        assembler.branch(&[0x0f, 0x83], compact_v13_loop)?;
+        assembler.instruction(&[0x48, 0x85, 0xc0])?;
+        assembler.branch(&[0x0f, 0x84], compact_reverse_finish)?;
+        assembler.bind(compact_v13_tail)?;
+        assembler.instruction(&[0x48, 0xff, 0xce])?;
+        if reverse_class_mode == NativeReverseClassMode::Zero {
+            assembler.instruction(&[0x0f, 0xb7, 0x51, 0x02])?; // tail bitmap at C^2
+            assembler.instruction(&[0xf6, 0xc2, 0x01])?;
+            assembler.instruction(&[0x4c, 0x0f, 0x45, 0xd6])?;
+        } else {
+            assembler.instruction(&[0x41, 0x0f, 0xb6, 0x04, 0x31])?;
+            assembler.instruction(&[0x41, 0x0f, 0xb6, 0x04, 0x00])?;
+            assembler.instruction(&[0x44, 0x89, 0xda])?;
+            assembler.instruction(&[0x41, 0x0f, 0xaf, 0xd3])?;
+            assembler.instruction(&[0x0f, 0xb7, 0x14, 0x51])?;
+            assembler.instruction(&[0x0f, 0xa3, 0xc2])?;
+            assembler.instruction(&[0x4c, 0x0f, 0x42, 0xd6])?;
+        }
+        assembler.branch(&[0xe9], compact_reverse_finish)?;
+
+        let emit_reverse_v14_key =
+            |assembler: &mut X86Assembler, length: usize| -> Result<(), ObjectError> {
+                let length_u8 = u8::try_from(length)
+                    .map_err(|_| ObjectError::ArithmeticOverflow("x86 reverse V14 key length"))?;
+                assembler.instruction(&[0x48, 0x83, 0xee, length_u8])?;
+                if length == 0 {
+                    return Err(ObjectError::InvalidModule(
+                        "x86 reverse V14 key is empty",
+                    ));
+                }
+                if reverse_class_mode == NativeReverseClassMode::Zero {
+                    return Ok(());
+                }
+                let mut offsets = (0..length).rev();
+                let first = offsets.next().ok_or(ObjectError::InvalidModule(
+                    "x86 reverse V14 key is empty",
+                ))?;
+                if first == 0 {
+                    assembler.instruction(&[0x41, 0x0f, 0xb6, 0x04, 0x31])?;
+                } else {
+                    assembler.instruction(&[
+                        0x41,
+                        0x0f,
+                        0xb6,
+                        0x44,
+                        0x31,
+                        u8::try_from(first).map_err(|_| {
+                            ObjectError::ArithmeticOverflow("x86 reverse V14 high byte")
+                        })?,
+                    ])?;
+                }
+                assembler.instruction(&[0x41, 0x0f, 0xb6, 0x04, 0x00])?;
+                for byte_offset in offsets {
+                    assembler.instruction(&[0x41, 0x0f, 0xaf, 0xc3])?;
+                    if byte_offset == 0 {
+                        assembler.instruction(&[0x41, 0x0f, 0xb6, 0x14, 0x31])?;
+                    } else {
+                        assembler.instruction(&[
+                            0x41,
+                            0x0f,
+                            0xb6,
+                            0x54,
+                            0x31,
+                            u8::try_from(byte_offset).map_err(|_| {
+                                ObjectError::ArithmeticOverflow("x86 reverse V14 key byte")
+                            })?,
+                        ])?;
+                    }
+                    assembler.instruction(&[0x41, 0x0f, 0xb6, 0x14, 0x10])?;
+                    assembler.instruction(&[0x01, 0xd0])?;
+                }
+                Ok(())
+            };
+        let emit_reverse_v14_accept =
+            |assembler: &mut X86Assembler| -> Result<(), ObjectError> {
+                assembler.instruction(&[0x89, 0xc2])?;
+                assembler.instruction(&[0xc1, 0xea, 0x0d])?;
+                assembler.instruction(&[0x83, 0xe2, 0x03])?;
+                assembler.instruction(&[0x48, 0x8d, 0x14, 0x16])?;
+                assembler.instruction(&[0x66, 0x85, 0xc0])?;
+                assembler.instruction(&[0x4c, 0x0f, 0x48, 0xd2])?;
+                Ok(())
+            };
+
+        assembler.bind(compact_v14_setup)?;
+        assembler.instruction(&[0x49, 0x89, 0xf2])?; // impossible candidate sentinel
+        assembler.instruction(&[0x48, 0x89, 0xf0])?;
+        assembler.instruction(&[0x48, 0x29, 0xd0])?;
+        assembler.instruction(&[0x48, 0x83, 0xf8, 0x04])?;
+        assembler.branch(&[0x0f, 0x82], compact_v14_tail_dispatch)?;
+        assembler.bind(compact_v14_loop)?;
+        emit_reverse_v14_key(&mut assembler, 4)?;
+        if reverse_class_mode == NativeReverseClassMode::Zero {
+            assembler.instruction(&[0x0f, 0xb7, 0x01])?; // fixed quad key zero
+        } else {
+            assembler.instruction(&[0x0f, 0xb7, 0x04, 0x41])?;
+        }
+        emit_reverse_v14_accept(&mut assembler)?;
+        assembler.instruction(&[0x25, 0xff, 0x1f, 0x00, 0x00])?;
+        assembler.branch(&[0x0f, 0x84], compact_reverse_finish)?;
+        assembler.instruction(&[0xff, 0xc8])?;
+        assembler.instruction(&[0x48, 0x8d, 0x0c, 0x47])?;
+        assembler.instruction(&[0x48, 0x89, 0xf0])?;
+        assembler.instruction(&[0x48, 0x2b, 0x44, 0x24, 0x40])?;
+        assembler.instruction(&[0x48, 0x83, 0xf8, 0x04])?;
+        assembler.branch(&[0x0f, 0x83], compact_v14_loop)?;
+
+        assembler.bind(compact_v14_tail_dispatch)?;
+        assembler.instruction(&[0x48, 0x89, 0xf0])?;
+        assembler.instruction(&[0x48, 0x2b, 0x44, 0x24, 0x40])?;
+        assembler.instruction(&[0x48, 0x83, 0xf8, 0x01])?;
+        assembler.branch(&[0x0f, 0x84], compact_v14_tail1)?;
+        assembler.instruction(&[0x48, 0x83, 0xf8, 0x02])?;
+        assembler.branch(&[0x0f, 0x84], compact_v14_tail2)?;
+        assembler.instruction(&[0x48, 0x83, 0xf8, 0x03])?;
+        assembler.branch(&[0x0f, 0x84], compact_v14_tail3)?;
+        assembler.branch(&[0xe9], compact_reverse_finish)?;
+
+        for (length, tail_label) in [
+            (3_usize, compact_v14_tail3),
+            (2, compact_v14_tail2),
+            (1, compact_v14_tail1),
+        ] {
+            assembler.bind(tail_label)?;
+            emit_reverse_v14_key(&mut assembler, length)?;
+            if reverse_class_mode == NativeReverseClassMode::Zero {
+                let byte_offset = u8::try_from(
+                    4_usize
+                        .checked_sub(length)
+                        .and_then(|cells| cells.checked_mul(core::mem::size_of::<u16>()))
+                        .ok_or(ObjectError::ArithmeticOverflow(
+                            "x86 reverse V14 unary tail offset",
+                        ))?,
+                )
+                .map_err(|_| ObjectError::ArithmeticOverflow(
+                    "x86 reverse V14 unary tail displacement",
+                ))?;
+                assembler.instruction(&[0x0f, 0xb7, 0x41, byte_offset])?;
+            } else {
+                assembler.instruction(&[0x44, 0x89, 0xda])?; // power = C
+                for exponent in 2..=4 {
+                    assembler.instruction(&[0x41, 0x0f, 0xaf, 0xd3])?;
+                    if exponent > length {
+                        assembler.instruction(&[0x01, 0xd0])?;
+                    }
+                }
+                assembler.instruction(&[0x0f, 0xb7, 0x04, 0x41])?;
+            }
+            emit_reverse_v14_accept(&mut assembler)?;
+            assembler.branch(&[0xe9], compact_reverse_finish)?;
+        }
+
+        assembler.bind(compact_reverse_finish)?;
+        assembler.instruction(&[0x4c, 0x3b, 0x54, 0x24, 0x60])?;
+        assembler.branch(&[0x0f, 0x85], reverse_success)?;
+        // Compact dead/no-accept is not authoritative by itself. Replay the
+        // exact established K0 decoder from the original @72 projection.
+        assembler.branch(&[0xe9], scalar_reverse_retry)?;
+
+        assembler.bind(scalar_reverse_retry)?;
+        assembler.instruction(&[0x4c, 0x8b, 0x5c, 0x24, 0x60])?;
+        assembler.instruction(&[0x48, 0x8b, 0x44, 0x24, 0x10])?;
+        assembler.branch(&[0xe9], scalar_reverse_setup)?;
+
+        assembler.bind(scalar_reverse_setup)?;
         assembler.instruction(&[
             0x48,
             0x8b,
@@ -28983,11 +29334,6 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_impl
             );
             assembler.instruction(&subtract_map)?;
         }
-
-        let reverse_loop = assembler.label()?;
-        let reverse_tail = assembler.label()?;
-        let reverse_finish = assembler.label()?;
-        let reverse_fallback = assembler.label()?;
 
         assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x40])?; // window start
         assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x18])?; // haystack
@@ -29074,6 +29420,7 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_impl
         assembler.bind(reverse_finish)?;
         assembler.instruction(&[0x4c, 0x3b, 0x54, 0x24, 0x60])?; // candidate == selected end
         assembler.branch(&[0x0f, 0x84], reverse_fallback)?;
+        assembler.bind(reverse_success)?;
         if filter_kind.is_some_and(X86StartFilterKind::needs_vzeroupper) {
             assembler.instruction(&[0xc5, 0xf8, 0x77])?;
         }
@@ -38769,10 +39116,27 @@ fn aarch64_emit_frozen_compact_entry(
     aarch64_load_u32_constant(
         assembler,
         9,
-        format.flag(),
+        if guard_mode.expects_reverse_supertransition() {
+            format.flag() | FROZEN_PREPARED_HEADER_V1_FLAG_REVERSE_SUPERTRANSITION
+        } else {
+            format.flag()
+        },
     )?;
     assembler.instruction(aarch64_cmp_w(8, 9)?)?;
-    assembler.branch_cond(AARCH64_NE, try_older)?;
+    if guard_mode.expects_reverse_supertransition() {
+        let accepted_flags = assembler.label()?;
+        assembler.branch_cond(AARCH64_EQ, accepted_flags)?;
+        aarch64_load_u32_constant(
+            assembler,
+            9,
+            format.flag(),
+        )?;
+        assembler.instruction(aarch64_cmp_w(8, 9)?)?;
+        assembler.branch_cond(AARCH64_NE, try_older)?;
+        assembler.bind(accepted_flags)?;
+    } else {
+        assembler.branch_cond(AARCH64_NE, try_older)?;
+    }
 
     // Every live exclusive handle owns the maximum V6 envelope. The active
     // seal authenticates its immutable setup proof; only the audit path needs
@@ -39199,7 +39563,16 @@ fn aarch64_emit_frozen_compact_entry(
                     DYNAMIC_NATIVE_ROWS_V11_NEXT_BLOCK_TOKEN_MASK
                 },
             )?;
-            assembler.instruction(aarch64_cmp_x(7, 8)?)?;
+            if format.is_dense_pair_supertransition() {
+                // V13 destination tokens name block starts, not the complete
+                // final block. Keep X7 as the live-cell extent for its mirror
+                // and compare the exact final one-based start separately.
+                assembler.instruction(aarch64_sub_x_reg(6, 7, 9)?)?;
+                assembler.instruction(aarch64_add_x_imm(6, 6, 1)?)?;
+                assembler.instruction(aarch64_cmp_x(6, 8)?)?;
+            } else {
+                assembler.instruction(aarch64_cmp_x(7, 8)?)?;
+            }
             assembler.branch_cond(AARCH64_HI, call_preflight)?;
         } else if format.is_quad_supertransition() {
             assembler.instruction(aarch64_mul_x(7, 10, 9)?)?;
@@ -40498,7 +40871,11 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_imp
     assembler.branch_cond(AARCH64_EQ, short_fallback)?;
     assembler.instruction(aarch64_cmp_x(4, 2)?)?;
     assembler.branch_cond(AARCH64_HI, short_fallback)?;
-    let compact_guard_mode = if use_asimd_identity {
+    let compact_guard_mode = if variable_span_recovery && use_asimd_identity {
+        FrozenCompactGuardMode::ActiveCapabilitySimdIdentityReverseSupertransition
+    } else if variable_span_recovery {
+        FrozenCompactGuardMode::ActiveCapabilityReverseSupertransition
+    } else if use_asimd_identity {
         FrozenCompactGuardMode::ActiveCapabilitySimdIdentity
     } else {
         FrozenCompactGuardMode::ActiveCapability
@@ -43545,11 +43922,288 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_imp
         assembler.branch(compact_native_match)?;
 
         assembler.bind(compact_native_match)?;
-        // Only V3--V14 active-capability bodies can reach this label. Header
-        // publication has already authenticated the reverse projection and
-        // bound its stride to the compiler's original K0 alphabet.
+        // Only V3--V14 active-capability bodies can reach this label. Their
+        // exact entry flag admits either the legacy K0 layout or that same
+        // layout plus the sidecar modifier. Test the modifier before @88 is
+        // interpreted as a descriptor pointer.
         assembler.instruction(aarch64_store_x(7, 31, 80)?)?;
         assembler.instruction(aarch64_load_x_imm(0, 31, 0)?)?;
+
+        let scalar_reverse_setup = assembler.label()?;
+        let scalar_reverse_retry = assembler.label()?;
+        let compact_reverse_setup = assembler.label()?;
+        let compact_v13_setup = assembler.label()?;
+        let compact_v13_loop = assembler.label()?;
+        let compact_v13_tail = assembler.label()?;
+        let compact_v14_setup = assembler.label()?;
+        let compact_v14_loop = assembler.label()?;
+        let compact_v14_tail_dispatch = assembler.label()?;
+        let compact_v14_tail3 = assembler.label()?;
+        let compact_v14_tail2 = assembler.label()?;
+        let compact_v14_tail1 = assembler.label()?;
+        let compact_reverse_finish = assembler.label()?;
+        let reverse_loop = assembler.label()?;
+        let reverse_tail = assembler.label()?;
+        let reverse_finish = assembler.label()?;
+        let reverse_success = assembler.label()?;
+        let reverse_fallback = assembler.label()?;
+
+        assembler.instruction(aarch64_load_w_imm(
+            8,
+            0,
+            u16::try_from(FROZEN_PREPARED_HEADER_V1_FLAGS_OFFSET)
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 compact reverse flags"))?,
+        )?)?;
+        assembler.branch_bit_set_w(8, 16, compact_reverse_setup)?;
+        assembler.branch(scalar_reverse_setup)?;
+
+        assembler.bind(compact_reverse_setup)?;
+        assembler.instruction(aarch64_load_x_imm(
+            6,
+            0,
+            u16::try_from(FROZEN_PREPARED_HEADER_V1_REVERSE_LIVE_CELLS_OFFSET).map_err(
+                |_| ObjectError::ArithmeticOverflow("AArch64 reverse descriptor address"),
+            )?,
+        )?)?;
+        assembler.instruction(aarch64_load_w_imm(
+            10,
+            6,
+            u16::try_from(FROZEN_REVERSE_SUPERTRANSITION_V1_FORMAT_VERSION_OFFSET)
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 reverse format"))?,
+        )?)?;
+        assembler.instruction(aarch64_load_x_imm(
+            8,
+            6,
+            u16::try_from(FROZEN_REVERSE_SUPERTRANSITION_V1_ROWS_ADDRESS_OFFSET)
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 reverse compact rows"))?,
+        )?)?;
+        assembler.instruction(aarch64_load_w_imm(
+            11,
+            6,
+            u16::try_from(FROZEN_REVERSE_SUPERTRANSITION_V1_INITIAL_BLOCK_OFFSET)
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 reverse initial block"))?,
+        )?)?;
+        assembler.instruction(aarch64_add_x_uxtw(11, 8, 11, 1)?)?;
+        if reverse_class_mode != NativeReverseClassMode::Zero {
+            assembler.instruction(aarch64_add_x_imm(
+                14,
+                6,
+                u16::try_from(FROZEN_REVERSE_SUPERTRANSITION_V1_CLASS_MAP_OFFSET)
+                    .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 reverse class map"))?,
+            )?)?;
+            assembler.instruction(aarch64_load_w_imm(
+                17,
+                6,
+                u16::try_from(FROZEN_REVERSE_SUPERTRANSITION_V1_CLASS_COUNT_OFFSET)
+                    .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 reverse class count"))?,
+            )?)?;
+        }
+        assembler.instruction(aarch64_mov_x(12, 7)?)?;
+        assembler.instruction(aarch64_load_x_imm(3, 31, 48)?)?;
+        if reverse_class_mode != NativeReverseClassMode::Zero {
+            assembler.instruction(aarch64_load_x_imm(15, 31, 8)?)?;
+        }
+        assembler.instruction(aarch64_cmp_w_imm(
+            10,
+            u16::try_from(FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION)
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 reverse V14 format"))?,
+        )?)?;
+        assembler.branch_cond(AARCH64_EQ, compact_v14_setup)?;
+        assembler.instruction(aarch64_cmp_w_imm(
+            10,
+            u16::try_from(FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION)
+                .map_err(|_| ObjectError::ArithmeticOverflow("AArch64 reverse V13 format"))?,
+        )?)?;
+        assembler.branch_cond(AARCH64_EQ, compact_v13_setup)?;
+        assembler.branch(reverse_fallback)?;
+
+        assembler.bind(compact_v13_setup)?;
+        assembler.instruction(aarch64_mov_x(13, 12)?)?;
+        assembler.instruction(aarch64_sub_x_reg(9, 12, 3)?)?;
+        assembler.instruction(aarch64_cmp_x_imm(9, 0)?)?;
+        assembler.branch_cond(AARCH64_EQ, compact_reverse_finish)?;
+        assembler.instruction(aarch64_cmp_x_imm(9, 2)?)?;
+        assembler.branch_cond(AARCH64_LO, compact_v13_tail)?;
+        assembler.bind(compact_v13_loop)?;
+        assembler.instruction(aarch64_sub_x_imm(12, 12, 2)?)?;
+        if reverse_class_mode == NativeReverseClassMode::Zero {
+            assembler.instruction(aarch64_load_halfword_imm(10, 11, 0)?)?;
+        } else {
+            assembler.instruction(aarch64_add_x_reg(9, 15, 12)?)?;
+            assembler.instruction(aarch64_load_byte_imm(10, 9, 1)?)?;
+            assembler.instruction(aarch64_load_byte_reg(10, 14, 10)?)?;
+            assembler.instruction(aarch64_load_byte_imm(16, 9, 0)?)?;
+            assembler.instruction(aarch64_load_byte_reg(16, 14, 16)?)?;
+            assembler.instruction(aarch64_madd_w(10, 10, 17, 16)?)?;
+            assembler.instruction(aarch64_load_h_uxtw(10, 11, 10)?)?;
+        }
+        let v13_no_accept = assembler.label()?;
+        assembler.branch_bit_clear_w(10, 15, v13_no_accept)?;
+        assembler.instruction(aarch64_lsr_w_imm(16, 10, 14)?)?;
+        assembler.instruction(aarch64_and_low_w(16, 16, 1)?)?;
+        assembler.instruction(aarch64_add_x_reg(16, 12, 16)?)?;
+        assembler.instruction(aarch64_mov_x(13, 16)?)?;
+        assembler.bind(v13_no_accept)?;
+        assembler.instruction(aarch64_and_low_w(10, 10, 14)?)?;
+        assembler.branch_zero_w(10, compact_reverse_finish)?;
+        assembler.instruction(aarch64_sub_w_imm(10, 10, 1)?)?;
+        assembler.instruction(aarch64_add_x_uxtw(11, 8, 10, 1)?)?;
+        assembler.instruction(aarch64_sub_x_reg(9, 12, 3)?)?;
+        assembler.instruction(aarch64_cmp_x_imm(9, 2)?)?;
+        assembler.branch_cond(AARCH64_HS, compact_v13_loop)?;
+        assembler.instruction(aarch64_cmp_x_imm(9, 0)?)?;
+        assembler.branch_cond(AARCH64_EQ, compact_reverse_finish)?;
+
+        assembler.bind(compact_v13_tail)?;
+        assembler.instruction(aarch64_sub_x_imm(12, 12, 1)?)?;
+        let v13_tail_reject = assembler.label()?;
+        if reverse_class_mode == NativeReverseClassMode::Zero {
+            assembler.instruction(aarch64_load_halfword_imm(16, 11, 2)?)?;
+        } else {
+            assembler.instruction(aarch64_load_byte_reg(10, 15, 12)?)?;
+            assembler.instruction(aarch64_load_byte_reg(10, 14, 10)?)?;
+            assembler.instruction(aarch64_mul_x(9, 17, 17)?)?;
+            assembler.instruction(aarch64_load_h_uxtw(16, 11, 9)?)?;
+            assembler.instruction(aarch64_lsrv_x(16, 16, 10)?)?;
+        }
+        assembler.branch_bit_clear_w(16, 0, v13_tail_reject)?;
+        assembler.instruction(aarch64_mov_x(13, 12)?)?;
+        assembler.bind(v13_tail_reject)?;
+        assembler.branch(compact_reverse_finish)?;
+
+        let emit_reverse_v14_key =
+            |assembler: &mut Aarch64Assembler, length: usize| -> Result<(), ObjectError> {
+                assembler.instruction(aarch64_sub_x_imm(
+                    12,
+                    12,
+                    u16::try_from(length).map_err(|_| {
+                        ObjectError::ArithmeticOverflow("AArch64 reverse V14 key length")
+                    })?,
+                )?)?;
+                if length == 0 {
+                    return Err(ObjectError::InvalidModule(
+                        "AArch64 reverse V14 key is empty",
+                    ));
+                }
+                if reverse_class_mode == NativeReverseClassMode::Zero {
+                    return Ok(());
+                }
+                assembler.instruction(aarch64_add_x_reg(9, 15, 12)?)?;
+                let mut offsets = (0..length).rev();
+                let first = offsets.next().ok_or(ObjectError::InvalidModule(
+                    "AArch64 reverse V14 key is empty",
+                ))?;
+                assembler.instruction(aarch64_load_byte_imm(
+                    10,
+                    9,
+                    u16::try_from(first).map_err(|_| {
+                        ObjectError::ArithmeticOverflow("AArch64 reverse V14 high byte")
+                    })?,
+                )?)?;
+                assembler.instruction(aarch64_load_byte_reg(10, 14, 10)?)?;
+                for byte_offset in offsets {
+                    assembler.instruction(aarch64_load_byte_imm(
+                        16,
+                        9,
+                        u16::try_from(byte_offset).map_err(|_| {
+                            ObjectError::ArithmeticOverflow("AArch64 reverse V14 key byte")
+                        })?,
+                    )?)?;
+                    assembler.instruction(aarch64_load_byte_reg(16, 14, 16)?)?;
+                    assembler.instruction(aarch64_madd_w(10, 10, 17, 16)?)?;
+                }
+                Ok(())
+            };
+        let emit_reverse_v14_accept =
+            |assembler: &mut Aarch64Assembler| -> Result<(), ObjectError> {
+                let no_accept = assembler.label()?;
+                assembler.branch_bit_clear_w(10, 15, no_accept)?;
+                assembler.instruction(aarch64_lsr_w_imm(16, 10, 13)?)?;
+                assembler.instruction(aarch64_and_low_w(16, 16, 2)?)?;
+                assembler.instruction(aarch64_add_x_reg(16, 12, 16)?)?;
+                assembler.instruction(aarch64_mov_x(13, 16)?)?;
+                assembler.bind(no_accept)?;
+                Ok(())
+            };
+
+        assembler.bind(compact_v14_setup)?;
+        assembler.instruction(aarch64_mov_x(13, 12)?)?;
+        assembler.instruction(aarch64_sub_x_reg(9, 12, 3)?)?;
+        assembler.instruction(aarch64_cmp_x_imm(9, 4)?)?;
+        assembler.branch_cond(AARCH64_LO, compact_v14_tail_dispatch)?;
+        assembler.bind(compact_v14_loop)?;
+        emit_reverse_v14_key(&mut assembler, 4)?;
+        if reverse_class_mode == NativeReverseClassMode::Zero {
+            assembler.instruction(aarch64_load_halfword_imm(10, 11, 0)?)?;
+        } else {
+            assembler.instruction(aarch64_load_h_uxtw(10, 11, 10)?)?;
+        }
+        emit_reverse_v14_accept(&mut assembler)?;
+        assembler.instruction(aarch64_and_low_w(10, 10, 13)?)?;
+        assembler.branch_zero_w(10, compact_reverse_finish)?;
+        assembler.instruction(aarch64_sub_w_imm(10, 10, 1)?)?;
+        assembler.instruction(aarch64_add_x_uxtw(11, 8, 10, 1)?)?;
+        assembler.instruction(aarch64_sub_x_reg(9, 12, 3)?)?;
+        assembler.instruction(aarch64_cmp_x_imm(9, 4)?)?;
+        assembler.branch_cond(AARCH64_HS, compact_v14_loop)?;
+
+        assembler.bind(compact_v14_tail_dispatch)?;
+        assembler.instruction(aarch64_sub_x_reg(9, 12, 3)?)?;
+        assembler.instruction(aarch64_cmp_x_imm(9, 1)?)?;
+        assembler.branch_cond(AARCH64_EQ, compact_v14_tail1)?;
+        assembler.instruction(aarch64_cmp_x_imm(9, 2)?)?;
+        assembler.branch_cond(AARCH64_EQ, compact_v14_tail2)?;
+        assembler.instruction(aarch64_cmp_x_imm(9, 3)?)?;
+        assembler.branch_cond(AARCH64_EQ, compact_v14_tail3)?;
+        assembler.branch(compact_reverse_finish)?;
+
+        for (length, tail_label) in [
+            (3_usize, compact_v14_tail3),
+            (2, compact_v14_tail2),
+            (1, compact_v14_tail1),
+        ] {
+            assembler.bind(tail_label)?;
+            emit_reverse_v14_key(&mut assembler, length)?;
+            if reverse_class_mode == NativeReverseClassMode::Zero {
+                let byte_offset = u16::try_from(
+                    4_usize
+                        .checked_sub(length)
+                        .and_then(|cells| cells.checked_mul(core::mem::size_of::<u16>()))
+                        .ok_or(ObjectError::ArithmeticOverflow(
+                            "AArch64 reverse V14 unary tail offset",
+                        ))?,
+                )
+                .map_err(|_| ObjectError::ArithmeticOverflow(
+                    "AArch64 reverse V14 unary tail displacement",
+                ))?;
+                assembler.instruction(aarch64_load_halfword_imm(10, 11, byte_offset)?)?;
+            } else {
+                assembler.instruction(aarch64_mov_x(9, 17)?)?;
+                for exponent in 2..=4 {
+                    assembler.instruction(aarch64_mul_x(9, 9, 17)?)?;
+                    if exponent > length {
+                        assembler.instruction(aarch64_add_w_reg(10, 10, 9)?)?;
+                    }
+                }
+                assembler.instruction(aarch64_load_h_uxtw(10, 11, 10)?)?;
+            }
+            emit_reverse_v14_accept(&mut assembler)?;
+            assembler.branch(compact_reverse_finish)?;
+        }
+
+        assembler.bind(compact_reverse_finish)?;
+        assembler.instruction(aarch64_cmp_x(13, 7)?)?;
+        assembler.branch_cond(AARCH64_NE, reverse_success)?;
+        // A compact miss replays the unchanged K0 authority at @72 rather
+        // than treating the independently coalesced sidecar as conclusive.
+        assembler.branch(scalar_reverse_retry)?;
+
+        assembler.bind(scalar_reverse_retry)?;
+        assembler.instruction(aarch64_load_x_imm(7, 31, 80)?)?;
+        assembler.instruction(aarch64_load_x_imm(0, 31, 0)?)?;
+        assembler.branch(scalar_reverse_setup)?;
+
+        assembler.bind(scalar_reverse_setup)?;
         assembler.instruction(aarch64_load_x_imm(
             8,
             0,
@@ -43574,11 +44228,6 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_imp
             assembler.instruction(aarch64_sub_x_imm(14, 14, 256)?)?;
         }
         assembler.instruction(aarch64_mov_x(12, 7)?)?;
-
-        let reverse_loop = assembler.label()?;
-        let reverse_tail = assembler.label()?;
-        let reverse_finish = assembler.label()?;
-        let reverse_fallback = assembler.label()?;
 
         assembler.instruction(aarch64_load_x_imm(3, 31, 48)?)?;
         assembler.instruction(aarch64_load_x_imm(15, 31, 8)?)?;
@@ -43677,6 +44326,7 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_imp
         assembler.bind(reverse_finish)?;
         assembler.instruction(aarch64_cmp_x(13, 7)?)?;
         assembler.branch_cond(AARCH64_EQ, reverse_fallback)?;
+        assembler.bind(reverse_success)?;
         assembler.instruction(aarch64_load_x_imm(5, 31, 24)?)?;
         assembler.instruction(aarch64_store_x(13, 5, 0)?)?;
         assembler.instruction(aarch64_load_x_imm(7, 31, 80)?)?;
@@ -48607,6 +49257,15 @@ mod tests {
                 .count()
         }
 
+        fn word_sequence_occurrences(code: &[u8], needle: &[u32]) -> usize {
+            code.chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>()
+                .windows(needle.len())
+                .filter(|window| *window == needle)
+                .count()
+        }
+
         assert_eq!(
             NativeReverseClassMode::from_class_count(1),
             Some(NativeReverseClassMode::Zero)
@@ -48646,11 +49305,11 @@ mod tests {
         let x86_pair_source_load = [0x41, 0x0f, 0xb6, 0x44, 0x31, 0x01];
         let x86_map_load = [0x41, 0x0f, 0xb6, 0x04, 0x00];
         assert_eq!(byte_occurrences(&x86_zero.code, &x86_pair_source_load), 0);
-        assert_eq!(byte_occurrences(&x86_identity.code, &x86_pair_source_load), 1);
-        assert_eq!(byte_occurrences(&x86_mapped.code, &x86_pair_source_load), 1);
+        assert_eq!(byte_occurrences(&x86_identity.code, &x86_pair_source_load), 3);
+        assert_eq!(byte_occurrences(&x86_mapped.code, &x86_pair_source_load), 3);
         assert_eq!(byte_occurrences(&x86_zero.code, &x86_map_load), 0);
-        assert_eq!(byte_occurrences(&x86_identity.code, &x86_map_load), 0);
-        assert_eq!(byte_occurrences(&x86_mapped.code, &x86_map_load), 2);
+        assert_eq!(byte_occurrences(&x86_identity.code, &x86_map_load), 6);
+        assert_eq!(byte_occurrences(&x86_mapped.code, &x86_map_load), 8);
         let x86_first_accept_cmov = [0x4d, 0x0f, 0x48, 0xd3];
         let x86_later_accept_cmov = [0x4c, 0x0f, 0x48, 0xd6];
         for emission in [&x86_zero, &x86_mapped, &x86_identity] {
@@ -48693,13 +49352,29 @@ mod tests {
         let arm_mapped = arm(2);
         let arm_identity = arm(256);
         let arm_pair_source_load = aarch64_load_byte_imm(16, 10, 1).unwrap();
+        let arm_compact_pair_source_load = [
+            aarch64_add_x_reg(9, 15, 12).unwrap(),
+            aarch64_load_byte_imm(10, 9, 1).unwrap(),
+        ];
         let arm_map_load = aarch64_load_byte_reg(16, 14, 16).unwrap();
         assert_eq!(word_occurrences(&arm_zero.code, arm_pair_source_load), 0);
         assert_eq!(word_occurrences(&arm_identity.code, arm_pair_source_load), 1);
         assert_eq!(word_occurrences(&arm_mapped.code, arm_pair_source_load), 1);
+        assert_eq!(
+            word_sequence_occurrences(&arm_zero.code, &arm_compact_pair_source_load),
+            0
+        );
+        assert_eq!(
+            word_sequence_occurrences(&arm_identity.code, &arm_compact_pair_source_load),
+            2
+        );
+        assert_eq!(
+            word_sequence_occurrences(&arm_mapped.code, &arm_compact_pair_source_load),
+            2
+        );
         assert_eq!(word_occurrences(&arm_zero.code, arm_map_load), 0);
-        assert_eq!(word_occurrences(&arm_identity.code, arm_map_load), 0);
-        assert_eq!(word_occurrences(&arm_mapped.code, arm_map_load), 2);
+        assert_eq!(word_occurrences(&arm_identity.code, arm_map_load), 7);
+        assert_eq!(word_occurrences(&arm_mapped.code, arm_map_load), 9);
         let arm_reverse_first_select = aarch64_csel_x(13, 16, 13, AARCH64_MI).unwrap();
         let arm_reverse_later_select = aarch64_csel_x(13, 12, 13, AARCH64_MI).unwrap();
         let arm_reverse_accept_test = aarch64_cmn_w_imm(10, 1).unwrap();
@@ -56953,12 +57628,6 @@ mod tests {
         };
         let arm_flag = |flag: u32| {
             [
-                aarch64_load_w_imm(
-                    8,
-                    0,
-                    u16::try_from(FROZEN_PREPARED_HEADER_V1_FLAGS_OFFSET).unwrap(),
-                )
-                .unwrap(),
                 aarch64_movz_x(9, u16::try_from(flag).unwrap(), 0).unwrap(),
                 aarch64_cmp_w(8, 9).unwrap(),
             ]
@@ -57435,14 +58104,14 @@ mod tests {
                     );
                 }
                 Architecture::Aarch64 => {
+                    // Variable-Span selectors first compare `base | bit16`,
+                    // then reuse the already-loaded flags register for the
+                    // legacy exact-base admission. Match that exact compare
+                    // suffix rather than requiring a redundant second load.
+                    // The combined comparison has an intervening MOVK, so it
+                    // cannot alias this two-instruction base selector.
                     let flag = |flag: u32| {
                         [
-                            aarch64_load_w_imm(
-                                8,
-                                0,
-                                u16::try_from(FROZEN_PREPARED_HEADER_V1_FLAGS_OFFSET).unwrap(),
-                            )
-                            .unwrap(),
                             aarch64_movz_x(9, u16::try_from(flag).unwrap(), 0).unwrap(),
                             aarch64_cmp_w(8, 9).unwrap(),
                         ]
@@ -58479,7 +59148,7 @@ mod tests {
             FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V14,
         ]
         .into_iter()
-        .map(|flag| format!("flags=={flag}U"))
+        .map(|flag| format!("base_flags=={flag}U"))
         .collect::<Vec<_>>()
         .join("||");
         let require_frozen_owner = if use_frozen_owner {
@@ -58494,6 +59163,7 @@ mod tests {
              static int active_dynamic_owner(handle_t h){{uint64_t seal=0;uint32_t flags=0;\
                memcpy(&seal,(const unsigned char*)h+{active_seal_offset}U,sizeof(seal));\
                memcpy(&flags,(const unsigned char*)h+{flags_offset}U,sizeof(flags));\
+               const uint32_t base_flags=flags&~UINT32_C({reverse_supertransition_flag});\
                return seal==UINT64_C(0x{active_seal:x})&&({compact_flag_predicate});}}\n\
              extern const unsigned char {program_symbol}[];\n\
              extern uint32_t {symbol}(handle_t,const unsigned char*,size_t,size_t,size_t,result_t*);\n\
@@ -58537,6 +59207,8 @@ mod tests {
             active_seal = FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL,
             active_seal_offset = FROZEN_PREPARED_HEADER_V1_ACTIVE_SEAL_OFFSET,
             flags_offset = FROZEN_PREPARED_HEADER_V1_FLAGS_OFFSET,
+            reverse_supertransition_flag =
+                FROZEN_PREPARED_HEADER_V1_FLAG_REVERSE_SUPERTRANSITION,
             window_start = window.start(),
             window_end = window.end(),
         );
@@ -61784,7 +62456,7 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
         any(target_os = "linux", target_os = "macos")
     ))]
     #[test]
-    #[ignore = "links a forged active V4 owner to prove compact variable-Span recovery never calls its helper"]
+    #[ignore = "links forged V13/V14 reverse sidecars to prove full-block Span recovery and scalar replay without helpers"]
     #[allow(
         clippy::too_many_lines,
         reason = "the direct descriptor fixture keeps forward, reverse, and helper-call provenance in one executable oracle"
@@ -61811,7 +62483,21 @@ int main(void){{int status=run(1,10);if(status)return status;return run(0,20);}}
             .native_dynamic_rows_view()
             .expect("scanner-free variable Span dynamic view");
         assert_eq!(view.source_class_count, 3);
-        assert!(view.source_byte_classes.is_some());
+        let source_byte_classes = view
+            .source_byte_classes
+            .expect("scanner-free variable Span reverse classes");
+        let reverse_chain_byte = source_byte_classes
+            .iter()
+            .position(|&class| class == 0)
+            .expect("reverse source class zero has a representative");
+        let reverse_compact_class_map = source_byte_classes.map(|class| u8::from(class != 0));
+        assert!(reverse_compact_class_map.contains(&0));
+        assert!(reverse_compact_class_map.contains(&1));
+        let reverse_compact_class_map = reverse_compact_class_map
+            .iter()
+            .map(u8::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
         let module = lower_without_materialized_k0(&program, target);
         assert_eq!(
             module.required_prepared_dynamic_rows_span_recovery_runtime_symbol(),
@@ -61867,17 +62553,35 @@ typedef struct {{
   uint32_t learned_loop_states[4]; uint32_t format_version;
 }} frozen_v4_tail_t;
 typedef struct {{ frozen_v1_t v1; frozen_v4_tail_t v4; }} frozen_v4_t;
+typedef struct {{
+  uint64_t ready_seal; uint64_t magic;
+  uint32_t abi_version; uint32_t abi_version_complement;
+  size_t descriptor_bytes; unsigned char artifact_identity[32];
+  size_t rows_address; size_t source_rows_address; uint64_t cache_identity;
+  size_t compact_live_cells; size_t source_live_cells;
+  uint32_t state_count; uint32_t class_count; uint32_t block_cells;
+  uint32_t initial_block; uint32_t source_initial_row; uint32_t source_row_stride;
+  uint32_t format_version; uint32_t reserved; unsigned char class_map[256];
+}} reverse_descriptor_t;
 typedef struct {{ size_t start; size_t end; size_t rows; uint64_t generation; }} preflight_t;
 typedef struct {{ size_t status; size_t native_rows_address; }} preflight_result_v6_t;
 typedef struct {{ size_t row; size_t position; size_t pending; size_t end; uint64_t generation; }} continuation_t;
 _Static_assert(sizeof(frozen_v1_t)=={v1_bytes}U,"V1 extent");
 _Static_assert(offsetof(frozen_v4_t,v4)=={tail_offset}U,"V4 tail offset");
 _Static_assert(sizeof(frozen_v4_t)=={v4_bytes}U,"V4 extent");
+_Static_assert(sizeof(reverse_descriptor_t)=={reverse_bytes}U,"reverse descriptor extent");
+_Static_assert(offsetof(reverse_descriptor_t,rows_address)=={reverse_rows_offset}U,"reverse rows offset");
+_Static_assert(offsetof(reverse_descriptor_t,source_rows_address)=={reverse_source_rows_offset}U,"reverse source rows offset");
+_Static_assert(offsetof(reverse_descriptor_t,format_version)=={reverse_format_offset}U,"reverse format offset");
+_Static_assert(offsetof(reverse_descriptor_t,class_map)=={reverse_map_offset}U,"reverse map offset");
 extern uint32_t {entry}(handle_t,const unsigned char*,size_t,size_t,size_t,result_t*);
 static const unsigned char identity[32]={{{identity}}};
-static uint16_t forward_rows[4];
-static uint32_t reverse_rows[6];
+static const unsigned char reverse_class_map[256]={{{reverse_compact_class_map}}};
+static uint16_t forward_rows[8];
+static uint32_t reverse_rows[24];
+static uint16_t compact_rows[240];
 static frozen_v4_t frozen;
+static reverse_descriptor_t reverse_descriptor;
 static unsigned helper_calls;
 uint32_t fre_aot_regex_runtime_search_v1(const unsigned char*a,const unsigned char*b,size_t n,size_t s,size_t e,result_t*r){{(void)a;(void)b;(void)n;(void)s;(void)e;(void)r;helper_calls++;return 97U;}}
 uint32_t fre_aot_regex_runtime_search_exclusive_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;helper_calls++;return 97U;}}
@@ -61886,47 +62590,119 @@ uint32_t fre_aot_regex_runtime_search_exclusive_dynamic_rows_deopt_v1(handle_t h
 uint32_t fre_aot_regex_runtime_search_exclusive_dynamic_rows_continue_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,const continuation_t*c){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;(void)i;(void)c;helper_calls++;return 97U;}}
 uint32_t fre_aot_regex_runtime_search_exclusive_dynamic_rows_recover_span_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r,const unsigned char*i,size_t x){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;(void)i;(void)x;helper_calls++;return 97U;}}
 size_t fre_aot_regex_runtime_scan_frozen_loop_v2(const unsigned char*p,const void*s,size_t n){{(void)p;(void)s;(void)n;helper_calls++;return 0U;}}
-static void init(void){{
-  memset(&frozen,0,sizeof(frozen));
-  forward_rows[0]=3U;forward_rows[1]=UINT16_C(0x8000);
-  forward_rows[2]=UINT16_C(0x8000);forward_rows[3]=UINT16_C(0x8000);
-  reverse_rows[0]=4U;reverse_rows[1]=UINT32_C(0x80000004);reverse_rows[2]=4U;
-  reverse_rows[3]=UINT32_C(0x80000000);reverse_rows[4]=0U;reverse_rows[5]=UINT32_C(0x80000000);
+static void init_base(void){{
+  memset(&frozen,0,sizeof(frozen));memset(forward_rows,0,sizeof(forward_rows));
+  memset(reverse_rows,0,sizeof(reverse_rows));
+  for(size_t state=0;state<8U;state++){{
+    forward_rows[state]=state==7U?UINT16_C(0x8000):(uint16_t)(state+2U);
+    reverse_rows[state*3U]=state==7U?UINT32_C(0x80000000):(uint32_t)((state+1U)*3U+1U);
+  }}
   frozen.v1.active_seal=UINT64_C({active_seal});frozen.v1.magic=UINT64_C({magic});
   frozen.v1.abi_version=UINT32_C({abi});frozen.v1.flags=UINT32_C({v4_flag});
   frozen.v1.header_bytes={v4_bytes}U;memcpy(frozen.v1.artifact_identity,identity,sizeof(identity));
   frozen.v1.forward_rows_address=(size_t)(uintptr_t)forward_rows;
   frozen.v1.reverse_rows_address=(size_t)(uintptr_t)reverse_rows;
-  frozen.v1.forward_live_cells=4U;frozen.v1.reverse_live_cells=6U;
-  frozen.v1.cache_identity=UINT64_C(77);frozen.v1.row_stride=2U;
+  frozen.v1.forward_live_cells=8U;frozen.v1.reverse_live_cells=24U;
+  frozen.v1.cache_identity=UINT64_C(77);frozen.v1.row_stride=1U;
   frozen.v1.forward_initial_row=0U;frozen.v1.reverse_initial_row=0U;
   frozen.v1.unfilled_cell=0U;frozen.v1.accept_mask=UINT32_C(0x8000);
   frozen.v1.next_row_token_mask=UINT32_C(0x7fff);
-  for(size_t i=0;i<256U;i++)frozen.v1.class_map[i]=(i==(size_t)'a')?1U:0U;
+  memset(frozen.v1.class_map,0,sizeof(frozen.v1.class_map));
   frozen.v4.ready_seal=UINT64_C({ready_seal});
   frozen.v4.rows_address=(size_t)(uintptr_t)forward_rows;
-  frozen.v4.cache_identity=UINT64_C(77);frozen.v4.state_count=2U;frozen.v4.class_count=2U;
-  frozen.v4.row_shift=1U;frozen.v4.initial_state=0U;frozen.v4.learned_loop_state_count=0U;
+  frozen.v4.cache_identity=UINT64_C(77);frozen.v4.state_count=8U;frozen.v4.class_count=1U;
+  frozen.v4.row_shift=0U;frozen.v4.initial_state=0U;frozen.v4.learned_loop_state_count=0U;
   for(size_t i=0;i<4U;i++)frozen.v4.learned_loop_states[i]=UINT32_MAX;
   frozen.v4.format_version=UINT32_C({v4_format});
 }}
-static int run(const unsigned char *hay,size_t end,size_t xs,size_t xe,int base){{
+static uint16_t v14_cell(size_t state,size_t key,size_t length,int include_destination){{
+  unsigned char classes[4]={{0U,0U,0U,0U}};
+  for(size_t index=length;index>0U;index--){{classes[index-1U]=(unsigned char)(key%2U);key/=2U;}}
+  int last_accept=-1;int live=1;
+  for(size_t index=0;index<length;index++){{
+    if(classes[index]!=0U){{live=0;break;}}
+    if(state==7U){{last_accept=(int)index;live=0;break;}}
+    state++;
+  }}
+  uint16_t cell=0U;
+  if(last_accept>=0){{cell=(uint16_t)(UINT16_C(0x8000)|((length-1U-(size_t)last_accept)<<13U));}}
+  if(include_destination&&live)cell=(uint16_t)(cell|(state*30U+1U));
+  return cell;
+}}
+static void fill_v14(void){{
+  const size_t lengths[4]={{4U,3U,2U,1U}};
+  for(size_t state=0;state<8U;state++){{
+    size_t cell=state*30U;
+    for(size_t section=0;section<4U;section++){{
+      const size_t length=lengths[section];const size_t keys=(size_t)1U<<length;
+      for(size_t key=0;key<keys;key++)compact_rows[cell++]=v14_cell(state,key,length,length==4U);
+    }}
+  }}
+}}
+static void fill_v13(void){{
+  for(size_t state=0;state<8U;state++){{
+    const size_t block=state*5U;
+    for(size_t first=0;first<2U;first++)for(size_t second=0;second<2U;second++){{
+      uint16_t cell=0U;
+      if(first==0U){{
+        if(state==7U)cell=UINT16_C(0xc000);
+        else if(second==0U)cell=state==6U?UINT16_C(0x8000):(uint16_t)((state+2U)*5U+1U);
+      }}
+      compact_rows[block+first*2U+second]=cell;
+    }}
+    compact_rows[block+4U]=state==7U?1U:0U;
+  }}
+}}
+static void init_compact(uint32_t format,int hit){{
+  init_base();memset(&reverse_descriptor,0,sizeof(reverse_descriptor));
+  memset(compact_rows,0,sizeof(compact_rows));
+  reverse_descriptor.ready_seal=UINT64_C({reverse_ready_seal});
+  reverse_descriptor.magic=UINT64_C({reverse_magic});
+  reverse_descriptor.abi_version=UINT32_C({reverse_abi});
+  reverse_descriptor.abi_version_complement=~UINT32_C({reverse_abi});
+  reverse_descriptor.descriptor_bytes={reverse_bytes}U;
+  memcpy(reverse_descriptor.artifact_identity,identity,sizeof(identity));
+  memcpy(reverse_descriptor.class_map,reverse_class_map,sizeof(reverse_class_map));
+  reverse_descriptor.rows_address=(size_t)(uintptr_t)compact_rows;
+  reverse_descriptor.source_rows_address=(size_t)(uintptr_t)reverse_rows;
+  reverse_descriptor.cache_identity=UINT64_C(77);
+  reverse_descriptor.source_live_cells=24U;reverse_descriptor.initial_block=0U;
+  reverse_descriptor.source_initial_row=0U;reverse_descriptor.source_row_stride=3U;
+  reverse_descriptor.format_version=format;
+  if(format==UINT32_C({v14_format})){{
+    reverse_descriptor.compact_live_cells=240U;reverse_descriptor.state_count=8U;
+    reverse_descriptor.class_count=2U;reverse_descriptor.block_cells=30U;
+    if(hit)fill_v14();
+  }}else{{
+    reverse_descriptor.compact_live_cells=40U;reverse_descriptor.state_count=8U;
+    reverse_descriptor.class_count=2U;reverse_descriptor.block_cells=5U;
+    if(hit)fill_v13();
+  }}
+  frozen.v1.flags=UINT32_C({v4_flag})|UINT32_C({reverse_flag});
+  frozen.v1.reverse_live_cells=(size_t)(uintptr_t)&reverse_descriptor;
+}}
+static int run(int base){{
+  unsigned char hay[64];memset(hay,{reverse_chain_byte}U,sizeof(hay));
   result_t result={{91U,92U}};helper_calls=0U;
-  uint32_t status={entry}((handle_t)&frozen,hay,64U,5U,end,&result);
-  if(status!=1U||result.start!=xs||result.end!=xe)return base;
+  uint32_t status={entry}((handle_t)&frozen,hay,sizeof(hay),5U,20U,&result);
+  if(status!=1U||result.start!=5U||result.end!=13U)return base;
   if(helper_calls!=0U)return base+1;
   return 0;
 }}
 int main(void){{
-  unsigned char hay[64];memset(hay,'a',sizeof(hay));init();
-  int status=run(hay,10U,5U,6U,10);if(status)return status;
-  hay[5]='b';hay[6]='q';status=run(hay,10U,5U,7U,20);if(status)return status;
-  result_t miss={{91U,92U}};helper_calls=0U;
-  status={entry}((handle_t)&frozen,hay,sizeof(hay),5U,6U,&miss);
-  if(status!=0U||miss.start!=0U||miss.end!=0U||helper_calls!=0U)return 30;
-  frozen.v1.flags=UINT32_C({v2_flag});helper_calls=0U;miss.start=91U;miss.end=92U;
-  status={entry}((handle_t)&frozen,hay,sizeof(hay),5U,45U,&miss);
-  if(status!=97U||helper_calls!=1U||miss.start!=91U||miss.end!=92U)return 31;
+  init_base();int status=run(10);if(status)return status;
+  init_compact(UINT32_C({v14_format}),1);frozen.v1.reverse_rows_address=1U;
+  status=run(20);if(status)return status;
+  init_compact(UINT32_C({v14_format}),0);reverse_descriptor.source_rows_address=1U;
+  status=run(30);if(status)return status;
+  init_compact(UINT32_C({v13_format}),1);frozen.v1.reverse_rows_address=1U;
+  status=run(40);if(status)return status;
+  init_compact(UINT32_C({v13_format}),0);reverse_descriptor.source_rows_address=1U;
+  status=run(50);if(status)return status;
+  init_base();frozen.v1.flags=UINT32_C({v2_flag});helper_calls=0U;
+  unsigned char hay[64];memset(hay,{reverse_chain_byte}U,sizeof(hay));result_t fallback={{91U,92U}};
+  status={entry}((handle_t)&frozen,hay,sizeof(hay),5U,45U,&fallback);
+  if(status!=97U||helper_calls!=1U||fallback.start!=91U||fallback.end!=92U)return 60;
   return 0;
 }}
 "##,
@@ -61940,6 +62716,22 @@ int main(void){{
             v4_flag = FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V4,
             ready_seal = FROZEN_PREPARED_HEADER_V4_READY_SEAL,
             v4_format = FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION,
+            reverse_flag = FROZEN_PREPARED_HEADER_V1_FLAG_REVERSE_SUPERTRANSITION,
+            reverse_ready_seal =
+                crate::program::FROZEN_REVERSE_SUPERTRANSITION_V1_READY_SEAL,
+            reverse_magic = crate::program::FROZEN_REVERSE_SUPERTRANSITION_V1_MAGIC,
+            reverse_abi =
+                crate::program::FROZEN_REVERSE_SUPERTRANSITION_V1_ABI_VERSION,
+            reverse_bytes = crate::program::FROZEN_REVERSE_SUPERTRANSITION_V1_BYTES,
+            reverse_rows_offset = FROZEN_REVERSE_SUPERTRANSITION_V1_ROWS_ADDRESS_OFFSET,
+            reverse_source_rows_offset =
+                crate::program::FROZEN_REVERSE_SUPERTRANSITION_V1_SOURCE_ROWS_ADDRESS_OFFSET,
+            reverse_format_offset = FROZEN_REVERSE_SUPERTRANSITION_V1_FORMAT_VERSION_OFFSET,
+            reverse_map_offset = FROZEN_REVERSE_SUPERTRANSITION_V1_CLASS_MAP_OFFSET,
+            reverse_compact_class_map = reverse_compact_class_map,
+            reverse_chain_byte = reverse_chain_byte,
+            v13_format = FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION,
+            v14_format = FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION,
         );
         let c_path = directory.join("compact-reverse.c");
         let executable = directory.join("compact-reverse");
@@ -84359,6 +85151,231 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
     }
 
     #[test]
+    fn reverse_supertransition_active_guards_admit_exact_base_and_combined_flags() {
+        fn occurrences(code: &[u8], needle: &[u8]) -> usize {
+            code.windows(needle.len())
+                .filter(|window| *window == needle)
+                .count()
+        }
+
+        let format = FrozenCompactNativeFormat::CellOffsetV4;
+        let base_flag = format.flag();
+        let combined_flag = base_flag | FROZEN_PREPARED_HEADER_V1_FLAG_REVERSE_SUPERTRANSITION;
+        let x86_flag_compare = |flag: u32| {
+            let mut bytes = vec![
+                0x81,
+                0x7f,
+                u8::try_from(FROZEN_PREPARED_HEADER_V1_FLAGS_OFFSET).unwrap(),
+            ];
+            bytes.extend_from_slice(&flag.to_le_bytes());
+            bytes
+        };
+        let mut x86 = X86Assembler::new();
+        let x86_try_older = x86.label().unwrap();
+        let x86_preflight = x86.label().unwrap();
+        let x86_enter = x86.label().unwrap();
+        x86_emit_frozen_compact_entry(
+            &mut x86,
+            format,
+            x86_try_older,
+            x86_preflight,
+            x86_enter,
+            FrozenCompactGuardMode::ActiveCapabilitySimdIdentityReverseSupertransition,
+        )
+        .unwrap();
+        for label in [x86_try_older, x86_preflight, x86_enter] {
+            x86.bind(label).unwrap();
+            x86.instruction(&[0xc3]).unwrap();
+        }
+        let x86 = x86.finish().unwrap();
+        assert_eq!(occurrences(&x86, &x86_flag_compare(combined_flag)), 1);
+        assert_eq!(occurrences(&x86, &x86_flag_compare(base_flag)), 1);
+        assert_eq!(
+            occurrences(
+                &x86,
+                &[
+                    0x48,
+                    0x81,
+                    0x7f,
+                    u8::try_from(FROZEN_PREPARED_HEADER_V1_HEADER_BYTES_OFFSET).unwrap(),
+                ],
+            ),
+            0,
+            "active owner capability must not pay the full extent verifier"
+        );
+
+        let mut arm = Aarch64Assembler::new();
+        let arm_try_older = arm.label().unwrap();
+        let arm_preflight = arm.label().unwrap();
+        let arm_enter = arm.label().unwrap();
+        aarch64_emit_frozen_compact_entry(
+            &mut arm,
+            format,
+            arm_try_older,
+            arm_preflight,
+            arm_enter,
+            FrozenCompactGuardMode::ActiveCapabilityReverseSupertransition,
+        )
+        .unwrap();
+        for label in [arm_try_older, arm_preflight, arm_enter] {
+            arm.bind(label).unwrap();
+            arm.instruction(0xd503_201f).unwrap();
+        }
+        let arm_words = arm
+            .finish()
+            .unwrap()
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        let combined_selector = [
+            aarch64_load_w_imm(
+                8,
+                0,
+                u16::try_from(FROZEN_PREPARED_HEADER_V1_FLAGS_OFFSET).unwrap(),
+            )
+            .unwrap(),
+            aarch64_movz_x(9, u16::try_from(base_flag).unwrap(), 0).unwrap(),
+            aarch64_movk_x(9, 1, 1).unwrap(),
+            aarch64_cmp_w(8, 9).unwrap(),
+        ];
+        assert_eq!(
+            arm_words
+                .windows(combined_selector.len())
+                .filter(|words| *words == combined_selector)
+                .count(),
+            1
+        );
+        let base_selector = [
+            aarch64_movz_x(9, u16::try_from(base_flag).unwrap(), 0).unwrap(),
+            aarch64_cmp_w(8, 9).unwrap(),
+        ];
+        assert_eq!(
+            arm_words
+                .windows(base_selector.len())
+                .filter(|words| *words == base_selector)
+                .count(),
+            1
+        );
+        assert!(!arm_words.contains(
+            &aarch64_load_x_imm(
+                8,
+                0,
+                u16::try_from(FROZEN_PREPARED_HEADER_V1_HEADER_BYTES_OFFSET).unwrap(),
+            )
+            .unwrap()
+        ));
+    }
+
+    #[test]
+    fn reverse_supertransition_postflight_is_emitted_cross_isa() {
+        fn occurrences(code: &[u8], needle: &[u8]) -> usize {
+            code.windows(needle.len())
+                .filter(|window| *window == needle)
+                .count()
+        }
+
+        let x86 = lower_x86_64_dynamic_rows_prepared_for_output_with_plan(
+            None,
+            FeatureSet::EMPTY,
+            OutputContract::Span,
+            None,
+            true,
+            true,
+        )
+        .unwrap();
+        let mut modifier_test = vec![
+            0xf7,
+            0x40,
+            u8::try_from(FROZEN_PREPARED_HEADER_V1_FLAGS_OFFSET).unwrap(),
+        ];
+        modifier_test.extend_from_slice(
+            &FROZEN_PREPARED_HEADER_V1_FLAG_REVERSE_SUPERTRANSITION.to_le_bytes(),
+        );
+        assert_eq!(occurrences(&x86.code, &modifier_test), 1);
+        assert!(x86.code.windows(4).any(|bytes| {
+            bytes
+                == [
+                    0x48,
+                    0x8b,
+                    0x78,
+                    u8::try_from(FROZEN_PREPARED_HEADER_V1_REVERSE_LIVE_CELLS_OFFSET).unwrap(),
+                ]
+        }));
+        let mut format_load = vec![0x44, 0x8b, 0x97];
+        format_load.extend_from_slice(
+            &i32::try_from(FROZEN_REVERSE_SUPERTRANSITION_V1_FORMAT_VERSION_OFFSET)
+                .unwrap()
+                .to_le_bytes(),
+        );
+        assert_eq!(occurrences(&x86.code, &format_load), 1);
+        let mut inline_map = vec![0x4c, 0x8d, 0x87];
+        inline_map.extend_from_slice(
+            &i32::try_from(FROZEN_REVERSE_SUPERTRANSITION_V1_CLASS_MAP_OFFSET)
+                .unwrap()
+                .to_le_bytes(),
+        );
+        assert_eq!(occurrences(&x86.code, &inline_map), 1);
+        assert!(x86.code.windows(4).any(|bytes| {
+            bytes
+                == [
+                    0x48,
+                    0x8b,
+                    0x78,
+                    u8::try_from(FROZEN_PREPARED_HEADER_V1_REVERSE_ROWS_ADDRESS_OFFSET).unwrap(),
+                ]
+        }));
+        assert!(occurrences(&x86.code, &[0x0f, 0xb7, 0x04, 0x41]) >= 2);
+
+        let arm = lower_aarch64_dynamic_rows_prepared_for_output_with_plan(
+            None,
+            OutputContract::Span,
+            None,
+            true,
+            true,
+        )
+        .unwrap();
+        let arm_words = arm
+            .code
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(arm_words.contains(
+            &aarch64_load_x_imm(
+                6,
+                0,
+                u16::try_from(FROZEN_PREPARED_HEADER_V1_REVERSE_LIVE_CELLS_OFFSET).unwrap(),
+            )
+            .unwrap()
+        ));
+        assert!(arm_words.contains(
+            &aarch64_load_w_imm(
+                10,
+                6,
+                u16::try_from(FROZEN_REVERSE_SUPERTRANSITION_V1_FORMAT_VERSION_OFFSET).unwrap(),
+            )
+            .unwrap()
+        ));
+        assert!(arm_words.contains(
+            &aarch64_add_x_imm(
+                14,
+                6,
+                u16::try_from(FROZEN_REVERSE_SUPERTRANSITION_V1_CLASS_MAP_OFFSET).unwrap(),
+            )
+            .unwrap()
+        ));
+        assert!(arm_words.contains(&aarch64_madd_w(10, 10, 17, 16).unwrap()));
+        assert!(arm_words.contains(&aarch64_load_h_uxtw(10, 11, 10).unwrap()));
+        assert!(arm_words.contains(
+            &aarch64_load_x_imm(
+                8,
+                0,
+                u16::try_from(FROZEN_PREPARED_HEADER_V1_REVERSE_ROWS_ADDRESS_OFFSET).unwrap(),
+            )
+            .unwrap()
+        ));
+    }
+
+    #[test]
     fn compact_variable_span_full_verifier_checks_reverse_geometry_cross_isa() {
         let source_class_count = 7_u16;
         let mut x86 = X86Assembler::new();
@@ -84624,6 +85641,12 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             .unwrap(),
             aarch64_cmp_w(8, 9).unwrap(),
         ];
+        let arm_combined_flag = [
+            arm_flag[0],
+            arm_flag[1],
+            aarch64_movk_x(9, 1, 1).unwrap(),
+            arm_flag[2],
+        ];
         assert_eq!(
             arm_guard_words
                 .windows(arm_flag.len())
@@ -84843,8 +85866,8 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
             .collect::<Vec<_>>();
         assert_eq!(
             variable_arm_words
-                .windows(arm_flag.len())
-                .filter(|words| *words == arm_flag)
+                .windows(arm_combined_flag.len())
+                .filter(|words| *words == arm_combined_flag)
                 .count(),
             1
         );
@@ -84960,9 +85983,15 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
         assert_eq!(occurrences(&x86_guard, &[0x41, 0xf6, 0xc2, 0x01]), 1);
         assert_eq!(occurrences(&x86_guard, &[0x41, 0x83, 0xf8, 0x08]), 1);
         assert_eq!(
-            occurrences(&x86_guard, &[0x48, 0x3d, 0xff, 0x3f, 0x00, 0x00]),
+            occurrences(
+                &x86_guard,
+                &[
+                    0x49, 0x89, 0xc2, 0x49, 0x29, 0xd2, 0x49, 0xff, 0xc2, 0x49, 0x81, 0xfa,
+                    0xff, 0x3f, 0x00, 0x00,
+                ],
+            ),
             1,
-            "V13 must prove its complete 14-bit one-based cell extent"
+            "V13 must prove its exact final aligned block-start token"
         );
 
         let mut arm_guard = Aarch64Assembler::new();
@@ -85011,6 +86040,15 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
         assert!(arm_guard_words.contains(&aarch64_and_low_x(9, 8, 1).unwrap()));
         assert!(arm_guard_words.contains(&aarch64_cmp_w_imm(11, 8).unwrap()));
         assert!(arm_guard_words.contains(&aarch64_movz_x(8, 0x3fff, 0).unwrap()));
+        assert!(arm_guard_words.windows(4).any(|words| {
+            words
+                == [
+                    aarch64_movz_x(8, DYNAMIC_NATIVE_ROWS_V13_NEXT_BLOCK_TOKEN_MASK, 0).unwrap(),
+                    aarch64_sub_x_reg(6, 7, 9).unwrap(),
+                    aarch64_add_x_imm(6, 6, 1).unwrap(),
+                    aarch64_cmp_x(6, 8).unwrap(),
+                ]
+        }));
         let mut arm_ready = Aarch64Assembler::new();
         aarch64_load_u64_constant(
             &mut arm_ready,

@@ -2931,6 +2931,76 @@ pub struct FrozenDynamicRowsV6 {
     loop_plans: [FrozenCompactLoopPlanV1; 4],
 }
 
+/// Immutable independently compacted reverse supertransition descriptor.
+///
+/// Reverse input is consumed from high addresses toward low addresses. V13
+/// therefore keys each pair as `(high_class, low_class)`, while V14 uses the
+/// analogous four-class order. `source_rows_address` retains the exact K0
+/// reverse projection used by the established scalar fallback; compact rows
+/// and their independently coalesced byte map never replace that recovery
+/// authority.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C)]
+pub(crate) struct FrozenReverseSupertransitionV1 {
+    ready_seal: u64,
+    magic: u64,
+    abi_version: u32,
+    abi_version_complement: u32,
+    descriptor_bytes: usize,
+    artifact_identity: [u8; 32],
+    rows_address: usize,
+    source_rows_address: usize,
+    cache_identity: u64,
+    compact_live_cells: usize,
+    source_live_cells: usize,
+    state_count: u32,
+    class_count: u32,
+    block_cells: u32,
+    initial_block: u32,
+    source_initial_row: u32,
+    source_row_stride: u32,
+    format_version: u32,
+    reserved: u32,
+    class_map: [u8; 256],
+}
+
+/// Pointer-stable ownership for one optional reverse V13/V14 generation.
+///
+/// The descriptor is boxed separately because the surrounding forward owner
+/// may move before publication. Generated code can therefore retain its
+/// address for the lifetime of the immutable prepared owner.
+#[derive(Debug)]
+struct FrozenReverseSupertransitionStorageV1 {
+    rows: Box<[u16]>,
+    descriptor: Box<FrozenReverseSupertransitionV1>,
+    resident_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FrozenReverseSupertransitionGenerationKey {
+    descriptor_address: usize,
+    ready_seal: u64,
+    magic: u64,
+    abi_version: u32,
+    abi_version_complement: u32,
+    descriptor_bytes: usize,
+    artifact_identity: [u8; 32],
+    rows_address: usize,
+    source_rows_address: usize,
+    cache_identity: u64,
+    compact_live_cells: usize,
+    source_live_cells: usize,
+    state_count: u32,
+    class_count: u32,
+    block_cells: u32,
+    initial_block: u32,
+    source_initial_row: u32,
+    source_row_stride: u32,
+    format_version: u32,
+    reserved: u32,
+}
+
 impl Default for FrozenDynamicRowsV6 {
     fn default() -> Self {
         Self {
@@ -3096,6 +3166,7 @@ pub struct FrozenDynamicRowsStorageV3 {
     loop_index: Box<[u8]>,
     loop_scanners: Box<[FrozenCompactLoopScanner]>,
     descriptor_v6: Option<FrozenDynamicRowsV6>,
+    reverse_supertransition: Option<FrozenReverseSupertransitionStorageV1>,
 }
 
 const FROZEN_RETAINED_PARTIAL_RESUME_PENDING_MASK: u32 = 1_u32 << 31;
@@ -3193,6 +3264,7 @@ pub struct FrozenPreparedHeaderOwnerGenerationKey {
     loop_index_address: usize,
     loop_index_length: usize,
     reverse: Option<FrozenRootReverseProjection>,
+    reverse_supertransition: Option<FrozenReverseSupertransitionGenerationKey>,
 }
 
 /// Single-use result of validating an inactive cached continuation shell.
@@ -3231,6 +3303,16 @@ impl FrozenStaticContinuationRowsStorageV1 {
     pub const fn compiler_private_format_version(&self) -> u32 {
         self.rows.effective_format_version()
     }
+}
+
+#[inline]
+const fn frozen_prepared_header_base_flags(flags: u32) -> u32 {
+    flags & !FROZEN_PREPARED_HEADER_V1_FLAG_REVERSE_SUPERTRANSITION
+}
+
+#[inline]
+const fn frozen_prepared_header_has_reverse_supertransition(flags: u32) -> bool {
+    flags & FROZEN_PREPARED_HEADER_V1_FLAG_REVERSE_SUPERTRANSITION != 0
 }
 
 #[inline]
@@ -3644,6 +3726,13 @@ pub const FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V13: u32 = 1 << 14;
 /// An authenticated dense mapped four-transition V14 tail is present.
 #[doc(hidden)]
 pub const FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V14: u32 = 1 << 15;
+/// The reverse-live-cells word names an independently sealed V13/V14 descriptor.
+///
+/// This is a modifier on one exact compact-forward generation flag. Headers
+/// without it retain the original direct-K0 reverse live-cell count. The
+/// reverse-row address always retains the original K0 row pointer.
+#[doc(hidden)]
+pub(crate) const FROZEN_PREPARED_HEADER_V1_FLAG_REVERSE_SUPERTRANSITION: u32 = 1 << 16;
 /// Sentinel used when no reverse root row exists.
 #[doc(hidden)]
 pub const FROZEN_PREPARED_HEADER_V1_NO_REVERSE_ROW: u32 = u32::MAX;
@@ -3773,6 +3862,17 @@ pub const FROZEN_PREPARED_HEADER_V13_READY_SEAL: u64 = 0x95c1_7a4e_32bd_f608;
 /// Final publication seal for a dense mapped four-transition V14 tail.
 #[doc(hidden)]
 pub const FROZEN_PREPARED_HEADER_V14_READY_SEAL: u64 = 0x8db6_f249_31ae_c570;
+/// Stable magic for an independently owned reverse supertransition.
+#[doc(hidden)]
+pub(crate) const FROZEN_REVERSE_SUPERTRANSITION_V1_MAGIC: u64 =
+    u64::from_le_bytes(*b"FRERVS1\0");
+/// Exact reverse-supertransition descriptor ABI version.
+#[doc(hidden)]
+pub(crate) const FROZEN_REVERSE_SUPERTRANSITION_V1_ABI_VERSION: u32 = 1;
+/// Final immutable seal for a completely initialized reverse descriptor.
+#[doc(hidden)]
+pub(crate) const FROZEN_REVERSE_SUPERTRANSITION_V1_READY_SEAL: u64 =
+    0x71a4_9d2c_e563_b80f;
 /// Exact mapped state-ordinal tail format selected by the V3 flag and extent.
 #[doc(hidden)]
 pub const FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION: u32 = 3;
@@ -4271,7 +4371,11 @@ fn frozen_pair_rows_v13_geometry(
     let pair_cells = class_count.checked_mul(class_count)?;
     let block_cells = pair_cells.checked_add(1)?;
     let total_cells = state_count.checked_mul(block_cells)?;
-    if total_cells > usize::from(DYNAMIC_NATIVE_ROWS_V13_NEXT_BLOCK_TOKEN_MASK) {
+    let last_block_token = state_count
+        .checked_sub(1)?
+        .checked_mul(block_cells)?
+        .checked_add(1)?;
+    if last_block_token > usize::from(DYNAMIC_NATIVE_ROWS_V13_NEXT_BLOCK_TOKEN_MASK) {
         return None;
     }
     let bytes = total_cells
@@ -4401,9 +4505,30 @@ fn frozen_quad_rows_v14_geometry(
     state_count: usize,
     class_count: usize,
 ) -> Option<(usize, usize, usize, usize, usize, usize, usize)> {
+    frozen_quad_rows_v14_geometry_with_minimum_classes(
+        state_count,
+        class_count,
+        FROZEN_QUAD_ROWS_V14_MIN_CLASSES,
+    )
+}
+
+/// Reverse recovery also benefits from the degenerate one-class V14 orbit.
+/// Forward V14 dispatch deliberately remains restricted to C=2..=4 because
+/// its target loops are statically specialized for those three radices.
+fn frozen_reverse_quad_rows_v14_geometry(
+    state_count: usize,
+    class_count: usize,
+) -> Option<(usize, usize, usize, usize, usize, usize, usize)> {
+    frozen_quad_rows_v14_geometry_with_minimum_classes(state_count, class_count, 1)
+}
+
+fn frozen_quad_rows_v14_geometry_with_minimum_classes(
+    state_count: usize,
+    class_count: usize,
+    minimum_classes: usize,
+) -> Option<(usize, usize, usize, usize, usize, usize, usize)> {
     if state_count == 0
-        || !(FROZEN_QUAD_ROWS_V14_MIN_CLASSES..=FROZEN_QUAD_ROWS_V14_MAX_CLASSES)
-            .contains(&class_count)
+        || !(minimum_classes..=FROZEN_QUAD_ROWS_V14_MAX_CLASSES).contains(&class_count)
     {
         return None;
     }
@@ -4522,6 +4647,31 @@ fn build_frozen_quad_rows_v14(
     let class_count = columns.class_count;
     let (_, _, _, _, block_cells, total_cells, _) =
         frozen_quad_rows_v14_geometry(state_count, class_count)?;
+    build_frozen_quad_rows_v14_with_geometry(
+        source_rows,
+        columns,
+        source_class_count,
+        state_count,
+        source_initial_state,
+        block_cells,
+        total_cells,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the shared builder receives the already authenticated forward or reverse geometry"
+)]
+fn build_frozen_quad_rows_v14_with_geometry(
+    source_rows: &[u32],
+    columns: &FrozenCompactColumnProjection,
+    source_class_count: usize,
+    state_count: usize,
+    source_initial_state: usize,
+    block_cells: usize,
+    total_cells: usize,
+) -> Option<Box<[u16]>> {
+    let class_count = columns.class_count;
     let semantic_cells = state_count.checked_mul(class_count)?;
     let mut semantics = Vec::new();
     semantics.try_reserve_exact(semantic_cells).ok()?;
@@ -4568,6 +4718,514 @@ fn build_frozen_quad_rows_v14(
         return None;
     }
     Some(rows.into_boxed_slice())
+}
+
+fn build_frozen_reverse_supertransition_v1(
+    source_rows: &[u32],
+    source_class_map: &[u8],
+    source_class_count: usize,
+    source_initial_row: u32,
+    cache_identity: u64,
+    artifact_identity: [u8; 32],
+    max_resident_bytes: usize,
+) -> Option<FrozenReverseSupertransitionStorageV1> {
+    if cache_identity == 0
+        || source_class_count == 0
+        || source_class_count > 256
+        || source_rows.is_empty()
+        || source_rows.len().checked_rem(source_class_count) != Some(0)
+        || !frozen_dynamic_source_rows_are_normalizable(source_rows, source_class_count)
+    {
+        return None;
+    }
+    let state_count = source_rows.len().checked_div(source_class_count)?;
+    let source_initial_row_usize = usize::try_from(source_initial_row).ok()?;
+    if source_initial_row_usize.checked_rem(source_class_count) != Some(0) {
+        return None;
+    }
+    let source_initial_state = source_initial_row_usize.checked_div(source_class_count)?;
+    if source_initial_state >= state_count {
+        return None;
+    }
+    let columns = coalesce_frozen_compact_columns(
+        source_rows,
+        source_class_map,
+        source_class_count,
+        state_count,
+        source_initial_state,
+    )?;
+    let class_count = columns.class_count;
+
+    let quad = frozen_reverse_quad_rows_v14_geometry(state_count, class_count).and_then(
+        |(_, _, _, _, block_cells, total_cells, _)| {
+            let resident_bytes = total_cells
+                .checked_mul(core::mem::size_of::<u16>())?
+                .checked_add(FROZEN_REVERSE_SUPERTRANSITION_V1_BYTES)?;
+            if resident_bytes > max_resident_bytes
+                || resident_bytes > FROZEN_QUAD_ROWS_V14_MAX_BYTES
+            {
+                return None;
+            }
+            let rows = build_frozen_quad_rows_v14_with_geometry(
+                source_rows,
+                &columns,
+                source_class_count,
+                state_count,
+                source_initial_state,
+                block_cells,
+                total_cells,
+            )?;
+            (rows.len() == total_cells).then_some((
+                rows,
+                block_cells,
+                FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION,
+                FROZEN_QUAD_ROWS_V14_MAX_BYTES,
+            ))
+        },
+    );
+    let (rows, block_cells, format_version, resident_cap) = if let Some(quad) = quad {
+        quad
+    } else {
+        let (_, block_cells, total_cells, _) =
+            frozen_pair_rows_v13_geometry(state_count, class_count)?;
+        let resident_bytes = total_cells
+            .checked_mul(core::mem::size_of::<u16>())?
+            .checked_add(FROZEN_REVERSE_SUPERTRANSITION_V1_BYTES)?;
+        if resident_bytes > max_resident_bytes
+            || resident_bytes > FROZEN_PAIR_ROWS_V13_MAX_BYTES
+        {
+            return None;
+        }
+        let rows = build_frozen_pair_rows_v13(
+            source_rows,
+            &columns,
+            source_class_count,
+            state_count,
+            source_initial_state,
+        )?;
+        if rows.len() != total_cells {
+            return None;
+        }
+        (
+            rows,
+            block_cells,
+            FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION,
+            FROZEN_PAIR_ROWS_V13_MAX_BYTES,
+        )
+    };
+    let resident_bytes = rows
+        .len()
+        .checked_mul(core::mem::size_of::<u16>())?
+        .checked_add(FROZEN_REVERSE_SUPERTRANSITION_V1_BYTES)?;
+    if resident_bytes > resident_cap {
+        return None;
+    }
+    let descriptor = Box::new(FrozenReverseSupertransitionV1 {
+        ready_seal: FROZEN_REVERSE_SUPERTRANSITION_V1_READY_SEAL,
+        magic: FROZEN_REVERSE_SUPERTRANSITION_V1_MAGIC,
+        abi_version: FROZEN_REVERSE_SUPERTRANSITION_V1_ABI_VERSION,
+        abi_version_complement: !FROZEN_REVERSE_SUPERTRANSITION_V1_ABI_VERSION,
+        descriptor_bytes: FROZEN_REVERSE_SUPERTRANSITION_V1_BYTES,
+        artifact_identity,
+        rows_address: rows.as_ptr().expose_provenance(),
+        source_rows_address: source_rows.as_ptr().expose_provenance(),
+        cache_identity,
+        compact_live_cells: rows.len(),
+        source_live_cells: source_rows.len(),
+        state_count: u32::try_from(state_count).ok()?,
+        class_count: u32::try_from(class_count).ok()?,
+        block_cells: u32::try_from(block_cells).ok()?,
+        initial_block: 0,
+        source_initial_row,
+        source_row_stride: u32::try_from(source_class_count).ok()?,
+        format_version,
+        reserved: 0,
+        class_map: columns.class_map,
+    });
+    let storage = FrozenReverseSupertransitionStorageV1 {
+        rows,
+        descriptor,
+        resident_bytes,
+    };
+    storage.is_valid().then_some(storage)
+}
+
+fn retain_frozen_reverse_supertransition_v1(
+    candidate: Option<FrozenReverseSupertransitionStorageV1>,
+    forward_resident_bytes: usize,
+    retained_map_reserve_bytes: usize,
+    retained_bytes: usize,
+    max_packed_bytes: usize,
+) -> Option<FrozenReverseSupertransitionStorageV1> {
+    let candidate = candidate?;
+    let combined = forward_resident_bytes
+        .checked_add(retained_map_reserve_bytes)?
+        .checked_add(candidate.resident_bytes)?;
+    (combined <= retained_bytes && combined <= max_packed_bytes).then_some(candidate)
+}
+
+impl FrozenReverseSupertransitionStorageV1 {
+    fn is_valid(&self) -> bool {
+        let rows = *self.descriptor;
+        let Ok(state_count) = usize::try_from(rows.state_count) else {
+            return false;
+        };
+        let Ok(class_count) = usize::try_from(rows.class_count) else {
+            return false;
+        };
+        let Ok(block_cells) = usize::try_from(rows.block_cells) else {
+            return false;
+        };
+        let Ok(source_row_stride) = usize::try_from(rows.source_row_stride) else {
+            return false;
+        };
+        let Ok(source_initial_row) = usize::try_from(rows.source_initial_row) else {
+            return false;
+        };
+        let geometry = match rows.format_version {
+            FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION => {
+                frozen_pair_rows_v13_geometry(state_count, class_count)
+                    .map(|(pair, block, total, bytes)| (pair, 0, 0, block, total, bytes))
+            }
+            FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION => {
+                frozen_reverse_quad_rows_v14_geometry(state_count, class_count).map(
+                    |(quad, tail3, tail2, _, block, total, bytes)| {
+                        (quad, tail3, tail2, block, total, bytes)
+                    },
+                )
+            }
+            _ => None,
+        };
+        let Some((first_section, second_section, third_section, expected_block, total, _)) =
+            geometry
+        else {
+            return false;
+        };
+        if rows.ready_seal != FROZEN_REVERSE_SUPERTRANSITION_V1_READY_SEAL
+            || rows.magic != FROZEN_REVERSE_SUPERTRANSITION_V1_MAGIC
+            || rows.abi_version != FROZEN_REVERSE_SUPERTRANSITION_V1_ABI_VERSION
+            || rows.abi_version_complement != !rows.abi_version
+            || rows.descriptor_bytes != FROZEN_REVERSE_SUPERTRANSITION_V1_BYTES
+            || rows.rows_address == 0
+            || rows.rows_address.checked_rem(core::mem::align_of::<u16>()) != Some(0)
+            || rows.rows_address != self.rows.as_ptr().expose_provenance()
+            || rows.source_rows_address == 0
+            || rows.source_rows_address.checked_rem(core::mem::align_of::<u32>()) != Some(0)
+            || rows.cache_identity == 0
+            || rows.compact_live_cells != self.rows.len()
+            || rows.compact_live_cells != total
+            || rows.source_live_cells == 0
+            || rows.source_live_cells
+                > usize::try_from(DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK)
+                    .unwrap_or(usize::MAX)
+            || rows.initial_block != 0
+            || rows.source_initial_row == FROZEN_PREPARED_HEADER_V1_NO_REVERSE_ROW
+            || source_row_stride == 0
+            || source_row_stride > 256
+            || rows.source_live_cells.checked_rem(source_row_stride) != Some(0)
+            || rows.source_live_cells.checked_div(source_row_stride) != Some(state_count)
+            || source_initial_row.checked_rem(source_row_stride) != Some(0)
+            || source_initial_row
+                .checked_add(source_row_stride)
+                .is_none_or(|end| end > rows.source_live_cells)
+            || block_cells != expected_block
+            || self.resident_bytes
+                != total
+                    .checked_mul(core::mem::size_of::<u16>())
+                    .and_then(|bytes| {
+                        bytes.checked_add(FROZEN_REVERSE_SUPERTRANSITION_V1_BYTES)
+                    })
+                    .unwrap_or(usize::MAX)
+            || self.resident_bytes
+                > if rows.format_version == FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION {
+                    FROZEN_QUAD_ROWS_V14_MAX_BYTES
+                } else {
+                    FROZEN_PAIR_ROWS_V13_MAX_BYTES
+                }
+            || rows.reserved != 0
+        {
+            return false;
+        }
+
+        let mut represented = [false; 256];
+        for &class in &rows.class_map {
+            let class = usize::from(class);
+            if class >= class_count {
+                return false;
+            }
+            represented[class] = true;
+        }
+        if represented[..class_count].iter().any(|&present| !present) {
+            return false;
+        }
+
+        if rows.format_version == FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION {
+            let live_class_mask = (1_u16 << class_count) - 1;
+            for block in self.rows.chunks_exact(block_cells) {
+                let tail_accepts = block[first_section];
+                if tail_accepts & !live_class_mask != 0 {
+                    return false;
+                }
+                for first_class in 0..class_count {
+                    for second_class in 0..class_count {
+                        let cell = block[first_class * class_count + second_class];
+                        let accepts = cell & DYNAMIC_NATIVE_ROWS_V13_ANY_ACCEPT_MASK != 0;
+                        let back_one =
+                            cell & DYNAMIC_NATIVE_ROWS_V13_ACCEPT_BACK_ONE_MASK != 0;
+                        let first_accepts = tail_accepts & (1_u16 << first_class) != 0;
+                        let token = cell & DYNAMIC_NATIVE_ROWS_V13_NEXT_BLOCK_TOKEN_MASK;
+                        if (back_one && (!accepts || !first_accepts))
+                            || (first_accepts && !accepts)
+                            || (token != 0
+                                && usize::from(token)
+                                    .checked_sub(1)
+                                    .is_none_or(|destination| {
+                                        destination >= total
+                                            || destination.checked_rem(block_cells) != Some(0)
+                                    }))
+                        {
+                            return false;
+                        }
+                    }
+                }
+            }
+            return true;
+        }
+
+        let sections = [
+            (0_usize, first_section, 4_u16, true),
+            (first_section, second_section, 3, false),
+            (first_section + second_section, third_section, 2, false),
+            (
+                first_section + second_section + third_section,
+                class_count,
+                1,
+                false,
+            ),
+        ];
+        for block in self.rows.chunks_exact(block_cells) {
+            for (start, count, length, permits_token) in sections {
+                for &cell in &block[start..start + count] {
+                    let accepts = cell & DYNAMIC_NATIVE_ROWS_V14_ANY_ACCEPT_MASK != 0;
+                    let distance = (cell & DYNAMIC_NATIVE_ROWS_V14_ACCEPT_DISTANCE_MASK) >> 13;
+                    let token = cell & DYNAMIC_NATIVE_ROWS_V14_NEXT_BLOCK_TOKEN_MASK;
+                    if (!accepts && distance != 0)
+                        || distance >= length
+                        || (!permits_token && token != 0)
+                        || (token != 0
+                            && usize::from(token)
+                                .checked_sub(1)
+                                .is_none_or(|destination| {
+                                    destination >= total
+                                        || destination.checked_rem(block_cells) != Some(0)
+                                }))
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    fn generation_key(&self) -> FrozenReverseSupertransitionGenerationKey {
+        let rows = *self.descriptor;
+        // The descriptor Box and row Box have no mutable safe API and remain
+        // owned by the borrowed forward owner. Pointer identity therefore
+        // binds the inline map and row contents without copying or scanning
+        // them on every cached-header rearm. Setup validation above remains
+        // the sole full semantic/map authentication pass.
+        FrozenReverseSupertransitionGenerationKey {
+            descriptor_address: (self.descriptor.as_ref()
+                as *const FrozenReverseSupertransitionV1)
+                .expose_provenance(),
+            ready_seal: rows.ready_seal,
+            magic: rows.magic,
+            abi_version: rows.abi_version,
+            abi_version_complement: rows.abi_version_complement,
+            descriptor_bytes: rows.descriptor_bytes,
+            artifact_identity: rows.artifact_identity,
+            rows_address: rows.rows_address,
+            source_rows_address: rows.source_rows_address,
+            cache_identity: rows.cache_identity,
+            compact_live_cells: rows.compact_live_cells,
+            source_live_cells: rows.source_live_cells,
+            state_count: rows.state_count,
+            class_count: rows.class_count,
+            block_cells: rows.block_cells,
+            initial_block: rows.initial_block,
+            source_initial_row: rows.source_initial_row,
+            source_row_stride: rows.source_row_stride,
+            format_version: rows.format_version,
+            reserved: rows.reserved,
+        }
+    }
+}
+
+#[cfg(test)]
+fn frozen_reverse_supertransition_span_start(
+    storage: &FrozenReverseSupertransitionStorageV1,
+    haystack: &[u8],
+    window_start: usize,
+    selected_end: usize,
+) -> Option<usize> {
+    if !storage.is_valid() || window_start > selected_end || selected_end > haystack.len() {
+        return None;
+    }
+    let descriptor = *storage.descriptor;
+    let class_count = usize::try_from(descriptor.class_count).ok()?;
+    let block_cells = usize::try_from(descriptor.block_cells).ok()?;
+    let mut block = usize::try_from(descriptor.initial_block).ok()?;
+    let mut cursor = selected_end;
+    let mut candidate = None;
+
+    if descriptor.format_version == FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION {
+        let (quad, tail3, tail2, tail1, _, total, _) =
+            frozen_reverse_quad_rows_v14_geometry(
+                usize::try_from(descriptor.state_count).ok()?,
+                class_count,
+            )?;
+        while cursor.checked_sub(window_start)? >= 4 {
+            let block_low = cursor.checked_sub(4)?;
+            let mut key = 0usize;
+            for &byte in haystack.get(block_low..cursor)?.iter().rev() {
+                let class = usize::from(*descriptor.class_map.get(usize::from(byte))?);
+                key = key.checked_mul(class_count)?.checked_add(class)?;
+            }
+            let cell = *storage.rows.get(block.checked_add(key)?)?;
+            cursor = block_low;
+            if cell & DYNAMIC_NATIVE_ROWS_V14_ANY_ACCEPT_MASK != 0 {
+                let distance = usize::from(
+                    (cell & DYNAMIC_NATIVE_ROWS_V14_ACCEPT_DISTANCE_MASK) >> 13,
+                );
+                candidate = cursor.checked_add(distance);
+            }
+            let token = cell & DYNAMIC_NATIVE_ROWS_V14_NEXT_BLOCK_TOKEN_MASK;
+            if token == 0 {
+                return candidate;
+            }
+            block = usize::from(token).checked_sub(1)?;
+            if block >= total || !block.is_multiple_of(block_cells) {
+                return None;
+            }
+        }
+        let remaining = cursor.checked_sub(window_start)?;
+        if remaining != 0 {
+            let (section_offset, section_cells) = match remaining {
+                1 => (quad.checked_add(tail3)?.checked_add(tail2)?, tail1),
+                2 => (quad.checked_add(tail3)?, tail2),
+                3 => (quad, tail3),
+                _ => return None,
+            };
+            let block_low = cursor.checked_sub(remaining)?;
+            let mut key = 0usize;
+            for &byte in haystack.get(block_low..cursor)?.iter().rev() {
+                let class = usize::from(*descriptor.class_map.get(usize::from(byte))?);
+                key = key.checked_mul(class_count)?.checked_add(class)?;
+            }
+            if key >= section_cells {
+                return None;
+            }
+            let cell = *storage
+                .rows
+                .get(block.checked_add(section_offset)?.checked_add(key)?)?;
+            cursor = block_low;
+            if cell & DYNAMIC_NATIVE_ROWS_V14_ANY_ACCEPT_MASK != 0 {
+                let distance = usize::from(
+                    (cell & DYNAMIC_NATIVE_ROWS_V14_ACCEPT_DISTANCE_MASK) >> 13,
+                );
+                candidate = cursor.checked_add(distance);
+            }
+        }
+        return candidate;
+    }
+
+    let (pair_cells, _, total, _) = frozen_pair_rows_v13_geometry(
+        usize::try_from(descriptor.state_count).ok()?,
+        class_count,
+    )?;
+    while cursor.checked_sub(window_start)? >= 2 {
+        let block_low = cursor.checked_sub(2)?;
+        let high = usize::from(*haystack.get(block_low.checked_add(1)?)?);
+        let low = usize::from(*haystack.get(block_low)?);
+        let high_class = usize::from(*descriptor.class_map.get(high)?);
+        let low_class = usize::from(*descriptor.class_map.get(low)?);
+        let key = high_class
+            .checked_mul(class_count)?
+            .checked_add(low_class)?;
+        let cell = *storage.rows.get(block.checked_add(key)?)?;
+        cursor = block_low;
+        if cell & DYNAMIC_NATIVE_ROWS_V13_ANY_ACCEPT_MASK != 0 {
+            candidate = cursor.checked_add(usize::from(
+                cell & DYNAMIC_NATIVE_ROWS_V13_ACCEPT_BACK_ONE_MASK != 0,
+            ));
+        }
+        let token = cell & DYNAMIC_NATIVE_ROWS_V13_NEXT_BLOCK_TOKEN_MASK;
+        if token == 0 {
+            return candidate;
+        }
+        block = usize::from(token).checked_sub(1)?;
+        if block >= total || !block.is_multiple_of(block_cells) {
+            return None;
+        }
+    }
+    if cursor > window_start {
+        cursor = cursor.checked_sub(1)?;
+        let byte = usize::from(*haystack.get(cursor)?);
+        let class = usize::from(*descriptor.class_map.get(byte)?);
+        let accepts = *storage.rows.get(block.checked_add(pair_cells)?)?;
+        if accepts & (1_u16.checked_shl(u32::try_from(class).ok()?)?) != 0 {
+            candidate = Some(cursor);
+        }
+    }
+    candidate
+}
+
+#[cfg(test)]
+fn frozen_reverse_scalar_span_start(
+    source_rows: &[u32],
+    source_class_map: &[u8],
+    source_class_count: usize,
+    source_initial_row: usize,
+    haystack: &[u8],
+    window_start: usize,
+    selected_end: usize,
+) -> Option<usize> {
+    if source_class_map.len() != 256
+        || source_class_count == 0
+        || source_initial_row.checked_rem(source_class_count) != Some(0)
+        || source_rows.len().checked_rem(source_class_count) != Some(0)
+        || source_initial_row
+            .checked_add(source_class_count)
+            .is_none_or(|end| end > source_rows.len())
+        || window_start > selected_end
+        || selected_end > haystack.len()
+    {
+        return None;
+    }
+    let mut row = source_initial_row;
+    let mut cursor = selected_end;
+    let mut candidate = None;
+    while cursor > window_start {
+        cursor = cursor.checked_sub(1)?;
+        let class = usize::from(*source_class_map.get(usize::from(*haystack.get(cursor)?))?);
+        if class >= source_class_count {
+            return None;
+        }
+        let cell = *source_rows.get(row.checked_add(class)?)?;
+        if cell & DYNAMIC_NATIVE_ROWS_V1_ACCEPT_MASK != 0 {
+            candidate = Some(cursor);
+        }
+        let token = cell & DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK;
+        if token == 0 {
+            break;
+        }
+        row = usize::try_from(token.checked_sub(1)?).ok()?;
+        if row >= source_rows.len() || !row.is_multiple_of(source_class_count) {
+            return None;
+        }
+    }
+    candidate
 }
 
 /// V3 tail field offsets used by target-native lowering.
@@ -4617,6 +5275,70 @@ pub const FROZEN_DYNAMIC_ROWS_V6_LOOP_INDEX_LENGTH_OFFSET: usize =
 #[doc(hidden)]
 pub const FROZEN_DYNAMIC_ROWS_V6_LOOP_PLANS_OFFSET: usize =
     std::mem::offset_of!(FrozenDynamicRowsV6, loop_plans);
+/// Reverse-supertransition descriptor field offsets used by target-native lowering.
+#[doc(hidden)]
+pub(crate) const FROZEN_REVERSE_SUPERTRANSITION_V1_READY_SEAL_OFFSET: usize =
+    std::mem::offset_of!(FrozenReverseSupertransitionV1, ready_seal);
+#[doc(hidden)]
+pub(crate) const FROZEN_REVERSE_SUPERTRANSITION_V1_MAGIC_OFFSET: usize =
+    std::mem::offset_of!(FrozenReverseSupertransitionV1, magic);
+#[doc(hidden)]
+pub(crate) const FROZEN_REVERSE_SUPERTRANSITION_V1_ABI_VERSION_OFFSET: usize =
+    std::mem::offset_of!(FrozenReverseSupertransitionV1, abi_version);
+#[doc(hidden)]
+pub(crate) const FROZEN_REVERSE_SUPERTRANSITION_V1_ABI_VERSION_COMPLEMENT_OFFSET: usize =
+    std::mem::offset_of!(FrozenReverseSupertransitionV1, abi_version_complement);
+#[doc(hidden)]
+pub(crate) const FROZEN_REVERSE_SUPERTRANSITION_V1_DESCRIPTOR_BYTES_OFFSET: usize =
+    std::mem::offset_of!(FrozenReverseSupertransitionV1, descriptor_bytes);
+#[doc(hidden)]
+pub(crate) const FROZEN_REVERSE_SUPERTRANSITION_V1_ARTIFACT_IDENTITY_OFFSET: usize =
+    std::mem::offset_of!(FrozenReverseSupertransitionV1, artifact_identity);
+#[doc(hidden)]
+pub(crate) const FROZEN_REVERSE_SUPERTRANSITION_V1_ROWS_ADDRESS_OFFSET: usize =
+    std::mem::offset_of!(FrozenReverseSupertransitionV1, rows_address);
+#[doc(hidden)]
+pub(crate) const FROZEN_REVERSE_SUPERTRANSITION_V1_SOURCE_ROWS_ADDRESS_OFFSET: usize =
+    std::mem::offset_of!(FrozenReverseSupertransitionV1, source_rows_address);
+#[doc(hidden)]
+pub(crate) const FROZEN_REVERSE_SUPERTRANSITION_V1_CACHE_IDENTITY_OFFSET: usize =
+    std::mem::offset_of!(FrozenReverseSupertransitionV1, cache_identity);
+#[doc(hidden)]
+pub(crate) const FROZEN_REVERSE_SUPERTRANSITION_V1_COMPACT_LIVE_CELLS_OFFSET: usize =
+    std::mem::offset_of!(FrozenReverseSupertransitionV1, compact_live_cells);
+#[doc(hidden)]
+pub(crate) const FROZEN_REVERSE_SUPERTRANSITION_V1_SOURCE_LIVE_CELLS_OFFSET: usize =
+    std::mem::offset_of!(FrozenReverseSupertransitionV1, source_live_cells);
+#[doc(hidden)]
+pub(crate) const FROZEN_REVERSE_SUPERTRANSITION_V1_STATE_COUNT_OFFSET: usize =
+    std::mem::offset_of!(FrozenReverseSupertransitionV1, state_count);
+#[doc(hidden)]
+pub(crate) const FROZEN_REVERSE_SUPERTRANSITION_V1_CLASS_COUNT_OFFSET: usize =
+    std::mem::offset_of!(FrozenReverseSupertransitionV1, class_count);
+#[doc(hidden)]
+pub(crate) const FROZEN_REVERSE_SUPERTRANSITION_V1_BLOCK_CELLS_OFFSET: usize =
+    std::mem::offset_of!(FrozenReverseSupertransitionV1, block_cells);
+#[doc(hidden)]
+pub(crate) const FROZEN_REVERSE_SUPERTRANSITION_V1_INITIAL_BLOCK_OFFSET: usize =
+    std::mem::offset_of!(FrozenReverseSupertransitionV1, initial_block);
+#[doc(hidden)]
+pub(crate) const FROZEN_REVERSE_SUPERTRANSITION_V1_SOURCE_INITIAL_ROW_OFFSET: usize =
+    std::mem::offset_of!(FrozenReverseSupertransitionV1, source_initial_row);
+#[doc(hidden)]
+pub(crate) const FROZEN_REVERSE_SUPERTRANSITION_V1_SOURCE_ROW_STRIDE_OFFSET: usize =
+    std::mem::offset_of!(FrozenReverseSupertransitionV1, source_row_stride);
+#[doc(hidden)]
+pub(crate) const FROZEN_REVERSE_SUPERTRANSITION_V1_FORMAT_VERSION_OFFSET: usize =
+    std::mem::offset_of!(FrozenReverseSupertransitionV1, format_version);
+#[doc(hidden)]
+pub(crate) const FROZEN_REVERSE_SUPERTRANSITION_V1_RESERVED_OFFSET: usize =
+    std::mem::offset_of!(FrozenReverseSupertransitionV1, reserved);
+#[doc(hidden)]
+pub(crate) const FROZEN_REVERSE_SUPERTRANSITION_V1_CLASS_MAP_OFFSET: usize =
+    std::mem::offset_of!(FrozenReverseSupertransitionV1, class_map);
+#[doc(hidden)]
+pub(crate) const FROZEN_REVERSE_SUPERTRANSITION_V1_BYTES: usize =
+    std::mem::size_of::<FrozenReverseSupertransitionV1>();
 #[doc(hidden)]
 pub const FROZEN_COMPACT_LOOP_PLAN_V1_BYTES: usize =
     std::mem::size_of::<FrozenCompactLoopPlanV1>();
@@ -4748,6 +5470,39 @@ const _: () = {
             == FROZEN_PREPARED_HEADER_V3_DYNAMIC_ROWS_OFFSET
     );
     assert!(FROZEN_PREPARED_HEADER_V14_BYTES == FROZEN_PREPARED_HEADER_V3_BYTES);
+    assert!(FROZEN_PREPARED_HEADER_V1_FLAG_REVERSE_SUPERTRANSITION.count_ones() == 1);
+    assert!(
+        FROZEN_PREPARED_HEADER_V1_FLAG_REVERSE_SUPERTRANSITION
+            > FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V14
+    );
+    assert!(FROZEN_REVERSE_SUPERTRANSITION_V1_READY_SEAL_OFFSET == 0);
+    if cfg!(target_pointer_width = "64") {
+        assert!(FROZEN_REVERSE_SUPERTRANSITION_V1_MAGIC_OFFSET == 8);
+        assert!(FROZEN_REVERSE_SUPERTRANSITION_V1_ABI_VERSION_OFFSET == 16);
+        assert!(FROZEN_REVERSE_SUPERTRANSITION_V1_ABI_VERSION_COMPLEMENT_OFFSET == 20);
+        assert!(FROZEN_REVERSE_SUPERTRANSITION_V1_DESCRIPTOR_BYTES_OFFSET == 24);
+        assert!(FROZEN_REVERSE_SUPERTRANSITION_V1_ARTIFACT_IDENTITY_OFFSET == 32);
+        assert!(FROZEN_REVERSE_SUPERTRANSITION_V1_ROWS_ADDRESS_OFFSET == 64);
+        assert!(FROZEN_REVERSE_SUPERTRANSITION_V1_SOURCE_ROWS_ADDRESS_OFFSET == 72);
+        assert!(FROZEN_REVERSE_SUPERTRANSITION_V1_CACHE_IDENTITY_OFFSET == 80);
+        assert!(FROZEN_REVERSE_SUPERTRANSITION_V1_COMPACT_LIVE_CELLS_OFFSET == 88);
+        assert!(FROZEN_REVERSE_SUPERTRANSITION_V1_SOURCE_LIVE_CELLS_OFFSET == 96);
+        assert!(FROZEN_REVERSE_SUPERTRANSITION_V1_STATE_COUNT_OFFSET == 104);
+        assert!(FROZEN_REVERSE_SUPERTRANSITION_V1_CLASS_COUNT_OFFSET == 108);
+        assert!(FROZEN_REVERSE_SUPERTRANSITION_V1_BLOCK_CELLS_OFFSET == 112);
+        assert!(FROZEN_REVERSE_SUPERTRANSITION_V1_INITIAL_BLOCK_OFFSET == 116);
+        assert!(FROZEN_REVERSE_SUPERTRANSITION_V1_SOURCE_INITIAL_ROW_OFFSET == 120);
+        assert!(FROZEN_REVERSE_SUPERTRANSITION_V1_SOURCE_ROW_STRIDE_OFFSET == 124);
+        assert!(FROZEN_REVERSE_SUPERTRANSITION_V1_FORMAT_VERSION_OFFSET == 128);
+        assert!(FROZEN_REVERSE_SUPERTRANSITION_V1_RESERVED_OFFSET == 132);
+        assert!(FROZEN_REVERSE_SUPERTRANSITION_V1_CLASS_MAP_OFFSET == 136);
+        assert!(FROZEN_REVERSE_SUPERTRANSITION_V1_BYTES == 392);
+    } else {
+        assert!(
+            FROZEN_REVERSE_SUPERTRANSITION_V1_CLASS_MAP_OFFSET + 256
+                <= FROZEN_REVERSE_SUPERTRANSITION_V1_BYTES
+        );
+    }
     assert!(
         FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V4
             != FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3
@@ -4961,6 +5716,7 @@ const _: () = {
     assert!(std::mem::size_of::<FrozenDynamicRowsV6>() == 280);
     assert!(FROZEN_PREPARED_HEADER_V6_BYTES == 664);
     assert!(FROZEN_PREPARED_HEADER_V7_BYTES == 664);
+    assert!(FROZEN_REVERSE_SUPERTRANSITION_V1_BYTES == 392);
     assert!(FROZEN_PREPARED_HEADER_V8_BYTES == 448);
     assert!(FROZEN_PREPARED_HEADER_V9_BYTES == 448);
     assert!(FROZEN_PREPARED_HEADER_V10_BYTES == 448);
@@ -5081,7 +5837,7 @@ impl FrozenPreparedHeaderV3 {
         if !self.v1.is_active() || self.v1.header_bytes != FROZEN_PREPARED_HEADER_V3_BYTES {
             return false;
         }
-        match self.v1.flags {
+        match frozen_prepared_header_base_flags(self.v1.flags) {
             FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3 => {
                 self.dynamic_rows_v3.format_version == FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION
                     && self.dynamic_rows_v3.ready_seal == FROZEN_PREPARED_HEADER_V3_READY_SEAL
@@ -5187,7 +5943,7 @@ impl FrozenPreparedHeaderV5 {
         if !self.v1.is_active() {
             return false;
         }
-        match self.v1.flags {
+        match frozen_prepared_header_base_flags(self.v1.flags) {
             FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3 => {
                 self.v1.header_bytes == FROZEN_PREPARED_HEADER_V3_BYTES
                     && self.dynamic_rows_v5.format_version
@@ -5201,7 +5957,8 @@ impl FrozenPreparedHeaderV5 {
                     && self.dynamic_rows_v5.ready_seal == FROZEN_PREPARED_HEADER_V4_READY_SEAL
             }
             FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V5 => {
-                self.v1.header_bytes == FROZEN_PREPARED_HEADER_V5_BYTES
+                !frozen_prepared_header_has_reverse_supertransition(self.v1.flags)
+                    && self.v1.header_bytes == FROZEN_PREPARED_HEADER_V5_BYTES
                     && self.dynamic_rows_v5.format_version
                         == FROZEN_DYNAMIC_ROWS_V5_FORMAT_VERSION
                     && self.dynamic_rows_v5.ready_seal == FROZEN_PREPARED_HEADER_V5_READY_SEAL
@@ -5290,7 +6047,7 @@ impl FrozenPreparedHeaderV6 {
             return false;
         }
         let rows = &self.dynamic_rows_v6;
-        match self.v1.flags {
+        match frozen_prepared_header_base_flags(self.v1.flags) {
             FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3 => {
                 self.v1.header_bytes == FROZEN_PREPARED_HEADER_V3_BYTES
                     && rows.compact.format_version == FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION
@@ -5302,7 +6059,8 @@ impl FrozenPreparedHeaderV6 {
                     && rows.compact.ready_seal == FROZEN_PREPARED_HEADER_V4_READY_SEAL
             }
             FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V5 => {
-                self.v1.header_bytes == FROZEN_PREPARED_HEADER_V5_BYTES
+                !frozen_prepared_header_has_reverse_supertransition(self.v1.flags)
+                    && self.v1.header_bytes == FROZEN_PREPARED_HEADER_V5_BYTES
                     && rows.compact.format_version == FROZEN_DYNAMIC_ROWS_V5_FORMAT_VERSION
                     && rows.compact.ready_seal == FROZEN_PREPARED_HEADER_V5_READY_SEAL
                     && (rows.loop_plan_count ^ rows.reserved) == u32::MAX
@@ -5409,14 +6167,15 @@ impl FrozenPreparedHeaderV6 {
         owner: &'a FrozenDynamicRowsStorageV3,
         expected_artifact_identity: [u8; 32],
     ) -> Option<FrozenDynamicRowsSpanCapability<'a>> {
+        let base_flags = frozen_prepared_header_base_flags(self.v1.flags);
         if !self.has_dynamic_rows()
-            || self.v1.flags == FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V5
+            || base_flags == FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V5
             || self.v1.artifact_identity != expected_artifact_identity
             || owner.artifact_identity != expected_artifact_identity
         {
             return None;
         }
-        let owner_rows = match self.v1.flags {
+        let owner_rows = match base_flags {
             FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V6
             | FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V7 => {
                 owner.descriptor_v6?.compact
@@ -5435,6 +6194,9 @@ impl FrozenPreparedHeaderV6 {
         let mut published_rows = self.dynamic_rows_v6.compact;
         published_rows.ready_seal = 0;
         let reverse = owner.root_prefill_receipt.reverse?;
+        let reverse_supertransition = owner.reverse_supertransition_generation_key();
+        let expected_reverse_live = reverse_supertransition
+            .map_or(reverse.live_cells, |key| key.descriptor_address);
         if published_rows != owner_rows
             || self.v1.forward_rows_address != owner_rows.rows_address
             || self.v1.forward_live_cells != owner.live_cells()
@@ -5442,8 +6204,10 @@ impl FrozenPreparedHeaderV6 {
             || !reverse.is_valid()
             || reverse.cache_identity != owner_rows.cache_identity
             || self.v1.reverse_rows_address != reverse.rows_address
-            || self.v1.reverse_live_cells != reverse.live_cells
+            || self.v1.reverse_live_cells != expected_reverse_live
             || self.v1.reverse_initial_row != reverse.initial_row
+            || frozen_prepared_header_has_reverse_supertransition(self.v1.flags)
+                != reverse_supertransition.is_some()
         {
             return None;
         }
@@ -6048,7 +6812,7 @@ impl FrozenDynamicRowsStorageV3 {
     fn retained_partial_packed_bytes(&self) -> Option<usize> {
         let state_count = usize::try_from(self.descriptor.state_count).ok()?;
         let class_count = usize::try_from(self.descriptor.class_count).ok()?;
-        match self.effective_format_version() {
+        let forward_bytes = match self.effective_format_version() {
             FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION => {
                 frozen_pair_rows_v11_geometry(state_count, class_count)
                     .map(|(_, _, _, _, bytes)| bytes)
@@ -6062,7 +6826,38 @@ impl FrozenDynamicRowsStorageV3 {
                     .map(|(_, _, _, _, _, _, bytes)| bytes)
             }
             _ => None,
-        }
+        }?;
+        forward_bytes.checked_add(
+            self.reverse_supertransition
+                .as_ref()
+                .map_or(0, |reverse| reverse.resident_bytes),
+        )
+    }
+
+    fn reverse_supertransition_generation_key(
+        &self,
+    ) -> Option<FrozenReverseSupertransitionGenerationKey> {
+        self.reverse_supertransition
+            .as_ref()
+            .map(FrozenReverseSupertransitionStorageV1::generation_key)
+    }
+
+    fn reverse_supertransition_is_valid(&self) -> bool {
+        let Some(reverse) = self.reverse_supertransition.as_ref() else {
+            return true;
+        };
+        let Some(source) = self.root_prefill_receipt.reverse else {
+            return false;
+        };
+        let rows = *reverse.descriptor;
+        reverse.is_valid()
+            && rows.artifact_identity == self.artifact_identity
+            && rows.source_rows_address == source.rows_address
+            && rows.source_live_cells == source.live_cells
+            && rows.source_initial_row == source.initial_row
+            && rows.source_row_stride == source.row_stride
+            && rows.cache_identity == source.cache_identity
+            && rows.cache_identity == self.descriptor.cache_identity
     }
 
     /// Return the completed live-K0 receipt from which this immutable owner
@@ -6189,7 +6984,13 @@ impl FrozenDynamicRowsStorageV3 {
                     token > usize::from(DYNAMIC_NATIVE_ROWS_V14_NEXT_BLOCK_TOKEN_MASK)
                 })
         } else if format.is_dense_pair_supertransition() {
-            live_cells > usize::from(DYNAMIC_NATIVE_ROWS_V13_NEXT_BLOCK_TOKEN_MASK)
+            state_count
+                .checked_sub(1)
+                .and_then(|last_state| last_state.checked_mul(physical_cells))
+                .and_then(|last_block| last_block.checked_add(1))
+                .is_none_or(|token| {
+                    token > usize::from(DYNAMIC_NATIVE_ROWS_V13_NEXT_BLOCK_TOKEN_MASK)
+                })
         } else if format.is_pair_supertransition() {
             live_cells
                 > usize::try_from(DYNAMIC_NATIVE_ROWS_V11_NEXT_BLOCK_TOKEN_MASK)
@@ -6254,6 +7055,7 @@ impl FrozenDynamicRowsStorageV3 {
                 .is_some_and(|reverse| {
                     !reverse.is_valid() || reverse.cache_identity != rows.cache_identity
                 })
+            || !self.reverse_supertransition_is_valid()
             || rows.ready_seal != 0
             || owner_is_invalid
             || rows.cache_identity == 0
@@ -11661,7 +12463,7 @@ impl CompiledProgram {
         header: &FrozenPreparedHeaderV6,
     ) -> Option<FrozenPreparedHeaderOwnerGenerationKey> {
         let published_format = header.compiler_private_dynamic_rows_format_version()?;
-        let (header_flag, header_bytes, ready_seal) =
+        let (base_header_flag, header_bytes, ready_seal) =
             frozen_prepared_header_publication_shape(published_format)?;
         let owner_format = owner.effective_format_version();
         let owner_compact = match published_format {
@@ -11683,6 +12485,13 @@ impl CompiledProgram {
         let variable_span = self.output == OutputContract::Span
             && self.exact_match_width.is_none();
         let reverse = owner.root_prefill_receipt.reverse;
+        let reverse_supertransition = owner.reverse_supertransition_generation_key();
+        let header_flag = base_header_flag
+            | if reverse_supertransition.is_some() {
+                FROZEN_PREPARED_HEADER_V1_FLAG_REVERSE_SUPERTRANSITION
+            } else {
+                0
+            };
         let expected_reverse = reverse.unwrap_or(FrozenRootReverseProjection {
             rows_address: 0,
             live_cells: 0,
@@ -11690,6 +12499,8 @@ impl CompiledProgram {
             initial_row: FROZEN_PREPARED_HEADER_V1_NO_REVERSE_ROW,
             cache_identity: 0,
         });
+        let expected_reverse_live = reverse_supertransition
+            .map_or(expected_reverse.live_cells, |key| key.descriptor_address);
         if workspace.identity.instance != self.identity.instance
             || owner.program_instance != self.identity.instance
             || owner.artifact_identity != self.identity.artifact
@@ -11708,8 +12519,16 @@ impl CompiledProgram {
             || reverse.is_some() != variable_span
             || reverse.is_some_and(|projection| !projection.is_valid())
             || header.v1.reverse_rows_address != expected_reverse.rows_address
-            || header.v1.reverse_live_cells != expected_reverse.live_cells
+            || header.v1.reverse_live_cells != expected_reverse_live
             || header.v1.reverse_initial_row != expected_reverse.initial_row
+            || reverse_supertransition.is_some_and(|key| {
+                reverse.is_none()
+                    || key.source_rows_address != expected_reverse.rows_address
+                    || key.source_live_cells != expected_reverse.live_cells
+                    || key.source_initial_row != expected_reverse.initial_row
+                    || key.source_row_stride != expected_reverse.row_stride
+                    || key.cache_identity != expected_reverse.cache_identity
+            })
         {
             return None;
         }
@@ -11753,6 +12572,7 @@ impl CompiledProgram {
             loop_index_address: header.dynamic_rows_v6.loop_index_address,
             loop_index_length: header.dynamic_rows_v6.loop_index_length,
             reverse,
+            reverse_supertransition,
         })
     }
 
@@ -11764,8 +12584,14 @@ impl CompiledProgram {
         key: &'key FrozenPreparedHeaderOwnerGenerationKey,
         expected_format: u32,
     ) -> Option<FrozenPreparedHeaderRearm<'header, 'owner, 'key>> {
-        let (expected_flag, expected_bytes, expected_ready_seal) =
+        let (base_expected_flag, expected_bytes, expected_ready_seal) =
             frozen_prepared_header_publication_shape(expected_format)?;
+        let expected_flag = base_expected_flag
+            | if key.reverse_supertransition.is_some() {
+                FROZEN_PREPARED_HEADER_V1_FLAG_REVERSE_SUPERTRANSITION
+            } else {
+                0
+            };
         let owner_format = owner.effective_format_version();
         let owner_compact = match expected_format {
             FROZEN_DYNAMIC_ROWS_V5_FORMAT_VERSION => {
@@ -11788,6 +12614,11 @@ impl CompiledProgram {
             initial_row: FROZEN_PREPARED_HEADER_V1_NO_REVERSE_ROW,
             cache_identity: 0,
         });
+        let expected_reverse_live = key
+            .reverse_supertransition
+            .map_or(expected_reverse.live_cells, |reverse| {
+                reverse.descriptor_address
+            });
         if key.program_instance != self.identity.instance
             || key.artifact_identity != self.identity.artifact
             || key.root_prefill_receipt.program_instance != self.identity.instance
@@ -11800,6 +12631,7 @@ impl CompiledProgram {
             || key.ready_seal != expected_ready_seal
             || key.root_prefill_receipt != owner.root_prefill_receipt
             || key.reverse != owner.root_prefill_receipt.reverse
+            || key.reverse_supertransition != owner.reverse_supertransition_generation_key()
             || workspace.identity.instance != self.identity.instance
             || owner.program_instance != self.identity.instance
             || owner.artifact_identity != self.identity.artifact
@@ -11821,7 +12653,7 @@ impl CompiledProgram {
             || header.v1.accept_mask != key.header_accept_mask
             || header.v1.next_row_token_mask != key.header_next_row_token_mask
             || header.v1.reverse_rows_address != expected_reverse.rows_address
-            || header.v1.reverse_live_cells != expected_reverse.live_cells
+            || header.v1.reverse_live_cells != expected_reverse_live
             || header.v1.reverse_initial_row != expected_reverse.initial_row
             || header.dynamic_rows_v6.loop_plan_count != key.loop_plan_count
             || header.dynamic_rows_v6.reserved != key.loop_reserved
@@ -12028,6 +12860,54 @@ impl CompiledProgram {
             k0: receipt,
             reverse: reverse_projection,
         };
+        let retained_map_reserve_bytes = if static_continuation_only
+            && fully_prefilled_fallback.is_some()
+        {
+            self.partial_dfa()
+                .and_then(|partial| {
+                    partial
+                        .resume_frontier_count()
+                        .checked_mul(core::mem::size_of::<u32>())
+                })
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        // Build reverse acceleration only after the winning forward format is
+        // known. V11/V13/V14 may also retain the status-8 frontier map and
+        // therefore reserve it first; generic formats cannot consume that map
+        // and may use the otherwise stranded bytes. A reverse decline never
+        // rejects or changes the already selected forward owner.
+        let build_reverse_supertransition_for_selected_forward =
+            |forward_resident_bytes: usize,
+             selected_retained_map_reserve_bytes: usize|
+             -> Option<FrozenReverseSupertransitionStorageV1> {
+                if !variable_span_recovery {
+                    return None;
+                }
+                let reverse_budget = retained_bytes
+                    .min(max_packed_bytes)
+                    .checked_sub(
+                        forward_resident_bytes
+                            .checked_add(selected_retained_map_reserve_bytes)?,
+                    )?;
+                let candidate = build_frozen_reverse_supertransition_v1(
+                    full.reverse_rows()?,
+                    full.class_map(),
+                    source_class_count,
+                    full.reverse_initial_row()?,
+                    full.cache_identity(),
+                    self.identity.artifact,
+                    reverse_budget,
+                );
+                retain_frozen_reverse_supertransition_v1(
+                    candidate,
+                    forward_resident_bytes,
+                    selected_retained_map_reserve_bytes,
+                    retained_bytes,
+                    max_packed_bytes,
+                )
+            };
 
         // The graph alphabet is conservative for this exact reachable K0
         // projection. Once every source cell and destination has been
@@ -12059,7 +12939,6 @@ impl CompiledProgram {
         if mapped_bytes > former_bytes || mapped_bytes > max_packed_bytes {
             return None;
         }
-
         // Copy only independently reauthenticated, nonroot K0 loop proofs.
         // Perform this arbitration against the original K0 row geometry
         // before an optional raw-byte expansion changes the compact stride.
@@ -12187,7 +13066,7 @@ impl CompiledProgram {
                 learned_loop_states: [u32::MAX; 4],
                 format_version: FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION,
             };
-            let storage = FrozenDynamicRowsStorageV3 {
+            let mut storage = FrozenDynamicRowsStorageV3 {
                 program_instance: self.identity.instance,
                 artifact_identity: self.identity.artifact,
                 root_prefill_receipt,
@@ -12202,10 +13081,19 @@ impl CompiledProgram {
                 loop_index: Box::default(),
                 loop_scanners: Box::default(),
                 descriptor_v6: None,
+                reverse_supertransition: None,
             };
             if storage.descriptor_is_valid_for(self.identity)
                 && storage.descriptor_v6_is_valid_for(self.identity)
             {
+                storage.reverse_supertransition =
+                    build_reverse_supertransition_for_selected_forward(
+                        quad_bytes,
+                        retained_map_reserve_bytes,
+                    );
+                if !storage.descriptor_is_valid_for(self.identity) {
+                    storage.reverse_supertransition = None;
+                }
                 return Some(storage);
             }
         }
@@ -12247,7 +13135,7 @@ impl CompiledProgram {
                 learned_loop_states: [u32::MAX; 4],
                 format_version: FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION,
             };
-            let storage = FrozenDynamicRowsStorageV3 {
+            let mut storage = FrozenDynamicRowsStorageV3 {
                 program_instance: self.identity.instance,
                 artifact_identity: self.identity.artifact,
                 root_prefill_receipt,
@@ -12262,10 +13150,19 @@ impl CompiledProgram {
                 loop_index: Box::default(),
                 loop_scanners: Box::default(),
                 descriptor_v6: None,
+                reverse_supertransition: None,
             };
             if storage.descriptor_is_valid_for(self.identity)
                 && storage.descriptor_v6_is_valid_for(self.identity)
             {
+                storage.reverse_supertransition =
+                    build_reverse_supertransition_for_selected_forward(
+                        pair_bytes,
+                        retained_map_reserve_bytes,
+                    );
+                if !storage.descriptor_is_valid_for(self.identity) {
+                    storage.reverse_supertransition = None;
+                }
                 return Some(storage);
             }
         }
@@ -12308,7 +13205,7 @@ impl CompiledProgram {
                 learned_loop_states: [u32::MAX; 4],
                 format_version: FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION,
             };
-            let storage = FrozenDynamicRowsStorageV3 {
+            let mut storage = FrozenDynamicRowsStorageV3 {
                 program_instance: self.identity.instance,
                 artifact_identity: self.identity.artifact,
                 root_prefill_receipt,
@@ -12323,10 +13220,19 @@ impl CompiledProgram {
                 loop_index: Box::default(),
                 loop_scanners: Box::default(),
                 descriptor_v6: None,
+                reverse_supertransition: None,
             };
             if storage.descriptor_is_valid_for(self.identity)
                 && storage.descriptor_v6_is_valid_for(self.identity)
             {
+                storage.reverse_supertransition =
+                    build_reverse_supertransition_for_selected_forward(
+                        pair_bytes,
+                        retained_map_reserve_bytes,
+                    );
+                if !storage.descriptor_is_valid_for(self.identity) {
+                    storage.reverse_supertransition = None;
+                }
                 return Some(storage);
             }
         }
@@ -12577,7 +13483,12 @@ impl CompiledProgram {
                 loop_plans,
             }
         });
-        let storage = FrozenDynamicRowsStorageV3 {
+        let forward_resident_bytes = packed_bytes.checked_add(if retain_loop_extension {
+            loop_payload_bytes
+        } else {
+            0
+        })?;
+        let mut storage = FrozenDynamicRowsStorageV3 {
             program_instance: self.identity.instance,
             artifact_identity: self.identity.artifact,
             root_prefill_receipt,
@@ -12592,10 +13503,21 @@ impl CompiledProgram {
             loop_index,
             loop_scanners,
             descriptor_v6,
+            reverse_supertransition: None,
         };
-        (storage.descriptor_is_valid_for(self.identity)
-            && storage.descriptor_v6_is_valid_for(self.identity))
-        .then_some(storage)
+        if !storage.descriptor_is_valid_for(self.identity)
+            || !storage.descriptor_v6_is_valid_for(self.identity)
+        {
+            return None;
+        }
+        storage.reverse_supertransition = build_reverse_supertransition_for_selected_forward(
+            forward_resident_bytes,
+            0,
+        );
+        if !storage.descriptor_is_valid_for(self.identity) {
+            storage.reverse_supertransition = None;
+        }
+        Some(storage)
     }
 
     /// Publish either the existing retained V1 projection or an additive
@@ -12666,6 +13588,13 @@ impl CompiledProgram {
             }
             None
         };
+        let reverse_supertransition = storage.reverse_supertransition_generation_key();
+        if reverse_supertransition.is_some() != storage.reverse_supertransition.is_some()
+            || reverse_supertransition.is_some() && !storage.reverse_supertransition_is_valid()
+            || reverse_supertransition.is_some() && reverse_projection.is_none()
+        {
+            return header;
+        }
         if storage.root_prefill_receipt.program_instance != self.identity.instance {
             return header;
         }
@@ -12761,7 +13690,12 @@ impl CompiledProgram {
         };
 
         header.dynamic_rows_v3 = rows;
-        header.v1.flags = format.header_flag();
+        header.v1.flags = format.header_flag()
+            | if reverse_supertransition.is_some() {
+                FROZEN_PREPARED_HEADER_V1_FLAG_REVERSE_SUPERTRANSITION
+            } else {
+                0
+            };
         header.v1.header_bytes = match format {
             FrozenCompactRowsFormat::StateOrdinalV3 => FROZEN_PREPARED_HEADER_V3_BYTES,
             FrozenCompactRowsFormat::CellOffsetV4 => FROZEN_PREPARED_HEADER_V4_BYTES,
@@ -12790,7 +13724,8 @@ impl CompiledProgram {
         header.v1.forward_initial_row = 0;
         if let Some(reverse) = reverse_projection {
             header.v1.reverse_rows_address = reverse.rows_address;
-            header.v1.reverse_live_cells = reverse.live_cells;
+            header.v1.reverse_live_cells = reverse_supertransition
+                .map_or(reverse.live_cells, |key| key.descriptor_address);
             header.v1.reverse_initial_row = reverse.initial_row;
         }
         if format.is_quad_supertransition() {
@@ -12948,7 +13883,8 @@ impl CompiledProgram {
         // V5 and retained V1 publications are final choices. Inactive receipt
         // declines must likewise remain inactive instead of consulting a
         // separately supplied compact owner.
-        if header.v1.flags == FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V5
+        if frozen_prepared_header_base_flags(header.v1.flags)
+            == FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V5
             || receipt.is_some()
         {
             return header;
@@ -12977,7 +13913,7 @@ impl CompiledProgram {
         };
         if !header.v1.is_active()
             || !matches!(
-                header.v1.flags,
+                frozen_prepared_header_base_flags(header.v1.flags),
                 FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V3
                     | FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V4
             )
@@ -12985,7 +13921,12 @@ impl CompiledProgram {
             return header;
         }
 
-        header.v1.flags = flag;
+        header.v1.flags = flag
+            | if frozen_prepared_header_has_reverse_supertransition(header.v1.flags) {
+                FROZEN_PREPARED_HEADER_V1_FLAG_REVERSE_SUPERTRANSITION
+            } else {
+                0
+            };
         header.v1.header_bytes = FROZEN_PREPARED_HEADER_V6_BYTES;
         header.dynamic_rows_v6 = rows;
         // All common mirrors were published by the lower-generation path.
@@ -20920,6 +21861,7 @@ mod tests {
             loop_index: Box::default(),
             loop_scanners: Box::default(),
             descriptor_v6: None,
+            reverse_supertransition: None,
         };
         assert!(rows.descriptor_is_valid_for(compiled.identity));
         assert!(rows.descriptor_v6_is_valid_for(compiled.identity));
@@ -22263,8 +23205,32 @@ mod tests {
             storage.class_map.as_ptr().expose_provenance(),
             live_reverse.rows_address
         );
-
         let identity = compiled.artifact_identity();
+        let reverse_supertransition = storage
+            .reverse_supertransition_generation_key()
+            .expect("independently compacted reverse owner");
+        assert_eq!(reverse_supertransition.source_rows_address, live_reverse.rows_address);
+        assert_eq!(reverse_supertransition.source_live_cells, live_reverse.live_cells);
+
+        // A valid owner without the optional modifier preserves the original
+        // @72 pointer/@88 live-cell ABI and remains independently admissible.
+        let retained_reverse_supertransition = storage.reverse_supertransition.take();
+        let base_header = compiled.compiler_private_frozen_prepared_header_v6(
+            &workspace,
+            None,
+            Some(&storage),
+        );
+        assert!(base_header.has_dynamic_rows());
+        assert!(!frozen_prepared_header_has_reverse_supertransition(
+            base_header.v1.flags
+        ));
+        assert_eq!(base_header.v1.reverse_rows_address, live_reverse.rows_address);
+        assert_eq!(base_header.v1.reverse_live_cells, live_reverse.live_cells);
+        assert!(base_header
+            .compiler_private_active_span_capability(&storage, identity)
+            .is_some());
+        storage.reverse_supertransition = retained_reverse_supertransition;
+
         let authenticated_reverse = storage.root_prefill_receipt.reverse;
         storage
             .root_prefill_receipt
@@ -22282,23 +23248,54 @@ mod tests {
             "publication must reauthenticate exact live reverse geometry"
         );
         storage.root_prefill_receipt.reverse = authenticated_reverse;
+        let valid_reverse_descriptor = *storage
+            .reverse_supertransition
+            .as_ref()
+            .unwrap()
+            .descriptor;
+        storage
+            .reverse_supertransition
+            .as_mut()
+            .unwrap()
+            .descriptor
+            .magic ^= 1;
+        let rejected_descriptor = compiled.compiler_private_frozen_prepared_header_v6(
+            &workspace,
+            None,
+            Some(&storage),
+        );
+        assert!(
+            !rejected_descriptor.is_active(),
+            "publication must reject a corrupted reverse descriptor"
+        );
+        *storage
+            .reverse_supertransition
+            .as_mut()
+            .unwrap()
+            .descriptor = valid_reverse_descriptor;
         let mut header = compiled.compiler_private_frozen_prepared_header_v6(
             &workspace,
             None,
             Some(&storage),
         );
         assert!(header.has_dynamic_rows());
+        assert!(frozen_prepared_header_has_reverse_supertransition(
+            header.v1.flags
+        ));
         assert_eq!(header.v1.reverse_rows_address, live_reverse.rows_address);
-        assert_eq!(header.v1.reverse_live_cells, live_reverse.live_cells);
+        assert_eq!(
+            header.v1.reverse_live_cells,
+            reverse_supertransition.descriptor_address
+        );
         assert_eq!(header.v1.reverse_initial_row, live_reverse.initial_row);
-        header.v1.reverse_live_cells = live_reverse.live_cells.saturating_sub(1);
+        header.v1.reverse_live_cells = reverse_supertransition.descriptor_address.wrapping_add(8);
         assert!(
             header
                 .compiler_private_active_span_capability(&storage, identity)
                 .is_none(),
             "post-publication geometry corruption must revoke Span authority"
         );
-        header.v1.reverse_live_cells = live_reverse.live_cells;
+        header.v1.reverse_live_cells = reverse_supertransition.descriptor_address;
 
         let mut haystack = vec![b'!'; DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES + 8];
         haystack[3..5].copy_from_slice(b"bq");
@@ -30674,6 +31671,7 @@ mod tests {
             loop_index: Box::default(),
             loop_scanners: Box::default(),
             descriptor_v6: None,
+            reverse_supertransition: None,
         };
         assert!(storage.descriptor_is_valid_for(compiled.identity));
         let header = compiled.compiler_private_frozen_prepared_header_v3(
@@ -30776,6 +31774,216 @@ mod tests {
     }
 
     #[test]
+    fn independently_compacted_reverse_supertransitions_match_scalar_oracle() {
+        for (class_count, expected_format, maximum_length) in [
+            (1_usize, FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION, 12_u32),
+            (2_usize, FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION, 9_u32),
+            (5_usize, FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION, 6_u32),
+        ] {
+            let state_count = class_count + 1;
+            let source_initial_state = state_count - 1;
+            let source_initial_row = source_initial_state * class_count;
+            let source_class_map: [u8; 256] = core::array::from_fn(|byte| {
+                u8::try_from(byte % class_count).expect("test class fits u8")
+            });
+            let mut source_rows = Vec::with_capacity(state_count * class_count);
+            for state in 0..state_count {
+                for class in 0..class_count {
+                    // Row zero gives every class a distinct destination, so
+                    // independent reverse coalescence must retain the exact C
+                    // columns. Other rows exercise accepting, dead, and live
+                    // edges without relying on any regex/source identity.
+                    let destination = if state == 0 {
+                        Some(class)
+                    } else if (state * 5 + class * 3) % 11 == 0 {
+                        None
+                    } else {
+                        Some((state * 3 + class + 1) % state_count)
+                    };
+                    let accepts = (state * 7 + class * 5 + 1) % 4 == 0;
+                    source_rows.push(frozen_test_source_cell(
+                        destination,
+                        class_count,
+                        accepts,
+                        0,
+                    ));
+                }
+            }
+            let mut storage = build_frozen_reverse_supertransition_v1(
+                &source_rows,
+                &source_class_map,
+                class_count,
+                u32::try_from(source_initial_row).unwrap(),
+                17,
+                [0x5a; 32],
+                usize::MAX,
+            )
+            .expect("bounded reverse supertransition owner");
+            assert!(storage.is_valid());
+            assert_eq!(storage.descriptor.format_version, expected_format);
+            assert_eq!(
+                usize::try_from(storage.descriptor.class_count).unwrap(),
+                class_count
+            );
+            assert_eq!(
+                storage.resident_bytes,
+                storage.rows.len() * core::mem::size_of::<u16>()
+                    + FROZEN_REVERSE_SUPERTRANSITION_V1_BYTES
+            );
+            assert!(build_frozen_reverse_supertransition_v1(
+                &source_rows,
+                &source_class_map,
+                class_count,
+                u32::try_from(source_initial_row).unwrap(),
+                17,
+                [0x5a; 32],
+                storage.resident_bytes,
+            )
+            .is_some());
+            let one_short_build = build_frozen_reverse_supertransition_v1(
+                &source_rows,
+                &source_class_map,
+                class_count,
+                u32::try_from(source_initial_row).unwrap(),
+                17,
+                [0x5a; 32],
+                storage.resident_bytes - 1,
+            );
+            if let Some(downgraded) = one_short_build {
+                assert_ne!(
+                    downgraded.descriptor.format_version,
+                    storage.descriptor.format_version,
+                    "one byte short must not retain the same reverse candidate"
+                );
+                assert!(downgraded.resident_bytes < storage.resident_bytes);
+            }
+            let forward_bytes = 37usize;
+            let retained_map_reserve_bytes = 20usize;
+            let generic_combined_bytes = forward_bytes
+                .checked_add(storage.resident_bytes)
+                .unwrap();
+            let exact_generic = build_frozen_reverse_supertransition_v1(
+                &source_rows,
+                &source_class_map,
+                class_count,
+                u32::try_from(source_initial_row).unwrap(),
+                17,
+                [0x5a; 32],
+                storage.resident_bytes,
+            );
+            assert!(retain_frozen_reverse_supertransition_v1(
+                exact_generic,
+                forward_bytes,
+                0,
+                generic_combined_bytes,
+                generic_combined_bytes,
+            )
+            .is_some());
+            let one_short_generic = build_frozen_reverse_supertransition_v1(
+                &source_rows,
+                &source_class_map,
+                class_count,
+                u32::try_from(source_initial_row).unwrap(),
+                17,
+                [0x5a; 32],
+                storage.resident_bytes,
+            );
+            assert!(retain_frozen_reverse_supertransition_v1(
+                one_short_generic,
+                forward_bytes,
+                0,
+                generic_combined_bytes - 1,
+                generic_combined_bytes - 1,
+            )
+            .is_none());
+
+            let combined_bytes = forward_bytes
+                .checked_add(retained_map_reserve_bytes)
+                .and_then(|bytes| bytes.checked_add(storage.resident_bytes))
+                .unwrap();
+            let exact_combined = build_frozen_reverse_supertransition_v1(
+                &source_rows,
+                &source_class_map,
+                class_count,
+                u32::try_from(source_initial_row).unwrap(),
+                17,
+                [0x5a; 32],
+                storage.resident_bytes,
+            );
+            assert!(retain_frozen_reverse_supertransition_v1(
+                exact_combined,
+                forward_bytes,
+                retained_map_reserve_bytes,
+                combined_bytes,
+                combined_bytes,
+            )
+            .is_some());
+            let one_short_combined = build_frozen_reverse_supertransition_v1(
+                &source_rows,
+                &source_class_map,
+                class_count,
+                u32::try_from(source_initial_row).unwrap(),
+                17,
+                [0x5a; 32],
+                storage.resident_bytes,
+            );
+            assert!(retain_frozen_reverse_supertransition_v1(
+                one_short_combined,
+                forward_bytes,
+                retained_map_reserve_bytes,
+                combined_bytes - 1,
+                combined_bytes - 1,
+            )
+            .is_none());
+
+            for length in 0..=maximum_length {
+                let input_count = class_count.pow(length);
+                for mut input_code in 0..input_count {
+                    let mut haystack = vec![0xee, 0xdd];
+                    for _ in 0..length {
+                        haystack.push(u8::try_from(input_code % class_count).unwrap());
+                        input_code /= class_count;
+                    }
+                    haystack.extend_from_slice(&[0xcc, 0xbb]);
+                    let window_start = 2;
+                    let selected_end = window_start + usize::try_from(length).unwrap();
+                    assert_eq!(
+                        frozen_reverse_supertransition_span_start(
+                            &storage,
+                            &haystack,
+                            window_start,
+                            selected_end,
+                        ),
+                        frozen_reverse_scalar_span_start(
+                            &source_rows,
+                            &source_class_map,
+                            class_count,
+                            source_initial_row,
+                            &haystack,
+                            window_start,
+                            selected_end,
+                        ),
+                        "C={class_count}, input={:?}",
+                        &haystack[window_start..selected_end]
+                    );
+                }
+            }
+
+            let valid_descriptor = *storage.descriptor;
+            storage.descriptor.magic ^= 1;
+            assert!(!storage.is_valid(), "descriptor magic corruption");
+            *storage.descriptor = valid_descriptor;
+            storage.descriptor.source_live_cells += 1;
+            assert!(!storage.is_valid(), "source quotient corruption");
+            *storage.descriptor = valid_descriptor;
+            storage.descriptor.class_map[0] = u8::try_from(class_count).unwrap();
+            assert!(!storage.is_valid(), "reverse class-map corruption");
+            *storage.descriptor = valid_descriptor;
+            assert!(storage.is_valid());
+        }
+    }
+
+    #[test]
     #[allow(
         clippy::too_many_lines,
         reason = "the dense pair model exhausts every two-state transition graph and short binary input"
@@ -30788,7 +31996,11 @@ mod tests {
             frozen_pair_rows_v13_geometry(252, 8),
             Some((64, 65, 16_380, 33_016))
         );
-        assert!(frozen_pair_rows_v13_geometry(253, 8).is_none());
+        assert_eq!(
+            frozen_pair_rows_v13_geometry(253, 8),
+            Some((64, 65, 16_445, 33_146))
+        );
+        assert!(frozen_pair_rows_v13_geometry(254, 8).is_none());
 
         for class_count in FROZEN_PAIR_ROWS_V13_MIN_CLASSES..=FROZEN_PAIR_ROWS_V13_MAX_CLASSES {
             let block_cells = class_count * class_count + 1;
@@ -32592,6 +33804,7 @@ mod tests {
                 loop_index: Box::default(),
                 loop_scanners: Box::default(),
                 descriptor_v6: None,
+                reverse_supertransition: None,
             }
         };
         let storages = vec![
@@ -33799,6 +35012,7 @@ mod tests {
             loop_index: Box::default(),
             loop_scanners: Box::default(),
             descriptor_v6: None,
+            reverse_supertransition: None,
         };
         assert!(storage.descriptor_is_valid_for(compiled.identity));
         assert!(storage.descriptor_v6_is_valid_for(compiled.identity));
@@ -35006,6 +36220,7 @@ mod tests {
                 loop_index: Box::default(),
                 loop_scanners: Box::default(),
                 descriptor_v6: None,
+                reverse_supertransition: None,
             }
         };
 
@@ -35167,6 +36382,7 @@ mod tests {
             loop_index: Box::default(),
             loop_scanners: Box::default(),
             descriptor_v6: None,
+            reverse_supertransition: None,
         };
         assert!(storage.rows.is_empty());
         assert!(storage.pair_rows_v11.is_none());
@@ -35283,6 +36499,7 @@ mod tests {
             loop_index: Box::default(),
             loop_scanners: Box::default(),
             descriptor_v6: None,
+            reverse_supertransition: None,
         };
         assert!(storage.descriptor_is_valid_for(compiled.identity));
         let mut header = compiled.compiler_private_frozen_prepared_header_v3(
@@ -35341,9 +36558,10 @@ mod tests {
             );
             assert!(header.is_active(), "{label}");
             assert!(header.has_dynamic_rows(), "{label}");
+            let base_flags = frozen_prepared_header_base_flags(header.v1.flags);
             assert!(
                 matches!(
-                    header.v1.flags,
+                    base_flags,
                     FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V4
                         | FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V10
                         | FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V11
@@ -35356,7 +36574,7 @@ mod tests {
             if dynamic.root_requirement.is_some() {
                 assert!(
                     !matches!(
-                        header.v1.flags,
+                        base_flags,
                         FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V11
                             | FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V13
                             | FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V14
@@ -36413,6 +37631,7 @@ mod tests {
             loop_index: Box::default(),
             loop_scanners: Box::default(),
             descriptor_v6: None,
+            reverse_supertransition: None,
         };
         assert!(storage.descriptor_is_valid_for(compiled.identity));
         let header = compiled.compiler_private_frozen_prepared_header_v3(
@@ -36909,6 +38128,68 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn reverse_supertransition_modifier_survives_v6_v7_promotion() {
+        let compiled = program(
+            r"ab*c|a",
+            OutputContract::Span,
+            CompileMode::Optimizing,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+        );
+        let mut workspace = compiled.prepare_workspace().unwrap();
+        let storage = compiled
+            .compiler_private_frozen_dynamic_rows_storage_v3(
+                &mut workspace,
+                usize::MAX,
+                usize::MAX,
+            )
+            .expect("variable-Span loop owner");
+        let loop_descriptor = storage
+            .descriptor_v6
+            .expect("variable-Span fixture retains a V6/V7 loop extension");
+        let base_flag = match loop_descriptor.compact.format_version {
+            FROZEN_DYNAMIC_ROWS_V6_FORMAT_VERSION => {
+                FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V6
+            }
+            FROZEN_DYNAMIC_ROWS_V7_FORMAT_VERSION => {
+                FROZEN_PREPARED_HEADER_V1_FLAG_DYNAMIC_ROWS_V7
+            }
+            format => panic!("expected V6/V7 loop extension, selected V{format}"),
+        };
+        let reverse = storage
+            .root_prefill_receipt
+            .reverse
+            .expect("variable-Span source reverse projection");
+        let reverse_supertransition = storage
+            .reverse_supertransition_generation_key()
+            .expect("independently compacted reverse descriptor");
+        let header = compiled.compiler_private_frozen_prepared_header_v6(
+            &workspace,
+            None,
+            Some(&storage),
+        );
+        assert!(header.has_dynamic_rows());
+        assert_eq!(
+            header.v1.flags,
+            base_flag | FROZEN_PREPARED_HEADER_V1_FLAG_REVERSE_SUPERTRANSITION
+        );
+        assert_eq!(header.v1.header_bytes, FROZEN_PREPARED_HEADER_V6_BYTES);
+        assert_eq!(header.v1.reverse_rows_address, reverse.rows_address);
+        assert_eq!(
+            header.v1.reverse_live_cells,
+            reverse_supertransition.descriptor_address
+        );
+        assert!(header
+            .compiler_private_active_span_capability(
+                &storage,
+                compiled.artifact_identity(),
+            )
+            .is_some());
     }
 
     #[test]
