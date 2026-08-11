@@ -82,6 +82,9 @@ use fre_aot_regex::{
     CompileError, CompiledProgram, FrozenCompactLoopScanner, FrozenDynamicRowsStorageV3,
     FrozenPreparedHeaderV6, FrozenStaticContinuationRowsStorageV1,
     FullyPrefilledFallbackReceipt, MatchResult, OutputContract,
+    StaticPrefixResumeAdmission, StaticPrefixResumeAdmissionPlan,
+    StaticPrefixResumeDescriptorKey, StaticPrefixResumeSearchOutcome,
+    StaticPrefixSpanRecoveryAdmission,
     FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION, FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION,
     FROZEN_DYNAMIC_ROWS_V8_FORMAT_VERSION, FROZEN_DYNAMIC_ROWS_V9_FORMAT_VERSION,
     FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION, FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION,
@@ -90,8 +93,9 @@ use fre_aot_regex::{
     PROGRAM_HEADER_LEN, ProgramFormatError, ProgramWorkspace, RetainedPartialPreflight,
     STATIC_PREFIX_INVOCATION_EPOCH_OFFSET,
     STATIC_PREFIX_RESUME_DESCRIPTOR_V1_HEADER_BYTES,
-    STATIC_PREFIX_RESUME_DESCRIPTOR_V1_MAX_BYTES, STATIC_PREFIX_RESUME_DESCRIPTOR_V1_VERSION,
-    STATIC_PREFIX_RESUME_DESCRIPTOR_V2_HEADER_BYTES, STATIC_PREFIX_RESUME_DESCRIPTOR_V2_VERSION,
+    STATIC_PREFIX_RESUME_DESCRIPTOR_V1_MAGIC, STATIC_PREFIX_RESUME_DESCRIPTOR_V1_MAX_BYTES,
+    STATIC_PREFIX_RESUME_DESCRIPTOR_V1_VERSION, STATIC_PREFIX_RESUME_DESCRIPTOR_V2_HEADER_BYTES,
+    STATIC_PREFIX_RESUME_DESCRIPTOR_V2_MAGIC, STATIC_PREFIX_RESUME_DESCRIPTOR_V2_VERSION,
     SearchWindow,
 };
 #[cfg(test)]
@@ -440,14 +444,13 @@ pub struct PreparedAotRegex {
 /// Span postflight. Keeping this raw object ticket outside `ProgramWorkspace`
 /// lets an all-native path avoid descriptor parsing, graph binding, and cache
 /// prefill; short windows also avoid touching portable executor workspace.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 struct StaticPrefixObjectTicket {
     haystack_address: usize,
     haystack_len: usize,
     window: SearchWindow,
     artifact_identity: [u8; ARTIFACT_IDENTITY_BYTES],
-    descriptor_version: u32,
-    descriptor_address: usize,
+    descriptor_key: StaticPrefixResumeDescriptorKey,
     invocation_epoch: u64,
 }
 
@@ -456,13 +459,14 @@ struct StaticPrefixObjectTicket {
 /// [`StaticPrefixObjectTicket`]: the continuation consumes the raw generated
 /// object capability while binding its descriptor, so Span recovery must not
 /// recreate or consume that descriptor capability a second time.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 struct StaticPrefixSpanPostflightTicket {
     haystack_address: usize,
     haystack_len: usize,
     window: SearchWindow,
     artifact_identity: [u8; ARTIFACT_IDENTITY_BYTES],
     invocation_epoch: u64,
+    recovery: StaticPrefixSpanRecoveryAdmission,
 }
 
 /// One authenticated continuation outcome before its ABI result encoding.
@@ -477,6 +481,20 @@ enum StaticPrefixContinuationOutcome {
         pending_end: usize,
     },
     Complete(MatchResult),
+}
+
+/// Linear result of trying to publish an authenticated immutable local tail.
+/// A decline returns the still-unconsumed admission for the frozen in-process
+/// scan and then K0.
+#[derive(Debug)]
+enum StaticPrefixFrozenProjectionOutcome {
+    Native {
+        status: u32,
+        canonical_state: usize,
+        pending_end: usize,
+        span_recovery: Option<StaticPrefixSpanRecoveryAdmission>,
+    },
+    Declined(StaticPrefixResumeAdmission),
 }
 
 const _: () = assert!(std::mem::offset_of!(PreparedAotRegex, frozen_header) == 0);
@@ -639,25 +657,19 @@ impl PreparedAotRegex {
         descriptor_address: usize,
     ) -> Result<(), CompileError> {
         let _ = self.retire_static_prefix_capabilities();
-        if expected_artifact_identity != *self.frozen_header.artifact_identity()
-            || !matches!(
-                descriptor_version,
-                STATIC_PREFIX_RESUME_DESCRIPTOR_V1_VERSION
-                    | STATIC_PREFIX_RESUME_DESCRIPTOR_V2_VERSION
-            )
-            || descriptor_address == 0
-        {
+        if expected_artifact_identity != *self.frozen_header.artifact_identity() {
             return Err(CompileError::InternalInvariant(
                 "static-prefix object preflight rejected its artifact or descriptor",
             ));
         }
+        let descriptor_key =
+            StaticPrefixResumeDescriptorKey::new(descriptor_version, descriptor_address)?;
         self.static_prefix_object_ticket = Some(StaticPrefixObjectTicket {
             haystack_address: haystack.as_ptr().expose_provenance(),
             haystack_len: haystack.len(),
             window,
             artifact_identity: expected_artifact_identity,
-            descriptor_version,
-            descriptor_address,
+            descriptor_key,
             invocation_epoch: self.static_prefix_invocation_epoch,
         });
         Ok(())
@@ -680,6 +692,7 @@ impl PreparedAotRegex {
         if ticket.haystack_address != haystack.as_ptr().expose_provenance()
             || ticket.haystack_len != haystack.len()
             || ticket.invocation_epoch != self.static_prefix_invocation_epoch
+            || ticket.artifact_identity != *self.frozen_header.artifact_identity()
         {
             return Err(CompileError::InternalInvariant(
                 "static-prefix continuation haystack differs from object preflight",
@@ -692,11 +705,17 @@ impl PreparedAotRegex {
     fn admit_static_prefix_span_postflight(
         &mut self,
         ticket: StaticPrefixObjectTicket,
+        recovery: Option<StaticPrefixSpanRecoveryAdmission>,
     ) -> Result<(), CompileError> {
         let _ = self.retire_static_prefix_capabilities();
         if self.program.output_contract() != OutputContract::Span
             || self.program.exact_match_width().is_some()
         {
+            if recovery.is_some() {
+                return Err(CompileError::InternalInvariant(
+                    "non-variable-Span continuation minted a recovery admission",
+                ));
+            }
             return Ok(());
         }
         if ticket.artifact_identity != *self.frozen_header.artifact_identity() {
@@ -704,12 +723,16 @@ impl PreparedAotRegex {
                 "static-prefix continuation cannot publish a foreign Span postflight",
             ));
         }
+        let recovery = recovery.ok_or(CompileError::InternalInvariant(
+            "variable-Span continuation did not mint a recovery admission",
+        ))?;
         self.static_prefix_span_postflight_ticket = Some(StaticPrefixSpanPostflightTicket {
             haystack_address: ticket.haystack_address,
             haystack_len: ticket.haystack_len,
             window: ticket.window,
             artifact_identity: ticket.artifact_identity,
             invocation_epoch: ticket.invocation_epoch,
+            recovery,
         });
         Ok(())
     }
@@ -720,7 +743,7 @@ impl PreparedAotRegex {
         haystack: &[u8],
         window: SearchWindow,
         expected_artifact_identity: [u8; ARTIFACT_IDENTITY_BYTES],
-    ) -> Result<(), CompileError> {
+    ) -> Result<Option<StaticPrefixSpanRecoveryAdmission>, CompileError> {
         let (object, postflight) = self.retire_static_prefix_capabilities();
         let (
             haystack_address,
@@ -728,6 +751,7 @@ impl PreparedAotRegex {
             admitted_window,
             artifact_identity,
             invocation_epoch,
+            recovery,
         ) =
             match (object, postflight) {
                 (Some(ticket), None) => (
@@ -736,6 +760,7 @@ impl PreparedAotRegex {
                     ticket.window,
                     ticket.artifact_identity,
                     ticket.invocation_epoch,
+                    None,
                 ),
                 (None, Some(ticket)) => (
                     ticket.haystack_address,
@@ -743,6 +768,7 @@ impl PreparedAotRegex {
                     ticket.window,
                     ticket.artifact_identity,
                     ticket.invocation_epoch,
+                    Some(ticket.recovery),
                 ),
                 (None, None) | (Some(_), Some(_)) => {
                     return Err(CompileError::InternalInvariant(
@@ -760,7 +786,7 @@ impl PreparedAotRegex {
                 "static-prefix Span recovery differs from its admitted invocation",
             ));
         }
-        Ok(())
+        Ok(recovery)
     }
 
     /// Execute without re-deserializing or allocating executor workspace.
@@ -1002,12 +1028,12 @@ impl PreparedAotRegex {
         } else {
             self.program
                 .recover_retained_partial_span_from_selected_end_with_workspace(
-                haystack,
-                window,
-                &mut self.workspace,
-                expected_artifact_identity,
-                selected_end,
-            )
+                    haystack,
+                    window,
+                    &mut self.workspace,
+                    expected_artifact_identity,
+                    selected_end,
+                )
         }
     }
 
@@ -1017,8 +1043,19 @@ impl PreparedAotRegex {
         window: SearchWindow,
         expected_artifact_identity: [u8; ARTIFACT_IDENTITY_BYTES],
         selected_end: usize,
+        admission: Option<StaticPrefixSpanRecoveryAdmission>,
     ) -> Result<MatchResult, CompileError> {
         self.deactivate_frozen_header();
+        if let Some(admission) = admission {
+            return self
+                .program
+                .recover_static_prefix_span_from_admission_with_workspace(
+                    haystack,
+                    &mut self.workspace,
+                    admission,
+                    selected_end,
+                );
+        }
         if let Some(receipt) = self.fully_prefilled_fallback {
             self.program
                 .recover_static_prefix_span_from_selected_end_with_fully_prefilled_fallback_workspace(
@@ -1065,55 +1102,10 @@ impl PreparedAotRegex {
             )
     }
 
-    fn bind_static_prefix_resume(
+    fn install_static_prefix_resume_receipt(
         &mut self,
-        haystack: &[u8],
-        window: SearchWindow,
-        expected_artifact_identity: [u8; ARTIFACT_IDENTITY_BYTES],
-        descriptor_version: u32,
-        descriptor_binding: usize,
-        descriptor: &[u32],
-    ) -> Result<(), CompileError> {
-        let binding_is_active = self
-            .program
-            .compiler_private_static_prefix_resume_binding_is_active_for_version(
-                &self.workspace,
-                descriptor_version,
-                descriptor_binding,
-            );
-        if !binding_is_active {
-            self.deactivate_frozen_header();
-        }
-        let newly_published = match descriptor_version {
-            STATIC_PREFIX_RESUME_DESCRIPTOR_V1_VERSION => {
-                self.program.bind_static_prefix_resume_with_workspace(
-                    haystack,
-                    window,
-                    &mut self.workspace,
-                    self.frozen_dynamic_rows.as_ref(),
-                    expected_artifact_identity,
-                    descriptor_binding,
-                    descriptor,
-                )?
-            }
-            STATIC_PREFIX_RESUME_DESCRIPTOR_V2_VERSION => {
-                self.program.bind_static_prefix_resume_v2_with_workspace(
-                    haystack,
-                    window,
-                    &mut self.workspace,
-                    self.frozen_dynamic_rows.as_ref(),
-                    expected_artifact_identity,
-                    descriptor_binding,
-                    descriptor,
-                )?
-            }
-            _ => {
-                return Err(CompileError::InternalInvariant(
-                    "static-prefix binding rejected its descriptor version",
-                ));
-            }
-        };
-        debug_assert!(!binding_is_active || newly_published.is_none());
+        newly_published: Option<FullyPrefilledFallbackReceipt>,
+    ) {
         if let Some(receipt) = newly_published {
             // Replacing the complete K0 cache retires every receipt and
             // immutable copy derived from its prior generation. Rebuild the
@@ -1147,7 +1139,6 @@ impl PreparedAotRegex {
                     FROZEN_DYNAMIC_SIDECAR_MAX_PACKED_BYTES,
                 );
         }
-        Ok(())
     }
 
     /// Authenticate one immutable compact continuation and publish the exact
@@ -1158,17 +1149,19 @@ impl PreparedAotRegex {
     fn project_static_prefix_resume_to_frozen_owner(
         &mut self,
         haystack: &[u8],
+        admission: StaticPrefixResumeAdmission,
         resume_state: usize,
         resume_position: usize,
         pending_end: usize,
-    ) -> Result<Option<(u32, usize, usize)>, CompileError> {
+    ) -> Result<StaticPrefixFrozenProjectionOutcome, CompileError> {
         if let Some(owner) = self.frozen_static_continuation_rows.as_ref()
             && let Some(projection) = self
                 .program
-                .try_project_static_prefix_resume_ticket_with_frozen_static_continuation_rows(
+                .try_project_static_prefix_resume_admission_with_frozen_static_continuation_rows(
                     haystack,
                     &mut self.workspace,
                     owner,
+                    &admission,
                     resume_state,
                     resume_position,
                     pending_end,
@@ -1203,37 +1196,41 @@ impl PreparedAotRegex {
                     }
                     Some(pending_end) => pending_end,
                 };
-                self.program
-                    .consume_static_prefix_resume_projection_with_workspace(
+                let span_recovery = self
+                    .program
+                    .consume_static_prefix_resume_admission_projection_with_workspace(
                         haystack,
                         &mut self.workspace,
+                        admission,
                         projection,
                     )?;
                 if let Some(header) = replacement_header {
                     self.static_continuation_header = header;
                 }
-                return Ok(Some((
-                    STATUS_STATIC_PREFIX_NATIVE_CONTINUATION_RESUME,
+                return Ok(StaticPrefixFrozenProjectionOutcome::Native {
+                    status: STATUS_STATIC_PREFIX_NATIVE_CONTINUATION_RESUME,
                     canonical_state,
                     pending_end,
-                )));
+                    span_recovery,
+                });
             }
         }
         let Some(owner) = self.frozen_dynamic_rows.as_ref() else {
-            return Ok(None);
+            return Ok(StaticPrefixFrozenProjectionOutcome::Declined(admission));
         };
         let Some(projection) = self
             .program
-            .try_project_static_prefix_resume_ticket_with_frozen_rows(
+            .try_project_static_prefix_resume_admission_with_frozen_rows(
                 haystack,
                 &mut self.workspace,
                 owner,
+                &admission,
                 resume_state,
                 resume_position,
                 pending_end,
             )?
         else {
-            return Ok(None);
+            return Ok(StaticPrefixFrozenProjectionOutcome::Declined(admission));
         };
         if !matches!(
             projection.format_version(),
@@ -1247,7 +1244,7 @@ impl PreparedAotRegex {
                 | FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION
                 | FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION
         ) {
-            return Ok(None);
+            return Ok(StaticPrefixFrozenProjectionOutcome::Declined(admission));
         }
         let header = self.program.compiler_private_frozen_prepared_header_v6(
             &self.workspace,
@@ -1255,7 +1252,7 @@ impl PreparedAotRegex {
             Some(owner),
         );
         let Some(header_format) = header.compiler_private_dynamic_rows_format_version() else {
-            return Ok(None);
+            return Ok(StaticPrefixFrozenProjectionOutcome::Declined(admission));
         };
         if header_format != projection.format_version()
             || !matches!(
@@ -1271,7 +1268,7 @@ impl PreparedAotRegex {
                     | FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION
             )
         {
-            return Ok(None);
+            return Ok(StaticPrefixFrozenProjectionOutcome::Declined(admission));
         }
         let canonical_state = projection.canonical_state();
         let pending_end = match projection.pending_end() {
@@ -1283,10 +1280,12 @@ impl PreparedAotRegex {
             }
             Some(pending_end) => pending_end,
         };
-        self.program
-            .consume_static_prefix_resume_projection_with_workspace(
+        let span_recovery = self
+            .program
+            .consume_static_prefix_resume_admission_projection_with_workspace(
                 haystack,
                 &mut self.workspace,
+                admission,
                 projection,
             )?;
         // The exclusive ABI permits no concurrent access. Replacing the
@@ -1294,39 +1293,46 @@ impl PreparedAotRegex {
         // generation at the same stable offset-zero address before native
         // execution resumes synchronously.
         self.frozen_header = header;
-        Ok(Some((
-            STATUS_STATIC_PREFIX_NATIVE_RESUME,
+        Ok(StaticPrefixFrozenProjectionOutcome::Native {
+            status: STATUS_STATIC_PREFIX_NATIVE_RESUME,
             canonical_state,
             pending_end,
-        )))
+            span_recovery,
+        })
     }
 
-    fn search_from_static_prefix_resume_ticket(
+    fn search_from_static_prefix_resume_admission(
         &mut self,
         haystack: &[u8],
+        admission: StaticPrefixResumeAdmission,
         resume_state: usize,
         resume_position: usize,
         pending_end: usize,
     ) -> Result<MatchResult, CompileError> {
         self.deactivate_frozen_header();
-        if let Some(owner) = self.frozen_dynamic_rows.as_ref()
-            && let Some(found) = self
+        let admission = if let Some(owner) = self.frozen_dynamic_rows.as_ref() {
+            match self
                 .program
-                .try_search_from_static_prefix_resume_ticket_with_frozen_rows(
+                .try_search_from_static_prefix_resume_admission_with_frozen_rows(
                     haystack,
                     &mut self.workspace,
                     owner,
+                    admission,
                     resume_state,
                     resume_position,
                     pending_end,
-                )?
-        {
-            return Ok(found);
-        }
+                )? {
+                StaticPrefixResumeSearchOutcome::Complete(found) => return Ok(found),
+                StaticPrefixResumeSearchOutcome::Declined(admission) => admission,
+            }
+        } else {
+            admission
+        };
         self.program
-            .search_from_static_prefix_resume_ticket_with_workspace(
+            .search_from_static_prefix_resume_admission_with_workspace(
                 haystack,
                 &mut self.workspace,
+                admission,
                 resume_state,
                 resume_position,
                 pending_end,
@@ -1341,7 +1347,7 @@ impl PreparedAotRegex {
     ///
     /// # Safety
     ///
-    /// `ticket.descriptor_address` must name the still-live immutable
+    /// `ticket.descriptor_key` must name the still-live immutable
     /// compiler-owned descriptor promised by the private object ABI.
     #[allow(
         unsafe_code,
@@ -1355,101 +1361,141 @@ impl PreparedAotRegex {
         resume_position: usize,
         pending_end: usize,
     ) -> Result<StaticPrefixContinuationOutcome, CompileError> {
-        if ticket.haystack_address != haystack.as_ptr().expose_provenance()
-            || ticket.haystack_len != haystack.len()
-            || ticket.invocation_epoch != self.static_prefix_invocation_epoch
-            || ticket.artifact_identity != *self.frozen_header.artifact_identity()
-            || !matches!(
-                ticket.descriptor_version,
-                STATIC_PREFIX_RESUME_DESCRIPTOR_V1_VERSION
-                    | STATIC_PREFIX_RESUME_DESCRIPTOR_V2_VERSION
-            )
-            || ticket.descriptor_address == 0
-        {
-            return Err(CompileError::InternalInvariant(
-                "static-prefix continuation object is no longer authenticated",
-            ));
-        }
-        let header_words = match ticket.descriptor_version {
-            STATIC_PREFIX_RESUME_DESCRIPTOR_V1_VERSION => {
-                STATIC_PREFIX_RESUME_DESCRIPTOR_V1_HEADER_BYTES / std::mem::size_of::<u32>()
-            }
-            STATIC_PREFIX_RESUME_DESCRIPTOR_V2_VERSION => {
-                STATIC_PREFIX_RESUME_DESCRIPTOR_V2_HEADER_BYTES / std::mem::size_of::<u32>()
-            }
-            _ => unreachable!("validated static-prefix resume descriptor version"),
-        };
-        let descriptor_is_bound = self
-            .program
-            .compiler_private_static_prefix_resume_binding_is_active_for_version(
-                &self.workspace,
-                ticket.descriptor_version,
-                ticket.descriptor_address,
-            );
-        let descriptor = if descriptor_is_bound {
-            // The generated object's address is its immutable binding
-            // capability. Once the graph-bound resume set authenticates that
-            // exact address, repeated holes need not re-read its bounded
-            // header or reconstruct a slice that the binding path ignores.
-            &[]
-        } else {
-            let descriptor_ptr =
-                std::ptr::with_exposed_provenance::<u32>(ticket.descriptor_address);
-            // SAFETY: the private ABI promises a readable fixed header at the
-            // authenticated compiler-owned address. The declared remainder is
-            // formed only after its bounded extent is validated below.
-            let header = unsafe { std::slice::from_raw_parts(descriptor_ptr, header_words) };
-            let total_words = usize::try_from(header[2]).map_err(|_| {
-                CompileError::InternalInvariant(
-                    "static-prefix descriptor word count does not fit usize",
-                )
-            })?;
-            let total_bytes = total_words
-                .checked_mul(std::mem::size_of::<u32>())
-                .ok_or(CompileError::InternalInvariant(
-                    "static-prefix descriptor byte count overflowed",
-                ))?;
-            if total_words < header_words
-                || total_bytes > STATIC_PREFIX_RESUME_DESCRIPTOR_V1_MAX_BYTES
-            {
-                return Err(CompileError::InternalInvariant(
-                    "static-prefix descriptor extent is invalid",
-                ));
-            }
-            // SAFETY: the compiler-owned object promises the complete extent
-            // declared by its checked fixed header.
-            unsafe { std::slice::from_raw_parts(descriptor_ptr, total_words) }
-        };
-        self.bind_static_prefix_resume(
-            haystack,
-            ticket.window,
+        debug_assert_eq!(
+            ticket.haystack_address,
+            haystack.as_ptr().expose_provenance(),
+            "the caller must pass one authenticated object"
+        );
+        debug_assert_eq!(ticket.haystack_len, haystack.len());
+        debug_assert_eq!(ticket.invocation_epoch, self.static_prefix_invocation_epoch);
+        debug_assert_eq!(
             ticket.artifact_identity,
-            ticket.descriptor_version,
-            ticket.descriptor_address,
-            descriptor,
-        )?;
-        if let Some((status, canonical_state, pending_end)) = self
-            .project_static_prefix_resume_to_frozen_owner(
+            *self.frozen_header.artifact_identity()
+        );
+
+        let admission = match self
+            .program
+            .classify_static_prefix_resume_object_with_workspace(
                 haystack,
-                resume_state,
-                resume_position,
-                pending_end,
+                ticket.window,
+                &mut self.workspace,
+                ticket.artifact_identity,
+                ticket.descriptor_key,
             )?
         {
-            self.admit_static_prefix_span_postflight(ticket)?;
-            return Ok(StaticPrefixContinuationOutcome::Native {
-                status,
-                canonical_state,
-                pending_end,
-            });
-        }
-        self.search_from_static_prefix_resume_ticket(
+            StaticPrefixResumeAdmissionPlan::Warm(admission) => admission,
+            StaticPrefixResumeAdmissionPlan::Cold(object) => {
+                let descriptor_key = object.descriptor_key();
+                let (header_words, expected_magic, reserved_start) =
+                    match descriptor_key.version() {
+                        STATIC_PREFIX_RESUME_DESCRIPTOR_V1_VERSION => (
+                            STATIC_PREFIX_RESUME_DESCRIPTOR_V1_HEADER_BYTES
+                                / std::mem::size_of::<u32>(),
+                            STATIC_PREFIX_RESUME_DESCRIPTOR_V1_MAGIC,
+                            5,
+                        ),
+                        STATIC_PREFIX_RESUME_DESCRIPTOR_V2_VERSION => (
+                            STATIC_PREFIX_RESUME_DESCRIPTOR_V2_HEADER_BYTES
+                                / std::mem::size_of::<u32>(),
+                            STATIC_PREFIX_RESUME_DESCRIPTOR_V2_MAGIC,
+                            6,
+                        ),
+                        _ => unreachable!("authenticated static-prefix descriptor key"),
+                    };
+                let descriptor_ptr =
+                    std::ptr::with_exposed_provenance::<u32>(descriptor_key.address());
+                // SAFETY: the private ABI promises a readable fixed header at
+                // the authenticated compiler-owned address. Only its declared
+                // word extent is consulted before the bounded check below.
+                let header = unsafe {
+                    std::slice::from_raw_parts(descriptor_ptr, header_words)
+                };
+                let total_words = usize::try_from(header[2]).map_err(|_| {
+                    CompileError::InternalInvariant(
+                        "static-prefix descriptor word count does not fit usize",
+                    )
+                })?;
+                let total_bytes = total_words
+                    .checked_mul(std::mem::size_of::<u32>())
+                    .ok_or(CompileError::InternalInvariant(
+                        "static-prefix descriptor byte count overflowed",
+                    ))?;
+                if total_words < header_words
+                    || total_bytes > STATIC_PREFIX_RESUME_DESCRIPTOR_V1_MAX_BYTES
+                {
+                    return Err(CompileError::InternalInvariant(
+                        "static-prefix descriptor extent is invalid",
+                    ));
+                }
+                // Zero, undersized, oversized, and overflowing declarations
+                // leave immutable owners published. Once the declared extent
+                // is bounded, the cold transaction may replace K0 lineage, so
+                // revoke both headers before semantic header validation and
+                // full descriptor decode.
+                self.deactivate_frozen_header();
+                let mut magic = [0_u8; 8];
+                magic[..4].copy_from_slice(&header[0].to_le_bytes());
+                magic[4..].copy_from_slice(&header[1].to_le_bytes());
+                let fixed_header_is_valid = &magic == expected_magic
+                    && header[3] != 0
+                    && header[4] != 0
+                    && header[reserved_start..].iter().all(|&word| word == 0)
+                    && (descriptor_key.version()
+                        != STATIC_PREFIX_RESUME_DESCRIPTOR_V2_VERSION
+                        || (header[4] <= 0x7fff_ffff
+                            && matches!(header[5], 1 | 2 | 4)));
+                if !fixed_header_is_valid {
+                    return Err(CompileError::InternalInvariant(
+                        "static-prefix descriptor fixed header is invalid",
+                    ));
+                }
+                // SAFETY: the compiler-owned object promises the complete extent
+                // declared by its checked fixed header.
+                let descriptor = unsafe {
+                    std::slice::from_raw_parts(descriptor_ptr, total_words)
+                };
+                let (admission, newly_published) = self
+                    .program
+                    .bind_cold_static_prefix_resume_object_with_workspace(
+                        &mut self.workspace,
+                        self.frozen_dynamic_rows.as_ref(),
+                        object,
+                        descriptor,
+                    )?;
+                self.install_static_prefix_resume_receipt(newly_published);
+                admission
+            }
+        };
+        match self.project_static_prefix_resume_to_frozen_owner(
             haystack,
+            admission,
             resume_state,
             resume_position,
             pending_end,
-        )
-        .map(StaticPrefixContinuationOutcome::Complete)
+        )? {
+            StaticPrefixFrozenProjectionOutcome::Native {
+                status,
+                canonical_state,
+                pending_end,
+                span_recovery,
+            } => {
+                self.admit_static_prefix_span_postflight(ticket, span_recovery)?;
+                Ok(StaticPrefixContinuationOutcome::Native {
+                    status,
+                    canonical_state,
+                    pending_end,
+                })
+            }
+            StaticPrefixFrozenProjectionOutcome::Declined(admission) => self
+                .search_from_static_prefix_resume_admission(
+                    haystack,
+                    admission,
+                    resume_state,
+                    resume_position,
+                    pending_end,
+                )
+                .map(StaticPrefixContinuationOutcome::Complete),
+        }
     }
 
     fn preflight_retained_partial_native_root(
@@ -1582,12 +1628,12 @@ impl PreparedAotRegex {
             self.deactivate_frozen_header();
             self.program
                 .recover_dynamic_native_rows_span_from_selected_end_with_workspace(
-                haystack,
-                window,
-                &mut self.workspace,
-                expected_artifact_identity,
-                selected_end,
-            )
+                    haystack,
+                    window,
+                    &mut self.workspace,
+                    expected_artifact_identity,
+                    selected_end,
+                )
         };
         if recovered.is_err() && used_compact_capability {
             // A rejected compact postflight cannot leave a reusable capability
@@ -2680,7 +2726,7 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_compiler_private_search_exclusive
         let Ok(ticket) = prepared.consume_static_prefix_object(haystack) else {
             return STATUS_RUNTIME_FAILURE;
         };
-        if ticket.descriptor_version != STATIC_PREFIX_RESUME_DESCRIPTOR_V1_VERSION {
+        if ticket.descriptor_key.version() != STATIC_PREFIX_RESUME_DESCRIPTOR_V1_VERSION {
             return STATUS_RUNTIME_FAILURE;
         }
         let Ok(outcome) = prepared.continue_static_prefix_object(
@@ -2764,7 +2810,7 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_compiler_private_search_exclusive
         let Ok(ticket) = prepared.consume_static_prefix_object(haystack) else {
             return STATUS_RUNTIME_FAILURE;
         };
-        if ticket.descriptor_version != STATIC_PREFIX_RESUME_DESCRIPTOR_V2_VERSION {
+        if ticket.descriptor_key.version() != STATIC_PREFIX_RESUME_DESCRIPTOR_V2_VERSION {
             return STATUS_RUNTIME_FAILURE;
         }
         let Ok(outcome) = prepared.continue_static_prefix_object(
@@ -2881,13 +2927,18 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_compiler_private_search_exclusive
         {
             return STATUS_RUNTIME_FAILURE;
         }
+        let Ok(descriptor_key) = StaticPrefixResumeDescriptorKey::new(
+            STATIC_PREFIX_RESUME_DESCRIPTOR_V1_VERSION,
+            descriptor_ptr.expose_provenance(),
+        ) else {
+            return STATUS_RUNTIME_FAILURE;
+        };
         let ticket = StaticPrefixObjectTicket {
             haystack_address: haystack.as_ptr().expose_provenance(),
             haystack_len: haystack.len(),
             window,
             artifact_identity: expected_artifact_identity,
-            descriptor_version: STATIC_PREFIX_RESUME_DESCRIPTOR_V1_VERSION,
-            descriptor_address: descriptor_ptr.expose_provenance(),
+            descriptor_key,
             invocation_epoch: prepared.static_prefix_invocation_epoch,
         };
         let Ok(outcome) = prepared.continue_static_prefix_object(
@@ -2985,13 +3036,18 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_compiler_private_search_exclusive
         {
             return STATUS_RUNTIME_FAILURE;
         }
+        let Ok(descriptor_key) = StaticPrefixResumeDescriptorKey::new(
+            STATIC_PREFIX_RESUME_DESCRIPTOR_V2_VERSION,
+            descriptor_ptr.expose_provenance(),
+        ) else {
+            return STATUS_RUNTIME_FAILURE;
+        };
         let ticket = StaticPrefixObjectTicket {
             haystack_address: haystack.as_ptr().expose_provenance(),
             haystack_len: haystack.len(),
             window,
             artifact_identity: expected_artifact_identity,
-            descriptor_version: STATIC_PREFIX_RESUME_DESCRIPTOR_V2_VERSION,
-            descriptor_address: descriptor_ptr.expose_provenance(),
+            descriptor_key,
             invocation_epoch: prepared.static_prefix_invocation_epoch,
         };
         let Ok(outcome) = prepared.continue_static_prefix_object(
@@ -3094,6 +3150,7 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_compiler_private_search_exclusive
                 SearchWindow::new(window_start, window_end),
                 expected_artifact_identity,
                 selected_end,
+                None,
             )
         else {
             return STATUS_RUNTIME_FAILURE;
@@ -3168,7 +3225,7 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_compiler_private_search_exclusive
             .cast::<[u8; ARTIFACT_IDENTITY_BYTES]>()
             .read();
         let window = SearchWindow::new(window_start, window_end);
-        let Ok(()) = prepared.consume_static_prefix_span_recovery_ticket(
+        let Ok(admission) = prepared.consume_static_prefix_span_recovery_ticket(
             haystack,
             window,
             expected_artifact_identity,
@@ -3181,6 +3238,7 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_compiler_private_search_exclusive
                 window,
                 expected_artifact_identity,
                 selected_end,
+                admission,
             )
         else {
             return STATUS_RUNTIME_FAILURE;
@@ -3302,6 +3360,7 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_compiler_private_search_exclusive
                 SearchWindow::new(window_start, window_end),
                 expected_artifact_identity,
                 selected_end,
+                None,
             )
         else {
             return STATUS_RUNTIME_FAILURE;
@@ -5459,18 +5518,51 @@ mod tests {
         handle: FreAotRegexExclusiveHandleV1,
         haystack: &[u8],
     ) {
-        // Model the exact capability transition performed only after a
-        // successful status-7/8 projection: consume the descriptor-bearing
-        // object ticket and publish a distinct variable-Span postflight.
-        // SAFETY: tests call this only with unique access to a live allocation
-        // and the exact admitted haystack while no FFI call overlaps.
+        assert!(haystack.len() > 1);
+        // Exercise the production capability transition. Some lifecycle
+        // callers intentionally arrive with a malformed outer object ticket;
+        // retire it, admit a real one-state descriptor, and synchronously run
+        // the actual continuation through projection consumption. Only that
+        // path may mint `StaticPrefixSpanRecoveryAdmission`.
+        // SAFETY: tests call this only with unique access to a live allocation,
+        // and the local descriptor remains live through the continuation.
         let prepared = unsafe { &mut *handle.0.cast::<PreparedAotRegex>() };
+        let _ = prepared.retire_static_prefix_capabilities();
+        assert_eq!(prepared.program.output_contract(), OutputContract::Span);
+        assert!(prepared.program.exact_match_width().is_none());
+        let descriptor = one_state_static_prefix_descriptor(0, false);
+        let artifact_identity = *prepared.frozen_header.artifact_identity();
+        prepared
+            .admit_static_prefix_object(
+                haystack,
+                SearchWindow::full(haystack),
+                artifact_identity,
+                STATIC_PREFIX_RESUME_DESCRIPTOR_V1_VERSION,
+                descriptor.as_ptr().expose_provenance(),
+            )
+            .expect("admit genuine continuation descriptor");
         let ticket = prepared
             .consume_static_prefix_object(haystack)
-            .expect("consume admitted object ticket as continuation");
-        prepared
-            .admit_static_prefix_span_postflight(ticket)
-            .expect("publish authenticated continuation postflight");
+            .expect("consume genuine continuation descriptor");
+        let resume_position = (haystack.len() / 2).clamp(1, haystack.len() - 1);
+        let outcome = unsafe {
+            prepared.continue_static_prefix_object(
+                haystack,
+                ticket,
+                0,
+                resume_position,
+                0,
+            )
+        }
+        .expect("continue genuine variable-Span projection");
+        assert!(matches!(
+            outcome,
+            StaticPrefixContinuationOutcome::Native {
+                status: STATUS_STATIC_PREFIX_NATIVE_RESUME
+                    | STATUS_STATIC_PREFIX_NATIVE_CONTINUATION_RESUME,
+                ..
+            }
+        ));
         assert!(prepared.static_prefix_object_ticket.is_none());
         assert!(prepared.static_prefix_span_postflight_ticket.is_some());
     }

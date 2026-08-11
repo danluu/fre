@@ -3116,6 +3116,122 @@ const fn frozen_retained_partial_handoff_block_bytes(format_version: u32) -> Opt
     }
 }
 
+/// Version-and-address identity of one immutable compiler-owned resume
+/// descriptor.
+///
+/// The address is part of the capability, rather than merely a place from
+/// which to read equivalent bytes. Reusing an address for a different wire
+/// version therefore always requires a cold binding transaction.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StaticPrefixResumeDescriptorKey {
+    version: u32,
+    address: usize,
+}
+
+impl StaticPrefixResumeDescriptorKey {
+    /// Construct a checked compiler-private descriptor identity.
+    #[doc(hidden)]
+    pub fn new(version: u32, address: usize) -> Result<Self, CompileError> {
+        if address == 0
+            || !matches!(
+                version,
+                STATIC_PREFIX_RESUME_DESCRIPTOR_V1_VERSION
+                    | STATIC_PREFIX_RESUME_DESCRIPTOR_V2_VERSION
+            )
+        {
+            return Err(CompileError::InternalInvariant(
+                "static-prefix descriptor key rejected its address or version",
+            ));
+        }
+        Ok(Self { version, address })
+    }
+
+    /// Wire version bound into this descriptor identity.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn version(self) -> u32 {
+        self.version
+    }
+
+    /// Immutable compiler-owned descriptor address.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn address(self) -> usize {
+        self.address
+    }
+}
+
+/// Cold half of one authenticated static-prefix object.
+///
+/// Private fields make this capability unforgeable outside this module, and
+/// deliberately omitting `Clone`/`Copy` makes the subsequent graph binding a
+/// linear operation.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct ColdStaticPrefixResumeObject {
+    program_instance: u64,
+    workspace_address: usize,
+    artifact_identity: [u8; 32],
+    haystack_address: usize,
+    haystack_len: usize,
+    window: SearchWindow,
+    descriptor: StaticPrefixResumeDescriptorKey,
+}
+
+impl ColdStaticPrefixResumeObject {
+    /// Descriptor key authenticated by the one warm/cold classification.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn descriptor_key(&self) -> StaticPrefixResumeDescriptorKey {
+        self.descriptor
+    }
+}
+
+/// Single-use authority to continue one exact static-prefix invocation.
+///
+/// The token owns haystack, window, artifact, workspace, descriptor, and
+/// sidecar-generation identity. A compact projection describes where to
+/// resume, but only this non-`Copy` admission authorizes executing it.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct StaticPrefixResumeAdmission {
+    program_instance: u64,
+    workspace_address: usize,
+    artifact_identity: [u8; 32],
+    haystack_address: usize,
+    haystack_len: usize,
+    window: SearchWindow,
+    descriptor: StaticPrefixResumeDescriptorKey,
+    admission_epoch: u64,
+}
+
+/// Result of the invocation's sole descriptor-binding classification.
+///
+/// `Warm` has already performed the one rearm/admit operation. `Cold` owns
+/// the authority required to read, decode, prefill, and publish the descriptor
+/// after its fixed header and bounded extent have been checked by the runtime.
+#[doc(hidden)]
+#[derive(Debug)]
+pub enum StaticPrefixResumeAdmissionPlan {
+    Warm(StaticPrefixResumeAdmission),
+    Cold(ColdStaticPrefixResumeObject),
+}
+
+/// Single-use reverse-only authority minted by a successful variable-Span
+/// native continuation handoff.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct StaticPrefixSpanRecoveryAdmission(StaticPrefixResumeAdmission);
+
+/// Result of trying the in-process immutable continuation before portable K0.
+#[doc(hidden)]
+#[derive(Debug)]
+pub enum StaticPrefixResumeSearchOutcome {
+    Complete(MatchResult),
+    Declined(StaticPrefixResumeAdmission),
+}
+
 /// Authenticated input to one immutable compact-row continuation.
 ///
 /// The projection is deliberately independent of any compact generation's
@@ -3123,7 +3239,7 @@ const fn frozen_retained_partial_handoff_block_bytes(format_version: u32) -> Opt
 /// validation and row execution. Constructing a projection does not retire
 /// the admitted single-use ticket; only a completed continuation may do so.
 #[doc(hidden)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct FrozenStaticPrefixResumeProjection {
     program_instance: u64,
     descriptor_binding: usize,
@@ -3141,49 +3257,49 @@ impl FrozenStaticPrefixResumeProjection {
     /// First byte in the exact admitted search window.
     #[doc(hidden)]
     #[must_use]
-    pub const fn window_start(self) -> usize {
+    pub const fn window_start(&self) -> usize {
         self.window.start
     }
 
     /// Exclusive end of the exact admitted search window.
     #[doc(hidden)]
     #[must_use]
-    pub const fn window_end(self) -> usize {
+    pub const fn window_end(&self) -> usize {
         self.window.end
     }
 
     /// First byte not consumed by the compiler-owned static prefix.
     #[doc(hidden)]
     #[must_use]
-    pub const fn resume_position(self) -> usize {
+    pub const fn resume_position(&self) -> usize {
         self.resume_position
     }
 
     /// Zero-based canonical compact state selected by the static frontier.
     #[doc(hidden)]
     #[must_use]
-    pub const fn canonical_state(self) -> usize {
+    pub const fn canonical_state(&self) -> usize {
         self.canonical_state
     }
 
     /// Pending selected endpoint carried by the static frontier, when any.
     #[doc(hidden)]
     #[must_use]
-    pub const fn pending_end(self) -> Option<usize> {
+    pub const fn pending_end(&self) -> Option<usize> {
         self.pending_end
     }
 
     /// Process-private cache identity shared with the immutable owner.
     #[doc(hidden)]
     #[must_use]
-    pub const fn cache_identity(self) -> u64 {
+    pub const fn cache_identity(&self) -> u64 {
         self.cache_identity
     }
 
     /// Exact compact row generation authenticated for this projection.
     #[doc(hidden)]
     #[must_use]
-    pub const fn format_version(self) -> u32 {
+    pub const fn format_version(&self) -> u32 {
         self.format_version
     }
 }
@@ -6757,6 +6873,9 @@ struct StaticPrefixResumeWorkspace {
     descriptor_version: u32,
     resume: K0ResumeSet,
     fully_prefilled: Option<FullyPrefilledFallbackReceipt>,
+    admission_epoch: u64,
+    // Retained only for the older compiler-private compatibility entry
+    // points. Current generated objects carry a linear admission instead.
     ticket: Option<StaticPrefixResumeTicket>,
 }
 
@@ -6768,12 +6887,36 @@ struct StaticPrefixResumeTicket {
 }
 
 impl StaticPrefixResumeWorkspace {
+    #[inline]
+    const fn descriptor_key(&self) -> StaticPrefixResumeDescriptorKey {
+        StaticPrefixResumeDescriptorKey {
+            version: self.descriptor_version,
+            address: self.descriptor_binding,
+        }
+    }
+
+    #[inline]
+    fn advance_admission_epoch(&mut self) -> u64 {
+        self.admission_epoch = self.admission_epoch.wrapping_add(1);
+        if self.admission_epoch == 0 {
+            self.admission_epoch = 1;
+        }
+        self.admission_epoch
+    }
+
     fn admit(&mut self, haystack: &[u8], window: SearchWindow) {
+        let _ = self.advance_admission_epoch();
         self.ticket = Some(StaticPrefixResumeTicket {
             haystack_address: haystack.as_ptr().expose_provenance(),
             haystack_len: haystack.len(),
             window,
         });
+    }
+
+    #[inline]
+    fn revoke_admissions(&mut self) {
+        let _ = self.advance_admission_epoch();
+        self.ticket = None;
     }
 
     fn consume(&mut self, haystack: &[u8]) -> Result<SearchWindow, CompileError> {
@@ -13598,7 +13741,7 @@ impl CompiledProgram {
         }
 
         if let Some(state) = workspace.static_prefix_resume.as_deref_mut() {
-            state.ticket = None;
+            state.revoke_admissions();
         }
         workspace.mark_dynamic_native_rows_dirty();
         let nfa = workspace.nfa.as_mut().ok_or(
@@ -13612,6 +13755,114 @@ impl CompiledProgram {
             }
             NfaMandatoryCutOutcome::Continue(_) => Ok(RetainedPartialPreflight::Enter(window)),
         }
+    }
+
+    /// Authenticate one generated static-prefix object and perform its sole
+    /// warm/cold descriptor classification.
+    ///
+    /// A warm result has already rearmed the exact sidecar and returns its
+    /// linear admission. A cold result deliberately carries no descriptor
+    /// slice: the runtime may now revoke published headers and validate the
+    /// fixed wire header before forming the complete bounded extent.
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the private object authentication binds artifact, workspace, haystack, window, and descriptor"
+    )]
+    pub fn classify_static_prefix_resume_object_with_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+        expected_artifact_identity: [u8; 32],
+        descriptor: StaticPrefixResumeDescriptorKey,
+    ) -> Result<StaticPrefixResumeAdmissionPlan, CompileError> {
+        self.validate_static_prefix_object_context(
+            haystack,
+            window,
+            workspace,
+            expected_artifact_identity,
+        )?;
+        // The key's fields are private, but retain a release-mode check at the
+        // public compiler-private boundary so future in-module constructors
+        // cannot accidentally weaken the wire contract.
+        StaticPrefixResumeDescriptorKey::new(descriptor.version, descriptor.address)?;
+
+        let workspace_address = std::ptr::from_ref(&*workspace).expose_provenance();
+        let haystack_address = haystack.as_ptr().expose_provenance();
+        let haystack_len = haystack.len();
+        if let Some(state) = workspace.static_prefix_resume.as_deref_mut()
+            && state.descriptor_key() == descriptor
+            && state.resume.is_bound_to(&self.automaton)
+        {
+            // This is the warm path's only state transition. In particular it
+            // neither decodes the descriptor nor touches K0 prefill state.
+            state.ticket = None;
+            let admission_epoch = state.advance_admission_epoch();
+            return Ok(StaticPrefixResumeAdmissionPlan::Warm(
+                StaticPrefixResumeAdmission {
+                    program_instance: self.identity.instance,
+                    workspace_address,
+                    artifact_identity: expected_artifact_identity,
+                    haystack_address,
+                    haystack_len,
+                    window,
+                    descriptor,
+                    admission_epoch,
+                },
+            ));
+        }
+
+        // Classification itself retires any older linear authority. A cold
+        // descriptor may subsequently fail fixed-header validation or decode;
+        // that failure must not leave an admission from the prior sidecar
+        // generation usable.
+        if let Some(state) = workspace.static_prefix_resume.as_deref_mut() {
+            state.revoke_admissions();
+        }
+
+        Ok(StaticPrefixResumeAdmissionPlan::Cold(
+            ColdStaticPrefixResumeObject {
+                program_instance: self.identity.instance,
+                workspace_address,
+                artifact_identity: expected_artifact_identity,
+                haystack_address,
+                haystack_len,
+                window,
+                descriptor,
+            },
+        ))
+    }
+
+    #[inline]
+    fn validate_static_prefix_resume_admission(
+        &self,
+        haystack: &[u8],
+        workspace: &ProgramWorkspace,
+        admission: &StaticPrefixResumeAdmission,
+    ) -> Result<SearchWindow, CompileError> {
+        let workspace_address = std::ptr::from_ref(workspace).expose_provenance();
+        let state = workspace.static_prefix_resume.as_deref().ok_or(
+            CompileError::InternalInvariant(
+                "static-prefix admission has no graph-bound sidecar",
+            ),
+        )?;
+        if admission.program_instance != self.identity.instance
+            || admission.workspace_address != workspace_address
+            || admission.artifact_identity != self.identity.artifact
+            || admission.haystack_address != haystack.as_ptr().expose_provenance()
+            || admission.haystack_len != haystack.len()
+            || admission.window.start > admission.window.end
+            || admission.window.end > haystack.len()
+            || state.descriptor_key() != admission.descriptor
+            || state.admission_epoch != admission.admission_epoch
+            || !state.resume.is_bound_to(&self.automaton)
+        {
+            return Err(CompileError::InternalInvariant(
+                "static-prefix resume admission is stale or belongs to a different invocation",
+            ));
+        }
+        Ok(admission.window)
     }
 
     /// Return whether the exact immutable descriptor is already graph-bound
@@ -13717,6 +13968,143 @@ impl CompiledProgram {
         )
     }
 
+    /// Decode and graph-bind a descriptor only after the invocation's sole
+    /// classification returned [`StaticPrefixResumeAdmissionPlan::Cold`].
+    ///
+    /// The descriptor slice must begin at the exact address in the cold
+    /// capability. Its decoder revalidates the complete wire representation;
+    /// this entry does not repeat warm/cold classification.
+    #[doc(hidden)]
+    pub fn bind_cold_static_prefix_resume_object_with_workspace(
+        &self,
+        workspace: &mut ProgramWorkspace,
+        frozen_owner: Option<&FrozenDynamicRowsStorageV3>,
+        object: ColdStaticPrefixResumeObject,
+        descriptor: &[u32],
+    ) -> Result<
+        (
+            StaticPrefixResumeAdmission,
+            Option<FullyPrefilledFallbackReceipt>,
+        ),
+        CompileError,
+    > {
+        let workspace_address = std::ptr::from_ref(&*workspace).expose_provenance();
+        if object.program_instance != self.identity.instance
+            || object.workspace_address != workspace_address
+            || object.artifact_identity != self.identity.artifact
+            || workspace.identity.instance != self.identity.instance
+            || descriptor.as_ptr().expose_provenance() != object.descriptor.address
+        {
+            return Err(CompileError::InternalInvariant(
+                "cold static-prefix object no longer matches its program, workspace, or descriptor",
+            ));
+        }
+        let newly_published = self.bind_cold_static_prefix_resume_descriptor_with_workspace(
+            workspace,
+            frozen_owner,
+            object.descriptor,
+            descriptor,
+        )?;
+        let state = workspace.static_prefix_resume.as_deref_mut().ok_or(
+            CompileError::InternalInvariant(
+                "cold static-prefix binding did not retain its sidecar",
+            ),
+        )?;
+        state.ticket = None;
+        let admission_epoch = state.advance_admission_epoch();
+        Ok((
+            StaticPrefixResumeAdmission {
+                program_instance: object.program_instance,
+                workspace_address: object.workspace_address,
+                artifact_identity: object.artifact_identity,
+                haystack_address: object.haystack_address,
+                haystack_len: object.haystack_len,
+                window: object.window,
+                descriptor: object.descriptor,
+                admission_epoch,
+            },
+            newly_published,
+        ))
+    }
+
+    fn bind_cold_static_prefix_resume_descriptor_with_workspace(
+        &self,
+        workspace: &mut ProgramWorkspace,
+        frozen_owner: Option<&FrozenDynamicRowsStorageV3>,
+        descriptor_key: StaticPrefixResumeDescriptorKey,
+        descriptor: &[u32],
+    ) -> Result<Option<FullyPrefilledFallbackReceipt>, CompileError> {
+        let prior_admission_epoch = workspace
+            .static_prefix_resume
+            .as_deref()
+            .map_or(0, |state| state.admission_epoch);
+        let mut resume = match descriptor_key.version {
+            STATIC_PREFIX_RESUME_DESCRIPTOR_V1_VERSION => {
+                self.static_prefix_resume_set_from_descriptor_v1(descriptor)?
+            }
+            STATIC_PREFIX_RESUME_DESCRIPTOR_V2_VERSION => {
+                self.static_prefix_resume_set_from_descriptor_v2(descriptor)?
+            }
+            _ => {
+                return Err(CompileError::InternalInvariant(
+                    "cold static-prefix binding rejected its descriptor version",
+                ));
+            }
+        };
+        let mut newly_published = None;
+        workspace.mark_dynamic_native_rows_dirty();
+        let fully_prefilled = workspace.nfa.as_mut().and_then(|nfa| {
+            if let Some(k0) = nfa.compiler_private_try_prefill_resume_caches_with_receipt(
+                &self.automaton,
+                &mut resume,
+            ) {
+                let receipt = FullyPrefilledFallbackReceipt {
+                    program_instance: self.identity.instance,
+                    k0,
+                };
+                newly_published = Some(receipt);
+                return Some(receipt);
+            }
+
+            let owner = frozen_owner.filter(|owner| {
+                owner.descriptor_is_valid_for(self.identity)
+                    && owner.root_prefill_receipt.program_instance == self.identity.instance
+            })?;
+            let k0 = nfa
+                .compiler_private_try_bind_resume_to_fully_prefilled_root_cache_with_receipt(
+                    &self.automaton,
+                    &mut resume,
+                    owner.root_prefill_receipt.k0,
+                )
+                .or_else(|| {
+                    nfa.compiler_private_try_extend_fully_prefilled_root_with_resume_receipt(
+                        &self.automaton,
+                        &mut resume,
+                        owner.root_prefill_receipt.k0,
+                    )
+                    .inspect(|&k0| {
+                        newly_published = Some(FullyPrefilledFallbackReceipt {
+                            program_instance: self.identity.instance,
+                            k0,
+                        });
+                    })
+                })?;
+            Some(FullyPrefilledFallbackReceipt {
+                program_instance: self.identity.instance,
+                k0,
+            })
+        });
+        workspace.static_prefix_resume = Some(Box::new(StaticPrefixResumeWorkspace {
+            descriptor_binding: descriptor_key.address,
+            descriptor_version: descriptor_key.version,
+            resume,
+            fully_prefilled,
+            admission_epoch: prior_admission_epoch,
+            ticket: None,
+        }));
+        Ok(newly_published)
+    }
+
     #[allow(
         clippy::too_many_arguments,
         reason = "the versioned hole binding authenticates object sidecar, workspace, and exact call"
@@ -13738,87 +14126,24 @@ impl CompiledProgram {
             workspace,
             expected_artifact_identity,
         )?;
-        if descriptor_binding == 0
-            || !matches!(
-                descriptor_version,
-                STATIC_PREFIX_RESUME_DESCRIPTOR_V1_VERSION
-                    | STATIC_PREFIX_RESUME_DESCRIPTOR_V2_VERSION
-            )
-        {
-            return Err(CompileError::InternalInvariant(
-                "static-prefix hole binding rejected its descriptor address or version",
-            ));
-        }
+        let descriptor_key =
+            StaticPrefixResumeDescriptorKey::new(descriptor_version, descriptor_binding)?;
         let already_bound = workspace
             .static_prefix_resume
             .as_deref()
             .is_some_and(|state| {
-                state.descriptor_binding == descriptor_binding
-                    && state.descriptor_version == descriptor_version
-                    && state.resume.is_bound_to(&self.automaton)
+                state.descriptor_key() == descriptor_key && state.resume.is_bound_to(&self.automaton)
             });
-        let mut newly_published = None;
-        if !already_bound {
-            let mut resume = match descriptor_version {
-                STATIC_PREFIX_RESUME_DESCRIPTOR_V1_VERSION => {
-                    self.static_prefix_resume_set_from_descriptor_v1(descriptor)?
-                }
-                STATIC_PREFIX_RESUME_DESCRIPTOR_V2_VERSION => {
-                    self.static_prefix_resume_set_from_descriptor_v2(descriptor)?
-                }
-                _ => unreachable!("validated static-prefix resume descriptor version"),
-            };
-            workspace.mark_dynamic_native_rows_dirty();
-            let fully_prefilled = workspace.nfa.as_mut().and_then(|nfa| {
-                if let Some(k0) = nfa.compiler_private_try_prefill_resume_caches_with_receipt(
-                    &self.automaton,
-                    &mut resume,
-                ) {
-                    let receipt = FullyPrefilledFallbackReceipt {
-                        program_instance: self.identity.instance,
-                        k0,
-                    };
-                    newly_published = Some(receipt);
-                    return Some(receipt);
-                }
-
-                let owner = frozen_owner.filter(|owner| {
-                    owner.descriptor_is_valid_for(self.identity)
-                        && owner.root_prefill_receipt.program_instance
-                            == self.identity.instance
-                })?;
-                let k0 = nfa
-                    .compiler_private_try_bind_resume_to_fully_prefilled_root_cache_with_receipt(
-                        &self.automaton,
-                        &mut resume,
-                        owner.root_prefill_receipt.k0,
-                    )
-                    .or_else(|| {
-                        nfa.compiler_private_try_extend_fully_prefilled_root_with_resume_receipt(
-                            &self.automaton,
-                            &mut resume,
-                            owner.root_prefill_receipt.k0,
-                        )
-                        .inspect(|&k0| {
-                            newly_published = Some(FullyPrefilledFallbackReceipt {
-                                program_instance: self.identity.instance,
-                                k0,
-                            });
-                        })
-                    })?;
-                Some(FullyPrefilledFallbackReceipt {
-                    program_instance: self.identity.instance,
-                    k0,
-                })
-            });
-            workspace.static_prefix_resume = Some(Box::new(StaticPrefixResumeWorkspace {
-                descriptor_binding,
-                descriptor_version,
-                resume,
-                fully_prefilled,
-                ticket: None,
-            }));
-        }
+        let newly_published = if already_bound {
+            None
+        } else {
+            self.bind_cold_static_prefix_resume_descriptor_with_workspace(
+                workspace,
+                frozen_owner,
+                descriptor_key,
+                descriptor,
+            )?
+        };
 
         workspace
             .static_prefix_resume
@@ -13846,6 +14171,62 @@ impl CompiledProgram {
         haystack: &[u8],
         workspace: &mut ProgramWorkspace,
         owner: &FrozenDynamicRowsStorageV3,
+        resume_state: usize,
+        resume_position: usize,
+        pending_end_word: usize,
+    ) -> Result<Option<FrozenStaticPrefixResumeProjection>, CompileError> {
+        self.try_project_static_prefix_resume_with_frozen_rows_inner(
+            haystack,
+            workspace,
+            owner,
+            None,
+            resume_state,
+            resume_position,
+            pending_end_word,
+        )
+    }
+
+    /// Speculatively project a linear admission into an immutable compact
+    /// state. The projection alone grants no execution authority; the caller
+    /// must consume the same admission through the checked terminal handoff.
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the private projection binds one exact owner, admission, and native frontier"
+    )]
+    pub fn try_project_static_prefix_resume_admission_with_frozen_rows(
+        &self,
+        haystack: &[u8],
+        workspace: &mut ProgramWorkspace,
+        owner: &FrozenDynamicRowsStorageV3,
+        admission: &StaticPrefixResumeAdmission,
+        resume_state: usize,
+        resume_position: usize,
+        pending_end_word: usize,
+    ) -> Result<Option<FrozenStaticPrefixResumeProjection>, CompileError> {
+        self.try_project_static_prefix_resume_with_frozen_rows_inner(
+            haystack,
+            workspace,
+            owner,
+            Some(admission.window),
+            resume_state,
+            resume_position,
+            pending_end_word,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the shared private projection binds one exact owner, window authority, and native frontier"
+    )]
+    fn try_project_static_prefix_resume_with_frozen_rows_inner(
+        &self,
+        haystack: &[u8],
+        workspace: &mut ProgramWorkspace,
+        owner: &FrozenDynamicRowsStorageV3,
+        admitted_window: Option<SearchWindow>,
         resume_state: usize,
         resume_position: usize,
         pending_end_word: usize,
@@ -13891,7 +14272,10 @@ impl CompiledProgram {
                 "static-prefix frozen continuation has no graph-bound sidecar",
             ),
         )?;
-        let window = state.peek(haystack)?;
+        let window = match admitted_window {
+            Some(window) => window,
+            None => state.peek(haystack)?,
+        };
         if resume_position <= window.start || resume_position >= window.end {
             return Err(CompileError::InternalInvariant(
                 "static-prefix frozen continuation position is outside its admitted window",
@@ -14022,6 +14406,38 @@ impl CompiledProgram {
         }))
     }
 
+    /// Linear-admission counterpart for the independently owned closed
+    /// continuation table.
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the private projection binds one exact owner, admission, and native frontier"
+    )]
+    pub fn try_project_static_prefix_resume_admission_with_frozen_static_continuation_rows(
+        &self,
+        haystack: &[u8],
+        workspace: &mut ProgramWorkspace,
+        owner: &FrozenStaticContinuationRowsStorageV1,
+        admission: &StaticPrefixResumeAdmission,
+        resume_state: usize,
+        resume_position: usize,
+        pending_end_word: usize,
+    ) -> Result<Option<FrozenStaticPrefixResumeProjection>, CompileError> {
+        let projection = self.try_project_static_prefix_resume_admission_with_frozen_rows(
+            haystack,
+            workspace,
+            &owner.rows,
+            admission,
+            resume_state,
+            resume_position,
+            pending_end_word,
+        )?;
+        Ok(projection.filter(|projection| {
+            projection.format_version == owner.compiler_private_format_version()
+                && frozen_static_continuation_format_is_supported(projection.format_version)
+        }))
+    }
+
     /// Retire the one-shot admission represented by an authenticated compact
     /// projection before transferring execution to its row engine.
     #[doc(hidden)]
@@ -14059,6 +14475,54 @@ impl CompiledProgram {
             dynamic.native_rows_dirty = true;
         }
         Ok(())
+    }
+
+    /// Consume one linear admission together with the compact projection it
+    /// authorized. A projection cannot independently retire or execute an
+    /// admission, even if its scalar fields were copied by a caller.
+    ///
+    /// Variable-width Span native handoffs receive a new linear reverse-only
+    /// capability. Other output contracts retire the admission here.
+    #[doc(hidden)]
+    #[inline]
+    pub fn consume_static_prefix_resume_admission_projection_with_workspace(
+        &self,
+        haystack: &[u8],
+        workspace: &mut ProgramWorkspace,
+        admission: StaticPrefixResumeAdmission,
+        projection: FrozenStaticPrefixResumeProjection,
+    ) -> Result<Option<StaticPrefixSpanRecoveryAdmission>, CompileError> {
+        let admitted_window =
+            self.validate_static_prefix_resume_admission(haystack, workspace, &admission)?;
+        let ProgramWorkspace {
+            static_prefix_resume,
+            dynamic_native_rows,
+            ..
+        } = workspace;
+        let state = static_prefix_resume.as_deref_mut().ok_or(
+            CompileError::InternalInvariant(
+                "static-prefix frozen projection has no graph-bound sidecar",
+            ),
+        )?;
+        if projection.program_instance != self.identity.instance
+            || state.descriptor_key() != admission.descriptor
+            || state.descriptor_binding != projection.descriptor_binding
+            || state.descriptor_version != projection.descriptor_version
+            || state.fully_prefilled != Some(projection.fully_prefilled)
+            || admitted_window != projection.window
+        {
+            return Err(CompileError::InternalInvariant(
+                "static-prefix frozen projection no longer matches its linear admission",
+            ));
+        }
+        if let Some(dynamic) = dynamic_native_rows.as_deref_mut() {
+            dynamic.native_rows_dirty = true;
+        }
+        if self.output == OutputContract::Span && self.exact_match_width.is_none() {
+            Ok(Some(StaticPrefixSpanRecoveryAdmission(admission)))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Try to continue a compiler-owned static prefix in the immutable
@@ -14101,6 +14565,8 @@ impl CompiledProgram {
         ) else {
             return Ok(None);
         };
+        let projection_window = projection.window;
+        let projection_fully_prefilled = projection.fully_prefilled;
 
         // Only a successfully authenticated and completed immutable scan owns
         // the ticket. Every decline above leaves it available to K0.
@@ -14133,6 +14599,107 @@ impl CompiledProgram {
                             "static-prefix frozen continuation endpoint precedes exact width",
                         ),
                     )?;
+                    if start < projection_window.start {
+                        return Err(CompileError::InternalInvariant(
+                            "static-prefix frozen continuation exact start precedes its window",
+                        ));
+                    }
+                    MatchResult::Span(Some((start, selected_end)))
+                } else {
+                    let recovered_start = self.recover_partial_span_start(
+                        haystack,
+                        projection_window,
+                        nfa.as_mut().ok_or(CompileError::InternalInvariant(
+                            "static-prefix frozen continuation has no reverse K0 workspace",
+                        ))?,
+                        Some(&state.resume),
+                        selected_end,
+                        Some(projection_fully_prefilled),
+                    )?;
+                    MatchResult::Span(Some((recovered_start, selected_end)))
+                }
+            }
+        };
+        Ok(Some(found))
+    }
+
+    /// Try the immutable in-process continuation using one linear admission.
+    /// A decline returns that same admission by value so portable K0 remains
+    /// the only possible terminal consumer.
+    #[doc(hidden)]
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the private continuation binds one exact owner, linear admission, and native frontier"
+    )]
+    pub fn try_search_from_static_prefix_resume_admission_with_frozen_rows(
+        &self,
+        haystack: &[u8],
+        workspace: &mut ProgramWorkspace,
+        owner: &FrozenDynamicRowsStorageV3,
+        admission: StaticPrefixResumeAdmission,
+        resume_state: usize,
+        resume_position: usize,
+        pending_end_word: usize,
+    ) -> Result<StaticPrefixResumeSearchOutcome, CompileError> {
+        let _ = self.validate_static_prefix_resume_admission(
+            haystack,
+            workspace,
+            &admission,
+        )?;
+        let Some(projection) = self
+            .try_project_static_prefix_resume_admission_with_frozen_rows(
+                haystack,
+                workspace,
+                owner,
+                &admission,
+                resume_state,
+                resume_position,
+                pending_end_word,
+            )?
+        else {
+            return Ok(StaticPrefixResumeSearchOutcome::Declined(admission));
+        };
+        let Some(forward) = owner.static_prefix_forward_from_canonical_state(
+            haystack,
+            projection.resume_position,
+            projection.window.end,
+            projection.canonical_state,
+            projection.pending_end,
+            self.output,
+        ) else {
+            return Ok(StaticPrefixResumeSearchOutcome::Declined(admission));
+        };
+
+        let ProgramWorkspace {
+            nfa,
+            static_prefix_resume,
+            dynamic_native_rows,
+            ..
+        } = workspace;
+        let state = static_prefix_resume.as_deref_mut().ok_or(
+            CompileError::InternalInvariant(
+                "static-prefix frozen continuation has no graph-bound sidecar",
+            ),
+        )?;
+        if let Some(dynamic) = dynamic_native_rows.as_deref_mut() {
+            dynamic.native_rows_dirty = true;
+        }
+        let found = match self.output {
+            OutputContract::Exists => MatchResult::Exists(forward.selected_end.is_some()),
+            OutputContract::SelectedEnd => MatchResult::SelectedEnd(forward.selected_end),
+            OutputContract::Span => {
+                let Some(selected_end) = forward.selected_end else {
+                    return Ok(StaticPrefixResumeSearchOutcome::Complete(
+                        MatchResult::Span(None),
+                    ));
+                };
+                if let Some(width) = self.exact_match_width {
+                    let start = selected_end.checked_sub(width).ok_or(
+                        CompileError::InternalInvariant(
+                            "static-prefix frozen continuation endpoint precedes exact width",
+                        ),
+                    )?;
                     if start < projection.window.start {
                         return Err(CompileError::InternalInvariant(
                             "static-prefix frozen continuation exact start precedes its window",
@@ -14154,7 +14721,7 @@ impl CompiledProgram {
                 }
             }
         };
-        Ok(Some(found))
+        Ok(StaticPrefixResumeSearchOutcome::Complete(found))
     }
 
     /// Continue from the exact frontier and first unconsumed byte returned by
@@ -14177,6 +14744,55 @@ impl CompiledProgram {
                 "static-prefix continuation rejected its workspace or graph",
             ));
         }
+        let window = workspace
+            .static_prefix_resume
+            .as_deref_mut()
+            .ok_or(CompileError::InternalInvariant(
+                "static-prefix continuation has no graph-bound sidecar",
+            ))?
+            .consume(haystack)?;
+        self.search_from_static_prefix_resume_admitted_window_with_workspace(
+            haystack,
+            window,
+            workspace,
+            resume_state,
+            resume_position,
+            pending_end_word,
+        )
+    }
+
+    /// Consume a linear admission in the portable K0 continuation.
+    #[doc(hidden)]
+    pub fn search_from_static_prefix_resume_admission_with_workspace(
+        &self,
+        haystack: &[u8],
+        workspace: &mut ProgramWorkspace,
+        admission: StaticPrefixResumeAdmission,
+        resume_state: usize,
+        resume_position: usize,
+        pending_end_word: usize,
+    ) -> Result<MatchResult, CompileError> {
+        let window =
+            self.validate_static_prefix_resume_admission(haystack, workspace, &admission)?;
+        self.search_from_static_prefix_resume_admitted_window_with_workspace(
+            haystack,
+            window,
+            workspace,
+            resume_state,
+            resume_position,
+            pending_end_word,
+        )
+    }
+
+    fn search_from_static_prefix_resume_admitted_window_with_workspace(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+        resume_state: usize,
+        resume_position: usize,
+        pending_end_word: usize,
+    ) -> Result<MatchResult, CompileError> {
         let ProgramWorkspace {
             nfa,
             static_prefix_resume,
@@ -14188,7 +14804,6 @@ impl CompiledProgram {
                 "static-prefix continuation has no graph-bound sidecar",
             ),
         )?;
-        let window = state.consume(haystack)?;
         if resume_position <= window.start || resume_position >= window.end {
             return Err(CompileError::InternalInvariant(
                 "static-prefix continuation position is outside its admitted window",
@@ -14219,6 +14834,58 @@ impl CompiledProgram {
             state.fully_prefilled,
         )?;
         Ok(resumed.found)
+    }
+
+    /// Consume the reverse-only capability minted by a successful
+    /// variable-width Span native continuation.
+    #[doc(hidden)]
+    pub fn recover_static_prefix_span_from_admission_with_workspace(
+        &self,
+        haystack: &[u8],
+        workspace: &mut ProgramWorkspace,
+        admission: StaticPrefixSpanRecoveryAdmission,
+        selected_end: usize,
+    ) -> Result<MatchResult, CompileError> {
+        let StaticPrefixSpanRecoveryAdmission(admission) = admission;
+        let window =
+            self.validate_static_prefix_resume_admission(haystack, workspace, &admission)?;
+        if self.context_dfa.is_some()
+            || !matches!(self.engine, ProgramEngine::OrderedNfa)
+            || self.automaton.stats().has_assertions()
+            || self.output != OutputContract::Span
+            || self.exact_match_width.is_some()
+            || selected_end <= window.start
+            || selected_end > window.end
+        {
+            return Err(CompileError::InternalInvariant(
+                "authenticated static-prefix Span recovery rejected its graph or endpoint",
+            ));
+        }
+        let ProgramWorkspace {
+            nfa,
+            static_prefix_resume,
+            dynamic_native_rows,
+            ..
+        } = workspace;
+        let state = static_prefix_resume.as_deref_mut().ok_or(
+            CompileError::InternalInvariant(
+                "authenticated static-prefix Span recovery has no graph-bound sidecar",
+            ),
+        )?;
+        if let Some(dynamic) = dynamic_native_rows.as_deref_mut() {
+            dynamic.native_rows_dirty = true;
+        }
+        let recovered_start = self.recover_partial_span_start(
+            haystack,
+            window,
+            nfa.as_mut().ok_or(CompileError::InternalInvariant(
+                "authenticated static-prefix Span recovery has no bidirectional K0 workspace",
+            ))?,
+            Some(&state.resume),
+            selected_end,
+            state.fully_prefilled,
+        )?;
+        Ok(MatchResult::Span(Some((recovered_start, selected_end))))
     }
 
     /// Recover a variable-width Span start using the exact static frontier set
@@ -29813,6 +30480,141 @@ mod tests {
     }
 
     #[test]
+    fn cold_static_prefix_classification_revokes_admission_before_failed_bind() {
+        let compiled = program(
+            "abc",
+            OutputContract::SelectedEnd,
+            CompileMode::Fast,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+        );
+        let consuming = compiled
+            .raw
+            .roles
+            .iter()
+            .enumerate()
+            .find_map(|(state, role)| {
+                (*role == StateRole::Consume).then(|| u32::try_from(state).unwrap())
+            })
+            .unwrap();
+        let frontier = [consuming];
+        let descriptor =
+            test_static_prefix_resume_descriptor_v1(&[(&frontier[..], false)]);
+        let descriptor_key = StaticPrefixResumeDescriptorKey::new(
+            STATIC_PREFIX_RESUME_DESCRIPTOR_V1_VERSION,
+            descriptor.as_ptr().expose_provenance(),
+        )
+        .unwrap();
+        let haystack = b"abc";
+        let window = SearchWindow::full(haystack);
+        let mut workspace = compiled.prepare_workspace().unwrap();
+
+        let StaticPrefixResumeAdmissionPlan::Cold(object) = compiled
+            .classify_static_prefix_resume_object_with_workspace(
+                haystack,
+                window,
+                &mut workspace,
+                compiled.identity.artifact,
+                descriptor_key,
+            )
+            .unwrap()
+        else {
+            panic!("a fresh descriptor unexpectedly classified warm");
+        };
+        let (_, _) = compiled
+            .bind_cold_static_prefix_resume_object_with_workspace(
+                &mut workspace,
+                None,
+                object,
+                &descriptor,
+            )
+            .unwrap();
+        let StaticPrefixResumeAdmissionPlan::Warm(warm_admission) = compiled
+            .classify_static_prefix_resume_object_with_workspace(
+                haystack,
+                window,
+                &mut workspace,
+                compiled.identity.artifact,
+                descriptor_key,
+            )
+            .unwrap()
+        else {
+            panic!("the bound descriptor did not classify warm");
+        };
+        assert!(compiled
+            .validate_static_prefix_resume_admission(
+                haystack,
+                &workspace,
+                &warm_admission,
+            )
+            .is_ok());
+
+        let mut malformed = descriptor.clone();
+        malformed[0] ^= 1;
+        let malformed_key = StaticPrefixResumeDescriptorKey::new(
+            STATIC_PREFIX_RESUME_DESCRIPTOR_V1_VERSION,
+            malformed.as_ptr().expose_provenance(),
+        )
+        .unwrap();
+        let StaticPrefixResumeAdmissionPlan::Cold(malformed_object) = compiled
+            .classify_static_prefix_resume_object_with_workspace(
+                haystack,
+                window,
+                &mut workspace,
+                compiled.identity.artifact,
+                malformed_key,
+            )
+            .unwrap()
+        else {
+            panic!("a distinct malformed descriptor unexpectedly classified warm");
+        };
+        assert!(compiled
+            .validate_static_prefix_resume_admission(
+                haystack,
+                &workspace,
+                &warm_admission,
+            )
+            .is_err());
+        assert!(compiled
+            .bind_cold_static_prefix_resume_object_with_workspace(
+                &mut workspace,
+                None,
+                malformed_object,
+                &malformed,
+            )
+            .is_err());
+        assert!(compiled
+            .validate_static_prefix_resume_admission(
+                haystack,
+                &workspace,
+                &warm_admission,
+            )
+            .is_err());
+
+        let StaticPrefixResumeAdmissionPlan::Warm(recovered_admission) = compiled
+            .classify_static_prefix_resume_object_with_workspace(
+                haystack,
+                window,
+                &mut workspace,
+                compiled.identity.artifact,
+                descriptor_key,
+            )
+            .unwrap()
+        else {
+            panic!("failed cold binding replaced the prior valid sidecar");
+        };
+        assert!(compiled
+            .validate_static_prefix_resume_admission(
+                haystack,
+                &workspace,
+                &recovered_admission,
+            )
+            .is_ok());
+    }
+
+    #[test]
     fn static_prefix_resume_peek_is_nondestructive_but_consume_retires_mismatch() {
         let compiled = program(
             "ab",
@@ -29833,6 +30635,7 @@ mod tests {
             descriptor_version: STATIC_PREFIX_RESUME_DESCRIPTOR_V1_VERSION,
             resume,
             fully_prefilled: None,
+            admission_epoch: 0,
             ticket: None,
         };
         let admitted = [b'a', b'b'];
