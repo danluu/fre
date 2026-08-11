@@ -4761,6 +4761,14 @@ enum TransitionLayout {
     /// removes the global class-map dependency at the cost of a 256-byte
     /// ordinal map in every materialized row.
     OrdinalMapBytes(u8),
+    /// A two-value local dictionary keyed by graph class (or by the exact
+    /// column quotient). Two packed cells begin the row; one qword-padded
+    /// membership bitmap selects slot one, while a clear bit selects the
+    /// deterministic modal value in slot zero.
+    BitSliceClasses(u8),
+    /// The same exact two-value dictionary indexed directly by the raw input
+    /// byte. Its 256-bit selector removes the global class-map dependency.
+    BitSliceBytes(u8),
 }
 
 /// Keep the cold resource-rescue lookup small enough to unroll without a
@@ -4863,6 +4871,7 @@ struct NativeOrdinalMapPlan {
     value_capacity: u8,
     comparison_exception_capacity: u8,
     keys: NativeOrdinalMapKeys,
+    kind: NativeLocalMapKind,
     cells: NativeCellEncoding,
     domain_count: u16,
     row_bytes: usize,
@@ -4876,12 +4885,38 @@ enum NativeOrdinalMapKeys {
     Bytes,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum NativeLocalMapKind {
+    Ordinal,
+    BitSlice1,
+}
+
 impl NativeOrdinalMapKeys {
-    const fn transitions(self, value_capacity: u8) -> TransitionLayout {
-        match self {
-            Self::Classes => TransitionLayout::OrdinalMapClasses(value_capacity),
-            Self::Bytes => TransitionLayout::OrdinalMapBytes(value_capacity),
+    const fn transitions(
+        self,
+        kind: NativeLocalMapKind,
+        value_capacity: u8,
+    ) -> TransitionLayout {
+        match (self, kind) {
+            (Self::Classes, NativeLocalMapKind::BitSlice1) => {
+                TransitionLayout::BitSliceClasses(value_capacity)
+            }
+            (Self::Bytes, NativeLocalMapKind::BitSlice1) => {
+                TransitionLayout::BitSliceBytes(value_capacity)
+            }
+            (Self::Classes, NativeLocalMapKind::Ordinal) => {
+                TransitionLayout::OrdinalMapClasses(value_capacity)
+            }
+            (Self::Bytes, NativeLocalMapKind::Ordinal) => {
+                TransitionLayout::OrdinalMapBytes(value_capacity)
+            }
         }
+    }
+}
+
+impl NativeOrdinalMapPlan {
+    const fn transitions(self) -> TransitionLayout {
+        self.keys.transitions(self.kind, self.value_capacity)
     }
 }
 
@@ -5557,6 +5592,79 @@ fn native_ordinal_map_row_bytes(
     value_bytes.checked_add(aligned_domain)
 }
 
+const NATIVE_BIT_SLICE_VALUE_CAPACITY: u8 = 1;
+const NATIVE_BIT_SLICE_BYTE_BITS: usize = 8;
+const NATIVE_BIT_SLICE_WORD_BYTES: usize = core::mem::size_of::<u64>();
+const NATIVE_BIT_SLICE_WORD_BITS: usize = 64;
+
+fn native_bit_slice_bitmap_offset(cells: NativeCellEncoding) -> Option<usize> {
+    let value_bytes = native_ordinal_map_value_bytes(
+        NATIVE_BIT_SLICE_VALUE_CAPACITY,
+        cells,
+    )?;
+    value_bytes
+        .checked_add(NATIVE_BIT_SLICE_WORD_BYTES.checked_sub(1)?)
+        .map(|offset| offset & !(NATIVE_BIT_SLICE_WORD_BYTES - 1))
+}
+
+fn native_bit_slice_bitmap_bytes(domain_count: usize) -> Option<usize> {
+    if !(1..=CLASS_MAP_BYTES).contains(&domain_count) {
+        return None;
+    }
+    domain_count
+        .checked_add(NATIVE_BIT_SLICE_WORD_BITS - 1)?
+        .checked_div(NATIVE_BIT_SLICE_WORD_BITS)?
+        .checked_mul(NATIVE_BIT_SLICE_WORD_BYTES)
+}
+
+fn native_bit_slice_row_bytes(
+    domain_count: usize,
+    cells: NativeCellEncoding,
+) -> Option<usize> {
+    native_bit_slice_bitmap_offset(cells)?
+        .checked_add(native_bit_slice_bitmap_bytes(domain_count)?)
+}
+
+/// Select the ordinary compact or wide packed-cell ABI after fixing the
+/// qword-aligned two-value row. The same absolute token and continuation-hole
+/// proof used by the u8 dictionary applies; only the selector geometry differs.
+fn select_native_bit_slice_encoding(
+    transitions: TransitionLayout,
+    domain_count: usize,
+    physical_forward_states: usize,
+    encoded_hole_states: usize,
+) -> Option<(NativeCellEncoding, usize)> {
+    if !matches!(
+        transitions,
+        TransitionLayout::BitSliceClasses(NATIVE_BIT_SLICE_VALUE_CAPACITY)
+            | TransitionLayout::BitSliceBytes(NATIVE_BIT_SLICE_VALUE_CAPACITY)
+    ) || physical_forward_states == 0
+        || encoded_hole_states == 0
+    {
+        return None;
+    }
+    for cells in [NativeCellEncoding::Compact16, NativeCellEncoding::Wide32] {
+        let row_bytes = native_bit_slice_row_bytes(domain_count, cells)?;
+        let forward_offset = native_table_prefix_bytes(transitions, cells, domain_count)?;
+        let final_hole = physical_forward_states
+            .checked_sub(1)
+            .and_then(|state| state.checked_mul(row_bytes))
+            .and_then(|offset| forward_offset.checked_add(offset))
+            .and_then(|offset| encode_native_row_offset(offset, cells))
+            .and_then(|last_live| last_live.checked_add(encoded_hole_states))
+            .and_then(|token| u32::try_from(token).ok())?;
+        let fits = if cells.is_compact() {
+            final_hole < cells.dead_token()
+        } else {
+            final_hole <= cells.next_mask()
+        };
+        if fits {
+            return Some((cells, row_bytes));
+        }
+    }
+    None
+}
+
 /// Select a packed-cell width only after fixing the local-dictionary row
 /// geometry. Compact tokens retain the ordinary zero-based halfword address;
 /// wide tokens retain their one-based absolute byte address. Hole ordinals
@@ -6126,6 +6234,95 @@ fn append_native_ordinal_map_record(
     Ok(())
 }
 
+fn append_native_bit_slice_record(
+    bytes: &mut Vec<u8>,
+    packed_domain: &[u32],
+    cells: NativeCellEncoding,
+    row_bytes: usize,
+) -> Result<(), ObjectError> {
+    if packed_domain.is_empty()
+        || packed_domain.len() > CLASS_MAP_BYTES
+        || !matches!(cells, NativeCellEncoding::Compact16 | NativeCellEncoding::Wide32)
+        || native_bit_slice_row_bytes(packed_domain.len(), cells) != Some(row_bytes)
+    {
+        return Err(ObjectError::InvalidModule("bit-slice row shape"));
+    }
+    let mut default = packed_domain[0];
+    let mut default_count = 0_usize;
+    for (key, &value) in packed_domain.iter().enumerate() {
+        if packed_domain[..key].contains(&value) {
+            continue;
+        }
+        let count = packed_domain.iter().filter(|&&other| other == value).count();
+        if count > default_count {
+            default = value;
+            default_count = count;
+        }
+    }
+    let alternate = packed_domain
+        .iter()
+        .copied()
+        .find(|&value| value != default)
+        .unwrap_or(default);
+    if packed_domain
+        .iter()
+        .any(|&value| value != default && value != alternate)
+    {
+        return Err(ObjectError::InvalidModule(
+            "bit-slice row exceeds two packed values",
+        ));
+    }
+
+    let row_start = bytes.len();
+    append_native_packed_cell(bytes, default, cells)?;
+    append_native_packed_cell(bytes, alternate, cells)?;
+    let bitmap_offset = native_bit_slice_bitmap_offset(cells).ok_or(
+        ObjectError::InvalidModule("bit-slice bitmap offset"),
+    )?;
+    bytes.resize(
+        row_start
+            .checked_add(bitmap_offset)
+            .ok_or(ObjectError::ArithmeticOverflow("bit-slice bitmap offset"))?,
+        0,
+    );
+    let bitmap_bytes = native_bit_slice_bitmap_bytes(packed_domain.len()).ok_or(
+        ObjectError::InvalidModule("bit-slice bitmap extent"),
+    )?;
+    bytes.resize(
+        bytes
+            .len()
+            .checked_add(bitmap_bytes)
+            .ok_or(ObjectError::ArithmeticOverflow("bit-slice bitmap extent"))?,
+        0,
+    );
+    for (key, &value) in packed_domain.iter().enumerate() {
+        if value != alternate || alternate == default {
+            continue;
+        }
+        let byte = row_start
+            .checked_add(bitmap_offset)
+            .and_then(|offset| offset.checked_add(key / NATIVE_BIT_SLICE_BYTE_BITS))
+            .ok_or(ObjectError::ArithmeticOverflow("bit-slice bitmap byte"))?;
+        let bit = u32::try_from(key % NATIVE_BIT_SLICE_BYTE_BITS)
+            .map_err(|_| ObjectError::ArithmeticOverflow("bit-slice bitmap bit"))?;
+        let mask = 1_u8
+            .checked_shl(bit)
+            .ok_or(ObjectError::ArithmeticOverflow("bit-slice bitmap mask"))?;
+        let slot = bytes.get_mut(byte).ok_or(ObjectError::InvalidModule(
+            "bit-slice bitmap byte is outside its row",
+        ))?;
+        *slot |= mask;
+    }
+    let row_end = row_start
+        .checked_add(row_bytes)
+        .ok_or(ObjectError::ArithmeticOverflow("bit-slice row extent"))?;
+    if bytes.len() > row_end {
+        return Err(ObjectError::InvalidModule("bit-slice row overflow"));
+    }
+    bytes.resize(row_end, 0);
+    Ok(())
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "three exact sparse representations, packed geometry and the cumulative profile share one selection transaction"
@@ -6312,10 +6509,11 @@ fn native_ordinal_map_row_profile(
     Some((value_capacity, comparison_exceptions))
 }
 
-fn derive_native_ordinal_map_plan(
+fn derive_native_local_map_plan(
     view: NativeProgramView<'_>,
     architecture: Architecture,
     keys: NativeOrdinalMapKeys,
+    kind: NativeLocalMapKind,
     exact_rows: Option<&NativeExactRowInternPlan>,
     column_quotient: Option<&NativeColumnQuotientPlan>,
 ) -> Option<NativeOrdinalMapPlan> {
@@ -6397,19 +6595,29 @@ fn derive_native_ordinal_map_plan(
         value_capacity = value_capacity.max(row_values);
         comparison_exception_capacity = comparison_exception_capacity.max(row_exceptions);
     }
-    if value_capacity == 0 {
+    if value_capacity == 0
+        || kind == NativeLocalMapKind::BitSlice1 && value_capacity != 1
+    {
         return None;
     }
     let value_capacity = u8::try_from(value_capacity).ok()?;
     let comparison_exception_capacity = u8::try_from(comparison_exception_capacity).ok()?;
-    let transitions = keys.transitions(value_capacity);
-    let (cells, row_bytes) = select_native_ordinal_map_encoding(
-        transitions,
-        value_capacity,
-        domain_count,
-        physical_forward_states,
-        encoded_hole_states,
-    )?;
+    let transitions = keys.transitions(kind, value_capacity);
+    let (cells, row_bytes) = match kind {
+        NativeLocalMapKind::BitSlice1 => select_native_bit_slice_encoding(
+            transitions,
+            domain_count,
+            physical_forward_states,
+            encoded_hole_states,
+        )?,
+        NativeLocalMapKind::Ordinal => select_native_ordinal_map_encoding(
+            transitions,
+            value_capacity,
+            domain_count,
+            physical_forward_states,
+            encoded_hole_states,
+        )?,
+    };
     let table_bytes = native_machine_bytes(
         transitions,
         cells,
@@ -6452,12 +6660,47 @@ fn derive_native_ordinal_map_plan(
         value_capacity,
         comparison_exception_capacity,
         keys,
+        kind,
         cells,
         domain_count: u16::try_from(domain_count).ok()?,
         row_bytes,
         table_bytes,
         dense_bytes,
     })
+}
+
+fn derive_native_ordinal_map_plan(
+    view: NativeProgramView<'_>,
+    architecture: Architecture,
+    keys: NativeOrdinalMapKeys,
+    exact_rows: Option<&NativeExactRowInternPlan>,
+    column_quotient: Option<&NativeColumnQuotientPlan>,
+) -> Option<NativeOrdinalMapPlan> {
+    derive_native_local_map_plan(
+        view,
+        architecture,
+        keys,
+        NativeLocalMapKind::Ordinal,
+        exact_rows,
+        column_quotient,
+    )
+}
+
+fn derive_native_bit_slice_plan(
+    view: NativeProgramView<'_>,
+    architecture: Architecture,
+    keys: NativeOrdinalMapKeys,
+    exact_rows: Option<&NativeExactRowInternPlan>,
+    column_quotient: Option<&NativeColumnQuotientPlan>,
+) -> Option<NativeOrdinalMapPlan> {
+    derive_native_local_map_plan(
+        view,
+        architecture,
+        keys,
+        NativeLocalMapKind::BitSlice1,
+        exact_rows,
+        column_quotient,
+    )
 }
 
 fn native_default_exception_retry_plan(
@@ -6714,7 +6957,9 @@ fn native_dense_candidate_cost(
         | TransitionLayout::DefaultSparseExceptions(_)
         | TransitionLayout::DefaultByteSparseExceptions(_)
         | TransitionLayout::OrdinalMapClasses(_)
-        | TransitionLayout::OrdinalMapBytes(_) => return None,
+        | TransitionLayout::OrdinalMapBytes(_)
+        | TransitionLayout::BitSliceClasses(_)
+        | TransitionLayout::BitSliceBytes(_) => return None,
     };
     let (hot_instruction_units, address_latency) = match (architecture, layout.cells) {
         (_, NativeCellEncoding::Compact8Direct) => (2, 0),
@@ -6984,7 +7229,7 @@ fn native_ordinal_map_plan_is_admitted(
     exact_rows: Option<&NativeExactRowInternPlan>,
     comparison: Option<NativeDefaultExceptionPlan>,
 ) -> bool {
-    if plan.table_bytes >= plan.dense_bytes {
+    if plan.kind != NativeLocalMapKind::Ordinal || plan.table_bytes >= plan.dense_bytes {
         return false;
     }
     let physical_forward_states = exact_rows.map_or_else(
@@ -7021,6 +7266,52 @@ fn native_ordinal_map_plan_is_admitted(
     plan.table_bytes <= DIRECT_BYTE_TABLE_BUDGET || data_dominates
 }
 
+fn native_bit_slice_plan_is_admitted(
+    view: NativeProgramView<'_>,
+    plan: NativeOrdinalMapPlan,
+    exact_rows: Option<&NativeExactRowInternPlan>,
+    comparison: Option<NativeDefaultExceptionPlan>,
+    ordinal: NativeOrdinalMapPlan,
+) -> bool {
+    if plan.kind != NativeLocalMapKind::BitSlice1
+        || plan.value_capacity != NATIVE_BIT_SLICE_VALUE_CAPACITY
+        || ordinal.kind != NativeLocalMapKind::Ordinal
+        || ordinal.value_capacity != NATIVE_BIT_SLICE_VALUE_CAPACITY
+        || plan.keys != ordinal.keys
+        || plan.domain_count != ordinal.domain_count
+        || plan.table_bytes >= plan.dense_bytes
+        || plan.table_bytes > ordinal.table_bytes
+    {
+        return false;
+    }
+    let physical_forward_states = exact_rows.map_or_else(
+        || {
+            view.dfa
+                .forward_cells
+                .len()
+                .checked_div(view.dfa.class_count)
+                .unwrap_or(0)
+        },
+        NativeExactRowInternPlan::physical_rows,
+    );
+    let comparison_bytes = comparison.and_then(|comparison| {
+        native_machine_bytes(
+            comparison.keys.transitions(comparison.exception_capacity),
+            comparison.cells,
+            view.dfa.class_count,
+            physical_forward_states,
+            0,
+        )
+        .map(|bytes| (bytes, comparison.cells))
+    });
+    if comparison_bytes.is_some_and(|(_, cells)| {
+        cells == NativeCellEncoding::Compact16 && plan.cells == NativeCellEncoding::Wide32
+    }) {
+        return false;
+    }
+    comparison_bytes.is_none_or(|(bytes, _)| plan.table_bytes <= bytes)
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "all local-dictionary descriptors share one exact retry and admission transaction"
@@ -7040,7 +7331,8 @@ fn build_native_ordinal_retry(
     if !is_optional_native_table_decline(dense_error) {
         return Ok(None);
     }
-    let mut candidates = [None; NativeOrdinalCandidateId::ALL.len()];
+    let mut ordinal_candidates = [None; NativeOrdinalCandidateId::ALL.len()];
+    let mut bit_slice_candidates = [None; NativeOrdinalCandidateId::ALL.len()];
     for stable_id in NativeOrdinalCandidateId::ALL {
         let candidate_exact = stable_id.uses_exact_rows().then_some(exact_rows).flatten();
         let candidate_quotient = stable_id
@@ -7052,7 +7344,7 @@ fn build_native_ordinal_retry(
         {
             continue;
         }
-        let Some(plan) = derive_native_ordinal_map_plan(
+        let Some(ordinal) = derive_native_ordinal_map_plan(
             view,
             architecture,
             stable_id.keys(),
@@ -7061,28 +7353,65 @@ fn build_native_ordinal_retry(
         ) else {
             continue;
         };
-        if native_ordinal_map_plan_is_admitted(view, plan, candidate_exact, comparison) {
-            candidates[stable_id.index()] = Some(plan);
+        if native_ordinal_map_plan_is_admitted(view, ordinal, candidate_exact, comparison) {
+            ordinal_candidates[stable_id.index()] = Some(ordinal);
+        }
+        if let Some(bit_slice) = derive_native_bit_slice_plan(
+            view,
+            architecture,
+            stable_id.keys(),
+            candidate_exact,
+            candidate_quotient,
+        )
+            && native_bit_slice_plan_is_admitted(
+                view,
+                bit_slice,
+                candidate_exact,
+                comparison,
+                ordinal,
+            )
+        {
+            bit_slice_candidates[stable_id.index()] = Some(bit_slice);
         }
     }
 
-    while candidates.iter().any(Option::is_some) {
+    while ordinal_candidates.iter().any(Option::is_some)
+        || bit_slice_candidates.iter().any(Option::is_some)
+    {
         let best_for = |keys| {
-            NativeOrdinalCandidateId::ALL
-                .iter()
-                .copied()
-                .filter(|&stable_id| stable_id.keys() == keys)
-                .filter_map(|stable_id| {
-                    candidates[stable_id.index()].map(|plan| (stable_id, plan))
-                })
-                .min_by_key(|(stable_id, plan)| (plan.table_bytes, *stable_id))
+            let mut best = None;
+            for stable_id in NativeOrdinalCandidateId::ALL {
+                if stable_id.keys() != keys {
+                    continue;
+                }
+                for plan in [
+                    bit_slice_candidates[stable_id.index()],
+                    ordinal_candidates[stable_id.index()],
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    let rank = (plan.table_bytes, plan.kind, stable_id);
+                    if best.is_none_or(
+                        |(best_id, best_plan): (
+                            NativeOrdinalCandidateId,
+                            NativeOrdinalMapPlan,
+                        )| rank < (best_plan.table_bytes, best_plan.kind, best_id),
+                    ) {
+                        best = Some((stable_id, plan));
+                    }
+                }
+            }
+            best
         };
         let class = best_for(NativeOrdinalMapKeys::Classes);
         let raw = best_for(NativeOrdinalMapKeys::Bytes);
         let selected = match (class, raw) {
             (Some(class), Some(raw)) => {
                 let raw_dominates = raw.1.table_bytes <= class.1.table_bytes;
-                let bounded_raw = raw.1.table_bytes <= DIRECT_BYTE_TABLE_BUDGET
+                let bounded_raw = raw.1.kind == NativeLocalMapKind::Ordinal
+                    && class.1.kind == NativeLocalMapKind::Ordinal
+                    && raw.1.table_bytes <= DIRECT_BYTE_TABLE_BUDGET
                     && class
                         .1
                         .table_bytes
@@ -7094,7 +7423,14 @@ fn build_native_ordinal_retry(
             (None, Some(raw)) => raw,
             (None, None) => break,
         };
-        candidates[selected.0.index()] = None;
+        match selected.1.kind {
+            NativeLocalMapKind::BitSlice1 => {
+                bit_slice_candidates[selected.0.index()] = None;
+            }
+            NativeLocalMapKind::Ordinal => {
+                ordinal_candidates[selected.0.index()] = None;
+            }
+        }
         let candidate_exact = selected
             .0
             .uses_exact_rows()
@@ -7396,7 +7732,9 @@ impl TransitionLayout {
             | Self::DefaultSparseExceptions(_)
             | Self::DefaultByteSparseExceptions(_)
             | Self::OrdinalMapClasses(_)
-            | Self::OrdinalMapBytes(_) => 0,
+            | Self::OrdinalMapBytes(_)
+            | Self::BitSliceClasses(_)
+            | Self::BitSliceBytes(_) => 0,
         }
     }
 
@@ -7410,8 +7748,9 @@ impl TransitionLayout {
             | Self::DefaultByteBoundaries(_)
             | Self::DefaultByteSparseExceptions(_)
             | Self::OrdinalMapBytes(_)
+            | Self::BitSliceBytes(_)
             | Self::DirectByte => 0,
-            Self::OrdinalMapClasses(_) => CLASS_MAP_BYTES,
+            Self::OrdinalMapClasses(_) | Self::BitSliceClasses(_) => CLASS_MAP_BYTES,
         }
     }
 }
@@ -7433,6 +7772,10 @@ fn native_default_exception_layout_is_valid(layout: &NativeDfaLayout) -> bool {
         }
         TransitionLayout::OrdinalMapClasses(capacity)
         | TransitionLayout::OrdinalMapBytes(capacity) => capacity != 0,
+        TransitionLayout::BitSliceClasses(capacity)
+        | TransitionLayout::BitSliceBytes(capacity) => {
+            capacity == NATIVE_BIT_SLICE_VALUE_CAPACITY
+        }
         TransitionLayout::ClassMapped | TransitionLayout::DirectByte => {
             return layout.sparse_boundary_profile.is_none();
         }
@@ -7477,13 +7820,22 @@ fn native_row_bytes(
             NativeCellEncoding::Compact16 | NativeCellEncoding::Wide32,
         ) if capacity != 0 => native_ordinal_map_row_bytes(capacity, class_count, cells),
         (
+            TransitionLayout::BitSliceClasses(capacity)
+            | TransitionLayout::BitSliceBytes(capacity),
+            NativeCellEncoding::Compact16 | NativeCellEncoding::Wide32,
+        ) if capacity == NATIVE_BIT_SLICE_VALUE_CAPACITY => {
+            native_bit_slice_row_bytes(class_count, cells)
+        }
+        (
             TransitionLayout::DefaultExceptions(_)
             | TransitionLayout::DefaultByteExceptions(_)
             | TransitionLayout::DefaultByteBoundaries(_)
             | TransitionLayout::DefaultSparseExceptions(_)
             | TransitionLayout::DefaultByteSparseExceptions(_)
             | TransitionLayout::OrdinalMapClasses(_)
-            | TransitionLayout::OrdinalMapBytes(_),
+            | TransitionLayout::OrdinalMapBytes(_)
+            | TransitionLayout::BitSliceClasses(_)
+            | TransitionLayout::BitSliceBytes(_),
             _,
         ) => None,
         (TransitionLayout::ClassMapped, NativeCellEncoding::Compact8Direct) => None,
@@ -7533,13 +7885,20 @@ fn native_table_prefix_bytes(
             NativeCellEncoding::Compact16 | NativeCellEncoding::Wide32,
         ) if capacity != 0 => Some(prefix),
         (
+            TransitionLayout::BitSliceClasses(capacity)
+            | TransitionLayout::BitSliceBytes(capacity),
+            NativeCellEncoding::Compact16 | NativeCellEncoding::Wide32,
+        ) if capacity == NATIVE_BIT_SLICE_VALUE_CAPACITY => Some(prefix),
+        (
             TransitionLayout::DefaultExceptions(_)
             | TransitionLayout::DefaultByteExceptions(_)
             | TransitionLayout::DefaultByteBoundaries(_)
             | TransitionLayout::DefaultSparseExceptions(_)
             | TransitionLayout::DefaultByteSparseExceptions(_)
             | TransitionLayout::OrdinalMapClasses(_)
-            | TransitionLayout::OrdinalMapBytes(_),
+            | TransitionLayout::OrdinalMapBytes(_)
+            | TransitionLayout::BitSliceClasses(_)
+            | TransitionLayout::BitSliceBytes(_),
             _,
         ) => None,
         (TransitionLayout::ClassMapped, NativeCellEncoding::Compact8Direct) => None,
@@ -10036,12 +10395,12 @@ fn build_native_dfa_table_with_cost_model_data_limit_and_asimd_policy(
     let dense_error = canonical_decline.ok_or(ObjectError::InvalidModule(
         "native dense candidate ranking lost the canonical lowering",
     ))?;
-    // Sparse rows remain a resource-only alternate after every feasible dense
-    // representation. This prevents a branchier modal row from shadowing a
-    // smaller exact or column-quotient dense table. Exact duplicate normalized
-    // rows produce identical class and byte-modal records, so try those proved
-    // compositions before the uninterned record. Boundary records retain their
-    // established uninterned route until they have an independent oracle.
+    // Sparse and local-map rows remain resource-only alternates after every
+    // feasible dense representation. This prevents a branchier modal or
+    // bitmap row from shadowing a smaller exact or column-quotient dense table.
+    // Exact duplicate normalized rows produce identical records, so try those
+    // proved compositions before the uninterned record. Boundary records keep
+    // their established uninterned route until they have an independent oracle.
     let comparison_plan =
         native_default_exception_retry_plan(view, architecture, &dense_error);
     if let Some(lowering) = build_native_ordinal_retry(
@@ -10221,7 +10580,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
     let dfa = view.dfa;
     if default_exceptions.is_some() && ordinal_map.is_some() {
         return Err(ObjectError::InvalidModule(
-            "comparison and ordinal fallback rows overlap",
+            "comparison and local-map fallback rows overlap",
         ));
     }
     if force_class_mapped && (default_exceptions.is_some() || ordinal_map.is_some()) {
@@ -10355,7 +10714,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
     {
         if column_quotient.is_some() {
             return Err(ObjectError::InvalidModule(
-                "raw ordinal rows retained a column quotient",
+                "raw local-map rows retained a column quotient",
             ));
         }
         CLASS_MAP_BYTES
@@ -10451,22 +10810,32 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
         }
         (transitions, plan.cells)
     } else if let Some(plan) = ordinal_map {
-        let transitions = plan.keys.transitions(plan.value_capacity);
-        let encoding_is_valid = select_native_ordinal_map_encoding(
-            transitions,
-            plan.value_capacity,
-            table_class_count,
-            physical_forward_states,
-            encoded_hole_states,
-        ) == Some((plan.cells, plan.row_bytes));
+        let transitions = plan.transitions();
+        let encoding_is_valid = match plan.kind {
+            NativeLocalMapKind::BitSlice1 => select_native_bit_slice_encoding(
+                transitions,
+                table_class_count,
+                physical_forward_states,
+                encoded_hole_states,
+            ),
+            NativeLocalMapKind::Ordinal => select_native_ordinal_map_encoding(
+                transitions,
+                plan.value_capacity,
+                table_class_count,
+                physical_forward_states,
+                encoded_hole_states,
+            ),
+        } == Some((plan.cells, plan.row_bytes));
         if encoded_hole_states == 0
             || retained_reverse_states != 0
             || usize::from(plan.domain_count) != table_class_count
             || plan.value_capacity == 0
+            || plan.kind == NativeLocalMapKind::BitSlice1
+                && plan.value_capacity != NATIVE_BIT_SLICE_VALUE_CAPACITY
             || !encoding_is_valid
         {
             return Err(ObjectError::InvalidModule(
-                "ordinal-map rows have an invalid partial shape",
+                "local-map rows have an invalid partial shape",
             ));
         }
         (transitions, plan.cells)
@@ -10506,7 +10875,9 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
     if column_quotient.is_some() {
         if !matches!(
             transitions,
-            TransitionLayout::ClassMapped | TransitionLayout::OrdinalMapClasses(_)
+            TransitionLayout::ClassMapped
+                | TransitionLayout::OrdinalMapClasses(_)
+                | TransitionLayout::BitSliceClasses(_)
         ) {
             return Err(ObjectError::InvalidModule(
                 "native column quotient requires class-mapped transitions",
@@ -11356,36 +11727,40 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
             }
         }
         TransitionLayout::OrdinalMapClasses(value_capacity)
-        | TransitionLayout::OrdinalMapBytes(value_capacity) => {
+        | TransitionLayout::OrdinalMapBytes(value_capacity)
+        | TransitionLayout::BitSliceClasses(value_capacity)
+        | TransitionLayout::BitSliceBytes(value_capacity) => {
             let partial = partial_layout.ok_or(ObjectError::InvalidModule(
-                "ordinal-map rows have no partial layout",
+                "local-map rows have no partial layout",
             ))?;
             for physical_state in 0..physical_forward_states {
                 let semantic_state = exact_rows
                     .map(|plan| {
                         plan.representative(physical_state).ok_or(
                             ObjectError::InvalidModule(
-                                "exact ordinal row has no semantic representative",
+                                "exact local-map row has no semantic representative",
                             ),
                         )
                     })
                     .transpose()?
                     .unwrap_or(physical_state);
                 let semantic_row = semantic_state.checked_mul(dfa.class_count).ok_or(
-                    ObjectError::ArithmeticOverflow("native ordinal semantic row"),
+                    ObjectError::ArithmeticOverflow("native local-map semantic row"),
                 )?;
                 let mut packed_domain = [0_u32; CLASS_MAP_BYTES];
                 for key in 0..table_class_count {
                     let graph_class = match transitions {
-                        TransitionLayout::OrdinalMapClasses(_) => column_quotient
+                        TransitionLayout::OrdinalMapClasses(_)
+                        | TransitionLayout::BitSliceClasses(_) => column_quotient
                             .and_then(|plan| plan.representative_classes.get(key))
                             .copied()
                             .map(usize::from)
                             .unwrap_or(key),
-                        TransitionLayout::OrdinalMapBytes(_) => {
+                        TransitionLayout::OrdinalMapBytes(_)
+                        | TransitionLayout::BitSliceBytes(_) => {
                             usize::from(*dfa.byte_classes.get(key).ok_or(
                                 ObjectError::InvalidModule(
-                                    "ordinal raw byte is outside the class map",
+                                    "local-map raw byte is outside the class map",
                                 ),
                             )?)
                         }
@@ -11395,14 +11770,14 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
                         .forward_cells
                         .get(semantic_row.checked_add(graph_class).ok_or(
                             ObjectError::ArithmeticOverflow(
-                                "native ordinal semantic cell",
+                                "native local-map semantic cell",
                             ),
                         )?)
                         .ok_or(ObjectError::InvalidModule(
-                            "native ordinal semantic row is outside its table",
+                            "native local-map semantic row is outside its table",
                         ))?;
                     *packed_domain.get_mut(key).ok_or(
-                        ObjectError::InvalidModule("native ordinal domain extent"),
+                        ObjectError::InvalidModule("native local-map domain extent"),
                     )? = pack_native_partial_forward_cell_with_exact_rows(
                         cell.next(),
                         cell.accepted(),
@@ -11416,15 +11791,31 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
                         exact_rows,
                     )?;
                 }
-                append_native_ordinal_map_record(
-                    &mut bytes,
-                    packed_domain.get(..table_class_count).ok_or(
-                        ObjectError::InvalidModule("native ordinal packed domain"),
-                    )?,
-                    value_capacity,
-                    cells,
-                    row_bytes,
+                let packed_domain = packed_domain.get(..table_class_count).ok_or(
+                    ObjectError::InvalidModule("native local-map packed domain"),
                 )?;
+                match transitions {
+                    TransitionLayout::OrdinalMapClasses(_)
+                    | TransitionLayout::OrdinalMapBytes(_) => {
+                        append_native_ordinal_map_record(
+                            &mut bytes,
+                            packed_domain,
+                            value_capacity,
+                            cells,
+                            row_bytes,
+                        )?;
+                    }
+                    TransitionLayout::BitSliceClasses(_)
+                    | TransitionLayout::BitSliceBytes(_) => {
+                        append_native_bit_slice_record(
+                            &mut bytes,
+                            packed_domain,
+                            cells,
+                            row_bytes,
+                        )?;
+                    }
+                    _ => unreachable!("guarded local-map transition layout"),
+                }
             }
         }
     }
@@ -11494,7 +11885,9 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
             | TransitionLayout::DefaultSparseExceptions(_)
             | TransitionLayout::DefaultByteSparseExceptions(_)
             | TransitionLayout::OrdinalMapClasses(_)
-            | TransitionLayout::OrdinalMapBytes(_) => {
+            | TransitionLayout::OrdinalMapBytes(_)
+            | TransitionLayout::BitSliceClasses(_)
+            | TransitionLayout::BitSliceBytes(_) => {
                 return Err(ObjectError::InvalidModule(
                     "default-exception rows retained a reverse machine",
                 ));
@@ -15452,6 +15845,36 @@ fn x86_emit_ordinal_map_lookup(
     Ok(())
 }
 
+fn x86_emit_bit_slice_lookup(
+    assembler: &mut X86Assembler,
+    value_capacity: u8,
+    cells: NativeCellEncoding,
+) -> Result<(), ObjectError> {
+    if value_capacity != NATIVE_BIT_SLICE_VALUE_CAPACITY
+        || !matches!(cells, NativeCellEncoding::Compact16 | NativeCellEncoding::Wide32)
+    {
+        return Err(ObjectError::InvalidModule("x86 bit-slice row shape"));
+    }
+    let bitmap_offset = native_bit_slice_bitmap_offset(cells)
+        .and_then(|offset| u8::try_from(offset).ok())
+        .ok_or(ObjectError::ArithmeticOverflow("x86 bit-slice bitmap offset"))?;
+    // RAX is a zero-extended class/raw-byte ordinal. BT treats the aligned
+    // qwords beginning at this displacement as one bit string, so the row's
+    // padded final word proves every possible register-indexed access.
+    assembler.instruction(&[0x49, 0x0f, 0xa3, 0x42, bitmap_offset])?;
+    assembler.instruction(&[0x0f, 0x92, 0xc0])?; // setc al
+    match cells {
+        NativeCellEncoding::Compact16 => {
+            assembler.instruction(&[0x41, 0x0f, 0xb7, 0x04, 0x42])?;
+        }
+        NativeCellEncoding::Wide32 => {
+            assembler.instruction(&[0x41, 0x8b, 0x04, 0x82])?;
+        }
+        _ => unreachable!("validated x86 bit-slice cell width"),
+    }
+    Ok(())
+}
+
 fn x86_emit_table_lookup(
     assembler: &mut X86Assembler,
     transitions: TransitionLayout,
@@ -15635,6 +16058,15 @@ fn x86_emit_table_lookup_with_sparse_boundary_tier(
         }
         TransitionLayout::OrdinalMapBytes(value_capacity) => {
             x86_emit_ordinal_map_lookup(assembler, value_capacity, cells)?;
+            return Ok(());
+        }
+        TransitionLayout::BitSliceClasses(value_capacity) => {
+            assembler.instruction(&[0x41, 0x0f, 0xb6, 0x04, 0x01])?; // eax = class_map[eax]
+            x86_emit_bit_slice_lookup(assembler, value_capacity, cells)?;
+            return Ok(());
+        }
+        TransitionLayout::BitSliceBytes(value_capacity) => {
+            x86_emit_bit_slice_lookup(assembler, value_capacity, cells)?;
             return Ok(());
         }
     }
@@ -29326,6 +29758,41 @@ fn aarch64_emit_ordinal_map_lookup(
     Ok(())
 }
 
+fn aarch64_emit_bit_slice_lookup(
+    assembler: &mut Aarch64Assembler,
+    value_capacity: u8,
+    cells: NativeCellEncoding,
+) -> Result<(), ObjectError> {
+    if value_capacity != NATIVE_BIT_SLICE_VALUE_CAPACITY
+        || !matches!(cells, NativeCellEncoding::Compact16 | NativeCellEncoding::Wide32)
+    {
+        return Err(ObjectError::InvalidModule("AArch64 bit-slice row shape"));
+    }
+    let bitmap_offset = native_bit_slice_bitmap_offset(cells)
+        .and_then(|offset| u16::try_from(offset).ok())
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "AArch64 bit-slice bitmap offset",
+        ))?;
+    // X8 is a zero-extended class/raw-byte ordinal. X10 and X12 are the
+    // established transient bitmap scratch pair and are dead at the scalar
+    // transition boundary on ASIMD, SVE and SVE2 entries alike.
+    assembler.instruction(aarch64_lsr_x_imm(10, 8, 6)?)?;
+    assembler.instruction(aarch64_add_x_imm(12, 11, bitmap_offset)?)?;
+    assembler.instruction(aarch64_load_x_lsl3(10, 12, 10)?)?;
+    assembler.instruction(aarch64_lsrv_x(10, 10, 8)?)?;
+    assembler.instruction(aarch64_and_low_x(10, 10, 1)?)?;
+    match cells {
+        NativeCellEncoding::Compact16 => {
+            assembler.instruction(aarch64_load_h_uxtw(8, 11, 10)?)?;
+        }
+        NativeCellEncoding::Wide32 => {
+            assembler.instruction(aarch64_load_w_uxtw(8, 11, 10)?)?;
+        }
+        _ => unreachable!("validated AArch64 bit-slice cell width"),
+    }
+    Ok(())
+}
+
 fn aarch64_emit_table_lookup(
     assembler: &mut Aarch64Assembler,
     transitions: TransitionLayout,
@@ -29493,6 +29960,15 @@ fn aarch64_emit_table_lookup_with_sparse_boundary_tier(
         }
         TransitionLayout::OrdinalMapBytes(value_capacity) => {
             aarch64_emit_ordinal_map_lookup(assembler, value_capacity, cells)?;
+            return Ok(());
+        }
+        TransitionLayout::BitSliceClasses(value_capacity) => {
+            assembler.instruction(aarch64_load_byte_reg(8, 5, 8)?)?;
+            aarch64_emit_bit_slice_lookup(assembler, value_capacity, cells)?;
+            return Ok(());
+        }
+        TransitionLayout::BitSliceBytes(value_capacity) => {
+            aarch64_emit_bit_slice_lookup(assembler, value_capacity, cells)?;
             return Ok(());
         }
     }
@@ -41117,6 +41593,86 @@ mod tests {
         }
     }
 
+    /// Six distinct binary rows are repeated exactly, while adjacent graph
+    /// classes are exact transition-column aliases. The six row bits retain
+    /// all 64 quotient columns and exercise live, accepted, dead, and partial
+    /// destinations without ever exceeding the Bit1 cardinality bound.
+    struct BitSliceComposeFixture {
+        byte_classes: [u8; 256],
+        class_representatives: [u8; 128],
+        forward_cells: Vec<ForwardCell>,
+    }
+
+    impl BitSliceComposeFixture {
+        const CLASS_COUNT: usize = 128;
+        const COMPLETE_ROWS: usize = 60;
+        const DISCOVERED_STATES: usize = Self::COMPLETE_ROWS + 4;
+        const QUOTIENT_CLASS_COUNT: usize = 64;
+        const PHYSICAL_ROWS: usize = 6;
+
+        fn new() -> Self {
+            let byte_classes = core::array::from_fn(|byte| {
+                u8::try_from(byte % Self::CLASS_COUNT).unwrap()
+            });
+            let class_representatives = core::array::from_fn(|class| {
+                u8::try_from(class).unwrap()
+            });
+            let complete_rows = u32::try_from(Self::COMPLETE_ROWS).unwrap();
+            let alternates = [
+                ForwardCell::new(1, false),
+                ForwardCell::new(NO_DFA_STATE, false),
+                ForwardCell::new(complete_rows, false),
+                ForwardCell::new(2, true),
+                ForwardCell::new(NO_DFA_STATE, true),
+                ForwardCell::new(complete_rows + 3, true),
+            ];
+            let ordinary = ForwardCell::new(0, false);
+            let mut forward_cells = Vec::with_capacity(
+                Self::COMPLETE_ROWS * Self::CLASS_COUNT,
+            );
+            for state in 0..Self::COMPLETE_ROWS {
+                let bit = state % Self::PHYSICAL_ROWS;
+                for class in 0..Self::CLASS_COUNT {
+                    let quotient = class / 2;
+                    forward_cells.push(if quotient & (1_usize << bit) == 0 {
+                        ordinary
+                    } else {
+                        alternates[bit]
+                    });
+                }
+            }
+            Self {
+                byte_classes,
+                class_representatives,
+                forward_cells,
+            }
+        }
+
+        fn view<'a>(&'a self, base: NativeProgramView<'a>) -> NativeProgramView<'a> {
+            NativeProgramView {
+                dfa: NativeDfaView {
+                    initial_state: 0,
+                    initial_pending: false,
+                    initial_terminal: false,
+                    byte_classes: &self.byte_classes,
+                    class_count: Self::CLASS_COUNT,
+                    class_representatives: &self.class_representatives,
+                    forward_cells: &self.forward_cells,
+                    reverse_initial: None,
+                    reverse_cells: &[],
+                },
+                partial_discovered_states: Some(Self::DISCOVERED_STATES),
+                collapse_partial_holes: false,
+                exact_match_width: None,
+                max_match_width: None,
+                exact_product_width: None,
+                retained_prefix_requirement: None,
+                retained_suffix_requirement: None,
+                ..base
+            }
+        }
+    }
+
     /// A non-power-of-two compact row whose padded indexed image narrowly
     /// misses the x86 cost gate. The exact physical-row ordinal image is one
     /// half of Wide32 and remains beyond the conservative L1 share, so both
@@ -41480,6 +42036,40 @@ mod tests {
         )
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the test oracle indexes one already validated fixed-stride bit-slice row"
+    )]
+    fn bit_slice_packed_at(
+        data: &[u8],
+        layout: NativeDfaLayout,
+        domain_count: usize,
+        physical_state: usize,
+        key: u8,
+    ) -> u32 {
+        let capacity = match layout.transitions {
+            TransitionLayout::BitSliceClasses(capacity)
+            | TransitionLayout::BitSliceBytes(capacity) => capacity,
+            other => panic!("expected bit-slice rows, got {other:?}"),
+        };
+        assert_eq!(capacity, NATIVE_BIT_SLICE_VALUE_CAPACITY);
+        let row_bytes = native_bit_slice_row_bytes(domain_count, layout.cells).unwrap();
+        let bitmap_offset = native_bit_slice_bitmap_offset(layout.cells).unwrap();
+        let row_start = usize::try_from(layout.forward_offset).unwrap()
+            + physical_state * row_bytes;
+        let key = usize::from(key);
+        let ordinal = usize::from(
+            data[row_start + bitmap_offset + key / NATIVE_BIT_SLICE_BYTE_BITS]
+                >> u32::try_from(key % NATIVE_BIT_SLICE_BYTE_BITS).unwrap()
+                & 1,
+        );
+        read_native_packed_cell(
+            data,
+            row_start + ordinal * layout.cells.bytes(),
+            layout.cells,
+        )
+    }
+
     #[derive(Clone, Copy)]
     struct LinkedSparseNativeFixture {
         byte_cells: [ForwardCell; CLASS_MAP_BYTES],
@@ -41641,6 +42231,161 @@ mod tests {
             })?,
             sparse_boundary_profile: Some(sparse_boundary_profile),
             asimd_lane_index_offset,
+            initial_pending: false,
+            initial_terminal: false,
+            has_reverse: false,
+            partial: Some(partial),
+            exact_span_width: (output == OutputContract::Span).then_some(1),
+            exact_prefix_match_width: None,
+            output,
+            start_filter: None,
+            exact_start_byte_set: None,
+            exact_start_storage: None,
+            suffix_filter: None,
+            declined_redundant_root_reverse: false,
+            seeded_reverse: None,
+            loop_skip: None,
+            vector_filter: None,
+            prefix_filter: None,
+            prefix_relation: None,
+            prefix_block: None,
+            prefix_fast_forward: None,
+        };
+        let emission = match target.architecture {
+            Architecture::X86_64 => lower_x86_64_dfa_with_entry_contract(
+                layout,
+                target.features,
+                NativeDfaEntryContract::PreparedPartialCore,
+            )?,
+            Architecture::Aarch64 => lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
+                layout,
+                target.features,
+                target.operating_system,
+                None,
+                None,
+                NativeDfaEntryContract::PreparedPartialCore,
+            )?,
+        };
+        Ok((
+            NativeLowering {
+                code: emission.code,
+                data,
+                relocations: emission.relocations,
+                slow_partial_table: None,
+                needs_runtime: false,
+                start_accelerator: StartAccelerator::Scalar,
+                anchored_prefix_filter_bytes: 0,
+            },
+            LinkedSparseNativeFixture {
+                byte_cells,
+                partial,
+            },
+        ))
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the linked fixture constructs one exact two-value bitmap row and its independent byte oracle"
+    )]
+    fn linked_bit_slice_native_fixture(
+        target: Target,
+        cells: NativeCellEncoding,
+        keys: NativeOrdinalMapKeys,
+        collapse_holes: bool,
+        output: OutputContract,
+        alternate: ForwardCell,
+    ) -> Result<(NativeLowering, LinkedSparseNativeFixture), ObjectError> {
+        assert!(matches!(
+            cells,
+            NativeCellEncoding::Compact16 | NativeCellEncoding::Wide32
+        ));
+        let transitions = keys.transitions(
+            NativeLocalMapKind::BitSlice1,
+            NATIVE_BIT_SLICE_VALUE_CAPACITY,
+        );
+        let row_bytes = native_bit_slice_row_bytes(CLASS_MAP_BYTES, cells)
+            .expect("linked bit-slice row geometry");
+        let forward_offset =
+            native_table_prefix_bytes(transitions, cells, CLASS_MAP_BYTES)
+                .expect("linked bit-slice table prefix");
+        let reverse_offset = forward_offset
+            .checked_add(row_bytes)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "linked bit-slice machine extent",
+            ))?;
+        let last_live_token = encode_native_row_offset(forward_offset, cells).ok_or(
+            ObjectError::InvalidModule("linked bit-slice initial row token"),
+        )?;
+        let partial = NativePartialDfaLayout {
+            hole_token_base: u32::try_from(last_live_token.checked_add(1).ok_or(
+                ObjectError::ArithmeticOverflow("linked bit-slice hole base"),
+            )?)
+            .map_err(|_| ObjectError::ArithmeticOverflow("linked bit-slice hole base"))?,
+            resume_states: 4,
+            collapse_holes,
+        };
+
+        let class_map: [u8; CLASS_MAP_BYTES] = core::array::from_fn(|byte| {
+            u8::try_from((byte * 73 + 19) & usize::from(u8::MAX)).unwrap()
+        });
+        let default = ForwardCell::new(0, false);
+        let key_cells: [ForwardCell; CLASS_MAP_BYTES] = core::array::from_fn(|key| {
+            if key.count_ones() % 2 == 0 {
+                default
+            } else {
+                alternate
+            }
+        });
+        let byte_cells = core::array::from_fn(|byte| {
+            let key = match keys {
+                NativeOrdinalMapKeys::Classes => class_map[byte],
+                NativeOrdinalMapKeys::Bytes => u8::try_from(byte).unwrap(),
+            };
+            key_cells[usize::from(key)]
+        });
+        let mut packed_domain = [0_u32; CLASS_MAP_BYTES];
+        for (key, &cell) in key_cells.iter().enumerate() {
+            packed_domain[key] = pack_native_partial_forward_cell(
+                cell.next(),
+                cell.accepted(),
+                forward_offset,
+                row_bytes,
+                1,
+                false,
+                None,
+                partial,
+                cells,
+            )?;
+        }
+        let mut data = Vec::new();
+        if keys == NativeOrdinalMapKeys::Classes {
+            data.extend_from_slice(&class_map);
+        }
+        append_native_bit_slice_record(
+            &mut data,
+            &packed_domain,
+            cells,
+            row_bytes,
+        )?;
+        if data.len() != reverse_offset {
+            return Err(ObjectError::InvalidModule(
+                "linked bit-slice fixture emitted an unexpected machine extent",
+            ));
+        }
+
+        let layout = NativeDfaLayout {
+            transitions,
+            cells,
+            forward_offset: u32::try_from(forward_offset).map_err(|_| {
+                ObjectError::ArithmeticOverflow("linked bit-slice forward offset")
+            })?,
+            reverse_offset: u32::try_from(reverse_offset).map_err(|_| {
+                ObjectError::ArithmeticOverflow("linked bit-slice reverse offset")
+            })?,
+            sparse_boundary_profile: None,
+            asimd_lane_index_offset: None,
             initial_pending: false,
             initial_terminal: false,
             has_reverse: false,
@@ -42079,6 +42824,30 @@ mod tests {
         use_column_quotient: bool,
         maximum: usize,
     ) -> Result<(Vec<u8>, NativeDfaLayout), ObjectError> {
+        build_forced_local_map_table(
+            view,
+            architecture,
+            keys,
+            NativeLocalMapKind::Ordinal,
+            use_exact_rows,
+            use_column_quotient,
+            maximum,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the test helper selects each independently proved local-map composition"
+    )]
+    fn build_forced_local_map_table(
+        view: NativeProgramView<'_>,
+        architecture: Architecture,
+        keys: NativeOrdinalMapKeys,
+        kind: NativeLocalMapKind,
+        use_exact_rows: bool,
+        use_column_quotient: bool,
+        maximum: usize,
+    ) -> Result<(Vec<u8>, NativeDfaLayout), ObjectError> {
         let exact_rows = use_exact_rows
             .then(|| {
                 derive_native_exact_row_intern_plan(
@@ -42104,10 +42873,11 @@ mod tests {
                 "forced ordinal composition is unavailable",
             ));
         }
-        let plan = derive_native_ordinal_map_plan(
+        let plan = derive_native_local_map_plan(
             view,
             architecture,
             keys,
+            kind,
             exact_rows.as_ref(),
             column_quotient.as_ref(),
         )
@@ -43172,7 +43942,7 @@ mod tests {
         clippy::too_many_lines,
         reason = "the fixed quotient geometry and exact cap transaction share one regression oracle"
     )]
-    fn column_quotient_retries_mapped_then_ordinal_as_the_cap_tightens() {
+    fn column_quotient_retries_mapped_then_bit_slice_as_the_cap_tightens() {
         const CLASS_COUNT: usize = 96;
         const QUOTIENT_CLASSES: usize = 48;
         const COMPLETE_ROWS: usize = 8;
@@ -43301,6 +44071,36 @@ mod tests {
                 ordinal.1.transitions,
                 TransitionLayout::OrdinalMapClasses(1),
             );
+            let class_bit_slice = build_forced_local_map_table(
+                view,
+                architecture,
+                NativeOrdinalMapKeys::Classes,
+                NativeLocalMapKind::BitSlice1,
+                false,
+                true,
+                usize::MAX,
+            )
+            .unwrap();
+            assert_eq!(
+                class_bit_slice.1.transitions,
+                TransitionLayout::BitSliceClasses(1),
+            );
+            let bit_slice = build_forced_local_map_table(
+                view,
+                architecture,
+                NativeOrdinalMapKeys::Bytes,
+                NativeLocalMapKind::BitSlice1,
+                false,
+                false,
+                usize::MAX,
+            )
+            .unwrap();
+            assert_eq!(
+                bit_slice.1.transitions,
+                TransitionLayout::BitSliceBytes(1),
+            );
+            assert!(bit_slice.0.len() < class_bit_slice.0.len(), "{architecture:?}");
+            assert!(class_bit_slice.0.len() < ordinal.0.len(), "{architecture:?}");
             assert!(ordinal.0.len() < mapped.0.len(), "{architecture:?}");
             assert_eq!(
                 build_native_dfa_table_with_cost_model_and_data_limit(
@@ -43323,10 +44123,10 @@ mod tests {
                     mapped.0.len() - 1,
                 )
                 .unwrap(),
-                ordinal,
-                "ordinal quotient fits below mapped dense: {architecture:?}",
+                bit_slice,
+                "Bit1 quotient fits below mapped dense: {architecture:?}",
             );
-            let below = ordinal.0.len() - 1;
+            let below = bit_slice.0.len() - 1;
             let declined = build_native_dfa_table_with_cost_model_and_data_limit(
                 view,
                 architecture,
@@ -43351,7 +44151,7 @@ mod tests {
         clippy::too_many_lines,
         reason = "the exact cap boundary and cross-target canonical candidate oracle stay together"
     )]
-    fn canonical_mapped_then_ordinal_partial_tables_follow_exact_caps() {
+    fn canonical_mapped_then_bit_slice_partial_tables_follow_exact_caps() {
         const CLASS_COUNT: usize = 64;
         const COMPLETE_ROWS: usize = 8;
         const DISCOVERED_STATES: usize = COMPLETE_ROWS + 2;
@@ -43482,6 +44282,36 @@ mod tests {
                 ordinal.1.transitions,
                 TransitionLayout::OrdinalMapClasses(1),
             );
+            let class_bit_slice = build_forced_local_map_table(
+                view,
+                architecture,
+                NativeOrdinalMapKeys::Classes,
+                NativeLocalMapKind::BitSlice1,
+                false,
+                false,
+                usize::MAX,
+            )
+            .unwrap();
+            assert_eq!(
+                class_bit_slice.1.transitions,
+                TransitionLayout::BitSliceClasses(1),
+            );
+            let bit_slice = build_forced_local_map_table(
+                view,
+                architecture,
+                NativeOrdinalMapKeys::Bytes,
+                NativeLocalMapKind::BitSlice1,
+                false,
+                false,
+                usize::MAX,
+            )
+            .unwrap();
+            assert_eq!(
+                bit_slice.1.transitions,
+                TransitionLayout::BitSliceBytes(1),
+            );
+            assert!(bit_slice.0.len() < class_bit_slice.0.len(), "{architecture:?}");
+            assert!(class_bit_slice.0.len() < ordinal.0.len(), "{architecture:?}");
             assert!(ordinal.0.len() < sparse.0.len(), "{architecture:?}");
             assert_eq!(
                 build_native_dfa_table_with_cost_model_and_data_limit(
@@ -43492,10 +44322,10 @@ mod tests {
                     mapped.0.len() - 1,
                 )
                 .unwrap(),
-                ordinal,
-                "ordinal rescue dominates sparse below mapped: {architecture:?}",
+                bit_slice,
+                "Bit1 rescue dominates ordinal and sparse below mapped: {architecture:?}",
             );
-            let below = ordinal.0.len() - 1;
+            let below = bit_slice.0.len() - 1;
             let declined = build_native_dfa_table_with_cost_model_and_data_limit(
                 view,
                 architecture,
@@ -44499,6 +45329,7 @@ mod tests {
                 }
             }
         }
+
     }
 
     #[test]
@@ -59501,11 +60332,13 @@ int main(void){{
                         }
                         TransitionLayout::DefaultExceptions(_)
                         | TransitionLayout::DefaultByteExceptions(_)
-            | TransitionLayout::DefaultByteBoundaries(_)
-            | TransitionLayout::DefaultSparseExceptions(_)
-            | TransitionLayout::DefaultByteSparseExceptions(_)
-            | TransitionLayout::OrdinalMapClasses(_)
-            | TransitionLayout::OrdinalMapBytes(_) => {
+                        | TransitionLayout::DefaultByteBoundaries(_)
+                        | TransitionLayout::DefaultSparseExceptions(_)
+                        | TransitionLayout::DefaultByteSparseExceptions(_)
+                        | TransitionLayout::OrdinalMapClasses(_)
+                        | TransitionLayout::OrdinalMapBytes(_)
+                        | TransitionLayout::BitSliceClasses(_)
+                        | TransitionLayout::BitSliceBytes(_) => {
                             panic!("unlimited partial table unexpectedly used resource rescue")
                         }
                     };
@@ -60005,6 +60838,97 @@ int main(void){{
     }
 
     #[test]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the exhaustive bounded-domain oracle indexes one exact qword-padded row"
+    )]
+    fn bit_slice_rows_have_exact_geometry_modal_ties_and_tail_bits() {
+        for domain_count in [1_usize, 2, 7, 8, 9, 63, 64, 65, 127, 128, 129, 255, 256] {
+            let bitmap_bytes = domain_count
+                .div_ceil(NATIVE_BIT_SLICE_WORD_BITS)
+                * NATIVE_BIT_SLICE_WORD_BYTES;
+            assert_eq!(native_bit_slice_bitmap_bytes(domain_count), Some(bitmap_bytes));
+            for cells in [NativeCellEncoding::Compact16, NativeCellEncoding::Wide32] {
+                let bitmap_offset = native_bit_slice_bitmap_offset(cells).unwrap();
+                assert_eq!(bitmap_offset, NATIVE_BIT_SLICE_WORD_BYTES);
+                let row_bytes = native_bit_slice_row_bytes(domain_count, cells).unwrap();
+                assert_eq!(row_bytes, bitmap_offset + bitmap_bytes);
+
+                // An even domain is an exact modal tie. Slot zero must remain
+                // the value first seen at key zero; odd keys select slot one.
+                let packed = (0..domain_count)
+                    .map(|key| if key % 2 == 0 { 0x10_u32 } else { 0x20_u32 })
+                    .collect::<Vec<_>>();
+                let mut row = Vec::new();
+                append_native_bit_slice_record(
+                    &mut row,
+                    &packed,
+                    cells,
+                    row_bytes,
+                )
+                .unwrap();
+                assert_eq!(row.len(), row_bytes);
+                assert_eq!(read_native_packed_cell(&row, 0, cells), 0x10);
+                assert_eq!(
+                    read_native_packed_cell(&row, cells.bytes(), cells),
+                    if domain_count == 1 { 0x10 } else { 0x20 },
+                );
+                assert!(row[2 * cells.bytes()..bitmap_offset]
+                    .iter()
+                    .all(|&byte| byte == 0));
+                for bit in 0..bitmap_bytes * NATIVE_BIT_SLICE_BYTE_BITS {
+                    let actual = row[bitmap_offset + bit / NATIVE_BIT_SLICE_BYTE_BITS]
+                        >> u32::try_from(bit % NATIVE_BIT_SLICE_BYTE_BITS).unwrap()
+                        & 1;
+                    let expected = u8::from(bit < domain_count && bit % 2 != 0);
+                    assert_eq!(
+                        actual, expected,
+                        "domain={domain_count}/cells={cells:?}/bit={bit}",
+                    );
+                }
+            }
+        }
+
+        assert!(native_bit_slice_bitmap_bytes(0).is_none());
+        assert!(native_bit_slice_bitmap_bytes(CLASS_MAP_BYTES + 1).is_none());
+        assert!(native_bit_slice_row_bytes(
+            8,
+            NativeCellEncoding::Compact16Indexed(4),
+        )
+        .is_none());
+        for transitions in [
+            TransitionLayout::BitSliceClasses(0),
+            TransitionLayout::BitSliceClasses(2),
+            TransitionLayout::BitSliceBytes(0),
+            TransitionLayout::BitSliceBytes(2),
+            TransitionLayout::OrdinalMapClasses(1),
+        ] {
+            assert!(select_native_bit_slice_encoding(transitions, 8, 1, 1).is_none());
+        }
+        let mut rejected = Vec::new();
+        assert!(matches!(
+            append_native_bit_slice_record(
+                &mut rejected,
+                &[1, 2, 3],
+                NativeCellEncoding::Compact16,
+                native_bit_slice_row_bytes(3, NativeCellEncoding::Compact16).unwrap(),
+            ),
+            Err(ObjectError::InvalidModule(
+                "bit-slice row exceeds two packed values"
+            ))
+        ));
+        assert!(matches!(
+            append_native_bit_slice_record(
+                &mut rejected,
+                &[1, 2],
+                NativeCellEncoding::Compact16,
+                usize::MAX,
+            ),
+            Err(ObjectError::InvalidModule("bit-slice row shape"))
+        ));
+    }
+
+    #[test]
     fn ordinal_map_lookup_lowers_the_same_scalar_dictionary_on_every_vector_tier() {
         let x86_kinds = [
             X86StartFilterKind::Sse2,
@@ -60085,11 +61009,126 @@ int main(void){{
     }
 
     #[test]
+    fn bit_slice_lookup_is_identical_across_every_supported_vector_tier() {
+        for kind in [
+            X86StartFilterKind::Sse2,
+            X86StartFilterKind::Avx2,
+            X86StartFilterKind::Avx512Bw,
+        ] {
+            for (transitions, mapped) in [
+                (
+                    TransitionLayout::BitSliceClasses(NATIVE_BIT_SLICE_VALUE_CAPACITY),
+                    true,
+                ),
+                (
+                    TransitionLayout::BitSliceBytes(NATIVE_BIT_SLICE_VALUE_CAPACITY),
+                    false,
+                ),
+            ] {
+                for cells in [NativeCellEncoding::Compact16, NativeCellEncoding::Wide32] {
+                    let mut assembler = X86Assembler::new();
+                    x86_emit_table_lookup(&mut assembler, transitions, cells, kind).unwrap();
+                    let code = assembler.finish().unwrap();
+                    let mut expected = vec![0x0f, 0xb6, 0x04, 0x17];
+                    if mapped {
+                        expected.extend_from_slice(&[0x41, 0x0f, 0xb6, 0x04, 0x01]);
+                    }
+                    expected.extend_from_slice(&[0x49, 0x0f, 0xa3, 0x42, 8]);
+                    expected.extend_from_slice(&[0x0f, 0x92, 0xc0]);
+                    match cells {
+                        NativeCellEncoding::Compact16 => {
+                            expected.extend_from_slice(&[0x41, 0x0f, 0xb7, 0x04, 0x42]);
+                        }
+                        NativeCellEncoding::Wide32 => {
+                            expected.extend_from_slice(&[0x41, 0x8b, 0x04, 0x82]);
+                        }
+                        _ => unreachable!("bounded bit-slice cell width"),
+                    }
+                    assert_eq!(code, expected, "{kind:?}/{transitions:?}/{cells:?}");
+                }
+            }
+        }
+
+        let arm_tiers = [
+            (
+                FeatureSet::of(CpuFeature::Aarch64Asimd),
+                OperatingSystem::Linux,
+            ),
+            (
+                FeatureSet::of(CpuFeature::Aarch64Asimd),
+                OperatingSystem::Macos,
+            ),
+            (
+                FeatureSet::of(CpuFeature::Aarch64Sve),
+                OperatingSystem::Linux,
+            ),
+            (
+                FeatureSet::of(CpuFeature::Aarch64Sve).with(CpuFeature::Aarch64Sve2),
+                OperatingSystem::Linux,
+            ),
+        ];
+        for (features, operating_system) in arm_tiers {
+            for (transitions, mapped) in [
+                (
+                    TransitionLayout::BitSliceClasses(NATIVE_BIT_SLICE_VALUE_CAPACITY),
+                    true,
+                ),
+                (
+                    TransitionLayout::BitSliceBytes(NATIVE_BIT_SLICE_VALUE_CAPACITY),
+                    false,
+                ),
+            ] {
+                for cells in [NativeCellEncoding::Compact16, NativeCellEncoding::Wide32] {
+                    let mut assembler = Aarch64Assembler::new();
+                    aarch64_emit_table_lookup(
+                        &mut assembler,
+                        transitions,
+                        cells,
+                        features,
+                        operating_system,
+                    )
+                    .unwrap();
+                    let words = assembler
+                        .finish()
+                        .unwrap()
+                        .chunks_exact(4)
+                        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                        .collect::<Vec<_>>();
+                    let mut expected = vec![aarch64_load_byte_reg(8, 0, 2).unwrap()];
+                    if mapped {
+                        expected.push(aarch64_load_byte_reg(8, 5, 8).unwrap());
+                    }
+                    expected.extend_from_slice(&[
+                        aarch64_lsr_x_imm(10, 8, 6).unwrap(),
+                        aarch64_add_x_imm(12, 11, 8).unwrap(),
+                        aarch64_load_x_lsl3(10, 12, 10).unwrap(),
+                        aarch64_lsrv_x(10, 10, 8).unwrap(),
+                        aarch64_and_low_x(10, 10, 1).unwrap(),
+                        match cells {
+                            NativeCellEncoding::Compact16 => {
+                                aarch64_load_h_uxtw(8, 11, 10).unwrap()
+                            }
+                            NativeCellEncoding::Wide32 => {
+                                aarch64_load_w_uxtw(8, 11, 10).unwrap()
+                            }
+                            _ => unreachable!("bounded bit-slice cell width"),
+                        },
+                    ]);
+                    assert_eq!(
+                        words, expected,
+                        "{features:?}/{operating_system:?}/{transitions:?}/{cells:?}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "class, raw-byte, exact-row, quotient, and resource selection share one packed oracle"
+        reason = "class, raw-byte, both local maps, exact compositions, and resource selection share one packed oracle"
     )]
-    fn ordinal_map_plans_are_exact_and_win_the_general_resource_retry() {
+    fn local_map_plans_are_exact_and_bit_slice_wins_the_general_resource_retry() {
         let compiled = compile_uniform_default_base(OutputContract::SelectedEnd);
         let base = compiled
             .program()
@@ -60122,8 +61161,9 @@ int main(void){{
             assert_eq!(comparison.exception_capacity, 64);
 
             let mut class_ordinal = None;
+            let mut class_bit_slice = None;
             for keys in [NativeOrdinalMapKeys::Classes, NativeOrdinalMapKeys::Bytes] {
-                let plan = derive_native_ordinal_map_plan(
+                let ordinal = derive_native_ordinal_map_plan(
                     view,
                     architecture,
                     keys,
@@ -60131,16 +61171,40 @@ int main(void){{
                     None,
                 )
                 .expect("two-value ordinal plan");
-                assert_eq!(plan.value_capacity, 1);
+                let bit_slice = derive_native_bit_slice_plan(
+                    view,
+                    architecture,
+                    keys,
+                    None,
+                    None,
+                )
+                .expect("two-value bit-slice plan");
+                assert_eq!(ordinal.kind, NativeLocalMapKind::Ordinal);
+                assert_eq!(bit_slice.kind, NativeLocalMapKind::BitSlice1);
+                assert_eq!(ordinal.value_capacity, 1);
+                assert_eq!(bit_slice.value_capacity, 1);
                 assert_eq!(
-                    plan.comparison_exception_capacity,
+                    ordinal.comparison_exception_capacity,
                     match keys {
                         NativeOrdinalMapKeys::Classes => 64,
                         NativeOrdinalMapKeys::Bytes => 128,
                     },
                 );
-                assert_eq!(plan.cells, NativeCellEncoding::Compact16);
-                let lowering = build_forced_ordinal_map_table(
+                assert_eq!(
+                    bit_slice.comparison_exception_capacity,
+                    ordinal.comparison_exception_capacity,
+                );
+                assert_eq!(ordinal.cells, NativeCellEncoding::Compact16);
+                assert_eq!(bit_slice.cells, NativeCellEncoding::Compact16);
+                assert!(bit_slice.table_bytes < ordinal.table_bytes);
+                assert!(native_bit_slice_plan_is_admitted(
+                    view,
+                    bit_slice,
+                    None,
+                    Some(comparison),
+                    ordinal,
+                ));
+                let ordinal_lowering = build_forced_ordinal_map_table(
                     view,
                     architecture,
                     keys,
@@ -60150,11 +61214,30 @@ int main(void){{
                 )
                 .unwrap();
                 assert_eq!(
-                    lowering.1.transitions,
-                    keys.transitions(plan.value_capacity),
+                    ordinal_lowering.1.transitions,
+                    ordinal.transitions(),
                 );
-                let domain_count = usize::from(plan.domain_count);
-                let partial = lowering.1.partial.expect("ordinal partial layout");
+                let bit_lowering = build_forced_local_map_table(
+                    view,
+                    architecture,
+                    keys,
+                    NativeLocalMapKind::BitSlice1,
+                    false,
+                    false,
+                    usize::MAX,
+                )
+                .unwrap();
+                assert_eq!(bit_lowering.1.transitions, bit_slice.transitions());
+                let domain_count = usize::from(ordinal.domain_count);
+                assert_eq!(bit_slice.domain_count, ordinal.domain_count);
+                let ordinal_partial = ordinal_lowering
+                    .1
+                    .partial
+                    .expect("ordinal partial layout");
+                let bit_partial = bit_lowering
+                    .1
+                    .partial
+                    .expect("bit-slice partial layout");
                 for state in 0..OrdinalMapFallbackFixture::COMPLETE_ROWS {
                     for byte in u8::MIN..=u8::MAX {
                         let graph_class =
@@ -60165,54 +61248,83 @@ int main(void){{
                             }
                             NativeOrdinalMapKeys::Bytes => byte,
                         };
-                        let actual = ordinal_map_packed_at(
-                            &lowering.0,
-                            lowering.1,
+                        let ordinal_actual = ordinal_map_packed_at(
+                            &ordinal_lowering.0,
+                            ordinal_lowering.1,
+                            domain_count,
+                            state,
+                            key,
+                        );
+                        let bit_actual = bit_slice_packed_at(
+                            &bit_lowering.0,
+                            bit_lowering.1,
                             domain_count,
                             state,
                             key,
                         );
                         let semantic = view.dfa.forward_cells
                             [state * OrdinalMapFallbackFixture::CLASS_COUNT + graph_class];
-                        let expected = pack_native_partial_forward_cell(
+                        let ordinal_expected = pack_native_partial_forward_cell(
                             semantic.next(),
                             semantic.accepted(),
-                            usize::try_from(lowering.1.forward_offset).unwrap(),
-                            plan.row_bytes,
+                            usize::try_from(ordinal_lowering.1.forward_offset).unwrap(),
+                            ordinal.row_bytes,
                             OrdinalMapFallbackFixture::COMPLETE_ROWS,
-                            lowering.1.has_start_scanner(),
-                            lowering.1.loop_skip.map(|loop_skip| loop_skip.state),
-                            partial,
-                            lowering.1.cells,
+                            ordinal_lowering.1.has_start_scanner(),
+                            ordinal_lowering
+                                .1
+                                .loop_skip
+                                .map(|loop_skip| loop_skip.state),
+                            ordinal_partial,
+                            ordinal_lowering.1.cells,
+                        )
+                        .unwrap();
+                        let bit_expected = pack_native_partial_forward_cell(
+                            semantic.next(),
+                            semantic.accepted(),
+                            usize::try_from(bit_lowering.1.forward_offset).unwrap(),
+                            bit_slice.row_bytes,
+                            OrdinalMapFallbackFixture::COMPLETE_ROWS,
+                            bit_lowering.1.has_start_scanner(),
+                            bit_lowering.1.loop_skip.map(|loop_skip| loop_skip.state),
+                            bit_partial,
+                            bit_lowering.1.cells,
                         )
                         .unwrap();
                         assert_eq!(
-                            actual, expected,
-                            "{architecture:?}/{keys:?}/state={state}/byte={byte}",
+                            ordinal_actual, ordinal_expected,
+                            "ordinal/{architecture:?}/{keys:?}/state={state}/byte={byte}",
+                        );
+                        assert_eq!(
+                            bit_actual, bit_expected,
+                            "bit/{architecture:?}/{keys:?}/state={state}/byte={byte}",
                         );
                     }
                 }
                 if keys == NativeOrdinalMapKeys::Classes {
-                    class_ordinal = Some(lowering);
+                    class_ordinal = Some(ordinal_lowering);
+                    class_bit_slice = Some(bit_lowering);
                 }
             }
             let class_ordinal = class_ordinal.unwrap();
-            let comparison = build_forced_default_exception_table(
+            let class_bit_slice = class_bit_slice.unwrap();
+            let comparison_lowering = build_forced_default_exception_table(
                 view,
                 architecture,
                 usize::MAX,
             )
             .unwrap();
-            assert!(class_ordinal.0.len() < comparison.0.len());
+            assert!(class_bit_slice.0.len() < class_ordinal.0.len());
+            assert!(class_ordinal.0.len() < comparison_lowering.0.len());
             let selected = build_native_dfa_table_with_cost_model_and_data_limit(
                 view,
                 architecture,
                 NativeVectorFilterCostModel::Established,
                 true,
-                class_ordinal.0.len(),
+                class_bit_slice.0.len(),
             )
             .unwrap();
-            assert_eq!(selected, class_ordinal, "{architecture:?}");
+            assert_eq!(selected, class_bit_slice, "{architecture:?}");
         }
 
         // Exact row aliases and a column quotient are independent equivalence
@@ -60285,6 +61397,249 @@ int main(void){{
                     );
                 }
             }
+        }
+
+        let bit_fixture = BitSliceComposeFixture::new();
+        let bit_view = bit_fixture.view(base);
+        let bit_exact_rows = derive_native_exact_row_intern_plan(
+            bit_view.dfa,
+            bit_view.partial_discovered_states,
+            false,
+        )
+        .unwrap();
+        let bit_quotient = derive_native_column_quotient_plan(
+            bit_view.dfa,
+            bit_view.partial_discovered_states,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            bit_exact_rows.physical_rows(),
+            BitSliceComposeFixture::PHYSICAL_ROWS,
+        );
+        assert_eq!(
+            bit_quotient.class_count(),
+            BitSliceComposeFixture::QUOTIENT_CLASS_COUNT,
+        );
+        for architecture in [Architecture::X86_64, Architecture::Aarch64] {
+            let comparison = derive_native_default_exception_plan(
+                bit_view.dfa,
+                bit_view.partial_discovered_states,
+                false,
+                architecture,
+            )
+            .unwrap();
+            for (keys, use_exact_rows, use_column_quotient) in [
+                (NativeOrdinalMapKeys::Classes, false, false),
+                (NativeOrdinalMapKeys::Classes, true, false),
+                (NativeOrdinalMapKeys::Classes, false, true),
+                (NativeOrdinalMapKeys::Classes, true, true),
+                (NativeOrdinalMapKeys::Bytes, false, false),
+                (NativeOrdinalMapKeys::Bytes, true, false),
+            ] {
+                let exact_rows = use_exact_rows.then_some(&bit_exact_rows);
+                let quotient = use_column_quotient.then_some(&bit_quotient);
+                let ordinal = derive_native_ordinal_map_plan(
+                    bit_view,
+                    architecture,
+                    keys,
+                    exact_rows,
+                    quotient,
+                )
+                .unwrap();
+                let plan = derive_native_bit_slice_plan(
+                    bit_view,
+                    architecture,
+                    keys,
+                    exact_rows,
+                    quotient,
+                )
+                .unwrap();
+                assert_eq!(plan.kind, NativeLocalMapKind::BitSlice1);
+                assert_eq!(plan.value_capacity, NATIVE_BIT_SLICE_VALUE_CAPACITY);
+                assert!(plan.table_bytes < plan.dense_bytes);
+                assert!(plan.table_bytes <= ordinal.table_bytes);
+                let physical_rows = exact_rows.map_or(
+                    BitSliceComposeFixture::COMPLETE_ROWS,
+                    NativeExactRowInternPlan::physical_rows,
+                );
+                let comparison_bytes = native_machine_bytes(
+                    comparison.keys.transitions(comparison.exception_capacity),
+                    comparison.cells,
+                    BitSliceComposeFixture::CLASS_COUNT,
+                    physical_rows,
+                    0,
+                )
+                .unwrap();
+                assert!(plan.table_bytes <= comparison_bytes);
+                assert!(native_bit_slice_plan_is_admitted(
+                    bit_view,
+                    plan,
+                    exact_rows,
+                    Some(comparison),
+                    ordinal,
+                ));
+
+                let mut dense_tie = plan;
+                dense_tie.table_bytes = dense_tie.dense_bytes;
+                assert!(!native_bit_slice_plan_is_admitted(
+                    bit_view,
+                    dense_tie,
+                    exact_rows,
+                    Some(comparison),
+                    ordinal,
+                ));
+                let mut ordinal_growth = plan;
+                ordinal_growth.table_bytes = ordinal.table_bytes.checked_add(1).unwrap();
+                ordinal_growth.dense_bytes = ordinal_growth.table_bytes.checked_add(1).unwrap();
+                assert!(!native_bit_slice_plan_is_admitted(
+                    bit_view,
+                    ordinal_growth,
+                    exact_rows,
+                    None,
+                    ordinal,
+                ));
+
+                let lowering = build_forced_local_map_table(
+                    bit_view,
+                    architecture,
+                    keys,
+                    NativeLocalMapKind::BitSlice1,
+                    use_exact_rows,
+                    use_column_quotient,
+                    usize::MAX,
+                )
+                .unwrap();
+                assert_eq!(lowering.1.transitions, plan.transitions());
+                let partial = lowering.1.partial.unwrap();
+                let domain_count = usize::from(plan.domain_count);
+                for physical_state in 0..physical_rows {
+                    let semantic_state = exact_rows
+                        .and_then(|rows| rows.representative(physical_state))
+                        .unwrap_or(physical_state);
+                    for byte in u8::MIN..=u8::MAX {
+                        let graph_class =
+                            usize::from(bit_view.dfa.byte_classes[usize::from(byte)]);
+                        let key = match keys {
+                            NativeOrdinalMapKeys::Classes => quotient.map_or_else(
+                                || u8::try_from(graph_class).unwrap(),
+                                |columns| columns.byte_to_quotient[usize::from(byte)],
+                            ),
+                            NativeOrdinalMapKeys::Bytes => byte,
+                        };
+                        let actual = bit_slice_packed_at(
+                            &lowering.0,
+                            lowering.1,
+                            domain_count,
+                            physical_state,
+                            key,
+                        );
+                        let semantic = bit_view.dfa.forward_cells[
+                            semantic_state * BitSliceComposeFixture::CLASS_COUNT + graph_class
+                        ];
+                        let expected = pack_native_partial_forward_cell_with_exact_rows(
+                            semantic.next(),
+                            semantic.accepted(),
+                            usize::try_from(lowering.1.forward_offset).unwrap(),
+                            plan.row_bytes,
+                            BitSliceComposeFixture::COMPLETE_ROWS,
+                            lowering.1.has_start_scanner(),
+                            lowering.1.loop_skip.map(|loop_skip| loop_skip.state),
+                            partial,
+                            lowering.1.cells,
+                            exact_rows,
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            actual, expected,
+                            "{architecture:?}/{keys:?}/exact={use_exact_rows}/quotient={use_column_quotient}/physical={physical_state}/byte={byte}",
+                        );
+                    }
+                }
+            }
+        }
+
+        let mut overfull = BitSliceComposeFixture::new();
+        overfull.forward_cells[0] = ForwardCell::new(3, false);
+        let overfull_view = overfull.view(base);
+        for architecture in [Architecture::X86_64, Architecture::Aarch64] {
+            assert!(derive_native_bit_slice_plan(
+                overfull_view,
+                architecture,
+                NativeOrdinalMapKeys::Classes,
+                None,
+                None,
+            )
+            .is_none());
+        }
+
+        // A real two-column binary descriptor is smaller as an ordinal row.
+        // Even when the ordinary hot-loop cost model selects a larger dense
+        // image, Bit1 must not grow this same exact local-map descriptor.
+        let binary_byte_classes = core::array::from_fn(|byte| {
+            u8::try_from(byte % 2).unwrap()
+        });
+        let binary_representatives = [0_u8, 1];
+        let mut binary_cells = Vec::new();
+        for _ in 0..4 {
+            binary_cells.extend_from_slice(&[
+                ForwardCell::new(0, false),
+                ForwardCell::new(NO_DFA_STATE, false),
+            ]);
+        }
+        let binary_view = NativeProgramView {
+            dfa: NativeDfaView {
+                initial_state: 0,
+                initial_pending: false,
+                initial_terminal: false,
+                byte_classes: &binary_byte_classes,
+                class_count: 2,
+                class_representatives: &binary_representatives,
+                forward_cells: &binary_cells,
+                reverse_initial: None,
+                reverse_cells: &[],
+            },
+            partial_discovered_states: Some(5),
+            collapse_partial_holes: false,
+            exact_match_width: None,
+            max_match_width: None,
+            exact_product_width: None,
+            retained_prefix_requirement: None,
+            retained_suffix_requirement: None,
+            ..base
+        };
+        for architecture in [Architecture::X86_64, Architecture::Aarch64] {
+            let ordinal = derive_native_ordinal_map_plan(
+                binary_view,
+                architecture,
+                NativeOrdinalMapKeys::Classes,
+                None,
+                None,
+            )
+            .unwrap();
+            let bit_slice = derive_native_bit_slice_plan(
+                binary_view,
+                architecture,
+                NativeOrdinalMapKeys::Classes,
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(bit_slice.table_bytes > ordinal.table_bytes);
+            assert!(
+                bit_slice.table_bytes < bit_slice.dense_bytes,
+                "{architecture:?}: bit={} dense={} ordinal={}",
+                bit_slice.table_bytes,
+                bit_slice.dense_bytes,
+                ordinal.table_bytes,
+            );
+            assert!(!native_bit_slice_plan_is_admitted(
+                binary_view,
+                bit_slice,
+                None,
+                None,
+                ordinal,
+            ));
         }
     }
 
@@ -67621,13 +68976,13 @@ int main(void){{
         any(target_os = "linux", target_os = "macos")
     ))]
     #[test]
-    #[ignore = "links and executes the exhaustive scalable sparse private-core matrix natively"]
+    #[ignore = "links and executes exhaustive sparse and Bit1 private-core matrices natively"]
     #[allow(
         clippy::arithmetic_side_effects,
         clippy::too_many_lines,
-        reason = "one opt-in linked differential owns every capacity, cell width, key mode, hole mode, output contract, byte, and two-byte window"
+        reason = "one opt-in linked differential owns sparse capacities plus every Bit1 cell width, key mode, hole mode, output contract, byte, and two-byte window"
     )]
-    fn linked_host_scalable_sparse_private_core_is_exact() {
+    fn linked_host_sparse_and_bit_slice_private_cores_are_exact() {
         use std::{fmt::Write as _, fs, process::Command};
 
         const SCRATCH_ZERO: usize = 0x1122_3344_5566_7788;
@@ -67794,6 +69149,119 @@ int main(void){{
                                 output,
                                 label: format!(
                                     "capacity={capacity}/cells={cells:?}/keys={keys:?}/collapse={collapse_holes}/output={output:?}"
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        for (alternate_id, alternate) in [
+            ForwardCell::new(0, true),
+            ForwardCell::new(NO_DFA_STATE, false),
+            ForwardCell::new(NO_DFA_STATE, true),
+            ForwardCell::new(1, false),
+            ForwardCell::new(2, true),
+            ForwardCell::new(4, true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for (cell_id, cells) in [
+                NativeCellEncoding::Compact16,
+                NativeCellEncoding::Wide32,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                for (key_id, keys) in [
+                    NativeOrdinalMapKeys::Bytes,
+                    NativeOrdinalMapKeys::Classes,
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    for collapse_holes in [false, true] {
+                        for (output_id, output) in [
+                            OutputContract::Exists,
+                            OutputContract::SelectedEnd,
+                            OutputContract::Span,
+                        ]
+                        .into_iter()
+                        .enumerate()
+                        {
+                            let (lowering, fixture) = linked_bit_slice_native_fixture(
+                                target,
+                                cells,
+                                keys,
+                                collapse_holes,
+                                output,
+                                alternate,
+                            )
+                            .unwrap_or_else(|error| {
+                                panic!(
+                                    "linked bit-slice fixture {alternate_id}/{cells:?}/{keys:?}/{collapse_holes}/{output:?}: {error}"
+                                )
+                            });
+                            let seed = format!(
+                                "fre-linked-bit-slice-v1/{alternate_id}/{cell_id}/{key_id}/{}/{output_id}",
+                                usize::from(collapse_holes),
+                            )
+                            .into_bytes();
+                            let module = CompiledModule::lower_serialized_with_prelowered(
+                                seed,
+                                Some(lowering),
+                                None,
+                                None,
+                                None,
+                                false,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                target,
+                            )
+                            .unwrap_or_else(|error| {
+                                panic!(
+                                    "linked bit-slice module {alternate_id}/{cells:?}/{keys:?}/{collapse_holes}/{output:?}: {error}"
+                                )
+                            });
+                            assert!(module.required_runtime_symbol().is_none());
+                            assert!(module.prepared_entry_symbol().is_none());
+                            let index = cases.len();
+                            append_linked_sparse_wrapper_assembly(
+                                &mut assembly,
+                                index,
+                                module.entry_symbol(),
+                            );
+                            let object = directory.join(format!("case-{index}.o"));
+                            fs::write(
+                                &object,
+                                emit_object(
+                                    &module,
+                                    ObjectFormat::for_target(target),
+                                    usize::MAX,
+                                )
+                                .unwrap(),
+                            )
+                            .unwrap();
+                            objects.push(object);
+                            writeln!(
+                                source,
+                                "extern uint32_t fre_sparse_wrap_{index}(const unsigned char*,size_t,size_t,size_t,size_t*,payload_t*);"
+                            )
+                            .unwrap();
+                            writeln!(
+                                source,
+                                "static void run_{index}(void){{for(unsigned b=0;b<256;b++){{unsigned char h[2]={{(unsigned char)b,(unsigned char)b}};for(size_t s=0;s<=2;s++){{for(size_t e=s;e<=2;e++){{size_t scratch[2]={{SCRATCH_ZERO,SCRATCH_ONE}};payload_t p={{PAYLOAD_SENTINEL,PAYLOAD_SENTINEL,PAYLOAD_SENTINEL,PAYLOAD_SENTINEL}};uint32_t status=fre_sparse_wrap_{index}(h,2,s,e,scratch,&p);printf(\"{index} %u %zu %zu %u %zu %zu %zu %zu %zu %zu\\n\",b,s,e,status,p.first,p.second,p.position,scratch[0],scratch[1],p.abi_bad);}}}}}}}}"
+                            )
+                            .unwrap();
+                            cases.push(LinkedCase {
+                                fixture,
+                                output,
+                                label: format!(
+                                    "bit-slice alternate={alternate_id}/cells={cells:?}/keys={keys:?}/collapse={collapse_holes}/output={output:?}"
                                 ),
                             });
                         }
@@ -86636,7 +88104,9 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                     | TransitionLayout::DefaultSparseExceptions(_)
                     | TransitionLayout::DefaultByteSparseExceptions(_)
                     | TransitionLayout::OrdinalMapClasses(_)
-                    | TransitionLayout::OrdinalMapBytes(_) => {
+                    | TransitionLayout::OrdinalMapBytes(_)
+                    | TransitionLayout::BitSliceClasses(_)
+                    | TransitionLayout::BitSliceBytes(_) => {
                         panic!("complete table unexpectedly used partial resource rescue")
                     }
                 };
@@ -86694,7 +88164,9 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                     | TransitionLayout::DefaultSparseExceptions(_)
                     | TransitionLayout::DefaultByteSparseExceptions(_)
                     | TransitionLayout::OrdinalMapClasses(_)
-                    | TransitionLayout::OrdinalMapBytes(_) => {
+                    | TransitionLayout::OrdinalMapBytes(_)
+                    | TransitionLayout::BitSliceClasses(_)
+                    | TransitionLayout::BitSliceBytes(_) => {
                         panic!("reverse table unexpectedly used partial resource rescue")
                     }
                 };
@@ -91232,7 +92704,9 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 | TransitionLayout::DefaultSparseExceptions(_)
                 | TransitionLayout::DefaultByteSparseExceptions(_)
                 | TransitionLayout::OrdinalMapClasses(_)
-                | TransitionLayout::OrdinalMapBytes(_) => {
+                | TransitionLayout::OrdinalMapBytes(_)
+                | TransitionLayout::BitSliceClasses(_)
+                | TransitionLayout::BitSliceBytes(_) => {
                     panic!("unlimited complete table unexpectedly used resource rescue")
                 }
             }
