@@ -18855,8 +18855,10 @@ impl CompiledProgram {
         Ok(Some(resumed.found))
     }
 
-    /// Complete a static-prefix resource fallback from one borrow-bound K0
-    /// row. Every successful branch consumes the token; variable Span may
+    /// Complete a resource fallback from one borrow-bound K0 row.
+    ///
+    /// Static-prefix and retained-partial continuations share this entry.
+    /// Every successful branch consumes the token; variable Span may
     /// defensively decline at an empty selected endpoint and leave the caller
     /// to the established exact resume entry.
     fn search_nfa_from_borrowed_fully_prefilled_selected_row(
