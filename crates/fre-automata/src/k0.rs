@@ -638,6 +638,7 @@ struct ContextTransitionStore {
     bucket_mask: usize,
     published: u32,
     loop_candidates_published: u32,
+    nonaccepting_loop_candidates_published: u32,
 }
 
 impl fmt::Debug for ContextTransitionStore {
@@ -697,6 +698,7 @@ impl ContextTransitionStore {
             bucket_mask,
             published: 0,
             loop_candidates_published: 0,
+            nonaccepting_loop_candidates_published: 0,
         })
     }
 
@@ -712,6 +714,7 @@ impl ContextTransitionStore {
             bucket_mask: 0,
             published: 0,
             loop_candidates_published: 0,
+            nonaccepting_loop_candidates_published: 0,
         }
     }
 
@@ -1579,15 +1582,22 @@ impl ContextTransitionStore {
                     hot.dense_missing = remaining;
                 }
                 let symbol_class = record.symbol & CONTEXT_SYMBOL_CLASS_MASK;
-                if symbol_class < CONTEXT_INITIAL_CLASS
-                    && context_cell_is_nonaccepting_self_loop(record)
-                {
+                if symbol_class < CONTEXT_INITIAL_CLASS && context_cell_is_self_loop(record) {
                     self.loop_candidates_published = self
                         .loop_candidates_published
                         .checked_add(1)
                         .ok_or(SearchError::ArithmeticOverflow {
                             computation: "contextual loop candidate publication count",
                         })?;
+                    if record.value & LAZY_CELL_ACCEPT == 0 {
+                        self.nonaccepting_loop_candidates_published = self
+                            .nonaccepting_loop_candidates_published
+                            .checked_add(1)
+                            .ok_or(SearchError::ArithmeticOverflow {
+                                computation:
+                                    "contextual nonaccepting loop candidate publication count",
+                            })?;
+                    }
                 }
                 *retained = hot;
             }
@@ -1911,28 +1921,34 @@ const fn encoded_self_loop_action(
     Some((start_action, value & LAZY_CELL_ACCEPT != 0))
 }
 
-const fn encoded_nonaccepting_self_loop_action(
-    encoded: u32,
+#[cfg(test)]
+const fn context_nonaccepting_self_loop_action(
+    source: u32,
     value: u32,
 ) -> Option<LazyStartAction> {
-    match encoded_self_loop_action(encoded, value) {
+    match context_self_loop_action(source, value) {
         Some((start_action, false)) => Some(start_action),
         Some((_, true)) | None => None,
     }
 }
 
-const fn context_nonaccepting_self_loop_action(
+const fn context_self_loop_action(
     source: u32,
     value: u32,
-) -> Option<LazyStartAction> {
+) -> Option<(LazyStartAction, bool)> {
     let Some(encoded) = source.checked_add(1) else {
         return None;
     };
-    encoded_nonaccepting_self_loop_action(encoded, value)
+    encoded_self_loop_action(encoded, value)
 }
 
+#[cfg(test)]
 const fn context_cell_is_nonaccepting_self_loop(record: ContextTransitionSlot) -> bool {
     context_nonaccepting_self_loop_action(record.source, record.value).is_some()
+}
+
+const fn context_cell_is_self_loop(record: ContextTransitionSlot) -> bool {
+    context_self_loop_action(record.source, record.value).is_some()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3474,6 +3490,7 @@ struct ContextLazyLoopSkipPlan {
     state: u32,
     scanner: LazyLoopScanner,
     start_action: LazyStartAction,
+    accepting: bool,
     leave_final_member: bool,
 }
 
@@ -3526,6 +3543,7 @@ impl ContextLazyLoopSkipPlans {
             entry.as_ref().is_some_and(|plan| {
                 plan.state == candidate.state
                     && plan.start_action == candidate.start_action
+                    && plan.accepting == candidate.accepting
                     && plan.leave_final_member == candidate.leave_final_member
                     && plan.scanner.words() == candidate.members
             })
@@ -3588,6 +3606,7 @@ struct ContextLazyLoopSkipCandidate {
     state: u32,
     members: [u64; 4],
     start_action: LazyStartAction,
+    accepting: bool,
     leave_final_member: bool,
 }
 
@@ -3660,6 +3679,36 @@ fn warm_context_loop_scan_threshold(
     };
     Ok((loop_probe.is_ready(position) && remaining_source >= scan_threshold)
         .then_some(scan_threshold))
+}
+
+/// Apply the scalar-equivalent selected-result effects of one nonempty
+/// contextual self-loop run after its input position has advanced.
+///
+/// Repeating Propagate leaves the live start unchanged, while repeating Drop
+/// clears it on the first member. Every accepting member overwrites the
+/// selected endpoint, so one update at the final skipped boundary is exact.
+#[inline]
+fn apply_context_lazy_loop_selected_effect(
+    plan: &ContextLazyLoopSkipPlan,
+    position: usize,
+    active_start: &mut Option<usize>,
+    pending_end: &mut Option<usize>,
+    pending_start: &mut Option<usize>,
+) -> Result<(), SearchError> {
+    match plan.start_action {
+        LazyStartAction::Propagate => {}
+        LazyStartAction::Drop => *active_start = None,
+        LazyStartAction::Reset => {
+            return Err(SearchError::InternalInvariant {
+                detail: "contextual loop retained a Reset action",
+            });
+        }
+    }
+    if plan.accepting {
+        *pending_end = Some(position);
+        *pending_start = *active_start;
+    }
+    Ok(())
 }
 
 impl LazyStartAction {
@@ -4006,6 +4055,7 @@ struct LazyWorkspace {
     direct_cells_published: u32,
     loop_skip_analyzed_at_cells: u32,
     context_loop_skip_analyzed_at_candidates: u32,
+    context_loop_skip_analyzed_at_nonaccepting_candidates: u32,
     context_dependencies_analyzed: usize,
     context_loop_skip_analyzed_at_dependencies: usize,
     initialized: bool,
@@ -4087,6 +4137,7 @@ impl LazyWorkspace {
             direct_cells_published: 0,
             loop_skip_analyzed_at_cells: 0,
             context_loop_skip_analyzed_at_candidates: 0,
+            context_loop_skip_analyzed_at_nonaccepting_candidates: 0,
             context_dependencies_analyzed: 0,
             context_loop_skip_analyzed_at_dependencies: 0,
             initialized: false,
@@ -4161,6 +4212,7 @@ impl LazyWorkspace {
             direct_cells_published: 0,
             loop_skip_analyzed_at_cells: 0,
             context_loop_skip_analyzed_at_candidates: 0,
+            context_loop_skip_analyzed_at_nonaccepting_candidates: 0,
             context_dependencies_analyzed: 0,
             context_loop_skip_analyzed_at_dependencies: 0,
             initialized: false,
@@ -10682,7 +10734,10 @@ fn try_warm_context_exists_loop<const LOOP_SKIP: bool>(
         if LOOP_SKIP {
             let selected = lazy
                 .context_loop_skip_plans
-                .find_with_hint(state, active_loop_slot);
+                .find_with_hint(state, active_loop_slot)
+                // Existence must observe the first accepting member rather
+                // than batch to the end of an accepting run.
+                .filter(|(_, plan)| !plan.accepting);
             let selected_slot = selected.map(|(slot, _)| slot);
             if selected_slot != active_loop_slot {
                 loop_probe.left_plan_state();
@@ -10731,7 +10786,8 @@ fn try_warm_context_exists_loop<const LOOP_SKIP: bool>(
                             },
                         )?;
                         // Retain exact scalar provenance even for Exists so a
-                        // later first-hole handoff is contract-neutral.
+                        // later first-hole handoff is contract-neutral. The
+                        // selected plan is necessarily nonaccepting.
                         restartable = false;
                         if plan.start_action == LazyStartAction::Drop {
                             active_start = None;
@@ -11117,12 +11173,14 @@ fn try_warm_context_selected_end_loop<const LOOP_SKIP: bool>(
                                 computation: "warm contextual loop source progress",
                             },
                         )?;
-                        // Preserve scalar provenance even though this facade
-                        // projects only the selected endpoint.
                         restartable = false;
-                        if plan.start_action == LazyStartAction::Drop {
-                            active_start = None;
-                        }
+                        apply_context_lazy_loop_selected_effect(
+                            plan,
+                            position,
+                            &mut active_start,
+                            &mut pending_end,
+                            &mut pending_start,
+                        )?;
                         if position == window.end() {
                             continue;
                         }
@@ -11852,13 +11910,14 @@ fn try_warm_context_span_loop<const LOOP_SKIP: bool>(
                                 computation: "warm contextual Span loop source progress",
                             },
                         )?;
-                        // A skipped self-loop is nonaccepting, so any selected
-                        // endpoint/start pair remains committed. Only live
-                        // frontier provenance follows the graph-proved action.
                         restartable = false;
-                        if plan.start_action == LazyStartAction::Drop {
-                            active_start = None;
-                        }
+                        apply_context_lazy_loop_selected_effect(
+                            plan,
+                            position,
+                            &mut active_start,
+                            &mut pending_end,
+                            &mut pending_start,
+                        )?;
                         if position == window.end() {
                             continue;
                         }
@@ -12005,11 +12064,14 @@ fn finish_mutable_warm_context_value(
     workspace: &mut K0Workspace,
     window: SearchWindow,
     meter: &mut WorkMeter,
+    contract: OutputContract,
     found: Option<MatchSpan>,
 ) -> Result<Option<MatchSpan>, SearchError> {
     try_learn_context_dependency_masks(automaton, workspace, meter)?;
     if window.end().saturating_sub(window.start()) >= LAZY_LOOP_SKIP_MIN_BYTES {
-        try_derive_context_lazy_loop_skip(automaton, workspace, meter)?;
+        try_derive_context_lazy_loop_skip_for_contract(
+            automaton, workspace, meter, contract,
+        )?;
     }
     Ok(found)
 }
@@ -12029,7 +12091,9 @@ fn complete_mutable_warm_context_forward(
     pending_start: Option<usize>,
 ) -> Result<Option<MatchSpan>, SearchError> {
     let Some(selected_end) = pending_end else {
-        return finish_mutable_warm_context_value(automaton, workspace, window, meter, None);
+        return finish_mutable_warm_context_value(
+            automaton, workspace, window, meter, contract, None,
+        );
     };
     if contract != OutputContract::Span {
         return finish_mutable_warm_context_value(
@@ -12037,6 +12101,7 @@ fn complete_mutable_warm_context_forward(
             workspace,
             window,
             meter,
+            contract,
             Some(MatchSpan::new(
                 pending_start.unwrap_or(window.start()),
                 selected_end,
@@ -12066,6 +12131,7 @@ fn complete_mutable_warm_context_forward(
         workspace,
         window,
         meter,
+        contract,
         Some(MatchSpan::new(start, selected_end)),
     )
 }
@@ -12271,7 +12337,10 @@ fn continue_mutable_warm_context_forward(
                     .context_loop_skip_plans
                     .find_with_hint(cached, active_loop_slot),
                 LazyState::Inline { .. } => None,
-            };
+            }
+            // The warm mutable handoff serves Exists, SelectedEnd, and Span.
+            // Exists must stop at the first accepting transition.
+            .filter(|(_, plan)| !plan.accepting || !earliest);
             let selected_slot = selected.map(|(slot, _)| slot);
             if selected_slot != active_loop_slot {
                 loop_probe.left_plan_state();
@@ -12323,13 +12392,14 @@ fn continue_mutable_warm_context_forward(
                                 computation: "warm contextual continuation loop progress",
                             },
                         )?;
-                        // The graph proof covers a nonaccepting self-loop and
-                        // therefore cannot re-enter the root between the
-                        // skipped run and its next scalar transition.
                         restartable = false;
-                        if plan.start_action == LazyStartAction::Drop {
-                            active_start = None;
-                        }
+                        apply_context_lazy_loop_selected_effect(
+                            plan,
+                            position,
+                            &mut active_start,
+                            &mut pending_end,
+                            &mut pending_start,
+                        )?;
                         if position == window.end() {
                             return complete_mutable_warm_context_forward(
                                 automaton,
@@ -12625,6 +12695,7 @@ fn continue_mutable_warm_context_reverse(
         workspace,
         window,
         &mut meter,
+        OutputContract::Span,
         Some(MatchSpan::new(start, continuation.selected_end)),
     )
 }
@@ -18941,7 +19012,12 @@ fn execute_prepared(
         && window.end().saturating_sub(window.start()) >= LAZY_LOOP_SKIP_MIN_BYTES
     {
         if contextual {
-            try_derive_context_lazy_loop_skip(automaton, workspace, &mut meter)?;
+            try_derive_context_lazy_loop_skip_for_contract(
+                automaton,
+                workspace,
+                &mut meter,
+                contract,
+            )?;
         } else {
             try_derive_lazy_loop_skip(automaton, workspace, &mut meter)?;
         }
@@ -20550,7 +20626,10 @@ fn execute_context_lazy_loop<const LOOP_SKIP: bool>(
                     .context_loop_skip_plans
                     .find_with_hint(state, active_loop_slot),
                 LazyState::Inline { .. } => None,
-            };
+            }
+            // Exists and EarliestEnd must observe the first accepting member;
+            // SelectedEnd and Span may batch to the last accepting member.
+            .filter(|(_, plan)| !plan.accepting || !earliest);
             let selected_slot = selected.map(|(slot, _)| slot);
             if selected_slot != active_loop_slot {
                 loop_probe.left_plan_state();
@@ -20608,9 +20687,13 @@ fn execute_context_lazy_loop<const LOOP_SKIP: bool>(
                             },
                         )?;
                         restartable = false;
-                        if plan.start_action == LazyStartAction::Drop {
-                            active_start = None;
-                        }
+                        apply_context_lazy_loop_selected_effect(
+                            plan,
+                            position,
+                            &mut active_start,
+                            &mut pending_end,
+                            &mut pending_start,
+                        )?;
                         if position == window.end() {
                             continue;
                         }
@@ -22712,7 +22795,7 @@ fn context_loop_subset_work_upper(
 }
 
 /// Find the widest pair-closed union of byte-context atoms for one exact
-/// contextual self-loop value.
+/// contextual self-loop value, including its acceptance and provenance effects.
 ///
 /// A product combines one immutable global ByteClass with one raw-context
 /// atom. For a fixed left product, an exact transition key depends on the
@@ -22731,7 +22814,7 @@ fn try_pair_closed_context_loop_union(
     meter: &mut WorkMeter,
 ) -> Result<ContextLoopUnionAnalysis, SearchError> {
     debug_assert_ne!(dependencies, 0);
-    debug_assert!(context_nonaccepting_self_loop_action(state, value).is_some());
+    debug_assert!(context_self_loop_action(state, value).is_some());
     lazy.context.validate_shape()?;
     let partition = match try_partition_context_loop_members(
         automaton,
@@ -23611,17 +23694,23 @@ fn try_learn_context_dependency_masks(
 
 /// Best-first, source-independent ordering for contextual loop proofs.
 ///
-/// A wider exact member set remains the primary policy. Consuming the complete
-/// run is strictly better than retaining one scalar member at equal width.
-/// Exact graph contents, provenance, and the member bitmap then provide a
-/// canonical total order without using transition-slot or state discovery
-/// order.
+/// Every nonaccepting proof ranks ahead of every accepting proof, preserving
+/// the complete preexisting plan set whenever at least four such states are
+/// available. Within either effect, a wider exact member set remains the
+/// primary policy. Consuming the complete run is strictly better than retaining
+/// one scalar member at equal width. Exact graph contents, provenance, and the
+/// member bitmap then provide a canonical total order without using transition-
+/// slot or state discovery order.
 fn compare_context_lazy_loop_candidates(
     lazy: &LazyWorkspace,
     left: ContextLazyLoopSkipCandidate,
     right: ContextLazyLoopSkipCandidate,
     meter: &mut WorkMeter,
 ) -> Result<Option<core::cmp::Ordering>, SearchError> {
+    let acceptance = left.accepting.cmp(&right.accepting);
+    if acceptance != core::cmp::Ordering::Equal {
+        return Ok(Some(acceptance));
+    }
     let cardinality = byte_bitmap_cardinality(right.members)
         .cmp(&byte_bitmap_cardinality(left.members));
     if cardinality != core::cmp::Ordering::Equal {
@@ -23864,6 +23953,7 @@ fn try_publish_context_lazy_loop_skip_candidates(
                 state: candidate.state,
                 scanner: LazyLoopScanner::new(candidate.members),
                 start_action: candidate.start_action,
+                accepting: candidate.accepting,
                 leave_final_member: candidate.leave_final_member,
             });
     }
@@ -23876,12 +23966,45 @@ fn try_publish_context_lazy_loop_skip_candidates(
 /// Learn one context-stable contextual self-loop from already-published exact
 /// transitions. Assertion-independent loops may consume a complete member
 /// run. A byte-context loop consumes only `run - 1`, keeping one final member
-/// for scalar evaluation against the real successor or endpoint. Unicode word
-/// context is exact inside an ASCII run because each adjacent byte is a valid
-/// one-byte scalar and Unicode word membership equals ASCII word membership.
-/// The bounded slot walk prevents a later EOF-context hot record from hiding
-/// an earlier interior-context witness. Equivalent bytes remain scanner-only;
-/// no inferred contextual record is published.
+/// for scalar evaluation against the real successor or endpoint. Every plan
+/// retains the exact acceptance and provenance effects of its authenticated
+/// cell. Unicode word context is exact inside an ASCII run because each
+/// adjacent byte is a valid one-byte scalar and Unicode word membership equals
+/// ASCII word membership. The bounded slot walk prevents a later EOF-context
+/// hot record from hiding an earlier interior-context witness. Equivalent bytes
+/// remain scanner-only; no inferred contextual record is published.
+fn context_lazy_loop_skip_has_useful_epoch(
+    lazy: &LazyWorkspace,
+    contract: OutputContract,
+) -> bool {
+    let dependencies_advanced = lazy.context_loop_skip_analyzed_at_dependencies
+        != lazy.context_dependencies_analyzed;
+    match contract {
+        OutputContract::SelectedEnd | OutputContract::Span => {
+            lazy.context_loop_skip_analyzed_at_candidates
+                != lazy.context.loop_candidates_published
+                || dependencies_advanced
+        }
+        OutputContract::Exists | OutputContract::EarliestEnd => {
+            let nonaccepting = lazy.context.nonaccepting_loop_candidates_published;
+            lazy.context_loop_skip_analyzed_at_nonaccepting_candidates != nonaccepting
+                || (nonaccepting != 0 && dependencies_advanced)
+        }
+    }
+}
+
+fn try_derive_context_lazy_loop_skip_for_contract(
+    automaton: &Automaton,
+    workspace: &mut K0Workspace,
+    meter: &mut WorkMeter,
+    contract: OutputContract,
+) -> Result<(), SearchError> {
+    if !context_lazy_loop_skip_has_useful_epoch(&workspace.lazy, contract) {
+        return Ok(());
+    }
+    try_derive_context_lazy_loop_skip(automaton, workspace, meter)
+}
+
 fn try_derive_context_lazy_loop_skip(
     automaton: &Automaton,
     workspace: &mut K0Workspace,
@@ -23898,6 +24021,10 @@ fn try_derive_context_lazy_loop_skip(
     }
 
     let analyzed_candidates = workspace.lazy.context.loop_candidates_published;
+    let analyzed_nonaccepting_candidates = workspace
+        .lazy
+        .context
+        .nonaccepting_loop_candidates_published;
     let analyzed_dependencies = workspace.lazy.context_dependencies_analyzed;
     let mut best_candidates = [None; CONTEXT_LAZY_LOOP_SKIP_PLAN_CAPACITY];
     // A retained proof stays valid when its exact associative transition
@@ -23918,6 +24045,7 @@ fn try_derive_context_lazy_loop_skip(
                 state: plan.state,
                 members: plan.scanner.words(),
                 start_action: plan.start_action,
+                accepting: plan.accepting,
                 leave_final_member: plan.leave_final_member,
             },
             meter,
@@ -23941,8 +24069,8 @@ fn try_derive_context_lazy_loop_skip(
         let Ok(class) = u8::try_from(symbol_class) else {
             continue;
         };
-        let Some(start_action) =
-            context_nonaccepting_self_loop_action(record.source, record.value)
+        let Some((start_action, accepting)) =
+            context_self_loop_action(record.source, record.value)
         else {
             continue;
         };
@@ -24001,6 +24129,7 @@ fn try_derive_context_lazy_loop_skip(
                 state: record.source,
                 members: equivalent,
                 start_action,
+                accepting,
                 leave_final_member,
             },
             meter,
@@ -24028,6 +24157,7 @@ fn try_derive_context_lazy_loop_skip(
                         state: record.source,
                         members: union,
                         start_action,
+                        accepting,
                         leave_final_member: true,
                     },
                     meter,
@@ -24046,6 +24176,10 @@ fn try_derive_context_lazy_loop_skip(
         return Ok(());
     }
     workspace.lazy.context_loop_skip_analyzed_at_candidates = analyzed_candidates;
+    workspace
+        .lazy
+        .context_loop_skip_analyzed_at_nonaccepting_candidates =
+        analyzed_nonaccepting_candidates;
     workspace.lazy.context_loop_skip_analyzed_at_dependencies =
         analyzed_dependencies;
     Ok(())
@@ -32721,6 +32855,31 @@ mod tests {
         .unwrap()
     }
 
+    fn contextual_greedy_a_plus() -> Automaton {
+        // The complementary word assertions preserve `a+` while making the
+        // destination closure contextual. After the first `a`, the retained
+        // pending row is an accepting self-loop for every later `a`: the
+        // higher-priority Consume survives before the lower-priority Accept.
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![StateRole::Consume, StateRole::Split, StateRole::Accept],
+                edge_offsets: vec![0, 1, 4, 4],
+                edge_targets: vec![1, 0, 0, 2],
+                edge_kinds: vec![
+                    EdgeKind::ByteRange,
+                    EdgeKind::AssertWordAscii,
+                    EdgeKind::AssertWordAsciiNegate,
+                    EdgeKind::Epsilon,
+                ],
+                byte_starts: vec![b'a', 0, 0, 0],
+                byte_ends: vec![b'a', 0, 0, 0],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
     fn a_star(greedy: bool) -> Automaton {
         let split_targets = if greedy { [1, 2] } else { [2, 1] };
         Automaton::from_raw(
@@ -33615,7 +33774,7 @@ mod tests {
 
     fn contextual_loop_cache_signature(
         workspace: &K0Workspace,
-    ) -> Vec<(u32, super::LazyStartAction, bool, [u64; 4])> {
+    ) -> Vec<(u32, super::LazyStartAction, bool, bool, [u64; 4])> {
         workspace
             .lazy
             .context_loop_skip_plans
@@ -33626,6 +33785,7 @@ mod tests {
                 (
                     plan.state,
                     plan.start_action,
+                    plan.accepting,
                     plan.leave_final_member,
                     plan.scanner.words(),
                 )
@@ -33661,6 +33821,7 @@ mod tests {
                 state: states_by_item[item_index],
                 members,
                 start_action: super::LazyStartAction::Propagate,
+                accepting: false,
                 leave_final_member: false,
             });
         }
@@ -36808,6 +36969,7 @@ mod tests {
             state: retained_state,
             scanner: super::LazyLoopScanner::All,
             start_action: super::LazyStartAction::Propagate,
+            accepting: false,
             leave_final_member: false,
         });
         super::byte_bitmap_insert(
@@ -48336,6 +48498,7 @@ mod tests {
                     state,
                     members: [ranked_members[item_index], 0, 0, 0],
                     start_action: super::LazyStartAction::Drop,
+                    accepting: false,
                     leave_final_member: true,
                 },
                 &mut ranking,
@@ -48363,6 +48526,7 @@ mod tests {
                     state,
                     members: [3, 0, 0, 0],
                     start_action,
+                    accepting: false,
                     leave_final_member,
                 },
                 &mut ranking,
@@ -48375,6 +48539,68 @@ mod tests {
             equal[0].unwrap().start_action,
             super::LazyStartAction::Propagate
         );
+
+        let mut effects = [None; super::CONTEXT_LAZY_LOOP_SKIP_PLAN_CAPACITY];
+        assert!(super::try_retain_context_lazy_loop_candidate(
+            &workspace.lazy,
+            &mut effects,
+            super::ContextLazyLoopSkipCandidate {
+                state,
+                members: [u64::MAX; 4],
+                start_action: super::LazyStartAction::Propagate,
+                accepting: true,
+                leave_final_member: false,
+            },
+            &mut ranking,
+        )
+        .unwrap());
+        assert!(super::try_retain_context_lazy_loop_candidate(
+            &workspace.lazy,
+            &mut effects,
+            super::ContextLazyLoopSkipCandidate {
+                state,
+                members: [1, 0, 0, 0],
+                start_action: super::LazyStartAction::Drop,
+                accepting: false,
+                leave_final_member: true,
+            },
+            &mut ranking,
+        )
+        .unwrap());
+        let preferred = effects[0].unwrap();
+        assert!(!preferred.accepting);
+        assert_eq!(preferred.members, [1, 0, 0, 0]);
+
+        let mut capacity = [None; super::CONTEXT_LAZY_LOOP_SKIP_PLAN_CAPACITY];
+        for (item_index, state) in states_by_item[..4].iter().copied().enumerate() {
+            assert!(super::try_retain_context_lazy_loop_candidate(
+                &workspace.lazy,
+                &mut capacity,
+                super::ContextLazyLoopSkipCandidate {
+                    state,
+                    members: [1_u64 << item_index, 0, 0, 0],
+                    start_action: super::LazyStartAction::Propagate,
+                    accepting: false,
+                    leave_final_member: false,
+                },
+                &mut ranking,
+            )
+            .unwrap());
+        }
+        assert!(super::try_retain_context_lazy_loop_candidate(
+            &workspace.lazy,
+            &mut capacity,
+            super::ContextLazyLoopSkipCandidate {
+                state: states_by_item[4],
+                members: [u64::MAX; 4],
+                start_action: super::LazyStartAction::Propagate,
+                accepting: true,
+                leave_final_member: false,
+            },
+            &mut ranking,
+        )
+        .unwrap());
+        assert!(capacity.into_iter().flatten().all(|candidate| !candidate.accepting));
     }
 
     #[test]
@@ -49836,6 +50062,429 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one contextual fixture covers every accepting-loop consumer and its no-replay handoff"
+    )]
+    fn contextual_accepting_loop_is_exact_for_warm_and_mutable_selected_paths() {
+        let plan = contextual_greedy_a_plus();
+        pin_without_start_filter(&plan);
+        let run_end = super::LAZY_LOOP_SKIP_MIN_BYTES * 3;
+        let mut source = vec![b'!'; super::WARM_CONTEXT_MIN_WINDOW_BYTES];
+        source[..run_end].fill(b'a');
+        let address = source.as_ptr();
+        let window = SearchWindow::full(&source);
+        let expected_span = Some(MatchSpan::new(0, run_end));
+        let mut session =
+            K0SearchSession::new_selected(&plan, WorkspaceLimits::unlimited(), true, true)
+                .unwrap();
+
+        assert_eq!(
+            session
+                .search_window::<Span>(&source, window, SearchLimits::unlimited())
+                .unwrap()
+                .into_output(),
+            expected_span,
+        );
+        let accepting = session
+            .workspace
+            .lazy
+            .context_loop_skip_plans
+            .entries
+            .iter()
+            .flatten()
+            .find(|plan| plan.accepting)
+            .copied()
+            .expect("the contextual greedy-plus row must retain its accepting loop proof");
+        assert_eq!(accepting.start_action, super::LazyStartAction::Propagate);
+        assert!(accepting.leave_final_member);
+        assert!(accepting.scanner.contains(b'a'));
+        assert!(!accepting.scanner.contains(b'!'));
+        assert_ne!(
+            session.workspace.lazy.modes[usize::try_from(accepting.state).unwrap()],
+            0,
+            "the accepting loop must remain bound to its pending-mode state",
+        );
+
+        let proof = plan.start_filter_proof.get().unwrap();
+        assert_eq!(
+            super::try_warm_context_exists_loop::<true>(
+                &plan,
+                &source,
+                window,
+                &session.workspace.lazy,
+                proof,
+            ),
+            super::try_warm_context_exists_loop::<false>(
+                &plan,
+                &source,
+                window,
+                &session.workspace.lazy,
+                proof,
+            ),
+            "Exists must keep the first accepting transition scalar",
+        );
+        assert_eq!(
+            super::try_warm_context_selected_end_loop::<true>(
+                &plan,
+                &source,
+                window,
+                &session.workspace.lazy,
+                proof,
+            ),
+            super::try_warm_context_selected_end_loop::<false>(
+                &plan,
+                &source,
+                window,
+                &session.workspace.lazy,
+                proof,
+            ),
+        );
+        assert_eq!(
+            super::try_warm_context_span_loop::<true>(
+                &plan,
+                &source,
+                window,
+                &session.workspace.lazy,
+                &session.workspace.reverse,
+                proof,
+            ),
+            super::try_warm_context_span_loop::<false>(
+                &plan,
+                &source,
+                window,
+                &session.workspace.lazy,
+                &session.workspace.reverse,
+                proof,
+            ),
+        );
+        assert_eq!(
+            super::try_warm_context_selected_end(
+                &plan,
+                &source,
+                window,
+                &session.workspace.lazy,
+                proof,
+            ),
+            Ok(Some(Some(run_end))),
+        );
+        assert_eq!(
+            super::try_warm_context_span(
+                &plan,
+                &source,
+                window,
+                &session.workspace.lazy,
+                &session.workspace.reverse,
+                proof,
+            ),
+            Ok(Some(expected_span)),
+        );
+
+        let mut selected_skip_work = None;
+        for contract in [
+            OutputContract::Exists,
+            OutputContract::EarliestEnd,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let mut scalar_meter = WorkMeter::new(u64::MAX, 0);
+            let mut scalar_adaptive = super::AdaptiveStartProbe::default();
+            let scalar = super::execute_context_lazy_loop::<false>(
+                &plan,
+                &source,
+                window,
+                &mut session.workspace,
+                &mut scalar_meter,
+                contract,
+                0,
+                None,
+                None,
+                None,
+                false,
+                false,
+                &mut scalar_adaptive,
+            )
+            .unwrap()
+            .unwrap();
+            let mut skipped_meter = WorkMeter::new(u64::MAX, 0);
+            let mut skipped_adaptive = super::AdaptiveStartProbe::default();
+            let skipped = super::execute_context_lazy_loop::<true>(
+                &plan,
+                &source,
+                window,
+                &mut session.workspace,
+                &mut skipped_meter,
+                contract,
+                0,
+                None,
+                None,
+                None,
+                false,
+                false,
+                &mut skipped_adaptive,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(skipped, scalar, "{contract:?}");
+            let expected_end = if matches!(
+                contract,
+                OutputContract::Exists | OutputContract::EarliestEnd
+            ) {
+                1
+            } else {
+                run_end
+            };
+            assert_eq!(skipped.0, Some(MatchSpan::new(0, expected_end)));
+            if contract == OutputContract::SelectedEnd {
+                assert!(
+                    skipped_meter.consumed < scalar_meter.consumed,
+                    "the accepting contextual run must bypass per-byte assertion lookup",
+                );
+                selected_skip_work = Some(skipped_meter.consumed);
+            }
+        }
+
+        let exact_limit = selected_skip_work.expect("SelectedEnd work");
+        let mut exact_meter = WorkMeter::new(exact_limit, 0);
+        let mut exact_adaptive = super::AdaptiveStartProbe::default();
+        assert!(super::execute_context_lazy_loop::<true>(
+            &plan,
+            &source,
+            window,
+            &mut session.workspace,
+            &mut exact_meter,
+            OutputContract::SelectedEnd,
+            0,
+            None,
+            None,
+            None,
+            false,
+            false,
+            &mut exact_adaptive,
+        )
+        .unwrap()
+        .is_some());
+        let one_below = exact_limit.checked_sub(1).unwrap();
+        let mut refused_meter = WorkMeter::new(one_below, 0);
+        let mut refused_adaptive = super::AdaptiveStartProbe::default();
+        assert!(matches!(
+            super::execute_context_lazy_loop::<true>(
+                &plan,
+                &source,
+                window,
+                &mut session.workspace,
+                &mut refused_meter,
+                OutputContract::SelectedEnd,
+                0,
+                None,
+                None,
+                None,
+                false,
+                false,
+                &mut refused_adaptive,
+            ),
+            Err(SearchError::WorkLimitExceeded { limit, .. }) if limit == one_below
+        ));
+
+        let signature = contextual_loop_cache_signature(&session.workspace);
+        let slots = session.workspace.lazy.context.slots.clone();
+        let hot = session.workspace.lazy.context.hot.clone();
+        let dense = session.workspace.lazy.context.dense.clone();
+        let shorter_end = super::LAZY_LOOP_SKIP_MIN_BYTES * 2;
+        source[shorter_end] = b'!';
+        source[shorter_end + 1] = b'!';
+        assert_eq!(source.as_ptr(), address);
+        assert_eq!(
+            super::try_warm_context_selected_end(
+                &plan,
+                &source,
+                window,
+                &session.workspace.lazy,
+                proof,
+            ),
+            Ok(Some(Some(shorter_end))),
+        );
+        assert_eq!(
+            super::try_warm_context_span(
+                &plan,
+                &source,
+                window,
+                &session.workspace.lazy,
+                &session.workspace.reverse,
+                proof,
+            ),
+            Ok(Some(Some(MatchSpan::new(0, shorter_end)))),
+        );
+        assert_eq!(contextual_loop_cache_signature(&session.workspace), signature);
+        assert_eq!(session.workspace.lazy.context.slots, slots);
+        assert_eq!(session.workspace.lazy.context.hot, hot);
+        assert_eq!(session.workspace.lazy.context.dense, dense);
+        source[shorter_end] = b'a';
+        source[shorter_end + 1] = b'a';
+
+        let global_dependencies = plan.boundary_context_classifier().assertions();
+        let root_dependencies = session
+            .workspace
+            .lazy
+            .context_root_dependency_mask(global_dependencies);
+        let normalized_initial_assertions =
+            super::enabled_assertion_mask_unmetered_for_dependencies(
+                &plan,
+                root_dependencies,
+                &source,
+                window.start(),
+            );
+        let exact_initial_assertions = super::enabled_assertion_mask_unmetered_for_dependencies(
+            &plan,
+            global_dependencies,
+            &source,
+            window.start(),
+        );
+        for symbol in [normalized_initial_assertions, exact_initial_assertions]
+            .map(super::contextual_initial_symbol)
+        {
+            if session.workspace.lazy.context.slots.iter().any(|record| {
+                record.source == CONTEXT_INITIAL_SOURCE && record.symbol == symbol
+            }) {
+                remove_exact_context_record(
+                    &mut session.workspace.lazy.context,
+                    CONTEXT_INITIAL_SOURCE,
+                    symbol,
+                );
+            }
+        }
+        let continuation = match super::probe_warm_context_selected_end(
+            &plan,
+            &source,
+            window,
+            &session.workspace.lazy,
+            proof,
+        )
+        .unwrap()
+        {
+            Some(super::WarmContextSelectedEndProbe::Continue(continuation)) => continuation,
+            other => panic!("expected accepting-loop initial continuation, got {other:?}"),
+        };
+        assert_eq!(continuation.phase, super::WarmContextForwardPhase::Initial);
+        assert_eq!(
+            super::continue_mutable_warm_context_forward(
+                &plan,
+                &source,
+                &mut session.workspace,
+                proof,
+                continuation,
+                OutputContract::SelectedEnd,
+            )
+            .unwrap()
+            .map(MatchSpan::end),
+            Some(run_end),
+        );
+        assert_eq!(contextual_loop_cache_signature(&session.workspace), signature);
+    }
+
+    #[test]
+    fn contextual_accepting_loop_effect_tracks_drop_and_propagate_provenance() {
+        for (start_action, expected_start) in [
+            (super::LazyStartAction::Propagate, Some(7)),
+            (super::LazyStartAction::Drop, None),
+        ] {
+            let plan = super::ContextLazyLoopSkipPlan {
+                state: 0,
+                scanner: super::LazyLoopScanner::All,
+                start_action,
+                accepting: true,
+                leave_final_member: false,
+            };
+            let mut active_start = Some(7);
+            let mut pending_end = Some(3);
+            let mut pending_start = Some(1);
+            super::apply_context_lazy_loop_selected_effect(
+                &plan,
+                19,
+                &mut active_start,
+                &mut pending_end,
+                &mut pending_start,
+            )
+            .unwrap();
+            assert_eq!(active_start, expected_start);
+            assert_eq!(pending_end, Some(19));
+            assert_eq!(pending_start, expected_start);
+        }
+    }
+
+    #[test]
+    fn contextual_accepting_only_derivation_is_deferred_for_earliest_contracts() {
+        let plan = contextual_nonpending_loop_then_terminal();
+        let mut workspace =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let mut intern = WorkMeter::new(u64::MAX, 0);
+        workspace.lazy.scratch[0] = 0;
+        workspace.lazy.scratch_len = 1;
+        assert_eq!(workspace.lazy.intern_initial(false, &mut intern, 0).unwrap(), 0);
+
+        let loop_record = ContextTransitionSlot::populated(
+            0,
+            super::contextual_symbol_for_byte(&plan, b'a', 0),
+            1 | super::LazyStartAction::Propagate.cell_bits() | super::LAZY_CELL_ACCEPT,
+        );
+        let mut publish = WorkMeter::new(u64::MAX, 0);
+        workspace
+            .lazy
+            .context
+            .publish(Some(0), loop_record, &mut publish, 0, 0)
+            .unwrap();
+        workspace.lazy.context.hot[0].dependency_mask = 0;
+        workspace.lazy.context_dependencies_analyzed = 1;
+        assert_eq!(workspace.lazy.context.loop_candidates_published, 1);
+        assert_eq!(
+            workspace
+                .lazy
+                .context
+                .nonaccepting_loop_candidates_published,
+            0,
+        );
+
+        for contract in [OutputContract::Exists, OutputContract::EarliestEnd] {
+            let mut earliest = WorkMeter::new(u64::MAX, 0);
+            super::try_derive_context_lazy_loop_skip_for_contract(
+                &plan,
+                &mut workspace,
+                &mut earliest,
+                contract,
+            )
+            .unwrap();
+            assert_eq!(earliest.consumed, 0, "{contract:?}");
+            assert!(workspace.lazy.context_loop_skip_plans.is_empty());
+            assert_eq!(workspace.lazy.context_loop_skip_analyzed_at_candidates, 0);
+        }
+
+        let mut selected = WorkMeter::new(u64::MAX, 0);
+        super::try_derive_context_lazy_loop_skip_for_contract(
+            &plan,
+            &mut workspace,
+            &mut selected,
+            OutputContract::SelectedEnd,
+        )
+        .unwrap();
+        assert_ne!(selected.consumed, 0);
+        let retained = workspace
+            .lazy
+            .context_loop_skip_plans
+            .first()
+            .expect("SelectedEnd must consume the deferred accepting proof");
+        assert!(retained.accepting);
+        assert!(retained.scanner.contains(b'a'));
+        assert_eq!(workspace.lazy.context_loop_skip_analyzed_at_candidates, 1);
+        assert_eq!(
+            workspace
+                .lazy
+                .context_loop_skip_analyzed_at_nonaccepting_candidates,
+            0,
+        );
+        assert_eq!(workspace.lazy.context_loop_skip_analyzed_at_dependencies, 1);
+    }
+
+    #[test]
     fn contextual_loop_candidate_survives_hot_terminal_and_publication_declines() {
         let plan = contextual_nonpending_loop_then_terminal();
         let mut workspace =
@@ -49866,8 +50515,26 @@ mod tests {
         assert_eq!(workspace.lazy.context.published, 0);
         assert_eq!(workspace.lazy.context.loop_candidates_published, 0);
 
+        let accepting = loop_cell | super::LAZY_CELL_ACCEPT;
+        let mut accepting_meter = WorkMeter::new(u64::MAX, 0);
+        workspace
+            .lazy
+            .context
+            .publish(
+                Some(0),
+                ContextTransitionSlot::populated(
+                    0,
+                    super::contextual_symbol_for_byte(&plan, b'b', 0),
+                    accepting,
+                ),
+                &mut accepting_meter,
+                0,
+                0,
+            )
+            .unwrap();
+        assert_eq!(workspace.lazy.context.loop_candidates_published, 1);
+
         let rejected = [
-            loop_cell | super::LAZY_CELL_ACCEPT,
             1 | super::LazyStartAction::Reset.cell_bits(),
             2 | super::LazyStartAction::Propagate.cell_bits(),
         ];
@@ -49877,12 +50544,12 @@ mod tests {
                 .lazy
                 .context
                 .publish(
-                    Some(index),
+                    Some(index + 1),
                     ContextTransitionSlot::populated(
                         0,
                         super::contextual_symbol_for_byte(
                             &plan,
-                            b'b' + u8::try_from(index).unwrap(),
+                            b'c' + u8::try_from(index).unwrap(),
                             0,
                         ),
                         value,
@@ -49892,7 +50559,7 @@ mod tests {
                     0,
                 )
                 .unwrap();
-            assert_eq!(workspace.lazy.context.loop_candidates_published, 0);
+            assert_eq!(workspace.lazy.context.loop_candidates_published, 1);
         }
 
         let drop_symbol = loop_symbol;
@@ -49908,7 +50575,7 @@ mod tests {
                 0,
             )
             .unwrap();
-        assert_eq!(workspace.lazy.context.loop_candidates_published, 1);
+        assert_eq!(workspace.lazy.context.loop_candidates_published, 2);
         assert_eq!(workspace.lazy.context.slots[3].symbol, drop_symbol);
         assert_eq!(workspace.lazy.context.slots[3].value, drop_cell);
 
@@ -49918,7 +50585,7 @@ mod tests {
             .context
             .publish(Some(4), loop_record, &mut publish, 0, 0)
             .unwrap();
-        assert_eq!(workspace.lazy.context.loop_candidates_published, 2);
+        assert_eq!(workspace.lazy.context.loop_candidates_published, 3);
 
         let terminal_symbol = super::contextual_symbol_for_byte(&plan, b'z', 0);
         workspace
@@ -49933,7 +50600,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(workspace.lazy.context.hot[0].symbol, terminal_symbol);
-        assert_eq!(workspace.lazy.context.loop_candidates_published, 2);
+        assert_eq!(workspace.lazy.context.loop_candidates_published, 3);
         assert_eq!(workspace.lazy.context.slots[4], loop_record);
         assert_eq!(size_of::<super::ContextHotTransition>(), 16);
 
@@ -50903,6 +51570,7 @@ mod tests {
             .first()
             .expect("the Unicode-dependent nonpending Drop self-loop must retain a scanner");
         assert_eq!(loop_plan.start_action, super::LazyStartAction::Drop);
+        assert!(!loop_plan.accepting);
         assert!(loop_plan.leave_final_member);
         assert!(loop_plan.scanner.contains(b'x'));
         assert_ne!(
@@ -60831,6 +61499,7 @@ mod tests {
             .first()
             .unwrap();
         assert_eq!(loop_plan.start_action, super::LazyStartAction::Drop);
+        assert!(!loop_plan.accepting);
 
         let dependencies = plan.boundary_context_classifier().assertions();
         let assertions = super::enabled_assertion_mask_unmetered_for_dependencies(
