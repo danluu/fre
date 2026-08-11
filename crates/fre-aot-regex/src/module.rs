@@ -7783,6 +7783,7 @@ fn build_native_ordinal_retry(
             false,
             candidate_quotient,
             Some(plan),
+            None,
             permit_asimd_candidate_mask,
         )
         .and_then(|lowering| require_native_start_scanner(view, max_native_data_bytes, lowering));
@@ -7814,6 +7815,7 @@ fn build_native_ordinal_retry(
                 Some(comparison),
                 candidate_exact,
                 false,
+                None,
                 None,
                 None,
                 permit_asimd_candidate_mask,
@@ -44987,6 +44989,7 @@ mod tests {
             false,
             column_quotient.as_ref(),
             Some(plan),
+            None,
             architecture == Architecture::Aarch64,
         )
     }
@@ -63810,6 +63813,7 @@ int main(void){{
                 false,
                 None,
                 Some(plan),
+                None,
                 permit_asimd_candidate_mask,
             )
             .unwrap()
@@ -63967,6 +63971,7 @@ int main(void){{
                     false,
                     None,
                     Some(plan),
+                    None,
                     permit_asimd_candidate_mask,
                 )
                 .unwrap()
@@ -63998,6 +64003,7 @@ int main(void){{
                 true,
                 None,
                 None,
+                None,
                 permit_asimd_candidate_mask,
             )
             .unwrap();
@@ -64017,6 +64023,7 @@ int main(void){{
                     Some(plan),
                     None,
                     false,
+                    None,
                     None,
                     None,
                     permit_asimd_candidate_mask,
