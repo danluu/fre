@@ -16,6 +16,7 @@
 mod absolute_anchored_cut;
 mod bit_parallel_exists;
 mod bounded_suffix_retry;
+mod byte_frequency;
 mod context_dfa;
 mod context_native;
 mod dfa;
@@ -157,7 +158,7 @@ pub use program::{
 /// Stable compiler pipeline identity.
 pub const COMPILER_VERSION: u32 = 1;
 /// Stable optimizer/cost-model identity.
-pub const OPTIMIZER_VERSION: u32 = 1;
+pub const OPTIMIZER_VERSION: u32 = 2;
 
 /// Deterministic pass identity retained in every compiler receipt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

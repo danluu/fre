@@ -22,6 +22,9 @@ use crate::{
     bounded_suffix_retry::{
         BoundedSuffixRetryPlan, select_bounded_interior_retry, select_bounded_suffix_retry,
     },
+    byte_frequency::{
+        BYTE_FREQUENCY_DENOMINATOR, byte_frequency_rank, estimated_byte_frequency_units,
+    },
     context_dfa::ContextDfaStats,
     context_native::MAX_CONTEXT_NATIVE_DATA_BYTES,
     dfa::{ForwardCell, NativeDfaView},
@@ -4669,38 +4672,12 @@ const SUFFIX_PREFILTER_MIN_WINDOW_BYTES: u16 = 128;
 /// selected kernel, so materializing constants for a prefilter that will not
 /// run is pure fixed overhead.
 const ENABLE_DEFERRED_SUFFIX_FILTER_CONSTANTS: bool = true;
-const BYTE_FREQUENCY_DENOMINATOR: u16 = 256;
 const MAX_LAZY_SECONDARY_FREQUENCY_UNITS: u16 = 64;
 const MAX_LAZY_SECONDARY_COST_UNITS: u64 = 128;
 /// A scalar aligned refinement is paid after every primary SIMD hit. Retain
 /// it only when the stable byte-frequency model predicts at most one such hit
 /// per 16 scanned bytes; broader primaries use the ordinary proven restart.
 const MAX_SCALAR_REFINEMENT_PRIMARY_FREQUENCY_UNITS: u16 = 16;
-/// Stable offline byte-frequency ranks for the native rare-byte cost model.
-///
-/// Lower ranks are rarer. The table is deliberately target, pattern-name and
-/// input independent; it is the conventional ranking used by mature
-/// substring prefilters. Absolute probabilities are conservatively bucketed
-/// below because rank gaps are ordinal, not linear frequencies.
-#[rustfmt::skip]
-const BYTE_FREQUENCY_RANK: [u8; 256] = [
-     55,  52,  51,  50,  49,  48,  47,  46,  45, 103, 242,  66,  67, 229,  44,  43,
-     42,  41,  40,  39,  38,  37,  36,  35,  34,  33,  56,  32,  31,  30,  29,  28,
-    255, 148, 164, 149, 136, 160, 155, 173, 221, 222, 134, 122, 232, 202, 215, 224,
-    208, 220, 204, 187, 183, 179, 177, 168, 178, 200, 226, 195, 154, 184, 174, 126,
-    120, 191, 157, 194, 170, 189, 162, 161, 150, 193, 142, 137, 171, 176, 185, 167,
-    186, 112, 175, 192, 188, 156, 140, 143, 123, 133, 128, 147, 138, 146, 114, 223,
-    151, 249, 216, 238, 236, 253, 227, 218, 230, 247, 135, 180, 241, 233, 246, 244,
-    231, 139, 245, 243, 251, 235, 201, 196, 240, 214, 152, 182, 205, 181, 127,  27,
-    212, 211, 210, 213, 228, 197, 169, 159, 131, 172, 105,  80,  98,  96,  97,  81,
-    207, 145, 116, 115, 144, 130, 153, 121, 107, 132, 109, 110, 124, 111,  82, 108,
-    118, 141, 113, 129, 119, 125, 165, 117,  92, 106,  83,  72,  99,  93,  65,  79,
-    166, 237, 163, 199, 190, 225, 209, 203, 198, 217, 219, 206, 234, 248, 158, 239,
-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-];
 const PREFIX_BITMAP_BYTES: usize = 32;
 const PREFIX_RELATION_BITMAP_BYTES: usize = 256 * 256 / 8;
 /// Exact relation rectangles that can be evaluated directly in one SIMD
@@ -14025,18 +14002,6 @@ fn mandatory_filter_selection_key(
     )
 }
 
-fn estimated_byte_frequency_units(byte: u8) -> u16 {
-    match BYTE_FREQUENCY_RANK[usize::from(byte)] {
-        255 => 32,
-        248..=254 => 24,
-        240..=247 => 16,
-        224..=239 => 8,
-        192..=223 => 4,
-        128..=191 => 2,
-        _ => 1,
-    }
-}
-
 fn estimated_filter_frequency_units(filter: NativeStartFilter) -> u16 {
     let mut units = 0_u16;
     for range in filter.ranges() {
@@ -14051,7 +14016,7 @@ fn filter_frequency_rank_sum(filter: NativeStartFilter) -> u16 {
     let mut sum = 0_u16;
     for range in filter.ranges() {
         for byte in range.start..=range.end {
-            sum = sum.saturating_add(u16::from(BYTE_FREQUENCY_RANK[usize::from(byte)]));
+            sum = sum.saturating_add(u16::from(byte_frequency_rank(byte)));
         }
     }
     sum
@@ -42246,7 +42211,9 @@ mod tests {
     fn partial_loop_limits() -> CompileLimitsV1 {
         CompileLimitsV1 {
             determinize: DeterminizeLimits {
-                max_states: 6,
+                // The fresh estimated-frequency replay needs seven state
+                // slots to retain this fixture's completed self-loop row.
+                max_states: 7,
                 ..DeterminizeLimits::default()
             },
             ..CompileLimitsV1::default()
@@ -74017,7 +73984,11 @@ int main(void){{
     fn partial_range_loop_uses_vla_base_sve_on_sve2_targets() {
         let limits = CompileLimitsV1 {
             determinize: DeterminizeLimits {
-                max_states: 4,
+                // Fresh compilation visits classes in stable estimated-byte-
+                // frequency order. Six states are the exact first cap that
+                // retains this graph's two-range self-loop row; five retains
+                // a different complete prefix with no loop candidate.
+                max_states: 6,
                 ..DeterminizeLimits::default()
             },
             ..CompileLimitsV1::default()
