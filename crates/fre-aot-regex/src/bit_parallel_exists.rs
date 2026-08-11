@@ -98,7 +98,11 @@ impl BuildResources {
     }
 }
 
-/// A complete assertion-free `Exists` executor derived from one raw graph.
+/// A complete assertion-free existence machine derived from one raw graph.
+///
+/// Its positive result is a complete `Exists` answer. Callers that require an
+/// ordered endpoint may consume only a negative result and must side-exit to
+/// the ordered executor on a possible match.
 ///
 /// The one-word representation retains the original four-source subset rows.
 /// Wider representations store one dense epsilon-closed destination vector
@@ -493,8 +497,9 @@ impl BitParallelExists {
     ///
     /// `raw_frontier` contains epsilon-closed consuming raw-state indices at
     /// `resume_position`, the first byte not consumed by the retained table.
-    /// The unanchored root is present in canonical Exists keys, but injecting
-    /// it again is idempotent and makes the boundary invariant explicit.
+    /// The unanchored root is present in canonical resume keys when required,
+    /// but injecting it again is idempotent and makes the boundary invariant
+    /// explicit for every output contract.
     pub(crate) fn search_from_raw_frontier(
         &self,
         haystack: &[u8],

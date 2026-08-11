@@ -2532,9 +2532,9 @@ enum ProgramOptimizationSidecar {
     /// Retained rows paired with the replay identity authenticated by their
     /// enclosing stable program version.
     Partial(Box<ReplayPartialDfa>),
-    /// Exact bounded assertion-free Exists fallback without retained rows.
+    /// Exact bounded assertion-free existence machine without retained rows.
     BitParallelExists(Box<BitParallelExists>),
-    /// Ranked retained rows and their exact bit-parallel Exists fallback.
+    /// Ranked retained rows and their exact bit-parallel existence machine.
     PartialBitParallelExists(Box<PartialBitParallelExists>),
 }
 
@@ -2638,6 +2638,59 @@ pub struct ProgramWorkspace {
     partial: Option<Box<PartialDfaWorkspace>>,
     static_prefix_resume: Option<Box<StaticPrefixResumeWorkspace>>,
     dynamic_native_rows: Option<Box<DynamicNativeRowsWorkspace>>,
+    endpoint_oracle_backoff: EndpointOracleBackoff,
+}
+
+/// Per-workspace admission state for the whole-window endpoint oracle.
+///
+/// A negative existence result is a complete endpoint result. A positive
+/// result must replay the ordered executor, so repeated positives receive the
+/// same periodic exponential backoff used by other speculative fallback
+/// entries. The state belongs to the compiler-owned program workspace rather
+/// than general K0 storage and is never consulted by `Exists` or retained-hole
+/// continuations.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct EndpointOracleBackoff {
+    positive_probe_streak: u8,
+    bypass_remaining: u16,
+}
+
+impl EndpointOracleBackoff {
+    const fn should_probe(self) -> bool {
+        self.bypass_remaining == 0
+    }
+
+    fn observe_negative(&mut self) {
+        self.positive_probe_streak = 0;
+        self.bypass_remaining = 0;
+    }
+
+    fn observe_positive_replay(&mut self) {
+        self.positive_probe_streak = self.positive_probe_streak.saturating_add(1);
+        if self.positive_probe_streak < 2 {
+            return;
+        }
+        let shift = u32::from(self.positive_probe_streak.saturating_sub(2))
+            .saturating_add(4)
+            .min(10);
+        self.bypass_remaining = 1_u16 << shift;
+    }
+
+    fn observe_bypassed_result(&mut self, found: &MatchResult) {
+        if match_result_has_match(found) {
+            self.bypass_remaining = self.bypass_remaining.saturating_sub(1);
+        } else {
+            self.observe_negative();
+        }
+    }
+}
+
+const fn match_result_has_match(found: &MatchResult) -> bool {
+    match found {
+        MatchResult::Exists(found) => *found,
+        MatchResult::SelectedEnd(found) => found.is_some(),
+        MatchResult::Span(found) => found.is_some(),
+    }
 }
 
 /// Opaque proof that one prepared program/workspace pair published every
@@ -9899,7 +9952,6 @@ impl CompiledProgram {
             .flatten();
         let has_nfa_exact_product = nfa_exact_product.is_some();
         let bit_parallel_exists = (nfa_exact_product.is_none()
-            && output == OutputContract::Exists
             && engine_selection_reason == EngineSelectionReason::DeterminizationResourceLimit
             && matches!(engine, ProgramEngine::OrderedNfa)
             // A resource decline can happen after the complete forward table
@@ -10136,19 +10188,20 @@ impl CompiledProgram {
         self.optimization_sidecar.bit_parallel_exists()
     }
 
-    /// Return the canonical one-word fallback dimensions and resource receipt.
+    /// Return the canonical bounded existence-machine dimensions and resource receipt.
     ///
-    /// This is present only for an assertion-free optimizing `Exists` program
-    /// whose complete determinization declined and whose validated Thompson
-    /// graph fit the fixed bit-parallel construction envelope.
+    /// This is present only for an assertion-free optimizing program whose
+    /// complete determinization declined and whose validated Thompson graph
+    /// fit the fixed bit-parallel construction envelope. `Exists` consumes the
+    /// result directly; endpoint contracts use only a proved negative result.
     #[must_use]
     pub fn bit_parallel_exists_stats(&self) -> Option<BitParallelExistsStats> {
         self.bit_parallel_exists().map(BitParallelExists::stats)
     }
 
-    /// Return the complete canonical one-word `Exists` machine for native
-    /// lowering. The explicit contract/engine checks keep the private sidecar
-    /// from becoming an accidental lowering seam for another result ABI.
+    /// Return the complete canonical existence machine for native `Exists`
+    /// lowering. The explicit contract/engine checks keep an endpoint negative
+    /// oracle from entering the standalone boolean result ABI.
     pub(crate) fn native_bit_parallel_exists_view(
         &self,
     ) -> Option<NativeBitParallelExistsView<'_>> {
@@ -11774,6 +11827,7 @@ impl CompiledProgram {
             partial,
             static_prefix_resume: None,
             dynamic_native_rows,
+            endpoint_oracle_backoff: EndpointOracleBackoff::default(),
         })
     }
 
@@ -11811,8 +11865,18 @@ impl CompiledProgram {
         }
         match &self.engine {
             ProgramEngine::OrderedNfa => {
-                if let Some(nfa) = workspace.nfa.as_mut() {
-                    return self.search_nfa(haystack, window, nfa);
+                let ProgramWorkspace {
+                    nfa,
+                    endpoint_oracle_backoff,
+                    ..
+                } = workspace;
+                if let Some(nfa) = nfa.as_mut() {
+                    return self.search_nfa(
+                        haystack,
+                        window,
+                        nfa,
+                        endpoint_oracle_backoff,
+                    );
                 }
                 let accelerator = self
                     .nfa_mandatory_cut
@@ -11872,8 +11936,10 @@ impl CompiledProgram {
     /// This preserves the ordinary semantic entry's compact call graph while
     /// selecting a retained partial DFA only when the artifact and its exact
     /// workspace both carry one and the input can amortize its fixed dispatch.
-    /// An eligible Exists hole continues in the bit-parallel executor from its
-    /// authenticated frontier rather than replaying the retained prefix.
+    /// An eligible hole may continue in the bit-parallel existence machine
+    /// from its authenticated frontier rather than replaying the retained
+    /// prefix. Endpoint contracts consume only a proved no-match; a possible
+    /// match remains on the ordered fallback.
     /// Runtime adapters for optimizing AOT artifacts should use this entry.
     ///
     /// # Errors
@@ -18352,6 +18418,7 @@ impl CompiledProgram {
         haystack: &[u8],
         mut window: SearchWindow,
         workspace: &mut K0Workspace,
+        endpoint_oracle_backoff: &mut EndpointOracleBackoff,
     ) -> Result<MatchResult, CompileError> {
         if let Some(found) = self.search_nfa_with_mandatory_suffix(haystack, window, workspace)? {
             return Ok(found);
@@ -18360,14 +18427,48 @@ impl CompiledProgram {
             NfaMandatoryCutOutcome::Complete(found) => return Ok(found),
             NfaMandatoryCutOutcome::Continue(narrowed) => window = narrowed,
         }
+        let mut positive_oracle_replay = false;
+        let mut bypassed_endpoint_oracle = false;
         if let Some(bit_parallel) = self.bit_parallel_exists() {
-            return Ok(MatchResult::Exists(bit_parallel.search(
-                haystack,
-                window.start,
-                window.end,
-            )?));
+            match self.output {
+                OutputContract::Exists => {
+                    return Ok(MatchResult::Exists(bit_parallel.search(
+                        haystack,
+                        window.start,
+                        window.end,
+                    )?));
+                }
+                OutputContract::SelectedEnd | OutputContract::Span
+                    if window.end.saturating_sub(window.start)
+                        >= PARTIAL_DFA_MIN_INPUT_BYTES =>
+                {
+                    if endpoint_oracle_backoff.should_probe() {
+                        let found = bit_parallel.search(haystack, window.start, window.end)?;
+                        if !found {
+                            endpoint_oracle_backoff.observe_negative();
+                            return Ok(match self.output {
+                                OutputContract::SelectedEnd => MatchResult::SelectedEnd(None),
+                                OutputContract::Span => MatchResult::Span(None),
+                                OutputContract::Exists => unreachable!(
+                                    "the direct Exists oracle returned above"
+                                ),
+                            });
+                        }
+                        positive_oracle_replay = true;
+                    } else {
+                        bypassed_endpoint_oracle = true;
+                    }
+                }
+                OutputContract::SelectedEnd | OutputContract::Span => {}
+            }
         }
-        self.search_nfa_unaccelerated(haystack, window, workspace)
+        let found = self.search_nfa_unaccelerated(haystack, window, workspace)?;
+        if positive_oracle_replay {
+            endpoint_oracle_backoff.observe_positive_replay();
+        } else if bypassed_endpoint_oracle {
+            endpoint_oracle_backoff.observe_bypassed_result(&found);
+        }
+        Ok(found)
     }
 
     /// Keep retained-row selection and its rare whole-window fallback out of
@@ -18802,15 +18903,6 @@ impl CompiledProgram {
         if resume_set.is_none()
             && let Some(bit_parallel) = self.bit_parallel_exists()
         {
-            if self.output != OutputContract::Exists {
-                return Err(CompileError::InternalInvariant(
-                    "bit-parallel continuation was paired with a non-Exists output",
-                ));
-            }
-            if resume.pending_end.is_some() {
-                state.observe_resume(consumed, input_bytes);
-                return Ok(Some(MatchResult::Exists(true)));
-            }
             let partial = self.partial_dfa().ok_or(CompileError::InternalInvariant(
                 "bit-parallel continuation has no retained partial DFA",
             ))?;
@@ -18819,19 +18911,42 @@ impl CompiledProgram {
                     "bit-parallel continuation has no authenticated resume frontier",
                 ),
             )?;
-            if pending {
+            if pending != resume.pending_end.is_some() {
                 return Err(CompileError::InternalInvariant(
-                    "bit-parallel Exists resume frontier retained an unreported acceptance",
+                    "bit-parallel resume pending mode disagrees with the canonical frontier",
                 ));
             }
-            let found = bit_parallel.search_from_raw_frontier(
-                haystack,
-                resume.position,
-                window.end,
-                frontier,
-            )?;
-            state.observe_resume(consumed, input_bytes);
-            return Ok(Some(MatchResult::Exists(found)));
+            if pending && self.output == OutputContract::Exists {
+                state.observe_resume(consumed, input_bytes);
+                return Ok(Some(MatchResult::Exists(true)));
+            }
+            let remaining = window.end.saturating_sub(resume.position);
+            if !pending
+                && (self.output == OutputContract::Exists
+                    || remaining >= PARTIAL_DFA_MIN_INPUT_BYTES)
+            {
+                let found = bit_parallel.search_from_raw_frontier(
+                    haystack,
+                    resume.position,
+                    window.end,
+                    frontier,
+                )?;
+                match self.output {
+                    OutputContract::Exists => {
+                        state.observe_resume(consumed, input_bytes);
+                        return Ok(Some(MatchResult::Exists(found)));
+                    }
+                    OutputContract::SelectedEnd if !found => {
+                        state.observe_resume(consumed, input_bytes);
+                        return Ok(Some(MatchResult::SelectedEnd(None)));
+                    }
+                    OutputContract::Span if !found => {
+                        state.observe_resume(consumed, input_bytes);
+                        return Ok(Some(MatchResult::Span(None)));
+                    }
+                    OutputContract::SelectedEnd | OutputContract::Span => {}
+                }
+            }
         }
         if resume_set
             .as_ref()
@@ -19865,12 +19980,11 @@ impl CompiledProgram {
         }
         // V7's optimizing-fallback marker and V6/V8 ranked retained rows are
         // stable proof that the serialized program came from the optimizing
-        // resource-fallback compiler. Reconstruct the bounded exact Exists
-        // executor from the canonical graph instead of consuming another
+        // resource-fallback compiler. Reconstruct the bounded exact existence
+        // machine from the canonical graph instead of consuming another
         // header flag; the one-byte header already uses its remaining bits for
         // graph dispatch and optimizer provenance.
-        let bit_parallel_exists = (output == OutputContract::Exists
-            && matches!(engine, ProgramEngine::OrderedNfa)
+        let bit_parallel_exists = (matches!(engine, ProgramEngine::OrderedNfa)
             && !has_nfa_exact_product
             && (optimizing_fallback_enabled
                 || (matches!(
@@ -24572,6 +24686,54 @@ mod tests {
             .unwrap_or_else(|| panic!("no retained handoff fixture for {pattern}/{output:?}"))
     }
 
+    fn endpoint_oracle_first_slice_fixture(
+        pattern: &str,
+        output: OutputContract,
+        haystack: &[u8],
+        expected_oracle_result: bool,
+    ) -> (CompiledProgram, PartialDfaResume) {
+        let window = SearchWindow::full(haystack);
+        (2..=128)
+            .find_map(|max_states| {
+                let compiled = program(
+                    pattern,
+                    output,
+                    CompileMode::Optimizing,
+                    DeterminizeLimits {
+                        max_states,
+                        ..DeterminizeLimits::default()
+                    },
+                );
+                let resume = authentic_partial_resume(&compiled, haystack, window)?;
+                if resume.pending_end.is_some()
+                    || window.end.saturating_sub(resume.position) < PARTIAL_DFA_MIN_INPUT_BYTES
+                {
+                    return None;
+                }
+                let (frontier, pending) = compiled
+                    .partial_dfa()?
+                    .resume_frontier(resume.state)?;
+                if pending {
+                    return None;
+                }
+                let found = compiled
+                    .bit_parallel_exists()?
+                    .search_from_raw_frontier(
+                        haystack,
+                        resume.position,
+                        window.end,
+                        frontier,
+                    )
+                    .ok()?;
+                (found == expected_oracle_result).then_some((compiled, resume))
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "no endpoint first-slice oracle fixture for {pattern}/{output:?}/{expected_oracle_result}"
+                )
+            })
+    }
+
     fn retained_runtime_observation(
         workspace: &ProgramWorkspace,
     ) -> (u8, u16, bool, Option<SearchWindow>, usize) {
@@ -24740,11 +24902,6 @@ mod tests {
         for (pattern, output, mode) in [
             (r"(?:ab|c)*z", OutputContract::Exists, CompileMode::Fast),
             (
-                r"(?:ab|c)*z",
-                OutputContract::SelectedEnd,
-                CompileMode::Optimizing,
-            ),
-            (
                 r"(?m:^a$)",
                 OutputContract::Exists,
                 CompileMode::Optimizing,
@@ -24828,6 +24985,298 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn bit_parallel_endpoint_negative_oracle_is_exact_and_round_trips() {
+        let cases: [(&str, &[u8]); 5] = [
+            (r"(?:ab|c)*z", b"xxabczxx"),
+            (r"(?:ab|c)*?z", b"xxabczxx"),
+            (r"(?:a|aa|b)+c", b"xxaaaacx"),
+            (r"(?:a(?:bc)?|b+d)e", b"xxbbbde"),
+            (r"(?:a{2,4}|ba+)c", b"xxbaaacx"),
+        ];
+        let mut short_haystacks = generated_byte_strings(b"abcxz", 3);
+        short_haystacks.extend(cases.iter().map(|(_, witness)| witness.to_vec()));
+        let limits = DeterminizeLimits {
+            max_states: 0,
+            ..DeterminizeLimits::default()
+        };
+
+        for output in [OutputContract::SelectedEnd, OutputContract::Span] {
+            for (pattern, witness) in cases {
+                let compiled = program(pattern, output, CompileMode::Optimizing, limits);
+                assert_eq!(compiled.engine_kind(), EngineKind::OrderedNfa, "{pattern}");
+                let stats = compiled.bit_parallel_exists_stats().unwrap_or_else(|| {
+                    panic!("missing endpoint existence oracle: {pattern}/{output:?}")
+                });
+                assert!(compiled.native_bit_parallel_exists_view().is_none());
+
+                let bytes = compiled.serialize().expect("serialize endpoint oracle");
+                assert_eq!(
+                    u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+                    PROGRAM_FORMAT_VERSION_V7
+                );
+                assert_ne!(bytes[15] & PROGRAM_FLAG_NFA_OPTIMIZING_FALLBACK, 0);
+                let restored = CompiledProgram::deserialize(&bytes)
+                    .expect("restore endpoint existence oracle");
+                assert_eq!(restored.serialize().unwrap(), bytes);
+                assert_eq!(restored.bit_parallel_exists_stats(), Some(stats));
+                assert!(restored.native_bit_parallel_exists_view().is_none());
+
+                let reference = program(
+                    pattern,
+                    output,
+                    CompileMode::Fast,
+                    DeterminizeLimits::default(),
+                );
+                let mut compiled_workspace = compiled.prepare_workspace().unwrap();
+                let mut restored_workspace = restored.prepare_workspace().unwrap();
+                let mut reference_workspace = reference.prepare_workspace().unwrap();
+
+                let long_negative = vec![b'x'; PARTIAL_DFA_MIN_INPUT_BYTES];
+                let mut long_positive = long_negative.clone();
+                long_positive.extend_from_slice(witness);
+                for (label, haystack) in [
+                    ("negative", long_negative.as_slice()),
+                    ("positive", long_positive.as_slice()),
+                ] {
+                    let window = SearchWindow::full(haystack);
+                    let expected = reference
+                        .search_with_workspace(haystack, window, &mut reference_workspace)
+                        .unwrap();
+                    assert_eq!(
+                        compiled
+                            .search_with_workspace(haystack, window, &mut compiled_workspace)
+                            .unwrap(),
+                        expected,
+                        "long {label}: {pattern}/{output:?}"
+                    );
+                    assert_eq!(
+                        restored
+                            .search_with_workspace(haystack, window, &mut restored_workspace)
+                            .unwrap(),
+                        expected,
+                        "restored long {label}: {pattern}/{output:?}"
+                    );
+                }
+
+                for haystack in &short_haystacks {
+                    for start in 0..=haystack.len() {
+                        for end in start..=haystack.len() {
+                            let window = SearchWindow::new(start, end);
+                            let expected = reference
+                                .search_with_workspace(
+                                    haystack,
+                                    window,
+                                    &mut reference_workspace,
+                                )
+                                .unwrap();
+                            assert_eq!(
+                                compiled
+                                    .search_with_workspace(
+                                        haystack,
+                                        window,
+                                        &mut compiled_workspace,
+                                    )
+                                    .unwrap(),
+                                expected,
+                                "short {pattern}/{output:?}/{haystack:?}/{start}..{end}"
+                            );
+                            assert_eq!(
+                                restored
+                                    .search_with_workspace(
+                                        haystack,
+                                        window,
+                                        &mut restored_workspace,
+                                    )
+                                    .unwrap(),
+                                expected,
+                                "restored short {pattern}/{output:?}/{haystack:?}/{start}..{end}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn endpoint_oracle_positive_backoff_is_periodic_bounded_and_resettable() {
+        let mut state = EndpointOracleBackoff::default();
+        assert!(state.should_probe());
+
+        state.observe_positive_replay();
+        assert_eq!(state.positive_probe_streak, 1);
+        assert_eq!(state.bypass_remaining, 0);
+        state.observe_positive_replay();
+        assert_eq!(state.positive_probe_streak, 2);
+        assert_eq!(state.bypass_remaining, 16);
+
+        for remaining in (0..16).rev() {
+            assert!(!state.should_probe());
+            state.observe_bypassed_result(&MatchResult::SelectedEnd(Some(1)));
+            assert_eq!(state.bypass_remaining, remaining);
+        }
+        assert!(state.should_probe());
+        state.observe_positive_replay();
+        assert_eq!(state.bypass_remaining, 32);
+
+        for _ in 0..u8::MAX {
+            state.bypass_remaining = 0;
+            state.observe_positive_replay();
+        }
+        assert_eq!(state.positive_probe_streak, u8::MAX);
+        assert_eq!(state.bypass_remaining, 1_024);
+
+        state.observe_bypassed_result(&MatchResult::Span(None));
+        assert_eq!(state, EndpointOracleBackoff::default());
+        state.observe_positive_replay();
+        state.observe_negative();
+        assert_eq!(state, EndpointOracleBackoff::default());
+    }
+
+    #[test]
+    fn endpoint_oracle_backoff_avoids_repeated_positive_replay_and_recovers_negative_wins() {
+        // Each first-byte and second-byte union covers the complete alphabet,
+        // but the accepted pairs remain correlated. There is consequently no
+        // selective mandatory cut, suffix, or exact Cartesian product to
+        // decide the search ahead of the bounded existence oracle.
+        let pattern = r"(?:[\x00-\x54][\x55-\xaa]|[\x55-\xaa][\xab-\xff]|[\xab-\xff][\x00-\x54])";
+        let negative = vec![0_u8; PARTIAL_DFA_MIN_INPUT_BYTES + 64];
+        let mut positive = negative.clone();
+        positive.extend_from_slice(&[0, 0x55]);
+
+        for output in [OutputContract::SelectedEnd, OutputContract::Span] {
+            let compiled = program(
+                pattern,
+                output,
+                CompileMode::Optimizing,
+                DeterminizeLimits {
+                    max_states: 0,
+                    ..DeterminizeLimits::default()
+                },
+            );
+            assert!(compiled.bit_parallel_exists_stats().is_some(), "{output:?}");
+            assert!(compiled.partial_dfa().is_none(), "{output:?}");
+            assert!(compiled.nfa_mandatory_suffix.is_none(), "{output:?}");
+            assert!(compiled.nfa_mandatory_cut.is_none(), "{output:?}");
+            let reference = program(
+                pattern,
+                output,
+                CompileMode::Fast,
+                DeterminizeLimits::default(),
+            );
+            let mut workspace = compiled.prepare_workspace().unwrap();
+            let mut reference_workspace = reference.prepare_workspace().unwrap();
+
+            for expected_streak in [1, 2] {
+                assert_eq!(
+                    compiled
+                        .search_with_workspace(
+                            &positive,
+                            SearchWindow::full(&positive),
+                            &mut workspace,
+                        )
+                        .unwrap(),
+                    reference
+                        .search_with_workspace(
+                            &positive,
+                            SearchWindow::full(&positive),
+                            &mut reference_workspace,
+                        )
+                        .unwrap(),
+                    "initial positive replay changed {output:?}"
+                );
+                assert_eq!(
+                    workspace.endpoint_oracle_backoff.positive_probe_streak,
+                    expected_streak,
+                    "positive probe streak changed for {output:?}"
+                );
+            }
+            assert_eq!(workspace.endpoint_oracle_backoff.bypass_remaining, 16);
+
+            for remaining in (0..16).rev() {
+                assert_eq!(
+                    compiled
+                        .search_with_workspace(
+                            &positive,
+                            SearchWindow::full(&positive),
+                            &mut workspace,
+                        )
+                        .unwrap(),
+                    reference
+                        .search_with_workspace(
+                            &positive,
+                            SearchWindow::full(&positive),
+                            &mut reference_workspace,
+                        )
+                        .unwrap(),
+                    "bypassed positive replay changed {output:?}"
+                );
+                assert_eq!(
+                    workspace.endpoint_oracle_backoff.bypass_remaining,
+                    remaining,
+                    "positive bypass countdown changed for {output:?}"
+                );
+            }
+            assert_eq!(workspace.endpoint_oracle_backoff.positive_probe_streak, 2);
+
+            compiled
+                .search_with_workspace(
+                    &positive,
+                    SearchWindow::full(&positive),
+                    &mut workspace,
+                )
+                .unwrap();
+            assert_eq!(workspace.endpoint_oracle_backoff.positive_probe_streak, 3);
+            assert_eq!(workspace.endpoint_oracle_backoff.bypass_remaining, 32);
+
+            assert_eq!(
+                compiled
+                    .search_with_workspace(
+                        &negative,
+                        SearchWindow::full(&negative),
+                        &mut workspace,
+                    )
+                    .unwrap(),
+                reference
+                    .search_with_workspace(
+                        &negative,
+                        SearchWindow::full(&negative),
+                        &mut reference_workspace,
+                    )
+                    .unwrap(),
+                "bypassed negative changed {output:?}"
+            );
+            assert_eq!(
+                workspace.endpoint_oracle_backoff,
+                EndpointOracleBackoff::default(),
+                "a bypassed negative did not re-enable the oracle for {output:?}"
+            );
+            assert_eq!(
+                compiled
+                    .search_with_workspace(
+                        &negative,
+                        SearchWindow::full(&negative),
+                        &mut workspace,
+                    )
+                    .unwrap(),
+                reference
+                    .search_with_workspace(
+                        &negative,
+                        SearchWindow::full(&negative),
+                        &mut reference_workspace,
+                    )
+                    .unwrap(),
+                "re-enabled negative oracle changed {output:?}"
+            );
+            assert_eq!(
+                workspace.endpoint_oracle_backoff,
+                EndpointOracleBackoff::default(),
+                "a proved negative changed backoff for {output:?}"
+            );
         }
     }
 
@@ -28504,6 +28953,14 @@ mod tests {
             let report = partial.determinization_report().unwrap();
             assert!(report.decline.is_some(), "{output:?}");
             assert!(partial.nfa_mandatory_suffix.is_none(), "{output:?}");
+            let bit_parallel_stats = partial
+                .bit_parallel_exists_stats()
+                .unwrap_or_else(|| panic!("missing retained-row existence machine: {output:?}"));
+            assert_eq!(
+                partial.native_bit_parallel_exists_view().is_some(),
+                output == OutputContract::Exists,
+                "endpoint oracle entered the standalone native Exists ABI"
+            );
 
             let bytes = partial.serialize().expect("serialize partial DFA");
             assert_eq!(
@@ -28521,6 +28978,11 @@ mod tests {
                 Some(DfaReplayOrder::DescendingEstimatedClassFrequency)
             );
             assert_eq!(restored.serialize().unwrap(), bytes);
+            assert_eq!(
+                restored.bit_parallel_exists_stats(),
+                Some(bit_parallel_stats),
+                "wire reconstruction omitted the existence machine for {output:?}"
+            );
 
             let reference = program(
                 pattern,
@@ -30107,6 +30569,11 @@ mod tests {
                     .unwrap_or_else(|| panic!("missing partial table for {pattern:?}/{output:?}"));
                 let (complete, discovered) = retained.retained_dimensions();
                 assert!(complete < discovered, "{pattern:?}/{output:?}");
+                assert!(
+                    partial.bit_parallel_exists_stats().is_some(),
+                    "missing endpoint existence oracle for {pattern:?}/{output:?}"
+                );
+                assert!(partial.native_bit_parallel_exists_view().is_none());
                 assert_eq!(
                     retained.resume_frontier_count(),
                     discovered - complete,
@@ -30150,6 +30617,104 @@ mod tests {
                     "{pattern:?}/{output:?} never reached a retained hole"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn endpoint_partial_first_slice_oracle_commits_only_a_proved_negative() {
+        let pattern = r"(?:a+Q|[b-c][a-b]{1,10}(?:z[a-b]+|z))";
+        let mut negative = b"cbbbb".to_vec();
+        negative.extend(std::iter::repeat_n(
+            b'x',
+            PARTIAL_DFA_MIN_INPUT_BYTES + 16,
+        ));
+        let mut positive = b"cbbbbzab".to_vec();
+        positive.extend(std::iter::repeat_n(
+            b'x',
+            PARTIAL_DFA_MIN_INPUT_BYTES + 16,
+        ));
+
+        for output in [OutputContract::SelectedEnd, OutputContract::Span] {
+            let (negative_program, negative_resume) = endpoint_oracle_first_slice_fixture(
+                pattern,
+                output,
+                &negative,
+                false,
+            );
+            let negative_window = SearchWindow::full(&negative);
+            let mut negative_workspace = negative_program.prepare_workspace().unwrap();
+            let ProgramWorkspace {
+                nfa,
+                partial,
+                ..
+            } = &mut negative_workspace;
+            let partial = partial.as_deref_mut().unwrap();
+            partial.resume = None;
+            let resolved = negative_program
+                .resolve_partial_hole(
+                    &negative,
+                    negative_window,
+                    nfa.as_mut().unwrap(),
+                    &mut partial.resume,
+                    &mut partial.state,
+                    negative_resume,
+                    None,
+                )
+                .unwrap();
+            assert_eq!(
+                resolved,
+                Some(match output {
+                    OutputContract::SelectedEnd => MatchResult::SelectedEnd(None),
+                    OutputContract::Span => MatchResult::Span(None),
+                    OutputContract::Exists => unreachable!(),
+                }),
+                "negative endpoint oracle did not complete {output:?}"
+            );
+
+            let (positive_program, positive_resume) = endpoint_oracle_first_slice_fixture(
+                pattern,
+                output,
+                &positive,
+                true,
+            );
+            let positive_window = SearchWindow::full(&positive);
+            let mut positive_workspace = positive_program.prepare_workspace().unwrap();
+            let ProgramWorkspace {
+                nfa,
+                partial,
+                ..
+            } = &mut positive_workspace;
+            let partial = partial.as_deref_mut().unwrap();
+            partial.resume = None;
+            assert_eq!(
+                positive_program
+                    .resolve_partial_hole(
+                        &positive,
+                        positive_window,
+                        nfa.as_mut().unwrap(),
+                        &mut partial.resume,
+                        &mut partial.state,
+                        positive_resume,
+                        None,
+                    )
+                    .unwrap(),
+                None,
+                "positive endpoint oracle fabricated an ordered {output:?} result"
+            );
+            assert_eq!(partial.state.consecutive_fallbacks, 1);
+            assert_eq!(partial.state.bypass_remaining, 0);
+
+            let reference = program(
+                pattern,
+                output,
+                CompileMode::Fast,
+                DeterminizeLimits::default(),
+            );
+            assert_eq!(
+                positive_program.search(&positive, positive_window).unwrap(),
+                reference.search(&positive, positive_window).unwrap(),
+                "ordered positive fallback changed {output:?}"
+            );
         }
     }
 
