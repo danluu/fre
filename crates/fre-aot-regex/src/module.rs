@@ -4761,6 +4761,16 @@ enum TransitionLayout {
     /// removes the global class-map dependency at the cost of a 256-byte
     /// ordinal map in every materialized row.
     OrdinalMapBytes(u8),
+    /// The local dictionary keyed by graph class (or column quotient), with
+    /// its key map first. Each map byte is the exact row-relative byte offset
+    /// of the packed value, removing a scaled dependent address operation.
+    /// This form is used only when every offset is exactly representable in
+    /// `u8`; wider rows retain `OrdinalMapClasses`.
+    OrdinalOffsetClasses(u8),
+    /// The byte-keyed form of the map-first byte-offset dictionary. Exact
+    /// 256-byte domains normally retain `OrdinalMapBytes`, since their value
+    /// vector cannot begin at a representable byte offset.
+    OrdinalOffsetBytes(u8),
     /// A two-value local dictionary keyed by graph class (or by the exact
     /// column quotient). Two packed cells begin the row; one qword-padded
     /// membership bitmap selects slot one, while a clear bit selects the
@@ -4921,6 +4931,7 @@ enum NativeOrdinalMapKeys {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum NativeLocalMapKind {
     Ordinal,
+    OrdinalOffset,
     BitSlice1,
 }
 
@@ -4942,6 +4953,12 @@ impl NativeOrdinalMapKeys {
             }
             (Self::Bytes, NativeLocalMapKind::Ordinal) => {
                 TransitionLayout::OrdinalMapBytes(value_capacity)
+            }
+            (Self::Classes, NativeLocalMapKind::OrdinalOffset) => {
+                TransitionLayout::OrdinalOffsetClasses(value_capacity)
+            }
+            (Self::Bytes, NativeLocalMapKind::OrdinalOffset) => {
+                TransitionLayout::OrdinalOffsetBytes(value_capacity)
             }
         }
     }
@@ -5649,6 +5666,45 @@ fn native_ordinal_map_row_bytes(
     value_bytes.checked_add(aligned_domain)
 }
 
+/// Byte offset of slot zero in a map-first ordinal row. Keeping this exactly
+/// cell aligned lets both backends use an ordinary register-offset packed-cell
+/// load after reading the map byte.
+fn native_ordinal_offset_map_value_offset(
+    domain_count: usize,
+    cells: NativeCellEncoding,
+) -> Option<usize> {
+    if !(1..=CLASS_MAP_BYTES).contains(&domain_count)
+        || !matches!(cells, NativeCellEncoding::Compact16 | NativeCellEncoding::Wide32)
+    {
+        return None;
+    }
+    let alignment_mask = cells.bytes().checked_sub(1)?;
+    domain_count
+        .checked_add(alignment_mask)
+        .map(|offset| offset & !alignment_mask)
+}
+
+fn native_ordinal_offset_map_is_eligible(
+    value_capacity: u8,
+    domain_count: usize,
+    cells: NativeCellEncoding,
+) -> bool {
+    let Some(value_offset) = native_ordinal_offset_map_value_offset(domain_count, cells) else {
+        return false;
+    };
+    let Some(last_value_offset) = usize::from(value_capacity)
+        .checked_mul(cells.bytes())
+        .and_then(|offset| value_offset.checked_add(offset))
+    else {
+        return false;
+    };
+    value_capacity != 0
+        && u8::try_from(last_value_offset).is_ok()
+        && native_ordinal_map_row_bytes(value_capacity, domain_count, cells)
+            == native_ordinal_map_value_bytes(value_capacity, cells)
+                .and_then(|bytes| value_offset.checked_add(bytes))
+}
+
 const NATIVE_BIT_SLICE_VALUE_CAPACITY: u8 = 1;
 const NATIVE_BIT_SLICE_BYTE_BITS: usize = 8;
 const NATIVE_BIT_SLICE_WORD_BYTES: usize = core::mem::size_of::<u64>();
@@ -6277,6 +6333,7 @@ fn append_native_ordinal_map_record(
     value_capacity: u8,
     cells: NativeCellEncoding,
     row_bytes: usize,
+    offset_map: bool,
 ) -> Result<(), ObjectError> {
     if packed_domain.is_empty()
         || packed_domain.len() > CLASS_MAP_BYTES
@@ -6332,6 +6389,40 @@ fn append_native_ordinal_map_record(
             .map_err(|_| ObjectError::ArithmeticOverflow("ordinal-map byte ordinal"))?;
     }
     let row_start = bytes.len();
+    if offset_map {
+        if !native_ordinal_offset_map_is_eligible(
+            value_capacity,
+            packed_domain.len(),
+            cells,
+        ) {
+            return Err(ObjectError::InvalidModule(
+                "ordinal offset-map row is not byte addressable",
+            ));
+        }
+        let value_offset = native_ordinal_offset_map_value_offset(packed_domain.len(), cells)
+            .ok_or(ObjectError::InvalidModule("ordinal offset-map value offset"))?;
+        for &ordinal in ordinals
+            .get(..packed_domain.len())
+            .ok_or(ObjectError::InvalidModule("ordinal-map domain extent"))?
+        {
+            let offset = usize::from(ordinal)
+                .checked_mul(cells.bytes())
+                .and_then(|offset| value_offset.checked_add(offset))
+                .and_then(|offset| u8::try_from(offset).ok())
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "ordinal offset-map byte offset",
+                ))?;
+            bytes.push(offset);
+        }
+        bytes.resize(
+            row_start
+                .checked_add(value_offset)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "ordinal offset-map value extent",
+                ))?,
+            0,
+        );
+    }
     for slot in 0..=usize::from(value_capacity) {
         append_native_packed_cell(
             bytes,
@@ -6339,11 +6430,13 @@ fn append_native_ordinal_map_record(
             cells,
         )?;
     }
-    bytes.extend_from_slice(
-        ordinals
-            .get(..packed_domain.len())
-            .ok_or(ObjectError::InvalidModule("ordinal-map domain extent"))?,
-    );
+    if !offset_map {
+        bytes.extend_from_slice(
+            ordinals
+                .get(..packed_domain.len())
+                .ok_or(ObjectError::InvalidModule("ordinal-map domain extent"))?,
+        );
+    }
     let row_end = row_start
         .checked_add(row_bytes)
         .ok_or(ObjectError::ArithmeticOverflow("ordinal-map row extent"))?;
@@ -6897,13 +6990,15 @@ fn derive_native_local_map_plan(
             physical_forward_states,
             encoded_hole_states,
         )?,
-        NativeLocalMapKind::Ordinal => select_native_ordinal_map_encoding(
-            transitions,
-            value_capacity,
-            domain_count,
-            physical_forward_states,
-            encoded_hole_states,
-        )?,
+        NativeLocalMapKind::Ordinal | NativeLocalMapKind::OrdinalOffset => {
+            select_native_ordinal_map_encoding(
+                transitions,
+                value_capacity,
+                domain_count,
+                physical_forward_states,
+                encoded_hole_states,
+            )?
+        }
     };
     let table_bytes = native_machine_bytes(
         transitions,
@@ -6963,14 +7058,22 @@ fn derive_native_ordinal_map_plan(
     exact_rows: Option<&NativeExactRowInternPlan>,
     column_quotient: Option<&NativeColumnQuotientPlan>,
 ) -> Option<NativeOrdinalMapPlan> {
-    derive_native_local_map_plan(
+    let mut plan = derive_native_local_map_plan(
         view,
         architecture,
         keys,
         NativeLocalMapKind::Ordinal,
         exact_rows,
         column_quotient,
-    )
+    )?;
+    if native_ordinal_offset_map_is_eligible(
+        plan.value_capacity,
+        usize::from(plan.domain_count),
+        plan.cells,
+    ) {
+        plan.kind = NativeLocalMapKind::OrdinalOffset;
+    }
+    Some(plan)
 }
 
 fn derive_native_bit_slice_plan(
@@ -7245,6 +7348,8 @@ fn native_dense_candidate_cost(
         | TransitionLayout::DefaultByteSparseExceptions(_)
         | TransitionLayout::OrdinalMapClasses(_)
         | TransitionLayout::OrdinalMapBytes(_)
+        | TransitionLayout::OrdinalOffsetClasses(_)
+        | TransitionLayout::OrdinalOffsetBytes(_)
         | TransitionLayout::BitSliceClasses(_)
         | TransitionLayout::BitSliceBytes(_)
         | TransitionLayout::HybridSparseExceptions(_)
@@ -7518,7 +7623,11 @@ fn native_ordinal_map_plan_is_admitted(
     exact_rows: Option<&NativeExactRowInternPlan>,
     comparison: Option<NativeDefaultExceptionPlan>,
 ) -> bool {
-    if plan.kind != NativeLocalMapKind::Ordinal || plan.table_bytes >= plan.dense_bytes {
+    if !matches!(
+        plan.kind,
+        NativeLocalMapKind::Ordinal | NativeLocalMapKind::OrdinalOffset
+    ) || plan.table_bytes >= plan.dense_bytes
+    {
         return false;
     }
     let physical_forward_states = exact_rows.map_or_else(
@@ -7837,8 +7946,13 @@ fn build_native_ordinal_retry(
         let selected = match (class, raw) {
             (Some(class), Some(raw)) => {
                 let raw_dominates = raw.2 <= class.2;
-                let bounded_raw = raw.1.kind == NativeLocalMapKind::Ordinal
-                    && class.1.kind == NativeLocalMapKind::Ordinal
+                let bounded_raw = matches!(
+                    raw.1.kind,
+                    NativeLocalMapKind::Ordinal | NativeLocalMapKind::OrdinalOffset
+                ) && matches!(
+                    class.1.kind,
+                    NativeLocalMapKind::Ordinal | NativeLocalMapKind::OrdinalOffset
+                )
                     && raw.2 <= DIRECT_BYTE_TABLE_BUDGET
                     && class
                         .2
@@ -7854,7 +7968,7 @@ fn build_native_ordinal_retry(
             NativeLocalMapKind::BitSlice1 => {
                 bit_slice_candidates[selected.0.index()] = None;
             }
-            NativeLocalMapKind::Ordinal => {
+            NativeLocalMapKind::Ordinal | NativeLocalMapKind::OrdinalOffset => {
                 ordinal_candidates[selected.0.index()] = None;
             }
         }
@@ -8175,6 +8289,8 @@ impl TransitionLayout {
             | Self::DefaultByteSparseExceptions(_)
             | Self::OrdinalMapClasses(_)
             | Self::OrdinalMapBytes(_)
+            | Self::OrdinalOffsetClasses(_)
+            | Self::OrdinalOffsetBytes(_)
             | Self::BitSliceClasses(_)
             | Self::BitSliceBytes(_)
             | Self::HybridSparseExceptions(_)
@@ -8196,9 +8312,12 @@ impl TransitionLayout {
             | Self::DefaultByteSparseExceptions(_)
             | Self::HybridByteSparseExceptions(_)
             | Self::OrdinalMapBytes(_)
+            | Self::OrdinalOffsetBytes(_)
             | Self::BitSliceBytes(_)
             | Self::DirectByte => 0,
-            Self::OrdinalMapClasses(_) | Self::BitSliceClasses(_) => CLASS_MAP_BYTES,
+            Self::OrdinalMapClasses(_)
+            | Self::OrdinalOffsetClasses(_)
+            | Self::BitSliceClasses(_) => CLASS_MAP_BYTES,
         }
     }
 }
@@ -8219,7 +8338,9 @@ fn native_default_exception_layout_is_valid(layout: &NativeDfaLayout) -> bool {
             usize::from(capacity) > MAX_NATIVE_DEFAULT_EXCEPTIONS
         }
         TransitionLayout::OrdinalMapClasses(capacity)
-        | TransitionLayout::OrdinalMapBytes(capacity) => capacity != 0,
+        | TransitionLayout::OrdinalMapBytes(capacity)
+        | TransitionLayout::OrdinalOffsetClasses(capacity)
+        | TransitionLayout::OrdinalOffsetBytes(capacity) => capacity != 0,
         TransitionLayout::BitSliceClasses(capacity)
         | TransitionLayout::BitSliceBytes(capacity) => {
             capacity == NATIVE_BIT_SLICE_VALUE_CAPACITY
@@ -8268,7 +8389,9 @@ fn native_row_bytes(
         }
         (
             TransitionLayout::OrdinalMapClasses(capacity)
-            | TransitionLayout::OrdinalMapBytes(capacity),
+            | TransitionLayout::OrdinalMapBytes(capacity)
+            | TransitionLayout::OrdinalOffsetClasses(capacity)
+            | TransitionLayout::OrdinalOffsetBytes(capacity),
             NativeCellEncoding::Compact16 | NativeCellEncoding::Wide32,
         ) if capacity != 0 => native_ordinal_map_row_bytes(capacity, class_count, cells),
         (
@@ -8286,6 +8409,8 @@ fn native_row_bytes(
             | TransitionLayout::DefaultByteSparseExceptions(_)
             | TransitionLayout::OrdinalMapClasses(_)
             | TransitionLayout::OrdinalMapBytes(_)
+            | TransitionLayout::OrdinalOffsetClasses(_)
+            | TransitionLayout::OrdinalOffsetBytes(_)
             | TransitionLayout::BitSliceClasses(_)
             | TransitionLayout::BitSliceBytes(_)
             | TransitionLayout::HybridSparseExceptions(_)
@@ -8335,7 +8460,9 @@ fn native_table_prefix_bytes(
         ) if usize::from(capacity) > MAX_NATIVE_DEFAULT_EXCEPTIONS => Some(prefix),
         (
             TransitionLayout::OrdinalMapClasses(capacity)
-            | TransitionLayout::OrdinalMapBytes(capacity),
+            | TransitionLayout::OrdinalMapBytes(capacity)
+            | TransitionLayout::OrdinalOffsetClasses(capacity)
+            | TransitionLayout::OrdinalOffsetBytes(capacity),
             NativeCellEncoding::Compact16 | NativeCellEncoding::Wide32,
         ) if capacity != 0 => Some(prefix),
         (
@@ -8356,6 +8483,8 @@ fn native_table_prefix_bytes(
             | TransitionLayout::DefaultByteSparseExceptions(_)
             | TransitionLayout::OrdinalMapClasses(_)
             | TransitionLayout::OrdinalMapBytes(_)
+            | TransitionLayout::OrdinalOffsetClasses(_)
+            | TransitionLayout::OrdinalOffsetBytes(_)
             | TransitionLayout::BitSliceClasses(_)
             | TransitionLayout::BitSliceBytes(_)
             | TransitionLayout::HybridSparseExceptions(_)
@@ -11360,13 +11489,15 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
                 physical_forward_states,
                 encoded_hole_states,
             ),
-            NativeLocalMapKind::Ordinal => select_native_ordinal_map_encoding(
-                transitions,
-                plan.value_capacity,
-                table_class_count,
-                physical_forward_states,
-                encoded_hole_states,
-            ),
+            NativeLocalMapKind::Ordinal | NativeLocalMapKind::OrdinalOffset => {
+                select_native_ordinal_map_encoding(
+                    transitions,
+                    plan.value_capacity,
+                    table_class_count,
+                    physical_forward_states,
+                    encoded_hole_states,
+                )
+            }
         } == Some((plan.cells, plan.row_bytes));
         if encoded_hole_states == 0
             || retained_reverse_states != 0
@@ -11374,6 +11505,12 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
             || plan.value_capacity == 0
             || plan.kind == NativeLocalMapKind::BitSlice1
                 && plan.value_capacity != NATIVE_BIT_SLICE_VALUE_CAPACITY
+            || plan.kind == NativeLocalMapKind::OrdinalOffset
+                && !native_ordinal_offset_map_is_eligible(
+                    plan.value_capacity,
+                    table_class_count,
+                    plan.cells,
+                )
             || !encoding_is_valid
         {
             return Err(ObjectError::InvalidModule(
@@ -11419,6 +11556,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
             transitions,
             TransitionLayout::ClassMapped
                 | TransitionLayout::OrdinalMapClasses(_)
+                | TransitionLayout::OrdinalOffsetClasses(_)
                 | TransitionLayout::BitSliceClasses(_)
         ) {
             return Err(ObjectError::InvalidModule(
@@ -12454,6 +12592,8 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
         }
         TransitionLayout::OrdinalMapClasses(value_capacity)
         | TransitionLayout::OrdinalMapBytes(value_capacity)
+        | TransitionLayout::OrdinalOffsetClasses(value_capacity)
+        | TransitionLayout::OrdinalOffsetBytes(value_capacity)
         | TransitionLayout::BitSliceClasses(value_capacity)
         | TransitionLayout::BitSliceBytes(value_capacity) => {
             let partial = partial_layout.ok_or(ObjectError::InvalidModule(
@@ -12477,12 +12617,14 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
                 for key in 0..table_class_count {
                     let graph_class = match transitions {
                         TransitionLayout::OrdinalMapClasses(_)
+                        | TransitionLayout::OrdinalOffsetClasses(_)
                         | TransitionLayout::BitSliceClasses(_) => column_quotient
                             .and_then(|plan| plan.representative_classes.get(key))
                             .copied()
                             .map(usize::from)
                             .unwrap_or(key),
                         TransitionLayout::OrdinalMapBytes(_)
+                        | TransitionLayout::OrdinalOffsetBytes(_)
                         | TransitionLayout::BitSliceBytes(_) => {
                             usize::from(*dfa.byte_classes.get(key).ok_or(
                                 ObjectError::InvalidModule(
@@ -12522,13 +12664,20 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
                 )?;
                 match transitions {
                     TransitionLayout::OrdinalMapClasses(_)
-                    | TransitionLayout::OrdinalMapBytes(_) => {
+                    | TransitionLayout::OrdinalMapBytes(_)
+                    | TransitionLayout::OrdinalOffsetClasses(_)
+                    | TransitionLayout::OrdinalOffsetBytes(_) => {
                         append_native_ordinal_map_record(
                             &mut bytes,
                             packed_domain,
                             value_capacity,
                             cells,
                             row_bytes,
+                            matches!(
+                                transitions,
+                                TransitionLayout::OrdinalOffsetClasses(_)
+                                    | TransitionLayout::OrdinalOffsetBytes(_)
+                            ),
                         )?;
                     }
                     TransitionLayout::BitSliceClasses(_)
@@ -12612,6 +12761,8 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
             | TransitionLayout::DefaultByteSparseExceptions(_)
             | TransitionLayout::OrdinalMapClasses(_)
             | TransitionLayout::OrdinalMapBytes(_)
+            | TransitionLayout::OrdinalOffsetClasses(_)
+            | TransitionLayout::OrdinalOffsetBytes(_)
             | TransitionLayout::BitSliceClasses(_)
             | TransitionLayout::BitSliceBytes(_)
             | TransitionLayout::HybridSparseExceptions(_)
@@ -16832,6 +16983,29 @@ fn x86_emit_ordinal_map_lookup(
     Ok(())
 }
 
+fn x86_emit_ordinal_offset_map_lookup(
+    assembler: &mut X86Assembler,
+    value_capacity: u8,
+    cells: NativeCellEncoding,
+) -> Result<(), ObjectError> {
+    if value_capacity == 0
+        || !matches!(cells, NativeCellEncoding::Compact16 | NativeCellEncoding::Wide32)
+    {
+        return Err(ObjectError::InvalidModule("x86 ordinal offset-map row shape"));
+    }
+    assembler.instruction(&[0x41, 0x0f, 0xb6, 0x04, 0x02])?; // eax = row.byte_offset[eax]
+    match cells {
+        NativeCellEncoding::Compact16 => {
+            assembler.instruction(&[0x41, 0x0f, 0xb7, 0x04, 0x02])?;
+        }
+        NativeCellEncoding::Wide32 => {
+            assembler.instruction(&[0x41, 0x8b, 0x04, 0x02])?;
+        }
+        _ => unreachable!("validated x86 ordinal offset cell width"),
+    }
+    Ok(())
+}
+
 fn x86_emit_bit_slice_lookup(
     assembler: &mut X86Assembler,
     value_capacity: u8,
@@ -17092,6 +17266,15 @@ fn x86_emit_table_lookup_with_sparse_boundary_tier(
         }
         TransitionLayout::OrdinalMapBytes(value_capacity) => {
             x86_emit_ordinal_map_lookup(assembler, value_capacity, cells)?;
+            return Ok(());
+        }
+        TransitionLayout::OrdinalOffsetClasses(value_capacity) => {
+            assembler.instruction(&[0x41, 0x0f, 0xb6, 0x04, 0x01])?; // eax = class_map[eax]
+            x86_emit_ordinal_offset_map_lookup(assembler, value_capacity, cells)?;
+            return Ok(());
+        }
+        TransitionLayout::OrdinalOffsetBytes(value_capacity) => {
+            x86_emit_ordinal_offset_map_lookup(assembler, value_capacity, cells)?;
             return Ok(());
         }
         TransitionLayout::BitSliceClasses(value_capacity) => {
@@ -29139,6 +29322,15 @@ fn aarch64_load_halfword_reg(destination: u8, base: u8, index: u8) -> Result<u32
     )
 }
 
+fn aarch64_load_w_reg(destination: u8, base: u8, index: u8) -> Result<u32, ObjectError> {
+    Ok(
+        0xb860_6800
+            | aarch64_reg(index, 16)?
+            | aarch64_reg(base, 5)?
+            | aarch64_reg(destination, 0)?,
+    )
+}
+
 fn aarch64_load_halfword_imm(
     destination: u8,
     base: u8,
@@ -30848,6 +31040,31 @@ fn aarch64_emit_ordinal_map_lookup(
     Ok(())
 }
 
+fn aarch64_emit_ordinal_offset_map_lookup(
+    assembler: &mut Aarch64Assembler,
+    value_capacity: u8,
+    cells: NativeCellEncoding,
+) -> Result<(), ObjectError> {
+    if value_capacity == 0
+        || !matches!(cells, NativeCellEncoding::Compact16 | NativeCellEncoding::Wide32)
+    {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 ordinal offset-map row shape",
+        ));
+    }
+    assembler.instruction(aarch64_load_byte_reg(8, 11, 8)?)?;
+    match cells {
+        NativeCellEncoding::Compact16 => {
+            assembler.instruction(aarch64_load_halfword_reg(8, 11, 8)?)?;
+        }
+        NativeCellEncoding::Wide32 => {
+            assembler.instruction(aarch64_load_w_reg(8, 11, 8)?)?;
+        }
+        _ => unreachable!("validated AArch64 ordinal offset cell width"),
+    }
+    Ok(())
+}
+
 fn aarch64_emit_bit_slice_lookup(
     assembler: &mut Aarch64Assembler,
     value_capacity: u8,
@@ -31105,6 +31322,15 @@ fn aarch64_emit_table_lookup_with_sparse_boundary_tier(
         }
         TransitionLayout::OrdinalMapBytes(value_capacity) => {
             aarch64_emit_ordinal_map_lookup(assembler, value_capacity, cells)?;
+            return Ok(());
+        }
+        TransitionLayout::OrdinalOffsetClasses(value_capacity) => {
+            assembler.instruction(aarch64_load_byte_reg(8, 5, 8)?)?;
+            aarch64_emit_ordinal_offset_map_lookup(assembler, value_capacity, cells)?;
+            return Ok(());
+        }
+        TransitionLayout::OrdinalOffsetBytes(value_capacity) => {
+            aarch64_emit_ordinal_offset_map_lookup(assembler, value_capacity, cells)?;
             return Ok(());
         }
         TransitionLayout::BitSliceClasses(value_capacity) => {
@@ -43437,7 +43663,9 @@ mod tests {
     ) -> u32 {
         let value_capacity = match layout.transitions {
             TransitionLayout::OrdinalMapClasses(capacity)
-            | TransitionLayout::OrdinalMapBytes(capacity) => capacity,
+            | TransitionLayout::OrdinalMapBytes(capacity)
+            | TransitionLayout::OrdinalOffsetClasses(capacity)
+            | TransitionLayout::OrdinalOffsetBytes(capacity) => capacity,
             other => panic!("expected ordinal-map rows, got {other:?}"),
         };
         let row_bytes = native_ordinal_map_row_bytes(
@@ -43446,16 +43674,35 @@ mod tests {
             layout.cells,
         )
         .unwrap();
-        let value_bytes = native_ordinal_map_value_bytes(value_capacity, layout.cells).unwrap();
         let row_start = usize::try_from(layout.forward_offset).unwrap()
             + physical_state * row_bytes;
-        let ordinal = usize::from(data[row_start + value_bytes + usize::from(key)]);
-        assert!(ordinal <= usize::from(value_capacity));
-        read_native_packed_cell(
-            data,
-            row_start + ordinal * layout.cells.bytes(),
-            layout.cells,
-        )
+        match layout.transitions {
+            TransitionLayout::OrdinalOffsetClasses(_)
+            | TransitionLayout::OrdinalOffsetBytes(_) => {
+                let offset = usize::from(data[row_start + usize::from(key)]);
+                let value_offset = native_ordinal_offset_map_value_offset(
+                    domain_count,
+                    layout.cells,
+                )
+                .unwrap();
+                assert!(offset >= value_offset);
+                assert!((offset - value_offset).is_multiple_of(layout.cells.bytes()));
+                read_native_packed_cell(data, row_start + offset, layout.cells)
+            }
+            TransitionLayout::OrdinalMapClasses(_) | TransitionLayout::OrdinalMapBytes(_) => {
+                let value_bytes =
+                    native_ordinal_map_value_bytes(value_capacity, layout.cells).unwrap();
+                let ordinal =
+                    usize::from(data[row_start + value_bytes + usize::from(key)]);
+                assert!(ordinal <= usize::from(value_capacity));
+                read_native_packed_cell(
+                    data,
+                    row_start + ordinal * layout.cells.bytes(),
+                    layout.cells,
+                )
+            }
+            _ => unreachable!("guarded ordinal-map layout"),
+        }
     }
 
     #[allow(
@@ -44108,6 +44355,154 @@ mod tests {
 
     #[allow(
         clippy::arithmetic_side_effects,
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the linked fixture constructs one exact map-first dictionary row and its independent byte oracle"
+    )]
+    fn linked_ordinal_offset_native_fixture(
+        target: Target,
+        cells: NativeCellEncoding,
+        collapse_holes: bool,
+        output: OutputContract,
+    ) -> Result<(NativeLowering, LinkedSparseNativeFixture), ObjectError> {
+        const DOMAIN_COUNT: usize = 64;
+        const VALUE_CAPACITY: u8 = 4;
+        assert!(native_ordinal_offset_map_is_eligible(
+            VALUE_CAPACITY,
+            DOMAIN_COUNT,
+            cells,
+        ));
+        let transitions = TransitionLayout::OrdinalOffsetClasses(VALUE_CAPACITY);
+        let row_bytes = native_ordinal_map_row_bytes(VALUE_CAPACITY, DOMAIN_COUNT, cells)
+            .expect("linked ordinal offset row geometry");
+        let forward_offset = native_table_prefix_bytes(transitions, cells, DOMAIN_COUNT)
+            .expect("linked ordinal offset table prefix");
+        let reverse_offset = forward_offset
+            .checked_add(row_bytes)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "linked ordinal offset machine extent",
+            ))?;
+        let last_live_token = encode_native_row_offset(forward_offset, cells).ok_or(
+            ObjectError::InvalidModule("linked ordinal offset initial row token"),
+        )?;
+        let partial = NativePartialDfaLayout {
+            hole_token_base: u32::try_from(last_live_token.checked_add(1).ok_or(
+                ObjectError::ArithmeticOverflow("linked ordinal offset hole base"),
+            )?)
+            .map_err(|_| ObjectError::ArithmeticOverflow("linked ordinal offset hole base"))?,
+            resume_states: 4,
+            collapse_holes,
+        };
+
+        let class_map: [u8; CLASS_MAP_BYTES] = core::array::from_fn(|byte| {
+            u8::try_from((byte * 73 + 19) % DOMAIN_COUNT).unwrap()
+        });
+        let key_cells: [ForwardCell; DOMAIN_COUNT] = core::array::from_fn(|key| {
+            match key % 5 {
+                0 => ForwardCell::new(0, false),
+                1 => ForwardCell::new(0, true),
+                2 => ForwardCell::new(NO_DFA_STATE, false),
+                3 => ForwardCell::new(1, false),
+                _ => ForwardCell::new(2, true),
+            }
+        });
+        let byte_cells = core::array::from_fn(|byte| {
+            key_cells[usize::from(class_map[byte])]
+        });
+        let mut packed_domain = [0_u32; DOMAIN_COUNT];
+        for (key, &cell) in key_cells.iter().enumerate() {
+            packed_domain[key] = pack_native_partial_forward_cell(
+                cell.next(),
+                cell.accepted(),
+                forward_offset,
+                row_bytes,
+                1,
+                false,
+                None,
+                partial,
+                cells,
+            )?;
+        }
+        let mut data = class_map.to_vec();
+        append_native_ordinal_map_record(
+            &mut data,
+            &packed_domain,
+            VALUE_CAPACITY,
+            cells,
+            row_bytes,
+            true,
+        )?;
+        if data.len() != reverse_offset {
+            return Err(ObjectError::InvalidModule(
+                "linked ordinal offset fixture emitted an unexpected machine extent",
+            ));
+        }
+
+        let layout = NativeDfaLayout {
+            transitions,
+            cells,
+            forward_offset: u32::try_from(forward_offset).map_err(|_| {
+                ObjectError::ArithmeticOverflow("linked ordinal offset forward offset")
+            })?,
+            reverse_offset: u32::try_from(reverse_offset).map_err(|_| {
+                ObjectError::ArithmeticOverflow("linked ordinal offset reverse offset")
+            })?,
+            sparse_boundary_profile: None,
+            asimd_lane_index_offset: None,
+            initial_pending: false,
+            initial_terminal: false,
+            has_reverse: false,
+            partial: Some(partial),
+            exact_span_width: (output == OutputContract::Span).then_some(1),
+            exact_prefix_match_width: None,
+            output,
+            start_filter: None,
+            exact_start_byte_set: None,
+            exact_start_storage: None,
+            suffix_filter: None,
+            declined_redundant_root_reverse: false,
+            seeded_reverse: None,
+            loop_skip: None,
+            vector_filter: None,
+            prefix_filter: None,
+            prefix_relation: None,
+            prefix_block: None,
+            prefix_fast_forward: None,
+        };
+        let emission = match target.architecture {
+            Architecture::X86_64 => lower_x86_64_dfa_with_entry_contract(
+                layout,
+                target.features,
+                NativeDfaEntryContract::PreparedPartialCore,
+            )?,
+            Architecture::Aarch64 => lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
+                layout,
+                target.features,
+                target.operating_system,
+                None,
+                None,
+                NativeDfaEntryContract::PreparedPartialCore,
+            )?,
+        };
+        Ok((
+            NativeLowering {
+                code: emission.code,
+                data,
+                relocations: emission.relocations,
+                slow_partial_table: None,
+                needs_runtime: false,
+                start_accelerator: StartAccelerator::Scalar,
+                anchored_prefix_filter_bytes: 0,
+            },
+            LinkedSparseNativeFixture {
+                byte_cells,
+                partial,
+            },
+        ))
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
         reason = "the two-byte exhaustive oracle advances a cursor within a validated window"
     )]
     fn linked_sparse_expected(
@@ -44547,14 +44942,51 @@ mod tests {
         use_column_quotient: bool,
         maximum: usize,
     ) -> Result<(Vec<u8>, NativeDfaLayout), ObjectError> {
-        build_forced_local_map_table(
+        let exact_rows = use_exact_rows
+            .then(|| {
+                derive_native_exact_row_intern_plan(
+                    view.dfa,
+                    view.partial_discovered_states,
+                    view.collapse_partial_holes,
+                )
+            })
+            .flatten();
+        let column_quotient = use_column_quotient
+            .then(|| {
+                derive_native_column_quotient_plan(
+                    view.dfa,
+                    view.partial_discovered_states,
+                    view.collapse_partial_holes,
+                )
+            })
+            .flatten();
+        if use_exact_rows && exact_rows.is_none()
+            || use_column_quotient && column_quotient.is_none()
+        {
+            return Err(ObjectError::InvalidModule(
+                "forced ordinal composition is unavailable",
+            ));
+        }
+        let plan = derive_native_ordinal_map_plan(
             view,
             architecture,
             keys,
-            NativeLocalMapKind::Ordinal,
-            use_exact_rows,
-            use_column_quotient,
+            exact_rows.as_ref(),
+            column_quotient.as_ref(),
+        )
+        .ok_or(ObjectError::InvalidModule("synthetic ordinal-map plan"))?;
+        build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_and_asimd_policy(
+            view,
+            architecture,
+            NativeVectorFilterCostModel::Established,
+            true,
             maximum,
+            None,
+            exact_rows.as_ref(),
+            false,
+            column_quotient.as_ref(),
+            Some(plan),
+            architecture == Architecture::Aarch64,
         )
     }
 
@@ -45793,7 +46225,7 @@ mod tests {
             .unwrap();
             assert_eq!(
                 ordinal.1.transitions,
-                TransitionLayout::OrdinalMapClasses(1),
+                TransitionLayout::OrdinalOffsetClasses(1),
             );
             let class_bit_slice = build_forced_local_map_table(
                 view,
@@ -46004,7 +46436,7 @@ mod tests {
             .unwrap();
             assert_eq!(
                 ordinal.1.transitions,
-                TransitionLayout::OrdinalMapClasses(1),
+                TransitionLayout::OrdinalOffsetClasses(1),
             );
             let class_bit_slice = build_forced_local_map_table(
                 view,
@@ -62320,6 +62752,8 @@ int main(void){{
                         | TransitionLayout::DefaultByteSparseExceptions(_)
                         | TransitionLayout::OrdinalMapClasses(_)
                         | TransitionLayout::OrdinalMapBytes(_)
+                        | TransitionLayout::OrdinalOffsetClasses(_)
+                        | TransitionLayout::OrdinalOffsetBytes(_)
                         | TransitionLayout::BitSliceClasses(_)
                         | TransitionLayout::BitSliceBytes(_)
                         | TransitionLayout::HybridSparseExceptions(_)
@@ -62776,6 +63210,33 @@ int main(void){{
             NativeCellEncoding::Compact16Indexed(4),
         )
         .is_none());
+        assert!(native_ordinal_offset_map_is_eligible(
+            1,
+            252,
+            NativeCellEncoding::Compact16,
+        ));
+        assert!(!native_ordinal_offset_map_is_eligible(
+            1,
+            253,
+            NativeCellEncoding::Compact16,
+        ));
+        assert!(native_ordinal_offset_map_is_eligible(
+            1,
+            248,
+            NativeCellEncoding::Wide32,
+        ));
+        assert!(!native_ordinal_offset_map_is_eligible(
+            1,
+            249,
+            NativeCellEncoding::Wide32,
+        ));
+        for cells in [NativeCellEncoding::Compact16, NativeCellEncoding::Wide32] {
+            assert!(!native_ordinal_offset_map_is_eligible(
+                1,
+                CLASS_MAP_BYTES,
+                cells,
+            ));
+        }
 
         // Four equally frequent values prove the stable first-key modal tie
         // break. Repeated non-modal values must share a dictionary slot, and
@@ -62785,7 +63246,7 @@ int main(void){{
             let row_bytes = native_ordinal_map_row_bytes(4, packed.len(), cells).unwrap();
             let value_bytes = native_ordinal_map_value_bytes(4, cells).unwrap();
             let mut row = Vec::new();
-            append_native_ordinal_map_record(&mut row, &packed, 4, cells, row_bytes)
+            append_native_ordinal_map_record(&mut row, &packed, 4, cells, row_bytes, false)
                 .unwrap();
             assert_eq!(row.len(), row_bytes);
             assert_eq!(
@@ -62799,6 +63260,44 @@ int main(void){{
             assert_eq!(
                 &row[value_bytes..value_bytes + packed.len()],
                 &[0, 1, 2, 1, 0, 2, 3, 3],
+            );
+
+            let value_offset =
+                native_ordinal_offset_map_value_offset(packed.len(), cells).unwrap();
+            let mut offset_row = Vec::new();
+            append_native_ordinal_map_record(
+                &mut offset_row,
+                &packed,
+                4,
+                cells,
+                row_bytes,
+                true,
+            )
+            .unwrap();
+            assert_eq!(offset_row.len(), row_bytes);
+            assert_eq!(
+                &offset_row[..packed.len()],
+                [0_u8, 1, 2, 1, 0, 2, 3, 3]
+                    .map(|ordinal| {
+                        u8::try_from(value_offset + usize::from(ordinal) * cells.bytes())
+                            .unwrap()
+                    })
+                    .as_slice(),
+            );
+            assert!(offset_row[packed.len()..value_offset]
+                .iter()
+                .all(|&byte| byte == 0));
+            assert_eq!(
+                (0..=4)
+                    .map(|slot| {
+                        read_native_packed_cell(
+                            &offset_row,
+                            value_offset + slot * cells.bytes(),
+                            cells,
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                [0x10, 0x20, 0x30, 0x40, 0x10],
             );
         }
         let mut rejected = Vec::new();
@@ -62815,11 +63314,32 @@ int main(void){{
                 2,
                 NativeCellEncoding::Compact16,
                 row_bytes,
+                false,
             ),
             Err(ObjectError::InvalidModule(
                 "ordinal-map row exceeds its value capacity"
             ))
         ));
+
+        let raw = (0..CLASS_MAP_BYTES)
+            .map(|key| u32::from(key % 2 != 0))
+            .collect::<Vec<_>>();
+        for cells in [NativeCellEncoding::Compact16, NativeCellEncoding::Wide32] {
+            let mut rejected = Vec::new();
+            assert!(matches!(
+                append_native_ordinal_map_record(
+                    &mut rejected,
+                    &raw,
+                    1,
+                    cells,
+                    native_ordinal_map_row_bytes(1, CLASS_MAP_BYTES, cells).unwrap(),
+                    true,
+                ),
+                Err(ObjectError::InvalidModule(
+                    "ordinal offset-map row is not byte addressable"
+                ))
+            ));
+        }
     }
 
     #[test]
@@ -62887,6 +63407,7 @@ int main(void){{
             TransitionLayout::BitSliceBytes(0),
             TransitionLayout::BitSliceBytes(2),
             TransitionLayout::OrdinalMapClasses(1),
+            TransitionLayout::OrdinalOffsetClasses(1),
         ] {
             assert!(select_native_bit_slice_encoding(transitions, 8, 1, 1).is_none());
         }
@@ -62989,6 +63510,102 @@ int main(void){{
                 assert!(words.contains(&aarch64_add_x_imm(6, 11, 10).unwrap()));
                 assert!(words.contains(&aarch64_load_byte_reg(8, 6, 8).unwrap()));
                 assert!(words.contains(&aarch64_load_h_uxtw(8, 11, 8).unwrap()));
+            }
+        }
+    }
+
+    #[test]
+    fn ordinal_offset_map_removes_scaled_lookup_on_every_supported_tier() {
+        for kind in [
+            X86StartFilterKind::Sse2,
+            X86StartFilterKind::Avx2,
+            X86StartFilterKind::Avx512Bw,
+        ] {
+            for (transitions, mapped) in [
+                (TransitionLayout::OrdinalOffsetClasses(4), true),
+                (TransitionLayout::OrdinalOffsetBytes(4), false),
+            ] {
+                for cells in [NativeCellEncoding::Compact16, NativeCellEncoding::Wide32] {
+                    let mut assembler = X86Assembler::new();
+                    x86_emit_table_lookup(&mut assembler, transitions, cells, kind).unwrap();
+                    let code = assembler.finish().unwrap();
+                    let mut expected = vec![0x0f, 0xb6, 0x04, 0x17];
+                    if mapped {
+                        expected.extend_from_slice(&[0x41, 0x0f, 0xb6, 0x04, 0x01]);
+                    }
+                    expected.extend_from_slice(&[0x41, 0x0f, 0xb6, 0x04, 0x02]);
+                    expected.extend_from_slice(match cells {
+                        NativeCellEncoding::Compact16 => {
+                            &[0x41, 0x0f, 0xb7, 0x04, 0x02][..]
+                        }
+                        NativeCellEncoding::Wide32 => &[0x41, 0x8b, 0x04, 0x02][..],
+                        _ => unreachable!("bounded ordinal offset cell width"),
+                    });
+                    assert_eq!(code, expected, "{kind:?}/{transitions:?}/{cells:?}");
+                }
+            }
+        }
+
+        let arm_tiers = [
+            (
+                FeatureSet::of(CpuFeature::Aarch64Asimd),
+                OperatingSystem::Linux,
+            ),
+            (
+                FeatureSet::of(CpuFeature::Aarch64Asimd),
+                OperatingSystem::Macos,
+            ),
+            (
+                FeatureSet::of(CpuFeature::Aarch64Sve),
+                OperatingSystem::Linux,
+            ),
+            (
+                FeatureSet::of(CpuFeature::Aarch64Sve).with(CpuFeature::Aarch64Sve2),
+                OperatingSystem::Linux,
+            ),
+        ];
+        for (features, operating_system) in arm_tiers {
+            for (transitions, mapped) in [
+                (TransitionLayout::OrdinalOffsetClasses(4), true),
+                (TransitionLayout::OrdinalOffsetBytes(4), false),
+            ] {
+                for cells in [NativeCellEncoding::Compact16, NativeCellEncoding::Wide32] {
+                    let mut assembler = Aarch64Assembler::new();
+                    aarch64_emit_table_lookup(
+                        &mut assembler,
+                        transitions,
+                        cells,
+                        features,
+                        operating_system,
+                    )
+                    .unwrap();
+                    let words = assembler
+                        .finish()
+                        .unwrap()
+                        .chunks_exact(4)
+                        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                        .collect::<Vec<_>>();
+                    let mut expected = vec![aarch64_load_byte_reg(8, 0, 2).unwrap()];
+                    if mapped {
+                        expected.push(aarch64_load_byte_reg(8, 5, 8).unwrap());
+                    }
+                    expected.extend_from_slice(&[
+                        aarch64_load_byte_reg(8, 11, 8).unwrap(),
+                        match cells {
+                            NativeCellEncoding::Compact16 => {
+                                aarch64_load_halfword_reg(8, 11, 8).unwrap()
+                            }
+                            NativeCellEncoding::Wide32 => {
+                                aarch64_load_w_reg(8, 11, 8).unwrap()
+                            }
+                            _ => unreachable!("bounded ordinal offset cell width"),
+                        },
+                    ]);
+                    assert_eq!(
+                        words, expected,
+                        "{features:?}/{operating_system:?}/{transitions:?}/{cells:?}",
+                    );
+                }
             }
         }
     }
@@ -63471,7 +64088,7 @@ int main(void){{
         .unwrap();
         assert_eq!(
             selected.1.transitions,
-            TransitionLayout::OrdinalMapClasses(1),
+            TransitionLayout::OrdinalOffsetClasses(1),
         );
         let lowering = lower_native_dfa_with_data_limit(
             production_view,
@@ -63541,10 +64158,25 @@ int main(void){{
                     None,
                 )
                 .expect("two-value bit-slice plan");
-                assert_eq!(ordinal.kind, NativeLocalMapKind::Ordinal);
+                assert_eq!(
+                    ordinal.kind,
+                    match keys {
+                        NativeOrdinalMapKeys::Classes => NativeLocalMapKind::OrdinalOffset,
+                        NativeOrdinalMapKeys::Bytes => NativeLocalMapKind::Ordinal,
+                    },
+                );
                 assert_eq!(bit_slice.kind, NativeLocalMapKind::BitSlice1);
                 assert_eq!(ordinal.value_capacity, 1);
                 assert_eq!(bit_slice.value_capacity, 1);
+                assert_eq!(
+                    ordinal.transitions(),
+                    match keys {
+                        NativeOrdinalMapKeys::Classes => {
+                            TransitionLayout::OrdinalOffsetClasses(1)
+                        }
+                        NativeOrdinalMapKeys::Bytes => TransitionLayout::OrdinalMapBytes(1),
+                    },
+                );
                 assert_eq!(
                     ordinal.comparison_exception_capacity,
                     match keys {
@@ -63723,6 +64355,10 @@ int main(void){{
                 usize::MAX,
             )
             .unwrap();
+            assert_eq!(
+                lowering.1.transitions,
+                TransitionLayout::OrdinalOffsetClasses(plan.value_capacity),
+            );
             let partial = lowering.1.partial.unwrap();
             for physical_state in 0..exact_rows.physical_rows() {
                 let semantic_state = exact_rows.representative(physical_state).unwrap();
@@ -71900,13 +72536,13 @@ int main(void){{
         any(target_os = "linux", target_os = "macos")
     ))]
     #[test]
-    #[ignore = "links and executes exhaustive sparse and Bit1 private-core matrices natively"]
+    #[ignore = "links and executes exhaustive sparse, Bit1, and ordinal-offset private-core matrices natively"]
     #[allow(
         clippy::arithmetic_side_effects,
         clippy::too_many_lines,
-        reason = "one opt-in linked differential owns sparse capacities plus every Bit1 cell width, key mode, hole mode, output contract, byte, and two-byte window"
+        reason = "one opt-in linked differential owns sparse capacities plus every local-map cell width, key mode, hole mode, output contract, byte, and two-byte window"
     )]
-    fn linked_host_sparse_and_bit_slice_private_cores_are_exact() {
+    fn linked_host_sparse_bit_slice_and_ordinal_offset_private_cores_are_exact() {
         use std::{fmt::Write as _, fs, process::Command};
 
         const SCRATCH_ZERO: usize = 0x1122_3344_5566_7788;
@@ -72190,6 +72826,97 @@ int main(void){{
                             });
                         }
                     }
+                }
+            }
+        }
+        for (cell_id, cells) in [
+            NativeCellEncoding::Compact16,
+            NativeCellEncoding::Wide32,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for collapse_holes in [false, true] {
+                for (output_id, output) in [
+                    OutputContract::Exists,
+                    OutputContract::SelectedEnd,
+                    OutputContract::Span,
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let (lowering, fixture) = linked_ordinal_offset_native_fixture(
+                        target,
+                        cells,
+                        collapse_holes,
+                        output,
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "linked ordinal offset fixture {cells:?}/{collapse_holes}/{output:?}: {error}"
+                        )
+                    });
+                    let seed = format!(
+                        "fre-linked-ordinal-offset-v1/{cell_id}/{}/{output_id}",
+                        usize::from(collapse_holes),
+                    )
+                    .into_bytes();
+                    let module = CompiledModule::lower_serialized_with_prelowered(
+                        seed,
+                        Some(lowering),
+                        None,
+                        None,
+                        None,
+                        false,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        target,
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "linked ordinal offset module {cells:?}/{collapse_holes}/{output:?}: {error}"
+                        )
+                    });
+                    assert!(module.required_runtime_symbol().is_none());
+                    assert!(module.prepared_entry_symbol().is_none());
+                    let index = cases.len();
+                    append_linked_sparse_wrapper_assembly(
+                        &mut assembly,
+                        index,
+                        module.entry_symbol(),
+                    );
+                    let object = directory.join(format!("case-{index}.o"));
+                    fs::write(
+                        &object,
+                        emit_object(
+                            &module,
+                            ObjectFormat::for_target(target),
+                            usize::MAX,
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    objects.push(object);
+                    writeln!(
+                        source,
+                        "extern uint32_t fre_sparse_wrap_{index}(const unsigned char*,size_t,size_t,size_t,size_t*,payload_t*);"
+                    )
+                    .unwrap();
+                    writeln!(
+                        source,
+                        "static void run_{index}(void){{for(unsigned b=0;b<256;b++){{unsigned char h[2]={{(unsigned char)b,(unsigned char)b}};for(size_t s=0;s<=2;s++){{for(size_t e=s;e<=2;e++){{size_t scratch[2]={{SCRATCH_ZERO,SCRATCH_ONE}};payload_t p={{PAYLOAD_SENTINEL,PAYLOAD_SENTINEL,PAYLOAD_SENTINEL,PAYLOAD_SENTINEL}};uint32_t status=fre_sparse_wrap_{index}(h,2,s,e,scratch,&p);printf(\"{index} %u %zu %zu %u %zu %zu %zu %zu %zu %zu\\n\",b,s,e,status,p.first,p.second,p.position,scratch[0],scratch[1],p.abi_bad);}}}}}}}}"
+                    )
+                    .unwrap();
+                    cases.push(LinkedCase {
+                        fixture,
+                        output,
+                        label: format!(
+                            "ordinal-offset cells={cells:?}/collapse={collapse_holes}/output={output:?}"
+                        ),
+                    });
                 }
             }
         }
@@ -91057,6 +91784,8 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                     | TransitionLayout::DefaultByteSparseExceptions(_)
                     | TransitionLayout::OrdinalMapClasses(_)
                     | TransitionLayout::OrdinalMapBytes(_)
+                    | TransitionLayout::OrdinalOffsetClasses(_)
+                    | TransitionLayout::OrdinalOffsetBytes(_)
                     | TransitionLayout::BitSliceClasses(_)
                     | TransitionLayout::BitSliceBytes(_)
                     | TransitionLayout::HybridSparseExceptions(_)
@@ -91119,6 +91848,8 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                     | TransitionLayout::DefaultByteSparseExceptions(_)
                     | TransitionLayout::OrdinalMapClasses(_)
                     | TransitionLayout::OrdinalMapBytes(_)
+                    | TransitionLayout::OrdinalOffsetClasses(_)
+                    | TransitionLayout::OrdinalOffsetBytes(_)
                     | TransitionLayout::BitSliceClasses(_)
                     | TransitionLayout::BitSliceBytes(_)
                     | TransitionLayout::HybridSparseExceptions(_)
@@ -95661,6 +96392,8 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 | TransitionLayout::DefaultByteSparseExceptions(_)
                 | TransitionLayout::OrdinalMapClasses(_)
                 | TransitionLayout::OrdinalMapBytes(_)
+                | TransitionLayout::OrdinalOffsetClasses(_)
+                | TransitionLayout::OrdinalOffsetBytes(_)
                 | TransitionLayout::BitSliceClasses(_)
                 | TransitionLayout::BitSliceBytes(_)
                 | TransitionLayout::HybridSparseExceptions(_)
