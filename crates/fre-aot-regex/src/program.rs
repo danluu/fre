@@ -13084,6 +13084,11 @@ impl CompiledProgram {
                     (1, FROZEN_DYNAMIC_SOURCE_START_PROPAGATE)
                 }
             };
+            let expected_accept_bits = if plan.accepting() {
+                DYNAMIC_NATIVE_ROWS_V1_ACCEPT_MASK
+            } else {
+                0
+            };
             let expected_token = plan.row_offset().checked_add(1)?;
             for byte in u8::MIN..=u8::MAX {
                 let word = usize::from(byte >> 6);
@@ -13095,12 +13100,18 @@ impl CompiledProgram {
                 let cell = *full
                     .forward_rows()
                     .get(source_row.checked_add(source_class)?)?;
-                if cell & DYNAMIC_NATIVE_ROWS_V1_ACCEPT_MASK != 0
+                if cell & DYNAMIC_NATIVE_ROWS_V1_ACCEPT_MASK != expected_accept_bits
                     || cell & DYNAMIC_NATIVE_ROWS_V1_NEXT_ROW_TOKEN_MASK != expected_token
                     || cell & FROZEN_DYNAMIC_SOURCE_START_MASK != expected_start_bits
                 {
                     return None;
                 }
+            }
+            // V6/V7 encode only nonaccepting loop extensions. Keep accepting
+            // proofs available to portable K0 without changing that frozen
+            // native ABI; a later format can add an explicit endpoint effect.
+            if plan.accepting() {
+                continue;
             }
             let slot = loop_candidates.get_mut(loop_candidate_count)?;
             *slot = Some(FrozenCompactLoopCandidate {

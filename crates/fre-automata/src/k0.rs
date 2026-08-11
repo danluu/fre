@@ -1896,19 +1896,28 @@ const fn contextual_initial_symbol(assertions: u32) -> u32 {
     CONTEXT_INITIAL_CLASS | (assertions << CONTEXT_SYMBOL_CLASS_BITS)
 }
 
+const fn encoded_self_loop_action(
+    encoded: u32,
+    value: u32,
+) -> Option<(LazyStartAction, bool)> {
+    if value & LAZY_CELL_STATE_MASK != encoded || value & LAZY_CELL_RESTART != 0 {
+        return None;
+    }
+    let start_action = if value & LAZY_CELL_START_PROPAGATE != 0 {
+        LazyStartAction::Propagate
+    } else {
+        LazyStartAction::Drop
+    };
+    Some((start_action, value & LAZY_CELL_ACCEPT != 0))
+}
+
 const fn encoded_nonaccepting_self_loop_action(
     encoded: u32,
     value: u32,
 ) -> Option<LazyStartAction> {
-    if value & LAZY_CELL_STATE_MASK != encoded
-        || value & (LAZY_CELL_ACCEPT | LAZY_CELL_RESTART) != 0
-    {
-        return None;
-    }
-    if value & LAZY_CELL_START_PROPAGATE != 0 {
-        Some(LazyStartAction::Propagate)
-    } else {
-        Some(LazyStartAction::Drop)
+    match encoded_self_loop_action(encoded, value) {
+        Some((start_action, false)) => Some(start_action),
+        Some((_, true)) | None => None,
     }
 }
 
@@ -3286,18 +3295,19 @@ fn scan_full_byte_exit_prefix_narrow(
             .count()
 }
 
-/// One graph-only proof for skipping a nonaccepting direct-DFA loop.
+/// One graph-only proof for skipping an exact direct-DFA loop.
 ///
 /// One already-published cell authenticates that the complete ordered
-/// transition returns to `row_offset`, does not accept, and has one exact
-/// start-provenance action. State-local ordered-edge equivalence supplies any
-/// inferred sibling bytes with that same action to the scanner without
-/// publishing their cells.
+/// transition returns to `row_offset`, has one exact acceptance result, and
+/// has one exact start-provenance action. State-local ordered-edge equivalence
+/// supplies any inferred sibling bytes with those same effects to the scanner
+/// without publishing their cells.
 #[derive(Clone, Copy, Debug)]
 struct LazyLoopSkipPlan {
     row_offset: u32,
     scanner: LazyLoopScanner,
     start_action: LazyStartAction,
+    accepting: bool,
 }
 
 const LAZY_LOOP_SKIP_PLAN_CAPACITY: usize = 4;
@@ -3353,6 +3363,7 @@ impl LazyLoopSkipPlans {
             entry.as_ref().is_some_and(|plan| {
                 direct_row_state(plan.row_offset, direct_row_stride) == candidate.state
                     && plan.start_action == candidate.start_action
+                    && plan.accepting == candidate.accepting
                     && plan.scanner.words() == candidate.members
             })
         })
@@ -3452,6 +3463,7 @@ struct LazyLoopSkipCandidate {
     state: u32,
     members: [u64; 4],
     start_action: LazyStartAction,
+    accepting: bool,
 }
 
 /// One authenticated contextual self-loop whose complete transition closure
@@ -3810,25 +3822,33 @@ pub enum K0DynamicLoopStartAction {
     Propagate = 1,
 }
 
-/// One copied graph proof for an immutable nonaccepting direct self-loop.
+const K0_DYNAMIC_LOOP_START_ACTION_MASK: u32 = 1;
+const K0_DYNAMIC_LOOP_ACCEPTING: u32 = 1 << 1;
+
+/// One copied graph proof for an immutable direct self-loop.
 ///
 /// The row offset names the original fully-prefilled K0 row. Bit `b` in
 /// `members` is set exactly when byte `b` takes the proved self-loop with the
-/// retained start action. The projection owns this value rather than exposing
-/// K0's private scanner layout.
+/// retained start action and acceptance result. The projection owns this value
+/// rather than exposing K0's private scanner layout.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(C)]
 pub struct K0DynamicLoopPlan {
     row_offset: u32,
-    start_action: K0DynamicLoopStartAction,
+    effects: u32,
     members: [u64; 4],
 }
+
+// `K0DynamicLoopPlan` is copied across the compiler-private crate boundary.
+// Pack the new acceptance effect into the existing action word so this
+// projection retains its original repr(C) size and alignment.
+const _: () = assert!(core::mem::size_of::<K0DynamicLoopPlan>() == 40);
 
 impl K0DynamicLoopPlan {
     const EMPTY: Self = Self {
         row_offset: u32::MAX,
-        start_action: K0DynamicLoopStartAction::Drop,
+        effects: K0DynamicLoopStartAction::Drop as u32,
         members: [0; 4],
     };
 
@@ -3841,7 +3861,19 @@ impl K0DynamicLoopPlan {
     #[doc(hidden)]
     #[must_use]
     pub const fn start_action(self) -> K0DynamicLoopStartAction {
-        self.start_action
+        if self.effects & K0_DYNAMIC_LOOP_START_ACTION_MASK
+            == K0DynamicLoopStartAction::Propagate as u32
+        {
+            K0DynamicLoopStartAction::Propagate
+        } else {
+            K0DynamicLoopStartAction::Drop
+        }
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn accepting(self) -> bool {
+        self.effects & K0_DYNAMIC_LOOP_ACCEPTING != 0
     }
 
     #[doc(hidden)]
@@ -8110,10 +8142,14 @@ impl K0Workspace {
             *learned_loop_rows.get_mut(learned_loop_row_count)? = plan.row_offset;
             *learned_loop_plans.get_mut(learned_loop_row_count)? = K0DynamicLoopPlan {
                 row_offset: plan.row_offset,
-                start_action: match plan.start_action {
-                    LazyStartAction::Drop => K0DynamicLoopStartAction::Drop,
-                    LazyStartAction::Propagate => K0DynamicLoopStartAction::Propagate,
+                effects: match plan.start_action {
+                    LazyStartAction::Drop => K0DynamicLoopStartAction::Drop as u32,
+                    LazyStartAction::Propagate => K0DynamicLoopStartAction::Propagate as u32,
                     LazyStartAction::Reset => return None,
+                } | if plan.accepting {
+                    K0_DYNAMIC_LOOP_ACCEPTING
+                } else {
+                    0
                 },
                 members: plan.scanner.words(),
             };
@@ -13055,7 +13091,8 @@ fn continue_warm_direct_exists_loop<const LOOP_SKIP: bool>(
                 active_loop_slot = selected_slot;
             }
             if let Some((_, plan)) = selected {
-                if loop_probe.is_ready(position)
+                if !plan.accepting
+                    && loop_probe.is_ready(position)
                     && haystack.len().saturating_sub(position) >= LAZY_LOOP_SKIP_MIN_BYTES
                 {
                     let skipped = plan.scanner.scan_forward(&haystack[position..]);
@@ -13330,7 +13367,8 @@ fn continue_mutable_warm_direct_exists(
                 active_loop_slot = selected_slot;
             }
             if let Some((_, plan)) = selected {
-                if loop_probe.is_ready(position)
+                if !plan.accepting
+                    && loop_probe.is_ready(position)
                     && haystack.len().saturating_sub(position) >= LAZY_LOOP_SKIP_MIN_BYTES
                 {
                     let skipped = plan.scanner.scan_forward(&haystack[position..]);
@@ -15623,9 +15661,9 @@ fn charge_accounted_warm_resume_step(work: &mut u64) -> Result<(), SearchError> 
 /// returns the exact cached row, byte position, pending endpoint, and
 /// already-accounted work. The value-only entry can then initialize mutable
 /// invocation scratch and continue at that cell without replaying the
-/// immutable warm prefix. An authenticated nonaccepting self-loop may scan
-/// its complete member run read-only; skipped bytes retain the scalar work
-/// ledger and cannot change the selected endpoint.
+/// immutable warm prefix. An authenticated self-loop may scan its complete
+/// member run read-only; skipped bytes retain the scalar work ledger, and an
+/// accepting plan advances a selected endpoint to the last skipped boundary.
 #[allow(
     clippy::too_many_arguments,
     reason = "the warmed continuation keeps its authenticated frontier and committed prefix explicit"
@@ -16128,7 +16166,8 @@ fn execute_accounted_warm_ordered_resume_endpoint_loop<
             if let Some((_, plan)) = selected {
                 let remaining_source = window.end().saturating_sub(position);
                 let remaining_work = u64::MAX.saturating_sub(work);
-                if loop_probe.is_ready(position)
+                if (!plan.accepting || !earliest)
+                    && loop_probe.is_ready(position)
                     && remaining_source >= LAZY_LOOP_SKIP_MIN_BYTES
                     && remaining_work
                         >= u64::try_from(LAZY_LOOP_SKIP_MIN_BYTES)
@@ -16163,6 +16202,9 @@ fn execute_accounted_warm_ordered_resume_endpoint_loop<
                                 computation: "warm resume loop source progress",
                             },
                         )?;
+                        if plan.accepting {
+                            pending_end = Some(position);
+                        }
                         if position == window.end() {
                             continue;
                         }
@@ -19684,7 +19726,70 @@ fn execute_lazy_resume_loop<const BATCH_WARM: bool>(
     }
     let mut boundaries = 1usize;
     let mut direct_ready_streak = 0u8;
+    let mut loop_probe = LazyLoopProbe::default();
+    let mut active_loop_slot = None;
     loop {
+        if BATCH_WARM && !earliest {
+            let selected = match state {
+                LazyState::Cached(cached) => workspace.lazy.loop_skip_plans.find_with_hint(
+                    cached,
+                    active_loop_slot,
+                    workspace.lazy.direct_row_stride,
+                ),
+                LazyState::Inline { .. } => None,
+            };
+            let selected_slot = selected.map(|(slot, _)| slot);
+            if selected_slot != active_loop_slot {
+                loop_probe.left_plan_state();
+                active_loop_slot = selected_slot;
+            }
+            if let Some((_, plan)) = selected {
+                if loop_probe.is_ready(position)
+                    && source.len() >= LAZY_LOOP_SKIP_MIN_BYTES
+                    && meter.remaining()
+                        >= u64::try_from(LAZY_LOOP_SKIP_MIN_BYTES)
+                            .expect("lazy loop threshold fits u64")
+                {
+                    let available = usize::try_from(meter.remaining())
+                        .unwrap_or(usize::MAX)
+                        .min(source.len());
+                    let scan_source = source.get(..available).ok_or(
+                        SearchError::InternalInvariant {
+                            detail: "resume loop scan exceeded the validated source",
+                        },
+                    )?;
+                    let skipped = plan.scanner.scan_forward(scan_source);
+                    loop_probe.observe(position, skipped)?;
+                    if skipped != 0 {
+                        meter.charge_admitted(
+                            u64::try_from(skipped)
+                                .expect("resume loop skip length fits u64"),
+                        );
+                        position = position.checked_add(skipped).ok_or(
+                            SearchError::ArithmeticOverflow {
+                                computation: "resume loop source progress",
+                            },
+                        )?;
+                        source = source.get(skipped..).ok_or(
+                            SearchError::InternalInvariant {
+                                detail: "resume loop skip exceeded the validated source",
+                            },
+                        )?;
+                        boundaries = boundaries.checked_add(skipped).ok_or(
+                            SearchError::ArithmeticOverflow {
+                                computation: "resume loop examined boundary count",
+                            },
+                        )?;
+                        if plan.accepting {
+                            pending_end = Some(position);
+                        }
+                        if source.is_empty() {
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
         if BATCH_WARM && direct_ready_streak >= RESUME_DIRECT_BATCH_MIN_READY {
             if let LazyState::Cached(mut cached) = state {
                 let batch_start = position;
@@ -20075,7 +20180,8 @@ fn execute_lazy_span_loop<const TRACK_START: bool, const LOOP_SKIP: bool>(
                 active_loop_slot = selected_slot;
             }
             if let Some((_, plan)) = selected {
-                if loop_probe.is_ready(position)
+                if !plan.accepting
+                    && loop_probe.is_ready(position)
                     && haystack.len().saturating_sub(position) >= LAZY_LOOP_SKIP_MIN_BYTES
                     && meter.remaining()
                         >= u64::try_from(LAZY_LOOP_SKIP_MIN_BYTES)
@@ -22871,16 +22977,22 @@ const fn lazy_loop_action_rank(action: LazyStartAction) -> u8 {
 
 /// Best-first, source-independent ordering for direct loop proofs.
 ///
-/// Cardinality preserves the existing global admission policy. Equal-width
-/// plans use the exact graph state rather than publication order; action and
-/// bitmap then make same-state candidates deterministic without combining
-/// their independently authenticated provenance.
+/// Every nonaccepting proof ranks ahead of every accepting proof, preserving
+/// the complete preexisting plan set whenever at least four such states are
+/// available. Within either effect, cardinality preserves the existing global
+/// admission policy. Equal-width plans use the exact graph state rather than
+/// publication order; action and bitmap then make same-state candidates
+/// deterministic without combining their independently authenticated effects.
 fn compare_lazy_loop_candidates(
     lazy: &LazyWorkspace,
     left: LazyLoopSkipCandidate,
     right: LazyLoopSkipCandidate,
     meter: &mut WorkMeter,
 ) -> Result<Option<core::cmp::Ordering>, SearchError> {
+    let acceptance = left.accepting.cmp(&right.accepting);
+    if acceptance != core::cmp::Ordering::Equal {
+        return Ok(Some(acceptance));
+    }
     let cardinality = byte_bitmap_cardinality(right.members)
         .cmp(&byte_bitmap_cardinality(left.members));
     if cardinality != core::cmp::Ordering::Equal {
@@ -23114,6 +23226,7 @@ fn try_publish_lazy_loop_skip_candidates(
                 .expect("a validated direct loop publication has one exact row"),
             scanner: LazyLoopScanner::new(candidate.members),
             start_action: candidate.start_action,
+            accepting: candidate.accepting,
         });
     }
     if bitmap_changed {
@@ -23160,6 +23273,8 @@ fn try_derive_lazy_loop_skip(
         let same_row_encoded = workspace.lazy.encoded_state(state_u32)?;
         let mut propagate_members = [0_u64; 4];
         let mut drop_members = [0_u64; 4];
+        let mut accepting_propagate_members = [0_u64; 4];
+        let mut accepting_drop_members = [0_u64; 4];
         for class_index in 0..automaton.byte_classes().count() {
             let class = u8::try_from(class_index).map_err(|_| {
                 SearchError::InternalInvariant {
@@ -23172,8 +23287,14 @@ fn try_derive_lazy_loop_skip(
                 .ok_or(SearchError::InternalInvariant {
                     detail: "lazy loop byte class has no representative",
                 })?;
-            if byte_bitmap_contains(propagate_members, byte)
-                || byte_bitmap_contains(drop_members, byte)
+            if [
+                propagate_members,
+                drop_members,
+                accepting_propagate_members,
+                accepting_drop_members,
+            ]
+            .into_iter()
+            .any(|members| byte_bitmap_contains(members, byte))
             {
                 continue;
             }
@@ -23181,7 +23302,8 @@ fn try_derive_lazy_loop_skip(
                 return Ok(());
             }
             let cell = workspace.lazy.direct_cell(row_offset, class)?;
-            let Some(start_action) = encoded_nonaccepting_self_loop_action(same_row_encoded, cell)
+            let Some((start_action, accepting)) =
+                encoded_self_loop_action(same_row_encoded, cell)
             else {
                 continue;
             };
@@ -23194,12 +23316,14 @@ fn try_derive_lazy_loop_skip(
             )? else {
                 return Ok(());
             };
-            let members = match start_action {
-                LazyStartAction::Propagate => &mut propagate_members,
-                LazyStartAction::Drop => &mut drop_members,
-                LazyStartAction::Reset => {
+            let members = match (accepting, start_action) {
+                (false, LazyStartAction::Propagate) => &mut propagate_members,
+                (false, LazyStartAction::Drop) => &mut drop_members,
+                (true, LazyStartAction::Propagate) => &mut accepting_propagate_members,
+                (true, LazyStartAction::Drop) => &mut accepting_drop_members,
+                (_, LazyStartAction::Reset) => {
                     return Err(SearchError::InternalInvariant {
-                        detail: "nonrestarting direct loop retained a Reset action",
+                        detail: "direct loop retained a Reset action",
                     });
                 }
             };
@@ -23208,10 +23332,14 @@ fn try_derive_lazy_loop_skip(
             }
         }
 
-        for (start_action, members) in [
+        let nonaccepting_candidates = [
             (LazyStartAction::Propagate, propagate_members),
             (LazyStartAction::Drop, drop_members),
-        ] {
+        ];
+        let has_nonaccepting = nonaccepting_candidates
+            .iter()
+            .any(|(_, members)| byte_bitmap_cardinality(*members) != 0);
+        for (start_action, members) in nonaccepting_candidates {
             if !try_retain_lazy_loop_candidate(
                 &workspace.lazy,
                 &mut best_candidates,
@@ -23219,10 +23347,37 @@ fn try_derive_lazy_loop_skip(
                     state: state_u32,
                     members,
                     start_action,
+                    accepting: false,
                 },
                 meter,
             )? {
                 return Ok(());
+            }
+        }
+        // Exists and root execution can consume only nonaccepting proofs. An
+        // accepting proof is therefore eligible only when this exact state
+        // has no nonaccepting candidate at all. The global ordering also puts
+        // every nonaccepting state ahead of every accepting state, so these
+        // additions can fill spare capacity but cannot displace an existing
+        // proof useful to those paths, even when their member set is wider.
+        if !has_nonaccepting {
+            for (start_action, members) in [
+                (LazyStartAction::Propagate, accepting_propagate_members),
+                (LazyStartAction::Drop, accepting_drop_members),
+            ] {
+                if !try_retain_lazy_loop_candidate(
+                    &workspace.lazy,
+                    &mut best_candidates,
+                    LazyLoopSkipCandidate {
+                        state: state_u32,
+                        members,
+                        start_action,
+                        accepting: true,
+                    },
+                    meter,
+                )? {
+                    return Ok(());
+                }
             }
         }
     }
@@ -32583,6 +32738,50 @@ mod tests {
         .unwrap()
     }
 
+    fn wide_greedy_a_star() -> Automaton {
+        // The `q` side chain raises the source-independent K0 row budget
+        // enough to admit a raw-byte overlay. It does not participate in the
+        // repeated `a` frontier, whose ordered closure is the ordinary greedy
+        // `[Consume, Accept]` state and therefore accepts on every self-loop.
+        Automaton::from_raw(
+            RawPlan {
+                start: 0,
+                roles: vec![
+                    StateRole::Split,
+                    StateRole::Consume,
+                    StateRole::Accept,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Consume,
+                    StateRole::Accept,
+                ],
+                edge_offsets: vec![0, 2, 4, 4, 5, 6, 7, 8, 9, 10, 11, 11],
+                edge_targets: vec![1, 2, 0, 3, 4, 5, 6, 7, 8, 9, 10],
+                edge_kinds: vec![
+                    EdgeKind::Epsilon,
+                    EdgeKind::Epsilon,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                    EdgeKind::ByteRange,
+                ],
+                byte_starts: vec![0, 0, b'a', b'q', b'b', b'c', b'd', b'e', b'f', b'g', b'h'],
+                byte_ends: vec![0, 0, b'a', b'q', b'b', b'c', b'd', b'e', b'f', b'g', b'h'],
+            },
+            CompileLimits::default(),
+        )
+        .unwrap()
+    }
+
     fn greedy_a_star_b() -> Automaton {
         // a*b: globally positive with a nullable repeated prefix.
         Automaton::from_raw(
@@ -33281,7 +33480,7 @@ mod tests {
 
     fn direct_loop_cache_signature(
         workspace: &K0Workspace,
-    ) -> Vec<(u32, super::LazyStartAction, [u64; 4])> {
+    ) -> Vec<(u32, super::LazyStartAction, bool, [u64; 4])> {
         workspace
             .lazy
             .loop_skip_plans
@@ -33292,6 +33491,7 @@ mod tests {
                 (
                     workspace.lazy.row_state(plan.row_offset),
                     plan.start_action,
+                    plan.accepting,
                     plan.scanner.words(),
                 )
             })
@@ -33330,6 +33530,7 @@ mod tests {
                 state: states_by_item[item_index],
                 members,
                 start_action: super::LazyStartAction::Propagate,
+                accepting: false,
             });
         }
         candidates
@@ -34637,11 +34838,13 @@ mod tests {
                 state: 10,
                 members: low_members,
                 start_action: super::LazyStartAction::Drop,
+                accepting: false,
             }),
             Some(super::LazyLoopSkipCandidate {
                 state: high_state,
                 members: high_members,
                 start_action: super::LazyStartAction::Propagate,
+                accepting: false,
             }),
             None,
             None,
@@ -48256,6 +48459,7 @@ mod tests {
                     state,
                     members: [ranked_members[item_index], 0, 0, 0],
                     start_action: super::LazyStartAction::Drop,
+                    accepting: false,
                 },
                 &mut ranking,
             )
@@ -48279,6 +48483,7 @@ mod tests {
                 state: state_five,
                 members: [1, 0, 0, 0],
                 start_action: super::LazyStartAction::Propagate,
+                accepting: false,
             },
             &mut ranking,
         )
@@ -48298,6 +48503,7 @@ mod tests {
                     state: state_one,
                     members: [3, 0, 0, 0],
                     start_action,
+                    accepting: false,
                 },
                 &mut ranking,
             )
@@ -48308,6 +48514,51 @@ mod tests {
             equal_action[0].unwrap().start_action,
             super::LazyStartAction::Propagate
         );
+    }
+
+    #[test]
+    fn accepting_direct_loop_candidates_cannot_displace_nonaccepting_plans() {
+        let plan = five_equal_direct_loop_states();
+        let (workspace, states_by_item) =
+            direct_equal_loop_cache_workspace(&plan, [1, 2, 3, 4, 5], &[]);
+        let mut retained = [None; super::LAZY_LOOP_SKIP_PLAN_CAPACITY];
+        let mut ranking = WorkMeter::new(u64::MAX, 0);
+
+        super::try_retain_lazy_loop_candidate(
+            &workspace.lazy,
+            &mut retained,
+            super::LazyLoopSkipCandidate {
+                state: states_by_item[0],
+                members: [u64::MAX; 4],
+                start_action: super::LazyStartAction::Propagate,
+                accepting: true,
+            },
+            &mut ranking,
+        )
+        .unwrap();
+        for state in states_by_item.into_iter().skip(1) {
+            super::try_retain_lazy_loop_candidate(
+                &workspace.lazy,
+                &mut retained,
+                super::LazyLoopSkipCandidate {
+                    state,
+                    members: [1, 0, 0, 0],
+                    start_action: super::LazyStartAction::Propagate,
+                    accepting: false,
+                },
+                &mut ranking,
+            )
+            .unwrap();
+        }
+
+        assert!(retained.into_iter().flatten().all(|candidate| !candidate.accepting));
+        let mut items = retained
+            .into_iter()
+            .flatten()
+            .map(|candidate| workspace.lazy.item(candidate.state, 0).unwrap())
+            .collect::<Vec<_>>();
+        items.sort_unstable();
+        assert_eq!(items, [2, 3, 4, 5]);
     }
 
     #[test]
@@ -49301,18 +49552,12 @@ mod tests {
     }
 
     #[test]
-    fn loop_skip_rejects_accept_restart_and_nonself_cells() {
+    fn loop_skip_rejects_restart_and_nonself_cells() {
         let plan = ascii_loop_class(1);
         let stride = direct_row_stride(&plan);
         let self_encoded = super::direct_row_encoded_state(0, stride).unwrap();
         let other_encoded = super::direct_row_encoded_state(1, stride).unwrap();
         let rejected = [
-            (
-                "accept",
-                self_encoded
-                    | super::LAZY_CELL_ACCEPT
-                    | super::LazyStartAction::Propagate.cell_bits(),
-            ),
             (
                 "restart",
                 self_encoded | super::LazyStartAction::Reset.cell_bits(),
@@ -49334,6 +49579,260 @@ mod tests {
                 "{name}: completed negative epoch"
             );
         }
+    }
+
+    #[test]
+    fn accepting_direct_loop_is_exact_for_selected_resume_paths() {
+        let plan = a_star(true);
+        let run_len = super::LAZY_LOOP_SKIP_MIN_BYTES * 3;
+        let haystack = vec![b'a'; run_len];
+        let window = SearchWindow::full(&haystack);
+        let mut workspace =
+            K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+
+        assert_eq!(
+            plan.prepare::<SelectedEnd>()
+                .search_window_with_workspace(
+                    &haystack,
+                    window,
+                    &mut workspace,
+                    SearchLimits::unlimited(),
+                )
+                .unwrap()
+                .into_output(),
+            Some(run_len)
+        );
+        let accepting = workspace
+            .lazy
+            .loop_skip_plans
+            .entries
+            .iter()
+            .flatten()
+            .find(|plan| plan.accepting)
+            .copied()
+            .expect("a greedy repeated accepting transition must retain its exact loop proof");
+        assert!(accepting.scanner.contains(b'a'));
+        assert_ne!(
+            workspace.lazy.modes[usize::try_from(
+                workspace.lazy.row_state(accepting.row_offset)
+            )
+            .unwrap()],
+            0,
+            "the accepting loop must remain bound to its pending-mode row"
+        );
+        let projection = workspace
+            .dynamic_root_projection(&plan)
+            .expect("the warmed accepting loop must remain dynamically projectable");
+        let projected = projection
+            .learned_loop_plans()
+            .iter()
+            .find(|candidate| candidate.row_offset() == accepting.row_offset)
+            .copied()
+            .expect("the dynamic projection must retain the loop owner");
+        assert!(projected.accepting());
+        assert_eq!(projected.members(), accepting.scanner.words());
+
+        for earliest in [false, true] {
+            let scalar = super::execute_accounted_warm_ordered_resume_endpoint_loop::<
+                false,
+                false,
+                false,
+            >(
+                &plan,
+                &haystack,
+                window,
+                &workspace,
+                accepting.row_offset,
+                0,
+                0,
+                None,
+                earliest,
+                17,
+            )
+            .unwrap();
+            let skipped = super::execute_accounted_warm_ordered_resume_endpoint_loop::<
+                true,
+                false,
+                false,
+            >(
+                &plan,
+                &haystack,
+                window,
+                &workspace,
+                accepting.row_offset,
+                0,
+                0,
+                None,
+                earliest,
+                17,
+            )
+            .unwrap();
+            assert_eq!(skipped, scalar, "earliest={earliest}");
+            let expected_end = if earliest { 1 } else { run_len };
+            assert_eq!(
+                skipped,
+                super::AccountedWarmResumeEndpoint::Complete {
+                    found: Some(expected_end),
+                    work: 17 + u64::try_from(expected_end).unwrap(),
+                }
+            );
+        }
+
+        let mut exit_source = haystack.clone();
+        exit_source.push(b'!');
+        let exit_window = SearchWindow::full(&exit_source);
+        let scalar_handoff =
+            super::execute_accounted_warm_ordered_resume_endpoint_loop::<false, false, false>(
+                &plan,
+                &exit_source,
+                exit_window,
+                &workspace,
+                accepting.row_offset,
+                0,
+                0,
+                None,
+                false,
+                23,
+            )
+            .unwrap();
+        let skipped_handoff =
+            super::execute_accounted_warm_ordered_resume_endpoint_loop::<true, false, false>(
+                &plan,
+                &exit_source,
+                exit_window,
+                &workspace,
+                accepting.row_offset,
+                0,
+                0,
+                None,
+                false,
+                23,
+            )
+            .unwrap();
+        assert_eq!(skipped_handoff, scalar_handoff);
+        assert_eq!(
+            skipped_handoff,
+            super::AccountedWarmResumeEndpoint::Continue(
+                super::WarmResumeForwardContinuation {
+                    row: accepting.row_offset,
+                    position: run_len,
+                    pending_end: Some(run_len),
+                    work: 23 + u64::try_from(run_len).unwrap(),
+                }
+            )
+        );
+
+        for contract in [
+            OutputContract::Exists,
+            OutputContract::EarliestEnd,
+            OutputContract::SelectedEnd,
+            OutputContract::Span,
+        ] {
+            let mut scalar_meter = WorkMeter::new(u64::MAX, 0);
+            let scalar = super::execute_lazy_resume_loop::<false>(
+                &plan,
+                &haystack,
+                window,
+                &mut workspace,
+                &mut scalar_meter,
+                contract,
+                0,
+                super::LazyState::Cached(accepting.row_offset),
+                0,
+                None,
+            )
+            .unwrap();
+            let mut skipped_meter = WorkMeter::new(u64::MAX, 0);
+            let skipped = super::execute_lazy_resume_loop::<true>(
+                &plan,
+                &haystack,
+                window,
+                &mut workspace,
+                &mut skipped_meter,
+                contract,
+                0,
+                super::LazyState::Cached(accepting.row_offset),
+                0,
+                None,
+            )
+            .unwrap();
+            assert_eq!(skipped, scalar, "{contract:?}");
+            assert_eq!(skipped_meter.consumed, scalar_meter.consumed, "{contract:?}");
+            let expected_end = if matches!(
+                contract,
+                OutputContract::Exists | OutputContract::EarliestEnd
+            ) {
+                1
+            } else {
+                run_len
+            };
+            assert_eq!(skipped.0, Some(MatchSpan::new(0, expected_end)));
+            assert_eq!(skipped.1, expected_end + 1, "{contract:?}");
+        }
+
+        let exit_class = byte_class(&plan, b'!');
+        assert_eq!(
+            workspace
+                .lazy
+                .direct_cell(accepting.row_offset, exit_class)
+                .unwrap(),
+            super::LAZY_CELL_UNFILLED
+        );
+        let published = workspace.lazy.direct_cells_published;
+        let exact_limit = u64::try_from(run_len).unwrap();
+        let mut scalar_meter = WorkMeter::new(exact_limit, 0);
+        assert!(matches!(
+            super::execute_lazy_resume_loop::<false>(
+                &plan,
+                &exit_source,
+                exit_window,
+                &mut workspace,
+                &mut scalar_meter,
+                OutputContract::SelectedEnd,
+                0,
+                super::LazyState::Cached(accepting.row_offset),
+                0,
+                None,
+            ),
+            Err(SearchError::WorkLimitExceeded {
+                limit,
+                consumed,
+                requested: 1,
+                position,
+            }) if limit == exact_limit && consumed == exact_limit && position == run_len
+        ));
+        let mut skipped_meter = WorkMeter::new(exact_limit, 0);
+        assert!(matches!(
+            super::execute_lazy_resume_loop::<true>(
+                &plan,
+                &exit_source,
+                exit_window,
+                &mut workspace,
+                &mut skipped_meter,
+                OutputContract::SelectedEnd,
+                0,
+                super::LazyState::Cached(accepting.row_offset),
+                0,
+                None,
+            ),
+            Err(SearchError::WorkLimitExceeded {
+                limit,
+                consumed,
+                requested: 1,
+                position,
+            }) if limit == exact_limit && consumed == exact_limit && position == run_len
+        ));
+        assert_eq!(scalar_meter.consumed, exact_limit);
+        assert_eq!(skipped_meter.consumed, exact_limit);
+        assert_eq!(workspace.lazy.direct_cells_published, published);
+        assert_eq!(
+            workspace
+                .lazy
+                .direct_cell(accepting.row_offset, exit_class)
+                .unwrap(),
+            super::LAZY_CELL_UNFILLED,
+            "the exactly clipped scanner must leave the first uncharged exit byte unread"
+        );
     }
 
     #[test]
@@ -54522,6 +55021,72 @@ mod tests {
             )
             .unwrap(),
             super::FullyPrefilledResumeSpan::Complete(Some(MatchSpan::new(0, haystack.len())))
+        );
+    }
+
+    #[test]
+    fn fully_prefilled_raw_byte_selected_rows_preserve_accepting_loop_effects() {
+        let plan = wide_greedy_a_star();
+        let frontier = [1_u32];
+        let mut resume = K0ResumeSet::new(&plan, 1, 1, [(&frontier[..], true)]).unwrap();
+        let mut workspace =
+            K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let receipt = workspace
+            .compiler_private_try_prefill_resume_caches_with_receipt(&plan, &mut resume)
+            .expect("the complete greedy-star graph must publish a resume receipt");
+        assert!(receipt.has_forward_byte_rows());
+
+        let compact_row = workspace.lazy.row_offset(resume.cached_states[0]).unwrap();
+        let (slot, compact_plan) = workspace
+            .lazy
+            .loop_skip_plans
+            .find(compact_row, workspace.lazy.direct_row_stride)
+            .expect("the pending greedy-star row must retain its loop proof");
+        assert!(compact_plan.accepting);
+        assert!(compact_plan.scanner.contains(b'a'));
+        let byte_row = super::fully_prefilled_byte_row_offset(
+            receipt.forward_cells,
+            workspace.lazy.row_state(compact_row),
+        )
+        .unwrap();
+        assert_eq!(workspace.lazy.fully_prefilled_byte_loop_rows[slot], byte_row);
+
+        let run_len = super::LAZY_LOOP_SKIP_MIN_BYTES * 3;
+        let haystack = vec![b'a'; run_len];
+        let window = SearchWindow::full(&haystack);
+        let expected_work = super::INVOCATION_RESET_WORK
+            + super::RESUME_CACHE_IDENTITY_CHECK_WORK
+            + u64::try_from(run_len).unwrap();
+        assert_eq!(
+            super::try_fully_prefilled_ordered_resume_endpoint(
+                &plan,
+                &haystack,
+                window,
+                &workspace,
+                &resume,
+                0,
+                0,
+                Some(0),
+                false,
+                false,
+                receipt,
+            )
+            .unwrap(),
+            Some((Some(run_len), expected_work))
+        );
+        assert_eq!(
+            workspace
+                .compiler_private_try_borrow_fully_prefilled_selected_row(
+                    &plan, &resume, 0, receipt, false,
+                )
+                .expect("the accepting raw-byte row must remain borrowable")
+                .search_selected_end_with_completion(&haystack, window, 0, Some(0))
+                .unwrap()
+                .into_parts(),
+            (
+                Some(run_len),
+                K0OrderedResumeCompletion::FullyWarmRows,
+            )
         );
     }
 
