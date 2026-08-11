@@ -68017,9 +68017,25 @@ int main(void){{
             Target::x86_64_linux()
                 .with_features(FeatureSet::of(CpuFeature::X86Avx2))
                 .expect("AVX2 target"),
+            Target::x86_64_linux()
+                .with_features(
+                    FeatureSet::of(CpuFeature::X86Avx512F)
+                        .with(CpuFeature::X86Avx512Bw)
+                        .with(CpuFeature::X86Avx512Vl),
+                )
+                .expect("AVX-512 target"),
             Target::aarch64_linux()
                 .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
                 .expect("ASIMD target"),
+            Target::aarch64_linux()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Sve))
+                .expect("SVE target"),
+            Target::aarch64_linux()
+                .with_features(
+                    FeatureSet::of(CpuFeature::Aarch64Sve)
+                        .with(CpuFeature::Aarch64Sve2),
+                )
+                .expect("SVE2 target"),
         ] {
             for (output, pattern) in [
                 (

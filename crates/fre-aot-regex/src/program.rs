@@ -3220,7 +3220,7 @@ pub struct FrozenDynamicRowsStorage {
 }
 
 /// Pointer-stable immutable ownership for a compact
-/// V3/V4/V8/V9/V10/V11/V12/V13/V14 table.
+/// V3/V4/V6/V7/V8/V9/V10/V11/V12/V13/V14 table.
 ///
 /// V10 and V12 own a separately allocated byte table, while V11 owns `u32`
 /// pair blocks and V13/V14 own dense `u16` supertransition blocks. No
@@ -3309,8 +3309,8 @@ impl FrozenRetainedPartialResumeMapV1 {
 /// excluded. V6/V7 may be retained because their nonroot loop index is an
 /// optional exact accelerator over the same closed V3/V4 rows; the generated
 /// local tail authenticates the current canonical state before consulting it.
-/// V11/V13/V14 may additionally own a bounded dense retained-hole map copied
-/// from the same fully authenticated K0 transaction. Its absence never
+/// Every closed format may additionally own a bounded dense retained-hole map
+/// copied from the same fully authenticated K0 transaction. Its absence never
 /// removes the established compact-v2 continuation.
 #[doc(hidden)]
 #[derive(Debug)]
@@ -3484,21 +3484,16 @@ const fn frozen_static_continuation_format_is_supported(format_version: u32) -> 
     )
 }
 
-/// Retained partial rows benefit from the dense multi-byte continuation
-/// formats without changing their generated hole ABI. The optional V6/V7
-/// nonroot loop extension remains owned by the generated static-prefix tail;
-/// a retained-row hole therefore stays on its established K0 continuation
-/// for those generations.
+/// Every closed arbitrary-state continuation format can own a retained-row
+/// hole without changing its generated ABI. Root-only V5 is deliberately
+/// absent from [`frozen_static_continuation_format_is_supported`]: its unary
+/// summary is valid only from canonical state zero, whereas this handoff may
+/// enter any authenticated canonical state.
 #[inline]
 const fn frozen_static_continuation_format_supports_retained_partial_handoff(
     format_version: u32,
 ) -> bool {
-    matches!(
-        format_version,
-        FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION
-            | FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION
-            | FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION
-    )
+    frozen_static_continuation_format_is_supported(format_version)
 }
 
 #[inline]
@@ -3508,6 +3503,14 @@ const fn frozen_retained_partial_handoff_block_bytes(format_version: u32) -> Opt
             Some(2)
         }
         FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION => Some(4),
+        FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION
+        | FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION
+        | FROZEN_DYNAMIC_ROWS_V6_FORMAT_VERSION
+        | FROZEN_DYNAMIC_ROWS_V7_FORMAT_VERSION
+        | FROZEN_DYNAMIC_ROWS_V8_FORMAT_VERSION
+        | FROZEN_DYNAMIC_ROWS_V9_FORMAT_VERSION
+        | FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION
+        | FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION => Some(1),
         _ => None,
     }
 }
@@ -6937,12 +6940,38 @@ impl FrozenDynamicRowsStorageV3 {
     }
 
     /// Exact resident row payload already charged to the packed-owner cap for
-    /// a retained-hole supertransition generation. Geometry includes the
-    /// inline 256-byte class map.
+    /// any closed retained-hole continuation generation. Geometry includes
+    /// the inline 256-byte class map, an optional V6/V7 loop extension, and an
+    /// optional reverse supertransition. The separately allocated dense
+    /// resume map can therefore share one explicit cap with every format.
     fn retained_partial_packed_bytes(&self) -> Option<usize> {
         let state_count = usize::try_from(self.descriptor.state_count).ok()?;
         let class_count = usize::try_from(self.descriptor.class_count).ok()?;
         let forward_bytes = match self.effective_format_version() {
+            FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION
+            | FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION
+            | FROZEN_DYNAMIC_ROWS_V8_FORMAT_VERSION
+            | FROZEN_DYNAMIC_ROWS_V9_FORMAT_VERSION => self
+                .rows
+                .len()
+                .checked_mul(core::mem::size_of::<u16>())?
+                .checked_add(256),
+            FROZEN_DYNAMIC_ROWS_V6_FORMAT_VERSION | FROZEN_DYNAMIC_ROWS_V7_FORMAT_VERSION => {
+                self.rows
+                    .len()
+                    .checked_mul(core::mem::size_of::<u16>())?
+                    .checked_add(256)?
+                    .checked_add(self.loop_index.len())?
+                    .checked_add(
+                        self.loop_scanners
+                            .len()
+                            .checked_mul(core::mem::size_of::<FrozenCompactLoopScanner>())?,
+                    )
+            }
+            FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION
+            | FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION => {
+                self.rows_u8.as_ref()?.len().checked_add(256)
+            }
             FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION => {
                 frozen_pair_rows_v11_geometry(state_count, class_count)
                     .map(|(_, _, _, _, bytes)| bytes)
@@ -12489,7 +12518,6 @@ impl CompiledProgram {
             || storage.artifact_identity != self.identity.artifact
             || storage.root_prefill_receipt.program_instance != self.identity.instance
             || storage.root_prefill_receipt.k0 != fully_prefilled.k0
-            || storage.descriptor.format_version != format_version
             || !frozen_static_continuation_format_supports_retained_partial_handoff(
                 format_version,
             )
@@ -12589,8 +12617,8 @@ impl CompiledProgram {
     /// table, and a unary V5 root summary is republished as the underlying
     /// exact V4 rows rather than being misapplied to an arbitrary state. An
     /// optional V6/V7 loop index accelerates only independently proved
-    /// nonroot self-loops. V11/V13/V14 may also copy an optional packed
-    /// retained-hole map when the combined row-plus-map extent fits
+    /// nonroot self-loops. Every closed generation may also copy an optional
+    /// packed retained-hole map when the combined row-plus-map extent fits
     /// `max_packed_bytes`; a map-only decline preserves this side owner for
     /// compact-v2. A row geometry or resource decline returns no side owner
     /// and leaves the ordinary root-compatible owner unchanged.
@@ -13129,10 +13157,9 @@ impl CompiledProgram {
             0
         };
         // Build reverse acceleration only after the winning forward format is
-        // known. V11/V13/V14 may also retain the status-8 frontier map and
-        // therefore reserve it first; generic formats cannot consume that map
-        // and may use the otherwise stranded bytes. A reverse decline never
-        // rejects or changes the already selected forward owner.
+        // known. Every arbitrary-state format may retain the status-8
+        // frontier map, so reserve it before the optional reverse sidecar. A
+        // reverse decline never rejects or changes the selected forward owner.
         let build_reverse_supertransition_for_selected_forward =
             |forward_resident_bytes: usize,
              selected_retained_map_reserve_bytes: usize|
@@ -13778,7 +13805,7 @@ impl CompiledProgram {
         }
         storage.reverse_supertransition = build_reverse_supertransition_for_selected_forward(
             forward_resident_bytes,
-            0,
+            retained_map_reserve_bytes,
         );
         if !storage.descriptor_is_valid_for(self.identity) {
             storage.reverse_supertransition = None;
@@ -13787,7 +13814,7 @@ impl CompiledProgram {
     }
 
     /// Publish either the existing retained V1 projection or an additive
-    /// compact V3/V4/V8/V9/V10/V11/V12/V13/V14 sidecar. Retained static rows
+    /// compact V3/V4/V6/V7/V8/V9/V10/V11/V12/V13/V14 sidecar. Retained static rows
     /// always win, and V2 remains independently constructible for older
     /// prepared owners.
     #[doc(hidden)]
@@ -14936,7 +14963,6 @@ impl CompiledProgram {
             || rows.artifact_identity != self.identity.artifact
             || rows.root_prefill_receipt.program_instance != self.identity.instance
             || rows.root_prefill_receipt.k0 != receipt.k0
-            || rows.descriptor.format_version != format_version
             || !frozen_static_continuation_format_supports_retained_partial_handoff(format_version)
         {
             return Ok(None);
@@ -15164,8 +15190,9 @@ impl CompiledProgram {
         // Projection has fixed authentication cost. If the suffix cannot
         // consume even one complete supertransition, the already-prefilled
         // K0 tail is the format-defined scalar executor and keeps ownership.
-        // This threshold follows only the row generation's exact width (two
-        // bytes for V11/V13, four for V14), never graph or benchmark identity.
+        // This threshold follows only the row generation's exact width (one
+        // byte for scalar formats, two for V11/V13, and four for V14), never
+        // graph or benchmark identity.
         if window.end.saturating_sub(resume_position) < block_bytes {
             return Ok(None);
         }
@@ -15184,7 +15211,6 @@ impl CompiledProgram {
             || rows.artifact_identity != self.identity.artifact
             || rows.root_prefill_receipt.program_instance != self.identity.instance
             || rows.root_prefill_receipt.k0 != receipt.k0
-            || rows.descriptor.format_version != format_version
             || !frozen_static_continuation_format_supports_retained_partial_handoff(
                 format_version,
             )
@@ -22021,6 +22047,20 @@ mod tests {
 
     use super::*;
 
+    const RETAINED_HANDOFF_FORMATS: [u32; 11] = [
+        FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION,
+        FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION,
+        FROZEN_DYNAMIC_ROWS_V6_FORMAT_VERSION,
+        FROZEN_DYNAMIC_ROWS_V7_FORMAT_VERSION,
+        FROZEN_DYNAMIC_ROWS_V8_FORMAT_VERSION,
+        FROZEN_DYNAMIC_ROWS_V9_FORMAT_VERSION,
+        FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION,
+        FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION,
+        FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION,
+        FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION,
+        FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION,
+    ];
+
     fn program(
         pattern: &str,
         output: OutputContract,
@@ -22260,7 +22300,7 @@ mod tests {
         }
     }
 
-    /// Build one exact immutable supertransition generation from the sealed
+    /// Build one exact immutable continuation generation from the sealed
     /// retained-fallback cache. Production setup selects among these formats
     /// by resource geometry; this test seam holds semantics and cache lineage
     /// fixed while exercising every decoder accepted by the handoff.
@@ -22299,7 +22339,7 @@ mod tests {
         let state_count = full.forward_rows().len() / source_class_count;
         let source_initial_state = usize::try_from(full.forward_initial_row()).unwrap()
             / source_class_count;
-        let columns = coalesce_frozen_compact_columns(
+        let mut columns = coalesce_frozen_compact_columns(
             full.forward_rows(),
             full.class_map(),
             source_class_count,
@@ -22316,31 +22356,33 @@ mod tests {
             reverse,
         };
 
-        let (pair_rows_v11, pair_rows_v13, quad_rows_v14, row_shift) =
-            match format_version {
+        let mut rows = Box::<[u16]>::default();
+        let mut rows_u8 = None;
+        let mut pair_rows_v11 = None;
+        let mut pair_rows_v13 = None;
+        let mut quad_rows_v14 = None;
+        let mut loop_index = Box::<[u8]>::default();
+        let mut loop_scanners = Box::<[FrozenCompactLoopScanner]>::default();
+        let mut descriptor_v6 = None;
+        let (descriptor_format, row_shift) = match format_version {
                 FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION => {
                     let (physical_classes, _, _, _, _) =
                         frozen_pair_rows_v11_geometry(state_count, class_count)
                             .expect("V11 test geometry");
-                    (
-                        Some(
-                            build_frozen_pair_rows_v11(
-                                full.forward_rows(),
-                                &columns,
-                                source_class_count,
-                                state_count,
-                                source_initial_state,
-                            )
-                            .expect("V11 test rows"),
-                        ),
-                        None,
-                        None,
-                        physical_classes.trailing_zeros(),
-                    )
+                    pair_rows_v11 = Some(
+                        build_frozen_pair_rows_v11(
+                            full.forward_rows(),
+                            &columns,
+                            source_class_count,
+                            state_count,
+                            source_initial_state,
+                        )
+                        .expect("V11 test rows"),
+                    );
+                    (format_version, physical_classes.trailing_zeros())
                 }
-                FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION => (
-                    None,
-                    Some(
+                FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION => {
+                    pair_rows_v13 = Some(
                         build_frozen_pair_rows_v13(
                             full.forward_rows(),
                             &columns,
@@ -22349,14 +22391,11 @@ mod tests {
                             source_initial_state,
                         )
                         .expect("V13 test rows"),
-                    ),
-                    None,
-                    0,
-                ),
-                FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION => (
-                    None,
-                    None,
-                    Some(
+                    );
+                    (format_version, 0)
+                }
+                FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION => {
+                    quad_rows_v14 = Some(
                         build_frozen_quad_rows_v14(
                             full.forward_rows(),
                             &columns,
@@ -22365,12 +22404,192 @@ mod tests {
                             source_initial_state,
                         )
                         .expect("V14 test rows"),
-                    ),
-                    0,
-                ),
+                    );
+                    (format_version, 0)
+                }
+                FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION
+                | FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION
+                | FROZEN_DYNAMIC_ROWS_V6_FORMAT_VERSION
+                | FROZEN_DYNAMIC_ROWS_V7_FORMAT_VERSION
+                | FROZEN_DYNAMIC_ROWS_V8_FORMAT_VERSION
+                | FROZEN_DYNAMIC_ROWS_V9_FORMAT_VERSION
+                | FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION
+                | FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION => {
+                    let format = match format_version {
+                        FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION
+                        | FROZEN_DYNAMIC_ROWS_V6_FORMAT_VERSION => {
+                            FrozenCompactRowsFormat::StateOrdinalV3
+                        }
+                        FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION
+                        | FROZEN_DYNAMIC_ROWS_V7_FORMAT_VERSION => {
+                            FrozenCompactRowsFormat::CellOffsetV4
+                        }
+                        FROZEN_DYNAMIC_ROWS_V8_FORMAT_VERSION => {
+                            FrozenCompactRowsFormat::StateOrdinalDirectV8
+                        }
+                        FROZEN_DYNAMIC_ROWS_V9_FORMAT_VERSION => {
+                            FrozenCompactRowsFormat::CellOffsetDirectV9
+                        }
+                        FROZEN_DYNAMIC_ROWS_V10_FORMAT_VERSION => {
+                            FrozenCompactRowsFormat::StateOrdinalDirectU8V10
+                        }
+                        FROZEN_DYNAMIC_ROWS_V12_FORMAT_VERSION => {
+                            FrozenCompactRowsFormat::StateOrdinalMappedU8V12
+                        }
+                        _ => unreachable!(),
+                    };
+                    if format.is_direct_byte() {
+                        columns = FrozenCompactColumnProjection {
+                            class_count: 256,
+                            source_classes: core::array::from_fn(|byte| {
+                                full.class_map()[byte]
+                            }),
+                            class_map: core::array::from_fn(|byte| {
+                                u8::try_from(byte).unwrap()
+                            }),
+                        };
+                    }
+                    let class_count = columns.class_count;
+                    let physical_cells = if format.is_u8() || format.is_state_ordinal() {
+                        class_count.checked_next_power_of_two().unwrap()
+                    } else {
+                        class_count
+                    };
+                    let compact_cells = state_count.checked_mul(physical_cells).unwrap();
+                    let mut owned_rows = Vec::new();
+                    let mut owned_rows_u8 = format.is_u8().then(Vec::new);
+                    for canonical_state in 0..state_count {
+                        let source_state = canonicalize_frozen_state_ordinal(
+                            canonical_state,
+                            source_initial_state,
+                        );
+                        let source_row = source_state.checked_mul(source_class_count).unwrap();
+                        for &source_class in &columns.source_classes[..class_count] {
+                            let semantic = frozen_compact_semantic_cell(
+                                full.forward_rows()
+                                    [source_row + usize::from(source_class)],
+                                source_class_count,
+                                state_count,
+                                source_initial_state,
+                            )
+                            .expect("test compact semantic cell");
+                            if format.is_u8() {
+                                owned_rows_u8
+                                    .as_mut()
+                                    .unwrap()
+                                    .push(encode_frozen_compact_u8_cell(semantic).unwrap());
+                            } else {
+                                let destination =
+                                    semantic & DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK;
+                                let token = if format.is_state_ordinal() || destination == 0 {
+                                    destination
+                                } else {
+                                    let destination = usize::from(destination) - 1;
+                                    u16::try_from(destination * class_count + 1).unwrap()
+                                };
+                                owned_rows.push(
+                                    token | (semantic & DYNAMIC_NATIVE_ROWS_V3_ACCEPT_MASK),
+                                );
+                            }
+                        }
+                        if physical_cells != class_count {
+                            if let Some(byte_rows) = owned_rows_u8.as_mut() {
+                                byte_rows.resize(
+                                    byte_rows.len() - class_count + physical_cells,
+                                    DYNAMIC_NATIVE_ROWS_V10_DEAD_CELL,
+                                );
+                            } else {
+                                owned_rows.resize(
+                                    owned_rows.len() - class_count + physical_cells,
+                                    DYNAMIC_NATIVE_ROWS_V3_DEAD_CELL,
+                                );
+                            }
+                        }
+                    }
+                    assert_eq!(
+                        owned_rows_u8.as_ref().map_or(owned_rows.len(), Vec::len),
+                        compact_cells,
+                    );
+                    rows = owned_rows.into_boxed_slice();
+                    rows_u8 = owned_rows_u8.map(Vec::into_boxed_slice);
+
+                    let base_format = match format_version {
+                        FROZEN_DYNAMIC_ROWS_V6_FORMAT_VERSION => {
+                            FROZEN_DYNAMIC_ROWS_V3_FORMAT_VERSION
+                        }
+                        FROZEN_DYNAMIC_ROWS_V7_FORMAT_VERSION => {
+                            FROZEN_DYNAMIC_ROWS_V4_FORMAT_VERSION
+                        }
+                        _ => format_version,
+                    };
+                    let row_shift = if format.is_u8() {
+                        physical_cells.trailing_zeros()
+                    } else if format.is_state_ordinal() {
+                        physical_cells.trailing_zeros() + 1
+                    } else {
+                        0
+                    };
+
+                    if matches!(
+                        format_version,
+                        FROZEN_DYNAMIC_ROWS_V6_FORMAT_VERSION
+                            | FROZEN_DYNAMIC_ROWS_V7_FORMAT_VERSION
+                    ) {
+                        let (loop_state, members) = (1..state_count)
+                            .find_map(|canonical_state| {
+                                let source_state = canonicalize_frozen_state_ordinal(
+                                    canonical_state,
+                                    source_initial_state,
+                                );
+                                let source_row = source_state * source_class_count;
+                                let mut members = [0_u64; 4];
+                                for byte in u8::MIN..=u8::MAX {
+                                    let source_class =
+                                        usize::from(full.class_map()[usize::from(byte)]);
+                                    let semantic = frozen_compact_semantic_cell(
+                                        full.forward_rows()[source_row + source_class],
+                                        source_class_count,
+                                        state_count,
+                                        source_initial_state,
+                                    )?;
+                                    if semantic & DYNAMIC_NATIVE_ROWS_V3_ACCEPT_MASK == 0
+                                        && semantic
+                                            & DYNAMIC_NATIVE_ROWS_V3_NEXT_STATE_TOKEN_MASK
+                                            == u16::try_from(canonical_state + 1).ok()?
+                                    {
+                                        members[usize::from(byte >> 6)] |=
+                                            1_u64 << u32::from(byte & 63);
+                                    }
+                                }
+                                (members != [0; 4]).then_some((canonical_state, members))
+                            })
+                            .unwrap_or_else(|| {
+                                panic!("V{format_version} fixture has no nonroot loop")
+                            });
+                        loop_scanners = vec![FrozenCompactLoopScanner::new(members)]
+                            .into_boxed_slice();
+                        let index_length = if format_version
+                            == FROZEN_DYNAMIC_ROWS_V6_FORMAT_VERSION
+                        {
+                            state_count
+                        } else {
+                            compact_cells
+                        };
+                        let mut index = vec![0_u8; index_length];
+                        let key = if format_version == FROZEN_DYNAMIC_ROWS_V6_FORMAT_VERSION {
+                            loop_state
+                        } else {
+                            loop_state * class_count
+                        };
+                        index[key] = 1;
+                        loop_index = index.into_boxed_slice();
+                    }
+                    (base_format, row_shift)
+                }
                 _ => panic!("unsupported retained handoff test format {format_version}"),
             };
-        let rows_address = pair_rows_v11
+        let class_count = columns.class_count;
+        let rows_address = quad_rows_v14
             .as_ref()
             .map(|rows| rows.as_ptr().expose_provenance())
             .or_else(|| {
@@ -22379,37 +22598,76 @@ mod tests {
                     .map(|rows| rows.as_ptr().expose_provenance())
             })
             .or_else(|| {
-                quad_rows_v14
+                pair_rows_v11
                     .as_ref()
                     .map(|rows| rows.as_ptr().expose_provenance())
             })
-            .expect("one retained handoff row owner");
+            .or_else(|| {
+                rows_u8
+                    .as_ref()
+                    .map(|rows| rows.as_ptr().expose_provenance())
+            })
+            .unwrap_or_else(|| rows.as_ptr().expose_provenance());
+        let descriptor = FrozenDynamicRowsV3 {
+            ready_seal: 0,
+            rows_address,
+            cache_identity,
+            state_count: u32::try_from(state_count).unwrap(),
+            class_count: u32::try_from(class_count).unwrap(),
+            row_shift,
+            initial_state: 0,
+            learned_loop_state_count: 0,
+            learned_loop_states: [u32::MAX; 4],
+            format_version: descriptor_format,
+        };
+        if matches!(
+            format_version,
+            FROZEN_DYNAMIC_ROWS_V6_FORMAT_VERSION | FROZEN_DYNAMIC_ROWS_V7_FORMAT_VERSION
+        ) {
+            let loop_state = loop_index
+                .iter()
+                .position(|&entry| entry == 1)
+                .map(|key| {
+                    if format_version == FROZEN_DYNAMIC_ROWS_V6_FORMAT_VERSION {
+                        key
+                    } else {
+                        key / class_count
+                    }
+                })
+                .unwrap();
+            let mut compact = descriptor;
+            compact.format_version = format_version;
+            let mut loop_plans = [FrozenCompactLoopPlanV1::INACTIVE; 4];
+            loop_plans[0] = FrozenCompactLoopPlanV1 {
+                canonical_state: u32::try_from(loop_state).unwrap(),
+                start_action: 0,
+                members: loop_scanners[0].words(),
+                scanner_address: loop_scanners.as_ptr().expose_provenance(),
+            };
+            descriptor_v6 = Some(FrozenDynamicRowsV6 {
+                compact,
+                loop_plan_count: 1,
+                reserved: 0,
+                loop_index_address: loop_index.as_ptr().expose_provenance(),
+                loop_index_length: loop_index.len(),
+                loop_plans,
+            });
+        }
         let rows = FrozenDynamicRowsStorageV3 {
             program_instance: compiled.identity.instance,
             artifact_identity: compiled.identity.artifact,
             root_prefill_receipt,
-            rows: Box::default(),
-            rows_u8: None,
+            rows,
+            rows_u8,
             pair_rows_v11,
             pair_rows_v13,
             quad_rows_v14,
             class_map: columns.class_map,
-            descriptor: FrozenDynamicRowsV3 {
-                ready_seal: 0,
-                rows_address,
-                cache_identity,
-                state_count: u32::try_from(state_count).unwrap(),
-                class_count: u32::try_from(class_count).unwrap(),
-                row_shift,
-                initial_state: 0,
-                learned_loop_state_count: 0,
-                learned_loop_states: [u32::MAX; 4],
-                format_version,
-            },
+            descriptor,
             unary_exists_first_accept_step: None,
-            loop_index: Box::default(),
-            loop_scanners: Box::default(),
-            descriptor_v6: None,
+            loop_index,
+            loop_scanners,
+            descriptor_v6,
             reverse_supertransition: None,
         };
         assert!(rows.descriptor_is_valid_for(compiled.identity));
@@ -33723,7 +33981,7 @@ mod tests {
                 frozen_static_continuation_format_supports_retained_partial_handoff(
                     format_version,
                 ),
-                matches!(format_version, 11 | 13 | 14),
+                matches!(format_version, 3 | 4 | 6..=14),
                 "retained handoff policy drifted for format {format_version}"
             );
             assert_eq!(
@@ -33731,6 +33989,7 @@ mod tests {
                 match format_version {
                     11 | 13 => Some(2),
                     14 => Some(4),
+                    3 | 4 | 6..=10 | 12 => Some(1),
                     _ => None,
                 },
                 "retained handoff width drifted for format {format_version}"
@@ -33771,16 +34030,11 @@ mod tests {
 
     #[test]
     fn retained_partial_dense_map_matches_every_authenticated_resume_ordinal() {
-        const FORMATS: [u32; 3] = [
-            FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION,
-            FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION,
-            FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION,
-        ];
         let mut haystack = vec![b'!'; 12];
         haystack.extend(vec![b'b'; PARTIAL_DFA_MIN_INPUT_BYTES + 64]);
         let window = SearchWindow::new(3, haystack.len());
         let (compiled, _) = retained_handoff_fixture(
-            r"[ab]{1,20}",
+            r"a+b|[ab]{1,20}",
             OutputContract::SelectedEnd,
             &haystack,
             window,
@@ -33813,7 +34067,7 @@ mod tests {
         assert_eq!(complete.count(), count);
         let source_initial_state = usize::try_from(complete.source_initial_state()).unwrap();
 
-        for format_version in FORMATS {
+        for format_version in RETAINED_HANDOFF_FORMATS {
             let owner = frozen_retained_owner_for_format(
                 &compiled,
                 &workspace,
@@ -33874,6 +34128,128 @@ mod tests {
                 None,
                 "V{format_version} accepted an out-of-bounds ordinal",
             );
+
+            let map_bytes = count * core::mem::size_of::<u32>();
+            let owner_bytes = owner
+                .rows
+                .retained_partial_packed_bytes()
+                .unwrap_or_else(|| panic!("V{format_version} has no resident accounting"));
+            let exact_bound = owner_bytes.checked_add(map_bytes).unwrap();
+            let exact = frozen_retained_owner_for_format_with_bound(
+                &compiled,
+                &workspace,
+                receipt,
+                format_version,
+                exact_bound,
+            );
+            assert!(
+                exact.retained_partial_resume.is_some(),
+                "V{format_version} declined its exact row-plus-map bound"
+            );
+            let one_short = frozen_retained_owner_for_format_with_bound(
+                &compiled,
+                &workspace,
+                receipt,
+                format_version,
+                exact_bound - 1,
+            );
+            assert!(
+                one_short.retained_partial_resume.is_none(),
+                "V{format_version} exceeded its row-plus-map bound"
+            );
+            assert!(one_short.rows.descriptor_is_valid_for(compiled.identity));
+            assert!(one_short.rows.descriptor_v6_is_valid_for(compiled.identity));
+        }
+    }
+
+    #[test]
+    fn serialized_retained_partial_executes_every_closed_continuation_format() {
+        let mut haystack = vec![b'!'; 12];
+        haystack.extend(vec![b'b'; PARTIAL_DFA_MIN_INPUT_BYTES + 64]);
+        let window = SearchWindow::new(3, haystack.len());
+        let (compiled, _) = retained_handoff_fixture(
+            r"a+b|[ab]{1,20}",
+            OutputContract::SelectedEnd,
+            &haystack,
+            window,
+            true,
+        );
+        let serialized = compiled.serialize().expect("serialize retained program");
+        let restored = CompiledProgram::deserialize(&serialized)
+            .expect("rederive retained program from wire form");
+        let resume = authentic_partial_resume(&restored, &haystack, window)
+            .expect("wire-restored retained frontier");
+        let expected = restored.search(&haystack, window).unwrap();
+
+        for format_version in RETAINED_HANDOFF_FORMATS {
+            let mut workspace = restored.prepare_workspace().unwrap();
+            let receipt = restored
+                .compiler_private_try_prefill_retained_fallback_with_workspace_receipt(
+                    &mut workspace,
+                )
+                .unwrap()
+                .unwrap_or_else(|| panic!("V{format_version} wire prefill declined"));
+            let owner = frozen_retained_owner_for_format(
+                &restored,
+                &workspace,
+                receipt,
+                format_version,
+            );
+            assert_eq!(owner.compiler_private_format_version(), format_version);
+
+            let block_bytes =
+                frozen_retained_partial_handoff_block_bytes(format_version).unwrap();
+            let short_window = SearchWindow::new(
+                window.start,
+                resume.position + block_bytes - 1,
+            );
+            let before = retained_runtime_observation(&workspace);
+            assert_eq!(
+                restored
+                    .try_search_from_consumed_retained_partial_resume_with_frozen_static_continuation_rows(
+                        &haystack,
+                        short_window,
+                        &mut workspace,
+                        &owner,
+                        resume.state,
+                        resume.position,
+                        resume.pending_end,
+                        receipt,
+                    )
+                    .unwrap(),
+                None,
+                "V{format_version} claimed a sub-block suffix"
+            );
+            assert_eq!(retained_runtime_observation(&workspace), before);
+
+            assert_eq!(
+                restored
+                    .preflight_retained_partial_native_root_with_workspace(
+                        &haystack,
+                        window,
+                        &mut workspace,
+                        restored.artifact_identity(),
+                    )
+                    .unwrap(),
+                RetainedPartialPreflight::Enter(window),
+                "V{format_version} wire admission"
+            );
+            let found = restored
+                .search_from_preflight_retained_partial_resume_ticket_inferred_with_frozen_static_continuation_rows_workspace(
+                    &haystack,
+                    &mut workspace,
+                    &owner,
+                    resume.state,
+                    resume.position,
+                    resume.pending_end.unwrap_or(0),
+                    receipt,
+                )
+                .unwrap_or_else(|error| panic!("V{format_version} wire continuation: {error}"));
+            assert_eq!(found, expected, "V{format_version} wire result");
+            let state = &workspace.partial.as_deref().unwrap().state;
+            assert_eq!(state.frozen_resumed, 1, "V{format_version}");
+            assert_eq!(state.native_entry_phase, RetainedPartialNativePhase::Retired);
+            assert_eq!(state.native_entry_window, None);
         }
     }
 
@@ -34775,16 +35151,11 @@ mod tests {
 
     #[test]
     fn retained_partial_native_projection_transfers_one_root_ticket_without_replay() {
-        const FORMATS: [u32; 3] = [
-            FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION,
-            FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION,
-            FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION,
-        ];
         let mut haystack = vec![b'!'; 12];
         haystack.extend(vec![b'b'; PARTIAL_DFA_MIN_INPUT_BYTES + 64]);
         let window = SearchWindow::new(3, haystack.len());
         let (compiled, resume) = retained_handoff_fixture(
-            r"[ab]{1,20}",
+            r"a+b|[ab]{1,20}",
             OutputContract::SelectedEnd,
             &haystack,
             window,
@@ -34792,7 +35163,7 @@ mod tests {
         );
         let pending_end = resume.pending_end.expect("fixture pending endpoint");
 
-        for format_version in FORMATS {
+        for format_version in RETAINED_HANDOFF_FORMATS {
             let mut workspace = compiled.prepare_workspace().unwrap();
             let receipt = compiled
                 .compiler_private_try_prefill_retained_fallback_with_workspace_receipt(
@@ -34932,31 +35303,38 @@ mod tests {
                 RetainedPartialNativePhase::RootArmed
             );
 
-            // A sub-supertransition suffix is a pure projection decline. The
-            // established compact-v2 path then consumes that root exactly
-            // once and leaves no replayable ticket.
+            // A sub-block suffix is a pure projection decline for the
+            // multi-byte formats. Scalar formats have no nonempty sub-block
+            // suffix, so consume their fresh root through compact-v2 at the
+            // original authenticated frontier. Either route consumes the root
+            // exactly once and leaves no replayable ticket.
             let block_bytes = frozen_retained_partial_handoff_block_bytes(format_version).unwrap();
-            let short_tail_position = window.end - (block_bytes - 1);
-            assert_eq!(
-                compiled
-                    .try_project_preflight_retained_partial_resume_ticket_with_frozen_static_continuation_rows_workspace(
-                        &haystack,
-                        &workspace,
-                        &owner,
-                        resume.state,
-                        short_tail_position,
-                        pending_end,
-                        receipt,
-                    )
-                    .unwrap(),
-                None
-            );
+            let fallback_position = if block_bytes == 1 {
+                resume.position
+            } else {
+                let short_tail_position = window.end - (block_bytes - 1);
+                assert_eq!(
+                    compiled
+                        .try_project_preflight_retained_partial_resume_ticket_with_frozen_static_continuation_rows_workspace(
+                            &haystack,
+                            &workspace,
+                            &owner,
+                            resume.state,
+                            short_tail_position,
+                            pending_end,
+                            receipt,
+                        )
+                        .unwrap(),
+                    None
+                );
+                short_tail_position
+            };
             let _ = compiled
                 .search_from_preflight_retained_partial_resume_ticket_inferred_with_workspace(
                     &haystack,
                     &mut workspace,
                     resume.state,
-                    short_tail_position,
+                    fallback_position,
                     pending_end,
                 )
                 .unwrap();
@@ -34969,7 +35347,7 @@ mod tests {
                         &haystack,
                         &mut workspace,
                         resume.state,
-                        short_tail_position,
+                        fallback_position,
                         pending_end,
                     )
                     .is_err()

@@ -1043,12 +1043,6 @@ impl PreparedAotRegex {
     ) -> Result<MatchResult, CompileError> {
         self.deactivate_frozen_header();
         if let Some(owner) = self.frozen_static_continuation_rows.as_ref()
-            && matches!(
-                owner.compiler_private_format_version(),
-                FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION
-                    | FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION
-                    | FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION
-            )
             && let Some(receipt) = self.fully_prefilled_fallback
         {
             #[cfg(test)]
@@ -12104,7 +12098,7 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
     }
 
     #[test]
-    fn compact_v2_retained_holes_select_only_batched_continuation_owners() {
+    fn compact_v2_retained_holes_fall_through_a_foreign_continuation_owner() {
         let pattern = r"a+Q|[b-c][a-b]{1,5}(?:x+|y+)";
         let mut limits = CompileLimitsV1::default();
         limits.determinize.max_states = 8;
@@ -12160,8 +12154,9 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
 
         // Obtain a valid V6/V7 arbitrary-state owner from a separate general
         // program, then place it in an otherwise identical retained session.
-        // The format gate must ignore it before any owner-lineage check and
-        // preserve the established receipt-backed K0 continuation.
+        // V6/V7 are now eligible formats, but the foreign program/cache
+        // lineage must decline before mutation and preserve the established
+        // receipt-backed K0 continuation.
         let mut loop_limits = CompileLimitsV1::default();
         loop_limits.determinize.max_states = 0;
         let loop_compiled = compile(
@@ -12210,7 +12205,7 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
                 .unwrap(),
             expected
         );
-        assert_eq!(legacy_k0.retained_partial_frozen_owner_handoffs, 0);
+        assert_eq!(legacy_k0.retained_partial_frozen_owner_handoffs, 1);
     }
 
     #[test]
