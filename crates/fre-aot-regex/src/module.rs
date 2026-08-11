@@ -3318,6 +3318,20 @@ impl StaticPrefixInputAdmission {
             ),
         })
     }
+
+    fn for_target_architecture(self, architecture: Architecture) -> Self {
+        match architecture {
+            Architecture::X86_64 => self,
+            Architecture::Aarch64
+                if self.short_native_max.is_some_and(|maximum| {
+                    usize::from(maximum) >= DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES
+                }) =>
+            {
+                self
+            }
+            Architecture::Aarch64 => Self::FALLBACK_ONLY,
+        }
+    }
 }
 
 /// Compose a transient, resource-bounded DFA prefix with the persistent
@@ -3392,15 +3406,15 @@ fn lower_native_slow_partial_prepared_with_data_limit(
         view.exact_match_width,
         has_complete_preflight_proofs,
     );
-    // The extra authenticated short-window dispatch amortizes on the x86
-    // wrapper. Keep the AArch64 wrapper on its established fallback route;
-    // its shorter call sequence does not recover the added dispatch cost.
-    let input_admission = match target.architecture {
-        Architecture::X86_64 => {
-            StaticPrefixInputAdmission::for_deferred_resume(resume, defer_preflight)?
-        }
-        Architecture::Aarch64 => StaticPrefixInputAdmission::FALLBACK_ONLY,
-    };
+    // The first observable hole is a graph property shared by both native
+    // backends. A window ending at or before that depth cannot request a
+    // missing row. Retain the established x86 admission; on AArch64, require
+    // the proof to cover the general native-row floor before paying for the
+    // extra authenticated short-window dispatch. The ordinary long-window
+    // route still bypasses the out-of-line short check on both backends.
+    let input_admission =
+        StaticPrefixInputAdmission::for_deferred_resume(resume, defer_preflight)?
+            .for_target_architecture(target.architecture);
     let exact_span_width = match (view.output, view.exact_match_width) {
         (OutputContract::Exists | OutputContract::SelectedEnd, _) => None,
         (OutputContract::Span, None) => None,
@@ -35765,6 +35779,17 @@ fn lower_aarch64_static_prefix_prepared_wrapper(
             "AArch64 short static-prefix admission is outside the fallback window",
         ));
     }
+    // Enforce the architecture-local profitability policy at the emitter
+    // boundary as well as at candidate selection, so a future caller cannot
+    // accidentally restore the rejected tiny-window ARM dispatch.
+    if input_admission
+        .short_native_max
+        .is_some_and(|maximum| usize::from(maximum) < DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES)
+    {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 short static-prefix admission is below the native-row floor",
+        ));
+    }
     let frame_bytes = if defer_preflight { 96 } else { 64 };
     let return_address_offset = if defer_preflight { 88 } else { 56 };
     // AAPCS64 supplies the first eight fused-boundary arguments in X0--X7;
@@ -60093,25 +60118,74 @@ int main(void){{
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one matrix proves exact short-window control flow and recovery on both backends"
+    )]
     fn deferred_static_prefix_short_admission_is_inclusive_and_cross_target() {
+        fn conditional_target(words: &[u32], branch: usize) -> Option<usize> {
+            let instruction = *words.get(branch)?;
+            if instruction & 0xff00_0010 != 0x5400_0000 {
+                return None;
+            }
+            let immediate = i32::try_from((instruction >> 5) & 0x7_ffff).ok()?;
+            let signed = (immediate << 13) >> 13;
+            branch.checked_add_signed(isize::try_from(signed).ok()?)
+        }
+
+        fn unconditional_target(words: &[u32], branch: usize) -> Option<usize> {
+            let instruction = *words.get(branch)?;
+            if instruction & 0xfc00_0000 != 0x1400_0000 {
+                return None;
+            }
+            let immediate = i32::try_from(instruction & 0x03ff_ffff).ok()?;
+            let signed = (immediate << 6) >> 6;
+            branch.checked_add_signed(isize::try_from(signed).ok()?)
+        }
+
         const HOLE_BYTES: u16 = 7;
-        let safe = StaticPrefixInputAdmission {
+        let x86_safe = StaticPrefixInputAdmission {
             short_native_max: Some(HOLE_BYTES),
         };
-        let admitted = |length: usize| {
+        let x86_admitted = |length: usize| {
             length >= PARTIAL_DFA_MIN_INPUT_BYTES || length <= usize::from(HOLE_BYTES)
         };
-        assert!(admitted(usize::from(HOLE_BYTES)));
-        assert!(!admitted(usize::from(HOLE_BYTES) + 1));
-        assert!(!admitted(PARTIAL_DFA_MIN_INPUT_BYTES - 1));
-        assert!(admitted(PARTIAL_DFA_MIN_INPUT_BYTES));
+        assert!(x86_admitted(usize::from(HOLE_BYTES)));
+        assert!(!x86_admitted(usize::from(HOLE_BYTES) + 1));
+        assert!(!x86_admitted(PARTIAL_DFA_MIN_INPUT_BYTES - 1));
+        assert!(x86_admitted(PARTIAL_DFA_MIN_INPUT_BYTES));
+
+        let aarch64_floor = u16::try_from(DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES).unwrap();
+        let below_aarch64_floor = StaticPrefixInputAdmission {
+            short_native_max: Some(aarch64_floor.checked_sub(1).unwrap()),
+        };
+        let at_aarch64_floor = StaticPrefixInputAdmission {
+            short_native_max: Some(aarch64_floor),
+        };
+        assert_eq!(
+            below_aarch64_floor.for_target_architecture(Architecture::X86_64),
+            below_aarch64_floor,
+        );
+        assert_eq!(
+            below_aarch64_floor.for_target_architecture(Architecture::Aarch64),
+            StaticPrefixInputAdmission::FALLBACK_ONLY,
+        );
+        assert_eq!(
+            at_aarch64_floor.for_target_architecture(Architecture::Aarch64),
+            at_aarch64_floor,
+        );
+        assert_eq!(
+            StaticPrefixInputAdmission::FALLBACK_ONLY
+                .for_target_architecture(Architecture::Aarch64),
+            StaticPrefixInputAdmission::FALLBACK_ONLY,
+        );
 
         let x86 = lower_x86_64_static_prefix_prepared_wrapper(
             OutputContract::Exists,
             false,
             Some(0),
             true,
-            safe,
+            x86_safe,
         )
         .unwrap();
         let x86_fallback_only = lower_x86_64_static_prefix_prepared_wrapper(
@@ -60145,47 +60219,148 @@ int main(void){{
             .windows(x86_short.len())
             .any(|window| window == x86_short));
 
-        let aarch64 = lower_aarch64_static_prefix_prepared_wrapper(
-            OutputContract::Exists,
-            false,
-            Some(0),
-            true,
-            safe,
-        )
-        .unwrap();
-        let aarch64_fallback_only = lower_aarch64_static_prefix_prepared_wrapper(
-            OutputContract::Exists,
-            false,
-            Some(0),
-            true,
-            StaticPrefixInputAdmission::FALLBACK_ONLY,
-        )
-        .unwrap();
-        let words = aarch64
-            .code
-            .chunks_exact(4)
-            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
-            .collect::<Vec<_>>();
-        let fallback_words = aarch64_fallback_only
-            .code
-            .chunks_exact(4)
-            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
-            .collect::<Vec<_>>();
         let floor_cmp = aarch64_cmp_x_imm(
             10,
             u16::try_from(PARTIAL_DFA_MIN_INPUT_BYTES).unwrap(),
         )
         .unwrap();
-        let short_cmp = aarch64_cmp_x_imm(10, HOLE_BYTES).unwrap();
-        assert!(words.windows(2).any(|window| {
-            window[0] == floor_cmp && window[1] & 0xff00_001f == 0x5400_0003
-        }));
-        assert!(words.windows(2).any(|window| {
-            window[0] == short_cmp && window[1] & 0xff00_001f == 0x5400_0009
-        }));
-        assert!(!fallback_words.windows(2).any(|window| {
-            window[0] == short_cmp && window[1] & 0xff00_001f == 0x5400_0009
-        }));
+        let short_cmp = aarch64_cmp_x_imm(10, aarch64_floor).unwrap();
+        for (output, span_recovery) in [
+            (OutputContract::Exists, false),
+            (OutputContract::SelectedEnd, false),
+            (OutputContract::Span, false),
+            (OutputContract::Span, true),
+        ] {
+            let aarch64 = lower_aarch64_static_prefix_prepared_wrapper(
+                output,
+                span_recovery,
+                Some(0),
+                true,
+                at_aarch64_floor,
+            )
+            .unwrap();
+            let fallback_only = lower_aarch64_static_prefix_prepared_wrapper(
+                output,
+                span_recovery,
+                Some(0),
+                true,
+                StaticPrefixInputAdmission::FALLBACK_ONLY,
+            )
+            .unwrap();
+            assert_eq!(
+                aarch64.code.len(),
+                fallback_only.code.len() + 3 * core::mem::size_of::<u32>(),
+                "one cold compare and two branches: {output:?}/{span_recovery}"
+            );
+            assert_eq!(aarch64.core_call_offset, fallback_only.core_call_offset);
+            assert_eq!(
+                aarch64.resume_tail_call_offset,
+                fallback_only.resume_tail_call_offset
+            );
+            assert_eq!(
+                aarch64.continuation_resume_tail_call_offset,
+                fallback_only.continuation_resume_tail_call_offset
+            );
+            assert_eq!(aarch64.relocations, fallback_only.relocations);
+            assert_eq!(
+                aarch64
+                    .relocations
+                    .iter()
+                    .filter(|relocation| {
+                        relocation.symbol
+                            == STATIC_PREFIX_LAZY_SPAN_RECOVERY_RUNTIME_SYMBOL
+                    })
+                    .count(),
+                usize::from(span_recovery),
+                "short admission retains variable-Span recovery: {output:?}"
+            );
+            assert_eq!(
+                aarch64
+                    .relocations
+                    .iter()
+                    .filter(|relocation| {
+                        relocation.symbol == PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL
+                    })
+                    .count(),
+                0,
+                "deferred admission never publishes eager Span recovery: {output:?}"
+            );
+
+            let words = aarch64
+                .code
+                .chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            let fallback_words = fallback_only
+                .code
+                .chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            let floor = words
+                .windows(2)
+                .enumerate()
+                .filter(|(_, window)| {
+                    window[0] == floor_cmp
+                        && window[1] & 0xff00_001f == 0x5400_0003
+                })
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            let fallback_floor = fallback_words
+                .windows(2)
+                .enumerate()
+                .filter(|(_, window)| {
+                    window[0] == floor_cmp
+                        && window[1] & 0xff00_001f == 0x5400_0003
+                })
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            assert_eq!(floor.len(), 1, "{output:?}/{span_recovery}");
+            assert_eq!(fallback_floor, floor, "{output:?}/{span_recovery}");
+            let floor_branch = floor[0] + 1;
+            let native_entry = floor_branch + 1;
+            let short_check = words.len() - 3;
+            assert_eq!(short_check, fallback_words.len());
+            assert_eq!(words[short_check], short_cmp);
+            assert_eq!(
+                words[short_check + 1] & 0xff00_001f,
+                0x5400_0009,
+                "B.LS native entry: {output:?}/{span_recovery}"
+            );
+            assert_eq!(
+                words[short_check + 2] & 0xfc00_0000,
+                0x1400_0000,
+                "B fallback: {output:?}/{span_recovery}"
+            );
+            assert_eq!(
+                conditional_target(&words, floor_branch),
+                Some(short_check),
+                "short floor enters only the cold block: {output:?}/{span_recovery}"
+            );
+            assert_eq!(
+                conditional_target(&words, short_check + 1),
+                Some(native_entry),
+                "proved short input rejoins the unchanged native entry: {output:?}/{span_recovery}"
+            );
+            let fallback_runtime = conditional_target(&fallback_words, floor_branch)
+                .expect("fallback-only short target");
+            assert_eq!(
+                unconditional_target(&words, short_check + 2),
+                Some(fallback_runtime),
+                "unproved short input rejoins the fallback-only target: {output:?}/{span_recovery}"
+            );
+            let changed_prefix_words = words[..short_check]
+                .iter()
+                .zip(&fallback_words)
+                .enumerate()
+                .filter(|(_, (admitted, fallback))| admitted != fallback)
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                changed_prefix_words,
+                vec![floor_branch],
+                "only the existing short-floor edge is retargeted: {output:?}/{span_recovery}"
+            );
+        }
 
         for invalid in [
             lower_x86_64_static_prefix_prepared_wrapper(
@@ -60193,14 +60368,39 @@ int main(void){{
                 false,
                 None,
                 true,
-                safe,
+                x86_safe,
             ),
             lower_x86_64_static_prefix_prepared_wrapper(
                 OutputContract::Exists,
                 false,
                 Some(0),
                 false,
-                safe,
+                x86_safe,
+            ),
+        ] {
+            assert!(matches!(invalid, Err(ObjectError::InvalidModule(_))));
+        }
+        for invalid in [
+            lower_aarch64_static_prefix_prepared_wrapper(
+                OutputContract::Exists,
+                false,
+                Some(0),
+                true,
+                below_aarch64_floor,
+            ),
+            lower_aarch64_static_prefix_prepared_wrapper(
+                OutputContract::Exists,
+                false,
+                None,
+                true,
+                at_aarch64_floor,
+            ),
+            lower_aarch64_static_prefix_prepared_wrapper(
+                OutputContract::Exists,
+                false,
+                Some(0),
+                false,
+                at_aarch64_floor,
             ),
         ] {
             assert!(matches!(invalid, Err(ObjectError::InvalidModule(_))));
@@ -60674,6 +60874,12 @@ int main(void){{
                     )
                     .expect("short admission maximum fits immediate");
                     assert!(short_native_max > 0);
+                    let expects_short_admission = StaticPrefixInputAdmission {
+                        short_native_max: Some(short_native_max),
+                    }
+                    .for_target_architecture(target.architecture)
+                    .short_native_max
+                    .is_some();
                     let wrapper = &hybrid.0.code
                         [hybrid.1.code_offset..hybrid.1.code_offset + hybrid.1.code_size];
                     match target.architecture {
@@ -60691,10 +60897,14 @@ int main(void){{
                                 .chunks_exact(4)
                                 .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
                                 .collect::<Vec<_>>();
-                            assert!(!words.windows(2).any(|window| {
-                                window[0] == compare
-                                    && window[1] & 0xff00_001f == 0x5400_0009
-                            }));
+                            assert_eq!(
+                                words.windows(2).any(|window| {
+                                    window[0] == compare
+                                        && window[1] & 0xff00_001f == 0x5400_0009
+                                }),
+                                expects_short_admission,
+                                "AArch64 short admission floor: {output:?}/{target:?}"
+                            );
                         }
                     }
                 }
@@ -76240,13 +76450,25 @@ int main(void){{int status=run_deferred_guards();if(status!=0)return status;stat
         for (name, output, defer_preflight, core_status) in [
             ("deferred-no-match", OutputContract::Exists, true, 0_u32),
             ("deferred-match", OutputContract::Exists, true, 1),
+            (
+                "deferred-selected-end",
+                OutputContract::SelectedEnd,
+                true,
+                1,
+            ),
             ("deferred-exact-span", OutputContract::Span, true, 1),
             ("eager-no-match", OutputContract::Exists, false, 0),
             ("eager-match", OutputContract::Exists, false, 1),
         ] {
+            let short_native_max = match target.architecture {
+                Architecture::X86_64 => 7,
+                Architecture::Aarch64 => {
+                    u16::try_from(DYNAMIC_NATIVE_ROWS_MIN_INPUT_BYTES).unwrap()
+                }
+            };
             let input_admission = if defer_preflight {
                 StaticPrefixInputAdmission {
-                    short_native_max: Some(7),
+                    short_native_max: Some(short_native_max),
                 }
             } else {
                 StaticPrefixInputAdmission::FALLBACK_ONLY
@@ -76431,15 +76653,10 @@ int main(void){{int status=run_deferred_guards();if(status!=0)return status;stat
             )
             .expect("write terminal wrapper object");
 
-            let expected_start = if output == OutputContract::Span && core_status == 1 {
-                3
-            } else {
-                0
-            };
-            let expected_end = if output == OutputContract::Span && core_status == 1 {
-                7
-            } else {
-                0
+            let (expected_start, expected_end) = match (output, core_status) {
+                (_, 0) | (OutputContract::Exists, _) => (0, 0),
+                (OutputContract::SelectedEnd, _) => (7, 7),
+                (OutputContract::Span, _) => (3, 7),
             };
             let source = format!(
                 r##"#include <stddef.h>
@@ -76463,9 +76680,9 @@ uint32_t fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_r
 uint32_t fre_aot_regex_runtime_search_exclusive_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,result_t*r){{(void)h;(void)p;(void)n;(void)s;(void)e;(void)r;fallback_calls++;return 93U;}}
 static int check_result(result_t r){{return r.start=={expected_start}U&&r.end=={expected_end}U;}}
 static int run_short_admission(void){{if(!{deferred}U)return 0;result_t result={{91U,92U}};uint32_t status;
-  reset(UINT64_C(1));status=fre_test_static_prefix_terminal_entry((handle_t)&prepared,haystack,sizeof(haystack),0U,7U,&result);
+  reset(UINT64_C(1));status=fre_test_static_prefix_terminal_entry((handle_t)&prepared,haystack,sizeof(haystack),0U,{short_native_max}U,&result);
   if(status!={core_status}U||!check_result(result)||fallback_calls!=0U||preflight_calls!=0U||prepared.invocation_epoch!=UINT64_C(2))return 20;
-  reset(UINT64_C(1));result.start=91U;result.end=92U;status=fre_test_static_prefix_terminal_entry((handle_t)&prepared,haystack,sizeof(haystack),0U,8U,&result);
+  reset(UINT64_C(1));result.start=91U;result.end=92U;status=fre_test_static_prefix_terminal_entry((handle_t)&prepared,haystack,sizeof(haystack),0U,{after_short_native_max}U,&result);
   if(status!=93U||result.start!=91U||result.end!=92U||fallback_calls!=1U||preflight_calls!=0U||prepared.invocation_epoch!=UINT64_C(2))return 21;
   reset(UINT64_C(1));status=fre_test_static_prefix_terminal_entry((handle_t)&prepared,haystack,sizeof(haystack),0U,255U,&result);
   if(status!=93U||fallback_calls!=1U||preflight_calls!=0U||prepared.invocation_epoch!=UINT64_C(2))return 22;
@@ -76490,6 +76707,8 @@ int main(void){{result_t result={{91U,92U}};reset(UINT64_C(1));if({deferred}U){{
                 deferred = usize::from(defer_preflight),
                 eager = usize::from(!defer_preflight),
                 core_status = core_status,
+                short_native_max = short_native_max,
+                after_short_native_max = short_native_max.checked_add(1).unwrap(),
             );
             let c_path = directory.join("terminal.c");
             let executable = directory.join("terminal");
