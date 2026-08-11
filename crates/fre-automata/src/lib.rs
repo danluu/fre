@@ -40,8 +40,8 @@ pub use error::{CompileError, MalformedPlan, ResourceKind, SearchError};
 pub use k0::{
     K0CompilerPrefill, K0CompilerPrefillAttempt, K0CompilerPrefillLimits, K0CompilerPrefillUsage,
     K0DynamicLoopPlan, K0DynamicLoopStartAction, K0DynamicRootProjection,
-    K0FullyPrefilledResumeCacheReceipt,
-    K0FullyPrefilledResumeMapProjection, K0FullyPrefilledRootProjection, K0PositiveEndLimits,
+    K0FullyPrefilledResumeCacheReceipt, K0FullyPrefilledResumeMapProjection,
+    K0FullyPrefilledRootProjection, K0FullyPrefilledSelectedRow, K0PositiveEndLimits,
     K0PositiveEndOutcome, K0PositiveEndReceipt, K0PositiveEndStartOutcome,
     K0PositiveEndStartVerification, K0PositiveEndVerification, K0ResumeSet, K0SearchSession,
     K0SpanSourceCursor, K0Workspace, WorkspaceLayout, WorkspaceLimits,

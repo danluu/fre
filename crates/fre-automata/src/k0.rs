@@ -6291,6 +6291,25 @@ pub struct K0FullyPrefilledResumeCacheReceipt {
     reverse_cells: usize,
 }
 
+/// One setup-authenticated selected row borrowing its complete K0 generation.
+///
+/// This capability is deliberately neither `Copy` nor `Clone`. Its shared
+/// borrows keep both the row cache and the selected resume metadata immutable
+/// until one consuming value entry finishes. A stale generation cannot create
+/// the token, and no raw address or independently storable row authority is
+/// exposed to its caller.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct K0FullyPrefilledSelectedRow<'a> {
+    automaton: &'a Automaton,
+    workspace: &'a K0Workspace,
+    _resume_set: &'a K0ResumeSet,
+    row: u32,
+    pending: bool,
+    reverse_authenticated: bool,
+    receipt: K0FullyPrefilledResumeCacheReceipt,
+}
+
 const FULLY_PREFILLED_FORWARD_BYTE_ROWS: u8 = 1 << 0;
 const FULLY_PREFILLED_REVERSE_BYTE_ROWS: u8 = 1 << 1;
 
@@ -8278,6 +8297,62 @@ impl K0Workspace {
             return None;
         }
         self.lazy.row_offset(cached_hint).ok()
+    }
+
+    /// Borrow one selected row from an exact setup-authenticated complete
+    /// ordered-resume generation.
+    ///
+    /// The returned token owns no storage. Its shared borrows prevent either
+    /// the K0 cache or resume hints from changing between this authentication
+    /// and the consuming value entry. A stale receipt, malformed selected
+    /// hint, or unavailable reverse generation declines without reading source
+    /// bytes; the caller may then use the ordinary exact resume entry.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn compiler_private_try_borrow_fully_prefilled_selected_row<'a>(
+        &'a self,
+        automaton: &'a Automaton,
+        resume_set: &'a K0ResumeSet,
+        resume_state: usize,
+        receipt: K0FullyPrefilledResumeCacheReceipt,
+        require_reverse: bool,
+    ) -> Option<K0FullyPrefilledSelectedRow<'a>> {
+        self.fully_prefilled_cache_is_live(
+            automaton,
+            resume_set,
+            receipt,
+            require_reverse,
+        )?;
+        let pending_mode = *resume_set.modes.get(resume_state)?;
+        let cached_hint = *resume_set.cached_states.get(resume_state)?;
+        let cached_identity = *resume_set.cached_workspace_identities.get(resume_state)?;
+        let cached_hint_index = usize::try_from(cached_hint).ok()?;
+        if pending_mode > 1
+            || cached_identity != receipt.cache_identity
+            || cached_hint == LAZY_NO_STATE
+            || cached_hint_index >= receipt.forward_state_len
+        {
+            return None;
+        }
+        let (_, _, cached_pending) = resume_lazy_state_bounds(&self.lazy, cached_hint).ok()?;
+        if cached_pending != (pending_mode != 0) {
+            return None;
+        }
+        let row = self.lazy.row_offset(cached_hint).ok()?;
+        let row_start = usize::try_from(row).ok()?;
+        let stride = usize::try_from(receipt.direct_row_stride).ok()?;
+        if stride == 0 || row_start.checked_add(stride)? > receipt.forward_cells {
+            return None;
+        }
+        Some(K0FullyPrefilledSelectedRow {
+            automaton,
+            workspace: self,
+            _resume_set: resume_set,
+            row,
+            pending: pending_mode != 0,
+            reverse_authenticated: receipt.reverse_allocated,
+            receipt,
+        })
     }
 
     /// Authenticate the complete cache transaction without selecting a
@@ -15653,6 +15728,176 @@ fn try_accounted_warm_ordered_resume_endpoint_impl<const LOOP_SKIP: bool>(
     )
 }
 
+impl K0FullyPrefilledSelectedRow<'_> {
+    /// Return the pending-end mode authenticated with this selected row.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn compiler_private_pending_mode(&self) -> bool {
+        self.pending
+    }
+
+    fn validate_request(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        resume_position: usize,
+        pending_end: Option<usize>,
+    ) -> Result<(), SearchError> {
+        validate_window(haystack, window)?;
+        if resume_position < window.start() || resume_position > window.end() {
+            return Err(SearchError::InvalidResumeState {
+                detail: "resume position is outside the original search window",
+            });
+        }
+        if self.pending != pending_end.is_some() {
+            return Err(SearchError::InvalidResumeState {
+                detail: "resume pending mode disagrees with the selected endpoint",
+            });
+        }
+        if pending_end.is_some_and(|end| end < window.start() || end > resume_position) {
+            return Err(SearchError::InvalidResumeState {
+                detail: "resume selected endpoint is outside the consumed prefix",
+            });
+        }
+        Ok(())
+    }
+
+    /// Consume this borrow in the fully-prefilled Exists loop.
+    #[doc(hidden)]
+    pub fn search_exists_with_completion(
+        self,
+        haystack: &[u8],
+        window: SearchWindow,
+        resume_position: usize,
+        pending_end: Option<usize>,
+    ) -> Result<K0OrderedResumeValue<bool>, SearchError> {
+        self.validate_request(haystack, window, resume_position, pending_end)?;
+        let (found, _) = execute_fully_prefilled_ordered_resume_endpoint_from_row(
+            self.automaton,
+            haystack,
+            window,
+            self.workspace,
+            self.row,
+            resume_position,
+            pending_end,
+            true,
+            self.receipt,
+        )?;
+        Ok(K0OrderedResumeValue::new(
+            found.is_some(),
+            K0OrderedResumeCompletion::FullyWarmRows,
+        ))
+    }
+
+    /// Consume this borrow in the fully-prefilled SelectedEnd loop.
+    #[doc(hidden)]
+    pub fn search_selected_end_with_completion(
+        self,
+        haystack: &[u8],
+        window: SearchWindow,
+        resume_position: usize,
+        pending_end: Option<usize>,
+    ) -> Result<K0OrderedResumeValue<Option<usize>>, SearchError> {
+        self.validate_request(haystack, window, resume_position, pending_end)?;
+        let (found, _) = execute_fully_prefilled_ordered_resume_endpoint_from_row(
+            self.automaton,
+            haystack,
+            window,
+            self.workspace,
+            self.row,
+            resume_position,
+            pending_end,
+            false,
+            self.receipt,
+        )?;
+        Ok(K0OrderedResumeValue::new(
+            found,
+            K0OrderedResumeCompletion::FullyWarmRows,
+        ))
+    }
+
+    /// Consume this borrow in the fully-prefilled bidirectional Span loop.
+    ///
+    /// `Ok(None)` preserves the established defensive decline for a selected
+    /// endpoint at the window start. The caller must then use the ordinary
+    /// exact Span resume entry.
+    #[doc(hidden)]
+    pub fn search_span_with_completion(
+        self,
+        haystack: &[u8],
+        window: SearchWindow,
+        resume_position: usize,
+        pending_end: Option<usize>,
+    ) -> Result<Option<K0OrderedResumeValue<Option<MatchSpan>>>, SearchError> {
+        self.validate_request(haystack, window, resume_position, pending_end)?;
+        if !self.reverse_authenticated {
+            return Err(SearchError::InvalidResumeState {
+                detail: "span resume requires a bidirectional workspace",
+            });
+        }
+        let (selected_end, work) = execute_fully_prefilled_ordered_resume_endpoint_from_row(
+            self.automaton,
+            haystack,
+            window,
+            self.workspace,
+            self.row,
+            resume_position,
+            pending_end,
+            false,
+            self.receipt,
+        )?;
+        let Some(selected_end) = selected_end else {
+            return Ok(Some(K0OrderedResumeValue::new(
+                None,
+                K0OrderedResumeCompletion::FullyWarmRows,
+            )));
+        };
+        if selected_end == window.start() {
+            return Ok(None);
+        }
+        let reverse_outcome = if self.receipt.has_reverse_byte_rows() {
+            let byte_row_base = u32::try_from(self.receipt.reverse_cells).map_err(|_| {
+                SearchError::InternalInvariant {
+                    detail: "authenticated reverse byte-row base does not fit u32",
+                }
+            })?;
+            execute_accounted_warm_ordered_resume_reverse_loop::<true, true>(
+                self.automaton,
+                haystack,
+                window,
+                self.workspace,
+                byte_row_base,
+                selected_end,
+                work,
+            )?
+            .0
+        } else {
+            execute_accounted_warm_ordered_resume_reverse_loop::<true, false>(
+                self.automaton,
+                haystack,
+                window,
+                self.workspace,
+                0,
+                selected_end,
+                work,
+            )?
+            .0
+        };
+        match reverse_outcome {
+            WarmResumeSpan::Complete(found) => Ok(Some(K0OrderedResumeValue::new(
+                found,
+                K0OrderedResumeCompletion::FullyWarmRows,
+            ))),
+            WarmResumeSpan::ContinueForward(_)
+            | WarmResumeSpan::RecoverReverse { .. }
+            | WarmResumeSpan::ContinueReverse(_)
+            | WarmResumeSpan::Declined => Err(SearchError::InternalInvariant {
+                detail: "fully-prefilled reverse loop produced a mutable handoff",
+            }),
+        }
+    }
+}
+
 /// Execute from a setup-authenticated complete resume cache. `None` is a
 /// constant-time stale-receipt decline and leaves the caller on the ordinary
 /// warm executor. A successful authentication selects a const-generic loop
@@ -15684,6 +15929,35 @@ fn try_fully_prefilled_ordered_resume_endpoint(
     ) else {
         return Ok(None);
     };
+    execute_fully_prefilled_ordered_resume_endpoint_from_row(
+        automaton,
+        haystack,
+        window,
+        workspace,
+        row,
+        resume_position,
+        pending_end,
+        earliest,
+        receipt,
+    )
+    .map(Some)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the already-authenticated selected row retains its exact request and receipt"
+)]
+fn execute_fully_prefilled_ordered_resume_endpoint_from_row(
+    automaton: &Automaton,
+    haystack: &[u8],
+    window: SearchWindow,
+    workspace: &K0Workspace,
+    row: u32,
+    resume_position: usize,
+    pending_end: Option<usize>,
+    earliest: bool,
+    receipt: K0FullyPrefilledResumeCacheReceipt,
+) -> Result<(Option<usize>, u64), SearchError> {
     let work = initial_accounted_warm_resume_work(RESUME_CACHE_IDENTITY_CHECK_WORK)?;
     let has_loop_rows = !workspace.lazy.loop_skip_plans.is_empty();
     let has_byte_rows = receipt.has_forward_byte_rows();
@@ -15758,7 +16032,7 @@ fn try_fully_prefilled_ordered_resume_endpoint(
         )?
     };
     match completed {
-        AccountedWarmResumeEndpoint::Complete { found, work } => Ok(Some((found, work))),
+        AccountedWarmResumeEndpoint::Complete { found, work } => Ok((found, work)),
         AccountedWarmResumeEndpoint::Continue(_) | AccountedWarmResumeEndpoint::Declined => {
             Err(SearchError::InternalInvariant {
                 detail: "fully-prefilled forward loop produced a mutable handoff",
@@ -54514,6 +54788,227 @@ mod tests {
             MatchSpan::new(window.start(), window.end())
         );
         assert_eq!(resume.fully_prefilled_cache_identity, 0);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one selected-row test covers output parity and representative constant-time stale declines"
+    )]
+    fn fully_prefilled_selected_row_is_differential_and_fails_closed() {
+        let plan = direct_split_loop_then_terminal();
+        let frontier = [0_u32];
+        let mut resume = K0ResumeSet::new(&plan, 1, 1, [(&frontier[..], false)]).unwrap();
+        let mut workspace =
+            K0Workspace::new_bidirectional(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let receipt = workspace
+            .compiler_private_try_prefill_resume_caches_with_receipt(&plan, &mut resume)
+            .expect("the complete direct graph must publish a receipt");
+
+        let prefix = 3;
+        let run = super::LAZY_LOOP_SKIP_MIN_BYTES * 2;
+        let mut haystack = vec![b'!'; prefix];
+        haystack.extend(core::iter::repeat(b'b').take(run));
+        haystack.push(b'z');
+        let end = haystack.len();
+        haystack.extend_from_slice(b"!!");
+        let window = SearchWindow::new(prefix, end);
+
+        let selected = workspace
+            .compiler_private_try_borrow_fully_prefilled_selected_row(
+                &plan, &resume, 0, receipt, false,
+            )
+            .expect("fresh selected Exists row");
+        assert!(!selected.compiler_private_pending_mode());
+        let borrowed_exists = selected
+            .search_exists_with_completion(&haystack, window, window.start(), None)
+            .unwrap()
+            .into_parts();
+        let established_exists = plan
+            .prepare::<Exists>()
+            .search_prevalidated_exists_value_from_fully_prefilled_ordered_resume_with_authenticated_workspace_with_completion(
+                &haystack,
+                window,
+                &mut workspace,
+                &mut resume,
+                0,
+                window.start(),
+                None,
+                SearchLimits::unlimited(),
+                receipt,
+            )
+            .unwrap()
+            .into_parts();
+        assert_eq!(borrowed_exists, established_exists);
+
+        let borrowed_end = workspace
+            .compiler_private_try_borrow_fully_prefilled_selected_row(
+                &plan, &resume, 0, receipt, false,
+            )
+            .expect("fresh selected-end row")
+            .search_selected_end_with_completion(&haystack, window, window.start(), None)
+            .unwrap()
+            .into_parts();
+        let established_end = plan
+            .prepare::<SelectedEnd>()
+            .search_prevalidated_selected_end_value_from_fully_prefilled_ordered_resume_with_authenticated_workspace_with_completion(
+                &haystack,
+                window,
+                &mut workspace,
+                &mut resume,
+                0,
+                window.start(),
+                None,
+                SearchLimits::unlimited(),
+                receipt,
+            )
+            .unwrap()
+            .into_parts();
+        assert_eq!(borrowed_end, established_end);
+
+        let borrowed_span = workspace
+            .compiler_private_try_borrow_fully_prefilled_selected_row(
+                &plan, &resume, 0, receipt, true,
+            )
+            .expect("fresh selected Span row")
+            .search_span_with_completion(&haystack, window, window.start(), None)
+            .unwrap()
+            .expect("a positive selected endpoint cannot defensively decline")
+            .into_parts();
+        let established_span = plan
+            .prepare::<Span>()
+            .search_prevalidated_span_value_from_fully_prefilled_ordered_resume_with_authenticated_workspace_with_completion(
+                &haystack,
+                window,
+                &mut workspace,
+                &mut resume,
+                0,
+                window.start(),
+                None,
+                SearchLimits::unlimited(),
+                receipt,
+            )
+            .unwrap()
+            .into_parts();
+        assert_eq!(borrowed_span, established_span);
+
+        let mut stale_receipt = receipt;
+        stale_receipt.cache_identity = receipt.cache_identity.wrapping_add(1).max(1);
+        assert!(workspace
+            .compiler_private_try_borrow_fully_prefilled_selected_row(
+                &plan,
+                &resume,
+                0,
+                stale_receipt,
+                false,
+            )
+            .is_none());
+        let stale_fallback = plan
+            .prepare::<SelectedEnd>()
+            .search_prevalidated_selected_end_value_from_fully_prefilled_ordered_resume_with_authenticated_workspace_with_completion(
+                &haystack,
+                window,
+                &mut workspace,
+                &mut resume,
+                0,
+                window.start(),
+                None,
+                SearchLimits::unlimited(),
+                stale_receipt,
+            )
+            .unwrap()
+            .into_parts();
+        let exact_fallback = plan
+            .prepare::<SelectedEnd>()
+            .search_prevalidated_selected_end_value_from_ordered_resume_with_authenticated_workspace_with_completion(
+                &haystack,
+                window,
+                &mut workspace,
+                &mut resume,
+                0,
+                window.start(),
+                None,
+                SearchLimits::unlimited(),
+            )
+            .unwrap()
+            .into_parts();
+        assert_eq!(stale_fallback, exact_fallback);
+
+        let saved_identity = resume.cached_workspace_identities[0];
+        resume.cached_workspace_identities[0] = saved_identity.wrapping_add(1).max(1);
+        assert!(workspace
+            .compiler_private_try_borrow_fully_prefilled_selected_row(
+                &plan, &resume, 0, receipt, false,
+            )
+            .is_none());
+        resume.cached_workspace_identities[0] = saved_identity;
+
+        let saved_hint = resume.cached_states[0];
+        resume.cached_states[0] = super::LAZY_NO_STATE;
+        assert!(workspace
+            .compiler_private_try_borrow_fully_prefilled_selected_row(
+                &plan, &resume, 0, receipt, false,
+            )
+            .is_none());
+        resume.cached_states[0] = saved_hint;
+
+        resume.modes[0] = 1;
+        assert!(workspace
+            .compiler_private_try_borrow_fully_prefilled_selected_row(
+                &plan, &resume, 0, receipt, false,
+            )
+            .is_none());
+        resume.modes[0] = 2;
+        assert!(workspace
+            .compiler_private_try_borrow_fully_prefilled_selected_row(
+                &plan, &resume, 0, receipt, false,
+            )
+            .is_none());
+        resume.modes[0] = 0;
+
+        let saved_generation = resume.fully_prefilled_cache_identity;
+        resume.fully_prefilled_cache_identity = 0;
+        assert!(workspace
+            .compiler_private_try_borrow_fully_prefilled_selected_row(
+                &plan, &resume, 0, receipt, false,
+            )
+            .is_none());
+        resume.fully_prefilled_cache_identity = saved_generation;
+
+        assert!(workspace
+            .compiler_private_try_borrow_fully_prefilled_selected_row(
+                &plan, &resume, 1, receipt, false,
+            )
+            .is_none());
+        assert!(workspace
+            .compiler_private_try_borrow_fully_prefilled_selected_row(
+                &direct_split_loop_then_terminal(),
+                &resume,
+                0,
+                receipt,
+                false,
+            )
+            .is_none());
+
+        let mut forward_only =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let mut forward_resume =
+            K0ResumeSet::new(&plan, 1, 1, [(&frontier[..], false)]).unwrap();
+        let forward_receipt = forward_only
+            .compiler_private_try_prefill_resume_caches_with_receipt(
+                &plan,
+                &mut forward_resume,
+            )
+            .expect("the forward graph must publish a receipt");
+        assert!(forward_only
+            .compiler_private_try_borrow_fully_prefilled_selected_row(
+                &plan,
+                &forward_resume,
+                0,
+                forward_receipt,
+                true,
+            )
+            .is_none());
     }
 
     #[test]

@@ -2,8 +2,8 @@ use fre_automata::{
     Automaton, CompileLimits as AutomatonCompileLimits, EdgeKind, Exists, K0CompilerPrefill,
     K0CompilerPrefillLimits, K0CompilerPrefillUsage, K0DynamicLoopStartAction,
     K0FullyPrefilledResumeCacheReceipt, K0FullyPrefilledRootProjection,
-    K0OrderedResumeCompletion, K0ResumeSet, K0Workspace, RawPlan, SearchLimits,
-    SearchWindow as K0SearchWindow, SelectedEnd, Span, StateRole, WorkspaceLimits,
+    K0FullyPrefilledSelectedRow, K0OrderedResumeCompletion, K0ResumeSet, K0Workspace, RawPlan,
+    SearchLimits, SearchWindow as K0SearchWindow, SelectedEnd, Span, StateRole, WorkspaceLimits,
 };
 use fre_simd_kernels::{
     ASCII_NARROW_BYTES, ASCII_WIDE_BYTES, AsciiByteSet, AsciiByteSetClassifier,
@@ -17284,6 +17284,48 @@ impl CompiledProgram {
                 "static-prefix continuation position is outside its admitted window",
             ));
         }
+        if let Some(receipt) = state
+            .fully_prefilled
+            .filter(|receipt| receipt.program_instance == self.identity.instance)
+        {
+            let require_reverse = self.output == OutputContract::Span
+                && !self
+                    .partial_dfa()
+                    .is_some_and(PartialDfa::initial_pending)
+                && self.exact_match_width.is_none();
+            if let Some(selected) = nfa.as_ref().and_then(|nfa| {
+                nfa.compiler_private_try_borrow_fully_prefilled_selected_row(
+                    &self.automaton,
+                    &state.resume,
+                    resume_state,
+                    receipt.k0,
+                    require_reverse,
+                )
+            }) {
+                let pending_end = selected
+                    .compiler_private_pending_mode()
+                    .then_some(pending_end_word);
+                if pending_end
+                    .is_some_and(|end| end <= window.start || end > resume_position)
+                {
+                    return Err(CompileError::InternalInvariant(
+                        "static-prefix continuation pending endpoint is outside its consumed prefix",
+                    ));
+                }
+                if let Some(dynamic) = dynamic_native_rows.as_deref_mut() {
+                    dynamic.native_rows_dirty = true;
+                }
+                if let Some(found) = self.search_nfa_from_borrowed_fully_prefilled_selected_row(
+                    haystack,
+                    window,
+                    selected,
+                    resume_position,
+                    pending_end,
+                )? {
+                    return Ok(found);
+                }
+            }
+        }
         let pending = state.resume.pending_mode(resume_state)?;
         let pending_end = pending.then_some(pending_end_word);
         if pending_end.is_some_and(|end| end <= window.start || end > resume_position) {
@@ -18814,6 +18856,99 @@ impl CompiledProgram {
         )?;
         state.observe_resume_completion(consumed, input_bytes, resumed.completion);
         Ok(Some(resumed.found))
+    }
+
+    /// Complete a static-prefix resource fallback from one borrow-bound K0
+    /// row. Every successful branch consumes the token; variable Span may
+    /// defensively decline at an empty selected endpoint and leave the caller
+    /// to the established exact resume entry.
+    fn search_nfa_from_borrowed_fully_prefilled_selected_row(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        selected: K0FullyPrefilledSelectedRow<'_>,
+        resume_position: usize,
+        pending_end: Option<usize>,
+    ) -> Result<Option<MatchResult>, CompileError> {
+        let k0_window = K0SearchWindow::new(window.start, window.end);
+        match self.output {
+            OutputContract::Exists => {
+                let found = selected
+                    .search_exists_with_completion(
+                        haystack,
+                        k0_window,
+                        resume_position,
+                        pending_end,
+                    )?
+                    .into_output();
+                Ok(Some(MatchResult::Exists(found)))
+            }
+            OutputContract::SelectedEnd => {
+                let found = selected
+                    .search_selected_end_with_completion(
+                        haystack,
+                        k0_window,
+                        resume_position,
+                        pending_end,
+                    )?
+                    .into_output();
+                Ok(Some(MatchResult::SelectedEnd(found)))
+            }
+            OutputContract::Span
+                if self
+                    .partial_dfa()
+                    .is_some_and(PartialDfa::initial_pending) =>
+            {
+                let found = selected
+                    .search_selected_end_with_completion(
+                        haystack,
+                        k0_window,
+                        resume_position,
+                        pending_end,
+                    )?
+                    .into_output()
+                    .map(|end| (window.start, end));
+                Ok(Some(MatchResult::Span(found)))
+            }
+            OutputContract::Span if self.exact_match_width.is_some() => {
+                let width = self
+                    .exact_match_width
+                    .expect("the guarded exact Span width is present");
+                let found = selected
+                    .search_selected_end_with_completion(
+                        haystack,
+                        k0_window,
+                        resume_position,
+                        pending_end,
+                    )?
+                    .into_output()
+                    .map(|end| {
+                        end.checked_sub(width).map(|start| (start, end)).ok_or(
+                            CompileError::InternalInvariant(
+                                "resumed fixed-width match end preceded its proved width",
+                            ),
+                        )
+                    })
+                    .transpose()?;
+                Ok(Some(MatchResult::Span(found)))
+            }
+            OutputContract::Span => {
+                let Some(found) = selected.search_span_with_completion(
+                    haystack,
+                    k0_window,
+                    resume_position,
+                    pending_end,
+                )?
+                else {
+                    return Ok(None);
+                };
+                Ok(Some(MatchResult::Span(
+                    found
+                        .into_output()
+                        .map(|span| (span.start(), span.end())),
+                )))
+            }
+        }
     }
 
     #[allow(
@@ -34287,6 +34422,106 @@ mod tests {
                 STATIC_PREFIX_RESUME_DESCRIPTOR_V2_VERSION,
                 descriptor_binding,
             ));
+    }
+
+    #[test]
+    fn static_prefix_portable_selected_row_matches_stale_exact_fallback() {
+        let compiled = program(
+            "abc",
+            OutputContract::SelectedEnd,
+            CompileMode::Fast,
+            DeterminizeLimits {
+                max_states: 0,
+                ..DeterminizeLimits::default()
+            },
+        );
+        let consuming = compiled
+            .raw
+            .roles
+            .iter()
+            .enumerate()
+            .find_map(|(state, role)| {
+                (*role == StateRole::Consume).then(|| u32::try_from(state).unwrap())
+            })
+            .unwrap();
+        let frontier = [consuming];
+        let descriptor =
+            test_static_prefix_resume_descriptor_v1(&[(&frontier[..], false)]);
+        let descriptor_binding = descriptor.as_ptr().expose_provenance();
+        let haystack = b"!abc";
+        let window = SearchWindow::full(haystack);
+        let mut workspace = compiled.prepare_workspace().unwrap();
+
+        assert!(compiled
+            .bind_static_prefix_resume_with_workspace(
+                haystack,
+                window,
+                &mut workspace,
+                None,
+                compiled.identity.artifact,
+                descriptor_binding,
+                &descriptor,
+            )
+            .unwrap()
+            .is_some());
+        {
+            let nfa = workspace.nfa.as_ref().unwrap();
+            let state = workspace.static_prefix_resume.as_deref().unwrap();
+            let receipt = state
+                .fully_prefilled
+                .expect("the bounded graph must retain its complete receipt");
+            assert!(nfa
+                .compiler_private_try_borrow_fully_prefilled_selected_row(
+                    &compiled.automaton,
+                    &state.resume,
+                    0,
+                    receipt.k0,
+                    false,
+                )
+                .is_some());
+        }
+        let selected = compiled
+            .search_from_static_prefix_resume_ticket_with_workspace(
+                haystack,
+                &mut workspace,
+                0,
+                1,
+                0,
+            )
+            .unwrap();
+
+        let stale_program_instance = compiled.identity.instance.wrapping_add(1).max(1);
+        workspace
+            .static_prefix_resume
+            .as_deref_mut()
+            .unwrap()
+            .fully_prefilled
+            .as_mut()
+            .unwrap()
+            .program_instance = stale_program_instance;
+        assert!(compiled
+            .bind_static_prefix_resume_with_workspace(
+                haystack,
+                window,
+                &mut workspace,
+                None,
+                compiled.identity.artifact,
+                descriptor_binding,
+                &descriptor,
+            )
+            .unwrap()
+            .is_none());
+        let exact_fallback = compiled
+            .search_from_static_prefix_resume_ticket_with_workspace(
+                haystack,
+                &mut workspace,
+                0,
+                1,
+                0,
+            )
+            .unwrap();
+        assert_eq!(selected, exact_fallback);
+        assert_eq!(selected, MatchResult::SelectedEnd(Some(haystack.len())));
     }
 
     #[test]
