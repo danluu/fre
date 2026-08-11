@@ -3088,6 +3088,34 @@ const fn frozen_static_continuation_format_is_supported(format_version: u32) -> 
     )
 }
 
+/// Retained partial rows benefit from the dense multi-byte continuation
+/// formats without changing their generated hole ABI. The optional V6/V7
+/// nonroot loop extension remains owned by the generated static-prefix tail;
+/// a retained-row hole therefore stays on its established K0 continuation
+/// for those generations.
+#[inline]
+const fn frozen_static_continuation_format_supports_retained_partial_handoff(
+    format_version: u32,
+) -> bool {
+    matches!(
+        format_version,
+        FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION
+            | FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION
+            | FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION
+    )
+}
+
+#[inline]
+const fn frozen_retained_partial_handoff_block_bytes(format_version: u32) -> Option<usize> {
+    match format_version {
+        FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION | FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION => {
+            Some(2)
+        }
+        FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION => Some(4),
+        _ => None,
+    }
+}
+
 /// Authenticated input to one immutable compact-row continuation.
 ///
 /// The projection is deliberately independent of any compact generation's
@@ -7208,6 +7236,8 @@ struct PartialDfaRuntimeState {
     forward_start_certified: usize,
     #[cfg(test)]
     complete_accelerated: usize,
+    #[cfg(test)]
+    frozen_resumed: usize,
 }
 
 // Retained rows have a fixed dispatch, workspace, and possible resume cost.
@@ -12553,6 +12583,66 @@ impl CompiledProgram {
         )
     }
 
+    /// Continue a ticketed retained-row hole in an independently owned
+    /// immutable supertransition table when its exact K0 lineage is still
+    /// sealed.
+    ///
+    /// The native hole ordinal is never interpreted as a compact row. It is
+    /// projected through the retained resume set and the supplied complete-K0
+    /// receipt, then canonicalized into the immutable owner's row numbering.
+    /// This entry consumes the ticket exactly once. Any owner-specific decline
+    /// retains the consumed window locally and continues through the existing
+    /// K0 path, so a caller never needs to replay the ticket.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same ticket, window, frontier, or search errors as the
+    /// established compact-v2 retained continuation.
+    #[doc(hidden)]
+    #[inline]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the private handoff binds one owner, receipt, ticket, and native frontier"
+    )]
+    pub fn search_from_preflight_retained_partial_resume_ticket_inferred_with_frozen_static_continuation_rows_workspace(
+        &self,
+        haystack: &[u8],
+        workspace: &mut ProgramWorkspace,
+        owner: &FrozenStaticContinuationRowsStorageV1,
+        resume_state: usize,
+        resume_position: usize,
+        pending_end: usize,
+        receipt: FullyPrefilledFallbackReceipt,
+    ) -> Result<MatchResult, CompileError> {
+        let window = Self::take_preflight_partial_resume_ticket(haystack, workspace)?;
+        let pending_end = self
+            .preflight_partial_resume_pending(resume_state)?
+            .then_some(pending_end);
+        if let Some(found) = self
+            .try_search_from_consumed_retained_partial_resume_with_frozen_static_continuation_rows(
+                haystack,
+                window,
+                workspace,
+                owner,
+                resume_state,
+                resume_position,
+                pending_end,
+                receipt,
+            )?
+        {
+            return Ok(found);
+        }
+        self.search_from_consumed_preflight_retained_partial_resume_with_workspace(
+            haystack,
+            window,
+            workspace,
+            resume_state,
+            resume_position,
+            pending_end,
+            Some(receipt),
+        )
+    }
+
     #[inline]
     fn take_preflight_partial_resume_ticket(
         haystack: &[u8],
@@ -12645,6 +12735,198 @@ impl CompiledProgram {
             resumed.completion,
         );
         Ok(resumed.found)
+    }
+
+    /// Attempt an immutable arbitrary-state continuation after the caller has
+    /// already retired the one-shot retained-row admission. `None` is a
+    /// transactional owner decline: no workspace row or adaptive state has
+    /// changed, and the caller still owns `window` for the ordinary K0 path.
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "authentication, projection, output shaping, and adaptive settlement form one transaction"
+    )]
+    fn try_search_from_consumed_retained_partial_resume_with_frozen_static_continuation_rows(
+        &self,
+        haystack: &[u8],
+        window: SearchWindow,
+        workspace: &mut ProgramWorkspace,
+        owner: &FrozenStaticContinuationRowsStorageV1,
+        resume_state: usize,
+        resume_position: usize,
+        pending_end: Option<usize>,
+        receipt: FullyPrefilledFallbackReceipt,
+    ) -> Result<Option<MatchResult>, CompileError> {
+        let rows = &owner.rows;
+        let format_version = owner.compiler_private_format_version();
+        let Some(block_bytes) =
+            frozen_retained_partial_handoff_block_bytes(format_version)
+        else {
+            return Ok(None);
+        };
+        // Projection has fixed authentication cost. If the suffix cannot
+        // consume even one complete supertransition, the already-prefilled
+        // K0 tail is the format-defined scalar executor and keeps ownership.
+        // This threshold follows only the row generation's exact width (two
+        // bytes for V11/V13, four for V14), never graph or benchmark identity.
+        if window.end.saturating_sub(resume_position) < block_bytes {
+            return Ok(None);
+        }
+        if !workspace.identity.compatible(&self.identity)
+            || self.context_dfa.is_some()
+            || !matches!(self.engine, ProgramEngine::OrderedNfa)
+            || self.automaton.stats().has_assertions()
+            || resume_position <= window.start
+            || resume_position >= window.end
+            // Retained K0 permits an initial nullable selection at the exact
+            // window start. Static-prefix objects are nonnullable and use a
+            // stricter lower bound; this handoff preserves the retained ABI.
+            || pending_end.is_some_and(|end| end < window.start || end > resume_position)
+            || receipt.program_instance != self.identity.instance
+            || rows.program_instance != self.identity.instance
+            || rows.artifact_identity != self.identity.artifact
+            || rows.root_prefill_receipt.program_instance != self.identity.instance
+            || rows.root_prefill_receipt.k0 != receipt.k0
+            || rows.descriptor.format_version != format_version
+            || !frozen_static_continuation_format_supports_retained_partial_handoff(
+                format_version,
+            )
+        {
+            return Ok(None);
+        }
+
+        let canonical_state = {
+            let Some(nfa) = workspace.nfa.as_ref() else {
+                return Ok(None);
+            };
+            let Some(partial_workspace) = workspace.partial.as_deref() else {
+                return Ok(None);
+            };
+            let Some(resume_set) = partial_workspace
+                .resume
+                .as_ref()
+                .filter(|resume| resume.is_bound_to(&self.automaton))
+            else {
+                return Ok(None);
+            };
+            let Some(mapping) = nfa.compiler_private_frozen_owner_resume_state_projection(
+                &self.automaton,
+                resume_set,
+                resume_state,
+                receipt.k0,
+            ) else {
+                return Ok(None);
+            };
+            if mapping.cache_identity() != rows.descriptor.cache_identity
+                || mapping.row_stride() == 0
+                || mapping.pending() != pending_end.is_some()
+            {
+                return Ok(None);
+            }
+            let source_initial_state = usize::try_from(mapping.source_initial_state()).map_err(
+                |_| {
+                    CompileError::InternalInvariant(
+                        "retained frozen continuation initial state does not fit usize",
+                    )
+                },
+            )?;
+            let source_state = usize::try_from(mapping.source_state()).map_err(|_| {
+                CompileError::InternalInvariant(
+                    "retained frozen continuation state does not fit usize",
+                )
+            })?;
+            let state_count = usize::try_from(rows.descriptor.state_count).map_err(|_| {
+                CompileError::InternalInvariant(
+                    "retained frozen continuation state count does not fit usize",
+                )
+            })?;
+            if mapping.state_count() != state_count
+                || source_initial_state >= state_count
+                || source_state >= state_count
+            {
+                return Ok(None);
+            }
+            canonicalize_frozen_state_ordinal(source_state, source_initial_state)
+        };
+
+        let Some(forward) = rows.static_prefix_forward_from_canonical_state(
+            haystack,
+            resume_position,
+            window.end,
+            canonical_state,
+            pending_end,
+            self.output,
+        ) else {
+            return Ok(None);
+        };
+
+        // No decline is possible below this point. The immutable scan owns
+        // the continuation, and every later mutable executor entry must first
+        // retire the prepared dynamic-row projection.
+        workspace.mark_dynamic_native_rows_dirty();
+        let ProgramWorkspace { nfa, partial, .. } = workspace;
+        let partial_workspace = partial.as_deref_mut().ok_or(
+            CompileError::InternalInvariant(
+                "retained frozen continuation has no retained workspace",
+            ),
+        )?;
+        let resume_set = partial_workspace
+            .resume
+            .as_ref()
+            .filter(|resume| resume.is_bound_to(&self.automaton))
+            .ok_or(CompileError::InternalInvariant(
+                "retained frozen continuation lost its authenticated K0 resume set",
+            ))?;
+        let found = match self.output {
+            OutputContract::Exists => MatchResult::Exists(forward.selected_end.is_some()),
+            OutputContract::SelectedEnd => MatchResult::SelectedEnd(forward.selected_end),
+            OutputContract::Span => match forward.selected_end {
+                None => MatchResult::Span(None),
+                Some(selected_end) => {
+                    if let Some(width) = self.exact_match_width {
+                        let start = selected_end.checked_sub(width).ok_or(
+                            CompileError::InternalInvariant(
+                                "retained frozen continuation endpoint precedes exact width",
+                            ),
+                        )?;
+                        if start < window.start {
+                            return Err(CompileError::InternalInvariant(
+                                "retained frozen continuation exact start precedes its window",
+                            ));
+                        }
+                        MatchResult::Span(Some((start, selected_end)))
+                    } else {
+                        let recovered_start = self.recover_partial_span_start(
+                            haystack,
+                            window,
+                            nfa.as_mut().ok_or(CompileError::InternalInvariant(
+                                "retained frozen continuation has no reverse K0 workspace",
+                            ))?,
+                            Some(resume_set),
+                            selected_end,
+                            Some(receipt),
+                        )?;
+                        MatchResult::Span(Some((recovered_start, selected_end)))
+                    }
+                }
+            },
+        };
+        #[cfg(test)]
+        {
+            partial_workspace.state.frozen_resumed = partial_workspace
+                .state
+                .frozen_resumed
+                .saturating_add(1);
+        }
+        // The receipt proved the entire K0 generation complete before owner
+        // entry. An early Exists/SelectedEnd return shortens this scan but
+        // does not weaken that already-published completeness proof.
+        partial_workspace.state.observe_resume_completion(
+            resume_position.saturating_sub(window.start),
+            window.end.saturating_sub(window.start),
+            K0OrderedResumeCompletion::FullyWarmRows,
+        );
+        Ok(Some(found))
     }
 
     /// Recover the selected start after an authenticated native retained-row
@@ -18335,6 +18617,146 @@ mod tests {
         }
     }
 
+    /// Build one exact immutable supertransition generation from the sealed
+    /// retained-fallback cache. Production setup selects among these formats
+    /// by resource geometry; this test seam holds semantics and cache lineage
+    /// fixed while exercising every decoder accepted by the handoff.
+    fn frozen_retained_owner_for_format(
+        compiled: &CompiledProgram,
+        workspace: &ProgramWorkspace,
+        receipt: FullyPrefilledFallbackReceipt,
+        format_version: u32,
+    ) -> FrozenStaticContinuationRowsStorageV1 {
+        let full = workspace
+            .nfa
+            .as_ref()
+            .expect("retained owner has a K0 workspace")
+            .compiler_private_fully_prefilled_root_projection_without_resume(
+                &compiled.automaton,
+                receipt.k0,
+            )
+            .expect("retained receipt projects a complete root cache");
+        let source_class_count = usize::try_from(full.row_stride()).unwrap();
+        let state_count = full.forward_rows().len() / source_class_count;
+        let source_initial_state = usize::try_from(full.forward_initial_row()).unwrap()
+            / source_class_count;
+        let columns = coalesce_frozen_compact_columns(
+            full.forward_rows(),
+            full.class_map(),
+            source_class_count,
+            state_count,
+            source_initial_state,
+        )
+        .expect("test owner has canonical compact columns");
+        let class_count = columns.class_count;
+        let cache_identity = full.cache_identity();
+        let reverse = FrozenRootReverseProjection::from_projection(&full);
+        let root_prefill_receipt = FullyPrefilledRootFallbackReceipt {
+            program_instance: compiled.identity.instance,
+            k0: receipt.k0,
+            reverse,
+        };
+
+        let (pair_rows_v11, pair_rows_v13, quad_rows_v14, row_shift) =
+            match format_version {
+                FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION => {
+                    let (physical_classes, _, _, _, _) =
+                        frozen_pair_rows_v11_geometry(state_count, class_count)
+                            .expect("V11 test geometry");
+                    (
+                        Some(
+                            build_frozen_pair_rows_v11(
+                                full.forward_rows(),
+                                &columns,
+                                source_class_count,
+                                state_count,
+                                source_initial_state,
+                            )
+                            .expect("V11 test rows"),
+                        ),
+                        None,
+                        None,
+                        physical_classes.trailing_zeros(),
+                    )
+                }
+                FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION => (
+                    None,
+                    Some(
+                        build_frozen_pair_rows_v13(
+                            full.forward_rows(),
+                            &columns,
+                            source_class_count,
+                            state_count,
+                            source_initial_state,
+                        )
+                        .expect("V13 test rows"),
+                    ),
+                    None,
+                    0,
+                ),
+                FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION => (
+                    None,
+                    None,
+                    Some(
+                        build_frozen_quad_rows_v14(
+                            full.forward_rows(),
+                            &columns,
+                            source_class_count,
+                            state_count,
+                            source_initial_state,
+                        )
+                        .expect("V14 test rows"),
+                    ),
+                    0,
+                ),
+                _ => panic!("unsupported retained handoff test format {format_version}"),
+            };
+        let rows_address = pair_rows_v11
+            .as_ref()
+            .map(|rows| rows.as_ptr().expose_provenance())
+            .or_else(|| {
+                pair_rows_v13
+                    .as_ref()
+                    .map(|rows| rows.as_ptr().expose_provenance())
+            })
+            .or_else(|| {
+                quad_rows_v14
+                    .as_ref()
+                    .map(|rows| rows.as_ptr().expose_provenance())
+            })
+            .expect("one retained handoff row owner");
+        let rows = FrozenDynamicRowsStorageV3 {
+            program_instance: compiled.identity.instance,
+            artifact_identity: compiled.identity.artifact,
+            root_prefill_receipt,
+            rows: Box::default(),
+            rows_u8: None,
+            pair_rows_v11,
+            pair_rows_v13,
+            quad_rows_v14,
+            class_map: columns.class_map,
+            descriptor: FrozenDynamicRowsV3 {
+                ready_seal: 0,
+                rows_address,
+                cache_identity,
+                state_count: u32::try_from(state_count).unwrap(),
+                class_count: u32::try_from(class_count).unwrap(),
+                row_shift,
+                initial_state: 0,
+                learned_loop_state_count: 0,
+                learned_loop_states: [u32::MAX; 4],
+                format_version,
+            },
+            unary_exists_first_accept_step: None,
+            loop_index: Box::default(),
+            loop_scanners: Box::default(),
+            descriptor_v6: None,
+        };
+        assert!(rows.descriptor_is_valid_for(compiled.identity));
+        assert!(rows.descriptor_v6_is_valid_for(compiled.identity));
+        FrozenStaticContinuationRowsStorageV1 { rows }
+    }
+
     fn frozen_test_source_cell(
         destination: Option<usize>,
         source_class_count: usize,
@@ -20741,6 +21163,46 @@ mod tests {
                 PartialDfaResult::Complete(_) => None,
             },
         }
+    }
+
+    fn retained_handoff_fixture(
+        pattern: &str,
+        output: OutputContract,
+        haystack: &[u8],
+        window: SearchWindow,
+        require_pending: bool,
+    ) -> (CompiledProgram, PartialDfaResume) {
+        (2..=32)
+            .find_map(|max_states| {
+                let compiled = program(
+                    pattern,
+                    output,
+                    CompileMode::Optimizing,
+                    DeterminizeLimits {
+                        max_states,
+                        ..DeterminizeLimits::default()
+                    },
+                );
+                let resume = authentic_partial_resume(&compiled, haystack, window)?;
+                (resume.position > window.start
+                    && resume.position < window.end
+                    && (!require_pending || resume.pending_end.is_some()))
+                .then_some((compiled, resume))
+            })
+            .unwrap_or_else(|| panic!("no retained handoff fixture for {pattern}/{output:?}"))
+    }
+
+    fn retained_runtime_observation(
+        workspace: &ProgramWorkspace,
+    ) -> (u8, u16, bool, Option<SearchWindow>, usize) {
+        let state = &workspace.partial.as_deref().unwrap().state;
+        (
+            state.consecutive_fallbacks,
+            state.bypass_remaining,
+            state.native_entry_in_flight,
+            state.native_entry_window,
+            state.frozen_resumed,
+        )
     }
 
     #[test]
@@ -28307,7 +28769,465 @@ mod tests {
                 matches!(format_version, 3 | 4 | 6..=14),
                 "static-continuation policy drifted for format {format_version}"
             );
+            assert_eq!(
+                frozen_static_continuation_format_supports_retained_partial_handoff(
+                    format_version,
+                ),
+                matches!(format_version, 11 | 13 | 14),
+                "retained handoff policy drifted for format {format_version}"
+            );
+            assert_eq!(
+                frozen_retained_partial_handoff_block_bytes(format_version),
+                match format_version {
+                    11 | 13 => Some(2),
+                    14 => Some(4),
+                    _ => None,
+                },
+                "retained handoff width drifted for format {format_version}"
+            );
         }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "three immutable generations, every output, decline, and adaptive settlement share one sealed fixture"
+    )]
+    fn retained_partial_handoff_uses_sealed_v11_v13_v14_and_falls_through_once() {
+        const FORMATS: [u32; 3] = [
+            FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION,
+            FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION,
+            FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION,
+        ];
+        const WINDOW_START: usize = 3;
+        let mut variable_haystack = vec![b'!'; WINDOW_START + 9];
+        variable_haystack.extend(vec![b'b'; PARTIAL_DFA_MIN_INPUT_BYTES + 64]);
+        let mut exact_haystack = vec![b'!'; WINDOW_START + 9];
+        for _ in 0..(PARTIAL_DFA_MIN_INPUT_BYTES / 2 + 32) {
+            exact_haystack.extend_from_slice(b"ab");
+        }
+
+        for (label, pattern, output, exact_width, require_pending) in [
+            (
+                "exists",
+                r"(?:ab|ba){4}",
+                OutputContract::Exists,
+                true,
+                false,
+            ),
+            (
+                "selected-pending",
+                r"[ab]{1,20}",
+                OutputContract::SelectedEnd,
+                false,
+                true,
+            ),
+            (
+                "span-exact",
+                r"(?:ab|ba){4}",
+                OutputContract::Span,
+                true,
+                false,
+            ),
+            (
+                "span-reverse",
+                r"[ab]{1,20}",
+                OutputContract::Span,
+                false,
+                true,
+            ),
+        ] {
+            let haystack = if exact_width {
+                &exact_haystack
+            } else {
+                &variable_haystack
+            };
+            let window = SearchWindow::new(WINDOW_START, haystack.len());
+            let (compiled, resume) = retained_handoff_fixture(
+                pattern,
+                output,
+                haystack,
+                window,
+                require_pending,
+            );
+            assert_eq!(compiled.exact_match_width.is_some(), exact_width, "{label}");
+            let expected = compiled.search(haystack, window).unwrap();
+
+            for format_version in FORMATS {
+                let mut workspace = compiled.prepare_workspace().unwrap();
+                let receipt = compiled
+                    .compiler_private_try_prefill_retained_fallback_with_workspace_receipt(
+                        &mut workspace,
+                    )
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("{label}/V{format_version} prefill declined"));
+                let owner = frozen_retained_owner_for_format(
+                    &compiled,
+                    &workspace,
+                    receipt,
+                    format_version,
+                );
+                assert_eq!(owner.compiler_private_format_version(), format_version);
+                if let Some(dynamic) = workspace.dynamic_native_rows.as_deref_mut() {
+                    dynamic.native_rows_dirty = false;
+                }
+                let block_bytes =
+                    frozen_retained_partial_handoff_block_bytes(format_version).unwrap();
+                let short_window = SearchWindow::new(
+                    window.start,
+                    resume.position.checked_add(block_bytes - 1).unwrap(),
+                );
+                assert!(short_window.end <= window.end);
+                let before_short_tail = retained_runtime_observation(&workspace);
+                assert_eq!(
+                    compiled
+                        .try_search_from_consumed_retained_partial_resume_with_frozen_static_continuation_rows(
+                            haystack,
+                            short_window,
+                            &mut workspace,
+                            &owner,
+                            resume.state,
+                            resume.position,
+                            resume.pending_end,
+                            receipt,
+                        )
+                        .unwrap(),
+                    None,
+                    "{label}/V{format_version} claimed a sub-block tail"
+                );
+                assert_eq!(retained_runtime_observation(&workspace), before_short_tail);
+                assert!(
+                    workspace
+                        .dynamic_native_rows
+                        .as_deref()
+                        .is_none_or(|dynamic| !dynamic.native_rows_dirty),
+                    "{label}/V{format_version} sub-block decline dirtied mutable rows"
+                );
+                assert_eq!(
+                    compiled
+                        .preflight_retained_partial_native_root_with_workspace(
+                            haystack,
+                            window,
+                            &mut workspace,
+                            compiled.artifact_identity(),
+                        )
+                        .unwrap(),
+                    RetainedPartialPreflight::Enter(window),
+                    "{label}/V{format_version} admission"
+                );
+                {
+                    let state = &mut workspace.partial.as_deref_mut().unwrap().state;
+                    state.consecutive_fallbacks = 4;
+                    state.bypass_remaining = 9;
+                }
+                let found = compiled
+                    .search_from_preflight_retained_partial_resume_ticket_inferred_with_frozen_static_continuation_rows_workspace(
+                        haystack,
+                        &mut workspace,
+                        &owner,
+                        resume.state,
+                        resume.position,
+                        resume.pending_end.unwrap_or(0),
+                        receipt,
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("{label}/V{format_version} continuation: {error}")
+                    });
+                assert_eq!(found, expected, "{label}/V{format_version}");
+                let state = &workspace.partial.as_deref().unwrap().state;
+                assert_eq!(state.frozen_resumed, 1, "{label}/V{format_version}");
+                assert_eq!(state.consecutive_fallbacks, 0, "{label}/V{format_version}");
+                assert_eq!(state.bypass_remaining, 0, "{label}/V{format_version}");
+                assert!(!state.native_entry_in_flight, "{label}/V{format_version}");
+                assert_eq!(state.native_entry_window, None, "{label}/V{format_version}");
+                assert!(
+                    workspace
+                        .dynamic_native_rows
+                        .as_deref()
+                        .is_none_or(|dynamic| dynamic.native_rows_dirty),
+                    "{label}/V{format_version} did not dirty the mutable projection"
+                );
+                assert!(
+                    compiled
+                        .search_from_preflight_retained_partial_resume_ticket_inferred_with_frozen_static_continuation_rows_workspace(
+                            haystack,
+                            &mut workspace,
+                            &owner,
+                            resume.state,
+                            resume.position,
+                            resume.pending_end.unwrap_or(0),
+                            receipt,
+                        )
+                        .is_err(),
+                    "{label}/V{format_version} replayed one ticket"
+                );
+
+                let mut declined_workspace = compiled.prepare_workspace().unwrap();
+                let declined_receipt = compiled
+                    .compiler_private_try_prefill_retained_fallback_with_workspace_receipt(
+                        &mut declined_workspace,
+                    )
+                    .unwrap()
+                    .unwrap();
+                assert_ne!(
+                    owner.rows.root_prefill_receipt.k0,
+                    declined_receipt.k0,
+                    "independent workspaces must have distinct cache generations"
+                );
+                if let Some(dynamic) = declined_workspace.dynamic_native_rows.as_deref_mut() {
+                    dynamic.native_rows_dirty = false;
+                }
+                assert_eq!(
+                    compiled
+                        .preflight_retained_partial_native_root_with_workspace(
+                            haystack,
+                            window,
+                            &mut declined_workspace,
+                            compiled.artifact_identity(),
+                        )
+                        .unwrap(),
+                    RetainedPartialPreflight::Enter(window)
+                );
+                {
+                    let state = &mut declined_workspace.partial.as_deref_mut().unwrap().state;
+                    state.consecutive_fallbacks = 4;
+                    state.bypass_remaining = 9;
+                }
+                let before_decline = retained_runtime_observation(&declined_workspace);
+                // Probe only the transactional owner phase before invoking
+                // the public consume-once wrapper. A decline must be purely
+                // observational: K0, not the rejected owner, performs the
+                // later dirtying and adaptive settlement.
+                assert_eq!(
+                    compiled
+                        .try_search_from_consumed_retained_partial_resume_with_frozen_static_continuation_rows(
+                            haystack,
+                            window,
+                            &mut declined_workspace,
+                            &owner,
+                            resume.state,
+                            resume.position,
+                            resume.pending_end,
+                            declined_receipt,
+                        )
+                        .unwrap(),
+                    None,
+                    "{label}/V{format_version} accepted a foreign cache generation"
+                );
+                assert_eq!(
+                    retained_runtime_observation(&declined_workspace),
+                    before_decline,
+                    "{label}/V{format_version} owner decline mutated adaptive or ticket state"
+                );
+                assert!(
+                    declined_workspace
+                        .dynamic_native_rows
+                        .as_deref()
+                        .is_none_or(|dynamic| !dynamic.native_rows_dirty),
+                    "{label}/V{format_version} owner decline dirtied mutable rows before K0"
+                );
+                let declined = compiled
+                    .search_from_preflight_retained_partial_resume_ticket_inferred_with_frozen_static_continuation_rows_workspace(
+                        haystack,
+                        &mut declined_workspace,
+                        &owner,
+                        resume.state,
+                        resume.position,
+                        resume.pending_end.unwrap_or(0),
+                        declined_receipt,
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("{label}/V{format_version} K0 fallthrough: {error}")
+                    });
+                assert_eq!(declined, expected, "{label}/V{format_version} decline");
+                let declined_state = &declined_workspace.partial.as_deref().unwrap().state;
+                assert_eq!(declined_state.frozen_resumed, 0);
+                assert_eq!(declined_state.consecutive_fallbacks, 0);
+                assert_eq!(declined_state.bypass_remaining, 0);
+                assert!(!declined_state.native_entry_in_flight);
+                assert_eq!(declined_state.native_entry_window, None);
+                assert!(
+                    declined_workspace
+                        .dynamic_native_rows
+                        .as_deref()
+                        .is_none_or(|dynamic| dynamic.native_rows_dirty),
+                    "{label}/V{format_version} K0 fallthrough did not dirty mutable rows"
+                );
+                assert!(
+                    compiled
+                        .search_from_preflight_retained_partial_resume_ticket_inferred_with_frozen_static_continuation_rows_workspace(
+                            haystack,
+                            &mut declined_workspace,
+                            &owner,
+                            resume.state,
+                            resume.position,
+                            resume.pending_end.unwrap_or(0),
+                            declined_receipt,
+                        )
+                        .is_err(),
+                    "{label}/V{format_version} decline replayed the consumed ticket"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn retained_partial_handoff_preserves_window_start_pending_boundary() {
+        const WINDOW_START: usize = 3;
+        let mut haystack = vec![b'!'; WINDOW_START + 9];
+        haystack.extend(vec![b'b'; PARTIAL_DFA_MIN_INPUT_BYTES + 64]);
+        let window = SearchWindow::new(WINDOW_START, haystack.len());
+        let (compiled, initial_resume) = retained_handoff_fixture(
+            r"[ab]{1,20}",
+            OutputContract::SelectedEnd,
+            &haystack,
+            window,
+            true,
+        );
+        haystack[initial_resume.position..].fill(b'!');
+        let resume = authentic_partial_resume(&compiled, &haystack, window)
+            .expect("the retained frontier precedes the replaced suffix");
+        assert_eq!(resume.state, initial_resume.state);
+        assert_eq!(resume.position, initial_resume.position);
+        assert!(resume.pending_end.is_some());
+
+        let mut baseline_workspace = compiled.prepare_workspace().unwrap();
+        let baseline_receipt = compiled
+            .compiler_private_try_prefill_retained_fallback_with_workspace_receipt(
+                &mut baseline_workspace,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            compiled
+                .preflight_retained_partial_native_root_with_workspace(
+                    &haystack,
+                    window,
+                    &mut baseline_workspace,
+                    compiled.artifact_identity(),
+                )
+                .unwrap(),
+            RetainedPartialPreflight::Enter(window)
+        );
+        let baseline = compiled
+            .search_from_preflight_retained_partial_resume_ticket_inferred_with_fully_prefilled_fallback_workspace(
+                &haystack,
+                &mut baseline_workspace,
+                resume.state,
+                resume.position,
+                window.start,
+                baseline_receipt,
+            )
+            .expect("established retained K0 accepts a window-start pending endpoint");
+        assert_eq!(baseline, MatchResult::SelectedEnd(Some(window.start)));
+
+        let mut direct_workspace = compiled.prepare_workspace().unwrap();
+        let direct_receipt = compiled
+            .compiler_private_try_prefill_retained_fallback_with_workspace_receipt(
+                &mut direct_workspace,
+            )
+            .unwrap()
+            .unwrap();
+        let owner = frozen_retained_owner_for_format(
+            &compiled,
+            &direct_workspace,
+            direct_receipt,
+            FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION,
+        );
+        assert_eq!(
+            compiled
+                .preflight_retained_partial_native_root_with_workspace(
+                    &haystack,
+                    window,
+                    &mut direct_workspace,
+                    compiled.artifact_identity(),
+                )
+                .unwrap(),
+            RetainedPartialPreflight::Enter(window)
+        );
+        let direct = compiled
+            .search_from_preflight_retained_partial_resume_ticket_inferred_with_frozen_static_continuation_rows_workspace(
+                &haystack,
+                &mut direct_workspace,
+                &owner,
+                resume.state,
+                resume.position,
+                window.start,
+                direct_receipt,
+            )
+            .expect("window-start pending endpoint is valid for retained K0");
+        assert_eq!(direct, baseline);
+        assert_eq!(
+            direct_workspace
+                .partial
+                .as_deref()
+                .unwrap()
+                .state
+                .frozen_resumed,
+            1
+        );
+
+        let mut rejected_workspace = compiled.prepare_workspace().unwrap();
+        let rejected_receipt = compiled
+            .compiler_private_try_prefill_retained_fallback_with_workspace_receipt(
+                &mut rejected_workspace,
+            )
+            .unwrap()
+            .unwrap();
+        let rejected_owner = frozen_retained_owner_for_format(
+            &compiled,
+            &rejected_workspace,
+            rejected_receipt,
+            FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION,
+        );
+        assert_eq!(
+            compiled
+                .preflight_retained_partial_native_root_with_workspace(
+                    &haystack,
+                    window,
+                    &mut rejected_workspace,
+                    compiled.artifact_identity(),
+                )
+                .unwrap(),
+            RetainedPartialPreflight::Enter(window)
+        );
+        assert!(
+            compiled
+                .search_from_preflight_retained_partial_resume_ticket_inferred_with_frozen_static_continuation_rows_workspace(
+                    &haystack,
+                    &mut rejected_workspace,
+                    &rejected_owner,
+                    resume.state,
+                    resume.position,
+                    window.start - 1,
+                    rejected_receipt,
+                )
+                .is_err(),
+            "a pending endpoint before the retained window was accepted"
+        );
+        assert_eq!(
+            rejected_workspace
+                .partial
+                .as_deref()
+                .unwrap()
+                .state
+                .frozen_resumed,
+            0
+        );
+        assert!(
+            compiled
+                .search_from_preflight_retained_partial_resume_ticket_inferred_with_frozen_static_continuation_rows_workspace(
+                    &haystack,
+                    &mut rejected_workspace,
+                    &rejected_owner,
+                    resume.state,
+                    resume.position,
+                    window.start,
+                    rejected_receipt,
+                )
+                .is_err(),
+            "an invalid boundary attempt did not consume its ticket"
+        );
     }
 
     #[test]

@@ -432,6 +432,8 @@ pub struct PreparedAotRegex {
     fully_prefilled_fallback: Option<FullyPrefilledFallbackReceipt>,
     static_prefix_object_ticket: Option<StaticPrefixObjectTicket>,
     static_prefix_span_postflight_ticket: Option<StaticPrefixSpanPostflightTicket>,
+    #[cfg(test)]
+    retained_partial_frozen_owner_handoffs: usize,
 }
 
 /// One generated static-prefix invocation awaiting either a native hole or a
@@ -587,6 +589,8 @@ impl PreparedAotRegex {
             fully_prefilled_fallback,
             static_prefix_object_ticket: None,
             static_prefix_span_postflight_ticket: None,
+            #[cfg(test)]
+            retained_partial_frozen_owner_handoffs: 0,
         })
     }
 
@@ -904,6 +908,33 @@ impl PreparedAotRegex {
         pending_end: usize,
     ) -> Result<MatchResult, CompileError> {
         self.deactivate_frozen_header();
+        if let Some(owner) = self.frozen_static_continuation_rows.as_ref()
+            && matches!(
+                owner.compiler_private_format_version(),
+                FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION
+                    | FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION
+                    | FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION
+            )
+            && let Some(receipt) = self.fully_prefilled_fallback
+        {
+            #[cfg(test)]
+            {
+                self.retained_partial_frozen_owner_handoffs = self
+                    .retained_partial_frozen_owner_handoffs
+                    .saturating_add(1);
+            }
+            return self
+                .program
+                .search_from_preflight_retained_partial_resume_ticket_inferred_with_frozen_static_continuation_rows_workspace(
+                    haystack,
+                    &mut self.workspace,
+                    owner,
+                    resume_state,
+                    resume_position,
+                    pending_end,
+                    receipt,
+                );
+        }
         if let Some(receipt) = self.fully_prefilled_fallback {
             self.program
                 .search_from_preflight_retained_partial_resume_ticket_inferred_with_fully_prefilled_fallback_workspace(
@@ -5066,6 +5097,7 @@ mod tests {
             fully_prefilled_fallback,
             static_prefix_object_ticket: None,
             static_prefix_span_postflight_ticket: None,
+            retained_partial_frozen_owner_handoffs: 0,
         };
         FreAotRegexExclusiveHandleV1(
             Box::into_raw(Box::new(prepared)).cast::<std::ffi::c_void>(),
@@ -10928,6 +10960,116 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
         assert!(prepared.frozen_dynamic_rows.is_some());
         assert_eq!(prepared.search(haystack, window).unwrap(), expected);
         assert!(!prepared.frozen_header.is_active());
+    }
+
+    #[test]
+    fn compact_v2_retained_holes_select_only_batched_continuation_owners() {
+        let pattern = r"a+Q|[b-c][a-b]{1,5}(?:x+|y+)";
+        let mut limits = CompileLimitsV1::default();
+        limits.determinize.max_states = 8;
+        let compiled = compile(
+            CompileRequest::new(pattern, Target::x86_64_linux())
+                .mode(CompileMode::Optimizing)
+                .limits(limits)
+                .output(OutputContract::Exists),
+        )
+        .expect("compile retained compact-v2 fixture");
+        let serialized = compiled.program().serialize().unwrap();
+        let mut haystack = b"xxcbbbbyyy".to_vec();
+        haystack.resize(320, b'!');
+        let window = SearchWindow::full(&haystack);
+        let expected = compiled.search(&haystack, window).unwrap();
+
+        let mut batched = PreparedAotRegex::deserialize(&serialized).unwrap();
+        let batched_format = batched
+            .frozen_static_continuation_rows
+            .as_ref()
+            .expect("retained fixture has a static continuation owner")
+            .compiler_private_format_version();
+        assert!(matches!(
+            batched_format,
+            FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION
+                | FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION
+                | FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION
+        ));
+        assert!(batched.fully_prefilled_fallback.is_some());
+        assert_eq!(
+            batched
+                .preflight_retained_partial_native_root(
+                    &haystack,
+                    window,
+                    compiled.receipt().program_sha256,
+                )
+                .unwrap(),
+            RetainedPartialPreflight::Enter(window)
+        );
+        assert_eq!(batched.retained_partial_frozen_owner_handoffs, 0);
+        assert_eq!(
+            batched
+                .search_from_preflight_retained_partial_resume_ticket_inferred(
+                    &haystack,
+                    0,
+                    5,
+                    0,
+                )
+                .unwrap(),
+            expected
+        );
+        assert_eq!(batched.retained_partial_frozen_owner_handoffs, 1);
+
+        // Obtain a valid V6/V7 arbitrary-state owner from a separate general
+        // program, then place it in an otherwise identical retained session.
+        // The format gate must ignore it before any owner-lineage check and
+        // preserve the established receipt-backed K0 continuation.
+        let mut loop_limits = CompileLimitsV1::default();
+        loop_limits.determinize.max_states = 0;
+        let loop_compiled = compile(
+            CompileRequest::new(
+                r"a+Q|b+R|c+S|d+T|e+U|f+V|g+W|h+X|i+Y|j+Z",
+                Target::x86_64_linux(),
+            )
+            .mode(CompileMode::Optimizing)
+            .limits(loop_limits)
+            .output(OutputContract::SelectedEnd),
+        )
+        .expect("compile loop-continuation owner");
+        let loop_serialized = loop_compiled.program().serialize().unwrap();
+        let mut loop_prepared = PreparedAotRegex::deserialize(&loop_serialized).unwrap();
+        let loop_owner = loop_prepared
+            .frozen_static_continuation_rows
+            .take()
+            .expect("loop fixture has a continuation owner");
+        assert!(matches!(
+            loop_owner.compiler_private_format_version(),
+            fre_aot_regex::FROZEN_DYNAMIC_ROWS_V6_FORMAT_VERSION
+                | fre_aot_regex::FROZEN_DYNAMIC_ROWS_V7_FORMAT_VERSION
+        ));
+
+        let mut legacy_k0 = PreparedAotRegex::deserialize(&serialized).unwrap();
+        legacy_k0.deactivate_frozen_header();
+        legacy_k0.frozen_static_continuation_rows = Some(loop_owner);
+        assert_eq!(
+            legacy_k0
+                .preflight_retained_partial_native_root(
+                    &haystack,
+                    window,
+                    compiled.receipt().program_sha256,
+                )
+                .unwrap(),
+            RetainedPartialPreflight::Enter(window)
+        );
+        assert_eq!(
+            legacy_k0
+                .search_from_preflight_retained_partial_resume_ticket_inferred(
+                    &haystack,
+                    0,
+                    5,
+                    0,
+                )
+                .unwrap(),
+            expected
+        );
+        assert_eq!(legacy_k0.retained_partial_frozen_owner_handoffs, 0);
     }
 
     #[test]
