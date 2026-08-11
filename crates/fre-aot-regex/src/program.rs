@@ -3098,6 +3098,53 @@ pub struct FrozenDynamicRowsStorageV3 {
     descriptor_v6: Option<FrozenDynamicRowsV6>,
 }
 
+const FROZEN_RETAINED_PARTIAL_RESUME_PENDING_MASK: u32 = 1_u32 << 31;
+const FROZEN_RETAINED_PARTIAL_RESUME_STATE_MASK: u32 =
+    !FROZEN_RETAINED_PARTIAL_RESUME_PENDING_MASK;
+
+/// Setup-owned projection from every retained-hole ordinal to the immutable
+/// compact owner's canonical state and pending mode.
+///
+/// The high bit of each entry carries the pending mode; the remaining bits
+/// carry a canonical state ordinal. Construction copies only a completely
+/// authenticated K0 resume map. Per-match projection can therefore remain a
+/// single bounds-checked immutable load without reading K0 or its resume set.
+#[derive(Debug)]
+struct FrozenRetainedPartialResumeMapV1 {
+    entries: Box<[u32]>,
+    cache_identity: u64,
+    state_count: u32,
+    format_version: u32,
+}
+
+impl FrozenRetainedPartialResumeMapV1 {
+    #[inline]
+    fn project(
+        &self,
+        rows: &FrozenDynamicRowsStorageV3,
+        expected_count: usize,
+        resume_state: usize,
+        expected_pending: bool,
+    ) -> Option<usize> {
+        if self.cache_identity == 0
+            || self.cache_identity != rows.descriptor.cache_identity
+            || self.state_count == 0
+            || self.state_count != rows.descriptor.state_count
+            || self.format_version != rows.effective_format_version()
+            || self.entries.len() != expected_count
+        {
+            return None;
+        }
+        let packed = *self.entries.get(resume_state)?;
+        let pending = packed & FROZEN_RETAINED_PARTIAL_RESUME_PENDING_MASK != 0;
+        let canonical_state = packed & FROZEN_RETAINED_PARTIAL_RESUME_STATE_MASK;
+        if pending != expected_pending || canonical_state >= self.state_count {
+            return None;
+        }
+        usize::try_from(canonical_state).ok()
+    }
+}
+
 /// Independently owned compact table that may be entered only from an already
 /// authenticated arbitrary-state continuation.
 ///
@@ -3109,10 +3156,14 @@ pub struct FrozenDynamicRowsStorageV3 {
 /// excluded. V6/V7 may be retained because their nonroot loop index is an
 /// optional exact accelerator over the same closed V3/V4 rows; the generated
 /// local tail authenticates the current canonical state before consulting it.
+/// V11/V13/V14 may additionally own a bounded dense retained-hole map copied
+/// from the same fully authenticated K0 transaction. Its absence never
+/// removes the established compact-v2 continuation.
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct FrozenStaticContinuationRowsStorageV1 {
     rows: FrozenDynamicRowsStorageV3,
+    retained_partial_resume: Option<FrozenRetainedPartialResumeMapV1>,
 }
 
 /// Setup-minted authority for one immutable compact-owner generation.
@@ -5966,6 +6017,29 @@ impl FrozenDynamicRowsStorageV3 {
         match self.descriptor_v6 {
             Some(rows) => rows.compact.format_version,
             None => self.descriptor.format_version,
+        }
+    }
+
+    /// Exact resident row payload already charged to the packed-owner cap for
+    /// a retained-hole supertransition generation. Geometry includes the
+    /// inline 256-byte class map.
+    fn retained_partial_packed_bytes(&self) -> Option<usize> {
+        let state_count = usize::try_from(self.descriptor.state_count).ok()?;
+        let class_count = usize::try_from(self.descriptor.class_count).ok()?;
+        match self.effective_format_version() {
+            FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION => {
+                frozen_pair_rows_v11_geometry(state_count, class_count)
+                    .map(|(_, _, _, _, bytes)| bytes)
+            }
+            FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION => {
+                frozen_pair_rows_v13_geometry(state_count, class_count)
+                    .map(|(_, _, _, bytes)| bytes)
+            }
+            FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION => {
+                frozen_quad_rows_v14_geometry(state_count, class_count)
+                    .map(|(_, _, _, _, _, _, bytes)| bytes)
+            }
+            _ => None,
         }
     }
 
@@ -11263,6 +11337,115 @@ impl CompiledProgram {
         )
     }
 
+    /// Copy a complete authenticated retained-hole map into the immutable
+    /// continuation owner. The row owner and map share one explicit resident
+    /// cap: a table that fits by itself does not authorize an unbounded second
+    /// allocation.
+    fn compiler_private_frozen_retained_partial_resume_map_v1(
+        &self,
+        workspace: &ProgramWorkspace,
+        storage: &FrozenDynamicRowsStorageV3,
+        fully_prefilled: FullyPrefilledFallbackReceipt,
+        max_packed_bytes: usize,
+    ) -> Option<FrozenRetainedPartialResumeMapV1> {
+        let format_version = storage.effective_format_version();
+        if workspace.identity.instance != self.identity.instance
+            || fully_prefilled.program_instance != self.identity.instance
+            || storage.program_instance != self.identity.instance
+            || storage.artifact_identity != self.identity.artifact
+            || storage.root_prefill_receipt.program_instance != self.identity.instance
+            || storage.root_prefill_receipt.k0 != fully_prefilled.k0
+            || storage.descriptor.format_version != format_version
+            || !frozen_static_continuation_format_supports_retained_partial_handoff(
+                format_version,
+            )
+            || !storage.descriptor_is_valid_for(self.identity)
+            || !storage.descriptor_v6_is_valid_for(self.identity)
+        {
+            return None;
+        }
+
+        let partial = self.partial_dfa()?;
+        let count = partial.resume_frontier_count();
+        if count == 0 {
+            return None;
+        }
+        let resume_set = workspace
+            .partial
+            .as_deref()?
+            .resume
+            .as_ref()
+            .filter(|resume| resume.is_bound_to(&self.automaton))?;
+        let nfa = workspace.nfa.as_ref()?;
+        let root = nfa.compiler_private_fully_prefilled_root_projection_without_resume(
+            &self.automaton,
+            fully_prefilled.k0,
+        )?;
+        let projection = nfa.compiler_private_fully_prefilled_resume_map_projection(
+            &self.automaton,
+            resume_set,
+            fully_prefilled.k0,
+        )?;
+        let state_count = projection.state_count();
+        let source_initial_state = usize::try_from(projection.source_initial_state()).ok()?;
+        let source_stride = usize::try_from(projection.compact_row_stride()).ok()?;
+        let root_initial_row = usize::try_from(root.forward_initial_row()).ok()?;
+        if projection.count() != count
+            || projection.cached_state_ids().len() != count
+            || projection.pending_modes().len() != count
+            || projection.cache_identity() != storage.descriptor.cache_identity
+            || projection.cache_identity() != root.cache_identity()
+            || state_count != usize::try_from(storage.descriptor.state_count).ok()?
+            || source_initial_state >= state_count
+            || source_stride == 0
+            || projection.compact_row_stride() != root.row_stride()
+            || state_count.checked_mul(source_stride)? != root.forward_rows().len()
+            || root_initial_row.checked_rem(source_stride) != Some(0)
+            || root_initial_row.checked_div(source_stride) != Some(source_initial_state)
+        {
+            return None;
+        }
+
+        let map_bytes = count.checked_mul(core::mem::size_of::<u32>())?;
+        let owner_packed_bytes = storage.retained_partial_packed_bytes()?;
+        if owner_packed_bytes.checked_add(map_bytes)? > max_packed_bytes {
+            return None;
+        }
+
+        let mut entries = Vec::new();
+        entries.try_reserve_exact(count).ok()?;
+        for resume_state in 0..count {
+            let source_state = usize::try_from(*projection.cached_state_ids().get(resume_state)?)
+                .ok()?;
+            let pending = projection.pending(resume_state)?;
+            if source_state >= state_count
+                || partial.resume_pending(resume_state) != Some(pending)
+            {
+                return None;
+            }
+            let canonical_state =
+                canonicalize_frozen_state_ordinal(source_state, source_initial_state);
+            let canonical_state = u32::try_from(canonical_state).ok()?;
+            if canonical_state & FROZEN_RETAINED_PARTIAL_RESUME_PENDING_MASK != 0 {
+                return None;
+            }
+            entries.push(
+                canonical_state
+                    | if pending {
+                        FROZEN_RETAINED_PARTIAL_RESUME_PENDING_MASK
+                    } else {
+                        0
+                    },
+            );
+        }
+        (entries.len() == count).then(|| FrozenRetainedPartialResumeMapV1 {
+            entries: entries.into_boxed_slice(),
+            cache_identity: projection.cache_identity(),
+            state_count: storage.descriptor.state_count,
+            format_version,
+        })
+    }
+
     /// Build an independently owned continuation table from the same
     /// authenticated complete K0 transaction used by the public root owner.
     ///
@@ -11272,8 +11455,11 @@ impl CompiledProgram {
     /// table, and a unary V5 root summary is republished as the underlying
     /// exact V4 rows rather than being misapplied to an arbitrary state. An
     /// optional V6/V7 loop index accelerates only independently proved
-    /// nonroot self-loops. A geometry or resource decline returns no side
-    /// owner and leaves the ordinary root-compatible owner unchanged.
+    /// nonroot self-loops. V11/V13/V14 may also copy an optional packed
+    /// retained-hole map when the combined row-plus-map extent fits
+    /// `max_packed_bytes`; a map-only decline preserves this side owner for
+    /// compact-v2. A row geometry or resource decline returns no side owner
+    /// and leaves the ordinary root-compatible owner unchanged.
     #[doc(hidden)]
     #[must_use]
     pub fn compiler_private_frozen_static_continuation_rows_storage_v3_with_fallback_receipt(
@@ -11292,8 +11478,21 @@ impl CompiledProgram {
                 true,
             )?;
         let format_version = storage.effective_format_version();
-        frozen_static_continuation_format_is_supported(format_version)
-            .then_some(FrozenStaticContinuationRowsStorageV1 { rows: storage })
+        if !frozen_static_continuation_format_is_supported(format_version) {
+            return None;
+        }
+        let retained_partial_resume = fully_prefilled_fallback.and_then(|receipt| {
+            self.compiler_private_frozen_retained_partial_resume_map_v1(
+                workspace,
+                &storage,
+                receipt,
+                max_packed_bytes,
+            )
+        });
+        Some(FrozenStaticContinuationRowsStorageV1 {
+            rows: storage,
+            retained_partial_resume,
+        })
     }
 
     /// Publish a closed side owner only for the authenticated local
@@ -13462,18 +13661,17 @@ impl CompiledProgram {
         // The continuation tail's reverse-only Span postflight owns only a
         // positive selected endpoint. Nullable variable spans and an exact
         // zero-width span therefore remain on compact-v2/K0.
+        let Some(partial) = self.partial_dfa() else {
+            return Ok(None);
+        };
         if !retained_partial_native_continuation_output_is_supported(
             self.output,
             self.exact_match_width,
-            self.partial_dfa()
-                .is_some_and(|partial| partial.initial_pending()),
+            partial.initial_pending(),
         ) {
             return Ok(None);
         }
-        let Some(pending) = self
-            .partial_dfa()
-            .and_then(|partial| partial.resume_pending(resume_state))
-        else {
+        let Some(pending) = partial.resume_pending(resume_state) else {
             return Ok(None);
         };
         // Zero is the ABI sentinel for no pending endpoint. A pending state
@@ -13486,61 +13684,26 @@ impl CompiledProgram {
             return Ok(None);
         }
 
-        let Some(nfa) = workspace.nfa.as_ref() else {
+        let Some(resume_map) = owner.retained_partial_resume.as_ref() else {
             return Ok(None);
         };
-        let Some(resume_set) = partial_workspace
-            .resume
-            .as_ref()
-            .filter(|resume| resume.is_bound_to(&self.automaton))
-        else {
-            return Ok(None);
-        };
-        let Some(mapping) = nfa.compiler_private_frozen_owner_resume_state_projection(
-            &self.automaton,
-            resume_set,
+        let Some(canonical_state) = resume_map.project(
+            rows,
+            partial.resume_frontier_count(),
             resume_state,
-            receipt.k0,
+            pending,
         ) else {
             return Ok(None);
         };
-        if mapping.cache_identity() != rows.descriptor.cache_identity
-            || mapping.row_stride() == 0
-            || mapping.pending() != pending
-        {
-            return Ok(None);
-        }
-        let source_initial_state = usize::try_from(mapping.source_initial_state()).map_err(|_| {
-            CompileError::InternalInvariant(
-                "retained frozen projection initial state does not fit usize",
-            )
-        })?;
-        let source_state = usize::try_from(mapping.source_state()).map_err(|_| {
-            CompileError::InternalInvariant("retained frozen projection state does not fit usize")
-        })?;
-        let state_count = usize::try_from(rows.descriptor.state_count).map_err(|_| {
-            CompileError::InternalInvariant(
-                "retained frozen projection state count does not fit usize",
-            )
-        })?;
-        if mapping.state_count() != state_count
-            || source_initial_state >= state_count
-            || source_state >= state_count
-        {
-            return Ok(None);
-        }
         Ok(Some(FrozenRetainedPartialResumeProjection {
             program_instance: self.identity.instance,
             workspace_address: std::ptr::from_ref(workspace).expose_provenance(),
             window,
             resume_state,
             resume_position,
-            canonical_state: canonicalize_frozen_state_ordinal(
-                source_state,
-                source_initial_state,
-            ),
+            canonical_state,
             pending_end,
-            cache_identity: mapping.cache_identity(),
+            cache_identity: resume_map.cache_identity,
             format_version,
             fully_prefilled: receipt,
         }))
@@ -13745,7 +13908,24 @@ impl CompiledProgram {
             return Ok(None);
         }
 
-        let canonical_state = {
+        let Some(partial) = self.partial_dfa() else {
+            return Ok(None);
+        };
+        let dense_projection = owner.retained_partial_resume.as_ref().and_then(|resume_map| {
+            resume_map.project(
+                rows,
+                partial.resume_frontier_count(),
+                resume_state,
+                pending_end.is_some(),
+            )
+        });
+        let canonical_state = if let Some(canonical_state) = dense_projection {
+            canonical_state
+        } else {
+            // The setup-owned dense map is an additive compact-v3
+            // accelerator. A missing, stale, or resource-declined map must
+            // preserve the established compact-v2 selected-state projection
+            // for every immutable row generation it already supports.
             let Some(nfa) = workspace.nfa.as_ref() else {
                 return Ok(None);
             };
@@ -20101,6 +20281,22 @@ mod tests {
         receipt: FullyPrefilledFallbackReceipt,
         format_version: u32,
     ) -> FrozenStaticContinuationRowsStorageV1 {
+        frozen_retained_owner_for_format_with_bound(
+            compiled,
+            workspace,
+            receipt,
+            format_version,
+            usize::MAX,
+        )
+    }
+
+    fn frozen_retained_owner_for_format_with_bound(
+        compiled: &CompiledProgram,
+        workspace: &ProgramWorkspace,
+        receipt: FullyPrefilledFallbackReceipt,
+        format_version: u32,
+        max_packed_bytes: usize,
+    ) -> FrozenStaticContinuationRowsStorageV1 {
         let full = workspace
             .nfa
             .as_ref()
@@ -20228,7 +20424,17 @@ mod tests {
         };
         assert!(rows.descriptor_is_valid_for(compiled.identity));
         assert!(rows.descriptor_v6_is_valid_for(compiled.identity));
-        FrozenStaticContinuationRowsStorageV1 { rows }
+        let retained_partial_resume = compiled
+            .compiler_private_frozen_retained_partial_resume_map_v1(
+                workspace,
+                &rows,
+                receipt,
+                max_packed_bytes,
+            );
+        FrozenStaticContinuationRowsStorageV1 {
+            rows,
+            retained_partial_resume,
+        }
     }
 
     fn frozen_test_source_cell(
@@ -30291,6 +30497,403 @@ mod tests {
             None,
             true,
         ));
+    }
+
+    #[test]
+    fn retained_partial_dense_map_matches_every_authenticated_resume_ordinal() {
+        const FORMATS: [u32; 3] = [
+            FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION,
+            FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION,
+            FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION,
+        ];
+        let mut haystack = vec![b'!'; 12];
+        haystack.extend(vec![b'b'; PARTIAL_DFA_MIN_INPUT_BYTES + 64]);
+        let window = SearchWindow::new(3, haystack.len());
+        let (compiled, _) = retained_handoff_fixture(
+            r"[ab]{1,20}",
+            OutputContract::SelectedEnd,
+            &haystack,
+            window,
+            true,
+        );
+        let partial = compiled.partial_dfa().expect("retained partial artifact");
+        let count = partial.resume_frontier_count();
+        assert_ne!(count, 0);
+
+        let mut workspace = compiled.prepare_workspace().unwrap();
+        let receipt = compiled
+            .compiler_private_try_prefill_retained_fallback_with_workspace_receipt(
+                &mut workspace,
+            )
+            .unwrap()
+            .expect("fully authenticated retained K0 map");
+        let resume_set = workspace
+            .partial
+            .as_deref()
+            .and_then(|partial| partial.resume.as_ref())
+            .expect("retained resume set");
+        let nfa = workspace.nfa.as_ref().expect("retained K0 workspace");
+        let complete = nfa
+            .compiler_private_fully_prefilled_resume_map_projection(
+                &compiled.automaton,
+                resume_set,
+                receipt.k0,
+            )
+            .expect("complete resume-map projection");
+        assert_eq!(complete.count(), count);
+        let source_initial_state = usize::try_from(complete.source_initial_state()).unwrap();
+
+        for format_version in FORMATS {
+            let owner = frozen_retained_owner_for_format(
+                &compiled,
+                &workspace,
+                receipt,
+                format_version,
+            );
+            let map = owner
+                .retained_partial_resume
+                .as_ref()
+                .unwrap_or_else(|| panic!("V{format_version} retained no dense resume map"));
+            assert_eq!(map.entries.len(), count, "V{format_version}");
+            assert_eq!(map.cache_identity, complete.cache_identity(), "V{format_version}");
+            assert_eq!(map.state_count, owner.rows.descriptor.state_count);
+            assert_eq!(map.format_version, format_version);
+
+            for resume_state in 0..count {
+                let selected = nfa
+                    .compiler_private_frozen_owner_resume_state_projection(
+                        &compiled.automaton,
+                        resume_set,
+                        resume_state,
+                        receipt.k0,
+                    )
+                    .unwrap_or_else(|| panic!("authenticated ordinal {resume_state}"));
+                let source_state = usize::try_from(selected.source_state()).unwrap();
+                let canonical_state =
+                    canonicalize_frozen_state_ordinal(source_state, source_initial_state);
+                let pending = partial.resume_pending(resume_state).unwrap();
+                assert_eq!(selected.pending(), pending, "ordinal {resume_state}");
+                assert_eq!(selected.source_initial_state(), complete.source_initial_state());
+                assert_eq!(selected.state_count(), complete.state_count());
+                assert_eq!(selected.row_stride(), complete.compact_row_stride());
+                assert_eq!(selected.cache_identity(), complete.cache_identity());
+                assert_eq!(
+                    map.project(
+                        &owner.rows,
+                        count,
+                        resume_state,
+                        pending,
+                    ),
+                    Some(canonical_state),
+                    "V{format_version}/ordinal {resume_state}",
+                );
+                let expected_entry = u32::try_from(canonical_state).unwrap()
+                    | if pending {
+                        FROZEN_RETAINED_PARTIAL_RESUME_PENDING_MASK
+                    } else {
+                        0
+                    };
+                assert_eq!(
+                    map.entries[resume_state],
+                    expected_entry,
+                    "V{format_version}/ordinal {resume_state}",
+                );
+            }
+            assert_eq!(
+                map.project(&owner.rows, count, count, false),
+                None,
+                "V{format_version} accepted an out-of-bounds ordinal",
+            );
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one armed transaction audits every immutable map mismatch and its exact resident bound"
+    )]
+    fn retained_partial_dense_map_is_bounded_and_declines_mismatch_without_transfer() {
+        let mut haystack = vec![b'!'; 12];
+        haystack.extend(vec![b'b'; PARTIAL_DFA_MIN_INPUT_BYTES + 64]);
+        let window = SearchWindow::new(3, haystack.len());
+        let (compiled, resume) = retained_handoff_fixture(
+            r"[ab]{1,20}",
+            OutputContract::SelectedEnd,
+            &haystack,
+            window,
+            true,
+        );
+        let pending_end = resume.pending_end.expect("pending retained resume");
+        let count = compiled
+            .partial_dfa()
+            .expect("retained partial artifact")
+            .resume_frontier_count();
+        let mut workspace = compiled.prepare_workspace().unwrap();
+        let receipt = compiled
+            .compiler_private_try_prefill_retained_fallback_with_workspace_receipt(
+                &mut workspace,
+            )
+            .unwrap()
+            .expect("fully authenticated retained K0 map");
+        let mut owner = frozen_retained_owner_for_format(
+            &compiled,
+            &workspace,
+            receipt,
+            FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION,
+        );
+        assert_eq!(
+            compiled
+                .preflight_retained_partial_native_root_with_workspace(
+                    &haystack,
+                    window,
+                    &mut workspace,
+                    compiled.artifact_identity(),
+                )
+                .unwrap(),
+            RetainedPartialPreflight::Enter(window),
+        );
+
+        macro_rules! assert_declines_root_armed {
+            ($reason:literal) => {{
+                assert_eq!(
+                    compiled
+                        .try_project_preflight_retained_partial_resume_ticket_with_frozen_static_continuation_rows_workspace(
+                            &haystack,
+                            &workspace,
+                            &owner,
+                            resume.state,
+                            resume.position,
+                            pending_end,
+                            receipt,
+                        )
+                        .unwrap(),
+                    None,
+                    $reason,
+                );
+                assert_eq!(
+                    workspace.partial.as_deref().unwrap().state.native_entry_phase,
+                    RetainedPartialNativePhase::RootArmed,
+                    $reason,
+                );
+                assert_eq!(
+                    workspace.partial.as_deref().unwrap().state.native_entry_window,
+                    Some(window),
+                    $reason,
+                );
+            }};
+        }
+
+        let saved_map = owner.retained_partial_resume.take();
+        assert_declines_root_armed!("missing dense map claimed the root ticket");
+        owner.retained_partial_resume = saved_map;
+
+        let original_cache_identity = owner
+            .retained_partial_resume
+            .as_ref()
+            .unwrap()
+            .cache_identity;
+        owner
+            .retained_partial_resume
+            .as_mut()
+            .unwrap()
+            .cache_identity ^= u64::MAX;
+        assert_declines_root_armed!("stale map cache identity claimed the root ticket");
+        owner
+            .retained_partial_resume
+            .as_mut()
+            .unwrap()
+            .cache_identity = original_cache_identity;
+
+        let original_state_count = owner
+            .retained_partial_resume
+            .as_ref()
+            .unwrap()
+            .state_count;
+        owner
+            .retained_partial_resume
+            .as_mut()
+            .unwrap()
+            .state_count = original_state_count.checked_add(1).unwrap();
+        assert_declines_root_armed!("mismatched map state count claimed the root ticket");
+        owner
+            .retained_partial_resume
+            .as_mut()
+            .unwrap()
+            .state_count = original_state_count;
+
+        owner
+            .retained_partial_resume
+            .as_mut()
+            .unwrap()
+            .format_version = FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION;
+        assert_declines_root_armed!("mismatched map format claimed the root ticket");
+        owner
+            .retained_partial_resume
+            .as_mut()
+            .unwrap()
+            .format_version = FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION;
+
+        let saved_entries = core::mem::take(
+            &mut owner
+                .retained_partial_resume
+                .as_mut()
+                .unwrap()
+                .entries,
+        );
+        assert_declines_root_armed!("truncated map claimed the root ticket");
+        owner
+            .retained_partial_resume
+            .as_mut()
+            .unwrap()
+            .entries = saved_entries;
+
+        let selected_entry = owner
+            .retained_partial_resume
+            .as_ref()
+            .unwrap()
+            .entries[resume.state];
+        owner
+            .retained_partial_resume
+            .as_mut()
+            .unwrap()
+            .entries[resume.state] = (selected_entry
+            & FROZEN_RETAINED_PARTIAL_RESUME_PENDING_MASK)
+            | original_state_count;
+        assert_declines_root_armed!("out-of-range canonical state claimed the root ticket");
+        owner
+            .retained_partial_resume
+            .as_mut()
+            .unwrap()
+            .entries[resume.state] = selected_entry ^ FROZEN_RETAINED_PARTIAL_RESUME_PENDING_MASK;
+        assert_declines_root_armed!("mismatched pending mode claimed the root ticket");
+        owner
+            .retained_partial_resume
+            .as_mut()
+            .unwrap()
+            .entries[resume.state] = selected_entry;
+
+        assert_eq!(
+            compiled
+                .try_project_preflight_retained_partial_resume_ticket_with_frozen_static_continuation_rows_workspace(
+                    &haystack,
+                    &workspace,
+                    &owner,
+                    count,
+                    resume.position,
+                    pending_end,
+                    receipt,
+                )
+                .unwrap(),
+            None,
+            "out-of-bounds map ordinal was accepted",
+        );
+        assert_eq!(
+            workspace.partial.as_deref().unwrap().state.native_entry_phase,
+            RetainedPartialNativePhase::RootArmed,
+        );
+
+        let map_bytes = count.checked_mul(core::mem::size_of::<u32>()).unwrap();
+        let owner_bytes = owner.rows.retained_partial_packed_bytes().unwrap();
+        let exact_bound = owner_bytes.checked_add(map_bytes).unwrap();
+        let exact_owner = frozen_retained_owner_for_format_with_bound(
+            &compiled,
+            &workspace,
+            receipt,
+            FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION,
+            exact_bound,
+        );
+        assert!(exact_owner.retained_partial_resume.is_some());
+        let one_byte_short_owner = frozen_retained_owner_for_format_with_bound(
+            &compiled,
+            &workspace,
+            receipt,
+            FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION,
+            exact_bound.checked_sub(1).unwrap(),
+        );
+        assert!(one_byte_short_owner.retained_partial_resume.is_none());
+        assert_eq!(one_byte_short_owner.rows.retained_partial_packed_bytes(), Some(owner_bytes));
+        assert_eq!(
+            compiled
+                .try_project_preflight_retained_partial_resume_ticket_with_frozen_static_continuation_rows_workspace(
+                    &haystack,
+                    &workspace,
+                    &one_byte_short_owner,
+                    resume.state,
+                    resume.position,
+                    pending_end,
+                    receipt,
+                )
+                .unwrap(),
+            None,
+            "a resource-declined map claimed the root ticket",
+        );
+        assert_eq!(
+            workspace.partial.as_deref().unwrap().state.native_entry_phase,
+            RetainedPartialNativePhase::RootArmed,
+        );
+
+        assert!(
+            compiled
+                .try_project_preflight_retained_partial_resume_ticket_with_frozen_static_continuation_rows_workspace(
+                    &haystack,
+                    &workspace,
+                    &owner,
+                    resume.state,
+                    resume.position,
+                    pending_end,
+                    receipt,
+                )
+                .unwrap()
+                .is_some(),
+            "restored dense map did not project",
+        );
+        assert_eq!(
+            workspace.partial.as_deref().unwrap().state.native_entry_phase,
+            RetainedPartialNativePhase::RootArmed,
+            "a successful read-only lookup transferred ownership",
+        );
+
+        // The map is required only by the generated compact-v3 projection.
+        // Its resource decline must leave the established compact-v2 frozen
+        // scan able to authenticate the selected K0 state directly.
+        let mut v2_workspace = compiled.prepare_workspace().unwrap();
+        let v2_receipt = compiled
+            .compiler_private_try_prefill_retained_fallback_with_workspace_receipt(
+                &mut v2_workspace,
+            )
+            .unwrap()
+            .expect("compact-v2 complete K0 generation");
+        let v2_full_owner = frozen_retained_owner_for_format(
+            &compiled,
+            &v2_workspace,
+            v2_receipt,
+            FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION,
+        );
+        let v2_owner_bytes = v2_full_owner.rows.retained_partial_packed_bytes().unwrap();
+        let v2_owner = frozen_retained_owner_for_format_with_bound(
+            &compiled,
+            &v2_workspace,
+            v2_receipt,
+            FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION,
+            v2_owner_bytes,
+        );
+        assert!(v2_owner.retained_partial_resume.is_none());
+        assert_eq!(
+            compiled
+                .try_search_from_consumed_retained_partial_resume_with_frozen_static_continuation_rows(
+                    &haystack,
+                    window,
+                    &mut v2_workspace,
+                    &v2_owner,
+                    resume.state,
+                    resume.position,
+                    resume.pending_end,
+                    v2_receipt,
+                )
+                .unwrap(),
+            Some(compiled.search(&haystack, window).unwrap()),
+            "a dense-map budget decline disabled the compact-v2 frozen scan",
+        );
     }
 
     #[test]
