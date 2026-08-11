@@ -6309,16 +6309,20 @@ impl K0FullyPrefilledResumeCacheReceipt {
 ///
 /// Construction revalidates the opaque prefill receipt and every retained
 /// resume entry, including its cache identity, state bounds, pending mode, and
-/// semantic frontier. Duplicate cached-state IDs remain valid because equal
-/// frontiers may intentionally share one interned state. The slices borrow
-/// the fixed resume-set allocation and remain stable only while neither the
-/// workspace nor resume set is mutably entered; compiler-private exclusive
-/// runtimes must treat such an entry as revoking their external seal.
+/// semantic frontier. It also authenticates the source state count and exact
+/// initial-state ordinal needed to canonicalize a separately owned frozen
+/// table. Duplicate cached-state IDs remain valid because equal frontiers may
+/// intentionally share one interned state. The slices borrow the fixed
+/// resume-set allocation and remain stable only while neither the workspace
+/// nor resume set is mutably entered; compiler-private exclusive runtimes must
+/// treat such an entry as revoking their external seal.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug)]
 pub struct K0FullyPrefilledResumeMapProjection<'a> {
     cached_state_ids: &'a [u32],
     pending_modes: &'a [u8],
+    source_initial_state: u32,
+    state_count: usize,
     compact_row_stride: u32,
     raw_byte_row_base: Option<u32>,
     cache_identity: u64,
@@ -6400,6 +6404,20 @@ impl K0FullyPrefilledResumeMapProjection<'_> {
     #[must_use]
     pub const fn count(&self) -> usize {
         self.cached_state_ids.len()
+    }
+
+    /// Source K0 state that the frozen owner canonicalizes to ordinal zero.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn source_initial_state(&self) -> u32 {
+        self.source_initial_state
+    }
+
+    /// Number of authenticated source K0 states in this complete generation.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn state_count(&self) -> usize {
+        self.state_count
     }
 
     #[doc(hidden)]
@@ -8592,9 +8610,29 @@ impl K0Workspace {
             }
         }
 
+        // Authenticate the source initial ordinal only after every parallel
+        // resume-map entry has passed its existing identity, bounds, mode, and
+        // semantic-frontier checks. Frozen compact owners swap this ordinal
+        // with zero once at setup, so callers need the exact state count and
+        // initial state from the same sealed K0 generation.
+        let source_initial_state = self.lazy.initial;
+        let source_initial_index = usize::try_from(source_initial_state).ok()?;
+        if source_initial_state == LAZY_NO_STATE
+            || source_initial_index >= receipt.forward_state_len
+        {
+            return None;
+        }
+        let source_initial_row =
+            usize::try_from(self.lazy.row_offset(source_initial_state).ok()?).ok()?;
+        if source_initial_row.checked_add(stride)? > receipt.forward_cells {
+            return None;
+        }
+
         Some(K0FullyPrefilledResumeMapProjection {
             cached_state_ids: &resume_set.cached_states,
             pending_modes: &resume_set.modes,
+            source_initial_state,
+            state_count: receipt.forward_state_len,
             compact_row_stride: receipt.direct_row_stride,
             raw_byte_row_base,
             cache_identity: receipt.cache_identity,
@@ -53492,6 +53530,87 @@ mod tests {
         assert_eq!(projection.count(), 1);
         assert_eq!(projection.pending(0), Some(false));
         assert!(projection.compact_row(0).is_some());
+        assert_eq!(projection.source_initial_state(), workspace.lazy.initial);
+        assert_eq!(projection.state_count(), workspace.lazy.state_len);
+    }
+
+    #[test]
+    fn fully_prefilled_resume_map_authenticates_source_state_geometry() {
+        let plan = direct_split_loop_then_terminal();
+        let frontier = [0_u32];
+        let mut resume = K0ResumeSet::new(&plan, 1, 1, [(&frontier[..], false)]).unwrap();
+        let mut workspace =
+            K0Workspace::new_accelerated(&plan, WorkspaceLimits::unlimited()).unwrap();
+        let receipt = workspace
+            .compiler_private_try_prefill_resume_caches_with_receipt(&plan, &mut resume)
+            .expect("the complete graph must publish source geometry");
+
+        {
+            let projection = workspace
+                .compiler_private_fully_prefilled_resume_map_projection(
+                    &plan, &resume, receipt,
+                )
+                .expect("the sealed map must authenticate its source geometry");
+            assert_eq!(projection.source_initial_state(), workspace.lazy.initial);
+            assert_eq!(projection.state_count(), receipt.forward_state_len);
+            assert_eq!(projection.state_count(), workspace.lazy.state_len);
+            assert!(
+                usize::try_from(projection.source_initial_state()).unwrap()
+                    < projection.state_count()
+            );
+            assert_eq!(
+                workspace
+                    .lazy
+                    .row_offset(projection.source_initial_state())
+                    .unwrap(),
+                projection
+                    .source_initial_state()
+                    .checked_mul(projection.compact_row_stride())
+                    .unwrap()
+            );
+        }
+
+        let mut stale_receipt = receipt;
+        stale_receipt.cache_identity ^= u64::MAX;
+        assert!(
+            workspace
+                .compiler_private_fully_prefilled_resume_map_projection(
+                    &plan,
+                    &resume,
+                    stale_receipt,
+                )
+                .is_none(),
+            "a stale cache generation must not expose source geometry"
+        );
+
+        let saved_initial = workspace.lazy.initial;
+        workspace.lazy.initial = super::LAZY_NO_STATE;
+        assert!(
+            workspace
+                .compiler_private_fully_prefilled_resume_map_projection(
+                    &plan, &resume, receipt,
+                )
+                .is_none(),
+            "a missing source initial state must fail closed"
+        );
+        workspace.lazy.initial = u32::try_from(receipt.forward_state_len).unwrap();
+        assert!(
+            workspace
+                .compiler_private_fully_prefilled_resume_map_projection(
+                    &plan, &resume, receipt,
+                )
+                .is_none(),
+            "an out-of-range source initial state must fail closed"
+        );
+        workspace.lazy.initial = saved_initial;
+        assert!(
+            workspace
+                .compiler_private_fully_prefilled_resume_map_projection(
+                    &plan, &resume, receipt,
+                )
+                .is_some(),
+            "restoring the authenticated source initial state must restore projection"
+        );
     }
 
     #[test]
@@ -53532,6 +53651,8 @@ mod tests {
             assert_eq!(projection.cached_state_ids().as_ptr(), resume.cached_states.as_ptr());
             assert_eq!(projection.pending_modes().as_ptr(), resume.modes.as_ptr());
             assert_eq!(projection.pending_modes(), &[0, 1, 0, 0]);
+            assert_eq!(projection.source_initial_state(), workspace.lazy.initial);
+            assert_eq!(projection.state_count(), receipt.forward_state_len);
             assert_eq!(projection.compact_row_stride(), receipt.direct_row_stride);
             assert_eq!(projection.raw_byte_row_base(), None);
             assert_eq!(projection.cache_identity(), receipt.cache_identity);
