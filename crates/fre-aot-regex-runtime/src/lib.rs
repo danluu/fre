@@ -11563,10 +11563,10 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
     #[test]
     fn retained_span_postflight_consumes_compact_v3_continuation_ownership() {
         let mut limits = CompileLimitsV1::default();
-        limits.determinize.max_states = 10;
+        limits.determinize.max_states = 8;
         let compiled = compile(
             CompileRequest::new(
-                r"(?:a+Q|[b-c][a-b]{1,10}(?:z[a-b]+|z))",
+                r"a+Q|[b-c][a-b]{1,5}(?:x+|y+)",
                 Target::x86_64_linux(),
             )
             .mode(CompileMode::Optimizing)
@@ -11578,13 +11578,13 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
         let identity = compiled.receipt().program_sha256;
         let serialized = compiled.program().serialize().unwrap();
         let handle = prepare_exclusive(&serialized);
-        let mut haystack = b"cbza".to_vec();
+        let mut haystack = b"xxcbbbbyyy".to_vec();
         haystack.resize(320, b'!');
         let expected = compiled.search(&haystack, SearchWindow::full(&haystack)).unwrap();
         let MatchResult::Span(Some((expected_start, selected_end))) = expected else {
             panic!("Span fixture did not match: {expected:?}");
         };
-        assert_eq!(selected_end, 4);
+        assert_eq!(selected_end, 10);
         let sentinel = FreAotRegexResultV1 { start: 71, end: 73 };
         let mut result = sentinel;
         let mut admitted = FreAotRegexSearchWindowV1 { start: 79, end: 83 };
@@ -11608,9 +11608,9 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
                 handle,
                 &haystack,
                 &mut result,
-                2,
-                3,
-                3,
+                0,
+                5,
+                0,
             ),
             STATUS_STATIC_PREFIX_NATIVE_CONTINUATION_RESUME
         );
