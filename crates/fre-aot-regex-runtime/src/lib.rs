@@ -41,11 +41,15 @@
 //! [`fre_aot_regex_runtime_search_exclusive_partial_native_root_preflight_v1`];
 //! that authenticated call admits first and runs the portable proofs only on
 //! a decline. If a native scan then reaches a partial-DFA hole, the current
-//! compiler continues the same exclusive session through
-//! [`fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v2`].
-//! Its single-use preflight ticket replaces repeated program and window
-//! authentication and supplies pending mode from the compact canonical
-//! resume-state index before K0 continues without replaying the prefix. The
+//! compiler first continues the same exclusive session through
+//! [`fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v3`].
+//! That entry projects every eligible retained hole into the sealed immutable
+//! continuation owner and returns compiler-private status 8; a general
+//! projection decline consumes through the unchanged
+//! [`fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v2`]
+//! path. Their single-use preflight ticket replaces repeated program and
+//! window authentication and supplies pending mode from the compact canonical
+//! resume-state index without replaying the retained prefix. The
 //! fully authenticating
 //! [`fre_aot_regex_runtime_search_exclusive_from_partial_v1`] remains available
 //! for older generated objects.
@@ -981,6 +985,82 @@ impl PreparedAotRegex {
                 pending_end,
             )
         }
+    }
+
+    /// Try the compact-v3 retained-hole handoff without consuming the root
+    /// ticket on decline. A successful result has already published the exact
+    /// immutable continuation header and transferred linear ownership to it.
+    fn project_preflight_retained_partial_resume_ticket_to_native_continuation(
+        &mut self,
+        haystack: &[u8],
+        resume_state: usize,
+        resume_position: usize,
+        pending_end: usize,
+    ) -> Result<Option<(usize, usize)>, CompileError> {
+        let Some(receipt) = self.fully_prefilled_fallback else {
+            return Ok(None);
+        };
+        let Some(owner) = self.frozen_static_continuation_rows.as_ref() else {
+            return Ok(None);
+        };
+        let Some(projection) = self
+            .program
+            .try_project_preflight_retained_partial_resume_ticket_with_frozen_static_continuation_rows_workspace(
+                haystack,
+                &self.workspace,
+                owner,
+                resume_state,
+                resume_position,
+                pending_end,
+                receipt,
+            )?
+        else {
+            return Ok(None);
+        };
+        let Some(header) = self
+            .program
+            .compiler_private_frozen_static_continuation_prepared_header_v6(
+                &self.workspace,
+                owner,
+            )
+        else {
+            return Ok(None);
+        };
+        if !header.is_active()
+            || header.compiler_private_dynamic_rows_format_version()
+                != Some(projection.format_version())
+        {
+            return Ok(None);
+        }
+
+        // This is the final fallible operation. Once ownership leaves the
+        // root there is no decline or portable re-entry before the exact
+        // second-header generation is synchronously published.
+        self.program
+            .transfer_preflight_retained_partial_projection_with_workspace(
+                &mut self.workspace,
+                owner,
+                projection,
+            )?;
+        // The retained preflight revoked both stable headers. Retire any
+        // unrelated static-prefix capability and keep offset zero inactive;
+        // only the exact second-header generation is republished below.
+        let _ = self.static_prefix_object_ticket.take();
+        let _ = self.static_prefix_span_postflight_ticket.take();
+        if self.frozen_header.is_active() {
+            self.frozen_header.deactivate();
+        }
+        self.static_continuation_header = header;
+        #[cfg(test)]
+        {
+            self.retained_partial_frozen_owner_handoffs = self
+                .retained_partial_frozen_owner_handoffs
+                .saturating_add(1);
+        }
+        Ok(Some((
+            projection.canonical_state(),
+            projection.pending_end_word(),
+        )))
     }
 
     fn prepared_partial_should_enter(
@@ -3947,6 +4027,81 @@ pub unsafe extern "C" fn fre_aot_regex_runtime_search_exclusive_from_partial_pre
     .unwrap_or(STATUS_RUNTIME_FAILURE)
 }
 
+/// Project a combined-preflight retained hole into the prepared immutable
+/// continuation table, or consume it through compact-v2 on a projection
+/// decline.
+///
+/// Unlike compact-v2, status 8 is a successful ownership transfer rather than
+/// a semantic search result. In that case `result_ptr.start` is the canonical
+/// immutable-table state and `result_ptr.end` is its pending endpoint word;
+/// the compiler-emitted wrapper must immediately enter its local continuation
+/// tail. The Program ticket remains live under continuation ownership until
+/// that tail returns locally, deoptimizes once, or performs one variable-Span
+/// recovery. A decline never changes ownership before invoking compact-v2.
+///
+/// This symbol is intentionally compiler-private. New objects that use status
+/// 8 therefore fail to link against an older runtime, while old compact-v2
+/// objects retain their exact ABI and behavior.
+///
+/// # Safety
+///
+/// Requirements are identical to
+/// [`fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v2`].
+#[doc(hidden)]
+#[unsafe(no_mangle)]
+#[allow(
+    unsafe_code,
+    clippy::too_many_arguments,
+    reason = "the compact-v3 compiler-private continuation maps one native payload"
+)]
+pub unsafe extern "C" fn fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v3(
+    handle: FreAotRegexExclusiveHandleV1,
+    haystack_ptr: *const u8,
+    haystack_len: usize,
+    result_ptr: *mut FreAotRegexResultV1,
+    resume_state: usize,
+    resume_position: usize,
+    pending_end: usize,
+) -> u32 {
+    // SAFETY: the compiler-owned ticket proves that the immediately preceding
+    // preflight authenticated these live allocations for exclusive use.
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        let prepared = &mut *handle.0.cast::<PreparedAotRegex>();
+        let haystack = std::slice::from_raw_parts(haystack_ptr, haystack_len);
+        match prepared.project_preflight_retained_partial_resume_ticket_to_native_continuation(
+            haystack,
+            resume_state,
+            resume_position,
+            pending_end,
+        ) {
+            Ok(Some((canonical_state, pending_end))) => {
+                result_ptr.write(FreAotRegexResultV1 {
+                    start: canonical_state,
+                    end: pending_end,
+                });
+                STATUS_STATIC_PREFIX_NATIVE_CONTINUATION_RESUME
+            }
+            Ok(None) => {
+                let Ok(found) = prepared
+                    .search_from_preflight_retained_partial_resume_ticket_inferred(
+                        haystack,
+                        resume_state,
+                        resume_position,
+                        pending_end,
+                    )
+                else {
+                    return STATUS_RUNTIME_FAILURE;
+                };
+                let (status, result) = encode_match_result(found);
+                result_ptr.write(result);
+                status
+            }
+            Err(_) => STATUS_RUNTIME_FAILURE,
+        }
+    }))
+    .unwrap_or(STATUS_RUNTIME_FAILURE)
+}
+
 /// Recover a Span start after an authenticated native retained-row completion
 /// selected only its endpoint.
 ///
@@ -6019,6 +6174,29 @@ mod tests {
         }
     }
 
+    fn call_exclusive_from_partial_preflight_compact_v3(
+        handle: FreAotRegexExclusiveHandleV1,
+        haystack: &[u8],
+        result: &mut FreAotRegexResultV1,
+        resume_state: usize,
+        resume_position: usize,
+        pending_end: usize,
+    ) -> u32 {
+        // SAFETY: each test owns the exact native-root transaction and keeps
+        // all readable/disjoint writable extents live through the call.
+        unsafe {
+            fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v3(
+                handle,
+                haystack.as_ptr(),
+                haystack.len(),
+                result,
+                resume_state,
+                resume_position,
+                pending_end,
+            )
+        }
+    }
+
     fn expected_ffi(result: MatchResult) -> (u32, FreAotRegexResultV1) {
         match result {
             MatchResult::Exists(false)
@@ -6166,6 +6344,7 @@ mod tests {
             "fre_aot_regex_runtime_search_exclusive_from_partial_preflight_v1",
             "fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v1",
             "fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v2",
+            "fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v3",
             "fre_aot_regex_runtime_search_exclusive_dynamic_rows_preflight_v1",
             "fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v1",
             "fre_aot_regex_runtime_compiler_private_search_exclusive_dynamic_rows_preflight_v2",
@@ -6463,6 +6642,15 @@ mod tests {
             usize,
             usize,
         ) -> u32 = fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v2;
+        let _: unsafe extern "C" fn(
+            FreAotRegexExclusiveHandleV1,
+            *const u8,
+            usize,
+            *mut FreAotRegexResultV1,
+            usize,
+            usize,
+            usize,
+        ) -> u32 = fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v3;
         // SAFETY: the malformed discriminator is rejected before dereference.
         assert_eq!(
             unsafe {
@@ -11162,6 +11350,313 @@ uint32_t fre_aot_regex_runtime_search_exclusive_frozen_fallback_v1(
             expected
         );
         assert_eq!(legacy_k0.retained_partial_frozen_owner_handoffs, 0);
+    }
+
+    #[test]
+    fn compact_v3_publishes_one_status8_continuation_and_declines_to_v2_once() {
+        let pattern = r"a+Q|[b-c][a-b]{1,5}(?:x+|y+)";
+        let mut limits = CompileLimitsV1::default();
+        limits.determinize.max_states = 8;
+        let compiled = compile(
+            CompileRequest::new(pattern, Target::x86_64_linux())
+                .mode(CompileMode::Optimizing)
+                .limits(limits)
+                .output(OutputContract::Exists),
+        )
+        .expect("compile retained compact-v3 fixture");
+        let identity = compiled.receipt().program_sha256;
+        let serialized = compiled.program().serialize().unwrap();
+        let handle = prepare_exclusive(&serialized);
+        let mut haystack = b"xxcbbbbyyy".to_vec();
+        haystack.resize(320, b'!');
+        let sentinel = FreAotRegexResultV1 {
+            start: 0xfeed_face,
+            end: 0xdead_beef,
+        };
+        let mut result = sentinel;
+        let mut admitted = FreAotRegexSearchWindowV1 {
+            start: usize::MAX,
+            end: usize::MAX,
+        };
+        assert_eq!(
+            call_exclusive_partial_native_root_preflight(
+                handle,
+                &haystack,
+                0,
+                haystack.len(),
+                &mut result,
+                &identity,
+                &mut admitted,
+            ),
+            STATUS_PARTIAL_PREFLIGHT_ENTER
+        );
+        assert_eq!(result, sentinel);
+        assert_eq!(
+            admitted,
+            FreAotRegexSearchWindowV1 {
+                start: 0,
+                end: haystack.len(),
+            }
+        );
+
+        // SAFETY: this test exclusively owns the live allocation. Projection
+        // is read-only and supplies the exact expected ABI payload.
+        let (expected_state, expected_pending, expected_format) = unsafe {
+            let prepared = &mut *handle.0.cast::<PreparedAotRegex>();
+            assert!(!prepared.static_continuation_header.is_active());
+            let receipt = prepared.fully_prefilled_fallback.unwrap();
+            let owner = prepared
+                .frozen_static_continuation_rows
+                .as_ref()
+                .expect("batched continuation owner");
+            let projection = prepared
+                .program
+                .try_project_preflight_retained_partial_resume_ticket_with_frozen_static_continuation_rows_workspace(
+                    &haystack,
+                    &prepared.workspace,
+                    owner,
+                    0,
+                    5,
+                    0,
+                    receipt,
+                )
+                .unwrap()
+                .expect("compact-v3 projection");
+            (
+                projection.canonical_state(),
+                projection.pending_end_word(),
+                projection.format_version(),
+            )
+        };
+        assert!(matches!(
+            expected_format,
+            FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION
+                | FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION
+                | FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION
+        ));
+        assert_eq!(
+            call_exclusive_from_partial_preflight_compact_v3(
+                handle,
+                &haystack,
+                &mut result,
+                0,
+                5,
+                0,
+            ),
+            STATUS_STATIC_PREFIX_NATIVE_CONTINUATION_RESUME
+        );
+        assert_eq!(
+            result,
+            FreAotRegexResultV1 {
+                start: expected_state,
+                end: expected_pending,
+            }
+        );
+        // SAFETY: the allocation remains exclusively owned between calls.
+        unsafe {
+            let prepared = &mut *handle.0.cast::<PreparedAotRegex>();
+            assert!(!prepared.frozen_header.is_active());
+            assert!(prepared.static_continuation_header.is_active());
+            assert_eq!(
+                prepared
+                    .static_continuation_header
+                    .compiler_private_dynamic_rows_format_version(),
+                Some(expected_format)
+            );
+            assert_eq!(
+                (&raw const prepared.static_continuation_header)
+                    .cast::<u8>()
+                    .addr()
+                    - (&raw const *prepared).cast::<u8>().addr(),
+                FROZEN_PREPARED_HEADER_V6_BYTES,
+            );
+        }
+
+        result = sentinel;
+        assert_eq!(
+            call_exclusive_from_partial_preflight_compact_v3(
+                handle,
+                &haystack,
+                &mut result,
+                0,
+                5,
+                0,
+            ),
+            STATUS_RUNTIME_FAILURE,
+            "compact-v3 cannot replay continuation ownership"
+        );
+        assert_eq!(result, sentinel);
+        // SAFETY: compact-v2 is deliberately invoked out of phase; it must
+        // reject without consuming the continuation-owned transaction.
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v2(
+                    handle,
+                    haystack.as_ptr(),
+                    haystack.len(),
+                    &raw mut result,
+                    0,
+                    5,
+                    0,
+                )
+            },
+            STATUS_RUNTIME_FAILURE
+        );
+        assert_eq!(result, sentinel);
+
+        // A following preflight is authoritative evidence that the immutable
+        // continuation returned locally, settles it, and arms a fresh root.
+        assert_eq!(
+            call_exclusive_partial_native_root_preflight(
+                handle,
+                &haystack,
+                0,
+                haystack.len(),
+                &mut result,
+                &identity,
+                &mut admitted,
+            ),
+            STATUS_PARTIAL_PREFLIGHT_ENTER
+        );
+        assert_eq!(result, sentinel);
+        assert_eq!(admitted.end, haystack.len());
+
+        // Less than one complete supertransition remains. Projection declines
+        // read-only and compact-v2 completes and consumes this root once.
+        result = sentinel;
+        let decline_position = haystack.len() - 1;
+        let declined_status = call_exclusive_from_partial_preflight_compact_v3(
+            handle,
+            &haystack,
+            &mut result,
+            0,
+            decline_position,
+            0,
+        );
+        assert!(matches!(declined_status, STATUS_NO_MATCH | STATUS_MATCH));
+        assert_ne!(result, sentinel);
+        result = sentinel;
+        assert_eq!(
+            unsafe {
+                fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v2(
+                    handle,
+                    haystack.as_ptr(),
+                    haystack.len(),
+                    &raw mut result,
+                    0,
+                    decline_position,
+                    0,
+                )
+            },
+            STATUS_RUNTIME_FAILURE,
+            "compact-v3 decline must consume through compact-v2 exactly once"
+        );
+        assert_eq!(result, sentinel);
+
+        // SAFETY: unique live handle, no overlapping call.
+        assert_eq!(
+            unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(handle) },
+            STATUS_SUCCESS
+        );
+    }
+
+    #[test]
+    fn retained_span_postflight_consumes_compact_v3_continuation_ownership() {
+        let mut limits = CompileLimitsV1::default();
+        limits.determinize.max_states = 10;
+        let compiled = compile(
+            CompileRequest::new(
+                r"(?:a+Q|[b-c][a-b]{1,10}(?:z[a-b]+|z))",
+                Target::x86_64_linux(),
+            )
+            .mode(CompileMode::Optimizing)
+            .limits(limits)
+            .output(OutputContract::Span),
+        )
+        .expect("compile retained compact-v3 Span fixture");
+        assert_eq!(compiled.program().exact_match_width(), None);
+        let identity = compiled.receipt().program_sha256;
+        let serialized = compiled.program().serialize().unwrap();
+        let handle = prepare_exclusive(&serialized);
+        let mut haystack = b"cbza".to_vec();
+        haystack.resize(320, b'!');
+        let expected = compiled.search(&haystack, SearchWindow::full(&haystack)).unwrap();
+        let MatchResult::Span(Some((expected_start, selected_end))) = expected else {
+            panic!("Span fixture did not match: {expected:?}");
+        };
+        assert_eq!(selected_end, 4);
+        let sentinel = FreAotRegexResultV1 { start: 71, end: 73 };
+        let mut result = sentinel;
+        let mut admitted = FreAotRegexSearchWindowV1 { start: 79, end: 83 };
+        assert_eq!(
+            call_exclusive_partial_native_root_preflight(
+                handle,
+                &haystack,
+                0,
+                haystack.len(),
+                &mut result,
+                &identity,
+                &mut admitted,
+            ),
+            STATUS_PARTIAL_PREFLIGHT_ENTER
+        );
+        assert_eq!(result, sentinel);
+        assert_eq!(admitted.start, 0);
+        assert_eq!(admitted.end, haystack.len());
+        assert_eq!(
+            call_exclusive_from_partial_preflight_compact_v3(
+                handle,
+                &haystack,
+                &mut result,
+                2,
+                3,
+                3,
+            ),
+            STATUS_STATIC_PREFIX_NATIVE_CONTINUATION_RESUME
+        );
+        // The status-8 payload is not a semantic Span; the generated tail
+        // would now select `selected_end` before invoking this postflight.
+        result = sentinel;
+        assert_eq!(
+            call_exclusive_recover_partial_span(
+                handle,
+                &haystack,
+                admitted.start,
+                admitted.end,
+                &mut result,
+                &identity,
+                selected_end,
+            ),
+            STATUS_MATCH
+        );
+        assert_eq!(
+            result,
+            FreAotRegexResultV1 {
+                start: expected_start,
+                end: selected_end,
+            }
+        );
+        result = sentinel;
+        assert_eq!(
+            call_exclusive_recover_partial_span(
+                handle,
+                &haystack,
+                admitted.start,
+                admitted.end,
+                &mut result,
+                &identity,
+                selected_end,
+            ),
+            STATUS_RUNTIME_FAILURE,
+            "continuation-owned Span recovery is one shot"
+        );
+        assert_eq!(result, sentinel);
+
+        // SAFETY: unique live handle, no overlapping call.
+        assert_eq!(
+            unsafe { fre_aot_regex_runtime_destroy_exclusive_v1(handle) },
+            STATUS_SUCCESS
+        );
     }
 
     #[test]

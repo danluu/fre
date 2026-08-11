@@ -356,6 +356,55 @@ pub enum RetainedPartialPreflight {
     Enter(SearchWindow),
 }
 
+/// Read-only projection of one retained native hole into the independently
+/// owned immutable continuation table.
+///
+/// Constructing this value neither consumes nor settles the admitted native
+/// transaction. The runtime must first publish the matching prepared header,
+/// then transfer the same one-shot transaction from the retained root to the
+/// immutable continuation owner through the checked method below.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FrozenRetainedPartialResumeProjection {
+    program_instance: u64,
+    workspace_address: usize,
+    window: SearchWindow,
+    resume_state: usize,
+    resume_position: usize,
+    canonical_state: usize,
+    pending_end: Option<usize>,
+    cache_identity: u64,
+    format_version: u32,
+    fully_prefilled: FullyPrefilledFallbackReceipt,
+}
+
+impl FrozenRetainedPartialResumeProjection {
+    /// Canonical immutable-table state selected by the retained hole ordinal.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn canonical_state(&self) -> usize {
+        self.canonical_state
+    }
+
+    /// Pending endpoint word for the native continuation ABI. Zero means the
+    /// authenticated state has no pending endpoint.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn pending_end_word(&self) -> usize {
+        match self.pending_end {
+            Some(end) => end,
+            None => 0,
+        }
+    }
+
+    /// Immutable row generation authenticated by this projection.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn format_version(&self) -> u32 {
+        self.format_version
+    }
+}
+
 /// Fixed-layout read-only view of one prepared K0 warmed-root cache.
 ///
 /// Addresses are represented as exposed-provenance `usize` values rather than
@@ -3113,6 +3162,24 @@ const fn frozen_retained_partial_handoff_block_bytes(format_version: u32) -> Opt
         }
         FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION => Some(4),
         _ => None,
+    }
+}
+
+/// Whether a retained immutable tail can complete this output without
+/// synthesizing authority absent from the native continuation ABI.
+#[inline]
+const fn retained_partial_native_continuation_output_is_supported(
+    output: OutputContract,
+    exact_match_width: Option<usize>,
+    initial_pending: bool,
+) -> bool {
+    match output {
+        OutputContract::Exists | OutputContract::SelectedEnd => true,
+        OutputContract::Span => match exact_match_width {
+            Some(0) => false,
+            Some(_) => true,
+            None => !initial_pending,
+        },
     }
 }
 
@@ -7363,12 +7430,21 @@ impl DynamicNativeRowsState {
 /// consulted, so an exact retained forward completion followed by reverse-only
 /// start recovery is itself a successful retained execution and resets the
 /// guard.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum RetainedPartialNativePhase {
+    #[default]
+    Retired,
+    RootArmed,
+    ContinuationOwned,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct PartialDfaRuntimeState {
     consecutive_fallbacks: u8,
     bypass_remaining: u16,
     native_entry_in_flight: bool,
     native_entry_window: Option<SearchWindow>,
+    native_entry_phase: RetainedPartialNativePhase,
     prefix_plan: Option<PartialDfaPrefixPlan>,
     prefix_supported: bool,
     #[cfg(test)]
@@ -7422,6 +7498,11 @@ impl PartialDfaRuntimeState {
         let enter = self.prefix_supported && self.bypass_remaining == 0;
         debug_assert!(self.native_entry_window.is_none());
         self.native_entry_in_flight = enter;
+        self.native_entry_phase = if enter {
+            RetainedPartialNativePhase::RootArmed
+        } else {
+            RetainedPartialNativePhase::Retired
+        };
         enter
     }
 
@@ -7437,12 +7518,17 @@ impl PartialDfaRuntimeState {
         authenticated_window: SearchWindow,
     ) -> bool {
         debug_assert!(!self.native_entry_in_flight);
+        debug_assert_eq!(
+            self.native_entry_phase,
+            RetainedPartialNativePhase::Retired
+        );
         debug_assert!(self.native_entry_window.is_none());
         if !self.prefix_supported {
             false
         } else if self.bypass_remaining == 0 {
             self.native_entry_in_flight = true;
             self.native_entry_window = Some(authenticated_window);
+            self.native_entry_phase = RetainedPartialNativePhase::RootArmed;
             true
         } else {
             self.bypass_remaining = self.bypass_remaining.saturating_sub(1);
@@ -7455,11 +7541,34 @@ impl PartialDfaRuntimeState {
     /// scan necessarily completed locally and is settled as a successful
     /// retained execution at that point.
     fn finish_unobserved_native_entry(&mut self) {
-        if self.native_entry_in_flight {
+        if self.native_entry_phase != RetainedPartialNativePhase::Retired {
+            debug_assert!(self.native_entry_in_flight);
             self.observe_complete();
         } else {
+            debug_assert!(!self.native_entry_in_flight);
             debug_assert!(self.native_entry_window.is_none());
         }
+    }
+
+    /// Inspect the combined-preflight ticket while the retained root still
+    /// owns it. This is deliberately read-only: a compact-v3 projection may
+    /// decline and then invoke the established consuming compact-v2 path.
+    fn peek_root_native_entry_window(&self) -> Option<SearchWindow> {
+        (self.native_entry_in_flight
+            && self.native_entry_phase == RetainedPartialNativePhase::RootArmed)
+            .then_some(self.native_entry_window)
+            .flatten()
+    }
+
+    /// Transfer one authenticated retained root transaction to its immutable
+    /// native continuation. The exact window remains live for a terminal
+    /// local return, continuation deopt, or variable-Span postflight.
+    fn transfer_native_entry_to_continuation(&mut self, window: SearchWindow) -> bool {
+        if self.peek_root_native_entry_window() != Some(window) {
+            return false;
+        }
+        self.native_entry_phase = RetainedPartialNativePhase::ContinuationOwned;
+        true
     }
 
     /// Consume an entry admitted by the combined preflight and authenticate
@@ -7471,10 +7580,20 @@ impl PartialDfaRuntimeState {
         authenticated
     }
 
-    /// Take the exact admitted window when the compiler-private continuation
-    /// ABI does not redundantly pass it back. Any attempt consumes the native
-    /// transaction, including a legacy entry that did not retain a window.
-    fn take_native_entry_window(&mut self) -> Option<SearchWindow> {
+    /// Consume only a retained-root transaction. Once compact-v3 transfers
+    /// ownership, an unsafe compact-v2 replay must fail without retiring the
+    /// continuation tail's live capability.
+    fn consume_root_native_entry_window(&mut self, window: SearchWindow) -> bool {
+        self.take_root_native_entry_window() == Some(window)
+    }
+
+    /// Take an admitted window only while the original retained table owns
+    /// it. A malformed root callback consumes a root ticket, while a callback
+    /// arriving after compact-v3 transfer cannot steal continuation authority.
+    fn take_root_native_entry_window(&mut self) -> Option<SearchWindow> {
+        if self.native_entry_phase != RetainedPartialNativePhase::RootArmed {
+            return None;
+        }
         let authenticated = self
             .native_entry_in_flight
             .then_some(self.native_entry_window)
@@ -7483,8 +7602,21 @@ impl PartialDfaRuntimeState {
         authenticated
     }
 
+    /// Take the exact admitted window when the compiler-private continuation
+    /// ABI does not redundantly pass it back. Any attempt consumes the native
+    /// transaction, including a legacy entry that did not retain a window.
+    fn take_native_entry_window(&mut self) -> Option<SearchWindow> {
+        let authenticated = (self.native_entry_in_flight
+            && self.native_entry_phase != RetainedPartialNativePhase::Retired)
+            .then_some(self.native_entry_window)
+            .flatten();
+        self.clear_native_entry();
+        authenticated
+    }
+
     fn clear_native_entry(&mut self) {
         self.native_entry_in_flight = false;
+        self.native_entry_phase = RetainedPartialNativePhase::Retired;
         if self.native_entry_window.is_some() {
             self.native_entry_window = None;
         }
@@ -8296,6 +8428,13 @@ pub(crate) struct NativePartialProgramView<'a> {
     pub(crate) output: OutputContract,
     pub(crate) dfa: NativePartialDfaView<'a>,
     pub(crate) exact_match_width: Option<usize>,
+    /// Exact immutable byte-boundary class count of the source K0 automaton.
+    /// Compact continuation normalization may merge these columns, but native
+    /// reverse recovery must retain the source boundary authority.
+    pub(crate) source_class_count: usize,
+    /// Exact immutable K0 byte-to-class map used only by variable-width Span
+    /// continuation recovery.
+    pub(crate) source_byte_classes: Option<[u8; 256]>,
     /// Full graph-derived native lowering input for the completed row prefix.
     /// Its target-specific lowering is publishable only when a mandatory
     /// retained scanner receives an exact SIMD code-generation receipt.
@@ -10269,6 +10408,13 @@ impl CompiledProgram {
             output: self.output,
             dfa: partial,
             exact_match_width: self.exact_match_width,
+            source_class_count: dfa_boundary_starts(&self.raw)
+                .iter()
+                .filter(|&&start| start)
+                .count(),
+            source_byte_classes: (self.output == OutputContract::Span
+                && self.exact_match_width.is_none())
+                .then(|| dfa_boundary_class_map(&self.raw)),
             native: NativeProgramView {
                 output: self.output,
                 raw: &self.raw,
@@ -12486,7 +12632,10 @@ impl CompiledProgram {
                 "preflight-authenticated partial resume has no retained workspace",
             ),
         )?;
-        if !partial_workspace.state.consume_native_entry_window(window) {
+        if !partial_workspace
+            .state
+            .consume_root_native_entry_window(window)
+        {
             return Err(CompileError::InternalInvariant(
                 "partial resume window was not admitted by combined preflight",
             ));
@@ -12786,6 +12935,214 @@ impl CompiledProgram {
         )
     }
 
+    /// Project an admitted retained-row hole into the independently owned
+    /// immutable continuation table without consuming its native ticket.
+    ///
+    /// A decline leaves the root-owned ticket untouched so the caller can
+    /// enter the established compact-v2 consuming path exactly once. A
+    /// successful projection is still read-only; generated continuation code
+    /// may run only after the caller publishes the matching prepared header
+    /// and transfers the projection through
+    /// [`Self::transfer_preflight_retained_partial_projection_with_workspace`].
+    #[doc(hidden)]
+    #[inline]
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the private projection authenticates one owner, ticket, and native frontier"
+    )]
+    pub fn try_project_preflight_retained_partial_resume_ticket_with_frozen_static_continuation_rows_workspace(
+        &self,
+        haystack: &[u8],
+        workspace: &ProgramWorkspace,
+        owner: &FrozenStaticContinuationRowsStorageV1,
+        resume_state: usize,
+        resume_position: usize,
+        pending_end_word: usize,
+        receipt: FullyPrefilledFallbackReceipt,
+    ) -> Result<Option<FrozenRetainedPartialResumeProjection>, CompileError> {
+        let rows = &owner.rows;
+        let format_version = owner.compiler_private_format_version();
+        let Some(block_bytes) = frozen_retained_partial_handoff_block_bytes(format_version) else {
+            return Ok(None);
+        };
+        let partial_workspace = workspace.partial.as_deref().ok_or(
+            CompileError::InternalInvariant(
+                "retained frozen projection has no retained workspace",
+            ),
+        )?;
+        let window = match partial_workspace.state.native_entry_phase {
+            RetainedPartialNativePhase::RootArmed => partial_workspace
+                .state
+                .peek_root_native_entry_window()
+                .ok_or(CompileError::InternalInvariant(
+                    "retained frozen projection root has no admitted window",
+                ))?,
+            RetainedPartialNativePhase::ContinuationOwned => {
+                return Err(CompileError::InternalInvariant(
+                    "retained frozen projection cannot replay continuation ownership",
+                ));
+            }
+            RetainedPartialNativePhase::Retired => {
+                return Err(CompileError::InternalInvariant(
+                    "retained frozen projection has no armed root transaction",
+                ));
+            }
+        };
+        if window.start > window.end
+            || window.end > haystack.len()
+            || window.end.saturating_sub(resume_position) < block_bytes
+            || !workspace.identity.compatible(&self.identity)
+            || self.context_dfa.is_some()
+            || !matches!(self.engine, ProgramEngine::OrderedNfa)
+            || self.automaton.stats().has_assertions()
+            || resume_position <= window.start
+            || resume_position >= window.end
+            || receipt.program_instance != self.identity.instance
+            || rows.program_instance != self.identity.instance
+            || rows.artifact_identity != self.identity.artifact
+            || rows.root_prefill_receipt.program_instance != self.identity.instance
+            || rows.root_prefill_receipt.k0 != receipt.k0
+            || rows.descriptor.format_version != format_version
+            || !frozen_static_continuation_format_supports_retained_partial_handoff(format_version)
+        {
+            return Ok(None);
+        }
+
+        // The continuation tail's reverse-only Span postflight owns only a
+        // positive selected endpoint. Nullable variable spans and an exact
+        // zero-width span therefore remain on compact-v2/K0.
+        if !retained_partial_native_continuation_output_is_supported(
+            self.output,
+            self.exact_match_width,
+            self.partial_dfa()
+                .is_some_and(|partial| partial.initial_pending()),
+        ) {
+            return Ok(None);
+        }
+        let Some(pending) = self
+            .partial_dfa()
+            .and_then(|partial| partial.resume_pending(resume_state))
+        else {
+            return Ok(None);
+        };
+        // Zero is the ABI sentinel for no pending endpoint. A pending state
+        // carrying zero cannot be represented by the native continuation.
+        if pending && pending_end_word == 0 {
+            return Ok(None);
+        }
+        let pending_end = pending.then_some(pending_end_word);
+        if pending_end.is_some_and(|end| end < window.start || end > resume_position) {
+            return Ok(None);
+        }
+
+        let Some(nfa) = workspace.nfa.as_ref() else {
+            return Ok(None);
+        };
+        let Some(resume_set) = partial_workspace
+            .resume
+            .as_ref()
+            .filter(|resume| resume.is_bound_to(&self.automaton))
+        else {
+            return Ok(None);
+        };
+        let Some(mapping) = nfa.compiler_private_frozen_owner_resume_state_projection(
+            &self.automaton,
+            resume_set,
+            resume_state,
+            receipt.k0,
+        ) else {
+            return Ok(None);
+        };
+        if mapping.cache_identity() != rows.descriptor.cache_identity
+            || mapping.row_stride() == 0
+            || mapping.pending() != pending
+        {
+            return Ok(None);
+        }
+        let source_initial_state = usize::try_from(mapping.source_initial_state()).map_err(|_| {
+            CompileError::InternalInvariant(
+                "retained frozen projection initial state does not fit usize",
+            )
+        })?;
+        let source_state = usize::try_from(mapping.source_state()).map_err(|_| {
+            CompileError::InternalInvariant("retained frozen projection state does not fit usize")
+        })?;
+        let state_count = usize::try_from(rows.descriptor.state_count).map_err(|_| {
+            CompileError::InternalInvariant(
+                "retained frozen projection state count does not fit usize",
+            )
+        })?;
+        if mapping.state_count() != state_count
+            || source_initial_state >= state_count
+            || source_state >= state_count
+        {
+            return Ok(None);
+        }
+        Ok(Some(FrozenRetainedPartialResumeProjection {
+            program_instance: self.identity.instance,
+            workspace_address: std::ptr::from_ref(workspace).expose_provenance(),
+            window,
+            resume_state,
+            resume_position,
+            canonical_state: canonicalize_frozen_state_ordinal(
+                source_state,
+                source_initial_state,
+            ),
+            pending_end,
+            cache_identity: mapping.cache_identity(),
+            format_version,
+            fully_prefilled: receipt,
+        }))
+    }
+
+    /// Transfer an already-projected retained root transaction to the
+    /// immutable continuation owner. This changes only linear ownership; the
+    /// exact native-entry window remains live until a terminal continuation,
+    /// Span postflight, or the next preflight settles it.
+    #[doc(hidden)]
+    #[inline]
+    pub fn transfer_preflight_retained_partial_projection_with_workspace(
+        &self,
+        workspace: &mut ProgramWorkspace,
+        owner: &FrozenStaticContinuationRowsStorageV1,
+        projection: FrozenRetainedPartialResumeProjection,
+    ) -> Result<(), CompileError> {
+        let rows = &owner.rows;
+        if projection.program_instance != self.identity.instance
+            || projection.workspace_address
+                != std::ptr::from_mut(workspace).expose_provenance()
+            || projection.format_version != owner.compiler_private_format_version()
+            || projection.cache_identity != rows.descriptor.cache_identity
+            || projection.fully_prefilled.program_instance != self.identity.instance
+            || projection.fully_prefilled.k0 != rows.root_prefill_receipt.k0
+            || projection.resume_position <= projection.window.start
+            || projection.resume_position >= projection.window.end
+            || self
+                .partial_dfa()
+                .and_then(|partial| partial.resume_pending(projection.resume_state))
+                != Some(projection.pending_end.is_some())
+        {
+            return Err(CompileError::InternalInvariant(
+                "retained frozen projection no longer matches its immutable owner",
+            ));
+        }
+        let partial_workspace = workspace.partial.as_deref_mut().ok_or(
+            CompileError::InternalInvariant(
+                "retained frozen projection has no retained workspace",
+            ),
+        )?;
+        if !partial_workspace
+            .state
+            .transfer_native_entry_to_continuation(projection.window)
+        {
+            return Err(CompileError::InternalInvariant(
+                "retained frozen projection no longer owns its root ticket",
+            ));
+        }
+        Ok(())
+    }
+
     #[inline]
     fn take_preflight_partial_resume_ticket(
         haystack: &[u8],
@@ -12798,7 +13155,7 @@ impl CompiledProgram {
                 "ticketed partial resume has no retained workspace",
             ))?
             .state
-            .take_native_entry_window()
+            .take_root_native_entry_window()
             .ok_or(CompileError::InternalInvariant(
                 "ticketed partial resume has no admitted native window",
             ))?;
@@ -29453,6 +29810,37 @@ mod tests {
                 "retained handoff width drifted for format {format_version}"
             );
         }
+        for output in [OutputContract::Exists, OutputContract::SelectedEnd] {
+            for exact_width in [None, Some(0), Some(1)] {
+                for initial_pending in [false, true] {
+                    assert!(retained_partial_native_continuation_output_is_supported(
+                        output,
+                        exact_width,
+                        initial_pending,
+                    ));
+                }
+            }
+        }
+        assert!(!retained_partial_native_continuation_output_is_supported(
+            OutputContract::Span,
+            Some(0),
+            false,
+        ));
+        assert!(retained_partial_native_continuation_output_is_supported(
+            OutputContract::Span,
+            Some(1),
+            true,
+        ));
+        assert!(retained_partial_native_continuation_output_is_supported(
+            OutputContract::Span,
+            None,
+            false,
+        ));
+        assert!(!retained_partial_native_continuation_output_is_supported(
+            OutputContract::Span,
+            None,
+            true,
+        ));
     }
 
     #[test]
@@ -29735,6 +30123,210 @@ mod tests {
                     "{label}/V{format_version} decline replayed the consumed ticket"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn retained_partial_native_projection_transfers_one_root_ticket_without_replay() {
+        const FORMATS: [u32; 3] = [
+            FROZEN_DYNAMIC_ROWS_V11_FORMAT_VERSION,
+            FROZEN_DYNAMIC_ROWS_V13_FORMAT_VERSION,
+            FROZEN_DYNAMIC_ROWS_V14_FORMAT_VERSION,
+        ];
+        let mut haystack = vec![b'!'; 12];
+        haystack.extend(vec![b'b'; PARTIAL_DFA_MIN_INPUT_BYTES + 64]);
+        let window = SearchWindow::new(3, haystack.len());
+        let (compiled, resume) = retained_handoff_fixture(
+            r"[ab]{1,20}",
+            OutputContract::SelectedEnd,
+            &haystack,
+            window,
+            true,
+        );
+        let pending_end = resume.pending_end.expect("fixture pending endpoint");
+
+        for format_version in FORMATS {
+            let mut workspace = compiled.prepare_workspace().unwrap();
+            let receipt = compiled
+                .compiler_private_try_prefill_retained_fallback_with_workspace_receipt(
+                    &mut workspace,
+                )
+                .unwrap()
+                .expect("fully prefilled K0 receipt");
+            let owner = frozen_retained_owner_for_format(
+                &compiled,
+                &workspace,
+                receipt,
+                format_version,
+            );
+            assert_eq!(
+                compiled
+                    .preflight_retained_partial_native_root_with_workspace(
+                        &haystack,
+                        window,
+                        &mut workspace,
+                        compiled.artifact_identity(),
+                    )
+                    .unwrap(),
+                RetainedPartialPreflight::Enter(window)
+            );
+            let state = &workspace.partial.as_deref().unwrap().state;
+            assert_eq!(
+                state.native_entry_phase,
+                RetainedPartialNativePhase::RootArmed
+            );
+            assert_eq!(state.native_entry_window, Some(window));
+
+            // A meaningful pending state cannot use the ABI's zero sentinel.
+            // The read-only decline leaves compact-v2 root ownership intact.
+            assert_eq!(
+                compiled
+                    .try_project_preflight_retained_partial_resume_ticket_with_frozen_static_continuation_rows_workspace(
+                        &haystack,
+                        &workspace,
+                        &owner,
+                        resume.state,
+                        resume.position,
+                        0,
+                        receipt,
+                    )
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                workspace.partial.as_deref().unwrap().state.native_entry_phase,
+                RetainedPartialNativePhase::RootArmed
+            );
+
+            let projection = compiled
+                .try_project_preflight_retained_partial_resume_ticket_with_frozen_static_continuation_rows_workspace(
+                    &haystack,
+                    &workspace,
+                    &owner,
+                    resume.state,
+                    resume.position,
+                    pending_end,
+                    receipt,
+                )
+                .unwrap()
+                .expect("batched retained projection");
+            assert_eq!(projection.format_version(), format_version);
+            assert_eq!(projection.pending_end_word(), pending_end);
+            assert!(
+                projection.canonical_state()
+                    < usize::try_from(owner.rows.descriptor.state_count).unwrap()
+            );
+            assert_eq!(
+                workspace.partial.as_deref().unwrap().state.native_entry_phase,
+                RetainedPartialNativePhase::RootArmed,
+                "projection must remain read-only"
+            );
+            compiled
+                .transfer_preflight_retained_partial_projection_with_workspace(
+                    &mut workspace,
+                    &owner,
+                    projection,
+                )
+                .unwrap();
+            let state = &workspace.partial.as_deref().unwrap().state;
+            assert_eq!(
+                state.native_entry_phase,
+                RetainedPartialNativePhase::ContinuationOwned
+            );
+            assert_eq!(state.native_entry_window, Some(window));
+
+            assert!(
+                compiled
+                    .try_project_preflight_retained_partial_resume_ticket_with_frozen_static_continuation_rows_workspace(
+                        &haystack,
+                        &workspace,
+                        &owner,
+                        resume.state,
+                        resume.position,
+                        pending_end,
+                        receipt,
+                    )
+                    .is_err(),
+                "compact-v3 must not replay continuation ownership"
+            );
+            assert!(
+                compiled
+                    .search_from_preflight_retained_partial_resume_ticket_inferred_with_workspace(
+                        &haystack,
+                        &mut workspace,
+                        resume.state,
+                        resume.position,
+                        pending_end,
+                    )
+                    .is_err(),
+                "compact-v2 must not steal continuation ownership"
+            );
+            assert_eq!(
+                workspace.partial.as_deref().unwrap().state.native_entry_phase,
+                RetainedPartialNativePhase::ContinuationOwned
+            );
+
+            // The next combined preflight is the terminal settlement for a
+            // native continuation that returned locally, then arms one fresh
+            // root transaction.
+            assert_eq!(
+                compiled
+                    .preflight_retained_partial_native_root_with_workspace(
+                        &haystack,
+                        window,
+                        &mut workspace,
+                        compiled.artifact_identity(),
+                    )
+                    .unwrap(),
+                RetainedPartialPreflight::Enter(window)
+            );
+            assert_eq!(
+                workspace.partial.as_deref().unwrap().state.native_entry_phase,
+                RetainedPartialNativePhase::RootArmed
+            );
+
+            // A sub-supertransition suffix is a pure projection decline. The
+            // established compact-v2 path then consumes that root exactly
+            // once and leaves no replayable ticket.
+            let block_bytes = frozen_retained_partial_handoff_block_bytes(format_version).unwrap();
+            let short_tail_position = window.end - (block_bytes - 1);
+            assert_eq!(
+                compiled
+                    .try_project_preflight_retained_partial_resume_ticket_with_frozen_static_continuation_rows_workspace(
+                        &haystack,
+                        &workspace,
+                        &owner,
+                        resume.state,
+                        short_tail_position,
+                        pending_end,
+                        receipt,
+                    )
+                    .unwrap(),
+                None
+            );
+            let _ = compiled
+                .search_from_preflight_retained_partial_resume_ticket_inferred_with_workspace(
+                    &haystack,
+                    &mut workspace,
+                    resume.state,
+                    short_tail_position,
+                    pending_end,
+                )
+                .unwrap();
+            let state = &workspace.partial.as_deref().unwrap().state;
+            assert_eq!(state.native_entry_phase, RetainedPartialNativePhase::Retired);
+            assert_eq!(state.native_entry_window, None);
+            assert!(
+                compiled
+                    .search_from_preflight_retained_partial_resume_ticket_inferred_with_workspace(
+                        &haystack,
+                        &mut workspace,
+                        resume.state,
+                        short_tail_position,
+                        pending_end,
+                    )
+                    .is_err()
+            );
         }
     }
 
@@ -34646,29 +35238,43 @@ mod tests {
                 false,
             ),
         ] {
-            let compiled = program(
-                pattern,
-                OutputContract::SelectedEnd,
-                CompileMode::Optimizing,
-                limits,
-            );
-            let partial = compiled
-                .partial_dfa()
-                .and_then(PartialDfa::native_incomplete_view)
-                .unwrap_or_else(|| panic!("fixture has no incomplete retained rows: {pattern:?}"));
-            let (prefix_plan, prefix_supported) =
-                PartialDfaPrefixPlan::derive(compiled.anchored_prefix.sets());
-            assert!(prefix_supported, "unsupported prefix fixture: {pattern:?}");
-            assert!(
-                partial.initial_pending || prefix_plan.is_none(),
-                "selective root already excludes fixture: {pattern:?}"
-            );
-            assert_eq!(compiled.nfa_mandatory_suffix.is_some(), expect_suffix);
-            assert_eq!(compiled.nfa_mandatory_cut.is_some(), !expect_suffix);
-            assert!(
-                compiled.native_partial_dfa_view().is_some(),
-                "combined preflight did not carry a complete NFA accelerator: {pattern:?}"
-            );
+            for output in [OutputContract::SelectedEnd, OutputContract::Span] {
+                let compiled = program(pattern, output, CompileMode::Optimizing, limits);
+                let partial = compiled
+                    .partial_dfa()
+                    .and_then(PartialDfa::native_incomplete_view)
+                    .unwrap_or_else(|| {
+                        panic!("fixture has no incomplete retained rows: {pattern:?}/{output:?}")
+                    });
+                let (prefix_plan, prefix_supported) =
+                    PartialDfaPrefixPlan::derive(compiled.anchored_prefix.sets());
+                assert!(
+                    prefix_supported,
+                    "unsupported prefix fixture: {pattern:?}/{output:?}"
+                );
+                assert!(
+                    partial.initial_pending || prefix_plan.is_none(),
+                    "selective root already excludes fixture: {pattern:?}/{output:?}"
+                );
+                assert_eq!(compiled.nfa_mandatory_suffix.is_some(), expect_suffix);
+                assert_eq!(compiled.nfa_mandatory_cut.is_some(), !expect_suffix);
+                let view = compiled.native_partial_dfa_view().unwrap_or_else(|| {
+                    panic!(
+                        "combined preflight did not carry a complete NFA accelerator: {pattern:?}/{output:?}"
+                    )
+                });
+                let expected_class_count = dfa_boundary_starts(&compiled.raw)
+                    .iter()
+                    .filter(|&&start| start)
+                    .count();
+                assert_eq!(view.source_class_count, expected_class_count);
+                assert_eq!(
+                    view.source_byte_classes,
+                    (output == OutputContract::Span)
+                        .then(|| dfa_boundary_class_map(&compiled.raw)),
+                    "partial native reverse authority must use the K0 boundary map"
+                );
+            }
         }
     }
 
@@ -35209,6 +35815,7 @@ mod tests {
         {
             let state = &mut prior.partial.as_deref_mut().unwrap().state;
             state.native_entry_in_flight = true;
+            state.native_entry_phase = RetainedPartialNativePhase::RootArmed;
             state.consecutive_fallbacks = 2;
             state.bypass_remaining = 16;
         }
