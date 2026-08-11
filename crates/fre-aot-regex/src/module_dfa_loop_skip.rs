@@ -57,6 +57,7 @@ pub(super) fn derive_native_dfa_loop_skip(
     forward_offset: usize,
     row_bytes: usize,
     logical_to_physical: Option<&[u32]>,
+    physical_row_offsets: Option<&[u32]>,
 ) -> Result<Option<NativeDfaLoopSkip>, ObjectError> {
     let Some(plan) = select_dfa_loop_skip(dfa, output) else {
         return Ok(None);
@@ -79,13 +80,22 @@ pub(super) fn derive_native_dfa_loop_skip(
         })
         .transpose()?
         .unwrap_or(state);
-    let row_offset = physical_state
-        .checked_mul(row_bytes)
-        .and_then(|offset| offset.checked_add(forward_offset))
-        .and_then(|offset| u32::try_from(offset).ok())
-        .ok_or(ObjectError::ArithmeticOverflow(
-            "native loop-skip row offset",
-        ))?;
+    let row_offset = if let Some(offsets) = physical_row_offsets {
+        offsets
+            .get(physical_state)
+            .copied()
+            .ok_or(ObjectError::InvalidModule(
+                "native loop-skip physical row has no variable offset",
+            ))?
+    } else {
+        physical_state
+            .checked_mul(row_bytes)
+            .and_then(|offset| offset.checked_add(forward_offset))
+            .and_then(|offset| u32::try_from(offset).ok())
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "native loop-skip row offset",
+            ))?
+    };
     Ok(Some(NativeDfaLoopSkip {
         filter: native_filter(plan)?,
         accepting: plan.accepting,

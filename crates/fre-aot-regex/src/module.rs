@@ -4769,6 +4769,13 @@ enum TransitionLayout {
     /// The same exact two-value dictionary indexed directly by the raw input
     /// byte. Its 256-bit selector removes the global class-map dependency.
     BitSliceBytes(u8),
+    /// A variable-stride scalable modal table. Rows with at most sixteen
+    /// exceptions use one compact 16-lane record; wider rows retain the
+    /// global long capacity. A duplicated key at the 16/17 boundary selects
+    /// the short form without adding a row tag or changing packed tokens.
+    HybridSparseExceptions(u8),
+    /// The same variable-stride representation keyed by raw input byte.
+    HybridByteSparseExceptions(u8),
 }
 
 /// Keep the cold resource-rescue lookup small enough to unroll without a
@@ -4864,6 +4871,32 @@ struct NativeDefaultExceptionPlan {
     cells: NativeCellEncoding,
     row_bytes: usize,
     sparse_boundary_profile: Option<NativeSparseBoundaryProfile>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct NativeHybridSparsePlan {
+    exception_capacity: u8,
+    keys: NativeDefaultExceptionKeys,
+    cells: NativeCellEncoding,
+    short_row_bytes: usize,
+    long_row_bytes: usize,
+    row_offsets: Vec<u32>,
+    short_rows: Vec<bool>,
+    table_bytes: usize,
+}
+
+impl NativeHybridSparsePlan {
+    fn transitions(&self) -> TransitionLayout {
+        native_hybrid_sparse_transitions(self.keys, self.exception_capacity)
+            .unwrap_or_else(|| unreachable!("boundary rows have no hybrid sparse representation"))
+    }
+
+    fn row_offset(&self, physical_state: usize) -> Option<usize> {
+        self.row_offsets
+            .get(physical_state)
+            .copied()
+            .and_then(|offset| usize::try_from(offset).ok())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5562,6 +5595,30 @@ fn native_default_exception_row_bytes(
     )
 }
 
+const NATIVE_HYBRID_SHORT_EXCEPTION_CAPACITY: u8 = 16;
+const NATIVE_HYBRID_SHORT_KEY_SLOTS: usize =
+    NATIVE_HYBRID_SHORT_EXCEPTION_CAPACITY as usize + 1;
+
+/// Offset of the compact row's sixteen semantic values. The seventeenth key
+/// is an authenticated discriminator: short rows duplicate key 15 into key
+/// 16, while a long row necessarily has distinct ascending keys there.
+fn native_hybrid_sparse_short_value_offset(cells: NativeCellEncoding) -> Option<usize> {
+    if !matches!(cells, NativeCellEncoding::Compact16 | NativeCellEncoding::Wide32) {
+        return None;
+    }
+    let keys_end = cells.bytes().checked_add(NATIVE_HYBRID_SHORT_KEY_SLOTS)?;
+    let alignment_mask = cells.bytes().checked_sub(1)?;
+    keys_end
+        .checked_add(alignment_mask)
+        .map(|offset| offset & !alignment_mask)
+}
+
+fn native_hybrid_sparse_short_row_bytes(cells: NativeCellEncoding) -> Option<usize> {
+    native_hybrid_sparse_short_value_offset(cells)?.checked_add(
+        usize::from(NATIVE_HYBRID_SHORT_EXCEPTION_CAPACITY).checked_mul(cells.bytes())?,
+    )
+}
+
 fn native_ordinal_map_value_bytes(
     value_capacity: u8,
     cells: NativeCellEncoding,
@@ -6151,6 +6208,69 @@ where
     Ok(())
 }
 
+fn append_native_hybrid_sparse_short_record<F>(
+    bytes: &mut Vec<u8>,
+    default: ForwardCell,
+    exceptions: &[NativeDefaultException],
+    exception_count: usize,
+    cells: NativeCellEncoding,
+    pack: F,
+) -> Result<(), ObjectError>
+where
+    F: Fn(ForwardCell) -> Result<u32, ObjectError>,
+{
+    let semantic_slots = usize::from(NATIVE_HYBRID_SHORT_EXCEPTION_CAPACITY);
+    if exception_count > semantic_slots || exceptions.len() < exception_count {
+        return Err(ObjectError::InvalidModule(
+            "hybrid sparse short row exceeds sixteen exceptions",
+        ));
+    }
+    let row_start = bytes.len();
+    let row_bytes = native_hybrid_sparse_short_row_bytes(cells).ok_or(
+        ObjectError::InvalidModule("hybrid sparse short row width"),
+    )?;
+    let value_offset = native_hybrid_sparse_short_value_offset(cells).ok_or(
+        ObjectError::InvalidModule("hybrid sparse short value offset"),
+    )?;
+    let duplicated = exception_count
+        .checked_sub(1)
+        .and_then(|slot| exceptions.get(slot))
+        .copied()
+        .flatten();
+    let exception_at = |slot: usize| exceptions.get(slot).copied().flatten().or(duplicated);
+
+    append_native_packed_cell(bytes, pack(default)?, cells)?;
+    for slot in 0..NATIVE_HYBRID_SHORT_KEY_SLOTS {
+        bytes.push(exception_at(slot).map_or(0, |(key, _)| key));
+    }
+    bytes.resize(
+        row_start
+            .checked_add(value_offset)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "hybrid sparse short value offset",
+            ))?,
+        0,
+    );
+    for slot in 0..semantic_slots {
+        // Every duplicate lane carries the duplicated exception value. This
+        // is stronger than relying on a particular backend's first-lane
+        // primitive and keeps all legal SIMD/SVE hit lanes semantically exact.
+        let cell = exception_at(slot).map_or(default, |(_, cell)| cell);
+        append_native_packed_cell(bytes, pack(cell)?, cells)?;
+    }
+    let row_end = row_start
+        .checked_add(row_bytes)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "hybrid sparse short row extent",
+        ))?;
+    if bytes.len() != row_end {
+        return Err(ObjectError::InvalidModule(
+            "hybrid sparse short row emitted an unexpected size",
+        ));
+    }
+    Ok(())
+}
+
 fn append_native_ordinal_map_record(
     bytes: &mut Vec<u8>,
     packed_domain: &[u32],
@@ -6458,6 +6578,173 @@ fn derive_native_default_exception_plan(
         row_bytes,
         sparse_boundary_profile,
     })
+}
+
+fn native_hybrid_sparse_transitions(
+    keys: NativeDefaultExceptionKeys,
+    exception_capacity: u8,
+) -> Option<TransitionLayout> {
+    match keys {
+        NativeDefaultExceptionKeys::Classes => {
+            Some(TransitionLayout::HybridSparseExceptions(exception_capacity))
+        }
+        NativeDefaultExceptionKeys::Bytes => {
+            Some(TransitionLayout::HybridByteSparseExceptions(exception_capacity))
+        }
+        NativeDefaultExceptionKeys::Boundaries => None,
+    }
+}
+
+/// Replace global scalable-row padding with deterministic short and long
+/// physical records. Representation choice depends only on the exact modal
+/// exception count of each representative row. Packed destination values are
+/// deliberately deferred until every absolute row start is known.
+fn derive_native_hybrid_sparse_plan(
+    view: NativeProgramView<'_>,
+    comparison: NativeDefaultExceptionPlan,
+    exact_rows: Option<&NativeExactRowInternPlan>,
+) -> Option<NativeHybridSparsePlan> {
+    let dfa = view.dfa;
+    let discovered = view.partial_discovered_states?;
+    if usize::from(comparison.exception_capacity)
+        <= usize::from(NATIVE_HYBRID_SHORT_EXCEPTION_CAPACITY)
+        || !matches!(
+            comparison.keys,
+            NativeDefaultExceptionKeys::Classes | NativeDefaultExceptionKeys::Bytes
+        )
+        || dfa.class_count == 0
+        || dfa.class_count > CLASS_MAP_BYTES
+        || dfa.forward_cells.is_empty()
+        || !dfa.forward_cells.len().is_multiple_of(dfa.class_count)
+        || dfa.reverse_initial.is_some()
+        || !dfa.reverse_cells.is_empty()
+    {
+        return None;
+    }
+    let forward_states = dfa.forward_cells.len().checked_div(dfa.class_count)?;
+    let resume_states = discovered.checked_sub(forward_states)?;
+    if resume_states == 0 {
+        return None;
+    }
+    let encoded_hole_states = if view.collapse_partial_holes {
+        1
+    } else {
+        resume_states
+    };
+    let normalization = NativeDefaultExceptionNormalization::new(
+        forward_states,
+        discovered,
+        view.collapse_partial_holes,
+    )?;
+    if let Some(plan) = exact_rows
+        && !native_exact_row_intern_plan_is_valid(
+            dfa,
+            discovered,
+            view.collapse_partial_holes,
+            plan,
+        )
+    {
+        return None;
+    }
+    let physical_forward_states = exact_rows
+        .map_or(forward_states, NativeExactRowInternPlan::physical_rows);
+    let forward_offset = match comparison.keys {
+        NativeDefaultExceptionKeys::Classes => CLASS_MAP_BYTES,
+        NativeDefaultExceptionKeys::Bytes => 0,
+        NativeDefaultExceptionKeys::Boundaries => return None,
+    };
+
+    for cells in [NativeCellEncoding::Compact16, NativeCellEncoding::Wide32] {
+        let short_row_bytes = native_hybrid_sparse_short_row_bytes(cells)?;
+        let long_row_bytes =
+            native_default_exception_row_bytes(comparison.exception_capacity, cells)?;
+        if short_row_bytes >= long_row_bytes
+            || !forward_offset.is_multiple_of(cells.bytes())
+            || !short_row_bytes.is_multiple_of(cells.bytes())
+            || !long_row_bytes.is_multiple_of(cells.bytes())
+        {
+            continue;
+        }
+        let mut row_offsets = Vec::new();
+        row_offsets.try_reserve_exact(physical_forward_states).ok()?;
+        let mut short_rows = Vec::new();
+        short_rows.try_reserve_exact(physical_forward_states).ok()?;
+        let mut next_offset = forward_offset;
+        let mut saw_short = false;
+        let mut saw_long = false;
+        for physical_state in 0..physical_forward_states {
+            let semantic_state = if let Some(plan) = exact_rows {
+                plan.representative(physical_state)?
+            } else {
+                physical_state
+            };
+            let semantic_row = semantic_state.checked_mul(dfa.class_count)?;
+            let row = dfa.forward_cells.get(
+                semantic_row..semantic_row.checked_add(dfa.class_count)?,
+            )?;
+            let exception_count = match comparison.keys {
+                NativeDefaultExceptionKeys::Classes => {
+                    native_sparse_default_exception_row(row, normalization)?.2
+                }
+                NativeDefaultExceptionKeys::Bytes => {
+                    native_sparse_default_byte_exception_row(
+                        row,
+                        dfa.byte_classes,
+                        normalization,
+                    )?
+                    .2
+                }
+                NativeDefaultExceptionKeys::Boundaries => return None,
+            };
+            if exception_count > usize::from(comparison.exception_capacity) {
+                return None;
+            }
+            let short = exception_count
+                <= usize::from(NATIVE_HYBRID_SHORT_EXCEPTION_CAPACITY);
+            saw_short |= short;
+            saw_long |= !short;
+            row_offsets.push(u32::try_from(next_offset).ok()?);
+            short_rows.push(short);
+            next_offset = next_offset.checked_add(if short {
+                short_row_bytes
+            } else {
+                long_row_bytes
+            })?;
+        }
+        if !saw_short || !saw_long {
+            continue;
+        }
+        let last_start = row_offsets
+            .last()
+            .copied()
+            .and_then(|offset| usize::try_from(offset).ok())?;
+        let hole_token_base = encode_native_row_offset(last_start, cells)?.checked_add(1)?;
+        let final_hole = hole_token_base
+            .checked_add(encoded_hole_states.checked_sub(1)?)
+            .and_then(|token| u32::try_from(token).ok())?;
+        let fits = if cells.is_compact() {
+            final_hole < cells.dead_token()
+        } else {
+            final_hole <= cells.next_mask()
+        };
+        let fixed_bytes = physical_forward_states
+            .checked_mul(long_row_bytes)
+            .and_then(|bytes| forward_offset.checked_add(bytes))?;
+        if !fits || next_offset >= fixed_bytes {
+            continue;
+        }
+        return Some(NativeHybridSparsePlan {
+            exception_capacity: comparison.exception_capacity,
+            keys: comparison.keys,
+            cells,
+            short_row_bytes,
+            long_row_bytes,
+            row_offsets,
+            short_rows,
+            table_bytes: next_offset,
+        });
+    }
+    None
 }
 
 fn native_ordinal_map_row_profile(
@@ -6959,7 +7246,9 @@ fn native_dense_candidate_cost(
         | TransitionLayout::OrdinalMapClasses(_)
         | TransitionLayout::OrdinalMapBytes(_)
         | TransitionLayout::BitSliceClasses(_)
-        | TransitionLayout::BitSliceBytes(_) => return None,
+        | TransitionLayout::BitSliceBytes(_)
+        | TransitionLayout::HybridSparseExceptions(_)
+        | TransitionLayout::HybridByteSparseExceptions(_) => return None,
     };
     let (hot_instruction_units, address_latency) = match (architecture, layout.cells) {
         (_, NativeCellEncoding::Compact8Direct) => (2, 0),
@@ -7576,6 +7865,42 @@ fn build_native_ordinal_retry(
     Ok(None)
 }
 
+fn native_target_finalized_data_len(
+    target: Option<Target>,
+    lowering: &(Vec<u8>, NativeDfaLayout),
+    maximum_table_bytes: usize,
+) -> Result<usize, ObjectError> {
+    let Some(target) = target else {
+        return Ok(lowering.0.len());
+    };
+    let mut data = lowering.0.clone();
+    let mut layout = lowering.1;
+    native_dense_target_cost_and_final_data(
+        &mut data,
+        &mut layout,
+        target,
+        maximum_table_bytes,
+    )?;
+    if data.len() > maximum_table_bytes {
+        return Err(ObjectError::Resource {
+            resource: crate::CompileResource::ProgramBytes,
+            limit: maximum_table_bytes,
+            required: data.len(),
+        });
+    }
+    Ok(data.len())
+}
+
+fn optional_native_lowering(
+    lowering: Result<(Vec<u8>, NativeDfaLayout), ObjectError>,
+) -> Result<Option<(Vec<u8>, NativeDfaLayout)>, ObjectError> {
+    match lowering {
+        Ok(lowering) => Ok(Some(lowering)),
+        Err(error) if is_optional_native_table_decline(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 fn build_native_dense_candidate(
     stable_id: NativeDenseCandidateId,
     view: NativeProgramView<'_>,
@@ -7655,6 +7980,7 @@ fn build_native_dense_candidate(
             exact_rows,
             force_class_mapped,
             column_quotient,
+            None,
             None,
             permit_asimd_candidate_mask,
         )?;
@@ -7832,6 +8158,10 @@ impl TransitionLayout {
 
     fn uses_vector_sparse_lookup(self) -> bool {
         self.scalable_exception_capacity().is_some()
+            || matches!(
+                self,
+                Self::HybridSparseExceptions(_) | Self::HybridByteSparseExceptions(_)
+            )
     }
 
     const fn row_cells(self, class_count: usize) -> usize {
@@ -7846,19 +8176,25 @@ impl TransitionLayout {
             | Self::OrdinalMapClasses(_)
             | Self::OrdinalMapBytes(_)
             | Self::BitSliceClasses(_)
-            | Self::BitSliceBytes(_) => 0,
+            | Self::BitSliceBytes(_)
+            | Self::HybridSparseExceptions(_)
+            | Self::HybridByteSparseExceptions(_) => 0,
         }
     }
 
     const fn table_prefix_bytes(self) -> usize {
         match self {
-            Self::ClassMapped | Self::DefaultExceptions(1..) | Self::DefaultSparseExceptions(_) => {
+            Self::ClassMapped
+            | Self::DefaultExceptions(1..)
+            | Self::DefaultSparseExceptions(_)
+            | Self::HybridSparseExceptions(_) => {
                 CLASS_MAP_BYTES
             }
             Self::DefaultExceptions(0)
             | Self::DefaultByteExceptions(_)
             | Self::DefaultByteBoundaries(_)
             | Self::DefaultByteSparseExceptions(_)
+            | Self::HybridByteSparseExceptions(_)
             | Self::OrdinalMapBytes(_)
             | Self::BitSliceBytes(_)
             | Self::DirectByte => 0,
@@ -7887,6 +8223,10 @@ fn native_default_exception_layout_is_valid(layout: &NativeDfaLayout) -> bool {
         TransitionLayout::BitSliceClasses(capacity)
         | TransitionLayout::BitSliceBytes(capacity) => {
             capacity == NATIVE_BIT_SLICE_VALUE_CAPACITY
+        }
+        TransitionLayout::HybridSparseExceptions(capacity)
+        | TransitionLayout::HybridByteSparseExceptions(capacity) => {
+            capacity > NATIVE_HYBRID_SHORT_EXCEPTION_CAPACITY
         }
         TransitionLayout::ClassMapped | TransitionLayout::DirectByte => {
             return layout.sparse_boundary_profile.is_none();
@@ -7947,7 +8287,9 @@ fn native_row_bytes(
             | TransitionLayout::OrdinalMapClasses(_)
             | TransitionLayout::OrdinalMapBytes(_)
             | TransitionLayout::BitSliceClasses(_)
-            | TransitionLayout::BitSliceBytes(_),
+            | TransitionLayout::BitSliceBytes(_)
+            | TransitionLayout::HybridSparseExceptions(_)
+            | TransitionLayout::HybridByteSparseExceptions(_),
             _,
         ) => None,
         (TransitionLayout::ClassMapped, NativeCellEncoding::Compact8Direct) => None,
@@ -8002,6 +8344,11 @@ fn native_table_prefix_bytes(
             NativeCellEncoding::Compact16 | NativeCellEncoding::Wide32,
         ) if capacity == NATIVE_BIT_SLICE_VALUE_CAPACITY => Some(prefix),
         (
+            TransitionLayout::HybridSparseExceptions(capacity)
+            | TransitionLayout::HybridByteSparseExceptions(capacity),
+            NativeCellEncoding::Compact16 | NativeCellEncoding::Wide32,
+        ) if capacity > NATIVE_HYBRID_SHORT_EXCEPTION_CAPACITY => Some(prefix),
+        (
             TransitionLayout::DefaultExceptions(_)
             | TransitionLayout::DefaultByteExceptions(_)
             | TransitionLayout::DefaultByteBoundaries(_)
@@ -8010,7 +8357,9 @@ fn native_table_prefix_bytes(
             | TransitionLayout::OrdinalMapClasses(_)
             | TransitionLayout::OrdinalMapBytes(_)
             | TransitionLayout::BitSliceClasses(_)
-            | TransitionLayout::BitSliceBytes(_),
+            | TransitionLayout::BitSliceBytes(_)
+            | TransitionLayout::HybridSparseExceptions(_)
+            | TransitionLayout::HybridByteSparseExceptions(_),
             _,
         ) => None,
         (TransitionLayout::ClassMapped, NativeCellEncoding::Compact8Direct) => None,
@@ -10530,49 +10879,97 @@ fn build_native_dfa_table_with_cost_model_data_limit_and_asimd_policy(
     )? {
         return Ok(lowering);
     }
-    if let Some(plan) = comparison_plan {
-        if plan.keys != NativeDefaultExceptionKeys::Boundaries
-            && let Some(exact_rows) = exact_rows.as_ref()
-        {
-            let retry =
+    if let Some(comparison) = comparison_plan {
+        for use_exact_rows in [true, false] {
+            let candidate_exact = if use_exact_rows {
+                if comparison.keys == NativeDefaultExceptionKeys::Boundaries {
+                    continue;
+                }
+                let Some(exact) = exact_rows.as_ref() else {
+                    continue;
+                };
+                Some(exact)
+            } else {
+                None
+            };
+            let fixed = optional_native_lowering(
                 build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_and_asimd_policy(
                     view,
                     architecture,
                     vector_cost_model,
                     relation_vector_owns_route,
                     max_native_data_bytes,
-                    Some(plan),
-                    Some(exact_rows),
+                    Some(comparison),
+                    candidate_exact,
                     false,
+                    None,
                     None,
                     None,
                     permit_asimd_candidate_mask,
                 )
                 .and_then(|lowering| {
                     require_native_start_scanner(view, max_native_data_bytes, lowering)
-                });
-            match retry {
-                Ok(lowering) => return Ok(lowering),
-                Err(error) if is_optional_native_table_decline(&error) => {}
-                Err(error) => return Err(error),
+                }),
+            )?;
+            let hybrid_plan = derive_native_hybrid_sparse_plan(
+                view,
+                comparison,
+                candidate_exact,
+            );
+            let hybrid = if let Some(plan) = hybrid_plan.as_ref() {
+                optional_native_lowering(
+                    build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_and_asimd_policy(
+                        view,
+                        architecture,
+                        vector_cost_model,
+                        relation_vector_owns_route,
+                        max_native_data_bytes,
+                        None,
+                        candidate_exact,
+                        false,
+                        None,
+                        None,
+                        Some(plan),
+                        permit_asimd_candidate_mask,
+                    )
+                    .and_then(|lowering| {
+                        require_native_start_scanner(view, max_native_data_bytes, lowering)
+                    }),
+                )?
+            } else {
+                None
+            };
+            match (fixed, hybrid) {
+                (Some(fixed), Some(hybrid)) => {
+                    let fixed_bytes = native_target_finalized_data_len(
+                        ranking_target,
+                        &fixed,
+                        max_native_data_bytes,
+                    )?;
+                    let hybrid_bytes = native_target_finalized_data_len(
+                        ranking_target,
+                        &hybrid,
+                        max_native_data_bytes,
+                    )?;
+                    let profitable = ranking_target.is_some_and(|target| {
+                        comparison.sparse_boundary_profile.is_some_and(|profile| {
+                            native_hybrid_sparse_guard_is_profitable(
+                                profile,
+                                comparison.exception_capacity,
+                                hybrid.1.cells,
+                                target,
+                            )
+                        })
+                    });
+                    if hybrid_bytes < fixed_bytes && profitable {
+                        return Ok(hybrid);
+                    }
+                    return Ok(fixed);
+                }
+                (Some(fixed), None) => return Ok(fixed),
+                (None, Some(hybrid)) => return Ok(hybrid),
+                (None, None) => {}
             }
-        }
-        let retry = build_native_dfa_table_with_cost_model_and_data_limit_once_with_asimd_policy(
-            view,
-            architecture,
-            vector_cost_model,
-            relation_vector_owns_route,
-            max_native_data_bytes,
-            Some(plan),
-            permit_asimd_candidate_mask,
-        )
-        .and_then(|lowering| {
-            require_native_start_scanner(view, max_native_data_bytes, lowering)
-        });
-        match retry {
-            Ok(lowering) => return Ok(lowering),
-            Err(error) if is_optional_native_table_decline(&error) => {}
-            Err(error) => return Err(error),
         }
     }
     // Optional resource pressure preserves the canonical resource decline.
@@ -10636,6 +11033,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_asimd_policy(
         false,
         None,
         None,
+        None,
         permit_asimd_candidate_mask,
     )
 }
@@ -10668,6 +11066,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows(
         force_class_mapped,
         column_quotient,
         None,
+        None,
         architecture == Architecture::Aarch64,
     )
 }
@@ -10688,15 +11087,22 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
     force_class_mapped: bool,
     column_quotient: Option<&NativeColumnQuotientPlan>,
     ordinal_map: Option<NativeOrdinalMapPlan>,
+    hybrid_sparse: Option<&NativeHybridSparsePlan>,
     permit_asimd_candidate_mask: bool,
 ) -> Result<(Vec<u8>, NativeDfaLayout), ObjectError> {
     let dfa = view.dfa;
-    if default_exceptions.is_some() && ordinal_map.is_some() {
+    if usize::from(default_exceptions.is_some())
+        + usize::from(ordinal_map.is_some())
+        + usize::from(hybrid_sparse.is_some())
+        > 1
+    {
         return Err(ObjectError::InvalidModule(
-            "comparison and local-map fallback rows overlap",
+            "native fallback row representations overlap",
         ));
     }
-    if force_class_mapped && (default_exceptions.is_some() || ordinal_map.is_some()) {
+    if force_class_mapped
+        && (default_exceptions.is_some() || ordinal_map.is_some() || hybrid_sparse.is_some())
+    {
         return Err(ObjectError::InvalidModule(
             "forced mapped rows overlap fallback rows",
         ));
@@ -10824,6 +11230,8 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
     };
     let table_class_count = if ordinal_map
         .is_some_and(|plan| plan.keys == NativeOrdinalMapKeys::Bytes)
+        || hybrid_sparse
+            .is_some_and(|plan| plan.keys == NativeDefaultExceptionKeys::Bytes)
     {
         if column_quotient.is_some() {
             return Err(ObjectError::InvalidModule(
@@ -10838,6 +11246,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
             ));
         };
         if default_exceptions.is_some()
+            || hybrid_sparse.is_some()
             || resume_states == 0
             || encoded_hole_states == 0
             || retained_reverse_states != 0
@@ -10891,7 +11300,27 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
     // and highest encodable live token. Re-run the ordinary target cost model
     // over physical rows so a tiny interned table does not inherit a multiply
     // or wide cell chosen for logical aliases that are never materialized.
-    let (transitions, cells) = if let Some(plan) = default_exceptions {
+    let (transitions, cells) = if let Some(plan) = hybrid_sparse {
+        let comparison = NativeDefaultExceptionPlan {
+            exception_capacity: plan.exception_capacity,
+            keys: plan.keys,
+            cells: plan.cells,
+            row_bytes: plan.long_row_bytes,
+            sparse_boundary_profile: None,
+        };
+        if encoded_hole_states == 0
+            || retained_reverse_states != 0
+            || plan.row_offsets.len() != physical_forward_states
+            || plan.short_rows.len() != physical_forward_states
+            || derive_native_hybrid_sparse_plan(view, comparison, exact_rows).as_ref()
+                != Some(plan)
+        {
+            return Err(ObjectError::InvalidModule(
+                "hybrid sparse rows have an invalid partial shape",
+            ));
+        }
+        (plan.transitions(), plan.cells)
+    } else if let Some(plan) = default_exceptions {
         let transitions = plan.keys.transitions(plan.exception_capacity);
         let encoding_is_valid = select_native_default_exception_encoding(
             transitions,
@@ -11004,26 +11433,54 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
             "byte-compact cells require a complete direct-byte table",
         ));
     }
-    let row_bytes = native_row_bytes(transitions, cells, table_class_count)
-        .ok_or(ObjectError::InvalidModule("native DFA row encoding"))?;
-    let forward_offset = native_table_prefix_bytes(transitions, cells, table_class_count)
-        .ok_or(ObjectError::InvalidModule("native DFA table prefix"))?;
-    let forward_bytes =
+    let row_bytes = if hybrid_sparse.is_some() {
+        0
+    } else {
+        native_row_bytes(transitions, cells, table_class_count)
+            .ok_or(ObjectError::InvalidModule("native DFA row encoding"))?
+    };
+    let forward_offset = if let Some(plan) = hybrid_sparse {
+        plan.row_offset(0).ok_or(ObjectError::InvalidModule(
+            "hybrid sparse table has no initial row",
+        ))?
+    } else {
+        native_table_prefix_bytes(transitions, cells, table_class_count)
+            .ok_or(ObjectError::InvalidModule("native DFA table prefix"))?
+    };
+    let forward_bytes = if let Some(plan) = hybrid_sparse {
+        plan.table_bytes.checked_sub(forward_offset).ok_or(
+            ObjectError::InvalidModule("hybrid sparse table precedes its first row"),
+        )?
+    } else {
         physical_forward_states
             .checked_mul(row_bytes)
             .ok_or(ObjectError::ArithmeticOverflow(
                 "native forward table bytes",
-            ))?;
+            ))?
+    };
     let partial_layout = if encoded_hole_states == 0 {
         None
     } else {
-        let last_row_offset = physical_forward_states
-            .checked_sub(1)
-            .and_then(|state| state.checked_mul(row_bytes))
-            .and_then(|offset| forward_offset.checked_add(offset))
-            .ok_or(ObjectError::ArithmeticOverflow(
-                "native partial final completed row",
-            ))?;
+        let last_row_offset = if let Some(plan) = hybrid_sparse {
+            plan.row_offset(
+                physical_forward_states
+                    .checked_sub(1)
+                    .ok_or(ObjectError::InvalidModule(
+                        "hybrid sparse table has no completed row",
+                    ))?,
+            )
+            .ok_or(ObjectError::InvalidModule(
+                "hybrid sparse final row has no offset",
+            ))?
+        } else {
+            physical_forward_states
+                .checked_sub(1)
+                .and_then(|state| state.checked_mul(row_bytes))
+                .and_then(|offset| forward_offset.checked_add(offset))
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "native partial final completed row",
+                ))?
+        };
         let last_live_token = encode_native_row_offset(last_row_offset, cells).ok_or(
             ObjectError::InvalidModule("native partial final row token is not encodable"),
         )?;
@@ -11060,12 +11517,15 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
             collapse_holes: view.collapse_partial_holes,
         })
     };
-    let reverse_bytes =
+    let reverse_bytes = if hybrid_sparse.is_some() {
+        0
+    } else {
         retained_reverse_states
             .checked_mul(row_bytes)
             .ok_or(ObjectError::ArithmeticOverflow(
                 "native reverse table bytes",
-            ))?;
+            ))?
+    };
     // A complete retained table is publishable only if native lowering keeps
     // the portable entry's exact root scanner. Prefer that same byte column
     // over the ordinary complete-DFA cost ranking; later admission also
@@ -11138,6 +11598,7 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
         forward_offset,
         row_bytes,
         exact_rows.map(|plan| plan.logical_to_physical.as_slice()),
+        hybrid_sparse.map(|plan| plan.row_offsets.as_slice()),
     )?;
     let retains_asimd_candidate_mask = permit_asimd_candidate_mask
         && architecture == Architecture::Aarch64
@@ -11260,12 +11721,20 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
                     })
                     .transpose()?
                     .unwrap_or(target_state);
-                let target_row_offset = physical_target_state
-                    .checked_mul(row_bytes)
-                    .and_then(|offset| forward_offset.checked_add(offset))
-                    .ok_or(ObjectError::ArithmeticOverflow(
-                        "native prefix target row offset",
-                    ))?;
+                let target_row_offset = if let Some(plan) = hybrid_sparse {
+                    plan.row_offset(physical_target_state).ok_or(
+                        ObjectError::InvalidModule(
+                            "native prefix target has no variable row offset",
+                        ),
+                    )?
+                } else {
+                    physical_target_state
+                        .checked_mul(row_bytes)
+                        .and_then(|offset| forward_offset.checked_add(offset))
+                        .ok_or(ObjectError::ArithmeticOverflow(
+                            "native prefix target row offset",
+                        ))?
+                };
                 Ok(NativePrefixFastForward {
                     consumed_bytes: plan.consumed_bytes,
                     target_row_offset: u32::try_from(target_row_offset).map_err(|_| {
@@ -11621,6 +12090,150 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
                         )?
                     };
                     append_native_packed_cell(&mut bytes, packed, cells)?;
+                }
+            }
+        }
+        TransitionLayout::HybridSparseExceptions(exception_capacity)
+        | TransitionLayout::HybridByteSparseExceptions(exception_capacity) => {
+            let plan = hybrid_sparse.ok_or(ObjectError::InvalidModule(
+                "hybrid sparse layout has no variable-row plan",
+            ))?;
+            if plan.transitions() != transitions
+                || plan.exception_capacity != exception_capacity
+                || plan.cells != cells
+            {
+                return Err(ObjectError::InvalidModule(
+                    "hybrid sparse plan disagrees with its transition layout",
+                ));
+            }
+            let normalization = NativeDefaultExceptionNormalization::new(
+                forward_states,
+                view.partial_discovered_states.ok_or(ObjectError::InvalidModule(
+                    "hybrid sparse rows have no discovered-state extent",
+                ))?,
+                view.collapse_partial_holes,
+            )
+            .ok_or(ObjectError::InvalidModule(
+                "hybrid sparse row normalization is invalid",
+            ))?;
+            let partial = partial_layout.ok_or(ObjectError::InvalidModule(
+                "hybrid sparse rows have no partial layout",
+            ))?;
+            for physical_state in 0..physical_forward_states {
+                let expected_offset = plan.row_offset(physical_state).ok_or(
+                    ObjectError::InvalidModule("hybrid sparse row has no offset"),
+                )?;
+                if bytes.len() != expected_offset {
+                    return Err(ObjectError::InvalidModule(
+                        "hybrid sparse row moved during serialization",
+                    ));
+                }
+                let semantic_state = exact_rows
+                    .map(|exact| {
+                        exact.representative(physical_state).ok_or(
+                            ObjectError::InvalidModule(
+                                "exact hybrid sparse row has no representative",
+                            ),
+                        )
+                    })
+                    .transpose()?
+                    .unwrap_or(physical_state);
+                let semantic_row = semantic_state.checked_mul(dfa.class_count).ok_or(
+                    ObjectError::ArithmeticOverflow("hybrid sparse semantic row"),
+                )?;
+                let row = dfa
+                    .forward_cells
+                    .get(
+                        semantic_row
+                            ..semantic_row.checked_add(dfa.class_count).ok_or(
+                                ObjectError::ArithmeticOverflow(
+                                    "hybrid sparse semantic row extent",
+                                ),
+                            )?,
+                    )
+                    .ok_or(ObjectError::InvalidModule(
+                        "hybrid sparse semantic row is outside its table",
+                    ))?;
+                let (default, exceptions, exception_count) = match transitions {
+                    TransitionLayout::HybridSparseExceptions(_) => {
+                        native_sparse_default_exception_row(row, normalization).ok_or(
+                            ObjectError::InvalidModule(
+                                "hybrid class row lost its modal representation",
+                            ),
+                        )?
+                    }
+                    TransitionLayout::HybridByteSparseExceptions(_) => {
+                        native_sparse_default_byte_exception_row(
+                            row,
+                            dfa.byte_classes,
+                            normalization,
+                        )
+                        .ok_or(ObjectError::InvalidModule(
+                            "hybrid raw row lost its modal representation",
+                        ))?
+                    }
+                    _ => unreachable!("guarded hybrid sparse transition layout"),
+                };
+                let pack = |cell: ForwardCell| {
+                    pack_native_partial_forward_cell_with_variable_rows(
+                        cell.next(),
+                        cell.accepted(),
+                        forward_states,
+                        has_start_scanner,
+                        loop_skip.map(|skip| skip.state),
+                        partial,
+                        cells,
+                        exact_rows,
+                        &plan.row_offsets,
+                    )
+                };
+                let short = *plan.short_rows.get(physical_state).ok_or(
+                    ObjectError::InvalidModule("hybrid sparse row has no shape bit"),
+                )?;
+                if short {
+                    if exception_count
+                        > usize::from(NATIVE_HYBRID_SHORT_EXCEPTION_CAPACITY)
+                    {
+                        return Err(ObjectError::InvalidModule(
+                            "hybrid short row exceeds its proved exception count",
+                        ));
+                    }
+                    append_native_hybrid_sparse_short_record(
+                        &mut bytes,
+                        default,
+                        &exceptions,
+                        exception_count,
+                        cells,
+                        pack,
+                    )?;
+                } else {
+                    if exception_count
+                        <= usize::from(NATIVE_HYBRID_SHORT_EXCEPTION_CAPACITY)
+                    {
+                        return Err(ObjectError::InvalidModule(
+                            "hybrid long row does not cross its discriminator",
+                        ));
+                    }
+                    append_native_default_exception_record(
+                        &mut bytes,
+                        default,
+                        &exceptions,
+                        exception_count,
+                        exception_capacity,
+                        cells,
+                        plan.long_row_bytes,
+                        pack,
+                    )?;
+                }
+                let expected_end = plan
+                    .row_offset(physical_state.checked_add(1).ok_or(
+                        ObjectError::ArithmeticOverflow("hybrid sparse next row"),
+                    )?)
+                    .unwrap_or(plan.table_bytes);
+                if bytes.len() != expected_end {
+                    return Err(ObjectError::InvalidModule(
+                        "hybrid sparse row emitted an unexpected extent",
+                    ));
                 }
             }
         }
@@ -12000,7 +12613,9 @@ fn build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_an
             | TransitionLayout::OrdinalMapClasses(_)
             | TransitionLayout::OrdinalMapBytes(_)
             | TransitionLayout::BitSliceClasses(_)
-            | TransitionLayout::BitSliceBytes(_) => {
+            | TransitionLayout::BitSliceBytes(_)
+            | TransitionLayout::HybridSparseExceptions(_)
+            | TransitionLayout::HybridByteSparseExceptions(_) => {
                 return Err(ObjectError::InvalidModule(
                     "default-exception rows retained a reverse machine",
                 ));
@@ -14175,6 +14790,96 @@ fn pack_native_partial_forward_cell_with_exact_rows(
     Ok(token | cells.accelerated() | if accepted { cells.accepts() } else { 0 })
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "variable sparse packing authenticates semantic rows, absolute starts, holes and accelerators together"
+)]
+fn pack_native_partial_forward_cell_with_variable_rows(
+    next: u32,
+    accepted: bool,
+    complete_states: usize,
+    initial_scannable: bool,
+    loop_state: Option<u32>,
+    partial: NativePartialDfaLayout,
+    cells: NativeCellEncoding,
+    exact_rows: Option<&NativeExactRowInternPlan>,
+    row_offsets: &[u32],
+) -> Result<u32, ObjectError> {
+    if !matches!(cells, NativeCellEncoding::Compact16 | NativeCellEncoding::Wide32) {
+        return Err(ObjectError::InvalidModule(
+            "variable sparse rows have an invalid cell width",
+        ));
+    }
+    if next == NO_DFA_STATE {
+        return pack_native_encoded_cell(
+            usize::try_from(cells.dead_token())
+                .map_err(|_| ObjectError::ArithmeticOverflow("native DFA dead token"))?,
+            accepted,
+            false,
+            true,
+            cells,
+            NativeDeadCellPolicy::ForwardTagged,
+        );
+    }
+    let logical = usize::try_from(next)
+        .map_err(|_| ObjectError::ArithmeticOverflow("native partial destination"))?;
+    if logical < complete_states {
+        let physical = exact_rows
+            .map(|plan| {
+                plan.physical_state(logical).ok_or(ObjectError::InvalidModule(
+                    "native DFA next state has no physical variable row",
+                ))
+            })
+            .transpose()?
+            .unwrap_or(logical);
+        let row_offset = row_offsets
+            .get(physical)
+            .copied()
+            .and_then(|offset| usize::try_from(offset).ok())
+            .ok_or(ObjectError::InvalidModule(
+                "native DFA next state has no variable row offset",
+            ))?;
+        let encoded = encode_native_row_offset(row_offset, cells).ok_or(
+            ObjectError::InvalidModule("native variable row is not encodable"),
+        )?;
+        let accelerated = (initial_scannable && next == 0) || loop_state == Some(next);
+        return pack_native_encoded_cell(
+            encoded,
+            accepted,
+            accelerated,
+            false,
+            cells,
+            NativeDeadCellPolicy::ForwardTagged,
+        );
+    }
+
+    let resume = logical.checked_sub(complete_states).ok_or(
+        ObjectError::InvalidModule("native partial destination precedes completed rows"),
+    )?;
+    let resume = u32::try_from(resume)
+        .map_err(|_| ObjectError::ArithmeticOverflow("native partial resume index"))?;
+    if resume >= partial.resume_states {
+        return Err(ObjectError::InvalidModule(
+            "native partial destination exceeds resume-key extent",
+        ));
+    }
+    let token = if partial.collapse_holes {
+        partial.hole_token_base
+    } else {
+        partial
+            .hole_token_base
+            .checked_add(resume)
+            .ok_or(ObjectError::ArithmeticOverflow("native partial hole token"))?
+    };
+    if token == 0 || token > cells.next_mask() || cells.is_compact() && token == cells.dead_token()
+    {
+        return Err(ObjectError::InvalidModule(
+            "native partial hole token exceeds its variable-row cell encoding",
+        ));
+    }
+    Ok(token | cells.accelerated() | if accepted { cells.accepts() } else { 0 })
+}
+
 fn pack_native_cell_with_acceleration(
     next: u32,
     flag: bool,
@@ -15440,6 +16145,144 @@ const AARCH64_SPARSE_BOUNDARY_COST: NativeSparseBoundaryCost = NativeSparseBound
     short_path_units: 1,
 };
 
+fn native_hybrid_sparse_work_is_profitable(
+    profile: NativeSparseBoundaryProfile,
+    short_work: u128,
+    long_work: u128,
+    guard_units: u8,
+    short_path_units: u8,
+) -> Option<bool> {
+    if !profile.is_valid()
+        || short_work >= long_work
+        || guard_units == 0
+    {
+        return Some(false);
+    }
+    let threshold = NATIVE_HYBRID_SHORT_EXCEPTION_CAPACITY;
+    let guard_paid = u128::from(profile.semantic_rows)
+        .checked_mul(u128::try_from(CLASS_MAP_BYTES).ok()?)?
+        .checked_mul(u128::from(guard_units))?;
+    let short_paid = u128::from(profile.stoppable_row_byte_units(threshold)?)
+        .checked_mul(u128::from(short_path_units))?;
+    let paid = guard_paid.checked_add(short_paid)?;
+    let saved = u128::from(profile.stoppable_default_miss_byte_units(threshold)?)
+        .checked_mul(long_work.checked_sub(short_work)?)?;
+    Some(saved > paid.checked_mul(2)?)
+}
+
+fn native_hybrid_sparse_guard_is_profitable(
+    profile: NativeSparseBoundaryProfile,
+    exception_capacity: u8,
+    cells: NativeCellEncoding,
+    target: Target,
+) -> bool {
+    if exception_capacity <= NATIVE_HYBRID_SHORT_EXCEPTION_CAPACITY {
+        return false;
+    }
+    match target.architecture {
+        Architecture::X86_64 => {
+            let kind = x86_start_filter_kind(target.features);
+            let Some(short) = x86_sparse_lookup_chunk_plan_for_row(
+                NATIVE_HYBRID_SHORT_EXCEPTION_CAPACITY,
+                NATIVE_HYBRID_SHORT_EXCEPTION_CAPACITY,
+                cells,
+                kind,
+            ) else {
+                return false;
+            };
+            let Some(long) = x86_sparse_lookup_chunk_plan_for_row(
+                exception_capacity,
+                exception_capacity,
+                cells,
+                kind,
+            ) else {
+                return false;
+            };
+            let Some(short_work) = native_sparse_plan_miss_units(short, 4, 2) else {
+                return false;
+            };
+            let Some(long_work) = native_sparse_plan_miss_units(long, 4, 2) else {
+                return false;
+            };
+            native_hybrid_sparse_work_is_profitable(
+                profile,
+                short_work,
+                long_work,
+                X86_SPARSE_BOUNDARY_COST.guard_units,
+                1,
+            ) == Some(true)
+        }
+        Architecture::Aarch64 => {
+            match aarch64_primary_scanner_isa(
+                target.operating_system,
+                target.features,
+                true,
+            ) {
+                Aarch64PrimaryScannerIsa::Scalar => {
+                    let Some(short_work) = native_sparse_binary_miss_comparisons(
+                        usize::from(NATIVE_HYBRID_SHORT_EXCEPTION_CAPACITY),
+                    )
+                    .and_then(|work| u128::try_from(work).ok())
+                    .and_then(|work| work.checked_mul(2))
+                    else {
+                        return false;
+                    };
+                    let Some(long_work) = native_sparse_binary_miss_comparisons(
+                        usize::from(exception_capacity),
+                    )
+                    .and_then(|work| u128::try_from(work).ok())
+                    .and_then(|work| work.checked_mul(2))
+                    else {
+                        return false;
+                    };
+                    native_hybrid_sparse_work_is_profitable(
+                        profile,
+                        short_work,
+                        long_work,
+                        AARCH64_SPARSE_BOUNDARY_COST.guard_units,
+                        AARCH64_SPARSE_BOUNDARY_COST.short_path_units,
+                    ) == Some(true)
+                }
+                Aarch64PrimaryScannerIsa::Asimd => {
+                    let Some(short) = aarch64_sparse_lookup_chunk_plan_for_row(
+                        NATIVE_HYBRID_SHORT_EXCEPTION_CAPACITY,
+                        NATIVE_HYBRID_SHORT_EXCEPTION_CAPACITY,
+                        cells,
+                    ) else {
+                        return false;
+                    };
+                    let Some(long) = aarch64_sparse_lookup_chunk_plan_for_row(
+                        exception_capacity,
+                        exception_capacity,
+                        cells,
+                    ) else {
+                        return false;
+                    };
+                    let Some(short_work) = native_sparse_plan_miss_units(short, 2, 2) else {
+                        return false;
+                    };
+                    let Some(long_work) = native_sparse_plan_miss_units(long, 2, 2) else {
+                        return false;
+                    };
+                    native_hybrid_sparse_work_is_profitable(
+                        profile,
+                        short_work,
+                        long_work,
+                        AARCH64_SPARSE_BOUNDARY_COST.guard_units,
+                        AARCH64_SPARSE_BOUNDARY_COST.short_path_units,
+                    ) == Some(true)
+                }
+                // Runtime SVE vector length can cover the complete 255-key
+                // semantic maximum in one probe. With no guaranteed lookup
+                // work reduction, a fixed table that fits must win. Resource
+                // rescue remains available when only the compact image fits.
+                Aarch64PrimaryScannerIsa::Sve
+                | Aarch64PrimaryScannerIsa::SveWithAsimdVl16 => false,
+            }
+        }
+    }
+}
+
 fn x86_sparse_lookup_lane_width(
     exception_capacity: u8,
     cells: NativeCellEncoding,
@@ -15802,6 +16645,27 @@ fn x86_emit_sparse_exception_lookup_prefix(
     cells: NativeCellEncoding,
     kind: X86StartFilterKind,
 ) -> Result<(), ObjectError> {
+    let value_offset = native_default_exception_value_offset(row_exception_capacity, cells).ok_or(
+        ObjectError::InvalidModule("x86 scalable-exception value offset"),
+    )?;
+    x86_emit_sparse_exception_lookup_prefix_with_value_offset(
+        assembler,
+        row_exception_capacity,
+        probe_exception_capacity,
+        cells,
+        kind,
+        value_offset,
+    )
+}
+
+fn x86_emit_sparse_exception_lookup_prefix_with_value_offset(
+    assembler: &mut X86Assembler,
+    row_exception_capacity: u8,
+    probe_exception_capacity: u8,
+    cells: NativeCellEncoding,
+    kind: X86StartFilterKind,
+    value_offset: usize,
+) -> Result<(), ObjectError> {
     let capacity = usize::from(probe_exception_capacity);
     let row_capacity = usize::from(row_exception_capacity);
     if !matches!(cells, NativeCellEncoding::Compact16 | NativeCellEncoding::Wide32)
@@ -15813,9 +16677,19 @@ fn x86_emit_sparse_exception_lookup_prefix(
             "x86 scalable-exception row shape",
         ));
     }
-    let value_offset = native_default_exception_value_offset(row_exception_capacity, cells).ok_or(
-        ObjectError::InvalidModule("x86 scalable-exception value offset"),
-    )?;
+    if value_offset
+        < cells
+            .bytes()
+            .checked_add(capacity)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "x86 scalable-exception key extent",
+            ))?
+        || !value_offset.is_multiple_of(cells.bytes())
+    {
+        return Err(ObjectError::InvalidModule(
+            "x86 scalable-exception explicit value offset",
+        ));
+    }
     let inline_default_slot = probe_exception_capacity == row_exception_capacity
         && row_capacity < native_default_exception_physical_slots(row_exception_capacity);
     let default = assembler.label()?;
@@ -16033,6 +16907,53 @@ fn x86_emit_table_lookup_with_sparse_boundary_tier(
         }
         return Ok(());
     }
+    if let TransitionLayout::HybridSparseExceptions(exception_capacity)
+    | TransitionLayout::HybridByteSparseExceptions(exception_capacity) = transitions
+    {
+        if sparse_boundary_tier.is_some()
+            || exception_capacity <= NATIVE_HYBRID_SHORT_EXCEPTION_CAPACITY
+        {
+            return Err(ObjectError::InvalidModule(
+                "x86 hybrid sparse dispatch shape",
+            ));
+        }
+        let long = assembler.label()?;
+        let done = assembler.label()?;
+        // This discriminator intentionally precedes the input load: its two
+        // key loads overwrite EAX. Short padding proves equality, while every
+        // long row has real, ascending and therefore distinct keys 15/16.
+        x86_emit_sparse_duplicate_boundary_guard(
+            assembler,
+            exception_capacity,
+            NATIVE_HYBRID_SHORT_EXCEPTION_CAPACITY,
+            cells,
+            long,
+        )?;
+        assembler.instruction(&[0x0f, 0xb6, 0x04, 0x17])?;
+        if matches!(transitions, TransitionLayout::HybridSparseExceptions(_)) {
+            assembler.instruction(&[0x41, 0x0f, 0xb6, 0x04, 0x01])?;
+        }
+        let short_value_offset = native_hybrid_sparse_short_value_offset(cells).ok_or(
+            ObjectError::InvalidModule("x86 hybrid sparse short value offset"),
+        )?;
+        x86_emit_sparse_exception_lookup_prefix_with_value_offset(
+            assembler,
+            NATIVE_HYBRID_SHORT_EXCEPTION_CAPACITY,
+            NATIVE_HYBRID_SHORT_EXCEPTION_CAPACITY,
+            cells,
+            kind,
+            short_value_offset,
+        )?;
+        assembler.branch(&[0xe9], done)?;
+        assembler.bind(long)?;
+        assembler.instruction(&[0x0f, 0xb6, 0x04, 0x17])?;
+        if matches!(transitions, TransitionLayout::HybridSparseExceptions(_)) {
+            assembler.instruction(&[0x41, 0x0f, 0xb6, 0x04, 0x01])?;
+        }
+        x86_emit_sparse_exception_lookup(assembler, exception_capacity, cells, kind)?;
+        assembler.bind(done)?;
+        return Ok(());
+    }
     if let Some(threshold) = sparse_boundary_tier {
         let (exception_capacity, class_keyed) = match transitions {
             TransitionLayout::DefaultSparseExceptions(capacity) => (capacity, true),
@@ -16181,6 +17102,10 @@ fn x86_emit_table_lookup_with_sparse_boundary_tier(
         TransitionLayout::BitSliceBytes(value_capacity) => {
             x86_emit_bit_slice_lookup(assembler, value_capacity, cells)?;
             return Ok(());
+        }
+        TransitionLayout::HybridSparseExceptions(_)
+        | TransitionLayout::HybridByteSparseExceptions(_) => {
+            unreachable!("hybrid sparse lookup returned before the ordinary dispatch")
         }
     }
     match cells {
@@ -18909,12 +19834,29 @@ fn lower_x86_64_dfa_with_entry_contract(
     let sparse_boundary_tier = x86_sparse_boundary_tier(&layout, table_lookup_kind);
     let filter_kind = (layout.exact_start_byte_set.is_some() || instruction_filter.is_some())
         .then_some(table_lookup_kind);
-    let table_lookup_needs_vzeroupper = layout
-        .transitions
-        .scalable_exception_capacity()
-        .is_some_and(|capacity| {
-            x86_sparse_lookup_needs_vzeroupper(capacity, layout.cells, table_lookup_kind)
-        });
+    let table_lookup_needs_vzeroupper = match layout.transitions {
+        TransitionLayout::HybridSparseExceptions(capacity)
+        | TransitionLayout::HybridByteSparseExceptions(capacity) => {
+            x86_sparse_lookup_needs_vzeroupper(
+                NATIVE_HYBRID_SHORT_EXCEPTION_CAPACITY,
+                layout.cells,
+                table_lookup_kind,
+            ) || x86_sparse_lookup_needs_vzeroupper(
+                capacity,
+                layout.cells,
+                table_lookup_kind,
+            )
+        }
+        transitions => transitions
+            .scalable_exception_capacity()
+            .is_some_and(|capacity| {
+                x86_sparse_lookup_needs_vzeroupper(
+                    capacity,
+                    layout.cells,
+                    table_lookup_kind,
+                )
+            }),
+    };
     let exact_vector_kind = if layout.exact_start_byte_set.is_some() {
         filter_kind.filter(|kind| !matches!(kind, X86StartFilterKind::Sse2))
     } else {
@@ -29652,6 +30594,31 @@ fn aarch64_emit_sparse_exception_lookup_prefix(
     operating_system: OperatingSystem,
     sve_fused_boundary: bool,
 ) -> Result<(), ObjectError> {
+    let value_offset = native_default_exception_value_offset(row_exception_capacity, cells).ok_or(
+        ObjectError::InvalidModule("AArch64 scalable-exception value offset"),
+    )?;
+    aarch64_emit_sparse_exception_lookup_prefix_with_value_offset(
+        assembler,
+        row_exception_capacity,
+        probe_exception_capacity,
+        cells,
+        features,
+        operating_system,
+        sve_fused_boundary,
+        value_offset,
+    )
+}
+
+fn aarch64_emit_sparse_exception_lookup_prefix_with_value_offset(
+    assembler: &mut Aarch64Assembler,
+    row_exception_capacity: u8,
+    probe_exception_capacity: u8,
+    cells: NativeCellEncoding,
+    features: FeatureSet,
+    operating_system: OperatingSystem,
+    sve_fused_boundary: bool,
+    value_offset: usize,
+) -> Result<(), ObjectError> {
     let capacity = usize::from(probe_exception_capacity);
     let row_capacity = usize::from(row_exception_capacity);
     if !matches!(cells, NativeCellEncoding::Compact16 | NativeCellEncoding::Wide32)
@@ -29663,9 +30630,19 @@ fn aarch64_emit_sparse_exception_lookup_prefix(
             "AArch64 scalable-exception row shape",
         ));
     }
-    let value_offset = native_default_exception_value_offset(row_exception_capacity, cells).ok_or(
-        ObjectError::InvalidModule("AArch64 scalable-exception value offset"),
-    )?;
+    if value_offset
+        < cells
+            .bytes()
+            .checked_add(capacity)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "AArch64 scalable-exception key extent",
+            ))?
+        || !value_offset.is_multiple_of(cells.bytes())
+    {
+        return Err(ObjectError::InvalidModule(
+            "AArch64 scalable-exception explicit value offset",
+        ));
+    }
     let inline_default_slot = probe_exception_capacity == row_exception_capacity
         && row_capacity < native_default_exception_physical_slots(row_exception_capacity);
     let default = assembler.label()?;
@@ -29961,6 +30938,61 @@ fn aarch64_emit_table_lookup_with_sparse_boundary_tier(
         }
         return Ok(());
     }
+    if let TransitionLayout::HybridSparseExceptions(exception_capacity)
+    | TransitionLayout::HybridByteSparseExceptions(exception_capacity) = transitions
+    {
+        if sparse_boundary_tier.is_some()
+            || sve_fused_boundary
+            || exception_capacity <= NATIVE_HYBRID_SHORT_EXCEPTION_CAPACITY
+        {
+            return Err(ObjectError::InvalidModule(
+                "AArch64 hybrid sparse dispatch shape",
+            ));
+        }
+        let long = assembler.label()?;
+        let done = assembler.label()?;
+        // The discriminator owns W8, so both exact lookup routes reload their
+        // query only after the row shape has been selected.
+        aarch64_emit_sparse_duplicate_boundary_guard(
+            assembler,
+            exception_capacity,
+            NATIVE_HYBRID_SHORT_EXCEPTION_CAPACITY,
+            cells,
+            long,
+        )?;
+        assembler.instruction(aarch64_load_byte_reg(8, 0, 2)?)?;
+        if matches!(transitions, TransitionLayout::HybridSparseExceptions(_)) {
+            assembler.instruction(aarch64_load_byte_reg(8, 5, 8)?)?;
+        }
+        let short_value_offset = native_hybrid_sparse_short_value_offset(cells).ok_or(
+            ObjectError::InvalidModule("AArch64 hybrid sparse short value offset"),
+        )?;
+        aarch64_emit_sparse_exception_lookup_prefix_with_value_offset(
+            assembler,
+            NATIVE_HYBRID_SHORT_EXCEPTION_CAPACITY,
+            NATIVE_HYBRID_SHORT_EXCEPTION_CAPACITY,
+            cells,
+            features,
+            operating_system,
+            false,
+            short_value_offset,
+        )?;
+        assembler.branch(done)?;
+        assembler.bind(long)?;
+        assembler.instruction(aarch64_load_byte_reg(8, 0, 2)?)?;
+        if matches!(transitions, TransitionLayout::HybridSparseExceptions(_)) {
+            assembler.instruction(aarch64_load_byte_reg(8, 5, 8)?)?;
+        }
+        aarch64_emit_sparse_exception_lookup(
+            assembler,
+            exception_capacity,
+            cells,
+            features,
+            operating_system,
+        )?;
+        assembler.bind(done)?;
+        return Ok(());
+    }
     if let Some(threshold) = sparse_boundary_tier {
         let (exception_capacity, class_keyed) = match transitions {
             TransitionLayout::DefaultSparseExceptions(capacity) => (capacity, true),
@@ -30083,6 +31115,10 @@ fn aarch64_emit_table_lookup_with_sparse_boundary_tier(
         TransitionLayout::BitSliceBytes(value_capacity) => {
             aarch64_emit_bit_slice_lookup(assembler, value_capacity, cells)?;
             return Ok(());
+        }
+        TransitionLayout::HybridSparseExceptions(_)
+        | TransitionLayout::HybridByteSparseExceptions(_) => {
+            unreachable!("hybrid sparse lookup returned before the ordinary dispatch")
         }
     }
     match cells {
@@ -33115,12 +34151,11 @@ fn lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
     let use_asimd_loop = sve_loop_kind.is_none()
         && features.has(CpuFeature::Aarch64Asimd)
         && layout.loop_skip.is_some();
-    let sparse_lookup_isa = layout
-        .transitions
-        .scalable_exception_capacity()
-        .map_or(Aarch64PrimaryScannerIsa::Scalar, |_| {
-            aarch64_primary_scanner_isa(operating_system, features, true)
-        });
+    let sparse_lookup_isa = if layout.transitions.uses_vector_sparse_lookup() {
+        aarch64_primary_scanner_isa(operating_system, features, true)
+    } else {
+        Aarch64PrimaryScannerIsa::Scalar
+    };
     let sparse_boundary_tier =
         aarch64_sparse_boundary_tier(&layout, features, operating_system);
     let sparse_sve_fused_boundary =
@@ -41395,6 +42430,182 @@ mod tests {
         }
     }
 
+    /// A benchmark-independent variable-row fixture spanning every semantic
+    /// edge of the short/long discriminator. Equal exception counts produce
+    /// exactly equal graph rows, so the same fixture also composes with exact
+    /// row interning. Singleton exceptional preimages prove the raw-byte form;
+    /// repeated preimages force the class-keyed form without changing rows.
+    struct HybridSparseFixture {
+        byte_classes: [u8; 256],
+        class_representatives: [u8; Self::CLASS_COUNT],
+        forward_cells: Vec<ForwardCell>,
+        row_exception_counts: Vec<usize>,
+    }
+
+    impl HybridSparseFixture {
+        const CLASS_COUNT: usize = 128;
+        const EXCEPTION_CAPACITY: usize = 31;
+        const RESUME_STATES: usize = 3;
+
+        fn new(singleton_exception_preimages: bool, last_row_is_long: bool) -> Self {
+            let byte_classes = if singleton_exception_preimages {
+                core::array::from_fn(|byte| {
+                    if byte < Self::CLASS_COUNT {
+                        u8::try_from(byte).unwrap()
+                    } else {
+                        0
+                    }
+                })
+            } else {
+                core::array::from_fn(|byte| {
+                    u8::try_from(byte % Self::CLASS_COUNT).unwrap()
+                })
+            };
+            let class_representatives = core::array::from_fn(|class| {
+                u8::try_from(
+                    byte_classes
+                        .iter()
+                        .position(|&actual| usize::from(actual) == class)
+                        .unwrap(),
+                )
+                .unwrap()
+            });
+            let mut row_exception_counts = vec![
+                0,
+                1,
+                15,
+                16,
+                17,
+                Self::EXCEPTION_CAPACITY,
+                1,
+                Self::EXCEPTION_CAPACITY,
+                16,
+                17,
+                15,
+                if last_row_is_long {
+                    Self::EXCEPTION_CAPACITY
+                } else {
+                    0
+                },
+            ];
+            let complete_states = row_exception_counts.len();
+            let complete_states_u32 = u32::try_from(complete_states).unwrap();
+            let mut forward_cells = Vec::with_capacity(
+                complete_states.checked_mul(Self::CLASS_COUNT).unwrap(),
+            );
+            for &exception_count in &row_exception_counts {
+                let first_exception = Self::CLASS_COUNT - exception_count;
+                for class in 0..Self::CLASS_COUNT {
+                    let cell = if class < first_exception {
+                        ForwardCell::new(0, false)
+                    } else {
+                        match (class - first_exception) % 7 {
+                            0 => ForwardCell::new(NO_DFA_STATE, false),
+                            1 => ForwardCell::new(complete_states_u32, false),
+                            2 => ForwardCell::new(complete_states_u32 + 1, true),
+                            3 => ForwardCell::new(1, false),
+                            4 => ForwardCell::new(0, true),
+                            5 => ForwardCell::new(NO_DFA_STATE, true),
+                            _ => ForwardCell::new(complete_states_u32 + 2, false),
+                        }
+                    };
+                    forward_cells.push(cell);
+                }
+            }
+            // Keep ownership explicit: tests mutate this vector when scaling
+            // the same graph shape across the Compact16/Wide32 token boundary.
+            row_exception_counts.shrink_to_fit();
+            Self {
+                byte_classes,
+                class_representatives,
+                forward_cells,
+                row_exception_counts,
+            }
+        }
+
+        fn repeated(
+            singleton_exception_preimages: bool,
+            complete_states: usize,
+        ) -> Self {
+            assert!(complete_states >= 2);
+            let template = Self::new(singleton_exception_preimages, true);
+            let row_exception_counts = (0..complete_states)
+                .map(|state| {
+                    if state % 3 == 0 {
+                        16
+                    } else {
+                        Self::EXCEPTION_CAPACITY
+                    }
+                })
+                .collect::<Vec<_>>();
+            let complete_states_u32 = u32::try_from(complete_states).unwrap();
+            let mut forward_cells = Vec::with_capacity(
+                complete_states.checked_mul(Self::CLASS_COUNT).unwrap(),
+            );
+            for &exception_count in &row_exception_counts {
+                let first_exception = Self::CLASS_COUNT - exception_count;
+                for class in 0..Self::CLASS_COUNT {
+                    let cell = if class < first_exception {
+                        ForwardCell::new(0, false)
+                    } else {
+                        match (class - first_exception) % 7 {
+                            0 => ForwardCell::new(NO_DFA_STATE, false),
+                            1 => ForwardCell::new(complete_states_u32, false),
+                            2 => ForwardCell::new(complete_states_u32 + 1, true),
+                            3 => ForwardCell::new(1, false),
+                            4 => ForwardCell::new(0, true),
+                            5 => ForwardCell::new(NO_DFA_STATE, true),
+                            _ => ForwardCell::new(complete_states_u32 + 2, false),
+                        }
+                    };
+                    forward_cells.push(cell);
+                }
+            }
+            Self {
+                byte_classes: template.byte_classes,
+                class_representatives: template.class_representatives,
+                forward_cells,
+                row_exception_counts,
+            }
+        }
+
+        fn complete_states(&self) -> usize {
+            self.row_exception_counts.len()
+        }
+
+        fn discovered_states(&self) -> usize {
+            self.complete_states() + Self::RESUME_STATES
+        }
+
+        fn view<'a>(
+            &'a self,
+            base: NativeProgramView<'a>,
+            collapse_partial_holes: bool,
+        ) -> NativeProgramView<'a> {
+            NativeProgramView {
+                dfa: NativeDfaView {
+                    initial_state: 0,
+                    initial_pending: false,
+                    initial_terminal: false,
+                    byte_classes: &self.byte_classes,
+                    class_count: Self::CLASS_COUNT,
+                    class_representatives: &self.class_representatives,
+                    forward_cells: &self.forward_cells,
+                    reverse_initial: None,
+                    reverse_cells: &[],
+                },
+                partial_discovered_states: Some(self.discovered_states()),
+                collapse_partial_holes,
+                exact_match_width: None,
+                max_match_width: None,
+                exact_product_width: None,
+                retained_prefix_requirement: None,
+                retained_suffix_requirement: None,
+                ..base
+            }
+        }
+    }
+
     /// Every retained row after row zero names ten distinct incomplete
     /// destinations and one row-specific live destination. Packed collapsed
     /// semantics retain only two observable hole variants (accepted and
@@ -42001,6 +43212,46 @@ mod tests {
         )
     }
 
+    fn derive_forced_hybrid_sparse_plan(
+        view: NativeProgramView<'_>,
+        architecture: Architecture,
+        exact_rows: Option<&NativeExactRowInternPlan>,
+    ) -> (NativeDefaultExceptionPlan, NativeHybridSparsePlan) {
+        let comparison = derive_native_default_exception_plan(
+            view.dfa,
+            view.partial_discovered_states,
+            view.collapse_partial_holes,
+            architecture,
+        )
+        .expect("synthetic hybrid sparse comparison plan");
+        let hybrid = derive_native_hybrid_sparse_plan(view, comparison, exact_rows)
+            .expect("synthetic hybrid sparse variable-row plan");
+        (comparison, hybrid)
+    }
+
+    fn build_forced_hybrid_sparse_table(
+        view: NativeProgramView<'_>,
+        architecture: Architecture,
+        maximum: usize,
+        exact_rows: Option<&NativeExactRowInternPlan>,
+    ) -> Result<(Vec<u8>, NativeDfaLayout), ObjectError> {
+        let (_, plan) = derive_forced_hybrid_sparse_plan(view, architecture, exact_rows);
+        build_native_dfa_table_with_cost_model_and_data_limit_once_with_exact_rows_and_asimd_policy(
+            view,
+            architecture,
+            NativeVectorFilterCostModel::Established,
+            true,
+            maximum,
+            None,
+            exact_rows,
+            false,
+            None,
+            None,
+            Some(&plan),
+            architecture == Architecture::Aarch64,
+        )
+    }
+
     fn lower_forced_default_exception_table_for_target(
         view: NativeProgramView<'_>,
         target: Target,
@@ -42109,6 +43360,64 @@ mod tests {
             if data[row_start + cell_bytes + slot] == key {
                 let value = row_start + value_offset + slot * cell_bytes;
                 packed = read_native_packed_cell(data, value, layout.cells);
+                break;
+            }
+        }
+        packed
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the oracle walks authenticated variable-row extents and indexes one validated record"
+    )]
+    fn hybrid_sparse_packed_at(
+        data: &[u8],
+        layout: NativeDfaLayout,
+        view: NativeProgramView<'_>,
+        physical_state: usize,
+        byte: u8,
+    ) -> u32 {
+        let (long_capacity, key) = match layout.transitions {
+            TransitionLayout::HybridSparseExceptions(capacity) => {
+                (capacity, view.dfa.byte_classes[usize::from(byte)])
+            }
+            TransitionLayout::HybridByteSparseExceptions(capacity) => (capacity, byte),
+            other => panic!("expected hybrid sparse rows, got {other:?}"),
+        };
+        let cell_bytes = layout.cells.bytes();
+        let short_row_bytes = native_hybrid_sparse_short_row_bytes(layout.cells).unwrap();
+        let long_row_bytes =
+            native_default_exception_row_bytes(long_capacity, layout.cells).unwrap();
+        let mut row_start = usize::try_from(layout.forward_offset).unwrap();
+        for _ in 0..physical_state {
+            let short = data[row_start + cell_bytes + 15]
+                == data[row_start + cell_bytes + 16];
+            row_start += if short {
+                short_row_bytes
+            } else {
+                long_row_bytes
+            };
+        }
+        let short = data[row_start + cell_bytes + 15]
+            == data[row_start + cell_bytes + 16];
+        let capacity = if short {
+            NATIVE_HYBRID_SHORT_EXCEPTION_CAPACITY
+        } else {
+            long_capacity
+        };
+        let value_offset = if short {
+            native_hybrid_sparse_short_value_offset(layout.cells).unwrap()
+        } else {
+            native_default_exception_value_offset(long_capacity, layout.cells).unwrap()
+        };
+        let mut packed = read_native_packed_cell(data, row_start, layout.cells);
+        for slot in 0..usize::from(capacity) {
+            if data[row_start + cell_bytes + slot] == key {
+                packed = read_native_packed_cell(
+                    data,
+                    row_start + value_offset + slot * cell_bytes,
+                    layout.cells,
+                );
                 break;
             }
         }
@@ -42396,6 +43705,252 @@ mod tests {
         ))
     }
 
+    #[derive(Clone, Copy)]
+    struct LinkedHybridSparseNativeFixture {
+        byte_cells: [[ForwardCell; CLASS_MAP_BYTES]; 2],
+        partial: NativePartialDfaLayout,
+        entry_byte: u8,
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the linked fixture emits two self-describing rows and an independent byte oracle"
+    )]
+    fn linked_hybrid_sparse_native_fixture(
+        target: Target,
+        cells: NativeCellEncoding,
+        keys: NativeDefaultExceptionKeys,
+        collapse_holes: bool,
+    ) -> Result<(NativeLowering, LinkedHybridSparseNativeFixture), ObjectError> {
+        const CAPACITY: u8 = 31;
+        const ENTRY_KEY: u8 = 73;
+        assert!(matches!(
+            cells,
+            NativeCellEncoding::Compact16 | NativeCellEncoding::Wide32
+        ));
+        assert!(matches!(
+            keys,
+            NativeDefaultExceptionKeys::Classes | NativeDefaultExceptionKeys::Bytes
+        ));
+        let transitions = native_hybrid_sparse_transitions(keys, CAPACITY)
+            .expect("linked hybrid transition layout");
+        let short_row_bytes = native_hybrid_sparse_short_row_bytes(cells)
+            .expect("linked hybrid short row geometry");
+        let long_row_bytes = native_default_exception_row_bytes(CAPACITY, cells)
+            .expect("linked hybrid long row geometry");
+        let forward_offset = native_table_prefix_bytes(transitions, cells, CLASS_MAP_BYTES)
+            .expect("linked hybrid table prefix");
+        let long_row_offset = forward_offset
+            .checked_add(short_row_bytes)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "linked hybrid long row offset",
+            ))?;
+        let reverse_offset = long_row_offset
+            .checked_add(long_row_bytes)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "linked hybrid machine extent",
+            ))?;
+        let last_live_token = encode_native_row_offset(long_row_offset, cells).ok_or(
+            ObjectError::InvalidModule("linked hybrid final live token"),
+        )?;
+        let partial = NativePartialDfaLayout {
+            hole_token_base: u32::try_from(last_live_token.checked_add(1).ok_or(
+                ObjectError::ArithmeticOverflow("linked hybrid hole base"),
+            )?)
+            .map_err(|_| ObjectError::ArithmeticOverflow("linked hybrid hole base"))?,
+            resume_states: 2,
+            collapse_holes,
+        };
+        let row_offsets = [
+            u32::try_from(forward_offset)
+                .map_err(|_| ObjectError::ArithmeticOverflow("linked hybrid short row"))?,
+            u32::try_from(long_row_offset)
+                .map_err(|_| ObjectError::ArithmeticOverflow("linked hybrid long row"))?,
+        ];
+
+        let class_map: [u8; CLASS_MAP_BYTES] = core::array::from_fn(|byte| {
+            u8::try_from((byte * 73 + 19) & usize::from(u8::MAX)).unwrap()
+        });
+        let entry_byte = match keys {
+            NativeDefaultExceptionKeys::Classes => u8::try_from(
+                class_map
+                    .iter()
+                    .position(|&class| class == ENTRY_KEY)
+                    .expect("linked hybrid entry class"),
+            )
+            .unwrap(),
+            NativeDefaultExceptionKeys::Bytes => ENTRY_KEY,
+            NativeDefaultExceptionKeys::Boundaries => {
+                unreachable!("linked hybrid fixture excludes boundaries")
+            }
+        };
+
+        let short_default = ForwardCell::new(0, false);
+        let short_exception = ForwardCell::new(1, false);
+        let mut short_key_cells = [short_default; CLASS_MAP_BYTES];
+        short_key_cells[usize::from(ENTRY_KEY)] = short_exception;
+        let mut short_exceptions = [None; MAX_NATIVE_SPARSE_EXCEPTIONS];
+        short_exceptions[0] = Some((ENTRY_KEY, short_exception));
+
+        let long_default = ForwardCell::new(1, false);
+        let mut long_key_cells = [long_default; CLASS_MAP_BYTES];
+        let mut long_exceptions = [None; MAX_NATIVE_SPARSE_EXCEPTIONS];
+        for slot in 0..usize::from(CAPACITY) {
+            let key = u8::try_from(slot * CLASS_MAP_BYTES / usize::from(CAPACITY)).unwrap();
+            let cell = match slot % 8 {
+                0 => ForwardCell::new(1, true),
+                1 => ForwardCell::new(0, false),
+                2 => ForwardCell::new(2, false),
+                3 => ForwardCell::new(3, true),
+                4 => ForwardCell::new(NO_DFA_STATE, false),
+                5 => ForwardCell::new(NO_DFA_STATE, true),
+                6 => ForwardCell::new(1, false),
+                _ => ForwardCell::new(0, true),
+            };
+            long_key_cells[usize::from(key)] = cell;
+            long_exceptions[slot] = Some((key, cell));
+        }
+        let byte_cells = [short_key_cells, long_key_cells].map(|key_cells| {
+            core::array::from_fn(|byte| {
+                let key = match keys {
+                    NativeDefaultExceptionKeys::Classes => class_map[byte],
+                    NativeDefaultExceptionKeys::Bytes => u8::try_from(byte).unwrap(),
+                    NativeDefaultExceptionKeys::Boundaries => {
+                        unreachable!("linked hybrid fixture excludes boundaries")
+                    }
+                };
+                key_cells[usize::from(key)]
+            })
+        });
+
+        let pack = |cell: ForwardCell| {
+            pack_native_partial_forward_cell_with_variable_rows(
+                cell.next(),
+                cell.accepted(),
+                2,
+                false,
+                None,
+                partial,
+                cells,
+                None,
+                &row_offsets,
+            )
+        };
+        let mut data = Vec::new();
+        if keys == NativeDefaultExceptionKeys::Classes {
+            data.extend_from_slice(&class_map);
+        }
+        append_native_hybrid_sparse_short_record(
+            &mut data,
+            short_default,
+            &short_exceptions,
+            1,
+            cells,
+            pack,
+        )?;
+        append_native_default_exception_record(
+            &mut data,
+            long_default,
+            &long_exceptions,
+            usize::from(CAPACITY),
+            CAPACITY,
+            cells,
+            long_row_bytes,
+            pack,
+        )?;
+        if data.len() != reverse_offset {
+            return Err(ObjectError::InvalidModule(
+                "linked hybrid fixture emitted an unexpected machine extent",
+            ));
+        }
+
+        let needs_asimd_lane_index = target.architecture == Architecture::Aarch64
+            && target.features.has(CpuFeature::Aarch64Asimd);
+        let asimd_lane_index_offset = if needs_asimd_lane_index {
+            let aligned = data
+                .len()
+                .checked_add(AARCH64_FIRST_LANE_INDEX.len() - 1)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "linked hybrid ASIMD lane alignment",
+                ))?
+                & !(AARCH64_FIRST_LANE_INDEX.len() - 1);
+            data.resize(aligned, 0);
+            data.extend_from_slice(&AARCH64_FIRST_LANE_INDEX);
+            Some(u32::try_from(aligned).map_err(|_| {
+                ObjectError::ArithmeticOverflow("linked hybrid ASIMD lane offset")
+            })?)
+        } else {
+            None
+        };
+        let layout = NativeDfaLayout {
+            transitions,
+            cells,
+            forward_offset: row_offsets[0],
+            reverse_offset: u32::try_from(reverse_offset).map_err(|_| {
+                ObjectError::ArithmeticOverflow("linked hybrid reverse offset")
+            })?,
+            sparse_boundary_profile: None,
+            asimd_lane_index_offset,
+            initial_pending: false,
+            initial_terminal: false,
+            has_reverse: false,
+            partial: Some(partial),
+            exact_span_width: None,
+            exact_prefix_match_width: None,
+            output: OutputContract::SelectedEnd,
+            start_filter: None,
+            exact_start_byte_set: None,
+            exact_start_storage: None,
+            suffix_filter: None,
+            declined_redundant_root_reverse: false,
+            seeded_reverse: None,
+            loop_skip: None,
+            vector_filter: None,
+            prefix_filter: None,
+            prefix_relation: None,
+            prefix_block: None,
+            prefix_fast_forward: None,
+        };
+        if !native_default_exception_layout_is_valid(&layout) {
+            return Err(ObjectError::InvalidModule(
+                "linked hybrid layout failed validation",
+            ));
+        }
+        let emission = match target.architecture {
+            Architecture::X86_64 => lower_x86_64_dfa_with_entry_contract(
+                layout,
+                target.features,
+                NativeDfaEntryContract::PreparedPartialCore,
+            )?,
+            Architecture::Aarch64 => lower_aarch64_dfa_with_entry_contract_and_suffix_kind(
+                layout,
+                target.features,
+                target.operating_system,
+                None,
+                None,
+                NativeDfaEntryContract::PreparedPartialCore,
+            )?,
+        };
+        Ok((
+            NativeLowering {
+                code: emission.code,
+                data,
+                relocations: emission.relocations,
+                slow_partial_table: None,
+                needs_runtime: false,
+                start_accelerator: StartAccelerator::Scalar,
+                anchored_prefix_filter_bytes: 0,
+            },
+            LinkedHybridSparseNativeFixture {
+                byte_cells,
+                partial,
+                entry_byte,
+            },
+        ))
+    }
+
     #[allow(
         clippy::arithmetic_side_effects,
         clippy::too_many_arguments,
@@ -42620,6 +44175,61 @@ mod tests {
                 second: Some(selected_end),
                 position: None,
             },
+        }
+    }
+
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the two-row oracle advances only within its validated search window"
+    )]
+    fn linked_hybrid_sparse_expected(
+        fixture: LinkedHybridSparseNativeFixture,
+        haystack: &[u8],
+    ) -> LinkedSparseExpected {
+        let mut state = 0_usize;
+        let mut pending = None;
+        for (position, &byte) in haystack.iter().enumerate() {
+            let cell = fixture.byte_cells[state][usize::from(byte)];
+            let next_position = position + 1;
+            if cell.accepted() {
+                pending = Some(next_position);
+            }
+            match cell.next() {
+                NO_DFA_STATE => break,
+                next @ 0..=1 => {
+                    state = usize::try_from(next).unwrap();
+                }
+                next => {
+                    if next_position == haystack.len() {
+                        break;
+                    }
+                    let resume = usize::try_from(next - 2).unwrap();
+                    return LinkedSparseExpected {
+                        status: NATIVE_PARTIAL_STATUS_RESUME,
+                        first: Some(if fixture.partial.collapse_holes {
+                            0
+                        } else {
+                            resume
+                        }),
+                        second: pending,
+                        position: Some(next_position),
+                    };
+                }
+            }
+        }
+        let Some(selected_end) = pending else {
+            return LinkedSparseExpected {
+                status: 0,
+                first: None,
+                second: None,
+                position: None,
+            };
+        };
+        LinkedSparseExpected {
+            status: 1,
+            first: None,
+            second: Some(selected_end),
+            position: None,
         }
     }
 
@@ -43008,6 +44618,7 @@ mod tests {
             false,
             column_quotient.as_ref(),
             Some(plan),
+            None,
             architecture == Architecture::Aarch64,
         )
     }
@@ -48339,6 +49950,265 @@ mod tests {
                 output == OutputContract::Span
             );
         }
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    #[ignore = "links and executes both hybrid sparse row shapes on the host ISA"]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::too_many_lines,
+        reason = "the opt-in linked differential enters a short row then exhaustively queries a long row for every cell/key/hole form"
+    )]
+    fn linked_host_hybrid_sparse_short_and_long_rows_are_exact() {
+        use std::{fmt::Write as _, fs, process::Command};
+
+        const SCRATCH_ZERO: usize = 0x1122_3344_5566_7788;
+        const SCRATCH_ONE: usize = 0x8877_6655_4433_2211;
+        const PAYLOAD_SENTINEL: usize = 0xa5a5_5a5a_55aa_aa55;
+
+        struct LinkedCase {
+            fixture: LinkedHybridSparseNativeFixture,
+            label: String,
+        }
+
+        let target = linked_sparse_host_target();
+        let directory = std::env::temp_dir().join(format!(
+            "fre-aot-linked-hybrid-sparse-{}-{}",
+            std::process::id(),
+            if cfg!(target_arch = "x86_64") {
+                "x86"
+            } else {
+                "arm"
+            }
+        ));
+        if directory.exists() {
+            fs::remove_dir_all(&directory).unwrap();
+        }
+        fs::create_dir_all(&directory).unwrap();
+        let mut assembly = String::from(".text\n");
+        let mut source = String::from(
+            "#include <stdint.h>\n#include <stddef.h>\n#include <stdio.h>\n\
+             typedef struct { size_t first; size_t second; size_t position; size_t abi_bad; } payload_t;\n",
+        );
+        writeln!(
+            source,
+            "#define SCRATCH_ZERO ((size_t)UINT64_C({SCRATCH_ZERO}))\n\
+             #define SCRATCH_ONE ((size_t)UINT64_C({SCRATCH_ONE}))\n\
+             #define PAYLOAD_SENTINEL ((size_t)UINT64_C({PAYLOAD_SENTINEL}))"
+        )
+        .unwrap();
+        let mut objects = Vec::new();
+        let mut cases = Vec::new();
+        for cells in [NativeCellEncoding::Compact16, NativeCellEncoding::Wide32] {
+            for keys in [
+                NativeDefaultExceptionKeys::Bytes,
+                NativeDefaultExceptionKeys::Classes,
+            ] {
+                for collapse_holes in [false, true] {
+                    let (lowering, fixture) = linked_hybrid_sparse_native_fixture(
+                        target,
+                        cells,
+                        keys,
+                        collapse_holes,
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "linked hybrid fixture {cells:?}/{keys:?}/{collapse_holes}: {error}"
+                        )
+                    });
+                    match target.architecture {
+                        Architecture::X86_64 => {
+                            let mut guard = vec![0x41, 0x0f, 0xb7, 0x82];
+                            guard.extend_from_slice(
+                                &u32::try_from(cells.bytes() + 15).unwrap().to_le_bytes(),
+                            );
+                            assert!(lowering
+                                .code
+                                .windows(guard.len())
+                                .any(|bytes| bytes == guard));
+                        }
+                        Architecture::Aarch64 => {
+                            let words = lowering
+                                .code
+                                .chunks_exact(4)
+                                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                                .collect::<Vec<_>>();
+                            let left = u16::try_from(cells.bytes() + 15).unwrap();
+                            assert!(words
+                                .contains(&aarch64_load_byte_imm(8, 11, left).unwrap()));
+                            assert!(words
+                                .contains(&aarch64_load_byte_imm(12, 11, left + 1).unwrap()));
+                        }
+                    }
+                    let index = cases.len();
+                    let seed = format!(
+                        "fre-linked-hybrid-sparse-v1/{cells:?}/{keys:?}/{collapse_holes}"
+                    )
+                    .into_bytes();
+                    let module = CompiledModule::lower_serialized_with_prelowered(
+                        seed,
+                        Some(lowering),
+                        None,
+                        None,
+                        None,
+                        false,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        target,
+                    )
+                    .unwrap();
+                    assert!(module.required_runtime_symbol().is_none());
+                    assert!(module.prepared_entry_symbol().is_none());
+                    append_linked_sparse_wrapper_assembly(
+                        &mut assembly,
+                        index,
+                        module.entry_symbol(),
+                    );
+                    let object = directory.join(format!("case-{index}.o"));
+                    fs::write(
+                        &object,
+                        emit_object(
+                            &module,
+                            ObjectFormat::for_target(target),
+                            usize::MAX,
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    objects.push(object);
+                    writeln!(
+                        source,
+                        "extern uint32_t fre_sparse_wrap_{index}(const unsigned char*,size_t,size_t,size_t,size_t*,payload_t*);"
+                    )
+                    .unwrap();
+                    writeln!(
+                        source,
+                        "static void run_{index}(void){{for(unsigned b=0;b<256;b++){{unsigned char hs[1]={{(unsigned char)b}};size_t ss[2]={{SCRATCH_ZERO,SCRATCH_ONE}};payload_t ps={{PAYLOAD_SENTINEL,PAYLOAD_SENTINEL,PAYLOAD_SENTINEL,PAYLOAD_SENTINEL}};uint32_t rs=fre_sparse_wrap_{index}(hs,1,0,1,ss,&ps);printf(\"{index} 0 %u %u %zu %zu %zu %zu %zu %zu\\n\",b,rs,ps.first,ps.second,ps.position,ss[0],ss[1],ps.abi_bad);unsigned char hl[2]={{{},(unsigned char)b}};size_t sl[2]={{SCRATCH_ZERO,SCRATCH_ONE}};payload_t pl={{PAYLOAD_SENTINEL,PAYLOAD_SENTINEL,PAYLOAD_SENTINEL,PAYLOAD_SENTINEL}};uint32_t rl=fre_sparse_wrap_{index}(hl,2,0,2,sl,&pl);printf(\"{index} 1 %u %u %zu %zu %zu %zu %zu %zu\\n\",b,rl,pl.first,pl.second,pl.position,sl[0],sl[1],pl.abi_bad);}}}}",
+                        fixture.entry_byte,
+                    )
+                    .unwrap();
+                    cases.push(LinkedCase {
+                        fixture,
+                        label: format!(
+                            "hybrid cells={cells:?}/keys={keys:?}/collapse={collapse_holes}"
+                        ),
+                    });
+                }
+            }
+        }
+        source.push_str("int main(void){\n");
+        for index in 0..cases.len() {
+            writeln!(source, "run_{index}();").unwrap();
+        }
+        source.push_str("return 0;}\n");
+        if cfg!(target_os = "linux") {
+            assembly.push_str(if cfg!(target_arch = "x86_64") {
+                ".section .note.GNU-stack,\"\",@progbits\n"
+            } else {
+                ".section .note.GNU-stack,\"\",%progbits\n"
+            });
+        }
+
+        let assembly_path = directory.join("wrappers.S");
+        let wrapper_object = directory.join("wrappers.o");
+        let source_path = directory.join("oracle.c");
+        let executable = directory.join("oracle");
+        fs::write(&assembly_path, assembly).unwrap();
+        fs::write(&source_path, source).unwrap();
+        let compiler = if cfg!(target_os = "macos") {
+            "clang"
+        } else {
+            "cc"
+        };
+        let status = Command::new(compiler)
+            .arg("-c")
+            .arg(&assembly_path)
+            .arg("-o")
+            .arg(&wrapper_object)
+            .status()
+            .expect("assemble hybrid sparse ABI wrappers");
+        assert!(status.success(), "hybrid sparse wrappers failed to assemble");
+        let status = Command::new(compiler)
+            .arg("-O0")
+            .arg(&source_path)
+            .arg(&wrapper_object)
+            .args(&objects)
+            .arg("-o")
+            .arg(&executable)
+            .status()
+            .expect("link hybrid sparse native oracle");
+        assert!(status.success(), "hybrid sparse oracle failed to link");
+        let output = Command::new(&executable)
+            .output()
+            .expect("execute hybrid sparse native oracle");
+        assert!(
+            output.status.success(),
+            "status={:?} stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let mut lines = stdout.lines();
+        for (case_index, case) in cases.iter().enumerate() {
+            for byte in u8::MIN..=u8::MAX {
+                for shape in 0..=1_usize {
+                    let line = lines.next().unwrap_or_else(|| {
+                        panic!("missing linked hybrid result for {}/{shape}/{byte}", case.label)
+                    });
+                    let actual = line
+                        .split_ascii_whitespace()
+                        .map(|part| part.parse::<usize>().unwrap())
+                        .collect::<Vec<_>>();
+                    assert_eq!(actual.len(), 10, "{}/{shape}/{byte}", case.label);
+                    assert_eq!(
+                        &actual[..3],
+                        &[case_index, shape, usize::from(byte)],
+                        "{}",
+                        case.label,
+                    );
+                    let expected = if shape == 0 {
+                        linked_hybrid_sparse_expected(case.fixture, &[byte])
+                    } else {
+                        linked_hybrid_sparse_expected(
+                            case.fixture,
+                            &[case.fixture.entry_byte, byte],
+                        )
+                    };
+                    assert_eq!(
+                        actual[3],
+                        usize::try_from(expected.status).unwrap(),
+                        "{}/{shape}/{byte}/status",
+                        case.label,
+                    );
+                    if let Some(first) = expected.first {
+                        assert_eq!(actual[4], first, "{}/{shape}/{byte}/first", case.label);
+                    }
+                    if let Some(second) = expected.second {
+                        assert_eq!(actual[5], second, "{}/{shape}/{byte}/second", case.label);
+                    }
+                    if let Some(position) = expected.position {
+                        assert_eq!(actual[6], position, "{}/{shape}/{byte}/position", case.label);
+                    }
+                    assert_eq!(
+                        &actual[7..9],
+                        &[SCRATCH_ZERO, SCRATCH_ONE],
+                        "{}/{shape}/{byte}/private scratch",
+                        case.label,
+                    );
+                    assert_eq!(actual[9], 0, "{}/{shape}/{byte}/callee-saved ABI", case.label);
+                }
+            }
+        }
+        assert!(lines.next().is_none(), "unexpected hybrid sparse oracle output");
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[cfg(all(
@@ -60451,7 +62321,9 @@ int main(void){{
                         | TransitionLayout::OrdinalMapClasses(_)
                         | TransitionLayout::OrdinalMapBytes(_)
                         | TransitionLayout::BitSliceClasses(_)
-                        | TransitionLayout::BitSliceBytes(_) => {
+                        | TransitionLayout::BitSliceBytes(_)
+                        | TransitionLayout::HybridSparseExceptions(_)
+                        | TransitionLayout::HybridByteSparseExceptions(_) => {
                             panic!("unlimited partial table unexpectedly used resource rescue")
                         }
                     };
@@ -62117,6 +63989,371 @@ int main(void){{
                 None,
                 None,
             ));
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::too_many_lines,
+        reason = "both key domains, row orders, hole policies and target families authenticate every variable extent"
+    )]
+    fn hybrid_sparse_geometry_and_planner_cover_every_discriminator_boundary() {
+        assert_eq!(
+            native_hybrid_sparse_short_value_offset(NativeCellEncoding::Compact16),
+            Some(20),
+        );
+        assert_eq!(
+            native_hybrid_sparse_short_row_bytes(NativeCellEncoding::Compact16),
+            Some(52),
+        );
+        assert_eq!(
+            native_hybrid_sparse_short_value_offset(NativeCellEncoding::Wide32),
+            Some(24),
+        );
+        assert_eq!(
+            native_hybrid_sparse_short_row_bytes(NativeCellEncoding::Wide32),
+            Some(88),
+        );
+
+        let compiled = compile_partial_loop(Target::x86_64_linux(), OutputContract::SelectedEnd);
+        let base = compiled
+            .program()
+            .native_partial_dfa_view()
+            .expect("hybrid sparse geometry base")
+            .native;
+        for (singleton_exception_preimages, expected_keys) in [
+            (true, NativeDefaultExceptionKeys::Bytes),
+            (false, NativeDefaultExceptionKeys::Classes),
+        ] {
+            for last_row_is_long in [false, true] {
+                let fixture = HybridSparseFixture::new(
+                    singleton_exception_preimages,
+                    last_row_is_long,
+                );
+                for boundary in [0, 1, 15, 16, 17, HybridSparseFixture::EXCEPTION_CAPACITY] {
+                    assert!(fixture.row_exception_counts.contains(&boundary));
+                }
+                for collapse_partial_holes in [false, true] {
+                    let view = fixture.view(base, collapse_partial_holes);
+                    for architecture in [Architecture::X86_64, Architecture::Aarch64] {
+                        let (comparison, plan) =
+                            derive_forced_hybrid_sparse_plan(view, architecture, None);
+                        assert_eq!(comparison.keys, expected_keys, "{architecture:?}");
+                        assert_eq!(
+                            comparison.exception_capacity,
+                            u8::try_from(HybridSparseFixture::EXCEPTION_CAPACITY).unwrap(),
+                            "{architecture:?}",
+                        );
+                        assert_eq!(plan.keys, expected_keys, "{architecture:?}");
+                        assert_eq!(plan.cells, NativeCellEncoding::Compact16);
+                        assert_eq!(plan.short_row_bytes, 52);
+                        assert_eq!(plan.long_row_bytes, 96);
+                        assert_eq!(plan.row_offsets.len(), fixture.complete_states());
+                        assert_eq!(plan.short_rows.len(), fixture.complete_states());
+                        assert_eq!(
+                            plan.transitions(),
+                            match expected_keys {
+                                NativeDefaultExceptionKeys::Classes => {
+                                    TransitionLayout::HybridSparseExceptions(31)
+                                }
+                                NativeDefaultExceptionKeys::Bytes => {
+                                    TransitionLayout::HybridByteSparseExceptions(31)
+                                }
+                                NativeDefaultExceptionKeys::Boundaries => unreachable!(),
+                            },
+                        );
+
+                        let mut cursor = match expected_keys {
+                            NativeDefaultExceptionKeys::Classes => CLASS_MAP_BYTES,
+                            NativeDefaultExceptionKeys::Bytes => 0,
+                            NativeDefaultExceptionKeys::Boundaries => unreachable!(),
+                        };
+                        let mut prior_token = None;
+                        for (state, &exception_count) in
+                            fixture.row_exception_counts.iter().enumerate()
+                        {
+                            assert_eq!(plan.row_offset(state), Some(cursor));
+                            assert!(cursor.is_multiple_of(plan.cells.bytes()));
+                            let token = encode_native_row_offset(cursor, plan.cells).unwrap();
+                            assert!(prior_token.is_none_or(|prior| token > prior));
+                            prior_token = Some(token);
+                            let short = exception_count
+                                <= usize::from(NATIVE_HYBRID_SHORT_EXCEPTION_CAPACITY);
+                            assert_eq!(plan.short_rows[state], short);
+                            cursor += if short {
+                                plan.short_row_bytes
+                            } else {
+                                plan.long_row_bytes
+                            };
+                        }
+                        assert_eq!(plan.table_bytes, cursor);
+                        assert_eq!(
+                            plan.short_rows.last().copied(),
+                            Some(!last_row_is_long),
+                        );
+
+                        let lowering = build_forced_hybrid_sparse_table(
+                            view,
+                            architecture,
+                            usize::MAX,
+                            None,
+                        )
+                        .unwrap();
+                        assert_eq!(lowering.1.transitions, plan.transitions());
+                        assert_eq!(lowering.1.cells, plan.cells);
+                        assert_eq!(
+                            usize::try_from(lowering.1.reverse_offset).unwrap(),
+                            plan.table_bytes,
+                        );
+                        let partial = lowering.1.partial.expect("hybrid sparse partial layout");
+                        let last_start = plan.row_offset(fixture.complete_states() - 1).unwrap();
+                        assert_eq!(
+                            partial.hole_token_base,
+                            u32::try_from(
+                                encode_native_row_offset(last_start, plan.cells).unwrap() + 1,
+                            )
+                            .unwrap(),
+                        );
+                        assert_eq!(partial.collapse_holes, collapse_partial_holes);
+                        assert_eq!(
+                            partial.resume_states,
+                            u32::try_from(HybridSparseFixture::RESUME_STATES).unwrap(),
+                        );
+                        assert!(matches!(
+                            build_forced_hybrid_sparse_table(
+                                view,
+                                architecture,
+                                plan.table_bytes - 1,
+                                None,
+                            ),
+                            Err(ObjectError::Resource {
+                                resource: crate::CompileResource::ProgramBytes,
+                                limit,
+                                ..
+                            }) if limit == plan.table_bytes - 1
+                        ));
+
+                        let cell_bytes = plan.cells.bytes();
+                        for state in 0..fixture.complete_states() {
+                            let row_start = plan.row_offset(state).unwrap();
+                            let serialized_short = lowering.0[row_start + cell_bytes + 15]
+                                == lowering.0[row_start + cell_bytes + 16];
+                            assert_eq!(serialized_short, plan.short_rows[state]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::too_many_lines,
+        reason = "every logical alias, raw byte, packed flag, hole form and accelerator shares one exact variable-row oracle"
+    )]
+    fn hybrid_sparse_exact_rows_have_an_exhaustive_packed_oracle() {
+        let compiled = compile_partial_loop(Target::x86_64_linux(), OutputContract::SelectedEnd);
+        let base = compiled
+            .program()
+            .native_partial_dfa_view()
+            .expect("hybrid sparse oracle base")
+            .native;
+        for singleton_exception_preimages in [false, true] {
+            let fixture = HybridSparseFixture::new(singleton_exception_preimages, true);
+            for collapse_partial_holes in [false, true] {
+                let view = fixture.view(base, collapse_partial_holes);
+                let exact_rows = derive_native_exact_row_intern_plan(
+                    view.dfa,
+                    view.partial_discovered_states,
+                    view.collapse_partial_holes,
+                )
+                .expect("hybrid sparse duplicate rows");
+                assert!(exact_rows.physical_rows() < fixture.complete_states());
+                for architecture in [Architecture::X86_64, Architecture::Aarch64] {
+                    let (_, plan) = derive_forced_hybrid_sparse_plan(
+                        view,
+                        architecture,
+                        Some(&exact_rows),
+                    );
+                    let lowering = build_forced_hybrid_sparse_table(
+                        view,
+                        architecture,
+                        usize::MAX,
+                        Some(&exact_rows),
+                    )
+                    .unwrap();
+                    assert_eq!(plan.row_offsets.len(), exact_rows.physical_rows());
+                    assert!(plan.short_rows.iter().any(|&short| short));
+                    assert!(plan.short_rows.iter().any(|&short| !short));
+                    assert_eq!(
+                        usize::try_from(lowering.1.reverse_offset).unwrap(),
+                        plan.table_bytes,
+                    );
+                    let partial = lowering.1.partial.expect("hybrid exact partial layout");
+                    let mut saw_dead = false;
+                    let mut saw_hole = false;
+                    let mut saw_accept = false;
+                    let mut saw_live = false;
+                    let mut saw_accelerated = false;
+                    for logical_state in 0..fixture.complete_states() {
+                        let physical_state = exact_rows.physical_state(logical_state).unwrap();
+                        for byte in u8::MIN..=u8::MAX {
+                            let graph_class =
+                                usize::from(view.dfa.byte_classes[usize::from(byte)]);
+                            let semantic = view.dfa.forward_cells
+                                [logical_state * HybridSparseFixture::CLASS_COUNT + graph_class];
+                            let expected = pack_native_partial_forward_cell_with_variable_rows(
+                                semantic.next(),
+                                semantic.accepted(),
+                                fixture.complete_states(),
+                                lowering.1.has_start_scanner(),
+                                lowering.1.loop_skip.map(|skip| skip.state),
+                                partial,
+                                lowering.1.cells,
+                                Some(&exact_rows),
+                                &plan.row_offsets,
+                            )
+                            .unwrap();
+                            let actual = hybrid_sparse_packed_at(
+                                &lowering.0,
+                                lowering.1,
+                                view,
+                                physical_state,
+                                byte,
+                            );
+                            assert_eq!(
+                                actual, expected,
+                                "{architecture:?}/raw={singleton_exception_preimages}/collapse={collapse_partial_holes}/logical={logical_state}/byte={byte}",
+                            );
+                            saw_dead |= semantic.next() == NO_DFA_STATE;
+                            saw_hole |= semantic.next() != NO_DFA_STATE
+                                && usize::try_from(semantic.next()).unwrap()
+                                    >= fixture.complete_states();
+                            saw_accept |= semantic.accepted();
+                            saw_live |= semantic.next() != NO_DFA_STATE
+                                && usize::try_from(semantic.next()).unwrap()
+                                    < fixture.complete_states();
+                            saw_accelerated |= expected & lowering.1.cells.accelerated() != 0;
+                        }
+                    }
+                    assert!(saw_dead && saw_hole && saw_accept && saw_live && saw_accelerated);
+                    if let Some(skip) = lowering.1.loop_skip {
+                        let logical = usize::try_from(skip.state).unwrap();
+                        let physical = exact_rows.physical_state(logical).unwrap();
+                        assert_eq!(
+                            usize::try_from(skip.row_offset).unwrap(),
+                            plan.row_offset(physical).unwrap(),
+                        );
+                    }
+                    if let Some(fast_forward) = lowering.1.prefix_fast_forward {
+                        assert!(plan
+                            .row_offsets
+                            .contains(&fast_forward.target_row_offset));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::too_many_lines,
+        reason = "the first unencodable compact variable table and both final-row forms share one Wide32 proof"
+    )]
+    fn hybrid_sparse_wide_rows_preserve_alignment_tokens_and_final_shape() {
+        let compiled = compile_partial_loop(Target::x86_64_linux(), OutputContract::SelectedEnd);
+        let base = compiled
+            .program()
+            .native_partial_dfa_view()
+            .expect("hybrid sparse wide base")
+            .native;
+        for singleton_exception_preimages in [false, true] {
+            for complete_states in [600, 601] {
+                let fixture = HybridSparseFixture::repeated(
+                    singleton_exception_preimages,
+                    complete_states,
+                );
+                let view = fixture.view(base, false);
+                for architecture in [Architecture::X86_64, Architecture::Aarch64] {
+                    let (comparison, plan) =
+                        derive_forced_hybrid_sparse_plan(view, architecture, None);
+                    assert_eq!(comparison.cells, NativeCellEncoding::Wide32);
+                    assert_eq!(plan.cells, NativeCellEncoding::Wide32);
+                    assert_eq!(plan.short_row_bytes, 88);
+                    assert_eq!(plan.long_row_bytes, 160);
+                    assert!(plan
+                        .row_offsets
+                        .iter()
+                        .all(|offset| usize::try_from(*offset).unwrap().is_multiple_of(4)));
+                    assert_eq!(
+                        plan.short_rows.last().copied(),
+                        Some((complete_states - 1) % 3 == 0),
+                    );
+                    let lowering = build_forced_hybrid_sparse_table(
+                        view,
+                        architecture,
+                        usize::MAX,
+                        None,
+                    )
+                    .unwrap();
+                    assert_eq!(lowering.1.cells, NativeCellEncoding::Wide32);
+                    assert_eq!(lowering.1.transitions, plan.transitions());
+                    assert_eq!(
+                        usize::try_from(lowering.1.reverse_offset).unwrap(),
+                        plan.table_bytes,
+                    );
+                    let partial = lowering.1.partial.expect("wide hybrid partial layout");
+                    let last_start = plan.row_offset(complete_states - 1).unwrap();
+                    assert_eq!(
+                        partial.hole_token_base,
+                        u32::try_from(
+                            encode_native_row_offset(last_start, NativeCellEncoding::Wide32)
+                                .unwrap()
+                                + 1,
+                        )
+                        .unwrap(),
+                    );
+                    for state in 0..complete_states {
+                        let row_start = plan.row_offset(state).unwrap();
+                        let serialized_short = lowering.0[row_start + 4 + 15]
+                            == lowering.0[row_start + 4 + 16];
+                        assert_eq!(serialized_short, plan.short_rows[state]);
+                    }
+                    for state in [0, 1, complete_states - 2, complete_states - 1] {
+                        for byte in [0_u8, 96, 111, 112, 127, u8::MAX] {
+                            let class = usize::from(view.dfa.byte_classes[usize::from(byte)]);
+                            let semantic = view.dfa.forward_cells
+                                [state * HybridSparseFixture::CLASS_COUNT + class];
+                            let expected = pack_native_partial_forward_cell_with_variable_rows(
+                                semantic.next(),
+                                semantic.accepted(),
+                                complete_states,
+                                lowering.1.has_start_scanner(),
+                                lowering.1.loop_skip.map(|skip| skip.state),
+                                partial,
+                                lowering.1.cells,
+                                None,
+                                &plan.row_offsets,
+                            )
+                            .unwrap();
+                            assert_eq!(
+                                hybrid_sparse_packed_at(
+                                    &lowering.0,
+                                    lowering.1,
+                                    view,
+                                    state,
+                                    byte,
+                                ),
+                                expected,
+                                "{architecture:?}/raw={singleton_exception_preimages}/states={complete_states}/state={state}/byte={byte}",
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -67637,6 +69874,160 @@ int main(void){{
     #[test]
     #[allow(
         clippy::too_many_lines,
+        reason = "class/raw dispatch and every supported fixed/scalable target tier share one structural lowering proof"
+    )]
+    fn hybrid_sparse_dispatch_lowers_every_target_tier() {
+        let compiled = compile_partial_loop(Target::x86_64_linux(), OutputContract::SelectedEnd);
+        let base = compiled
+            .program()
+            .native_partial_dfa_view()
+            .expect("hybrid target-tier base")
+            .native;
+        let avx512 = FeatureSet::of(CpuFeature::X86Avx512F).with(CpuFeature::X86Avx512Bw);
+        let asimd = FeatureSet::of(CpuFeature::Aarch64Asimd);
+        let sve = FeatureSet::of(CpuFeature::Aarch64Sve);
+        let sve2 = sve.with(CpuFeature::Aarch64Sve2);
+        let targets = [
+            Target::x86_64_linux(),
+            Target::x86_64_macos(),
+            Target::x86_64_linux()
+                .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+                .unwrap(),
+            Target::x86_64_linux().with_features(avx512).unwrap(),
+            Target::aarch64_linux(),
+            Target::aarch64_macos().with_features(asimd).unwrap(),
+            Target::aarch64_linux().with_features(asimd).unwrap(),
+            Target::aarch64_linux().with_features(sve).unwrap(),
+            Target::aarch64_linux().with_features(sve2).unwrap(),
+            Target::aarch64_linux()
+                .with_features(asimd.with(CpuFeature::Aarch64Sve).with(CpuFeature::Aarch64Sve2))
+                .unwrap(),
+        ];
+        for singleton_exception_preimages in [false, true] {
+            let fixture = HybridSparseFixture::new(singleton_exception_preimages, true);
+            let view = fixture.view(base, false);
+            for target in targets {
+                let lowering = build_forced_hybrid_sparse_table(
+                    view,
+                    target.architecture,
+                    usize::MAX,
+                    None,
+                )
+                .unwrap();
+                assert!(native_default_exception_layout_is_valid(&lowering.1));
+                assert!(lowering.1.sparse_boundary_profile.is_none());
+                let class_keyed = matches!(
+                    lowering.1.transitions,
+                    TransitionLayout::HybridSparseExceptions(31)
+                );
+                assert_eq!(class_keyed, !singleton_exception_preimages, "{target:?}");
+                let code = match target.architecture {
+                    Architecture::X86_64 => {
+                        lower_x86_64_dfa(lowering.1, target.features).unwrap().0
+                    }
+                    Architecture::Aarch64 => lower_aarch64_dfa_for_operating_system(
+                        lowering.1,
+                        target.features,
+                        target.operating_system,
+                        None,
+                    )
+                    .unwrap()
+                    .0,
+                };
+                match target.architecture {
+                    Architecture::X86_64 => {
+                        let has = |instruction: &[u8]| {
+                            code.windows(instruction.len()).any(|bytes| bytes == instruction)
+                        };
+                        assert!(has(&[0x41, 0x0f, 0xb7, 0x82, 17, 0, 0, 0]), "{target:?}");
+                        assert!(has(&[0x38, 0xe0]), "{target:?}");
+                        assert!(
+                            code.windows(4)
+                                .filter(|bytes| *bytes == [0x0f, 0xb6, 0x04, 0x17])
+                                .count()
+                                >= 2,
+                            "{target:?}",
+                        );
+                        let class_load = [0x41, 0x0f, 0xb6, 0x04, 0x01];
+                        assert_eq!(
+                            code.windows(class_load.len())
+                                .any(|bytes| bytes == class_load),
+                            class_keyed,
+                            "{target:?}",
+                        );
+                        match x86_start_filter_kind(target.features) {
+                            X86StartFilterKind::Sse2 => {
+                                assert!(has(&[0x66, 0x41, 0x0f, 0xd7, 0xc6]), "{target:?}");
+                                assert!(has(&[0xf3, 0x45, 0x0f, 0x6f, 0xb2, 18, 0, 0, 0]), "{target:?}");
+                            }
+                            X86StartFilterKind::Avx2 => {
+                                assert!(has(&[0xc4, 0xc1, 0x79, 0xd7, 0xc6]), "{target:?}");
+                                assert!(has(&[0xc4, 0x41, 0x7d, 0x74, 0xb2, 2, 0, 0, 0]), "{target:?}");
+                                assert!(has(&[0xc5, 0xf8, 0x77, 0xc3]), "{target:?}");
+                            }
+                            X86StartFilterKind::Avx512Bw => {
+                                assert!(has(&[0xc4, 0xc1, 0x79, 0xd7, 0xc6]), "{target:?}");
+                                assert!(has(&[0x62, 0xd1, 0x7d, 0x48, 0x74, 0x8a, 2, 0, 0, 0]), "{target:?}");
+                                assert!(has(&[0xc5, 0xf8, 0x77, 0xc3]), "{target:?}");
+                            }
+                        }
+                    }
+                    Architecture::Aarch64 => {
+                        let words = code
+                            .chunks_exact(4)
+                            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                            .collect::<Vec<_>>();
+                        assert!(
+                            words.contains(&aarch64_load_byte_imm(8, 11, 17).unwrap()),
+                            "{target:?}",
+                        );
+                        assert!(
+                            words.contains(&aarch64_load_byte_imm(12, 11, 18).unwrap()),
+                            "{target:?}",
+                        );
+                        assert!(words.contains(&aarch64_cmp_w(8, 12).unwrap()), "{target:?}");
+                        assert!(
+                            words
+                                .iter()
+                                .filter(|&&word| word == aarch64_load_byte_reg(8, 0, 2).unwrap())
+                                .count()
+                                >= 2,
+                            "{target:?}",
+                        );
+                        assert_eq!(
+                            words.contains(&aarch64_load_byte_reg(8, 5, 8).unwrap()),
+                            class_keyed,
+                            "{target:?}",
+                        );
+                        match aarch64_primary_scanner_isa(
+                            target.operating_system,
+                            target.features,
+                            true,
+                        ) {
+                            Aarch64PrimaryScannerIsa::Scalar => {
+                                assert!(!words.contains(&aarch64_cmeq_16b(24, 24, 0).unwrap()));
+                                assert!(!words.contains(&aarch64_sve_whilelo_b(1, 10, 12).unwrap()));
+                            }
+                            Aarch64PrimaryScannerIsa::Asimd => {
+                                assert!(words.contains(&aarch64_cmeq_16b(24, 24, 0).unwrap()));
+                            }
+                            Aarch64PrimaryScannerIsa::Sve => {
+                                assert!(words.contains(&aarch64_sve_whilelo_b(1, 10, 12).unwrap()));
+                            }
+                            Aarch64PrimaryScannerIsa::SveWithAsimdVl16 => {
+                                assert!(words.contains(&aarch64_cmeq_16b(24, 24, 0).unwrap()));
+                                assert!(words.contains(&aarch64_sve_whilelo_b(1, 10, 12).unwrap()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
         reason = "the six ISA tiers and both AArch64 operating systems share one scalable-vector shape proof"
     )]
     fn scalable_sparse_vector_lookup_lowers_every_target_tier() {
@@ -67879,6 +70270,62 @@ int main(void){{
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn hybrid_sparse_admission_is_target_exact_and_strictly_two_to_one() {
+        let hot_short_rows = NativeSparseBoundaryProfile {
+            semantic_rows: 1,
+            stoppable_default_miss_byte_units: [256; NATIVE_SPARSE_BOUNDARY_TIERS.len()],
+            stoppable_row_byte_units: [256; NATIVE_SPARSE_BOUNDARY_TIERS.len()],
+        };
+        let cold_short_rows = NativeSparseBoundaryProfile {
+            semantic_rows: 1,
+            stoppable_default_miss_byte_units: [0; NATIVE_SPARSE_BOUNDARY_TIERS.len()],
+            stoppable_row_byte_units: [256; NATIVE_SPARSE_BOUNDARY_TIERS.len()],
+        };
+        let cells = NativeCellEncoding::Compact16;
+        let avx512 = FeatureSet::of(CpuFeature::X86Avx512F).with(CpuFeature::X86Avx512Bw);
+        for target in [
+            Target::x86_64_linux(),
+            Target::x86_64_linux()
+                .with_features(FeatureSet::of(CpuFeature::X86Avx2))
+                .unwrap(),
+            Target::x86_64_linux().with_features(avx512).unwrap(),
+            Target::aarch64_linux()
+                .with_features(FeatureSet::of(CpuFeature::Aarch64Asimd))
+                .unwrap(),
+        ] {
+            assert!(native_hybrid_sparse_guard_is_profitable(
+                hot_short_rows,
+                u8::MAX,
+                cells,
+                target,
+            ), "{target:?}");
+            assert!(!native_hybrid_sparse_guard_is_profitable(
+                cold_short_rows,
+                u8::MAX,
+                cells,
+                target,
+            ), "{target:?}");
+        }
+        assert!(!native_hybrid_sparse_guard_is_profitable(
+            hot_short_rows,
+            u8::MAX,
+            cells,
+            Target::aarch64_linux(),
+        ));
+        for features in [
+            FeatureSet::of(CpuFeature::Aarch64Sve),
+            FeatureSet::of(CpuFeature::Aarch64Sve).with(CpuFeature::Aarch64Sve2),
+        ] {
+            assert!(!native_hybrid_sparse_guard_is_profitable(
+                hot_short_rows,
+                u8::MAX,
+                cells,
+                Target::aarch64_linux().with_features(features).unwrap(),
+            ));
         }
     }
 
@@ -88611,7 +91058,9 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                     | TransitionLayout::OrdinalMapClasses(_)
                     | TransitionLayout::OrdinalMapBytes(_)
                     | TransitionLayout::BitSliceClasses(_)
-                    | TransitionLayout::BitSliceBytes(_) => {
+                    | TransitionLayout::BitSliceBytes(_)
+                    | TransitionLayout::HybridSparseExceptions(_)
+                    | TransitionLayout::HybridByteSparseExceptions(_) => {
                         panic!("complete table unexpectedly used partial resource rescue")
                     }
                 };
@@ -88671,7 +91120,9 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                     | TransitionLayout::OrdinalMapClasses(_)
                     | TransitionLayout::OrdinalMapBytes(_)
                     | TransitionLayout::BitSliceClasses(_)
-                    | TransitionLayout::BitSliceBytes(_) => {
+                    | TransitionLayout::BitSliceBytes(_)
+                    | TransitionLayout::HybridSparseExceptions(_)
+                    | TransitionLayout::HybridByteSparseExceptions(_) => {
                         panic!("reverse table unexpectedly used partial resource rescue")
                     }
                 };
@@ -93211,7 +95662,9 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                 | TransitionLayout::OrdinalMapClasses(_)
                 | TransitionLayout::OrdinalMapBytes(_)
                 | TransitionLayout::BitSliceClasses(_)
-                | TransitionLayout::BitSliceBytes(_) => {
+                | TransitionLayout::BitSliceBytes(_)
+                | TransitionLayout::HybridSparseExceptions(_)
+                | TransitionLayout::HybridByteSparseExceptions(_) => {
                     panic!("unlimited complete table unexpectedly used resource rescue")
                 }
             }
