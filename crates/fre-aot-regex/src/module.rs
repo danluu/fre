@@ -1074,8 +1074,10 @@ const DYNAMIC_ROWS_SPAN_RECOVERY_RUNTIME_SYMBOL: usize = 13;
 const DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL: usize = 14;
 
 const RUNTIME_SYMBOL_NAME: &str = "fre_aot_regex_runtime_search_v1";
-const PARTIAL_RUNTIME_SYMBOL_NAME: &str =
+const PARTIAL_RUNTIME_V2_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v2";
+const PARTIAL_RUNTIME_V3_SYMBOL_NAME: &str =
+    "fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v3";
 #[cfg(test)]
 const SLOW_PREFIX_CONTINUE_V1_RUNTIME_SYMBOL_NAME: &str =
     "fre_aot_regex_runtime_compiler_private_search_exclusive_static_prefix_continue_v1";
@@ -1280,8 +1282,37 @@ struct PreparedNativeEntryLayout {
     dynamic_rows: bool,
     slow_prefix: bool,
     slow_prefix_resume: bool,
+    /// The ordinary retained-row wrapper may enter an appended immutable
+    /// arbitrary-state continuation after its compact-v3 helper publishes
+    /// status 8. This is distinct from the static-prefix descriptor route.
+    retained_continuation_tail: bool,
     deferred_static_prefix_preflight: bool,
     deferred_static_prefix_hole: bool,
+}
+
+const fn prepared_partial_runtime_symbol_name(
+    prepared: PreparedNativeEntryLayout,
+) -> &'static str {
+    if prepared.deferred_static_prefix_hole {
+        SLOW_PREFIX_FUSED_CONTINUE_RUNTIME_SYMBOL_NAME
+    } else if prepared.slow_prefix_resume {
+        SLOW_PREFIX_CONTINUE_RUNTIME_SYMBOL_NAME
+    } else if prepared.retained_continuation_tail {
+        PARTIAL_RUNTIME_V3_SYMBOL_NAME
+    } else {
+        PARTIAL_RUNTIME_V2_SYMBOL_NAME
+    }
+}
+
+const fn partial_retains_continuation_tail(
+    output: OutputContract,
+    exact_match_width: Option<usize>,
+    initial_pending: bool,
+) -> bool {
+    !matches!(
+        (output, exact_match_width, initial_pending),
+        (OutputContract::Span, Some(0), _) | (OutputContract::Span, None, true)
+    )
 }
 
 const fn may_attempt_retained_slow_lowering(
@@ -2603,14 +2634,7 @@ impl CompiledModule {
                             .map_err(|_| ObjectError::ArithmeticOverflow("partial native core size"))?,
                     });
                     symbols.push(ModuleSymbol {
-                        name: if prepared.deferred_static_prefix_hole {
-                            SLOW_PREFIX_FUSED_CONTINUE_RUNTIME_SYMBOL_NAME
-                        } else if prepared.slow_prefix_resume {
-                            SLOW_PREFIX_CONTINUE_RUNTIME_SYMBOL_NAME
-                        } else {
-                            PARTIAL_RUNTIME_SYMBOL_NAME
-                        }
-                        .to_owned(),
+                        name: prepared_partial_runtime_symbol_name(prepared).to_owned(),
                         binding: SymbolBinding::Global,
                         kind: SymbolKind::Function,
                         section: None,
@@ -2868,9 +2892,11 @@ impl CompiledModule {
                             });
                         }
                         if needs_dynamic_rows_loop_scan_symbol {
-                            if !prepared.slow_prefix_resume {
+                            if !prepared.slow_prefix_resume
+                                && !prepared.retained_continuation_tail
+                            {
                                 return Err(ObjectError::InvalidModule(
-                                    "non-dynamic prepared loop helper has no static continuation",
+                                    "non-dynamic prepared loop helper has no immutable continuation",
                                 ));
                             }
                             while symbols.len() < DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL {
@@ -3600,6 +3626,7 @@ fn lower_native_dynamic_rows_prepared(
                 dynamic_rows: true,
                 slow_prefix: false,
                 slow_prefix_resume: false,
+                retained_continuation_tail: false,
                 deferred_static_prefix_preflight: false,
                 deferred_static_prefix_hole: false,
             }),
@@ -5105,6 +5132,7 @@ fn lower_native_slow_partial_prepared_with_data_limit(
                 dynamic_rows: false,
                 slow_prefix: true,
                 slow_prefix_resume: resume.is_some(),
+                retained_continuation_tail: false,
                 deferred_static_prefix_preflight: defer_preflight,
                 deferred_static_prefix_hole: defer_preflight && resume.is_some(),
             }),
@@ -5394,6 +5422,65 @@ fn lower_native_partial_prepared(
     let span_recovery = view.output == OutputContract::Span
         && !dfa.initial_pending
         && view.exact_match_width.is_none();
+    let source_variable_span =
+        view.output == OutputContract::Span && view.exact_match_width.is_none();
+    let exact_span_width = match (view.output, view.exact_match_width) {
+        (OutputContract::Exists | OutputContract::SelectedEnd, _) => None,
+        (OutputContract::Span, None) => None,
+        (OutputContract::Span, Some(width)) => Some(
+            u64::try_from(width)
+                .map_err(|_| ObjectError::ArithmeticOverflow("partial native Span width"))?,
+        ),
+    };
+    let retained_continuation_tail = partial_retains_continuation_tail(
+        view.output,
+        view.exact_match_width,
+        dfa.initial_pending,
+    );
+    let variable_span_recovery = source_variable_span && retained_continuation_tail;
+    let reverse_class_mode = NativeReverseClassMode::from_class_count(view.source_class_count)
+        .ok_or(ObjectError::InvalidModule(
+            "partial continuation source class count is outside the byte alphabet",
+        ))?;
+    let source_byte_classes = match (source_variable_span, view.source_byte_classes) {
+        (true, Some(classes)) => classes,
+        (true, None) => {
+            return Err(ObjectError::InvalidModule(
+                "partial variable Span has no exact K0 source byte-class map",
+            ));
+        }
+        (false, None) => [0; 256],
+        (false, Some(_)) => {
+            return Err(ObjectError::InvalidModule(
+                "partial non-variable output unexpectedly carries a K0 source byte-class map",
+            ));
+        }
+    };
+    if source_variable_span {
+        let mut source_classes_seen = [false; 256];
+        for (byte, &class) in source_byte_classes.iter().enumerate() {
+            let class = usize::from(class);
+            if class >= view.source_class_count {
+                return Err(ObjectError::InvalidModule(
+                    "partial K0 source class map exceeds its exact class count",
+                ));
+            }
+            if reverse_class_mode == NativeReverseClassMode::Identity && class != byte {
+                return Err(ObjectError::InvalidModule(
+                    "partial 256-class K0 source map is not canonical identity",
+                ));
+            }
+            source_classes_seen[class] = true;
+        }
+        if source_classes_seen[..view.source_class_count]
+            .iter()
+            .any(|&seen| !seen)
+        {
+            return Err(ObjectError::InvalidModule(
+                "partial K0 source class map omits a declared class",
+            ));
+        }
+    }
 
     // This is the sole target-specific selective-root publication gate. The
     // ordinary full-native lowering returns `None` unless its emitted scanner
@@ -5417,6 +5504,49 @@ fn lower_native_partial_prepared(
             "partial native core unexpectedly requires a runtime",
         ));
     }
+    let continuation_tail = if retained_continuation_tail {
+        let tail = match target.architecture {
+            Architecture::X86_64 => {
+                lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_impl(
+                    None,
+                    target.features,
+                    view.output,
+                    exact_span_width,
+                    false,
+                    view.source_class_count >= FROZEN_COMPACT_DIRECT_BYTE_MIN_CLASSES,
+                    true,
+                    true,
+                    view.source_class_count,
+                    true,
+                )?
+            }
+            Architecture::Aarch64 => {
+                lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_impl(
+                    None,
+                    view.output,
+                    exact_span_width,
+                    false,
+                    view.source_class_count >= FROZEN_COMPACT_DIRECT_BYTE_MIN_CLASSES,
+                    true,
+                    true,
+                    target.features.has(CpuFeature::Aarch64Asimd),
+                    view.source_class_count,
+                    true,
+                )?
+            }
+        };
+        if tail.scanner.is_some()
+            || tail.static_resume_entry_offset.is_none()
+            || tail.static_continuation_resume_entry_offset.is_none()
+        {
+            return Err(ObjectError::InvalidModule(
+                "partial immutable continuation tail is incomplete or retained a root scanner",
+            ));
+        }
+        Some(tail)
+    } else {
+        None
+    };
 
     let table_offset = program_bytes
         .len()
@@ -5429,12 +5559,37 @@ fn lower_native_partial_prepared(
         .len()
         .checked_sub(table_offset)
         .ok_or(ObjectError::ArithmeticOverflow("partial table size"))?;
+    let reverse_map_prefix_bytes =
+        if variable_span_recovery && reverse_class_mode.needs_map() {
+            NATIVE_DYNAMIC_REVERSE_CLASS_MAP_BYTES
+        } else {
+            0
+        };
     let identity_offset = program_bytes
         .len()
+        .checked_add(reverse_map_prefix_bytes)
+        .ok_or(ObjectError::ArithmeticOverflow(
+            "partial reverse class-map extent",
+        ))?
         .checked_add(15)
         .ok_or(ObjectError::ArithmeticOverflow("partial identity alignment"))?
         & !15;
-    program_bytes.resize(identity_offset, 0);
+    if reverse_map_prefix_bytes != 0 {
+        let map_offset = identity_offset
+            .checked_sub(NATIVE_DYNAMIC_REVERSE_CLASS_MAP_BYTES)
+            .ok_or(ObjectError::ArithmeticOverflow(
+                "partial reverse class-map offset",
+            ))?;
+        program_bytes.resize(map_offset, 0);
+        program_bytes.extend_from_slice(&source_byte_classes);
+    } else {
+        program_bytes.resize(identity_offset, 0);
+    }
+    if program_bytes.len() != identity_offset {
+        return Err(ObjectError::InvalidModule(
+            "partial reverse class map is not adjacent to the artifact identity",
+        ));
+    }
     program_bytes.extend_from_slice(&view.artifact_identity);
 
     let (mut code, mut relocations) = match target.architecture {
@@ -5458,10 +5613,15 @@ fn lower_native_partial_prepared(
             }
         }
     }
-    let (prepared_code, prepared_relocations) = match target.architecture {
+    let wrapper = match target.architecture {
         Architecture::X86_64 => lower_x86_64_partial_prepared(view)?,
         Architecture::Aarch64 => lower_aarch64_partial_prepared(view)?,
     };
+    let NativePartialPreparedWrapper {
+        code: prepared_code,
+        relocations: prepared_relocations,
+        continuation_resume_tail_call_offset,
+    } = wrapper;
     let code_size = prepared_code.len();
     push_bytes(&mut code, &prepared_code)?;
     for mut relocation in prepared_relocations {
@@ -5510,6 +5670,94 @@ fn lower_native_partial_prepared(
         relocations.push(relocation);
     }
 
+    match (continuation_resume_tail_call_offset, continuation_tail) {
+        (Some(continuation_resume_tail_call_offset), Some(continuation_tail)) => {
+            let continuation_local_entry = continuation_tail
+                .static_continuation_resume_entry_offset
+                .ok_or(ObjectError::InvalidModule(
+                    "partial continuation tail has no continuation side entry",
+                ))?;
+            // Require the ordinary side entry too even though this wrapper can
+            // only request status 8. Both entry ABIs are emitted by one shared
+            // selector and their joint presence makes a capability split fail.
+            let _ordinary_local_entry = continuation_tail.static_resume_entry_offset.ok_or(
+                ObjectError::InvalidModule(
+                    "partial continuation tail has no ordinary side entry",
+                ),
+            )?;
+            let tail_offset = code
+                .len()
+                .checked_add(code_alignment_mask)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "partial continuation tail alignment",
+                ))?
+                & !code_alignment_mask;
+            match target.architecture {
+                Architecture::X86_64 => code.resize(tail_offset, 0x90),
+                Architecture::Aarch64 => {
+                    while code.len() < tail_offset {
+                        push_bytes(&mut code, &0xd503_201f_u32.to_le_bytes())?;
+                    }
+                }
+            }
+            let absolute_tail_call = code_offset
+                .checked_add(continuation_resume_tail_call_offset)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "partial continuation local call offset",
+                ))?;
+            let absolute_tail_entry = tail_offset
+                .checked_add(continuation_local_entry)
+                .ok_or(ObjectError::ArithmeticOverflow(
+                    "partial continuation local entry offset",
+                ))?;
+            match target.architecture {
+                Architecture::X86_64 => {
+                    patch_x86_64_local_call(&mut code, absolute_tail_call, absolute_tail_entry)?;
+                }
+                Architecture::Aarch64 => {
+                    patch_aarch64_local_call(&mut code, absolute_tail_call, absolute_tail_entry)?;
+                }
+            }
+            push_bytes(&mut code, &continuation_tail.code)?;
+            for mut relocation in continuation_tail.relocations {
+                match relocation.symbol {
+                    PARTIAL_IDENTITY_SYMBOL
+                    | PREPARED_FALLBACK_RUNTIME_SYMBOL
+                    | DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL => {}
+                    DYNAMIC_ROWS_SPAN_RECOVERY_RUNTIME_SYMBOL
+                        if view.output == OutputContract::Span =>
+                    {
+                        // The appended arbitrary-state continuation retains the
+                        // original partial-preflight authority. Its variable-Span
+                        // postflight consumes the retained partial ticket.
+                        relocation.symbol = PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL;
+                    }
+                    _ => {
+                        // Public dynamic preflight, mutation, deopt, and
+                        // continuation helpers are unreachable here.
+                        continue;
+                    }
+                }
+                relocation.offset = relocation
+                    .offset
+                    .checked_add(offset_u64(
+                        tail_offset,
+                        "partial continuation tail relocation base",
+                    )?)
+                    .ok_or(ObjectError::ArithmeticOverflow(
+                        "partial continuation tail relocation offset",
+                    ))?;
+                relocations.push(relocation);
+            }
+        }
+        (None, None) => {}
+        _ => {
+            return Err(ObjectError::InvalidModule(
+                "partial continuation wrapper and appended tail disagree",
+            ));
+        }
+    }
+
     Ok(Some((
         NativeLowering {
             code,
@@ -5534,6 +5782,7 @@ fn lower_native_partial_prepared(
                 dynamic_rows: false,
                 slow_prefix: false,
                 slow_prefix_resume: false,
+                retained_continuation_tail,
                 deferred_static_prefix_preflight: false,
                 deferred_static_prefix_hole: false,
             }),
@@ -5564,6 +5813,17 @@ fn native_module_digest(
         if prepared.slow_prefix_resume && !prepared.slow_prefix {
             return Err(ObjectError::InvalidModule(
                 "static-prefix resume layout has no static prefix",
+            ));
+        }
+        if prepared.retained_continuation_tail
+            && (prepared.dynamic_rows
+                || prepared.slow_prefix
+                || prepared.slow_prefix_resume
+                || prepared.deferred_static_prefix_preflight
+                || prepared.deferred_static_prefix_hole)
+        {
+            return Err(ObjectError::InvalidModule(
+                "retained continuation tail conflicts with another prepared mode",
             ));
         }
         if prepared.deferred_static_prefix_preflight
@@ -5655,15 +5915,10 @@ fn native_module_digest(
             .any(|relocation| relocation.symbol == PARTIAL_RUNTIME_SYMBOL)
         {
             let partial_symbol_name = match prepared_layout.map(|layout| layout.kind) {
-                Some(PreparedEntryKind::Native(prepared))
-                    if prepared.deferred_static_prefix_hole =>
-                {
-                    SLOW_PREFIX_FUSED_CONTINUE_RUNTIME_SYMBOL_NAME
+                Some(PreparedEntryKind::Native(prepared)) => {
+                    prepared_partial_runtime_symbol_name(prepared)
                 }
-                Some(PreparedEntryKind::Native(prepared)) if prepared.slow_prefix_resume => {
-                    SLOW_PREFIX_CONTINUE_RUNTIME_SYMBOL_NAME
-                }
-                _ => PARTIAL_RUNTIME_SYMBOL_NAME,
+                _ => PARTIAL_RUNTIME_V2_SYMBOL_NAME,
             };
             update_bytes(
                 &mut digest,
@@ -29314,15 +29569,26 @@ fn lower_x86_64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_impl
     })
 }
 
+struct NativePartialPreparedWrapper {
+    code: Vec<u8>,
+    relocations: Vec<ModuleRelocation>,
+    continuation_resume_tail_call_offset: Option<usize>,
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the prepared SysV entry keeps helper validation, preflight, private native outcome, and continuation marshaling contiguous"
 )]
 fn lower_x86_64_partial_prepared(
     view: &NativePartialProgramView<'_>,
-) -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
+) -> Result<NativePartialPreparedWrapper, ObjectError> {
     const FRAME_BYTES: u8 = 72;
     let mut assembler = X86Assembler::new();
+    let emit_continuation_tail = partial_retains_continuation_tail(
+        view.output,
+        view.exact_match_width,
+        view.dfa.initial_pending,
+    );
     let span_recovery = view.output == OutputContract::Span
         && !view.dfa.initial_pending
         && view.exact_match_width.is_none();
@@ -29469,7 +29735,10 @@ fn lower_x86_64_partial_prepared(
     // Convert the core's r10/rdx/r11 state, position, and pending endpoint into
     // the compact private ABI. The canonical resume state supplies pending
     // mode, so only the raw endpoint occupies a SysV stack argument; identity
-    // and window stay in the consumed preflight ticket.
+    // and window stay in the preflight ticket. Preserve the first-unconsumed
+    // cursor in the frame because compact-v3 may replace every caller-saved
+    // register while publishing a status-8 canonical-state payload.
+    assembler.instruction(&[0x48, 0x89, 0x54, 0x24, 0x40])?;
     assembler.instruction(&[0x4c, 0x89, 0x1c, 0x24])?;
     assembler.instruction(&[0x49, 0x89, 0xd1])?; // position -> r9
     assembler.instruction(&[0x4d, 0x89, 0xd0])?; // state -> r8
@@ -29481,8 +29750,57 @@ fn lower_x86_64_partial_prepared(
     let runtime_displacement_label = assembler.label()?;
     assembler.bind(runtime_displacement_label)?;
     push_bytes(&mut assembler.code, &[0; 4])?;
+    let continuation_resume = assembler.label()?;
+    assembler.instruction(&[
+        0x83,
+        0xf8,
+        STATIC_PREFIX_NATIVE_CONTINUATION_RESUME_STATUS,
+    ])?;
+    assembler.branch(&[0x0f, 0x84], continuation_resume)?;
     assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
     assembler.instruction(&[0xc3])?;
+
+    assembler.bind(continuation_resume)?;
+    let continuation_resume_tail_call_displacement_label = if emit_continuation_tail {
+        // Reconstitute the public prepared ABI, recover the cursor saved before
+        // compact-v3, and load its canonical state/pending payload from the caller's
+        // still-private result slot. The appended local side entry selects the
+        // fixed second prepared header while retaining the original owner base.
+        assembler.instruction(&[0x48, 0x8b, 0x7c, 0x24, 0x10])?;
+        assembler.instruction(&[0x48, 0x8b, 0x74, 0x24, 0x18])?;
+        assembler.instruction(&[0x48, 0x8b, 0x54, 0x24, 0x20])?;
+        assembler.instruction(&[0x48, 0x8b, 0x4c, 0x24, 0x30])?;
+        assembler.instruction(&[0x4c, 0x8b, 0x44, 0x24, 0x38])?;
+        assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x28])?;
+        assembler.instruction(&[0x4c, 0x8b, 0x54, 0x24, 0x40])?;
+        assembler.instruction(&[0x4d, 0x8b, 0x19])?;
+        assembler.instruction(&[0x49, 0x8b, 0x41, 0x08])?;
+        assembler.instruction(&[0xe8])?;
+        let call = assembler.label()?;
+        assembler.bind(call)?;
+        push_bytes(&mut assembler.code, &[0; 4])?;
+        assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+        assembler.instruction(&[0xc3])?;
+        Some(call)
+    } else {
+        // The selected compatibility helper promises never to publish status 8
+        // for a Span shape that cannot retain this tail. Still scrub its private
+        // payload and fail closed if a mismatched runtime violates that ABI.
+        assembler.instruction(&[0x4c, 0x8b, 0x4c, 0x24, 0x28])?;
+        assembler.instruction(&[0x31, 0xc0])?;
+        assembler.instruction(&[0x49, 0x89, 0x01])?;
+        assembler.instruction(&[0x49, 0x89, 0x41, 0x08])?;
+        assembler.instruction(&[
+            0xb8,
+            PREPARED_RUNTIME_FAILURE_STATUS,
+            0,
+            0,
+            0,
+        ])?;
+        assembler.instruction(&[0x48, 0x83, 0xc4, FRAME_BYTES])?;
+        assembler.instruction(&[0xc3])?;
+        None
+    };
 
     assembler.bind(native_invalid)?;
     assembler.instruction(&[0xb8, 2, 0, 0, 0])?;
@@ -29510,6 +29828,9 @@ fn lower_x86_64_partial_prepared(
         })
         .transpose()?;
     let runtime_displacement = finished.label_offset(runtime_displacement_label)?;
+    let continuation_resume_tail_call_offset = continuation_resume_tail_call_displacement_label
+        .map(|label| finished.label_offset(label))
+        .transpose()?;
     let fallback_runtime_displacement =
         finished.label_offset(fallback_runtime_displacement_label)?;
     let mut relocations = vec![
@@ -29577,7 +29898,11 @@ fn lower_x86_64_partial_prepared(
             addend: -4,
         });
     }
-    Ok((finished.code, relocations))
+    Ok(NativePartialPreparedWrapper {
+        code: finished.code,
+        relocations,
+        continuation_resume_tail_call_offset,
+    })
 }
 
 type Aarch64Label = usize;
@@ -43879,9 +44204,14 @@ fn lower_aarch64_dynamic_rows_prepared_for_output_with_plan_and_capabilities_imp
 )]
 fn lower_aarch64_partial_prepared(
     view: &NativePartialProgramView<'_>,
-) -> Result<(Vec<u8>, Vec<ModuleRelocation>), ObjectError> {
+) -> Result<NativePartialPreparedWrapper, ObjectError> {
     const FRAME_BYTES: u16 = 64;
     let mut assembler = Aarch64Assembler::new();
+    let emit_continuation_tail = partial_retains_continuation_tail(
+        view.output,
+        view.exact_match_width,
+        view.dfa.initial_pending,
+    );
     let span_recovery = view.output == OutputContract::Span
         && !view.dfa.initial_pending
         && view.exact_match_width.is_none();
@@ -44004,16 +44334,55 @@ fn lower_aarch64_partial_prepared(
     assembler.bind(native_resume)?;
     // Convert the core's x6/x2/x7 state, position, and pending endpoint into
     // the compact seven-register ABI; the canonical resume state supplies
-    // pending mode and the preflight ticket owns the window.
+    // pending mode and the preflight ticket owns the window. Save the cursor
+    // before compact-v3 may clobber every caller-saved register.
+    assembler.instruction(aarch64_store_x(2, 31, 48)?)?;
     assembler.instruction(aarch64_mov_x(5, 2)?)?;
     assembler.instruction(aarch64_mov_x(4, 6)?)?;
     assembler.instruction(aarch64_mov_x(6, 7)?)?;
     assembler.instruction(aarch64_load_pair_x(0, 1, 31, 0)?)?;
     assembler.instruction(aarch64_load_pair_x(2, 3, 31, 16)?)?;
     let runtime_branch = assembler.instruction(0x9400_0000)?; // bl runtime helper
+    let continuation_resume = assembler.label()?;
+    assembler.instruction(aarch64_cmp_w_imm(
+        0,
+        u16::from(STATIC_PREFIX_NATIVE_CONTINUATION_RESUME_STATUS),
+    )?)?;
+    assembler.branch_cond(AARCH64_EQ, continuation_resume)?;
     assembler.instruction(aarch64_load_x_imm(30, 31, 56)?)?;
     assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
     assembler.instruction(0xd65f_03c0)?;
+
+    assembler.bind(continuation_resume)?;
+    let continuation_resume_tail_call = if emit_continuation_tail {
+        // Restore the public ABI in X0..X5, recover the saved cursor in X8, and
+        // load compact-v3's canonical state/pending payload from result[0..16].
+        // The appended continuation side entry saves the original X0 owner before
+        // selecting its fixed second prepared header.
+        assembler.instruction(aarch64_load_pair_x(0, 1, 31, 0)?)?;
+        assembler.instruction(aarch64_load_pair_x(2, 5, 31, 16)?)?;
+        assembler.instruction(aarch64_load_pair_x(3, 4, 31, 32)?)?;
+        assembler.instruction(aarch64_load_x_imm(8, 31, 48)?)?;
+        assembler.instruction(aarch64_load_pair_x(6, 7, 5, 0)?)?;
+        let call = assembler.instruction(0x9400_0000)?;
+        assembler.instruction(aarch64_load_x_imm(30, 31, 56)?)?;
+        assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+        assembler.instruction(0xd65f_03c0)?;
+        Some(call)
+    } else {
+        // Fail closed if a mismatched runtime ever exposes the private status
+        // on a Span shape that cannot retain this continuation tail.
+        assembler.instruction(aarch64_load_x_imm(5, 31, 24)?)?;
+        assembler.instruction(aarch64_store_pair_x(31, 31, 5, 0)?)?;
+        assembler.instruction(aarch64_movz_w(
+            0,
+            u16::from(PREPARED_RUNTIME_FAILURE_STATUS),
+        )?)?;
+        assembler.instruction(aarch64_load_x_imm(30, 31, 56)?)?;
+        assembler.instruction(aarch64_add_x_imm(31, 31, FRAME_BYTES)?)?;
+        assembler.instruction(0xd65f_03c0)?;
+        None
+    };
 
     assembler.bind(native_invalid)?;
     assembler.instruction(aarch64_movz_w(0, 2)?)?;
@@ -44032,6 +44401,11 @@ fn lower_aarch64_partial_prepared(
         runtime_branch,
         fallback_runtime_branch,
     ];
+    let continuation_resume_tail_call_index = continuation_resume_tail_call.map(|call| {
+        let index = relocation_offsets.len();
+        relocation_offsets.push(call);
+        index
+    });
     let span_recovery_relocation_base = span_recovery_relocations.map(
         |(identity_page, identity_page_offset, runtime_branch)| {
             let base = relocation_offsets.len();
@@ -44134,7 +44508,12 @@ fn lower_aarch64_partial_prepared(
             addend: 0,
         });
     }
-    Ok((code, relocations))
+    Ok(NativePartialPreparedWrapper {
+        code,
+        relocations,
+        continuation_resume_tail_call_offset: continuation_resume_tail_call_index
+            .map(|index| relocation_offsets[index]),
+    })
 }
 
 #[cfg(test)]
@@ -53692,6 +54071,16 @@ mod tests {
                     .is_none()
             );
             assert!(compiled.module().required_prepared_runtime_symbol().is_none());
+            assert_eq!(
+                compiled.module().symbols()[PARTIAL_RUNTIME_SYMBOL].name,
+                PARTIAL_RUNTIME_V2_SYMBOL_NAME,
+                "dynamic-row layouts retain the established slot-8 helper: {target:?}",
+            );
+            assert!(compiled
+                .module()
+                .symbols()
+                .iter()
+                .all(|symbol| symbol.name != PARTIAL_RUNTIME_V3_SYMBOL_NAME));
             assert_eq!(compiled.module().symbols()[PARTIAL_TABLE_SYMBOL].size, 0);
             assert_eq!(
                 compiled.module().symbols()[PARTIAL_NATIVE_CORE_SYMBOL].size,
@@ -66179,14 +66568,14 @@ int main(void){{
                 assert!(prepared.starts_with(PREPARED_ENTRY_SYMBOL_PREFIX));
                 assert_eq!(fallback_module.start_accelerator(), StartAccelerator::None);
                 assert_eq!(fallback_module.anchored_prefix_filter_bytes(), 0);
-                assert_eq!(fallback_module.symbols().len(), 11);
+                assert_eq!(fallback_module.symbols().len(), 15);
                 assert_eq!(
                     fallback_module.symbols()[PARTIAL_NATIVE_CORE_SYMBOL].section,
                     Some(TEXT_SECTION)
                 );
                 assert_eq!(
                     fallback_module.symbols()[PARTIAL_RUNTIME_SYMBOL].name,
-                    PARTIAL_RUNTIME_SYMBOL_NAME
+                    PARTIAL_RUNTIME_V3_SYMBOL_NAME
                 );
                 assert_eq!(
                     fallback_module.symbols()[PARTIAL_RUNTIME_SYMBOL].section,
@@ -66194,8 +66583,12 @@ int main(void){{
                 );
                 assert_eq!(
                     fallback_module.required_prepared_runtime_symbol(),
-                    Some(PARTIAL_RUNTIME_SYMBOL_NAME)
+                    Some(PARTIAL_RUNTIME_V3_SYMBOL_NAME)
                 );
+                assert!(fallback_module
+                    .symbols()
+                    .iter()
+                    .all(|symbol| symbol.name != PARTIAL_RUNTIME_V2_SYMBOL_NAME));
                 assert_eq!(
                     fallback_module.symbols()[PREPARED_FALLBACK_RUNTIME_SYMBOL].name,
                     PREPARED_FALLBACK_RUNTIME_SYMBOL_NAME
@@ -66224,6 +66617,14 @@ int main(void){{
                     fallback_module.required_prepared_preflight_runtime_symbol(),
                     Some(PREPARED_PREFLIGHT_RUNTIME_SYMBOL_NAME)
                 );
+                assert_eq!(
+                    fallback_module.required_prepared_dynamic_rows_loop_scan_runtime_symbol(),
+                    Some(DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL_NAME)
+                );
+                assert_eq!(
+                    fallback_module.symbols()[DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL].name,
+                    DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL_NAME
+                );
                 assert!(fallback_module.relocations().iter().any(|relocation| {
                     relocation.symbol == PARTIAL_TABLE_SYMBOL
                 }));
@@ -66239,6 +66640,17 @@ int main(void){{
                 assert!(fallback_module.relocations().iter().any(|relocation| {
                     relocation.symbol == PREPARED_PREFLIGHT_RUNTIME_SYMBOL
                 }));
+                assert_eq!(
+                    fallback_module
+                        .relocations()
+                        .iter()
+                        .filter(|relocation| {
+                            relocation.symbol == DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL
+                        })
+                        .count(),
+                    2,
+                    "only the appended V7/V6 continuation selector needs slot 14",
+                );
                 let serialized = compiled.program().serialize().expect("serialize program");
                 assert_eq!(
                     fallback_module.required_runtime_program().map(|(_, size)| size),
@@ -66304,8 +66716,13 @@ int main(void){{
             .native_partial_dfa_view()
             .expect("partial prepared view");
 
-        let (x86, x86_relocations) = lower_x86_64_partial_prepared(&view).unwrap();
-        assert_eq!(x86.len(), 223, "x86 combined prepared wrapper size");
+        let NativePartialPreparedWrapper {
+            code: x86,
+            relocations: x86_relocations,
+            continuation_resume_tail_call_offset: x86_continuation_call,
+        } = lower_x86_64_partial_prepared(&view).unwrap();
+        let x86_continuation_call = x86_continuation_call.expect("x86 status-8 local call");
+        assert_eq!(x86.len(), 289, "x86 combined prepared wrapper size");
         assert_eq!(
             x86_relocations
                 .iter()
@@ -66389,13 +66806,52 @@ int main(void){{
         );
         let runtime_offset = usize::try_from(x86_relocations[3].offset).unwrap();
         assert_eq!(x86.get(runtime_offset.wrapping_sub(1)), Some(&0xe8));
+        assert!(x86.windows(5).any(|bytes| {
+            bytes == [0x48, 0x89, 0x54, 0x24, 0x40]
+        }), "x86 compact-v3 path must preserve the native cursor");
+        assert!(x86.windows(3).any(|bytes| {
+            bytes
+                == [
+                    0x83,
+                    0xf8,
+                    STATIC_PREFIX_NATIVE_CONTINUATION_RESUME_STATUS,
+                ]
+        }));
+        assert_eq!(
+            x86.get(x86_continuation_call.wrapping_sub(1)..x86_continuation_call + 4),
+            Some([0xe8, 0, 0, 0, 0].as_slice())
+        );
+        assert_eq!(
+            x86.get(x86_continuation_call - 43..x86_continuation_call - 1),
+            Some(
+                [
+                    0x48, 0x8b, 0x7c, 0x24, 0x10, // handle
+                    0x48, 0x8b, 0x74, 0x24, 0x18, // haystack
+                    0x48, 0x8b, 0x54, 0x24, 0x20, // length
+                    0x48, 0x8b, 0x4c, 0x24, 0x30, // exact start
+                    0x4c, 0x8b, 0x44, 0x24, 0x38, // exact end
+                    0x4c, 0x8b, 0x4c, 0x24, 0x28, // result
+                    0x4c, 0x8b, 0x54, 0x24, 0x40, // saved cursor
+                    0x4d, 0x8b, 0x19, // canonical state = result[0]
+                    0x49, 0x8b, 0x41, 0x08, // pending = result[1]
+                ]
+                .as_slice()
+            ),
+            "x86 status-8 branch must restore the continuation side-entry ABI",
+        );
         let fallback_offset = usize::try_from(x86_relocations[4].offset).unwrap();
         assert_eq!(x86.get(fallback_offset.wrapping_sub(1)), Some(&0xe9));
 
-        let (aarch64, aarch64_relocations) = lower_aarch64_partial_prepared(&view).unwrap();
+        let NativePartialPreparedWrapper {
+            code: aarch64,
+            relocations: aarch64_relocations,
+            continuation_resume_tail_call_offset: aarch64_continuation_call,
+        } = lower_aarch64_partial_prepared(&view).unwrap();
+        let aarch64_continuation_call =
+            aarch64_continuation_call.expect("AArch64 status-8 local call");
         assert_eq!(
             aarch64.len(),
-            200,
+            248,
             "AArch64 combined prepared wrapper size"
         );
         assert_eq!(
@@ -66502,11 +66958,165 @@ int main(void){{
             u32::from_le_bytes(aarch64[runtime_offset..runtime_offset + 4].try_into().unwrap()),
             0x9400_0000
         );
+        assert!(words.contains(&aarch64_store_x(2, 31, 48).unwrap()));
+        assert!(words.contains(
+            &aarch64_cmp_w_imm(
+                0,
+                u16::from(STATIC_PREFIX_NATIVE_CONTINUATION_RESUME_STATUS)
+            )
+            .unwrap()
+        ));
+        assert_eq!(
+            u32::from_le_bytes(
+                aarch64[aarch64_continuation_call..aarch64_continuation_call + 4]
+                    .try_into()
+                    .unwrap()
+            ),
+            0x9400_0000
+        );
+        assert_eq!(
+            aarch64[aarch64_continuation_call - 20..aarch64_continuation_call]
+                .chunks_exact(4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>(),
+            [
+                aarch64_load_pair_x(0, 1, 31, 0).unwrap(),
+                aarch64_load_pair_x(2, 5, 31, 16).unwrap(),
+                aarch64_load_pair_x(3, 4, 31, 32).unwrap(),
+                aarch64_load_x_imm(8, 31, 48).unwrap(),
+                aarch64_load_pair_x(6, 7, 5, 0).unwrap(),
+            ],
+            "AArch64 status-8 branch must restore the continuation side-entry ABI",
+        );
         let fallback_offset = usize::try_from(aarch64_relocations[5].offset).unwrap();
         assert_eq!(
             u32::from_le_bytes(aarch64[fallback_offset..fallback_offset + 4].try_into().unwrap()),
             0x1400_0000
         );
+
+        // A genuine exact-empty retained partial is not expected from the
+        // current graph selector. Mutate only the output contract here to
+        // keep its compatibility policy independently testable: it must use
+        // compact-v2, fail closed on an impossible private status 8, and not
+        // append or publish any immutable-continuation dependency.
+        let mut exact_empty_view = view;
+        exact_empty_view.output = OutputContract::Span;
+        exact_empty_view.exact_match_width = Some(0);
+        exact_empty_view.native.output = OutputContract::Span;
+        exact_empty_view.native.exact_match_width = Some(0);
+
+        let exact_empty_x86 = lower_x86_64_partial_prepared(&exact_empty_view).unwrap();
+        assert_eq!(exact_empty_x86.code.len(), 261);
+        assert!(exact_empty_x86
+            .continuation_resume_tail_call_offset
+            .is_none());
+        assert!(exact_empty_x86.code.windows(14).any(|bytes| {
+            bytes
+                == [
+                    0x31, 0xc0, // scrub result[0]
+                    0x49, 0x89, 0x01, // result[0] = 0
+                    0x49, 0x89, 0x41, 0x08, // result[1] = 0
+                    0xb8, PREPARED_RUNTIME_FAILURE_STATUS, 0, 0, 0,
+                ]
+        }));
+
+        let exact_empty_aarch64 = lower_aarch64_partial_prepared(&exact_empty_view).unwrap();
+        assert_eq!(exact_empty_aarch64.code.len(), 236);
+        assert!(exact_empty_aarch64
+            .continuation_resume_tail_call_offset
+            .is_none());
+        let exact_empty_aarch64_words = exact_empty_aarch64
+            .code
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(exact_empty_aarch64_words.windows(3).any(|words| {
+            words
+                == [
+                    aarch64_load_x_imm(5, 31, 24).unwrap(),
+                    aarch64_store_pair_x(31, 31, 5, 0).unwrap(),
+                    aarch64_movz_w(0, u16::from(PREPARED_RUNTIME_FAILURE_STATUS)).unwrap(),
+                ]
+        }));
+
+        let mut nullable_variable_span_view = view;
+        nullable_variable_span_view.output = OutputContract::Span;
+        nullable_variable_span_view.exact_match_width = None;
+        nullable_variable_span_view.dfa.initial_pending = true;
+        assert!(!partial_retains_continuation_tail(
+            nullable_variable_span_view.output,
+            nullable_variable_span_view.exact_match_width,
+            nullable_variable_span_view.dfa.initial_pending,
+        ));
+        assert!(lower_x86_64_partial_prepared(&nullable_variable_span_view)
+            .unwrap()
+            .continuation_resume_tail_call_offset
+            .is_none());
+        assert!(lower_aarch64_partial_prepared(&nullable_variable_span_view)
+            .unwrap()
+            .continuation_resume_tail_call_offset
+            .is_none());
+
+        let serialized = compiled.program().serialize().unwrap();
+        for target in [
+            Target::x86_64_linux(),
+            Target::x86_64_macos(),
+            Target::aarch64_linux(),
+            Target::aarch64_macos(),
+        ] {
+            let (lowering, layout) = lower_native_partial_prepared(
+                serialized.clone(),
+                &exact_empty_view,
+                target,
+            )
+            .unwrap_or_else(|error| panic!("exact-empty partial {target:?}: {error}"))
+            .unwrap_or_else(|| panic!("exact-empty partial declined on {target:?}"));
+            let prepared = match layout.kind {
+                PreparedEntryKind::Native(prepared) => prepared,
+                PreparedEntryKind::RuntimeAdapter => {
+                    panic!("exact-empty partial selected a runtime adapter: {target:?}")
+                }
+            };
+            assert!(!prepared.retained_continuation_tail, "{target:?}");
+            assert_eq!(
+                prepared_partial_runtime_symbol_name(prepared),
+                PARTIAL_RUNTIME_V2_SYMBOL_NAME,
+                "{target:?}",
+            );
+            assert_eq!(
+                lowering.code.len(),
+                prepared.native_core_offset + prepared.native_core_size,
+                "exact-empty partial appended a continuation tail: {target:?}",
+            );
+            assert!(lowering.relocations.iter().all(|relocation| {
+                relocation.symbol != DYNAMIC_ROWS_LOOP_SCAN_RUNTIME_SYMBOL
+            }));
+            let module = CompiledModule::lower_serialized_with_prelowered(
+                serialized.clone(),
+                Some(lowering),
+                Some(layout),
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                target,
+            )
+            .unwrap_or_else(|error| panic!("assemble exact-empty partial {target:?}: {error}"));
+            assert_eq!(
+                module.required_prepared_runtime_symbol(),
+                Some(PARTIAL_RUNTIME_V2_SYMBOL_NAME),
+                "{target:?}",
+            );
+            assert!(module
+                .symbols()
+                .iter()
+                .all(|symbol| symbol.name != PARTIAL_RUNTIME_V3_SYMBOL_NAME));
+        }
     }
 
     #[test]
@@ -77957,17 +78567,17 @@ int main(void){{
                     relocation.symbol == PARTIAL_SPAN_RECOVERY_RUNTIME_SYMBOL
                 })
                 .count(),
-            1
+            2
         );
 
         for (code, relocations, architecture) in [
             {
-                let (code, relocations) = lower_x86_64_partial_prepared(&span_view).unwrap();
-                (code, relocations, Architecture::X86_64)
+                let wrapper = lower_x86_64_partial_prepared(&span_view).unwrap();
+                (wrapper.code, wrapper.relocations, Architecture::X86_64)
             },
             {
-                let (code, relocations) = lower_aarch64_partial_prepared(&span_view).unwrap();
-                (code, relocations, Architecture::Aarch64)
+                let wrapper = lower_aarch64_partial_prepared(&span_view).unwrap();
+                (wrapper.code, wrapper.relocations, Architecture::Aarch64)
             },
         ] {
             assert_eq!(
@@ -80988,7 +81598,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
                   s!={window_start}U||e!={window_end}U||memcmp(d,identity,32U)!=0)return 88U;\
                if(expect_path==2){{w->start={narrowed_start}U;w->end=e;return 6U;}}\
                if(expect_path==3){{r[0]=321U;r[1]=654U;return 76U;}}return 88U;}}\n\
-             uint32_t fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v2(\
+             uint32_t fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v3(\
                handle_t h,const unsigned char*p,size_t n,size_t*r,\
                size_t state,size_t position,size_t pend){{\
                if(expect_path!=2||h!=(handle_t)(uintptr_t)0x1234U||p!=haystack||n!=sizeof(haystack)||\
@@ -81600,7 +82210,7 @@ __asm__(".text\n.globl " CNAME(call_resume) "\n" CNAME(call_resume) ":\n"
              uint32_t fre_aot_regex_runtime_search_exclusive_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,size_t*r){{\
                fallback_calls++;if(mode!=2||h!=(handle_t)(uintptr_t)0x1234U||p!=haystack||n!=sizeof(haystack)||s!=0U||e!=100U||r==NULL)return 89U;\
                r[0]=9U;r[1]=9U;return 77U;}}\n\
-             uint32_t fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v2(handle_t h,const unsigned char*p,size_t n,size_t*r,size_t a,size_t b,size_t z){{\
+             uint32_t fre_aot_regex_runtime_search_exclusive_from_partial_preflight_compact_v3(handle_t h,const unsigned char*p,size_t n,size_t*r,size_t a,size_t b,size_t z){{\
                (void)h;(void)p;(void)n;(void)r;(void)a;(void)b;(void)z;return 90U;}}\n\
              uint32_t fre_aot_regex_runtime_search_exclusive_partial_preflight_v1(handle_t h,const unsigned char*p,size_t n,size_t s,size_t e,size_t*r,const unsigned char*d,window_t*w){{\
                preflight_calls++;if(h!=(handle_t)(uintptr_t)0x1234U||p!=haystack||n!=sizeof(haystack)||s!=0U||e!=sizeof(haystack)||r==NULL||w==NULL||memcmp(d,identity,32U)!=0)return 88U;\
